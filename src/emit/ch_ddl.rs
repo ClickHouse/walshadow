@@ -23,14 +23,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use clickhouse_c::BoxedAsyncClient;
 use tokio::sync::watch;
 
 use crate::catalog::type_bridge::{self, ResolvedColumn};
-use crate::ch::{
-    EmitterError, backoff_step, connect_client, exec_drain, is_retryable, quote_ident,
-    reconnect_if_idle,
-};
+use crate::ch::{ChConn, EmitterError, connect_client, exec_drain, quote_ident};
 use crate::column_rules::ColumnRules;
 use crate::config::{ConfigResolver, ResolvedConfig};
 use crate::emit::ch_emitter::{EmitterConfig, RetryConfig};
@@ -193,7 +189,7 @@ pub(crate) fn is_system_namespace(ns: &str, runtime_config_schema: Option<&str>)
 
 /// CH-side DDL writer. Owns one BoxedAsyncClient over its own TCP.
 pub struct DdlApplicator {
-    client: BoxedAsyncClient,
+    client: ChConn,
     config: DdlConfig,
     /// Live config layers. `refresh_config` folds a republished snapshot
     /// into `config` (namespaces + drop strategy) at each apply, so SIGHUP
@@ -207,7 +203,6 @@ pub struct DdlApplicator {
     /// Per-attempt cap (shares `EmitterConfig::insert_timeout`); a
     /// half-open CH socket can't park the reorder barrier past this
     query_timeout: Duration,
-    last_used: std::time::Instant,
     /// Owner of runtime-derived mapping state. Set: auto-created mappings,
     /// diff folds, and DROP forgets record into the resolver so the
     /// republish full-swap preserves them. Unset (bootstrap drain, tests
@@ -236,16 +231,14 @@ impl DdlApplicator {
         mapping: MappingHandle,
         config_rx: watch::Receiver<Arc<ResolvedConfig>>,
     ) -> Result<Self, EmitterError> {
-        let client = connect_client(emitter_cfg).await?;
         Ok(Self {
-            client,
+            client: ChConn::connect(emitter_cfg).await?,
             config: ddl_cfg,
             config_rx,
             mapping,
             conn_cfg: emitter_cfg.clone(),
             retry: emitter_cfg.retry.clone(),
             query_timeout: emitter_cfg.insert_timeout,
-            last_used: std::time::Instant::now(),
             resolver: None,
             ensured_databases: HashSet::new(),
             stats: DdlStats::default(),
@@ -306,8 +299,7 @@ impl DdlApplicator {
             self.conn_cfg.user = user;
             self.conn_cfg.password = password;
             self.conn_cfg.secure = secure;
-            self.client = connect_client(&self.conn_cfg).await?;
-            self.last_used = std::time::Instant::now();
+            self.client.dial(&self.conn_cfg).await?;
         }
         Ok(())
     }
@@ -639,29 +631,24 @@ impl DdlApplicator {
 
     async fn execute(&mut self, sql: &str) -> Result<(), EmitterError> {
         tracing::debug!(target: "walshadow::ch_ddl", sql = %sql, "applying");
-        let mut attempt = 0u32;
-        let mut backoff = self.retry.initial_backoff;
-        reconnect_if_idle(&mut self.client, &self.conn_cfg, self.last_used).await?;
-        loop {
-            let attempt_result = exec_drain(&mut self.client, sql, self.query_timeout).await;
-            match attempt_result {
-                Ok(()) => {
-                    self.last_used = std::time::Instant::now();
-                    return Ok(());
-                }
-                Err(e) if is_retryable(&e) && attempt < self.retry.max_attempts => {
+        let query_timeout = self.query_timeout;
+        self.client
+            .retry(
+                &self.conn_cfg,
+                self.retry.backoff(),
+                |mut client| async move {
+                    let result = exec_drain(&mut client, sql, query_timeout).await;
+                    (client, result)
+                },
+                |e, attempt| {
                     tracing::warn!(
                         target: "walshadow::ch_ddl",
                         error = %e, attempt, sql = %sql,
                         "DDL attempt failed; reconnecting + retrying",
                     );
-                    attempt += 1;
-                    backoff_step(&mut backoff, self.retry.max_backoff).await;
-                    self.client = connect_client(&self.conn_cfg).await?;
-                }
-                Err(e) => return Err(e),
-            }
-        }
+                },
+            )
+            .await
     }
 }
 
@@ -1012,6 +999,34 @@ mod tests {
     use std::sync::LazyLock;
 
     static SYS: LazyLock<Arc<SystemColumns>> = LazyLock::new(Arc::default);
+
+    #[tokio::test]
+    async fn ddl_retry_includes_failed_reconnect() {
+        let sql = "CREATE DATABASE IF NOT EXISTS retry_test";
+        for (retries, idle) in [(0, false), (1, false), (2, false), (1, true)] {
+            let (config, server) =
+                crate::ch::test_support::retry_server(retries, sql, false, idle).await;
+            let resolved = Arc::new(ResolvedConfig::default());
+            let ddl = DdlConfig::from_resolved(
+                &resolved,
+                config.database.clone(),
+                false,
+                SYS.clone(),
+                false,
+                None,
+            );
+            let mut applicator = DdlApplicator::new(
+                &config,
+                ddl,
+                crate::mapping::mapping_handle(HashMap::default()),
+                watch::channel(resolved).1,
+            )
+            .await
+            .unwrap();
+            assert_eq!(applicator.execute(sql).await.is_ok(), retries == 2 || idle);
+            server.await.unwrap();
+        }
+    }
 
     fn dest(database: &str, desc: &RelDescriptor) -> TableTarget {
         TableTarget::new(database, &desc.rel_name.name)

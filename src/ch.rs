@@ -5,8 +5,12 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use backon::{BackoffBuilder, ExponentialBuilder};
 use clickhouse_c::{AsyncClient, BoxedAsyncClient, ClientOpts, Codec, Compression, Event};
 use thiserror::Error;
+
+#[cfg(test)]
+pub(crate) mod test_support;
 
 #[derive(Debug, Error)]
 pub enum EmitterError {
@@ -129,18 +133,6 @@ pub async fn connect_client(
     }
 }
 
-pub async fn reconnect_if_idle(
-    client: &mut BoxedAsyncClient,
-    config: &impl ConnectionConfig,
-    last_used: Instant,
-) -> Result<bool, EmitterError> {
-    if last_used.elapsed() < config.idle_reconnect() {
-        return Ok(false);
-    }
-    *client = connect_client(config).await?;
-    Ok(true)
-}
-
 pub async fn drain_to_end_of_stream(client: &mut BoxedAsyncClient) -> Result<(), EmitterError> {
     loop {
         match client.recv_event().await? {
@@ -181,9 +173,131 @@ pub async fn exec_drain(
     .await
 }
 
-pub async fn backoff_step(backoff: &mut Duration, max: Duration) {
-    tokio::time::sleep(*backoff).await;
-    *backoff = backoff.saturating_mul(2).min(max);
+/// Connection owned by its retry loop. A cleared client redials on next use,
+/// so a failed reconnect spends retry budget instead of aborting the caller.
+pub struct ChConn {
+    client: Option<BoxedAsyncClient>,
+    last_used: Instant,
+    dials: u64,
+}
+
+impl Default for ChConn {
+    /// Deferred dial: first use connects
+    fn default() -> Self {
+        Self {
+            client: None,
+            last_used: Instant::now(),
+            dials: 0,
+        }
+    }
+}
+
+impl ChConn {
+    /// Eager dial, so an unreachable endpoint fails at construction
+    pub async fn connect(config: &impl ConnectionConfig) -> Result<Self, EmitterError> {
+        let mut conn = Self::default();
+        conn.dial(config).await?;
+        conn.dials = 0;
+        Ok(conn)
+    }
+
+    /// Redial now, for settings fixed at connect (codec, host, credentials)
+    pub async fn dial(&mut self, config: &impl ConnectionConfig) -> Result<(), EmitterError> {
+        self.client = None;
+        self.ready(config).await?;
+        Ok(())
+    }
+
+    pub async fn ready(
+        &mut self,
+        config: &impl ConnectionConfig,
+    ) -> Result<&mut BoxedAsyncClient, EmitterError> {
+        if self.last_used.elapsed() >= config.idle_reconnect() {
+            self.client = None;
+        }
+        if self.client.is_none() {
+            self.client = Some(connect_client(config).await?);
+            self.last_used = Instant::now();
+            self.dials += 1;
+        }
+        Ok(self.client.as_mut().expect("just connected"))
+    }
+
+    /// Dials since the last call, excluding the one at construction
+    pub fn take_dials(&mut self) -> u64 {
+        std::mem::take(&mut self.dials)
+    }
+
+    /// [`Self::retry_when`] over [`is_retryable`]
+    pub async fn retry<T, Fut>(
+        &mut self,
+        config: &impl ConnectionConfig,
+        backoff: ExponentialBuilder,
+        op: impl FnMut(BoxedAsyncClient) -> Fut,
+        on_retry: impl FnMut(&EmitterError, u32),
+    ) -> Result<T, EmitterError>
+    where
+        Fut: Future<Output = (BoxedAsyncClient, Result<T, EmitterError>)>,
+    {
+        self.retry_when(config, backoff, is_retryable, op, on_retry)
+            .await
+    }
+
+    /// Resend `op` until it succeeds, `when` rejects the error, or `backoff`
+    /// runs out. Each resend gets a fresh connection, so a failed dial is
+    /// itself a retryable attempt.
+    ///
+    /// `op` owns the client for one attempt and hands it back: a closure
+    /// lending `&mut` client can't promise a `Send` future on stable, and the
+    /// inserter pool spawns.
+    pub async fn retry_when<T, Fut>(
+        &mut self,
+        config: &impl ConnectionConfig,
+        backoff: ExponentialBuilder,
+        when: impl Fn(&EmitterError) -> bool,
+        mut op: impl FnMut(BoxedAsyncClient) -> Fut,
+        mut on_retry: impl FnMut(&EmitterError, u32),
+    ) -> Result<T, EmitterError>
+    where
+        Fut: Future<Output = (BoxedAsyncClient, Result<T, EmitterError>)>,
+    {
+        let mut backoff = backoff.build();
+        let mut attempt = 0u32;
+        loop {
+            let error = match self.take_ready(config).await {
+                Ok(client) => {
+                    let (client, result) = op(client).await;
+                    self.client = Some(client);
+                    match result {
+                        Ok(value) => {
+                            self.last_used = Instant::now();
+                            return Ok(value);
+                        }
+                        Err(e) => e,
+                    }
+                }
+                Err(e) => e,
+            };
+            if !when(&error) {
+                return Err(error);
+            }
+            let Some(delay) = backoff.next() else {
+                return Err(error);
+            };
+            on_retry(&error, attempt);
+            attempt += 1;
+            self.client = None;
+            tokio::time::sleep(delay).await;
+        }
+    }
+
+    async fn take_ready(
+        &mut self,
+        config: &impl ConnectionConfig,
+    ) -> Result<BoxedAsyncClient, EmitterError> {
+        self.ready(config).await?;
+        Ok(self.client.take().expect("just connected"))
+    }
 }
 
 pub fn is_retryable(error: &EmitterError) -> bool {

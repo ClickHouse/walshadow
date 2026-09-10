@@ -8,17 +8,14 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
-use clickhouse_c::{
-    Allocator, Block, BlockBuilder, BoxedAsyncClient, ColumnBuilder, Event, TypeAst,
-};
+use clickhouse_c::{Allocator, Block, BlockBuilder, ColumnBuilder, Event, TypeAst};
 use thiserror::Error;
 use tokio::sync::Mutex;
 
 use bytes::Bytes;
 
 use crate::ch::{
-    EmitterError, backoff_step, connect_client, drain_to_end_of_stream, is_retryable, quote_ident,
-    with_timeout,
+    ChConn, EmitterError, drain_to_end_of_stream, is_retryable, quote_ident, with_timeout,
 };
 use crate::decode::heap_decoder::{
     ColumnValue, ToastPointer, VARLENA_EXTSIZE_BITS, VARLENA_EXTSIZE_MASK, decompress_varlena,
@@ -497,7 +494,7 @@ const CH_UNKNOWN_TABLE: i32 = 60;
 const CH_UNKNOWN_DATABASE: i32 = 81;
 
 struct ChState {
-    client: Option<BoxedAsyncClient>,
+    client: ChConn,
     created: HashSet<u32>,
 }
 
@@ -516,7 +513,7 @@ impl ClickHouseChunkStore {
             conn,
             alloc: Allocator::global(&mimalloc::MiMalloc),
             state: Mutex::new(ChState {
-                client: None,
+                client: ChConn::default(),
                 created: HashSet::new(),
             }),
         }
@@ -607,34 +604,26 @@ impl ClickHouseChunkStore {
         sql: &str,
         bb: Option<&BlockBuilder<'_>>,
     ) -> Result<(), EmitterError> {
-        let mut attempt = 0u32;
-        let mut backoff = self.conn.retry.initial_backoff;
-        loop {
-            if state.client.is_none() {
-                state.client = Some(connect_client(&self.conn).await?);
-            }
-            let res = {
-                let client = state.client.as_mut().expect("just connected");
-                with_timeout(self.conn.insert_timeout, async {
-                    client.send_query(sql, None).await?;
-                    if let Some(bb) = bb {
-                        client.send_data(Some(bb)).await?;
-                        client.send_data_end().await?;
-                    }
-                    drain_to_end_of_stream(client).await
-                })
-                .await
-            };
-            match res {
-                Ok(()) => return Ok(()),
-                Err(e) if is_retryable(&e) && attempt < self.conn.retry.max_attempts => {
-                    attempt += 1;
-                    state.client = None;
-                    backoff_step(&mut backoff, self.conn.retry.max_backoff).await;
-                }
-                Err(e) => return Err(e),
-            }
-        }
+        state
+            .client
+            .retry(
+                &self.conn,
+                self.conn.retry.backoff(),
+                |mut client| async move {
+                    let result = with_timeout(self.conn.insert_timeout, async {
+                        client.send_query(sql, None).await?;
+                        if let Some(bb) = bb {
+                            client.send_data(Some(bb)).await?;
+                            client.send_data_end().await?;
+                        }
+                        drain_to_end_of_stream(&mut client).await
+                    })
+                    .await;
+                    (client, result)
+                },
+                |_, _| {},
+            )
+            .await
     }
 
     async fn put_locked(&self, state: &mut ChState, rows: &[ToastRow]) -> Result<(), EmitterError> {
@@ -704,51 +693,47 @@ impl ClickHouseChunkStore {
         sql: &str,
         parse: impl Fn(&Block, &mut A) -> Result<(), EmitterError>,
     ) -> Result<A, EmitterError> {
-        let mut attempt = 0u32;
-        let mut backoff = self.conn.retry.initial_backoff;
-        loop {
-            if state.client.is_none() {
-                state.client = Some(connect_client(&self.conn).await?);
-            }
-            let res = {
-                let client = state.client.as_mut().expect("just connected");
-                with_timeout(self.conn.insert_timeout, async {
-                    client.send_query(sql, None).await?;
-                    let mut out = A::default();
-                    loop {
-                        match client.recv_event().await? {
-                            Event::Data(block) => parse(&block, &mut out)?,
-                            Event::EndOfStream => break,
-                            Event::Exception(exc) => {
-                                return Err(EmitterError::ServerException {
-                                    code: exc.code(),
-                                    message: String::from_utf8_lossy(exc.display_text())
-                                        .into_owned(),
-                                });
+        state
+            .client
+            .retry_when(
+                &self.conn,
+                self.conn.retry.backoff(),
+                |e| is_retryable(e) && !is_missing_mirror(e),
+                |mut client| async {
+                    let result = with_timeout(self.conn.insert_timeout, async {
+                        client.send_query(sql, None).await?;
+                        let mut out = A::default();
+                        loop {
+                            match client.recv_event().await? {
+                                Event::Data(block) => parse(&block, &mut out)?,
+                                Event::EndOfStream => break,
+                                Event::Exception(exc) => {
+                                    return Err(EmitterError::ServerException {
+                                        code: exc.code(),
+                                        message: String::from_utf8_lossy(exc.display_text())
+                                            .into_owned(),
+                                    });
+                                }
+                                _ => {}
                             }
-                            _ => {}
                         }
-                    }
-                    Ok::<_, EmitterError>(out)
-                })
-                .await
-            };
-            match res {
-                Ok(out) => return Ok(out),
-                Err(e @ EmitterError::ServerException { code, .. })
-                    if code == CH_UNKNOWN_TABLE || code == CH_UNKNOWN_DATABASE =>
-                {
-                    return Err(e);
-                }
-                Err(e) if is_retryable(&e) && attempt < self.conn.retry.max_attempts => {
-                    attempt += 1;
-                    state.client = None;
-                    backoff_step(&mut backoff, self.conn.retry.max_backoff).await;
-                }
-                Err(e) => return Err(e),
-            }
-        }
+                        Ok(out)
+                    })
+                    .await;
+                    (client, result)
+                },
+                |_, _| {},
+            )
+            .await
     }
+}
+
+fn is_missing_mirror(error: &EmitterError) -> bool {
+    matches!(
+        error,
+        EmitterError::ServerException { code, .. }
+            if *code == CH_UNKNOWN_TABLE || *code == CH_UNKNOWN_DATABASE
+    )
 }
 
 /// Feed one result block into the assembler; seq order validated across

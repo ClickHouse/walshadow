@@ -12,13 +12,11 @@
 //! dedups by `_lsn`). Retry-exhaustion is fatal: the watermark can't advance
 //! without this batch.
 
-use clickhouse_c::{Allocator, BlockBuilder, BoxedAsyncClient, ColumnBuilder, TypeAst};
+use backon::Retryable;
+use clickhouse_c::{Allocator, BlockBuilder, ColumnBuilder, TypeAst};
 use tokio::task::JoinHandle;
 
-use crate::ch::{
-    EmitterError, backoff_step, connect_client, drain_to_end_of_stream, is_retryable,
-    reconnect_if_idle, with_timeout,
-};
+use crate::ch::{ChConn, EmitterError, drain_to_end_of_stream, with_timeout};
 use crate::config::ResolvedConfig;
 use crate::emit::ch_emitter::{ColumnBuf, EmitterConfig, EmitterStats, build_leaf, build_root};
 use crate::emit::pipeline::Fatal;
@@ -32,8 +30,7 @@ use std::sync::atomic::Ordering;
 use tokio::sync::watch;
 
 struct Inserter {
-    client: BoxedAsyncClient,
-    last_used: std::time::Instant,
+    client: ChConn,
     alloc: Allocator,
     config: EmitterConfig,
     /// Parsed column types per table, refreshed when a batch's `schema_epoch`
@@ -67,8 +64,10 @@ impl Inserter {
     }
 
     async fn reconnect(&mut self) -> Result<(), EmitterError> {
-        self.client = connect_client(&self.config).await?;
-        self.stats.reconnects.fetch_add(1, Ordering::Relaxed);
+        self.client.dial(&self.config).await?;
+        self.stats
+            .reconnects
+            .fetch_add(self.client.take_dials(), Ordering::Relaxed);
         Ok(())
     }
 
@@ -81,33 +80,32 @@ impl Inserter {
         sql: &str,
         bb: &BlockBuilder<'_>,
     ) -> Result<(), EmitterError> {
-        let retry = self.config.retry.clone();
-        let mut attempt = 0u32;
-        let mut backoff = retry.initial_backoff;
-        reconnect_if_idle(&mut self.client, &self.config, self.last_used).await?;
-        loop {
-            let attempt_result = with_timeout(self.config.insert_timeout, async {
-                self.client.send_query(sql, None).await?;
-                self.client.send_data(Some(bb)).await?;
-                self.client.send_data_end().await?;
-                // Only after EndOfStream returns are rows durable and ackable
-                drain_to_end_of_stream(&mut self.client).await
-            })
-            .await;
-            match attempt_result {
-                Ok(()) => {
-                    self.last_used = std::time::Instant::now();
-                    return Ok(());
-                }
-                Err(e) if is_retryable(&e) && attempt < retry.max_attempts => {
+        let insert_timeout = self.config.insert_timeout;
+        let result = self
+            .client
+            .retry(
+                &self.config,
+                self.config.retry.backoff(),
+                |mut client| async move {
+                    let result = with_timeout(insert_timeout, async {
+                        client.send_query(sql, None).await?;
+                        client.send_data(Some(bb)).await?;
+                        client.send_data_end().await?;
+                        // Only after EndOfStream returns are rows durable and ackable
+                        drain_to_end_of_stream(&mut client).await
+                    })
+                    .await;
+                    (client, result)
+                },
+                |_, _| {
                     self.stats.retries_attempted.fetch_add(1, Ordering::Relaxed);
-                    attempt += 1;
-                    backoff_step(&mut backoff, retry.max_backoff).await;
-                    self.reconnect().await?;
-                }
-                Err(e) => return Err(e),
-            }
-        }
+                },
+            )
+            .await;
+        self.stats
+            .reconnects
+            .fetch_add(self.client.take_dials(), Ordering::Relaxed);
+        result
     }
 
     async fn run(mut self, rx: async_channel::Receiver<InsertBatch>, fatal: Fatal) {
@@ -269,19 +267,14 @@ async fn resolve_oracle_with_retry(
     retry: &crate::emit::ch_emitter::RetryConfig,
     stats: &EmitterStats,
 ) -> Result<Option<OracleBlock>, EmitterError> {
-    let mut attempt = 0u32;
-    let mut backoff = retry.initial_backoff;
-    loop {
-        match resolve_oracle(oracle.clone(), alloc, batch).await {
-            Ok(v) => return Ok(v),
-            Err(e) if e.retryable() && attempt < retry.max_attempts => {
-                stats.retries_attempted.fetch_add(1, Ordering::Relaxed);
-                attempt += 1;
-                backoff_step(&mut backoff, retry.max_backoff).await;
-            }
-            Err(e) => return Err(EmitterError::Type(e.to_string())),
-        }
-    }
+    (|| resolve_oracle(oracle.clone(), alloc, batch))
+        .retry(retry.backoff())
+        .when(OracleError::retryable)
+        .notify(|_, _| {
+            stats.retries_attempted.fetch_add(1, Ordering::Relaxed);
+        })
+        .await
+        .map_err(|e| EmitterError::Type(e.to_string()))
 }
 
 async fn resolve_oracle(
@@ -335,10 +328,8 @@ pub(crate) async fn spawn_pool(
 ) -> Result<Vec<JoinHandle<()>>, EmitterError> {
     let mut handles = Vec::with_capacity(n.max(1));
     for _ in 0..n.max(1) {
-        let client = connect_client(config).await?;
         let inserter = Inserter {
-            client,
-            last_used: std::time::Instant::now(),
+            client: ChConn::connect(config).await?,
             alloc: Allocator::global(&mimalloc::MiMalloc),
             config: config.clone(),
             asts: HashMap::new(),
@@ -352,4 +343,51 @@ pub(crate) async fn spawn_pool(
         handles.push(tokio::spawn(inserter.run(rx, fatal)));
     }
     Ok(handles)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::emit::pipeline::ack;
+
+    #[tokio::test]
+    async fn insert_retry_preserves_payload_through_failed_reconnect() {
+        let sql = "INSERT INTO retry_test (x) VALUES";
+        for (retries, idle) in [(0, false), (1, false), (2, false), (1, true)] {
+            let (config, server) =
+                crate::ch::test_support::retry_server(retries, sql, true, idle).await;
+            let client = ChConn::connect(&config).await.unwrap();
+            let (ack, collector) = ack::spawn(Arc::default());
+            let stats = Arc::new(EmitterStats::default());
+            let mut inserter = Inserter {
+                client,
+                alloc: Allocator::stdlib(),
+                config,
+                asts: HashMap::new(),
+                ack,
+                stats: stats.clone(),
+                config_rx: None,
+                oracle: None,
+            };
+            let ast = TypeAst::parse("UInt8", inserter.alloc).unwrap();
+            let column = ColumnBuilder::fixed(&[42], 1, 1).unwrap();
+            let mut block = BlockBuilder::new();
+            block.append("x", ast.view(), &column).unwrap();
+            assert_eq!(
+                inserter.send_with_retry(sql, &block).await.is_ok(),
+                retries == 2 || idle
+            );
+            assert_eq!(
+                stats.retries_attempted.load(Ordering::Relaxed),
+                u64::from(retries)
+            );
+            assert_eq!(
+                stats.reconnects.load(Ordering::Relaxed),
+                u64::from(retries == 2 || idle)
+            );
+            server.await.unwrap();
+            drop(inserter);
+            collector.await.unwrap();
+        }
+    }
 }
