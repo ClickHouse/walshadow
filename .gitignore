@@ -13,6 +13,7 @@ pgext/log/
 *.so
 *.gcda
 *.gcno
+*.gcov
 *.diffs
 architecture/*.png
 

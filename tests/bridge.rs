@@ -572,6 +572,84 @@ async fn bridge_scans_uncommitted_ddl() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn bridge_scans_null_missing_value() {
+    if !pg_available() {
+        eprintln!("skip: no initdb on PATH");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let guard = start_pg(&tmp, ports::PG_SHADOW_PORT);
+    let bridge = dial(&guard.sh).await;
+    let setup = connect_sql(&guard.sh).await;
+    setup
+        .batch_execute(
+            "CREATE TABLE t (id int);
+             ALTER TABLE t ADD COLUMN c int DEFAULT 7;",
+        )
+        .await
+        .expect("committed setup");
+    let oid_t = oid_of(&setup, "t").await;
+    let baseline = bridge
+        .scan(Catalog::Attribute, 0, &[oid_t])
+        .await
+        .expect("scan before fault")
+        .parse::<AttributeRow>()
+        .expect("attribute rows");
+    assert_eq!(baseline.len(), 2);
+    let mut expected = baseline.clone();
+    let column = expected.iter_mut().find(|a| a.attname == "c").unwrap();
+    assert_eq!(column.attrelid, oid_t);
+    assert_eq!(column.attmissingval.as_deref(), Some("{7}"));
+    column.attmissingval = None;
+
+    // PostgreSQL DDL updates flag and value together, inject catalog inconsistency
+    let fault = connect_sql(&guard.sh).await;
+    fault
+        .batch_execute("BEGIN; LOCK TABLE t IN ACCESS EXCLUSIVE MODE")
+        .await
+        .expect("lock fault target");
+    let changed = fault
+        .query(
+            "UPDATE pg_attribute SET attmissingval = NULL
+             WHERE attrelid = $1 AND attname = 'c' AND atthasmissing
+             RETURNING atthasmissing, attmissingval IS NULL",
+            &[&oid_t],
+        )
+        .await
+        .expect("inject missing catalog value");
+    assert_eq!(changed.len(), 1);
+    assert!(changed[0].get::<_, bool>(0));
+    assert!(changed[0].get::<_, bool>(1));
+    let xid = top_xid(&fault).await;
+
+    for (top, expected) in [(xid, &expected), (0, &baseline)] {
+        let attrs = bridge
+            .scan(Catalog::Attribute, top, &[oid_t])
+            .await
+            .expect("scan during fault")
+            .parse::<AttributeRow>()
+            .expect("attribute rows");
+        assert_eq!(&attrs, expected, "top xid {top}");
+    }
+
+    fault.batch_execute("ROLLBACK").await.expect("undo fault");
+    let restored = bridge
+        .scan(Catalog::Attribute, 0, &[oid_t])
+        .await
+        .expect("scan after rollback")
+        .parse::<AttributeRow>()
+        .expect("attribute rows");
+    assert_eq!(restored, baseline);
+    assert_eq!(
+        bridge
+            .stats
+            .reconnects
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn bridge_reconnects_after_worker_exit() {
     if !pg_available() {
         eprintln!("skip: no initdb on PATH");
@@ -1007,7 +1085,9 @@ async fn bridge_native_hstore_expander_requires_extension_membership() {
          CREATE FUNCTION decoy.hstore_to_matrix(hstore) RETURNS text[]
              LANGUAGE sql AS $$ SELECT ARRAY[['wrong', 'value']] $$;
          CREATE FUNCTION decoy.hstore_to_matrix(int) RETURNS text[]
-             LANGUAGE sql AS $$ SELECT ARRAY[['wrong', 'overload']] $$;",
+             LANGUAGE sql AS $$ SELECT ARRAY[['wrong', 'overload']] $$;
+         CREATE FUNCTION decoy.hstore_to_matrix(hstore, int) RETURNS text[]
+             LANGUAGE sql AS $$ SELECT ARRAY[['wrong', 'arity']] $$;",
     )
     .await
     .unwrap();
@@ -1063,4 +1143,149 @@ async fn bridge_native_hstore_expander_requires_extension_membership() {
             .load(std::sync::atomic::Ordering::Relaxed),
         0
     );
+}
+
+/// A key-share lock does not conflict with a non-key update, so both end up
+/// in one multixact on the superseded `pg_class` row. The overlay has to read
+/// the update xid out of it; taking the raw xmax would leave the row visible
+/// and answer two `pg_class` rows for one relation
+#[tokio::test(flavor = "current_thread")]
+async fn bridge_scans_multixact_catalog_rows() {
+    if !pg_available() {
+        eprintln!("skip: no initdb on PATH");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let guard = start_pg(&tmp, ports::PG_SHADOW_PORT);
+    let bridge = dial(&guard.sh).await;
+
+    let setup = connect_sql(&guard.sh).await;
+    setup
+        .batch_execute("CREATE TABLE t (id int PRIMARY KEY, a text)")
+        .await
+        .expect("committed setup");
+    let oid_t = oid_of(&setup, "t").await;
+
+    let locker = connect_sql(&guard.sh).await;
+    locker
+        .batch_execute(&format!(
+            "BEGIN; SELECT relname FROM pg_class WHERE oid = {oid_t} FOR KEY SHARE"
+        ))
+        .await
+        .expect("key share on the class row");
+
+    let ddl = connect_sql(&guard.sh).await;
+    ddl.batch_execute("BEGIN").await.expect("open ddl");
+    let xid = top_xid(&ddl).await;
+
+    // A lock is all of xmax so far, and a lock supersedes nothing
+    let locked = bridge
+        .scan(Catalog::Class, xid, &[oid_t])
+        .await
+        .expect("scan a locked class row")
+        .parse::<ClassRow>()
+        .expect("class rows");
+    assert_eq!(locked.len(), 1, "{locked:#?}");
+
+    ddl.batch_execute("ALTER TABLE t ADD COLUMN c int")
+        .await
+        .expect("ddl under the lock");
+
+    let class = bridge
+        .scan(Catalog::Class, xid, &[oid_t])
+        .await
+        .expect("scan pg_class")
+        .parse::<ClassRow>()
+        .expect("class rows");
+    assert_eq!(class.len(), 1, "{class:#?}");
+    assert_eq!(class[0].relname, "t");
+    assert_eq!(class[0].oid, oid_t);
+
+    // The locker's own transaction never wrote, so nothing it holds is a
+    // writer the scan had to resolve
+    let attrs = bridge
+        .scan(Catalog::Attribute, xid, &[oid_t])
+        .await
+        .expect("scan pg_attribute")
+        .parse::<AttributeRow>()
+        .expect("attribute rows");
+    let cols: Vec<&str> = attrs.iter().map(|a| a.attname.as_str()).collect();
+    assert_eq!(cols, ["id", "a", "c"]);
+}
+
+/// An aborted DDL leaves its catalog rows on the page until vacuum. The first
+/// read after the abort hint-bits them dead, and the scan has to skip them on
+/// that alone, without asking the commit log again
+#[tokio::test(flavor = "current_thread")]
+async fn bridge_scan_skips_aborted_ddl_debris() {
+    if !pg_available() {
+        eprintln!("skip: no initdb on PATH");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let guard = start_pg(&tmp, ports::PG_SHADOW_PORT);
+    let bridge = dial(&guard.sh).await;
+
+    let sql = connect_sql(&guard.sh).await;
+    sql.batch_execute("BEGIN; CREATE TABLE gone (id int); ROLLBACK")
+        .await
+        .expect("aborted ddl");
+    // Any ordinary read over the debris is what writes the hint bit
+    sql.batch_execute("SELECT count(*) FROM pg_class")
+        .await
+        .expect("read pg_class");
+
+    // No transaction of ours, so the committed view, and the whole catalog
+    let scan = bridge
+        .scan(Catalog::Class, 0, &[])
+        .await
+        .expect("scan pg_class");
+    let rows = scan.parse::<ClassRow>().expect("class rows");
+    assert!(
+        !rows.iter().any(|r| r.relname == "gone"),
+        "answered a rolled back relation"
+    );
+    // Debris the scan read past, so the skip was the predicate's
+    assert!(scan.scanned > rows.len() as u32, "{scan:#?}");
+}
+
+/// An in-progress writer that resolves to somebody else's top transaction is
+/// not in our tree. Its rows are neither ours to answer nor a reason to fail
+/// the read: the parentage is known, it just roots elsewhere
+#[tokio::test(flavor = "current_thread")]
+async fn bridge_scan_skips_another_subtransactions_rows() {
+    if !pg_available() {
+        eprintln!("skip: no initdb on PATH");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let guard = start_pg(&tmp, ports::PG_SHADOW_PORT);
+    let bridge = dial(&guard.sh).await;
+
+    let setup = connect_sql(&guard.sh).await;
+    setup
+        .batch_execute("CREATE TABLE t (id int)")
+        .await
+        .expect("committed setup");
+    let oid_t = oid_of(&setup, "t").await;
+
+    // A savepoint is what gives the write its own xid under a parent
+    let other = connect_sql(&guard.sh).await;
+    other
+        .batch_execute("BEGIN; SAVEPOINT s; ALTER TABLE t ADD COLUMN c int")
+        .await
+        .expect("open subtransaction ddl");
+
+    let reader = connect_sql(&guard.sh).await;
+    reader.batch_execute("BEGIN").await.expect("open reader");
+    let xid = top_xid(&reader).await;
+
+    let scan = bridge
+        .scan(Catalog::Attribute, xid, &[oid_t])
+        .await
+        .expect("scan pg_attribute");
+    assert!(scan.subtrans_mismatch > 0, "{scan:#?}");
+    let attrs = scan.parse::<AttributeRow>().expect("attribute rows");
+    let cols: Vec<&str> = attrs.iter().map(|a| a.attname.as_str()).collect();
+    assert_eq!(cols, ["id"], "answered a column of another tree");
 }

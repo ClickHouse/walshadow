@@ -359,16 +359,6 @@ ws_catalog_plan(WsCatalog cat, WsCatalogPlan *plan)
 	return false;
 }
 
-int
-ws_overlay_ncols(WsCatalog cat)
-{
-	WsCatalogPlan plan;
-
-	if (!ws_catalog_plan(cat, &plan))
-		return -1;
-	return plan.ncols;
-}
-
 /* -------------------------------------------------------------------------
  * scan
  * ------------------------------------------------------------------------- */
@@ -424,6 +414,7 @@ ws_overlay_scan(WsCatalog cat, TransactionId top, const Oid *oids, int noids,
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("unknown walshadow catalog id %d", (int) cat)));
+	stats->ncols = plan.ncols;
 
 	/* An empty oid list is the whole catalog, which is the only mode
 	 * pg_namespace and pg_type have. The lock argument comes with the list, so

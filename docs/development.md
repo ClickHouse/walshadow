@@ -6,6 +6,7 @@ See [module build guide](../pgext/README.md) for PG_CONFIG and installation
 
 ```bash
 make -C pgext
+make -C pgext faultshim.so
 cargo nextest run --workspace --all-targets --locked
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings

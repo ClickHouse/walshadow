@@ -185,7 +185,7 @@ jobs:
       - name: PG module coverage
         if: ${{ !cancelled() }}
         working-directory: walshadow/pgext
-        run: make coverage-html
+        run: make coverage-html COVERAGE_MIN_LINE=100
 
       - name: Upload PG module coverage
         if: ${{ !cancelled() }}
