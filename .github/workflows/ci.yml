@@ -69,7 +69,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential liblz4-dev libzstd-dev curl gnupg lsb-release
+            build-essential liblz4-dev libzstd-dev curl gnupg lsb-release \
+            gcovr
 
       # The runner's preinstalled postgresql-common ships only one major
       # at a time; pull the requested major straight from PGDG so the
@@ -149,8 +150,8 @@ jobs:
         working-directory: walshadow/pgext
         run: |
           PG_CONFIG=/usr/lib/postgresql/${{ matrix.pg-major }}/bin/pg_config
-          make PG_CONFIG=$PG_CONFIG
-          sudo make PG_CONFIG=$PG_CONFIG install
+          make PG_CONFIG=$PG_CONFIG coverage-build
+          sudo make PG_CONFIG=$PG_CONFIG COVERAGE=1 CC=gcc install
 
       # Each e2e test stages a source + shadow PG cluster on disk; the
       # runner's root fs is small, so point TMPDIR at the larger /mnt volume.
@@ -180,6 +181,20 @@ jobs:
           cargo llvm-cov clean --workspace
           cargo llvm-cov nextest --workspace --all-targets --locked \
             --no-report --no-fail-fast
+
+      - name: PG module coverage
+        if: ${{ !cancelled() }}
+        working-directory: walshadow/pgext
+        run: make coverage-html
+
+      - name: Upload PG module coverage
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-pgext-pg${{ matrix.pg-major }}
+          path: walshadow/pgext/coverage
+          if-no-files-found: error
+          retention-days: 30
 
       - name: Upload test artifacts on failure
         if: failure()
@@ -235,7 +250,7 @@ jobs:
         continue-on-error: true
         uses: actions/download-artifact@v8
         with:
-          pattern: coverage-pg*
+          pattern: coverage-pg[0-9]*
           path: lcov
 
       - name: Merge coverage

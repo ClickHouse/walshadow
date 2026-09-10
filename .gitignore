@@ -11,6 +11,8 @@ pgext/log/
 *.o
 *.bc
 *.so
+*.gcda
+*.gcno
 *.diffs
 architecture/*.png
 
