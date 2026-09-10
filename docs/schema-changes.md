@@ -17,6 +17,15 @@ changes after earlier rows and before later rows
 | `DROP TABLE` | retains, warns, or drops destination based on policy |
 | `VACUUM FULL`, `CLUSTER`, rewriting `ALTER` | continues with rewritten source relation |
 
+Table renames, schema moves, replica-identity changes, and switching to unlogged
+storage are not automatically reconciled with destination routing and keys
+Coordinate these changes with an explicit destination and mapping migration
+They are not uniformly rejected before replication continues
+
+Nullability changes use same warning-only path as type changes. Dropping NOT NULL
+on source does not make destination nullable; a subsequent NULL can become a
+destination default. Migrate destination representation before such rows arrive
+
 ## Configure source table drops
 
 Destination retention is default

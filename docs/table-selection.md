@@ -70,7 +70,7 @@ receives changes from start LSN onwards
 | `none` | skipped | none | destination already has baseline, or only future changes matter |
 | `copy` | read with live SQL snapshot | table scan | normal table additions |
 | `base_backup` | read from fresh physical backup | cluster-sized backup stream | SQL scan pressure is undesirable |
-| `object_store` | read from latest wal-g backup plus archived WAL | no source data scan | continuous compatible backup archive exists |
+| `object_store` | read from latest wal-g backup plus archived WAL | archive reads, conditional source repair | continuous compatible backup archive exists |
 
 `base_backup` streams whole PostgreSQL cluster even when adding one table
 because PostgreSQL backup protocol has no per-table filter
@@ -78,6 +78,11 @@ because PostgreSQL backup protocol has no per-table filter
 `object_store` requires `[backup]` configuration, full wal-g backup, and
 continuous archived WAL coverage. Use `copy` when backup predates incompatible
 schema changes or archive coverage has gaps
+
+Backup modes can fall back to source COPY scans for mapped external TOAST values
+or unresolved multixact visibility. Object storage removes backup transfer from
+source, but does not guarantee a load without source queries. See
+[initial-load limits](limitations.md#initial-loads)
 
 ## Select future tables by name
 

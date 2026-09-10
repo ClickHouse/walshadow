@@ -1,5 +1,5 @@
 //! Backup-sourced per-table initial load: `initial_load='base_backup'` and
-//! `'object_store'` (plans/add_table.md).
+//! `'object_store'` (architecture/bootstrap.md).
 //!
 //! Reuses greenfield bootstrap plumbing — [`BackupSource`] impls,
 //! [`PageWalkSink`], [`bootstrap::drain`] — with a per-rel filter over the
@@ -8,7 +8,7 @@
 //! the sink Taps filtered heap files (+ `pg_xact/` and `pg_multixact/` into
 //! memory for the gate) and Skips everything else.
 //!
-//! ## `_lsn` tagging (plans/add_table.md §invariant)
+//! ## `_lsn` tagging (architecture/bootstrap.md)
 //!
 //! Walked rows must lose to every WAL-delivered mutation the backup state
 //! does not already reflect: tag with the LSN where continuous WAL coverage
@@ -149,7 +149,7 @@ async fn run_object_store_pass(ctx: &PassContext, reqs: &[BackupRequest]) -> Res
     let target_db = target_db_oid(reqs)?;
     // Archive from the `[backup]` config, never the source-PG overlay:
     // credentials in a source table is the wrong trust direction
-    // (plans/add_table.md §Anti-goals)
+    // (architecture/bootstrap.md)
     let settings = ctx
         .emitter
         .backup
@@ -365,7 +365,7 @@ async fn walk_and_ship(
     // Join gate + drain on every path (both exit on channel close), then
     // quiesce the tail before surfacing an error: a detached inserter could
     // otherwise final-flush into a staging table a retry pass has already
-    // rebuilt (plans/add_table.md §Staging swap)
+    // rebuilt (architecture/bootstrap.md)
     let gate_join = gate.await.context("backup_backfill: gate join");
     let drain_join = drain.await.context("backup_backfill: drain join");
 

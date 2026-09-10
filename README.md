@@ -35,9 +35,9 @@ PostgreSQL major version
 - [Planned source switchover](docs/failover.md)
 - [Current limitations](docs/limitations.md)
 
-Engineering rationale lives in [plans](plans/INDEX.md), architecture diagrams
-in [architecture](architecture/README.md), and open work in
-[future plans](plans/future/INDEX.md)
+System design and diagrams live in [architecture](architecture/README.md),
+unfinished work in [plans](plans/INDEX.md), and build and test guidance in
+[development](docs/development.md). Read source for implementation details
 
 ## Build from source
 

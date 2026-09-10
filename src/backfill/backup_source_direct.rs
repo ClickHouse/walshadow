@@ -6,7 +6,7 @@
 //! Single-pass: seed the page-walk
 //! [`CatalogMap`](crate::backfill::backup_page_walk::CatalogMap) from source PG
 //! before this runs so all routing decisions are known when bytes land.
-//! See [plans/bootstrap.md](../plans/bootstrap.md).
+//! See [architecture/bootstrap.md](../../architecture/bootstrap.md).
 
 use std::path::PathBuf;
 use std::sync::Arc;

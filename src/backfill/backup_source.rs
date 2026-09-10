@@ -1,6 +1,6 @@
 //! File-streaming backup-source trait. A base backup is a stream of
 //! files with cluster-relative paths, regardless of wire encoding.
-//! See [plans/bootstrap.md](../plans/bootstrap.md).
+//! See [architecture/bootstrap.md](../../architecture/bootstrap.md).
 //!
 //! Production impls: [`crate::backfill::backup_source_direct::DirectSource`]
 //! (replication protocol) and

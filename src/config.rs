@@ -4,7 +4,7 @@
 //!
 //! Precedence, highest wins: **CLI flag > `<schema>.config_*` PG row > TOML**.
 //! The PG-row layer (the runtime-config overlay,
-//! [plans/future/runtime_config_from_pg.md]) is typed in-memory state
+//! [configuration](../docs/configuration.md)) is typed in-memory state
 //! ([`crate::runtime_config::ConfigOverlay`]) seeded at boot from source PG and
 //! mutated live by [`ConfigResolver::apply_config_event`] as config-table WAL
 //! writes drain at their commit LSN. `resolve` is the single merge point.

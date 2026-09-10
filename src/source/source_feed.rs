@@ -65,8 +65,7 @@ pub fn is_wal_segment_removed(err: &anyhow::Error) -> bool {
 
 /// Why a named slot cannot carry the resume position. Walshadow creates no slot
 /// it was not booted with, so both are the operator's to fix: the promotion
-/// target owns its slot and `[source] slot` names it (plans/failover.md
-/// §Operator protocol).
+/// target owns its slot and `[source] slot` names it, see docs/failover.md
 #[derive(Debug, thiserror::Error)]
 pub enum SlotError {
     #[error("no physical replication slot {slot:?} on the source{}", match kind {

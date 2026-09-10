@@ -49,7 +49,7 @@
 //!
 //! PG `heap_insert`/`heap_update` set `REGBUF_KEEP_DATA` under
 //! `RelationIsLogicallyLogged(rel)` (holds at `wal_level=logical`,
-//! walshadow's hard floor, PLAN.md "Pitfalls/wal_level on source"). With
+//! walshadow's source requirement, see docs/limitations.md). With
 //! `KEEP_DATA` tuple bytes are always in `block.data`, even when an FPI
 //! replaces the page at recovery (`heap_xlog_insert`). Decoder reads tuple
 //! bytes off `block.data` exclusively; FPI-restore lives in [`crate::decode::fpi`]

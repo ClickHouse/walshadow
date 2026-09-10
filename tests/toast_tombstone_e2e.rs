@@ -1,4 +1,4 @@
-//! TOAST tombstone + mirror lifecycle end-to-end (`plans/TOAST.md`):
+//! TOAST tombstone + mirror lifecycle end-to-end (`architecture/values.md`):
 //! source PG → walshadow pipeline → TID-keyed CH mirror. No GC task, no
 //! tracker: a chunk DELETE lands as a tombstone row, reclamation is
 //! ReplacingMergeTree merge behavior, fetch is per-TID as-of state.

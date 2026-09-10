@@ -1,5 +1,5 @@
-//! Rewrite-generation + commit-time stash end-to-end (`plans/TOAST.md`
-//! phase 3): records on filenodes invisible at record time stash raw in the
+//! Rewrite-generation + commit-time stash end-to-end (`architecture/values.md`):
+//! records on filenodes invisible at record time stash raw in the
 //! xact spill, resolve at commit via `relation_at(rfn, commit_lsn)`, decode
 //! against the surviving toast rel, and close each marker-proven generation
 //! with residual `O - B` tombstones — never a mirror truncate.

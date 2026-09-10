@@ -3,8 +3,8 @@
 //! per table; `'base_backup'` / `'object_store'` coalesce into one
 //! [`crate::backfill::backup_backfill`] pass per mode, loading per-rel staging tables
 //! that publish via `EXCHANGE TABLES` + live-window copy-back on success
-//! ([`crate::backfill::backfill_staging`], plans/add_table.md §Staging swap)
-//! (plans/future/runtime_config_from_pg.md §Per-table opt-in).
+//! ([`crate::backfill::backfill_staging`], architecture/bootstrap.md)
+//! (docs/configuration.md).
 //!
 //! ## COPY mode
 //!
@@ -33,7 +33,7 @@
 //! exact `NumericKind::Finite` form); every out-of-matrix type also selects
 //! as `::text` and ships as [`ColumnValue::PgPendingText`], so the oracle
 //! converts it through `typinput` exactly as it does a WAL-path default
-//! (plans/oracle.md).
+//! (architecture/values.md).
 //!
 //! ## Resume ledger
 //!
@@ -115,7 +115,7 @@ struct LedgerEntry {
     /// [`InitialLoadMode`] string; absent ⇒ `copy`
     #[serde(default = "default_ledger_mode")]
     mode: String,
-    /// Backup-mode staging swap phase (plans/add_table.md §Staging swap):
+    /// Backup-mode staging swap phase (architecture/bootstrap.md):
     /// pass rows durable, `EXCHANGE TABLES` issued or about to be — boot
     /// resumes the swap tail (copy-back + drop) instead of re-loading
     #[serde(default)]
@@ -767,7 +767,7 @@ impl CopyBackfiller {
         self.refresh_gauges(&inner.ledger);
     }
 
-    /// Staged pass (plans/add_table.md §Staging swap): rows land in per-rel
+    /// Staged pass (architecture/bootstrap.md): rows land in per-rel
     /// staging tables, success publishes each rel via EXCHANGE + copy-back.
     /// Per-rel ledger transitions ride [`Self::publish_staged`]; this frame
     /// only reports the load itself.

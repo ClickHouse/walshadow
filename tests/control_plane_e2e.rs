@@ -655,7 +655,7 @@ const SIBLING_PORT: u16 = 5435;
 /// `Latest checkpoint location` from a stopped cluster's `pg_control`. Fast
 /// shutdown writes its checkpoint last, so this is the primary's final durable
 /// record and what the promotion target must have replayed
-/// (plans/failover.md §Operator protocol).
+/// (architecture/recovery.md).
 fn controldata_checkpoint_lsn(data_dir: &Path) -> Result<u64> {
     let out = Command::new("pg_controldata")
         .args(["-D", data_dir.to_str().unwrap()])
@@ -1099,7 +1099,7 @@ async fn pause_apply_resume_reroutes_backlog_whole() {
 }
 
 /// Pause must publish the frontier it froze, so a promotion decision reads a
-/// value that cannot move under it (plans/failover.md §Surfaces).
+/// value that cannot move under it (architecture/recovery.md).
 /// `pause_consumed_lsn` is what resume asks the promoted target to
 /// serve; `pause_received_lsn` is the source head the target must reach first.
 /// Both stay put while the pipeline keeps draining behind them
@@ -1176,7 +1176,7 @@ fn email_of(id: u32) -> String {
     format!("SELECT argMax(email, _lsn) FROM demo.users WHERE _is_deleted = 0 AND id = {id}")
 }
 
-/// Steps 2 to 7 of plans/failover.md §Operator protocol against standby
+/// Steps 2 to 7 of architecture/recovery.md against standby
 /// `target`, leaving the pump to cross the fork on its own. Row id 2 commits
 /// below the fork while walshadow is paused, so the drain from the frozen
 /// frontier to `F` owes it to ClickHouse
@@ -1315,7 +1315,7 @@ fn promote(target: &Shadow) -> Result<()> {
     Ok(())
 }
 
-/// Operator-driven switchover, plans/failover.md §Operator protocol, on a
+/// Operator-driven switchover, architecture/recovery.md, on a
 /// slotless run: pause, stop writes with `-m fast`, prove the target holds the
 /// whole tail, repoint `[source]` while it is still a standby, promote, resume.
 /// Walshadow must drain the ancestor timeline to the fork, cross to the
@@ -1403,7 +1403,7 @@ async fn switchover_crosses_fork_and_keeps_every_row() {
 }
 
 /// A crossing has to survive a restart, on both sides of the fork
-/// (plans/failover.md §Crossing order). Same drill as
+/// (architecture/recovery.md). Same drill as
 /// `switchover_crosses_fork_and_keeps_every_row`, then two restarts:
 ///
 /// - floor at the fork segment's start, which the barrier commits on the
@@ -1556,7 +1556,7 @@ async fn restart_after_switchover_resumes_on_both_sides_of_the_fork() {
 /// descendant, so nothing walks the ancestor to its end — the shadow keeps
 /// replaying a branch no walsender will finish for it, and no history file ever
 /// places the descendant it has to move to
-/// (plans/failover.md §Lineage)
+/// (architecture/recovery.md)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn restart_between_promotion_and_crossing_still_crosses() {
     if !gated() {
@@ -1626,7 +1626,7 @@ async fn restart_between_promotion_and_crossing_still_crosses() {
 /// repoint made, walshadow already holds a connection to the target, so it can
 /// report the target's replay and receive positions beside the frozen frontier
 /// they have to reach, plus one ready / not-ready that names the failing term
-/// (plans/failover.md §Operator protocol)
+/// (architecture/recovery.md)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn status_answers_the_promotion_gate_before_the_promotion() {
     if !gated() {
@@ -1731,7 +1731,7 @@ async fn status_answers_the_promotion_gate_before_the_promotion() {
 /// Restart while paused below the fork, which is where the operator takes the
 /// promotion decision. The pause survives, the frontier re-freezes rather than
 /// coming back stale, and `ctl status` says so — the pair read before the
-/// restart has to be read again (plans/failover.md §What pause freezes)
+/// restart has to be read again (architecture/recovery.md)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn restart_while_paused_refreezes_the_frontier_and_still_crosses() {
     if !gated() {
@@ -1810,7 +1810,7 @@ async fn restart_while_paused_refreezes_the_frontier_and_still_crosses() {
 /// Restart inside the barrier: the crossing has proved the fork and is waiting
 /// for the pipeline to reach it, so nothing durable names the descendant yet.
 /// The restart has to come back on the ancestor, re-cross, and arrive at the
-/// same barrier (plans/failover.md §Barrier)
+/// same barrier (architecture/recovery.md)
 ///
 /// The barrier is held open by pausing the shadow's replay, which is one of its
 /// three terms. Restarting restarts the shadow too, which clears the pause, so
@@ -1898,7 +1898,7 @@ async fn restart_inside_the_fork_barrier_recrosses_and_converges() {
 /// on the descendant while the shadow still sits at `F` on the ancestor. Boot
 /// has to re-advertise the switchpoint the crossing never delivered, and the
 /// shadow has to cross on that seeded list alone
-/// (plans/failover.md §Crossing)
+/// (architecture/recovery.md)
 ///
 /// A shadow told about the descendant crosses on its own within milliseconds of
 /// the commit, so the window is held open rather than raced for: recovery is
@@ -1996,7 +1996,7 @@ async fn restart_between_the_commit_and_the_advertise_crosses_on_the_seeded_list
 /// head and calling that continuation successful. A slot the target does not
 /// have refuses the repoint by name, and one that goes missing between the
 /// repoint and the fork parks the crossing instead of exiting the daemon into a
-/// restart loop (plans/failover.md §Refusals)
+/// restart loop (architecture/recovery.md)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn slot_proofs_name_the_missing_slot_and_park_the_crossing() {
     if !gated() {
@@ -2132,7 +2132,7 @@ async fn slot_proofs_name_the_missing_slot_and_park_the_crossing() {
 /// the source forked. The reconnect has to notice on its own: same cluster,
 /// live timeline newer than the one being read, the read branch still serving
 /// the resume LSN, so it asks for that branch and lets the walsender end it at
-/// the fork (plans/failover.md §Operator protocol)
+/// the fork (architecture/recovery.md)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn promotion_under_a_stable_endpoint_crosses_without_a_repoint() {
     if !gated() {
@@ -2241,7 +2241,7 @@ fn take_over_source_address(h: &Harness, target: &Shadow) -> Result<Shadow> {
 /// Timeline numbers are not unique across branches: two standbys of one primary,
 /// promoted independently, are both timeline 2 under one system identifier. The
 /// chain places either of them, so only where the branch begins separates the
-/// one walshadow crossed onto from its sibling (plans/failover.md §Lineage)
+/// one walshadow crossed onto from its sibling (architecture/recovery.md)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_sibling_timeline_two_is_refused_against_its_switchpoint() {
     if !gated() {

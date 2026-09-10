@@ -47,6 +47,11 @@ Watch:
 - pending backfills
 - timeline crossing and endpoint swap failures
 
+Alert on sustained failure to advance, not just process availability. Shadow
+replay lag measures catalog progress; ClickHouse acknowledgement backlog measures
+destination progress. Either can stall while daemon still answers status requests
+Choose thresholds from workload's normal lag and retained-WAL budget
+
 Grafana reads walshadow metrics only. It does not connect to source or
 ClickHouse
 
@@ -84,6 +89,14 @@ Normal stop and start resumes from persisted manifest. Keep together:
 - filtered WAL directory
 - spill directory and manifests
 - config and fragment directory
+
+Keep descriptor history, backfill ledgers, and deferred TOAST retirement state
+alongside manifest. Do not clean spill directory wholesale between starts
+Daemon removes transient transaction spill itself and reconstructs it from WAL
+
+Filtered-WAL cleanup also preserves shadow restartpoint. Do not delete segments
+solely because current replay position is newer; restarted shadow may still
+need them. Disabling configured retention leaves filtered segments on disk
 
 Do not reuse state against unrelated PostgreSQL cluster. Source system-ID
 mismatch fails startup
@@ -124,6 +137,10 @@ retry budget expires, daemon exits and relies on process supervisor restart
 Restart replays from durable floor, and generated `ReplacingMergeTree` tables
 converge duplicate row versions by `_lsn`
 
+An outage can grow source slot retention, local filtered WAL, and spill usage
+Monitor all three alongside destination backlog. If required source WAL is lost,
+recovery needs retained archive coverage or a fresh baseline
+
 If ClickHouse remains unavailable:
 
 1. Keep source WAL available through slot or archive
@@ -131,6 +148,26 @@ If ClickHouse remains unavailable:
 3. Restart walshadow if supervisor stopped retrying
 4. Confirm `emitter_ack` advances
 5. Confirm lag returns toward zero
+
+## Managed shadow
+
+Keep shadow in recovery. Do not promote it, vacuum it locally, or write into its
+catalogs. Source catalog vacuum and maintenance arrive through filtered WAL
+Shadow is not a data-bearing source replica
+
+Shadow's replication connection to walshadow requires a live stream for catalog
+boundary capture; archive files provide recovery fallback, not an equivalent
+startup mode. Keep connection timeout enabled and investigate attachment failure
+instead of bypassing it
+
+Walshadow's shadow-facing sender currently trusts its client and lacks TLS/SCRAM
+Keep that listener on loopback or an otherwise isolated local deployment
+Source PostgreSQL and ClickHouse connection security are separate settings
+
+Avoid long-running diagnostic queries on shadow. Sender ignores hot-standby
+feedback, so query conflicts can still be canceled by recovery. Type conversion
+pins output settings, but matching extension and timezone-data versions remains
+a deployment responsibility
 
 ## Common startup failures
 

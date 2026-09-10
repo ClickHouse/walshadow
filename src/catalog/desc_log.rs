@@ -63,12 +63,7 @@
 //! `(db_node, rel_node)` alone can alias two live relations after OID
 //! wraparound. Capture resolves the `pg_class.reltablespace` 0 sentinel to
 //! the database's `dattablespace`, so stored rfns compare directly against
-//! WAL locators' physical spcOid. See `plans/future/TABLESPACES.md` §0.
-//!
-//! Known scope debt: an interval fences its whole span, so DML that
-//! provably postdates the layout change inside it still fails closed.
-//! Per-record fidelity needs an intra-xact descriptor timeline —
-//! `plans/future/descriptor_timeline.md`.
+//! WAL locators' physical spcOid. See `plans/tablespaces.md`
 
 use std::collections::BTreeMap;
 use std::io::SeekFrom;

@@ -174,7 +174,7 @@ impl TimelineHistory {
     /// Coarser than [`tli_of_point`](Self::tli_of_point), and the resolution a
     /// resume position needs: a crossing commits the fork segment's start as
     /// the floor, which sits below the fork itself yet on the descendant
-    /// (plans/failover.md §Crossing order).
+    /// (architecture/recovery.md).
     pub fn tli_of_segment(&self, lsn: u64, seg_size: u64) -> Option<u32> {
         let seg = lsn / seg_size;
         self.entries
