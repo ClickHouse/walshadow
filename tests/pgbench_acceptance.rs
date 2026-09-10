@@ -11,12 +11,12 @@
 //! 3. spawn CH + pre-create dest tables ReplacingMergeTree(_lsn)
 //! 4. spawn walshadow-stream `--bootstrap-mode=direct
 //!    --bootstrap-shadow-data-dir` against four-table CH config
-//! 5. await bootstrap (metrics endpoint up) → assert row counts match
-//! 6. `pgbench -T 30 -c 4 -j 2` in background; at +10s ADD COLUMN c
+//! 5. await bootstrap row counts and emitter ack before starting workload
+//! 6. `pgbench -T 6 -c 4 -j 2` in background; at +2s ADD COLUMN c
 //!    int DEFAULT 7 on pgbench_accounts (item 1 read-time defaults);
-//!    at +20s CREATE INDEX CONCURRENTLY on pgbench_history (catalog-
+//!    at +4s CREATE INDEX CONCURRENTLY on pgbench_history (catalog-
 //!    cache + non-blocking-DDL exercise)
-//! 7. await pgbench exit; drain via `pg_switch_wal` + `--max-segments=1`
+//! 7. await pgbench exit; drain via `pg_switch_wal` + emitter ack
 //! 8. parity oracle: count + sum + `c` column for accounts
 //!
 //! Skipped silently when `initdb`, `pg_basebackup`, `clickhouse`, or
@@ -290,8 +290,7 @@ async fn run_ddl_intermix(
     let spill_dir = tmp.path().join("spill");
     fs::create_dir_all(&spill_dir).unwrap();
 
-    // 7. Spawn walshadow-stream. `--max-segments=1` gates clean exit
-    //    once we trigger `pg_switch_wal` post-workload.
+    // 7. Spawn walshadow-stream
     let bin = env!("CARGO_BIN_EXE_walshadow-stream");
     let stderr_path = tmp.path().join("daemon.stderr.log");
     let stderr_file = fs::File::create(&stderr_path).expect("open daemon stderr log");
@@ -413,6 +412,14 @@ async fn run_ddl_intermix(
                 std::thread::sleep(Duration::from_millis(300));
             }
         }
+
+        // DDL during bootstrap is unsupported, row counts can converge before window replay finishes
+        let bootstrap_lsn = walshadow::pg::parse_pg_lsn(&psql_source(
+            &source,
+            "SELECT pg_current_wal_lsn()::text",
+        )?)?;
+        wait_for_ack_catchup(metrics_addr, bootstrap_lsn, Duration::from_secs(120))
+            .context("bootstrap emitter ack catchup")?;
 
         // 10. Background pgbench workload. -T 6 wallclock keeps the
         //     test seconds-scale while still exercising thousands of

@@ -787,3 +787,23 @@ pub fn assert_ch_matches_source(
     }
     Ok(())
 }
+
+/// Poll for parity, startup ack can precede CH writes
+pub fn wait_ch_matches_source(
+    ch: &ChServer,
+    source: &Shadow,
+    src_table: &str,
+    ch_table: &str,
+    timeout: Duration,
+) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let parity = assert_ch_matches_source(ch, source, src_table, ch_table);
+        if parity.is_ok() || Instant::now() >= deadline {
+            return parity.with_context(|| {
+                format!("{ch_table} never converged with {src_table} in {timeout:?}")
+            });
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
