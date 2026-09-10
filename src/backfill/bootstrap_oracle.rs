@@ -402,6 +402,26 @@ mod tests {
         assert!(!needs_oracle(&catalog, &Arc::default(), &rules));
     }
 
+    #[test]
+    fn invalid_target_needs_oracle() {
+        let rules = ColumnRules::default();
+        let desc = rel(vec![attr(1, "id", INT4OID, "int4", 4)]);
+        let (catalog, mut tables) = bridged(desc.clone(), &rules);
+        let mapping = Arc::make_mut(&mut tables).get_mut(&desc.rel_name).unwrap();
+        mapping.columns[0].target_type = "NotAType".into();
+        assert!(
+            TablePlan::build(
+                Allocator::stdlib(),
+                &desc,
+                mapping,
+                &rules,
+                &SystemColumns::default(),
+            )
+            .is_err()
+        );
+        assert!(needs_oracle(&catalog, &tables, &rules));
+    }
+
     const DUMP: &str = "\
 --
 -- PostgreSQL database dump
@@ -475,9 +495,60 @@ CREATE TABLE public.app (
     #[test]
     fn filter_keeps_extensions_not_in_the_excluded_set() {
         let out = filter_out_extensions(DUMP, &["some_other_ext".to_string()]);
-        assert!(
-            out.contains("pg_clickhouse"),
-            "unrelated exclusion is a no-op"
-        );
+        assert_eq!(out, DUMP);
+    }
+
+    #[test]
+    fn filter_extension_entries() {
+        for (meta, sql, dropped) in [
+            ("stub; Type: EXTENSION", "CREATE EXTENSION stub;", true),
+            ("keep; Type: EXTENSION", "CREATE EXTENSION keep;", false),
+            (
+                "EXTENSION stub; Type: COMMENT",
+                "COMMENT ON EXTENSION stub IS 'stub';",
+                true,
+            ),
+            (
+                "EXTENSION keep; Type: COMMENT",
+                "COMMENT ON EXTENSION keep IS 'keep';",
+                false,
+            ),
+            (
+                "stub; Type: COMMENT",
+                "COMMENT ON TABLE stub IS 'stub';",
+                false,
+            ),
+            (
+                "f(); Type: FUNCTION",
+                "  ALTER EXTENSION \"stub\" ADD FUNCTION f();",
+                true,
+            ),
+            (
+                "f(); Type: FUNCTION",
+                "ALTER EXTENSION keep ADD FUNCTION f();",
+                false,
+            ),
+            ("stub; Type: TABLE", "CREATE TABLE stub (id int);", false),
+        ] {
+            let entry = format!("--\n-- Name: {meta}; Schema: public; Owner: -\n--\n{sql}\n");
+            let settings = "  SET default_table_access_method = heap;\n";
+            let tail = "--\n-- Name: app; Type: TABLE; Schema: public; Owner: -\n--\nCREATE TABLE app (id int);\n";
+            for prefix in [
+                "",
+                "-- PostgreSQL database dump\nSET statement_timeout = 0;\n",
+            ] {
+                let dump = format!("{prefix}{entry}{settings}{tail}");
+                let expected = if dropped {
+                    format!("{prefix}{settings}{tail}")
+                } else {
+                    dump.clone()
+                };
+                assert_eq!(
+                    filter_out_extensions(&dump, &["stub".into()]),
+                    expected,
+                    "{meta}"
+                );
+            }
+        }
     }
 }
