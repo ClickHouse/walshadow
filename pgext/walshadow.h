@@ -57,9 +57,9 @@ typedef struct WsScanStats
 	 * Whole-catalog scans error on an unresolvable writer instead. A committed
 	 * read owns no transaction, so nothing lands here */
 	uint32		subtrans_mismatch;
+	/* projection width, ie values per row the scan appended */
+	int			ncols;
 } WsScanStats;
-
-extern int	ws_overlay_ncols(WsCatalog cat);
 
 /*
  * `top` invalid reads the committed view; an empty `oids` reads the whole

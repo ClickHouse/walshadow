@@ -79,8 +79,6 @@ ws_cell_errcontext(void *arg)
 {
 	WsCellContext *ctx = (WsCellContext *) arg;
 
-	if (ctx->col == NULL)
-		return;
 	errcontext("walshadow oracle column %u (\"%.*s\"), row %u, source type %u",
 			   ctx->col_index, ctx->col->name_len, ctx->col->name,
 			   ctx->row, ctx->col->source_oid);
@@ -120,11 +118,8 @@ ws_reconstruct_datum(const WsNativeCol *col, const char *body, uint32 len)
 		s[len] = '\0';
 		return PointerGetDatum(s);
 	}
-	if (col->typlen <= 0)
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("non-positive typlen %d for oid %u",
-						col->typlen, col->source_oid)));
+	/* pg_type has no typlen 0, and -1/-2 are handled above */
+	Assert(col->typlen > 0);
 	if (len < (uint32) col->typlen)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
@@ -368,6 +363,8 @@ ws_handle_encode_native(StringInfo req, StringInfo resp)
 	/* CH forbids Nullable(Array) and Nullable(Map), default both to empty */
 	pgch_writer_set_null_array(w, PGCH_NULL_ARRAY_EMPTY);
 
+	/* n_cols is non-zero, so the callback always has a column to name */
+	cellctx.col = &cols[0];
 	errcb.callback = ws_cell_errcontext;
 	errcb.arg = &cellctx;
 	errcb.previous = error_context_stack;
@@ -398,11 +395,8 @@ ws_handle_encode_native(StringInfo req, StringInfo resp)
 	pgch_checkpoint_free(&checkpoint);
 	error_context_stack = errcb.previous;
 
-	if (pgch_writer_rows(w) != n_rows)
-		ereport(ERROR,
-				(errcode(ERRCODE_INTERNAL_ERROR),
-				 errmsg("walshadow oracle wrote %zu rows, expected %u",
-						pgch_writer_rows(w), n_rows)));
+	/* One value per cell, so the loop above is the row count */
+	Assert(pgch_writer_rows(w) == n_rows);
 
 	/* Block occupies response remainder */
 	pq_sendbyte(resp, WS_STATUS_OK);

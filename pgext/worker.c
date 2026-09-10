@@ -70,8 +70,9 @@ static char ws_bound_path[MAXPGPATH];
 static void
 ws_unlink_socket(int code, Datum arg)
 {
-	if (ws_bound_path[0] != '\0')
-		(void) unlink(ws_bound_path);
+	/* registered once the path is bound, so there is always one */
+	Assert(ws_bound_path[0] != '\0');
+	(void) unlink(ws_bound_path);
 }
 
 /*
@@ -96,6 +97,10 @@ ws_reject_non_socket(const char *path)
 /*
  * A live listener on the same path is another cluster's worker and taking it
  * over would silently answer that daemon's requests from the wrong catalog.
+ *
+ * Only a refused connect and an absent path prove nobody is listening. Any
+ * other failure says nothing about the peer, and unlinking on it would be the
+ * takeover this check exists to prevent.
  */
 static bool
 ws_path_has_listener(const char *path)
@@ -111,7 +116,10 @@ ws_path_has_listener(const char *path)
 	memset(&addr, 0, sizeof(addr));
 	addr.sun_family = AF_UNIX;
 	strlcpy(addr.sun_path, path, sizeof(addr.sun_path));
-	alive = connect(fd, (struct sockaddr *) &addr, sizeof(addr)) == 0;
+	if (connect(fd, (struct sockaddr *) &addr, sizeof(addr)) == 0)
+		alive = true;
+	else
+		alive = errno != ECONNREFUSED && errno != ENOENT;
 	closesocket(fd);
 	return alive;
 }
@@ -147,7 +155,10 @@ ws_listen(const char *path)
 	strlcpy(addr.sun_path, path, sizeof(addr.sun_path));
 	if (bind(fd, (struct sockaddr *) &addr, sizeof(addr)) < 0)
 	{
+		int			bind_errno = errno;
+
 		closesocket(fd);
+		errno = bind_errno;		/* close reports its own, bind's is the news */
 		ereport(ERROR,
 				(errcode_for_socket_access(),
 				 errmsg("walshadow: could not bind \"%s\": %m", path)));
@@ -313,7 +324,6 @@ ws_handle_scan(StringInfo req, StringInfo resp)
 	WsCatalog	cat = (WsCatalog) pq_getmsgbyte(req);
 	TransactionId top = (TransactionId) pq_getmsgint(req, 4);
 	uint32		noids = pq_getmsgint(req, 4);
-	int			ncols = ws_overlay_ncols(cat);
 	Oid		   *oids = NULL;
 	StringInfoData rows;
 	WsScanStats stats = {0, 0, 0};
@@ -321,10 +331,6 @@ ws_handle_scan(StringInfo req, StringInfo resp)
 	uint64		lsn_end;
 	uint32		i;
 
-	if (ncols < 0)
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("unknown walshadow catalog id %d", (int) cat)));
 	if (noids > WS_MAX_SCAN_OIDS)
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
@@ -354,7 +360,7 @@ ws_handle_scan(StringInfo req, StringInfo resp)
 	pq_sendint32(resp, stats.scanned);
 	pq_sendint32(resp, stats.subtrans_mismatch);
 	pq_sendint32(resp, stats.emitted);
-	pq_sendint16(resp, (uint16) ncols);
+	pq_sendint16(resp, (uint16) stats.ncols);
 	pq_sendbytes(resp, rows.data, rows.len);
 }
 
@@ -608,8 +614,9 @@ ws_serve_loop(pgsocket listen_fd)
 		 * array, so any other ready position from this round is stale; they
 		 * stay readable and are picked up next time round.
 		 */
-		if (serve >= 0 && serve < nconns)
+		if (serve >= 0)
 		{
+			Assert(serve < nconns);
 			pgstat_report_activity(STATE_RUNNING, "walshadow request");
 			if (!ws_serve_request(conns[serve]))
 				ws_drop_conn(conns, &nconns, serve);
@@ -719,7 +726,7 @@ _PG_init(void)
 
 	MarkGUCPrefixReserved("walshadow");
 
-	if (ws_socket_path == NULL || ws_socket_path[0] == '\0')
+	if (ws_socket_path[0] == '\0')
 		return;
 
 	memset(&worker, 0, sizeof(worker));
