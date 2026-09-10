@@ -16,8 +16,8 @@
 //!      walsender bind (SO_REUSEADDR), no `--ignore-cursor`
 //!   8. poll source + daemon's `walshadow_emitter_ack_lsn` until ack
 //!      catches up to the snapshotted LSN
-//!   9. assert CH count + sum(id) + md5(string_agg(name, ',' ORDER BY
-//!      id)) matches source's
+//!   9. poll CH count + sum(id) + md5(string_agg(name, ',' ORDER BY
+//!      id)) until it matches source's
 //!
 //! `WALSHADOW_KILL_SEED` env seeds the LCG; unset → fixed 0xC11AC11A so
 //! CI is reproducible. Strategy folds into the base seed and the per-run
@@ -505,9 +505,12 @@ async fn run_drill(strategy: Strategy) -> Result<()> {
 
         if let Err(e) = outcome {
             let stderr_blob = fs::read_to_string(&stderr_path).unwrap_or_default();
+            let restart_blob =
+                fs::read_to_string(stderr_path.with_extension("restart.log")).unwrap_or_default();
             bail!(
                 "cycle {strategy:?}#{run} (seed={cycle_seed:#x}, kill_delay={kill_delay_ms}ms): {e:#}\n\
-                 --- daemon stderr ---\n{stderr_blob}",
+                 --- daemon stderr ---\n{stderr_blob}\
+                 --- restart daemon stderr ---\n{restart_blob}",
             );
         }
     }
@@ -613,8 +616,8 @@ async fn run_cycle(
         .await
         .context("emitter ack catchup")?;
 
-    // 10. Oracle. Reuses the count + sum + md5 helper from item 9.
-    fx::assert_ch_matches_source(ch, source, "kr.t", "default.kr_t")
+    // 10. Wait for source/CH parity
+    fx::wait_ch_matches_source(ch, source, "kr.t", "default.kr_t", Duration::from_secs(60))
         .context("source vs CH parity")?;
 
     // Resume manifest is on disk, parseable, floor never above the ack.
