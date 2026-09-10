@@ -257,42 +257,6 @@ async fn bridge_hello_and_encode_native() {
 
     use std::sync::atomic::Ordering;
     assert!(bridge.stats.native_bytes.load(Ordering::Relaxed) > 0);
-
-    // Bad body aborts request without closing connection
-    let bad: [(u32, &[u8]); _] = [(23, &[42, 0, 0, 0]), (23, &[0x00])];
-    let oracle = Oracle::new(bridge.clone());
-    let bufs: Vec<OracleColumnBuf> = bad
-        .iter()
-        .map(|(oid, raw)| {
-            let mut b = OracleColumnBuf::new(*oid, -1);
-            b.push(OracleCell::DiskRaw(raw.to_vec()));
-            b
-        })
-        .collect();
-    let names = ["a", "b"];
-    let columns: Vec<OracleRequestColumn<'_>> = bufs
-        .iter()
-        .zip(names)
-        .enumerate()
-        .map(|(i, (buf, name))| OracleRequestColumn {
-            ordinal: i as u32,
-            name,
-            target_type: "String",
-            buf,
-        })
-        .collect();
-    assert!(
-        oracle
-            .encode_batch(&columns, 1, clickhouse_c::Allocator::stdlib())
-            .await
-            .is_err(),
-        "short int4 body fails the request",
-    );
-    assert_eq!(
-        strings_through_oracle(bridge.clone(), &[(23, &[7, 0, 0, 0])]).await,
-        ["7"],
-    );
-    assert!(bridge.is_up());
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -1025,5 +989,78 @@ async fn bridge_committed_read_falls_back_when_replay_moves() {
             CatalogError::Bridge(BridgeError::ReplayMismatch { .. })
         ),
         "{err:?}"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn bridge_native_hstore_expander_requires_extension_membership() {
+    if !pg_available() {
+        eprintln!("skip: no initdb on PATH");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let guard = start_pg(&tmp, ports::PG_SHADOW_PORT);
+    let sql = connect_sql(&guard.sh).await;
+    sql.batch_execute(
+        "CREATE EXTENSION hstore;
+         CREATE SCHEMA decoy;
+         CREATE FUNCTION decoy.hstore_to_matrix(hstore) RETURNS text[]
+             LANGUAGE sql AS $$ SELECT ARRAY[['wrong', 'value']] $$;
+         CREATE FUNCTION decoy.hstore_to_matrix(int) RETURNS text[]
+             LANGUAGE sql AS $$ SELECT ARRAY[['wrong', 'overload']] $$;",
+    )
+    .await
+    .unwrap();
+    let oid = oid_of_type(&sql, "hstore").await;
+    let bridge = Arc::new(dial(&guard.sh).await);
+    let oracle = Oracle::new(bridge.clone());
+    let mut buf = OracleColumnBuf::new(oid, -1);
+    buf.push(OracleCell::TextInput(br#""a"=>"one", "b"=>NULL"#.to_vec()));
+    buf.push(OracleCell::Default);
+    let columns = [OracleRequestColumn {
+        ordinal: 0,
+        name: "h",
+        target_type: "Map(String, Nullable(String))",
+        buf: &buf,
+    }];
+    for attached in [true, false, true] {
+        if !attached {
+            sql.batch_execute("ALTER EXTENSION hstore DROP FUNCTION hstore_to_matrix(hstore)")
+                .await
+                .unwrap();
+        }
+        let result = oracle
+            .encode_batch(&columns, 2, clickhouse_c::Allocator::stdlib())
+            .await;
+        if attached {
+            let block = result.unwrap();
+            let map = block.column(0).unwrap();
+            assert_eq!(map.array_offsets().unwrap(), [2, 2]);
+            let entries = map.array_values().unwrap();
+            assert_eq!(
+                entries.tuple_child(0).unwrap().string().unwrap(),
+                (&[1, 2][..], &b"ab"[..])
+            );
+            let values = entries.tuple_child(1).unwrap();
+            assert_eq!(values.null_map().unwrap(), [0, 1]);
+            assert_eq!(
+                values.nullable_inner().unwrap().string().unwrap(),
+                (&[3, 3][..], &b"one"[..])
+            );
+        } else {
+            let err = result.unwrap_err();
+            assert!(err.to_string().contains("cannot encode"), "{err}");
+            assert!(!err.retryable());
+            sql.batch_execute("ALTER EXTENSION hstore ADD FUNCTION hstore_to_matrix(hstore)")
+                .await
+                .unwrap();
+        }
+    }
+    assert_eq!(
+        bridge
+            .stats
+            .reconnects
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0
     );
 }

@@ -957,4 +957,35 @@ mod tests {
         fs::write(data_dir.join("PG_VERSION"), b"17\n").unwrap();
         assert!(shadow.data_dir_initialized());
     }
+
+    fn stub_bin(path: &Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::write(path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// Unreadable running settings must not read as an unraised floor: a
+    /// resume there would shut a shadow down for an operator's pause
+    #[test]
+    fn resume_propagates_failed_settings_probe() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        stub_bin(
+            &bin.join("psql"),
+            "case \"$*\" in *current_setting*) exit 1;; esac\necho paused",
+        );
+        stub_bin(
+            &bin.join("pg_controldata"),
+            "echo 'max_connections setting: 500'\n\
+             echo 'max_worker_processes setting: 16'\n\
+             echo 'max_wal_senders setting: 12'\n\
+             echo 'max_prepared_xacts setting: 2'\n\
+             echo 'max_locks_per_xact setting: 128'",
+        );
+        let mut cfg = ShadowConfig::new(tmp.path().join("data"), tmp.path().join("filtered"));
+        cfg.pg_bin_dir = Some(bin);
+        let err = Shadow::new(cfg).try_pg_wal_replay_resume().unwrap_err();
+        assert!(matches!(err, ShadowError::Process { .. }), "{err}");
+    }
 }

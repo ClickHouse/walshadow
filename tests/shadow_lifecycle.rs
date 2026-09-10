@@ -3,21 +3,26 @@
 //! Skipped silently if `initdb` is not on `$PATH` (CI sandboxes
 //! without PG, etc.). Run locally against any installed PG ≥ 12.
 //!
-//! Two scenarios:
+//! Three scenarios:
 //!
 //! 1. `normal_mode_lifecycle` — initdb → start (no recovery signal) →
 //!    probe in-recovery false, `pg_class` populated → stop.
 //! 2. `standby_mode_lifecycle` — initdb → start normal → stop →
 //!    write standby.signal → start_with_floor_retry → wait for replay LSN
 //!    → probe in-recovery true → stop.
+//! 3. `guc_floor_pause_resumes_then_restarts` — raise a GUC on one cluster,
+//!    replay that WAL into a pre-raise copy → replay pauses → resume for the
+//!    floor → restart on the raised value → operator pause holds.
 
 #[path = "common/ports.rs"]
 mod ports;
 
+use std::path::Path;
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use walshadow::shadow::{Shadow, ShadowConfig};
+use walrus::pg::wal::segment::is_wal_filename;
+use walshadow::shadow::{ResumeOutcome, Shadow, ShadowConfig, SourceGucFloor};
 
 fn pg_available() -> bool {
     Command::new("initdb")
@@ -163,6 +168,102 @@ fn restore_command_filename_is_segment_relative() {
     assert!(tmp.path().join("data/standby.signal").exists());
 }
 
+/// PG pauses hot standby when a replayed `XLOG_PARAMETER_CHANGE` names a value
+/// above the running one, and shuts down once that pause is lifted. Producing
+/// the record needs a cluster that raises the value and a copy of that cluster
+/// from before the raise to replay it
+#[test]
+fn guc_floor_pause_resumes_then_restarts() {
+    if !pg_available() {
+        eprintln!("skip: no initdb on PATH");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let shadow = make_shadow(&tmp, ports::PG_SHADOW_PORT);
+    let data = tmp.path().join("data");
+    let pre_raise = tmp.path().join("pre-raise");
+
+    let low = SourceGucFloor::default();
+    shadow.initdb().expect("initdb");
+    shadow.materialize_conf(&low, None).expect("conf (low)");
+    shadow.start().expect("start (low)");
+    shadow.stop().expect("stop (low)");
+    copy_tree(&data, &pre_raise);
+
+    // Startup logs XLOG_PARAMETER_CHANGE for a value above pg_control's
+    let raised = SourceGucFloor {
+        max_connections: low.max_connections + 100,
+        ..low
+    };
+    shadow
+        .materialize_conf(&raised, None)
+        .expect("conf (raised)");
+    shadow.start().expect("start (raised)");
+    shadow.stop().expect("stop (raised)");
+    stage_wal(&data, &shadow.config().filter_out_dir);
+
+    std::fs::remove_dir_all(&data).unwrap();
+    copy_tree(&pre_raise, &data);
+    shadow.write_standby_signal().expect("standby signal");
+    shadow
+        .start_with_floor_retry(None)
+        .expect("start (standby)");
+    let started = scopeguard_stop(&shadow);
+
+    // Replay reaches the record asynchronously, so probe as the daemon does
+    let outcome = wait_for("replay pause", Duration::from_secs(30), || {
+        match shadow.try_pg_wal_replay_resume() {
+            Ok(ResumeOutcome::NotPaused) => None,
+            other => Some(other),
+        }
+    });
+    assert_eq!(
+        outcome.expect("resume probe"),
+        ResumeOutcome::ResumedForFloor
+    );
+    assert_eq!(
+        shadow.control_guc_floor().expect("floor after replay"),
+        raised,
+        "replayed parameter change writes raised values to pg_control",
+    );
+
+    wait_for("postmaster exit", Duration::from_secs(15), || {
+        (!shadow.is_running().expect("pg_ctl status")).then_some(())
+    });
+    shadow.clear_stale_pid().expect("clear stale pid");
+    shadow
+        .start_with_floor_retry(None)
+        .expect("restart on raised floor");
+    let conf = std::fs::read_to_string(data.join("postgresql.conf")).unwrap();
+    assert!(
+        conf.contains(&format!("max_connections = {}", raised.max_connections)),
+        "{conf}",
+    );
+    assert!(shadow.health().expect("health").in_recovery);
+    assert_eq!(
+        shadow.try_pg_wal_replay_resume().expect("resume probe"),
+        ResumeOutcome::NotPaused,
+        "raised value satisfies the record on replay",
+    );
+
+    // An operator pause reads the same floor as the running values, so it holds
+    shadow
+        .psql_one("SELECT pg_wal_replay_pause()")
+        .expect("operator pause");
+    assert_eq!(
+        shadow.try_pg_wal_replay_resume().expect("resume probe"),
+        ResumeOutcome::PausedForeign,
+    );
+    assert_ne!(
+        shadow
+            .psql_one("SELECT pg_get_wal_replay_pause_state()")
+            .expect("pause state"),
+        "not paused",
+    );
+
+    drop(started);
+}
+
 // ----- helpers --------------------------------------------------------
 
 /// Best-effort stop on test exit. We can't use a real scopeguard crate
@@ -179,4 +280,35 @@ impl Drop for StopOnDrop<'_> {
 
 fn scopeguard_stop(shadow: &Shadow) -> StopOnDrop<'_> {
     StopOnDrop { shadow }
+}
+
+fn copy_tree(src: &Path, dst: &Path) {
+    let status = Command::new("cp")
+        .args(["-a".as_ref(), src.as_os_str(), dst.as_os_str()])
+        .status()
+        .expect("cp -a");
+    assert!(status.success(), "cp -a {src:?} {dst:?}");
+}
+
+/// Feed WAL to a standby the way walshadow does, through `restore_command`
+fn stage_wal(data: &Path, filter_dir: &Path) {
+    for entry in std::fs::read_dir(data.join("pg_wal")).expect("pg_wal") {
+        let entry = entry.unwrap();
+        let name = entry.file_name();
+        let name = name.to_str().expect("utf8 segment name");
+        if is_wal_filename(name) {
+            std::fs::copy(entry.path(), filter_dir.join(name)).expect("stage segment");
+        }
+    }
+}
+
+fn wait_for<T>(what: &str, timeout: Duration, mut probe: impl FnMut() -> Option<T>) -> T {
+    let start = Instant::now();
+    loop {
+        if let Some(v) = probe() {
+            return v;
+        }
+        assert!(start.elapsed() < timeout, "timed out waiting for {what}");
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
