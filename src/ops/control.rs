@@ -354,16 +354,29 @@ fn selected_tables(root: &Table) -> Vec<(String, String)> {
 }
 
 async fn stream_status(ctx: &SharedCtx) -> Result<String> {
-    let paused = get_config(ctx)
-        .await?
+    let root = get_config(ctx).await?;
+    let paused = root
         .get("stream")
         .and_then(Value::as_table)
         .and_then(|t| t.get("paused"))
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let ch_host = root
+        .get("ch")
+        .and_then(Value::as_table)
+        .and_then(|t| t.get("host"))
+        .and_then(Value::as_str)
+        .unwrap_or("localhost")
+        .to_string();
+    let tables: Vec<Value> = selected_tables(&root)
+        .into_iter()
+        .map(|(ns, rel)| Value::String(format!("{ns}.{rel}")))
+        .collect();
     let snap = ctx.metrics.snapshot().await;
     let mut out = Table::new();
     out.insert("paused".into(), paused.into());
+    out.insert("ch_host".into(), ch_host.into());
+    out.insert("tables".into(), Value::Array(tables));
     out.insert(
         "rows_synced".into(),
         (snap.emitter_rows_total as i64).into(),
