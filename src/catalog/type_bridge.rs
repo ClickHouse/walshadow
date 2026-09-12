@@ -151,11 +151,11 @@ fn array_ch_type(type_name: &str) -> Option<String> {
     Some(format!("Array(Nullable({inner}))"))
 }
 
-/// Render post-`DEFAULT ` fragment from `missing_text` (PG fast-path
+/// Render post-`DEFAULT ` fragment from `missing_default` (PG fast-path
 /// `ALTER TABLE ... ADD COLUMN ... DEFAULT k`). `None` when no fast-path
 /// default or value not cleanly expressible as CH literal
 fn render_default(att: &RelAttr, ch_inner: &str) -> Option<String> {
-    let _ = att.missing_text.as_ref()?;
+    let _ = att.missing_default.as_ref()?;
     let value = heap_decoder::missing_value_for(att);
     if matches!(value, ColumnValue::Null) {
         return None;
@@ -392,7 +392,7 @@ mod tests {
             type_len: 4,
             type_align: 'i',
             type_storage: 'p',
-            missing_text: missing.map(String::from),
+            missing_default: missing.map(|s| crate::schema::MissingDefault::Text(s.into())),
         }
     }
 

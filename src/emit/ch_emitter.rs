@@ -2259,7 +2259,7 @@ mod tests {
                     type_len: 4,
                     type_align: 'i',
                     type_storage: 'p',
-                    missing_text: None,
+                    missing_default: None,
                 },
                 RelAttr {
                     attnum: 2,
@@ -2273,7 +2273,7 @@ mod tests {
                     type_len: -1,
                     type_align: 'i',
                     type_storage: 'x',
-                    missing_text: None,
+                    missing_default: None,
                 },
             ],
         }

@@ -79,7 +79,7 @@ pub fn compatible_reader(old: &RelDescriptor, new: &RelDescriptor) -> Result<(),
     // NOT NULL without a missing value implies the rewrite path, which this
     // predicate must not bless for in-place history
     for n in &new.attributes[old.attributes.len()..] {
-        if !n.dropped && n.not_null && n.missing_text.is_none() {
+        if !n.dropped && n.not_null && n.missing_default.is_none() {
             return Err(Incompat::Physical(
                 "appended not-null column without missing value",
             ));
@@ -110,8 +110,9 @@ fn slot_compatible(o: &RelAttr, n: &RelAttr) -> Result<(), Incompat> {
         return Err(Incompat::Physical("type change"));
     }
     // Tuples shorter than attnum read the missing value; a different one
-    // reinterprets history
-    if o.missing_text != n.missing_text {
+    // reinterprets history. Compare by value, not encoding: the worker and
+    // mirror paths spell the same default differently (raw bytes vs text).
+    if !crate::decode::heap_decoder::missing_defaults_equivalent(o, n) {
         return Err(Incompat::Physical("missing value change"));
     }
     // Below: no reader consults these. The walk reads attlen/attalign/
@@ -150,7 +151,7 @@ mod tests {
             type_len,
             type_align: 'i',
             type_storage: if type_len > 0 { 'p' } else { 'x' },
-            missing_text: None,
+            missing_default: None,
         }
     }
 
@@ -160,7 +161,7 @@ mod tests {
             dropped: true,
             name: format!("........pg.dropped.{attnum}........"),
             type_name: String::new(),
-            missing_text: None,
+            missing_default: None,
             not_null: false,
             ..attr(attnum, 0, type_len)
         }
@@ -205,7 +206,7 @@ mod tests {
         // NOT NULL append with stored missing value
         let mut with_missing = attr(2, 20, 8);
         with_missing.not_null = true;
-        with_missing.missing_text = Some("7".into());
+        with_missing.missing_default = Some("7".into());
         let new = rel(vec![attr(1, 23, 4), with_missing]);
         assert_eq!(compatible_reader(&old, &new), Ok(()));
         // NOT NULL append without missing value = rewrite territory
@@ -235,7 +236,7 @@ mod tests {
             Err(Incompat::Physical("type change"))
         );
         let mut missing = rel(vec![attr(1, 23, 4)]);
-        missing.attributes[0].missing_text = Some("1".into());
+        missing.attributes[0].missing_default = Some("1".into());
         assert_eq!(
             compatible_reader(&old, &missing),
             Err(Incompat::Physical("missing value change"))
@@ -269,7 +270,7 @@ mod tests {
         // Physical wins wherever both apply, whatever the slot order
         let mut both = rel(vec![attr(1, 1043, -1), attr(2, 23, 4)]);
         both.attributes[0].typmod = 24;
-        both.attributes[1].missing_text = Some("1".into());
+        both.attributes[1].missing_default = Some("1".into());
         let old_two = rel(vec![attr(1, 1043, -1), attr(2, 23, 4)]);
         assert_eq!(
             compatible_reader(&old_two, &both),

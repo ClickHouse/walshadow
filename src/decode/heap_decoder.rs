@@ -70,9 +70,9 @@ use walrus::pg::walparser::{RelFileNode, RmId, XLogRecord};
 
 use crate::schema::{
     BOOLOID, BPCHAROID, BYTEAOID, CHAROID, CIDROID, DATEOID, FLOAT4OID, FLOAT8OID, INETOID,
-    INT2OID, INT4OID, INT8OID, INTERVALOID, JSONOID, NAMEOID, NUMERICOID, OIDOID, RelAttr,
-    RelDescriptor, ReplIdent, TEXTOID, TIMEOID, TIMESTAMPOID, TIMESTAMPTZOID, TIMETZOID, UUIDOID,
-    VARCHAROID,
+    INT2OID, INT4OID, INT8OID, INTERVALOID, JSONOID, MissingDefault, NAMEOID, NUMERICOID, OIDOID,
+    RelAttr, RelDescriptor, ReplIdent, TEXTOID, TIMEOID, TIMESTAMPOID, TIMESTAMPTZOID, TIMETZOID,
+    UUIDOID, VARCHAROID,
 };
 
 /// SmallVec sized at 1: single-row INSERT/UPDATE/DELETE stays stack-allocated,
@@ -873,14 +873,55 @@ fn decode_tuple_payload(
     })
 }
 
-/// Resolve `RelAttr::missing_text` (PG `attmissingval[1]::text`) via the
-/// Tier 1/2 matrix; Tier 3 falls to `PgPendingText` (oracle resolves at emit).
-/// `Null` when attribute has no missing default.
+/// Resolve a column's fast default ([`RelAttr::missing_default`]) to a value;
+/// `Null` when there is none. Tier-3 stays a pending value the oracle resolves.
 pub fn missing_value_for(att: &RelAttr) -> ColumnValue {
-    let Some(text) = att.missing_text.as_deref() else {
-        return ColumnValue::Null;
+    match &att.missing_default {
+        Some(MissingDefault::Raw(arr)) => missing_value_from_array(att, arr),
+        Some(MissingDefault::Text(text)) => missing_value_from_text(att.type_oid, text),
+        None => ColumnValue::Null,
+    }
+}
+
+/// The worker and SQL paths encode a default differently (raw vs text) but
+/// resolve to one value, so compare by value; tier-3 stays pending, so equal
+/// source type counts as equal.
+pub fn missing_defaults_equivalent(a: &RelAttr, b: &RelAttr) -> bool {
+    use ColumnValue::{PgPending, PgPendingText};
+    match (missing_value_for(a), missing_value_for(b)) {
+        (
+            PgPending { type_oid: x, .. } | PgPendingText { type_oid: x, .. },
+            PgPending { type_oid: y, .. } | PgPendingText { type_oid: y, .. },
+        ) => x == y,
+        (l, r) => l == r,
+    }
+}
+
+fn missing_value_from_array(att: &RelAttr, arr: &[u8]) -> ColumnValue {
+    // ArrayType: vl_len_(4) ndim(4) dataoffset(4) elemtype(4) dims[] lbounds[] [nulls] data
+    let decode = || -> Option<ColumnValue> {
+        if arr.len() < 16 {
+            return None;
+        }
+        let ndim = i32::from_le_bytes(arr[4..8].try_into().ok()?);
+        let dataoffset = i32::from_le_bytes(arr[8..12].try_into().ok()?);
+        if ndim != 1 {
+            return None;
+        }
+        let abs = if dataoffset != 0 {
+            dataoffset as usize
+        } else {
+            // MAXALIGN(16 + 8*ndim), no null bitmap
+            (16 + 8 * ndim as usize).next_multiple_of(8)
+        };
+        decode_one_value(att, arr, abs).ok().map(|(v, _)| v)
     };
-    match att.type_oid {
+    decode().unwrap_or(ColumnValue::Null)
+}
+
+/// `attmissingval` element from its `anyarray_out` text form (SQL/mirror path).
+pub(crate) fn missing_value_from_text(type_oid: u32, text: &str) -> ColumnValue {
+    match type_oid {
         BOOLOID => match text {
             "t" | "true" | "yes" | "on" | "1" => ColumnValue::Bool(true),
             _ => ColumnValue::Bool(false),
@@ -918,7 +959,7 @@ pub fn missing_value_for(att: &RelAttr) -> ColumnValue {
         JSONOID => ColumnValue::Json(text.to_owned()),
         // attmissingval text requires typinput
         _ => ColumnValue::PgPendingText {
-            type_oid: att.type_oid,
+            type_oid,
             text: text.to_owned(),
         },
     }
@@ -1004,7 +1045,7 @@ fn read_u16(buf: &[u8], cur: &mut usize) -> Result<u16, DecodeError> {
 
 /// Returns `(value, bytes_consumed)`. Varlena reports total on-disk length
 /// (header + body, including TOAST pointer's full 18 bytes).
-fn decode_one_value(
+pub(crate) fn decode_one_value(
     att: &RelAttr,
     buf: &[u8],
     abs: usize,
@@ -1403,7 +1444,7 @@ mod tests {
             type_len,
             type_align,
             type_storage: 'p',
-            missing_text: None,
+            missing_default: None,
         }
     }
 
@@ -1882,10 +1923,10 @@ mod tests {
 
     #[test]
     fn missing_value_substitutes_when_natts_below_catalog() {
-        // Catalog natts=3, wal natts=2 (pre-ALTER row); col 3 missing_text="7"
+        // Catalog natts=3, wal natts=2 (pre-ALTER row); col 3 missing_default="7"
         // must surface 7 not NULL
         let mut a3 = rel_attr(3, "c", INT4OID, 4, 'i');
-        a3.missing_text = Some("7".into());
+        a3.missing_default = Some("7".into());
         let rel = descriptor(
             16500,
             vec![
@@ -1910,7 +1951,7 @@ mod tests {
 
     #[test]
     fn missing_value_absent_falls_back_to_null() {
-        // Catalog natts=3, wal natts=2, col 3 no missing_text => NULL
+        // Catalog natts=3, wal natts=2, col 3 no missing_default => NULL
         let rel = descriptor(
             16501,
             vec![
@@ -1932,10 +1973,10 @@ mod tests {
 
     #[test]
     fn missing_value_physical_null_unaffected_by_default() {
-        // Bitmap-clear NULL on a missing_text col stays NULL: substitution
+        // Bitmap-clear NULL on a missing_default col stays NULL: substitution
         // applies only for natts below catalog, never to an explicit WAL NULL
         let mut a2 = rel_attr(2, "b", INT4OID, 4, 'i');
-        a2.missing_text = Some("99".into());
+        a2.missing_default = Some("99".into());
         let rel = descriptor(16502, vec![rel_attr(1, "a", INT4OID, 4, 'i'), a2]);
         let bitmap = 0b00000001u8; // bit 1 clear = NULL
         let mut payload = Vec::new();
@@ -2020,25 +2061,25 @@ mod tests {
     #[test]
     fn missing_value_for_type_matrix() {
         let mut bool_att = rel_attr(1, "b", BOOLOID, 1, 'c');
-        bool_att.missing_text = Some("t".into());
+        bool_att.missing_default = Some("t".into());
         assert_eq!(missing_value_for(&bool_att), ColumnValue::Bool(true));
-        bool_att.missing_text = Some("false".into());
+        bool_att.missing_default = Some("false".into());
         assert_eq!(missing_value_for(&bool_att), ColumnValue::Bool(false));
 
         let mut i4 = rel_attr(1, "x", INT4OID, 4, 'i');
-        i4.missing_text = Some("42".into());
+        i4.missing_default = Some("42".into());
         assert_eq!(missing_value_for(&i4), ColumnValue::Int4(42));
 
         let mut i8 = rel_attr(1, "x", INT8OID, 8, 'd');
-        i8.missing_text = Some("-9223372036854775808".into());
+        i8.missing_default = Some("-9223372036854775808".into());
         assert_eq!(missing_value_for(&i8), ColumnValue::Int8(i64::MIN));
 
         let mut txt = rel_attr(1, "n", TEXTOID, -1, 'i');
-        txt.missing_text = Some("hello".into());
+        txt.missing_default = Some("hello".into());
         assert_eq!(missing_value_for(&txt), ColumnValue::Text("hello".into()));
 
         let mut num = rel_attr(1, "n", NUMERICOID, -1, 'i');
-        num.missing_text = Some("3.14".into());
+        num.missing_default = Some("3.14".into());
         assert_eq!(
             missing_value_for(&num),
             ColumnValue::PgPendingText {
@@ -2049,6 +2090,93 @@ mod tests {
 
         let none = rel_attr(1, "x", INT4OID, 4, 'i');
         assert_eq!(missing_value_for(&none), ColumnValue::Null);
+    }
+
+    // One-element, no-null on-disk ArrayType; element lands at MAXALIGN(24).
+    fn raw_array(elemtype: u32, elem: &[u8]) -> Vec<u8> {
+        let mut v = Vec::with_capacity(24 + elem.len());
+        v.extend_from_slice(&0u32.to_le_bytes()); // vl_len_ (ignored)
+        v.extend_from_slice(&1i32.to_le_bytes()); // ndim
+        v.extend_from_slice(&0i32.to_le_bytes()); // dataoffset
+        v.extend_from_slice(&elemtype.to_le_bytes());
+        v.extend_from_slice(&1i32.to_le_bytes()); // dims[0]
+        v.extend_from_slice(&1i32.to_le_bytes()); // lbounds[0]
+        assert_eq!(v.len(), 24);
+        v.extend_from_slice(elem);
+        v
+    }
+
+    fn short_varlena(content: &[u8]) -> Vec<u8> {
+        let total = 1 + content.len();
+        let mut v = vec![((total as u8) << 1) | 1];
+        v.extend_from_slice(content);
+        v
+    }
+
+    const JSONBOID: u32 = 3802;
+
+    #[test]
+    fn fast_default_raw_scalar_decodes_to_value() {
+        let mut a = rel_attr(1, "x", INT4OID, 4, 'i');
+        a.missing_default = Some(MissingDefault::Raw(raw_array(INT4OID, &7i32.to_le_bytes())));
+        assert_eq!(missing_value_for(&a), ColumnValue::Int4(7));
+    }
+
+    #[test]
+    fn fast_default_raw_text_decodes_to_value() {
+        let mut a = rel_attr(1, "n", TEXTOID, -1, 'i');
+        a.missing_default = Some(MissingDefault::Raw(raw_array(
+            TEXTOID,
+            &short_varlena(b"hi"),
+        )));
+        assert_eq!(missing_value_for(&a), ColumnValue::Text("hi".into()));
+    }
+
+    #[test]
+    fn fast_default_raw_tier3_stays_pending_not_dropped() {
+        // jsonb has no lock-free text form: raw must survive as pending, not NULL
+        let mut a = rel_attr(1, "j", JSONBOID, -1, 'i');
+        let body = [0x01u8, 0x20, 0x00];
+        a.missing_default = Some(MissingDefault::Raw(raw_array(
+            JSONBOID,
+            &short_varlena(&body),
+        )));
+        match missing_value_for(&a) {
+            ColumnValue::PgPending { type_oid, raw } => {
+                assert_eq!(type_oid, JSONBOID);
+                assert_eq!(raw, body);
+            }
+            other => panic!("tier-3 fast default must stay pending, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fast_default_malformed_raw_is_null_not_panic() {
+        let mut a = rel_attr(1, "x", INT4OID, 4, 'i');
+        a.missing_default = Some(MissingDefault::Raw(vec![0, 1, 2]));
+        assert_eq!(missing_value_for(&a), ColumnValue::Null);
+    }
+
+    #[test]
+    fn fast_default_equivalent_across_raw_and_text() {
+        let mut raw7 = rel_attr(1, "x", INT4OID, 4, 'i');
+        raw7.missing_default = Some(MissingDefault::Raw(raw_array(INT4OID, &7i32.to_le_bytes())));
+        let mut text7 = rel_attr(1, "x", INT4OID, 4, 'i');
+        text7.missing_default = Some("7".into());
+        assert!(missing_defaults_equivalent(&raw7, &text7));
+
+        let mut text8 = rel_attr(1, "x", INT4OID, 4, 'i');
+        text8.missing_default = Some("8".into());
+        assert!(!missing_defaults_equivalent(&raw7, &text8));
+
+        let mut raw_j = rel_attr(1, "j", JSONBOID, -1, 'i');
+        raw_j.missing_default = Some(MissingDefault::Raw(raw_array(
+            JSONBOID,
+            &short_varlena(&[0x01, 0x20, 0x00]),
+        )));
+        let mut text_j = rel_attr(1, "j", JSONBOID, -1, 'i');
+        text_j.missing_default = Some(r#"{"k": 1}"#.into());
+        assert!(missing_defaults_equivalent(&raw_j, &text_j));
     }
 
     #[test]

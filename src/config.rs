@@ -1352,7 +1352,7 @@ mod tests {
                 type_len: 4,
                 type_align: 'i',
                 type_storage: 'p',
-                missing_text: None,
+                missing_default: None,
             }],
         }
     }
@@ -1548,7 +1548,7 @@ mod tests {
             type_len: -1,
             type_align: 'i',
             type_storage: 'x',
-            missing_text: None,
+            missing_default: None,
         });
         let diff = SchemaDiff {
             added_columns: vec![desc.attributes[1].clone()],

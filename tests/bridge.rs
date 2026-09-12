@@ -478,7 +478,32 @@ async fn bridge_scans_uncommitted_ddl() {
     assert_eq!(cols, ["id", "a", "c"], "{attrs:#?}");
     assert!(attrs.iter().all(|a| a.attnum >= 1));
     let added = attrs.iter().find(|a| a.attname == "c").unwrap();
-    assert_eq!(added.attmissingval.as_deref(), Some("{7}"));
+    let hex = added
+        .attmissingval
+        .as_deref()
+        .expect("fast default present");
+    let bytes: Vec<u8> = (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+        .collect();
+    let c_attr = walshadow::schema::RelAttr {
+        attnum: added.attnum,
+        name: "c".into(),
+        type_oid: 23,
+        typmod: -1,
+        not_null: false,
+        dropped: false,
+        type_name: "int4".into(),
+        type_byval: true,
+        type_len: 4,
+        type_align: 'i',
+        type_storage: 'p',
+        missing_default: Some(walshadow::schema::MissingDefault::Raw(bytes)),
+    };
+    assert_eq!(
+        walshadow::heap_decoder::missing_value_for(&c_attr),
+        walshadow::heap_decoder::ColumnValue::Int4(7)
+    );
     assert_eq!(added.atttypid, 23);
     assert!(attrs[0].attmissingval.is_none());
 
@@ -808,14 +833,30 @@ async fn bridge_overlay_descriptors_track_open_ddl() {
         .expect("mirroring statement");
     assert_eq!(stated, committed, "statement diverged from the worker");
     assert_eq!(mirror.stats().mirror_fetches, 1);
-    // Capture-all: no oid list on the wire, the eligibility predicate in SQL
-    let by_oid = |(_, mut descs): (u64, Vec<_>)| {
-        descs.sort_by_key(|d: &walshadow::schema::RelDescriptor| d.oid);
+    // Compare fast defaults by value: worker ships raw bytes, mirror text.
+    let canon = |(_, mut descs): (u64, Vec<walshadow::schema::RelDescriptor>)| {
+        descs.sort_by_key(|d| d.oid);
+        for d in &mut descs {
+            for a in &mut d.attributes {
+                if a.missing_default.is_some() {
+                    let key = match walshadow::heap_decoder::missing_value_for(a) {
+                        walshadow::heap_decoder::ColumnValue::PgPending { type_oid, .. }
+                        | walshadow::heap_decoder::ColumnValue::PgPendingText {
+                            type_oid, ..
+                        } => {
+                            format!("pending:{type_oid}")
+                        }
+                        other => format!("{other:?}"),
+                    };
+                    a.missing_default = Some(walshadow::schema::MissingDefault::Text(key));
+                }
+            }
+        }
         descs
     };
     assert_eq!(
-        mirror.fetch_all_descriptors().await.map(by_oid).unwrap(),
-        cat.fetch_all_descriptors().await.map(by_oid).unwrap(),
+        mirror.fetch_all_descriptors().await.map(canon).unwrap(),
+        cat.fetch_all_descriptors().await.map(canon).unwrap(),
         "statement and worker disagree on the eligible set",
     );
 
@@ -860,7 +901,10 @@ async fn bridge_overlay_descriptors_track_open_ddl() {
 
     let cols: Vec<&str> = t.attributes.iter().map(|a| a.name.as_str()).collect();
     assert_eq!(cols, ["id", "a", "c"]);
-    assert_eq!(t.attributes[2].missing_text.as_deref(), Some("7"));
+    assert_eq!(
+        walshadow::heap_decoder::missing_value_for(&t.attributes[2]),
+        walshadow::heap_decoder::ColumnValue::Int4(7)
+    );
     assert_eq!(t.attributes[2].type_name, "int4");
     // Unchanged by the ALTER, so still the committed values
     assert_eq!(t.rfn, committed[0].rfn);

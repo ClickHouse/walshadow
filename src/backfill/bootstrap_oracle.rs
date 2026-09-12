@@ -298,7 +298,7 @@ mod tests {
             type_len,
             type_align: 'i',
             type_storage: if type_len < 0 { 'x' } else { 'p' },
-            missing_text: None,
+            missing_default: None,
         }
     }
 

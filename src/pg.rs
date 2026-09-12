@@ -98,7 +98,11 @@ impl RawAttr {
             type_len: self.type_len,
             type_align: single_char(&self.type_align, "attalign")?,
             type_storage: single_char(&self.type_storage, "attstorage")?,
-            missing_text: self.missing.as_deref().and_then(parse_array_one_element),
+            missing_default: self
+                .missing
+                .as_deref()
+                .and_then(parse_array_one_element)
+                .map(crate::schema::MissingDefault::Text),
         })
     }
 }

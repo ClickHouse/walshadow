@@ -154,7 +154,21 @@ pub struct RelAttr {
     pub type_len: i16,
     pub type_align: char,
     pub type_storage: char,
-    pub missing_text: Option<String>,
+    pub missing_default: Option<MissingDefault>,
+}
+
+/// Fast default (`attmissingval`): raw on-disk bytes from the pinned worker, or
+/// `anyarray_out` text from the SQL path. Decoded by `missing_value_for`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MissingDefault {
+    Raw(Vec<u8>),
+    Text(String),
+}
+
+impl From<&str> for MissingDefault {
+    fn from(s: &str) -> Self {
+        MissingDefault::Text(s.to_owned())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -241,7 +255,7 @@ mod tests {
             type_len: 4,
             type_align: 'i',
             type_storage: 'p',
-            missing_text: None,
+            missing_default: None,
         }
     }
 
