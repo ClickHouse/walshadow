@@ -326,6 +326,21 @@ impl ShadowStreamState {
         }
     }
 
+    /// Publish history bytes for a branch without moving off it.
+    ///
+    /// [`advertise_timeline`](Self::advertise_timeline) only carries history
+    /// for branches this walsender crossed *onto*, so the one it boots on would
+    /// have none while `IDENTIFY_SYSTEM` names it. A walreceiver fetches
+    /// `TIMELINE_HISTORY` for every timeline in `[its own, the primary's]` it
+    /// lacks locally (`WalRcvFetchTimeLineHistoryFiles`), so an unanswerable
+    /// boot branch is a FATAL on its side and a reconnect loop on ours.
+    pub fn seed_history(&mut self, tli: u32, history: Vec<u8>) {
+        if self.histories.iter().any(|(t, _)| *t == tli) {
+            return;
+        }
+        self.histories.push((tli, history));
+    }
+
     /// Move the served branch to `next_tli`, forked at `switch_lsn`, with the
     /// descendant's history bytes.
     ///

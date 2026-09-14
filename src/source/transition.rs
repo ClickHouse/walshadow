@@ -837,6 +837,32 @@ pub async fn load_boot_history(
         .with_context(|| format!("history_malformed: timeline {live_timeline}"))
 }
 
+/// History bytes for `tli`: the chain already holds the target's, every
+/// ancestor comes off the source
+async fn branch_history(
+    feed: &mut SourceFeed,
+    history: &TimelineHistory,
+    tli: u32,
+) -> Result<Vec<u8>> {
+    if tli == history.target() {
+        return Ok(history.raw().to_vec());
+    }
+    feed.timeline_history(tli)
+        .await?
+        .with_context(|| format!("history_missing: timeline {tli}"))
+}
+
+/// `<tli>.history` beside the filtered archive, where the shadow's
+/// `restore_command` looks for it
+async fn persist_history(out_dir: &Path, tli: u32, raw: &[u8]) -> Result<()> {
+    tokio::fs::create_dir_all(out_dir)
+        .await
+        .with_context(|| format!("create filtered dir {}", out_dir.display()))?;
+    crate::fs::write_atomic(out_dir, &history_filename(tli), raw)
+        .await
+        .with_context(|| format!("persist history for timeline {tli}"))
+}
+
 /// Re-advertise crossings floor passed before shadow
 pub async fn seed_shadow_branches(
     state: &mut ShadowStreamState,
@@ -845,6 +871,25 @@ pub async fn seed_shadow_branches(
     out_dir: &Path,
     through: u32,
 ) -> Result<()> {
+    // The branch the walsender opens on is advertised by `IDENTIFY_SYSTEM` but
+    // crossed onto by nothing, so it needs its history seeded outright. Timeline
+    // 1 has no history file to serve, and a chain with no raw bytes (an
+    // unprovable branch the boot path already warned about) has none to offer.
+    let boot = state.timeline;
+    if boot > 1 {
+        let raw = branch_history(feed, history, boot).await?;
+        if raw.is_empty() {
+            tracing::warn!(
+                target: "walshadow",
+                timeline = boot,
+                "no history bytes for the boot branch; a walreceiver that lacks \
+                 its own copy cannot be answered",
+            );
+        } else {
+            persist_history(out_dir, boot, &raw).await?;
+            state.seed_history(boot, raw);
+        }
+    }
     while state.timeline < through {
         let finished = state.timeline;
         let next = history
@@ -853,19 +898,8 @@ pub async fn seed_shadow_branches(
         let switch_lsn = history
             .begin_of(next)
             .with_context(|| format!("timeline {next} has no switchpoint in the chain"))?;
-        let raw = if next == history.target() {
-            history.raw().to_vec()
-        } else {
-            feed.timeline_history(next)
-                .await?
-                .with_context(|| format!("history_missing: timeline {next}"))?
-        };
-        tokio::fs::create_dir_all(out_dir)
-            .await
-            .with_context(|| format!("create filtered dir {}", out_dir.display()))?;
-        crate::fs::write_atomic(out_dir, &history_filename(next), &raw)
-            .await
-            .with_context(|| format!("persist history for timeline {next}"))?;
+        let raw = branch_history(feed, history, next).await?;
+        persist_history(out_dir, next, &raw).await?;
         state.advertise_timeline(next, switch_lsn, raw);
         tracing::info!(
             target: "walshadow",
