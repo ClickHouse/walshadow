@@ -25,13 +25,13 @@ name = "walshadow"
 path = "src/lib.rs"
 
 [features]
-# Compression codecs walshadow's CH-Native emitter advertises
-# in its Hello packet & negotiates onto the wire. Forwarded to
-# clickhouse-c-rs so its `chc_*_codec_init` symbols & C TU link only
-# what the top crate actually offers. `lz4` matches the ClickHouse
-# server default; flip `default-features = false` for an
-# uncompressed-only build with neither codec lib linked.
-default = ["lz4"]
+# Compression codecs walshadow's CH-Native emitter links. Forwarded to
+# clickhouse-c-rs so its `chc_*_codec_init` symbols & C TU link only what the
+# top crate offers. Flip `default-features = false` for an uncompressed-only
+# build with neither codec lib linked — which then cannot decode a compressed
+# server response. Both by default: the wire flag only says what we send, and
+# a server answers in whatever method it is configured for.
+default = ["lz4", "zstd"]
 lz4 = ["clickhouse-c-rs/lz4"]
 zstd = ["clickhouse-c-rs/zstd"]
 

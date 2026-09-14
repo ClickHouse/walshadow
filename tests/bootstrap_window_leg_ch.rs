@@ -435,7 +435,9 @@ async fn ctid_repair_converges_with_updates_deletes_reuse_and_crossing_transacti
     walshadow::visibility_gate::resolve_phase(
         spool,
         &view,
-        &walshadow::visibility_gate::GateOutput::Repair(&tx),
+        &walshadow::visibility_gate::GateOutput::Repair(&walshadow::visibility_gate::LaneFan::new(
+            vec![tx.clone()],
+        )),
         &mut gate_stats,
     )
     .await

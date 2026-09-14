@@ -85,25 +85,22 @@ impl BootstrapOracle {
         .context("bootstrap oracle provision task")?
         .context("bootstrap oracle provision")?;
 
-        let bridge =
-            match crate::ops::bridge::connect_with_budget(&bridge_socket, workers, connect_budget)
-                .await
-            {
-                Ok(bridge) => bridge,
-                Err(e) => {
-                    // Nothing else owns this postmaster yet; leaving it up
-                    // outlives the daemon and the next attempt unlinks its
-                    // data dir from under it
-                    let _ = tokio::task::spawn_blocking(move || shadow.stop()).await;
-                    return Err(anyhow::Error::new(e).context(format!(
-                        "bootstrap oracle bridge connect ({} of {workers} worker sockets \
-                         present under {}; a bridge pool over max_worker_processes \
-                         registers fewer workers than the daemon dials)",
-                        present_sockets(&socket_dir, workers),
-                        socket_dir.display(),
-                    )));
-                }
-            };
+        let connected =
+            crate::ops::bridge::connect_with_budget(&bridge_socket, workers, connect_budget).await;
+        if connected.is_err() {
+            // Nothing else owns this postmaster; left up it outlives the daemon
+            // and the next attempt unlinks its data dir
+            let _ = shadow.stop();
+        }
+        let bridge = connected.with_context(|| {
+            format!(
+                "bootstrap oracle bridge connect ({} of {workers} worker sockets present \
+                 under {}; a bridge pool over max_worker_processes registers fewer \
+                 workers than the daemon dials)",
+                present_sockets(&socket_dir, workers),
+                socket_dir.display(),
+            )
+        })?;
         Ok(Self {
             shadow,
             oracle: Arc::new(Oracle::new(Arc::new(bridge))),

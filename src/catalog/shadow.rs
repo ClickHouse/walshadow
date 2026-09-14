@@ -314,8 +314,8 @@ impl Shadow {
              max_worker_processes = {max_worker_processes}\n",
             sock = self.config.socket_str(),
             port = self.config.port,
-            // PG only logs excess workers and drops their registration, so a
-            // bridge pool over the default leaves sockets the daemon never finds
+            // PG only logs excess workers and drops them, so a bridge pool over
+            // the default leaves sockets the daemon never finds
             max_worker_processes = SourceGucFloor::default().max_worker_processes
                 + self.config.bridge.as_ref().map_or(0, |b| {
                     b.workers.clamp(1, crate::ops::bridge::MAX_BRIDGE_WORKERS) as u32
@@ -891,10 +891,7 @@ mod tests {
         );
     }
 
-    /// The bootstrap oracle configures itself through `write_base_conf`, not
-    /// `materialize_conf`. Without the bridge allowance PG caps registration at
-    /// the default 8, drops the excess workers with only a LOG line, and the
-    /// daemon then dials sockets that will never exist.
+    /// The oracle configures itself here, not through `materialize_conf`
     #[test]
     fn base_conf_raises_worker_slots_for_the_bridge_pool() {
         let tmp = tempfile::tempdir().unwrap();
