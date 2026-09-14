@@ -62,9 +62,7 @@ use walshadow::backup_source_object_store::ObjectStoreSource;
 use walshadow::boundary_hold::{
     BoundaryGateConfig, BoundaryHoldSink, BoundaryHoldStats, CatalogBoundaryGate,
 };
-use walshadow::ch_emitter::{
-    BootstrapMode, DEFAULT_DECODER_POOL, DEFAULT_INSERTER_POOL, EmitterConfig, EmitterStats,
-};
+use walshadow::ch_emitter::{BootstrapMode, EmitterConfig, EmitterStats};
 use walshadow::config::{CliOverrides, ConfigResolver, ResolvedConfig, SourceConn, cli_over_toml};
 use walshadow::decoder_sink::MetricsTupleObserver;
 use walshadow::manifest;
@@ -1838,12 +1836,12 @@ async fn run_session(
         let decoders = positive_usize(
             "decoder_pool_size",
             args.decoder_pool_size,
-            DEFAULT_DECODER_POOL,
+            walshadow::ch_emitter::default_decoder_pool(),
         );
         let inserters = positive_usize(
             "inserter_pool_size",
             args.inserter_pool_size,
-            DEFAULT_INSERTER_POOL,
+            walshadow::ch_emitter::default_inserter_pool(),
         );
         tracing::info!(
             target: "walshadow::pipeline",
@@ -5692,19 +5690,19 @@ mod tests {
     fn owned_shadow_sizes_bridge_from_inserter_config() {
         let tmp = tempfile::tempdir().unwrap();
         let args = args_from(&[]);
-        for (toml, workers, slots) in [
-            (None, 1, 2),
-            (Some("[ch]"), 3, 4),
-            (Some("[ch]\ninserter_pool_size = 5"), 5, 6),
-            (Some("[ch]\ninserter_pool_size = 16"), 8, 9),
+        for (toml, expect) in [
+            (None, Some(1)),
+            (Some("[ch]"), None),
+            (Some("[ch]\ninserter_pool_size = 5"), Some(5)),
+            (Some("[ch]\ninserter_pool_size = 16"), Some(8)),
         ] {
             let config = toml.map(|t| EmitterConfig::from_toml_str(t).unwrap());
-            let shadow = build_owned_shadow(
-                &args,
-                "postgres",
-                tmp.path().to_path_buf(),
-                bridge_pool_size(config.as_ref()),
-            );
+            let workers = bridge_pool_size(config.as_ref());
+            if let Some(want) = expect {
+                assert_eq!(workers, want, "{toml:?}");
+            }
+            let slots = workers + 1;
+            let shadow = build_owned_shadow(&args, "postgres", tmp.path().to_path_buf(), workers);
             let floor = walshadow::shadow::SourceGucFloor {
                 max_worker_processes: 1,
                 ..Default::default()

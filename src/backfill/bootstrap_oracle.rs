@@ -86,9 +86,24 @@ impl BootstrapOracle {
         .context("bootstrap oracle provision")?;
 
         let bridge =
-            crate::ops::bridge::connect_with_budget(&bridge_socket, workers, connect_budget)
+            match crate::ops::bridge::connect_with_budget(&bridge_socket, workers, connect_budget)
                 .await
-                .context("bootstrap oracle bridge connect")?;
+            {
+                Ok(bridge) => bridge,
+                Err(e) => {
+                    // Nothing else owns this postmaster yet; leaving it up
+                    // outlives the daemon and the next attempt unlinks its
+                    // data dir from under it
+                    let _ = tokio::task::spawn_blocking(move || shadow.stop()).await;
+                    return Err(anyhow::Error::new(e).context(format!(
+                        "bootstrap oracle bridge connect ({} of {workers} worker sockets \
+                         present under {}; a bridge pool over max_worker_processes \
+                         registers fewer workers than the daemon dials)",
+                        present_sockets(&socket_dir, workers),
+                        socket_dir.display(),
+                    )));
+                }
+            };
         Ok(Self {
             shadow,
             oracle: Arc::new(Oracle::new(Arc::new(bridge))),
@@ -112,6 +127,19 @@ impl Drop for BootstrapOracle {
         let _ = self.shadow.stop();
         let _ = std::fs::remove_dir_all(&self.base_dir);
     }
+}
+
+fn present_sockets(socket_dir: &std::path::Path, workers: usize) -> usize {
+    (0..workers)
+        .filter(|i| {
+            let name = if *i == 0 {
+                "walshadow-bridge.sock".to_string()
+            } else {
+                format!("walshadow-bridge.sock.{i}")
+            };
+            socket_dir.join(name).exists()
+        })
+        .count()
 }
 
 fn oracle_cfg(

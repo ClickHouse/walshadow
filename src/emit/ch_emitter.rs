@@ -275,8 +275,23 @@ pub struct BootstrapSettings {
 pub(crate) const DEFAULT_RESIDENT_PAYLOAD_MAX: usize = 512 << 20;
 pub(crate) const DEFAULT_INLINE_VALUE_MAX: usize = 64 << 20;
 
-pub const DEFAULT_DECODER_POOL: usize = 3;
-pub const DEFAULT_INSERTER_POOL: usize = 3;
+pub const DEFAULT_POOL_FLOOR: usize = 3;
+pub const MAX_DECODER_POOL: usize = 16;
+
+pub fn default_decoder_pool() -> usize {
+    vcpus().clamp(DEFAULT_POOL_FLOOR, MAX_DECODER_POOL)
+}
+
+/// Also sets `walshadow.bridge_workers`, one PG background worker each
+pub fn default_inserter_pool() -> usize {
+    vcpus().clamp(DEFAULT_POOL_FLOOR, crate::ops::bridge::MAX_BRIDGE_WORKERS)
+}
+
+fn vcpus() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(DEFAULT_POOL_FLOOR)
+}
 
 pub(crate) const DEFAULT_INSERT_TIMEOUT_SECS: u64 = 30;
 pub(crate) const DEFAULT_IDLE_RECONNECT_SECS: u64 = 30;
@@ -348,8 +363,8 @@ impl Default for EmitterConfig {
             source: crate::config::SourceConn::default(),
             resident_payload_max: DEFAULT_RESIDENT_PAYLOAD_MAX,
             inline_value_max: DEFAULT_INLINE_VALUE_MAX,
-            decoder_pool_size: DEFAULT_DECODER_POOL,
-            inserter_pool_size: DEFAULT_INSERTER_POOL,
+            decoder_pool_size: default_decoder_pool(),
+            inserter_pool_size: default_inserter_pool(),
             decoder_batch_size: DEFAULT_QUEUEING_BATCH_SIZE,
             decoder_queue_capacity: DEFAULT_QUEUEING_RECORD_SINK_CAPACITY,
             backup: None,
@@ -2199,8 +2214,14 @@ mod tests {
         assert_eq!(c.row_budget, 4_194_304);
         assert_eq!(c.byte_budget, 256 << 20);
         assert_eq!(c.flush_timeout, Duration::from_millis(1000));
-        assert_eq!(c.decoder_pool_size, 3);
-        assert_eq!(c.inserter_pool_size, 3);
+        assert_eq!(c.decoder_pool_size, default_decoder_pool());
+        assert_eq!(c.inserter_pool_size, default_inserter_pool());
+        assert!((DEFAULT_POOL_FLOOR..=MAX_DECODER_POOL).contains(&c.decoder_pool_size));
+        assert!(
+            (DEFAULT_POOL_FLOOR..=crate::ops::bridge::MAX_BRIDGE_WORKERS)
+                .contains(&c.inserter_pool_size),
+            "inserter pool must stay within the bridge pool it sizes",
+        );
         assert_eq!(c.decoder_batch_size, 512);
         assert_eq!(c.decoder_queue_capacity, 131_072);
         assert!(c.replicate_all);

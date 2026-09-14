@@ -310,9 +310,16 @@ impl Shadow {
              listen_addresses = ''\n\
              unix_socket_directories = '{sock}'\n\
              port = {port}\n\
-             shared_buffers = 32MB\n",
+             shared_buffers = 32MB\n\
+             max_worker_processes = {max_worker_processes}\n",
             sock = self.config.socket_str(),
             port = self.config.port,
+            // PG only logs excess workers and drops their registration, so a
+            // bridge pool over the default leaves sockets the daemon never finds
+            max_worker_processes = SourceGucFloor::default().max_worker_processes
+                + self.config.bridge.as_ref().map_or(0, |b| {
+                    b.workers.clamp(1, crate::ops::bridge::MAX_BRIDGE_WORKERS) as u32
+                }),
         );
         let mut f = fs::OpenOptions::new().append(true).open(&conf_path)?;
         f.write_all(body.as_bytes())?;
@@ -881,6 +888,50 @@ mod tests {
         assert_eq!(
             cfg.socket_dir,
             PathBuf::from("/tmp/walshadow-test/shadow_sock")
+        );
+    }
+
+    /// The bootstrap oracle configures itself through `write_base_conf`, not
+    /// `materialize_conf`. Without the bridge allowance PG caps registration at
+    /// the default 8, drops the excess workers with only a LOG line, and the
+    /// daemon then dials sockets that will never exist.
+    #[test]
+    fn base_conf_raises_worker_slots_for_the_bridge_pool() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+        fs::write(data_dir.join("postgresql.conf"), b"").unwrap();
+
+        let mut cfg = ShadowConfig::new(data_dir.clone(), tmp.path().join("filtered"));
+        cfg.socket_dir = tmp.path().join("sock");
+        let mut bridge = BridgeConf::in_dir(&cfg.socket_dir);
+        bridge.workers = 8;
+        cfg.bridge = Some(bridge);
+        Shadow::new(cfg).write_base_conf().unwrap();
+
+        let conf = fs::read_to_string(data_dir.join("postgresql.conf")).unwrap();
+        let want = SourceGucFloor::default().max_worker_processes + 8;
+        assert!(
+            conf.contains(&format!("max_worker_processes = {want}\n")),
+            "{conf}"
+        );
+        assert!(conf.contains("walshadow.bridge_workers = 8\n"), "{conf}");
+    }
+
+    #[test]
+    fn base_conf_without_a_bridge_keeps_the_plain_floor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+        fs::write(data_dir.join("postgresql.conf"), b"").unwrap();
+        let cfg = ShadowConfig::new(data_dir.clone(), tmp.path().join("filtered"));
+        Shadow::new(cfg).write_base_conf().unwrap();
+
+        let conf = fs::read_to_string(data_dir.join("postgresql.conf")).unwrap();
+        let want = SourceGucFloor::default().max_worker_processes;
+        assert!(
+            conf.contains(&format!("max_worker_processes = {want}\n")),
+            "{conf}"
         );
     }
 
