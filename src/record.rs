@@ -10,6 +10,7 @@ use walrus::pg::wal::segment::SegmentName;
 use walrus::pg::walparser::{RmId, XLogRecord};
 
 use crate::filter::manifest::Manifest;
+use crate::source::timeline::TimelineHistory;
 
 pub const WAL_SEG_SIZE: u64 = walrus::pg::wal::segment::DEFAULT_WAL_SEG_SIZE;
 
@@ -35,6 +36,25 @@ pub fn segments_covering(timeline: u32, range: std::ops::Range<u64>) -> Vec<Segm
         }
         cur = cur.next(WAL_SEG_SIZE);
     }
+}
+
+/// Name segments covering half-open `range` using archive lineage
+/// `XLogInitNewTimeline` copies ancestor bytes into descendant's fork segment
+/// Fall back to `base_timeline` outside known history
+pub fn segments_covering_lineage(
+    history: &TimelineHistory,
+    base_timeline: u32,
+    range: std::ops::Range<u64>,
+) -> Vec<SegmentName> {
+    segments_covering(base_timeline, range)
+        .into_iter()
+        .map(|seg| SegmentName {
+            timeline: history
+                .tli_of_segment(seg.start_lsn(WAL_SEG_SIZE), WAL_SEG_SIZE)
+                .unwrap_or(base_timeline),
+            ..seg
+        })
+        .collect()
 }
 
 /// Numeric id fallback for unknown rmgrs
@@ -398,5 +418,36 @@ impl RecordBytesSink for NoopBytesSink {
         _bytes: &'a [u8],
     ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
         Box::pin(future::ready(Ok(())))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Descendant's file serves entire fork segment, including ancestor prefix
+    #[test]
+    fn lineage_names_each_segment_for_the_branch_whose_file_serves_it() {
+        let at_boundary = TimelineHistory::parse(2, b"1\t0/3000000\tno recovery target\n").unwrap();
+        let tlis = |h: &TimelineHistory| -> Vec<u32> {
+            segments_covering_lineage(h, 1, 0x100_0000..0x400_0001)
+                .iter()
+                .map(|s| s.timeline)
+                .collect()
+        };
+        assert_eq!(tlis(&at_boundary), [1, 1, 2, 2]);
+
+        let mid_segment = TimelineHistory::parse(2, b"1\t0/3800000\tno recovery target\n").unwrap();
+        assert_eq!(tlis(&mid_segment), [1, 1, 2, 2]);
+    }
+
+    #[test]
+    fn lineage_crosses_from_a_base_branch_above_timeline_one() {
+        let history = TimelineHistory::parse(3, b"2\t0/3000000\tno recovery target\n").unwrap();
+        let tlis: Vec<u32> = segments_covering_lineage(&history, 2, 0x200_0000..0x300_0001)
+            .iter()
+            .map(|s| s.timeline)
+            .collect();
+        assert_eq!(tlis, [2, 3]);
     }
 }

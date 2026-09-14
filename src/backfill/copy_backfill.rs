@@ -550,6 +550,8 @@ pub struct CopyBackfiller {
     /// rows encode under the same `config_column` overrides WAL-driven rows
     /// use. `None` == boot values only.
     config_rx: Option<watch::Receiver<Arc<ResolvedConfig>>>,
+    /// Branch the stream proved, for backup passes replaying archived WAL
+    history_rx: watch::Receiver<Arc<crate::source::timeline::TimelineHistory>>,
     /// Pipeline's resident-payload pool: backup passes run concurrently
     /// with live streaming and draw from the same budget
     budget: Option<crate::budget::MemoryBudget>,
@@ -575,6 +577,7 @@ impl CopyBackfiller {
         log: Arc<crate::catalog::desc_log::DescriptorLog>,
         spill_dir: &Path,
         config_rx: Option<watch::Receiver<Arc<ResolvedConfig>>>,
+        history_rx: watch::Receiver<Arc<crate::source::timeline::TimelineHistory>>,
         budget: Option<crate::budget::MemoryBudget>,
         oracle: Option<Arc<Oracle>>,
     ) -> Self {
@@ -596,6 +599,7 @@ impl CopyBackfiller {
             log,
             spill_dir: spill_dir.to_path_buf(),
             config_rx,
+            history_rx,
             budget,
             oracle,
             backup_pass_lock: Mutex::new(()),
@@ -869,6 +873,7 @@ impl CopyBackfiller {
             log: self.log.clone(),
             scratch_dir: self.spill_dir.join("backup_backfill"),
             config_rx: self.config_rx.clone(),
+            history_rx: self.history_rx.clone(),
             budget: self.budget.clone(),
             oracle: self.oracle.clone(),
         };

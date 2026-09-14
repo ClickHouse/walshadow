@@ -78,7 +78,11 @@ request per insert batch
   skipped or fail repair
 - `copy` scans selected table through PostgreSQL SQL path
 - `base_backup` transfers cluster-sized backup even for one table
-- `object_store` requires full wal-g backup and continuous archived WAL to selection point
+- `object_store` requires full wal-g backup and continuous archived WAL, including archived
+  timeline history, to selection point
+- promotion between object-store backup and selection point follows the branch the
+  stream proved, which gap replay requires archived history to match; reject backups
+  extending beyond ancestor fork point
 - old object-store backup with intervening catalog changes can be rejected, use newer backup or `copy`
 - `initial_load = "none"` never reconstructs rows which existed before selection and receive no later change
 

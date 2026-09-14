@@ -425,13 +425,9 @@ impl Switchover<'_> {
         // (`src/backend/access/transam/timeline.c`, `findNewestTimeLine`).
         let mut histories: Vec<TimelineHistory> = Vec::new();
         for tli in (finished_tli + 1)..=live_tli {
-            let raw = feed
-                .timeline_history(tli)
-                .await
-                .map_err(source)?
+            let history = source_history(feed, tli)
+                .await?
                 .ok_or(TransitionError::HistoryMissing { tli })?;
-            let history = TimelineHistory::parse(tli, &raw)
-                .map_err(|source| TransitionError::HistoryMalformed { tli, source })?;
             histories.push(history);
         }
         let live_history = histories.last().expect("live_tli > finished_tli");
@@ -809,32 +805,46 @@ impl CrossingState {
     }
 }
 
+/// Chain `tli` names, off the source. `None` where the source serves no
+/// history file: timeline 1 never has one, and PG answers `58P01` for a file
+/// it has not written
+pub async fn source_history(
+    feed: &mut SourceFeed,
+    tli: u32,
+) -> Result<Option<TimelineHistory>, TransitionError> {
+    if tli <= 1 {
+        return Ok(None);
+    }
+    let Some(raw) = feed.timeline_history(tli).await.map_err(source)? else {
+        return Ok(None);
+    };
+    TimelineHistory::parse(tli, &raw)
+        .map(Some)
+        .map_err(|source| TransitionError::HistoryMalformed { tli, source })
+}
+
 /// Load live timeline history, requiring ancestry proof when branch changed
 pub async fn load_boot_history(
     feed: &mut SourceFeed,
     live_timeline: u32,
     stored_timeline: u32,
 ) -> Result<TimelineHistory> {
-    if live_timeline <= 1 {
-        return Ok(TimelineHistory::root(live_timeline));
+    if let Some(history) = source_history(feed, live_timeline).await? {
+        return Ok(history);
     }
-    let missing = || {
-        format!(
+    // Timeline 1's absent file is the shape of the chain, not a missing proof
+    if live_timeline > 1 {
+        let missing = format!(
             "source reports timeline {live_timeline} but serves no history file for it, \
              so nothing can be placed against its ancestry",
-        )
-    };
-    let Some(raw) = feed.timeline_history(live_timeline).await? else {
+        );
         anyhow::ensure!(
             live_timeline == stored_timeline,
-            "history_missing: {}, and stored timeline {stored_timeline} needs that proof",
-            missing(),
+            "history_missing: {missing}, and stored timeline {stored_timeline} needs that proof",
         );
-        tracing::warn!(target: "walshadow", live_timeline, "history_missing: {}", missing());
-        return Ok(TimelineHistory::root(live_timeline));
-    };
-    TimelineHistory::parse(live_timeline, &raw)
-        .with_context(|| format!("history_malformed: timeline {live_timeline}"))
+        tracing::warn!(target: "walshadow", live_timeline, "history_missing: {missing}");
+    }
+    Ok(TimelineHistory::root(live_timeline))
 }
 
 /// History bytes for `tli`: the chain already holds the target's, every

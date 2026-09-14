@@ -7,7 +7,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, watch};
 use walshadow::backfill_staging::{self, StagingRel, StagingSession};
 use walshadow::backfill_types::BackupRequest;
 use walshadow::ch_emitter::{EmitterConfig, EmitterStats};
@@ -18,6 +18,7 @@ use walshadow::runtime_config::InitialLoadMode;
 use walshadow::schema::{RelDescriptor, RelName};
 use walshadow::shadow::Shadow;
 use walshadow::shadow_catalog::{ShadowCatalog, ShadowCatalogConfig};
+use walshadow::timeline::TimelineHistory;
 
 struct Fixture {
     source: Shadow,
@@ -150,6 +151,7 @@ impl Fixture {
                 self.log.clone(),
                 dir,
                 None,
+                watch::channel(Arc::new(TimelineHistory::root(1))).1,
                 None,
                 None,
             )

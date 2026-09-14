@@ -97,7 +97,7 @@ pub async fn replay_segments(
         .await
         .context("bootstrap window leg: open")?;
     let db_oid = leg.db_oid;
-    let drive = pump_segments_through(segments, cfg.timeline, db_oid, &mut leg.sink).await;
+    let drive = pump_segments_through(segments, db_oid, &mut leg.sink).await;
     if let Err(e) = drive {
         leg.quiesce().await;
         return Err(e.context("bootstrap window leg: replay segments"));
