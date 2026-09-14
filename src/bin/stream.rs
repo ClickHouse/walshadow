@@ -5452,6 +5452,32 @@ async fn fetch_wal_into_pg_wal(
         .await
         .with_context(|| format!("fetch WAL {name} -> {}", dst.display()))?;
     }
+    // A direct bootstrap's tar carries pg_wal whole, history files included;
+    // this leg enumerates segments, so without it the shadow lands on a
+    // promoted branch with no `<tli>.history` and has to ask the walsender for
+    // one on its first connection. Absent from the archive is survivable —
+    // walshadow serves it from `seed_shadow_branches` — so warn, don't fail.
+    let history = walshadow::timeline::history_filename(timeline);
+    if timeline > 1 {
+        let dst = pg_wal_dir.join(&history);
+        match walrus::pg::wal::fetch::handle(
+            settings,
+            storage.clone(),
+            &history,
+            &dst,
+            walrus::pg::wal::fetch::Prefetch::Off,
+        )
+        .await
+        {
+            Ok(()) => {}
+            Err(e) => tracing::warn!(
+                target: "walshadow::bootstrap",
+                timeline,
+                error = %e,
+                "archive holds no {history}; the shadow will ask the walsender for it",
+            ),
+        }
+    }
     tracing::info!(
         target: "walshadow::bootstrap",
         fetched = segments.len(),
