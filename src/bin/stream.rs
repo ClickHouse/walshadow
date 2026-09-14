@@ -96,7 +96,7 @@ use walshadow::timeline::TimelineHistory;
 use walshadow::toast::ToastResolver;
 use walshadow::transition::{
     CrossingState, CrossingWedge, ForkGuards, Switchover, TimelineStats, TransitionError,
-    load_boot_history, seed_shadow_branches,
+    load_boot_history, seed_shadow_branches, source_history,
 };
 use walshadow::visibility::PgXactPatch;
 use walshadow::wal_stream::WalStream;
@@ -1165,6 +1165,9 @@ async fn run_session(
             history.tli_of_segment(aligned.get(), WAL_SEG_SIZE),
         ),
     };
+    // Backup passes replay archived WAL off the same branch, and outlive a
+    // crossing, so they read the chain here rather than re-deriving it
+    let (history_tx, history_rx) = watch::channel(Arc::new(history.clone()));
     // Same number, different branch: the chain places a sibling exactly where it
     // places a descendant, and only the switchpoint separates them. A stored
     // begin is the chain a previous run proved, carried forward
@@ -1679,6 +1682,7 @@ async fn run_session(
                 desc_log.clone(),
                 &args.spill_dir,
                 Some(config_rx.clone()),
+                history_rx,
                 Some(pipeline_budget.clone()),
                 oracle.clone(),
             )
@@ -2607,6 +2611,7 @@ async fn run_session(
                             "crossed source timeline",
                         );
                         history = crossed.history;
+                        history_tx.send_replace(Arc::new(history.clone()));
                         crossing.committed();
                         source_swap_pending = false;
                         source_swap_retry_at = None;
@@ -4049,23 +4054,8 @@ async fn resume_source_feed(
         ident.timeline,
         branch.timeline,
     );
-    let raw_history = if ident.timeline > 1 {
-        feed.timeline_history(ident.timeline)
-            .await
-            .context("TIMELINE_HISTORY")?
-    } else {
-        None
-    };
-    match raw_history {
-        Some(raw) => {
-            let history = TimelineHistory::parse(ident.timeline, &raw).map_err(|source| {
-                TransitionError::HistoryMalformed {
-                    tli: ident.timeline,
-                    source,
-                }
-            })?;
-            prove_branch(&history, branch, resume_lsn.get())?;
-        }
+    match source_history(&mut feed, ident.timeline).await? {
+        Some(history) => prove_branch(&history, branch, resume_lsn.get())?,
         // Timeline 1 has no history file, and a source serving none for a newer
         // branch can place nothing; only a run that never left the branch it is
         // asking for is provable without one
@@ -5395,12 +5385,10 @@ async fn fetch_archive_segment(
     start_lsn: u64,
 ) -> Result<(String, Vec<u8>)> {
     let seg_start = WalStream::align_down(start_lsn, WAL_SEG_SIZE);
-    let seg_end = seg_start + WAL_SEG_SIZE - 1;
-    let segments = walshadow::backup_backfill::fetch_gap_segments(
-        settings, storage, seg_dir, timeline, seg_start, seg_end,
-    )
-    .await
-    .context("fetch archive WAL")?;
+    let names = segments_covering(timeline, seg_start..seg_start + WAL_SEG_SIZE);
+    let segments = walshadow::backup_backfill::fetch_segments(settings, storage, seg_dir, &names)
+        .await
+        .context("fetch archive WAL")?;
     let [(segment, path)] = segments.as_slice() else {
         anyhow::bail!(
             "archive fetch returned {} segments for one-segment range",

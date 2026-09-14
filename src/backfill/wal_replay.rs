@@ -399,21 +399,25 @@ impl SegmentSink for DropSegments {
     }
 }
 
-/// Drive fetched segments through `RecordSink` in LSN order
+/// Replay fetched segments in LSN order, following each segment's timeline
 pub async fn pump_segments_through(
     segments: &[(SegmentName, PathBuf)],
-    timeline: u32,
     target_db_oid: Oid,
     sink: &mut (dyn RecordSink + Send),
 ) -> Result<()> {
     let Some((first, _)) = segments.first() else {
         return Ok(());
     };
-    let mut stream = WalStream::new(timeline, WAL_SEG_SIZE, first.start_lsn(WAL_SEG_SIZE))
+    let mut stream = WalStream::new(first.timeline, WAL_SEG_SIZE, first.start_lsn(WAL_SEG_SIZE))
         .map_err(|e| anyhow::anyhow!("wal_replay: WalStream: {e}"))?;
     stream.filter_mut().set_target_db(target_db_oid);
     let mut seg_sink = DropSegments;
     for (seg, path) in segments {
+        if seg.timeline != stream.timeline() {
+            stream
+                .adopt_timeline(seg.timeline)
+                .map_err(|e| anyhow::anyhow!("wal_replay: {}: {e}", seg.format()))?;
+        }
         let bytes = tokio::fs::read(path)
             .await
             .with_context(|| format!("read {}", path.display()))?;
@@ -573,6 +577,106 @@ mod tests {
         let patch = patch.lock().unwrap();
         assert_eq!(status(&patch, PREPARED_XID), XidStatus::Aborted);
         assert_ne!(status(&patch, FINISHER_XID), XidStatus::Aborted);
+    }
+
+    #[derive(Default)]
+    struct CountingSink(usize);
+
+    impl RecordSink for CountingSink {
+        fn on_record<'a>(
+            &'a mut self,
+            _record: &'a Record<'a>,
+        ) -> Pin<Box<dyn Future<Output = std::result::Result<(), SinkError>> + Send + 'a>> {
+            self.0 += 1;
+            Box::pin(std::future::ready(Ok(())))
+        }
+    }
+
+    /// Write two records followed by zeros, which mark end of valid WAL
+    async fn write_segment(dir: &Path, seg: SegmentName) -> PathBuf {
+        use walrus::pg::walparser::{
+            RmId, WAL_PAGE_SIZE, X_LOG_RECORD_HEADER_SIZE, XLP_LONG_HEADER, XLP_PAGE_MAGIC_PG15,
+            XLR_BLOCK_ID_DATA_SHORT,
+        };
+        let mut rec = Vec::new();
+        rec.extend_from_slice(&0u32.to_le_bytes()); // total_len backpatched
+        rec.extend_from_slice(&0u32.to_le_bytes()); // xid
+        rec.extend_from_slice(&0u64.to_le_bytes()); // prev
+        rec.push(0); // info
+        rec.push(RmId::Clog as u8);
+        rec.extend_from_slice(&[0u8; 2]); // pad
+        rec.extend_from_slice(&0u32.to_le_bytes()); // crc backpatched
+        rec.push(XLR_BLOCK_ID_DATA_SHORT);
+        rec.push(4);
+        rec.extend_from_slice(&[0xDEu8; 4]);
+        let total = (X_LOG_RECORD_HEADER_SIZE + 6) as u32;
+        assert_eq!(total as usize, rec.len());
+        rec[0..4].copy_from_slice(&total.to_le_bytes());
+        let crc = crate::filter::rewrite::compute_crc(&rec);
+        rec[20..24].copy_from_slice(&crc.to_le_bytes());
+
+        let mut page = Vec::with_capacity(WAL_PAGE_SIZE as usize);
+        page.extend_from_slice(&XLP_PAGE_MAGIC_PG15.to_le_bytes());
+        page.extend_from_slice(&XLP_LONG_HEADER.to_le_bytes());
+        page.extend_from_slice(&seg.timeline.to_le_bytes());
+        page.extend_from_slice(&seg.start_lsn(WAL_SEG_SIZE).to_le_bytes());
+        page.extend_from_slice(&0u32.to_le_bytes()); // remaining_data_len
+        page.extend_from_slice(&12345u64.to_le_bytes()); // sysid
+        page.extend_from_slice(&(WAL_SEG_SIZE as u32).to_le_bytes());
+        page.extend_from_slice(&(WAL_PAGE_SIZE as u32).to_le_bytes());
+        page.extend_from_slice(&[0u8; 4]); // pad to 40
+        for _ in 0..2 {
+            page.extend_from_slice(&rec);
+            let pad = (8 - (page.len() % 8)) % 8;
+            page.extend(std::iter::repeat_n(0u8, pad));
+        }
+
+        let path = dir.join(seg.format());
+        let mut file = tokio::fs::File::create(&path).await.unwrap();
+        tokio::io::AsyncWriteExt::write_all(&mut file, &page)
+            .await
+            .unwrap();
+        // Keep zero tail sparse
+        file.set_len(WAL_SEG_SIZE).await.unwrap();
+        path
+    }
+
+    #[tokio::test]
+    async fn pump_crosses_a_timeline_switch_between_segments() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut segments = Vec::new();
+        for (timeline, seg_no) in [(1u32, 1u32), (2, 2)] {
+            let seg = SegmentName {
+                timeline,
+                log_id: 0,
+                seg_no,
+            };
+            segments.push((seg, write_segment(tmp.path(), seg).await));
+        }
+        let mut sink = CountingSink::default();
+        pump_segments_through(&segments, DB, &mut sink)
+            .await
+            .unwrap();
+        assert_eq!(sink.0, 4, "two records out of each branch's segment");
+    }
+
+    #[tokio::test]
+    async fn pump_refuses_a_segment_below_the_branch_it_reached() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut segments = Vec::new();
+        for (timeline, seg_no) in [(2u32, 1u32), (1, 2)] {
+            let seg = SegmentName {
+                timeline,
+                log_id: 0,
+                seg_no,
+            };
+            segments.push((seg, write_segment(tmp.path(), seg).await));
+        }
+        let mut sink = CountingSink::default();
+        let err = pump_segments_through(&segments, DB, &mut sink)
+            .await
+            .expect_err("a descending branch is not a lineage");
+        assert!(err.to_string().contains("timeline"), "{err}");
     }
 
     /// Reject payloads missing subxact list

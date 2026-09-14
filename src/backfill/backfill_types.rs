@@ -12,6 +12,7 @@ use crate::emit::ch_emitter::{EmitterConfig, EmitterStats};
 use crate::mapping::MappingHandle;
 use crate::ops::oracle::Oracle;
 use crate::schema::RelDescriptor;
+use crate::source::timeline::TimelineHistory;
 
 #[derive(Debug, Clone)]
 pub struct BackupRequest {
@@ -28,6 +29,9 @@ pub struct PassContext {
     pub log: Arc<DescriptorLog>,
     pub scratch_dir: PathBuf,
     pub config_rx: Option<watch::Receiver<Arc<ResolvedConfig>>>,
+    /// Branch the stream proved, re-seated at a crossing: a backup pass names
+    /// gap segments off it rather than re-deriving lineage from the archive
+    pub history_rx: watch::Receiver<Arc<TimelineHistory>>,
     pub budget: Option<MemoryBudget>,
     pub oracle: Option<Arc<Oracle>>,
 }

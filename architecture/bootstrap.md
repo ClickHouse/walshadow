@@ -33,6 +33,10 @@ COPY loads use PostgreSQL's SQL visibility. Backup-based loads use page walk and
 WAL replay without replacing existing shadow. Destination staging separates
 partial initial state from published table
 
+Replay of archived WAL between backup and selection point follows the branch the
+stream proved, cross-checked against archived history. Reject backups whose redo
+or finish lies outside that branch, including loads without gap replay
+
 For backup-based table loads, a durable ledger tracks load and swap progress
 After staged rows are ready, table exchange publishes them and live changes are
 reconciled. Restart must distinguish a swap that has already happened from one

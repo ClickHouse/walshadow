@@ -24,11 +24,14 @@
 //!
 //! ## object_store sequencing
 //!
-//! sentinel → fetch gap segments → records-only pre-scan (catalog-skew
-//! abort + [`PgXactPatch`] harvest) → filtered walk (gate resolves deferred
-//! tuples against backup pg_xact + patch at successful walk EOF) → gap replay
-//! through [`WalReplaySink`], shared with greenfield window replay. Rows use
-//! commit LSNs and stop at each relation's coverage bound.
+//! Resolve archive lineage, fetch gap segments, pre-scan for catalog skew and
+//! [`PgXactPatch`], then walk backup. Resolve deferred tuples against backup
+//! pg_xact + patch at successful walk EOF. Replay gap through [`WalReplaySink`]
+//! using commit LSNs, up to each relation's coverage bound
+//!
+//! Follow promotions along the branch the stream proved, cross-checked against
+//! archived history by [`crate::source::archive_history`] before a gap replay
+//! Reject backups whose redo or finish lies outside that branch
 //!
 //! The pre-scan aborts on gap writes that would invalidate the walk: a
 //! pg_class / pg_attribute new-tuple write whose row oid is (or cannot be
@@ -53,7 +56,7 @@ use crate::backfill::backup_page_walk::{
     BOOTSTRAP_TUPLE_CHANNEL_CAP, BackfillTuple, CatalogMap, PageWalkSink,
 };
 use crate::backfill::backup_sentinel::build_lsn_pair;
-use crate::backfill::backup_source::{BackupSink, BackupSource, PumpStats};
+use crate::backfill::backup_source::{BackupSink, BackupSource, EndInfo, PumpStats, StartInfo};
 use crate::backfill::backup_source_direct::DirectSource;
 use crate::backfill::backup_source_object_store::ObjectStoreSource;
 use crate::backfill::spool::{DEFERRED_SPOOL_MEM_MAX, DeferredSpool};
@@ -74,9 +77,11 @@ use crate::filter::main_data::{parse_xl_heap_truncate, parse_xl_relmap_update};
 use crate::filter::pg_class_decoder::{
     DecodeOutcome, decode_pg_class_tuple, info_carries_new_tuple_heap,
 };
-use crate::record::{Record, RecordSink, SinkError, segments_covering};
+use crate::record::{Record, RecordSink, SinkError, segments_covering_lineage};
 use crate::runtime_config::InitialLoadMode;
 use crate::schema::RelDescriptor;
+use crate::source::archive_history;
+use crate::source::timeline::TimelineHistory;
 use crate::toast::ToastResolver;
 use crate::xact::xact_buffer::{XactBuffer, XactBufferConfig};
 use ahash::{HashMap, HashSet, HashSetExt};
@@ -171,9 +176,12 @@ async fn run_object_store_pass(ctx: &PassContext, reqs: &[BackupRequest]) -> Res
             sentinel.sentinel.increment_from
         );
     }
-    let (start, _end) = build_lsn_pair(&resolved, &sentinel)?;
+    let (start, end) = build_lsn_pair(&resolved, &sentinel)?;
     let b_redo = start.start_lsn;
     let s_max = reqs.iter().map(|r| r.s_lsn).max().unwrap_or(0);
+    let seg_dir = ctx.scratch_dir.join("gap_wal");
+    let history = ctx.history_rx.borrow().clone();
+    validate_backup_lineage(&history, &start, &end)?;
 
     let mut outcome = PassOutcome {
         b_redo,
@@ -182,30 +190,28 @@ async fn run_object_store_pass(ctx: &PassContext, reqs: &[BackupRequest]) -> Res
 
     // Gap leg only when the backup predates an opt-in boundary
     let (patch, gap_segments) = if b_redo < s_max {
-        let seg_dir = ctx.scratch_dir.join("gap_wal");
-        let segments =
-            fetch_gap_segments(settings, &storage, &seg_dir, start.timeline, b_redo, s_max)
-                .await
-                .context(
-                    "backup_backfill: fetch archive WAL for the gap (a timeline switch or archive \
-             gap aborts; remedy: fresher backup, or initial_load='copy')",
-                )?;
+        // Only a replay leg reads the archive's own WAL, so only it needs the
+        // archive to agree on the chain serving those segments
+        archive_history::verify(settings, &storage, &seg_dir, &history)
+            .await
+            .context("backup_backfill: cross-check archived timeline history")?;
+        let names =
+            segments_covering_lineage(&history, start.timeline, b_redo..s_max.saturating_add(1));
+        let segments = fetch_segments(settings, &storage, &seg_dir, &names)
+            .await
+            .context(
+                "backup_backfill: fetch archive WAL for the gap (an archive gap or unarchived \
+             timeline history aborts; remedy: fresher backup, or initial_load='copy')",
+            )?;
         outcome.gap_segments = segments.len() as u32;
         let filter_oids: HashSet<u32> = reqs.iter().map(|r| r.desc.oid).collect();
         let current_rfns: HashMap<u32, u32> = reqs
             .iter()
             .map(|r| (r.desc.oid, r.desc.rfn.rel_node))
             .collect();
-        let patch = prescan_gap(
-            &segments,
-            start.timeline,
-            target_db,
-            &filter_oids,
-            &current_rfns,
-            s_max,
-        )
-        .await
-        .context("backup_backfill: gap catalog pre-scan")?;
+        let patch = prescan_gap(&segments, target_db, &filter_oids, &current_rfns, s_max)
+            .await
+            .context("backup_backfill: gap catalog pre-scan")?;
         (patch, segments)
     } else {
         (PgXactPatch::new(), Vec::new())
@@ -230,16 +236,12 @@ async fn run_object_store_pass(ctx: &PassContext, reqs: &[BackupRequest]) -> Res
         reqs,
         &tags,
         patch,
-        had_gap.then_some((gap_segments, start.timeline, b_redo)),
+        had_gap.then_some((gap_segments, b_redo)),
         &mut outcome,
     )
     .await?;
     // Fetched segments only help a *failed* pass resume; reclaim on success
-    if had_gap {
-        tokio::fs::remove_dir_all(ctx.scratch_dir.join("gap_wal"))
-            .await
-            .ok();
-    }
+    tokio::fs::remove_dir_all(&seg_dir).await.ok();
     Ok(outcome)
 }
 
@@ -247,8 +249,8 @@ fn rfn_key(desc: &RelDescriptor) -> (Oid, Oid) {
     (desc.rfn.db_node, desc.rfn.rel_node)
 }
 
-/// Gap replay inputs: fetched segments, timeline, `B_redo`.
-type ReplayLeg = (Vec<(SegmentName, PathBuf)>, u32, u64);
+/// Gap replay inputs: fetched segments, `B_redo`
+type ReplayLeg = (Vec<(SegmentName, PathBuf)>, u64);
 
 /// Shared trunk: filter map (+ toast rels), gated walk into a dedicated
 /// insert tail, then an optional gap replay continuing the seq space.
@@ -397,7 +399,7 @@ async fn walk_and_ship(
     };
 
     let mut next_seq = drain_outcome.next_seq;
-    if let Some((segments, timeline, b_redo)) = replay {
+    if let Some((segments, b_redo)) = replay {
         let s_by_rfn: ReplayTargets = reqs
             .iter()
             .map(|r| (rfn_key(&r.desc), (r.desc.clone(), r.s_lsn)))
@@ -405,7 +407,6 @@ async fn walk_and_ship(
         let replay_res = replay_gap(
             ctx,
             &segments,
-            timeline,
             b_redo,
             s_by_rfn,
             resolver.clone(),
@@ -471,22 +472,41 @@ async fn gate_task(
 // Gap segment fetch
 // ---------------------------------------------------------------------------
 
-/// Fetch archive WAL covering `[from, to]` on `timeline` into `seg_dir`.
-/// A missing segment (archive gap, or the archive switched timelines) errors
-/// through wal-rus's `fetch::handle`. Exposed for restart archive fallback
-/// (see the `fetch_archive_segment` / `SourceRecovery` path in the stream binary).
-pub async fn fetch_gap_segments(
+fn validate_backup_lineage(
+    history: &TimelineHistory,
+    start: &StartInfo,
+    end: &EndInfo,
+) -> Result<()> {
+    anyhow::ensure!(
+        start.start_lsn < end.end_lsn && start.timeline == end.timeline,
+        "backup_backfill: invalid backup WAL range",
+    );
+    if !history.proves_ancestor(start.timeline, start.start_lsn)
+        || !history.proves_ancestor(end.timeline, end.end_lsn - 1)
+    {
+        bail!(
+            "backup_backfill: backup WAL range [{:#X}, {:#X}) on timeline {} is outside \
+             source timeline {}'s history. Remedies: a backup on the source's own lineage, \
+             or initial_load='copy'",
+            start.start_lsn,
+            end.end_lsn,
+            start.timeline,
+            history.target(),
+        );
+    }
+    Ok(())
+}
+
+/// Fetch archived `segments` into `seg_dir`, failing on missing segments
+pub async fn fetch_segments(
     settings: &walrus::config::Settings,
     storage: &walrus::storage::DynStorage,
     seg_dir: &Path,
-    timeline: u32,
-    from: u64,
-    to: u64,
+    segments: &[SegmentName],
 ) -> Result<Vec<(SegmentName, PathBuf)>> {
     tokio::fs::create_dir_all(seg_dir)
         .await
         .with_context(|| format!("create {}", seg_dir.display()))?;
-    let segments = segments_covering(timeline, from..to.saturating_add(1));
     let mut out = Vec::with_capacity(segments.len());
     for seg in segments {
         let name = seg.format();
@@ -502,7 +522,7 @@ pub async fn fetch_gap_segments(
             .await
             .with_context(|| format!("fetch WAL {name}"))?;
         }
-        out.push((seg, dst));
+        out.push((*seg, dst));
     }
     Ok(out)
 }
@@ -516,7 +536,6 @@ pub async fn fetch_gap_segments(
 async fn replay_gap(
     ctx: &PassContext,
     segments: &[(SegmentName, PathBuf)],
-    timeline: u32,
     b_redo: u64,
     targets: ReplayTargets,
     resolver: ToastResolver,
@@ -569,7 +588,7 @@ async fn replay_gap(
         // Pre-scan already harvested transaction patch
         patch: None,
     });
-    pump_segments_through(segments, timeline, ctx.log.db_oid(), &mut sink).await?;
+    pump_segments_through(segments, ctx.log.db_oid(), &mut sink).await?;
     Ok(sink.stats())
 }
 
@@ -585,7 +604,6 @@ async fn replay_gap(
 /// segment carries such records.
 async fn prescan_gap(
     segments: &[(SegmentName, PathBuf)],
-    timeline: u32,
     target_db_oid: Oid,
     filter_oids: &HashSet<u32>,
     current_rfns: &HashMap<u32, u32>,
@@ -599,7 +617,7 @@ async fn prescan_gap(
         skew: None,
         s_max,
     };
-    pump_segments_through(segments, timeline, target_db_oid, &mut sink).await?;
+    pump_segments_through(segments, target_db_oid, &mut sink).await?;
     if let Some(reason) = sink.skew {
         bail!(
             "backup_backfill: catalog skew in the backup→opt-in gap ({reason}); the walk \
@@ -1411,5 +1429,57 @@ mod tests {
         let err = gate.await.unwrap().unwrap_err();
         assert!(err.contains("pg_multixact"), "{err}");
         assert!(err.contains("initial_load='copy'"), "{err}");
+    }
+
+    fn backup_range(timeline: u32, range: std::ops::Range<u64>) -> (StartInfo, EndInfo) {
+        (
+            StartInfo {
+                timeline,
+                start_lsn: range.start,
+                tablespaces: Vec::new(),
+            },
+            EndInfo {
+                timeline,
+                end_lsn: range.end,
+            },
+        )
+    }
+
+    #[test]
+    fn backup_must_finish_before_source_leaves_its_timeline() {
+        let history = TimelineHistory::parse(2, b"1\t0/3000000\tpromotion\n").unwrap();
+        for (timeline, range, valid) in [
+            (1, 0x100_0000..0x200_0000, true),
+            (1, 0x100_0000..0x300_0000, true),
+            (1, 0x100_0000..0x300_0001, false),
+            (1, 0x400_0000..0x500_0000, false),
+            (2, 0x200_0000..0x400_0000, false),
+            (2, 0x300_0000..0x400_0000, true),
+            (3, 0x400_0000..0x500_0000, false),
+        ] {
+            let (start, end) = backup_range(timeline, range.clone());
+            let result = validate_backup_lineage(&history, &start, &end);
+            assert_eq!(
+                result.is_ok(),
+                valid,
+                "timeline {timeline}, {range:#X?}: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn backup_rejects_sibling_timeline() {
+        let history = TimelineHistory::parse(3, b"1\t0/3000000\tpromotion\n").unwrap();
+        let (start, end) = backup_range(2, 0x400_0000..0x500_0000);
+        let err = validate_backup_lineage(&history, &start, &end).unwrap_err();
+        assert!(err.to_string().contains("outside"), "{err}");
+    }
+
+    #[test]
+    fn backup_rejects_empty_or_reversed_range() {
+        for (from, to) in [(0, 0), (2, 1)] {
+            let (start, end) = backup_range(1, from..to);
+            assert!(validate_backup_lineage(&TimelineHistory::root(1), &start, &end).is_err());
+        }
     }
 }

@@ -37,9 +37,11 @@ archive file for a complete required segment
 Make verified fork prefix available to archive-only shadow recovery or report
 explicit wait for segment durability. Test restart before segment fills
 
-Use same history rules for object-store bootstrap, table backfill, gap pre-scan,
-gap replay, and direct backup from a standby. A backup's timeline is lineage
-input, not proof it belongs to current source. Reject backups outside ancestry
+Object-store bootstrap WAL hydration, its window leg, landed-WAL filtering, and
+direct backup from a standby resolve branches through
+[archive history](../src/source/archive_history.rs), on the same rules as the
+table load's gap. A backup's timeline is lineage input, not proof it belongs to
+current source. Reject backups outside ancestry
 
 Once archive fallback covers these cases, prove slotless pause can resume after
 source recycles WAL. Missing history or segments must still stop replication
@@ -63,8 +65,9 @@ aborted continuation evidence expected by PostgreSQL reader, accepting page flag
 alone cannot make shadow cross safely. Test failure without shadow PANIC/FATAL,
 then enable only after source and shadow agree on overwritten LSN
 
-Use one lineage resolver for live fallback, backup gap pre-scan, gap replay,
-and backfill. Resolve filename per segment and owning branch per record range
+Live archive fallback resolves each segment through the same archive-history
+resolver the table load's gap uses, rather than the branch it happens to stream.
+Resolve filename per segment and owning branch per record range
 Handle multiple forks inside one segment and suppress repeated prefixes only
 after validation, never send prefix twice through filter or decoder. Place
 history files before shadow requests descendant WAL

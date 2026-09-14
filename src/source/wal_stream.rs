@@ -472,6 +472,23 @@ impl WalStream {
         Ok(Self::align_down(switch_lsn, self.seg_size))
     }
 
+    /// Adopt a higher timeline at a segment boundary, preserving buffered WAL
+    /// `XLogFileReadAnyTLI` (`access/transam/xlogrecovery.c`) reads fork segments
+    /// from descendant files, which include ancestor prefixes
+    pub fn adopt_timeline(&mut self, tli: u32) -> Result<(), WalStreamError> {
+        if tli <= self.timeline {
+            return Err(WalStreamError::TimelineNotAbove {
+                current_tli: self.timeline,
+                next_tli: tli,
+            });
+        }
+        if !self.next_lsn.is_multiple_of(self.seg_size) {
+            return Err(WalStreamError::UnalignedBase(self.next_lsn));
+        }
+        self.timeline = tli;
+        Ok(())
+    }
+
     /// Roll raw source bytes into the current segment's digest, restarting at
     /// every segment boundary the input crosses. Keyed off LSN rather than
     /// flush cadence, so a record straddling a boundary cannot shift it.
@@ -1247,6 +1264,48 @@ mod tests {
             .unwrap();
         let (name, _, _) = &seg.segments[0];
         assert_eq!(name.timeline, 2, "fork segment carries the descendant name");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn adopt_relabels_segments_without_dropping_bytes() {
+        const SEG: u64 = 8192;
+        let mut ws = WalStream::new(1, SEG, 0).unwrap();
+        let mut rec = CollectingRecordSink::default();
+        let mut seg = CollectingSegmentSink::default();
+        ws.push(0, &synth_two_record_page(), &mut rec, &mut seg)
+            .await
+            .unwrap();
+        ws.adopt_timeline(2).unwrap();
+        assert_eq!(ws.next_lsn(), SEG, "frontier untouched");
+        assert_eq!(seg.segments[0].0.timeline, 1, "sealed under the ancestor");
+
+        ws.push(SEG, &synth_two_record_page(), &mut rec, &mut seg)
+            .await
+            .unwrap();
+        assert_eq!(seg.segments[1].0.timeline, 2);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn adopt_refuses_an_older_branch_or_a_mid_segment_position() {
+        const SEG: u64 = 2 * 8192;
+        let mut ws = WalStream::new(4, SEG, 0).unwrap();
+        assert!(matches!(
+            ws.adopt_timeline(4),
+            Err(WalStreamError::TimelineNotAbove {
+                current_tli: 4,
+                next_tli: 4
+            }),
+        ));
+        let mut rec = CollectingRecordSink::default();
+        let mut seg = CollectingSegmentSink::default();
+        ws.push(0, &synth_two_record_page(), &mut rec, &mut seg)
+            .await
+            .unwrap();
+        assert!(matches!(
+            ws.adopt_timeline(5),
+            Err(WalStreamError::UnalignedBase(8192)),
+        ));
+        assert_eq!(ws.timeline(), 4, "a refused adoption changes nothing");
     }
 
     #[tokio::test(flavor = "current_thread")]

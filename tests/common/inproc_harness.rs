@@ -909,6 +909,10 @@ async fn build_pipeline_inner(
                     desc_log.clone(),
                     &spill_dir,
                     Some(config_rx.clone()),
+                    tokio::sync::watch::channel(Arc::new(
+                        walshadow::timeline::TimelineHistory::root(1),
+                    ))
+                    .1,
                     None,
                     oracle.clone(),
                 )
