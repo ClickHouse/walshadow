@@ -40,8 +40,8 @@
 //! `attmissingval` arrives as PG `typoutput` text form (see
 //! `parse_array_one_element` in `shadow_catalog.rs`); routed through
 //! `heap_decoder::missing_value_for(att) → ColumnValue`, rendered via
-//! [`column_value_to_sql_literal`]. Tier-3 / unknown fall through to
-//! `String`-typed default.
+//! [`column_value_to_sql_literal`]. A tier-3 default that reached us as raw
+//! on-disk bytes rather than text has no CH literal and is dropped.
 
 use crate::decode::heap_decoder::{self, ColumnValue};
 use crate::schema::{
@@ -252,13 +252,14 @@ pub fn column_value_to_sql_literal(v: &ColumnValue, ch_inner: &str) -> Option<St
         ColumnValue::Interval(v) => Some(sql_string_literal(&v.to_text())),
         ColumnValue::Inet(v) => Some(sql_string_literal(&v.to_text())),
         ColumnValue::Uuid(b) => Some(format!("toUUID({})", sql_string_literal(&format_uuid(b)))),
-        ColumnValue::PgPending { raw, .. } => {
-            // Render raw typoutput bytes as String default; non-String CH inner
-            // lands as a cast, matching PG `DEFAULT typeinput('…')` semantics
-            Some(sql_bytes_literal(raw))
-        }
-        ColumnValue::PgPendingText { text, .. } => Some(sql_bytes_literal(text.as_bytes())),
-        ColumnValue::ExternalToast(_) | ColumnValue::Unsupported { .. } => None,
+        // `PgPending.raw` is the on-disk datum, not typoutput text — jsonb
+        // binary, numeric binary — so only the oracle can render it. CH casts
+        // a column's DEFAULT to the column type at DDL time, and binary jsonb
+        // against `JSON` is a hard parse error, not a wrong value
+        ColumnValue::PgPendingText { text, .. } => Some(sql_string_literal(text)),
+        ColumnValue::PgPending { .. }
+        | ColumnValue::ExternalToast(_)
+        | ColumnValue::Unsupported { .. } => None,
     }
 }
 
@@ -394,6 +395,24 @@ mod tests {
             type_storage: 'p',
             missing_default: missing.map(|s| crate::schema::MissingDefault::Text(s.into())),
         }
+    }
+
+    /// `attmissingval` is a one-element `anyarray`: header, then the element at
+    /// MAXALIGN(24). The element is the jsonb datum behind its varlena header,
+    /// and `{}` is the four-byte jsonb container header, native-endian
+    fn attmissingval_empty_object() -> Vec<u8> {
+        const JSONB_EMPTY_OBJECT: [u8; 4] = [0x00, 0x00, 0x00, 0x20];
+        let mut v = Vec::with_capacity(32);
+        v.extend_from_slice(&0u32.to_le_bytes()); // vl_len_, ignored
+        v.extend_from_slice(&1i32.to_le_bytes()); // ndim
+        v.extend_from_slice(&0i32.to_le_bytes()); // dataoffset, no null bitmap
+        v.extend_from_slice(&JSONBOID.to_le_bytes());
+        v.extend_from_slice(&1i32.to_le_bytes()); // dims[0]
+        v.extend_from_slice(&1i32.to_le_bytes()); // lbounds[0]
+        let total = VARHDRSZ as u32 + JSONB_EMPTY_OBJECT.len() as u32;
+        v.extend_from_slice(&(total << 2).to_le_bytes());
+        v.extend_from_slice(&JSONB_EMPTY_OBJECT);
+        v
     }
 
     #[test]
@@ -668,17 +687,52 @@ mod tests {
     }
 
     #[test]
-    fn default_for_timestamp_renders_pgpending_bytes() {
-        // missing_value_for routes TIMESTAMPTZ through PgPending; literal
-        // writer emits raw typoutput bytes via `unhex(...)` not
-        // `toDateTime64(...)`, typed path needs oracle round-trip
+    fn default_for_timestamp_renders_pgpending_text() {
+        // missing_value_for routes TIMESTAMPTZ through PgPendingText; the
+        // literal writer quotes the typoutput text and leaves CH to cast it,
+        // rather than rebuilding `toDateTime64(...)` without the oracle
         let r = map(
             &attr(TIMESTAMPTZOID, 6, true, Some("2024-01-02 03:04:05+00")),
             false,
         )
         .unwrap();
-        let d = r.default_sql.expect("default rendered");
-        assert!(d.starts_with("unhex('"), "{d}");
+        assert_eq!(r.default_sql.as_deref(), Some("'2024-01-02 03:04:05+00'"),);
+    }
+
+    /// A fast-path `ADD COLUMN jsonb DEFAULT '{}'` leaves `attmissingval`
+    /// holding the *binary* jsonb datum, and `JSONB` maps to CH `JSON`.
+    /// Rendering those bytes produced `DEFAULT unhex('00000020')`, which CH
+    /// rejects — "Cannot parse JSON object here ... default expression and
+    /// column type are incompatible" — failing the DDL and, since the DDL
+    /// replays on every boot, crash-looping the daemon
+    #[test]
+    fn raw_jsonb_default_is_dropped_not_rendered_as_bytes() {
+        let mut att = attr(JSONBOID, -1, true, None);
+        att.type_byval = false;
+        att.type_len = -1;
+        att.type_storage = 'x';
+        att.missing_default = Some(crate::schema::MissingDefault::Raw(
+            attmissingval_empty_object(),
+        ));
+        // The decode really does reach the datum; it is the rendering that
+        // has to refuse, not a silently unreadable default
+        assert_eq!(
+            heap_decoder::missing_value_for(&att),
+            ColumnValue::PgPending {
+                type_oid: JSONBOID,
+                raw: vec![0x00, 0x00, 0x00, 0x20],
+            },
+        );
+        assert_eq!(map(&att, false).unwrap().default_sql, None);
+    }
+
+    /// The same column reached through the SQL path carries text, which does
+    /// render — as a quoted literal CH can cast, never as `unhex`
+    #[test]
+    fn text_jsonb_default_renders_a_json_literal() {
+        let r = map(&attr(JSONBOID, -1, true, Some("{}")), false).unwrap();
+        assert_eq!(r.ch_type, "JSON");
+        assert_eq!(r.default_sql.as_deref(), Some("'{}'"));
     }
 
     #[test]
