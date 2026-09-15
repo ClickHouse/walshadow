@@ -36,7 +36,7 @@ lz4 = ["clickhouse-c-rs/lz4"]
 zstd = ["clickhouse-c-rs/zstd"]
 
 [dependencies]
-wal-rus = "0.3.2"
+wal-rus = "0.3.3"
 clickhouse-c-rs = { version = "0.2", default-features = false, features = ["tokio", "tls"] }
 # hash keys are internal (relfilenodes, oids, xids, names), never network
 # input, so SipHash's HashDoS margin buys nothing at 2-4x per probe
@@ -70,7 +70,7 @@ toml = { version = "1", default-features = false, features = ["parse", "display"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt", "ansi"] }
 url = "2"
-zstd = "0.13"
+zstd = "0.14"
 opentelemetry = "0.32"
 opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
 opentelemetry-otlp = { version = "0.32", default-features = false, features = ["grpc-tonic", "trace"] }
