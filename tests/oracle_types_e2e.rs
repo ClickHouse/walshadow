@@ -249,6 +249,53 @@ async fn native_array_targets_carry_elements_and_nulls() {
     assert_eq!(row(3), "[]\t[]\t[]\t[]", "NULL array");
 }
 
+/// `ADD COLUMN` defaults supply values for rows already stored in ClickHouse
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn jsonb_fast_default_resolves_through_oracle() {
+    if skip_gate() {
+        return;
+    }
+    let (source, ch, _tmp) = run_oracle(
+        fx::Ports::alloc(),
+        "walshadow-oracle-fast-default",
+        "CREATE TABLE public.fd (id int PRIMARY KEY, payload text);\n",
+        "CREATE OR REPLACE TABLE walshadow_test.fd (\
+            id Int32, payload Nullable(String),\
+            _lsn UInt64, _xid UInt32, _commit_ts DateTime64(6, 'UTC'), _is_deleted Bool\
+         ) ENGINE = ReplacingMergeTree(_lsn, _is_deleted) ORDER BY id",
+        vec![fx::TableMappingSpec {
+            source_table: RelName::new("public", "fd"),
+            target_table: TableTarget::new("walshadow_test", "fd"),
+            columns: vec![col(1, "id", "Int32"), col(2, "payload", "Nullable(String)")],
+        }],
+        "INSERT INTO public.fd VALUES (1, 'before');\n\
+         ALTER TABLE public.fd ADD COLUMN labels jsonb DEFAULT '{\"a\": 1}';\n\
+         INSERT INTO public.fd VALUES (2, 'after', '{\"b\": 2}');\n\
+         SELECT pg_switch_wal();\n",
+    )
+    .await;
+    let _src = fx::StopOnDrop { sh: &source };
+
+    assert_eq!(
+        ch.query(
+            "SELECT default_expression FROM system.columns \
+             WHERE database = 'walshadow_test' AND table = 'fd' AND name = 'labels'"
+        )
+        .unwrap(),
+        // TSV escapes quotes in SQL literals
+        r"unhex(\'7b2261223a20317d\')",
+        "ADD COLUMN must carry the default the shadow rendered",
+    );
+    let labels = |id: i32| {
+        ch.query(&format!(
+            "SELECT labels FROM walshadow_test.fd FINAL WHERE id = {id} AND _is_deleted = 0"
+        ))
+        .unwrap()
+    };
+    assert_eq!(labels(1), r#"{"a":1}"#, "row predating the ALTER");
+    assert_eq!(labels(2), r#"{"b":2}"#);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn hstore_maps_through_the_extension_expander() {
     if skip_gate() || !extension_available("hstore") {

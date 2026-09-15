@@ -241,6 +241,30 @@ impl Oracle {
             ordinals: columns.iter().map(|c| c.ordinal).collect(),
         })
     }
+
+    /// Render one datum as PG text for SQL literals
+    pub async fn text_value(
+        &self,
+        source_type_oid: u32,
+        source_typmod: i32,
+        cell: OracleCell,
+    ) -> Result<String, OracleError> {
+        let mut buf = OracleColumnBuf::new(source_type_oid, source_typmod, "String");
+        buf.push(cell);
+        let columns = [OracleRequestColumn {
+            ordinal: 0,
+            name: "value",
+            target_type: "String",
+            buf: &buf,
+        }];
+        let block = self.encode_batch(&columns, 1, Allocator::stdlib()).await?;
+        // Single-row String data spans entire slab
+        let (_, data) = block
+            .column(0)
+            .and_then(|c| c.string())
+            .ok_or_else(|| OracleError::Response("text value came back untyped".into()))?;
+        Ok(String::from_utf8_lossy(data).into_owned())
+    }
 }
 
 /// Fixed wire cost before column cells

@@ -37,11 +37,9 @@
 //!
 //! ## Default expression
 //!
-//! `attmissingval` arrives as PG `typoutput` text form (see
-//! `parse_array_one_element` in `shadow_catalog.rs`); routed through
-//! `heap_decoder::missing_value_for(att) → ColumnValue`, rendered via
-//! [`column_value_to_sql_literal`]. Tier-3 / unknown fall through to
-//! `String`-typed default.
+//! `attmissingval` arrives as on-disk PG bytes (pinned worker) or element
+//! text (SQL path). Resolve tier-3 bytes through shadow PG before rendering
+//! `ADD COLUMN` defaults with [`column_value_to_sql_literal`]
 
 use crate::decode::heap_decoder::{self, ColumnValue};
 use crate::schema::{
@@ -252,13 +250,10 @@ pub fn column_value_to_sql_literal(v: &ColumnValue, ch_inner: &str) -> Option<St
         ColumnValue::Interval(v) => Some(sql_string_literal(&v.to_text())),
         ColumnValue::Inet(v) => Some(sql_string_literal(&v.to_text())),
         ColumnValue::Uuid(b) => Some(format!("toUUID({})", sql_string_literal(&format_uuid(b)))),
-        ColumnValue::PgPending { raw, .. } => {
-            // Render raw typoutput bytes as String default; non-String CH inner
-            // lands as a cast, matching PG `DEFAULT typeinput('…')` semantics
-            Some(sql_bytes_literal(raw))
-        }
         ColumnValue::PgPendingText { text, .. } => Some(sql_bytes_literal(text.as_bytes())),
-        ColumnValue::ExternalToast(_) | ColumnValue::Unsupported { .. } => None,
+        ColumnValue::PgPending { .. }
+        | ColumnValue::ExternalToast(_)
+        | ColumnValue::Unsupported { .. } => None,
     }
 }
 
@@ -668,10 +663,7 @@ mod tests {
     }
 
     #[test]
-    fn default_for_timestamp_renders_pgpending_bytes() {
-        // missing_value_for routes TIMESTAMPTZ through PgPending; literal
-        // writer emits raw typoutput bytes via `unhex(...)` not
-        // `toDateTime64(...)`, typed path needs oracle round-trip
+    fn default_for_timestamp_renders_text_bytes() {
         let r = map(
             &attr(TIMESTAMPTZOID, 6, true, Some("2024-01-02 03:04:05+00")),
             false,
@@ -679,6 +671,24 @@ mod tests {
         .unwrap();
         let d = r.default_sql.expect("default rendered");
         assert!(d.starts_with("unhex('"), "{d}");
+    }
+
+    /// PG jsonb `{}` has binary payload `00 00 00 20`
+    #[test]
+    fn unresolved_disk_default_never_renders_as_string() {
+        let value = ColumnValue::PgPending {
+            type_oid: JSONBOID,
+            raw: vec![0, 0, 0, 0x20],
+        };
+        for ch_type in ["JSON", "String", "Array(Nullable(Int32))"] {
+            assert_eq!(column_value_to_sql_literal(&value, ch_type), None);
+        }
+    }
+
+    #[test]
+    fn default_for_jsonb_text_renders_as_bytes() {
+        let r = map(&attr(JSONBOID, -1, true, Some("{}")), false).unwrap();
+        assert_eq!(r.default_sql.as_deref(), Some("unhex('7b7d')"));
     }
 
     #[test]

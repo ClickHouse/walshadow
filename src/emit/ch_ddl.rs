@@ -20,6 +20,7 @@
 //! then applies the schema change, then resumes. Post-DDL rows encode
 //! against the new shape.
 
+use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -29,13 +30,17 @@ use crate::catalog::type_bridge::{self, ResolvedColumn};
 use crate::ch::{ChConn, EmitterError, connect_client, exec_drain, quote_ident};
 use crate::column_rules::ColumnRules;
 use crate::config::{ConfigResolver, ResolvedConfig};
+use crate::decode::heap_decoder::{self, ColumnValue};
 use crate::emit::ch_emitter::{EmitterConfig, RetryConfig};
 use crate::mapping::{
     ColumnMapping, DropTableStrategy, MappingHandle, MappingSnapshot, NamespaceMapping,
     SystemColumns, TableMapping, TableTarget, apply_column_rule, derive_columns_for_mapping,
     fold_diff_into_mapping,
 };
-use crate::schema::{RelDescriptor, RelName, SchemaDiff, SchemaEvent, replident_key_attnums};
+use crate::ops::oracle::{Oracle, OracleCell};
+use crate::schema::{
+    MissingDefault, RelAttr, RelDescriptor, RelName, SchemaDiff, SchemaEvent, replident_key_attnums,
+};
 use crate::table_rules::{TableRule, TableRules};
 use ahash::{HashMap, HashSet, HashSetExt};
 
@@ -209,6 +214,8 @@ pub struct DdlApplicator {
     /// without a resolver): mutate the live handle directly — no republish
     /// runs in those contexts, so nothing clobbers the write.
     resolver: Option<Arc<ConfigResolver>>,
+    /// Shadow PG renderer for tier-3 fast defaults
+    oracle: Option<Arc<Oracle>>,
     ensured_databases: HashSet<String>,
     pub stats: DdlStats,
 }
@@ -240,6 +247,7 @@ impl DdlApplicator {
             retry: emitter_cfg.retry.clone(),
             query_timeout: emitter_cfg.insert_timeout,
             resolver: None,
+            oracle: None,
             ensured_databases: HashSet::new(),
             stats: DdlStats::default(),
         })
@@ -248,6 +256,12 @@ impl DdlApplicator {
     /// Route mapping writes through resolver so republished snapshots retain them
     pub fn with_resolver(mut self, resolver: Arc<ConfigResolver>) -> Self {
         self.resolver = Some(resolver);
+        self
+    }
+
+    /// Use shadow PG to render tier-3 fast defaults for `ADD COLUMN`
+    pub fn with_oracle(mut self, oracle: Option<Arc<Oracle>>) -> Self {
+        self.oracle = oracle;
         self
     }
 
@@ -424,9 +438,11 @@ impl DdlApplicator {
             self.execute(&sql).await?;
             self.stats.alters_applied += 1;
         }
+        let oracle = self.oracle.clone();
         for att in &diff.added_columns {
             let pk_member = replident_key_attnums(new).contains(&att.attnum);
-            let Ok(resolved) = type_bridge::map(att, pk_member) else {
+            let att = resolve_disk_default(oracle.as_deref(), att).await;
+            let Ok(resolved) = type_bridge::map(&att, pk_member) else {
                 // Unbridged type; operator TOML override is the recovery path
                 self.stats.skipped += 1;
                 continue;
@@ -756,6 +772,37 @@ pub fn render_add_column(target: &str, name: &str, resolved: &ResolvedColumn) ->
         s.push_str(d);
     }
     s
+}
+
+/// Pinned worker sends raw defaults to avoid `pg_type` locks during replay
+/// Resolve through shadow PG so rows predating `ADD COLUMN` read PG's fast default
+async fn resolve_disk_default<'a>(oracle: Option<&Oracle>, att: &'a RelAttr) -> Cow<'a, RelAttr> {
+    let ColumnValue::PgPending { raw, .. } = heap_decoder::missing_value_for(att) else {
+        return Cow::Borrowed(att);
+    };
+    let Some(oracle) = oracle else {
+        return Cow::Borrowed(att);
+    };
+    match oracle
+        .text_value(att.type_oid, att.typmod, OracleCell::DiskRaw(raw))
+        .await
+    {
+        Ok(text) => {
+            let mut resolved = att.clone();
+            resolved.missing_default = Some(MissingDefault::Text(text));
+            Cow::Owned(resolved)
+        }
+        Err(e) => {
+            tracing::warn!(
+                target: "walshadow::ch_ddl",
+                column = %att.name,
+                type_oid = att.type_oid,
+                error = %e,
+                "fast default left off ADD COLUMN: shadow did not render it",
+            );
+            Cow::Borrowed(att)
+        }
+    }
 }
 
 /// Shared CREATE tail: synthetic columns (mirror `TablePlan::build`),
@@ -1326,6 +1373,58 @@ mod tests {
             .unwrap()
             .expect("renderable");
         assert!(sql.ends_with("ORDER BY (`_lsn`)"), "{sql}");
+    }
+
+    /// `CREATE TABLE` starts empty, only `ADD COLUMN` needs defaults for existing rows
+    #[test]
+    fn unresolved_disk_default_renders_no_default_clause() {
+        use crate::decode::heap_decoder::{raw_missing_array, short_varlena};
+        use crate::schema::{JSONBOID, MissingDefault};
+
+        let mut labels = att(2, "labels", JSONBOID, true, None);
+        labels.type_byval = false;
+        labels.type_len = -1;
+        labels.type_storage = 'x';
+        labels.missing_default = Some(MissingDefault::Raw(raw_missing_array(
+            JSONBOID,
+            &short_varlena(&[0x01, 0x20, 0x00]),
+        )));
+        let resolved = type_bridge::map(&labels, false).unwrap();
+        assert_eq!(
+            render_add_column("default.t", "labels", &resolved),
+            "ALTER TABLE default.t ADD COLUMN IF NOT EXISTS `labels` JSON"
+        );
+        let d = desc(
+            "t",
+            vec![att(1, "id", INT4OID, true, None), labels],
+            Some(vec![1]),
+        );
+        let sql = render_create_table(
+            &d,
+            &dest("default", &d),
+            &shape(false),
+            &ColumnRules::default(),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(sql.contains("`labels` JSON,"), "{sql}");
+        assert!(!sql.contains("DEFAULT"), "{sql}");
+    }
+
+    #[test]
+    fn resolved_disk_default_renders_on_add_column() {
+        use crate::schema::JSONBOID;
+
+        let mut labels = att(2, "labels", JSONBOID, true, Some(r#"{"a": 1}"#));
+        labels.type_byval = false;
+        labels.type_len = -1;
+        labels.type_storage = 'x';
+        let resolved = type_bridge::map(&labels, false).unwrap();
+        assert_eq!(
+            render_add_column("default.t", "labels", &resolved),
+            "ALTER TABLE default.t ADD COLUMN IF NOT EXISTS `labels` JSON \
+             DEFAULT unhex('7b2261223a20317d')"
+        );
     }
 
     #[test]

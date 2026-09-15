@@ -1666,7 +1666,8 @@ async fn run_session(
         )
         .await
         .context("init DDL applicator")?
-        .with_resolver(resolver.clone());
+        .with_resolver(resolver.clone())
+        .with_oracle(oracle.clone());
         let stats = emitter_stats.clone();
         emitter_stats_handle = Some(stats.clone());
         // Backfiller for `initial_load` opt-ins (COPY / backup-sourced):
