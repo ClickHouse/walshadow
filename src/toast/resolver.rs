@@ -40,6 +40,11 @@ const FETCH_BLOCK_ROWS: usize = 1024;
 /// PG `VARHDRSZ`, 4-byte varlena header
 const VARHDRSZ: i32 = 4;
 
+/// `toast_save_datum` writes a compressed datum out from `VARDATA` (`ptr + 4`),
+/// so the chunks begin with the inline varlena's `va_tcinfo` word, which is not
+/// part of the compressed payload
+const TCINFO_LEN: usize = 4;
+
 #[derive(Debug, Error)]
 pub enum ChunkStoreError {
     #[error("toast store clickhouse: {0}")]
@@ -65,6 +70,12 @@ pub(crate) fn pointer_extsize(p: &ToastPointer) -> usize {
     (p.va_extinfo & VARLENA_EXTSIZE_MASK) as usize
 }
 
+/// `VARATT_EXTERNAL_IS_COMPRESSED`: stored fewer bytes than the value holds.
+/// Not the method bits — pglz is method 0, so those are zero for a pglz datum
+fn pointer_is_compressed(p: &ToastPointer) -> bool {
+    (pointer_extsize(p) as i64) < i64::from(p.va_rawsize - VARHDRSZ)
+}
+
 /// Validate value caps, return heap leaf-permit need
 pub(crate) fn check_value_caps(
     pointers: &[ToastPointer],
@@ -81,7 +92,7 @@ pub(crate) fn check_value_caps(
                 max,
             });
         }
-        let compressed = (p.va_extinfo & !VARLENA_EXTSIZE_MASK) != 0;
+        let compressed = pointer_is_compressed(p);
         retained += if compressed { raw } else { ext };
         if compressed {
             transient = transient.max(ext);
@@ -97,17 +108,20 @@ pub(crate) fn detoasted_value(raw: Vec<u8>, type_oid: u32) -> ColumnValue {
 
 /// Convert stored bytes to raw bytes using pointer compression method
 pub(crate) fn finish_value(p: &ToastPointer, stored: Vec<u8>) -> Result<Vec<u8>, ToastValueError> {
-    let compressed = (p.va_extinfo & !VARLENA_EXTSIZE_MASK) != 0;
-    if !compressed {
+    if !pointer_is_compressed(p) {
         return Ok(stored);
     }
     let method = ((p.va_extinfo >> VARLENA_EXTSIZE_BITS) & 0x3) as u8;
     let raw_len = (p.va_rawsize - VARHDRSZ).max(0) as usize;
-    match decompress_varlena(method, &stored, raw_len) {
+    let payload = stored.get(TCINFO_LEN..).unwrap_or(&[]);
+    match decompress_varlena(method, payload, raw_len) {
         Some(out) => Ok(out),
         None => Err(ToastValueError::Detoast(format!(
-            "decompress failed (method {method}, {} bytes → {raw_len})",
-            stored.len()
+            "decompress failed (method {method}, {} bytes \u{2192} {raw_len}) for value {} in \
+             pg_toast_{}",
+            payload.len(),
+            p.va_valueid,
+            p.va_toastrelid,
         ))),
     }
 }
@@ -1156,6 +1170,55 @@ mod tests {
 
     fn assembled(body: &[u8]) -> FetchedValue {
         FetchedValue::Assembled(body.to_vec())
+    }
+
+    const PG_LZ4_CHUNKS: &[u8] = include_bytes!("testdata/compressed_external_lz4.bin");
+    const PG_PGLZ_CHUNKS: &[u8] = include_bytes!("testdata/compressed_external_pglz.bin");
+    const PG_PLAIN: &str = include_str!("testdata/compressed_external_plain.txt");
+
+    /// Fixtures are the concatenated `pg_toast_*.chunk_data` of one
+    /// compressed-external `text` value, taken verbatim from PostgreSQL 18
+    /// with `default_toast_compression` set each way. Every other TOAST test
+    /// uses `SET STORAGE EXTERNAL`, which turns compression off, so nothing
+    /// else covers this path
+    #[test]
+    fn pg_compressed_external_chunks_carry_a_tcinfo_prefix() {
+        for (method, chunks) in [(1u8, PG_LZ4_CHUNKS), (0, PG_PGLZ_CHUNKS)] {
+            let raw_len = PG_PLAIN.len();
+            let tcinfo = u32::from_le_bytes(chunks[..4].try_into().unwrap());
+            assert_eq!(tcinfo & VARLENA_EXTSIZE_MASK, raw_len as u32);
+            assert_eq!(tcinfo >> VARLENA_EXTSIZE_BITS, u32::from(method));
+
+            let p = ToastPointer {
+                va_rawsize: raw_len as i32 + VARHDRSZ,
+                va_extinfo: chunks.len() as u32 | (u32::from(method) << VARLENA_EXTSIZE_BITS),
+                va_valueid: 229503,
+                va_toastrelid: 16550,
+            };
+            let out = finish_value(&p, chunks.to_vec()).expect("detoasts");
+            assert_eq!(String::from_utf8(out).unwrap(), PG_PLAIN);
+
+            assert!(
+                decompress_varlena(method, chunks, raw_len).is_none(),
+                "method {method}: the tcinfo prefix has to be skipped",
+            );
+        }
+    }
+
+    #[test]
+    fn detoast_failure_names_the_value() {
+        let p = ToastPointer {
+            va_rawsize: 314008 + VARHDRSZ,
+            va_extinfo: 79453 | (1 << VARLENA_EXTSIZE_BITS),
+            va_valueid: 229503,
+            va_toastrelid: 16550,
+        };
+        let err = finish_value(&p, vec![0u8; 79453]).expect_err("garbage fails");
+        assert_eq!(
+            err.to_string(),
+            "toast decompression: decompress failed (method 1, 79449 bytes \u{2192} 314008) \
+             for value 229503 in pg_toast_16550",
+        );
     }
 
     fn tomb(tid: (u32, u16), lsn: u64) -> ToastRow {
