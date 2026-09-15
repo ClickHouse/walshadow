@@ -22,8 +22,8 @@ use crate::mapping::{MappingSnapshot, TableMapping};
 use crate::ops::oracle::render_ext_columns;
 use crate::schema::{RelDescriptor, RelName};
 use crate::toast::{
-    CHUNK_PUT_BATCH, CHUNK_PUT_BYTES, FetchedValue, ToastResolver, ToastRow, check_value_caps,
-    detoasted_value, finish_value, pointer_extsize,
+    FetchedValue, ToastResolver, ToastRow, check_value_caps, detoasted_value, finish_value,
+    pointer_extsize,
 };
 use ahash::HashSet;
 
@@ -169,8 +169,9 @@ impl DrainSink {
                 if let Some(row) = row_from_columns(tuple, rel.oid) {
                     self.chunk_batch_bytes += row.chunk_data.len();
                     self.chunk_batch.push(row);
-                    if self.chunk_batch.len() >= CHUNK_PUT_BATCH
-                        || self.chunk_batch_bytes >= CHUNK_PUT_BYTES
+                    if self
+                        .resolver
+                        .put_limit_reached(self.chunk_batch.len(), self.chunk_batch_bytes)
                     {
                         flush_chunks(&self.resolver, &mut self.chunk_batch).await?;
                         self.chunk_batch_bytes = 0;

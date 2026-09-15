@@ -514,7 +514,10 @@ pub struct ClickHouseChunkStore {
 
 impl ClickHouseChunkStore {
     pub fn new(conn: EmitterConfig) -> Self {
-        let slots = conn.inserter_pool_size.max(1);
+        let slots = conn
+            .toast
+            .connections
+            .map_or_else(|| conn.inserter_pool_size.max(1), |n| n.get());
         Self {
             alloc: Allocator::global(&mimalloc::MiMalloc),
             states: (0..slots)
@@ -880,6 +883,8 @@ impl ChunkStore for ClickHouseChunkStore {
 pub struct ToastResolver {
     store: Option<Arc<dyn ChunkStore>>,
     stats: Arc<EmitterStats>,
+    put_batch_rows: usize,
+    put_batch_bytes: usize,
     /// V3 hard per-value decode-target cap, checked before allocation
     inline_value_max: usize,
     /// Leaf permits for per-value transients (assembly, decompress, JIT
@@ -892,6 +897,8 @@ impl ToastResolver {
         Self {
             store: None,
             stats: Arc::new(EmitterStats::default()),
+            put_batch_rows: CHUNK_PUT_BATCH,
+            put_batch_bytes: CHUNK_PUT_BYTES,
             inline_value_max: usize::MAX,
             budget: None,
         }
@@ -901,6 +908,14 @@ impl ToastResolver {
         Self {
             store: Some(Arc::new(ClickHouseChunkStore::new(emitter.clone()))),
             stats,
+            put_batch_rows: emitter
+                .toast
+                .put_batch_rows
+                .map_or(CHUNK_PUT_BATCH, |n| n.get()),
+            put_batch_bytes: emitter
+                .toast
+                .put_batch_bytes
+                .map_or(CHUNK_PUT_BYTES, |n| n.get()),
             inline_value_max: emitter.inline_value_max,
             budget: None,
         }
@@ -911,6 +926,8 @@ impl ToastResolver {
         Self {
             store: Some(store),
             stats,
+            put_batch_rows: CHUNK_PUT_BATCH,
+            put_batch_bytes: CHUNK_PUT_BYTES,
             inline_value_max: usize::MAX,
             budget: None,
         }
@@ -943,6 +960,10 @@ impl ToastResolver {
 
     pub fn stores_chunks(&self) -> bool {
         self.store.is_some()
+    }
+
+    pub fn put_limit_reached(&self, rows: usize, bytes: usize) -> bool {
+        rows >= self.put_batch_rows || bytes >= self.put_batch_bytes
     }
 
     /// Shared counters, for commit-time stash resolution off the serial path
@@ -1017,7 +1038,7 @@ impl ToastResolver {
         while start < rows.len() {
             let mut end = start;
             let mut bytes = 0usize;
-            while end < rows.len() && end - start < CHUNK_PUT_BATCH && bytes < CHUNK_PUT_BYTES {
+            while end < rows.len() && !self.put_limit_reached(end - start, bytes) {
                 bytes += rows[end].chunk_data.len();
                 end += 1;
             }
@@ -1035,13 +1056,12 @@ impl ToastResolver {
         Ok(())
     }
 
-    /// [`Self::put`] in WAL-order slices sealed at [`CHUNK_PUT_BATCH`] rows
-    /// or [`CHUNK_PUT_BYTES`], bounding one ClickHouse block build
+    /// [`Self::put`] in WAL-order slices sealed at configured row or byte limit
     pub async fn put_batched(&self, rows: &[ToastRow]) -> Result<(), ChunkStoreError> {
         let mut start = 0usize;
         let mut bytes = 0usize;
         for (i, r) in rows.iter().enumerate() {
-            if i > start && (i - start >= CHUNK_PUT_BATCH || bytes >= CHUNK_PUT_BYTES) {
+            if i > start && self.put_limit_reached(i - start, bytes) {
                 self.put(&rows[start..i]).await?;
                 start = i;
                 bytes = 0;
@@ -1594,6 +1614,60 @@ mod tests {
             assembled(&b"aa".repeat(rows.len())),
             "all slices landed, in order"
         );
+    }
+
+    #[test]
+    fn toast_config_keeps_connections_independent_of_inserters() {
+        let cfg = EmitterConfig::from_toml_str(
+            "[ch]\ninserter_pool_size = 8\n[toast]\nconnections = 2\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.inserter_pool_size, 8);
+        assert_eq!(ClickHouseChunkStore::new(cfg).states.len(), 2);
+        for key in ["put_batch_rows", "put_batch_bytes", "connections"] {
+            assert!(
+                EmitterConfig::from_toml_str(&format!("[toast]\n{key} = 0\n")).is_err(),
+                "{key} must reject zero"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn configured_put_limits_preserve_materialized_and_referenced_rows() {
+        let refs: Vec<_> = (0..7)
+            .map(|seq| ToastRowRef {
+                toast_relid: 16500,
+                blkno: 1,
+                offnum: 1 + seq as u16,
+                chunk_id: 7,
+                chunk_seq: seq,
+                chunk_data: Body::Mem(Bytes::from_static(b"ab")),
+                lsn: 0x1000 + u64::from(seq),
+            })
+            .collect();
+        for (rows, bytes, puts) in [(3, 1024, 3), (100, 3, 4)] {
+            let cfg = EmitterConfig::from_toml_str(&format!(
+                "[toast]\nput_batch_rows = {rows}\nput_batch_bytes = {bytes}\n"
+            ))
+            .unwrap();
+            for referenced in [false, true] {
+                let store = Arc::new(MemChunkStore::new());
+                let stats = Arc::new(EmitterStats::default());
+                let mut resolver = ToastResolver::from_config(&cfg, stats.clone());
+                resolver.store = Some(store.clone());
+                if referenced {
+                    resolver.put_row_refs(None, &refs).await.unwrap();
+                } else {
+                    let rows: Vec<_> = refs.iter().map(|r| r.materialize(None).unwrap()).collect();
+                    resolver.put_batched(&rows).await.unwrap();
+                }
+                assert_eq!(stats.toast_chunk_puts.load(Ordering::Relaxed), puts);
+                assert_eq!(
+                    store.fetch(16500, 7, u64::MAX, 14).await.unwrap(),
+                    assembled(&b"ab".repeat(7))
+                );
+            }
+        }
     }
 
     #[test]

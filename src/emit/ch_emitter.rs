@@ -214,6 +214,7 @@ pub struct EmitterConfig {
     /// `[bootstrap]`: shadow seeding source + its object-store knobs.
     /// Boot-only, CLI overrides TOML
     pub bootstrap: BootstrapSettings,
+    pub toast: ToastSettings,
 }
 
 /// Choose bootstrap source for empty shadow data dir
@@ -272,6 +273,14 @@ pub struct BootstrapSettings {
     pub object_store_parallelism: Option<NonZeroUsize>,
     /// `lanes`: parallel repair/drain/batcher lanes for the greenfield load
     pub lanes: Option<NonZeroUsize>,
+}
+
+/// `[toast]` chunk-store controls, applied at startup
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
+pub struct ToastSettings {
+    pub put_batch_rows: Option<NonZeroUsize>,
+    pub put_batch_bytes: Option<NonZeroUsize>,
+    pub connections: Option<NonZeroUsize>,
 }
 
 pub(crate) const DEFAULT_RESIDENT_PAYLOAD_MAX: usize = 512 << 20;
@@ -372,6 +381,7 @@ impl Default for EmitterConfig {
             decoder_queue_capacity: DEFAULT_QUEUEING_RECORD_SINK_CAPACITY,
             backup: None,
             bootstrap: BootstrapSettings::default(),
+            toast: ToastSettings::default(),
         }
     }
 }
@@ -566,6 +576,8 @@ struct ConfigDocument {
     backup: Option<BackupSection>,
     #[serde(default)]
     bootstrap: BootstrapSettings,
+    #[serde(default)]
+    toast: ToastSettings,
     #[serde(default)]
     namespace: BTreeMap<String, NamespacePatch>,
     #[serde(default)]
@@ -778,6 +790,7 @@ impl EmitterConfig {
             out.backup = Some(parse_backup(bk)?);
         }
         out.bootstrap = doc.bootstrap;
+        out.toast = doc.toast;
         for (ns, n) in doc.namespace {
             out.namespaces.insert(
                 ns,
