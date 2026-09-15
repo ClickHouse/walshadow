@@ -11,7 +11,7 @@
 //! 3. spawn CH + pre-create dest tables ReplacingMergeTree(_lsn)
 //! 4. spawn walshadow-stream `--bootstrap-mode=direct
 //!    --bootstrap-shadow-data-dir` against four-table CH config
-//! 5. await bootstrap row counts and emitter ack before starting workload
+//! 5. await bootstrap row counts and pump catchup before starting workload
 //! 6. `pgbench -T 6 -c 4 -j 2` in background; at +2s ADD COLUMN c
 //!    int DEFAULT 7 on pgbench_accounts (item 1 read-time defaults);
 //!    at +4s CREATE INDEX CONCURRENTLY on pgbench_history (catalog-
@@ -413,13 +413,22 @@ async fn run_ddl_intermix(
             }
         }
 
-        // DDL during bootstrap is unsupported, row counts can converge before window replay finishes
+        // DDL during bootstrap is unsupported, row counts can converge before
+        // window replay finishes. Pump binds its walsender only after bootstrap
+        // hands off, so receiving source's head proves window replay is done.
+        // Nothing writes WAL while this gate waits, so an emitter_ack gate
+        // would never open, see `wait_for_metric_lsn`
         let bootstrap_lsn = walshadow::pg::parse_pg_lsn(&psql_source(
             &source,
             "SELECT pg_current_wal_lsn()::text",
         )?)?;
-        wait_for_ack_catchup(metrics_addr, bootstrap_lsn, Duration::from_secs(120))
-            .context("bootstrap emitter ack catchup")?;
+        wait_for_metric_lsn(
+            metrics_addr,
+            "walshadow_source_received_lsn",
+            bootstrap_lsn,
+            Duration::from_secs(120),
+        )
+        .context("bootstrap pump catchup")?;
 
         // 10. Background pgbench workload. -T 6 wallclock keeps the
         //     test seconds-scale while still exercising thousands of
@@ -485,15 +494,24 @@ async fn run_ddl_intermix(
         // 14. Force a segment seal so the daemon's pump definitely
         //     reaches every committed row in WAL, then poll the daemon's
         //     `walshadow_emitter_ack_lsn` until it crosses source's
-        //     post-switch `pg_current_wal_lsn`. ChildGuard's Drop will
-        //     SIGKILL the daemon once assertions pass.
+        //     post-switch `pg_current_wal_lsn`. The switch also moves
+        //     source's insert pointer past its last standby snapshot,
+        //     so bgwriter logs another one within
+        //     `LOG_SNAPSHOT_INTERVAL_MS` — that record is what carries
+        //     the ack over the target. ChildGuard's Drop will SIGKILL
+        //     the daemon once assertions pass.
         psql_source(&source, "SELECT pg_switch_wal()").context("pg_switch_wal")?;
         let target_lsn_text =
             psql_source(&source, "SELECT pg_current_wal_lsn()::text").context("read source LSN")?;
         let target_lsn =
             walshadow::pg::parse_pg_lsn(&target_lsn_text).context("parse source LSN")?;
-        wait_for_ack_catchup(metrics_addr, target_lsn, Duration::from_secs(60))
-            .context("emitter ack catchup")?;
+        wait_for_metric_lsn(
+            metrics_addr,
+            "walshadow_emitter_ack_lsn",
+            target_lsn,
+            Duration::from_secs(60),
+        )
+        .context("emitter ack catchup")?;
 
         // 15. Optional: nudge CH to merge so FINAL queries are cheap.
         //     ReplacingMergeTree(_lsn) collapses duplicate (aid)-keyed
@@ -640,21 +658,32 @@ fn wait_child_with_timeout(
     anyhow::bail!("pgbench did not exit within {deadline:?}");
 }
 
-/// Poll the daemon's `/metrics` endpoint until
-/// `walshadow_emitter_ack_lsn >= target`. Read: "the daemon has flushed
-/// every row up through `target` to CH." Used as the test's drain gate
-/// in place of `--max-segments` (which races with bootstrap-triggered
-/// segment seals).
-fn wait_for_ack_catchup(metrics_addr: SocketAddr, target: u64, deadline: Duration) -> Result<u64> {
+/// Poll the daemon's `/metrics` endpoint until `metric` reaches `target`.
+/// Stands in for `--max-segments`, which races with bootstrap-triggered
+/// segment seals.
+///
+/// `walshadow_emitter_ack_lsn` carries record *start* LSNs (a commit's seq
+/// publishes its commit record's start, idle advance publishes the last
+/// record's start), so it reaches `target` only once a record starting at or
+/// past `target` is flushed to CH. `pg_current_wal_lsn` reports the *end* of
+/// the last record, so a source that never writes again pins the ack one
+/// record short of its own head; gate on `walshadow_source_received_lsn`
+/// instead, which the pump takes from the walsender's WAL end
+fn wait_for_metric_lsn(
+    metrics_addr: SocketAddr,
+    metric: &str,
+    target: u64,
+    deadline: Duration,
+) -> Result<u64> {
     let start = std::time::Instant::now();
     let mut last_body = String::new();
     while start.elapsed() < deadline {
         if let Ok(body) = fx::http_get(metrics_addr, "/metrics") {
             last_body = body;
-            if let Some(ack) = fx::parse_metric(&last_body, "walshadow_emitter_ack_lsn")
-                && ack >= target
+            if let Some(seen) = fx::parse_metric(&last_body, metric)
+                && seen >= target
             {
-                return Ok(ack);
+                return Ok(seen);
             }
         }
         std::thread::sleep(Duration::from_millis(200));
@@ -668,5 +697,5 @@ fn wait_for_ack_catchup(metrics_addr: SocketAddr, target: u64, deadline: Duratio
         }
         let _ = std::fs::write(&path, &last_body);
     }
-    anyhow::bail!("emitter_ack_lsn never reached {target:X} in {deadline:?}");
+    anyhow::bail!("{metric} never reached {target:X} in {deadline:?}");
 }

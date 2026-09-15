@@ -168,19 +168,28 @@ pub fn make_source(tmp: &tempfile::TempDir) -> Shadow {
 
 /// Whether PostgreSQL reports a base backup in flight.
 pub fn backup_in_progress(source: &Shadow) -> bool {
-    let n = source
-        .psql_one("SELECT count(*) FROM pg_stat_progress_basebackup")
-        .unwrap_or_default();
-    n.trim() != "0" && !n.trim().is_empty()
+    backup_reported(source, "")
 }
 
-/// Wait until the daemon's `BASE_BACKUP` shows up on the source, the cue
-/// for a drill to write inside the backup window.
+/// Treat failed psql as no matching backup
+fn backup_reported(source: &Shadow, filter: &str) -> bool {
+    let n = source
+        .psql_one(&format!(
+            "SELECT count(*) FROM pg_stat_progress_basebackup {filter}"
+        ))
+        .unwrap_or_default();
+    !matches!(n.trim(), "" | "0")
+}
+
+/// Wait for backup checkpoint before drill writes
+/// PostgreSQL reports progress before `do_pg_backup_start` fixes start LSN,
+/// so earlier writes can miss both snapshot and window replay
 pub fn wait_for_backup_streaming(source: &Shadow, timeout: Duration) -> Result<()> {
     let deadline = Instant::now() + timeout;
-    while !backup_in_progress(source) {
+    let past_checkpoint = "WHERE phase NOT IN ('initializing', 'waiting for checkpoint to finish')";
+    while !backup_reported(source, past_checkpoint) {
         if Instant::now() >= deadline {
-            bail!("BASE_BACKUP never showed up in pg_stat_progress_basebackup");
+            bail!("BASE_BACKUP never passed its start-of-backup checkpoint");
         }
         std::thread::sleep(Duration::from_millis(20));
     }
