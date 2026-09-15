@@ -53,241 +53,153 @@ pub async fn drain(
     ack: AckHandle,
     stats: Arc<EmitterStats>,
     resolver: ToastResolver,
-    deferred: Option<DeferredSpool>,
+    mut deferred: Option<DeferredSpool>,
     row_policy: RowPolicy,
     config: Option<Arc<ResolvedConfig>>,
     skip_initial: HashSet<RelName>,
 ) -> Result<BootstrapDrainOutcome, String> {
-    let mut sink = DrainSink::new(
-        catalog,
-        mapping,
-        msg_tx,
-        ack,
-        stats,
-        resolver,
-        deferred,
-        row_policy,
-        config,
-        skip_initial,
-    );
+    let routes = freeze_routes(&mapping, config.as_deref(), &row_policy);
+    let mut next_seq = 0;
+    let mut rows_routed = 0;
+    let mut open = None;
+    let mut chunk_batch = Vec::new();
+    let mut chunk_batch_bytes = 0;
+    let mut start_lsn = 0;
+    let mut out = RowBuf::default();
     while let Some(slab) = rx.recv().await {
-        sink.push(slab).await?;
-    }
-    sink.finish().await
-}
-
-/// [`drain`]'s state, held across slabs
-pub struct DrainSink {
-    catalog: CatalogMap,
-    msg_tx: mpsc::Sender<BatcherMsg>,
-    ack: AckHandle,
-    stats: Arc<EmitterStats>,
-    resolver: ToastResolver,
-    deferred: Option<DeferredSpool>,
-    skip_initial: HashSet<RelName>,
-    routes: ahash::HashMap<RelName, Arc<RouteSnapshot>>,
-    next_seq: u64,
-    rows_routed: u64,
-    open: Option<(walrus::pg::walparser::RelFileNode, u64, u64)>,
-    chunk_batch: Vec<ToastRow>,
-    chunk_batch_bytes: usize,
-    start_lsn: u64,
-    out: RowBuf,
-}
-
-impl DrainSink {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        catalog: CatalogMap,
-        mapping: MappingSnapshot,
-        msg_tx: mpsc::Sender<BatcherMsg>,
-        ack: AckHandle,
-        stats: Arc<EmitterStats>,
-        resolver: ToastResolver,
-        deferred: Option<DeferredSpool>,
-        row_policy: RowPolicy,
-        config: Option<Arc<ResolvedConfig>>,
-        skip_initial: HashSet<RelName>,
-    ) -> Self {
-        Self {
-            catalog,
-            msg_tx,
-            ack,
-            stats,
-            resolver,
-            deferred,
-            skip_initial,
-            // Routes frozen once per pass from the caller's config snapshot
-            routes: freeze_routes(&mapping, config.as_deref(), &row_policy),
-            next_seq: 0,
-            rows_routed: 0,
-            open: None,
-            chunk_batch: Vec::new(),
-            chunk_batch_bytes: 0,
-            start_lsn: 0,
-            // Rows coalesce into `BatcherMsg::Rows` on the decode pool's dual
-            // trigger, so a slab costs one channel hop, not one per row
-            out: RowBuf::default(),
-        }
-    }
-
-    pub async fn push(&mut self, slab: Vec<BackfillTuple>) -> Result<(), String> {
         for tuple in slab {
             let rfn = tuple.rfn;
             let source_lsn = tuple.source_lsn;
-            self.start_lsn = source_lsn;
+            start_lsn = source_lsn;
 
-            let same = matches!(&self.open, Some((r, _, _)) if *r == rfn);
+            let same = matches!(&open, Some((r, _, _)) if *r == rfn);
             let seq = if same {
-                self.open.as_ref().expect("same implies open").1
+                open.as_ref().expect("same implies open").1
             } else {
-                if let Some((_, prev_seq, prev_rows)) = self.open.take() {
+                if let Some((_, prev_seq, prev_rows)) = open.take() {
                     // Every row of the closing seq on the channel before its
                     // expected count is published
-                    self.out.flush(&self.msg_tx).await?;
-                    self.ack.placed(prev_seq, prev_rows);
+                    out.flush(&msg_tx).await?;
+                    ack.placed(prev_seq, prev_rows);
                 }
-                let s = self.next_seq;
-                self.next_seq += 1;
-                self.ack.register(s, source_lsn);
-                self.open = Some((rfn, s, 0));
+                let s = next_seq;
+                next_seq += 1;
+                ack.register(s, source_lsn);
+                open = Some((rfn, s, 0));
                 s
             };
 
-            let Some(rel) = self.catalog.get(rfn.db_node, rfn.rel_node) else {
-                self.stats
-                    .unsupported_relations
-                    .fetch_add(1, Ordering::Relaxed);
+            let Some(rel) = catalog.get(rfn.db_node, rfn.rel_node) else {
+                stats.unsupported_relations.fetch_add(1, Ordering::Relaxed);
                 continue;
             };
 
-            if self.skip_initial.contains(&rel.rel_name) {
+            if skip_initial.contains(&rel.rel_name) {
                 continue;
             }
 
-            if self.catalog.is_toast(rfn.db_node, rfn.rel_node) {
+            if catalog.is_toast(rfn.db_node, rfn.rel_node) {
                 if let Some(row) = row_from_columns(tuple, rel.oid) {
-                    self.chunk_batch_bytes += row.chunk_data.len();
-                    self.chunk_batch.push(row);
-                    if self
-                        .resolver
-                        .put_limit_reached(self.chunk_batch.len(), self.chunk_batch_bytes)
-                    {
-                        flush_chunks(&self.resolver, &mut self.chunk_batch).await?;
-                        self.chunk_batch_bytes = 0;
+                    chunk_batch_bytes += row.chunk_data.len();
+                    chunk_batch.push(row);
+                    if resolver.put_limit_reached(chunk_batch.len(), chunk_batch_bytes) {
+                        flush_chunks(&resolver, &mut chunk_batch).await?;
+                        chunk_batch_bytes = 0;
                     }
                 }
                 continue;
             }
 
-            let Some(route) = self.routes.get(&rel.rel_name).cloned() else {
-                self.stats
-                    .unsupported_relations
-                    .fetch_add(1, Ordering::Relaxed);
+            let Some(route) = routes.get(&rel.rel_name).cloned() else {
+                stats.unsupported_relations.fetch_add(1, Ordering::Relaxed);
                 continue;
             };
 
             let mut tuple = tuple;
             let mut permit = None;
             if tuple.has_mapped_external(&route.mapping) {
-                let deferred = self.deferred.as_mut().ok_or_else(|| {
+                let deferred = deferred.as_mut().ok_or_else(|| {
                     format!("bootstrap: unrepaired external value in {}", rel.rel_name)
                 })?;
-                if self.resolver.stores_chunks() {
+                if resolver.stores_chunks() {
                     deferred
                         .push(tuple)
                         .await
                         .map_err(|e| format!("bootstrap: deferred spool: {e}"))?;
-                    self.stats
+                    stats
                         .bootstrap_deferred_bytes
                         .store(deferred.resident_bytes() as u64, Ordering::Relaxed);
-                    self.stats
+                    stats
                         .bootstrap_deferred_spool_bytes
                         .store(deferred.spooled_bytes(), Ordering::Relaxed);
                     continue;
                 }
-                permit =
-                    resolve_or_fill_toast(&mut tuple, &rel, &route.mapping, &self.resolver).await?;
+                permit = resolve_or_fill_toast(&mut tuple, &rel, &route.mapping, &resolver).await?;
             }
             render_ext_columns(&rel.attributes, &mut tuple.columns);
-            self.out
-                .push(&self.msg_tx, seq, rel, route, tuple, permit)
-                .await?;
-            bump(&mut self.open, &mut self.rows_routed);
+            out.push(&msg_tx, seq, rel, route, tuple, permit).await?;
+            bump(&mut open, &mut rows_routed);
         }
-        Ok(())
+    }
+    out.flush(&msg_tx).await?;
+    if let Some((_, seq, rows)) = open.take() {
+        ack.placed(seq, rows);
     }
 
-    pub async fn finish(mut self) -> Result<BootstrapDrainOutcome, String> {
-        self.out.flush(&self.msg_tx).await?;
-        if let Some((_, seq, rows)) = self.open.take() {
-            self.ack.placed(seq, rows);
-        }
-
-        if !self.chunk_batch.is_empty() {
-            flush_chunks(&self.resolver, &mut self.chunk_batch).await?;
-        }
-
-        if let Some(deferred) = self.deferred.take().filter(|s| s.records() > 0) {
-            tracing::info!(
-                target: "walshadow::bootstrap",
-                deferred = deferred.records(),
-                spooled_bytes = deferred.spooled_bytes(),
-                "resolving deferred TOAST tuples from chunk store",
-            );
-            let seq = self.next_seq;
-            self.next_seq += 1;
-            self.ack.register(seq, self.start_lsn);
-            let mut placed = 0u64;
-            let mut replay = deferred
-                .into_reader()
-                .await
-                .map_err(|e| format!("bootstrap: deferred spool seal: {e}"))?;
-            while let Some(mut tuple) = replay
-                .next()
-                .await
-                .map_err(|e| format!("bootstrap: deferred spool replay: {e}"))?
-            {
-                let Some(rel) = self.catalog.get(tuple.rfn.db_node, tuple.rfn.rel_node) else {
-                    self.stats
-                        .unsupported_relations
-                        .fetch_add(1, Ordering::Relaxed);
-                    continue;
-                };
-                let Some(route) = self.routes.get(&rel.rel_name).cloned() else {
-                    self.stats
-                        .unsupported_relations
-                        .fetch_add(1, Ordering::Relaxed);
-                    continue;
-                };
-                let permit =
-                    resolve_or_fill_toast(&mut tuple, &rel, &route.mapping, &self.resolver).await?;
-                render_ext_columns(&rel.attributes, &mut tuple.columns);
-                self.out
-                    .push(&self.msg_tx, seq, rel, route, tuple, permit)
-                    .await?;
-                placed += 1;
-                self.rows_routed += 1;
-            }
-            self.out.flush(&self.msg_tx).await?;
-            replay
-                .finish()
-                .await
-                .map_err(|e| format!("bootstrap: deferred spool cleanup: {e}"))?;
-            self.stats
-                .bootstrap_deferred_bytes
-                .store(0, Ordering::Relaxed);
-            self.stats
-                .bootstrap_deferred_spool_bytes
-                .store(0, Ordering::Relaxed);
-            self.ack.placed(seq, placed);
-        }
-
-        Ok(BootstrapDrainOutcome {
-            next_seq: self.next_seq,
-            rows_routed: self.rows_routed,
-        })
+    if !chunk_batch.is_empty() {
+        flush_chunks(&resolver, &mut chunk_batch).await?;
     }
+
+    if let Some(deferred) = deferred.take().filter(|s| s.records() > 0) {
+        tracing::info!(
+            target: "walshadow::bootstrap",
+            deferred = deferred.records(),
+            spooled_bytes = deferred.spooled_bytes(),
+            "resolving deferred TOAST tuples from chunk store",
+        );
+        let seq = next_seq;
+        next_seq += 1;
+        ack.register(seq, start_lsn);
+        let mut placed = 0u64;
+        let mut replay = deferred
+            .into_reader()
+            .await
+            .map_err(|e| format!("bootstrap: deferred spool seal: {e}"))?;
+        while let Some(mut tuple) = replay
+            .next()
+            .await
+            .map_err(|e| format!("bootstrap: deferred spool replay: {e}"))?
+        {
+            let Some(rel) = catalog.get(tuple.rfn.db_node, tuple.rfn.rel_node) else {
+                stats.unsupported_relations.fetch_add(1, Ordering::Relaxed);
+                continue;
+            };
+            let Some(route) = routes.get(&rel.rel_name).cloned() else {
+                stats.unsupported_relations.fetch_add(1, Ordering::Relaxed);
+                continue;
+            };
+            let permit = resolve_or_fill_toast(&mut tuple, &rel, &route.mapping, &resolver).await?;
+            render_ext_columns(&rel.attributes, &mut tuple.columns);
+            out.push(&msg_tx, seq, rel, route, tuple, permit).await?;
+            placed += 1;
+            rows_routed += 1;
+        }
+        out.flush(&msg_tx).await?;
+        replay
+            .finish()
+            .await
+            .map_err(|e| format!("bootstrap: deferred spool cleanup: {e}"))?;
+        stats.bootstrap_deferred_bytes.store(0, Ordering::Relaxed);
+        stats
+            .bootstrap_deferred_spool_bytes
+            .store(0, Ordering::Relaxed);
+        ack.placed(seq, placed);
+    }
+
+    Ok(BootstrapDrainOutcome {
+        next_seq,
+        rows_routed,
+    })
 }
 
 fn bump(open: &mut Option<(walrus::pg::walparser::RelFileNode, u64, u64)>, rows_routed: &mut u64) {

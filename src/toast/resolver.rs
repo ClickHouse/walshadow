@@ -496,6 +496,7 @@ const CH_UNKNOWN_DATABASE: i32 = 81;
 
 struct ChState {
     client: ChConn,
+    created: HashSet<u32>,
 }
 
 /// TID-keyed ClickHouse mirror, one table per TOAST relation
@@ -508,8 +509,6 @@ pub struct ClickHouseChunkStore {
     /// would serialize the whole thing
     states: Vec<Mutex<ChState>>,
     next: AtomicUsize,
-    /// Shared so one slot's `CREATE` counts for every slot
-    created: Mutex<HashSet<u32>>,
 }
 
 impl ClickHouseChunkStore {
@@ -524,11 +523,11 @@ impl ClickHouseChunkStore {
                 .map(|_| {
                     Mutex::new(ChState {
                         client: ChConn::default(),
+                        created: HashSet::new(),
                     })
                 })
                 .collect(),
             next: AtomicUsize::new(0),
-            created: Mutex::new(HashSet::new()),
             conn,
         }
     }
@@ -662,12 +661,10 @@ impl ClickHouseChunkStore {
             by_relid.entry(r.toast_relid).or_default().push(r);
         }
         for (relid, group) in by_relid {
-            if self.created.lock().await.insert(relid) {
+            if !state.created.contains(&relid) {
                 let create = self.create_sql(relid);
-                if let Err(e) = self.exec_write(state, &create, None).await {
-                    self.created.lock().await.remove(&relid);
-                    return Err(e);
-                }
+                self.exec_write(state, &create, None).await?;
+                state.created.insert(relid);
             }
             let n = group.len();
             let mut blkno = Vec::with_capacity(n * 4);

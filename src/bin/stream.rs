@@ -4695,11 +4695,10 @@ async fn run_bootstrap(
             .iter()
             .map(|t| (t.msg_tx.clone(), t.ack.clone()))
             .collect();
-        let (gated_tx, stages) = sink.spawn(lane_tails);
-        let gated_tx = Arc::new(gated_tx);
+        let (repair_txs, stages) = sink.spawn(lane_tails);
         let mut gate_txs = Vec::with_capacity(lanes);
         let mut gate_handles = Vec::with_capacity(lanes);
-        for i in 0..lanes {
+        for (i, repair_tx) in repair_txs.into_iter().enumerate() {
             let (gate_tx, mut gate_rx) = tokio::sync::mpsc::channel(
                 walshadow::backup_page_walk::BOOTSTRAP_TUPLE_CHANNEL_CAP,
             );
@@ -4709,7 +4708,6 @@ async fn run_bootstrap(
                 .join(format!("bootstrap_gate_deferred.{i}.bin"));
             tokio::fs::remove_file(&spool_path).await.ok();
             let catalog = drain_catalog.clone();
-            let fan = gated_tx.clone();
             gate_handles.push(tokio_util::task::AbortOnDropHandle::new(tokio::spawn(
                 async move {
                     let mut spool = walshadow::spool::DeferredSpool::new(
@@ -4719,7 +4717,7 @@ async fn run_bootstrap(
                     let mut gate_stats = GateStats::default();
                     stream_phase(
                         &mut gate_rx,
-                        &GateOutput::Repair(&fan),
+                        &GateOutput::Repair(&repair_tx),
                         &catalog,
                         &mut spool,
                         &mut gate_stats,
@@ -4729,7 +4727,6 @@ async fn run_bootstrap(
                 },
             )));
         }
-        drop(gated_tx);
         let gate = async move {
             let mut rx = rx;
             let mut at = 0usize;

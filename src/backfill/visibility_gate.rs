@@ -6,7 +6,6 @@
 
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
 use anyhow::Result;
 use tokio::sync::mpsc;
@@ -49,45 +48,20 @@ pub struct GateStats {
     pub p_hi: u64,
 }
 
-/// Round-robin, never keyed on the relation: the walk covers one file at a
-/// time, so keying would idle every lane but one
-pub struct LaneFan {
-    lanes: Vec<mpsc::Sender<RepairBatch>>,
-    next: AtomicUsize,
-}
-
-impl LaneFan {
-    pub fn new(lanes: Vec<mpsc::Sender<RepairBatch>>) -> Self {
-        assert!(!lanes.is_empty(), "lane fan needs at least one lane");
-        Self {
-            lanes,
-            next: AtomicUsize::new(0),
-        }
-    }
-
-    fn pick(&self) -> &mpsc::Sender<RepairBatch> {
-        let at = self.next.fetch_add(1, AtomicOrdering::Relaxed) % self.lanes.len();
-        &self.lanes[at]
-    }
-}
-
 pub enum GateOutput<'a> {
     Rows(&'a mpsc::Sender<Vec<BackfillTuple>>),
-    Repair(&'a LaneFan),
+    Repair(&'a mpsc::Sender<RepairBatch>),
 }
 
 impl GateOutput<'_> {
     async fn send(&self, rows: Vec<BackfillTuple>, unresolved: bool) -> bool {
         match self {
             Self::Rows(tx) => tx.send(rows).await.is_ok(),
-            Self::Repair(fan) => {
+            Self::Repair(tx) => {
                 if rows.is_empty() {
                     return true;
                 }
-                fan.pick()
-                    .send(RepairBatch { rows, unresolved })
-                    .await
-                    .is_ok()
+                tx.send(RepairBatch { rows, unresolved }).await.is_ok()
             }
         }
     }
@@ -275,11 +249,11 @@ struct RepairDrainLane {
 
 impl GreenfieldSink {
     /// Spawn source repair feeding the bootstrap drain. Gate stage owns the
-    /// returned sender; dropping it winds both stages down
+    /// returned senders; dropping each winds its lane down
     pub fn spawn(
         &self,
         tails: Vec<(mpsc::Sender<BatcherMsg>, AckHandle)>,
-    ) -> (LaneFan, RepairDrain) {
+    ) -> (Vec<mpsc::Sender<RepairBatch>>, RepairDrain) {
         let mut senders = Vec::with_capacity(tails.len());
         let mut lanes = Vec::with_capacity(tails.len());
         for (msg_tx, ack) in tails {
@@ -311,7 +285,7 @@ impl GreenfieldSink {
             senders.push(tx);
             lanes.push(RepairDrainLane { repair, drain });
         }
-        (LaneFan::new(senders), RepairDrain { lanes })
+        (senders, RepairDrain { lanes })
     }
 }
 
@@ -394,7 +368,7 @@ pub async fn resolve_greenfield(
         if spool.records() == 0 {
             continue;
         }
-        resolved = resolve_phase(spool, &view, &GateOutput::Repair(&txs), &mut gate_stats).await;
+        resolved = resolve_phase(spool, &view, &GateOutput::Repair(&txs[0]), &mut gate_stats).await;
         if resolved.is_err() {
             break;
         }
@@ -450,73 +424,52 @@ mod tests {
         }
     }
 
-    /// A slab routed nowhere is rows consumed with no counter moving
     #[tokio::test]
-    async fn every_slab_reaches_one_lane_and_lanes_all_get_work() {
-        let mut txs = Vec::new();
-        let mut rxs = Vec::new();
-        for _ in 0..4 {
-            let (tx, rx) = mpsc::channel(64);
-            txs.push(tx);
-            rxs.push(rx);
-        }
-        let fan = LaneFan::new(txs.clone());
-        let out = GateOutput::Repair(&fan);
-        for rel_node in 16400..16416u32 {
-            let mut t = tuple(100, 0, HEAP_XMIN_COMMITTED);
-            t.rfn = rfn(rel_node);
-            assert!(out.send(vec![t], false).await, "slab {rel_node} dropped");
-        }
+    async fn repair_lanes_close_independently() {
+        let sink = GreenfieldSink {
+            source: crate::config::SourceConn::default().to_pg_config(),
+            catalog: CatalogMap::new(),
+            mapping: Default::default(),
+            repair_scope: RepairScope::default(),
+            copy_rate: CopyRate::new(None),
+            config: Arc::new(ResolvedConfig::default()),
+            emitter: EmitterConfig::default(),
+            stats: Arc::new(EmitterStats::default()),
+            resolver: ToastResolver::disabled(),
+            skip_initial: HashSet::new(),
+        };
+        let (ack, ack_task) = crate::emit::pipeline::ack::spawn(Arc::new(Default::default()));
+        let (msg_tx, _msg_rx) = mpsc::channel(1);
+        let (mut txs, mut stages) =
+            sink.spawn(vec![(msg_tx.clone(), ack.clone()), (msg_tx, ack.clone())]);
+        let first = txs.remove(0);
+        assert!(
+            GateOutput::Repair(&first)
+                .send(vec![tuple(100, 0, HEAP_XMIN_COMMITTED)], false)
+                .await
+        );
+        drop(first);
+        let lane = stages.lanes.remove(0);
+        let drained = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            join_stage(lane.repair, "repair").await.unwrap();
+            join_stage(lane.drain, "drain").await.unwrap()
+        })
+        .await
+        .expect("first lane closes while second remains open");
+        assert_eq!(drained.next_seq, 1);
+        assert!(!stages.lanes[0].repair.is_finished());
         drop(txs);
-
-        let mut seen = 0;
-        for (i, rx) in rxs.iter_mut().enumerate() {
-            let mut n = 0;
-            while let Ok(batch) = rx.try_recv() {
-                n += batch.rows.len();
-            }
-            assert!(n > 0, "lane {i} never received a slab");
-            seen += n;
-        }
-        assert_eq!(seen, 16, "every slab must land exactly once");
-    }
-
-    /// Keying lanes on the relation would idle every lane but one
-    #[tokio::test]
-    async fn one_relation_spreads_across_every_lane() {
-        let mut txs = Vec::new();
-        let mut rxs = Vec::new();
-        for _ in 0..4 {
-            let (tx, rx) = mpsc::channel(64);
-            txs.push(tx);
-            rxs.push(rx);
-        }
-        let fan = LaneFan::new(txs);
-        let out = GateOutput::Repair(&fan);
-        for _ in 0..16 {
-            let t = tuple(100, 0, HEAP_XMIN_COMMITTED);
-            assert!(out.send(vec![t], false).await, "slab dropped");
-        }
-        drop(fan);
-
-        let mut total = 0;
-        for (i, rx) in rxs.iter_mut().enumerate() {
-            let mut n = 0;
-            while let Ok(batch) = rx.try_recv() {
-                n += batch.rows.len();
-            }
-            assert_eq!(n, 4, "lane {i} got {n} of one relation's slabs");
-            total += n;
-        }
-        assert_eq!(total, 16);
+        let (_, drained) = stages.join().await.unwrap();
+        assert_eq!(drained[0].next_seq, 0);
+        drop(ack);
+        ack_task.await.unwrap();
     }
 
     #[tokio::test]
     async fn empty_slabs_are_not_sent() {
         let (tx, mut rx) = mpsc::channel(4);
-        let fan = LaneFan::new(vec![tx]);
-        assert!(GateOutput::Repair(&fan).send(Vec::new(), false).await);
-        drop(fan);
+        assert!(GateOutput::Repair(&tx).send(Vec::new(), false).await);
+        drop(tx);
         assert!(rx.try_recv().is_err(), "empty slab must not occupy a lane");
     }
 
@@ -710,17 +663,15 @@ mod tests {
         }
         spools.push(spool_at("several-empty", Vec::new()).await);
 
-        let fan = LaneFan::new(vec![tx.clone()]);
         for spool in spools {
             if spool.records() == 0 {
                 continue;
             }
-            resolve_phase(spool, &view, &GateOutput::Repair(&fan), &mut stats)
+            resolve_phase(spool, &view, &GateOutput::Repair(&tx), &mut stats)
                 .await
                 .unwrap();
         }
         drop(tx);
-        drop(fan);
 
         let mut blknos = Vec::new();
         while let Some(batch) = rx.recv().await {
@@ -745,14 +696,9 @@ mod tests {
             tuple(100, 0, HEAP_XMIN_COMMITTED),
         ])
         .await;
-        resolve_phase(
-            spool,
-            &view,
-            &GateOutput::Repair(&LaneFan::new(vec![tx.clone()])),
-            &mut stats,
-        )
-        .await
-        .unwrap();
+        resolve_phase(spool, &view, &GateOutput::Repair(&tx), &mut stats)
+            .await
+            .unwrap();
         drop(tx);
         let visible = rx.recv().await.expect("visible rows");
         assert!(!visible.unresolved);

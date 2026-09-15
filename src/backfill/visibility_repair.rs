@@ -90,18 +90,12 @@ impl RowRepair {
         let mut stats = RepairStats::default();
         let mut connection = None;
         let mut reads: PendingReads = HashMap::default();
-        let mut queued = 0usize;
-        let mut open = true;
-        while open {
-            match rx.recv().await {
-                Some(batch) => queued += self.sort_batch(batch, &tx, &mut reads).await?,
-                None => open = false,
-            }
-            while open && queued < REPAIR_TID_BATCH {
+        while let Some(batch) = rx.recv().await {
+            let mut queued = self.sort_batch(batch, &tx, &mut reads).await?;
+            while queued < REPAIR_TID_BATCH {
                 match rx.try_recv() {
                     Ok(batch) => queued += self.sort_batch(batch, &tx, &mut reads).await?,
-                    Err(mpsc::error::TryRecvError::Empty) => break,
-                    Err(mpsc::error::TryRecvError::Disconnected) => open = false,
+                    Err(_) => break,
                 }
             }
             if reads.is_empty() {
@@ -122,7 +116,6 @@ impl RowRepair {
                     .with_context(|| format!("row repair: unknown filenode {db}/{rel}"))?;
                 stats.rows += copy_locked(client, &desc, lsn, &tx, &tids, &self.rate).await?;
             }
-            queued = 0;
         }
         if let Some(client) = connection {
             stats.p_hi = current_wal_lsn(&client).await?;
