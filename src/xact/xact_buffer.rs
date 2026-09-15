@@ -2460,7 +2460,21 @@ impl ValueResolution<'_> {
                 .map_err(|e| XactBufferError::Detoast(format!("toast store fetch: {e}")))?
                 .expect("store checked via fill_on_miss");
             let cached = match fetched {
-                FetchedValue::Assembled(stored) => CachedValue::Decoded(finish_value(p, stored)?),
+                // Store bytes reconstruct a backup page, so undecodable bytes
+                // carry the same evidence as a short run: fill per miss policy
+                FetchedValue::Assembled(stored) => match finish_value(p, stored) {
+                    Ok(raw) => CachedValue::Decoded(raw),
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "walshadow::xact_buffer",
+                            toast_relid = p.va_toastrelid,
+                            value_id = p.va_valueid,
+                            error = %e,
+                            "store value undecodable; filling default",
+                        );
+                        CachedValue::Mismatch
+                    }
+                },
                 FetchedValue::Missing => CachedValue::Missing,
                 FetchedValue::Mismatch { .. } => CachedValue::Mismatch,
             };
@@ -3854,12 +3868,14 @@ mod tests {
         };
         // Uncompressed: leaf need = extsize
         assert_eq!(check_value_caps(&[ptr(104, 100)], 1000).unwrap(), 100);
-        // Compressed (method bits set): extsize + rawsize
+        // Compressed (extsize under rawsize): extsize + rawsize
         let compressed = 80u32 | (1 << VARLENA_EXTSIZE_BITS);
         assert_eq!(
             check_value_caps(&[ptr(104, compressed)], 1000).unwrap(),
             180
         );
+        // pglz carries method id 0, so size alone marks it compressed
+        assert_eq!(check_value_caps(&[ptr(104, 80)], 1000).unwrap(), 180);
         // Decode target over cap: typed error before allocation
         let err = check_value_caps(&[ptr(2000, 100)], 1000).unwrap_err();
         assert!(matches!(

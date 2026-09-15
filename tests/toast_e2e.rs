@@ -28,6 +28,9 @@ use walshadow::schema::RelName;
 /// 16 bytes * 512 = 8192, comfortably past the ~2KB toast threshold and
 /// spanning multiple ~2KB toast chunks.
 const BODY_SQL: &str = "repeat('walshadow-toast-', 512)";
+/// 16 bytes * 65536 = 1 MiB, which pglz crushes to ~12 KB: still past the
+/// toast threshold, so default storage lands it out of line *compressed*.
+const ZBODY_SQL: &str = "repeat('walshadow-zbody-', 65536)";
 /// UPDATE's replacement `meta`: big enough that the new tuple version can't
 /// fit in the packed page's leftover space (forces a cross-page update, see
 /// workload comment).
@@ -51,8 +54,10 @@ async fn replident_full_unchanged_toast_update() {
     ) = fx::bootstrap_clusters(
         &tmp,
         // EXTERNAL: out-of-line, uncompressed — guarantees the 8KB body
-        // toasts into multiple chunks instead of compressing inline.
-        "CREATE TABLE public.doc (id int PRIMARY KEY, meta text, body text);\n\
+        // toasts into multiple chunks instead of compressing inline. `zbody`
+        // keeps default storage, so it lands out of line compressed and the
+        // pointer's codec method rides `va_extinfo`.
+        "CREATE TABLE public.doc (id int PRIMARY KEY, meta text, body text, zbody text);\n\
          ALTER TABLE public.doc ALTER COLUMN body SET STORAGE EXTERNAL;\n\
          ALTER TABLE public.doc REPLICA IDENTITY FULL;\n",
         slot.source,
@@ -72,6 +77,7 @@ async fn replident_full_unchanged_toast_update() {
             id Int32,\
             meta Nullable(String),\
             body Nullable(String),\
+            zbody Nullable(String),\
             _lsn UInt64,\
             _xid UInt32,\
             _commit_ts DateTime64(6, 'UTC'), _is_deleted Bool\
@@ -96,6 +102,11 @@ async fn replident_full_unchanged_toast_update() {
             ColumnMapping {
                 src_attnum: 3,
                 target_name: "body".into(),
+                target_type: "Nullable(String)".into(),
+            },
+            ColumnMapping {
+                src_attnum: 4,
+                target_name: "zbody".into(),
                 target_type: "Nullable(String)".into(),
             },
         ],
@@ -131,8 +142,8 @@ async fn replident_full_unchanged_toast_update() {
     let driver = fx::spawn_workload(
         &source,
         vec![
-            format!("INSERT INTO public.doc VALUES (1, 'v1', {BODY_SQL})"),
-            "INSERT INTO public.doc SELECT g, repeat('f', 500), NULL \
+            format!("INSERT INTO public.doc VALUES (1, 'v1', {BODY_SQL}, {ZBODY_SQL})"),
+            "INSERT INTO public.doc SELECT g, repeat('f', 500), NULL, NULL \
              FROM generate_series(2, 17) g"
                 .into(),
             format!("UPDATE public.doc SET meta = {META2_SQL} WHERE id = 1"),
@@ -174,6 +185,17 @@ async fn replident_full_unchanged_toast_update() {
         "1",
         "unchanged TOAST body survives the RIF update",
     );
+    // Compressed external: store rehydration has to strip `va_tcinfo` and
+    // pick the codec by stored-vs-raw size, since pglz is method id 0
+    assert_eq!(
+        ch.query(&format!(
+            "SELECT zbody = {ZBODY_SQL} FROM walshadow_test.doc \
+             WHERE id = 1 ORDER BY _lsn DESC LIMIT 1"
+        ))
+        .expect("ch zbody"),
+        "1",
+        "unchanged compressed TOAST body survives the RIF update",
+    );
     assert_eq!(stats.toast_values_filled_default.load(Ordering::Relaxed), 0);
     assert_eq!(stats.toast_fetch_miss.load(Ordering::Relaxed), 0);
 
@@ -182,6 +204,15 @@ async fn replident_full_unchanged_toast_update() {
     let toast_relid = source
         .psql_one("SELECT reltoastrelid FROM pg_class WHERE oid = 'public.doc'::regclass")
         .expect("source toast relid");
+    assert_eq!(
+        ch.query(&format!(
+            "SELECT count(DISTINCT chunk_id) FROM walshadow_test.pg_toast_{toast_relid} \
+             WHERE chunk_id != 0"
+        ))
+        .expect("mirror chunk ids"),
+        "2",
+        "both the uncompressed and the compressed body toasted out of line",
+    );
     assert_eq!(
         ch.query(&format!(
             "SELECT groupArray(name) FROM system.columns \

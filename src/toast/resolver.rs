@@ -38,6 +38,11 @@ pub const CHUNK_PUT_BYTES: usize = 4 << 20;
 const FETCH_BLOCK_ROWS: usize = 1024;
 /// PG `VARHDRSZ`, 4-byte varlena header
 const VARHDRSZ: i32 = 4;
+/// `va_tcinfo` leads a compressed value's stored bytes: `toast_save_datum`
+/// keeps everything past the datum's own 4-byte varlena header, and PG reads
+/// the codec payload from `VARHDRSZ_COMPRESSED` (PG `src/include/varatt.h`,
+/// `src/backend/access/common/detoast.c`)
+const TCINFO_SZ: usize = 4;
 
 #[derive(Debug, Error)]
 pub enum ChunkStoreError {
@@ -64,6 +69,18 @@ pub(crate) fn pointer_extsize(p: &ToastPointer) -> usize {
     (p.va_extinfo & VARLENA_EXTSIZE_MASK) as usize
 }
 
+/// Uncompressed datum bytes, PG `va_rawsize - VARHDRSZ`
+pub(crate) fn pointer_rawsize(p: &ToastPointer) -> usize {
+    (p.va_rawsize - VARHDRSZ).max(0) as usize
+}
+
+/// PG `VARATT_EXTERNAL_IS_COMPRESSED` (`src/include/varatt.h`): stored size
+/// against raw size. Method bits cannot answer it, pglz is method id 0 so they
+/// stay clear on a pglz-compressed pointer
+pub(crate) fn pointer_compressed(p: &ToastPointer) -> bool {
+    pointer_extsize(p) < pointer_rawsize(p)
+}
+
 /// Validate value caps, return heap leaf-permit need
 pub(crate) fn check_value_caps(
     pointers: &[ToastPointer],
@@ -72,7 +89,7 @@ pub(crate) fn check_value_caps(
     let mut retained = 0usize;
     let mut transient = 0usize;
     for p in pointers {
-        let raw = (p.va_rawsize - VARHDRSZ).max(0) as usize;
+        let raw = pointer_rawsize(p);
         let ext = pointer_extsize(p);
         if raw.max(ext) > max {
             return Err(ToastValueError::ValueTooLarge {
@@ -80,7 +97,7 @@ pub(crate) fn check_value_caps(
                 max,
             });
         }
-        let compressed = (p.va_extinfo & !VARLENA_EXTSIZE_MASK) != 0;
+        let compressed = pointer_compressed(p);
         retained += if compressed { raw } else { ext };
         if compressed {
             transient = transient.max(ext);
@@ -96,19 +113,27 @@ pub(crate) fn detoasted_value(raw: Vec<u8>, type_oid: u32) -> ColumnValue {
 
 /// Convert stored bytes to raw bytes using pointer compression method
 pub(crate) fn finish_value(p: &ToastPointer, stored: Vec<u8>) -> Result<Vec<u8>, ToastValueError> {
-    let compressed = (p.va_extinfo & !VARLENA_EXTSIZE_MASK) != 0;
-    if !compressed {
+    if !pointer_compressed(p) {
         return Ok(stored);
     }
-    let method = ((p.va_extinfo >> VARLENA_EXTSIZE_BITS) & 0x3) as u8;
-    let raw_len = (p.va_rawsize - VARHDRSZ).max(0) as usize;
-    match decompress_varlena(method, &stored, raw_len) {
-        Some(out) => Ok(out),
-        None => Err(ToastValueError::Detoast(format!(
-            "decompress failed (method {method}, {} bytes → {raw_len})",
+    let method = (p.va_extinfo >> VARLENA_EXTSIZE_BITS) as u8;
+    let raw_len = pointer_rawsize(p);
+    let Some(body) = stored.get(TCINFO_SZ..) else {
+        return Err(ToastValueError::Detoast(format!(
+            "toast value {}/{}: compressed value holds {} bytes, under va_tcinfo",
+            p.va_toastrelid,
+            p.va_valueid,
             stored.len()
-        ))),
-    }
+        )));
+    };
+    decompress_varlena(method, body, raw_len).ok_or_else(|| {
+        ToastValueError::Detoast(format!(
+            "toast value {}/{}: decompress failed (method {method}, {} bytes → {raw_len})",
+            p.va_toastrelid,
+            p.va_valueid,
+            body.len()
+        ))
+    })
 }
 
 /// Chunk birth or TID tombstone, keyed by heap TID and record LSN
@@ -1112,6 +1137,64 @@ mod tests {
             offnum: tid.1,
             source_lsn: lsn,
         })
+    }
+
+    fn ptr(rawsize: i32, extinfo: u32) -> ToastPointer {
+        ToastPointer {
+            va_rawsize: rawsize,
+            va_extinfo: extinfo,
+            va_valueid: 7,
+            va_toastrelid: 16500,
+        }
+    }
+
+    /// Chunk bytes PG writes for a compressed value: `va_tcinfo`, then payload
+    fn stored_compressed(payload: &[u8], raw_len: usize, method: u8) -> Vec<u8> {
+        let tcinfo = (u32::from(method) << VARLENA_EXTSIZE_BITS) | raw_len as u32;
+        let mut out = tcinfo.to_le_bytes().to_vec();
+        out.extend_from_slice(payload);
+        out
+    }
+
+    /// Compresses well past the toast threshold, so PG keeps it out of line
+    fn compressible() -> Vec<u8> {
+        "walshadow-toast-".repeat(4096).into_bytes()
+    }
+
+    /// pglz is method id 0, so the method bits stay clear on its pointers
+    #[test]
+    fn pglz_external_detoasts() {
+        let raw = compressible();
+        let payload = pglz::compress(&raw, &pglz::Strategy::ALWAYS).expect("pglz compress");
+        let stored = stored_compressed(&payload, raw.len(), 0);
+        let p = ptr(raw.len() as i32 + VARHDRSZ, stored.len() as u32);
+        assert!(pointer_compressed(&p));
+        assert_eq!(finish_value(&p, stored).unwrap(), raw);
+    }
+
+    #[test]
+    fn lz4_external_detoasts_past_tcinfo() {
+        let raw = compressible();
+        let payload = lz4::block::compress(&raw, None, false).expect("lz4 compress");
+        let stored = stored_compressed(&payload, raw.len(), 1);
+        let p = ptr(
+            raw.len() as i32 + VARHDRSZ,
+            stored.len() as u32 | (1 << VARLENA_EXTSIZE_BITS),
+        );
+        assert_eq!(finish_value(&p, stored).unwrap(), raw);
+    }
+
+    #[test]
+    fn uncompressed_external_passes_through() {
+        let p = ptr(4 + VARHDRSZ, 4);
+        assert!(!pointer_compressed(&p));
+        assert_eq!(finish_value(&p, b"abcd".to_vec()).unwrap(), b"abcd");
+    }
+
+    #[test]
+    fn compressed_value_under_tcinfo_errors() {
+        let err = finish_value(&ptr(1000, 3), vec![0u8; 3]).unwrap_err();
+        assert!(matches!(err, ToastValueError::Detoast(_)), "{err}");
     }
 
     #[tokio::test]

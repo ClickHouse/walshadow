@@ -309,11 +309,25 @@ async fn resolve_or_fill_toast(
             .await
             .map_err(|e| format!("bootstrap: toast store fetch: {e}"))?;
         match fetched {
-            Some(FetchedValue::Assembled(stored)) => {
-                let raw = finish_value(&p, stored).map_err(|e| e.to_string())?;
-                retained += raw.len();
-                tuple.columns[idx] = Some(detoasted_value(raw, type_oid));
-            }
+            Some(FetchedValue::Assembled(stored)) => match finish_value(&p, stored) {
+                Ok(raw) => {
+                    retained += raw.len();
+                    tuple.columns[idx] = Some(detoasted_value(raw, type_oid));
+                }
+                // Walked bytes, not walshadow's reassembly: a page the copy
+                // caught mid-write reads back dense and still undecodable
+                Err(e) => {
+                    resolver.note_filled_mismatch();
+                    tracing::warn!(
+                        target: "walshadow::bootstrap",
+                        relation = %rel.rel_name,
+                        column = %c.target_name,
+                        error = %e,
+                        "walked value undecodable; filling default",
+                    );
+                    tuple.columns[idx] = Some(ColumnValue::Null);
+                }
+            },
             None => {
                 resolver.note_filled_default();
                 tuple.columns[idx] = Some(ColumnValue::Null);
