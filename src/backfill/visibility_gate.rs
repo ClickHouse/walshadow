@@ -57,7 +57,12 @@ impl GateOutput<'_> {
     async fn send(&self, rows: Vec<BackfillTuple>, unresolved: bool) -> bool {
         match self {
             Self::Rows(tx) => tx.send(rows).await.is_ok(),
-            Self::Repair(tx) => tx.send(RepairBatch { rows, unresolved }).await.is_ok(),
+            Self::Repair(tx) => {
+                if rows.is_empty() {
+                    return true;
+                }
+                tx.send(RepairBatch { rows, unresolved }).await.is_ok()
+            }
         }
     }
 }
@@ -233,56 +238,74 @@ pub struct GreenfieldSink {
     pub skip_initial: HashSet<RelName>,
 }
 
-/// Spawned repair and drain stages of one leg
 pub struct RepairDrain {
+    lanes: Vec<RepairDrainLane>,
+}
+
+struct RepairDrainLane {
     repair: AbortOnDropHandle<Result<RepairStats>>,
     drain: AbortOnDropHandle<Result<BootstrapDrainOutcome, String>>,
 }
 
 impl GreenfieldSink {
     /// Spawn source repair feeding the bootstrap drain. Gate stage owns the
-    /// returned sender; dropping it winds both stages down
+    /// returned senders; dropping each winds its lane down
     pub fn spawn(
         &self,
-        msg_tx: mpsc::Sender<BatcherMsg>,
-        ack: AckHandle,
-    ) -> (mpsc::Sender<RepairBatch>, RepairDrain) {
-        let (tx, rx) = mpsc::channel(BOOTSTRAP_TUPLE_CHANNEL_CAP);
-        let (repaired_tx, repaired_rx) = mpsc::channel(BOOTSTRAP_TUPLE_CHANNEL_CAP);
-        let repair = AbortOnDropHandle::new(tokio::spawn(
-            RowRepair {
-                source: self.source.clone(),
-                catalog: self.catalog.clone(),
-                scope: self.repair_scope.clone(),
-                rate: self.copy_rate.clone(),
-            }
-            .run(rx, repaired_tx),
-        ));
-        let drain = AbortOnDropHandle::new(tokio::spawn(bootstrap::drain(
-            repaired_rx,
-            self.catalog.clone(),
-            self.mapping.clone(),
-            msg_tx,
-            ack,
-            self.stats.clone(),
-            self.resolver.clone(),
-            // Repair strips mapped external pointers, so nothing defers
-            None,
-            self.emitter.row_policy(),
-            Some(self.config.clone()),
-            self.skip_initial.clone(),
-        )));
-        (tx, RepairDrain { repair, drain })
+        tails: Vec<(mpsc::Sender<BatcherMsg>, AckHandle)>,
+    ) -> (Vec<mpsc::Sender<RepairBatch>>, RepairDrain) {
+        let mut senders = Vec::with_capacity(tails.len());
+        let mut lanes = Vec::with_capacity(tails.len());
+        for (msg_tx, ack) in tails {
+            let (tx, rx) = mpsc::channel(BOOTSTRAP_TUPLE_CHANNEL_CAP);
+            let (repaired_tx, repaired_rx) = mpsc::channel(BOOTSTRAP_TUPLE_CHANNEL_CAP);
+            let repair = AbortOnDropHandle::new(tokio::spawn(
+                RowRepair {
+                    source: self.source.clone(),
+                    catalog: self.catalog.clone(),
+                    scope: self.repair_scope.clone(),
+                    rate: self.copy_rate.clone(),
+                }
+                .run(rx, repaired_tx),
+            ));
+            let drain = AbortOnDropHandle::new(tokio::spawn(bootstrap::drain(
+                repaired_rx,
+                self.catalog.clone(),
+                self.mapping.clone(),
+                msg_tx,
+                ack,
+                self.stats.clone(),
+                self.resolver.clone(),
+                // Repair strips mapped external pointers, so nothing defers
+                None,
+                self.emitter.row_policy(),
+                Some(self.config.clone()),
+                self.skip_initial.clone(),
+            )));
+            senders.push(tx);
+            lanes.push(RepairDrainLane { repair, drain });
+        }
+        (senders, RepairDrain { lanes })
     }
 }
 
 impl RepairDrain {
-    /// Join both stages before surfacing either error, so a failed repair
-    /// still lets the drain finish what it holds
-    pub async fn join(self) -> Result<(RepairStats, BootstrapDrainOutcome), String> {
-        let repaired = join_stage(self.repair, "row repair").await;
-        let drained = join_stage(self.drain, "drain").await;
-        Ok((repaired?, drained?))
+    /// Joins every stage before surfacing an error, so a failed repair still
+    /// lets the drains finish what they hold
+    pub async fn join(self) -> Result<(RepairStats, Vec<BootstrapDrainOutcome>), String> {
+        let mut repairs = Vec::with_capacity(self.lanes.len());
+        let mut drains = Vec::with_capacity(self.lanes.len());
+        for lane in self.lanes {
+            repairs.push(join_stage(lane.repair, "row repair").await);
+            drains.push(join_stage(lane.drain, "drain").await);
+        }
+        let mut repaired = RepairStats::default();
+        for r in repairs {
+            let r = r?;
+            repaired.rows += r.rows;
+            repaired.p_hi = repaired.p_hi.max(r.p_hi);
+        }
+        Ok((repaired, drains.into_iter().collect::<Result<_, _>>()?))
     }
 }
 
@@ -299,7 +322,8 @@ async fn join_stage<T, E: std::fmt::Display>(
 
 /// Greenfield resolution inputs
 pub struct PendingGate {
-    pub deferred: DeferredSpool,
+    /// One per gate task
+    pub deferred: Vec<DeferredSpool>,
     pub sink: GreenfieldSink,
     pub oracle: Option<Arc<crate::ops::oracle::Oracle>>,
     /// Streaming-phase counters
@@ -318,7 +342,7 @@ pub async fn resolve_greenfield(
         oracle,
         stream_stats: mut gate_stats,
     } = gate;
-    if deferred.records() == 0 {
+    if deferred.iter().map(DeferredSpool::records).sum::<u64>() == 0 {
         return Ok(gate_stats);
     }
     let accum = read_pg_xact(data_dir).await?;
@@ -337,15 +361,25 @@ pub async fn resolve_greenfield(
     .await
     .map_err(anyhow::Error::msg)?;
 
-    let (tx, stages) = sink.spawn(tail.msg_tx.clone(), tail.ack.clone());
-    let resolved = resolve_phase(deferred, &view, &GateOutput::Repair(&tx), &mut gate_stats).await;
-    drop(tx);
+    // Replays what the walk deferred, not the bulk load: one lane is enough
+    let (txs, stages) = sink.spawn(vec![(tail.msg_tx.clone(), tail.ack.clone())]);
+    let mut resolved = Ok(());
+    for spool in deferred {
+        if spool.records() == 0 {
+            continue;
+        }
+        resolved = resolve_phase(spool, &view, &GateOutput::Repair(&txs[0]), &mut gate_stats).await;
+        if resolved.is_err() {
+            break;
+        }
+    }
+    drop(txs);
     // Drain tail before surfacing errors
     let next_seq = match (resolved, stages.join().await) {
         (Ok(()), Ok((repaired, drained))) => {
             gate_stats.repaired_rows += repaired.rows;
             gate_stats.p_hi = gate_stats.p_hi.max(repaired.p_hi);
-            drained.next_seq
+            drained.iter().map(|d| d.next_seq).max().unwrap_or(0)
         }
         (Err(e), _) | (_, Err(e)) => {
             tail.quiesce().await;
@@ -390,9 +424,62 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn repair_lanes_close_independently() {
+        let sink = GreenfieldSink {
+            source: crate::config::SourceConn::default().to_pg_config(),
+            catalog: CatalogMap::new(),
+            mapping: Default::default(),
+            repair_scope: RepairScope::default(),
+            copy_rate: CopyRate::new(None),
+            config: Arc::new(ResolvedConfig::default()),
+            emitter: EmitterConfig::default(),
+            stats: Arc::new(EmitterStats::default()),
+            resolver: ToastResolver::disabled(),
+            skip_initial: HashSet::new(),
+        };
+        let (ack, ack_task) = crate::emit::pipeline::ack::spawn(Arc::new(Default::default()));
+        let (msg_tx, _msg_rx) = mpsc::channel(1);
+        let (mut txs, mut stages) =
+            sink.spawn(vec![(msg_tx.clone(), ack.clone()), (msg_tx, ack.clone())]);
+        let first = txs.remove(0);
+        assert!(
+            GateOutput::Repair(&first)
+                .send(vec![tuple(100, 0, HEAP_XMIN_COMMITTED)], false)
+                .await
+        );
+        drop(first);
+        let lane = stages.lanes.remove(0);
+        let drained = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            join_stage(lane.repair, "repair").await.unwrap();
+            join_stage(lane.drain, "drain").await.unwrap()
+        })
+        .await
+        .expect("first lane closes while second remains open");
+        assert_eq!(drained.next_seq, 1);
+        assert!(!stages.lanes[0].repair.is_finished());
+        drop(txs);
+        let (_, drained) = stages.join().await.unwrap();
+        assert_eq!(drained[0].next_seq, 0);
+        drop(ack);
+        ack_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn empty_slabs_are_not_sent() {
+        let (tx, mut rx) = mpsc::channel(4);
+        assert!(GateOutput::Repair(&tx).send(Vec::new(), false).await);
+        drop(tx);
+        assert!(rx.try_recv().is_err(), "empty slab must not occupy a lane");
+    }
+
     async fn spool_of(tuples: Vec<BackfillTuple>) -> DeferredSpool {
+        spool_at("unused", tuples).await
+    }
+
+    async fn spool_at(tag: &str, tuples: Vec<BackfillTuple>) -> DeferredSpool {
         let mut spool = DeferredSpool::new(
-            std::env::temp_dir().join("ws-visibility-gate-unused.bin"),
+            std::env::temp_dir().join(format!("ws-visibility-gate-{tag}.bin")),
             DEFERRED_SPOOL_MEM_MAX,
         );
         for t in tuples {
@@ -558,6 +645,43 @@ mod tests {
         assert_eq!(stats.deferred, 0, "chunks never spool");
     }
 
+    /// A spool skipped here is rows silently missing from the destination
+    #[tokio::test]
+    async fn several_spools_all_replay_into_one_output() {
+        let accum = PgXactAccum::new();
+        let patch = PgXactPatch::new();
+        let multi = PgMultiXactAccum::new();
+        let view = PgXactView::new(&accum, &patch).with_multixact(&multi);
+        let (tx, mut rx) = mpsc::channel(16);
+        let mut stats = GateStats::default();
+
+        let mut spools = Vec::new();
+        for i in 0..3u32 {
+            let mut t = tuple(100, 0, HEAP_XMIN_COMMITTED);
+            t.blkno = i;
+            spools.push(spool_at(&format!("several-{i}"), vec![t]).await);
+        }
+        spools.push(spool_at("several-empty", Vec::new()).await);
+
+        for spool in spools {
+            if spool.records() == 0 {
+                continue;
+            }
+            resolve_phase(spool, &view, &GateOutput::Repair(&tx), &mut stats)
+                .await
+                .unwrap();
+        }
+        drop(tx);
+
+        let mut blknos = Vec::new();
+        while let Some(batch) = rx.recv().await {
+            blknos.extend(batch.rows.iter().map(|r| r.blkno));
+        }
+        blknos.sort_unstable();
+        assert_eq!(blknos, vec![0, 1, 2], "every spool's tuple must resolve");
+        assert_eq!(stats.emitted, 3);
+    }
+
     #[tokio::test]
     async fn greenfield_repairs_only_undecidable_tuples() {
         let accum = PgXactAccum::new();
@@ -614,7 +738,7 @@ mod tests {
     #[tokio::test]
     async fn resolve_greenfield_is_a_noop_without_deferrals() {
         let pending = PendingGate {
-            deferred: spool_of(Vec::new()).await,
+            deferred: vec![spool_of(Vec::new()).await],
             sink: GreenfieldSink {
                 source: crate::config::SourceConn::default().to_pg_config(),
                 catalog: CatalogMap::new(),

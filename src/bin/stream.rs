@@ -62,9 +62,7 @@ use walshadow::backup_source_object_store::ObjectStoreSource;
 use walshadow::boundary_hold::{
     BoundaryGateConfig, BoundaryHoldSink, BoundaryHoldStats, CatalogBoundaryGate,
 };
-use walshadow::ch_emitter::{
-    BootstrapMode, DEFAULT_DECODER_POOL, DEFAULT_INSERTER_POOL, EmitterConfig, EmitterStats,
-};
+use walshadow::ch_emitter::{BootstrapMode, EmitterConfig, EmitterStats};
 use walshadow::config::{CliOverrides, ConfigResolver, ResolvedConfig, SourceConn, cli_over_toml};
 use walshadow::decoder_sink::MetricsTupleObserver;
 use walshadow::manifest;
@@ -107,6 +105,7 @@ struct BootstrapPlan {
     mode: BootstrapMode,
     backup_name: String,
     parallelism: Option<usize>,
+    lanes: Option<usize>,
 }
 
 impl BootstrapPlan {
@@ -147,6 +146,8 @@ fn resolve_bootstrap(args: &Args, ch: Option<&EmitterConfig>) -> Result<Bootstra
         toml.and_then(|b| b.object_store_parallelism),
     )
     .map(NonZeroUsize::get);
+    let lanes =
+        cli_over_toml(args.bootstrap_lanes, toml.and_then(|b| b.lanes)).map(NonZeroUsize::get);
 
     if mode != BootstrapMode::ObjectStore {
         for (knob, set) in [
@@ -168,6 +169,7 @@ fn resolve_bootstrap(args: &Args, ch: Option<&EmitterConfig>) -> Result<Bootstra
         mode,
         backup_name: backup_name.unwrap_or_else(|| "LATEST".into()),
         parallelism,
+        lanes,
     })
 }
 
@@ -549,6 +551,11 @@ struct Args {
     /// to `ObjectStoreSource`'s own `min(4, num_cpus)` default.
     #[arg(long)]
     bootstrap_object_store_parallelism: Option<NonZeroUsize>,
+    /// Parallel repair/drain/batcher lanes for the greenfield load. Each gets
+    /// its own batcher and `inserter_pool_size / lanes` inserters. Unset falls
+    /// through to `[bootstrap] lanes`, then `min(inserter_pool_size, num_cpus)`
+    #[arg(long)]
+    bootstrap_lanes: Option<NonZeroUsize>,
     /// BASE_BACKUP fast-checkpoint flag for `direct` mode. `true` avoids
     /// waiting for source's checkpoint_timeout; flip off if checkpoint
     /// cost matters more than bootstrap latency.
@@ -1838,12 +1845,12 @@ async fn run_session(
         let decoders = positive_usize(
             "decoder_pool_size",
             args.decoder_pool_size,
-            DEFAULT_DECODER_POOL,
+            walshadow::ch_emitter::DEFAULT_DECODER_POOL,
         );
         let inserters = positive_usize(
             "inserter_pool_size",
             args.inserter_pool_size,
-            DEFAULT_INSERTER_POOL,
+            walshadow::ch_emitter::default_inserter_pool(),
         );
         tracing::info!(
             target: "walshadow::pipeline",
@@ -3578,6 +3585,16 @@ fn stage_gauges(v: &StageCounters<'_>) -> MetricsSnapshot {
         bootstrap_deferred_spool_bytes: emitter_stats
             .map(|s| s.bootstrap_deferred_spool_bytes.load(Ordering::Relaxed))
             .unwrap_or(0),
+        toast_chunk_puts_total: emitter_stats
+            .map(|s| s.toast_chunk_puts.load(Ordering::Relaxed))
+            .unwrap_or(0),
+        toast_chunk_put_seconds: emitter_stats
+            .map(|s| s.toast_chunk_put_nanos.load(Ordering::Relaxed))
+            .unwrap_or(0) as f64
+            / 1e9,
+        toast_chunks_stored_total: emitter_stats
+            .map(|s| s.toast_chunks_stored.load(Ordering::Relaxed))
+            .unwrap_or(0),
         toast_tombstones_stored_total: emitter_stats
             .map(|s| s.toast_tombstones_stored.load(Ordering::Relaxed))
             .unwrap_or(0),
@@ -4335,9 +4352,8 @@ async fn run_bootstrap(
     let catalog_map = seed_in_snapshot(sql_client)
         .await
         .context("bootstrap: seed_in_snapshot")?;
-    // One seed, two consumers that must agree: the landing decides which
-    // relation files reach the shadow, `filter_landed_wal` decides which
-    // records may redo onto them. Disagreement re-creates a skipped file.
+    // The landing and `filter_landed_wal` must agree on what counts as
+    // catalog, or redo re-creates a file the landing skipped
     let mut landing_tracker = walshadow::catalog_tracker::CatalogTracker::new();
     landing_tracker
         .seed_from_source(sql_client)
@@ -4597,25 +4613,43 @@ async fn run_bootstrap(
         // Window leg shares the tail's fatal, so a CH outage stops both
         let fatal = Fatal::new();
         let inserter_pool_size = emitter_cfg.inserter_pool_size;
+        let lanes = bootstrap_lanes(inserter_pool_size, plan.lanes);
+        let per_lane = lane_inserters(inserter_pool_size, lanes);
+        // Per-batcher budgets, and every lane has one: undivided, the real
+        // in-flight ceiling is `lanes * byte_budget`
+        let lane_cfg = {
+            let mut c = emitter_cfg.clone();
+            c.row_budget = (c.row_budget / lanes).max(1);
+            c.byte_budget = (c.byte_budget / lanes).max(8 << 20);
+            c
+        };
 
         // Throwaway watermark: durability proof is `wait_through(K)`, resume
         // LSN is carried via the WAL pipeline's emitter_ack seed (see `run`),
         // so uniform `commit_lsn = start_lsn` here is fine.
-        let tail = OwnedTail::spawn(
-            &emitter_cfg,
-            inserter_pool_size,
-            stats.clone(),
-            fatal.clone(),
-            None,
-            oracle.clone(),
-            "bootstrap",
-        )
-        .await
-        .map_err(anyhow::Error::msg)?;
+        let mut tails = Vec::with_capacity(lanes);
+        for inserters in &per_lane {
+            tails.push(
+                OwnedTail::spawn(
+                    &lane_cfg,
+                    *inserters,
+                    stats.clone(),
+                    fatal.clone(),
+                    None,
+                    oracle.clone(),
+                    "bootstrap",
+                )
+                .await
+                .map_err(anyhow::Error::msg)?,
+            );
+        }
         tracing::info!(
             target: "walshadow::bootstrap",
             addr = %addr,
-            inserters = inserter_pool_size,
+            lanes,
+            inserters = per_lane.iter().sum::<usize>(),
+            row_budget = lane_cfg.row_budget,
+            byte_budget = lane_cfg.byte_budget,
             "bootstrap insert tail started",
         );
 
@@ -4657,29 +4691,72 @@ async fn run_bootstrap(
         };
 
         // Gate page tuples, defer unknowns until transaction logs land
-        let gate_spool_path = args.spill_dir.join("bootstrap_gate_deferred.bin");
-        tokio::fs::remove_file(&gate_spool_path).await.ok();
-        let (gated_tx, stages) = sink.spawn(tail.msg_tx.clone(), tail.ack.clone());
-        let gate = tokio_util::task::AbortOnDropHandle::new(tokio::spawn({
-            let catalog = drain_catalog.clone();
-            let mut rx = rx;
-            let mut spool = walshadow::spool::DeferredSpool::new(
-                gate_spool_path,
-                walshadow::spool::DEFERRED_SPOOL_MEM_MAX,
+        let lane_tails: Vec<_> = tails
+            .iter()
+            .map(|t| (t.msg_tx.clone(), t.ack.clone()))
+            .collect();
+        let (repair_txs, stages) = sink.spawn(lane_tails);
+        let mut gate_txs = Vec::with_capacity(lanes);
+        let mut gate_handles = Vec::with_capacity(lanes);
+        for (i, repair_tx) in repair_txs.into_iter().enumerate() {
+            let (gate_tx, mut gate_rx) = tokio::sync::mpsc::channel(
+                walshadow::backup_page_walk::BOOTSTRAP_TUPLE_CHANNEL_CAP,
             );
-            async move {
-                let mut gate_stats = GateStats::default();
-                stream_phase(
-                    &mut rx,
-                    &GateOutput::Repair(&gated_tx),
-                    &catalog,
-                    &mut spool,
-                    &mut gate_stats,
-                )
-                .await
-                .map(|()| (gate_stats, spool))
+            gate_txs.push(gate_tx);
+            let spool_path = args
+                .spill_dir
+                .join(format!("bootstrap_gate_deferred.{i}.bin"));
+            tokio::fs::remove_file(&spool_path).await.ok();
+            let catalog = drain_catalog.clone();
+            gate_handles.push(tokio_util::task::AbortOnDropHandle::new(tokio::spawn(
+                async move {
+                    let mut spool = walshadow::spool::DeferredSpool::new(
+                        spool_path,
+                        walshadow::spool::DEFERRED_SPOOL_MEM_MAX,
+                    );
+                    let mut gate_stats = GateStats::default();
+                    stream_phase(
+                        &mut gate_rx,
+                        &GateOutput::Repair(&repair_tx),
+                        &catalog,
+                        &mut spool,
+                        &mut gate_stats,
+                    )
+                    .await
+                    .map(|()| (gate_stats, spool))
+                },
+            )));
+        }
+        let gate = async move {
+            let mut rx = rx;
+            let mut at = 0usize;
+            while let Some(slab) = rx.recv().await {
+                let lane = at % gate_txs.len();
+                at += 1;
+                if gate_txs[lane].send(slab).await.is_err() {
+                    break;
+                }
             }
-        }));
+            drop(gate_txs);
+            let mut stats = GateStats::default();
+            let mut spools = Vec::with_capacity(gate_handles.len());
+            for h in gate_handles {
+                let (s, spool) = h
+                    .await
+                    .map_err(|e| format!("bootstrap gate join: {e}"))?
+                    .map_err(|e| format!("bootstrap gate: {e}"))?;
+                stats.emitted += s.emitted;
+                stats.gated += s.gated;
+                stats.deferred += s.deferred;
+                stats.multixact_emitted += s.multixact_emitted;
+                stats.chunks_gated += s.chunks_gated;
+                stats.unresolved += s.unresolved;
+                stats.repaired_rows += s.repaired_rows;
+                stats.p_hi = stats.p_hi.max(s.p_hi);
+                spools.push(spool);
+            }
+            Ok::<_, String>((stats, spools))
+        };
 
         // Borrow feed until stop watch publishes end_lsn or zero
         let (stop_tx, stop_rx) = tokio::sync::watch::channel(None);
@@ -4711,9 +4788,8 @@ async fn run_bootstrap(
             tokio::join!(gate, stages.join(), pump_then_stop, leg_fut);
         let prepared = (|| -> Result<_> {
             let (repair_stats, drain_outcome) = stage_res.map_err(|e| anyhow::anyhow!(e))?;
-            let (mut gate_stats, gate_spool) = gate_res
-                .context("bootstrap gate join")?
-                .map_err(|e| anyhow::anyhow!("bootstrap gate: {e}"))?;
+            let (mut gate_stats, gate_spool) =
+                gate_res.map_err(|e| anyhow::anyhow!("bootstrap gate: {e}"))?;
             gate_stats.repaired_rows += repair_stats.rows;
             gate_stats.p_hi = gate_stats.p_hi.max(repair_stats.p_hi);
             let outcome: BootstrapOutcome = pump_res
@@ -4743,19 +4819,26 @@ async fn run_bootstrap(
         let (gate_stats, gate_spool, drain_outcome, outcome, window) = match prepared {
             Ok(prepared) => prepared,
             Err(e) => {
-                tail.quiesce().await;
+                for tail in tails {
+                    tail.quiesce().await;
+                }
                 return Err(e);
             }
         };
-        let k = drain_outcome.next_seq;
-
-        tail.finish(k).await.map_err(anyhow::Error::msg)?;
+        // Seqs are per-lane, so each tail is proven through its own count
+        let rows_routed: u64 = drain_outcome.iter().map(|d| d.rows_routed).sum();
+        let seqs: u64 = drain_outcome.iter().map(|d| d.next_seq).sum();
+        for (tail, outcome) in tails.into_iter().zip(&drain_outcome) {
+            tail.finish(outcome.next_seq)
+                .await
+                .map_err(anyhow::Error::msg)?;
+        }
         tracing::info!(
             target: "walshadow::bootstrap",
-            rows_routed = drain_outcome.rows_routed,
+            rows_routed,
             rows_emitted = stats.rows_emitted.load(Ordering::Relaxed),
             blocks_sent = stats.blocks_sent.load(Ordering::Relaxed),
-            seqs = k,
+            seqs,
             "bootstrap insert tail drained",
         );
         pending_gate = Some(PendingGate {
@@ -4764,7 +4847,7 @@ async fn run_bootstrap(
             oracle: oracle.clone(),
             stream_stats: gate_stats,
         });
-        (drain_outcome.rows_routed, outcome, window)
+        (rows_routed, outcome, window)
     } else {
         // Metrics-only skips destination convergence
         let mut observer = MetricsTupleObserver::default();
@@ -4883,8 +4966,7 @@ async fn run_bootstrap(
     }
     tokio::fs::remove_dir_all(&window_scratch).await.ok();
 
-    // The backup's WAL landed raw. Everything that needed the raw bytes has
-    // read them by now; rewrite before the shadow's recovery gets a look.
+    // The backup's WAL landed raw; rewrite before the shadow's recovery sees it
     let landed = walshadow::backfill::wal_landing::filter_landed_wal(
         &shadow_data_dir.join("pg_wal"),
         outcome.start.timeline,
@@ -5135,6 +5217,27 @@ async fn prepare_bootstrap_dir(dir: &Path) -> Result<()> {
 /// Inserter count is the demand on the oracle: one bridge worker and one
 /// resolver per inserter is what keeps a batch resolving while the others
 /// insert
+/// Bounded by the inserter pool: a lane without an inserter cannot insert
+fn bootstrap_lanes(inserter_pool_size: usize, override_lanes: Option<usize>) -> usize {
+    let ceiling = inserter_pool_size.max(1);
+    let want = override_lanes.unwrap_or_else(|| {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+    });
+    want.clamp(1, ceiling)
+}
+
+/// Distributes the remainder; `div_ceil` per lane would hand out more
+/// connections than the pool names
+fn lane_inserters(inserter_pool_size: usize, lanes: usize) -> Vec<usize> {
+    let (base, rem) = (inserter_pool_size / lanes, inserter_pool_size % lanes);
+    (0..lanes)
+        .map(|i| base + usize::from(i < rem))
+        .map(|n| n.max(1))
+        .collect()
+}
+
 fn bridge_pool_size(ch_config: Option<&EmitterConfig>) -> usize {
     ch_config
         .map_or(1, |cfg| cfg.inserter_pool_size)
@@ -5628,6 +5731,37 @@ mod tests {
     }
 
     #[test]
+    fn bootstrap_lanes_layers_override_over_the_derived_default() {
+        let derived = bootstrap_lanes(8, None);
+        assert!((1..=8).contains(&derived), "derived {derived}");
+        assert_eq!(bootstrap_lanes(8, Some(2)), 2, "override wins");
+        assert_eq!(bootstrap_lanes(8, Some(0)), 1, "zero clamps to one lane");
+        assert_eq!(bootstrap_lanes(1, None), 1, "a single inserter is one lane");
+        assert_eq!(
+            bootstrap_lanes(3, Some(16)),
+            3,
+            "lanes never exceed inserters; a lane with none cannot insert",
+        );
+    }
+
+    #[test]
+    fn lane_inserters_distribute_the_pool_without_overshooting() {
+        for (pool, lanes) in [(8, 3), (8, 8), (8, 1), (5, 4), (3, 3), (12, 5)] {
+            let split = lane_inserters(pool, lanes);
+            assert_eq!(split.len(), lanes, "pool {pool} lanes {lanes}");
+            assert!(
+                split.iter().all(|n| *n >= 1),
+                "every lane needs an inserter"
+            );
+            assert_eq!(
+                split.iter().sum::<usize>(),
+                pool,
+                "pool {pool} over {lanes} lanes must sum to the pool, got {split:?}",
+            );
+        }
+    }
+
+    #[test]
     fn bootstrap_plan_layers_cli_over_toml() {
         let toml = |s: &str| EmitterConfig::from_toml_str(s).unwrap();
 
@@ -5692,19 +5826,19 @@ mod tests {
     fn owned_shadow_sizes_bridge_from_inserter_config() {
         let tmp = tempfile::tempdir().unwrap();
         let args = args_from(&[]);
-        for (toml, workers, slots) in [
-            (None, 1, 2),
-            (Some("[ch]"), 3, 4),
-            (Some("[ch]\ninserter_pool_size = 5"), 5, 6),
-            (Some("[ch]\ninserter_pool_size = 16"), 8, 9),
+        for (toml, expect) in [
+            (None, Some(1)),
+            (Some("[ch]"), None),
+            (Some("[ch]\ninserter_pool_size = 5"), Some(5)),
+            (Some("[ch]\ninserter_pool_size = 16"), Some(8)),
         ] {
             let config = toml.map(|t| EmitterConfig::from_toml_str(t).unwrap());
-            let shadow = build_owned_shadow(
-                &args,
-                "postgres",
-                tmp.path().to_path_buf(),
-                bridge_pool_size(config.as_ref()),
-            );
+            let workers = bridge_pool_size(config.as_ref());
+            if let Some(want) = expect {
+                assert_eq!(workers, want, "{toml:?}");
+            }
+            let slots = workers + 1;
+            let shadow = build_owned_shadow(&args, "postgres", tmp.path().to_path_buf(), workers);
             let floor = walshadow::shadow::SourceGucFloor {
                 max_worker_processes: 1,
                 ..Default::default()

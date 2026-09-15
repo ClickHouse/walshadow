@@ -14,8 +14,8 @@
 //!   6. snapshot source's pg_current_wal_lsn + row state
 //!   7. restart the daemon with identical flags — same spill dir, same
 //!      walsender bind (SO_REUSEADDR), no `--ignore-cursor`
-//!   8. poll source + daemon's `walshadow_emitter_ack_lsn` until ack
-//!      catches up to the snapshotted LSN
+//!   8. poll source + daemon's `walshadow_source_received_lsn` until the
+//!      restarted pump catches up to the snapshotted LSN
 //!   9. poll CH count + sum(id) + md5(string_agg(name, ',' ORDER BY
 //!      id)) until it matches source's
 //!
@@ -340,9 +340,11 @@ async fn wait_for_first_commit(metrics_addr: SocketAddr, deadline: Duration) -> 
 }
 
 /// Poll source's `pg_current_wal_lsn` + daemon's
-/// `walshadow_emitter_ack_lsn` until the latter catches up. Returns
-/// the LSN at which the ack landed.
-async fn wait_for_ack_catchup(
+/// `walshadow_source_received_lsn` until the restarted pump catches up
+///
+/// `emitter_ack` carries record start LSNs while `pg_current_wal_lsn` reports
+/// the last record's end, so an idle source never lifts it to the target
+async fn wait_for_received_catchup(
     source: &Shadow,
     metrics_addr: SocketAddr,
     deadline: Duration,
@@ -352,14 +354,14 @@ async fn wait_for_ack_catchup(
     let target = parse_pg_lsn(&target_text).context("parse source LSN")?;
     while start.elapsed() < deadline {
         if let Ok(body) = fx::http_get(metrics_addr, "/metrics")
-            && let Some(ack) = fx::parse_metric(&body, "walshadow_emitter_ack_lsn")
-            && ack >= target
+            && let Some(received) = fx::parse_metric(&body, "walshadow_source_received_lsn")
+            && received >= target
         {
-            return Ok(ack);
+            return Ok(received);
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
-    bail!("emitter_ack_lsn never reached {target:X} in {deadline:?}");
+    bail!("source_received_lsn never reached {target:X} in {deadline:?}");
 }
 
 fn write_ch_config(ch_config_path: &Path, ch_tcp_port: u16) -> Result<()> {
@@ -611,10 +613,10 @@ async fn run_cycle(
     fx::wait_for_listen(flags.metrics_addr, Duration::from_secs(60))
         .context("restart daemon metrics endpoint never came up")?;
 
-    // 9. Wait for emitter ack to catch up to source's idle LSN.
-    let _ack = wait_for_ack_catchup(source, flags.metrics_addr, Duration::from_secs(90))
+    // 9. Wait for the restarted pump to reach source's idle LSN.
+    wait_for_received_catchup(source, flags.metrics_addr, Duration::from_secs(90))
         .await
-        .context("emitter ack catchup")?;
+        .context("restart pump catchup")?;
 
     // 10. Wait for source/CH parity
     fx::wait_ch_matches_source(ch, source, "kr.t", "default.kr_t", Duration::from_secs(60))

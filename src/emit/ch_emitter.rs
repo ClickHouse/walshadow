@@ -214,6 +214,7 @@ pub struct EmitterConfig {
     /// `[bootstrap]`: shadow seeding source + its object-store knobs.
     /// Boot-only, CLI overrides TOML
     pub bootstrap: BootstrapSettings,
+    pub toast: ToastSettings,
 }
 
 /// Choose bootstrap source for empty shadow data dir
@@ -270,13 +271,39 @@ pub struct BootstrapSettings {
     /// [`crate::backup_source_object_store::ObjectStoreSource`]'s
     /// `min(4, num_cpus)` clamp in place
     pub object_store_parallelism: Option<NonZeroUsize>,
+    /// `lanes`: parallel repair/drain/batcher lanes for the greenfield load
+    pub lanes: Option<NonZeroUsize>,
+}
+
+/// `[toast]` chunk-store controls, applied at startup
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
+pub struct ToastSettings {
+    pub put_batch_rows: Option<NonZeroUsize>,
+    pub put_batch_bytes: Option<NonZeroUsize>,
+    pub connections: Option<NonZeroUsize>,
 }
 
 pub(crate) const DEFAULT_RESIDENT_PAYLOAD_MAX: usize = 512 << 20;
 pub(crate) const DEFAULT_INLINE_VALUE_MAX: usize = 64 << 20;
 
-pub const DEFAULT_DECODER_POOL: usize = 3;
-pub const DEFAULT_INSERTER_POOL: usize = 3;
+pub const DEFAULT_POOL_FLOOR: usize = 3;
+
+/// A constant, not vCPU-scaled: [`crate::emit::pipeline::leaf_reserve_for`]
+/// caps `decoders * inline_value_max` at half the resolved `[memory]` budget,
+/// so a derived default can refuse boot where this one passes
+pub const DEFAULT_DECODER_POOL: usize = DEFAULT_POOL_FLOOR;
+
+/// Round-trip bound, so it tracks vCPUs; also sets
+/// `walshadow.bridge_workers`, so it stops where that pool does
+pub fn default_inserter_pool() -> usize {
+    vcpus().clamp(DEFAULT_POOL_FLOOR, crate::ops::bridge::MAX_BRIDGE_WORKERS)
+}
+
+fn vcpus() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(DEFAULT_POOL_FLOOR)
+}
 
 pub(crate) const DEFAULT_INSERT_TIMEOUT_SECS: u64 = 30;
 pub(crate) const DEFAULT_IDLE_RECONNECT_SECS: u64 = 30;
@@ -349,11 +376,12 @@ impl Default for EmitterConfig {
             resident_payload_max: DEFAULT_RESIDENT_PAYLOAD_MAX,
             inline_value_max: DEFAULT_INLINE_VALUE_MAX,
             decoder_pool_size: DEFAULT_DECODER_POOL,
-            inserter_pool_size: DEFAULT_INSERTER_POOL,
+            inserter_pool_size: default_inserter_pool(),
             decoder_batch_size: DEFAULT_QUEUEING_BATCH_SIZE,
             decoder_queue_capacity: DEFAULT_QUEUEING_RECORD_SINK_CAPACITY,
             backup: None,
             bootstrap: BootstrapSettings::default(),
+            toast: ToastSettings::default(),
         }
     }
 }
@@ -548,6 +576,8 @@ struct ConfigDocument {
     backup: Option<BackupSection>,
     #[serde(default)]
     bootstrap: BootstrapSettings,
+    #[serde(default)]
+    toast: ToastSettings,
     #[serde(default)]
     namespace: BTreeMap<String, NamespacePatch>,
     #[serde(default)]
@@ -760,6 +790,7 @@ impl EmitterConfig {
             out.backup = Some(parse_backup(bk)?);
         }
         out.bootstrap = doc.bootstrap;
+        out.toast = doc.toast;
         for (ns, n) in doc.namespace {
             out.namespaces.insert(
                 ns,
@@ -1976,6 +2007,9 @@ crate::atomic_stats! {
         /// batcher's own `flush_timeout` deadline and never bumps this
         pub flush_deadline_trips,
         pub toast_chunks_stored,
+        /// With the seconds counter, per-part commit latency
+        pub toast_chunk_puts,
+        pub toast_chunk_put_nanos,
         pub toast_tombstones_stored,
         /// Toasted values reassembled from the store (not the in-xact buffer)
         pub toast_values_fetched,
@@ -2199,8 +2233,13 @@ mod tests {
         assert_eq!(c.row_budget, 4_194_304);
         assert_eq!(c.byte_budget, 256 << 20);
         assert_eq!(c.flush_timeout, Duration::from_millis(1000));
-        assert_eq!(c.decoder_pool_size, 3);
-        assert_eq!(c.inserter_pool_size, 3);
+        assert_eq!(c.decoder_pool_size, DEFAULT_DECODER_POOL);
+        assert_eq!(c.inserter_pool_size, default_inserter_pool());
+        assert!(
+            (DEFAULT_POOL_FLOOR..=crate::ops::bridge::MAX_BRIDGE_WORKERS)
+                .contains(&c.inserter_pool_size),
+            "inserter pool must stay within the bridge pool it sizes",
+        );
         assert_eq!(c.decoder_batch_size, 512);
         assert_eq!(c.decoder_queue_capacity, 131_072);
         assert!(c.replicate_all);
@@ -2384,8 +2423,10 @@ mod tests {
 
     #[test]
     fn compression_choice_build_codec_respects_features() {
+        // `None` still installs a decoder: the wire flag is what we send, and
+        // the server answers in whatever method it is configured for
         let none = CompressionChoice::None.build_codec().unwrap();
-        assert!(none.is_none());
+        assert_eq!(none.is_some(), cfg!(any(feature = "lz4", feature = "zstd")));
         let lz4 = CompressionChoice::Lz4.build_codec();
         #[cfg(feature = "lz4")]
         {

@@ -172,6 +172,33 @@ See [Query destination data](destination-tables.md)
 walshadow reads these tables but never writes them. Keep archive credentials
 and bootstrap configuration in TOML, not source-side tables
 
+## TOAST buffering
+
+Tune chunk-store buffering independently of inserter count, restart daemon to apply
+
+| `[toast]` setting | Default | Effect |
+|---|---:|---|
+| `put_batch_rows` | 65,536 | Seal chunk INSERT after this many rows |
+| `put_batch_bytes` | 67,108,864 | Seal chunk INSERT after this many body bytes |
+| `connections` | `ch.inserter_pool_size` | Limit concurrent chunk-store connections |
+
+Both seals apply to bootstrap and WAL chunk writes. Each bootstrap drain holds
+its own batch, so more lanes can multiply buffered chunk bodies. A byte seal
+can overshoot by one chunk. Smaller seals reduce buffering and create more
+ClickHouse parts; fewer connections reduce concurrent INSERT buffers but can
+reduce throughput
+
+For smaller buffers, retain connection parallelism and restore previous seals:
+
+```toml
+[toast]
+put_batch_rows = 256
+put_batch_bytes = 4194304
+```
+
+All three settings require positive integers. Existing `[bootstrap] lanes`
+and `[ch] inserter_pool_size` controls remain independent
+
 ## Backup archive
 
 Configure wal-g-compatible object storage for object-store bootstrap, WAL

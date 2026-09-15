@@ -366,10 +366,15 @@ impl CopyRate {
 
     async fn consume(&self, bytes: usize) {
         if let Some(rate) = self.bytes_per_sec {
-            let mut next = self.next.lock().await;
-            *next = (*next).max(tokio::time::Instant::now())
-                + Duration::from_secs_f64(bytes as f64 / rate as f64);
-            tokio::time::sleep_until(*next).await;
+            // Reserve under the lock, wait outside it: held across the sleep
+            // it serializes every caller
+            let until = {
+                let mut next = self.next.lock().await;
+                *next = (*next).max(tokio::time::Instant::now())
+                    + Duration::from_secs_f64(bytes as f64 / rate as f64);
+                *next
+            };
+            tokio::time::sleep_until(until).await;
         }
     }
 }

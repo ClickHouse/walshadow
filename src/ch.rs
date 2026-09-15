@@ -71,30 +71,34 @@ impl CompressionChoice {
         }
     }
 
+    /// Every codec this build links, whatever `self` asks to *send*. The
+    /// choice only sets the wire flag; a server answers in whatever method it
+    /// is configured for, so a client that installed one codec — or none —
+    /// fails on the first frame it cannot decode
     pub fn build_codec(self) -> Result<Option<Pin<Box<Codec>>>, EmitterError> {
         match self {
-            Self::None => Ok(None),
-            Self::Lz4 => {
-                #[cfg(feature = "lz4")]
-                {
-                    Ok(Some(Codec::lz4()))
-                }
-                #[cfg(not(feature = "lz4"))]
-                {
-                    Err(EmitterError::CompressionUnsupported("lz4"))
-                }
+            Self::Lz4 if !cfg!(feature = "lz4") => {
+                return Err(EmitterError::CompressionUnsupported("lz4"));
             }
-            Self::Zstd => {
-                #[cfg(feature = "zstd")]
-                {
-                    Ok(Some(Codec::zstd()))
-                }
-                #[cfg(not(feature = "zstd"))]
-                {
-                    Err(EmitterError::CompressionUnsupported("zstd"))
-                }
+            Self::Zstd if !cfg!(feature = "zstd") => {
+                return Err(EmitterError::CompressionUnsupported("zstd"));
             }
+            _ => {}
         }
+        if !cfg!(any(feature = "lz4", feature = "zstd")) {
+            return Ok(None);
+        }
+        let mut codec = Codec::empty();
+        // Slots are per method and each init fills only its own, so one codec
+        // decodes both
+        unsafe {
+            let raw = codec.as_mut().raw_mut();
+            #[cfg(feature = "lz4")]
+            clickhouse_c::sys::chc_lz4_codec_init(raw);
+            #[cfg(feature = "zstd")]
+            clickhouse_c::sys::chc_zstd_codec_init(raw);
+        }
+        Ok(Some(codec))
     }
 }
 
@@ -312,4 +316,38 @@ pub fn is_retryable(error: &EmitterError) -> bool {
 
 pub fn quote_ident(name: &str) -> String {
     format!("`{}`", name.replace('`', "``"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `compression = "none"` still has to decode a compressed response: the
+    /// wire flag says what we send, not what the server answers in. A server
+    /// set to ZSTD against a codec-less client fails on the first frame
+    #[test]
+    fn every_choice_installs_a_decoder() {
+        let choices = [
+            CompressionChoice::None,
+            #[cfg(feature = "lz4")]
+            CompressionChoice::Lz4,
+            #[cfg(feature = "zstd")]
+            CompressionChoice::Zstd,
+        ];
+        for choice in choices {
+            let codec = choice.build_codec().expect("codec builds");
+            assert_eq!(
+                codec.is_some(),
+                cfg!(any(feature = "lz4", feature = "zstd")),
+                "{choice:?} left the client unable to decode any frame",
+            );
+        }
+    }
+
+    #[test]
+    fn wire_flag_tracks_the_choice() {
+        assert_eq!(CompressionChoice::None.to_wire(), Compression::None);
+        assert_eq!(CompressionChoice::Lz4.to_wire(), Compression::Lz4);
+        assert_eq!(CompressionChoice::Zstd.to_wire(), Compression::Zstd);
+    }
 }

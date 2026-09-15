@@ -98,6 +98,43 @@ async fn drive_store_backed(resolver: &ToastResolver, stats: &EmitterStats) {
     assert_eq!(miss, Some(FetchedValue::Missing));
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_first_puts_create_mirrors_without_retries() {
+    if !fx::clickhouse_available() {
+        eprintln!("skip: no clickhouse binary on PATH");
+        return;
+    }
+    let slot = fx::Ports::alloc();
+    let ch = fx::ChServer::spawn(tempfile::tempdir().unwrap(), slot.ch_tcp, slot.ch_http)
+        .expect("spawn ch");
+    let mut cfg = config(ch.port);
+    cfg.inserter_pool_size = 4;
+    cfg.retry.max_attempts = 0;
+    let store = ClickHouseChunkStore::new(cfg);
+
+    // Failed CREATE must leave its connection ready to retry creation
+    assert!(
+        store
+            .put(&[row(16500, 7, 0, (1, 1), 0x1000, b"ab")])
+            .await
+            .is_err()
+    );
+    ch.query(&format!("CREATE DATABASE {DB}")).unwrap();
+    for relid in 16500..16508 {
+        let batches: Vec<_> = (0..4)
+            .map(|seq| vec![row(relid, 7, seq, (1, seq as u16 + 1), 0x1000, b"ab")])
+            .collect();
+        let results = futures::future::join_all(batches.iter().map(|batch| store.put(batch))).await;
+        for result in results {
+            result.unwrap();
+        }
+        assert_eq!(
+            store.fetch(relid, 7, u64::MAX, 8).await.unwrap(),
+            assembled(b"abababab")
+        );
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ch_chunk_store_put_fetch_roundtrip() {
     if !fx::clickhouse_available() {

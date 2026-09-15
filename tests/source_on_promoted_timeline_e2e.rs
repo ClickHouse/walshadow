@@ -112,6 +112,9 @@ async fn shadow_streams_from_a_source_booted_on_a_promoted_timeline() {
     for _ in 0..2 {
         promote_once(&source).expect("promote source");
     }
+    source
+        .psql_one("CHECKPOINT")
+        .expect("checkpoint promoted source");
     let tli = timeline_of(&source);
     assert_eq!(
         tli, 3,

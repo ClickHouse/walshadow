@@ -49,14 +49,14 @@ pub const PG_TOAST_NS: &str = "pg_toast";
 
 /// Body bytes a segment accumulates before its complete pages walk. Sets
 /// the `spawn_blocking` grain and, with the channel depth, the pages in
-/// flight; 16 pages decode in well under a millisecond, so the hop cost
-/// amortizes without pinning much heap.
-pub const SLAB_BYTES: usize = 16 * PAGE_BYTES;
+/// flight.
+pub const SLAB_BYTES: usize = 64 * PAGE_BYTES;
 /// Bootstrap tuple channel depth, in slabs. Small + bounded so a saturated
 /// CH inserter parks the page walk (and its source fetch) rather than
 /// buffering a whole relation in RAM. `SLAB_BYTES * CAP` bounds the heap
-/// payload in flight per concurrent segment.
-pub const BOOTSTRAP_TUPLE_CHANNEL_CAP: usize = 8;
+/// payload in flight per concurrent segment, and the greenfield chain holds
+/// `1 + 2 * lanes` of them.
+pub const BOOTSTRAP_TUPLE_CHANNEL_CAP: usize = 16;
 
 #[derive(Debug, Error)]
 pub enum PageWalkError {

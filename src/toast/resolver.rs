@@ -5,7 +5,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use async_trait::async_trait;
 use clickhouse_c::{Allocator, Block, BlockBuilder, ColumnBuilder, Event, TypeAst};
@@ -28,11 +28,12 @@ use ahash::{HashMap, HashMapExt, HashSet, HashSetExt};
 /// mirror rows via `Bytes`
 pub type ChunkMap = HashMap<(u32, u32), BTreeMap<u32, Bytes>>;
 
-/// Row seal for one store put slice
-pub const CHUNK_PUT_BATCH: usize = 256;
+/// Row seal for one store put slice. One `INSERT` is one CH part and a part
+/// commit costs the same whatever it holds, so small parts waste it
+pub const CHUNK_PUT_BATCH: usize = 65_536;
 /// Byte seal for one store put slice; typical chunks trip the row seal
 /// first, this bounds atypically fat bodies
-pub const CHUNK_PUT_BYTES: usize = 4 << 20;
+pub const CHUNK_PUT_BYTES: usize = 64 << 20;
 /// Fetch result rows per block: bounds one block's buffer to ~2 MiB at
 /// `TOAST_MAX_CHUNK_SIZE`, ordering validated across block boundaries
 const FETCH_BLOCK_ROWS: usize = 1024;
@@ -504,19 +505,47 @@ struct ChState {
 pub struct ClickHouseChunkStore {
     conn: EmitterConfig,
     alloc: Allocator,
-    state: Mutex<ChState>,
+    /// Taken round-robin: a restore is often one relid, so keying on it
+    /// would serialize the whole thing
+    states: Vec<Mutex<ChState>>,
+    next: AtomicUsize,
 }
 
 impl ClickHouseChunkStore {
     pub fn new(conn: EmitterConfig) -> Self {
+        let slots = conn
+            .toast
+            .connections
+            .map_or_else(|| conn.inserter_pool_size.max(1), |n| n.get());
         Self {
-            conn,
             alloc: Allocator::global(&mimalloc::MiMalloc),
-            state: Mutex::new(ChState {
-                client: ChConn::default(),
-                created: HashSet::new(),
-            }),
+            states: (0..slots)
+                .map(|_| {
+                    Mutex::new(ChState {
+                        client: ChConn::default(),
+                        created: HashSet::new(),
+                    })
+                })
+                .collect(),
+            next: AtomicUsize::new(0),
+            conn,
         }
+    }
+
+    async fn slot(&self) -> tokio::sync::MutexGuard<'_, ChState> {
+        let start = self.next.fetch_add(1, Ordering::Relaxed);
+        for i in 0..self.states.len() {
+            let at = (start + i) % self.states.len();
+            if let Ok(guard) = self.states[at].try_lock() {
+                return guard;
+            }
+        }
+        self.states[start % self.states.len()].lock().await
+    }
+
+    async fn slot_for(&self, toast_relid: u32) -> tokio::sync::MutexGuard<'_, ChState> {
+        let at = toast_relid as usize % self.states.len();
+        self.states[at].lock().await
     }
 
     fn toast_table(&self, toast_relid: u32) -> String {
@@ -776,7 +805,9 @@ impl ChunkStore for ClickHouseChunkStore {
         if rows.is_empty() {
             return Ok(());
         }
-        let mut state = self.state.lock().await;
+        // One batch, one INSERT: splitting across slots multiplies CH parts,
+        // and a part commit costs the same whatever it holds
+        let mut state = self.slot().await;
         self.put_locked(&mut state, rows)
             .await
             .map_err(|e| ChunkStoreError::Clickhouse(e.to_string()))
@@ -790,7 +821,7 @@ impl ChunkStore for ClickHouseChunkStore {
         expected_size: usize,
     ) -> Result<FetchedValue, ChunkStoreError> {
         let sql = self.fetch_sql(toast_relid, value_id, max_lsn);
-        let mut state = self.state.lock().await;
+        let mut state = self.slot_for(toast_relid).await;
         let asm: Option<ChunkAssembler> = self
             .query_locked(
                 &mut state,
@@ -816,7 +847,7 @@ impl ChunkStore for ClickHouseChunkStore {
 
     async fn truncate_mirror(&self, toast_relid: u32) -> Result<(), ChunkStoreError> {
         let sql = self.truncate_sql(toast_relid);
-        let mut state = self.state.lock().await;
+        let mut state = self.slot_for(toast_relid).await;
         self.exec_write(&mut state, &sql, None)
             .await
             .map_err(|e| ChunkStoreError::Clickhouse(e.to_string()))
@@ -829,7 +860,7 @@ impl ChunkStore for ClickHouseChunkStore {
         commit_lsn: u64,
     ) -> Result<(), ChunkStoreError> {
         let sql = self.rewrite_barrier_sql(toast_relid, marker_lsn, commit_lsn);
-        let mut state = self.state.lock().await;
+        let mut state = self.slot_for(toast_relid).await;
         match self.exec_write(&mut state, &sql, None).await {
             Ok(()) => Ok(()),
             // Never-populated mirror: no table, nothing lived, nothing to
@@ -849,6 +880,8 @@ impl ChunkStore for ClickHouseChunkStore {
 pub struct ToastResolver {
     store: Option<Arc<dyn ChunkStore>>,
     stats: Arc<EmitterStats>,
+    put_batch_rows: usize,
+    put_batch_bytes: usize,
     /// V3 hard per-value decode-target cap, checked before allocation
     inline_value_max: usize,
     /// Leaf permits for per-value transients (assembly, decompress, JIT
@@ -861,6 +894,8 @@ impl ToastResolver {
         Self {
             store: None,
             stats: Arc::new(EmitterStats::default()),
+            put_batch_rows: CHUNK_PUT_BATCH,
+            put_batch_bytes: CHUNK_PUT_BYTES,
             inline_value_max: usize::MAX,
             budget: None,
         }
@@ -870,6 +905,14 @@ impl ToastResolver {
         Self {
             store: Some(Arc::new(ClickHouseChunkStore::new(emitter.clone()))),
             stats,
+            put_batch_rows: emitter
+                .toast
+                .put_batch_rows
+                .map_or(CHUNK_PUT_BATCH, |n| n.get()),
+            put_batch_bytes: emitter
+                .toast
+                .put_batch_bytes
+                .map_or(CHUNK_PUT_BYTES, |n| n.get()),
             inline_value_max: emitter.inline_value_max,
             budget: None,
         }
@@ -880,6 +923,8 @@ impl ToastResolver {
         Self {
             store: Some(store),
             stats,
+            put_batch_rows: CHUNK_PUT_BATCH,
+            put_batch_bytes: CHUNK_PUT_BYTES,
             inline_value_max: usize::MAX,
             budget: None,
         }
@@ -912,6 +957,10 @@ impl ToastResolver {
 
     pub fn stores_chunks(&self) -> bool {
         self.store.is_some()
+    }
+
+    pub fn put_limit_reached(&self, rows: usize, bytes: usize) -> bool {
+        rows >= self.put_batch_rows || bytes >= self.put_batch_bytes
     }
 
     /// Shared counters, for commit-time stash resolution off the serial path
@@ -955,7 +1004,12 @@ impl ToastResolver {
         if rows.is_empty() {
             return Ok(());
         }
+        let started = std::time::Instant::now();
         store.put(rows).await?;
+        self.stats
+            .toast_chunk_put_nanos
+            .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        self.stats.toast_chunk_puts.fetch_add(1, Ordering::Relaxed);
         let tombstones = rows.iter().filter(|r| r.is_tombstone()).count() as u64;
         self.stats
             .toast_chunks_stored
@@ -981,7 +1035,7 @@ impl ToastResolver {
         while start < rows.len() {
             let mut end = start;
             let mut bytes = 0usize;
-            while end < rows.len() && end - start < CHUNK_PUT_BATCH && bytes < CHUNK_PUT_BYTES {
+            while end < rows.len() && !self.put_limit_reached(end - start, bytes) {
                 bytes += rows[end].chunk_data.len();
                 end += 1;
             }
@@ -999,13 +1053,12 @@ impl ToastResolver {
         Ok(())
     }
 
-    /// [`Self::put`] in WAL-order slices sealed at [`CHUNK_PUT_BATCH`] rows
-    /// or [`CHUNK_PUT_BYTES`], bounding one ClickHouse block build
+    /// [`Self::put`] in WAL-order slices sealed at configured row or byte limit
     pub async fn put_batched(&self, rows: &[ToastRow]) -> Result<(), ChunkStoreError> {
         let mut start = 0usize;
         let mut bytes = 0usize;
         for (i, r) in rows.iter().enumerate() {
-            if i > start && (i - start >= CHUNK_PUT_BATCH || bytes >= CHUNK_PUT_BYTES) {
+            if i > start && self.put_limit_reached(i - start, bytes) {
                 self.put(&rows[start..i]).await?;
                 start = i;
                 bytes = 0;
@@ -1492,13 +1545,63 @@ mod tests {
         assert_eq!(asm.finish(), assembled(b"abcd"));
     }
 
+    /// Fanning one batch across slots spends N part commits to move the
+    /// bytes of one
+    #[tokio::test]
+    async fn one_sealed_batch_is_one_insert() {
+        let store = Arc::new(MemChunkStore::new());
+        let stats = Arc::new(EmitterStats::default());
+        let r = ToastResolver::with_store(store.clone(), stats.clone());
+        let rows: Vec<ToastRow> = (0..64u32)
+            .map(|i| row(7, i, (1, 1 + i as u16), 0x1000 + u64::from(i), b"aa"))
+            .collect();
+
+        r.put(&rows).await.unwrap();
+
+        assert_eq!(
+            stats.toast_chunk_puts.load(Ordering::Relaxed),
+            1,
+            "a batch that fits one seal must cost exactly one INSERT",
+        );
+        assert_eq!(stats.toast_chunks_stored.load(Ordering::Relaxed), 64);
+    }
+
+    /// A restore is often one relid, so slots must not be keyed on it
+    #[tokio::test]
+    async fn chunk_store_slots_are_concurrent_for_one_relid() {
+        let store = ClickHouseChunkStore::new(EmitterConfig {
+            inserter_pool_size: 4,
+            ..EmitterConfig::default()
+        });
+        assert_eq!(store.states.len(), 4);
+
+        let mut held = Vec::new();
+        for _ in 0..4 {
+            held.push(store.slot().await);
+        }
+        assert_eq!(held.len(), 4, "every slot handed out without blocking");
+        drop(held);
+
+        let pinned = 16505usize % store.states.len();
+        let a = store.slot_for(16505).await;
+        assert!(
+            store.states[pinned].try_lock().is_err(),
+            "slot_for must pin a relid to one slot",
+        );
+        drop(a);
+    }
+
     #[tokio::test]
     async fn put_batched_preserves_order_across_slices() {
         let store = Arc::new(MemChunkStore::new());
         let stats = Arc::new(EmitterStats::default());
         let r = ToastResolver::with_store(store.clone(), stats);
+        // offnum is u16 and the seal exceeds it; carry into blkno
         let rows: Vec<ToastRow> = (0..CHUNK_PUT_BATCH as u32 + 3)
-            .map(|i| row(7, i, (1, 1 + i as u16), 0x1000 + u64::from(i), b"aa"))
+            .map(|i| {
+                let tid = (1 + i / 1000, 1 + (i % 1000) as u16);
+                row(7, i, tid, 0x1000 + u64::from(i), b"aa")
+            })
             .collect();
         r.put_batched(&rows).await.unwrap();
         let expected = 2 * rows.len();
@@ -1508,6 +1611,60 @@ mod tests {
             assembled(&b"aa".repeat(rows.len())),
             "all slices landed, in order"
         );
+    }
+
+    #[test]
+    fn toast_config_keeps_connections_independent_of_inserters() {
+        let cfg = EmitterConfig::from_toml_str(
+            "[ch]\ninserter_pool_size = 8\n[toast]\nconnections = 2\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.inserter_pool_size, 8);
+        assert_eq!(ClickHouseChunkStore::new(cfg).states.len(), 2);
+        for key in ["put_batch_rows", "put_batch_bytes", "connections"] {
+            assert!(
+                EmitterConfig::from_toml_str(&format!("[toast]\n{key} = 0\n")).is_err(),
+                "{key} must reject zero"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn configured_put_limits_preserve_materialized_and_referenced_rows() {
+        let refs: Vec<_> = (0..7)
+            .map(|seq| ToastRowRef {
+                toast_relid: 16500,
+                blkno: 1,
+                offnum: 1 + seq as u16,
+                chunk_id: 7,
+                chunk_seq: seq,
+                chunk_data: Body::Mem(Bytes::from_static(b"ab")),
+                lsn: 0x1000 + u64::from(seq),
+            })
+            .collect();
+        for (rows, bytes, puts) in [(3, 1024, 3), (100, 3, 4)] {
+            let cfg = EmitterConfig::from_toml_str(&format!(
+                "[toast]\nput_batch_rows = {rows}\nput_batch_bytes = {bytes}\n"
+            ))
+            .unwrap();
+            for referenced in [false, true] {
+                let store = Arc::new(MemChunkStore::new());
+                let stats = Arc::new(EmitterStats::default());
+                let mut resolver = ToastResolver::from_config(&cfg, stats.clone());
+                resolver.store = Some(store.clone());
+                if referenced {
+                    resolver.put_row_refs(None, &refs).await.unwrap();
+                } else {
+                    let rows: Vec<_> = refs.iter().map(|r| r.materialize(None).unwrap()).collect();
+                    resolver.put_batched(&rows).await.unwrap();
+                }
+                assert_eq!(stats.toast_chunk_puts.load(Ordering::Relaxed), puts);
+                assert_eq!(
+                    store.fetch(16500, 7, u64::MAX, 14).await.unwrap(),
+                    assembled(&b"ab".repeat(7))
+                );
+            }
+        }
     }
 
     #[test]

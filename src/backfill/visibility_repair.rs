@@ -17,7 +17,13 @@ use crate::source::source_feed::open_sql_client;
 use ahash::HashMap;
 
 /// CTIDs per `COPY`, bounding the `ctid = ANY (ARRAY[...])` literal
-const CTID_BATCH: usize = 256;
+const CTID_BATCH: usize = 4096;
+
+/// CTIDs accumulated before one lock-and-read cycle, whose `BEGIN` / `LOCK` /
+/// verify / `ROLLBACK` cost is flat in the batch size
+const REPAIR_TID_BATCH: usize = 16_384;
+
+type PendingReads = HashMap<(Oid, Oid, u64), Vec<(u32, u16)>>;
 
 #[derive(Debug, Default, Clone)]
 pub struct RepairScope {
@@ -83,29 +89,14 @@ impl RowRepair {
     ) -> Result<RepairStats> {
         let mut stats = RepairStats::default();
         let mut connection = None;
-        while let Some(RepairBatch { rows, unresolved }) = rx.recv().await {
-            let mut pass = Vec::new();
-            let mut reads: HashMap<_, Vec<_>> = HashMap::default();
-            // Unresolved rows out of scope get no read and have no route, so
-            // they reach neither branch
-            for t in rows {
-                if self
-                    .scope
-                    .get(&t)
-                    .is_some_and(|m| unresolved || t.has_mapped_external(m))
-                {
-                    reads
-                        .entry((t.rfn.db_node, t.rfn.rel_node, t.source_lsn))
-                        .or_default()
-                        .push((t.blkno, t.offnum));
-                } else if !unresolved {
-                    pass.push(t);
+        let mut reads: PendingReads = HashMap::default();
+        while let Some(batch) = rx.recv().await {
+            let mut queued = self.sort_batch(batch, &tx, &mut reads).await?;
+            while queued < REPAIR_TID_BATCH {
+                match rx.try_recv() {
+                    Ok(batch) => queued += self.sort_batch(batch, &tx, &mut reads).await?,
+                    Err(_) => break,
                 }
-            }
-            if !pass.is_empty() {
-                tx.send(pass)
-                    .await
-                    .context("row repair: drain closed early")?;
             }
             if reads.is_empty() {
                 continue;
@@ -118,7 +109,7 @@ impl RowRepair {
                 connection = Some(client);
             }
             let client = connection.as_ref().unwrap();
-            for ((db, rel, lsn), tids) in reads {
+            for ((db, rel, lsn), tids) in reads.drain() {
                 let desc = self
                     .catalog
                     .get(db, rel)
@@ -130,6 +121,39 @@ impl RowRepair {
             stats.p_hi = current_wal_lsn(&client).await?;
         }
         Ok(stats)
+    }
+
+    /// Returns the CTIDs added
+    async fn sort_batch(
+        &self,
+        batch: RepairBatch,
+        tx: &mpsc::Sender<Vec<BackfillTuple>>,
+        reads: &mut PendingReads,
+    ) -> Result<usize> {
+        let RepairBatch { rows, unresolved } = batch;
+        let mut pass = Vec::new();
+        let mut added = 0usize;
+        for t in rows {
+            if self
+                .scope
+                .get(&t)
+                .is_some_and(|m| unresolved || t.has_mapped_external(m))
+            {
+                reads
+                    .entry((t.rfn.db_node, t.rfn.rel_node, t.source_lsn))
+                    .or_default()
+                    .push((t.blkno, t.offnum));
+                added += 1;
+            } else if !unresolved {
+                pass.push(t);
+            }
+        }
+        if !pass.is_empty() {
+            tx.send(pass)
+                .await
+                .context("row repair: drain closed early")?;
+        }
+        Ok(added)
     }
 }
 

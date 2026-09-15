@@ -151,14 +151,8 @@ async fn optin_initial_load_none_skips_snapshot_but_streams_cdc() {
             }
             std::thread::sleep(Duration::from_millis(250));
         }
-        let deadline = Instant::now() + Duration::from_secs(60);
-        while source.psql_one("SELECT count(*) FROM pg_stat_progress_basebackup")? == "0" {
-            anyhow::ensure!(
-                Instant::now() < deadline,
-                "bootstrap never opened BASE_BACKUP"
-            );
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        fx::wait_for_backup_streaming(&source, Duration::from_secs(60))
+            .context("bootstrap never opened BASE_BACKUP")?;
         source.apply_schema_dump(
             "INSERT INTO public.t VALUES (100000, ARRAY[1,2]); SELECT pg_switch_wal()",
         )?;

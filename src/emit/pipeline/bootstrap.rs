@@ -22,8 +22,8 @@ use crate::mapping::{MappingSnapshot, TableMapping};
 use crate::ops::oracle::render_ext_columns;
 use crate::schema::{RelDescriptor, RelName};
 use crate::toast::{
-    CHUNK_PUT_BATCH, CHUNK_PUT_BYTES, FetchedValue, ToastResolver, ToastRow, check_value_caps,
-    detoasted_value, finish_value, pointer_extsize,
+    FetchedValue, ToastResolver, ToastRow, check_value_caps, detoasted_value, finish_value,
+    pointer_extsize,
 };
 use ahash::HashSet;
 
@@ -58,16 +58,13 @@ pub async fn drain(
     config: Option<Arc<ResolvedConfig>>,
     skip_initial: HashSet<RelName>,
 ) -> Result<BootstrapDrainOutcome, String> {
-    // Routes frozen once per pass from the caller's config snapshot
     let routes = freeze_routes(&mapping, config.as_deref(), &row_policy);
-    let mut next_seq = 0u64;
-    let mut rows_routed = 0u64;
-    let mut open: Option<(walrus::pg::walparser::RelFileNode, u64, u64)> = None;
-    let mut chunk_batch: Vec<ToastRow> = Vec::new();
-    let mut chunk_batch_bytes = 0usize;
-    let mut start_lsn = 0u64;
-    // Rows coalesce into `BatcherMsg::Rows` on the same dual trigger the
-    // decode pool uses, so a walk slab costs one channel hop, not one per row
+    let mut next_seq = 0;
+    let mut rows_routed = 0;
+    let mut open = None;
+    let mut chunk_batch = Vec::new();
+    let mut chunk_batch_bytes = 0;
+    let mut start_lsn = 0;
     let mut out = RowBuf::default();
     while let Some(slab) = rx.recv().await {
         for tuple in slab {
@@ -105,8 +102,7 @@ pub async fn drain(
                 if let Some(row) = row_from_columns(tuple, rel.oid) {
                     chunk_batch_bytes += row.chunk_data.len();
                     chunk_batch.push(row);
-                    if chunk_batch.len() >= CHUNK_PUT_BATCH || chunk_batch_bytes >= CHUNK_PUT_BYTES
-                    {
+                    if resolver.put_limit_reached(chunk_batch.len(), chunk_batch_bytes) {
                         flush_chunks(&resolver, &mut chunk_batch).await?;
                         chunk_batch_bytes = 0;
                     }
@@ -145,7 +141,6 @@ pub async fn drain(
             bump(&mut open, &mut rows_routed);
         }
     }
-
     out.flush(&msg_tx).await?;
     if let Some((_, seq, rows)) = open.take() {
         ack.placed(seq, rows);
@@ -155,7 +150,7 @@ pub async fn drain(
         flush_chunks(&resolver, &mut chunk_batch).await?;
     }
 
-    if let Some(deferred) = deferred.filter(|s| s.records() > 0) {
+    if let Some(deferred) = deferred.take().filter(|s| s.records() > 0) {
         tracing::info!(
             target: "walshadow::bootstrap",
             deferred = deferred.records(),

@@ -96,6 +96,9 @@ pub struct MetricsSnapshot {
     pub decoder_toast_chunks_total: u64,
     pub decoder_toast_malformed_total: u64,
     pub decoder_toast_deletes_total: u64,
+    pub toast_chunks_stored_total: u64,
+    pub toast_chunk_puts_total: u64,
+    pub toast_chunk_put_seconds: f64,
     pub toast_tombstones_stored_total: u64,
     pub toast_values_filled_superseded_total: u64,
     pub toast_values_filled_mismatch_total: u64,
@@ -670,6 +673,18 @@ pub fn render(snap: &MetricsSnapshot) -> String {
             "DELETE records on toast relations, buffered as tombstone rows.",
             "counter",
             snap.decoder_toast_deletes_total,
+        ),
+        (
+            "walshadow_toast_chunk_puts_total",
+            "Chunk-store INSERTs issued. Against the seconds counter this gives              per-part commit latency, which caps a TOAST-heavy restore.",
+            "counter",
+            snap.toast_chunk_puts_total,
+        ),
+        (
+            "walshadow_toast_chunks_stored_total",
+            "TOAST chunk rows persisted to the CH store; the bootstrap's              TOAST-phase progress signal.",
+            "counter",
+            snap.toast_chunks_stored_total,
         ),
         (
             "walshadow_toast_tombstones_stored_total",
@@ -1431,6 +1446,11 @@ pub fn render(snap: &MetricsSnapshot) -> String {
     writeln!(s, "{name} {:.3}", snap.desc_capture_seconds_total).unwrap();
 
     for (name, help, secs) in [
+        (
+            "walshadow_toast_chunk_put_seconds_total",
+            "Cumulative wall-clock inside chunk-store INSERTs. Divided by toast_chunk_puts_total this is per-part commit latency.",
+            snap.toast_chunk_put_seconds,
+        ),
         (
             "walshadow_bootstrap_decode_seconds_total",
             "Cumulative CPU inside the bootstrap page walk, tuple decode included.",
