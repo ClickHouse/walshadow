@@ -22,6 +22,9 @@ and workload limits before attaching
 
 - destination uses ClickHouse Native protocol
 - source column type changes require manual ClickHouse migration
+- `CREATE TABLE` omits a fast default only shadow PostgreSQL can render (raw
+  `jsonb`, arrays); the table it creates is empty, and `ADD COLUMN` resolves
+  the default through the oracle
 - `time` mapping requires ClickHouse `Time64` support
 - same-named tables from different PostgreSQL schemas need explicit destination mapping
 - `base_backup` and `object_store` table loads publish with staging-table swap, database must support `EXCHANGE TABLES`

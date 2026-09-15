@@ -1417,6 +1417,30 @@ pub fn is_replica_identity_attr(replident: &ReplIdent, attnum: i16) -> bool {
     }
 }
 
+/// PG `attmissingval`: one-element, no-null `ArrayType`, payload at `MAXALIGN(24)`
+#[cfg(test)]
+pub(crate) fn raw_missing_array(elemtype: u32, elem: &[u8]) -> Vec<u8> {
+    let mut v = Vec::with_capacity(24 + elem.len());
+    v.extend_from_slice(&0u32.to_le_bytes()); // vl_len_ (ignored)
+    v.extend_from_slice(&1i32.to_le_bytes()); // ndim
+    v.extend_from_slice(&0i32.to_le_bytes()); // dataoffset
+    v.extend_from_slice(&elemtype.to_le_bytes());
+    v.extend_from_slice(&1i32.to_le_bytes()); // dims[0]
+    v.extend_from_slice(&1i32.to_le_bytes()); // lbounds[0]
+    assert_eq!(v.len(), 24);
+    v.extend_from_slice(elem);
+    v
+}
+
+/// PG short varlena: 1-byte header, payload up to 126 bytes
+#[cfg(test)]
+pub(crate) fn short_varlena(content: &[u8]) -> Vec<u8> {
+    let total = 1 + content.len();
+    let mut v = vec![((total as u8) << 1) | 1];
+    v.extend_from_slice(content);
+    v
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2092,40 +2116,22 @@ mod tests {
         assert_eq!(missing_value_for(&none), ColumnValue::Null);
     }
 
-    // One-element, no-null on-disk ArrayType; element lands at MAXALIGN(24).
-    fn raw_array(elemtype: u32, elem: &[u8]) -> Vec<u8> {
-        let mut v = Vec::with_capacity(24 + elem.len());
-        v.extend_from_slice(&0u32.to_le_bytes()); // vl_len_ (ignored)
-        v.extend_from_slice(&1i32.to_le_bytes()); // ndim
-        v.extend_from_slice(&0i32.to_le_bytes()); // dataoffset
-        v.extend_from_slice(&elemtype.to_le_bytes());
-        v.extend_from_slice(&1i32.to_le_bytes()); // dims[0]
-        v.extend_from_slice(&1i32.to_le_bytes()); // lbounds[0]
-        assert_eq!(v.len(), 24);
-        v.extend_from_slice(elem);
-        v
-    }
-
-    fn short_varlena(content: &[u8]) -> Vec<u8> {
-        let total = 1 + content.len();
-        let mut v = vec![((total as u8) << 1) | 1];
-        v.extend_from_slice(content);
-        v
-    }
-
     const JSONBOID: u32 = 3802;
 
     #[test]
     fn fast_default_raw_scalar_decodes_to_value() {
         let mut a = rel_attr(1, "x", INT4OID, 4, 'i');
-        a.missing_default = Some(MissingDefault::Raw(raw_array(INT4OID, &7i32.to_le_bytes())));
+        a.missing_default = Some(MissingDefault::Raw(raw_missing_array(
+            INT4OID,
+            &7i32.to_le_bytes(),
+        )));
         assert_eq!(missing_value_for(&a), ColumnValue::Int4(7));
     }
 
     #[test]
     fn fast_default_raw_text_decodes_to_value() {
         let mut a = rel_attr(1, "n", TEXTOID, -1, 'i');
-        a.missing_default = Some(MissingDefault::Raw(raw_array(
+        a.missing_default = Some(MissingDefault::Raw(raw_missing_array(
             TEXTOID,
             &short_varlena(b"hi"),
         )));
@@ -2137,7 +2143,7 @@ mod tests {
         // jsonb has no lock-free text form: raw must survive as pending, not NULL
         let mut a = rel_attr(1, "j", JSONBOID, -1, 'i');
         let body = [0x01u8, 0x20, 0x00];
-        a.missing_default = Some(MissingDefault::Raw(raw_array(
+        a.missing_default = Some(MissingDefault::Raw(raw_missing_array(
             JSONBOID,
             &short_varlena(&body),
         )));
@@ -2160,7 +2166,10 @@ mod tests {
     #[test]
     fn fast_default_equivalent_across_raw_and_text() {
         let mut raw7 = rel_attr(1, "x", INT4OID, 4, 'i');
-        raw7.missing_default = Some(MissingDefault::Raw(raw_array(INT4OID, &7i32.to_le_bytes())));
+        raw7.missing_default = Some(MissingDefault::Raw(raw_missing_array(
+            INT4OID,
+            &7i32.to_le_bytes(),
+        )));
         let mut text7 = rel_attr(1, "x", INT4OID, 4, 'i');
         text7.missing_default = Some("7".into());
         assert!(missing_defaults_equivalent(&raw7, &text7));
@@ -2170,7 +2179,7 @@ mod tests {
         assert!(!missing_defaults_equivalent(&raw7, &text8));
 
         let mut raw_j = rel_attr(1, "j", JSONBOID, -1, 'i');
-        raw_j.missing_default = Some(MissingDefault::Raw(raw_array(
+        raw_j.missing_default = Some(MissingDefault::Raw(raw_missing_array(
             JSONBOID,
             &short_varlena(&[0x01, 0x20, 0x00]),
         )));

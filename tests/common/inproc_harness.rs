@@ -879,7 +879,8 @@ async fn build_pipeline_inner(
     let applicator = DdlApplicator::new(&emitter_cfg, ddl_cfg, mapping.clone(), config_rx.clone())
         .await
         .expect("ddl applicator init")
-        .with_resolver(config_resolver.clone());
+        .with_resolver(config_resolver.clone())
+        .with_oracle(oracle.clone());
     let stats = Arc::new(EmitterStats::default());
     let emitter_ack = Arc::new(Monotone::<EmitterAck>::new(0));
     // Aligned boot head stands in for the daemon's resolved floor (a
