@@ -351,6 +351,8 @@ snapshot! {
     counter bridge_native_bytes_total: u64 =
         "Native block bytes the bridge returned for ENCODE_NATIVE requests.",
     counter uptime_seconds: u64 = "Seconds since the daemon began its status loop.",
+    gauge bootstrap_attempt: u32 =
+        "Which attempt the running initial load is; above 1 means an incomplete one was discarded and re-extracted.",
     counter archive_wal_segments_total: u64 =
         "WAL segments replayed out of the backup archive because the source could not serve the resume point.",
     gauge archive_restore_active: u64 =
