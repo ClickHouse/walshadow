@@ -1,17 +1,18 @@
-//! Fixed-capacity ASCII buffer. `inet`, `interval`, `time` and `timetz` text
-//! all have a length bound, so their cells render off the stack. Every write
-//! funnels through [`TextBuf::push`], which takes ASCII only, keeping the
-//! contents valid UTF-8 for [`TextBuf::as_str`]. A byte past the bound drops
-//! rather than panics: each renderer's longest output is pinned by a test.
+//! Fixed-capacity ASCII buffer. `inet`, `interval`, `time`, `timetz` and
+//! `timestamp` text all have a length bound, so their cells render off the
+//! stack. Every write funnels through `push`, which takes ASCII only, keeping
+//! the contents valid UTF-8 for [`AsciiBuf::as_str`]. A byte past the bound
+//! drops rather than panics: each renderer's longest output is pinned by a
+//! test.
 
 use std::ops::Deref;
 
-pub struct TextBuf<const N: usize> {
+pub struct AsciiBuf<const N: usize> {
     buf: [u8; N],
     len: usize,
 }
 
-impl<const N: usize> TextBuf<N> {
+impl<const N: usize> AsciiBuf<N> {
     pub(crate) fn new() -> Self {
         Self {
             buf: [0; N],
@@ -80,7 +81,30 @@ impl<const N: usize> TextBuf<N> {
     }
 }
 
-impl<const N: usize> Deref for TextBuf<N> {
+impl<const N: usize> Deref for AsciiBuf<N> {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+/// Exactly `N` ASCII bytes, for renderers whose width never varies, so they
+/// carry no length
+pub struct AsciiArray<const N: usize>([u8; N]);
+
+impl<const N: usize> AsciiArray<N> {
+    pub(crate) fn new(bytes: [u8; N]) -> Self {
+        debug_assert!(bytes.is_ascii());
+        Self(bytes)
+    }
+
+    pub fn as_str(&self) -> &str {
+        unsafe { std::str::from_utf8_unchecked(&self.0) }
+    }
+}
+
+impl<const N: usize> Deref for AsciiArray<N> {
     type Target = str;
 
     fn deref(&self) -> &str {
@@ -93,8 +117,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn text_buf_writes_ascii_forms() {
-        let mut b = TextBuf::<16>::new();
+    fn ascii_buf_writes_ascii_forms() {
+        let mut b = AsciiBuf::<16>::new();
         b.push_uint(7, 2);
         b.push(b':');
         b.push_int(-42);
@@ -104,15 +128,15 @@ mod tests {
     }
 
     #[test]
-    fn text_buf_drops_writes_past_capacity() {
-        let mut b = TextBuf::<4>::new();
+    fn ascii_buf_drops_writes_past_capacity() {
+        let mut b = AsciiBuf::<4>::new();
         b.push_str("abcdef");
         assert_eq!(b.as_str(), "abcd");
     }
 
     #[test]
-    fn text_buf_drops_non_ascii() {
-        let mut b = TextBuf::<16>::new();
+    fn ascii_buf_drops_non_ascii() {
+        let mut b = AsciiBuf::<16>::new();
         b.push_str("a\u{e9}b");
         b.push(0xff);
         b.push(b'c');
@@ -120,8 +144,13 @@ mod tests {
     }
 
     #[test]
-    fn text_buf_hex_keeps_a_zero_group() {
-        let mut b = TextBuf::<4>::new();
+    fn ascii_array_reads_back_as_str() {
+        assert_eq!(AsciiArray::new(*b"abc").as_str(), "abc");
+    }
+
+    #[test]
+    fn ascii_buf_hex_keeps_a_zero_group() {
+        let mut b = AsciiBuf::<4>::new();
         b.push_hex(0);
         assert_eq!(b.as_str(), "0");
     }

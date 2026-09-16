@@ -1,9 +1,9 @@
 //! Time-of-day text shared by `interval`, `time` and `timetz`.
 
-use super::TextBuf;
+use crate::ascii_buf::AsciiBuf;
 
 /// `HH:MM:SS`, plus a fraction less its trailing zeros when nonzero
-pub(crate) fn write_time_us<const N: usize>(out: &mut TextBuf<N>, us: i64) {
+pub(crate) fn write_time_us<const N: usize>(out: &mut AsciiBuf<N>, us: i64) {
     if us < 0 {
         out.push(b'-');
     }
@@ -26,8 +26,8 @@ pub(crate) fn write_time_us<const N: usize>(out: &mut TextBuf<N>, us: i64) {
     }
 }
 
-pub(crate) fn format_time_us(us: i64) -> TextBuf<32> {
-    let mut out = TextBuf::new();
+pub(crate) fn format_time_us(us: i64) -> AsciiBuf<32> {
+    let mut out = AsciiBuf::new();
     write_time_us(&mut out, us);
     out
 }
@@ -35,8 +35,8 @@ pub(crate) fn format_time_us(us: i64) -> TextBuf<32> {
 /// PG `timetz_out`: time-of-day plus zone offset. PG stores zone as seconds
 /// *west* of UTC (negative east), so displayed offset flips sign. `±HH`,
 /// appends `:MM` then `:SS` only when nonzero
-pub(crate) fn timetz_to_text(micros: i64, tz_seconds: i32) -> TextBuf<48> {
-    let mut out = TextBuf::new();
+pub(crate) fn timetz_to_text(micros: i64, tz_seconds: i32) -> AsciiBuf<48> {
+    let mut out = AsciiBuf::new();
     write_time_us(&mut out, micros);
     out.push(if tz_seconds > 0 { b'-' } else { b'+' });
     let abs = u64::from(tz_seconds.unsigned_abs());

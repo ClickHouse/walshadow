@@ -48,6 +48,7 @@ use walrus::pg::backup::format_pg_lsn;
 use walrus::pg::replication::base_backup::BaseBackupOpts;
 use walrus::pg::replication::conn::PgConfig;
 use walrus::pg::replication::tls::SslMode;
+use walrus::time::Timestamp;
 use walshadow::backfill::visibility_gate::{
     GateStats, GreenfieldSink, PendingGate, resolve_greenfield, stream_phase,
 };
@@ -4449,10 +4450,9 @@ async fn run_bootstrap(
                 None
             };
             let opts = BaseBackupOpts {
-                label: format!(
-                    "walshadow-bootstrap-{}",
-                    chrono::Utc::now().format("%Y%m%dT%H%M%SZ")
-                ),
+                // `basic()` stamp lets `pg_stat_progress_basebackup` and
+                // `backup_label` read the label as a wall-clock instant
+                label: format!("walshadow-bootstrap-{}", Timestamp::now().basic()),
                 fast_checkpoint: args.bootstrap_fast_checkpoint,
                 no_verify_checksums: false,
                 max_rate_kib: args.bootstrap_max_rate_kib,

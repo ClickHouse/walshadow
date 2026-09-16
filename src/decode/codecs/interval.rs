@@ -3,8 +3,8 @@
 //! Fixed 16 bytes: `i64` micros + `i32` days + `i32` months.
 
 use super::CodecError;
-use super::TextBuf;
 use super::time::write_time_us;
+use crate::ascii_buf::AsciiBuf;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IntervalValue {
@@ -32,7 +32,7 @@ pub fn decode_interval(body: &[u8]) -> Result<IntervalValue, CodecError> {
 }
 
 /// One `years`/`mons`/`days` field, space-separated from what precedes it
-fn push_unit<const N: usize>(out: &mut TextBuf<N>, n: i32, singular: &str, plural: &str) {
+fn push_unit<const N: usize>(out: &mut AsciiBuf<N>, n: i32, singular: &str, plural: &str) {
     if !out.is_empty() {
         out.push(b' ');
     }
@@ -47,8 +47,8 @@ fn push_unit<const N: usize>(out: &mut TextBuf<N>, n: i32, singular: &str, plura
 
 impl IntervalValue {
     /// PG `interval_out` with `IntervalStyle = postgres`
-    pub fn to_text(&self) -> TextBuf<80> {
-        let mut out = TextBuf::new();
+    pub fn to_text(&self) -> AsciiBuf<80> {
+        let mut out = AsciiBuf::new();
         let years = self.months / 12;
         let mons = self.months % 12;
         if years != 0 {

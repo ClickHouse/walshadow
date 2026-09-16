@@ -36,7 +36,7 @@ lz4 = ["clickhouse-c-rs/lz4"]
 zstd = ["clickhouse-c-rs/zstd"]
 
 [dependencies]
-wal-rus = "0.3.3"
+wal-rus = "0.3.4"
 clickhouse-c-rs = { version = "0.2", default-features = false, features = ["tokio", "tls"] }
 # hash keys are internal (relfilenodes, oids, xids, names), never network
 # input, so SipHash's HashDoS margin buys nothing at 2-4x per probe
@@ -47,7 +47,6 @@ async-channel = "2.5"
 async-trait = "0.1"
 backon = { version = "1", features = ["tokio-sleep"] }
 bytes = "1"
-chrono = { version = "0.4", default-features = false, features = ["clock"] }
 clap = { version = "4", features = ["derive", "env"] }
 crc32c = "0.6"
 fallible-iterator = "0.2"
