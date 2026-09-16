@@ -271,7 +271,7 @@ pub struct BootstrapSettings {
     /// [`crate::backup_source_object_store::ObjectStoreSource`]'s
     /// `min(4, num_cpus)` clamp in place
     pub object_store_parallelism: Option<NonZeroUsize>,
-    /// `lanes`: parallel repair/drain/batcher lanes for the greenfield load
+    /// `lanes`: parallel drain/batcher lanes for the greenfield load
     pub lanes: Option<NonZeroUsize>,
 }
 
@@ -2035,11 +2035,26 @@ crate::atomic_stats! {
         pub toast_values_filled_superseded,
         pub toast_values_filled_mismatch,
         pub toast_fetch_miss,
-        /// Gauge: bytes resident in the bootstrap TOAST-deferred spool's
-        /// in-memory prefix, zeroed after replay
+        /// Chunk rows mirrored from a restored TOAST page image, repairing
+        /// backup page copies read mid-write
+        pub toast_image_rows_mirrored,
+        /// Gauge: bytes resident in the in-memory prefixes of every
+        /// bootstrap TOAST-deferred spool, released as each one replays
         pub bootstrap_deferred_bytes,
-        /// Gauge: encoded bytes in the bootstrap TOAST-deferred spool file
+        /// Gauge: encoded bytes in every bootstrap TOAST-deferred spool file
         pub bootstrap_deferred_spool_bytes,
+        /// Undecided backup tuples written to pending tables
+        /// ([`crate::backfill::visibility_pending`])
+        pub pending_rows,
+        pub pending_tables,
+        pub pending_tables_dropped,
+        /// Deciding xids whose commit or abort a settle round learned
+        pub pending_xacts_settled,
+        /// Gauge: xids the pending row ledger still waits on
+        pub pending_outstanding_xids,
+        /// Gauge: outstanding xids the shadow's `pg_xact` no longer covers,
+        /// so no settle round can ever decide them
+        pub pending_undecidable_xids,
         pub toast_mirror_truncates,
         pub toast_mirror_retires,
         /// Rewrite generations closed with residual `O - B` tombstones

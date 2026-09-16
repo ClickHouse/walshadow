@@ -171,7 +171,7 @@ impl StagingSession {
 
     /// Statement safe to re-apply (DROP/CREATE IF NOT EXISTS, dedup-absorbed
     /// INSERT..SELECT): reconnect + resend on retryable failure.
-    async fn exec_retry(&mut self, sql: &str) -> Result<()> {
+    pub(crate) async fn exec_retry(&mut self, sql: &str) -> Result<()> {
         let timeout = self.timeout;
         self.client
             .retry(
@@ -202,7 +202,7 @@ impl StagingSession {
     }
 
     /// Single-column String SELECT, one attempt under the timeout.
-    async fn query_strings(&mut self, sql: &str) -> Result<Vec<String>> {
+    pub(crate) async fn query_strings(&mut self, sql: &str) -> Result<Vec<String>> {
         let timeout = self.timeout;
         let client = self
             .client
@@ -354,7 +354,7 @@ fn read_string_column(block: &Block, out: &mut Vec<String>) -> Result<(), Emitte
 }
 
 /// CH single-quoted string literal.
-fn sql_str(s: &str) -> String {
+pub(crate) fn sql_str(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('\'');
     for c in s.chars() {

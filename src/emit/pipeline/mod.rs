@@ -127,6 +127,8 @@ pub struct PipelineConfig {
     /// spill dir; entries due at resume retire via the post-spawn
     /// [`reorder::ReorderSink::flush_due_retires`] call
     pub retires: crate::toast::toast_retire::RetireLedger,
+    /// Pending backup rows; recover outcomes with [`reorder::ReorderSink::settle_pending_boot`]
+    pub pending_rows: crate::backfill::visibility_pending::PendingLedger,
     /// Persisted resolved floor (aligned, archive-clamped), seeded at the
     /// resolved start; pruners cut against it verbatim
     pub resume_floor: Arc<Monotone<Floor>>,
@@ -195,9 +197,11 @@ impl PipelineConfig {
             config_resolver,
             backfiller,
             retires,
+            pending_rows,
             resume_floor,
             budget,
         } = self;
+        let emitter = Arc::new(emitter);
         let m = decoder_pool_size.max(1);
         let fatal = Fatal::new();
 
@@ -273,6 +277,8 @@ impl PipelineConfig {
             plan_dir,
             Some(budget.clone()),
             retires,
+            pending_rows,
+            emitter.clone(),
             resume_floor,
             mapping,
             emitter.row_policy(),

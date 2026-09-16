@@ -1,33 +1,17 @@
-//! Backup-era tuple visibility gate for backup-sourced initial loads
-//! (architecture/bootstrap.md).
+//! Resolve backup tuple visibility from hints and transaction history
 //!
-//! A page walk sees raw pages: dead-but-unvacuumed tuples, aborted inserts,
-//! in-flight writers. Emit a tuple only when backup-era `pg_xact` says `xmin`
-//! committed and `xmax` absent/aborted; infomask hint bits
-//! (PG `src/include/access/htup_details.h`) short-circuit most lookups.
+//! Emit committed inserts with absent or aborted deleters. Defer in-progress
+//! transactions to [pending tables](crate::backfill::visibility_pending): row
+//! WAL can predate backup redo, so replay cannot reconstruct discarded tuples
 //!
-//! - Skipped in-flight tuples are re-delivered by the mode's WAL leg
-//!   (their commits land past the walk's coverage start).
-//! - Skipped aborted tuples were never real.
-//! - Dead tuples stop resurrecting, the fidelity gain over greenfield's
-//!   emit-every-`LP_NORMAL` stance.
+//! Overlay backup `pg_xact` ([`PgXactAccum`]) with WAL commit/abort outcomes
+//! ([`PgXactPatch`]). Resolve multixact updaters through backup `pg_multixact`
+//! ([`PgMultiXactAccum`]), then consult same transaction view
 //!
-//! PgXact sources layer: a [`PgXactPatch`] harvested from gap-WAL commit/abort
-//! records overlays the [`PgXactAccum`] collected from the backup's `pg_xact/`
-//! files. Patch covers xacts in flight across the backup's redo point whose
-//! commits land inside the archive-replay gap; without it their backup-page
-//! tuples read as in-progress and rows written before the redo point would be
-//! lost because gap replay only re-delivers records ≥ redo.
-//!
-//! `HEAP_XMAX_IS_MULTI` resolves through the backup's `pg_multixact/`
-//! (offsets + members SLRUs, [`PgMultiXactAccum`]): the update/delete
-//! member's xid runs through the same pg_xact view. Bytes the backup never
-//! copied prove the multi postdates the copy — copies happen past the redo
-//! point, so the update's WAL record is covered by the mode's WAL leg and
-//! the old version emits safely. A multi the snapshot can't bound
-//! (truncated below, garbage) is [`Visibility::Unresolvable`]: emitting
-//! risks resurrecting a pre-coverage dead version, skipping risks dropping
-//! a live row, so the pass aborts.
+//! Multixacts newer than copied SLRU bounds belong to covered WAL; retain old
+//! tuple version. Unbounded or corrupt multixacts yield [`Visibility::Unresolvable`],
+//! which ends the pass
+//! See architecture/bootstrap.md
 
 use std::path::{Path, PathBuf};
 
@@ -98,8 +82,10 @@ pub enum XidStatus {
     Committed,
     Aborted,
     InProgress,
-    /// No pg_xact coverage: xid predates oldest collected segment
-    /// (truncated ⇒ ancient ⇒ committed-or-vacuumed)
+    /// No pg_xact coverage: xid predates oldest collected segment. Reading
+    /// that as ancient needs the tuple's own page, since vacuum freezes
+    /// surviving tuples and removes aborted ones before the horizon moves
+    /// past them
     Unknown,
 }
 
@@ -386,67 +372,126 @@ pub enum Visibility {
     Unresolvable,
 }
 
-/// Gate one on-page tuple. `pg_xact: None` is the streaming pass: hint bits
-/// only, undecidable tuples (including every non-lock-only multixact xmax)
-/// defer; `Some` is the post-walk resolution and never defers, though a
-/// multixact the snapshot can't decide surfaces as
-/// [`Visibility::Unresolvable`].
+/// One side of a tuple's verdict. `Pending` names the xid whose outcome
+/// decides it: the insert side needs a commit, the delete side an abort
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Side {
+    /// This side keeps the tuple alive
+    Live,
+    /// This side kills it
+    Dead,
+    Pending(u32),
+    /// Hint bits alone can't decide and no view was supplied
+    Unknown,
+    /// Multixact the backup snapshot can't bound
+    Unresolvable,
+}
+
+/// Insert side: did the tuple's writer commit?
+fn insert_side(xmin: u32, infomask: u16, pg_xact: Option<&PgXactView>) -> Side {
+    if xmin_frozen(infomask) || (xmin > 0 && xmin < FIRST_NORMAL_XID) {
+        return Side::Live;
+    }
+    if infomask & HEAP_XMIN_INVALID != 0 {
+        return Side::Dead;
+    }
+    if infomask & HEAP_XMIN_COMMITTED != 0 {
+        return Side::Live;
+    }
+    let Some(v) = pg_xact else {
+        return Side::Unknown;
+    };
+    match v.xid_status(xmin) {
+        XidStatus::Committed | XidStatus::Unknown => Side::Live,
+        XidStatus::Aborted => Side::Dead,
+        XidStatus::InProgress => Side::Pending(xmin),
+    }
+}
+
+/// Delete side: did a deleter or multixact updater commit?
+fn delete_side(xmax: u32, infomask: u16, pg_xact: Option<&PgXactView>) -> Side {
+    if xmax == 0 || infomask & HEAP_XMAX_INVALID != 0 || xmax_locked_only(infomask) {
+        return Side::Live;
+    }
+    if infomask & HEAP_XMAX_IS_MULTI != 0 {
+        let Some(v) = pg_xact else {
+            return Side::Unknown;
+        };
+        let Some(multi) = v.multi else {
+            return Side::Unresolvable;
+        };
+        return match multi.updater(xmax) {
+            MultiXactUpdater::Covered | MultiXactUpdater::LockOnly => Side::Live,
+            MultiXactUpdater::Updater(x) => xid_delete_side(v, x),
+            MultiXactUpdater::Unresolvable => Side::Unresolvable,
+        };
+    }
+    if infomask & HEAP_XMAX_COMMITTED != 0 {
+        return Side::Dead;
+    }
+    let Some(v) = pg_xact else {
+        return Side::Unknown;
+    };
+    xid_delete_side(v, xmax)
+}
+
+fn xid_delete_side(v: &PgXactView, xid: u32) -> Side {
+    match v.xid_status(xid) {
+        XidStatus::Committed | XidStatus::Unknown => Side::Dead,
+        XidStatus::Aborted => Side::Live,
+        XidStatus::InProgress => Side::Pending(xid),
+    }
+}
+
+/// Resolve on-page visibility from hints and optional transaction history
 ///
-/// `Unknown` resolves optimistically for `xmin` (truncated pg_xact ⇒ ancient ⇒
-/// committed) and pessimistically for `xmax` (an ancient committed deleter ⇒
-/// dead): both directions keep dead tuples dead. A multixact updater xid
-/// gets the same xmax pessimism: freeze clears aborted updaters, so a
-/// referenced multi outliving pg_xact truncation implies its updater
-/// committed.
+/// Vacuum freezes survivors and removes aborted tuples before truncating
+/// `pg_xact`, allowing ancient xmin to count as committed and xmax as dead
+/// Pending copies lack this evidence and must retain unknown outcomes
 pub fn tuple_visibility(
     xmin: u32,
     xmax: u32,
     infomask: u16,
     pg_xact: Option<&PgXactView>,
 ) -> Visibility {
-    let frozen = xmin_frozen(infomask) || (xmin > 0 && xmin < FIRST_NORMAL_XID);
-    if !frozen {
-        if infomask & HEAP_XMIN_INVALID != 0 {
-            return Visibility::Skip;
-        }
-        if infomask & HEAP_XMIN_COMMITTED == 0 {
-            match pg_xact {
-                None => return Visibility::Defer,
-                Some(v) => match v.xid_status(xmin) {
-                    XidStatus::Committed | XidStatus::Unknown => {}
-                    XidStatus::Aborted | XidStatus::InProgress => return Visibility::Skip,
-                },
-            }
-        }
-    }
-    if xmax == 0 || infomask & HEAP_XMAX_INVALID != 0 || xmax_locked_only(infomask) {
-        return Visibility::Emit;
-    }
-    if infomask & HEAP_XMAX_IS_MULTI != 0 {
-        let Some(v) = pg_xact else {
-            return Visibility::Defer;
-        };
-        let Some(multi) = v.multi else {
-            return Visibility::Unresolvable;
-        };
-        return match multi.updater(xmax) {
-            MultiXactUpdater::Covered | MultiXactUpdater::LockOnly => Visibility::Emit,
-            MultiXactUpdater::Updater(x) => match v.xid_status(x) {
-                XidStatus::Committed | XidStatus::Unknown => Visibility::Skip,
-                XidStatus::Aborted | XidStatus::InProgress => Visibility::Emit,
-            },
-            MultiXactUpdater::Unresolvable => Visibility::Unresolvable,
-        };
-    }
-    if infomask & HEAP_XMAX_COMMITTED != 0 {
+    let insert = insert_side(xmin, infomask, pg_xact);
+    if insert == Side::Dead {
         return Visibility::Skip;
     }
-    match pg_xact {
-        None => Visibility::Defer,
-        Some(v) => match v.xid_status(xmax) {
-            XidStatus::Committed | XidStatus::Unknown => Visibility::Skip,
-            XidStatus::Aborted | XidStatus::InProgress => Visibility::Emit,
-        },
+    if insert == Side::Unknown {
+        return Visibility::Defer;
+    }
+    match delete_side(xmax, infomask, pg_xact) {
+        Side::Dead => Visibility::Skip,
+        Side::Unresolvable => Visibility::Unresolvable,
+        Side::Unknown | Side::Pending(_) => Visibility::Defer,
+        Side::Live if matches!(insert, Side::Pending(_)) => Visibility::Defer,
+        Side::Live => Visibility::Emit,
+    }
+}
+
+/// Require insert commit and delete abort; zero marks an already settled side
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PendingXids {
+    pub insert: u32,
+    pub delete: u32,
+}
+
+impl PendingXids {
+    pub fn is_empty(&self) -> bool {
+        self.insert == 0 && self.delete == 0
+    }
+}
+
+/// Resolve deciding xids, reducing multixact xmax to its updater
+pub fn deferred_xids(xmin: u32, xmax: u32, infomask: u16, view: &PgXactView) -> PendingXids {
+    let pending = |side| match side {
+        Side::Pending(x) => x,
+        _ => 0,
+    };
+    PendingXids {
+        insert: pending(insert_side(xmin, infomask, Some(view))),
+        delete: pending(delete_side(xmax, infomask, Some(view))),
     }
 }
 
@@ -668,8 +713,10 @@ mod tests {
         );
     }
 
+    /// In-flight writers and deleters defer even against a complete view:
+    /// their rows predate WAL coverage, so retain them until their outcomes arrive
     #[test]
-    fn pg_xact_resolution_never_defers() {
+    fn pg_xact_resolution_defers_only_in_flight_xacts() {
         let a = accum_with(
             0,
             &[
@@ -684,12 +731,34 @@ mod tests {
         assert_eq!(tuple_visibility(100, 0, 0, Some(&v)), Visibility::Emit);
         // xmin aborted via pg_xact
         assert_eq!(tuple_visibility(101, 0, 0, Some(&v)), Visibility::Skip);
-        // xmin in-progress: WAL leg re-delivers
-        assert_eq!(tuple_visibility(150, 0, 0, Some(&v)), Visibility::Skip);
+        assert_eq!(tuple_visibility(150, 0, 0, Some(&v)), Visibility::Defer);
+        assert_eq!(
+            deferred_xids(150, 0, 0, &v),
+            PendingXids {
+                insert: 150,
+                delete: 0
+            }
+        );
         // deleter committed via pg_xact
         assert_eq!(tuple_visibility(100, 200, 0, Some(&v)), Visibility::Skip);
-        // deleter in-flight: tuple stays visible
-        assert_eq!(tuple_visibility(100, 150, 0, Some(&v)), Visibility::Emit);
+        assert_eq!(tuple_visibility(100, 150, 0, Some(&v)), Visibility::Defer);
+        assert_eq!(
+            deferred_xids(100, 150, 0, &v),
+            PendingXids {
+                insert: 0,
+                delete: 150
+            }
+        );
+        // Same xact inserted and deleted: neither outcome can free the row
+        assert_eq!(
+            deferred_xids(150, 150, 0, &v),
+            PendingXids {
+                insert: 150,
+                delete: 150
+            }
+        );
+        // A settled tuple has no deciding xid left
+        assert!(deferred_xids(100, 0, 0, &v).is_empty());
     }
 
     #[test]
@@ -803,10 +872,21 @@ mod tests {
         assert_eq!(tuple_visibility(100, 20, mask, Some(&v)), Visibility::Emit);
         // Covered (post-copy) multi: WAL leg re-delivers the update
         assert_eq!(tuple_visibility(100, 30, mask, Some(&v)), Visibility::Emit);
-        // In-progress updater: WAL leg owns the update, tuple emits
+        // Retain the row until its updater aborts, keyed on the
+        // resolved member xid rather than the multi
         let m2 = mx_accum(&[(10, 100), (11, 101)], &[(100, 950, 4)]);
         let v2 = PgXactView::new(&a, &p).with_multixact(&m2);
-        assert_eq!(tuple_visibility(100, 10, mask, Some(&v2)), Visibility::Emit);
+        assert_eq!(
+            tuple_visibility(100, 10, mask, Some(&v2)),
+            Visibility::Defer
+        );
+        assert_eq!(
+            deferred_xids(100, 10, mask, &v2),
+            PendingXids {
+                insert: 0,
+                delete: 950
+            }
+        );
         // Gap-patch-committed updater: dead
         let mut p3 = PgXactPatch::new();
         p3.commit(950, &[]);

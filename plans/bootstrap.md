@@ -1,81 +1,103 @@
 # Transactions crossing bootstrap
 
-Backup bootstrap can finish while transactions affecting walked tuples remain
-open. Replaying from oldest buffered WAL record covers changes inside backup
-window, but earlier inserts can remain absent and earlier deletes can remain
-visible. Increasing handoff wait reduces exposure without proving completeness
+Retain undecided backup tuples until their transactions settle. Row WAL can
+predate backup redo while commit or abort lands after handoff, leaving replay
+unable to reconstruct those rows
 
-Current visibility decisions live in
-[visibility gate](../src/backfill/visibility_gate.rs) and
-[tuple visibility](../src/decode/visibility.rs). Current operator limitations
-live in [initial loads](../docs/limitations.md#initial-loads)
+See [visibility gate](../src/backfill/visibility_gate.rs),
+[tuple visibility](../src/decode/visibility.rs), and
+[pending storage](../src/backfill/visibility_pending.rs) for implementation,
+[initial loads](../docs/limitations.md#initial-loads) for operator limits
 
 ## Preserve undecided rows
 
-Treat an in-progress inserting transaction, deleting transaction, or multixact
-updater as undecided. Keep its tuple and deciding transaction IDs until outcome
-is known. Do not combine undecided tuples with rows proven invisible
+`tuple_visibility` returns `Defer` for in-progress inserts, deletes, or multixact
+updaters. `deferred_xids` identifies required outcomes: insert must commit,
+delete must abort. Resolve multixacts to updater xids before storage so
+settlement needs only transaction status
 
-Persist carried tuples and pending relation repairs before declaring bootstrap
-complete. State must survive startup cleanup and record original load boundary
-If persistent carry is not available, refuse completion while required visibility
-remains unknown, keeping enough state for a safe retry
+Use one `<table>__wspending` sibling per destination on plain
+`MergeTree ORDER BY tuple() PRIMARY KEY tuple() PARTITION BY tuple()`.
+Name every key clause because ClickHouse `CREATE … AS` inherits omitted keys.
+Plain MergeTree preserves competing UPDATE versions; ReplacingMergeTree could
+collapse rows sharing a key and load version before visibility is known
 
-After handoff and on restart, settle carried tuples as transaction outcomes
-become available. Emit committed inserts and aborted deletes; discard aborted
-inserts and committed deletes. Keep original load version so later streamed
-changes win. Delay relation repair when unresolved transactions can still change
-its result
+Store rendered destination rows plus three metadata columns:
 
-Retain WAL replay from oldest buffered record. Carry and replay cover different
-parts of crossing transaction, and neither replaces other. Missing required
-history remains an error
+- `_ws_xmin`: xid whose commit is required, zero when already proven
+- `_ws_xmax`: xid whose abort is required, zero when no deleter remains
+- `_ws_infomask`: original tuple hint bits behind those reductions
 
-## Carry implementation
+Promote survivors with `INSERT INTO <target> SELECT … FROM <pending>` at original
+load version so later streamed changes win. Select only rows resolved by current
+round to avoid repeating earlier promotions. Drop pending table once all deciding
+xids settle, discarding aborted inserts and committed deletes
 
-Change `resolve_phase` so `Visibility::Defer` survives final visibility pass
-instead of sharing discard path with `Skip`. Retain deciding xmin, xmax, or
-multixact updater IDs with raw tuple and full physical identity. Preserve
-pending-relation xid hints even when relation repair replaces individual tuples
+Replay from oldest buffered WAL record for later changes; missing required
+history remains an error. Include pending rows in
+[TOAST reclamation](shadow_toast.md) safety accounting
 
-Extend [deferred spool](../src/backfill/spool.rs) or introduce durable carry
-format beside bootstrap marker, outside startup-cleared scratch. Manifest needs
-source/timeline identity, original `start_lsn`, outstanding xids, pending relation
-generations, and spool reference. Fsync data and manifest before clearing marker
-Use atomic replacement when shrinking carry; a crash must leave old or new
-complete state, never a manifest pointing at partially rewritten tuples
+## Pending row durability
 
-On handoff and startup, rebuild `PgXactView` from shadow transaction logs and
-settle only tuples whose deciding outcomes are available. Retain unresolved
-entries, preserve original row version, and clean carry only after emitted rows
-are durable. Retain required transaction-status history or reject if it has aged
-out. Include carry in [TOAST reclamation](shadow_toast.md) safety accounting
+Write pending rows and persist ledger before clearing bootstrap marker. For
+staged loads, publish swap before recording pending manifests so EXCHANGE cannot
+discard promoted rows. Failed passes leave no entry; retry rebuilds pending tables
 
-If [parallel bootstrap decode](performance.md) lands first, carry and deferred
-TOAST paths need coordinated writers and completion accounting. A worker cannot
-acknowledge a deferred tuple merely because it wrote restart-unsafe scratch
+`{spill_dir}/visibility_carry.toml` retains its existing filename and `carry` key
+for restart compatibility. Record relation `(namespace, relname)`, destination
+database and table, original `start_lsn`, and outstanding, committed, and aborted
+xids. Retain known outcomes across rounds for rows waiting on both insert and
+delete. Replace ledger atomically and reject corrupt state
+
+Promote before updating ledger; drop pending table before removing its entry.
+Destination dedup absorbs promotions repeated after a crash
+
+## Settling
+
+Fold live `XLOG_XACT_COMMIT` / `XLOG_XACT_ABORT` outcomes, including subtransactions,
+into ledger. At boot, recover outcomes from shadow transaction logs for records
+absent from resumed WAL
+
+Retain required transaction history. Vacuum freezes surviving tuples and removes
+aborted tuples before truncating `pg_xact`, providing evidence for on-page
+visibility decisions. Pending copies receive no such updates: missing status
+leaves rows unpublished and xids outstanding. Report these through
+`walshadow_pending_undecidable_xids` and a boot log
+
+Resolve mapped TOAST values through walk's chunk store before rendering pending
+rows. Missing chunks fail pending writes just as they fail main drain
+
+`XLOG_RUNNING_XACTS` could bound outstanding xids, as in PostgreSQL hot standby.
+Extend `parse_running_xacts_next_xid` to read xid array and respect
+`subxid_overflow`. Records arrive from bgwriter and checkpoints; do not depend on
+forcing one
+
+Coordinate [parallel bootstrap decode](performance.md) completion with pending
+rows and deferred TOAST. Scratch writes alone cannot acknowledge deferred tuples
 
 ## Completion
 
 Exercise INSERT, UPDATE, and DELETE begun before backup redo and inside backup
-window, with both commit and rollback after handoff. Cover multixact updaters,
-subtransactions, relation repair, and restart before settlement. Run direct and
-object-store cases with explicit retained-history assumptions
+window, committing or rolling back after handoff. Cover multixact updaters,
+subtransactions, deferred external values, and restart before settlement. Run
+direct and object-store cases with explicit retained-history assumptions
 
-Assert final row contents, deletion state, restart position, and eventual carry
-cleanup. Keep per-table load rejection behavior covered separately
+Assert row contents, deletion state, restart position, and pending table cleanup.
+Keep per-table load rejection coverage separate
 
-DDL during initial load remains a separate unsupported case. Before adding
-support, define how a destructive or type-changing DDL cancels or restarts an
-active table load without exposing partial staging results. Do not silently
-restart against a newer snapshot without preserving convergence boundaries
+DDL during initial load remains unsupported. Define cancellation or restart for
+destructive and type-changing DDL before adding support, preserving staging and
+convergence boundaries
 
 ## Reduce source SQL reads
 
-Removing automatic COPY repair requires a physical visibility proof for retained
-tuples and reused TOAST generations. Backup transaction logs and tuple-location
-order alone do not establish generation age. Replace missing evidence before
-removing source reads, and keep WAL replay ordered behind required chunk history
+Backup-based initial loads issue no source SQL scans for user rows. Explicit
+`initial_load = "copy"` still scans selected table and remains `init`'s default.
+Baseline external values in backup modes resolve from walked chunk mirrors,
+so reused TOAST generations need a physical proof of age: backup transaction
+logs and tuple-location order do not
+establish it, and no source read compensates. Keep WAL replay ordered behind
+required chunk history
 
 Eliminating all source SQL also requires descriptors from landed catalogs, an
 OID-consistent type converter without source pg_dump, and alternatives for slot,

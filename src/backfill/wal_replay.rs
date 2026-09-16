@@ -156,6 +156,51 @@ impl WalReplaySink {
         self.replay
     }
 
+    /// Mirror every chunk tuple a restored TOAST page image carries, not
+    /// only the one its record names. The image is a page copy, not
+    /// transactional evidence, so it bypasses the xact stash: neighbours
+    /// belong to other writers and an abort must not withdraw them
+    ///
+    /// Repairs a backup page the walk read mid-write. Any page a backup
+    /// modifies is written before its first change in the window, so the
+    /// image carries what the torn copy lost
+    async fn harvest_toast_images(
+        &self,
+        record: &Record<'_>,
+    ) -> std::result::Result<(), SinkError> {
+        let mut rows = Vec::new();
+        for block in record.parsed.blocks.iter().filter(|b| b.header.has_image()) {
+            if i32::from(block.header.fork_num()) != crate::filter::main_data::MAIN_FORKNUM {
+                continue;
+            }
+            let rfn = block.header.location.rel;
+            let Ok((rel, _)) = self.log.descriptor_at_spanned(rfn, record.next_lsn) else {
+                continue;
+            };
+            if rel.kind != 't' {
+                continue;
+            }
+            let page = crate::decode::fpi::restore_block_image(block, record.page_magic)
+                .map_err(|e| SinkError::Other(format!("wal_replay: toast image restore: {e}")))?;
+            rows.extend(crate::backfill::backup_page_walk::toast_rows_from_page(
+                &page,
+                &rel,
+                block.header.location.block_no,
+                crate::backfill::backup_page_walk::page_pd_lsn(&page),
+            ));
+        }
+        if rows.is_empty() {
+            return Ok(());
+        }
+        self.stats
+            .toast_image_rows_mirrored
+            .fetch_add(rows.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        self.resolver
+            .put_batched(&rows)
+            .await
+            .map_err(|e| SinkError::Other(format!("wal_replay: toast image put: {e}")))
+    }
+
     async fn on_commit(
         &mut self,
         xid: u32,
@@ -330,6 +375,7 @@ impl RecordSink for WalReplaySink {
             if rm == RmId::Heap as u8 || rm == RmId::Heap2 as u8 {
                 if let Some(rel) = record.parsed.blocks.first().map(|b| b.header.location.rel) {
                     if self.filter_rfns.contains(&(rel.db_node, rel.rel_node)) {
+                        self.harvest_toast_images(record).await?;
                         self.decoder.on_record(record).await?;
                     } else if self.whole_db_filter
                         && rel.db_node == self.log.db_oid()
@@ -488,6 +534,161 @@ mod tests {
             page_magic: 0xD116,
             ..Default::default()
         }
+    }
+
+    /// Heap record carrying one TOAST page image and nothing else, the
+    /// shape an FPI takes when a backup forces page writes
+    fn image_record(page: &[u8], rel_node: Oid, block_no: u32) -> Record<'static> {
+        use walrus::pg::walparser::{
+            BKP_BLOCK_HAS_IMAGE, BlockLocation, XLogRecordBlock, XLogRecordBlockHeader,
+            XLogRecordBlockImageHeader,
+        };
+        let mut header = XLogRecordBlockHeader::new(0);
+        header.fork_flags = BKP_BLOCK_HAS_IMAGE;
+        header.image_header = XLogRecordBlockImageHeader {
+            image_length: page.len() as u16,
+            hole_offset: 0,
+            hole_length: 0,
+            info: 0,
+        };
+        header.location = BlockLocation::new(1663, DB, rel_node, block_no);
+        Record {
+            parsed: XLogRecord {
+                header: XLogRecordHeader {
+                    resource_manager_id: RmId::Heap as u8,
+                    info: crate::decode::heap_decoder::XLOG_HEAP_INSERT,
+                    xact_id: 55,
+                    ..Default::default()
+                },
+                blocks: vec![XLogRecordBlock {
+                    header,
+                    image: std::borrow::Cow::Owned(page.to_vec()),
+                    data: std::borrow::Cow::Borrowed(&[]),
+                }],
+                ..Default::default()
+            },
+            source_lsn: 0x7000,
+            next_lsn: 0x7100,
+            page_magic: walrus::pg::walparser::XLP_PAGE_MAGIC_PG15,
+            ..Default::default()
+        }
+    }
+
+    /// Neighbours on a restored image reach the mirror, so a value whose
+    /// chunks the backup copy lost still assembles. They date from the
+    /// page's own version, below the walked referrer's bound
+    #[tokio::test]
+    async fn image_harvest_mirrors_every_chunk_on_the_page() {
+        use crate::backfill::backup_page_walk::{synth_toast_chunk_page, toast_chunk_rel};
+        use crate::toast::{ChunkStore, FetchedValue, MemChunkStore};
+
+        let dir = tempfile::tempdir().unwrap();
+        let rel = Arc::new(toast_chunk_rel());
+        let mut catalog = crate::backfill::backup_page_walk::CatalogMap::new();
+        catalog.insert(rel.clone());
+        let log = seed_test_log(dir.path(), &catalog).await;
+        let store = Arc::new(MemChunkStore::new());
+        let resolver = ToastResolver::with_store(store.clone(), Arc::new(EmitterStats::default()));
+        let sink = image_sink(dir.path(), log, resolver).await;
+
+        let page = synth_toast_chunk_page(
+            &[
+                (7, 0, b"first".as_slice()),
+                (8, 0, b"only".as_slice()),
+                (7, 1, b"third".as_slice()),
+            ],
+            0x6000,
+        );
+        let record = image_record(&page, rel.rfn.rel_node, 3);
+        sink.harvest_toast_images(&record).await.unwrap();
+
+        // Referrer bound is the walk's `start_lsn`, above the page version
+        assert_eq!(
+            store.fetch(rel.oid, 7, 0x6800, 10).await.unwrap(),
+            FetchedValue::Assembled(b"firstthird".to_vec()),
+        );
+        assert_eq!(
+            store.fetch(rel.oid, 8, 0x6800, 4).await.unwrap(),
+            FetchedValue::Assembled(b"only".to_vec()),
+        );
+    }
+
+    async fn seed_test_log(
+        dir: &Path,
+        catalog: &crate::backfill::backup_page_walk::CatalogMap,
+    ) -> Arc<DescriptorLog> {
+        use crate::catalog::desc_log::{BatchRecord, LogEntry, LogValue};
+        let desc_dir = dir.join("desc_log");
+        tokio::fs::create_dir_all(&desc_dir).await.unwrap();
+        let log = DescriptorLog::open(
+            &desc_dir,
+            DescLogIdentity {
+                pg_major: 17,
+                system_id: "7300000000000000001".into(),
+                timeline: 1,
+                db_oid: DB,
+                wal_seg_size: WAL_SEG_SIZE as u32,
+            },
+        )
+        .await
+        .unwrap();
+        log.seed(
+            BatchRecord {
+                captured_at: 0x1000,
+                commit_lsn: 0,
+                observations: Vec::new(),
+                ambiguities: Vec::new(),
+                entries: catalog
+                    .descriptors()
+                    .map(|d| {
+                        Arc::new(LogEntry {
+                            valid_from: 0x1000,
+                            oid: d.oid,
+                            rfn: d.rfn,
+                            value: LogValue::Present(d.clone()),
+                        })
+                    })
+                    .collect(),
+            },
+            0x1000,
+        )
+        .await
+        .unwrap();
+        Arc::new(log)
+    }
+
+    async fn image_sink(
+        dir: &Path,
+        log: Arc<DescriptorLog>,
+        resolver: ToastResolver,
+    ) -> WalReplaySink {
+        let spill = dir.join("image_spill");
+        tokio::fs::create_dir_all(&spill).await.unwrap();
+        let buffer = Arc::new(Mutex::new(
+            XactBuffer::new(crate::xact::xact_buffer::XactBufferConfig::new(spill)).unwrap(),
+        ));
+        let (msg_tx, _msg_rx) = mpsc::channel(8);
+        let (ack, _collector) = ack::spawn(Arc::new(Monotone::<EmitterAck>::new(0)));
+        WalReplaySink::new(WalReplayInputs {
+            log,
+            buffer,
+            resolver,
+            filter_rfns: HashSet::default(),
+            targets: ReplayTargets::default(),
+            from_lsn: 0,
+            whole_db_filter: false,
+            mapping: Arc::default(),
+            stats: Arc::new(EmitterStats::default()),
+            budget: None,
+            row_policy: Default::default(),
+            config: None,
+            batch_rows: 64,
+            batch_bytes: 1 << 20,
+            msg_tx,
+            ack,
+            next_seq: 0,
+            patch: None,
+        })
     }
 
     /// Sink with no targets: the xact records under test carry no rows, so

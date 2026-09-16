@@ -70,7 +70,12 @@ receives changes from start LSN onwards
 | `none` | skipped | none | destination already has baseline, or only future changes matter |
 | `copy` | read with live SQL snapshot | table scan | normal table additions |
 | `base_backup` | read from fresh physical backup | cluster-sized backup stream | SQL scan pressure is undesirable |
-| `object_store` | read from latest wal-g backup plus archived WAL | archive reads, conditional source repair | continuous compatible backup archive exists |
+| `object_store` | read from latest wal-g backup plus archived WAL | archive reads | continuous compatible backup archive exists |
+
+`walshadow-stream init` defaults to `--initial-load copy`. This mode scans only
+selected table through PostgreSQL, which supplies visible rows and detoasted
+values. Choose `--initial-load base_backup` or `--initial-load object_store`
+to load existing rows from physical data
 
 `base_backup` streams whole PostgreSQL cluster even when adding one table
 because PostgreSQL backup protocol has no per-table filter
@@ -79,9 +84,10 @@ because PostgreSQL backup protocol has no per-table filter
 continuous archived WAL coverage. Use `copy` when backup predates incompatible
 schema changes or archive coverage has gaps
 
-Backup modes can fall back to source COPY scans for mapped external TOAST values
-or unresolved multixact visibility. Object storage removes backup transfer from
-source, but does not guarantee a load without source queries. See
+Backup modes resolve mapped external TOAST values from walked chunk mirrors.
+Missing chunks or multixact visibility that backup cannot resolve stop the load;
+retry with a fresher backup or explicitly select `copy`. Source SQL queries still
+supply metadata and control replication. See
 [initial-load limits](limitations.md#initial-loads)
 
 ## Select future tables by name

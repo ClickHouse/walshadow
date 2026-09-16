@@ -48,6 +48,17 @@ pub struct DeferredSpool {
     spooled_bytes: u64,
 }
 
+/// Records and bytes, never the buffered tuples
+impl std::fmt::Debug for DeferredSpool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeferredSpool")
+            .field("records", &self.records)
+            .field("spooled_bytes", &self.spooled_bytes)
+            .field("path", &self.path)
+            .finish_non_exhaustive()
+    }
+}
+
 impl DeferredSpool {
     /// `path` is created lazily at first overflow; parent dir must exist or
     /// be creatable

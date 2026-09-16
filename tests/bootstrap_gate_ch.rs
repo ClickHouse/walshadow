@@ -145,10 +145,10 @@ async fn dead_and_aborted_tuples_stay_out_of_ch() {
             "gate verdict off: {line}"
         );
         ensure!(!line.contains("deferred=0"), "nothing deferred: {line}");
-        // Fixed-width relation bypasses repair
+        // Fixed-width relation waits on no chunk mirror
         ensure!(
-            line.contains("unresolved=0"),
-            "relation left the walk: {line}"
+            !stderr.contains("resolving deferred TOAST tuples"),
+            "relation waited on the chunk store",
         );
         Ok(())
     })();

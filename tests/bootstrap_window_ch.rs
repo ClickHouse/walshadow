@@ -172,14 +172,6 @@ async fn window_writes_reach_ch() {
             !shipped.contains("rows=0"),
             "window leg shipped no rows: {shipped}",
         );
-        let gate = log
-            .lines()
-            .find(|l| l.contains("bootstrap visibility gate settled"))
-            .context("no gate summary")?;
-        anyhow::ensure!(
-            gate.contains("unresolved=0"),
-            "unexpected source repair: {gate}"
-        );
         Ok(())
     })();
 

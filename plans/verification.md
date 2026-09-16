@@ -84,7 +84,7 @@ restart before both COMMIT PREPARED and ROLLBACK PREPARED
 
 Coordinate with [failover fence](failover.md): ordinary abandoned state must not
 clear prepared state, and xid reuse on descendant must not recover ancestor
-scratch. Coordinate with [bootstrap carry](bootstrap.md) when PREPARE predates
+scratch. Coordinate with [pending bootstrap rows](bootstrap.md) when PREPARE predates
 backup redo, where replay inside backup window cannot reconstruct earlier rows
 
 Normalize differential-oracle locale and timezone inputs. Pin or record source

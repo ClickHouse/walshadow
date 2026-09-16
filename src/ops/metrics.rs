@@ -180,9 +180,20 @@ snapshot! {
     counter memory_budget_overshoots_total: u64 =
         "Requests above a budget compartment, admitted with only the satisfiable share metered.",
     gauge bootstrap_deferred_bytes: u64 =
-        "Resident bytes in the bootstrap TOAST-deferred spool's in-memory prefix.",
+        "Resident bytes in the in-memory prefixes of every bootstrap TOAST-deferred spool.",
     gauge bootstrap_deferred_spool_bytes: u64 =
-        "Encoded bytes in the bootstrap TOAST-deferred spool file.",
+        "Encoded bytes in every bootstrap TOAST-deferred spool file.",
+    counter pending_rows_total: u64 =
+        "Undecided backup rows written to ClickHouse pending tables.",
+    counter pending_tables_total: u64 = "Pending tables created for undecided backup rows.",
+    counter pending_tables_dropped_total: u64 =
+        "Pending tables dropped after all transaction outcomes were resolved.",
+    counter pending_xacts_settled_total: u64 =
+        "Transaction outcomes resolved for pending rows.",
+    gauge pending_outstanding_xids: u64 =
+        "Transaction ids pending rows still wait on.",
+    gauge pending_undecidable_xids: u64 =
+        "Outstanding transaction ids absent from shadow pg_xact, leaving rows pending.",
     /// Bootstrap pump stage attribution. Live while a greenfield bootstrap
     /// runs, then frozen at its final values for the rest of the session
     counter bootstrap_bytes_tapped: u64 =
@@ -218,6 +229,8 @@ snapshot! {
         "Cumulative wall-clock inside chunk-store INSERTs. Divided by toast_chunk_puts_total this is per-part commit latency.",
     counter toast_tombstones_stored_total: u64 =
         "TOAST delete tombstone rows persisted to the CH store.",
+    counter toast_image_rows_mirrored_total: u64 =
+        "Chunk rows mirrored from restored page images during a backup window; non-zero means the backup copied TOAST pages mid-write.",
     counter toast_values_filled_superseded_total: u64 =
         "Store-mode values filled after their history merge-collapsed.",
     counter toast_values_filled_mismatch_total: u64 =

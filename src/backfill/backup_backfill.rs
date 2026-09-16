@@ -60,7 +60,8 @@ use crate::backfill::backup_source::{BackupSink, BackupSource, EndInfo, PumpStat
 use crate::backfill::backup_source_direct::DirectSource;
 use crate::backfill::backup_source_object_store::ObjectStoreSource;
 use crate::backfill::spool::{DEFERRED_SPOOL_MEM_MAX, DeferredSpool};
-use crate::backfill::visibility_gate::{GateOutput, GateStats, resolve_phase, stream_phase};
+use crate::backfill::visibility_gate::{GateStats, resolve_phase, stream_phase};
+use crate::backfill::visibility_pending::{self, PendingSpool};
 use crate::backfill::wal_replay::{
     ReplayStats, ReplayTargets, WalReplayInputs, WalReplaySink, pump_segments_through,
 };
@@ -327,6 +328,8 @@ async fn walk_and_ship(
     let toast_spool_path = ctx.scratch_dir.join("bootstrap_deferred.bin");
     tokio::fs::remove_file(&gate_spool_path).await.ok();
     tokio::fs::remove_file(&toast_spool_path).await.ok();
+    let pending_spool_path = ctx.scratch_dir.join("gate_pending.bin");
+    tokio::fs::remove_file(&pending_spool_path).await.ok();
     let gate = tokio::spawn(gate_task(
         walk_rx,
         gated_tx,
@@ -336,6 +339,7 @@ async fn walk_and_ship(
         patch,
         walk_ok_rx,
         DeferredSpool::new(gate_spool_path, DEFERRED_SPOOL_MEM_MAX),
+        PendingSpool::new(pending_spool_path, filter.clone()),
     ));
     let drain = tokio::spawn(bootstrap::drain(
         gated_rx,
@@ -345,7 +349,7 @@ async fn walk_and_ship(
         tail.ack.clone(),
         ctx.stats.clone(),
         resolver.clone(),
-        Some(DeferredSpool::new(toast_spool_path, DEFERRED_SPOOL_MEM_MAX)),
+        bootstrap::Deferral::Local(DeferredSpool::new(toast_spool_path, DEFERRED_SPOOL_MEM_MAX)),
         ctx.emitter.row_policy(),
         ctx.config_rx.as_ref().map(|rx| rx.borrow().clone()),
         HashSet::new(),
@@ -375,19 +379,20 @@ async fn walk_and_ship(
         tail.quiesce().await;
         return Err(e);
     }
-    let (gate_stats, pg_xact_segments) = match gate_join.and_then(|r| r.map_err(anyhow::Error::msg))
-    {
-        Ok(s) => s,
-        Err(e) => {
-            tail.quiesce().await;
-            return Err(e);
-        }
-    };
-    // Every non-toast tuple lands in exactly one of emitted/gated (deferred
-    // resolves into one at EOF), so their sum is the walked total
-    outcome.rows_walked += gate_stats.emitted + gate_stats.gated;
+    let (gate_stats, pg_xact_segments, pending) =
+        match gate_join.and_then(|r| r.map_err(anyhow::Error::msg)) {
+            Ok(s) => s,
+            Err(e) => {
+                tail.quiesce().await;
+                return Err(e);
+            }
+        };
+    // Every non-toast tuple ends up emitted, gated, or pending
+    // (deferred resolves into one at EOF), so their sum is the walked total
+    outcome.rows_walked += gate_stats.emitted + gate_stats.gated + gate_stats.pending;
     outcome.rows_gated += gate_stats.gated;
     outcome.rows_deferred += gate_stats.deferred;
+    outcome.rows_pending += gate_stats.pending;
     outcome.multixact_emitted += gate_stats.multixact_emitted;
     outcome.pg_xact_segments = pg_xact_segments;
     let drain_outcome = match drain_join.and_then(|r| r.map_err(anyhow::Error::msg)) {
@@ -429,6 +434,21 @@ async fn walk_and_ship(
     }
 
     tail.finish(next_seq).await.map_err(anyhow::Error::msg)?;
+
+    // Pending rows need a separate tail after this pass closes its seq space
+    // Record their manifests after publishing the pass
+    outcome.pending_tables = visibility_pending::ship(
+        pending,
+        &ctx.published.snapshot().await,
+        ctx.emitter.clone(),
+        ctx.stats.clone(),
+        resolver,
+        ctx.config_rx.as_ref().map(|rx| rx.borrow().clone()),
+        ctx.oracle.clone(),
+        &ctx.scratch_dir,
+    )
+    .await
+    .map_err(anyhow::Error::msg)?;
     Ok(())
 }
 
@@ -443,29 +463,24 @@ async fn gate_task(
     patch: PgXactPatch,
     walk_ok: oneshot::Receiver<()>,
     mut deferred: DeferredSpool,
-) -> Result<(GateStats, usize), String> {
+    mut pending: PendingSpool,
+) -> Result<(GateStats, usize, PendingSpool), String> {
     let mut stats = GateStats::default();
     // Per-table loads abort on unprovable tuples
-    stream_phase(
-        &mut rx,
-        &GateOutput::Rows(&tx),
-        &filter,
-        &mut deferred,
-        &mut stats,
-    )
-    .await?;
+    stream_phase(&mut rx, &tx, &filter, &mut deferred, &mut stats).await?;
     if walk_ok.await.is_err() {
         stats.gated += stats.deferred;
         deferred.discard().await;
-        return Ok((stats, 0));
+        // Resolution never ran; shipping reclaims the empty pending row spool
+        return Ok((stats, 0, pending));
     }
     // Take the accums out so no std guard is held across the sends below
     let accum = std::mem::take(&mut *pg_xact.lock().expect("pg_xact accum lock"));
     let multi = std::mem::take(&mut *pg_multixact.lock().expect("pg_multixact accum lock"));
     let segments = accum.segment_count();
     let view = PgXactView::new(&accum, &patch).with_multixact(&multi);
-    resolve_phase(deferred, &view, &GateOutput::Rows(&tx), &mut stats).await?;
-    Ok((stats, segments))
+    resolve_phase(deferred, &view, &tx, Some(&mut pending), &mut stats).await?;
+    Ok((stats, segments, pending))
 }
 
 // ---------------------------------------------------------------------------
@@ -1218,6 +1233,15 @@ mod tests {
         )
     }
 
+    /// Pending row sink with an empty catalog: the gate counts pushes as gated,
+    /// preserving discard behavior for these cases
+    fn test_pending() -> PendingSpool {
+        PendingSpool::new(
+            std::env::temp_dir().join("ws-pending-test-unused.bin"),
+            CatalogMap::new(),
+        )
+    }
+
     #[tokio::test]
     async fn gate_task_routes_hinted_defers_unhinted_and_resolves_at_eof() {
         let filter = CatalogMap::new();
@@ -1242,6 +1266,7 @@ mod tests {
             patch,
             walk_ok_rx,
             DeferredSpool::new(spool_path.clone(), 0),
+            test_pending(),
         ));
 
         // Hinted-committed: passes through immediately
@@ -1266,7 +1291,7 @@ mod tests {
         drop(walk_tx);
         walk_ok_tx.send(()).unwrap();
 
-        let (stats, _segments) = gate.await.unwrap().unwrap();
+        let (stats, _segments, _pending) = gate.await.unwrap().unwrap();
         let mut got = Vec::new();
         while let Some(t) = gated_rx.recv().await {
             got.extend(t.iter().map(|x| x.xid));
@@ -1306,6 +1331,7 @@ mod tests {
             patch,
             walk_ok_rx,
             DeferredSpool::new(spool_path.clone(), 0),
+            test_pending(),
         ));
 
         // Hinted-committed: routed before the failure, stays flushed
@@ -1323,7 +1349,7 @@ mod tests {
         drop(walk_tx);
         drop(walk_ok_tx);
 
-        let (stats, _segments) = gate.await.unwrap().unwrap();
+        let (stats, _segments, _pending) = gate.await.unwrap().unwrap();
         let mut got = Vec::new();
         while let Some(t) = gated_rx.recv().await {
             got.extend(t.iter().map(|x| x.xid));
@@ -1372,6 +1398,7 @@ mod tests {
             patch,
             walk_ok_rx,
             mem_spool(),
+            test_pending(),
         ));
 
         walk_tx
@@ -1386,7 +1413,7 @@ mod tests {
         drop(walk_tx);
         walk_ok_tx.send(()).unwrap();
 
-        let (stats, _segments) = gate.await.unwrap().unwrap();
+        let (stats, _segments, _pending) = gate.await.unwrap().unwrap();
         assert!(gated_rx.recv().await.is_none(), "dead tuple must not emit");
         assert_eq!(stats.deferred, 1, "multixact defers to EOF");
         assert_eq!(stats.gated, 1);
@@ -1412,6 +1439,7 @@ mod tests {
             PgXactPatch::new(),
             walk_ok_rx,
             mem_spool(),
+            test_pending(),
         ));
 
         walk_tx
@@ -1426,7 +1454,7 @@ mod tests {
         drop(walk_tx);
         walk_ok_tx.send(()).unwrap();
 
-        let err = gate.await.unwrap().unwrap_err();
+        let err = gate.await.unwrap().map(|_| ()).unwrap_err();
         assert!(err.contains("pg_multixact"), "{err}");
         assert!(err.contains("initial_load='copy'"), "{err}");
     }
