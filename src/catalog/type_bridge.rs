@@ -41,6 +41,7 @@
 //! text (SQL path). Resolve tier-3 bytes through shadow PG before rendering
 //! `ADD COLUMN` defaults with [`column_value_to_sql_literal`]
 
+use crate::decode::codecs::{format_time_us, timetz_to_text};
 use crate::decode::heap_decoder::{self, ColumnValue};
 use crate::schema::{
     BOOLOID, BPCHAROID, BYTEAOID, CHAROID, CIDROID, DATEOID, FLOAT4OID, FLOAT8OID, INETOID,
@@ -232,11 +233,11 @@ pub fn column_value_to_sql_literal(v: &ColumnValue, ch_inner: &str) -> Option<St
         ColumnValue::Bytea(b) => Some(sql_bytes_literal(b)),
         ColumnValue::Date(days) => Some(format!("toDate32({days})")),
         ColumnValue::Time(micros) => {
-            let txt = render_pg_time(*micros);
+            let txt = format_time_us(*micros);
             Some(sql_string_literal(&txt))
         }
         ColumnValue::TimeTz { micros, tz_seconds } => {
-            let txt = render_pg_timetz(*micros, *tz_seconds);
+            let txt = timetz_to_text(*micros, *tz_seconds);
             Some(sql_string_literal(&txt))
         }
         ColumnValue::Timestamp(micros) | ColumnValue::TimestampTz(micros) => {
@@ -269,40 +270,6 @@ fn format_float(f: f64) -> String {
             s
         } else {
             format!("{s}.0")
-        }
-    }
-}
-
-/// PG `time` (microseconds since midnight) → typoutput `HH:MM:SS[.ffffff]`
-fn render_pg_time(micros: i64) -> String {
-    let m = micros.rem_euclid(86_400_000_000);
-    let total_secs = m / 1_000_000;
-    let frac = (m % 1_000_000) as u32;
-    let h = total_secs / 3_600;
-    let mm = (total_secs % 3_600) / 60;
-    let ss = total_secs % 60;
-    if frac == 0 {
-        format!("{h:02}:{mm:02}:{ss:02}")
-    } else {
-        format!("{h:02}:{mm:02}:{ss:02}.{frac:06}")
-    }
-}
-
-fn render_pg_timetz(micros: i64, tz_seconds: i32) -> String {
-    let time = render_pg_time(micros);
-    if tz_seconds == 0 {
-        format!("{time}+00")
-    } else {
-        // PG tz_seconds is west-positive; displayed offset is negation
-        let total = -tz_seconds;
-        let sign = if total >= 0 { '+' } else { '-' };
-        let total = total.abs();
-        let h = total / 3_600;
-        let m = (total % 3_600) / 60;
-        if m == 0 {
-            format!("{time}{sign}{h:02}")
-        } else {
-            format!("{time}{sign}{h:02}:{m:02}")
         }
     }
 }
@@ -392,32 +359,45 @@ mod tests {
     }
 
     #[test]
-    fn render_pg_time_matches_typoutput() {
+    fn time_default_matches_typoutput() {
         let cases = [
             (0i64, "00:00:00"),
             (3_661_000_000, "01:01:01"),
             (3_661_000_001, "01:01:01.000001"),
+            (3_661_500_000, "01:01:01.5"),
             (86_399_999_999, "23:59:59.999999"),
-            // Negative micros wrap via rem_euclid
-            (-1, "23:59:59.999999"),
+            (86_400_000_000, "24:00:00"),
         ];
         for (micros, expected) in cases {
-            assert_eq!(render_pg_time(micros), expected, "micros={micros}");
+            assert_eq!(
+                column_value_to_sql_literal(&ColumnValue::Time(micros), "Time64(6)"),
+                Some(sql_string_literal(expected)),
+                "micros={micros}"
+            );
         }
     }
 
     #[test]
-    fn render_pg_timetz_applies_pg_sign_convention() {
+    fn timetz_default_matches_typoutput() {
         let cases = [
             (0i64, 0i32, "00:00:00+00"),
             (0, -3_600, "00:00:00+01"),    // UTC+1
             (0, 19_800, "00:00:00-05:30"), // UTC-5:30
-            (3_661_500_000, -19_800, "01:01:01.500000+05:30"),
+            (3_661_500_000, -19_800, "01:01:01.5+05:30"),
+            (0, -3_601, "00:00:00+01:00:01"),
+            (0, 3_661, "00:00:00-01:01:01"),
+            (86_400_000_000, 0, "24:00:00+00"),
         ];
         for (micros, tz, expected) in cases {
             assert_eq!(
-                render_pg_timetz(micros, tz),
-                expected,
+                column_value_to_sql_literal(
+                    &ColumnValue::TimeTz {
+                        micros,
+                        tz_seconds: tz,
+                    },
+                    "String"
+                ),
+                Some(sql_string_literal(expected)),
                 "micros={micros} tz={tz}"
             );
         }
@@ -673,11 +653,13 @@ mod tests {
         assert!(d.starts_with("unhex('"), "{d}");
     }
 
-    /// PG jsonb `{}` has binary payload `00 00 00 20`
+    /// Fringe varlena type with no local codec
+    const TSVECTOROID: u32 = 3614;
+
     #[test]
     fn unresolved_disk_default_never_renders_as_string() {
         let value = ColumnValue::PgPending {
-            type_oid: JSONBOID,
+            type_oid: TSVECTOROID,
             raw: vec![0, 0, 0, 0x20],
         };
         for ch_type in ["JSON", "String", "Array(Nullable(Int32))"] {
@@ -685,10 +667,12 @@ mod tests {
         }
     }
 
+    /// `jsonb` reaches the bridge as `jsonb_out` text, so the literal is the
+    /// document CH parses into its `JSON` column
     #[test]
-    fn default_for_jsonb_text_renders_as_bytes() {
-        let r = map(&attr(JSONBOID, -1, true, Some("{}")), false).unwrap();
-        assert_eq!(r.default_sql.as_deref(), Some("unhex('7b7d')"));
+    fn default_for_jsonb_text_renders_the_document() {
+        let r = map(&attr(JSONBOID, -1, true, Some(r#"{"a": 1}"#)), false).unwrap();
+        assert_eq!(r.default_sql.as_deref(), Some(r#"'{"a": 1}'"#));
     }
 
     #[test]

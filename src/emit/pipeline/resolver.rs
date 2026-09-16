@@ -314,6 +314,7 @@ mod tests {
             offsets,
             data,
             null_map,
+            ..
         } = &batch.buffers[0]
         else {
             panic!("column not built locally: {:?}", batch.buffers[0]);

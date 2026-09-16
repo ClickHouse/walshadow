@@ -251,7 +251,7 @@ async fn native_array_targets_carry_elements_and_nulls() {
 
 /// `ADD COLUMN` defaults supply values for rows already stored in ClickHouse
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn jsonb_fast_default_resolves_through_oracle() {
+async fn jsonb_fast_default_renders_on_add_column() {
     if skip_gate() {
         return;
     }
@@ -283,8 +283,8 @@ async fn jsonb_fast_default_resolves_through_oracle() {
         )
         .unwrap(),
         // TSV escapes quotes in SQL literals
-        r"unhex(\'7b2261223a20317d\')",
-        "ADD COLUMN must carry the default the shadow rendered",
+        r#"\'{"a": 1}\'"#,
+        "ADD COLUMN must carry the default walshadow rendered",
     );
     let labels = |id: i32| {
         ch.query(&format!(
@@ -347,12 +347,14 @@ async fn hstore_maps_through_the_extension_expander() {
     assert_eq!(row(3, "h"), "{}", "SQL NULL hstore");
 }
 
+/// A `JSON` column is a string body on the wire, so the documents the local
+/// codecs render reach CH without a conversion request
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn json_targets_take_every_json_shape() {
     if skip_gate() {
         return;
     }
-    let (source, ch, _tmp) = run_oracle(
+    let (source, ch, _tmp, oracle) = run_oracle_stats(
         fx::Ports::alloc(),
         "walshadow-oracle-json",
         "CREATE TABLE public.js (id int PRIMARY KEY, b jsonb, j json);\n",
@@ -390,6 +392,14 @@ async fn json_targets_take_every_json_shape() {
         )
         .unwrap(),
         "{}",
+    );
+    assert_eq!(
+        oracle
+            .stats
+            .blocks
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "json and jsonb encode locally, so the oracle never runs",
     );
 }
 

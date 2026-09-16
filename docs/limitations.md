@@ -23,8 +23,8 @@ and workload limits before attaching
 - destination uses ClickHouse Native protocol
 - source column type changes require manual ClickHouse migration
 - `CREATE TABLE` omits a fast default only shadow PostgreSQL can render (raw
-  `jsonb`, arrays); the table it creates is empty, and `ADD COLUMN` resolves
-  the default through the oracle
+  arrays); the table it creates is empty, and `ADD COLUMN` resolves the
+  default through the oracle
 - `time` mapping requires ClickHouse `Time64` support
 - same-named tables from different PostgreSQL schemas need explicit destination mapping
 - `base_backup` and `object_store` table loads publish with staging-table swap, database must support `EXCHANGE TABLES`
@@ -32,9 +32,9 @@ and workload limits before attaching
 
 ## Types shadow PostgreSQL converts
 
-Values outside walshadow's own codec set (`jsonb`, arrays, `hstore`, enums,
-ranges, domains, extension types) are converted by shadow PostgreSQL, one
-request per insert batch
+Values outside walshadow's own codec set (arrays, `hstore`, enums, ranges,
+domains, extension types) are converted by shadow PostgreSQL, one request per
+insert batch
 
 - a value shadow PostgreSQL cannot convert stops the batch and names the
   column and row, rather than writing a substituted value

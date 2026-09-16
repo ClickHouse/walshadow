@@ -1008,6 +1008,7 @@ fn canonical_type(ast: &TypeAst, configured: &str) -> String {
         .to_owned()
 }
 
+/// CH JSON serialization v1 accepts strings, legacy Object needs a kind prefix
 fn composite_target(ast: &TypeAst) -> bool {
     let view = ast.view();
     let inner = if view.kind() == Some(Kind::Nullable) {
@@ -1017,7 +1018,7 @@ fn composite_target(ast: &TypeAst) -> bool {
     };
     matches!(
         inner.and_then(|v| v.kind()),
-        Some(Kind::Array | Kind::Map | Kind::Json | Kind::Object)
+        Some(Kind::Array | Kind::Map | Kind::Object)
     )
 }
 
@@ -1199,6 +1200,7 @@ pub(crate) enum ColumnBuf {
     String {
         offsets: Vec<u64>,
         data: Vec<u8>,
+        absent: &'static [u8],
     },
     /// `null_map[i] = 1` means NULL; zero bytes go into `inner` for null
     /// rows so the slab stays dense
@@ -1211,6 +1213,7 @@ pub(crate) enum ColumnBuf {
         offsets: Vec<u64>,
         data: Vec<u8>,
         null_map: Vec<u8>,
+        absent: &'static [u8],
     },
     Oracle(OracleColumnBuf),
 }
@@ -1227,15 +1230,23 @@ impl ColumnBuf {
         } else {
             (false, view)
         };
+        // CH parses JSON cells even when null_map marks them NULL
+        let absent: &[u8] = if inner.kind() == Some(Kind::Json) {
+            b"{}"
+        } else {
+            b""
+        };
         Ok(match (nullable, inner.elem_size()) {
             (false, 0) => Self::String {
                 offsets: Vec::new(),
                 data: Vec::new(),
+                absent,
             },
             (true, 0) => Self::NullableString {
                 offsets: Vec::new(),
                 data: Vec::new(),
                 null_map: Vec::new(),
+                absent,
             },
             (false, w) => Self::Fixed {
                 width: w,
@@ -1252,7 +1263,7 @@ impl ColumnBuf {
     fn approx_size(&self) -> usize {
         match self {
             Self::Fixed { bytes, .. } => bytes.len(),
-            Self::String { offsets, data } => offsets.len() * 8 + data.len(),
+            Self::String { offsets, data, .. } => offsets.len() * 8 + data.len(),
             Self::NullableFixed {
                 null_map, inner, ..
             } => null_map.len() + inner.len(),
@@ -1260,6 +1271,7 @@ impl ColumnBuf {
                 offsets,
                 data,
                 null_map,
+                ..
             } => offsets.len() * 8 + data.len() + null_map.len(),
             Self::Oracle(o) => o.approx_size(),
         }
@@ -1280,8 +1292,10 @@ impl ColumnBuf {
                 offsets,
                 data,
                 null_map,
+                absent,
             } => {
                 null_map.push(1);
+                data.extend_from_slice(absent);
                 offsets.push(data.len() as u64);
                 Ok(())
             }
@@ -1296,14 +1310,18 @@ impl ColumnBuf {
         }
     }
 
-    /// Type default for absent values where NULL is unrepresentable: zero
-    /// bytes for fixed shapes (0 / epoch / empty FixedString, matching CH
-    /// column DEFAULT), empty string for varlen. Nullable shapes keep NULL,
-    /// the more faithful absence marker
+    /// Use CH type defaults for non-nullable columns, NULL otherwise
     fn append_default(&mut self) {
         match self {
             Self::Fixed { width, bytes } => bytes.extend(std::iter::repeat_n(0u8, *width)),
-            Self::String { offsets, data } => offsets.push(data.len() as u64),
+            Self::String {
+                offsets,
+                data,
+                absent,
+            } => {
+                data.extend_from_slice(absent);
+                offsets.push(data.len() as u64);
+            }
             nullable => nullable.append_null().expect("nullable shape takes NULL"),
         }
     }
@@ -1346,7 +1364,7 @@ impl ColumnBuf {
 
     fn append_string_bytes(&mut self, raw: &[u8]) -> Result<(), EmitterError> {
         match self {
-            Self::String { offsets, data } => {
+            Self::String { offsets, data, .. } => {
                 data.extend_from_slice(raw);
                 offsets.push(data.len() as u64);
                 Ok(())
@@ -1355,6 +1373,7 @@ impl ColumnBuf {
                 offsets,
                 data,
                 null_map,
+                ..
             } => {
                 null_map.push(0);
                 data.extend_from_slice(raw);
@@ -1554,9 +1573,14 @@ pub(crate) fn literal_column(
             offsets,
             data,
             null_map: Vec::with_capacity(n_rows),
+            absent: b"",
         }
     } else {
-        ColumnBuf::String { offsets, data }
+        ColumnBuf::String {
+            offsets,
+            data,
+            absent: b"",
+        }
     };
     for cell in buf.cells() {
         if let OracleCell::Literal(bytes) = cell {
@@ -1595,7 +1619,7 @@ pub(crate) fn build_root<'b>(
     };
     Ok(match buf {
         ColumnBuf::Fixed { width, bytes } => ColumnBuilder::fixed(bytes, *width, n_rows)?,
-        ColumnBuf::String { offsets, data } => ColumnBuilder::string(offsets, data, n_rows)?,
+        ColumnBuf::String { offsets, data, .. } => ColumnBuilder::string(offsets, data, n_rows)?,
         ColumnBuf::NullableFixed { null_map, .. } | ColumnBuf::NullableString { null_map, .. } => {
             wrap(null_map)?
         }
@@ -1923,15 +1947,7 @@ fn encode_value(
                     }
                 },
                 // String column: lossless text, including NaN/±Inf
-                None => {
-                    let txt: &str = match n {
-                        NumericKind::Finite(s) => s.as_str(),
-                        NumericKind::NaN => "NaN",
-                        NumericKind::PInf => "Infinity",
-                        NumericKind::NInf => "-Infinity",
-                    };
-                    buf.append_string_bytes(txt.as_bytes())
-                }
+                None => buf.append_string_bytes(n.as_text().as_bytes()),
             }
         }
         ColumnValue::Inet(v) => buf.append_string_bytes(v.to_text().as_bytes()),
@@ -1977,8 +1993,8 @@ fn oracle_cell(v: Option<&ColumnValue>, source_type_oid: u32) -> Result<OracleCe
             }
             OracleCell::TextInput(text.as_bytes().to_vec())
         }
-        // json varlena body is text
-        Some(ColumnValue::Json(s)) => OracleCell::DiskRaw(s.as_bytes().to_vec()),
+        // jsonb needs typinput to reconstruct binary storage from document text
+        Some(ColumnValue::Json(s)) => OracleCell::TextInput(s.as_bytes().to_vec()),
         // PostGIS WKT must bypass HEXEWKB typoutput
         Some(ColumnValue::Text(s)) | Some(ColumnValue::Name(s)) => {
             OracleCell::Literal(s.as_bytes().to_vec())
@@ -2100,7 +2116,7 @@ impl std::fmt::Debug for ColumnBuf {
                 .field("width", width)
                 .field("bytes_len", &bytes.len())
                 .finish(),
-            Self::String { offsets, data } => f
+            Self::String { offsets, data, .. } => f
                 .debug_struct("String")
                 .field("rows", &offsets.len())
                 .field("data_len", &data.len())
@@ -2119,6 +2135,7 @@ impl std::fmt::Debug for ColumnBuf {
                 offsets,
                 data,
                 null_map,
+                ..
             } => f
                 .debug_struct("NullableString")
                 .field("rows", &null_map.len())
@@ -2484,7 +2501,7 @@ mod tests {
         buf.push(OracleCell::Literal(b"a".to_vec()));
         buf.push(OracleCell::Default);
         match literal_column(&buf, "String", 2) {
-            Some(ColumnBuf::String { offsets, data }) => {
+            Some(ColumnBuf::String { offsets, data, .. }) => {
                 assert_eq!(data, b"a");
                 assert_eq!(offsets, [1, 1]);
             }
@@ -2875,6 +2892,51 @@ mod tests {
         }
     }
 
+    #[test]
+    fn json_target_encodes_locally_and_fills_absent_cells() {
+        let alloc = Allocator::stdlib();
+        let mut rel = mk_rel();
+        rel.attributes[1].type_oid = crate::schema::JSONBOID;
+        rel.attributes[1].type_name = "jsonb".into();
+        for target in ["JSON", "Nullable(JSON)"] {
+            let mut m = mk_mapping();
+            m.columns[1].target_type = target.into();
+            let plan = TablePlan::build(
+                alloc,
+                &rel,
+                &m,
+                &ColumnRules::default(),
+                &SystemColumns::default(),
+            )
+            .unwrap();
+            assert_eq!(plan.columns[1].encoding, ColumnEncoding::Local, "{target}");
+            let mut enc = TableEncoder::new(plan).unwrap();
+            let mut doc = committed(1, None);
+            doc.decoded.new.as_mut().unwrap().columns[1] =
+                Some(ColumnValue::Json(r#"{"a": 1}"#.into()));
+            enc.append_row(&doc, &m, OP_INSERT).unwrap();
+            enc.append_row(&committed(2, None), &m, OP_INSERT).unwrap();
+            match &enc.buffers[1] {
+                ColumnBuf::String {
+                    offsets,
+                    data,
+                    absent,
+                }
+                | ColumnBuf::NullableString {
+                    offsets,
+                    data,
+                    absent,
+                    ..
+                } => {
+                    assert_eq!(*absent, b"{}", "{target}");
+                    assert_eq!(data.as_slice(), br#"{"a": 1}{}"#, "{target}");
+                    assert_eq!(offsets, &[8, 10], "{target}");
+                }
+                other => panic!("{target} took no local shape: {other:?}"),
+            }
+        }
+    }
+
     /// Key-only old image, the shape a delete logs under non-FULL
     /// replica identity
     #[test]
@@ -2882,7 +2944,7 @@ mod tests {
         let alloc = Allocator::stdlib();
         let rel = mk_rel();
         let mut m = mk_mapping();
-        m.columns[1].target_type = "JSON".into();
+        m.columns[1].target_type = "Array(Nullable(String))".into();
         let plan = TablePlan::build(
             alloc,
             &rel,
@@ -2964,7 +3026,7 @@ mod tests {
         // Insert: genuine NULL mapped onto the non-Nullable column
         enc.append_row(&committed(4, None), &m, OP_INSERT).unwrap();
         match &enc.buffers[1] {
-            ColumnBuf::String { offsets, data } => {
+            ColumnBuf::String { offsets, data, .. } => {
                 assert_eq!(offsets, &[0u64, 0]);
                 assert!(data.is_empty());
             }
@@ -3028,6 +3090,7 @@ mod tests {
                 offsets,
                 data,
                 null_map,
+                ..
             } => {
                 assert_eq!(null_map, &[0u8, 1, 0]);
                 assert_eq!(offsets, &[5u64, 5, 9]);

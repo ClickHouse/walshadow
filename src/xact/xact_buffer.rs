@@ -3763,22 +3763,36 @@ mod tests {
 
     #[test]
     fn detoasted_value_routes_tier3_like_inline() {
-        use crate::schema::{BYTEAOID, JSONBOID, TEXTOID};
+        use crate::schema::{BYTEAOID, TEXTOID};
+        /// Fringe varlena type with no local codec
+        const TSVECTOROID: u32 = 3614;
         assert!(
             matches!(detoasted_value(b"raw".to_vec(), BYTEAOID), ColumnValue::Bytea(b) if b == b"raw")
         );
         assert!(
             matches!(detoasted_value(b"hi".to_vec(), TEXTOID), ColumnValue::Text(s) if s == "hi")
         );
-        // Tier 3 (jsonb) lands as PgPending carrying the body so the oracle
-        // resolves it like an inline jsonb, not Unsupported
-        match detoasted_value(b"\x01body".to_vec(), JSONBOID) {
+        // Tier 3 lands as PgPending carrying the body so the oracle resolves
+        // it like an inline value, not Unsupported
+        match detoasted_value(b"\x01body".to_vec(), TSVECTOROID) {
             ColumnValue::PgPending { type_oid, raw } => {
-                assert_eq!(type_oid, JSONBOID);
+                assert_eq!(type_oid, TSVECTOROID);
                 assert_eq!(raw, b"\x01body");
             }
             other => panic!("expected PgPending, got {other:?}"),
         }
+    }
+
+    /// A detoasted jsonb renders through its codec, same as an inline one
+    #[test]
+    fn detoasted_jsonb_renders_its_document() {
+        assert_eq!(
+            detoasted_value(
+                0x2000_0000u32.to_le_bytes().to_vec(),
+                crate::schema::JSONBOID
+            ),
+            ColumnValue::Json("{}".into()),
+        );
     }
 
     fn bytea_rel() -> RelDescriptor {

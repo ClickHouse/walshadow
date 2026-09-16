@@ -10,7 +10,7 @@
 //!
 //! Repro without a second machine: give the SOURCE a private extension via
 //! `extension_control_path` + `dynamic_library_path` (PG18+), so it lives in a
-//! temp dir the oracle's default paths never see. A `jsonb` column forces the
+//! temp dir the oracle's default paths never see. An enum column forces the
 //! oracle to be provisioned; the extension itself is unused. On the buggy tree
 //! the bootstrap aborts and the row never reaches ClickHouse; the fix drops the
 //! unavailable extension from the dump and the row lands.
@@ -173,14 +173,15 @@ async fn bootstrap_survives_extension_absent_from_oracle() {
     source.start().expect("start source");
     let _src_stop = fx::StopOnDrop { sh: &source };
 
-    // `stub` is irrelevant to translation — no column uses its type. The `jsonb`
+    // `stub` is irrelevant to translation — no column uses its type. The enum
     // column is what forces the bootstrap oracle to be provisioned at all.
     source
         .apply_schema_dump(
             "CREATE EXTENSION stub;\n\
-             CREATE TABLE public.t (id int PRIMARY KEY, name text, doc jsonb);\n\
+             CREATE TYPE mood AS ENUM ('happy', 'sad');\n\
+             CREATE TABLE public.t (id int PRIMARY KEY, name text, feel mood);\n\
              ALTER TABLE public.t REPLICA IDENTITY FULL;\n\
-             INSERT INTO public.t VALUES (1, 'hello', '{\"k\": 42}');\n\
+             INSERT INTO public.t VALUES (1, 'hello', 'happy');\n\
              CHECKPOINT;\n\
              SELECT pg_switch_wal();\n",
         )
@@ -218,12 +219,12 @@ async fn bootstrap_survives_extension_absent_from_oracle() {
             }
             std::thread::sleep(Duration::from_millis(250));
         }
-        // The oracle-routed jsonb column must still resolve.
-        let k = ch
-            .query("SELECT toString(doc.k) FROM default.t FINAL WHERE id = 1")
-            .context("read jsonb path from CH")?;
-        if k != "42" {
-            anyhow::bail!("jsonb column not decoded: doc.k = {k:?}");
+        // The oracle-routed enum column must still resolve.
+        let feel = ch
+            .query("SELECT feel FROM default.t FINAL WHERE id = 1")
+            .context("read enum column from CH")?;
+        if feel != "happy" {
+            anyhow::bail!("enum column not decoded: feel = {feel:?}");
         }
         Ok(())
     })();

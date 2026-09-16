@@ -29,8 +29,9 @@
 //! Binary COPY carries each field in `typsend` wire form (big-endian), not
 //! the on-disk datum form the WAL heap decoder reads. Fixed-width types and
 //! byte/text strings decode natively into the same [`ColumnValue`] variants
-//! the WAL path produces; `numeric` selects as `::text` (numeric_out is the
-//! exact `NumericKind::Finite` form); every out-of-matrix type also selects
+//! the WAL path produces; `numeric` and `jsonb` select as `::text`
+//! (`numeric_out` and `jsonb_out` are the forms the WAL path renders too);
+//! every out-of-matrix type also selects
 //! as `::text` and ships as [`ColumnValue::PgPendingText`], so the oracle
 //! converts it through `typinput` exactly as it does a WAL-path default
 //! (architecture/values.md).
@@ -80,8 +81,8 @@ use crate::pos::{Pos, Snapshot};
 use crate::runtime_config::InitialLoadMode;
 use crate::schema::{
     BOOLOID, BPCHAROID, BYTEAOID, CHAROID, DATEOID, FLOAT4OID, FLOAT8OID, INT2OID, INT4OID,
-    INT8OID, JSONOID, NAMEOID, NUMERICOID, OIDOID, RelDescriptor, RelName, TEXTOID, TIMEOID,
-    TIMESTAMPOID, TIMESTAMPTZOID, UUIDOID, VARCHAROID,
+    INT8OID, JSONBOID, JSONOID, NAMEOID, NUMERICOID, OIDOID, RelDescriptor, RelName, TEXTOID,
+    TIMEOID, TIMESTAMPOID, TIMESTAMPTZOID, UUIDOID, VARCHAROID,
 };
 use crate::source::source_feed::open_sql_client;
 use crate::toast::ToastResolver;
@@ -316,6 +317,9 @@ fn column_plan(desc: &RelDescriptor) -> CopyPlan {
         let ident = quote_ident(&a.name);
         let (expr, kind) = match wire_kind(a.type_oid) {
             Some(k) => (ident, k),
+            // jsonb's send form prefixes a version byte; its text is the
+            // document the WAL path renders, so take that instead
+            None if a.type_oid == JSONBOID => (format!("{ident}::text"), WireKind::Json),
             None if a.type_oid == NUMERICOID => (format!("{ident}::text"), WireKind::NumericText),
             None => (format!("{ident}::text"), WireKind::CastText),
         };
@@ -1347,15 +1351,21 @@ mod tests {
             attr(2, "gone", TEXTOID, true),
             attr(3, "price", NUMERICOID, false),
             attr(4, "tags", 1009, false), // text[] — out of matrix
+            attr(5, "doc", JSONBOID, false),
         ]);
         let plan = column_plan(&d);
-        assert_eq!(plan.select, "\"id\", \"price\"::text, \"tags\"::text");
-        assert_eq!(plan.natts, 4);
-        assert_eq!(plan.cols.len(), 3, "dropped column not selected");
+        assert_eq!(
+            plan.select,
+            "\"id\", \"price\"::text, \"tags\"::text, \"doc\"::text"
+        );
+        assert_eq!(plan.natts, 5);
+        assert_eq!(plan.cols.len(), 4, "dropped column not selected");
         assert_eq!(plan.cols[0].kind, WireKind::Int8);
         assert_eq!(plan.cols[1].kind, WireKind::NumericText);
         assert_eq!(plan.cols[2].kind, WireKind::CastText);
         assert_eq!(plan.cols[2].attnum, 4);
+        // jsonb_out text, the document shape the WAL path yields
+        assert_eq!(plan.cols[3].kind, WireKind::Json);
     }
 
     #[test]
