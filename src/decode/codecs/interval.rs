@@ -3,7 +3,8 @@
 //! Fixed 16 bytes: `i64` micros + `i32` days + `i32` months.
 
 use super::CodecError;
-use super::time::format_time_us;
+use super::TextBuf;
+use super::time::write_time_us;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IntervalValue {
@@ -30,35 +31,42 @@ pub fn decode_interval(body: &[u8]) -> Result<IntervalValue, CodecError> {
     })
 }
 
+/// One `years`/`mons`/`days` field, space-separated from what precedes it
+fn push_unit<const N: usize>(out: &mut TextBuf<N>, n: i32, singular: &str, plural: &str) {
+    if !out.is_empty() {
+        out.push(b' ');
+    }
+    out.push_int(n.into());
+    out.push(b' ');
+    out.push_str(if n.unsigned_abs() == 1 {
+        singular
+    } else {
+        plural
+    });
+}
+
 impl IntervalValue {
     /// PG `interval_out` with `IntervalStyle = postgres`
-    pub fn to_text(&self) -> String {
-        let mut parts: Vec<String> = Vec::new();
+    pub fn to_text(&self) -> TextBuf<80> {
+        let mut out = TextBuf::new();
         let years = self.months / 12;
         let mons = self.months % 12;
         if years != 0 {
-            parts.push(format!(
-                "{years} {}",
-                if years.abs() == 1 { "year" } else { "years" }
-            ));
+            push_unit(&mut out, years, "year", "years");
         }
         if mons != 0 {
-            parts.push(format!(
-                "{mons} {}",
-                if mons.abs() == 1 { "mon" } else { "mons" }
-            ));
+            push_unit(&mut out, mons, "mon", "mons");
         }
         if self.days != 0 {
-            parts.push(format!(
-                "{} {}",
-                self.days,
-                if self.days.abs() == 1 { "day" } else { "days" }
-            ));
+            push_unit(&mut out, self.days, "day", "days");
         }
-        if self.micros != 0 || parts.is_empty() {
-            parts.push(format_time_us(self.micros));
+        if self.micros != 0 || out.is_empty() {
+            if !out.is_empty() {
+                out.push(b' ');
+            }
+            write_time_us(&mut out, self.micros);
         }
-        parts.join(" ")
+        out
     }
 }
 
@@ -81,7 +89,7 @@ mod tests {
                 micros: 14_706_700_000,
             }
         );
-        assert_eq!(v.to_text(), "1 year 2 mons 3 days 04:05:06.7");
+        assert_eq!(v.to_text().as_str(), "1 year 2 mons 3 days 04:05:06.7");
 
         assert_eq!(
             IntervalValue {
@@ -89,7 +97,8 @@ mod tests {
                 days: 0,
                 micros: 0,
             }
-            .to_text(),
+            .to_text()
+            .as_str(),
             "00:00:00",
         );
         assert_eq!(
@@ -98,7 +107,8 @@ mod tests {
                 days: 1,
                 micros: 0,
             }
-            .to_text(),
+            .to_text()
+            .as_str(),
             "1 year 1 mon 1 day",
         );
         assert_eq!(
@@ -107,7 +117,8 @@ mod tests {
                 days: 0,
                 micros: 90_000_000,
             }
-            .to_text(),
+            .to_text()
+            .as_str(),
             "00:01:30",
         );
         assert_eq!(
@@ -116,7 +127,8 @@ mod tests {
                 days: 0,
                 micros: 0,
             }
-            .to_text(),
+            .to_text()
+            .as_str(),
             "-1 mon",
         );
 
@@ -145,14 +157,14 @@ mod tests {
         body.extend_from_slice(&0i32.to_le_bytes());
         body.extend_from_slice(&12i32.to_le_bytes());
         let v = decode_interval(&body).unwrap();
-        assert_eq!(v.to_text(), "1 year 01:00:00");
+        assert_eq!(v.to_text().as_str(), "1 year 01:00:00");
     }
 
     #[test]
     fn interval_zero() {
         let body = [0u8; 16];
         let v = decode_interval(&body).unwrap();
-        assert_eq!(v.to_text(), "00:00:00");
+        assert_eq!(v.to_text().as_str(), "00:00:00");
     }
 
     #[test]
@@ -171,7 +183,7 @@ mod tests {
             days: 0,
             micros: -3_600_000_000,
         };
-        assert_eq!(v.to_text(), "-01:00:00");
+        assert_eq!(v.to_text().as_str(), "-01:00:00");
     }
 
     #[test]
@@ -181,6 +193,21 @@ mod tests {
             days: 0,
             micros: 1_000,
         };
-        assert_eq!(v.to_text(), "00:00:00.001");
+        assert_eq!(v.to_text().as_str(), "00:00:00.001");
+    }
+
+    /// Longest output `interval_out` can produce, against the buffer bound
+    #[test]
+    fn extreme_datum_fits_its_buffer() {
+        assert_eq!(
+            IntervalValue {
+                months: i32::MIN,
+                days: i32::MIN,
+                micros: i64::MIN,
+            }
+            .to_text()
+            .as_str(),
+            "-178956970 years -8 mons -2147483648 days -2562047788:00:54.775808",
+        );
     }
 }

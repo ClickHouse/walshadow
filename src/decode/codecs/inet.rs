@@ -12,7 +12,7 @@
 //! are NOT on disk: is_cidr comes from the column type OID (INETOID vs
 //! CIDROID), addr count is implied by family.
 
-use super::CodecError;
+use super::{CodecError, TextBuf};
 
 pub const PGSQL_AF_INET: u8 = 2;
 pub const PGSQL_AF_INET6: u8 = 3;
@@ -66,34 +66,43 @@ impl InetValue {
     /// PG `inet_out` / `cidr_out`: dotted-quad or colon-hex with optional
     /// `/bits` suffix. `inet` omits suffix when bits == family max; `cidr`
     /// always emits it
-    pub fn to_text(&self) -> String {
-        let addr_text = match self.family {
-            PGSQL_AF_INET => format!(
-                "{}.{}.{}.{}",
-                self.addr[0], self.addr[1], self.addr[2], self.addr[3]
-            ),
-            PGSQL_AF_INET6 => format_ipv6(&self.addr),
-            _ => String::from("?"),
-        };
+    pub fn to_text(&self) -> TextBuf<48> {
+        let mut out = TextBuf::new();
+        match self.family {
+            PGSQL_AF_INET => {
+                for (i, octet) in self.addr.iter().take(4).enumerate() {
+                    if i > 0 {
+                        out.push(b'.');
+                    }
+                    out.push_uint(u64::from(*octet), 1);
+                }
+            }
+            PGSQL_AF_INET6 => write_ipv6(&mut out, &self.addr),
+            _ => out.push(b'?'),
+        }
         let max_bits = if self.family == PGSQL_AF_INET {
             32
         } else {
             128
         };
         if self.is_cidr || self.bits != max_bits {
-            format!("{addr_text}/{}", self.bits)
-        } else {
-            addr_text
+            out.push(b'/');
+            out.push_uint(u64::from(self.bits), 1);
         }
+        out
     }
 }
 
 /// IPv6 matching PG `inet_net_ntop`: RFC 5952 canonical form (lower-case hex,
-/// no per-group leading zeros, `::` collapses longest run of ≥2 zero groups)
-fn format_ipv6(bytes: &[u8]) -> String {
+/// no per-group leading zeros, `::` collapses longest run of >= 2 zero groups)
+fn write_ipv6<const N: usize>(out: &mut TextBuf<N>, bytes: &[u8]) {
+    let Some(addr) = bytes.first_chunk::<16>() else {
+        out.push(b'?');
+        return;
+    };
     let mut groups = [0u16; 8];
-    for (i, g) in groups.iter_mut().enumerate() {
-        *g = ((bytes[i * 2] as u16) << 8) | bytes[i * 2 + 1] as u16;
+    for (group, raw) in groups.iter_mut().zip(addr.as_chunks::<2>().0) {
+        *group = u16::from_be_bytes(*raw);
     }
     let mut best_start = None;
     let mut best_len = 1usize;
@@ -114,7 +123,6 @@ fn format_ipv6(bytes: &[u8]) -> String {
             i += 1;
         }
     }
-    let mut out = String::new();
     let mut k = 0;
     while k < 8 {
         if Some(k) == best_start {
@@ -123,12 +131,11 @@ fn format_ipv6(bytes: &[u8]) -> String {
             continue;
         }
         if !out.is_empty() && !out.ends_with(':') {
-            out.push(':');
+            out.push(b':');
         }
-        out.push_str(&format!("{:x}", groups[k]));
+        out.push_hex(groups[k]);
         k += 1;
     }
-    out
 }
 
 #[cfg(test)]
@@ -143,7 +150,7 @@ mod tests {
         assert_eq!(v.bits, 32);
         assert!(!v.is_cidr);
         assert_eq!(v.addr, [192, 168, 0, 1]);
-        assert_eq!(v.to_text(), "192.168.0.1");
+        assert_eq!(v.to_text().as_str(), "192.168.0.1");
     }
 
     #[test]
@@ -151,14 +158,14 @@ mod tests {
         let body = [PGSQL_AF_INET, 24, 10, 0, 0, 0];
         let v = decode_inet(&body, true).unwrap();
         assert!(v.is_cidr);
-        assert_eq!(v.to_text(), "10.0.0.0/24");
+        assert_eq!(v.to_text().as_str(), "10.0.0.0/24");
     }
 
     #[test]
     fn inet_ipv4_with_short_mask() {
         let body = [PGSQL_AF_INET, 24, 192, 168, 0, 1];
         let v = decode_inet(&body, false).unwrap();
-        assert_eq!(v.to_text(), "192.168.0.1/24");
+        assert_eq!(v.to_text().as_str(), "192.168.0.1/24");
     }
 
     #[test]
@@ -167,7 +174,7 @@ mod tests {
         body.extend_from_slice(&[0u8; 15]);
         body.push(1);
         let v = decode_inet(&body, false).unwrap();
-        assert_eq!(v.to_text(), "::1");
+        assert_eq!(v.to_text().as_str(), "::1");
     }
 
     #[test]
@@ -175,7 +182,7 @@ mod tests {
         let mut body = vec![PGSQL_AF_INET6, 128];
         body.extend_from_slice(&[0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01]);
         let v = decode_inet(&body, false).unwrap();
-        assert_eq!(v.to_text(), "fe80::1");
+        assert_eq!(v.to_text().as_str(), "fe80::1");
     }
 
     #[test]
@@ -213,7 +220,7 @@ mod tests {
             is_cidr: false,
             addr: Vec::new(),
         };
-        assert!(v.to_text().starts_with('?'));
+        assert!(v.to_text().as_str().starts_with('?'));
     }
 
     #[test]
@@ -223,6 +230,18 @@ mod tests {
             body.extend_from_slice(&i.to_be_bytes());
         }
         let v = decode_inet(&body, false).unwrap();
-        assert_eq!(v.to_text(), "1:2:3:4:5:6:7:8");
+        assert_eq!(v.to_text().as_str(), "1:2:3:4:5:6:7:8");
+    }
+
+    /// Longest output `inet_out` can produce, against the buffer bound
+    #[test]
+    fn extreme_datum_fits_its_buffer() {
+        let mut body = vec![PGSQL_AF_INET6, 128];
+        body.extend_from_slice(&[0xff; 16]);
+        let v = decode_inet(&body, true).unwrap();
+        assert_eq!(
+            v.to_text().as_str(),
+            "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff/128"
+        );
     }
 }
