@@ -50,7 +50,7 @@ use walrus::pg::replication::conn::PgConfig;
 use walrus::pg::replication::tls::SslMode;
 use walrus::time::Timestamp;
 use walshadow::backfill::visibility_gate::{
-    GateStats, GreenfieldSink, PendingGate, resolve_greenfield, stream_phase,
+    DeferredLane, GateStats, GreenfieldSink, PendingGate, resolve_greenfield, stream_phase,
 };
 use walshadow::backfill_bootstrap::{
     BootstrapConfig, BootstrapOutcome, BootstrapProgress, drain_backfill, seed_in_snapshot,
@@ -3638,6 +3638,9 @@ fn stage_gauges(v: &StageCounters<'_>) -> MetricsSnapshot {
         toast_chunk_put_seconds: emitter_seconds(|s| &s.toast_chunk_put_nanos),
         toast_chunks_stored_total: emitter(|s| &s.toast_chunks_stored),
         toast_tombstones_stored_total: emitter(|s| &s.toast_tombstones_stored),
+        toast_values_fetched_total: emitter(|s| &s.toast_values_fetched),
+        toast_value_fetch_batches_total: emitter(|s| &s.toast_value_fetch_batches),
+        toast_value_fetch_seconds: emitter_seconds(|s| &s.toast_value_fetch_nanos),
         toast_image_rows_mirrored_total: emitter(|s| &s.toast_image_rows_mirrored),
         toast_values_filled_superseded_total: emitter(|s| &s.toast_values_filled_superseded),
         toast_values_filled_mismatch_total: emitter(|s| &s.toast_values_filled_mismatch),
@@ -4933,21 +4936,29 @@ async fn run_bootstrap(
 
         // Referrers the lanes handed back. One lane reaching its end proves
         // nothing about a sibling's chunk puts, so resolution waits for all
-        // of them and rides the first lane's tail
-        let handback: Vec<_> = drain_outcome
-            .iter_mut()
-            .filter_map(|d| d.deferred.take())
-            .collect();
+        // of them, then replays each spool on the tail that drained it
+        let mut handback = Vec::with_capacity(lanes);
+        let mut handback_at = Vec::with_capacity(lanes);
+        for (i, outcome) in drain_outcome.iter_mut().enumerate() {
+            let Some(spool) = outcome.deferred.take() else {
+                continue;
+            };
+            handback.push(DeferredLane {
+                spool,
+                msg_tx: tails[i].msg_tx.clone(),
+                ack: tails[i].ack.clone(),
+                first_seq: outcome.next_seq,
+            });
+            handback_at.push(i);
+        }
         let mut deferred_rows = 0;
         if !handback.is_empty() {
-            let lane = &tails[0];
-            let resolved = sink
-                .resolve_deferred(handback, &lane.msg_tx, &lane.ack, drain_outcome[0].next_seq)
-                .await;
-            match resolved {
+            match sink.resolve_deferred(handback).await {
                 Ok(resolved) => {
-                    drain_outcome[0].next_seq = resolved.next_seq;
-                    deferred_rows = resolved.rows_routed;
+                    for (i, lane) in handback_at.into_iter().zip(resolved) {
+                        drain_outcome[i].next_seq = lane.next_seq;
+                        deferred_rows += lane.rows_routed;
+                    }
                 }
                 Err(e) => {
                     for tail in tails {

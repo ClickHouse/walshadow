@@ -2312,7 +2312,7 @@ pub async fn detoast_heap(
     if pointers.is_empty() {
         return Ok(None);
     }
-    let leaf_need = check_value_caps(&pointers, resolver.inline_value_max())?;
+    let leaf_need = check_value_caps(pointers.iter().copied(), resolver.inline_value_max())?;
     // One leaf at a time per worker: reserved for the heap's aggregate
     // resolution peak (every retained decoded value + the largest
     // single-value transient), shrunk to retained bytes before return
@@ -3867,15 +3867,12 @@ mod tests {
             va_toastrelid: 16500,
         };
         // Uncompressed: leaf need = extsize
-        assert_eq!(check_value_caps(&[ptr(104, 100)], 1000).unwrap(), 100);
+        assert_eq!(check_value_caps([ptr(104, 100)], 1000).unwrap(), 100);
         // Compressed (method bits set): extsize + rawsize
         let compressed = 80u32 | (1 << VARLENA_EXTSIZE_BITS);
-        assert_eq!(
-            check_value_caps(&[ptr(104, compressed)], 1000).unwrap(),
-            180
-        );
+        assert_eq!(check_value_caps([ptr(104, compressed)], 1000).unwrap(), 180);
         // Decode target over cap: typed error before allocation
-        let err = check_value_caps(&[ptr(2000, 100)], 1000).unwrap_err();
+        let err = check_value_caps([ptr(2000, 100)], 1000).unwrap_err();
         assert!(matches!(
             err,
             ToastValueError::ValueTooLarge {
@@ -3884,7 +3881,7 @@ mod tests {
             }
         ));
         // Stored form over cap trips too (caps ChunkAssembler expected_size)
-        let err = check_value_caps(&[ptr(104, 1500)], 1000).unwrap_err();
+        let err = check_value_caps([ptr(104, 1500)], 1000).unwrap_err();
         assert!(matches!(err, ToastValueError::ValueTooLarge { .. }));
     }
 

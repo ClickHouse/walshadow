@@ -395,6 +395,100 @@ async fn ch_chunk_store_put_fetch_roundtrip() {
     );
 }
 
+/// Batched fetch against real CH: results align with the caller's order
+/// whatever it is, batches wider than one query's `IN` list split and merge
+/// back, and every as-of verdict matches the single-value path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ch_chunk_store_fetch_many_aligns_and_splits() {
+    if !fx::clickhouse_available() {
+        eprintln!("skip: no clickhouse binary on PATH");
+        return;
+    }
+    let slot = fx::Ports::alloc();
+    let ch_tmp = tempfile::tempdir().unwrap();
+    let ch = fx::ChServer::spawn(ch_tmp, slot.ch_tcp, slot.ch_http).expect("spawn ch");
+    ch.query(&format!("CREATE DATABASE IF NOT EXISTS {DB}"))
+        .expect("create db");
+
+    let mut cfg = config(ch.port);
+    cfg.inserter_pool_size = 4;
+    let store = ClickHouseChunkStore::new(cfg);
+
+    // 200 single-chunk values: past one query's id width, so a fetch has to
+    // split across the pool and merge its splits back
+    let body = |id: u32| format!("v{id}").into_bytes();
+    let rows: Vec<ToastRow> = (1..=200)
+        .map(|id| {
+            row(
+                16900,
+                id,
+                0,
+                (id / 10, (id % 10) as u16 + 1),
+                0x1000 + u64::from(id),
+                &body(id),
+            )
+        })
+        .collect();
+    store.put(&rows).await.unwrap();
+    // Value 5 dies and a later value is born at its TID. Freeze merges so
+    // the pre-death bound still has history to read
+    ch.query(&format!("SYSTEM STOP MERGES {DB}.pg_toast_16900"))
+        .expect("stop merges");
+    store.put(&[tomb(16900, (0, 6), 0x2000)]).await.unwrap();
+    store
+        .put(&[row(16900, 301, 0, (0, 6), 0x3000, b"reborn")])
+        .await
+        .unwrap();
+
+    // Unsorted, with a dead value, a reused TID, an id that never existed
+    // and a pointer size the run deviates from
+    let want = [
+        (200, 4),
+        (1, 2),
+        (5, 2),
+        (301, 6),
+        (999, 3),
+        (42, 3),
+        (7, 9),
+    ];
+    assert_eq!(
+        store.fetch_many(16900, &want, u64::MAX).await.unwrap(),
+        vec![
+            assembled(b"v200"),
+            assembled(b"v1"),
+            FetchedValue::Missing,
+            assembled(b"reborn"),
+            FetchedValue::Missing,
+            assembled(b"v42"),
+            FetchedValue::Mismatch { got: 2 },
+        ],
+    );
+    // As-of bound below the death: the old occupant whole, its successor
+    // not yet born
+    assert_eq!(
+        store
+            .fetch_many(16900, &[(5, 2), (301, 6)], 0x1fff)
+            .await
+            .unwrap(),
+        vec![assembled(b"v5"), FetchedValue::Missing],
+    );
+    // Never-populated mirror stays a hard error through the batch path
+    assert!(matches!(
+        store.fetch_many(70000, &[(1, 1)], u64::MAX).await,
+        Err(ChunkStoreError::MissingMirror(70000))
+    ));
+
+    let all: Vec<(u32, usize)> = (1..=200).map(|id| (id, body(id).len())).collect();
+    let got = store.fetch_many(16900, &all, u64::MAX).await.unwrap();
+    for (&(id, _), got) in all.iter().zip(got) {
+        let expected = match id {
+            5 => FetchedValue::Missing,
+            id => assembled(&body(id)),
+        };
+        assert_eq!(got, expected, "value {id} across the split");
+    }
+}
+
 /// `rewrite_barrier` against real CH: residual `O - B` tombstones at the
 /// commit LSN for TIDs live as of the marker with no row past it; reused
 /// TIDs and pre-marker deaths untouched; re-runs insert nothing (replay

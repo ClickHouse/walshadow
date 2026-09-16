@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::mpsc;
 
 use crate::backfill::backup_page_walk::{BackfillTuple, CatalogMap};
-use crate::backfill::spool::DeferredSpool;
+use crate::backfill::spool::{DeferredReader, DeferredSpool};
 use crate::config::ResolvedConfig;
 use crate::decode::heap_decoder::{ColumnValue, ToastPointer};
 use crate::emit::ch_emitter::EmitterStats;
@@ -25,7 +25,7 @@ use crate::toast::{
     FetchedValue, ToastResolver, ToastRow, check_value_caps, detoasted_value, finish_value,
     pointer_extsize,
 };
-use ahash::HashSet;
+use ahash::{HashMap, HashMapExt, HashSet};
 
 /// Rows per `BatcherMsg::Rows` from the bootstrap drain. Fixed rather than
 /// config-driven: bootstrap rows are uniform inserts, and the byte trigger
@@ -151,8 +151,8 @@ pub async fn drain(
     let mut chunk_batch = Vec::new();
     let mut chunk_batch_bytes = 0;
     let mut out = RowBuf::default();
-    while let Some(slab) = rx.recv().await {
-        for tuple in slab {
+    while let Some(batch) = rx.recv().await {
+        for tuple in batch {
             let rfn = tuple.rfn;
             let source_lsn = tuple.source_lsn;
 
@@ -213,7 +213,9 @@ pub async fn drain(
                     footprint.publish(spool);
                     continue;
                 }
-                permit = resolve_or_fill_toast(&mut tuple, &rel, &route.mapping, &resolver).await?;
+                permit = resolve_or_fill_toast(&mut tuple, &rel, &route.mapping, &resolver)
+                    .await?
+                    .map(Arc::new);
             }
             render_ext_columns(&rel.attributes, &mut tuple.columns);
             out.push(&msg_tx, seq, rel, route, tuple, permit).await?;
@@ -311,27 +313,24 @@ async fn resolve_spooled(
         .into_reader()
         .await
         .map_err(|e| format!("bootstrap: deferred spool seal: {e}"))?;
-    while let Some(mut tuple) = replay
-        .next()
-        .await
-        .map_err(|e| format!("bootstrap: deferred spool replay: {e}"))?
-    {
-        let Some(rel) = catalog.get(tuple.rfn.db_node, tuple.rfn.rel_node) else {
-            stats.unsupported_relations.fetch_add(1, Ordering::Relaxed);
-            continue;
-        };
-        let Some(route) = routes.get(&rel.rel_name).cloned() else {
-            stats.unsupported_relations.fetch_add(1, Ordering::Relaxed);
-            continue;
-        };
-        let at = *seq.get_or_insert_with(|| {
-            ack.register(first_seq, tuple.source_lsn);
-            first_seq
-        });
-        let permit = resolve_or_fill_toast(&mut tuple, &rel, &route.mapping, resolver).await?;
-        render_ext_columns(&rel.attributes, &mut tuple.columns);
-        out.push(msg_tx, at, rel, route, tuple, permit).await?;
-        placed += 1;
+    // Read and fetch the next batch while this one routes: spool reads and
+    // inserts otherwise leave the store pool idle
+    let mut ready = prepare_batch(&mut replay, routes, catalog, stats, resolver).await?;
+    while let Some(batch) = ready.take() {
+        let (next, routed) = tokio::join!(
+            prepare_batch(&mut replay, routes, catalog, stats, resolver),
+            route_batch(
+                batch,
+                &mut out,
+                msg_tx,
+                ack,
+                first_seq,
+                &mut seq,
+                &mut placed
+            ),
+        );
+        routed?;
+        ready = next?;
     }
     out.flush(msg_tx).await?;
     replay
@@ -377,7 +376,7 @@ impl RowBuf {
         rel: Arc<RelDescriptor>,
         route: Arc<RouteSnapshot>,
         tuple: BackfillTuple,
-        value_permit: Option<crate::budget::MemoryPermit>,
+        value_permit: Option<Arc<crate::budget::MemoryPermit>>,
     ) -> Result<(), String> {
         let committed = tuple.into_committed_insert();
         self.bytes += committed.decoded.approx_bytes();
@@ -386,7 +385,7 @@ impl RowBuf {
             rel,
             route,
             committed,
-            value_permit: value_permit.map(Arc::new),
+            value_permit,
         });
         if self.rows.len() >= DRAIN_CHUNK_ROWS || self.bytes >= DECODE_CHUNK_BYTES {
             self.flush(msg_tx).await?;
@@ -409,7 +408,289 @@ impl RowBuf {
     }
 }
 
+/// Referrers one fetch round covers, alongside a
+/// [`DECODE_CHUNK_BYTES`] seal on held tuples plus the values they wait
+/// for: a round's rows all route before the next one reads
+const REPLAY_BATCH_ROWS: usize = 4096;
+
+/// `(toast_relid, value_id, as-of bound)`. The bound is part of the key:
+/// a resumed load tags relations with their own `_lsn`
+type ValueKey = (u32, u32, u64);
+
+/// Routed referrers awaiting their values, with the leaf bytes resolving
+/// them peaks at
+struct ReplayBatch {
+    rows: Vec<ReplayRow>,
+    /// Leaf permit bytes: what the round's values retain plus its largest
+    /// decompression transient
+    need: usize,
+    /// Inline bytes the held tuples already carry
+    resident: usize,
+}
+
+struct ReplayRow {
+    tuple: BackfillTuple,
+    rel: Arc<RelDescriptor>,
+    route: Arc<RouteSnapshot>,
+    pointers: Vec<PointerSite>,
+}
+
+/// Mapped external pointer: its tuple column, its mapping column (the miss
+/// message's target name) and the pointer itself
+struct PointerSite {
+    idx: usize,
+    col: usize,
+    p: ToastPointer,
+}
+
 /// Check only columns routed to ClickHouse
+fn mapped_pointers(tuple: &BackfillTuple, mapping: &TableMapping) -> Vec<PointerSite> {
+    mapping
+        .columns
+        .iter()
+        .enumerate()
+        .filter_map(|(col, c)| {
+            let idx = usize::try_from(c.src_attnum as i32 - 1).ok()?;
+            let Some(ColumnValue::ExternalToast(p)) = tuple.columns.get(idx)? else {
+                return None;
+            };
+            Some(PointerSite { idx, col, p: *p })
+        })
+        .collect()
+}
+
+/// Batch whose values are resolved, holding the leaf permit its rows ride
+struct ResolvedReplayBatch {
+    rows: Vec<ReplayRow>,
+    permit: Option<Arc<crate::budget::MemoryPermit>>,
+}
+
+/// Read one batch and resolve its values; `None` at spool end
+async fn prepare_batch(
+    replay: &mut DeferredReader,
+    routes: &ahash::HashMap<RelName, Arc<RouteSnapshot>>,
+    catalog: &CatalogMap,
+    stats: &EmitterStats,
+    resolver: &ToastResolver,
+) -> Result<Option<ResolvedReplayBatch>, String> {
+    let mut batch = next_batch(replay, routes, catalog, stats, resolver).await?;
+    if batch.rows.is_empty() {
+        return Ok(None);
+    }
+    // One permit per batch: every value a round fetched stays resident
+    // until its row routes, so the rows share what survives
+    let mut leaf = match resolver.budget() {
+        Some(b) => Some(b.acquire(batch.need).await),
+        None => None,
+    };
+    let retained = resolve_batch(&mut batch, resolver).await?;
+    if let Some(p) = leaf.as_mut() {
+        p.shrink(retained as u64);
+    }
+    Ok(Some(ResolvedReplayBatch {
+        rows: batch.rows,
+        permit: leaf.map(Arc::new),
+    }))
+}
+
+/// Route a resolved batch's rows, each under the replay's trailing seq
+async fn route_batch(
+    batch: ResolvedReplayBatch,
+    out: &mut RowBuf,
+    msg_tx: &mpsc::Sender<BatcherMsg>,
+    ack: &AckHandle,
+    first_seq: u64,
+    seq: &mut Option<u64>,
+    placed: &mut u64,
+) -> Result<(), String> {
+    let ResolvedReplayBatch { rows, permit } = batch;
+    for row in rows {
+        let mut tuple = row.tuple;
+        let at = *seq.get_or_insert_with(|| {
+            ack.register(first_seq, tuple.source_lsn);
+            first_seq
+        });
+        render_ext_columns(&row.rel.attributes, &mut tuple.columns);
+        out.push(msg_tx, at, row.rel, row.route, tuple, permit.clone())
+            .await?;
+        *placed += 1;
+    }
+    Ok(())
+}
+
+/// Read referrers until the batch seals or the spool ends, dropping rows no
+/// mapped relation owns. Value caps are checked here, before any fetch
+async fn next_batch(
+    replay: &mut DeferredReader,
+    routes: &ahash::HashMap<RelName, Arc<RouteSnapshot>>,
+    catalog: &CatalogMap,
+    stats: &EmitterStats,
+    resolver: &ToastResolver,
+) -> Result<ReplayBatch, String> {
+    let mut batch = ReplayBatch {
+        rows: Vec::new(),
+        need: 0,
+        resident: 0,
+    };
+    while batch.rows.len() < REPLAY_BATCH_ROWS && batch.need + batch.resident < DECODE_CHUNK_BYTES {
+        let Some(tuple) = replay
+            .next()
+            .await
+            .map_err(|e| format!("bootstrap: deferred spool replay: {e}"))?
+        else {
+            break;
+        };
+        let Some(rel) = catalog.get(tuple.rfn.db_node, tuple.rfn.rel_node) else {
+            stats.unsupported_relations.fetch_add(1, Ordering::Relaxed);
+            continue;
+        };
+        let Some(route) = routes.get(&rel.rel_name).cloned() else {
+            stats.unsupported_relations.fetch_add(1, Ordering::Relaxed);
+            continue;
+        };
+        let pointers = mapped_pointers(&tuple, &route.mapping);
+        batch.need += check_value_caps(
+            pointers.iter().map(|site| site.p),
+            resolver.inline_value_max(),
+        )
+        .map_err(|e| format!("bootstrap: {e}"))?;
+        batch.resident += crate::backfill::spool::approx_bytes(&tuple);
+        batch.rows.push(ReplayRow {
+            tuple,
+            rel,
+            route,
+            pointers,
+        });
+    }
+    Ok(batch)
+}
+
+/// Fetch the batch's values, one round trip per mirror and bound, then
+/// detoast every referrer's columns. Returns the bytes the rows retain
+async fn resolve_batch(batch: &mut ReplayBatch, resolver: &ToastResolver) -> Result<usize, String> {
+    let mut values = fetch_batch_values(batch, resolver).await?;
+    let mut retained = 0usize;
+    for ReplayRow {
+        tuple,
+        rel,
+        route,
+        pointers,
+    } in &mut batch.rows
+    {
+        for site in pointers.iter() {
+            let key = (site.p.va_toastrelid, site.p.va_valueid, tuple.source_lsn);
+            let fetched = values.take(key);
+            let type_oid = rel.attributes.get(site.idx).map_or(0, |a| a.type_oid);
+            let target = &route.mapping.columns[site.col].target_name;
+            let (column, bytes) = apply_fetched(fetched, &site.p, type_oid, rel, target, resolver)?;
+            retained += bytes;
+            tuple.columns[site.idx] = Some(column);
+        }
+    }
+    Ok(retained)
+}
+
+/// A batch's values, with how many referrers each one still owes
+struct FetchedValues {
+    /// `None` without store: nothing to consult, every referrer fills
+    values: Option<HashMap<ValueKey, FetchedValue>>,
+    uses: HashMap<ValueKey, u32>,
+}
+
+impl FetchedValues {
+    /// Last referrer of a value takes its bytes, earlier ones copy
+    fn take(&mut self, key: ValueKey) -> Option<FetchedValue> {
+        let left = self.uses.get_mut(&key)?;
+        *left -= 1;
+        let values = self.values.as_mut()?;
+        if *left == 0 {
+            values.remove(&key)
+        } else {
+            values.get(&key).cloned()
+        }
+    }
+}
+
+/// Distinct values a batch needs, fetched per mirror and bound
+async fn fetch_batch_values(
+    batch: &ReplayBatch,
+    resolver: &ToastResolver,
+) -> Result<FetchedValues, String> {
+    let mut uses: HashMap<ValueKey, u32> = HashMap::new();
+    let mut wanted: HashMap<(u32, u64), Vec<(u32, usize)>> = HashMap::new();
+    for row in &batch.rows {
+        let bound = row.tuple.source_lsn;
+        for site in &row.pointers {
+            let key = (site.p.va_toastrelid, site.p.va_valueid, bound);
+            let seen = uses.entry(key).or_default();
+            *seen += 1;
+            if *seen == 1 {
+                wanted
+                    .entry((key.0, bound))
+                    .or_default()
+                    .push((key.1, pointer_extsize(&site.p)));
+            }
+        }
+    }
+    let mut values = HashMap::with_capacity(uses.len());
+    for ((toast_relid, bound), batch) in wanted {
+        let Some(got) = resolver
+            .fetch_values(toast_relid, &batch, bound)
+            .await
+            .map_err(|e| format!("bootstrap: toast store fetch: {e}"))?
+        else {
+            return Ok(FetchedValues { values: None, uses });
+        };
+        for ((value_id, _), value) in batch.iter().zip(got) {
+            values.insert((toast_relid, *value_id, bound), value);
+        }
+    }
+    Ok(FetchedValues {
+        values: Some(values),
+        uses,
+    })
+}
+
+/// Turn one fetch outcome into the column its row routes, counting fills.
+/// Returns the bytes the column retains
+fn apply_fetched(
+    fetched: Option<FetchedValue>,
+    p: &ToastPointer,
+    type_oid: u32,
+    rel: &RelDescriptor,
+    target: &str,
+    resolver: &ToastResolver,
+) -> Result<(ColumnValue, usize), String> {
+    match fetched {
+        Some(FetchedValue::Assembled(stored)) => {
+            let raw = finish_value(p, stored).map_err(|e| e.to_string())?;
+            let retained = raw.len();
+            Ok((detoasted_value(raw, type_oid), retained))
+        }
+        None => {
+            resolver.note_filled_default();
+            Ok((ColumnValue::Null, 0))
+        }
+        // No superseding version can precede deferred resolution: the
+        // walk put these chunks moments earlier, a miss is a bug
+        Some(outcome) => {
+            resolver.note_fetch_miss();
+            let extsize = pointer_extsize(p);
+            let detail = match outcome {
+                FetchedValue::Mismatch { got } => {
+                    format!("chunks sum to {got} bytes, pointer says {extsize}")
+                }
+                _ => "has no chunks in the store".into(),
+            };
+            Err(format!(
+                "bootstrap: relation {} column {target} value_id={} on toast relid={}: \
+                 {detail}; remedy: fresher backup, or initial_load='copy'",
+                rel.rel_name, p.va_valueid, p.va_toastrelid
+            ))
+        }
+    }
+}
+
 /// Resolve mapped TOAST pointers or fill in disabled mode. Value cap
 /// checked before any fetch; the returned leaf permit is shrunk to the
 /// retained decoded bytes and rides the routed row to insert ack
@@ -419,67 +700,32 @@ async fn resolve_or_fill_toast(
     mapping: &TableMapping,
     resolver: &ToastResolver,
 ) -> Result<Option<crate::budget::MemoryPermit>, String> {
-    let mut pointers: Vec<ToastPointer> = Vec::new();
-    for c in &mapping.columns {
-        let Some(Some(ColumnValue::ExternalToast(p))) = usize::try_from(c.src_attnum as i32 - 1)
-            .ok()
-            .and_then(|idx| tuple.columns.get(idx))
-        else {
-            continue;
-        };
-        pointers.push(*p);
-    }
-    if pointers.is_empty() {
+    let sites = mapped_pointers(tuple, mapping);
+    if sites.is_empty() {
         return Ok(None);
     }
-    let need = check_value_caps(&pointers, resolver.inline_value_max())
+    let need = check_value_caps(sites.iter().map(|site| site.p), resolver.inline_value_max())
         .map_err(|e| format!("bootstrap: {e}"))?;
     let mut leaf = match resolver.budget() {
         Some(b) => Some(b.acquire(need).await),
         None => None,
     };
     let mut retained = 0usize;
-    for c in &mapping.columns {
-        let Ok(idx) = usize::try_from(c.src_attnum as i32 - 1) else {
-            continue;
-        };
-        let Some(Some(ColumnValue::ExternalToast(p))) = tuple.columns.get(idx) else {
-            continue;
-        };
-        let p = *p;
-        let type_oid = rel.attributes.get(idx).map(|a| a.type_oid).unwrap_or(0);
-        let extsize = pointer_extsize(&p);
+    for site in &sites {
+        let type_oid = rel.attributes.get(site.idx).map_or(0, |a| a.type_oid);
         let fetched = resolver
-            .fetch_value(p.va_toastrelid, p.va_valueid, tuple.source_lsn, extsize)
+            .fetch_value(
+                site.p.va_toastrelid,
+                site.p.va_valueid,
+                tuple.source_lsn,
+                pointer_extsize(&site.p),
+            )
             .await
             .map_err(|e| format!("bootstrap: toast store fetch: {e}"))?;
-        match fetched {
-            Some(FetchedValue::Assembled(stored)) => {
-                let raw = finish_value(&p, stored).map_err(|e| e.to_string())?;
-                retained += raw.len();
-                tuple.columns[idx] = Some(detoasted_value(raw, type_oid));
-            }
-            None => {
-                resolver.note_filled_default();
-                tuple.columns[idx] = Some(ColumnValue::Null);
-            }
-            // No superseding version can precede deferred resolution: the
-            // walk put these chunks moments earlier, a miss is a bug
-            Some(outcome) => {
-                resolver.note_fetch_miss();
-                let detail = match outcome {
-                    FetchedValue::Mismatch { got } => {
-                        format!("chunks sum to {got} bytes, pointer says {extsize}")
-                    }
-                    _ => "has no chunks in the store".into(),
-                };
-                return Err(format!(
-                    "bootstrap: relation {} column {} value_id={} on toast relid={}: \
-                     {detail}; remedy: fresher backup, or initial_load='copy'",
-                    rel.rel_name, c.target_name, p.va_valueid, p.va_toastrelid
-                ));
-            }
-        }
+        let target = &mapping.columns[site.col].target_name;
+        let (column, bytes) = apply_fetched(fetched, &site.p, type_oid, rel, target, resolver)?;
+        retained += bytes;
+        tuple.columns[site.idx] = Some(column);
     }
     if let Some(p) = leaf.as_mut() {
         p.shrink(retained as u64);
@@ -1193,6 +1439,185 @@ mod tests {
         assert_eq!(rows.len(), 1);
         let cols = &rows[0].committed.decoded.new.as_ref().unwrap().columns;
         assert_eq!(cols[0], Some(ColumnValue::Bytea(b"hello".to_vec())));
+        drop(ack);
+        collector.await.unwrap();
+    }
+
+    /// Replay order survives the batch boundary: batch N+1 resolves while
+    /// batch N routes, so a late batch must not overtake an early one
+    #[tokio::test]
+    async fn deferred_replay_keeps_order_across_batches() {
+        let rows = REPLAY_BATCH_ROWS + 1;
+        let mut catalog = CatalogMap::new();
+        catalog.insert(bytea_rel(16400));
+        catalog.insert(toast_rel(16500));
+        let mut tables = HashMap::new();
+        tables.insert(RelName::new("public", "t16400"), bytea_mapping_for(16400));
+        let mapping = Arc::new(tables);
+
+        let (ack, collector) = ack::spawn(Arc::new(crate::pos::Monotone::new(0)));
+        let (msg_tx, mut msg_rx) = mpsc::channel::<BatcherMsg>(64);
+        let (tup_tx, tup_rx) = mpsc::channel::<Vec<BackfillTuple>>(4);
+        let spool_tmp = tempfile::tempdir().unwrap();
+
+        // `bytea_toast_tuple` pins extsize at 5, so every body is 5 bytes
+        let bodies: Vec<Vec<u8>> = (0..rows).map(|i| format!("{i:05}").into_bytes()).collect();
+        let chunks = bodies
+            .iter()
+            .enumerate()
+            .map(|(i, body)| {
+                let mut t = toast_chunk_tuple(16500, i as u32 + 1, 0, body);
+                t.blkno = i as u32;
+                t.offnum = 1;
+                t
+            })
+            .collect();
+        tup_tx.send(chunks).await.unwrap();
+        let referrers = (0..rows)
+            .map(|i| bytea_toast_tuple(16400, 16500, i as u32 + 1))
+            .collect();
+        tup_tx.send(referrers).await.unwrap();
+        drop(tup_tx);
+
+        let stats = Arc::new(EmitterStats::default());
+        let drain_task = tokio::spawn(drain(
+            tup_rx,
+            catalog,
+            mapping,
+            msg_tx,
+            ack.clone(),
+            stats.clone(),
+            ToastResolver::with_store(Arc::new(MemChunkStore::new()), stats.clone()),
+            Deferral::Local(DeferredSpool::new(
+                spool_tmp.path().join("bootstrap_deferred.bin"),
+                0,
+            )),
+            Default::default(),
+            None,
+            HashSet::new(),
+        ));
+
+        let routed = collect_rows(&mut msg_rx).await;
+        let outcome = drain_task.await.unwrap().unwrap();
+        assert_eq!(outcome.rows_routed as usize, rows);
+        let got: Vec<_> = routed
+            .iter()
+            .map(|r| r.committed.decoded.new.as_ref().unwrap().columns[0].clone())
+            .collect();
+        let want: Vec<_> = bodies
+            .into_iter()
+            .map(|b| Some(ColumnValue::Bytea(b)))
+            .collect();
+        assert_eq!(got, want, "replay order kept across the batch boundary");
+        assert_eq!(
+            stats.toast_value_fetch_batches.load(Ordering::Relaxed),
+            2,
+            "row cap sealed a second batch, one round trip each",
+        );
+        drop(ack);
+        collector.await.unwrap();
+    }
+
+    /// One round trip per mirror resolves a whole batch, distinct values
+    /// fetched once however many referrers share them, rows routed in
+    /// replay order
+    #[tokio::test]
+    async fn deferred_replay_fetches_once_per_mirror() {
+        /// `toast_chunk_tuple` pins one TID; a mirror needs its rows apart
+        fn chunk_at(value_id: u32, body: &[u8], tid: (u32, u16), rel_node: u32) -> BackfillTuple {
+            let mut t = toast_chunk_tuple(rel_node, value_id, 0, body);
+            t.blkno = tid.0;
+            t.offnum = tid.1;
+            t
+        }
+
+        let mut catalog = CatalogMap::new();
+        catalog.insert(bytea_rel(16400));
+        catalog.insert(bytea_rel(16401));
+        catalog.insert(toast_rel(16500));
+        catalog.insert(toast_rel(16600));
+        let mut tables = HashMap::new();
+        tables.insert(RelName::new("public", "t16400"), bytea_mapping_for(16400));
+        tables.insert(RelName::new("public", "t16401"), bytea_mapping_for(16401));
+        let mapping = Arc::new(tables);
+
+        let (ack, collector) = ack::spawn(Arc::new(crate::pos::Monotone::new(0)));
+        let (msg_tx, mut msg_rx) = mpsc::channel::<BatcherMsg>(64);
+        let (tup_tx, tup_rx) = mpsc::channel::<Vec<BackfillTuple>>(64);
+        let spool_tmp = tempfile::tempdir().unwrap();
+
+        tup_tx
+            .send(vec![
+                chunk_at(1, b"hello", (1, 1), 16500),
+                chunk_at(2, b"world", (1, 2), 16500),
+            ])
+            .await
+            .unwrap();
+        tup_tx
+            .send(vec![chunk_at(3, b"there", (1, 1), 16600)])
+            .await
+            .unwrap();
+        // Value 1 referred to twice: an UPDATE leaves the pointer alone
+        tup_tx
+            .send(vec![
+                bytea_toast_tuple(16400, 16500, 1),
+                bytea_toast_tuple(16400, 16500, 1),
+                bytea_toast_tuple(16400, 16500, 2),
+            ])
+            .await
+            .unwrap();
+        tup_tx
+            .send(vec![bytea_toast_tuple(16401, 16600, 3)])
+            .await
+            .unwrap();
+        drop(tup_tx);
+
+        let stats = Arc::new(EmitterStats::default());
+        let drain_task = tokio::spawn(drain(
+            tup_rx,
+            catalog,
+            mapping,
+            msg_tx,
+            ack.clone(),
+            stats.clone(),
+            ToastResolver::with_store(Arc::new(MemChunkStore::new()), stats.clone()),
+            Deferral::Local(DeferredSpool::new(
+                spool_tmp.path().join("bootstrap_deferred.bin"),
+                0,
+            )),
+            Default::default(),
+            None,
+            HashSet::new(),
+        ));
+
+        let rows = collect_rows(&mut msg_rx).await;
+        let outcome = drain_task.await.unwrap().unwrap();
+        assert_eq!(outcome.rows_routed, 4);
+        let bodies: Vec<_> = rows
+            .iter()
+            .map(|r| r.committed.decoded.new.as_ref().unwrap().columns[0].clone())
+            .collect();
+        assert_eq!(
+            bodies,
+            [b"hello", b"hello", b"world", b"there"]
+                .map(|b| Some(ColumnValue::Bytea(b.to_vec())))
+                .to_vec(),
+            "replay order kept, shared value resolved for both referrers",
+        );
+        assert!(
+            rows.iter().all(|r| r.seq == rows[0].seq),
+            "one trailing seq for the replay",
+        );
+        assert_eq!(
+            stats.toast_value_fetch_batches.load(Ordering::Relaxed),
+            2,
+            "one round trip per mirror, not per referrer",
+        );
+        assert_eq!(
+            stats.toast_values_fetched.load(Ordering::Relaxed),
+            3,
+            "distinct values fetched once each",
+        );
         drop(ack);
         collector.await.unwrap();
     }

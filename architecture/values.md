@@ -17,6 +17,10 @@ location, with record LSN as version. Lookup is bounded by referring record's
 position so later chunk reuse cannot automatically replace an earlier value
 Reconstruction validates sequence and expected size before decompression
 
+One lookup covers many values of one mirror at one bound, which is how deferred
+bootstrap referrers resolve: per-value as-of aggregation is unchanged, wide
+batches split at a fixed width, and splits run across store connections
+
 Destination merges can remove old chunk versions. Current miss handling relies
 on supersession by later main-row versions; it does not authorize filling values
 when an entire required mirror is missing. Bootstrap visibility and reused
