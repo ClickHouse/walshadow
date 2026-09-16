@@ -17,7 +17,7 @@
 use std::path::PathBuf;
 
 use tokio::fs::{File, OpenOptions};
-use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader};
 
 use crate::backfill::backup_page_walk::BackfillTuple;
 use crate::xact::spill::{
@@ -136,6 +136,43 @@ impl DeferredSpool {
         Ok(())
     }
 
+    /// Unlike the xact spill's disposable contract, a bootstrap gate spool
+    /// outlives a crash: the tuples in it came from backup pages nothing can
+    /// re-read, so a resumed load replays them instead of the whole backup
+    pub async fn checkpoint(&mut self) -> Result<()> {
+        if self.file.is_none() {
+            if self.mem.is_empty() {
+                return Ok(());
+            }
+            self.create_and_flush_prefix().await?;
+        }
+        self.flush_buf().await?;
+        let file = self.file.as_mut().expect("file after prefix flush");
+        file.flush().await?;
+        file.sync_data().await?;
+        Ok(())
+    }
+
+    /// Reopen a checkpointed spool for further appends, discarding a record
+    /// a crash left half-written
+    pub async fn reopen(path: PathBuf, mem_max: usize) -> Result<Self> {
+        let (valid_len, records) = complete_prefix(&path).await?;
+        let file = OpenOptions::new().write(true).open(&path).await?;
+        file.set_len(valid_len).await?;
+        let mut file = file;
+        file.seek(std::io::SeekFrom::Start(valid_len)).await?;
+        Ok(Self {
+            mem: Vec::new(),
+            mem_bytes: 0,
+            mem_max,
+            path,
+            file: Some(file),
+            buf: Vec::new(),
+            records,
+            spooled_bytes: valid_len.saturating_sub(4),
+        })
+    }
+
     /// Seal writes, hand back a sequential reader
     pub async fn into_reader(mut self) -> Result<DeferredReader> {
         let src = match self.file.take() {
@@ -166,6 +203,30 @@ impl DeferredSpool {
 }
 
 /// Open a spool file and validate its header
+async fn complete_prefix(path: &std::path::Path) -> Result<(u64, u64)> {
+    let total = tokio::fs::metadata(path).await?.len();
+    let mut reader = open_validated(path).await?;
+    let mut offset = 4u64;
+    let mut records = 0u64;
+    let mut len = [0u8; 4];
+    while offset + 4 <= total {
+        if reader.read_exact(&mut len).await.is_err() {
+            break;
+        }
+        let body = u64::from(u32::from_le_bytes(len));
+        if offset + 4 + body > total {
+            break;
+        }
+        let mut skip = vec![0u8; body as usize];
+        if reader.read_exact(&mut skip).await.is_err() {
+            break;
+        }
+        offset += 4 + body;
+        records += 1;
+    }
+    Ok((offset, records))
+}
+
 async fn open_validated(path: &std::path::Path) -> Result<BufReader<File>> {
     let mut reader = BufReader::new(File::open(path).await?);
     let mut header = [0u8; 4];
@@ -348,6 +409,82 @@ mod tests {
                 Some(ColumnValue::Bytea(payload.to_vec())),
             ],
         }
+    }
+
+    #[tokio::test]
+    async fn checkpoint_then_reopen_keeps_every_record() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("gate.bin");
+        let mut spool = DeferredSpool::new(path.clone(), 0);
+        for i in 0..4 {
+            spool.push(tuple(i, b"before")).await.unwrap();
+        }
+        spool.checkpoint().await.unwrap();
+        drop(spool);
+
+        let mut spool = DeferredSpool::reopen(path.clone(), 0).await.unwrap();
+        assert_eq!(spool.records(), 4);
+        spool.push(tuple(4, b"after")).await.unwrap();
+        spool.checkpoint().await.unwrap();
+
+        let all = drain_all(spool).await;
+        assert_eq!(all.len(), 5);
+        assert_eq!(all[0].source_lsn, 0);
+        assert_eq!(all[4].source_lsn, 4);
+    }
+
+    /// A crash mid-append leaves a record whose body never landed; replay
+    /// has to drop it rather than fail the resumed load
+    #[tokio::test]
+    async fn reopen_truncates_a_half_written_record() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("gate.bin");
+        let mut spool = DeferredSpool::new(path.clone(), 0);
+        spool.push(tuple(1, b"whole")).await.unwrap();
+        spool.checkpoint().await.unwrap();
+        let sealed = tokio::fs::metadata(&path).await.unwrap().len();
+        drop(spool);
+
+        let mut torn = tokio::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .await
+            .unwrap();
+        torn.write_all(&99u32.to_le_bytes()).await.unwrap();
+        torn.write_all(b"only-a-few").await.unwrap();
+        torn.flush().await.unwrap();
+        drop(torn);
+
+        let spool = DeferredSpool::reopen(path.clone(), 0).await.unwrap();
+        assert_eq!(spool.records(), 1);
+        assert_eq!(tokio::fs::metadata(&path).await.unwrap().len(), sealed);
+        let all = drain_all(spool).await;
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].source_lsn, 1);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_forces_an_in_memory_prefix_to_disk() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("gate.bin");
+        let mut spool = DeferredSpool::new(path.clone(), DEFERRED_SPOOL_MEM_MAX);
+        spool.push(tuple(7, b"resident")).await.unwrap();
+        assert!(!path.exists(), "small spool stays in memory until forced");
+        spool.checkpoint().await.unwrap();
+        drop(spool);
+
+        let spool = DeferredSpool::reopen(path.clone(), 0).await.unwrap();
+        assert_eq!(spool.records(), 1);
+        assert_eq!(drain_all(spool).await[0].source_lsn, 7);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_on_an_empty_spool_writes_nothing() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("gate.bin");
+        let mut spool = DeferredSpool::new(path.clone(), DEFERRED_SPOOL_MEM_MAX);
+        spool.checkpoint().await.unwrap();
+        assert!(!path.exists());
     }
 
     async fn drain_all(spool: DeferredSpool) -> Vec<BackfillTuple> {

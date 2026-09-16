@@ -1,6 +1,8 @@
-use std::path::Path;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use tokio::io::AsyncWriteExt;
 
 use crate::ch_emitter::BootstrapMode;
 
@@ -128,6 +130,57 @@ pub async fn begin_attempt(
     );
     marker.write(data_dir).await?;
     Ok(marker)
+}
+
+pub const LEDGER_FILENAME: &str = "walshadow_bootstrap.parts";
+
+#[derive(Debug, Default)]
+pub struct PartLedger {
+    path: PathBuf,
+    landed: HashSet<String>,
+}
+
+impl PartLedger {
+    pub fn open(dir: &Path) -> Self {
+        let path = dir.join(LEDGER_FILENAME);
+        let landed = std::fs::read_to_string(&path)
+            .map(|raw| {
+                raw.split_inclusive('\n')
+                    .filter_map(|line| line.strip_suffix('\n'))
+                    .filter(|line| !line.is_empty())
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default();
+        Self { path, landed }
+    }
+
+    pub fn contains(&self, key: &str) -> bool {
+        self.landed.contains(key)
+    }
+
+    pub fn len(&self) -> usize {
+        self.landed.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.landed.is_empty()
+    }
+
+    pub async fn record(&self, key: &str) -> Result<()> {
+        let mut f = tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .await
+            .with_context(|| format!("open {}", self.path.display()))?;
+        f.write_all(format!("{key}\n").as_bytes())
+            .await
+            .with_context(|| format!("append {}", self.path.display()))?;
+        f.sync_data()
+            .await
+            .with_context(|| format!("fsync {}", self.path.display()))
+    }
 }
 
 pub async fn discard_partial(data_dir: &Path, spill_dir: &Path) -> Result<()> {
@@ -344,6 +397,43 @@ mod tests {
         assert!(!data_dir.join("PG_VERSION").exists());
         assert!(!spool.exists());
         assert_eq!(BootstrapMarker::read(&data_dir), Some(second));
+    }
+
+    #[tokio::test]
+    async fn ledger_records_survive_a_reopen() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ledger = PartLedger::open(tmp.path());
+        assert!(ledger.is_empty());
+        ledger
+            .record("base_x/tar_partitions/part_001.tar.lz4")
+            .await
+            .unwrap();
+        ledger
+            .record("base_x/tar_partitions/part_002.tar.lz4")
+            .await
+            .unwrap();
+
+        let back = PartLedger::open(tmp.path());
+        assert_eq!(back.len(), 2);
+        assert!(back.contains("base_x/tar_partitions/part_001.tar.lz4"));
+        assert!(!back.contains("base_x/tar_partitions/part_003.tar.lz4"));
+    }
+
+    /// A crash mid-append leaves a line with no terminator; it names a part
+    /// whose files may be torn, so it must not count as landed
+    #[tokio::test]
+    async fn ledger_drops_a_torn_trailing_record() {
+        let tmp = tempfile::tempdir().unwrap();
+        tokio::fs::write(
+            tmp.path().join(LEDGER_FILENAME),
+            b"part_001.tar\npart_002.tar\npart_00",
+        )
+        .await
+        .unwrap();
+        let ledger = PartLedger::open(tmp.path());
+        assert_eq!(ledger.len(), 2);
+        assert!(ledger.contains("part_002.tar"));
+        assert!(!ledger.contains("part_00"));
     }
 
     #[tokio::test]
