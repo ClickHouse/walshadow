@@ -4332,7 +4332,7 @@ async fn run_bootstrap(
     );
 
     type WalHydrate = (walrus::config::Settings, walrus::storage::DynStorage);
-    let (source, wal_hydrate): (Box<dyn BackupSource>, Option<WalHydrate>) = match plan.mode {
+    let (source, mut wal_hydrate): (Box<dyn BackupSource>, Option<WalHydrate>) = match plan.mode {
         BootstrapMode::Direct => {
             let hydrate = if args.bootstrap_wal_from_archive {
                 let settings = ch_config.as_ref().and_then(|c| c.backup.clone()).context(
@@ -4550,17 +4550,18 @@ async fn run_bootstrap(
     let (rx, pump) = spawn_greenfield_bootstrap(cfg, source, catalog_map, store_toast);
     let pump = tokio_util::task::AbortOnDropHandle::new(pump);
 
-    let mut window_cfg: Option<walshadow::backfill::bootstrap_window::WindowLegConfig> = None;
     // Overlay window transaction outcomes on backup pg_xact
     let window_patch = Arc::new(std::sync::Mutex::new(PgXactPatch::new()));
     // Metrics-only mode has no pending gate
     let mut pending_gate: Option<PendingGate> = None;
     // Preserve live failure if file fallback also fails
     let mut window_leg_error: Option<anyhow::Error> = None;
+    // Only a live leg borrowed the feed
+    let mut live_leg_ran = false;
     let window_scratch = args.spill_dir.join("bootstrap_window");
     tokio::fs::remove_dir_all(&window_scratch).await.ok();
 
-    let (shipped, outcome, mut window) = if let Some(target) = ch_target {
+    let (shipped, outcome, window) = if let Some(target) = ch_target {
         let (emitter_cfg, mapping, resolved, skip_initial) = target;
         // Route bootstrap rows through the shared insert tail. Bootstrap
         // is the easy case: every row op=Insert at _lsn = start_lsn, no
@@ -4612,7 +4613,7 @@ async fn run_bootstrap(
         );
 
         // Run WAL window beside page walk when user relations exist
-        window_cfg = (!drain_catalog.is_empty()).then(|| {
+        let mut window_cfg = (!drain_catalog.is_empty()).then(|| {
             walshadow::backfill::bootstrap_window::WindowLegConfig {
                 emitter: emitter_cfg.clone(),
                 mapping: mapping.clone(),
@@ -4749,7 +4750,8 @@ async fn run_bootstrap(
             // Retry failed live read from landed WAL
             let window = match leg_res {
                 Ok(w) => {
-                    if w.is_some() {
+                    live_leg_ran = w.is_some();
+                    if live_leg_ran {
                         window_cfg = None;
                     }
                     w
@@ -4767,7 +4769,7 @@ async fn run_bootstrap(
             };
             Ok((gate_stats, gate_spool, drain_outcome, outcome, window))
         })();
-        let (gate_stats, gate_spool, mut drain_outcome, outcome, window) = match prepared {
+        let (gate_stats, gate_spool, mut drain_outcome, outcome, mut window) = match prepared {
             Ok(prepared) => prepared,
             Err(e) => {
                 for tail in tails {
@@ -4776,6 +4778,57 @@ async fn run_bootstrap(
                 return Err(fatal.message().map(anyhow::Error::msg).unwrap_or(e));
             }
         };
+
+        // Deferred referrers resolve out of the chunk store, so every window
+        // record has to be in it first. A live leg joined above; a leg over
+        // the WAL the backup landed replays here, before the tails close
+        if let Some(mut cfg) = window_cfg {
+            cfg.timeline = outcome.start.timeline;
+            let replayed = async {
+                if let Some((settings, storage)) = wal_hydrate.take() {
+                    fetch_wal_into_pg_wal(
+                        &settings,
+                        storage,
+                        &shadow_data_dir,
+                        outcome.start.start_lsn,
+                        outcome.end.end_lsn,
+                        outcome.start.timeline,
+                    )
+                    .await
+                    .context("bootstrap: hydrate shadow pg_wal from object store")?;
+                }
+                let segments = walshadow::backfill::bootstrap_window::segments_in_dir(
+                    &shadow_data_dir.join("pg_wal"),
+                    outcome.start.timeline,
+                    outcome.start.start_lsn,
+                    outcome.end.end_lsn,
+                )
+                .await?;
+                walshadow::backfill::bootstrap_window::replay_segments(
+                    cfg,
+                    &segments,
+                    outcome.start.start_lsn,
+                    outcome.end.end_lsn,
+                )
+                .await
+            }
+            .await;
+            match replayed {
+                Ok(w) => window = Some(w),
+                Err(e) => {
+                    for tail in tails {
+                        tail.quiesce().await;
+                    }
+                    let e = match &window_leg_error {
+                        Some(live) => {
+                            e.context(format!("after the live window leg failed: {live:#}"))
+                        }
+                        None => e.context("bootstrap: backup-window WAL leg"),
+                    };
+                    return Err(fatal.message().map(anyhow::Error::msg).unwrap_or(e));
+                }
+            }
+        }
 
         // Referrers the lanes handed back. One lane reaching its end proves
         // nothing about a sibling's chunk puts, so resolution waits for all
@@ -4843,7 +4896,7 @@ async fn run_bootstrap(
     };
 
     // Replace live-leg COPY connection and recheck source identity
-    if window.is_some() || window_leg_error.is_some() {
+    if live_leg_ran || window_leg_error.is_some() {
         *feed = SourceFeed::connect(src_cfg)
             .await
             .with_context(|| {
@@ -4908,32 +4961,6 @@ async fn run_bootstrap(
         .context("bootstrap: hydrate shadow pg_wal from object store")?;
     }
 
-    // Replay hydrated or fallback window from shadow pg_wal
-    if let Some(mut cfg) = window_cfg {
-        cfg.timeline = outcome.start.timeline;
-        let pg_wal = shadow_data_dir.join("pg_wal");
-        let replayed = async {
-            let segments = walshadow::backfill::bootstrap_window::segments_in_dir(
-                &pg_wal,
-                outcome.start.timeline,
-                outcome.start.start_lsn,
-                outcome.end.end_lsn,
-            )
-            .await?;
-            walshadow::backfill::bootstrap_window::replay_segments(
-                cfg,
-                &segments,
-                outcome.start.start_lsn,
-                outcome.end.end_lsn,
-            )
-            .await
-        }
-        .await;
-        window = Some(replayed.map_err(|e| match window_leg_error {
-            Some(live) => e.context(format!("after the live window leg failed: {live:#}")),
-            None => e.context("bootstrap: backup-window WAL leg"),
-        })?);
-    }
     let open_floor = window.and_then(|w| w.open_floor);
     if let Some(w) = window {
         tracing::info!(

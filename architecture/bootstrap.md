@@ -20,11 +20,11 @@ and spill constrain memory while backup and insertion proceed independently
 Shadow is not ready during this phase. A temporary PostgreSQL instance built
 from source schema converts values that need PostgreSQL's type machinery
 
-Rows carrying external values wait for the chunk mirror the same walk writes.
-Walk lanes finish independently, so resolution starts once every lane flushed
-its chunks. Window WAL page images refill chunks a page copied mid-write lost,
-every tuple the image carries and not only the one its record names. A value
-the mirror cannot reassemble stops the load rather than substituting one
+Rows carrying external values wait for the chunk mirror the walk and the window
+leg write. Window page images refill chunks a page copied mid-write lost, every
+tuple an image carries and not only the one its record names, so resolution
+waits for both every walk lane and the window leg. A value the mirror cannot
+reassemble stops the load rather than substituting one
 
 Rows written before backup redo can remain undecided after handoff. Retain them
 in pending tables beside destinations until commit or abort decides visibility.

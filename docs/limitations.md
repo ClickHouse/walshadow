@@ -63,8 +63,8 @@ request per insert batch
   `walshadow_pending_undecidable_xids` alongside `walshadow_pending_outstanding_xids`
 - backup rows with mapped external TOAST values render from walked chunk mirrors
   without source SQL scans. They spool to bootstrap scratch until every walk
-  lane flushed its chunks; inline values and unmapped
-  external columns need no wait
+  lane flushed its chunks and the backup-window leg replayed; inline values and
+  unmapped external columns need no wait
 - restored TOAST page images in backup-window WAL mirror every chunk they
   carry, repairing pages the backup copied mid-write. They date from the page's
   own version, so walked chunks never outrank them
