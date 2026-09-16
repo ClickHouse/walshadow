@@ -2024,6 +2024,8 @@ async fn run_session(
         backup: backup_settings.as_ref(),
         spill_dir: &args.spill_dir,
         floor: &resume_floor,
+        metrics: &metrics,
+        emitter_ack: &emitter_ack,
     };
     if let Err(e) = feed
         .start_physical_replication(
@@ -4086,6 +4088,48 @@ struct SourceRecovery<'a> {
     /// Published resume floor, which is what a slot on the far end has to still
     /// reach — the reconnect's own `resume_lsn` sits above it
     floor: &'a Monotone<Floor>,
+    metrics: &'a MetricsRegistry,
+    emitter_ack: &'a Monotone<EmitterAck>,
+}
+
+struct ArchiveLegProgress {
+    start_lsn: u64,
+    started: Instant,
+    segments: u64,
+    published: u64,
+    window_start: Instant,
+    window_lsn: u64,
+}
+
+impl ArchiveLegProgress {
+    fn new(start_lsn: u64) -> Self {
+        let now = Instant::now();
+        Self {
+            start_lsn,
+            started: now,
+            segments: 0,
+            published: 0,
+            window_start: now,
+            window_lsn: start_lsn,
+        }
+    }
+
+    fn take_unpublished(&mut self) -> u64 {
+        let fresh = self.segments - self.published;
+        self.published = self.segments;
+        fresh
+    }
+
+    fn report_due(&mut self, interval: Duration, lsn: u64) -> Option<f64> {
+        let elapsed = self.window_start.elapsed();
+        if elapsed < interval {
+            return None;
+        }
+        let bytes = lsn.saturating_sub(self.window_lsn) as f64;
+        self.window_start = Instant::now();
+        self.window_lsn = lsn;
+        Some(bytes / elapsed.as_secs_f64() / (1024.0 * 1024.0))
+    }
 }
 
 impl SourceRecovery<'_> {
@@ -4163,6 +4207,9 @@ impl SourceRecovery<'_> {
             }
         };
         let seg_dir = self.spill_dir.join("resume_wal");
+        let mut progress = ArchiveLegProgress::new(resume_lsn.get());
+        self.publish_archive_leg(&mut progress, resume_lsn, true)
+            .await;
 
         loop {
             let archive_segment = fetch_archive_segment(
@@ -4177,10 +4224,15 @@ impl SourceRecovery<'_> {
                 Ok(segment) => segment,
                 Err(archive_error) => {
                     let _ = tokio::fs::remove_dir_all(&seg_dir).await;
+                    self.publish_archive_leg(&mut progress, resume_lsn, false)
+                        .await;
                     tracing::info!(
                         target: "walshadow",
                         error = %archive_error,
                         resume_lsn = %resume_lsn,
+                        segments = progress.segments,
+                        replayed_bytes = resume_lsn.get() - progress.start_lsn,
+                        elapsed_secs = progress.started.elapsed().as_secs(),
                         "archive lacks next WAL — switching back to source",
                     );
                     return self
@@ -4199,13 +4251,48 @@ impl SourceRecovery<'_> {
                 .push(resume_lsn.get(), &bytes, record_sink, segment_sink)
                 .await
                 .with_context(|| format!("replay archived WAL {name}"))?;
-            tracing::info!(
+            tracing::debug!(
                 target: "walshadow",
                 segment = name,
                 "restored resume WAL from archive",
             );
             resume_lsn = stream.next_lsn();
+            progress.segments += 1;
+            if let Some(mib_per_sec) = progress.report_due(self.status_interval, resume_lsn.get()) {
+                self.publish_archive_leg(&mut progress, resume_lsn, true)
+                    .await;
+                tracing::info!(
+                    target: "walshadow",
+                    segment = name,
+                    resume_lsn = %resume_lsn,
+                    segments = progress.segments,
+                    mib_per_sec = format!("{mib_per_sec:.1}"),
+                    emitter_ack_lsn = %self.emitter_ack.get(),
+                    "restoring resume WAL from archive",
+                );
+            }
         }
+    }
+
+    async fn publish_archive_leg(
+        &self,
+        progress: &mut ArchiveLegProgress,
+        resume_lsn: Pos<Floor>,
+        active: bool,
+    ) {
+        let fresh_segments = progress.take_unpublished();
+        let lsn = resume_lsn.get();
+        let emitter_ack = self.emitter_ack.get();
+        let floor = self.floor.get();
+        self.metrics
+            .update(move |snap| {
+                snap.archive_wal_segments_total += fresh_segments;
+                snap.archive_restore_active = u64::from(active);
+                snap.filter_lsn = Pos::new(lsn);
+                snap.emitter_ack_lsn = emitter_ack;
+                snap.floor_lsn = floor;
+            })
+            .await;
     }
 
     async fn reconnect_or_operator(
@@ -5539,6 +5626,57 @@ mod tests {
             "/tmp/sock",
         ];
         Args::parse_from(base.iter().copied().chain(argv.iter().copied()))
+    }
+
+    /// The archive leg owns the pump task until the archive runs out, so the
+    /// status loop cannot run and everything it publishes froze for the whole
+    /// leg. Reporting is per `status_interval`, not per 16 MiB segment
+    #[test]
+    fn archive_leg_reports_once_per_status_interval() {
+        let mut progress = ArchiveLegProgress::new(0);
+        let interval = Duration::from_millis(20);
+
+        progress.segments += 1;
+        assert_eq!(progress.report_due(interval, WAL_SEG_SIZE), None);
+        std::thread::sleep(interval);
+        progress.segments += 1;
+        let mib_per_sec = progress
+            .report_due(interval, 2 * WAL_SEG_SIZE)
+            .expect("due once the interval passes");
+        assert!(mib_per_sec > 0.0, "{mib_per_sec}");
+
+        // Window resets, so the next report rates its own bytes, not the leg's
+        assert_eq!(progress.report_due(interval, 2 * WAL_SEG_SIZE), None);
+    }
+
+    #[test]
+    fn archive_leg_publishes_each_segment_once() {
+        let mut progress = ArchiveLegProgress::new(0);
+        assert_eq!(progress.take_unpublished(), 0);
+        progress.segments += 3;
+        assert_eq!(progress.take_unpublished(), 3);
+        assert_eq!(progress.take_unpublished(), 0);
+        progress.segments += 1;
+        assert_eq!(progress.take_unpublished(), 1);
+    }
+
+    /// A partial publish from inside the leg must not blank the fields the
+    /// status loop owns, or the leg would look like a dead pipeline
+    #[tokio::test]
+    async fn metrics_update_keeps_fields_it_does_not_touch() {
+        let registry = MetricsRegistry::new();
+        registry
+            .set(MetricsSnapshot {
+                emitter_rows_total: 17,
+                ..MetricsSnapshot::default()
+            })
+            .await;
+        registry
+            .update(|snap| snap.archive_restore_active = 1)
+            .await;
+        let snap = registry.snapshot().await;
+        assert_eq!(snap.emitter_rows_total, 17);
+        assert_eq!(snap.archive_restore_active, 1);
     }
 
     #[test]

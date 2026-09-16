@@ -334,6 +334,10 @@ snapshot! {
     counter bridge_native_bytes_total: u64 =
         "Native block bytes the bridge returned for ENCODE_NATIVE requests.",
     counter uptime_seconds: u64 = "Seconds since the daemon began its status loop.",
+    counter archive_wal_segments_total: u64 =
+        "WAL segments replayed out of the backup archive because the source could not serve the resume point.",
+    gauge archive_restore_active: u64 =
+        "1 while the pump is inside that archive leg, which owns the pump task for its whole duration, so every other family here holds the value it had when the leg started.",
     counter source_endpoint_swaps_total: u64 =
         "Source feeds swapped onto a reloaded `[source]` endpoint or slot.",
     counter source_endpoint_swap_failures_total: u64 =
@@ -446,6 +450,10 @@ impl MetricsRegistry {
     /// Single writer (status-line loop), so the write lock is uncontended.
     pub async fn set(&self, snap: MetricsSnapshot) {
         *self.inner.write().await = snap;
+    }
+
+    pub async fn update(&self, edit: impl FnOnce(&mut MetricsSnapshot)) {
+        edit(&mut *self.inner.write().await);
     }
 
     pub async fn snapshot(&self) -> MetricsSnapshot {
