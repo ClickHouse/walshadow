@@ -12,7 +12,8 @@
 //! are NOT on disk: is_cidr comes from the column type OID (INETOID vs
 //! CIDROID), addr count is implied by family.
 
-use super::{CodecError, TextBuf};
+use super::CodecError;
+use crate::ascii_buf::AsciiBuf;
 
 pub const PGSQL_AF_INET: u8 = 2;
 pub const PGSQL_AF_INET6: u8 = 3;
@@ -66,8 +67,8 @@ impl InetValue {
     /// PG `inet_out` / `cidr_out`: dotted-quad or colon-hex with optional
     /// `/bits` suffix. `inet` omits suffix when bits == family max; `cidr`
     /// always emits it
-    pub fn to_text(&self) -> TextBuf<48> {
-        let mut out = TextBuf::new();
+    pub fn to_text(&self) -> AsciiBuf<48> {
+        let mut out = AsciiBuf::new();
         match self.family {
             PGSQL_AF_INET => {
                 for (i, octet) in self.addr.iter().take(4).enumerate() {
@@ -95,7 +96,7 @@ impl InetValue {
 
 /// IPv6 matching PG `inet_net_ntop`: RFC 5952 canonical form (lower-case hex,
 /// no per-group leading zeros, `::` collapses longest run of >= 2 zero groups)
-fn write_ipv6<const N: usize>(out: &mut TextBuf<N>, bytes: &[u8]) {
+fn write_ipv6<const N: usize>(out: &mut AsciiBuf<N>, bytes: &[u8]) {
     let Some(addr) = bytes.first_chunk::<16>() else {
         out.push(b'?');
         return;

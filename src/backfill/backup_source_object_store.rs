@@ -297,29 +297,11 @@ mod tests {
             sentinel: BackupSentinelDto {
                 backup_start_lsn: std::num::NonZeroU64::new(0x0300_0000),
                 backup_finish_lsn: std::num::NonZeroU64::new(0x0300_1000),
-                increment_from_lsn: None,
-                increment_from: None,
-                increment_full_name: None,
-                increment_count: None,
-                increment_format: Default::default(),
                 pg_version: 160000,
-                system_identifier: None,
-                uncompressed_size: 0,
-                compressed_size: 0,
-                data_catalog_size: 0,
-                user_data: None,
                 files_metadata_disabled: true,
-                tablespace_spec: None,
-                backup_start_chkp_num: None,
-                increment_from_chkp_num: None,
+                ..Default::default()
             },
-            version: 2,
-            start_time: chrono::Utc::now(),
-            finish_time: chrono::Utc::now(),
-            date_fmt: String::new(),
-            hostname: String::new(),
-            data_dir: String::new(),
-            is_permanent: false,
+            ..Default::default()
         };
         let (start, end) = build_lsn_pair(&resolved, &s).unwrap();
         assert_eq!(start.start_lsn, 0x0300_0000);

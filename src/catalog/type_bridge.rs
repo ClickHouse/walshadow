@@ -41,6 +41,7 @@
 //! text (SQL path). Resolve tier-3 bytes through shadow PG before rendering
 //! `ADD COLUMN` defaults with [`column_value_to_sql_literal`]
 
+use crate::ascii_buf::{AsciiArray, AsciiBuf};
 use crate::decode::codecs::{format_time_us, timetz_to_text};
 use crate::decode::heap_decoder::{self, ColumnValue};
 use crate::schema::{
@@ -48,6 +49,7 @@ use crate::schema::{
     INT2OID, INT4OID, INT8OID, INTERVALOID, JSONBOID, JSONOID, NAMEOID, NUMERICOID, OIDOID,
     RelAttr, TEXTOID, TIMEOID, TIMESTAMPOID, TIMESTAMPTZOID, TIMETZOID, UUIDOID, VARCHAROID,
 };
+use walrus::time::civil_from_days;
 
 /// PG `VARHDRSZ`, 4-byte varlena header, used by `typmod` packing
 const VARHDRSZ: i32 = 4;
@@ -276,20 +278,32 @@ fn format_float(f: f64) -> String {
 
 /// PG `timestamp` / `timestamptz` (PG-epoch microseconds) → CH-parseable ISO
 /// string, up to 6 fractional digits
-fn render_pg_timestamp(pg_micros: i64) -> String {
-    use chrono::{DateTime, TimeZone, Utc};
+fn render_pg_timestamp(pg_micros: i64) -> AsciiBuf<32> {
+    const DAY_US: i64 = 86_400 * 1_000_000;
     let unix_micros = pg_micros.saturating_add(walrus::pg::replication::PG_EPOCH_USEC);
-    let secs = unix_micros.div_euclid(1_000_000);
-    let nanos = (unix_micros.rem_euclid(1_000_000) * 1_000) as u32;
-    let dt: DateTime<Utc> = Utc.timestamp_opt(secs, nanos).single().unwrap_or_else(|| {
-        // Value out of chrono's range; clamp to epoch
-        DateTime::<Utc>::from_timestamp(0, 0).unwrap()
-    });
-    if dt.timestamp_subsec_micros() == 0 {
-        dt.format("%Y-%m-%d %H:%M:%S").to_string()
-    } else {
-        dt.format("%Y-%m-%d %H:%M:%S%.6f").to_string()
+    let (year, month, day) = civil_from_days(unix_micros.div_euclid(DAY_US));
+    let day_us = unix_micros.rem_euclid(DAY_US).unsigned_abs();
+    let mut out = AsciiBuf::new();
+    if year < 0 {
+        out.push(b'-');
     }
+    out.push_uint(year.unsigned_abs(), 4);
+    out.push(b'-');
+    out.push_uint(month.into(), 2);
+    out.push(b'-');
+    out.push_uint(day.into(), 2);
+    out.push(b' ');
+    out.push_uint(day_us / 3_600_000_000, 2);
+    out.push(b':');
+    out.push_uint(day_us / 60_000_000 % 60, 2);
+    out.push(b':');
+    out.push_uint(day_us / 1_000_000 % 60, 2);
+    let micros = day_us % 1_000_000;
+    if micros != 0 {
+        out.push(b'.');
+        out.push_uint(micros, 6);
+    }
+    out
 }
 
 fn parse_datetime64_precision(inner: &str) -> Option<i32> {
@@ -298,15 +312,15 @@ fn parse_datetime64_precision(inner: &str) -> Option<i32> {
     body[..comma].trim().parse::<i32>().ok()
 }
 
-fn format_uuid(b: &[u8; 16]) -> String {
-    let mut s = String::with_capacity(36);
+fn format_uuid(b: &[u8; 16]) -> AsciiArray<36> {
+    let mut out = [b'-'; 36];
+    let mut at = 0;
     for (i, byte) in b.iter().enumerate() {
-        s.push_str(&format!("{byte:02x}"));
-        if matches!(i, 3 | 5 | 7 | 9) {
-            s.push('-');
-        }
+        out[at] = b"0123456789abcdef"[(byte >> 4) as usize];
+        out[at + 1] = b"0123456789abcdef"[(byte & 0xf) as usize];
+        at += if matches!(i, 3 | 5 | 7 | 9) { 3 } else { 2 };
     }
-    s
+    AsciiArray::new(out)
 }
 
 /// CH SQL string-literal escaping. Double backslash + single-quote; other
@@ -404,11 +418,19 @@ mod tests {
     }
 
     #[test]
-    fn render_pg_timestamp_normal_and_out_of_range_fallback() {
+    fn render_pg_timestamp_covers_datum_extremes() {
         // pg_micros=0 is PG epoch (2000-01-01)
-        assert_eq!(render_pg_timestamp(0), "2000-01-01 00:00:00");
-        // i64::MAX overflows chrono range → epoch fallback
-        assert_eq!(render_pg_timestamp(i64::MAX), "1970-01-01 00:00:00");
+        assert_eq!(render_pg_timestamp(0).as_str(), "2000-01-01 00:00:00");
+        // PG spells timestamp infinity as the i64 bounds; both stay in the
+        // widest form the buffer holds
+        assert_eq!(
+            render_pg_timestamp(i64::MAX).as_str(),
+            "294247-01-10 04:00:54.775807"
+        );
+        assert_eq!(
+            render_pg_timestamp(i64::MIN).as_str(),
+            "-290278-12-22 19:59:05.224192"
+        );
     }
 
     fn named_attr(oid: u32, type_name: &str, not_null: bool) -> RelAttr {

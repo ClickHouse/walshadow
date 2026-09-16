@@ -16,6 +16,7 @@ macro_rules! trace_span {
     };
 }
 
+pub mod ascii_buf;
 #[macro_use]
 pub mod atomic_stats;
 pub mod backfill;
