@@ -509,7 +509,9 @@ fn row_from_columns(mut tuple: BackfillTuple, toast_relid: u32) -> Option<ToastR
         chunk_id,
         chunk_seq,
         chunk_data: bytes::Bytes::from(chunk_data),
-        lsn: tuple.source_lsn,
+        // Weakest evidence for a TID: a backup copy can be torn, so any
+        // WAL-sourced row for the same TID outranks it
+        lsn: 0,
     })
 }
 

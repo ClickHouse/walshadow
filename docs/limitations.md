@@ -65,6 +65,9 @@ request per insert batch
   without source SQL scans. They spool to bootstrap scratch until every walk
   lane flushed its chunks; inline values and unmapped
   external columns need no wait
+- restored TOAST page images in backup-window WAL mirror every chunk they
+  carry, repairing pages the backup copied mid-write. They date from the page's
+  own version, so walked chunks never outrank them
 - an external value the mirror cannot reassemble stops the load rather than
   substituting one; rerun against a fresher backup, or load the table with
   `initial_load = 'copy'`

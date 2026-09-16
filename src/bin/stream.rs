@@ -3625,6 +3625,7 @@ fn stage_gauges(v: &StageCounters<'_>) -> MetricsSnapshot {
         toast_chunk_put_seconds: emitter_seconds(|s| &s.toast_chunk_put_nanos),
         toast_chunks_stored_total: emitter(|s| &s.toast_chunks_stored),
         toast_tombstones_stored_total: emitter(|s| &s.toast_tombstones_stored),
+        toast_image_rows_mirrored_total: emitter(|s| &s.toast_image_rows_mirrored),
         toast_values_filled_superseded_total: emitter(|s| &s.toast_values_filled_superseded),
         toast_values_filled_mismatch_total: emitter(|s| &s.toast_values_filled_mismatch),
         toast_mirror_truncates_total: emitter(|s| &s.toast_mirror_truncates),

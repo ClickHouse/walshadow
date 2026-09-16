@@ -229,6 +229,8 @@ snapshot! {
         "Cumulative wall-clock inside chunk-store INSERTs. Divided by toast_chunk_puts_total this is per-part commit latency.",
     counter toast_tombstones_stored_total: u64 =
         "TOAST delete tombstone rows persisted to the CH store.",
+    counter toast_image_rows_mirrored_total: u64 =
+        "Chunk rows mirrored from restored page images during a backup window; non-zero means the backup copied TOAST pages mid-write.",
     counter toast_values_filled_superseded_total: u64 =
         "Store-mode values filled after their history merge-collapsed.",
     counter toast_values_filled_mismatch_total: u64 =

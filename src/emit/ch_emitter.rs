@@ -2019,6 +2019,9 @@ crate::atomic_stats! {
         pub toast_values_filled_superseded,
         pub toast_values_filled_mismatch,
         pub toast_fetch_miss,
+        /// Chunk rows mirrored from a restored TOAST page image, repairing
+        /// backup page copies read mid-write
+        pub toast_image_rows_mirrored,
         /// Gauge: bytes resident in the in-memory prefixes of every
         /// bootstrap TOAST-deferred spool, released as each one replays
         pub bootstrap_deferred_bytes,

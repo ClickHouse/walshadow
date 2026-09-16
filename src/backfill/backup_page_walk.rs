@@ -4,13 +4,15 @@
 //!
 //! ## V1 limits
 //!
-//! - No FPI replay on backup pages. Pages with `pd_lsn < start_lsn`
+//! - No FPI replay on backup heap pages. Pages with `pd_lsn < start_lsn`
 //!   captured mid-write get walked as-shipped. WAL records in
 //!   `[start_lsn, end_lsn]` re-emit at higher `_lsn` and
 //!   `ReplacingMergeTree(_lsn)` collapses the duplicate. Accepted
 //!   brief-duplicate window, see [architecture/bootstrap.md](../../architecture/bootstrap.md).
 //! - With chunk storage enabled, walk `pg_toast_<relid>` pages and let
-//!   bootstrap drain resolve deferred referrers
+//!   bootstrap drain resolve deferred referrers. Window page images repair
+//!   these, so a walked chunk row ranks below every WAL-sourced row for its
+//!   TID
 
 use std::io;
 use std::sync::Arc;
@@ -343,6 +345,58 @@ pub(crate) fn page_tuple_bytes(page: &[u8], offnum: u16) -> Option<&[u8]> {
         return None;
     }
     Some(&page[lp_off..lp_off + lp_len])
+}
+
+/// Slots the line pointer array holds
+pub(crate) fn page_max_offnum(page: &[u8]) -> u16 {
+    if page.len() < SIZE_OF_PAGE_HEADER {
+        return 0;
+    }
+    let pd_lower = u16::from_le_bytes(page[12..14].try_into().unwrap()) as usize;
+    (pd_lower.saturating_sub(SIZE_OF_PAGE_HEADER) / SIZE_OF_ITEM_ID) as u16
+}
+
+/// Version every tuple on the page predates. In a restored image this is
+/// the version before the carrying record: PG assembles the image inside
+/// the critical section, `PageSetLSN` runs after `XLogInsert` returns
+pub(crate) fn page_pd_lsn(page: &[u8]) -> u64 {
+    if page.len() < SIZE_OF_PAGE_HEADER {
+        return 0;
+    }
+    u64::from_le_bytes(page[0..8].try_into().unwrap())
+}
+
+/// Chunk rows a TOAST page holds, TID-keyed and dated `lsn`
+pub(crate) fn toast_rows_from_page(
+    page: &[u8],
+    rel: &RelDescriptor,
+    blkno: u32,
+    lsn: u64,
+) -> Vec<crate::toast::ToastRow> {
+    let mut rows = Vec::new();
+    for offnum in 1..=page_max_offnum(page) {
+        let Some(tuple) = page_tuple_bytes(page, offnum) else {
+            continue;
+        };
+        let Some((_, _, _, mut columns)) = decode_on_page_tuple(tuple, rel) else {
+            continue;
+        };
+        let Some((chunk_id, chunk_seq, chunk_data)) =
+            crate::decode::heap_decoder::take_toast_chunk_columns(&mut columns)
+        else {
+            continue;
+        };
+        rows.push(crate::toast::ToastRow {
+            toast_relid: rel.oid,
+            blkno,
+            offnum,
+            chunk_id,
+            chunk_seq,
+            chunk_data: bytes::Bytes::from(chunk_data),
+            lsn,
+        });
+    }
+    rows
 }
 
 /// Decode one on-page tuple into `(xmin, xmax, infomask, columns)`.
@@ -866,6 +920,69 @@ impl EntrySink for SlruEntry {
     }
 }
 
+#[cfg(test)]
+/// `pg_toast_16400(chunk_id oid, chunk_seq int4, chunk_data bytea)`
+pub(crate) fn toast_chunk_rel() -> RelDescriptor {
+    use crate::schema::{BYTEAOID, INT4OID, OIDOID, RelAttr, RelName};
+    let attr = |attnum: i16, name: &str, type_oid: u32, type_len: i16| RelAttr {
+        attnum,
+        name: name.into(),
+        type_oid,
+        typmod: -1,
+        not_null: false,
+        dropped: false,
+        type_name: String::new(),
+        type_byval: type_len > 0,
+        type_len,
+        type_align: 'i',
+        type_storage: 'p',
+        missing_default: None,
+    };
+    let mut rel = make_rel();
+    rel.oid = 16401;
+    rel.rfn.rel_node = 16401;
+    rel.kind = 't';
+    rel.rel_name = RelName::new("pg_toast", "pg_toast_16400");
+    rel.attributes = vec![
+        attr(1, "chunk_id", OIDOID, 4),
+        attr(2, "chunk_seq", INT4OID, 4),
+        attr(3, "chunk_data", BYTEAOID, -1),
+    ];
+    rel
+}
+
+#[cfg(test)]
+/// Chunk tuples at successive offnums, page dated `pd_lsn`. Bodies stay
+/// short so each rides a 1-byte varlena header
+pub(crate) fn synth_toast_chunk_page(
+    chunks: &[(u32, i32, &[u8])],
+    pd_lsn: u64,
+) -> [u8; PAGE_BYTES] {
+    let mut page = [0u8; PAGE_BYTES];
+    page[0..8].copy_from_slice(&pd_lsn.to_le_bytes());
+    let mut upper = PAGE_BYTES;
+    for (i, (chunk_id, chunk_seq, body)) in chunks.iter().enumerate() {
+        let len = 24 + 4 + 4 + 1 + body.len();
+        upper -= len.next_multiple_of(8);
+        let t = upper;
+        page[t..t + 4].copy_from_slice(&99u32.to_le_bytes()); // t_xmin
+        page[t + 18..t + 20].copy_from_slice(&3u16.to_le_bytes()); // natts
+        page[t + 22] = 24; // t_hoff
+        page[t + 24..t + 28].copy_from_slice(&chunk_id.to_le_bytes());
+        page[t + 28..t + 32].copy_from_slice(&chunk_seq.to_le_bytes());
+        // SET_VARSIZE_1B: length including header, low bit set
+        page[t + 32] = ((body.len() as u8 + 1) << 1) | 0x01;
+        page[t + 33..t + 33 + body.len()].copy_from_slice(body);
+        let slot = SIZE_OF_PAGE_HEADER + i * SIZE_OF_ITEM_ID;
+        let raw = (t as u32 & 0x7FFF) | ((LP_NORMAL as u32) << 15) | ((len as u32 & 0x7FFF) << 17);
+        page[slot..slot + SIZE_OF_ITEM_ID].copy_from_slice(&raw.to_le_bytes());
+    }
+    let pd_lower = SIZE_OF_PAGE_HEADER + chunks.len() * SIZE_OF_ITEM_ID;
+    page[12..14].copy_from_slice(&(pd_lower as u16).to_le_bytes());
+    page[14..16].copy_from_slice(&(upper as u16).to_le_bytes());
+    page
+}
+
 /// Test fixture `public.t(id int4)`, shared with `backfill_bootstrap`
 #[cfg(test)]
 pub(crate) fn make_rel() -> RelDescriptor {
@@ -1058,6 +1175,49 @@ mod tests {
         assert!(out.is_empty());
         assert_eq!(tally.tuples_skipped_lp_flag, 1);
         assert_eq!(tally.tuples_emitted, 0);
+    }
+
+    /// A restored image mirrors every chunk on the page, not only the tuple
+    /// its record names: the neighbours are what a torn backup copy lost
+    #[test]
+    fn toast_rows_from_page_takes_every_live_chunk() {
+        let rel = toast_chunk_rel();
+        let page = synth_toast_chunk_page(
+            &[(7, 0, b"first"), (8, 0, b"second"), (7, 1, b"third")],
+            0x9000,
+        );
+        let rows = toast_rows_from_page(&page, &rel, 3, page_pd_lsn(&page));
+        assert_eq!(rows.len(), 3);
+        assert!(rows.iter().all(|r| r.toast_relid == 16401 && r.blkno == 3));
+        assert!(rows.iter().all(|r| r.lsn == 0x9000));
+        assert_eq!(
+            rows.iter()
+                .map(|r| (r.chunk_id, r.chunk_seq, r.chunk_data.as_ref()))
+                .collect::<Vec<_>>(),
+            vec![
+                (7, 0, b"first".as_slice()),
+                (8, 0, b"second".as_slice()),
+                (7, 1, b"third".as_slice()),
+            ],
+        );
+        assert_eq!(rows.iter().map(|r| r.offnum).collect::<Vec<_>>(), [1, 2, 3]);
+    }
+
+    #[test]
+    fn toast_rows_from_page_skips_dead_slots() {
+        let rel = toast_chunk_rel();
+        let mut page = synth_toast_chunk_page(&[(7, 0, b"first"), (8, 0, b"second")], 0x9000);
+        // Flip slot 0 LP_NORMAL (1) -> LP_DEAD (3)
+        let raw = u32::from_le_bytes(
+            page[SIZE_OF_PAGE_HEADER..SIZE_OF_PAGE_HEADER + 4]
+                .try_into()
+                .unwrap(),
+        );
+        let dead = (raw & !(0x3 << 15)) | (3u32 << 15);
+        page[SIZE_OF_PAGE_HEADER..SIZE_OF_PAGE_HEADER + 4].copy_from_slice(&dead.to_le_bytes());
+        let rows = toast_rows_from_page(&page, &rel, 0, 0x9000);
+        assert_eq!(rows.len(), 1);
+        assert_eq!((rows[0].chunk_id, rows[0].offnum), (8, 2));
     }
 
     #[test]
