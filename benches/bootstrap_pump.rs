@@ -388,7 +388,7 @@ async fn bench_drain(shape: Shape) -> Report {
         ack.clone(),
         stats.clone(),
         ToastResolver::disabled(),
-        None,
+        bootstrap::Deferral::Rejected,
         Default::default(),
         None,
         ahash::HashSet::default(),

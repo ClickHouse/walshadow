@@ -101,7 +101,7 @@ older TOAST fetch, and `toast_reclaim_lsn` as highest destructive boundary relea
 Require `toast_reclaim_lsn <= resume_safe_lsn`, interpreted on validated lineage
 Before releasing boundary D: withhold record, finish or durably materialize
 dependent work, fsync restart proof covering D, then publish original bytes
-Include [bootstrap carry](bootstrap.md) and future destination queues in proof
+Include [pending bootstrap rows](bootstrap.md) and future destination queues in proof
 
 Stage archive segments and manifest durably before atomic publication. On
 restart, recover manifest or rescan staged records, validate against cursor and

@@ -23,7 +23,12 @@ pub struct BackupRequest {
 pub struct PassContext {
     pub pg: PgConfig,
     pub emitter: Arc<EmitterConfig>,
+    /// Routing for this pass's rows; staging targets while a pass is
+    /// unpublished
     pub mapping: MappingHandle,
+    /// Live published routing. Pending tables are siblings of the destination,
+    /// not of staging, since a promote lands after the swap
+    pub published: MappingHandle,
     pub stats: Arc<EmitterStats>,
     pub catalog: Arc<Mutex<ShadowCatalog>>,
     pub log: Arc<DescriptorLog>,
@@ -41,6 +46,8 @@ pub struct PassOutcome {
     pub rows_walked: u64,
     pub rows_gated: u64,
     pub rows_deferred: u64,
+    /// Undecided rows parked in pending tables
+    pub rows_pending: u64,
     pub multixact_emitted: u64,
     pub rows_replayed: u64,
     pub replay_commits_past_s: u64,
@@ -48,4 +55,6 @@ pub struct PassOutcome {
     pub b_redo: u64,
     pub pg_xact_segments: usize,
     pub pg_xact_patch_len: usize,
+    /// Pending tables the pass wrote; the caller records them once it publishes
+    pub pending_tables: Vec<crate::backfill::visibility_pending::PendingManifest>,
 }

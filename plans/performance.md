@@ -68,8 +68,9 @@ memory, especially many small relations and wide rows
 
 External-pointer detection happens after decode, so workers become concurrent
 writers to deferred storage. Choose serialized spool writer or per-worker spools
-with deterministic merge and restart ownership. Preserve [open-xact carry](bootstrap.md)
-and [shadow TOAST readiness](shadow_toast.md), bound both queued bytes and jobs
+with deterministic merge and restart ownership. Preserve
+[rows awaiting transaction outcomes](bootstrap.md) and
+[shadow TOAST readiness](shadow_toast.md), bound both queued bytes and jobs
 
 Tune fetch/decompress concurrency, decode workers, and inserter connections
 independently. Estimate inserter demand from batch production rate and measured

@@ -22,12 +22,15 @@ use std::sync::atomic::Ordering;
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use walrus::pg::walparser::RmId;
 
+use crate::backfill::backfill_staging::StagingSession;
+use crate::backfill::visibility_pending::{self, PendingLedger};
 use crate::catalog::desc_log::DescriptorLog;
 use crate::catalog::pending::PendingCatalog;
 use crate::catalog::shadow_catalog::ShadowCatalog;
 use crate::decode::heap_decoder::{DescribedHeap, HeapOp};
+use crate::decode::visibility::{PgXactPatch, PgXactView, read_pg_xact};
 use crate::emit::ch_ddl::DdlApplicator;
-use crate::emit::ch_emitter::EmitterStats;
+use crate::emit::ch_emitter::{EmitterConfig, EmitterStats};
 use crate::record::{Record, RecordSink, SinkError};
 use crate::schema::{RelDescriptor, RelName, SchemaEvent};
 use ahash::{HashMap, HashMapExt, HashSet, HashSetExt};
@@ -90,6 +93,12 @@ pub struct ReorderSink {
     /// ledger persists queue so a stop inside the wait window can't leak
     /// the mirror (resume never replays the drop)
     retires: RetireLedger,
+    /// Retain undecided backup rows until transaction outcomes arrive
+    pending_rows: PendingLedger,
+    /// Control connection for the settle statements, opened on first hit
+    pending_session: Option<StagingSession>,
+    /// Whole emitter config, kept for that lazy connect
+    emitter: Arc<EmitterConfig>,
     /// Persisted resolved floor (aligned, archive-clamped) — the position
     /// a crash-now restart resumes from. Seeded at the resolved start,
     /// advanced only after each manifest persist.
@@ -160,6 +169,8 @@ impl ReorderSink {
         plan_dir: std::path::PathBuf,
         budget: Option<crate::budget::MemoryBudget>,
         retires: RetireLedger,
+        pending_rows: PendingLedger,
+        emitter: Arc<EmitterConfig>,
         resume_floor: Arc<Monotone<Floor>>,
         mapping: MappingHandle,
         row_policy: RowPolicy,
@@ -199,6 +210,9 @@ impl ReorderSink {
             budget,
             span_registry,
             retires,
+            pending_rows,
+            pending_session: None,
+            emitter,
             resume_floor,
             reload_rx,
             applied_opt_ins: HashSet::new(),
@@ -550,6 +564,73 @@ impl ReorderSink {
         Ok(())
     }
 
+    /// Settle pending rows on commit or abort, including subtransactions
+    async fn note_pending(
+        &mut self,
+        xid: u32,
+        subxacts: &[u32],
+        committed: bool,
+    ) -> Result<(), SinkError> {
+        let settled = self.pending_rows.note(xid, subxacts, committed);
+        if settled == 0 {
+            return Ok(());
+        }
+        self.stats
+            .pending_xacts_settled
+            .fetch_add(settled, Ordering::Relaxed);
+        self.settle_pending().await
+    }
+
+    async fn settle_pending(&mut self) -> Result<(), SinkError> {
+        if self.pending_rows.is_empty() {
+            return Ok(());
+        }
+        if self.pending_session.is_none() {
+            self.pending_session = Some(
+                StagingSession::connect(self.emitter.clone())
+                    .await
+                    .map_err(|e| SinkError::Other(format!("pending visibility: connect: {e}")))?,
+            );
+        }
+        let sess = self.pending_session.as_mut().expect("just connected");
+        visibility_pending::settle(&mut self.pending_rows, sess, &self.stats)
+            .await
+            .map_err(SinkError::Other)
+    }
+
+    /// Recover outcomes from shadow transaction logs before resumed WAL
+    pub async fn settle_pending_boot(
+        &mut self,
+        shadow_data_dir: Option<&std::path::Path>,
+    ) -> Result<(), SinkError> {
+        if self.pending_rows.is_empty() {
+            return Ok(());
+        }
+        if let Some(dir) = shadow_data_dir.filter(|d| d.join("pg_xact").is_dir()) {
+            let accum = read_pg_xact(dir).await.map_err(|e| {
+                SinkError::Other(format!("pending visibility: shadow pg_xact: {e}"))
+            })?;
+            let patch = PgXactPatch::new();
+            let fold = self
+                .pending_rows
+                .note_view(&PgXactView::new(&accum, &patch));
+            self.stats
+                .pending_xacts_settled
+                .fetch_add(fold.settled, Ordering::Relaxed);
+            self.stats
+                .pending_undecidable_xids
+                .store(fold.undecidable, Ordering::Relaxed);
+            if fold.undecidable > 0 {
+                tracing::warn!(
+                    target: "walshadow::visibility_pending",
+                    xids = fold.undecidable,
+                    "shadow pg_xact lacks deciding xids; retain pending rows and tables",
+                );
+            }
+        }
+        self.settle_pending().await
+    }
+
     /// Residual `O - B` deaths for one rewrite generation; barrier loop
     /// already flushed its births
     async fn apply_toast_barrier(
@@ -769,6 +850,7 @@ impl ReorderSink {
         // the buffered work lives under the prepared xid — drain there, or
         // capture-keyed events would never leave the buffer
         let xid = payload.twophase_xid.unwrap_or(xid);
+        self.note_pending(xid, &payload.subxacts, true).await?;
         // Parent for this commit's spans; held until on_commit returns so it
         // outlives the prune below. No-op span when tracing off/unsampled.
         let txn = self
@@ -933,6 +1015,7 @@ impl ReorderSink {
             .unwrap_or_default();
         // ABORT PREPARED: buffered state keys off the prepared xid
         let xid = payload.twophase_xid.unwrap_or(xid);
+        self.note_pending(xid, &payload.subxacts, false).await?;
         let seq = self.alloc_seq();
         self.ack.register(seq, record.source_lsn);
         {

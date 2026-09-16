@@ -940,6 +940,9 @@ async fn build_pipeline_inner(
         config_resolver: Some(config_resolver.clone()),
         backfiller,
         retires,
+        pending_rows: walshadow::visibility_pending::PendingLedger::load(&spill_dir)
+            .await
+            .expect("load pending visibility ledger"),
         resume_floor: resume_floor.clone(),
         budget: None,
     };

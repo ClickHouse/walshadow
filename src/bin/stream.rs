@@ -49,9 +49,8 @@ use walrus::pg::replication::base_backup::BaseBackupOpts;
 use walrus::pg::replication::conn::PgConfig;
 use walrus::pg::replication::tls::SslMode;
 use walshadow::backfill::visibility_gate::{
-    GateOutput, GateStats, GreenfieldSink, PendingGate, resolve_greenfield, stream_phase,
+    GateStats, GreenfieldSink, PendingGate, resolve_greenfield, stream_phase,
 };
-use walshadow::backfill::visibility_repair::RepairScope;
 use walshadow::backfill_bootstrap::{
     BootstrapConfig, BootstrapOutcome, BootstrapProgress, drain_backfill, seed_in_snapshot,
     spawn_greenfield_bootstrap,
@@ -551,7 +550,7 @@ struct Args {
     /// to `ObjectStoreSource`'s own `min(4, num_cpus)` default.
     #[arg(long)]
     bootstrap_object_store_parallelism: Option<NonZeroUsize>,
-    /// Parallel repair/drain/batcher lanes for the greenfield load. Each gets
+    /// Parallel drain/batcher lanes for greenfield load. Each gets
     /// its own batcher and `inserter_pool_size / lanes` inserters. Unset falls
     /// through to `[bootstrap] lanes`, then `min(inserter_pool_size, num_cpus)`
     #[arg(long)]
@@ -561,7 +560,7 @@ struct Args {
     /// cost matters more than bootstrap latency.
     #[arg(long, default_value_t = true)]
     bootstrap_fast_checkpoint: bool,
-    /// Cap direct BASE_BACKUP and bootstrap COPY repair separately in KiB/s
+    /// Cap direct BASE_BACKUP transfer in KiB/s
     /// PostgreSQL accepts 32..1048576; window WAL remains unthrottled
     #[arg(long, value_parser = clap::value_parser!(i32).range(32..=1_048_576))]
     bootstrap_max_rate_kib: Option<i32>,
@@ -1589,6 +1588,12 @@ async fn run_session(
     let retires = walshadow::toast_retire::RetireLedger::load(&args.spill_dir)
         .await
         .context("load toast retire ledger")?;
+    // Pending tables a bootstrap or backup pass left holding undecided rows.
+    // Settling needs ClickHouse, so a metrics-only run leaves the ledger for
+    // a later CH run over the same spill dir
+    let pending_rows = walshadow::visibility_pending::PendingLedger::load(&args.spill_dir)
+        .await
+        .context("load pending visibility ledger")?;
     // Layered config resolver (CLI > TOML); `Some` only with `--ch-config`.
     // Moved into the SIGHUP task, which re-reads TOML and republishes.
     let mut config_resolver: Option<Arc<ConfigResolver>> = None;
@@ -1832,6 +1837,7 @@ async fn run_session(
             config_resolver: config_resolver.clone(),
             backfiller: backfiller_effects,
             retires,
+            pending_rows,
             resume_floor: resume_floor.clone(),
             budget: Some(pipeline_budget),
         }
@@ -1876,6 +1882,7 @@ async fn run_session(
             config_resolver: None,
             backfiller: None,
             retires,
+            pending_rows: walshadow::visibility_pending::PendingLedger::empty(),
             resume_floor: resume_floor.clone(),
             budget: None,
         }
@@ -1889,6 +1896,10 @@ async fn run_session(
         .flush_due_retires()
         .await
         .context("boot flush of due toast-mirror retires")?;
+    reorder_sink
+        .settle_pending_boot(args.bootstrap_shadow_data_dir.as_deref())
+        .await
+        .context("boot settle of pending backup rows")?;
     reorder_sink
         .apply_boot_events(desc_log.active_present_at(raw_start.get()), raw_start.get())
         .await
@@ -3604,6 +3615,12 @@ fn stage_gauges(v: &StageCounters<'_>) -> MetricsSnapshot {
     MetricsSnapshot {
         bootstrap_deferred_bytes: emitter(|s| &s.bootstrap_deferred_bytes),
         bootstrap_deferred_spool_bytes: emitter(|s| &s.bootstrap_deferred_spool_bytes),
+        pending_rows_total: emitter(|s| &s.pending_rows),
+        pending_tables_total: emitter(|s| &s.pending_tables),
+        pending_tables_dropped_total: emitter(|s| &s.pending_tables_dropped),
+        pending_xacts_settled_total: emitter(|s| &s.pending_xacts_settled),
+        pending_outstanding_xids: emitter(|s| &s.pending_outstanding_xids),
+        pending_undecidable_xids: emitter(|s| &s.pending_undecidable_xids),
         toast_chunk_puts_total: emitter(|s| &s.toast_chunk_puts),
         toast_chunk_put_seconds: emitter_seconds(|s| &s.toast_chunk_put_nanos),
         toast_chunks_stored_total: emitter(|s| &s.toast_chunks_stored),
@@ -4426,12 +4443,11 @@ async fn run_bootstrap(
 
     // Decline unmapped relations at `begin` so their pages never decode.
     // Metrics-only (no CH) has no mapping to filter against, so it walks all
-    let (tap_filenodes, needs_oracle, repair_scope, routes) = match &ch_target {
+    let (tap_filenodes, needs_oracle, routes) = match &ch_target {
         Some((_, mapping, resolved, skip_initial)) => {
             let routed = mapping.snapshot().await;
             let is_routed = |rn: &RelName| routed.contains_key(rn);
             let walked = |rn: &RelName| is_routed(rn) && !skip_initial.contains(rn);
-            let scope = RepairScope::mapped(&drain_catalog, &routed, walked);
             (
                 walshadow::backfill_bootstrap::tap_filenode_set(&drain_catalog, is_routed, walked)
                     .map(Arc::new),
@@ -4440,11 +4456,10 @@ async fn run_bootstrap(
                     &routed,
                     &resolved.column_rules,
                 ),
-                scope,
                 routed,
             )
         }
-        None => (None, false, RepairScope::default(), Default::default()),
+        None => (None, false, Default::default()),
     };
 
     // Off the backup window: provisioning is an initdb + pg_dump + apply +
@@ -4539,8 +4554,6 @@ async fn run_bootstrap(
     let window_patch = Arc::new(std::sync::Mutex::new(PgXactPatch::new()));
     // Metrics-only mode has no pending gate
     let mut pending_gate: Option<PendingGate> = None;
-    let copy_rate =
-        walshadow::copy_backfill::CopyRate::new(args.bootstrap_max_rate_kib.map(|n| n as u32));
     // Preserve live failure if file fallback also fails
     let mut window_leg_error: Option<anyhow::Error> = None;
     let window_scratch = args.spill_dir.join("bootstrap_window");
@@ -4622,16 +4635,14 @@ async fn run_bootstrap(
         // mapping snapshot the CREATEs above rendered from: per-relation
         // system column names have to match what CH now holds
         let sink = GreenfieldSink {
-            source: src_cfg.clone(),
             catalog: drain_catalog.clone(),
             mapping: routes,
-            repair_scope,
-            copy_rate,
             config: resolved.clone(),
             emitter: emitter_cfg.clone(),
             stats: stats.clone(),
             resolver: resolver.clone(),
             skip_initial,
+            scratch_dir: args.spill_dir.clone(),
         };
 
         // Gate page tuples, defer unknowns until transaction logs land
@@ -4639,10 +4650,10 @@ async fn run_bootstrap(
             .iter()
             .map(|t| (t.msg_tx.clone(), t.ack.clone()))
             .collect();
-        let (repair_txs, stages) = sink.spawn(lane_tails);
+        let (drain_txs, stages) = sink.spawn(lane_tails, "bootstrap_drain").await;
         let mut gate_txs = Vec::with_capacity(lanes);
         let mut gate_handles = Vec::with_capacity(lanes);
-        for (i, repair_tx) in repair_txs.into_iter().enumerate() {
+        for (i, drain_tx) in drain_txs.into_iter().enumerate() {
             let (gate_tx, mut gate_rx) = tokio::sync::mpsc::channel(
                 walshadow::backup_page_walk::BOOTSTRAP_TUPLE_CHANNEL_CAP,
             );
@@ -4661,7 +4672,7 @@ async fn run_bootstrap(
                     let mut gate_stats = GateStats::default();
                     stream_phase(
                         &mut gate_rx,
-                        &GateOutput::Repair(&repair_tx),
+                        &drain_tx,
                         &catalog,
                         &mut spool,
                         &mut gate_stats,
@@ -4694,9 +4705,6 @@ async fn run_bootstrap(
                 stats.deferred += s.deferred;
                 stats.multixact_emitted += s.multixact_emitted;
                 stats.chunks_gated += s.chunks_gated;
-                stats.unresolved += s.unresolved;
-                stats.repaired_rows += s.repaired_rows;
-                stats.p_hi = stats.p_hi.max(s.p_hi);
                 spools.push(spool);
             }
             Ok::<_, String>((stats, spools))
@@ -4731,11 +4739,9 @@ async fn run_bootstrap(
         let (gate_res, stage_res, pump_res, leg_res) =
             tokio::join!(gate, stages.join(), pump_then_stop, leg_fut);
         let prepared = (|| -> Result<_> {
-            let (repair_stats, drain_outcome) = stage_res.map_err(|e| anyhow::anyhow!(e))?;
-            let (mut gate_stats, gate_spool) =
+            let drain_outcome = stage_res.map_err(|e| anyhow::anyhow!(e))?;
+            let (gate_stats, gate_spool) =
                 gate_res.map_err(|e| anyhow::anyhow!("bootstrap gate: {e}"))?;
-            gate_stats.repaired_rows += repair_stats.rows;
-            gate_stats.p_hi = gate_stats.p_hi.max(repair_stats.p_hi);
             let outcome: BootstrapOutcome = pump_res
                 .context("bootstrap pump join")?
                 .context("bootstrap pump")?;
@@ -4760,7 +4766,7 @@ async fn run_bootstrap(
             };
             Ok((gate_stats, gate_spool, drain_outcome, outcome, window))
         })();
-        let (gate_stats, gate_spool, drain_outcome, outcome, window) = match prepared {
+        let (gate_stats, gate_spool, mut drain_outcome, outcome, window) = match prepared {
             Ok(prepared) => prepared,
             Err(e) => {
                 for tail in tails {
@@ -4769,8 +4775,39 @@ async fn run_bootstrap(
                 return Err(fatal.message().map(anyhow::Error::msg).unwrap_or(e));
             }
         };
+
+        // Referrers the lanes handed back. One lane reaching its end proves
+        // nothing about a sibling's chunk puts, so resolution waits for all
+        // of them and rides the first lane's tail
+        let handback: Vec<_> = drain_outcome
+            .iter_mut()
+            .filter_map(|d| d.deferred.take())
+            .collect();
+        let mut deferred_rows = 0;
+        if !handback.is_empty() {
+            let lane = &tails[0];
+            let resolved = sink
+                .resolve_deferred(handback, &lane.msg_tx, &lane.ack, drain_outcome[0].next_seq)
+                .await;
+            match resolved {
+                Ok(resolved) => {
+                    drain_outcome[0].next_seq = resolved.next_seq;
+                    deferred_rows = resolved.rows_routed;
+                }
+                Err(e) => {
+                    for tail in tails {
+                        tail.quiesce().await;
+                    }
+                    return Err(fatal
+                        .message()
+                        .map(anyhow::Error::msg)
+                        .unwrap_or_else(|| anyhow::anyhow!(e)));
+                }
+            }
+        }
         // Seqs are per-lane, so each tail is proven through its own count
-        let rows_routed: u64 = drain_outcome.iter().map(|d| d.rows_routed).sum();
+        let rows_routed: u64 =
+            drain_outcome.iter().map(|d| d.rows_routed).sum::<u64>() + deferred_rows;
         let seqs: u64 = drain_outcome.iter().map(|d| d.next_seq).sum();
         for (tail, outcome) in tails.into_iter().zip(&drain_outcome) {
             tail.finish(outcome.next_seq)
@@ -4780,6 +4817,7 @@ async fn run_bootstrap(
         tracing::info!(
             target: "walshadow::bootstrap",
             rows_routed,
+            deferred_rows,
             rows_emitted = stats.rows_emitted.load(Ordering::Relaxed),
             blocks_sent = stats.blocks_sent.load(Ordering::Relaxed),
             seqs,
@@ -4932,19 +4970,29 @@ async fn run_bootstrap(
     // Resolve deferred tuples after window transaction overlay is complete
     if let Some(pending) = pending_gate {
         let patch = std::mem::take(&mut *window_patch.lock().expect("window patch lock"));
-        let gate = resolve_greenfield(pending, &shadow_data_dir, &patch)
+        let (gate, pending_tables) = resolve_greenfield(pending, &shadow_data_dir, &patch)
             .await
             .context("bootstrap: visibility gate")?;
+        // Persist the ledger before clearing the marker so pending rows
+        // already in ClickHouse can be published after restart
+        let mut ledger = walshadow::visibility_pending::PendingLedger::load(&args.spill_dir)
+            .await
+            .context("bootstrap: load pending visibility ledger")?;
+        for m in &pending_tables {
+            ledger
+                .push(m)
+                .await
+                .context("bootstrap: persist pending visibility ledger")?;
+        }
         tracing::info!(
             target: "walshadow::bootstrap",
             emitted = gate.emitted,
             gated = gate.gated,
             deferred = gate.deferred,
+            pending = gate.pending,
+            pending_tables = pending_tables.len(),
             multixact_emitted = gate.multixact_emitted,
             chunks_gated = gate.chunks_gated,
-            unresolved = gate.unresolved,
-            repaired_rows = gate.repaired_rows,
-            p_hi = gate.p_hi,
             patch_xacts = patch.len(),
             "bootstrap visibility gate settled",
         );

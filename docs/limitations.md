@@ -55,31 +55,34 @@ request per insert batch
 ## Initial loads
 
 - transactions open past greenfield handoff resume from their first buffered
-  record, using source or archived WAL; missing history stops replication
-  instead of skipping it. Earlier records can still leave missing inserts or
-  stale deletes
-- mapped external TOAST values trigger streaming `COPY` reads of at most 256
-  physical row locations (CTIDs) per query, alongside backup page walk; inline
-  values and unmapped external columns stay on page walk. Tables with external
-  values in every row still require reading every such row from source
-- unresolved multixacts trigger CTID `COPY` repair after backup and window
-  replay; repair reads remain serial
-- repair output streams through bounded channels into configured inserter pool;
-  user table data never lands in shadow catalog. Unknown visibility can still
-  spill to bootstrap scratch files until transaction logs arrive
-- `--bootstrap-max-rate-kib` caps direct backup transfer and COPY repair output
-  separately, each at configured rate; concurrent rates can add together.
-  COPY cap counts binary field bytes, not source disk reads; WAL stays unthrottled
+  record, using source or archived WAL; missing history stops replication.
+  Rows written before replay starts wait in `<table>__wspending` until commit
+  or abort determines visibility
+- retain shadow transaction history across restarts; missing `pg_xact` status
+  leaves pending rows unpublished. Boot logs unresolved xids and reports
+  `walshadow_pending_undecidable_xids` alongside `walshadow_pending_outstanding_xids`
+- backup rows with mapped external TOAST values render from walked chunk mirrors
+  without source SQL scans. They spool to bootstrap scratch until every walk
+  lane flushed its chunks; inline values and unmapped
+  external columns need no wait
+- an external value the mirror cannot reassemble stops the load rather than
+  substituting one; rerun against a fresher backup, or load the table with
+  `initial_load = 'copy'`
+- a multixact xmax the backup's `pg_multixact` cannot bound stops the load, with
+  the same remedies
+- walked rows stream through bounded channels into configured inserter pool;
+  user table data never lands in shadow catalog. Unknown visibility spills to
+  bootstrap scratch files until transaction logs arrive
+- `--bootstrap-max-rate-kib` caps direct backup transfer at configured rate;
+  window WAL stays unthrottled
 - `--bootstrap-wind-down-secs` controls live window wait for transactions open
   across handoff (default 5, zero skips waiting). Timeout resumes pump below
   `end_lsn` at oldest buffered record; increasing wait reduces these rewinds
-- repair reads each physical relation with `ONLY` and rejects row-security
-  filtering; source account must be able to read every row of repaired relations
-- repair locks each relation through descriptor validation and every COPY of
-  that batch, rejecting dropped, rewritten, or reshaped relations between batches
 - DDL during greenfield bootstrap is unsupported; affected relations may be
-  skipped or fail repair
-- `copy` scans selected table through PostgreSQL SQL path
+  skipped or fail the load
+- `copy`, selected by default by `init`, scans selected table through PostgreSQL
+  SQL path; source account must be able to read every row, row-security filtering
+  fails the load
 - `base_backup` transfers cluster-sized backup even for one table
 - `object_store` requires full wal-g backup and continuous archived WAL, including archived
   timeline history, to selection point
@@ -91,15 +94,14 @@ request per insert batch
 
 ## Large values
 
-Default `[toast] mode = "disabled"` cannot always reconstruct values stored
-externally before replication window. Enable ClickHouse TOAST storage before
-initial load when complete large-value history matters
+ClickHouse output always uses persistent TOAST chunk mirrors. Missing required
+mirror tables stop replication, see [large toasted values](destination-tables.md#large-toasted-values)
 
 Reused TOAST value IDs can leave ambiguous generations in backup chunk mirrors
-when hint bits do not prove older chunks dead. CTID repair fixes baseline rows,
-but later unchanged-pointer updates still depend on those mirrors. Chunk lookup
-orders by `(ver, blkno, offnum)` for determinism, not generation correctness:
-a newer generation at a lower TID can lose when versions tie
+when hint bits do not prove older chunks dead. Baseline rows and later
+unchanged-pointer updates both resolve from those mirrors. Chunk lookup orders
+by `(ver, blkno, offnum)` for determinism, not generation correctness: a newer
+generation at a lower TID can lose when versions tie
 
 ## Not an HA system
 

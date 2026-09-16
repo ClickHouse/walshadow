@@ -1,5 +1,5 @@
-//! Verify greenfield repairs external rows and seeds chunk mirror
-//! for later unchanged external pointers
+//! Verify greenfield renders external rows from the chunk mirror the walk
+//! seeds, and that the mirror survives for later unchanged pointers
 
 #![cfg(target_os = "linux")]
 
@@ -146,22 +146,18 @@ async fn dead_and_aborted_external_values_stay_out_of_ch() {
             .context("updated body probe")?;
         ensure!(fresh == "1", "id=1 kept the superseded body");
 
-        // Repair tally proves COPY path ran
+        // Deferral tally proves the rows rendered from the mirror
         let stderr = daemon.stderr();
         let line = stderr
             .lines()
-            .find(|l| l.contains("bootstrap visibility gate settled"))
-            .context("repair never logged its read")?;
+            .find(|l| l.contains("resolving deferred TOAST tuples"))
+            .context("no row waited on the chunk store")?;
         ensure!(
-            line.contains("unresolved=0"),
-            "unexpected unresolved visibility: {line}"
-        );
-        ensure!(
-            line.contains(&format!("repaired_rows={N_LIVE}")),
-            "repair row count off: {line}"
+            line.contains(&format!("deferred={N_LIVE}")),
+            "deferred row count off: {line}"
         );
 
-        // The rows came from COPY, the chunks still went to the mirror
+        // Every live row deferred, so its chunks are in the mirror
         let toast_relid = source
             .psql_one("SELECT reltoastrelid FROM pg_class WHERE oid = 's19.t'::regclass")
             .context("source toast relid")?;

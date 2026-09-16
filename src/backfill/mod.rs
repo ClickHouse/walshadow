@@ -15,6 +15,6 @@ pub mod opt_in;
 pub mod pg_path;
 pub mod spool;
 pub mod visibility_gate;
-pub mod visibility_repair;
+pub mod visibility_pending;
 pub mod wal_landing;
 pub mod wal_replay;

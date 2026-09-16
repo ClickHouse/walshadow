@@ -5,7 +5,7 @@
 //! resume LSN to backup end
 
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::sync::mpsc;
 
@@ -33,17 +33,97 @@ use ahash::HashSet;
 const DRAIN_CHUNK_ROWS: usize = 1024;
 
 /// Completion frontier for `FlushAll` and resume advance
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Default)]
 pub struct BootstrapDrainOutcome {
     /// Dense over `[0, next_seq)`
     pub next_seq: u64,
     pub rows_routed: u64,
+    /// Referrers a [`Deferral::Handback`] left for the caller's own pass
+    pub deferred: Option<DeferredSpool>,
+}
+
+/// One holder's share of the deferred-spool gauges
+///
+/// Greenfield runs a spool per lane against one gauge pair, so each holder
+/// reports deltas and releases what it still owns on drop: a failed lane
+/// cannot leave its bytes standing, and a finishing lane cannot zero a peer's
+struct DeferredFootprint<'a> {
+    stats: &'a EmitterStats,
+    resident: u64,
+    spooled: u64,
+}
+
+impl<'a> DeferredFootprint<'a> {
+    fn new(stats: &'a EmitterStats) -> Self {
+        Self {
+            stats,
+            resident: 0,
+            spooled: 0,
+        }
+    }
+
+    /// Take over bytes a lane published, so replay releases them
+    fn adopt(stats: &'a EmitterStats, spool: &DeferredSpool) -> Self {
+        Self {
+            stats,
+            resident: spool.resident_bytes() as u64,
+            spooled: spool.spooled_bytes(),
+        }
+    }
+
+    fn publish(&mut self, spool: &DeferredSpool) {
+        shift(
+            &self.stats.bootstrap_deferred_bytes,
+            &mut self.resident,
+            spool.resident_bytes() as u64,
+        );
+        shift(
+            &self.stats.bootstrap_deferred_spool_bytes,
+            &mut self.spooled,
+            spool.spooled_bytes(),
+        );
+    }
+
+    /// Spool outlives this holder: whoever takes it owns the bytes
+    fn hand_off(mut self) {
+        self.resident = 0;
+        self.spooled = 0;
+    }
+}
+
+impl Drop for DeferredFootprint<'_> {
+    fn drop(&mut self) {
+        self.stats
+            .bootstrap_deferred_bytes
+            .fetch_sub(self.resident, Ordering::Relaxed);
+        self.stats
+            .bootstrap_deferred_spool_bytes
+            .fetch_sub(self.spooled, Ordering::Relaxed);
+    }
+}
+
+/// Move a shared gauge from what this holder reported to what it holds now
+fn shift(gauge: &AtomicU64, held: &mut u64, now: u64) {
+    if now >= *held {
+        gauge.fetch_add(now - *held, Ordering::Relaxed);
+    } else {
+        gauge.fetch_sub(*held - now, Ordering::Relaxed);
+    }
+    *held = now;
+}
+
+/// Referrers whose TOAST files the walk had not reached when their row passed
+pub enum Deferral {
+    /// Detoasted input: an external pointer is a bug
+    Rejected,
+    /// Resolve at drain end, past every chunk put this task made
+    Local(DeferredSpool),
+    /// Hand back through the outcome: a sibling lane may still be putting
+    /// chunks, so only the caller knows when every file landed
+    Handback(DeferredSpool),
 }
 
 /// Drain baseline tuples into shared insert tail
-///
-/// `None` requires repaired input, `Some` permits per-table backup referrers
-/// to wait for later TOAST files
 #[allow(clippy::too_many_arguments)]
 pub async fn drain(
     mut rx: mpsc::Receiver<Vec<BackfillTuple>>,
@@ -53,24 +133,28 @@ pub async fn drain(
     ack: AckHandle,
     stats: Arc<EmitterStats>,
     resolver: ToastResolver,
-    mut deferred: Option<DeferredSpool>,
+    deferral: Deferral,
     row_policy: RowPolicy,
     config: Option<Arc<ResolvedConfig>>,
     skip_initial: HashSet<RelName>,
 ) -> Result<BootstrapDrainOutcome, String> {
+    let (mut deferred, handback) = match deferral {
+        Deferral::Rejected => (None, false),
+        Deferral::Local(spool) => (Some(spool), false),
+        Deferral::Handback(spool) => (Some(spool), true),
+    };
     let routes = freeze_routes(&mapping, config.as_deref(), &row_policy);
+    let mut footprint = DeferredFootprint::new(&stats);
     let mut next_seq = 0;
     let mut rows_routed = 0;
     let mut open = None;
     let mut chunk_batch = Vec::new();
     let mut chunk_batch_bytes = 0;
-    let mut start_lsn = 0;
     let mut out = RowBuf::default();
     while let Some(slab) = rx.recv().await {
         for tuple in slab {
             let rfn = tuple.rfn;
             let source_lsn = tuple.source_lsn;
-            start_lsn = source_lsn;
 
             let same = matches!(&open, Some((r, _, _)) if *r == rfn);
             let seq = if same {
@@ -118,20 +202,15 @@ pub async fn drain(
             let mut tuple = tuple;
             let mut permit = None;
             if tuple.has_mapped_external(&route.mapping) {
-                let deferred = deferred.as_mut().ok_or_else(|| {
-                    format!("bootstrap: unrepaired external value in {}", rel.rel_name)
-                })?;
                 if resolver.stores_chunks() {
-                    deferred
+                    let spool = deferred.as_mut().ok_or_else(|| {
+                        format!("bootstrap: undeferrable external value in {}", rel.rel_name)
+                    })?;
+                    spool
                         .push(tuple)
                         .await
                         .map_err(|e| format!("bootstrap: deferred spool: {e}"))?;
-                    stats
-                        .bootstrap_deferred_bytes
-                        .store(deferred.resident_bytes() as u64, Ordering::Relaxed);
-                    stats
-                        .bootstrap_deferred_spool_bytes
-                        .store(deferred.spooled_bytes(), Ordering::Relaxed);
+                    footprint.publish(spool);
                     continue;
                 }
                 permit = resolve_or_fill_toast(&mut tuple, &rel, &route.mapping, &resolver).await?;
@@ -150,55 +229,126 @@ pub async fn drain(
         flush_chunks(&resolver, &mut chunk_batch).await?;
     }
 
-    if let Some(deferred) = deferred.take().filter(|s| s.records() > 0) {
-        tracing::info!(
-            target: "walshadow::bootstrap",
-            deferred = deferred.records(),
-            spooled_bytes = deferred.spooled_bytes(),
-            "resolving deferred TOAST tuples from chunk store",
-        );
-        let seq = next_seq;
-        next_seq += 1;
-        ack.register(seq, start_lsn);
-        let mut placed = 0u64;
-        let mut replay = deferred
-            .into_reader()
-            .await
-            .map_err(|e| format!("bootstrap: deferred spool seal: {e}"))?;
-        while let Some(mut tuple) = replay
-            .next()
-            .await
-            .map_err(|e| format!("bootstrap: deferred spool replay: {e}"))?
-        {
-            let Some(rel) = catalog.get(tuple.rfn.db_node, tuple.rfn.rel_node) else {
-                stats.unsupported_relations.fetch_add(1, Ordering::Relaxed);
-                continue;
-            };
-            let Some(route) = routes.get(&rel.rel_name).cloned() else {
-                stats.unsupported_relations.fetch_add(1, Ordering::Relaxed);
-                continue;
-            };
-            let permit = resolve_or_fill_toast(&mut tuple, &rel, &route.mapping, &resolver).await?;
-            render_ext_columns(&rel.attributes, &mut tuple.columns);
-            out.push(&msg_tx, seq, rel, route, tuple, permit).await?;
-            placed += 1;
-            rows_routed += 1;
+    match deferred.take().filter(|s| s.records() > 0) {
+        Some(spool) if handback => {
+            footprint.hand_off();
+            Ok(BootstrapDrainOutcome {
+                next_seq,
+                rows_routed,
+                deferred: Some(spool),
+            })
         }
-        out.flush(&msg_tx).await?;
-        replay
-            .finish()
-            .await
-            .map_err(|e| format!("bootstrap: deferred spool cleanup: {e}"))?;
-        stats.bootstrap_deferred_bytes.store(0, Ordering::Relaxed);
-        stats
-            .bootstrap_deferred_spool_bytes
-            .store(0, Ordering::Relaxed);
-        ack.placed(seq, placed);
+        Some(spool) => {
+            footprint.hand_off();
+            let resolved = resolve_spooled(
+                spool, &routes, &catalog, &msg_tx, &ack, &stats, &resolver, next_seq,
+            )
+            .await?;
+            Ok(BootstrapDrainOutcome {
+                next_seq: resolved.next_seq,
+                rows_routed: rows_routed + resolved.rows_routed,
+                deferred: None,
+            })
+        }
+        None => Ok(BootstrapDrainOutcome {
+            next_seq,
+            rows_routed,
+            deferred: None,
+        }),
     }
+}
 
+/// Resolve referrers a walk handed back, against the chunk store
+///
+/// Split from [`drain`] so a multi-lane caller resolves once every lane
+/// flushed its puts: one lane reaching its end proves nothing about a
+/// sibling's chunk files
+#[allow(clippy::too_many_arguments)]
+pub async fn drain_deferred(
+    spool: DeferredSpool,
+    catalog: &CatalogMap,
+    mapping: &MappingSnapshot,
+    msg_tx: &mpsc::Sender<BatcherMsg>,
+    ack: &AckHandle,
+    stats: &EmitterStats,
+    resolver: &ToastResolver,
+    row_policy: &RowPolicy,
+    config: Option<&ResolvedConfig>,
+    first_seq: u64,
+) -> Result<BootstrapDrainOutcome, String> {
+    let routes = freeze_routes(mapping, config, row_policy);
+    resolve_spooled(
+        spool, &routes, catalog, msg_tx, ack, stats, resolver, first_seq,
+    )
+    .await
+}
+
+/// Route spooled referrers under one trailing seq, registered on the first
+/// row that routes so an all-unmapped spool leaves no seq to prove
+#[allow(clippy::too_many_arguments)]
+async fn resolve_spooled(
+    spool: DeferredSpool,
+    routes: &ahash::HashMap<RelName, Arc<RouteSnapshot>>,
+    catalog: &CatalogMap,
+    msg_tx: &mpsc::Sender<BatcherMsg>,
+    ack: &AckHandle,
+    stats: &EmitterStats,
+    resolver: &ToastResolver,
+    first_seq: u64,
+) -> Result<BootstrapDrainOutcome, String> {
+    tracing::info!(
+        target: "walshadow::bootstrap",
+        deferred = spool.records(),
+        spooled_bytes = spool.spooled_bytes(),
+        "resolving deferred TOAST tuples from chunk store",
+    );
+    // Released on drop, so a failed replay gives its bytes back too
+    let _footprint = DeferredFootprint::adopt(stats, &spool);
+    let mut out = RowBuf::default();
+    let mut seq = None;
+    let mut placed = 0u64;
+    let mut replay = spool
+        .into_reader()
+        .await
+        .map_err(|e| format!("bootstrap: deferred spool seal: {e}"))?;
+    while let Some(mut tuple) = replay
+        .next()
+        .await
+        .map_err(|e| format!("bootstrap: deferred spool replay: {e}"))?
+    {
+        let Some(rel) = catalog.get(tuple.rfn.db_node, tuple.rfn.rel_node) else {
+            stats.unsupported_relations.fetch_add(1, Ordering::Relaxed);
+            continue;
+        };
+        let Some(route) = routes.get(&rel.rel_name).cloned() else {
+            stats.unsupported_relations.fetch_add(1, Ordering::Relaxed);
+            continue;
+        };
+        let at = *seq.get_or_insert_with(|| {
+            ack.register(first_seq, tuple.source_lsn);
+            first_seq
+        });
+        let permit = resolve_or_fill_toast(&mut tuple, &rel, &route.mapping, resolver).await?;
+        render_ext_columns(&rel.attributes, &mut tuple.columns);
+        out.push(msg_tx, at, rel, route, tuple, permit).await?;
+        placed += 1;
+    }
+    out.flush(msg_tx).await?;
+    replay
+        .finish()
+        .await
+        .map_err(|e| format!("bootstrap: deferred spool cleanup: {e}"))?;
+    let next_seq = match seq {
+        Some(s) => {
+            ack.placed(s, placed);
+            s + 1
+        }
+        None => first_seq,
+    };
     Ok(BootstrapDrainOutcome {
         next_seq,
-        rows_routed,
+        rows_routed: placed,
+        deferred: None,
     })
 }
 
@@ -324,7 +474,8 @@ async fn resolve_or_fill_toast(
                     _ => "has no chunks in the store".into(),
                 };
                 return Err(format!(
-                    "bootstrap: relation {} column {} value_id={} on toast relid={}: {detail}",
+                    "bootstrap: relation {} column {} value_id={} on toast relid={}: \
+                     {detail}; remedy: fresher backup, or initial_load='copy'",
                     rel.rel_name, c.target_name, p.va_valueid, p.va_toastrelid
                 ));
             }
@@ -573,7 +724,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn repaired_input_rejects_external_pointers() {
+    async fn detoasted_input_rejects_external_pointers() {
         let mut catalog = CatalogMap::new();
         catalog.insert(rel(16400));
         let mapping = Arc::new(
@@ -588,22 +739,23 @@ mod tests {
             .await
             .unwrap();
         drop(tx);
+        let stats = Arc::new(EmitterStats::default());
         let err = drain(
             rx,
             catalog,
             mapping,
             msg_tx,
             ack,
-            Arc::new(EmitterStats::default()),
-            ToastResolver::disabled(),
-            None,
+            stats.clone(),
+            ToastResolver::with_store(Arc::new(MemChunkStore::new()), stats),
+            Deferral::Rejected,
             Default::default(),
             None,
             HashSet::new(),
         )
         .await
         .unwrap_err();
-        assert!(err.contains("unrepaired external value"), "{err}");
+        assert!(err.contains("undeferrable external value"), "{err}");
         collector.await.unwrap();
     }
 
@@ -641,7 +793,7 @@ mod tests {
             ack.clone(),
             stats.clone(),
             ToastResolver::disabled(),
-            Some(mem_spool()),
+            Deferral::Local(mem_spool()),
             Default::default(),
             None,
             HashSet::new(),
@@ -694,7 +846,7 @@ mod tests {
             ack.clone(),
             stats.clone(),
             ToastResolver::disabled(),
-            Some(mem_spool()),
+            Deferral::Local(mem_spool()),
             Default::default(),
             None,
             HashSet::new(),
@@ -745,7 +897,7 @@ mod tests {
             ack.clone(),
             stats.clone(),
             resolver,
-            Some(mem_spool()),
+            Deferral::Local(mem_spool()),
             Default::default(),
             None,
             HashSet::new(),
@@ -808,7 +960,7 @@ mod tests {
             stats.clone(),
             ToastResolver::with_store(store, stats.clone()),
             // Threshold 0: deferred referrer rides a real spool file
-            Some(DeferredSpool::new(
+            Deferral::Local(DeferredSpool::new(
                 spool_tmp.path().join("bootstrap_deferred.bin"),
                 0,
             )),
@@ -829,6 +981,166 @@ mod tests {
         assert_eq!(stats.toast_values_fetched.load(Ordering::Relaxed), 1);
         drop(ack);
         collector.await.unwrap();
+    }
+
+    /// Handback leaves a referrer unrouted: a lane cannot know when its
+    /// siblings' chunk puts landed, so resolution is the caller's call
+    #[tokio::test]
+    async fn handback_defers_resolution_to_the_caller() {
+        let mut catalog = CatalogMap::new();
+        catalog.insert(bytea_rel(16400));
+        catalog.insert(toast_rel(16500));
+        let mut tables = HashMap::new();
+        tables.insert(RelName::new("public", "t16400"), bytea_mapping_for(16400));
+        let mapping = Arc::new(tables);
+
+        let (ack, collector) = ack::spawn(Arc::new(crate::pos::Monotone::new(0)));
+        let (msg_tx, mut msg_rx) = mpsc::channel::<BatcherMsg>(64);
+        let (tup_tx, tup_rx) = mpsc::channel::<Vec<BackfillTuple>>(64);
+        tup_tx
+            .send(vec![toast_chunk_tuple(16500, 1, 0, b"hello")])
+            .await
+            .unwrap();
+        tup_tx
+            .send(vec![bytea_toast_tuple(16400, 16500, 1)])
+            .await
+            .unwrap();
+        drop(tup_tx);
+
+        let stats = Arc::new(EmitterStats::default());
+        let resolver = ToastResolver::with_store(Arc::new(MemChunkStore::new()), stats.clone());
+        let mut outcome = drain(
+            tup_rx,
+            catalog.clone(),
+            mapping.clone(),
+            msg_tx.clone(),
+            ack.clone(),
+            stats.clone(),
+            resolver.clone(),
+            Deferral::Handback(mem_spool()),
+            Default::default(),
+            None,
+            HashSet::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome.rows_routed, 0, "handback routes no referrer");
+        let spool = outcome.deferred.take().expect("referrer handed back");
+        assert_eq!(spool.records(), 1);
+        assert_eq!(
+            stats.bootstrap_deferred_bytes.load(Ordering::Relaxed),
+            spool.resident_bytes() as u64,
+            "handed-back bytes stay charged until the caller replays them",
+        );
+
+        let resolved = drain_deferred(
+            spool,
+            &catalog,
+            &mapping,
+            &msg_tx,
+            &ack,
+            &stats,
+            &resolver,
+            &Default::default(),
+            None,
+            outcome.next_seq,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resolved.rows_routed, 1);
+        assert_eq!(
+            stats.bootstrap_deferred_bytes.load(Ordering::Relaxed),
+            0,
+            "replay releases the bytes it adopted",
+        );
+        drop(msg_tx);
+
+        let rows = collect_rows(&mut msg_rx).await;
+        assert_eq!(rows.len(), 1);
+        let cols = &rows[0].committed.decoded.new.as_ref().unwrap().columns;
+        assert_eq!(cols[0], Some(ColumnValue::Bytea(b"hello".to_vec())));
+        drop(ack);
+        collector.await.unwrap();
+    }
+
+    /// Lanes share one gauge pair, so each charges its own spool and a
+    /// finishing lane leaves its peers' bytes standing
+    #[tokio::test]
+    async fn lane_footprints_add_up_and_release_one_at_a_time() {
+        let mut catalog = CatalogMap::new();
+        catalog.insert(bytea_rel(16400));
+        catalog.insert(toast_rel(16500));
+        let mut tables = HashMap::new();
+        tables.insert(RelName::new("public", "t16400"), bytea_mapping_for(16400));
+        let mapping = Arc::new(tables);
+        let stats = Arc::new(EmitterStats::default());
+        let resolver = ToastResolver::with_store(Arc::new(MemChunkStore::new()), stats.clone());
+        let (msg_tx, _msg_rx) = mpsc::channel::<BatcherMsg>(64);
+
+        let mut lanes = Vec::new();
+        for value_id in [1, 2] {
+            let (ack, collector) = ack::spawn(Arc::new(crate::pos::Monotone::new(0)));
+            let (tup_tx, tup_rx) = mpsc::channel::<Vec<BackfillTuple>>(64);
+            let mut chunk = toast_chunk_tuple(16500, value_id, 0, b"hello");
+            // Store keys generations by TID, so each lane needs its own
+            chunk.offnum = value_id as u16;
+            tup_tx.send(vec![chunk]).await.unwrap();
+            tup_tx
+                .send(vec![bytea_toast_tuple(16400, 16500, value_id)])
+                .await
+                .unwrap();
+            drop(tup_tx);
+            let mut outcome = drain(
+                tup_rx,
+                catalog.clone(),
+                mapping.clone(),
+                msg_tx.clone(),
+                ack.clone(),
+                stats.clone(),
+                resolver.clone(),
+                Deferral::Handback(mem_spool()),
+                Default::default(),
+                None,
+                HashSet::new(),
+            )
+            .await
+            .unwrap();
+            let spool = outcome.deferred.take().expect("referrer handed back");
+            lanes.push((spool, ack, collector, outcome.next_seq));
+        }
+
+        let mut remaining: u64 = lanes.iter().map(|(s, ..)| s.resident_bytes() as u64).sum();
+        assert!(remaining > 0, "both lanes hold resident referrers");
+        assert_eq!(
+            stats.bootstrap_deferred_bytes.load(Ordering::Relaxed),
+            remaining,
+            "gauge sums the lanes",
+        );
+
+        for (spool, ack, collector, first_seq) in lanes {
+            remaining -= spool.resident_bytes() as u64;
+            drain_deferred(
+                spool,
+                &catalog,
+                &mapping,
+                &msg_tx,
+                &ack,
+                &stats,
+                &resolver,
+                &Default::default(),
+                None,
+                first_seq,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                stats.bootstrap_deferred_bytes.load(Ordering::Relaxed),
+                remaining,
+                "replay releases only its own bytes",
+            );
+            drop(ack);
+            collector.await.unwrap();
+        }
     }
 
     /// Referrer deferred past the walk still routes under the pass's frozen
@@ -866,7 +1178,7 @@ mod tests {
             ack.clone(),
             stats.clone(),
             ToastResolver::with_store(store, stats.clone()),
-            Some(mem_spool()),
+            Deferral::Local(mem_spool()),
             Default::default(),
             None,
             HashSet::new(),

@@ -177,7 +177,7 @@ async fn bootstrap_tail_fans_out_n2() {
         ack.clone(),
         stats.clone(),
         ToastResolver::disabled(),
-        None,
+        bootstrap::Deferral::Rejected,
         Default::default(),
         None,
         ahash::HashSet::default(),

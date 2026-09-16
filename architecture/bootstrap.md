@@ -19,19 +19,27 @@ and spill constrain memory while backup and insertion proceed independently
 
 Shadow is not ready during this phase. A temporary PostgreSQL instance built
 from source schema converts values that need PostgreSQL's type machinery
-Relation repair reads source rows when physical pages cannot provide a reliable
-visible value
+
+Rows carrying external values wait for the chunk mirror the same walk writes.
+Walk lanes finish independently, so resolution starts once every lane flushed
+its chunks. A value the mirror cannot reassemble stops the load rather than
+substituting one
+
+Rows written before backup redo can remain undecided after handoff. Retain them
+in pending tables beside destinations until commit or abort decides visibility.
+Promote survivors at original coverage version so later streamed changes win
 
 Handoff waits for required insertion and recovery work, then persists restart
 position before steady streaming advances it. Transactions still open can lower
-resume position into backup window. This does not recover every change before
-backup redo, see [remaining visibility work](../plans/bootstrap.md)
+resume position into backup window. See
+[remaining visibility work](../plans/bootstrap.md)
 
 ## Per-table loads
 
-COPY loads use PostgreSQL's SQL visibility. Backup-based loads use page walk and
-WAL replay without replacing existing shadow. Destination staging separates
-partial initial state from published table
+`initial_load = "copy"`, selected by default by `init`, scans selected table
+through PostgreSQL for visible rows and detoasted values. Backup-based loads
+use page walk and WAL replay without replacing existing shadow. Destination
+staging separates partial initial state from published table
 
 Replay of archived WAL between backup and selection point follows the branch the
 stream proved, cross-checked against archived history. Reject backups whose redo
@@ -51,5 +59,6 @@ Staging changes what destination materialized views observe. See
 Start in [bootstrap](../src/backfill/backfill_bootstrap.rs),
 [window replay](../src/backfill/bootstrap_window.rs),
 [visibility gate](../src/backfill/visibility_gate.rs),
+[pending visibility](../src/backfill/visibility_pending.rs),
 [table backfill](../src/backfill/backup_backfill.rs), and
 [staging](../src/backfill/backfill_staging.rs)

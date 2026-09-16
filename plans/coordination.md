@@ -7,7 +7,7 @@ plans; these contracts identify changes that cannot be designed independently
 |---|---|---|
 | WAL publication before decoder dispatch | [Replay callback](custom_rmgr.md), [shadow TOAST](shadow_toast.md), [performance](performance.md) | Arm or classify before publishing bytes, then prove every decoder replay wait remains reachable under backpressure |
 | Filtered archives and manifests | [Replay callback](custom_rmgr.md), [shadow TOAST](shadow_toast.md), [failover](failover.md) | Recover original record meaning, gate destructive bytes on every recovery path, validate branch and fork prefix before publication |
-| Durable resume floor | [Bootstrap](bootstrap.md), [verification](verification.md), [shadow TOAST](shadow_toast.md), [destinations](extensions.md#multiple-clickhouse-destinations) | Account for unresolved transactions, carry, deferred reads, queued work, and every required destination before retention or cleanup advances |
+| Durable resume floor | [Bootstrap](bootstrap.md), [verification](verification.md), [shadow TOAST](shadow_toast.md), [destinations](extensions.md#multiple-clickhouse-destinations) | Account for unresolved transactions, pending rows, deferred reads, queued work, and every required destination before retention or cleanup advances |
 | Full physical identity | [Tablespaces](tablespaces.md), [catalog](catalog.md), [shadow TOAST](shadow_toast.md) | Key by tablespace, database, and filenode; preserve relation OID and generation separately for logical ownership and retirement |
 | Schema planning and route snapshots | [Schema](schema.md), [runtime config](runtime_config.md), [fuzzing](fuzzing.md), [destinations](extensions.md#multiple-clickhouse-destinations) | Validate transaction before effects, retain source baseline separately from destination projection, publish mapping after successful application |
 | Bootstrap jobs and deferred storage | [Performance](performance.md), [bootstrap](bootstrap.md), [shadow TOAST](shadow_toast.md) | Assign completion identity before parallel decode, retain original load version, make deferral safe for concurrent writers and restart |
@@ -33,7 +33,7 @@ things. Do not reuse one watermark merely because each is represented as an LSN
 
 ## Persistence changes
 
-For every new carry file, manifest, cursor field, or durable destination queue,
+For every new pending row file, manifest, cursor field, or durable destination queue,
 specify identity, format version, write/fsync/publication order, startup recovery,
 and cleanup condition. Test old-format startup and interrupted replacement
 Never recover by scanning anonymous scratch files and assuming they are complete

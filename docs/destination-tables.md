@@ -158,17 +158,10 @@ Override inferred type with name-based column rule, see
 ## Large toasted values
 
 Values stored externally by PostgreSQL need persistent chunk history when
-references predate replication window. Enable ClickHouse-backed TOAST storage
-for full reconstruction across bootstrap and restarts
-
-```toml
-[toast]
-mode = "clickhouse"
-```
-
-Default `disabled` mode fills unrecoverable values with null or column default
-and reports counters. Enable `clickhouse` before initial load for workloads with
-large text, JSON, arrays, or bytea values
+references predate replication window. ClickHouse output always stores TOAST
+chunks in ClickHouse mirrors for reconstruction across bootstrap and restarts
+No mode selection is required. `[toast]` controls only
+[buffering and connections](configuration.md#toast-buffering)
 
 Missing required mirror tables stop replication. Do not delete active mirrors
 to reduce disk use. Relation-drop cleanup can leave empty mirror tables until

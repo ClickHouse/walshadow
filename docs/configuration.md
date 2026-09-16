@@ -129,7 +129,7 @@ Require restart:
 - `replicate_all`
 - runtime-config schema
 - cluster-wide `[system_columns]` names
-- soft-delete and TOAST modes
+- soft-delete mode and TOAST buffering settings
 - worker-pool sizes and memory limits
 - backup and shadow bootstrap choices
 

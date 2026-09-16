@@ -299,16 +299,6 @@ pub async fn drain_backfill<O: TupleObserver + ?Sized>(
 /// filenode. Wrap in [`seed_in_snapshot`] when DDL quiescence isn't external.
 /// Filenode 0 (partitioned parents, views) has no heap to page-walk; skipped.
 pub async fn seed_catalog_from_source(client: &Client) -> Result<CatalogMap> {
-    seed_catalog(client, None).await
-}
-
-/// Re-read one relation for descriptor validation. Silent: repair calls it
-/// once per locked batch, not once per pass
-pub(crate) async fn seed_relation_from_source(client: &Client, oid: u32) -> Result<CatalogMap> {
-    seed_catalog(client, Some(oid)).await
-}
-
-async fn seed_catalog(client: &Client, oid: Option<u32>) -> Result<CatalogMap> {
     let db_oid = current_database_oid(client).await?;
     let rows = client
         .query(
@@ -327,9 +317,8 @@ async fn seed_catalog(client: &Client, oid: Option<u32>) -> Result<CatalogMap> {
                 coalesce(pg_relation_filenode(c.oid), 0)::oid \
              FROM pg_class c \
              JOIN pg_namespace n ON n.oid = c.relnamespace \
-             WHERE c.oid >= 16384 AND c.relkind IN ('r', 't', 'm') \
-               AND ($1::oid IS NULL OR c.oid = $1)",
-            &[&oid],
+             WHERE c.oid >= 16384 AND c.relkind IN ('r', 't', 'm')",
+            &[],
         )
         .await
         .context("bootstrap: enumerate user relations on source")?;
@@ -370,13 +359,11 @@ async fn seed_catalog(client: &Client, oid: Option<u32>) -> Result<CatalogMap> {
         };
         map.insert(Arc::new(desc));
     }
-    if oid.is_none() {
-        tracing::info!(
-            target = "walshadow::backfill_bootstrap",
-            relations = map.len(),
-            "catalog seed populated"
-        );
-    }
+    tracing::info!(
+        target = "walshadow::backfill_bootstrap",
+        relations = map.len(),
+        "catalog seed populated"
+    );
     Ok(map)
 }
 
