@@ -1,7 +1,8 @@
 //! User-heap tuple decoder + Tier 1/2 type matrix.
 //!
 //! Tier 1 (fixed-width) + Tier 2 (length-prefixed mechanical) types decode
-//! inline; Tier 3 (`numeric`, `jsonb`, arrays) defers to the codecs.
+//! inline, `numeric` and `jsonb` through [`crate::decode::codecs`]; Tier 3
+//! (arrays, extension types) surfaces raw bytes for the oracle.
 //!
 //! ## WAL layout (PG `access/heapam_xlog.h`, `heapam.c::heap_xlog_*`)
 //!
@@ -70,9 +71,9 @@ use walrus::pg::walparser::{RelFileNode, RmId, XLogRecord};
 
 use crate::schema::{
     BOOLOID, BPCHAROID, BYTEAOID, CHAROID, CIDROID, DATEOID, FLOAT4OID, FLOAT8OID, INETOID,
-    INT2OID, INT4OID, INT8OID, INTERVALOID, JSONOID, MissingDefault, NAMEOID, NUMERICOID, OIDOID,
-    RelAttr, RelDescriptor, ReplIdent, TEXTOID, TIMEOID, TIMESTAMPOID, TIMESTAMPTZOID, TIMETZOID,
-    UUIDOID, VARCHAROID,
+    INT2OID, INT4OID, INT8OID, INTERVALOID, JSONBOID, JSONOID, MissingDefault, NAMEOID, NUMERICOID,
+    OIDOID, RelAttr, RelDescriptor, ReplIdent, TEXTOID, TIMEOID, TIMESTAMPOID, TIMESTAMPTZOID,
+    TIMETZOID, UUIDOID, VARCHAROID,
 };
 
 /// SmallVec sized at 1: single-row INSERT/UPDATE/DELETE stays stack-allocated,
@@ -231,15 +232,17 @@ pub enum ColumnValue {
     /// `text`/`varchar`/`bpchar`, varlena + UTF-8 decode. Invalid UTF-8
     /// surfaces as [`ColumnValue::Bytea`].
     Text(String),
-    /// `numeric` Tier 3. PG-text form for finite; NaN/Infinity carry their
+    /// `numeric` Tier 2. PG-text form for finite; NaN/Infinity carry their
     /// flag. Emitter maps to CH `String` (PG precision is per-row, no fixed
     /// CH `Decimal` fits without operator config).
     Numeric(crate::decode::codecs::NumericKind),
-    /// `inet`/`cidr` Tier 3. Emit via [`crate::decode::codecs::InetValue::to_text`].
+    /// `inet`/`cidr` Tier 2. Emit via [`crate::decode::codecs::InetValue::to_text`].
     Inet(crate::decode::codecs::InetValue),
-    /// `interval` Tier 3, 16-byte fixed-width (months, days, micros).
+    /// `interval` Tier 2, 16-byte fixed-width (months, days, micros).
     Interval(crate::decode::codecs::IntervalValue),
-    /// `json` Tier 3, varlena text on disk, passed through unchanged.
+    /// JSON document text: `json` is varlena text on disk and passes
+    /// through unchanged, `jsonb` renders through
+    /// [`crate::decode::codecs::decode_jsonb`].
     Json(String),
     /// Unhandled on-disk Datum body, varlena header stripped
     PgPending {
@@ -956,7 +959,8 @@ pub(crate) fn missing_value_from_text(type_oid: u32, text: &str) -> ColumnValue 
             .map(ColumnValue::Oid)
             .unwrap_or(ColumnValue::Null),
         TEXTOID | VARCHAROID | BPCHAROID | NAMEOID => ColumnValue::Text(text.to_owned()),
-        JSONOID => ColumnValue::Json(text.to_owned()),
+        // `jsonb` arrives as `jsonb_out` text, already what the emitter ships
+        JSONOID | JSONBOID => ColumnValue::Json(text.to_owned()),
         // attmissingval text requires typinput
         _ => ColumnValue::PgPendingText {
             type_oid,
@@ -1318,7 +1322,14 @@ pub(crate) fn varlena_to_value(type_oid: u32, body: Cow<[u8]>) -> ColumnValue {
             Ok(s) => ColumnValue::Json(s),
             Err(e) => ColumnValue::Bytea(e.into_bytes()),
         },
-        // Tier 3 deferred: jsonb, range types, arrays (typcategory='A'),
+        JSONBOID => match crate::decode::codecs::decode_jsonb(&body) {
+            Ok(s) => ColumnValue::Json(s),
+            Err(_) => ColumnValue::Unsupported {
+                type_oid,
+                raw: body.into_owned(),
+            },
+        },
+        // Tier 3 deferred: range types, arrays (typcategory='A'),
         // tsvector etc. Carries full on-disk body so the SQL bridge
         // reconstructs the varlena Datum; walshadow extension resolves at emit
         _ => ColumnValue::PgPending {
@@ -1333,7 +1344,15 @@ pub(crate) fn local_matrix_covers(type_oid: u32, type_len: i16) -> bool {
     match type_len {
         -1 => matches!(
             type_oid,
-            BYTEAOID | TEXTOID | VARCHAROID | BPCHAROID | NUMERICOID | INETOID | CIDROID | JSONOID
+            BYTEAOID
+                | TEXTOID
+                | VARCHAROID
+                | BPCHAROID
+                | NUMERICOID
+                | INETOID
+                | CIDROID
+                | JSONOID
+                | JSONBOID
         ),
         -2 => true,
         _ => matches!(
@@ -1448,6 +1467,10 @@ mod tests {
     use walrus::pg::walparser::{
         BlockLocation, XLogRecordBlock, XLogRecordBlockHeader, XLogRecordHeader,
     };
+
+    /// Fringe varlena type with no local codec, standing in for anything the
+    /// oracle converts
+    const TSVECTOROID: u32 = 3614;
 
     fn rel_attr(
         attnum: i16,
@@ -1922,9 +1945,9 @@ mod tests {
 
     #[test]
     fn decode_unsupported_type_emits_pending() {
-        // jsonb=3802 is outside the local matrix; varlena fall-through yields
+        // tsvector is outside the local matrix; varlena fall-through yields
         // PgPending preserving raw bytes (shadow extension resolves at emit)
-        let rel = descriptor(16397, vec![rel_attr(1, "j", 3802, -1, 'i')]);
+        let rel = descriptor(16397, vec![rel_attr(1, "t", TSVECTOROID, -1, 'i')]);
         let body = b"\x01opaque";
         let total = 4 + body.len();
         let header_u32 = (total as u32) << 2;
@@ -1938,7 +1961,7 @@ mod tests {
         let new = out.new.unwrap();
         match &new.columns[0] {
             Some(ColumnValue::PgPending { type_oid, raw }) => {
-                assert_eq!(*type_oid, 3802);
+                assert_eq!(*type_oid, TSVECTOROID);
                 assert_eq!(raw.as_slice(), body);
             }
             other => panic!("expected PgPending, got {other:?}"),
@@ -2116,8 +2139,6 @@ mod tests {
         assert_eq!(missing_value_for(&none), ColumnValue::Null);
     }
 
-    const JSONBOID: u32 = 3802;
-
     #[test]
     fn fast_default_raw_scalar_decodes_to_value() {
         let mut a = rel_attr(1, "x", INT4OID, 4, 'i');
@@ -2140,20 +2161,31 @@ mod tests {
 
     #[test]
     fn fast_default_raw_tier3_stays_pending_not_dropped() {
-        // jsonb has no lock-free text form: raw must survive as pending, not NULL
-        let mut a = rel_attr(1, "j", JSONBOID, -1, 'i');
+        // tsvector has no local text form: raw must survive as pending, not NULL
+        let mut a = rel_attr(1, "t", TSVECTOROID, -1, 'i');
         let body = [0x01u8, 0x20, 0x00];
         a.missing_default = Some(MissingDefault::Raw(raw_missing_array(
-            JSONBOID,
+            TSVECTOROID,
             &short_varlena(&body),
         )));
         match missing_value_for(&a) {
             ColumnValue::PgPending { type_oid, raw } => {
-                assert_eq!(type_oid, JSONBOID);
+                assert_eq!(type_oid, TSVECTOROID);
                 assert_eq!(raw, body);
             }
             other => panic!("tier-3 fast default must stay pending, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn fast_default_raw_jsonb_renders_its_document() {
+        // `{}`: bare container header, JB_FOBJECT with no pairs
+        let mut a = rel_attr(1, "j", JSONBOID, -1, 'i');
+        a.missing_default = Some(MissingDefault::Raw(raw_missing_array(
+            JSONBOID,
+            &short_varlena(&0x2000_0000u32.to_le_bytes()),
+        )));
+        assert_eq!(missing_value_for(&a), ColumnValue::Json("{}".into()));
     }
 
     #[test]
@@ -2178,14 +2210,31 @@ mod tests {
         text8.missing_default = Some("8".into());
         assert!(!missing_defaults_equivalent(&raw7, &text8));
 
+        let mut raw_ts = rel_attr(1, "t", TSVECTOROID, -1, 'i');
+        raw_ts.missing_default = Some(MissingDefault::Raw(raw_missing_array(
+            TSVECTOROID,
+            &short_varlena(&[0x01, 0x20, 0x00]),
+        )));
+        let mut text_ts = rel_attr(1, "t", TSVECTOROID, -1, 'i');
+        text_ts.missing_default = Some("'a' 'b'".into());
+        assert!(missing_defaults_equivalent(&raw_ts, &text_ts));
+    }
+
+    /// Raw and text both render, so jsonb equivalence is by document
+    #[test]
+    fn fast_default_equivalent_across_raw_and_text_jsonb() {
         let mut raw_j = rel_attr(1, "j", JSONBOID, -1, 'i');
         raw_j.missing_default = Some(MissingDefault::Raw(raw_missing_array(
             JSONBOID,
-            &short_varlena(&[0x01, 0x20, 0x00]),
+            &short_varlena(&0x2000_0000u32.to_le_bytes()),
         )));
         let mut text_j = rel_attr(1, "j", JSONBOID, -1, 'i');
-        text_j.missing_default = Some(r#"{"k": 1}"#.into());
+        text_j.missing_default = Some("{}".into());
         assert!(missing_defaults_equivalent(&raw_j, &text_j));
+
+        let mut other = rel_attr(1, "j", JSONBOID, -1, 'i');
+        other.missing_default = Some(r#"{"a": 1}"#.into());
+        assert!(!missing_defaults_equivalent(&raw_j, &other));
     }
 
     #[test]

@@ -1379,20 +1379,23 @@ mod tests {
     #[test]
     fn unresolved_disk_default_renders_no_default_clause() {
         use crate::decode::heap_decoder::{raw_missing_array, short_varlena};
-        use crate::schema::{JSONBOID, MissingDefault};
+        use crate::schema::MissingDefault;
+        /// Fringe varlena type with no local codec
+        const TSVECTOROID: u32 = 3614;
 
-        let mut labels = att(2, "labels", JSONBOID, true, None);
+        let mut labels = att(2, "labels", TSVECTOROID, true, None);
+        labels.type_name = "tsvector".into();
         labels.type_byval = false;
         labels.type_len = -1;
         labels.type_storage = 'x';
         labels.missing_default = Some(MissingDefault::Raw(raw_missing_array(
-            JSONBOID,
+            TSVECTOROID,
             &short_varlena(&[0x01, 0x20, 0x00]),
         )));
         let resolved = type_bridge::map(&labels, false).unwrap();
         assert_eq!(
             render_add_column("default.t", "labels", &resolved),
-            "ALTER TABLE default.t ADD COLUMN IF NOT EXISTS `labels` JSON"
+            "ALTER TABLE default.t ADD COLUMN IF NOT EXISTS `labels` String"
         );
         let d = desc(
             "t",
@@ -1407,12 +1410,12 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert!(sql.contains("`labels` JSON,"), "{sql}");
+        assert!(sql.contains("`labels` String,"), "{sql}");
         assert!(!sql.contains("DEFAULT"), "{sql}");
     }
 
     #[test]
-    fn resolved_disk_default_renders_on_add_column() {
+    fn jsonb_disk_default_renders_on_add_column() {
         use crate::schema::JSONBOID;
 
         let mut labels = att(2, "labels", JSONBOID, true, Some(r#"{"a": 1}"#));
@@ -1422,8 +1425,7 @@ mod tests {
         let resolved = type_bridge::map(&labels, false).unwrap();
         assert_eq!(
             render_add_column("default.t", "labels", &resolved),
-            "ALTER TABLE default.t ADD COLUMN IF NOT EXISTS `labels` JSON \
-             DEFAULT unhex('7b2261223a20317d')"
+            r#"ALTER TABLE default.t ADD COLUMN IF NOT EXISTS `labels` JSON DEFAULT '{"a": 1}'"#
         );
     }
 

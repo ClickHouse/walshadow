@@ -316,7 +316,9 @@ mod tests {
     use crate::column_rules::{ColumnRule, ColumnRulesBuilder};
     use crate::decode::heap_decoder::local_matrix_covers;
     use crate::mapping::{TableMapping, TableTarget, derive_columns_for_mapping};
-    use crate::schema::{INT4OID, JSONOID, RelAttr, RelDescriptor, RelName, ReplIdent, TEXTOID};
+    use crate::schema::{
+        INT4OID, JSONBOID, JSONOID, RelAttr, RelDescriptor, RelName, ReplIdent, TEXTOID,
+    };
     use crate::table_rules::MatchKind;
     use ahash::HashMap;
 
@@ -382,26 +384,30 @@ mod tests {
         b.finish().0
     }
 
+    /// CH takes a `JSON` column as a string body, so the document the local
+    /// codecs render needs no conversion
     #[test]
-    fn json_target_needs_oracle_though_source_decodes_locally() {
-        assert!(
-            local_matrix_covers(JSONOID, -1),
-            "premise: json decodes local"
-        );
+    fn json_targets_need_no_oracle() {
         let rules = ColumnRules::default();
-        let (catalog, tables) = bridged(
-            rel(vec![
-                attr(1, "id", INT4OID, "int4", 4),
-                attr(2, "doc", JSONOID, "json", -1),
-            ]),
-            &rules,
-        );
-        assert_eq!(
-            tables[&RelName::new("public", "foo")].columns[1].target_type,
-            "Nullable(JSON)",
-            "premise: default bridge maps json to a composite CH target",
-        );
-        assert!(needs_oracle(&catalog, &tables, &rules));
+        for (oid, name) in [(JSONOID, "json"), (JSONBOID, "jsonb")] {
+            assert!(
+                local_matrix_covers(oid, -1),
+                "premise: {name} decodes local"
+            );
+            let (catalog, tables) = bridged(
+                rel(vec![
+                    attr(1, "id", INT4OID, "int4", 4),
+                    attr(2, "doc", oid, name, -1),
+                ]),
+                &rules,
+            );
+            assert_eq!(
+                tables[&RelName::new("public", "foo")].columns[1].target_type,
+                "Nullable(JSON)",
+                "premise: default bridge maps {name} to a CH JSON target",
+            );
+            assert!(!needs_oracle(&catalog, &tables, &rules), "{name}");
+        }
     }
 
     #[test]
