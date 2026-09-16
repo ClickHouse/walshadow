@@ -291,21 +291,38 @@ impl GreenfieldSink {
 
 impl RepairDrain {
     /// Joins every stage before surfacing an error, so a failed repair still
-    /// lets the drains finish what they hold
+    /// lets the drains finish what they hold. The drain owns the receiver, so a
+    /// repair `drain closed early` is only a symptom of the drain dying first;
+    /// surface the drain's error ahead of the repair's, and log both, so the
+    /// real cause is never swallowed by its own downstream symptom.
     pub async fn join(self) -> Result<(RepairStats, Vec<BootstrapDrainOutcome>), String> {
-        let mut repairs = Vec::with_capacity(self.lanes.len());
-        let mut drains = Vec::with_capacity(self.lanes.len());
-        for lane in self.lanes {
-            repairs.push(join_stage(lane.repair, "row repair").await);
-            drains.push(join_stage(lane.drain, "drain").await);
-        }
         let mut repaired = RepairStats::default();
-        for r in repairs {
-            let r = r?;
-            repaired.rows += r.rows;
-            repaired.p_hi = repaired.p_hi.max(r.p_hi);
+        let mut drained = Vec::with_capacity(self.lanes.len());
+        let mut first_err: Option<String> = None;
+        for lane in self.lanes {
+            let repair = join_stage(lane.repair, "row repair").await;
+            let drain = join_stage(lane.drain, "drain").await;
+            for e in [repair.as_ref().err(), drain.as_ref().err()]
+                .into_iter()
+                .flatten()
+            {
+                tracing::error!(target: "walshadow::bootstrap", error = %e, "repair lane stage failed");
+            }
+            if first_err.is_none() {
+                first_err = drain.as_ref().err().or(repair.as_ref().err()).cloned();
+            }
+            if let Ok(r) = &repair {
+                repaired.rows += r.rows;
+                repaired.p_hi = repaired.p_hi.max(r.p_hi);
+            }
+            if let Ok(d) = drain {
+                drained.push(d);
+            }
         }
-        Ok((repaired, drains.into_iter().collect::<Result<_, _>>()?))
+        if let Some(e) = first_err {
+            return Err(e);
+        }
+        Ok((repaired, drained))
     }
 }
 
