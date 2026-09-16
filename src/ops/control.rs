@@ -390,7 +390,7 @@ async fn stream_status(ctx: &SharedCtx) -> Result<String> {
         (snap.shadow_apply_lag_bytes as i64).into(),
     );
     out.insert("lag_seconds".into(), snap.shadow_apply_lag_seconds.into());
-    out.insert("uptime_secs".into(), (snap.uptime_secs as i64).into());
+    out.insert("uptime_secs".into(), (snap.uptime_seconds as i64).into());
     // `show` reports the configured endpoint; this reports whether the pump
     // reached it, which is what an endpoint move waits on, and which proof
     // stopped it when it did not

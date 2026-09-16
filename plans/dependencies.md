@@ -18,11 +18,7 @@ If a full adapter cannot preserve credential behavior, evaluate narrower signing
 and token-management libraries. Treat this as an alternative to a full backend
 replacement, not a reason to stack both approaches
 
-## Metrics and throttling
-
-Consider a standard Prometheus encoder when label, histogram, or escaping
-complexity warrants it. Preserve metric names and bound label cardinality
-Changing encoder does not require replacing HTTP endpoint
+## Throttling
 
 Consider a rate limiter when measured requirements include aggregate budgets,
 burst limits, or fairness across concurrent readers. Preserve cancellation and
@@ -82,57 +78,12 @@ readers, reader replacement, idle bursts, short reads, EOF, cancellation, rates
 below chunk size, and rates above u32 byte range. Measure contention before
 claiming fairness or throughput improvement
 
-## Encoding: prometheus-client
-
-Prefer prometheus-client for a planned encoding migration, after resolving sample
-name compatibility. `src/ops/metrics.rs::render` contains roughly 950 lines of
-declarations and formatting, with another renderer in `src/ops/stages.rs`
-Most labels are fixed, so escaping is currently limited exposure; declarations
-and domain snapshots remain necessary even after replacing wire formatting
-
-Keep MetricsSnapshot and existing atomic counters. Await snapshot acquisition
-before synchronous encoding, expose owned snapshot through a
-[Collector](https://docs.rs/prometheus-client/0.25.0/prometheus_client/collector/trait.Collector.html)
-with const metrics or direct MetricEncoder calls. Avoid duplicating counters in
-a second mutable registry. Preserve integer values without i64 casts and keep
-RateEstimator local
-
-[Text encoding](https://docs.rs/prometheus-client/0.25.0/prometheus_client/encoding/text/index.html)
-emits OpenMetrics, appends `_total` to counter sample names, and terminates with
-`# EOF`. Register conventional counters without their existing `_total` suffix
-Resolve these legacy counter names before migration:
-
-- `walshadow_uptime_seconds`
-- `walshadow_desc_capture_total_sql`
-- `walshadow_desc_capture_total_log_replay`
-- `walshadow_xact_plan_bytes`
-- `walshadow_xact_plan_rows`
-- `walshadow_raw_stash_bytes`
-
-Strict preservation of counter names and types prevents a direct standard
-OpenMetrics conversion for these families. Plan explicit name migration or
-retain existing encoding; avoid disguising counters as gauges or rewriting
-encoded output to remove suffixes
-
-Encode stage metrics before one final EOF marker. Keep HTTP endpoint, update
-Content-Type to `application/openmetrics-text; version=1.0.0; charset=utf-8`
-Preserve conditional families and bare plus labelled backfill-pending samples
-Verify parsed names, labels, values, types, one descriptor per family, infinity,
-escaping, stage inclusion, and successful scraping. Existing substring tests
-alone cannot establish wire-format compatibility
-
 ## Dependency review
-
-Reviewed governor 0.10.4 and prometheus-client 0.25.0
-This evaluation changes no runtime dependencies and makes no performance claim
 
 - [Governor manifest](https://github.com/boinkor-net/governor/blob/v0.10.4/governor/Cargo.toml):
   MIT, no declared rust-version. Start with default-features=false and std for
   direct limiter, avoid optional dashmap, quanta, and jitter dependencies unless
   needed. std still brings futures-timer; core includes nonzero_ext and spinning_top
-- [Prometheus-client manifest](https://docs.rs/crate/prometheus-client/0.25.0/source/Cargo.toml):
-  Apache-2.0 OR MIT, no declared rust-version. Default features empty, text path
-  uses dtoa, itoa, parking_lot, and derive encoder. Leave protobuf features off
+  Reviewing 0.10.4 claims nothing about throughput; no limiter is wired yet
 
-Repo CI uses stable Rust without declared MSRV. Verify candidate resolution,
-actual dependency delta, and build on supported toolchain during implementation
+Repo CI uses stable Rust without declared MSRV
