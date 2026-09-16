@@ -44,7 +44,7 @@ use std::pin::Pin;
 use tokio::sync::{Mutex, watch};
 use tokio_postgres::types::PgLsn;
 use tokio_util::sync::CancellationToken;
-use walrus::pg::backup::{BACKUP_NAME_PREFIX, format_pg_lsn};
+use walrus::pg::backup::format_pg_lsn;
 use walrus::pg::replication::base_backup::BaseBackupOpts;
 use walrus::pg::replication::conn::PgConfig;
 use walrus::pg::replication::tls::SslMode;
@@ -58,6 +58,7 @@ use walshadow::backfill_bootstrap::{
 use walshadow::backup_source::BackupSource;
 use walshadow::backup_source_direct::DirectSource;
 use walshadow::backup_source_object_store::ObjectStoreSource;
+use walshadow::bootstrap_marker::{self, BootstrapMarker};
 use walshadow::boundary_hold::{
     BoundaryGateConfig, BoundaryHoldSink, BoundaryHoldStats, CatalogBoundaryGate,
 };
@@ -994,42 +995,47 @@ async fn run_session(
     // keeps inserter and TOAST totals from resetting at handoff
     let emitter_stats = Arc::new(EmitterStats::default());
     let mut bootstrap_metrics: Option<BootstrapMetrics> = None;
-    let bootstrap_handoff: Option<BootstrapHandoff> =
-        if matches!(shadow_start, ShadowStart::Bootstrap(_)) {
-            if !args.skip_preflight {
-                let source_sql = feed
-                    .sql_client()
-                    .await
-                    .context("source sidecar sql for bootstrap pre-flight")?;
-                walshadow::preflight::bootstrap(walshadow::preflight::BootstrapInputs {
-                    source_sql,
-                    wal_from_archive: args.bootstrap_wal_from_archive,
-                    window_leg: bootstrap_plan.live_window_leg(args),
-                })
+    let bootstrap_handoff: Option<BootstrapHandoff> = if shadow_start.bootstraps() {
+        if !args.skip_preflight {
+            let source_sql = feed
+                .sql_client()
                 .await
-                .context("bootstrap pre-flight probe")?
-                .into_result()
-                .context("pre-flight rejected bootstrap")?;
-            }
-            let (handoff, stage) = run_bootstrap(
-                &cfg,
-                &mut feed,
-                args,
-                &bootstrap_plan,
-                ch_config.clone(),
-                BootstrapObservers {
-                    metrics: &metrics,
-                    emitter_stats: emitter_stats.clone(),
-                    uptime_from: start_instant,
-                },
-            )
+                .context("source sidecar sql for bootstrap pre-flight")?;
+            walshadow::preflight::bootstrap(walshadow::preflight::BootstrapInputs {
+                source_sql,
+                wal_from_archive: args.bootstrap_wal_from_archive,
+                window_leg: bootstrap_plan.live_window_leg(args),
+            })
             .await
-            .context("bootstrap")?;
-            bootstrap_metrics = Some(stage);
-            Some(handoff)
+            .context("bootstrap pre-flight probe")?
+            .into_result()
+            .context("pre-flight rejected bootstrap")?;
+        }
+        let previous = if let ShadowStart::Rebootstrap(_, marker) = &shadow_start {
+            Some(marker.clone())
         } else {
             None
         };
+        let (handoff, stage) = run_bootstrap(
+            &cfg,
+            &mut feed,
+            args,
+            &bootstrap_plan,
+            previous,
+            ch_config.clone(),
+            BootstrapObservers {
+                metrics: &metrics,
+                emitter_stats: emitter_stats.clone(),
+                uptime_from: start_instant,
+            },
+        )
+        .await
+        .context("bootstrap")?;
+        bootstrap_metrics = Some(stage);
+        Some(handoff)
+    } else {
+        None
+    };
     let bootstrap_end_lsn: Option<u64> = bootstrap_handoff.as_ref().map(|h| h.end_lsn);
     let bootstrap_resume_lsn: Option<u64> =
         bootstrap_handoff.as_ref().map(BootstrapHandoff::resume_lsn);
@@ -1037,7 +1043,9 @@ async fn run_session(
     // Keep shadow alive until pipeline teardown finishes
     let shadow_lifecycle: Option<ShadowLifecycle> = match &shadow_start {
         ShadowStart::External => None,
-        ShadowStart::Bootstrap(dir) | ShadowStart::Resume(dir) => {
+        ShadowStart::Bootstrap(dir)
+        | ShadowStart::Rebootstrap(dir, _)
+        | ShadowStart::Resume(dir) => {
             let shadow = Arc::new(build_owned_shadow(
                 args,
                 &source_conn.dbname,
@@ -2769,6 +2777,7 @@ async fn run_session(
                 oracle: [oracle_stats, bootstrap_metrics.as_ref().map(|b| &*b.oracle)],
                 bridge: [bridge_stats, bootstrap_metrics.as_ref().map(|b| &*b.bridge)],
                 bootstrap: bootstrap_metrics.as_ref().map(|b| &b.progress),
+                bootstrap_attempt: 0,
                 uptime_secs: start_instant.elapsed().as_secs(),
             },
         )
@@ -3559,6 +3568,7 @@ struct StageCounters<'a> {
     oracle: [Option<&'a walshadow::oracle::OracleStats>; 2],
     bridge: [Option<&'a walshadow::bridge::BridgeStats>; 2],
     bootstrap: Option<&'a BootstrapProgress>,
+    bootstrap_attempt: u32,
     uptime_secs: u64,
 }
 
@@ -3693,6 +3703,7 @@ fn stage_gauges(v: &StageCounters<'_>) -> MetricsSnapshot {
         oracle_conversion_errors_total: oracle(|s| &s.conversion_errors),
         oracle_errors_total: oracle(|s| &s.errors),
         uptime_seconds: v.uptime_secs,
+        bootstrap_attempt: v.bootstrap_attempt,
         // Gauge, so it answers off whichever bridge is serving: bootstrap's
         // oracle socket is gone by the time the live bridge dials
         bridge_up: v
@@ -4351,9 +4362,9 @@ fn shadow_data_dir_initialized(dir: &std::path::Path) -> bool {
 /// Caller starts WAL pump from returned LSN, then starts and supervises
 /// shadow in [`run`]
 /// Config, credential, and CH-endpoint failures are resolved before the data
-/// dir is created, so they leave nothing behind. Once extraction starts,
-/// [`BOOTSTRAP_INCOMPLETE_MARKER`] remains after a failure; automatic
-/// rebootstrap is intentionally unsupported
+/// dir is created, so they leave nothing behind. Once extraction starts, the
+/// marker survives a failure; `previous` carries it back on the retry
+/// [`BootstrapMode::ObjectStore`] gets, and is `None` for a first attempt
 ///
 /// `ch_config` `Some`: bootstrap rows route through the shared insert tail
 /// (synthetic INSERT `_lsn = start_lsn`, `_commit_ts = 0`, `_is_deleted = 0`).
@@ -4365,6 +4376,7 @@ async fn run_bootstrap(
     feed: &mut SourceFeed,
     args: &Args,
     plan: &BootstrapPlan,
+    previous: Option<BootstrapMarker>,
     ch_config: Option<EmitterConfig>,
     observers: BootstrapObservers<'_>,
 ) -> Result<(BootstrapHandoff, BootstrapMetrics)> {
@@ -4385,7 +4397,7 @@ async fn run_bootstrap(
     // foreign/externally-seeded dir. Overwriting it would be destructive and
     // non-recoverable — make the operator clear it (or use `--bootstrap-mode=off`
     // to resume an externally-managed shadow).
-    if shadow_data_dir_initialized(&shadow_data_dir) {
+    if previous.is_none() && shadow_data_dir_initialized(&shadow_data_dir) {
         anyhow::bail!(
             "bootstrap: {} already holds a cluster (PG_VERSION present) but no completed-bootstrap \
              marker — provide an empty data dir to bootstrap, or --bootstrap-mode=off to resume it",
@@ -4421,6 +4433,7 @@ async fn run_bootstrap(
     );
 
     type WalHydrate = (walrus::config::Settings, walrus::storage::DynStorage);
+    let mut pinned_backup: Option<String> = None;
     let (source, mut wal_hydrate): (Box<dyn BackupSource>, Option<WalHydrate>) = match plan.mode {
         BootstrapMode::Direct => {
             let hydrate = if args.bootstrap_wal_from_archive {
@@ -4455,17 +4468,14 @@ async fn run_bootstrap(
             let storage = settings
                 .build_storage()
                 .context("bootstrap: build archive storage")?;
-            let name = plan.backup_name.clone();
-            if name != "LATEST" && !name.starts_with(BACKUP_NAME_PREFIX) {
-                anyhow::bail!(
-                    "bootstrap: backup name {name:?} must be `LATEST` or begin with \
-                         `{BACKUP_NAME_PREFIX}` (--bootstrap-backup-name / [bootstrap] backup_name)"
-                );
-            }
+            let resolved =
+                bootstrap_marker::resolve_backup(&storage, &plan.backup_name, previous.as_ref())
+                    .await?;
+            pinned_backup = Some(resolved.clone());
             let mut src = ObjectStoreSource::new(
                 settings.clone(),
                 storage.clone(),
-                name,
+                resolved,
                 args.spill_dir.clone(),
             );
             if let Some(n) = plan.parallelism {
@@ -4589,7 +4599,7 @@ async fn run_bootstrap(
     };
     let oracle = bootstrap_oracle.as_ref().map(|o| o.oracle());
 
-    prepare_bootstrap_dir(&shadow_data_dir)
+    let marker = bootstrap_marker::begin_attempt(&shadow_data_dir, previous, pinned_backup)
         .await
         .context("prepare shadow data dir for bootstrap")?;
 
@@ -4620,6 +4630,7 @@ async fn run_bootstrap(
         let stats = bootstrap_stats.clone();
         let oracle_stats = oracle_stats.clone();
         let bridge_stats = bridge_stats.clone();
+        let attempt = marker.attempts;
         async move {
             let mut tick = tokio::time::interval(Duration::from_secs(5));
             loop {
@@ -4630,6 +4641,7 @@ async fn run_bootstrap(
                         oracle: [None, Some(&oracle_stats)],
                         bridge: [None, Some(&bridge_stats)],
                         bootstrap: Some(&progress),
+                        bootstrap_attempt: attempt,
                         uptime_secs: uptime_from.elapsed().as_secs(),
                     }))
                     .await;
@@ -5127,9 +5139,7 @@ async fn run_bootstrap(
             .with_context(|| format!("bootstrap: chmod 0700 {}", shadow_data_dir.display()))?;
     }
 
-    tokio::fs::remove_file(shadow_data_dir.join(BOOTSTRAP_INCOMPLETE_MARKER))
-        .await
-        .context("clear completed bootstrap marker")?;
+    BootstrapMarker::clear(&shadow_data_dir).await?;
 
     timing.finish();
     Ok((
@@ -5233,11 +5243,6 @@ async fn bootstrap_build_mapping(
     Ok((mapping, resolved))
 }
 
-/// Mark bootstrap before extraction, clear only after backup and required
-/// object-store WAL land successfully. Refuse automatic rebootstrap when
-/// marker survives a failed run
-const BOOTSTRAP_INCOMPLETE_MARKER: &str = "walshadow_bootstrap.incomplete";
-
 /// Choose external management, one-time bootstrap, or resume from
 /// `--bootstrap-shadow-data-dir` and data dir state
 /// Mode only chooses bootstrap source
@@ -5245,7 +5250,14 @@ enum ShadowStart {
     /// Connect to externally managed shadow when no data dir is given
     External,
     Bootstrap(PathBuf),
+    Rebootstrap(PathBuf, BootstrapMarker),
     Resume(PathBuf),
+}
+
+impl ShadowStart {
+    fn bootstraps(&self) -> bool {
+        matches!(self, Self::Bootstrap(_) | Self::Rebootstrap(..))
+    }
 }
 
 fn resolve_shadow_start(args: &Args, mode: BootstrapMode) -> Result<ShadowStart> {
@@ -5275,11 +5287,9 @@ fn resolve_shadow_start(args: &Args, mode: BootstrapMode) -> Result<ShadowStart>
             other.display(),
         );
     }
-    anyhow::ensure!(
-        !dir.join(BOOTSTRAP_INCOMPLETE_MARKER).exists(),
-        "shadow data dir {} contains {BOOTSTRAP_INCOMPLETE_MARKER}; bootstrap incomplete, automatic rebootstrap unsupported, choose a new empty data dir or use operator recovery",
-        dir.display(),
-    );
+    if let Some(marker) = bootstrap_marker::pending_attempt(dir, mode)? {
+        return Ok(ShadowStart::Rebootstrap(dir.clone(), marker));
+    }
     if dir.join("PG_VERSION").exists() {
         if !matches!(mode, BootstrapMode::Off) {
             tracing::info!(
@@ -5305,22 +5315,6 @@ fn paths_overlap(a: &Path, b: &Path) -> bool {
         (Ok(a), Ok(b)) => a == b || a.starts_with(&b) || b.starts_with(&a),
         _ => true,
     }
-}
-
-/// Require empty data dir and mark bootstrap in progress
-/// Never clear partial or initialized standby state automatically
-async fn prepare_bootstrap_dir(dir: &Path) -> Result<()> {
-    tokio::fs::create_dir_all(dir)
-        .await
-        .with_context(|| format!("create {}", dir.display()))?;
-    let mut rd = tokio::fs::read_dir(dir).await?;
-    anyhow::ensure!(
-        rd.next_entry().await?.is_none(),
-        "shadow data dir {} is non-empty; automatic rebootstrap unsupported, choose a new empty data dir or use operator recovery",
-        dir.display(),
-    );
-    tokio::fs::write(dir.join(BOOTSTRAP_INCOMPLETE_MARKER), b"").await?;
-    Ok(())
 }
 
 /// Inserter count is the demand on the oracle: one bridge worker and one
@@ -5783,6 +5777,7 @@ mod tests {
             oracle: [Some(&live_oracle), Some(&boot_oracle)],
             bridge: [Some(&live_bridge), Some(&boot_bridge)],
             bootstrap: None,
+            bootstrap_attempt: 2,
             uptime_secs: 11,
         });
         assert_eq!(snap.oracle_rows_total, 10);
@@ -5794,12 +5789,14 @@ mod tests {
         // Live bridge owns the gauge once it exists, whatever bootstrap left
         assert_eq!(snap.bridge_up, 0);
         assert_eq!(snap.uptime_seconds, 11);
+        assert_eq!(snap.bootstrap_attempt, 2);
 
         let boot_only = stage_gauges(&StageCounters {
             emitter: None,
             oracle: [None, Some(&boot_oracle)],
             bridge: [None, Some(&boot_bridge)],
             bootstrap: None,
+            bootstrap_attempt: 2,
             uptime_secs: 11,
         });
         assert_eq!(boot_only.oracle_rows_total, 7);
@@ -6055,28 +6052,28 @@ mod tests {
             ShadowStart::Resume(_)
         ));
 
-        // Incomplete bootstrap never triggers automatic rebootstrap
-        std::fs::write(dir.join(BOOTSTRAP_INCOMPLETE_MARKER), b"").unwrap();
+        // Incomplete bootstrap: object_store re-extracts itself, the rest
+        // still want an operator
+        std::fs::write(
+            dir.join(walshadow::bootstrap_marker::MARKER_FILENAME),
+            b"attempts = 1\n",
+        )
+        .unwrap();
         assert!(shadow_start(&direct(dir_str)).is_err());
         assert!(shadow_start(&off(dir_str)).is_err());
+        assert!(matches!(
+            shadow_start(&args_from(&[
+                "--bootstrap-mode",
+                "object_store",
+                "--bootstrap-shadow-data-dir",
+                dir_str,
+                "--walsender-bind",
+                "127.0.0.1:5999",
+            ]))
+            .unwrap(),
+            ShadowStart::Rebootstrap(..)
+        ));
         assert!(dir.join("PG_VERSION").exists());
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn prepare_bootstrap_dir_marks_empty_dir() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join("data");
-        prepare_bootstrap_dir(&dir).await.unwrap();
-        assert!(dir.join(BOOTSTRAP_INCOMPLETE_MARKER).exists());
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn prepare_bootstrap_dir_refuses_nonempty_dir_without_deleting_it() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join("data");
-        std::fs::create_dir_all(dir.join("sibling-archive")).unwrap();
-        assert!(prepare_bootstrap_dir(&dir).await.is_err());
-        assert!(dir.join("sibling-archive").exists());
     }
 
     #[test]
