@@ -4,7 +4,7 @@ Review these limits before production use
 
 ## PostgreSQL
 
-- PostgreSQL 16, 17, and 18, daemon rejects unaudited majors
+- PostgreSQL 16, 17, 18, and 19, daemon rejects unaudited majors
 - shadow PostgreSQL major must match source major
 - one source database per walshadow process
 - `wal_level = logical` required

@@ -127,11 +127,6 @@ async fn run_boundary_ddl(held: Held<'_>, d_ddl: &str) -> Result<(), String> {
     let schema = format!(
         "CREATE TABLE demo (id int primary key, v text);\n\
          INSERT INTO demo VALUES (1, 'a');\n\
-         -- An aborted inserter's pg_attribute row for demo, which a scan\n\
-         -- reading under SnapshotAny has to reject on its own\n\
-         BEGIN;\n\
-         ALTER TABLE demo ADD COLUMN rolled_back int;\n\
-         ROLLBACK;\n\
          CREATE FUNCTION ws_test_lock_unlock_relation(oid) RETURNS void \
          AS '{}', 'ws_test_lock_unlock_relation' LANGUAGE c;\n",
         so.display(),
@@ -301,14 +296,21 @@ async fn boundary_capture_survives_recovery_held_lock_with_fast_default() {
 /// Scoped sub-case: `pg_class` pins the position first and is not the catalog
 /// under lock, so the `pg_attribute` scan behind it arrives with both an oid
 /// list and a lock it cannot take, the one read that filters rows itself
-/// instead of letting an index do it
+/// instead of letting an index do it.
+///
+/// `SET NOT NULL` rides along so D supersedes a `pg_attribute` row of demo
+/// too: under `SnapshotAny` the old version is still on the page, carrying
+/// D's own in-progress xmax, so the scan has to reject it itself. An aborted
+/// inserter's row would do as well, except a source-side prune can take that
+/// one away before the backup, and PG 19 does
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn boundary_capture_survives_recovery_held_lock_on_scoped_catalog() {
     if !fx::pg_available() || !fx::pg_basebackup_available() || !fx::clickhouse_available() {
         eprintln!("skip: missing initdb / pg_basebackup / clickhouse");
         return;
     }
-    if let Err(e) = run_boundary(Some(PG_ATTRIBUTE)).await {
+    let ddl = "ALTER TABLE demo ADD COLUMN w int, ALTER COLUMN v SET NOT NULL";
+    if let Err(e) = run_boundary_ddl(Some(PG_ATTRIBUTE), ddl).await {
         panic!(
             "boundary capture wedged behind a recovery-held AccessExclusiveLock \
              on pg_attribute: {e}"

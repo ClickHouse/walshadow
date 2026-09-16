@@ -453,8 +453,11 @@ async fn bootstrap_clusters_inner(
     let shadow_data = tmp.path().join("shadow-data");
     pg_basebackup(&source, &shadow_data).expect("pg_basebackup source → shadow");
 
-    source.psql_one("SELECT pg_switch_wal()").expect("rotate");
-
+    // No rotate here: the backup ends on a segment boundary and the clone
+    // resumes at the next segment. A rotate past a segment holding
+    // post-backup writes (a hint-bit FPI, say) moves the head, and with it
+    // this walsender's seed, one segment on, so the standby never gets the
+    // segment it asks for and PANICs on the hole
     let shadow_filter_dir = tmp.path().join("filtered");
     fs::create_dir_all(&shadow_filter_dir).unwrap();
     let shadow_sock = tmp.path().join("shadow-sock");
@@ -916,6 +919,7 @@ async fn build_pipeline_inner(
                     .1,
                     None,
                     oracle.clone(),
+                    (feed.server_version_num() / 10000) as u32,
                 )
                 .await,
             ))

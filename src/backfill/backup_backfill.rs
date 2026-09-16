@@ -306,7 +306,9 @@ async fn walk_and_ship(
     .map_err(anyhow::Error::msg)?;
 
     let pg_xact = Arc::new(std::sync::Mutex::new(PgXactAccum::new()));
-    let pg_multixact = Arc::new(std::sync::Mutex::new(PgMultiXactAccum::new()));
+    let pg_multixact = Arc::new(std::sync::Mutex::new(PgMultiXactAccum::new(
+        ctx.source_major,
+    )));
     let (walk_tx, walk_rx) = mpsc::channel::<Vec<BackfillTuple>>(BOOTSTRAP_TUPLE_CHANNEL_CAP);
     let (gated_tx, gated_rx) = mpsc::channel::<Vec<BackfillTuple>>(BOOTSTRAP_TUPLE_CHANNEL_CAP);
 
@@ -476,7 +478,7 @@ async fn gate_task(
     }
     // Take the accums out so no std guard is held across the sends below
     let accum = std::mem::take(&mut *pg_xact.lock().expect("pg_xact accum lock"));
-    let multi = std::mem::take(&mut *pg_multixact.lock().expect("pg_multixact accum lock"));
+    let multi = pg_multixact.lock().expect("pg_multixact accum lock").take();
     let segments = accum.segment_count();
     let view = PgXactView::new(&accum, &patch).with_multixact(&multi);
     resolve_phase(deferred, &view, &tx, Some(&mut pending), &mut stats).await?;
@@ -1247,7 +1249,7 @@ mod tests {
     async fn gate_task_routes_hinted_defers_unhinted_and_resolves_at_eof() {
         let filter = CatalogMap::new();
         let pg_xact = Arc::new(std::sync::Mutex::new(PgXactAccum::new()));
-        let pg_multixact = Arc::new(std::sync::Mutex::new(PgMultiXactAccum::new()));
+        let pg_multixact = Arc::new(std::sync::Mutex::new(PgMultiXactAccum::new(17)));
         let mut patch = PgXactPatch::new();
         patch.commit(500, &[]);
         patch.abort(600, &[]);
@@ -1312,7 +1314,7 @@ mod tests {
     async fn gate_task_discards_deferred_without_walk_success() {
         let filter = CatalogMap::new();
         let pg_xact = Arc::new(std::sync::Mutex::new(PgXactAccum::new()));
-        let pg_multixact = Arc::new(std::sync::Mutex::new(PgMultiXactAccum::new()));
+        let pg_multixact = Arc::new(std::sync::Mutex::new(PgMultiXactAccum::new(17)));
         let mut patch = PgXactPatch::new();
         // Patch alone would emit xid 500; failure path must not consult it
         patch.commit(500, &[]);
@@ -1371,7 +1373,7 @@ mod tests {
         let mut mem = vec![0u8; 8192];
         mem[500] = 5;
         mem[504..508].copy_from_slice(&901u32.to_le_bytes());
-        let mut multi = PgMultiXactAccum::new();
+        let mut multi = PgMultiXactAccum::new(17);
         multi.insert_offsets_segment(0, off);
         multi.insert_members_segment(0, mem);
         multi
@@ -1426,7 +1428,7 @@ mod tests {
         let filter = CatalogMap::new();
         let pg_xact = Arc::new(std::sync::Mutex::new(PgXactAccum::new()));
         // Empty accum: mxid below any collected segment ⇒ unresolvable
-        let pg_multixact = Arc::new(std::sync::Mutex::new(PgMultiXactAccum::new()));
+        let pg_multixact = Arc::new(std::sync::Mutex::new(PgMultiXactAccum::new(17)));
 
         let (walk_tx, walk_rx) = mpsc::channel(16);
         let (gated_tx, _gated_rx) = mpsc::channel(16);

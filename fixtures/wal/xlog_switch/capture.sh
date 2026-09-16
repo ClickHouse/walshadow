@@ -20,7 +20,8 @@ trap '[ -z "$CID" ] || docker rm -f "$CID" >/dev/null 2>&1 || true; rm -rf "$wor
 
 if [ "${WALSHADOW_USE_LOCAL:-0}" = "1" ]; then
     echo "WALSHADOW_USE_LOCAL=1: using local postgres" >&2
-    local_major=$(postgres -V | awk '{split($3, version, "."); print version[1]}')
+    # awk numeric coercion trims a pre-release suffix: "19beta3" -> 19
+    local_major=$(postgres -V | awk '{print $3+0}')
     if [ -z "$local_major" ] || [ "$local_major" -lt 15 ]; then
         echo "local postgres major '$local_major' < 15; walshadow rejects PG <= 14 captures" >&2
         exit 1

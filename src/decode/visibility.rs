@@ -49,10 +49,9 @@ const TRANSACTION_STATUS_ABORTED: u8 = 0x02;
 const TRANSACTION_STATUS_SUB_COMMITTED: u8 = 0x03;
 
 // pg_multixact SLRU geometry (PG src/backend/access/transam/multixact.c):
-// offsets are 4-byte MultiXactOffset entries, 2048 per 8 KiB page; members
-// pack groups of 4 flag bytes + 4 xids (20 bytes), 409 groups per page with
-// 12 pad bytes at each page end
-const MXOFF_PER_SEGMENT: u32 = (8192 / 4) * SLRU_PAGES_PER_SEGMENT;
+// offsets hold MultiXactOffset entries, 4 bytes through PG 18 and 8 from PG
+// 19 (PG src/include/c.h); members pack groups of 4 flag bytes + 4 xids
+// (20 bytes), 409 groups per page with 12 pad bytes at each page end
 const MULTIXACT_MEMBERS_PER_GROUP: u32 = 4;
 const MULTIXACT_GROUP_SIZE: usize = 4 + 4 * 4;
 const MULTIXACT_MEMBERS_PER_PAGE: u32 =
@@ -156,7 +155,7 @@ pub enum MultiXactUpdater {
 }
 
 enum SlruRead {
-    Val(u32),
+    Val(u64),
     /// Segment, page tail, or entry past what the backup copied — or the
     /// reserved zero value: unwritten when the copy happened
     Unwritten,
@@ -172,15 +171,21 @@ enum MemberRead {
 
 /// `pg_multixact/{offsets,members}` segments collected from the backup
 /// stream, same whole-file-in-memory posture as [`PgXactAccum`].
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct PgMultiXactAccum {
     offsets: HashMap<u32, Vec<u8>>,
     members: HashMap<u32, Vec<u8>>,
+    /// `sizeof(MultiXactOffset)` on the source
+    offset_bytes: u32,
 }
 
 impl PgMultiXactAccum {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(source_major: u32) -> Self {
+        Self {
+            offsets: HashMap::default(),
+            members: HashMap::default(),
+            offset_bytes: if source_major >= 19 { 8 } else { 4 },
+        }
     }
 
     pub fn insert_offsets_segment(&mut self, segno: u32, bytes: Vec<u8>) {
@@ -195,42 +200,69 @@ impl PgMultiXactAccum {
         self.offsets.len() + self.members.len()
     }
 
-    fn read_u32(map: &HashMap<u32, Vec<u8>>, segno: u32, byte: usize) -> SlruRead {
-        let Some(seg) = map.get(&segno) else {
-            if map.keys().any(|s| *s < segno) {
+    /// Move segments out, leaving an empty accum of the same layout
+    pub fn take(&mut self) -> Self {
+        Self {
+            offsets: std::mem::take(&mut self.offsets),
+            members: std::mem::take(&mut self.members),
+            offset_bytes: self.offset_bytes,
+        }
+    }
+
+    fn offsets_per_segment(&self) -> u32 {
+        (8192 / self.offset_bytes) * SLRU_PAGES_PER_SEGMENT
+    }
+
+    /// Member offsets wrap at the offsets entry width
+    fn wrap_offset(&self, off: u64) -> u64 {
+        if self.offset_bytes == 4 {
+            return off & u64::from(u32::MAX);
+        }
+        off
+    }
+
+    fn read_offset(&self, segno: u32, byte: usize) -> SlruRead {
+        let Some(seg) = self.offsets.get(&segno) else {
+            if self.offsets.keys().any(|s| *s < segno) {
                 return SlruRead::Unwritten;
             }
             return SlruRead::Truncated;
         };
-        match seg.get(byte..byte + 4) {
-            Some(b) => SlruRead::Val(u32::from_le_bytes(b.try_into().expect("4-byte slice"))),
-            None => SlruRead::Unwritten,
-        }
+        let width = self.offset_bytes as usize;
+        let Some(b) = seg.get(byte..byte + width) else {
+            return SlruRead::Unwritten;
+        };
+        let mut entry = [0u8; 8];
+        entry[..width].copy_from_slice(b);
+        SlruRead::Val(u64::from_le_bytes(entry))
     }
 
     /// Offsets entry for `mxid`. Zero is reserved to mean unset
     /// (`GetNewMultiXactId` skips it), so it reads as unwritten-at-copy.
     fn offset_at(&self, mxid: u32) -> SlruRead {
-        let segno = mxid / MXOFF_PER_SEGMENT;
-        let byte = ((mxid % MXOFF_PER_SEGMENT) * 4) as usize;
-        match Self::read_u32(&self.offsets, segno, byte) {
+        let per_segment = self.offsets_per_segment();
+        let byte = ((mxid % per_segment) * self.offset_bytes) as usize;
+        match self.read_offset(mxid / per_segment, byte) {
             SlruRead::Val(0) => SlruRead::Unwritten,
             r => r,
         }
     }
 
-    fn member_at(&self, off: u32) -> MemberRead {
-        let page = off / MULTIXACT_MEMBERS_PER_PAGE;
-        let segno = page / SLRU_PAGES_PER_SEGMENT;
+    fn member_at(&self, off: u64) -> MemberRead {
+        let page = off / u64::from(MULTIXACT_MEMBERS_PER_PAGE);
+        // Segment keys parse as u32, so a wider segno resolves through repair
+        let Ok(segno) = u32::try_from(page / u64::from(SLRU_PAGES_PER_SEGMENT)) else {
+            return MemberRead::Truncated;
+        };
         let Some(seg) = self.members.get(&segno) else {
             if self.members.keys().any(|s| *s < segno) {
                 return MemberRead::Unwritten;
             }
             return MemberRead::Truncated;
         };
-        let idx = off % MULTIXACT_MEMBERS_PER_PAGE;
+        let idx = (off % u64::from(MULTIXACT_MEMBERS_PER_PAGE)) as u32;
         let member = (idx % MULTIXACT_MEMBERS_PER_GROUP) as usize;
-        let base = ((page % SLRU_PAGES_PER_SEGMENT) * 8192) as usize
+        let base = (page % u64::from(SLRU_PAGES_PER_SEGMENT)) as usize * 8192
             + (idx / MULTIXACT_MEMBERS_PER_GROUP) as usize * MULTIXACT_GROUP_SIZE;
         let xid_pos = base + 4 + member * 4;
         match (seg.get(base + member), seg.get(xid_pos..xid_pos + 4)) {
@@ -265,12 +297,12 @@ impl PgMultiXactAccum {
             SlruRead::Unwritten => return MultiXactUpdater::Covered,
             SlruRead::Truncated => return MultiXactUpdater::Unresolvable,
         };
-        let nmembers = end.wrapping_sub(start);
-        if nmembers == 0 || nmembers > MULTIXACT_MEMBERS_SANITY_CAP {
+        let nmembers = self.wrap_offset(end.wrapping_sub(start));
+        if nmembers == 0 || nmembers > u64::from(MULTIXACT_MEMBERS_SANITY_CAP) {
             return MultiXactUpdater::Unresolvable;
         }
         for i in 0..nmembers {
-            let off = start.wrapping_add(i);
+            let off = self.wrap_offset(start.wrapping_add(i));
             match self.member_at(off) {
                 MemberRead::Member { xid: 0, .. } if off == 0 => {}
                 MemberRead::Member { xid: 0, .. } | MemberRead::Unwritten => {
@@ -556,8 +588,8 @@ pub async fn read_pg_xact(data_dir: &Path) -> Result<PgXactAccum> {
 }
 
 /// Read landed `pg_multixact` offsets and members segments
-pub async fn read_pg_multixact(data_dir: &Path) -> Result<PgMultiXactAccum> {
-    let mut accum = PgMultiXactAccum::new();
+pub async fn read_pg_multixact(data_dir: &Path, source_major: u32) -> Result<PgMultiXactAccum> {
+    let mut accum = PgMultiXactAccum::new(source_major);
     for sub in ["offsets", "members"] {
         let dir = Path::new("pg_multixact").join(sub);
         for (rel, bytes) in read_slru_dir(data_dir, &dir).await? {
@@ -790,9 +822,20 @@ mod tests {
     /// Offsets entries and members laid out per multixact.c geometry into
     /// segment 0 (mxids < 65536, member offsets < 52352).
     fn mx_accum(offsets: &[(u32, u32)], members: &[(u32, u32, u8)]) -> PgMultiXactAccum {
+        mx_accum_major(17, offsets, members)
+    }
+
+    /// `major` selects the offsets entry width. Entries stay under 2^32, so
+    /// the wide layout writes the same bytes with a zero high half
+    fn mx_accum_major(
+        major: u32,
+        offsets: &[(u32, u32)],
+        members: &[(u32, u32, u8)],
+    ) -> PgMultiXactAccum {
+        let mut m = PgMultiXactAccum::new(major);
         let mut off = vec![0u8; 8192];
         for (mxid, v) in offsets {
-            let byte = ((mxid % MXOFF_PER_SEGMENT) * 4) as usize;
+            let byte = ((mxid % m.offsets_per_segment()) * m.offset_bytes) as usize;
             off[byte..byte + 4].copy_from_slice(&v.to_le_bytes());
         }
         let mut mem = vec![0u8; 8192];
@@ -803,7 +846,6 @@ mod tests {
             mem[base + member] = *status;
             mem[base + 4 + member * 4..base + 8 + member * 4].copy_from_slice(&xid.to_le_bytes());
         }
-        let mut m = PgMultiXactAccum::new();
         m.insert_offsets_segment(0, off);
         m.insert_members_segment(0, mem);
         m
@@ -830,7 +872,10 @@ mod tests {
         // mxid 40: offsets entry zero ⇒ unwritten at copy
         assert_eq!(m.updater(40), MultiXactUpdater::Covered);
         // Next segment never copied ⇒ allocated post-copy
-        assert_eq!(m.updater(MXOFF_PER_SEGMENT + 5), MultiXactUpdater::Covered);
+        assert_eq!(
+            m.updater(m.offsets_per_segment() + 5),
+            MultiXactUpdater::Covered
+        );
     }
 
     #[test]
@@ -845,13 +890,27 @@ mod tests {
         let m = mx_accum(&[(10, 100), (11, 100)], &[]);
         assert_eq!(m.updater(10), MultiXactUpdater::Unresolvable);
         // Truncated below the collected range
-        let mut m = PgMultiXactAccum::new();
+        let mut m = PgMultiXactAccum::new(17);
         m.insert_offsets_segment(3, vec![0u8; 8192]);
         assert_eq!(m.updater(5), MultiXactUpdater::Unresolvable);
         // Members segment truncated while offsets resolve
         let mut m = mx_accum(&[(10, 100), (11, 101)], &[]);
         m.members = HashMap::from_iter([(2, vec![0u8; 8192])]);
         assert_eq!(m.updater(10), MultiXactUpdater::Unresolvable);
+    }
+
+    /// PG 19 widened MultiXactOffset, so reading its offsets at the PG 18
+    /// stride lands on an unwritten neighbour and resurrects a dead version
+    #[test]
+    fn pg19_offsets_resolve_at_their_own_stride() {
+        let offsets = &[(10, 100), (11, 101)];
+        let members = &[(100, 900, 4)];
+        let wide = mx_accum_major(19, offsets, members);
+        assert_eq!(wide.updater(10), MultiXactUpdater::Updater(900));
+        let mut narrow = PgMultiXactAccum::new(18);
+        narrow.insert_offsets_segment(0, wide.offsets[&0].clone());
+        narrow.insert_members_segment(0, wide.members[&0].clone());
+        assert_eq!(narrow.updater(10), MultiXactUpdater::Covered);
     }
 
     #[test]
@@ -970,7 +1029,7 @@ mod tests {
 
         let accum = read_pg_xact(dir).await.unwrap();
         // No pg_multixact/ at all: a cluster that never made one
-        let multi = read_pg_multixact(dir).await.unwrap();
+        let multi = read_pg_multixact(dir, 17).await.unwrap();
         let patch = PgXactPatch::new();
         let view = PgXactView::new(&accum, &patch).with_multixact(&multi);
 
