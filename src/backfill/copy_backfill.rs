@@ -507,6 +507,8 @@ pub struct CopyBackfiller {
     /// with live streaming and draw from the same budget
     budget: Option<crate::budget::MemoryBudget>,
     oracle: Option<Arc<Oracle>>,
+    /// Source PG major: picks the backup's pg_multixact offsets width
+    source_major: u32,
     /// Fixed scratch paths require one cluster backup pass at a time
     backup_pass_lock: Mutex<()>,
     inner: Mutex<Inner>,
@@ -531,6 +533,7 @@ impl CopyBackfiller {
         history_rx: watch::Receiver<Arc<crate::source::timeline::TimelineHistory>>,
         budget: Option<crate::budget::MemoryBudget>,
         oracle: Option<Arc<Oracle>>,
+        source_major: u32,
     ) -> Self {
         let ledger = Ledger::load(spill_dir).await;
         let emitter = Arc::new(emitter);
@@ -553,6 +556,7 @@ impl CopyBackfiller {
             history_rx,
             budget,
             oracle,
+            source_major,
             backup_pass_lock: Mutex::new(()),
             inner: Mutex::new(Inner {
                 ledger,
@@ -830,6 +834,7 @@ impl CopyBackfiller {
             history_rx: self.history_rx.clone(),
             budget: self.budget.clone(),
             oracle: self.oracle.clone(),
+            source_major: self.source_major,
         };
         let outcome = crate::backfill::backup_backfill::run_pass(&ctx, mode, reqs).await?;
         self.publish_staged(&staging, reqs).await;

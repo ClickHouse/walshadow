@@ -125,7 +125,7 @@ fn stats_item_width(page_magic: u16) -> usize {
 /// `SysCacheIdentifier` values shift across majors: name-sorted generation
 /// (PG `src/backend/catalog/genbki.pl`; stable branches append via
 /// Z-prefixed names so ids hold within a major). 35/36 on PG 16-17,
-/// 37/38 on PG 18 (EXTENSIONNAME/OID sort ahead)
+/// 37/38 on PG 18-19 (EXTENSIONNAME/OID sort ahead)
 fn namespace_catcache_ids(page_magic: u16) -> [i8; 2] {
     if page_magic >= 0xD118 {
         [37, 38]

@@ -29,6 +29,8 @@ use std::time::{Duration, Instant};
 
 use thiserror::Error;
 
+use crate::source::shadow_stream::WALRECEIVER_PROTOCOL_PIN;
+
 #[derive(Debug, Error)]
 pub enum ShadowError {
     #[error("io: {0}")]
@@ -453,7 +455,7 @@ impl Shadow {
             args.push(o);
         }
         args.push("start");
-        let res = self.run("pg_ctl", args);
+        let res = self.run_env("pg_ctl", args, &[WALRECEIVER_PROTOCOL_PIN]);
         if let Err(ShadowError::Process {
             cmd,
             status,
@@ -726,14 +728,26 @@ impl Shadow {
         I: IntoIterator<Item = S>,
         S: AsRef<std::ffi::OsStr>,
     {
+        self.run_env(cmd, args, &[])
+    }
+
+    fn run_env<I, S>(&self, cmd: &str, args: I, env: &[(&str, &str)]) -> Result<Output>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<std::ffi::OsStr>,
+    {
         let bin = self.config.bin(cmd);
-        let out = Command::new(&bin).args(args).output().map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                ShadowError::MissingBinary(cmd.into())
-            } else {
-                ShadowError::Io(e)
-            }
-        })?;
+        let out = Command::new(&bin)
+            .args(args)
+            .envs(env.iter().copied())
+            .output()
+            .map_err(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    ShadowError::MissingBinary(cmd.into())
+                } else {
+                    ShadowError::Io(e)
+                }
+            })?;
         self.check(cmd, out)
     }
 

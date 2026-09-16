@@ -1448,8 +1448,8 @@ async fn run_session(
     // bound to this source + shadow pairing. Sole schema-event source.
     let source_major = (feed.server_version_num() / 10000) as u32;
     anyhow::ensure!(
-        (16..=18).contains(&source_major),
-        "source PG major {source_major} unsupported (commit-record sinval layout audited for 16-18)",
+        (16..=19).contains(&source_major),
+        "source PG major {source_major} unsupported (commit-record sinval layout audited for 16-19)",
     );
     let shadow_db_oid = catalog
         .lock()
@@ -1707,6 +1707,7 @@ async fn run_session(
                 history_rx,
                 Some(pipeline_budget.clone()),
                 oracle.clone(),
+                source_major,
             )
             .await,
         ));
@@ -5208,9 +5209,10 @@ async fn run_bootstrap(
     if let Some(pending) = pending_gate {
         let mut patch = std::mem::take(&mut *window_patch.lock().expect("window patch lock"));
         patch.seal();
-        let (gate, pending_tables) = resolve_greenfield(pending, &shadow_data_dir, &patch)
-            .await
-            .context("bootstrap: visibility gate")?;
+        let (gate, pending_tables) =
+            resolve_greenfield(pending, &shadow_data_dir, &patch, source_major)
+                .await
+                .context("bootstrap: visibility gate")?;
         // Persist the ledger before clearing the marker so pending rows
         // already in ClickHouse can be published after restart
         let mut ledger = walshadow::visibility_pending::PendingLedger::load(&args.spill_dir)

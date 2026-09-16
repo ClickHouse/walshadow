@@ -23,7 +23,9 @@ use std::time::Duration;
 
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
-use walshadow::shadow_stream::{ShadowStreamState, WalSenderAddr, spawn_listener};
+use walshadow::shadow_stream::{
+    ShadowStreamState, WALRECEIVER_PROTOCOL_PIN, WalSenderAddr, spawn_listener,
+};
 
 fn pg_binary(name: &str) -> Option<PathBuf> {
     let from_path = std::env::var_os("PATH")?;
@@ -169,6 +171,7 @@ async fn pg_walreceiver_connects_and_runs_identify_system() {
         .args(["-D", standby_data.to_str().unwrap()])
         .args(["-l", standby_log.to_str().unwrap()])
         .args(["-w", "-t", "10", "start"])
+        .env(WALRECEIVER_PROTOCOL_PIN.0, WALRECEIVER_PROTOCOL_PIN.1)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();

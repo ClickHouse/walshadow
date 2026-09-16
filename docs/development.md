@@ -48,7 +48,7 @@ make -C pgext coverage-html
 Install GCC, matching `gcov`, and `gcovr` for
 [PG module coverage](../pgext/README.md#coverage) of `pgext/*.c` and `pgext/*.h`
 
-CI merges coverage across PostgreSQL 16, 17, and 18. Use fresh line-coverage
+CI merges coverage across PostgreSQL 16, 17, 18, and 19. Use fresh line-coverage
 reports to locate missing behavior; exported function counts can include generic
 instantiations. Do not disable lints or coverage to make a report pass
 

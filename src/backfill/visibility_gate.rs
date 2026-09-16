@@ -365,6 +365,7 @@ pub async fn resolve_greenfield(
     gate: PendingGate,
     data_dir: &Path,
     patch: &PgXactPatch,
+    source_major: u32,
 ) -> Result<(GateStats, Vec<PendingManifest>)> {
     let PendingGate {
         deferred,
@@ -377,7 +378,7 @@ pub async fn resolve_greenfield(
         return Ok((gate_stats, Vec::new()));
     }
     let accum = read_pg_xact(data_dir).await?;
-    let multi = read_pg_multixact(data_dir).await?;
+    let multi = read_pg_multixact(data_dir, source_major).await?;
     let view = PgXactView::new(&accum, patch).with_multixact(&multi);
 
     let oracle_for_pending = oracle.clone();
@@ -803,7 +804,7 @@ mod tests {
     async fn several_spools_all_replay_into_one_output() {
         let accum = PgXactAccum::new();
         let patch = PgXactPatch::new();
-        let multi = PgMultiXactAccum::new();
+        let multi = PgMultiXactAccum::new(17);
         let view = PgXactView::new(&accum, &patch).with_multixact(&multi);
         let (tx, mut rx) = mpsc::channel(16);
         let mut stats = GateStats::default();
@@ -850,7 +851,7 @@ mod tests {
     async fn in_flight_tuples_reach_pending() {
         let accum = in_progress_accum();
         let patch = PgXactPatch::new();
-        let multi = PgMultiXactAccum::new();
+        let multi = PgMultiXactAccum::new(17);
         let view = PgXactView::new(&accum, &patch).with_multixact(&multi);
         let (tx, mut rx) = mpsc::channel(8);
         let mut stats = GateStats::default();
@@ -890,7 +891,7 @@ mod tests {
     async fn in_flight_tuples_without_pending_stay_gated() {
         let accum = in_progress_accum();
         let patch = PgXactPatch::new();
-        let multi = PgMultiXactAccum::new();
+        let multi = PgMultiXactAccum::new(17);
         let view = PgXactView::new(&accum, &patch).with_multixact(&multi);
         let (tx, _rx) = mpsc::channel(8);
         let mut stats = GateStats::default();
@@ -906,7 +907,7 @@ mod tests {
     async fn undecidable_multixact_aborts_the_pass() {
         let accum = PgXactAccum::new();
         let patch = PgXactPatch::new();
-        let multi = PgMultiXactAccum::new();
+        let multi = PgMultiXactAccum::new(17);
         let view = PgXactView::new(&accum, &patch).with_multixact(&multi);
         let (tx, _rx) = mpsc::channel(4);
         let mut stats = GateStats::default();
@@ -947,7 +948,7 @@ mod tests {
             },
         };
         let (stats, pending_tables) =
-            resolve_greenfield(pending, Path::new("/nonexistent"), &PgXactPatch::new())
+            resolve_greenfield(pending, Path::new("/nonexistent"), &PgXactPatch::new(), 17)
                 .await
                 .unwrap();
         assert_eq!(stats.emitted, 7);

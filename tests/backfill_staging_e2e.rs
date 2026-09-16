@@ -141,6 +141,12 @@ impl Fixture {
     }
 
     async fn backfiller(&self, dir: &Path) -> Arc<CopyBackfiller> {
+        let source_major: u32 = self
+            .source
+            .psql_one("SELECT current_setting('server_version_num')::int / 10000")
+            .unwrap()
+            .parse()
+            .unwrap();
         Arc::new(
             CopyBackfiller::new(
                 fx::pg_cfg(&self.source, "backfill-staging"),
@@ -154,6 +160,7 @@ impl Fixture {
                 watch::channel(Arc::new(TimelineHistory::root(1))).1,
                 None,
                 None,
+                source_major,
             )
             .await,
         )

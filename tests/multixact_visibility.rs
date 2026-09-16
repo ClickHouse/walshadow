@@ -39,6 +39,18 @@ fn make_cluster(tmp: &tempfile::TempDir, port: u16) -> Shadow {
     Shadow::new(cfg)
 }
 
+/// Members segment names widened in PG 19, so take the only file a fresh
+/// cluster wrote rather than naming it
+fn only_segment(dir: &std::path::Path) -> Vec<u8> {
+    let mut files: Vec<_> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    files.sort();
+    assert_eq!(files.len(), 1, "one segment expected in {dir:?}");
+    std::fs::read(&files[0]).unwrap()
+}
+
 struct StopOnDrop<'a> {
     sh: &'a Shadow,
 }
@@ -94,16 +106,15 @@ fn multixact_updater_matches_live_pg() {
         .unwrap();
     assert!(members.contains(":keysh"), "locker member in {members:?}");
 
+    let source_major: u32 = sh
+        .psql_one("SELECT current_setting('server_version_num')::int / 10000")
+        .unwrap()
+        .parse()
+        .unwrap();
     let data_dir = &sh.config().data_dir;
-    let mut multi = PgMultiXactAccum::new();
-    multi.insert_offsets_segment(
-        0,
-        std::fs::read(data_dir.join("pg_multixact/offsets/0000")).unwrap(),
-    );
-    multi.insert_members_segment(
-        0,
-        std::fs::read(data_dir.join("pg_multixact/members/0000")).unwrap(),
-    );
+    let mut multi = PgMultiXactAccum::new(source_major);
+    multi.insert_offsets_segment(0, only_segment(&data_dir.join("pg_multixact/offsets")));
+    multi.insert_members_segment(0, only_segment(&data_dir.join("pg_multixact/members")));
     assert_eq!(multi.updater(mxid), MultiXactUpdater::Updater(updater_xid));
     // Unallocated mxid reads past the written tail: covered by the WAL leg
     assert_eq!(multi.updater(next_multi), MultiXactUpdater::Covered);

@@ -38,6 +38,13 @@ use crate::pos::{
 use crate::record::{RecordBytesSink, SinkError};
 use ahash::{HashMap, HashMapExt};
 
+/// libpq environment for shadow's walreceiver. This walsender speaks protocol
+/// 3.0 and sends no `NegotiateProtocolVersion`; PG 19 beta libpq greases every
+/// handshake with protocol 3.9999 plus `_pq_.test_protocol_negotiation` and
+/// drops a server that accepts either without negotiating. PG 16-17 libpq has
+/// no such option and never reads the variable
+pub const WALRECEIVER_PROTOCOL_PIN: (&str, &str) = ("PGMAXPROTOCOLVERSION", "3.0");
+
 #[derive(Debug, Clone, Copy)]
 enum Phase {
     /// Switchpoint the branch stops at, PG's `sendTimeLineValidUpto`. `None`

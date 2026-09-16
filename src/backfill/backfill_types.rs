@@ -39,6 +39,8 @@ pub struct PassContext {
     pub history_rx: watch::Receiver<Arc<TimelineHistory>>,
     pub budget: Option<MemoryBudget>,
     pub oracle: Option<Arc<Oracle>>,
+    /// Source PG major: picks the backup's pg_multixact offsets width
+    pub source_major: u32,
 }
 
 #[derive(Debug, Default, Clone)]

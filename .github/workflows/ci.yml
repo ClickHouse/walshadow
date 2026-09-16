@@ -28,7 +28,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        pg-major: [16, 17, 18]
+        pg-major: [16, 17, 18, 19]
 
     steps:
       # Coverage files can fill the runner disk.
@@ -74,15 +74,17 @@ jobs:
 
       # The runner's preinstalled postgresql-common ships only one major
       # at a time; pull the requested major straight from PGDG so the
-      # matrix can pin any of 16 / 17 / 18 independently of the runner
-      # image's choice. `systemctl stop postgresql` parks any auto-
-      # started instance so tests own the unix-socket dirs cleanly.
+      # matrix can pin any of 16 / 17 / 18 / 19 independently of the runner
+      # image's choice. PGDG keeps released majors in `main` and a
+      # pre-release major in its own numbered component, so name both.
+      # `systemctl stop postgresql` parks any auto-started instance so
+      # tests own the unix-socket dirs cleanly.
       - name: Install PostgreSQL ${{ matrix.pg-major }} (PGDG)
         run: |
           sudo systemctl stop postgresql 2>/dev/null || true
           curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
             | sudo gpg --dearmor -o /usr/share/keyrings/postgres-archive-keyring.gpg
-          echo "deb [signed-by=/usr/share/keyrings/postgres-archive-keyring.gpg] https://apt.postgresql.org/pub/repos/apt/ $(lsb_release -cs)-pgdg main" \
+          echo "deb [signed-by=/usr/share/keyrings/postgres-archive-keyring.gpg] https://apt.postgresql.org/pub/repos/apt/ $(lsb_release -cs)-pgdg main ${{ matrix.pg-major }}" \
             | sudo tee /etc/apt/sources.list.d/pgdg.list
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
@@ -239,7 +241,7 @@ jobs:
 
   # Combine coverage from every PostgreSQL version.
   coverage-merge:
-    name: line coverage (merged 16/17/18)
+    name: line coverage (merged 16/17/18/19)
     needs: test
     if: always()
     runs-on: ubuntu-latest
