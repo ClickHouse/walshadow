@@ -28,6 +28,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -144,6 +145,11 @@ impl BackupSource for ObjectStoreSource {
             "draining tar partitions"
         );
 
+        stats.parts_total.store(
+            (data_parts.len() + control_parts.len()) as u64,
+            Ordering::Relaxed,
+        );
+
         let target = Arc::new(PumpTarget::new(data_dir, sink.clone(), stats));
 
         // Phase A: bounded fan-out of data parts via buffer_unordered
@@ -196,6 +202,7 @@ async fn unpack_one_part(
     pump_tar_to_sink(&mut archive, target)
         .await
         .with_context(|| format!("ObjectStoreSource: tar unpack {key}"))?;
+    target.stats.parts_done.fetch_add(1, Ordering::Relaxed);
     tracing::info!(
         target = "walshadow::backup_source_object_store",
         key,
