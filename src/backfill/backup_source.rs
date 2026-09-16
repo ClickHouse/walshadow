@@ -43,6 +43,8 @@ crate::atomic_stats! {
         /// Inside `EntrySink::chunk`: page framing, decode, channel send.
         /// Against `page_walk.decode_nanos` this is the tap's overhead
         pub sink_chunk_nanos,
+        pub parts_total,
+        pub parts_done,
     }
 }
 

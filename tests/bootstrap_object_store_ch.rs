@@ -223,6 +223,17 @@ async fn object_store_bootstrap_ch_end_to_end() {
         fx::assert_ch_matches_source(&ch, &source, "s14.t", "default.t")
             .context("source vs CH parity")?;
 
+        let body = fx::http_get(daemon.metrics_addr, "/metrics").context("scrape /metrics")?;
+        let total = fx::parse_metric(&body, "walshadow_bootstrap_parts_total")
+            .context("walshadow_bootstrap_parts_total absent")?;
+        let done = fx::parse_metric(&body, "walshadow_bootstrap_parts_done_total")
+            .context("walshadow_bootstrap_parts_done_total absent")?;
+        anyhow::ensure!(total > 0, "part total never published");
+        anyhow::ensure!(
+            done == total,
+            "bootstrap finished with {done}/{total} parts counted",
+        );
+
         Ok(())
     })();
 
