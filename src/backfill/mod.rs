@@ -8,6 +8,7 @@ pub(super) mod backup_sink;
 pub mod backup_source;
 pub mod backup_source_direct;
 pub mod backup_source_object_store;
+pub mod bootstrap_marker;
 pub mod bootstrap_oracle;
 pub mod bootstrap_window;
 pub mod copy_backfill;
