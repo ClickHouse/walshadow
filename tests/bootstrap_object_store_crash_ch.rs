@@ -80,6 +80,10 @@ async fn killed_object_store_bootstrap_finishes_after_restart() {
     let source = fx::start_source(&tmp);
     let _src_stop = fx::StopOnDrop { sh: &source };
     fx::load_source_workload(&source, "s14", N_ROWS).expect("load source workload");
+    // Set hint bits and flush them, so backup pages resolve visible and ship
+    // rows to ClickHouse before the gate settles
+    source.psql_one("SELECT count(*) FROM s14.t").unwrap();
+    source.psql_one("CHECKPOINT").unwrap();
 
     let storage_root = tmp.path().join("wal-g");
     fs::create_dir_all(&storage_root).unwrap();
@@ -157,17 +161,27 @@ async fn killed_object_store_bootstrap_finishes_after_restart() {
     daemon
         .wait_for_log("draining tar partitions", Duration::from_secs(60))
         .expect("first run never reached extraction");
-    let mid_flight = BootstrapMarker::read(&daemon.shadow_data_dir);
+    // Kill only once rows are durable in ClickHouse: the retry then has to
+    // deduplicate against them rather than load into an empty table
+    fx::wait_for_ch_value(
+        &ch,
+        "SELECT count() > 0 FROM default.t",
+        "1",
+        Duration::from_secs(60),
+    )
+    .expect("first attempt inserted nothing to deduplicate against");
 
     let mut child = first.into_inner().expect("first run still held its child");
     child.kill().expect("SIGKILL the daemon mid-bootstrap");
     child.wait().expect("reap the killed daemon");
     daemon.stop_shadow();
 
-    let mid_flight = mid_flight.expect(
-        "killed before the marker appeared; the bootstrap is too small to catch \
-         mid-flight, raise N_ROWS",
-    );
+    let mid_flight = BootstrapMarker::read(&daemon.shadow_data_dir)
+        .expect("read the interrupted marker")
+        .expect(
+            "killed before the marker appeared; the bootstrap is too small to catch \
+             mid-flight, raise N_ROWS",
+        );
     assert_eq!(mid_flight.attempts, 1, "first run is attempt 1");
     assert_eq!(
         mid_flight.backup_name.as_deref(),
@@ -203,14 +217,19 @@ async fn killed_object_store_bootstrap_finishes_after_restart() {
         fx::assert_ch_matches_source(&ch, &source, "s14.t", "default.t")
             .context("source vs CH parity after the crash")?;
 
+        daemon.wait_for_log("bootstrap visibility gate settled", Duration::from_secs(60))?;
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while BootstrapMarker::read(&daemon.shadow_data_dir)?.is_some() {
+            anyhow::ensure!(
+                std::time::Instant::now() < deadline,
+                "marker outlived a bootstrap that completed",
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
         let log = daemon.stderr();
         anyhow::ensure!(
             log.contains("discarding an incomplete bootstrap"),
             "restart did not re-extract; it took some other path:\n{log}",
-        );
-        anyhow::ensure!(
-            BootstrapMarker::read(&daemon.shadow_data_dir).is_none(),
-            "marker outlived a bootstrap that completed",
         );
         Ok(())
     })();

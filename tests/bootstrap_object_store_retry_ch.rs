@@ -7,6 +7,9 @@
 //!
 //! Seeded rather than killed on purpose: killing mid-extraction makes *where*
 //! it dies the variable, and the resumable state is the same either way.
+//!
+//! A second, newer backup lands before the retry and the daemon is configured
+//! with `LATEST`, so the run only passes if the pin beats the configuration.
 
 #![cfg(target_os = "linux")]
 
@@ -95,7 +98,7 @@ async fn incomplete_object_store_bootstrap_retries_itself() {
         std::env::remove_var("PGPASSWORD");
     }
     let cfg = PgConfig::resolve(&Vars::default()).expect("resolve source PgConfig from libpq env");
-    push::handle(&settings, storage.clone(), PushArgs::default(), cfg)
+    push::handle(&settings, storage.clone(), PushArgs::default(), cfg.clone())
         .await
         .expect("wal-rus push::handle against source PG");
     source
@@ -112,6 +115,18 @@ async fn incomplete_object_store_bootstrap_retries_itself() {
         .next()
         .expect("one backup on fresh storage")
         .name;
+
+    push::handle(&settings, storage.clone(), PushArgs::default(), cfg)
+        .await
+        .expect("push a newer backup for LATEST to resolve to");
+    let latest = walrus::pg::backup::fetch::resolve_name(&storage, "LATEST")
+        .await
+        .expect("resolve latest backup");
+    assert_ne!(latest, backup_name, "LATEST must have moved off the pin");
+    source.psql_one("SELECT pg_switch_wal()").unwrap();
+    push_completed_wal_segments(&source, &settings, storage.clone())
+        .await
+        .unwrap();
 
     let ch_tmp = tempfile::tempdir().unwrap();
     let ch = fx::ChServer::spawn(ch_tmp, slot.ch_tcp, slot.ch_http).expect("spawn ch");
@@ -153,7 +168,7 @@ async fn incomplete_object_store_bootstrap_retries_itself() {
             &ch_config_path,
             slot.walsender,
             "object-store",
-            &["--bootstrap-backup-name", &backup_name],
+            &["--bootstrap-backup-name", "LATEST"],
             &[
                 ("PGHOST", socket_host.clone()),
                 ("PGPORT", source.config().port.to_string()),
@@ -180,18 +195,27 @@ async fn incomplete_object_store_bootstrap_retries_itself() {
         fx::assert_ch_matches_source(&ch, &source, "s14.t", "default.t")
             .context("source vs CH parity after the retry")?;
 
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while BootstrapMarker::read(&daemon.shadow_data_dir)?.is_some() {
+            anyhow::ensure!(
+                std::time::Instant::now() < deadline,
+                "marker outlived a bootstrap that completed",
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
         let log = daemon.stderr();
         anyhow::ensure!(
             log.contains("discarding an incomplete bootstrap"),
             "daemon did not report the retry:\n{log}",
         );
         anyhow::ensure!(
-            !stale_spool.exists(),
-            "the previous attempt's gate spool survived the retry",
+            log.lines()
+                .any(|line| line.contains("fetching") && line.contains(&backup_name)),
+            "retry fetched something other than the pinned backup:\n{log}",
         );
         anyhow::ensure!(
-            BootstrapMarker::read(&daemon.shadow_data_dir).is_none(),
-            "marker outlived a bootstrap that completed",
+            !stale_spool.exists(),
+            "the previous attempt's gate spool survived the retry",
         );
         Ok(())
     })();

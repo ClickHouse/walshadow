@@ -93,10 +93,11 @@ insert batch
   stream proved, which gap replay requires archived history to match; reject backups
   extending beyond ancestor fork point
 - old object-store backup with intervening catalog changes can be rejected, use newer backup or `copy`
-- an interrupted `object_store` load discards its partial data dir and re-extracts, up to
+- an interrupted `object_store` load discards its partial data and re-extracts, up to
   three attempts, pinned to the backup the first attempt resolved so already-inserted rows
-  deduplicate; past that, and in every other mode, it stops for an operator. No progress
-  carries across attempts, so each one re-reads the whole backup
+  deduplicate. Failed cleanup keeps the pin and consumes an attempt. Past the cap, and for
+  a marker naming no backup, an unreadable marker, or any other mode, it stops for an
+  operator. No progress carries across attempts, so each one re-reads the whole backup
 - `initial_load = "none"` never reconstructs rows which existed before selection and receive no later change
 
 ## Large values

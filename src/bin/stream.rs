@@ -6056,7 +6056,7 @@ mod tests {
         // still want an operator
         std::fs::write(
             dir.join(walshadow::bootstrap_marker::MARKER_FILENAME),
-            b"attempts = 1\n",
+            b"attempts = 1\nbackup_name = \"base_original\"\n",
         )
         .unwrap();
         assert!(shadow_start(&direct(dir_str)).is_err());
@@ -6074,6 +6074,28 @@ mod tests {
             ShadowStart::Rebootstrap(..)
         ));
         assert!(dir.join("PG_VERSION").exists());
+    }
+
+    /// Every mode refuses a marker it cannot act on; only a pinned,
+    /// unexhausted `object_store` attempt retries itself
+    #[test]
+    fn shadow_start_rejects_invalid_markers_on_initialized_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("PG_VERSION"), b"17\n").unwrap();
+        for raw in [b"".as_slice(), b"attempts = 1\n", &[0xff]] {
+            std::fs::write(tmp.path().join(bootstrap_marker::MARKER_FILENAME), raw).unwrap();
+            for mode in ["off", "direct", "object_store"] {
+                let args = args_from(&[
+                    "--bootstrap-mode",
+                    mode,
+                    "--bootstrap-shadow-data-dir",
+                    tmp.path().to_str().unwrap(),
+                    "--walsender-bind",
+                    "127.0.0.1:5999",
+                ]);
+                assert!(shadow_start(&args).is_err());
+            }
+        }
     }
 
     #[test]

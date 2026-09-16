@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::io;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -10,7 +11,7 @@ pub const MARKER_FILENAME: &str = "walshadow_bootstrap.incomplete";
 
 pub const MAX_ATTEMPTS: u32 = 3;
 
-#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BootstrapMarker {
     pub attempts: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -18,55 +19,80 @@ pub struct BootstrapMarker {
 }
 
 impl BootstrapMarker {
-    pub fn read(dir: &Path) -> Option<Self> {
-        let raw = std::fs::read_to_string(dir.join(MARKER_FILENAME)).ok()?;
-        Some(toml::from_str(&raw).unwrap_or(Self {
-            attempts: 1,
-            backup_name: None,
-        }))
+    /// Only absence is a clean answer: an unreadable or unparseable marker
+    /// still says a bootstrap was interrupted, so it stops startup rather
+    /// than reading as a fresh data dir
+    pub fn read(dir: &Path) -> Result<Option<Self>> {
+        let path = dir.join(MARKER_FILENAME);
+        let raw = match std::fs::read_to_string(&path) {
+            Ok(raw) => raw,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
+        };
+        toml::from_str(&raw).map(Some).with_context(|| {
+            format!(
+                "parse {}; bootstrap incomplete, use operator recovery",
+                path.display()
+            )
+        })
     }
 
     pub async fn write(&self, dir: &Path) -> Result<()> {
         let body = toml::to_string(self).context("render bootstrap marker")?;
-        tokio::fs::write(dir.join(MARKER_FILENAME), body)
+        crate::fs::write_atomic(dir, MARKER_FILENAME, body.as_bytes())
             .await
-            .context("write bootstrap marker")
+            .context("persist bootstrap marker")
     }
 
     pub async fn clear(dir: &Path) -> Result<()> {
         tokio::fs::remove_file(dir.join(MARKER_FILENAME))
             .await
-            .context("clear completed bootstrap marker")
+            .context("clear completed bootstrap marker")?;
+        crate::fs::fsync_dir(dir)
+            .await
+            .context("persist bootstrap completion")
     }
 
-    pub fn attempts_exhausted(&self) -> bool {
-        self.attempts >= MAX_ATTEMPTS
-    }
-
-    pub fn next_attempt(&self) -> Self {
+    fn next_attempt(&self) -> Self {
         Self {
             attempts: self.attempts + 1,
             backup_name: self.backup_name.clone(),
         }
     }
 
-    pub fn pin(&mut self, backup_name: &str) {
-        self.backup_name = Some(backup_name.to_owned());
+    /// Retrying against a different backup rebases every row on a different
+    /// snapshot, so only a resolved name licenses one
+    fn pinned_backup(&self) -> Result<&str> {
+        self.backup_name
+            .as_deref()
+            .filter(|name| name.starts_with(walrus::pg::backup::BACKUP_NAME_PREFIX))
+            .context("bootstrap incomplete without a resolved backup pin; use operator recovery")
+    }
+
+    fn check_retry(&self) -> Result<()> {
+        self.pinned_backup()?;
+        anyhow::ensure!(
+            (1..MAX_ATTEMPTS).contains(&self.attempts),
+            "bootstrap incomplete after {} attempt(s); use operator recovery",
+            self.attempts,
+        );
+        Ok(())
     }
 }
 
 pub fn pending_attempt(dir: &Path, mode: BootstrapMode) -> Result<Option<BootstrapMarker>> {
-    let Some(marker) = BootstrapMarker::read(dir) else {
+    let Some(marker) = BootstrapMarker::read(dir)? else {
         return Ok(None);
     };
     anyhow::ensure!(
-        mode == BootstrapMode::ObjectStore && !marker.attempts_exhausted(),
-        "shadow data dir {} contains {MARKER_FILENAME}; bootstrap incomplete after {} attempt(s) \
-         in mode {mode:?}, automatic rebootstrap unsupported, choose a new empty data dir or use \
-         operator recovery",
+        mode == BootstrapMode::ObjectStore,
+        "shadow data dir {} contains {MARKER_FILENAME}; bootstrap incomplete in mode {mode:?}, \
+         automatic rebootstrap unsupported, choose a new empty data dir or use operator recovery",
         dir.display(),
-        marker.attempts,
     );
+    marker
+        .check_retry()
+        .with_context(|| format!("shadow data dir {}", dir.display()))?;
     Ok(Some(marker))
 }
 
@@ -75,8 +101,8 @@ pub async fn resolve_backup(
     configured: &str,
     previous: Option<&BootstrapMarker>,
 ) -> Result<String> {
-    let name = if let Some(pinned) = previous.and_then(|m| m.backup_name.as_deref()) {
-        pinned
+    let name = if let Some(marker) = previous {
+        marker.pinned_backup()?
     } else {
         configured
     };
@@ -96,25 +122,33 @@ pub async fn begin_attempt(
     previous: Option<BootstrapMarker>,
     pin: Option<String>,
 ) -> Result<BootstrapMarker> {
-    let mut marker = match previous {
-        Some(previous) => {
-            let next = previous.next_attempt();
-            tracing::warn!(
-                target: "walshadow::bootstrap",
-                data_dir = %data_dir.display(),
-                attempt = next.attempts,
-                max_attempts = MAX_ATTEMPTS,
-                backup_name = next.backup_name.as_deref().unwrap_or("LATEST"),
-                "discarding an incomplete bootstrap and extracting again",
-            );
-            discard_partial(data_dir).await?;
-            next
-        }
-        None => BootstrapMarker::default().next_attempt(),
+    let Some(previous) = previous else {
+        return first_attempt(data_dir, pin).await;
     };
-    if let Some(name) = pin {
-        marker.pin(&name);
-    }
+    previous.check_retry()?;
+    anyhow::ensure!(
+        pin == previous.backup_name,
+        "bootstrap retry changed backup pin",
+    );
+    let marker = previous.next_attempt();
+    // Land the next attempt before deleting anything: an interrupted or
+    // failed cleanup must still leave a marker naming the pinned backup
+    marker.write(data_dir).await?;
+    tracing::warn!(
+        target: "walshadow::bootstrap",
+        data_dir = %data_dir.display(),
+        attempt = marker.attempts,
+        max_attempts = MAX_ATTEMPTS,
+        backup_name = marker.backup_name.as_deref(),
+        "discarding an incomplete bootstrap and extracting again",
+    );
+    discard_partial(data_dir).await?;
+    Ok(marker)
+}
+
+/// Never clear partial or initialized standby state automatically: an empty
+/// dir is the only state a fresh load may claim
+async fn first_attempt(data_dir: &Path, pin: Option<String>) -> Result<BootstrapMarker> {
     tokio::fs::create_dir_all(data_dir)
         .await
         .with_context(|| format!("create {}", data_dir.display()))?;
@@ -125,6 +159,10 @@ pub async fn begin_attempt(
          data dir or use operator recovery",
         data_dir.display(),
     );
+    let marker = BootstrapMarker {
+        attempts: 1,
+        backup_name: pin,
+    };
     marker.write(data_dir).await?;
     Ok(marker)
 }
@@ -180,94 +218,57 @@ impl PartLedger {
     }
 }
 
-pub async fn discard_partial(data_dir: &Path) -> Result<()> {
-    match tokio::fs::remove_dir_all(data_dir).await {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e),
+/// Empty the data dir apart from the marker: the pinned next attempt has to
+/// outlive the partial data it replaces
+async fn discard_partial(data_dir: &Path) -> Result<()> {
+    let mut rd = match tokio::fs::read_dir(data_dir).await {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e).with_context(|| format!("read {}", data_dir.display())),
+    };
+    while let Some(entry) = rd.next_entry().await? {
+        if entry.file_name() == MARKER_FILENAME {
+            continue;
+        }
+        let path = entry.path();
+        if entry.file_type().await?.is_dir() {
+            tokio::fs::remove_dir_all(&path).await
+        } else {
+            tokio::fs::remove_file(&path).await
+        }
+        .with_context(|| format!("discard partial bootstrap {}", path.display()))?;
     }
-    .with_context(|| format!("discard partial bootstrap {}", data_dir.display()))
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
     use super::*;
+
+    fn pinned(attempts: u32) -> BootstrapMarker {
+        BootstrapMarker {
+            attempts,
+            backup_name: Some("base_original".into()),
+        }
+    }
 
     #[tokio::test]
     async fn round_trips_attempts_and_pinned_backup() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
-        assert_eq!(BootstrapMarker::read(dir), None);
-
-        let mut marker = BootstrapMarker {
-            attempts: 1,
-            backup_name: None,
-        };
-        marker.pin("base_00000006000003DE00000064");
-        marker.write(dir).await.unwrap();
-
-        let back = BootstrapMarker::read(dir).expect("marker present");
-        assert_eq!(back, marker);
-        assert!(!back.attempts_exhausted());
-
+        assert_eq!(BootstrapMarker::read(dir).unwrap(), None);
+        pinned(1).write(dir).await.unwrap();
+        assert_eq!(BootstrapMarker::read(dir).unwrap(), Some(pinned(1)));
+        pinned(2).write(dir).await.unwrap();
+        assert_eq!(BootstrapMarker::read(dir).unwrap(), Some(pinned(2)));
         BootstrapMarker::clear(dir).await.unwrap();
-        assert_eq!(BootstrapMarker::read(dir), None);
-    }
-
-    #[tokio::test]
-    async fn unparseable_marker_counts_as_one_attempt() {
-        let tmp = tempfile::tempdir().unwrap();
-        tokio::fs::write(tmp.path().join(MARKER_FILENAME), b"")
-            .await
-            .unwrap();
-        let marker = BootstrapMarker::read(tmp.path()).expect("marker present");
-        assert_eq!(marker.attempts, 1);
-        assert_eq!(marker.backup_name, None);
-        assert!(!marker.attempts_exhausted());
+        assert_eq!(BootstrapMarker::read(dir).unwrap(), None);
     }
 
     #[test]
-    fn next_attempt_keeps_the_pin_and_stops_at_the_cap() {
-        let mut marker = BootstrapMarker {
-            attempts: 1,
-            backup_name: None,
-        };
-        marker.pin("base_x");
-        for expected in 2..=MAX_ATTEMPTS {
-            marker = marker.next_attempt();
-            assert_eq!(marker.attempts, expected);
-            assert_eq!(marker.backup_name.as_deref(), Some("base_x"));
-        }
-        assert!(marker.attempts_exhausted());
-    }
-
-    #[tokio::test]
-    async fn discard_takes_the_whole_partial_data_dir() {
-        let tmp = tempfile::tempdir().unwrap();
-        let data_dir = tmp.path().join("shadow");
-        tokio::fs::create_dir_all(data_dir.join("base"))
-            .await
-            .unwrap();
-        tokio::fs::write(data_dir.join("PG_VERSION"), b"17\n")
-            .await
-            .unwrap();
-        let sibling = tmp.path().join("spill");
-        tokio::fs::create_dir_all(&sibling).await.unwrap();
-        tokio::fs::write(sibling.join("xact_spill.0.bin"), b"keep")
-            .await
-            .unwrap();
-
-        discard_partial(&data_dir).await.unwrap();
-
-        assert!(!data_dir.exists());
-        assert!(
-            sibling.join("xact_spill.0.bin").exists(),
-            "only the data dir is this function's to remove",
-        );
-    }
-
-    #[tokio::test]
-    async fn no_marker_is_not_a_pending_attempt() {
+    fn no_marker_is_not_a_pending_attempt() {
         let tmp = tempfile::tempdir().unwrap();
         for mode in [
             BootstrapMode::Off,
@@ -278,46 +279,58 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn object_store_retries_under_the_cap_and_refuses_at_it() {
+    /// Legacy empty markers and torn writes name no backup, so no mode may
+    /// read them as a resumable attempt
+    #[test]
+    fn corrupt_and_legacy_markers_block_resume() {
         let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path();
-        let mut marker = BootstrapMarker {
-            attempts: 1,
-            backup_name: None,
-        };
-        marker.pin("base_x");
-        marker.write(dir).await.unwrap();
-        assert_eq!(
-            pending_attempt(dir, BootstrapMode::ObjectStore).unwrap(),
-            Some(marker.clone()),
-        );
-
-        BootstrapMarker {
-            attempts: MAX_ATTEMPTS,
-            backup_name: Some("base_x".into()),
+        std::fs::write(tmp.path().join("PG_VERSION"), b"17\n").unwrap();
+        for raw in [b"".as_slice(), b"attempts =", &[0xff]] {
+            std::fs::write(tmp.path().join(MARKER_FILENAME), raw).unwrap();
+            for mode in [
+                BootstrapMode::Off,
+                BootstrapMode::Direct,
+                BootstrapMode::ObjectStore,
+            ] {
+                assert!(pending_attempt(tmp.path(), mode).is_err());
+            }
         }
-        .write(dir)
-        .await
-        .unwrap();
-        let err = pending_attempt(dir, BootstrapMode::ObjectStore).unwrap_err();
-        assert!(err.to_string().contains("operator recovery"), "{err}");
-        assert!(
-            err.to_string().contains(&format!("{MAX_ATTEMPTS} attempt")),
-            "{err}",
-        );
+    }
+
+    #[test]
+    fn marker_io_error_blocks_resume() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join(MARKER_FILENAME)).unwrap();
+        assert!(pending_attempt(tmp.path(), BootstrapMode::ObjectStore).is_err());
     }
 
     #[tokio::test]
-    async fn other_modes_still_demand_an_operator() {
+    async fn retry_requires_concrete_pin_valid_count_and_object_store() {
         let tmp = tempfile::tempdir().unwrap();
-        BootstrapMarker {
-            attempts: 1,
-            backup_name: None,
+        for attempts in [0, MAX_ATTEMPTS, u32::MAX] {
+            pinned(attempts).write(tmp.path()).await.unwrap();
+            let err = format!(
+                "{:#}",
+                pending_attempt(tmp.path(), BootstrapMode::ObjectStore).unwrap_err(),
+            );
+            assert!(err.contains("operator recovery"), "{err}");
+            assert!(err.contains(&format!("{attempts} attempt")), "{err}");
         }
-        .write(tmp.path())
-        .await
-        .unwrap();
+        for backup_name in [None, Some("LATEST".into()), Some("invalid".into())] {
+            BootstrapMarker {
+                attempts: 1,
+                backup_name,
+            }
+            .write(tmp.path())
+            .await
+            .unwrap();
+            assert!(pending_attempt(tmp.path(), BootstrapMode::ObjectStore).is_err());
+        }
+        pinned(1).write(tmp.path()).await.unwrap();
+        assert_eq!(
+            pending_attempt(tmp.path(), BootstrapMode::ObjectStore).unwrap(),
+            Some(pinned(1)),
+        );
         for mode in [BootstrapMode::Off, BootstrapMode::Direct] {
             let err = pending_attempt(tmp.path(), mode).unwrap_err();
             assert!(err.to_string().contains("operator recovery"), "{err}");
@@ -330,7 +343,7 @@ mod tests {
         let data_dir = tmp.path().join("shadow");
         let marker = begin_attempt(&data_dir, None, None).await.unwrap();
         assert_eq!(marker.attempts, 1);
-        assert_eq!(BootstrapMarker::read(&data_dir), Some(marker));
+        assert_eq!(BootstrapMarker::read(&data_dir).unwrap(), Some(marker));
 
         let err = begin_attempt(&data_dir, None, None).await.unwrap_err();
         assert!(err.to_string().contains("non-empty"), "{err}");
@@ -341,22 +354,118 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retry_discards_the_partial_and_keeps_the_pin() {
+    async fn retry_keeps_the_pin_and_removes_only_partial_data() {
         let tmp = tempfile::tempdir().unwrap();
         let data_dir = tmp.path().join("shadow");
-        let first = begin_attempt(&data_dir, None, None).await.unwrap();
+        let first = begin_attempt(&data_dir, None, pinned(1).backup_name)
+            .await
+            .unwrap();
+        assert_eq!(first, pinned(1));
+        tokio::fs::create_dir_all(data_dir.join("base"))
+            .await
+            .unwrap();
         tokio::fs::write(data_dir.join("PG_VERSION"), b"17\n")
             .await
             .unwrap();
+        let spill_dir = tmp.path().join("spill");
+        tokio::fs::create_dir_all(&spill_dir).await.unwrap();
+        let keep = spill_dir.join("xact_spill.0.bin");
+        tokio::fs::write(&keep, b"keep").await.unwrap();
 
-        let mut pinned = first;
-        pinned.pin("base_pinned");
-        let second = begin_attempt(&data_dir, Some(pinned), None).await.unwrap();
+        let second = begin_attempt(&data_dir, Some(first), pinned(1).backup_name)
+            .await
+            .unwrap();
 
-        assert_eq!(second.attempts, 2);
-        assert_eq!(second.backup_name.as_deref(), Some("base_pinned"));
+        assert_eq!(second, pinned(2));
+        assert_eq!(
+            pending_attempt(&data_dir, BootstrapMode::ObjectStore).unwrap(),
+            Some(second),
+        );
         assert!(!data_dir.join("PG_VERSION").exists());
-        assert_eq!(BootstrapMarker::read(&data_dir), Some(second));
+        assert!(!data_dir.join("base").exists());
+        assert!(
+            keep.exists(),
+            "only the data dir is this function's to empty"
+        );
+    }
+
+    /// Cleanup dies partway: the next attempt is already on disk, so the
+    /// restart still knows its backup and burns an attempt rather than
+    /// looping on the same failure
+    #[tokio::test]
+    async fn cleanup_failure_keeps_pin_and_consumes_attempt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("shadow");
+        let first = begin_attempt(&data_dir, None, pinned(1).backup_name)
+            .await
+            .unwrap();
+        let blocked = data_dir.join("base");
+        tokio::fs::create_dir_all(&blocked).await.unwrap();
+        tokio::fs::write(blocked.join("1"), b"page").await.unwrap();
+        let sealed = std::fs::Permissions::from_mode(0o500);
+        tokio::fs::set_permissions(&blocked, sealed).await.unwrap();
+
+        assert!(
+            begin_attempt(&data_dir, Some(first), pinned(1).backup_name)
+                .await
+                .is_err()
+        );
+        let previous = pending_attempt(&data_dir, BootstrapMode::ObjectStore).unwrap();
+        assert_eq!(previous, Some(pinned(2)));
+
+        let open = std::fs::Permissions::from_mode(0o700);
+        tokio::fs::set_permissions(&blocked, open).await.unwrap();
+        assert_eq!(
+            begin_attempt(&data_dir, previous, pinned(1).backup_name)
+                .await
+                .unwrap(),
+            pinned(3),
+        );
+        assert!(!blocked.exists());
+        assert!(pending_attempt(&data_dir, BootstrapMode::ObjectStore).is_err());
+    }
+
+    #[tokio::test]
+    async fn changed_pin_leaves_partial_data_intact() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("shadow");
+        let first = begin_attempt(&data_dir, None, pinned(1).backup_name)
+            .await
+            .unwrap();
+        let version = data_dir.join("PG_VERSION");
+        tokio::fs::write(&version, b"17\n").await.unwrap();
+
+        assert!(
+            begin_attempt(&data_dir, Some(first), Some("base_new".into()))
+                .await
+                .is_err()
+        );
+        assert!(version.exists());
+        assert_eq!(BootstrapMarker::read(&data_dir).unwrap(), Some(pinned(1)));
+    }
+
+    #[tokio::test]
+    async fn resolved_pin_overrides_configured_backup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage: walrus::storage::DynStorage =
+            std::sync::Arc::new(walrus::storage::fs::FsStorage::new(tmp.path()).unwrap());
+        for configured in ["LATEST", "base_new"] {
+            assert_eq!(
+                resolve_backup(&storage, configured, Some(&pinned(1)))
+                    .await
+                    .unwrap(),
+                "base_original",
+            );
+            let unpinned = BootstrapMarker {
+                attempts: 1,
+                backup_name: None,
+            };
+            assert!(
+                resolve_backup(&storage, configured, Some(&unpinned))
+                    .await
+                    .is_err()
+            );
+        }
     }
 
     #[tokio::test]
