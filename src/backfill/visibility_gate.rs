@@ -299,13 +299,14 @@ impl RepairDrain {
             repairs.push(join_stage(lane.repair, "row repair").await);
             drains.push(join_stage(lane.drain, "drain").await);
         }
+        let drained = drains.into_iter().collect::<Result<_, _>>()?;
         let mut repaired = RepairStats::default();
         for r in repairs {
             let r = r?;
             repaired.rows += r.rows;
             repaired.p_hi = repaired.p_hi.max(r.p_hi);
         }
-        Ok((repaired, drains.into_iter().collect::<Result<_, _>>()?))
+        Ok((repaired, drained))
     }
 }
 
@@ -349,11 +350,12 @@ pub async fn resolve_greenfield(
     let multi = read_pg_multixact(data_dir).await?;
     let view = PgXactView::new(&accum, patch).with_multixact(&multi);
 
+    let fatal = Fatal::new();
     let tail = OwnedTail::spawn(
         &sink.emitter,
         sink.emitter.inserter_pool_size,
         sink.stats.clone(),
-        Fatal::new(),
+        fatal.clone(),
         None,
         oracle,
         "visibility gate",
@@ -383,7 +385,7 @@ pub async fn resolve_greenfield(
         }
         (Err(e), _) | (_, Err(e)) => {
             tail.quiesce().await;
-            anyhow::bail!(e);
+            anyhow::bail!(fatal.message().unwrap_or(e));
         }
     };
     tail.finish(next_seq).await.map_err(anyhow::Error::msg)?;
@@ -422,6 +424,62 @@ mod tests {
             offnum: 0,
             columns: Vec::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn drain_failure_survives_repair_channel_closure() {
+        for panics in [false, true] {
+            let (tx, rx) = mpsc::channel(1);
+            tx.send(RepairBatch {
+                rows: vec![tuple(100, 0, HEAP_XMIN_COMMITTED)],
+                unresolved: false,
+            })
+            .await
+            .unwrap();
+            drop(tx);
+            let (repaired_tx, repaired_rx) = mpsc::channel(1);
+            let repair = AbortOnDropHandle::new(tokio::spawn(async move {
+                repaired_tx.closed().await;
+                RowRepair {
+                    source: crate::config::SourceConn::default().to_pg_config(),
+                    catalog: CatalogMap::new(),
+                    scope: RepairScope::default(),
+                    rate: CopyRate::new(None),
+                }
+                .run(rx, repaired_tx)
+                .await
+            }));
+            let drain = AbortOnDropHandle::new(tokio::spawn(async move {
+                drop(repaired_rx);
+                assert!(!panics, "toast store unavailable");
+                Err("toast store unavailable".to_string())
+            }));
+            let stages = RepairDrain {
+                lanes: vec![RepairDrainLane { repair, drain }],
+            };
+            let err = stages.join().await.unwrap_err();
+            assert!(err.starts_with("bootstrap drain"), "{err}");
+            assert!(err.contains("toast store unavailable"), "{err}");
+            assert!(!err.contains("drain closed early"), "{err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn repair_failure_survives_successful_drain() {
+        let stages = RepairDrain {
+            lanes: vec![RepairDrainLane {
+                repair: AbortOnDropHandle::new(tokio::spawn(async {
+                    anyhow::bail!("source sql unavailable")
+                })),
+                drain: AbortOnDropHandle::new(tokio::spawn(async {
+                    Ok(BootstrapDrainOutcome::default())
+                })),
+            }],
+        };
+        assert_eq!(
+            stages.join().await.unwrap_err(),
+            "bootstrap row repair: source sql unavailable"
+        );
     }
 
     #[tokio::test]

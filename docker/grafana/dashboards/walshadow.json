@@ -381,7 +381,7 @@
       },
       "targets": [
         {
-          "expr": "walshadow_uptime_seconds",
+          "expr": "walshadow_uptime_seconds_total",
           "instant": true,
           "legendFormat": "uptime",
           "refId": "A"

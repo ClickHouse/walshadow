@@ -3549,10 +3549,26 @@ struct StageCounters<'a> {
     uptime_secs: u64,
 }
 
+/// Zero rather than absent when no emitter is serving: the phase has not
+/// started, which reads the same as not yet counted
+fn emitter_counts<const N: usize>(
+    stats: Option<&EmitterStats>,
+    picks: [fn(&EmitterStats) -> &AtomicU64; N],
+) -> [u64; N] {
+    picks.map(|pick| stats.map_or(0, |s| pick(s).load(Ordering::Relaxed)))
+}
+
 fn stage_gauges(v: &StageCounters<'_>) -> MetricsSnapshot {
     let (proc_cpu, proc_rss) = read_process_stats();
-    let emitter_stats = v.emitter;
-    let uptime_secs = v.uptime_secs;
+    let emitter = |pick: fn(&EmitterStats) -> &AtomicU64| -> u64 {
+        v.emitter.map_or(0, |s| pick(s).load(Ordering::Relaxed))
+    };
+    let emitter_seconds =
+        |pick: fn(&EmitterStats) -> &AtomicU64| -> f64 { emitter(pick) as f64 / 1e9 };
+    let emitter_ops =
+        |pick: fn(&EmitterStats) -> &walshadow::decode::heap_decoder::OpCounters| -> [u64; 7] {
+            v.emitter.map_or([0; 7], |s| pick(s).load())
+        };
     let oracle = |pick: fn(&walshadow::oracle::OracleStats) -> &AtomicU64| -> u64 {
         v.oracle
             .iter()
@@ -3579,157 +3595,84 @@ fn stage_gauges(v: &StageCounters<'_>) -> MetricsSnapshot {
                 .sum()
         })
     };
+    let bridge_op_seconds = |pick: fn(
+        &walshadow::bridge::BridgeStats,
+    ) -> &[AtomicU64; walshadow::bridge::OP_COUNT]|
+     -> [f64; walshadow::bridge::OP_COUNT] {
+        bridge_ops(pick).map(|nanos| nanos as f64 / 1e9)
+    };
     MetricsSnapshot {
-        bootstrap_deferred_bytes: emitter_stats
-            .map(|s| s.bootstrap_deferred_bytes.load(Ordering::Relaxed))
-            .unwrap_or(0),
-        bootstrap_deferred_spool_bytes: emitter_stats
-            .map(|s| s.bootstrap_deferred_spool_bytes.load(Ordering::Relaxed))
-            .unwrap_or(0),
-        toast_chunk_puts_total: emitter_stats
-            .map(|s| s.toast_chunk_puts.load(Ordering::Relaxed))
-            .unwrap_or(0),
-        toast_chunk_put_seconds: emitter_stats
-            .map(|s| s.toast_chunk_put_nanos.load(Ordering::Relaxed))
-            .unwrap_or(0) as f64
-            / 1e9,
-        toast_chunks_stored_total: emitter_stats
-            .map(|s| s.toast_chunks_stored.load(Ordering::Relaxed))
-            .unwrap_or(0),
-        toast_tombstones_stored_total: emitter_stats
-            .map(|s| s.toast_tombstones_stored.load(Ordering::Relaxed))
-            .unwrap_or(0),
-        toast_values_filled_superseded_total: emitter_stats
-            .map(|s| s.toast_values_filled_superseded.load(Ordering::Relaxed))
-            .unwrap_or(0),
-        toast_values_filled_mismatch_total: emitter_stats
-            .map(|s| s.toast_values_filled_mismatch.load(Ordering::Relaxed))
-            .unwrap_or(0),
-        toast_mirror_truncates_total: emitter_stats
-            .map(|s| s.toast_mirror_truncates.load(Ordering::Relaxed))
-            .unwrap_or(0),
-        toast_mirror_retires_total: emitter_stats
-            .map(|s| s.toast_mirror_retires.load(Ordering::Relaxed))
-            .unwrap_or(0),
-        toast_rewrite_barriers_total: emitter_stats
-            .map(|s| s.toast_rewrite_barriers.load(Ordering::Relaxed))
-            .unwrap_or(0),
-        toast_stash_decoded_total: emitter_stats
-            .map(|s| s.toast_stash_decoded.load(Ordering::Relaxed))
-            .unwrap_or(0),
-        toast_stash_discarded_total: emitter_stats
-            .map(|s| s.toast_stash_discarded.load(Ordering::Relaxed))
-            .unwrap_or(0),
-        toast_stash_in_place_total: emitter_stats
-            .map(|s| s.toast_stash_in_place.load(Ordering::Relaxed))
-            .unwrap_or(0),
-        stash_foreign_db_skipped_total: emitter_stats
-            .map(|s| s.stash_foreign_db_skipped.load(Ordering::Relaxed))
-            .unwrap_or(0),
-        xact_plan_rows: emitter_stats
-            .map(|s| s.plan_rows.load(Ordering::Relaxed))
-            .unwrap_or(0),
-        xact_plan_bytes_by_storage: emitter_stats
-            .map(|s| {
-                [
-                    s.plan_bytes_mem.load(Ordering::Relaxed),
-                    s.plan_bytes_file.load(Ordering::Relaxed),
-                ]
-            })
-            .unwrap_or_default(),
-        xact_plan_failures_by_reason: emitter_stats
-            .map(|s| {
-                [
-                    s.plan_failures_spool.load(Ordering::Relaxed),
-                    s.plan_failures_fail_closed_image_only
-                        .load(Ordering::Relaxed),
-                    s.plan_failures_fail_closed_malformed
-                        .load(Ordering::Relaxed),
-                    s.plan_failures_fail_closed_unsupported_op
-                        .load(Ordering::Relaxed),
-                    s.plan_failures_stash_ambiguous.load(Ordering::Relaxed),
-                    s.plan_failures_incomplete_toast.load(Ordering::Relaxed),
-                    s.plan_failures_missing_stash_resolution
-                        .load(Ordering::Relaxed),
-                    s.plan_failures_detoast.load(Ordering::Relaxed),
-                    s.plan_failures_partial_update.load(Ordering::Relaxed),
-                    s.plan_failures_view.load(Ordering::Relaxed),
-                    s.plan_failures_drain.load(Ordering::Relaxed),
-                ]
-            })
-            .unwrap_or_default(),
-        route_snapshots_by_result: emitter_stats
-            .map(|s| {
-                [
-                    s.route_snapshots_mapped.load(Ordering::Relaxed),
-                    s.route_snapshots_unmapped.load(Ordering::Relaxed),
-                ]
-            })
-            .unwrap_or_default(),
-        raw_decode_records_by_kind_op: emitter_stats
-            .map(|s| {
-                [
-                    s.raw_decode_toast_ops.load(),
-                    s.raw_decode_ordinary_ops.load(),
-                ]
-            })
-            .unwrap_or_default(),
-        raw_decode_rows_by_op: emitter_stats
-            .map(|s| s.raw_decode_rows_ops.load())
-            .unwrap_or_default(),
-        emitter_rows_total: emitter_stats
-            .map(|s| s.rows_emitted.load(Ordering::Relaxed))
-            .unwrap_or(0),
-        emitter_blocks_total: emitter_stats
-            .map(|s| s.blocks_sent.load(Ordering::Relaxed))
-            .unwrap_or(0),
-        queue_jobs_out_total: emitter_stats
-            .map(|s| s.queue_jobs_out.load(Ordering::Relaxed))
-            .unwrap_or(0),
-        decode_jobs_in_total: emitter_stats
-            .map(|s| s.decode_jobs_in.load(Ordering::Relaxed))
-            .unwrap_or(0),
-        decode_rows_out_total: emitter_stats
-            .map(|s| s.decode_rows_out.load(Ordering::Relaxed))
-            .unwrap_or(0),
-        insertbatch_rows_in_total: emitter_stats
-            .map(|s| s.insertbatch_rows_in.load(Ordering::Relaxed))
-            .unwrap_or(0),
-        insertbatch_batches_out_total: emitter_stats
-            .map(|s| s.insertbatch_batches_out.load(Ordering::Relaxed))
-            .unwrap_or(0),
-        inserter_batches_in_total: emitter_stats
-            .map(|s| s.inserter_batches_in.load(Ordering::Relaxed))
-            .unwrap_or(0),
-        inserter_ch_seconds_total: emitter_stats
-            .map(|s| s.inserter_ch_nanos.load(Ordering::Relaxed) as f64 / 1e9)
-            .unwrap_or(0.0),
-        inserter_encode_seconds_total: emitter_stats
-            .map(|s| s.inserter_encode_nanos.load(Ordering::Relaxed) as f64 / 1e9)
-            .unwrap_or(0.0),
-        oracle_resolve_seconds_total: emitter_stats
-            .map(|s| s.oracle_resolve_nanos.load(Ordering::Relaxed) as f64 / 1e9)
-            .unwrap_or(0.0),
+        bootstrap_deferred_bytes: emitter(|s| &s.bootstrap_deferred_bytes),
+        bootstrap_deferred_spool_bytes: emitter(|s| &s.bootstrap_deferred_spool_bytes),
+        toast_chunk_puts_total: emitter(|s| &s.toast_chunk_puts),
+        toast_chunk_put_seconds: emitter_seconds(|s| &s.toast_chunk_put_nanos),
+        toast_chunks_stored_total: emitter(|s| &s.toast_chunks_stored),
+        toast_tombstones_stored_total: emitter(|s| &s.toast_tombstones_stored),
+        toast_values_filled_superseded_total: emitter(|s| &s.toast_values_filled_superseded),
+        toast_values_filled_mismatch_total: emitter(|s| &s.toast_values_filled_mismatch),
+        toast_mirror_truncates_total: emitter(|s| &s.toast_mirror_truncates),
+        toast_mirror_retires_total: emitter(|s| &s.toast_mirror_retires),
+        toast_rewrite_barriers_total: emitter(|s| &s.toast_rewrite_barriers),
+        toast_stash_decoded_total: emitter(|s| &s.toast_stash_decoded),
+        toast_stash_discarded_total: emitter(|s| &s.toast_stash_discarded),
+        toast_stash_in_place_total: emitter(|s| &s.toast_stash_in_place),
+        stash_foreign_db_skipped_total: emitter(|s| &s.stash_foreign_db_skipped),
+        xact_plan_rows: emitter(|s| &s.plan_rows),
+        xact_plan_bytes_by_storage: emitter_counts(
+            v.emitter,
+            [|s| &s.plan_bytes_mem, |s| &s.plan_bytes_file],
+        ),
+        xact_plan_failures_by_reason: emitter_counts(
+            v.emitter,
+            [
+                |s| &s.plan_failures_spool,
+                |s| &s.plan_failures_fail_closed_image_only,
+                |s| &s.plan_failures_fail_closed_malformed,
+                |s| &s.plan_failures_fail_closed_unsupported_op,
+                |s| &s.plan_failures_stash_ambiguous,
+                |s| &s.plan_failures_incomplete_toast,
+                |s| &s.plan_failures_missing_stash_resolution,
+                |s| &s.plan_failures_detoast,
+                |s| &s.plan_failures_partial_update,
+                |s| &s.plan_failures_view,
+                |s| &s.plan_failures_drain,
+            ],
+        ),
+        route_snapshots_by_result: emitter_counts(
+            v.emitter,
+            [
+                |s| &s.route_snapshots_mapped,
+                |s| &s.route_snapshots_unmapped,
+            ],
+        ),
+        raw_decode_records_by_kind_op: [
+            emitter_ops(|s| &s.raw_decode_toast_ops),
+            emitter_ops(|s| &s.raw_decode_ordinary_ops),
+        ],
+        raw_decode_rows_by_op: emitter_ops(|s| &s.raw_decode_rows_ops),
+        emitter_rows_total: emitter(|s| &s.rows_emitted),
+        emitter_blocks_total: emitter(|s| &s.blocks_sent),
+        queue_jobs_out_total: emitter(|s| &s.queue_jobs_out),
+        decode_jobs_in_total: emitter(|s| &s.decode_jobs_in),
+        decode_rows_out_total: emitter(|s| &s.decode_rows_out),
+        insertbatch_rows_in_total: emitter(|s| &s.insertbatch_rows_in),
+        insertbatch_batches_out_total: emitter(|s| &s.insertbatch_batches_out),
+        inserter_batches_in_total: emitter(|s| &s.inserter_batches_in),
+        inserter_ch_seconds_total: emitter_seconds(|s| &s.inserter_ch_nanos),
+        inserter_encode_seconds_total: emitter_seconds(|s| &s.inserter_encode_nanos),
+        oracle_resolve_seconds_total: emitter_seconds(|s| &s.oracle_resolve_nanos),
         process_cpu_seconds_total: proc_cpu,
         process_resident_memory_bytes: proc_rss,
-        emitter_xacts_total: emitter_stats
-            .map(|s| s.xacts_committed.load(Ordering::Relaxed))
-            .unwrap_or(0),
-        emitter_unsupported_relations: emitter_stats
-            .map(|s| s.unsupported_relations.load(Ordering::Relaxed))
-            .unwrap_or(0),
-        emitter_deletes_discarded: emitter_stats
-            .map(|s| s.deletes_discarded.load(Ordering::Relaxed))
-            .unwrap_or(0),
-        oracle_local_columns_total: emitter_stats
-            .map(|s| s.oracle_local_columns.load(Ordering::Relaxed))
-            .unwrap_or(0),
+        emitter_xacts_total: emitter(|s| &s.xacts_committed),
+        emitter_unsupported_relations: emitter(|s| &s.unsupported_relations),
+        emitter_deletes_discarded: emitter(|s| &s.deletes_discarded),
+        oracle_local_columns_total: emitter(|s| &s.oracle_local_columns),
         oracle_blocks_total: oracle(|s| &s.blocks),
         oracle_rows_total: oracle(|s| &s.rows),
         oracle_cells_total: oracle(|s| &s.cells),
         oracle_conversion_errors_total: oracle(|s| &s.conversion_errors),
         oracle_errors_total: oracle(|s| &s.errors),
-        uptime_secs,
+        uptime_seconds: v.uptime_secs,
         // Gauge, so it answers off whichever bridge is serving: bootstrap's
         // oracle socket is gone by the time the live bridge dials
         bridge_up: v
@@ -3740,9 +3683,9 @@ fn stage_gauges(v: &StageCounters<'_>) -> MetricsSnapshot {
             .map_or(0, |b| b.up.load(Ordering::Relaxed)),
         bridge_requests_by_op: bridge_ops(|b| &b.requests),
         bridge_errors_by_op: bridge_ops(|b| &b.errors),
-        bridge_request_nanos_by_op: bridge_ops(|b| &b.request_nanos),
-        bridge_lock_wait_nanos_by_op: bridge_ops(|b| &b.lock_wait_nanos),
-        bridge_service_nanos_by_op: bridge_ops(|b| &b.service_nanos),
+        bridge_request_seconds_by_op: bridge_op_seconds(|b| &b.request_nanos),
+        bridge_lock_wait_seconds_by_op: bridge_op_seconds(|b| &b.lock_wait_nanos),
+        bridge_service_seconds_by_op: bridge_op_seconds(|b| &b.service_nanos),
         bridge_request_bytes_by_op: bridge_ops(|b| &b.request_bytes),
         bridge_response_bytes_by_op: bridge_ops(|b| &b.response_bytes),
         bridge_reconnects_total: bridge(|b| &b.reconnects),
@@ -4823,7 +4766,7 @@ async fn run_bootstrap(
                 for tail in tails {
                     tail.quiesce().await;
                 }
-                return Err(e);
+                return Err(fatal.message().map(anyhow::Error::msg).unwrap_or(e));
             }
         };
         // Seqs are per-lane, so each tail is proven through its own count
@@ -5634,7 +5577,7 @@ mod tests {
         );
         // Live bridge owns the gauge once it exists, whatever bootstrap left
         assert_eq!(snap.bridge_up, 0);
-        assert_eq!(snap.uptime_secs, 11);
+        assert_eq!(snap.uptime_seconds, 11);
 
         let boot_only = stage_gauges(&StageCounters {
             emitter: None,

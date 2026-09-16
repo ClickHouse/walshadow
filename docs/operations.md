@@ -29,8 +29,9 @@ toward `source_received`. Short differences are expected while batches flush
 
 ## Monitor with Prometheus and Grafana
 
-Set `--metrics-bind` to expose Prometheus text metrics. Docker deployment uses
-port 9484 and includes optional provisioned dashboard
+Set `--metrics-bind` to expose OpenMetrics text metrics, which Prometheus
+scrapes directly. Counter series carry `_total`. Docker deployment uses port
+9484 and includes optional provisioned dashboard
 
 ```bash
 docker compose -f docker/docker-compose.yml \

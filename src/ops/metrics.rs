@@ -1,25 +1,40 @@
-//! HTTP/Prometheus metrics surface.
+//! HTTP/OpenMetrics metrics surface.
 //!
-//! `/metrics` over plain TCP, Prometheus
-//! [text-format](https://prometheus.io/docs/instrumenting/exposition_formats/),
-//! hand-rolled to avoid a `prometheus` crate dependency for a tiny gauge set.
+//! `/metrics` over plain TCP, encoded by `prometheus-client` as
+//! [OpenMetrics text](https://github.com/prometheus/OpenMetrics/blob/v1.0.0/specification/OpenMetrics.md#text-format):
+//! counter samples carry `_total`, the body closes with `# EOF`.
+//!
+//! Declarations live here rather than in a mutable metric registry: values are
+//! already atomics elsewhere in the pipeline, so a scrape encodes one owned
+//! [`MetricsSnapshot`] through a [`Collector`].
 //!
 //! Registry is `Arc`-cloneable: daemon's main loop writes at status-tick
 //! cadence, HTTP server reads a snapshot per request. Endpoint is read-only by
 //! design (no `/quit`, no admin verbs); operator actions stay on the CLI.
 
 use std::collections::{BTreeMap, VecDeque};
+use std::fmt;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use prometheus_client::collector::Collector;
+use prometheus_client::encoding::{
+    DescriptorEncoder, EncodeCounterValue, EncodeGaugeValue, GaugeValueEncoder, MetricEncoder,
+    NoLabelSet, text,
+};
+use prometheus_client::metrics::MetricType;
+use prometheus_client::registry::Registry;
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 
+use crate::catalog::pending::DegradeReason;
+use crate::decode::heap_decoder::HEAP_OP_LABELS;
+use crate::ops::bridge::OP_LABELS;
 use crate::pos::{Drain, EmitterAck, FilterDispatched, Floor, Pos, ShadowReplay, SourceReceived};
 use crate::source::transition::SWITCH_FAILURE_REASONS;
 
@@ -31,287 +46,391 @@ pub enum MetricsError {
     Bind { addr: String, source: io::Error },
 }
 
-/// Snapshot of every value `/metrics` renders. Daemon writes per status-line
-/// iteration; HTTP readers take a read lock and serialise.
-#[derive(Debug, Default, Clone)]
-pub struct MetricsSnapshot {
-    /// Source PG's most recent `server_wal_end` (write LSN as PG sees it)
-    pub source_received_lsn: Pos<SourceReceived>,
+macro_rules! encode_metric {
+    ($enc:expr, counter, $name:expr, $help:expr, $value:expr) => {
+        counter($enc, $name, $help, $value)?
+    };
+    ($enc:expr, gauge, $name:expr, $help:expr, $value:expr) => {
+        gauge($enc, $name, $help, $value)?
+    };
+    ($enc:expr, counter, $name:expr, $help:expr, $value:expr, $key:literal, $labels:expr) => {
+        counter_series($enc, $name, $help, $key, $labels.into_iter().zip($value))?
+    };
+    ($enc:expr, gauge, $name:expr, $help:expr, $value:expr, $key:literal, $labels:expr) => {
+        gauge_series($enc, $name, $help, $key, $labels.into_iter().zip($value))?
+    };
+}
+
+/// Declares [`MetricsSnapshot`] and the families a scrape renders off it, so a
+/// metric is one entry rather than a field, a doc comment and an encode call.
+/// Help text doubles as the field's documentation; `walshadow_` plus the field
+/// name is the family name, which [`declare`] trims of the `_by_<label>` tail a
+/// `["label" = LABELS]` array carries, and of the `_total` OpenMetrics re-adds
+/// to counter samples.
+///
+/// A `custom` field the table declares but does not encode: either its family
+/// carries several labels, a bare sample beside a labelled one, or a value no
+/// field holds, so [`encode_snapshot`] writes it by hand, or `ctl status` is
+/// its only reader.
+macro_rules! snapshot {
+    (
+        custom { $($(#[doc = $custom_doc:literal])* $custom:ident: $custom_ty:ty,)* }
+        $(
+            $(#[doc = $doc:literal])*
+            $kind:ident $field:ident: $ty:ty $([$key:literal = $labels:expr])? = $help:literal,
+        )*
+    ) => {
+        /// Snapshot of every value `/metrics` renders. Daemon writes per
+        /// status-line iteration; HTTP readers take a read lock and serialise.
+        #[derive(Debug, Default, Clone)]
+        pub struct MetricsSnapshot {
+            $($(#[doc = $custom_doc])* pub $custom: $custom_ty,)*
+            $(
+                #[doc = $help]
+                $(#[doc = $doc])*
+                pub $field: $ty,
+            )*
+        }
+
+        fn encode_fields(snap: &MetricsSnapshot, enc: &mut DescriptorEncoder<'_>) -> fmt::Result {
+            $(encode_metric!(
+                enc,
+                $kind,
+                concat!("walshadow_", stringify!($field)),
+                $help,
+                snap.$field
+                $(, $key, $labels)?
+            );)*
+            Ok(())
+        }
+    };
+}
+
+snapshot! {
+    custom {
+        /// `route` is `"to_shadow"` / `"to_decoder"`
+        records_by_rm_route: BTreeMap<(String, &'static str), u64>,
+        /// Raw-stash records `[dirty, marker]` x op, rendered `kind=`/`op=`
+        /// labelled
+        raw_stash_records_by_kind_op: [[u64; 7]; 2],
+        /// Commit-resolve raw decode records `[toast, ordinary]` x op
+        raw_decode_records_by_kind_op: [[u64; 7]; 2],
+        /// `initial_load` backfills recorded in the ledger but not yet
+        /// complete (in flight, or awaiting re-run on next boot), rendered
+        /// bare and split `[copy, base_backup, object_store]` under one family
+        config_backfills_pending: u64,
+        config_backfills_pending_by_mode: [u64; 3],
+        /// Refusal a crossing parked on, rendered as `crossing_wedged`. The
+        /// pump keeps publishing rather than exiting into a restart that
+        /// re-crosses and re-fails, so this is how the daemon says it is
+        /// waiting for an operator
+        crossing_blocked_on: &'static str,
+        /// PostgreSQL source system identifier, rendered as a `source_info`
+        /// label to hold 64 bits a float64 sample would round
+        source_system_id: u64,
+        /// Proof the last endpoint swap failed on, from the crossing's own
+        /// vocabulary; empty once one lands
+        source_endpoint_swap_blocked_on: &'static str,
+        /// `crossing_blocked_on`'s own words, which name the pair behind it
+        crossing_detail: String,
+        /// Both frozen pause numbers were re-derived by this process from a
+        /// pause it found already in effect, so a pair read before a restart
+        /// is stale
+        pause_refrozen: bool,
+        /// Every term of the promotion gate holds, so the target may be
+        /// promoted
+        promotion_ready: bool,
+        /// First term that does not, empty once ready
+        promotion_blocked_on: &'static str,
+        promotion_target_in_recovery: bool,
+        /// Target's `pg_last_wal_replay_lsn()`, read while paused
+        promotion_target_replay_lsn: u64,
+        /// Target's `pg_last_wal_receive_lsn()`, read while paused
+        promotion_target_receive_lsn: u64,
+    }
+
+    gauge source_received_lsn: Pos<SourceReceived> =
+        "Source PG's most recent server_wal_end seen on the replication socket.",
     /// Last segment-boundary LSN dispatched downstream; becomes durable once
     /// segment fsync lands
-    pub filter_lsn: Pos<FilterDispatched>,
-    /// Shadow PG's `pg_last_wal_replay_lsn()`, `0` until first poll
-    pub shadow_replay_lsn: Pos<ShadowReplay>,
-    /// Highest commit LSN drained out of the xact buffer, so above every
-    /// commit whose rows could have reached ClickHouse
-    pub decoder_commit_lsn: Pos<Drain>,
+    gauge filter_lsn: Pos<FilterDispatched> =
+        "LSN of the last filtered WAL byte the daemon has dispatched.",
+    gauge shadow_replay_lsn: Pos<ShadowReplay> =
+        "Shadow PG's pg_last_wal_replay_lsn(), polled at status cadence.",
+    gauge decoder_commit_lsn: Pos<Drain> = "Highest commit LSN drained out of the xact buffer.",
     /// Live insert watermark, unlike manifest's resume-safe `emitter_ack`
-    pub emitter_ack_lsn: Pos<EmitterAck>,
-    /// Durable resume floor: restart resumes here and every pruner cuts to it
-    pub floor_lsn: Pos<Floor>,
-    /// `route` is `"to_shadow"` / `"to_decoder"`
-    pub records_by_rm_route: BTreeMap<(String, &'static str), u64>,
-    pub xact_active: u64,
-    pub xact_bytes_in_memory: u64,
-    pub spill_xacts_active: u64,
-    pub spill_bytes_active: u64,
-    /// Bytes resident inside an active commit drain (merge heads + in-mem
-    /// tail + chunk generations + mirror rows held by consumers)
-    pub drain_resident_bytes: u64,
-    /// Chunk-generation share of `drain_resident_bytes`, held until the
-    /// last drain batch / decode job drops its generation
-    pub drain_chunk_resident_bytes: u64,
-    /// Mirror-row share of `drain_resident_bytes`, held until store put
-    pub drain_row_resident_bytes: u64,
-    /// Bytes in transaction TOAST body spool files (disk, not resident)
-    pub toast_xact_spool_bytes: u64,
-    /// Bytes held by live [`crate::budget::MemoryBudget`] permits
-    pub resident_payload_bytes: u64,
-    pub resident_payload_peak_bytes: u64,
-    /// Budget acquisitions that had to wait for a release
-    pub memory_budget_waits_total: u64,
-    /// Requests above a budget compartment's satisfiable share, admitted
-    /// with only that share metered
-    pub memory_budget_overshoots_total: u64,
-    /// Bytes resident in the bootstrap TOAST-deferred spool's in-memory
-    /// prefix
-    pub bootstrap_deferred_bytes: u64,
-    /// Encoded bytes in the bootstrap TOAST-deferred spool file
-    pub bootstrap_deferred_spool_bytes: u64,
+    gauge emitter_ack_lsn: Pos<EmitterAck> = "Contiguous-done watermark from the insert pipeline.",
+    gauge floor_lsn: Pos<Floor> = "Durable resume floor: restart resumes here and pruners cut to it.",
+    gauge xact_active: u64 = "Active transactions buffered in memory or on spill.",
+    gauge xact_bytes_in_memory: u64 = "Bytes held in memory across all buffered xacts.",
+    gauge spill_xacts_active: u64 = "Xacts with at least one entry currently in their spill file.",
+    gauge spill_bytes_active: u64 = "Bytes currently held across all active xact spill files.",
+    gauge drain_resident_bytes: u64 =
+        "Bytes resident inside an active commit drain (heads + chunk generations + mirror rows).",
+    gauge drain_chunk_resident_bytes: u64 =
+        "Chunk-generation share of drain_resident_bytes, held until consumers drop.",
+    gauge drain_row_resident_bytes: u64 =
+        "Mirror-row share of drain_resident_bytes, held until store put completes.",
+    gauge toast_xact_spool_bytes: u64 =
+        "Bytes in transaction TOAST body spool files (disk, not resident).",
+    gauge resident_payload_bytes: u64 =
+        "Bytes held by live memory-budget permits across pipeline stages.",
+    gauge resident_payload_peak_bytes: u64 = "High-water mark of resident payload permit bytes.",
+    counter memory_budget_waits_total: u64 = "Budget acquisitions that waited for a release.",
+    counter memory_budget_overshoots_total: u64 =
+        "Requests above a budget compartment, admitted with only the satisfiable share metered.",
+    gauge bootstrap_deferred_bytes: u64 =
+        "Resident bytes in the bootstrap TOAST-deferred spool's in-memory prefix.",
+    gauge bootstrap_deferred_spool_bytes: u64 =
+        "Encoded bytes in the bootstrap TOAST-deferred spool file.",
     /// Bootstrap pump stage attribution. Live while a greenfield bootstrap
     /// runs, then frozen at its final values for the rest of the session
-    pub bootstrap_bytes_tapped: u64,
-    pub bootstrap_pages_walked: u64,
-    pub bootstrap_tuples_emitted: u64,
-    pub bootstrap_files_walked: u64,
-    pub bootstrap_files_skipped_unmapped: u64,
-    pub bootstrap_decode_seconds: f64,
-    pub bootstrap_tap_seconds: f64,
-    pub bootstrap_channel_block_seconds: f64,
-    pub spill_evictions_total: u64,
-    pub xacts_committed_total: u64,
-    pub xacts_aborted_total: u64,
-    pub decoder_decoded_total: u64,
-    pub decoder_partial_total: u64,
-    pub decoder_toast_chunks_total: u64,
-    pub decoder_toast_malformed_total: u64,
-    pub decoder_toast_deletes_total: u64,
-    pub toast_chunks_stored_total: u64,
-    pub toast_chunk_puts_total: u64,
-    pub toast_chunk_put_seconds: f64,
-    pub toast_tombstones_stored_total: u64,
-    pub toast_values_filled_superseded_total: u64,
-    pub toast_values_filled_mismatch_total: u64,
-    pub toast_mirror_truncates_total: u64,
-    pub toast_mirror_retires_total: u64,
-    pub toast_rewrite_barriers_total: u64,
-    pub toast_stash_buffered_total: u64,
-    pub raw_stash_deferred_total: u64,
-    pub toast_stash_decoded_total: u64,
-    pub toast_stash_discarded_total: u64,
-    pub toast_stash_in_place_total: u64,
-    pub stash_foreign_db_skipped_total: u64,
-    /// Routed heaps sealed into transaction plans
-    pub xact_plan_rows: u64,
+    counter bootstrap_bytes_tapped: u64 =
+        "Backup body bytes the bootstrap pump handed to the page-walk sink.",
+    counter bootstrap_pages_walked: u64 = "8 KiB heap pages the bootstrap walk framed.",
+    counter bootstrap_tuples_emitted: u64 =
+        "Live tuples the bootstrap walk decoded off backup pages.",
+    counter bootstrap_files_walked: u64 = "User-heap segments the bootstrap walk decoded.",
+    counter bootstrap_files_skipped_unmapped: u64 =
+        "User-heap segments declined at begin because no mapped relation owns them; their bytes drain unread.",
+    counter bootstrap_decode_seconds: f64 =
+        "Cumulative CPU inside the bootstrap page walk, tuple decode included.",
+    counter bootstrap_tap_seconds: f64 =
+        "Cumulative time bootstrap tap readers spent inside the sink: page framing, decode, channel send. Against bootstrap_decode_seconds this is the tap's own overhead.",
+    counter bootstrap_channel_block_seconds: f64 =
+        "Cumulative time the bootstrap walk spent waiting for a free tuple-channel slot, i.e. emitter drain time seen by the walk.",
+    counter spill_evictions_total: u64 = "Total evictions in→spill since daemon start.",
+    counter xacts_committed_total: u64 = "Total xacts drained as commits since daemon start.",
+    counter xacts_aborted_total: u64 = "Total xacts dropped as aborts since daemon start.",
+    counter decoder_decoded_total: u64 = "Heap records decoded since daemon start.",
+    counter decoder_partial_total: u64 = "Decoded tuples with prefix/suffix-from-old elided columns.",
+    counter decoder_toast_chunks_total: u64 =
+        "TOAST chunks routed into the xact buffer's chunk slot.",
+    counter decoder_toast_malformed_total: u64 =
+        "TOAST inserts the decoder couldn't reinterpret as a chunk.",
+    counter decoder_toast_deletes_total: u64 =
+        "DELETE records on toast relations, buffered as tombstone rows.",
+    counter toast_chunks_stored_total: u64 =
+        "TOAST chunk rows persisted to the CH store; the bootstrap's TOAST-phase progress signal.",
+    counter toast_chunk_puts_total: u64 =
+        "Chunk-store INSERTs issued. Against the seconds counter this gives per-part commit latency, which caps a TOAST-heavy restore.",
+    counter toast_chunk_put_seconds: f64 =
+        "Cumulative wall-clock inside chunk-store INSERTs. Divided by toast_chunk_puts_total this is per-part commit latency.",
+    counter toast_tombstones_stored_total: u64 =
+        "TOAST delete tombstone rows persisted to the CH store.",
+    counter toast_values_filled_superseded_total: u64 =
+        "Store-mode values filled after their history merge-collapsed.",
+    counter toast_values_filled_mismatch_total: u64 =
+        "Store-mode values filled off a dense-but-short store run (partial collapse or generation mixing).",
+    counter toast_mirror_truncates_total: u64 =
+        "Mirror wipes from owner TRUNCATE, applied at the reorder barrier.",
+    counter toast_mirror_retires_total: u64 =
+        "Mirrors emptied because their toast rel dropped (owner DROP / rewrite); table retained.",
+    counter toast_rewrite_barriers_total: u64 =
+        "Rewrite generations closed with residual O-B tombstones.",
+    counter toast_stash_buffered_total: u64 =
+        "Records on marker-proven invisible filenodes stashed raw for commit-time resolution.",
+    counter raw_stash_deferred_total: u64 =
+        "Records held raw because their xact tree wrote catalog state earlier in the stream; resolved at commit.",
+    counter toast_stash_decoded_total: u64 =
+        "Stashed records decoded at commit against a resolved toast heap.",
+    counter toast_stash_discarded_total: u64 =
+        "Stashed records discarded: filenode unresolvable post-commit (dropped or rotated away).",
+    counter toast_stash_in_place_total: u64 =
+        "Stashed toast filenodes that superseded no predecessor, so queued no residual barrier.",
+    counter stash_foreign_db_skipped_total: u64 =
+        "Stashed filenodes resolved to a foreign database at commit, counted once per filenode.",
+    counter xact_plan_rows: u64 = "Routed heaps sealed into transaction plans.",
     /// Sealed plan bytes `[mem, file]`, rendered `storage=` labelled
-    pub xact_plan_bytes_by_storage: [u64; 2],
+    counter xact_plan_bytes_by_storage: [u64; 2] ["storage" = ["mem", "file"]] =
+        "Sealed transaction-plan bytes by final backing.",
     /// Planning failures `[spool, fail_closed, detoast, partial_update,
     /// view, drain]`, rendered `reason=` labelled
-    pub xact_plan_failures_by_reason: [u64; 11],
-    /// Plan-time route resolutions `[mapped, unmapped]`, rendered
-    /// `result=` labelled
-    pub route_snapshots_by_result: [u64; 2],
-    /// Raw-stash records `[dirty, marker]` × op
-    /// ([`crate::decode::heap_decoder::HEAP_OP_LABELS`]), rendered
-    /// `kind=`/`op=` labelled
-    pub raw_stash_records_by_kind_op: [[u64; 7]; 2],
-    /// Cumulative raw-stash bytes `[mem, spill]` by first landing,
-    /// rendered `storage=` labelled
-    pub raw_stash_bytes_by_storage: [u64; 2],
-    /// Commit-resolve raw decode records `[toast, ordinary]` × op
-    pub raw_decode_records_by_kind_op: [[u64; 7]; 2],
-    /// Rows fanned out of decoded raw records per op
-    pub raw_decode_rows_by_op: [u64; 7],
-    /// Gauges: raw-decoded heaps queued for pending-first yield
-    pub raw_pending_rows: u64,
-    pub raw_pending_bytes: u64,
-    pub emitter_rows_total: u64,
-    pub emitter_blocks_total: u64,
-    pub emitter_xacts_total: u64,
-    pub emitter_unsupported_relations: u64,
-    /// DELETE rows dropped for want of a delete-marker column
-    pub emitter_deletes_discarded: u64,
-    /// Forward-declared per-table opt-ins (`config_table.replicate=true`)
-    /// awaiting their `CREATE TABLE`.
-    pub config_pending_decl_rels: u64,
+    counter xact_plan_failures_by_reason: [u64; 11] ["reason" = PLAN_FAILURE_REASONS] =
+        "Planning-stage failures; the whole transaction emits nothing.",
+    counter route_snapshots_by_result: [u64; 2] ["result" = ["mapped", "unmapped"]] =
+        "Plan-time route resolutions, one per relation per transaction.",
+    counter raw_stash_bytes_by_storage: [u64; 2] ["storage" = ["mem", "spill"]] =
+        "Cumulative raw-stash payload bytes by first landing.",
+    counter raw_decode_rows_by_op: [u64; 7] ["op" = HEAP_OP_LABELS] =
+        "Rows fanned out of decoded raw records.",
+    gauge raw_pending_rows: u64 = "Raw-decoded heaps queued for pending-first yield.",
+    gauge raw_pending_bytes: u64 = "Bytes held by the pending raw fanout.",
+    counter emitter_rows_total: u64 = "Rows the CH emitter has handed to send_data.",
+    counter emitter_blocks_total: u64 = "Native blocks the CH emitter has written.",
+    counter emitter_xacts_total: u64 = "Xacts the CH emitter has drained.",
+    counter emitter_unsupported_relations: u64 =
+        "Tuples skipped because the source relation has no mapping in --ch-config.",
+    counter emitter_deletes_discarded: u64 =
+        "DELETE rows dropped because is_deleted = false leaves no marker column.",
+    gauge config_pending_decl_rels: u64 =
+        "Forward-declared per-table opt-ins awaiting their CREATE TABLE.",
     /// Cumulative `replicate=true` materialisations / `replicate=false`
     /// exclusions applied via the config overlay.
-    pub config_replicate_opt_in_total: u64,
-    pub config_replicate_opt_out_total: u64,
-    /// `initial_load` backfills recorded in the ledger but not yet complete
-    /// (in flight, or awaiting re-run on next boot).
-    pub config_backfills_pending: u64,
-    /// `config_backfills_pending` split `[copy, base_backup, object_store]`;
-    /// rendered as `mode=` labelled series under the umbrella gauge.
-    pub config_backfills_pending_by_mode: [u64; 3],
-    // Pipeline flow + process gauges; see `render` for descriptions.
-    pub pump_queue_depth: u64,
-    pub queue_records_out_total: u64,
-    pub queue_jobs_out_total: u64,
-    pub decode_jobs_in_total: u64,
-    pub decode_rows_out_total: u64,
-    pub insertbatch_rows_in_total: u64,
-    pub insertbatch_batches_out_total: u64,
-    pub inserter_batches_in_total: u64,
-    pub inserter_ch_seconds_total: f64,
-    pub inserter_encode_seconds_total: f64,
-    pub oracle_resolve_seconds_total: f64,
-    pub process_cpu_seconds_total: f64,
-    pub process_resident_memory_bytes: u64,
-    pub oracle_local_columns_total: u64,
-    pub oracle_blocks_total: u64,
-    pub oracle_rows_total: u64,
-    pub oracle_cells_total: u64,
-    pub oracle_conversion_errors_total: u64,
-    pub oracle_errors_total: u64,
-    /// 1 while the pgext bridge worker's last transport attempt succeeded,
-    /// 0 after failure.
-    pub bridge_up: u64,
+    counter config_replicate_opt_in_total: u64 =
+        "Total config_table.replicate=true materialisations applied.",
+    counter config_replicate_opt_out_total: u64 =
+        "Total config_table.replicate=false / removals applied.",
+    gauge pump_queue_depth: u64 = "Records buffered between the WAL pump and the queueing worker.",
+    counter queue_records_out_total: u64 =
+        "Records the queueing/reorder worker has dequeued and dispatched. rate() is the worker's throughput; with pump_queue_depth it tells deep-and-draining from deep-and-stalled.",
+    counter queue_jobs_out_total: u64 =
+        "DecodeJobs the queueing worker shipped to the decode pool. queue_jobs_out - decode_jobs_in is the worker->pool channel depth.",
+    counter decode_jobs_in_total: u64 =
+        "DecodeJobs the decode pool has pulled. Pinned at queue_jobs_out ⇒ pool idle; the gap at the channel cap ⇒ the pool is the limiter.",
+    counter decode_rows_out_total: u64 =
+        "Rows the decode pool routed to the insertbatch builder. decode_rows_out - insertbatch_rows_in is the pool->builder channel depth.",
+    counter insertbatch_rows_in_total: u64 =
+        "Rows the insertbatch builder accepted before sealing into InsertBatches.",
+    counter insertbatch_batches_out_total: u64 =
+        "InsertBatches the builder sealed and pushed to the inserter pool.",
+    counter inserter_batches_in_total: u64 =
+        "InsertBatches an inserter finished draining to ClickHouse. insertbatch_batches_out - inserter_batches_in is the live backlog; their rates show inserter-pool saturation.",
+    counter inserter_ch_seconds_total: f64 =
+        "Cumulative inserter time inside the ClickHouse INSERT round trip. Against inserter_pool_size x uptime this is CH-side utilization.",
+    counter inserter_encode_seconds_total: f64 =
+        "Cumulative inserter time rebuilding the Native block over a batch's owned slabs.",
+    counter oracle_resolve_seconds_total: f64 =
+        "Cumulative resolver time inside the oracle round trip. Overlaps inserter_ch_seconds_total, so the larger of the two is the tail's limiter.",
+    counter process_cpu_seconds_total: f64 =
+        "Total user+system CPU seconds consumed by the walshadow process.",
+    gauge process_resident_memory_bytes: u64 = "Resident set size of the walshadow process (VmRSS).",
+    counter oracle_local_columns_total: u64 =
+        "Oracle-routed columns the daemon built itself: already-rendered cells against a String target, which PG would hand straight back.",
+    counter oracle_blocks_total: u64 =
+        "Partial Native blocks the walshadow extension returned and the daemon validated.",
+    counter oracle_rows_total: u64 = "Rows carried by those blocks.",
+    counter oracle_cells_total: u64 = "Source cells sent for conversion, rows times oracle columns.",
+    counter oracle_conversion_errors_total: u64 =
+        "Requests the extension failed on one PG Datum it could not convert.",
+    counter oracle_errors_total: u64 = "Oracle request, transport, or response-validation failures.",
+    gauge bridge_up: u64 =
+        "1 while the pgext bridge worker answered the last request over its socket.",
     /// Per-op, rendered `op=` labelled; order matches
-    /// [`OP_LABELS`](crate::ops::bridge::OP_LABELS).
-    pub bridge_requests_by_op: [u64; 4],
-    pub bridge_errors_by_op: [u64; 4],
-    pub bridge_request_nanos_by_op: [u64; 4],
+    /// [`OP_LABELS`].
+    counter bridge_requests_by_op: [u64; 4] ["op" = OP_LABELS] =
+        "Requests sent to the pgext bridge worker.",
+    counter bridge_errors_by_op: [u64; 4] ["op" = OP_LABELS] =
+        "Bridge requests that failed, transport or worker-side.",
+    counter bridge_request_seconds_by_op: [f64; 4] ["op" = OP_LABELS] =
+        "Wall time spent in bridge round trips.",
     /// Queued behind another caller on the single bridge socket
-    pub bridge_lock_wait_nanos_by_op: [u64; 4],
+    counter bridge_lock_wait_seconds_by_op: [f64; 4] ["op" = OP_LABELS] =
+        "Wall time bridge callers spent queued for the socket. Against bridge_service_seconds this says whether the worker or the funnel in front of it is the limiter.",
     /// Wire time with the socket held
-    pub bridge_service_nanos_by_op: [u64; 4],
-    pub bridge_request_bytes_by_op: [u64; 4],
-    pub bridge_response_bytes_by_op: [u64; 4],
-    pub bridge_reconnects_total: u64,
-    pub bridge_scan_rows_total: u64,
-    pub bridge_scan_subtrans_mismatch_total: u64,
-    pub bridge_scan_replay_moved_total: u64,
-    pub bridge_native_bytes_total: u64,
-    pub uptime_secs: u64,
-    /// Feeds swapped onto a reloaded `[source]` endpoint or slot
-    pub source_endpoint_swaps_total: u64,
-    /// Swap attempts refused or unreachable (identity proof, connect, START;
-    /// a slot the target does not have fails here)
-    pub source_endpoint_swap_failures_total: u64,
-    /// 1 while config names an endpoint or slot the pump has not reached yet
-    pub source_endpoint_swap_pending: u64,
-    /// Proof the last swap attempt failed on, from the crossing's own
-    /// vocabulary; empty once one lands
-    pub source_endpoint_swap_blocked_on: &'static str,
-    /// Refusal a crossing parked on. The pump keeps publishing rather than
-    /// exiting into a restart that re-crosses and re-fails, so this is how the
-    /// daemon says it is waiting for an operator
-    pub crossing_blocked_on: &'static str,
-    /// That refusal's own words, which name the pair behind it
-    pub crossing_detail: String,
-    /// PostgreSQL source system identifier
-    pub source_system_id: u64,
-    /// Branch the pump is reading
-    pub source_timeline: u32,
-    /// Branch owning the durable floor, which restart resumes on. Trails
-    /// `source_timeline` between a fork and the floor crossing it
-    pub floor_timeline: u32,
-    pub timeline_switches_total: u64,
+    counter bridge_service_seconds_by_op: [f64; 4] ["op" = OP_LABELS] =
+        "Wall time on the wire with the bridge socket held: worker conversion plus transfer.",
+    counter bridge_request_bytes_by_op: [u64; 4] ["op" = OP_LABELS] =
+        "Request frame bytes written to the bridge socket.",
+    counter bridge_response_bytes_by_op: [u64; 4] ["op" = OP_LABELS] =
+        "Response frame bytes read back off the bridge socket.",
+    counter bridge_reconnects_total: u64 =
+        "Bridge sockets redialled after a worker exit or transport error.",
+    counter bridge_scan_rows_total: u64 = "Catalog rows the bridge's overlay scans returned.",
+    counter bridge_scan_subtrans_mismatch_total: u64 =
+        "Overlay tuples whose writer did not resolve to the requested top xid; trusted as ours only on rel-scoped catalogs.",
+    counter bridge_scan_replay_moved_total: u64 =
+        "Bridge scans that found shadow replay off the position their read pinned; committed reads answer these off SQL instead.",
+    counter bridge_native_bytes_total: u64 =
+        "Native block bytes the bridge returned for ENCODE_NATIVE requests.",
+    counter uptime_seconds: u64 = "Seconds since the daemon began its status loop.",
+    counter source_endpoint_swaps_total: u64 =
+        "Source feeds swapped onto a reloaded `[source]` endpoint or slot.",
+    counter source_endpoint_swap_failures_total: u64 =
+        "Swap attempts refused or unreachable (identity proof, connect, START_REPLICATION, missing slot).",
+    gauge source_endpoint_swap_pending: u64 =
+        "1 while config names a source endpoint or slot the pump has not reached yet.",
+    gauge source_timeline: u32 = "Source WAL timeline the pump is reading.",
+    gauge floor_timeline: u32 = "Timeline owning the durable floor, which restart resumes on.",
+    counter timeline_switches_total: u64 = "Source timeline crossings completed.",
     /// Crossings refused, rendered `reason=` labelled; order matches
     /// [`SWITCH_FAILURE_REASONS`]
-    pub timeline_switch_failures_by_reason: [u64; SWITCH_FAILURE_REASONS.len()],
+    counter timeline_switch_failures_by_reason: [u64; SWITCH_FAILURE_REASONS.len()]
+        ["reason" = SWITCH_FAILURE_REASONS] =
+        "Crossings refused; the stream stays on the ancestor.",
     /// Most recent fork point, diagnostic
-    pub timeline_switch_lsn: u64,
-    /// Descendant bytes compared against the retained ancestor prefix
-    pub timeline_prefix_bytes_verified_total: u64,
-    pub timeline_transition_seconds_total: f64,
+    gauge timeline_switch_lsn: u64 = "Fork LSN of the most recent timeline crossing.",
+    counter timeline_prefix_bytes_verified_total: u64 =
+        "Descendant bytes compared against the retained ancestor fork prefix.",
+    counter timeline_transition_seconds_total: f64 = "Seconds spent inside timeline crossings.",
     /// `WalStream::next_lsn` frozen when the pump observed `[stream] paused`,
     /// which resume asks the source to serve. `0` while not paused: a value
     /// left from an earlier pause cannot be compared against a promotion
     /// decision either
-    pub pause_consumed_lsn: u64,
+    gauge pause_consumed_lsn: u64 =
+        "Consumed frontier frozen when the pump observed the pause; 0 while running.",
     /// Source head last heard about, frozen at the same instant. The promotion
     /// target must reach it before it is promoted
-    pub pause_received_lsn: u64,
-    /// Both frozen numbers were re-derived by this process from a pause it
-    /// found already in effect, so a pair read before a restart is stale
-    pub pause_refrozen: bool,
-    /// Every term of the promotion gate holds, so the target may be promoted
-    pub promotion_ready: bool,
-    /// First term that does not, empty once ready
-    pub promotion_blocked_on: &'static str,
-    pub promotion_target_in_recovery: bool,
-    /// Target's `pg_last_wal_replay_lsn()`, read while paused
-    pub promotion_target_replay_lsn: u64,
-    /// Target's `pg_last_wal_receive_lsn()`, read while paused
-    pub promotion_target_receive_lsn: u64,
-    /// Branch the shadow-facing walsender advertises
-    pub shadow_served_timeline: u32,
+    gauge pause_received_lsn: u64 =
+        "Source head frozen when the pump observed the pause; 0 while running.",
+    gauge shadow_served_timeline: u32 = "Timeline the shadow-facing walsender advertises.",
     /// Branch the shadow is replaying, which is how a shadow that followed the
     /// chain reads differently from one that merely survived
-    pub shadow_replay_timeline: u32,
+    gauge shadow_replay_timeline: u32 = "Timeline the shadow is replaying.",
     /// `source_received_lsn - min_apply_lsn` across active shadow walreceivers.
     /// Caller saturates to 0 when shadow is ahead; passes `source_received_lsn`
     /// when none connected (disconnect = max lag)
-    pub shadow_apply_lag_bytes: u64,
+    gauge shadow_apply_lag_bytes: u64 =
+        "Bytes between source_received_lsn and the min apply LSN reported by active shadow walreceivers.",
     /// `shadow_apply_lag_bytes` / rolling 30s WAL byte-rate estimate.
     /// `f64::INFINITY` (renders `+Inf`) when rate is 0
-    pub shadow_apply_lag_seconds: f64,
-    pub shadow_stream_active_connections: u64,
+    gauge shadow_apply_lag_seconds: f64 =
+        "Estimated seconds shadow trails source, by source byte rate over last 30s.",
+    gauge shadow_stream_active_connections: u64 =
+        "Currently-attached walreceiver connections to walshadow's walsender.",
     /// Cumulative connections dropped by `slow_threshold` overflow
-    pub shadow_stream_dropped_connections_total: u64,
-    /// Publication holds released at catalog-mutating commit boundaries
-    pub catalog_boundary_holds_total: u64,
-    /// Holds woken with Err (worker death, walreceiver loss, timeout)
-    pub catalog_boundary_hold_failures_total: u64,
-    /// Cumulative seconds spent parked in released holds
-    pub catalog_boundary_hold_seconds_total: f64,
-    /// Boundaries captured via shadow SQL fan-out
-    pub desc_capture_sql_total: u64,
-    /// Boundaries replayed from stored descriptor-log batches
-    pub desc_capture_log_replay_total: u64,
-    /// Boundaries at or below the seed's covered_through, skipped
-    pub desc_capture_skipped_covered_total: u64,
-    /// Capture-all boundaries (whole-relcache inval / pg_namespace write)
-    pub desc_capture_all_total: u64,
-    /// Descriptors fetched across SQL captures
-    pub desc_capture_rels_total: u64,
-    /// Cumulative seconds inside descriptor capture (part of the hold)
-    pub desc_capture_seconds_total: f64,
-    pub desc_events_added_total: u64,
-    pub desc_events_changed_total: u64,
-    pub desc_events_dropped_total: u64,
-    /// Command boundaries read into the pending timeline
-    pub pending_captures_total: u64,
-    /// Descriptors read across those boundaries
-    pub pending_rels_total: u64,
-    /// Publication holds taken for a command boundary
-    pub pending_holds_total: u64,
-    /// Cumulative seconds parked in command-boundary holds
-    pub pending_hold_seconds_total: f64,
-    /// Pending slots folded into a commit batch
-    pub pending_entries_promoted_total: u64,
-    /// Pending slots dropped with an aborted tree
-    pub pending_entries_dropped_abort_total: u64,
-    /// Ambiguity intervals the timeline covered end to end
-    pub pending_ambiguities_suppressed_total: u64,
-    /// Transactions degraded to commit-time capture, by
-    /// [`DegradeReason::ALL`](crate::catalog::pending::DegradeReason::ALL)
-    pub pending_degraded_by_reason: [u64; 5],
-    /// Descriptor-log index entries / tail bytes / batches
-    pub desc_log_entries: u64,
-    pub desc_log_tail_bytes: u64,
-    pub desc_log_batches: u64,
-    pub desc_log_gc_total: u64,
-    pub desc_log_gc_dropped_entries_total: u64,
-    pub desc_lookups_present_total: u64,
-    pub desc_lookups_dropped_total: u64,
-    pub desc_lookups_retired_total: u64,
-    pub desc_lookups_ambiguous_total: u64,
-    pub descriptor_ambiguous_total: u64,
-    pub desc_lookups_not_covered_total: u64,
-    pub desc_lookups_foreign_db_total: u64,
+    counter shadow_stream_dropped_connections_total: u64 =
+        "Connections dropped by slow-client cutoff since daemon start.",
+    counter catalog_boundary_holds_total: u64 =
+        "Publication holds released at catalog-mutating commit boundaries.",
+    counter catalog_boundary_hold_failures_total: u64 =
+        "Catalog-boundary holds woken with an error (worker death, walreceiver loss, timeout).",
+    counter catalog_boundary_hold_seconds_total: f64 =
+        "Cumulative seconds the pump parked in released catalog-boundary holds.",
+    counter desc_capture_sql_total: u64 = "Catalog boundaries captured via shadow SQL fan-out.",
+    counter desc_capture_log_replay_total: u64 =
+        "Catalog boundaries replayed from stored descriptor-log batches.",
+    counter desc_capture_skipped_covered_total: u64 =
+        "Boundaries at or below the seed's covered_through, skipped.",
+    counter desc_capture_all_total: u64 =
+        "Capture-all boundaries (whole-relcache inval / pg_namespace write).",
+    counter desc_capture_rels_total: u64 = "Descriptors fetched across SQL captures.",
+    counter desc_capture_seconds_total: f64 =
+        "Cumulative seconds inside descriptor capture (within the boundary hold).",
+    counter desc_events_added_total: u64 = "Added schema events produced by descriptor capture.",
+    counter desc_events_changed_total: u64 = "Changed schema events produced by descriptor capture.",
+    counter desc_events_dropped_total: u64 = "Dropped schema events produced by descriptor capture.",
+    counter pending_captures_total: u64 =
+        "Command boundaries read into the pending catalog timeline.",
+    counter pending_rels_total: u64 = "Descriptors read across command boundaries.",
+    counter pending_holds_total: u64 = "Publication holds taken for a command boundary.",
+    counter pending_hold_seconds_total: f64 =
+        "Cumulative seconds the pump parked in command-boundary holds.",
+    counter pending_entries_promoted_total: u64 =
+        "Pending slots folded into a commit's descriptor-log batch.",
+    counter pending_entries_dropped_abort_total: u64 =
+        "Pending slots dropped with an aborted transaction tree.",
+    counter pending_ambiguities_suppressed_total: u64 =
+        "Ambiguity intervals the pending timeline covered end to end.",
+    counter pending_degraded_by_reason: [u64; 5]
+        ["reason" = DegradeReason::ALL.map(|reason| reason.label())] =
+        "Transactions degraded to commit-time capture, by reason.",
+    gauge desc_log_entries: u64 = "Descriptor-log index entries resident.",
+    gauge desc_log_tail_bytes: u64 = "Descriptor-log tail bytes since last checkpoint.",
+    gauge desc_log_batches: u64 = "Descriptor-log batches resident.",
+    counter desc_log_gc_total: u64 = "Descriptor-log checkpoint compactions.",
+    counter desc_log_gc_dropped_entries_total: u64 = "Entries dropped by descriptor-log GC.",
+    counter desc_lookups_present_total: u64 = "Descriptor lookups answered Present.",
+    counter desc_lookups_dropped_total: u64 = "Descriptor lookups answered Dropped.",
+    counter desc_lookups_retired_total: u64 =
+        "Descriptor lookups answered Retired (rotated-away filenode).",
+    counter desc_lookups_ambiguous_total: u64 =
+        "Descriptor lookups landing in an ambiguity interval.",
+    counter descriptor_ambiguous_total: u64 =
+        "Ambiguity intervals published at capture for unproven in-place changes.",
+    counter desc_lookups_not_covered_total: u64 = "Descriptor lookups answered NotCovered.",
+    counter desc_lookups_foreign_db_total: u64 =
+        "Descriptor lookups on a foreign database's filenode.",
 }
 
 #[derive(Debug, Clone, Default)]
@@ -398,8 +517,6 @@ impl Default for RateEstimator {
     }
 }
 
-/// Prometheus text-format. Each metric gets `# HELP` + `# TYPE`; counters use
-/// the `_total` suffix per Prom convention.
 /// `reason=` label order of `MetricsSnapshot::xact_plan_failures_by_reason`,
 /// matching [`crate::emit::pipeline::planner::drain_reason`]
 const PLAN_FAILURE_REASONS: [&str; 11] = [
@@ -416,1087 +533,190 @@ const PLAN_FAILURE_REASONS: [&str; 11] = [
     "drain",
 ];
 
-pub fn render(snap: &MetricsSnapshot) -> String {
-    use std::fmt::Write as _;
-    let mut s = String::with_capacity(1024);
+/// Family declaration off a snapshot field name: a `_by_<label>` tail names
+/// the label rather than the family, and OpenMetrics appends `_total` to
+/// counter samples itself, so a counter family declares the name without it
+fn declare<'s>(
+    enc: &'s mut DescriptorEncoder<'_>,
+    name: &'s str,
+    help: &str,
+    kind: MetricType,
+) -> Result<MetricEncoder<'s>, fmt::Error> {
+    let name = name.rsplit_once("_by_").map_or(name, |(head, _)| head);
+    let name = if matches!(kind, MetricType::Counter) {
+        name.strip_suffix("_total").unwrap_or(name)
+    } else {
+        name
+    };
+    enc.encode_descriptor(name, help, None, kind)
+}
 
-    for (name, help, value) in [
-        (
-            "walshadow_source_received_lsn",
-            "Source PG's most recent server_wal_end seen on the replication socket.",
-            snap.source_received_lsn.get(),
-        ),
-        (
-            "walshadow_filter_lsn",
-            "LSN of the last filtered WAL byte the daemon has dispatched.",
-            snap.filter_lsn.get(),
-        ),
-        (
-            "walshadow_shadow_replay_lsn",
-            "Shadow PG's pg_last_wal_replay_lsn(), polled at status cadence.",
-            snap.shadow_replay_lsn.get(),
-        ),
-        (
-            "walshadow_decoder_commit_lsn",
-            "Highest commit LSN drained out of the xact buffer.",
-            snap.decoder_commit_lsn.get(),
-        ),
-        (
-            "walshadow_emitter_ack_lsn",
-            "Contiguous-done watermark from the insert pipeline.",
-            snap.emitter_ack_lsn.get(),
-        ),
-        (
-            "walshadow_floor_lsn",
-            "Durable resume floor: restart resumes here and pruners cut to it.",
-            snap.floor_lsn.get(),
-        ),
-        (
-            "walshadow_source_timeline",
-            "Source WAL timeline the pump is reading.",
-            u64::from(snap.source_timeline),
-        ),
-        (
-            "walshadow_floor_timeline",
-            "Timeline owning the durable floor, which restart resumes on.",
-            u64::from(snap.floor_timeline),
-        ),
-        (
-            "walshadow_timeline_switch_lsn",
-            "Fork LSN of the most recent timeline crossing.",
-            snap.timeline_switch_lsn,
-        ),
-        (
-            "walshadow_pause_consumed_lsn",
-            "Consumed frontier frozen when the pump observed the pause; 0 while running.",
-            snap.pause_consumed_lsn,
-        ),
-        (
-            "walshadow_pause_received_lsn",
-            "Source head frozen when the pump observed the pause; 0 while running.",
-            snap.pause_received_lsn,
-        ),
-        (
-            "walshadow_crossing_wedged",
-            "1 while a crossing is parked on a refusal only an operator can clear.",
-            u64::from(!snap.crossing_blocked_on.is_empty()),
-        ),
-        (
-            "walshadow_shadow_served_timeline",
-            "Timeline the shadow-facing walsender advertises.",
-            u64::from(snap.shadow_served_timeline),
-        ),
-        (
-            "walshadow_shadow_replay_timeline",
-            "Timeline the shadow is replaying.",
-            u64::from(snap.shadow_replay_timeline),
-        ),
-    ] {
-        writeln!(s, "# HELP {name} {help}").unwrap();
-        writeln!(s, "# TYPE {name} gauge").unwrap();
-        writeln!(s, "{name} {value}").unwrap();
+pub(crate) fn counter<V: EncodeCounterValue>(
+    enc: &mut DescriptorEncoder<'_>,
+    name: &str,
+    help: &str,
+    value: V,
+) -> fmt::Result {
+    declare(enc, name, help, MetricType::Counter)?
+        .encode_counter::<NoLabelSet, _, u64>(&value, None)
+}
+
+pub(crate) fn gauge<V: EncodeGaugeValue>(
+    enc: &mut DescriptorEncoder<'_>,
+    name: &str,
+    help: &str,
+    value: V,
+) -> fmt::Result {
+    declare(enc, name, help, MetricType::Gauge)?.encode_gauge(&value)
+}
+
+/// One `key=` labelled series per `(label, value)`, under one declaration
+pub(crate) fn counter_series<'a, V: EncodeCounterValue>(
+    enc: &mut DescriptorEncoder<'_>,
+    name: &str,
+    help: &str,
+    key: &str,
+    series: impl IntoIterator<Item = (&'a str, V)>,
+) -> fmt::Result {
+    let mut family = declare(enc, name, help, MetricType::Counter)?;
+    for (label, value) in series {
+        family
+            .encode_family(&[(key, label)])?
+            .encode_counter::<NoLabelSet, _, u64>(&value, None)?;
     }
+    Ok(())
+}
 
-    writeln!(
-        s,
-        "# HELP walshadow_filter_records_total Records observed by the filter, labeled by rmgr + route."
-    )
-    .unwrap();
-    writeln!(s, "# TYPE walshadow_filter_records_total counter").unwrap();
+pub(crate) fn gauge_series<'a, V: EncodeGaugeValue>(
+    enc: &mut DescriptorEncoder<'_>,
+    name: &str,
+    help: &str,
+    key: &str,
+    series: impl IntoIterator<Item = (&'a str, V)>,
+) -> fmt::Result {
+    let mut family = declare(enc, name, help, MetricType::Gauge)?;
+    for (label, value) in series {
+        family
+            .encode_family(&[(key, label)])?
+            .encode_gauge(&value)?;
+    }
+    Ok(())
+}
+
+/// `kind=`/`op=` grid over [`HEAP_OP_LABELS`]
+fn counter_kind_op(
+    enc: &mut DescriptorEncoder<'_>,
+    name: &str,
+    help: &str,
+    kinds: [&str; 2],
+    grid: &[[u64; 7]; 2],
+) -> fmt::Result {
+    let mut family = declare(enc, name, help, MetricType::Counter)?;
+    for (kind, ops) in kinds.into_iter().zip(grid) {
+        for (op, value) in HEAP_OP_LABELS.into_iter().zip(ops) {
+            family
+                .encode_family(&[("kind", kind), ("op", op)])?
+                .encode_counter::<NoLabelSet, _, u64>(value, None)?;
+        }
+    }
+    Ok(())
+}
+
+/// LSN gauges carry their raw `u64`
+impl<K> EncodeGaugeValue for Pos<K> {
+    fn encode(&self, encoder: &mut GaugeValueEncoder) -> fmt::Result {
+        EncodeGaugeValue::encode(&self.get(), encoder)
+    }
+}
+
+/// Snapshot owned for the length of a scrape, so encoding runs without the
+/// registry lock
+#[derive(Debug)]
+struct SnapshotCollector(MetricsSnapshot);
+
+impl Collector for SnapshotCollector {
+    fn encode(&self, mut enc: DescriptorEncoder) -> fmt::Result {
+        encode_snapshot(&self.0, &mut enc)
+    }
+}
+
+/// `snapshot!`-declared families, then the `custom` ones
+fn encode_snapshot(snap: &MetricsSnapshot, enc: &mut DescriptorEncoder<'_>) -> fmt::Result {
+    encode_fields(snap, enc)?;
+
+    gauge(
+        enc,
+        "walshadow_crossing_wedged",
+        "1 while a crossing is parked on a refusal only an operator can clear.",
+        u64::from(!snap.crossing_blocked_on.is_empty()),
+    )?;
+
+    // rmgr names come out of the fixed resource-manager table, so label values
+    // need no escaping the encoder does not do
+    let mut records = declare(
+        enc,
+        "walshadow_filter_records_total",
+        "Records observed by the filter, labeled by rmgr + route.",
+        MetricType::Counter,
+    )?;
     for ((rm, route), n) in &snap.records_by_rm_route {
-        writeln!(
-            s,
-            "walshadow_filter_records_total{{rmgr={rm:?},route={route:?}}} {n}"
-        )
-        .unwrap();
+        records
+            .encode_family(&[("rmgr", rm.as_str()), ("route", *route)])?
+            .encode_counter::<NoLabelSet, _, u64>(n, None)?;
     }
 
-    let pairs: &[(&str, &str, &str, u64)] = &[
-        (
-            "walshadow_xact_active",
-            "Active transactions buffered in memory or on spill.",
-            "gauge",
-            snap.xact_active,
-        ),
-        (
-            "walshadow_xact_bytes_in_memory",
-            "Bytes held in memory across all buffered xacts.",
-            "gauge",
-            snap.xact_bytes_in_memory,
-        ),
-        (
-            "walshadow_spill_xacts_active",
-            "Xacts with at least one entry currently in their spill file.",
-            "gauge",
-            snap.spill_xacts_active,
-        ),
-        (
-            "walshadow_spill_bytes_active",
-            "Bytes currently held across all active xact spill files.",
-            "gauge",
-            snap.spill_bytes_active,
-        ),
-        (
-            "walshadow_drain_resident_bytes",
-            "Bytes resident inside an active commit drain (heads + chunk generations + mirror rows).",
-            "gauge",
-            snap.drain_resident_bytes,
-        ),
-        (
-            "walshadow_drain_chunk_resident_bytes",
-            "Chunk-generation share of drain_resident_bytes, held until consumers drop.",
-            "gauge",
-            snap.drain_chunk_resident_bytes,
-        ),
-        (
-            "walshadow_drain_row_resident_bytes",
-            "Mirror-row share of drain_resident_bytes, held until store put completes.",
-            "gauge",
-            snap.drain_row_resident_bytes,
-        ),
-        (
-            "walshadow_toast_xact_spool_bytes",
-            "Bytes in transaction TOAST body spool files (disk, not resident).",
-            "gauge",
-            snap.toast_xact_spool_bytes,
-        ),
-        (
-            "walshadow_resident_payload_bytes",
-            "Bytes held by live memory-budget permits across pipeline stages.",
-            "gauge",
-            snap.resident_payload_bytes,
-        ),
-        (
-            "walshadow_resident_payload_peak_bytes",
-            "High-water mark of resident payload permit bytes.",
-            "gauge",
-            snap.resident_payload_peak_bytes,
-        ),
-        (
-            "walshadow_memory_budget_waits_total",
-            "Budget acquisitions that waited for a release.",
-            "counter",
-            snap.memory_budget_waits_total,
-        ),
-        (
-            "walshadow_memory_budget_overshoots_total",
-            "Requests above a budget compartment, admitted with only the satisfiable share metered.",
-            "counter",
-            snap.memory_budget_overshoots_total,
-        ),
-        (
-            "walshadow_bootstrap_deferred_bytes",
-            "Resident bytes in the bootstrap TOAST-deferred spool's in-memory prefix.",
-            "gauge",
-            snap.bootstrap_deferred_bytes,
-        ),
-        (
-            "walshadow_bootstrap_deferred_spool_bytes",
-            "Encoded bytes in the bootstrap TOAST-deferred spool file.",
-            "gauge",
-            snap.bootstrap_deferred_spool_bytes,
-        ),
-        (
-            "walshadow_bootstrap_bytes_tapped_total",
-            "Backup body bytes the bootstrap pump handed to the page-walk sink.",
-            "counter",
-            snap.bootstrap_bytes_tapped,
-        ),
-        (
-            "walshadow_bootstrap_pages_walked_total",
-            "8 KiB heap pages the bootstrap walk framed.",
-            "counter",
-            snap.bootstrap_pages_walked,
-        ),
-        (
-            "walshadow_bootstrap_tuples_emitted_total",
-            "Live tuples the bootstrap walk decoded off backup pages.",
-            "counter",
-            snap.bootstrap_tuples_emitted,
-        ),
-        (
-            "walshadow_bootstrap_files_walked_total",
-            "User-heap segments the bootstrap walk decoded.",
-            "counter",
-            snap.bootstrap_files_walked,
-        ),
-        (
-            "walshadow_bootstrap_files_skipped_unmapped_total",
-            "User-heap segments declined at begin because no mapped relation owns them; their bytes drain unread.",
-            "counter",
-            snap.bootstrap_files_skipped_unmapped,
-        ),
-        (
-            "walshadow_spill_evictions_total",
-            "Total evictions in→spill since daemon start.",
-            "counter",
-            snap.spill_evictions_total,
-        ),
-        (
-            "walshadow_xacts_committed_total",
-            "Total xacts drained as commits since daemon start.",
-            "counter",
-            snap.xacts_committed_total,
-        ),
-        (
-            "walshadow_xacts_aborted_total",
-            "Total xacts dropped as aborts since daemon start.",
-            "counter",
-            snap.xacts_aborted_total,
-        ),
-        (
-            "walshadow_decoder_decoded_total",
-            "Heap records decoded since daemon start.",
-            "counter",
-            snap.decoder_decoded_total,
-        ),
-        (
-            "walshadow_decoder_partial_total",
-            "Decoded tuples with prefix/suffix-from-old elided columns.",
-            "counter",
-            snap.decoder_partial_total,
-        ),
-        (
-            "walshadow_decoder_toast_chunks_total",
-            "TOAST chunks routed into the xact buffer's chunk slot.",
-            "counter",
-            snap.decoder_toast_chunks_total,
-        ),
-        (
-            "walshadow_decoder_toast_malformed_total",
-            "TOAST inserts the decoder couldn't reinterpret as a chunk.",
-            "counter",
-            snap.decoder_toast_malformed_total,
-        ),
-        (
-            "walshadow_decoder_toast_deletes_total",
-            "DELETE records on toast relations, buffered as tombstone rows.",
-            "counter",
-            snap.decoder_toast_deletes_total,
-        ),
-        (
-            "walshadow_toast_chunk_puts_total",
-            "Chunk-store INSERTs issued. Against the seconds counter this gives              per-part commit latency, which caps a TOAST-heavy restore.",
-            "counter",
-            snap.toast_chunk_puts_total,
-        ),
-        (
-            "walshadow_toast_chunks_stored_total",
-            "TOAST chunk rows persisted to the CH store; the bootstrap's              TOAST-phase progress signal.",
-            "counter",
-            snap.toast_chunks_stored_total,
-        ),
-        (
-            "walshadow_toast_tombstones_stored_total",
-            "TOAST delete tombstone rows persisted to the CH store.",
-            "counter",
-            snap.toast_tombstones_stored_total,
-        ),
-        (
-            "walshadow_toast_values_filled_superseded_total",
-            "Store-mode values filled after their history merge-collapsed.",
-            "counter",
-            snap.toast_values_filled_superseded_total,
-        ),
-        (
-            "walshadow_toast_values_filled_mismatch_total",
-            "Store-mode values filled off a dense-but-short store run \
-             (partial collapse or generation mixing).",
-            "counter",
-            snap.toast_values_filled_mismatch_total,
-        ),
-        (
-            "walshadow_toast_mirror_truncates_total",
-            "Mirror wipes from owner TRUNCATE, applied at the reorder barrier.",
-            "counter",
-            snap.toast_mirror_truncates_total,
-        ),
-        (
-            "walshadow_toast_mirror_retires_total",
-            "Mirrors emptied because their toast rel dropped (owner DROP / rewrite); \
-             table retained.",
-            "counter",
-            snap.toast_mirror_retires_total,
-        ),
-        (
-            "walshadow_toast_rewrite_barriers_total",
-            "Rewrite generations closed with residual O-B tombstones.",
-            "counter",
-            snap.toast_rewrite_barriers_total,
-        ),
-        (
-            "walshadow_toast_stash_buffered_total",
-            "Records on marker-proven invisible filenodes stashed raw for \
-             commit-time resolution.",
-            "counter",
-            snap.toast_stash_buffered_total,
-        ),
-        (
-            "walshadow_raw_stash_deferred_total",
-            "Records held raw because their xact tree wrote catalog state \
-             earlier in the stream; resolved at commit.",
-            "counter",
-            snap.raw_stash_deferred_total,
-        ),
-        (
-            "walshadow_toast_stash_decoded_total",
-            "Stashed records decoded at commit against a resolved toast heap.",
-            "counter",
-            snap.toast_stash_decoded_total,
-        ),
-        (
-            "walshadow_toast_stash_discarded_total",
-            "Stashed records discarded: filenode unresolvable post-commit \
-             (dropped or rotated away).",
-            "counter",
-            snap.toast_stash_discarded_total,
-        ),
-        (
-            "walshadow_toast_stash_in_place_total",
-            "Stashed toast filenodes that superseded no predecessor, so \
-             queued no residual barrier.",
-            "counter",
-            snap.toast_stash_in_place_total,
-        ),
-        (
-            "walshadow_stash_foreign_db_skipped_total",
-            "Stashed filenodes resolved to a foreign database at commit, \
-             counted once per filenode.",
-            "counter",
-            snap.stash_foreign_db_skipped_total,
-        ),
-        (
-            "walshadow_emitter_rows_total",
-            "Rows the CH emitter has handed to send_data.",
-            "counter",
-            snap.emitter_rows_total,
-        ),
-        (
-            "walshadow_emitter_blocks_total",
-            "Native blocks the CH emitter has written.",
-            "counter",
-            snap.emitter_blocks_total,
-        ),
-        (
-            "walshadow_emitter_xacts_total",
-            "Xacts the CH emitter has drained.",
-            "counter",
-            snap.emitter_xacts_total,
-        ),
-        (
-            "walshadow_emitter_unsupported_relations_total",
-            "Tuples skipped because the source relation has no mapping in --ch-config.",
-            "counter",
-            snap.emitter_unsupported_relations,
-        ),
-        (
-            "walshadow_emitter_deletes_discarded_total",
-            "DELETE rows dropped because is_deleted = false leaves no marker column.",
-            "counter",
-            snap.emitter_deletes_discarded,
-        ),
-        (
-            "walshadow_pump_queue_depth",
-            "Records buffered between the WAL pump and the queueing worker.",
-            "gauge",
-            snap.pump_queue_depth,
-        ),
-        (
-            "walshadow_queue_records_out_total",
-            "Records the queueing/reorder worker has dequeued and dispatched. rate() is the worker's throughput; with pump_queue_depth it tells deep-and-draining from deep-and-stalled.",
-            "counter",
-            snap.queue_records_out_total,
-        ),
-        (
-            "walshadow_queue_jobs_out_total",
-            "DecodeJobs the queueing worker shipped to the decode pool. queue_jobs_out - decode_jobs_in is the worker->pool channel depth.",
-            "counter",
-            snap.queue_jobs_out_total,
-        ),
-        (
-            "walshadow_decode_jobs_in_total",
-            "DecodeJobs the decode pool has pulled. Pinned at queue_jobs_out ⇒ pool idle; the gap at the channel cap ⇒ the pool is the limiter.",
-            "counter",
-            snap.decode_jobs_in_total,
-        ),
-        (
-            "walshadow_decode_rows_out_total",
-            "Rows the decode pool routed to the insertbatch builder. decode_rows_out - insertbatch_rows_in is the pool->builder channel depth.",
-            "counter",
-            snap.decode_rows_out_total,
-        ),
-        (
-            "walshadow_insertbatch_rows_in_total",
-            "Rows the insertbatch builder accepted before sealing into InsertBatches.",
-            "counter",
-            snap.insertbatch_rows_in_total,
-        ),
-        (
-            "walshadow_insertbatch_batches_out_total",
-            "InsertBatches the builder sealed and pushed to the inserter pool.",
-            "counter",
-            snap.insertbatch_batches_out_total,
-        ),
-        (
-            "walshadow_inserter_batches_in_total",
-            "InsertBatches an inserter finished draining to ClickHouse. insertbatch_batches_out - inserter_batches_in is the live backlog; their rates show inserter-pool saturation.",
-            "counter",
-            snap.inserter_batches_in_total,
-        ),
-        (
-            "walshadow_process_resident_memory_bytes",
-            "Resident set size of the walshadow process (VmRSS).",
-            "gauge",
-            snap.process_resident_memory_bytes,
-        ),
-        (
-            "walshadow_oracle_local_columns_total",
-            "Oracle-routed columns the daemon built itself: already-rendered cells against a String target, which PG would hand straight back.",
-            "counter",
-            snap.oracle_local_columns_total,
-        ),
-        (
-            "walshadow_oracle_blocks_total",
-            "Partial Native blocks the walshadow extension returned and the daemon validated.",
-            "counter",
-            snap.oracle_blocks_total,
-        ),
-        (
-            "walshadow_oracle_rows_total",
-            "Rows carried by those blocks.",
-            "counter",
-            snap.oracle_rows_total,
-        ),
-        (
-            "walshadow_oracle_cells_total",
-            "Source cells sent for conversion, rows times oracle columns.",
-            "counter",
-            snap.oracle_cells_total,
-        ),
-        (
-            "walshadow_oracle_conversion_errors_total",
-            "Requests the extension failed on one PG Datum it could not convert.",
-            "counter",
-            snap.oracle_conversion_errors_total,
-        ),
-        (
-            "walshadow_oracle_errors_total",
-            "Oracle request, transport, or response-validation failures.",
-            "counter",
-            snap.oracle_errors_total,
-        ),
-        (
-            "walshadow_bridge_up",
-            "1 while the pgext bridge worker answered the last request over its socket.",
-            "gauge",
-            snap.bridge_up,
-        ),
-        (
-            "walshadow_bridge_reconnects_total",
-            "Bridge sockets redialled after a worker exit or transport error.",
-            "counter",
-            snap.bridge_reconnects_total,
-        ),
-        (
-            "walshadow_bridge_scan_rows_total",
-            "Catalog rows the bridge's overlay scans returned.",
-            "counter",
-            snap.bridge_scan_rows_total,
-        ),
-        (
-            "walshadow_bridge_scan_subtrans_mismatch_total",
-            "Overlay tuples whose writer did not resolve to the requested top xid; trusted as ours only on rel-scoped catalogs.",
-            "counter",
-            snap.bridge_scan_subtrans_mismatch_total,
-        ),
-        (
-            "walshadow_bridge_scan_replay_moved_total",
-            "Bridge scans that found shadow replay off the position their read pinned; committed reads answer these off SQL instead.",
-            "counter",
-            snap.bridge_scan_replay_moved_total,
-        ),
-        (
-            "walshadow_bridge_native_bytes_total",
-            "Native block bytes the bridge returned for ENCODE_NATIVE requests.",
-            "counter",
-            snap.bridge_native_bytes_total,
-        ),
-        (
-            "walshadow_uptime_seconds",
-            "Seconds since the daemon began its status loop.",
-            "counter",
-            snap.uptime_secs,
-        ),
-        (
-            "walshadow_source_endpoint_swaps_total",
-            "Source feeds swapped onto a reloaded [source] endpoint or slot.",
-            "counter",
-            snap.source_endpoint_swaps_total,
-        ),
-        (
-            "walshadow_source_endpoint_swap_failures_total",
-            "Swap attempts refused or unreachable (identity proof, connect, START_REPLICATION, missing slot).",
-            "counter",
-            snap.source_endpoint_swap_failures_total,
-        ),
-        (
-            "walshadow_source_endpoint_swap_pending",
-            "1 while config names a source endpoint or slot the pump has not reached yet.",
-            "gauge",
-            snap.source_endpoint_swap_pending,
-        ),
-        (
-            "walshadow_shadow_apply_lag_bytes",
-            "Bytes between source_received_lsn and the min apply LSN reported by active shadow walreceivers.",
-            "gauge",
-            snap.shadow_apply_lag_bytes,
-        ),
-        (
-            "walshadow_shadow_stream_active_connections",
-            "Currently-attached walreceiver connections to walshadow's walsender.",
-            "gauge",
-            snap.shadow_stream_active_connections,
-        ),
-        (
-            "walshadow_shadow_stream_dropped_connections_total",
-            "Connections dropped by slow-client cutoff since daemon start.",
-            "counter",
-            snap.shadow_stream_dropped_connections_total,
-        ),
-        (
-            "walshadow_catalog_boundary_holds_total",
-            "Publication holds released at catalog-mutating commit boundaries.",
-            "counter",
-            snap.catalog_boundary_holds_total,
-        ),
-        (
-            "walshadow_catalog_boundary_hold_failures_total",
-            "Catalog-boundary holds woken with an error (worker death, walreceiver loss, timeout).",
-            "counter",
-            snap.catalog_boundary_hold_failures_total,
-        ),
-        (
-            "walshadow_desc_capture_total_sql",
-            "Catalog boundaries captured via shadow SQL fan-out.",
-            "counter",
-            snap.desc_capture_sql_total,
-        ),
-        (
-            "walshadow_desc_capture_total_log_replay",
-            "Catalog boundaries replayed from stored descriptor-log batches.",
-            "counter",
-            snap.desc_capture_log_replay_total,
-        ),
-        (
-            "walshadow_desc_capture_skipped_covered_total",
-            "Boundaries at or below the seed's covered_through, skipped.",
-            "counter",
-            snap.desc_capture_skipped_covered_total,
-        ),
-        (
-            "walshadow_desc_capture_all_total",
-            "Capture-all boundaries (whole-relcache inval / pg_namespace write).",
-            "counter",
-            snap.desc_capture_all_total,
-        ),
-        (
-            "walshadow_desc_capture_rels_total",
-            "Descriptors fetched across SQL captures.",
-            "counter",
-            snap.desc_capture_rels_total,
-        ),
-        (
-            "walshadow_desc_events_added_total",
-            "Added schema events produced by descriptor capture.",
-            "counter",
-            snap.desc_events_added_total,
-        ),
-        (
-            "walshadow_desc_events_changed_total",
-            "Changed schema events produced by descriptor capture.",
-            "counter",
-            snap.desc_events_changed_total,
-        ),
-        (
-            "walshadow_desc_events_dropped_total",
-            "Dropped schema events produced by descriptor capture.",
-            "counter",
-            snap.desc_events_dropped_total,
-        ),
-        (
-            "walshadow_pending_captures_total",
-            "Command boundaries read into the pending catalog timeline.",
-            "counter",
-            snap.pending_captures_total,
-        ),
-        (
-            "walshadow_pending_rels_total",
-            "Descriptors read across command boundaries.",
-            "counter",
-            snap.pending_rels_total,
-        ),
-        (
-            "walshadow_pending_holds_total",
-            "Publication holds taken for a command boundary.",
-            "counter",
-            snap.pending_holds_total,
-        ),
-        (
-            "walshadow_pending_entries_promoted_total",
-            "Pending slots folded into a commit's descriptor-log batch.",
-            "counter",
-            snap.pending_entries_promoted_total,
-        ),
-        (
-            "walshadow_pending_entries_dropped_abort_total",
-            "Pending slots dropped with an aborted transaction tree.",
-            "counter",
-            snap.pending_entries_dropped_abort_total,
-        ),
-        (
-            "walshadow_pending_ambiguities_suppressed_total",
-            "Ambiguity intervals the pending timeline covered end to end.",
-            "counter",
-            snap.pending_ambiguities_suppressed_total,
-        ),
-        (
-            "walshadow_desc_log_entries",
-            "Descriptor-log index entries resident.",
-            "gauge",
-            snap.desc_log_entries,
-        ),
-        (
-            "walshadow_desc_log_tail_bytes",
-            "Descriptor-log tail bytes since last checkpoint.",
-            "gauge",
-            snap.desc_log_tail_bytes,
-        ),
-        (
-            "walshadow_desc_log_batches",
-            "Descriptor-log batches resident.",
-            "gauge",
-            snap.desc_log_batches,
-        ),
-        (
-            "walshadow_desc_log_gc_total",
-            "Descriptor-log checkpoint compactions.",
-            "counter",
-            snap.desc_log_gc_total,
-        ),
-        (
-            "walshadow_desc_log_gc_dropped_entries_total",
-            "Entries dropped by descriptor-log GC.",
-            "counter",
-            snap.desc_log_gc_dropped_entries_total,
-        ),
-        (
-            "walshadow_desc_lookups_present_total",
-            "Descriptor lookups answered Present.",
-            "counter",
-            snap.desc_lookups_present_total,
-        ),
-        (
-            "walshadow_desc_lookups_dropped_total",
-            "Descriptor lookups answered Dropped.",
-            "counter",
-            snap.desc_lookups_dropped_total,
-        ),
-        (
-            "walshadow_desc_lookups_retired_total",
-            "Descriptor lookups answered Retired (rotated-away filenode).",
-            "counter",
-            snap.desc_lookups_retired_total,
-        ),
-        (
-            "walshadow_desc_lookups_ambiguous_total",
-            "Descriptor lookups landing in an ambiguity interval.",
-            "counter",
-            snap.desc_lookups_ambiguous_total,
-        ),
-        (
-            "walshadow_descriptor_ambiguous_total",
-            "Ambiguity intervals published at capture for unproven in-place changes.",
-            "counter",
-            snap.descriptor_ambiguous_total,
-        ),
-        (
-            "walshadow_desc_lookups_not_covered_total",
-            "Descriptor lookups answered NotCovered.",
-            "counter",
-            snap.desc_lookups_not_covered_total,
-        ),
-        (
-            "walshadow_desc_lookups_foreign_db_total",
-            "Descriptor lookups on a foreign database's filenode.",
-            "counter",
-            snap.desc_lookups_foreign_db_total,
-        ),
-        (
-            "walshadow_config_pending_decl_rels",
-            "Forward-declared per-table opt-ins awaiting their CREATE TABLE.",
-            "gauge",
-            snap.config_pending_decl_rels,
-        ),
-        (
-            "walshadow_config_replicate_opt_in_total",
-            "Total config_table.replicate=true materialisations applied.",
-            "counter",
-            snap.config_replicate_opt_in_total,
-        ),
-        (
-            "walshadow_config_replicate_opt_out_total",
-            "Total config_table.replicate=false / removals applied.",
-            "counter",
-            snap.config_replicate_opt_out_total,
-        ),
-    ];
-    for (name, help, kind, value) in pairs {
-        writeln!(s, "# HELP {name} {help}").unwrap();
-        writeln!(s, "# TYPE {name} {kind}").unwrap();
-        writeln!(s, "{name} {value}").unwrap();
-    }
+    counter_kind_op(
+        enc,
+        "walshadow_raw_stash_records_total",
+        "Records stashed raw for commit-time resolution.",
+        ["dirty", "marker"],
+        &snap.raw_stash_records_by_kind_op,
+    )?;
+    counter_kind_op(
+        enc,
+        "walshadow_raw_decode_records_total",
+        "Stashed records decoded at commit resolution.",
+        ["toast", "ordinary"],
+        &snap.raw_decode_records_by_kind_op,
+    )?;
 
     // Label preserves 64-bit identifier beyond float64 precision
-    {
-        let name = "walshadow_source_info";
-        writeln!(s, "# HELP {name} Source cluster the pump is reading.").unwrap();
-        writeln!(s, "# TYPE {name} gauge").unwrap();
-        writeln!(s, "{name}{{system_id=\"{}\"}} 1", snap.source_system_id).unwrap();
-    }
-
-    // Timeline crossing, counters plus the labelled refusal family
-    {
-        for (name, help, value) in [
-            (
-                "walshadow_timeline_switches_total",
-                "Source timeline crossings completed.",
-                snap.timeline_switches_total,
-            ),
-            (
-                "walshadow_timeline_prefix_bytes_verified_total",
-                "Descendant bytes compared against the retained ancestor fork prefix.",
-                snap.timeline_prefix_bytes_verified_total,
-            ),
-        ] {
-            writeln!(s, "# HELP {name} {help}").unwrap();
-            writeln!(s, "# TYPE {name} counter").unwrap();
-            writeln!(s, "{name} {value}").unwrap();
-        }
-        let name = "walshadow_timeline_transition_seconds_total";
-        writeln!(s, "# HELP {name} Seconds spent inside timeline crossings.").unwrap();
-        writeln!(s, "# TYPE {name} counter").unwrap();
-        writeln!(s, "{name} {}", snap.timeline_transition_seconds_total).unwrap();
-        let name = "walshadow_timeline_switch_failures_total";
-        writeln!(
-            s,
-            "# HELP {name} Crossings refused; the stream stays on the ancestor."
-        )
-        .unwrap();
-        writeln!(s, "# TYPE {name} counter").unwrap();
-        for (reason, v) in SWITCH_FAILURE_REASONS
-            .iter()
-            .zip(snap.timeline_switch_failures_by_reason)
-        {
-            writeln!(s, "{name}{{reason=\"{reason}\"}} {v}").unwrap();
-        }
-    }
-
-    // Transaction-plan families, labelled series
-    {
-        let name = "walshadow_xact_plan_bytes";
-        writeln!(
-            s,
-            "# HELP {name} Sealed transaction-plan bytes by final backing."
-        )
-        .unwrap();
-        writeln!(s, "# TYPE {name} counter").unwrap();
-        for (storage, v) in ["mem", "file"].iter().zip(snap.xact_plan_bytes_by_storage) {
-            writeln!(s, "{name}{{storage=\"{storage}\"}} {v}").unwrap();
-        }
-        let name = "walshadow_xact_plan_rows";
-        writeln!(
-            s,
-            "# HELP {name} Routed heaps sealed into transaction plans."
-        )
-        .unwrap();
-        writeln!(s, "# TYPE {name} counter").unwrap();
-        writeln!(s, "{name} {}", snap.xact_plan_rows).unwrap();
-        let name = "walshadow_xact_plan_failures_total";
-        writeln!(
-            s,
-            "# HELP {name} Planning-stage failures; the whole transaction emits nothing."
-        )
-        .unwrap();
-        writeln!(s, "# TYPE {name} counter").unwrap();
-        for (reason, v) in PLAN_FAILURE_REASONS
-            .iter()
-            .zip(snap.xact_plan_failures_by_reason)
-        {
-            writeln!(s, "{name}{{reason=\"{reason}\"}} {v}").unwrap();
-        }
-        let name = "walshadow_route_snapshots_total";
-        writeln!(
-            s,
-            "# HELP {name} Plan-time route resolutions, one per relation per transaction."
-        )
-        .unwrap();
-        writeln!(s, "# TYPE {name} counter").unwrap();
-        for (result, v) in ["mapped", "unmapped"]
-            .iter()
-            .zip(snap.route_snapshots_by_result)
-        {
-            writeln!(s, "{name}{{result=\"{result}\"}} {v}").unwrap();
-        }
-    }
-
-    // Raw stash/decode families, `kind=`/`op=` labelled
-    {
-        use crate::decode::heap_decoder::HEAP_OP_LABELS;
-        let name = "walshadow_raw_stash_records_total";
-        writeln!(
-            s,
-            "# HELP {name} Records stashed raw for commit-time resolution."
-        )
-        .unwrap();
-        writeln!(s, "# TYPE {name} counter").unwrap();
-        for (kind, ops) in ["dirty", "marker"]
-            .iter()
-            .zip(&snap.raw_stash_records_by_kind_op)
-        {
-            for (op, v) in HEAP_OP_LABELS.iter().zip(ops) {
-                writeln!(s, "{name}{{kind=\"{kind}\",op=\"{op}\"}} {v}").unwrap();
-            }
-        }
-        let name = "walshadow_raw_stash_bytes";
-        writeln!(
-            s,
-            "# HELP {name} Cumulative raw-stash payload bytes by first landing."
-        )
-        .unwrap();
-        writeln!(s, "# TYPE {name} counter").unwrap();
-        for (storage, v) in ["mem", "spill"].iter().zip(snap.raw_stash_bytes_by_storage) {
-            writeln!(s, "{name}{{storage=\"{storage}\"}} {v}").unwrap();
-        }
-        let name = "walshadow_raw_decode_records_total";
-        writeln!(
-            s,
-            "# HELP {name} Stashed records decoded at commit resolution."
-        )
-        .unwrap();
-        writeln!(s, "# TYPE {name} counter").unwrap();
-        for (kind, ops) in ["toast", "ordinary"]
-            .iter()
-            .zip(&snap.raw_decode_records_by_kind_op)
-        {
-            for (op, v) in HEAP_OP_LABELS.iter().zip(ops) {
-                writeln!(s, "{name}{{kind=\"{kind}\",op=\"{op}\"}} {v}").unwrap();
-            }
-        }
-        let name = "walshadow_raw_decode_rows_total";
-        writeln!(s, "# HELP {name} Rows fanned out of decoded raw records.").unwrap();
-        writeln!(s, "# TYPE {name} counter").unwrap();
-        for (op, v) in HEAP_OP_LABELS.iter().zip(snap.raw_decode_rows_by_op) {
-            writeln!(s, "{name}{{op=\"{op}\"}} {v}").unwrap();
-        }
-        let name = "walshadow_raw_pending_rows";
-        writeln!(
-            s,
-            "# HELP {name} Raw-decoded heaps queued for pending-first yield."
-        )
-        .unwrap();
-        writeln!(s, "# TYPE {name} gauge").unwrap();
-        writeln!(s, "{name} {}", snap.raw_pending_rows).unwrap();
-        let name = "walshadow_raw_pending_bytes";
-        writeln!(s, "# HELP {name} Bytes held by the pending raw fanout.").unwrap();
-        writeln!(s, "# TYPE {name} gauge").unwrap();
-        writeln!(s, "{name} {}", snap.raw_pending_bytes).unwrap();
-    }
+    declare(
+        enc,
+        "walshadow_source_info",
+        "Source cluster the pump is reading.",
+        MetricType::Gauge,
+    )?
+    .encode_family(&[("system_id", snap.source_system_id)])?
+    .encode_gauge(&1u64)?;
 
     // Umbrella count bare + per-mode labelled series in one family
+    let mut backfills = declare(
+        enc,
+        "walshadow_config_backfills_pending",
+        "initial_load backfills recorded but not yet complete.",
+        MetricType::Gauge,
+    )?;
+    backfills.encode_gauge(&snap.config_backfills_pending)?;
+    for (mode, value) in ["copy", "base_backup", "object_store"]
+        .into_iter()
+        .zip(snap.config_backfills_pending_by_mode)
     {
-        let name = "walshadow_config_backfills_pending";
-        writeln!(
-            s,
-            "# HELP {name} initial_load backfills recorded but not yet complete."
-        )
-        .unwrap();
-        writeln!(s, "# TYPE {name} gauge").unwrap();
-        writeln!(s, "{name} {}", snap.config_backfills_pending).unwrap();
-        for (mode, v) in ["copy", "base_backup", "object_store"]
-            .iter()
-            .zip(snap.config_backfills_pending_by_mode)
-        {
-            writeln!(s, "{name}{{mode=\"{mode}\"}} {v}").unwrap();
-        }
+        backfills
+            .encode_family(&[("mode", mode)])?
+            .encode_gauge(&value)?;
     }
+    Ok(())
+}
 
-    // Bridge families, `op=` labelled
-    {
-        use crate::ops::bridge::OP_LABELS;
-        let name = "walshadow_bridge_requests_total";
-        writeln!(s, "# HELP {name} Requests sent to the pgext bridge worker.").unwrap();
-        writeln!(s, "# TYPE {name} counter").unwrap();
-        for (op, v) in OP_LABELS.iter().zip(snap.bridge_requests_by_op) {
-            writeln!(s, "{name}{{op=\"{op}\"}} {v}").unwrap();
-        }
-        let name = "walshadow_bridge_errors_total";
-        writeln!(
-            s,
-            "# HELP {name} Bridge requests that failed, transport or worker-side."
-        )
-        .unwrap();
-        writeln!(s, "# TYPE {name} counter").unwrap();
-        for (op, v) in OP_LABELS.iter().zip(snap.bridge_errors_by_op) {
-            writeln!(s, "{name}{{op=\"{op}\"}} {v}").unwrap();
-        }
-        for (name, help, nanos) in [
-            (
-                "walshadow_bridge_request_seconds_total",
-                "Wall time spent in bridge round trips.",
-                snap.bridge_request_nanos_by_op,
-            ),
-            (
-                "walshadow_bridge_lock_wait_seconds_total",
-                "Wall time bridge callers spent queued for the socket. Against bridge_service_seconds this says whether the worker or the funnel in front of it is the limiter.",
-                snap.bridge_lock_wait_nanos_by_op,
-            ),
-            (
-                "walshadow_bridge_service_seconds_total",
-                "Wall time on the wire with the bridge socket held: worker conversion plus transfer.",
-                snap.bridge_service_nanos_by_op,
-            ),
-        ] {
-            writeln!(s, "# HELP {name} {help}").unwrap();
-            writeln!(s, "# TYPE {name} counter").unwrap();
-            for (op, v) in OP_LABELS.iter().zip(nanos) {
-                let secs = v as f64 / 1e9;
-                writeln!(s, "{name}{{op=\"{op}\"}} {secs}").unwrap();
-            }
-        }
-        for (name, help, bytes) in [
-            (
-                "walshadow_bridge_request_bytes_total",
-                "Request frame bytes written to the bridge socket.",
-                snap.bridge_request_bytes_by_op,
-            ),
-            (
-                "walshadow_bridge_response_bytes_total",
-                "Response frame bytes read back off the bridge socket.",
-                snap.bridge_response_bytes_by_op,
-            ),
-        ] {
-            writeln!(s, "# HELP {name} {help}").unwrap();
-            writeln!(s, "# TYPE {name} counter").unwrap();
-            for (op, v) in OP_LABELS.iter().zip(bytes) {
-                writeln!(s, "{name}{{op=\"{op}\"}} {v}").unwrap();
-            }
-        }
-    }
-
-    // Prom format accepts `+Inf` for unknown rate
-    let name = "walshadow_shadow_apply_lag_seconds";
-    writeln!(
-        s,
-        "# HELP {name} Estimated seconds shadow trails source, by source byte rate over last 30s.",
-    )
-    .unwrap();
-    writeln!(s, "# TYPE {name} gauge").unwrap();
-    if snap.shadow_apply_lag_seconds.is_infinite() {
-        writeln!(s, "{name} +Inf").unwrap();
-    } else {
-        writeln!(s, "{name} {:.3}", snap.shadow_apply_lag_seconds).unwrap();
-    }
-
-    let name = "walshadow_catalog_boundary_hold_seconds_total";
-    writeln!(
-        s,
-        "# HELP {name} Cumulative seconds the pump parked in released catalog-boundary holds.",
-    )
-    .unwrap();
-    writeln!(s, "# TYPE {name} counter").unwrap();
-    writeln!(s, "{name} {:.3}", snap.catalog_boundary_hold_seconds_total).unwrap();
-    let name = "walshadow_pending_hold_seconds_total";
-    writeln!(
-        s,
-        "# HELP {name} Cumulative seconds the pump parked in command-boundary holds.",
-    )
-    .unwrap();
-    writeln!(s, "# TYPE {name} counter").unwrap();
-    writeln!(s, "{name} {:.3}", snap.pending_hold_seconds_total).unwrap();
-    let name = "walshadow_pending_degraded_total";
-    writeln!(
-        s,
-        "# HELP {name} Transactions degraded to commit-time capture, by reason.",
-    )
-    .unwrap();
-    writeln!(s, "# TYPE {name} counter").unwrap();
-    for (reason, v) in crate::catalog::pending::DegradeReason::ALL
-        .iter()
-        .zip(snap.pending_degraded_by_reason)
-    {
-        writeln!(s, "{name}{{reason=\"{}\"}} {v}", reason.label()).unwrap();
-    }
-    let name = "walshadow_desc_capture_seconds_total";
-    writeln!(
-        s,
-        "# HELP {name} Cumulative seconds inside descriptor capture (within the boundary hold)."
-    )
-    .unwrap();
-    writeln!(s, "# TYPE {name} counter").unwrap();
-    writeln!(s, "{name} {:.3}", snap.desc_capture_seconds_total).unwrap();
-
-    for (name, help, secs) in [
-        (
-            "walshadow_toast_chunk_put_seconds_total",
-            "Cumulative wall-clock inside chunk-store INSERTs. Divided by toast_chunk_puts_total this is per-part commit latency.",
-            snap.toast_chunk_put_seconds,
-        ),
-        (
-            "walshadow_bootstrap_decode_seconds_total",
-            "Cumulative CPU inside the bootstrap page walk, tuple decode included.",
-            snap.bootstrap_decode_seconds,
-        ),
-        (
-            "walshadow_bootstrap_tap_seconds_total",
-            "Cumulative time bootstrap tap readers spent inside the sink: page framing, decode, channel send. Against bootstrap_decode_seconds this is the tap's own overhead.",
-            snap.bootstrap_tap_seconds,
-        ),
-        (
-            "walshadow_bootstrap_channel_block_seconds_total",
-            "Cumulative time the bootstrap walk spent waiting for a free tuple-channel slot, i.e. emitter drain time seen by the walk.",
-            snap.bootstrap_channel_block_seconds,
-        ),
-        (
-            "walshadow_inserter_ch_seconds_total",
-            "Cumulative inserter time inside the ClickHouse INSERT round trip. Against inserter_pool_size x uptime this is CH-side utilization.",
-            snap.inserter_ch_seconds_total,
-        ),
-        (
-            "walshadow_inserter_encode_seconds_total",
-            "Cumulative inserter time rebuilding the Native block over a batch's owned slabs.",
-            snap.inserter_encode_seconds_total,
-        ),
-        (
-            "walshadow_oracle_resolve_seconds_total",
-            "Cumulative resolver time inside the oracle round trip. Overlaps inserter_ch_seconds_total, so the larger of the two is the tail's limiter.",
-            snap.oracle_resolve_seconds_total,
-        ),
-    ] {
-        writeln!(s, "# HELP {name} {help}").unwrap();
-        writeln!(s, "# TYPE {name} counter").unwrap();
-        writeln!(s, "{name} {secs:.3}").unwrap();
-    }
-
-    // Process CPU as a float counter (seconds); rate() ≈ cores in use.
-    let name = "walshadow_process_cpu_seconds_total";
-    writeln!(
-        s,
-        "# HELP {name} Total user+system CPU seconds consumed by the walshadow process.",
-    )
-    .unwrap();
-    writeln!(s, "# TYPE {name} counter").unwrap();
-    writeln!(s, "{name} {:.3}", snap.process_cpu_seconds_total).unwrap();
-    s
+/// Snapshot families, stage timings, then the OpenMetrics `# EOF` marker
+pub fn render(snap: MetricsSnapshot) -> String {
+    let mut registry = Registry::default();
+    registry.register_collector(Box::new(SnapshotCollector(snap)));
+    registry.register_collector(Box::new(crate::ops::stages::StageCollector));
+    let mut out = String::with_capacity(16 << 10);
+    text::encode(&mut out, &registry).expect("String write cannot fail");
+    out
 }
 
 /// Returns the bound address (resolves `:0` ephemeral ports) and join handle.
@@ -1550,12 +770,10 @@ async fn handle_client(
     let mut buf = [0u8; 1024];
     let n = socket.read(&mut buf).await?;
     let _ = n;
-    let snap = registry.snapshot().await;
-    let mut body = render(&snap);
-    crate::ops::stages::render(&mut body);
+    let body = render(registry.snapshot().await);
     let resp = format!(
         "HTTP/1.0 200 OK\r\n\
-         Content-Type: text/plain; version=0.0.4; charset=utf-8\r\n\
+         Content-Type: application/openmetrics-text; version=1.0.0; charset=utf-8\r\n\
          Content-Length: {}\r\n\
          Connection: close\r\n\
          \r\n\
@@ -1577,13 +795,13 @@ mod tests {
             source_received_lsn: 0xCAFE_BABE.into(),
             filter_lsn: 0xC0FFEE.into(),
             xact_active: 3,
-            uptime_secs: 42,
+            uptime_seconds: 42,
             ..MetricsSnapshot::default()
         };
         snap.records_by_rm_route
             .insert(("Heap".into(), "to_decoder"), 17);
 
-        let body = render(&snap);
+        let body = render(snap);
         assert!(body.contains("# HELP walshadow_source_received_lsn"));
         assert!(body.contains("# TYPE walshadow_source_received_lsn gauge"));
         assert!(body.contains("walshadow_source_received_lsn 3405691582"));
@@ -1592,7 +810,7 @@ mod tests {
             body.contains("walshadow_filter_records_total{rmgr=\"Heap\",route=\"to_decoder\"} 17")
         );
         assert!(body.contains("walshadow_xact_active 3"));
-        assert!(body.contains("walshadow_uptime_seconds 42"));
+        assert!(body.contains("walshadow_uptime_seconds_total 42"));
     }
 
     #[test]
@@ -1604,11 +822,11 @@ mod tests {
             route_snapshots_by_result: [7, 8],
             ..MetricsSnapshot::default()
         };
-        let body = render(&snap);
+        let body = render(snap);
         assert!(body.contains("# TYPE walshadow_xact_plan_bytes counter"));
-        assert!(body.contains("walshadow_xact_plan_bytes{storage=\"mem\"} 100"));
-        assert!(body.contains("walshadow_xact_plan_bytes{storage=\"file\"} 200"));
-        assert!(body.contains("walshadow_xact_plan_rows 9"));
+        assert!(body.contains("walshadow_xact_plan_bytes_total{storage=\"mem\"} 100"));
+        assert!(body.contains("walshadow_xact_plan_bytes_total{storage=\"file\"} 200"));
+        assert!(body.contains("walshadow_xact_plan_rows_total 9"));
         for (i, reason) in PLAN_FAILURE_REASONS.iter().enumerate() {
             let want = format!(
                 "walshadow_xact_plan_failures_total{{reason=\"{reason}\"}} {}",
@@ -1636,16 +854,16 @@ mod tests {
             oracle_resolve_seconds_total: 8.25,
             ..MetricsSnapshot::default()
         };
-        let body = render(&snap);
+        let body = render(snap);
         for want in [
             "walshadow_bootstrap_bytes_tapped_total 1073741824",
             "walshadow_bootstrap_pages_walked_total 131072",
             "walshadow_bootstrap_files_skipped_unmapped_total 297",
-            "walshadow_bootstrap_decode_seconds_total 12.500",
-            "walshadow_bootstrap_channel_block_seconds_total 3.250",
-            "walshadow_bootstrap_tap_seconds_total 0.000",
-            "walshadow_inserter_ch_seconds_total 41.500",
-            "walshadow_oracle_resolve_seconds_total 8.250",
+            "walshadow_bootstrap_decode_seconds_total 12.5",
+            "walshadow_bootstrap_channel_block_seconds_total 3.25",
+            "walshadow_bootstrap_tap_seconds_total 0.0",
+            "walshadow_inserter_ch_seconds_total 41.5",
+            "walshadow_oracle_resolve_seconds_total 8.25",
         ] {
             assert!(body.contains(want), "missing {want}");
         }
@@ -1655,7 +873,7 @@ mod tests {
     /// was emitted bare and labelled with contradicting HELP text
     #[test]
     fn render_declares_each_family_once() {
-        let body = render(&MetricsSnapshot::default());
+        let body = render(MetricsSnapshot::default());
         let mut seen: ahash::HashMap<&str, usize> = ahash::HashMap::default();
         for line in body.lines() {
             if let Some(rest) = line.strip_prefix("# TYPE ")
@@ -1689,7 +907,7 @@ mod tests {
         snap.raw_stash_records_by_kind_op[1][5] = 32; // marker multi_insert
         snap.raw_decode_records_by_kind_op[0][0] = 33; // toast insert
         snap.raw_decode_records_by_kind_op[1][2] = 34; // ordinary update
-        let body = render(&snap);
+        let body = render(snap);
         assert!(
             body.contains("walshadow_raw_stash_records_total{kind=\"dirty\",op=\"insert\"} 31")
         );
@@ -1698,8 +916,8 @@ mod tests {
                 "walshadow_raw_stash_records_total{kind=\"marker\",op=\"multi_insert\"} 32"
             )
         );
-        assert!(body.contains("walshadow_raw_stash_bytes{storage=\"mem\"} 11"));
-        assert!(body.contains("walshadow_raw_stash_bytes{storage=\"spill\"} 12"));
+        assert!(body.contains("walshadow_raw_stash_bytes_total{storage=\"mem\"} 11"));
+        assert!(body.contains("walshadow_raw_stash_bytes_total{storage=\"spill\"} 12"));
         assert!(
             body.contains("walshadow_raw_decode_records_total{kind=\"toast\",op=\"insert\"} 33")
         );
@@ -1738,29 +956,35 @@ mod tests {
             shadow_stream_dropped_connections_total: 5,
             ..MetricsSnapshot::default()
         };
-        let body = render(&snap);
+        let body = render(snap);
         assert!(body.contains("# HELP walshadow_shadow_apply_lag_bytes"));
         assert!(body.contains("# TYPE walshadow_shadow_apply_lag_bytes gauge"));
         assert!(body.contains("walshadow_shadow_apply_lag_bytes 12345"));
         assert!(body.contains("# HELP walshadow_shadow_apply_lag_seconds"));
         assert!(body.contains("# TYPE walshadow_shadow_apply_lag_seconds gauge"));
-        assert!(body.contains("walshadow_shadow_apply_lag_seconds 1.235"));
+        assert!(body.contains("walshadow_shadow_apply_lag_seconds 1.23456"));
         assert!(body.contains("# HELP walshadow_shadow_stream_active_connections"));
         assert!(body.contains("# TYPE walshadow_shadow_stream_active_connections gauge"));
         assert!(body.contains("walshadow_shadow_stream_active_connections 2"));
-        assert!(body.contains("# HELP walshadow_shadow_stream_dropped_connections_total"));
-        assert!(body.contains("# TYPE walshadow_shadow_stream_dropped_connections_total counter"));
+        assert!(body.contains("# HELP walshadow_shadow_stream_dropped_connections"));
+        assert!(body.contains("# TYPE walshadow_shadow_stream_dropped_connections counter"));
         assert!(body.contains("walshadow_shadow_stream_dropped_connections_total 5"));
     }
 
+    /// Unknown rate stays infinite on the wire. prometheus-client spells it
+    /// `inf` where the hand-rolled encoder spelled it `+Inf`; Prometheus
+    /// parses either through Go's ParseFloat
     #[test]
-    fn render_emits_infinity_as_plus_inf() {
+    fn render_emits_infinity_for_unknown_rate() {
         let snap = MetricsSnapshot {
             shadow_apply_lag_seconds: f64::INFINITY,
             ..MetricsSnapshot::default()
         };
-        let body = render(&snap);
-        assert!(body.contains("walshadow_shadow_apply_lag_seconds +Inf"));
+        let body = render(snap);
+        assert!(
+            body.contains("walshadow_shadow_apply_lag_seconds inf"),
+            "{body}"
+        );
     }
 
     #[test]
@@ -1808,6 +1032,64 @@ mod tests {
         assert!((s - 5.0).abs() < 1e-6, "expected 5.0 got {s}");
     }
 
+    /// Wire shape rather than substrings: every sample belongs to the family
+    /// declared above it, counter samples carry `_total`, labels are quoted,
+    /// values parse, and one EOF marker closes the body after stage families
+    #[test]
+    fn exposition_parses_as_openmetrics() {
+        let mut snap = MetricsSnapshot {
+            shadow_apply_lag_seconds: f64::INFINITY,
+            uptime_seconds: 7,
+            source_system_id: u64::MAX,
+            ..MetricsSnapshot::default()
+        };
+        snap.records_by_rm_route
+            .insert(("Heap".into(), "to_shadow"), 3);
+        let body = render(snap);
+
+        let (families, tail) = body.split_once("# EOF\n").expect("EOF marker");
+        assert!(tail.is_empty(), "bytes after EOF: {tail:?}");
+        assert!(families.contains("walshadow_stage_completed_total{stage=\"copy\"} 0"));
+
+        let mut declared: Option<(&str, &str)> = None;
+        let mut helped = "";
+        for line in families.lines() {
+            if let Some(rest) = line.strip_prefix("# HELP ") {
+                let (name, help) = rest.split_once(' ').expect("HELP text");
+                assert!(!help.is_empty(), "{name} declared with empty help");
+                helped = name;
+                continue;
+            }
+            if let Some(rest) = line.strip_prefix("# TYPE ") {
+                let (name, kind) = rest.split_once(' ').expect("TYPE keyword");
+                assert_eq!(name, helped, "TYPE without its own HELP: {line}");
+                assert!(matches!(kind, "counter" | "gauge"), "{line}");
+                declared = Some((name, kind));
+                continue;
+            }
+            let (head, value) = line.rsplit_once(' ').expect("sample value");
+            let (name, labels) = match head.split_once('{') {
+                Some((name, labels)) => (name, labels.strip_suffix('}').expect("closing brace")),
+                None => (head, ""),
+            };
+            let (family, kind) = declared.expect("sample ahead of its declaration");
+            let want = match kind {
+                "counter" => format!("{family}_total"),
+                _ => family.to_owned(),
+            };
+            assert_eq!(name, want, "sample outside its family: {line}");
+            for label in labels.split_terminator(',') {
+                let (key, val) = label.split_once('=').expect("key=value label");
+                assert!(!key.is_empty(), "{line}");
+                assert!(
+                    val.len() >= 2 && val.starts_with('"') && val.ends_with('"'),
+                    "{line}"
+                );
+            }
+            assert!(value.parse::<f64>().is_ok(), "unparseable value: {line}");
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn http_serve_returns_text_format_body() {
         let reg = MetricsRegistry::new();
@@ -1826,7 +1108,7 @@ mod tests {
         sock.read_to_end(&mut buf).await.unwrap();
         let resp = String::from_utf8(buf).unwrap();
         assert!(resp.starts_with("HTTP/1.0 200 OK\r\n"), "{resp}");
-        assert!(resp.contains("Content-Type: text/plain"));
+        assert!(resp.contains("Content-Type: application/openmetrics-text"));
         assert!(resp.contains("walshadow_filter_lsn 57005"), "{resp}");
     }
 }

@@ -1,10 +1,15 @@
 //! Process-wide elapsed timings, including waits and overlapping work
 
-use std::fmt::Write;
+use std::fmt;
 use std::future::Future;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use prometheus_client::collector::Collector;
+use prometheus_client::encoding::DescriptorEncoder;
+
+use crate::ops::metrics::{counter_series, gauge, gauge_series};
 
 pub struct Stage {
     name: &'static str,
@@ -91,55 +96,57 @@ stages! {
     SETTLE => "settle",
 }
 
-pub fn render(out: &mut String) {
-    static EPOCH: OnceLock<f64> = OnceLock::new();
-    let epoch = EPOCH.get_or_init(|| {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs_f64()
-    });
-    writeln!(
-        out,
-        "# HELP walshadow_stage_epoch_seconds Timing registry identity, changes after restart"
-    )
-    .unwrap();
-    writeln!(out, "# TYPE walshadow_stage_epoch_seconds gauge").unwrap();
-    writeln!(out, "walshadow_stage_epoch_seconds {epoch}").unwrap();
-    for (suffix, kind, help) in [
-        (
-            "seconds_total",
-            "counter",
+/// Stage families off the process-wide registry, one series per stage
+#[derive(Debug)]
+pub struct StageCollector;
+
+impl Collector for StageCollector {
+    fn encode(&self, mut enc: DescriptorEncoder) -> fmt::Result {
+        static EPOCH: OnceLock<f64> = OnceLock::new();
+        let epoch = EPOCH.get_or_init(|| {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs_f64()
+        });
+        gauge(
+            &mut enc,
+            "walshadow_stage_epoch_seconds",
+            "Timing registry identity, changes after restart",
+            *epoch,
+        )?;
+        counter_series(
+            &mut enc,
+            "walshadow_stage_seconds_total",
             "Elapsed seconds of finished attempts, including waits and overlaps",
-        ),
-        (
-            "completed_total",
-            "counter",
+            "stage",
+            ALL.iter()
+                .map(|s| (s.name, s.nanos.load(Ordering::Relaxed) as f64 / 1e9)),
+        )?;
+        counter_series(
+            &mut enc,
+            "walshadow_stage_completed_total",
             "Successfully finished stage attempts",
-        ),
-        (
-            "interrupted_total",
-            "counter",
+            "stage",
+            ALL.iter()
+                .map(|s| (s.name, s.completed.load(Ordering::Relaxed))),
+        )?;
+        counter_series(
+            &mut enc,
+            "walshadow_stage_interrupted_total",
             "Failed or cancelled stage attempts",
-        ),
-        ("active", "gauge", "Currently running stage attempts"),
-    ] {
-        writeln!(out, "# HELP walshadow_stage_{suffix} {help}").unwrap();
-        writeln!(out, "# TYPE walshadow_stage_{suffix} {kind}").unwrap();
-        for stage in ALL {
-            let value = match suffix {
-                "seconds_total" => stage.nanos.load(Ordering::Relaxed) as f64 / 1e9,
-                "completed_total" => stage.completed.load(Ordering::Relaxed) as f64,
-                "interrupted_total" => stage.interrupted.load(Ordering::Relaxed) as f64,
-                _ => stage.active.load(Ordering::Relaxed) as f64,
-            };
-            writeln!(
-                out,
-                "walshadow_stage_{suffix}{{stage=\"{}\"}} {value}",
-                stage.name
-            )
-            .unwrap();
-        }
+            "stage",
+            ALL.iter()
+                .map(|s| (s.name, s.interrupted.load(Ordering::Relaxed))),
+        )?;
+        gauge_series(
+            &mut enc,
+            "walshadow_stage_active",
+            "Currently running stage attempts",
+            "stage",
+            ALL.iter()
+                .map(|s| (s.name, s.active.load(Ordering::Relaxed))),
+        )
     }
 }
 
