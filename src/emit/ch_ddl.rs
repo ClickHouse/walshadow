@@ -1425,7 +1425,7 @@ mod tests {
         let resolved = type_bridge::map(&labels, false).unwrap();
         assert_eq!(
             render_add_column("default.t", "labels", &resolved),
-            r#"ALTER TABLE default.t ADD COLUMN IF NOT EXISTS `labels` JSON DEFAULT '{"a": 1}'"#
+            r#"ALTER TABLE default.t ADD COLUMN IF NOT EXISTS `labels` String DEFAULT '{"a": 1}'"#
         );
     }
 

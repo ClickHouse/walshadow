@@ -141,7 +141,7 @@ Common mappings include:
 | `time` | `Time64(6)` |
 | `timestamp`, `timestamptz` | `DateTime64(..., 'UTC')` |
 | `uuid` | `UUID` |
-| `json`, `jsonb` | `JSON` |
+| `json`, `jsonb` | `String` |
 | `hstore` | `Map(String, Nullable(String))` |
 | `vector`, `halfvec` (pgvector) | `Array(Float32)` |
 | `geography`, `geometry` (PostGIS) | `String`, WKT for 2-D points, PostgreSQL's own hex form otherwise |
