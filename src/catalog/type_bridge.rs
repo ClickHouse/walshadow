@@ -24,7 +24,7 @@
 //! | `interval` | `String` | |
 //! | `uuid` | `UUID` | |
 //! | `inet` / `cidr` | `String` | |
-//! | `json` / `jsonb` | `JSON` | native CH JSON (string serialization) |
+//! | `json` / `jsonb` | `String` | document text |
 //! | `hstore` | `Map(String, Nullable(String))` | by type name |
 //! | `vector` / `halfvec` | `Array(Float32)` | pgvector, by type name |
 //! | `geography` / `geometry` | `String` | WKT `POINT(x y)`, rendered at decode |
@@ -111,7 +111,7 @@ pub fn base_type_for(att: &RelAttr) -> Result<String, BridgeError> {
         TIMESTAMPOID | TIMESTAMPTZOID => datetime64_ch_type(att.typmod),
         UUIDOID => "UUID".into(),
         INETOID | CIDROID => "String".into(),
-        JSONOID | JSONBOID => "JSON".into(),
+        JSONOID | JSONBOID => "String".into(),
         // Extension / array types carry dynamic OIDs, so match on the type
         // name: `hstore` → Map, `vector` (pgvector) → Array(Float32),
         // `_<elem>` (PG array convention) → Array of a supported element, else
@@ -447,25 +447,18 @@ mod tests {
     }
 
     #[test]
-    fn json_maps_to_ch_json() {
-        assert_eq!(
-            base_type_for(&attr(JSONOID, -1, true, None)).unwrap(),
-            "JSON"
-        );
-        assert_eq!(
-            base_type_for(&attr(JSONBOID, -1, true, None)).unwrap(),
-            "JSON"
-        );
-        assert_eq!(
-            map(&attr(JSONBOID, -1, true, None), false).unwrap().ch_type,
-            "JSON"
-        );
-        assert_eq!(
-            map(&attr(JSONBOID, -1, false, None), false)
-                .unwrap()
-                .ch_type,
-            "Nullable(JSON)"
-        );
+    fn json_maps_to_ch_string() {
+        for oid in [JSONOID, JSONBOID] {
+            assert_eq!(base_type_for(&attr(oid, -1, true, None)).unwrap(), "String");
+            assert_eq!(
+                map(&attr(oid, -1, true, None), false).unwrap().ch_type,
+                "String"
+            );
+            assert_eq!(
+                map(&attr(oid, -1, false, None), false).unwrap().ch_type,
+                "Nullable(String)"
+            );
+        }
     }
 
     #[test]
@@ -667,8 +660,7 @@ mod tests {
         }
     }
 
-    /// `jsonb` reaches the bridge as `jsonb_out` text, so the literal is the
-    /// document CH parses into its `JSON` column
+    /// Preserve PostgreSQL `jsonb_out` text
     #[test]
     fn default_for_jsonb_text_renders_the_document() {
         let r = map(&attr(JSONBOID, -1, true, Some(r#"{"a": 1}"#)), false).unwrap();

@@ -292,8 +292,8 @@ async fn jsonb_fast_default_renders_on_add_column() {
         ))
         .unwrap()
     };
-    assert_eq!(labels(1), r#"{"a":1}"#, "row predating the ALTER");
-    assert_eq!(labels(2), r#"{"b":2}"#);
+    assert_eq!(labels(1), r#"{"a": 1}"#, "row predating the ALTER");
+    assert_eq!(labels(2), r#"{"b": 2}"#);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

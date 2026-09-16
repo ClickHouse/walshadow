@@ -384,8 +384,6 @@ mod tests {
         b.finish().0
     }
 
-    /// CH takes a `JSON` column as a string body, so the document the local
-    /// codecs render needs no conversion
     #[test]
     fn json_targets_need_no_oracle() {
         let rules = ColumnRules::default();
@@ -403,8 +401,8 @@ mod tests {
             );
             assert_eq!(
                 tables[&RelName::new("public", "foo")].columns[1].target_type,
-                "Nullable(JSON)",
-                "premise: default bridge maps {name} to a CH JSON target",
+                "Nullable(String)",
+                "premise: default bridge maps {name} to a CH String target",
             );
             assert!(!needs_oracle(&catalog, &tables, &rules), "{name}");
         }
