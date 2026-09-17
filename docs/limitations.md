@@ -111,6 +111,24 @@ unchanged-pointer updates both resolve from those mirrors. Chunk lookup orders
 by `(ver, blkno, offnum)` for determinism, not generation correctness: a newer
 generation at a lower TID can lose when versions tie
 
+### Shadow value backend
+
+`[toast] backend = "shadow"` (see
+[configuration](configuration.md#value-backend)) serves both a greenfield
+bootstrap and live CDC. Three limits carry real risk:
+
+- **No reclamation fence.** Nothing withholds a prune or vacuum record from
+  shadow's replay, so a value that restartable work still needs can be gone
+  after a restart below the durable floor
+- **Shadow becomes a durability dependency for data**, not only a catalog
+  oracle. The ClickHouse mirror survives the loss of shadow; these values do
+  not, and rebuilding them means a fresh bootstrap
+- **No migration path.** The backends hold different history, so switching an
+  existing deployment needs a fresh bootstrap
+
+It reads the live generation exactly, which retires the reused-value-ID
+ambiguity recorded above for the ClickHouse mirror.
+
 ## Not an HA system
 
 walshadow consumes PostgreSQL failover decisions, it does not make them. It

@@ -186,7 +186,15 @@ impl WalReplaySink {
     ///
     /// Repairs a backup page the walk read mid-write. Any page a backup
     /// modifies is written before its first change in the window, so the
-    /// image carries what the torn copy lost
+    /// image carries what the torn copy lost.
+    ///
+    /// Reached from two resource managers. A Heap record carries an image on
+    /// the first post-checkpoint touch of a page, but a DELETE of pre-window
+    /// chunks carries none — that page's image arrives separately as
+    /// `XLOG_FPI_FOR_HINT` when a hint bit is set on it, which is an XLOG
+    /// record and so outside the `filter_rfns` gate the Heap path sits behind.
+    /// Watching only Heap left exactly the pages holding pre-window values
+    /// unrepaired
     async fn harvest_toast_images(
         &mut self,
         record: &Record<'_>,
@@ -474,6 +482,20 @@ impl RecordSink for WalReplaySink {
     ) -> Pin<Box<dyn Future<Output = std::result::Result<(), SinkError>> + Send + 'a>> {
         Box::pin(async move {
             let rm = record.parsed.header.resource_manager_id;
+            // Page images of a TOAST page arrive on two rmgrs, and the one
+            // that matters most is not Heap: a DELETE of pre-window chunks
+            // carries no image of its own, and the page's image turns up in a
+            // separate `XLOG_FPI_FOR_HINT` when a hint bit is set on it
+            // A page image of a TOAST page reaches the mirror from two
+            // resource managers, and the one that matters is not Heap: a
+            // DELETE of pre-window chunks carries no image of its own, and
+            // that page's image arrives separately as `XLOG_FPI_FOR_HINT`
+            // when a hint bit is set on it. Watching only the Heap branch
+            // below left exactly the pages holding pre-window values
+            // unrepaired
+            if crate::filter::classify::is_page_image(&record.parsed) {
+                self.harvest_toast_images(record).await?;
+            }
             if rm == RmId::Heap as u8 || rm == RmId::Heap2 as u8 {
                 if let Some(rel) = record.parsed.blocks.first().map(|b| b.header.location.rel) {
                     if self.filter_rfns.contains(&(rel.db_node, rel.rel_node)) {

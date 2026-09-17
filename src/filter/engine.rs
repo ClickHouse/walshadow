@@ -62,7 +62,7 @@ impl FilterStats {
 
     pub fn record(&mut self, class: Class, route: Route, bytes: u64) {
         match route {
-            Route::ToShadow => {
+            Route::ToShadow | Route::ToBoth => {
                 self.kept += 1;
                 self.kept_bytes += bytes;
                 match class {
@@ -187,6 +187,21 @@ pub struct Filter {
     /// (offline segment filter, no capture consumer) proves no record's
     /// database, so no record dirties
     target_db_oid: Option<u32>,
+    /// Shadow-TOAST: user relation records reach shadow as well as the
+    /// decoder, so shadow holds the physical chunks a later fetch reads.
+    ///
+    /// Routes every user relation, not only TOAST heaps and their indexes.
+    /// Identifying those by relfilenode needs oid-to-filenode across
+    /// rewrites plus the toast index, and a rule that misses one loses
+    /// values silently. Shipped volume is unchanged either way — a dropped
+    /// record is rewritten to a NOOP of equal `xl_tot_len` — so the cost is
+    /// shadow's disk and apply work, not bandwidth
+    user_to_shadow: bool,
+    /// Shadow-TOAST: user relations whose records shadow replays because it
+    /// serves their values. Exact for everything that existed when the walk
+    /// staged their files; a relation created since is covered by
+    /// `user_to_shadow`
+    keep_user_rels: HashSet<(u32, u32)>,
 }
 
 impl Filter {
@@ -199,6 +214,8 @@ impl Filter {
             observed_from_xid: None,
             smgr_markers: Arc::new(Mutex::new(SmgrMarkers::default())),
             target_db_oid: None,
+            user_to_shadow: false,
+            keep_user_rels: HashSet::default(),
         }
     }
 
@@ -206,6 +223,31 @@ impl Filter {
     /// streams set this before the first record
     pub fn set_target_db(&mut self, db_oid: u32) {
         self.target_db_oid = Some(db_oid);
+    }
+
+    /// Deliver user relation records to shadow as well as the decoder, for
+    /// the shadow-TOAST backend. Set before the first record: flipping it
+    /// mid-stream leaves shadow missing the files the earlier records wrote
+    pub fn route_user_to_shadow(&mut self, on: bool) {
+        self.user_to_shadow = on;
+    }
+
+    pub fn routes_user_to_shadow(&self) -> bool {
+        self.user_to_shadow
+    }
+
+    /// Deliver these user relations' records to shadow as well as the
+    /// decoder, without routing every user relation there
+    pub fn keep_user_rels(&mut self, rels: HashSet<(u32, u32)>) {
+        self.keep_user_rels = rels;
+    }
+
+    fn user_rel_to_shadow(&self, record: &XLogRecord) -> bool {
+        self.user_to_shadow
+            || record.blocks.iter().any(|b| {
+                let r = b.header.location.rel;
+                self.keep_user_rels.contains(&(r.db_node, r.rel_node))
+            })
     }
 
     /// Capture reads rotation markers through this handle
@@ -295,6 +337,8 @@ impl Filter {
                 if any_block_is_catalog(&self.tracker, &record.blocks) {
                     // tracker has filenodes the bootstrap classify rule misses
                     (Route::ToShadow, self.descriptor_touch_db(record))
+                } else if self.user_rel_to_shadow(record) {
+                    (Route::ToBoth, None)
                 } else {
                     (Route::ToDecoder, None)
                 }
@@ -304,6 +348,10 @@ impl Filter {
                     if self.tracker.is_catalog(rel.db_node, rel.rel_node) {
                         let opaque = self.tracker.is_opaque_catalog(rel.db_node, rel.rel_node);
                         (Route::ToShadow, (!opaque).then_some(rel.db_node))
+                    } else if self.user_to_shadow
+                        || self.keep_user_rels.contains(&(rel.db_node, rel.rel_node))
+                    {
+                        (Route::ToBoth, None)
                     } else {
                         (Route::ToDecoder, None)
                     }
@@ -705,6 +753,62 @@ mod tests {
         let mut f = Filter::new();
         f.set_target_db(TARGET_DB);
         f
+    }
+
+    /// Shadow-TOAST routing: shadow needs the records that wrote the chunks
+    /// it will later be asked for, and the decoder still needs to emit the row
+    #[test]
+    fn user_records_reach_both_sides_under_shadow_toast() {
+        let mut f = target_filter();
+        let user = rec(RmId::Heap, &[(TARGET_DB, 16500)]);
+        assert_eq!(f.decide(&user), Route::ToDecoder, "off by default");
+
+        f.route_user_to_shadow(true);
+        assert!(f.routes_user_to_shadow());
+        assert_eq!(f.decide(&user), Route::ToBoth);
+
+        // Catalog and special records keep their existing route: they were
+        // already going to shadow, and nothing decodes them
+        assert_eq!(f.decide(&rec(RmId::Heap, &[(TARGET_DB, 1259)])), Route::ToShadow);
+        assert_eq!(f.decide(&rec(RmId::Xact, &[])), Route::ToShadow);
+
+        // A foreign database's user relation is still a user relation
+        assert_eq!(f.decide(&rec(RmId::Heap, &[(6, 16500)])), Route::ToBoth);
+    }
+
+    /// `ToBoth` is kept on the wire, so shadow gets the original bytes rather
+    /// than the NOOP a dropped record is rewritten to
+    #[test]
+    fn to_both_counts_as_kept_not_dropped() {
+        let mut stats = FilterStats::default();
+        stats.record(Class::User, Route::ToBoth, 64);
+        assert_eq!((stats.kept, stats.dropped), (1, 0));
+        assert_eq!(stats.kept_bytes, 64);
+        assert_eq!(stats.kept_user, 1);
+
+        let mut dropped = FilterStats::default();
+        dropped.record(Class::User, Route::ToDecoder, 64);
+        assert_eq!((dropped.kept, dropped.dropped), (0, 1));
+    }
+
+    /// A record with no block refs whose relation resolves to a user relation
+    /// takes the same route as one that names it in a block
+    #[test]
+    fn empty_class_user_relation_follows_the_setting() {
+        let mut f = target_filter();
+        let mut r = rec(RmId::Btree, &[]);
+        r.header.info = main_data::XLOG_BTREE_REUSE_PAGE;
+        let mut md = Vec::new();
+        md.extend_from_slice(&1663u32.to_le_bytes());
+        md.extend_from_slice(&TARGET_DB.to_le_bytes());
+        md.extend_from_slice(&16500u32.to_le_bytes());
+        md.extend_from_slice(&0u32.to_le_bytes());
+        md.extend_from_slice(&0u64.to_le_bytes());
+        md.push(0);
+        r.main_data = md.into();
+        assert_eq!(f.decide(&r), Route::ToDecoder);
+        f.route_user_to_shadow(true);
+        assert_eq!(f.decide(&r), Route::ToBoth);
     }
 
     fn rec(rm: RmId, rels: &[(u32, u32)]) -> XLogRecord<'static> {

@@ -67,7 +67,7 @@ pub fn filter_segment(
             })?;
         let route = filter.decide(&parsed);
         let kind = match route {
-            Route::ToShadow => Kind::Kept,
+            Route::ToShadow | Route::ToBoth => Kind::Kept,
             Route::ToDecoder => Kind::Dropped,
         };
 

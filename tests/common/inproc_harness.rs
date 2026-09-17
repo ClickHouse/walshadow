@@ -693,6 +693,16 @@ pub async fn build_pipeline_with_oracle(
     build_pipeline_inner(args, |_| {}, Some(oracle)).await
 }
 
+/// Both at once: `[toast] backend = "shadow"` needs the oracle's bridge to
+/// read through and the config to select it
+pub async fn build_pipeline_tuned(
+    args: BuildPipelineArgs<'_>,
+    tune: impl FnOnce(&mut EmitterConfig),
+    oracle: Option<Arc<walshadow::oracle::Oracle>>,
+) -> Pipeline {
+    build_pipeline_inner(args, tune, oracle).await
+}
+
 async fn build_pipeline_inner(
     args: BuildPipelineArgs<'_>,
     tune: impl FnOnce(&mut EmitterConfig),
@@ -856,6 +866,11 @@ async fn build_pipeline_inner(
     }
 
     tune(&mut emitter_cfg);
+    // Mirrors `bin/stream.rs`: shadow-backed values only exist on shadow if
+    // shadow replayed the records that wrote them
+    if emitter_cfg.toast.backend.is_shadow() {
+        stream.filter_mut().route_user_to_shadow(true);
+    }
     let pending_cfg = emitter_cfg.pending_capture;
     let pending_catalog = Arc::new(walshadow::pending::PendingCatalog::default());
 

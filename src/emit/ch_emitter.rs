@@ -275,12 +275,36 @@ pub struct BootstrapSettings {
     pub lanes: Option<NonZeroUsize>,
 }
 
+/// Where external TOAST values live.
+///
+/// `Clickhouse` mirrors every chunk into a per-relation `ReplacingMergeTree`
+/// keyed by physical tuple location. `Shadow` reads them out of shadow
+/// PostgreSQL's own TOAST heaps instead, which writes no chunks at all — see
+/// `plans/shadow_toast.md`. The two are not interchangeable on a running
+/// deployment: values written under one backend are not readable under the
+/// other, so switching needs a fresh bootstrap
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToastBackend {
+    #[default]
+    Clickhouse,
+    Shadow,
+}
+
+impl ToastBackend {
+    pub fn is_shadow(self) -> bool {
+        matches!(self, ToastBackend::Shadow)
+    }
+}
+
 /// `[toast]` chunk-store controls, applied at startup
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
 pub struct ToastSettings {
     pub put_batch_rows: Option<NonZeroUsize>,
     pub put_batch_bytes: Option<NonZeroUsize>,
     pub connections: Option<NonZeroUsize>,
+    #[serde(default)]
+    pub backend: ToastBackend,
 }
 
 pub(crate) const DEFAULT_RESIDENT_PAYLOAD_MAX: usize = 512 << 20;

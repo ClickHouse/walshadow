@@ -178,6 +178,7 @@ Tune chunk-store buffering independently of inserter count, restart daemon to ap
 
 | `[toast]` setting | Default | Effect |
 |---|---:|---|
+| `backend` | `clickhouse` | Where external values live: `clickhouse` or `shadow` |
 | `put_batch_rows` | 65,536 | Seal chunk INSERT after this many rows |
 | `put_batch_bytes` | 67,108,864 | Seal chunk INSERT after this many body bytes |
 | `connections` | `ch.inserter_pool_size` | Limit concurrent chunk-store connections |
@@ -196,8 +197,51 @@ put_batch_rows = 256
 put_batch_bytes = 4194304
 ```
 
-All three settings require positive integers. Existing `[bootstrap] lanes`
-and `[ch] inserter_pool_size` controls remain independent
+The three buffering settings require positive integers. Existing
+`[bootstrap] lanes` and `[ch] inserter_pool_size` controls remain independent
+
+### Value backend
+
+`backend = "clickhouse"` mirrors every chunk into a per-relation
+`ReplacingMergeTree` keyed by physical tuple location.
+
+`backend = "shadow"` reads values out of shadow PostgreSQL's own TOAST heaps
+and writes no chunks at all. Shadow answers every lookup — the backup-window
+replay leg's, the page walk's deferred rows, and live CDC after handoff.
+
+**Shadow starts during bootstrap, not after it.** The source's TOAST heaps and
+their indexes are landed into shadow's data dir, and shadow then reaches the
+backup's end position by ordinary recovery. That is what makes a value written
+*during* the backup readable: its chunks are appended mid-window, so no file
+copy holds them — only replaying the WAL does. Recovery also repairs pages the
+backup copied mid-write, which is the same reason a base backup is only valid
+once its WAL is replayed.
+
+The backup-window replay leg reads its own copy of the in-window WAL segments
+from `--spill-dir`, because the originals in `pg_wal` are rewritten before
+shadow's recovery sees them.
+
+**Costs and constraints:**
+
+- Shadow holds the TOAST heaps and indexes for as long as it runs. On a
+  TOAST-heavy corpus that is most of the database's size. Nothing else about
+  the backup is landed — user heaps still stream through without touching disk
+- Shadow replays those relations' WAL as well as the catalog's. Shipped WAL
+  volume is unchanged — a dropped record is rewritten to a NOOP of equal
+  length — so the cost is shadow's disk and apply work, not bandwidth
+- A read waits for shadow to replay through the referring record, then reads
+  at whatever position replay has reached. Nothing yet withholds a replayed
+  reclamation, so a restart below the durable floor can find a value gone
+- The `[toast]` buffering settings above do nothing: there are no chunk writes
+  to seal
+- The two backends hold different history and are not interchangeable on a
+  running deployment. Switching needs a fresh bootstrap
+- Default tablespace only: a relation behind a `pg_tblspc` symlink is not
+  landed, and is counted rather than silently mis-served
+- The bootstrap oracle is unaffected. It is provisioned only for tier-3 type
+  conversion, as before, and takes no part in resolving values
+
+Design and open work in `plans/shadow_toast.md`
 
 ## Backup archive
 

@@ -22,6 +22,144 @@ then decompress. A missing or ambiguous value is fatal unless supersession is
 independently proven. Never silently fall back to a backend with different
 history
 
+### Measured answer
+
+Built: `WS_OP_FETCH_TOAST` in `pgext/toast.c`, `Bridge::fetch_toast`, a read-only
+`ShadowToastStore`, and `tests/shadow_toast_reads.rs`. Results on PG 18:
+
+- A value whose referring row version is dead reads back byte-exact, so
+  `HeapTupleSatisfiesToast` ignoring xmax is confirmed as usable
+- **VACUUM is not the reclaimer.** Opportunistic pruning takes the chunks as
+  soon as the cleanup horizon passes the deleting transaction. On a primary
+  that is immediate and unprompted: a 240,000-byte value read back as 480
+  bytes, its final chunk, with no VACUUM issued. Pin the horizon with an open
+  repeatable-read snapshot and the same value reads back whole
+- On a standby the property holds as the design needs it to. Nothing prunes
+  locally, so the value stays whole until an `XLOG_HEAP2_PRUNE` record is
+  replayed, and replaying the reclamation then takes it. That makes the fence
+  primarily about prune records, not vacuum records
+- Density plus total size is sufficient validation: it rejects a partly pruned
+  run and interleaved generations under a reused id with one rule. True value-id
+  reuse is not reproducible in a test (PG refuses direct writes to a toast
+  relation and the OID counter cannot be rewound), so that case rests on the
+  rule rather than on a measurement
+- Latency: 8 values / 720,000 stored bytes in one round trip, 3.7 ms total,
+  457 us per value. The ClickHouse mirror's round trip measured 71.9 ms flat
+
+Chunks come back stored, not decompressed: the daemon already owns pglz/lz4 and
+the `va_tcinfo` prefix, and raw-size validation stays where the decompressor is.
+
+### Wired up
+
+`[toast] backend = "shadow"` selects it, for a greenfield bootstrap and for
+live CDC. Covered by `tests/bootstrap_toast_oracle_ch.rs` and
+`tests/toast_shadow_backend_e2e.rs`.
+
+**Shadow is the only value server, and it starts during bootstrap.** The
+source's TOAST heaps *and their indexes* are landed into its data dir, and it
+reaches `end_lsn` by ordinary recovery. That is what makes a value written
+during the backup readable at all — its chunks are appended mid-window, so no
+file copy and no page image holds them. Recovery also repairs torn pages
+correctly, restoring each image into a buffer it marks dirty so the checksum
+is recomputed.
+
+The one ordering constraint: `filter_landed_wal` rewrites `pg_wal` in place and
+must precede shadow's recovery, but the backup-window leg needs those bytes
+raw. `wal_landing::copy_window_segments` gives the leg its own copy under
+`--spill-dir`, which is what lets shadow start ahead of it.
+
+Supporting changes:
+
+- Deferral keys on `!resolver.fill_on_miss()`, not `stores_chunks()`: "a store
+  owes this value" is the condition; "the store also takes writes" is not
+- The staged set is explicit (`toast_staging::StagedRels`), not derived from
+  `CatalogMap::is_toast`. It has to include the toast **index**, which is a
+  relation the catalog seed holds no descriptor for, and whose filenode comes
+  from a `pg_class`/`pg_index` query on the source. The indexes also join
+  `tap_filenodes`, or the walk declines them before the staging hook
+- `Route::ToBoth` plus `Filter::keep_user_rels` deliver those relations'
+  records to shadow as well as the decoder. Exact for everything that existed
+  at backup time; the blanket `route_user_to_shadow` survives only as the
+  no-bootstrap fallback, because over-routing costs disk while under-routing
+  loses a value silently
+- `filter_landed_wal` runs once, keeping those relations' records rather than
+  rewriting them to NOOPs
+- `run()` adopts the shadow bootstrap started, rather than starting a second
+  postmaster on the same data dir
+- The bootstrap oracle is untouched: provisioned only for tier-3 type
+  conversion, and no part of the value path
+
+### What was tried and removed
+
+Three designs were built and discarded, each for a reason worth keeping:
+
+1. **Bootstrap refuses the backend; live CDC only.** Useless — bootstrap is
+   where the cost is.
+2. **Serve bootstrap values from the bootstrap oracle.** It is already running
+   with a bridge, and `pg_dump --binary-upgrade` gives it the source's OIDs
+   and relfilenodes, so the files belong at the paths they already have. It
+   cannot redo source WAL, so it can only ever hold the backup *copy* — which
+   does not contain values written during the backup. It also needed
+   `pg_resetwal -x` to keep clog reads in range, `REINDEX` to rebuild indexes
+   over the landed heaps (a full scan), a second copy of the corpus, and
+   `ignore_checksum_failure`, because a raw backup copy contains torn pages
+   whose checksums do not match.
+3. **Repair the copy from the window's full-page images**
+   (`ToastPagePatcher`, first image per block). Unsound: a page gets an image
+   only on its first post-checkpoint touch, so chunks appended later in the
+   window appear in no image. The same argument rules out landing a btree
+   index this way — a page split relocates entries onto a newly-initialised
+   page logged `REGBUF_WILL_INIT`, which carries no image at all. Under real
+   redo none of this applies, because the split record is applied too.
+
+### Measured PostgreSQL behaviour worth not rediscovering
+
+From `pg_walinspect` over a real backup window with concurrent TOAST churn —
+35 records touching the toast relation, 5 carrying a page image:
+
+| source of a TOAST page image | emitted? |
+|---|---|
+| `Heap INSERT`, first post-checkpoint touch of an existing page | yes |
+| `Heap INSERT` into a freshly initialised page | no (`REGBUF_WILL_INIT`) |
+| `Heap DELETE` of pre-window chunks | no image on the record itself |
+| `XLOG_FPI_FOR_HINT` on that same page | yes — and this is where it arrives |
+| a plain read of the toasted value | no: `SnapshotToast` never consults clog, so there is no hint bit to set |
+
+**This exposed a live bug in the ClickHouse backend, fixed here:**
+`harvest_toast_images` was called only from the Heap/Heap2 branch of
+`on_record`, so the mirror missed every `XLOG_FPI_FOR_HINT` image — which per
+the table above is exactly where the images for pages holding pre-window
+values arrive. The mirror's torn-page repair was missing the pages it existed
+for. It now runs on XLOG page images too.
+
+### The fence cannot be delegated to PostgreSQL
+
+Tested, because it would have removed most of the work below. PG's standby
+conflict machinery parks replay of a record carrying a `snapshotConflictHorizon`
+while a query holds an older snapshot, and `max_standby_archive_delay = -1`
+makes it wait rather than cancel. Measured on a real standby:
+
+- A snapshot opened *before* the referrer's delete replays does park the
+  reclamation, and the value stays whole behind it
+- A snapshot opened *after* it does not, and the value is gone
+
+Conflict resolution protects tuples the held snapshot can see. A reader owing
+pre-window values is always in the second case, so PG will not hold the line for
+it. The fence has to be walshadow's own.
+
+What makes that tractable: walshadow *is* shadow's WAL supply, over the
+walsender and the archive directory `restore_command` reads. Withholding a
+destructive record is therefore a publication decision, not new machinery —
+which is why `BoundaryHoldSink` already withholds successor bytes from both
+paths by blocking in `on_record`, and why gating the archive separately is not
+optional. Staging differs from that hold only in keeping the pump running
+instead of parking it, so `resume_safe_lsn` can still advance. It is also
+fail-safe on daemon crash: nothing ships, so replay cannot pass the staged
+record. The cost is that a catalog boundary above a staged record waits for
+`resume_safe_lsn` to reach it, which is ClickHouse-paced — normally seconds,
+but `hold_timeout` turns a ClickHouse slowdown into a DDL outage rather than
+DDL lag.
+
 ## Preserve physical storage
 
 Seed complete TOAST heap and index files, including forks and relation segments

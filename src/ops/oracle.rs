@@ -189,6 +189,12 @@ impl Oracle {
 
     /// Round-trip cost of resolution: the request bytes and worker service
     /// time behind [`OracleStats`]
+    /// Shared bridge, so a shadow-backed TOAST store rides the same worker
+    /// pool the oracle does rather than dialling its own
+    pub fn bridge(&self) -> Arc<Bridge> {
+        self.bridge.clone()
+    }
+
     pub fn bridge_stats(&self) -> Arc<crate::ops::bridge::BridgeStats> {
         self.bridge.stats.clone()
     }

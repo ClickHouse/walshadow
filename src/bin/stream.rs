@@ -1047,22 +1047,32 @@ async fn run_session(
         ShadowStart::Bootstrap(dir)
         | ShadowStart::Rebootstrap(dir, _)
         | ShadowStart::Resume(dir) => {
-            let shadow = Arc::new(build_owned_shadow(
-                args,
-                &source_conn.dbname,
-                dir.clone(),
-                bridge_workers,
-            ));
-            shadow
-                .write_standby_signal()
-                .context("write standby.signal")?;
-            walshadow::ops::stages::SHADOW_REPLAY
-                .measure(start_owned_shadow(
-                    &shadow,
-                    bootstrap_end_lsn,
-                    Duration::from_secs(args.bootstrap_shadow_replay_timeout),
-                ))
-                .await?;
+            // Bootstrap starts shadow itself under the shadow-TOAST backend,
+            // because it resolves values out of it. Adopt that instance: a
+            // second postmaster on the same data dir would refuse, and
+            // restarting it would throw away the replay it already did
+            let shadow = match bootstrap_handoff.as_ref().and_then(|h| h.shadow.clone()) {
+                Some(running) => running,
+                None => {
+                    let shadow = Arc::new(build_owned_shadow(
+                        args,
+                        &source_conn.dbname,
+                        dir.clone(),
+                        bridge_workers,
+                    ));
+                    shadow
+                        .write_standby_signal()
+                        .context("write standby.signal")?;
+                    walshadow::ops::stages::SHADOW_REPLAY
+                        .measure(start_owned_shadow(
+                            &shadow,
+                            bootstrap_end_lsn,
+                            Duration::from_secs(args.bootstrap_shadow_replay_timeout),
+                        ))
+                        .await?;
+                    shadow
+                }
+            };
             Some(ShadowLifecycle::spawn(
                 shadow,
                 walsender_primary_conninfo(args.walsender_bind),
@@ -1458,6 +1468,35 @@ async fn run_session(
         .await
         .context("shadow database oid")?;
     stream.filter_mut().set_target_db(shadow_db_oid);
+    // Shadow-TOAST reads values out of shadow's own heaps, so shadow has to
+    // replay the records that wrote them
+    let shadow_toast = ch_config
+        .as_ref()
+        .is_some_and(|c| c.toast.backend.is_shadow());
+    if shadow_toast {
+        let rels = bootstrap_handoff
+            .as_ref()
+            .map(|h| h.toast_rels.clone())
+            .unwrap_or_default();
+        if rels.is_empty() {
+            // No bootstrap this boot, so nothing enumerated the TOAST
+            // relations. Route every user relation rather than guess: over
+            // routing costs shadow disk, under routing loses a value
+            stream.filter_mut().route_user_to_shadow(true);
+            tracing::warn!(
+                target: "walshadow::toast",
+                "[toast] backend = shadow without a bootstrap to enumerate TOAST \
+                 relations: routing every user relation to shadow",
+            );
+        } else {
+            stream.filter_mut().keep_user_rels(rels.clone());
+            tracing::info!(
+                target: "walshadow::toast",
+                toast_rels = rels.len(),
+                "[toast] backend = shadow: replaying these relations on shadow too",
+            );
+        }
+    }
     let pending_cfg = ch_config
         .as_ref()
         .map(|c| c.pending_capture)
@@ -3437,6 +3476,7 @@ async fn populate_metrics(
             match route {
                 walshadow::record::Route::ToShadow => "to_shadow",
                 walshadow::record::Route::ToDecoder => "to_decoder",
+                walshadow::record::Route::ToBoth => "to_both",
             },
         );
         by_rm.insert(key, *n);
@@ -4428,6 +4468,10 @@ async fn run_bootstrap(
         .await
         .context("bootstrap: seed catalog filenodes")?;
     let catalog_filenodes: Vec<_> = landing_tracker.nodes().collect();
+    // Filtered at one of two points depending on the backend, never both:
+    // the shadow backend rewrites before its recovery starts mid-bootstrap,
+    // the ClickHouse backend after the window leg has read the raw segments
+    let mut landing_tracker = Some(landing_tracker);
     tracing::info!(
         target: "walshadow::bootstrap",
         relations = catalog_map.len(),
@@ -4501,12 +4545,48 @@ async fn run_bootstrap(
     let bootstrap_stats = emitter_stats;
     // Leaf-only pool for the bootstrap tail: caps each value (V3) and
     // bounds decoded rows in flight to insert ack; no admission stage
-    let resolver = if let Some(cfg) = &ch_config {
-        ToastResolver::from_config(cfg, bootstrap_stats.clone()).with_budget(
-            walshadow::budget::MemoryBudget::new(cfg.resident_payload_max),
+    let shadow_toast = ch_config
+        .as_ref()
+        .is_some_and(|c| c.toast.backend.is_shadow());
+    // Two value servers, each given only what it can read correctly. The
+    // oracle takes the staged files before window replay and answers that
+    // leg, which only ever asks for values written before the backup. Shadow
+    // takes the same files afterwards and reaches `end_lsn` by real redo,
+    // which is what makes a value written *during* the backup readable — its
+    // chunks are appended mid-window, so no file copy holds them.
+    //
+    // Both bind late: the resolvers are built here and cloned into the gate,
+    // drain lanes and tails long before either instance is serving
+    // Set when shadow-TOAST starts shadow mid-bootstrap, so `run` adopts it
+    // rather than starting a second postmaster on the same data dir
+    let mut running_shadow: Option<Arc<Shadow>> = None;
+    let shadow_toast_bridge = walshadow::toast::shadow_store::LateBridge::default();
+    let toast_staging = shadow_toast.then(|| {
+        walshadow::backfill::toast_staging::ToastStaging::new(
+            args.spill_dir.join("bootstrap_oracle_toast"),
         )
-    } else {
-        ToastResolver::disabled()
+    });
+    let shadow_backed = |cell: &walshadow::toast::shadow_store::LateBridge,
+                         cfg: &EmitterConfig| {
+        ToastResolver::with_store(
+            Arc::new(walshadow::toast::shadow_store::ShadowToastStore::late(
+                cell.clone(),
+            )),
+            bootstrap_stats.clone(),
+        )
+        .with_inline_value_max(cfg.inline_value_max)
+        .with_budget(walshadow::budget::MemoryBudget::new(
+            cfg.resident_payload_max,
+        ))
+    };
+    // Shadow answers every lookup, the window leg's included: it is replaying
+    // before that leg runs
+    let resolver = match &ch_config {
+        Some(cfg) if shadow_toast => shadow_backed(&shadow_toast_bridge, cfg),
+        Some(cfg) => ToastResolver::from_config(cfg, bootstrap_stats.clone()).with_budget(
+            walshadow::budget::MemoryBudget::new(cfg.resident_payload_max),
+        ),
+        None => ToastResolver::disabled(),
     };
     let store_toast = resolver.stores_chunks();
 
@@ -4566,23 +4646,93 @@ async fn run_bootstrap(
         None => (None, false, Default::default()),
     };
 
+    let source_conninfo = format!(
+        "host={} port={} user={} dbname={} sslmode={}",
+        src_cfg.host,
+        src_cfg.port,
+        src_cfg.user,
+        src_cfg.database,
+        if src_cfg.sslmode == SslMode::Disable {
+            "disable"
+        } else {
+            "prefer"
+        },
+    );
+
+    // A TOAST heap is unreadable without its index, and shadow cannot rebuild
+    // one — it is a read-only standby. The index is a relation the catalog
+    // seed holds no descriptor for, so its filenode comes from the source
+    let mut toast_stage_rels: ahash::HashSet<(u32, u32)> = ahash::HashSet::default();
+    if shadow_toast {
+        let heaps: Vec<u32> = drain_catalog
+            .descriptors()
+            .filter(|d| d.kind == 't')
+            .filter(|d| {
+                tap_filenodes
+                    .as_ref()
+                    .is_none_or(|set| set.contains(&(d.rfn.db_node, d.rfn.rel_node)))
+            })
+            .map(|d| d.rfn.rel_node)
+            .collect();
+        let db_oid = drain_catalog
+            .descriptors()
+            .map(|d| d.rfn.db_node)
+            .next()
+            .unwrap_or_default();
+        for rel in &heaps {
+            toast_stage_rels.insert((db_oid, *rel));
+        }
+        if !heaps.is_empty() {
+            // The sidecar client the catalog seed used, not a fresh dial: a
+            // conninfo rebuilt from `src_cfg` carries no password, which the
+            // source may well require
+            // Interpolated, not bound: `oid[]` has no Rust mapping, and these
+            // are filenodes read out of the catalog seed moments ago
+            let list = heaps
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            let rows = sql_client
+                .query(
+                    &format!(
+                        "SELECT ic.relfilenode::int8 FROM pg_class t \
+                         JOIN pg_index i ON i.indrelid = t.oid \
+                         JOIN pg_class ic ON ic.oid = i.indexrelid \
+                         WHERE t.relkind = 't' \
+                         AND t.relfilenode = ANY('{{{list}}}'::oid[])"
+                    ),
+                    &[],
+                )
+                .await
+                .context("bootstrap: read toast index filenodes")?;
+            for row in &rows {
+                toast_stage_rels.insert((db_oid, row.get::<_, i64>(0) as u32));
+            }
+            tracing::info!(
+                target: "walshadow::bootstrap",
+                toast_heaps = heaps.len(),
+                toast_indexes = rows.len(),
+                "staging TOAST storage for the shadow value backend",
+            );
+        }
+    }
+    // The walk declines anything outside the mapped set before it reaches the
+    // staging hook, so the indexes have to join it
+    let tap_filenodes = match tap_filenodes {
+        Some(set) if shadow_toast => {
+            let mut set = (*set).clone();
+            set.extend(toast_stage_rels.iter().copied());
+            Some(Arc::new(set))
+        }
+        other => other,
+    };
+
     // Off the backup window: provisioning is an initdb + pg_dump + apply +
     // restart, and doing it after `BASE_BACKUP` opens parks a live backup
     // through all of it — in object-store mode against walrus's 60 s request
     // cap
     let bootstrap_oracle = if needs_oracle {
-        let source_conninfo = format!(
-            "host={} port={} user={} dbname={} sslmode={}",
-            src_cfg.host,
-            src_cfg.port,
-            src_cfg.user,
-            src_cfg.database,
-            if src_cfg.sslmode == SslMode::Disable {
-                "disable"
-            } else {
-                "prefer"
-            },
-        );
         Some(
             walshadow::backfill::bootstrap_oracle::BootstrapOracle::provision(
                 args.spill_dir.join("bootstrap_oracle"),
@@ -4618,6 +4768,12 @@ async fn run_bootstrap(
 
     let mut cfg =
         BootstrapConfig::new(shadow_data_dir.clone()).with_catalog_filenodes(catalog_filenodes);
+    if let Some(staging) = &toast_staging {
+        cfg = cfg.staging_toast_into(
+            staging.root().to_path_buf(),
+            Arc::new(toast_stage_rels.clone()),
+        );
+    }
     if let Some(set) = tap_filenodes {
         cfg = cfg.with_tap_filenodes(set);
     }
@@ -4981,26 +5137,159 @@ async fn run_bootstrap(
             .context("bootstrap: record extraction checkpoint")?;
         }
 
-        // Deferred referrers resolve out of the chunk store, so every window
+        if let Some((settings, storage)) = wal_hydrate.take() {
+            fetch_wal_into_pg_wal(
+                &settings,
+                storage,
+                &shadow_data_dir,
+                outcome.start.start_lsn,
+                outcome.end.end_lsn,
+                outcome.start.timeline,
+            )
+            .await
+            .context("bootstrap: hydrate shadow pg_wal from object store")?;
+        }
+
+        // Shadow answers every value lookup below, so it has to be replaying
+        // before the window leg runs. `filter_landed_wal` rewrites `pg_wal`
+        // in place and has to precede shadow's recovery, but the leg needs
+        // those bytes raw — so the leg reads its own copy
+        let window_wal = if shadow_toast {
+            let dir = args.spill_dir.join("bootstrap_window_wal");
+            let copied = walshadow::backfill::wal_landing::copy_window_segments(
+                &shadow_data_dir.join("pg_wal"),
+                &dir,
+                outcome.start.timeline,
+                outcome.start.start_lsn,
+                outcome.end.end_lsn,
+            )
+            .await
+            .context("bootstrap: copy window WAL for the replay leg")?;
+            tracing::info!(
+                target: "walshadow::bootstrap",
+                segments = copied,
+                dir = %dir.display(),
+                "copied window WAL so the leg reads it raw",
+            );
+            dir
+        } else {
+            shadow_data_dir.join("pg_wal")
+        };
+
+        // Shadow is the value store, and everything below reads from it, so
+        // it starts here. It reaches `end_lsn` by ordinary recovery out of
+        // its own pg_wal, which is what makes a value written *during* the
+        // backup readable: those chunks are appended mid-window, so no file
+        // copy holds them. Redo also repairs torn pages correctly, restoring
+        // each image into a buffer it marks dirty so the checksum is
+        // recomputed
+        let staged_rels = match &toast_staging {
+            Some(staging) => walshadow::backfill::toast_staging::staged_filenodes(staging)
+                .await
+                .context("bootstrap: list staged TOAST relations")?,
+            None => ahash::HashSet::default(),
+        };
+        let staged_db_oid = staged_rels.iter().next().map(|&(db, _)| db);
+
+        // Filtered here only under the shadow backend, because shadow starts
+        // just below and no recovery may redo records into files the landing
+        // skipped. The window leg reads its own copy of these segments, so
+        // rewriting the originals now takes nothing away from it.
+        //
+        // The ClickHouse backend keeps the original ordering: its leg reads
+        // `pg_wal` itself, so the rewrite has to wait until after the leg has
+        // run — see the call further down
+        if shadow_toast {
+            let landed = walshadow::backfill::wal_landing::filter_landed_wal(
+                &shadow_data_dir.join("pg_wal"),
+                outcome.start.timeline,
+                outcome.end.end_lsn,
+                landing_tracker.take().expect("landed WAL filtered once"),
+                staged_rels.clone(),
+            )
+            .await
+            .context("bootstrap: filter landed WAL")?;
+            tracing::info!(
+                target: "walshadow::bootstrap",
+                segments = landed.segments,
+                segments_blanked = landed.segments_blanked,
+                kept = landed.kept,
+                dropped = landed.dropped,
+                dropped_bytes = landed.dropped_bytes,
+                "landed WAL filtered",
+            );
+        }
+
+        if shadow_toast {
+            if let Some(staging) = &toast_staging
+                && let Some(db_oid) = staged_db_oid
+            {
+                let (files, bytes) = walshadow::backfill::toast_staging::install_into(
+                    staging,
+                    &shadow_data_dir,
+                    db_oid,
+                )
+                .await
+                .context("bootstrap: install staged TOAST into shadow")?;
+                tracing::info!(
+                    target: "walshadow::bootstrap",
+                    files,
+                    bytes,
+                    db_oid,
+                    "installed staged TOAST heaps into shadow",
+                );
+            }
+
+            // PG refuses a data dir whose mode is not 0700 or 0750
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                tokio::fs::set_permissions(&shadow_data_dir, fs::Permissions::from_mode(0o700))
+                    .await
+                    .with_context(|| {
+                        format!("bootstrap: chmod 0700 {}", shadow_data_dir.display())
+                    })?;
+            }
+            let started = Arc::new(build_owned_shadow(
+                args,
+                &src_cfg.database,
+                shadow_data_dir.clone(),
+                bridge_workers,
+            ));
+            started
+                .write_standby_signal()
+                .context("bootstrap: write standby.signal")?;
+            // Reaches `end_lsn` out of its own pg_wal, no walsender needed
+            walshadow::ops::stages::SHADOW_REPLAY
+                .measure(start_owned_shadow(
+                    &started,
+                    Some(outcome.end.end_lsn),
+                    Duration::from_secs(args.bootstrap_shadow_replay_timeout),
+                ))
+                .await
+                .context("bootstrap: start shadow to serve TOAST values")?;
+            running_shadow = Some(started);
+            let bridge = walshadow::bridge::connect_with_budget(
+                &args.bridge_socket_path(),
+                bridge_workers,
+                Duration::from_secs(args.shadow_connect_timeout),
+            )
+            .await
+            .context("bootstrap: dial shadow bridge for TOAST values")?;
+            shadow_toast_bridge
+                .set(Arc::new(bridge))
+                .ok()
+                .context("bootstrap: shadow TOAST bridge bound twice")?;
+        }
+
+        // Deferred referrers resolve out of the value store, so every window
         // record has to be in it first. A live leg joined above; a leg over
         // the WAL the backup landed replays here, before the tails close
         if let Some(mut cfg) = window_cfg {
             cfg.timeline = outcome.start.timeline;
             let replayed = async {
-                if let Some((settings, storage)) = wal_hydrate.take() {
-                    fetch_wal_into_pg_wal(
-                        &settings,
-                        storage,
-                        &shadow_data_dir,
-                        outcome.start.start_lsn,
-                        outcome.end.end_lsn,
-                        outcome.start.timeline,
-                    )
-                    .await
-                    .context("bootstrap: hydrate shadow pg_wal from object store")?;
-                }
                 let segments = walshadow::backfill::bootstrap_window::segments_in_dir(
-                    &shadow_data_dir.join("pg_wal"),
+                    &window_wal,
                     outcome.start.timeline,
                     outcome.start.start_lsn,
                     outcome.end.end_lsn,
@@ -5186,24 +5475,29 @@ async fn run_bootstrap(
     }
     tokio::fs::remove_dir_all(&window_scratch).await.ok();
 
-    // The backup's WAL landed raw; rewrite before the shadow's recovery sees it
-    let landed = walshadow::backfill::wal_landing::filter_landed_wal(
-        &shadow_data_dir.join("pg_wal"),
-        outcome.start.timeline,
-        outcome.end.end_lsn,
-        landing_tracker,
-    )
-    .await
-    .context("bootstrap: filter landed WAL")?;
-    tracing::info!(
-        target: "walshadow::bootstrap",
-        segments = landed.segments,
-        segments_blanked = landed.segments_blanked,
-        kept = landed.kept,
-        dropped = landed.dropped,
-        dropped_bytes = landed.dropped_bytes,
-        "landed WAL filtered",
-    );
+    // The backup's WAL landed raw; rewrite before the shadow's recovery sees
+    // it. After the window leg, which reads these same segments — the shadow
+    // backend filters earlier and gives its leg a copy instead
+    if let Some(tracker) = landing_tracker.take() {
+        let landed = walshadow::backfill::wal_landing::filter_landed_wal(
+            &shadow_data_dir.join("pg_wal"),
+            outcome.start.timeline,
+            outcome.end.end_lsn,
+            tracker,
+            ahash::HashSet::default(),
+        )
+        .await
+        .context("bootstrap: filter landed WAL")?;
+        tracing::info!(
+            target: "walshadow::bootstrap",
+            segments = landed.segments,
+            segments_blanked = landed.segments_blanked,
+            kept = landed.kept,
+            dropped = landed.dropped,
+            dropped_bytes = landed.dropped_bytes,
+            "landed WAL filtered",
+        );
+    }
 
     // Resolve deferred tuples after window transaction overlay is complete
     if let Some(pending) = pending_gate {
@@ -5250,6 +5544,9 @@ async fn run_bootstrap(
             .with_context(|| format!("bootstrap: chmod 0700 {}", shadow_data_dir.display()))?;
     }
 
+    if let Some(staging) = &toast_staging {
+        tokio::fs::remove_dir_all(staging.root()).await.ok();
+    }
     bootstrap_marker::ExtractedCheckpoint::clear(&shadow_data_dir).await?;
     BootstrapMarker::clear(&shadow_data_dir).await?;
 
@@ -5258,6 +5555,15 @@ async fn run_bootstrap(
         BootstrapHandoff {
             end_lsn: outcome.end.end_lsn,
             open_floor,
+            // Recomputed rather than threaded out of the inner scope: a
+            // directory listing, and the tree is unchanged since
+            shadow: running_shadow.clone(),
+            toast_rels: match &toast_staging {
+                Some(staging) => walshadow::backfill::toast_staging::staged_filenodes(staging)
+                    .await
+                    .context("bootstrap: list staged TOAST relations")?,
+                None => ahash::HashSet::default(),
+            },
         },
         BootstrapMetrics {
             progress,
@@ -5291,6 +5597,14 @@ struct BootstrapHandoff {
     end_lsn: u64,
     /// Earliest record among transactions open at window seal
     open_floor: Option<u64>,
+    /// Shadow-TOAST: relations whose TOAST files bootstrap installed into
+    /// shadow. Live streaming keeps exactly these current, rather than every
+    /// user relation
+    toast_rels: ahash::HashSet<(u32, u32)>,
+    /// Shadow-TOAST: bootstrap had to start shadow to resolve values out of
+    /// it, so it hands the running instance on rather than leaving `run` to
+    /// start a second one against the same data dir
+    shadow: Option<Arc<Shadow>>,
 }
 
 impl BootstrapHandoff {
@@ -6324,18 +6638,24 @@ mod tests {
         let crossing = BootstrapHandoff {
             end_lsn: 0x3000,
             open_floor: Some(0x1000),
+            toast_rels: ahash::HashSet::default(),
+            shadow: None,
         };
         assert_eq!(crossing.resume_lsn(), 0x1000);
 
         let clean = BootstrapHandoff {
             end_lsn: 0x3000,
             open_floor: None,
+            toast_rels: ahash::HashSet::default(),
+            shadow: None,
         };
         assert_eq!(clean.resume_lsn(), 0x3000);
         assert_eq!(
             BootstrapHandoff {
                 end_lsn: 0x3000,
-                open_floor: Some(0x4000)
+                open_floor: Some(0x4000),
+                toast_rels: ahash::HashSet::default(),
+                shadow: None,
             }
             .resume_lsn(),
             0x3000

@@ -21,7 +21,7 @@ use tokio::net::UnixStream;
 use tokio::sync::Mutex;
 
 /// Frame and op layouts. Must equal `WS_PROTO_VERSION` in `pgext/walshadow.h`
-pub const PROTO_VERSION: u32 = 3;
+pub const PROTO_VERSION: u32 = 4;
 /// Catalog column plans. Must equal `WS_PROJECTION_VERSION`
 pub const PROJECTION_VERSION: u32 = 1;
 
@@ -38,6 +38,9 @@ const MAX_RESPONSE_BYTES: usize = 256 * 1024 * 1024;
 pub const MAX_SCAN_OIDS: usize = 65536;
 /// Matches `WS_MAX_WORKERS`, the ceiling on `walshadow.bridge_workers`
 pub const MAX_BRIDGE_WORKERS: usize = 8;
+/// Matches `WS_MAX_FETCH_VALUES`. Only the caller knows which values share a
+/// replay bound, so splitting a longer list is its call
+pub const MAX_FETCH_VALUES: usize = 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -46,9 +49,16 @@ pub enum Op {
     EncodeNative = 0x02,
     Scan = 0x03,
     ReplayLsn = 0x04,
+    FetchToast = 0x05,
 }
 
-pub const OP_LABELS: [&str; 4] = ["hello", "encode_native", "scan", "replay_lsn"];
+pub const OP_LABELS: [&str; 5] = [
+    "hello",
+    "encode_native",
+    "scan",
+    "replay_lsn",
+    "fetch_toast",
+];
 pub const OP_COUNT: usize = OP_LABELS.len();
 
 impl Op {
@@ -99,6 +109,38 @@ impl Catalog {
             Catalog::Namespace | Catalog::Type => 2,
         }
     }
+}
+
+/// Visibility a [`Bridge::fetch_toast`] reads with. `Toast` is what PG's own
+/// detoast uses and ignores xmax, so a value whose referring row version is
+/// dead stays readable until pruning removes the chunks. `Any` is wider and
+/// exists to expose generations `Toast` hides, not for production reads
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ToastSnapshot {
+    Toast = 0,
+    Any = 1,
+}
+
+/// One value's chunk run, parallel to the request's value list
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FetchedChunks {
+    /// Stored bytes, seq-dense from 0 and totalling the expected size
+    Stored(Vec<u8>),
+    /// No chunk under the id
+    Missing,
+    /// Gapped, repeated across generations, or a different total than the
+    /// pointer's stored size. `got` is how far the run got
+    Mismatch { got: usize },
+}
+
+pub struct ToastFetch {
+    /// Replay position sampled before and after the read. A destructive
+    /// record replayed between them is what would make a run stale, so both
+    /// travel and the caller compares
+    pub replay_lsn_start: u64,
+    pub replay_lsn_end: u64,
+    pub values: Vec<FetchedChunks>,
 }
 
 #[derive(Debug, Error)]
@@ -379,6 +421,71 @@ impl Bridge {
     pub async fn replay_lsn(&self) -> Result<u64, BridgeError> {
         let body = self.call(Op::ReplayLsn, request_frame(0)).await?;
         Cursor::at(&body, 1).u64()
+    }
+
+    /// Read stored TOAST chunk runs out of shadow's physical heaps, one
+    /// round trip per call. `values` is `(value_id, expected stored size)`
+    /// against one toast relation, ids unique.
+    ///
+    /// `min_replay_lsn` is a floor, not the equality [`scan_at`](Self::scan_at)
+    /// asserts: a value's chunks are written below the record that refers to
+    /// them, so replay only has to have reached the referrer. Bytes come back
+    /// **stored** — still compressed when the pointer says so — because the
+    /// daemon owns pglz/lz4 and the `va_tcinfo` prefix
+    pub async fn fetch_toast(
+        &self,
+        toast_relid: u32,
+        values: &[(u32, usize)],
+        min_replay_lsn: u64,
+        snapshot: ToastSnapshot,
+    ) -> Result<ToastFetch, BridgeError> {
+        if values.is_empty() || values.len() > MAX_FETCH_VALUES {
+            return Err(BridgeError::Protocol(format!(
+                "toast fetch of {} values, want 1..{MAX_FETCH_VALUES}",
+                values.len()
+            )));
+        }
+        let mut frame = request_frame(17 + values.len() * 8);
+        frame.extend_from_slice(&min_replay_lsn.to_be_bytes());
+        frame.extend_from_slice(&toast_relid.to_be_bytes());
+        frame.push(snapshot as u8);
+        frame.extend_from_slice(&(values.len() as u32).to_be_bytes());
+        for &(id, expected) in values {
+            frame.extend_from_slice(&id.to_be_bytes());
+            frame.extend_from_slice(&(expected as u32).to_be_bytes());
+        }
+
+        let body = self.call(Op::FetchToast, frame).await?;
+        let mut c = Cursor::at(&body, 1);
+        let replay_lsn_start = c.u64()?;
+        let replay_lsn_end = c.u64()?;
+        let n = c.u32()? as usize;
+        if n != values.len() {
+            return Err(BridgeError::Protocol(format!(
+                "toast fetch answered {n} values for {} asked",
+                values.len()
+            )));
+        }
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            let tag = c.u8()?;
+            let len = c.u32()? as usize;
+            out.push(match tag {
+                0 => FetchedChunks::Stored(c.take(len)?.to_vec()),
+                1 => FetchedChunks::Missing,
+                2 => FetchedChunks::Mismatch { got: len },
+                other => {
+                    return Err(BridgeError::Protocol(format!(
+                        "toast fetch result tag {other}"
+                    )));
+                }
+            });
+        }
+        Ok(ToastFetch {
+            replay_lsn_start,
+            replay_lsn_end,
+            values: out,
+        })
     }
 
     /// Return response remainder as one locally framed Native block.

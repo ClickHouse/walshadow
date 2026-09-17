@@ -59,6 +59,12 @@ pub enum ChunkStoreError {
     /// Body spool read at row materialization
     #[error("toast store io: {0}")]
     Io(#[from] std::io::Error),
+    /// Shadow-backed read: bridge transport, or the worker refusing
+    #[error("toast store shadow: {0}")]
+    Shadow(String),
+    /// Shadow holds the values, so it has nowhere to put a decoded chunk
+    #[error("toast store shadow is read-only, refused {0}")]
+    ReadOnly(&'static str),
 }
 
 #[derive(Debug, Error)]
@@ -361,6 +367,12 @@ impl ChunkAssembler {
 /// Durable TID-keyed chunk store
 #[async_trait]
 pub trait ChunkStore: Send + Sync {
+    /// Whether this backend accepts decoded chunk rows. A backend that holds
+    /// the values physically has nowhere to put them, and callers must stop
+    /// collecting rather than call `put` and take the error
+    fn accepts_writes(&self) -> bool {
+        true
+    }
     /// Replay emits byte-identical rows at equal key and version
     async fn put(&self, rows: &[ToastRow]) -> Result<(), ChunkStoreError>;
     /// Assemble newest live row per sequence at `max_lsn` against the
@@ -1020,9 +1032,47 @@ impl ToastResolver {
         }
     }
 
+    /// ClickHouse-mirror resolver, whatever `[toast] backend` says. Callers
+    /// that can honour the setting use [`Self::for_backend`]
     pub fn from_config(emitter: &EmitterConfig, stats: Arc<EmitterStats>) -> Self {
+        Self::with_limits(
+            Arc::new(ClickHouseChunkStore::new(emitter.clone())),
+            emitter,
+            stats,
+        )
+    }
+
+    /// Resolver for `emitter`'s configured backend. The shadow backend reads
+    /// through `bridge` and needs one; passing `None` for it is a
+    /// configuration error rather than a silent fall back to the mirror,
+    /// because the two backends hold different history
+    pub fn for_backend(
+        emitter: &EmitterConfig,
+        stats: Arc<EmitterStats>,
+        bridge: Option<Arc<crate::ops::bridge::Bridge>>,
+    ) -> Result<Self, String> {
+        if !emitter.toast.backend.is_shadow() {
+            return Ok(Self::from_config(emitter, stats));
+        }
+        let bridge = bridge.ok_or_else(|| {
+            "[toast] backend = \"shadow\" needs the pgext bridge; \
+             pass --bridge-lib-dir and let walshadow manage shadow"
+                .to_string()
+        })?;
+        Ok(Self::with_limits(
+            Arc::new(crate::toast::shadow_store::ShadowToastStore::new(bridge)),
+            emitter,
+            stats,
+        ))
+    }
+
+    fn with_limits(
+        store: Arc<dyn ChunkStore>,
+        emitter: &EmitterConfig,
+        stats: Arc<EmitterStats>,
+    ) -> Self {
         Self {
-            store: Some(Arc::new(ClickHouseChunkStore::new(emitter.clone()))),
+            store: Some(store),
             stats,
             put_batch_rows: emitter
                 .toast
@@ -1074,8 +1124,11 @@ impl ToastResolver {
         self.budget.as_ref()
     }
 
+    /// Whether anything should collect chunk rows for this resolver. False
+    /// without a store, and false for a read-only backend: a store that holds
+    /// the values already needs no mirror of them
     pub fn stores_chunks(&self) -> bool {
-        self.store.is_some()
+        self.store.as_ref().is_some_and(|s| s.accepts_writes())
     }
 
     pub fn put_limit_reached(&self, rows: usize, bytes: usize) -> bool {
@@ -1642,6 +1695,110 @@ mod tests {
         assert!(tomb.is_tombstone() && tomb.chunk_data.is_empty());
         // File body without spool is an error, not a panic
         assert!(refs[1].materialize(None).is_err());
+    }
+
+    /// A read-only backend keeps `fill_on_miss` false — a store exists, so a
+    /// miss is evidence, not licence to default-fill — while `stores_chunks`
+    /// goes false so nothing collects rows it cannot accept
+    #[tokio::test(flavor = "current_thread")]
+    async fn read_only_store_reads_without_accepting_writes() {
+        struct ReadOnly(MemChunkStore);
+
+        #[async_trait]
+        impl ChunkStore for ReadOnly {
+            fn accepts_writes(&self) -> bool {
+                false
+            }
+            async fn put(&self, _rows: &[ToastRow]) -> Result<(), ChunkStoreError> {
+                Err(ChunkStoreError::ReadOnly("put"))
+            }
+            async fn fetch(
+                &self,
+                relid: u32,
+                id: u32,
+                max_lsn: u64,
+                expected: usize,
+            ) -> Result<FetchedValue, ChunkStoreError> {
+                self.0.fetch(relid, id, max_lsn, expected).await
+            }
+            async fn truncate_mirror(&self, _relid: u32) -> Result<(), ChunkStoreError> {
+                Err(ChunkStoreError::ReadOnly("truncate_mirror"))
+            }
+            async fn rewrite_barrier(
+                &self,
+                _relid: u32,
+                _marker: u64,
+                _commit: u64,
+            ) -> Result<(), ChunkStoreError> {
+                Err(ChunkStoreError::ReadOnly("rewrite_barrier"))
+            }
+        }
+
+        let inner = MemChunkStore::new();
+        inner
+            .put(&[ToastRow {
+                toast_relid: 16500,
+                blkno: 1,
+                offnum: 1,
+                chunk_id: 7,
+                chunk_seq: 0,
+                chunk_data: Bytes::from_static(b"body"),
+                lsn: 0x1000,
+            }])
+            .await
+            .unwrap();
+
+        let r = ToastResolver::with_store(
+            Arc::new(ReadOnly(inner)),
+            Arc::new(EmitterStats::default()),
+        );
+        assert!(!r.stores_chunks(), "nothing should collect rows for it");
+        assert!(!r.fill_on_miss(), "a miss still has to be explained");
+        assert_eq!(
+            r.fetch_value(16500, 7, u64::MAX, 4).await.unwrap(),
+            Some(assembled(b"body")),
+        );
+        // The write surface refuses rather than silently dropping rows
+        assert!(r.put(&[ToastRow {
+            toast_relid: 16500,
+            blkno: 2,
+            offnum: 1,
+            chunk_id: 8,
+            chunk_seq: 0,
+            chunk_data: Bytes::from_static(b"x"),
+            lsn: 0x2000,
+        }])
+        .await
+        .is_err());
+        assert!(r.truncate_mirror(16500).await.is_err());
+        assert!(r.rewrite_barrier(16500, 1, 2).await.is_err());
+    }
+
+    /// `[toast] backend` picks the store, and the shadow one is unavailable
+    /// without the bridge it reads through
+    #[test]
+    fn for_backend_honours_the_setting() {
+        let stats = || Arc::new(EmitterStats::default());
+        let ch = EmitterConfig::from_toml_str("[toast]\nbackend = \"clickhouse\"\n").unwrap();
+        assert!(!ch.toast.backend.is_shadow());
+        let r = ToastResolver::for_backend(&ch, stats(), None).expect("clickhouse needs no bridge");
+        assert!(r.stores_chunks(), "the mirror takes writes");
+
+        let default = EmitterConfig::from_toml_str("").unwrap();
+        assert_eq!(default.toast.backend, crate::emit::ch_emitter::ToastBackend::Clickhouse);
+
+        let shadow = EmitterConfig::from_toml_str("[toast]\nbackend = \"shadow\"\n").unwrap();
+        assert!(shadow.toast.backend.is_shadow());
+        let err = match ToastResolver::for_backend(&shadow, stats(), None) {
+            Err(e) => e,
+            Ok(_) => panic!("shadow without a bridge must be a config error"),
+        };
+        assert!(err.contains("bridge"), "{err}");
+
+        assert!(
+            EmitterConfig::from_toml_str("[toast]\nbackend = \"elsewhere\"\n").is_err(),
+            "an unknown backend must not fall back to the mirror",
+        );
     }
 
     /// Oversized under a tiny budget: overshoots and stores, never an

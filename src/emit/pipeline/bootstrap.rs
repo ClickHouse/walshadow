@@ -202,7 +202,11 @@ pub async fn drain(
             let mut tuple = tuple;
             let mut permit = None;
             if tuple.has_mapped_external(&route.mapping) {
-                if resolver.stores_chunks() {
+                // A store owes this value, so it cannot be rendered here: the
+                // mirror has not been written yet on this pass, and a
+                // shadow-backed read has nothing serving it until the walk is
+                // done. Only a resolver with no store at all fills inline
+                if !resolver.fill_on_miss() {
                     let spool = deferred.as_mut().ok_or_else(|| {
                         format!("bootstrap: undeferrable external value in {}", rel.rel_name)
                     })?;
@@ -667,8 +671,23 @@ fn apply_fetched(
             resolver.note_filled_default();
             Ok((ColumnValue::Null, 0))
         }
-        // No superseding version can precede deferred resolution: the
-        // walk put these chunks moments earlier, a miss is a bug
+        // A miss means different things depending on who filled the store.
+        //
+        // When the walk seeded it, the walk put these chunks moments earlier
+        // and no superseding version can precede deferred resolution, so a
+        // miss is a bug and reporting it is the only safe move.
+        //
+        // A read-only backend was seeded by nothing: it holds the state at
+        // the backup's end position, and a value the copy still carried can
+        // legitimately be gone there because a later record removed it. That
+        // is provably supersession rather than loss — PostgreSQL cannot
+        // reclaim a live row's chunks, so the value being absent at the end
+        // position means the row is not live there, and every walk row
+        // carries `start_lsn`, which any later version outranks
+        Some(_) if !resolver.stores_chunks() => {
+            resolver.note_filled_superseded();
+            Ok((ColumnValue::Null, 0))
+        }
         Some(outcome) => {
             resolver.note_fetch_miss();
             let extsize = pointer_extsize(p);
@@ -772,6 +791,82 @@ mod tests {
     }
 
     use super::*;
+
+    /// A miss means opposite things depending on who seeded the store, and
+    /// the two must not converge: a walk-seeded mirror losing a chunk it just
+    /// wrote is a bug worth stopping the load for, while a read-only backend
+    /// not holding a value at the backup's end position is supersession — the
+    /// row cannot be live there, because PostgreSQL does not reclaim a live
+    /// row's chunks, and the walk's copy carries `start_lsn` for any later
+    /// version to outrank
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_miss_is_fatal_for_a_seeded_mirror_and_superseded_for_a_read_only_store() {
+        use crate::toast::{ChunkStore, ChunkStoreError, MemChunkStore, ToastRow};
+
+        struct ReadOnly;
+
+        #[async_trait::async_trait]
+        impl ChunkStore for ReadOnly {
+            fn accepts_writes(&self) -> bool {
+                false
+            }
+            async fn put(&self, _: &[ToastRow]) -> Result<(), ChunkStoreError> {
+                Err(ChunkStoreError::ReadOnly("put"))
+            }
+            async fn fetch(
+                &self,
+                _: u32,
+                _: u32,
+                _: u64,
+                _: usize,
+            ) -> Result<FetchedValue, ChunkStoreError> {
+                // Short run: the value is not in the end-position state
+                Ok(FetchedValue::Mismatch { got: 7984 })
+            }
+            async fn truncate_mirror(&self, _: u32) -> Result<(), ChunkStoreError> {
+                Err(ChunkStoreError::ReadOnly("truncate_mirror"))
+            }
+            async fn rewrite_barrier(&self, _: u32, _: u64, _: u64) -> Result<(), ChunkStoreError> {
+                Err(ChunkStoreError::ReadOnly("rewrite_barrier"))
+            }
+        }
+
+        let ptr = crate::decode::heap_decoder::ToastPointer {
+            va_rawsize: 9104,
+            va_extinfo: 9100,
+            va_valueid: 16402,
+            va_toastrelid: 16390,
+        };
+        let rel = crate::backfill::backup_page_walk::toast_chunk_rel();
+        let short = Some(FetchedValue::Mismatch { got: 7984 });
+
+        // Walk-seeded: the chunks were put moments ago, so this is a defect
+        let seeded = ToastResolver::with_store(
+            Arc::new(MemChunkStore::new()),
+            Arc::new(EmitterStats::default()),
+        );
+        assert!(seeded.stores_chunks());
+        let err = apply_fetched(short.clone(), &ptr, 25, &rel, "body", &seeded)
+            .expect_err("a seeded mirror losing its own chunk must stop the load");
+        assert!(err.contains("chunks sum to 7984 bytes, pointer says 9100"), "{err}");
+        assert_eq!(seeded.stats_handle().toast_fetch_miss.load(Ordering::Relaxed), 1);
+
+        // Read-only: nothing seeded it, so the row is not live at the end
+        // position and a later version supersedes the walk's copy
+        let stats = Arc::new(EmitterStats::default());
+        let read_only = ToastResolver::with_store(Arc::new(ReadOnly), stats.clone());
+        assert!(!read_only.stores_chunks() && !read_only.fill_on_miss());
+        let (column, retained) = apply_fetched(short, &ptr, 25, &rel, "body", &read_only)
+            .expect("a read-only backend fills instead of failing the load");
+        assert_eq!(column, ColumnValue::Null);
+        assert_eq!(retained, 0);
+        assert_eq!(stats.toast_values_filled_superseded.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            stats.toast_fetch_miss.load(Ordering::Relaxed),
+            0,
+            "not counted as a miss: it is the expected answer, not a fault",
+        );
+    }
     use crate::backfill::spool::DEFERRED_SPOOL_MEM_MAX;
     use crate::mapping::{ColumnMapping, TableMapping, TableTarget};
 

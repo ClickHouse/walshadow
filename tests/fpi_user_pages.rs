@@ -110,6 +110,10 @@ impl ImageCensus {
                 (true, Route::ToDecoder) => self.user_images_dropped += 1,
                 (false, Route::ToShadow) => self.catalog_images_to_shadow += 1,
                 (false, Route::ToDecoder) => self.catalog_images_dropped += 1,
+                // Shadow-TOAST routes user pages deliberately; this census
+                // measures the accidental leak, so it is not that
+                (true, Route::ToBoth) => self.user_images_to_shadow += 1,
+                (false, Route::ToBoth) => self.catalog_images_to_shadow += 1,
             }
         }
     }

@@ -44,6 +44,10 @@ pub async fn filter_landed_wal(
     timeline: u32,
     end_lsn: u64,
     tracker: CatalogTracker,
+    // Shadow-TOAST: relations whose records shadow has to replay, because it
+    // serves their values after handoff. Their files were staged, so redo has
+    // something to write into
+    keep_rels: ahash::HashSet<(u32, u32)>,
 ) -> Result<LandedWalStats> {
     let segments = segments_on_disk(pg_wal, timeline).await?;
     let in_window = segments
@@ -57,6 +61,7 @@ pub async fn filter_landed_wal(
     let mut stream = WalStream::new(timeline, WAL_SEG_SIZE, first.start_lsn(WAL_SEG_SIZE))
         .map_err(|e| anyhow::anyhow!("wal_landing: WalStream: {e}"))?;
     *stream.filter_mut().tracker_mut() = tracker;
+    stream.filter_mut().keep_user_rels(keep_rels);
 
     let mut records = DropRecords;
     let mut writer = WriteBack {
@@ -215,6 +220,41 @@ impl SegmentSink for WriteBack {
     }
 }
 
+/// Copy the in-window segments out of `pg_wal` into `dir`.
+///
+/// The backup-window replay leg needs these bytes as the source wrote them,
+/// but [`filter_landed_wal`] rewrites `pg_wal` in place and has to run before
+/// any recovery sees it. Under the shadow value backend that recovery starts
+/// *during* bootstrap, because shadow is what answers the leg's own value
+/// lookups — so the leg reads a copy instead of the original.
+pub async fn copy_window_segments(
+    pg_wal: &Path,
+    dir: &Path,
+    timeline: u32,
+    from_lsn: u64,
+    end_lsn: u64,
+) -> Result<u64> {
+    tokio::fs::create_dir_all(dir)
+        .await
+        .with_context(|| format!("create {}", dir.display()))?;
+    let mut copied = 0u64;
+    for seg in segments_on_disk(pg_wal, timeline).await? {
+        if seg.start_lsn(WAL_SEG_SIZE) >= end_lsn {
+            break;
+        }
+        // The leg reads from a segment boundary at or below its floor
+        if seg.start_lsn(WAL_SEG_SIZE) + WAL_SEG_SIZE <= from_lsn {
+            continue;
+        }
+        let name = seg.format();
+        tokio::fs::copy(pg_wal.join(&name), dir.join(&name))
+            .await
+            .with_context(|| format!("copy WAL segment {name}"))?;
+        copied += 1;
+    }
+    Ok(copied)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -282,6 +322,7 @@ mod tests {
             1,
             WAL_SEG_SIZE,
             CatalogTracker::new(),
+            ahash::HashSet::default(),
         )
         .await
         .unwrap();

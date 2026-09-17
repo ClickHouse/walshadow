@@ -1021,6 +1021,60 @@ async fn bridge_error_frames_stay_parseable() {
     assert_eq!(bridge.replay_lsn().await.expect("still serving"), 0);
 }
 
+/// `FETCH_TOAST` request validation, reached by hand because the typed client
+/// refuses these before the socket sees them
+#[tokio::test(flavor = "current_thread")]
+async fn bridge_fetch_toast_refuses_malformed_frames() {
+    if !pg_available() {
+        eprintln!("skip: no initdb on PATH");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let guard = start_pg(&tmp, ports::reserve_port());
+    let path = guard.sh.bridge_socket().unwrap().to_path_buf();
+    let mut raw = UnixStream::connect(&path).expect("raw connect");
+
+    // `[op][min_replay_lsn:u64][toast_relid:u32][snapshot:u8][nvalues:u32]`
+    // then `[value_id:u32][expected:u32]` per value
+    let frame = |snapmode: u8, nvalues: u32, values: &[(u32, u32)]| {
+        let mut body = vec![0x05u8];
+        body.extend_from_slice(&0u64.to_be_bytes());
+        body.extend_from_slice(&1u32.to_be_bytes());
+        body.push(snapmode);
+        body.extend_from_slice(&nvalues.to_be_bytes());
+        for (id, expected) in values {
+            body.extend_from_slice(&id.to_be_bytes());
+            body.extend_from_slice(&expected.to_be_bytes());
+        }
+        let mut out = (body.len() as u32).to_be_bytes().to_vec();
+        out.extend_from_slice(&body);
+        out
+    };
+
+    for (snapmode, nvalues, values, want) in [
+        (0u8, 0u32, &[][..], "want 1.."),
+        (
+            0,
+            walshadow::bridge::MAX_FETCH_VALUES as u32 + 1,
+            &[][..],
+            "want 1..",
+        ),
+        (0xff, 1, &[(1u32, 8u32)][..], "snapshot mode"),
+        // Declared sizes over the response cap are refused before any read
+        (0, 2, &[(1, u32::MAX / 2), (2, u32::MAX / 2)][..], "over the"),
+    ] {
+        raw.write_all(&frame(snapmode, nvalues, values))
+            .expect("write");
+        let msg = parse_error_frame(&read_frame(&mut raw));
+        assert!(msg.contains(want), "mode {snapmode} n {nvalues}: {msg}");
+    }
+
+    // The connection still serves after each refusal
+    raw.write_all(&1u32.to_be_bytes()).expect("write header");
+    raw.write_all(&[0x04]).expect("write replay_lsn");
+    assert_eq!(read_frame(&mut raw)[0], 0);
+}
+
 /// Worker stand-in that answers `HELLO` honestly and then reports a replay
 /// position that moved inside the scan. Real movement wants a live standby
 /// mid-stream; the daemon-side branch is the same either way.

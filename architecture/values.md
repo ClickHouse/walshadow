@@ -44,6 +44,17 @@ Conversion failure stops batch with column and row context. Module pins output
 settings to make conversion reproducible. Greenfield bootstrap uses a temporary
 PostgreSQL instance because managed shadow is not ready yet
 
+## Alternative value backend
+
+`[toast] backend = "shadow"` reads external values out of PostgreSQL's own
+TOAST heaps rather than a mirror, writing no chunks. The source's files are
+landed into shadow's data dir, and shadow is started during bootstrap so it
+reaches the backup's end position by ordinary recovery — which is what holds
+values written *during* the backup, whose chunks no file copy contains. Limits
+in
+[large values](../docs/limitations.md#shadow-value-backend); design in
+[shadow TOAST plan](../plans/shadow_toast.md)
+
 ## Implementation
 
 Start in [TOAST resolver](../src/toast/resolver.rs),
