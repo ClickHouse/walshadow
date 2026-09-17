@@ -23,6 +23,10 @@ RUN apk add --no-cache \
         lz4-dev \
         zstd-dev
 ENV RUSTFLAGS="-C target-feature=-crt-static"
+# musl-dev ships its own <stddef.h> ahead of gcc's and omits C23
+# unreachable(), which clickhouse-c uses under C23. cc-rs appends CFLAGS
+# after its own -std, so the polyfill reaches every C unit it compiles.
+ENV CFLAGS="-Dunreachable()=__builtin_unreachable()"
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY bench ./bench
@@ -44,8 +48,11 @@ WORKDIR /src
 COPY pgext ./pgext
 # with_llvm=no: skip the JIT bitcode step (image's PGXS hardcodes clang-19,
 # absent here); the .so itself is complete and JIT-independent.
+# COPT: same musl C23 gap as rust-builder, reached here because gcc 15
+# defaults to gnu23 and PGXS passes no -std.
 RUN make -C pgext clean \
-    && make -C pgext with_llvm=no PG_CONFIG=/usr/local/bin/pg_config
+    && make -C pgext with_llvm=no PG_CONFIG=/usr/local/bin/pg_config \
+        COPT="-D'unreachable()=__builtin_unreachable()'"
 
 
 FROM postgres:${PG_MAJOR}-alpine AS runtime
