@@ -3052,6 +3052,7 @@ dependencies = [
  "postgres-protocol",
  "prometheus-client",
  "regex-automata",
+ "roaring",
  "serde",
  "serde_json",
  "smallvec",

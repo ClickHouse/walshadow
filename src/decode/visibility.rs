@@ -15,8 +15,9 @@
 
 use std::path::{Path, PathBuf};
 
-use ahash::{HashMap, HashSet};
+use ahash::HashMap;
 use anyhow::{Context, Result};
+use roaring::RoaringBitmap;
 
 // t_infomask bits, PG src/include/access/htup_details.h
 pub const HEAP_XMAX_KEYSHR_LOCK: u16 = 0x0010;
@@ -292,10 +293,13 @@ impl PgMultiXactAccum {
 
 /// Commit/abort outcomes harvested from gap-WAL xact records (top xid +
 /// subxids), overlaying backup pg_xact.
+///
+/// RoaringBitmaps as a long bootstrap holds every xid source assigned,
+/// and those are a near-dense ascending range.
 #[derive(Debug, Default)]
 pub struct PgXactPatch {
-    committed: HashSet<u32>,
-    aborted: HashSet<u32>,
+    committed: RoaringBitmap,
+    aborted: RoaringBitmap,
 }
 
 impl PgXactPatch {
@@ -313,8 +317,14 @@ impl PgXactPatch {
         self.aborted.extend(subxids);
     }
 
+    /// Run-length encode the ascending stretches once harvesting is done
+    pub fn seal(&mut self) {
+        self.committed.optimize();
+        self.aborted.optimize();
+    }
+
     pub fn len(&self) -> usize {
-        self.committed.len() + self.aborted.len()
+        self.committed.len() as usize + self.aborted.len() as usize
     }
 
     pub fn is_empty(&self) -> bool {
@@ -349,10 +359,10 @@ impl<'a> PgXactView<'a> {
             // Bootstrap / frozen xids are permanently committed
             return XidStatus::Committed;
         }
-        if self.patch.committed.contains(&xid) {
+        if self.patch.committed.contains(xid) {
             return XidStatus::Committed;
         }
-        if self.patch.aborted.contains(&xid) {
+        if self.patch.aborted.contains(xid) {
             return XidStatus::Aborted;
         }
         self.accum.status(xid)
