@@ -2,7 +2,7 @@
 //!
 //! | event | CH SQL |
 //! |---|---|
-//! | `Added` | `CREATE TABLE IF NOT EXISTS …` (namespace `auto_create = true`; a mapped rel re-creates its dest when strategy = drop) |
+//! | `Added` | `CREATE TABLE IF NOT EXISTS …` (namespace `auto_create = true`; a mapped rel re-creates its dest when strategy = drop, then `ALTER TABLE … ADD COLUMN IF NOT EXISTS …` per mapped column so a dest predating the mapping gains columns routed since) |
 //! | `Changed.added_columns` | `ALTER TABLE … ADD COLUMN IF NOT EXISTS …` per column in attnum order |
 //! | `Changed.renamed_columns` | `ALTER TABLE … RENAME COLUMN IF EXISTS … TO …` first |
 //! | `Changed.dropped_columns` | `ALTER TABLE … DROP COLUMN IF EXISTS …` |
@@ -339,6 +339,11 @@ impl DdlApplicator {
                 render_create_table_from_mapping(desc, &m, &self.config.create_shape(&settings));
             self.execute(&sql).await?;
             self.stats.creates_applied += 1;
+            // Dest that outlived an older mapping lacks columns routed since
+            if let Some(sql) = render_add_mapped_columns(&m) {
+                self.execute(&sql).await?;
+                self.stats.alters_applied += 1;
+            }
             return Ok(());
         }
         // Operator opt-out (`replicate=false`) beats namespace auto_create:
@@ -774,6 +779,28 @@ pub fn render_add_column(target: &str, name: &str, resolved: &ResolvedColumn) ->
     s
 }
 
+/// `ALTER TABLE <t> ADD COLUMN IF NOT EXISTS …` with one clause per routed
+/// column, `None` when the mapping routes nothing
+fn render_add_mapped_columns(mapping: &TableMapping) -> Option<String> {
+    if mapping.columns.is_empty() {
+        return None;
+    }
+    let clauses: Vec<String> = mapping
+        .columns
+        .iter()
+        .map(|c| format!("ADD COLUMN IF NOT EXISTS {}", mapped_col_def(c)))
+        .collect();
+    Some(format!(
+        "ALTER TABLE {} {}",
+        mapping.target.sql(),
+        clauses.join(", ")
+    ))
+}
+
+fn mapped_col_def(c: &ColumnMapping) -> String {
+    format!("{} {}", quote_ident(&c.target_name), c.target_type)
+}
+
 /// Pinned worker sends raw defaults to avoid `pg_type` locks during replay
 /// Resolve through shadow PG so rows predating `ADD COLUMN` read PG's fast default
 async fn resolve_disk_default<'a>(oracle: Option<&Oracle>, att: &'a RelAttr) -> Cow<'a, RelAttr> {
@@ -1014,11 +1041,7 @@ pub fn render_create_table_from_mapping(
     mapping: &TableMapping,
     shape: &CreateShape<'_>,
 ) -> String {
-    let col_defs: Vec<String> = mapping
-        .columns
-        .iter()
-        .map(|c| format!("{} {}", quote_ident(&c.target_name), c.target_type))
-        .collect();
+    let col_defs: Vec<String> = mapping.columns.iter().map(mapped_col_def).collect();
     let mut orderable: HashMap<&str, bool> = HashMap::default();
     orderable_system(&shape.system, &mut orderable);
     for c in &mapping.columns {
@@ -1314,6 +1337,33 @@ mod tests {
             sql,
             "ALTER TABLE default.t ADD COLUMN IF NOT EXISTS `c` String"
         );
+    }
+
+    #[test]
+    fn render_add_mapped_columns_reconciles_routed_shape() {
+        let mut mapping = TableMapping {
+            target: TableTarget::new("warehouse", "orders"),
+            columns: vec![
+                ColumnMapping {
+                    src_attnum: 1,
+                    target_name: "order_id".into(),
+                    target_type: "Int64".into(),
+                },
+                ColumnMapping {
+                    src_attnum: 2,
+                    target_name: "description".into(),
+                    target_type: "Nullable(String)".into(),
+                },
+            ],
+        };
+
+        assert_eq!(
+            render_add_mapped_columns(&mapping).unwrap(),
+            "ALTER TABLE `warehouse`.`orders` ADD COLUMN IF NOT EXISTS `order_id` Int64, \
+             ADD COLUMN IF NOT EXISTS `description` Nullable(String)"
+        );
+        mapping.columns.clear();
+        assert!(render_add_mapped_columns(&mapping).is_none());
     }
 
     #[test]
