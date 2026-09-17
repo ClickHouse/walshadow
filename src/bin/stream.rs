@@ -5098,7 +5098,8 @@ async fn run_bootstrap(
 
     // Resolve deferred tuples after window transaction overlay is complete
     if let Some(pending) = pending_gate {
-        let patch = std::mem::take(&mut *window_patch.lock().expect("window patch lock"));
+        let mut patch = std::mem::take(&mut *window_patch.lock().expect("window patch lock"));
+        patch.seal();
         let (gate, pending_tables) = resolve_greenfield(pending, &shadow_data_dir, &patch)
             .await
             .context("bootstrap: visibility gate")?;

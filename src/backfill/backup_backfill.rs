@@ -640,6 +640,7 @@ async fn prescan_gap(
              fresher backup, or use initial_load='copy'"
         );
     }
+    sink.patch.seal();
     Ok(sink.patch)
 }
 
