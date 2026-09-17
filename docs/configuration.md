@@ -234,6 +234,51 @@ ClickHouse. Choose it only when limits below are acceptable
 See [current limitations](limitations.md#shadow-value-mode) before enabling
 this mode
 
+### Value size cap
+
+`[memory] inline_value_max` (default 1 GiB) caps decoded size of one external
+value. walshadow does not fetch values over cap. By default, it writes NULL, or
+column type's default for a non-Nullable column, and increments
+`toast_values_filled_oversize`. Set `inline_value_overflow = "error"` to fail
+transaction instead
+
+```toml
+[memory]
+inline_value_max = 67108864
+inline_value_overflow = "error"
+```
+
+Both settings apply to initial load and WAL processing in every value mode
+
+### Memory budget
+
+`[memory] resident_payload_max` controls backpressure for payload bytes held
+while decoding and inserting rows. New work waits when budget is full. Default
+is one half of cgroup memory limit, or host memory without a cgroup limit, with
+a 512 MiB minimum. This default assumes a dedicated host or container. Set an
+explicit limit in shared environments
+
+Each decoder reserves `[memory] value_reserve` bytes (default 64 MiB) for value
+resolution. Other pipeline work cannot use this memory. Total reserved memory
+is `decoder_pool_size * value_reserve`
+
+`inline_value_max` rejects values; it does not contribute to reserved memory.
+A decode request larger than total reserved memory runs alone and may
+temporarily take payload use above `resident_payload_max`. Such requests
+increment `memory_budget_overshoots_total`; waits behind them increment
+`memory_budget_big_leaf_waits_total`. Raise `value_reserve` when these waits are
+common and more memory is available
+
+```toml
+[memory]
+resident_payload_max = 1073741824
+value_reserve = 67108864
+```
+
+Both settings apply at startup. Total reserved memory must fit within half of
+`resident_payload_max`, and remaining memory must hold one pending batch.
+walshadow rejects invalid combinations
+
 ## Backup archive
 
 Configure wal-g-compatible object storage for object-store bootstrap, WAL

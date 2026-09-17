@@ -27,12 +27,18 @@
 //!   allocations made *while holding* an admission permit — store-fetch
 //!   assembly, decompress output, body-spool read buffers, JIT mirror-row
 //!   materialization slices. The waited share clamps to the leaf reserve
-//!   (sized `decoder_pool.max(1) * inline_value_max` at pipeline spawn),
+//!   (sized `decoder_pool.max(1) * value_reserve` at pipeline spawn),
 //!   which admission never consumes, so leaf waiters only ever wait on
 //!   other leaf holders — those release at insert ack without acquiring,
 //!   never on an admission release, so no cycle exists. Pools built
 //!   without a reserve have no admission users (leaf-only pools, eg the
 //!   bootstrap tail) and clamp to the whole pool instead.
+//!
+//! ## Large values run one at a time
+//!
+//! Only reserve size counts against pool for larger values. A separate permit
+//! allows one such value at a time. Acquire it before memory permit to avoid
+//! deadlock. [`MemoryPermit::shrink`] returns it once retained bytes fit reserve.
 //!
 //! Acquisition order: one permit per owner; take admission before any
 //! leaf; never hold two leaves; transfer permits with the bytes they
@@ -56,6 +62,8 @@ struct Inner {
     /// Admission compartment, `total - leaf_reserve`; admission permits
     /// hold units here AND in `sem` (taken in that fixed order)
     admission: Semaphore,
+    /// Allows one value larger than `leaf_max`
+    big_leaf: Semaphore,
     total: usize,
     admission_max: usize,
     /// Waited-share clamp for leaf acquires: the reserve when one exists
@@ -65,6 +73,7 @@ struct Inner {
     peak: AtomicU64,
     waits: AtomicU64,
     overshoots: AtomicU64,
+    big_leaf_waits: AtomicU64,
 }
 
 /// Shared byte pool; clone hands out the same budget
@@ -86,6 +95,7 @@ impl MemoryBudget {
             inner: Arc::new(Inner {
                 sem: Semaphore::new(total.div_ceil(GRANULARITY).max(1)),
                 admission: Semaphore::new(admission_max.div_ceil(GRANULARITY).max(1)),
+                big_leaf: Semaphore::new(1),
                 total,
                 admission_max,
                 leaf_max: if leaf_reserve == 0 {
@@ -97,6 +107,7 @@ impl MemoryBudget {
                 peak: AtomicU64::new(0),
                 waits: AtomicU64::new(0),
                 overshoots: AtomicU64::new(0),
+                big_leaf_waits: AtomicU64::new(0),
             }),
         }
     }
@@ -133,6 +144,11 @@ impl MemoryBudget {
         self.inner.overshoots.load(Ordering::Relaxed)
     }
 
+    /// Large values that waited for another large value
+    pub fn big_leaf_waits_total(&self) -> u64 {
+        self.inner.big_leaf_waits.load(Ordering::Relaxed)
+    }
+
     async fn sem_units(sem: &Semaphore, units: u32, waits: &AtomicU64) {
         if let Ok(p) = sem.try_acquire_many(units) {
             p.forget();
@@ -153,12 +169,16 @@ impl MemoryBudget {
     /// holders releasing
     pub async fn acquire(&self, bytes: usize) -> MemoryPermit {
         let metered = bytes.min(self.inner.leaf_max);
-        if metered < bytes {
+        let big = metered < bytes;
+        if big {
             self.inner.overshoots.fetch_add(1, Ordering::Relaxed);
+            Self::sem_units(&self.inner.big_leaf, 1, &self.inner.big_leaf_waits).await;
         }
         let units = units_for(metered);
         Self::sem_units(&self.inner.sem, units, &self.inner.waits).await;
-        self.permit(bytes, units, 0)
+        let mut permit = self.permit(bytes, units, 0);
+        permit.big_leaf = big;
+        permit
     }
 
     /// Admission reserve `bytes` from `total - leaf_reserve`; the pipeline
@@ -186,6 +206,7 @@ impl MemoryBudget {
             bytes: bytes as u64,
             units,
             admission_units,
+            big_leaf: false,
         }
     }
 }
@@ -210,6 +231,8 @@ pub struct MemoryPermit {
     units: u32,
     /// Units also held in the admission compartment (0 for leaf permits)
     admission_units: u32,
+    /// Holds large-value permit until bytes fit reserve
+    big_leaf: bool,
 }
 
 impl MemoryPermit {
@@ -242,6 +265,10 @@ impl MemoryPermit {
             .cur
             .fetch_sub(self.bytes - bytes, Ordering::Relaxed);
         self.bytes = bytes;
+        if self.big_leaf && bytes as usize <= self.inner.leaf_max {
+            self.big_leaf = false;
+            self.inner.big_leaf.add_permits(1);
+        }
     }
 }
 
@@ -262,7 +289,48 @@ impl Drop for MemoryPermit {
                 .admission
                 .add_permits(self.admission_units as usize);
         }
+        if self.big_leaf {
+            self.inner.big_leaf.add_permits(1);
+        }
     }
+}
+
+/// Return cgroup limit or host memory, whichever is smaller
+///
+/// Return `None` when neither cgroup limit nor `/proc/meminfo` can be read
+pub fn host_memory_limit() -> Option<usize> {
+    memory_limit_from(
+        "/sys/fs/cgroup/memory.max",
+        "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+        "/proc/meminfo",
+    )
+}
+
+/// Treat cgroup v2 `max` and cgroup v1 values at or above host memory as no
+/// limit
+fn memory_limit_from(v2: &str, v1: &str, meminfo: &str) -> Option<usize> {
+    let total = read_mem_total(meminfo);
+    let limit = read_usize(v2).or_else(|| read_usize(v1));
+    match (limit, total) {
+        (Some(l), Some(t)) => Some(l.min(t)),
+        (l, t) => l.or(t),
+    }
+}
+
+fn read_usize(path: &str) -> Option<usize> {
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+fn read_mem_total(path: &str) -> Option<usize> {
+    let kb: usize = std::fs::read_to_string(path)
+        .ok()?
+        .lines()
+        .find_map(|l| l.strip_prefix("MemTotal:"))?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()?;
+    kb.checked_mul(1024)
 }
 
 fn units_for(bytes: usize) -> u32 {
@@ -272,6 +340,54 @@ fn units_for(bytes: usize) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn write(dir: &std::path::Path, name: &str, body: &str) -> String {
+        let p = dir.join(name);
+        std::fs::write(&p, body).unwrap();
+        p.to_str().unwrap().to_string()
+    }
+
+    /// Prefer cgroup limit when lower than host memory
+    #[test]
+    fn memory_limit_prefers_the_binding_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        let meminfo = write(d, "meminfo", "MemFree: 1 kB\nMemTotal:       2048 kB\n");
+        let capped = write(d, "memory.max", "524288\n");
+        let unlimited = write(d, "unlimited", "max\n");
+        let v1_sentinel = write(d, "limit_in_bytes", "9223372036854771712\n");
+        let missing = d.join("absent").to_str().unwrap().to_string();
+
+        assert_eq!(
+            memory_limit_from(&capped, &missing, &meminfo),
+            Some(512 << 10)
+        );
+        // Unlimited cgroup values use host memory
+        assert_eq!(
+            memory_limit_from(&unlimited, &v1_sentinel, &meminfo),
+            Some(2 << 20)
+        );
+        // Host memory works without cgroup files
+        assert_eq!(
+            memory_limit_from(&missing, &missing, &meminfo),
+            Some(2 << 20)
+        );
+        // cgroup limit works without host memory
+        assert_eq!(
+            memory_limit_from(&capped, &missing, &missing),
+            Some(512 << 10)
+        );
+        assert_eq!(memory_limit_from(&missing, &missing, &missing), None);
+        // Invalid host memory is unavailable, not zero
+        let garbage = write(d, "garbage", "MemTotal:       lots\n");
+        assert_eq!(memory_limit_from(&missing, &missing, &garbage), None);
+    }
+
+    /// Never report zero for this host
+    #[test]
+    fn host_memory_limit_reads_this_host() {
+        assert_ne!(host_memory_limit(), Some(0));
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn acquire_release_round_trip() {
@@ -404,6 +520,49 @@ mod tests {
         assert_eq!(b.waits_total(), 0);
         drop(q);
         drop(p);
+        assert_eq!(b.resident_bytes(), 0);
+    }
+
+    /// Allow only one large value above reserve at a time
+    #[tokio::test(flavor = "current_thread")]
+    async fn oversized_leaves_serialize() {
+        let b = MemoryBudget::with_leaf_reserve(128 << 10, 64 << 10);
+        let first = b.acquire(256 << 10).await;
+        let b2 = b.clone();
+        let waiter = tokio::spawn(async move { b2.acquire(256 << 10).await });
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished(), "second large value waits");
+        assert_eq!(b.resident_bytes(), 256 << 10);
+        drop(first);
+        let second = waiter.await.unwrap();
+        assert_eq!(b.resident_bytes(), 256 << 10);
+        assert_eq!(b.big_leaf_waits_total(), 1);
+        drop(second);
+        assert_eq!(b.resident_bytes(), 0);
+    }
+
+    /// Decode values within reserve while a large value resolves
+    #[tokio::test(flavor = "current_thread")]
+    async fn sized_leaf_ignores_the_gate() {
+        let b = MemoryBudget::with_leaf_reserve(256 << 10, 128 << 10);
+        let big = b.acquire(512 << 10).await;
+        let small = b.acquire(64 << 10).await;
+        assert_eq!(b.big_leaf_waits_total(), 0);
+        drop((big, small));
+        assert_eq!(b.resident_bytes(), 0);
+    }
+
+    /// Return large-value permit when retained bytes fit reserve
+    #[tokio::test(flavor = "current_thread")]
+    async fn shrink_below_reserve_releases_the_gate() {
+        let b = MemoryBudget::with_leaf_reserve(128 << 10, 64 << 10);
+        let mut peak = b.acquire(256 << 10).await;
+        peak.shrink(8 << 10);
+        // Large-value permit is free
+        let next = b.acquire(256 << 10).await;
+        assert_eq!(b.big_leaf_waits_total(), 0);
+        drop(next);
+        drop(peak);
         assert_eq!(b.resident_bytes(), 0);
     }
 
