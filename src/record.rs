@@ -94,9 +94,7 @@ pub enum Route {
     #[default]
     ToShadow,
     ToDecoder,
-    /// Shadow replays it *and* the decoder decodes it. The shadow-TOAST
-    /// backend needs the original bytes on both sides: shadow to hold the
-    /// physical chunks a later fetch reads, the decoder to emit the row
+    /// Send original record to shadow replay and decoder
     ToBoth,
 }
 

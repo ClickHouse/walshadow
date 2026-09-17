@@ -1,32 +1,25 @@
 //! Stage the source's TOAST heap files so PostgreSQL can serve values out of
 //! them instead of a ClickHouse chunk mirror.
 //!
-//! One staged tree, two consumers, each given what it can read correctly:
+//! One staged tree serves two consumers:
 //!
-//! * The **bootstrap oracle** takes it before window replay, and answers that
-//!   leg's lookups. `pg_dump --binary-upgrade` gives the oracle the source's
-//!   OIDs and relfilenodes, so a pointer's `va_toastrelid` resolves there and
-//!   the files belong at the paths they already have. Window replay only ever
-//!   asks for values written *before* the backup, whose chunks a plain copy
-//!   holds.
-//! * **Shadow** takes the same tree afterwards and reaches `end_lsn` by real
-//!   redo, which is what makes values written *during* the backup readable —
-//!   their chunks are appended mid-window, so no copy and no page image holds
-//!   them. Redo also repairs torn pages properly, restoring each image into a
-//!   buffer it marks dirty so the page checksum is recomputed.
+//! * Bootstrap oracle uses copied files while processing backup WAL.
+//!   `pg_dump --binary-upgrade` preserves source relation OIDs and relfilenodes,
+//!   so `va_toastrelid` resolves without remapping.
+//! * Shadow uses same files and replays WAL through `end_lsn`. Replay adds
+//!   values written during backup and repairs torn pages and checksums.
 //!
-//! The tree mirrors the data-dir layout, so it merges into one unchanged.
+//! Tree mirrors PostgreSQL data-directory layout.
 
 use std::io;
 use std::path::{Path, PathBuf};
 
 use ahash::HashSet;
 
-/// Relations whose files a staging pass writes: the TOAST heaps and their
-/// indexes, keyed `(db_node, rel_node)`
+/// Staged TOAST heaps and indexes, keyed by `(db_node, rel_node)`
 pub type StagedRels = std::sync::Arc<ahash::HashSet<(u32, u32)>>;
 
-/// Where to stage, and what
+/// Staging root and relation set
 pub type StagingTarget = (PathBuf, StagedRels);
 
 /// Root of a tree mirroring the data dir
@@ -45,10 +38,7 @@ impl ToastStaging {
     }
 }
 
-/// `(db, relnode)` for every relation the tree holds, from the file names.
-/// Exact for everything that existed at backup time, which is what both the
-/// landed-WAL filter and the live route need in order to keep those files
-/// current afterwards
+/// Read `(db, relnode)` pairs from staged filenames
 pub async fn staged_filenodes(staging: &ToastStaging) -> io::Result<HashSet<(u32, u32)>> {
     let mut out: HashSet<(u32, u32)> = HashSet::default();
     let base = staging.root().join("base");
@@ -65,8 +55,7 @@ pub async fn staged_filenodes(staging: &ToastStaging) -> io::Result<HashSet<(u32
         while let Some(f) = files.next_entry().await? {
             let name = f.file_name();
             let Some(name) = name.to_str() else { continue };
-            // `<relnode>` or `<relnode>.<segno>`; every segment is the same
-            // relation
+            // Map `<relnode>` and `<relnode>.<segno>` to same relation
             let stem = name.split('.').next().unwrap_or(name);
             if let Ok(rel) = stem.parse::<u32>() {
                 out.insert((db_oid, rel));
@@ -78,10 +67,9 @@ pub async fn staged_filenodes(staging: &ToastStaging) -> io::Result<HashSet<(u32
 
 /// Copy the tree into `data_dir`, renaming the database directory to `db_oid`.
 ///
-/// Copy, not move: both consumers need it, and the oracle takes it first.
+/// Copy because oracle and shadow both need source tree.
 /// `pg_dump --binary-upgrade` preserves relation OIDs and relfilenodes but not
-/// the database's, so that rename is the one adjustment the oracle needs;
-/// shadow is a physical copy and takes its own OID unchanged.
+/// database OID. Rename database directory for oracle; shadow keeps source OID.
 pub async fn install_into(
     staging: &ToastStaging,
     data_dir: &Path,
@@ -158,7 +146,7 @@ mod tests {
             "the second consumer still needs the tree",
         );
 
-        // Same tree into a second data dir, this time under its own oid
+        // Install same tree for shadow using source database OID
         let shadow = tmp.path().join("shadow");
         install_into(&staging, &shadow, 5).await.unwrap();
         assert!(shadow.join("base/5/16400").is_file());

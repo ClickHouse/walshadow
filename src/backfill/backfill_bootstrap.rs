@@ -64,10 +64,7 @@ pub struct BootstrapConfig {
     /// `None` taps every seeded relation
     pub tap_filenodes: Option<Arc<ahash::HashSet<(Oid, Oid)>>>,
     pub progress: BootstrapProgress,
-    /// Shadow-TOAST: stage these relations' files under this root instead of
-    /// walking their pages into a chunk mirror. A PostgreSQL is given them and
-    /// asked for the values. Holds the TOAST heaps *and their indexes*: a heap
-    /// without its index is unreadable, and shadow cannot rebuild one
+    /// Stage TOAST heaps and indexes for shadow instead of building chunk mirror
     pub toast_staging: Option<crate::backfill::toast_staging::StagingTarget>,
 }
 

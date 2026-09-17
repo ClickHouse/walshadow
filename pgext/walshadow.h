@@ -19,8 +19,7 @@
 #define WS_OP_REPLAY_LSN		0x04
 #define WS_OP_FETCH_TOAST		0x05
 
-/* FETCH_TOAST visibility. TOAST is what detoast reads with; ANY is wider and
- * exists to expose generations TOAST hides, not for production reads */
+/* FETCH_TOAST visibility. ANY exposes generations hidden by TOAST for tests */
 #define WS_SNAP_TOAST		0x00
 #define WS_SNAP_ANY			0x01
 
@@ -28,12 +27,10 @@
 #define WS_FETCH_OK			0x00
 /* no chunk at all under the value id */
 #define WS_FETCH_MISSING	0x01
-/* chunks found, but the run is gapped, duplicated across generations, or a
- * different total than the pointer's stored size */
+/* chunks found, but sequence or total size does not match pointer */
 #define WS_FETCH_MISMATCH	0x02
 
-/* Bounds one FETCH_TOAST request. A longer list is the caller's to chunk,
- * since only the caller knows which values share a replay bound */
+/* Maximum values sharing one FETCH_TOAST replay bound */
 #define WS_MAX_FETCH_VALUES	1024
 
 /* response status byte */

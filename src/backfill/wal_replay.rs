@@ -179,22 +179,13 @@ impl WalReplaySink {
         Ok(self.stats())
     }
 
-    /// Mirror every chunk tuple a restored TOAST page image carries, not
-    /// only the one its record names. The image is a page copy, not
-    /// transactional evidence, so it bypasses the xact stash: neighbours
-    /// belong to other writers and an abort must not withdraw them
+    /// Mirror all chunks from restored TOAST page image. Bypass transaction
+    /// stash because neighboring tuples may belong to other transactions.
     ///
-    /// Repairs a backup page the walk read mid-write. Any page a backup
-    /// modifies is written before its first change in the window, so the
-    /// image carries what the torn copy lost.
+    /// Repair backup pages copied during concurrent writes.
     ///
-    /// Reached from two resource managers. A Heap record carries an image on
-    /// the first post-checkpoint touch of a page, but a DELETE of pre-window
-    /// chunks carries none — that page's image arrives separately as
-    /// `XLOG_FPI_FOR_HINT` when a hint bit is set on it, which is an XLOG
-    /// record and so outside the `filter_rfns` gate the Heap path sits behind.
-    /// Watching only Heap left exactly the pages holding pre-window values
-    /// unrepaired
+    /// Process Heap images and XLOG_FPI_FOR_HINT images. Deletes of pre-backup
+    /// chunks may have only latter image.
     async fn harvest_toast_images(
         &mut self,
         record: &Record<'_>,
@@ -482,17 +473,7 @@ impl RecordSink for WalReplaySink {
     ) -> Pin<Box<dyn Future<Output = std::result::Result<(), SinkError>> + Send + 'a>> {
         Box::pin(async move {
             let rm = record.parsed.header.resource_manager_id;
-            // Page images of a TOAST page arrive on two rmgrs, and the one
-            // that matters most is not Heap: a DELETE of pre-window chunks
-            // carries no image of its own, and the page's image turns up in a
-            // separate `XLOG_FPI_FOR_HINT` when a hint bit is set on it
-            // A page image of a TOAST page reaches the mirror from two
-            // resource managers, and the one that matters is not Heap: a
-            // DELETE of pre-window chunks carries no image of its own, and
-            // that page's image arrives separately as `XLOG_FPI_FOR_HINT`
-            // when a hint bit is set on it. Watching only the Heap branch
-            // below left exactly the pages holding pre-window values
-            // unrepaired
+            // Capture TOAST page images from Heap and XLOG resource managers
             if crate::filter::classify::is_page_image(&record.parsed) {
                 self.harvest_toast_images(record).await?;
             }

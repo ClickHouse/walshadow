@@ -278,11 +278,9 @@ pub struct BootstrapSettings {
 /// Where external TOAST values live.
 ///
 /// `Clickhouse` mirrors every chunk into a per-relation `ReplacingMergeTree`
-/// keyed by physical tuple location. `Shadow` reads them out of shadow
-/// PostgreSQL's own TOAST heaps instead, which writes no chunks at all — see
-/// `plans/shadow_toast.md`. The two are not interchangeable on a running
-/// deployment: values written under one backend are not readable under the
-/// other, so switching needs a fresh bootstrap
+/// keyed by physical tuple location. `Shadow` reads PostgreSQL TOAST heaps and
+/// writes no chunks. Switching backend requires fresh bootstrap because each
+/// backend stores different history. See `plans/shadow_toast.md`
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ToastBackend {

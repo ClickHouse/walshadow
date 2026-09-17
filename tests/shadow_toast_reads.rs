@@ -3,17 +3,13 @@
 //!
 //! `plans/shadow_toast.md` proposes reading external values out of shadow's
 //! physical TOAST heaps instead of the ClickHouse chunk mirror. The design
-//! rests on one property: `HeapTupleSatisfiesToast` ignores xmax, so a value
-//! whose referring row version is dead should stay readable until the chunks
-//! are physically reclaimed. This measures the property and, more usefully,
-//! measures *what* reclaims — because that is what a fence has to withhold.
+//! requires `HeapTupleSatisfiesToast` to ignore xmax so values remain readable
+//! until physical reclamation. Tests identify which operations reclaim chunks.
 //!
-//! The answer these tests record: it is not VACUUM. Opportunistic pruning
-//! (`heap_page_prune_opt`) takes the chunks the moment the cleanup horizon
-//! passes the deleting transaction, which on a primary is immediately. Shadow
-//! is a physical standby where replayed WAL is the sole writer, so nothing
-//! prunes locally and the chunks survive until an `XLOG_HEAP2_PRUNE` record is
-//! replayed — the first entry in the plan's destructive-operation list.
+//! Opportunistic pruning (`heap_page_prune_opt`) can remove chunks as soon as
+//! cleanup horizon passes deleting transaction, without VACUUM. Shadow does
+//! not prune locally, so chunks remain until replay applies corresponding
+//! `XLOG_HEAP2_PRUNE` record.
 //!
 //! Requires `pgext/walshadow.so` built against the `initdb` on PATH.
 
@@ -313,9 +309,7 @@ async fn dead_referrer_still_yields_its_value() {
     hold.release().await;
 }
 
-/// Pruning, not VACUUM, is the reclaimer — and it needs no statement of its
-/// own. This is the finding that makes the plan's fence about
-/// `XLOG_HEAP2_PRUNE` rather than about vacuum records
+/// Verify opportunistic pruning reclaims chunks without VACUUM
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pruning_reclaims_as_soon_as_the_horizon_passes() {
     if !have("initdb") {
@@ -937,22 +931,14 @@ async fn replay_passed_within(standby: &Client, lsn: &str, budget: Duration) -> 
     }
 }
 
-/// Can PG's own standby-conflict machinery serve as the reclamation fence?
+/// Verify PostgreSQL standby conflicts cannot provide reclamation fence.
 ///
-/// It parks replay of a record carrying a `snapshotConflictHorizon` while a
-/// query holds an older snapshot, and `max_standby_archive_delay = -1` makes it
-/// wait rather than cancel. If that covered us, the plan's staged-bytes fence
-/// would be unnecessary.
+/// PostgreSQL pauses records with `snapshotConflictHorizon` while older visible
+/// snapshots exist. `max_standby_archive_delay = -1` waits instead of canceling.
 ///
-/// It does not. Measured both ways below: conflict resolution protects tuples
-/// the held snapshot can *see*, and a snapshot opened after the referrer died
-/// cannot see the row, so PG declines to conflict and the chunks go. A snapshot
-/// opened before the delete replays does hold the line — but that is a snapshot
-/// that still sees the live row, which is not the state a reader owing old
-/// values is in.
-///
-/// So the fence has to be walshadow's own, which is what
-/// `plans/shadow_toast.md` prescribes.
+/// Conflict handling protects only tuples visible to held snapshot. Snapshot
+/// opened after row deletion does not protect old chunks, so walshadow needs
+/// its own reclamation fence.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pg_standby_conflicts_do_not_fence_reclamation() {
     if !have("initdb") || !have("pg_basebackup") {
@@ -973,8 +959,7 @@ async fn pg_standby_conflicts_do_not_fence_reclamation() {
     ship_wal(&source.sh);
     wait_replay_past(&sb_sql, &seeded, "the INSERT").await;
 
-    // Reader A sees the live row: its interest in the chunks is one PG
-    // recognises
+    // Snapshot opened before delete protects visible row
     let early = connect_sql(&standby.sh).await;
     exec(&early, "BEGIN ISOLATION LEVEL REPEATABLE READ").await;
     assert_eq!(
@@ -1000,8 +985,7 @@ async fn pg_standby_conflicts_do_not_fence_reclamation() {
         "replay must reach the reclamation once nothing conflicts"
     );
 
-    // Reader B opens after the reclamation replayed, which is the state a
-    // reader owing pre-window values is actually in. Nothing is left to protect
+    // Snapshot opened after reclamation cannot protect old chunks
     let late = connect_sql(&standby.sh).await;
     exec(&late, "BEGIN ISOLATION LEVEL REPEATABLE READ").await;
     exec(&late, "SELECT 1").await;
@@ -1020,12 +1004,7 @@ async fn pg_standby_conflicts_do_not_fence_reclamation() {
     );
 }
 
-/// Readiness has three shapes, and the store has to tell them apart.
-///
-/// A primary has no replay position: the bootstrap oracle is one, and its
-/// files are staged complete before it serves, so a read must not wait. A
-/// standby does have one, and a read below it must wait and then say so rather
-/// than hang. And a store whose PostgreSQL is not bound yet must park.
+/// Distinguish ready primary, replaying standby, and unbound PostgreSQL
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn store_readiness_distinguishes_primary_standby_and_unbound() {
     use std::sync::Arc;
@@ -1043,7 +1022,7 @@ async fn store_readiness_distinguishes_primary_standby_and_unbound() {
     let v = seed_value(&src_sql, "t_ready", "repeat('ab', 120000)", true).await;
     let seeded = scalar(&src_sql, "SELECT pg_current_wal_lsn()::text").await;
 
-    // Unbound: parks, then names what it was waiting for
+    // Unbound store waits, then reports missing PostgreSQL
     let unbound = LateBridge::default();
     let parked =
         ShadowToastStore::late(unbound.clone()).with_replay_wait_max(Duration::from_millis(300));

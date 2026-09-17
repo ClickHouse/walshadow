@@ -1,17 +1,13 @@
 //! TOAST values read out of shadow PostgreSQL instead of a ClickHouse mirror.
 //!
-//! Shadow already replays source WAL. Carrying the physical TOAST heaps and
-//! indexes too makes every external value a local index lookup, which removes
-//! the chunk mirror from both the write path (no puts at all) and the read
-//! path. Selected by `[toast] backend = "shadow"`; design in
-//! `plans/shadow_toast.md`. Live CDC reads through this; a greenfield
-//! bootstrap does not yet, because its deferred referrers resolve before
-//! shadow recovery starts.
+//! Shadow stores physical TOAST heaps and indexes while replaying source WAL,
+//! so external values can use local index lookups without ClickHouse chunk
+//! mirror. Select with `[toast] backend = "shadow"`; see
+//! `plans/shadow_toast.md`. Greenfield bootstrap and live CDC both use this
+//! backend.
 //!
-//! Read-only by construction. The mirror's writes exist to reconstruct history
-//! ClickHouse would not otherwise have; shadow *is* that history, so a
-//! `ToastRow` has nowhere to go and every write method refuses rather than
-//! silently succeeding.
+//! Store is read-only. Shadow receives data through WAL replay, so write methods
+//! reject decoded `ToastRow` values.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -21,21 +17,15 @@ use async_trait::async_trait;
 use crate::ops::bridge::{Bridge, FetchedChunks, MAX_FETCH_VALUES, ToastSnapshot};
 use crate::toast::{ChunkStore, ChunkStoreError, FetchedValue, ToastRow};
 
-/// Round-trip payload budget. One value can be `inline_value_max` (64 MiB by
-/// default) on its own, so a batch takes at least one regardless and this only
-/// bounds how many more join it
+/// Round-trip payload target. Always allow one value even when it exceeds limit
 const FETCH_REQUEST_BYTES: usize = 64 << 20;
 
 /// Poll cadence while waiting for shadow replay to cover a read
 const REPLAY_POLL: Duration = Duration::from_millis(20);
-/// Ceiling on that wait. Generous because it is bounded by shadow applying
-/// bytes already dispatched to it, not by anything downstream; exceeding it
-/// means shadow stopped applying, which is fatal either way
+/// Maximum time to wait for shadow to apply dispatched WAL
 const REPLAY_WAIT_MAX: Duration = Duration::from_secs(60);
 
-/// Bridge a resolver is built around before the PostgreSQL behind it exists.
-/// Bootstrap builds the resolver, clones it into the gate, drain lanes and
-/// tails, and only later has an instance to read from
+/// Bridge populated after bootstrap starts PostgreSQL
 pub type LateBridge = Arc<tokio::sync::OnceCell<Arc<Bridge>>>;
 
 pub struct ShadowToastStore {
@@ -51,9 +41,7 @@ impl ShadowToastStore {
         Self::late(cell)
     }
 
-    /// Store over a bridge bound later. A read before then parks, so an
-    /// ordering mistake surfaces as a timeout naming what it waited for
-    /// rather than as a fetch against a socket that is not there
+    /// Create store that waits for bridge to become available
     pub fn late(bridge: LateBridge) -> Self {
         Self {
             bridge,
@@ -67,8 +55,7 @@ impl ShadowToastStore {
         self
     }
 
-    /// Bound bridge, or a park until one is. Same budget as the replay wait:
-    /// both are "shadow is not ready yet"
+    /// Return bound bridge or wait until readiness deadline
     async fn bridge(&self) -> Result<&Arc<Bridge>, ChunkStoreError> {
         if let Some(b) = self.bridge.get() {
             return Ok(b);
@@ -88,24 +75,17 @@ impl ShadowToastStore {
         }
     }
 
-    /// Park until shadow has applied through `through`.
+    /// Wait until shadow has applied through `through`.
     ///
-    /// Safe to block on: `WalStream` dispatches a record's wire bytes before
-    /// awaiting the record sink, so by the time anything asks for a value at
-    /// `through` those bytes are already on their way to shadow. The wait
-    /// needs no further pump progress, which is the same argument
-    /// `BoundaryHoldSink` rests on.
+    /// `WalStream` dispatches record bytes before awaiting record sink. WAL
+    /// needed to reach `through` is already on its way to shadow, so this wait
+    /// does not require more pump progress.
     ///
-    /// Polls rather than asking the worker to wait: the bridge serves one
-    /// request at a time, so a worker-side wait would stall the catalog reads
-    /// a publication hold depends on
-    /// Returns the floor to send with the request: the caller's position on a
-    /// standby, so the worker re-checks it after the poll, and none on a
-    /// primary, which has no replay position to check against
+    /// Poll here instead of blocking worker, which must remain available for
+    /// catalog reads. Return replay floor for standby request. Return zero for
+    /// primary, which has no replay position.
     async fn await_replay(&self, bridge: &Bridge, through: u64) -> Result<u64, ChunkStoreError> {
-        // A primary has no replay position and reports 0, which is what the
-        // bootstrap oracle is. Nothing to wait for: its files are staged
-        // complete before it starts serving
+        // Primary files are complete before service and have no replay position
         if through == 0 || !bridge.info().is_some_and(|i| i.in_recovery) {
             return Ok(0);
         }
@@ -129,9 +109,7 @@ impl ShadowToastStore {
         }
     }
 
-    /// `SnapshotAny` surfaces generations `SnapshotToast` hides, which is how
-    /// value-id reuse becomes visible instead of silently resolving. Reads
-    /// under it are for measurement, not production
+    /// Use wider snapshot to expose reused value-ID generations in tests
     pub fn with_snapshot(mut self, snapshot: ToastSnapshot) -> Self {
         self.snapshot = snapshot;
         self
@@ -163,10 +141,8 @@ impl ChunkStore for ShadowToastStore {
             .unwrap_or(FetchedValue::Missing))
     }
 
-    /// The mirror reads `max_lsn` as an as-of ceiling; shadow reads it as a
-    /// floor on replay. Same position, opposite role: chunks are written below
-    /// the record that refers to them, so replay reaching the referrer is what
-    /// makes the value present rather than what bounds which version wins
+    /// Treat `max_lsn` as minimum replay position. Chunks precede referring
+    /// record, so reaching this position makes value available
     async fn fetch_many(
         &self,
         toast_relid: u32,
@@ -177,11 +153,10 @@ impl ChunkStore for ShadowToastStore {
             return Ok(Vec::new());
         }
         let bridge = self.bridge().await?;
-        // Before the first request, not per slice: one wait covers the batch
+        // Wait once for complete batch
         let floor = self.await_replay(bridge, max_lsn).await?;
         let mut out = Vec::with_capacity(values.len());
-        // The resolver hands its whole list down and leaves splitting to the
-        // store, so the wire caps are this side's to respect
+        // Split resolver batch to satisfy wire limits
         for slice in request_slices(values) {
             let got = bridge
                 .fetch_toast(toast_relid, slice, floor, self.snapshot)
@@ -210,7 +185,7 @@ impl ChunkStore for ShadowToastStore {
     }
 }
 
-/// Split on whichever wire cap binds first, never below one value
+/// Split at first wire limit, always include at least one value
 fn request_slices(values: &[(u32, usize)]) -> impl Iterator<Item = &[(u32, usize)]> {
     let mut rest = values;
     std::iter::from_fn(move || {
@@ -251,7 +226,7 @@ mod tests {
             "every value ends up in exactly one request"
         );
 
-        // One oversized value still travels alone rather than being dropped
+        // Send oversized value alone
         let huge = [(1u32, FETCH_REQUEST_BYTES * 4), (2, 8)];
         let slices: Vec<_> = request_slices(&huge).collect();
         assert_eq!(slices, vec![&huge[..1], &huge[1..]]);

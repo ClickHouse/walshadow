@@ -187,20 +187,15 @@ pub struct Filter {
     /// (offline segment filter, no capture consumer) proves no record's
     /// database, so no record dirties
     target_db_oid: Option<u32>,
-    /// Shadow-TOAST: user relation records reach shadow as well as the
-    /// decoder, so shadow holds the physical chunks a later fetch reads.
+    /// Route all user relation records to shadow and decoder.
     ///
     /// Routes every user relation, not only TOAST heaps and their indexes.
-    /// Identifying those by relfilenode needs oid-to-filenode across
-    /// rewrites plus the toast index, and a rule that misses one loses
-    /// values silently. Shipped volume is unchanged either way — a dropped
-    /// record is rewritten to a NOOP of equal `xl_tot_len` — so the cost is
-    /// shadow's disk and apply work, not bandwidth
+    /// Identifying only TOAST relations would require tracking relfilenode
+    /// changes and indexes. Missing one would lose values. Routing changes
+    /// shadow disk and replay work, not shipped bytes, because dropped records
+    /// become equal-length NOOPs.
     user_to_shadow: bool,
-    /// Shadow-TOAST: user relations whose records shadow replays because it
-    /// serves their values. Exact for everything that existed when the walk
-    /// staged their files; a relation created since is covered by
-    /// `user_to_shadow`
+    /// Relations staged at backup whose WAL shadow must replay
     keep_user_rels: HashSet<(u32, u32)>,
 }
 
@@ -225,9 +220,7 @@ impl Filter {
         self.target_db_oid = Some(db_oid);
     }
 
-    /// Deliver user relation records to shadow as well as the decoder, for
-    /// the shadow-TOAST backend. Set before the first record: flipping it
-    /// mid-stream leaves shadow missing the files the earlier records wrote
+    /// Route user records to shadow and decoder. Set before first record
     pub fn route_user_to_shadow(&mut self, on: bool) {
         self.user_to_shadow = on;
     }
@@ -236,8 +229,7 @@ impl Filter {
         self.user_to_shadow
     }
 
-    /// Deliver these user relations' records to shadow as well as the
-    /// decoder, without routing every user relation there
+    /// Route selected user relations to shadow and decoder
     pub fn keep_user_rels(&mut self, rels: HashSet<(u32, u32)>) {
         self.keep_user_rels = rels;
     }
@@ -755,8 +747,7 @@ mod tests {
         f
     }
 
-    /// Shadow-TOAST routing: shadow needs the records that wrote the chunks
-    /// it will later be asked for, and the decoder still needs to emit the row
+    /// Shadow receives chunk WAL while decoder emits row
     #[test]
     fn user_records_reach_both_sides_under_shadow_toast() {
         let mut f = target_filter();
@@ -767,20 +758,18 @@ mod tests {
         assert!(f.routes_user_to_shadow());
         assert_eq!(f.decide(&user), Route::ToBoth);
 
-        // Catalog and special records keep their existing route: they were
-        // already going to shadow, and nothing decodes them
+        // Preserve existing route for catalog and special records
         assert_eq!(
             f.decide(&rec(RmId::Heap, &[(TARGET_DB, 1259)])),
             Route::ToShadow
         );
         assert_eq!(f.decide(&rec(RmId::Xact, &[])), Route::ToShadow);
 
-        // A foreign database's user relation is still a user relation
+        // Route user relations from any database consistently
         assert_eq!(f.decide(&rec(RmId::Heap, &[(6, 16500)])), Route::ToBoth);
     }
 
-    /// `ToBoth` is kept on the wire, so shadow gets the original bytes rather
-    /// than the NOOP a dropped record is rewritten to
+    /// Keep `ToBoth` records unchanged so shadow receives original bytes
     #[test]
     fn to_both_counts_as_kept_not_dropped() {
         let mut stats = FilterStats::default();

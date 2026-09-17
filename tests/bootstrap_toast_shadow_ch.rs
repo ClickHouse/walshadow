@@ -2,16 +2,14 @@
 //! come out of shadow's own TOAST heaps, and no chunk mirror is written
 //! anywhere.
 //!
-//! Shadow is started mid-bootstrap and replays to `end_lsn`, which is the only
-//! way to hold a value written *during* the backup — its chunks are appended
-//! mid-window, so no file copy contains them. What this pins:
+//! Shadow starts during bootstrap and replays to `end_lsn`. WAL replay adds
+//! chunks written during backup that are absent from copied files. Test checks:
 //!
 //! - every live external value reaches ClickHouse byte-identical
 //! - dead and aborted generations still do not
 //! - `toast_chunk_puts` is zero and no `pg_toast_*` table appears in CH
-//! - rows took the deferral path rather than an inline fetch during the walk
-//! - shadow is started mid-bootstrap and replays to `end_lsn`, which is what
-//!   makes a value written *during* the backup resolvable at all
+//! - page-walk rows use deferred lookup
+//! - shadow starts during bootstrap and replays to `end_lsn`
 //!
 //! The mirror-backed equivalent is `bootstrap_toast_gate_ch.rs`.
 
@@ -71,19 +69,19 @@ fn churn_toast_in_window(source: &Shadow, schema: &str) -> Result<()> {
     source.psql_one("CHECKPOINT")?;
     // Delete rows seeded pre-window: their chunks sit on toast pages the
     // backup is copying, so removing them dirties those pages and the window
-    // carries an image of each. A read would not do — `SnapshotToast` never
+    // carries an image of each. A read does not, `SnapshotToast` never
     // consults clog, so a toast page has no hint bit for a read to set.
     //
     // DELETE rather than UPDATE: an UPDATE under REPLICA IDENTITY FULL inside
     // the window puts the old version's delete and the new version's insert
     // at the same commit LSN, which `ReplacingMergeTree` has no deterministic
-    // tiebreak for — a separate question from TOAST value resolution
+    // tiebreak for, which is unrelated to TOAST value resolution
     source.psql_one(&format!(
         "DELETE FROM {schema}.t WHERE id BETWEEN 301 AND 304"
     ))?;
     // Rows inserted while the backup runs. Their transaction can straddle
     // `end_lsn`, leaving the walk a partially written page and part of the
-    // value above the window — the case the read-only fill path exists for
+    // value beyond window, which exercises read-only fill path
     source.psql_one(&format!(
         "INSERT INTO {schema}.t \
          SELECT g, repeat('window-'||g::text||'---', {BODY_REPEAT}) \
@@ -177,11 +175,8 @@ async fn bootstrap_renders_external_values_out_of_shadow() {
         fx::wait_for_listen(daemon.metrics_addr, Duration::from_secs(30))
             .context("daemon metrics endpoint never came up")?;
 
-        // The pre-window rows are the deterministic part: they are in the
-        // backup, so the walk owes every one of them. How many of the
-        // in-window inserts land depends on where the backup window happened
-        // to close relative to them, which the test does not control, so it
-        // is reported rather than asserted
+        // Assert pre-backup rows. Report in-window rows because backup end may
+        // fall between inserts.
         fx::wait_for_ch_value(
             &ch,
             &format!(
@@ -210,8 +205,7 @@ async fn bootstrap_renders_external_values_out_of_shadow() {
             .query("SELECT count() FROM default.t FINAL WHERE id >= 1000")
             .context("aborted count")?;
         ensure!(aborted == "0", "rolled-back rows reached CH: {aborted}");
-        // Seeded pre-window, deleted inside it: the window leg has to carry
-        // the tombstone, or the walk's copy of them survives
+        // Backup WAL must carry deletes for rows copied by page walk
         let doomed = ch
             .query(
                 "SELECT count() FROM default.t FINAL \
@@ -271,10 +265,7 @@ async fn bootstrap_renders_external_values_out_of_shadow() {
             "nothing deferred, so nothing was read from the oracle: {deferred}"
         );
 
-        // Shadow took the same tree and was started mid-bootstrap, which is
-        // what makes a value written during the backup resolvable: its chunks
-        // are appended mid-window, so no file copy and no page image holds
-        // them — only redo to `end_lsn` does
+        // Shadow must install staged files and replay through `end_lsn`
         let installed = stderr
             .lines()
             .find(|l| l.contains("installed staged TOAST heaps into shadow"))
@@ -283,8 +274,7 @@ async fn bootstrap_renders_external_values_out_of_shadow() {
             !installed.contains("files=0"),
             "nothing was installed: {installed}"
         );
-        // Heap and index both: shadow cannot rebuild an index, so a heap
-        // landed without one is unreadable
+        // Shadow needs both heap and index files
         ensure!(
             stderr
                 .lines()

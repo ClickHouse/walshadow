@@ -1,15 +1,9 @@
-//! `[toast] backend = "shadow"` end to end: source PG → walshadow filter →
-//! shadow PG → heap decoder → xact buffer → reorder → decode pool →
-//! inserter pool → `clickhouse server`, with no chunk mirror anywhere.
+//! End-to-end test for `[toast] backend = "shadow"` without chunk mirror.
 //!
-//! The load-bearing case is the same one `toast_e2e.rs` pins for the mirror:
-//! under REPLICA IDENTITY FULL an UPDATE that leaves `body` alone logs a bare
-//! TOAST pointer, so the winning row version can only be completed by reading
-//! the value back out of storage. Here that storage is shadow's own TOAST
-//! heap, which only holds the chunks because their records were routed to it.
+//! Under REPLICA IDENTITY FULL, UPDATE that does not change `body` logs only
+//! TOAST pointer. Resolver must read value from shadow TOAST heap.
 //!
-//! Asserts the negative too: ClickHouse must contain no chunk mirror, and the
-//! resolver must have issued no puts.
+//! Verify ClickHouse has no chunk mirror and resolver performs no writes.
 
 #![cfg(target_os = "linux")]
 
@@ -26,9 +20,7 @@ use walshadow::schema::RelName;
 /// 16 bytes * 512 = 8192, past the ~2KB toast threshold and spanning several
 /// ~2KB chunks, so a partial read would be visible as a short value
 const BODY_SQL: &str = "repeat('walshadow-toast-', 512)";
-/// Fat enough that the updated tuple cannot fit the packed page's leftover
-/// space, forcing a cross-page update so PG logs the whole tuple rather than
-/// eliding the unchanged column
+/// Force cross-page update so PostgreSQL logs complete tuple
 const META2_SQL: &str = "repeat('v2-update-', 60)";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -38,8 +38,7 @@ const MAX_RESPONSE_BYTES: usize = 256 * 1024 * 1024;
 pub const MAX_SCAN_OIDS: usize = 65536;
 /// Matches `WS_MAX_WORKERS`, the ceiling on `walshadow.bridge_workers`
 pub const MAX_BRIDGE_WORKERS: usize = 8;
-/// Matches `WS_MAX_FETCH_VALUES`. Only the caller knows which values share a
-/// replay bound, so splitting a longer list is its call
+/// Must match `WS_MAX_FETCH_VALUES`
 pub const MAX_FETCH_VALUES: usize = 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -111,10 +110,8 @@ impl Catalog {
     }
 }
 
-/// Visibility a [`Bridge::fetch_toast`] reads with. `Toast` is what PG's own
-/// detoast uses and ignores xmax, so a value whose referring row version is
-/// dead stays readable until pruning removes the chunks. `Any` is wider and
-/// exists to expose generations `Toast` hides, not for production reads
+/// Snapshot visibility for [`Bridge::fetch_toast`]. `Toast` matches PostgreSQL
+/// detoast behavior. `Any` exposes hidden generations for tests
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum ToastSnapshot {
@@ -125,19 +122,16 @@ pub enum ToastSnapshot {
 /// One value's chunk run, parallel to the request's value list
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FetchedChunks {
-    /// Stored bytes, seq-dense from 0 and totalling the expected size
+    /// Stored bytes with consecutive sequence and expected total size
     Stored(Vec<u8>),
     /// No chunk under the id
     Missing,
-    /// Gapped, repeated across generations, or a different total than the
-    /// pointer's stored size. `got` is how far the run got
+    /// Sequence or total size mismatch. `got` is assembled byte count
     Mismatch { got: usize },
 }
 
 pub struct ToastFetch {
-    /// Replay position sampled before and after the read. A destructive
-    /// record replayed between them is what would make a run stale, so both
-    /// travel and the caller compares
+    /// Replay positions sampled before and after read
     pub replay_lsn_start: u64,
     pub replay_lsn_end: u64,
     pub values: Vec<FetchedChunks>,
@@ -423,15 +417,12 @@ impl Bridge {
         Cursor::at(&body, 1).u64()
     }
 
-    /// Read stored TOAST chunk runs out of shadow's physical heaps, one
-    /// round trip per call. `values` is `(value_id, expected stored size)`
-    /// against one toast relation, ids unique.
+    /// Read stored TOAST chunks from one shadow relation in one round trip.
+    /// `values` contains unique `(value_id, expected stored size)` pairs.
     ///
-    /// `min_replay_lsn` is a floor, not the equality [`scan_at`](Self::scan_at)
-    /// asserts: a value's chunks are written below the record that refers to
-    /// them, so replay only has to have reached the referrer. Bytes come back
-    /// **stored** — still compressed when the pointer says so — because the
-    /// daemon owns pglz/lz4 and the `va_tcinfo` prefix
+    /// `min_replay_lsn` is minimum replay position. Value chunks precede
+    /// referring record, so replay only needs to reach referrer. Returned bytes
+    /// remain compressed for daemon to decode.
     pub async fn fetch_toast(
         &self,
         toast_relid: u32,

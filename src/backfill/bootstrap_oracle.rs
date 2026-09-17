@@ -17,12 +17,9 @@ use crate::ops::oracle::Oracle;
 
 const ORACLE_PORT: u16 = 55440;
 
-/// Rebuild budget for the staged toast indexes. The oracle is throwaway and
-/// doing nothing else while this runs, so the initdb defaults are the wrong
-/// trade — a 4 MiB sort against a TOAST corpus spills for no reason
+/// Memory available to each staged TOAST index rebuild
 const REINDEX_WORK_MEM: &str = "1GB";
-/// `max_parallel_maintenance_workers`. Bounded rather than vCPU-scaled: the
-/// daemon's own pools are competing for the same machine
+/// Maximum parallel workers used by index rebuild
 const REINDEX_WORKERS: usize = 4;
 
 pub struct BootstrapOracle {
@@ -609,25 +606,18 @@ pub struct ToastInstallStats {
 }
 
 impl BootstrapOracle {
-    /// Take the staged TOAST heaps and start serving values out of them.
+    /// Install staged TOAST heaps and start serving values.
     ///
-    /// Stops the oracle first: its files cannot be written under a live
-    /// postmaster, which is why the page walk staged them elsewhere. The
-    /// caller's `Arc<Bridge>` survives the restart — a stop is a transport
-    /// error the bridge redials through.
+    /// Stop oracle before installing files. Existing `Arc<Bridge>` reconnects
+    /// after restart.
     ///
-    /// Indexes are rebuilt rather than landed. The oracle is a primary, so
-    /// `REINDEX` regenerates them from the heaps we just installed, which
-    /// avoids staging and repairing index files whose torn pages no
-    /// full-page image in the descriptor log covers.
+    /// Rebuild indexes from installed heaps to avoid copied torn index pages.
     pub async fn install_toast(
         &self,
         staging: &ToastStaging,
         next_xid: u32,
     ) -> Result<ToastInstallStats> {
-        // `pg_dump --binary-upgrade` preserves relation OIDs and relfilenodes
-        // but not the database's, so the one rename the move performs is
-        // source db oid to the oracle's. The staged tree names the source's
+        // Remap source database OID, relation OIDs and relfilenodes are stable
         let src = match staged_database_dir(staging)? {
             Some(dir) => dir,
             None => return Ok(ToastInstallStats::default()),
@@ -651,7 +641,7 @@ impl BootstrapOracle {
                 let mut installed: Vec<u32> = Vec::new();
                 let rd = match std::fs::read_dir(&src) {
                     Ok(rd) => rd,
-                    // Nothing toasted, or nothing mapped: a legitimate load
+                    // Empty staging tree is valid
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                         return Ok((stats, installed));
                     }
@@ -666,12 +656,10 @@ impl BootstrapOracle {
                     let from = entry.path();
                     let to = dst.join(entry.file_name());
                     let len = entry.metadata()?.len();
-                    // Copy, not move: shadow needs the same tree to serve values
-                    // from after handoff, and the staging dir is the one source
-                    // of it
+                    // Preserve staging tree for shadow installation
                     std::fs::copy(&from, &to)
                         .with_context(|| format!("copy {} -> {}", from.display(), to.display()))?;
-                    // `<relnode>` or `<relnode>.<segno>`: one relation either way
+                    // Map relation segments to base relfilenode
                     if let Some(rel) = entry
                         .file_name()
                         .to_str()
@@ -709,12 +697,7 @@ impl BootstrapOracle {
         self.shadow
             .start()
             .context("restart oracle after toast install")?;
-        // Only the relations that took a file. An index over an empty heap is
-        // already correct, and a rebuild of it is pure work.
-        //
-        // The rebuild is a heap scan plus sort plus build, which PostgreSQL
-        // parallelizes. This instance is throwaway and is doing nothing else,
-        // so give it room rather than the initdb defaults
+        // Rebuild indexes only for installed relation files
         let reindexed: u64 = self
             .shadow
             .psql_one(&format!(
@@ -755,9 +738,7 @@ impl BootstrapOracle {
     }
 }
 
-/// The one `base/<db>` the page walk staged, or `None` when nothing toasted.
-/// More than one means the walk saw two databases, which the followed-database
-/// scoping should have prevented
+/// Return staged `base/<db>` directory, reject multiple databases
 fn staged_database_dir(staging: &ToastStaging) -> Result<Option<PathBuf>> {
     let base = staging.root().join("base");
     let rd = match std::fs::read_dir(&base) {

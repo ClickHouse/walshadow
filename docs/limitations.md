@@ -115,19 +115,19 @@ generation at a lower TID can lose when versions tie
 
 `[toast] backend = "shadow"` (see
 [configuration](configuration.md#value-backend)) serves both a greenfield
-bootstrap and live CDC. Three limits carry real risk:
+bootstrap and live CDC. It has three important limitations:
 
-- **No reclamation fence.** Nothing withholds a prune or vacuum record from
-  shadow's replay, so a value that restartable work still needs can be gone
-  after a restart below the durable floor
-- **Shadow becomes a durability dependency for data**, not only a catalog
-  oracle. The ClickHouse mirror survives the loss of shadow; these values do
-  not, and rebuilding them means a fresh bootstrap
-- **No migration path.** The backends hold different history, so switching an
-  existing deployment needs a fresh bootstrap
+- **No reclamation fence.** walshadow does not delay prune or vacuum records
+  during shadow replay. After restart from a position below durable processing
+  progress, PostgreSQL may already have removed a required value
+- **Shadow stores required data, not only catalog state.** Losing shadow does
+  not lose a ClickHouse chunk mirror, but it does lose values stored by this
+  backend. Recovery requires a fresh bootstrap
+- **No migration path.** Backends store different history. Switching an
+  existing deployment requires a fresh bootstrap
 
-It reads the live generation exactly, which retires the reused-value-ID
-ambiguity recorded above for the ClickHouse mirror.
+Shadow reads current value generation directly, so ClickHouse mirror's reused
+value-ID ambiguity described above does not apply
 
 ## Not an HA system
 

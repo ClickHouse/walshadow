@@ -59,10 +59,10 @@ pub enum ChunkStoreError {
     /// Body spool read at row materialization
     #[error("toast store io: {0}")]
     Io(#[from] std::io::Error),
-    /// Shadow-backed read: bridge transport, or the worker refusing
+    /// Shadow read failed in bridge or worker
     #[error("toast store shadow: {0}")]
     Shadow(String),
-    /// Shadow holds the values, so it has nowhere to put a decoded chunk
+    /// Backend is read-only
     #[error("toast store shadow is read-only, refused {0}")]
     ReadOnly(&'static str),
 }
@@ -367,9 +367,7 @@ impl ChunkAssembler {
 /// Durable TID-keyed chunk store
 #[async_trait]
 pub trait ChunkStore: Send + Sync {
-    /// Whether this backend accepts decoded chunk rows. A backend that holds
-    /// the values physically has nowhere to put them, and callers must stop
-    /// collecting rather than call `put` and take the error
+    /// Whether backend accepts decoded chunk rows
     fn accepts_writes(&self) -> bool {
         true
     }
@@ -1032,8 +1030,7 @@ impl ToastResolver {
         }
     }
 
-    /// ClickHouse-mirror resolver, whatever `[toast] backend` says. Callers
-    /// that can honour the setting use [`Self::for_backend`]
+    /// Build ClickHouse-mirror resolver regardless of configured backend
     pub fn from_config(emitter: &EmitterConfig, stats: Arc<EmitterStats>) -> Self {
         Self::with_limits(
             Arc::new(ClickHouseChunkStore::new(emitter.clone())),
@@ -1042,10 +1039,7 @@ impl ToastResolver {
         )
     }
 
-    /// Resolver for `emitter`'s configured backend. The shadow backend reads
-    /// through `bridge` and needs one; passing `None` for it is a
-    /// configuration error rather than a silent fall back to the mirror,
-    /// because the two backends hold different history
+    /// Build resolver for configured backend. Shadow requires `bridge`
     pub fn for_backend(
         emitter: &EmitterConfig,
         stats: Arc<EmitterStats>,
@@ -1124,9 +1118,7 @@ impl ToastResolver {
         self.budget.as_ref()
     }
 
-    /// Whether anything should collect chunk rows for this resolver. False
-    /// without a store, and false for a read-only backend: a store that holds
-    /// the values already needs no mirror of them
+    /// Whether resolver store accepts decoded chunks
     pub fn stores_chunks(&self) -> bool {
         self.store.as_ref().is_some_and(|s| s.accepts_writes())
     }
@@ -1697,9 +1689,7 @@ mod tests {
         assert!(refs[1].materialize(None).is_err());
     }
 
-    /// A read-only backend keeps `fill_on_miss` false — a store exists, so a
-    /// miss is evidence, not licence to default-fill — while `stores_chunks`
-    /// goes false so nothing collects rows it cannot accept
+    /// Read-only backend neither stores chunks nor fills missing values
     #[tokio::test(flavor = "current_thread")]
     async fn read_only_store_reads_without_accepting_writes() {
         struct ReadOnly(MemChunkStore);
@@ -1756,7 +1746,7 @@ mod tests {
             r.fetch_value(16500, 7, u64::MAX, 4).await.unwrap(),
             Some(assembled(b"body")),
         );
-        // The write surface refuses rather than silently dropping rows
+        // Reject writes instead of dropping rows
         assert!(
             r.put(&[ToastRow {
                 toast_relid: 16500,
@@ -1774,8 +1764,7 @@ mod tests {
         assert!(r.rewrite_barrier(16500, 1, 2).await.is_err());
     }
 
-    /// `[toast] backend` picks the store, and the shadow one is unavailable
-    /// without the bridge it reads through
+    /// Shadow backend requires bridge
     #[test]
     fn for_backend_honours_the_setting() {
         let stats = || Arc::new(EmitterStats::default());

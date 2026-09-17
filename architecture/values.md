@@ -47,12 +47,11 @@ PostgreSQL instance because managed shadow is not ready yet
 ## Alternative value backend
 
 `[toast] backend = "shadow"` reads external values out of PostgreSQL's own
-TOAST heaps rather than a mirror, writing no chunks. The source's files are
-landed into shadow's data dir, and shadow is started during bootstrap so it
-reaches the backup's end position by ordinary recovery — which is what holds
-values written *during* the backup, whose chunks no file copy contains. Limits
-in
-[large values](../docs/limitations.md#shadow-value-backend); design in
+TOAST heaps instead of writing chunks to a mirror. Bootstrap copies source
+TOAST files into shadow's data directory and starts shadow so PostgreSQL can
+replay WAL through end of backup. WAL replay adds values written during backup
+that are not present in copied files. See
+[large-value limitations](../docs/limitations.md#shadow-value-backend) and
 [shadow TOAST plan](../plans/shadow_toast.md)
 
 ## Implementation

@@ -489,14 +489,10 @@ pub struct PageWalkSink {
     /// `pg_multixact/{offsets,members}` segments, for multixact xmax
     /// resolution in the same gate
     pg_multixact: Option<Arc<std::sync::Mutex<crate::decode::visibility::PgMultiXactAccum>>>,
-    /// Shadow-TOAST: write these relations' bodies here, mirroring the
-    /// data-dir layout, so a PostgreSQL can be given the files and asked for
-    /// the values instead of a chunk mirror being written. Set only when
-    /// `store_toast` is false, since the two are alternatives.
+    /// Copy selected relation files into PostgreSQL data-directory layout.
+    /// Set only when `store_toast` is false.
     ///
-    /// An explicit set rather than [`CatalogMap::is_toast`]: a TOAST heap is
-    /// unreadable without its index, and the index is a relation the catalog
-    /// map holds no descriptor for
+    /// Explicit set includes TOAST indexes absent from [`CatalogMap`]
     toast_stage: Option<crate::backfill::toast_staging::StagingTarget>,
 }
 
@@ -528,9 +524,7 @@ impl PageWalkSink {
         }
     }
 
-    /// Stage `rels` under `dir`, keeping their `base/<db>/<file>` paths so the
-    /// tree merges into a data dir unchanged. Their pages are not walked:
-    /// the file is the value store, so there is no mirror to fill
+    /// Stage `rels` under `dir` using their `base/<db>/<file>` paths
     pub fn staging_toast(
         mut self,
         dir: PathBuf,
@@ -540,8 +534,7 @@ impl PageWalkSink {
         self
     }
 
-    /// Counting entry that writes the body into the staging tree, for a
-    /// relation the shadow-TOAST backend serves values out of
+    /// Write relation body to staging tree and update counters
     async fn stage_entry(
         &self,
         f: &BaseRelFile,
@@ -706,8 +699,7 @@ impl BackupSink for PageWalkSink {
                 .fetch_add(1, Ordering::Relaxed);
             return Ok(FileAction::Skip);
         }
-        // Before any descriptor lookup: the toast index has none, and a heap
-        // staged without it cannot be read
+        // Stage TOAST index before descriptor lookup, catalog map has none
         if let Some(mut entry) = self.stage_entry(&f, meta).await? {
             entry.block_no = f.segno.saturating_mul(RELSEG_BLOCKS);
             self.stats
@@ -733,9 +725,7 @@ impl BackupSink for PageWalkSink {
             return Ok(FileAction::Skip);
         }
         let Some(desc) = desc else {
-            // TOAST heap whose descriptor the map lacks; count pages, no walk.
-            // Still stage it: the value store is the file, and a descriptor
-            // the map is missing does not make its chunks unreachable
+            // Stage relation even when catalog map lacks descriptor
             return Ok(FileAction::Tap(Box::new(PageWalkEntry::counting(
                 f.segno.saturating_mul(RELSEG_BLOCKS),
                 self.stats.clone(),
@@ -792,8 +782,7 @@ pub struct PageWalkEntry {
     walk: Option<WalkTarget>,
     out: Out,
     stats: Arc<PageWalkStats>,
-    /// Shadow-TOAST staging target. Bytes go through untouched: the file is
-    /// the value store, so a page the walk would not decode still has to land
+    /// Staging target for unmodified relation bytes
     land: Option<tokio::fs::File>,
     /// Previous slab's walk, still running. One slab of overlap: the tar
     /// reader refills while the blocking pool decodes, so read and decode

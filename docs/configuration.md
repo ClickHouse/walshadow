@@ -178,7 +178,7 @@ Tune chunk-store buffering independently of inserter count, restart daemon to ap
 
 | `[toast]` setting | Default | Effect |
 |---|---:|---|
-| `backend` | `clickhouse` | Where external values live: `clickhouse` or `shadow` |
+| `backend` | `clickhouse` | Store external values in `clickhouse` or `shadow` |
 | `put_batch_rows` | 65,536 | Seal chunk INSERT after this many rows |
 | `put_batch_bytes` | 67,108,864 | Seal chunk INSERT after this many body bytes |
 | `connections` | `ch.inserter_pool_size` | Limit concurrent chunk-store connections |
@@ -206,42 +206,38 @@ The three buffering settings require positive integers. Existing
 `ReplacingMergeTree` keyed by physical tuple location.
 
 `backend = "shadow"` reads values out of shadow PostgreSQL's own TOAST heaps
-and writes no chunks at all. Shadow answers every lookup — the backup-window
-replay leg's, the page walk's deferred rows, and live CDC after handoff.
+and does not write chunks to ClickHouse. Shadow handles lookups during backup
+WAL replay, deferred page-walk processing, and live CDC.
 
-**Shadow starts during bootstrap, not after it.** The source's TOAST heaps and
-their indexes are landed into shadow's data dir, and shadow then reaches the
-backup's end position by ordinary recovery. That is what makes a value written
-*during* the backup readable: its chunks are appended mid-window, so no file
-copy holds them — only replaying the WAL does. Recovery also repairs pages the
-backup copied mid-write, which is the same reason a base backup is only valid
-once its WAL is replayed.
+**Shadow starts during bootstrap.** Bootstrap copies source TOAST heaps and
+indexes into shadow's data directory. PostgreSQL then replays WAL through end
+of backup. This replay adds values written during backup that are not present
+in copied files. It also repairs pages copied during a concurrent write, just
+as normal base-backup recovery does.
 
-The backup-window replay leg reads its own copy of the in-window WAL segments
-from `--spill-dir`, because the originals in `pg_wal` are rewritten before
-shadow's recovery sees them.
+Backup WAL processing reads unmodified segments from `--spill-dir` because
+walshadow rewrites segments in `pg_wal` before shadow recovery reads them.
 
 **Costs and constraints:**
 
-- Shadow holds the TOAST heaps and indexes for as long as it runs. On a
-  TOAST-heavy corpus that is most of the database's size. Nothing else about
-  the backup is landed — user heaps still stream through without touching disk
+- Shadow stores TOAST heaps and indexes while it runs. For a TOAST-heavy
+  database, these files may account for most database storage. Other user
+  heaps continue to stream without being copied to disk
 - Shadow replays those relations' WAL as well as the catalog's. Shipped WAL
-  volume is unchanged — a dropped record is rewritten to a NOOP of equal
-  length — so the cost is shadow's disk and apply work, not bandwidth
-- A read waits for shadow to replay through the referring record, then reads
-  at whatever position replay has reached. Nothing yet withholds a replayed
-  reclamation, so a restart below the durable floor can find a value gone
-- The `[toast]` buffering settings above do nothing: there are no chunk writes
-  to seal
-- The two backends hold different history and are not interchangeable on a
-  running deployment. Switching needs a fresh bootstrap
-- Default tablespace only: a relation behind a `pg_tblspc` symlink is not
-  landed, and is counted rather than silently mis-served
-- The bootstrap oracle is unaffected. It is provisioned only for tier-3 type
-  conversion, as before, and takes no part in resolving values
+  volume does not change because walshadow replaces each dropped record with
+  an equal-length NOOP. Additional costs are shadow disk space and WAL replay
+- Reads wait until shadow has replayed referring record. walshadow does not yet
+  delay prune or vacuum records, so restart from a position below durable
+  processing progress may find that PostgreSQL has removed a required value
+- Buffering settings above have no effect because this backend writes no chunks
+- Backends store different history. Switching a running deployment requires a
+  fresh bootstrap
+- Only default tablespace is supported. walshadow counts and skips relations
+  reached through `pg_tblspc` symlinks instead of returning incorrect values
+- Bootstrap oracle remains responsible only for tier-3 type conversion and
+  does not resolve values
 
-Design and open work in `plans/shadow_toast.md`
+See [shadow TOAST plan](../plans/shadow_toast.md) for design and open work
 
 ## Backup archive
 

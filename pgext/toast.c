@@ -1,21 +1,18 @@
 /*
- * toast.c — read stored TOAST values out of shadow's physical heaps.
+ * Read stored TOAST values from shadow's physical heaps.
  *
- * The daemon's alternative to the ClickHouse chunk mirror: shadow already
- * replays source WAL, so if it also carries the TOAST heaps and indexes the
- * value is readable locally. Chunks are returned *stored*, not decompressed —
- * the daemon owns pglz/lz4 and the `va_tcinfo` prefix, and validating raw size
- * there keeps one decompressor in the system.
+ * Shadow stores TOAST heaps and indexes while replaying source WAL, so daemon
+ * can read values locally instead of using ClickHouse chunk mirror. Return
+ * stored chunks without decompression. Daemon handles pglz/lz4, va_tcinfo,
+ * and raw-size validation.
  *
- * Visibility is `HeapTupleSatisfiesToast`, which ignores xmax: a value whose
- * referring row version is dead stays readable until pruning or vacuum removes
- * the chunks. That is the property the design rests on, and this op exists to
- * measure it rather than assume it.
+ * HeapTupleSatisfiesToast ignores xmax. Values remain readable after referring
+ * row version dies until pruning or vacuum removes chunks.
  *
- * Reuse of a value id across generations is the one case the ordered scan
- * cannot resolve on its own, because both generations satisfy the snapshot.
- * Requiring the run to be exactly dense from 0 covers it the same way it
- * covers a partly pruned run: either way the scan is refused, never spliced.
+ * Ordered scan cannot distinguish reused value IDs when snapshot includes
+ * multiple generations. Require sequence starting at zero with no gaps and
+ * exact total size. Reject partial or interleaved runs instead of combining
+ * chunks from different generations.
  */
 #include "postgres.h"
 
@@ -41,12 +38,10 @@
 #define WS_TOAST_ATT_DATA		3
 
 /*
- * Toast-snapshot visibility, without depending on how a given major exposes
- * it: PG 18 exports `SnapshotToastData` and `get_toast_snapshot()`, while 16
- * and 17 have neither and build one through the `InitToastSnapshot` macro.
- * All three agree on the parts that matter — `snapshot_type` selects
- * `HeapTupleSatisfiesToast`, and a zero `lsn`/`whenTaken` is what disables the
- * old-snapshot check that only PG 16 still carries.
+ * Initialize TOAST snapshot across supported PostgreSQL versions. PostgreSQL
+ * 18 exports SnapshotToastData and get_toast_snapshot(); 16 and 17 use
+ * InitToastSnapshot. All use snapshot_type to select HeapTupleSatisfiesToast.
+ * Zero lsn and whenTaken disable old-snapshot check retained by PostgreSQL 16.
  */
 static void
 ws_init_toast_snapshot(SnapshotData *snap)
@@ -59,11 +54,9 @@ ws_init_toast_snapshot(SnapshotData *snap)
  * Assemble one value's chunk run, appending
  * `[result:u8][len:u32][stored bytes]` to `out`.
  *
- * The run is accepted only when every `chunk_seq` lands exactly where the
- * previous one ended and the whole run totals `expected` — the same evidence
- * the mirror's assembler demands, so both backends fill on the same terms.
- * Density alone rejects a partly pruned run and interleaved generations
- * under a reused id, so neither needs a case of its own.
+ * Accept only consecutive chunk_seq values starting at zero and exact expected
+ * size, matching mirror validation. Same checks reject partially pruned runs
+ * and interleaved generations under reused IDs.
  */
 static void
 ws_fetch_one(Relation toastrel, Relation toastidx, Snapshot snap,
@@ -95,9 +88,7 @@ ws_fetch_one(Relation toastrel, Relation toastidx, Snapshot snap,
 		char	   *chunkdata;
 
 		saw_any = true;
-		/* A toast rel's columns are NOT NULL and its chunks are never
-		 * themselves toasted (PG catalog/toasting.c), so these are
-		 * structural, the same way detoast.c treats them */
+		/* TOAST columns are NOT NULL, see catalog/toasting.c */
 		d = heap_getattr(ttup, WS_TOAST_ATT_SEQ, tupdesc, &isnull);
 		Assert(!isnull);
 		seq = DatumGetInt32(d);
@@ -105,8 +96,7 @@ ws_fetch_one(Relation toastrel, Relation toastidx, Snapshot snap,
 		d = heap_getattr(ttup, WS_TOAST_ATT_DATA, tupdesc, &isnull);
 		Assert(!isnull);
 		chunk = DatumGetPointer(d);
-		/* `chunk_data` is TYPSTORAGE_PLAIN, so it is neither packed into a
-		 * short header nor toasted itself */
+		/* TYPSTORAGE_PLAIN prevents short headers and nested TOAST values */
 		Assert(!VARATT_IS_EXTENDED(chunk));
 		chunksize = VARSIZE(chunk) - VARHDRSZ;
 		chunkdata = VARDATA(chunk);
@@ -125,8 +115,7 @@ ws_fetch_one(Relation toastrel, Relation toastidx, Snapshot snap,
 	else
 		result = WS_FETCH_OK;
 
-	/* Length travels either way: on a refusal it is how far the run got,
-	 * which is what the daemon reports. Bytes follow only when accepted */
+	/* Report assembled length on failure, include bytes only on success */
 	pq_sendbyte(out, result);
 	pq_sendint32(out, (uint32) body.len);
 	if (result == WS_FETCH_OK)
@@ -170,12 +159,7 @@ ws_handle_fetch_toast(StringInfo req, StringInfo resp)
 	{
 		ids[i] = (Oid) pq_getmsgint(req, 4);
 		sizes[i] = pq_getmsgint(req, 4);
-		/*
-		 * Refused on the declared sizes rather than on the assembled run: a
-		 * batch the response cannot carry must cost no reads, and the
-		 * StringInfo it would build errors as out-of-memory rather than as a
-		 * protocol answer the daemon can act on
-		 */
+		/* Reject oversized batch before reads or StringInfo allocation */
 		want += sizes[i];
 		if (want > WS_MAX_RESPONSE_BYTES)
 			ereport(ERROR,
@@ -185,11 +169,10 @@ ws_handle_fetch_toast(StringInfo req, StringInfo resp)
 	}
 
 	/*
-	 * Sampled before the relation is opened so a refusal costs no lock. The
-	 * caller's bound is a floor, not the equality `SCAN` asserts: a value's
-	 * chunks are written below the referring record, so replay only has to
-	 * have reached it. Both samples go back regardless, because a destructive
-	 * record replayed mid-batch is what would make an assembled run stale.
+	 * Sample before opening relation so early rejection acquires no lock.
+	 * Caller's bound is minimum replay position. Chunks precede referring
+	 * record, so replay only needs to reach that record. Return positions before
+	 * and after read to detect destructive WAL replay during batch.
 	 */
 	lsn_start = (uint64) GetXLogReplayRecPtr(NULL);
 	if (min_replay_lsn != 0 && lsn_start < min_replay_lsn)

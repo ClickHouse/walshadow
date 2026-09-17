@@ -44,9 +44,7 @@ pub async fn filter_landed_wal(
     timeline: u32,
     end_lsn: u64,
     tracker: CatalogTracker,
-    // Shadow-TOAST: relations whose records shadow has to replay, because it
-    // serves their values after handoff. Their files were staged, so redo has
-    // something to write into
+    // Relations shadow must replay after staged files are installed
     keep_rels: ahash::HashSet<(u32, u32)>,
 ) -> Result<LandedWalStats> {
     let segments = segments_on_disk(pg_wal, timeline).await?;
@@ -222,11 +220,8 @@ impl SegmentSink for WriteBack {
 
 /// Copy the in-window segments out of `pg_wal` into `dir`.
 ///
-/// The backup-window replay leg needs these bytes as the source wrote them,
-/// but [`filter_landed_wal`] rewrites `pg_wal` in place and has to run before
-/// any recovery sees it. Under the shadow value backend that recovery starts
-/// *during* bootstrap, because shadow is what answers the leg's own value
-/// lookups — so the leg reads a copy instead of the original.
+/// Backup WAL processing needs original bytes, while [`filter_landed_wal`]
+/// rewrites `pg_wal` before shadow recovery. Read original segments from copy.
 pub async fn copy_window_segments(
     pg_wal: &Path,
     dir: &Path,
@@ -242,7 +237,7 @@ pub async fn copy_window_segments(
         if seg.start_lsn(WAL_SEG_SIZE) >= end_lsn {
             break;
         }
-        // The leg reads from a segment boundary at or below its floor
+        // Start copy at segment containing replay floor
         if seg.start_lsn(WAL_SEG_SIZE) + WAL_SEG_SIZE <= from_lsn {
             continue;
         }
