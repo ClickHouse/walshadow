@@ -1,0 +1,48 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1120" height="560" viewBox="0 0 1120 560" role="img" aria-labelledby="title desc">
+  <title id="title">Shadow TOAST data and replay paths</title>
+  <desc id="desc">Original WAL feeds decoding while filtered WAL and copied TOAST files feed shadow PostgreSQL. Same-transaction chunks resolve directly. Older pointers wait for shadow replay, then fetch stored chunks through PostgreSQL extension before rows reach ClickHouse. Destructive WAL reaches shadow unheld, so a value reclaimed before its row emits NULL. Planned work pins source xmin and spills values instead of holding replay.</desc>
+  <defs>
+    <marker id="data" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 1 1 L 9 5 L 1 9" fill="none" stroke="#A3A9CE" stroke-width="1.5"/></marker>
+    <marker id="control" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 1 1 L 9 5 L 1 9" fill="none" stroke="#E49B5D" stroke-width="1.5"/></marker>
+  </defs>
+  <style>
+    text { font-family: Arial, Helvetica, sans-serif; font-size: 18px; fill: #ECE1D7; }
+    .name { font-family: monospace; font-size: 19px; font-weight: 600; }
+    .label { font-size: 16px; fill: #C1A78E; }
+  </style>
+  <rect width="1120" height="560" fill="#292522"/>
+  <path d="M 48 72 C 48 56 288 56 288 72 V 144 C 288 160 48 160 48 144 Z M 48 72 C 48 88 288 88 288 72" fill="#422741" stroke="#CF9BC2" stroke-width="1.3"/>
+  <text x="64" y="104" class="name">Backup TOAST files</text>
+  <text x="64" y="130">Heaps + indexes</text>
+  <rect x="48" y="232" width="240" height="96" fill="#273142" stroke="#867462" stroke-width="1.3"/>
+  <text x="64" y="264" class="name">Source WAL</text>
+  <text x="64" y="290">Original records</text>
+  <text x="64" y="314">Stable WAL positions</text>
+  <rect x="392" y="48" width="296" height="136" fill="#34302C" stroke="#867462" stroke-width="1.3"/>
+  <text x="408" y="80" class="name">Shadow PostgreSQL</text>
+  <text x="408" y="108">Copied physical files</text>
+  <text x="408" y="134">Filtered WAL replay</text>
+  <text x="408" y="160">TOAST fetch extension</text>
+  <rect x="392" y="232" width="296" height="96" fill="#292522" stroke="#867462" stroke-width="1.3"/>
+  <text x="408" y="264" class="name">Decoder / resolver</text>
+  <text x="408" y="290">Current chunks, direct</text>
+  <text x="408" y="314">Older pointers, shadow fetch</text>
+  <rect x="816" y="232" width="256" height="96" fill="#403A36" stroke="#EBC06D" stroke-width="1.3"/>
+  <text x="832" y="264" class="name">ClickHouse</text>
+  <text x="832" y="290">Resolved row values</text>
+  <path d="M 288 112 H 392" fill="none" stroke="#A3A9CE" stroke-width="1.8" marker-end="url(#data)"/>
+  <text x="304" y="98" class="label">bootstrap copy</text>
+  <path d="M 288 260 H 336 V 144 H 392" fill="none" stroke="#A3A9CE" stroke-width="1.8" marker-end="url(#data)"/>
+  <text x="300" y="206" class="label">filtered replay</text>
+  <path d="M 288 304 H 392" fill="none" stroke="#A3A9CE" stroke-width="1.8" marker-end="url(#data)"/>
+  <text x="304" y="290" class="label">decode</text>
+  <path d="M 540 232 V 184" fill="none" stroke="#E49B5D" stroke-width="1.8" marker-end="url(#control)" marker-start="url(#control)"/>
+  <text x="556" y="216" class="label">wait + fetch</text>
+  <path d="M 688 280 H 816" fill="none" stroke="#A3A9CE" stroke-width="1.8" marker-end="url(#data)"/>
+  <rect x="392" y="416" width="296" height="96" fill="#392D24" stroke="#E49B5D" stroke-width="1.3" stroke-dasharray="7 5"/>
+  <text x="408" y="444" class="name">No reclamation fence</text>
+  <text x="408" y="470">Reclaimed value emits NULL</text>
+  <text x="408" y="494" class="label">Planned: xmin pin, value spill</text>
+  <path d="M 336 328 V 460 H 392" fill="none" stroke="#E49B5D" stroke-width="1.8" stroke-dasharray="7 5" marker-end="url(#control)"/>
+  <text x="64" y="430" class="label">prune, vacuum, truncate, drop</text>
+</svg>

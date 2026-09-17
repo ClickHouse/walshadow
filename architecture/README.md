@@ -15,8 +15,9 @@ row decoding and uses PostgreSQL conversion for types it cannot decode locally
 
 Filtering preserves WAL positions while replacing unwanted records or blocks
 with valid placeholders. This keeps compatibility work in WAL transformation
-instead of requiring a PostgreSQL recovery fork. Shadow retains catalogs and
-recovery state, not ordinary user-table contents
+instead of requiring a PostgreSQL recovery fork. By default, shadow retains
+catalogs and recovery state, not ordinary user-table contents. Shadow TOAST mode
+also retains selected physical data, see [shadow TOAST storage](shadow-toast.md)
 
 ## Streaming topology
 
@@ -50,6 +51,7 @@ and plan data can spill to disk
 |---|---|---|
 | [Catalog capture and DDL](catalog.md) | Historical tuple layouts and ordered schema effects | [capture](../src/source/catalog_capture.rs), [reorder](../src/emit/pipeline/reorder.rs) |
 | [TOAST and type conversion](values.md) | Historical large values and PostgreSQL conversion | [resolver](../src/toast/resolver.rs), [oracle](../src/ops/oracle.rs) |
+| [Shadow TOAST storage](shadow-toast.md) | PostgreSQL-backed large values and physical WAL routing | [reader](../src/toast/shadow_store.rs), [filter](../src/filter/engine.rs) |
 | [Bootstrap](bootstrap.md) | Backup visibility, concurrent WAL, and initial-load publication | [backup](../src/backfill/backfill_bootstrap.rs), [window](../src/backfill/bootstrap_window.rs) |
 | [Restart and cleanup](recovery.md) | Durable progress, retained history, and timeline crossing | [manifest](../src/source/manifest.rs), [status loop](../src/bin/stream.rs) |
 

@@ -94,6 +94,8 @@ pub enum Route {
     #[default]
     ToShadow,
     ToDecoder,
+    /// Send original record to shadow replay and decoder
+    ToBoth,
 }
 
 /// Which sample point a boundary is. Both park publication until shadow
@@ -312,6 +314,7 @@ impl MetricsRecordSink {
             let route = match route {
                 Route::ToShadow => "to_shadow",
                 Route::ToDecoder => "to_decoder",
+                Route::ToBoth => "to_both",
             };
             write!(summary, " {}/{}={count}", rmgr_label(*rm), route).unwrap();
         }

@@ -155,8 +155,8 @@ jobs:
           make PG_CONFIG=$PG_CONFIG coverage-build
           sudo make PG_CONFIG=$PG_CONFIG COVERAGE=1 CC=gcc install
 
-      # Separate module, never installed: catalog_ael_boundary loads it into
-      # the *source* cluster to reproduce VACUUM's lock lifetime deterministically
+      # Separate module, never installed: tests load it into their *source*
+      # cluster for primitives SQL cannot express, eg VACUUM's lock lifetime
       - name: Build walshadow test-only PG module
         working-directory: walshadow/pgext/test
         run: make PG_CONFIG=/usr/lib/postgresql/${{ matrix.pg-major }}/bin/pg_config

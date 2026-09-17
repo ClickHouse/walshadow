@@ -98,6 +98,9 @@ impl Census {
         match record.route {
             Route::ToShadow => self.to_shadow += 1,
             Route::ToDecoder => self.to_decoder += 1,
+            // Shadow replays it, so it counts there; the decoder side is not
+            // what this census measures
+            Route::ToBoth => self.to_shadow += 1,
         }
         let xid = record.parsed.header.xact_id;
         let op = format!(

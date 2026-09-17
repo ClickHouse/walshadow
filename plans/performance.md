@@ -36,7 +36,7 @@ Check process uptime and cumulative series remain valid across phase changes
 | Filter CRC consumes a core | Parallelize independent record work while preserving output order |
 | Per-record allocation dominates | Evaluate inline storage for small block-reference lists |
 | Catalog refresh work dominates | Narrow invalidation only after measuring recapture and cache cost |
-| TOAST fetch or materialization dominates | Compare current store with [shadow proposal](shadow_toast.md) |
+| TOAST fetch or materialization dominates | Compare ClickHouse and [shadow modes](../architecture/shadow-toast.md) |
 
 Bootstrap workers change ordering: assign acknowledgement sequence before
 parallel decode and account for concurrent deferred-TOAST writers. Preserve

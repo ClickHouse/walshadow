@@ -16,7 +16,7 @@
 #   make PG_CONFIG=/usr/lib/postgresql/17/bin/pg_config
 
 MODULE_big = walshadow
-OBJS = native.o overlay.o worker.o
+OBJS = native.o overlay.o toast.o worker.o
 
 # Unmodified upstream, pinned as a recursive submodule. `native.o` is the one
 # translation unit compiling both header-only implementations; -isystem keeps

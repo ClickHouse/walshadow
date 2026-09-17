@@ -187,6 +187,11 @@ impl Oracle {
         self.bridge.pool_size()
     }
 
+    /// Shared worker bridge used by oracle and shadow TOAST store
+    pub fn bridge(&self) -> Arc<Bridge> {
+        self.bridge.clone()
+    }
+
     /// Round-trip cost of resolution: the request bytes and worker service
     /// time behind [`OracleStats`]
     pub fn bridge_stats(&self) -> Arc<crate::ops::bridge::BridgeStats> {

@@ -2797,7 +2797,7 @@ impl RecordSink for BufferingDecoderSink {
                 );
                 return Ok(());
             }
-            if record.route != Route::ToDecoder {
+            if !matches!(record.route, Route::ToDecoder | Route::ToBoth) {
                 return Ok(());
             }
             if rm != RmId::Heap as u8 && rm != RmId::Heap2 as u8 {

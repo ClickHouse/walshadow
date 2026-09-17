@@ -5,7 +5,7 @@
 //! * `Special` rmgr → ToShadow (recovery plumbing shadow needs verbatim)
 //! * `Catalog` → ToShadow
 //! * `User` → ToDecoder (XLOG_NOOP placeholder on shadow; original bytes
-//!   feed the heap decoder)
+//!   feed the heap decoder), or ToBoth for a relation in `shadow_rels`
 //! * `Empty` → reclassify via `main_data::relation_for_empty` against
 //!   `CatalogTracker`. Unrecognised → ToShadow: correctness over bytes,
 //!   wrongly suppressing a catalog record breaks shadow.
@@ -62,7 +62,7 @@ impl FilterStats {
 
     pub fn record(&mut self, class: Class, route: Route, bytes: u64) {
         match route {
-            Route::ToShadow => {
+            Route::ToShadow | Route::ToBoth => {
                 self.kept += 1;
                 self.kept_bytes += bytes;
                 match class {
@@ -187,6 +187,14 @@ pub struct Filter {
     /// (offline segment filter, no capture consumer) proves no record's
     /// database, so no record dirties
     target_db_oid: Option<u32>,
+    /// User relations stored by shadow whose WAL must also reach shadow
+    ///
+    /// `None` keeps only catalog WAL. Seed from shadow's data directory and add
+    /// relations when shadow replays `XLOG_SMGR_CREATE`. Never route a relation
+    /// missing from shadow, redo can fail when first record lacks a full image
+    shadow_rels: Option<HashSet<(u32, u32)>>,
+    /// Ignore creates before this LSN because shadow may not have their files
+    admit_creates_from: u64,
 }
 
 impl Filter {
@@ -199,6 +207,8 @@ impl Filter {
             observed_from_xid: None,
             smgr_markers: Arc::new(Mutex::new(SmgrMarkers::default())),
             target_db_oid: None,
+            shadow_rels: None,
+            admit_creates_from: 0,
         }
     }
 
@@ -206,6 +216,32 @@ impl Filter {
     /// streams set this before the first record
     pub fn set_target_db(&mut self, db_oid: u32) {
         self.target_db_oid = Some(db_oid);
+    }
+
+    /// Route `rels` and relations created at or after `from_lsn` to both paths
+    ///
+    /// `rels` lists files shadow already holds at `from_lsn`
+    pub fn keep_user_rels(&mut self, rels: HashSet<(u32, u32)>, from_lsn: u64) {
+        self.shadow_rels = Some(rels);
+        self.admit_creates_from = from_lsn;
+    }
+
+    /// Relations routed to shadow as well as decoder, `None` when off
+    pub fn shadow_rels(&self) -> Option<&HashSet<(u32, u32)>> {
+        self.shadow_rels.as_ref()
+    }
+
+    fn keeps_user_rel(&self, db: u32, rel: u32) -> bool {
+        self.shadow_rels
+            .as_ref()
+            .is_some_and(|s| s.contains(&(db, rel)))
+    }
+
+    fn user_rel_to_shadow(&self, record: &XLogRecord) -> bool {
+        record.blocks.iter().any(|b| {
+            let r = b.header.location.rel;
+            self.keeps_user_rel(r.db_node, r.rel_node)
+        })
     }
 
     /// Capture reads rotation markers through this handle
@@ -295,6 +331,8 @@ impl Filter {
                 if any_block_is_catalog(&self.tracker, &record.blocks) {
                     // tracker has filenodes the bootstrap classify rule misses
                     (Route::ToShadow, self.descriptor_touch_db(record))
+                } else if self.user_rel_to_shadow(record) {
+                    (Route::ToBoth, None)
                 } else {
                     (Route::ToDecoder, None)
                 }
@@ -304,6 +342,8 @@ impl Filter {
                     if self.tracker.is_catalog(rel.db_node, rel.rel_node) {
                         let opaque = self.tracker.is_opaque_catalog(rel.db_node, rel.rel_node);
                         (Route::ToShadow, (!opaque).then_some(rel.db_node))
+                    } else if self.keeps_user_rel(rel.db_node, rel.rel_node) {
+                        (Route::ToBoth, None)
                     } else {
                         (Route::ToDecoder, None)
                     }
@@ -320,6 +360,13 @@ impl Filter {
                 .lock()
                 .expect("smgr markers poisoned")
                 .insert(rfn, source_lsn);
+            // Ignore other databases because their values are never read
+            if let Some(rels) = &mut self.shadow_rels
+                && source_lsn >= self.admit_creates_from
+                && self.target_db_oid.is_none_or(|db| db == rfn.db_node)
+            {
+                rels.insert((rfn.db_node, rfn.rel_node));
+            }
         }
         // Running-xacts records provide observation points during streaming
         if record.header.resource_manager_id == RmId::Standby as u8
@@ -705,6 +752,107 @@ mod tests {
         let mut f = Filter::new();
         f.set_target_db(TARGET_DB);
         f
+    }
+
+    /// Shadow receives chunk WAL while decoder emits row
+    #[test]
+    fn user_records_reach_both_sides_under_shadow_toast() {
+        let mut f = target_filter();
+        let user = rec(RmId::Heap, &[(TARGET_DB, 16500)]);
+        assert_eq!(f.decide(&user), Route::ToDecoder, "off by default");
+        assert!(f.shadow_rels().is_none());
+
+        f.keep_user_rels([(TARGET_DB, 16500)].into_iter().collect(), 0);
+        assert_eq!(f.decide(&user), Route::ToBoth);
+        // Listed relations only, keyed by database
+        assert_eq!(
+            f.decide(&rec(RmId::Heap, &[(TARGET_DB, 16501)])),
+            Route::ToDecoder
+        );
+        assert_eq!(f.decide(&rec(RmId::Heap, &[(6, 16500)])), Route::ToDecoder);
+
+        // Preserve existing route for catalog and special records
+        assert_eq!(
+            f.decide(&rec(RmId::Heap, &[(TARGET_DB, 1259)])),
+            Route::ToShadow
+        );
+        assert_eq!(f.decide(&rec(RmId::Xact, &[])), Route::ToShadow);
+    }
+
+    /// Admit main-fork relations created while shadow is replaying WAL
+    #[test]
+    fn smgr_create_admits_relation_for_shadow() {
+        let heap = |db, rel| rec(RmId::Heap, &[(db, rel)]);
+        let mut f = target_filter();
+        f.keep_user_rels(HashSet::default(), 10);
+        assert_eq!(f.decide(&heap(TARGET_DB, 24000)), Route::ToDecoder);
+        f.decide_record(&smgr_create(TARGET_DB, 24000, 0), 10, 0xD116)
+            .unwrap();
+        assert_eq!(f.decide(&heap(TARGET_DB, 24000)), Route::ToBoth);
+
+        // Created before shadow's recovery started: shadow has no file
+        f.decide_record(&smgr_create(TARGET_DB, 23999, 0), 9, 0xD116)
+            .unwrap();
+        assert_eq!(f.decide(&heap(TARGET_DB, 23999)), Route::ToDecoder);
+
+        // Init fork is not main storage
+        f.decide_record(&smgr_create(TARGET_DB, 24001, 1), 11, 0xD116)
+            .unwrap();
+        assert_eq!(f.decide(&heap(TARGET_DB, 24001)), Route::ToDecoder);
+
+        // Foreign database serves no value read
+        f.decide_record(&smgr_create(FOREIGN_DB, 24002, 0), 12, 0xD116)
+            .unwrap();
+        assert_eq!(f.decide(&heap(FOREIGN_DB, 24002)), Route::ToDecoder);
+
+        // Offline filter has no followed database and admits every one
+        let mut offline = Filter::new();
+        offline.keep_user_rels(HashSet::default(), 0);
+        offline
+            .decide_record(&smgr_create(FOREIGN_DB, 24002, 0), 12, 0xD116)
+            .unwrap();
+        assert_eq!(offline.decide(&heap(FOREIGN_DB, 24002)), Route::ToBoth);
+
+        // Off: creation changes nothing
+        let mut off = target_filter();
+        off.decide_record(&smgr_create(TARGET_DB, 24000, 0), 10, 0xD116)
+            .unwrap();
+        assert!(off.shadow_rels().is_none());
+        assert_eq!(off.decide(&heap(TARGET_DB, 24000)), Route::ToDecoder);
+    }
+
+    /// Keep `ToBoth` records unchanged so shadow receives original bytes
+    #[test]
+    fn to_both_counts_as_kept_not_dropped() {
+        let mut stats = FilterStats::default();
+        stats.record(Class::User, Route::ToBoth, 64);
+        assert_eq!((stats.kept, stats.dropped), (1, 0));
+        assert_eq!(stats.kept_bytes, 64);
+        assert_eq!(stats.kept_user, 1);
+
+        let mut dropped = FilterStats::default();
+        dropped.record(Class::User, Route::ToDecoder, 64);
+        assert_eq!((dropped.kept, dropped.dropped), (0, 1));
+    }
+
+    /// A record with no block refs whose relation resolves to a user relation
+    /// takes the same route as one that names it in a block
+    #[test]
+    fn empty_class_user_relation_follows_the_setting() {
+        let mut f = target_filter();
+        let mut r = rec(RmId::Btree, &[]);
+        r.header.info = main_data::XLOG_BTREE_REUSE_PAGE;
+        let mut md = Vec::new();
+        md.extend_from_slice(&1663u32.to_le_bytes());
+        md.extend_from_slice(&TARGET_DB.to_le_bytes());
+        md.extend_from_slice(&16500u32.to_le_bytes());
+        md.extend_from_slice(&0u32.to_le_bytes());
+        md.extend_from_slice(&0u64.to_le_bytes());
+        md.push(0);
+        r.main_data = md.into();
+        assert_eq!(f.decide(&r), Route::ToDecoder);
+        f.keep_user_rels([(TARGET_DB, 16500)].into_iter().collect(), 0);
+        assert_eq!(f.decide(&r), Route::ToBoth);
     }
 
     fn rec(rm: RmId, rels: &[(u32, u32)]) -> XLogRecord<'static> {
@@ -1621,19 +1769,24 @@ mod tests {
         assert!(f.decide_record(&commit, 300, 0xD116).is_err());
     }
 
-    #[test]
-    fn smgr_create_records_pump_marker() {
-        use crate::filter::main_data::XLOG_SMGR_CREATE;
-        let mut f = target_filter();
+    /// `XLOG_SMGR_CREATE` of `rel` in `db`, default tablespace
+    fn smgr_create(db: u32, rel: u32, fork: i32) -> XLogRecord<'static> {
         let mut md = Vec::new();
         md.extend_from_slice(&1663u32.to_le_bytes());
-        md.extend_from_slice(&5u32.to_le_bytes());
-        md.extend_from_slice(&24000u32.to_le_bytes());
-        md.extend_from_slice(&0i32.to_le_bytes()); // MAIN_FORKNUM
+        md.extend_from_slice(&db.to_le_bytes());
+        md.extend_from_slice(&rel.to_le_bytes());
+        md.extend_from_slice(&fork.to_le_bytes());
         let mut r = rec(RmId::Smgr, &[]);
-        r.header.info = XLOG_SMGR_CREATE;
+        r.header.info = main_data::XLOG_SMGR_CREATE;
         r.main_data = std::borrow::Cow::Owned(md);
-        f.decide_record(&r, 777, 0xD116).unwrap();
+        r
+    }
+
+    #[test]
+    fn smgr_create_records_pump_marker() {
+        let mut f = target_filter();
+        f.decide_record(&smgr_create(5, 24000, 0), 777, 0xD116)
+            .unwrap();
         let rfn = RelFileNode {
             spc_node: 1663,
             db_node: 5,
