@@ -234,7 +234,7 @@ async fn leg_reads_through_end_lsn_inside_its_first_segment() {
         let (stop_tx, stop_rx) = tokio::sync::watch::channel(Some(end_lsn));
         let patch = Arc::new(std::sync::Mutex::new(PgXactPatch::new()));
         let cfg = WindowLegConfig {
-        wind_down: Duration::from_secs(5),
+            wind_down: Duration::from_secs(5),
             emitter: emitter(slot.ch_tcp),
             mapping: walshadow::mapping::mapping_handle(emitter(slot.ch_tcp).tables),
             config: Arc::new(ResolvedConfig::default()),

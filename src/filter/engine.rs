@@ -769,7 +769,10 @@ mod tests {
 
         // Catalog and special records keep their existing route: they were
         // already going to shadow, and nothing decodes them
-        assert_eq!(f.decide(&rec(RmId::Heap, &[(TARGET_DB, 1259)])), Route::ToShadow);
+        assert_eq!(
+            f.decide(&rec(RmId::Heap, &[(TARGET_DB, 1259)])),
+            Route::ToShadow
+        );
         assert_eq!(f.decide(&rec(RmId::Xact, &[])), Route::ToShadow);
 
         // A foreign database's user relation is still a user relation

@@ -179,9 +179,11 @@ async fn unchanged_toast_pointer_resolves_out_of_shadow() {
         "the unchanged pointer resolved to the full value out of shadow",
     );
     assert_eq!(
-        ch.query("SELECT length(body) FROM walshadow_test.doc \
-                  WHERE id = 1 ORDER BY _lsn DESC LIMIT 1")
-            .expect("ch body length"),
+        ch.query(
+            "SELECT length(body) FROM walshadow_test.doc \
+                  WHERE id = 1 ORDER BY _lsn DESC LIMIT 1"
+        )
+        .expect("ch body length"),
         "8192",
         "a truncated read would still compare unequal, so pin the length too",
     );
@@ -189,7 +191,10 @@ async fn unchanged_toast_pointer_resolves_out_of_shadow() {
     // Nothing filled: a default or a superseded fill would make the value
     // assertions above pass for the wrong reason on a NULL-able column
     assert_eq!(stats.toast_values_filled_default.load(Ordering::Relaxed), 0);
-    assert_eq!(stats.toast_values_filled_superseded.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        stats.toast_values_filled_superseded.load(Ordering::Relaxed),
+        0
+    );
     assert_eq!(stats.toast_fetch_miss.load(Ordering::Relaxed), 0);
     assert!(
         stats.toast_values_fetched.load(Ordering::Relaxed) > 0,

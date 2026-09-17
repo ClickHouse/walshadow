@@ -4566,8 +4566,7 @@ async fn run_bootstrap(
             args.spill_dir.join("bootstrap_oracle_toast"),
         )
     });
-    let shadow_backed = |cell: &walshadow::toast::shadow_store::LateBridge,
-                         cfg: &EmitterConfig| {
+    let shadow_backed = |cell: &walshadow::toast::shadow_store::LateBridge, cfg: &EmitterConfig| {
         ToastResolver::with_store(
             Arc::new(walshadow::toast::shadow_store::ShadowToastStore::late(
                 cell.clone(),

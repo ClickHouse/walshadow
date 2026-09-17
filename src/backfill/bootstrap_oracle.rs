@@ -8,11 +8,11 @@ use anyhow::{Context, Result};
 use clickhouse_c::Allocator;
 
 use crate::backfill::backup_page_walk::CatalogMap;
+use crate::backfill::toast_staging::ToastStaging;
 use crate::catalog::shadow::{BridgeConf, Shadow, ShadowConfig};
 use crate::column_rules::ColumnRules;
 use crate::emit::ch_emitter::TablePlan;
 use crate::mapping::{MappingSnapshot, SystemColumns};
-use crate::backfill::toast_staging::ToastStaging;
 use crate::ops::oracle::Oracle;
 
 const ORACLE_PORT: u16 = 55440;
@@ -645,67 +645,66 @@ impl BootstrapOracle {
         let dst = data_dir.join("base").join(db_oid.to_string());
 
         self.shadow.stop().context("stop oracle to install toast")?;
-        let (stats, installed) = tokio::task::spawn_blocking(
-            move || -> Result<(ToastInstallStats, Vec<u32>)> {
-            let mut stats = ToastInstallStats::default();
-            let mut installed: Vec<u32> = Vec::new();
-            let rd = match std::fs::read_dir(&src) {
-                Ok(rd) => rd,
-                // Nothing toasted, or nothing mapped: a legitimate load
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    return Ok((stats, installed));
+        let (stats, installed) =
+            tokio::task::spawn_blocking(move || -> Result<(ToastInstallStats, Vec<u32>)> {
+                let mut stats = ToastInstallStats::default();
+                let mut installed: Vec<u32> = Vec::new();
+                let rd = match std::fs::read_dir(&src) {
+                    Ok(rd) => rd,
+                    // Nothing toasted, or nothing mapped: a legitimate load
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        return Ok((stats, installed));
+                    }
+                    Err(e) => {
+                        return Err(e).with_context(|| format!("read staged {}", src.display()));
+                    }
+                };
+                std::fs::create_dir_all(&dst)
+                    .with_context(|| format!("create {}", dst.display()))?;
+                for entry in rd {
+                    let entry = entry?;
+                    let from = entry.path();
+                    let to = dst.join(entry.file_name());
+                    let len = entry.metadata()?.len();
+                    // Copy, not move: shadow needs the same tree to serve values
+                    // from after handoff, and the staging dir is the one source
+                    // of it
+                    std::fs::copy(&from, &to)
+                        .with_context(|| format!("copy {} -> {}", from.display(), to.display()))?;
+                    // `<relnode>` or `<relnode>.<segno>`: one relation either way
+                    if let Some(rel) = entry
+                        .file_name()
+                        .to_str()
+                        .and_then(|n| n.split('.').next().unwrap_or(n).parse::<u32>().ok())
+                        && !installed.contains(&rel)
+                    {
+                        installed.push(rel);
+                    }
+                    stats.files_moved += 1;
+                    stats.bytes_moved += len;
                 }
-                Err(e) => {
-                    return Err(e).with_context(|| format!("read staged {}", src.display()));
-                }
-            };
-            std::fs::create_dir_all(&dst)
-                .with_context(|| format!("create {}", dst.display()))?;
-            for entry in rd {
-                let entry = entry?;
-                let from = entry.path();
-                let to = dst.join(entry.file_name());
-                let len = entry.metadata()?.len();
-                // Copy, not move: shadow needs the same tree to serve values
-                // from after handoff, and the staging dir is the one source
-                // of it
-                std::fs::copy(&from, &to)
-                    .with_context(|| format!("copy {} -> {}", from.display(), to.display()))?;
-                // `<relnode>` or `<relnode>.<segno>`: one relation either way
-                if let Some(rel) = entry
-                    .file_name()
-                    .to_str()
-                    .and_then(|n| n.split('.').next().unwrap_or(n).parse::<u32>().ok())
-                    && !installed.contains(&rel)
-                {
-                    installed.push(rel);
-                }
-                stats.files_moved += 1;
-                stats.bytes_moved += len;
-            }
-            let resetwal = match &bin_dir {
-                Some(d) => d.join("pg_resetwal"),
-                None => PathBuf::from("pg_resetwal"),
-            };
-            let out = Command::new(&resetwal)
-                .args([
-                    "-x",
-                    &next_xid.to_string(),
-                    "-D",
-                    data_dir.to_str().context("non-utf8 oracle data dir")?,
-                ])
-                .output()
-                .with_context(|| format!("spawn {}", resetwal.display()))?;
-            anyhow::ensure!(
-                out.status.success(),
-                "pg_resetwal -x {next_xid}: {}",
-                String::from_utf8_lossy(&out.stderr),
-            );
-            Ok((stats, installed))
-            },
-        )
-        .await
-        .context("oracle toast install task")??;
+                let resetwal = match &bin_dir {
+                    Some(d) => d.join("pg_resetwal"),
+                    None => PathBuf::from("pg_resetwal"),
+                };
+                let out = Command::new(&resetwal)
+                    .args([
+                        "-x",
+                        &next_xid.to_string(),
+                        "-D",
+                        data_dir.to_str().context("non-utf8 oracle data dir")?,
+                    ])
+                    .output()
+                    .with_context(|| format!("spawn {}", resetwal.display()))?;
+                anyhow::ensure!(
+                    out.status.success(),
+                    "pg_resetwal -x {next_xid}: {}",
+                    String::from_utf8_lossy(&out.stderr),
+                );
+                Ok((stats, installed))
+            })
+            .await
+            .context("oracle toast install task")??;
 
         self.shadow
             .start()
@@ -781,4 +780,3 @@ fn staged_database_dir(staging: &ToastStaging) -> Result<Option<PathBuf>> {
     );
     Ok(dirs.pop())
 }
-

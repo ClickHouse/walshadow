@@ -218,21 +218,19 @@ async fn bootstrap_renders_external_values_out_of_shadow() {
                  WHERE _is_deleted = 0 AND id BETWEEN 301 AND 304",
             )
             .context("in-window delete count")?;
-        ensure!(doomed == "0", "rows deleted inside the window survived: {doomed}");
+        ensure!(
+            doomed == "0",
+            "rows deleted inside the window survived: {doomed}"
+        );
 
         // Byte comparison catches a wrong generation or a short reassembly,
         // which is what a torn page that was never repaired would produce
         let present: Vec<i32> = (1..=N_LIVE)
-            .chain(
-                (201..=208)
-                    .filter(|id| in_window.contains(&id.to_string())),
-            )
+            .chain((201..=208).filter(|id| in_window.contains(&id.to_string())))
             .collect();
         for id in present {
             let want: String = source
-                .psql_one(&format!(
-                    "SELECT md5(body) FROM {schema}.t WHERE id = {id}"
-                ))
+                .psql_one(&format!("SELECT md5(body) FROM {schema}.t WHERE id = {id}"))
                 .with_context(|| format!("source body digest id={id}"))?
                 .trim()
                 .into();
@@ -256,7 +254,10 @@ async fn bootstrap_renders_external_values_out_of_shadow() {
                  WHERE database = 'default' AND name = '{mirror}'"
             ))
             .context("chunk mirror probe")?;
-        ensure!(created == "0", "shadow backend created chunk mirror {mirror}");
+        ensure!(
+            created == "0",
+            "shadow backend created chunk mirror {mirror}"
+        );
 
         let stderr = daemon.stderr();
 
@@ -269,7 +270,6 @@ async fn bootstrap_renders_external_values_out_of_shadow() {
             !deferred.contains("deferred=0"),
             "nothing deferred, so nothing was read from the oracle: {deferred}"
         );
-
 
         // Shadow took the same tree and was started mid-bootstrap, which is
         // what makes a value written during the backup resolvable: its chunks
@@ -300,7 +300,9 @@ async fn bootstrap_renders_external_values_out_of_shadow() {
             "the oracle should take no part in resolving values",
         );
         ensure!(
-            stderr.lines().any(|l| l.contains("caught up to bootstrap end_lsn")),
+            stderr
+                .lines()
+                .any(|l| l.contains("caught up to bootstrap end_lsn")),
             "shadow never replayed to end_lsn, so in-window values cannot resolve",
         );
         Ok(())

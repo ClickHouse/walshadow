@@ -41,6 +41,21 @@
 #define WS_TOAST_ATT_DATA		3
 
 /*
+ * Toast-snapshot visibility, without depending on how a given major exposes
+ * it: PG 18 exports `SnapshotToastData` and `get_toast_snapshot()`, while 16
+ * and 17 have neither and build one through the `InitToastSnapshot` macro.
+ * All three agree on the parts that matter — `snapshot_type` selects
+ * `HeapTupleSatisfiesToast`, and a zero `lsn`/`whenTaken` is what disables the
+ * old-snapshot check that only PG 16 still carries.
+ */
+static void
+ws_init_toast_snapshot(SnapshotData *snap)
+{
+	memset(snap, 0, sizeof(*snap));
+	snap->snapshot_type = SNAPSHOT_TOAST;
+}
+
+/*
  * Assemble one value's chunk run, appending
  * `[result:u8][len:u32][stored bytes]` to `out`.
  *
@@ -192,7 +207,10 @@ ws_handle_fetch_toast(StringInfo req, StringInfo resp)
 	validIndex = toast_open_indexes(toastrel, AccessShareLock,
 									&toastidxs, &num_indexes);
 
-	snap = (snapmode == WS_SNAP_ANY) ? SnapshotAnyData : SnapshotToastData;
+	if (snapmode == WS_SNAP_ANY)
+		snap = SnapshotAnyData;
+	else
+		ws_init_toast_snapshot(&snap);
 
 	initStringInfo(&vals);
 	for (i = 0; i < nvalues; i++)

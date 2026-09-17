@@ -655,7 +655,9 @@ async fn batch_fetch_aligns_with_its_request() {
 
 /// Ship every completed segment to the archive the standby restores from
 fn ship_wal(source: &Shadow) {
-    source.psql_one("SELECT pg_switch_wal()").expect("switch wal");
+    source
+        .psql_one("SELECT pg_switch_wal()")
+        .expect("switch wal");
     source
         .psql_one("CHECKPOINT")
         .expect("checkpoint so the segment is archived");
@@ -825,7 +827,10 @@ async fn standby_keeps_the_value_until_the_prune_record_replays() {
         "replaying the reclamation must take the value: {}",
         describe(&after, v.extsize)
     );
-    eprintln!("standby after replayed reclamation: {}", describe(&after, v.extsize));
+    eprintln!(
+        "standby after replayed reclamation: {}",
+        describe(&after, v.extsize)
+    );
 }
 
 /// The `ChunkStore` face the pipeline would see: reads map onto the mirror's
@@ -972,7 +977,10 @@ async fn pg_standby_conflicts_do_not_fence_reclamation() {
     // recognises
     let early = connect_sql(&standby.sh).await;
     exec(&early, "BEGIN ISOLATION LEVEL REPEATABLE READ").await;
-    assert_eq!(scalar(&early, "SELECT count(*)::text FROM t_fence").await, "1");
+    assert_eq!(
+        scalar(&early, "SELECT count(*)::text FROM t_fence").await,
+        "1"
+    );
 
     exec(&src_sql, "DELETE FROM t_fence WHERE id = 1").await;
     hold.release().await;
@@ -980,8 +988,7 @@ async fn pg_standby_conflicts_do_not_fence_reclamation() {
     let reclaimed = scalar(&src_sql, "SELECT pg_current_wal_lsn()::text").await;
     ship_wal(&source.sh);
 
-    let parked_for_early =
-        !replay_passed_within(&sb_sql, &reclaimed, Duration::from_secs(5)).await;
+    let parked_for_early = !replay_passed_within(&sb_sql, &reclaimed, Duration::from_secs(5)).await;
     let under_early = fetch(&sb_bridge, &v, ToastSnapshot::Toast).await;
     eprintln!(
         "snapshot predating the DELETE parks replay: {parked_for_early}, value {}",
@@ -999,7 +1006,10 @@ async fn pg_standby_conflicts_do_not_fence_reclamation() {
     exec(&late, "BEGIN ISOLATION LEVEL REPEATABLE READ").await;
     exec(&late, "SELECT 1").await;
     let under_late = fetch(&sb_bridge, &v, ToastSnapshot::Toast).await;
-    eprintln!("value to a snapshot opened after it: {}", describe(&under_late, v.extsize));
+    eprintln!(
+        "value to a snapshot opened after it: {}",
+        describe(&under_late, v.extsize)
+    );
     exec(&late, "COMMIT").await;
 
     assert_ne!(
@@ -1035,8 +1045,8 @@ async fn store_readiness_distinguishes_primary_standby_and_unbound() {
 
     // Unbound: parks, then names what it was waiting for
     let unbound = LateBridge::default();
-    let parked = ShadowToastStore::late(unbound.clone())
-        .with_replay_wait_max(Duration::from_millis(300));
+    let parked =
+        ShadowToastStore::late(unbound.clone()).with_replay_wait_max(Duration::from_millis(300));
     let started = Instant::now();
     let err = parked
         .fetch(v.toast_relid, v.value_id, 0, v.extsize)
@@ -1084,8 +1094,8 @@ async fn store_readiness_distinguishes_primary_standby_and_unbound() {
     let (_standby, sb_bridge, sb_sql) = clone_standby(&tmp, &source.sh, &archive).await;
     ship_wal(&source.sh);
     wait_replay_past(&sb_sql, &seeded, "the INSERT").await;
-    let on_standby = ShadowToastStore::new(Arc::new(sb_bridge))
-        .with_replay_wait_max(Duration::from_millis(300));
+    let on_standby =
+        ShadowToastStore::new(Arc::new(sb_bridge)).with_replay_wait_max(Duration::from_millis(300));
     assert!(matches!(
         on_standby
             .fetch(v.toast_relid, v.value_id, 0, v.extsize)

@@ -1061,7 +1061,12 @@ async fn bridge_fetch_toast_refuses_malformed_frames() {
         ),
         (0xff, 1, &[(1u32, 8u32)][..], "snapshot mode"),
         // Declared sizes over the response cap are refused before any read
-        (0, 2, &[(1, u32::MAX / 2), (2, u32::MAX / 2)][..], "over the"),
+        (
+            0,
+            2,
+            &[(1, u32::MAX / 2), (2, u32::MAX / 2)][..],
+            "over the",
+        ),
     ] {
         raw.write_all(&frame(snapmode, nvalues, values))
             .expect("write");

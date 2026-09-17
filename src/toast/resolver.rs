@@ -1748,10 +1748,8 @@ mod tests {
             .await
             .unwrap();
 
-        let r = ToastResolver::with_store(
-            Arc::new(ReadOnly(inner)),
-            Arc::new(EmitterStats::default()),
-        );
+        let r =
+            ToastResolver::with_store(Arc::new(ReadOnly(inner)), Arc::new(EmitterStats::default()));
         assert!(!r.stores_chunks(), "nothing should collect rows for it");
         assert!(!r.fill_on_miss(), "a miss still has to be explained");
         assert_eq!(
@@ -1759,17 +1757,19 @@ mod tests {
             Some(assembled(b"body")),
         );
         // The write surface refuses rather than silently dropping rows
-        assert!(r.put(&[ToastRow {
-            toast_relid: 16500,
-            blkno: 2,
-            offnum: 1,
-            chunk_id: 8,
-            chunk_seq: 0,
-            chunk_data: Bytes::from_static(b"x"),
-            lsn: 0x2000,
-        }])
-        .await
-        .is_err());
+        assert!(
+            r.put(&[ToastRow {
+                toast_relid: 16500,
+                blkno: 2,
+                offnum: 1,
+                chunk_id: 8,
+                chunk_seq: 0,
+                chunk_data: Bytes::from_static(b"x"),
+                lsn: 0x2000,
+            }])
+            .await
+            .is_err()
+        );
         assert!(r.truncate_mirror(16500).await.is_err());
         assert!(r.rewrite_barrier(16500, 1, 2).await.is_err());
     }
@@ -1785,7 +1785,10 @@ mod tests {
         assert!(r.stores_chunks(), "the mirror takes writes");
 
         let default = EmitterConfig::from_toml_str("").unwrap();
-        assert_eq!(default.toast.backend, crate::emit::ch_emitter::ToastBackend::Clickhouse);
+        assert_eq!(
+            default.toast.backend,
+            crate::emit::ch_emitter::ToastBackend::Clickhouse
+        );
 
         let shadow = EmitterConfig::from_toml_str("[toast]\nbackend = \"shadow\"\n").unwrap();
         assert!(shadow.toast.backend.is_shadow());

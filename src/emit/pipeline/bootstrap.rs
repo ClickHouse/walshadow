@@ -848,8 +848,17 @@ mod tests {
         assert!(seeded.stores_chunks());
         let err = apply_fetched(short.clone(), &ptr, 25, &rel, "body", &seeded)
             .expect_err("a seeded mirror losing its own chunk must stop the load");
-        assert!(err.contains("chunks sum to 7984 bytes, pointer says 9100"), "{err}");
-        assert_eq!(seeded.stats_handle().toast_fetch_miss.load(Ordering::Relaxed), 1);
+        assert!(
+            err.contains("chunks sum to 7984 bytes, pointer says 9100"),
+            "{err}"
+        );
+        assert_eq!(
+            seeded
+                .stats_handle()
+                .toast_fetch_miss
+                .load(Ordering::Relaxed),
+            1
+        );
 
         // Read-only: nothing seeded it, so the row is not live at the end
         // position and a later version supersedes the walk's copy
@@ -860,7 +869,10 @@ mod tests {
             .expect("a read-only backend fills instead of failing the load");
         assert_eq!(column, ColumnValue::Null);
         assert_eq!(retained, 0);
-        assert_eq!(stats.toast_values_filled_superseded.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            stats.toast_values_filled_superseded.load(Ordering::Relaxed),
+            1
+        );
         assert_eq!(
             stats.toast_fetch_miss.load(Ordering::Relaxed),
             0,

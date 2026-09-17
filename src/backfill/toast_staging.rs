@@ -168,7 +168,9 @@ mod tests {
     async fn install_tolerates_an_absent_tree() {
         let tmp = tempfile::tempdir().unwrap();
         let staging = ToastStaging::new(tmp.path().join("never-written"));
-        let got = install_into(&staging, &tmp.path().join("d"), 5).await.unwrap();
+        let got = install_into(&staging, &tmp.path().join("d"), 5)
+            .await
+            .unwrap();
         assert_eq!(got, (0, 0));
     }
 }
