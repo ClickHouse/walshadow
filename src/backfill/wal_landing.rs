@@ -44,8 +44,9 @@ pub async fn filter_landed_wal(
     timeline: u32,
     end_lsn: u64,
     tracker: CatalogTracker,
-    // Relations shadow must replay after staged files are installed
-    keep_rels: ahash::HashSet<(u32, u32)>,
+    // Start with staged relations, then add relations created during recovery
+    // `None` keeps only catalog WAL
+    shadow_rels: Option<(ahash::HashSet<(u32, u32)>, u64)>,
 ) -> Result<LandedWalStats> {
     let segments = segments_on_disk(pg_wal, timeline).await?;
     let in_window = segments
@@ -59,7 +60,9 @@ pub async fn filter_landed_wal(
     let mut stream = WalStream::new(timeline, WAL_SEG_SIZE, first.start_lsn(WAL_SEG_SIZE))
         .map_err(|e| anyhow::anyhow!("wal_landing: WalStream: {e}"))?;
     *stream.filter_mut().tracker_mut() = tracker;
-    stream.filter_mut().keep_user_rels(keep_rels);
+    if let Some((rels, redo_lsn)) = shadow_rels {
+        stream.filter_mut().keep_user_rels(rels, redo_lsn);
+    }
 
     let mut records = DropRecords;
     let mut writer = WriteBack {
@@ -317,7 +320,7 @@ mod tests {
             1,
             WAL_SEG_SIZE,
             CatalogTracker::new(),
-            ahash::HashSet::default(),
+            None,
         )
         .await
         .unwrap();

@@ -44,15 +44,18 @@ Conversion failure stops batch with column and row context. Module pins output
 settings to make conversion reproducible. Greenfield bootstrap uses a temporary
 PostgreSQL instance because managed shadow is not ready yet
 
-## Alternative value backend
+## Alternative value modes
 
-`[toast] backend = "shadow"` reads external values out of PostgreSQL's own
-TOAST heaps instead of writing chunks to a mirror. Bootstrap copies source
-TOAST files into shadow's data directory and starts shadow so PostgreSQL can
-replay WAL through end of backup. WAL replay adds values written during backup
-that are not present in copied files. See
-[large-value limitations](../docs/limitations.md#shadow-value-backend) and
+Shadow mode reads external values from PostgreSQL's own TOAST heaps instead of
+writing chunks to a mirror. See
+[shadow TOAST architecture](shadow-toast.md),
+[large-value limitations](../docs/limitations.md#shadow-value-mode) and
 [shadow TOAST plan](../plans/shadow_toast.md)
+
+Disabled mode keeps no value store. A value can still be restored when its
+chunks appear in same transaction's WAL. Otherwise, it becomes NULL, or column
+type's default when target is not Nullable. See
+[disabled mode](../docs/configuration.md#value-mode)
 
 ## Implementation
 
@@ -60,5 +63,5 @@ Start in [TOAST resolver](../src/toast/resolver.rs),
 [retirement ledger](../src/toast/toast_retire.rs),
 [conversion client](../src/ops/oracle.rs), and
 [PostgreSQL module](../pgext/worker.c). Build instructions live in
-[module guide](../pgext/README.md), proposed storage alternative in
-[shadow TOAST plan](../plans/shadow_toast.md)
+[module guide](../pgext/README.md), PostgreSQL-backed storage in
+[shadow TOAST architecture](shadow-toast.md)

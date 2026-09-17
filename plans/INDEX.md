@@ -36,7 +36,7 @@ writes. A documented limitation does not imply code rejects it
 | [Performance](performance.md) | Locate bottlenecks before changing concurrency or allocation |
 | [Runtime configuration](runtime_config.md) | Add source-side commands and explain effective settings |
 | [Failover](failover.md) | Continue after unplanned promotion or across archived timeline changes |
-| [Shadow TOAST storage](shadow_toast.md) | Evaluate PostgreSQL-backed large-value reads with safe reclamation |
+| [Shadow TOAST reclamation](shadow_toast.md) | Keep historical values readable under lag and restart |
 | [Replay callback](custom_rmgr.md) | Reduce measured command-boundary capture stalls |
 | [Dependencies](dependencies.md) | Replace generic protocol code when an adapter preserves behavior |
 | [Tier 2 containers](tier2.md) | Remove shadow round trips for array, map, and vector columns |

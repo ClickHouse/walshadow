@@ -23,7 +23,7 @@ use tokio::sync::Mutex;
 use crate::toast::FetchedValue;
 
 /// Frame and op layouts. Must equal `WS_PROTO_VERSION` in `pgext/walshadow.h`
-pub const PROTO_VERSION: u32 = 4;
+pub const PROTO_VERSION: u32 = 5;
 /// Catalog column plans. Must equal `WS_PROJECTION_VERSION`
 pub const PROJECTION_VERSION: u32 = 1;
 
@@ -110,23 +110,6 @@ impl Catalog {
             Catalog::Namespace | Catalog::Type => 2,
         }
     }
-}
-
-/// Snapshot visibility for [`Bridge::fetch_toast`]. `Toast` matches PostgreSQL
-/// detoast behavior. `Any` exposes hidden generations for tests
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u8)]
-pub enum ToastSnapshot {
-    Toast = 0,
-    Any = 1,
-}
-
-pub struct ToastFetch {
-    /// Replay positions sampled before and after read
-    pub replay_lsn_start: u64,
-    pub replay_lsn_end: u64,
-    /// One result per requested value, in request order
-    pub values: Vec<FetchedValue>,
 }
 
 #[derive(Debug, Error)]
@@ -410,7 +393,8 @@ impl Bridge {
     }
 
     /// Read stored TOAST chunks from one shadow relation in one round trip.
-    /// `values` contains unique `(value_id, expected stored size)` pairs.
+    /// `values` contains unique `(value_id, expected stored size)` pairs;
+    /// results come back one per value, in request order.
     ///
     /// `min_replay_lsn` is minimum replay position. Value chunks precede
     /// referring record, so replay only needs to reach referrer. Returned bytes
@@ -420,18 +404,16 @@ impl Bridge {
         toast_relid: u32,
         values: &[(u32, usize)],
         min_replay_lsn: u64,
-        snapshot: ToastSnapshot,
-    ) -> Result<ToastFetch, BridgeError> {
+    ) -> Result<Vec<FetchedValue>, BridgeError> {
         if values.is_empty() || values.len() > MAX_FETCH_VALUES {
             return Err(BridgeError::Protocol(format!(
                 "toast fetch of {} values, want 1..{MAX_FETCH_VALUES}",
                 values.len()
             )));
         }
-        let mut frame = request_frame(17 + values.len() * 8);
+        let mut frame = request_frame(16 + values.len() * 8);
         frame.extend_from_slice(&min_replay_lsn.to_be_bytes());
         frame.extend_from_slice(&toast_relid.to_be_bytes());
-        frame.push(snapshot as u8);
         frame.extend_from_slice(&(values.len() as u32).to_be_bytes());
         for &(id, expected) in values {
             frame.extend_from_slice(&id.to_be_bytes());
@@ -440,8 +422,6 @@ impl Bridge {
 
         let body = self.call(Op::FetchToast, frame).await?;
         let mut c = Cursor::at(&body, 1);
-        let replay_lsn_start = c.u64()?;
-        let replay_lsn_end = c.u64()?;
         let n = c.u32()? as usize;
         if n != values.len() {
             return Err(BridgeError::Protocol(format!(
@@ -464,11 +444,7 @@ impl Bridge {
                 }
             });
         }
-        Ok(ToastFetch {
-            replay_lsn_start,
-            replay_lsn_end,
-            values: out,
-        })
+        Ok(out)
     }
 
     /// Return response remainder as one locally framed Native block.

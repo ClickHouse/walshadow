@@ -64,8 +64,6 @@ pub struct BootstrapConfig {
     /// `None` taps every seeded relation
     pub tap_filenodes: Option<Arc<ahash::HashSet<(Oid, Oid)>>>,
     pub progress: BootstrapProgress,
-    /// Stage TOAST heaps and indexes for shadow instead of building chunk mirror
-    pub toast_staging: Option<crate::backfill::toast_staging::StagingTarget>,
 }
 
 impl BootstrapConfig {
@@ -75,17 +73,7 @@ impl BootstrapConfig {
             catalog_filenodes: CatalogFilenodes::new(),
             tap_filenodes: None,
             progress: BootstrapProgress::default(),
-            toast_staging: None,
         }
-    }
-
-    pub fn staging_toast_into(
-        mut self,
-        root: PathBuf,
-        rels: crate::backfill::toast_staging::StagedRels,
-    ) -> Self {
-        self.toast_staging = Some((root, rels));
-        self
     }
 
     pub fn with_catalog_filenodes(mut self, c: impl IntoIterator<Item = (Oid, Oid)>) -> Self {
@@ -208,9 +196,6 @@ pub fn spawn_greenfield_bootstrap(
         let disk = lander.stats.clone();
         let mut page_walk = PageWalkSink::new(catalog_map, tx, store_toast)
             .with_stats(cfg.progress.page_walk.clone());
-        if let Some((root, rels)) = cfg.toast_staging.clone() {
-            page_walk = page_walk.staging_toast(root, rels);
-        }
         if let Some(set) = cfg.tap_filenodes.clone() {
             page_walk = page_walk.with_tap_filenodes(set);
         }

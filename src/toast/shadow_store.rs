@@ -2,9 +2,9 @@
 //!
 //! Shadow stores physical TOAST heaps and indexes while replaying source WAL,
 //! so external values can use local index lookups without ClickHouse chunk
-//! mirror. Select with `[toast] backend = "shadow"`; see
+//! mirror. Select with `[toast] mode = "shadow"`; see
 //! `plans/shadow_toast.md`. Greenfield bootstrap and live CDC both use this
-//! backend.
+//! store.
 //!
 //! Store is read-only. Shadow receives data through WAL replay, so write methods
 //! reject decoded `ToastRow` values.
@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 
-use crate::ops::bridge::{Bridge, MAX_FETCH_VALUES, ToastSnapshot};
+use crate::ops::bridge::{Bridge, BridgeError, MAX_FETCH_VALUES};
 use crate::toast::{ChunkStore, ChunkStoreError, FetchedValue, ToastRow};
 
 /// Round-trip payload target. Always allow one value even when it exceeds limit
@@ -22,7 +22,9 @@ const FETCH_REQUEST_BYTES: usize = 64 << 20;
 
 /// Poll cadence while waiting for shadow replay to cover a read
 const REPLAY_POLL: Duration = Duration::from_millis(20);
-/// Maximum time to wait for shadow to apply dispatched WAL
+/// Maximum poll interval while worker socket cannot accept connections
+const UNREACHABLE_POLL_MAX: Duration = Duration::from_secs(1);
+/// Maximum time without replay progress or a worker connection
 const REPLAY_WAIT_MAX: Duration = Duration::from_secs(60);
 
 /// Bridge populated after bootstrap starts PostgreSQL
@@ -30,7 +32,6 @@ pub type LateBridge = Arc<tokio::sync::OnceCell<Arc<Bridge>>>;
 
 pub struct ShadowToastStore {
     bridge: LateBridge,
-    snapshot: ToastSnapshot,
     replay_wait_max: Duration,
 }
 
@@ -45,7 +46,6 @@ impl ShadowToastStore {
     pub fn late(bridge: LateBridge) -> Self {
         Self {
             bridge,
-            snapshot: ToastSnapshot::Toast,
             replay_wait_max: REPLAY_WAIT_MAX,
         }
     }
@@ -81,35 +81,69 @@ impl ShadowToastStore {
     /// Poll here instead of blocking worker, which must remain available for
     /// catalog reads. Return replay floor for standby request. Return zero for
     /// primary, which has no replay position.
+    ///
+    /// Supervisor restarts postmaster after a GUC floor change stops it
+    /// Worker socket cannot accept connections during restart. Treat that like
+    /// stalled replay and restart timeout whenever replay position changes
     async fn await_replay(&self, bridge: &Bridge, through: u64) -> Result<u64, ChunkStoreError> {
         // Primary files are complete before service and have no replay position
         if through == 0 || !bridge.info().is_some_and(|i| i.in_recovery) {
             return Ok(0);
         }
-        let deadline = Instant::now() + self.replay_wait_max;
+        let mut since = Instant::now();
+        let mut last: Option<u64> = None;
+        let mut unreachable = false;
+        let mut poll = REPLAY_POLL;
         loop {
-            let at = bridge
-                .replay_lsn()
-                .await
-                .map_err(|e| ChunkStoreError::Shadow(format!("replay position: {e}")))?;
-            if at >= through {
-                return Ok(through);
+            match bridge.replay_lsn().await {
+                Ok(at) if at >= through => return Ok(through),
+                Ok(at) => {
+                    if unreachable || last != Some(at) {
+                        since = Instant::now();
+                    }
+                    if unreachable {
+                        tracing::info!(
+                            target: "walshadow::toast",
+                            replay_lsn = format_args!("{at:X}"),
+                            "shadow is reachable again, waiting for replay",
+                        );
+                    }
+                    unreachable = false;
+                    last = Some(at);
+                    poll = REPLAY_POLL;
+                }
+                Err(BridgeError::Io(e)) => {
+                    if !unreachable {
+                        since = Instant::now();
+                        tracing::warn!(
+                            target: "walshadow::toast",
+                            error = %e,
+                            "shadow is unreachable, waiting for it to restart",
+                        );
+                    }
+                    unreachable = true;
+                    poll = (poll * 2).min(UNREACHABLE_POLL_MAX);
+                }
+                Err(e) => {
+                    return Err(ChunkStoreError::Shadow(format!("replay position: {e}")));
+                }
             }
-            if Instant::now() >= deadline {
-                return Err(ChunkStoreError::Shadow(format!(
-                    "shadow replay stuck at {at:X}, value needs {through:X} \
-                     after {:?}",
-                    self.replay_wait_max
-                )));
+            if since.elapsed() >= self.replay_wait_max {
+                return Err(ChunkStoreError::Shadow(if unreachable {
+                    format!(
+                        "shadow unreachable for {:?}, value needs replay past {through:X}",
+                        self.replay_wait_max
+                    )
+                } else {
+                    format!(
+                        "shadow replay stuck at {:X}, value needs {through:X} after {:?}",
+                        last.unwrap_or(0),
+                        self.replay_wait_max
+                    )
+                }));
             }
-            tokio::time::sleep(REPLAY_POLL).await;
+            tokio::time::sleep(poll).await;
         }
-    }
-
-    /// Use wider snapshot to expose reused value-ID generations in tests
-    pub fn with_snapshot(mut self, snapshot: ToastSnapshot) -> Self {
-        self.snapshot = snapshot;
-        self
     }
 }
 
@@ -141,10 +175,10 @@ impl ChunkStore for ShadowToastStore {
         // Split resolver batch to satisfy wire limits
         for slice in request_slices(values) {
             let got = bridge
-                .fetch_toast(toast_relid, slice, floor, self.snapshot)
+                .fetch_toast(toast_relid, slice, floor)
                 .await
                 .map_err(|e| ChunkStoreError::Shadow(e.to_string()))?;
-            out.extend(got.values);
+            out.extend(got);
         }
         Ok(out)
     }

@@ -79,10 +79,23 @@ ws_fetch_one(Relation toastrel, Relation toastidx, Snapshot snap,
 		d = heap_getattr(ttup, WS_TOAST_ATT_DATA, tupdesc, &isnull);
 		Assert(!isnull);
 		chunk = DatumGetPointer(d);
-		/* TYPSTORAGE_PLAIN prevents short headers and nested TOAST values */
-		Assert(!VARATT_IS_EXTENDED(chunk));
-		chunksize = VARSIZE(chunk) - VARHDRSZ;
-		chunkdata = VARDATA(chunk);
+		/* Same three cases as heap_fetch_toast_slice (access/heap/heaptoast.c) */
+		if (!VARATT_IS_EXTENDED(chunk))
+		{
+			chunksize = VARSIZE(chunk) - VARHDRSZ;
+			chunkdata = VARDATA(chunk);
+		}
+		else if (VARATT_IS_SHORT(chunk))
+		{
+			chunksize = VARSIZE_SHORT(chunk) - VARHDRSZ_SHORT;
+			chunkdata = VARDATA_SHORT(chunk);
+		}
+		else
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("walshadow: compressed or external TOAST chunk for "
+							"value %u in %s",
+							value_id, RelationGetRelationName(toastrel))));
 
 		if (seq != nchunks)
 			dense = false;
@@ -111,7 +124,6 @@ ws_handle_fetch_toast(StringInfo req, StringInfo resp)
 {
 	uint64		min_replay_lsn = pq_getmsgint64(req);
 	Oid			toast_relid = (Oid) pq_getmsgint(req, 4);
-	uint8		snapmode = pq_getmsgbyte(req);
 	uint32		nvalues = pq_getmsgint(req, 4);
 	Oid		   *ids;
 	uint32	   *sizes;
@@ -121,8 +133,7 @@ ws_handle_fetch_toast(StringInfo req, StringInfo resp)
 	int			validIndex;
 	SnapshotData snap = {0};
 	StringInfoData vals;
-	uint64		lsn_start;
-	uint64		lsn_end;
+	uint64		replay_lsn;
 	Size		want = 0;
 	uint32		i;
 
@@ -131,10 +142,6 @@ ws_handle_fetch_toast(StringInfo req, StringInfo resp)
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 				 errmsg("walshadow fetch of %u values, want 1..%d",
 						nvalues, WS_MAX_FETCH_VALUES)));
-	if (snapmode != WS_SNAP_TOAST && snapmode != WS_SNAP_ANY)
-		ereport(ERROR,
-				(errcode(ERRCODE_PROTOCOL_VIOLATION),
-				 errmsg("walshadow unknown fetch snapshot mode %u", snapmode)));
 
 	ids = palloc_array(Oid, nvalues);
 	sizes = palloc_array(uint32, nvalues);
@@ -154,22 +161,36 @@ ws_handle_fetch_toast(StringInfo req, StringInfo resp)
 	/*
 	 * Sample before opening relation so early rejection acquires no lock.
 	 * Caller's bound is minimum replay position. Chunks precede referring
-	 * record, so replay only needs to reach that record. Return positions before
-	 * and after read to detect destructive WAL replay during batch.
+	 * record, so replay only needs to reach that record.
 	 */
-	lsn_start = (uint64) GetXLogReplayRecPtr(NULL);
-	if (min_replay_lsn != 0 && lsn_start < min_replay_lsn)
+	replay_lsn = (uint64) GetXLogReplayRecPtr(NULL);
+	if (min_replay_lsn != 0 && replay_lsn < min_replay_lsn)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("walshadow: replay at %X/%08X is below the requested %X/%08X",
-						LSN_FORMAT_ARGS((XLogRecPtr) lsn_start),
+						LSN_FORMAT_ARGS((XLogRecPtr) replay_lsn),
 						LSN_FORMAT_ARGS((XLogRecPtr) min_replay_lsn))));
 
+	/*
+	 * Shadow can drop relation before ClickHouse requests its values because
+	 * no reclamation fence delays DROP TABLE. Report each value as missing,
+	 * matching behavior after replayed TRUNCATE
+	 */
 	toastrel = try_table_open(toast_relid, AccessShareLock);
 	if (toastrel == NULL)
-		ereport(ERROR,
-				(errcode(ERRCODE_UNDEFINED_TABLE),
-				 errmsg("walshadow: no toast relation %u", toast_relid)));
+	{
+		ereport(LOG,
+				(errmsg("walshadow: toast relation %u is gone, %u values answer missing",
+						toast_relid, nvalues)));
+		pq_sendbyte(resp, WS_STATUS_OK);
+		pq_sendint32(resp, nvalues);
+		for (i = 0; i < nvalues; i++)
+		{
+			pq_sendbyte(resp, WS_FETCH_MISSING);
+			pq_sendint32(resp, 0);
+		}
+		return;
+	}
 	validIndex = toast_open_indexes(toastrel, AccessShareLock,
 									&toastidxs, &num_indexes);
 
@@ -178,7 +199,7 @@ ws_handle_fetch_toast(StringInfo req, StringInfo resp)
 	 * InitToastSnapshot. Zero lsn and whenTaken disable PostgreSQL 16
 	 * old-snapshot check
 	 */
-	snap.snapshot_type = snapmode == WS_SNAP_ANY ? SNAPSHOT_ANY : SNAPSHOT_TOAST;
+	snap.snapshot_type = SNAPSHOT_TOAST;
 
 	initStringInfo(&vals);
 	for (i = 0; i < nvalues; i++)
@@ -187,11 +208,8 @@ ws_handle_fetch_toast(StringInfo req, StringInfo resp)
 
 	toast_close_indexes(toastidxs, num_indexes, AccessShareLock);
 	table_close(toastrel, AccessShareLock);
-	lsn_end = (uint64) GetXLogReplayRecPtr(NULL);
 
 	pq_sendbyte(resp, WS_STATUS_OK);
-	pq_sendint64(resp, lsn_start);
-	pq_sendint64(resp, lsn_end);
 	pq_sendint32(resp, nvalues);
 	pq_sendbytes(resp, vals.data, vals.len);
 }

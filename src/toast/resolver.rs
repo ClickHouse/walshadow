@@ -21,7 +21,7 @@ use crate::ch::{
 use crate::decode::heap_decoder::{
     ColumnValue, ToastPointer, VARLENA_EXTSIZE_BITS, VARLENA_EXTSIZE_MASK, decompress_varlena,
 };
-use crate::emit::ch_emitter::{EmitterConfig, EmitterStats};
+use crate::emit::ch_emitter::{EmitterConfig, EmitterStats, ToastMode};
 use crate::xact::spill::{BodyRef, BodySpoolFile, ToastChunk, ToastDelete};
 use ahash::{HashMap, HashMapExt, HashSet, HashSetExt};
 
@@ -1000,43 +1000,47 @@ impl ToastResolver {
         }
     }
 
-    /// Build ClickHouse-mirror resolver regardless of configured backend
+    /// Build resolver without a bridge
+    ///
+    /// Disabled mode keeps no store, other modes use ClickHouse mirror
     pub fn from_config(emitter: &EmitterConfig, stats: Arc<EmitterStats>) -> Self {
-        Self::with_limits(
-            Arc::new(ClickHouseChunkStore::new(emitter.clone())),
-            emitter,
-            stats,
-        )
+        let store: Option<Arc<dyn ChunkStore>> = match emitter.toast.mode {
+            ToastMode::Disabled => None,
+            _ => Some(Arc::new(ClickHouseChunkStore::new(emitter.clone()))),
+        };
+        Self::with_limits(store, emitter, stats)
     }
 
-    /// Build resolver for configured backend. Shadow requires `bridge`
-    pub fn for_backend(
+    /// Build resolver for configured mode. Shadow requires `bridge`
+    pub fn for_mode(
         emitter: &EmitterConfig,
         stats: Arc<EmitterStats>,
         bridge: Option<Arc<crate::ops::bridge::Bridge>>,
     ) -> Result<Self, String> {
-        if !emitter.toast.backend.is_shadow() {
+        if !emitter.toast.mode.is_shadow() {
             return Ok(Self::from_config(emitter, stats));
         }
         let bridge = bridge.ok_or_else(|| {
-            "[toast] backend = \"shadow\" needs the pgext bridge; \
+            "[toast] mode = \"shadow\" needs the pgext bridge; \
              pass --bridge-lib-dir and let walshadow manage shadow"
                 .to_string()
         })?;
         Ok(Self::with_limits(
-            Arc::new(crate::toast::shadow_store::ShadowToastStore::new(bridge)),
+            Some(Arc::new(crate::toast::shadow_store::ShadowToastStore::new(
+                bridge,
+            ))),
             emitter,
             stats,
         ))
     }
 
     fn with_limits(
-        store: Arc<dyn ChunkStore>,
+        store: Option<Arc<dyn ChunkStore>>,
         emitter: &EmitterConfig,
         stats: Arc<EmitterStats>,
     ) -> Self {
         Self {
-            store: Some(store),
+            store,
             stats,
             put_batch_rows: emitter
                 .toast
@@ -1733,32 +1737,46 @@ mod tests {
         assert!(r.rewrite_barrier(16500, 1, 2).await.is_err());
     }
 
-    /// Shadow backend requires bridge
+    /// Shadow mode requires bridge, disabled mode keeps no store
     #[test]
-    fn for_backend_honours_the_setting() {
+    fn for_mode_honours_the_setting() {
         let stats = || Arc::new(EmitterStats::default());
-        let ch = EmitterConfig::from_toml_str("[toast]\nbackend = \"clickhouse\"\n").unwrap();
-        assert!(!ch.toast.backend.is_shadow());
-        let r = ToastResolver::for_backend(&ch, stats(), None).expect("clickhouse needs no bridge");
+        let ch = EmitterConfig::from_toml_str("[toast]\nmode = \"clickhouse\"\n").unwrap();
+        assert!(!ch.toast.mode.is_shadow());
+        let r = ToastResolver::for_mode(&ch, stats(), None).expect("clickhouse needs no bridge");
         assert!(r.stores_chunks(), "the mirror takes writes");
 
         let default = EmitterConfig::from_toml_str("").unwrap();
-        assert_eq!(
-            default.toast.backend,
-            crate::emit::ch_emitter::ToastBackend::Clickhouse
-        );
+        assert_eq!(default.toast.mode, ToastMode::Clickhouse);
 
-        let shadow = EmitterConfig::from_toml_str("[toast]\nbackend = \"shadow\"\n").unwrap();
-        assert!(shadow.toast.backend.is_shadow());
-        let err = match ToastResolver::for_backend(&shadow, stats(), None) {
+        let shadow = EmitterConfig::from_toml_str("[toast]\nmode = \"shadow\"\n").unwrap();
+        assert!(shadow.toast.mode.is_shadow());
+        let err = match ToastResolver::for_mode(&shadow, stats(), None) {
             Err(e) => e,
             Ok(_) => panic!("shadow without a bridge must be a config error"),
         };
         assert!(err.contains("bridge"), "{err}");
 
+        let disabled = EmitterConfig::from_toml_str(
+            "[memory]\ninline_value_max = 4096\n[toast]\nmode = \"disabled\"\n",
+        )
+        .unwrap();
+        assert_eq!(disabled.toast.mode, ToastMode::Disabled);
+        for r in [
+            ToastResolver::for_mode(&disabled, stats(), None).expect("disabled needs no bridge"),
+            ToastResolver::from_config(&disabled, stats()),
+        ] {
+            assert!(!r.stores_chunks() && r.fill_on_miss());
+            assert_eq!(
+                r.inline_value_max(),
+                4096,
+                "values in current transaction keep size limit"
+            );
+        }
+
         assert!(
-            EmitterConfig::from_toml_str("[toast]\nbackend = \"elsewhere\"\n").is_err(),
-            "an unknown backend must not fall back to the mirror",
+            EmitterConfig::from_toml_str("[toast]\nmode = \"elsewhere\"\n").is_err(),
+            "an unknown mode must not fall back to the mirror",
         );
     }
 

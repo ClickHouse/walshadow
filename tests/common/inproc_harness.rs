@@ -693,7 +693,7 @@ pub async fn build_pipeline_with_oracle(
     build_pipeline_inner(args, |_| {}, Some(oracle)).await
 }
 
-/// Both at once: `[toast] backend = "shadow"` needs the oracle's bridge to
+/// Both at once: `[toast] mode = "shadow"` needs the oracle's bridge to
 /// read through and the config to select it
 pub async fn build_pipeline_tuned(
     args: BuildPipelineArgs<'_>,
@@ -866,10 +866,15 @@ async fn build_pipeline_inner(
     }
 
     tune(&mut emitter_cfg);
-    // Mirrors `bin/stream.rs`: shadow-backed values only exist on shadow if
-    // shadow replayed the records that wrote them
-    if emitter_cfg.toast.backend.is_shadow() {
-        stream.filter_mut().route_user_to_shadow(true);
+    // Match `bin/stream.rs`: replay WAL for every relation stored by shadow
+    if emitter_cfg.toast.mode.is_shadow() {
+        let rels = walshadow::backfill::pg_path::user_relation_filenodes(
+            &shadow.config().data_dir,
+            shadow_db_oid,
+        )
+        .await
+        .expect("list shadow relations");
+        stream.filter_mut().keep_user_rels(rels, 0);
     }
     let pending_cfg = emitter_cfg.pending_capture;
     let pending_catalog = Arc::new(walshadow::pending::PendingCatalog::default());

@@ -8,7 +8,6 @@ use anyhow::{Context, Result};
 use clickhouse_c::Allocator;
 
 use crate::backfill::backup_page_walk::CatalogMap;
-use crate::backfill::toast_staging::ToastStaging;
 use crate::catalog::shadow::{BridgeConf, Shadow, ShadowConfig};
 use crate::column_rules::ColumnRules;
 use crate::emit::ch_emitter::TablePlan;
@@ -16,11 +15,6 @@ use crate::mapping::{MappingSnapshot, SystemColumns};
 use crate::ops::oracle::Oracle;
 
 const ORACLE_PORT: u16 = 55440;
-
-/// Memory available to each staged TOAST index rebuild
-const REINDEX_WORK_MEM: &str = "1GB";
-/// Maximum parallel workers used by index rebuild
-const REINDEX_WORKERS: usize = 4;
 
 pub struct BootstrapOracle {
     shadow: Shadow,
@@ -596,168 +590,4 @@ CREATE TABLE public.app (
             }
         }
     }
-}
-
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct ToastInstallStats {
-    pub files_moved: u64,
-    pub bytes_moved: u64,
-    pub toast_tables_reindexed: u64,
-}
-
-impl BootstrapOracle {
-    /// Install staged TOAST heaps and start serving values.
-    ///
-    /// Stop oracle before installing files. Existing `Arc<Bridge>` reconnects
-    /// after restart.
-    ///
-    /// Rebuild indexes from installed heaps to avoid copied torn index pages.
-    pub async fn install_toast(
-        &self,
-        staging: &ToastStaging,
-        next_xid: u32,
-    ) -> Result<ToastInstallStats> {
-        // Remap source database OID, relation OIDs and relfilenodes are stable
-        let src = match staged_database_dir(staging)? {
-            Some(dir) => dir,
-            None => return Ok(ToastInstallStats::default()),
-        };
-        let db_oid: u32 = self
-            .shadow
-            .psql_one("SELECT oid FROM pg_database WHERE datname = current_database()")
-            .context("oracle database oid")?
-            .trim()
-            .parse()
-            .context("parse oracle database oid")?;
-
-        let data_dir = self.shadow.config().data_dir.clone();
-        let bin_dir = self.shadow.config().pg_bin_dir.clone();
-        let dst = data_dir.join("base").join(db_oid.to_string());
-
-        self.shadow.stop().context("stop oracle to install toast")?;
-        let (stats, installed) =
-            tokio::task::spawn_blocking(move || -> Result<(ToastInstallStats, Vec<u32>)> {
-                let mut stats = ToastInstallStats::default();
-                let mut installed: Vec<u32> = Vec::new();
-                let rd = match std::fs::read_dir(&src) {
-                    Ok(rd) => rd,
-                    // Empty staging tree is valid
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                        return Ok((stats, installed));
-                    }
-                    Err(e) => {
-                        return Err(e).with_context(|| format!("read staged {}", src.display()));
-                    }
-                };
-                std::fs::create_dir_all(&dst)
-                    .with_context(|| format!("create {}", dst.display()))?;
-                for entry in rd {
-                    let entry = entry?;
-                    let from = entry.path();
-                    let to = dst.join(entry.file_name());
-                    let len = entry.metadata()?.len();
-                    // Preserve staging tree for shadow installation
-                    std::fs::copy(&from, &to)
-                        .with_context(|| format!("copy {} -> {}", from.display(), to.display()))?;
-                    // Map relation segments to base relfilenode
-                    if let Some(rel) = entry
-                        .file_name()
-                        .to_str()
-                        .and_then(|n| n.split('.').next().unwrap_or(n).parse::<u32>().ok())
-                        && !installed.contains(&rel)
-                    {
-                        installed.push(rel);
-                    }
-                    stats.files_moved += 1;
-                    stats.bytes_moved += len;
-                }
-                let resetwal = match &bin_dir {
-                    Some(d) => d.join("pg_resetwal"),
-                    None => PathBuf::from("pg_resetwal"),
-                };
-                let out = Command::new(&resetwal)
-                    .args([
-                        "-x",
-                        &next_xid.to_string(),
-                        "-D",
-                        data_dir.to_str().context("non-utf8 oracle data dir")?,
-                    ])
-                    .output()
-                    .with_context(|| format!("spawn {}", resetwal.display()))?;
-                anyhow::ensure!(
-                    out.status.success(),
-                    "pg_resetwal -x {next_xid}: {}",
-                    String::from_utf8_lossy(&out.stderr),
-                );
-                Ok((stats, installed))
-            })
-            .await
-            .context("oracle toast install task")??;
-
-        self.shadow
-            .start()
-            .context("restart oracle after toast install")?;
-        // Rebuild indexes only for installed relation files
-        let reindexed: u64 = self
-            .shadow
-            .psql_one(&format!(
-                "SET maintenance_work_mem = '{REINDEX_WORK_MEM}'; \
-                 SET max_parallel_maintenance_workers = {REINDEX_WORKERS}; \
-                 DO $$ DECLARE r record; n int := 0; BEGIN \
-                 FOR r IN SELECT c.oid::regclass AS t FROM pg_class c \
-                 WHERE c.relkind = 't' AND c.relnamespace = 'pg_toast'::regnamespace \
-                 AND c.relfilenode = ANY ('{{{oids}}}'::oid[]) \
-                 LOOP EXECUTE 'REINDEX TABLE ' || r.t; n := n + 1; END LOOP; \
-                 RAISE NOTICE 'reindexed %', n; END $$; \
-                 SELECT count(*) FROM pg_class c WHERE c.relkind = 't' \
-                 AND c.relnamespace = 'pg_toast'::regnamespace \
-                 AND c.relfilenode = ANY ('{{{oids}}}'::oid[])",
-                oids = installed
-                    .iter()
-                    .map(u32::to_string)
-                    .collect::<Vec<_>>()
-                    .join(","),
-            ))
-            .context("reindex oracle toast tables")?
-            .trim()
-            .parse()
-            .unwrap_or(0);
-
-        tracing::info!(
-            target: "walshadow::bootstrap_oracle",
-            files = stats.files_moved,
-            bytes = stats.bytes_moved,
-            toast_tables = reindexed,
-            next_xid,
-            "installed staged TOAST heaps into the bootstrap oracle",
-        );
-        Ok(ToastInstallStats {
-            toast_tables_reindexed: reindexed,
-            ..stats
-        })
-    }
-}
-
-/// Return staged `base/<db>` directory, reject multiple databases
-fn staged_database_dir(staging: &ToastStaging) -> Result<Option<PathBuf>> {
-    let base = staging.root().join("base");
-    let rd = match std::fs::read_dir(&base) {
-        Ok(rd) => rd,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e).with_context(|| format!("read {}", base.display())),
-    };
-    let mut dirs: Vec<PathBuf> = Vec::new();
-    for entry in rd {
-        let entry = entry?;
-        if entry.file_type()?.is_dir() {
-            dirs.push(entry.path());
-        }
-    }
-    anyhow::ensure!(
-        dirs.len() <= 1,
-        "staged TOAST spans {} databases under {}; the walk is scoped to one",
-        dirs.len(),
-        base.display(),
-    );
-    Ok(dirs.pop())
 }

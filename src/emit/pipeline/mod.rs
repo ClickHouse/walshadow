@@ -216,8 +216,8 @@ impl PipelineConfig {
         let resolver = if matches!(tail, TailKind::Null) {
             crate::toast::ToastResolver::disabled().with_stats(stats.clone())
         } else {
-            // Shadow backend requires oracle bridge
-            crate::toast::ToastResolver::for_backend(
+            // Shadow mode requires oracle bridge
+            crate::toast::ToastResolver::for_mode(
                 &emitter,
                 stats.clone(),
                 oracle.as_ref().map(|o| o.bridge()),

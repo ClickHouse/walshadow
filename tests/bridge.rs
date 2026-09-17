@@ -1031,16 +1031,17 @@ async fn bridge_fetch_toast_refuses_malformed_frames() {
     }
     let tmp = tempfile::tempdir().unwrap();
     let guard = start_pg(&tmp, ports::reserve_port());
+    // Worker creates the socket after postmaster start; dial waits for it
+    let _bridge = dial(&guard.sh).await;
     let path = guard.sh.bridge_socket().unwrap().to_path_buf();
     let mut raw = UnixStream::connect(&path).expect("raw connect");
 
-    // `[op][min_replay_lsn:u64][toast_relid:u32][snapshot:u8][nvalues:u32]`
+    // `[op][min_replay_lsn:u64][toast_relid:u32][nvalues:u32]`
     // then `[value_id:u32][expected:u32]` per value
-    let frame = |snapmode: u8, nvalues: u32, values: &[(u32, u32)]| {
+    let frame = |nvalues: u32, values: &[(u32, u32)]| {
         let mut body = vec![0x05u8];
         body.extend_from_slice(&0u64.to_be_bytes());
         body.extend_from_slice(&1u32.to_be_bytes());
-        body.push(snapmode);
         body.extend_from_slice(&nvalues.to_be_bytes());
         for (id, expected) in values {
             body.extend_from_slice(&id.to_be_bytes());
@@ -1051,27 +1052,23 @@ async fn bridge_fetch_toast_refuses_malformed_frames() {
         out
     };
 
-    for (snapmode, nvalues, values, want) in [
-        (0u8, 0u32, &[][..], "want 1.."),
+    for (nvalues, values, want) in [
+        (0u32, &[][..], "want 1.."),
         (
-            0,
             walshadow::bridge::MAX_FETCH_VALUES as u32 + 1,
             &[][..],
             "want 1..",
         ),
-        (0xff, 1, &[(1u32, 8u32)][..], "snapshot mode"),
         // Declared sizes over the response cap are refused before any read
         (
-            0,
             2,
-            &[(1, u32::MAX / 2), (2, u32::MAX / 2)][..],
+            &[(1u32, u32::MAX / 2), (2, u32::MAX / 2)][..],
             "over the",
         ),
     ] {
-        raw.write_all(&frame(snapmode, nvalues, values))
-            .expect("write");
+        raw.write_all(&frame(nvalues, values)).expect("write");
         let msg = parse_error_frame(&read_frame(&mut raw));
-        assert!(msg.contains(want), "mode {snapmode} n {nvalues}: {msg}");
+        assert!(msg.contains(want), "n {nvalues}: {msg}");
     }
 
     // The connection still serves after each refusal
@@ -1127,6 +1124,110 @@ fn spawn_moving_worker(listener: tokio::net::UnixListener) {
             }
         }
     });
+}
+
+/// Mock standby worker for value reads
+///
+/// `REPLAY_LSN` returns `lsn`, `FETCH_TOAST` returns one assembled value
+fn spawn_toast_worker(
+    listener: tokio::net::UnixListener,
+    lsn: Arc<std::sync::atomic::AtomicU64>,
+) -> tokio::task::JoinHandle<()> {
+    use std::sync::atomic::Ordering;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    tokio::spawn(async move {
+        while let Ok((mut sock, _)) = listener.accept().await {
+            loop {
+                let mut hdr = [0u8; 4];
+                if sock.read_exact(&mut hdr).await.is_err() {
+                    break;
+                }
+                let mut req = vec![0u8; u32::from_be_bytes(hdr) as usize];
+                if sock.read_exact(&mut req).await.is_err() {
+                    break;
+                }
+                let mut body = vec![0u8];
+                match req.first() {
+                    Some(&0x01) => {
+                        body.extend_from_slice(&PROTO_VERSION.to_be_bytes());
+                        body.extend_from_slice(&PROJECTION_VERSION.to_be_bytes());
+                        body.extend_from_slice(&170_000u32.to_be_bytes());
+                        body.push(1);
+                    }
+                    Some(&0x04) => {
+                        body.extend_from_slice(&lsn.load(Ordering::Relaxed).to_be_bytes())
+                    }
+                    _ => {
+                        body.extend_from_slice(&1u32.to_be_bytes());
+                        body.push(0);
+                        body.extend_from_slice(&4u32.to_be_bytes());
+                        body.extend_from_slice(b"body");
+                    }
+                }
+                let mut frame = (body.len() as u32).to_be_bytes().to_vec();
+                frame.extend_from_slice(&body);
+                if sock.write_all(&frame).await.is_err() {
+                    break;
+                }
+            }
+        }
+    })
+}
+
+/// Keep value read pending while supervisor restarts worker
+#[tokio::test(flavor = "current_thread")]
+async fn shadow_store_read_survives_worker_restart() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use walshadow::toast::shadow_store::ShadowToastStore;
+    use walshadow::toast::{ChunkStore, FetchedValue};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let sock = tmp.path().join("toast.sock");
+    let lsn = Arc::new(AtomicU64::new(0x1000));
+    let worker = spawn_toast_worker(
+        tokio::net::UnixListener::bind(&sock).expect("bind stand-in"),
+        lsn.clone(),
+    );
+    let bridge = Arc::new(
+        walshadow::bridge::connect_with_budget(&sock, 1, Duration::from_secs(5))
+            .await
+            .expect("stand-in bridge"),
+    );
+    let store = Arc::new(
+        ShadowToastStore::new(bridge.clone()).with_replay_wait_max(Duration::from_secs(5)),
+    );
+    let read = tokio::spawn({
+        let store = store.clone();
+        async move { store.fetch_many(16500, &[(7, 4)], 0x2000).await }
+    });
+
+    // Polls see 0x1000, then worker stops accepting connections
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    worker.abort();
+    let _ = worker.await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!read.is_finished(), "read must hold while shadow is down");
+
+    // Restart worker after replay passes required record
+    fs::remove_file(&sock).unwrap();
+    lsn.store(0x3000, Ordering::Relaxed);
+    let worker = spawn_toast_worker(
+        tokio::net::UnixListener::bind(&sock).expect("rebind stand-in"),
+        lsn.clone(),
+    );
+    let got = read.await.unwrap().expect("read holds through the restart");
+    assert_eq!(got, vec![FetchedValue::Assembled(b"body".to_vec())]);
+    assert!(bridge.stats.reconnects.load(Ordering::Relaxed) >= 1);
+    worker.abort();
+
+    // A shadow that stays down exhausts the same budget
+    worker.await.ok();
+    let store = ShadowToastStore::new(bridge).with_replay_wait_max(Duration::from_millis(300));
+    let err = store
+        .fetch_many(16500, &[(7, 4)], 0x4000)
+        .await
+        .expect_err("no worker ever answers");
+    assert!(err.to_string().contains("unreachable"), "{err}");
 }
 
 /// 8. Replay movement sends a committed read to the mirroring statement and

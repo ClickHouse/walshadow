@@ -102,8 +102,9 @@ insert batch
 
 ## Large values
 
-ClickHouse output always uses persistent TOAST chunk mirrors. Missing required
-mirror tables stop replication, see [large toasted values](destination-tables.md#large-toasted-values)
+Default `clickhouse` value mode uses persistent TOAST chunk mirrors. Missing
+required mirror tables stop replication, see
+[large toasted values](destination-tables.md#large-toasted-values)
 
 Reused TOAST value IDs can leave ambiguous generations in backup chunk mirrors
 when hint bits do not prove older chunks dead. Baseline rows and later
@@ -111,19 +112,22 @@ unchanged-pointer updates both resolve from those mirrors. Chunk lookup orders
 by `(ver, blkno, offnum)` for determinism, not generation correctness: a newer
 generation at a lower TID can lose when versions tie
 
-### Shadow value backend
+### Shadow value mode
 
-`[toast] backend = "shadow"` (see
-[configuration](configuration.md#value-backend)) serves both a greenfield
+`[toast] mode = "shadow"` (see
+[configuration](configuration.md#value-mode)) serves both a greenfield
 bootstrap and live CDC. It has three important limitations:
 
-- **No reclamation fence.** walshadow does not delay prune or vacuum records
-  during shadow replay. After restart from a position below durable processing
-  progress, PostgreSQL may already have removed a required value
+- **No reclamation fence.** walshadow does not delay prune, vacuum,
+  `TRUNCATE`, `DROP TABLE`, or rewrite records during shadow replay. Shadow
+  applies them as soon as WAL arrives, while rows wait for ClickHouse. If
+  shadow removes a value before ClickHouse writes its row, the value becomes
+  NULL and increments `toast_values_filled_superseded`. Restart from a
+  position below durable processing progress has the same risk
 - **Shadow stores required data, not only catalog state.** Losing shadow does
   not lose a ClickHouse chunk mirror, but it does lose values stored by this
-  backend. Recovery requires a fresh bootstrap
-- **No migration path.** Backends store different history. Switching an
+  mode. Recovery requires a fresh bootstrap
+- **No migration path.** Modes store different history. Switching an
   existing deployment requires a fresh bootstrap
 
 Shadow reads current value generation directly, so ClickHouse mirror's reused

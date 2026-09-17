@@ -15,7 +15,6 @@ pub mod copy_backfill;
 pub mod opt_in;
 pub mod pg_path;
 pub mod spool;
-pub mod toast_staging;
 pub mod visibility_gate;
 pub mod visibility_pending;
 pub mod wal_landing;

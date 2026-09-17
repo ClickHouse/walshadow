@@ -23,7 +23,7 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use tokio_postgres::{Client, NoTls};
-use walshadow::bridge::{Bridge, ToastSnapshot};
+use walshadow::bridge::Bridge;
 use walshadow::pg::socket_conninfo;
 use walshadow::shadow::{BridgeConf, Shadow, ShadowConfig};
 use walshadow::toast::FetchedValue;
@@ -209,12 +209,11 @@ async fn seed_value(c: &Client, name: &str, body_sql: &str, external: bool) -> V
     }
 }
 
-async fn fetch(bridge: &Bridge, v: &Value, snap: ToastSnapshot) -> FetchedValue {
+async fn fetch(bridge: &Bridge, v: &Value) -> FetchedValue {
     bridge
-        .fetch_toast(v.toast_relid, &[(v.value_id, v.extsize)], 0, snap)
+        .fetch_toast(v.toast_relid, &[(v.value_id, v.extsize)], 0)
         .await
         .unwrap_or_else(|e| panic!("fetch {} value {}: {e}", v.table, v.value_id))
-        .values
         .pop()
         .expect("one value asked, one answered")
 }
@@ -263,7 +262,7 @@ async fn live_value_reads_back_byte_exact() {
     let sql = connect_sql(&pg.sh).await;
 
     let v = seed_value(&sql, "t_live", "repeat('ab', 120000)", true).await;
-    match fetch(&bridge, &v, ToastSnapshot::Toast).await {
+    match fetch(&bridge, &v).await {
         FetchedValue::Assembled(b) => {
             assert_eq!(b.len(), v.extsize, "stored length");
             assert_eq!(b, v.raw.as_bytes(), "stored bytes are the plaintext");
@@ -299,7 +298,7 @@ async fn dead_referrer_still_yields_its_value() {
     .await;
 
     for v in [&deleted, &replaced] {
-        let got = fetch(&bridge, v, ToastSnapshot::Toast).await;
+        let got = fetch(&bridge, v).await;
         assert!(
             matches!(&got, FetchedValue::Assembled(b) if b == v.raw.as_bytes()),
             "{} after its referrer died: {}",
@@ -325,12 +324,12 @@ async fn pruning_reclaims_as_soon_as_the_horizon_passes() {
     let pinned = seed_value(&sql, "t_pinned", "repeat('qr', 120000)", true).await;
     let hold = PinnedHorizon::hold(&pg.sh).await;
     exec(&sql, "DELETE FROM t_pinned WHERE id = 1").await;
-    let under_hold = fetch(&bridge, &pinned, ToastSnapshot::Toast).await;
+    let under_hold = fetch(&bridge, &pinned).await;
     hold.release().await;
 
     let free = seed_value(&sql, "t_free", "repeat('st', 120000)", true).await;
     exec(&sql, "DELETE FROM t_free WHERE id = 1").await;
-    let no_hold = fetch(&bridge, &free, ToastSnapshot::Toast).await;
+    let no_hold = fetch(&bridge, &free).await;
 
     eprintln!(
         "horizon pinned: {}\nhorizon free:   {}",
@@ -364,7 +363,7 @@ async fn partly_reclaimed_run_refuses() {
 
     let v = seed_value(&sql, "t_torn", "repeat('uv', 120000)", true).await;
     exec(&sql, "DELETE FROM t_torn WHERE id = 1").await;
-    let got = fetch(&bridge, &v, ToastSnapshot::Toast).await;
+    let got = fetch(&bridge, &v).await;
     match &got {
         FetchedValue::Mismatch { got } => assert!(
             *got < v.extsize,
@@ -393,7 +392,7 @@ async fn vacuum_rewrite_and_truncate_each_remove_the_value() {
     exec(&sql, "DELETE FROM t_vac WHERE id = 1").await;
     exec(&sql, "VACUUM t_vac").await;
     assert_eq!(
-        fetch(&bridge, &vacuumed, ToastSnapshot::Toast).await,
+        fetch(&bridge, &vacuumed).await,
         FetchedValue::Missing,
         "VACUUM removes the chunks and their index entries"
     );
@@ -403,34 +402,17 @@ async fn vacuum_rewrite_and_truncate_each_remove_the_value() {
     let rewritten = seed_value(&sql, "t_rewrite", "repeat('ij', 120000)", true).await;
     exec(&sql, "DELETE FROM t_rewrite WHERE id = 1").await;
     exec(&sql, "VACUUM FULL t_rewrite").await;
-    assert_eq!(
-        fetch(&bridge, &rewritten, ToastSnapshot::Toast).await,
-        FetchedValue::Missing,
-    );
+    assert_eq!(fetch(&bridge, &rewritten).await, FetchedValue::Missing,);
 
     let truncated = seed_value(&sql, "t_trunc", "repeat('kl', 120000)", true).await;
     exec(&sql, "TRUNCATE t_trunc").await;
-    assert_eq!(
-        fetch(&bridge, &truncated, ToastSnapshot::Toast).await,
-        FetchedValue::Missing,
-    );
+    assert_eq!(fetch(&bridge, &truncated).await, FetchedValue::Missing,);
 
-    // DROP takes the relation with it, which is an error rather than a Missing
-    // that would license filling a default
+    // DROP takes the relation with it. Shadow replays it at pump pace with no
+    // fence, so a read that lost the race answers Missing like TRUNCATE does
     let dropped = seed_value(&sql, "t_drop", "repeat('yz', 120000)", true).await;
     exec(&sql, "DROP TABLE t_drop").await;
-    assert!(
-        bridge
-            .fetch_toast(
-                dropped.toast_relid,
-                &[(dropped.value_id, dropped.extsize)],
-                0,
-                ToastSnapshot::Toast,
-            )
-            .await
-            .is_err(),
-        "a dropped toast relation must not answer Missing"
-    );
+    assert_eq!(fetch(&bridge, &dropped).await, FetchedValue::Missing,);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -453,7 +435,7 @@ async fn compressed_value_comes_back_stored_not_inflated() {
         v.extsize,
         v.raw.len()
     );
-    match fetch(&bridge, &v, ToastSnapshot::Toast).await {
+    match fetch(&bridge, &v).await {
         FetchedValue::Assembled(b) => {
             assert_eq!(b.len(), v.extsize, "stored, not inflated");
             assert_ne!(b, v.raw.as_bytes(), "bytes are the compressed form");
@@ -475,40 +457,30 @@ async fn fetch_refuses_malformed_requests() {
     let v = seed_value(&sql, "t_bad", "repeat('op', 120000)", true).await;
 
     // Empty and over-cap lists never reach the socket
-    assert!(
-        bridge
-            .fetch_toast(v.toast_relid, &[], 0, ToastSnapshot::Toast)
-            .await
-            .is_err()
-    );
+    assert!(bridge.fetch_toast(v.toast_relid, &[], 0).await.is_err());
     let too_many: Vec<(u32, usize)> = (0..walshadow::bridge::MAX_FETCH_VALUES as u32 + 1)
         .map(|i| (i, 0))
         .collect();
     assert!(
         bridge
-            .fetch_toast(v.toast_relid, &too_many, 0, ToastSnapshot::Toast)
+            .fetch_toast(v.toast_relid, &too_many, 0)
             .await
             .is_err()
     );
 
-    // An unknown relation is an error, never a Missing that licenses a fill
-    assert!(
-        bridge
-            .fetch_toast(999_999, &[(1, 8)], 0, ToastSnapshot::Toast)
-            .await
-            .is_err(),
-        "absent toast relation must not answer Missing"
-    );
+    // A relation shadow no longer has answers Missing per value, as a
+    // replayed TRUNCATE does: a drop racing the emitter must not fail the
+    // pipeline while no reclamation fence holds it back
+    let gone = bridge
+        .fetch_toast(999_999, &[(1, 8), (2, 8)], 0)
+        .await
+        .expect("absent toast relation is a per-value result");
+    assert_eq!(gone, vec![FetchedValue::Missing, FetchedValue::Missing]);
 
     // A replay floor a primary cannot meet is refused rather than answered
     assert!(
         bridge
-            .fetch_toast(
-                v.toast_relid,
-                &[(v.value_id, v.extsize)],
-                u64::MAX,
-                ToastSnapshot::Toast,
-            )
+            .fetch_toast(v.toast_relid, &[(v.value_id, v.extsize)], u64::MAX,)
             .await
             .is_err(),
         "min_replay_lsn above the current position must refuse"
@@ -517,15 +489,9 @@ async fn fetch_refuses_malformed_requests() {
     // A value id that was never allocated is Missing, not an error
     assert_eq!(
         bridge
-            .fetch_toast(
-                v.toast_relid,
-                &[(v.value_id.wrapping_add(7919), 8)],
-                0,
-                ToastSnapshot::Toast
-            )
+            .fetch_toast(v.toast_relid, &[(v.value_id.wrapping_add(7919), 8)], 0,)
             .await
             .expect("absent id is a per-value result")
-            .values
             .pop()
             .unwrap(),
         FetchedValue::Missing,
@@ -534,24 +500,12 @@ async fn fetch_refuses_malformed_requests() {
     // Wrong expected size is a mismatch, so a torn run can never pass as whole
     assert!(matches!(
         bridge
-            .fetch_toast(
-                v.toast_relid,
-                &[(v.value_id, v.extsize - 1)],
-                0,
-                ToastSnapshot::Toast
-            )
+            .fetch_toast(v.toast_relid, &[(v.value_id, v.extsize - 1)], 0,)
             .await
             .expect("size disagreement is a per-value result")
-            .values
             .pop()
             .unwrap(),
         FetchedValue::Mismatch { .. }
-    ));
-
-    // SnapshotAny is wider but must agree on a live, whole value
-    assert!(matches!(
-        fetch(&bridge, &v, ToastSnapshot::Any).await,
-        FetchedValue::Assembled(ref b) if b == v.raw.as_bytes()
     ));
 }
 
@@ -611,18 +565,18 @@ async fn batch_fetch_aligns_with_its_request() {
     asked.insert(4, (u32::MAX, 16));
     let started = Instant::now();
     let got = bridge
-        .fetch_toast(toast_relid, &asked, 0, ToastSnapshot::Toast)
+        .fetch_toast(toast_relid, &asked, 0)
         .await
         .expect("batch fetch");
     let elapsed = started.elapsed();
-    assert_eq!(got.values.len(), asked.len());
-    assert_eq!(got.values[4], FetchedValue::Missing);
+    assert_eq!(got.len(), asked.len());
+    assert_eq!(got[4], FetchedValue::Missing);
     let mut bytes = 0usize;
     for (i, (_, expected)) in asked.iter().enumerate() {
         if i == 4 {
             continue;
         }
-        match &got.values[i] {
+        match &got[i] {
             FetchedValue::Assembled(b) => {
                 assert_eq!(b.len(), *expected, "value {i}");
                 bytes += b.len();
@@ -636,10 +590,6 @@ async fn batch_fetch_aligns_with_its_request() {
         "8 values, {bytes} stored bytes, one round trip: {:?} ({:?}/value)",
         elapsed,
         elapsed / 8
-    );
-    assert!(
-        got.replay_lsn_start == 0 && got.replay_lsn_end == 0,
-        "a primary reports no replay position"
     );
 }
 
@@ -789,22 +739,13 @@ async fn standby_keeps_the_value_until_the_prune_record_replays() {
     let replay = scalar(&sb_sql, "SELECT pg_last_wal_replay_lsn()::text").await;
     let replay_lsn = walshadow::pg::parse_pg_lsn(&replay).expect("parse replay lsn");
     let got = sb_bridge
-        .fetch_toast(
-            v.toast_relid,
-            &[(v.value_id, v.extsize)],
-            replay_lsn,
-            ToastSnapshot::Toast,
-        )
+        .fetch_toast(v.toast_relid, &[(v.value_id, v.extsize)], replay_lsn)
         .await
         .expect("standby fetch at its own replay position");
     assert!(
-        got.replay_lsn_start >= replay_lsn,
-        "worker samples a replay position at or past the floor asked for"
-    );
-    assert!(
-        matches!(&got.values[0], FetchedValue::Assembled(b) if b == v.raw.as_bytes()),
+        matches!(&got[0], FetchedValue::Assembled(b) if b == v.raw.as_bytes()),
         "on a standby the dead referrer's value must still read whole: {}",
-        describe(&got.values[0], v.extsize)
+        describe(&got[0], v.extsize)
     );
 
     // Now let the source prune and ship the record. Replaying it is what takes
@@ -815,7 +756,7 @@ async fn standby_keeps_the_value_until_the_prune_record_replays() {
     ship_wal(&source.sh);
     wait_replay_past(&sb_sql, &after_vacuum, "the VACUUM").await;
 
-    let after = fetch(&sb_bridge, &v, ToastSnapshot::Toast).await;
+    let after = fetch(&sb_bridge, &v).await;
     assert_ne!(
         after,
         FetchedValue::Assembled(v.raw.clone().into_bytes()),
@@ -875,21 +816,12 @@ async fn shadow_store_reads_and_refuses_writes() {
             .unwrap()
             .is_empty()
     );
-    // The wider snapshot must agree on a live, whole value
+    // A relation shadow no longer has reads as superseded, the same as its
+    // truncated chunks would
     assert_eq!(
-        ShadowToastStore::new(Arc::new(dial(pg.sh.bridge_socket().unwrap()).await))
-            .with_snapshot(ToastSnapshot::Any)
-            .fetch(v.toast_relid, v.value_id, 0, v.extsize)
-            .await
-            .expect("fetch under SnapshotAny"),
-        FetchedValue::Assembled(v.raw.clone().into_bytes()),
+        store.fetch(999_999, 1, 0, 8).await.expect("gone relation"),
+        FetchedValue::Missing,
     );
-    // A relation shadow does not have is an error, not a Missing: absence of a
-    // backend is not evidence the value was superseded
-    assert!(matches!(
-        store.fetch(999_999, 1, 0, 8).await,
-        Err(ChunkStoreError::Shadow(_))
-    ));
 
     let row = ToastRow {
         toast_relid: v.toast_relid,
@@ -975,7 +907,7 @@ async fn pg_standby_conflicts_do_not_fence_reclamation() {
     ship_wal(&source.sh);
 
     let parked_for_early = !replay_passed_within(&sb_sql, &reclaimed, Duration::from_secs(5)).await;
-    let under_early = fetch(&sb_bridge, &v, ToastSnapshot::Toast).await;
+    let under_early = fetch(&sb_bridge, &v).await;
     eprintln!(
         "snapshot predating the DELETE parks replay: {parked_for_early}, value {}",
         describe(&under_early, v.extsize)
@@ -990,7 +922,7 @@ async fn pg_standby_conflicts_do_not_fence_reclamation() {
     let late = connect_sql(&standby.sh).await;
     exec(&late, "BEGIN ISOLATION LEVEL REPEATABLE READ").await;
     exec(&late, "SELECT 1").await;
-    let under_late = fetch(&sb_bridge, &v, ToastSnapshot::Toast).await;
+    let under_late = fetch(&sb_bridge, &v).await;
     eprintln!(
         "value to a snapshot opened after it: {}",
         describe(&under_late, v.extsize)

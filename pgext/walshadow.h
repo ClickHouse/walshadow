@@ -8,7 +8,7 @@
 
 /* Bumped when a request or response layout changes, or when an op's reading
  * of an unchanged layout changes */
-#define WS_PROTO_VERSION		4
+#define WS_PROTO_VERSION		5
 /* Bumped when any catalog projection changes shape */
 #define WS_PROJECTION_VERSION	1
 
@@ -18,10 +18,6 @@
 #define WS_OP_SCAN				0x03
 #define WS_OP_REPLAY_LSN		0x04
 #define WS_OP_FETCH_TOAST		0x05
-
-/* FETCH_TOAST visibility. ANY exposes generations hidden by TOAST for tests */
-#define WS_SNAP_TOAST		0x00
-#define WS_SNAP_ANY			0x01
 
 /* per-value result in a FETCH_TOAST response */
 #define WS_FETCH_OK			0x00

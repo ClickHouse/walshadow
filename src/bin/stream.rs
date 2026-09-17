@@ -1465,31 +1465,28 @@ async fn run_session(
         .await
         .context("shadow database oid")?;
     stream.filter_mut().set_target_db(shadow_db_oid);
-    // Shadow must replay WAL for relations that store external values
-    let shadow_toast = ch_config
-        .as_ref()
-        .is_some_and(|c| c.toast.backend.is_shadow());
+    // Replay WAL only for user relations already stored by shadow
+    // Read replay position first so concurrent creates are included
+    let shadow_toast = ch_config.as_ref().is_some_and(|c| c.toast.mode.is_shadow());
     if shadow_toast {
-        let rels = bootstrap_handoff
-            .as_ref()
-            .map(|h| h.toast_rels.clone())
-            .unwrap_or_default();
-        if rels.is_empty() {
-            // No bootstrap relation list, route all user relations safely
-            stream.filter_mut().route_user_to_shadow(true);
-            tracing::warn!(
-                target: "walshadow::toast",
-                "[toast] backend = shadow without a bootstrap to enumerate TOAST \
-                 relations: routing every user relation to shadow",
-            );
-        } else {
-            stream.filter_mut().keep_user_rels(rels.clone());
-            tracing::info!(
-                target: "walshadow::toast",
-                toast_rels = rels.len(),
-                "[toast] backend = shadow: replaying these relations on shadow too",
-            );
-        }
+        let dir = shadow_start.data_dir().context(
+            "[toast] mode = shadow reads values from a daemon-owned shadow; \
+             pass --bootstrap-shadow-data-dir",
+        )?;
+        let replayed = bridge
+            .replay_lsn()
+            .await
+            .context("shadow replay position for toast routing")?;
+        let rels = walshadow::backfill::pg_path::user_relation_filenodes(dir, shadow_db_oid)
+            .await
+            .context("list shadow relations for toast routing")?;
+        tracing::info!(
+            target: "walshadow::toast",
+            rels = rels.len(),
+            replayed = format_pg_lsn(replayed).to_string(),
+            "[toast] mode = shadow: replaying WAL for these relations on shadow",
+        );
+        stream.filter_mut().keep_user_rels(rels, replayed);
     }
     let pending_cfg = ch_config
         .as_ref()
@@ -3178,6 +3175,9 @@ fn spawn_mapping_refresher(
 /// Max unsynced segments queued before the pump blocks on `on_segment`;
 const SEGMENT_FSYNC_QUEUE: usize = 64;
 
+/// `pg_default`, PG `catalog/pg_tablespace.dat`
+const DEFAULT_TABLESPACE_OID: u32 = 1663;
+
 #[cfg(target_os = "linux")]
 fn sync_filesystem(fd: std::os::fd::RawFd) -> std::io::Result<()> {
     if unsafe { libc::syncfs(fd) } == 0 {
@@ -4462,9 +4462,9 @@ async fn run_bootstrap(
         .await
         .context("bootstrap: seed catalog filenodes")?;
     let catalog_filenodes: Vec<_> = landing_tracker.nodes().collect();
-    // Filtered at one of two points depending on the backend, never both:
-    // the shadow backend rewrites before its recovery starts mid-bootstrap,
-    // the ClickHouse backend after the window leg has read the raw segments
+    // Filtered at one of two points depending on toast mode, never both:
+    // shadow mode rewrites before its recovery starts mid-bootstrap, other
+    // modes after the window leg has read the raw segments
     let mut landing_tracker = Some(landing_tracker);
     tracing::info!(
         target: "walshadow::bootstrap",
@@ -4539,21 +4539,11 @@ async fn run_bootstrap(
     let bootstrap_stats = emitter_stats;
     // Leaf-only pool for the bootstrap tail: caps each value (V3) and
     // bounds decoded rows in flight to insert ack; no admission stage
-    let shadow_toast = ch_config
-        .as_ref()
-        .is_some_and(|c| c.toast.backend.is_shadow());
-    // Oracle serves copied pre-backup values. Shadow replays through end_lsn
-    // to serve values written during backup.
-    //
-    // Bind bridges after corresponding PostgreSQL instances start
-    // Pass bootstrap shadow instance to main run loop
+    let shadow_toast = ch_config.as_ref().is_some_and(|c| c.toast.mode.is_shadow());
+    // Shadow serves values once bootstrap starts it; its bridge binds then
+    // and run() adopts the instance
     let mut running_shadow: Option<Arc<Shadow>> = None;
     let shadow_toast_bridge = walshadow::toast::shadow_store::LateBridge::default();
-    let toast_staging = shadow_toast.then(|| {
-        walshadow::backfill::toast_staging::ToastStaging::new(
-            args.spill_dir.join("bootstrap_oracle_toast"),
-        )
-    });
     let shadow_backed = |cell: &walshadow::toast::shadow_store::LateBridge, cfg: &EmitterConfig| {
         ToastResolver::with_store(
             Arc::new(walshadow::toast::shadow_store::ShadowToastStore::late(
@@ -4632,23 +4622,12 @@ async fn run_bootstrap(
         None => (None, false, Default::default()),
     };
 
-    let source_conninfo = format!(
-        "host={} port={} user={} dbname={} sslmode={}",
-        src_cfg.host,
-        src_cfg.port,
-        src_cfg.user,
-        src_cfg.database,
-        if src_cfg.sslmode == SslMode::Disable {
-            "disable"
-        } else {
-            "prefer"
-        },
-    );
-
-    // Query source for TOAST index filenodes absent from catalog seed
-    let mut toast_stage_rels: ahash::HashSet<(u32, u32)> = ahash::HashSet::default();
+    // Shadow keeps TOAST heaps and their indexes the way it keeps catalogs:
+    // landed in place by the backup, then replayed. Index filenodes are
+    // absent from catalog seed, so query source for them
+    let mut shadow_toast_rels: ahash::HashSet<(u32, u32)> = ahash::HashSet::default();
     if shadow_toast {
-        let heaps: Vec<u32> = drain_catalog
+        let toast_heaps: Vec<_> = drain_catalog
             .descriptors()
             .filter(|d| d.kind == 't')
             .filter(|d| {
@@ -4656,15 +4635,29 @@ async fn run_bootstrap(
                     .as_ref()
                     .is_none_or(|set| set.contains(&(d.rfn.db_node, d.rfn.rel_node)))
             })
-            .map(|d| d.rfn.rel_node)
             .collect();
+        // Lander keys on `base/<db>/` paths; refuse other tablespaces now
+        // rather than at shadow's first read
+        if let Some(d) = toast_heaps
+            .iter()
+            .find(|d| d.rfn.spc_node != DEFAULT_TABLESPACE_OID)
+        {
+            anyhow::bail!(
+                "bootstrap: TOAST relation {} (filenode {}) is in tablespace {}; \
+                 [toast] mode = shadow keeps files from default tablespace only",
+                d.rel_name,
+                d.rfn.rel_node,
+                d.rfn.spc_node,
+            );
+        }
+        let heaps: Vec<u32> = toast_heaps.iter().map(|d| d.rfn.rel_node).collect();
         let db_oid = drain_catalog
             .descriptors()
             .map(|d| d.rfn.db_node)
             .next()
             .unwrap_or_default();
         for rel in &heaps {
-            toast_stage_rels.insert((db_oid, *rel));
+            shadow_toast_rels.insert((db_oid, *rel));
         }
         if !heaps.is_empty() {
             // Reuse authenticated sidecar client from catalog seed
@@ -4677,7 +4670,11 @@ async fn run_bootstrap(
             let rows = sql_client
                 .query(
                     &format!(
-                        "SELECT ic.relfilenode::int8 FROM pg_class t \
+                        "SELECT ic.relfilenode::int8, ic.relname::text, \
+                         coalesce(nullif(ic.reltablespace, 0), \
+                                  (SELECT dattablespace FROM pg_database \
+                                   WHERE datname = current_database()))::int8 \
+                         FROM pg_class t \
                          JOIN pg_index i ON i.indrelid = t.oid \
                          JOIN pg_class ic ON ic.oid = i.indexrelid \
                          WHERE t.relkind = 't' \
@@ -4688,31 +4685,41 @@ async fn run_bootstrap(
                 .await
                 .context("bootstrap: read toast index filenodes")?;
             for row in &rows {
-                toast_stage_rels.insert((db_oid, row.get::<_, i64>(0) as u32));
+                let spc = row.get::<_, i64>(2) as u32;
+                anyhow::ensure!(
+                    spc == DEFAULT_TABLESPACE_OID,
+                    "bootstrap: TOAST index {} is in tablespace {spc}; \
+                     [toast] mode = shadow keeps files from default tablespace only",
+                    row.get::<_, String>(1),
+                );
+                shadow_toast_rels.insert((db_oid, row.get::<_, i64>(0) as u32));
             }
             tracing::info!(
                 target: "walshadow::bootstrap",
                 toast_heaps = heaps.len(),
                 toast_indexes = rows.len(),
-                "staging TOAST storage for the shadow value backend",
+                "landing TOAST storage in shadow",
             );
         }
     }
-    // Include indexes in page-walk file filter
-    let tap_filenodes = match tap_filenodes {
-        Some(set) if shadow_toast => {
-            let mut set = (*set).clone();
-            set.extend(toast_stage_rels.iter().copied());
-            Some(Arc::new(set))
-        }
-        other => other,
-    };
 
     // Off the backup window: provisioning is an initdb + pg_dump + apply +
     // restart, and doing it after `BASE_BACKUP` opens parks a live backup
     // through all of it — in object-store mode against walrus's 60 s request
     // cap
     let bootstrap_oracle = if needs_oracle {
+        let source_conninfo = format!(
+            "host={} port={} user={} dbname={} sslmode={}",
+            src_cfg.host,
+            src_cfg.port,
+            src_cfg.user,
+            src_cfg.database,
+            if src_cfg.sslmode == SslMode::Disable {
+                "disable"
+            } else {
+                "prefer"
+            },
+        );
         Some(
             walshadow::backfill::bootstrap_oracle::BootstrapOracle::provision(
                 args.spill_dir.join("bootstrap_oracle"),
@@ -4746,14 +4753,11 @@ async fn run_bootstrap(
         .context("bootstrap: sample source write head for the window leg")?;
     let source_major = (feed.server_version_num() / 10000) as u32;
 
-    let mut cfg =
-        BootstrapConfig::new(shadow_data_dir.clone()).with_catalog_filenodes(catalog_filenodes);
-    if let Some(staging) = &toast_staging {
-        cfg = cfg.staging_toast_into(
-            staging.root().to_path_buf(),
-            Arc::new(toast_stage_rels.clone()),
-        );
-    }
+    let mut cfg = BootstrapConfig::new(shadow_data_dir.clone()).with_catalog_filenodes(
+        catalog_filenodes
+            .into_iter()
+            .chain(shadow_toast_rels.iter().copied()),
+    );
     if let Some(set) = tap_filenodes {
         cfg = cfg.with_tap_filenodes(set);
     }
@@ -5153,26 +5157,16 @@ async fn run_bootstrap(
             shadow_data_dir.join("pg_wal")
         };
 
-        // Start shadow before value reads. Recovery adds values written during
-        // backup and repairs torn pages and checksums.
-        let staged_rels = match &toast_staging {
-            Some(staging) => walshadow::backfill::toast_staging::staged_filenodes(staging)
-                .await
-                .context("bootstrap: list staged TOAST relations")?,
-            None => ahash::HashSet::default(),
-        };
-        let staged_db_oid = staged_rels.iter().next().map(|&(db, _)| db);
-
         // Rewrite landed WAL before shadow recovery; backup processing uses copy.
         //
-        // ClickHouse backend rewrites after reading original `pg_wal` below
+        // Non-shadow toast modes rewrite after reading original `pg_wal` below
         if shadow_toast {
             let landed = walshadow::backfill::wal_landing::filter_landed_wal(
                 &shadow_data_dir.join("pg_wal"),
                 outcome.start.timeline,
                 outcome.end.end_lsn,
                 landing_tracker.take().expect("landed WAL filtered once"),
-                staged_rels.clone(),
+                Some((shadow_toast_rels, outcome.start.start_lsn)),
             )
             .await
             .context("bootstrap: filter landed WAL")?;
@@ -5185,28 +5179,9 @@ async fn run_bootstrap(
                 dropped_bytes = landed.dropped_bytes,
                 "landed WAL filtered",
             );
-        }
 
-        if shadow_toast {
-            if let Some(staging) = &toast_staging
-                && let Some(db_oid) = staged_db_oid
-            {
-                let (files, bytes) = walshadow::backfill::toast_staging::install_into(
-                    staging,
-                    &shadow_data_dir,
-                    db_oid,
-                )
-                .await
-                .context("bootstrap: install staged TOAST into shadow")?;
-                tracing::info!(
-                    target: "walshadow::bootstrap",
-                    files,
-                    bytes,
-                    db_oid,
-                    "installed staged TOAST heaps into shadow",
-                );
-            }
-
+            // Start shadow before value reads. Recovery adds values written
+            // during backup and repairs torn pages and checksums.
             // PostgreSQL requires data-directory mode 0700 or 0750
             #[cfg(unix)]
             {
@@ -5440,14 +5415,14 @@ async fn run_bootstrap(
     }
     tokio::fs::remove_dir_all(&window_scratch).await.ok();
 
-    // ClickHouse backend rewrites landed WAL after backup processing reads it
+    // Non-shadow toast modes rewrite landed WAL after backup processing reads it
     if let Some(tracker) = landing_tracker.take() {
         let landed = walshadow::backfill::wal_landing::filter_landed_wal(
             &shadow_data_dir.join("pg_wal"),
             outcome.start.timeline,
             outcome.end.end_lsn,
             tracker,
-            ahash::HashSet::default(),
+            None,
         )
         .await
         .context("bootstrap: filter landed WAL")?;
@@ -5507,9 +5482,6 @@ async fn run_bootstrap(
             .with_context(|| format!("bootstrap: chmod 0700 {}", shadow_data_dir.display()))?;
     }
 
-    if let Some(staging) = &toast_staging {
-        tokio::fs::remove_dir_all(staging.root()).await.ok();
-    }
     bootstrap_marker::ExtractedCheckpoint::clear(&shadow_data_dir).await?;
     BootstrapMarker::clear(&shadow_data_dir).await?;
 
@@ -5518,14 +5490,7 @@ async fn run_bootstrap(
         BootstrapHandoff {
             end_lsn: outcome.end.end_lsn,
             open_floor,
-            // Recompute from unchanged staging tree
             shadow: running_shadow.clone(),
-            toast_rels: match &toast_staging {
-                Some(staging) => walshadow::backfill::toast_staging::staged_filenodes(staging)
-                    .await
-                    .context("bootstrap: list staged TOAST relations")?,
-                None => ahash::HashSet::default(),
-            },
         },
         BootstrapMetrics {
             progress,
@@ -5559,8 +5524,6 @@ struct BootstrapHandoff {
     end_lsn: u64,
     /// Earliest record among transactions open at window seal
     open_floor: Option<u64>,
-    /// Relations installed into shadow whose WAL live stream must preserve
-    toast_rels: ahash::HashSet<(u32, u32)>,
     /// Shadow instance started during bootstrap
     shadow: Option<Arc<Shadow>>,
 }
@@ -5641,6 +5604,14 @@ enum ShadowStart {
 impl ShadowStart {
     fn bootstraps(&self) -> bool {
         matches!(self, Self::Bootstrap(_) | Self::Rebootstrap(..))
+    }
+
+    /// Data directory of a daemon-owned shadow
+    fn data_dir(&self) -> Option<&Path> {
+        match self {
+            Self::External => None,
+            Self::Bootstrap(d) | Self::Rebootstrap(d, _) | Self::Resume(d) => Some(d),
+        }
     }
 }
 
@@ -6596,7 +6567,6 @@ mod tests {
         let crossing = BootstrapHandoff {
             end_lsn: 0x3000,
             open_floor: Some(0x1000),
-            toast_rels: ahash::HashSet::default(),
             shadow: None,
         };
         assert_eq!(crossing.resume_lsn(), 0x1000);
@@ -6604,7 +6574,6 @@ mod tests {
         let clean = BootstrapHandoff {
             end_lsn: 0x3000,
             open_floor: None,
-            toast_rels: ahash::HashSet::default(),
             shadow: None,
         };
         assert_eq!(clean.resume_lsn(), 0x3000);
@@ -6612,7 +6581,6 @@ mod tests {
             BootstrapHandoff {
                 end_lsn: 0x3000,
                 open_floor: Some(0x4000),
-                toast_rels: ahash::HashSet::default(),
                 shadow: None,
             }
             .resume_lsn(),

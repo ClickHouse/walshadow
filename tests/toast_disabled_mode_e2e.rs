@@ -1,30 +1,31 @@
-//! End-to-end test for `[toast] mode = "shadow"` without chunk mirror.
+//! End-to-end test for `[toast] mode = "disabled"`: no chunk store at all.
 //!
+//! INSERT carries chunks in the same transaction, so its value still resolves.
 //! Under REPLICA IDENTITY FULL, UPDATE that does not change `body` logs only
-//! TOAST pointer. Resolver must read value from shadow TOAST heap.
+//! its TOAST pointer. With no store to read, resolver writes NULL and counts a
+//! default fill.
 //!
-//! Verify ClickHouse has no chunk mirror and resolver performs no writes.
+//! Verify ClickHouse has no chunk mirror and the resolver neither writes nor
+//! reads a store.
 
 #![cfg(target_os = "linux")]
 
 #[path = "common/inproc_harness.rs"]
 mod fx;
 
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use walshadow::mapping::{ColumnMapping, TableTarget};
 use walshadow::schema::RelName;
 
-/// 16 bytes * 512 = 8192, past the ~2KB toast threshold and spanning several
-/// ~2KB chunks, so a partial read would be visible as a short value
+/// 16 bytes * 512 = 8192, past the ~2KB toast threshold
 const BODY_SQL: &str = "repeat('walshadow-toast-', 512)";
 /// Force cross-page update so PostgreSQL logs complete tuple
 const META2_SQL: &str = "repeat('v2-update-', 60)";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn unchanged_toast_pointer_resolves_out_of_shadow() {
+async fn unchanged_toast_pointer_fills_null_without_store() {
     if !fx::requirements_available() {
         return;
     }
@@ -38,7 +39,7 @@ async fn unchanged_toast_pointer_resolves_out_of_shadow() {
             shadow_filter_dir,
         },
         shadow_stream_state,
-    ) = fx::bootstrap_clusters_with_bridge(
+    ) = fx::bootstrap_clusters(
         &tmp,
         "CREATE TABLE public.doc (id int PRIMARY KEY, meta text, body text);\n\
          ALTER TABLE public.doc ALTER COLUMN body SET STORAGE EXTERNAL;\n\
@@ -89,20 +90,7 @@ async fn unchanged_toast_pointer_resolves_out_of_shadow() {
         ],
     }];
 
-    // Same bridge the oracle uses: a shadow-backed value read rides the
-    // worker pool rather than dialling its own socket
-    let bridge = Arc::new(
-        walshadow::bridge::connect_with_budget(
-            shadow.bridge_socket().expect("shadow bridge configured"),
-            1,
-            Duration::from_secs(20),
-        )
-        .await
-        .expect("dial shadow bridge"),
-    );
-    let oracle = Arc::new(walshadow::oracle::Oracle::new(bridge));
-
-    let mut pipeline = fx::build_pipeline_tuned(
+    let mut pipeline = fx::build_pipeline_with(
         fx::BuildPipelineArgs {
             tmp: &tmp,
             source: &source,
@@ -112,43 +100,24 @@ async fn unchanged_toast_pointer_resolves_out_of_shadow() {
             ch_database: "walshadow_test",
             ch_tcp_port: slot.ch_tcp,
             mappings,
-            app_name: "walshadow-toast-shadow-backend",
+            app_name: "walshadow-toast-disabled-mode",
             ddl: None,
         },
-        |cfg| cfg.toast.mode = walshadow::ch_emitter::ToastMode::Shadow,
-        Some(oracle),
+        |cfg| cfg.toast.mode = walshadow::ch_emitter::ToastMode::Disabled,
     )
     .await;
 
-    let db_oid: u32 = source
-        .psql_one("SELECT oid FROM pg_database WHERE datname = current_database()")
-        .expect("db oid")
-        .parse()
-        .unwrap();
-    let toast_filenode: u32 = source
-        .psql_one(
-            "SELECT relfilenode FROM pg_class WHERE oid = \
-             (SELECT reltoastrelid FROM pg_class WHERE oid = 'public.doc'::regclass)",
-        )
-        .expect("toast filenode")
-        .parse()
-        .unwrap();
     assert!(
-        pipeline
-            .stream
-            .filter_mut()
-            .shadow_rels()
-            .is_some_and(|rels| rels.contains(&(db_oid, toast_filenode))),
-        "shadow mode must route the TOAST relation's records to shadow",
+        pipeline.stream.filter_mut().shadow_rels().is_none(),
+        "disabled mode must not replay user heaps on shadow",
     );
 
+    // Row 2 keeps body from INSERT chunks
+    // Row 1 update logs only pointer to older value
     let driver = fx::spawn_workload(
         &source,
         vec![
-            format!("INSERT INTO public.doc VALUES (1, 'v1', {BODY_SQL})"),
-            "INSERT INTO public.doc SELECT g, repeat('f', 500), NULL \
-             FROM generate_series(2, 17) g"
-                .into(),
+            format!("INSERT INTO public.doc VALUES (1, 'v1', {BODY_SQL}), (2, 'v1', {BODY_SQL})"),
             format!("UPDATE public.doc SET meta = {META2_SQL} WHERE id = 1"),
             "SELECT pg_switch_wal()".into(),
         ],
@@ -158,56 +127,38 @@ async fn unchanged_toast_pointer_resolves_out_of_shadow() {
     let _ = driver.join();
     assert!(shipped >= 1, "no segments shipped in 45s");
 
-    // The read happens against shadow's replay position, so shadow has to
-    // have applied the chunk records before the pipeline drains
-    let target = pipeline.stream.dispatched_lsn();
-    let observed = shadow
-        .wait_for_replay(target, Duration::from_secs(30))
-        .expect("shadow replay catches up");
-    assert!(observed >= target);
-
     let stats = pipeline.stats.clone();
     pipeline.shutdown().await.expect("pipeline drains clean");
 
     assert_eq!(
         ch.query(&format!(
-            "SELECT meta = {META2_SQL} FROM walshadow_test.doc \
-             WHERE id = 1 ORDER BY _lsn DESC LIMIT 1"
+            "SELECT body = {BODY_SQL} FROM walshadow_test.doc \
+             WHERE id = 2 ORDER BY _lsn DESC LIMIT 1"
         ))
-        .expect("ch meta"),
+        .expect("ch insert body"),
         "1",
-        "UPDATE's meta wins under RIF",
+        "INSERT resolves from chunks in its transaction",
     );
     assert_eq!(
         ch.query(&format!(
-            "SELECT body = {BODY_SQL} FROM walshadow_test.doc \
+            "SELECT meta = {META2_SQL}, isNull(body) FROM walshadow_test.doc \
              WHERE id = 1 ORDER BY _lsn DESC LIMIT 1"
         ))
-        .expect("ch body"),
-        "1",
-        "the unchanged pointer resolved to the full value out of shadow",
-    );
-    assert_eq!(
-        ch.query(
-            "SELECT length(body) FROM walshadow_test.doc \
-                  WHERE id = 1 ORDER BY _lsn DESC LIMIT 1"
-        )
-        .expect("ch body length"),
-        "8192",
-        "a truncated read would still compare unequal, so pin the length too",
+        .expect("ch update row"),
+        "1\t1",
+        "UPDATE keeps meta and fills the unchanged pointer with NULL",
     );
 
-    // Nothing filled: a default or a superseded fill would make the value
-    // assertions above pass for the wrong reason on a NULL-able column
-    assert_eq!(stats.toast_values_filled_default.load(Ordering::Relaxed), 0);
+    assert_eq!(stats.toast_values_filled_default.load(Ordering::Relaxed), 1);
     assert_eq!(
         stats.toast_values_filled_superseded.load(Ordering::Relaxed),
         0
     );
     assert_eq!(stats.toast_fetch_miss.load(Ordering::Relaxed), 0);
-    assert!(
-        stats.toast_values_fetched.load(Ordering::Relaxed) > 0,
-        "the value came from a store read, not from the in-xact chunk map",
+    assert_eq!(
+        stats.toast_values_fetched.load(Ordering::Relaxed),
+        0,
+        "no store to read from",
     );
 
     // No mirror: not written, and no DDL issued for one
@@ -223,6 +174,6 @@ async fn unchanged_toast_pointer_resolves_out_of_shadow() {
         ))
         .expect("mirror presence"),
         "0",
-        "shadow mode must create no chunk mirror",
+        "disabled mode must create no chunk mirror",
     );
 }

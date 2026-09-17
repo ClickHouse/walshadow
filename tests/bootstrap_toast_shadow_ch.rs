@@ -1,4 +1,4 @@
-//! Greenfield bootstrap under `[toast] backend = "shadow"`: external values
+//! Greenfield bootstrap under `[toast] mode = "shadow"`: external values
 //! come out of shadow's own TOAST heaps, and no chunk mirror is written
 //! anywhere.
 //!
@@ -100,7 +100,7 @@ fn write_shadow_toast_config(path: &Path, ch_port: u16, schema: &str) -> Result<
          compression = \"lz4\"\n\
          \n\
          [toast]\n\
-         backend = \"shadow\"\n\
+         mode = \"shadow\"\n\
          \n\
          [table.\"{schema}\".\"t\"]\n\
          target_database = \"default\"\n\
@@ -248,10 +248,7 @@ async fn bootstrap_renders_external_values_out_of_shadow() {
                  WHERE database = 'default' AND name = '{mirror}'"
             ))
             .context("chunk mirror probe")?;
-        ensure!(
-            created == "0",
-            "shadow backend created chunk mirror {mirror}"
-        );
+        ensure!(created == "0", "shadow mode created chunk mirror {mirror}");
 
         let stderr = daemon.stderr();
 
@@ -265,30 +262,39 @@ async fn bootstrap_renders_external_values_out_of_shadow() {
             "nothing deferred, so nothing was read from the oracle: {deferred}"
         );
 
-        // Shadow must install staged files and replay through `end_lsn`
-        let installed = stderr
-            .lines()
-            .find(|l| l.contains("installed staged TOAST heaps into shadow"))
-            .context("shadow was left without the TOAST files it serves from")?;
-        ensure!(
-            !installed.contains("files=0"),
-            "nothing was installed: {installed}"
-        );
-        // Shadow needs both heap and index files
-        ensure!(
-            stderr
-                .lines()
-                .any(|l| l.contains("staging TOAST storage") && l.contains("toast_indexes=1")),
-            "the toast index was not staged, so shadow cannot scan the heap",
-        );
-        // The oracle is out of the value path entirely; it is provisioned
-        // only when a tier-3 type needs converting
-        ensure!(
-            !stderr
-                .lines()
-                .any(|l| l.contains("installed staged TOAST heaps into the bootstrap oracle")),
-            "the oracle should take no part in resolving values",
-        );
+        // Shadow scans the landed heap through its index, so both files must
+        // sit in its data directory
+        let db_oid = source
+            .psql_one("SELECT oid FROM pg_database WHERE datname = current_database()")
+            .context("source database oid")?;
+        let toast_relid = toast_relid.trim();
+        for (what, sql) in [
+            (
+                "heap",
+                format!("SELECT relfilenode FROM pg_class WHERE oid = {toast_relid}"),
+            ),
+            (
+                "index",
+                format!(
+                    "SELECT relfilenode FROM pg_class WHERE oid = \
+                     (SELECT indexrelid FROM pg_index WHERE indrelid = {toast_relid})"
+                ),
+            ),
+        ] {
+            let filenode = source
+                .psql_one(&sql)
+                .with_context(|| format!("toast {what} filenode"))?;
+            let path = daemon
+                .shadow_data_dir
+                .join("base")
+                .join(db_oid.trim())
+                .join(filenode.trim());
+            ensure!(
+                path.is_file(),
+                "shadow lacks the toast {what} it serves from: {}",
+                path.display()
+            );
+        }
         ensure!(
             stderr
                 .lines()

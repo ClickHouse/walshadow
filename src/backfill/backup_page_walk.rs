@@ -15,7 +15,6 @@
 //!   TID
 
 use std::io;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
@@ -489,11 +488,6 @@ pub struct PageWalkSink {
     /// `pg_multixact/{offsets,members}` segments, for multixact xmax
     /// resolution in the same gate
     pg_multixact: Option<Arc<std::sync::Mutex<crate::decode::visibility::PgMultiXactAccum>>>,
-    /// Copy selected relation files into PostgreSQL data-directory layout.
-    /// Set only when `store_toast` is false.
-    ///
-    /// Explicit set includes TOAST indexes absent from [`CatalogMap`]
-    toast_stage: Option<crate::backfill::toast_staging::StagingTarget>,
 }
 
 /// Which SLRU accum a Tapped non-heap file installs into at `end()`.
@@ -520,45 +514,7 @@ impl PageWalkSink {
             tap_filenodes: None,
             pg_xact: None,
             pg_multixact: None,
-            toast_stage: None,
         }
-    }
-
-    /// Stage `rels` under `dir` using their `base/<db>/<file>` paths
-    pub fn staging_toast(
-        mut self,
-        dir: PathBuf,
-        rels: crate::backfill::toast_staging::StagedRels,
-    ) -> Self {
-        self.toast_stage = Some((dir, rels));
-        self
-    }
-
-    /// Write relation body to staging tree and update counters
-    async fn stage_entry(
-        &self,
-        f: &BaseRelFile,
-        meta: &FileMeta,
-    ) -> io::Result<Option<PageWalkEntry>> {
-        let Some((dir, rels)) = &self.toast_stage else {
-            return Ok(None);
-        };
-        if !rels.contains(&(f.db, f.filenode)) {
-            return Ok(None);
-        }
-        let target = dir.join(&meta.path);
-        if let Some(parent) = target.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-        let land = tokio::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&target)
-            .await?;
-        let mut entry = PageWalkEntry::counting(0, self.stats.clone());
-        entry.land = Some(land);
-        Ok(Some(entry))
     }
 
     /// Collect `pg_xact/` segments for the visibility gate.
@@ -613,7 +569,6 @@ impl PageWalkSink {
             tap_filenodes: None,
             pg_xact: None,
             pg_multixact: None,
-            toast_stage: None,
         }
     }
 
@@ -699,14 +654,6 @@ impl BackupSink for PageWalkSink {
                 .fetch_add(1, Ordering::Relaxed);
             return Ok(FileAction::Skip);
         }
-        // Stage TOAST index before descriptor lookup, catalog map has none
-        if let Some(mut entry) = self.stage_entry(&f, meta).await? {
-            entry.block_no = f.segno.saturating_mul(RELSEG_BLOCKS);
-            self.stats
-                .toast_files_observed
-                .fetch_add(1, Ordering::Relaxed);
-            return Ok(FileAction::Tap(Box::new(entry)));
-        }
         let desc = self.catalog.get(f.db, f.filenode);
         let is_toast = self.catalog.is_toast(f.db, f.filenode);
         if is_toast {
@@ -725,7 +672,7 @@ impl BackupSink for PageWalkSink {
             return Ok(FileAction::Skip);
         }
         let Some(desc) = desc else {
-            // Stage relation even when catalog map lacks descriptor
+            // TOAST heap whose descriptor the map lacks; count pages, no walk
             return Ok(FileAction::Tap(Box::new(PageWalkEntry::counting(
                 f.segno.saturating_mul(RELSEG_BLOCKS),
                 self.stats.clone(),
@@ -737,7 +684,6 @@ impl BackupSink for PageWalkSink {
             .copied()
             .unwrap_or_else(|| self.source_lsn());
         Ok(FileAction::Tap(Box::new(PageWalkEntry {
-            land: None,
             block_no: f.segno.saturating_mul(RELSEG_BLOCKS),
             slab: Vec::with_capacity(SLAB_BYTES + PAGE_BYTES),
             spare: None,
@@ -782,8 +728,6 @@ pub struct PageWalkEntry {
     walk: Option<WalkTarget>,
     out: Out,
     stats: Arc<PageWalkStats>,
-    /// Staging target for unmodified relation bytes
-    land: Option<tokio::fs::File>,
     /// Previous slab's walk, still running. One slab of overlap: the tar
     /// reader refills while the blocking pool decodes, so read and decode
     /// cost `max`, not `sum`
@@ -800,7 +744,6 @@ impl PageWalkEntry {
             walk: None,
             out: Out::Captured(Arc::default()),
             stats,
-            land: None,
             pending: None,
         }
     }
@@ -905,9 +848,6 @@ impl PageWalkEntry {
 #[async_trait]
 impl EntrySink for PageWalkEntry {
     async fn chunk(&mut self, bytes: &[u8]) -> io::Result<()> {
-        if let Some(f) = self.land.as_mut() {
-            tokio::io::AsyncWriteExt::write_all(f, bytes).await?;
-        }
         self.slab.extend_from_slice(bytes);
         if self.slab.len() >= SLAB_BYTES {
             self.drain_slab().await?;
@@ -916,10 +856,6 @@ impl EntrySink for PageWalkEntry {
     }
 
     async fn end(mut self: Box<Self>) -> io::Result<()> {
-        if let Some(f) = self.land.as_mut() {
-            tokio::io::AsyncWriteExt::flush(f).await?;
-            f.sync_data().await?;
-        }
         self.drain_slab().await?;
         self.join_pending().await?;
         let trailing = self.slab.len() as u64;
