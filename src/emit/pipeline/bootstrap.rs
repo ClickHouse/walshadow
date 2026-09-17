@@ -479,10 +479,7 @@ async fn prepare_batch(
     }
     // One permit per batch: every value a round fetched stays resident
     // until its row routes, so the rows share what survives
-    let mut leaf = match resolver.budget() {
-        Some(b) => Some(b.acquire(batch.need).await),
-        None => None,
-    };
+    let mut leaf = crate::budget::acquire_opt(resolver.budget(), batch.need).await;
     let retained = resolve_batch(&mut batch, resolver).await?;
     if let Some(p) = leaf.as_mut() {
         p.shrink(retained as u64);
@@ -706,10 +703,7 @@ async fn resolve_or_fill_toast(
     }
     let need = check_value_caps(sites.iter().map(|site| site.p), resolver.inline_value_max())
         .map_err(|e| format!("bootstrap: {e}"))?;
-    let mut leaf = match resolver.budget() {
-        Some(b) => Some(b.acquire(need).await),
-        None => None,
-    };
+    let mut leaf = crate::budget::acquire_opt(resolver.budget(), need).await;
     let mut retained = 0usize;
     for site in &sites {
         let type_oid = rel.attributes.get(site.idx).map_or(0, |a| a.type_oid);

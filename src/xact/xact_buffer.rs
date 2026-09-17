@@ -2262,9 +2262,7 @@ impl CommittedDrain {
         let sealed_empty = sealed.map.is_empty();
         let new_rows = m.take_rows();
         if !sealed_empty {
-            if let Some(budget) = budget {
-                sealed._permit = Some(budget.admit(sealed.resident_bytes()).await);
-            }
+            sealed._permit = crate::budget::admit_opt(budget, sealed.resident_bytes()).await;
             self.generations.push(Arc::new(sealed));
         }
         if heaps.is_empty() && ordered_events.is_empty() && sealed_empty && new_rows.is_empty() {
@@ -2316,10 +2314,7 @@ pub async fn detoast_heap(
     // One leaf at a time per worker: reserved for the heap's aggregate
     // resolution peak (every retained decoded value + the largest
     // single-value transient), shrunk to retained bytes before return
-    let mut leaf = match resolver.budget() {
-        Some(b) => Some(b.acquire(leaf_need).await),
-        None => None,
-    };
+    let mut leaf = crate::budget::acquire_opt(resolver.budget(), leaf_need).await;
     // Attached at decode: same descriptor interpretation from decode to
     // detoast regardless of captures landing in between
     let rel = heap.descriptor.clone();
@@ -2327,25 +2322,37 @@ pub async fn detoast_heap(
     for p in &pointers {
         *uses.entry((p.va_toastrelid, p.va_valueid)).or_default() += 1;
     }
+    let cache =
+        prefetch_store_values(&pointers, chunk_maps, resolver, heap.decoded.source_lsn).await?;
     let mut res = ValueResolution {
         spool,
         xact_maps: chunk_maps,
         resolver,
-        source_lsn: heap.decoded.source_lsn,
         uses,
-        cache: HashMap::new(),
+        cache,
         retained: 0,
     };
     if let Some(t) = heap.decoded.new.as_mut() {
-        res.resolve_tuple(t, &rel).await?;
+        res.resolve_tuple(t, &rel)?;
     }
     if let Some(t) = heap.decoded.old.as_mut() {
-        res.resolve_tuple(t, &rel).await?;
+        res.resolve_tuple(t, &rel)?;
     }
     if let Some(p) = leaf.as_mut() {
         p.shrink(res.retained as u64);
     }
     Ok(leaf)
+}
+
+/// Whether [`detoast_heap`] resolves anything, ie whether it reads the
+/// chunk store. Lets callers owing the read a flush skip it for
+/// inline-only heaps
+pub fn heap_reads_toast(heap: &DescribedHeap) -> bool {
+    [heap.decoded.new.as_ref(), heap.decoded.old.as_ref()]
+        .into_iter()
+        .flatten()
+        .flat_map(|t| t.columns.iter())
+        .any(|c| matches!(c, Some(ColumnValue::ExternalToast(_))))
 }
 
 /// Append every on-disk toast pointer; carries `va_extinfo`/`va_rawsize`
@@ -2364,6 +2371,57 @@ fn collect_toast_pointers(
     }
 }
 
+/// Fetch every pointer the xact's chunk maps can't cover in one round
+/// trip per toast rel, so resolution never waits a value at a time. Ids
+/// dedup: a key used by both tuples fetches once.
+///
+/// `bound` is the referrer's LSN, one per heap. Batching a wider unit
+/// would mix bounds under one key, so it needs per-value bounds in the
+/// store query
+async fn prefetch_store_values(
+    pointers: &[ToastPointer],
+    chunk_maps: &[&ChunkRefMap],
+    resolver: &ToastResolver,
+    bound: u64,
+) -> std::result::Result<HashMap<(u32, u32), CachedValue>, XactBufferError> {
+    let mut cache = HashMap::new();
+    if resolver.fill_on_miss() {
+        return Ok(cache);
+    }
+    let mut wanted: HashMap<u32, HashMap<u32, ToastPointer>> = HashMap::new();
+    for p in pointers {
+        let key = (p.va_toastrelid, p.va_valueid);
+        if chunk_maps.iter().any(|m| m.contains_key(&key)) {
+            continue;
+        }
+        wanted
+            .entry(p.va_toastrelid)
+            .or_default()
+            .insert(p.va_valueid, *p);
+    }
+    for (toast_relid, ptrs) in wanted {
+        let ptrs: Vec<ToastPointer> = ptrs.into_values().collect();
+        let batch: Vec<(u32, usize)> = ptrs
+            .iter()
+            .map(|p| (p.va_valueid, pointer_extsize(p)))
+            .collect();
+        let got = resolver
+            .fetch_values(toast_relid, &batch, bound)
+            .await
+            .map_err(|e| XactBufferError::Detoast(format!("toast store fetch: {e}")))?
+            .expect("store checked via fill_on_miss");
+        for (p, fetched) in ptrs.iter().zip(got) {
+            let cached = match fetched {
+                FetchedValue::Assembled(stored) => CachedValue::Decoded(finish_value(p, stored)?),
+                FetchedValue::Missing => CachedValue::Missing,
+                FetchedValue::Mismatch { .. } => CachedValue::Mismatch,
+            };
+            cache.insert((p.va_toastrelid, p.va_valueid), cached);
+        }
+    }
+    Ok(cache)
+}
+
 /// Store-fetched value decoded once per key; cloned for all but the last
 /// use, which moves the buffer
 enum CachedValue {
@@ -2373,13 +2431,12 @@ enum CachedValue {
     Mismatch,
 }
 
-/// Per-heap value resolution: on-demand store fetch (never all values at
-/// once), decoded bytes tallied in `retained` for the leaf-permit shrink
+/// Per-heap value resolution over prefetched store values, decoded bytes
+/// tallied in `retained` for the leaf-permit shrink
 struct ValueResolution<'a> {
     spool: Option<&'a BodySpoolFile>,
     xact_maps: &'a [&'a ChunkRefMap],
     resolver: &'a ToastResolver,
-    source_lsn: u64,
     /// Pointer occurrences per key across both tuples, sizing cache
     /// retention (last use moves instead of cloning)
     uses: HashMap<(u32, u32), u32>,
@@ -2388,7 +2445,7 @@ struct ValueResolution<'a> {
 }
 
 impl ValueResolution<'_> {
-    async fn resolve_tuple(
+    fn resolve_tuple(
         &mut self,
         t: &mut crate::decode::heap_decoder::DecodedTuple,
         rel: &RelDescriptor,
@@ -2434,14 +2491,15 @@ impl ValueResolution<'_> {
                 }
                 continue;
             }
-            *col = Some(self.resolve_store(&p, type_oid).await?);
+            *col = Some(self.resolve_store(&p, type_oid)?);
         }
         Ok(())
     }
 
     /// Pre-window / bootstrap value whose chunks aren't in this xact,
-    /// fetched assembled against the pointer's stored size
-    async fn resolve_store(
+    /// assembled by [`prefetch_store_values`] against the pointer's
+    /// stored size
+    fn resolve_store(
         &mut self,
         p: &ToastPointer,
         type_oid: u32,
@@ -2452,21 +2510,7 @@ impl ValueResolution<'_> {
             return Ok(ColumnValue::Null);
         }
         let key = (p.va_toastrelid, p.va_valueid);
-        if !self.cache.contains_key(&key) {
-            let fetched = self
-                .resolver
-                .fetch_value(key.0, key.1, self.source_lsn, pointer_extsize(p))
-                .await
-                .map_err(|e| XactBufferError::Detoast(format!("toast store fetch: {e}")))?
-                .expect("store checked via fill_on_miss");
-            let cached = match fetched {
-                FetchedValue::Assembled(stored) => CachedValue::Decoded(finish_value(p, stored)?),
-                FetchedValue::Missing => CachedValue::Missing,
-                FetchedValue::Mismatch { .. } => CachedValue::Mismatch,
-            };
-            self.cache.insert(key, cached);
-        }
-        match self.cache.get(&key).expect("just primed") {
+        match self.cache.get(&key).expect("prefetched with the heap") {
             CachedValue::Missing => {
                 self.resolver.note_filled_superseded();
                 return Ok(ColumnValue::Null);
@@ -3856,6 +3900,19 @@ mod tests {
         map
     }
 
+    /// Callers owing a store read a flush gate on this, so an inline-only
+    /// heap must answer false whichever tuple carries the pointer
+    #[test]
+    fn heap_reads_toast_tracks_external_pointers() {
+        let mut heap = heap_with_value(1, 0x100, 8);
+        assert!(!heap_reads_toast(&heap));
+        heap.decoded.old = Some(toast_ptr_tuple(9));
+        assert!(heap_reads_toast(&heap));
+        heap.decoded.new = Some(toast_ptr_tuple(9));
+        heap.decoded.old = None;
+        assert!(heap_reads_toast(&heap));
+    }
+
     /// V3 cap fires before allocation with a typed non-retryable error;
     /// leaf need sizes for the worst per-value transient
     #[test]
@@ -3921,7 +3978,6 @@ mod tests {
             spool,
             xact_maps,
             resolver,
-            source_lsn: 0,
             uses: HashMap::from_iter([((16500u32, 55u32), 1)]),
             cache,
             retained: 0,
@@ -3945,7 +4001,7 @@ mod tests {
         let mut t = toast_ptr_tuple(55);
         let cache = HashMap::from_iter([(key, CachedValue::Missing)]);
         let mut r = seeded(&store_resolver, None, &[], cache);
-        r.resolve_tuple(&mut t, &rel).await.unwrap();
+        r.resolve_tuple(&mut t, &rel).unwrap();
         assert_eq!(t.columns[0], Some(ColumnValue::Null));
         assert_eq!(r.retained, 0, "fills retain nothing");
         assert_eq!(
@@ -3961,7 +4017,6 @@ mod tests {
         let mut t = toast_ptr_tuple(55);
         let err = seeded(&store_resolver, None, &maps, HashMap::new())
             .resolve_tuple(&mut t, &rel)
-            .await
             .expect_err("in-xact gap surfaces");
         assert!(matches!(
             err,
@@ -3979,7 +4034,7 @@ mod tests {
         let maps = [&whole];
         let mut t = toast_ptr_tuple(55);
         let mut r = seeded(&store_resolver, None, &maps, HashMap::new());
-        r.resolve_tuple(&mut t, &rel).await.unwrap();
+        r.resolve_tuple(&mut t, &rel).unwrap();
         assert_eq!(t.columns[0], Some(ColumnValue::Bytea(b"abcd".to_vec())));
         assert_eq!(r.retained, 4, "decoded bytes tally for the permit shrink");
 
@@ -3994,7 +4049,6 @@ mod tests {
             HashMap::new(),
         )
         .resolve_tuple(&mut t, &rel)
-        .await
         .unwrap();
         assert_eq!(t.columns[0], Some(ColumnValue::Bytea(b"abcd".to_vec())));
 
@@ -4002,7 +4056,7 @@ mod tests {
         let mut t = toast_ptr_tuple(55);
         let cache = HashMap::from_iter([(key, CachedValue::Decoded(b"abcd".to_vec()))]);
         let mut r = seeded(&store_resolver, None, &[], cache);
-        r.resolve_tuple(&mut t, &rel).await.unwrap();
+        r.resolve_tuple(&mut t, &rel).unwrap();
         assert_eq!(t.columns[0], Some(ColumnValue::Bytea(b"abcd".to_vec())));
         assert_eq!(r.retained, 4);
         assert!(r.cache.is_empty(), "last use moves the buffer out");
@@ -4013,7 +4067,6 @@ mod tests {
         let cache = HashMap::from_iter([(key, CachedValue::Mismatch)]);
         seeded(&store_resolver, None, &[], cache)
             .resolve_tuple(&mut t, &rel)
-            .await
             .unwrap();
         assert_eq!(t.columns[0], Some(ColumnValue::Null));
         assert_eq!(
@@ -4037,7 +4090,6 @@ mod tests {
         let mut t = toast_ptr_tuple(55);
         let err = seeded(&store_resolver, None, &maps, HashMap::new())
             .resolve_tuple(&mut t, &rel)
-            .await
             .expect_err("in-xact size mismatch surfaces");
         assert!(matches!(err, XactBufferError::Detoast(_)));
 
@@ -4046,13 +4098,13 @@ mod tests {
         let mut t = toast_ptr_tuple(55);
         seeded(&disabled, None, &[], HashMap::new())
             .resolve_tuple(&mut t, &rel)
-            .await
             .unwrap();
         assert_eq!(t.columns[0], Some(ColumnValue::Null));
     }
 
-    /// Store fetch runs once per key: decode once, clone for earlier
-    /// duplicate uses (old/new tuple reuse), move the buffer on the last
+    /// Store fetch runs once per key in one round trip: decode once,
+    /// clone for earlier duplicate uses (old/new tuple reuse), move the
+    /// buffer on the last
     #[tokio::test(flavor = "current_thread")]
     async fn resolve_store_fetches_once_and_moves_last_use() {
         use crate::toast::{ChunkStore, MemChunkStore, ToastRow};
@@ -4077,18 +4129,20 @@ mod tests {
             va_valueid: 55,
             va_toastrelid: 16500,
         };
+        let cache = prefetch_store_values(&[p, p], &[], &resolver, 10)
+            .await
+            .unwrap();
         let mut r = ValueResolution {
             spool: None,
             xact_maps: &[],
             resolver: &resolver,
-            source_lsn: 10,
             uses: HashMap::from_iter([((16500u32, 55u32), 2)]),
-            cache: HashMap::new(),
+            cache,
             retained: 0,
         };
-        let first = r.resolve_store(&p, 17).await.unwrap();
+        let first = r.resolve_store(&p, 17).unwrap();
         assert!(!r.cache.is_empty(), "pending duplicate use stays cached");
-        let second = r.resolve_store(&p, 17).await.unwrap();
+        let second = r.resolve_store(&p, 17).unwrap();
         assert_eq!(first, ColumnValue::Bytea(b"abcd".to_vec()));
         assert_eq!(second, ColumnValue::Bytea(b"abcd".to_vec()));
         assert!(r.cache.is_empty(), "last use moves the buffer out");
@@ -4099,6 +4153,57 @@ mod tests {
                 .load(std::sync::atomic::Ordering::Relaxed),
             1,
             "one fetch serves both uses"
+        );
+        assert_eq!(
+            stats
+                .toast_value_fetch_batches
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "gathered into one round trip"
+        );
+    }
+
+    /// Every store-bound pointer of a heap gathers into one round trip;
+    /// keys the xact's chunk map already holds never reach the store
+    #[tokio::test(flavor = "current_thread")]
+    async fn prefetch_gathers_store_values_and_skips_in_xact_keys() {
+        use crate::toast::{ChunkStore, MemChunkStore, ToastRow};
+        let store = Arc::new(MemChunkStore::new());
+        let row = |chunk_id: u32, blkno: u32| ToastRow {
+            toast_relid: 16500,
+            blkno,
+            offnum: 1,
+            chunk_id,
+            chunk_seq: 0,
+            chunk_data: bytes::Bytes::from_static(b"abcd"),
+            lsn: 1,
+        };
+        store.put(&[row(55, 1), row(56, 2)]).await.unwrap();
+        let stats = Arc::new(crate::emit::ch_emitter::EmitterStats::default());
+        let resolver = ToastResolver::with_store(store, stats.clone());
+        let ptr = |va_valueid| ToastPointer {
+            va_rawsize: 8,
+            va_extinfo: 4,
+            va_valueid,
+            va_toastrelid: 16500,
+        };
+        let in_xact = mem_refs((16500, 57), &[(0, b"abcd")]);
+        let cache = prefetch_store_values(&[ptr(55), ptr(56), ptr(57)], &[&in_xact], &resolver, 10)
+            .await
+            .unwrap();
+        assert_eq!(cache.len(), 2, "in-xact key stays out of the cache");
+        assert_eq!(
+            stats
+                .toast_value_fetch_batches
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "one round trip per toast rel"
+        );
+        assert_eq!(
+            stats
+                .toast_values_fetched
+                .load(std::sync::atomic::Ordering::Relaxed),
+            2
         );
     }
 

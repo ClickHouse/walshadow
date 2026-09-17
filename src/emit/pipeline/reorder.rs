@@ -727,10 +727,9 @@ impl ReorderSink {
         }
         let heaps = std::mem::take(pending);
         let bytes = std::mem::take(pending_bytes);
-        let permit = match &self.budget {
-            Some(b) => Some(Arc::new(b.admit(bytes).await)),
-            None => None,
-        };
+        let permit = crate::budget::admit_opt(self.budget.as_ref(), bytes)
+            .await
+            .map(Arc::new);
         let seq = self.alloc_seq();
         if publish {
             self.ack.register(seq, commit_lsn);

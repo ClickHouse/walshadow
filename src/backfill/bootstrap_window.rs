@@ -231,7 +231,6 @@ impl Leg {
     /// `handoff` bounds the open-xact report: the pump rebuilds anything
     /// opened above it on its own
     async fn close(self, from_lsn: u64, through_lsn: u64, handoff: u64) -> Result<WindowLegStats> {
-        let replay = self.sink.stats();
         let open_floor = self
             .sink
             .xacts_opened_below(handoff)
@@ -239,7 +238,13 @@ impl Leg {
             .into_iter()
             .map(|(_, first_lsn)| first_lsn)
             .min();
-        drop(self.sink);
+        let replay = match self.sink.finish().await {
+            Ok(replay) => replay,
+            Err(e) => {
+                self.tail.quiesce().await;
+                return Err(anyhow::anyhow!("bootstrap window leg: finish: {e}"));
+            }
+        };
         self.tail
             .finish(replay.next_seq)
             .await
