@@ -23,9 +23,10 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use tokio_postgres::{Client, NoTls};
-use walshadow::bridge::{Bridge, FetchedChunks, ToastSnapshot};
+use walshadow::bridge::{Bridge, ToastSnapshot};
 use walshadow::pg::socket_conninfo;
 use walshadow::shadow::{BridgeConf, Shadow, ShadowConfig};
+use walshadow::toast::FetchedValue;
 
 fn have(bin: &str) -> bool {
     Command::new(bin)
@@ -208,7 +209,7 @@ async fn seed_value(c: &Client, name: &str, body_sql: &str, external: bool) -> V
     }
 }
 
-async fn fetch(bridge: &Bridge, v: &Value, snap: ToastSnapshot) -> FetchedChunks {
+async fn fetch(bridge: &Bridge, v: &Value, snap: ToastSnapshot) -> FetchedValue {
     bridge
         .fetch_toast(v.toast_relid, &[(v.value_id, v.extsize)], 0, snap)
         .await
@@ -218,11 +219,11 @@ async fn fetch(bridge: &Bridge, v: &Value, snap: ToastSnapshot) -> FetchedChunks
         .expect("one value asked, one answered")
 }
 
-fn describe(f: &FetchedChunks, expected: usize) -> String {
+fn describe(f: &FetchedValue, expected: usize) -> String {
     match f {
-        FetchedChunks::Stored(b) => format!("Stored {} of {expected}", b.len()),
-        FetchedChunks::Missing => "Missing".into(),
-        FetchedChunks::Mismatch { got } => format!("Mismatch got {got} of {expected}"),
+        FetchedValue::Assembled(b) => format!("Assembled {} of {expected}", b.len()),
+        FetchedValue::Missing => "Missing".into(),
+        FetchedValue::Mismatch { got } => format!("Mismatch got {got} of {expected}"),
     }
 }
 
@@ -263,7 +264,7 @@ async fn live_value_reads_back_byte_exact() {
 
     let v = seed_value(&sql, "t_live", "repeat('ab', 120000)", true).await;
     match fetch(&bridge, &v, ToastSnapshot::Toast).await {
-        FetchedChunks::Stored(b) => {
+        FetchedValue::Assembled(b) => {
             assert_eq!(b.len(), v.extsize, "stored length");
             assert_eq!(b, v.raw.as_bytes(), "stored bytes are the plaintext");
         }
@@ -300,7 +301,7 @@ async fn dead_referrer_still_yields_its_value() {
     for v in [&deleted, &replaced] {
         let got = fetch(&bridge, v, ToastSnapshot::Toast).await;
         assert!(
-            matches!(&got, FetchedChunks::Stored(b) if b == v.raw.as_bytes()),
+            matches!(&got, FetchedValue::Assembled(b) if b == v.raw.as_bytes()),
             "{} after its referrer died: {}",
             v.table,
             describe(&got, v.extsize)
@@ -337,13 +338,13 @@ async fn pruning_reclaims_as_soon_as_the_horizon_passes() {
         describe(&no_hold, free.extsize)
     );
     assert!(
-        matches!(&under_hold, FetchedChunks::Stored(b) if b == pinned.raw.as_bytes()),
+        matches!(&under_hold, FetchedValue::Assembled(b) if b == pinned.raw.as_bytes()),
         "pinned: {}",
         describe(&under_hold, pinned.extsize)
     );
     assert_ne!(
         no_hold,
-        FetchedChunks::Stored(free.raw.clone().into_bytes()),
+        FetchedValue::Assembled(free.raw.clone().into_bytes()),
         "an unpinned horizon lets pruning take the chunks with no VACUUM asked for"
     );
 }
@@ -365,13 +366,13 @@ async fn partly_reclaimed_run_refuses() {
     exec(&sql, "DELETE FROM t_torn WHERE id = 1").await;
     let got = fetch(&bridge, &v, ToastSnapshot::Toast).await;
     match &got {
-        FetchedChunks::Mismatch { got } => assert!(
+        FetchedValue::Mismatch { got } => assert!(
             *got < v.extsize,
             "a torn run reports how far it got: {got} of {}",
             v.extsize
         ),
-        FetchedChunks::Missing => {}
-        FetchedChunks::Stored(_) => {
+        FetchedValue::Missing => {}
+        FetchedValue::Assembled(_) => {
             panic!("a pruned run must not read back as the value")
         }
     }
@@ -393,7 +394,7 @@ async fn vacuum_rewrite_and_truncate_each_remove_the_value() {
     exec(&sql, "VACUUM t_vac").await;
     assert_eq!(
         fetch(&bridge, &vacuumed, ToastSnapshot::Toast).await,
-        FetchedChunks::Missing,
+        FetchedValue::Missing,
         "VACUUM removes the chunks and their index entries"
     );
 
@@ -404,14 +405,14 @@ async fn vacuum_rewrite_and_truncate_each_remove_the_value() {
     exec(&sql, "VACUUM FULL t_rewrite").await;
     assert_eq!(
         fetch(&bridge, &rewritten, ToastSnapshot::Toast).await,
-        FetchedChunks::Missing,
+        FetchedValue::Missing,
     );
 
     let truncated = seed_value(&sql, "t_trunc", "repeat('kl', 120000)", true).await;
     exec(&sql, "TRUNCATE t_trunc").await;
     assert_eq!(
         fetch(&bridge, &truncated, ToastSnapshot::Toast).await,
-        FetchedChunks::Missing,
+        FetchedValue::Missing,
     );
 
     // DROP takes the relation with it, which is an error rather than a Missing
@@ -453,7 +454,7 @@ async fn compressed_value_comes_back_stored_not_inflated() {
         v.raw.len()
     );
     match fetch(&bridge, &v, ToastSnapshot::Toast).await {
-        FetchedChunks::Stored(b) => {
+        FetchedValue::Assembled(b) => {
             assert_eq!(b.len(), v.extsize, "stored, not inflated");
             assert_ne!(b, v.raw.as_bytes(), "bytes are the compressed form");
         }
@@ -527,7 +528,7 @@ async fn fetch_refuses_malformed_requests() {
             .values
             .pop()
             .unwrap(),
-        FetchedChunks::Missing,
+        FetchedValue::Missing,
     );
 
     // Wrong expected size is a mismatch, so a torn run can never pass as whole
@@ -544,13 +545,13 @@ async fn fetch_refuses_malformed_requests() {
             .values
             .pop()
             .unwrap(),
-        FetchedChunks::Mismatch { .. }
+        FetchedValue::Mismatch { .. }
     ));
 
     // SnapshotAny is wider but must agree on a live, whole value
     assert!(matches!(
         fetch(&bridge, &v, ToastSnapshot::Any).await,
-        FetchedChunks::Stored(ref b) if b == v.raw.as_bytes()
+        FetchedValue::Assembled(ref b) if b == v.raw.as_bytes()
     ));
 }
 
@@ -615,14 +616,14 @@ async fn batch_fetch_aligns_with_its_request() {
         .expect("batch fetch");
     let elapsed = started.elapsed();
     assert_eq!(got.values.len(), asked.len());
-    assert_eq!(got.values[4], FetchedChunks::Missing);
+    assert_eq!(got.values[4], FetchedValue::Missing);
     let mut bytes = 0usize;
     for (i, (_, expected)) in asked.iter().enumerate() {
         if i == 4 {
             continue;
         }
         match &got.values[i] {
-            FetchedChunks::Stored(b) => {
+            FetchedValue::Assembled(b) => {
                 assert_eq!(b.len(), *expected, "value {i}");
                 bytes += b.len();
             }
@@ -801,7 +802,7 @@ async fn standby_keeps_the_value_until_the_prune_record_replays() {
         "worker samples a replay position at or past the floor asked for"
     );
     assert!(
-        matches!(&got.values[0], FetchedChunks::Stored(b) if b == v.raw.as_bytes()),
+        matches!(&got.values[0], FetchedValue::Assembled(b) if b == v.raw.as_bytes()),
         "on a standby the dead referrer's value must still read whole: {}",
         describe(&got.values[0], v.extsize)
     );
@@ -817,7 +818,7 @@ async fn standby_keeps_the_value_until_the_prune_record_replays() {
     let after = fetch(&sb_bridge, &v, ToastSnapshot::Toast).await;
     assert_ne!(
         after,
-        FetchedChunks::Stored(v.raw.clone().into_bytes()),
+        FetchedValue::Assembled(v.raw.clone().into_bytes()),
         "replaying the reclamation must take the value: {}",
         describe(&after, v.extsize)
     );
@@ -833,7 +834,7 @@ async fn standby_keeps_the_value_until_the_prune_record_replays() {
 async fn shadow_store_reads_and_refuses_writes() {
     use std::sync::Arc;
     use walshadow::toast::shadow_store::ShadowToastStore;
-    use walshadow::toast::{ChunkStore, ChunkStoreError, FetchedValue, ToastRow};
+    use walshadow::toast::{ChunkStore, ChunkStoreError, ToastRow};
 
     if !have("initdb") {
         eprintln!("skip: no initdb on PATH");
@@ -998,7 +999,7 @@ async fn pg_standby_conflicts_do_not_fence_reclamation() {
 
     assert_ne!(
         under_late,
-        FetchedChunks::Stored(v.raw.clone().into_bytes()),
+        FetchedValue::Assembled(v.raw.clone().into_bytes()),
         "PG does not keep a value alive for a snapshot that cannot see its row, \
          so the reclamation fence cannot be delegated to standby conflicts"
     );
@@ -1009,7 +1010,7 @@ async fn pg_standby_conflicts_do_not_fence_reclamation() {
 async fn store_readiness_distinguishes_primary_standby_and_unbound() {
     use std::sync::Arc;
     use walshadow::toast::shadow_store::{LateBridge, ShadowToastStore};
-    use walshadow::toast::{ChunkStore, ChunkStoreError, FetchedValue};
+    use walshadow::toast::{ChunkStore, ChunkStoreError};
 
     if !have("initdb") || !have("pg_basebackup") {
         eprintln!("skip: no initdb/pg_basebackup on PATH");

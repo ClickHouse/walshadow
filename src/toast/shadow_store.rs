@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 
-use crate::ops::bridge::{Bridge, FetchedChunks, MAX_FETCH_VALUES, ToastSnapshot};
+use crate::ops::bridge::{Bridge, MAX_FETCH_VALUES, ToastSnapshot};
 use crate::toast::{ChunkStore, ChunkStoreError, FetchedValue, ToastRow};
 
 /// Round-trip payload target. Always allow one value even when it exceeds limit
@@ -57,12 +57,8 @@ impl ShadowToastStore {
 
     /// Return bound bridge or wait until readiness deadline
     async fn bridge(&self) -> Result<&Arc<Bridge>, ChunkStoreError> {
-        if let Some(b) = self.bridge.get() {
-            return Ok(b);
-        }
         let deadline = Instant::now() + self.replay_wait_max;
         loop {
-            tokio::time::sleep(REPLAY_POLL).await;
             if let Some(b) = self.bridge.get() {
                 return Ok(b);
             }
@@ -72,6 +68,7 @@ impl ShadowToastStore {
                     self.replay_wait_max
                 )));
             }
+            tokio::time::sleep(REPLAY_POLL).await;
         }
     }
 
@@ -126,21 +123,6 @@ impl ChunkStore for ShadowToastStore {
         Err(ChunkStoreError::ReadOnly("put"))
     }
 
-    async fn fetch(
-        &self,
-        toast_relid: u32,
-        value_id: u32,
-        max_lsn: u64,
-        expected_size: usize,
-    ) -> Result<FetchedValue, ChunkStoreError> {
-        Ok(self
-            .fetch_many(toast_relid, &[(value_id, expected_size)], max_lsn)
-            .await?
-            .into_iter()
-            .next()
-            .unwrap_or(FetchedValue::Missing))
-    }
-
     /// Treat `max_lsn` as minimum replay position. Chunks precede referring
     /// record, so reaching this position makes value available
     async fn fetch_many(
@@ -162,11 +144,7 @@ impl ChunkStore for ShadowToastStore {
                 .fetch_toast(toast_relid, slice, floor, self.snapshot)
                 .await
                 .map_err(|e| ChunkStoreError::Shadow(e.to_string()))?;
-            out.extend(got.values.into_iter().map(|v| match v {
-                FetchedChunks::Stored(b) => FetchedValue::Assembled(b),
-                FetchedChunks::Missing => FetchedValue::Missing,
-                FetchedChunks::Mismatch { got } => FetchedValue::Mismatch { got },
-            }));
+            out.extend(got.values);
         }
         Ok(out)
     }

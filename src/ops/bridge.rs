@@ -20,6 +20,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::sync::Mutex;
 
+use crate::toast::FetchedValue;
+
 /// Frame and op layouts. Must equal `WS_PROTO_VERSION` in `pgext/walshadow.h`
 pub const PROTO_VERSION: u32 = 4;
 /// Catalog column plans. Must equal `WS_PROJECTION_VERSION`
@@ -119,22 +121,12 @@ pub enum ToastSnapshot {
     Any = 1,
 }
 
-/// One value's chunk run, parallel to the request's value list
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum FetchedChunks {
-    /// Stored bytes with consecutive sequence and expected total size
-    Stored(Vec<u8>),
-    /// No chunk under the id
-    Missing,
-    /// Sequence or total size mismatch. `got` is assembled byte count
-    Mismatch { got: usize },
-}
-
 pub struct ToastFetch {
     /// Replay positions sampled before and after read
     pub replay_lsn_start: u64,
     pub replay_lsn_end: u64,
-    pub values: Vec<FetchedChunks>,
+    /// One result per requested value, in request order
+    pub values: Vec<FetchedValue>,
 }
 
 #[derive(Debug, Error)]
@@ -462,9 +454,9 @@ impl Bridge {
             let tag = c.u8()?;
             let len = c.u32()? as usize;
             out.push(match tag {
-                0 => FetchedChunks::Stored(c.take(len)?.to_vec()),
-                1 => FetchedChunks::Missing,
-                2 => FetchedChunks::Mismatch { got: len },
+                0 => FetchedValue::Assembled(c.take(len)?.to_vec()),
+                1 => FetchedValue::Missing,
+                2 => FetchedValue::Mismatch { got: len },
                 other => {
                     return Err(BridgeError::Protocol(format!(
                         "toast fetch result tag {other}"

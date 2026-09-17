@@ -798,15 +798,14 @@ mod tests {
             async fn put(&self, _: &[ToastRow]) -> Result<(), ChunkStoreError> {
                 Err(ChunkStoreError::ReadOnly("put"))
             }
-            async fn fetch(
+            async fn fetch_many(
                 &self,
                 _: u32,
-                _: u32,
+                values: &[(u32, usize)],
                 _: u64,
-                _: usize,
-            ) -> Result<FetchedValue, ChunkStoreError> {
+            ) -> Result<Vec<FetchedValue>, ChunkStoreError> {
                 // Incomplete value is absent from end-of-backup state
-                Ok(FetchedValue::Mismatch { got: 7984 })
+                Ok(vec![FetchedValue::Mismatch { got: 7984 }; values.len()])
             }
             async fn truncate_mirror(&self, _: u32) -> Result<(), ChunkStoreError> {
                 Err(ChunkStoreError::ReadOnly("truncate_mirror"))

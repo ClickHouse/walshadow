@@ -17,18 +17,16 @@
 #include "postgres.h"
 
 #include "access/genam.h"
-#include "access/heaptoast.h"
 #include "access/htup_details.h"
 #include "access/stratnum.h"
 #include "access/table.h"
 #include "access/toast_internals.h"
-#include "access/xlog.h"
 #include "access/xlogdefs.h"
 #include "access/xlogrecovery.h"
 #include "libpq/pqformat.h"
 #include "utils/fmgroids.h"
 #include "utils/rel.h"
-#include "utils/snapmgr.h"
+#include "utils/snapshot.h"
 
 #include "walshadow.h"
 
@@ -36,19 +34,6 @@
 #define WS_TOAST_ATT_ID			1
 #define WS_TOAST_ATT_SEQ		2
 #define WS_TOAST_ATT_DATA		3
-
-/*
- * Initialize TOAST snapshot across supported PostgreSQL versions. PostgreSQL
- * 18 exports SnapshotToastData and get_toast_snapshot(); 16 and 17 use
- * InitToastSnapshot. All use snapshot_type to select HeapTupleSatisfiesToast.
- * Zero lsn and whenTaken disable old-snapshot check retained by PostgreSQL 16.
- */
-static void
-ws_init_toast_snapshot(SnapshotData *snap)
-{
-	memset(snap, 0, sizeof(*snap));
-	snap->snapshot_type = SNAPSHOT_TOAST;
-}
 
 /*
  * Assemble one value's chunk run, appending
@@ -67,9 +52,8 @@ ws_fetch_one(Relation toastrel, Relation toastidx, Snapshot snap,
 	HeapTuple	ttup;
 	TupleDesc	tupdesc = RelationGetDescr(toastrel);
 	StringInfoData body;
-	int32		next_seq = 0;
+	int32		nchunks = 0;
 	bool		dense = true;
-	bool		saw_any = false;
 	uint8		result;
 
 	initStringInfo(&body);
@@ -87,7 +71,6 @@ ws_fetch_one(Relation toastrel, Relation toastidx, Snapshot snap,
 		int32		chunksize;
 		char	   *chunkdata;
 
-		saw_any = true;
 		/* TOAST columns are NOT NULL, see catalog/toasting.c */
 		d = heap_getattr(ttup, WS_TOAST_ATT_SEQ, tupdesc, &isnull);
 		Assert(!isnull);
@@ -101,14 +84,14 @@ ws_fetch_one(Relation toastrel, Relation toastidx, Snapshot snap,
 		chunksize = VARSIZE(chunk) - VARHDRSZ;
 		chunkdata = VARDATA(chunk);
 
-		if (seq != next_seq)
+		if (seq != nchunks)
 			dense = false;
-		next_seq = seq + 1;
+		nchunks++;
 		appendBinaryStringInfo(&body, chunkdata, chunksize);
 	}
 	systable_endscan_ordered(toastscan);
 
-	if (!saw_any)
+	if (nchunks == 0)
 		result = WS_FETCH_MISSING;
 	else if (!dense || (uint32) body.len != expected)
 		result = WS_FETCH_MISMATCH;
@@ -136,7 +119,7 @@ ws_handle_fetch_toast(StringInfo req, StringInfo resp)
 	Relation   *toastidxs;
 	int			num_indexes;
 	int			validIndex;
-	SnapshotData snap;
+	SnapshotData snap = {0};
 	StringInfoData vals;
 	uint64		lsn_start;
 	uint64		lsn_end;
@@ -190,10 +173,12 @@ ws_handle_fetch_toast(StringInfo req, StringInfo resp)
 	validIndex = toast_open_indexes(toastrel, AccessShareLock,
 									&toastidxs, &num_indexes);
 
-	if (snapmode == WS_SNAP_ANY)
-		snap = SnapshotAnyData;
-	else
-		ws_init_toast_snapshot(&snap);
+	/*
+	 * PostgreSQL 18 exports SnapshotToastData; 16 and 17 initialize it with
+	 * InitToastSnapshot. Zero lsn and whenTaken disable PostgreSQL 16
+	 * old-snapshot check
+	 */
+	snap.snapshot_type = snapmode == WS_SNAP_ANY ? SNAPSHOT_ANY : SNAPSHOT_TOAST;
 
 	initStringInfo(&vals);
 	for (i = 0; i < nvalues; i++)

@@ -373,35 +373,31 @@ pub trait ChunkStore: Send + Sync {
     }
     /// Replay emits byte-identical rows at equal key and version
     async fn put(&self, rows: &[ToastRow]) -> Result<(), ChunkStoreError>;
-    /// Assemble newest live row per sequence at `max_lsn` against the
-    /// pointer's stored size (`va_extsize`)
+    /// Assemble newest live row per sequence at `max_lsn` against each
+    /// pointer's stored size (`va_extsize`) over one mirror's
+    /// `(value_id, expected_size)` batch, results aligned with `values`.
+    /// Ids must be unique: a store resolves each one once
     ///
     /// [`FetchedValue::Missing`] when no live row remains at bound,
     /// [`ChunkStoreError::MissingMirror`] when mirror is absent
+    async fn fetch_many(
+        &self,
+        toast_relid: u32,
+        values: &[(u32, usize)],
+        max_lsn: u64,
+    ) -> Result<Vec<FetchedValue>, ChunkStoreError>;
+    /// [`Self::fetch_many`] for one value
     async fn fetch(
         &self,
         toast_relid: u32,
         value_id: u32,
         max_lsn: u64,
         expected_size: usize,
-    ) -> Result<FetchedValue, ChunkStoreError>;
-    /// [`Self::fetch`] over one mirror's `(value_id, expected_size)` batch,
-    /// results aligned with `values`. Ids must be unique: a store resolves
-    /// each one once
-    async fn fetch_many(
-        &self,
-        toast_relid: u32,
-        values: &[(u32, usize)],
-        max_lsn: u64,
-    ) -> Result<Vec<FetchedValue>, ChunkStoreError> {
-        let mut out = Vec::with_capacity(values.len());
-        for &(value_id, expected_size) in values {
-            out.push(
-                self.fetch(toast_relid, value_id, max_lsn, expected_size)
-                    .await?,
-            );
-        }
-        Ok(out)
+    ) -> Result<FetchedValue, ChunkStoreError> {
+        let mut got = self
+            .fetch_many(toast_relid, &[(value_id, expected_size)], max_lsn)
+            .await?;
+        Ok(got.pop().unwrap_or(FetchedValue::Missing))
     }
     /// Empty mirror without dropping it
     ///
@@ -440,19 +436,6 @@ impl ChunkStore for MemChunkStore {
             mirrors.entry(r.toast_relid).or_default().push(r.clone());
         }
         Ok(())
-    }
-
-    async fn fetch(
-        &self,
-        toast_relid: u32,
-        value_id: u32,
-        max_lsn: u64,
-        expected_size: usize,
-    ) -> Result<FetchedValue, ChunkStoreError> {
-        let mut got = self
-            .fetch_many(toast_relid, &[(value_id, expected_size)], max_lsn)
-            .await?;
-        Ok(got.pop().unwrap_or(FetchedValue::Missing))
     }
 
     /// One pass over the mirror for the whole batch, as the CH store's one
@@ -917,19 +900,6 @@ impl ChunkStore for ClickHouseChunkStore {
         self.put_locked(&mut state, rows)
             .await
             .map_err(|e| ChunkStoreError::Clickhouse(e.to_string()))
-    }
-
-    async fn fetch(
-        &self,
-        toast_relid: u32,
-        value_id: u32,
-        max_lsn: u64,
-        expected_size: usize,
-    ) -> Result<FetchedValue, ChunkStoreError> {
-        let mut got = self
-            .fetch_many(toast_relid, &[(value_id, expected_size)], max_lsn)
-            .await?;
-        Ok(got.pop().unwrap_or(FetchedValue::Missing))
     }
 
     async fn fetch_many(
@@ -1702,14 +1672,13 @@ mod tests {
             async fn put(&self, _rows: &[ToastRow]) -> Result<(), ChunkStoreError> {
                 Err(ChunkStoreError::ReadOnly("put"))
             }
-            async fn fetch(
+            async fn fetch_many(
                 &self,
                 relid: u32,
-                id: u32,
+                values: &[(u32, usize)],
                 max_lsn: u64,
-                expected: usize,
-            ) -> Result<FetchedValue, ChunkStoreError> {
-                self.0.fetch(relid, id, max_lsn, expected).await
+            ) -> Result<Vec<FetchedValue>, ChunkStoreError> {
+                self.0.fetch_many(relid, values, max_lsn).await
             }
             async fn truncate_mirror(&self, _relid: u32) -> Result<(), ChunkStoreError> {
                 Err(ChunkStoreError::ReadOnly("truncate_mirror"))
