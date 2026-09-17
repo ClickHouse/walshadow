@@ -408,10 +408,9 @@ impl RowBuf {
     }
 }
 
-/// Referrers one fetch round covers, alongside a
-/// [`DECODE_CHUNK_BYTES`] seal on held tuples plus the values they wait
-/// for: a round's rows all route before the next one reads
-const REPLAY_BATCH_ROWS: usize = 4096;
+const REPLAY_BATCH_ROWS: usize = 65536;
+
+const REPLAY_FETCH_BYTES: usize = 64 << 20;
 
 /// `(toast_relid, value_id, as-of bound)`. The bound is part of the key:
 /// a resumed load tags relations with their own `_lsn`
@@ -529,7 +528,7 @@ async fn next_batch(
         need: 0,
         resident: 0,
     };
-    while batch.rows.len() < REPLAY_BATCH_ROWS && batch.need + batch.resident < DECODE_CHUNK_BYTES {
+    while batch.rows.len() < REPLAY_BATCH_ROWS && batch.need + batch.resident < REPLAY_FETCH_BYTES {
         let Some(tuple) = replay
             .next()
             .await
