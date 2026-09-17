@@ -638,25 +638,21 @@ impl ClickHouseChunkStore {
         format!("TRUNCATE TABLE IF EXISTS {}", self.toast_table(toast_relid))
     }
 
-    /// `O - B` server-side: TIDs live as of the marker minus TIDs with any
-    /// row past it (generation births + previously inserted residuals, so
-    /// re-runs insert nothing). Aggregate alias must differ from the source
-    /// column (CH error 184)
+    /// `O - B` server-side in one scan: a TID survives when its newest row
+    /// is a birth at or below the marker. Any row past the marker excludes
+    /// it, generation births and residuals an earlier run inserted alike, so
+    /// re-runs insert nothing. `GROUP BY` matches the table's `ORDER BY`, so
+    /// aggregation streams in key order instead of hashing every mirrored TID
     fn rewrite_barrier_sql(&self, toast_relid: u32, marker_lsn: u64, commit_lsn: u64) -> String {
         let table = self.toast_table(toast_relid);
         format!(
             "INSERT INTO {table} (`blkno`, `offnum`, `chunk_id`, `chunk_seq`, `chunk_data`, \
              `_lsn`, `_is_deleted`)\n\
              SELECT `blkno`, `offnum`, 0, 0, '', {commit_lsn}, 1\n\
-             FROM (\n  \
-             SELECT `blkno`, `offnum`, argMax(`_is_deleted`, `_lsn`) AS `dead`\n  \
-             FROM {table}\n  \
-             WHERE `_lsn` <= {marker_lsn}\n  \
+             FROM {table}\n\
              GROUP BY `blkno`, `offnum`\n\
-             )\n\
-             WHERE `dead` = 0\n  \
-             AND (`blkno`, `offnum`) NOT IN (\n    \
-             SELECT DISTINCT `blkno`, `offnum` FROM {table} WHERE `_lsn` > {marker_lsn})"
+             HAVING max(`_lsn`) <= {marker_lsn} AND argMax(`_is_deleted`, `_lsn`) = 0\n\
+             SETTINGS optimize_aggregation_in_order = 1"
         )
     }
 
@@ -1193,10 +1189,7 @@ impl ToastResolver {
                 bytes += rows[end].chunk_data.len();
                 end += 1;
             }
-            let _leaf = match &self.budget {
-                Some(b) => Some(b.acquire(bytes).await),
-                None => None,
-            };
+            let _leaf = crate::budget::acquire_opt(self.budget.as_ref(), bytes).await;
             let mut batch: Vec<ToastRow> = Vec::with_capacity(end - start);
             for r in &rows[start..end] {
                 batch.push(r.materialize(spool)?);
@@ -1906,15 +1899,10 @@ mod tests {
             "INSERT INTO `wh`.`pg_toast_16500` (`blkno`, `offnum`, `chunk_id`, `chunk_seq`, \
              `chunk_data`, `_lsn`, `_is_deleted`)\n\
              SELECT `blkno`, `offnum`, 0, 0, '', 16384, 1\n\
-             FROM (\n  \
-             SELECT `blkno`, `offnum`, argMax(`_is_deleted`, `_lsn`) AS `dead`\n  \
-             FROM `wh`.`pg_toast_16500`\n  \
-             WHERE `_lsn` <= 8192\n  \
+             FROM `wh`.`pg_toast_16500`\n\
              GROUP BY `blkno`, `offnum`\n\
-             )\n\
-             WHERE `dead` = 0\n  \
-             AND (`blkno`, `offnum`) NOT IN (\n    \
-             SELECT DISTINCT `blkno`, `offnum` FROM `wh`.`pg_toast_16500` WHERE `_lsn` > 8192)"
+             HAVING max(`_lsn`) <= 8192 AND argMax(`_is_deleted`, `_lsn`) = 0\n\
+             SETTINGS optimize_aggregation_in_order = 1"
         );
 
         assert_eq!(

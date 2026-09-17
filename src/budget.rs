@@ -105,6 +105,13 @@ impl MemoryBudget {
         self.inner.total
     }
 
+    /// Share a single leaf acquire waits on: the reserve on a mixed pool,
+    /// the whole pool on a leaf-only one. A holder staying inside it
+    /// never withholds bytes admission needs
+    pub fn leaf_max(&self) -> usize {
+        self.inner.leaf_max
+    }
+
     /// Bytes currently held by live permits; can exceed `total` while an
     /// overshooting permit is live
     pub fn resident_bytes(&self) -> u64 {
@@ -181,6 +188,18 @@ impl MemoryBudget {
             admission_units,
         }
     }
+}
+
+/// [`MemoryBudget::acquire`] against an optional pool: no pool means no
+/// permit and no metering
+pub async fn acquire_opt(budget: Option<&MemoryBudget>, bytes: usize) -> Option<MemoryPermit> {
+    Some(budget?.acquire(bytes).await)
+}
+
+/// [`MemoryBudget::admit`] against an optional pool: no pool means no
+/// permit and no metering
+pub async fn admit_opt(budget: Option<&MemoryBudget>, bytes: usize) -> Option<MemoryPermit> {
+    Some(budget?.admit(bytes).await)
 }
 
 /// Owned share of the pool, released on drop. Move it with the bytes it

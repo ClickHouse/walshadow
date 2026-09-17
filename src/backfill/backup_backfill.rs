@@ -604,7 +604,9 @@ async fn replay_gap(
         patch: None,
     });
     pump_segments_through(segments, ctx.log.db_oid(), &mut sink).await?;
-    Ok(sink.stats())
+    sink.finish()
+        .await
+        .map_err(|e| anyhow::anyhow!("backup_backfill: finish gap replay: {e}"))
 }
 
 // ---------------------------------------------------------------------------

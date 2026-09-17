@@ -12,7 +12,7 @@ use tokio::sync::{Mutex, mpsc};
 use walrus::pg::wal::segment::SegmentName;
 use walrus::pg::walparser::{Oid, RmId};
 
-use crate::budget::MemoryBudget;
+use crate::budget::{MemoryBudget, MemoryPermit, acquire_opt};
 use crate::catalog::desc_log::DescriptorLog;
 use crate::config::ResolvedConfig;
 use crate::decode::heap_decoder::CommittedTuple;
@@ -30,10 +30,11 @@ use crate::mapping::MappingSnapshot;
 use crate::record::{Record, RecordSink, SegmentSink, SinkError, WAL_SEG_SIZE};
 use crate::schema::{FIRST_NORMAL_OBJECT_ID, RelDescriptor, RelName};
 use crate::source::wal_stream::WalStream;
-use crate::toast::{ChunkRefMap, ToastResolver};
+use crate::toast::{ChunkRefMap, ToastResolver, ToastRow, ToastRowRef};
+use crate::xact::spill::BodySpoolFile;
 use crate::xact::xact_buffer::{
     BufferingDecoderSink, DrainEntry, DrainedBatch, SubxactTracker, WalkStep, XactBuffer,
-    detoast_heap, resolve_stash,
+    detoast_heap, heap_reads_toast, resolve_stash,
 };
 use ahash::{HashMap, HashSet};
 
@@ -104,11 +105,23 @@ pub struct WalReplaySink {
     patch: Option<Arc<std::sync::Mutex<PgXactPatch>>>,
     /// Current `(sequence, routed rows)`, registered on first row
     open: Option<(u64, u64)>,
+    /// Rows waiting for next mirror write
+    pending_rows: Vec<ToastRow>,
+    pending_bytes: usize,
+    /// Leaf permits covering the materialized bodies in `pending_rows`
+    pending_permits: Vec<MemoryPermit>,
+    /// Resident ceiling for `pending_rows`, inside the leaf share so a
+    /// held batch never withholds bytes a drain admit waits on
+    pending_cap: usize,
     replay: ReplayStats,
 }
 
 impl WalReplaySink {
     pub fn new(inputs: WalReplayInputs) -> Self {
+        let pending_cap = inputs
+            .resolver
+            .budget()
+            .map_or(usize::MAX, MemoryBudget::leaf_max);
         Self {
             decoder: BufferingDecoderSink::new(inputs.log.clone(), inputs.buffer.clone()),
             buffer: inputs.buffer,
@@ -133,6 +146,10 @@ impl WalReplaySink {
             ack: inputs.ack,
             patch: inputs.patch,
             open: None,
+            pending_rows: Vec::new(),
+            pending_bytes: 0,
+            pending_permits: Vec::new(),
+            pending_cap,
             replay: ReplayStats {
                 next_seq: inputs.next_seq,
                 ..Default::default()
@@ -156,6 +173,12 @@ impl WalReplaySink {
         self.replay
     }
 
+    /// Flush pending rows and finish replay
+    pub async fn finish(mut self) -> std::result::Result<ReplayStats, SinkError> {
+        self.flush_rows().await?;
+        Ok(self.stats())
+    }
+
     /// Mirror every chunk tuple a restored TOAST page image carries, not
     /// only the one its record names. The image is a page copy, not
     /// transactional evidence, so it bypasses the xact stash: neighbours
@@ -165,9 +188,12 @@ impl WalReplaySink {
     /// modifies is written before its first change in the window, so the
     /// image carries what the torn copy lost
     async fn harvest_toast_images(
-        &self,
+        &mut self,
         record: &Record<'_>,
     ) -> std::result::Result<(), SinkError> {
+        if !self.resolver.stores_chunks() {
+            return Ok(());
+        }
         let mut rows = Vec::new();
         for block in record.parsed.blocks.iter().filter(|b| b.header.has_image()) {
             if i32::from(block.header.fork_num()) != crate::filter::main_data::MAIN_FORKNUM {
@@ -195,10 +221,77 @@ impl WalReplaySink {
         self.stats
             .toast_image_rows_mirrored
             .fetch_add(rows.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        for row in rows {
+            self.queue_row(row).await?;
+        }
+        Ok(())
+    }
+
+    /// Seal a batch that reached a put limit, or that the next body would
+    /// push past the resident cap, then cover the body the caller is
+    /// about to hold. Sealing first keeps held permits inside
+    /// `pending_cap`, so the acquire never waits on units this sink holds
+    async fn reserve_pending(
+        &mut self,
+        bytes: usize,
+    ) -> std::result::Result<Option<MemoryPermit>, SinkError> {
+        if self
+            .resolver
+            .put_limit_reached(self.pending_rows.len(), self.pending_bytes)
+            || self.pending_bytes + bytes > self.pending_cap
+        {
+            self.flush_rows().await?;
+        }
+        Ok(acquire_opt(self.resolver.budget(), bytes).await)
+    }
+
+    fn push_pending(&mut self, row: ToastRow, permit: Option<MemoryPermit>) {
+        self.pending_bytes += row.chunk_data.len();
+        self.pending_permits.extend(permit);
+        self.pending_rows.push(row);
+    }
+
+    /// Buffer rows to reduce store round trips. Flush before reads, at batch
+    /// limit, and when replay closes
+    async fn queue_row(&mut self, row: ToastRow) -> std::result::Result<(), SinkError> {
+        let permit = self.reserve_pending(row.chunk_data.len()).await?;
+        self.push_pending(row, permit);
+        Ok(())
+    }
+
+    /// Load file-backed data before transaction spool is removed
+    async fn queue_rows(
+        &mut self,
+        spool: Option<&BodySpoolFile>,
+        rows: &[ToastRowRef],
+    ) -> std::result::Result<(), SinkError> {
+        if !self.resolver.stores_chunks() {
+            return Ok(());
+        }
+        for r in rows {
+            // Permit before the read: the body is resident from here
+            let permit = self.reserve_pending(r.chunk_data.len()).await?;
+            let row = r
+                .materialize(spool)
+                .map_err(|e| SinkError::Other(format!("wal_replay: toast body load: {e}")))?;
+            self.push_pending(row, permit);
+        }
+        Ok(())
+    }
+
+    /// Write pending rows to chunk store
+    async fn flush_rows(&mut self) -> std::result::Result<(), SinkError> {
+        if self.pending_rows.is_empty() {
+            return Ok(());
+        }
+        let rows = std::mem::take(&mut self.pending_rows);
+        self.pending_bytes = 0;
+        // Bodies stay covered until the write lands
+        let _permits = std::mem::take(&mut self.pending_permits);
         self.resolver
             .put_batched(&rows)
             .await
-            .map_err(|e| SinkError::Other(format!("wal_replay: toast image put: {e}")))
+            .map_err(|e| SinkError::Other(format!("wal_replay: write toast rows: {e}")))
     }
 
     async fn on_commit(
@@ -274,10 +367,8 @@ impl WalReplaySink {
             match step {
                 WalkStep::Rows { upto } => {
                     if upto > rows_cursor {
-                        self.resolver
-                            .put_row_refs(walk.new_rows.spool(), &walk.new_rows[rows_cursor..upto])
-                            .await
-                            .map_err(|e| SinkError::Other(format!("toast store put: {e}")))?;
+                        self.queue_rows(walk.new_rows.spool(), &walk.new_rows[rows_cursor..upto])
+                            .await?;
                         rows_cursor = upto;
                     }
                 }
@@ -288,6 +379,8 @@ impl WalReplaySink {
                     toast_relid,
                     marker_lsn,
                 }) => {
+                    // Barrier reads rows from current rewrite
+                    self.flush_rows().await?;
                     self.resolver
                         .rewrite_barrier(toast_relid, marker_lsn, commit_lsn)
                         .await
@@ -330,6 +423,15 @@ impl WalReplaySink {
                         continue;
                     }
                     let rel = rel.clone();
+                    // Make earlier commits available before resolving values.
+                    // Inline-only heaps read nothing: flushing for them
+                    // shreds the batch on a row-heavy segment. Gate stays
+                    // as wide as detoast's leaf acquire: narrowing it to
+                    // store-bound pointers would hold pending leaf permits
+                    // across that acquire, which can wait on them
+                    if heap_reads_toast(&heap) {
+                        self.flush_rows().await?;
+                    }
                     let value_permit = detoast_heap(&mut heap, spool, &ref_maps, &self.resolver)
                         .await
                         .map_err(SinkError::from)?;
@@ -589,7 +691,7 @@ mod tests {
         let log = seed_test_log(dir.path(), &catalog).await;
         let store = Arc::new(MemChunkStore::new());
         let resolver = ToastResolver::with_store(store.clone(), Arc::new(EmitterStats::default()));
-        let sink = image_sink(dir.path(), log, resolver).await;
+        let mut sink = image_sink(dir.path(), log, resolver).await;
 
         let page = synth_toast_chunk_page(
             &[
@@ -601,6 +703,7 @@ mod tests {
         );
         let record = image_record(&page, rel.rfn.rel_node, 3);
         sink.harvest_toast_images(&record).await.unwrap();
+        sink.finish().await.unwrap();
 
         // Referrer bound is the walk's `start_lsn`, above the page version
         assert_eq!(
@@ -611,6 +714,69 @@ mod tests {
             store.fetch(rel.oid, 8, 0x6800, 4).await.unwrap(),
             FetchedValue::Assembled(b"only".to_vec()),
         );
+    }
+
+    /// Batch image rows from multiple records into one store write
+    #[tokio::test]
+    async fn image_harvest_batches_rows_across_records() {
+        use crate::backfill::backup_page_walk::{synth_toast_chunk_page, toast_chunk_rel};
+        use crate::toast::{ChunkStore, FetchedValue, MemChunkStore};
+        use std::sync::atomic::Ordering;
+
+        let dir = tempfile::tempdir().unwrap();
+        let rel = Arc::new(toast_chunk_rel());
+        let mut catalog = crate::backfill::backup_page_walk::CatalogMap::new();
+        catalog.insert(rel.clone());
+        let log = seed_test_log(dir.path(), &catalog).await;
+        let store = Arc::new(MemChunkStore::new());
+        let stats = Arc::new(EmitterStats::default());
+        let resolver = ToastResolver::with_store(store.clone(), stats.clone());
+        let mut sink = image_sink(dir.path(), log, resolver).await;
+
+        for (block_no, value_id) in [(3u32, 7u32), (4, 8)] {
+            let page = synth_toast_chunk_page(&[(value_id, 0, b"body".as_slice())], 0x6000);
+            let record = image_record(&page, rel.rfn.rel_node, block_no);
+            sink.harvest_toast_images(&record).await.unwrap();
+        }
+        assert_eq!(stats.toast_chunk_puts.load(Ordering::Relaxed), 0);
+
+        sink.finish().await.unwrap();
+        assert_eq!(stats.toast_chunk_puts.load(Ordering::Relaxed), 1);
+        for value_id in [7, 8] {
+            assert_eq!(
+                store.fetch(rel.oid, value_id, 0x6800, 4).await.unwrap(),
+                FetchedValue::Assembled(b"body".to_vec()),
+            );
+        }
+    }
+
+    /// Queued bodies live off the store until flush, so they must ride
+    /// permits the way the per-slice put they replaced did
+    #[tokio::test]
+    async fn queued_rows_hold_budget_until_flush() {
+        use crate::backfill::backup_page_walk::{synth_toast_chunk_page, toast_chunk_rel};
+        use crate::toast::MemChunkStore;
+
+        let dir = tempfile::tempdir().unwrap();
+        let rel = Arc::new(toast_chunk_rel());
+        let mut catalog = crate::backfill::backup_page_walk::CatalogMap::new();
+        catalog.insert(rel.clone());
+        let log = seed_test_log(dir.path(), &catalog).await;
+        let budget = MemoryBudget::new(1 << 20);
+        let resolver = ToastResolver::with_store(
+            Arc::new(MemChunkStore::new()),
+            Arc::new(EmitterStats::default()),
+        )
+        .with_budget(budget.clone());
+        let mut sink = image_sink(dir.path(), log, resolver).await;
+
+        let page = synth_toast_chunk_page(&[(7, 0, b"body".as_slice())], 0x6000);
+        let record = image_record(&page, rel.rfn.rel_node, 3);
+        sink.harvest_toast_images(&record).await.unwrap();
+        assert_eq!(budget.resident_bytes(), 4);
+
+        sink.finish().await.unwrap();
+        assert_eq!(budget.resident_bytes(), 0);
     }
 
     async fn seed_test_log(
