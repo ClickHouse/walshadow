@@ -4605,6 +4605,8 @@ async fn run_bootstrap(
     let marker = bootstrap_marker::begin_attempt(&shadow_data_dir, previous, pinned_backup)
         .await
         .context("prepare shadow data dir for bootstrap")?;
+    let resume =
+        bootstrap_marker::resumable_extraction(&shadow_data_dir, marker.backup_name.as_deref())?;
 
     // Sample window floor before BASE_BACKUP
     let source_ident = feed
@@ -4651,7 +4653,27 @@ async fn run_bootstrap(
             }
         }
     }));
-    let (rx, pump) = spawn_greenfield_bootstrap(cfg, source, catalog_map, store_toast);
+    let (rx, pump) = match &resume {
+        Some(done) => {
+            let (_tx, rx) = tokio::sync::mpsc::channel(1);
+            let outcome = BootstrapOutcome {
+                start: walshadow::backup_source::StartInfo {
+                    start_lsn: done.start_lsn,
+                    timeline: done.timeline,
+                    tablespaces: Vec::new(),
+                },
+                end: walshadow::backup_source::EndInfo {
+                    end_lsn: done.end_lsn,
+                    timeline: done.timeline,
+                },
+                disk: Arc::default(),
+                page_walk: Arc::default(),
+                pump: cfg.progress.pump.clone(),
+            };
+            (rx, tokio::spawn(async move { Ok(outcome) }))
+        }
+        None => spawn_greenfield_bootstrap(cfg, source, catalog_map, store_toast),
+    };
     let pump = tokio_util::task::AbortOnDropHandle::new(pump);
 
     // Overlay window transaction outcomes on backup pg_xact
@@ -4749,6 +4771,10 @@ async fn run_bootstrap(
             resolver: resolver.clone(),
             skip_initial,
             scratch_dir: args.spill_dir.clone(),
+            inherit_spools: resume
+                .as_ref()
+                .map(|done| done.handback_spools.clone())
+                .unwrap_or_default(),
         };
 
         // Gate page tuples, defer unknowns until transaction logs land
@@ -4756,7 +4782,10 @@ async fn run_bootstrap(
             .iter()
             .map(|t| (t.msg_tx.clone(), t.ack.clone()))
             .collect();
-        let (drain_txs, stages) = sink.spawn(lane_tails, "bootstrap_drain").await;
+        let (drain_txs, stages) = sink
+            .spawn(lane_tails, "bootstrap_drain")
+            .await
+            .map_err(anyhow::Error::msg)?;
         let mut gate_txs = Vec::with_capacity(lanes);
         let mut gate_handles = Vec::with_capacity(lanes);
         for (i, drain_tx) in drain_txs.into_iter().enumerate() {
@@ -4767,14 +4796,33 @@ async fn run_bootstrap(
             let spool_path = args
                 .spill_dir
                 .join(format!("bootstrap_gate_deferred.{i}.bin"));
-            tokio::fs::remove_file(&spool_path).await.ok();
+            // A resumed attempt inherits the spool the extraction checkpoint
+            // fsynced; only a fresh pass may clear a stale one
+            let inherit = resume.as_ref().and_then(|done| {
+                walshadow::bootstrap_marker::SpooledRecords::expected(
+                    &done.deferred_spools,
+                    &spool_path,
+                )
+            });
+            if inherit.is_none() {
+                tokio::fs::remove_file(&spool_path).await.ok();
+            }
             let catalog = drain_catalog.clone();
             gate_handles.push(tokio_util::task::AbortOnDropHandle::new(tokio::spawn(
                 async move {
-                    let mut spool = walshadow::spool::DeferredSpool::new(
-                        spool_path,
-                        walshadow::spool::DEFERRED_SPOOL_MEM_MAX,
-                    );
+                    let mut spool = match inherit {
+                        Some(records) => walshadow::spool::DeferredSpool::reopen(
+                            spool_path,
+                            walshadow::spool::DEFERRED_SPOOL_MEM_MAX,
+                            records,
+                        )
+                        .await
+                        .map_err(|e| format!("bootstrap: reopen deferred spool: {e}"))?,
+                        None => walshadow::spool::DeferredSpool::new(
+                            spool_path,
+                            walshadow::spool::DEFERRED_SPOOL_MEM_MAX,
+                        ),
+                    };
                     let mut gate_stats = GateStats::default();
                     stream_phase(
                         &mut gate_rx,
@@ -4873,7 +4921,7 @@ async fn run_bootstrap(
             };
             Ok((gate_stats, gate_spool, drain_outcome, outcome, window))
         })();
-        let (gate_stats, gate_spool, mut drain_outcome, outcome, mut window) = match prepared {
+        let (gate_stats, mut gate_spool, mut drain_outcome, outcome, mut window) = match prepared {
             Ok(prepared) => prepared,
             Err(e) => {
                 for tail in tails {
@@ -4882,6 +4930,55 @@ async fn run_bootstrap(
                 return Err(fatal.message().map(anyhow::Error::msg).unwrap_or(e));
             }
         };
+
+        // Only an object-store attempt can re-read the identical backup, so
+        // only it can resume past extraction
+        if let Some(backup_name) = marker.backup_name.clone().filter(|_| resume.is_none()) {
+            for (tail, drained) in tails.iter().zip(&drain_outcome) {
+                tail.checkpoint(drained.next_seq)
+                    .await
+                    .map_err(anyhow::Error::msg)?;
+            }
+            let mut deferred_spools = Vec::with_capacity(gate_spool.len());
+            for spool in &mut gate_spool {
+                spool
+                    .checkpoint()
+                    .await
+                    .context("bootstrap: persist deferred gate spool")?;
+                if spool.records() > 0 {
+                    deferred_spools.push(bootstrap_marker::SpooledRecords {
+                        path: spool.path().to_path_buf(),
+                        records: spool.records(),
+                    });
+                }
+            }
+            let mut handback_spools = Vec::with_capacity(drain_outcome.len());
+            for drained in &mut drain_outcome {
+                if let Some(spool) = drained.deferred.as_mut() {
+                    spool
+                        .checkpoint()
+                        .await
+                        .context("bootstrap: persist deferred referrer spool")?;
+                    if spool.records() > 0 {
+                        handback_spools.push(bootstrap_marker::SpooledRecords {
+                            path: spool.path().to_path_buf(),
+                            records: spool.records(),
+                        });
+                    }
+                }
+            }
+            bootstrap_marker::ExtractedCheckpoint {
+                backup_name,
+                start_lsn: outcome.start.start_lsn,
+                end_lsn: outcome.end.end_lsn,
+                timeline: outcome.start.timeline,
+                deferred_spools,
+                handback_spools,
+            }
+            .write(&shadow_data_dir)
+            .await
+            .context("bootstrap: record extraction checkpoint")?;
+        }
 
         // Deferred referrers resolve out of the chunk store, so every window
         // record has to be in it first. A live leg joined above; a leg over
@@ -5151,6 +5248,7 @@ async fn run_bootstrap(
             .with_context(|| format!("bootstrap: chmod 0700 {}", shadow_data_dir.display()))?;
     }
 
+    bootstrap_marker::ExtractedCheckpoint::clear(&shadow_data_dir).await?;
     BootstrapMarker::clear(&shadow_data_dir).await?;
 
     timing.finish();

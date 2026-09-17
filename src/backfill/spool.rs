@@ -75,6 +75,10 @@ impl DeferredSpool {
         }
     }
 
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
     pub fn records(&self) -> u64 {
         self.records
     }
@@ -165,9 +169,20 @@ impl DeferredSpool {
     }
 
     /// Reopen a checkpointed spool for further appends, discarding a record
-    /// a crash left half-written
-    pub async fn reopen(path: PathBuf, mem_max: usize) -> Result<Self> {
+    /// a crash left half-written. `expect_records` is what the checkpoint
+    /// counted: a short file means records a resumed pass would silently skip,
+    /// so it refuses rather than replaying an incomplete set
+    pub async fn reopen(path: PathBuf, mem_max: usize, expect_records: u64) -> Result<Self> {
         let (valid_len, records) = complete_prefix(&path).await?;
+        if records != expect_records {
+            return Err(SpillError::Format {
+                offset: valid_len as usize,
+                detail: format!(
+                    "spool {} holds {records} complete records, checkpoint counted                      {expect_records}",
+                    path.display(),
+                ),
+            });
+        }
         let file = OpenOptions::new().write(true).open(&path).await?;
         file.set_len(valid_len).await?;
         let mut file = file;
@@ -433,7 +448,7 @@ mod tests {
         spool.checkpoint().await.unwrap();
         drop(spool);
 
-        let mut spool = DeferredSpool::reopen(path.clone(), 0).await.unwrap();
+        let mut spool = DeferredSpool::reopen(path.clone(), 0, 4).await.unwrap();
         assert_eq!(spool.records(), 4);
         spool.push(tuple(4, b"after")).await.unwrap();
         spool.checkpoint().await.unwrap();
@@ -466,7 +481,11 @@ mod tests {
         torn.flush().await.unwrap();
         drop(torn);
 
-        let spool = DeferredSpool::reopen(path.clone(), 0).await.unwrap();
+        assert!(
+            DeferredSpool::reopen(path.clone(), 0, 2).await.is_err(),
+            "a torn tail must refuse a count the checkpoint promised",
+        );
+        let spool = DeferredSpool::reopen(path.clone(), 0, 1).await.unwrap();
         assert_eq!(spool.records(), 1);
         assert_eq!(tokio::fs::metadata(&path).await.unwrap().len(), sealed);
         let all = drain_all(spool).await;
@@ -484,7 +503,7 @@ mod tests {
         spool.checkpoint().await.unwrap();
         drop(spool);
 
-        let spool = DeferredSpool::reopen(path.clone(), 0).await.unwrap();
+        let spool = DeferredSpool::reopen(path.clone(), 0, 1).await.unwrap();
         assert_eq!(spool.records(), 1);
         assert_eq!(drain_all(spool).await[0].source_lsn, 7);
     }
