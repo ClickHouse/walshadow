@@ -2029,6 +2029,9 @@ crate::atomic_stats! {
         pub toast_tombstones_stored,
         /// Toasted values reassembled from the store (not the in-xact buffer)
         pub toast_values_fetched,
+        /// Store fetch round trips; a batch covers many values
+        pub toast_value_fetch_batches,
+        pub toast_value_fetch_nanos,
         /// Toasted values NULL/default-filled because no store could rebuild
         /// them (disabled mode). Surfaced, never silent
         pub toast_values_filled_default,

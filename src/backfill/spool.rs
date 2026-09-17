@@ -330,7 +330,7 @@ fn truncated(e: std::io::Error) -> SpillError {
     }
 }
 
-fn approx_bytes(value: &BackfillTuple) -> usize {
+pub(crate) fn approx_bytes(value: &BackfillTuple) -> usize {
     std::mem::size_of::<BackfillTuple>()
         + value
             .columns

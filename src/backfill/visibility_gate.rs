@@ -6,6 +6,7 @@
 //! [pending tables](crate::backfill::visibility_pending). A multixact the
 //! backup snapshot cannot bound ends the pass
 
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -218,6 +219,8 @@ pub struct GreenfieldSink {
 
 pub struct DrainLanes {
     lanes: Vec<AbortOnDropHandle<Result<BootstrapDrainOutcome, String>>>,
+    /// Names this group in a lane's error
+    stage: &'static str,
 }
 
 impl GreenfieldSink {
@@ -235,7 +238,7 @@ impl GreenfieldSink {
             // Stale files from a crashed pass block create_new
             let spool = self.scratch_dir.join(format!("{tag}_deferred.{i}.bin"));
             tokio::fs::remove_file(&spool).await.ok();
-            lanes.push(AbortOnDropHandle::new(tokio::spawn(bootstrap::drain(
+            lanes.push(bootstrap::drain(
                 rx,
                 self.catalog.clone(),
                 self.mapping.clone(),
@@ -248,54 +251,78 @@ impl GreenfieldSink {
                 self.emitter.row_policy(),
                 Some(self.config.clone()),
                 self.skip_initial.clone(),
-            ))));
+            ));
             senders.push(tx);
         }
-        (senders, DrainLanes { lanes })
+        (senders, DrainLanes::spawn_all("drain", lanes))
     }
 
-    /// Render referrers the lanes handed back, on one lane's tail, which
-    /// therefore closes its seq space last
+    /// Render referrers the lanes handed back, each on the tail that
+    /// drained it so the replay is not capped by one tail's inserts. Lanes
+    /// hold disjoint seq spaces, so they close their own
     pub async fn resolve_deferred(
         &self,
-        spools: Vec<DeferredSpool>,
-        msg_tx: &mpsc::Sender<BatcherMsg>,
-        ack: &AckHandle,
-        first_seq: u64,
-    ) -> Result<BootstrapDrainOutcome, String> {
-        let row_policy = self.emitter.row_policy();
-        let mut out = BootstrapDrainOutcome {
-            next_seq: first_seq,
-            ..Default::default()
-        };
-        for spool in spools {
-            let resolved = bootstrap::drain_deferred(
-                spool,
-                &self.catalog,
-                &self.mapping,
-                msg_tx,
-                ack,
-                &self.stats,
-                &self.resolver,
-                &row_policy,
-                Some(&self.config),
-                out.next_seq,
-            )
-            .await?;
-            out.next_seq = resolved.next_seq;
-            out.rows_routed += resolved.rows_routed;
-        }
-        Ok(out)
+        lanes: Vec<DeferredLane>,
+    ) -> Result<Vec<BootstrapDrainOutcome>, String> {
+        let lanes = lanes.into_iter().map(|lane| {
+            let catalog = self.catalog.clone();
+            let mapping = self.mapping.clone();
+            let stats = self.stats.clone();
+            let resolver = self.resolver.clone();
+            let config = self.config.clone();
+            let row_policy = self.emitter.row_policy();
+            async move {
+                bootstrap::drain_deferred(
+                    lane.spool,
+                    &catalog,
+                    &mapping,
+                    &lane.msg_tx,
+                    &lane.ack,
+                    &stats,
+                    &resolver,
+                    &row_policy,
+                    Some(&config),
+                    lane.first_seq,
+                )
+                .await
+            }
+        });
+        DrainLanes::spawn_all("deferred resolve", lanes)
+            .join()
+            .await
     }
 }
 
+/// One lane's handed-back referrers and the tail they replay on: the same
+/// tail that drained the lane, resuming its seq space
+pub struct DeferredLane {
+    pub spool: DeferredSpool,
+    pub msg_tx: mpsc::Sender<BatcherMsg>,
+    pub ack: AckHandle,
+    pub first_seq: u64,
+}
+
 impl DrainLanes {
+    /// One task per lane, so lanes run together rather than in turn
+    fn spawn_all<F>(stage: &'static str, lanes: impl IntoIterator<Item = F>) -> Self
+    where
+        F: Future<Output = Result<BootstrapDrainOutcome, String>> + Send + 'static,
+    {
+        Self {
+            lanes: lanes
+                .into_iter()
+                .map(|lane| AbortOnDropHandle::new(tokio::spawn(lane)))
+                .collect(),
+            stage,
+        }
+    }
+
     /// Joins every lane before surfacing an error, so a failed one still lets
     /// the others finish what they hold
     pub async fn join(self) -> Result<Vec<BootstrapDrainOutcome>, String> {
         let mut drained = Vec::with_capacity(self.lanes.len());
         for lane in self.lanes {
-            drained.push(join_stage(lane, "drain").await);
+            drained.push(join_stage(lane, self.stage).await);
         }
         drained.into_iter().collect()
     }
@@ -385,14 +412,21 @@ pub async fn resolve_greenfield(
     // Drain tail before surfacing errors
     let frontier = match (resolved, stages.join().await) {
         (Ok(()), Ok(mut drained)) => {
-            let spools = drained
+            let open = drained.iter().map(|d| d.next_seq).max().unwrap_or(0);
+            let lanes = drained
                 .iter_mut()
-                .filter_map(|d| d.deferred.take())
+                .filter_map(|d| {
+                    d.deferred.take().map(|spool| DeferredLane {
+                        spool,
+                        msg_tx: tail.msg_tx.clone(),
+                        ack: tail.ack.clone(),
+                        first_seq: d.next_seq,
+                    })
+                })
                 .collect();
-            let first_seq = drained.iter().map(|d| d.next_seq).max().unwrap_or(0);
-            sink.resolve_deferred(spools, &tail.msg_tx, &tail.ack, first_seq)
+            sink.resolve_deferred(lanes)
                 .await
-                .map(|resolved| resolved.next_seq)
+                .map(|r| r.iter().map(|o| o.next_seq).max().unwrap_or(open))
         }
         (Err(e), _) | (_, Err(e)) => Err(e),
     };
@@ -459,16 +493,13 @@ mod tests {
     /// A failed lane surfaces its own message, not a channel-closure artifact
     #[tokio::test]
     async fn drain_failure_surfaces_through_join() {
-        let lanes = DrainLanes {
-            lanes: vec![
-                AbortOnDropHandle::new(tokio::spawn(async {
-                    Err("toast store unavailable".to_string())
-                })),
-                AbortOnDropHandle::new(tokio::spawn(async {
-                    Ok(BootstrapDrainOutcome::default())
-                })),
+        let lanes = DrainLanes::spawn_all(
+            "drain",
+            [
+                std::future::ready(Err("toast store unavailable".to_string())),
+                std::future::ready(Ok(BootstrapDrainOutcome::default())),
             ],
-        };
+        );
         let err = lanes.join().await.unwrap_err();
         assert_eq!(err, "bootstrap drain: toast store unavailable");
     }
@@ -513,6 +544,82 @@ mod tests {
         assert_eq!(drained[0].next_seq, 0);
         drop(ack);
         ack_task.await.unwrap();
+    }
+
+    /// Lanes replay on the tail that drained them, together: two spools
+    /// route to two tails at once, each resuming its own seq space
+    #[tokio::test]
+    async fn deferred_lanes_replay_on_their_own_tails() {
+        use crate::decode::heap_decoder::ColumnValue;
+        use crate::mapping::{ColumnMapping, TableMapping, TableTarget};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut catalog = CatalogMap::new();
+        catalog.insert(make_rel_named(16400, 16400, 0, RelName::new("public", "t")));
+        let mut tables = ahash::HashMap::default();
+        tables.insert(
+            RelName::new("public", "t"),
+            TableMapping {
+                target: TableTarget::new("default", "t"),
+                columns: vec![ColumnMapping {
+                    src_attnum: 1,
+                    target_name: "id".into(),
+                    target_type: "Int32".into(),
+                }],
+            },
+        );
+        let sink = GreenfieldSink {
+            catalog,
+            mapping: Arc::new(tables),
+            config: Arc::new(ResolvedConfig::default()),
+            emitter: EmitterConfig::default(),
+            stats: Arc::new(EmitterStats::default()),
+            resolver: ToastResolver::disabled(),
+            skip_initial: HashSet::new(),
+            scratch_dir: tmp.path().to_path_buf(),
+        };
+
+        let row = |id| BackfillTuple {
+            columns: vec![Some(ColumnValue::Int4(id))],
+            ..tuple(100, 0, HEAP_XMIN_COMMITTED)
+        };
+        let mut tails = Vec::new();
+        let mut lanes = Vec::new();
+        for (i, first_seq) in [3u64, 7].into_iter().enumerate() {
+            let (ack, ack_task) = crate::emit::pipeline::ack::spawn(Arc::new(Default::default()));
+            let (msg_tx, msg_rx) = mpsc::channel(16);
+            lanes.push(DeferredLane {
+                spool: spool_at(&format!("lane-{i}"), vec![row(i as i32), row(9)]).await,
+                msg_tx,
+                ack: ack.clone(),
+                first_seq,
+            });
+            tails.push((ack, ack_task, msg_rx));
+        }
+
+        let out = sink.resolve_deferred(lanes).await.unwrap();
+        assert_eq!(
+            out.iter().map(|o| o.next_seq).collect::<Vec<_>>(),
+            vec![4, 8],
+            "each lane closed the seq it opened, not a shared one",
+        );
+        assert!(out.iter().all(|o| o.rows_routed == 2));
+
+        for (want_seq, (ack, ack_task, mut msg_rx)) in [3u64, 7].into_iter().zip(tails) {
+            let mut seqs = Vec::new();
+            while let Some(msg) = msg_rx.recv().await {
+                match msg {
+                    BatcherMsg::Rows(chunk) => seqs.extend(chunk.rows.iter().map(|r| r.seq)),
+                    BatcherMsg::Row(r) => seqs.push(r.seq),
+                    BatcherMsg::FlushAll(reply) => {
+                        let _ = reply.send(());
+                    }
+                }
+            }
+            assert_eq!(seqs, vec![want_seq; 2], "rows rode their own lane's tail");
+            drop(ack);
+            ack_task.await.unwrap();
+        }
     }
 
     async fn spool_of(tuples: Vec<BackfillTuple>) -> DeferredSpool {

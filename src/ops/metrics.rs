@@ -233,6 +233,12 @@ snapshot! {
         "Cumulative wall-clock inside chunk-store INSERTs. Divided by toast_chunk_puts_total this is per-part commit latency.",
     counter toast_tombstones_stored_total: u64 =
         "TOAST delete tombstone rows persisted to the CH store.",
+    counter toast_values_fetched_total: u64 =
+        "Values reassembled out of the CH store rather than the in-xact buffer: pre-window re-emits and the bootstrap's deferred referrers.",
+    counter toast_value_fetch_batches_total: u64 =
+        "Store fetch round trips. Against toast_values_fetched_total this is values per query, the deferred-resolution batching factor.",
+    counter toast_value_fetch_seconds: f64 =
+        "Cumulative wall-clock inside chunk-store fetches. Divided by toast_value_fetch_batches_total this is per-query latency.",
     counter toast_image_rows_mirrored_total: u64 =
         "Chunk rows mirrored from restored page images during a backup window; non-zero means the backup copied TOAST pages mid-write.",
     counter toast_values_filled_superseded_total: u64 =
