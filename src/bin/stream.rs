@@ -3494,6 +3494,7 @@ async fn populate_metrics(
         resident_payload_peak_bytes: budget.map(|b| b.peak_bytes()).unwrap_or(0),
         memory_budget_waits_total: budget.map(|b| b.waits_total()).unwrap_or(0),
         memory_budget_overshoots_total: budget.map(|b| b.overshoots_total()).unwrap_or(0),
+        memory_budget_big_leaf_waits_total: budget.map(|b| b.big_leaf_waits_total()).unwrap_or(0),
         spill_evictions_total: xact_stats.spill_evictions_total,
         xacts_committed_total: xact_stats.committed_xacts_total,
         xacts_aborted_total: xact_stats.aborted_xacts_total,
@@ -3679,6 +3680,7 @@ fn stage_gauges(v: &StageCounters<'_>) -> MetricsSnapshot {
         toast_image_rows_mirrored_total: emitter(|s| &s.toast_image_rows_mirrored),
         toast_values_filled_superseded_total: emitter(|s| &s.toast_values_filled_superseded),
         toast_values_filled_mismatch_total: emitter(|s| &s.toast_values_filled_mismatch),
+        toast_values_filled_oversize_total: emitter(|s| &s.toast_values_filled_oversize),
         toast_mirror_truncates_total: emitter(|s| &s.toast_mirror_truncates),
         toast_mirror_retires_total: emitter(|s| &s.toast_mirror_retires),
         toast_rewrite_barriers_total: emitter(|s| &s.toast_rewrite_barriers),
@@ -4552,6 +4554,7 @@ async fn run_bootstrap(
             bootstrap_stats.clone(),
         )
         .with_inline_value_max(cfg.inline_value_max)
+        .with_overflow(cfg.inline_value_overflow)
         .with_budget(walshadow::budget::MemoryBudget::new(
             cfg.resident_payload_max,
         ))

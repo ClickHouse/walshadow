@@ -181,14 +181,16 @@ pub struct EmitterConfig {
     pub runtime_config_schema: Option<String>,
     /// Source PostgreSQL connection and slot
     pub source: crate::config::SourceConn,
-    /// `[memory] resident_payload_max`: global resident payload permit
-    /// pool ([`crate::budget::MemoryBudget`])
+    /// `[memory] resident_payload_max`: global payload memory limit
     pub resident_payload_max: usize,
-    /// `[memory] inline_value_max`: hard per-value decode-target cap;
-    /// also sizes the budget's leaf reserve per decode worker. Reserve
-    /// (`decoder_pool * inline_value_max`) must fit half
-    /// `resident_payload_max` (validated at pipeline spawn)
+    /// `[memory] inline_value_max`: maximum decoded value size. Oversized
+    /// values become NULL or fail their transaction, based on
+    /// `inline_value_overflow`
     pub inline_value_max: usize,
+    /// `[memory] value_reserve`: memory reserved per decoder for one value
+    pub value_reserve: usize,
+    /// `[memory] inline_value_overflow`: action for oversized values
+    pub inline_value_overflow: InlineValueOverflow,
     /// `[ch] decoder_pool_size`: decode workers (M). `> 1` relaxes
     /// per-table WAL order, leaning on `_lsn` ReplacingMergeTree dedup
     /// ([emitter.md](../../architecture/README.md)). `--decoder-pool-size`
@@ -299,6 +301,15 @@ impl ToastMode {
     }
 }
 
+/// Action for TOAST values larger than `inline_value_max`
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InlineValueOverflow {
+    #[default]
+    Null,
+    Error,
+}
+
 /// `[toast]` chunk-store controls, applied at startup
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
 pub struct ToastSettings {
@@ -309,13 +320,26 @@ pub struct ToastSettings {
     pub mode: ToastMode,
 }
 
-pub(crate) const DEFAULT_RESIDENT_PAYLOAD_MAX: usize = 512 << 20;
-pub(crate) const DEFAULT_INLINE_VALUE_MAX: usize = 64 << 20;
+pub(crate) const DEFAULT_INLINE_VALUE_MAX: usize = 1 << 30;
+pub(crate) const DEFAULT_VALUE_RESERVE: usize = 64 << 20;
+
+/// Leave half for shadow PostgreSQL, transaction buffer, and unmetered allocations
+const RESIDENT_PAYLOAD_FRACTION: usize = 2;
+/// Keep default reserve within half of pool
+pub(crate) const MIN_RESIDENT_PAYLOAD_MAX: usize = 512 << 20;
+
+/// Return half of available memory, with enough room for default reserve
+pub fn default_resident_payload_max() -> usize {
+    crate::budget::host_memory_limit()
+        .map(|m| m / RESIDENT_PAYLOAD_FRACTION)
+        .unwrap_or(MIN_RESIDENT_PAYLOAD_MAX)
+        .max(MIN_RESIDENT_PAYLOAD_MAX)
+}
 
 pub const DEFAULT_POOL_FLOOR: usize = 3;
 
 /// A constant, not vCPU-scaled: [`crate::emit::pipeline::leaf_reserve_for`]
-/// caps `decoders * inline_value_max` at half the resolved `[memory]` budget,
+/// caps `decoders * value_reserve` at half the resolved `[memory]` budget,
 /// so a derived default can refuse boot where this one passes
 pub const DEFAULT_DECODER_POOL: usize = DEFAULT_POOL_FLOOR;
 
@@ -399,8 +423,10 @@ impl Default for EmitterConfig {
             plan_disk_max: DEFAULT_PLAN_DISK_MAX,
             runtime_config_schema: None,
             source: crate::config::SourceConn::default(),
-            resident_payload_max: DEFAULT_RESIDENT_PAYLOAD_MAX,
+            resident_payload_max: default_resident_payload_max(),
             inline_value_max: DEFAULT_INLINE_VALUE_MAX,
+            value_reserve: DEFAULT_VALUE_RESERVE,
+            inline_value_overflow: InlineValueOverflow::default(),
             decoder_pool_size: DEFAULT_DECODER_POOL,
             inserter_pool_size: default_inserter_pool(),
             decoder_batch_size: DEFAULT_QUEUEING_BATCH_SIZE,
@@ -642,6 +668,8 @@ struct ChPatch {
 struct MemoryPatch {
     resident_payload_max: Option<usize>,
     inline_value_max: Option<usize>,
+    value_reserve: Option<usize>,
+    inline_value_overflow: Option<InlineValueOverflow>,
 }
 
 #[derive(Default, serde::Deserialize)]
@@ -801,6 +829,11 @@ impl EmitterConfig {
             .resident_payload_max
             .unwrap_or(out.resident_payload_max);
         out.inline_value_max = doc.memory.inline_value_max.unwrap_or(out.inline_value_max);
+        out.value_reserve = doc.memory.value_reserve.unwrap_or(out.value_reserve);
+        out.inline_value_overflow = doc
+            .memory
+            .inline_value_overflow
+            .unwrap_or(out.inline_value_overflow);
         out.runtime_config_schema = doc.runtime_config.schema;
         let st = doc.stream;
         out.paused = st.paused.unwrap_or(out.paused);
@@ -2063,6 +2096,8 @@ crate::atomic_stats! {
         pub toast_values_filled_default,
         pub toast_values_filled_superseded,
         pub toast_values_filled_mismatch,
+        /// Oversized values replaced under `inline_value_overflow = "null"`
+        pub toast_values_filled_oversize,
         pub toast_fetch_miss,
         /// Chunk rows mirrored from a restored TOAST page image, repairing
         /// backup page copies read mid-write
@@ -3258,15 +3293,33 @@ mod tests {
             "[ch]\n\
              [memory]\n\
              resident_payload_max = 1048576\n\
-             inline_value_max = 65536\n",
+             inline_value_max = 65536\n\
+             value_reserve = 4096\n\
+             inline_value_overflow = \"error\"\n",
         )
         .unwrap();
         assert_eq!(c.resident_payload_max, 1 << 20);
         assert_eq!(c.inline_value_max, 64 << 10);
+        assert_eq!(c.value_reserve, 4 << 10);
+        assert_eq!(c.inline_value_overflow, InlineValueOverflow::Error);
         // Omitted section keeps defaults
         let d = EmitterConfig::from_toml_str("[ch]\n").unwrap();
-        assert_eq!(d.resident_payload_max, DEFAULT_RESIDENT_PAYLOAD_MAX);
+        assert_eq!(d.resident_payload_max, default_resident_payload_max());
         assert_eq!(d.inline_value_max, DEFAULT_INLINE_VALUE_MAX);
+        assert_eq!(d.value_reserve, DEFAULT_VALUE_RESERVE);
+        assert_eq!(d.inline_value_overflow, InlineValueOverflow::Null);
+    }
+
+    /// Keep default pool large enough for reserve
+    #[test]
+    fn derived_pool_default_stays_bootable() {
+        let pool = default_resident_payload_max();
+        let expected = crate::budget::host_memory_limit()
+            .map(|m| m / RESIDENT_PAYLOAD_FRACTION)
+            .unwrap_or(MIN_RESIDENT_PAYLOAD_MAX)
+            .max(MIN_RESIDENT_PAYLOAD_MAX);
+        assert_eq!(pool, expected);
+        assert!(DEFAULT_DECODER_POOL * DEFAULT_VALUE_RESERVE <= pool / 2);
     }
 
     #[test]
@@ -3716,6 +3769,10 @@ mod tests {
         rejects(
             "[memory]\ninline_value_max = -1\n",
             "`memory.inline_value_max`",
+        );
+        rejects(
+            "[memory]\ninline_value_overflow = \"drop\"\n",
+            "`memory.inline_value_overflow`",
         );
         rejects("[stream]\nreplicate_all = 0\n", "`stream.replicate_all`");
         rejects(

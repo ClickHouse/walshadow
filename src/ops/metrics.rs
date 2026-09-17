@@ -179,6 +179,8 @@ snapshot! {
     counter memory_budget_waits_total: u64 = "Budget acquisitions that waited for a release.",
     counter memory_budget_overshoots_total: u64 =
         "Requests above a budget compartment, admitted with only the satisfiable share metered.",
+    counter memory_budget_big_leaf_waits_total: u64 =
+        "Large values that waited for another large value to finish.",
     gauge bootstrap_deferred_bytes: u64 =
         "Resident bytes in the in-memory prefixes of every bootstrap TOAST-deferred spool.",
     gauge bootstrap_deferred_spool_bytes: u64 =
@@ -245,6 +247,8 @@ snapshot! {
         "Store-mode values filled after their history merge-collapsed.",
     counter toast_values_filled_mismatch_total: u64 =
         "Store-mode values filled off a dense-but-short store run (partial collapse or generation mixing).",
+    counter toast_values_filled_oversize_total: u64 =
+        "Values over inline_value_max replaced with NULL or a column default.",
     counter toast_mirror_truncates_total: u64 =
         "Mirror wipes from owner TRUNCATE, applied at the reorder barrier.",
     counter toast_mirror_retires_total: u64 =
