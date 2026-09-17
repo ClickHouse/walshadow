@@ -23,7 +23,7 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use tokio_postgres::{Client, NoTls};
-use walshadow::bridge::Bridge;
+use walshadow::bridge::{Bridge, BridgeError};
 use walshadow::pg::socket_conninfo;
 use walshadow::shadow::{BridgeConf, Shadow, ShadowConfig};
 use walshadow::toast::FetchedValue;
@@ -45,6 +45,16 @@ fn pgext_dir() -> PathBuf {
         "pgext/walshadow.so missing, run `make -C pgext`"
     );
     dir
+}
+
+fn wstest_module() -> PathBuf {
+    let so = Path::new(env!("CARGO_MANIFEST_DIR")).join("pgext/test/wstest.so");
+    assert!(
+        so.is_file(),
+        "{} missing, run `make -C pgext/test`",
+        so.display()
+    );
+    so
 }
 
 struct StopOnDrop {
@@ -507,6 +517,73 @@ async fn fetch_refuses_malformed_requests() {
             .unwrap(),
         FetchedValue::Mismatch { .. }
     ));
+}
+
+/// Toast columns are PLAIN storage, so PostgreSQL only ever writes plain
+/// 4-byte chunk headers. The reader still takes the other two shapes the way
+/// heap_fetch_toast_slice does: a short header reads, a compressed one is
+/// corruption and refuses the request. Neither can come from SQL, so wstest
+/// plants them
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn planted_chunk_headers_short_reads_compressed_refuses() {
+    if !have("initdb") {
+        eprintln!("skip: no initdb on PATH");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let pg = start_pg(&tmp, ports::reserve_port(), &tmp.path().join("archive"));
+    let bridge = dial(pg.sh.bridge_socket().unwrap()).await;
+    let sql = connect_sql(&pg.sh).await;
+
+    // Seed before planting: the seed reads chunk lengths through SQL, which
+    // would detoast the planted compressed chunk
+    let v = seed_value(&sql, "t_plant", "repeat('mn', 120000)", true).await;
+    exec(
+        &sql,
+        &format!(
+            "CREATE FUNCTION ws_test_plant_toast_chunk(oid, oid, int, bytea, bool) \
+             RETURNS void AS '{}', 'ws_test_plant_toast_chunk' LANGUAGE c",
+            wstest_module().display()
+        ),
+    )
+    .await;
+    let plant = |id: u32, seq: u32, payload: &str, compressed: bool| {
+        format!(
+            "SELECT ws_test_plant_toast_chunk({}, {id}, {seq}, '{payload}'::bytea, {compressed})",
+            v.toast_relid
+        )
+    };
+
+    // Ids the toast relation never allocated
+    let short_id = 4_000_000_000;
+    exec(&sql, &plant(short_id, 0, "hello", false)).await;
+    exec(&sql, &plant(short_id, 1, "world", false)).await;
+    let got = bridge
+        .fetch_toast(v.toast_relid, &[(short_id, 10)], 0)
+        .await
+        .expect("short chunks assemble")
+        .pop()
+        .unwrap();
+    assert_eq!(got, FetchedValue::Assembled(b"helloworld".to_vec()));
+
+    let bad_id = short_id + 1;
+    exec(&sql, &plant(bad_id, 0, "xyz", true)).await;
+    let err = bridge
+        .fetch_toast(v.toast_relid, &[(v.value_id, v.extsize), (bad_id, 3)], 0)
+        .await
+        .expect_err("a compressed chunk refuses the whole request");
+    assert!(
+        matches!(&err, BridgeError::Remote(m) if m.contains("compressed or external TOAST chunk")),
+        "{err}"
+    );
+
+    // Refusal aborted that request's transaction and the worker stays usable
+    let after = fetch(&bridge, &v).await;
+    assert!(
+        matches!(&after, FetchedValue::Assembled(b) if b == v.raw.as_bytes()),
+        "{}",
+        describe(&after, v.extsize)
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
