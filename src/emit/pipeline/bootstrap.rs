@@ -459,6 +459,22 @@ fn mapped_pointers(tuple: &BackfillTuple, mapping: &TableMapping) -> Vec<Pointer
         .collect()
 }
 
+/// Replace oversized values with NULL and remove them from fetch list
+fn fill_oversize(
+    tuple: &mut BackfillTuple,
+    sites: &mut Vec<PointerSite>,
+    resolver: &ToastResolver,
+) {
+    sites.retain(|site| {
+        if !resolver.value_oversize(&site.p) {
+            return true;
+        }
+        resolver.note_filled_oversize();
+        tuple.columns[site.idx] = Some(ColumnValue::Null);
+        false
+    });
+}
+
 /// Batch whose values are resolved, holding the leaf permit its rows ride
 struct ResolvedReplayBatch {
     rows: Vec<ReplayRow>,
@@ -530,7 +546,7 @@ async fn next_batch(
         resident: 0,
     };
     while batch.rows.len() < REPLAY_BATCH_ROWS && batch.need + batch.resident < REPLAY_FETCH_BYTES {
-        let Some(tuple) = replay
+        let Some(mut tuple) = replay
             .next()
             .await
             .map_err(|e| format!("bootstrap: deferred spool replay: {e}"))?
@@ -545,12 +561,14 @@ async fn next_batch(
             stats.unsupported_relations.fetch_add(1, Ordering::Relaxed);
             continue;
         };
-        let pointers = mapped_pointers(&tuple, &route.mapping);
+        let mut pointers = mapped_pointers(&tuple, &route.mapping);
         batch.need += check_value_caps(
             pointers.iter().map(|site| site.p),
             resolver.inline_value_max(),
+            resolver.overflow(),
         )
         .map_err(|e| format!("bootstrap: {e}"))?;
+        fill_oversize(&mut tuple, &mut pointers, resolver);
         batch.resident += crate::backfill::spool::approx_bytes(&tuple);
         batch.rows.push(ReplayRow {
             tuple,
@@ -705,12 +723,17 @@ async fn resolve_or_fill_toast(
     mapping: &TableMapping,
     resolver: &ToastResolver,
 ) -> Result<Option<crate::budget::MemoryPermit>, String> {
-    let sites = mapped_pointers(tuple, mapping);
+    let mut sites = mapped_pointers(tuple, mapping);
     if sites.is_empty() {
         return Ok(None);
     }
-    let need = check_value_caps(sites.iter().map(|site| site.p), resolver.inline_value_max())
-        .map_err(|e| format!("bootstrap: {e}"))?;
+    let need = check_value_caps(
+        sites.iter().map(|site| site.p),
+        resolver.inline_value_max(),
+        resolver.overflow(),
+    )
+    .map_err(|e| format!("bootstrap: {e}"))?;
+    fill_oversize(tuple, &mut sites, resolver);
     let mut leaf = crate::budget::acquire_opt(resolver.budget(), need).await;
     let mut retained = 0usize;
     for site in &sites {
@@ -1246,6 +1269,61 @@ mod tests {
             "unresolved toast NULL-filled"
         );
         assert_eq!(stats.toast_values_filled_default.load(Ordering::Relaxed), 1);
+        drop(ack);
+        collector.await.unwrap();
+    }
+
+    /// Replace oversized deferred value without fetching it
+    #[tokio::test]
+    async fn null_overflow_fills_oversize_toast_without_fetch() {
+        let mut catalog = CatalogMap::new();
+        catalog.insert(bytea_rel(16400));
+        let mut tables = HashMap::new();
+        tables.insert(RelName::new("public", "t16400"), bytea_mapping_for(16400));
+        let mapping = Arc::new(tables);
+
+        let emitter_ack = Arc::new(crate::pos::Monotone::new(0));
+        let (ack, collector) = ack::spawn(emitter_ack);
+        let (msg_tx, mut msg_rx) = mpsc::channel::<BatcherMsg>(64);
+        let (tup_tx, tup_rx) = mpsc::channel::<Vec<BackfillTuple>>(64);
+
+        tup_tx
+            .send(vec![bytea_toast_tuple(16400, 16500, 1)])
+            .await
+            .unwrap();
+        drop(tup_tx);
+
+        let stats = Arc::new(EmitterStats::default());
+        // Pointer footprint is 5 bytes
+        let resolver = ToastResolver::with_store(Arc::new(MemChunkStore::new()), stats.clone())
+            .with_inline_value_max(4)
+            .with_overflow(crate::emit::ch_emitter::InlineValueOverflow::Null);
+        let drain_task = tokio::spawn(drain(
+            tup_rx,
+            catalog,
+            mapping,
+            msg_tx,
+            ack.clone(),
+            stats.clone(),
+            resolver,
+            Deferral::Local(mem_spool()),
+            Default::default(),
+            None,
+            HashSet::new(),
+        ));
+
+        let rows = collect_rows(&mut msg_rx).await;
+        let outcome = drain_task.await.unwrap().unwrap();
+        assert_eq!(outcome.rows_routed, 1);
+        assert_eq!(rows.len(), 1);
+        let cols = &rows[0].committed.decoded.new.as_ref().unwrap().columns;
+        assert_eq!(cols[0], Some(ColumnValue::Null));
+        assert_eq!(
+            stats.toast_values_filled_oversize.load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(stats.toast_values_filled_default.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.toast_values_fetched.load(Ordering::Relaxed), 0);
         drop(ack);
         collector.await.unwrap();
     }

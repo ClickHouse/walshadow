@@ -21,7 +21,7 @@ use crate::ch::{
 use crate::decode::heap_decoder::{
     ColumnValue, ToastPointer, VARLENA_EXTSIZE_BITS, VARLENA_EXTSIZE_MASK, decompress_varlena,
 };
-use crate::emit::ch_emitter::{EmitterConfig, EmitterStats, ToastMode};
+use crate::emit::ch_emitter::{EmitterConfig, EmitterStats, InlineValueOverflow, ToastMode};
 use crate::xact::spill::{BodyRef, BodySpoolFile, ToastChunk, ToastDelete};
 use ahash::{HashMap, HashMapExt, HashSet, HashSetExt};
 
@@ -86,26 +86,36 @@ fn pointer_is_compressed(p: &ToastPointer) -> bool {
     (pointer_extsize(p) as i64) < i64::from(p.va_rawsize - VARHDRSZ)
 }
 
-/// Validate value caps, return heap leaf-permit need
+/// Return larger of decoded and stored sizes
+pub(crate) fn pointer_footprint(p: &ToastPointer) -> usize {
+    ((p.va_rawsize - VARHDRSZ).max(0) as usize).max(pointer_extsize(p))
+}
+
+/// Check value limits and return memory needed for decoding
+///
+/// Ignore oversized values under [`InlineValueOverflow::Null`], caller replaces
+/// them without fetching
 pub(crate) fn check_value_caps(
     pointers: impl IntoIterator<Item = ToastPointer>,
     max: usize,
+    overflow: InlineValueOverflow,
 ) -> Result<usize, ToastValueError> {
     let mut retained = 0usize;
     let mut transient = 0usize;
     for p in pointers {
-        let raw = (p.va_rawsize - VARHDRSZ).max(0) as usize;
-        let ext = pointer_extsize(&p);
-        if raw.max(ext) > max {
+        let footprint = pointer_footprint(&p);
+        if footprint > max {
+            if overflow == InlineValueOverflow::Null {
+                continue;
+            }
             return Err(ToastValueError::ValueTooLarge {
-                rawsize: raw.max(ext),
+                rawsize: footprint,
                 max,
             });
         }
-        let compressed = pointer_is_compressed(&p);
-        retained += if compressed { raw } else { ext };
-        if compressed {
-            transient = transient.max(ext);
+        retained += footprint;
+        if pointer_is_compressed(&p) {
+            transient = transient.max(pointer_extsize(&p));
         }
     }
     Ok(retained + transient)
@@ -983,6 +993,8 @@ pub struct ToastResolver {
     put_batch_bytes: usize,
     /// V3 hard per-value decode-target cap, checked before allocation
     inline_value_max: usize,
+    /// Action for values over `inline_value_max`
+    overflow: InlineValueOverflow,
     /// Leaf permits for per-value transients (assembly, decompress, JIT
     /// materialization); `None` = unmetered (serial/metrics-only paths)
     budget: Option<crate::budget::MemoryBudget>,
@@ -996,6 +1008,7 @@ impl ToastResolver {
             put_batch_rows: CHUNK_PUT_BATCH,
             put_batch_bytes: CHUNK_PUT_BYTES,
             inline_value_max: usize::MAX,
+            overflow: InlineValueOverflow::default(),
             budget: None,
         }
     }
@@ -1051,6 +1064,7 @@ impl ToastResolver {
                 .put_batch_bytes
                 .map_or(CHUNK_PUT_BYTES, |n| n.get()),
             inline_value_max: emitter.inline_value_max,
+            overflow: emitter.inline_value_overflow,
             budget: None,
         }
     }
@@ -1063,6 +1077,7 @@ impl ToastResolver {
             put_batch_rows: CHUNK_PUT_BATCH,
             put_batch_bytes: CHUNK_PUT_BYTES,
             inline_value_max: usize::MAX,
+            overflow: InlineValueOverflow::default(),
             budget: None,
         }
     }
@@ -1086,6 +1101,21 @@ impl ToastResolver {
 
     pub fn inline_value_max(&self) -> usize {
         self.inline_value_max
+    }
+
+    /// Override oversized value action
+    pub fn with_overflow(mut self, overflow: InlineValueOverflow) -> Self {
+        self.overflow = overflow;
+        self
+    }
+
+    pub fn overflow(&self) -> InlineValueOverflow {
+        self.overflow
+    }
+
+    /// Return whether value exceeds limit
+    pub fn value_oversize(&self, p: &ToastPointer) -> bool {
+        pointer_footprint(p) > self.inline_value_max
     }
 
     pub fn budget(&self) -> Option<&crate::budget::MemoryBudget> {
@@ -1278,6 +1308,13 @@ impl ToastResolver {
     pub fn note_filled_default(&self) {
         self.stats
             .toast_values_filled_default
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count oversized value replacement
+    pub fn note_filled_oversize(&self) {
+        self.stats
+            .toast_values_filled_oversize
             .fetch_add(1, Ordering::Relaxed);
     }
 
