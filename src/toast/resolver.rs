@@ -38,10 +38,9 @@ pub const CHUNK_PUT_BYTES: usize = 64 << 20;
 /// Fetch result rows per block: bounds one block's buffer to ~2 MiB at
 /// `TOAST_MAX_CHUNK_SIZE`, ordering validated across block boundaries
 const FETCH_BLOCK_ROWS: usize = 1024;
-/// Value id ceiling per fetch query: wider `IN` lists save round trips but
-/// blunt the `chunk_id` skip index. A batch splits at the pool's width
-/// first, so narrow batches still reach every connection
-const FETCH_BATCH_VALUES: usize = 128;
+const FETCH_QUERY_IDS: usize = 1024;
+
+const CHUNK_ID_INDEX_FP: f64 = 0.000001;
 /// PG `VARHDRSZ`, 4-byte varlena header
 const VARHDRSZ: i32 = 4;
 
@@ -620,7 +619,8 @@ impl ClickHouseChunkStore {
             "CREATE TABLE IF NOT EXISTS {} (\n  \
              `blkno` UInt32,\n  `offnum` UInt16,\n  `chunk_id` UInt32,\n  `chunk_seq` UInt32,\n  \
              `chunk_data` String,\n  `_lsn` UInt64,\n  `_is_deleted` UInt8,\n  \
-             INDEX `idx_chunk_id` `chunk_id` TYPE bloom_filter GRANULARITY 1\n\
+             INDEX `idx_chunk_id` `chunk_id` \
+             TYPE bloom_filter({CHUNK_ID_INDEX_FP}) GRANULARITY 1\n\
              ) ENGINE = ReplacingMergeTree(`_lsn`, `_is_deleted`)\nORDER BY (`blkno`, `offnum`)",
             self.toast_table(toast_relid)
         )
@@ -947,17 +947,14 @@ impl ChunkStore for ClickHouseChunkStore {
         // Ascending: a split's ids stay adjacent in the mirror's granules
         ids.sort_unstable();
         let mut assembled: HashMap<u32, ChunkAssembler> = HashMap::with_capacity(ids.len());
-        // Spread a batch over the pool before widening any one query: a
-        // batch narrower than the pool would leave connections idle
-        let width = ids
-            .len()
-            .div_ceil(self.states.len())
-            .clamp(1, FETCH_BATCH_VALUES);
+        let queries = ids.len().div_ceil(FETCH_QUERY_IDS).max(1);
+        let width = ids.len().div_ceil(queries);
+        let concurrency = queries.min(self.states.len());
         let split: Vec<_> = ids
             .chunks(width)
             .map(|ids| self.fetch_batch(toast_relid, ids, max_lsn, &expected))
             .collect();
-        let mut batches = futures::stream::iter(split).buffer_unordered(self.states.len());
+        let mut batches = futures::stream::iter(split).buffer_unordered(concurrency);
         while let Some(batch) = batches.next().await {
             assembled.extend(batch?);
         }
@@ -1117,9 +1114,8 @@ impl ToastResolver {
         Ok(Some(v.into_iter().next().unwrap_or(FetchedValue::Missing)))
     }
 
-    /// One store round trip per [`FETCH_BATCH_VALUES`] slice of `values`,
-    /// results aligned with it; `None` without store. Value ids must be
-    /// unique
+    /// Fetch `values` from the store, results aligned with it; `None` without
+    /// store. Value ids must be unique
     pub async fn fetch_values(
         &self,
         toast_relid: u32,
@@ -1871,6 +1867,22 @@ mod tests {
     }
 
     #[test]
+    fn chunk_id_index_stays_selective_at_the_widths_reads_use() {
+        let effective = |fp: f64, n: i32| 1.0 - (1.0 - fp).powi(n);
+
+        assert!(effective(0.025, FETCH_QUERY_IDS as i32) > 0.9);
+        assert!((effective(0.025, 33) - 0.566).abs() < 0.01);
+
+        for n in [1, 8, 33, FETCH_QUERY_IDS as i32] {
+            let e = effective(CHUNK_ID_INDEX_FP, n);
+            assert!(
+                e < 0.15,
+                "fp {CHUNK_ID_INDEX_FP} admits {e:.3} of granules at {n} ids",
+            );
+        }
+    }
+
+    #[test]
     fn ch_store_renders_toast_schema_and_sql() {
         let cfg = EmitterConfig {
             database: "wh".into(),
@@ -1885,7 +1897,8 @@ mod tests {
             "CREATE TABLE IF NOT EXISTS `wh`.`pg_toast_16500` (\n  \
              `blkno` UInt32,\n  `offnum` UInt16,\n  `chunk_id` UInt32,\n  `chunk_seq` UInt32,\n  \
              `chunk_data` String,\n  `_lsn` UInt64,\n  `_is_deleted` UInt8,\n  \
-             INDEX `idx_chunk_id` `chunk_id` TYPE bloom_filter GRANULARITY 1\n\
+             INDEX `idx_chunk_id` `chunk_id` \
+             TYPE bloom_filter(0.000001) GRANULARITY 1\n\
              ) ENGINE = ReplacingMergeTree(`_lsn`, `_is_deleted`)\nORDER BY (`blkno`, `offnum`)"
         );
 
