@@ -44,6 +44,9 @@ pub async fn filter_landed_wal(
     timeline: u32,
     end_lsn: u64,
     tracker: CatalogTracker,
+    // Start with staged relations, then add relations created during recovery
+    // `None` keeps only catalog WAL
+    shadow_rels: Option<(ahash::HashSet<(u32, u32)>, u64)>,
 ) -> Result<LandedWalStats> {
     let segments = segments_on_disk(pg_wal, timeline).await?;
     let in_window = segments
@@ -57,6 +60,9 @@ pub async fn filter_landed_wal(
     let mut stream = WalStream::new(timeline, WAL_SEG_SIZE, first.start_lsn(WAL_SEG_SIZE))
         .map_err(|e| anyhow::anyhow!("wal_landing: WalStream: {e}"))?;
     *stream.filter_mut().tracker_mut() = tracker;
+    if let Some((rels, redo_lsn)) = shadow_rels {
+        stream.filter_mut().keep_user_rels(rels, redo_lsn);
+    }
 
     let mut records = DropRecords;
     let mut writer = WriteBack {
@@ -215,6 +221,38 @@ impl SegmentSink for WriteBack {
     }
 }
 
+/// Copy the in-window segments out of `pg_wal` into `dir`.
+///
+/// Backup WAL processing needs original bytes, while [`filter_landed_wal`]
+/// rewrites `pg_wal` before shadow recovery. Read original segments from copy.
+pub async fn copy_window_segments(
+    pg_wal: &Path,
+    dir: &Path,
+    timeline: u32,
+    from_lsn: u64,
+    end_lsn: u64,
+) -> Result<u64> {
+    tokio::fs::create_dir_all(dir)
+        .await
+        .with_context(|| format!("create {}", dir.display()))?;
+    let mut copied = 0u64;
+    for seg in segments_on_disk(pg_wal, timeline).await? {
+        if seg.start_lsn(WAL_SEG_SIZE) >= end_lsn {
+            break;
+        }
+        // Start copy at segment containing replay floor
+        if seg.start_lsn(WAL_SEG_SIZE) + WAL_SEG_SIZE <= from_lsn {
+            continue;
+        }
+        let name = seg.format();
+        tokio::fs::copy(pg_wal.join(&name), dir.join(&name))
+            .await
+            .with_context(|| format!("copy WAL segment {name}"))?;
+        copied += 1;
+    }
+    Ok(copied)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -282,6 +320,7 @@ mod tests {
             1,
             WAL_SEG_SIZE,
             CatalogTracker::new(),
+            None,
         )
         .await
         .unwrap();

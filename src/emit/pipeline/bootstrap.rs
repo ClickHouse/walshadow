@@ -202,7 +202,8 @@ pub async fn drain(
             let mut tuple = tuple;
             let mut permit = None;
             if tuple.has_mapped_external(&route.mapping) {
-                if resolver.stores_chunks() {
+                // Defer until page walk has populated or started backing store
+                if !resolver.fill_on_miss() {
                     let spool = deferred.as_mut().ok_or_else(|| {
                         format!("bootstrap: undeferrable external value in {}", rel.rel_name)
                     })?;
@@ -667,8 +668,16 @@ fn apply_fetched(
             resolver.note_filled_default();
             Ok((ColumnValue::Null, 0))
         }
-        // No superseding version can precede deferred resolution: the
-        // walk put these chunks moments earlier, a miss is a bug
+        // Interpret miss according to store ownership.
+        //
+        // Walk-seeded store must contain chunks written during this pass.
+        //
+        // Read-only store contains state at end of backup. Missing value was
+        // removed after copied row and is superseded by later row version.
+        Some(_) if !resolver.stores_chunks() => {
+            resolver.note_filled_superseded();
+            Ok((ColumnValue::Null, 0))
+        }
         Some(outcome) => {
             resolver.note_fetch_miss();
             let extsize = pointer_extsize(p);
@@ -772,6 +781,87 @@ mod tests {
     }
 
     use super::*;
+
+    /// Distinguish missing data in walk-seeded store from superseded value in
+    /// read-only end-of-backup store
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_miss_is_fatal_for_a_seeded_mirror_and_superseded_for_a_read_only_store() {
+        use crate::toast::{ChunkStore, ChunkStoreError, MemChunkStore, ToastRow};
+
+        struct ReadOnly;
+
+        #[async_trait::async_trait]
+        impl ChunkStore for ReadOnly {
+            fn accepts_writes(&self) -> bool {
+                false
+            }
+            async fn put(&self, _: &[ToastRow]) -> Result<(), ChunkStoreError> {
+                Err(ChunkStoreError::ReadOnly("put"))
+            }
+            async fn fetch_many(
+                &self,
+                _: u32,
+                values: &[(u32, usize)],
+                _: u64,
+            ) -> Result<Vec<FetchedValue>, ChunkStoreError> {
+                // Incomplete value is absent from end-of-backup state
+                Ok(vec![FetchedValue::Mismatch { got: 7984 }; values.len()])
+            }
+            async fn truncate_mirror(&self, _: u32) -> Result<(), ChunkStoreError> {
+                Err(ChunkStoreError::ReadOnly("truncate_mirror"))
+            }
+            async fn rewrite_barrier(&self, _: u32, _: u64, _: u64) -> Result<(), ChunkStoreError> {
+                Err(ChunkStoreError::ReadOnly("rewrite_barrier"))
+            }
+        }
+
+        let ptr = crate::decode::heap_decoder::ToastPointer {
+            va_rawsize: 9104,
+            va_extinfo: 9100,
+            va_valueid: 16402,
+            va_toastrelid: 16390,
+        };
+        let rel = crate::backfill::backup_page_walk::toast_chunk_rel();
+        let short = Some(FetchedValue::Mismatch { got: 7984 });
+
+        // Walk-seeded store must contain chunks just written
+        let seeded = ToastResolver::with_store(
+            Arc::new(MemChunkStore::new()),
+            Arc::new(EmitterStats::default()),
+        );
+        assert!(seeded.stores_chunks());
+        let err = apply_fetched(short.clone(), &ptr, 25, &rel, "body", &seeded)
+            .expect_err("a seeded mirror losing its own chunk must stop the load");
+        assert!(
+            err.contains("chunks sum to 7984 bytes, pointer says 9100"),
+            "{err}"
+        );
+        assert_eq!(
+            seeded
+                .stats_handle()
+                .toast_fetch_miss
+                .load(Ordering::Relaxed),
+            1
+        );
+
+        // Missing read-only value is superseded at end-of-backup state
+        let stats = Arc::new(EmitterStats::default());
+        let read_only = ToastResolver::with_store(Arc::new(ReadOnly), stats.clone());
+        assert!(!read_only.stores_chunks() && !read_only.fill_on_miss());
+        let (column, retained) = apply_fetched(short, &ptr, 25, &rel, "body", &read_only)
+            .expect("a read-only backend fills instead of failing the load");
+        assert_eq!(column, ColumnValue::Null);
+        assert_eq!(retained, 0);
+        assert_eq!(
+            stats.toast_values_filled_superseded.load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            stats.toast_fetch_miss.load(Ordering::Relaxed),
+            0,
+            "not counted as a miss: it is the expected answer, not a fault",
+        );
+    }
     use crate::backfill::spool::DEFERRED_SPOOL_MEM_MAX;
     use crate::mapping::{ColumnMapping, TableMapping, TableTarget};
 

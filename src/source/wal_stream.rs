@@ -305,7 +305,7 @@ impl WalStream {
             }
             let route = verdict.route;
             let kind = match route {
-                Route::ToShadow => Kind::Kept,
+                Route::ToShadow | Route::ToBoth => Kind::Kept,
                 Route::ToDecoder => Kind::Dropped,
             };
             if route == Route::ToDecoder {

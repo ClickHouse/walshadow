@@ -178,6 +178,7 @@ Tune chunk-store buffering independently of inserter count, restart daemon to ap
 
 | `[toast]` setting | Default | Effect |
 |---|---:|---|
+| `mode` | `clickhouse` | Choose `clickhouse`, `shadow`, or `disabled` storage for external values |
 | `put_batch_rows` | 65,536 | Seal chunk INSERT after this many rows |
 | `put_batch_bytes` | 67,108,864 | Seal chunk INSERT after this many body bytes |
 | `connections` | `ch.inserter_pool_size` | Limit concurrent chunk-store connections |
@@ -196,8 +197,42 @@ put_batch_rows = 256
 put_batch_bytes = 4194304
 ```
 
-All three settings require positive integers. Existing `[bootstrap] lanes`
-and `[ch] inserter_pool_size` controls remain independent
+The three buffering settings require positive integers. Existing
+`[bootstrap] lanes` and `[ch] inserter_pool_size` controls remain independent
+
+### Value mode
+
+`mode = "clickhouse"` stores large values in ClickHouse. This is default and
+keeps value history outside shadow PostgreSQL
+
+`mode = "disabled"` keeps no value store and writes no chunks. A value can
+still be restored when its chunks appear in the same transaction's WAL.
+Otherwise, it becomes NULL, or the column type's default when target is not
+Nullable, and increments `toast_values_filled_default`. Bootstrap skips TOAST
+relations, so existing external values load as NULL. Use this when ClickHouse
+does not need large values and their storage cost is not justified
+
+`mode = "shadow"` stores large values in shadow PostgreSQL instead of
+ClickHouse. Choose it only when limits below are acceptable
+
+**Costs and constraints:**
+
+- Shadow stores TOAST heaps and indexes while it runs. For a TOAST-heavy
+  database, these files may account for most database storage. User heaps
+  present at bootstrap stream without being copied to disk
+- Shadow also stores every relation created after bootstrap, including plain
+  heaps. This increases shadow disk use and replay work
+- Shadow can remove a value before ClickHouse writes its row during heavy lag,
+  table maintenance, truncate, drop, or restart. Affected destination value
+  becomes NULL, or column default when destination column is not Nullable
+- Buffering settings above have no effect because this mode writes no chunks
+- Changing mode requires a fresh bootstrap
+- Only default tablespace is supported. Bootstrap refuses a mapped table whose
+  large-value storage uses another tablespace. Moving or creating such a table
+  after bootstrap is not supported
+
+See [current limitations](limitations.md#shadow-value-mode) before enabling
+this mode
 
 ## Backup archive
 

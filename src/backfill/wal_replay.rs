@@ -179,14 +179,13 @@ impl WalReplaySink {
         Ok(self.stats())
     }
 
-    /// Mirror every chunk tuple a restored TOAST page image carries, not
-    /// only the one its record names. The image is a page copy, not
-    /// transactional evidence, so it bypasses the xact stash: neighbours
-    /// belong to other writers and an abort must not withdraw them
+    /// Mirror all chunks from restored TOAST page image. Bypass transaction
+    /// stash because neighboring tuples may belong to other transactions.
     ///
-    /// Repairs a backup page the walk read mid-write. Any page a backup
-    /// modifies is written before its first change in the window, so the
-    /// image carries what the torn copy lost
+    /// Repair backup pages copied during concurrent writes.
+    ///
+    /// Process Heap images and XLOG_FPI_FOR_HINT images. Deletes of pre-backup
+    /// chunks may have only latter image.
     async fn harvest_toast_images(
         &mut self,
         record: &Record<'_>,
@@ -474,6 +473,10 @@ impl RecordSink for WalReplaySink {
     ) -> Pin<Box<dyn Future<Output = std::result::Result<(), SinkError>> + Send + 'a>> {
         Box::pin(async move {
             let rm = record.parsed.header.resource_manager_id;
+            // Capture TOAST page images from Heap and XLOG resource managers
+            if crate::filter::classify::is_page_image(&record.parsed) {
+                self.harvest_toast_images(record).await?;
+            }
             if rm == RmId::Heap as u8 || rm == RmId::Heap2 as u8 {
                 if let Some(rel) = record.parsed.blocks.first().map(|b| b.header.location.rel) {
                     if self.filter_rfns.contains(&(rel.db_node, rel.rel_node)) {

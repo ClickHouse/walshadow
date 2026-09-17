@@ -275,12 +275,38 @@ pub struct BootstrapSettings {
     pub lanes: Option<NonZeroUsize>,
 }
 
+/// Where external TOAST values live.
+///
+/// `Clickhouse` mirrors every chunk into a per-relation `ReplacingMergeTree`
+/// keyed by physical tuple location. `Shadow` reads PostgreSQL TOAST heaps and
+/// writes no chunks. `Disabled` keeps no store. Values can still be restored
+/// from chunks in the same transaction's WAL. Other values become NULL, or
+/// target type's default when not Nullable, and increment
+/// `toast_values_filled_default`. Switching mode requires fresh bootstrap
+/// because each mode stores different history. See `plans/shadow_toast.md`
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToastMode {
+    #[default]
+    Clickhouse,
+    Shadow,
+    Disabled,
+}
+
+impl ToastMode {
+    pub fn is_shadow(self) -> bool {
+        matches!(self, ToastMode::Shadow)
+    }
+}
+
 /// `[toast]` chunk-store controls, applied at startup
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
 pub struct ToastSettings {
     pub put_batch_rows: Option<NonZeroUsize>,
     pub put_batch_bytes: Option<NonZeroUsize>,
     pub connections: Option<NonZeroUsize>,
+    #[serde(default)]
+    pub mode: ToastMode,
 }
 
 pub(crate) const DEFAULT_RESIDENT_PAYLOAD_MAX: usize = 512 << 20;
