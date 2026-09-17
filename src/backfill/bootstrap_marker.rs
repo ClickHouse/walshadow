@@ -11,11 +11,70 @@ pub const MARKER_FILENAME: &str = "walshadow_bootstrap.incomplete";
 
 pub const MAX_ATTEMPTS: u32 = 3;
 
+pub const EXTRACTED_FILENAME: &str = "walshadow_bootstrap.extracted";
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BootstrapMarker {
     pub attempts: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backup_name: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ExtractedCheckpoint {
+    pub backup_name: String,
+    pub start_lsn: u64,
+    pub end_lsn: u64,
+    pub timeline: u32,
+    #[serde(default)]
+    pub deferred_spools: Vec<SpooledRecords>,
+    #[serde(default)]
+    pub handback_spools: Vec<SpooledRecords>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SpooledRecords {
+    pub path: PathBuf,
+    pub records: u64,
+}
+
+impl SpooledRecords {
+    pub fn expected(spools: &[Self], path: &Path) -> Option<u64> {
+        spools.iter().find(|s| s.path == path).map(|s| s.records)
+    }
+}
+
+impl ExtractedCheckpoint {
+    pub fn read(dir: &Path) -> Result<Option<Self>> {
+        let path = dir.join(EXTRACTED_FILENAME);
+        let raw = match std::fs::read_to_string(&path) {
+            Ok(raw) => raw,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
+        };
+        toml::from_str(&raw)
+            .map(Some)
+            .with_context(|| format!("parse {}", path.display()))
+    }
+
+    pub async fn write(&self, dir: &Path) -> Result<()> {
+        let body = toml::to_string(self).context("render extracted checkpoint")?;
+        crate::fs::write_atomic(dir, EXTRACTED_FILENAME, body.as_bytes())
+            .await
+            .context("persist extracted checkpoint")
+    }
+
+    pub async fn clear(dir: &Path) -> Result<()> {
+        match tokio::fs::remove_file(dir.join(EXTRACTED_FILENAME)).await {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e).context("clear extracted checkpoint"),
+        }
+    }
+
+    pub fn matches(&self, backup_name: &str) -> bool {
+        self.backup_name == backup_name
+    }
 }
 
 impl BootstrapMarker {
@@ -67,6 +126,10 @@ impl BootstrapMarker {
             .as_deref()
             .filter(|name| name.starts_with(walrus::pg::backup::BACKUP_NAME_PREFIX))
             .context("bootstrap incomplete without a resolved backup pin; use operator recovery")
+    }
+
+    pub fn pinned_backup_name(&self) -> Result<&str> {
+        self.pinned_backup()
     }
 
     fn check_retry(&self) -> Result<()> {
@@ -134,6 +197,19 @@ pub async fn begin_attempt(
     // Land the next attempt before deleting anything: an interrupted or
     // failed cleanup must still leave a marker naming the pinned backup
     marker.write(data_dir).await?;
+    if let Some(done) = resumable_extraction(data_dir, marker.backup_name.as_deref())? {
+        tracing::warn!(
+            target: "walshadow::bootstrap",
+            data_dir = %data_dir.display(),
+            attempt = marker.attempts,
+            max_attempts = MAX_ATTEMPTS,
+            backup_name = done.backup_name,
+            end_lsn = done.end_lsn,
+            deferred_spools = done.deferred_spools.len(),
+            "resuming an incomplete bootstrap past extraction",
+        );
+        return Ok(marker);
+    }
     tracing::warn!(
         target: "walshadow::bootstrap",
         data_dir = %data_dir.display(),
@@ -144,6 +220,30 @@ pub async fn begin_attempt(
     );
     discard_partial(data_dir).await?;
     Ok(marker)
+}
+
+pub fn resumable_extraction(
+    data_dir: &Path,
+    pinned: Option<&str>,
+) -> Result<Option<ExtractedCheckpoint>> {
+    let Some(done) = ExtractedCheckpoint::read(data_dir)? else {
+        return Ok(None);
+    };
+    let Some(pinned) = pinned else {
+        return Ok(None);
+    };
+    if !done.matches(pinned) {
+        return Ok(None);
+    }
+    if done
+        .deferred_spools
+        .iter()
+        .chain(&done.handback_spools)
+        .any(|s| !s.path.exists())
+    {
+        return Ok(None);
+    }
+    Ok(Some(done))
 }
 
 /// Never clear partial or initialized standby state automatically: an empty

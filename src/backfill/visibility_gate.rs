@@ -15,6 +15,7 @@ use tokio::sync::mpsc;
 use tokio_util::task::AbortOnDropHandle;
 
 use crate::backfill::backup_page_walk::{BOOTSTRAP_TUPLE_CHANNEL_CAP, BackfillTuple, CatalogMap};
+use crate::backfill::bootstrap_marker::SpooledRecords;
 use crate::backfill::spool::{DEFERRED_SPOOL_MEM_MAX, DeferredSpool};
 use crate::backfill::visibility_pending::{PendingManifest, PendingSpool};
 use crate::config::ResolvedConfig;
@@ -215,6 +216,7 @@ pub struct GreenfieldSink {
     pub skip_initial: HashSet<RelName>,
     /// Holds each lane's deferred-referrer spool
     pub scratch_dir: PathBuf,
+    pub inherit_spools: Vec<SpooledRecords>,
 }
 
 pub struct DrainLanes {
@@ -230,14 +232,18 @@ impl GreenfieldSink {
         &self,
         tails: Vec<(mpsc::Sender<BatcherMsg>, AckHandle)>,
         tag: &str,
-    ) -> (Vec<mpsc::Sender<Vec<BackfillTuple>>>, DrainLanes) {
+    ) -> Result<(Vec<mpsc::Sender<Vec<BackfillTuple>>>, DrainLanes), String> {
         let mut senders = Vec::with_capacity(tails.len());
         let mut lanes = Vec::with_capacity(tails.len());
         for (i, (msg_tx, ack)) in tails.into_iter().enumerate() {
             let (tx, rx) = mpsc::channel(BOOTSTRAP_TUPLE_CHANNEL_CAP);
-            // Stale files from a crashed pass block create_new
+            // Stale files from a crashed pass block create_new; a resumed
+            // attempt inherits the spool its extraction checkpoint fsynced
             let spool = self.scratch_dir.join(format!("{tag}_deferred.{i}.bin"));
-            tokio::fs::remove_file(&spool).await.ok();
+            let inherit = SpooledRecords::expected(&self.inherit_spools, &spool);
+            if inherit.is_none() {
+                tokio::fs::remove_file(&spool).await.ok();
+            }
             lanes.push(bootstrap::drain(
                 rx,
                 self.catalog.clone(),
@@ -247,14 +253,19 @@ impl GreenfieldSink {
                 self.stats.clone(),
                 self.resolver.clone(),
                 // A referrer can want chunks a sibling lane is still putting
-                bootstrap::Deferral::Handback(DeferredSpool::new(spool, DEFERRED_SPOOL_MEM_MAX)),
+                bootstrap::Deferral::Handback(match inherit {
+                    Some(records) => DeferredSpool::reopen(spool, DEFERRED_SPOOL_MEM_MAX, records)
+                        .await
+                        .map_err(|e| format!("bootstrap: reopen handback spool: {e}"))?,
+                    None => DeferredSpool::new(spool, DEFERRED_SPOOL_MEM_MAX),
+                }),
                 self.emitter.row_policy(),
                 Some(self.config.clone()),
                 self.skip_initial.clone(),
             ));
             senders.push(tx);
         }
-        (senders, DrainLanes::spawn_all("drain", lanes))
+        Ok((senders, DrainLanes::spawn_all("drain", lanes)))
     }
 
     /// Render referrers the lanes handed back, each on the tail that
@@ -390,7 +401,8 @@ pub async fn resolve_greenfield(
     // Replays what the walk deferred, not the bulk load: one lane is enough
     let (txs, stages) = sink
         .spawn(vec![(tail.msg_tx.clone(), tail.ack.clone())], "gate_drain")
-        .await;
+        .await
+        .map_err(anyhow::Error::msg)?;
     let mut resolved = Ok(());
     for spool in deferred {
         if spool.records() == 0 {
@@ -516,6 +528,7 @@ mod tests {
             resolver: ToastResolver::disabled(),
             skip_initial: HashSet::new(),
             scratch_dir: tmp.path().to_path_buf(),
+            inherit_spools: Vec::new(),
         };
         let (ack, ack_task) = crate::emit::pipeline::ack::spawn(Arc::new(Default::default()));
         let (msg_tx, _msg_rx) = mpsc::channel(1);
@@ -524,7 +537,8 @@ mod tests {
                 vec![(msg_tx.clone(), ack.clone()), (msg_tx, ack.clone())],
                 "lane-test",
             )
-            .await;
+            .await
+            .expect("lanes spawn");
         let first = txs.remove(0);
         first
             .send(vec![tuple(100, 0, HEAP_XMIN_COMMITTED)])
@@ -577,6 +591,7 @@ mod tests {
             resolver: ToastResolver::disabled(),
             skip_initial: HashSet::new(),
             scratch_dir: tmp.path().to_path_buf(),
+            inherit_spools: Vec::new(),
         };
 
         let row = |id| BackfillTuple {
@@ -922,6 +937,7 @@ mod tests {
                 stats: Arc::new(EmitterStats::default()),
                 resolver: ToastResolver::disabled(),
                 skip_initial: HashSet::new(),
+                inherit_spools: Vec::new(),
                 scratch_dir: std::env::temp_dir(),
             },
             oracle: None,

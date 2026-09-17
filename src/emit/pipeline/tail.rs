@@ -62,27 +62,7 @@ impl TailParts {
         through: u64,
         fatal: &Fatal,
     ) -> Result<(), String> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        if msg_tx.send(BatcherMsg::FlushAll(reply_tx)).await.is_err() {
-            return Err(fatal
-                .message()
-                .unwrap_or_else(|| "tail closed before flush".into()));
-        }
-        // Prefer concurrent fatal over successful completion
-        tokio::select! {
-            biased;
-            _ = fatal.wait() => {
-                return Err(fatal.message().unwrap_or_else(|| "tail fatal during flush".into()));
-            }
-            r = reply_rx => r.map_err(|_| "batcher dropped flush ack".to_string())?,
-        }
-        tokio::select! {
-            biased;
-            _ = fatal.wait() => {
-                return Err(fatal.message().unwrap_or_else(|| "tail fatal during drain".into()));
-            }
-            r = ack.wait_through(through) => r.map_err(|e| format!("tail drain: {e}"))?,
-        }
+        flush_and_prove(&msg_tx, &ack, through, fatal).await?;
         drop(msg_tx);
         drop(ack);
         self.join().await;
@@ -91,6 +71,36 @@ impl TailParts {
         }
         Ok(())
     }
+}
+
+async fn flush_and_prove(
+    msg_tx: &mpsc::Sender<BatcherMsg>,
+    ack: &AckHandle,
+    through: u64,
+    fatal: &Fatal,
+) -> Result<(), String> {
+    let (reply_tx, reply_rx) = oneshot::channel();
+    if msg_tx.send(BatcherMsg::FlushAll(reply_tx)).await.is_err() {
+        return Err(fatal
+            .message()
+            .unwrap_or_else(|| "tail closed before flush".into()));
+    }
+    // Prefer concurrent fatal over successful completion
+    tokio::select! {
+        biased;
+        _ = fatal.wait() => {
+            return Err(fatal.message().unwrap_or_else(|| "tail fatal during flush".into()));
+        }
+        r = reply_rx => r.map_err(|_| "batcher dropped flush ack".to_string())?,
+    }
+    tokio::select! {
+        biased;
+        _ = fatal.wait() => {
+            return Err(fatal.message().unwrap_or_else(|| "tail fatal during drain".into()));
+        }
+        r = ack.wait_through(through) => r.map_err(|e| format!("tail drain: {e}"))?,
+    }
+    Ok(())
 }
 
 /// Tail plus the producer handles a single bootstrap leg holds
@@ -134,6 +144,12 @@ impl OwnedTail {
             fatal,
             context,
         })
+    }
+
+    pub async fn checkpoint(&self, through: u64) -> Result<(), String> {
+        flush_and_prove(&self.msg_tx, &self.ack, through, &self.fatal)
+            .await
+            .map_err(|m| format!("{}: {m}", self.context))
     }
 
     /// Seal batches and prove every seq below `through` durable
