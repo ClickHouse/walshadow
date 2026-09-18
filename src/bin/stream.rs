@@ -1258,6 +1258,11 @@ async fn run_session(
         .collect();
 
     let mut stream = WalStream::new(start_timeline, WAL_SEG_SIZE, aligned)?;
+    let mut prefix_dirs = vec![args.out_dir.clone()];
+    if let Some(dir) = shadow_start.data_dir() {
+        prefix_dirs.push(dir.join("pg_wal"));
+    }
+    stream.preserve_resume_prefix(&prefix_dirs).await?;
     // Shadow must attach to this listener before catalog replay can advance
     let mut shadow_boot = walshadow::shadow_stream::ShadowStreamState::new(
         history.shadow_boot_branch(stored_timeline, aligned.get(), start_timeline),
