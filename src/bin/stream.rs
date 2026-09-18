@@ -2317,7 +2317,11 @@ async fn run_session(
         // segment; the natural terms must not undo the position a restart
         // resumes from. A rewind (`--start-lsn`, `--ignore-cursor`) lowers it by
         // seeding `resume_floor` at the rewind point instead
-        let floor = manifest::resolved_floor(resume_safe_lsn, durable).max(resume_floor.get());
+        let releasable = match shadow_replay.get() {
+            s if shadow_toast && s != 0 => resume_safe_lsn.get().min(s).into(),
+            _ => resume_safe_lsn,
+        };
+        let floor = manifest::resolved_floor(releasable, durable).max(resume_floor.get());
         let floor_timeline = history.floor_branch(
             floor.get(),
             live_identity.timeline,
