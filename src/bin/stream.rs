@@ -2081,8 +2081,68 @@ async fn run_session(
         );
     }
 
+    let archive_rate = Mutex::new(RateEstimator::default());
+    let archive_metrics = async |stream: &WalStream, sink: &DaemonSinks| {
+        let (xact_stats, drain_resident) = {
+            let b = xact_buffer.lock().await;
+            (b.stats().clone(), DrainResident::from_buffer(&b))
+        };
+        let shadow = shadow_state.lock().await.aggregate();
+        let mut base = metrics.snapshot().await;
+        base.source_received_lsn = Pos::new(stream.next_lsn().get());
+        base.filter_lsn = Pos::new(stream.dispatched_lsn());
+        base.shadow_replay_lsn = shadow_replay_lsn.get();
+        base.decoder_commit_lsn = xact_stats.drain_lsn;
+        base.emitter_ack_lsn = emitter_ack.get();
+        base.floor_lsn = resume_floor.get();
+        base.shadow_apply_lag_bytes = stream
+            .next_lsn()
+            .get()
+            .saturating_sub(shadow.min_apply_lsn.map_or(0, Pos::get));
+        let mut rate = archive_rate.lock().await;
+        rate.observe(Instant::now(), stream.next_lsn().get());
+        base.shadow_apply_lag_seconds = rate.seconds_for(base.shadow_apply_lag_bytes);
+        drop(rate);
+        base.shadow_stream_active_connections = shadow.active_connections as u64;
+        base.shadow_stream_dropped_connections_total = shadow.dropped_total;
+        base.shadow_replay_timeline = shadow.replay_timeline.unwrap_or(0);
+        populate_pipeline_metrics(
+            &metrics,
+            base,
+            PipelineMetrics {
+                rec_metrics: &sink.metrics,
+                pump_queue_depth: sink.decoder_xact.in_flight(),
+                queue_records_out_total: sink.decoder_xact.processed(),
+                xact_stats: &xact_stats,
+                drain_resident,
+                budget: Some(&pipeline_handle.budget),
+                decoder_stats: &sink.decoder_stats,
+                boundary_hold: &boundary_hold_stats,
+                capture: &capture_stats,
+                desc_log: &desc_log,
+                config_resolver: metrics_resolver.as_deref(),
+                backfiller: metrics_backfiller.as_deref(),
+                counters: StageCounters {
+                    emitter: sink.emitter_stats.as_deref(),
+                    oracle: [
+                        oracle.as_ref().map(|o| o.stats.as_ref()),
+                        bootstrap_metrics.as_ref().map(|b| &*b.oracle),
+                    ],
+                    bridge: [
+                        Some(bridge.stats.as_ref()),
+                        bootstrap_metrics.as_ref().map(|b| &*b.bridge),
+                    ],
+                    bootstrap: bootstrap_metrics.as_ref().map(|b| &b.progress),
+                    bootstrap_attempt: 0,
+                    uptime_secs: start_instant.elapsed().as_secs(),
+                },
+            },
+        )
+        .await;
+    };
     let source_recovery = SourceRecovery {
         status_interval: Duration::from_secs(args.status_interval),
+        publish_pipeline: archive_metrics,
         backup: backup_settings.as_ref(),
         spill_dir: &args.spill_dir,
         floor: &resume_floor,
@@ -2744,14 +2804,7 @@ async fn run_session(
             let b = xact_buffer.lock().await;
             let stats = b.stats().clone();
             let line = stats.summary();
-            let resident = DrainResident {
-                total: b.drain_resident_bytes(),
-                chunks: b.drain_chunk_resident_bytes(),
-                rows: b.drain_row_resident_bytes(),
-                spool: b.toast_spool_bytes(),
-                raw_pending_rows: b.raw_pending_rows(),
-                raw_pending_bytes: b.raw_pending_bytes(),
-            };
+            let resident = DrainResident::from_buffer(&b);
             (stats, resident, line)
         };
         let oracle_line = oracle
@@ -3446,6 +3499,19 @@ struct DrainResident {
     raw_pending_bytes: u64,
 }
 
+impl DrainResident {
+    fn from_buffer(b: &XactBuffer) -> Self {
+        Self {
+            total: b.drain_resident_bytes(),
+            chunks: b.drain_chunk_resident_bytes(),
+            rows: b.drain_row_resident_bytes(),
+            spool: b.toast_spool_bytes(),
+            raw_pending_rows: b.raw_pending_rows(),
+            raw_pending_bytes: b.raw_pending_bytes(),
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn populate_metrics(
     registry: &MetricsRegistry,
@@ -3471,6 +3537,101 @@ async fn populate_metrics(
     backfiller: Option<&walshadow::copy_backfill::CopyBackfiller>,
     counters: StageCounters<'_>,
 ) {
+    let base = MetricsSnapshot {
+        source_received_lsn,
+        filter_lsn,
+        shadow_replay_lsn,
+        decoder_commit_lsn,
+        emitter_ack_lsn,
+        source_endpoint_swaps_total: source_swap.swaps,
+        source_endpoint_swap_failures_total: source_swap.failures,
+        source_endpoint_swap_pending: u64::from(source_swap.pending),
+        source_endpoint_swap_blocked_on: source_swap.blocked_on,
+        crossing_blocked_on: timeline_view.wedge.as_ref().map_or("", |w| w.reason),
+        crossing_detail: timeline_view.wedge.map(|w| w.detail).unwrap_or_default(),
+        source_system_id: timeline_view.source_system_id,
+        source_timeline: timeline_view.source_timeline,
+        floor_timeline: timeline_view.floor_timeline,
+        shadow_served_timeline: timeline_view.shadow_served_timeline,
+        shadow_replay_timeline: timeline_view.shadow_replay_timeline,
+        floor_lsn: timeline_view.floor_lsn,
+        timeline_switches_total: timeline_view.stats.switches,
+        timeline_switch_failures_by_reason: timeline_view.stats.failures_by_reason,
+        timeline_switch_lsn: timeline_view.stats.switch_lsn,
+        timeline_prefix_bytes_verified_total: timeline_view.stats.prefix_bytes_verified,
+        timeline_transition_seconds_total: timeline_view.stats.seconds_total,
+        pause_consumed_lsn: timeline_view.pause_frontier.map_or(0, |(c, _)| c),
+        pause_received_lsn: timeline_view.pause_frontier.map_or(0, |(_, r)| r),
+        pause_refrozen: timeline_view.pause_refrozen,
+        promotion_ready: timeline_view.promotion.ready,
+        promotion_blocked_on: timeline_view.promotion.blocked_on,
+        promotion_target_in_recovery: timeline_view.promotion.in_recovery,
+        promotion_target_replay_lsn: timeline_view.promotion.replay_lsn,
+        promotion_target_receive_lsn: timeline_view.promotion.receive_lsn,
+        shadow_apply_lag_bytes: shadow_view.apply_lag_bytes,
+        shadow_apply_lag_seconds: shadow_view.apply_lag_seconds,
+        shadow_stream_active_connections: shadow_view.active_connections,
+        shadow_stream_dropped_connections_total: shadow_view.dropped_total,
+        ..registry.snapshot().await
+    };
+    populate_pipeline_metrics(
+        registry,
+        base,
+        PipelineMetrics {
+            rec_metrics,
+            pump_queue_depth,
+            queue_records_out_total,
+            xact_stats,
+            drain_resident,
+            budget,
+            decoder_stats,
+            boundary_hold,
+            capture,
+            desc_log,
+            config_resolver,
+            backfiller,
+            counters,
+        },
+    )
+    .await;
+}
+
+struct PipelineMetrics<'a> {
+    rec_metrics: &'a MetricsRecordSink,
+    pump_queue_depth: u64,
+    queue_records_out_total: u64,
+    xact_stats: &'a walshadow::xact_buffer::XactBufferStats,
+    drain_resident: DrainResident,
+    budget: Option<&'a walshadow::budget::MemoryBudget>,
+    decoder_stats: &'a walshadow::decoder_sink::DecoderStats,
+    boundary_hold: &'a BoundaryHoldStats,
+    capture: &'a walshadow::catalog_capture::CaptureStats,
+    desc_log: &'a walshadow::desc_log::DescriptorLog,
+    config_resolver: Option<&'a ConfigResolver>,
+    backfiller: Option<&'a walshadow::copy_backfill::CopyBackfiller>,
+    counters: StageCounters<'a>,
+}
+
+async fn populate_pipeline_metrics(
+    registry: &MetricsRegistry,
+    base: MetricsSnapshot,
+    pipeline: PipelineMetrics<'_>,
+) {
+    let PipelineMetrics {
+        rec_metrics,
+        pump_queue_depth,
+        queue_records_out_total,
+        xact_stats,
+        drain_resident,
+        budget,
+        decoder_stats,
+        boundary_hold,
+        capture,
+        desc_log,
+        config_resolver,
+        backfiller,
+        counters,
+    } = pipeline;
     use std::collections::BTreeMap;
     use walshadow::record::rmgr_label;
     let desc_log_gauges = desc_log.gauges();
@@ -3488,11 +3649,6 @@ async fn populate_metrics(
         by_rm.insert(key, *n);
     }
     let snap = MetricsSnapshot {
-        source_received_lsn,
-        filter_lsn,
-        shadow_replay_lsn,
-        decoder_commit_lsn,
-        emitter_ack_lsn,
         records_by_rm_route: by_rm,
         xact_active: xact_stats.xacts_active,
         xact_bytes_in_memory: xact_stats.bytes_in_memory,
@@ -3529,35 +3685,6 @@ async fn populate_metrics(
         raw_pending_bytes: drain_resident.raw_pending_bytes,
         pump_queue_depth,
         queue_records_out_total,
-        source_endpoint_swaps_total: source_swap.swaps,
-        source_endpoint_swap_failures_total: source_swap.failures,
-        source_endpoint_swap_pending: u64::from(source_swap.pending),
-        source_endpoint_swap_blocked_on: source_swap.blocked_on,
-        crossing_blocked_on: timeline_view.wedge.as_ref().map_or("", |w| w.reason),
-        crossing_detail: timeline_view.wedge.map(|w| w.detail).unwrap_or_default(),
-        source_system_id: timeline_view.source_system_id,
-        source_timeline: timeline_view.source_timeline,
-        floor_timeline: timeline_view.floor_timeline,
-        shadow_served_timeline: timeline_view.shadow_served_timeline,
-        shadow_replay_timeline: timeline_view.shadow_replay_timeline,
-        floor_lsn: timeline_view.floor_lsn,
-        timeline_switches_total: timeline_view.stats.switches,
-        timeline_switch_failures_by_reason: timeline_view.stats.failures_by_reason,
-        timeline_switch_lsn: timeline_view.stats.switch_lsn,
-        timeline_prefix_bytes_verified_total: timeline_view.stats.prefix_bytes_verified,
-        timeline_transition_seconds_total: timeline_view.stats.seconds_total,
-        pause_consumed_lsn: timeline_view.pause_frontier.map_or(0, |(c, _)| c),
-        pause_received_lsn: timeline_view.pause_frontier.map_or(0, |(_, r)| r),
-        pause_refrozen: timeline_view.pause_refrozen,
-        promotion_ready: timeline_view.promotion.ready,
-        promotion_blocked_on: timeline_view.promotion.blocked_on,
-        promotion_target_in_recovery: timeline_view.promotion.in_recovery,
-        promotion_target_replay_lsn: timeline_view.promotion.replay_lsn,
-        promotion_target_receive_lsn: timeline_view.promotion.receive_lsn,
-        shadow_apply_lag_bytes: shadow_view.apply_lag_bytes,
-        shadow_apply_lag_seconds: shadow_view.apply_lag_seconds,
-        shadow_stream_active_connections: shadow_view.active_connections,
-        shadow_stream_dropped_connections_total: shadow_view.dropped_total,
         catalog_boundary_holds_total: boundary_hold.holds.load(Ordering::Relaxed),
         catalog_boundary_hold_failures_total: boundary_hold.failures.load(Ordering::Relaxed),
         catalog_boundary_hold_seconds_total: boundary_hold.hold_seconds_total(),
@@ -3601,7 +3728,7 @@ async fn populate_metrics(
         config_replicate_opt_out_total: config_resolver.map(|r| r.opt_out_total()).unwrap_or(0),
         config_backfills_pending: backfiller.map(|b| b.pending_count()).unwrap_or(0),
         config_backfills_pending_by_mode: backfiller.map(|b| b.pending_by_mode()).unwrap_or([0; 3]),
-        ..stage_gauges(&counters)
+        ..stage_gauges_on(&counters, base)
     };
     registry.set(snap).await;
 }
@@ -3631,6 +3758,10 @@ fn emitter_counts<const N: usize>(
 }
 
 fn stage_gauges(v: &StageCounters<'_>) -> MetricsSnapshot {
+    stage_gauges_on(v, MetricsSnapshot::default())
+}
+
+fn stage_gauges_on(v: &StageCounters<'_>, base: MetricsSnapshot) -> MetricsSnapshot {
     let (proc_cpu, proc_rss) = read_process_stats();
     let emitter = |pick: fn(&EmitterStats) -> &AtomicU64| -> u64 {
         v.emitter.map_or(0, |s| pick(s).load(Ordering::Relaxed))
@@ -3777,16 +3908,19 @@ fn stage_gauges(v: &StageCounters<'_>) -> MetricsSnapshot {
         bridge_scan_replay_moved_total: bridge(|b| &b.scan_replay_moved),
         bridge_scan_subtrans_mismatch_total: bridge(|b| &b.scan_subtrans_mismatch),
         bridge_native_bytes_total: bridge(|b| &b.native_bytes),
-        ..bootstrap_gauges(v.bootstrap)
+        ..bootstrap_gauges(v.bootstrap, base)
     }
 }
 
 /// Bootstrap stage attribution, frozen at its final values once the pump
 /// returns. Rendered for the whole session so a slow initial load stays
 /// attributable after the fact
-fn bootstrap_gauges(progress: Option<&BootstrapProgress>) -> MetricsSnapshot {
+fn bootstrap_gauges(
+    progress: Option<&BootstrapProgress>,
+    base: MetricsSnapshot,
+) -> MetricsSnapshot {
     let Some(p) = progress else {
-        return MetricsSnapshot::default();
+        return base;
     };
     let ld = |a: &AtomicU64| a.load(Ordering::Relaxed);
     MetricsSnapshot {
@@ -3800,7 +3934,7 @@ fn bootstrap_gauges(progress: Option<&BootstrapProgress>) -> MetricsSnapshot {
         bootstrap_decode_seconds: ld(&p.page_walk.decode_nanos) as f64 / 1e9,
         bootstrap_tap_seconds: ld(&p.pump.sink_chunk_nanos) as f64 / 1e9,
         bootstrap_channel_block_seconds: ld(&p.page_walk.channel_block_nanos) as f64 / 1e9,
-        ..MetricsSnapshot::default()
+        ..base
     }
 }
 
@@ -4165,7 +4299,8 @@ fn swap_reason(err: &anyhow::Error) -> &'static str {
         .unwrap_or("source")
 }
 
-struct SourceRecovery<'a> {
+struct SourceRecovery<'a, F> {
+    publish_pipeline: F,
     status_interval: Duration,
     backup: Option<&'a walrus::config::Settings>,
     spill_dir: &'a Path,
@@ -4216,7 +4351,7 @@ impl ArchiveLegProgress {
     }
 }
 
-impl SourceRecovery<'_> {
+impl<F: AsyncFn(&WalStream, &DaemonSinks)> SourceRecovery<'_, F> {
     /// Try source, replay archive gap, then return to source. `cfg`, `slot`,
     /// and `branch` are the live endpoint, slot name, and proved branch, passed
     /// per call rather than held, so a recovery that starts after a `[source]`
@@ -4230,7 +4365,7 @@ impl SourceRecovery<'_> {
         slot: Option<&str>,
         branch: SourceBranch,
         stream: &mut WalStream,
-        record_sink: &mut (dyn RecordSink + Send),
+        record_sink: &mut DaemonSinks,
         segment_sink: &mut (dyn walshadow::record::SegmentSink + Send),
     ) -> Result<SourceFeed> {
         let mut resume_lsn = stream.next_lsn();
@@ -4292,7 +4427,7 @@ impl SourceRecovery<'_> {
         };
         let seg_dir = self.spill_dir.join("resume_wal");
         let mut progress = ArchiveLegProgress::new(resume_lsn.get());
-        self.publish_archive_leg(&mut progress, resume_lsn, true)
+        self.publish_archive_leg(&mut progress, stream, record_sink, true)
             .await;
 
         loop {
@@ -4308,7 +4443,7 @@ impl SourceRecovery<'_> {
                 Ok(segment) => segment,
                 Err(archive_error) => {
                     let _ = tokio::fs::remove_dir_all(&seg_dir).await;
-                    self.publish_archive_leg(&mut progress, resume_lsn, false)
+                    self.publish_archive_leg(&mut progress, stream, record_sink, false)
                         .await;
                     tracing::info!(
                         target: "walshadow",
@@ -4343,7 +4478,7 @@ impl SourceRecovery<'_> {
             resume_lsn = stream.next_lsn();
             progress.segments += 1;
             if let Some(mib_per_sec) = progress.report_due(self.status_interval, resume_lsn.get()) {
-                self.publish_archive_leg(&mut progress, resume_lsn, true)
+                self.publish_archive_leg(&mut progress, stream, record_sink, true)
                     .await;
                 tracing::info!(
                     target: "walshadow",
@@ -4361,18 +4496,18 @@ impl SourceRecovery<'_> {
     async fn publish_archive_leg(
         &self,
         progress: &mut ArchiveLegProgress,
-        resume_lsn: Pos<Floor>,
+        stream: &WalStream,
+        record_sink: &DaemonSinks,
         active: bool,
     ) {
+        (self.publish_pipeline)(stream, record_sink).await;
         let fresh_segments = progress.take_unpublished();
-        let lsn = resume_lsn.get();
         let emitter_ack = self.emitter_ack.get();
         let floor = self.floor.get();
         self.metrics
             .update(move |snap| {
                 snap.archive_wal_segments_total += fresh_segments;
                 snap.archive_restore_active = u64::from(active);
-                snap.filter_lsn = Pos::new(lsn);
                 snap.emitter_ack_lsn = emitter_ack;
                 snap.floor_lsn = floor;
             })
@@ -6119,6 +6254,132 @@ mod tests {
         let snap = registry.snapshot().await;
         assert_eq!(snap.emitter_rows_total, 17);
         assert_eq!(snap.archive_restore_active, 1);
+    }
+
+    #[tokio::test]
+    async fn pipeline_metrics_refresh_during_archive_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = walshadow::desc_log::DescriptorLog::open(
+            dir.path(),
+            walshadow::desc_log::DescLogIdentity {
+                pg_major: 18,
+                system_id: "1".into(),
+                timeline: 1,
+                db_oid: 5,
+                wal_seg_size: WAL_SEG_SIZE as u32,
+            },
+        )
+        .await
+        .unwrap();
+        let registry = MetricsRegistry::new();
+        registry
+            .set(MetricsSnapshot {
+                archive_restore_active: 1,
+                archive_wal_segments_total: 42,
+                filter_lsn: Pos::new(2 * WAL_SEG_SIZE),
+                ..MetricsSnapshot::default()
+            })
+            .await;
+        let records = MetricsRecordSink::default();
+        let decoder = walshadow::decoder_sink::DecoderStats::default();
+        let emitter = EmitterStats::default();
+        let boundary = BoundaryHoldStats::default();
+        let capture = walshadow::catalog_capture::CaptureStats::default();
+        for n in [7, 13] {
+            decoder.decoded.store(n, Ordering::Relaxed);
+            emitter.rows_emitted.store(n * 2, Ordering::Relaxed);
+            let xacts = walshadow::xact_buffer::XactBufferStats {
+                xacts_active: n,
+                ..Default::default()
+            };
+            populate_pipeline_metrics(
+                &registry,
+                registry.snapshot().await,
+                PipelineMetrics {
+                    rec_metrics: &records,
+                    pump_queue_depth: n,
+                    queue_records_out_total: n * 3,
+                    xact_stats: &xacts,
+                    drain_resident: DrainResident {
+                        total: n * 10,
+                        chunks: 0,
+                        rows: n * 10,
+                        spool: 0,
+                        raw_pending_rows: n,
+                        raw_pending_bytes: n * 10,
+                    },
+                    budget: None,
+                    decoder_stats: &decoder,
+                    boundary_hold: &boundary,
+                    capture: &capture,
+                    desc_log: &log,
+                    config_resolver: None,
+                    backfiller: None,
+                    counters: StageCounters {
+                        emitter: Some(&emitter),
+                        oracle: [None, None],
+                        bridge: [None, None],
+                        bootstrap: None,
+                        bootstrap_attempt: 0,
+                        uptime_secs: n,
+                    },
+                },
+            )
+            .await;
+            let snap = registry.snapshot().await;
+            assert_eq!(snap.decoder_decoded_total, n);
+            assert_eq!(snap.emitter_rows_total, n * 2);
+            assert_eq!(snap.xact_active, n);
+            assert_eq!(snap.pump_queue_depth, n);
+            assert_eq!(snap.queue_records_out_total, n * 3);
+            assert_eq!(snap.drain_resident_bytes, n * 10);
+            assert_eq!(snap.raw_pending_rows, n);
+            assert_eq!(snap.uptime_seconds, n);
+            assert_eq!(snap.archive_restore_active, 1);
+            assert_eq!(snap.archive_wal_segments_total, 42);
+            assert_eq!(snap.filter_lsn.get(), 2 * WAL_SEG_SIZE);
+        }
+    }
+
+    #[test]
+    fn archive_stage_metrics_refresh_without_resetting_recovery_state() {
+        let emitter = EmitterStats::default();
+        let counters = StageCounters {
+            emitter: Some(&emitter),
+            oracle: [None, None],
+            bridge: [None, None],
+            bootstrap: None,
+            bootstrap_attempt: 0,
+            uptime_secs: 10,
+        };
+        let base = MetricsSnapshot {
+            archive_restore_active: 1,
+            archive_wal_segments_total: 42,
+            source_received_lsn: Pos::new(3 * WAL_SEG_SIZE),
+            filter_lsn: Pos::new(2 * WAL_SEG_SIZE),
+            config_backfills_pending: 21,
+            ..MetricsSnapshot::default()
+        };
+        emitter.rows_emitted.store(17, Ordering::Relaxed);
+        let first = stage_gauges_on(&counters, base);
+        assert_eq!(first.emitter_rows_total, 17);
+        emitter.rows_emitted.store(29, Ordering::Relaxed);
+        emitter.decode_rows_out.store(31, Ordering::Relaxed);
+        let next = stage_gauges_on(
+            &StageCounters {
+                uptime_secs: 20,
+                ..counters
+            },
+            first,
+        );
+        assert_eq!(next.emitter_rows_total, 29);
+        assert_eq!(next.decode_rows_out_total, 31);
+        assert_eq!(next.uptime_seconds, 20);
+        assert_eq!(next.archive_restore_active, 1);
+        assert_eq!(next.archive_wal_segments_total, 42);
+        assert_eq!(next.source_received_lsn.get(), 3 * WAL_SEG_SIZE);
+        assert_eq!(next.filter_lsn.get(), 2 * WAL_SEG_SIZE);
+        assert_eq!(next.config_backfills_pending, 21);
     }
 
     #[test]
