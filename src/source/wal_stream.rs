@@ -93,6 +93,8 @@ pub enum WalStreamError {
     UnalignedBase(u64),
     #[error("sink: {0}")]
     Sink(#[from] SinkError),
+    #[error("shadow replay eligibility: {0:#}")]
+    ShadowRelations(#[source] anyhow::Error),
     #[error("resume continuation: {0:#}")]
     ResumePrefix(#[source] anyhow::Error),
     #[error("stream poisoned by prior error; create a fresh WalStream to resume")]
@@ -339,6 +341,10 @@ impl WalStream {
                 // views; dispatch needs the original parse, not post-rewrite.
                 parsed_for_sink = parsed.into_owned();
             }
+            self.filter
+                .flush_shadow_rels()
+                .await
+                .map_err(WalStreamError::ShadowRelations)?;
             let route = verdict.route;
             let kind = match route {
                 Route::ToShadow | Route::ToBoth => Kind::Kept,
@@ -1195,6 +1201,79 @@ mod tests {
         }
         page.resize(page_len, 0);
         page
+    }
+
+    #[tokio::test]
+    async fn persist_admission_before_publishing_create() {
+        use crate::filter::shadow_relations::ShadowRelations;
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        struct RejectWire(Arc<AtomicUsize>);
+        impl RecordBytesSink for RejectWire {
+            fn on_wire_chunk<'a>(
+                &'a mut self,
+                _: u64,
+                _: &'a [u8],
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = Result<(), SinkError>> + Send + 'a>,
+            > {
+                Box::pin(async move {
+                    self.0.fetch_add(1, Ordering::SeqCst);
+                    Err(std::io::Error::other("stop after admission").into())
+                })
+            }
+        }
+
+        let md: Vec<_> = [1663u32, 5, 16456, 0]
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect();
+        let page = page_of(&[raw_rec(RmId::Smgr as u8, 0x10, 0, None, Some(&md))], 8192);
+        for fail_persist in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut stream = WalStream::new(1, 8192, 0u64).unwrap();
+            stream.filter_mut().keep_user_rels(Default::default(), 0);
+            stream
+                .filter_mut()
+                .persist_shadow_rels(tmp.path())
+                .await
+                .unwrap();
+            if fail_persist {
+                let path = tmp.path().join("walshadow_relations.toml");
+                std::fs::remove_file(&path).unwrap();
+                std::fs::create_dir(&path).unwrap();
+            }
+            let calls = Arc::new(AtomicUsize::new(0));
+            stream.set_bytes_sink(Box::new(RejectWire(calls.clone())));
+            let mut records = CollectingRecordSink::default();
+            let mut segments = CollectingSegmentSink::default();
+            let err = stream
+                .push(0, &page, &mut records, &mut segments)
+                .await
+                .unwrap_err();
+            if fail_persist {
+                assert!(matches!(err, WalStreamError::ShadowRelations(_)), "{err}");
+                assert_eq!(calls.load(Ordering::SeqCst), 0);
+            } else {
+                assert!(matches!(err, WalStreamError::Sink(_)), "{err}");
+                assert_eq!(calls.load(Ordering::SeqCst), 1);
+                assert!(
+                    ShadowRelations::load(tmp.path())
+                        .await
+                        .unwrap()
+                        .contains(&(5, 16456))
+                );
+            }
+            assert!(records.records.is_empty());
+            assert!(segments.segments.is_empty());
+            assert!(matches!(
+                stream.push(0, &page, &mut records, &mut segments).await,
+                Err(WalStreamError::Poisoned)
+            ));
+        }
     }
 
     /// The fork verify compares raw source bytes, so the digest must be taken

@@ -976,6 +976,11 @@ async fn run_session(
     );
     let bootstrap_plan = resolve_bootstrap(args, ch_config.as_ref())?;
     let shadow_start = resolve_shadow_start(args, bootstrap_plan.mode)?;
+    if ch_config.as_ref().is_some_and(|c| c.toast.mode.is_shadow())
+        && let ShadowStart::Resume(dir) = &shadow_start
+    {
+        walshadow::filter::shadow_relations::ShadowRelations::load(dir).await?;
+    }
     let bridge_workers = match shadow_start {
         ShadowStart::External => 1,
         _ => bridge_pool_size(ch_config.as_ref()),
@@ -1482,28 +1487,17 @@ async fn run_session(
         .await
         .context("shadow database oid")?;
     stream.filter_mut().set_target_db(shadow_db_oid);
-    // Replay WAL only for user relations already stored by shadow
-    // Read replay position first so concurrent creates are included
     let shadow_toast = ch_config.as_ref().is_some_and(|c| c.toast.mode.is_shadow());
     if shadow_toast {
-        let dir = shadow_start.data_dir().context(
-            "[toast] mode = shadow reads values from a daemon-owned shadow; \
-             pass --bootstrap-shadow-data-dir",
-        )?;
-        let replayed = bridge
-            .replay_lsn()
-            .await
-            .context("shadow replay position for toast routing")?;
-        let rels = walshadow::backfill::pg_path::user_relation_filenodes(dir, shadow_db_oid)
-            .await
-            .context("list shadow relations for toast routing")?;
+        let dir = shadow_start
+            .data_dir()
+            .context("[toast] mode = shadow requires a daemon-owned shadow")?;
+        stream.filter_mut().load_shadow_rels(dir).await?;
         tracing::info!(
             target: "walshadow::toast",
-            rels = rels.len(),
-            replayed = format_pg_lsn(replayed).to_string(),
-            "[toast] mode = shadow: replaying WAL for these relations on shadow",
+            rels = stream.filter().shadow_rels().map_or(0, |rels| rels.len()),
+            "[toast] mode = shadow: loaded durable replay eligibility",
         );
-        stream.filter_mut().keep_user_rels(rels, replayed);
     }
     let pending_cfg = ch_config
         .as_ref()
