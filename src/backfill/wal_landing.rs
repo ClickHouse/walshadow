@@ -62,6 +62,14 @@ pub async fn filter_landed_wal(
     *stream.filter_mut().tracker_mut() = tracker;
     if let Some((rels, redo_lsn)) = shadow_rels {
         stream.filter_mut().keep_user_rels(rels, redo_lsn);
+        stream
+            .filter_mut()
+            .persist_shadow_rels(
+                pg_wal
+                    .parent()
+                    .context("pg_wal must belong to shadow data directory")?,
+            )
+            .await?;
     }
 
     let mut records = DropRecords;
