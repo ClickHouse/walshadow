@@ -1265,7 +1265,7 @@ impl ToastResolver {
         toast_relid: u32,
         metric: &AtomicU64,
     ) -> Result<(), ChunkStoreError> {
-        let Some(store) = &self.store else {
+        let Some(store) = &self.store.as_ref().filter(|s| s.accepts_writes()) else {
             return Ok(());
         };
         store.truncate_mirror(toast_relid).await?;
@@ -1293,7 +1293,7 @@ impl ToastResolver {
         marker_lsn: u64,
         commit_lsn: u64,
     ) -> Result<(), ChunkStoreError> {
-        let Some(store) = &self.store else {
+        let Some(store) = &self.store.as_ref().filter(|s| s.accepts_writes()) else {
             return Ok(());
         };
         store
@@ -1770,8 +1770,12 @@ mod tests {
             .await
             .is_err()
         );
-        assert!(r.truncate_mirror(16500).await.is_err());
-        assert!(r.rewrite_barrier(16500, 1, 2).await.is_err());
+        r.truncate_mirror(16500)
+            .await
+            .expect("no mirror to empty, so a TRUNCATE barrier has nothing to do");
+        r.rewrite_barrier(16500, 1, 2)
+            .await
+            .expect("no mirror to tombstone, so a rewrite barrier has nothing to do");
     }
 
     /// Shadow mode requires bridge, disabled mode keeps no store

@@ -25,7 +25,7 @@ const REPLAY_POLL: Duration = Duration::from_millis(20);
 /// Maximum poll interval while worker socket cannot accept connections
 const UNREACHABLE_POLL_MAX: Duration = Duration::from_secs(1);
 /// Maximum time without replay progress or a worker connection
-const REPLAY_WAIT_MAX: Duration = Duration::from_secs(60);
+const REPLAY_WAIT_MAX: Duration = Duration::from_secs(900);
 
 /// Bridge populated after bootstrap starts PostgreSQL
 pub type LateBridge = Arc<tokio::sync::OnceCell<Arc<Bridge>>>;
