@@ -231,6 +231,21 @@ pub fn resolve_resume_lsn(
     }
 }
 
+pub fn resume_serving_shadow(
+    resume: Pos<Floor>,
+    shadow_resume: Pos<ShadowFlush>,
+    pinned: bool,
+) -> Pos<Floor> {
+    if pinned || shadow_resume.is_zero() {
+        return resume;
+    }
+    Pos::new(
+        resume
+            .get()
+            .min(WalStream::align_down(shadow_resume.get(), WAL_SEG_SIZE)),
+    )
+}
+
 /// Out-dir trim cut — shadow-recovery domain, distinct from the manifest
 /// floor. Keep `retention_bytes` behind replay, never past the last
 /// restartpoint REDO (shadow resumes recovery there).

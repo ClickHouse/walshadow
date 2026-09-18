@@ -1129,10 +1129,16 @@ async fn run_session(
         ident.xlogpos,
     );
     let pinned = bootstrap_end_lsn.is_some() || start_lsn_override.is_some();
+    let shadow_resume = manifest_at_boot
+        .as_ref()
+        .map(|m| m.lsn.shadow_flush)
+        .unwrap_or_default();
+    let raw_start = manifest::resume_serving_shadow(raw_start, shadow_resume, pinned);
     let floor_at_boot = manifest_at_boot
         .as_ref()
         .map(|m| m.floor)
-        .filter(|f| !f.is_zero());
+        .filter(|f| !f.is_zero())
+        .map(|f| manifest::resume_serving_shadow(f, shadow_resume, pinned));
     // Archive-end scan only feeds the greenfield clamp (keep archive
     // continuous until live streaming begins: starting after last sealed
     // segment leaves shadow missing WAL; re-read from earlier LSN, CH
