@@ -59,8 +59,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::pos::{
-    Drain, FilterDurable, Floor, Pos, ResumeSafe, ShadowFlush, ShadowReplay, SourceReceived,
-    Switchpoint,
+    Drain, FilterDurable, Floor, LsnKind, Pos, ResumeSafe, ShadowFlush, ShadowReplay,
+    SourceReceived, Switchpoint,
 };
 use crate::record::WAL_SEG_SIZE;
 use crate::source::wal_stream::WalStream;
@@ -231,19 +231,28 @@ pub fn resolve_resume_lsn(
     }
 }
 
-pub fn resume_serving_shadow(
-    resume: Pos<Floor>,
-    shadow_resume: Pos<ShadowFlush>,
-    pinned: bool,
-) -> Pos<Floor> {
-    if pinned || shadow_resume.is_zero() {
-        return resume;
+#[derive(Debug, Clone, Copy)]
+pub struct ShadowFloor(Option<u64>);
+
+impl ShadowFloor {
+    pub fn new(shadow_holds_data: bool, live: u64, persisted: u64) -> Self {
+        if !shadow_holds_data {
+            return Self(None);
+        }
+        let at = if live != 0 { live } else { persisted };
+        Self((at != 0).then_some(WalStream::align_down(at, WAL_SEG_SIZE)))
     }
-    Pos::new(
-        resume
-            .get()
-            .min(WalStream::align_down(shadow_resume.get(), WAL_SEG_SIZE)),
-    )
+
+    pub fn unbounded() -> Self {
+        Self(None)
+    }
+
+    pub fn bound<K: LsnKind>(&self, pos: Pos<K>) -> Pos<K> {
+        match self.0 {
+            Some(at) => Pos::new(pos.get().min(at)),
+            None => pos,
+        }
+    }
 }
 
 /// Out-dir trim cut — shadow-recovery domain, distinct from the manifest

@@ -1129,16 +1129,22 @@ async fn run_session(
         ident.xlogpos,
     );
     let pinned = bootstrap_end_lsn.is_some() || start_lsn_override.is_some();
-    let shadow_resume = manifest_at_boot
+    let shadow_holds_data = ch_config.as_ref().is_some_and(|c| c.toast.mode.is_shadow());
+    let shadow_replay_seed = manifest_at_boot
         .as_ref()
-        .map(|m| m.lsn.shadow_flush)
+        .map(|m| m.lsn.shadow_replay.get().max(m.lsn.shadow_flush.get()))
         .unwrap_or_default();
-    let raw_start = manifest::resume_serving_shadow(raw_start, shadow_resume, pinned);
+    let boot_shadow_floor = if pinned {
+        manifest::ShadowFloor::unbounded()
+    } else {
+        manifest::ShadowFloor::new(shadow_holds_data, 0, shadow_replay_seed)
+    };
+    let raw_start = boot_shadow_floor.bound(raw_start);
     let floor_at_boot = manifest_at_boot
         .as_ref()
         .map(|m| m.floor)
         .filter(|f| !f.is_zero())
-        .map(|f| manifest::resume_serving_shadow(f, shadow_resume, pinned));
+        .map(|f| boot_shadow_floor.bound(f));
     // Archive-end scan only feeds the greenfield clamp (keep archive
     // continuous until live streaming begins: starting after last sealed
     // segment leaves shadow missing WAL; re-read from earlier LSN, CH
@@ -2311,11 +2317,10 @@ async fn run_session(
             // Read acknowledgment first so no transaction escapes floor
             (drain_lsn, b.resume_safe_lsn(ea))
         };
-        // shadow_replay==0 (sweeper off or not yet reported) means "no
-        // constraint from shadow", not the literal min: else a fresh boot
-        // with retention off pins apply_lsn at 0 and source's slot never recycles.
+        let shadow_floor =
+            manifest::ShadowFloor::new(shadow_toast, shadow_replay.get(), shadow_replay_seed);
         let apply_ceiling = match shadow_replay.get() {
-            0 => resume_safe_lsn,
+            0 => shadow_floor.bound(resume_safe_lsn),
             s => s.min(resume_safe_lsn.get()).into(),
         };
         // Never walks back. A crossing commits the fork segment's start, which
@@ -2323,11 +2328,9 @@ async fn run_session(
         // segment; the natural terms must not undo the position a restart
         // resumes from. A rewind (`--start-lsn`, `--ignore-cursor`) lowers it by
         // seeding `resume_floor` at the rewind point instead
-        let releasable = match shadow_replay.get() {
-            s if shadow_toast && s != 0 => resume_safe_lsn.get().min(s).into(),
-            _ => resume_safe_lsn,
-        };
-        let floor = manifest::resolved_floor(releasable, durable).max(resume_floor.get());
+        let floor = shadow_floor
+            .bound(manifest::resolved_floor(resume_safe_lsn, durable))
+            .max(resume_floor.get());
         let floor_timeline = history.floor_branch(
             floor.get(),
             live_identity.timeline,
