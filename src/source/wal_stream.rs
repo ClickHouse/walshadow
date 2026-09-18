@@ -30,6 +30,8 @@
 //! segment-level dispatch fires on segment boundary with already-filtered
 //! bytes + accumulated manifest. No re-parse, no second walk.
 
+use std::path::PathBuf;
+
 use thiserror::Error;
 use walrus::pg::wal::segment::SegmentName;
 use walrus::pg::walparser::{
@@ -48,6 +50,7 @@ use crate::record::{
 use crate::record::{
     NoopBytesSink, Record, RecordBytesSink, RecordSink, Route, SegmentSink, SinkError,
 };
+use crate::source::resume_prefix::ResumePrefix;
 #[cfg(test)]
 use crate::source::segment_sink::{DirSegmentSink, SegFsync};
 use crate::source::streaming_walker::{CompletedRecord, StreamingWalker, WalkError};
@@ -90,6 +93,8 @@ pub enum WalStreamError {
     UnalignedBase(u64),
     #[error("sink: {0}")]
     Sink(#[from] SinkError),
+    #[error("resume continuation: {0:#}")]
+    ResumePrefix(#[source] anyhow::Error),
     #[error("stream poisoned by prior error; create a fresh WalStream to resume")]
     Poisoned,
 }
@@ -127,6 +132,7 @@ pub struct WalStream {
     raw_crc: u32,
     raw_crc_from: u64,
     poisoned: bool,
+    resume_prefix: Option<ResumePrefix>,
 }
 
 /// Digest of the ancestor bytes a descendant repeats, from
@@ -165,7 +171,24 @@ impl WalStream {
             raw_crc: 0,
             raw_crc_from: start_lsn,
             poisoned: false,
+            resume_prefix: None,
         })
+    }
+
+    /// Preserve continuation of a record already rewritten before resume.
+    /// `dirs` rank by trust: the first holding the resume segment wins
+    pub async fn preserve_resume_prefix(&mut self, dirs: &[PathBuf]) -> Result<(), WalStreamError> {
+        self.resume_prefix = ResumePrefix::load(dirs, self.timeline, self.seg_size, self.next_lsn)
+            .await
+            .map_err(WalStreamError::ResumePrefix)?;
+        if let Some(prefix) = &self.resume_prefix {
+            tracing::info!(
+                start_lsn = format_args!("{:#X}", self.next_lsn),
+                end_lsn = format_args!("{:#X}", prefix.end_lsn()),
+                "preserving filtered resume continuation"
+            );
+        }
+        Ok(())
     }
 
     /// Stats here are cumulative across every segment this stream processed.
@@ -228,7 +251,20 @@ impl WalStream {
             // predictable; spanning records may push buf past seg_size
             // until they complete + flush back down.
             let take = chunk_cap.min(data.len());
-            self.walker.extend(&data[..take]);
+            let chunk = &data[..take];
+            if let Some(prefix) = &self.resume_prefix {
+                let mut spliced = chunk.to_vec();
+                if let Err(error) = prefix.apply(cur_lsn, &mut spliced) {
+                    self.poisoned = true;
+                    return Err(WalStreamError::ResumePrefix(error));
+                }
+                self.walker.extend(&spliced);
+                if cur_lsn + take as u64 >= prefix.end_lsn() {
+                    self.resume_prefix = None;
+                }
+            } else {
+                self.walker.extend(chunk);
+            }
             cur_lsn += take as u64;
             data = &data[take..];
 
