@@ -322,6 +322,7 @@ snapshot! {
     counter process_cpu_seconds_total: f64 =
         "Total user+system CPU seconds consumed by the walshadow process.",
     gauge process_resident_memory_bytes: u64 = "Resident set size of the walshadow process (VmRSS).",
+    gauge process_threads: u64 = "OS threads in walshadow, including async and blocking workers.",
     counter oracle_local_columns_total: u64 =
         "Oracle-routed columns the daemon built itself: already-rendered cells against a String target, which PG would hand straight back.",
     counter oracle_blocks_total: u64 =

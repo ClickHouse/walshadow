@@ -14,6 +14,11 @@
 //! equal `next_lsn` (nothing past the commit has published during the hold),
 //! anything else means the log lost coverage — fatal.
 //!
+//! Statistics-only commits leave relation definitions unchanged, so skip
+//! replay waits and save an empty batch. Restart loses evidence that only
+//! statistics changed. Replay saved batch to avoid querying shadow after
+//! it has replayed past this commit
+//!
 //! valid_from bias-early: a descriptor is a backward-compatible reader of
 //! older tuples, never the reverse. Rotated filenode → the rfn's
 //! `XLOG_SMGR_CREATE` marker (before any page write); in-place change → the
@@ -172,12 +177,12 @@ impl CatalogCapture {
         self.stats.clone()
     }
 
-    /// Whether the pump should park for this boundary. A commit always
-    /// bounds; a command boundary the caps or the inval set rule out costs
-    /// nothing and is skipped before the hold
+    /// Decide whether to wait for shadow replay before capture
+    /// Skip statistics-only commits and command boundaries excluded by
+    /// capture capabilities or invalidations
     pub fn admits(&self, info: &BoundaryInfo, next_lsn: u64) -> bool {
         let BoundaryKind::Command { .. } = info.kind else {
-            return true;
+            return !info.stats_only;
         };
         // Aligned-prefix re-read: shadow replayed past this point long ago,
         // so the scan could only answer for where replay is now. Degrades
@@ -274,6 +279,9 @@ impl CatalogCapture {
         let events = if let Some(batch) = self.log.batch_at(next_lsn) {
             self.stats.log_replays.fetch_add(1, Relaxed);
             self.replay_events(&batch)
+        } else if info.stats_only {
+            self.cover_stub(commit_lsn, next_lsn).await?;
+            Vec::new()
         } else {
             self.sql_capture(info, commit_lsn, next_lsn).await?
         };
@@ -418,6 +426,21 @@ impl CatalogCapture {
             .fetch_add(slots.len() as u64, Relaxed);
         self.pending.record(top_xid, slots);
         Ok(())
+    }
+
+    /// Save an empty batch so restart can replay this boundary without
+    /// querying shadow after it has replayed past this position
+    async fn cover_stub(&self, commit_lsn: u64, next_lsn: u64) -> Result<(), SinkError> {
+        self.log
+            .append_batch(BatchRecord {
+                captured_at: next_lsn,
+                commit_lsn,
+                observations: Vec::new(),
+                ambiguities: Vec::new(),
+                entries: Vec::new(),
+            })
+            .await
+            .map_err(|e| SinkError::Other(format!("descriptor log append: {e}")))
     }
 
     async fn sql_capture(

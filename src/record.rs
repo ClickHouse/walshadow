@@ -98,8 +98,8 @@ pub enum Route {
     ToBoth,
 }
 
-/// Which sample point a boundary is. Both park publication until shadow
-/// replays through `next_lsn`; what capture reads there differs.
+/// When to capture catalog state. Both kinds pause publication until shadow
+/// replays through `next_lsn`, except for statistics-only commits
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum BoundaryKind {
     /// Commit of a catalog-mutating xact: the committed shape, durable
@@ -142,6 +142,10 @@ pub struct BoundaryInfo {
     /// pending state a late `XLOG_XACT_ASSIGNMENT` left keyed under a
     /// subxid. Empty at a command boundary
     pub members: Vec<u32>,
+    /// Commit changed only planner statistics, so skip catalog reads and
+    /// replay waits. Save an empty batch for restart, since evidence that
+    /// only statistics changed is lost on restart
+    pub stats_only: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -173,8 +177,8 @@ pub struct Record<'a> {
     pub next_lsn: u64,
     pub page_magic: u16,
     pub route: Route,
-    /// Commit of a catalog-mutating xact: pump must hold successor-byte
-    /// publication until shadow replays through `next_lsn`
+    /// Commit changed catalog data, so pause publication of later bytes
+    /// until shadow replays through `next_lsn`, except for statistics-only commits
     pub catalog_boundary: bool,
     /// Capture input for a catalog boundary; `Some` iff `catalog_boundary`
     pub boundary_info: Option<std::sync::Arc<BoundaryInfo>>,
