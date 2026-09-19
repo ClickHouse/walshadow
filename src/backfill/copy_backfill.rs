@@ -229,6 +229,31 @@ impl Ledger {
         crate::fs::write_atomic(&self.dir, LEDGER_FILENAME, text.as_bytes()).await
     }
 
+    async fn fallback_to_copy(
+        &mut self,
+        rel: &RelName,
+        mode: InitialLoadMode,
+        s_lsn: u64,
+    ) -> std::io::Result<bool> {
+        let Some(rec) = self.entries.get_mut(rel) else {
+            return Ok(false);
+        };
+        if rec.done
+            || rec.swapped
+            || rec.staging_uuid.is_some()
+            || rec.mode != mode
+            || rec.s_lsn.get() != s_lsn
+        {
+            return Ok(false);
+        }
+        rec.mode = InitialLoadMode::Copy;
+        if let Err(e) = self.persist().await {
+            self.entries.get_mut(rel).unwrap().mode = mode;
+            return Err(e);
+        }
+        Ok(true)
+    }
+
     fn pending_count(&self) -> u64 {
         self.entries.values().filter(|r| !r.done).count() as u64
     }
@@ -350,6 +375,7 @@ pub(crate) async fn copy_rows_into(
     desc: &RelDescriptor,
     lsn: u64,
     tx: &mpsc::Sender<Vec<BackfillTuple>>,
+    stats: &EmitterStats,
 ) -> anyhow::Result<u64> {
     let plan = column_plan(desc);
     let sql = format!(
@@ -367,9 +393,11 @@ pub(crate) async fn copy_rows_into(
     let mut slab_bytes = 0usize;
     while let Some(row) = stream.next().await {
         let row = row.context("backfill: COPY stream")?;
+        let mut payload_bytes = 0u64;
         let mut columns: Vec<Option<ColumnValue>> = vec![None; plan.natts];
         for (i, cp) in plan.cols.iter().enumerate() {
             let raw: Option<&[u8]> = row.try_get(i).context("backfill: COPY field")?;
+            payload_bytes += raw.map_or(0, |bytes| bytes.len() as u64);
             let v = raw
                 .map(|raw| decode_field(cp.kind, cp.type_oid, raw))
                 .transpose()
@@ -394,6 +422,10 @@ pub(crate) async fn copy_rows_into(
             columns,
         });
         rows += 1;
+        stats.backfill_copy_rows.fetch_add(1, Ordering::Relaxed);
+        stats
+            .backfill_copy_bytes
+            .fetch_add(payload_bytes, Ordering::Relaxed);
         if slab.len() >= COPY_SLAB_ROWS || slab_bytes >= COPY_SLAB_BYTES {
             slab_bytes = 0;
             tx.send(std::mem::take(&mut slab))
@@ -755,8 +787,8 @@ impl CopyBackfiller {
 
     /// Coalesced backup pass: wait out the window, drain the mode's queue,
     /// run one cluster-sized pass for every queued rel. Regime A: a failed
-    /// pass leaves every entry pending (next boot's seed re-queues them) and
-    /// never poisons the pump.
+    /// pass falls back to COPY when enabled, otherwise stays pending.
+    /// Failure never poisons the pump.
     async fn run_backup_pass(self: Arc<Self>, mode: InitialLoadMode) {
         tokio::time::sleep(self.coalesce_window).await;
         let reqs: Vec<BackupRequest> = {
@@ -797,15 +829,56 @@ impl CopyBackfiller {
                     mode = mode.as_str(),
                     tables = reqs.len(),
                     error = %format!("{e:#}"),
-                    "backup backfill pass failed; entries stay pending (re-run on next boot)",
+                    "backup backfill pass failed",
                 );
+                if self.emitter.bootstrap.copy_fallback.unwrap_or(true) {
+                    for req in &reqs {
+                        if self.prepare_copy_fallback(mode, req).await {
+                            self.clone().run(req.desc.clone(), req.s_lsn.into()).await;
+                        }
+                    }
+                }
             }
         }
         let mut inner = self.inner.lock().await;
         for r in &reqs {
-            inner.active.remove(&r.desc.rel_name);
+            if inner
+                .ledger
+                .entries
+                .get(&r.desc.rel_name)
+                .is_none_or(|rec| rec.mode == mode && rec.s_lsn.get() == r.s_lsn)
+            {
+                inner.active.remove(&r.desc.rel_name);
+            }
         }
         self.refresh_gauges(&inner.ledger);
+    }
+
+    async fn prepare_copy_fallback(&self, mode: InitialLoadMode, req: &BackupRequest) -> bool {
+        let mut inner = self.inner.lock().await;
+        let rel = &req.desc.rel_name;
+        match inner.ledger.fallback_to_copy(rel, mode, req.s_lsn).await {
+            Ok(true) => {}
+            Ok(false) => return false,
+            Err(e) => {
+                tracing::error!(
+                    target: "walshadow::backfill",
+                    qname = %rel,
+                    error = %e,
+                    "COPY fallback ledger persist failed; entry stays pending",
+                );
+                return false;
+            }
+        }
+        self.refresh_gauges(&inner.ledger);
+        tracing::warn!(
+            target: "walshadow::backfill",
+            qname = %rel,
+            previous_mode = mode.as_str(),
+            s_lsn = %format_pg_lsn(req.s_lsn),
+            "retrying failed backup load through COPY",
+        );
+        true
     }
 
     /// Staged pass (architecture/bootstrap.md): rows land in per-rel
@@ -1219,7 +1292,13 @@ impl CopyBackfiller {
         ));
 
         let rows = crate::ops::stages::COPY
-            .measure(copy_rows_into(&client, desc, s_lsn.get(), &tup_tx))
+            .measure(copy_rows_into(
+                &client,
+                desc,
+                s_lsn.get(),
+                &tup_tx,
+                &self.stats,
+            ))
             .await?;
         drop(tup_tx);
 
@@ -1385,6 +1464,62 @@ mod tests {
             decode_field(WireKind::Text, 0, &[0xFF, 0xFE]).unwrap(),
             ColumnValue::Bytea(vec![0xFF, 0xFE]),
         );
+    }
+
+    #[tokio::test]
+    async fn fallback_ledger_guards_and_persistence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rel = RelName::new("app", "orders");
+        let mode = InitialLoadMode::ObjectStore;
+        let mut ledger = Ledger::load(tmp.path()).await;
+        let pending = LedgerRec {
+            s_lsn: 100.into(),
+            done: false,
+            mode,
+            swapped: false,
+            staging_uuid: None,
+        };
+        assert!(!ledger.fallback_to_copy(&rel, mode, 100).await.unwrap());
+        for rec in [
+            LedgerRec {
+                done: true,
+                ..pending.clone()
+            },
+            LedgerRec {
+                swapped: true,
+                ..pending.clone()
+            },
+            LedgerRec {
+                staging_uuid: Some("uuid".into()),
+                ..pending.clone()
+            },
+            LedgerRec {
+                s_lsn: 200.into(),
+                ..pending.clone()
+            },
+            LedgerRec {
+                mode: InitialLoadMode::BaseBackup,
+                ..pending.clone()
+            },
+        ] {
+            ledger.entries.insert(rel.clone(), rec);
+            assert!(!ledger.fallback_to_copy(&rel, mode, 100).await.unwrap());
+        }
+        ledger.entries.insert(rel.clone(), pending);
+        ledger.persist().await.unwrap();
+        let original_dir = ledger.dir.clone();
+        let blocker = tmp.path().join("not-a-directory");
+        std::fs::write(&blocker, "blocked").unwrap();
+        ledger.dir = blocker;
+        assert!(ledger.fallback_to_copy(&rel, mode, 100).await.is_err());
+        assert_eq!(ledger.entries[&rel].mode, mode);
+        assert_eq!(Ledger::load(tmp.path()).await.entries[&rel].mode, mode);
+        ledger.dir = original_dir;
+        assert!(ledger.fallback_to_copy(&rel, mode, 100).await.unwrap());
+        let resumed = Ledger::load(tmp.path()).await;
+        assert_eq!(resumed.entries[&rel].mode, InitialLoadMode::Copy);
+        assert_eq!(resumed.entries[&rel].s_lsn.get(), 100);
+        assert!(!resumed.entries[&rel].done);
     }
 
     #[tokio::test]

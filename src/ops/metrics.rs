@@ -185,6 +185,10 @@ snapshot! {
         "Resident bytes in the in-memory prefixes of every bootstrap TOAST-deferred spool.",
     gauge bootstrap_deferred_spool_bytes: u64 =
         "Encoded bytes in every bootstrap TOAST-deferred spool file.",
+    gauge bootstrap_deferred_replay_bytes: u64 =
+        "Total encoded file bytes in active deferred TOAST replays, excluding spool headers.",
+    gauge bootstrap_deferred_replayed_bytes: u64 =
+        "Encoded file bytes processed by active deferred TOAST replays; excludes prefetched batches and does not imply ClickHouse acknowledgement.",
     counter pending_rows_total: u64 =
         "Undecided backup rows written to ClickHouse pending tables.",
     counter pending_tables_total: u64 = "Pending tables created for undecided backup rows.",
@@ -283,6 +287,10 @@ snapshot! {
         "Rows fanned out of decoded raw records.",
     gauge raw_pending_rows: u64 = "Raw-decoded heaps queued for pending-first yield.",
     gauge raw_pending_bytes: u64 = "Bytes held by the pending raw fanout.",
+    counter backfill_backup_rows_total: u64 = "Tuples decoded by table backfill backup walks, including TOAST chunks and rows awaiting visibility checks. Cumulative across passes.",
+    counter backfill_backup_bytes_total: u64 = "Backup body bytes handed to table backfill page walks, excluding skipped files. Cumulative across passes.",
+    counter backfill_copy_rows_total: u64 = "Rows decoded from source COPY for table backfills.",
+    counter backfill_copy_bytes_total: u64 = "Field payload bytes decoded from source COPY, excluding binary framing.",
     counter emitter_rows_total: u64 = "Rows the CH emitter has handed to send_data.",
     counter emitter_blocks_total: u64 = "Native blocks the CH emitter has written.",
     counter emitter_xacts_total: u64 = "Xacts the CH emitter has drained.",
@@ -890,6 +898,10 @@ mod tests {
     #[test]
     fn render_exposes_bootstrap_stage_attribution() {
         let snap = MetricsSnapshot {
+            backfill_backup_rows_total: 7,
+            backfill_backup_bytes_total: 8192,
+            backfill_copy_rows_total: 3,
+            backfill_copy_bytes_total: 23,
             bootstrap_bytes_tapped: 1 << 30,
             bootstrap_pages_walked: 131_072,
             bootstrap_files_skipped_unmapped: 297,
@@ -902,6 +914,10 @@ mod tests {
         };
         let body = render(snap);
         for want in [
+            "walshadow_backfill_backup_rows_total 7",
+            "walshadow_backfill_backup_bytes_total 8192",
+            "walshadow_backfill_copy_rows_total 3",
+            "walshadow_backfill_copy_bytes_total 23",
             "walshadow_bootstrap_bytes_tapped_total 1073741824",
             "walshadow_bootstrap_pages_walked_total 131072",
             "walshadow_bootstrap_files_skipped_unmapped_total 297",
@@ -920,11 +936,15 @@ mod tests {
         let body = render(MetricsSnapshot {
             bootstrap_parts_total: 392,
             bootstrap_parts_done: 117,
+            bootstrap_deferred_replay_bytes: 1000,
+            bootstrap_deferred_replayed_bytes: 250,
             ..MetricsSnapshot::default()
         });
         for want in [
             "walshadow_bootstrap_parts_total 392",
             "walshadow_bootstrap_parts_done_total 117",
+            "walshadow_bootstrap_deferred_replay_bytes 1000",
+            "walshadow_bootstrap_deferred_replayed_bytes 250",
         ] {
             assert!(body.contains(want), "missing {want}\n{body}");
         }

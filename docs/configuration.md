@@ -356,6 +356,15 @@ defaulting to 8 when absent. This controls concurrent parts, not ClickHouse
 inserter count. Incomplete table backfills still restart their pass; completed
 parts are not independently checkpointed.
 
+`[bootstrap] copy_fallback` defaults to `true`. Failed `base_backup` and
+`object_store` table loads retry through source COPY, one table at a time per
+failed pass. Set `copy_fallback = false` to leave failures pending until restart.
+Fallback preserves original load LSN and persists COPY mode before reading source;
+restarts resume recorded mode even if fallback is subsequently disabled. COPY
+adds source database read load. Completed or publishing staging tables never
+fall back. This option does not apply to greenfield bootstrap or publication
+failures. Failed COPY remains pending until restart.
+
 `walshadow_archive_fetch_seconds_total` sums fetch durations across concurrent
 requests, including decrypt and decompression. `walshadow_archive_replay_seconds_total`
 measures filter/dispatch time including downstream backpressure. Compare rates

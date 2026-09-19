@@ -3875,6 +3875,8 @@ fn stage_gauges_on(v: &StageCounters<'_>, base: MetricsSnapshot) -> MetricsSnaps
     MetricsSnapshot {
         bootstrap_deferred_bytes: emitter(|s| &s.bootstrap_deferred_bytes),
         bootstrap_deferred_spool_bytes: emitter(|s| &s.bootstrap_deferred_spool_bytes),
+        bootstrap_deferred_replay_bytes: emitter(|s| &s.bootstrap_deferred_replay_bytes),
+        bootstrap_deferred_replayed_bytes: emitter(|s| &s.bootstrap_deferred_replayed_bytes),
         pending_rows_total: emitter(|s| &s.pending_rows),
         pending_tables_total: emitter(|s| &s.pending_tables),
         pending_tables_dropped_total: emitter(|s| &s.pending_tables_dropped),
@@ -3933,6 +3935,10 @@ fn stage_gauges_on(v: &StageCounters<'_>, base: MetricsSnapshot) -> MetricsSnaps
         ],
         raw_decode_rows_by_op: emitter_ops(|s| &s.raw_decode_rows_ops),
         emitter_rows_total: emitter(|s| &s.rows_emitted),
+        backfill_backup_rows_total: emitter(|s| &s.backfill_backup_walk.tuples_emitted),
+        backfill_backup_bytes_total: emitter(|s| &s.backfill_backup_pump.bytes_tapped),
+        backfill_copy_rows_total: emitter(|s| &s.backfill_copy_rows),
+        backfill_copy_bytes_total: emitter(|s| &s.backfill_copy_bytes),
         emitter_blocks_total: emitter(|s| &s.blocks_sent),
         queue_jobs_out_total: emitter(|s| &s.queue_jobs_out),
         decode_jobs_in_total: emitter(|s| &s.decode_jobs_in),
@@ -6389,9 +6395,19 @@ mod tests {
             config_backfills_pending: 21,
             ..MetricsSnapshot::default()
         };
+        emitter
+            .backfill_backup_walk
+            .tuples_emitted
+            .store(3, Ordering::Relaxed);
+        emitter
+            .backfill_backup_pump
+            .bytes_tapped
+            .store(8192, Ordering::Relaxed);
         emitter.rows_emitted.store(17, Ordering::Relaxed);
         let first = stage_gauges_on(&counters, base);
         assert_eq!(first.emitter_rows_total, 17);
+        assert_eq!(first.backfill_backup_rows_total, 3);
+        assert_eq!(first.backfill_backup_bytes_total, 8192);
         emitter.rows_emitted.store(29, Ordering::Relaxed);
         emitter.decode_rows_out.store(31, Ordering::Relaxed);
         let next = stage_gauges_on(
