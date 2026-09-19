@@ -50,6 +50,29 @@ WAL parser separates block headers from payloads because record layout does
 too. Do not merge passes based only on repeated-loop appearance. Profile actual
 cost before changing framing or allocation
 
+## Archive recovery follow-ups
+
+Recovery measurements on 2026-09-19 showed pump queue waits consuming about 76%
+of elapsed time, versus 1.5% waiting for archive fetches. Treat these as workload
+observations; WAL ranges and backfill phases differ between runs. Queue pressure
+locates a downstream limit but does not distinguish dispatch CPU, shadow replay,
+or insert latency
+
+Try these in order:
+
+1. Parallelize backup-backfill inserts within existing byte budget
+   [Backup backfill](../src/backfill/backup_backfill.rs) currently starts one
+   inserter even when configured pool size is 16. Compare one versus four workers
+   sharing unchanged encoded-buffer allowance. Measure backfill rows/s separately
+   from WAL progress, plus insert latency, part count, RSS, and durable completion
+   counts. Verify overlapping inserts improve throughput before raising concurrency
+2. Profile serial WAL dispatch, then batch measured hot operations
+   [Queue worker](../src/source/queueing_record_sink.rs) receives batches but awaits
+   each record individually. Attribute decode, transaction-buffer, commit-drain,
+   shadow-replay waits, and downstream waits before changing execution. Amortize
+   hot operations across records where possible while preserving commit/DDL order,
+   byte-before-record reachability, and contiguous durable acknowledgements
+
 ## Bootstrap worker shape
 
 Each tap entry decodes its own segment, so add decode workers only after

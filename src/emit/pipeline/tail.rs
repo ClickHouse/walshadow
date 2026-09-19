@@ -300,6 +300,7 @@ pub async fn spawn_with_config(
         BatcherConfig {
             row_budget: emitter.row_budget,
             byte_budget: emitter.byte_budget,
+            inserters: n,
             flush_timeout,
         },
         Allocator::global(&mimalloc::MiMalloc),

@@ -1319,6 +1319,23 @@ impl ColumnBuf {
         })
     }
 
+    pub(crate) fn allocated_bytes(&self) -> usize {
+        match self {
+            Self::Fixed { bytes, .. } => bytes.capacity(),
+            Self::String { offsets, data, .. } => offsets.capacity() * 8 + data.capacity(),
+            Self::NullableFixed {
+                null_map, inner, ..
+            } => null_map.capacity() + inner.capacity(),
+            Self::NullableString {
+                offsets,
+                data,
+                null_map,
+                ..
+            } => offsets.capacity() * 8 + data.capacity() + null_map.capacity(),
+            Self::Oracle(o) => o.allocated_bytes(),
+        }
+    }
+
     fn approx_size(&self) -> usize {
         match self {
             Self::Fixed { bytes, .. } => bytes.len(),

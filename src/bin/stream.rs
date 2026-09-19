@@ -3525,9 +3525,9 @@ struct TimelineView {
 }
 
 #[allow(clippy::too_many_arguments)]
-/// CPU seconds + RSS bytes from `/proc/self`. Linux-only; `(0.0, 0)` if
+/// CPU seconds, RSS bytes and threads from `/proc/self`. Zero if
 /// unreadable. Assumes `CLK_TCK` 100 (USER_HZ) and `VmRSS` in kB.
-fn read_process_stats() -> (f64, u64) {
+fn read_process_stats() -> (f64, u64, u64) {
     const CLK_TCK: f64 = 100.0;
     let cpu = std::fs::read_to_string("/proc/self/stat")
         .ok()
@@ -3541,20 +3541,20 @@ fn read_process_stats() -> (f64, u64) {
             Some((utime + stime) as f64 / CLK_TCK)
         })
         .unwrap_or(0.0);
-    let rss = std::fs::read_to_string("/proc/self/status")
-        .ok()
-        .and_then(|s| {
-            let kb: u64 = s
-                .lines()
-                .find(|l| l.starts_with("VmRSS:"))?
-                .split_whitespace()
-                .nth(1)?
-                .parse()
-                .ok()?;
-            Some(kb * 1024)
-        })
-        .unwrap_or(0);
-    (cpu, rss)
+    let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    let field = |name: &str| -> u64 {
+        status
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix(name)?
+                    .split_whitespace()
+                    .next()?
+                    .parse()
+                    .ok()
+            })
+            .unwrap_or(0)
+    };
+    (cpu, field("VmRSS:") * 1024, field("Threads:"))
 }
 
 /// Drain-resident + spool gauge readings taken under one buffer lock
@@ -3830,7 +3830,7 @@ fn stage_gauges(v: &StageCounters<'_>) -> MetricsSnapshot {
 }
 
 fn stage_gauges_on(v: &StageCounters<'_>, base: MetricsSnapshot) -> MetricsSnapshot {
-    let (proc_cpu, proc_rss) = read_process_stats();
+    let (proc_cpu, proc_rss, proc_threads) = read_process_stats();
     let emitter = |pick: fn(&EmitterStats) -> &AtomicU64| -> u64 {
         v.emitter.map_or(0, |s| pick(s).load(Ordering::Relaxed))
     };
@@ -3945,6 +3945,7 @@ fn stage_gauges_on(v: &StageCounters<'_>, base: MetricsSnapshot) -> MetricsSnaps
         oracle_resolve_seconds_total: emitter_seconds(|s| &s.oracle_resolve_nanos),
         process_cpu_seconds_total: proc_cpu,
         process_resident_memory_bytes: proc_rss,
+        process_threads: proc_threads,
         emitter_xacts_total: emitter(|s| &s.xacts_committed),
         emitter_unsupported_relations: emitter(|s| &s.unsupported_relations),
         emitter_deletes_discarded: emitter(|s| &s.deletes_discarded),
