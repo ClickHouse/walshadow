@@ -296,11 +296,11 @@ async fn walk_and_ship(
     }
     let store_toast = resolver.stores_chunks();
 
-    // Dedicated tail: own CH connection, own seq space, own fatal — the
+    // Dedicated tail: own connections, own seq space, own fatal — the
     // live pipeline never blocks on a backfill (Regime A)
     let tail = OwnedTail::spawn(
         &ctx.emitter,
-        1,
+        ctx.emitter.inserter_pool_size.clamp(1, 3),
         ctx.stats.clone(),
         Fatal::new(),
         ctx.config_rx.clone(),

@@ -275,6 +275,8 @@ pub struct BootstrapSettings {
     pub object_store_parallelism: Option<NonZeroUsize>,
     /// `lanes`: parallel drain/batcher lanes for the greenfield load
     pub lanes: Option<NonZeroUsize>,
+    /// Retry failed table backup loads through source COPY, default true
+    pub copy_fallback: Option<bool>,
 }
 
 /// Where external TOAST values live.
@@ -2124,6 +2126,8 @@ crate::atomic_stats! {
         pub bootstrap_deferred_bytes,
         /// Gauge: encoded bytes in every bootstrap TOAST-deferred spool file
         pub bootstrap_deferred_spool_bytes,
+        pub bootstrap_deferred_replay_bytes,
+        pub bootstrap_deferred_replayed_bytes,
         /// Undecided backup tuples written to pending tables
         /// ([`crate::backfill::visibility_pending`])
         pub pending_rows,
@@ -3809,6 +3813,19 @@ mod tests {
         rejects("[table]\npublic = 3\n", "`table.public`");
         rejects("[table.public]\norders = 3\n", "`table.public.orders`");
         rejects("[table.public.orders]\ncolumns = 3\n", "columns");
+    }
+
+    #[test]
+    fn config_copy_fallback_defaults_on_and_can_be_disabled() {
+        for (src, expected) in [
+            ("[ch]", true),
+            ("[bootstrap]\ncopy_fallback = true", true),
+            ("[bootstrap]\ncopy_fallback = false", false),
+        ] {
+            let config = EmitterConfig::from_toml_str(src).unwrap();
+            assert_eq!(config.bootstrap.copy_fallback.unwrap_or(true), expected);
+        }
+        assert!(EmitterConfig::from_toml_str("[bootstrap]\ncopy_fallback = \"false\"").is_err());
     }
 
     #[test]

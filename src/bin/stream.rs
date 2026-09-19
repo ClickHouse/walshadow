@@ -3875,6 +3875,8 @@ fn stage_gauges_on(v: &StageCounters<'_>, base: MetricsSnapshot) -> MetricsSnaps
     MetricsSnapshot {
         bootstrap_deferred_bytes: emitter(|s| &s.bootstrap_deferred_bytes),
         bootstrap_deferred_spool_bytes: emitter(|s| &s.bootstrap_deferred_spool_bytes),
+        bootstrap_deferred_replay_bytes: emitter(|s| &s.bootstrap_deferred_replay_bytes),
+        bootstrap_deferred_replayed_bytes: emitter(|s| &s.bootstrap_deferred_replayed_bytes),
         pending_rows_total: emitter(|s| &s.pending_rows),
         pending_tables_total: emitter(|s| &s.pending_tables),
         pending_tables_dropped_total: emitter(|s| &s.pending_tables_dropped),

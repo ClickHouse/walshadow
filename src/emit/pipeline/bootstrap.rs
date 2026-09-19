@@ -102,6 +102,44 @@ impl Drop for DeferredFootprint<'_> {
     }
 }
 
+struct DeferredReplayProgress<'a> {
+    stats: &'a EmitterStats,
+    total: u64,
+    processed: u64,
+}
+
+impl<'a> DeferredReplayProgress<'a> {
+    fn new(stats: &'a EmitterStats, total: u64) -> Self {
+        stats
+            .bootstrap_deferred_replay_bytes
+            .fetch_add(total, Ordering::Relaxed);
+        Self {
+            stats,
+            total,
+            processed: 0,
+        }
+    }
+
+    fn advance(&mut self, remaining: u64) {
+        shift(
+            &self.stats.bootstrap_deferred_replayed_bytes,
+            &mut self.processed,
+            self.total - remaining,
+        );
+    }
+}
+
+impl Drop for DeferredReplayProgress<'_> {
+    fn drop(&mut self) {
+        self.stats
+            .bootstrap_deferred_replayed_bytes
+            .fetch_sub(self.processed, Ordering::Relaxed);
+        self.stats
+            .bootstrap_deferred_replay_bytes
+            .fetch_sub(self.total, Ordering::Relaxed);
+    }
+}
+
 /// Move a shared gauge from what this holder reported to what it holds now
 fn shift(gauge: &AtomicU64, held: &mut u64, now: u64) {
     if now >= *held {
@@ -314,10 +352,12 @@ async fn resolve_spooled(
         .into_reader()
         .await
         .map_err(|e| format!("bootstrap: deferred spool seal: {e}"))?;
+    let mut progress = DeferredReplayProgress::new(stats, replay.remaining_file_bytes());
     // Read and fetch the next batch while this one routes: spool reads and
     // inserts otherwise leave the store pool idle
     let mut ready = prepare_batch(&mut replay, routes, catalog, stats, resolver).await?;
     while let Some(batch) = ready.take() {
+        let remaining = replay.remaining_file_bytes();
         let (next, routed) = tokio::join!(
             prepare_batch(&mut replay, routes, catalog, stats, resolver),
             route_batch(
@@ -331,6 +371,7 @@ async fn resolve_spooled(
             ),
         );
         routed?;
+        progress.advance(remaining);
         ready = next?;
     }
     out.flush(msg_tx).await?;
@@ -788,6 +829,61 @@ fn row_from_columns(mut tuple: BackfillTuple, toast_relid: u32) -> Option<ToastR
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn deferred_replay_progress_preserves_other_lanes_on_drop() {
+        use super::*;
+        let stats = EmitterStats::default();
+        let mut first = DeferredReplayProgress::new(&stats, 100);
+        let mut second = DeferredReplayProgress::new(&stats, 200);
+        first.advance(75);
+        second.advance(100);
+        assert_eq!(
+            stats
+                .bootstrap_deferred_replay_bytes
+                .load(Ordering::Relaxed),
+            300
+        );
+        assert_eq!(
+            stats
+                .bootstrap_deferred_replayed_bytes
+                .load(Ordering::Relaxed),
+            125
+        );
+        drop(first);
+        assert_eq!(
+            stats
+                .bootstrap_deferred_replay_bytes
+                .load(Ordering::Relaxed),
+            200
+        );
+        assert_eq!(
+            stats
+                .bootstrap_deferred_replayed_bytes
+                .load(Ordering::Relaxed),
+            100
+        );
+        second.advance(0);
+        assert_eq!(
+            stats
+                .bootstrap_deferred_replayed_bytes
+                .load(Ordering::Relaxed),
+            200
+        );
+        drop(second);
+        assert_eq!(
+            stats
+                .bootstrap_deferred_replay_bytes
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            stats
+                .bootstrap_deferred_replayed_bytes
+                .load(Ordering::Relaxed),
+            0
+        );
+    }
+
     /// Flatten the drain's coalesced `Rows` chunks back to a row list
     async fn collect_rows(rx: &mut mpsc::Receiver<BatcherMsg>) -> Vec<RoutedRow> {
         let mut rows = Vec::new();

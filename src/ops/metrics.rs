@@ -185,6 +185,10 @@ snapshot! {
         "Resident bytes in the in-memory prefixes of every bootstrap TOAST-deferred spool.",
     gauge bootstrap_deferred_spool_bytes: u64 =
         "Encoded bytes in every bootstrap TOAST-deferred spool file.",
+    gauge bootstrap_deferred_replay_bytes: u64 =
+        "Total encoded file bytes in active deferred TOAST replays, excluding spool headers.",
+    gauge bootstrap_deferred_replayed_bytes: u64 =
+        "Encoded file bytes processed by active deferred TOAST replays; excludes prefetched batches and does not imply ClickHouse acknowledgement.",
     counter pending_rows_total: u64 =
         "Undecided backup rows written to ClickHouse pending tables.",
     counter pending_tables_total: u64 = "Pending tables created for undecided backup rows.",
@@ -920,11 +924,15 @@ mod tests {
         let body = render(MetricsSnapshot {
             bootstrap_parts_total: 392,
             bootstrap_parts_done: 117,
+            bootstrap_deferred_replay_bytes: 1000,
+            bootstrap_deferred_replayed_bytes: 250,
             ..MetricsSnapshot::default()
         });
         for want in [
             "walshadow_bootstrap_parts_total 392",
             "walshadow_bootstrap_parts_done_total 117",
+            "walshadow_bootstrap_deferred_replay_bytes 1000",
+            "walshadow_bootstrap_deferred_replayed_bytes 250",
         ] {
             assert!(body.contains(want), "missing {want}\n{body}");
         }
