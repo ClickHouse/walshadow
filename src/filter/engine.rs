@@ -523,10 +523,12 @@ impl Filter {
         }
         let dirty_hit = merged.is_some();
         // Statistics-only transactions do not need invalidation recapture
-        if stats_only && !capture_all {
+        let stats_only = stats_only && !capture_all;
+        if stats_only {
             inval_oids.clear();
         }
-        if !dirty_hit && inval_oids.is_empty() && !capture_all {
+        // Restart may lose statistics-only evidence, retain a durable empty batch
+        if !dirty_hit && inval_oids.is_empty() && !capture_all && !stats_only {
             return Ok(XactEnd::default());
         }
         // Inval-only boundary (dirty tracker missed the writes): the
@@ -554,6 +556,7 @@ impl Filter {
                 capture_all: capture_all || merged.unenumerated,
                 kind: BoundaryKind::Commit,
                 members,
+                stats_only,
             })),
             aborted_tree: None,
         })
@@ -632,6 +635,7 @@ impl Filter {
             capture_all: namespace_hit || flush,
             kind: BoundaryKind::Command { writer_xid: xid },
             members: Vec::new(),
+            stats_only: false,
         })))
     }
 
@@ -1394,9 +1398,9 @@ mod tests {
         r
     }
 
-    /// Statistics writes and their invalidations do not need a boundary
+    /// Persist statistics-only commits for replay after observation state resets
     #[test]
-    fn analyze_commit_raises_no_boundary() {
+    fn analyze_commit_retains_empty_boundary() {
         let mut f = target_filter();
         f.decide_record(&running_xacts_rec(700), 10, 0xD116)
             .unwrap();
@@ -1419,13 +1423,36 @@ mod tests {
             &[(-2, 5, 16384), (-2, 5, 16389)],
             None,
         );
+        let boundary = f
+            .decide_record(&commit, 130, 0xD116)
+            .unwrap()
+            .boundary
+            .unwrap();
+        assert!(boundary.oids.is_empty());
+        assert!(!boundary.capture_all);
         assert!(
-            f.decide_record(&commit, 130, 0xD116)
-                .unwrap()
-                .boundary
-                .is_none(),
-            "commit boundary for a statistics-only transaction",
+            boundary.stats_only,
+            "statistics-only commit should not wait for shadow replay"
         );
+        assert_eq!(boundary.kind, BoundaryKind::Commit);
+
+        let mut resumed = target_filter();
+        resumed.observe_from_xid(900);
+        resumed
+            .decide_record(&pg_class_inplace(746), 110, 0xD116)
+            .unwrap();
+        resumed.decide_record(&invals, 120, 0xD116).unwrap();
+        let replay = resumed
+            .decide_record(&commit, 130, 0xD116)
+            .unwrap()
+            .boundary
+            .unwrap();
+        assert!(!replay.oids.is_empty());
+        assert!(
+            !replay.stats_only,
+            "restart loses statistics-only evidence, so replay must use saved empty batch",
+        );
+        assert_eq!(boundary.drain_xid, replay.drain_xid);
     }
 
     #[test]

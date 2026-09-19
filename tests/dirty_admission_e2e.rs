@@ -724,3 +724,61 @@ async fn ddl_then_toasted_insert_keeps_existing_toast_generation() {
         "and the chunks must decode out of the stash, not be discarded",
     );
 }
+
+/// Verify ANALYZE skips descriptor reads and saves an empty batch for replay
+/// Restart needs this batch because evidence that only statistics changed is lost
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn analyze_covers_its_commit_without_reading_shadow() {
+    if skip_gate() {
+        return;
+    }
+    let mut drill = build_drill(
+        fx::Ports::alloc(),
+        "CREATE SCHEMA das;\n\
+         CREATE TABLE das.t (id bigint PRIMARY KEY, v text);\n",
+        "das",
+        "walshadow-analyze-stub",
+    )
+    .await;
+    let log_stats = drill.pipeline.desc_log.stats_handle();
+    let capture_stats = drill
+        .pipeline
+        .sinks
+        .capture
+        .as_ref()
+        .expect("DDL pipeline should have catalog capture")
+        .stats_handle();
+    let desc_log = drill.pipeline.desc_log.clone();
+    let batches_before = log_stats.batches_appended.load(Ordering::Relaxed);
+    let sql_before = capture_stats.sql_captures.load(Ordering::Relaxed);
+
+    let driver = spawn_txn(
+        &drill.source,
+        "INSERT INTO das.t (id, v) SELECT g, 'v' FROM generate_series(1, 200) g;\n\
+         ANALYZE das.t;\n\
+         SELECT pg_switch_wal();\n",
+    );
+    pump_and_drain(&mut drill).await;
+    let _ = driver.join();
+    drill.pipeline.shutdown().await.expect("pipeline drains");
+    let _ = drill.shadow.stop();
+    let _ = drill.source.stop();
+
+    assert_eq!(
+        capture_stats.sql_captures.load(Ordering::Relaxed),
+        sql_before,
+        "statistics commit queried shadow for descriptors",
+    );
+    assert_eq!(
+        log_stats.batches_appended.load(Ordering::Relaxed),
+        batches_before + 1,
+        "statistics-only commit should append exactly one empty batch",
+    );
+    let stub = desc_log
+        .batch_at(desc_log.head())
+        .expect("log head should contain appended batch");
+    assert!(
+        stub.entries.is_empty() && stub.observations.is_empty(),
+        "statistics-only batch should contain no entries or observations: {stub:?}",
+    );
+}

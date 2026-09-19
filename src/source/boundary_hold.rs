@@ -7,7 +7,8 @@
 //! `on_record`: [`WalStream`](crate::source::wal_stream::WalStream)
 //! dispatches wire bytes for record N, then awaits the record sink before
 //! framing N+1, so an await here holds every successor byte from both the
-//! shadow wire and the archive segment sink. DML-only commits never park.
+//! shadow wire and the archive segment sink. DML-only and
+//! statistics-only commits never wait for shadow replay
 //!
 //! Shadow keeps applying during the hold — the walsender listener task
 //! flushes already-queued bytes independently — and reports apply progress
@@ -225,12 +226,20 @@ impl RecordSink for BoundaryHoldSink {
             let boundary = record.boundary_info.clone();
             let park = match (&self.capture, &boundary) {
                 (Some(capture), Some(info)) => capture.admits(info, record.next_lsn),
-                // Hold-only harness: a command boundary nobody reads is a
-                // stall for nothing
-                (None, Some(info)) => matches!(info.kind, BoundaryKind::Commit),
+                // Without capture, wait only for commits that change more than statistics
+                (None, Some(info)) => matches!(info.kind, BoundaryKind::Commit) && !info.stats_only,
                 _ => true,
             };
             if !park {
+                // Save an empty batch so restart can replay this commit
+                // without reading catalog state from shadow
+                if let (Some(capture), Some(info)) = (&self.capture, &boundary)
+                    && matches!(info.kind, BoundaryKind::Commit)
+                {
+                    capture
+                        .capture_boundary(info, record.source_lsn, record.next_lsn)
+                        .await?;
+                }
                 return self.inner.on_record(record).await;
             }
             // Ship + flush the xact's predecessors before parking; the
@@ -496,6 +505,30 @@ mod tests {
             ..Default::default()
         };
         sink.on_record(&rec).await.expect("no park");
+        assert_eq!(sink.gate.stats.failures.load(Ordering::Relaxed), 0);
+        sink.close().await.expect("close");
+    }
+
+    #[tokio::test]
+    async fn sink_never_parks_at_a_statistics_only_commit() {
+        // No walreceiver runs here, so waiting for replay would time out
+        let q = QueueingRecordSink::spawn(CountingRecordSink::default(), 4, 16, None);
+        let gate = gate_with(state(), Duration::from_millis(10));
+        let mut sink = BoundaryHoldSink::new(q, gate);
+        let stub = crate::record::BoundaryInfo {
+            drain_xid: 7,
+            stats_only: true,
+            ..Default::default()
+        };
+        let rec = Record {
+            source_lsn: 0x1F00,
+            next_lsn: 0x2000,
+            catalog_boundary: true,
+            boundary_info: Some(Arc::new(stub)),
+            ..Default::default()
+        };
+        sink.on_record(&rec).await.expect("no park");
+        assert_eq!(sink.gate.stats.holds.load(Ordering::Relaxed), 0);
         assert_eq!(sink.gate.stats.failures.load(Ordering::Relaxed), 0);
         sink.close().await.expect("close");
     }

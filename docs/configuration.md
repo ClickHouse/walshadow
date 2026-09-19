@@ -279,6 +279,20 @@ Both settings apply at startup. Total reserved memory must fit within half of
 `resident_payload_max`, and remaining memory must hold one pending batch.
 walshadow rejects invalid combinations
 
+ClickHouse tails bound sealed encoder buffers by startup `[ch] byte_budget`,
+including spare vector capacity. Each batch targets that budget divided by
+inserter count, keeping concurrent inserts within a byte limit. Partial batches
+across tables share another `byte_budget`; a producer waiting to hand off a
+sealed batch can hold one additional batch. A single oversized row may exceed
+these limits. Oracle responses and native client buffers remain additional costs
+
+Sealed-buffer permits stay held through resolution, retries and insert completion.
+This pool is separate from decoded-payload admission to avoid circular waits.
+Live byte-budget reductions lower flush thresholds; increasing sealed-buffer
+capacity requires restarting walshadow
+
+`walshadow_process_threads` reports OS threads
+
 ## Backup archive
 
 Configure wal-g-compatible object storage for object-store bootstrap, WAL

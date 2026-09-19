@@ -262,6 +262,7 @@ mod tests {
             BatcherConfig {
                 row_budget: 1_000,
                 byte_budget: 1 << 30,
+                inserters: 1,
                 flush_timeout: Duration::from_secs(3600),
             },
             Allocator::stdlib(),
