@@ -56,7 +56,7 @@ use crate::backfill::backup_page_walk::{
     BOOTSTRAP_TUPLE_CHANNEL_CAP, BackfillTuple, CatalogMap, PageWalkSink,
 };
 use crate::backfill::backup_sentinel::build_lsn_pair;
-use crate::backfill::backup_source::{BackupSink, BackupSource, EndInfo, PumpStats, StartInfo};
+use crate::backfill::backup_source::{BackupSink, BackupSource, EndInfo, StartInfo};
 use crate::backfill::backup_source_direct::DirectSource;
 use crate::backfill::backup_source_object_store::ObjectStoreSource;
 use crate::backfill::spool::{DEFERRED_SPOOL_MEM_MAX, DeferredSpool};
@@ -296,11 +296,11 @@ async fn walk_and_ship(
     }
     let store_toast = resolver.stores_chunks();
 
-    // Dedicated tail: own CH connection, own seq space, own fatal — the
+    // Dedicated tail: own connections, own seq space, own fatal — the
     // live pipeline never blocks on a backfill (Regime A)
     let tail = OwnedTail::spawn(
         &ctx.emitter,
-        1,
+        ctx.emitter.inserter_pool_size.clamp(1, 3),
         ctx.stats.clone(),
         Fatal::new(),
         ctx.config_rx.clone(),
@@ -319,6 +319,7 @@ async fn walk_and_ship(
 
     let sink: Arc<dyn BackupSink> = Arc::new(
         PageWalkSink::new(filter.clone(), walk_tx, store_toast)
+            .with_stats(ctx.stats.backfill_backup_walk.clone())
             .with_pg_xact_accum(pg_xact.clone())
             .with_pg_multixact_accum(pg_multixact.clone())
             .with_lsn_overrides(lsn_overrides),
@@ -366,7 +367,7 @@ async fn walk_and_ship(
     // against a complete pg_xact accum; a failed source drops the sender
     // and the gate discards them instead
     let run_res = source
-        .run(data_dir, sink, Arc::new(PumpStats::default()))
+        .run(data_dir, sink, ctx.stats.backfill_backup_pump.clone())
         .await
         .context("backup_backfill: source.run");
     if run_res.is_ok() {

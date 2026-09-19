@@ -291,6 +291,15 @@ pub struct DeferredReader {
 }
 
 impl DeferredReader {
+    pub fn remaining_file_bytes(&self) -> u64 {
+        match &self.src {
+            ReadSrc::File {
+                remaining_bytes, ..
+            } => *remaining_bytes,
+            ReadSrc::Mem(_) => 0,
+        }
+    }
+
     pub async fn next(&mut self) -> Result<Option<BackfillTuple>> {
         match &mut self.src {
             ReadSrc::Mem(it) => Ok(it.next()),
@@ -518,11 +527,19 @@ mod tests {
     }
 
     async fn drain_all(spool: DeferredSpool) -> Vec<BackfillTuple> {
+        let mut remaining = spool.spooled_bytes();
         let mut reader = spool.into_reader().await.unwrap();
+        assert_eq!(reader.remaining_file_bytes(), remaining);
         let mut out = Vec::new();
         while let Some(t) = reader.next().await.unwrap() {
+            let next = reader.remaining_file_bytes();
+            if remaining > 0 {
+                assert!(next < remaining);
+            }
+            remaining = next;
             out.push(t);
         }
+        assert_eq!(remaining, 0);
         reader.finish().await.unwrap();
         out
     }
