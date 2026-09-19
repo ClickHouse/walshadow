@@ -63,6 +63,7 @@ pub struct QueueingRecordSink {
     /// Records the worker has dispatched; with `in_flight`, tells a draining
     /// queue from a stalled one.
     processed: Arc<AtomicU64>,
+    send_wait_nanos: u64,
     worker: Option<JoinHandle<()>>,
     /// Per-txn span map; `Some` only with OTLP on. `flush_buf` stamps each
     /// shipped record's ship instant (`note_shipped`).
@@ -218,6 +219,7 @@ impl QueueingRecordSink {
             err,
             in_flight,
             processed,
+            send_wait_nanos: 0,
             worker: Some(worker),
             span_registry,
         }
@@ -231,6 +233,10 @@ impl QueueingRecordSink {
     /// Records the worker has dispatched (see the `processed` field).
     pub fn processed(&self) -> u64 {
         self.processed.load(Ordering::Relaxed)
+    }
+
+    pub fn send_wait_seconds(&self) -> f64 {
+        self.send_wait_nanos as f64 / 1e9
     }
 
     /// False once the worker task ended: fatal-error drain closes the
@@ -270,7 +276,12 @@ impl QueueingRecordSink {
             .ok_or_else(|| SinkError::Other("queueing record sink already closed".into()))?;
         // Blocking the pump here is deadlock-safe: shadow is fed by an independent
         // walsender task (+keepalive), so a parked pump can't starve wait_for_replay.
-        if tx.send((Instant::now(), batch)).await.is_err() {
+        let started = Instant::now();
+        let sent = tx.send((started, batch)).await;
+        self.send_wait_nanos = self
+            .send_wait_nanos
+            .saturating_add(started.elapsed().as_nanos() as u64);
+        if sent.is_err() {
             self.in_flight.fetch_sub(n, Ordering::Relaxed);
             if let Some(e) = self.take_pending_error() {
                 return Err(e);

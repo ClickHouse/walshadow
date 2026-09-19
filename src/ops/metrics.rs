@@ -365,8 +365,16 @@ snapshot! {
         "Which attempt the running initial load is; above 1 means an incomplete one was discarded and re-extracted.",
     counter archive_wal_segments_total: u64 =
         "WAL segments replayed out of the backup archive because the source could not serve the resume point.",
+    counter archive_fetch_seconds_total: f64 =
+        "Summed archive fetch durations, including download, decompression and local staging; overlapping fetches add.",
+    counter archive_wait_seconds_total: f64 =
+        "Pump time awaiting next prefetched WAL segment, including waits spanning status ticks.",
+    counter pump_queue_wait_seconds_total: f64 =
+        "Pump time sending batches into bounded decoder queue.",
+    counter archive_replay_seconds_total: f64 =
+        "Time filtering and dispatching archived WAL, including downstream backpressure.",
     gauge archive_restore_active: u64 =
-        "1 while the pump is inside that archive leg, which owns the pump task for its whole duration, so every other family here holds the value it had when the leg started.",
+        "1 while consuming prefetched archive WAL through the normal pump.",
     counter source_endpoint_swaps_total: u64 =
         "Source feeds swapped onto a reloaded `[source]` endpoint or slot.",
     counter source_endpoint_swap_failures_total: u64 =

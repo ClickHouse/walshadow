@@ -793,3 +793,145 @@ async fn wire_drop_midsegment_shadow_resumes_streaming() {
         panic!("{e:#}\n--- daemon stderr ---\n{stderr}\n--- shadow startup.log tail ---\n{tail}");
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn process_restart_preserves_shadow_postmaster() {
+    if !pg_available() || !pg_basebackup_available() {
+        eprintln!("skip: PostgreSQL binaries unavailable");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let source = make_pg(&tmp, "source", ports::PG_SOURCE_PORT);
+    source.initdb().unwrap();
+    source.write_base_conf().unwrap();
+    append_source_conf(&source);
+    source.start().unwrap();
+    let _source_stop = StopOnDrop { sh: &source };
+    let data = tmp.path().join("shadow-data");
+    pg_basebackup(&source, &data).unwrap();
+    let filtered = tmp.path().join("filtered");
+    let socket = tmp.path().join("shadow-sock");
+    fs::create_dir_all(&filtered).unwrap();
+    fs::create_dir_all(&socket).unwrap();
+    let port = ports::reserve_port();
+    rewrite_for_shadow(&data, ports::PG_SHADOW_PORT, &socket).unwrap();
+    enable_recovery(&data, &filtered, port).unwrap();
+    append_bridge_conf(&data, &socket, pgext_dir()).unwrap();
+    let mut cfg = ShadowConfig::new(data.clone(), filtered.clone());
+    cfg.port = ports::PG_SHADOW_PORT;
+    cfg.socket_dir = socket.clone();
+    cfg.bridge = Some(BridgeConf::in_dir(&socket));
+    let shadow = Shadow::new(cfg);
+    shadow.start().unwrap();
+    let _shadow_stop = StopOnDrop { sh: &shadow };
+    shadow.validate_running().unwrap();
+    let mut incompatible = shadow.config().clone();
+    incompatible.bridge.as_mut().unwrap().workers = 2;
+    assert!(matches!(
+        Shadow::new(incompatible).validate_running(),
+        Err(walshadow::shadow::ShadowError::Incompatible(_))
+    ));
+    let pid = fs::read_to_string(data.join("postmaster.pid"))
+        .unwrap()
+        .lines()
+        .next()
+        .unwrap()
+        .to_string();
+    let spill = tmp.path().join("spill");
+    for round in 0..3 {
+        let metrics_port = ports::reserve_port();
+        let metrics_addr: SocketAddr = format!("127.0.0.1:{metrics_port}").parse().unwrap();
+        let log = tmp.path().join(format!("daemon-{round}.log"));
+        let mut child = Command::new(env!("CARGO_BIN_EXE_walshadow-stream"))
+            .args([
+                "--host",
+                source.config().socket_dir.to_str().unwrap(),
+                "--port",
+                &ports::PG_SOURCE_PORT.to_string(),
+                "--user",
+                "postgres",
+                "--dbname",
+                "postgres",
+                "--sslmode",
+                "disable",
+                "--out-dir",
+                filtered.to_str().unwrap(),
+                "--spill-dir",
+                spill.to_str().unwrap(),
+                "--bootstrap-shadow-data-dir",
+                data.to_str().unwrap(),
+                "--keep-shadow-running",
+                "--shadow-socket-dir",
+                socket.to_str().unwrap(),
+                "--shadow-port",
+                &ports::PG_SHADOW_PORT.to_string(),
+                "--shadow-user",
+                "postgres",
+                "--walsender-bind",
+                &format!("127.0.0.1:{port}"),
+                "--metrics-bind",
+                &metrics_addr.to_string(),
+                "--status-interval",
+                "1",
+                "--retention-bytes",
+                "0",
+            ])
+            .stdout(Stdio::null())
+            .stderr(fs::File::create(&log).unwrap())
+            .spawn()
+            .unwrap();
+        let result: Result<()> = async {
+            let started = Instant::now();
+            loop {
+                if let Some(status) = child.try_wait()? {
+                    bail!("daemon exited: {status}");
+                }
+                if http_get(metrics_addr, "/metrics")
+                    .ok()
+                    .and_then(|body| metric_u64(&body, "walshadow_uptime_seconds_total").ok())
+                    .is_some_and(|uptime| uptime > 0)
+                {
+                    break;
+                }
+                anyhow::ensure!(
+                    started.elapsed() < Duration::from_secs(60),
+                    "daemon not ready"
+                );
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            source.psql_one("SELECT pg_switch_wal()")?;
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let signal = if round == 1 { "-KILL" } else { "-TERM" };
+            let status = Command::new("kill")
+                .args([signal, &child.id().to_string()])
+                .status()?;
+            anyhow::ensure!(status.success(), "kill {signal} failed");
+            let status = wait_with_timeout(&mut child, Duration::from_secs(30))?;
+            anyhow::ensure!(
+                status.success() == (round != 1),
+                "unexpected shutdown status: {status}"
+            );
+            Ok(())
+        }
+        .await;
+        if result.is_err() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        assert!(
+            result.is_ok(),
+            "{result:?}\n{}",
+            fs::read_to_string(&log).unwrap()
+        );
+        assert!(shadow.is_running().unwrap());
+        assert_eq!(
+            fs::read_to_string(data.join("postmaster.pid"))
+                .unwrap()
+                .lines()
+                .next()
+                .unwrap(),
+            pid
+        );
+        assert!(spill.join("manifest.toml").exists());
+    }
+}
