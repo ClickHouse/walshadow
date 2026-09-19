@@ -221,7 +221,12 @@ async fn run_object_store_pass(ctx: &PassContext, reqs: &[BackupRequest]) -> Res
 
     let source = Box::new(
         ObjectStoreSource::new(settings.clone(), storage, resolved, ctx.scratch_dir.clone())
-            .with_parallelism(4),
+            .with_parallelism(
+                ctx.emitter
+                    .bootstrap
+                    .object_store_parallelism
+                    .map_or(8, |n| n.get()),
+            ),
     );
     // Tag min(B_redo, S) per rel: gap replay covers (B_redo, S], so walked
     // rows must lose to replayed commits; a backup newer than the opt-in
