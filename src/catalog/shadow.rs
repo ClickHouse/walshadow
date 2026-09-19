@@ -43,6 +43,8 @@ pub enum ShadowError {
     },
     #[error("psql parse: {0}")]
     PsqlParse(String),
+    #[error("running shadow incompatible with requested configuration: {0}")]
+    Incompatible(String),
     #[error("pg_controldata parse: {0}")]
     ControlDataParse(String),
     #[error("timeout waiting for {what} after {elapsed:?}")]
@@ -269,6 +271,38 @@ impl Shadow {
         &self.config
     }
 
+    /// Reject adoption of another cluster or restart-only configuration change
+    pub fn validate_running(&self) -> Result<()> {
+        if !self.is_in_recovery()? {
+            return Err(ShadowError::NotInRecovery);
+        }
+        let actual = self.psql_one("SHOW data_directory")?;
+        if fs::canonicalize(actual)? != fs::canonicalize(&self.config.data_dir)? {
+            return Err(ShadowError::Incompatible("data_directory differs".into()));
+        }
+        let restore = format!("cp {}/%f %p", self.config.filter_out_dir.display());
+        if self.psql_one("SHOW restore_command")? != restore {
+            return Err(ShadowError::Incompatible("restore_command differs".into()));
+        }
+        if let Some(bridge) = &self.config.bridge {
+            if self.psql_one("SHOW walshadow.socket_path")? != bridge.socket_path.to_string_lossy()
+            {
+                return Err(ShadowError::Incompatible("bridge socket differs".into()));
+            }
+            let workers = self.psql_one("SHOW walshadow.bridge_workers")?;
+            if workers
+                .parse::<usize>()
+                .ok()
+                .is_none_or(|n| n < bridge.workers)
+            {
+                return Err(ShadowError::Incompatible(
+                    "bridge worker increase requires shadow restart".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Socket the preloaded bridge worker listens on, `None` when unconfigured
     pub fn bridge_socket(&self) -> Option<&Path> {
         self.config.bridge.as_ref().map(|b| b.socket_path.as_path())
@@ -398,8 +432,16 @@ impl Shadow {
         Ok(())
     }
 
-    /// Set `primary_conninfo` and reload running shadow
+    /// Set `primary_conninfo` and reload running shadow. Appends, so an
+    /// adopted shadow — whose conf this daemon never regenerated — must not
+    /// gain a line per boot
     pub fn point_at_walsender(&self, conninfo: &str) -> Result<()> {
+        if self
+            .psql_one("SHOW primary_conninfo")
+            .is_ok_and(|cur| cur == conninfo)
+        {
+            return Ok(());
+        }
         let conf_path = self.config.data_dir.join("postgresql.conf");
         let mut f = fs::OpenOptions::new().append(true).open(&conf_path)?;
         f.write_all(primary_conninfo_line(conninfo).as_bytes())?;

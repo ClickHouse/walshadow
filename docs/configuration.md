@@ -298,3 +298,55 @@ object_store_parallelism = 8
 Supported archive schemes are `s3://`, `gs://`, and `file://`. Prefer ambient
 cloud credentials. When using static S3 credentials, set both `access_key` and
 `secret_key`
+
+### Process-only deployment
+
+Pass `--keep-shadow-running` or set `WALSHADOW_KEEP_SHADOW_RUNNING=true` to
+leave managed shadow PostgreSQL running when walshadow exits. On startup,
+walshadow checks recovery mode, data directory, restore command and bridge
+configuration before adopting it, and fails startup rather than restarting
+PostgreSQL. A changed shadow port or socket directory surfaces as a connection
+failure during that check, not as a named mismatch. Extension replacement and
+increases in bridge worker count still require a separately planned PostgreSQL
+restart. `primary_conninfo` needs no restart: walshadow repoints an adopted
+shadow at its own walsender by reload.
+
+For systemd, install `deploy/walshadow.service.d/process-restart.conf` as
+`/etc/systemd/system/walshadow.service.d/process-restart.conf` and run
+`systemctl daemon-reload`. Launcher must `exec` walshadow, so MainPID receives
+SIGTERM. Drop-in scopes signals to walshadow; stopping unit deliberately leaves
+shadow running. Stop shadow explicitly with `pg_ctl` when retiring instance.
+An old binary does not honor preservation flag. For first migration, install
+new binary and drop-in, reload systemd, then signal only old MainPID with
+`systemctl kill --kill-who=main --signal=SIGKILL walshadow`. Automatic restart
+launches new binary and adopts running shadow. This uses last durable cursor;
+old archive loop may have left it behind. Subsequent upgrades use normal
+`systemctl restart walshadow` and graceful checkpointing.
+
+`--archive-prefetch` controls concurrent archive downloads, default 4, range
+1–64. Downloads overlap filtering and decoding, with ordered consumption and
+a bounded queue. At most approximately `(prefetch + 2) * 16 MiB` of decoded WAL
+is retained, plus decompressor and pipeline buffers. That memory is not charged
+to `[memory] resident_payload_max`, so raise this only where the unmetered half
+of the host has room. Segments decode straight into memory over the same
+decrypt and decompress path as `wal-fetch`, so recovery writes no staging files
+and an interrupted leg leaves none behind.
+
+Archive recovery now runs through normal checkpoint, pause, metrics and signal
+handling. Restart cursor remains bounded by durable WAL, shadow replay and
+oldest unacknowledged transaction. Graceful exit drains pipeline and writes a
+final checkpoint. Prefetched bytes never advance durable cursor.
+
+Object-store table backfills honor `[bootstrap] object_store_parallelism`,
+defaulting to 8 when absent. This controls concurrent parts, not ClickHouse
+inserter count. Incomplete table backfills still restart their pass; completed
+parts are not independently checkpointed.
+
+`walshadow_archive_fetch_seconds_total` sums fetch durations across concurrent
+requests, including decrypt and decompression. `walshadow_archive_replay_seconds_total`
+measures filter/dispatch time including downstream backpressure. Compare rates
+with archive segments and queue depth to locate remaining serialization.
+
+`walshadow_archive_wait_seconds_total` measures pump waits for prefetched WAL;
+`walshadow_pump_queue_wait_seconds_total` measures sends blocked behind decoder.
+These distinguish insufficient fetch concurrency from downstream backpressure.
