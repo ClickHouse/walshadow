@@ -102,6 +102,9 @@ impl Fixture {
         fx::create_ch_dest_table(&ch, "default", "t").unwrap();
         let emitter = EmitterConfig {
             port: ports.ch_tcp,
+            inserter_pool_size: 4,
+            byte_budget: 1 << 20,
+            row_budget: 1,
             insert_timeout: Duration::from_secs(2),
             ..Default::default()
         };
@@ -403,4 +406,100 @@ async fn staged_schema_change_discards_load_and_keeps_retry_pending() {
             .unwrap(),
         "1\tnew"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn resumed_copy_preserves_boundary_and_newer_live_rows() {
+    if !fx::requirements_available() {
+        return;
+    }
+    let mut fx = Fixture::new().await;
+    fx.emitter.bootstrap.copy_fallback = Some(false);
+    let dir = tempfile::tempdir().unwrap();
+    fx.source.psql_one("ALTER TABLE public.t ALTER COLUMN name SET STORAGE EXTERNAL; UPDATE public.t SET name = repeat('external', 1000) WHERE id = 1").unwrap();
+    fx.ch
+        .query("INSERT INTO default.t (id, name, _lsn) VALUES (2, 'live', 200)")
+        .unwrap();
+    std::fs::write(
+        dir.path().join("backfills.toml"),
+        r#"version = 1
+[[backfill]]
+namespace = "public"
+relname = "t"
+s_lsn = "0/64"
+done = false
+mode = "copy"
+swapped = false
+"#,
+    )
+    .unwrap();
+    let backfiller = fx.backfiller(dir.path()).await;
+    backfiller
+        .note_opt_in(&fx.desc, InitialLoadMode::ObjectStore, 300)
+        .await;
+    wait_done(&backfiller, dir.path()).await;
+    assert_eq!(
+        fx.ch
+            .query("SELECT id, length(name), _lsn FROM default.t FINAL ORDER BY id")
+            .unwrap(),
+        "1\t8000\t100\n2\t4\t200\n3\t5\t100"
+    );
+    let ledger = read_ledger(dir.path());
+    assert_eq!(ledger["backfill"][0]["mode"].as_str(), Some("copy"));
+    assert_eq!(ledger["backfill"][0]["s_lsn"].as_str(), Some("0/64"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failed_backup_defaults_to_copy_at_original_boundary() {
+    if !fx::requirements_available() {
+        return;
+    }
+    let fx = Fixture::new().await;
+    let dir = tempfile::tempdir().unwrap();
+    fx.ch
+        .query("INSERT INTO default.t (id, name, _lsn) VALUES (2, 'live', 200)")
+        .unwrap();
+    let backfiller = fx.backfiller(dir.path()).await;
+    backfiller
+        .note_opt_in(&fx.desc, InitialLoadMode::ObjectStore, 100)
+        .await;
+    wait_done(&backfiller, dir.path()).await;
+    assert_eq!(fx.rows(), "1\tone\n2\tlive\n3\tthree");
+    let ledger = read_ledger(dir.path());
+    assert_eq!(ledger["backfill"][0]["mode"].as_str(), Some("copy"));
+    assert_eq!(ledger["backfill"][0]["s_lsn"].as_str(), Some("0/64"));
+    assert_eq!(
+        fx.ch
+            .query("SELECT id, _lsn FROM default.t FINAL ORDER BY id")
+            .unwrap(),
+        "1\t100\n2\t200\n3\t100"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failed_backup_can_disable_copy_fallback() {
+    if !fx::requirements_available() {
+        return;
+    }
+    let mut fx = Fixture::new().await;
+    fx.emitter.bootstrap.copy_fallback = Some(false);
+    let dir = tempfile::tempdir().unwrap();
+    let backfiller = fx.backfiller(dir.path()).await;
+    backfiller
+        .note_opt_in(&fx.desc, InitialLoadMode::ObjectStore, 100)
+        .await;
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while fx.ch.query("EXISTS default.t__wsstg").unwrap() != "1" {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(backfiller.pending_by_mode(), [0, 0, 1]);
+    assert_eq!(
+        read_ledger(dir.path())["backfill"][0]["mode"].as_str(),
+        Some("object_store")
+    );
+    assert_eq!(fx.rows(), "");
 }

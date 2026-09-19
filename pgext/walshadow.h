@@ -8,7 +8,7 @@
 
 /* Bumped when a request or response layout changes, or when an op's reading
  * of an unchanged layout changes */
-#define WS_PROTO_VERSION		3
+#define WS_PROTO_VERSION		5
 /* Bumped when any catalog projection changes shape */
 #define WS_PROJECTION_VERSION	1
 
@@ -17,6 +17,17 @@
 #define WS_OP_ENCODE_NATIVE		0x02
 #define WS_OP_SCAN				0x03
 #define WS_OP_REPLAY_LSN		0x04
+#define WS_OP_FETCH_TOAST		0x05
+
+/* per-value result in a FETCH_TOAST response */
+#define WS_FETCH_OK			0x00
+/* no chunk at all under the value id */
+#define WS_FETCH_MISSING	0x01
+/* chunks found, but sequence or total size does not match pointer */
+#define WS_FETCH_MISMATCH	0x02
+
+/* Maximum values sharing one FETCH_TOAST replay bound */
+#define WS_MAX_FETCH_VALUES	1024
 
 /* response status byte */
 #define WS_STATUS_OK		0x00
@@ -46,6 +57,9 @@ typedef enum WsCatalog
 } WsCatalog;
 
 extern void ws_handle_encode_native(StringInfo req, StringInfo resp);
+
+/* toast.c */
+extern void ws_handle_fetch_toast(StringInfo req, StringInfo resp);
 
 /* overlay.c */
 typedef struct WsScanStats

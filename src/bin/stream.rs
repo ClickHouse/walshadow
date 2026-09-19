@@ -38,9 +38,11 @@ use std::time::{Duration, Instant};
 use ahash::HashSet;
 use anyhow::{Context, Result};
 use clap::Parser;
+use futures::{StreamExt, stream as futures_stream};
 use std::fs;
 use std::future::Future;
 use std::pin::Pin;
+use tokio::io::AsyncReadExt;
 use tokio::sync::{Mutex, watch};
 use tokio_postgres::types::PgLsn;
 use tokio_util::sync::CancellationToken;
@@ -375,6 +377,17 @@ struct Args {
     start_lsn: Option<String>,
     #[arg(long, default_value_t = 10)]
     status_interval: u64,
+
+    /// Concurrent archive fetches, each holding at most one WAL segment.
+    /// Held bytes are not charged to `[memory] resident_payload_max`, which
+    /// leaves only half the host for shadow and every unmetered allocation
+    #[arg(long, default_value = "4", value_parser = clap::value_parser!(u16).range(1..=64))]
+    archive_prefetch: u16,
+
+    /// Reconnect to compatible shadow PostgreSQL and leave it running on exit
+    #[arg(long, env = "WALSHADOW_KEEP_SHADOW_RUNNING")]
+    keep_shadow_running: bool,
+
     /// Stop after this many segments shipped (smoke tests). Zero = forever.
     #[arg(long, default_value_t = 0)]
     max_segments: u64,
@@ -976,6 +989,11 @@ async fn run_session(
     );
     let bootstrap_plan = resolve_bootstrap(args, ch_config.as_ref())?;
     let shadow_start = resolve_shadow_start(args, bootstrap_plan.mode)?;
+    if ch_config.as_ref().is_some_and(|c| c.toast.mode.is_shadow())
+        && let ShadowStart::Resume(dir) = &shadow_start
+    {
+        walshadow::filter::shadow_relations::ShadowRelations::load(dir).await?;
+    }
     let bridge_workers = match shadow_start {
         ShadowStart::External => 1,
         _ => bridge_pool_size(ch_config.as_ref()),
@@ -1047,25 +1065,34 @@ async fn run_session(
         ShadowStart::Bootstrap(dir)
         | ShadowStart::Rebootstrap(dir, _)
         | ShadowStart::Resume(dir) => {
-            let shadow = Arc::new(build_owned_shadow(
-                args,
-                &source_conn.dbname,
-                dir.clone(),
-                bridge_workers,
-            ));
-            shadow
-                .write_standby_signal()
-                .context("write standby.signal")?;
-            walshadow::ops::stages::SHADOW_REPLAY
-                .measure(start_owned_shadow(
-                    &shadow,
-                    bootstrap_end_lsn,
-                    Duration::from_secs(args.bootstrap_shadow_replay_timeout),
-                ))
-                .await?;
+            // Reuse shadow instance started during bootstrap
+            let shadow = match bootstrap_handoff.as_ref().and_then(|h| h.shadow.clone()) {
+                Some(running) => running,
+                None => {
+                    let shadow = Arc::new(build_owned_shadow(
+                        args,
+                        &source_conn.dbname,
+                        dir.clone(),
+                        bridge_workers,
+                    ));
+                    shadow
+                        .write_standby_signal()
+                        .context("write standby.signal")?;
+                    walshadow::ops::stages::SHADOW_REPLAY
+                        .measure(start_owned_shadow(
+                            &shadow,
+                            bootstrap_end_lsn,
+                            Duration::from_secs(args.bootstrap_shadow_replay_timeout),
+                            args.keep_shadow_running,
+                        ))
+                        .await?;
+                    shadow
+                }
+            };
             Some(ShadowLifecycle::spawn(
                 shadow,
                 walsender_primary_conninfo(args.walsender_bind),
+                args.keep_shadow_running,
             ))
         }
     };
@@ -1122,10 +1149,22 @@ async fn run_session(
         ident.xlogpos,
     );
     let pinned = bootstrap_end_lsn.is_some() || start_lsn_override.is_some();
+    let shadow_holds_data = ch_config.as_ref().is_some_and(|c| c.toast.mode.is_shadow());
+    let shadow_replay_seed = manifest_at_boot
+        .as_ref()
+        .map(|m| m.lsn.shadow_replay.get().max(m.lsn.shadow_flush.get()))
+        .unwrap_or_default();
+    let boot_shadow_floor = if pinned {
+        manifest::ShadowFloor::unbounded()
+    } else {
+        manifest::ShadowFloor::new(shadow_holds_data, 0, shadow_replay_seed)
+    };
+    let raw_start = boot_shadow_floor.bound(raw_start);
     let floor_at_boot = manifest_at_boot
         .as_ref()
         .map(|m| m.floor)
-        .filter(|f| !f.is_zero());
+        .filter(|f| !f.is_zero())
+        .map(|f| boot_shadow_floor.bound(f));
     // Archive-end scan only feeds the greenfield clamp (keep archive
     // continuous until live streaming begins: starting after last sealed
     // segment leaves shadow missing WAL; re-read from earlier LSN, CH
@@ -1239,6 +1278,11 @@ async fn run_session(
         .collect();
 
     let mut stream = WalStream::new(start_timeline, WAL_SEG_SIZE, aligned)?;
+    let mut prefix_dirs = vec![args.out_dir.clone()];
+    if let Some(dir) = shadow_start.data_dir() {
+        prefix_dirs.push(dir.join("pg_wal"));
+    }
+    stream.preserve_resume_prefix(&prefix_dirs).await?;
     // Shadow must attach to this listener before catalog replay can advance
     let mut shadow_boot = walshadow::shadow_stream::ShadowStreamState::new(
         history.shadow_boot_branch(stored_timeline, aligned.get(), start_timeline),
@@ -1458,6 +1502,18 @@ async fn run_session(
         .await
         .context("shadow database oid")?;
     stream.filter_mut().set_target_db(shadow_db_oid);
+    let shadow_toast = ch_config.as_ref().is_some_and(|c| c.toast.mode.is_shadow());
+    if shadow_toast {
+        let dir = shadow_start
+            .data_dir()
+            .context("[toast] mode = shadow requires a daemon-owned shadow")?;
+        stream.filter_mut().load_shadow_rels(dir).await?;
+        tracing::info!(
+            target: "walshadow::toast",
+            rels = stream.filter().shadow_rels().map_or(0, |rels| rels.len()),
+            "[toast] mode = shadow: loaded durable replay eligibility",
+        );
+    }
     let pending_cfg = ch_config
         .as_ref()
         .map(|c| c.pending_capture)
@@ -2043,11 +2099,10 @@ async fn run_session(
     let source_recovery = SourceRecovery {
         status_interval: Duration::from_secs(args.status_interval),
         backup: backup_settings.as_ref(),
-        spill_dir: &args.spill_dir,
         floor: &resume_floor,
-        metrics: &metrics,
-        emitter_ack: &emitter_ack,
+        prefetch: usize::from(args.archive_prefetch),
     };
+    let mut archive = None;
     if let Err(e) = feed
         .start_physical_replication(
             source_conn.slot.as_deref(),
@@ -2055,19 +2110,19 @@ async fn run_session(
             start_timeline,
         )
         .await
-    {
-        feed = source_recovery
+        && let Some(recovered) = source_recovery
             .recover(
                 e,
                 &cfg,
                 source_conn.slot.as_deref(),
                 stream_branch(&history, live_identity.system_id, &stream),
-                &mut stream,
-                &mut record_sink,
-                &mut segment_sink,
+                stream.next_lsn(),
+                &mut archive,
             )
             .await
-            .context("resume WAL source")?;
+            .context("resume WAL source")?
+    {
+        feed = recovered;
     }
 
     let mut segments_shipped = 0u64;
@@ -2125,6 +2180,12 @@ async fn run_session(
     let mut crossing = CrossingState::default();
     let mut barrier_logged: Option<Instant> = None;
     let shutdown_reason = loop {
+        if archive.is_some() && history.branch_exhausted(stream.timeline(), stream.next_lsn().get())
+        {
+            archive = None;
+            crossing.ancestor_ended();
+            crossing.needs_connection();
+        }
         let paused = pump_config_rx
             .as_ref()
             .map(|rx| rx.borrow().paused)
@@ -2172,6 +2233,7 @@ async fn run_session(
             {
                 Ok(swapped) => {
                     feed = swapped;
+                    archive = None;
                     source_swap_pending = false;
                     source_swap_retry_at = None;
                     source_swaps_total += 1;
@@ -2275,11 +2337,10 @@ async fn run_session(
             // Read acknowledgment first so no transaction escapes floor
             (drain_lsn, b.resume_safe_lsn(ea))
         };
-        // shadow_replay==0 (sweeper off or not yet reported) means "no
-        // constraint from shadow", not the literal min: else a fresh boot
-        // with retention off pins apply_lsn at 0 and source's slot never recycles.
+        let shadow_floor =
+            manifest::ShadowFloor::new(shadow_toast, shadow_replay.get(), shadow_replay_seed);
         let apply_ceiling = match shadow_replay.get() {
-            0 => resume_safe_lsn,
+            0 => shadow_floor.bound(resume_safe_lsn),
             s => s.min(resume_safe_lsn.get()).into(),
         };
         // Never walks back. A crossing commits the fork segment's start, which
@@ -2287,7 +2348,9 @@ async fn run_session(
         // segment; the natural terms must not undo the position a restart
         // resumes from. A rewind (`--start-lsn`, `--ignore-cursor`) lowers it by
         // seeding `resume_floor` at the rewind point instead
-        let floor = manifest::resolved_floor(resume_safe_lsn, durable).max(resume_floor.get());
+        let floor = shadow_floor
+            .bound(manifest::resolved_floor(resume_safe_lsn, durable))
+            .max(resume_floor.get());
         let floor_timeline = history.floor_branch(
             floor.get(),
             live_identity.timeline,
@@ -2339,6 +2402,8 @@ async fn run_session(
         let dispatched_before = stream.dispatched_lsn();
         // Set inside the select arm, acted on once the chunk borrow is released
         let mut ancestor_ended = false;
+        let archived_bytes;
+        let mut archived_segment = false;
         let chunk = tokio::select! {
             biased;
             sig = tokio::signal::ctrl_c() => {
@@ -2353,7 +2418,41 @@ async fn run_session(
             // arm and the pump continues from the same LSN. A pending crossing
             // also parks it — that connection is out of COPY until the
             // descendant is requested.
-            res = feed.next_event(status, &mut chunk_buf), if !paused && !crossing.pending() => match res {
+            result = async { archive.as_mut().unwrap().next().await },
+                if archive.is_some() && !paused && !crossing.pending() => {
+                match result {
+                    Some(Ok((start_lsn, mut bytes))) => {
+                        anyhow::ensure!(start_lsn == stream.next_lsn().get(), "archive WAL discontinuity");
+                        if let Some(fork) = history.switchpoint_of(stream.timeline()) {
+                            anyhow::ensure!(start_lsn < fork, "archive read past timeline fork");
+                            bytes.truncate((fork - start_lsn).min(bytes.len() as u64) as usize);
+                        }
+                        archived_bytes = bytes;
+                        archived_segment = true;
+                        Some(walshadow::source_feed::WalChunk {
+                            start_lsn,
+                            server_wal_end: start_lsn + archived_bytes.len() as u64,
+                            data: &archived_bytes,
+                        })
+                    }
+                    result => {
+                        let reason = match result {
+                            Some(Err(e)) => format!("{e:#}"),
+                            None => "archive reader stopped".to_string(),
+                            Some(Ok(_)) => unreachable!(),
+                        };
+                        archive = None;
+                        tracing::info!(target: "walshadow", reason, "archive ended, reconnecting source");
+                        feed = source_recovery.reconnect_or_operator(
+                            &cfg, source_conn.slot.as_deref(),
+                            stream_branch(&history, live_identity.system_id, &stream),
+                            stream.next_lsn(), &reason,
+                        ).await?;
+                        None
+                    }
+                }
+            },
+            res = feed.next_event(status, &mut chunk_buf), if archive.is_none() && !paused && !crossing.pending() => match res {
                 Ok(SourceEvent::Wal(c)) => Some(c),
                 Ok(SourceEvent::TimelineEnd) => {
                     ancestor_ended = true;
@@ -2383,17 +2482,18 @@ async fn run_session(
                         resume_lsn = %stream.next_lsn(),
                         "source shut down its walsender — reconnecting",
                     );
-                    feed = source_recovery
+                    if let Some(recovered) = source_recovery
                         .recover(
                             anyhow::anyhow!("source walsender exited"),
                             &cfg,
                             source_conn.slot.as_deref(),
                             stream_branch(&history, live_identity.system_id, &stream),
-                            &mut stream,
-                            &mut record_sink,
-                            &mut segment_sink,
+                            stream.next_lsn(),
+                            &mut archive,
                         )
-                        .await?;
+                        .await? {
+                            feed = recovered;
+                        }
                     source_swap_pending = false;
                     source_swap_retry_at = None;
                     None
@@ -2406,17 +2506,18 @@ async fn run_session(
                         resume_lsn = format_pg_lsn(resume).to_string(),
                         "source stream error — recovering",
                     );
-                    feed = source_recovery
+                    if let Some(recovered) = source_recovery
                         .recover(
                             e,
                             &cfg,
                             source_conn.slot.as_deref(),
                             stream_branch(&history, live_identity.system_id, &stream),
-                            &mut stream,
-                            &mut record_sink,
-                            &mut segment_sink,
+                            stream.next_lsn(),
+                            &mut archive,
                         )
-                        .await?;
+                        .await? {
+                            feed = recovered;
+                        }
                     // Recovery dialed the live endpoint, so a queued swap is done
                     source_swap_pending = false;
                     source_swap_retry_at = None;
@@ -2435,6 +2536,7 @@ async fn run_session(
             .map(|c| c.server_wal_end)
             .unwrap_or(received.get());
         if let Some(chunk) = chunk {
+            let replay_started = Instant::now();
             stream
                 .push(
                     chunk.start_lsn,
@@ -2443,7 +2545,28 @@ async fn run_session(
                     &mut segment_sink,
                 )
                 .await?;
+            if archived_segment {
+                metrics
+                    .update(|snap| {
+                        snap.archive_wal_segments_total += 1;
+                        snap.archive_replay_seconds_total += replay_started.elapsed().as_secs_f64();
+                    })
+                    .await;
+            }
         }
+        metrics
+            .update(|snap| {
+                snap.archive_restore_active = u64::from(archive.is_some());
+                snap.pump_queue_wait_seconds_total =
+                    record_sink.decoder_xact.inner.send_wait_seconds();
+                if let Some(reader) = &archive {
+                    snap.archive_fetch_seconds_total +=
+                        reader.fetch_nanos.swap(0, Ordering::Relaxed) as f64 / 1e9;
+                    snap.archive_wait_seconds_total +=
+                        reader.wait_nanos.swap(0, Ordering::Relaxed) as f64 / 1e9;
+                }
+            })
+            .await;
         if ancestor_ended {
             // Answer the backend's CopyDone now, leaving the connection in
             // simple-query mode: that is the state the crossing reads history
@@ -2702,14 +2825,7 @@ async fn run_session(
             let b = xact_buffer.lock().await;
             let stats = b.stats().clone();
             let line = stats.summary();
-            let resident = DrainResident {
-                total: b.drain_resident_bytes(),
-                chunks: b.drain_chunk_resident_bytes(),
-                rows: b.drain_row_resident_bytes(),
-                spool: b.toast_spool_bytes(),
-                raw_pending_rows: b.raw_pending_rows(),
-                raw_pending_bytes: b.raw_pending_bytes(),
-            };
+            let resident = DrainResident::from_buffer(&b);
             (stats, resident, line)
         };
         let oracle_line = oracle
@@ -2865,12 +2981,15 @@ async fn run_session(
             inflight_stall_logged = false;
         }
     };
+    drop(archive);
     tracing::info!(
         target: "walshadow",
         reason = shutdown_reason,
         out_dir = %args.out_dir.display(),
         "stopping — flushing partial segment",
     );
+    let final_timeline = stream.timeline();
+    let final_received = stream.next_lsn().get();
     stream
         .close(Some(&mut segment_sink), &mut record_sink)
         .await
@@ -2903,6 +3022,50 @@ async fn run_session(
         .join()
         .await
         .map_err(|m| anyhow::anyhow!("decode+insert pipeline drain failed: {m}"))?;
+    let (drain, resume_safe) = {
+        let mut b = xact_buffer.lock().await;
+        let ea = emitter_ack.get();
+        let drain = b.stats().drain_lsn;
+        (drain, b.resume_safe_lsn(ea))
+    };
+    let shadow_replay = shadow_replay_lsn.get();
+    // `close` zero-pads the final partial to a whole segment, so its fsync
+    // publishes a durable end past what the source actually sent
+    let durable = Pos::new(durable_lsn.get().get().min(final_received));
+    let floor = manifest::ShadowFloor::new(shadow_toast, shadow_replay.get(), shadow_replay_seed)
+        .bound(manifest::resolved_floor(resume_safe, durable))
+        .max(resume_floor.get());
+    let floor_timeline = history.floor_branch(
+        floor.get(),
+        live_identity.timeline,
+        final_timeline,
+        WAL_SEG_SIZE,
+    );
+    manifest::write(
+        &args.spill_dir,
+        &manifest::Manifest {
+            version: manifest::MANIFEST_VERSION,
+            floor,
+            source: manifest::SourceIdentity {
+                system_id: live_identity.system_id,
+                timeline: floor_timeline,
+                timeline_begin: history.begin_of(floor_timeline).unwrap_or(0).into(),
+            },
+            wal: manifest::WalBranch {
+                stream_timeline: final_timeline,
+            },
+            lsn: manifest::LsnSet {
+                source_received: Pos::new(final_received),
+                filter_durable: durable,
+                shadow_replay,
+                drain,
+                emitter_ack: resume_safe,
+                shadow_flush: shadow_flush_lsn.get(),
+            },
+        },
+    )
+    .await
+    .context("write shutdown resume manifest")?;
     if let Some(lifecycle) = shadow_lifecycle {
         lifecycle.shutdown().await;
     }
@@ -3145,6 +3308,9 @@ fn spawn_mapping_refresher(
 /// Max unsynced segments queued before the pump blocks on `on_segment`;
 const SEGMENT_FSYNC_QUEUE: usize = 64;
 
+/// `pg_default`, PG `catalog/pg_tablespace.dat`
+const DEFAULT_TABLESPACE_OID: u32 = 1663;
+
 #[cfg(target_os = "linux")]
 fn sync_filesystem(fd: std::os::fd::RawFd) -> std::io::Result<()> {
     if unsafe { libc::syncfs(fd) } == 0 {
@@ -3359,9 +3525,9 @@ struct TimelineView {
 }
 
 #[allow(clippy::too_many_arguments)]
-/// CPU seconds + RSS bytes from `/proc/self`. Linux-only; `(0.0, 0)` if
+/// CPU seconds, RSS bytes and threads from `/proc/self`. Zero if
 /// unreadable. Assumes `CLK_TCK` 100 (USER_HZ) and `VmRSS` in kB.
-fn read_process_stats() -> (f64, u64) {
+fn read_process_stats() -> (f64, u64, u64) {
     const CLK_TCK: f64 = 100.0;
     let cpu = std::fs::read_to_string("/proc/self/stat")
         .ok()
@@ -3375,20 +3541,20 @@ fn read_process_stats() -> (f64, u64) {
             Some((utime + stime) as f64 / CLK_TCK)
         })
         .unwrap_or(0.0);
-    let rss = std::fs::read_to_string("/proc/self/status")
-        .ok()
-        .and_then(|s| {
-            let kb: u64 = s
-                .lines()
-                .find(|l| l.starts_with("VmRSS:"))?
-                .split_whitespace()
-                .nth(1)?
-                .parse()
-                .ok()?;
-            Some(kb * 1024)
-        })
-        .unwrap_or(0);
-    (cpu, rss)
+    let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    let field = |name: &str| -> u64 {
+        status
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix(name)?
+                    .split_whitespace()
+                    .next()?
+                    .parse()
+                    .ok()
+            })
+            .unwrap_or(0)
+    };
+    (cpu, field("VmRSS:") * 1024, field("Threads:"))
 }
 
 /// Drain-resident + spool gauge readings taken under one buffer lock
@@ -3399,6 +3565,19 @@ struct DrainResident {
     spool: u64,
     raw_pending_rows: u64,
     raw_pending_bytes: u64,
+}
+
+impl DrainResident {
+    fn from_buffer(b: &XactBuffer) -> Self {
+        Self {
+            total: b.drain_resident_bytes(),
+            chunks: b.drain_chunk_resident_bytes(),
+            rows: b.drain_row_resident_bytes(),
+            spool: b.toast_spool_bytes(),
+            raw_pending_rows: b.raw_pending_rows(),
+            raw_pending_bytes: b.raw_pending_bytes(),
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3426,62 +3605,12 @@ async fn populate_metrics(
     backfiller: Option<&walshadow::copy_backfill::CopyBackfiller>,
     counters: StageCounters<'_>,
 ) {
-    use std::collections::BTreeMap;
-    use walshadow::record::rmgr_label;
-    let desc_log_gauges = desc_log.gauges();
-    let log_stats = desc_log.stats_handle();
-    let mut by_rm = BTreeMap::new();
-    for ((rm, route), n) in &rec_metrics.by_rm_route {
-        let key = (
-            rmgr_label(*rm).to_string(),
-            match route {
-                walshadow::record::Route::ToShadow => "to_shadow",
-                walshadow::record::Route::ToDecoder => "to_decoder",
-            },
-        );
-        by_rm.insert(key, *n);
-    }
-    let snap = MetricsSnapshot {
+    let base = MetricsSnapshot {
         source_received_lsn,
         filter_lsn,
         shadow_replay_lsn,
         decoder_commit_lsn,
         emitter_ack_lsn,
-        records_by_rm_route: by_rm,
-        xact_active: xact_stats.xacts_active,
-        xact_bytes_in_memory: xact_stats.bytes_in_memory,
-        spill_xacts_active: xact_stats.spill_xacts_active,
-        spill_bytes_active: xact_stats.spill_bytes_active,
-        drain_resident_bytes: drain_resident.total,
-        drain_chunk_resident_bytes: drain_resident.chunks,
-        drain_row_resident_bytes: drain_resident.rows,
-        toast_xact_spool_bytes: drain_resident.spool,
-        resident_payload_bytes: budget.map(|b| b.resident_bytes()).unwrap_or(0),
-        resident_payload_peak_bytes: budget.map(|b| b.peak_bytes()).unwrap_or(0),
-        memory_budget_waits_total: budget.map(|b| b.waits_total()).unwrap_or(0),
-        memory_budget_overshoots_total: budget.map(|b| b.overshoots_total()).unwrap_or(0),
-        spill_evictions_total: xact_stats.spill_evictions_total,
-        xacts_committed_total: xact_stats.committed_xacts_total,
-        xacts_aborted_total: xact_stats.aborted_xacts_total,
-        decoder_decoded_total: decoder_stats.decoded.load(Ordering::Relaxed),
-        decoder_partial_total: decoder_stats.partial.load(Ordering::Relaxed),
-        decoder_toast_chunks_total: decoder_stats.toast_chunks_buffered.load(Ordering::Relaxed),
-        decoder_toast_malformed_total: decoder_stats.toast_chunks_malformed.load(Ordering::Relaxed),
-        decoder_toast_deletes_total: decoder_stats.toast_chunk_deletes.load(Ordering::Relaxed),
-        toast_stash_buffered_total: decoder_stats.toast_stash_buffered.load(Ordering::Relaxed),
-        raw_stash_deferred_total: decoder_stats.raw_stash_deferred.load(Ordering::Relaxed),
-        raw_stash_records_by_kind_op: [
-            decoder_stats.raw_stash_dirty_ops.load(),
-            decoder_stats.raw_stash_marker_ops.load(),
-        ],
-        raw_stash_bytes_by_storage: [
-            xact_stats.raw_stash_bytes_mem,
-            xact_stats.raw_stash_bytes_spill,
-        ],
-        raw_pending_rows: drain_resident.raw_pending_rows,
-        raw_pending_bytes: drain_resident.raw_pending_bytes,
-        pump_queue_depth,
-        queue_records_out_total,
         source_endpoint_swaps_total: source_swap.swaps,
         source_endpoint_swap_failures_total: source_swap.failures,
         source_endpoint_swap_pending: u64::from(source_swap.pending),
@@ -3511,6 +3640,119 @@ async fn populate_metrics(
         shadow_apply_lag_seconds: shadow_view.apply_lag_seconds,
         shadow_stream_active_connections: shadow_view.active_connections,
         shadow_stream_dropped_connections_total: shadow_view.dropped_total,
+        ..registry.snapshot().await
+    };
+    populate_pipeline_metrics(
+        registry,
+        base,
+        PipelineMetrics {
+            rec_metrics,
+            pump_queue_depth,
+            queue_records_out_total,
+            xact_stats,
+            drain_resident,
+            budget,
+            decoder_stats,
+            boundary_hold,
+            capture,
+            desc_log,
+            config_resolver,
+            backfiller,
+            counters,
+        },
+    )
+    .await;
+}
+
+struct PipelineMetrics<'a> {
+    rec_metrics: &'a MetricsRecordSink,
+    pump_queue_depth: u64,
+    queue_records_out_total: u64,
+    xact_stats: &'a walshadow::xact_buffer::XactBufferStats,
+    drain_resident: DrainResident,
+    budget: Option<&'a walshadow::budget::MemoryBudget>,
+    decoder_stats: &'a walshadow::decoder_sink::DecoderStats,
+    boundary_hold: &'a BoundaryHoldStats,
+    capture: &'a walshadow::catalog_capture::CaptureStats,
+    desc_log: &'a walshadow::desc_log::DescriptorLog,
+    config_resolver: Option<&'a ConfigResolver>,
+    backfiller: Option<&'a walshadow::copy_backfill::CopyBackfiller>,
+    counters: StageCounters<'a>,
+}
+
+async fn populate_pipeline_metrics(
+    registry: &MetricsRegistry,
+    base: MetricsSnapshot,
+    pipeline: PipelineMetrics<'_>,
+) {
+    let PipelineMetrics {
+        rec_metrics,
+        pump_queue_depth,
+        queue_records_out_total,
+        xact_stats,
+        drain_resident,
+        budget,
+        decoder_stats,
+        boundary_hold,
+        capture,
+        desc_log,
+        config_resolver,
+        backfiller,
+        counters,
+    } = pipeline;
+    use std::collections::BTreeMap;
+    use walshadow::record::rmgr_label;
+    let desc_log_gauges = desc_log.gauges();
+    let log_stats = desc_log.stats_handle();
+    let mut by_rm = BTreeMap::new();
+    for ((rm, route), n) in &rec_metrics.by_rm_route {
+        let key = (
+            rmgr_label(*rm).to_string(),
+            match route {
+                walshadow::record::Route::ToShadow => "to_shadow",
+                walshadow::record::Route::ToDecoder => "to_decoder",
+                walshadow::record::Route::ToBoth => "to_both",
+            },
+        );
+        by_rm.insert(key, *n);
+    }
+    let snap = MetricsSnapshot {
+        records_by_rm_route: by_rm,
+        xact_active: xact_stats.xacts_active,
+        xact_bytes_in_memory: xact_stats.bytes_in_memory,
+        spill_xacts_active: xact_stats.spill_xacts_active,
+        spill_bytes_active: xact_stats.spill_bytes_active,
+        drain_resident_bytes: drain_resident.total,
+        drain_chunk_resident_bytes: drain_resident.chunks,
+        drain_row_resident_bytes: drain_resident.rows,
+        toast_xact_spool_bytes: drain_resident.spool,
+        resident_payload_bytes: budget.map(|b| b.resident_bytes()).unwrap_or(0),
+        resident_payload_peak_bytes: budget.map(|b| b.peak_bytes()).unwrap_or(0),
+        memory_budget_waits_total: budget.map(|b| b.waits_total()).unwrap_or(0),
+        memory_budget_overshoots_total: budget.map(|b| b.overshoots_total()).unwrap_or(0),
+        memory_budget_big_leaf_waits_total: budget.map(|b| b.big_leaf_waits_total()).unwrap_or(0),
+        spill_evictions_total: xact_stats.spill_evictions_total,
+        xacts_committed_total: xact_stats.committed_xacts_total,
+        xacts_aborted_total: xact_stats.aborted_xacts_total,
+        decoder_decoded_total: decoder_stats.decoded.load(Ordering::Relaxed),
+        decoder_partial_total: decoder_stats.partial.load(Ordering::Relaxed),
+        decoder_toast_chunks_total: decoder_stats.toast_chunks_buffered.load(Ordering::Relaxed),
+        decoder_toast_malformed_total: decoder_stats.toast_chunks_malformed.load(Ordering::Relaxed),
+        decoder_toast_deletes_total: decoder_stats.toast_chunk_deletes.load(Ordering::Relaxed),
+        toast_stash_buffered_total: decoder_stats.toast_stash_buffered.load(Ordering::Relaxed),
+        raw_stash_deferred_total: decoder_stats.raw_stash_deferred.load(Ordering::Relaxed),
+        raw_stash_records_by_kind_op: [
+            decoder_stats.raw_stash_dirty_ops.load(),
+            decoder_stats.raw_stash_marker_ops.load(),
+        ],
+        raw_stash_bytes_by_storage: [
+            xact_stats.raw_stash_bytes_mem,
+            xact_stats.raw_stash_bytes_spill,
+        ],
+        raw_pending_rows: drain_resident.raw_pending_rows,
+        raw_pending_bytes: drain_resident.raw_pending_bytes,
+        pump_queue_depth,
+        queue_records_out_total,
         catalog_boundary_holds_total: boundary_hold.holds.load(Ordering::Relaxed),
         catalog_boundary_hold_failures_total: boundary_hold.failures.load(Ordering::Relaxed),
         catalog_boundary_hold_seconds_total: boundary_hold.hold_seconds_total(),
@@ -3554,7 +3796,7 @@ async fn populate_metrics(
         config_replicate_opt_out_total: config_resolver.map(|r| r.opt_out_total()).unwrap_or(0),
         config_backfills_pending: backfiller.map(|b| b.pending_count()).unwrap_or(0),
         config_backfills_pending_by_mode: backfiller.map(|b| b.pending_by_mode()).unwrap_or([0; 3]),
-        ..stage_gauges(&counters)
+        ..stage_gauges_on(&counters, base)
     };
     registry.set(snap).await;
 }
@@ -3584,7 +3826,11 @@ fn emitter_counts<const N: usize>(
 }
 
 fn stage_gauges(v: &StageCounters<'_>) -> MetricsSnapshot {
-    let (proc_cpu, proc_rss) = read_process_stats();
+    stage_gauges_on(v, MetricsSnapshot::default())
+}
+
+fn stage_gauges_on(v: &StageCounters<'_>, base: MetricsSnapshot) -> MetricsSnapshot {
+    let (proc_cpu, proc_rss, proc_threads) = read_process_stats();
     let emitter = |pick: fn(&EmitterStats) -> &AtomicU64| -> u64 {
         v.emitter.map_or(0, |s| pick(s).load(Ordering::Relaxed))
     };
@@ -3629,6 +3875,8 @@ fn stage_gauges(v: &StageCounters<'_>) -> MetricsSnapshot {
     MetricsSnapshot {
         bootstrap_deferred_bytes: emitter(|s| &s.bootstrap_deferred_bytes),
         bootstrap_deferred_spool_bytes: emitter(|s| &s.bootstrap_deferred_spool_bytes),
+        bootstrap_deferred_replay_bytes: emitter(|s| &s.bootstrap_deferred_replay_bytes),
+        bootstrap_deferred_replayed_bytes: emitter(|s| &s.bootstrap_deferred_replayed_bytes),
         pending_rows_total: emitter(|s| &s.pending_rows),
         pending_tables_total: emitter(|s| &s.pending_tables),
         pending_tables_dropped_total: emitter(|s| &s.pending_tables_dropped),
@@ -3645,6 +3893,7 @@ fn stage_gauges(v: &StageCounters<'_>) -> MetricsSnapshot {
         toast_image_rows_mirrored_total: emitter(|s| &s.toast_image_rows_mirrored),
         toast_values_filled_superseded_total: emitter(|s| &s.toast_values_filled_superseded),
         toast_values_filled_mismatch_total: emitter(|s| &s.toast_values_filled_mismatch),
+        toast_values_filled_oversize_total: emitter(|s| &s.toast_values_filled_oversize),
         toast_mirror_truncates_total: emitter(|s| &s.toast_mirror_truncates),
         toast_mirror_retires_total: emitter(|s| &s.toast_mirror_retires),
         toast_rewrite_barriers_total: emitter(|s| &s.toast_rewrite_barriers),
@@ -3698,6 +3947,7 @@ fn stage_gauges(v: &StageCounters<'_>) -> MetricsSnapshot {
         oracle_resolve_seconds_total: emitter_seconds(|s| &s.oracle_resolve_nanos),
         process_cpu_seconds_total: proc_cpu,
         process_resident_memory_bytes: proc_rss,
+        process_threads: proc_threads,
         emitter_xacts_total: emitter(|s| &s.xacts_committed),
         emitter_unsupported_relations: emitter(|s| &s.unsupported_relations),
         emitter_deletes_discarded: emitter(|s| &s.deletes_discarded),
@@ -3729,16 +3979,19 @@ fn stage_gauges(v: &StageCounters<'_>) -> MetricsSnapshot {
         bridge_scan_replay_moved_total: bridge(|b| &b.scan_replay_moved),
         bridge_scan_subtrans_mismatch_total: bridge(|b| &b.scan_subtrans_mismatch),
         bridge_native_bytes_total: bridge(|b| &b.native_bytes),
-        ..bootstrap_gauges(v.bootstrap)
+        ..bootstrap_gauges(v.bootstrap, base)
     }
 }
 
 /// Bootstrap stage attribution, frozen at its final values once the pump
 /// returns. Rendered for the whole session so a slow initial load stays
 /// attributable after the fact
-fn bootstrap_gauges(progress: Option<&BootstrapProgress>) -> MetricsSnapshot {
+fn bootstrap_gauges(
+    progress: Option<&BootstrapProgress>,
+    base: MetricsSnapshot,
+) -> MetricsSnapshot {
     let Some(p) = progress else {
-        return MetricsSnapshot::default();
+        return base;
     };
     let ld = |a: &AtomicU64| a.load(Ordering::Relaxed);
     MetricsSnapshot {
@@ -3752,7 +4005,7 @@ fn bootstrap_gauges(progress: Option<&BootstrapProgress>) -> MetricsSnapshot {
         bootstrap_decode_seconds: ld(&p.page_walk.decode_nanos) as f64 / 1e9,
         bootstrap_tap_seconds: ld(&p.pump.sink_chunk_nanos) as f64 / 1e9,
         bootstrap_channel_block_seconds: ld(&p.page_walk.channel_block_nanos) as f64 / 1e9,
-        ..MetricsSnapshot::default()
+        ..base
     }
 }
 
@@ -4117,218 +4370,171 @@ fn swap_reason(err: &anyhow::Error) -> &'static str {
         .unwrap_or("source")
 }
 
+/// Fetched segment, holding the budget slot it occupies until the pump takes it
+type ArchiveSegment = (u64, Vec<u8>, tokio::sync::OwnedSemaphorePermit);
+
+struct ArchiveFeed {
+    wait_nanos: AtomicU64,
+    rx: tokio::sync::mpsc::Receiver<Result<ArchiveSegment>>,
+    task: tokio::task::JoinHandle<()>,
+    fetch_nanos: Arc<AtomicU64>,
+}
+
+impl ArchiveFeed {
+    fn spawn(
+        settings: walrus::config::Settings,
+        storage: walrus::storage::DynStorage,
+        timeline: u32,
+        start: u64,
+        concurrency: usize,
+    ) -> Self {
+        // `buffered` only advances its fetches while the stream is polled, so
+        // a worker parked on a full channel freezes every download in flight.
+        // Capacity below `concurrency` caps real depth at that capacity
+        let (tx, rx) = tokio::sync::mpsc::channel(concurrency);
+        // Ordered consumption lets a completed fetch sit in `buffered` waiting
+        // its turn, so slots alone bound nothing. A permit taken before the
+        // download and released at handoff holds resident segments to
+        // `concurrency`, plus the one the pump is replaying
+        let budget = Arc::new(tokio::sync::Semaphore::new(concurrency));
+        let fetch_nanos = Arc::new(AtomicU64::new(0));
+        let elapsed = fetch_nanos.clone();
+        let task = tokio::spawn(async move {
+            let starts = std::iter::successors(Some(start), |lsn| {
+                (lsn / WAL_SEG_SIZE + 1).checked_mul(WAL_SEG_SIZE)
+            });
+            let pending = futures_stream::iter(starts)
+                .map(|lsn| {
+                    let (settings, storage, elapsed) = (&settings, &storage, &elapsed);
+                    let budget = budget.clone();
+                    async move {
+                        let permit = budget.acquire_owned().await.expect("budget stays open");
+                        let began = Instant::now();
+                        let result = fetch_archive_segment(settings, storage, timeline, lsn)
+                            .await
+                            .map(|(_, bytes)| (lsn, bytes, permit));
+                        elapsed.fetch_add(began.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                        result
+                    }
+                })
+                .buffered(concurrency);
+            tokio::pin!(pending);
+            while let Some(result) = pending.next().await {
+                let failed = result.is_err();
+                if tx.send(result).await.is_err() || failed {
+                    break;
+                }
+            }
+        });
+        Self {
+            wait_nanos: AtomicU64::new(0),
+            rx,
+            task,
+            fetch_nanos,
+        }
+    }
+
+    async fn next(&mut self) -> Option<Result<(u64, Vec<u8>)>> {
+        let _elapsed = ArchiveWait {
+            nanos: &self.wait_nanos,
+            started: Instant::now(),
+        };
+        let fetched = self.rx.recv().await?;
+        Some(fetched.map(|(lsn, bytes, _budget)| (lsn, bytes)))
+    }
+}
+
+struct ArchiveWait<'a> {
+    nanos: &'a AtomicU64,
+    started: Instant,
+}
+
+impl Drop for ArchiveWait<'_> {
+    fn drop(&mut self) {
+        self.nanos
+            .fetch_add(self.started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    }
+}
+
+impl Drop for ArchiveFeed {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
 struct SourceRecovery<'a> {
     status_interval: Duration,
     backup: Option<&'a walrus::config::Settings>,
-    spill_dir: &'a Path,
-    /// Published resume floor, which is what a slot on the far end has to still
-    /// reach — the reconnect's own `resume_lsn` sits above it
     floor: &'a Monotone<Floor>,
-    metrics: &'a MetricsRegistry,
-    emitter_ack: &'a Monotone<EmitterAck>,
-}
-
-struct ArchiveLegProgress {
-    start_lsn: u64,
-    started: Instant,
-    segments: u64,
-    published: u64,
-    window_start: Instant,
-    window_lsn: u64,
-}
-
-impl ArchiveLegProgress {
-    fn new(start_lsn: u64) -> Self {
-        let now = Instant::now();
-        Self {
-            start_lsn,
-            started: now,
-            segments: 0,
-            published: 0,
-            window_start: now,
-            window_lsn: start_lsn,
-        }
-    }
-
-    fn take_unpublished(&mut self) -> u64 {
-        let fresh = self.segments - self.published;
-        self.published = self.segments;
-        fresh
-    }
-
-    fn report_due(&mut self, interval: Duration, lsn: u64) -> Option<f64> {
-        let elapsed = self.window_start.elapsed();
-        if elapsed < interval {
-            return None;
-        }
-        let bytes = lsn.saturating_sub(self.window_lsn) as f64;
-        self.window_start = Instant::now();
-        self.window_lsn = lsn;
-        Some(bytes / elapsed.as_secs_f64() / (1024.0 * 1024.0))
-    }
+    prefetch: usize,
 }
 
 impl SourceRecovery<'_> {
-    /// Try source, replay archive gap, then return to source. `cfg`, `slot`,
+    /// Try source, otherwise start bounded archive fetches for normal pump. `cfg`, `slot`,
     /// and `branch` are the live endpoint, slot name, and proved branch, passed
     /// per call rather than held, so a recovery that starts after a `[source]`
     /// reload or a crossing dials the new address under the new name and asks
     /// for the descendant, with the archive read under its segment names.
-    #[allow(clippy::too_many_arguments)]
     async fn recover(
         &self,
         source_error: anyhow::Error,
         cfg: &PgConfig,
         slot: Option<&str>,
         branch: SourceBranch,
-        stream: &mut WalStream,
-        record_sink: &mut (dyn RecordSink + Send),
-        segment_sink: &mut (dyn walshadow::record::SegmentSink + Send),
-    ) -> Result<SourceFeed> {
-        let mut resume_lsn = stream.next_lsn();
-        let source_missing = walshadow::source_feed::is_wal_segment_removed(&source_error);
-
+        resume_lsn: Pos<Floor>,
+        archive: &mut Option<ArchiveFeed>,
+    ) -> Result<Option<SourceFeed>> {
         // Source first (primary_conninfo analog): a plain drop is usually
         // transient, so try the source again at the exact resume point before
         // reaching for the archive. A removed-WAL (58P01) error means the
         // source genuinely can't serve it — skip straight to the archive.
-        if !source_missing {
-            let floor = self.floor.get();
-            match resume_source_feed(cfg, slot, resume_lsn, branch, floor, self.status_interval)
-                .await
-            {
-                Ok(feed) => return Ok(feed),
-                Err(retry_error) => tracing::warn!(
-                    target: "walshadow",
-                    error = %retry_error,
-                    resume_lsn = %resume_lsn,
-                    "source still unavailable — trying archive",
-                ),
-            }
+        let source_missing = walshadow::source_feed::is_wal_segment_removed(&source_error);
+        let reason = if source_missing {
+            source_error
         } else {
-            tracing::warn!(
-                target: "walshadow",
-                error = %source_error,
-                resume_lsn = %resume_lsn,
-                "source recycled resume point — trying archive",
-            );
-        }
-
-        // Archive fallback (restore_command analog). `reconnect_or_operator`
-        // covers both "no archive": a transient error retries the source with
-        // backoff, a removed-WAL error surfaces the operator-action message.
-        let Some(settings) = self.backup else {
-            return self
-                .reconnect_or_operator(
-                    cfg,
-                    slot,
-                    branch,
-                    resume_lsn,
-                    "no [backup] archive configured",
-                )
-                .await;
-        };
-        let storage = match settings.build_storage() {
-            Ok(storage) => storage,
-            Err(archive_error) => {
-                return self
-                    .reconnect_or_operator(
-                        cfg,
-                        slot,
-                        branch,
-                        resume_lsn,
-                        &format!("build archive storage: {archive_error:#}"),
-                    )
-                    .await;
-            }
-        };
-        let seg_dir = self.spill_dir.join("resume_wal");
-        let mut progress = ArchiveLegProgress::new(resume_lsn.get());
-        self.publish_archive_leg(&mut progress, resume_lsn, true)
-            .await;
-
-        loop {
-            let archive_segment = fetch_archive_segment(
-                settings,
-                &storage,
-                &seg_dir,
-                branch.timeline,
-                resume_lsn.get(),
+            match resume_source_feed(
+                cfg,
+                slot,
+                resume_lsn,
+                branch,
+                self.floor.get(),
+                self.status_interval,
             )
-            .await;
-            let (name, bytes) = match archive_segment {
-                Ok(segment) => segment,
-                Err(archive_error) => {
-                    let _ = tokio::fs::remove_dir_all(&seg_dir).await;
-                    self.publish_archive_leg(&mut progress, resume_lsn, false)
-                        .await;
-                    tracing::info!(
-                        target: "walshadow",
-                        error = %archive_error,
-                        resume_lsn = %resume_lsn,
-                        segments = progress.segments,
-                        replayed_bytes = resume_lsn.get() - progress.start_lsn,
-                        elapsed_secs = progress.started.elapsed().as_secs(),
-                        "archive lacks next WAL — switching back to source",
-                    );
-                    return self
-                        .reconnect_or_operator(
-                            cfg,
-                            slot,
-                            branch,
-                            resume_lsn,
-                            &format!("archive fallback failed: {archive_error:#}"),
-                        )
-                        .await;
-                }
-            };
-
-            stream
-                .push(resume_lsn.get(), &bytes, record_sink, segment_sink)
-                .await
-                .with_context(|| format!("replay archived WAL {name}"))?;
-            tracing::debug!(
-                target: "walshadow",
-                segment = name,
-                "restored resume WAL from archive",
-            );
-            resume_lsn = stream.next_lsn();
-            progress.segments += 1;
-            if let Some(mib_per_sec) = progress.report_due(self.status_interval, resume_lsn.get()) {
-                self.publish_archive_leg(&mut progress, resume_lsn, true)
-                    .await;
-                tracing::info!(
-                    target: "walshadow",
-                    segment = name,
-                    resume_lsn = %resume_lsn,
-                    segments = progress.segments,
-                    mib_per_sec = format!("{mib_per_sec:.1}"),
-                    emitter_ack_lsn = %self.emitter_ack.get(),
-                    "restoring resume WAL from archive",
-                );
+            .await
+            {
+                Ok(feed) => return Ok(Some(feed)),
+                Err(retry_error) => retry_error,
             }
-        }
-    }
-
-    async fn publish_archive_leg(
-        &self,
-        progress: &mut ArchiveLegProgress,
-        resume_lsn: Pos<Floor>,
-        active: bool,
-    ) {
-        let fresh_segments = progress.take_unpublished();
-        let lsn = resume_lsn.get();
-        let emitter_ack = self.emitter_ack.get();
-        let floor = self.floor.get();
-        self.metrics
-            .update(move |snap| {
-                snap.archive_wal_segments_total += fresh_segments;
-                snap.archive_restore_active = u64::from(active);
-                snap.filter_lsn = Pos::new(lsn);
-                snap.emitter_ack_lsn = emitter_ack;
-                snap.floor_lsn = floor;
-            })
-            .await;
+        };
+        tracing::warn!(
+            target: "walshadow",
+            error = %reason,
+            resume_lsn = %resume_lsn,
+            source_missing,
+            "source cannot serve the resume point — trying archive",
+        );
+        // Archive fallback (restore_command analog). `reconnect_or_operator`
+        // covers every "no archive": a transient error retries the source with
+        // backoff, a removed-WAL error surfaces the operator-action message.
+        let archive_error = match self.backup.map(|s| (s, s.build_storage())) {
+            None => "no [backup] archive configured".to_string(),
+            Some((_, Err(e))) => format!("build archive storage: {e:#}"),
+            Some((settings, Ok(storage))) => {
+                tracing::info!(target: "walshadow", resume_lsn = %resume_lsn,
+                    prefetch = self.prefetch, "starting archive recovery");
+                *archive = Some(ArchiveFeed::spawn(
+                    settings.clone(),
+                    storage,
+                    branch.timeline,
+                    resume_lsn.get(),
+                    self.prefetch,
+                ));
+                return Ok(None);
+            }
+        };
+        self.reconnect_or_operator(cfg, slot, branch, resume_lsn, &archive_error)
+            .await
+            .map(Some)
     }
 
     async fn reconnect_or_operator(
@@ -4428,6 +4634,10 @@ async fn run_bootstrap(
         .await
         .context("bootstrap: seed catalog filenodes")?;
     let catalog_filenodes: Vec<_> = landing_tracker.nodes().collect();
+    // Filtered at one of two points depending on toast mode, never both:
+    // shadow mode rewrites before its recovery starts mid-bootstrap, other
+    // modes after the window leg has read the raw segments
+    let mut landing_tracker = Some(landing_tracker);
     tracing::info!(
         target: "walshadow::bootstrap",
         relations = catalog_map.len(),
@@ -4501,12 +4711,31 @@ async fn run_bootstrap(
     let bootstrap_stats = emitter_stats;
     // Leaf-only pool for the bootstrap tail: caps each value (V3) and
     // bounds decoded rows in flight to insert ack; no admission stage
-    let resolver = if let Some(cfg) = &ch_config {
-        ToastResolver::from_config(cfg, bootstrap_stats.clone()).with_budget(
-            walshadow::budget::MemoryBudget::new(cfg.resident_payload_max),
+    let shadow_toast = ch_config.as_ref().is_some_and(|c| c.toast.mode.is_shadow());
+    // Shadow serves values once bootstrap starts it; its bridge binds then
+    // and run() adopts the instance
+    let mut running_shadow: Option<Arc<Shadow>> = None;
+    let shadow_toast_bridge = walshadow::toast::shadow_store::LateBridge::default();
+    let shadow_backed = |cell: &walshadow::toast::shadow_store::LateBridge, cfg: &EmitterConfig| {
+        ToastResolver::with_store(
+            Arc::new(walshadow::toast::shadow_store::ShadowToastStore::late(
+                cell.clone(),
+            )),
+            bootstrap_stats.clone(),
         )
-    } else {
-        ToastResolver::disabled()
+        .with_inline_value_max(cfg.inline_value_max)
+        .with_overflow(cfg.inline_value_overflow)
+        .with_budget(walshadow::budget::MemoryBudget::new(
+            cfg.resident_payload_max,
+        ))
+    };
+    // Shadow starts before backup WAL processing needs value lookups
+    let resolver = match &ch_config {
+        Some(cfg) if shadow_toast => shadow_backed(&shadow_toast_bridge, cfg),
+        Some(cfg) => ToastResolver::from_config(cfg, bootstrap_stats.clone()).with_budget(
+            walshadow::budget::MemoryBudget::new(cfg.resident_payload_max),
+        ),
+        None => ToastResolver::disabled(),
     };
     let store_toast = resolver.stores_chunks();
 
@@ -4566,6 +4795,87 @@ async fn run_bootstrap(
         None => (None, false, Default::default()),
     };
 
+    // Shadow keeps TOAST heaps and their indexes the way it keeps catalogs:
+    // landed in place by the backup, then replayed. Index filenodes are
+    // absent from catalog seed, so query source for them
+    let mut shadow_toast_rels: ahash::HashSet<(u32, u32)> = ahash::HashSet::default();
+    if shadow_toast {
+        let toast_heaps: Vec<_> = drain_catalog
+            .descriptors()
+            .filter(|d| d.kind == 't')
+            .filter(|d| {
+                tap_filenodes
+                    .as_ref()
+                    .is_none_or(|set| set.contains(&(d.rfn.db_node, d.rfn.rel_node)))
+            })
+            .collect();
+        // Lander keys on `base/<db>/` paths; refuse other tablespaces now
+        // rather than at shadow's first read
+        if let Some(d) = toast_heaps
+            .iter()
+            .find(|d| d.rfn.spc_node != DEFAULT_TABLESPACE_OID)
+        {
+            anyhow::bail!(
+                "bootstrap: TOAST relation {} (filenode {}) is in tablespace {}; \
+                 [toast] mode = shadow keeps files from default tablespace only",
+                d.rel_name,
+                d.rfn.rel_node,
+                d.rfn.spc_node,
+            );
+        }
+        let heaps: Vec<u32> = toast_heaps.iter().map(|d| d.rfn.rel_node).collect();
+        let db_oid = drain_catalog
+            .descriptors()
+            .map(|d| d.rfn.db_node)
+            .next()
+            .unwrap_or_default();
+        for rel in &heaps {
+            shadow_toast_rels.insert((db_oid, *rel));
+        }
+        if !heaps.is_empty() {
+            // Reuse authenticated sidecar client from catalog seed
+            // Interpolate because client has no `oid[]` Rust mapping
+            let list = heaps
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            let rows = sql_client
+                .query(
+                    &format!(
+                        "SELECT ic.relfilenode::int8, ic.relname::text, \
+                         coalesce(nullif(ic.reltablespace, 0), \
+                                  (SELECT dattablespace FROM pg_database \
+                                   WHERE datname = current_database()))::int8 \
+                         FROM pg_class t \
+                         JOIN pg_index i ON i.indrelid = t.oid \
+                         JOIN pg_class ic ON ic.oid = i.indexrelid \
+                         WHERE t.relkind = 't' \
+                         AND t.relfilenode = ANY('{{{list}}}'::oid[])"
+                    ),
+                    &[],
+                )
+                .await
+                .context("bootstrap: read toast index filenodes")?;
+            for row in &rows {
+                let spc = row.get::<_, i64>(2) as u32;
+                anyhow::ensure!(
+                    spc == DEFAULT_TABLESPACE_OID,
+                    "bootstrap: TOAST index {} is in tablespace {spc}; \
+                     [toast] mode = shadow keeps files from default tablespace only",
+                    row.get::<_, String>(1),
+                );
+                shadow_toast_rels.insert((db_oid, row.get::<_, i64>(0) as u32));
+            }
+            tracing::info!(
+                target: "walshadow::bootstrap",
+                toast_heaps = heaps.len(),
+                toast_indexes = rows.len(),
+                "landing TOAST storage in shadow",
+            );
+        }
+    }
+
     // Off the backup window: provisioning is an initdb + pg_dump + apply +
     // restart, and doing it after `BASE_BACKUP` opens parks a live backup
     // through all of it — in object-store mode against walrus's 60 s request
@@ -4616,8 +4926,11 @@ async fn run_bootstrap(
         .context("bootstrap: sample source write head for the window leg")?;
     let source_major = (feed.server_version_num() / 10000) as u32;
 
-    let mut cfg =
-        BootstrapConfig::new(shadow_data_dir.clone()).with_catalog_filenodes(catalog_filenodes);
+    let mut cfg = BootstrapConfig::new(shadow_data_dir.clone()).with_catalog_filenodes(
+        catalog_filenodes
+            .into_iter()
+            .chain(shadow_toast_rels.iter().copied()),
+    );
     if let Some(set) = tap_filenodes {
         cfg = cfg.with_tap_filenodes(set);
     }
@@ -4981,26 +5294,116 @@ async fn run_bootstrap(
             .context("bootstrap: record extraction checkpoint")?;
         }
 
-        // Deferred referrers resolve out of the chunk store, so every window
-        // record has to be in it first. A live leg joined above; a leg over
-        // the WAL the backup landed replays here, before the tails close
+        if let Some((settings, storage)) = wal_hydrate.take() {
+            fetch_wal_into_pg_wal(
+                &settings,
+                storage,
+                &shadow_data_dir,
+                outcome.start.start_lsn,
+                outcome.end.end_lsn,
+                outcome.start.timeline,
+            )
+            .await
+            .context("bootstrap: hydrate shadow pg_wal from object store")?;
+        }
+
+        // Preserve original WAL for backup processing before in-place rewrite
+        let window_wal = if shadow_toast {
+            let dir = args.spill_dir.join("bootstrap_window_wal");
+            let copied = walshadow::backfill::wal_landing::copy_window_segments(
+                &shadow_data_dir.join("pg_wal"),
+                &dir,
+                outcome.start.timeline,
+                outcome.start.start_lsn,
+                outcome.end.end_lsn,
+            )
+            .await
+            .context("bootstrap: copy window WAL for the replay leg")?;
+            tracing::info!(
+                target: "walshadow::bootstrap",
+                segments = copied,
+                dir = %dir.display(),
+                "copied window WAL so the leg reads it raw",
+            );
+            dir
+        } else {
+            shadow_data_dir.join("pg_wal")
+        };
+
+        // Rewrite landed WAL before shadow recovery; backup processing uses copy.
+        //
+        // Non-shadow toast modes rewrite after reading original `pg_wal` below
+        if shadow_toast {
+            let landed = walshadow::backfill::wal_landing::filter_landed_wal(
+                &shadow_data_dir.join("pg_wal"),
+                outcome.start.timeline,
+                outcome.end.end_lsn,
+                landing_tracker.take().expect("landed WAL filtered once"),
+                Some((shadow_toast_rels, outcome.start.start_lsn)),
+            )
+            .await
+            .context("bootstrap: filter landed WAL")?;
+            tracing::info!(
+                target: "walshadow::bootstrap",
+                segments = landed.segments,
+                segments_blanked = landed.segments_blanked,
+                kept = landed.kept,
+                dropped = landed.dropped,
+                dropped_bytes = landed.dropped_bytes,
+                "landed WAL filtered",
+            );
+
+            // Start shadow before value reads. Recovery adds values written
+            // during backup and repairs torn pages and checksums.
+            // PostgreSQL requires data-directory mode 0700 or 0750
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                tokio::fs::set_permissions(&shadow_data_dir, fs::Permissions::from_mode(0o700))
+                    .await
+                    .with_context(|| {
+                        format!("bootstrap: chmod 0700 {}", shadow_data_dir.display())
+                    })?;
+            }
+            let started = Arc::new(build_owned_shadow(
+                args,
+                &src_cfg.database,
+                shadow_data_dir.clone(),
+                bridge_workers,
+            ));
+            started
+                .write_standby_signal()
+                .context("bootstrap: write standby.signal")?;
+            // Recover to `end_lsn` from local pg_wal
+            walshadow::ops::stages::SHADOW_REPLAY
+                .measure(start_owned_shadow(
+                    &started,
+                    Some(outcome.end.end_lsn),
+                    Duration::from_secs(args.bootstrap_shadow_replay_timeout),
+                    false,
+                ))
+                .await
+                .context("bootstrap: start shadow to serve TOAST values")?;
+            running_shadow = Some(started);
+            let bridge = walshadow::bridge::connect_with_budget(
+                &args.bridge_socket_path(),
+                bridge_workers,
+                Duration::from_secs(args.shadow_connect_timeout),
+            )
+            .await
+            .context("bootstrap: dial shadow bridge for TOAST values")?;
+            shadow_toast_bridge
+                .set(Arc::new(bridge))
+                .ok()
+                .context("bootstrap: shadow TOAST bridge bound twice")?;
+        }
+
+        // Replay backup WAL before resolving deferred value references
         if let Some(mut cfg) = window_cfg {
             cfg.timeline = outcome.start.timeline;
             let replayed = async {
-                if let Some((settings, storage)) = wal_hydrate.take() {
-                    fetch_wal_into_pg_wal(
-                        &settings,
-                        storage,
-                        &shadow_data_dir,
-                        outcome.start.start_lsn,
-                        outcome.end.end_lsn,
-                        outcome.start.timeline,
-                    )
-                    .await
-                    .context("bootstrap: hydrate shadow pg_wal from object store")?;
-                }
                 let segments = walshadow::backfill::bootstrap_window::segments_in_dir(
-                    &shadow_data_dir.join("pg_wal"),
+                    &window_wal,
                     outcome.start.timeline,
                     outcome.start.start_lsn,
                     outcome.end.end_lsn,
@@ -5186,24 +5589,27 @@ async fn run_bootstrap(
     }
     tokio::fs::remove_dir_all(&window_scratch).await.ok();
 
-    // The backup's WAL landed raw; rewrite before the shadow's recovery sees it
-    let landed = walshadow::backfill::wal_landing::filter_landed_wal(
-        &shadow_data_dir.join("pg_wal"),
-        outcome.start.timeline,
-        outcome.end.end_lsn,
-        landing_tracker,
-    )
-    .await
-    .context("bootstrap: filter landed WAL")?;
-    tracing::info!(
-        target: "walshadow::bootstrap",
-        segments = landed.segments,
-        segments_blanked = landed.segments_blanked,
-        kept = landed.kept,
-        dropped = landed.dropped,
-        dropped_bytes = landed.dropped_bytes,
-        "landed WAL filtered",
-    );
+    // Non-shadow toast modes rewrite landed WAL after backup processing reads it
+    if let Some(tracker) = landing_tracker.take() {
+        let landed = walshadow::backfill::wal_landing::filter_landed_wal(
+            &shadow_data_dir.join("pg_wal"),
+            outcome.start.timeline,
+            outcome.end.end_lsn,
+            tracker,
+            None,
+        )
+        .await
+        .context("bootstrap: filter landed WAL")?;
+        tracing::info!(
+            target: "walshadow::bootstrap",
+            segments = landed.segments,
+            segments_blanked = landed.segments_blanked,
+            kept = landed.kept,
+            dropped = landed.dropped,
+            dropped_bytes = landed.dropped_bytes,
+            "landed WAL filtered",
+        );
+    }
 
     // Resolve deferred tuples after window transaction overlay is complete
     if let Some(pending) = pending_gate {
@@ -5258,6 +5664,7 @@ async fn run_bootstrap(
         BootstrapHandoff {
             end_lsn: outcome.end.end_lsn,
             open_floor,
+            shadow: running_shadow.clone(),
         },
         BootstrapMetrics {
             progress,
@@ -5291,6 +5698,8 @@ struct BootstrapHandoff {
     end_lsn: u64,
     /// Earliest record among transactions open at window seal
     open_floor: Option<u64>,
+    /// Shadow instance started during bootstrap
+    shadow: Option<Arc<Shadow>>,
 }
 
 impl BootstrapHandoff {
@@ -5369,6 +5778,14 @@ enum ShadowStart {
 impl ShadowStart {
     fn bootstraps(&self) -> bool {
         matches!(self, Self::Bootstrap(_) | Self::Rebootstrap(..))
+    }
+
+    /// Data directory of a daemon-owned shadow
+    fn data_dir(&self) -> Option<&Path> {
+        match self {
+            Self::External => None,
+            Self::Bootstrap(d) | Self::Rebootstrap(d, _) | Self::Resume(d) => Some(d),
+        }
     }
 }
 
@@ -5497,10 +5914,16 @@ async fn start_owned_shadow(
     shadow: &Arc<Shadow>,
     replay_target: Option<u64>,
     replay_timeout: Duration,
+    keep_running: bool,
 ) -> Result<()> {
     let s = shadow.clone();
     tokio::task::spawn_blocking(move || -> Result<()> {
         if s.is_running().context("shadow status probe")? {
+            if keep_running {
+                s.validate_running().context("validate running shadow")?;
+                tracing::info!(target: "walshadow::shadow", "reusing running shadow");
+                return Ok(());
+            }
             // Adopt only fires after unclean prior exit left the postmaster
             // alive holding stale port/socket/primary_conninfo. Stop so the
             // restart below binds params this daemon connects and streams with;
@@ -5539,16 +5962,18 @@ const SHADOW_RESTART_BACKOFF_MAX: Duration = Duration::from_secs(60);
 /// Call `shutdown` on clean exit; Drop is just a fallback, its abort
 /// can race a restart already in flight on the blocking pool
 struct ShadowLifecycle {
+    keep_running: bool,
     shadow: Arc<Shadow>,
     supervisor: Option<tokio::task::JoinHandle<()>>,
     cancel: CancellationToken,
 }
 
 impl ShadowLifecycle {
-    fn spawn(shadow: Arc<Shadow>, conninfo: Option<String>) -> Self {
+    fn spawn(shadow: Arc<Shadow>, conninfo: Option<String>, keep_running: bool) -> Self {
         let cancel = CancellationToken::new();
         let supervisor = tokio::spawn(Self::supervise(shadow.clone(), conninfo, cancel.clone()));
         Self {
+            keep_running,
             shadow,
             supervisor: Some(supervisor),
             cancel,
@@ -5635,6 +6060,9 @@ impl ShadowLifecycle {
         {
             tracing::warn!(target: "walshadow::shadow", error = %e, "shadow supervisor join failed");
         }
+        if self.keep_running {
+            return;
+        }
         if let Some(true) = probe_blocking(&self.shadow, |s| s.is_running()).await
             && probe_blocking(&self.shadow, |s| s.stop()).await.is_none()
         {
@@ -5668,6 +6096,9 @@ impl Drop for ShadowLifecycle {
         if let Some(h) = &self.supervisor {
             h.abort();
         }
+        if self.keep_running {
+            return;
+        }
         // Daemon is exiting, blocking pg_ctl cannot delay other work
         match self.shadow.is_running() {
             Ok(true) => {
@@ -5689,6 +6120,10 @@ impl Drop for ShadowLifecycle {
     }
 }
 
+/// Compressions walrus and wal-g write, so a bucket filled under another
+/// configuration stays readable
+const ARCHIVE_WAL_EXTS: &[&str] = &["zst", "br", "lz4", "lzma", ""];
+
 /// Fetch archived WAL for source recovery, returning the bytes that begin at
 /// exactly `start_lsn`. The archive stores whole 16 MiB segment files, so
 /// fetch the single segment containing `start_lsn` (aligned range → one
@@ -5698,35 +6133,56 @@ impl Drop for ShadowLifecycle {
 async fn fetch_archive_segment(
     settings: &walrus::config::Settings,
     storage: &walrus::storage::DynStorage,
-    seg_dir: &Path,
     timeline: u32,
     start_lsn: u64,
 ) -> Result<(String, Vec<u8>)> {
     let seg_start = WalStream::align_down(start_lsn, WAL_SEG_SIZE);
-    let names = segments_covering(timeline, seg_start..seg_start + WAL_SEG_SIZE);
-    let segments = walshadow::backup_backfill::fetch_segments(settings, storage, seg_dir, &names)
-        .await
-        .context("fetch archive WAL")?;
-    let [(segment, path)] = segments.as_slice() else {
-        anyhow::bail!(
-            "archive fetch returned {} segments for one-segment range",
-            segments.len()
-        );
-    };
-    let bytes = tokio::fs::read(path)
-        .await
-        .with_context(|| format!("read archived WAL {}", path.display()))?;
+    let name = segments_covering(timeline, seg_start..seg_start + WAL_SEG_SIZE)[0].format();
+    let mut bytes = read_archive_wal(settings, storage, &name).await?;
     if bytes.len() != WAL_SEG_SIZE as usize {
         anyhow::bail!(
-            "archived WAL {} has {} bytes, expected {}",
-            segment.format(),
+            "archived WAL {name} has {} bytes, expected {WAL_SEG_SIZE}",
             bytes.len(),
-            WAL_SEG_SIZE,
         );
     }
-    let _ = tokio::fs::remove_file(path).await;
-    let offset = (start_lsn - seg_start) as usize;
-    Ok((segment.format(), bytes[offset..].to_vec()))
+    bytes.drain(..(start_lsn - seg_start) as usize);
+    Ok((name, bytes))
+}
+
+/// Read one archived WAL object whole, over the same throttle, decrypt and
+/// decompress chain walrus `wal-fetch` uses. Fetching into memory keeps a
+/// prefetch slot off the staging disk, which otherwise costs a 32 MiB round
+/// trip per 16 MiB of WAL and leaves a tmp file behind on an aborted leg.
+/// Preferred compression is fetched directly, so a uniform bucket costs one
+/// request instead of an existence probe per candidate
+async fn read_archive_wal(
+    settings: &walrus::config::Settings,
+    storage: &walrus::storage::DynStorage,
+    name: &str,
+) -> Result<Vec<u8>> {
+    let preferred = settings.compression.extension();
+    let rest = ARCHIVE_WAL_EXTS.iter().copied().filter(|e| *e != preferred);
+    for ext in std::iter::once(preferred).chain(rest) {
+        let folder = walrus::pg::WAL_FOLDER;
+        let dot = if ext.is_empty() { "" } else { "." };
+        let key = format!("{folder}/{name}{dot}{ext}");
+        let body = match storage.get(&key).await {
+            Ok(body) => body,
+            Err(walrus::storage::StorageError::NotFound(_)) => continue,
+            Err(e) => return Err(anyhow::Error::new(e).context(format!("get {key}"))),
+        };
+        let method = walrus::compression::Method::from_extension(ext)
+            .unwrap_or(walrus::compression::Method::None);
+        let mut decoded =
+            walrus::compression::decode(method, settings.decrypt(settings.throttle_network(body)));
+        let mut bytes = Vec::with_capacity(WAL_SEG_SIZE as usize);
+        decoded
+            .read_to_end(&mut bytes)
+            .await
+            .with_context(|| format!("read {key}"))?;
+        return Ok(bytes);
+    }
+    anyhow::bail!("WAL {name} not found in archive")
 }
 
 /// Fetch WAL `[start_lsn, end_lsn]` from archive storage into shadow's `pg_wal/`.
@@ -5812,38 +6268,6 @@ mod tests {
         Args::parse_from(base.iter().copied().chain(argv.iter().copied()))
     }
 
-    /// The archive leg owns the pump task until the archive runs out, so the
-    /// status loop cannot run and everything it publishes froze for the whole
-    /// leg. Reporting is per `status_interval`, not per 16 MiB segment
-    #[test]
-    fn archive_leg_reports_once_per_status_interval() {
-        let mut progress = ArchiveLegProgress::new(0);
-        let interval = Duration::from_millis(20);
-
-        progress.segments += 1;
-        assert_eq!(progress.report_due(interval, WAL_SEG_SIZE), None);
-        std::thread::sleep(interval);
-        progress.segments += 1;
-        let mib_per_sec = progress
-            .report_due(interval, 2 * WAL_SEG_SIZE)
-            .expect("due once the interval passes");
-        assert!(mib_per_sec > 0.0, "{mib_per_sec}");
-
-        // Window resets, so the next report rates its own bytes, not the leg's
-        assert_eq!(progress.report_due(interval, 2 * WAL_SEG_SIZE), None);
-    }
-
-    #[test]
-    fn archive_leg_publishes_each_segment_once() {
-        let mut progress = ArchiveLegProgress::new(0);
-        assert_eq!(progress.take_unpublished(), 0);
-        progress.segments += 3;
-        assert_eq!(progress.take_unpublished(), 3);
-        assert_eq!(progress.take_unpublished(), 0);
-        progress.segments += 1;
-        assert_eq!(progress.take_unpublished(), 1);
-    }
-
     /// A partial publish from inside the leg must not blank the fields the
     /// status loop owns, or the leg would look like a dead pipeline
     #[tokio::test]
@@ -5861,6 +6285,132 @@ mod tests {
         let snap = registry.snapshot().await;
         assert_eq!(snap.emitter_rows_total, 17);
         assert_eq!(snap.archive_restore_active, 1);
+    }
+
+    #[tokio::test]
+    async fn pipeline_metrics_refresh_during_archive_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = walshadow::desc_log::DescriptorLog::open(
+            dir.path(),
+            walshadow::desc_log::DescLogIdentity {
+                pg_major: 18,
+                system_id: "1".into(),
+                timeline: 1,
+                db_oid: 5,
+                wal_seg_size: WAL_SEG_SIZE as u32,
+            },
+        )
+        .await
+        .unwrap();
+        let registry = MetricsRegistry::new();
+        registry
+            .set(MetricsSnapshot {
+                archive_restore_active: 1,
+                archive_wal_segments_total: 42,
+                filter_lsn: Pos::new(2 * WAL_SEG_SIZE),
+                ..MetricsSnapshot::default()
+            })
+            .await;
+        let records = MetricsRecordSink::default();
+        let decoder = walshadow::decoder_sink::DecoderStats::default();
+        let emitter = EmitterStats::default();
+        let boundary = BoundaryHoldStats::default();
+        let capture = walshadow::catalog_capture::CaptureStats::default();
+        for n in [7, 13] {
+            decoder.decoded.store(n, Ordering::Relaxed);
+            emitter.rows_emitted.store(n * 2, Ordering::Relaxed);
+            let xacts = walshadow::xact_buffer::XactBufferStats {
+                xacts_active: n,
+                ..Default::default()
+            };
+            populate_pipeline_metrics(
+                &registry,
+                registry.snapshot().await,
+                PipelineMetrics {
+                    rec_metrics: &records,
+                    pump_queue_depth: n,
+                    queue_records_out_total: n * 3,
+                    xact_stats: &xacts,
+                    drain_resident: DrainResident {
+                        total: n * 10,
+                        chunks: 0,
+                        rows: n * 10,
+                        spool: 0,
+                        raw_pending_rows: n,
+                        raw_pending_bytes: n * 10,
+                    },
+                    budget: None,
+                    decoder_stats: &decoder,
+                    boundary_hold: &boundary,
+                    capture: &capture,
+                    desc_log: &log,
+                    config_resolver: None,
+                    backfiller: None,
+                    counters: StageCounters {
+                        emitter: Some(&emitter),
+                        oracle: [None, None],
+                        bridge: [None, None],
+                        bootstrap: None,
+                        bootstrap_attempt: 0,
+                        uptime_secs: n,
+                    },
+                },
+            )
+            .await;
+            let snap = registry.snapshot().await;
+            assert_eq!(snap.decoder_decoded_total, n);
+            assert_eq!(snap.emitter_rows_total, n * 2);
+            assert_eq!(snap.xact_active, n);
+            assert_eq!(snap.pump_queue_depth, n);
+            assert_eq!(snap.queue_records_out_total, n * 3);
+            assert_eq!(snap.drain_resident_bytes, n * 10);
+            assert_eq!(snap.raw_pending_rows, n);
+            assert_eq!(snap.uptime_seconds, n);
+            assert_eq!(snap.archive_restore_active, 1);
+            assert_eq!(snap.archive_wal_segments_total, 42);
+            assert_eq!(snap.filter_lsn.get(), 2 * WAL_SEG_SIZE);
+        }
+    }
+
+    #[test]
+    fn archive_stage_metrics_refresh_without_resetting_recovery_state() {
+        let emitter = EmitterStats::default();
+        let counters = StageCounters {
+            emitter: Some(&emitter),
+            oracle: [None, None],
+            bridge: [None, None],
+            bootstrap: None,
+            bootstrap_attempt: 0,
+            uptime_secs: 10,
+        };
+        let base = MetricsSnapshot {
+            archive_restore_active: 1,
+            archive_wal_segments_total: 42,
+            source_received_lsn: Pos::new(3 * WAL_SEG_SIZE),
+            filter_lsn: Pos::new(2 * WAL_SEG_SIZE),
+            config_backfills_pending: 21,
+            ..MetricsSnapshot::default()
+        };
+        emitter.rows_emitted.store(17, Ordering::Relaxed);
+        let first = stage_gauges_on(&counters, base);
+        assert_eq!(first.emitter_rows_total, 17);
+        emitter.rows_emitted.store(29, Ordering::Relaxed);
+        emitter.decode_rows_out.store(31, Ordering::Relaxed);
+        let next = stage_gauges_on(
+            &StageCounters {
+                uptime_secs: 20,
+                ..counters
+            },
+            first,
+        );
+        assert_eq!(next.emitter_rows_total, 29);
+        assert_eq!(next.decode_rows_out_total, 31);
+        assert_eq!(next.uptime_seconds, 20);
+        assert_eq!(next.archive_restore_active, 1);
+        assert_eq!(next.archive_wal_segments_total, 42);
+        assert_eq!(next.source_received_lsn.get(), 3 * WAL_SEG_SIZE);
+        assert_eq!(next.filter_lsn.get(), 2 * WAL_SEG_SIZE);
+        assert_eq!(next.config_backfills_pending, 21);
     }
 
     #[test]
@@ -5929,6 +6479,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn archive_prefetch_preserves_order_and_stops_at_gap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let settings = walrus::config::Settings {
+            storage: walrus::config::StorageSettings::Fs {
+                path: tmp.path().join("archive").display().to_string(),
+            },
+            ..Default::default()
+        };
+        let storage = settings.build_storage().unwrap();
+        for index in [0u64, 1, 3] {
+            let name =
+                segments_covering(1, index * WAL_SEG_SIZE..(index + 1) * WAL_SEG_SIZE)[0].format();
+            let path = tmp.path().join(name);
+            fs::write(&path, vec![index as u8; WAL_SEG_SIZE as usize]).unwrap();
+            walrus::pg::wal::push::handle(&settings, storage.clone(), &path)
+                .await
+                .unwrap();
+        }
+        let mut reader = ArchiveFeed::spawn(settings, storage, 1, 42, 4);
+        let (lsn, bytes) = reader.next().await.unwrap().unwrap();
+        assert_eq!(lsn, 42);
+        assert_eq!(bytes.len(), WAL_SEG_SIZE as usize - 42);
+        assert!(bytes.iter().all(|b| *b == 0));
+        let (lsn, bytes) = reader.next().await.unwrap().unwrap();
+        assert_eq!(lsn, WAL_SEG_SIZE);
+        assert!(bytes.iter().all(|b| *b == 1));
+        assert!(reader.next().await.unwrap().is_err());
+        assert!(
+            reader.next().await.is_none(),
+            "must not skip missing segment"
+        );
+    }
+
+    #[tokio::test]
+    async fn archive_prefetch_drop_cancels_worker() {
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let task = tokio::spawn(async move {
+            let _tx = tx;
+            std::future::pending::<()>().await;
+        });
+        let abort = task.abort_handle();
+        drop(ArchiveFeed {
+            wait_nanos: AtomicU64::new(0),
+            rx,
+            task,
+            fetch_nanos: Arc::new(AtomicU64::new(0)),
+        });
+        tokio::task::yield_now().await;
+        assert!(abort.is_finished());
+    }
+
+    #[tokio::test]
     async fn archive_fetch_reads_exact_segment() {
         let tmp = tempfile::tempdir().unwrap();
         let archive = tmp.path().join("archive");
@@ -5945,12 +6547,38 @@ mod tests {
             .await
             .unwrap();
 
-        let (name, bytes) =
-            fetch_archive_segment(&settings, &storage, &tmp.path().join("restore"), 1, 0)
-                .await
-                .unwrap();
+        let (name, bytes) = fetch_archive_segment(&settings, &storage, 1, 0)
+            .await
+            .unwrap();
         assert_eq!(name, "000000010000000000000000");
         assert_eq!(bytes.len(), WAL_SEG_SIZE as usize);
+    }
+
+    #[tokio::test]
+    async fn archive_fetch_falls_back_across_compressions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let segment_path = tmp.path().join("000000010000000000000000");
+        fs::write(&segment_path, vec![7; WAL_SEG_SIZE as usize]).unwrap();
+        let storage = walrus::config::StorageSettings::Fs {
+            path: tmp.path().join("archive").display().to_string(),
+        };
+        let pushed = walrus::config::Settings {
+            storage: storage.clone(),
+            compression: walrus::compression::Method::None,
+            ..Default::default()
+        };
+        let built = pushed.build_storage().unwrap();
+        walrus::pg::wal::push::handle(&pushed, built.clone(), &segment_path)
+            .await
+            .unwrap();
+        // A bucket written under another compression must still read back
+        let reading = walrus::config::Settings {
+            storage,
+            ..Default::default()
+        };
+        let (_, bytes) = fetch_archive_segment(&reading, &built, 1, 0).await.unwrap();
+        assert_eq!(bytes.len(), WAL_SEG_SIZE as usize);
+        assert!(bytes.iter().all(|b| *b == 7));
     }
 
     #[tokio::test]
@@ -5976,10 +6604,9 @@ mod tests {
             .unwrap();
 
         let offset = WAL_SEG_SIZE / 2;
-        let (name, bytes) =
-            fetch_archive_segment(&settings, &storage, &tmp.path().join("restore"), 1, offset)
-                .await
-                .unwrap();
+        let (name, bytes) = fetch_archive_segment(&settings, &storage, 1, offset)
+            .await
+            .unwrap();
         // Same segment file, sliced to begin at the mid-segment LSN.
         assert_eq!(name, "000000010000000000000000");
         assert_eq!(bytes.len(), (WAL_SEG_SIZE - offset) as usize);
@@ -6324,18 +6951,21 @@ mod tests {
         let crossing = BootstrapHandoff {
             end_lsn: 0x3000,
             open_floor: Some(0x1000),
+            shadow: None,
         };
         assert_eq!(crossing.resume_lsn(), 0x1000);
 
         let clean = BootstrapHandoff {
             end_lsn: 0x3000,
             open_floor: None,
+            shadow: None,
         };
         assert_eq!(clean.resume_lsn(), 0x3000);
         assert_eq!(
             BootstrapHandoff {
                 end_lsn: 0x3000,
-                open_floor: Some(0x4000)
+                open_floor: Some(0x4000),
+                shadow: None,
             }
             .resume_lsn(),
             0x3000

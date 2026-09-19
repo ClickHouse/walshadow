@@ -221,7 +221,12 @@ async fn run_object_store_pass(ctx: &PassContext, reqs: &[BackupRequest]) -> Res
 
     let source = Box::new(
         ObjectStoreSource::new(settings.clone(), storage, resolved, ctx.scratch_dir.clone())
-            .with_parallelism(4),
+            .with_parallelism(
+                ctx.emitter
+                    .bootstrap
+                    .object_store_parallelism
+                    .map_or(8, |n| n.get()),
+            ),
     );
     // Tag min(B_redo, S) per rel: gap replay covers (B_redo, S], so walked
     // rows must lose to replayed commits; a backup newer than the opt-in
@@ -291,11 +296,11 @@ async fn walk_and_ship(
     }
     let store_toast = resolver.stores_chunks();
 
-    // Dedicated tail: own CH connection, own seq space, own fatal — the
+    // Dedicated tail: own connections, own seq space, own fatal — the
     // live pipeline never blocks on a backfill (Regime A)
     let tail = OwnedTail::spawn(
         &ctx.emitter,
-        1,
+        ctx.emitter.inserter_pool_size.clamp(1, 3),
         ctx.stats.clone(),
         Fatal::new(),
         ctx.config_rx.clone(),

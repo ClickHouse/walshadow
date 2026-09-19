@@ -5,12 +5,13 @@
 //! * `Special` rmgr → ToShadow (recovery plumbing shadow needs verbatim)
 //! * `Catalog` → ToShadow
 //! * `User` → ToDecoder (XLOG_NOOP placeholder on shadow; original bytes
-//!   feed the heap decoder)
+//!   feed the heap decoder), or ToBoth for a relation in `shadow_rels`
 //! * `Empty` → reclassify via `main_data::relation_for_empty` against
 //!   `CatalogTracker`. Unrecognised → ToShadow: correctness over bytes,
 //!   wrongly suppressing a catalog record breaks shadow.
 
 use std::collections::VecDeque;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use walrus::pg::walparser::{RelFileNode, RmId, XLogRecord, XLogRecordBlock};
@@ -28,6 +29,7 @@ use crate::filter::classify::{Class, classify};
 use crate::filter::dirty_tree::{DirtyState, DirtyTree};
 use crate::filter::main_data;
 use crate::filter::manifest::ManifestStats;
+use crate::filter::shadow_relations::ShadowRelations;
 use crate::record::{AffectedOid, BoundaryInfo, BoundaryKind, Route, rmgr_label};
 use crate::schema::FIRST_NORMAL_OBJECT_ID;
 use ahash::{HashMap, HashSet, HashSetExt};
@@ -62,7 +64,7 @@ impl FilterStats {
 
     pub fn record(&mut self, class: Class, route: Route, bytes: u64) {
         match route {
-            Route::ToShadow => {
+            Route::ToShadow | Route::ToBoth => {
                 self.kept += 1;
                 self.kept_bytes += bytes;
                 match class {
@@ -187,6 +189,7 @@ pub struct Filter {
     /// (offline segment filter, no capture consumer) proves no record's
     /// database, so no record dirties
     target_db_oid: Option<u32>,
+    shadow_rels: Option<ShadowRelations>,
 }
 
 impl Filter {
@@ -199,6 +202,7 @@ impl Filter {
             observed_from_xid: None,
             smgr_markers: Arc::new(Mutex::new(SmgrMarkers::default())),
             target_db_oid: None,
+            shadow_rels: None,
         }
     }
 
@@ -206,6 +210,50 @@ impl Filter {
     /// streams set this before the first record
     pub fn set_target_db(&mut self, db_oid: u32) {
         self.target_db_oid = Some(db_oid);
+    }
+
+    /// Route `rels` and relations created at or after `from_lsn` to both paths
+    ///
+    /// `rels` lists files shadow already holds at `from_lsn`
+    pub fn keep_user_rels(&mut self, rels: HashSet<(u32, u32)>, from_lsn: u64) {
+        self.shadow_rels = Some(ShadowRelations::new(rels, from_lsn));
+    }
+
+    /// Relations routed to shadow as well as decoder, `None` when off
+    pub fn shadow_rels(&self) -> Option<&ShadowRelations> {
+        self.shadow_rels.as_ref()
+    }
+
+    fn keeps_user_rel(&self, db: u32, rel: u32, lsn: u64) -> bool {
+        self.shadow_rels
+            .as_ref()
+            .is_some_and(|s| s.keeps((db, rel), lsn))
+    }
+
+    fn user_rel_to_shadow(&self, record: &XLogRecord, lsn: u64) -> bool {
+        record.blocks.iter().any(|b| {
+            let r = b.header.location.rel;
+            self.keeps_user_rel(r.db_node, r.rel_node, lsn)
+        })
+    }
+
+    pub async fn persist_shadow_rels(&mut self, dir: &Path) -> anyhow::Result<()> {
+        if let Some(rels) = &mut self.shadow_rels {
+            rels.persist(dir).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn load_shadow_rels(&mut self, dir: &Path) -> anyhow::Result<()> {
+        self.shadow_rels = Some(ShadowRelations::load(dir).await?);
+        Ok(())
+    }
+
+    pub(crate) async fn flush_shadow_rels(&mut self) -> anyhow::Result<()> {
+        if let Some(rels) = &mut self.shadow_rels {
+            rels.flush().await?;
+        }
+        Ok(())
     }
 
     /// Capture reads rotation markers through this handle
@@ -295,6 +343,8 @@ impl Filter {
                 if any_block_is_catalog(&self.tracker, &record.blocks) {
                     // tracker has filenodes the bootstrap classify rule misses
                     (Route::ToShadow, self.descriptor_touch_db(record))
+                } else if self.user_rel_to_shadow(record, source_lsn) {
+                    (Route::ToBoth, None)
                 } else {
                     (Route::ToDecoder, None)
                 }
@@ -304,6 +354,8 @@ impl Filter {
                     if self.tracker.is_catalog(rel.db_node, rel.rel_node) {
                         let opaque = self.tracker.is_opaque_catalog(rel.db_node, rel.rel_node);
                         (Route::ToShadow, (!opaque).then_some(rel.db_node))
+                    } else if self.keeps_user_rel(rel.db_node, rel.rel_node, source_lsn) {
+                        (Route::ToBoth, None)
                     } else {
                         (Route::ToDecoder, None)
                     }
@@ -320,6 +372,12 @@ impl Filter {
                 .lock()
                 .expect("smgr markers poisoned")
                 .insert(rfn, source_lsn);
+            // Ignore other databases because their values are never read
+            if let Some(rels) = &mut self.shadow_rels
+                && self.target_db_oid.is_none_or(|db| db == rfn.db_node)
+            {
+                rels.admit((rfn.db_node, rfn.rel_node), source_lsn);
+            }
         }
         // Running-xacts records provide observation points during streaming
         if record.header.resource_manager_id == RmId::Standby as u8
@@ -465,10 +523,12 @@ impl Filter {
         }
         let dirty_hit = merged.is_some();
         // Statistics-only transactions do not need invalidation recapture
-        if stats_only && !capture_all {
+        let stats_only = stats_only && !capture_all;
+        if stats_only {
             inval_oids.clear();
         }
-        if !dirty_hit && inval_oids.is_empty() && !capture_all {
+        // Restart may lose statistics-only evidence, retain a durable empty batch
+        if !dirty_hit && inval_oids.is_empty() && !capture_all && !stats_only {
             return Ok(XactEnd::default());
         }
         // Inval-only boundary (dirty tracker missed the writes): the
@@ -496,6 +556,7 @@ impl Filter {
                 capture_all: capture_all || merged.unenumerated,
                 kind: BoundaryKind::Commit,
                 members,
+                stats_only,
             })),
             aborted_tree: None,
         })
@@ -574,6 +635,7 @@ impl Filter {
             capture_all: namespace_hit || flush,
             kind: BoundaryKind::Command { writer_xid: xid },
             members: Vec::new(),
+            stats_only: false,
         })))
     }
 
@@ -705,6 +767,160 @@ mod tests {
         let mut f = Filter::new();
         f.set_target_db(TARGET_DB);
         f
+    }
+
+    /// Shadow receives chunk WAL while decoder emits row
+    #[test]
+    fn user_records_reach_both_sides_under_shadow_toast() {
+        let mut f = target_filter();
+        let user = rec(RmId::Heap, &[(TARGET_DB, 16500)]);
+        assert_eq!(f.decide(&user), Route::ToDecoder, "off by default");
+        assert!(f.shadow_rels().is_none());
+
+        f.keep_user_rels([(TARGET_DB, 16500)].into_iter().collect(), 0);
+        assert_eq!(f.decide(&user), Route::ToBoth);
+        // Listed relations only, keyed by database
+        assert_eq!(
+            f.decide(&rec(RmId::Heap, &[(TARGET_DB, 16501)])),
+            Route::ToDecoder
+        );
+        assert_eq!(f.decide(&rec(RmId::Heap, &[(6, 16500)])), Route::ToDecoder);
+
+        // Preserve existing route for catalog and special records
+        assert_eq!(
+            f.decide(&rec(RmId::Heap, &[(TARGET_DB, 1259)])),
+            Route::ToShadow
+        );
+        assert_eq!(f.decide(&rec(RmId::Xact, &[])), Route::ToShadow);
+    }
+
+    /// Admit main-fork relations created while shadow is replaying WAL
+    #[test]
+    fn smgr_create_admits_relation_for_shadow() {
+        let heap = |db, rel| rec(RmId::Heap, &[(db, rel)]);
+        let mut f = target_filter();
+        f.keep_user_rels(HashSet::default(), 10);
+        assert_eq!(f.decide(&heap(TARGET_DB, 24000)), Route::ToDecoder);
+        f.decide_record(&smgr_create(TARGET_DB, 24000, 0), 10, 0xD116)
+            .unwrap();
+        assert_eq!(
+            f.decide_record(&heap(TARGET_DB, 24000), 10, 0xD116)
+                .unwrap()
+                .route,
+            Route::ToBoth
+        );
+
+        // Created before shadow's recovery started: shadow has no file
+        f.decide_record(&smgr_create(TARGET_DB, 23999, 0), 9, 0xD116)
+            .unwrap();
+        assert_eq!(f.decide(&heap(TARGET_DB, 23999)), Route::ToDecoder);
+
+        // Init fork is not main storage
+        f.decide_record(&smgr_create(TARGET_DB, 24001, 1), 11, 0xD116)
+            .unwrap();
+        assert_eq!(f.decide(&heap(TARGET_DB, 24001)), Route::ToDecoder);
+
+        // Foreign database serves no value read
+        f.decide_record(&smgr_create(FOREIGN_DB, 24002, 0), 12, 0xD116)
+            .unwrap();
+        assert_eq!(f.decide(&heap(FOREIGN_DB, 24002)), Route::ToDecoder);
+
+        // Offline filter has no followed database and admits every one
+        let mut offline = Filter::new();
+        offline.keep_user_rels(HashSet::default(), 0);
+        offline
+            .decide_record(&smgr_create(FOREIGN_DB, 24002, 0), 12, 0xD116)
+            .unwrap();
+        assert_eq!(
+            offline
+                .decide_record(&heap(FOREIGN_DB, 24002), 12, 0xD116)
+                .unwrap()
+                .route,
+            Route::ToBoth
+        );
+
+        // Off: creation changes nothing
+        let mut off = target_filter();
+        off.decide_record(&smgr_create(TARGET_DB, 24000, 0), 10, 0xD116)
+            .unwrap();
+        assert!(off.shadow_rels().is_none());
+        assert_eq!(off.decide(&heap(TARGET_DB, 24000)), Route::ToDecoder);
+    }
+
+    #[tokio::test]
+    async fn resume_uses_durable_routes_and_creation_lsn() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut bootstrap = target_filter();
+        bootstrap.keep_user_rels([(TARGET_DB, 17000)].into_iter().collect(), 100);
+        bootstrap.persist_shadow_rels(tmp.path()).await.unwrap();
+        bootstrap
+            .decide_record(&smgr_create(TARGET_DB, 24000, 0), 120, 0xD116)
+            .unwrap();
+        bootstrap.flush_shadow_rels().await.unwrap();
+
+        // SMGR redo can recreate storage for a heap omitted from backup
+        let base = tmp.path().join("base/5");
+        tokio::fs::create_dir_all(&base).await.unwrap();
+        tokio::fs::write(base.join("16456"), []).await.unwrap();
+        let mut resumed = target_filter();
+        resumed.load_shadow_rels(tmp.path()).await.unwrap();
+        for (rel, lsn, expected) in [
+            (17000, 90, Route::ToBoth),
+            (16456, 110, Route::ToDecoder),
+            (24000, 119, Route::ToDecoder),
+            (24000, 120, Route::ToBoth),
+        ] {
+            let record = rec(RmId::Heap, &[(TARGET_DB, rel)]);
+            assert_eq!(
+                resumed.decide_record(&record, lsn, 0xD116).unwrap().route,
+                expected
+            );
+        }
+        resumed
+            .decide_record(&smgr_create(TARGET_DB, 16456, 0), 99, 0xD116)
+            .unwrap();
+        assert!(!resumed.shadow_rels().unwrap().contains(&(TARGET_DB, 16456)));
+        resumed
+            .decide_record(&smgr_create(TARGET_DB, 25000, 0), 130, 0xD116)
+            .unwrap();
+        resumed.flush_shadow_rels().await.unwrap();
+        let mut again = target_filter();
+        again.load_shadow_rels(tmp.path()).await.unwrap();
+        assert!(again.shadow_rels().unwrap().contains(&(TARGET_DB, 25000)));
+    }
+
+    /// Keep `ToBoth` records unchanged so shadow receives original bytes
+    #[test]
+    fn to_both_counts_as_kept_not_dropped() {
+        let mut stats = FilterStats::default();
+        stats.record(Class::User, Route::ToBoth, 64);
+        assert_eq!((stats.kept, stats.dropped), (1, 0));
+        assert_eq!(stats.kept_bytes, 64);
+        assert_eq!(stats.kept_user, 1);
+
+        let mut dropped = FilterStats::default();
+        dropped.record(Class::User, Route::ToDecoder, 64);
+        assert_eq!((dropped.kept, dropped.dropped), (0, 1));
+    }
+
+    /// A record with no block refs whose relation resolves to a user relation
+    /// takes the same route as one that names it in a block
+    #[test]
+    fn empty_class_user_relation_follows_the_setting() {
+        let mut f = target_filter();
+        let mut r = rec(RmId::Btree, &[]);
+        r.header.info = main_data::XLOG_BTREE_REUSE_PAGE;
+        let mut md = Vec::new();
+        md.extend_from_slice(&1663u32.to_le_bytes());
+        md.extend_from_slice(&TARGET_DB.to_le_bytes());
+        md.extend_from_slice(&16500u32.to_le_bytes());
+        md.extend_from_slice(&0u32.to_le_bytes());
+        md.extend_from_slice(&0u64.to_le_bytes());
+        md.push(0);
+        r.main_data = md.into();
+        assert_eq!(f.decide(&r), Route::ToDecoder);
+        f.keep_user_rels([(TARGET_DB, 16500)].into_iter().collect(), 0);
+        assert_eq!(f.decide(&r), Route::ToBoth);
     }
 
     fn rec(rm: RmId, rels: &[(u32, u32)]) -> XLogRecord<'static> {
@@ -1182,9 +1398,9 @@ mod tests {
         r
     }
 
-    /// Statistics writes and their invalidations do not need a boundary
+    /// Persist statistics-only commits for replay after observation state resets
     #[test]
-    fn analyze_commit_raises_no_boundary() {
+    fn analyze_commit_retains_empty_boundary() {
         let mut f = target_filter();
         f.decide_record(&running_xacts_rec(700), 10, 0xD116)
             .unwrap();
@@ -1207,13 +1423,36 @@ mod tests {
             &[(-2, 5, 16384), (-2, 5, 16389)],
             None,
         );
+        let boundary = f
+            .decide_record(&commit, 130, 0xD116)
+            .unwrap()
+            .boundary
+            .unwrap();
+        assert!(boundary.oids.is_empty());
+        assert!(!boundary.capture_all);
         assert!(
-            f.decide_record(&commit, 130, 0xD116)
-                .unwrap()
-                .boundary
-                .is_none(),
-            "commit boundary for a statistics-only transaction",
+            boundary.stats_only,
+            "statistics-only commit should not wait for shadow replay"
         );
+        assert_eq!(boundary.kind, BoundaryKind::Commit);
+
+        let mut resumed = target_filter();
+        resumed.observe_from_xid(900);
+        resumed
+            .decide_record(&pg_class_inplace(746), 110, 0xD116)
+            .unwrap();
+        resumed.decide_record(&invals, 120, 0xD116).unwrap();
+        let replay = resumed
+            .decide_record(&commit, 130, 0xD116)
+            .unwrap()
+            .boundary
+            .unwrap();
+        assert!(!replay.oids.is_empty());
+        assert!(
+            !replay.stats_only,
+            "restart loses statistics-only evidence, so replay must use saved empty batch",
+        );
+        assert_eq!(boundary.drain_xid, replay.drain_xid);
     }
 
     #[test]
@@ -1621,19 +1860,24 @@ mod tests {
         assert!(f.decide_record(&commit, 300, 0xD116).is_err());
     }
 
-    #[test]
-    fn smgr_create_records_pump_marker() {
-        use crate::filter::main_data::XLOG_SMGR_CREATE;
-        let mut f = target_filter();
+    /// `XLOG_SMGR_CREATE` of `rel` in `db`, default tablespace
+    fn smgr_create(db: u32, rel: u32, fork: i32) -> XLogRecord<'static> {
         let mut md = Vec::new();
         md.extend_from_slice(&1663u32.to_le_bytes());
-        md.extend_from_slice(&5u32.to_le_bytes());
-        md.extend_from_slice(&24000u32.to_le_bytes());
-        md.extend_from_slice(&0i32.to_le_bytes()); // MAIN_FORKNUM
+        md.extend_from_slice(&db.to_le_bytes());
+        md.extend_from_slice(&rel.to_le_bytes());
+        md.extend_from_slice(&fork.to_le_bytes());
         let mut r = rec(RmId::Smgr, &[]);
-        r.header.info = XLOG_SMGR_CREATE;
+        r.header.info = main_data::XLOG_SMGR_CREATE;
         r.main_data = std::borrow::Cow::Owned(md);
-        f.decide_record(&r, 777, 0xD116).unwrap();
+        r
+    }
+
+    #[test]
+    fn smgr_create_records_pump_marker() {
+        let mut f = target_filter();
+        f.decide_record(&smgr_create(5, 24000, 0), 777, 0xD116)
+            .unwrap();
         let rfn = RelFileNode {
             spc_node: 1663,
             db_node: 5,

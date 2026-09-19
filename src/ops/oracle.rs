@@ -71,6 +71,7 @@ pub struct OracleColumnBuf {
     pub source_typmod: i32,
     cells: Vec<OracleCell>,
     wire_bytes: usize,
+    payload_capacity: usize,
     /// PostgreSQL hands a String target its literal back unchanged, so such
     /// a column resolves in the daemon while every cell is one
     string_target: bool,
@@ -89,6 +90,7 @@ impl OracleColumnBuf {
             source_typmod,
             cells: Vec::new(),
             wire_bytes: 0,
+            payload_capacity: 0,
             string_target: matches!(target_type, "String" | "Nullable(String)"),
             remote_cells: 0,
             literal_bytes: 0,
@@ -96,6 +98,12 @@ impl OracleColumnBuf {
     }
 
     pub fn push(&mut self, cell: OracleCell) {
+        self.payload_capacity += match &cell {
+            OracleCell::Default => 0,
+            OracleCell::DiskRaw(v) | OracleCell::TextInput(v) | OracleCell::Literal(v) => {
+                v.capacity()
+            }
+        };
         let bytes = cell.wire_bytes();
         self.wire_bytes += bytes;
         if self.resolves_locally(&cell) {
@@ -130,6 +138,10 @@ impl OracleColumnBuf {
 
     pub fn cells(&self) -> &[OracleCell] {
         &self.cells
+    }
+
+    pub(crate) fn allocated_bytes(&self) -> usize {
+        self.payload_capacity + self.cells.capacity() * std::mem::size_of::<OracleCell>()
     }
 
     pub fn approx_size(&self) -> usize {
@@ -185,6 +197,11 @@ impl Oracle {
     /// worker serves one request per loop iteration
     pub fn concurrency(&self) -> usize {
         self.bridge.pool_size()
+    }
+
+    /// Shared worker bridge used by oracle and shadow TOAST store
+    pub fn bridge(&self) -> Arc<Bridge> {
+        self.bridge.clone()
     }
 
     /// Round-trip cost of resolution: the request bytes and worker service

@@ -21,7 +21,7 @@ use crate::ch::{
 use crate::decode::heap_decoder::{
     ColumnValue, ToastPointer, VARLENA_EXTSIZE_BITS, VARLENA_EXTSIZE_MASK, decompress_varlena,
 };
-use crate::emit::ch_emitter::{EmitterConfig, EmitterStats};
+use crate::emit::ch_emitter::{EmitterConfig, EmitterStats, InlineValueOverflow, ToastMode};
 use crate::xact::spill::{BodyRef, BodySpoolFile, ToastChunk, ToastDelete};
 use ahash::{HashMap, HashMapExt, HashSet, HashSetExt};
 
@@ -59,6 +59,12 @@ pub enum ChunkStoreError {
     /// Body spool read at row materialization
     #[error("toast store io: {0}")]
     Io(#[from] std::io::Error),
+    /// Shadow read failed in bridge or worker
+    #[error("toast store shadow: {0}")]
+    Shadow(String),
+    /// Backend is read-only
+    #[error("toast store shadow is read-only, refused {0}")]
+    ReadOnly(&'static str),
 }
 
 #[derive(Debug, Error)]
@@ -80,26 +86,36 @@ fn pointer_is_compressed(p: &ToastPointer) -> bool {
     (pointer_extsize(p) as i64) < i64::from(p.va_rawsize - VARHDRSZ)
 }
 
-/// Validate value caps, return heap leaf-permit need
+/// Return larger of decoded and stored sizes
+pub(crate) fn pointer_footprint(p: &ToastPointer) -> usize {
+    ((p.va_rawsize - VARHDRSZ).max(0) as usize).max(pointer_extsize(p))
+}
+
+/// Check value limits and return memory needed for decoding
+///
+/// Ignore oversized values under [`InlineValueOverflow::Null`], caller replaces
+/// them without fetching
 pub(crate) fn check_value_caps(
     pointers: impl IntoIterator<Item = ToastPointer>,
     max: usize,
+    overflow: InlineValueOverflow,
 ) -> Result<usize, ToastValueError> {
     let mut retained = 0usize;
     let mut transient = 0usize;
     for p in pointers {
-        let raw = (p.va_rawsize - VARHDRSZ).max(0) as usize;
-        let ext = pointer_extsize(&p);
-        if raw.max(ext) > max {
+        let footprint = pointer_footprint(&p);
+        if footprint > max {
+            if overflow == InlineValueOverflow::Null {
+                continue;
+            }
             return Err(ToastValueError::ValueTooLarge {
-                rawsize: raw.max(ext),
+                rawsize: footprint,
                 max,
             });
         }
-        let compressed = pointer_is_compressed(&p);
-        retained += if compressed { raw } else { ext };
-        if compressed {
-            transient = transient.max(ext);
+        retained += footprint;
+        if pointer_is_compressed(&p) {
+            transient = transient.max(pointer_extsize(&p));
         }
     }
     Ok(retained + transient)
@@ -361,37 +377,37 @@ impl ChunkAssembler {
 /// Durable TID-keyed chunk store
 #[async_trait]
 pub trait ChunkStore: Send + Sync {
+    /// Whether backend accepts decoded chunk rows
+    fn accepts_writes(&self) -> bool {
+        true
+    }
     /// Replay emits byte-identical rows at equal key and version
     async fn put(&self, rows: &[ToastRow]) -> Result<(), ChunkStoreError>;
-    /// Assemble newest live row per sequence at `max_lsn` against the
-    /// pointer's stored size (`va_extsize`)
+    /// Assemble newest live row per sequence at `max_lsn` against each
+    /// pointer's stored size (`va_extsize`) over one mirror's
+    /// `(value_id, expected_size)` batch, results aligned with `values`.
+    /// Ids must be unique: a store resolves each one once
     ///
     /// [`FetchedValue::Missing`] when no live row remains at bound,
     /// [`ChunkStoreError::MissingMirror`] when mirror is absent
+    async fn fetch_many(
+        &self,
+        toast_relid: u32,
+        values: &[(u32, usize)],
+        max_lsn: u64,
+    ) -> Result<Vec<FetchedValue>, ChunkStoreError>;
+    /// [`Self::fetch_many`] for one value
     async fn fetch(
         &self,
         toast_relid: u32,
         value_id: u32,
         max_lsn: u64,
         expected_size: usize,
-    ) -> Result<FetchedValue, ChunkStoreError>;
-    /// [`Self::fetch`] over one mirror's `(value_id, expected_size)` batch,
-    /// results aligned with `values`. Ids must be unique: a store resolves
-    /// each one once
-    async fn fetch_many(
-        &self,
-        toast_relid: u32,
-        values: &[(u32, usize)],
-        max_lsn: u64,
-    ) -> Result<Vec<FetchedValue>, ChunkStoreError> {
-        let mut out = Vec::with_capacity(values.len());
-        for &(value_id, expected_size) in values {
-            out.push(
-                self.fetch(toast_relid, value_id, max_lsn, expected_size)
-                    .await?,
-            );
-        }
-        Ok(out)
+    ) -> Result<FetchedValue, ChunkStoreError> {
+        let mut got = self
+            .fetch_many(toast_relid, &[(value_id, expected_size)], max_lsn)
+            .await?;
+        Ok(got.pop().unwrap_or(FetchedValue::Missing))
     }
     /// Empty mirror without dropping it
     ///
@@ -430,19 +446,6 @@ impl ChunkStore for MemChunkStore {
             mirrors.entry(r.toast_relid).or_default().push(r.clone());
         }
         Ok(())
-    }
-
-    async fn fetch(
-        &self,
-        toast_relid: u32,
-        value_id: u32,
-        max_lsn: u64,
-        expected_size: usize,
-    ) -> Result<FetchedValue, ChunkStoreError> {
-        let mut got = self
-            .fetch_many(toast_relid, &[(value_id, expected_size)], max_lsn)
-            .await?;
-        Ok(got.pop().unwrap_or(FetchedValue::Missing))
     }
 
     /// One pass over the mirror for the whole batch, as the CH store's one
@@ -909,19 +912,6 @@ impl ChunkStore for ClickHouseChunkStore {
             .map_err(|e| ChunkStoreError::Clickhouse(e.to_string()))
     }
 
-    async fn fetch(
-        &self,
-        toast_relid: u32,
-        value_id: u32,
-        max_lsn: u64,
-        expected_size: usize,
-    ) -> Result<FetchedValue, ChunkStoreError> {
-        let mut got = self
-            .fetch_many(toast_relid, &[(value_id, expected_size)], max_lsn)
-            .await?;
-        Ok(got.pop().unwrap_or(FetchedValue::Missing))
-    }
-
     async fn fetch_many(
         &self,
         toast_relid: u32,
@@ -1003,6 +993,8 @@ pub struct ToastResolver {
     put_batch_bytes: usize,
     /// V3 hard per-value decode-target cap, checked before allocation
     inline_value_max: usize,
+    /// Action for values over `inline_value_max`
+    overflow: InlineValueOverflow,
     /// Leaf permits for per-value transients (assembly, decompress, JIT
     /// materialization); `None` = unmetered (serial/metrics-only paths)
     budget: Option<crate::budget::MemoryBudget>,
@@ -1016,13 +1008,52 @@ impl ToastResolver {
             put_batch_rows: CHUNK_PUT_BATCH,
             put_batch_bytes: CHUNK_PUT_BYTES,
             inline_value_max: usize::MAX,
+            overflow: InlineValueOverflow::default(),
             budget: None,
         }
     }
 
+    /// Build resolver without a bridge
+    ///
+    /// Disabled mode keeps no store, other modes use ClickHouse mirror
     pub fn from_config(emitter: &EmitterConfig, stats: Arc<EmitterStats>) -> Self {
+        let store: Option<Arc<dyn ChunkStore>> = match emitter.toast.mode {
+            ToastMode::Disabled => None,
+            _ => Some(Arc::new(ClickHouseChunkStore::new(emitter.clone()))),
+        };
+        Self::with_limits(store, emitter, stats)
+    }
+
+    /// Build resolver for configured mode. Shadow requires `bridge`
+    pub fn for_mode(
+        emitter: &EmitterConfig,
+        stats: Arc<EmitterStats>,
+        bridge: Option<Arc<crate::ops::bridge::Bridge>>,
+    ) -> Result<Self, String> {
+        if !emitter.toast.mode.is_shadow() {
+            return Ok(Self::from_config(emitter, stats));
+        }
+        let bridge = bridge.ok_or_else(|| {
+            "[toast] mode = \"shadow\" needs the pgext bridge; \
+             pass --bridge-lib-dir and let walshadow manage shadow"
+                .to_string()
+        })?;
+        Ok(Self::with_limits(
+            Some(Arc::new(crate::toast::shadow_store::ShadowToastStore::new(
+                bridge,
+            ))),
+            emitter,
+            stats,
+        ))
+    }
+
+    fn with_limits(
+        store: Option<Arc<dyn ChunkStore>>,
+        emitter: &EmitterConfig,
+        stats: Arc<EmitterStats>,
+    ) -> Self {
         Self {
-            store: Some(Arc::new(ClickHouseChunkStore::new(emitter.clone()))),
+            store,
             stats,
             put_batch_rows: emitter
                 .toast
@@ -1033,6 +1064,7 @@ impl ToastResolver {
                 .put_batch_bytes
                 .map_or(CHUNK_PUT_BYTES, |n| n.get()),
             inline_value_max: emitter.inline_value_max,
+            overflow: emitter.inline_value_overflow,
             budget: None,
         }
     }
@@ -1045,6 +1077,7 @@ impl ToastResolver {
             put_batch_rows: CHUNK_PUT_BATCH,
             put_batch_bytes: CHUNK_PUT_BYTES,
             inline_value_max: usize::MAX,
+            overflow: InlineValueOverflow::default(),
             budget: None,
         }
     }
@@ -1070,12 +1103,28 @@ impl ToastResolver {
         self.inline_value_max
     }
 
+    /// Override oversized value action
+    pub fn with_overflow(mut self, overflow: InlineValueOverflow) -> Self {
+        self.overflow = overflow;
+        self
+    }
+
+    pub fn overflow(&self) -> InlineValueOverflow {
+        self.overflow
+    }
+
+    /// Return whether value exceeds limit
+    pub fn value_oversize(&self, p: &ToastPointer) -> bool {
+        pointer_footprint(p) > self.inline_value_max
+    }
+
     pub fn budget(&self) -> Option<&crate::budget::MemoryBudget> {
         self.budget.as_ref()
     }
 
+    /// Whether resolver store accepts decoded chunks
     pub fn stores_chunks(&self) -> bool {
-        self.store.is_some()
+        self.store.as_ref().is_some_and(|s| s.accepts_writes())
     }
 
     pub fn put_limit_reached(&self, rows: usize, bytes: usize) -> bool {
@@ -1216,7 +1265,7 @@ impl ToastResolver {
         toast_relid: u32,
         metric: &AtomicU64,
     ) -> Result<(), ChunkStoreError> {
-        let Some(store) = &self.store else {
+        let Some(store) = &self.store.as_ref().filter(|s| s.accepts_writes()) else {
             return Ok(());
         };
         store.truncate_mirror(toast_relid).await?;
@@ -1244,7 +1293,7 @@ impl ToastResolver {
         marker_lsn: u64,
         commit_lsn: u64,
     ) -> Result<(), ChunkStoreError> {
-        let Some(store) = &self.store else {
+        let Some(store) = &self.store.as_ref().filter(|s| s.accepts_writes()) else {
             return Ok(());
         };
         store
@@ -1259,6 +1308,13 @@ impl ToastResolver {
     pub fn note_filled_default(&self) {
         self.stats
             .toast_values_filled_default
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count oversized value replacement
+    pub fn note_filled_oversize(&self) {
+        self.stats
+            .toast_values_filled_oversize
             .fetch_add(1, Ordering::Relaxed);
     }
 
@@ -1642,6 +1698,127 @@ mod tests {
         assert!(tomb.is_tombstone() && tomb.chunk_data.is_empty());
         // File body without spool is an error, not a panic
         assert!(refs[1].materialize(None).is_err());
+    }
+
+    /// Read-only backend neither stores chunks nor fills missing values
+    #[tokio::test(flavor = "current_thread")]
+    async fn read_only_store_reads_without_accepting_writes() {
+        struct ReadOnly(MemChunkStore);
+
+        #[async_trait]
+        impl ChunkStore for ReadOnly {
+            fn accepts_writes(&self) -> bool {
+                false
+            }
+            async fn put(&self, _rows: &[ToastRow]) -> Result<(), ChunkStoreError> {
+                Err(ChunkStoreError::ReadOnly("put"))
+            }
+            async fn fetch_many(
+                &self,
+                relid: u32,
+                values: &[(u32, usize)],
+                max_lsn: u64,
+            ) -> Result<Vec<FetchedValue>, ChunkStoreError> {
+                self.0.fetch_many(relid, values, max_lsn).await
+            }
+            async fn truncate_mirror(&self, _relid: u32) -> Result<(), ChunkStoreError> {
+                Err(ChunkStoreError::ReadOnly("truncate_mirror"))
+            }
+            async fn rewrite_barrier(
+                &self,
+                _relid: u32,
+                _marker: u64,
+                _commit: u64,
+            ) -> Result<(), ChunkStoreError> {
+                Err(ChunkStoreError::ReadOnly("rewrite_barrier"))
+            }
+        }
+
+        let inner = MemChunkStore::new();
+        inner
+            .put(&[ToastRow {
+                toast_relid: 16500,
+                blkno: 1,
+                offnum: 1,
+                chunk_id: 7,
+                chunk_seq: 0,
+                chunk_data: Bytes::from_static(b"body"),
+                lsn: 0x1000,
+            }])
+            .await
+            .unwrap();
+
+        let r =
+            ToastResolver::with_store(Arc::new(ReadOnly(inner)), Arc::new(EmitterStats::default()));
+        assert!(!r.stores_chunks(), "nothing should collect rows for it");
+        assert!(!r.fill_on_miss(), "a miss still has to be explained");
+        assert_eq!(
+            r.fetch_value(16500, 7, u64::MAX, 4).await.unwrap(),
+            Some(assembled(b"body")),
+        );
+        // Reject writes instead of dropping rows
+        assert!(
+            r.put(&[ToastRow {
+                toast_relid: 16500,
+                blkno: 2,
+                offnum: 1,
+                chunk_id: 8,
+                chunk_seq: 0,
+                chunk_data: Bytes::from_static(b"x"),
+                lsn: 0x2000,
+            }])
+            .await
+            .is_err()
+        );
+        r.truncate_mirror(16500)
+            .await
+            .expect("no mirror to empty, so a TRUNCATE barrier has nothing to do");
+        r.rewrite_barrier(16500, 1, 2)
+            .await
+            .expect("no mirror to tombstone, so a rewrite barrier has nothing to do");
+    }
+
+    /// Shadow mode requires bridge, disabled mode keeps no store
+    #[test]
+    fn for_mode_honours_the_setting() {
+        let stats = || Arc::new(EmitterStats::default());
+        let ch = EmitterConfig::from_toml_str("[toast]\nmode = \"clickhouse\"\n").unwrap();
+        assert!(!ch.toast.mode.is_shadow());
+        let r = ToastResolver::for_mode(&ch, stats(), None).expect("clickhouse needs no bridge");
+        assert!(r.stores_chunks(), "the mirror takes writes");
+
+        let default = EmitterConfig::from_toml_str("").unwrap();
+        assert_eq!(default.toast.mode, ToastMode::Clickhouse);
+
+        let shadow = EmitterConfig::from_toml_str("[toast]\nmode = \"shadow\"\n").unwrap();
+        assert!(shadow.toast.mode.is_shadow());
+        let err = match ToastResolver::for_mode(&shadow, stats(), None) {
+            Err(e) => e,
+            Ok(_) => panic!("shadow without a bridge must be a config error"),
+        };
+        assert!(err.contains("bridge"), "{err}");
+
+        let disabled = EmitterConfig::from_toml_str(
+            "[memory]\ninline_value_max = 4096\n[toast]\nmode = \"disabled\"\n",
+        )
+        .unwrap();
+        assert_eq!(disabled.toast.mode, ToastMode::Disabled);
+        for r in [
+            ToastResolver::for_mode(&disabled, stats(), None).expect("disabled needs no bridge"),
+            ToastResolver::from_config(&disabled, stats()),
+        ] {
+            assert!(!r.stores_chunks() && r.fill_on_miss());
+            assert_eq!(
+                r.inline_value_max(),
+                4096,
+                "values in current transaction keep size limit"
+            );
+        }
+
+        assert!(
+            EmitterConfig::from_toml_str("[toast]\nmode = \"elsewhere\"\n").is_err(),
+            "an unknown mode must not fall back to the mirror",
+        );
     }
 
     /// Oversized under a tiny budget: overshoots and stores, never an

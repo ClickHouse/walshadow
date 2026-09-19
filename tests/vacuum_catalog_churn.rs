@@ -1,4 +1,4 @@
-//! Check that maintenance traffic does not create catalog boundaries
+//! Verify maintenance skips catalog reads and replay waits
 //!
 //! Run with `--nocapture` to print boundary details
 
@@ -75,6 +75,8 @@ struct BoundaryRow {
     capture_all: bool,
     /// Relation oids selected for recapture
     oids: Vec<u32>,
+    /// Commit changed only statistics, so save an empty batch without waiting
+    stats_only: bool,
 }
 
 /// Count filter decisions and boundary sources
@@ -98,6 +100,9 @@ impl Census {
         match record.route {
             Route::ToShadow => self.to_shadow += 1,
             Route::ToDecoder => self.to_decoder += 1,
+            // Shadow replays it, so it counts there; the decoder side is not
+            // what this census measures
+            Route::ToBoth => self.to_shadow += 1,
         }
         let xid = record.parsed.header.xact_id;
         let op = format!(
@@ -128,6 +133,7 @@ impl Census {
                 rels,
                 capture_all: info.capture_all,
                 oids: info.oids.iter().map(|a| a.oid).collect(),
+                stats_only: info.stats_only,
             });
         }
     }
@@ -150,19 +156,26 @@ impl Census {
             let rels: Vec<String> = b.rels.iter().map(|r| name_of(*r)).collect();
             let oids: Vec<String> = b.oids.iter().map(|o| names.oid(*o)).collect();
             println!(
-                "    boundary {:#X} {} capture_all={} recaptures [{}] via writes to [{}]",
+                "    boundary {:#X} {} capture_all={} stats_only={} \
+                 recaptures [{}] via writes to [{}]",
                 b.lsn,
                 b.kind,
                 b.capture_all,
+                b.stats_only,
                 oids.join(", "),
                 rels.join(", "),
             );
         }
     }
 
-    /// Catalog relations that dirtied at least one boundary
+    /// Find boundaries that require replay waits and catalog reads
+    fn reading_boundaries(&self) -> Vec<&BoundaryRow> {
+        self.boundaries.iter().filter(|b| !b.stats_only).collect()
+    }
+
+    /// Find catalog relations changed at boundaries that require catalog reads
     fn boundary_rels(&self) -> BTreeSet<u32> {
-        self.boundaries
+        self.reading_boundaries()
             .iter()
             .flat_map(|b| b.rels.clone())
             .collect()
@@ -213,7 +226,12 @@ impl RecordSink for HoldingCensus {
     ) -> Pin<Box<dyn std::future::Future<Output = Result<(), SinkError>> + Send + 'a>> {
         Box::pin(async move {
             self.census.observe(record);
-            if record.catalog_boundary {
+            // Match pump behavior, skip replay waits for statistics-only commits
+            let parks = record
+                .boundary_info
+                .as_ref()
+                .is_some_and(|info| !info.stats_only);
+            if parks {
                 let parked = Instant::now();
                 self.gate
                     .hold(
@@ -389,7 +407,7 @@ async fn attach(source: &Shadow, app_name: &str) -> (SourceFeed, WalStream) {
     (feed, stream)
 }
 
-/// Verify maintenance workloads do not create boundaries
+/// Verify maintenance workloads require no catalog reads
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn maintenance_traffic_costs_no_catalog_boundary() {
     if !pg_available() {
@@ -482,10 +500,11 @@ async fn maintenance_traffic_costs_no_catalog_boundary() {
         ("vacuum analyze", &vacuum_analyze),
     ] {
         let rels: Vec<String> = census.boundary_rels().iter().map(name_of).collect();
+        let reading = census.reading_boundaries();
         assert!(
-            census.boundaries.is_empty(),
-            "{phase_name}: {} catalog boundaries, dirtied by [{}] — each one stalls the pump",
-            census.boundaries.len(),
+            reading.is_empty(),
+            "{phase_name}: {} boundaries require catalog reads and replay waits after changes to [{}]",
+            reading.len(),
             rels.join(", "),
         );
     }

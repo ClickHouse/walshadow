@@ -216,7 +216,13 @@ impl PipelineConfig {
         let resolver = if matches!(tail, TailKind::Null) {
             crate::toast::ToastResolver::disabled().with_stats(stats.clone())
         } else {
-            crate::toast::ToastResolver::from_config(&emitter, stats.clone())
+            // Shadow mode requires oracle bridge
+            crate::toast::ToastResolver::for_mode(
+                &emitter,
+                stats.clone(),
+                oracle.as_ref().map(|o| o.bridge()),
+            )
+            .map_err(EmitterError::Config)?
         }
         .with_budget(budget.clone());
 
@@ -307,7 +313,7 @@ pub fn build_budget(
 ) -> Result<crate::budget::MemoryBudget, String> {
     let reserve = leaf_reserve_for(
         emitter.resident_payload_max,
-        emitter.inline_value_max,
+        emitter.value_reserve,
         decoders,
     )?;
     // Progress invariant: a drain admits slices while holding its sealed
@@ -331,20 +337,21 @@ pub fn build_budget(
     ))
 }
 
-/// Leaf reserve: one in-flight per-value transient per decode worker.
-/// Reserve capped at half the pool so admission keeps meaningful
-/// headroom — at equality every nonempty slice would fail `admit`
+/// Reserve `value_reserve` bytes per decoder
+///
+/// Keep reserve below half of pool so pipeline can accept nonempty batches.
+/// Values larger than reserve run one at a time
 pub fn leaf_reserve_for(
     resident_payload_max: usize,
-    inline_value_max: usize,
+    value_reserve: usize,
     decoders: usize,
 ) -> Result<usize, String> {
-    let reserve = decoders.max(1).saturating_mul(inline_value_max);
+    let reserve = decoders.max(1).saturating_mul(value_reserve);
     if reserve > resident_payload_max / 2 {
         return Err(format!(
-            "leaf reserve {reserve} ({} decoders x inline_value_max {inline_value_max}) \
-             exceeds half of resident_payload_max {resident_payload_max}; raise \
-             resident_payload_max or lower inline_value_max / decoder pool",
+            "value_reserve needs {reserve} bytes for {} decoders, more than half of \
+             resident_payload_max {resident_payload_max}; raise resident_payload_max \
+             or lower value_reserve or decoder_pool_size",
             decoders.max(1),
         ));
     }
@@ -360,13 +367,24 @@ mod tests {
     #[test]
     fn leaf_reserve_rejects_zero_admission_headroom() {
         let defaults = crate::emit::ch_emitter::EmitterConfig::default();
-        let (pool, value) = (defaults.resident_payload_max, defaults.inline_value_max);
+        let (pool, value) = (defaults.resident_payload_max, defaults.value_reserve);
         assert_eq!(leaf_reserve_for(pool, value, 1), Ok(value));
         assert_eq!(leaf_reserve_for(pool, value, 4), Ok(4 * value));
-        assert!(leaf_reserve_for(pool, value, 8).is_err());
         // Equality with the pool previously passed the old check and left
         // admission_max == 0
         assert!(leaf_reserve_for(pool, pool / 8, 8).is_err());
+        assert!(leaf_reserve_for(pool, pool, 1).is_err());
+    }
+
+    /// Do not size pool from maximum value size
+    #[test]
+    fn hard_value_cap_does_not_size_the_pool() {
+        let cfg = crate::emit::ch_emitter::EmitterConfig {
+            resident_payload_max: 512 << 20,
+            inline_value_max: 1 << 30,
+            ..Default::default()
+        };
+        assert!(build_budget(&cfg, 4).is_ok());
     }
 
     /// Admission must fit one drain's retained state plus slice headroom,
@@ -376,7 +394,7 @@ mod tests {
         let mut cfg = crate::emit::ch_emitter::EmitterConfig::default();
         assert!(build_budget(&cfg, 4).is_ok());
         cfg.resident_payload_max = 64 << 20;
-        cfg.inline_value_max = 1 << 20;
+        cfg.value_reserve = 1 << 20;
         assert!(build_budget(&cfg, 1).is_err());
     }
 }

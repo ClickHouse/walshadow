@@ -34,7 +34,7 @@ use tokio::task::JoinHandle;
 
 use crate::catalog::pending::DegradeReason;
 use crate::decode::heap_decoder::HEAP_OP_LABELS;
-use crate::ops::bridge::OP_LABELS;
+use crate::ops::bridge::{OP_COUNT, OP_LABELS};
 use crate::pos::{Drain, EmitterAck, FilterDispatched, Floor, Pos, ShadowReplay, SourceReceived};
 use crate::source::transition::SWITCH_FAILURE_REASONS;
 
@@ -179,10 +179,16 @@ snapshot! {
     counter memory_budget_waits_total: u64 = "Budget acquisitions that waited for a release.",
     counter memory_budget_overshoots_total: u64 =
         "Requests above a budget compartment, admitted with only the satisfiable share metered.",
+    counter memory_budget_big_leaf_waits_total: u64 =
+        "Large values that waited for another large value to finish.",
     gauge bootstrap_deferred_bytes: u64 =
         "Resident bytes in the in-memory prefixes of every bootstrap TOAST-deferred spool.",
     gauge bootstrap_deferred_spool_bytes: u64 =
         "Encoded bytes in every bootstrap TOAST-deferred spool file.",
+    gauge bootstrap_deferred_replay_bytes: u64 =
+        "Total encoded file bytes in active deferred TOAST replays, excluding spool headers.",
+    gauge bootstrap_deferred_replayed_bytes: u64 =
+        "Encoded file bytes processed by active deferred TOAST replays; excludes prefetched batches and does not imply ClickHouse acknowledgement.",
     counter pending_rows_total: u64 =
         "Undecided backup rows written to ClickHouse pending tables.",
     counter pending_tables_total: u64 = "Pending tables created for undecided backup rows.",
@@ -245,6 +251,8 @@ snapshot! {
         "Store-mode values filled after their history merge-collapsed.",
     counter toast_values_filled_mismatch_total: u64 =
         "Store-mode values filled off a dense-but-short store run (partial collapse or generation mixing).",
+    counter toast_values_filled_oversize_total: u64 =
+        "Values over inline_value_max replaced with NULL or a column default.",
     counter toast_mirror_truncates_total: u64 =
         "Mirror wipes from owner TRUNCATE, applied at the reorder barrier.",
     counter toast_mirror_retires_total: u64 =
@@ -318,6 +326,7 @@ snapshot! {
     counter process_cpu_seconds_total: f64 =
         "Total user+system CPU seconds consumed by the walshadow process.",
     gauge process_resident_memory_bytes: u64 = "Resident set size of the walshadow process (VmRSS).",
+    gauge process_threads: u64 = "OS threads in walshadow, including async and blocking workers.",
     counter oracle_local_columns_total: u64 =
         "Oracle-routed columns the daemon built itself: already-rendered cells against a String target, which PG would hand straight back.",
     counter oracle_blocks_total: u64 =
@@ -331,21 +340,21 @@ snapshot! {
         "1 while the pgext bridge worker answered the last request over its socket.",
     /// Per-op, rendered `op=` labelled; order matches
     /// [`OP_LABELS`].
-    counter bridge_requests_by_op: [u64; 4] ["op" = OP_LABELS] =
+    counter bridge_requests_by_op: [u64; OP_COUNT] ["op" = OP_LABELS] =
         "Requests sent to the pgext bridge worker.",
-    counter bridge_errors_by_op: [u64; 4] ["op" = OP_LABELS] =
+    counter bridge_errors_by_op: [u64; OP_COUNT] ["op" = OP_LABELS] =
         "Bridge requests that failed, transport or worker-side.",
-    counter bridge_request_seconds_by_op: [f64; 4] ["op" = OP_LABELS] =
+    counter bridge_request_seconds_by_op: [f64; OP_COUNT] ["op" = OP_LABELS] =
         "Wall time spent in bridge round trips.",
     /// Queued behind another caller on the single bridge socket
-    counter bridge_lock_wait_seconds_by_op: [f64; 4] ["op" = OP_LABELS] =
+    counter bridge_lock_wait_seconds_by_op: [f64; OP_COUNT] ["op" = OP_LABELS] =
         "Wall time bridge callers spent queued for the socket. Against bridge_service_seconds this says whether the worker or the funnel in front of it is the limiter.",
     /// Wire time with the socket held
-    counter bridge_service_seconds_by_op: [f64; 4] ["op" = OP_LABELS] =
+    counter bridge_service_seconds_by_op: [f64; OP_COUNT] ["op" = OP_LABELS] =
         "Wall time on the wire with the bridge socket held: worker conversion plus transfer.",
-    counter bridge_request_bytes_by_op: [u64; 4] ["op" = OP_LABELS] =
+    counter bridge_request_bytes_by_op: [u64; OP_COUNT] ["op" = OP_LABELS] =
         "Request frame bytes written to the bridge socket.",
-    counter bridge_response_bytes_by_op: [u64; 4] ["op" = OP_LABELS] =
+    counter bridge_response_bytes_by_op: [u64; OP_COUNT] ["op" = OP_LABELS] =
         "Response frame bytes read back off the bridge socket.",
     counter bridge_reconnects_total: u64 =
         "Bridge sockets redialled after a worker exit or transport error.",
@@ -361,8 +370,16 @@ snapshot! {
         "Which attempt the running initial load is; above 1 means an incomplete one was discarded and re-extracted.",
     counter archive_wal_segments_total: u64 =
         "WAL segments replayed out of the backup archive because the source could not serve the resume point.",
+    counter archive_fetch_seconds_total: f64 =
+        "Summed archive fetch durations, including download, decompression and local staging; overlapping fetches add.",
+    counter archive_wait_seconds_total: f64 =
+        "Pump time awaiting next prefetched WAL segment, including waits spanning status ticks.",
+    counter pump_queue_wait_seconds_total: f64 =
+        "Pump time sending batches into bounded decoder queue.",
+    counter archive_replay_seconds_total: f64 =
+        "Time filtering and dispatching archived WAL, including downstream backpressure.",
     gauge archive_restore_active: u64 =
-        "1 while the pump is inside that archive leg, which owns the pump task for its whole duration, so every other family here holds the value it had when the leg started.",
+        "1 while consuming prefetched archive WAL through the normal pump.",
     counter source_endpoint_swaps_total: u64 =
         "Source feeds swapped onto a reloaded `[source]` endpoint or slot.",
     counter source_endpoint_swap_failures_total: u64 =
@@ -907,11 +924,15 @@ mod tests {
         let body = render(MetricsSnapshot {
             bootstrap_parts_total: 392,
             bootstrap_parts_done: 117,
+            bootstrap_deferred_replay_bytes: 1000,
+            bootstrap_deferred_replayed_bytes: 250,
             ..MetricsSnapshot::default()
         });
         for want in [
             "walshadow_bootstrap_parts_total 392",
             "walshadow_bootstrap_parts_done_total 117",
+            "walshadow_bootstrap_deferred_replay_bytes 1000",
+            "walshadow_bootstrap_deferred_replayed_bytes 250",
         ] {
             assert!(body.contains(want), "missing {want}\n{body}");
         }

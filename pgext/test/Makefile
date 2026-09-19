@@ -1,5 +1,5 @@
-# Test-only loadable module; see wstest.c. Built by the integration tests
-# that need VACUUM's lock lifetime without waiting on autovacuum.
+# Test-only loadable module; see wstest.c. Built by integration tests that
+# need primitives SQL cannot express, on their source cluster.
 #
 #   make -C pgext/test
 MODULES = wstest

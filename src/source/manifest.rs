@@ -59,8 +59,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::pos::{
-    Drain, FilterDurable, Floor, Pos, ResumeSafe, ShadowFlush, ShadowReplay, SourceReceived,
-    Switchpoint,
+    Drain, FilterDurable, Floor, LsnKind, Pos, ResumeSafe, ShadowFlush, ShadowReplay,
+    SourceReceived, Switchpoint,
 };
 use crate::record::WAL_SEG_SIZE;
 use crate::source::wal_stream::WalStream;
@@ -228,6 +228,30 @@ pub fn resolve_resume_lsn(
         (None, Some(l), _) => l,
         (None, None, Some(c)) if !c.is_zero() => c.retag(),
         (None, None, _) => greenfield_head.into().retag(),
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ShadowFloor(Option<u64>);
+
+impl ShadowFloor {
+    pub fn new(shadow_holds_data: bool, live: u64, persisted: u64) -> Self {
+        if !shadow_holds_data {
+            return Self(None);
+        }
+        let at = if live != 0 { live } else { persisted };
+        Self((at != 0).then_some(WalStream::align_down(at, WAL_SEG_SIZE)))
+    }
+
+    pub fn unbounded() -> Self {
+        Self(None)
+    }
+
+    pub fn bound<K: LsnKind>(&self, pos: Pos<K>) -> Pos<K> {
+        match self.0 {
+            Some(at) => Pos::new(pos.get().min(at)),
+            None => pos,
+        }
     }
 }
 

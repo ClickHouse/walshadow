@@ -215,8 +215,8 @@ pub enum XactBufferError {
     /// `toast_index_mem_max` or reduce per-xact TOAST chunk count
     #[error("toast index metadata {bytes} bytes exceeds cap {max}")]
     ToastIndexOverflow { bytes: usize, max: usize },
-    /// Hard value cap, checked before allocation. Non-retryable:
-    /// replay decodes same value; raise `inline_value_max`
+    /// Value exceeded `inline_value_max` under error policy. Replay fails again,
+    /// so raise limit or remove error policy
     #[error("toast value of {rawsize} bytes exceeds inline_value_max {max}")]
     ValueTooLarge { rawsize: usize, max: usize },
     /// Stashed set resolved to a toast heap without its `XLOG_SMGR_CREATE`
@@ -2310,7 +2310,13 @@ pub async fn detoast_heap(
     if pointers.is_empty() {
         return Ok(None);
     }
-    let leaf_need = check_value_caps(pointers.iter().copied(), resolver.inline_value_max())?;
+    let leaf_need = check_value_caps(
+        pointers.iter().copied(),
+        resolver.inline_value_max(),
+        resolver.overflow(),
+    )?;
+    // Oversized values need no fetch under null policy
+    pointers.retain(|p| !resolver.value_oversize(p));
     // One leaf at a time per worker: reserved for the heap's aggregate
     // resolution peak (every retained decoded value + the largest
     // single-value transient), shrunk to retained bytes before return
@@ -2456,6 +2462,11 @@ impl ValueResolution<'_> {
             };
             // `ToastPointer: Copy` frees the borrow on `col` before reassign
             let p: ToastPointer = *p;
+            if self.resolver.value_oversize(&p) {
+                self.resolver.note_filled_oversize();
+                *col = Some(ColumnValue::Null);
+                continue;
+            }
             let type_oid = rel.attributes.get(idx).map(|a| a.type_oid).unwrap_or(0);
             let key = (p.va_toastrelid, p.va_valueid);
             if let Some(v) = self.xact_maps.iter().find_map(|m| m.get(&key)) {
@@ -2797,7 +2808,7 @@ impl RecordSink for BufferingDecoderSink {
                 );
                 return Ok(());
             }
-            if record.route != Route::ToDecoder {
+            if !matches!(record.route, Route::ToDecoder | Route::ToBoth) {
                 return Ok(());
             }
             if rm != RmId::Heap as u8 && rm != RmId::Heap2 as u8 {
@@ -3369,6 +3380,7 @@ mod tests {
     use super::raw_fixtures::*;
     use super::*;
     use crate::decode::heap_decoder::{DecodedTuple, HeapOp, VARLENA_EXTSIZE_BITS};
+    use crate::emit::ch_emitter::InlineValueOverflow;
     use tempfile::tempdir;
     use walrus::pg::walparser::RelFileNode;
 
@@ -3923,13 +3935,20 @@ mod tests {
             va_valueid: 1,
             va_toastrelid: 16500,
         };
+        let strict = InlineValueOverflow::Error;
         // Uncompressed: leaf need = extsize
-        assert_eq!(check_value_caps([ptr(104, 100)], 1000).unwrap(), 100);
+        assert_eq!(
+            check_value_caps([ptr(104, 100)], 1000, strict).unwrap(),
+            100
+        );
         // Compressed (method bits set): extsize + rawsize
         let compressed = 80u32 | (1 << VARLENA_EXTSIZE_BITS);
-        assert_eq!(check_value_caps([ptr(104, compressed)], 1000).unwrap(), 180);
+        assert_eq!(
+            check_value_caps([ptr(104, compressed)], 1000, strict).unwrap(),
+            180
+        );
         // Decode target over cap: typed error before allocation
-        let err = check_value_caps([ptr(2000, 100)], 1000).unwrap_err();
+        let err = check_value_caps([ptr(2000, 100)], 1000, strict).unwrap_err();
         assert!(matches!(
             err,
             ToastValueError::ValueTooLarge {
@@ -3938,8 +3957,58 @@ mod tests {
             }
         ));
         // Stored form over cap trips too (caps ChunkAssembler expected_size)
-        let err = check_value_caps([ptr(104, 1500)], 1000).unwrap_err();
+        let err = check_value_caps([ptr(104, 1500)], 1000, strict).unwrap_err();
         assert!(matches!(err, ToastValueError::ValueTooLarge { .. }));
+        // Null policy ignores oversized values
+        assert_eq!(
+            check_value_caps(
+                [ptr(2000, 100), ptr(104, 1500), ptr(104, 100)],
+                1000,
+                InlineValueOverflow::Null
+            )
+            .unwrap(),
+            100
+        );
+    }
+
+    /// Replace oversized values without reading transaction or stored chunks
+    #[tokio::test(flavor = "current_thread")]
+    async fn oversize_pointer_fills_null_under_null_overflow() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let stats = Arc::new(crate::emit::ch_emitter::EmitterStats::default());
+        let key = (16500u32, 55u32);
+        let whole = mem_refs(key, &[(0, b"ab"), (1, b"cd")]);
+        let maps = [&whole];
+        let capped = |overflow| {
+            ToastResolver::with_store(Arc::new(crate::toast::MemChunkStore::new()), stats.clone())
+                .with_inline_value_max(3)
+                .with_overflow(overflow)
+        };
+
+        let mut heap = heap_with_value(1, 0x100, 8);
+        heap.decoded.new = Some(toast_ptr_tuple(55));
+        heap.decoded.old = Some(toast_ptr_tuple(55));
+        let resolver = capped(InlineValueOverflow::Null);
+        detoast_heap(&mut heap, None, &maps, &resolver)
+            .await
+            .expect("fills instead of failing");
+        for t in [&heap.decoded.new, &heap.decoded.old] {
+            assert_eq!(t.as_ref().unwrap().columns[0], Some(ColumnValue::Null));
+        }
+        assert_eq!(stats.toast_values_filled_oversize.load(Relaxed), 2);
+        assert_eq!(stats.toast_values_filled_default.load(Relaxed), 0);
+        assert_eq!(stats.toast_values_fetched.load(Relaxed), 0);
+
+        let mut heap = heap_with_value(1, 0x100, 8);
+        heap.decoded.new = Some(toast_ptr_tuple(55));
+        let err = detoast_heap(&mut heap, None, &maps, &capped(InlineValueOverflow::Error))
+            .await
+            .expect_err("error policy rejects oversized value");
+        assert!(matches!(
+            err,
+            XactBufferError::ValueTooLarge { rawsize: 4, max: 3 }
+        ));
+        assert_eq!(stats.toast_values_filled_oversize.load(Relaxed), 2);
     }
 
     /// Spool + file-ref map for one value's `(seq, body)` chunks; `lsn`

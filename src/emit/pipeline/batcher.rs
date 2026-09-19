@@ -20,7 +20,7 @@
 
 use std::collections::hash_map::Entry;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use clickhouse_c::Allocator;
@@ -122,6 +122,7 @@ pub(crate) struct InsertBatch {
     pub(crate) per_seq: Vec<(u64, u64)>,
     /// Admission permit shares covering these rows, dropped post-insert-ack
     _permits: Vec<Arc<crate::budget::MemoryPermit>>,
+    _encoded: crate::budget::MemoryPermit,
 }
 
 /// Rows and `FlushAll` share one FIFO channel so a barrier's flush can never
@@ -144,6 +145,7 @@ pub enum BatcherMsg {
 pub struct BatcherConfig {
     pub row_budget: usize,
     pub byte_budget: usize,
+    pub inserters: usize,
     /// Partial-batch deadline; caller passes positive (0 defaulted upstream)
     /// so cold tables can't pin the watermark.
     pub flush_timeout: Duration,
@@ -151,6 +153,7 @@ pub struct BatcherConfig {
 
 struct Table {
     enc: TableEncoder,
+    allocated_bytes: usize,
     meta: Arc<BatchMeta>,
     seq_counts: Vec<(u64, u64)>,
     slice_permits: Vec<Arc<crate::budget::MemoryPermit>>,
@@ -158,10 +161,17 @@ struct Table {
     deadline: Option<Instant>,
 }
 
-/// Per-message routing state shared by every row of one `BatcherMsg`.
+struct BatchOutput {
+    sender: async_channel::Sender<InsertBatch>,
+    budget: crate::budget::MemoryBudget,
+    partial_bytes: AtomicUsize,
+    batch_limit: usize,
+}
+
+/// Per-message routing state shared by every row of one `BatcherMsg`
 struct RowCtx<'a> {
     cfg: BatcherConfig,
-    out: &'a async_channel::Sender<InsertBatch>,
+    out: &'a BatchOutput,
     alloc: Allocator,
     epoch: u64,
     stats: &'a EmitterStats,
@@ -179,6 +189,12 @@ pub(crate) fn spawn(
     mut config_rx: Option<watch::Receiver<Arc<ResolvedConfig>>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
+        let out = BatchOutput {
+            sender: out,
+            budget: crate::budget::MemoryBudget::new(cfg.byte_budget.max(1)),
+            partial_bytes: AtomicUsize::new(0),
+            batch_limit: (cfg.byte_budget / cfg.inserters.max(1)).max(1),
+        };
         let mut tables: HashMap<RelName, Table> = HashMap::new();
         let mut epoch: u64 = 0;
         let stats = stats.as_ref();
@@ -264,6 +280,7 @@ fn effective_cfg(boot: &BatcherConfig, resolved: Option<&ResolvedConfig>) -> Bat
     BatcherConfig {
         row_budget: r.row_budget,
         byte_budget: r.byte_budget,
+        inserters: boot.inserters,
         flush_timeout,
     }
 }
@@ -319,6 +336,7 @@ async fn handle_row(
             let enc = TableEncoder::new(plan).map_err(|e| e.to_string())?;
             e.insert(Table {
                 enc,
+                allocated_bytes: 0,
                 meta,
                 seq_counts: Vec::new(),
                 slice_permits: Vec::new(),
@@ -365,8 +383,26 @@ async fn handle_row(
     if t.deadline.is_none() {
         t.deadline = Some(Instant::now() + ctx.cfg.flush_timeout);
     }
-    if t.enc.rows >= ctx.cfg.row_budget || t.enc.approx_bytes >= ctx.cfg.byte_budget {
+    let bytes = t
+        .enc
+        .buffers
+        .iter()
+        .map(ColumnBuf::allocated_bytes)
+        .sum::<usize>();
+    ctx.out
+        .partial_bytes
+        .fetch_add(bytes - t.allocated_bytes, Ordering::Relaxed);
+    t.allocated_bytes = bytes;
+    let batch_limit = ctx.cfg.byte_budget.min(ctx.out.batch_limit);
+    if t.enc.rows >= ctx.cfg.row_budget || bytes >= batch_limit {
         emit_batch(t, ctx.out, ctx.stats).await?;
+    }
+    if ctx.out.partial_bytes.load(Ordering::Relaxed)
+        >= ctx.cfg.byte_budget.min(ctx.out.budget.total())
+    {
+        for table in tables.values_mut() {
+            emit_batch(table, ctx.out, ctx.stats).await?;
+        }
     }
     Ok(())
 }
@@ -375,11 +411,9 @@ async fn handle_row(
 /// inserter. No-op when empty. Bumps `insertbatch_batches_out` once the batch
 /// is on the inserter channel (the inserter bumps `inserter_batches_in` once it
 /// drains).
-async fn emit_batch(
-    t: &mut Table,
-    out: &async_channel::Sender<InsertBatch>,
-    stats: &EmitterStats,
-) -> Result<(), String> {
+async fn emit_batch(t: &mut Table, out: &BatchOutput, stats: &EmitterStats) -> Result<(), String> {
+    out.partial_bytes
+        .fetch_sub(std::mem::take(&mut t.allocated_bytes), Ordering::Relaxed);
     let (buffers, n_rows) = t.enc.take_block().map_err(|e| e.to_string())?;
     t.deadline = None;
     if n_rows == 0 {
@@ -391,14 +425,19 @@ async fn emit_batch(
     let per_seq = std::mem::take(&mut t.seq_counts);
     let mut permits = std::mem::take(&mut t.slice_permits);
     permits.append(&mut t.value_permits);
+    let bytes = buffers.iter().map(ColumnBuf::allocated_bytes).sum();
+    // Separate pool avoids waiting on decoded payload held by this batch
+    let encoded = out.budget.acquire(bytes).await;
     let batch = InsertBatch {
         meta: t.meta.clone(),
         buffers,
         n_rows,
         per_seq,
         _permits: permits,
+        _encoded: encoded,
     };
-    out.send(batch)
+    out.sender
+        .send(batch)
         .await
         .map_err(|_| "inserter queue closed".to_string())?;
     stats
@@ -411,7 +450,7 @@ async fn emit_batch(
 /// including when encoder is empty
 async fn flush_due(
     tables: &mut HashMap<RelName, Table>,
-    out: &async_channel::Sender<InsertBatch>,
+    out: &BatchOutput,
     now: Instant,
     stats: &EmitterStats,
 ) -> Result<(), String> {
@@ -427,7 +466,7 @@ async fn flush_due(
 /// against post-DDL descriptors and inserters re-parse cached types.
 async fn flush_all(
     tables: &mut HashMap<RelName, Table>,
-    out: &async_channel::Sender<InsertBatch>,
+    out: &BatchOutput,
     epoch: &mut u64,
     stats: &EmitterStats,
 ) -> Result<(), String> {
@@ -540,6 +579,7 @@ mod tests {
             batches_tx,
             BatcherConfig {
                 row_budget: 2,
+                inserters: 1,
                 byte_budget: 1 << 30,
                 flush_timeout: Duration::from_secs(3600),
             },
@@ -594,6 +634,7 @@ mod tests {
             batches_tx,
             BatcherConfig {
                 row_budget: 2,
+                inserters: 1,
                 byte_budget: 1 << 30,
                 flush_timeout: Duration::from_secs(3600),
             },
@@ -643,6 +684,7 @@ mod tests {
             batches_tx,
             BatcherConfig {
                 row_budget: 1,
+                inserters: 1,
                 byte_budget: 1 << 30,
                 flush_timeout: Duration::from_secs(3600),
             },
@@ -701,6 +743,7 @@ mod tests {
             batches_tx,
             BatcherConfig {
                 row_budget: 1_000,
+                inserters: 1,
                 byte_budget: 1 << 30,
                 // Huge deadline: only FlushAll, not the timer, can seal
                 flush_timeout: Duration::from_secs(3600),
@@ -757,6 +800,7 @@ mod tests {
     fn partial_block_cfg(flush_timeout: Duration) -> BatcherConfig {
         BatcherConfig {
             row_budget: 1_000,
+            inserters: 1,
             byte_budget: 1 << 30,
             flush_timeout,
         }
@@ -853,12 +897,133 @@ mod tests {
         assert!(fatal.message().is_none());
     }
 
+    #[tokio::test]
+    async fn encoded_budget_waits_for_insert_owner_even_after_queue_drains() {
+        let (tx, rx, fatal, handle) = spawn_deadline_batcher(
+            BatcherConfig {
+                row_budget: 1,
+                byte_budget: 1024,
+                inserters: 1,
+                flush_timeout: Duration::from_secs(60),
+            },
+            None,
+        );
+        tx.send(BatcherMsg::Row(row(0, 1))).await.unwrap();
+        let first = rx.recv().await.unwrap();
+        tx.send(BatcherMsg::Row(row(1, 2))).await.unwrap();
+        let (reply, mut flushed) = oneshot::channel();
+        tx.send(BatcherMsg::FlushAll(reply)).await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut flushed)
+                .await
+                .is_err()
+        );
+        assert!(rx.is_empty());
+        assert_eq!(first.per_seq, vec![(0, 1)]);
+        drop(first);
+        let second = rx.recv().await.unwrap();
+        assert_eq!(second.per_seq, vec![(1, 1)]);
+        flushed.await.unwrap();
+        drop(second);
+        drop(tx);
+        handle.await.unwrap();
+        assert!(!fatal.is_set());
+    }
+
+    #[tokio::test]
+    async fn partial_tables_share_byte_limit() {
+        let (tx, rx, fatal, handle) = spawn_deadline_batcher(
+            BatcherConfig {
+                row_budget: 1_000,
+                byte_budget: 1024,
+                inserters: 1,
+                flush_timeout: Duration::from_secs(60),
+            },
+            None,
+        );
+        for i in 0..40 {
+            tx.send(BatcherMsg::Row(row_for(&format!("t{i}"), i, 1)))
+                .await
+                .unwrap();
+        }
+        let first = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.n_rows, 1);
+        let mut seqs = first.per_seq.clone();
+        drop(first);
+        drop(tx);
+        while let Ok(batch) = rx.recv().await {
+            seqs.extend_from_slice(&batch.per_seq);
+        }
+        seqs.sort_unstable();
+        assert_eq!(seqs, (0..40).map(|i| (i, 1)).collect::<Vec<_>>());
+        handle.await.unwrap();
+        assert!(!fatal.is_set());
+    }
+
+    #[tokio::test]
+    async fn oversized_string_batches_make_progress_without_losing_rows() {
+        let (tx, rx, fatal, handle) = spawn_deadline_batcher(
+            BatcherConfig {
+                row_budget: 1000,
+                byte_budget: 1024,
+                inserters: 2,
+                flush_timeout: Duration::from_secs(60),
+            },
+            None,
+        );
+        for i in 0..2 {
+            let mut r = row(i, 1);
+            let attr = &mut Arc::make_mut(&mut r.rel).attributes[0];
+            attr.type_oid = 25;
+            attr.type_name = "text".into();
+            attr.type_len = -1;
+            attr.type_byval = false;
+            r.route = RouteSnapshot::freeze(
+                Arc::new(TableMapping {
+                    target: TableTarget::new("default", "t"),
+                    columns: vec![ColumnMapping {
+                        src_attnum: 1,
+                        target_name: "id".into(),
+                        target_type: "String".into(),
+                    }],
+                }),
+                Arc::default(),
+                Default::default(),
+            );
+            r.committed.decoded.new.as_mut().unwrap().columns =
+                vec![Some(ColumnValue::Text("x".repeat(64 << 10)))];
+            tx.send(BatcherMsg::Row(r)).await.unwrap();
+        }
+        let first = rx.recv().await.unwrap();
+        assert!(first._encoded.bytes() >= 64 << 10);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), rx.recv())
+                .await
+                .is_err()
+        );
+        assert_eq!(first.per_seq, vec![(0, 1)]);
+        drop(first);
+        let second = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.per_seq, vec![(1, 1)]);
+        drop(second);
+        drop(tx);
+        handle.await.unwrap();
+        assert!(!fatal.is_set());
+    }
+
     /// Byte budget wins over an unreached deadline: no clock time passes.
     #[tokio::test(start_paused = true)]
     async fn byte_budget_flushes_before_deadline() {
         let (msg_tx, batches_rx, fatal, handle) = spawn_deadline_batcher(
             BatcherConfig {
                 row_budget: 1_000,
+                inserters: 1,
                 byte_budget: 1,
                 flush_timeout: Duration::from_secs(1),
             },
