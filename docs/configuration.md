@@ -353,8 +353,7 @@ final checkpoint. Prefetched bytes never advance durable cursor.
 
 Object-store table backfills honor `[bootstrap] object_store_parallelism`,
 defaulting to 8 when absent. This controls concurrent parts, not ClickHouse
-inserter count. Incomplete table backfills still restart their pass; completed
-parts are not independently checkpointed.
+inserter count.
 
 `[bootstrap] copy_fallback` defaults to `true`. Failed `base_backup` and
 `object_store` table loads retry through source COPY, one table at a time per
@@ -373,3 +372,56 @@ with archive segments and queue depth to locate remaining serialization.
 `walshadow_archive_wait_seconds_total` measures pump waits for prefetched WAL;
 `walshadow_pump_queue_wait_seconds_total` measures sends blocked behind decoder.
 These distinguish insufficient fetch concurrency from downstream backpressure.
+
+### Object-store backfill restart
+
+`spill/backup_backfill/backup_replay.json` carries an object-store pass across
+a restart. It pins the backup name, the relation mappings and the staging table
+UUIDs; a mismatch on any of them discards the file and restarts the pass.
+Staging tables and TOAST mirrors survive, so a resumed pass keeps the rows an
+earlier attempt inserted. ClickHouse may receive duplicate rows after a crash;
+`ReplacingMergeTree` resolves them at unchanged row keys and `_lsn` values.
+
+Every phase records only behind proven inserts, so a restart repeats work and
+never skips it:
+
+- page walk, per heap file. An archive part holding no `pg_xact` or
+  `pg_multixact` segment and no unrecorded heap file is not fetched again.
+  Transaction-status files are always re-read: the visibility gate rebuilds its
+  whole view on each attempt
+- deferred TOAST replay, as a byte offset into the spool
+- WAL gap replay, as the lowest LSN a resumed replay must re-read. That is the
+  oldest transaction still buffered when the last segment closed, so a
+  transaction spanning the boundary replays whole
+
+Checkpoint after completed batches, targeting 30 seconds between saves. Slow
+fetches or inserts can extend that interval. Restart repeats archive
+validation.
+
+Older runs without a checkpoint still repeat the backup walk. Do not synthesize
+an offset from read progress: prefetched rows may not have reached ClickHouse.
+Passes producing undecided visibility rows restart their pass from whatever
+walk progress they recorded.
+
+A resumed pass logs what it skipped under `walshadow::backfill` at info:
+`resuming backup page walk` names the recorded file count before the walk
+starts, `backup page walk resumed` names the heap files declined and the
+archive parts never fetched once it ends.
+
+### Resumable COPY
+
+`initial_load = 'copy'` reads the table in heap-block chunks, one
+`COPY (SELECT … WHERE ctid >= … AND ctid < …)` per chunk under its own insert
+tail. `backfills.toml` records the next block only once that tail proved its
+rows durable, so a restart repeats at most one chunk. Repeated rows carry the
+same `_lsn = S` and collapse.
+
+`[bootstrap] copy_chunk_blocks` sets the chunk size in 8 KiB pages, defaulting
+to 131072 (1 GiB, PostgreSQL's segment size). A table smaller than one chunk
+issues exactly the single unqualified COPY it always did.
+
+The cursor is paired with the relation's filenode. `VACUUM FULL`, `CLUSTER`,
+`TRUNCATE` and rewriting `ALTER TABLE` relocate rows, so a filenode change
+between chunks restarts the table rather than resuming into pages that no
+longer hold the same rows. Chunk predicates need a TID range scan; leave
+`enable_tidscan` on at the source.

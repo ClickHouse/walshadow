@@ -292,6 +292,7 @@ pub async fn ship(
         emitter.row_policy(),
         config,
         HashSet::new(),
+        None,
     ));
 
     let replayed = replay(spool, &tx).await;

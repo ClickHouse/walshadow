@@ -28,6 +28,7 @@ use crate::backfill::backup_source::{
     BackupSink, EntrySink, FileAction, FileKind, FileMeta, StartInfo,
 };
 use crate::backfill::pg_path::{BaseRelFile, RelFork, parse_base_path};
+use crate::backfill::walk_barrier::WalkBarrier;
 use crate::decode::heap_decoder::{
     ColumnValue, CommittedTuple, DecodeError, DecodedHeap, DecodedTuple, HeapOp, decode_block_data,
 };
@@ -182,6 +183,8 @@ crate::atomic_stats! {
         pub files_skipped_unknown_filenode,
         /// Filenode outside the mapped set, declined before any page decode
         pub files_skipped_unmapped,
+        /// Walked by an earlier attempt of a resumed pass, declined here
+        pub files_resumed,
         pub toast_files_observed,
         pub pages_walked,
         pub slots_seen,
@@ -488,6 +491,22 @@ pub struct PageWalkSink {
     /// `pg_multixact/{offsets,members}` segments, for multixact xmax
     /// resolution in the same gate
     pg_multixact: Option<Arc<std::sync::Mutex<crate::decode::visibility::PgMultiXactAccum>>>,
+    /// Resumable walk: heap files a checkpoint already proved durable, and the
+    /// barrier every other file reports completion through
+    resume: Option<WalkResume>,
+}
+
+/// Resume inputs for one pass. Absent for greenfield, which has no checkpoint
+/// to resume from
+struct WalkResume {
+    barrier: Arc<WalkBarrier>,
+    /// Cluster-relative paths, matching [`FileMeta::path`]
+    done: HashSet<String>,
+    /// Archive parts an earlier attempt drained whole
+    done_parts: HashSet<String>,
+    /// Per-part tally built as entries dispatch, handed to the barrier at
+    /// `part_done`
+    open_parts: std::sync::Mutex<HashMap<String, (Vec<String>, bool)>>,
 }
 
 /// Which SLRU accum a Tapped non-heap file installs into at `end()`.
@@ -514,6 +533,7 @@ impl PageWalkSink {
             tap_filenodes: None,
             pg_xact: None,
             pg_multixact: None,
+            resume: None,
         }
     }
 
@@ -524,6 +544,37 @@ impl PageWalkSink {
     ) -> Self {
         self.pg_xact = Some(accum);
         self
+    }
+
+    /// Skip heap files a checkpoint already proved, and report the rest
+    /// through `barrier` as they finish. SLRU files are never skipped: the
+    /// gate needs a whole transaction view however much of the walk resumed
+    pub fn with_resume(
+        mut self,
+        barrier: Arc<WalkBarrier>,
+        done: HashSet<String>,
+        done_parts: HashSet<String>,
+    ) -> Self {
+        self.resume = Some(WalkResume {
+            barrier,
+            done,
+            done_parts,
+            open_parts: std::sync::Mutex::new(HashMap::new()),
+        });
+        self
+    }
+
+    /// Note what a part held, so a later attempt can leave it unfetched
+    fn tally(&self, meta: &FileMeta, file: Option<&str>, slru: bool) {
+        let (Some(r), Some(part)) = (&self.resume, meta.part.as_deref()) else {
+            return;
+        };
+        let mut open = r.open_parts.lock().expect("part tally lock");
+        let entry = open.entry(part.to_string()).or_insert((Vec::new(), false));
+        if let Some(f) = file {
+            entry.0.push(f.to_string());
+        }
+        entry.1 |= slru;
     }
 
     /// Collect `pg_multixact/` segments for multixact xmax resolution.
@@ -569,6 +620,7 @@ impl PageWalkSink {
             tap_filenodes: None,
             pg_xact: None,
             pg_multixact: None,
+            resume: None,
         }
     }
 
@@ -622,10 +674,24 @@ impl BackupSink for PageWalkSink {
         Ok(())
     }
 
+    async fn want_part(&self, key: &str) -> bool {
+        self.resume
+            .as_ref()
+            .is_none_or(|r| !r.done_parts.contains(key))
+    }
+
+    async fn part_done(&self, key: &str) {
+        let Some(r) = &self.resume else { return };
+        let tally = r.open_parts.lock().expect("part tally lock").remove(key);
+        let (files, slru) = tally.unwrap_or_default();
+        r.barrier.part_drained(key.to_string(), files, slru).await;
+    }
+
     async fn begin(&self, meta: &FileMeta) -> io::Result<FileAction> {
         if matches!(meta.kind, FileKind::File)
             && let Some(slru) = self.classify_slru(&meta.path)
         {
+            self.tally(meta, None, true);
             return Ok(FileAction::Tap(Box::new(SlruEntry {
                 seg: slru,
                 buf: Vec::with_capacity(meta.size as usize),
@@ -683,6 +749,14 @@ impl BackupSink for PageWalkSink {
             .get(&(desc.rfn.db_node, desc.rfn.rel_node))
             .copied()
             .unwrap_or_else(|| self.source_lsn());
+        let path = meta.path.to_string_lossy().into_owned();
+        self.tally(meta, Some(&path), false);
+        if let Some(r) = &self.resume
+            && r.done.contains(&path)
+        {
+            self.stats.files_resumed.fetch_add(1, Ordering::Relaxed);
+            return Ok(FileAction::Skip);
+        }
         Ok(FileAction::Tap(Box::new(PageWalkEntry {
             block_no: f.segno.saturating_mul(RELSEG_BLOCKS),
             slab: Vec::with_capacity(SLAB_BYTES + PAGE_BYTES),
@@ -694,6 +768,7 @@ impl BackupSink for PageWalkSink {
             },
             stats: self.stats.clone(),
             pending: None,
+            finished: self.resume.as_ref().map(|r| (r.barrier.clone(), path)),
         })))
     }
 }
@@ -732,6 +807,9 @@ pub struct PageWalkEntry {
     /// reader refills while the blocking pool decodes, so read and decode
     /// cost `max`, not `sum`
     pending: Option<tokio::task::JoinHandle<(Vec<u8>, Vec<BackfillTuple>)>>,
+    /// Resumable walk: register this path then send an empty slab, so the
+    /// gate popping the name has already consumed the file's tuples
+    finished: Option<(Arc<WalkBarrier>, String)>,
 }
 
 impl PageWalkEntry {
@@ -745,6 +823,7 @@ impl PageWalkEntry {
             out: Out::Captured(Arc::default()),
             stats,
             pending: None,
+            finished: None,
         }
     }
 
@@ -865,6 +944,15 @@ impl EntrySink for PageWalkEntry {
             self.stats
                 .tail_bytes_dropped
                 .fetch_add(trailing, Ordering::Relaxed);
+        }
+        // One registration, one marker: the gate pops a name per empty slab
+        if let Some((barrier, path)) = self.finished.take()
+            && let Out::Channel(tx) = &self.out
+        {
+            barrier.finished_file(path).await;
+            tx.send(Vec::new()).await.map_err(|e| {
+                io::Error::other(format!("PageWalkSink: emitter channel closed: {e}"))
+            })?;
         }
         Ok(())
     }
@@ -1088,6 +1176,7 @@ mod tests {
             size: PAGE_BYTES as u64,
             mode: 0o600,
             kind: FileKind::File,
+            part: None,
         }
     }
     use crate::schema::RelName;
@@ -1393,6 +1482,7 @@ mod tests {
             size: 0,
             mode: 0,
             kind: FileKind::File,
+            part: None,
         });
         assert_eq!(
             m,
@@ -1499,6 +1589,73 @@ mod tests {
         }
     }
 
+    /// Resume inputs decide three things before any page decodes: recorded
+    /// parts are never fetched, recorded files never tap, and a file that
+    /// does tap reports itself behind its own tuples
+    #[tokio::test]
+    async fn resumed_sink_skips_recorded_work_and_reports_what_it_walks() {
+        let mut catalog = CatalogMap::new();
+        catalog.insert(Arc::new(make_rel()));
+        let barrier = Arc::new(WalkBarrier::default());
+        let (tx, mut rx) = mpsc::channel::<Vec<BackfillTuple>>(4);
+        let sink = PageWalkSink::new(catalog, tx, false)
+            .with_resume(
+                barrier.clone(),
+                ["base/5/16400.1".to_string()].into_iter().collect(),
+                ["part_007.tar.zst".to_string()].into_iter().collect(),
+            )
+            .with_lsn_overrides(HashMap::new());
+        sink.start(&StartInfo {
+            start_lsn: 0x1000,
+            timeline: 1,
+            tablespaces: Vec::new(),
+        })
+        .await
+        .unwrap();
+
+        assert!(!sink.want_part("part_007.tar.zst").await);
+        assert!(sink.want_part("part_008.tar.zst").await);
+
+        let part = |path: &str| FileMeta {
+            path: PathBuf::from(path),
+            size: PAGE_BYTES as u64,
+            mode: 0o600,
+            kind: FileKind::File,
+            part: Some(Arc::from("part_008.tar.zst")),
+        };
+        assert!(matches!(
+            sink.begin(&part("base/5/16400.1")).await.unwrap(),
+            FileAction::Skip
+        ));
+        let FileAction::Tap(entry) = sink.begin(&part("base/5/16400")).await.unwrap() else {
+            panic!("an unrecorded heap file must tap");
+        };
+        assert!(
+            barrier.pop_finished().await.is_none(),
+            "nothing reports before its body ends"
+        );
+        entry.end().await.unwrap();
+        assert_eq!(
+            barrier.pop_finished().await.as_deref(),
+            Some("base/5/16400")
+        );
+        assert!(
+            rx.recv().await.is_some_and(|slab| slab.is_empty()),
+            "end of file rides the walk channel so the gate keeps its order"
+        );
+
+        // SLRU in the part keeps it off the skip list however many heap
+        // files it also carried
+        sink.begin(&part("pg_xact/0000")).await.unwrap();
+        sink.part_done("part_008.tar.zst").await;
+        assert!(
+            barrier
+                .settled_parts(&["base/5/16400".to_string()].into_iter().collect())
+                .await
+                .is_empty()
+        );
+    }
+
     #[tokio::test]
     async fn pagewalk_sink_rejects_non_base_paths() {
         let sink = PageWalkSink::new_capturing(CatalogMap::new());
@@ -1515,6 +1672,7 @@ mod tests {
                 size: 0,
                 mode: 0,
                 kind: FileKind::File,
+                part: None,
             })
             .await
             .unwrap(),
