@@ -18,6 +18,7 @@ use crate::backfill::backup_page_walk::{BOOTSTRAP_TUPLE_CHANNEL_CAP, BackfillTup
 use crate::backfill::bootstrap_marker::SpooledRecords;
 use crate::backfill::spool::{DEFERRED_SPOOL_MEM_MAX, DeferredSpool};
 use crate::backfill::visibility_pending::{PendingManifest, PendingSpool};
+use crate::backfill::walk_barrier::{Ticker, WALK_CHECKPOINT_PERIOD, WalkBarrier};
 use crate::config::ResolvedConfig;
 use crate::decode::visibility::{
     HEAP_XMAX_IS_MULTI, PgXactPatch, PgXactView, Visibility, deferred_xids, read_pg_multixact,
@@ -56,8 +57,21 @@ pub async fn stream_phase(
     catalog: &CatalogMap,
     deferred: &mut DeferredSpool,
     stats: &mut GateStats,
+    barrier: Option<&Arc<WalkBarrier>>,
 ) -> Result<(), String> {
+    let mut forwarded = 0u64;
+    let mut popped: Vec<(String, u64)> = Vec::new();
+    let mut ticker = Ticker::new(WALK_CHECKPOINT_PERIOD);
     while let Some(slab) = rx.recv().await {
+        // Empty slab means one walked file's tuples are all behind us
+        if slab.is_empty() {
+            if let Some(b) = barrier
+                && let Some(path) = b.pop_finished().await
+            {
+                popped.push((path, forwarded));
+            }
+            continue;
+        }
         let mut pass = Vec::with_capacity(slab.len());
         for t in slab {
             if catalog.is_toast(t.rfn.db_node, t.rfn.rel_node) {
@@ -85,11 +99,40 @@ pub async fn stream_phase(
                     .map_err(|e| format!("visibility gate: deferred spool: {e}"))?,
             }
         }
-        if !pass.is_empty() && tx.send(pass).await.is_err() {
-            break;
+        if !pass.is_empty() {
+            forwarded += pass.len() as u64;
+            if tx.send(pass).await.is_err() {
+                break;
+            }
+        }
+        if let Some(b) = barrier
+            && ticker.fire()
+        {
+            publish(b, deferred, &mut popped).await?;
         }
     }
+    // Walk EOF: hand over the last files rather than drop what they paired with
+    if let Some(b) = barrier
+        && !popped.is_empty()
+    {
+        publish(b, deferred, &mut popped).await?;
+    }
     stats.deferred = deferred.records();
+    Ok(())
+}
+
+/// fsync first, so the mark handed over covers every tuple these files
+/// deferred rather than forwarded
+async fn publish(
+    barrier: &WalkBarrier,
+    deferred: &mut DeferredSpool,
+    popped: &mut Vec<(String, u64)>,
+) -> Result<(), String> {
+    let mark = deferred
+        .checkpoint()
+        .await
+        .map_err(|e| format!("visibility gate: deferred spool checkpoint: {e}"))?;
+    barrier.publish_gate(std::mem::take(popped), mark).await;
     Ok(())
 }
 
@@ -262,6 +305,7 @@ impl GreenfieldSink {
                 self.emitter.row_policy(),
                 Some(self.config.clone()),
                 self.skip_initial.clone(),
+                None,
             ));
             senders.push(tx);
         }
@@ -294,6 +338,7 @@ impl GreenfieldSink {
                     &row_policy,
                     Some(&config),
                     lane.first_seq,
+                    None,
                 )
                 .await
             }
@@ -472,7 +517,11 @@ pub async fn resolve_greenfield(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backfill::backup_page_walk::make_rel_named;
+    use crate::backfill::backup_checkpoint::SpoolMark;
+    use crate::backfill::backup_page_walk::{
+        PAGE_BYTES, PageWalkSink, make_rel, make_rel_named, synth_single_tuple_page,
+    };
+    use crate::backfill::backup_source::{BackupSink, FileAction, FileKind, FileMeta, StartInfo};
     use crate::backfill::spool::DEFERRED_SPOOL_MEM_MAX;
     use crate::decode::visibility::{
         HEAP_XMAX_COMMITTED, HEAP_XMAX_INVALID, HEAP_XMAX_IS_MULTI, HEAP_XMIN_COMMITTED,
@@ -480,6 +529,7 @@ mod tests {
     };
     use crate::decode::visibility::{PgMultiXactAccum, PgXactAccum};
     use ahash::HashSetExt;
+    use std::path::PathBuf;
     use walrus::pg::walparser::RelFileNode;
 
     fn rfn(rel_node: u32) -> RelFileNode {
@@ -501,6 +551,142 @@ mod tests {
             offnum: 0,
             columns: Vec::new(),
         }
+    }
+
+    /// One visible tuple on its own page, so a file's forwarded count is its
+    /// page count
+    fn visible_page(value: i32) -> [u8; PAGE_BYTES] {
+        let mut page = synth_single_tuple_page(value);
+        let infomask = (PAGE_BYTES - 32) + 20;
+        page[infomask..infomask + 2]
+            .copy_from_slice(&(HEAP_XMIN_COMMITTED | HEAP_XMAX_INVALID).to_le_bytes());
+        page
+    }
+
+    /// The barrier's ordering claim, sink through gate: a file registers
+    /// behind its own slabs, so the count it pairs with covers every tuple it
+    /// produced and none of the next file's
+    #[tokio::test]
+    async fn a_walked_file_pairs_with_the_tuples_forwarded_before_its_marker() {
+        let mut catalog = CatalogMap::new();
+        catalog.insert(Arc::new(make_rel()));
+        let barrier = Arc::new(WalkBarrier::default());
+        let (walk_tx, mut walk_rx) = mpsc::channel::<Vec<BackfillTuple>>(16);
+        let (tx, mut rx) = mpsc::channel::<Vec<BackfillTuple>>(16);
+        let sink = PageWalkSink::new(catalog.clone(), walk_tx, false).with_resume(
+            barrier.clone(),
+            HashSet::new(),
+            HashSet::new(),
+        );
+        sink.start(&StartInfo {
+            start_lsn: 0x1000,
+            timeline: 1,
+            tablespaces: Vec::new(),
+        })
+        .await
+        .unwrap();
+        for (path, pages) in [("base/5/16400", 2u32), ("base/5/16400.1", 1)] {
+            let meta = FileMeta {
+                path: PathBuf::from(path),
+                size: u64::from(pages) * PAGE_BYTES as u64,
+                mode: 0o600,
+                kind: FileKind::File,
+                part: None,
+            };
+            let FileAction::Tap(mut entry) = sink.begin(&meta).await.unwrap() else {
+                panic!("{path} must tap");
+            };
+            for page in 0..pages {
+                entry.chunk(&visible_page(page as i32)).await.unwrap();
+            }
+            entry.end().await.unwrap();
+        }
+        drop(sink);
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut spool = DeferredSpool::new(dir.path().join("gate.bin"), DEFERRED_SPOOL_MEM_MAX);
+        let mut stats = GateStats::default();
+        stream_phase(
+            &mut walk_rx,
+            &tx,
+            &catalog,
+            &mut spool,
+            &mut stats,
+            Some(&barrier),
+        )
+        .await
+        .unwrap();
+        drop(tx);
+        let mut forwarded = 0;
+        while let Some(slab) = rx.recv().await {
+            forwarded += slab.len();
+        }
+        assert_eq!(forwarded, 3, "three visible tuples across two files");
+
+        barrier.publish_drain(1, 9, SpoolMark::default()).await;
+        assert!(
+            barrier.collect().await.is_none(),
+            "the first file needs both its tuples drained"
+        );
+        barrier.publish_drain(2, 9, SpoolMark::default()).await;
+        assert_eq!(
+            barrier.collect().await.unwrap().files,
+            vec!["base/5/16400".to_string()],
+            "the second file's tuple is still undrained"
+        );
+        barrier.publish_drain(3, 9, SpoolMark::default()).await;
+        assert_eq!(
+            barrier.collect().await.unwrap().files,
+            vec!["base/5/16400.1".to_string()],
+        );
+    }
+
+    /// The empty slab is what orders file completion against the tuples the
+    /// gate has already forwarded
+    #[tokio::test]
+    async fn end_of_file_slab_pairs_a_walked_file_with_the_forwarded_count() {
+        let mut catalog = CatalogMap::new();
+        catalog.insert(make_rel_named(16400, 16400, 0, RelName::new("public", "t")));
+        let barrier = Arc::new(WalkBarrier::default());
+        let (walk_tx, mut walk_rx) = mpsc::channel::<Vec<BackfillTuple>>(8);
+        let (tx, mut rx) = mpsc::channel::<Vec<BackfillTuple>>(8);
+        let dir = tempfile::tempdir().unwrap();
+        let mut spool = DeferredSpool::new(dir.path().join("gate.bin"), DEFERRED_SPOOL_MEM_MAX);
+        let mut stats = GateStats::default();
+
+        let visible = HEAP_XMIN_COMMITTED | HEAP_XMAX_INVALID;
+        walk_tx
+            .send(vec![tuple(10, 0, visible), tuple(11, 0, visible)])
+            .await
+            .unwrap();
+        barrier.finished_file("base/5/16400".into()).await;
+        walk_tx.send(Vec::new()).await.unwrap();
+        drop(walk_tx);
+
+        stream_phase(
+            &mut walk_rx,
+            &tx,
+            &catalog,
+            &mut spool,
+            &mut stats,
+            Some(&barrier),
+        )
+        .await
+        .unwrap();
+        drop(tx);
+        assert_eq!(rx.recv().await.map(|s| s.len()), Some(2));
+        assert_eq!(stats.emitted, 2);
+
+        barrier.publish_drain(1, 3, SpoolMark::default()).await;
+        assert!(
+            barrier.collect().await.is_none(),
+            "a file waits for the drain to read past it"
+        );
+        barrier.publish_drain(2, 4, SpoolMark::default()).await;
+        assert_eq!(
+            barrier.collect().await.unwrap().files,
+            vec!["base/5/16400".to_string()]
+        );
     }
 
     /// A failed lane surfaces its own message, not a channel-closure artifact
@@ -680,7 +866,7 @@ mod tests {
 
         let mut stats = GateStats::default();
         let mut spool = spool_of(Vec::new()).await;
-        stream_phase(&mut walk_rx, &tx, catalog, &mut spool, &mut stats)
+        stream_phase(&mut walk_rx, &tx, catalog, &mut spool, &mut stats, None)
             .await
             .unwrap();
         drop(tx);

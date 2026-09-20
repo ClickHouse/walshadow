@@ -52,6 +52,7 @@ use walrus::pg::wal::segment::SegmentName;
 use walrus::pg::walparser::{Oid, RmId};
 
 use crate::backfill::backfill_types::{BackupRequest, PassContext, PassOutcome};
+use crate::backfill::backup_checkpoint::{self, BackupCheckpoint, WalkState};
 use crate::backfill::backup_page_walk::{
     BOOTSTRAP_TUPLE_CHANNEL_CAP, BackfillTuple, CatalogMap, PageWalkSink,
 };
@@ -63,22 +64,22 @@ use crate::backfill::spool::{DEFERRED_SPOOL_MEM_MAX, DeferredSpool};
 use crate::backfill::visibility_gate::{GateStats, resolve_phase, stream_phase};
 use crate::backfill::visibility_pending::{self, PendingSpool};
 use crate::backfill::wal_replay::{
-    ReplayStats, ReplayTargets, WalReplayInputs, WalReplaySink, pump_segments_through,
+    ReplayStats, ReplayTargets, SegmentPump, WalReplayInputs, WalReplaySink, pump_segments_through,
 };
+use crate::backfill::walk_barrier::{Ticker, WALK_CHECKPOINT_PERIOD, WalkBarrier};
 use crate::decode::heap_decoder::{XLOG_HEAP_OPMASK, XLOG_HEAP_TRUNCATE};
 use crate::decode::visibility::{PgMultiXactAccum, PgXactAccum, PgXactPatch, PgXactView};
 use crate::decode::wal_xact::{
     XLOG_XACT_ABORT, XLOG_XACT_ABORT_PREPARED, XLOG_XACT_COMMIT, XLOG_XACT_COMMIT_PREPARED,
     XLOG_XACT_OPMASK, parse_xact_payload,
 };
-use crate::emit::pipeline::batcher::BatcherMsg;
 use crate::emit::pipeline::tail::OwnedTail;
-use crate::emit::pipeline::{Fatal, ack::AckHandle, bootstrap};
+use crate::emit::pipeline::{Fatal, bootstrap};
 use crate::filter::main_data::{parse_xl_heap_truncate, parse_xl_relmap_update};
 use crate::filter::pg_class_decoder::{
     DecodeOutcome, decode_pg_class_tuple, info_carries_new_tuple_heap,
 };
-use crate::record::{Record, RecordSink, SinkError, segments_covering_lineage};
+use crate::record::{Record, RecordSink, SinkError, WAL_SEG_SIZE, segments_covering_lineage};
 use crate::runtime_config::InitialLoadMode;
 use crate::schema::RelDescriptor;
 use crate::source::archive_history;
@@ -123,6 +124,7 @@ async fn run_base_backup_pass(ctx: &PassContext, reqs: &[BackupRequest]) -> Resu
         PgXactPatch::new(),
         None,
         &mut outcome,
+        None,
     )
     .await?;
     Ok(outcome)
@@ -163,9 +165,13 @@ async fn run_object_store_pass(ctx: &PassContext, reqs: &[BackupRequest]) -> Res
     let storage = settings
         .build_storage()
         .context("backup_backfill: build archive storage")?;
-    let resolved = walrus::pg::backup::fetch::resolve_name(&storage, "LATEST")
-        .await
-        .context("backup_backfill: resolve LATEST backup")?;
+    let resolved = if ctx.checkpoint.backup.is_empty() {
+        walrus::pg::backup::fetch::resolve_name(&storage, "LATEST")
+            .await
+            .context("backup_backfill: resolve LATEST backup")?
+    } else {
+        ctx.checkpoint.backup.clone()
+    };
     if !resolved.starts_with(BACKUP_NAME_PREFIX) {
         bail!("backup_backfill: resolved backup name {resolved:?} not wal-g shaped");
     }
@@ -220,13 +226,18 @@ async fn run_object_store_pass(ctx: &PassContext, reqs: &[BackupRequest]) -> Res
     outcome.pg_xact_patch_len = patch.len();
 
     let source = Box::new(
-        ObjectStoreSource::new(settings.clone(), storage, resolved, ctx.scratch_dir.clone())
-            .with_parallelism(
-                ctx.emitter
-                    .bootstrap
-                    .object_store_parallelism
-                    .map_or(8, |n| n.get()),
-            ),
+        ObjectStoreSource::new(
+            settings.clone(),
+            storage,
+            resolved.clone(),
+            ctx.scratch_dir.clone(),
+        )
+        .with_parallelism(
+            ctx.emitter
+                .bootstrap
+                .object_store_parallelism
+                .map_or(8, |n| n.get()),
+        ),
     );
     // Tag min(B_redo, S) per rel: gap replay covers (B_redo, S], so walked
     // rows must lose to replayed commits; a backup newer than the opt-in
@@ -244,6 +255,7 @@ async fn run_object_store_pass(ctx: &PassContext, reqs: &[BackupRequest]) -> Res
         patch,
         had_gap.then_some((gap_segments, b_redo)),
         &mut outcome,
+        Some(resolved),
     )
     .await?;
     // Fetched segments only help a *failed* pass resume; reclaim on success
@@ -269,6 +281,7 @@ async fn walk_and_ship(
     patch: PgXactPatch,
     replay: Option<ReplayLeg>,
     outcome: &mut PassOutcome,
+    backup_name: Option<String>,
 ) -> Result<()> {
     // Filter set: the rels being added plus their pg_toast_<oid> rels, so a
     // filtered walk carries external chunks. Toast rows tag their parent's
@@ -294,8 +307,6 @@ async fn walk_and_ship(
     if let Some(b) = &ctx.budget {
         resolver = resolver.with_budget(b.clone());
     }
-    let store_toast = resolver.stores_chunks();
-
     // Dedicated tail: own connections, own seq space, own fatal — the
     // live pipeline never blocks on a backfill (Regime A)
     let tail = OwnedTail::spawn(
@@ -310,136 +321,160 @@ async fn walk_and_ship(
     .await
     .map_err(anyhow::Error::msg)?;
 
-    let pg_xact = Arc::new(std::sync::Mutex::new(PgXactAccum::new()));
-    let pg_multixact = Arc::new(std::sync::Mutex::new(PgMultiXactAccum::new(
-        ctx.source_major,
-    )));
-    let (walk_tx, walk_rx) = mpsc::channel::<Vec<BackfillTuple>>(BOOTSTRAP_TUPLE_CHANNEL_CAP);
-    let (gated_tx, gated_rx) = mpsc::channel::<Vec<BackfillTuple>>(BOOTSTRAP_TUPLE_CHANNEL_CAP);
-
-    let sink: Arc<dyn BackupSink> = Arc::new(
-        PageWalkSink::new(filter.clone(), walk_tx, store_toast)
-            .with_stats(ctx.stats.backfill_backup_walk.clone())
-            .with_pg_xact_accum(pg_xact.clone())
-            .with_pg_multixact_accum(pg_multixact.clone())
-            .with_lsn_overrides(lsn_overrides),
-    );
-
-    // data_dir is never written: PageWalkSink only Taps/Skips
-    let data_dir = ctx.scratch_dir.join("void");
-    tokio::fs::create_dir_all(&data_dir).await.ok();
-
-    let (walk_ok_tx, walk_ok_rx) = oneshot::channel();
-    // Deferred spools live under scratch; stale files from a crashed pass
-    // block create_new, remove first
-    let gate_spool_path = ctx.scratch_dir.join("gate_deferred.bin");
-    let toast_spool_path = ctx.scratch_dir.join("bootstrap_deferred.bin");
-    tokio::fs::remove_file(&gate_spool_path).await.ok();
-    tokio::fs::remove_file(&toast_spool_path).await.ok();
-    let pending_spool_path = ctx.scratch_dir.join("gate_pending.bin");
-    tokio::fs::remove_file(&pending_spool_path).await.ok();
-    let gate = tokio::spawn(gate_task(
-        walk_rx,
-        gated_tx,
-        filter.clone(),
-        pg_xact,
-        pg_multixact,
-        patch,
-        walk_ok_rx,
-        DeferredSpool::new(gate_spool_path, DEFERRED_SPOOL_MEM_MAX),
-        PendingSpool::new(pending_spool_path, filter.clone()),
-    ));
-    let drain = tokio::spawn(bootstrap::drain(
-        gated_rx,
-        filter,
-        ctx.mapping.snapshot().await,
-        tail.msg_tx.clone(),
-        tail.ack.clone(),
-        ctx.stats.clone(),
-        resolver.clone(),
-        bootstrap::Deferral::Local(DeferredSpool::new(toast_spool_path, DEFERRED_SPOOL_MEM_MAX)),
-        ctx.emitter.row_policy(),
-        ctx.config_rx.as_ref().map(|rx| rx.borrow().clone()),
-        HashSet::new(),
-    ));
-
-    // Success signal before the joins: gate resolves deferred tuples only
-    // against a complete pg_xact accum; a failed source drops the sender
-    // and the gate discards them instead
-    let run_res = source
-        .run(data_dir, sink, ctx.stats.backfill_backup_pump.clone())
-        .await
-        .context("backup_backfill: source.run");
-    if run_res.is_ok() {
-        let _ = walk_ok_tx.send(());
-    } else {
-        drop(walk_ok_tx);
-    }
-
-    // Join gate + drain on every path (both exit on channel close), then
-    // quiesce the tail before surfacing an error: a detached inserter could
-    // otherwise final-flush into a staging table a retry pass has already
-    // rebuilt (architecture/bootstrap.md)
-    let gate_join = gate.await.context("backup_backfill: gate join");
-    let drain_join = drain.await.context("backup_backfill: drain join");
-
-    if let Err(e) = run_res {
-        tail.quiesce().await;
-        return Err(e);
-    }
-    let (gate_stats, pg_xact_segments, pending) =
-        match gate_join.and_then(|r| r.map_err(anyhow::Error::msg)) {
-            Ok(s) => s,
-            Err(e) => {
-                tail.quiesce().await;
-                return Err(e);
-            }
+    let result: Result<_> = async {
+        let mut checkpoint = ctx.checkpoint.clone();
+        let mut descriptors: Vec<_> = filter
+            .descriptors()
+            .map(|d| {
+                let mut bytes = Vec::new();
+                crate::catalog::desc_log::encode_descriptor_bytes(&mut bytes, d);
+                bytes
+            })
+            .collect();
+        descriptors.sort();
+        let catalog = backup_checkpoint::digest(descriptors.iter().map(Vec::as_slice));
+        if checkpoint.resuming() {
+            anyhow::ensure!(
+                checkpoint.catalog == catalog,
+                "backup replay catalog changed"
+            );
+        }
+        // Only an object-store pass can name the backup a resume must re-read
+        if let Some(backup) = &backup_name {
+            checkpoint.backup = backup.clone();
+            checkpoint.catalog = catalog;
+        }
+        let (drain_outcome, pending) = if checkpoint.ready() {
+            outcome.counts = checkpoint.counts;
+            let spool = DeferredSpool::resume(
+                ctx.scratch_dir.join("bootstrap_deferred.bin"),
+                checkpoint.spool,
+                checkpoint.offset,
+            )
+            .await?;
+            ctx.stats
+                .bootstrap_deferred_spool_bytes
+                .fetch_add(checkpoint.spool.bytes, std::sync::atomic::Ordering::Relaxed);
+            tracing::info!(target: "walshadow::backfill", offset = checkpoint.offset,
+            bytes = checkpoint.spool.bytes, "resuming deferred backup replay");
+            (
+                bootstrap::BootstrapDrainOutcome {
+                    next_seq: 0,
+                    rows_routed: 0,
+                    deferred: Some(spool),
+                },
+                PendingSpool::new(ctx.scratch_dir.join("gate_pending.bin"), filter.clone()),
+            )
+        } else {
+            run_walk(
+                ctx,
+                source,
+                &filter,
+                lsn_overrides,
+                patch,
+                &resolver,
+                &tail,
+                &mut checkpoint,
+                backup_name.is_some(),
+                outcome,
+            )
+            .await?
         };
-    // Every non-toast tuple ends up emitted, gated, or pending
-    // (deferred resolves into one at EOF), so their sum is the walked total
-    outcome.rows_walked += gate_stats.emitted + gate_stats.gated + gate_stats.pending;
-    outcome.rows_gated += gate_stats.gated;
-    outcome.rows_deferred += gate_stats.deferred;
-    outcome.rows_pending += gate_stats.pending;
-    outcome.multixact_emitted += gate_stats.multixact_emitted;
-    outcome.pg_xact_segments = pg_xact_segments;
-    let drain_outcome = match drain_join.and_then(|r| r.map_err(anyhow::Error::msg)) {
-        Ok(o) => o,
+        let mut next_seq = drain_outcome.next_seq;
+        let mut deferred = drain_outcome.deferred;
+        // Walk output durable, so record it whether or not referrers were
+        // deferred: the later phases checkpoint against this same file
+        if !checkpoint.ready() && pending.rows() == 0 && backup_name.is_some() {
+            tail.checkpoint(next_seq)
+                .await
+                .map_err(anyhow::Error::msg)?;
+            if let Some(spool) = deferred.as_mut() {
+                let resident = spool.resident_bytes() as u64;
+                let spooled = spool.spooled_bytes();
+                checkpoint.spool = spool.checkpoint().await?;
+                ctx.stats
+                    .bootstrap_deferred_bytes
+                    .fetch_sub(resident, std::sync::atomic::Ordering::Relaxed);
+                ctx.stats.bootstrap_deferred_spool_bytes.fetch_add(
+                    spool.spooled_bytes() - spooled,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            }
+            checkpoint.counts = outcome.counts;
+            // Per-file resume is spent once the walk ends; drop it rather than
+            // carry a path per relation segment through every later save
+            checkpoint.walk = WalkState {
+                done: true,
+                ..Default::default()
+            };
+            checkpoint.save(&ctx.scratch_dir).await?;
+        }
+        let resumable = checkpoint.ready();
+        if let Some(spool) = deferred {
+            let config = ctx.config_rx.as_ref().map(|rx| rx.borrow().clone());
+            let mapping = ctx.mapping.snapshot().await;
+            let replay_checkpoint = resumable.then_some(bootstrap::ReplayCheckpoint {
+                state: &mut checkpoint,
+                dir: &ctx.scratch_dir,
+                tail: &tail,
+            });
+            let resolved = bootstrap::drain_deferred(
+                spool,
+                &filter,
+                &mapping,
+                &tail.msg_tx,
+                &tail.ack,
+                &ctx.stats,
+                &resolver,
+                &ctx.emitter.row_policy(),
+                config.as_deref(),
+                next_seq,
+                replay_checkpoint,
+            )
+            .await
+            .map_err(anyhow::Error::msg)?;
+            next_seq = resolved.next_seq;
+        }
+        if let Some((segments, b_redo)) = replay {
+            let s_by_rfn: ReplayTargets = reqs
+                .iter()
+                .map(|r| (rfn_key(&r.desc), (r.desc.clone(), r.s_lsn)))
+                .collect();
+            // Segments wholly below the resume point replayed already; commits at
+            // or below it are filtered, so only a transaction the boundary caught
+            // mid-write comes through twice
+            let from = checkpoint.replay_from.unwrap_or(b_redo);
+            let segments: Vec<_> = segments
+                .into_iter()
+                .filter(|(seg, _)| seg.start_lsn(WAL_SEG_SIZE) + WAL_SEG_SIZE > from)
+                .collect();
+            let replay_stats = replay_gap(
+                ctx,
+                &segments,
+                from,
+                s_by_rfn,
+                resolver.clone(),
+                &tail,
+                next_seq,
+                resumable.then_some((&mut checkpoint, ctx.scratch_dir.as_path())),
+            )
+            .await
+            .context("backup_backfill: gap replay")?;
+            next_seq = replay_stats.next_seq;
+            outcome.rows_replayed = replay_stats.rows_replayed;
+            outcome.replay_commits_past_s = replay_stats.commits_past_through;
+        }
+
+        Ok((next_seq, pending))
+    }
+    .await;
+    let (next_seq, pending) = match result {
+        Ok(result) => result,
         Err(e) => {
             tail.quiesce().await;
             return Err(e);
         }
     };
-
-    let mut next_seq = drain_outcome.next_seq;
-    if let Some((segments, b_redo)) = replay {
-        let s_by_rfn: ReplayTargets = reqs
-            .iter()
-            .map(|r| (rfn_key(&r.desc), (r.desc.clone(), r.s_lsn)))
-            .collect();
-        let replay_res = replay_gap(
-            ctx,
-            &segments,
-            b_redo,
-            s_by_rfn,
-            resolver.clone(),
-            tail.msg_tx.clone(),
-            tail.ack.clone(),
-            next_seq,
-        )
-        .await
-        .context("backup_backfill: gap replay");
-        let replay_stats = match replay_res {
-            Ok(s) => s,
-            Err(e) => {
-                tail.quiesce().await;
-                return Err(e);
-            }
-        };
-        next_seq = replay_stats.next_seq;
-        outcome.rows_replayed = replay_stats.rows_replayed;
-        outcome.replay_commits_past_s = replay_stats.commits_past_through;
-    }
 
     tail.finish(next_seq).await.map_err(anyhow::Error::msg)?;
 
@@ -460,7 +495,185 @@ async fn walk_and_ship(
     Ok(())
 }
 
-/// Run visibility gate and track `pg_xact` segments
+/// Page-walk leg: gate and drain the whole backup into `tail`, recording
+/// walked files behind proven inserts while it runs. Hands back what the
+/// drain deferred plus the undecided rows the gate parked
+#[allow(clippy::too_many_arguments)]
+async fn run_walk(
+    ctx: &PassContext,
+    source: Box<dyn BackupSource>,
+    filter: &CatalogMap,
+    lsn_overrides: HashMap<(Oid, Oid), u64>,
+    patch: PgXactPatch,
+    resolver: &ToastResolver,
+    tail: &OwnedTail,
+    checkpoint: &mut BackupCheckpoint,
+    resumable: bool,
+    outcome: &mut PassOutcome,
+) -> Result<(bootstrap::BootstrapDrainOutcome, PendingSpool)> {
+    // A resumed walk skips files an earlier attempt proved and reopens the
+    // spools at their recorded marks; SLRU files are always re-read, so
+    // the gate still resolves against a whole transaction view
+    let resuming = checkpoint.walk_started();
+    if !resuming {
+        checkpoint.walk = Default::default();
+    }
+    let pg_xact = Arc::new(std::sync::Mutex::new(PgXactAccum::new()));
+    let pg_multixact = Arc::new(std::sync::Mutex::new(PgMultiXactAccum::new(
+        ctx.source_major,
+    )));
+    let (walk_tx, walk_rx) = mpsc::channel::<Vec<BackfillTuple>>(BOOTSTRAP_TUPLE_CHANNEL_CAP);
+    let (gated_tx, gated_rx) = mpsc::channel::<Vec<BackfillTuple>>(BOOTSTRAP_TUPLE_CHANNEL_CAP);
+
+    let (walk_ok_tx, walk_ok_rx) = oneshot::channel();
+    // Deferred spools live under scratch; stale files from a crashed pass
+    // block create_new, remove first
+    let gate_spool_path = ctx.scratch_dir.join("gate_deferred.bin");
+    let toast_spool_path = ctx.scratch_dir.join("bootstrap_deferred.bin");
+    let pending_spool_path = ctx.scratch_dir.join("gate_pending.bin");
+    // Pending rows only exist past walk EOF, so a mid-walk resume starts
+    // that spool over whatever an aborted attempt left
+    tokio::fs::remove_file(&pending_spool_path).await.ok();
+    let reopened = if resuming {
+        tracing::info!(
+            target: "walshadow::backfill",
+            files = checkpoint.walk.files.len(),
+            parts = checkpoint.walk.parts.len(),
+            gate_records = checkpoint.walk.gate_deferred.records,
+            toast_records = checkpoint.walk.toast_deferred.records,
+            "resuming backup page walk",
+        );
+        reopen_walk_spools(checkpoint, &gate_spool_path, &toast_spool_path)
+            .await
+            .inspect_err(|e| {
+                tracing::warn!(
+                    target: "walshadow::backfill",
+                    error = %e,
+                    "walk spools unusable; re-walking the whole backup",
+                );
+            })
+            .ok()
+    } else {
+        None
+    };
+    // Spools gone or short means the recorded files can no longer be
+    // proved, so the skip set goes with them
+    let resuming = reopened.is_some();
+    let (gate_spool, toast_spool) = match reopened {
+        Some(pair) => pair,
+        None => {
+            checkpoint.walk = Default::default();
+            tokio::fs::remove_file(&gate_spool_path).await.ok();
+            tokio::fs::remove_file(&toast_spool_path).await.ok();
+            (
+                DeferredSpool::new(gate_spool_path, DEFERRED_SPOOL_MEM_MAX),
+                DeferredSpool::new(toast_spool_path, DEFERRED_SPOOL_MEM_MAX),
+            )
+        }
+    };
+
+    // Built after the reopen so a failed reopen retires the skip set with
+    // the spools it could no longer prove
+    let barrier = resumable.then(|| Arc::new(WalkBarrier::default()));
+    let mut walk_sink = PageWalkSink::new(filter.clone(), walk_tx, resolver.stores_chunks())
+        .with_stats(ctx.stats.backfill_backup_walk.clone())
+        .with_pg_xact_accum(pg_xact.clone())
+        .with_pg_multixact_accum(pg_multixact.clone())
+        .with_lsn_overrides(lsn_overrides);
+    if let Some(b) = &barrier {
+        walk_sink = walk_sink.with_resume(
+            b.clone(),
+            checkpoint.walk.files.iter().cloned().collect(),
+            checkpoint.walk.parts.iter().cloned().collect(),
+        );
+    }
+    let sink: Arc<dyn BackupSink> = Arc::new(walk_sink);
+
+    // data_dir is never written: PageWalkSink only Taps/Skips
+    let data_dir = ctx.scratch_dir.join("void");
+    tokio::fs::create_dir_all(&data_dir).await.ok();
+    let gate = tokio::spawn(gate_task(
+        walk_rx,
+        gated_tx,
+        filter.clone(),
+        pg_xact,
+        pg_multixact,
+        patch,
+        walk_ok_rx,
+        gate_spool,
+        PendingSpool::new(pending_spool_path, filter.clone()),
+        barrier.clone(),
+    ));
+    let drain = tokio::spawn(bootstrap::drain(
+        gated_rx,
+        filter.clone(),
+        ctx.mapping.snapshot().await,
+        tail.msg_tx.clone(),
+        tail.ack.clone(),
+        ctx.stats.clone(),
+        resolver.clone(),
+        bootstrap::Deferral::Handback(toast_spool),
+        ctx.emitter.row_policy(),
+        ctx.config_rx.as_ref().map(|rx| rx.borrow().clone()),
+        HashSet::new(),
+        barrier.clone(),
+    ));
+
+    // Success signal before the joins: gate resolves deferred tuples only
+    // against a complete pg_xact accum; a failed source drops the sender
+    // and the gate discards them instead
+    let run_res = tokio::select! {
+        r = source.run(data_dir, sink, ctx.stats.backfill_backup_pump.clone())
+            => r.context("backup_backfill: source.run"),
+        e = record_walked(barrier.as_deref(), tail, checkpoint, &ctx.scratch_dir)
+            => Err(e),
+    };
+    if run_res.is_ok() {
+        let _ = walk_ok_tx.send(());
+    } else {
+        drop(walk_ok_tx);
+    }
+
+    if resuming {
+        tracing::info!(
+            target: "walshadow::backfill",
+            files_resumed = ctx
+                .stats
+                .backfill_backup_walk
+                .files_resumed
+                .load(std::sync::atomic::Ordering::Relaxed),
+            parts_skipped = ctx
+                .stats
+                .backfill_backup_pump
+                .parts_skipped
+                .load(std::sync::atomic::Ordering::Relaxed),
+            "backup page walk resumed",
+        );
+    }
+
+    // Join gate + drain on every path (both exit on channel close) before
+    // surfacing an error; the caller then quiesces the tail, since a detached
+    // inserter could otherwise final-flush into a staging table a retry pass
+    // has already rebuilt (architecture/bootstrap.md)
+    let gate_join = gate.await.context("backup_backfill: gate join");
+    let drain_join = drain.await.context("backup_backfill: drain join");
+    run_res?;
+    let (gate_stats, pg_xact_segments, pending) =
+        gate_join.and_then(|r| r.map_err(anyhow::Error::msg))?;
+    // Every non-toast tuple ends up emitted, gated, or pending
+    // (deferred resolves into one at EOF), so their sum is the walked total
+    outcome.counts.walked += gate_stats.emitted + gate_stats.gated + gate_stats.pending;
+    outcome.counts.gated += gate_stats.gated;
+    outcome.counts.deferred += gate_stats.deferred;
+    outcome.rows_pending += gate_stats.pending;
+    outcome.counts.multixact += gate_stats.multixact_emitted;
+    outcome.counts.pg_xact_segments = pg_xact_segments;
+    Ok((
+        drain_join.and_then(|r| r.map_err(anyhow::Error::msg))?,
+        pending,
+    ))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn gate_task(
     mut rx: mpsc::Receiver<Vec<BackfillTuple>>,
@@ -472,10 +685,19 @@ async fn gate_task(
     walk_ok: oneshot::Receiver<()>,
     mut deferred: DeferredSpool,
     mut pending: PendingSpool,
+    barrier: Option<Arc<WalkBarrier>>,
 ) -> Result<(GateStats, usize, PendingSpool), String> {
     let mut stats = GateStats::default();
     // Per-table loads abort on unprovable tuples
-    stream_phase(&mut rx, &tx, &filter, &mut deferred, &mut stats).await?;
+    stream_phase(
+        &mut rx,
+        &tx,
+        &filter,
+        &mut deferred,
+        &mut stats,
+        barrier.as_ref(),
+    )
+    .await?;
     if walk_ok.await.is_err() {
         stats.gated += stats.deferred;
         deferred.discard().await;
@@ -489,6 +711,63 @@ async fn gate_task(
     let view = PgXactView::new(&accum, &patch).with_multixact(&multi);
     resolve_phase(deferred, &view, &tx, Some(&mut pending), &mut stats).await?;
     Ok((stats, segments, pending))
+}
+
+/// Reopen both walk spools at the marks a checkpoint recorded
+async fn reopen_walk_spools(
+    checkpoint: &BackupCheckpoint,
+    gate_path: &Path,
+    toast_path: &Path,
+) -> Result<(DeferredSpool, DeferredSpool)> {
+    let walk = &checkpoint.walk;
+    Ok((
+        DeferredSpool::reopen_at(
+            gate_path.to_path_buf(),
+            DEFERRED_SPOOL_MEM_MAX,
+            walk.gate_deferred,
+        )
+        .await?,
+        DeferredSpool::reopen_at(
+            toast_path.to_path_buf(),
+            DEFERRED_SPOOL_MEM_MAX,
+            walk.toast_deferred,
+        )
+        .await?,
+    ))
+}
+
+/// Record walked files behind proven inserts for as long as the walk runs.
+/// Only resolves on failure: the select driving it ends when the walk does.
+/// A pass with no barrier has nothing to record, so it never resolves at all
+async fn record_walked(
+    barrier: Option<&WalkBarrier>,
+    tail: &OwnedTail,
+    state: &mut BackupCheckpoint,
+    dir: &Path,
+) -> anyhow::Error {
+    let Some(barrier) = barrier else {
+        return std::future::pending().await;
+    };
+    loop {
+        tokio::time::sleep(WALK_CHECKPOINT_PERIOD).await;
+        let Some(proof) = barrier.collect().await else {
+            continue;
+        };
+        if let Err(e) = tail.checkpoint(proof.next_seq).await {
+            return anyhow::Error::msg(e);
+        }
+        state.walk.files.extend(proof.files);
+        state.walk.gate_deferred = proof.gate_deferred;
+        state.walk.toast_deferred = proof.toast_deferred;
+        let recorded = state.walk.files.iter().cloned().collect();
+        state
+            .walk
+            .parts
+            .extend(barrier.settled_parts(&recorded).await);
+        if let Err(e) = state.save(dir).await {
+            return e;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -559,12 +838,12 @@ pub async fn fetch_segments(
 async fn replay_gap(
     ctx: &PassContext,
     segments: &[(SegmentName, PathBuf)],
-    b_redo: u64,
+    from_lsn: u64,
     targets: ReplayTargets,
     resolver: ToastResolver,
-    msg_tx: mpsc::Sender<BatcherMsg>,
-    ack: AckHandle,
+    tail: &OwnedTail,
     next_seq: u64,
+    mut checkpoint: Option<(&mut BackupCheckpoint, &Path)>,
 ) -> Result<ReplayStats> {
     let spill = ctx.scratch_dir.join("replay_spill");
     tokio::fs::create_dir_all(&spill).await.ok();
@@ -595,7 +874,7 @@ async fn replay_gap(
         resolver,
         filter_rfns,
         targets,
-        from_lsn: b_redo,
+        from_lsn,
         // Filter is the opted-in set, so unfiltered rels are deliberate
         whole_db_filter: false,
         mapping: ctx.mapping.snapshot().await,
@@ -605,13 +884,38 @@ async fn replay_gap(
         config: ctx.config_rx.as_ref().map(|rx| rx.borrow().clone()),
         batch_rows: ctx.emitter.drain_batch_rows,
         batch_bytes: ctx.emitter.drain_batch_bytes,
-        msg_tx,
-        ack,
+        msg_tx: tail.msg_tx.clone(),
+        ack: tail.ack.clone(),
         next_seq,
         // Pre-scan already harvested transaction patch
         patch: None,
     });
-    pump_segments_through(segments, ctx.log.db_oid(), &mut sink).await?;
+    let Some((first, _)) = segments.first() else {
+        return sink
+            .finish()
+            .await
+            .map_err(|e| anyhow::anyhow!("backup_backfill: finish gap replay: {e}"));
+    };
+    let mut pump = SegmentPump::start(first, ctx.log.db_oid())?;
+    let mut ticker = Ticker::new(WALK_CHECKPOINT_PERIOD);
+    for (seg, path) in segments {
+        pump.push(seg, path, &mut sink).await?;
+        // Boundary flush costs an insert round trip, so pace it like the walk
+        // rather than paying one per segment
+        let Some((state, dir)) = checkpoint.as_mut().filter(|_| ticker.fire()) else {
+            continue;
+        };
+        let seq = sink
+            .segment_boundary()
+            .await
+            .map_err(|e| anyhow::anyhow!("backup_backfill: gap replay boundary: {e}"))?;
+        tail.checkpoint(seq).await.map_err(anyhow::Error::msg)?;
+        // Resume cannot start above a transaction whose prefix is buffered
+        let end = seg.start_lsn(WAL_SEG_SIZE) + WAL_SEG_SIZE;
+        state.replay_from = Some(sink.oldest_inflight().await.map_or(end, |l| l.min(end)));
+        state.save(dir).await?;
+    }
+    pump.close(&mut sink).await?;
     sink.finish()
         .await
         .map_err(|e| anyhow::anyhow!("backup_backfill: finish gap replay: {e}"))
@@ -1278,6 +1582,7 @@ mod tests {
             walk_ok_rx,
             DeferredSpool::new(spool_path.clone(), 0),
             test_pending(),
+            None,
         ));
 
         // Hinted-committed: passes through immediately
@@ -1343,6 +1648,7 @@ mod tests {
             walk_ok_rx,
             DeferredSpool::new(spool_path.clone(), 0),
             test_pending(),
+            None,
         ));
 
         // Hinted-committed: routed before the failure, stays flushed
@@ -1410,6 +1716,7 @@ mod tests {
             walk_ok_rx,
             mem_spool(),
             test_pending(),
+            None,
         ));
 
         walk_tx
@@ -1451,6 +1758,7 @@ mod tests {
             walk_ok_rx,
             mem_spool(),
             test_pending(),
+            None,
         ));
 
         walk_tx

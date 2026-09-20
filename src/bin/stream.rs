@@ -5148,6 +5148,7 @@ async fn run_bootstrap(
                         &catalog,
                         &mut spool,
                         &mut gate_stats,
+                        None,
                     )
                     .await
                     .map(|()| (gate_stats, spool))

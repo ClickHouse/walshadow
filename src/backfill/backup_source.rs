@@ -45,6 +45,8 @@ crate::atomic_stats! {
         pub sink_chunk_nanos,
         pub parts_total,
         pub parts_done,
+        /// Recorded complete by an earlier attempt, never fetched
+        pub parts_skipped,
     }
 }
 
@@ -75,6 +77,9 @@ pub struct FileMeta {
     pub size: u64,
     pub mode: u32,
     pub kind: FileKind,
+    /// Archive object this entry came out of, for sources that fetch in
+    /// parts. A resumed walk skips whole parts by this key
+    pub part: Option<Arc<str>>,
 }
 
 /// Sink routing decision per file at `begin()`.
@@ -154,6 +159,14 @@ pub trait BackupSink: Send + Sync {
     /// Must be cheap; per-file dispatch is the hot path
     async fn begin(&self, meta: &FileMeta) -> io::Result<FileAction>;
 
+    /// Parts a resumed walk need not fetch. Default takes every part
+    async fn want_part(&self, _key: &str) -> bool {
+        true
+    }
+
+    /// Every entry of `key` has been dispatched and its bodies streamed
+    async fn part_done(&self, _key: &str) {}
+
     async fn finish(&self, _info: &EndInfo) -> io::Result<()> {
         Ok(())
     }
@@ -166,6 +179,7 @@ pub struct PumpTarget {
     pub data_dir: PathBuf,
     pub sink: Arc<dyn BackupSink>,
     pub stats: Arc<PumpStats>,
+    pub part: Option<Arc<str>>,
 }
 
 impl PumpTarget {
@@ -174,6 +188,17 @@ impl PumpTarget {
             data_dir,
             sink,
             stats,
+            part: None,
+        }
+    }
+
+    /// Tag every entry of one archive object with the key it came from
+    pub fn for_part(&self, key: &str) -> Self {
+        Self {
+            data_dir: self.data_dir.clone(),
+            sink: self.sink.clone(),
+            stats: self.stats.clone(),
+            part: Some(Arc::from(key)),
         }
     }
 }
@@ -233,6 +258,7 @@ pub(crate) fn tar_entry_meta<R: AsyncRead + Unpin>(
         size,
         mode,
         kind,
+        part: None,
     }))
 }
 
@@ -251,9 +277,10 @@ where
     let mut entries = archive.entries()?;
     while let Some(entry_res) = entries.next().await {
         let mut entry = entry_res?;
-        let Some(meta) = tar_entry_meta(&entry)? else {
+        let Some(mut meta) = tar_entry_meta(&entry)? else {
             continue;
         };
+        meta.part = target.part.clone();
         pump_entry(&mut entry, &meta, target).await?;
     }
     Ok(())
@@ -388,6 +415,7 @@ pub(crate) async fn emit_tablespace_symlink(
         kind: FileKind::Symlink {
             target: PathBuf::from(&tablespace.location),
         },
+        part: None,
     };
     let mut body = tokio::io::empty();
     pump_entry(&mut body, &meta, target).await

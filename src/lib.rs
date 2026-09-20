@@ -45,10 +45,10 @@ pub mod xact;
 
 #[doc(hidden)]
 pub use backfill::{
-    backfill_bootstrap, backfill_staging, backfill_types, backup_backfill, backup_page_walk,
-    backup_sentinel, backup_source, backup_source_direct, backup_source_object_store,
-    bootstrap_marker, bootstrap_window, copy_backfill, opt_in, pg_path, spool, visibility_gate,
-    visibility_pending, wal_replay,
+    backfill_bootstrap, backfill_staging, backfill_types, backup_backfill, backup_checkpoint,
+    backup_page_walk, backup_sentinel, backup_source, backup_source_direct,
+    backup_source_object_store, bootstrap_marker, bootstrap_window, copy_backfill, opt_in, pg_path,
+    spool, visibility_gate, visibility_pending, wal_replay, walk_barrier,
 };
 #[doc(hidden)]
 pub use catalog::{desc_log, pending, shadow, shadow_catalog, type_bridge};

@@ -161,7 +161,13 @@ impl BackupSource for ObjectStoreSource {
                 let settings = settings.clone();
                 let spool = part_spool_dir.clone();
                 let target = target.clone();
-                async move { unpack_one_part(&settings, &storage, &key, &spool, &target).await }
+                async move {
+                    if !target.sink.want_part(&key).await {
+                        target.stats.parts_skipped.fetch_add(1, Ordering::Relaxed);
+                        return Ok(());
+                    }
+                    unpack_one_part(&settings, &storage, &key, &spool, &target).await
+                }
             })
             .buffer_unordered(parallelism)
             .try_collect::<Vec<_>>()
@@ -188,6 +194,7 @@ async fn unpack_one_part(
     part_spool_dir: &std::path::Path,
     target: &PumpTarget,
 ) -> Result<()> {
+    let target = &target.for_part(key);
     let method = method_from_key(key);
     let body = storage
         .get(key)
@@ -202,6 +209,7 @@ async fn unpack_one_part(
     pump_tar_to_sink(&mut archive, target)
         .await
         .with_context(|| format!("ObjectStoreSource: tar unpack {key}"))?;
+    target.sink.part_done(key).await;
     target.stats.parts_done.fetch_add(1, Ordering::Relaxed);
     tracing::info!(
         target = "walshadow::backup_source_object_store",

@@ -9,8 +9,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::sync::mpsc;
 
+use crate::backfill::backup_checkpoint::SpoolMark;
 use crate::backfill::backup_page_walk::{BackfillTuple, CatalogMap};
 use crate::backfill::spool::{DeferredReader, DeferredSpool};
+use crate::backfill::walk_barrier::{Ticker, WALK_CHECKPOINT_PERIOD, WalkBarrier};
 use crate::config::ResolvedConfig;
 use crate::decode::heap_decoder::{ColumnValue, ToastPointer};
 use crate::emit::ch_emitter::EmitterStats;
@@ -175,6 +177,7 @@ pub async fn drain(
     row_policy: RowPolicy,
     config: Option<Arc<ResolvedConfig>>,
     skip_initial: HashSet<RelName>,
+    barrier: Option<Arc<WalkBarrier>>,
 ) -> Result<BootstrapDrainOutcome, String> {
     let (mut deferred, handback) = match deferral {
         Deferral::Rejected => (None, false),
@@ -189,7 +192,10 @@ pub async fn drain(
     let mut chunk_batch = Vec::new();
     let mut chunk_batch_bytes = 0;
     let mut out = RowBuf::default();
+    let mut consumed = 0u64;
+    let mut ticker = Ticker::new(WALK_CHECKPOINT_PERIOD);
     while let Some(batch) = rx.recv().await {
+        consumed += batch.len() as u64;
         for tuple in batch {
             let rfn = tuple.rfn;
             let source_lsn = tuple.source_lsn;
@@ -260,6 +266,29 @@ pub async fn drain(
             out.push(&msg_tx, seq, rel, route, tuple, permit).await?;
             bump(&mut open, &mut rows_routed);
         }
+        // Resumable walk: close the seq space and fsync the spool so the
+        // checkpointer can name every tuple consumed so far durable
+        if let Some(b) = &barrier
+            && ticker.fire()
+        {
+            if !chunk_batch.is_empty() {
+                flush_chunks(&resolver, &mut chunk_batch).await?;
+                chunk_batch_bytes = 0;
+            }
+            out.flush(&msg_tx).await?;
+            if let Some((_, seq, rows)) = open.take() {
+                ack.placed(seq, rows);
+            }
+            let mut mark = SpoolMark::default();
+            if let Some(spool) = deferred.as_mut() {
+                mark = spool
+                    .checkpoint()
+                    .await
+                    .map_err(|e| format!("bootstrap: deferred spool checkpoint: {e}"))?;
+                footprint.publish(spool);
+            }
+            b.publish_drain(consumed, next_seq, mark).await;
+        }
     }
     out.flush(&msg_tx).await?;
     if let Some((_, seq, rows)) = open.take() {
@@ -282,7 +311,7 @@ pub async fn drain(
         Some(spool) => {
             footprint.hand_off();
             let resolved = resolve_spooled(
-                spool, &routes, &catalog, &msg_tx, &ack, &stats, &resolver, next_seq,
+                spool, &routes, &catalog, &msg_tx, &ack, &stats, &resolver, next_seq, None,
             )
             .await?;
             Ok(BootstrapDrainOutcome {
@@ -316,12 +345,19 @@ pub async fn drain_deferred(
     row_policy: &RowPolicy,
     config: Option<&ResolvedConfig>,
     first_seq: u64,
+    checkpoint: Option<ReplayCheckpoint<'_>>,
 ) -> Result<BootstrapDrainOutcome, String> {
     let routes = freeze_routes(mapping, config, row_policy);
     resolve_spooled(
-        spool, &routes, catalog, msg_tx, ack, stats, resolver, first_seq,
+        spool, &routes, catalog, msg_tx, ack, stats, resolver, first_seq, checkpoint,
     )
     .await
+}
+
+pub struct ReplayCheckpoint<'a> {
+    pub state: &'a mut crate::backfill::backup_checkpoint::BackupCheckpoint,
+    pub dir: &'a std::path::Path,
+    pub tail: &'a crate::emit::pipeline::tail::OwnedTail,
 }
 
 /// Route spooled referrers under one trailing seq, registered on the first
@@ -336,6 +372,7 @@ async fn resolve_spooled(
     stats: &EmitterStats,
     resolver: &ToastResolver,
     first_seq: u64,
+    mut checkpoint: Option<ReplayCheckpoint<'_>>,
 ) -> Result<BootstrapDrainOutcome, String> {
     tracing::info!(
         target: "walshadow::bootstrap",
@@ -348,11 +385,16 @@ async fn resolve_spooled(
     let mut out = RowBuf::default();
     let mut seq = None;
     let mut placed = 0u64;
+    let total_bytes = spool.spooled_bytes();
+    let mut next_seq = first_seq;
+    let mut total_placed = 0;
+    let mut ticker = Ticker::new(WALK_CHECKPOINT_PERIOD);
     let mut replay = spool
         .into_reader()
         .await
         .map_err(|e| format!("bootstrap: deferred spool seal: {e}"))?;
-    let mut progress = DeferredReplayProgress::new(stats, replay.remaining_file_bytes());
+    let mut progress = DeferredReplayProgress::new(stats, total_bytes);
+    progress.advance(replay.remaining_file_bytes());
     // Read and fetch the next batch while this one routes: spool reads and
     // inserts otherwise leave the store pool idle
     let mut ready = prepare_batch(&mut replay, routes, catalog, stats, resolver).await?;
@@ -365,30 +407,59 @@ async fn resolve_spooled(
                 &mut out,
                 msg_tx,
                 ack,
-                first_seq,
+                next_seq,
                 &mut seq,
                 &mut placed
             ),
         );
         routed?;
         progress.advance(remaining);
+        if let Some(c) = checkpoint.as_mut() {
+            out.flush(msg_tx).await?;
+            if let Some(s) = seq.take() {
+                ack.placed(s, placed);
+                next_seq = s + 1;
+            }
+            total_placed += placed;
+            placed = 0;
+            if ticker.fire() {
+                c.tail.checkpoint(next_seq).await?;
+                c.state.offset = total_bytes - remaining;
+                c.state.rows += total_placed;
+                total_placed = 0;
+                c.state.save(c.dir).await.map_err(|e| e.to_string())?;
+            }
+        }
         ready = next?;
     }
     out.flush(msg_tx).await?;
-    replay
-        .finish()
-        .await
-        .map_err(|e| format!("bootstrap: deferred spool cleanup: {e}"))?;
+    let rows_routed = match checkpoint.as_mut() {
+        Some(c) => {
+            c.tail.checkpoint(next_seq).await?;
+            c.state.offset = total_bytes;
+            c.state.rows += total_placed;
+            c.state.save(c.dir).await.map_err(|e| e.to_string())?;
+            c.state.rows
+        }
+        // Resumable passes keep the spool until the pass itself publishes
+        None => {
+            replay
+                .finish()
+                .await
+                .map_err(|e| format!("bootstrap: deferred spool cleanup: {e}"))?;
+            placed
+        }
+    };
     let next_seq = match seq {
         Some(s) => {
             ack.placed(s, placed);
             s + 1
         }
-        None => first_seq,
+        None => next_seq,
     };
     Ok(BootstrapDrainOutcome {
         next_seq,
-        rows_routed: placed,
+        rows_routed,
         deferred: None,
     })
 }
@@ -1202,6 +1273,7 @@ mod tests {
             Default::default(),
             None,
             HashSet::new(),
+            None,
         )
         .await
         .unwrap_err();
@@ -1247,6 +1319,7 @@ mod tests {
             Default::default(),
             None,
             HashSet::new(),
+            None,
         ));
 
         let mut by_seq: HashMap<u64, u64> = HashMap::new();
@@ -1300,6 +1373,7 @@ mod tests {
             Default::default(),
             None,
             HashSet::new(),
+            None,
         ));
 
         let seqs: Vec<u64> = collect_rows(&mut msg_rx)
@@ -1351,6 +1425,7 @@ mod tests {
             Default::default(),
             None,
             HashSet::new(),
+            None,
         ));
 
         let rows = collect_rows(&mut msg_rx).await;
@@ -1406,6 +1481,7 @@ mod tests {
             Default::default(),
             None,
             HashSet::new(),
+            None,
         ));
 
         let rows = collect_rows(&mut msg_rx).await;
@@ -1472,6 +1548,7 @@ mod tests {
             Default::default(),
             None,
             HashSet::new(),
+            None,
         ));
 
         let rows = collect_rows(&mut msg_rx).await;
@@ -1526,6 +1603,7 @@ mod tests {
             Default::default(),
             None,
             HashSet::new(),
+            None,
         )
         .await
         .unwrap();
@@ -1549,6 +1627,7 @@ mod tests {
             &Default::default(),
             None,
             outcome.next_seq,
+            None,
         )
         .await
         .unwrap();
@@ -1607,6 +1686,7 @@ mod tests {
                 Default::default(),
                 None,
                 HashSet::new(),
+                None,
             )
             .await
             .unwrap();
@@ -1635,6 +1715,7 @@ mod tests {
                 &Default::default(),
                 None,
                 first_seq,
+                None,
             )
             .await
             .unwrap();
@@ -1687,6 +1768,7 @@ mod tests {
             Default::default(),
             None,
             HashSet::new(),
+            None,
         ));
         drop(tup_tx);
 
@@ -1752,6 +1834,7 @@ mod tests {
             Default::default(),
             None,
             HashSet::new(),
+            None,
         ));
 
         let routed = collect_rows(&mut msg_rx).await;
@@ -1773,6 +1856,134 @@ mod tests {
         );
         drop(ack);
         collector.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn checkpoint_excludes_failed_prefetch_and_resumes_acknowledged_prefix() {
+        use crate::backfill::backup_checkpoint::BackupCheckpoint;
+        use crate::emit::ch_emitter::EmitterConfig;
+        use crate::emit::pipeline::tail::OwnedTail;
+        use crate::runtime_config::InitialLoadMode;
+        use crate::toast::{ChunkStore, ChunkStoreError};
+
+        struct FailPrefetch(AtomicU64);
+        #[async_trait::async_trait]
+        impl ChunkStore for FailPrefetch {
+            async fn truncate_mirror(&self, _: u32) -> Result<(), ChunkStoreError> {
+                Ok(())
+            }
+            async fn rewrite_barrier(&self, _: u32, _: u64, _: u64) -> Result<(), ChunkStoreError> {
+                Ok(())
+            }
+
+            async fn put(&self, _: &[ToastRow]) -> Result<(), ChunkStoreError> {
+                Ok(())
+            }
+            async fn fetch_many(
+                &self,
+                _: u32,
+                values: &[(u32, usize)],
+                _: u64,
+            ) -> Result<Vec<FetchedValue>, ChunkStoreError> {
+                tokio::time::advance(std::time::Duration::from_secs(31)).await;
+                if self.0.fetch_add(1, Ordering::Relaxed) == 1 {
+                    return Err(ChunkStoreError::Shadow("injected prefetch failure".into()));
+                }
+                Ok(values
+                    .iter()
+                    .map(|_| FetchedValue::Assembled(b"hello".to_vec()))
+                    .collect())
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bootstrap_deferred.bin");
+        let mut spool = DeferredSpool::new(path.clone(), 0);
+        for _ in 0..=REPLAY_BATCH_ROWS {
+            spool
+                .push(bytea_toast_tuple(16400, 16500, 1))
+                .await
+                .unwrap();
+        }
+        let mark = spool.checkpoint().await.unwrap();
+        let total = spool.spooled_bytes();
+        let mut state = BackupCheckpoint::new(
+            InitialLoadMode::ObjectStore,
+            &[],
+            &Arc::default(),
+            &EmitterConfig::default(),
+            None,
+        );
+        state.spool = mark;
+        state.save(dir.path()).await.unwrap();
+        let mut catalog = CatalogMap::new();
+        catalog.insert(bytea_rel(16400));
+        let mut tables = HashMap::new();
+        tables.insert(RelName::new("public", "t16400"), bytea_mapping_for(16400));
+        let mapping = Arc::new(tables);
+        let stats = Arc::new(EmitterStats::default());
+        let resolver =
+            ToastResolver::with_store(Arc::new(FailPrefetch(AtomicU64::new(0))), stats.clone());
+        let tail = OwnedTail::null();
+        stats
+            .bootstrap_deferred_spool_bytes
+            .store(total, Ordering::Relaxed);
+        let result = drain_deferred(
+            spool,
+            &catalog,
+            &mapping,
+            &tail.msg_tx,
+            &tail.ack,
+            &stats,
+            &resolver,
+            &Default::default(),
+            None,
+            0,
+            Some(ReplayCheckpoint {
+                state: &mut state,
+                dir: dir.path(),
+                tail: &tail,
+            }),
+        )
+        .await;
+        assert!(result.unwrap_err().contains("injected prefetch failure"));
+        let mut saved = BackupCheckpoint::load(dir.path()).await.unwrap().unwrap();
+        assert_eq!(saved.rows, REPLAY_BATCH_ROWS as u64);
+        assert_eq!(saved.offset, total - total / saved.spool.records);
+        assert!(path.exists());
+        tail.finish(1).await.unwrap();
+
+        let spool = DeferredSpool::resume(path.clone(), saved.spool, saved.offset)
+            .await
+            .unwrap();
+        stats
+            .bootstrap_deferred_spool_bytes
+            .store(total, Ordering::Relaxed);
+        let tail = OwnedTail::null();
+        let result = drain_deferred(
+            spool,
+            &catalog,
+            &mapping,
+            &tail.msg_tx,
+            &tail.ack,
+            &stats,
+            &resolver,
+            &Default::default(),
+            None,
+            0,
+            Some(ReplayCheckpoint {
+                state: &mut saved,
+                dir: dir.path(),
+                tail: &tail,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.rows_routed, REPLAY_BATCH_ROWS as u64 + 1);
+        assert_eq!(saved.offset, total);
+        assert_eq!(result.next_seq, 1);
+        assert!(path.exists(), "retain spool until pass publishes");
+        tail.finish(result.next_seq).await.unwrap();
     }
 
     /// One round trip per mirror resolves a whole batch, distinct values
@@ -1845,6 +2056,7 @@ mod tests {
             Default::default(),
             None,
             HashSet::new(),
+            None,
         ));
 
         let rows = collect_rows(&mut msg_rx).await;

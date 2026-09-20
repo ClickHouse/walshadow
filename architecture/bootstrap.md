@@ -51,6 +51,16 @@ After staged rows are ready, table exchange publishes them and live changes are
 reconciled. Restart must distinguish a swap that has already happened from one
 still pending; otherwise retry can replace newer destination state
 
+An interrupted load resumes rather than repeating. Each phase records progress
+only behind rows the destination has proven durable, so a restart replays a
+bounded overlap and the load version collapses the repeats. Recording ahead of
+that proof would instead skip rows, so ordering between walk, gate and
+destination acknowledgement is what the resume state rests on. Staging tables
+and chunk mirrors are retained across the restart, which makes the recorded
+progress meaningful. Anything that could have relocated rows underneath it,
+a fresh backup, changed mappings, a rewritten source relation, discards the
+state instead
+
 Staging changes what destination materialized views observe. See
 [table selection](../docs/table-selection.md) and
 [initial-load limits](../docs/limitations.md#initial-loads) before deployment

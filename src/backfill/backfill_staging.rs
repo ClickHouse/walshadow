@@ -80,6 +80,15 @@ pub async fn prepare(
     live: &MappingHandle,
     reqs: &[BackupRequest],
 ) -> Result<StagingPlan> {
+    prepare_reusing(emitter, live, reqs, false).await
+}
+
+pub async fn prepare_reusing(
+    emitter: Arc<EmitterConfig>,
+    live: &MappingHandle,
+    reqs: &[BackupRequest],
+    reuse: bool,
+) -> Result<StagingPlan> {
     let mut sess = StagingSession::connect(emitter).await?;
     // Freeze routing for entire staging plan
     let live_map = live.snapshot().await;
@@ -101,9 +110,11 @@ pub async fn prepare(
             table: m.target.table.clone(),
             s_lsn: r.s_lsn,
         };
-        sess.rebuild_staging(&rel)
-            .await
-            .with_context(|| format!("backfill_staging: rebuild staging for {name}"))?;
+        if !reuse {
+            sess.rebuild_staging(&rel)
+                .await
+                .with_context(|| format!("backfill_staging: rebuild staging for {name}"))?;
+        }
         staged.insert(
             name.clone(),
             TableMapping {

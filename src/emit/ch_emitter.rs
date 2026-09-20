@@ -24,7 +24,7 @@
 //! WAL ordering within a single dest table is preserved
 
 use std::collections::BTreeMap;
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -277,6 +277,11 @@ pub struct BootstrapSettings {
     pub lanes: Option<NonZeroUsize>,
     /// Retry failed table backup loads through source COPY, default true
     pub copy_fallback: Option<bool>,
+    /// `copy_chunk_blocks`: heap pages per resumable COPY chunk. Each chunk
+    /// proves its rows durable before progress persists, so a restart replays
+    /// at most one chunk. `None` uses
+    /// [`COPY_CHUNK_BLOCKS`](crate::backfill::copy_backfill::COPY_CHUNK_BLOCKS)
+    pub copy_chunk_blocks: Option<NonZeroU32>,
 }
 
 /// Where external TOAST values live.
@@ -2324,6 +2329,7 @@ pub async fn load_effective(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backfill::copy_backfill::COPY_CHUNK_BLOCKS;
     use crate::decode::heap_decoder::{DecodedHeap, DecodedTuple};
     use backon::BackoffBuilder;
     use walrus::pg::walparser::RelFileNode;
@@ -3830,6 +3836,27 @@ mod tests {
             assert_eq!(config.bootstrap.copy_fallback.unwrap_or(true), expected);
         }
         assert!(EmitterConfig::from_toml_str("[bootstrap]\ncopy_fallback = \"false\"").is_err());
+    }
+
+    #[test]
+    fn config_copy_chunk_blocks_defaults_to_a_segment() {
+        for (src, expected) in [
+            ("[ch]", COPY_CHUNK_BLOCKS),
+            ("[bootstrap]\ncopy_chunk_blocks = 8192", 8192),
+        ] {
+            let config = EmitterConfig::from_toml_str(src).unwrap();
+            assert_eq!(
+                config
+                    .bootstrap
+                    .copy_chunk_blocks
+                    .map_or(COPY_CHUNK_BLOCKS, NonZeroU32::get),
+                expected
+            );
+        }
+        assert!(
+            EmitterConfig::from_toml_str("[bootstrap]\ncopy_chunk_blocks = 0").is_err(),
+            "a zero chunk would never advance the cursor",
+        );
     }
 
     #[test]

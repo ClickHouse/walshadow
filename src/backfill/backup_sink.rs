@@ -282,6 +282,7 @@ mod tests {
             size: 0,
             mode: 0,
             kind: FileKind::Dir,
+            part: None,
         };
         assert_eq!(lander.classify(&dir("pg_logical")), DiskAction::Keep);
         assert_eq!(
@@ -299,6 +300,7 @@ mod tests {
                 size: 0,
                 mode: 0,
                 kind: FileKind::File,
+                part: None,
             }),
             DiskAction::SkipDenylist,
             "file contents under a denylisted dir stay skipped",
@@ -315,6 +317,7 @@ mod tests {
                     size: 0,
                     mode: 0,
                     kind: FileKind::File,
+                    part: None,
                 },
                 DiskAction::Keep,
             ),
@@ -324,6 +327,7 @@ mod tests {
                     size: 0,
                     mode: 0,
                     kind: FileKind::File,
+                    part: None,
                 },
                 DiskAction::Keep,
             ),
@@ -333,6 +337,7 @@ mod tests {
                     size: 0,
                     mode: 0,
                     kind: FileKind::File,
+                    part: None,
                 },
                 DiskAction::SkipUserHeap,
             ),
@@ -342,6 +347,7 @@ mod tests {
                     size: 0,
                     mode: 0,
                     kind: FileKind::File,
+                    part: None,
                 },
                 DiskAction::SkipDenylist,
             ),
@@ -351,6 +357,7 @@ mod tests {
                     size: 0,
                     mode: 0,
                     kind: FileKind::Dir,
+                    part: None,
                 },
                 DiskAction::Keep,
             ),
@@ -360,6 +367,7 @@ mod tests {
                     size: 0,
                     mode: 0,
                     kind: FileKind::File,
+                    part: None,
                 },
                 DiskAction::Keep,
             ),
@@ -371,6 +379,7 @@ mod tests {
                     kind: FileKind::Symlink {
                         target: PathBuf::from("/srv/ts/a"),
                     },
+                    part: None,
                 },
                 DiskAction::Keep,
             ),
@@ -437,6 +446,7 @@ mod tests {
             size: 0,
             mode: 0,
             kind: FileKind::File,
+            part: None,
         };
         assert!(matches!(
             mux.begin(&file("base/5/1259")).await.unwrap(),
@@ -491,6 +501,7 @@ mod tests {
             size: 0,
             mode: 0,
             kind: FileKind::File,
+            part: None,
         };
         mux.begin(&file("base/5/1259")).await.unwrap();
         mux.begin(&file("pg_replslot/0/state")).await.unwrap();
