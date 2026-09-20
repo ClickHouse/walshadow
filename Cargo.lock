@@ -2975,9 +2975,9 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "wal-rus"
-version = "0.3.4"
+version = "0.3.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4fffb3db360b091ad352763af5e3390f8c722aa47b1d9a7a2af9c105db8d6441"
+checksum = "9aaaa0606fb22eb1bb58ac1bb36dfa83149fac6d5578fc932454097a8cd2a8b8"
 dependencies = [
  "anyhow",
  "astral-tokio-tar",

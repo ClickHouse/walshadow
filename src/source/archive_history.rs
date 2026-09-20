@@ -1,10 +1,7 @@
 //! Cross-check archived timeline history against the branch the source proved
 
-use std::path::Path;
-
 use anyhow::{Context, Result};
 use walrus::config::Settings;
-use walrus::pg::wal::fetch::Prefetch;
 use walrus::storage::DynStorage;
 
 use crate::source::timeline::{TimelineHistory, history_filename};
@@ -14,22 +11,12 @@ use crate::source::timeline::{TimelineHistory, history_filename};
 pub async fn verify(
     settings: &Settings,
     storage: &DynStorage,
-    dir: &Path,
     source: &TimelineHistory,
 ) -> Result<()> {
-    tokio::fs::create_dir_all(dir)
-        .await
-        .with_context(|| format!("create {}", dir.display()))?;
     let name = history_filename(source.target());
-    let dst = dir.join(&name);
-    if !dst.exists() {
-        walrus::pg::wal::fetch::handle(settings, storage.clone(), &name, &dst, Prefetch::Off)
-            .await
-            .with_context(|| format!("fetch {name}"))?;
-    }
-    let raw = tokio::fs::read(&dst)
+    let raw = walrus::pg::wal::fetch::read_segment(settings, storage, &name)
         .await
-        .with_context(|| format!("read {}", dst.display()))?;
+        .with_context(|| format!("fetch {name}"))?;
     let archived =
         TimelineHistory::parse(source.target(), &raw).with_context(|| format!("parse {name}"))?;
     anyhow::ensure!(
@@ -41,6 +28,8 @@ pub async fn verify(
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
 
     /// Match `archive_command`: store history uncompressed under `wal_005/`
@@ -70,9 +59,7 @@ mod tests {
         let (settings, storage) = fs_archive(&tmp.path().join("archive"));
         archive_history_file(&settings, &storage, 2, "1\t0/3000000\tpromotion\n").await;
         let source = TimelineHistory::parse(3, b"1\t0/3000000\tpromotion\n").unwrap();
-        let err = verify(&settings, &storage, &tmp.path().join("probe"), &source)
-            .await
-            .unwrap_err();
+        let err = verify(&settings, &storage, &source).await.unwrap_err();
         assert!(err.to_string().contains("00000003.history"), "{err:#}");
     }
 
@@ -82,9 +69,7 @@ mod tests {
         let (settings, storage) = fs_archive(&tmp.path().join("archive"));
         archive_history_file(&settings, &storage, 4, "1\t0/3000000\tpromotion\n").await;
         let source = TimelineHistory::parse(4, b"1\t0/3000000\tpromotion\n").unwrap();
-        verify(&settings, &storage, &tmp.path().join("probe"), &source)
-            .await
-            .unwrap();
+        verify(&settings, &storage, &source).await.unwrap();
     }
 
     #[tokio::test]
@@ -94,9 +79,7 @@ mod tests {
             let (settings, storage) = fs_archive(&tmp.path().join("archive"));
             archive_history_file(&settings, &storage, 3, body).await;
             let source = TimelineHistory::parse(3, b"1\t0/3000000\tpromotion\n").unwrap();
-            let err = verify(&settings, &storage, &tmp.path().join("probe"), &source)
-                .await
-                .unwrap_err();
+            let err = verify(&settings, &storage, &source).await.unwrap_err();
             assert!(err.to_string().contains("disagrees"), "{err:#}");
         }
     }

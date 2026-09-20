@@ -13,11 +13,12 @@
 //!
 //! Requires `pgext/walshadow.so` built against the `initdb` on PATH.
 
+#[path = "common/pgext.rs"]
+mod pgext;
 #[path = "common/ports.rs"]
 mod ports;
 
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -28,23 +29,22 @@ use walshadow::pg::socket_conninfo;
 use walshadow::shadow::{BridgeConf, Shadow, ShadowConfig};
 use walshadow::toast::FetchedValue;
 
-fn have(bin: &str) -> bool {
-    Command::new(bin)
-        .arg("--version")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
-fn pgext_dir() -> PathBuf {
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("pgext");
-    assert!(
-        dir.join("walshadow.so").is_file(),
-        "pgext/walshadow.so missing, run `make -C pgext`"
-    );
-    dir
+/// Skip line plus `false` when a binary these clusters need is missing
+fn requirements(tools: &[&str]) -> bool {
+    for tool in tools {
+        let found = Command::new(tool)
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !found {
+            eprintln!("skip: no {tool} on PATH");
+            return false;
+        }
+    }
+    true
 }
 
 fn wstest_module() -> PathBuf {
@@ -57,54 +57,22 @@ fn wstest_module() -> PathBuf {
     so
 }
 
-struct StopOnDrop {
-    sh: Shadow,
-}
-
-impl Drop for StopOnDrop {
-    fn drop(&mut self) {
-        let _ = self.sh.stop();
-    }
-}
-
-fn append_conf(data_dir: &Path, lines: &str) {
-    let mut f = fs::OpenOptions::new()
-        .append(true)
-        .open(data_dir.join("postgresql.conf"))
-        .expect("open conf");
-    f.write_all(lines.as_bytes()).expect("append conf");
-}
-
 /// Autovacuum off throughout, so every reclamation in here is one the test
 /// asked for and a Missing names the operation that caused it
-fn start_pg(tmp: &tempfile::TempDir, port: u16, archive: &Path) -> StopOnDrop {
-    let mut cfg = ShadowConfig::new(tmp.path().join("data"), tmp.path().join("filtered"));
-    cfg.port = port;
-    cfg.socket_dir = tmp.path().join("sock");
-    cfg.ctl_timeout = Duration::from_secs(60);
-    let mut bridge = BridgeConf::in_dir(&cfg.socket_dir);
-    bridge.library_dir = Some(pgext_dir());
-    cfg.bridge = Some(bridge);
-    fs::create_dir_all(&cfg.filter_out_dir).unwrap();
-    fs::create_dir_all(&cfg.socket_dir).unwrap();
+fn start_pg(tmp: &tempfile::TempDir, port: u16, archive: &Path) -> pgext::Cluster {
     fs::create_dir_all(archive).unwrap();
-
-    let sh = Shadow::new(cfg);
-    sh.initdb().expect("initdb");
-    sh.write_base_conf().expect("write_base_conf");
-    append_conf(
-        &sh.config().data_dir,
-        &format!(
-            "\n# shadow_toast_reads source\n\
-             autovacuum = off\n\
-             archive_mode = on\n\
-             archive_command = 'cp %p {}/%f'\n\
-             max_wal_senders = 4\n",
-            archive.display()
-        ),
-    );
-    sh.start().expect("start");
-    StopOnDrop { sh }
+    let pg = pgext::stage(tmp.path(), port, Duration::from_secs(30));
+    pg.append_conf(&format!(
+        "\n# shadow_toast_reads source\n\
+         autovacuum = off\n\
+         archive_mode = on\n\
+         archive_command = 'cp %p {}/%f'\n\
+         max_wal_senders = 4\n",
+        archive.display()
+    ));
+    // `Shadow::start` over `Cluster::start`: it pins the walreceiver protocol
+    pg.shadow().start().expect("start");
+    pg
 }
 
 async fn dial(sock: &Path) -> Bridge {
@@ -262,14 +230,13 @@ impl PinnedHorizon {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn live_value_reads_back_byte_exact() {
-    if !have("initdb") {
-        eprintln!("skip: no initdb on PATH");
+    if !requirements(&["initdb"]) {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
     let pg = start_pg(&tmp, ports::reserve_port(), &tmp.path().join("archive"));
-    let bridge = dial(pg.sh.bridge_socket().unwrap()).await;
-    let sql = connect_sql(&pg.sh).await;
+    let bridge = dial(pg.shadow().bridge_socket().unwrap()).await;
+    let sql = connect_sql(pg.shadow()).await;
 
     let v = seed_value(&sql, "t_live", "repeat('ab', 120000)", true).await;
     match fetch(&bridge, &v).await {
@@ -285,18 +252,17 @@ async fn live_value_reads_back_byte_exact() {
 /// and `SnapshotToast` reads them despite a committed xmax
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn dead_referrer_still_yields_its_value() {
-    if !have("initdb") {
-        eprintln!("skip: no initdb on PATH");
+    if !requirements(&["initdb"]) {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
     let pg = start_pg(&tmp, ports::reserve_port(), &tmp.path().join("archive"));
-    let bridge = dial(pg.sh.bridge_socket().unwrap()).await;
-    let sql = connect_sql(&pg.sh).await;
+    let bridge = dial(pg.shadow().bridge_socket().unwrap()).await;
+    let sql = connect_sql(pg.shadow()).await;
 
     let deleted = seed_value(&sql, "t_deleted", "repeat('cd', 120000)", true).await;
     let replaced = seed_value(&sql, "t_replaced", "repeat('ef', 120000)", true).await;
-    let hold = PinnedHorizon::hold(&pg.sh).await;
+    let hold = PinnedHorizon::hold(pg.shadow()).await;
 
     exec(&sql, "DELETE FROM t_deleted WHERE id = 1").await;
     // An UPDATE externalizes a fresh value under a new id and deletes the old
@@ -322,17 +288,16 @@ async fn dead_referrer_still_yields_its_value() {
 /// Verify opportunistic pruning reclaims chunks without VACUUM
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pruning_reclaims_as_soon_as_the_horizon_passes() {
-    if !have("initdb") {
-        eprintln!("skip: no initdb on PATH");
+    if !requirements(&["initdb"]) {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
     let pg = start_pg(&tmp, ports::reserve_port(), &tmp.path().join("archive"));
-    let bridge = dial(pg.sh.bridge_socket().unwrap()).await;
-    let sql = connect_sql(&pg.sh).await;
+    let bridge = dial(pg.shadow().bridge_socket().unwrap()).await;
+    let sql = connect_sql(pg.shadow()).await;
 
     let pinned = seed_value(&sql, "t_pinned", "repeat('qr', 120000)", true).await;
-    let hold = PinnedHorizon::hold(&pg.sh).await;
+    let hold = PinnedHorizon::hold(pg.shadow()).await;
     exec(&sql, "DELETE FROM t_pinned WHERE id = 1").await;
     let under_hold = fetch(&bridge, &pinned).await;
     hold.release().await;
@@ -362,14 +327,13 @@ async fn pruning_reclaims_as_soon_as_the_horizon_passes() {
 /// pass as the value. Density plus total size is the whole check
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn partly_reclaimed_run_refuses() {
-    if !have("initdb") {
-        eprintln!("skip: no initdb on PATH");
+    if !requirements(&["initdb"]) {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
     let pg = start_pg(&tmp, ports::reserve_port(), &tmp.path().join("archive"));
-    let bridge = dial(pg.sh.bridge_socket().unwrap()).await;
-    let sql = connect_sql(&pg.sh).await;
+    let bridge = dial(pg.shadow().bridge_socket().unwrap()).await;
+    let sql = connect_sql(pg.shadow()).await;
 
     let v = seed_value(&sql, "t_torn", "repeat('uv', 120000)", true).await;
     exec(&sql, "DELETE FROM t_torn WHERE id = 1").await;
@@ -389,14 +353,13 @@ async fn partly_reclaimed_run_refuses() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn vacuum_rewrite_and_truncate_each_remove_the_value() {
-    if !have("initdb") {
-        eprintln!("skip: no initdb on PATH");
+    if !requirements(&["initdb"]) {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
     let pg = start_pg(&tmp, ports::reserve_port(), &tmp.path().join("archive"));
-    let bridge = dial(pg.sh.bridge_socket().unwrap()).await;
-    let sql = connect_sql(&pg.sh).await;
+    let bridge = dial(pg.shadow().bridge_socket().unwrap()).await;
+    let sql = connect_sql(pg.shadow()).await;
 
     let vacuumed = seed_value(&sql, "t_vac", "repeat('wx', 120000)", true).await;
     exec(&sql, "DELETE FROM t_vac WHERE id = 1").await;
@@ -427,14 +390,13 @@ async fn vacuum_rewrite_and_truncate_each_remove_the_value() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn compressed_value_comes_back_stored_not_inflated() {
-    if !have("initdb") {
-        eprintln!("skip: no initdb on PATH");
+    if !requirements(&["initdb"]) {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
     let pg = start_pg(&tmp, ports::reserve_port(), &tmp.path().join("archive"));
-    let bridge = dial(pg.sh.bridge_socket().unwrap()).await;
-    let sql = connect_sql(&pg.sh).await;
+    let bridge = dial(pg.shadow().bridge_socket().unwrap()).await;
+    let sql = connect_sql(pg.shadow()).await;
 
     // Repeating pattern: compresses hard, still over the toast target, so it
     // lands external *and* compressed
@@ -456,14 +418,13 @@ async fn compressed_value_comes_back_stored_not_inflated() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fetch_refuses_malformed_requests() {
-    if !have("initdb") {
-        eprintln!("skip: no initdb on PATH");
+    if !requirements(&["initdb"]) {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
     let pg = start_pg(&tmp, ports::reserve_port(), &tmp.path().join("archive"));
-    let bridge = dial(pg.sh.bridge_socket().unwrap()).await;
-    let sql = connect_sql(&pg.sh).await;
+    let bridge = dial(pg.shadow().bridge_socket().unwrap()).await;
+    let sql = connect_sql(pg.shadow()).await;
     let v = seed_value(&sql, "t_bad", "repeat('op', 120000)", true).await;
 
     // Empty and over-cap lists never reach the socket
@@ -526,14 +487,13 @@ async fn fetch_refuses_malformed_requests() {
 /// plants them
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn planted_chunk_headers_short_reads_compressed_refuses() {
-    if !have("initdb") {
-        eprintln!("skip: no initdb on PATH");
+    if !requirements(&["initdb"]) {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
     let pg = start_pg(&tmp, ports::reserve_port(), &tmp.path().join("archive"));
-    let bridge = dial(pg.sh.bridge_socket().unwrap()).await;
-    let sql = connect_sql(&pg.sh).await;
+    let bridge = dial(pg.shadow().bridge_socket().unwrap()).await;
+    let sql = connect_sql(pg.shadow()).await;
 
     // Seed before planting: the seed reads chunk lengths through SQL, which
     // would detoast the planted compressed chunk
@@ -588,14 +548,13 @@ async fn planted_chunk_headers_short_reads_compressed_refuses() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn batch_fetch_aligns_with_its_request() {
-    if !have("initdb") {
-        eprintln!("skip: no initdb on PATH");
+    if !requirements(&["initdb"]) {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
     let pg = start_pg(&tmp, ports::reserve_port(), &tmp.path().join("archive"));
-    let bridge = dial(pg.sh.bridge_socket().unwrap()).await;
-    let sql = connect_sql(&pg.sh).await;
+    let bridge = dial(pg.shadow().bridge_socket().unwrap()).await;
+    let sql = connect_sql(pg.shadow()).await;
 
     exec(&sql, "CREATE TABLE t_many (id int primary key, body text)").await;
     exec(&sql, "ALTER TABLE t_many ALTER body SET STORAGE EXTERNAL").await;
@@ -712,7 +671,7 @@ async fn clone_standby(
     tmp: &tempfile::TempDir,
     source: &Shadow,
     archive: &Path,
-) -> (StopOnDrop, Bridge, Client) {
+) -> (pgext::Cluster, Bridge, Client) {
     let sb_data = tmp.path().join("sb-data");
     let sb_sock = tmp.path().join("sb-sock");
     let sb_port = ports::reserve_port();
@@ -747,70 +706,64 @@ async fn clone_standby(
     sb_cfg.socket_dir = sb_sock.clone();
     sb_cfg.ctl_timeout = Duration::from_secs(60);
     let mut bridge = BridgeConf::in_dir(&sb_sock);
-    bridge.library_dir = Some(pgext_dir());
+    bridge.library_dir = Some(pgext::pgext_dir());
     fs::create_dir_all(&sb_cfg.filter_out_dir).unwrap();
-    append_conf(
-        &sb_data,
-        &format!(
-            "\n# shadow_toast_reads standby\n\
-             port = {sb_port}\n\
-             unix_socket_directories = '{}'\n\
-             listen_addresses = ''\n\
-             hot_standby = on\n\
-             autovacuum = off\n\
-             archive_mode = off\n\
-             hot_standby_feedback = off\n\
-             max_standby_streaming_delay = -1\n\
-             max_standby_archive_delay = -1\n\
-             wal_retrieve_retry_interval = '100ms'\n\
-             restore_command = 'cp {}/%f %p'\n\
-             recovery_target_timeline = 'latest'\n{}",
-            sb_sock.display(),
-            archive.display(),
-            bridge.conf_text(&sb_cfg.dbname),
-        ),
+    let conf = format!(
+        "\n# shadow_toast_reads standby\n\
+         port = {sb_port}\n\
+         unix_socket_directories = '{}'\n\
+         listen_addresses = ''\n\
+         hot_standby = on\n\
+         autovacuum = off\n\
+         archive_mode = off\n\
+         hot_standby_feedback = off\n\
+         max_standby_streaming_delay = -1\n\
+         max_standby_archive_delay = -1\n\
+         wal_retrieve_retry_interval = '100ms'\n\
+         restore_command = 'cp {}/%f %p'\n\
+         recovery_target_timeline = 'latest'\n{}",
+        sb_sock.display(),
+        archive.display(),
+        bridge.conf_text(&sb_cfg.dbname),
     );
     fs::write(sb_data.join("standby.signal"), b"").unwrap();
     sb_cfg.bridge = Some(bridge);
-    let standby = StopOnDrop {
-        sh: Shadow::new(sb_cfg),
-    };
-    if let Err(e) = standby.sh.start() {
-        let log = fs::read_to_string(sb_data.join("startup.log")).unwrap_or_default();
-        panic!("standby start: {e}\n{log}");
+    let standby = pgext::adopt(Shadow::new(sb_cfg));
+    standby.append_conf(&conf);
+    if let Err(e) = standby.shadow().start() {
+        panic!("standby start: {e}\n{}", standby.log());
     }
     assert!(
-        standby.sh.is_in_recovery().expect("probe recovery"),
+        standby.shadow().is_in_recovery().expect("probe recovery"),
         "must boot into recovery"
     );
-    let sb_bridge = dial(standby.sh.bridge_socket().unwrap()).await;
-    let sb_sql = connect_sql(&standby.sh).await;
+    let sb_bridge = dial(standby.shadow().bridge_socket().unwrap()).await;
+    let sb_sql = connect_sql(standby.shadow()).await;
     (standby, sb_bridge, sb_sql)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn standby_keeps_the_value_until_the_prune_record_replays() {
-    if !have("initdb") || !have("pg_basebackup") {
-        eprintln!("skip: no initdb/pg_basebackup on PATH");
+    if !requirements(&["initdb", "pg_basebackup"]) {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
     let archive = tmp.path().join("archive");
     let source = start_pg(&tmp, ports::reserve_port(), &archive);
-    let src_sql = connect_sql(&source.sh).await;
+    let src_sql = connect_sql(source.shadow()).await;
 
     // Horizon pinned on the source for the whole run, so the source never
     // prunes and no prune record is ever written. This is what a shadow sees
     // by construction: replayed WAL is its only writer
-    let hold = PinnedHorizon::hold(&source.sh).await;
+    let hold = PinnedHorizon::hold(source.shadow()).await;
     let v = seed_value(&src_sql, "t_sb", "repeat('ab', 120000)", true).await;
     exec(&src_sql, "DELETE FROM t_sb WHERE id = 1").await;
     let after_delete = scalar(&src_sql, "SELECT pg_current_wal_lsn()::text").await;
 
     // Clone after the delete, so the standby starts from a page carrying dead
     // chunks and an intact run
-    let (_standby, sb_bridge, sb_sql) = clone_standby(&tmp, &source.sh, &archive).await;
-    ship_wal(&source.sh);
+    let (_standby, sb_bridge, sb_sql) = clone_standby(&tmp, source.shadow(), &archive).await;
+    ship_wal(source.shadow());
     wait_replay_past(&sb_sql, &after_delete, "the DELETE").await;
 
     let replay = scalar(&sb_sql, "SELECT pg_last_wal_replay_lsn()::text").await;
@@ -830,7 +783,7 @@ async fn standby_keeps_the_value_until_the_prune_record_replays() {
     hold.release().await;
     exec(&src_sql, "VACUUM t_sb").await;
     let after_vacuum = scalar(&src_sql, "SELECT pg_current_wal_lsn()::text").await;
-    ship_wal(&source.sh);
+    ship_wal(source.shadow());
     wait_replay_past(&sb_sql, &after_vacuum, "the VACUUM").await;
 
     let after = fetch(&sb_bridge, &v).await;
@@ -854,14 +807,13 @@ async fn shadow_store_reads_and_refuses_writes() {
     use walshadow::toast::shadow_store::ShadowToastStore;
     use walshadow::toast::{ChunkStore, ChunkStoreError, ToastRow};
 
-    if !have("initdb") {
-        eprintln!("skip: no initdb on PATH");
+    if !requirements(&["initdb"]) {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
     let pg = start_pg(&tmp, ports::reserve_port(), &tmp.path().join("archive"));
-    let bridge = Arc::new(dial(pg.sh.bridge_socket().unwrap()).await);
-    let sql = connect_sql(&pg.sh).await;
+    let bridge = Arc::new(dial(pg.shadow().bridge_socket().unwrap()).await);
+    let sql = connect_sql(pg.shadow()).await;
     let v = seed_value(&sql, "t_store", "repeat('ab', 120000)", true).await;
 
     let store = ShadowToastStore::new(bridge);
@@ -951,26 +903,25 @@ async fn replay_passed_within(standby: &Client, lsn: &str, budget: Duration) -> 
 /// its own reclamation fence.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pg_standby_conflicts_do_not_fence_reclamation() {
-    if !have("initdb") || !have("pg_basebackup") {
-        eprintln!("skip: no initdb/pg_basebackup on PATH");
+    if !requirements(&["initdb", "pg_basebackup"]) {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
     let archive = tmp.path().join("archive");
     let source = start_pg(&tmp, ports::reserve_port(), &archive);
-    let src_sql = connect_sql(&source.sh).await;
+    let src_sql = connect_sql(source.shadow()).await;
 
     // Seed and clone while the row is still live, so a standby snapshot can be
     // opened on either side of the DELETE
-    let hold = PinnedHorizon::hold(&source.sh).await;
+    let hold = PinnedHorizon::hold(source.shadow()).await;
     let v = seed_value(&src_sql, "t_fence", "repeat('ab', 120000)", true).await;
     let seeded = scalar(&src_sql, "SELECT pg_current_wal_lsn()::text").await;
-    let (standby, sb_bridge, sb_sql) = clone_standby(&tmp, &source.sh, &archive).await;
-    ship_wal(&source.sh);
+    let (standby, sb_bridge, sb_sql) = clone_standby(&tmp, source.shadow(), &archive).await;
+    ship_wal(source.shadow());
     wait_replay_past(&sb_sql, &seeded, "the INSERT").await;
 
     // Snapshot opened before delete protects visible row
-    let early = connect_sql(&standby.sh).await;
+    let early = connect_sql(standby.shadow()).await;
     exec(&early, "BEGIN ISOLATION LEVEL REPEATABLE READ").await;
     assert_eq!(
         scalar(&early, "SELECT count(*)::text FROM t_fence").await,
@@ -981,7 +932,7 @@ async fn pg_standby_conflicts_do_not_fence_reclamation() {
     hold.release().await;
     exec(&src_sql, "VACUUM t_fence").await;
     let reclaimed = scalar(&src_sql, "SELECT pg_current_wal_lsn()::text").await;
-    ship_wal(&source.sh);
+    ship_wal(source.shadow());
 
     let parked_for_early = !replay_passed_within(&sb_sql, &reclaimed, Duration::from_secs(5)).await;
     let under_early = fetch(&sb_bridge, &v).await;
@@ -996,7 +947,7 @@ async fn pg_standby_conflicts_do_not_fence_reclamation() {
     );
 
     // Snapshot opened after reclamation cannot protect old chunks
-    let late = connect_sql(&standby.sh).await;
+    let late = connect_sql(standby.shadow()).await;
     exec(&late, "BEGIN ISOLATION LEVEL REPEATABLE READ").await;
     exec(&late, "SELECT 1").await;
     let under_late = fetch(&sb_bridge, &v).await;
@@ -1021,14 +972,13 @@ async fn store_readiness_distinguishes_primary_standby_and_unbound() {
     use walshadow::toast::shadow_store::{LateBridge, ShadowToastStore};
     use walshadow::toast::{ChunkStore, ChunkStoreError};
 
-    if !have("initdb") || !have("pg_basebackup") {
-        eprintln!("skip: no initdb/pg_basebackup on PATH");
+    if !requirements(&["initdb", "pg_basebackup"]) {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
     let archive = tmp.path().join("archive");
     let source = start_pg(&tmp, ports::reserve_port(), &archive);
-    let src_sql = connect_sql(&source.sh).await;
+    let src_sql = connect_sql(source.shadow()).await;
     let v = seed_value(&src_sql, "t_ready", "repeat('ab', 120000)", true).await;
     let seeded = scalar(&src_sql, "SELECT pg_current_wal_lsn()::text").await;
 
@@ -1050,7 +1000,9 @@ async fn store_readiness_distinguishes_primary_standby_and_unbound() {
     // Binding it makes the same store readable, no restart involved
     assert!(
         unbound
-            .set(Arc::new(dial(source.sh.bridge_socket().unwrap()).await))
+            .set(Arc::new(
+                dial(source.shadow().bridge_socket().unwrap()).await
+            ))
             .is_ok(),
         "binds once",
     );
@@ -1080,8 +1032,8 @@ async fn store_readiness_distinguishes_primary_standby_and_unbound() {
 
     // Standby: the floor is real, so a read above its position waits its
     // budget and then reports both positions
-    let (_standby, sb_bridge, sb_sql) = clone_standby(&tmp, &source.sh, &archive).await;
-    ship_wal(&source.sh);
+    let (_standby, sb_bridge, sb_sql) = clone_standby(&tmp, source.shadow(), &archive).await;
+    ship_wal(source.shadow());
     wait_replay_past(&sb_sql, &seeded, "the INSERT").await;
     let on_standby =
         ShadowToastStore::new(Arc::new(sb_bridge)).with_replay_wait_max(Duration::from_millis(300));

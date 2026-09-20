@@ -42,7 +42,6 @@ use futures::{StreamExt, stream as futures_stream};
 use std::fs;
 use std::future::Future;
 use std::pin::Pin;
-use tokio::io::AsyncReadExt;
 use tokio::sync::{Mutex, watch};
 use tokio_postgres::types::PgLsn;
 use tokio_util::sync::CancellationToken;
@@ -2343,32 +2342,13 @@ async fn run_session(
             0 => shadow_floor.bound(resume_safe_lsn),
             s => s.min(resume_safe_lsn.get()).into(),
         };
-        // Never walks back. A crossing commits the fork segment's start, which
-        // `align_down(emitter_ack)` reaches only once descendant WAL fills that
-        // segment; the natural terms must not undo the position a restart
-        // resumes from. A rewind (`--start-lsn`, `--ignore-cursor`) lowers it by
-        // seeding `resume_floor` at the rewind point instead
-        let floor = shadow_floor
-            .bound(manifest::resolved_floor(resume_safe_lsn, durable))
-            .max(resume_floor.get());
-        let floor_timeline = history.floor_branch(
-            floor.get(),
-            live_identity.timeline,
+        let cur = resume_manifest(
+            &history,
+            &live_identity,
+            resume_floor.get(),
+            shadow_floor,
             stream.timeline(),
-            WAL_SEG_SIZE,
-        );
-        let cur = manifest::Manifest {
-            version: manifest::MANIFEST_VERSION,
-            floor,
-            source: manifest::SourceIdentity {
-                system_id: live_identity.system_id,
-                timeline: floor_timeline,
-                timeline_begin: history.begin_of(floor_timeline).unwrap_or(0).into(),
-            },
-            wal: manifest::WalBranch {
-                stream_timeline: stream.timeline(),
-            },
-            lsn: manifest::LsnSet {
+            manifest::LsnSet {
                 source_received: received,
                 filter_durable: durable,
                 shadow_replay,
@@ -2376,7 +2356,7 @@ async fn run_session(
                 emitter_ack: resume_safe_lsn,
                 shadow_flush: shadow_flush_lsn.get(),
             },
-        };
+        );
         if last_cursor_write.is_none_or(|t| t.elapsed() >= cursor_write_interval) {
             manifest::write(&args.spill_dir, &cur)
                 .await
@@ -2812,7 +2792,7 @@ async fn run_session(
         // Re-read rather than reuse the top-of-iteration pair: a crossing commits
         // a new floor and branch mid-iteration, and this is what an operator
         // watches to know the crossing is durable
-        let published_floor = floor.max(resume_floor.get());
+        let published_floor = cur.floor.max(resume_floor.get());
         let published_branch = history.floor_branch(
             published_floor.get(),
             live_identity.timeline,
@@ -3032,29 +3012,15 @@ async fn run_session(
     // `close` zero-pads the final partial to a whole segment, so its fsync
     // publishes a durable end past what the source actually sent
     let durable = Pos::new(durable_lsn.get().get().min(final_received));
-    let floor = manifest::ShadowFloor::new(shadow_toast, shadow_replay.get(), shadow_replay_seed)
-        .bound(manifest::resolved_floor(resume_safe, durable))
-        .max(resume_floor.get());
-    let floor_timeline = history.floor_branch(
-        floor.get(),
-        live_identity.timeline,
-        final_timeline,
-        WAL_SEG_SIZE,
-    );
     manifest::write(
         &args.spill_dir,
-        &manifest::Manifest {
-            version: manifest::MANIFEST_VERSION,
-            floor,
-            source: manifest::SourceIdentity {
-                system_id: live_identity.system_id,
-                timeline: floor_timeline,
-                timeline_begin: history.begin_of(floor_timeline).unwrap_or(0).into(),
-            },
-            wal: manifest::WalBranch {
-                stream_timeline: final_timeline,
-            },
-            lsn: manifest::LsnSet {
+        &resume_manifest(
+            &history,
+            &live_identity,
+            resume_floor.get(),
+            manifest::ShadowFloor::new(shadow_toast, shadow_replay.get(), shadow_replay_seed),
+            final_timeline,
+            manifest::LsnSet {
                 source_received: Pos::new(final_received),
                 filter_durable: durable,
                 shadow_replay,
@@ -3062,7 +3028,7 @@ async fn run_session(
                 emitter_ack: resume_safe,
                 shadow_flush: shadow_flush_lsn.get(),
             },
-        },
+        ),
     )
     .await
     .context("write shutdown resume manifest")?;
@@ -3308,9 +3274,6 @@ fn spawn_mapping_refresher(
 /// Max unsynced segments queued before the pump blocks on `on_segment`;
 const SEGMENT_FSYNC_QUEUE: usize = 64;
 
-/// `pg_default`, PG `catalog/pg_tablespace.dat`
-const DEFAULT_TABLESPACE_OID: u32 = 1663;
-
 #[cfg(target_os = "linux")]
 fn sync_filesystem(fd: std::os::fd::RawFd) -> std::io::Result<()> {
     if unsafe { libc::syncfs(fd) } == 0 {
@@ -3542,18 +3505,7 @@ fn read_process_stats() -> (f64, u64, u64) {
         })
         .unwrap_or(0.0);
     let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
-    let field = |name: &str| -> u64 {
-        status
-            .lines()
-            .find_map(|line| {
-                line.strip_prefix(name)?
-                    .split_whitespace()
-                    .next()?
-                    .parse()
-                    .ok()
-            })
-            .unwrap_or(0)
-    };
+    let field = |name: &str| walshadow::budget::proc_field(&status, name).unwrap_or(0);
     (cpu, field("VmRSS:") * 1024, field("Threads:"))
 }
 
@@ -4143,6 +4095,47 @@ async fn promotion_gate(
 /// which makes the log the only place the wait is legible.
 const BARRIER_LOG_INTERVAL: Duration = Duration::from_secs(2);
 
+/// Manifest for one resume point, floor included. The pump loop's cadence
+/// write and the shutdown write have to land the same floor, so both derive it
+/// here rather than each from the terms it happens to hold
+fn resume_manifest(
+    history: &TimelineHistory,
+    identity: &manifest::SourceIdentity,
+    published_floor: Pos<Floor>,
+    shadow_floor: manifest::ShadowFloor,
+    stream_timeline: u32,
+    lsn: manifest::LsnSet,
+) -> manifest::Manifest {
+    // Never walks back. A crossing commits the fork segment's start, which
+    // `align_down(emitter_ack)` reaches only once descendant WAL fills that
+    // segment; the natural terms must not undo the position a restart
+    // resumes from. A rewind (`--start-lsn`, `--ignore-cursor`) lowers it by
+    // seeding `resume_floor` at the rewind point instead
+    let floor = shadow_floor
+        .bound(manifest::resolved_floor(
+            lsn.emitter_ack,
+            lsn.filter_durable,
+        ))
+        .max(published_floor);
+    let floor_timeline = history.floor_branch(
+        floor.get(),
+        identity.timeline,
+        stream_timeline,
+        WAL_SEG_SIZE,
+    );
+    manifest::Manifest {
+        version: manifest::MANIFEST_VERSION,
+        floor,
+        source: manifest::SourceIdentity {
+            system_id: identity.system_id,
+            timeline: floor_timeline,
+            timeline_begin: history.begin_of(floor_timeline).unwrap_or(0).into(),
+        },
+        wal: manifest::WalBranch { stream_timeline },
+        lsn,
+    }
+}
+
 /// Commit a crossing's resume position: the fork segment's start, on the
 /// descendant. Sound only behind the barrier, which proved nothing below the
 /// fork is still in flight — the floor's contract is that a restart from it
@@ -4720,25 +4713,18 @@ async fn run_bootstrap(
     // and run() adopts the instance
     let mut running_shadow: Option<Arc<Shadow>> = None;
     let shadow_toast_bridge = walshadow::toast::shadow_store::LateBridge::default();
-    let shadow_backed = |cell: &walshadow::toast::shadow_store::LateBridge, cfg: &EmitterConfig| {
-        ToastResolver::with_store(
-            Arc::new(walshadow::toast::shadow_store::ShadowToastStore::late(
-                cell.clone(),
-            )),
+    // Shadow starts before backup WAL processing needs value lookups, so the
+    // store reads through a cell this frame binds later
+    let resolver = match &ch_config {
+        Some(cfg) => ToastResolver::for_mode(
+            cfg,
             bootstrap_stats.clone(),
+            Some(shadow_toast_bridge.clone()),
         )
-        .with_inline_value_max(cfg.inline_value_max)
-        .with_overflow(cfg.inline_value_overflow)
+        .map_err(anyhow::Error::msg)?
         .with_budget(walshadow::budget::MemoryBudget::new(
             cfg.resident_payload_max,
-        ))
-    };
-    // Shadow starts before backup WAL processing needs value lookups
-    let resolver = match &ch_config {
-        Some(cfg) if shadow_toast => shadow_backed(&shadow_toast_bridge, cfg),
-        Some(cfg) => ToastResolver::from_config(cfg, bootstrap_stats.clone()).with_budget(
-            walshadow::budget::MemoryBudget::new(cfg.resident_payload_max),
-        ),
+        )),
         None => ToastResolver::disabled(),
     };
     let store_toast = resolver.stores_chunks();
@@ -4799,86 +4785,16 @@ async fn run_bootstrap(
         None => (None, false, Default::default()),
     };
 
-    // Shadow keeps TOAST heaps and their indexes the way it keeps catalogs:
-    // landed in place by the backup, then replayed. Index filenodes are
-    // absent from catalog seed, so query source for them
-    let mut shadow_toast_rels: ahash::HashSet<(u32, u32)> = ahash::HashSet::default();
-    if shadow_toast {
-        let toast_heaps: Vec<_> = drain_catalog
-            .descriptors()
-            .filter(|d| d.kind == 't')
-            .filter(|d| {
-                tap_filenodes
-                    .as_ref()
-                    .is_none_or(|set| set.contains(&(d.rfn.db_node, d.rfn.rel_node)))
-            })
-            .collect();
-        // Lander keys on `base/<db>/` paths; refuse other tablespaces now
-        // rather than at shadow's first read
-        if let Some(d) = toast_heaps
-            .iter()
-            .find(|d| d.rfn.spc_node != DEFAULT_TABLESPACE_OID)
-        {
-            anyhow::bail!(
-                "bootstrap: TOAST relation {} (filenode {}) is in tablespace {}; \
-                 [toast] mode = shadow keeps files from default tablespace only",
-                d.rel_name,
-                d.rfn.rel_node,
-                d.rfn.spc_node,
-            );
-        }
-        let heaps: Vec<u32> = toast_heaps.iter().map(|d| d.rfn.rel_node).collect();
-        let db_oid = drain_catalog
-            .descriptors()
-            .map(|d| d.rfn.db_node)
-            .next()
-            .unwrap_or_default();
-        for rel in &heaps {
-            shadow_toast_rels.insert((db_oid, *rel));
-        }
-        if !heaps.is_empty() {
-            // Reuse authenticated sidecar client from catalog seed
-            // Interpolate because client has no `oid[]` Rust mapping
-            let list = heaps
-                .iter()
-                .map(u32::to_string)
-                .collect::<Vec<_>>()
-                .join(",");
-            let rows = sql_client
-                .query(
-                    &format!(
-                        "SELECT ic.relfilenode::int8, ic.relname::text, \
-                         coalesce(nullif(ic.reltablespace, 0), \
-                                  (SELECT dattablespace FROM pg_database \
-                                   WHERE datname = current_database()))::int8 \
-                         FROM pg_class t \
-                         JOIN pg_index i ON i.indrelid = t.oid \
-                         JOIN pg_class ic ON ic.oid = i.indexrelid \
-                         WHERE t.relkind = 't' \
-                         AND t.relfilenode = ANY('{{{list}}}'::oid[])"
-                    ),
-                    &[],
-                )
-                .await
-                .context("bootstrap: read toast index filenodes")?;
-            for row in &rows {
-                let spc = row.get::<_, i64>(2) as u32;
-                anyhow::ensure!(
-                    spc == DEFAULT_TABLESPACE_OID,
-                    "bootstrap: TOAST index {} is in tablespace {spc}; \
-                     [toast] mode = shadow keeps files from default tablespace only",
-                    row.get::<_, String>(1),
-                );
-                shadow_toast_rels.insert((db_oid, row.get::<_, i64>(0) as u32));
-            }
-            tracing::info!(
-                target: "walshadow::bootstrap",
-                toast_heaps = heaps.len(),
-                toast_indexes = rows.len(),
-                "landing TOAST storage in shadow",
-            );
-        }
-    }
+    let shadow_toast_rels: ahash::HashSet<(u32, u32)> = if shadow_toast {
+        walshadow::toast::shadow_landing::toast_relations(
+            sql_client,
+            drain_catalog.descriptors().map(Arc::as_ref),
+            tap_filenodes.as_deref(),
+        )
+        .await?
+    } else {
+        ahash::HashSet::default()
+    };
 
     // Off the backup window: provisioning is an initdb + pg_dump + apply +
     // restart, and doing it after `BASE_BACKUP` opens parks a live backup
@@ -6125,16 +6041,16 @@ impl Drop for ShadowLifecycle {
     }
 }
 
-/// Compressions walrus and wal-g write, so a bucket filled under another
-/// configuration stays readable
-const ARCHIVE_WAL_EXTS: &[&str] = &["zst", "br", "lz4", "lzma", ""];
-
 /// Fetch archived WAL for source recovery, returning the bytes that begin at
 /// exactly `start_lsn`. The archive stores whole 16 MiB segment files, so
 /// fetch the single segment containing `start_lsn` (aligned range → one
 /// entry) and slice off the already-consumed prefix — the returned bytes line
 /// up with `WalStream::next_lsn`, which is byte- not segment-aligned in steady
 /// state.
+///
+/// Reading whole into memory keeps a prefetch slot off the staging disk, which
+/// otherwise costs a 32 MiB round trip per 16 MiB of WAL and leaves a tmp file
+/// behind on an aborted leg
 async fn fetch_archive_segment(
     settings: &walrus::config::Settings,
     storage: &walrus::storage::DynStorage,
@@ -6143,7 +6059,7 @@ async fn fetch_archive_segment(
 ) -> Result<(String, Vec<u8>)> {
     let seg_start = WalStream::align_down(start_lsn, WAL_SEG_SIZE);
     let name = segments_covering(timeline, seg_start..seg_start + WAL_SEG_SIZE)[0].format();
-    let mut bytes = read_archive_wal(settings, storage, &name).await?;
+    let mut bytes = walrus::pg::wal::fetch::read_segment(settings, storage, &name).await?;
     if bytes.len() != WAL_SEG_SIZE as usize {
         anyhow::bail!(
             "archived WAL {name} has {} bytes, expected {WAL_SEG_SIZE}",
@@ -6152,42 +6068,6 @@ async fn fetch_archive_segment(
     }
     bytes.drain(..(start_lsn - seg_start) as usize);
     Ok((name, bytes))
-}
-
-/// Read one archived WAL object whole, over the same throttle, decrypt and
-/// decompress chain walrus `wal-fetch` uses. Fetching into memory keeps a
-/// prefetch slot off the staging disk, which otherwise costs a 32 MiB round
-/// trip per 16 MiB of WAL and leaves a tmp file behind on an aborted leg.
-/// Preferred compression is fetched directly, so a uniform bucket costs one
-/// request instead of an existence probe per candidate
-async fn read_archive_wal(
-    settings: &walrus::config::Settings,
-    storage: &walrus::storage::DynStorage,
-    name: &str,
-) -> Result<Vec<u8>> {
-    let preferred = settings.compression.extension();
-    let rest = ARCHIVE_WAL_EXTS.iter().copied().filter(|e| *e != preferred);
-    for ext in std::iter::once(preferred).chain(rest) {
-        let folder = walrus::pg::WAL_FOLDER;
-        let dot = if ext.is_empty() { "" } else { "." };
-        let key = format!("{folder}/{name}{dot}{ext}");
-        let body = match storage.get(&key).await {
-            Ok(body) => body,
-            Err(walrus::storage::StorageError::NotFound(_)) => continue,
-            Err(e) => return Err(anyhow::Error::new(e).context(format!("get {key}"))),
-        };
-        let method = walrus::compression::Method::from_extension(ext)
-            .unwrap_or(walrus::compression::Method::None);
-        let mut decoded =
-            walrus::compression::decode(method, settings.decrypt(settings.throttle_network(body)));
-        let mut bytes = Vec::with_capacity(WAL_SEG_SIZE as usize);
-        decoded
-            .read_to_end(&mut bytes)
-            .await
-            .with_context(|| format!("read {key}"))?;
-        return Ok(bytes);
-    }
-    anyhow::bail!("WAL {name} not found in archive")
 }
 
 /// Fetch WAL `[start_lsn, end_lsn]` from archive storage into shadow's `pg_wal/`.

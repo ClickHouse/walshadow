@@ -330,6 +330,12 @@ pub fn stage(tmp: &Path, port: u16, io_timeout: Duration) -> Cluster {
     Cluster { sh, running: false }
 }
 
+/// Wrap a cluster this fixture did not stage — a `pg_basebackup` clone, say —
+/// so it still stops on drop and shares the helpers below
+pub fn adopt(sh: Shadow) -> Cluster {
+    Cluster { sh, running: false }
+}
+
 impl Cluster {
     pub fn shadow(&self) -> &Shadow {
         &self.sh

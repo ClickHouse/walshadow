@@ -3,7 +3,7 @@ mod fx;
 
 use std::sync::Arc;
 
-use walshadow::backfill_staging::{StagingSession, prepare, prepare_reusing};
+use walshadow::backfill_staging::{StagingSession, prepare};
 use walshadow::backfill_types::BackupRequest;
 use walshadow::backup_checkpoint::BackupCheckpoint;
 use walshadow::ch_emitter::EmitterConfig;
@@ -51,7 +51,9 @@ async fn checkpoint_reuses_staging_and_rejects_replaced_table() {
             attributes: Vec::new(),
         }),
     }];
-    let plan = prepare(emitter.clone(), &mapping, &requests).await.unwrap();
+    let plan = prepare(emitter.clone(), &mapping, &requests, false)
+        .await
+        .unwrap();
     let snapshot = mapping.snapshot().await;
     let mut checkpoint = BackupCheckpoint::new(
         InitialLoadMode::ObjectStore,
@@ -75,7 +77,7 @@ async fn checkpoint_reuses_staging_and_rejects_replaced_table() {
     let resumed = BackupCheckpoint::load(dir.path()).await.unwrap().unwrap();
     assert!(resumed.matches(&checkpoint));
     assert!(resumed.staging_intact(&mut session).await.unwrap());
-    prepare_reusing(emitter.clone(), &mapping, &requests, true)
+    prepare(emitter.clone(), &mapping, &requests, true)
         .await
         .unwrap();
     assert!(resumed.staging_intact(&mut session).await.unwrap());
@@ -100,6 +102,6 @@ async fn checkpoint_reuses_staging_and_rejects_replaced_table() {
         &emitter,
         None
     )));
-    prepare(emitter, &mapping, &requests).await.unwrap();
+    prepare(emitter, &mapping, &requests, false).await.unwrap();
     assert!(!resumed.staging_intact(&mut session).await.unwrap());
 }

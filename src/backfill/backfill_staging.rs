@@ -75,15 +75,10 @@ pub struct StagingPlan {
 
 /// Rebuild one staging table per mapped rel (`DROP` + `CREATE .. AS` clones
 /// structure and engine) and snapshot the routing map against them.
+///
+/// `reuse` keeps the existing tables: a resumed pass is vouched for by rows
+/// already in them, so rebuilding would throw its own progress away
 pub async fn prepare(
-    emitter: Arc<EmitterConfig>,
-    live: &MappingHandle,
-    reqs: &[BackupRequest],
-) -> Result<StagingPlan> {
-    prepare_reusing(emitter, live, reqs, false).await
-}
-
-pub async fn prepare_reusing(
     emitter: Arc<EmitterConfig>,
     live: &MappingHandle,
     reqs: &[BackupRequest],

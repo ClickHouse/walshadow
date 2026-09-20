@@ -18,7 +18,7 @@ use crate::backfill::backup_page_walk::{BOOTSTRAP_TUPLE_CHANNEL_CAP, BackfillTup
 use crate::backfill::bootstrap_marker::SpooledRecords;
 use crate::backfill::spool::{DEFERRED_SPOOL_MEM_MAX, DeferredSpool};
 use crate::backfill::visibility_pending::{PendingManifest, PendingSpool};
-use crate::backfill::walk_barrier::{Ticker, WALK_CHECKPOINT_PERIOD, WalkBarrier};
+use crate::backfill::walk_barrier::{WALK_CHECKPOINT_PERIOD, WalkBarrier};
 use crate::config::ResolvedConfig;
 use crate::decode::visibility::{
     HEAP_XMAX_IS_MULTI, PgXactPatch, PgXactView, Visibility, deferred_xids, read_pg_multixact,
@@ -32,6 +32,7 @@ use crate::emit::pipeline::tail::OwnedTail;
 use crate::emit::pipeline::{Fatal, bootstrap};
 use crate::mapping::MappingSnapshot;
 use crate::schema::RelName;
+use crate::ticker::Ticker;
 use crate::toast::ToastResolver;
 use ahash::HashSet;
 
@@ -517,12 +518,12 @@ pub async fn resolve_greenfield(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backfill::backup_checkpoint::SpoolMark;
     use crate::backfill::backup_page_walk::{
         PAGE_BYTES, PageWalkSink, make_rel, make_rel_named, synth_single_tuple_page,
     };
-    use crate::backfill::backup_source::{BackupSink, FileAction, FileKind, FileMeta, StartInfo};
+    use crate::backfill::backup_source::{BackupSink, FileAction, FileMeta, StartInfo};
     use crate::backfill::spool::DEFERRED_SPOOL_MEM_MAX;
+    use crate::backfill::spool::SpoolMark;
     use crate::decode::visibility::{
         HEAP_XMAX_COMMITTED, HEAP_XMAX_INVALID, HEAP_XMAX_IS_MULTI, HEAP_XMIN_COMMITTED,
         HEAP_XMIN_INVALID,
@@ -590,8 +591,7 @@ mod tests {
                 path: PathBuf::from(path),
                 size: u64::from(pages) * PAGE_BYTES as u64,
                 mode: 0o600,
-                kind: FileKind::File,
-                part: None,
+                ..Default::default()
             };
             let FileAction::Tap(mut entry) = sink.begin(&meta).await.unwrap() else {
                 panic!("{path} must tap");

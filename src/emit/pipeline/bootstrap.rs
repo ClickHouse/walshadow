@@ -9,10 +9,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::sync::mpsc;
 
-use crate::backfill::backup_checkpoint::SpoolMark;
 use crate::backfill::backup_page_walk::{BackfillTuple, CatalogMap};
-use crate::backfill::spool::{DeferredReader, DeferredSpool};
-use crate::backfill::walk_barrier::{Ticker, WALK_CHECKPOINT_PERIOD, WalkBarrier};
+use crate::backfill::spool::{DeferredReader, DeferredSpool, SpoolMark};
+use crate::backfill::walk_barrier::{WALK_CHECKPOINT_PERIOD, WalkBarrier};
 use crate::config::ResolvedConfig;
 use crate::decode::heap_decoder::{ColumnValue, ToastPointer};
 use crate::emit::ch_emitter::EmitterStats;
@@ -23,6 +22,7 @@ use crate::emit::route::{RouteSnapshot, RowPolicy, freeze_routes};
 use crate::mapping::{MappingSnapshot, TableMapping};
 use crate::ops::oracle::render_ext_columns;
 use crate::schema::{RelDescriptor, RelName};
+use crate::ticker::Ticker;
 use crate::toast::{
     FetchedValue, ToastResolver, ToastRow, check_value_caps, detoasted_value, finish_value,
     pointer_extsize,
@@ -577,14 +577,7 @@ fn fill_oversize(
     sites: &mut Vec<PointerSite>,
     resolver: &ToastResolver,
 ) {
-    sites.retain(|site| {
-        if !resolver.value_oversize(&site.p) {
-            return true;
-        }
-        resolver.note_filled_oversize();
-        tuple.columns[site.idx] = Some(ColumnValue::Null);
-        false
-    });
+    sites.retain(|site| !resolver.fill_oversize(&mut tuple.columns[site.idx], &site.p));
 }
 
 /// Batch whose values are resolved, holding the leaf permit its rows ride

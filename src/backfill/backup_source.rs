@@ -52,8 +52,9 @@ crate::atomic_stats! {
 
 /// Filesystem-object kind. Tar-driven sources translate tar entry types
 /// here; the trait does not expose tar.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum FileKind {
+    #[default]
     File,
     Dir,
     /// `target` is the resolved path; PG tablespace symlinks carry
@@ -71,7 +72,7 @@ pub enum FileKind {
 /// - `pg_control` controlfile
 /// - `pg_tblspc/16384` tablespace symlink
 /// - `pg_xact/0000` transaction-status file
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct FileMeta {
     pub path: PathBuf,
     pub size: u64,

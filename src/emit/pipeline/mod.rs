@@ -220,7 +220,9 @@ impl PipelineConfig {
             crate::toast::ToastResolver::for_mode(
                 &emitter,
                 stats.clone(),
-                oracle.as_ref().map(|o| o.bridge()),
+                oracle
+                    .as_ref()
+                    .map(|o| crate::toast::shadow_store::bound(o.bridge())),
             )
             .map_err(EmitterError::Config)?
         }

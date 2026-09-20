@@ -321,16 +321,22 @@ fn read_usize(path: &str) -> Option<usize> {
     std::fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
-fn read_mem_total(path: &str) -> Option<usize> {
-    let kb: usize = std::fs::read_to_string(path)
-        .ok()?
-        .lines()
-        .find_map(|l| l.strip_prefix("MemTotal:"))?
+/// First number on a `Key:  N ...` line, as `/proc/meminfo` and
+/// `/proc/self/status` write them
+pub fn proc_field(text: &str, key: &str) -> Option<u64> {
+    text.lines()
+        .find_map(|l| l.strip_prefix(key))?
         .split_whitespace()
         .next()?
         .parse()
-        .ok()?;
-    kb.checked_mul(1024)
+        .ok()
+}
+
+fn read_mem_total(path: &str) -> Option<usize> {
+    let text = std::fs::read_to_string(path).ok()?;
+    usize::try_from(proc_field(&text, "MemTotal:")?)
+        .ok()?
+        .checked_mul(1024)
 }
 
 fn units_for(bytes: usize) -> u32 {
