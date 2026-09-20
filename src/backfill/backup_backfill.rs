@@ -66,7 +66,7 @@ use crate::backfill::visibility_pending::{self, PendingSpool};
 use crate::backfill::wal_replay::{
     ReplayStats, ReplayTargets, SegmentPump, WalReplayInputs, WalReplaySink, pump_segments_through,
 };
-use crate::backfill::walk_barrier::{Ticker, WALK_CHECKPOINT_PERIOD, WalkBarrier};
+use crate::backfill::walk_barrier::{WALK_CHECKPOINT_PERIOD, WalkBarrier};
 use crate::decode::heap_decoder::{XLOG_HEAP_OPMASK, XLOG_HEAP_TRUNCATE};
 use crate::decode::visibility::{PgMultiXactAccum, PgXactAccum, PgXactPatch, PgXactView};
 use crate::decode::wal_xact::{
@@ -84,6 +84,7 @@ use crate::runtime_config::InitialLoadMode;
 use crate::schema::RelDescriptor;
 use crate::source::archive_history;
 use crate::source::timeline::TimelineHistory;
+use crate::ticker::Ticker;
 use crate::toast::ToastResolver;
 use crate::xact::xact_buffer::{XactBuffer, XactBufferConfig};
 use ahash::{HashMap, HashSet, HashSetExt};
@@ -199,7 +200,7 @@ async fn run_object_store_pass(ctx: &PassContext, reqs: &[BackupRequest]) -> Res
     let (patch, gap_segments) = if b_redo < s_max {
         // Only a replay leg reads the archive's own WAL, so only it needs the
         // archive to agree on the chain serving those segments
-        archive_history::verify(settings, &storage, &seg_dir, &history)
+        archive_history::verify(settings, &storage, &history)
             .await
             .context("backup_backfill: cross-check archived timeline history")?;
         let names =

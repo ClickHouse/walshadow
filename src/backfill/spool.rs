@@ -20,7 +20,6 @@ use std::path::PathBuf;
 use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader};
 
-use crate::backfill::backup_checkpoint::SpoolMark;
 use crate::backfill::backup_page_walk::BackfillTuple;
 use crate::xact::spill::{
     Cursor, SpillError, decode_value, encode_value, push_u8, push_u16, push_u32, push_u64,
@@ -49,6 +48,15 @@ pub struct DeferredSpool {
     records: u64,
     spooled_bytes: u64,
     read_offset: u64,
+}
+
+/// Durable length of an append-only spool. Records pair with bytes so
+/// [`DeferredSpool::reopen_at`] can refuse a file a crash left shorter than
+/// whoever recorded the mark counted
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SpoolMark {
+    pub records: u64,
+    pub bytes: u64,
 }
 
 /// Records and bytes, never the buffered tuples

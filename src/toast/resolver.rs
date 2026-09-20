@@ -1024,11 +1024,12 @@ impl ToastResolver {
         Self::with_limits(store, emitter, stats)
     }
 
-    /// Build resolver for configured mode. Shadow requires `bridge`
+    /// Build resolver for configured mode. Shadow requires `bridge`, which
+    /// bootstrap binds only once it has started PostgreSQL
     pub fn for_mode(
         emitter: &EmitterConfig,
         stats: Arc<EmitterStats>,
-        bridge: Option<Arc<crate::ops::bridge::Bridge>>,
+        bridge: Option<crate::toast::shadow_store::LateBridge>,
     ) -> Result<Self, String> {
         if !emitter.toast.mode.is_shadow() {
             return Ok(Self::from_config(emitter, stats));
@@ -1039,9 +1040,9 @@ impl ToastResolver {
                 .to_string()
         })?;
         Ok(Self::with_limits(
-            Some(Arc::new(crate::toast::shadow_store::ShadowToastStore::new(
-                bridge,
-            ))),
+            Some(Arc::new(
+                crate::toast::shadow_store::ShadowToastStore::late(bridge),
+            )),
             emitter,
             stats,
         ))
@@ -1116,6 +1117,17 @@ impl ToastResolver {
     /// Return whether value exceeds limit
     pub fn value_oversize(&self, p: &ToastPointer) -> bool {
         pointer_footprint(p) > self.inline_value_max
+    }
+
+    /// Replace an oversized value in place, counting the fill. True when the
+    /// pointer is settled and needs no fetch
+    pub fn fill_oversize(&self, col: &mut Option<ColumnValue>, p: &ToastPointer) -> bool {
+        if !self.value_oversize(p) {
+            return false;
+        }
+        self.note_filled_oversize();
+        *col = Some(ColumnValue::Null);
+        true
     }
 
     pub fn budget(&self) -> Option<&crate::budget::MemoryBudget> {

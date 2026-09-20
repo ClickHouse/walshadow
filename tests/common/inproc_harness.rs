@@ -692,16 +692,9 @@ pub async fn build_pipeline_with(
 }
 
 /// `build_pipeline` with the oracle wired in, so oracle-routed columns convert
-/// to Native through the shadow's `walshadow` module (architecture/values.md).
-pub async fn build_pipeline_with_oracle(
-    args: BuildPipelineArgs<'_>,
-    oracle: Arc<walshadow::oracle::Oracle>,
-) -> Pipeline {
-    build_pipeline_inner(args, |_| {}, Some(oracle)).await
-}
-
-/// Both at once: `[toast] mode = "shadow"` needs the oracle's bridge to
-/// read through and the config to select it
+/// to Native through the shadow's `walshadow` module (architecture/values.md),
+/// and with final say over the emitter config — `[toast] mode = "shadow"`
+/// wants both, since it reads values through the oracle's bridge
 pub async fn build_pipeline_tuned(
     args: BuildPipelineArgs<'_>,
     tune: impl FnOnce(&mut EmitterConfig),
@@ -873,7 +866,9 @@ async fn build_pipeline_inner(
     }
 
     tune(&mut emitter_cfg);
-    // Match `bin/stream.rs`: replay WAL for every relation stored by shadow
+    // Stand in for bootstrap, which seeds eligibility from the source catalog
+    // and persists it for the next boot to load. No harness runs bootstrap, so
+    // take what shadow already holds, then persist on the same path
     if emitter_cfg.toast.mode.is_shadow() {
         let rels = walshadow::backfill::pg_path::user_relation_filenodes(
             &shadow.config().data_dir,
@@ -882,6 +877,11 @@ async fn build_pipeline_inner(
         .await
         .expect("list shadow relations");
         stream.filter_mut().keep_user_rels(rels, 0);
+        stream
+            .filter_mut()
+            .persist_shadow_rels(&shadow.config().data_dir)
+            .await
+            .expect("persist shadow replay eligibility");
     }
     let pending_cfg = emitter_cfg.pending_capture;
     let pending_catalog = Arc::new(walshadow::pending::PendingCatalog::default());

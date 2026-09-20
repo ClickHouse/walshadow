@@ -1175,8 +1175,7 @@ mod tests {
             path: PathBuf::from(path),
             size: PAGE_BYTES as u64,
             mode: 0o600,
-            kind: FileKind::File,
-            part: None,
+            ..Default::default()
         }
     }
     use crate::schema::RelName;
@@ -1481,8 +1480,7 @@ mod tests {
             path: PathBuf::from("base/5/16400"),
             size: 0,
             mode: 0,
-            kind: FileKind::File,
-            part: None,
+            ..Default::default()
         });
         assert_eq!(
             m,
@@ -1671,8 +1669,7 @@ mod tests {
                 path: PathBuf::from("pg_control"),
                 size: 0,
                 mode: 0,
-                kind: FileKind::File,
-                part: None,
+                ..Default::default()
             })
             .await
             .unwrap(),

@@ -113,7 +113,7 @@ async fn run_oracle_stats(
     );
     let oracle = Arc::new(Oracle::new(Arc::new(bridge)));
 
-    let mut pipeline = fx::build_pipeline_with_oracle(
+    let mut pipeline = fx::build_pipeline_tuned(
         fx::BuildPipelineArgs {
             tmp: &tmp,
             source: &source,
@@ -126,7 +126,8 @@ async fn run_oracle_stats(
             app_name,
             ddl: None,
         },
-        oracle.clone(),
+        |_| {},
+        Some(oracle.clone()),
     )
     .await;
 

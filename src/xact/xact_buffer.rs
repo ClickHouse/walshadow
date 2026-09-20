@@ -2462,9 +2462,7 @@ impl ValueResolution<'_> {
             };
             // `ToastPointer: Copy` frees the borrow on `col` before reassign
             let p: ToastPointer = *p;
-            if self.resolver.value_oversize(&p) {
-                self.resolver.note_filled_oversize();
-                *col = Some(ColumnValue::Null);
+            if self.resolver.fill_oversize(col, &p) {
                 continue;
             }
             let type_oid = rel.attributes.get(idx).map(|a| a.type_oid).unwrap_or(0);

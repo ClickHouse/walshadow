@@ -981,10 +981,9 @@ impl CopyBackfiller {
             None => BackupCheckpoint::discard(&scratch_dir).await?,
         }
         let resuming = checkpoint.resuming();
-        let staging =
-            backfill_staging::prepare_reusing(dest.clone(), &self.mapping, reqs, resuming)
-                .await
-                .context("staging prepare")?;
+        let staging = backfill_staging::prepare(dest.clone(), &self.mapping, reqs, resuming)
+            .await
+            .context("staging prepare")?;
         if !resuming {
             let mut session = backfill_staging::StagingSession::connect(dest.clone()).await?;
             checkpoint.capture_staging(&staging, &mut session).await?;

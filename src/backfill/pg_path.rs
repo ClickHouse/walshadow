@@ -66,6 +66,12 @@ pub fn parse_base_path(path: &Path) -> Option<BaseRelFile> {
 /// Find user relations with main forks under shadow's `base/<db_oid>/`
 ///
 /// Skip initdb filenodes. Catalog routing handles rotated catalog files first
+///
+/// Not a daemon path: recovery can recreate a file without its pages, so
+/// replay eligibility is durable state
+/// ([`crate::filter::shadow_relations`]), never inferred from the directory.
+/// Here for callers that have no eligibility file to read, such as tests
+/// standing in for bootstrap
 pub async fn user_relation_filenodes(
     data_dir: &Path,
     db_oid: u32,

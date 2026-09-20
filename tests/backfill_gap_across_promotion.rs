@@ -235,7 +235,7 @@ async fn gap_replay_crosses_a_promotion() {
         2,
         "source pins the branch, not the archive"
     );
-    archive_history::verify(&settings, &storage, &seg_dir, &history)
+    archive_history::verify(&settings, &storage, &history)
         .await
         .expect("archive records the chain the source serves");
     drop(feed);

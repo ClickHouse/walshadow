@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::backfill::backfill_staging::{StagingPlan, StagingSession};
 use crate::backfill::backfill_types::{BackupRequest, WalkCounts};
+use crate::backfill::spool::SpoolMark;
 use crate::config::ResolvedConfig;
 use crate::emit::ch_emitter::EmitterConfig;
 use crate::mapping::MappingSnapshot;
@@ -29,15 +30,6 @@ pub fn digest<'a>(parts: impl IntoIterator<Item = &'a [u8]>) -> u64 {
         h.write(part);
     }
     h.finish()
-}
-
-/// Durable length of an append-only spool. Records pair with bytes so
-/// [`crate::backfill::spool::DeferredSpool::reopen_at`] can refuse a file a
-/// crash left shorter than the checkpoint counted
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SpoolMark {
-    pub records: u64,
-    pub bytes: u64,
 }
 
 /// Page-walk progress. A heap file lands here only once every tuple it

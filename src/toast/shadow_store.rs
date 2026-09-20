@@ -30,6 +30,14 @@ const REPLAY_WAIT_MAX: Duration = Duration::from_secs(900);
 /// Bridge populated after bootstrap starts PostgreSQL
 pub type LateBridge = Arc<tokio::sync::OnceCell<Arc<Bridge>>>;
 
+/// Already-dialled bridge as a [`LateBridge`], so callers holding either
+/// reach the same constructors
+pub fn bound(bridge: Arc<Bridge>) -> LateBridge {
+    let cell = LateBridge::default();
+    cell.set(bridge).ok();
+    cell
+}
+
 pub struct ShadowToastStore {
     bridge: LateBridge,
     replay_wait_max: Duration,
@@ -37,9 +45,7 @@ pub struct ShadowToastStore {
 
 impl ShadowToastStore {
     pub fn new(bridge: Arc<Bridge>) -> Self {
-        let cell = LateBridge::default();
-        cell.set(bridge).ok();
-        Self::late(cell)
+        Self::late(bound(bridge))
     }
 
     /// Create store that waits for bridge to become available

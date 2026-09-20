@@ -20,37 +20,11 @@ use ahash::HashSet;
 use std::time::Duration;
 
 use tokio::sync::Mutex;
-use tokio::time::Instant;
 
-use crate::backfill::backup_checkpoint::SpoolMark;
+use crate::backfill::spool::SpoolMark;
 
 /// Seconds between stage publishes and checkpoint writes
 pub const WALK_CHECKPOINT_PERIOD: Duration = Duration::from_secs(30);
-
-/// Periodic gate on the publishing stages, so a checkpoint costs one fsync per
-/// spool per period whatever the tuple rate
-pub struct Ticker {
-    period: Duration,
-    next: Instant,
-}
-
-impl Ticker {
-    pub fn new(period: Duration) -> Self {
-        Self {
-            period,
-            next: Instant::now() + period,
-        }
-    }
-
-    pub fn fire(&mut self) -> bool {
-        let now = Instant::now();
-        if now < self.next {
-            return false;
-        }
-        self.next = now + self.period;
-        true
-    }
-}
 
 #[derive(Clone, Copy, Default)]
 struct DrainReport {
@@ -253,14 +227,5 @@ mod tests {
             barrier.settled_parts(&recorded).await.is_empty(),
             "a settled part is not offered twice"
         );
-    }
-
-    #[test]
-    fn ticker_fires_once_per_period() {
-        let mut ticker = Ticker::new(Duration::from_secs(30));
-        assert!(!ticker.fire());
-        ticker.next = Instant::now();
-        assert!(ticker.fire());
-        assert!(!ticker.fire());
     }
 }

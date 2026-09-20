@@ -180,6 +180,7 @@ impl Fixture {
                 desc: self.desc.clone(),
                 s_lsn: 100,
             }],
+            false,
         )
         .await
         .unwrap();
