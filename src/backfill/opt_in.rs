@@ -43,6 +43,12 @@ pub trait Backfiller: Send + Sync {
     );
 
     async fn note_opt_out(&self, rel: &RelName);
+
+    /// Why this backfiller cannot serve `mode`, so callers refuse the request
+    /// before creating a destination it would leave empty
+    fn refuses(&self, _mode: InitialLoadMode) -> Option<&'static str> {
+        None
+    }
 }
 
 /// Dispatch one `config_table` row's inclusion intent. `opt_in_lsn` is the
@@ -153,6 +159,18 @@ async fn opt_in_known(
     row: &TableRow,
     opt_in_lsn: u64,
 ) -> Result<(), EmitterError> {
+    if let Some(mode) = row.initial_load.as_deref().and_then(|m| m.parse().ok())
+        && let Some(reason) = backfiller.and_then(|b| b.refuses(mode))
+    {
+        tracing::error!(
+            target: "walshadow::config",
+            qname = %desc.rel_name,
+            mode = mode.as_str(),
+            reason,
+            "initial_load unsupported here; table left out of scope",
+        );
+        return Ok(());
+    }
     if !applicator.ensure_ch_table(desc).await? {
         return Ok(());
     }

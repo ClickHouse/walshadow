@@ -49,20 +49,45 @@ enum CtlCommand {
     /// Show effective config with passwords masked
     Show,
     /// List source tables, optionally within one schema
-    Tables { schema: Option<String> },
+    Tables {
+        schema: Option<String>,
+        /// Source database to read, default `[source] dbname`
+        #[arg(long)]
+        database: Option<String>,
+    },
     /// List source schemas
-    Schemas,
+    Schemas {
+        /// Source database to read, default `[source] dbname`
+        #[arg(long)]
+        database: Option<String>,
+    },
     /// List source columns
-    Columns { schema: String, table: String },
+    Columns {
+        schema: String,
+        table: String,
+        /// Source database to read, default `[source] dbname`
+        #[arg(long)]
+        database: Option<String>,
+    },
     /// Start replicating one table
     Add {
         schema: String,
         table: String,
         #[arg(long, value_enum)]
         initial_load: Option<InitialLoad>,
+        /// Nest under `[database.<dbname>]` to name another source database
+        /// Defaults to `[source] dbname`
+        #[arg(long)]
+        database: Option<String>,
     },
     /// Stop replicating one table, retain ClickHouse table
-    Remove { schema: String, table: String },
+    Remove {
+        schema: String,
+        table: String,
+        /// Name another source database, see `add --database`
+        #[arg(long)]
+        database: Option<String>,
+    },
     /// Freeze WAL consumption
     Pause,
     /// Resume WAL consumption
@@ -108,7 +133,7 @@ impl CtlCommand {
             Self::Status => Ok(sugar("status", Table::new())),
             Self::Show => Ok(sugar("show", Table::new())),
             Self::Reload => Ok(sugar("reload", Table::new())),
-            Self::Schemas => Ok(sugar("schemas", Table::new())),
+            Self::Schemas { database } => Ok(sugar("schemas", db_body(database.as_deref()))),
             Self::Pause => Ok(sugar(
                 "apply",
                 section("stream", pair("paused", true.into())),
@@ -117,15 +142,20 @@ impl CtlCommand {
                 "apply",
                 section("stream", pair("paused", false.into())),
             )),
-            Self::Tables { schema } => {
-                let mut body = Table::new();
+            Self::Tables { schema, database } => {
+                let mut body = db_body(database.as_deref());
                 if let Some(schema) = schema {
                     body.insert("namespace".into(), schema.into());
                 }
                 Ok(sugar("tables", body))
             }
-            Self::Columns { schema, table } => {
-                let mut body = pair("namespace", schema.into());
+            Self::Columns {
+                schema,
+                table,
+                database,
+            } => {
+                let mut body = db_body(database.as_deref());
+                body.insert("namespace".into(), schema.into());
                 body.insert("relname".into(), table.into());
                 Ok(sugar("columns", body))
             }
@@ -133,16 +163,27 @@ impl CtlCommand {
                 schema,
                 table,
                 initial_load,
+                database,
             } => {
                 let mut block = pair("replicate", true.into());
                 if let Some(mode) = initial_load {
                     block.insert("initial_load".into(), mode.as_str().into());
                 }
-                Ok(sugar("apply", table_block(&schema, &table, block)))
+                Ok(sugar(
+                    "apply",
+                    table_block(database.as_deref(), &schema, &table, block),
+                ))
             }
-            Self::Remove { schema, table } => {
+            Self::Remove {
+                schema,
+                table,
+                database,
+            } => {
                 let block = pair("replicate", false.into());
-                Ok(sugar("apply", table_block(&schema, &table, block)))
+                Ok(sugar(
+                    "apply",
+                    table_block(database.as_deref(), &schema, &table, block),
+                ))
             }
             Self::Source { url } => Ok(sugar(
                 "apply",
@@ -279,16 +320,22 @@ fn section(name: &str, body: Table) -> Table {
     root
 }
 
-/// `[table.<ns>.<rel>]`, the two name parts kept separate all the way down
-fn table_block(ns: &str, rel: &str, block: Table) -> Table {
-    section(
-        "table",
-        section(ns, {
-            let mut t = Table::new();
-            t.insert(rel.into(), Value::Table(block));
-            t
-        }),
-    )
+/// Request body naming one source database to read
+fn db_body(db: Option<&str>) -> Table {
+    let mut body = Table::new();
+    if let Some(db) = db {
+        body.insert("database".into(), db.into());
+    }
+    body
+}
+
+/// Keep database, schema, and table names as separate TOML keys
+fn table_block(db: Option<&str>, ns: &str, rel: &str, block: Table) -> Table {
+    let scoped = section("table", section(ns, pair(rel, Value::Table(block))));
+    let Some(db) = db else {
+        return scoped;
+    };
+    section("database", section(db, scoped))
 }
 
 #[cfg(test)]
@@ -311,6 +358,21 @@ mod tests {
         assert_eq!(
             toml::to_string(&c.body).unwrap(),
             "[table.public.users]\ninitial_load = \"copy\"\nreplicate = true\n"
+        );
+    }
+
+    /// Nest entries under `[database.<dbname>]` to name another database
+    #[test]
+    fn add_can_name_the_source_database() {
+        let c = cmd(&["add", "public", "users", "--database", "app"]);
+        assert_eq!(
+            toml::to_string(&c.body).unwrap(),
+            "[database.app.table.public.users]\nreplicate = true\n"
+        );
+        let c = cmd(&["remove", "public", "users", "--database", "app"]);
+        assert_eq!(
+            toml::to_string(&c.body).unwrap(),
+            "[database.app.table.public.users]\nreplicate = false\n"
         );
     }
 

@@ -90,6 +90,9 @@ pub(crate) const DEFAULT_DECODE_CHUNK_ROWS: usize = 1024;
 /// Per-replica connection + mapping config. TOML `[ch]` table holds
 /// connection params, `[table.<namespace>.<relname>]` blocks declare
 /// per-relation mapping; parse via [`EmitterConfig::from_toml_str`].
+///
+/// `[database.<dbname>.table.<namespace>.<relname>]` names a table in another
+/// database of the cluster; entries outside `[database.*]` use `[source] dbname`
 #[derive(Debug, Clone)]
 pub struct EmitterConfig {
     pub host: String,
@@ -140,6 +143,9 @@ pub struct EmitterConfig {
     /// Per-namespace defaults keyed on PG schema name; per-table
     /// entries in `tables` win for the relation they name
     pub namespaces: HashMap<String, NamespaceMapping>,
+    /// Sorted database names from `[source] dbname` and table or namespace prefixes
+    /// Keep same order for every database, bridge socket numbering depends on it
+    pub databases: Vec<String>,
     /// Global `--drop-table-strategy` default; per-namespace override
     /// via `[namespace.<ns>] drop_table_strategy = ...`
     pub drop_table_strategy: DropTableStrategy,
@@ -266,7 +272,7 @@ pub struct BootstrapSettings {
     #[serde(default, deserialize_with = "crate::toml_de::de_from_str")]
     pub mode: Option<BootstrapMode>,
     /// `backup_name`: `LATEST` or a literal `base_…` name. The
-    /// `base_`-prefix check lives in `bin/stream.rs`, next to the
+    /// `base_`-prefix check lives in `bin/stream/bootstrap.rs`, next to the
     /// object-store dispatch that consumes it
     pub backup_name: Option<String>,
     /// `object_store_parallelism`: in-flight data parts. `None` leaves
@@ -418,6 +424,7 @@ impl Default for EmitterConfig {
             replicate_all: true,
             pending_capture: Default::default(),
             namespaces: HashMap::new(),
+            databases: Vec::new(),
             drop_table_strategy: DropTableStrategy::default(),
             retry: RetryConfig::default(),
             insert_timeout: Duration::from_secs(DEFAULT_INSERT_TIMEOUT_SECS),
@@ -637,10 +644,154 @@ struct ConfigDocument {
     bootstrap: BootstrapSettings,
     #[serde(default)]
     toast: ToastSettings,
+    /// `[namespace.<schema>]`
+    #[serde(default)]
+    namespace: BTreeMap<String, NamespacePatch>,
+    /// `[table.<schema>.<relname>]`
+    #[serde(default)]
+    table: BTreeMap<String, BTreeMap<String, TablePatch>>,
+    /// Other source databases, `[database.<dbname>.table.<schema>.<relname>]`
+    #[serde(default)]
+    database: BTreeMap<String, DbEntries>,
+}
+
+/// Schema and table settings for one source database
+#[derive(Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DbEntries {
     #[serde(default)]
     namespace: BTreeMap<String, NamespacePatch>,
     #[serde(default)]
     table: BTreeMap<String, BTreeMap<String, TablePatch>>,
+}
+
+/// Return `(namespace, relname, settings)` entries for source database `dbname`
+/// Unprefixed entries belong to `[source] dbname`, as in
+/// [`EmitterConfig::for_database`]; leave validation to
+/// [`EmitterConfig::from_table`]
+pub fn table_entries_for<'t>(
+    root: &'t toml::Table,
+    dbname: &str,
+) -> Vec<(&'t str, &'t str, &'t toml::Table)> {
+    let unprefixed = root
+        .get("source")
+        .and_then(toml::Value::as_table)
+        .and_then(|t| t.get("dbname"))
+        .and_then(toml::Value::as_str)
+        .unwrap_or_default()
+        == dbname;
+    let prefixed = root
+        .get("database")
+        .and_then(toml::Value::as_table)
+        .and_then(|dbs| dbs.get(dbname))
+        .and_then(toml::Value::as_table)
+        .and_then(|db| db.get("table"));
+    let mut out = Vec::new();
+    for schemas in unprefixed
+        .then(|| root.get("table"))
+        .flatten()
+        .into_iter()
+        .chain(prefixed)
+        .filter_map(toml::Value::as_table)
+    {
+        for (ns, value) in schemas {
+            let Some(rels) = value.as_table() else {
+                continue;
+            };
+            out.extend(
+                rels.iter()
+                    .filter_map(|(rel, v)| v.as_table().map(|t| (ns.as_str(), rel.as_str(), t))),
+            );
+        }
+    }
+    out
+}
+
+fn duplicate_entry(ctx: &str) -> EmitterError {
+    EmitterError::Config(format!(
+        "`{ctx}` is configured twice, with and without a `database` prefix"
+    ))
+}
+
+/// Fold entries that name no database into the ones `[source] dbname` owns
+fn fold_unprefixed(
+    into: &mut DbEntries,
+    namespace: BTreeMap<String, NamespacePatch>,
+    table: BTreeMap<String, BTreeMap<String, TablePatch>>,
+) -> Result<(), EmitterError> {
+    for (ns, patch) in namespace {
+        if into.namespace.insert(ns.clone(), patch).is_some() {
+            return Err(duplicate_entry(&format!("namespace.{ns}")));
+        }
+    }
+    for (ns, rels) in table {
+        let schema = into.table.entry(ns.clone()).or_default();
+        for (rel, patch) in rels {
+            if schema.insert(rel.clone(), patch).is_some() {
+                return Err(duplicate_entry(&format!("table.{ns}.{rel}")));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A cluster backup walks one database's pages, so a load sourced from one
+/// covers `[source] dbname` alone. Reject the other databases' requests where
+/// the operator writes them, not after a pass starts
+fn reject_backup_loads(db: &str, entries: &DbEntries) -> Result<(), EmitterError> {
+    let backup = |mode: Option<InitialLoadMode>| {
+        mode.filter(|m| {
+            matches!(
+                m,
+                InitialLoadMode::BaseBackup | InitialLoadMode::ObjectStore
+            )
+        })
+    };
+    let refuse = |ctx: String, mode: InitialLoadMode| {
+        Err(EmitterError::Config(format!(
+            "`{ctx}`: initial_load = \"{}\" loads from a cluster backup, which \
+             covers only the database `[source] dbname` names; use \"copy\" for \
+             `{db}`",
+            mode.as_str()
+        )))
+    };
+    for (ns, patch) in &entries.namespace {
+        if let Some(mode) = backup(patch.initial_load) {
+            return refuse(format!("database.{db}.namespace.{ns}"), mode);
+        }
+    }
+    for (ns, rels) in &entries.table {
+        for (rel, patch) in rels {
+            if let Some(mode) = backup(patch.initial_load) {
+                return refuse(format!("database.{db}.table.{ns}.{rel}"), mode);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Resolve ClickHouse destination to check for conflicting mappings
+/// Skip patterns and entries with replication disabled
+fn declared_target(
+    ch_database: &str,
+    schema_database: Option<&str>,
+    rel: &str,
+    t: &TablePatch,
+) -> Option<(String, String)> {
+    if t.replicate == Some(false)
+        || matches!(t.match_kind, Some(MatchKind::Glob | MatchKind::Regex))
+    {
+        return None;
+    }
+    let database = t
+        .target_database
+        .clone()
+        .or_else(|| schema_database.map(str::to_owned))
+        .unwrap_or_else(|| ch_database.to_owned());
+    Some((
+        database,
+        t.target_table.clone().unwrap_or_else(|| rel.to_owned()),
+    ))
 }
 
 #[derive(Default, serde::Deserialize)]
@@ -694,6 +845,7 @@ struct StreamPatch {
 }
 
 #[derive(Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct NamespacePatch {
     target_database: Option<String>,
     auto_create: Option<bool>,
@@ -704,6 +856,7 @@ struct NamespacePatch {
 }
 
 #[derive(Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct TablePatch {
     replicate: Option<bool>,
     target_database: Option<String>,
@@ -729,6 +882,7 @@ struct TablePatch {
 }
 
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ColumnPatch {
     attnum: Option<i16>,
     name: Option<String>,
@@ -789,8 +943,18 @@ impl EmitterConfig {
         Self::from_table(&root)
     }
 
-    /// Build from an already-parsed (and possibly conf.d-merged) TOML table.
+    /// Build mappings for `[source] dbname` from parsed and merged TOML
     pub fn from_table(root: &toml::Table) -> Result<Self, EmitterError> {
+        Self::from_table_for(root, None)
+    }
+
+    /// Build mappings for one source database
+    /// Share connection, insert, memory, bootstrap, and TOAST settings across databases
+    pub fn for_database(root: &toml::Table, dbname: &str) -> Result<Self, EmitterError> {
+        Self::from_table_for(root, Some(dbname))
+    }
+
+    fn from_table_for(root: &toml::Table, scope: Option<&str>) -> Result<Self, EmitterError> {
         let doc: ConfigDocument = toml::Value::Table(root.clone())
             .try_into()
             .map_err(crate::toml_de::config_error)?;
@@ -808,7 +972,7 @@ impl EmitterConfig {
         out.drain_batch_rows = ch.drain_batch_rows.unwrap_or(out.drain_batch_rows);
         out.drain_batch_bytes = ch.drain_batch_bytes.unwrap_or(out.drain_batch_bytes);
         out.plan_disk_max = ch.plan_disk_max.unwrap_or(out.plan_disk_max);
-        // Leave zero for bin/stream.rs to clamp
+        // Leave zero for bin/stream/args.rs to clamp
         out.decoder_pool_size = ch.decoder_pool_size.unwrap_or(out.decoder_pool_size);
         out.inserter_pool_size = ch.inserter_pool_size.unwrap_or(out.inserter_pool_size);
         out.decoder_batch_size = ch.decoder_batch_size.unwrap_or(out.decoder_batch_size);
@@ -852,12 +1016,44 @@ impl EmitterConfig {
             .pending_max_hold_ms
             .map_or(out.pending_capture.max_hold_per_xact, Duration::from_millis);
         out.source = doc.source;
+        // Unprefixed entries belong to `[source] dbname` whatever database
+        // this parse is scoped to, so a prefixed entry for another database
+        // never collides with them
+        let default_db = out.source.dbname.clone();
+        let scope = scope.unwrap_or(&default_db).to_owned();
+        out.source.dbname = scope.clone();
         if let Some(bk) = &doc.backup {
             out.backup = Some(parse_backup(bk)?);
         }
         out.bootstrap = doc.bootstrap;
         out.toast = doc.toast;
-        for (ns, n) in doc.namespace {
+        let mut buckets = doc.database;
+        if let Some(db) = buckets.keys().next()
+            && default_db.is_empty()
+        {
+            return Err(EmitterError::Config(format!(
+                "`database.{db}` names another source database, set `dbname` in \
+                 `[source]` to select this process's own"
+            )));
+        }
+        fold_unprefixed(
+            buckets.entry(default_db.clone()).or_default(),
+            doc.namespace,
+            doc.table,
+        )?;
+        for (db, entries) in buckets.iter().filter(|(db, _)| **db != default_db) {
+            reject_backup_loads(db, entries)?;
+        }
+        let local = buckets.remove(&scope).unwrap_or_default();
+        // Entries of the scoped database read back as the operator wrote them
+        let local_ctx = |ns: &str, name: &str| {
+            if scope == default_db {
+                format!("table.{ns}.{name}")
+            } else {
+                format!("database.{scope}.table.{ns}.{name}")
+            }
+        };
+        for (ns, n) in local.namespace {
             out.namespaces.insert(
                 ns,
                 NamespaceMapping {
@@ -868,142 +1064,191 @@ impl EmitterConfig {
                 },
             );
         }
-        for (ns, rels) in doc.table {
+        // Prevent processes from writing different source tables to one destination
+        let mut owners: HashMap<(String, String), String> = HashMap::new();
+        for (ns, rels) in local.table {
             for (name, t) in rels {
-                let rel = RelName::new(&ns, &name);
-                let ctx = format!("table.{ns}.{name}");
-                let kind = t.match_kind.unwrap_or(MatchKind::Exact);
-                let replicate = t.replicate;
-                let system = SystemColumnNames {
-                    lsn: t.lsn,
-                    xid: t.xid,
-                    commit_ts: t.commit_ts,
-                    is_deleted: t.is_deleted,
-                };
-                system.validate(&ctx).map_err(EmitterError::Config)?;
-                let rule = TableRule {
-                    system,
-                    target_database: t.target_database,
-                    target_table: t.target_table,
-                    replicate,
-                    initial_load: t.initial_load.map(|m| m.as_str().to_string()),
-                    order_by: t.order_by,
-                    primary_key: t.primary_key,
-                };
-                out.table_entries.push((rel.clone(), kind, rule.clone()));
-                let mut pinned = Vec::new();
-                let mut named = Vec::new();
-                for (i, c) in t.columns.into_iter().enumerate() {
-                    let ctx = format!("{ctx}.columns[{i}]");
-                    let att_kind = c.match_kind.unwrap_or(MatchKind::Exact);
-                    match (c.attnum, c.name) {
-                        (Some(_), Some(_)) => {
-                            return Err(EmitterError::Config(format!(
-                                "{ctx}: attnum and name are alternatives, not both"
-                            )));
-                        }
-                        (None, None) => {
-                            return Err(EmitterError::Config(format!(
-                                "{ctx}: missing attnum or name"
-                            )));
-                        }
-                        (Some(src_attnum), None) => {
-                            if c.match_kind.is_some() {
-                                return Err(EmitterError::Config(format!(
-                                    "{ctx}.match: an attnum entry names one column already"
-                                )));
-                            }
-                            pinned.push(ColumnMapping {
-                                src_attnum,
-                                target_name: c.target.ok_or_else(|| {
-                                    EmitterError::Config(format!("{ctx}: missing target"))
-                                })?,
-                                target_type: c.target_type.ok_or_else(|| {
-                                    EmitterError::Config(format!("{ctx}: missing type"))
-                                })?,
-                            });
-                        }
-                        (None, Some(attname)) => {
-                            if c.target.is_some() && att_kind != MatchKind::Exact {
-                                return Err(EmitterError::Config(format!(
-                                    "{ctx}.target: a `match = \"{}\"` entry can name \
-                                     several columns, which cannot share one target",
-                                    att_kind.as_str()
-                                )));
-                            }
-                            if c.target.is_none() && c.target_type.is_none() {
-                                return Err(EmitterError::Config(format!(
-                                    "{ctx}: sets neither target nor type"
-                                )));
-                            }
-                            named.push(ColumnEntry {
-                                rel: rel.clone(),
-                                rel_kind: kind,
-                                attname,
-                                att_kind,
-                                rule: ColumnRule {
-                                    target_name: c.target,
-                                    target_type: c.target_type,
-                                },
-                            });
-                        }
-                    }
+                let schema_db = out
+                    .namespaces
+                    .get(&ns)
+                    .and_then(|n| n.target_database.clone());
+                if let Some(target) =
+                    declared_target(&out.database, schema_db.as_deref(), &name, &t)
+                {
+                    owners.insert(target, local_ctx(&ns, &name));
                 }
-                if !pinned.is_empty() && !named.is_empty() {
-                    return Err(EmitterError::Config(format!(
-                        "{ctx}.columns: attnum entries pin the whole projection, so a \
-                         name entry beside them would never apply"
-                    )));
-                }
-                out.column_entries.append(&mut named);
-                if kind != MatchKind::Exact {
-                    if !pinned.is_empty() {
+                out.fold_table_entry(&ns, name, t)?;
+            }
+        }
+        for (db, entries) in buckets {
+            for (ns, rels) in &entries.table {
+                let schema_db = entries
+                    .namespace
+                    .get(ns)
+                    .and_then(|n| n.target_database.as_deref());
+                for (name, t) in rels {
+                    let Some(target) = declared_target(&out.database, schema_db, name, t) else {
+                        continue;
+                    };
+                    let ctx = format!("database.{db}.table.{ns}.{name}");
+                    if let Some(owner) = owners.get(&target) {
                         return Err(EmitterError::Config(format!(
-                            "{ctx}.columns: a `match = \"{}\"` entry cannot pin attnums; \
-                             key the entries on `name` instead",
-                            kind.as_str()
+                            "`{ctx}` and `{owner}` both write to {}.{}, set a different \
+                             target_database or target_table",
+                            target.0, target.1
                         )));
                     }
-                    continue;
+                    owners.insert(target, ctx);
                 }
-                if pinned.is_empty() {
-                    out.table_opt_ins.insert(
-                        rel,
-                        TableRow {
-                            target_database: rule.target_database,
-                            target_table: rule.target_table,
-                            replicate,
-                            initial_load: rule.initial_load,
-                            ..TableRow::default()
+            }
+            out.databases.push(db);
+        }
+        out.databases
+            .extend([default_db, scope].into_iter().filter(|db| !db.is_empty()));
+        out.databases.sort();
+        out.databases.dedup();
+        Ok(out)
+    }
+
+    /// Apply table and column settings for this process's source database
+    fn fold_table_entry(
+        &mut self,
+        ns: &str,
+        name: String,
+        t: TablePatch,
+    ) -> Result<(), EmitterError> {
+        let rel = RelName::new(ns, &name);
+        let ctx = format!("table.{ns}.{name}");
+        let kind = t.match_kind.unwrap_or(MatchKind::Exact);
+        let replicate = t.replicate;
+        let system = SystemColumnNames {
+            lsn: t.lsn,
+            xid: t.xid,
+            commit_ts: t.commit_ts,
+            is_deleted: t.is_deleted,
+        };
+        system.validate(&ctx).map_err(EmitterError::Config)?;
+        let rule = TableRule {
+            system,
+            target_database: t.target_database,
+            target_table: t.target_table,
+            replicate,
+            initial_load: t.initial_load.map(|m| m.as_str().to_string()),
+            order_by: t.order_by,
+            primary_key: t.primary_key,
+        };
+        self.table_entries.push((rel.clone(), kind, rule.clone()));
+        let mut pinned = Vec::new();
+        let mut named = Vec::new();
+        for (i, c) in t.columns.into_iter().enumerate() {
+            let ctx = format!("{ctx}.columns[{i}]");
+            let att_kind = c.match_kind.unwrap_or(MatchKind::Exact);
+            match (c.attnum, c.name) {
+                (Some(_), Some(_)) => {
+                    return Err(EmitterError::Config(format!(
+                        "{ctx}: attnum and name are alternatives, not both"
+                    )));
+                }
+                (None, None) => {
+                    return Err(EmitterError::Config(format!(
+                        "{ctx}: missing attnum or name"
+                    )));
+                }
+                (Some(src_attnum), None) => {
+                    if c.match_kind.is_some() {
+                        return Err(EmitterError::Config(format!(
+                            "{ctx}.match: an attnum entry names one column already"
+                        )));
+                    }
+                    pinned.push(ColumnMapping {
+                        src_attnum,
+                        target_name: c.target.ok_or_else(|| {
+                            EmitterError::Config(format!("{ctx}: missing target"))
+                        })?,
+                        target_type: c
+                            .target_type
+                            .ok_or_else(|| EmitterError::Config(format!("{ctx}: missing type")))?,
+                    });
+                }
+                (None, Some(attname)) => {
+                    if c.target.is_some() && att_kind != MatchKind::Exact {
+                        return Err(EmitterError::Config(format!(
+                            "{ctx}.target: a `match = \"{}\"` entry can name \
+                                 several columns, which cannot share one target",
+                            att_kind.as_str()
+                        )));
+                    }
+                    if c.target.is_none() && c.target_type.is_none() {
+                        return Err(EmitterError::Config(format!(
+                            "{ctx}: sets neither target nor type"
+                        )));
+                    }
+                    named.push(ColumnEntry {
+                        rel: rel.clone(),
+                        rel_kind: kind,
+                        attname,
+                        att_kind,
+                        rule: ColumnRule {
+                            target_name: c.target,
+                            target_type: c.target_type,
                         },
-                    );
-                    continue;
-                }
-                if replicate == Some(false) {
-                    continue;
-                }
-                let database = rule
-                    .target_database
-                    .or_else(|| {
-                        out.namespaces
-                            .get(ns.as_str())
-                            .and_then(|n| n.target_database.clone())
-                    })
-                    .unwrap_or_else(|| out.database.clone());
-                let table = rule.target_table.unwrap_or(name);
-                out.tables.insert(
-                    rel.clone(),
-                    TableMapping {
-                        target: TableTarget { database, table },
-                        columns: pinned,
-                    },
-                );
-                if let Some(mode) = rule.initial_load {
-                    out.table_initial_loads.insert(rel, mode);
+                    });
                 }
             }
         }
-        Ok(out)
+        if !pinned.is_empty() && !named.is_empty() {
+            return Err(EmitterError::Config(format!(
+                "{ctx}.columns: attnum entries pin the whole projection, so a \
+                     name entry beside them would never apply"
+            )));
+        }
+        self.column_entries.append(&mut named);
+        if kind != MatchKind::Exact {
+            if !pinned.is_empty() {
+                return Err(EmitterError::Config(format!(
+                    "{ctx}.columns: a `match = \"{}\"` entry cannot pin attnums; \
+                         key the entries on `name` instead",
+                    kind.as_str()
+                )));
+            }
+            return Ok(());
+        }
+        if pinned.is_empty() {
+            self.table_opt_ins.insert(
+                rel,
+                TableRow {
+                    target_database: rule.target_database,
+                    target_table: rule.target_table,
+                    replicate,
+                    initial_load: rule.initial_load,
+                    ..TableRow::default()
+                },
+            );
+            return Ok(());
+        }
+        if replicate == Some(false) {
+            return Ok(());
+        }
+        let database = rule
+            .target_database
+            .or_else(|| {
+                self.namespaces
+                    .get(ns)
+                    .and_then(|n| n.target_database.clone())
+            })
+            .unwrap_or_else(|| self.database.clone());
+        let table = rule.target_table.unwrap_or(name);
+        self.tables.insert(
+            rel.clone(),
+            TableMapping {
+                target: TableTarget { database, table },
+                columns: pinned,
+            },
+        );
+        if let Some(mode) = rule.initial_load {
+            self.table_initial_loads.insert(rel, mode);
+        }
+        Ok(())
     }
 }
 
@@ -3644,6 +3889,273 @@ mod tests {
         assert_eq!(dotted_rel.target.sql(), "`default`.`b.c`");
     }
 
+    /// Database prefixes preserve table identity within source database
+    #[test]
+    fn database_qualified_key_reads_as_the_followed_database() {
+        let c = EmitterConfig::from_toml_str(
+            "[ch]\n\
+             database = \"cdc\"\n\
+             [source]\n\
+             dbname = \"app\"\n\
+             [database.app.table.public.orders]\n\
+             target_table = \"orders_v2\"\n\
+             [database.app.namespace.public]\n\
+             auto_create = true\n",
+        )
+        .unwrap();
+        assert_eq!(
+            c.table_entries.iter().map(|(r, ..)| r).collect::<Vec<_>>(),
+            vec![&RelName::new("public", "orders")]
+        );
+        assert_eq!(
+            c.table_opt_ins[&RelName::new("public", "orders")]
+                .target_table
+                .as_deref(),
+            Some("orders_v2")
+        );
+        assert!(c.namespaces["public"].auto_create, "namespace level too");
+        assert_eq!(c.databases, vec!["app".to_string()], "only app is named");
+    }
+
+    /// Database-prefixed entries name a database without routing it here
+    #[test]
+    fn foreign_database_entries_route_nothing() {
+        const DOC: &str = "[ch]\n\
+             database = \"cdc\"\n\
+             [source]\n\
+             dbname = \"app\"\n\
+             [table.public.orders]\n\
+             replicate = true\n\
+             [database.billing.table.public.orders]\n\
+             target_table = \"billing_orders\"\n\
+             [database.billing.table.public.invoices]\n\
+             target_table = \"billing_invoices\"\n\
+             [database.billing.namespace.public]\n\
+             auto_create = true\n";
+        let c = EmitterConfig::from_toml_str(DOC).unwrap();
+        assert_eq!(
+            c.table_entries.iter().map(|(r, ..)| r).collect::<Vec<_>>(),
+            vec![&RelName::new("public", "orders")]
+        );
+        assert!(c.namespaces.is_empty(), "billing's namespace stays out");
+        assert_eq!(c.databases, vec!["app".to_string(), "billing".to_string()]);
+        // Same document scoped to the other database routes its entries
+        let doc: toml::Table = toml::from_str(DOC).unwrap();
+        let billing = EmitterConfig::for_database(&doc, "billing").unwrap();
+        let mut rels: Vec<&str> = billing
+            .table_entries
+            .iter()
+            .map(|(r, ..)| &*r.name)
+            .collect();
+        rels.sort_unstable();
+        assert_eq!(rels, vec!["invoices", "orders"]);
+        assert!(
+            billing.namespaces["public"].auto_create,
+            "billing's namespace"
+        );
+        assert_eq!(
+            billing.databases, c.databases,
+            "one list, whatever the scope"
+        );
+    }
+
+    /// Backup-sourced loads cover the database `[source] dbname` names
+    #[test]
+    fn backup_initial_load_outside_the_primary_database_is_rejected() {
+        let doc = |entry: &str| {
+            format!(
+                "[ch]\n\
+                 database = \"cdc\"\n\
+                 [source]\n\
+                 dbname = \"app\"\n\
+                 {entry}"
+            )
+        };
+        for mode in ["base_backup", "object_store"] {
+            let msg = EmitterConfig::from_toml_str(&doc(&format!(
+                "[database.billing.table.public.ledger]\ninitial_load = \"{mode}\"\n"
+            )))
+            .expect_err(mode)
+            .to_string();
+            assert!(
+                msg.contains("database.billing.table.public.ledger"),
+                "{msg}"
+            );
+            assert!(msg.contains(mode) && msg.contains("copy"), "{msg}");
+        }
+        let msg = EmitterConfig::from_toml_str(&doc(
+            "[database.billing.namespace.public]\ninitial_load = \"base_backup\"\n",
+        ))
+        .expect_err("namespace level too")
+        .to_string();
+        assert!(msg.contains("database.billing.namespace.public"), "{msg}");
+        // The primary database is exactly what a cluster backup covers
+        for entry in [
+            "[table.public.orders]\ninitial_load = \"base_backup\"\n",
+            "[database.app.table.public.orders]\ninitial_load = \"object_store\"\n",
+            "[database.billing.table.public.ledger]\ninitial_load = \"copy\"\n",
+        ] {
+            EmitterConfig::from_toml_str(&doc(entry)).unwrap_or_else(|e| panic!("{entry}: {e}"));
+        }
+    }
+
+    /// A schema and a database can share a name, the key level says which
+    #[test]
+    fn schema_named_like_a_database_stays_a_schema() {
+        let c = EmitterConfig::from_toml_str(
+            "[ch]\n\
+             database = \"cdc\"\n\
+             [source]\n\
+             dbname = \"app\"\n\
+             [table.billing.orders]\n\
+             target_table = \"app_billing_orders\"\n\
+             [database.billing.table.public.orders]\n\
+             target_table = \"billing_orders\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            c.table_entries.iter().map(|(r, ..)| r).collect::<Vec<_>>(),
+            vec![&RelName::new("billing", "orders")],
+            "schema `billing` of database `app`"
+        );
+        assert_eq!(c.databases, vec!["app".to_string(), "billing".to_string()]);
+    }
+
+    /// Reject mappings that mix source databases in one ClickHouse table
+    #[test]
+    fn cross_database_destination_collision_is_rejected() {
+        let msg = EmitterConfig::from_toml_str(
+            "[ch]\n\
+             database = \"cdc\"\n\
+             [source]\n\
+             dbname = \"app\"\n\
+             [table.public.orders]\n\
+             replicate = true\n\
+             [database.billing.table.public.orders]\n\
+             replicate = true\n",
+        )
+        .expect_err("collides")
+        .to_string();
+        assert!(
+            msg.contains("`database.billing.table.public.orders`"),
+            "{msg}"
+        );
+        assert!(msg.contains("`table.public.orders`"), "{msg}");
+        assert!(msg.contains("cdc.orders"), "{msg}");
+        for distinct in [
+            "target_database = \"billing_cdc\"",
+            "target_table = \"billing_orders\"",
+            "replicate = false",
+        ] {
+            EmitterConfig::from_toml_str(&format!(
+                "[ch]\n\
+                 database = \"cdc\"\n\
+                 [source]\n\
+                 dbname = \"app\"\n\
+                 [table.public.orders]\n\
+                 replicate = true\n\
+                 [database.billing.table.public.orders]\n\
+                 {distinct}\n"
+            ))
+            .unwrap_or_else(|e| panic!("{distinct}: {e}"));
+        }
+    }
+
+    /// Merge `[database.<dbname>]` entries with unprefixed ones, reject duplicates
+    #[test]
+    fn qualified_and_unqualified_entries_merge() {
+        let c = EmitterConfig::from_toml_str(
+            "[ch]\n\
+             database = \"cdc\"\n\
+             [source]\n\
+             dbname = \"zz\"\n\
+             [table.public.orders]\n\
+             replicate = true\n\
+             [database.zz.table.public.users]\n\
+             replicate = true\n",
+        )
+        .unwrap();
+        let mut rels: Vec<&str> = c.table_entries.iter().map(|(r, ..)| &*r.name).collect();
+        rels.sort_unstable();
+        assert_eq!(rels, vec!["orders", "users"], "database `zz` sorts last");
+        assert_eq!(c.databases, vec!["zz".to_string()]);
+
+        let msg = EmitterConfig::from_toml_str(
+            "[ch]\n\
+             [source]\n\
+             dbname = \"app\"\n\
+             [table.public.orders]\n\
+             replicate = true\n\
+             [database.app.table.public.orders]\n\
+             replicate = false\n",
+        )
+        .expect_err("one relation, two spellings")
+        .to_string();
+        assert!(msg.contains("`table.public.orders`"), "{msg}");
+        let msg = EmitterConfig::from_toml_str(
+            "[ch]\n\
+             [source]\n\
+             dbname = \"app\"\n\
+             [namespace.public]\n\
+             auto_create = true\n\
+             [database.app.namespace.public]\n\
+             auto_create = false\n",
+        )
+        .expect_err("one schema, two spellings")
+        .to_string();
+        assert!(msg.contains("`namespace.public`"), "{msg}");
+    }
+
+    /// Require source `dbname`, reject stale prefixes and unknown settings
+    #[test]
+    fn database_key_level_rejects_ambiguous_entries() {
+        let rejects = |src: &str| {
+            EmitterConfig::from_toml_str(src).expect_err(src);
+        };
+        rejects("[ch]\n[database.billing.table.public.orders]\nreplicate = true\n");
+        rejects("[ch]\n[database.billing.namespace.public]\nauto_create = true\n");
+        // A database prefix under `table` reads as a relation setting
+        rejects(
+            "[ch]\n\
+             [source]\n\
+             dbname = \"app\"\n\
+             [table.billing.public.orders]\n\
+             replicate = true\n",
+        );
+        rejects(
+            "[ch]\n\
+             [source]\n\
+             dbname = \"app\"\n\
+             [namespace.billing.public]\n\
+             auto_create = true\n",
+        );
+        rejects(
+            "[ch]\n\
+             [source]\n\
+             dbname = \"app\"\n\
+             [table.public.orders]\n\
+             replicat = true\n",
+        );
+    }
+
+    /// Include source database name in errors from shared config
+    #[test]
+    fn foreign_database_type_error_names_its_database() {
+        let msg = EmitterConfig::from_toml_str(
+            "[ch]\n\
+             [source]\n\
+             dbname = \"app\"\n\
+             [database.billing.table.public.orders]\n\
+             replicate = \"no\"\n",
+        )
+        .expect_err("replicate is a boolean")
+        .to_string();
+        assert!(
+            msg.contains("database.billing.table.public.orders.replicate"),
+            "{msg}"
+        );
+    }
+
     #[test]
     fn merge_tables_deep_and_overwrite() {
         let mut base: toml::Table = toml::from_str(
@@ -3823,6 +4335,7 @@ mod tests {
         );
         rejects("source = 3\n", "`source`");
         rejects("[table]\npublic = 3\n", "`table.public`");
+        rejects("[namespace]\nsales = 3\n", "`namespace.sales`");
         rejects("[table.public]\norders = 3\n", "`table.public.orders`");
         rejects("[table.public.orders]\ncolumns = 3\n", "columns");
     }

@@ -137,6 +137,9 @@ pub struct BoundaryInfo {
     /// namespace rename changes every embedded namespace text with zero
     /// per-relation invals)
     pub capture_all: bool,
+    /// Database identified by catalog writes or commit record
+    /// Zero requests catalog capture for every configured database
+    pub db_oid: u32,
     pub kind: BoundaryKind,
     /// Tree members the filter drained at this commit, so promotion finds
     /// pending state a late `XLOG_XACT_ASSIGNMENT` left keyed under a

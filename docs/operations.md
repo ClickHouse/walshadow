@@ -14,6 +14,8 @@ Primary fields:
 | Field | Meaning |
 |---|---|
 | `paused` | source consumption intentionally frozen |
+| `dbname` | source database `[source]` names |
+| `databases` | every replicated database and its selected tables |
 | `rows_synced` | rows sent since process start |
 | `backfills_pending` | tables still loading existing rows |
 | `lag_bytes`, `lag_seconds` | shadow replay distance from source |
@@ -56,6 +58,12 @@ Watch:
 - resident memory and spill usage
 - pending backfills
 - timeline crossing and endpoint swap failures
+
+Metrics for work a source database owns carry a `database=` label: bridge
+requests, descriptor log and capture counters, and config overlay counters.
+Sum them when a panel wants one number for the daemon. Cluster WAL positions,
+transaction buffer, insert pipeline, and process resource metrics stay
+unlabelled, they are shared by every database
 
 Alert on sustained failure to advance, not just process availability. Shadow
 replay lag measures catalog progress; ClickHouse acknowledgement backlog measures

@@ -325,7 +325,7 @@
       },
       "targets": [
         {
-          "expr": "walshadow_config_backfills_pending{mode=\"\"}",
+          "expr": "sum(walshadow_config_backfills_pending)",
           "instant": true,
           "legendFormat": "pending",
           "refId": "A"
@@ -846,12 +846,12 @@
           "refId": "B"
         },
         {
-          "expr": "walshadow_config_backfills_pending{mode=\"\"}",
+          "expr": "sum(walshadow_config_backfills_pending)",
           "legendFormat": "pending backfills",
           "refId": "C"
         },
         {
-          "expr": "walshadow_config_pending_decl_rels",
+          "expr": "sum(walshadow_config_pending_decl_rels)",
           "legendFormat": "pending table declarations",
           "refId": "D"
         },

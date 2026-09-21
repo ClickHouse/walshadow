@@ -8,6 +8,7 @@ use clickhouse_c::{Allocator, Block, BlockOpts, BlockReader, Column, SliceIo};
 use crate::decode::heap_decoder::ColumnValue;
 use crate::ops::bridge::{Bridge, BridgeError, MAX_REQUEST_BYTES, request_frame};
 use crate::schema::RelAttr;
+use tokio_postgres::types::Oid;
 
 /// Cell tags, matching `WS_CELL_*` in `pgext/walshadow.h`
 const CELL_DEFAULT: u8 = 0x00;
@@ -181,15 +182,27 @@ impl OracleBlock {
 }
 
 pub struct Oracle {
-    bridge: Arc<Bridge>,
+    /// One bridge per followed database: `typoutput` is not a pure function
+    /// of the bytes, so a value converts against its own database's catalog.
+    /// A lone entry answers for any database — single-database pipelines and
+    /// the greenfield throwaway have exactly one shadow to ask
+    bridges: Vec<(Oid, Arc<Bridge>)>,
     xid_ceiling: Arc<crate::toast::xid_ceiling::XidCeiling>,
     pub stats: Arc<OracleStats>,
 }
 
 impl Oracle {
+    /// Database argument for a single-shadow oracle, which answers for
+    /// whatever database it was pointed at
+    pub const ANY_DATABASE: Oid = 0;
+
     pub fn new(bridge: Arc<Bridge>) -> Self {
+        Self::per_database(vec![(0, bridge)])
+    }
+
+    pub fn per_database(bridges: Vec<(Oid, Arc<Bridge>)>) -> Self {
         Self {
-            bridge,
+            bridges,
             xid_ceiling: Arc::default(),
             stats: Arc::new(OracleStats::default()),
         }
@@ -205,25 +218,48 @@ impl Oracle {
         self.xid_ceiling.clone()
     }
 
-    /// Requests the shadow answers at once, ie the bridge's pool width. One
-    /// worker serves one request per loop iteration
-    pub fn concurrency(&self) -> usize {
-        self.bridge.pool_size()
+    fn bridge(&self, db: Oid) -> Result<&Arc<Bridge>, OracleError> {
+        if let [(_, only)] = &self.bridges[..] {
+            return Ok(only);
+        }
+        self.bridges
+            .iter()
+            .find(|(oid, _)| *oid == db)
+            .map(|(_, bridge)| bridge)
+            .ok_or_else(|| OracleError::Absent(format!("no shadow oracle for database {db}")))
     }
 
-    /// Shared worker bridge used by oracle and shadow TOAST store
-    pub fn bridge(&self) -> Arc<Bridge> {
-        self.bridge.clone()
+    /// Requests the shadow answers at once, ie one database's pool width.
+    /// One worker serves one request per loop iteration
+    pub fn concurrency(&self) -> usize {
+        self.bridges
+            .first()
+            .map_or(1, |(_, bridge)| bridge.pool_size())
+    }
+
+    /// Bridge the shadow TOAST store reads through. Its reads carry no
+    /// database, so the store is refused above one followed database and
+    /// this answers off the only entry
+    pub fn toast_bridge(&self) -> Arc<Bridge> {
+        self.bridges
+            .first()
+            .map(|(_, bridge)| bridge.clone())
+            .expect("oracle holds at least one bridge")
     }
 
     /// Round-trip cost of resolution: the request bytes and worker service
-    /// time behind [`OracleStats`]
+    /// time behind [`OracleStats`]. Pools share one stats handle, so any
+    /// bridge reports the total
     pub fn bridge_stats(&self) -> Arc<crate::ops::bridge::BridgeStats> {
-        self.bridge.stats.clone()
+        self.bridges
+            .first()
+            .map(|(_, bridge)| bridge.stats.clone())
+            .unwrap_or_default()
     }
 
     pub async fn encode_batch(
         &self,
+        db: Oid,
         columns: &[OracleRequestColumn<'_>],
         n_rows: usize,
         alloc: Allocator,
@@ -240,7 +276,7 @@ impl Oracle {
             }
         }
         let response = match self
-            .bridge
+            .bridge(db)?
             .encode_native(encode_request(columns, n_rows))
             .await
         {
@@ -274,6 +310,7 @@ impl Oracle {
     /// Render one datum as PG text for SQL literals
     pub async fn text_value(
         &self,
+        db: Oid,
         source_type_oid: u32,
         source_typmod: i32,
         cell: OracleCell,
@@ -286,7 +323,9 @@ impl Oracle {
             target_type: "String",
             buf: &buf,
         }];
-        let block = self.encode_batch(&columns, 1, Allocator::stdlib()).await?;
+        let block = self
+            .encode_batch(db, &columns, 1, Allocator::stdlib())
+            .await?;
         // Single-row String data spans entire slab
         let (_, data) = block
             .column(0)

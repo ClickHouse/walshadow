@@ -912,3 +912,68 @@ mod tests {
         );
     }
 }
+
+/// Read catalog changes through each database's shadow connection
+/// Database OID zero requests capture for all databases
+/// An empty set skips capture without pausing WAL processing
+#[derive(Default)]
+pub struct CaptureSet {
+    by_db: Vec<(Oid, CatalogCapture)>,
+}
+
+impl CaptureSet {
+    pub fn insert(&mut self, db: Oid, capture: CatalogCapture) {
+        self.by_db.push((db, capture));
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.by_db.is_empty()
+    }
+
+    /// Each database counts its own captures, which `database=` labels on
+    /// the metric surface
+    pub fn stats_handles(&self) -> impl Iterator<Item = (Oid, Arc<CaptureStats>)> + '_ {
+        self.by_db
+            .iter()
+            .map(|(db, capture)| (*db, capture.stats_handle()))
+    }
+
+    /// Select capture instances for affected databases
+    fn scoped(&self, db_oid: Oid) -> impl Iterator<Item = &CatalogCapture> {
+        self.by_db
+            .iter()
+            .filter(move |(db, _)| db_oid == 0 || *db == db_oid)
+            .map(|(_, capture)| capture)
+    }
+
+    /// Pause WAL processing if any affected database needs catalog reads
+    pub fn admits(&self, info: &BoundaryInfo, next_lsn: u64) -> bool {
+        self.scoped(info.db_oid)
+            .any(|capture| capture.admits(info, next_lsn))
+    }
+
+    pub fn charge_hold(&self, info: &BoundaryInfo, held: Duration) {
+        for capture in self.scoped(info.db_oid) {
+            capture.charge_hold(info, held);
+        }
+    }
+
+    /// Transaction IDs are unique across databases, clear shared pending state once
+    pub fn forget_aborted(&self, members: &[u32]) {
+        for (_, capture) in &self.by_db {
+            capture.forget_aborted(members);
+        }
+    }
+
+    pub async fn capture_boundary(
+        &self,
+        info: &BoundaryInfo,
+        commit_lsn: u64,
+        next_lsn: u64,
+    ) -> Result<(), SinkError> {
+        for capture in self.scoped(info.db_oid) {
+            capture.capture_boundary(info, commit_lsn, next_lsn).await?;
+        }
+        Ok(())
+    }
+}

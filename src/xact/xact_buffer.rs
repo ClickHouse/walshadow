@@ -46,7 +46,9 @@ use tokio::sync::Mutex;
 use tracing::Instrument;
 use walrus::pg::walparser::{RelFileNode, RmId};
 
-use crate::catalog::desc_log::{Ambiguity, DescriptorLog, LogEntry, LogValue, LookupResult};
+use crate::catalog::desc_log::{
+    Ambiguity, DescriptorLog, DescriptorLogs, LogEntry, LogValue, LookupResult,
+};
 use crate::catalog::pending::{PendingCatalog, PendingSlot};
 use crate::decode::decoder_sink::{DecoderSinkError, DecoderStats};
 use crate::decode::heap_decoder::{
@@ -2328,8 +2330,14 @@ pub async fn detoast_heap(
     for p in &pointers {
         *uses.entry((p.va_toastrelid, p.va_valueid)).or_default() += 1;
     }
-    let cache =
-        prefetch_store_values(&pointers, chunk_maps, resolver, heap.decoded.source_lsn).await?;
+    let cache = prefetch_store_values(
+        &pointers,
+        chunk_maps,
+        resolver,
+        heap.decoded.rfn.db_node,
+        heap.decoded.source_lsn,
+    )
+    .await?;
     let mut res = ValueResolution {
         spool,
         xact_maps: chunk_maps,
@@ -2388,6 +2396,7 @@ async fn prefetch_store_values(
     pointers: &[ToastPointer],
     chunk_maps: &[&ChunkRefMap],
     resolver: &ToastResolver,
+    db_oid: u32,
     bound: u64,
 ) -> std::result::Result<HashMap<(u32, u32), CachedValue>, XactBufferError> {
     let mut cache = HashMap::new();
@@ -2412,7 +2421,7 @@ async fn prefetch_store_values(
             .map(|p| (p.va_valueid, pointer_extsize(p)))
             .collect();
         let got = resolver
-            .fetch_values(toast_relid, &batch, bound)
+            .fetch_values(db_oid, toast_relid, &batch, bound)
             .await
             .map_err(|e| XactBufferError::Detoast(format!("toast store fetch: {e}")))?
             .expect("store checked via fill_on_miss");
@@ -2633,7 +2642,7 @@ pub(crate) fn reassemble_value_ref(
 /// [`ToastChunk`]; semantic errors absorb into [`DecoderStats`] rather
 /// than poison the stream.
 pub struct BufferingDecoderSink {
-    log: Arc<DescriptorLog>,
+    logs: DescriptorLogs,
     buffer: Arc<Mutex<XactBuffer>>,
     stats: Arc<DecoderStats>,
     /// `txn` span registry. When set (tracing on), the decoder parents its
@@ -2647,9 +2656,9 @@ pub struct BufferingDecoderSink {
 }
 
 impl BufferingDecoderSink {
-    pub fn new(log: Arc<DescriptorLog>, buffer: Arc<Mutex<XactBuffer>>) -> Self {
+    pub fn new(logs: DescriptorLogs, buffer: Arc<Mutex<XactBuffer>>) -> Self {
         Self {
-            log,
+            logs,
             buffer,
             stats: Arc::new(DecoderStats::default()),
             span_registry: None,
@@ -2736,11 +2745,13 @@ impl BufferingDecoderSink {
             // LSN is unreachable anyway — TRUNCATE rotates the filenode (so
             // its own commit publishes no in-place verdict) and a concurrent
             // xact cannot hold this rel's AccessExclusiveLock
+            // Relid array belongs to a database this daemon does not
+            // follow: its OIDs name nothing here
+            let Some(log) = self.logs.lookup(parsed.db_oid) else {
+                break;
+            };
             let (rel, valid_from) =
-                match self
-                    .log
-                    .descriptor_by_oid_in_db_at_spanned(parsed.db_oid, relid, source_lsn)
-                {
+                match log.descriptor_by_oid_in_db_at_spanned(parsed.db_oid, relid, source_lsn) {
                     Ok(found) => found,
                     // Record's whole relid array belongs to another database:
                     // its OIDs name nothing here, whatever they collide with
@@ -2861,11 +2872,17 @@ impl RecordSink for BufferingDecoderSink {
                 .as_ref()
                 .and_then(|r| r.decode_parent(txn_xid));
             let _ = sampled;
+            // Unfollowed database: same skip a foreign-db lookup takes
+            let Some(log) = self.logs.lookup(rfn.db_node) else {
+                self.stats
+                    .catalog_not_found
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return Ok(());
+            };
             // Wait-free interval lookup: every record reaching this worker
             // already has log coverage (capture runs inside the boundary
             // hold, before successor bytes publish)
-            let (rel, rel_valid_from) = match self.log.descriptor_at_spanned(rfn, record.source_lsn)
-            {
+            let (rel, rel_valid_from) = match log.descriptor_at_spanned(rfn, record.source_lsn) {
                 Ok(pair) => pair,
                 Err(LookupResult::Present(_)) => {
                     unreachable!("spanned lookup returns Present via Ok")
@@ -2879,7 +2896,7 @@ impl RecordSink for BufferingDecoderSink {
                     return Ok(());
                 }
                 Err(LookupResult::NotCovered)
-                    if record.source_lsn <= self.log.covered_through() || txn_xid == 0 =>
+                    if record.source_lsn <= log.covered_through() || txn_xid == 0 =>
                 {
                     self.stats
                         .catalog_not_found
@@ -4203,7 +4220,7 @@ mod tests {
             va_valueid: 55,
             va_toastrelid: 16500,
         };
-        let cache = prefetch_store_values(&[p, p], &[], &resolver, 10)
+        let cache = prefetch_store_values(&[p, p], &[], &resolver, 0, 10)
             .await
             .unwrap();
         let mut r = ValueResolution {
@@ -4262,9 +4279,10 @@ mod tests {
             va_toastrelid: 16500,
         };
         let in_xact = mem_refs((16500, 57), &[(0, b"abcd")]);
-        let cache = prefetch_store_values(&[ptr(55), ptr(56), ptr(57)], &[&in_xact], &resolver, 10)
-            .await
-            .unwrap();
+        let cache =
+            prefetch_store_values(&[ptr(55), ptr(56), ptr(57)], &[&in_xact], &resolver, 0, 10)
+                .await
+                .unwrap();
         assert_eq!(cache.len(), 2, "in-xact key stays out of the cache");
         assert_eq!(
             stats
@@ -4767,7 +4785,7 @@ mod tests {
         let buffer = Arc::new(Mutex::new(
             XactBuffer::new(cfg(spill_dir.path().to_path_buf())).unwrap(),
         ));
-        let mut sink = BufferingDecoderSink::new(log.clone(), buffer);
+        let mut sink = BufferingDecoderSink::new(DescriptorLogs::single(log.clone()), buffer);
 
         sink.on_record(&truncate_record(6)).await.unwrap();
         assert_eq!(

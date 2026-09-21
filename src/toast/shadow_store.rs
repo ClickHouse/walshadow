@@ -61,7 +61,7 @@ impl From<LateBridge> for ShadowRead {
 impl From<&crate::ops::oracle::Oracle> for ShadowRead {
     fn from(oracle: &crate::ops::oracle::Oracle) -> Self {
         Self {
-            bridge: bound(oracle.bridge()),
+            bridge: bound(oracle.toast_bridge()),
             ceiling: oracle.xid_ceiling(),
         }
     }

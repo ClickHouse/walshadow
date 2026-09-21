@@ -36,7 +36,7 @@ use crate::emit::ch_emitter::{
 };
 use crate::emit::pipeline::{DEFAULT_PIPELINE_FLUSH, Fatal};
 use crate::emit::route::RouteSnapshot;
-use crate::schema::{RelDescriptor, RelName};
+use crate::schema::{RelDescriptor, TableKey};
 use ahash::{HashMap, HashMapExt};
 
 /// One decoded row routed to its destination. `route`/`rel` are `Arc`
@@ -72,7 +72,7 @@ pub struct ColMeta {
 /// Immutable per-table block shape, shared by every batch of that table
 /// until a barrier rebuilds it (bumping `schema_epoch`).
 pub struct BatchMeta {
-    pub table_key: RelName,
+    pub table_key: TableKey,
     pub insert_sql: String,
     /// Order matches `InsertBatch::buffers`: mapped columns then the
     /// synthetic ones (lsn, xid, commit_ts, delete marker when configured).
@@ -81,7 +81,7 @@ pub struct BatchMeta {
 }
 
 impl BatchMeta {
-    fn from_plan(plan: &TablePlan, table_key: RelName, schema_epoch: u64) -> Self {
+    fn from_plan(plan: &TablePlan, table_key: TableKey, schema_epoch: u64) -> Self {
         let mut columns = Vec::with_capacity(plan.columns.len() + 4);
         for c in &plan.columns {
             columns.push(ColMeta {
@@ -195,7 +195,7 @@ pub(crate) fn spawn(
             partial_bytes: AtomicUsize::new(0),
             batch_limit: (cfg.byte_budget / cfg.inserters.max(1)).max(1),
         };
-        let mut tables: HashMap<RelName, Table> = HashMap::new();
+        let mut tables: HashMap<TableKey, Table> = HashMap::new();
         let mut epoch: u64 = 0;
         let stats = stats.as_ref();
         // Reuse one timer for earliest table deadline and reset it only when
@@ -298,7 +298,7 @@ async fn config_changed(rx: &mut Option<watch::Receiver<Arc<ResolvedConfig>>>) {
 /// Process a decoder's row chunk in order. Chunk only amortizes the channel
 /// hop, not the coalescing; budget/deadline trips behave per-row.
 async fn handle_rows(
-    tables: &mut HashMap<RelName, Table>,
+    tables: &mut HashMap<TableKey, Table>,
     ctx: &RowCtx<'_>,
     chunk: RowChunk,
 ) -> Result<(), String> {
@@ -309,7 +309,7 @@ async fn handle_rows(
 }
 
 async fn handle_row(
-    tables: &mut HashMap<RelName, Table>,
+    tables: &mut HashMap<TableKey, Table>,
     ctx: &RowCtx<'_>,
     row: RoutedRow,
     slice_permit: Option<&Arc<crate::budget::MemoryPermit>>,
@@ -317,8 +317,9 @@ async fn handle_row(
     ctx.stats
         .insertbatch_rows_in
         .fetch_add(1, Ordering::Relaxed);
-    // Key clone is two Arc bumps, cheaper than a second `RelName` hash
-    let t = match tables.entry(row.rel.rel_name.clone()) {
+    // Key clone is two Arc bumps, cheaper than a second hash
+    let key = TableKey::new(row.rel.rfn.db_node, row.rel.rel_name.clone());
+    let t = match tables.entry(key) {
         Entry::Occupied(e) => e.into_mut(),
         Entry::Vacant(e) => {
             // Overrides ride the route frozen at planning; a `Column*` config
@@ -449,7 +450,7 @@ async fn emit_batch(t: &mut Table, out: &BatchOutput, stats: &EmitterStats) -> R
 /// Flush tables whose deadlines have passed. `emit_batch` clears each deadline,
 /// including when encoder is empty
 async fn flush_due(
-    tables: &mut HashMap<RelName, Table>,
+    tables: &mut HashMap<TableKey, Table>,
     out: &BatchOutput,
     now: Instant,
     stats: &EmitterStats,
@@ -465,7 +466,7 @@ async fn flush_due(
 /// Seal every table, drop all encoders, bump `epoch` so next rows rebuild
 /// against post-DDL descriptors and inserters re-parse cached types.
 async fn flush_all(
-    tables: &mut HashMap<RelName, Table>,
+    tables: &mut HashMap<TableKey, Table>,
     out: &BatchOutput,
     epoch: &mut u64,
     stats: &EmitterStats,
@@ -854,8 +855,8 @@ mod tests {
         let first_at = start.elapsed();
         let second = batches_rx.recv().await.expect("second batch");
         let second_at = start.elapsed();
-        assert_eq!(first.meta.table_key, RelName::new("public", "a"));
-        assert_eq!(second.meta.table_key, RelName::new("public", "b"));
+        assert_eq!(first.meta.table_key.rel, RelName::new("public", "a"));
+        assert_eq!(second.meta.table_key.rel, RelName::new("public", "b"));
         assert!(
             (Duration::from_secs(1)..Duration::from_millis(1100)).contains(&first_at),
             "table a flushed at {first_at:?}"
@@ -1091,11 +1092,11 @@ mod tests {
         let second = batches_rx.recv().await.expect("second batch");
         let second_at = start.elapsed();
         assert_eq!(
-            first.meta.table_key,
+            first.meta.table_key.rel,
             RelName::new("public", "b"),
             "shorter new deadline flushes first"
         );
-        assert_eq!(second.meta.table_key, RelName::new("public", "a"));
+        assert_eq!(second.meta.table_key.rel, RelName::new("public", "a"));
         assert!(
             (Duration::from_millis(300)..Duration::from_millis(400)).contains(&first_at),
             "table b flushed at {first_at:?}, want 200 ms after its row"

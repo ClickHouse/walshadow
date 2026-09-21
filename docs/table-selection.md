@@ -27,7 +27,9 @@ replicate_all = true
 replicate = false
 ```
 
-Use this mode when destination should track whole database by default
+Use this mode to replicate all tables by default. It covers the source database
+`dbname` in `[source]` names; entries prefixed with another database name bring
+that database in too, see [several databases](multi-database.md)
 
 ## Replicate an explicit set
 

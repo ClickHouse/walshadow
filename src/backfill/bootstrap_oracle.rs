@@ -235,7 +235,7 @@ fn filter_out_extensions(dump: &str, excluded: &[String]) -> String {
     if excluded.is_empty() {
         return dump.to_string();
     }
-    let excluded: std::collections::HashSet<&str> = excluded.iter().map(String::as_str).collect();
+    let excluded: ahash::HashSet<&str> = excluded.iter().map(String::as_str).collect();
     let lines: Vec<&str> = dump.lines().collect();
     let n = lines.len();
     let is_header = |i: usize| {
@@ -268,7 +268,7 @@ fn filter_out_extensions(dump: &str, excluded: &[String]) -> String {
     joined
 }
 
-fn should_drop_entry(seg: &[&str], excluded: &std::collections::HashSet<&str>) -> bool {
+fn should_drop_entry(seg: &[&str], excluded: &ahash::HashSet<&str>) -> bool {
     let meta = seg
         .get(1)
         .and_then(|h| h.strip_prefix("-- Name: "))

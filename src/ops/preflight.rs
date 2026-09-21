@@ -18,6 +18,8 @@
 //!   the bootstrap skips the inline WAL window and reads it from the
 //!   `[backup]` bucket, so an unarchived source leaves nothing to fetch.
 //! - source `max_wal_senders` cannot seat Direct backup and window stream
+//! - a `database.schema.table` key names a database missing from
+//!   `pg_database`, which would replicate nothing under that prefix
 
 use std::fmt;
 
@@ -91,6 +93,11 @@ pub enum PreflightError {
          runs. Raise max_wal_senders on the source"
     )]
     WalSendersTooLow { got: i32, need: i32 },
+    #[error(
+        "config names source database {db:?}, but pg_database has no such \
+         database; fix the `database.schema.table` key or create the database"
+    )]
+    SourceDatabaseMissing { db: String },
     #[error("pg query: {0}")]
     Pg(#[from] tokio_postgres::Error),
     #[error("shadow_version_num could not be parsed: {0:?}")]
@@ -213,42 +220,60 @@ pub async fn source(input: SourceInputs<'_>) -> Result<PreflightReport, Prefligh
     }
 
     if let Some(cfg) = input.ch_config {
-        for key in cfg.tables.keys() {
-            // pg_class⋈pg_namespace by parts: zero rows (not raise) on a
-            // missing relation; one row of relreplident otherwise.
-            let (ns, name): (&str, &str) = (&key.namespace, &key.name);
+        for db in &cfg.databases {
             let row = input
                 .source_sql
-                .query_opt(
-                    "SELECT c.relreplident::text, \
-                            EXISTS (SELECT 1 FROM pg_index i \
-                                    WHERE i.indrelid = c.oid AND i.indisprimary) \
-                     FROM pg_class c \
-                     JOIN pg_namespace n ON n.oid = c.relnamespace \
-                     WHERE n.nspname = $1 AND c.relname = $2",
-                    &[&ns, &name],
-                )
+                .query_opt("SELECT 1 FROM pg_database WHERE datname = $1", &[&db])
                 .await?;
-            match row {
-                Some(r) => {
-                    let id: String = r.get(0);
-                    let has_pk: bool = r.get(1);
-                    let ch = id.chars().next().unwrap_or('?');
-                    if !replica_identity_has_key(ch, has_pk) {
-                        report.errors.push(PreflightError::BadReplicaIdentity {
-                            rel: key.clone(),
-                            got: ch,
-                        });
-                    }
-                }
-                None => report
+            if row.is_none() {
+                report
                     .errors
-                    .push(PreflightError::MappedRelMissing { rel: key.clone() }),
+                    .push(PreflightError::SourceDatabaseMissing { db: db.clone() });
             }
         }
+        report
+            .errors
+            .extend(mapped_relations(input.source_sql, cfg).await?);
     }
 
     Ok(report)
+}
+
+/// Check configured tables exist and have usable replica identities
+/// Use a connection to source database selected by `cfg`
+pub async fn mapped_relations(
+    source_sql: &Client,
+    cfg: &EmitterConfig,
+) -> Result<Vec<PreflightError>, PreflightError> {
+    let mut errors = Vec::new();
+    for key in cfg.tables.keys() {
+        let (ns, name): (&str, &str) = (&key.namespace, &key.name);
+        let row = source_sql
+            .query_opt(
+                "SELECT c.relreplident::text, \
+                        EXISTS (SELECT 1 FROM pg_index i \
+                                WHERE i.indrelid = c.oid AND i.indisprimary) \
+                 FROM pg_class c \
+                 JOIN pg_namespace n ON n.oid = c.relnamespace \
+                 WHERE n.nspname = $1 AND c.relname = $2",
+                &[&ns, &name],
+            )
+            .await?;
+        if let Some(r) = row {
+            let id: String = r.get(0);
+            let has_pk: bool = r.get(1);
+            let ch = id.chars().next().unwrap_or('?');
+            if !replica_identity_has_key(ch, has_pk) {
+                errors.push(PreflightError::BadReplicaIdentity {
+                    rel: key.clone(),
+                    got: ch,
+                });
+            }
+        } else {
+            errors.push(PreflightError::MappedRelMissing { rel: key.clone() });
+        }
+    }
+    Ok(errors)
 }
 
 /// Shadow/source major must match: a same-physical-WAL standby can't span

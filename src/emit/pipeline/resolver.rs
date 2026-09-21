@@ -158,7 +158,7 @@ async fn resolve_oracle(
         ))
     })?;
     oracle
-        .encode_batch(&columns, batch.n_rows, alloc)
+        .encode_batch(batch.meta.table_key.db_oid, &columns, batch.n_rows, alloc)
         .await
         .map(Some)
 }

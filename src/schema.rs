@@ -58,6 +58,26 @@ impl std::fmt::Display for RelName {
     }
 }
 
+/// Batch identity down the insert path: the same relation name in two source
+/// databases routes to two destinations, so the database is part of the key
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct TableKey {
+    pub db_oid: u32,
+    pub rel: RelName,
+}
+
+impl TableKey {
+    pub fn new(db_oid: u32, rel: RelName) -> Self {
+        Self { db_oid, rel }
+    }
+}
+
+impl std::fmt::Display for TableKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}@db{}", self.rel, self.db_oid)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct RelDescriptor {
     pub rfn: RelFileNode,

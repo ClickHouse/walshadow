@@ -30,6 +30,10 @@ pub(crate) struct DirtyState {
     /// carry shared `dbId == 0` scope). Lets the commit fail closed when
     /// its `xl_xact_dbinfo.dbId` contradicts that proof
     pub(crate) direct_write: bool,
+    /// Database identified by catalog writes
+    pub(crate) db: Option<u32>,
+    /// Conflicting database from catalog writes, reject transaction at commit
+    pub(crate) db_other: Option<u32>,
 }
 
 impl DirtyState {
@@ -39,6 +43,8 @@ impl DirtyState {
             oids: HashMap::new(),
             unenumerated: false,
             direct_write: false,
+            db: None,
+            db_other: None,
         }
     }
 
@@ -46,6 +52,12 @@ impl DirtyState {
         self.first_touch = self.first_touch.min(other.first_touch);
         self.unenumerated |= other.unenumerated;
         self.direct_write |= other.direct_write;
+        match (self.db, other.db) {
+            (Some(ours), Some(theirs)) if ours != theirs => self.db_other = Some(theirs),
+            (None, theirs) => self.db = theirs,
+            _ => {}
+        }
+        self.db_other = self.db_other.or(other.db_other);
         for (oid, lsn) in other.oids {
             self.oids
                 .entry(oid)

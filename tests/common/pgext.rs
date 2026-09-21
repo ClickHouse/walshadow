@@ -12,7 +12,7 @@ use std::fs;
 use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output};
 use std::time::{Duration, Instant};
 
 use walshadow::shadow::{BridgeConf, Shadow, ShadowConfig};
@@ -382,9 +382,31 @@ impl Cluster {
     }
 
     pub fn start(&mut self, env: &[(String, String)]) {
+        let out = self.pg_ctl_start(env);
+        assert!(
+            out.status.success(),
+            "pg_ctl start: {}\n{}",
+            String::from_utf8_lossy(&out.stderr),
+            self.log()
+        );
+        self.running = true;
+    }
+
+    /// Config `_PG_init` rejects is FATAL in the postmaster, so `pg_ctl`
+    /// reports the failure and leaves nothing to stop
+    pub fn start_refused(&self) {
+        let out = self.pg_ctl_start(&[]);
+        assert!(
+            !out.status.success(),
+            "postmaster started on config it must refuse:\n{}",
+            self.log()
+        );
+    }
+
+    fn pg_ctl_start(&self, env: &[(String, String)]) -> Output {
         let data = self.sh.config().data_dir.clone();
         let log = data.join("startup.log");
-        let out = Command::new("pg_ctl")
+        Command::new("pg_ctl")
             .args([
                 "-D",
                 data.to_str().unwrap(),
@@ -397,14 +419,7 @@ impl Cluster {
             ])
             .envs(env.iter().cloned())
             .output()
-            .expect("pg_ctl start");
-        assert!(
-            out.status.success(),
-            "pg_ctl start: {}\n{}",
-            String::from_utf8_lossy(&out.stderr),
-            self.log()
-        );
-        self.running = true;
+            .expect("pg_ctl start")
     }
 
     pub fn stop(&mut self) {
@@ -574,7 +589,7 @@ pub fn request(sock: &mut UnixStream, payload: &[u8]) -> Vec<u8> {
 pub fn hello(sock: &mut UnixStream) -> Vec<u8> {
     let body = request(sock, &[0x01]);
     assert_eq!(body[0], 0, "hello answered {body:?}");
-    assert_eq!(body.len(), 14, "hello frame {body:?}");
+    assert_eq!(body.len(), 18, "hello frame {body:?}");
     body
 }
 

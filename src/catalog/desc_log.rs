@@ -1575,6 +1575,61 @@ fn decode_attnums(cur: &mut Cur<'_>) -> Result<Vec<i16>> {
     Ok(out)
 }
 
+/// Descriptor logs by database: one log per followed database, selected by
+/// a record's `RelFileNode::db_node`
+#[derive(Clone, Debug, Default)]
+pub struct DescriptorLogs {
+    by_db: Vec<(Oid, Arc<DescriptorLog>)>,
+}
+
+impl DescriptorLogs {
+    pub fn new(logs: impl IntoIterator<Item = Arc<DescriptorLog>>) -> Self {
+        Self {
+            by_db: logs.into_iter().map(|log| (log.db_oid(), log)).collect(),
+        }
+    }
+
+    pub fn single(log: Arc<DescriptorLog>) -> Self {
+        Self::new([log])
+    }
+
+    pub fn get(&self, db_oid: Oid) -> Option<&Arc<DescriptorLog>> {
+        self.by_db
+            .iter()
+            .find(|(db, _)| *db == db_oid)
+            .map(|(_, log)| log)
+    }
+
+    /// Log a record's database resolves to. A miss — a database this daemon
+    /// does not follow — counts as a foreign-database lookup, same as one
+    /// the log itself would have refused
+    pub fn lookup(&self, db_oid: Oid) -> Option<&Arc<DescriptorLog>> {
+        let found = self.get(db_oid);
+        if found.is_none()
+            && let Some((_, log)) = self.by_db.first()
+        {
+            log.stats
+                .lookups_foreign_db
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        found
+    }
+
+    /// `[source] dbname`'s log, for paths that are single-database by
+    /// construction (bootstrap gap replay)
+    pub fn primary(&self) -> &Arc<DescriptorLog> {
+        &self.by_db.first().expect("at least one log").1
+    }
+
+    pub fn all(&self) -> impl Iterator<Item = &Arc<DescriptorLog>> {
+        self.by_db.iter().map(|(_, log)| log)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.by_db.is_empty()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

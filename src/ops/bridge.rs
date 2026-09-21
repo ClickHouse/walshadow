@@ -23,7 +23,7 @@ use tokio::sync::Mutex;
 use crate::toast::FetchedValue;
 
 /// Frame and op layouts. Must equal `WS_PROTO_VERSION` in `pgext/walshadow.h`
-pub const PROTO_VERSION: u32 = 6;
+pub const PROTO_VERSION: u32 = 7;
 /// Catalog column plans. Must equal `WS_PROJECTION_VERSION`
 pub const PROJECTION_VERSION: u32 = 1;
 
@@ -38,10 +38,13 @@ const MAX_RESPONSE_BYTES: usize = 256 * 1024 * 1024;
 /// Matches `WS_MAX_SCAN_OIDS`. A longer list is the caller's to chunk, since
 /// only the caller knows whether the chunks share a replay position
 pub const MAX_SCAN_OIDS: usize = 65536;
-/// Matches `WS_MAX_WORKERS`, the ceiling on `walshadow.bridge_workers`
+/// Matches `WS_MAX_WORKERS`, the per-database ceiling on
+/// `walshadow.bridge_workers`
 pub const MAX_BRIDGE_WORKERS: usize = 8;
 /// Must match `WS_MAX_FETCH_VALUES`
 pub const MAX_FETCH_VALUES: usize = 1024;
+/// Matches `WS_MAX_DATABASES`, the ceiling on `walshadow.databases`
+pub const MAX_BRIDGE_DATABASES: usize = 8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -154,6 +157,8 @@ pub struct Hello {
     pub projection: u32,
     pub pg_version_num: u32,
     pub in_recovery: bool,
+    /// Worker database OID, used to reject connections to another database
+    pub datid: u32,
 }
 
 /// Response body a worker answered with, on loan from the bridge's pool.
@@ -344,14 +349,21 @@ impl Bridge {
         path: impl AsRef<Path>,
         workers: usize,
     ) -> Result<Self, BridgeError> {
+        Self::connect_database(path, 0, workers).await
+    }
+
+    /// Connect to one database's workers, numbered in `walshadow.databases` order
+    /// Start at socket `db_index * workers`, reserve first worker for catalog reads
+    pub async fn connect_database(
+        path: impl AsRef<Path>,
+        db_index: usize,
+        workers: usize,
+    ) -> Result<Self, BridgeError> {
         let base = path.as_ref();
-        let slots: Vec<Slot> = (0..workers.clamp(1, MAX_BRIDGE_WORKERS))
+        let workers = workers.clamp(1, MAX_BRIDGE_WORKERS);
+        let slots: Vec<Slot> = (0..workers)
             .map(|i| Slot {
-                path: if i == 0 {
-                    base.to_owned()
-                } else {
-                    PathBuf::from(format!("{}.{i}", base.display()))
-                },
+                path: slot_path(base, db_index * workers + i),
                 conn: Mutex::new(None),
             })
             .collect();
@@ -611,20 +623,23 @@ impl Bridge {
         let len = res?;
 
         let mut c = Cursor::at(&body[..len], 1);
-        let info = Hello {
-            proto: c.u32()?,
-            projection: c.u32()?,
-            pg_version_num: c.u32()?,
-            in_recovery: c.u8()? != 0,
-        };
-        if info.proto != PROTO_VERSION || info.projection != PROJECTION_VERSION {
+        // Older workers send shorter responses, report version mismatch first
+        let (proto, projection) = (c.u32()?, c.u32()?);
+        if proto != PROTO_VERSION || projection != PROJECTION_VERSION {
             return Err(BridgeError::Version {
-                proto: info.proto,
-                projection: info.projection,
+                proto,
+                projection,
                 want_proto: PROTO_VERSION,
                 want_projection: PROJECTION_VERSION,
             });
         }
+        let info = Hello {
+            proto,
+            projection,
+            pg_version_num: c.u32()?,
+            in_recovery: c.u8()? != 0,
+            datid: c.u32()?,
+        };
         // A worker that came back a different build must not be trusted to
         // answer requests the daemon framed against the old one
         let first = *self.info.get_or_init(|| info);
@@ -810,6 +825,15 @@ async fn round_trip(
     }
 }
 
+/// Keep socket 0 at `walshadow.socket_path` for existing clients
+pub fn slot_path(base: &Path, i: usize) -> PathBuf {
+    if i == 0 {
+        base.to_owned()
+    } else {
+        PathBuf::from(format!("{}.{i}", base.display()))
+    }
+}
+
 /// Connect with a wall-clock budget while shadow reaches consistency.
 /// Matches catalog's
 /// [`with_transient_retry`](crate::catalog::shadow_catalog::with_transient_retry) shape
@@ -818,8 +842,20 @@ pub async fn connect_with_budget(
     workers: usize,
     budget: Duration,
 ) -> Result<Bridge, BridgeError> {
+    connect_database_with_budget(path, 0, workers, budget).await
+}
+
+/// [`connect_with_budget`] for one source database's slice of the sockets.
+/// Each database counts into its own [`BridgeStats`], which `database=`
+/// labels on the metric surface
+pub async fn connect_database_with_budget(
+    path: &Path,
+    db_index: usize,
+    workers: usize,
+    budget: Duration,
+) -> Result<Bridge, BridgeError> {
     let deadline = tokio::time::Instant::now() + budget;
-    (|| Bridge::connect_pooled(path, workers))
+    (|| Bridge::connect_database(path, db_index, workers))
         .retry(
             ExponentialBuilder::default()
                 .with_min_delay(Duration::from_millis(100))
@@ -1205,6 +1241,7 @@ mod tests {
         b.extend_from_slice(&projection.to_be_bytes());
         b.extend_from_slice(&170004u32.to_be_bytes());
         b.push(1);
+        b.extend_from_slice(&16384u32.to_be_bytes());
         b
     }
 

@@ -135,3 +135,30 @@ An uninstalled build tree reaches PG through `dynamic_library_path`:
   fails rather than silently skips
 
 A `make install` into `$libdir` needs neither
+
+## Bridge settings
+
+Set these in shadow's `postgresql.conf`. Restart PostgreSQL after changing them,
+except `walshadow.io_timeout_ms`, which supports reload
+
+| Setting | Default | Purpose |
+|---|---|---|
+| `walshadow.socket_path` | empty | Unix socket path, empty disables bridge workers |
+| `walshadow.databases` | `"postgres"` | Comma-separated database names |
+| `walshadow.bridge_workers` | `1` | Workers per database, from 1 to 8 |
+| `walshadow.io_timeout_ms` | `30000` | Connection timeout in milliseconds |
+| `walshadow.lock_timeout_ms` | `1000` | Catalog read lock timeout in milliseconds, zero disables timeout |
+
+Double-quote each database name to preserve case and punctuation. Double any
+embedded double quotes, following PostgreSQL identifier rules
+
+```conf
+walshadow.databases = '"app","billing"'
+walshadow.bridge_workers = 2
+```
+
+Number sockets across databases in listed order. Socket 0 uses
+`walshadow.socket_path`, remaining sockets append `.1`, `.2`, and so on
+In example above, `app` uses sockets 0 and 1, `billing` uses sockets 2 and 3
+Each worker handles one request at a time, so worker count limits concurrent
+requests per database. Total worker count cannot exceed 64

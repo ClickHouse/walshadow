@@ -3,7 +3,7 @@
 //! Spawns the daemon as a subprocess pointed at a basebackup-bootstrapped
 //! source / shadow PG pair, drives an INSERT/UPDATE/DELETE workload, and
 //! asserts shadow replays the workload before the daemon exits via its
-//! `--max-segments` cap. Exercises [bin/stream.rs]'s argv parsing,
+//! `--max-segments` cap. Exercises [bin/stream/args.rs]'s argv parsing,
 //! `run()` setup (preflight + tracker seed + ShadowCatalog connect +
 //! cursor write + status loop), the metrics endpoint, retention sweeper
 //! poll path, and the partial-segment flush on shutdown — paths the

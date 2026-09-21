@@ -367,7 +367,10 @@ async fn defer_catalog_decode_stashes_raw_and_commit_fences() {
     let buffer = Arc::new(Mutex::new(
         XactBuffer::new(cfg(tmp.path().join("spill"), 1024)).unwrap(),
     ));
-    let mut sink = BufferingDecoderSink::new(log.clone(), buffer.clone());
+    let mut sink = BufferingDecoderSink::new(
+        walshadow::desc_log::DescriptorLogs::single(log.clone()),
+        buffer.clone(),
+    );
     let record = Record {
         parsed: XLogRecord {
             header: XLogRecordHeader {

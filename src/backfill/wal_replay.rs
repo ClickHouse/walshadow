@@ -13,7 +13,7 @@ use walrus::pg::wal::segment::SegmentName;
 use walrus::pg::walparser::{Oid, RmId};
 
 use crate::budget::{MemoryBudget, MemoryPermit, acquire_opt};
-use crate::catalog::desc_log::DescriptorLog;
+use crate::catalog::desc_log::{DescriptorLog, DescriptorLogs};
 use crate::config::ResolvedConfig;
 use crate::decode::heap_decoder::CommittedTuple;
 use crate::decode::visibility::PgXactPatch;
@@ -123,7 +123,10 @@ impl WalReplaySink {
             .budget()
             .map_or(usize::MAX, MemoryBudget::leaf_max);
         Self {
-            decoder: BufferingDecoderSink::new(inputs.log.clone(), inputs.buffer.clone()),
+            decoder: BufferingDecoderSink::new(
+                DescriptorLogs::single(inputs.log.clone()),
+                inputs.buffer.clone(),
+            ),
             buffer: inputs.buffer,
             log: inputs.log,
             pending: Default::default(),

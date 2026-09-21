@@ -209,7 +209,10 @@ async fn bootstrap_oracle_preserves_types_and_removes_cluster() {
         ];
         let oracle = bootstrap.oracle();
         assert!(Arc::ptr_eq(&oracle, &bootstrap.oracle()));
-        let block = oracle.encode_batch(&columns, 1, alloc()).await.unwrap();
+        let block = oracle
+            .encode_batch(Oracle::ANY_DATABASE, &columns, 1, alloc())
+            .await
+            .unwrap();
         assert_eq!(
             block.column(0).unwrap().string().unwrap(),
             (&[4][..], &b"busy"[..])
@@ -230,7 +233,12 @@ async fn bootstrap_oracle_preserves_types_and_removes_cluster() {
         drop(bootstrap);
         assert!(!base.exists());
         assert!(!shadow.is_running().unwrap());
-        assert!(oracle.encode_batch(&columns, 1, alloc()).await.is_err());
+        assert!(
+            oracle
+                .encode_batch(Oracle::ANY_DATABASE, &columns, 1, alloc())
+                .await
+                .is_err()
+        );
     }
     assert_eq!(source.sh.psql_one("SELECT count(*) FROM t").unwrap(), "1");
 }
@@ -374,7 +382,7 @@ async fn oracle_encodes_tier3_disk_bytes() {
     ];
 
     let block = oracle
-        .encode_batch(&columns, 1, alloc())
+        .encode_batch(Oracle::ANY_DATABASE, &columns, 1, alloc())
         .await
         .expect("oracle answers");
 
@@ -449,7 +457,10 @@ async fn oracle_defaults_fill_absent_cells() {
             buf,
         })
         .collect();
-    let block = oracle.encode_batch(&columns, 3, alloc()).await.unwrap();
+    let block = oracle
+        .encode_batch(Oracle::ANY_DATABASE, &columns, 3, alloc())
+        .await
+        .unwrap();
     assert_eq!(
         block.column(0).unwrap().string().unwrap(),
         (&[0, 7, 7][..], &b"literal"[..])
@@ -554,7 +565,7 @@ async fn oracle_fails_whole_request_on_bad_cell() {
         let mut value = buf(oid, vec![good.clone(), bad]);
         value.source_typmod = typmod;
         let err = oracle
-            .encode_batch(&request(&value), 2, alloc())
+            .encode_batch(Oracle::ANY_DATABASE, &request(&value), 2, alloc())
             .await
             .expect_err("bad cell fails whole request");
         let msg = err.to_string();
@@ -570,7 +581,7 @@ async fn oracle_fails_whole_request_on_bad_cell() {
         let mut value = buf(oid, vec![good.clone(), good]);
         value.source_typmod = typmod;
         let block = oracle
-            .encode_batch(&request(&value), 2, alloc())
+            .encode_batch(Oracle::ANY_DATABASE, &request(&value), 2, alloc())
             .await
             .expect("worker still serves");
         assert_eq!(
@@ -687,7 +698,7 @@ async fn worker_refuses_malformed_requests() {
             "{expected}: {err}"
         );
         let block = oracle
-            .encode_batch(&columns, 1, alloc())
+            .encode_batch(Oracle::ANY_DATABASE, &columns, 1, alloc())
             .await
             .expect("worker still serves");
         assert_eq!(
@@ -718,13 +729,16 @@ async fn oracle_recovers_after_cluster_restart() {
         }]
     };
     oracle
-        .encode_batch(&request(), 1, alloc())
+        .encode_batch(Oracle::ANY_DATABASE, &request(), 1, alloc())
         .await
         .expect("first request");
 
     guard.sh.stop().expect("stop");
     assert!(
-        oracle.encode_batch(&request(), 1, alloc()).await.is_err(),
+        oracle
+            .encode_batch(Oracle::ANY_DATABASE, &request(), 1, alloc())
+            .await
+            .is_err(),
         "no block while the cluster is down",
     );
     assert!(oracle.stats.errors.load(Ordering::Relaxed) >= 1);
@@ -733,7 +747,11 @@ async fn oracle_recovers_after_cluster_restart() {
     // Postmaster is up before the worker has re-bound its socket
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
-        if oracle.encode_batch(&request(), 1, alloc()).await.is_ok() {
+        if oracle
+            .encode_batch(Oracle::ANY_DATABASE, &request(), 1, alloc())
+            .await
+            .is_ok()
+        {
             break;
         }
         assert!(

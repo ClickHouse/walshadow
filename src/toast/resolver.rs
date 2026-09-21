@@ -991,6 +991,7 @@ impl ChunkStore for ClickHouseChunkStore {
 #[derive(Clone)]
 pub struct ToastResolver {
     store: Option<Arc<dyn ChunkStore>>,
+    database_stores: Option<Arc<HashMap<u32, Arc<dyn ChunkStore>>>>,
     stats: Arc<EmitterStats>,
     put_batch_rows: usize,
     put_batch_bytes: usize,
@@ -1007,6 +1008,7 @@ impl ToastResolver {
     pub fn disabled() -> Self {
         Self {
             store: None,
+            database_stores: None,
             stats: Arc::new(EmitterStats::default()),
             put_batch_rows: CHUNK_PUT_BATCH,
             put_batch_bytes: CHUNK_PUT_BYTES,
@@ -1058,6 +1060,7 @@ impl ToastResolver {
     ) -> Self {
         Self {
             store,
+            database_stores: None,
             stats,
             put_batch_rows: emitter
                 .toast
@@ -1077,6 +1080,7 @@ impl ToastResolver {
     pub fn with_store(store: Arc<dyn ChunkStore>, stats: Arc<EmitterStats>) -> Self {
         Self {
             store: Some(store),
+            database_stores: None,
             stats,
             put_batch_rows: CHUNK_PUT_BATCH,
             put_batch_bytes: CHUNK_PUT_BYTES,
@@ -1084,6 +1088,14 @@ impl ToastResolver {
             overflow: InlineValueOverflow::default(),
             budget: None,
         }
+    }
+
+    pub fn with_database_stores(
+        mut self,
+        stores: impl IntoIterator<Item = (u32, Arc<dyn ChunkStore>)>,
+    ) -> Self {
+        self.database_stores = Some(Arc::new(stores.into_iter().collect()));
+        self
     }
 
     /// Leaf-permit pool, attached at pipeline spawn
@@ -1160,13 +1172,14 @@ impl ToastResolver {
     /// `None` without store
     pub async fn fetch_value(
         &self,
+        db_oid: u32,
         toast_relid: u32,
         value_id: u32,
         max_lsn: u64,
         expected_size: usize,
     ) -> Result<Option<FetchedValue>, ChunkStoreError> {
         let Some(v) = self
-            .fetch_values(toast_relid, &[(value_id, expected_size)], max_lsn)
+            .fetch_values(db_oid, toast_relid, &[(value_id, expected_size)], max_lsn)
             .await?
         else {
             return Ok(None);
@@ -1178,6 +1191,7 @@ impl ToastResolver {
     /// store. Value ids must be unique
     pub async fn fetch_values(
         &self,
+        db_oid: u32,
         toast_relid: u32,
         values: &[(u32, usize)],
         max_lsn: u64,
@@ -1188,6 +1202,12 @@ impl ToastResolver {
         if values.is_empty() {
             return Ok(Some(Vec::new()));
         }
+        let store = match &self.database_stores {
+            Some(stores) => stores.get(&db_oid).ok_or_else(|| {
+                ChunkStoreError::Shadow(format!("no TOAST store for database {db_oid}"))
+            })?,
+            None => store,
+        };
         let started = std::time::Instant::now();
         let got = store.fetch_many(toast_relid, values, max_lsn).await?;
         self.stats
@@ -1435,6 +1455,32 @@ mod tests {
             offnum: tid.1,
             source_lsn: lsn,
         })
+    }
+
+    #[tokio::test]
+    async fn database_stores_isolate_colliding_value_ids() {
+        let first = Arc::new(MemChunkStore::new());
+        let second = Arc::new(MemChunkStore::new());
+        first.put(&[row(7, 0, (1, 1), 10, b"first")]).await.unwrap();
+        second
+            .put(&[row(7, 0, (1, 1), 10, b"other")])
+            .await
+            .unwrap();
+        let resolver = ToastResolver::with_store(first.clone(), Arc::default())
+            .with_database_stores([
+                (1, first as Arc<dyn ChunkStore>),
+                (2, second as Arc<dyn ChunkStore>),
+            ]);
+        for (db_oid, expected) in [(1, b"first"), (2, b"other")] {
+            assert_eq!(
+                resolver.fetch_value(db_oid, 16500, 7, 10, 5).await.unwrap(),
+                Some(FetchedValue::Assembled(expected.to_vec())),
+            );
+        }
+        assert!(matches!(
+            resolver.fetch_value(3, 16500, 7, 10, 5).await,
+            Err(ChunkStoreError::Shadow(_)),
+        ));
     }
 
     #[tokio::test]
@@ -1775,7 +1821,7 @@ mod tests {
         assert!(!r.stores_chunks(), "nothing should collect rows for it");
         assert!(!r.fill_on_miss(), "a miss still has to be explained");
         assert_eq!(
-            r.fetch_value(16500, 7, u64::MAX, 4).await.unwrap(),
+            r.fetch_value(0, 16500, 7, u64::MAX, 4).await.unwrap(),
             Some(assembled(b"body")),
         );
         // Reject writes instead of dropping rows
@@ -1874,7 +1920,7 @@ mod tests {
         let r = ToastResolver::disabled();
         assert!(r.fill_on_miss());
         assert!(!r.stores_chunks());
-        assert!(r.fetch_value(1, 2, u64::MAX, 3).await.unwrap().is_none());
+        assert!(r.fetch_value(0, 1, 2, u64::MAX, 3).await.unwrap().is_none());
         r.put(&[row(2, 0, (1, 1), 0x1000, b"x")]).await.unwrap();
     }
 
@@ -1891,11 +1937,11 @@ mod tests {
         assert_eq!(stats.toast_chunks_stored.load(Ordering::Relaxed), 1);
         assert_eq!(stats.toast_tombstones_stored.load(Ordering::Relaxed), 1);
 
-        let got = r.fetch_value(16500, 7, u64::MAX, 2).await.unwrap();
+        let got = r.fetch_value(0, 16500, 7, u64::MAX, 2).await.unwrap();
         assert_eq!(got, Some(assembled(b"hi")));
         assert_eq!(stats.toast_values_fetched.load(Ordering::Relaxed), 1);
 
-        let miss = r.fetch_value(16500, 404, u64::MAX, 2).await.unwrap();
+        let miss = r.fetch_value(0, 16500, 404, u64::MAX, 2).await.unwrap();
         assert_eq!(miss, Some(FetchedValue::Missing));
         assert_eq!(
             stats.toast_values_fetched.load(Ordering::Relaxed),

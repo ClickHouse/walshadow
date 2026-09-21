@@ -185,11 +185,9 @@ pub struct Filter {
     /// First xid known to be fully visible to this run
     observed_from_xid: Option<u32>,
     smgr_markers: Arc<Mutex<SmgrMarkers>>,
-    /// Followed database. Routing and catalog-filenode tracking stay
-    /// cluster-wide; this scopes descriptor-capture input only. `None`
-    /// (offline segment filter, no capture consumer) proves no record's
-    /// database, so no record dirties
-    target_db_oid: Option<u32>,
+    /// Databases that need table metadata updates, empty disables capture
+    /// Continue routing WAL and tracking catalog files for all databases
+    targets: Vec<u32>,
     shadow_rels: Option<ShadowRelations>,
     /// Xid ceilings the shadow TOAST store reads. Absent for offline
     /// filters, which serve no reads
@@ -205,7 +203,7 @@ impl Filter {
             stats_writers: HashSet::new(),
             observed_from_xid: None,
             smgr_markers: Arc::new(Mutex::new(SmgrMarkers::default())),
-            target_db_oid: None,
+            targets: Vec::new(),
             shadow_rels: None,
             xid_ceiling: None,
         }
@@ -219,7 +217,17 @@ impl Filter {
     /// Scope descriptor-capture input to the followed database. Live
     /// streams set this before the first record
     pub fn set_target_db(&mut self, db_oid: u32) {
-        self.target_db_oid = Some(db_oid);
+        self.set_target_dbs([db_oid]);
+    }
+
+    /// [`set_target_db`](Self::set_target_db) for a multi-database stream
+    pub fn set_target_dbs(&mut self, db_oids: impl IntoIterator<Item = u32>) {
+        self.targets = db_oids.into_iter().collect();
+    }
+
+    /// Followed databases, in the order they were set
+    pub fn target_dbs(&self) -> &[u32] {
+        &self.targets
     }
 
     /// Route `rels` and relations created at or after `from_lsn` to both paths
@@ -384,7 +392,7 @@ impl Filter {
                 .insert(rfn, source_lsn);
             // Ignore other databases because their values are never read
             if let Some(rels) = &mut self.shadow_rels
-                && self.target_db_oid.is_none_or(|db| db == rfn.db_node)
+                && (self.targets.is_empty() || self.targets.contains(&rfn.db_node))
             {
                 rels.admit((rfn.db_node, rfn.rel_node), source_lsn);
             }
@@ -410,9 +418,16 @@ impl Filter {
         // Foreign and shared catalog writes route to shadow and update the
         // cluster-wide tracker above, but feed no descriptor of the
         // followed database, so they must not dirty its capture tree
-        if xid != 0 && catalog_touch_db.is_some_and(|db| self.is_target_db(db)) {
+        if let Some(db) = catalog_touch_db.filter(|db| xid != 0 && self.is_target_db(*db)) {
             let dirty = self.dirty.touch(xid, source_lsn);
             dirty.direct_write = true;
+            if let Some(have) = dirty.db
+                && have != db
+            {
+                dirty.db_other = Some(db);
+            } else {
+                dirty.db = Some(db);
+            }
             if let Some(oid) = obs.pg_class_user_oid {
                 dirty.oids.entry(oid).or_insert(source_lsn);
             }
@@ -497,16 +512,24 @@ impl Filter {
                 aborted_tree: merged.is_some().then(|| Arc::new(members)),
             });
         }
-        // Scope contradiction: the tree holds writes admitted as this
-        // database's, yet the committing backend names another. One of the
-        // two scopes is wrong, so no boundary built here is trustworthy.
-        // Checked after the drain — state leaves with the xact either way
-        if let Some(target) = self.target_db_oid
-            && let Some(db_id) = payload.db_id
-            && db_id != target
-            && merged.as_ref().is_some_and(|state| state.direct_write)
-        {
-            return Err(XactPayloadError::ForeignScope { db_id, target });
+        // PostgreSQL transactions can write to only one database
+        // Reject conflicting database IDs after removing transaction state
+        if let Some(state) = merged.as_ref().filter(|state| state.direct_write) {
+            let proved = state.db.unwrap_or(0);
+            if let Some(second) = state.db_other {
+                return Err(XactPayloadError::MixedScope {
+                    first: proved,
+                    second,
+                });
+            }
+            if let Some(db_id) = payload.db_id
+                && db_id != proved
+            {
+                return Err(XactPayloadError::ForeignScope {
+                    db_id,
+                    target: proved,
+                });
+            }
         }
         // Target relcache invals: second oid source + capture-all trigger.
         // db 0 = shared relation; user rels there are impossible, kept for
@@ -549,6 +572,12 @@ impl Filter {
         // of the xact's rows, so its events order after them — safe for
         // descriptor bias (newer reader reads older tuples)
         let mut merged = merged.unwrap_or_else(|| DirtyState::new(source_lsn));
+        // Use database from catalog writes or commit record
+        // Zero requests catalog capture for every configured database
+        let db_oid = merged
+            .db
+            .or(payload.db_id.filter(|db| self.is_target_db(*db)))
+            .unwrap_or(0);
         for oid in inval_oids {
             merged.oids.entry(oid).or_default();
         }
@@ -567,6 +596,7 @@ impl Filter {
                 tree_first_touch: merged.first_touch,
                 oids,
                 capture_all: capture_all || merged.unenumerated,
+                db_oid,
                 kind: BoundaryKind::Commit,
                 members,
                 stats_only,
@@ -600,10 +630,14 @@ impl Filter {
         let invals = parse_xact_invalidations(&record.main_data, page_magic)?;
         let namespace_hit = invals.namespace.hits(|db| self.is_target_or_shared(db));
         let mut flush = false;
+        let mut inval_db: Option<u32> = None;
         let mut oids: Vec<u32> = Vec::with_capacity(invals.relcache.len());
         for inval in &invals.relcache {
             if !self.is_target_or_shared(inval.db_id) {
                 continue;
+            }
+            if inval.db_id != 0 {
+                inval_db = inval_db.or(Some(inval.db_id));
             }
             if inval.rel_id == 0 {
                 flush = true;
@@ -622,6 +656,7 @@ impl Filter {
         }
         let dirty = self.dirty.touch(xid, source_lsn);
         dirty.unenumerated |= namespace_hit || flush;
+        let db_oid = dirty.db.or(inval_db).unwrap_or(0);
         for oid in &oids {
             // Inval record LSN sits at command end: after the command's
             // catalog writes, before commit — a live pg_class decode's
@@ -646,6 +681,7 @@ impl Filter {
             tree_first_touch,
             oids: touches,
             capture_all: namespace_hit || flush,
+            db_oid,
             kind: BoundaryKind::Command { writer_xid: xid },
             members: Vec::new(),
             stats_only: false,
@@ -695,10 +731,9 @@ impl Filter {
         (!self.tracker.is_opaque_catalog(rel.db_node, rel.rel_node)).then_some(db)
     }
 
-    /// Per-database relation / catalog scope: the record's database is
-    /// provably the followed one. An unwired filter proves nothing
+    /// Check whether record belongs to a configured database
     fn is_target_db(&self, db: u32) -> bool {
-        self.target_db_oid == Some(db)
+        self.targets.contains(&db)
     }
 
     /// Invalidation-message scope: accept db in {0, followed}. PG uses
@@ -707,8 +742,7 @@ impl Filter {
     /// so it admits nothing: shared scope is only shared relative to a
     /// followed database
     fn is_target_or_shared(&self, db: u32) -> bool {
-        self.target_db_oid
-            .is_some_and(|target| db == 0 || db == target)
+        !self.targets.is_empty() && (db == 0 || self.targets.contains(&db))
     }
 
     pub fn rmgr_label(record: &XLogRecord) -> String {

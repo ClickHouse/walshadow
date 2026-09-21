@@ -34,8 +34,8 @@ use crate::decode::heap_decoder::{self, ColumnValue};
 use crate::emit::ch_emitter::{EmitterConfig, RetryConfig};
 use crate::mapping::{
     ColumnMapping, DropTableStrategy, MappingHandle, MappingSnapshot, NamespaceMapping,
-    SystemColumns, TableMapping, TableTarget, apply_column_rule, derive_columns_for_mapping,
-    fold_diff_into_mapping,
+    SystemColumns, TableMapping, TableTarget, TargetOwners, apply_column_rule,
+    derive_columns_for_mapping, fold_diff_into_mapping,
 };
 use crate::ops::oracle::{Oracle, OracleCell};
 use crate::schema::{
@@ -43,6 +43,7 @@ use crate::schema::{
 };
 use crate::table_rules::{TableRule, TableRules};
 use ahash::{HashMap, HashSet, HashSetExt};
+use tokio_postgres::types::Oid;
 
 /// Knobs that don't ride the INSERT pump. [`DdlApplicator`] rebuilds them
 /// from a republished [`ResolvedConfig`] snapshot at each apply, so SIGHUP
@@ -217,6 +218,10 @@ pub struct DdlApplicator {
     /// Shadow PG renderer for tier-3 fast defaults
     oracle: Option<Arc<Oracle>>,
     ensured_databases: HashSet<String>,
+    /// This applicator's source database and the destinations every followed
+    /// database has claimed. Unset for a single database, which owns every
+    /// destination it names
+    owner: Option<(u32, Arc<TargetOwners>)>,
     pub stats: DdlStats,
 }
 
@@ -249,6 +254,7 @@ impl DdlApplicator {
             resolver: None,
             oracle: None,
             ensured_databases: HashSet::new(),
+            owner: None,
             stats: DdlStats::default(),
         })
     }
@@ -263,6 +269,34 @@ impl DdlApplicator {
     pub fn with_oracle(mut self, oracle: Option<Arc<Oracle>>) -> Self {
         self.oracle = oracle;
         self
+    }
+
+    /// Refuse destinations another followed database already writes to
+    pub fn with_target_owners(mut self, db_oid: u32, owners: Arc<TargetOwners>) -> Self {
+        self.owner = Some((db_oid, owners));
+        self
+    }
+
+    /// `false` when another database owns `target`, ie nothing may be created
+    /// or mapped there
+    async fn claims_target(&mut self, target: &TableTarget, rel: &RelName) -> bool {
+        let Some((db_oid, owners)) = &self.owner else {
+            return true;
+        };
+        let Err((owner_db, owner_rel)) = owners.claim(target, *db_oid, rel).await else {
+            return true;
+        };
+        tracing::error!(
+            target: "walshadow::ch_ddl",
+            qname = %rel,
+            db_oid = *db_oid,
+            owner_qname = %owner_rel,
+            owner_db_oid = owner_db,
+            destination = %target.sql(),
+            "another source database already writes this destination; \
+             set target_database or target_table to separate them",
+        );
+        false
     }
 
     pub fn config(&self) -> &DdlConfig {
@@ -333,6 +367,10 @@ impl DdlApplicator {
         // Mapped dest created from the mapping when missing; IF NOT EXISTS
         // no-ops an operator-managed table and re-creates after strategy=drop.
         if let Some(m) = self.mapping_for(&desc.rel_name).await {
+            if !self.claims_target(&m.target, &desc.rel_name).await {
+                self.stats.skipped += 1;
+                return Ok(());
+            }
             self.ensure_database(&m.target.database).await?;
             let settings = self.config.rules.settings(&desc.rel_name);
             let sql =
@@ -366,6 +404,10 @@ impl DdlApplicator {
             self.stats.skipped += 1;
             return Ok(());
         };
+        if !self.claims_target(&target, &desc.rel_name).await {
+            self.stats.skipped += 1;
+            return Ok(());
+        }
         self.ensure_database(&target.database).await?;
         self.execute(&sql).await?;
         self.stats.creates_applied += 1;
@@ -399,6 +441,10 @@ impl DdlApplicator {
             self.stats.skipped += 1;
             return Ok(false);
         };
+        if !self.claims_target(&target, &desc.rel_name).await {
+            self.stats.skipped += 1;
+            return Ok(false);
+        }
         self.ensure_database(&target.database).await?;
         self.execute(&sql).await?;
         self.stats.creates_applied += 1;
@@ -446,7 +492,7 @@ impl DdlApplicator {
         let oracle = self.oracle.clone();
         for att in &diff.added_columns {
             let pk_member = replident_key_attnums(new).contains(&att.attnum);
-            let att = resolve_disk_default(oracle.as_deref(), att).await;
+            let att = resolve_disk_default(oracle.as_deref(), new.rfn.db_node, att).await;
             let Ok(resolved) = type_bridge::map(&att, pk_member) else {
                 // Unbridged type; operator TOML override is the recovery path
                 self.stats.skipped += 1;
@@ -600,7 +646,15 @@ impl DdlApplicator {
             }
             _ => false,
         };
-        predict_route_effect(&self.plan_config(config), mapping, event, excluded)
+        let effect = predict_route_effect(&self.plan_config(config), mapping, event, excluded)?;
+        // Trailing rows of the applying commit route through this prediction,
+        // so it may not name a destination another database owns
+        if let Some((rel, Some(m))) = &effect
+            && !self.claims_target(&m.target, rel).await
+        {
+            return Ok(None);
+        }
+        Ok(effect)
     }
 
     fn plan_config(&self, frozen: Option<&ResolvedConfig>) -> DdlConfig {
@@ -627,6 +681,9 @@ impl DdlApplicator {
     }
 
     async fn forget_mapping(&mut self, rel: &RelName) {
+        if let Some((db_oid, owners)) = &self.owner {
+            owners.release(*db_oid, rel).await;
+        }
         if let Some(r) = &self.resolver {
             r.forget_derived_mapping(rel).await;
         } else {
@@ -803,7 +860,11 @@ fn mapped_col_def(c: &ColumnMapping) -> String {
 
 /// Pinned worker sends raw defaults to avoid `pg_type` locks during replay
 /// Resolve through shadow PG so rows predating `ADD COLUMN` read PG's fast default
-async fn resolve_disk_default<'a>(oracle: Option<&Oracle>, att: &'a RelAttr) -> Cow<'a, RelAttr> {
+async fn resolve_disk_default<'a>(
+    oracle: Option<&Oracle>,
+    db: Oid,
+    att: &'a RelAttr,
+) -> Cow<'a, RelAttr> {
     let ColumnValue::PgPending { raw, .. } = heap_decoder::missing_value_for(att) else {
         return Cow::Borrowed(att);
     };
@@ -811,7 +872,7 @@ async fn resolve_disk_default<'a>(oracle: Option<&Oracle>, att: &'a RelAttr) -> 
         return Cow::Borrowed(att);
     };
     match oracle
-        .text_value(att.type_oid, att.typmod, OracleCell::DiskRaw(raw))
+        .text_value(db, att.type_oid, att.typmod, OracleCell::DiskRaw(raw))
         .await
     {
         Ok(text) => {

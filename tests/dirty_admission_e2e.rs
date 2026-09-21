@@ -432,13 +432,13 @@ async fn benign_in_place_alter_then_dml_delivers() {
         "walshadow-dirty-benign",
     )
     .await;
-    let capture_stats = drill
+    let (_, capture_stats) = drill
         .pipeline
         .sinks
         .capture
-        .as_ref()
-        .expect("capture wired")
-        .stats_handle();
+        .stats_handles()
+        .next()
+        .expect("one capture");
 
     let driver = spawn_txn(
         &drill.source,
@@ -741,13 +741,13 @@ async fn analyze_covers_its_commit_without_reading_shadow() {
     )
     .await;
     let log_stats = drill.pipeline.desc_log.stats_handle();
-    let capture_stats = drill
+    let (_, capture_stats) = drill
         .pipeline
         .sinks
         .capture
-        .as_ref()
-        .expect("DDL pipeline should have catalog capture")
-        .stats_handle();
+        .stats_handles()
+        .next()
+        .expect("one capture");
     let desc_log = drill.pipeline.desc_log.clone();
     let batches_before = log_stats.batches_appended.load(Ordering::Relaxed);
     let sql_before = capture_stats.sql_captures.load(Ordering::Relaxed);

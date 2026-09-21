@@ -278,6 +278,9 @@ struct MergeInputs {
 /// the SIGHUP task (calls [`reload`](Self::reload)) and the WAL apply path
 /// (calls [`apply_config_event`](Self::apply_config_event)).
 pub struct ConfigResolver {
+    /// Source database this resolver publishes, ie which entries of a shared
+    /// document it re-reads
+    dbname: String,
     /// `--ch-config`; `None` disables reload (nothing to re-read)
     toml_path: Option<PathBuf>,
     /// CLI-arg `[source]` base layer, merged under the file on reload (matches
@@ -321,6 +324,7 @@ impl ConfigResolver {
         let (initial, _) = Self::resolve(base, &overlay, &cli, &opt_in, &ColumnRules::default());
         let (tx, rx) = watch::channel(Arc::new(initial));
         let this = Arc::new(Self {
+            dbname: base.source.dbname.clone(),
             toml_path,
             cli_base,
             cli,
@@ -353,6 +357,15 @@ impl ConfigResolver {
     /// Another receiver on the same channel.
     pub fn subscribe(&self) -> watch::Receiver<Arc<ResolvedConfig>> {
         self.tx.subscribe()
+    }
+
+    pub fn dbname(&self) -> &str {
+        &self.dbname
+    }
+
+    /// Databases the config names, which a reload re-reads
+    pub async fn configured_databases(&self) -> Vec<String> {
+        self.inner.lock().await.base.databases.clone()
     }
 
     /// Overlay values currently rejected at merge.
@@ -809,8 +822,9 @@ impl ConfigResolver {
             return Ok(());
         };
         let merged = crate::ch_emitter::load_effective(path, self.cli_base.clone()).await?;
-        let base = EmitterConfig::from_table(&merged)?;
         let mut inner = self.inner.lock().await;
+        // This resolver's own database, not whichever one `[source]` names
+        let base = EmitterConfig::for_database(&merged, &self.dbname)?;
         inner.base = base;
         self.republish(&inner).await;
         Ok(())
@@ -2007,6 +2021,40 @@ mod tests {
             .unwrap();
         resolver.reload().await.unwrap();
         assert_eq!(rx.borrow_and_update().source.host, "pg-b");
+    }
+
+    /// A reload republishes each database's own entries, not the primary's
+    #[tokio::test]
+    async fn reload_keeps_the_resolver_scoped_to_its_database() {
+        const DOC: &str = "[ch]\nhost = \"ch\"\n[source]\ndbname = \"app\"\n\
+             [table.public.orders]\nreplicate = true\n\
+             [database.billing.table.public.ledger]\nreplicate = true\n";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ch-config.toml");
+        tokio::fs::write(&path, DOC).await.unwrap();
+        let doc: toml::Table = toml::from_str(DOC).unwrap();
+        let base = EmitterConfig::for_database(&doc, "billing").unwrap();
+        let (resolver, mut rx) = ConfigResolver::new(
+            &base,
+            CliOverrides::default(),
+            Some(path.clone()),
+            toml::Table::new(),
+            dummy_handles(),
+        );
+        let billing_rels = |rx: &mut watch::Receiver<Arc<ResolvedConfig>>| {
+            let snap = rx.borrow_and_update();
+            snap.table_opt_ins.keys().cloned().collect::<Vec<_>>()
+        };
+        assert_eq!(
+            billing_rels(&mut rx),
+            vec![crate::schema::RelName::new("public", "ledger")]
+        );
+        resolver.reload().await.unwrap();
+        assert_eq!(
+            billing_rels(&mut rx),
+            vec![crate::schema::RelName::new("public", "ledger")],
+            "a reload must not hand app's tables to billing"
+        );
     }
 
     /// Backfill caches `overlay_dest` and rebuilds on `!dest_conn_eq`, so the

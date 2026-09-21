@@ -34,7 +34,7 @@ use tokio::sync::Mutex;
 
 use crate::pos::{Pos, ShadowReplay};
 use crate::record::{BoundaryKind, Record, RecordSink, SinkError};
-use crate::source::catalog_capture::CatalogCapture;
+use crate::source::catalog_capture::CaptureSet;
 use crate::source::queueing_record_sink::QueueingRecordSink;
 use crate::source::shadow_stream::ShadowStreamState;
 
@@ -176,8 +176,8 @@ impl CatalogBoundaryGate {
 pub struct BoundaryHoldSink {
     pub inner: QueueingRecordSink,
     pub gate: CatalogBoundaryGate,
-    /// `None` = hold-only (tests / capture-less harnesses)
-    pub capture: Option<CatalogCapture>,
+    /// Empty = hold-only (tests / capture-less harnesses)
+    pub capture: CaptureSet,
 }
 
 impl BoundaryHoldSink {
@@ -185,12 +185,12 @@ impl BoundaryHoldSink {
         Self {
             inner,
             gate,
-            capture: None,
+            capture: CaptureSet::default(),
         }
     }
 
-    pub fn with_capture(mut self, capture: CatalogCapture) -> Self {
-        self.capture = Some(capture);
+    pub fn with_capture(mut self, capture: CaptureSet) -> Self {
+        self.capture = capture;
         self
     }
 
@@ -217,26 +217,28 @@ impl RecordSink for BoundaryHoldSink {
         record: &'a Record<'a>,
     ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
         Box::pin(async move {
-            if let (Some(capture), Some(members)) = (&self.capture, &record.aborted_tree) {
-                capture.forget_aborted(members);
+            if let Some(members) = &record.aborted_tree {
+                self.capture.forget_aborted(members);
             }
             if !record.catalog_boundary {
                 return self.inner.on_record(record).await;
             }
             let boundary = record.boundary_info.clone();
-            let park = match (&self.capture, &boundary) {
-                (Some(capture), Some(info)) => capture.admits(info, record.next_lsn),
+            let park = match &boundary {
+                Some(info) if !self.capture.is_empty() => {
+                    self.capture.admits(info, record.next_lsn)
+                }
                 // Without capture, wait only for commits that change more than statistics
-                (None, Some(info)) => matches!(info.kind, BoundaryKind::Commit) && !info.stats_only,
-                _ => true,
+                Some(info) => matches!(info.kind, BoundaryKind::Commit) && !info.stats_only,
+                None => true,
             };
             if !park {
                 // Save an empty batch so restart can replay this commit
                 // without reading catalog state from shadow
-                if let (Some(capture), Some(info)) = (&self.capture, &boundary)
+                if let Some(info) = &boundary
                     && matches!(info.kind, BoundaryKind::Commit)
                 {
-                    capture
+                    self.capture
                         .capture_boundary(info, record.source_lsn, record.next_lsn)
                         .await?;
                 }
@@ -260,9 +262,9 @@ impl RecordSink for BoundaryHoldSink {
                 self.inner.flush().await?;
                 return Err(hold_err);
             }
-            if let (Some(capture), Some(info)) = (&self.capture, &boundary) {
-                capture.charge_hold(info, parked.elapsed());
-                capture
+            if let Some(info) = &boundary {
+                self.capture.charge_hold(info, parked.elapsed());
+                self.capture
                     .capture_boundary(info, record.source_lsn, record.next_lsn)
                     .await?;
             }

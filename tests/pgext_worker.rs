@@ -46,7 +46,7 @@ fn worker_reload_reaches_both_waits() {
     let tmp = tempfile::tempdir().unwrap();
     let mut pg = pgext::stage(tmp.path(), ports::PG_SHADOW_PORT, Duration::from_secs(20));
     pg.start(&[]);
-    pg.wait_log(0, "walshadow bridge listening");
+    pg.wait_log(0, "walshadow bridge for");
     let path = pg.bridge_path();
     let mut healthy = hello_on(&path);
 
@@ -87,7 +87,7 @@ fn worker_shutdown_drops_clients_and_unlinks_socket() {
     let tmp = tempfile::tempdir().unwrap();
     let mut pg = pgext::stage(tmp.path(), ports::PG_SHADOW_PORT, Duration::from_secs(30));
     pg.start(&[]);
-    pg.wait_log(0, "walshadow bridge listening");
+    pg.wait_log(0, "walshadow bridge for");
     let path = pg.bridge_path();
 
     let mut clients: Vec<_> = (0..3).map(|_| hello_on(&path)).collect();
@@ -121,7 +121,7 @@ fn worker_refuses_ninth_connection() {
     let tmp = tempfile::tempdir().unwrap();
     let mut pg = pgext::stage(tmp.path(), ports::PG_SHADOW_PORT, Duration::from_secs(30));
     pg.start(&[]);
-    pg.wait_log(0, "walshadow bridge listening");
+    pg.wait_log(0, "walshadow bridge for");
     let path = pg.bridge_path();
 
     // Handshake each one: a successful connect only proves kernel backlog
@@ -168,7 +168,7 @@ fn worker_keeps_serving_around_a_dropped_connection() {
     let tmp = tempfile::tempdir().unwrap();
     let mut pg = pgext::stage(tmp.path(), ports::PG_SHADOW_PORT, Duration::from_secs(30));
     pg.start(&[]);
-    pg.wait_log(0, "walshadow bridge listening");
+    pg.wait_log(0, "walshadow bridge for");
     let path = pg.bridge_path();
 
     // Handshakes in order, so the connection array is first, middle, last
@@ -263,11 +263,42 @@ fn worker_serves_a_connection_whose_buffers_cannot_widen() {
     // the pair
     faults.arm(&[Rule::fail(Op::Setsockopt, 1, libc::ENOBUFS)]);
     pg.start(&faults.env());
-    pg.wait_log(0, "walshadow bridge listening");
+    pg.wait_log(0, "walshadow bridge for");
 
     let mut conn = hello_on(&pg.bridge_path());
     faults.wait_consumed();
     // Both the handshake and the request behind it crossed the connection
     // whose buffers stayed at the default
     hello(&mut conn);
+}
+
+/// `walshadow.databases` names the worker's connections, and a list the
+/// postmaster cannot turn into that set has no safe reading. Each refusal is
+/// FATAL before any worker registers, so the cluster never comes up half-wired
+#[test]
+fn unusable_databases_list_refuses_startup() {
+    if !pgext::pg_available() {
+        eprintln!("skip: no initdb on PATH");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let pg = pgext::stage(tmp.path(), ports::PG_SHADOW_PORT, Duration::from_secs(30));
+
+    // Last wins, so each append is the next attempt's value
+    let from = pg.log_len();
+    pg.append_conf("walshadow.databases = '\"unterminated'\n");
+    pg.start_refused();
+    pg.wait_log(from, "walshadow.databases is not a comma-separated list");
+
+    let from = pg.log_len();
+    pg.append_conf("walshadow.databases = ''\n");
+    pg.start_refused();
+    pg.wait_log(from, "walshadow.databases must name at least one database");
+
+    // One socket per database per worker, so the product is what has a ceiling
+    let from = pg.log_len();
+    pg.append_conf("walshadow.databases = 'a,b,c,d,e,f,g,h,i'\n");
+    pg.append_conf("walshadow.bridge_workers = 8\n");
+    pg.start_refused();
+    pg.wait_log(from, "9 databases x 8 bridge workers exceeds 64 sockets");
 }
