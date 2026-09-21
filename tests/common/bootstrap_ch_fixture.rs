@@ -25,12 +25,15 @@ use std::net::TcpStream;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+use walshadow::bridge::Bridge;
 use walshadow::mapping::TableTarget;
 use walshadow::schema::RelName;
 use walshadow::shadow::{BridgeConf, Shadow, ShadowConfig};
+use walshadow::shadow_catalog::{ShadowCatalog, ShadowCatalogConfig};
 
 /// ClickHouse server subprocess wrapper shared by the pipeline DDL
 /// drill, both bootstrap-to-CH drills, and the
@@ -381,15 +384,59 @@ pub fn requirements_available() -> bool {
     true
 }
 
-/// Source cluster under `tmp`, initialised with the bootstrap overrides and
-/// running. Caller keeps it alive and wraps it in [`StopOnDrop`].
-pub fn start_source(tmp: &tempfile::TempDir) -> Shadow {
+/// Source cluster under `tmp`, initialised with the bootstrap overrides,
+/// not yet running.
+fn prepared_source(tmp: &tempfile::TempDir) -> Shadow {
     let source = make_source(tmp);
     source.initdb().expect("initdb source");
     source.write_base_conf().expect("source base conf");
     append_source_conf(&source).expect("append source conf");
+    source
+}
+
+/// Source cluster under `tmp`, initialised with the bootstrap overrides and
+/// running. Caller keeps it alive and wraps it in [`StopOnDrop`].
+pub fn start_source(tmp: &tempfile::TempDir) -> Shadow {
+    let source = prepared_source(tmp);
     source.start().expect("start source");
     source
+}
+
+/// Start source with bridge worker preloaded for [`connect_catalog`]
+pub fn start_bridged_source(tmp: &tempfile::TempDir) -> Shadow {
+    let source = prepared_source(tmp);
+    append_bridge_conf(
+        &source.config().data_dir,
+        &source.config().socket_dir,
+        "postgres",
+        pgext_dir(),
+    )
+    .expect("preload bridge worker");
+    source.start().expect("start source");
+    source
+}
+
+/// Connect to source's preloaded bridge worker and catalog
+/// Set catalog connection's application name to `app_name`
+pub async fn connect_catalog(source: &Shadow, app_name: &str) -> (Arc<Bridge>, ShadowCatalog) {
+    let bridge = Arc::new(
+        walshadow::bridge::connect_with_budget(
+            &source.config().socket_dir.join("walshadow-bridge.sock"),
+            1,
+            Duration::from_secs(20),
+        )
+        .await
+        .expect("dial bridge worker"),
+    );
+    let pg = pg_cfg(source, app_name);
+    let catalog = ShadowCatalog::connect(
+        &walshadow::pg::socket_conninfo(&pg.host, pg.port, &pg.user, &pg.database),
+        ShadowCatalogConfig::default(),
+        bridge.clone(),
+    )
+    .await
+    .expect("connect shadow catalog");
+    (bridge, catalog)
 }
 
 /// Poll `sql` on CH until it answers `want`. The tail drains asynchronously,

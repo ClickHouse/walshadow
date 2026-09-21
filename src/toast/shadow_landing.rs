@@ -4,13 +4,98 @@
 //! landed in place by the backup, then replayed. Index filenodes are absent
 //! from the catalog seed, so the source answers for them.
 
-use ahash::{HashSet, HashSetExt};
+use ahash::{HashMap, HashSet, HashSetExt};
 use anyhow::{Context, Result, bail, ensure};
+use tokio::sync::Mutex;
 
-use crate::schema::RelDescriptor;
+use crate::catalog::shadow_catalog::ShadowCatalog;
+use crate::filter::shadow_relations::ShadowHeld;
+use crate::schema::{RelDescriptor, RelName};
 
 /// `pg_default`, PG `catalog/pg_tablespace.dat`
 pub const DEFAULT_TABLESPACE_OID: u32 = 1663;
+
+/// Find TOAST heaps shadow cannot replay, paired with their parent relations
+/// Use one catalog read for entire batch
+///
+/// TOAST heaps must be seeded during bootstrap or admitted at `CREATE`
+/// A running standby cannot be seeded with older heaps added later
+async fn unheld_toasts<'a>(
+    catalog: &Mutex<ShadowCatalog>,
+    held: &ShadowHeld,
+    descs: &'a [RelDescriptor],
+) -> Result<Vec<(&'a RelDescriptor, RelDescriptor)>> {
+    let toasted: Vec<&RelDescriptor> = descs.iter().filter(|d| d.toast_oid != 0).collect();
+    if toasted.is_empty() {
+        return Ok(Vec::new());
+    }
+    // `toast_oid` is the `reltoastrelid` a descriptor lookup would re-read
+    let oids: Vec<u32> = toasted.iter().map(|d| d.toast_oid).collect();
+    let (_, fetched) = catalog.lock().await.fetch_descriptors_batch(&oids).await?;
+    let mut by_oid: HashMap<u32, RelDescriptor> = fetched.into_iter().map(|t| (t.oid, t)).collect();
+    Ok(toasted
+        .into_iter()
+        .filter_map(|desc| {
+            let toast = by_oid.remove(&desc.toast_oid)?;
+            (!held.contains((toast.rfn.db_node, toast.rfn.rel_node))).then_some((desc, toast))
+        })
+        .collect())
+}
+
+/// TOAST heap shadow cannot replay for `desc`, if any. Batch form is
+/// [`unserved_rels`]
+pub async fn unheld_toast(
+    catalog: &Mutex<ShadowCatalog>,
+    held: &ShadowHeld,
+    desc: &RelDescriptor,
+) -> Result<Option<RelDescriptor>> {
+    Ok(unheld_toasts(catalog, held, std::slice::from_ref(desc))
+        .await?
+        .pop()
+        .map(|(_, toast)| toast))
+}
+
+/// Check whether shadow holds external values for `desc`, warning if absent
+/// Reject missing TOAST heaps to avoid replacing their values with NULL
+pub async fn serves_toast(
+    catalog: &Mutex<ShadowCatalog>,
+    held: &ShadowHeld,
+    desc: &RelDescriptor,
+) -> Result<bool> {
+    let Some(toast) = unheld_toast(catalog, held, desc).await? else {
+        return Ok(true);
+    };
+    warn_unserved(desc, &toast);
+    Ok(false)
+}
+
+/// Return relations rejected by [`serves_toast`], warning once per relation
+pub async fn unserved_rels(
+    catalog: &Mutex<ShadowCatalog>,
+    held: &ShadowHeld,
+    descs: &[RelDescriptor],
+) -> Result<Vec<RelName>> {
+    Ok(unheld_toasts(catalog, held, descs)
+        .await?
+        .into_iter()
+        .map(|(desc, toast)| {
+            warn_unserved(desc, &toast);
+            desc.rel_name.clone()
+        })
+        .collect())
+}
+
+fn warn_unserved(desc: &RelDescriptor, toast: &RelDescriptor) {
+    tracing::warn!(
+        target: "walshadow::config",
+        qname = %desc.rel_name,
+        toast = %toast.rel_name,
+        filenode = toast.rfn.rel_node,
+        "[toast] mode = shadow cannot replicate this table: TOAST heap is missing \
+         and a running shadow cannot be seeded after bootstrap. \
+         Re-bootstrap with table included, or use [toast] mode = \"clickhouse\"",
+    );
+}
 
 /// Opted-in TOAST heaps, refusing any the lander cannot place. It keys on
 /// `base/<db>/` paths, so a non-default tablespace has to fail here rather

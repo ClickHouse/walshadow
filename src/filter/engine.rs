@@ -32,6 +32,7 @@ use crate::filter::manifest::ManifestStats;
 use crate::filter::shadow_relations::ShadowRelations;
 use crate::record::{AffectedOid, BoundaryInfo, BoundaryKind, Route, rmgr_label};
 use crate::schema::FIRST_NORMAL_OBJECT_ID;
+use crate::toast::xid_ceiling::{XidCeiling, follows};
 use ahash::{HashMap, HashSet, HashSetExt};
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -190,6 +191,9 @@ pub struct Filter {
     /// database, so no record dirties
     target_db_oid: Option<u32>,
     shadow_rels: Option<ShadowRelations>,
+    /// Xid ceilings the shadow TOAST store reads. Absent for offline
+    /// filters, which serve no reads
+    xid_ceiling: Option<Arc<XidCeiling>>,
 }
 
 impl Filter {
@@ -203,7 +207,13 @@ impl Filter {
             smgr_markers: Arc::new(Mutex::new(SmgrMarkers::default())),
             target_db_oid: None,
             shadow_rels: None,
+            xid_ceiling: None,
         }
+    }
+
+    /// Feed xid ceilings for shadow TOAST generation checks
+    pub fn set_xid_ceiling(&mut self, ceiling: Arc<XidCeiling>) {
+        self.xid_ceiling = Some(ceiling);
     }
 
     /// Scope descriptor-capture input to the followed database. Live
@@ -264,7 +274,7 @@ impl Filter {
     /// Record an xid after which transactions are fully observed
     pub fn observe_from_xid(&mut self, xid: u32) {
         let earlier = match self.observed_from_xid {
-            Some(have) if (have.wrapping_sub(xid) as i32) <= 0 => have,
+            Some(have) if follows(xid, have) => have,
             _ => xid,
         };
         self.observed_from_xid = Some(earlier);
@@ -387,6 +397,9 @@ impl Filter {
             self.observe_from_xid(next_xid);
         }
         let xid = record.header.xact_id;
+        if let Some(ceiling) = &self.xid_ceiling {
+            ceiling.observe(source_lsn, xid);
+        }
         // Subxid → top link rides the subxact's first record at
         // wal_level=logical (`XLR_BLOCK_ID_TOPLEVEL_XID`); learn before
         // touch and admission so both resolve the true root
@@ -657,9 +670,8 @@ impl Filter {
 
     /// Return true when transaction history is fully observed
     fn fully_observed(&self, xid: u32) -> bool {
-        // Compare transaction IDs with wraparound
         self.observed_from_xid
-            .is_some_and(|from| (xid.wrapping_sub(from) as i32) >= 0)
+            .is_some_and(|from| !follows(from, xid))
     }
 
     /// Return true when tree contains only fully observed statistics writes

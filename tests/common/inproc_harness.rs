@@ -898,6 +898,10 @@ async fn build_pipeline_inner(
         toml::Table::new(),
         mapping.clone(),
     );
+    // Apply daemon's TOAST admission check to opt-ins
+    if let Some(rels) = stream.filter().shadow_rels() {
+        config_resolver.bind_shadow_toast(rels.held());
+    }
     let ddl_cfg = DdlConfig::from_resolved(
         &config_rx.borrow(),
         emitter_cfg.database.clone(),

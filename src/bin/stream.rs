@@ -1441,7 +1441,12 @@ async fn run_session(
         tracing::info!(target: "walshadow::preflight", "pre-flight passed");
     }
 
-    let oracle = Some(Arc::new(walshadow::oracle::Oracle::new(bridge.clone())));
+    // Share pump's xid samples with shadow TOAST reads to detect reused IDs
+    let xid_ceiling = Arc::new(walshadow::toast::xid_ceiling::XidCeiling::default());
+    stream.filter_mut().set_xid_ceiling(xid_ceiling.clone());
+    let oracle = Some(Arc::new(
+        walshadow::oracle::Oracle::new(bridge.clone()).with_xid_ceiling(xid_ceiling),
+    ));
 
     // START_REPLICATION runs after sinks are built so archive fallback can
     // advance identical filter and decode paths.
@@ -1502,16 +1507,23 @@ async fn run_session(
         .context("shadow database oid")?;
     stream.filter_mut().set_target_db(shadow_db_oid);
     let shadow_toast = ch_config.as_ref().is_some_and(|c| c.toast.mode.is_shadow());
+    // Check TOAST availability for opt-in and configured relations
+    let mut shadow_toast_held = None;
     if shadow_toast {
         let dir = shadow_start
             .data_dir()
             .context("[toast] mode = shadow requires a daemon-owned shadow")?;
         stream.filter_mut().load_shadow_rels(dir).await?;
+        let rels = stream
+            .filter()
+            .shadow_rels()
+            .context("shadow replay eligibility missing after load")?;
         tracing::info!(
             target: "walshadow::toast",
-            rels = stream.filter().shadow_rels().map_or(0, |rels| rels.len()),
+            rels = rels.len(),
             "[toast] mode = shadow: loaded durable replay eligibility",
         );
+        shadow_toast_held = Some(rels.held());
     }
     let pending_cfg = ch_config
         .as_ref()
@@ -1687,6 +1699,21 @@ async fn run_session(
             cli_base(args),
             mapping.clone(),
         );
+        if let Some(held) = &shadow_toast_held {
+            resolver.bind_shadow_toast(held.clone());
+            // Check configured tables here because they bypass opt-in
+            // Preserve exclusions across SIGHUP reloads
+            let descs = catalog
+                .lock()
+                .await
+                .descriptors_by_name(emitter_cfg.tables.keys())
+                .await?;
+            for rel in
+                walshadow::toast::shadow_landing::unserved_rels(&catalog, held, &descs).await?
+            {
+                resolver.exclude_table(&rel).await;
+            }
+        }
         reloader.set_resolver(Some(resolver.clone())).await;
         spawn_mapping_refresher(config_rx.clone(), mapping.clone());
         // Runtime-config overlay (§7): before the pump consumes WAL, seed the
@@ -1845,29 +1872,26 @@ async fn run_session(
         // Baseline seeding suppresses the Added event for pinned mappings, so a
         // plain TOML mapping (no initial_load, no opt-in) would tail into a
         // missing CH table. Ensure those dests here; the others own their copy.
-        for rel in &active_tables {
-            if sql_scoped_tables.contains(rel) {
-                continue;
-            }
+        let pinned = active_tables.iter().filter(|rel| {
             let has_initial_load = emitter_cfg
                 .table_initial_loads
-                .get(rel)
+                .get(*rel)
                 .and_then(|mode| mode.parse::<InitialLoadMode>().ok())
                 .is_some_and(|m| m != InitialLoadMode::None);
-            if has_initial_load {
-                continue;
-            }
-            let Some(desc) = catalog
-                .lock()
-                .await
-                .descriptor_by_name(rel)
-                .await
-                .with_context(|| format!("resolve descriptor for pinned mapping {rel}"))?
-            else {
-                continue;
-            };
+            !sql_scoped_tables.contains(*rel) && !has_initial_load
+        });
+        let descs = catalog
+            .lock()
+            .await
+            .descriptors_by_name(pinned)
+            .await
+            .context("resolve descriptors for pinned mappings")?;
+        for desc in descs {
+            let rel = desc.rel_name.clone();
             applicator
-                .apply(&SchemaEvent::Added { desc })
+                .apply(&SchemaEvent::Added {
+                    desc: Arc::new(desc),
+                })
                 .await
                 .with_context(|| format!("ensure CH dest for pinned mapping {rel}"))?;
         }
@@ -3845,6 +3869,7 @@ fn stage_gauges_on(v: &StageCounters<'_>, base: MetricsSnapshot) -> MetricsSnaps
         toast_image_rows_mirrored_total: emitter(|s| &s.toast_image_rows_mirrored),
         toast_values_filled_superseded_total: emitter(|s| &s.toast_values_filled_superseded),
         toast_values_filled_mismatch_total: emitter(|s| &s.toast_values_filled_mismatch),
+        toast_values_filled_generation_total: emitter(|s| &s.toast_values_filled_generation),
         toast_values_filled_oversize_total: emitter(|s| &s.toast_values_filled_oversize),
         toast_mirror_truncates_total: emitter(|s| &s.toast_mirror_truncates),
         toast_mirror_retires_total: emitter(|s| &s.toast_mirror_retires),
@@ -4719,7 +4744,8 @@ async fn run_bootstrap(
         Some(cfg) => ToastResolver::for_mode(
             cfg,
             bootstrap_stats.clone(),
-            Some(shadow_toast_bridge.clone()),
+            // Backup replay has no pump to sample xid ceilings
+            Some(shadow_toast_bridge.clone().into()),
         )
         .map_err(anyhow::Error::msg)?
         .with_budget(walshadow::budget::MemoryBudget::new(

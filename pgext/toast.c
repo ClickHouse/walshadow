@@ -13,6 +13,12 @@
  * multiple generations. Require sequence starting at zero with no gaps and
  * exact total size. Reject partial or interleaved runs instead of combining
  * chunks from different generations.
+ *
+ * These checks cannot detect a replacement with matching size or distinguish
+ * a partial replacement from a partially reclaimed original. PostgreSQL reuses
+ * a value ID only after all its chunks are gone (SnapshotAny probe in
+ * GetNewOidWithIndex, catalog/catalog.c). Report newest chunk xmin so daemon
+ * can compare it with xid ceiling at referring record
  */
 #include "postgres.h"
 
@@ -21,6 +27,7 @@
 #include "access/stratnum.h"
 #include "access/table.h"
 #include "access/toast_internals.h"
+#include "access/transam.h"
 #include "access/xlogdefs.h"
 #include "access/xlogrecovery.h"
 #include "libpq/pqformat.h"
@@ -37,11 +44,12 @@
 
 /*
  * Assemble one value's chunk run, appending
- * `[result:u8][len:u32][stored bytes]` to `out`.
+ * `[result:u8][newest xmin:u32][len:u32][stored bytes]` to `out`.
  *
  * Accept only consecutive chunk_seq values starting at zero and exact expected
  * size, matching mirror validation. Same checks reject partially pruned runs
- * and interleaved generations under reused IDs.
+ * and interleaved generations under reused IDs. Include newest xmin to detect
+ * replacements these checks cannot distinguish
  */
 static void
 ws_fetch_one(Relation toastrel, Relation toastidx, Snapshot snap,
@@ -54,6 +62,7 @@ ws_fetch_one(Relation toastrel, Relation toastidx, Snapshot snap,
 	StringInfoData body;
 	int32		nchunks = 0;
 	bool		dense = true;
+	TransactionId newest = InvalidTransactionId;
 	uint8		result;
 
 	initStringInfo(&body);
@@ -67,6 +76,7 @@ ws_fetch_one(Relation toastrel, Relation toastidx, Snapshot snap,
 		Datum		d;
 		bool		isnull;
 		int32		seq;
+		TransactionId xmin;
 		Pointer		chunk;
 		int32		chunksize;
 		char	   *chunkdata;
@@ -75,6 +85,12 @@ ws_fetch_one(Relation toastrel, Relation toastidx, Snapshot snap,
 		d = heap_getattr(ttup, WS_TOAST_ATT_SEQ, tupdesc, &isnull);
 		Assert(!isnull);
 		seq = DatumGetInt32(d);
+
+		/* Frozen and bootstrap xmin cannot date chunks, report zero */
+		xmin = HeapTupleHeaderGetXmin(ttup->t_data);
+		if (TransactionIdIsNormal(xmin) &&
+			(!TransactionIdIsValid(newest) || TransactionIdFollows(xmin, newest)))
+			newest = xmin;
 
 		d = heap_getattr(ttup, WS_TOAST_ATT_DATA, tupdesc, &isnull);
 		Assert(!isnull);
@@ -113,6 +129,7 @@ ws_fetch_one(Relation toastrel, Relation toastidx, Snapshot snap,
 
 	/* Report assembled length on failure, include bytes only on success */
 	pq_sendbyte(out, result);
+	pq_sendint32(out, (uint32) newest);
 	pq_sendint32(out, (uint32) body.len);
 	if (result == WS_FETCH_OK)
 		pq_sendbytes(out, body.data, body.len);
@@ -187,6 +204,7 @@ ws_handle_fetch_toast(StringInfo req, StringInfo resp)
 		for (i = 0; i < nvalues; i++)
 		{
 			pq_sendbyte(resp, WS_FETCH_MISSING);
+			pq_sendint32(resp, 0);
 			pq_sendint32(resp, 0);
 		}
 		return;

@@ -18,13 +18,14 @@ plans; these contracts identify changes that cannot be designed independently
 
 Current byte-before-record ordering allows decoder waits to observe WAL already
 sent to shadow. A replay callback permits receipt ahead while holding redo;
-TOAST reclamation instead withholds destructive records until older reads finish
-Neither feature can inherit deadlock freedom from current ordering unchanged
+TOAST reclamation saves affected values before sending those bytes. Both need
+a hook before publication and a fresh check for deadlocks
 
-Draw wait dependencies for a transaction needing catalog replay beyond a held
-TOAST boundary, a full decoder queue, and a blocked destination. Choose draining,
-durable materialization, or explicit rejection before permitting that cycle
-Bound arm slots, record queues, staged archives, retained shadow WAL, and deferred
+Holding destructive records can deadlock: advancing resolved floor requires
+pump progress, while catalog capture stops pump until shadow replays past each
+boundary. See [shadow TOAST](shadow_toast.md) for details
+
+Bound arm slots, record queues, staged archives, spilled values, and deferred
 tuples independently, then measure combined memory and disk budgets
 
 Keep raw witness WAL separate from filtered shadow WAL. Witness durability,

@@ -34,6 +34,7 @@ use walrus::pg::replication::tls::{SslMode, TlsParams};
 use crate::ch::{CompressionChoice, EmitterError};
 use crate::column_rules::{ColumnRule, ColumnRules, ColumnRulesBuilder};
 use crate::emit::ch_emitter::EmitterConfig;
+use crate::filter::shadow_relations::ShadowHeld;
 use crate::mapping::{
     DropTableStrategy, MappingHandle, NamespaceMapping, TableMapping, TableTarget,
     derive_columns_for_mapping, fold_diff_into_mapping,
@@ -298,6 +299,9 @@ pub struct ConfigResolver {
     /// exclusions applied.
     opt_in_total: AtomicU64,
     opt_out_total: AtomicU64,
+    /// TOAST heaps shadow can replay, set after filter loads replay eligibility
+    /// Unset outside shadow mode, which reads values from destination mirror
+    shadow_toast: std::sync::OnceLock<ShadowHeld>,
 }
 
 impl ConfigResolver {
@@ -331,8 +335,19 @@ impl ConfigResolver {
             pending_decl: AtomicU64::new(0),
             opt_in_total: AtomicU64::new(0),
             opt_out_total: AtomicU64::new(0),
+            shadow_toast: std::sync::OnceLock::new(),
         });
         (this, rx)
+    }
+
+    /// Set shadow TOAST eligibility once, before first opt-in
+    pub fn bind_shadow_toast(&self, held: ShadowHeld) {
+        let _ = self.shadow_toast.set(held);
+    }
+
+    /// `None` unless `[toast] mode = "shadow"`
+    pub fn shadow_toast(&self) -> Option<&ShadowHeld> {
+        self.shadow_toast.get()
     }
 
     /// Another receiver on the same channel.

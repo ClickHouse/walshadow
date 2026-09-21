@@ -130,8 +130,14 @@ bootstrap and live CDC. It has three important limitations:
 - **No migration path.** Modes store different history. Switching an
   existing deployment requires a fresh bootstrap
 
-Shadow reads current value generation directly, so ClickHouse mirror's reused
-value-ID ambiguity described above does not apply
+Shadow reads current generation directly, avoiding mirror's mixed-generation
+ambiguity described above. A reused value ID can still return a newer value.
+PostgreSQL reissues an ID only after all its chunks are gone, so replacement
+chunks postdate referring record. Reads compare chunk `xmin` with highest
+transaction ID assigned when that record was written. Newer chunks increment
+`toast_values_filled_generation` instead of returning replacement bytes,
+whether complete or partial. Sampling at 1 MiB WAL intervals and frozen `xmin`
+values can hide reuse, so passing this check does not prove a value is original
 
 ## Not an HA system
 

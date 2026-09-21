@@ -76,7 +76,10 @@ pub async fn apply_table_opt_in(
                 .map_err(|error| EmitterError::Catalog(error.to_string()))?;
             match desc {
                 Some(desc) => {
-                    opt_in_known(resolver, applicator, backfiller, &desc, row, opt_in_lsn).await?
+                    if shadow_serves_toast(resolver, catalog, &desc).await? {
+                        opt_in_known(resolver, applicator, backfiller, &desc, row, opt_in_lsn)
+                            .await?;
+                    }
                 }
                 None => {
                     tracing::warn!(
@@ -99,13 +102,29 @@ pub async fn apply_table_opt_in(
     Ok(())
 }
 
+/// Check whether shadow holds this relation's external values
+/// Always true outside shadow mode, which uses destination mirror
+async fn shadow_serves_toast(
+    resolver: &ConfigResolver,
+    catalog: &Arc<Mutex<ShadowCatalog>>,
+    desc: &RelDescriptor,
+) -> Result<bool, EmitterError> {
+    let Some(held) = resolver.shadow_toast() else {
+        return Ok(true);
+    };
+    crate::toast::shadow_landing::serves_toast(catalog, held, desc)
+        .await
+        .map_err(|error| EmitterError::Catalog(error.to_string()))
+}
+
 /// When a `CREATE TABLE` lands, materialise a parked forward-declaration for
 /// that qname (no-op otherwise). Runs from the catalog-event apply, inside the
 /// same barrier fence, so trailing rows in the creating xact route.
 ///
 /// No backfill: the rel was born after the declaration, so nothing pre-dates
 /// its WAL coverage — any xact that can see the table commits after the
-/// `CREATE`, and its rows were buffered inclusion-agnostically.
+/// `CREATE`, and its rows were buffered inclusion-agnostically. Skip shadow
+/// TOAST admission check because `CREATE` already admitted its TOAST heap
 pub async fn materialize_pending_on_added(
     resolver: &ConfigResolver,
     applicator: &mut DdlApplicator,

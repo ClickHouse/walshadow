@@ -221,8 +221,8 @@ impl PipelineConfig {
                 &emitter,
                 stats.clone(),
                 oracle
-                    .as_ref()
-                    .map(|o| crate::toast::shadow_store::bound(o.bridge())),
+                    .as_deref()
+                    .map(crate::toast::shadow_store::ShadowRead::from),
             )
             .map_err(EmitterError::Config)?
         }

@@ -18,7 +18,7 @@ use walshadow::mapping::{ColumnMapping, MappingHandle, TableMapping, TableTarget
 use walshadow::runtime_config::InitialLoadMode;
 use walshadow::schema::{RelDescriptor, RelName};
 use walshadow::shadow::Shadow;
-use walshadow::shadow_catalog::{ShadowCatalog, ShadowCatalogConfig};
+use walshadow::shadow_catalog::ShadowCatalog;
 use walshadow::timeline::TimelineHistory;
 
 struct Fixture {
@@ -36,18 +36,7 @@ struct Fixture {
 impl Fixture {
     async fn new() -> Self {
         let tmp = tempfile::tempdir().unwrap();
-        let source = fx::make_source(&tmp);
-        source.initdb().unwrap();
-        source.write_base_conf().unwrap();
-        fx::append_source_conf(&source).unwrap();
-        fx::append_bridge_conf(
-            &source.config().data_dir,
-            &source.config().socket_dir,
-            "postgres",
-            fx::pgext_dir(),
-        )
-        .unwrap();
-        source.start().unwrap();
+        let source = fx::start_bridged_source(&tmp);
         let stop = fx::StopOnDrop { sh: &source };
         source
             .psql_one(
@@ -57,23 +46,7 @@ impl Fixture {
                  CHECKPOINT",
             )
             .unwrap();
-        let bridge = Arc::new(
-            walshadow::bridge::connect_with_budget(
-                &source.config().socket_dir.join("walshadow-bridge.sock"),
-                1,
-                Duration::from_secs(20),
-            )
-            .await
-            .unwrap(),
-        );
-        let pg = fx::pg_cfg(&source, "backfill-staging");
-        let mut catalog = ShadowCatalog::connect(
-            &walshadow::pg::socket_conninfo(&pg.host, pg.port, &pg.user, &pg.database),
-            ShadowCatalogConfig::default(),
-            bridge.clone(),
-        )
-        .await
-        .unwrap();
+        let (bridge, mut catalog) = fx::connect_catalog(&source, "backfill-staging").await;
         let (_, descs) = catalog.fetch_all_descriptors().await.unwrap();
         let desc = Arc::new(
             descs
