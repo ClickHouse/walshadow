@@ -2421,6 +2421,7 @@ async fn prefetch_store_values(
                 FetchedValue::Assembled(stored) => CachedValue::Decoded(finish_value(p, stored)?),
                 FetchedValue::Missing => CachedValue::Missing,
                 FetchedValue::Mismatch { .. } => CachedValue::Mismatch,
+                FetchedValue::Generation => CachedValue::Generation,
             };
             cache.insert((p.va_toastrelid, p.va_valueid), cached);
         }
@@ -2435,6 +2436,8 @@ enum CachedValue {
     /// Safe only after supersession or replayed owner TRUNCATE
     Missing,
     Mismatch,
+    /// Value id now holds a later generation, original is unreadable
+    Generation,
 }
 
 /// Per-heap value resolution over prefetched store values, decoded bytes
@@ -2526,6 +2529,10 @@ impl ValueResolution<'_> {
             }
             CachedValue::Mismatch => {
                 self.resolver.note_filled_mismatch();
+                return Ok(ColumnValue::Null);
+            }
+            CachedValue::Generation => {
+                self.resolver.note_filled_generation();
                 return Ok(ColumnValue::Null);
             }
             CachedValue::Decoded(_) => {}

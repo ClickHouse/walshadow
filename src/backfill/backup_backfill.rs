@@ -304,7 +304,15 @@ async fn walk_and_ship(
         }
     }
 
-    let mut resolver = ToastResolver::from_config(&ctx.emitter, ctx.stats.clone());
+    // Use live pipeline's store, `from_config` always selects ClickHouse mirror
+    let mut resolver = ToastResolver::for_mode(
+        &ctx.emitter,
+        ctx.stats.clone(),
+        ctx.oracle
+            .as_deref()
+            .map(crate::toast::shadow_store::ShadowRead::from),
+    )
+    .map_err(anyhow::Error::msg)?;
     if let Some(b) = &ctx.budget {
         resolver = resolver.with_budget(b.clone());
     }

@@ -111,9 +111,8 @@ pub struct ShadowCatalog {
     stats: ShadowCatalogStats,
 }
 
-/// `query`/`query_one`/`query_opt` with a single transparent reconnect-retry on
-/// closed-connection errors. Macro over `$method` shares one body across the
-/// three arities without boxing the future.
+/// Reconnect and retry `query`/`query_one` once on closed-connection errors
+/// Share implementation without boxing futures
 macro_rules! query_with_reconnect {
     ($self:ident, $method:ident, $statement:expr, $params:expr) => {{
         $self.ensure_open().await?;
@@ -165,17 +164,21 @@ impl ShadowCatalog {
         })
     }
 
-    async fn oid_by_name(&mut self, rel: &RelName) -> Result<Option<Oid>> {
-        let (ns, name): (&str, &str) = (&rel.namespace, &rel.name);
-        let row = self
-            .query_opt_retry(
+    /// Look up OIDs in shadow's `pg_class`, omitting unknown names
+    /// Results are unordered
+    async fn oids_by_name(&mut self, rels: &[&RelName]) -> Result<Vec<Oid>> {
+        let namespaces: Vec<&str> = rels.iter().map(|r| &*r.namespace).collect();
+        let names: Vec<&str> = rels.iter().map(|r| &*r.name).collect();
+        let rows = self
+            .query_retry(
                 "SELECT c.oid FROM pg_class c \
                  JOIN pg_namespace n ON n.oid = c.relnamespace \
-                 WHERE n.nspname = $1 AND c.relname = $2",
-                &[&ns, &name],
+                 JOIN unnest($1::text[], $2::text[]) AS want(nspname, relname) \
+                   ON want.nspname = n.nspname AND want.relname = c.relname",
+                &[&namespaces, &names],
             )
             .await?;
-        Ok(row.map(|r| r.get(0)))
+        Ok(rows.iter().map(|r| r.get(0)).collect())
     }
 
     /// Resolve a relation name to its current source descriptor via shadow's
@@ -186,10 +189,27 @@ impl ShadowCatalog {
         &mut self,
         rel: &RelName,
     ) -> Result<Option<Arc<RelDescriptor>>> {
-        let Some(oid) = self.oid_by_name(rel).await? else {
-            return Ok(None);
-        };
-        Ok(self.fetch_one(oid).await?.map(Arc::new))
+        Ok(self
+            .descriptors_by_name([rel])
+            .await?
+            .into_iter()
+            .next()
+            .map(Arc::new))
+    }
+
+    /// Batch [`descriptor_by_name`](Self::descriptor_by_name) using one name
+    /// lookup and one descriptor read, omitting names absent from shadow
+    pub async fn descriptors_by_name<'a>(
+        &mut self,
+        rels: impl IntoIterator<Item = &'a RelName>,
+    ) -> Result<Vec<RelDescriptor>> {
+        let rels: Vec<&RelName> = rels.into_iter().collect();
+        let oids = self.oids_by_name(&rels).await?;
+        // An empty oid list reads as the whole catalog downstream
+        if oids.is_empty() {
+            return Ok(Vec::new());
+        }
+        Ok(self.fetch_descriptors_batch(&oids).await?.1)
     }
 
     async fn fetch_one(&mut self, oid: Oid) -> Result<Option<RelDescriptor>> {
@@ -246,14 +266,6 @@ impl ShadowCatalog {
         params: &[&(dyn ToSql + Sync)],
     ) -> Result<Row> {
         query_with_reconnect!(self, query_one, statement, params)
-    }
-
-    async fn query_opt_retry(
-        &mut self,
-        statement: &str,
-        params: &[&(dyn ToSql + Sync)],
-    ) -> Result<Option<Row>> {
-        query_with_reconnect!(self, query_opt, statement, params)
     }
 
     async fn query_retry(

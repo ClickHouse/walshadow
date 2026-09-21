@@ -791,6 +791,11 @@ fn apply_fetched(
             resolver.note_filled_default();
             Ok((ColumnValue::Null, 0))
         }
+        // Confirmed ID reuse needs no store ownership check
+        Some(FetchedValue::Generation) => {
+            resolver.note_filled_generation();
+            Ok((ColumnValue::Null, 0))
+        }
         // Interpret miss according to store ownership.
         //
         // Walk-seeded store must contain chunks written during this pass.
@@ -808,7 +813,10 @@ fn apply_fetched(
                 FetchedValue::Mismatch { got } => {
                     format!("chunks sum to {got} bytes, pointer says {extsize}")
                 }
-                _ => "has no chunks in the store".into(),
+                FetchedValue::Missing => "has no chunks in the store".into(),
+                FetchedValue::Assembled(_) | FetchedValue::Generation => {
+                    unreachable!("matched above")
+                }
             };
             Err(format!(
                 "bootstrap: relation {} column {target} value_id={} on toast relid={}: \

@@ -14,7 +14,8 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 
-use crate::ops::bridge::{Bridge, BridgeError, MAX_FETCH_VALUES};
+use crate::ops::bridge::{Bridge, BridgeError, FetchedChunks, MAX_FETCH_VALUES};
+use crate::toast::xid_ceiling::{XidCeiling, follows};
 use crate::toast::{ChunkStore, ChunkStoreError, FetchedValue, ToastRow};
 
 /// Round-trip payload target. Always allow one value even when it exceeds limit
@@ -38,8 +39,36 @@ pub fn bound(bridge: Arc<Bridge>) -> LateBridge {
     cell
 }
 
+/// Bridge and xid samples for shadow reads
+/// Detect reused value IDs using pump's samples, returning
+/// [`FetchedValue::Generation`]. Default ceiling skips generation checks
+#[derive(Clone, Default)]
+pub struct ShadowRead {
+    pub bridge: LateBridge,
+    pub ceiling: Arc<XidCeiling>,
+}
+
+/// Create a read without generation checks
+impl From<LateBridge> for ShadowRead {
+    fn from(bridge: LateBridge) -> Self {
+        Self {
+            bridge,
+            ceiling: Arc::default(),
+        }
+    }
+}
+
+impl From<&crate::ops::oracle::Oracle> for ShadowRead {
+    fn from(oracle: &crate::ops::oracle::Oracle) -> Self {
+        Self {
+            bridge: bound(oracle.bridge()),
+            ceiling: oracle.xid_ceiling(),
+        }
+    }
+}
+
 pub struct ShadowToastStore {
-    bridge: LateBridge,
+    read: ShadowRead,
     replay_wait_max: Duration,
 }
 
@@ -49,9 +78,9 @@ impl ShadowToastStore {
     }
 
     /// Create store that waits for bridge to become available
-    pub fn late(bridge: LateBridge) -> Self {
+    pub fn late(read: impl Into<ShadowRead>) -> Self {
         Self {
-            bridge,
+            read: read.into(),
             replay_wait_max: REPLAY_WAIT_MAX,
         }
     }
@@ -65,7 +94,7 @@ impl ShadowToastStore {
     async fn bridge(&self) -> Result<&Arc<Bridge>, ChunkStoreError> {
         let deadline = Instant::now() + self.replay_wait_max;
         loop {
-            if let Some(b) = self.bridge.get() {
+            if let Some(b) = self.read.bridge.get() {
                 return Ok(b);
             }
             if Instant::now() >= deadline {
@@ -177,6 +206,9 @@ impl ChunkStore for ShadowToastStore {
         let bridge = self.bridge().await?;
         // Wait once for complete batch
         let floor = self.await_replay(bridge, max_lsn).await?;
+        // Batch bound is the newest referring record, so its ceiling covers
+        // every value here
+        let ceiling = self.read.ceiling.at(max_lsn);
         let mut out = Vec::with_capacity(values.len());
         // Split resolver batch to satisfy wire limits
         for slice in request_slices(values) {
@@ -184,7 +216,7 @@ impl ChunkStore for ShadowToastStore {
                 .fetch_toast(toast_relid, slice, floor)
                 .await
                 .map_err(|e| ChunkStoreError::Shadow(e.to_string()))?;
-            out.extend(got);
+            out.extend(got.into_iter().map(|c| judge(c, ceiling)));
         }
         Ok(out)
     }
@@ -200,6 +232,17 @@ impl ChunkStore for ShadowToastStore {
         _commit_lsn: u64,
     ) -> Result<(), ChunkStoreError> {
         Err(ChunkStoreError::ReadOnly("rewrite_barrier"))
+    }
+}
+
+/// Detect reused IDs from chunks newer than referring record
+/// PostgreSQL reuses an ID only after all original chunks are gone
+/// Skip check if ceiling or normal xmin is unavailable
+fn judge(c: FetchedChunks, ceiling: u32) -> FetchedValue {
+    if ceiling != 0 && c.xmin != 0 && follows(c.xmin, ceiling) {
+        FetchedValue::Generation
+    } else {
+        c.value
     }
 }
 
@@ -228,6 +271,52 @@ fn request_slices(values: &[(u32, usize)]) -> impl Iterator<Item = &[(u32, usize
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_run_younger_than_the_ceiling_reads_as_a_later_generation() {
+        let torn = |xmin| FetchedChunks {
+            value: FetchedValue::Mismatch { got: 3 },
+            xmin,
+        };
+        let whole = |xmin| FetchedChunks {
+            value: FetchedValue::Assembled(b"abc".to_vec()),
+            xmin,
+        };
+
+        assert_eq!(judge(whole(200), 100), FetchedValue::Generation);
+        assert_eq!(
+            judge(torn(200), 100),
+            FetchedValue::Generation,
+            "a partly reclaimed replacement is still a replacement",
+        );
+        assert_eq!(
+            judge(torn(50), 100),
+            FetchedValue::Mismatch { got: 3 },
+            "partially reclaimed original remains a size mismatch",
+        );
+        assert_eq!(
+            judge(whole(100), 100),
+            whole(100).value,
+            "equal is not newer"
+        );
+        assert_eq!(judge(whole(200), 0), whole(200).value, "unsampled ceiling");
+        assert_eq!(judge(whole(0), 100), whole(0).value, "frozen chunks");
+        assert_eq!(
+            judge(
+                FetchedChunks {
+                    value: FetchedValue::Missing,
+                    xmin: 0,
+                },
+                100,
+            ),
+            FetchedValue::Missing,
+        );
+        assert_eq!(
+            judge(whole(4), u32::MAX - 6),
+            FetchedValue::Generation,
+            "xid order wraps",
+        );
+    }
 
     #[test]
     fn slices_respect_both_caps_and_never_drop_a_value() {

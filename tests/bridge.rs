@@ -1160,6 +1160,8 @@ fn spawn_toast_worker(
                     _ => {
                         body.extend_from_slice(&1u32.to_be_bytes());
                         body.push(0);
+                        // Frozen chunks, so no ceiling ever rejects this value
+                        body.extend_from_slice(&0u32.to_be_bytes());
                         body.extend_from_slice(&4u32.to_be_bytes());
                         body.extend_from_slice(b"body");
                     }

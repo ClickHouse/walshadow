@@ -2124,6 +2124,8 @@ crate::atomic_stats! {
         pub toast_values_filled_default,
         pub toast_values_filled_superseded,
         pub toast_values_filled_mismatch,
+        /// Shadow values replaced with a fill after detecting value-ID reuse
+        pub toast_values_filled_generation,
         /// Oversized values replaced under `inline_value_overflow = "null"`
         pub toast_values_filled_oversize,
         pub toast_fetch_miss,

@@ -1,12 +1,36 @@
 //! Persist replay eligibility, recovery can recreate files without their pages
 
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use ahash::{HashMap, HashSet};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 
 const FILE: &str = "walshadow_relations.toml";
+
+/// Share relation membership outside routing task
+///
+/// Keep per-record routing reads in [`ShadowRelations`] free of locks
+/// Less frequent opt-in checks can take a lock
+#[derive(Clone, Default)]
+pub struct ShadowHeld(Arc<Mutex<HashSet<(u32, u32)>>>);
+
+impl ShadowHeld {
+    pub fn contains(&self, rel: (u32, u32)) -> bool {
+        self.0.lock().expect("shadow held poisoned").contains(&rel)
+    }
+
+    fn insert(&self, rel: (u32, u32)) {
+        self.0.lock().expect("shadow held poisoned").insert(rel);
+    }
+}
+
+impl FromIterator<(u32, u32)> for ShadowHeld {
+    fn from_iter<I: IntoIterator<Item = (u32, u32)>>(rels: I) -> Self {
+        Self(Arc::new(Mutex::new(rels.into_iter().collect())))
+    }
+}
 
 #[derive(Serialize, Deserialize)]
 struct Stored {
@@ -17,6 +41,7 @@ struct Stored {
 
 pub struct ShadowRelations {
     rels: HashMap<(u32, u32), u64>,
+    held: ShadowHeld,
     creates_from: u64,
     dir: Option<PathBuf>,
     dirty: bool,
@@ -25,6 +50,7 @@ pub struct ShadowRelations {
 impl ShadowRelations {
     pub fn new(rels: HashSet<(u32, u32)>, creates_from: u64) -> Self {
         Self {
+            held: rels.iter().copied().collect(),
             rels: rels.into_iter().map(|r| (r, 0)).collect(),
             creates_from,
             dir: None,
@@ -34,6 +60,11 @@ impl ShadowRelations {
 
     pub fn contains(&self, rel: &(u32, u32)) -> bool {
         self.rels.contains_key(rel)
+    }
+
+    /// Membership handle for opt-in admission
+    pub fn held(&self) -> ShadowHeld {
+        self.held.clone()
     }
 
     pub fn len(&self) -> usize {
@@ -53,6 +84,7 @@ impl ShadowRelations {
             return;
         }
         self.rels.insert(rel, lsn);
+        self.held.insert(rel);
         self.dirty = true;
         tracing::info!(
             db = rel.0,
@@ -84,6 +116,7 @@ impl ShadowRelations {
             );
         }
         Ok(Self {
+            held: rels.keys().copied().collect(),
             rels,
             creates_from: stored.creates_from,
             dir: Some(dir.to_path_buf()),
@@ -123,6 +156,26 @@ impl ShadowRelations {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn held_tracks_seed_admissions_and_reload() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut rels = ShadowRelations::new(HashSet::from_iter([(5, 17000)]), 100);
+        let held = rels.held();
+        assert!(held.contains((5, 17000)));
+        assert!(!held.contains((5, 17001)));
+
+        // Below `creates_from` stays out of both views
+        rels.admit((5, 17001), 99);
+        assert!(!held.contains((5, 17001)));
+        rels.admit((5, 17001), 120);
+        assert!(held.contains((5, 17001)));
+
+        rels.persist(tmp.path()).await.unwrap();
+        let reloaded = ShadowRelations::load(tmp.path()).await.unwrap();
+        let held = reloaded.held();
+        assert!(held.contains((5, 17000)) && held.contains((5, 17001)));
+    }
 
     #[tokio::test]
     async fn refuse_missing_or_invalid_eligibility() {

@@ -316,6 +316,9 @@ pub enum FetchedValue {
     Mismatch { got: usize },
     /// Exactly `expected_size` bytes, seq-dense from 0
     Assembled(Vec<u8>),
+    /// Chunks postdate referring record, indicating value-ID reuse
+    /// Applies to complete and partial replacements, shadow store only
+    Generation,
 }
 
 /// Ordered chunk assembler: seqs must arrive ascending, bytes append into
@@ -1024,24 +1027,24 @@ impl ToastResolver {
         Self::with_limits(store, emitter, stats)
     }
 
-    /// Build resolver for configured mode. Shadow requires `bridge`, which
-    /// bootstrap binds only once it has started PostgreSQL
+    /// Build resolver for configured mode. Shadow requires `read`
+    /// Bootstrap binds its bridge after starting PostgreSQL
     pub fn for_mode(
         emitter: &EmitterConfig,
         stats: Arc<EmitterStats>,
-        bridge: Option<crate::toast::shadow_store::LateBridge>,
+        read: Option<crate::toast::shadow_store::ShadowRead>,
     ) -> Result<Self, String> {
         if !emitter.toast.mode.is_shadow() {
             return Ok(Self::from_config(emitter, stats));
         }
-        let bridge = bridge.ok_or_else(|| {
+        let read = read.ok_or_else(|| {
             "[toast] mode = \"shadow\" needs the pgext bridge; \
              pass --bridge-lib-dir and let walshadow manage shadow"
                 .to_string()
         })?;
         Ok(Self::with_limits(
             Some(Arc::new(
-                crate::toast::shadow_store::ShadowToastStore::late(bridge),
+                crate::toast::shadow_store::ShadowToastStore::late(read),
             )),
             emitter,
             stats,
@@ -1341,6 +1344,13 @@ impl ToastResolver {
     pub fn note_filled_mismatch(&self) {
         self.stats
             .toast_values_filled_mismatch
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count fill caused by value-ID reuse
+    pub fn note_filled_generation(&self) {
+        self.stats
+            .toast_values_filled_generation
             .fetch_add(1, Ordering::Relaxed);
     }
 

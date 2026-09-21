@@ -251,6 +251,8 @@ snapshot! {
         "Store-mode values filled after their history merge-collapsed.",
     counter toast_values_filled_mismatch_total: u64 =
         "Store-mode values filled off a dense-but-short store run (partial collapse or generation mixing).",
+    counter toast_values_filled_generation_total: u64 =
+        "Shadow values replaced with a fill after detecting value-ID reuse.",
     counter toast_values_filled_oversize_total: u64 =
         "Values over inline_value_max replaced with NULL or a column default.",
     counter toast_mirror_truncates_total: u64 =

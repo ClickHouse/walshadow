@@ -182,6 +182,7 @@ impl OracleBlock {
 
 pub struct Oracle {
     bridge: Arc<Bridge>,
+    xid_ceiling: Arc<crate::toast::xid_ceiling::XidCeiling>,
     pub stats: Arc<OracleStats>,
 }
 
@@ -189,8 +190,19 @@ impl Oracle {
     pub fn new(bridge: Arc<Bridge>) -> Self {
         Self {
             bridge,
+            xid_ceiling: Arc::default(),
             stats: Arc::new(OracleStats::default()),
         }
+    }
+
+    /// Share pump's xid ceilings with shadow TOAST store
+    pub fn with_xid_ceiling(mut self, ceiling: Arc<crate::toast::xid_ceiling::XidCeiling>) -> Self {
+        self.xid_ceiling = ceiling;
+        self
+    }
+
+    pub fn xid_ceiling(&self) -> Arc<crate::toast::xid_ceiling::XidCeiling> {
+        self.xid_ceiling.clone()
     }
 
     /// Requests the shadow answers at once, ie the bridge's pool width. One

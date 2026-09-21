@@ -111,6 +111,17 @@ async fn scalar(c: &Client, sql: &str) -> String {
         .unwrap_or_default()
 }
 
+/// Assign and return a fresh xid to bound later writes
+async fn current_xid(c: &Client) -> u32 {
+    scalar(
+        c,
+        "SELECT (pg_current_xact_id()::text::numeric % 4294967296)::text",
+    )
+    .await
+    .parse()
+    .expect("xid fits 32 bits")
+}
+
 /// A toast relation is named for its parent's oid, not its own, so the name is
 /// read back rather than derived from `reltoastrelid`
 async fn toast_table(c: &Client, toast_relid: u32) -> String {
@@ -194,6 +205,7 @@ async fn fetch(bridge: &Bridge, v: &Value) -> FetchedValue {
         .unwrap_or_else(|e| panic!("fetch {} value {}: {e}", v.table, v.value_id))
         .pop()
         .expect("one value asked, one answered")
+        .value
 }
 
 fn describe(f: &FetchedValue, expected: usize) -> String {
@@ -201,6 +213,7 @@ fn describe(f: &FetchedValue, expected: usize) -> String {
         FetchedValue::Assembled(b) => format!("Assembled {} of {expected}", b.len()),
         FetchedValue::Missing => "Missing".into(),
         FetchedValue::Mismatch { got } => format!("Mismatch got {got} of {expected}"),
+        FetchedValue::Generation => "Generation".into(),
     }
 }
 
@@ -345,9 +358,7 @@ async fn partly_reclaimed_run_refuses() {
             v.extsize
         ),
         FetchedValue::Missing => {}
-        FetchedValue::Assembled(_) => {
-            panic!("a pruned run must not read back as the value")
-        }
+        other => panic!("a pruned run must not read back as the value: {other:?}"),
     }
 }
 
@@ -446,12 +457,13 @@ async fn fetch_refuses_malformed_requests() {
         .fetch_toast(999_999, &[(1, 8), (2, 8)], 0)
         .await
         .expect("absent toast relation is a per-value result");
+    let gone: Vec<FetchedValue> = gone.into_iter().map(|c| c.value).collect();
     assert_eq!(gone, vec![FetchedValue::Missing, FetchedValue::Missing]);
 
     // A replay floor a primary cannot meet is refused rather than answered
     assert!(
         bridge
-            .fetch_toast(v.toast_relid, &[(v.value_id, v.extsize)], u64::MAX,)
+            .fetch_toast(v.toast_relid, &[(v.value_id, v.extsize)], u64::MAX)
             .await
             .is_err(),
         "min_replay_lsn above the current position must refuse"
@@ -460,22 +472,24 @@ async fn fetch_refuses_malformed_requests() {
     // A value id that was never allocated is Missing, not an error
     assert_eq!(
         bridge
-            .fetch_toast(v.toast_relid, &[(v.value_id.wrapping_add(7919), 8)], 0,)
+            .fetch_toast(v.toast_relid, &[(v.value_id.wrapping_add(7919), 8)], 0)
             .await
             .expect("absent id is a per-value result")
             .pop()
-            .unwrap(),
+            .unwrap()
+            .value,
         FetchedValue::Missing,
     );
 
     // Wrong expected size is a mismatch, so a torn run can never pass as whole
     assert!(matches!(
         bridge
-            .fetch_toast(v.toast_relid, &[(v.value_id, v.extsize - 1)], 0,)
+            .fetch_toast(v.toast_relid, &[(v.value_id, v.extsize - 1)], 0)
             .await
             .expect("size disagreement is a per-value result")
             .pop()
-            .unwrap(),
+            .unwrap()
+            .value,
         FetchedValue::Mismatch { .. }
     ));
 }
@@ -524,7 +538,7 @@ async fn planted_chunk_headers_short_reads_compressed_refuses() {
         .expect("short chunks assemble")
         .pop()
         .unwrap();
-    assert_eq!(got, FetchedValue::Assembled(b"helloworld".to_vec()));
+    assert_eq!(got.value, FetchedValue::Assembled(b"helloworld".to_vec()));
 
     let bad_id = short_id + 1;
     exec(&sql, &plant(bad_id, 0, "xyz", true)).await;
@@ -543,6 +557,115 @@ async fn planted_chunk_headers_short_reads_compressed_refuses() {
         matches!(&after, FetchedValue::Assembled(b) if b == v.raw.as_bytes()),
         "{}",
         describe(&after, v.extsize)
+    );
+}
+
+/// Reject reused value IDs for both complete and partial replacements
+/// Size and sequence checks alone cannot detect reuse
+/// Plant replacement chunks to avoid waiting for OID counter to wrap,
+/// then read with an earlier xid ceiling
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn chunks_younger_than_the_ceiling_read_as_a_later_generation() {
+    use std::sync::Arc;
+    use walshadow::toast::ChunkStore;
+    use walshadow::toast::shadow_store::{ShadowRead, ShadowToastStore, bound};
+    use walshadow::toast::xid_ceiling::{XidCeiling, follows};
+
+    if !requirements(&["initdb"]) {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let pg = start_pg(&tmp, ports::reserve_port(), &tmp.path().join("archive"));
+    let bridge = Arc::new(dial(pg.shadow().bridge_socket().unwrap()).await);
+    let sql = connect_sql(pg.shadow()).await;
+
+    let v = seed_value(&sql, "t_gen", "repeat('gh', 120000)", true).await;
+    exec(
+        &sql,
+        &format!(
+            "CREATE FUNCTION ws_test_plant_toast_chunk(oid, oid, int, bytea, bool) \
+             RETURNS void AS '{}', 'ws_test_plant_toast_chunk' LANGUAGE c",
+            wstest_module().display()
+        ),
+    )
+    .await;
+
+    let before = current_xid(&sql).await;
+    let reissued = 4_000_000_000;
+    for (seq, part) in ["hello", "world"].iter().enumerate() {
+        exec(
+            &sql,
+            &format!(
+                "SELECT ws_test_plant_toast_chunk({}, {reissued}, {seq}, '{part}'::bytea, false)",
+                v.toast_relid
+            ),
+        )
+        .await;
+    }
+    let after = current_xid(&sql).await;
+
+    // The extension reports when the chunks were written, nothing more
+    let raw = bridge
+        .fetch_toast(v.toast_relid, &[(reissued, 10)], 0)
+        .await
+        .expect("fetch the planted run");
+    assert!(
+        follows(raw[0].xmin, before) && !follows(raw[0].xmin, after),
+        "planted chunks were written between the two ceilings, xmin is {}",
+        raw[0].xmin,
+    );
+
+    // Every read shares one sample, so the lookup position does not matter
+    let store = |ceiling_xid: u32| {
+        let ceiling = Arc::new(XidCeiling::default());
+        ceiling.observe(0, ceiling_xid);
+        ShadowToastStore::late(ShadowRead {
+            bridge: bound(bridge.clone()),
+            ceiling,
+        })
+    };
+
+    let earlier = store(before);
+    assert_eq!(
+        earlier
+            .fetch(v.toast_relid, reissued, 0, 10)
+            .await
+            .expect("fetch under the earlier ceiling"),
+        FetchedValue::Generation,
+        "chunks written after the referring record are another value",
+    );
+    assert_eq!(
+        earlier
+            .fetch(v.toast_relid, reissued, 0, 9)
+            .await
+            .expect("fetch a torn replacement"),
+        FetchedValue::Generation,
+        "a replacement that does not even assemble is still a replacement",
+    );
+
+    let later = store(after);
+    assert_eq!(
+        later
+            .fetch(v.toast_relid, reissued, 0, 10)
+            .await
+            .expect("fetch under the later ceiling"),
+        FetchedValue::Assembled(b"helloworld".to_vec()),
+        "a ceiling above the chunks accepts them",
+    );
+    assert!(
+        matches!(
+            later.fetch(v.toast_relid, reissued, 0, 9).await,
+            Ok(FetchedValue::Mismatch { got: 10 })
+        ),
+        "without detected reuse, wrong size remains a mismatch",
+    );
+    assert_eq!(
+        later
+            .fetch(v.toast_relid, v.value_id, 0, v.extsize)
+            .await
+            .expect("fetch the original"),
+        FetchedValue::Assembled(v.raw.clone().into_bytes()),
+        "a value older than the ceiling is untouched by the check",
     );
 }
 
@@ -605,6 +728,7 @@ async fn batch_fetch_aligns_with_its_request() {
         .await
         .expect("batch fetch");
     let elapsed = started.elapsed();
+    let got: Vec<FetchedValue> = got.into_iter().map(|c| c.value).collect();
     assert_eq!(got.len(), asked.len());
     assert_eq!(got[4], FetchedValue::Missing);
     let mut bytes = 0usize;
@@ -773,9 +897,9 @@ async fn standby_keeps_the_value_until_the_prune_record_replays() {
         .await
         .expect("standby fetch at its own replay position");
     assert!(
-        matches!(&got[0], FetchedValue::Assembled(b) if b == v.raw.as_bytes()),
+        matches!(&got[0].value, FetchedValue::Assembled(b) if b == v.raw.as_bytes()),
         "on a standby the dead referrer's value must still read whole: {}",
-        describe(&got[0], v.extsize)
+        describe(&got[0].value, v.extsize)
     );
 
     // Now let the source prune and ship the record. Replaying it is what takes
