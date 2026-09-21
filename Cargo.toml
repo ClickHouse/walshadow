@@ -18,7 +18,7 @@ path = "src/bin/filter.rs"
 
 [[bin]]
 name = "walshadow-stream"
-path = "src/bin/stream.rs"
+path = "src/bin/stream/main.rs"
 
 [lib]
 name = "walshadow"

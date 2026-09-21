@@ -50,7 +50,7 @@ operator assertion that a server looks like correct primary. Procedure lives in
 [switchover guide](../docs/failover.md); unplanned cases remain in
 [failover plan](../plans/failover.md)
 
-Start implementation reading in [daemon](../src/bin/stream.rs),
+Start implementation reading in [daemon](../src/bin/stream/main.rs),
 [transaction buffer](../src/xact/xact_buffer.rs),
 [acknowledgements](../src/emit/pipeline/ack.rs), and
 [source transition](../src/source/transition.rs)

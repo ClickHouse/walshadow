@@ -6,7 +6,10 @@ Review these limits before production use
 
 - PostgreSQL 16, 17, 18, and 19, daemon rejects unaudited majors
 - shadow PostgreSQL major must match source major
-- one source database per walshadow process
+- one process replicates every database its config names
+  ([several databases](multi-database.md)); adding or removing one needs a
+  restart, and existing rows load from a backup only for the database
+  `[source] dbname` names
 - `wal_level = logical` required
 - every replicated table needs usable replica identity
 - prepared transactions are not supported for production use; commit and abort
@@ -26,7 +29,11 @@ and workload limits before attaching
   arrays); the table it creates is empty, and `ADD COLUMN` resolves the
   default through the oracle
 - `time` mapping requires ClickHouse `Time64` support
-- same-named tables from different PostgreSQL schemas need explicit destination mapping
+- same-named tables from different PostgreSQL schemas or databases need
+  explicit destination mapping. Config parsing rejects conflicts between
+  explicit entries; `replicate_all` names destinations after source tables, so
+  the second table to claim one destination is refused with an error and left
+  unreplicated until it names its own `target_database` or `target_table`
 - `base_backup` and `object_store` table loads publish with staging-table swap, database must support `EXCHANGE TABLES`
 - backup rows inserted into staging do not fire destination materialized views, live rows copied back after swap can fire twice
 
@@ -41,8 +48,8 @@ insert batch
 - a multidimensional array does not fit the default one-layer `Array(...)`
   mapping; map the column to a matching nested `Array(Array(...))` instead
 - greenfield bootstrap runs before the shadow exists, so it starts a throwaway
-  PostgreSQL from the source schema to convert them; that needs `pg_dump` and
-  the source's extensions installable on the daemon host, else bootstrap stops
+  PostgreSQL instance from source schema to convert them, which requires `pg_dump`
+  Schema objects for extensions unavailable on daemon host are omitted
 
 ## Ordering and consistency
 
@@ -84,8 +91,8 @@ insert batch
 - DDL during greenfield bootstrap is unsupported; affected relations may be
   skipped or fail the load
 - `copy`, selected by default by `init`, scans selected table through PostgreSQL
-  SQL path; source account must be able to read every row, row-security filtering
-  fails the load
+  SQL path, source account must be able to read every row
+  Rows hidden by row security are skipped without an error
 - `base_backup` transfers cluster-sized backup even for one table
 - `object_store` requires full wal-g backup and continuous archived WAL, including archived
   timeline history, to selection point
@@ -93,11 +100,12 @@ insert batch
   stream proved, which gap replay requires archived history to match; reject backups
   extending beyond ancestor fork point
 - old object-store backup with intervening catalog changes can be rejected, use newer backup or `copy`
-- an interrupted `object_store` load discards its partial data and re-extracts, up to
-  three attempts, pinned to the backup the first attempt resolved so already-inserted rows
-  deduplicate. Failed cleanup keeps the pin and consumes an attempt. Past the cap, and for
-  a marker naming no backup, an unreadable marker, or any other mode, it stops for an
-  operator. No progress carries across attempts, so each one re-reads the whole backup
+- an interrupted `object_store` load allows up to three attempts using same backup
+  to avoid duplicate rows. If checkpoint and temporary data files survive, retry skips
+  extraction. Otherwise, it discards partial data and extracts again. Failed cleanup
+  counts as an attempt and keeps chosen backup. Manual intervention is required after
+  three attempts, if saved recovery state is unreadable or names no backup, or if load
+  uses another mode
 - `initial_load = "none"` never reconstructs rows which existed before selection and receive no later change
 
 ## Large values

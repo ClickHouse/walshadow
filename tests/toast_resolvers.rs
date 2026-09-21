@@ -86,13 +86,16 @@ async fn drive_store_backed(resolver: &ToastResolver, stats: &EmitterStats) {
 
     // Pre-window re-emit: the in-xact buffer missed these chunks, so the
     // reassembler rehydrates the value from the store.
-    let got = resolver.fetch_value(16700, 42, u64::MAX, 11).await.unwrap();
+    let got = resolver
+        .fetch_value(0, 16700, 42, u64::MAX, 11)
+        .await
+        .unwrap();
     assert_eq!(got, Some(assembled(b"hello world")));
     assert_eq!(stats.toast_values_fetched.load(Ordering::Relaxed), 1);
 
     // Genuine miss -> Missing (caller fills + counts).
     let miss = resolver
-        .fetch_value(16700, 404, u64::MAX, 11)
+        .fetch_value(0, 16700, 404, u64::MAX, 11)
         .await
         .unwrap();
     assert_eq!(miss, Some(FetchedValue::Missing));
@@ -609,7 +612,7 @@ async fn disabled_resolver_no_store_fills_on_miss() {
     // No store to hydrate from: None even for a just-put value.
     assert!(
         resolver
-            .fetch_value(16700, 42, u64::MAX, 5)
+            .fetch_value(0, 16700, 42, u64::MAX, 5)
             .await
             .unwrap()
             .is_none()

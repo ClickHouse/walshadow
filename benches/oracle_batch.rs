@@ -211,7 +211,7 @@ async fn one_batch(oracle: &Oracle, buf: &OracleColumnBuf, rows: usize) -> Durat
     }];
     let started = Instant::now();
     let block = oracle
-        .encode_batch(&columns, rows, Allocator::stdlib())
+        .encode_batch(Oracle::ANY_DATABASE, &columns, rows, Allocator::stdlib())
         .await
         .expect("oracle answers");
     let elapsed = started.elapsed();

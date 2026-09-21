@@ -73,7 +73,7 @@ fn scan(cat: u8, top: u32, oids: &[u32]) -> Vec<u8> {
 fn open(tmp: &std::path::Path) -> (Cluster, UnixStream) {
     let mut pg = pgext::stage(tmp, ports::PG_SHADOW_PORT, Duration::from_secs(30));
     pg.start(&[]);
-    pg.wait_log(0, "walshadow bridge listening");
+    pg.wait_log(0, "walshadow bridge for");
     let sock = pgext::hello_on(&pg.bridge_path());
     (pg, sock)
 }

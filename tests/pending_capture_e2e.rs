@@ -120,9 +120,10 @@ fn capture_stats(drill: &Drill) -> std::sync::Arc<walshadow::catalog_capture::Ca
         .pipeline
         .sinks
         .capture
-        .as_ref()
-        .expect("capture wired")
-        .stats_handle()
+        .stats_handles()
+        .next()
+        .expect("one capture")
+        .1
 }
 
 fn load(c: &std::sync::atomic::AtomicU64) -> u64 {

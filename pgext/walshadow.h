@@ -8,7 +8,7 @@
 
 /* Bumped when a request or response layout changes, or when an op's reading
  * of an unchanged layout changes */
-#define WS_PROTO_VERSION		6
+#define WS_PROTO_VERSION		7
 /* Bumped when any catalog projection changes shape */
 #define WS_PROJECTION_VERSION	1
 

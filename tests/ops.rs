@@ -212,7 +212,9 @@ async fn preflight_rejects_old_version_missing_slot_and_unknown_rel() {
         .await
         .expect("shadow sql");
 
-    let ch_config = mapping_for(&[("s11", "ghost")]);
+    let mut ch_config = mapping_for(&[("s11", "ghost")]);
+    // `[database.<dbname>]` entry for a nonexistent database
+    ch_config.databases.push("ghostdb".into());
     let report = walshadow::preflight::run(Inputs {
         source_version_num: 150_000, // < 16: too old, and major 15 ≠ shadow major
         source_sql: &src_sql,
@@ -239,6 +241,11 @@ async fn preflight_rejects_old_version_missing_slot_and_unknown_rel() {
         has(
             &|e| matches!(e, PreflightError::SlotMissing { slot } if slot == "walshadow_absent_slot")
         ),
+        "{:?}",
+        report.errors
+    );
+    assert!(
+        has(&|e| matches!(e, PreflightError::SourceDatabaseMissing { db } if db == "ghostdb")),
         "{:?}",
         report.errors
     );

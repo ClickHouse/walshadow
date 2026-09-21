@@ -27,15 +27,16 @@ use std::time::Duration;
 use tokio::sync::{Mutex, watch};
 use tokio::task::JoinHandle;
 
-use crate::catalog::shadow_catalog::ShadowCatalog;
 use crate::ch::EmitterError;
 use crate::emit::ch_ddl::DdlApplicator;
 use crate::emit::ch_emitter::{EmitterConfig, EmitterStats};
-use crate::mapping::MappingHandle;
 use crate::ops::oracle::Oracle;
 use crate::ops::trace::TxnSpanRegistry;
 use crate::pos::{EmitterAck, Floor, Monotone};
+use crate::source_db::SourceDbs;
 use crate::xact::xact_buffer::{SubxactTracker, XactBuffer};
+use ahash::HashMap;
+use tokio_postgres::types::Oid;
 
 /// One-shot fatal-error signal shared across pipeline stages. Pump polls
 /// [`Fatal::message`] to exit with the root cause; the DDL barrier `select`s
@@ -95,21 +96,21 @@ pub enum TailKind {
 
 /// Inputs the daemon supplies to stand up the pipeline.
 pub struct PipelineConfig {
+    /// Cluster-wide knobs: CH connection, insert budgets, pool sizes. The
+    /// per-database table rules live on each [`SourceDb`](crate::source_db::SourceDb)
     pub emitter: EmitterConfig,
     pub decoder_pool_size: usize,
     pub inserter_pool_size: usize,
-    pub catalog: Arc<Mutex<ShadowCatalog>>,
-    pub mapping: MappingHandle,
+    /// Followed databases: descriptor log, shadow catalog, routing map
+    pub dbs: Arc<SourceDbs>,
     pub oracle: Option<Arc<Oracle>>,
-    /// `None` observes schema events / truncates without CH DDL (pairs
-    /// with [`TailKind::Null`])
-    pub applicator: Option<DdlApplicator>,
+    /// One per database that applies CH DDL. A database with no entry has
+    /// its schema events and truncates observed only (pairs with
+    /// [`TailKind::Null`])
+    pub applicators: HashMap<Oid, DdlApplicator>,
     pub tail: TailKind,
     pub buffer: Arc<Mutex<XactBuffer>>,
     pub subxact_tracker: Arc<Mutex<SubxactTracker>>,
-    /// Durable descriptor log: decode pool + reorder read interval-scoped
-    /// descriptors from it
-    pub log: Arc<crate::catalog::desc_log::DescriptorLog>,
     /// Speculative per-transaction catalog state shared with capture; empty
     /// unless pending capture is on
     pub pending: Arc<crate::catalog::pending::PendingCatalog>,
@@ -117,12 +118,9 @@ pub struct PipelineConfig {
     /// Per-txn span map shared with the pump + buffer; `Some` only when OTLP
     /// tracing is on. Reorder parents `commit.drain`/`dispatch` under `txn`.
     pub span_registry: Option<TxnSpanRegistry>,
-    /// Runtime-config overlay resolver, applied to inside the reorder barrier
-    /// when a `DrainEntry::Config` drains. `None` disables live config apply.
-    pub config_resolver: Option<Arc<crate::config::ConfigResolver>>,
-    /// COPY backfiller for `initial_load='copy'` opt-ins; `None` streams from
-    /// the opt-in LSN only.
-    pub backfiller: Option<Arc<dyn crate::backfill::opt_in::Backfiller>>,
+    /// COPY backfillers for `initial_load='copy'` opt-ins, one per database.
+    /// A database with no entry streams from the opt-in LSN only
+    pub backfillers: HashMap<Oid, Arc<dyn crate::backfill::opt_in::Backfiller>>,
     /// Durable queue of deferred toast-mirror retires, loaded from the
     /// spill dir; entries due at resume retire via the post-spawn
     /// [`reorder::ReorderSink::flush_due_retires`] call
@@ -183,19 +181,16 @@ impl PipelineConfig {
             emitter,
             decoder_pool_size,
             inserter_pool_size,
-            catalog,
-            mapping,
+            dbs,
             oracle,
-            applicator,
+            applicators,
             tail,
             buffer,
             subxact_tracker,
-            log,
             pending,
             stats,
             span_registry,
-            config_resolver,
-            backfiller,
+            backfillers,
             retires,
             pending_rows,
             resume_floor,
@@ -213,7 +208,7 @@ impl PipelineConfig {
         // One resolver shared by the decode pool (fetch on miss) and the
         // reorder coordinator (put per commit).
         // Metrics-only (Null tail) has no CH connection, so no chunk store.
-        let resolver = if matches!(tail, TailKind::Null) {
+        let mut resolver = if matches!(tail, TailKind::Null) {
             crate::toast::ToastResolver::disabled().with_stats(stats.clone())
         } else {
             // Shadow mode requires oracle bridge
@@ -228,9 +223,29 @@ impl PipelineConfig {
         }
         .with_budget(budget.clone());
 
+        if emitter.toast.mode.is_shadow() && !matches!(tail, TailKind::Null) {
+            let ceiling = oracle
+                .as_ref()
+                .expect("shadow oracle checked")
+                .xid_ceiling();
+            resolver = resolver.with_database_stores(dbs.all().iter().map(|db| {
+                let read = crate::toast::shadow_store::ShadowRead {
+                    bridge: crate::toast::shadow_store::bound(db.bridge.clone()),
+                    ceiling: ceiling.clone(),
+                };
+                (
+                    db.oid,
+                    Arc::new(crate::toast::shadow_store::ShadowToastStore::late(read))
+                        as Arc<dyn crate::toast::ChunkStore>,
+                )
+            }));
+        }
+
         // Live emitter knobs (budgets/flush/compression/retry) reach the batcher
         // + inserter pool via this receiver; `None` keeps them at boot values.
-        let tail_config_rx = config_resolver.as_ref().map(|r| r.subscribe());
+        // Insert-side knobs are cluster-wide, so the primary's resolver is
+        // the one the tail tracks
+        let tail_config_rx = dbs.primary().resolver.as_ref().map(|r| r.subscribe());
 
         // Shared tail (ack collector + inserter pool + batcher), the same unit
         // bootstrap feeds via the page walk. Null swaps in the swallow task.
@@ -265,18 +280,16 @@ impl PipelineConfig {
         let plan_dir = buffer.lock().await.spill_dir().to_path_buf();
         let reorder = reorder::ReorderSink::new(
             buffer,
-            log,
+            dbs,
             pending,
-            catalog,
             subxact_tracker,
-            applicator,
+            applicators,
             ack,
             jobs_tx,
             msg_tx,
             stats,
             resolver.clone(),
-            config_resolver,
-            backfiller,
+            backfillers,
             fatal.clone(),
             span_registry,
             emitter.drain_batch_rows,
@@ -288,8 +301,6 @@ impl PipelineConfig {
             pending_rows,
             emitter.clone(),
             resume_floor,
-            mapping,
-            emitter.row_policy(),
         );
 
         Ok((

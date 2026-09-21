@@ -29,6 +29,7 @@ PostgreSQL major version
 - [Architecture](architecture/README.md)
 - [Configuration](docs/configuration.md)
 - [Table selection](docs/table-selection.md)
+- [Several databases](docs/multi-database.md)
 - [Destination tables](docs/destination-tables.md)
 - [Schema changes](docs/schema-changes.md)
 - [Operations](docs/operations.md)

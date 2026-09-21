@@ -12,6 +12,7 @@
 //! cadence, HTTP server reads a snapshot per request. Endpoint is read-only by
 //! design (no `/quit`, no admin verbs); operator actions stay on the CLI.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::io;
@@ -58,6 +59,65 @@ macro_rules! encode_metric {
     };
     ($enc:expr, gauge, $name:expr, $help:expr, $value:expr, $key:literal, $labels:expr) => {
         gauge_series($enc, $name, $help, $key, $labels.into_iter().zip($value))?
+    };
+}
+
+/// [`encode_metric`] for a family every database carries: the `database=`
+/// label comes first, a declared label array second
+macro_rules! encode_db_metric {
+    ($enc:expr, $dbs:expr, $names:expr, counter, $name:expr, $help:expr, $field:ident) => {
+        counter_series(
+            $enc,
+            $name,
+            $help,
+            "database",
+            $names
+                .iter()
+                .zip($dbs)
+                .map(|(db, s)| (db.as_ref(), s.$field)),
+        )?
+    };
+    ($enc:expr, $dbs:expr, $names:expr, gauge, $name:expr, $help:expr, $field:ident) => {
+        gauge_series(
+            $enc,
+            $name,
+            $help,
+            "database",
+            $names
+                .iter()
+                .zip($dbs)
+                .map(|(db, s)| (db.as_ref(), s.$field)),
+        )?
+    };
+    (
+        $enc:expr, $dbs:expr, $names:expr, counter, $name:expr, $help:expr, $field:ident,
+        $key:literal, $labels:expr
+    ) => {
+        counter_grid(
+            $enc,
+            $name,
+            $help,
+            $key,
+            $names
+                .iter()
+                .zip($dbs)
+                .map(|(db, s)| (db.as_ref(), $labels.into_iter().zip(s.$field))),
+        )?
+    };
+    (
+        $enc:expr, $dbs:expr, $names:expr, gauge, $name:expr, $help:expr, $field:ident,
+        $key:literal, $labels:expr
+    ) => {
+        gauge_grid(
+            $enc,
+            $name,
+            $help,
+            $key,
+            $names
+                .iter()
+                .zip($dbs)
+                .map(|(db, s)| (db.as_ref(), $labels.into_iter().zip(s.$field))),
+        )?
     };
 }
 
@@ -115,11 +175,14 @@ snapshot! {
         raw_stash_records_by_kind_op: [[u64; 7]; 2],
         /// Commit-resolve raw decode records `[toast, ordinary]` x op
         raw_decode_records_by_kind_op: [[u64; 7]; 2],
+        /// Per-database series, config order. Every family [`DbSeries`]
+        /// declares renders one `database=` labelled sample from each entry
+        by_database: Vec<DbSeries>,
         /// `initial_load` backfills recorded in the ledger but not yet
-        /// complete (in flight, or awaiting re-run on next boot), rendered
-        /// bare and split `[copy, base_backup, object_store]` under one family
+        /// complete (in flight, or awaiting re-run on next boot), summed
+        /// across databases. `ctl status` reads it; the scrape renders the
+        /// per-database split instead
         config_backfills_pending: u64,
-        config_backfills_pending_by_mode: [u64; 3],
         /// Refusal a crossing parked on, rendered as `crossing_wedged`. The
         /// pump keeps publishing rather than exiting into a restart that
         /// re-crosses and re-fails, so this is how the daemon says it is
@@ -300,14 +363,6 @@ snapshot! {
         "Tuples skipped because the source relation has no mapping in --ch-config.",
     counter emitter_deletes_discarded: u64 =
         "DELETE rows dropped because is_deleted = false leaves no marker column.",
-    gauge config_pending_decl_rels: u64 =
-        "Forward-declared per-table opt-ins awaiting their CREATE TABLE.",
-    /// Cumulative `replicate=true` materialisations / `replicate=false`
-    /// exclusions applied via the config overlay.
-    counter config_replicate_opt_in_total: u64 =
-        "Total config_table.replicate=true materialisations applied.",
-    counter config_replicate_opt_out_total: u64 =
-        "Total config_table.replicate=false / removals applied.",
     gauge pump_queue_depth: u64 = "Records buffered between the WAL pump and the queueing worker.",
     counter queue_records_out_total: u64 =
         "Records the queueing/reorder worker has dequeued and dispatched. rate() is the worker's throughput; with pump_queue_depth it tells deep-and-draining from deep-and-stalled.",
@@ -342,35 +397,6 @@ snapshot! {
     counter oracle_conversion_errors_total: u64 =
         "Requests the extension failed on one PG Datum it could not convert.",
     counter oracle_errors_total: u64 = "Oracle request, transport, or response-validation failures.",
-    gauge bridge_up: u64 =
-        "1 while the pgext bridge worker answered the last request over its socket.",
-    /// Per-op, rendered `op=` labelled; order matches
-    /// [`OP_LABELS`].
-    counter bridge_requests_by_op: [u64; OP_COUNT] ["op" = OP_LABELS] =
-        "Requests sent to the pgext bridge worker.",
-    counter bridge_errors_by_op: [u64; OP_COUNT] ["op" = OP_LABELS] =
-        "Bridge requests that failed, transport or worker-side.",
-    counter bridge_request_seconds_by_op: [f64; OP_COUNT] ["op" = OP_LABELS] =
-        "Wall time spent in bridge round trips.",
-    /// Queued behind another caller on the single bridge socket
-    counter bridge_lock_wait_seconds_by_op: [f64; OP_COUNT] ["op" = OP_LABELS] =
-        "Wall time bridge callers spent queued for the socket. Against bridge_service_seconds this says whether the worker or the funnel in front of it is the limiter.",
-    /// Wire time with the socket held
-    counter bridge_service_seconds_by_op: [f64; OP_COUNT] ["op" = OP_LABELS] =
-        "Wall time on the wire with the bridge socket held: worker conversion plus transfer.",
-    counter bridge_request_bytes_by_op: [u64; OP_COUNT] ["op" = OP_LABELS] =
-        "Request frame bytes written to the bridge socket.",
-    counter bridge_response_bytes_by_op: [u64; OP_COUNT] ["op" = OP_LABELS] =
-        "Response frame bytes read back off the bridge socket.",
-    counter bridge_reconnects_total: u64 =
-        "Bridge sockets redialled after a worker exit or transport error.",
-    counter bridge_scan_rows_total: u64 = "Catalog rows the bridge's overlay scans returned.",
-    counter bridge_scan_subtrans_mismatch_total: u64 =
-        "Overlay tuples whose writer did not resolve to the requested top xid; trusted as ours only on rel-scoped catalogs.",
-    counter bridge_scan_replay_moved_total: u64 =
-        "Bridge scans that found shadow replay off the position their read pinned; committed reads answer these off SQL instead.",
-    counter bridge_native_bytes_total: u64 =
-        "Native block bytes the bridge returned for ENCODE_NATIVE requests.",
     counter uptime_seconds: u64 = "Seconds since the daemon began its status loop.",
     gauge bootstrap_attempt: u32 =
         "Which attempt the running initial load is; above 1 means an incomplete one was discarded and re-extracted.",
@@ -439,6 +465,90 @@ snapshot! {
         "Catalog-boundary holds woken with an error (worker death, walreceiver loss, timeout).",
     counter catalog_boundary_hold_seconds_total: f64 =
         "Cumulative seconds the pump parked in released catalog-boundary holds.",
+}
+
+/// Declares [`DbSeries`] and the families a scrape renders off it, one
+/// `database=` labelled sample per followed database. Same field syntax as
+/// [`snapshot!`]; a `["key" = LABELS]` array carries its own label beside the
+/// database's
+macro_rules! db_snapshot {
+    (
+        custom { $($(#[doc = $custom_doc:literal])* $custom:ident: $custom_ty:ty,)* }
+        $(
+            $(#[doc = $doc:literal])*
+            $kind:ident $field:ident: $ty:ty $([$key:literal = $labels:expr])? = $help:literal,
+        )*
+    ) => {
+        /// One source database's share of the work: its bridge sockets,
+        /// descriptor log, catalog capture and config overlay. Values are
+        /// that database's own, never a cluster total
+        #[derive(Debug, Default, Clone)]
+        pub struct DbSeries {
+            /// `database=` label value, from `[source] databases`
+            pub database: String,
+            $($(#[doc = $custom_doc])* pub $custom: $custom_ty,)*
+            $(
+                #[doc = $help]
+                $(#[doc = $doc])*
+                pub $field: $ty,
+            )*
+        }
+
+        fn encode_db_fields(dbs: &[DbSeries], enc: &mut DescriptorEncoder<'_>) -> fmt::Result {
+            let names: Vec<Cow<'_, str>> =
+                dbs.iter().map(|db| escape_label(&db.database)).collect();
+            $(encode_db_metric!(
+                enc,
+                dbs,
+                names,
+                $kind,
+                concat!("walshadow_", stringify!($field)),
+                $help,
+                $field
+                $(, $key, $labels)?
+            );)*
+            Ok(())
+        }
+    };
+}
+
+db_snapshot! {
+    custom {
+        /// This database's `initial_load` backfills recorded in the ledger
+        /// but not yet complete. Only `ctl status` reads it; the scrape
+        /// renders the `mode=` split beside it
+        config_backfills_pending: u64,
+    }
+
+    gauge bridge_up: u64 =
+        "1 while the pgext bridge worker answered the last request over its socket.",
+    /// Per-op, rendered `op=` labelled; order matches
+    /// [`OP_LABELS`].
+    counter bridge_requests_by_op: [u64; OP_COUNT] ["op" = OP_LABELS] =
+        "Requests sent to the pgext bridge worker.",
+    counter bridge_errors_by_op: [u64; OP_COUNT] ["op" = OP_LABELS] =
+        "Bridge requests that failed, transport or worker-side.",
+    counter bridge_request_seconds_by_op: [f64; OP_COUNT] ["op" = OP_LABELS] =
+        "Wall time spent in bridge round trips.",
+    /// Queued behind another caller on the single bridge socket
+    counter bridge_lock_wait_seconds_by_op: [f64; OP_COUNT] ["op" = OP_LABELS] =
+        "Wall time bridge callers spent queued for the socket. Against bridge_service_seconds this says whether the worker or the funnel in front of it is the limiter.",
+    /// Wire time with the socket held
+    counter bridge_service_seconds_by_op: [f64; OP_COUNT] ["op" = OP_LABELS] =
+        "Wall time on the wire with the bridge socket held: worker conversion plus transfer.",
+    counter bridge_request_bytes_by_op: [u64; OP_COUNT] ["op" = OP_LABELS] =
+        "Request frame bytes written to the bridge socket.",
+    counter bridge_response_bytes_by_op: [u64; OP_COUNT] ["op" = OP_LABELS] =
+        "Response frame bytes read back off the bridge socket.",
+    counter bridge_reconnects_total: u64 =
+        "Bridge sockets redialled after a worker exit or transport error.",
+    counter bridge_scan_rows_total: u64 = "Catalog rows the bridge's overlay scans returned.",
+    counter bridge_scan_subtrans_mismatch_total: u64 =
+        "Overlay tuples whose writer did not resolve to the requested top xid; trusted as ours only on rel-scoped catalogs.",
+    counter bridge_scan_replay_moved_total: u64 =
+        "Bridge scans that found shadow replay off the position their read pinned; committed reads answer these off SQL instead.",
+    counter bridge_native_bytes_total: u64 =
+        "Native block bytes the bridge returned for ENCODE_NATIVE requests.",
     counter desc_capture_sql_total: u64 = "Catalog boundaries captured via shadow SQL fan-out.",
     counter desc_capture_log_replay_total: u64 =
         "Catalog boundaries replayed from stored descriptor-log batches.",
@@ -483,6 +593,16 @@ snapshot! {
     counter desc_lookups_not_covered_total: u64 = "Descriptor lookups answered NotCovered.",
     counter desc_lookups_foreign_db_total: u64 =
         "Descriptor lookups on a foreign database's filenode.",
+    gauge config_pending_decl_rels: u64 =
+        "Forward-declared per-table opt-ins awaiting their CREATE TABLE.",
+    /// Cumulative `replicate=true` materialisations / `replicate=false`
+    /// exclusions applied via the config overlay.
+    counter config_replicate_opt_in_total: u64 =
+        "Total config_table.replicate=true materialisations applied.",
+    counter config_replicate_opt_out_total: u64 =
+        "Total config_table.replicate=false / removals applied.",
+    gauge config_backfills_pending_by_mode: [u64; 3] ["mode" = BACKFILL_MODES] =
+        "initial_load backfills recorded in the ledger but not yet complete.",
 }
 
 #[derive(Debug, Clone, Default)]
@@ -589,6 +709,9 @@ const PLAN_FAILURE_REASONS: [&str; 11] = [
     "drain",
 ];
 
+/// `mode=` label order of [`DbSeries::config_backfills_pending_by_mode`]
+const BACKFILL_MODES: [&str; 3] = ["copy", "base_backup", "object_store"];
+
 /// Family declaration off a snapshot field name: a `_by_<label>` tail names
 /// the label rather than the family, and OpenMetrics appends `_total` to
 /// counter samples itself, so a counter family declares the name without it
@@ -678,6 +801,69 @@ fn counter_kind_op(
     Ok(())
 }
 
+/// `database=`/`key=` grid, one row of `(label, value)` pairs per database
+fn counter_grid<'a, V, I>(
+    enc: &mut DescriptorEncoder<'_>,
+    name: &str,
+    help: &str,
+    key: &str,
+    rows: impl IntoIterator<Item = (&'a str, I)>,
+) -> fmt::Result
+where
+    V: EncodeCounterValue,
+    I: IntoIterator<Item = (&'a str, V)>,
+{
+    let mut family = declare(enc, name, help, MetricType::Counter)?;
+    for (database, series) in rows {
+        for (label, value) in series {
+            family
+                .encode_family(&[("database", database), (key, label)])?
+                .encode_counter::<NoLabelSet, _, u64>(&value, None)?;
+        }
+    }
+    Ok(())
+}
+
+fn gauge_grid<'a, V, I>(
+    enc: &mut DescriptorEncoder<'_>,
+    name: &str,
+    help: &str,
+    key: &str,
+    rows: impl IntoIterator<Item = (&'a str, I)>,
+) -> fmt::Result
+where
+    V: EncodeGaugeValue,
+    I: IntoIterator<Item = (&'a str, V)>,
+{
+    let mut family = declare(enc, name, help, MetricType::Gauge)?;
+    for (database, series) in rows {
+        for (label, value) in series {
+            family
+                .encode_family(&[("database", database), (key, label)])?
+                .encode_gauge(&value)?;
+        }
+    }
+    Ok(())
+}
+
+/// The encoder writes label values through, and a database name is whatever
+/// `CREATE DATABASE` took, so escape what OpenMetrics reserves inside quotes
+fn escape_label(value: &str) -> Cow<'_, str> {
+    if !value.contains(['\\', '"', '\n']) {
+        return Cow::Borrowed(value);
+    }
+    let mut out = String::with_capacity(value.len() + 8);
+    for c in value.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            _ => out.push(c),
+        }
+    }
+    Cow::Owned(out)
+}
+
 /// LSN gauges carry their raw `u64`
 impl<K> EncodeGaugeValue for Pos<K> {
     fn encode(&self, encoder: &mut GaugeValueEncoder) -> fmt::Result {
@@ -746,23 +932,7 @@ fn encode_snapshot(snap: &MetricsSnapshot, enc: &mut DescriptorEncoder<'_>) -> f
     .encode_family(&[("system_id", snap.source_system_id)])?
     .encode_gauge(&1u64)?;
 
-    // Umbrella count bare + per-mode labelled series in one family
-    let mut backfills = declare(
-        enc,
-        "walshadow_config_backfills_pending",
-        "initial_load backfills recorded but not yet complete.",
-        MetricType::Gauge,
-    )?;
-    backfills.encode_gauge(&snap.config_backfills_pending)?;
-    for (mode, value) in ["copy", "base_backup", "object_store"]
-        .into_iter()
-        .zip(snap.config_backfills_pending_by_mode)
-    {
-        backfills
-            .encode_family(&[("mode", mode)])?
-            .encode_gauge(&value)?;
-    }
-    Ok(())
+    encode_db_fields(&snap.by_database, enc)
 }
 
 /// Snapshot families, stage timings, then the OpenMetrics `# EOF` marker
@@ -982,8 +1152,12 @@ mod tests {
             raw_decode_rows_by_op: [1, 2, 3, 4, 5, 6, 7],
             raw_pending_rows: 13,
             raw_pending_bytes: 14,
-            descriptor_ambiguous_total: 21,
-            desc_lookups_ambiguous_total: 22,
+            by_database: vec![DbSeries {
+                database: "app".into(),
+                descriptor_ambiguous_total: 21,
+                desc_lookups_ambiguous_total: 22,
+                ..DbSeries::default()
+            }],
             ..MetricsSnapshot::default()
         };
         snap.raw_stash_records_by_kind_op[0][0] = 31; // dirty insert
@@ -1011,9 +1185,73 @@ mod tests {
         assert!(body.contains("walshadow_raw_pending_rows 13"));
         assert!(body.contains("walshadow_raw_pending_bytes 14"));
         // Published intervals and lookups landing in one stay distinct
-        // families, each bare
-        assert!(body.contains("walshadow_descriptor_ambiguous_total 21"));
-        assert!(body.contains("walshadow_desc_lookups_ambiguous_total 22"));
+        // families
+        assert!(body.contains("walshadow_descriptor_ambiguous_total{database=\"app\"} 21"));
+        assert!(body.contains("walshadow_desc_lookups_ambiguous_total{database=\"app\"} 22"));
+    }
+
+    #[test]
+    fn render_keeps_each_database_on_its_own_series() {
+        let body = render(MetricsSnapshot {
+            by_database: vec![
+                DbSeries {
+                    database: "app".into(),
+                    bridge_up: 1,
+                    bridge_requests_by_op: [3, 0, 0, 0, 0],
+                    desc_log_entries: 9,
+                    config_backfills_pending_by_mode: [2, 0, 0],
+                    ..DbSeries::default()
+                },
+                DbSeries {
+                    database: "billing".into(),
+                    bridge_up: 0,
+                    bridge_requests_by_op: [5, 0, 0, 0, 0],
+                    desc_log_entries: 11,
+                    config_backfills_pending_by_mode: [0, 0, 7],
+                    ..DbSeries::default()
+                },
+            ],
+            ..MetricsSnapshot::default()
+        });
+        for want in [
+            "walshadow_bridge_up{database=\"app\"} 1",
+            "walshadow_bridge_up{database=\"billing\"} 0",
+            &format!(
+                "walshadow_bridge_requests_total{{database=\"app\",op=\"{}\"}} 3",
+                OP_LABELS[0]
+            ),
+            &format!(
+                "walshadow_bridge_requests_total{{database=\"billing\",op=\"{}\"}} 5",
+                OP_LABELS[0]
+            ),
+            "walshadow_desc_log_entries{database=\"app\"} 9",
+            "walshadow_desc_log_entries{database=\"billing\"} 11",
+            "walshadow_config_backfills_pending{database=\"app\",mode=\"copy\"} 2",
+            "walshadow_config_backfills_pending{database=\"billing\",mode=\"object_store\"} 7",
+        ] {
+            assert!(body.contains(want), "missing {want}\n{body}");
+        }
+        // Cluster WAL and process-wide work is counted once, unlabelled
+        assert!(body.contains("walshadow_xacts_committed_total 0"), "{body}");
+        assert!(body.contains("walshadow_pump_queue_depth 0"), "{body}");
+    }
+
+    /// A database name is a PG identifier, so a quote in it must not end the
+    /// label and truncate the scrape
+    #[test]
+    fn render_escapes_a_database_label() {
+        let body = render(MetricsSnapshot {
+            by_database: vec![DbSeries {
+                database: "we\"ird\\name".into(),
+                desc_log_entries: 4,
+                ..DbSeries::default()
+            }],
+            ..MetricsSnapshot::default()
+        });
+        assert!(
+            body.contains(r#"walshadow_desc_log_entries{database="we\"ird\\name"} 4"#),
+            "{body}"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1124,6 +1362,16 @@ mod tests {
             shadow_apply_lag_seconds: f64::INFINITY,
             uptime_seconds: 7,
             source_system_id: u64::MAX,
+            by_database: vec![
+                DbSeries {
+                    database: "app".into(),
+                    ..DbSeries::default()
+                },
+                DbSeries {
+                    database: "billing".into(),
+                    ..DbSeries::default()
+                },
+            ],
             ..MetricsSnapshot::default()
         };
         snap.records_by_rm_route

@@ -32,6 +32,7 @@ writes. A documented limitation does not imply code rejects it
 
 | Plan | Reason to take it up |
 |---|---|
+| [Multi-database loads and metrics](multi_database.md) | Extend heap-page bootstrap and backup loads beyond primary database, attribute metrics |
 | [Fuzzing](fuzzing.md) | Find parser and schema-transition interactions beyond fixed regressions |
 | [Performance](performance.md) | Locate bottlenecks before changing concurrency or allocation |
 | [Runtime configuration](runtime_config.md) | Add source-side commands and explain effective settings |

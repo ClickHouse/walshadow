@@ -525,9 +525,9 @@ const REPLAY_BATCH_ROWS: usize = 65536;
 
 const REPLAY_FETCH_BYTES: usize = 64 << 20;
 
-/// `(toast_relid, value_id, as-of bound)`. The bound is part of the key:
+/// `(db_oid, toast_relid, value_id, as-of bound)`. The bound is part of the key:
 /// a resumed load tags relations with their own `_lsn`
-type ValueKey = (u32, u32, u64);
+type ValueKey = (u32, u32, u32, u64);
 
 /// Routed referrers awaiting their values, with the leaf bytes resolving
 /// them peaks at
@@ -698,7 +698,12 @@ async fn resolve_batch(batch: &mut ReplayBatch, resolver: &ToastResolver) -> Res
     } in &mut batch.rows
     {
         for site in pointers.iter() {
-            let key = (site.p.va_toastrelid, site.p.va_valueid, tuple.source_lsn);
+            let key = (
+                tuple.rfn.db_node,
+                site.p.va_toastrelid,
+                site.p.va_valueid,
+                tuple.source_lsn,
+            );
             let fetched = values.take(key);
             let type_oid = rel.attributes.get(site.idx).map_or(0, |a| a.type_oid);
             let target = &route.mapping.columns[site.col].target_name;
@@ -737,32 +742,37 @@ async fn fetch_batch_values(
     resolver: &ToastResolver,
 ) -> Result<FetchedValues, String> {
     let mut uses: HashMap<ValueKey, u32> = HashMap::new();
-    let mut wanted: HashMap<(u32, u64), Vec<(u32, usize)>> = HashMap::new();
+    let mut wanted: HashMap<(u32, u32, u64), Vec<(u32, usize)>> = HashMap::new();
     for row in &batch.rows {
         let bound = row.tuple.source_lsn;
         for site in &row.pointers {
-            let key = (site.p.va_toastrelid, site.p.va_valueid, bound);
+            let key = (
+                row.tuple.rfn.db_node,
+                site.p.va_toastrelid,
+                site.p.va_valueid,
+                bound,
+            );
             let seen = uses.entry(key).or_default();
             *seen += 1;
             if *seen == 1 {
                 wanted
-                    .entry((key.0, bound))
+                    .entry((key.0, key.1, bound))
                     .or_default()
-                    .push((key.1, pointer_extsize(&site.p)));
+                    .push((key.2, pointer_extsize(&site.p)));
             }
         }
     }
     let mut values = HashMap::with_capacity(uses.len());
-    for ((toast_relid, bound), batch) in wanted {
+    for ((db_oid, toast_relid, bound), batch) in wanted {
         let Some(got) = resolver
-            .fetch_values(toast_relid, &batch, bound)
+            .fetch_values(db_oid, toast_relid, &batch, bound)
             .await
             .map_err(|e| format!("bootstrap: toast store fetch: {e}"))?
         else {
             return Ok(FetchedValues { values: None, uses });
         };
         for ((value_id, _), value) in batch.iter().zip(got) {
-            values.insert((toast_relid, *value_id, bound), value);
+            values.insert((db_oid, toast_relid, *value_id, bound), value);
         }
     }
     Ok(FetchedValues {
@@ -853,6 +863,7 @@ async fn resolve_or_fill_toast(
         let type_oid = rel.attributes.get(site.idx).map_or(0, |a| a.type_oid);
         let fetched = resolver
             .fetch_value(
+                tuple.rfn.db_node,
                 site.p.va_toastrelid,
                 site.p.va_valueid,
                 tuple.source_lsn,
@@ -1985,6 +1996,50 @@ mod tests {
         assert_eq!(result.next_seq, 1);
         assert!(path.exists(), "retain spool until pass publishes");
         tail.finish(result.next_seq).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn deferred_replay_isolates_database_value_ids() {
+        use crate::toast::ChunkStore;
+
+        let mut stores = Vec::new();
+        let mut batch = ReplayBatch {
+            rows: Vec::new(),
+            need: 0,
+            resident: 0,
+        };
+        for (db_oid, body) in [(1, b"first"), (2, b"other")] {
+            let store = Arc::new(MemChunkStore::new());
+            let chunk = toast_chunk_tuple(16500, 1, 0, body);
+            store
+                .put(&[row_from_columns(chunk, 16500).unwrap()])
+                .await
+                .unwrap();
+            stores.push((db_oid, store as Arc<dyn ChunkStore>));
+            let mut tuple = bytea_toast_tuple(16400, 16500, 1);
+            tuple.rfn.db_node = db_oid;
+            let route = RouteSnapshot::freeze(
+                Arc::new(bytea_mapping_for(16400)),
+                Arc::default(),
+                RowPolicy::default(),
+            );
+            let pointers = mapped_pointers(&tuple, &route.mapping);
+            batch.rows.push(ReplayRow {
+                tuple,
+                rel: bytea_rel(16400),
+                route,
+                pointers,
+            });
+        }
+        let resolver = ToastResolver::with_store(stores[0].1.clone(), Arc::default())
+            .with_database_stores(stores);
+        resolve_batch(&mut batch, &resolver).await.unwrap();
+        for (row, expected) in batch.rows.iter().zip([b"first", b"other"]) {
+            assert_eq!(
+                row.tuple.columns[0],
+                Some(ColumnValue::Bytea(expected.to_vec()))
+            );
+        }
     }
 
     /// One round trip per mirror resolves a whole batch, distinct values

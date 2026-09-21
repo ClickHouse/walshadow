@@ -37,7 +37,7 @@ fn open(tmp: &std::path::Path) -> Fixture {
     let mut pg = pgext::stage(tmp, ports::PG_SHADOW_PORT, IO_TIMEOUT);
     let faults = Faults::new(tmp);
     pg.start(&faults.env());
-    pg.wait_log(0, "walshadow bridge listening");
+    pg.wait_log(0, "walshadow bridge for");
     let mut healthy = hello_on(&pg.bridge_path());
     let reference = hello(&mut healthy);
     Fixture {
@@ -255,7 +255,7 @@ fn shutdown_reaches_the_write_wait() {
     let mut pg = pgext::stage(tmp.path(), ports::PG_SHADOW_PORT, Duration::from_secs(20));
     let faults = Faults::new(tmp.path());
     pg.start(&faults.env());
-    pg.wait_log(0, "walshadow bridge listening");
+    pg.wait_log(0, "walshadow bridge for");
 
     faults.arm(&[Rule::fail_forever(Op::Send, 1, libc::EAGAIN)]);
     let mut sock = pgext::connect(&pg.bridge_path());

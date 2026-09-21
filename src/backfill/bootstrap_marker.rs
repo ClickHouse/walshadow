@@ -1,7 +1,7 @@
-use std::collections::HashSet;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use ahash::HashSet;
 use anyhow::{Context, Result};
 use tokio::io::AsyncWriteExt;
 

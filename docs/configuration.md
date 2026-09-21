@@ -58,12 +58,18 @@ Example above names its scope. Omit `[stream]` to replicate every user table,
 including tables created later. `init` writes `[source]`, `[ch]`, and chosen
 `[table.*]` blocks, leaving that broad default in place
 
+`[table.<schema>.<relname>]` names a table in source database selected by
+`dbname` in `[source]`. Use `[database.<dbname>.table.<schema>.<relname>]` to
+name a table in another database of the same cluster, which one process
+replicates alongside. See [several databases](multi-database.md)
+
 Pass file with `--ch-config`. Loader also merges sibling directory formed by
 replacing `.toml` with `.d`, for example `ch-config.d/*.toml`
 
 Invalid values and incompatible mapping fields fail validation instead of
-falling back silently. Loader ignores unknown keys, so check spelling here when
-a setting has no effect
+falling back silently. Unknown keys in `[table.*]`, `[namespace.*]`, and
+`[database.*]` are errors; other sections ignore them, so check spelling there
+when a setting has no effect
 
 ## Precedence
 

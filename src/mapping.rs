@@ -16,7 +16,7 @@ pub struct TableMapping {
     pub columns: Vec<ColumnMapping>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TableTarget {
     pub database: String,
     pub table: String,
@@ -36,6 +36,44 @@ impl TableTarget {
             quote_ident(&self.database),
             quote_ident(&self.table)
         )
+    }
+}
+
+/// ClickHouse tables claimed by one source database. `replicate_all` names a
+/// destination after its source table, so two databases holding one table name
+/// would otherwise merge their rows into one destination
+#[derive(Debug, Default)]
+pub struct TargetOwners {
+    owned: RwLock<HashMap<TableTarget, (u32, RelName)>>,
+}
+
+impl TargetOwners {
+    /// Claim `target` for one database's relation, idempotent for the owner
+    /// `Err` names the database oid and relation already writing there
+    pub async fn claim(
+        &self,
+        target: &TableTarget,
+        db_oid: u32,
+        rel: &RelName,
+    ) -> Result<(), (u32, RelName)> {
+        let mut owned = self.owned.write().await;
+        let claimant = (db_oid, rel.clone());
+        match owned.get(target) {
+            Some(owner) if *owner == claimant => Ok(()),
+            Some(owner) => Err(owner.clone()),
+            None => {
+                owned.insert(target.clone(), claimant);
+                Ok(())
+            }
+        }
+    }
+
+    /// Release what one relation claimed, so a re-created table claims again
+    pub async fn release(&self, db_oid: u32, rel: &RelName) {
+        self.owned
+            .write()
+            .await
+            .retain(|_, (oid, owner)| (*oid, &*owner) != (db_oid, rel));
     }
 }
 
@@ -404,6 +442,40 @@ fn quote_ident(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One destination belongs to one source relation of one database
+    #[tokio::test]
+    async fn target_owners_refuse_a_second_claimant() {
+        let owners = TargetOwners::default();
+        let target = TableTarget::new("cdc", "orders");
+        let app = RelName::new("public", "orders");
+        let billing = RelName::new("billing", "orders");
+        owners.claim(&target, 16384, &app).await.expect("first");
+        owners
+            .claim(&target, 16384, &app)
+            .await
+            .expect("same claimant re-claims");
+        assert_eq!(
+            owners.claim(&target, 5, &app).await,
+            Err((16384, app.clone())),
+            "another database writing the same table"
+        );
+        assert_eq!(
+            owners.claim(&target, 16384, &billing).await,
+            Err((16384, app.clone())),
+            "another schema of one database writing the same table"
+        );
+        // A different destination is free, and a dropped one frees its own
+        owners
+            .claim(&TableTarget::new("cdc", "orders_v2"), 5, &app)
+            .await
+            .expect("distinct target");
+        owners.release(16384, &app).await;
+        owners
+            .claim(&target, 5, &billing)
+            .await
+            .expect("released target is claimable");
+    }
 
     /// Parse a `[system_columns]` body the way `ConfigDocument` does
     fn system_columns(body: &str) -> Result<SystemColumns, String> {

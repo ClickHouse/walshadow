@@ -9,6 +9,11 @@
 //! the source sidecar) while CDC streams another, mixing two databases into one
 //! ClickHouse table with no diagnostic.
 //!
+//! Both entries use `table.<database>.<schema>.<relname>` keys, so one
+//! process replicates both databases into destinations of their own. Existing
+//! rows load from the backup for `[source] dbname` only, so `postgres`'s
+//! pre-boot row stays out while its post-boot CDC row lands
+//!
 //! Here the table lives in source database `duptest`, named only by the TOML.
 //! `--dbname postgres` disagrees and `--shadow-dbname postgres` is passed as
 //! well (deprecated and ignored). Bootstrap rows and post-boot CDC must both
@@ -80,8 +85,12 @@ fn write_config(path: &Path, ch_port: u16) -> Result<()> {
          database = \"default\"\n\
          compression = \"lz4\"\n\
          \n\
-         [table.\"public\".\"dup\"]\n\
-         replicate = true\n"
+         [database.duptest.table.\"public\".\"dup\"]\n\
+         replicate = true\n\
+         \n\
+         [database.postgres.table.\"public\".\"dup\"]\n\
+         replicate = true\n\
+         target_table = \"dup_from_postgres\"\n"
     );
     fs::write(path, body).context("write ch-config")
 }
@@ -223,25 +232,50 @@ async fn shadow_catalog_follows_applied_source_dbname() {
             .with_context(|| format!("post-boot insert into {db}"))?;
         }
         psql_db(&source, "postgres", "SELECT pg_switch_wal();").context("seal post-boot WAL")?;
+        // Each database commits on its own, so wait for both destinations
         let deadline = Instant::now() + Duration::from_secs(90);
         loop {
-            let got = ch
+            let mine = ch
                 .query("SELECT b FROM default.dup FINAL WHERE a = 2")
                 .unwrap_or_default();
             anyhow::ensure!(
-                got != "cdc-postgres",
+                mine != "cdc-postgres",
                 "CDC replicated the wrong database: --dbname/--shadow-dbname \
                  named postgres, [source] dbname named duptest"
             );
-            if got == "cdc-duptest" {
-                return Ok(());
+            let other = match ch
+                .query("EXISTS TABLE default.dup_from_postgres")
+                .as_deref()
+            {
+                Ok("1") => ch
+                    .query("SELECT b FROM default.dup_from_postgres FINAL WHERE a = 2")
+                    .unwrap_or_default(),
+                _ => String::new(),
+            };
+            if mine == "cdc-duptest" && other == "cdc-postgres" {
+                break;
             }
             anyhow::ensure!(
                 Instant::now() < deadline,
-                "post-boot CDC row never landed (saw {got:?})"
+                "post-boot CDC rows never landed (dup {mine:?}, \
+                 dup_from_postgres {other:?})"
             );
             std::thread::sleep(Duration::from_millis(200));
         }
+        anyhow::ensure!(
+            ch.query("SELECT count() FROM default.dup_from_postgres FINAL WHERE a = 1")
+                .unwrap_or_default()
+                == "0",
+            "a backup load covers `[source] dbname` only, so the second \
+             database's pre-boot row must not appear"
+        );
+        anyhow::ensure!(
+            ch.query("SELECT count() FROM default.dup FINAL")
+                .unwrap_or_default()
+                == "2",
+            "duptest's destination holds its own two rows and no others"
+        );
+        Ok(())
     })();
 
     if bootstrap_shadow_data_dir.join("postmaster.pid").exists() {

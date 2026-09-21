@@ -206,7 +206,12 @@ async fn bytes_through_oracle(bridge: Arc<Bridge>, items: &[(u32, &[u8])]) -> Ve
         })
         .collect();
     let block = oracle
-        .encode_batch(&columns, 1, clickhouse_c::Allocator::stdlib())
+        .encode_batch(
+            Oracle::ANY_DATABASE,
+            &columns,
+            1,
+            clickhouse_c::Allocator::stdlib(),
+        )
         .await
         .expect("oracle answers");
     (0..items.len())
@@ -369,7 +374,12 @@ async fn bridge_native_strings_match_typoutput() {
         }];
         assert!(
             oracle
-                .encode_batch(&columns, 1, clickhouse_c::Allocator::stdlib())
+                .encode_batch(
+                    Oracle::ANY_DATABASE,
+                    &columns,
+                    1,
+                    clickhouse_c::Allocator::stdlib()
+                )
                 .await
                 .is_err(),
             "oid {oid} must fail the request",
@@ -1104,6 +1114,7 @@ fn spawn_moving_worker(listener: tokio::net::UnixListener) {
                     body.extend_from_slice(&PROJECTION_VERSION.to_be_bytes());
                     body.extend_from_slice(&170_000u32.to_be_bytes());
                     body.push(1);
+                    body.extend_from_slice(&16_384u32.to_be_bytes());
                 } else {
                     // No rows, and the two positions disagree
                     body.extend_from_slice(&0x1000u64.to_be_bytes());
@@ -1153,6 +1164,7 @@ fn spawn_toast_worker(
                         body.extend_from_slice(&PROJECTION_VERSION.to_be_bytes());
                         body.extend_from_slice(&170_000u32.to_be_bytes());
                         body.push(1);
+                        body.extend_from_slice(&16_384u32.to_be_bytes());
                     }
                     Some(&0x04) => {
                         body.extend_from_slice(&lsn.load(Ordering::Relaxed).to_be_bytes())
@@ -1323,7 +1335,12 @@ async fn bridge_native_hstore_expander_requires_extension_membership() {
                 .unwrap();
         }
         let result = oracle
-            .encode_batch(&columns, 2, clickhouse_c::Allocator::stdlib())
+            .encode_batch(
+                Oracle::ANY_DATABASE,
+                &columns,
+                2,
+                clickhouse_c::Allocator::stdlib(),
+            )
             .await;
         if attached {
             let block = result.unwrap();
@@ -1565,6 +1582,7 @@ async fn bridge_worker_pool_serves_concurrent_requests() {
                 }];
                 Oracle::new(bridge)
                     .encode_batch(
+                        Oracle::ANY_DATABASE,
                         &columns,
                         cells.cells().len(),
                         clickhouse_c::Allocator::stdlib(),

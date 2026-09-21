@@ -95,6 +95,9 @@ pub enum XactPayloadError {
     /// publish a boundary built from another database's OIDs
     #[error("commit dbinfo db {db_id} contradicts target db {target} catalog dirt")]
     ForeignScope { db_id: u32, target: u32 },
+    /// Reject catalog writes to two databases, PostgreSQL allows only one per transaction
+    #[error("catalog writes in one transaction span databases {first} and {second}")]
+    MixedScope { first: u32, second: u32 },
 }
 
 impl XactPayloadError {

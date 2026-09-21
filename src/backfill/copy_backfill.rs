@@ -607,6 +607,9 @@ pub struct CopyBackfiller {
     oracle: Option<Arc<Oracle>>,
     /// Source PG major: picks the backup's pg_multixact offsets width
     source_major: u32,
+    /// A cluster backup walks the pages of the database `[source] dbname`
+    /// names, so only that database can load from one
+    backup_loads: bool,
     /// Fixed scratch paths require one cluster backup pass at a time
     backup_pass_lock: Mutex<()>,
     inner: Mutex<Inner>,
@@ -655,6 +658,7 @@ impl CopyBackfiller {
             budget,
             oracle,
             source_major,
+            backup_loads: true,
             backup_pass_lock: Mutex::new(()),
             inner: Mutex::new(Inner {
                 ledger,
@@ -823,6 +827,12 @@ impl CopyBackfiller {
                 }
             }
         }
+    }
+
+    /// A cluster backup covers one database, so every other one loads by COPY
+    pub fn with_backup_loads(mut self, allowed: bool) -> Self {
+        self.backup_loads = allowed;
+        self
     }
 
     /// Opt-out / row removal: drop the ledger entry so a later re-insert
@@ -1554,6 +1564,16 @@ impl Backfiller for CopyBackfiller {
 
     async fn note_opt_out(&self, rel: &RelName) {
         CopyBackfiller::note_opt_out(self, rel).await;
+    }
+
+    fn refuses(&self, mode: InitialLoadMode) -> Option<&'static str> {
+        let from_backup = matches!(
+            mode,
+            InitialLoadMode::BaseBackup | InitialLoadMode::ObjectStore
+        );
+        (from_backup && !self.backup_loads).then_some(
+            "a cluster backup covers only the database `[source] dbname` names, use \"copy\"",
+        )
     }
 }
 

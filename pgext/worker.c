@@ -36,6 +36,7 @@
 #include "utils/memutils.h"
 #include "utils/snapmgr.h"
 #include "utils/timestamp.h"
+#include "utils/varlena.h"
 #include "utils/wait_event.h"
 
 #include "walshadow.h"
@@ -44,12 +45,12 @@ PG_MODULE_MAGIC;
 
 #define WS_MAX_CONNS		8
 /*
- * Each worker serves one request at a time, so oracle throughput is one
- * backend's conversion rate. `walshadow.bridge_workers` registers copies;
- * worker 0 keeps the bare `socket_path` so a single-worker deployment and
- * every catalog read are untouched, worker i listens on `socket_path.i`.
+ * Each worker handles one request at a time and connects to one database
+ * Number sockets in `walshadow.databases` order, starting at zero
  */
 #define WS_MAX_WORKERS		8
+#define WS_MAX_DATABASES	8
+#define WS_MAX_SOCKETS		(WS_MAX_WORKERS * WS_MAX_DATABASES)
 #define WS_LISTEN_BACKLOG	16
 #define WS_IDLE_POLL_MS		1000
 #define WS_MAX_SCAN_OIDS	65536
@@ -85,7 +86,7 @@ typedef struct WsConn
 PGDLLEXPORT void ws_worker_main(Datum main_arg);
 
 static char *ws_socket_path = NULL;
-static char *ws_database = NULL;
+static char *ws_databases = NULL;
 static int	ws_bridge_workers = 1;
 static int	ws_io_timeout_ms = 30000;
 static int	ws_lock_timeout_ms = 1000;
@@ -451,6 +452,7 @@ ws_dispatch(StringInfo req, StringInfo resp)
 				pq_sendint32(resp, WS_PROJECTION_VERSION);
 				pq_sendint32(resp, PG_VERSION_NUM);
 				pq_sendbyte(resp, RecoveryInProgress() ? 1 : 0);
+				pq_sendint32(resp, (uint32) MyDatabaseId);
 				break;
 			case WS_OP_REPLAY_LSN:
 				pq_sendbyte(resp, WS_STATUS_OK);
@@ -740,12 +742,14 @@ ws_worker_main(Datum main_arg)
 	pgsocket	listen_fd;
 	char		buf[32];
 	char		path[MAXPGPATH];
+	/* Use registered database name across worker restarts */
+	const char *dbname = MyBgworkerEntry->bgw_extra;
 
 	pqsignal(SIGTERM, SignalHandlerForShutdownRequest);
 	pqsignal(SIGHUP, SignalHandlerForConfigReload);
 	BackgroundWorkerUnblockSignals();
 
-	BackgroundWorkerInitializeConnection(ws_database, NULL, 0);
+	BackgroundWorkerInitializeConnection(dbname, NULL, 0);
 
 	/*
 	 * The replaying transaction holds AccessExclusiveLock on its own
@@ -778,8 +782,8 @@ ws_worker_main(Datum main_arg)
 		snprintf(path, sizeof(path), "%s.%d", ws_socket_path, idx);
 	listen_fd = ws_listen(path);
 	ereport(LOG,
-			(errmsg("walshadow bridge listening on \"%s\" (proto %d)",
-					path, WS_PROTO_VERSION)));
+			(errmsg("walshadow bridge for \"%s\" listening on \"%s\" (proto %d)",
+					dbname, path, WS_PROTO_VERSION)));
 
 	ws_serve_loop(listen_fd);
 
@@ -797,6 +801,9 @@ void
 _PG_init(void)
 {
 	BackgroundWorker worker;
+	List	   *databases;
+	ListCell   *cell;
+	char	   *raw;
 	int			i;
 
 	/*
@@ -807,38 +814,36 @@ _PG_init(void)
 		return;
 
 	DefineCustomStringVariable("walshadow.socket_path",
-							   "Unix socket the walshadow bridge listens on.",
-							   "Empty disables the worker.",
+							   "Bridge Unix socket path",
+							   "Empty disables bridge workers",
 							   &ws_socket_path,
 							   "",
 							   PGC_POSTMASTER, 0,
 							   NULL, NULL, NULL);
-	DefineCustomStringVariable("walshadow.database",
-							   "Database the walshadow bridge connects to.",
+	DefineCustomStringVariable("walshadow.databases",
+							   "Bridge databases",
 							   NULL,
-							   &ws_database,
-							   "postgres",
-							   PGC_POSTMASTER, 0,
+							   &ws_databases,
+							   "\"postgres\"",
+							   PGC_POSTMASTER, GUC_LIST_INPUT,
 							   NULL, NULL, NULL);
 	DefineCustomIntVariable("walshadow.io_timeout_ms",
-							"Abandon a bridge connection stalled this long.",
+							"Bridge connection timeout",
 							NULL,
 							&ws_io_timeout_ms,
 							30000, 100, INT_MAX,
 							PGC_SIGHUP, GUC_UNIT_MS,
 							NULL, NULL, NULL);
 	DefineCustomIntVariable("walshadow.lock_timeout_ms",
-							"lock_timeout the bridge applies to its own reads.",
+							"Bridge catalog lock timeout",
 							NULL,
 							&ws_lock_timeout_ms,
 							1000, 0, INT_MAX,
 							PGC_POSTMASTER, GUC_UNIT_MS,
 							NULL, NULL, NULL);
 	DefineCustomIntVariable("walshadow.bridge_workers",
-							"Bridge workers to register.",
-							"Worker 0 listens on socket_path, worker i on "
-							"socket_path.i. Each serves one request at a "
-							"time, so this bounds concurrent decode.",
+							"Bridge workers per database",
+							NULL,
 							&ws_bridge_workers,
 							1, 1, WS_MAX_WORKERS,
 							PGC_POSTMASTER, 0,
@@ -849,18 +854,43 @@ _PG_init(void)
 	if (ws_socket_path[0] == '\0')
 		return;
 
-	for (i = 0; i < ws_bridge_workers; i++)
+	raw = pstrdup(ws_databases);
+	if (!SplitIdentifierString(raw, ',', &databases))
+		ereport(ERROR,
+				(errcode(ERRCODE_CONFIG_FILE_ERROR),
+				 errmsg("walshadow.databases is not a comma-separated list")));
+	if (databases == NIL)
+		ereport(ERROR,
+				(errcode(ERRCODE_CONFIG_FILE_ERROR),
+				 errmsg("walshadow.databases must name at least one database")));
+	if (list_length(databases) * ws_bridge_workers > WS_MAX_SOCKETS)
+		ereport(ERROR,
+				(errcode(ERRCODE_CONFIG_FILE_ERROR),
+				 errmsg("walshadow: %d databases x %d bridge workers exceeds %d sockets",
+						list_length(databases), ws_bridge_workers,
+						WS_MAX_SOCKETS)));
+
+	i = 0;
+	foreach(cell, databases)
 	{
-		memset(&worker, 0, sizeof(worker));
-		worker.bgw_flags = BGWORKER_SHMEM_ACCESS | BGWORKER_BACKEND_DATABASE_CONNECTION;
-		/* Catalog reads need a database connection, so not before consistency */
-		worker.bgw_start_time = BgWorkerStart_ConsistentState;
-		worker.bgw_restart_time = 5;
-		worker.bgw_main_arg = Int32GetDatum(i);
-		strlcpy(worker.bgw_library_name, "walshadow", BGW_MAXLEN);
-		strlcpy(worker.bgw_function_name, "ws_worker_main", BGW_MAXLEN);
-		snprintf(worker.bgw_name, BGW_MAXLEN, "walshadow bridge %d", i);
-		strlcpy(worker.bgw_type, "walshadow bridge", BGW_MAXLEN);
-		RegisterBackgroundWorker(&worker);
+		const char *dbname = (const char *) lfirst(cell);
+		int			w;
+
+		for (w = 0; w < ws_bridge_workers; w++, i++)
+		{
+			memset(&worker, 0, sizeof(worker));
+			worker.bgw_flags = BGWORKER_SHMEM_ACCESS | BGWORKER_BACKEND_DATABASE_CONNECTION;
+			/* Catalog reads need a database connection, so not before consistency */
+			worker.bgw_start_time = BgWorkerStart_ConsistentState;
+			worker.bgw_restart_time = 5;
+			worker.bgw_main_arg = Int32GetDatum(i);
+			strlcpy(worker.bgw_library_name, "walshadow", BGW_MAXLEN);
+			strlcpy(worker.bgw_function_name, "ws_worker_main", BGW_MAXLEN);
+			/* Preserve database name across worker restarts */
+			strlcpy(worker.bgw_extra, dbname, BGW_EXTRALEN);
+			snprintf(worker.bgw_name, BGW_MAXLEN, "walshadow bridge %d (%s)", i, dbname);
+			strlcpy(worker.bgw_type, "walshadow bridge", BGW_MAXLEN);
+			RegisterBackgroundWorker(&worker);
+		}
 	}
 }

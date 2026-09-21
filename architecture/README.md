@@ -53,9 +53,9 @@ and plan data can spill to disk
 | [TOAST and type conversion](values.md) | Historical large values and PostgreSQL conversion | [resolver](../src/toast/resolver.rs), [oracle](../src/ops/oracle.rs) |
 | [Shadow TOAST storage](shadow-toast.md) | PostgreSQL-backed large values and physical WAL routing | [reader](../src/toast/shadow_store.rs), [filter](../src/filter/engine.rs) |
 | [Bootstrap](bootstrap.md) | Backup visibility, concurrent WAL, and initial-load publication | [backup](../src/backfill/backfill_bootstrap.rs), [window](../src/backfill/bootstrap_window.rs) |
-| [Restart and cleanup](recovery.md) | Durable progress, retained history, and timeline crossing | [manifest](../src/source/manifest.rs), [status loop](../src/bin/stream.rs) |
+| [Restart and cleanup](recovery.md) | Durable progress, retained history, and timeline crossing | [manifest](../src/source/manifest.rs), [status loop](../src/bin/stream/session.rs) |
 
-Streaming wiring lives in [stream.rs](../src/bin/stream.rs), queue ownership
+Streaming wiring lives in [stream/](../src/bin/stream/), queue ownership
 in [queueing_record_sink.rs](../src/source/queueing_record_sink.rs), and pool
 assembly in [pipeline/mod.rs](../src/emit/pipeline/mod.rs)
 

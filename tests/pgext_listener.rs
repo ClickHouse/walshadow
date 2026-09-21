@@ -80,7 +80,7 @@ fn listener_refuses_paths_it_does_not_own() {
     assert!(stale_path.exists(), "std leaves the socket file behind");
     point_at(&pg, &stale_path);
     pg.start(&[]);
-    pg.wait_log(0, "walshadow bridge listening");
+    pg.wait_log(0, "walshadow bridge for");
     hello_on(&stale_path);
     // Datum reconstruction and unrestricted catalog scans are owner-only
     let mode = fs::metadata(&stale_path).unwrap().permissions().mode() & 0o777;

@@ -47,6 +47,7 @@ pub mod record;
 pub mod runtime_config;
 pub mod schema;
 pub mod source;
+pub mod source_db;
 pub mod table_rules;
 pub mod ticker;
 pub mod toast;

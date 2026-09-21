@@ -32,6 +32,10 @@ to read and validate stored chunks. Rust side decompresses value and checks raw
 size. Shadow is read-only from resolver perspective; decoded chunk writes never
 go back into PostgreSQL
 
+Reads select database-specific bridge using referring row’s database OID.
+Batched bootstrap lookups include database OID in value keys, so identical
+TOAST relation and value IDs across databases stay separate
+
 PostgreSQL can reclaim chunks through prune, vacuum, truncate, drop, or rewrite
 before slower ClickHouse work reads them. Current mode reports such values as
 superseded and emits NULL or column default. To detect reused value IDs,
