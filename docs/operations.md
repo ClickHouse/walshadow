@@ -24,6 +24,15 @@ Primary fields:
 | `source_swap_pending` | requested source endpoint has not completed handoff |
 | `crossing_blocked_on` | timeline crossing is parked on named proof |
 
+Each replicated relation is one `[[tables]]` entry:
+
+| Field | Meaning |
+|---|---|
+| `source_table` | `<dbname>.<schema>.<table>` on the source |
+| `destination_table` | `<database>.<table>` in ClickHouse, after `target_database` / `target_table` overrides |
+| `initial_load` | configured mode: `none`, `copy`, `base_backup`, `object_store` |
+| `cdc` | relation is in CDC scope |
+
 Healthy steady state has `drain`, `emitter_ack`, and `shadow_replay` moving
 toward `source_received`. Short differences are expected while batches flush
 

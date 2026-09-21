@@ -353,6 +353,56 @@ fn selected_tables(root: &Table) -> Vec<(String, String)> {
     out
 }
 
+fn namespace_str(root: &Table, namespace: &str, key: &str) -> Option<String> {
+    root.get("namespace")
+        .and_then(Value::as_table)
+        .and_then(|t| t.get(namespace))
+        .and_then(Value::as_table)
+        .and_then(|t| t.get(key))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+}
+
+fn status_tables(root: &Table, source_database: &str, ch_database: &str) -> Vec<Value> {
+    selected_tables(root)
+        .into_iter()
+        .map(|(ns, rel)| {
+            let block = root
+                .get("table")
+                .and_then(Value::as_table)
+                .and_then(|t| t.get(&ns))
+                .and_then(Value::as_table)
+                .and_then(|t| t.get(&rel))
+                .and_then(Value::as_table);
+            let block_str = |key: &str| {
+                block
+                    .and_then(|b| b.get(key))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            };
+            let database = block_str("target_database")
+                .or_else(|| namespace_str(root, &ns, "target_database"))
+                .unwrap_or_else(|| ch_database.to_owned());
+            let table = block_str("target_table").unwrap_or_else(|| rel.clone());
+            let initial_load = block_str("initial_load")
+                .or_else(|| namespace_str(root, &ns, "initial_load"))
+                .unwrap_or_else(|| "none".into());
+            let mut entry = Table::new();
+            entry.insert(
+                "source_table".into(),
+                format!("{source_database}.{ns}.{rel}").into(),
+            );
+            entry.insert(
+                "destination_table".into(),
+                format!("{database}.{table}").into(),
+            );
+            entry.insert("initial_load".into(), initial_load.into());
+            entry.insert("cdc".into(), true.into());
+            Value::Table(entry)
+        })
+        .collect()
+}
+
 async fn stream_status(ctx: &SharedCtx) -> Result<String> {
     let root = get_config(ctx).await?;
     let paused = root
@@ -368,14 +418,22 @@ async fn stream_status(ctx: &SharedCtx) -> Result<String> {
         .and_then(Value::as_str)
         .unwrap_or("localhost")
         .to_string();
-    let tables: Vec<Value> = selected_tables(&root)
-        .into_iter()
-        .map(|(ns, rel)| Value::String(format!("{ns}.{rel}")))
-        .collect();
+    let section_str = |section: &str, key: &str, fallback: &str| {
+        root.get(section)
+            .and_then(Value::as_table)
+            .and_then(|t| t.get(key))
+            .and_then(Value::as_str)
+            .unwrap_or(fallback)
+            .to_string()
+    };
+    let source_database = section_str("source", "dbname", "postgres");
+    let ch_database = section_str("ch", "database", "default");
+    let tables = status_tables(&root, &source_database, &ch_database);
     let snap = ctx.metrics.snapshot().await;
     let mut out = Table::new();
     out.insert("paused".into(), paused.into());
     out.insert("ch_host".into(), ch_host.into());
+    out.insert("ch_database".into(), ch_database.into());
     out.insert("tables".into(), Value::Array(tables));
     out.insert(
         "rows_synced".into(),
@@ -628,6 +686,66 @@ mod tests {
         assert_eq!(parsed.get("paused").and_then(Value::as_bool), Some(true));
         assert!(call(&sock, "bogus", "").await.starts_with("ERR"));
         assert!(call(&sock, "apply", "").await.starts_with("ERR"));
+    }
+
+    #[tokio::test]
+    async fn status_tables_name_both_ends_and_both_phases() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("c.sock");
+        let _h = serve(sock.clone(), ctx_at(dir.path())).await.unwrap();
+
+        assert!(
+            call(
+                &sock,
+                "apply",
+                "[source]\ndbname = \"app\"\n\
+                 [ch]\ndatabase = \"cdc\"\n\
+                 [namespace.shop]\ntarget_database = \"warehouse\"\n\
+                 [table.public.orders]\nreplicate = true\ninitial_load = \"copy\"\n\
+                 [table.public.audit]\nreplicate = false\n\
+                 [table.shop.items]\nreplicate = true\ntarget_table = \"line_items\"\n"
+            )
+            .await
+            .starts_with("OK")
+        );
+
+        let status = call(&sock, "status", "").await;
+        let parsed: Table = status.strip_prefix("OK\n").unwrap().parse().unwrap();
+        assert_eq!(
+            parsed.get("ch_database").and_then(Value::as_str),
+            Some("cdc")
+        );
+        let tables = parsed.get("tables").and_then(Value::as_array).unwrap();
+        let entry = |source: &str| -> Table {
+            tables
+                .iter()
+                .filter_map(Value::as_table)
+                .find(|t| t.get("source_table").and_then(Value::as_str) == Some(source))
+                .cloned()
+                .unwrap_or_else(|| panic!("{source} missing from {status}"))
+        };
+        assert_eq!(tables.len(), 2, "{status}");
+
+        let orders = entry("app.public.orders");
+        assert_eq!(
+            orders.get("destination_table").and_then(Value::as_str),
+            Some("cdc.orders")
+        );
+        assert_eq!(
+            orders.get("initial_load").and_then(Value::as_str),
+            Some("copy")
+        );
+        assert_eq!(orders.get("cdc").and_then(Value::as_bool), Some(true));
+
+        let items = entry("app.shop.items");
+        assert_eq!(
+            items.get("destination_table").and_then(Value::as_str),
+            Some("warehouse.line_items")
+        );
+        assert_eq!(
+            items.get("initial_load").and_then(Value::as_str),
+            Some("none")
+        );
     }
 
     // Regression: applying one table used to opt every other table out
