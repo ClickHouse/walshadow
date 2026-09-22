@@ -268,6 +268,7 @@ impl RecordSink for DaemonSinks {
 #[derive(Debug, Parser)]
 #[command(
     name = "walshadow-stream init",
+    version = walshadow::VERSION,
     about = "Probe source + destination, pick tables, write the config."
 )]
 struct InitArgs {
@@ -323,6 +324,7 @@ impl InitArgs {
 #[derive(Debug, Parser)]
 #[command(
     name = "walshadow-stream",
+    version = walshadow::VERSION,
     about = "Stream + filter physical WAL from source PG."
 )]
 struct Args {

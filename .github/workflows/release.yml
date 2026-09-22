@@ -1,0 +1,165 @@
+name: Release
+
+# Build the walshadow-stream / walshadow-classify / walshadow-filter binaries
+# for linux x86_64 + aarch64 and publish them.
+#
+#   main push   -> one tar.gz per target as workflow artifacts
+#   v* tag push -> same archives + SHA256SUMS attached to a GitHub Release,
+#                  with a build-provenance attestation per archive
+#
+# Each arch builds natively on its own runner, same as docker.yml. Dynamic
+# glibc link: the binaries need liblz4.so.1 / libzstd.so.1 at runtime and a
+# glibc at least as new as ubuntu-24.04's (2.39).
+#
+# Archive layout: walshadow-<version>-<target>/{walshadow-*,LICENSE,README.md}
+# where <version> is the tag without its `v`, or `sha-<short>` on main, the
+# same commit tag scheme docker.yml uses.
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  # Build only, no release. Paths that change how the archives are produced
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+      - build.rs
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+
+    steps:
+      # The Rust build does not touch pgext, so no submodules.
+      - name: Checkout walshadow
+        uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Install C deps (lz4 + zstd for clickhouse-c-rs)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential liblz4-dev libzstd-dev
+
+      # Tags must match Cargo.toml so the archive name, the release and
+      # `--version` agree on what version this is.
+      - name: Resolve version
+        id: version
+        run: |
+          set -euo pipefail
+          crate=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "walshadow") | .version')
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            version="${GITHUB_REF_NAME#v}"
+            if [[ "$version" != "$crate" ]]; then
+              echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $crate"
+              exit 1
+            fi
+          else
+            version="sha-$(git rev-parse --short HEAD)"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "archive=walshadow-$version-${{ matrix.target }}" >> "$GITHUB_OUTPUT"
+
+      # `-p walshadow --bins`: the bench workspace member has bins too, keep
+      # them out of the release. build.rs picks up the git sha for --version.
+      - name: Build
+        run: cargo build --release --locked -p walshadow --bins --target ${{ matrix.target }}
+
+      - name: Smoke test
+        run: |
+          set -euo pipefail
+          for bin in walshadow-stream walshadow-classify walshadow-filter; do
+            "target/${{ matrix.target }}/release/$bin" --version
+          done
+
+      - name: Package
+        env:
+          ARCHIVE: ${{ steps.version.outputs.archive }}
+        run: |
+          set -euo pipefail
+          mkdir -p "dist/$ARCHIVE"
+          cp target/${{ matrix.target }}/release/walshadow-{stream,classify,filter} \
+             LICENSE README.md "dist/$ARCHIVE/"
+          tar -czf "dist/$ARCHIVE.tar.gz" -C dist "$ARCHIVE"
+          ls -l dist/*.tar.gz
+
+      - name: Upload archive
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.version.outputs.archive }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    name: github release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+
+    steps:
+      - name: Fetch archives
+        uses: actions/download-artifact@v8
+        with:
+          pattern: walshadow-*
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          sha256sum -- *.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+
+      # Verify with: gh attestation verify <archive> --repo ClickHouse/walshadow
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: dist/*.tar.gz
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/*.tar.gz dist/SHA256SUMS \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            --verify-tag

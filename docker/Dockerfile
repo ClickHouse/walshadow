@@ -27,6 +27,9 @@ ENV RUSTFLAGS="-C target-feature=-crt-static"
 # unreachable(), which clickhouse-c uses under C23. cc-rs appends CFLAGS
 # after its own -std, so the polyfill reaches every C unit it compiles.
 ENV CFLAGS="-Dunreachable()=__builtin_unreachable()"
+# Commit shown by `walshadow-stream --version`; no .git in the build context
+ARG WALSHADOW_GIT_SHA=unknown
+ENV WALSHADOW_GIT_SHA=$WALSHADOW_GIT_SHA
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY bench ./bench
