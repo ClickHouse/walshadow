@@ -18,6 +18,7 @@ use walshadow::classify::Summary;
 #[derive(Parser, Debug)]
 #[command(
     name = "walshadow-classify",
+    version = walshadow::VERSION,
     about = "Classify WAL records into catalog/user/special"
 )]
 struct Args {

@@ -22,6 +22,7 @@ pub struct Command {
 #[derive(Debug, Parser)]
 #[command(
     name = "walshadow-stream ctl",
+    version = crate::VERSION,
     about = "Control a running walshadow-stream daemon"
 )]
 pub struct Cli {

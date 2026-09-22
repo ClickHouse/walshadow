@@ -25,6 +25,7 @@ use walshadow::filter_segment::filter_segment;
 #[derive(Debug, Parser)]
 #[command(
     name = "walshadow-filter",
+    version = walshadow::VERSION,
     about = "Filter WAL segment to catalog-only."
 )]
 struct Args {

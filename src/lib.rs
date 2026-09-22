@@ -4,6 +4,15 @@
 //! records, mappings, PostgreSQL paths, ClickHouse transport, and backfill
 //! requests
 
+/// `<crate version> (<git sha>)`, what every binary prints for `--version`.
+/// The sha comes from build.rs
+pub const VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (",
+    env!("WALSHADOW_GIT_SHA"),
+    ")"
+);
+
 /// `info_span!(target: "walshadow::trace", …)` when `$on`, else a no-op span
 /// (fields unevaluated on the unsampled path).
 macro_rules! trace_span {
