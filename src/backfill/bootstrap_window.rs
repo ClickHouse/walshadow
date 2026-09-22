@@ -25,6 +25,7 @@ use crate::emit::ch_emitter::{EmitterConfig, EmitterStats};
 use crate::emit::pipeline::Fatal;
 use crate::emit::pipeline::tail::OwnedTail;
 use crate::mapping::MappingHandle;
+use crate::pos::Pos;
 use crate::record::{WAL_SEG_SIZE, segments_covering};
 use crate::source::source_feed::{SourceEvent, SourceFeed, StandbyStatus};
 use crate::source::wal_stream::WalStream;
@@ -321,7 +322,7 @@ async fn run_live(
     feed.start_physical_replication(None, begin, timeline)
         .await
         .context("bootstrap window leg: START_REPLICATION")?;
-    let mut stream = WalStream::new(timeline, WAL_SEG_SIZE, begin)
+    let mut stream = WalStream::new(timeline, WAL_SEG_SIZE, Pos::new(begin))
         .map_err(|e| anyhow::anyhow!("bootstrap window leg: WalStream: {e}"))?;
     stream.filter_mut().set_target_db(leg.db_oid);
     let mut seg_sink = DropSegments;

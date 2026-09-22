@@ -122,7 +122,7 @@ async fn native_numeric_time_timetz_round_trip() {
     });
 
     let stats = Arc::new(EmitterStats::default());
-    let emitter_ack = Arc::new(Monotone::<EmitterAck>::new(0));
+    let emitter_ack = Arc::new(Monotone::<EmitterAck>::default());
     let fatal = Fatal::new();
     let (msg_tx, ack, tail_parts) = tail::spawn(&cfg, 1, stats, emitter_ack, fatal.clone())
         .await

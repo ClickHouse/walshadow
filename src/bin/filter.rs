@@ -1,45 +1,46 @@
-//! `walshadow-filter` — drop user-relation WAL records, emit filtered
-//! segment + manifest sidecar.
+//! `walshadow-filter` — drop user-relation WAL records from consecutive
+//! segments, writing filtered segments under their own names.
 //!
 //! ```text
-//! walshadow-filter --in seg.wal[.zst|.gz|.lz4|.lzma|.br][.partial] \
-//!     --out-dir filtered/ [--manifest filtered/seg.json]
+//! walshadow-filter --in seg1.wal[.zst|.gz|.lz4|.lzma|.br] [--in seg2 …] \
+//!     --out-dir filtered/
 //! ```
 //!
 //! Handles *segment-file* compression (whole-segment codec envelope from
 //! pg_receivewal/archive_command), NOT the orthogonal `wal_compression`
-//! GUC that compresses FPIs *inside* records — that's `filter_segment`'s
-//! concern.
+//! GUC that compresses FPIs *inside* records.
+//!
+//! Drives the daemon's streaming filter, so catalog state carries across
+//! segments. A record spanning past the last input holds its segment back;
+//! the first segment's leading continuation passes through unchanged.
 
-use std::fs;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use clap::Parser;
 use tokio::io::AsyncReadExt;
 use walrus::pg::wal::segment_file::open_segment_file;
-use walshadow::filter::Filter;
-use walshadow::filter_segment::filter_segment;
+use walshadow::pos::Pos;
+use walshadow::record::CountingRecordSink;
+use walshadow::segment_sink::DirSegmentSink;
+use walshadow::wal_stream::WalStream;
 
 #[derive(Debug, Parser)]
 #[command(
     name = "walshadow-filter",
     version = walshadow::VERSION,
-    about = "Filter WAL segment to catalog-only."
+    about = "Filter consecutive WAL segments to catalog-only."
 )]
 struct Args {
-    /// Input segment file. Compression suffix (.zst .gz .lz4 .lzma .br)
-    /// is auto-detected; `.partial` peer accepted.
-    #[arg(long = "in", value_name = "SEGMENT")]
-    input: PathBuf,
-    /// Output directory for the filtered segment.
+    /// Input segment files in LSN order. Compression suffix (.zst .gz .lz4
+    /// .lzma .br) is auto-detected.
+    #[arg(long = "in", value_name = "SEGMENT", required = true)]
+    input: Vec<PathBuf>,
+    /// Output directory for filtered segments.
     #[arg(long = "out-dir", value_name = "DIR")]
     out_dir: PathBuf,
-    /// Optional explicit manifest path. Default: `<out-dir>/<seg>.json`.
-    #[arg(long = "manifest", value_name = "PATH")]
-    manifest: Option<PathBuf>,
-    /// Print a one-line summary to stderr on success.
+    /// Skip the summary line on stderr.
     #[arg(long)]
     quiet: bool,
 }
@@ -57,67 +58,85 @@ async fn main() -> ExitCode {
 }
 
 async fn run(args: Args) -> Result<()> {
-    let (seg_name, mut reader) = open_segment_file(&args.input)
-        .await
-        .with_context(|| format!("open input {}", args.input.display()))?;
-    let mut bytes = Vec::new();
-    reader
-        .read_to_end(&mut bytes)
-        .await
-        .with_context(|| format!("read input {}", args.input.display()))?;
-    let name = seg_name.format();
-
-    let mut filter = Filter::new();
-    let (filtered, manifest, _parsed) = filter_segment(&bytes, &name, &mut filter)
-        .with_context(|| format!("filter {}", args.input.display()))?;
-
-    fs::create_dir_all(&args.out_dir)
+    let mut segments = DirSegmentSink::new(args.out_dir.clone())
         .with_context(|| format!("create out-dir {}", args.out_dir.display()))?;
-    let out_path = args.out_dir.join(&name);
-    fs::write(&out_path, &filtered)
-        .with_context(|| format!("write filtered segment {}", out_path.display()))?;
-
-    let manifest_path = args
-        .manifest
-        .unwrap_or_else(|| args.out_dir.join(format!("{name}.manifest.json")));
-    let mf = fs::File::create(&manifest_path)
-        .with_context(|| format!("create manifest {}", manifest_path.display()))?;
-    serde_json::to_writer_pretty(mf, &manifest)
-        .with_context(|| format!("write manifest {}", manifest_path.display()))?;
-
-    if !args.quiet {
-        let s = &manifest.stats;
+    let mut records = CountingRecordSink::default();
+    let mut stream: Option<WalStream> = None;
+    for input in &args.input {
+        let (seg, mut reader) = open_segment_file(input)
+            .await
+            .with_context(|| format!("open input {}", input.display()))?;
+        let mut bytes = Vec::new();
+        reader
+            .read_to_end(&mut bytes)
+            .await
+            .with_context(|| format!("read input {}", input.display()))?;
+        let seg_size = long_header_seg_size(&bytes)
+            .with_context(|| format!("{}: no long page header", input.display()))?;
+        ensure!(
+            seg_size.is_power_of_two() && bytes.len() as u64 <= seg_size,
+            "{}: {} bytes against segment size {seg_size}",
+            input.display(),
+            bytes.len()
+        );
+        // Captures may trim trailing zero pages
+        bytes.resize(seg_size as usize, 0);
+        let lsn = seg.start_lsn(seg_size);
+        let stream = match &mut stream {
+            Some(stream) => stream,
+            None => stream.insert(WalStream::new(seg.timeline, seg_size, Pos::new(lsn))?),
+        };
+        ensure!(
+            stream.timeline() == seg.timeline && stream.seg_size() == seg_size,
+            "{}: timeline or segment size differs from first input",
+            input.display()
+        );
+        stream
+            .push(lsn, &bytes, &mut records, &mut segments)
+            .await
+            .with_context(|| format!("filter {}", input.display()))?;
+    }
+    let stream = stream.expect("clap requires an input");
+    if stream.dispatched_lsn() < stream.next_lsn().get() {
         eprintln!(
-            "filtered {}: {} records, kept {} ({} bytes), dropped {} ({} bytes), relmap updates {}, pg_class undecoded {}",
-            name,
-            s.records,
+            "walshadow-filter: record continues past last input, segment at {:#X} held back",
+            stream.dispatched_lsn()
+        );
+    }
+    if !args.quiet {
+        let s = stream.filter().stats();
+        let t = stream.filter().tracker().stats();
+        eprintln!(
+            "filtered {} segments: {} records, kept {} ({} bytes), dropped {} ({} bytes), relmap updates {}, pg_class undecoded {}, oid in prefix {}",
+            args.input.len(),
+            s.kept + s.dropped,
             s.kept,
             s.kept_bytes,
             s.dropped,
             s.dropped_bytes,
-            s.relmap_updates,
-            s.pg_class_writes_undecoded,
+            t.relmap_updates,
+            t.pg_class_writes_undecoded,
+            t.pg_class_writes_oid_in_prefix,
         );
     }
     Ok(())
+}
+
+/// `XLogLongPageHeaderData.xlp_seg_size`, present on every segment's first page
+fn long_header_seg_size(bytes: &[u8]) -> Option<u64> {
+    Some(u32::from_le_bytes(bytes.get(32..36)?.try_into().ok()?) as u64)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn fixture_segment() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("fixtures/wal/classify/segments/000000010000000000000001.gz")
-    }
-
     #[tokio::test]
     async fn run_errors_on_missing_input() {
         let tmp = tempfile::tempdir().unwrap();
         let err = run(Args {
-            input: tmp.path().join("nope.wal"),
+            input: vec![tmp.path().join("nope.wal")],
             out_dir: tmp.path().join("out"),
-            manifest: None,
             quiet: true,
         })
         .await
@@ -126,37 +145,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_filters_fixture_and_writes_outputs() {
-        let seg = fixture_segment();
-        if !seg.exists() {
-            eprintln!("skip: no captured segment at {seg:?}");
-            return;
-        }
+    async fn run_filters_fixture_and_writes_segment() {
+        let seg = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/wal/xlog_switch/segments/000000010000000000000002.gz");
+        assert!(seg.exists(), "committed fixture {seg:?}");
         let tmp = tempfile::tempdir().unwrap();
         let out_dir = tmp.path().join("out");
-        let manifest = tmp.path().join("seg.json");
         run(Args {
-            input: seg,
+            input: vec![seg],
             out_dir: out_dir.clone(),
-            manifest: Some(manifest.clone()),
             quiet: false,
         })
         .await
         .expect("run");
-        assert!(manifest.exists(), "manifest written");
-        let segs: Vec<_> = fs::read_dir(&out_dir)
+        let names: Vec<_> = std::fs::read_dir(&out_dir)
             .unwrap()
-            .filter_map(|e| e.ok())
+            .map(|e| e.unwrap().file_name())
             .collect();
-        assert_eq!(segs.len(), 1, "one filtered segment written");
-
-        run(Args {
-            input: fixture_segment(),
-            out_dir,
-            manifest: None,
-            quiet: true,
-        })
-        .await
-        .expect("run quiet, default manifest path");
+        assert_eq!(names, ["000000010000000000000002"]);
     }
 }

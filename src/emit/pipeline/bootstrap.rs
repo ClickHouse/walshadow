@@ -27,6 +27,7 @@ use crate::toast::{
     FetchedValue, ToastResolver, ToastRow, check_value_caps, detoasted_value, finish_value,
     pointer_extsize,
 };
+use crate::xact::xact_buffer::{MissPolicy, StoreMiss, fill_store_miss};
 use ahash::{HashMap, HashMapExt, HashSet};
 
 /// Rows per `BatcherMsg::Rows` from the bootstrap drain. Fixed rather than
@@ -472,8 +473,8 @@ fn bump(open: &mut Option<(walrus::pg::walparser::RelFileNode, u64, u64)>, rows_
 }
 
 /// Coalesces routed rows into one `BatcherMsg::Rows` per
-/// [`DECODE_CHUNK_BYTES`]-shaped trigger, the same amortization the streaming
-/// decode pool gets. Rows of different seqs may share a chunk; the batcher
+/// [`DECODE_CHUNK_BYTES`]-shaped trigger, the same amortization streaming
+/// placement gets. Rows of different seqs may share a chunk; the batcher
 /// routes each independently
 #[derive(Default)]
 struct RowBuf {
@@ -791,50 +792,23 @@ fn apply_fetched(
     target: &str,
     resolver: &ToastResolver,
 ) -> Result<(ColumnValue, usize), String> {
-    match fetched {
-        Some(FetchedValue::Assembled(stored)) => {
+    let miss = match StoreMiss::split(fetched) {
+        Ok(stored) => {
             let raw = finish_value(p, stored).map_err(|e| e.to_string())?;
             let retained = raw.len();
-            Ok((detoasted_value(raw, type_oid), retained))
+            return Ok((detoasted_value(raw, type_oid), retained));
         }
-        None => {
-            resolver.note_filled_default();
-            Ok((ColumnValue::Null, 0))
-        }
-        // Confirmed ID reuse needs no store ownership check
-        Some(FetchedValue::Generation) => {
-            resolver.note_filled_generation();
-            Ok((ColumnValue::Null, 0))
-        }
-        // Interpret miss according to store ownership.
-        //
-        // Walk-seeded store must contain chunks written during this pass.
-        //
-        // Read-only store contains state at end of backup. Missing value was
-        // removed after copied row and is superseded by later row version.
-        Some(_) if !resolver.stores_chunks() => {
-            resolver.note_filled_superseded();
-            Ok((ColumnValue::Null, 0))
-        }
-        Some(outcome) => {
-            resolver.note_fetch_miss();
-            let extsize = pointer_extsize(p);
-            let detail = match outcome {
-                FetchedValue::Mismatch { got } => {
-                    format!("chunks sum to {got} bytes, pointer says {extsize}")
-                }
-                FetchedValue::Missing => "has no chunks in the store".into(),
-                FetchedValue::Assembled(_) | FetchedValue::Generation => {
-                    unreachable!("matched above")
-                }
-            };
-            Err(format!(
+        Err(miss) => miss,
+    };
+    let column =
+        fill_store_miss(miss, p, resolver, MissPolicy::bootstrap(resolver)).map_err(|detail| {
+            format!(
                 "bootstrap: relation {} column {target} value_id={} on toast relid={}: \
                  {detail}; remedy: fresher backup, or initial_load='copy'",
                 rel.rel_name, p.va_valueid, p.va_toastrelid
-            ))
-        }
-    }
+            )
+        })?;
+    Ok((column, 0))
 }
 
 /// Resolve mapped TOAST pointers or fill in disabled mode. Value cap
@@ -1075,8 +1049,8 @@ mod tests {
         )
     }
     use crate::decode::heap_decoder::{ColumnValue, ToastPointer};
-    use crate::emit::pipeline::ack;
     use crate::emit::pipeline::batcher::BatcherMsg;
+    use crate::emit::pipeline::{Fatal, ack};
     use crate::schema::{RelAttr, RelDescriptor, RelName, ReplIdent};
     use crate::toast::MemChunkStore;
     use ahash::{HashMap, HashMapExt, HashSetExt};
@@ -1265,7 +1239,7 @@ mod tests {
                 .into_iter()
                 .collect(),
         );
-        let (ack, collector) = ack::spawn(Arc::new(crate::pos::Monotone::new(0)));
+        let (ack, collector) = ack::spawn(Arc::new(crate::pos::Monotone::default()), Fatal::new());
         let (msg_tx, _msg_rx) = mpsc::channel(1);
         let (tx, rx) = mpsc::channel(1);
         tx.send(vec![bytea_toast_tuple(16400, 16401, 7)])
@@ -1305,8 +1279,8 @@ mod tests {
         tables.insert(RelName::new("public", "t16401"), mapping_for(16401));
         let mapping = Arc::new(tables);
 
-        let emitter_ack = Arc::new(crate::pos::Monotone::new(0));
-        let (ack, collector) = ack::spawn(emitter_ack);
+        let emitter_ack = Arc::new(crate::pos::Monotone::default());
+        let (ack, collector) = ack::spawn(emitter_ack, Fatal::new());
         let (msg_tx, mut msg_rx) = mpsc::channel::<BatcherMsg>(64);
         let (tup_tx, tup_rx) = mpsc::channel::<Vec<BackfillTuple>>(64);
 
@@ -1361,8 +1335,8 @@ mod tests {
         tables.insert(RelName::new("public", "t16400"), mapping_for(16400));
         let mapping = Arc::new(tables);
 
-        let emitter_ack = Arc::new(crate::pos::Monotone::new(0));
-        let (ack, collector) = ack::spawn(emitter_ack);
+        let emitter_ack = Arc::new(crate::pos::Monotone::default());
+        let (ack, collector) = ack::spawn(emitter_ack, Fatal::new());
         let (msg_tx, mut msg_rx) = mpsc::channel::<BatcherMsg>(64);
         let (tup_tx, tup_rx) = mpsc::channel::<Vec<BackfillTuple>>(64);
 
@@ -1412,8 +1386,8 @@ mod tests {
         tables.insert(RelName::new("public", "t16400"), bytea_mapping_for(16400));
         let mapping = Arc::new(tables);
 
-        let emitter_ack = Arc::new(crate::pos::Monotone::new(0));
-        let (ack, collector) = ack::spawn(emitter_ack);
+        let emitter_ack = Arc::new(crate::pos::Monotone::default());
+        let (ack, collector) = ack::spawn(emitter_ack, Fatal::new());
         let (msg_tx, mut msg_rx) = mpsc::channel::<BatcherMsg>(64);
         let (tup_tx, tup_rx) = mpsc::channel::<Vec<BackfillTuple>>(64);
 
@@ -1465,8 +1439,8 @@ mod tests {
         tables.insert(RelName::new("public", "t16400"), bytea_mapping_for(16400));
         let mapping = Arc::new(tables);
 
-        let emitter_ack = Arc::new(crate::pos::Monotone::new(0));
-        let (ack, collector) = ack::spawn(emitter_ack);
+        let emitter_ack = Arc::new(crate::pos::Monotone::default());
+        let (ack, collector) = ack::spawn(emitter_ack, Fatal::new());
         let (msg_tx, mut msg_rx) = mpsc::channel::<BatcherMsg>(64);
         let (tup_tx, tup_rx) = mpsc::channel::<Vec<BackfillTuple>>(64);
 
@@ -1525,8 +1499,8 @@ mod tests {
         tables.insert(RelName::new("public", "t16400"), bytea_mapping_for(16400));
         let mapping = Arc::new(tables);
 
-        let emitter_ack = Arc::new(crate::pos::Monotone::new(0));
-        let (ack, collector) = ack::spawn(emitter_ack);
+        let emitter_ack = Arc::new(crate::pos::Monotone::default());
+        let (ack, collector) = ack::spawn(emitter_ack, Fatal::new());
         let (msg_tx, mut msg_rx) = mpsc::channel::<BatcherMsg>(64);
         let (tup_tx, tup_rx) = mpsc::channel::<Vec<BackfillTuple>>(64);
         let spool_tmp = tempfile::tempdir().unwrap();
@@ -1588,7 +1562,7 @@ mod tests {
         tables.insert(RelName::new("public", "t16400"), bytea_mapping_for(16400));
         let mapping = Arc::new(tables);
 
-        let (ack, collector) = ack::spawn(Arc::new(crate::pos::Monotone::new(0)));
+        let (ack, collector) = ack::spawn(Arc::new(crate::pos::Monotone::default()), Fatal::new());
         let (msg_tx, mut msg_rx) = mpsc::channel::<BatcherMsg>(64);
         let (tup_tx, tup_rx) = mpsc::channel::<Vec<BackfillTuple>>(64);
         tup_tx
@@ -1675,7 +1649,8 @@ mod tests {
 
         let mut lanes = Vec::new();
         for value_id in [1, 2] {
-            let (ack, collector) = ack::spawn(Arc::new(crate::pos::Monotone::new(0)));
+            let (ack, collector) =
+                ack::spawn(Arc::new(crate::pos::Monotone::default()), Fatal::new());
             let (tup_tx, tup_rx) = mpsc::channel::<Vec<BackfillTuple>>(64);
             let mut chunk = toast_chunk_tuple(16500, value_id, 0, b"hello");
             // Store keys generations by TID, so each lane needs its own
@@ -1752,8 +1727,8 @@ mod tests {
         tables.insert(RelName::new("public", "t16400"), bytea_mapping_for(16400));
         let mapping = Arc::new(tables);
 
-        let emitter_ack = Arc::new(crate::pos::Monotone::new(0));
-        let (ack, collector) = ack::spawn(emitter_ack);
+        let emitter_ack = Arc::new(crate::pos::Monotone::default());
+        let (ack, collector) = ack::spawn(emitter_ack, Fatal::new());
         let (msg_tx, mut msg_rx) = mpsc::channel::<BatcherMsg>(64);
         let (tup_tx, tup_rx) = mpsc::channel::<Vec<BackfillTuple>>(64);
 
@@ -1806,7 +1781,7 @@ mod tests {
         tables.insert(RelName::new("public", "t16400"), bytea_mapping_for(16400));
         let mapping = Arc::new(tables);
 
-        let (ack, collector) = ack::spawn(Arc::new(crate::pos::Monotone::new(0)));
+        let (ack, collector) = ack::spawn(Arc::new(crate::pos::Monotone::default()), Fatal::new());
         let (msg_tx, mut msg_rx) = mpsc::channel::<BatcherMsg>(64);
         let (tup_tx, tup_rx) = mpsc::channel::<Vec<BackfillTuple>>(4);
         let spool_tmp = tempfile::tempdir().unwrap();
@@ -2065,7 +2040,7 @@ mod tests {
         tables.insert(RelName::new("public", "t16401"), bytea_mapping_for(16401));
         let mapping = Arc::new(tables);
 
-        let (ack, collector) = ack::spawn(Arc::new(crate::pos::Monotone::new(0)));
+        let (ack, collector) = ack::spawn(Arc::new(crate::pos::Monotone::default()), Fatal::new());
         let (msg_tx, mut msg_rx) = mpsc::channel::<BatcherMsg>(64);
         let (tup_tx, tup_rx) = mpsc::channel::<Vec<BackfillTuple>>(64);
         let spool_tmp = tempfile::tempdir().unwrap();

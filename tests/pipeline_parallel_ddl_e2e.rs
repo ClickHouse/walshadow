@@ -193,7 +193,7 @@ async fn parallel_pipeline_schema_evolution_orders_after_data() {
     );
 
     assert!(
-        ack.get() > 0,
+        !ack.get().is_zero(),
         "durable watermark advanced through the barrier",
     );
 }
@@ -351,7 +351,7 @@ async fn parallel_pipeline_truncate_orders_after_data() {
     );
 
     assert!(
-        ack.get() > 0,
+        !ack.get().is_zero(),
         "durable watermark advanced through the barrier",
     );
 }

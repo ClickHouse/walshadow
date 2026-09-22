@@ -68,7 +68,7 @@ pub use decode::{codecs, decoder_sink, fpi, heap_decoder, visibility, wal_xact};
 #[doc(hidden)]
 pub use emit::{ch_ddl, ch_emitter, pipeline};
 #[doc(hidden)]
-pub use filter::{catalog_tracker, classify, filter_segment, main_data, pg_class_decoder, rewrite};
+pub use filter::{catalog_tracker, classify, main_data, pg_class_decoder, rewrite};
 #[doc(hidden)]
 pub use ops::{
     bridge, control, ctl, init, introspect, metrics, oracle, preflight, retention, trace,

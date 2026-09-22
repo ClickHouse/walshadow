@@ -9,7 +9,10 @@
 //! walshadow-stream \
 //!     --host /tmp/source_sock --port 5432 --user postgres --dbname postgres \
 //!     --shadow-socket-dir /tmp/shadow_sock --shadow-port 5433 \
+//!     --bootstrap-shadow-data-dir /var/lib/walshadow/shadow \
+//!     --walsender-bind 127.0.0.1:5434 \
 //!     --out-dir /var/lib/walshadow/filtered \
+//!     --spill-dir /var/lib/walshadow/spill \
 //!     [--slot walshadow_phys] \
 //!     [--start-lsn 0/16B3750] \
 //!     [--metrics-bind 127.0.0.1:9484] \
@@ -50,7 +53,7 @@ use tokio::sync::Mutex;
 use walshadow::metrics::MetricsRegistry;
 
 use crate::args::{Args, InitArgs, cli_base, url_base, validate_transport_args};
-use crate::runtime_cfg::spawn_sighup_reload;
+use crate::runtime_cfg::spawn_shutdown_signals;
 use crate::session::run_session;
 use crate::tracing_setup::init_tracing;
 
@@ -127,7 +130,7 @@ async fn run_ctl(socket: &Path, cmd: walshadow::ctl::Command) -> Result<()> {
 
 /// Process-lifetime entry: bind metrics + control socket + SIGHUP, then stream
 /// one session. Every reconfigure (socket / SIGHUP) is a live reload — no
-/// restart. Ctrl-C breaks the pump loop and drains gracefully.
+/// restart. SIGINT/SIGTERM break the pump loop and drain gracefully.
 async fn run(mut args: Args) -> Result<()> {
     use walshadow::control::{Reloader, SharedCtx};
 
@@ -141,15 +144,7 @@ async fn run(mut args: Args) -> Result<()> {
                 "SIGHUP install failed",
             );
         })?;
-    // Match systemd SIGTERM with ctrl_c shutdown path
-    let sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        .inspect_err(|e| {
-            tracing::warn!(
-                target: "walshadow",
-                error = %e,
-                "SIGTERM install failed",
-            );
-        })?;
+    let shutdown = spawn_shutdown_signals()?;
 
     let metrics = MetricsRegistry::new();
     let reloader = Arc::new(Reloader::default());
@@ -184,7 +179,6 @@ async fn run(mut args: Args) -> Result<()> {
     } else {
         None
     };
-    let _sighup = spawn_sighup_reload(sighup, reloader.clone());
 
-    run_session(&args, &metrics, &reloader, sigterm).await
+    run_session(&args, &metrics, &reloader, sighup, &shutdown).await
 }

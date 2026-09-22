@@ -73,6 +73,15 @@
 //!      no delete marker, and the operator sort key, while a relation the
 //!      pattern misses keeps the cluster-wide names.
 //!
+//! 11. `copy_load_resolves_unchanged_toast_after_update`
+//!    * COPY-loaded row with an out-of-line value, then an UPDATE of another
+//!      column carrying the unchanged TOAST pointer.
+//!    * Expect: the value resolves from the chunk mirror the load seeded.
+//!
+//! 12. `copy_load_pins_output_settings`
+//!    * `ALTER DATABASE … SET intervalstyle = iso_8601` before a COPY load.
+//!    * Expect: COPY and WAL rows render the same interval identically.
+//!
 //! Source-side `config_*` install runs the real `sql/runtime_config_install.sql`
 
 //! inside the bootstrap schema dump, so the drills double as install-script
@@ -1255,4 +1264,160 @@ async fn pattern_row_shapes_auto_created_tables() {
         .query("SELECT argMax(body, _peerdb_version) FROM walshadow_test.events_2026 WHERE id = 1")
         .expect("ch body");
     assert_eq!(body, "shaped", "rows INSERT under the renamed columns");
+}
+
+/// Bootstrap `schema_sql`, run `workload` (opt-in first) off the WAL stream,
+/// then poll `probe` on CH until it reads `want` or 20s pass. Returns CH for
+/// follow-up queries and the last probe answer
+async fn copy_load_converges(
+    schema_sql: &str,
+    workload: Vec<String>,
+    app_name: &str,
+    probe: &str,
+    want: &str,
+) -> (fx::ChServer, String) {
+    let slot = fx::Ports::alloc();
+    let tmp = tempfile::tempdir().unwrap();
+    let (
+        fx::BootstrappedClusters {
+            source,
+            shadow,
+            shadow_filter_dir,
+        },
+        shadow_stream_state,
+    ) = fx::bootstrap_clusters_with_bridge(
+        &tmp,
+        schema_sql,
+        slot.source,
+        slot.shadow,
+        slot.walsender,
+    )
+    .await;
+    let _src_stop = fx::StopOnDrop { sh: &source };
+    let _shd_stop = fx::StopOnDrop { sh: &shadow };
+
+    let ch_tmp = tempfile::tempdir().unwrap();
+    let ch = fx::ChServer::spawn(ch_tmp, slot.ch_tcp, slot.ch_http).expect("spawn ch");
+    ch.query("CREATE DATABASE IF NOT EXISTS walshadow_test")
+        .expect("create db");
+
+    let mut pipeline = fx::build_pipeline(fx::BuildPipelineArgs {
+        tmp: &tmp,
+        source: &source,
+        shadow: &shadow,
+        shadow_filter_dir: &shadow_filter_dir,
+        shadow_stream_state,
+        ch_database: "walshadow_test",
+        ch_tcp_port: slot.ch_tcp,
+        mappings: vec![],
+        app_name,
+        ddl: Some(overlay_ddl_args()),
+    })
+    .await;
+
+    let driver = fx::spawn_workload(&source, workload);
+    let shipped = fx::pump_segments(&mut pipeline, 1, Duration::from_secs(45)).await;
+    let _ = driver.join();
+    assert!(shipped >= 1, "no segments shipped in 45s");
+
+    let target = pipeline.stream.dispatched_lsn();
+    let observed = shadow
+        .wait_for_replay(target, Duration::from_secs(30))
+        .expect("shadow replay");
+    assert!(observed >= target);
+    pipeline.shutdown().await.expect("pipeline drains clean");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let mut got = String::new();
+    while std::time::Instant::now() < deadline {
+        got = ch.query(probe).unwrap_or_default();
+        if got == want {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    (ch, got)
+}
+
+/// COPY loads a row whose large value lives out of line; a later UPDATE of
+/// another column carries the unchanged TOAST pointer, which resolves only
+/// against a chunk mirror the load seeded
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn copy_load_resolves_unchanged_toast_after_update() {
+    if !fx::requirements_available() {
+        return;
+    }
+    // 200 md5 digests: 6400 bytes, stored uncompressed out of line
+    let schema_sql = format!(
+        "{INSTALL_SQL}\n\
+         CREATE SCHEMA app;\n\
+         CREATE TABLE app.docs (id bigint PRIMARY KEY, tag text, big text);\n\
+         ALTER TABLE app.docs ALTER COLUMN big SET STORAGE EXTERNAL;\n\
+         INSERT INTO app.docs VALUES\
+            (1, 'v1', (SELECT string_agg(md5(i::text), '' ORDER BY i) \
+                       FROM generate_series(1, 200) i)),\
+            (2, 'v1', 'small');\n"
+    );
+    let (ch, got) = copy_load_converges(
+        &schema_sql,
+        vec![
+            "INSERT INTO walshadow.config_table (namespace, relname, replicate, initial_load) \
+             VALUES ('app', 'docs', true, 'copy')"
+                .into(),
+            "UPDATE app.docs SET tag = 'v2' WHERE id = 1".into(),
+            "SELECT pg_switch_wal()".into(),
+        ],
+        "walshadow-copy-toast",
+        "SELECT count() FROM walshadow_test.docs FINAL WHERE _is_deleted = 0",
+        "2",
+    )
+    .await;
+    assert_eq!(got, "2", "both rows reach CH");
+
+    let doc = ch
+        .query(
+            "SELECT tag, length(big), substring(big, 1, 32), substring(big, 6369, 32) \
+             FROM walshadow_test.docs FINAL WHERE _is_deleted = 0 AND id = 1",
+        )
+        .expect("ch updated row");
+    assert_eq!(
+        doc, "v2\t6400\tc4ca4238a0b923820dcc509a6f75849b\t3644a684f98ea8fe223c713b77189a77",
+        "unchanged TOAST value must survive the UPDATE",
+    );
+}
+
+/// COPY renders out-of-matrix types through source text output; database
+/// defaults must not leak into it, so a COPY row and a WAL row holding the
+/// same interval read identically
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn copy_load_pins_output_settings() {
+    if !fx::requirements_available() {
+        return;
+    }
+    let schema_sql = format!(
+        "{INSTALL_SQL}\n\
+         ALTER DATABASE postgres SET intervalstyle = 'iso_8601';\n\
+         CREATE SCHEMA app;\n\
+         CREATE TABLE app.spans (id bigint PRIMARY KEY, span interval);\n\
+         INSERT INTO app.spans VALUES (1, '1 day 02:03:04');\n"
+    );
+    let (_ch, got) = copy_load_converges(
+        &schema_sql,
+        vec![
+            "INSERT INTO walshadow.config_table (namespace, relname, replicate, initial_load) \
+             VALUES ('app', 'spans', true, 'copy')"
+                .into(),
+            "INSERT INTO app.spans VALUES (2, '1 day 02:03:04')".into(),
+            "SELECT pg_switch_wal()".into(),
+        ],
+        "walshadow-copy-settings",
+        "SELECT groupArray(span) FROM \
+         (SELECT span FROM walshadow_test.spans FINAL WHERE _is_deleted = 0 ORDER BY id)",
+        "['1 day 02:03:04','1 day 02:03:04']",
+    )
+    .await;
+    assert_eq!(
+        got, "['1 day 02:03:04','1 day 02:03:04']",
+        "COPY row renders like the WAL row"
+    );
 }

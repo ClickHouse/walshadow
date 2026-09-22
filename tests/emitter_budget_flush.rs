@@ -28,6 +28,7 @@ use walshadow::heap_decoder::{ColumnValue, CommittedTuple, DecodedHeap, DecodedT
 use walshadow::mapping::{ColumnMapping, TableMapping, TableTarget};
 use walshadow::pipeline::batcher::{BatcherMsg, RoutedRow};
 use walshadow::pipeline::{Fatal, tail};
+use walshadow::pos::Pos;
 use walshadow::pos::{EmitterAck, Monotone};
 use walshadow::schema::{RelAttr, RelDescriptor, RelName, ReplIdent};
 
@@ -154,7 +155,7 @@ async fn budget_trips_seal_complete_inserts() {
     };
 
     let stats = Arc::new(EmitterStats::default());
-    let emitter_ack = Arc::new(Monotone::<EmitterAck>::new(0));
+    let emitter_ack = Arc::new(Monotone::<EmitterAck>::default());
     let fatal = Fatal::new();
     let (msg_tx, ack, tail_parts) =
         tail::spawn(&cfg, 1, stats.clone(), emitter_ack.clone(), fatal.clone())
@@ -198,7 +199,7 @@ async fn budget_trips_seal_complete_inserts() {
     // The contiguous-done watermark reaches the seq's commit lsn.
     assert_eq!(
         emitter_ack.get(),
-        commit_lsn,
+        Pos::new(commit_lsn),
         "durable horizon must reach the commit lsn",
     );
 

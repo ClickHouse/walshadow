@@ -19,6 +19,7 @@ use walrus::pg::walparser::{
     RmId, X_LOG_RECORD_HEADER_SIZE, XLP_LONG_HEADER, XLP_PAGE_MAGIC_PG15, XLR_BLOCK_ID_DATA_LONG,
 };
 
+use walshadow::pos::Pos;
 use walshadow::queueing_record_sink::QueueingRecordSink;
 use walshadow::record::{CollectingSegmentSink, CountingRecordSink, Record, RecordSink, SinkError};
 use walshadow::rewrite::compute_crc;
@@ -161,7 +162,7 @@ async fn run_case(
     record_sink: &mut (dyn RecordSink + Send),
     bytes_sink: Option<Box<dyn walshadow::record::RecordBytesSink + Send>>,
 ) {
-    let mut stream = WalStream::new(1, SEG_SIZE, 0).unwrap();
+    let mut stream = WalStream::new(1, SEG_SIZE, Pos::ZERO).unwrap();
     if let Some(bs) = bytes_sink {
         stream.set_bytes_sink(bs);
     }

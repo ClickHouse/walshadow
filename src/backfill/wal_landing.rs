@@ -18,7 +18,7 @@ use anyhow::{Context, Result, bail};
 use walrus::pg::wal::segment::{SegmentName, is_wal_filename};
 
 use crate::filter::catalog_tracker::CatalogTracker;
-use crate::filter::manifest::Manifest;
+use crate::pos::Pos;
 use crate::record::{Record, RecordSink, SegmentSink, SinkError, WAL_SEG_SIZE};
 use crate::source::wal_stream::WalStream;
 
@@ -57,8 +57,12 @@ pub async fn filter_landed_wal(
         return Ok(LandedWalStats::default());
     };
 
-    let mut stream = WalStream::new(timeline, WAL_SEG_SIZE, first.start_lsn(WAL_SEG_SIZE))
-        .map_err(|e| anyhow::anyhow!("wal_landing: WalStream: {e}"))?;
+    let mut stream = WalStream::new(
+        timeline,
+        WAL_SEG_SIZE,
+        Pos::new(first.start_lsn(WAL_SEG_SIZE)),
+    )
+    .map_err(|e| anyhow::anyhow!("wal_landing: WalStream: {e}"))?;
     *stream.filter_mut().tracker_mut() = tracker;
     if let Some((rels, redo_lsn)) = shadow_rels {
         stream.filter_mut().keep_user_rels(rels, redo_lsn);
@@ -104,7 +108,9 @@ pub async fn filter_landed_wal(
             .await
             .with_context(|| format!("wal_landing: blank {}", seg.format()))?;
     }
-    sync_dir(pg_wal).await?;
+    crate::fs::fsync_dir(pg_wal)
+        .await
+        .with_context(|| format!("wal_landing: fsync {}", pg_wal.display()))?;
 
     let stats = stream.filter().stats();
     Ok(LandedWalStats {
@@ -133,6 +139,13 @@ async fn segments_on_disk(pg_wal: &Path, timeline: u32) -> Result<Vec<SegmentNam
     {
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
+        if is_rewrite_leftover(name) {
+            let path = entry.path();
+            tokio::fs::remove_file(&path)
+                .await
+                .with_context(|| format!("wal_landing: remove {}", path.display()))?;
+            continue;
+        }
         if !is_wal_filename(name) {
             continue;
         }
@@ -161,6 +174,13 @@ async fn segments_on_disk(pg_wal: &Path, timeline: u32) -> Result<Vec<SegmentNam
     Ok(found)
 }
 
+/// Temp file an interrupted [`write_segment`] left beside its segment
+fn is_rewrite_leftover(name: &str) -> bool {
+    [".tmp", ".walshadow-filtering"]
+        .iter()
+        .any(|suffix| name.strip_suffix(suffix).is_some_and(is_wal_filename))
+}
+
 async fn read_segment(dir: &Path, seg: SegmentName) -> Result<Vec<u8>> {
     let path = dir.join(seg.format());
     let bytes = tokio::fs::read(&path)
@@ -176,26 +196,9 @@ async fn read_segment(dir: &Path, seg: SegmentName) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-/// Replaces a segment through a sibling temp file: a crash mid-write must not
-/// leave the shadow a half-rewritten segment it would then replay.
+/// A crash mid-write must not leave shadow a half-rewritten segment to replay
 async fn write_segment(dir: &Path, seg: SegmentName, bytes: &[u8]) -> std::io::Result<()> {
-    let name = seg.format();
-    let tmp = dir.join(format!("{name}.walshadow-filtering"));
-    let mut f = tokio::fs::File::create(&tmp).await?;
-    tokio::io::AsyncWriteExt::write_all(&mut f, bytes).await?;
-    f.sync_all().await?;
-    drop(f);
-    tokio::fs::rename(&tmp, dir.join(&name)).await
-}
-
-async fn sync_dir(dir: &Path) -> Result<()> {
-    let handle = tokio::fs::File::open(dir)
-        .await
-        .with_context(|| format!("wal_landing: open {}", dir.display()))?;
-    handle
-        .sync_all()
-        .await
-        .with_context(|| format!("wal_landing: fsync {}", dir.display()))
+    crate::fs::write_atomic(dir, &seg.format(), bytes).await
 }
 
 struct DropRecords;
@@ -219,7 +222,6 @@ impl SegmentSink for WriteBack {
         &'a mut self,
         seg: SegmentName,
         bytes: &'a [u8],
-        _manifest: &'a Manifest,
     ) -> Pin<Box<dyn Future<Output = std::result::Result<(), SinkError>> + Send + 'a>> {
         Box::pin(async move {
             write_segment(&self.dir, seg, bytes).await?;
@@ -291,6 +293,27 @@ mod tests {
 
         let got = segments_on_disk(tmp.path(), 1).await.unwrap();
         assert_eq!(got, vec![seg(1), seg(2), seg(3)]);
+    }
+
+    #[tokio::test]
+    async fn scan_removes_interrupted_rewrites() {
+        let tmp = tempfile::tempdir().unwrap();
+        touch(tmp.path(), &seg(1).format()).await;
+        let leftovers = [
+            format!("{}.tmp", seg(1).format()),
+            format!("{}.walshadow-filtering", seg(2).format()),
+        ];
+        for name in &leftovers {
+            touch(tmp.path(), name).await;
+        }
+        touch(tmp.path(), "keep.tmp").await;
+
+        let got = segments_on_disk(tmp.path(), 1).await.unwrap();
+        assert_eq!(got, vec![seg(1)]);
+        for name in &leftovers {
+            assert!(!tmp.path().join(name).exists(), "{name} survived");
+        }
+        assert!(tmp.path().join("keep.tmp").exists());
     }
 
     #[tokio::test]

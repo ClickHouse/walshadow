@@ -8,8 +8,8 @@
 //! and controls in original order with the event-before-heap tie break;
 //! any planning error drops the writer and the file unlinks, so the
 //! transaction emits nothing. Files are transient and source-WAL
-//! reconstructible: never durable, removed at startup by
-//! [`clean_plan_files`] via the spill-dir clear.
+//! reconstructible: never durable, live in xact scratch dir wiped at
+//! startup.
 //!
 //! Frame layout after the 4-byte `magic + version` header:
 //! `[len:u32][crc32c:u32][body]`, body tag 0 = heap
@@ -35,8 +35,6 @@ use ahash::{HashMap, HashMapExt};
 /// ASCII for `xxd`-friendly debug
 pub const PLAN_MAGIC: [u8; 2] = *b"WP";
 pub const PLAN_VERSION: u16 = 1;
-/// Spool file suffix, startup-cleanup key
-pub const PLAN_SUFFIX: &str = ".plan";
 
 /// Plans at or below this stay memory-resident: the common
 /// single-statement commit never touches the filesystem. Larger plans
@@ -505,28 +503,6 @@ fn read_or_unsealed(r: &mut impl Read, buf: &mut [u8]) -> Result<()> {
     })
 }
 
-/// Startup cleanup: plans are transient, any survivor is a crash leftover.
-/// Returns removed count
-pub fn clean_plan_files(dir: &Path) -> std::io::Result<u64> {
-    let entries = match fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
-        Err(e) => return Err(e),
-    };
-    let mut removed = 0;
-    for entry in entries {
-        let p = entry?.path();
-        if p.file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|s| s.ends_with(PLAN_SUFFIX))
-        {
-            fs::remove_file(&p)?;
-            removed += 1;
-        }
-    }
-    Ok(removed)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -803,16 +779,5 @@ mod tests {
         assert!(matches!(err, PlanSpoolError::DiskBudget { .. }), "{err}");
         drop(w);
         assert!(!path.exists(), "abandoned plan unlinks");
-    }
-
-    #[test]
-    fn cleanup_removes_only_plan_files() {
-        let tmp = tempfile::tempdir().unwrap();
-        for name in ["1.plan", "2.plan", "xid-3.bin"] {
-            fs::write(tmp.path().join(name), b"x").unwrap();
-        }
-        assert_eq!(clean_plan_files(tmp.path()).unwrap(), 2);
-        assert!(tmp.path().join("xid-3.bin").exists());
-        assert_eq!(clean_plan_files(&tmp.path().join("absent")).unwrap(), 0);
     }
 }

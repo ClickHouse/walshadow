@@ -93,6 +93,10 @@ insert batch
 - `copy`, selected by default by `init`, scans selected table through PostgreSQL
   SQL path, source account must be able to read every row
   Rows hidden by row security are skipped without an error
+- `copy` in `clickhouse` value mode also copies the table's TOAST heap, needing
+  `pg_read_all_data` at source; a live selection holds streaming at the
+  selection point until it finishes. COPY falling back from a backup load
+  copies it later, so updates between can store NULL for unchanged large values
 - `base_backup` transfers cluster-sized backup even for one table
 - `object_store` requires full wal-g backup and continuous archived WAL, including archived
   timeline history, to selection point

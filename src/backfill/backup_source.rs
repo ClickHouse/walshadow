@@ -385,7 +385,7 @@ where
                 .open(&target)
                 .await?;
             tokio::io::copy(body, &mut f).await?;
-            f.sync_data().await.ok();
+            f.sync_data().await?;
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;

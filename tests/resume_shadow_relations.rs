@@ -9,6 +9,7 @@ use std::time::Duration;
 use walrus::pg::wal::segment::SegmentName;
 use walshadow::backfill::{pg_path, wal_landing};
 use walshadow::filter::catalog_tracker::CatalogTracker;
+use walshadow::pos::Pos;
 use walshadow::record::{CollectingRecordSink, Route, WAL_SEG_SIZE};
 use walshadow::segment_sink::DirSegmentSink;
 use walshadow::shadow::{Shadow, ShadowConfig};
@@ -124,7 +125,7 @@ async fn retained_routes_prevent_invalid_page_recovery_after_resume() {
     };
     let bytes = fs::read(raw.join(seg.format())).unwrap();
     for (sh, durable) in [(&bad, false), (&good, true)] {
-        let mut stream = WalStream::new(1, WAL_SEG_SIZE, resume).unwrap();
+        let mut stream = WalStream::new(1, WAL_SEG_SIZE, Pos::new(resume)).unwrap();
         if durable {
             stream
                 .filter_mut()

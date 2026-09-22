@@ -342,7 +342,7 @@ async fn commit_drains_in_arrival_order_and_clears_state() {
     assert_eq!(seen[0].commit_lsn, 300);
     assert_eq!(seen[1].commit_lsn, 300);
     assert_eq!(b.stats().committed_xacts_total, 1);
-    assert_eq!(b.stats().drain_lsn, 300);
+    assert_eq!(b.stats().drain_lsn, Pos::new(300));
 }
 
 /// Admission: a user record flagged `defer_catalog_decode` enters raw
@@ -462,7 +462,7 @@ async fn commit_unknown_xid_no_ops() {
     );
     drain.finish().await.unwrap();
     assert_eq!(b.stats().commits_unknown_xid, 1);
-    assert_eq!(b.stats().drain_lsn, 0x9000);
+    assert_eq!(b.stats().drain_lsn, Pos::new(0x9000));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -715,7 +715,7 @@ async fn abort_drops_xact_and_unlinks_spill_against_real_shadow() {
     }
     assert!(b.stats().spill_xacts_active >= 1);
     b.abort(11, Pos::new(200), &[]).await.unwrap();
-    let leftover: Vec<_> = std::fs::read_dir(&spill_dir)
+    let leftover: Vec<_> = std::fs::read_dir(walshadow::fs::scratch_dir(&spill_dir))
         .unwrap()
         .filter_map(|e| e.ok())
         .filter(|e| e.file_name().to_string_lossy().starts_with("xid-"))

@@ -103,10 +103,9 @@ impl CatalogBoundaryGate {
     pub async fn hold(
         &self,
         commit_lsn: u64,
-        next_lsn: impl Into<Pos<ShadowReplay>>,
+        next_lsn: Pos<ShadowReplay>,
         worker_alive: impl Fn() -> bool,
     ) -> Result<(), SinkError> {
-        let next_lsn = next_lsn.into();
         let applied = self.state.lock().await.applied();
         let start = Instant::now();
         let held = loop {
@@ -337,10 +336,14 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(20)).await;
                 // apply == next_lsn exactly must release (replay reports
                 // EndRecPtr, not last wire byte)
-                s.lock().await.observe_status(id, 0x2000, 0x2000, 0x2000);
+                s.lock()
+                    .await
+                    .observe_status(id, 0x2000, Pos::new(0x2000), Pos::new(0x2000));
             }
         });
-        gate.hold(0x1F00, 0x2000, || true).await.expect("released");
+        gate.hold(0x1F00, Pos::new(0x2000), || true)
+            .await
+            .expect("released");
         waiter.await.unwrap();
         assert_eq!(gate.stats.holds.load(Ordering::Relaxed), 1);
         assert_eq!(gate.stats.failures.load(Ordering::Relaxed), 0);
@@ -367,11 +370,15 @@ mod tests {
             let s = s.clone();
             async move {
                 tokio::time::sleep(Duration::from_millis(20)).await;
-                s.lock().await.observe_status(id, 0x2000, 0x2000, 0x2000);
+                s.lock()
+                    .await
+                    .observe_status(id, 0x2000, Pos::new(0x2000), Pos::new(0x2000));
             }
         });
         let started = Instant::now();
-        gate.hold(0x1F00, 0x2000, || true).await.expect("released");
+        gate.hold(0x1F00, Pos::new(0x2000), || true)
+            .await
+            .expect("released");
         waiter.await.unwrap();
         assert!(
             started.elapsed() < Duration::from_secs(1),
@@ -398,14 +405,21 @@ mod tests {
                         // 'd' + u32 len + 'k' + wal_end(8) + time(8) + reply(1)
                         assert_eq!(bytes[5], b'k');
                         assert_eq!(*bytes.last().unwrap(), 1, "reply requested");
-                        s.lock().await.observe_status(id, 0x3000, 0x3000, 0x3000);
+                        s.lock().await.observe_status(
+                            id,
+                            0x3000,
+                            Pos::new(0x3000),
+                            Pos::new(0x3000),
+                        );
                         return;
                     }
                     tokio::time::sleep(Duration::from_millis(1)).await;
                 }
             }
         });
-        gate.hold(0x2F00, 0x3000, || true).await.expect("released");
+        gate.hold(0x2F00, Pos::new(0x3000), || true)
+            .await
+            .expect("released");
         prodded.await.unwrap();
     }
 
@@ -415,7 +429,7 @@ mod tests {
         let _ = s.lock().await.register_connection(0x1000, 1, None);
         let gate = gate_with(s.clone(), Duration::from_millis(20));
         let err = gate
-            .hold(0x1F00, 0x2000, || true)
+            .hold(0x1F00, Pos::new(0x2000), || true)
             .await
             .expect_err("must time out");
         assert!(err.to_string().contains("timed out"), "{err}");
@@ -428,7 +442,7 @@ mod tests {
         // comes, deadline fails the boundary
         let gate = gate_with(state(), Duration::from_millis(20));
         let err = gate
-            .hold(0x1F00, 0x2000, || true)
+            .hold(0x1F00, Pos::new(0x2000), || true)
             .await
             .expect_err("must time out");
         assert!(err.to_string().contains("0 walreceiver"), "{err}");
@@ -449,10 +463,14 @@ mod tests {
                     .await
                     .register_connection(0x1000, 1, None)
                     .expect("current timeline");
-                s.lock().await.observe_status(id, 0x2000, 0x2000, 0x2000);
+                s.lock()
+                    .await
+                    .observe_status(id, 0x2000, Pos::new(0x2000), Pos::new(0x2000));
             }
         });
-        gate.hold(0x1F00, 0x2000, || true).await.expect("released");
+        gate.hold(0x1F00, Pos::new(0x2000), || true)
+            .await
+            .expect("released");
         attach.await.unwrap();
     }
 
@@ -462,7 +480,7 @@ mod tests {
         let _ = s.lock().await.register_connection(0x1000, 1, None);
         let gate = gate_with(s, Duration::from_secs(30));
         let err = gate
-            .hold(0x1F00, 0x2000, || false)
+            .hold(0x1F00, Pos::new(0x2000), || false)
             .await
             .expect_err("dead worker must fail the hold");
         assert!(err.to_string().contains("worker terminated"), "{err}");
@@ -566,7 +584,9 @@ mod tests {
             let s = s.clone();
             async move {
                 tokio::time::sleep(Duration::from_millis(20)).await;
-                s.lock().await.observe_status(id, 0x2000, 0x2000, 0x2000);
+                s.lock()
+                    .await
+                    .observe_status(id, 0x2000, Pos::new(0x2000), Pos::new(0x2000));
             }
         });
         let rec = Record {

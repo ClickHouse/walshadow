@@ -346,8 +346,10 @@ async fn bench_drain(shape: Shape) -> Report {
     }
     let routes = Arc::new(tables.into_iter().collect());
 
-    let (msg_tx, ack, tail) =
-        walshadow::pipeline::tail::spawn_null(Arc::new(Monotone::<EmitterAck>::new(0)));
+    let (msg_tx, ack, tail) = walshadow::pipeline::tail::spawn_null(
+        Arc::new(Monotone::<EmitterAck>::default()),
+        walshadow::pipeline::Fatal::new(),
+    );
     let (tup_tx, tup_rx) = tokio::sync::mpsc::channel::<Vec<BackfillTuple>>(16);
 
     let per_rel = shape.pages_per_segment as u64 * shape.tuples_per_page as u64;

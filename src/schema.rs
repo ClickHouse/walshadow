@@ -177,8 +177,10 @@ pub struct RelAttr {
     pub missing_default: Option<MissingDefault>,
 }
 
-/// Fast default (`attmissingval`): raw on-disk bytes from the pinned worker, or
-/// `anyarray_out` text from the SQL path. Decoded by `missing_value_for`.
+/// Fast default (`attmissingval`), decoded by `missing_value_for`. Shadow
+/// catalog reads yield `Raw` on-disk bytes; `Text` (element's `anyarray_out`
+/// form) comes from source-PG SQL, which has no way to the bytes, oracle
+/// rendered DDL defaults, and descriptor logs older than raw shadow reads
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MissingDefault {
     Raw(Vec<u8>),

@@ -119,12 +119,13 @@ pub struct OwnedTail {
 impl OwnedTail {
     #[cfg(test)]
     pub(crate) fn null() -> Self {
-        let (msg_tx, ack, parts) = spawn_null(Arc::new(Monotone::new(0)));
+        let fatal = Fatal::new();
+        let (msg_tx, ack, parts) = spawn_null(Arc::new(Monotone::default()), fatal.clone());
         Self {
             msg_tx,
             ack,
             parts,
-            fatal: Fatal::new(),
+            fatal,
             context: "test",
         }
     }
@@ -142,7 +143,7 @@ impl OwnedTail {
             emitter,
             inserter_pool_size,
             stats,
-            Arc::new(Monotone::<EmitterAck>::new(0)),
+            Arc::new(Monotone::<EmitterAck>::default()),
             fatal.clone(),
             config_rx,
             oracle,
@@ -216,8 +217,9 @@ pub async fn spawn(
 /// identical to the CH tail, so reorder/decode stages run unchanged.
 pub fn spawn_null(
     emitter_ack: Arc<Monotone<EmitterAck>>,
+    fatal: Fatal,
 ) -> (mpsc::Sender<BatcherMsg>, AckHandle, TailParts) {
-    let (ack, collector) = ack::spawn(emitter_ack);
+    let (ack, collector) = ack::spawn(emitter_ack, fatal);
     let collector = AbortOnDropHandle::new(collector);
     let (msg_tx, mut msg_rx) = mpsc::channel::<BatcherMsg>(256);
     let swallow_ack = ack.clone();
@@ -264,7 +266,7 @@ pub async fn spawn_with_config(
 ) -> Result<(mpsc::Sender<BatcherMsg>, AckHandle, TailParts), EmitterError> {
     let n = inserter_pool_size.max(1);
 
-    let (ack, collector) = ack::spawn(emitter_ack);
+    let (ack, collector) = ack::spawn(emitter_ack, fatal.clone());
     let collector = AbortOnDropHandle::new(collector);
 
     // Rows and FlushAll share one FIFO channel so a flush can't overtake rows
@@ -341,7 +343,7 @@ mod tests {
 
     #[tokio::test]
     async fn dropped_tail_closes_workers_with_live_producers() {
-        let (tx, ack, parts) = spawn_null(Arc::new(Monotone::new(0)));
+        let (tx, ack, parts) = spawn_null(Arc::new(Monotone::default()), Fatal::new());
         drop(parts);
         tokio::time::timeout(std::time::Duration::from_secs(1), tx.closed())
             .await

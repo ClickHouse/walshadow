@@ -118,7 +118,10 @@ async fn open_catalog(sh: &Shadow, bridge: Arc<Bridge>) -> ShadowCatalog {
 /// every committed read it serves answers off the mirroring statement — what a
 /// standby away from a publication hold looks like
 async fn open_mirror_catalog(sh: &Shadow, sock: &Path) -> (Arc<Bridge>, ShadowCatalog) {
-    spawn_moving_worker(tokio::net::UnixListener::bind(sock).expect("bind stand-in"));
+    spawn_moving_worker(
+        tokio::net::UnixListener::bind(sock).expect("bind stand-in"),
+        sh.bridge_socket().expect("bridge configured").to_path_buf(),
+    );
     let bridge = Arc::new(
         walshadow::bridge::connect_with_budget(sock, 1, Duration::from_secs(5))
             .await
@@ -834,6 +837,8 @@ async fn bridge_overlay_descriptors_track_open_ddl() {
              -- must render the same way
              CREATE TABLE app.m (id int, gone text);
              ALTER TABLE app.m ADD COLUMN v numeric[] DEFAULT '{1.5}';
+             ALTER TABLE app.m ADD COLUMN at timestamp DEFAULT '2024-01-02 03:04:05';
+             ALTER TABLE app.m ADD COLUMN ok bool DEFAULT 'yes';
              ALTER TABLE app.m DROP COLUMN gone;",
         )
         .await
@@ -850,30 +855,13 @@ async fn bridge_overlay_descriptors_track_open_ddl() {
         .expect("mirroring statement");
     assert_eq!(stated, committed, "statement diverged from the worker");
     assert_eq!(mirror.stats().mirror_fetches, 1);
-    // Compare fast defaults by value: worker ships raw bytes, mirror text.
-    let canon = |(_, mut descs): (u64, Vec<walshadow::schema::RelDescriptor>)| {
+    let sorted = |(_, mut descs): (u64, Vec<walshadow::schema::RelDescriptor>)| {
         descs.sort_by_key(|d| d.oid);
-        for d in &mut descs {
-            for a in &mut d.attributes {
-                if a.missing_default.is_some() {
-                    let key = match walshadow::heap_decoder::missing_value_for(a) {
-                        walshadow::heap_decoder::ColumnValue::PgPending { type_oid, .. }
-                        | walshadow::heap_decoder::ColumnValue::PgPendingText {
-                            type_oid, ..
-                        } => {
-                            format!("pending:{type_oid}")
-                        }
-                        other => format!("{other:?}"),
-                    };
-                    a.missing_default = Some(walshadow::schema::MissingDefault::Text(key));
-                }
-            }
-        }
         descs
     };
     assert_eq!(
-        mirror.fetch_all_descriptors().await.map(canon).unwrap(),
-        cat.fetch_all_descriptors().await.map(canon).unwrap(),
+        mirror.fetch_all_descriptors().await.map(sorted).unwrap(),
+        cat.fetch_all_descriptors().await.map(sorted).unwrap(),
         "statement and worker disagree on the eligible set",
     );
 
@@ -1087,49 +1075,52 @@ async fn bridge_fetch_toast_refuses_malformed_frames() {
     assert_eq!(read_frame(&mut raw)[0], 0);
 }
 
-/// Worker stand-in that answers `HELLO` honestly and then reports a replay
-/// position that moved inside the scan. Real movement wants a live standby
-/// mid-stream; the daemon-side branch is the same either way.
-fn spawn_moving_worker(listener: tokio::net::UnixListener) {
+/// Worker stand-in that relays to `upstream` and reports every scan's replay
+/// position as having moved inside it. A scan the caller pinned gets no rows,
+/// as its boundary is not one the real worker ever sat at. Real movement wants
+/// a live standby mid-stream; the daemon-side branch is the same either way.
+fn spawn_moving_worker(listener: tokio::net::UnixListener, upstream: PathBuf) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     tokio::spawn(async move {
         while let Ok((mut sock, _)) = listener.accept().await {
+            let mut up = tokio::net::UnixStream::connect(&upstream)
+                .await
+                .expect("dial upstream worker");
             loop {
                 let mut hdr = [0u8; 4];
-                if tokio::io::AsyncReadExt::read_exact(&mut sock, &mut hdr)
-                    .await
-                    .is_err()
-                {
+                if sock.read_exact(&mut hdr).await.is_err() {
                     break;
                 }
                 let mut req = vec![0u8; u32::from_be_bytes(hdr) as usize];
-                if tokio::io::AsyncReadExt::read_exact(&mut sock, &mut req)
-                    .await
-                    .is_err()
-                {
+                if sock.read_exact(&mut req).await.is_err() {
                     break;
                 }
-                let mut body = vec![0u8];
-                if req.first() == Some(&0x01) {
-                    body.extend_from_slice(&PROTO_VERSION.to_be_bytes());
-                    body.extend_from_slice(&PROJECTION_VERSION.to_be_bytes());
-                    body.extend_from_slice(&170_000u32.to_be_bytes());
-                    body.push(1);
-                    body.extend_from_slice(&16_384u32.to_be_bytes());
-                } else {
+                let scan = req.first() == Some(&0x03);
+                let body = if scan && req.get(6..14).is_some_and(|b| b != [0; 8]) {
                     // No rows, and the two positions disagree
+                    let mut body = vec![0u8];
                     body.extend_from_slice(&0x1000u64.to_be_bytes());
                     body.extend_from_slice(&0x2000u64.to_be_bytes());
                     for _ in 0..3 {
                         body.extend_from_slice(&0u32.to_be_bytes());
                     }
                     body.extend_from_slice(&(Catalog::Class.ncols() as u16).to_be_bytes());
-                }
+                    body
+                } else {
+                    up.write_all(&hdr).await.expect("relay header");
+                    up.write_all(&req).await.expect("relay request");
+                    up.read_exact(&mut hdr).await.expect("relay answer header");
+                    let mut body = vec![0u8; u32::from_be_bytes(hdr) as usize];
+                    up.read_exact(&mut body).await.expect("relay answer");
+                    if scan && body.first() == Some(&0) {
+                        body[1..9].copy_from_slice(&0x1000u64.to_be_bytes());
+                        body[9..17].copy_from_slice(&0x2000u64.to_be_bytes());
+                    }
+                    body
+                };
                 let mut frame = (body.len() as u32).to_be_bytes().to_vec();
                 frame.extend_from_slice(&body);
-                if tokio::io::AsyncWriteExt::write_all(&mut sock, &frame)
-                    .await
-                    .is_err()
-                {
+                if sock.write_all(&frame).await.is_err() {
                     break;
                 }
             }

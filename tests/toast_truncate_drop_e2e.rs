@@ -458,6 +458,11 @@ async fn drop_retire_survives_restart_from_ledger() {
     // next boot's resume head past the drop segment; the stop right after
     // is the window — no later commit ever enters flush_due_retires.
     let mut pipeline = build(shadow_stream_state.clone(), "walshadow-toast-ledger-1").await;
+    let system_id: u64 = source
+        .psql_one("SELECT system_identifier FROM pg_control_system()")
+        .expect("source system id")
+        .parse()
+        .expect("numeric system id");
     let driver = fx::spawn_workload(
         &source,
         vec![
@@ -496,7 +501,7 @@ async fn drop_retire_survives_restart_from_ledger() {
     pipeline.shutdown().await.expect("first pipeline drains");
     assert_eq!(stats.toast_mirror_retires.load(Ordering::Relaxed), 0);
     assert_eq!(
-        walshadow::toast_retire::RetireLedger::load(&spill_dir)
+        walshadow::toast_retire::RetireLedger::load(&spill_dir, system_id)
             .await
             .expect("read ledger")
             .entries()
@@ -527,7 +532,7 @@ async fn drop_retire_survives_restart_from_ledger() {
         1
     );
     assert!(
-        walshadow::toast_retire::RetireLedger::load(&spill_dir)
+        walshadow::toast_retire::RetireLedger::load(&spill_dir, system_id)
             .await
             .expect("read ledger")
             .is_empty(),

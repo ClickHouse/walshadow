@@ -9,6 +9,7 @@
 
 use std::path::PathBuf;
 
+use walshadow::pos::Pos;
 use walshadow::record::{CollectingRecordSink, CollectingSegmentSink, Record};
 use walshadow::shadow_stream::{ShadowStreamSink, ShadowStreamState};
 use walshadow::wal_stream::WalStream;
@@ -58,7 +59,7 @@ fn key(r: &Record) -> RecordKey {
 }
 
 async fn run_with_chunk_sizes(bytes: &[u8], seg_size: u64, chunks: &[usize]) -> Vec<RecordKey> {
-    let mut stream = WalStream::new(1, seg_size, 0).expect("stream new");
+    let mut stream = WalStream::new(1, seg_size, Pos::ZERO).expect("stream new");
     let mut recs = CollectingRecordSink::default();
     let mut segs = CollectingSegmentSink::default();
     let mut lsn = 0u64;
@@ -116,7 +117,7 @@ async fn bulk_and_chunked_emit_identical_segment_bytes() {
     let bytes = load_segment(&path).await.expect("load fixture");
     let seg_size = bytes.len() as u64;
 
-    let mut stream_bulk = WalStream::new(1, seg_size, 0).unwrap();
+    let mut stream_bulk = WalStream::new(1, seg_size, Pos::ZERO).unwrap();
     let mut rec_bulk = CollectingRecordSink::default();
     let mut seg_bulk = CollectingSegmentSink::default();
     stream_bulk
@@ -124,7 +125,7 @@ async fn bulk_and_chunked_emit_identical_segment_bytes() {
         .await
         .expect("bulk push");
 
-    let mut stream_chunked = WalStream::new(1, seg_size, 0).unwrap();
+    let mut stream_chunked = WalStream::new(1, seg_size, Pos::ZERO).unwrap();
     let mut rec_chunked = CollectingRecordSink::default();
     let mut seg_chunked = CollectingSegmentSink::default();
     for (i, b) in bytes.iter().enumerate() {
@@ -141,13 +142,13 @@ async fn bulk_and_chunked_emit_identical_segment_bytes() {
 
     assert_eq!(seg_bulk.segments.len(), 1);
     assert_eq!(seg_chunked.segments.len(), 1);
-    let (_, bulk_bytes, bulk_mani) = &seg_bulk.segments[0];
-    let (_, chunked_bytes, chunked_mani) = &seg_chunked.segments[0];
+    let (_, bulk_bytes) = &seg_bulk.segments[0];
+    let (_, chunked_bytes) = &seg_chunked.segments[0];
     assert_eq!(bulk_bytes, chunked_bytes, "segment bytes diverged");
     assert_eq!(
-        bulk_mani.records.len(),
-        chunked_mani.records.len(),
-        "manifest record counts diverged",
+        rec_bulk.records.len(),
+        rec_chunked.records.len(),
+        "record counts diverged",
     );
 }
 
@@ -167,7 +168,7 @@ async fn shadow_stream_sink_receives_byte_exact_wire_stream() {
     let bytes = load_segment(&path).await.expect("load fixture");
     let seg_size = bytes.len() as u64;
 
-    let mut stream = WalStream::new(1, seg_size, 0).expect("stream new");
+    let mut stream = WalStream::new(1, seg_size, Pos::ZERO).expect("stream new");
     let mut rec_sink = CollectingRecordSink::default();
     let mut seg_sink = CollectingSegmentSink::default();
 
@@ -210,7 +211,7 @@ async fn shadow_stream_sink_receives_byte_exact_wire_stream() {
         .drain_send_queue(conn)
         .unwrap_or_default();
     let reconstructed = strip_wal_frames(&queued);
-    let (_, seg_bytes, _) = &seg_sink.segments[0];
+    let (_, seg_bytes) = &seg_sink.segments[0];
     assert_eq!(
         reconstructed.len(),
         seg_bytes.len(),

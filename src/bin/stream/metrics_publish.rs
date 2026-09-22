@@ -3,6 +3,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 use walshadow::backfill_bootstrap::BootstrapProgress;
 use walshadow::boundary_hold::BoundaryHoldStats;
@@ -15,7 +16,7 @@ use walshadow::pos::{
 use walshadow::record::MetricsRecordSink;
 use walshadow::transition::{CrossingWedge, TimelineStats};
 
-use crate::source_recovery::PromotionGate;
+use crate::source_recovery::{PromotionGate, SOURCE_SWAP_RETRY};
 
 /// Shadow-side numbers for the metrics publish step, from
 /// [`ShadowStreamState::aggregate`](walshadow::shadow_stream::ShadowStreamState::aggregate)
@@ -27,14 +28,40 @@ pub(crate) struct ShadowMetricsView {
     pub(crate) dropped_total: u64,
 }
 
-/// Live `[source]` endpoint moves, from the pump's swap state.
-pub(crate) struct SourceSwapView {
-    pub(crate) swaps: u64,
-    pub(crate) failures: u64,
+/// Live `[source]` endpoint moves the pump has yet to reach
+#[derive(Default)]
+pub(crate) struct SourceSwap {
     /// Config names an endpoint the pump has not reached yet
     pub(crate) pending: bool,
+    pub(crate) retry_at: Option<Instant>,
+    pub(crate) swaps: u64,
+    pub(crate) failures: u64,
     /// Proof the last attempt failed on, empty once one lands
     pub(crate) blocked_on: &'static str,
+}
+
+impl SourceSwap {
+    pub(crate) fn requested(&mut self) {
+        self.pending = true;
+        self.retry_at = None;
+    }
+
+    pub(crate) fn due(&self, now: Instant) -> bool {
+        self.pending && self.retry_at.is_none_or(|at| now >= at)
+    }
+
+    pub(crate) fn failed(&mut self, reason: &'static str) {
+        self.failures += 1;
+        self.retry_at = Some(Instant::now() + SOURCE_SWAP_RETRY);
+        self.blocked_on = reason;
+    }
+
+    /// A fresh feed dialed the live endpoint, nothing left to swap
+    pub(crate) fn settled(&mut self) {
+        self.pending = false;
+        self.retry_at = None;
+        self.blocked_on = "";
+    }
 }
 
 /// Branch selection plus the frozen pause frontier — everything a switchover
@@ -223,7 +250,7 @@ pub(crate) async fn populate_metrics(
     drain_resident: DrainResident,
     budget: Option<&walshadow::budget::MemoryBudget>,
     decoder_stats: &walshadow::decoder_sink::DecoderStats,
-    source_swap: SourceSwapView,
+    source_swap: &SourceSwap,
     timeline_view: TimelineView,
     shadow_view: ShadowMetricsView,
     boundary_hold: &BoundaryHoldStats,

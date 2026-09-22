@@ -2,9 +2,10 @@
 //!
 //! Bootstrap and backup gates defer tuples until walk EOF; count is not a
 //! memory bound, so past a byte threshold records append to a versioned
-//! file and replay sequentially. Files are disposable derived state
-//! ([`crate::xact::spill`] crash-recovery contract): no fsync, startup wipe safe,
-//! failure leaves replay covered by the WAL cursor.
+//! file and replay sequentially. Records stay unsynced until
+//! [`DeferredSpool::checkpoint`], which fsyncs them for a resumed load; a
+//! spool no checkpoint names is disposable derived state
+//! ([`crate::xact::spill`] crash-recovery contract)
 //!
 //! ```text
 //! [2 bytes "WD" magic] [u16 LE version] then repeating:
@@ -124,7 +125,8 @@ impl DeferredSpool {
     }
 
     async fn create_and_flush_prefix(&mut self) -> Result<()> {
-        if let Some(parent) = self.path.parent() {
+        let parent = self.path.parent().filter(|p| !p.as_os_str().is_empty());
+        if let Some(parent) = parent {
             tokio::fs::create_dir_all(parent).await?;
         }
         let file = OpenOptions::new()
@@ -132,6 +134,8 @@ impl DeferredSpool {
             .create_new(true)
             .open(&self.path)
             .await?;
+        // Checkpoint names this file, so its directory entry must survive
+        crate::fs::fsync_dir(parent.unwrap_or(std::path::Path::new("."))).await?;
         self.buf.extend_from_slice(&SPOOL_MAGIC);
         push_u16(&mut self.buf, SPOOL_VERSION);
         self.file = Some(file);

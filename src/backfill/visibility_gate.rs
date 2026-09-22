@@ -717,7 +717,10 @@ mod tests {
             scratch_dir: tmp.path().to_path_buf(),
             inherit_spools: Vec::new(),
         };
-        let (ack, ack_task) = crate::emit::pipeline::ack::spawn(Arc::new(Default::default()));
+        let (ack, ack_task) = crate::emit::pipeline::ack::spawn(
+            Arc::new(Default::default()),
+            crate::emit::pipeline::Fatal::new(),
+        );
         let (msg_tx, _msg_rx) = mpsc::channel(1);
         let (mut txs, mut lanes) = sink
             .spawn(
@@ -788,7 +791,10 @@ mod tests {
         let mut tails = Vec::new();
         let mut lanes = Vec::new();
         for (i, first_seq) in [3u64, 7].into_iter().enumerate() {
-            let (ack, ack_task) = crate::emit::pipeline::ack::spawn(Arc::new(Default::default()));
+            let (ack, ack_task) = crate::emit::pipeline::ack::spawn(
+                Arc::new(Default::default()),
+                crate::emit::pipeline::Fatal::new(),
+            );
             let (msg_tx, msg_rx) = mpsc::channel(16);
             lanes.push(DeferredLane {
                 spool: spool_at(&format!("lane-{i}"), vec![row(i as i32), row(9)]).await,

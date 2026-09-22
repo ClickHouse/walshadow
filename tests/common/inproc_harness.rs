@@ -43,7 +43,7 @@ use walshadow::mapping::{
 use walshadow::pg::socket_conninfo;
 use walshadow::pipeline::reorder::ReorderSink;
 use walshadow::pipeline::{PipelineConfig, PipelineHandle, TailKind};
-use walshadow::pos::{EmitterAck, Floor, Monotone};
+use walshadow::pos::{EmitterAck, Floor, Monotone, Pos};
 use walshadow::record::{
     BoundaryKind, MetricsRecordSink, Record, RecordSink, SinkError, WAL_SEG_SIZE,
 };
@@ -727,7 +727,7 @@ async fn build_pipeline_inner(
         .with_status_interval(Duration::from_millis(500));
     let ident = feed.identify_system().await.expect("IDENTIFY_SYSTEM");
     let aligned = WalStream::align_down(ident.xlogpos, WAL_SEG_SIZE);
-    let mut stream = WalStream::new(ident.timeline, WAL_SEG_SIZE, aligned).unwrap();
+    let mut stream = WalStream::new(ident.timeline, WAL_SEG_SIZE, Pos::new(aligned)).unwrap();
     stream.set_bytes_sink(Box::new(walshadow::shadow_stream::ShadowStreamSink::new(
         shadow_stream_state,
     )));
@@ -916,19 +916,24 @@ async fn build_pipeline_inner(
         .with_resolver(config_resolver.clone())
         .with_oracle(oracle.clone());
     let stats = Arc::new(EmitterStats::default());
-    let emitter_ack = Arc::new(Monotone::<EmitterAck>::new(0));
+    let emitter_ack = Arc::new(Monotone::<EmitterAck>::default());
     // Aligned boot head stands in for the daemon's resolved floor (a
     // rebuilt harness re-reads from the segment start, like a daemon
     // restart): retires queued by this run defer until a test advances
     // the floor; ledger entries below a prior run's segment are due and
     // retire in the boot flush below.
-    let resume_floor = Arc::new(Monotone::<Floor>::new(WalStream::align_down(
+    let resume_floor = Arc::new(Monotone::<Floor>::new(Pos::new(WalStream::align_down(
         ident.xlogpos,
         WAL_SEG_SIZE,
-    )));
-    let retires = walshadow::toast_retire::RetireLedger::load(&spill_dir)
+    ))));
+    let system_id: u64 = ident.sysid.parse().expect("sysid");
+    let retires = walshadow::toast_retire::RetireLedger::load(&spill_dir, system_id)
         .await
         .expect("load toast retire ledger");
+    let pending_rows = walshadow::visibility_pending::PendingLedger::load(&spill_dir, system_id)
+        .await
+        .expect("load pending visibility ledger")
+        .shared();
     // COPY backfiller (`initial_load='copy'` opt-ins): own source SQL session +
     // CH tail per backfill, resume ledger beside the spill dir (mirrors
     // bin/stream/runtime_cfg.rs when `[runtime_config] schema` is set).
@@ -951,8 +956,11 @@ async fn build_pipeline_inner(
                     None,
                     oracle.clone(),
                     (feed.server_version_num() / 10000) as u32,
+                    system_id,
+                    pending_rows.clone(),
                 )
-                .await,
+                .await
+                .expect("load backfill ledger"),
             ))
         } else {
             None
@@ -983,9 +991,7 @@ async fn build_pipeline_inner(
         span_registry: None,
         backfillers: backfiller.map(|b| (shadow_db_oid, b)).into_iter().collect(),
         retires,
-        pending_rows: walshadow::visibility_pending::PendingLedger::load(&spill_dir)
-            .await
-            .expect("load pending visibility ledger"),
+        pending_rows,
         resume_floor: resume_floor.clone(),
         budget: None,
     };

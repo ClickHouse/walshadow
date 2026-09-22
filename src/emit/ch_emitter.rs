@@ -84,7 +84,7 @@ pub(crate) const DEFAULT_PLAN_DISK_MAX: u64 = 8 << 30; // 8 GiB
 /// serial emitter's close-on-every-xact behaviour (bootstrap backfill).
 pub(crate) const DEFAULT_FLUSH_TIMEOUT_MS: u64 = 1000;
 
-/// Rows one decode worker coalesces before routing
+/// Rows coalesced per batcher chunk
 pub(crate) const DEFAULT_DECODE_CHUNK_ROWS: usize = 1024;
 
 /// Per-replica connection + mapping config. TOML `[ch]` table holds
@@ -168,8 +168,8 @@ pub struct EmitterConfig {
     /// per row, and whether the delete marker exists. Boot-only; per-relation
     /// renames layer over it via `table_entries` / `config_table`
     pub system_columns: Arc<SystemColumns>,
-    /// Rows a decode worker coalesces before routing one chunk to the
-    /// batcher (`DEFAULT_DECODE_CHUNK_ROWS`). Tunable so
+    /// Rows coalesced before routing one chunk to the batcher
+    /// (`DEFAULT_DECODE_CHUNK_ROWS`). Tunable so
     /// tests can trip the mid-loop flush without a huge xact.
     pub decode_chunk_rows: usize,
     /// Row / byte budget per commit-drain slice
@@ -197,10 +197,9 @@ pub struct EmitterConfig {
     pub value_reserve: usize,
     /// `[memory] inline_value_overflow`: action for oversized values
     pub inline_value_overflow: InlineValueOverflow,
-    /// `[ch] decoder_pool_size`: decode workers (M). `> 1` relaxes
-    /// per-table WAL order, leaning on `_lsn` ReplacingMergeTree dedup
-    /// ([emitter.md](../../architecture/README.md)). `--decoder-pool-size`
-    /// overrides. Boot-only, the pool is sized at pipeline spawn
+    /// `[ch] decoder_pool_size`: concurrent value resolutions, each holding
+    /// `value_reserve` of the memory budget. `--decoder-pool-size`
+    /// overrides. Boot-only, the budget is sized at spawn
     pub decoder_pool_size: usize,
     /// `[ch] inserter_pool_size`: concurrent CH INSERT connections (N).
     /// Native is request/response with no pipelining, so N is the
@@ -2513,6 +2512,15 @@ impl std::fmt::Debug for ColumnBuf {
 /// lexical filename order (later wins) — like Postgres `include_dir`. The base
 /// file may be absent (empty table); a malformed fragment is a hard error.
 pub async fn load_merged(ch_config: &std::path::Path) -> Result<toml::Table, EmitterError> {
+    load_merged_with(ch_config, None).await
+}
+
+/// [`load_merged`] taking `over`'s table in place of that fragment file,
+/// whether or not the file exists yet
+pub async fn load_merged_with(
+    ch_config: &std::path::Path,
+    over: Option<(&std::path::Path, &toml::Table)>,
+) -> Result<toml::Table, EmitterError> {
     let mut root: toml::Table = match tokio::fs::read_to_string(ch_config).await {
         Ok(s) => toml::from_str(&s).map_err(|e: toml::de::Error| {
             EmitterError::Config(format!("parse {}: {e}", ch_config.display()))
@@ -2526,24 +2534,33 @@ pub async fn load_merged(ch_config: &std::path::Path) -> Result<toml::Table, Emi
         }
     };
     let dir = ch_config.with_extension("d");
+    let mut frags: Vec<std::path::PathBuf> = Vec::new();
     if let Ok(mut rd) = tokio::fs::read_dir(&dir).await {
-        let mut frags: Vec<std::path::PathBuf> = Vec::new();
         while let Ok(Some(ent)) = rd.next_entry().await {
             let p = ent.path();
             if p.extension().and_then(|e| e.to_str()) == Some("toml") {
                 frags.push(p);
             }
         }
-        frags.sort();
-        for p in frags {
-            let s = tokio::fs::read_to_string(&p)
-                .await
-                .map_err(|e| EmitterError::Config(format!("read {}: {e}", p.display())))?;
-            let frag: toml::Table = toml::from_str(&s).map_err(|e: toml::de::Error| {
-                EmitterError::Config(format!("parse {}: {e}", p.display()))
-            })?;
-            merge_tables(&mut root, frag);
+    }
+    if let Some((p, _)) = over
+        && !frags.iter().any(|f| f == p)
+    {
+        frags.push(p.to_path_buf());
+    }
+    frags.sort();
+    for p in frags {
+        if let Some((_, table)) = over.filter(|(o, _)| *o == p) {
+            merge_tables(&mut root, table.clone());
+            continue;
         }
+        let s = tokio::fs::read_to_string(&p)
+            .await
+            .map_err(|e| EmitterError::Config(format!("read {}: {e}", p.display())))?;
+        let frag: toml::Table = toml::from_str(&s).map_err(|e: toml::de::Error| {
+            EmitterError::Config(format!("parse {}: {e}", p.display()))
+        })?;
+        merge_tables(&mut root, frag);
     }
     Ok(root)
 }

@@ -73,7 +73,7 @@ pub(crate) fn spawn_segment_fsync(
                     return;
                 }
             }
-            durable_lsn.join(max_lsn);
+            durable_lsn.join(Pos::new(max_lsn));
         }
     })
 }
@@ -104,64 +104,62 @@ pub(crate) fn spawn_desc_log_gc(
     })
 }
 
-/// Every [`DEFAULT_TRIM_INTERVAL`], read shadow replay LSN and last
-/// restartpoint REDO LSN, then trim below
-/// `min(replay_lsn - retention_bytes, redo)`
+/// Every [`DEFAULT_TRIM_INTERVAL`], read last restartpoint REDO LSN and trim
+/// below `min(replay_lsn - retention_bytes, redo)`
 /// Keep WAL from restartpoint because shadow resumes recovery there
 /// Reconnect after failed query because daemon may restart shadow
-pub(crate) fn spawn_retention(
+pub(crate) async fn trim_retention(
     out_dir: PathBuf,
     retention_bytes: u64,
     shadow_conninfo: String,
     shadow_replay_lsn: Arc<Monotone<ShadowReplay>>,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut client: Option<tokio_postgres::Client> = None;
-        loop {
-            tokio::time::sleep(DEFAULT_TRIM_INTERVAL).await;
-            if client.is_none() {
-                match open_retention_client(&shadow_conninfo).await {
-                    Ok(c) => client = Some(c),
-                    Err(e) => {
-                        tracing::warn!(
-                            target: "walshadow::retention",
-                            error = %e,
-                            "shadow connect failed; retrying next cycle",
-                        );
-                        continue;
-                    }
-                }
-            }
-            let (replay, redo) = match query_replay_state(client.as_ref().expect("just set")).await
-            {
-                Ok(v) => v,
+) {
+    let mut client: Option<tokio_postgres::Client> = None;
+    loop {
+        tokio::time::sleep(DEFAULT_TRIM_INTERVAL).await;
+        // Wait until shadow replays first record
+        let lsn = shadow_replay_lsn.get();
+        if lsn.is_zero() {
+            continue;
+        }
+        if client.is_none() {
+            match open_retention_client(&shadow_conninfo).await {
+                Ok(c) => client = Some(c),
                 Err(e) => {
-                    tracing::warn!(target: "walshadow::retention", error = %e, "lsn query");
-                    client = None;
+                    tracing::warn!(
+                        target: "walshadow::retention",
+                        error = %e,
+                        "shadow connect failed; retrying next cycle",
+                    );
                     continue;
                 }
-            };
-            // Wait until shadow replays first record
-            let Some(lsn) = replay else { continue };
-            shadow_replay_lsn.join(lsn);
-            let cutoff = manifest::retention_cutoff(lsn, retention_bytes, redo.map(Pos::new));
-            match trim_below_lsn(&out_dir, cutoff).await {
-                Ok(r) if r.segments_removed > 0 => {
-                    tracing::info!(
-                        target: "walshadow::retention",
-                        segments = r.segments_removed,
-                        manifests = r.manifests_removed,
-                        partials = r.partials_removed,
-                        bytes_freed = r.bytes_freed,
-                        cutoff_lsn = %cutoff,
-                        "trim cycle",
-                    );
-                }
-                Ok(_) => {}
-                Err(e) => tracing::warn!(target: "walshadow::retention", error = %e, "trim"),
             }
         }
-    })
+        let redo = match query_redo_lsn(client.as_ref().expect("just set")).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(target: "walshadow::retention", error = %e, "redo lsn query");
+                client = None;
+                continue;
+            }
+        };
+        let cutoff = manifest::retention_cutoff(lsn, retention_bytes, redo.map(Pos::new));
+        match trim_below_lsn(&out_dir, cutoff).await {
+            Ok(r) if r.segments_removed > 0 => {
+                tracing::info!(
+                    target: "walshadow::retention",
+                    segments = r.segments_removed,
+                    manifests = r.manifests_removed,
+                    partials = r.partials_removed,
+                    bytes_freed = r.bytes_freed,
+                    cutoff_lsn = %cutoff,
+                    "trim cycle",
+                );
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!(target: "walshadow::retention", error = %e, "trim"),
+        }
+    }
 }
 
 pub(crate) async fn open_retention_client(conninfo: &str) -> Result<tokio_postgres::Client> {
@@ -172,16 +170,10 @@ pub(crate) async fn open_retention_client(conninfo: &str) -> Result<tokio_postgr
     Ok(client)
 }
 
-pub(crate) async fn query_replay_state(
-    client: &tokio_postgres::Client,
-) -> Result<(Option<u64>, Option<u64>)> {
+pub(crate) async fn query_redo_lsn(client: &tokio_postgres::Client) -> Result<Option<u64>> {
     let row = client
-        .query_one(
-            "SELECT pg_last_wal_replay_lsn(), redo_lsn FROM pg_control_checkpoint()",
-            &[],
-        )
+        .query_one("SELECT redo_lsn FROM pg_control_checkpoint()", &[])
         .await?;
-    let replay: Option<PgLsn> = row.get(0);
-    let redo: Option<PgLsn> = row.get(1);
-    Ok((replay.map(u64::from), redo.map(u64::from)))
+    let redo: Option<PgLsn> = row.get(0);
+    Ok(redo.map(u64::from))
 }

@@ -17,7 +17,8 @@ use walshadow::shadow_catalog::ShadowCatalog;
 use walshadow::source_db::{DbLink, SourceDb};
 
 use crate::args::{Args, cli_base};
-use crate::runtime_cfg::{apply_toml_initial_loads, seed_runtime_config, spawn_mapping_refresher};
+use crate::runtime_cfg::{apply_toml_initial_loads, refresh_mapping, seed_runtime_config};
+use crate::session::SessionTasks;
 
 pub(crate) struct SourceDbInputs<'a> {
     pub(crate) args: &'a Args,
@@ -39,6 +40,9 @@ pub(crate) struct SourceDbInputs<'a> {
     pub(crate) raw_start: Pos<Floor>,
     /// Relations shadow can serve TOAST for, absent unless `[toast] mode = shadow`
     pub(crate) shadow_toast_held: Option<&'a walshadow::filter::shadow_relations::ShadowHeld>,
+    pub(crate) system_id: u64,
+    pub(crate) pending_rows: &'a walshadow::visibility_pending::SharedPendingLedger,
+    pub(crate) tasks: &'a mut SessionTasks,
 }
 
 pub(crate) struct BuiltSourceDb {
@@ -97,7 +101,10 @@ pub(crate) async fn build_source_db(input: SourceDbInputs<'_>) -> anyhow::Result
             resolver.exclude_table(&rel).await;
         }
     }
-    spawn_mapping_refresher(config_rx.clone(), mapping.clone());
+    input.tasks.spawn(
+        "mapping refresher",
+        refresh_mapping(config_rx.clone(), mapping.clone()),
+    );
     // Runtime-config overlay (§7): before the pump consumes WAL, seed the
     // resolver from this database's config_* tables over a sidecar libpq
     // connection. Post-seed writes arrive live off the WAL stream. Refuse
@@ -160,8 +167,11 @@ pub(crate) async fn build_source_db(input: SourceDbInputs<'_>) -> anyhow::Result
             Some(input.budget.clone()),
             input.oracle.clone(),
             input.source_major,
+            input.system_id,
+            input.pending_rows.clone(),
         )
         .await
+        .context("load backfill ledger")?
         .with_backup_loads(input.primary),
     );
     let backfiller_effects: Option<Arc<dyn walshadow::opt_in::Backfiller>> =

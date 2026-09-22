@@ -184,6 +184,7 @@ mod tests {
 
     use super::*;
     use crate::filter::rewrite::{compute_crc, noop_replace};
+    use crate::pos::Pos;
     use crate::record::{
         CollectingRecordSink, CollectingSegmentSink, RecordBytesSink, SinkError, WAL_SEG_SIZE,
     };
@@ -209,14 +210,6 @@ mod tests {
                 self.0.lock().unwrap().extend_from_slice(bytes);
                 Ok(())
             })
-        }
-
-        fn on_segment_boundary<'a>(
-            &'a mut self,
-            lsn: u64,
-            bytes: &'a [u8],
-        ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
-            self.on_wire_chunk(lsn, bytes)
         }
     }
 
@@ -286,7 +279,7 @@ mod tests {
         std::fs::write(segment_path(dir.path(), 1, WAL_SEG_SIZE, start), &retained).unwrap();
 
         for chunk_size in [17, WAL_SEG_SIZE as usize] {
-            let mut stream = WalStream::new(1, WAL_SEG_SIZE, start).unwrap();
+            let mut stream = WalStream::new(1, WAL_SEG_SIZE, Pos::new(start)).unwrap();
             stream
                 .preserve_resume_prefix(&[dir.path().to_path_buf()])
                 .await
@@ -325,7 +318,7 @@ mod tests {
         let mut retained = page(start, 100, WAL_SEG_SIZE);
         retained.resize(WAL_SEG_SIZE as usize, 0);
         std::fs::write(segment_path(dir.path(), 1, WAL_SEG_SIZE, start), &retained).unwrap();
-        let mut stream = WalStream::new(1, WAL_SEG_SIZE, start).unwrap();
+        let mut stream = WalStream::new(1, WAL_SEG_SIZE, Pos::new(start)).unwrap();
         stream
             .preserve_resume_prefix(&[dir.path().to_path_buf()])
             .await

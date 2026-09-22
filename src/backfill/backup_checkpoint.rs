@@ -18,18 +18,20 @@ const FILENAME: &str = "backup_replay.json";
 /// its resume and the pass restarts
 const VERSION: u32 = 1;
 
-/// Digest of what a resume must not change. Not stable across builds: drift
-/// reads as a mismatch, which restarts the pass rather than reusing state it
-/// cannot vouch for
+/// FNV-1a digest of what a resume must not change, persisted so it must not
+/// depend on build. Inputs render through `Debug`, so a build changing that
+/// output reads as a mismatch, which restarts the pass rather than reusing
+/// state it cannot vouch for
 pub fn digest<'a>(parts: impl IntoIterator<Item = &'a [u8]>) -> u64 {
-    use std::hash::{BuildHasher, Hasher};
-    let mut h = ahash::RandomState::with_seeds(0x7761_6c73, 0x6861_646f, 0x7773_746b, 0x7074_0001)
-        .build_hasher();
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for part in parts {
-        h.write_u64(part.len() as u64);
-        h.write(part);
+        let len = (part.len() as u64).to_le_bytes();
+        for &b in len.iter().chain(part) {
+            h = (h ^ u64::from(b)).wrapping_mul(PRIME);
+        }
     }
-    h.finish()
+    h
 }
 
 /// Page-walk progress. A heap file lands here only once every tuple it
@@ -206,6 +208,16 @@ impl BackupCheckpoint {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Persisted, so a pinned value catches any build-dependent drift
+    #[test]
+    fn digest_is_stable_across_builds() {
+        assert_eq!(digest([b"a".as_slice(), b"bc"]), 0xba1e_1f0e_0704_d8ea);
+        assert_ne!(
+            digest([b"ab".as_slice(), b"c"]),
+            digest([b"a".as_slice(), b"bc"])
+        );
+    }
 
     #[tokio::test]
     async fn checkpoint_drops_a_cursor_past_spool_and_preserves_previous_file() {

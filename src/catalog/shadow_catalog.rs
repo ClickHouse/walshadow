@@ -519,7 +519,6 @@ impl ShadowCatalog {
             namespaces,
             types,
             replay_lsn: pinned,
-            missing_raw: true,
         })
     }
 
@@ -531,7 +530,10 @@ impl ShadowCatalog {
             Scope::Oids(oids) => self.query_retry(&MIRROR_BATCH_SQL, &[&oids]).await?,
             Scope::Eligible => self.query_retry(&MIRROR_ALL_SQL, &[]).await?,
         };
-        DescriptorRows::from_mirror(&rows)
+        let mut out = DescriptorRows::from_mirror(&rows)?;
+        let bridge = self.bridge.clone();
+        raw_missing_values(&bridge, &mut out.attrs).await?;
+        Ok(out)
     }
 
     /// Oid → name for one whole-catalog projection.
@@ -685,7 +687,7 @@ const NO_REPLAY: &str = "0/0";
 /// `::text` cast says `true` where `boolout` says `t`, and would take
 /// `int2vector` out of the space-separated form the worker sends. `attnum >=
 /// 1` drops the system columns the descriptor never wants; `attmissingval`
-/// carries `anyarray_out` form only when `atthasmissing`.
+/// only marks a fast default present, [`raw_missing_values`] fetches its bytes.
 ///
 /// Position branch is first so its `pg_last_wal_replay_lsn()` is read as close
 /// to snapshot acquisition as one statement allows.
@@ -709,7 +711,7 @@ fn mirror_sql(scope_pred: &str) -> String {
              format('%s', a.atttypid), format('%s', a.atttypmod), format('%s', a.attnotnull), \
              format('%s', a.attisdropped), format('%s', a.attbyval), format('%s', a.attlen), \
              format('%s', a.attalign), format('%s', a.attstorage), \
-             CASE WHEN a.atthasmissing THEN a.attmissingval::text END] \
+             CASE WHEN a.atthasmissing AND a.attmissingval IS NOT NULL THEN '' END] \
            FROM att a \
          UNION ALL SELECT {index}, ARRAY[\
              format('%s', i.indexrelid), format('%s', i.indrelid), \
@@ -740,6 +742,40 @@ static MIRROR_ALL_SQL: LazyLock<String> = LazyLock::new(|| {
         "c.oid >= {FIRST_NORMAL_OBJECT_ID} AND c.relkind IN ('r', 'p', 'm', 't')"
     ))
 });
+
+/// Swap each fast default the statement marked present for its on-disk bytes
+/// off the worker, the one encoding decode reads. The bytes hold still while
+/// `atthasmissing` does: a rewrite clears it, and a non-rewriting `ALTER TYPE`
+/// only relabels the array (PG `ATExecAlterColumnType`). So the worker's
+/// position need not match the statement's snapshot, only still carry it
+async fn raw_missing_values(bridge: &Bridge, attrs: &mut [AttributeRow]) -> Result<()> {
+    let oids: Vec<Oid> = attrs
+        .iter()
+        .filter(|a| a.attmissingval.is_some())
+        .map(|a| a.attrelid)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let mut raw: HashMap<(Oid, i16), String> = HashMap::new();
+    for chunk in oids.chunks(MAX_SCAN_OIDS) {
+        let scan = bridge.scan(Catalog::Attribute, 0, chunk).await?;
+        for row in scan.parse::<AttributeRow>()? {
+            if let Some(hex) = row.attmissingval {
+                raw.insert((row.attrelid, row.attnum), hex);
+            }
+        }
+    }
+    for attr in attrs.iter_mut().filter(|a| a.attmissingval.is_some()) {
+        let hex = raw.remove(&(attr.attrelid, attr.attnum)).ok_or_else(|| {
+            CatalogError::Parse(format!(
+                "worker lost fast default of relation {} attnum {} since the statement read it",
+                attr.attrelid, attr.attnum
+            ))
+        })?;
+        attr.attmissingval = Some(hex);
+    }
+    Ok(())
+}
 
 /// Which relations one descriptor read covers.
 #[derive(Clone, Copy)]
@@ -798,8 +834,6 @@ struct DescriptorRows {
     namespaces: HashMap<Oid, String>,
     types: HashMap<Oid, String>,
     replay_lsn: u64,
-    /// Worker ships `attmissingval` as raw hex bytes; mirror ships text.
-    missing_raw: bool,
 }
 
 impl DescriptorRows {
@@ -874,7 +908,6 @@ impl DescriptorRows {
                 &self.types,
                 db_node,
                 default_tablespace,
-                self.missing_raw,
             )?);
         }
         Ok(out)
@@ -894,7 +927,6 @@ fn decode_hex(s: &str) -> Option<Vec<u8>> {
 /// One descriptor out of projection rows already scoped to `class.oid`. The
 /// single definition of the shape, so a committed read and an overlay read of
 /// an unchanged relation are equal.
-#[allow(clippy::too_many_arguments)]
 fn descriptor_from_rows(
     class: &ClassRow,
     attrs: &[AttributeRow],
@@ -903,7 +935,6 @@ fn descriptor_from_rows(
     types: &HashMap<Oid, String>,
     db_node: Oid,
     default_tablespace: Oid,
-    missing_raw: bool,
 ) -> Result<RelDescriptor> {
     let namespace_name = namespaces.get(&class.relnamespace).ok_or_else(|| {
         CatalogError::Parse(format!(
@@ -949,16 +980,10 @@ fn descriptor_from_rows(
             type_len: attr.attlen,
             type_align: attr.attalign.to_string(),
             type_storage: attr.attstorage.to_string(),
-            // Raw (worker) hex is decoded below; only text (mirror) parses here.
-            missing: if missing_raw {
-                None
-            } else {
-                attr.attmissingval.clone()
-            },
+            missing: None,
         };
         let mut rel_attr = raw.build().map_err(CatalogError::Parse)?;
-        if missing_raw
-            && let Some(hex) = attr.attmissingval.as_deref()
+        if let Some(hex) = attr.attmissingval.as_deref()
             && let Some(bytes) = decode_hex(hex)
         {
             rel_attr.missing_default = Some(crate::schema::MissingDefault::Raw(bytes));
@@ -1064,6 +1089,9 @@ mod tests {
         }
     }
 
+    /// int4[] `{7}` on disk: header, ndim, dataoffset, elemtype, dim, lbound, datum
+    const RAW_SEVEN: &str = "70000000010000000000000017000000010000000100000007000000";
+
     fn names(pairs: &[(Oid, &str)]) -> HashMap<Oid, String> {
         pairs.iter().map(|(o, n)| (*o, (*n).to_owned())).collect()
     }
@@ -1082,7 +1110,6 @@ mod tests {
             &names(&[(23, "int4"), (25, "text")]),
             5,
             DEFAULT_TABLESPACE,
-            false,
         )
     }
 
@@ -1092,7 +1119,7 @@ mod tests {
             attr_row(2, "a", 25),
             attr_row(1, "id", 23),
             AttributeRow {
-                attmissingval: Some("{7}".into()),
+                attmissingval: Some(RAW_SEVEN.into()),
                 ..attr_row(3, "c", 23)
             },
         ];
@@ -1119,7 +1146,10 @@ mod tests {
         let cols: Vec<&str> = desc.attributes.iter().map(|a| a.name.as_str()).collect();
         assert_eq!(cols, ["id", "a", "c"]);
         assert_eq!(desc.attributes[1].type_name, "text");
-        assert_eq!(desc.attributes[2].missing_default, Some("7".into()));
+        assert_eq!(
+            desc.attributes[2].missing_default,
+            decode_hex(RAW_SEVEN).map(crate::schema::MissingDefault::Raw)
+        );
     }
 
     #[test]

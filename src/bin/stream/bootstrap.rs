@@ -35,7 +35,6 @@ use walshadow::pipeline::Fatal;
 use walshadow::pipeline::tail::OwnedTail;
 use walshadow::runtime_config::InitialLoadMode;
 use walshadow::schema::{RelName, SchemaEvent};
-use walshadow::shadow::Shadow;
 use walshadow::source_feed::SourceFeed;
 use walshadow::toast::ToastResolver;
 use walshadow::visibility::PgXactPatch;
@@ -43,7 +42,7 @@ use walshadow::visibility::PgXactPatch;
 use crate::archive::fetch_wal_into_pg_wal;
 use crate::args::{Args, cli_base};
 use crate::metrics_publish::{DbMetricSources, StageCounters, stage_gauges};
-use crate::shadow_proc::{bridge_pool_size, build_owned_shadow, start_owned_shadow};
+use crate::shadow_proc::{OwnedShadow, bridge_pool_size, build_owned_shadow, start_owned_shadow};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BootstrapPlan {
@@ -62,15 +61,8 @@ impl BootstrapPlan {
 
 pub(crate) fn resolve_bootstrap(args: &Args, ch: Option<&EmitterConfig>) -> Result<BootstrapPlan> {
     let toml = ch.map(|c| &c.bootstrap);
-    // External-shadow (no data dir) can't bootstrap; only default to Direct when
-    // a shadow data dir is configured.
-    let default_mode = if args.bootstrap_shadow_data_dir.is_some() {
-        BootstrapMode::Direct
-    } else {
-        BootstrapMode::Off
-    };
-    let mode =
-        cli_over_toml(args.bootstrap_mode, toml.and_then(|b| b.mode)).unwrap_or(default_mode);
+    let mode = cli_over_toml(args.bootstrap_mode, toml.and_then(|b| b.mode))
+        .unwrap_or(BootstrapMode::Direct);
     let backup_name = cli_over_toml(
         args.bootstrap_backup_name.clone(),
         toml.and_then(|b| b.backup_name.clone()),
@@ -142,10 +134,7 @@ pub(crate) async fn run_bootstrap(
     } = observers;
     let timing = walshadow::ops::stages::BOOTSTRAP.start();
     let bridge_workers = bridge_pool_size(ch_config.as_ref());
-    let shadow_data_dir = args
-        .bootstrap_shadow_data_dir
-        .clone()
-        .context("--bootstrap-shadow-data-dir required when --bootstrap-mode != off")?;
+    let shadow_data_dir = args.bootstrap_shadow_data_dir.clone();
 
     // Never land a base backup onto a dir that already holds a cluster: a
     // `PG_VERSION` with no completion marker is a crashed bootstrap or a
@@ -264,7 +253,7 @@ pub(crate) async fn run_bootstrap(
     };
     // Shadow serves values once bootstrap starts it; its bridge binds then
     // and run() adopts the instance
-    let mut running_shadow: Option<Arc<Shadow>> = None;
+    let mut running_shadow: Option<OwnedShadow> = None;
     let shadow_toast_bridge = walshadow::toast::shadow_store::LateBridge::default();
     // Shadow starts before backup WAL processing needs value lookups, so the
     // store reads through a cell this frame binds later
@@ -850,27 +839,31 @@ pub(crate) async fn run_bootstrap(
                         format!("bootstrap: chmod 0700 {}", shadow_data_dir.display())
                     })?;
             }
-            let started = Arc::new(build_owned_shadow(
-                args,
-                &src_cfg.database,
-                &shadow_databases,
-                shadow_data_dir.clone(),
-                bridge_workers,
+            // Guard before start, so a failed bootstrap stops what it started
+            let started = running_shadow.insert(OwnedShadow::new(
+                build_owned_shadow(
+                    args,
+                    &src_cfg.database,
+                    &shadow_databases,
+                    shadow_data_dir.clone(),
+                    bridge_workers,
+                ),
+                args.keep_shadow_running,
             ));
             started
+                .shadow
                 .write_standby_signal()
                 .context("bootstrap: write standby.signal")?;
             // Recover to `end_lsn` from local pg_wal
             walshadow::ops::stages::SHADOW_REPLAY
                 .measure(start_owned_shadow(
-                    &started,
+                    &started.shadow,
                     Some(outcome.end.end_lsn),
                     Duration::from_secs(args.bootstrap_shadow_replay_timeout),
                     false,
                 ))
                 .await
                 .context("bootstrap: start shadow to serve TOAST values")?;
-            running_shadow = Some(started);
             let bridge = walshadow::bridge::connect_with_budget(
                 &args.bridge_socket_path(),
                 bridge_workers,
@@ -1107,9 +1100,15 @@ pub(crate) async fn run_bootstrap(
                 .context("bootstrap: visibility gate")?;
         // Persist the ledger before clearing the marker so pending rows
         // already in ClickHouse can be published after restart
-        let mut ledger = walshadow::visibility_pending::PendingLedger::load(&args.spill_dir)
-            .await
-            .context("bootstrap: load pending visibility ledger")?;
+        let mut ledger = walshadow::visibility_pending::PendingLedger::load(
+            &args.spill_dir,
+            source_ident
+                .sysid
+                .parse()
+                .context("IDENTIFY_SYSTEM sysid")?,
+        )
+        .await
+        .context("bootstrap: load pending visibility ledger")?;
         for m in &pending_tables {
             ledger
                 .push(m)
@@ -1150,7 +1149,7 @@ pub(crate) async fn run_bootstrap(
         BootstrapHandoff {
             end_lsn: outcome.end.end_lsn,
             open_floor,
-            shadow: running_shadow.clone(),
+            shadow: running_shadow,
         },
         BootstrapMetrics {
             progress,
@@ -1185,7 +1184,7 @@ pub(crate) struct BootstrapHandoff {
     /// Earliest record among transactions open at window seal
     pub(crate) open_floor: Option<u64>,
     /// Shadow instance started during bootstrap
-    pub(crate) shadow: Option<Arc<Shadow>>,
+    pub(crate) shadow: Option<OwnedShadow>,
 }
 
 impl BootstrapHandoff {
@@ -1250,12 +1249,10 @@ pub(crate) async fn bootstrap_build_mapping(
     Ok((mapping, resolved))
 }
 
-/// Choose external management, one-time bootstrap, or resume from
-/// `--bootstrap-shadow-data-dir` and data dir state
+/// Choose one-time bootstrap or resume from `--bootstrap-shadow-data-dir`
+/// and data dir state
 /// Mode only chooses bootstrap source
 pub(crate) enum ShadowStart {
-    /// Connect to externally managed shadow when no data dir is given
-    External,
     Bootstrap(PathBuf),
     Rebootstrap(PathBuf, BootstrapMarker),
     Resume(PathBuf),
@@ -1266,30 +1263,15 @@ impl ShadowStart {
         matches!(self, Self::Bootstrap(_) | Self::Rebootstrap(..))
     }
 
-    /// Data directory of a daemon-owned shadow
-    pub(crate) fn data_dir(&self) -> Option<&Path> {
+    pub(crate) fn data_dir(&self) -> &Path {
         match self {
-            Self::External => None,
-            Self::Bootstrap(d) | Self::Rebootstrap(d, _) | Self::Resume(d) => Some(d),
+            Self::Bootstrap(d) | Self::Rebootstrap(d, _) | Self::Resume(d) => d,
         }
     }
 }
 
 pub(crate) fn resolve_shadow_start(args: &Args, mode: BootstrapMode) -> Result<ShadowStart> {
-    let Some(dir) = &args.bootstrap_shadow_data_dir else {
-        anyhow::ensure!(
-            matches!(mode, BootstrapMode::Off),
-            "bootstrap mode {mode:?} requires --bootstrap-shadow-data-dir",
-        );
-        return Ok(ShadowStart::External);
-    };
-    anyhow::ensure!(
-        args.walsender_bind.port() != 0,
-        "--walsender-bind {} has port 0; daemon-owned shadow bakes this \
-         address into shadow's primary_conninfo before shadow starts, so the \
-         port must be known upfront, pass an explicit --walsender-bind port",
-        args.walsender_bind,
-    );
+    let dir = &args.bootstrap_shadow_data_dir;
     for (flag, other) in [
         ("--out-dir", &args.out_dir),
         ("--spill-dir", &args.spill_dir),
@@ -1366,15 +1348,6 @@ mod tests {
     }
 
     #[test]
-    fn shadow_start_external_without_data_dir() {
-        assert!(matches!(
-            shadow_start(&args_from(&[])).unwrap(),
-            ShadowStart::External
-        ));
-        assert!(shadow_start(&args_from(&["--bootstrap-mode", "direct"])).is_err());
-    }
-
-    #[test]
     fn bootstrap_lanes_layers_override_over_the_derived_default() {
         let derived = bootstrap_lanes(8, None);
         assert!((1..=8).contains(&derived), "derived {derived}");
@@ -1432,7 +1405,7 @@ mod tests {
         assert_eq!(plan.parallelism, Some(8), "TOML fills what the CLI omits");
 
         let plan = resolve_bootstrap(&args_from(&[]), Some(&toml("[ch]\n"))).unwrap();
-        assert_eq!(plan.mode, BootstrapMode::Off);
+        assert_eq!(plan.mode, BootstrapMode::Direct);
         assert_eq!(plan.backup_name, "LATEST");
         assert_eq!(plan.parallelism, None);
 
@@ -1543,25 +1516,6 @@ mod tests {
                 assert!(shadow_start(&args).is_err());
             }
         }
-    }
-
-    #[test]
-    fn shadow_start_rejects_kernel_picked_port_for_owned_shadow() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join("data");
-        std::fs::create_dir_all(&dir).unwrap();
-        let dir_str = dir.to_str().unwrap();
-        // Default --walsender-bind is 127.0.0.1:0 (kernel-picked); daemon
-        // can't bake an unknown port into shadow's primary_conninfo.
-        assert!(
-            shadow_start(&args_from(&[
-                "--bootstrap-mode",
-                "direct",
-                "--bootstrap-shadow-data-dir",
-                dir_str,
-            ]))
-            .is_err()
-        );
     }
 
     #[test]

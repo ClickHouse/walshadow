@@ -817,15 +817,15 @@ impl ConfigResolver {
     /// it), re-merge with overlay + CLI, publish. Carries the CH connection +
     /// table opt-ins live; the source connection isn't in scope here. Parse /
     /// read errors surface to the caller and leave the last snapshot in effect.
+    /// Reads under `inner` so concurrent reloads publish in read order.
     pub async fn reload(&self) -> Result<(), EmitterError> {
         let Some(path) = &self.toml_path else {
             return Ok(());
         };
-        let merged = crate::ch_emitter::load_effective(path, self.cli_base.clone()).await?;
         let mut inner = self.inner.lock().await;
+        let merged = crate::ch_emitter::load_effective(path, self.cli_base.clone()).await?;
         // This resolver's own database, not whichever one `[source]` names
-        let base = EmitterConfig::for_database(&merged, &self.dbname)?;
-        inner.base = base;
+        inner.base = EmitterConfig::for_database(&merged, &self.dbname)?;
         self.republish(&inner).await;
         Ok(())
     }
@@ -2103,5 +2103,32 @@ mod tests {
             apply(&mut moved);
             assert!(!live.dest_conn_eq(&moved));
         }
+    }
+
+    /// A reload queued behind another publishes what it reads once it holds
+    /// the lock, not a file it read before waiting
+    #[tokio::test(flavor = "current_thread")]
+    async fn reload_reads_under_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ch-config.toml");
+        std::fs::write(&path, "[ch]\ndrop_table_strategy = \"retain\"\n").unwrap();
+        let (resolver, rx) = ConfigResolver::new(
+            &base_with("retain"),
+            CliOverrides::default(),
+            Some(path.clone()),
+            toml::Table::new(),
+            dummy_handles(),
+        );
+        let held = resolver.inner.lock().await;
+        let queued = tokio::spawn({
+            let resolver = resolver.clone();
+            async move { resolver.reload().await }
+        });
+        // Let the queued reload run up to the lock
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        std::fs::write(&path, "[ch]\ndrop_table_strategy = \"drop\"\n").unwrap();
+        drop(held);
+        queued.await.unwrap().unwrap();
+        assert_eq!(rx.borrow().drop_table_strategy, DropTableStrategy::Drop);
     }
 }

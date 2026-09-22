@@ -37,7 +37,8 @@ planning committed transactions
 ![Commit pipeline: bounded DecodeJob queue fans out to M workers, rows merge through one batcher, InsertBatch queue fans out to N inserters, and separate Register, Placed and Acked events advance a contiguous watermark](workers.svg)
 
 `BufferingDecoderSink` and `ReorderSink` share one record-queue worker
-`[ch].decoder_pool_size` and `[ch].inserter_pool_size` size downstream pools
+`ReorderSink` plans each commit and places its rows onto the batcher in order
+`[ch].inserter_pool_size` sizes the inserter pool
 Each inserter owns a ClickHouse connection and can take any sealed batch
 
 Sequence numbers identify work slices, not necessarily whole transactions

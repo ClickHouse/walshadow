@@ -375,24 +375,11 @@ impl SpillStore {
         })
     }
 
-    /// Wipe every spill file. Crash-recovery contract: on-disk state is
+    /// Wipe store dir wholesale. Crash-recovery contract: on-disk state is
     /// always drained-into-CH or replayable from the cursor's `decoder_lsn`,
     /// so prior-crash leftovers are safe to discard
-    pub async fn clear(&self) -> Result<()> {
-        let mut entries = match tokio::fs::read_dir(&self.dir).await {
-            Ok(e) => e,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
-            Err(e) => return Err(e.into()),
-        };
-        while let Some(entry) = entries.next_entry().await? {
-            let p = entry.path();
-            if p.file_name().and_then(|n| n.to_str()).is_some_and(|s| {
-                (s.starts_with("xid-") || s.starts_with("toastbody-")) && s.ends_with(".bin")
-            }) {
-                let _ = tokio::fs::remove_file(&p).await;
-            }
-        }
-        Ok(())
+    pub fn clear(&self) -> Result<()> {
+        Ok(crate::fs::reset_dir(&self.dir)?)
     }
 }
 
@@ -431,7 +418,7 @@ impl BodySpoolFile {
         }
     }
 
-    /// Positional read, no shared cursor: decode workers read concurrently.
+    /// Positional read, no shared cursor: readers share one fd concurrently.
     /// Sync from async context; production wants spawn_blocking or a
     /// buffered pread layer for cold reads
     pub fn read_at(&self, offset: u64, out: &mut [u8]) -> io::Result<()> {
@@ -471,8 +458,8 @@ pub struct BodySpoolWriter {
 }
 
 impl BodySpoolWriter {
-    /// Distinct prefix from xact spill so startup wipes both families;
-    /// `commit_lsn` disambiguates xid reuse across slot rotations
+    /// Distinct prefix from xact spill; `commit_lsn` disambiguates xid reuse
+    /// across slot rotations
     pub fn create(
         dir: &Path,
         xid: u32,
@@ -597,10 +584,9 @@ impl SpillWriter {
     }
 
     /// Flush + close, return a reader at the start. Caller drives `next()` to
-    /// `Ok(None)` then `unlink()`
+    /// `Ok(None)` then `unlink()`. No fsync: restart wipes spill unread
     pub async fn finish(mut self) -> Result<SpillReader> {
         self.file.flush().await?;
-        self.file.sync_all().await?;
         drop(self.file);
         let file = OpenOptions::new().read(true).open(&self.path).await?;
         Ok(SpillReader {
@@ -1534,36 +1520,20 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn clear_removes_only_spill_files() {
+    async fn clear_wipes_store_dir_only() {
         let tmp = tempdir().unwrap();
-        let store = SpillStore::new(tmp.path().to_path_buf()).unwrap();
+        let store = SpillStore::new(crate::fs::scratch_dir(tmp.path())).unwrap();
         let mut w1 = store.writer(1, 0).await.unwrap();
         w1.write(&SpillEntry::Heap(Box::new(sample_heap(1, 0))))
             .await
             .unwrap();
-        let mut w2 = store.writer(2, 0).await.unwrap();
-        w2.write(&SpillEntry::Heap(Box::new(sample_heap(2, 0))))
-            .await
-            .unwrap();
-        // Drop without finish() so files stay on disk
+        // Drop without finish() so file stays on disk
         drop(w1);
-        drop(w2);
         let bystander = tmp.path().join("README");
         tokio::fs::write(&bystander, b"keep me").await.unwrap();
-        store.clear().await.unwrap();
-        assert!(bystander.exists(), "non-spill file must survive clear()");
-        let mut left = tokio::fs::read_dir(tmp.path()).await.unwrap();
-        let mut count = 0;
-        while let Some(e) = left.next_entry().await.unwrap() {
-            let n = e.file_name();
-            let s = n.to_str().unwrap();
-            assert!(
-                !(s.starts_with("xid-") && s.ends_with(".bin")),
-                "spill file leaked: {s}"
-            );
-            count += 1;
-        }
-        assert!(count >= 1, "README should still be there");
+        store.clear().unwrap();
+        assert!(bystander.exists(), "durable root file must survive clear()");
+        assert_eq!(std::fs::read_dir(store.dir()).unwrap().count(), 0);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1639,7 +1609,7 @@ mod tests {
         // Simulate crash: writer dropped without unlink
         drop(w);
         assert!(path.exists());
-        store.clear().await.unwrap();
+        store.clear().unwrap();
         assert!(!path.exists(), "startup wipe reclaims body spools");
     }
 
@@ -1973,6 +1943,6 @@ mod tests {
         let store = SpillStore::new(tmp.path().to_path_buf()).unwrap();
         // read_dir returns NotFound, clear must absorb
         tokio::fs::remove_dir_all(tmp.path()).await.unwrap();
-        store.clear().await.unwrap();
+        store.clear().unwrap();
     }
 }

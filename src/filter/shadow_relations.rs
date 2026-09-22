@@ -1,4 +1,7 @@
 //! Persist replay eligibility, recovery can recreate files without their pages
+//!
+//! File carries the shadow cluster's system identifier from `pg_control`
+//! beside it, so eligibility copied from another cluster fails load
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -35,6 +38,8 @@ impl FromIterator<(u32, u32)> for ShadowHeld {
 #[derive(Serialize, Deserialize)]
 struct Stored {
     version: u32,
+    #[serde(default)]
+    system_id: Option<u64>,
     creates_from: u64,
     relations: Vec<(u32, u32, u64)>,
 }
@@ -104,6 +109,15 @@ impl ShadowRelations {
             stored.version == 1,
             "unsupported shadow replay eligibility version"
         );
+        let control = control_system_id(dir).await?;
+        if let Some(stored_id) = stored.system_id {
+            ensure!(
+                control == Some(stored_id),
+                "{} belongs to system {stored_id}, shadow pg_control says {control:?}; \
+                 rebootstrap shadow",
+                path.display(),
+            );
+        }
         let mut rels = HashMap::default();
         for (db, rel, lsn) in stored.relations {
             ensure!(
@@ -120,7 +134,8 @@ impl ShadowRelations {
             rels,
             creates_from: stored.creates_from,
             dir: Some(dir.to_path_buf()),
-            dirty: false,
+            // Stamp a file predating the identifier at next flush
+            dirty: stored.system_id.is_none() && control.is_some(),
         })
     }
 
@@ -142,6 +157,7 @@ impl ShadowRelations {
         relations.sort_unstable();
         let raw = toml::to_string(&Stored {
             version: 1,
+            system_id: control_system_id(dir).await?,
             creates_from: self.creates_from,
             relations,
         })?;
@@ -151,6 +167,21 @@ impl ShadowRelations {
         self.dirty = false;
         Ok(())
     }
+}
+
+/// `ControlFileData.system_identifier`, its leading field in host byte
+/// order; `None` without a cluster in `dir`
+async fn control_system_id(dir: &Path) -> Result<Option<u64>> {
+    let path = dir.join("global/pg_control");
+    let raw = match tokio::fs::read(&path).await {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
+    };
+    let id = raw
+        .first_chunk::<8>()
+        .with_context(|| format!("{} too short", path.display()))?;
+    Ok(Some(u64::from_ne_bytes(*id)))
 }
 
 #[cfg(test)]
@@ -175,6 +206,37 @@ mod tests {
         let reloaded = ShadowRelations::load(tmp.path()).await.unwrap();
         let held = reloaded.held();
         assert!(held.contains((5, 17000)) && held.contains((5, 17001)));
+    }
+
+    #[tokio::test]
+    async fn stamps_control_identity_and_refuses_another_cluster() {
+        let tmp = tempfile::tempdir().unwrap();
+        tokio::fs::write(
+            tmp.path().join(FILE),
+            "version = 1\ncreates_from = 100\nrelations = [[5, 17000, 0]]\n",
+        )
+        .await
+        .unwrap();
+        tokio::fs::create_dir(tmp.path().join("global"))
+            .await
+            .unwrap();
+        let control = tmp.path().join("global/pg_control");
+        tokio::fs::write(&control, 42u64.to_ne_bytes())
+            .await
+            .unwrap();
+
+        let mut rels = ShadowRelations::load(tmp.path()).await.unwrap();
+        rels.flush().await.unwrap();
+        let raw = tokio::fs::read_to_string(tmp.path().join(FILE))
+            .await
+            .unwrap();
+        assert!(raw.contains("system_id = 42"), "{raw}");
+
+        tokio::fs::write(&control, 43u64.to_ne_bytes())
+            .await
+            .unwrap();
+        let err = ShadowRelations::load(tmp.path()).await.err().unwrap();
+        assert!(err.to_string().contains("belongs to system 42"), "{err}");
     }
 
     #[tokio::test]

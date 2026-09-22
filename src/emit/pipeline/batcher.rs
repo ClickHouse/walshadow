@@ -131,7 +131,7 @@ pub(crate) struct InsertBatch {
 pub enum BatcherMsg {
     /// Single row (bootstrap drain). One channel hop + wakeup per row.
     Row(RoutedRow),
-    /// Chunk of rows from one decode worker (see `decode::DECODE_CHUNK_ROWS`),
+    /// Chunk of rows from one placement (see `decode::DECODE_CHUNK_BYTES`),
     /// amortizing the per-row channel-send + cross-thread wakeup — the
     /// dominant coordination cost under sustained load. Rows may carry
     /// different `seq`s; batcher routes each independently.

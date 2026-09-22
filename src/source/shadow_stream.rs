@@ -416,7 +416,7 @@ impl ShadowStreamState {
             return;
         }
         let end_lsn = start_lsn + bytes.len() as u64;
-        self.server_wal_end = self.server_wal_end.max(end_lsn.into());
+        self.server_wal_end = self.server_wal_end.max(Pos::new(end_lsn));
         self.retain_wire(start_lsn, bytes);
         let server_wal_end = self.server_wal_end.get();
         // Snapshot: enqueue below takes `&mut self`, so the map can't stay borrowed
@@ -439,7 +439,7 @@ impl ShadowStreamState {
                     encode_wal_data_frame_into(out, frame_lsn, server_wal_end, to_send);
                 })
             {
-                self.advance_dispatched(id, cut.unwrap_or(end_lsn));
+                self.advance_dispatched(id, Pos::new(cut.unwrap_or(end_lsn)));
             }
             if cut.is_some() {
                 self.end_timeline_for(id, ends_at.expect("cut came from ends_at"));
@@ -505,7 +505,7 @@ impl ShadowStreamState {
             });
             pos = end;
         }
-        self.advance_dispatched(id, server_wal_end);
+        self.advance_dispatched(id, Pos::new(server_wal_end));
     }
 
     pub fn drop_connection(&mut self, id: u64) {
@@ -520,11 +520,10 @@ impl ShadowStreamState {
         &mut self,
         id: u64,
         _write_lsn: u64,
-        flush_lsn: impl Into<Pos<ShadowFlush>>,
-        apply_lsn: impl Into<Pos<ShadowReplay>>,
+        flush_lsn: Pos<ShadowFlush>,
+        apply_lsn: Pos<ShadowReplay>,
     ) {
         if let Some(c) = self.connections.get_mut(&id) {
-            let (flush_lsn, apply_lsn) = (flush_lsn.into(), apply_lsn.into());
             c.flush_lsn = c.flush_lsn.max(flush_lsn);
             let advanced = apply_lsn > c.apply_lsn;
             c.apply_lsn = c.apply_lsn.max(apply_lsn);
@@ -601,8 +600,7 @@ impl ShadowStreamState {
         self.frame_copy_data(id, Some(self.slow_threshold), build_body)
     }
 
-    pub fn advance_dispatched(&mut self, id: u64, new_lsn: impl Into<Pos<ShadowDispatched>>) {
-        let new_lsn = new_lsn.into();
+    pub fn advance_dispatched(&mut self, id: u64, new_lsn: Pos<ShadowDispatched>) {
         if let Some(c) = self.connections.get_mut(&id) {
             c.dispatched_lsn = c.dispatched_lsn.max(new_lsn);
         }
@@ -655,18 +653,6 @@ impl RecordBytesSink for ShadowStreamSink {
     ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
         Box::pin(async move {
             self.state.lock().await.dispatch_wire(start_lsn, bytes);
-            Ok(())
-        })
-    }
-
-    fn on_segment_boundary<'a>(
-        &'a mut self,
-        start_lsn: u64,
-        trailing_bytes: &'a [u8],
-    ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
-        Box::pin(async move {
-            let mut state = self.state.lock().await;
-            state.dispatch_wire(start_lsn, trailing_bytes);
             Ok(())
         })
     }
@@ -924,8 +910,8 @@ where
                             s.observe_status(
                                 id,
                                 status.write_lsn,
-                                status.flush_lsn,
-                                status.apply_lsn,
+                                Pos::new(status.flush_lsn),
+                                Pos::new(status.apply_lsn),
                             );
                         }
                     }
@@ -994,16 +980,16 @@ mod tests {
             .expect("current timeline");
         let applied = s.applied();
         let quiet = applied.current();
-        s.observe_status(id, 0x2000, 0x2000, 0x1000);
+        s.observe_status(id, 0x2000, Pos::new(0x2000), Pos::new(0x1000));
         assert_eq!(
             applied.current(),
             quiet,
             "flush progress alone releases nothing",
         );
-        s.observe_status(id, 0x2000, 0x2000, 0x1800);
+        s.observe_status(id, 0x2000, Pos::new(0x2000), Pos::new(0x1800));
         let woke = applied.current();
         assert!(woke > quiet);
-        s.observe_status(id, 0x2000, 0x2000, 0x1800);
+        s.observe_status(id, 0x2000, Pos::new(0x2000), Pos::new(0x1800));
         assert_eq!(applied.current(), woke, "a repeated status is not progress");
     }
 
@@ -1171,8 +1157,8 @@ mod tests {
         let b = s
             .register_connection(0x1000, 1, None)
             .expect("current timeline");
-        s.observe_status(a, 0x2000, 0x2000, 0x1800);
-        s.observe_status(b, 0x2200, 0x2100, 0x1900);
+        s.observe_status(a, 0x2000, Pos::new(0x2000), Pos::new(0x1800));
+        s.observe_status(b, 0x2200, Pos::new(0x2100), Pos::new(0x1900));
         let agg = s.aggregate();
         assert_eq!(agg.active_connections, 2);
         assert_eq!(agg.min_flush_lsn, Some(0x2000.into()));
@@ -1336,8 +1322,8 @@ mod tests {
     async fn on_segment_retired_trims_completed_keeps_straddling_bytes() {
         let state = Arc::new(Mutex::new(fresh_state())); // current_lsn = 0x1000
         let mut sink = ShadowStreamSink::new(state.clone());
-        // Wire dispatched past the 0x1004 boundary into the next segment — the
-        // straddle case where the old on_segment_boundary reset was skipped.
+        // Wire dispatched past the 0x1004 boundary into the next segment, as
+        // when a record straddles it
         sink.on_wire_chunk(0x1000, b"AAAABBBB").await.unwrap(); // head = 0x1008
         sink.on_segment_retired(0x1004).await.unwrap();
 

@@ -608,6 +608,25 @@ impl Shadow {
         Ok(out.status.code() == Some(0))
     }
 
+    /// Block until postmaster finishes startup like `pg_ctl start -w`,
+    /// `false` once it exits. Status is line 8 of `postmaster.pid`, see PG
+    /// `src/include/utils/pidfile.h`
+    pub fn wait_started(&self) -> Result<bool> {
+        let pid = self.config.data_dir.join("postmaster.pid");
+        while self.is_running()? {
+            let status = match fs::read_to_string(&pid) {
+                Ok(body) => body.lines().nth(7).map(|l| l.trim().to_owned()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+                Err(e) => return Err(e.into()),
+            };
+            if matches!(status.as_deref(), Some("ready" | "standby")) {
+                return Ok(true);
+            }
+            thread::sleep(self.config.wait_poll);
+        }
+        Ok(false)
+    }
+
     /// Feed a SQL payload to `psql -f -` (eg `pg_dump --schema-only`).
     pub fn apply_schema_dump(&self, sql: &str) -> Result<()> {
         let mut child = Command::new(self.config.bin("psql"))
