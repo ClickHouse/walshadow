@@ -351,7 +351,7 @@ async fn emitter_tls_round_trip() {
     // `AsyncClient::connect_tls`, so spawning the tail exercises the secure
     // path the same way the WAL/bootstrap producers do.
     let stats = Arc::new(EmitterStats::default());
-    let emitter_ack = Arc::new(Monotone::<EmitterAck>::new(0));
+    let emitter_ack = Arc::new(Monotone::<EmitterAck>::default());
     let fatal = Fatal::new();
     let (msg_tx, ack, tail_parts) = tail::spawn(&cfg, 1, stats, emitter_ack, fatal.clone())
         .await

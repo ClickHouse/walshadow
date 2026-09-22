@@ -3,8 +3,7 @@
 //! heap-tuple) in segment N can authorise a heap record in segment
 //! N+1 against the rewritten filenode.
 //!
-//! Pre-fix, `filter_segment` constructed a fresh `Filter` each call;
-//! every segment's tracker started empty. Two synthetic 1-page
+//! A fresh `Filter` per segment would start every tracker empty. Two synthetic 1-page
 //! segments (seg_size = 8 KiB) are pushed through `WalStream`; the
 //! second segment's heap record targets the rewritten filenode from
 //! the first. With the fix it lands as `Kept`; without it it would
@@ -25,7 +24,7 @@ use walrus::pg::walparser::{
     RmId, X_LOG_RECORD_HEADER_SIZE, XLP_LONG_HEADER, XLP_PAGE_MAGIC_PG15, XLR_BLOCK_ID_DATA_LONG,
 };
 
-use walshadow::filter::manifest::Kind;
+use walshadow::pos::Pos;
 use walshadow::record::Route;
 use walshadow::record::{
     CollectingRecordSink, CollectingSegmentSink, CompositeRecordSink, Record, RecordSink, SinkError,
@@ -192,7 +191,7 @@ async fn catalog_tracker_state_survives_segment_boundary() {
     );
     let seg2 = build_one_page_segment(&[&heap_rec]);
 
-    let mut stream = WalStream::new(1, SEG_SIZE, 0).expect("WalStream::new");
+    let mut stream = WalStream::new(1, SEG_SIZE, Pos::ZERO).expect("WalStream::new");
     let mut records = CollectingRecordSink::default();
     let mut segs = CollectingSegmentSink::default();
 
@@ -208,37 +207,22 @@ async fn catalog_tracker_state_survives_segment_boundary() {
     assert_eq!(segs.segments.len(), 2, "two segments dispatched");
     assert_eq!(records.records.len(), 2, "two records surfaced");
 
-    // Segment 1's relmap update — kept (special rmgr).
-    let seg1_manifest = &segs.segments[0].2;
-    assert_eq!(seg1_manifest.records.len(), 1);
-    assert_eq!(seg1_manifest.records[0].kind, Kind::Kept);
-    assert_eq!(seg1_manifest.stats.relmap_updates, 1);
-
     // Segment 2's heap record — kept iff the tracker carried the
     // relmap update across the segment boundary. This is the
     // regression assertion.
-    let seg2_manifest = &segs.segments[1].2;
-    assert_eq!(seg2_manifest.records.len(), 1);
     assert_eq!(
-        seg2_manifest.records[0].kind,
-        Kind::Kept,
+        records.records[1].route,
+        Route::ToShadow,
         "heap record on relmap-rewritten pg_class filenode must be kept; \
          a per-segment Filter would lose the seg-1 relmap and drop this",
     );
-    // No new relmap updates landed in seg 2 — `ManifestStats` is
-    // per-segment even though `FilterStats` on the long-lived `Filter`
-    // is cumulative.
-    assert_eq!(seg2_manifest.stats.relmap_updates, 0);
 
     // Cumulative filter stats sanity: 2 records seen total, both kept.
     let filter = stream.filter();
     assert_eq!(filter.stats().kept, 2);
     assert_eq!(filter.stats().dropped, 0);
     assert_eq!(filter.tracker().stats().relmap_updates, 1);
-
-    // RecordSink routes reflect the same outcome.
     assert_eq!(records.records[0].route, Route::ToShadow);
-    assert_eq!(records.records[1].route, Route::ToShadow);
 }
 
 /// Every record bracketed by one BEGIN…COMMIT carries the
@@ -269,7 +253,7 @@ async fn records_in_one_xact_share_xact_id_through_stream() {
     );
     let seg = build_one_page_segment(&[&r1, &r2, &r3, &r_other]);
 
-    let mut stream = WalStream::new(1, SEG_SIZE, 0).expect("WalStream::new");
+    let mut stream = WalStream::new(1, SEG_SIZE, Pos::ZERO).expect("WalStream::new");
     let mut records = CollectingRecordSink::default();
     let mut segs = CollectingSegmentSink::default();
     stream
@@ -408,7 +392,7 @@ async fn composite_sink_fans_out_to_all_inner_sinks() {
         Box::new(SharedCollectingSink(collected.clone())),
         Box::new(SharedCountingSink(counted.clone())),
     ]);
-    let mut stream = WalStream::new(1, SEG_SIZE, 0).expect("WalStream::new");
+    let mut stream = WalStream::new(1, SEG_SIZE, Pos::ZERO).expect("WalStream::new");
     let mut segs = CollectingSegmentSink::default();
     stream
         .push(0, &seg, &mut comp, &mut segs)
@@ -470,7 +454,7 @@ async fn composite_sink_propagates_inner_error_and_short_circuits() {
         }),
         Box::new(SharedCountingSink(after.clone())),
     ]);
-    let mut stream = WalStream::new(1, SEG_SIZE, 0).expect("WalStream::new");
+    let mut stream = WalStream::new(1, SEG_SIZE, Pos::ZERO).expect("WalStream::new");
     let mut segs = CollectingSegmentSink::default();
     let err = stream
         .push(0, &seg, &mut comp, &mut segs)

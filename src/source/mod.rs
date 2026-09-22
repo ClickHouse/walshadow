@@ -4,7 +4,6 @@ pub mod catalog_capture;
 pub mod manifest;
 pub mod queueing_record_sink;
 mod resume_prefix;
-pub(super) mod segment;
 pub mod segment_sink;
 pub mod shadow_stream;
 pub mod source_feed;

@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 use walrus::pg::replication::conn::PgConfig;
 use walrus::pg::replication::tls::{SslMode, TlsParams};
 use walshadow::boundary_hold::{BoundaryGateConfig, CatalogBoundaryGate};
+use walshadow::pos::Pos;
 use walshadow::record::{Record, RecordSink, Route, SinkError, WAL_SEG_SIZE, rmgr_label};
 use walshadow::schema::FIRST_NORMAL_OBJECT_ID;
 use walshadow::segment_sink::DirSegmentSink;
@@ -385,7 +386,7 @@ async fn attach(source: &Shadow, app_name: &str) -> (SourceFeed, WalStream) {
         .with_status_interval(Duration::from_millis(500));
     let ident = feed.identify_system().await.expect("IDENTIFY_SYSTEM");
     let aligned = WalStream::align_down(ident.xlogpos, WAL_SEG_SIZE);
-    let mut stream = WalStream::new(ident.timeline, WAL_SEG_SIZE, aligned).unwrap();
+    let mut stream = WalStream::new(ident.timeline, WAL_SEG_SIZE, Pos::new(aligned)).unwrap();
     stream.filter_mut().set_target_db(current_db_oid(source));
     {
         let sql_client = feed.sql_client().await.expect("sql client");

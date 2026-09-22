@@ -1,12 +1,11 @@
 //! End-to-end drill against the `walshadow-stream` binary.
 //!
-//! Spawns the daemon as a subprocess pointed at a basebackup-bootstrapped
-//! source / shadow PG pair, drives an INSERT/UPDATE/DELETE workload, and
-//! asserts shadow replays the workload before the daemon exits via its
-//! `--max-segments` cap. Exercises [bin/stream/args.rs]'s argv parsing,
-//! `run()` setup (preflight + tracker seed + ShadowCatalog connect +
-//! cursor write + status loop), the metrics endpoint, retention sweeper
-//! poll path, and the partial-segment flush on shutdown — paths the
+//! Spawns the daemon as a subprocess owning a basebackup-cloned shadow data
+//! dir, drives an INSERT/UPDATE/DELETE workload, and asserts shadow replays
+//! the workload before the daemon exits via its `--max-segments` cap.
+//! Exercises [bin/stream/args.rs]'s argv parsing, `run()` setup (shadow start +
+//! preflight + tracker seed + ShadowCatalog connect + cursor write + status
+//! loop), the metrics endpoint, and the partial-segment flush on shutdown — paths the
 //! pipeline_e2e / bootstrap_*_e2e fixtures don't reach because they
 //! re-implement the daemon's sink chain inline rather than driving the binary.
 //!
@@ -82,6 +81,16 @@ fn make_pg(tmp: &tempfile::TempDir, name: &str, port: u16) -> Shadow {
     cfg.ctl_timeout = Duration::from_secs(60);
     fs::create_dir_all(&cfg.filter_out_dir).unwrap();
     fs::create_dir_all(&cfg.socket_dir).unwrap();
+    Shadow::new(cfg)
+}
+
+/// Handle on the daemon-owned shadow for queries and teardown, never started
+/// here
+fn owned_shadow_handle(data: &Path, filtered: &Path, socket: &Path) -> Shadow {
+    let mut cfg = ShadowConfig::new(data.to_path_buf(), filtered.to_path_buf());
+    cfg.port = ports::PG_SHADOW_PORT;
+    cfg.socket_dir = socket.to_path_buf();
+    cfg.ctl_timeout = Duration::from_secs(60);
     Shadow::new(cfg)
 }
 
@@ -282,9 +291,8 @@ async fn bin_stream_replicates_segments_and_serves_metrics() {
         )
         .expect("apply source schema");
 
-    // 2. pg_basebackup -> shadow data dir. Retarget + standby.signal +
-    //    restore_command so shadow boots into recovery against the
-    //    daemon's --out-dir.
+    // 2. pg_basebackup -> shadow data dir. Daemon owns it from here:
+    //    writes conf + standby.signal, starts recovery against --out-dir.
     let shadow_data = tmp.path().join("shadow-data");
     pg_basebackup(&source, &shadow_data).expect("pg_basebackup");
     source.psql_one("SELECT pg_switch_wal()").expect("rotate");
@@ -293,31 +301,13 @@ async fn bin_stream_replicates_segments_and_serves_metrics() {
     fs::create_dir_all(&shadow_filter_dir).unwrap();
     let shadow_sock = tmp.path().join("shadow-sock");
     fs::create_dir_all(&shadow_sock).unwrap();
-    rewrite_for_shadow(&shadow_data, ports::PG_SHADOW_PORT, &shadow_sock)
-        .expect("retarget shadow conf");
-    enable_recovery(&shadow_data, &shadow_filter_dir, walsender_port)
-        .expect("enable shadow recovery");
-    append_bridge_conf(&shadow_data, &shadow_sock, bridge_lib_dir).expect("preload bridge worker");
-
-    let mut shadow_cfg = ShadowConfig::new(shadow_data.clone(), shadow_filter_dir.clone());
-    shadow_cfg.port = ports::PG_SHADOW_PORT;
-    shadow_cfg.socket_dir = shadow_sock.clone();
-    shadow_cfg.ctl_timeout = Duration::from_secs(60);
-    let shadow = Shadow::new(shadow_cfg);
-    if let Err(e) = shadow.start() {
-        let log = fs::read_to_string(shadow_data.join("startup.log"))
-            .unwrap_or_else(|_| "<no startup.log>".into());
-        panic!("start shadow standby failed: {e}\nstartup.log:\n{log}");
-    }
+    let shadow = owned_shadow_handle(&shadow_data, &shadow_filter_dir, &shadow_sock);
     let _shd_stop = StopOnDrop { sh: &shadow };
-    assert!(
-        shadow.is_in_recovery().expect("probe in-recovery"),
-        "shadow must boot in recovery",
-    );
 
     // 3. Spawn walshadow-stream. `--max-segments=1` makes the daemon
     //    exit cleanly after the workload's pg_switch_wal seals a
-    //    segment; `--metrics-bind` doubles as a readiness probe.
+    //    segment, `--keep-shadow-running` leaves shadow up for the
+    //    replay checks; `--metrics-bind` doubles as a readiness probe.
     let spill_dir = tmp.path().join("spill");
     fs::create_dir_all(&spill_dir).unwrap();
     let bin = env!("CARGO_BIN_EXE_walshadow-stream");
@@ -356,11 +346,15 @@ async fn bin_stream_replicates_segments_and_serves_metrics() {
             &metrics_addr.to_string(),
             "--walsender-bind",
             &format!("127.0.0.1:{walsender_port}"),
-            // Retention disabled — no shadow_replay sweeper churn
-            // racing the test's max-segments exit. Default would
-            // poll shadow on a 60s cadence; we'd never observe it.
+            // Retention disabled, so the pump's walreceiver apply LSN is
+            // the only feed of shadow_replay_lsn
             "--retention-bytes",
             "0",
+            "--bootstrap-shadow-data-dir",
+            shadow_data.to_str().unwrap(),
+            "--keep-shadow-running",
+            "--bridge-lib-dir",
+            bridge_lib_dir.to_str().unwrap(),
         ])
         .env("RUST_LOG", "warn,walshadow=info")
         .stdout(Stdio::null())
@@ -426,11 +420,16 @@ async fn bin_stream_replicates_segments_and_serves_metrics() {
             let body = http_get(metrics_addr, "/metrics").context("ack poll scrape")?;
             let ack = metric_u64(&body, "walshadow_emitter_ack_lsn")
                 .context("emitter_ack gauge in poll scrape")?;
-            if ack > ack_at_boot {
+            let replay = metric_u64(&body, "walshadow_shadow_replay_lsn")
+                .context("shadow_replay gauge in poll scrape")?;
+            if ack > ack_at_boot && replay > 0 {
                 break;
             }
             if std::time::Instant::now() > deadline {
-                bail!("emitter_ack_lsn never advanced past boot value {ack_at_boot}");
+                bail!(
+                    "emitter_ack_lsn {ack} never advanced past boot value {ack_at_boot}, \
+                     or shadow_replay_lsn {replay} stayed zero without retention",
+                );
             }
             std::thread::sleep(Duration::from_millis(200));
         }
@@ -660,24 +659,7 @@ async fn wire_drop_midsegment_shadow_resumes_streaming() {
     fs::create_dir_all(&filter_dir).unwrap();
     let shadow_sock = tmp.path().join("wd-shadow-sock");
     fs::create_dir_all(&shadow_sock).unwrap();
-    rewrite_for_shadow(&shadow_data, ports::PG_SHADOW_PORT, &shadow_sock).expect("retarget shadow");
-    enable_recovery(&shadow_data, &filter_dir, walsender_port).expect("enable recovery");
-    append_bridge_conf(&shadow_data, &shadow_sock, bridge_lib_dir).expect("preload bridge worker");
-    // Slow the walreceiver restart so killing it leaves a multi-second window in
-    // which the writer advances the head — guaranteeing the reconnect lands
-    // behind it (the gap). Overrides the 100ms from rewrite_for_shadow.
-    {
-        let conf = shadow_data.join("postgresql.conf");
-        let mut f = fs::OpenOptions::new().append(true).open(&conf).unwrap();
-        writeln!(f, "wal_retrieve_retry_interval = '2s'").unwrap();
-    }
-
-    let mut shadow_cfg = ShadowConfig::new(shadow_data.clone(), filter_dir.clone());
-    shadow_cfg.port = ports::PG_SHADOW_PORT;
-    shadow_cfg.socket_dir = shadow_sock.clone();
-    shadow_cfg.ctl_timeout = Duration::from_secs(60);
-    let shadow = Shadow::new(shadow_cfg);
-    shadow.start().expect("start shadow");
+    let shadow = owned_shadow_handle(&shadow_data, &filter_dir, &shadow_sock);
     let _shd_stop = StopOnDrop { sh: &shadow };
 
     let spill_dir = tmp.path().join("wd-spill");
@@ -721,6 +703,10 @@ async fn wire_drop_midsegment_shadow_resumes_streaming() {
             // never trips a spurious drop.
             "--retention-bytes",
             "0",
+            "--bootstrap-shadow-data-dir",
+            shadow_data.to_str().unwrap(),
+            "--bridge-lib-dir",
+            bridge_lib_dir.to_str().unwrap(),
         ])
         .env("RUST_LOG", "warn,walshadow=info")
         .stdout(Stdio::null())
@@ -732,6 +718,31 @@ async fn wire_drop_midsegment_shadow_resumes_streaming() {
     let mut writer: Option<Child> = None;
     let result = (|| -> Result<()> {
         wait_for_listen(metrics_addr, Duration::from_secs(30)).context("daemon never came up")?;
+        let attached = Instant::now();
+        while http_get(metrics_addr, "/metrics")
+            .and_then(|b| metric_u64(&b, "walshadow_shadow_stream_active_connections"))
+            .unwrap_or(0)
+            == 0
+        {
+            anyhow::ensure!(
+                attached.elapsed() < Duration::from_secs(60),
+                "shadow walreceiver never attached"
+            );
+            sleep(Duration::from_millis(200));
+        }
+        // Slow the walreceiver restart so killing it leaves a multi-second
+        // window in which the writer advances the head, guaranteeing the
+        // reconnect lands behind it (the gap). Daemon regenerates conf at
+        // start, so this lands after it via reload
+        let mut conf = fs::OpenOptions::new()
+            .append(true)
+            .open(shadow_data.join("postgresql.conf"))?;
+        writeln!(conf, "wal_retrieve_retry_interval = '2s'")?;
+        let reload = Command::new("pg_ctl")
+            .args(["-D", shadow_data.to_str().unwrap(), "reload"])
+            .output()
+            .context("pg_ctl reload")?;
+        anyhow::ensure!(reload.status.success(), "pg_ctl reload: {reload:?}");
 
         // Continuous WAL so the wire stays active (a lone write goes idle and
         // its trailing record never streams). Started now — shadow is attached

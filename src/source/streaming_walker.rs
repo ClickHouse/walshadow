@@ -1,26 +1,24 @@
 //! Record-cadence WAL segment walker.
 //!
 //! Driven by [`WalStream::push`](crate::source::wal_stream::WalStream::push) as
-//! bytes arrive on the replication socket. Mirrors
-//! [`crate::source::segment::SegmentWalker`]'s page state machine (same `Pending`
-//! cross-page stitching, same byte-range bookkeeping) but dispatches
-//! records the moment they complete, not at segment boundary. Buffer
-//! keeps accumulating so [`DirSegmentSink`](crate::source::segment_sink::DirSegmentSink)
-//! sees a full 16 MiB segment byte-for-byte at segment end, including
-//! in-place noop rewrites applied via
-//! [`rewrite_record`](StreamingWalker::rewrite_record).
-//!
-//! Cross-segment straddling matches the per-segment walker: `Pending`
-//! drops at segment reset, so records whose last byte sits in segment
-//! N+1 are lost. PG emits `XLOG_SWITCH` on operator-driven boundaries,
-//! aligning the demo case by construction.
+//! bytes arrive on the replication socket. Page state machine stitches
+//! cross-page records and tracks where each record's bytes sit, so a
+//! dropped record is rewritten in place. Records dispatch the moment they
+//! complete. Buffer keeps accumulating so
+//! [`DirSegmentSink`](crate::source::segment_sink::DirSegmentSink) sees a
+//! full 16 MiB segment byte-for-byte at segment end, including in-place
+//! noop rewrites applied via [`rewrite_record`](StreamingWalker::rewrite_record).
 
-use smallvec::smallvec;
+use smallvec::{SmallVec, smallvec};
 use walrus::pg::walparser::{X_LOG_RECORD_ALIGNMENT, X_LOG_RECORD_HEADER_SIZE};
 
-use crate::source::segment::ByteRanges;
 pub use crate::source::wal_page::WalkError;
 use crate::source::wal_page::{PAGE_SIZE, PageHeaderParse, align_up, parse_page_header};
+
+/// Inline-1: a record almost always lives on one page, multi-range only when
+/// it straddles a page boundary. Millions per segment, so inline case skips a
+/// heap alloc on the hot path.
+pub type ByteRanges = SmallVec<[(usize, usize); 1]>;
 
 /// One completed record's physical footprint within the current segment.
 ///
@@ -106,8 +104,7 @@ impl Pending {
     }
 }
 
-/// Streaming variant of [`SegmentWalker`](crate::source::segment::SegmentWalker);
-/// records yield as soon as their last byte arrives.
+/// Records yield as soon as their last byte arrives
 pub struct StreamingWalker {
     seg_size: usize,
     buf: Vec<u8>,

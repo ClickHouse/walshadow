@@ -129,34 +129,6 @@ fn pg_basebackup(source: &Shadow, dest: &Path) -> Result<()> {
     Ok(())
 }
 
-fn rewrite_for_shadow(data_dir: &Path, port: u16, socket_dir: &Path) -> Result<()> {
-    let conf = data_dir.join("postgresql.conf");
-    let mut f = fs::OpenOptions::new().append(true).open(&conf)?;
-    writeln!(f, "\n# walshadow kill-restart shadow overrides")?;
-    writeln!(f, "port = {port}")?;
-    writeln!(f, "unix_socket_directories = '{}'", socket_dir.display())?;
-    writeln!(f, "listen_addresses = ''")?;
-    writeln!(f, "hot_standby = on")?;
-    writeln!(f, "autovacuum = off")?;
-    writeln!(f, "fsync = off")?;
-    writeln!(f, "wal_retrieve_retry_interval = '100ms'")?;
-    Ok(())
-}
-
-fn enable_recovery(data_dir: &Path, restore_from: &Path, walsender_port: u16) -> Result<()> {
-    fs::write(data_dir.join("standby.signal"), b"")?;
-    let conf = data_dir.join("postgresql.conf");
-    let mut f = fs::OpenOptions::new().append(true).open(&conf)?;
-    writeln!(f, "\n# walshadow kill-restart recovery")?;
-    writeln!(
-        f,
-        "primary_conninfo = 'host=127.0.0.1 port={walsender_port} user=walshadow application_name=shadow sslmode=disable'",
-    )?;
-    writeln!(f, "restore_command = 'cp {}/%f %p'", restore_from.display())?;
-    writeln!(f, "recovery_target_timeline = 'latest'")?;
-    Ok(())
-}
-
 /// Daemon argv used by every spawn in the drill. Captures every flag
 /// that must stay identical across kill / restart so the manifest +
 /// spill dir continuity is preserved.
@@ -164,6 +136,7 @@ struct DaemonFlags {
     source_sock: PathBuf,
     shadow_sock: PathBuf,
     filter_dir: PathBuf,
+    shadow_data: PathBuf,
     spill_dir: PathBuf,
     metrics_addr: SocketAddr,
     walsender_bind: SocketAddr,
@@ -205,6 +178,11 @@ impl DaemonFlags {
             "0".into(),
             "--ch-config".into(),
             self.ch_config.to_string_lossy().into_owned(),
+            "--bootstrap-shadow-data-dir".into(),
+            self.shadow_data.to_string_lossy().into_owned(),
+            "--keep-shadow-running".into(),
+            "--bridge-lib-dir".into(),
+            fx::pgext_dir().to_string_lossy().into_owned(),
         ]
     }
 }
@@ -443,20 +421,13 @@ async fn run_drill(strategy: Strategy) -> Result<()> {
     fs::create_dir_all(&shadow_filter_dir)?;
     let shadow_sock = tmp.path().join("shadow-sock");
     fs::create_dir_all(&shadow_sock)?;
-    rewrite_for_shadow(&shadow_data, fx::PG_SHADOW_PORT, &shadow_sock)
-        .context("retarget shadow")?;
-    enable_recovery(&shadow_data, &shadow_filter_dir, slot.walsender).context("recovery conf")?;
-    // Bridge worker outlives every daemon cycle: the daemon dials it at boot,
-    // so each restart reconnects to the same preloaded worker
-    fx::append_bridge_conf(&shadow_data, &shadow_sock, "postgres", fx::pgext_dir())
-        .context("preload bridge worker")?;
-
+    // First daemon starts shadow; `--keep-shadow-running` leaves it up across
+    // every SIGKILL, and each restart adopts it with its bridge worker
     let mut shadow_cfg = ShadowConfig::new(shadow_data.clone(), shadow_filter_dir.clone());
     shadow_cfg.port = fx::PG_SHADOW_PORT;
     shadow_cfg.socket_dir = shadow_sock.clone();
     shadow_cfg.ctl_timeout = Duration::from_secs(60);
     let shadow = Shadow::new(shadow_cfg);
-    shadow.start().context("start shadow standby")?;
     let _shd_stop = fx::StopOnDrop { sh: &shadow };
 
     // 3. CH server + dest table (alive across all 5 daemon cycles).
@@ -474,6 +445,7 @@ async fn run_drill(strategy: Strategy) -> Result<()> {
         source_sock: source.config().socket_dir.clone(),
         shadow_sock: shadow_sock.clone(),
         filter_dir: shadow_filter_dir.clone(),
+        shadow_data: shadow_data.clone(),
         spill_dir: spill_dir.clone(),
         metrics_addr: format!("127.0.0.1:{}", slot.metrics).parse().unwrap(),
         walsender_bind: format!("127.0.0.1:{}", slot.walsender).parse().unwrap(),

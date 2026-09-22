@@ -6,6 +6,7 @@ use std::sync::Arc;
 use ahash::HashSet;
 use anyhow::Context;
 use tokio::sync::{Mutex, watch};
+use tokio_util::sync::CancellationToken;
 use walshadow::config::{ConfigResolver, ResolvedConfig};
 use walshadow::mapping::MappingHandle;
 use walshadow::pg::quote_ident;
@@ -13,27 +14,62 @@ use walshadow::runtime_config::InitialLoadMode;
 use walshadow::schema::RelName;
 use walshadow::shadow_catalog::ShadowCatalog;
 
-pub(crate) fn spawn_sighup_reload(
+pub(crate) async fn sighup_reload(
     mut sig: tokio::signal::unix::Signal,
     reloader: Arc<walshadow::control::Reloader>,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        while sig.recv().await.is_some() {
-            tracing::info!(target: "walshadow", "SIGHUP — live reload");
-            match reloader.reload().await {
-                Err(e) => {
-                    tracing::warn!(target: "walshadow", error = %format!("{e:#}"), "reload failed")
-                }
-                Ok(unfollowed) if !unfollowed.is_empty() => tracing::warn!(
-                    target: "walshadow::config",
-                    databases = %unfollowed.join(","),
-                    "config names databases this process does not follow; \
-                     shadow registers bridge workers at startup, so restart to add them",
-                ),
-                Ok(_) => {}
+) {
+    while sig.recv().await.is_some() {
+        tracing::info!(target: "walshadow", "SIGHUP — live reload");
+        match reloader.reload().await {
+            Err(e) => {
+                tracing::warn!(target: "walshadow", error = %format!("{e:#}"), "reload failed")
             }
+            Ok(unfollowed) if !unfollowed.is_empty() => tracing::warn!(
+                target: "walshadow::config",
+                databases = %unfollowed.join(","),
+                "config names databases this process does not follow; \
+                 shadow registers bridge workers at startup, so restart to add them",
+            ),
+            Ok(_) => {}
         }
-    })
+    }
+}
+
+/// First SIGINT/SIGTERM cancels the returned token, second exits at once
+pub(crate) fn spawn_shutdown_signals() -> anyhow::Result<CancellationToken> {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut term = signal(SignalKind::terminate()).context("install SIGTERM handler")?;
+    let mut int = signal(SignalKind::interrupt()).context("install SIGINT handler")?;
+    let token = CancellationToken::new();
+    let cancel = token.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = term.recv() => {}
+                _ = int.recv() => {}
+            }
+            if cancel.is_cancelled() {
+                tracing::warn!(target: "walshadow", "second signal, exiting without drain");
+                std::process::exit(1);
+            }
+            tracing::info!(target: "walshadow", "signal, shutting down");
+            cancel.cancel();
+        }
+    });
+    Ok(token)
+}
+
+/// Run `fut` unless shutdown is signalled first. Bailing mid-startup skips
+/// the final manifest write, which restart tolerates like a crash
+pub(crate) async fn or_signal<T>(
+    shutdown: &CancellationToken,
+    fut: impl Future<Output = anyhow::Result<T>>,
+) -> anyhow::Result<T> {
+    tokio::select! {
+        biased;
+        () = shutdown.cancelled() => anyhow::bail!("signal"),
+        out = fut => out,
+    }
 }
 
 /// Seed the resolver overlay from source PG's `<schema>.config_*` tables via
@@ -229,20 +265,18 @@ pub(crate) async fn apply_toml_initial_loads(
 
 /// Applies each republished [`ResolvedConfig`] snapshot to the live routing
 /// map. Full swap of the operator mapping, matching the boot seed; runs
-/// until the resolver's sender drops (SIGHUP disabled or daemon teardown).
-pub(crate) fn spawn_mapping_refresher(
+/// until the resolver's sender drops (daemon teardown).
+pub(crate) async fn refresh_mapping(
     mut config_rx: watch::Receiver<Arc<ResolvedConfig>>,
     mapping: MappingHandle,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        // Boot value already seeded into `mapping`; react to republishes.
-        while config_rx.changed().await.is_ok() {
-            let tables = config_rx.borrow_and_update().tables.clone();
-            mapping.publish(Arc::new(tables)).await;
-            tracing::info!(
-                target: "walshadow::config",
-                "routing map refreshed from resolved config",
-            );
-        }
-    })
+) {
+    // Boot value already seeded into `mapping`; react to republishes.
+    while config_rx.changed().await.is_ok() {
+        let tables = config_rx.borrow_and_update().tables.clone();
+        mapping.publish(Arc::new(tables)).await;
+        tracing::info!(
+            target: "walshadow::config",
+            "routing map refreshed from resolved config",
+        );
+    }
 }

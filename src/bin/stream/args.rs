@@ -182,20 +182,10 @@ pub(crate) struct Args {
     /// `dynamic_library_path`.
     #[arg(long)]
     pub(crate) bridge_lib_dir: Option<PathBuf>,
-    /// Walsender bind address. `127.0.0.1:0` lets the kernel pick a free
-    /// port, valid only for externally managed shadow (no
-    /// `--bootstrap-shadow-data-dir`): operator reads
-    /// `--walsender-port-file` and configures `primary_conninfo` by hand.
-    /// Daemon-owned shadow bakes this address into shadow's generated
-    /// `primary_conninfo` before shadow starts, so it rejects port 0 —
-    /// pass an explicit port there.
-    #[arg(long, default_value = "127.0.0.1:0")]
-    pub(crate) walsender_bind: SocketAddr,
-    /// File the daemon writes the bound walsender address into (one line
-    /// `host:port`). For `--walsender-bind` port 0: operator reads it to
-    /// learn the picked port and configures shadow's `primary_conninfo`.
+    /// Walsender bind address. Shadow's generated `primary_conninfo` names
+    /// it before shadow starts, so port 0 is rejected
     #[arg(long)]
-    pub(crate) walsender_port_file: Option<PathBuf>,
+    pub(crate) walsender_bind: SocketAddr,
     /// Slow-client backpressure: bytes queued onto a slow shadow
     /// connection before it's dropped + the wire falls back to
     /// `restore_command`.
@@ -308,15 +298,13 @@ pub(crate) struct Args {
     /// `object_store` reads wal-g-format backup from `[backup]` in
     /// `--ch-config`. Initialized data dir resumes without bootstrap
     /// regardless of mode. Unset falls through to `[bootstrap] mode` in
-    /// `--ch-config`, then to `off`
+    /// `--ch-config`, then to `direct`
     #[arg(long)]
     pub(crate) bootstrap_mode: Option<BootstrapMode>,
-    /// Shadow PG data dir. When set, daemon bootstraps or resumes shadow,
-    /// writes config, starts and supervises postmaster, then stops it on
-    /// exit. When unset, manage shadow externally. Required when
-    /// `--bootstrap-mode != off`
+    /// Shadow PG data dir. Daemon bootstraps or resumes shadow, writes
+    /// config, starts and supervises postmaster, then stops it on exit
     #[arg(long)]
-    pub(crate) bootstrap_shadow_data_dir: Option<PathBuf>,
+    pub(crate) bootstrap_shadow_data_dir: PathBuf,
     /// Object-store backup name. `LATEST` resolves to newest sentinel;
     /// otherwise the literal `base_TTTTTTTTLLLLLLLLSSSSSSSS` form. Unset
     /// falls through to `[bootstrap] backup_name`, then to `LATEST`.
@@ -420,6 +408,12 @@ pub(crate) fn validate_transport_args(args: &Args) -> Result<()> {
         args.catalog_hold_timeout > 0,
         "--catalog-hold-timeout must be positive",
     );
+    anyhow::ensure!(
+        args.walsender_bind.port() != 0,
+        "--walsender-bind {} has port 0; shadow's primary_conninfo names this \
+         address before shadow starts, so pass an explicit port",
+        args.walsender_bind,
+    );
     if let Some(db) = &args.shadow_dbname {
         tracing::warn!(
             target: "walshadow",
@@ -454,7 +448,7 @@ pub(crate) fn finish_ch_config(mut cfg: EmitterConfig, args: &Args) -> EmitterCo
 
 #[cfg(test)]
 pub(crate) fn args_from(argv: &[&str]) -> Args {
-    let base = [
+    let mut all = vec![
         "walshadow-stream",
         "--out-dir",
         "/tmp/out",
@@ -463,7 +457,16 @@ pub(crate) fn args_from(argv: &[&str]) -> Args {
         "--shadow-socket-dir",
         "/tmp/sock",
     ];
-    Args::parse_from(base.iter().copied().chain(argv.iter().copied()))
+    for (flag, default) in [
+        ("--bootstrap-shadow-data-dir", "/tmp/shadow-data"),
+        ("--walsender-bind", "127.0.0.1:5555"),
+    ] {
+        if !argv.contains(&flag) {
+            all.extend([flag, default]);
+        }
+    }
+    all.extend(argv);
+    Args::parse_from(all)
 }
 
 #[cfg(test)]
@@ -499,6 +502,10 @@ mod tests {
     #[test]
     fn transport_args_reject_archive_only_and_zero_hold_timeout() {
         assert!(validate_transport_args(&args_from(&[])).is_ok());
+        assert!(
+            validate_transport_args(&args_from(&["--walsender-bind", "127.0.0.1:0"])).is_err(),
+            "shadow's primary_conninfo cannot name a kernel-picked port",
+        );
         assert!(
             validate_transport_args(&args_from(&["--walsender-connect-timeout", "0"])).is_err(),
             "archive-only escape hatch must fail startup",

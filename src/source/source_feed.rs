@@ -21,7 +21,8 @@ use walrus::pg::replication::conn::{
 use walrus::pg::replication::stream::{Frame, build_status_update, decode_frame};
 use walrus::pg::replication::tls::{SocketStream, SslMode, maybe_upgrade};
 
-use crate::pos::{Floor, Pos, ResumeSafe, SourceReceived};
+use crate::pos::{Floor, Pos, ResumeSafe, ShadowReplay, SourceReceived};
+use crate::source::manifest::ShadowFloor;
 
 /// Matches wal-rus / wal-g defaults; servers tolerate up to
 /// `wal_sender_timeout` of silence (default 60s).
@@ -140,12 +141,35 @@ pub struct StandbyStatus {
 }
 
 impl StandbyStatus {
+    /// `apply` stays under shadow replay and the resume-safe ack, `flush`
+    /// also under the persisted floor a crash-now restart asks for. `shadow`
+    /// stands in for a replay LSN shadow has not reported yet
+    pub fn bounded(
+        write_lsn: Pos<SourceReceived>,
+        floor: Pos<Floor>,
+        resume_safe: Pos<ResumeSafe>,
+        shadow_replay: Pos<ShadowReplay>,
+        shadow: ShadowFloor,
+    ) -> Self {
+        // Replay and resume-safe ack share WAL position space, so either caps apply
+        let apply_lsn = if shadow_replay.is_zero() {
+            shadow.bound(resume_safe)
+        } else {
+            resume_safe.min(shadow_replay.retag())
+        };
+        Self {
+            write_lsn,
+            flush_lsn: floor.min(apply_lsn.retag()),
+            apply_lsn,
+        }
+    }
+
     /// All three slots at the same value.
     pub fn collapsed(lsn: u64) -> Self {
         Self {
-            write_lsn: lsn.into(),
-            flush_lsn: lsn.into(),
-            apply_lsn: lsn.into(),
+            write_lsn: Pos::new(lsn),
+            flush_lsn: Pos::new(lsn),
+            apply_lsn: Pos::new(lsn),
         }
     }
 }
@@ -624,6 +648,25 @@ mod tests {
             &mut floors,
         );
         assert_eq!(triple(held), (5000, 4000, 4000));
+    }
+
+    #[test]
+    fn bounded_status_stays_under_every_consumer() {
+        let open = ShadowFloor::unbounded();
+        let s = StandbyStatus::bounded(9000.into(), 4000.into(), 7000.into(), 5000.into(), open);
+        assert_eq!(triple(s), (9000, 4000, 5000));
+        let s = StandbyStatus::bounded(9000.into(), 8000.into(), 7000.into(), 0.into(), open);
+        assert_eq!(triple(s), (9000, 7000, 7000), "no replay reported yet");
+        let seeded = ShadowFloor::new(true, 0, crate::record::WAL_SEG_SIZE + 5);
+        let seg = crate::record::WAL_SEG_SIZE;
+        let s = StandbyStatus::bounded(
+            (9 * seg).into(),
+            (8 * seg).into(),
+            (7 * seg).into(),
+            0.into(),
+            seeded,
+        );
+        assert_eq!(triple(s), (9 * seg, seg, seg), "persisted replay stands in");
     }
 
     /// Both halves of the start LSN must be rendered in hexadecimal, matching

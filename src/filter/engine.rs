@@ -24,11 +24,10 @@ use crate::decode::wal_xact::{
 };
 use tokio_postgres::Client;
 
-use crate::filter::catalog_tracker::{CatalogTracker, CatalogTrackerStats, SeedError};
+use crate::filter::catalog_tracker::{CatalogTracker, SeedError};
 use crate::filter::classify::{Class, classify};
 use crate::filter::dirty_tree::{DirtyState, DirtyTree};
 use crate::filter::main_data;
-use crate::filter::manifest::ManifestStats;
 use crate::filter::shadow_relations::ShadowRelations;
 use crate::record::{AffectedOid, BoundaryInfo, BoundaryKind, Route, rmgr_label};
 use crate::schema::FIRST_NORMAL_OBJECT_ID;
@@ -48,21 +47,6 @@ pub struct FilterStats {
 }
 
 impl FilterStats {
-    /// Field-wise difference; per-segment manifest carves a window out of
-    /// a long-lived [`Filter`]'s cumulative `stats`.
-    pub fn delta_from(&self, prev: &Self) -> Self {
-        Self {
-            kept: self.kept - prev.kept,
-            dropped: self.dropped - prev.dropped,
-            kept_bytes: self.kept_bytes - prev.kept_bytes,
-            dropped_bytes: self.dropped_bytes - prev.dropped_bytes,
-            kept_catalog: self.kept_catalog - prev.kept_catalog,
-            kept_user: self.kept_user - prev.kept_user,
-            kept_special: self.kept_special - prev.kept_special,
-            kept_empty: self.kept_empty - prev.kept_empty,
-        }
-    }
-
     pub fn record(&mut self, class: Class, route: Route, bytes: u64) {
         match route {
             Route::ToShadow | Route::ToBoth => {
@@ -81,31 +65,6 @@ impl FilterStats {
             }
         }
     }
-}
-
-impl ManifestStats {
-    pub(crate) fn from_filter(stats: FilterStats, catalog: CatalogTrackerStats) -> Self {
-        Self {
-            records: stats.kept + stats.dropped,
-            kept: stats.kept,
-            dropped: stats.dropped,
-            kept_bytes: stats.kept_bytes,
-            dropped_bytes: stats.dropped_bytes,
-            catalog_keeps: stats.kept_catalog,
-            user_keeps: stats.kept_user,
-            special_keeps: stats.kept_special,
-            empty_keeps: stats.kept_empty,
-            relmap_updates: catalog.relmap_updates,
-            pg_class_writes_undecoded: catalog.pg_class_writes_undecoded,
-            pg_class_writes_oid_in_prefix: catalog.pg_class_writes_oid_in_prefix,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct FilterSnapshot {
-    stats: FilterStats,
-    catalog: CatalogTrackerStats,
 }
 
 /// Full routing verdict for one record; see [`Filter::decide_record`].
@@ -303,15 +262,6 @@ impl Filter {
         Ok(next_xid)
     }
 
-    pub fn decide(&mut self, record: &XLogRecord) -> Route {
-        // Offline callers (segment filter tool) have no LSN and no capture;
-        // a malformed commit payload only degrades boundary metadata there,
-        // and commit records route ToShadow either way
-        self.decide_record(record, 0, 0xD116)
-            .map(|v| v.route)
-            .unwrap_or(Route::ToShadow)
-    }
-
     pub fn tracker(&self) -> &CatalogTracker {
         &self.tracker
     }
@@ -324,20 +274,6 @@ impl Filter {
         &self.stats
     }
 
-    pub(crate) fn snapshot(&self) -> FilterSnapshot {
-        FilterSnapshot {
-            stats: self.stats,
-            catalog: self.tracker.stats(),
-        }
-    }
-
-    pub(crate) fn manifest_stats_since(&self, previous: FilterSnapshot) -> ManifestStats {
-        ManifestStats::from_filter(
-            self.stats.delta_from(&previous.stats),
-            self.tracker.stats().delta_from(previous.catalog),
-        )
-    }
-
     /// Classify route and catalog boundary, reject incomplete commit metadata
     pub fn decide_record(
         &mut self,
@@ -345,7 +281,7 @@ impl Filter {
         source_lsn: u64,
         page_magic: u16,
     ) -> Result<Verdict, XactPayloadError> {
-        let obs = self.tracker.observe(record);
+        let obs = self.tracker.observe(record, page_magic);
         let class = classify(record);
         // `catalog_touch_db` names the database whose catalog this record
         // wrote: only paths proving a catalog relation was written yield
@@ -808,6 +744,12 @@ mod tests {
     /// Followed database in these tests; 6 is the foreign one
     const TARGET_DB: u32 = 5;
 
+    impl Filter {
+        fn decide(&mut self, record: &XLogRecord) -> Route {
+            self.decide_record(record, 0, 0xD116).unwrap().route
+        }
+    }
+
     /// Live wiring: the followed database is set before the first record
     fn target_filter() -> Filter {
         let mut f = Filter::new();
@@ -837,7 +779,7 @@ mod tests {
             f.decide(&rec(RmId::Heap, &[(TARGET_DB, 1259)])),
             Route::ToShadow
         );
-        assert_eq!(f.decide(&rec(RmId::Xact, &[])), Route::ToShadow);
+        assert_eq!(f.decide(&rec(RmId::Clog, &[])), Route::ToShadow);
     }
 
     /// Admit main-fork relations created while shadow is replaying WAL
@@ -1014,7 +956,7 @@ mod tests {
     #[test]
     fn special_rmgr_is_kept() {
         let mut f = target_filter();
-        let r = rec(RmId::Xact, &[]);
+        let r = rec(RmId::Clog, &[]);
         assert_eq!(f.decide(&r), Route::ToShadow);
     }
 

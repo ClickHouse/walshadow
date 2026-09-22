@@ -365,25 +365,54 @@ async fn create_table_and_copy_same_xact_delivers() {
     if skip_gate() {
         return;
     }
-    let mut drill = build_drill(
+    let drill = build_drill(
         fx::Ports::alloc(),
         "CREATE SCHEMA dac;\n",
         "dac",
         "walshadow-dirty-create-copy",
     )
     .await;
+    create_and_copy_same_xact_delivers(drill, "dac").await;
+}
 
+/// Same shape with scope from `replicate_all` alone: plan-time route
+/// prediction must map the table like the executor's create does
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn create_table_and_copy_same_xact_delivers_under_replicate_all() {
+    if skip_gate() {
+        return;
+    }
+    let drill = build_drill_with(
+        fx::Ports::alloc(),
+        "CREATE SCHEMA dar;\n",
+        "dar",
+        "walshadow-dirty-create-copy-replicate-all",
+        |cfg| {
+            cfg.replicate_all = true;
+            cfg.namespaces
+                .get_mut("dar")
+                .expect("drill namespace")
+                .auto_create = false;
+        },
+    )
+    .await;
+    create_and_copy_same_xact_delivers(drill, "dar").await;
+}
+
+async fn create_and_copy_same_xact_delivers(mut drill: Drill, ns: &str) {
     let driver = spawn_txn(
         &drill.source,
-        "BEGIN;\n\
-         CREATE TABLE dac.fresh (id bigint PRIMARY KEY, v text);\n\
-         COPY dac.fresh (id, v) FROM stdin;\n\
-         1\ta\n\
-         2\tb\n\
-         3\tc\n\
-         \\.\n\
-         COMMIT;\n\
-         SELECT pg_switch_wal();\n",
+        &format!(
+            "BEGIN;\n\
+             CREATE TABLE {ns}.fresh (id bigint PRIMARY KEY, v text);\n\
+             COPY {ns}.fresh (id, v) FROM stdin;\n\
+             1\ta\n\
+             2\tb\n\
+             3\tc\n\
+             \\.\n\
+             COMMIT;\n\
+             SELECT pg_switch_wal();\n"
+        ),
     );
     pump_and_drain(&mut drill).await;
     let _ = driver.join();

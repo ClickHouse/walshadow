@@ -393,6 +393,8 @@ pub enum PendingLedgerError {
 #[derive(Serialize, Deserialize)]
 struct PendingFile {
     version: u32,
+    #[serde(default)]
+    system_id: Option<u64>,
     #[serde(default, rename = "carry")]
     entries: Vec<PendingEntry>,
 }
@@ -457,27 +459,39 @@ impl PendingEntry {
 #[derive(Debug)]
 pub struct PendingLedger {
     dir: PathBuf,
+    system_id: u64,
     entries: Vec<PendingEntry>,
 }
+
+/// One ledger shared by live commit folding and backup passes adding
+/// tables, so neither persists a copy missing the other's state
+pub type SharedPendingLedger = Arc<tokio::sync::Mutex<PendingLedger>>;
 
 pub fn ledger_path(spill_dir: &Path) -> PathBuf {
     spill_dir.join(PENDING_LEDGER_FILENAME)
 }
 
 impl PendingLedger {
-    /// Treat missing file as empty; reject corrupt state
-    pub async fn load(spill_dir: &Path) -> Result<Self, PendingLedgerError> {
+    /// Treat missing file as empty; reject corrupt state and state another
+    /// source system wrote
+    pub async fn load(spill_dir: &Path, system_id: u64) -> Result<Self, PendingLedgerError> {
         let mut ledger = Self {
             dir: spill_dir.to_path_buf(),
+            system_id,
             entries: Vec::new(),
         };
-        match tokio::fs::read_to_string(ledger_path(spill_dir)).await {
+        let path = ledger_path(spill_dir);
+        match tokio::fs::read_to_string(&path).await {
             Ok(text) => {
                 let file: PendingFile = toml::from_str(&text)?;
                 if file.version != PENDING_LEDGER_VERSION {
                     return Err(PendingLedgerError::Version(file.version));
                 }
+                let unstamped = crate::fs::check_source(&path, file.system_id, system_id)?;
                 ledger.entries = file.entries;
+                if unstamped {
+                    ledger.persist().await?;
+                }
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(e.into()),
@@ -489,8 +503,13 @@ impl PendingLedger {
     pub fn empty() -> Self {
         Self {
             dir: PathBuf::new(),
+            system_id: 0,
             entries: Vec::new(),
         }
+    }
+
+    pub fn shared(self) -> SharedPendingLedger {
+        Arc::new(tokio::sync::Mutex::new(self))
     }
 
     pub fn is_empty(&self) -> bool {
@@ -515,6 +534,7 @@ impl PendingLedger {
         }
         let text = toml::to_string(&PendingFile {
             version: PENDING_LEDGER_VERSION,
+            system_id: Some(self.system_id),
             entries: self.entries.clone(),
         })
         .expect("pending ledger serialize");
@@ -523,6 +543,12 @@ impl PendingLedger {
 
     /// Replace previous pass state after rebuilding and publishing tables
     pub async fn push(&mut self, manifest: &PendingManifest) -> io::Result<()> {
+        self.stage(manifest);
+        self.persist().await
+    }
+
+    /// [`Self::push`] without persisting
+    pub fn stage(&mut self, manifest: &PendingManifest) {
         let mut xids = manifest.xids.clone();
         xids.sort_unstable();
         let entry = PendingEntry {
@@ -530,7 +556,7 @@ impl PendingLedger {
             relname: manifest.rel.rel.name.to_string(),
             database: manifest.rel.database.clone(),
             table: manifest.rel.table.clone(),
-            start_lsn: manifest.start_lsn.into(),
+            start_lsn: Pos::new(manifest.start_lsn),
             outstanding: xids,
             committed: Vec::new(),
             aborted: Vec::new(),
@@ -540,7 +566,6 @@ impl PendingLedger {
         self.entries
             .retain(|e| e.namespace != entry.namespace || e.relname != entry.relname);
         self.entries.push(entry);
-        self.persist().await
     }
 
     /// Record transaction and subtransaction outcomes; return settled count
@@ -806,7 +831,7 @@ mod tests {
     #[tokio::test]
     async fn ledger_round_trips_and_settles_across_rounds() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut ledger = PendingLedger::load(tmp.path()).await.unwrap();
+        let mut ledger = PendingLedger::load(tmp.path(), 7).await.unwrap();
         assert!(ledger.is_empty());
         ledger
             .push(&manifest("orders", vec![101, 102]))
@@ -818,7 +843,7 @@ mod tests {
         assert_eq!(ledger.note(999, &[], true), 0);
         ledger.persist().await.unwrap();
 
-        let mut reloaded = PendingLedger::load(tmp.path()).await.unwrap();
+        let mut reloaded = PendingLedger::load(tmp.path(), 7).await.unwrap();
         assert_eq!(reloaded.entries()[0].committed, [101]);
         assert_eq!(reloaded.entries()[0].outstanding, [102]);
         assert_eq!(reloaded.outstanding(), [102].into_iter().collect());
@@ -832,7 +857,7 @@ mod tests {
     #[tokio::test]
     async fn promote_selects_only_settled_rows() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut ledger = PendingLedger::load(tmp.path()).await.unwrap();
+        let mut ledger = PendingLedger::load(tmp.path(), 7).await.unwrap();
         ledger
             .push(&manifest("orders", vec![101, 102]))
             .await
@@ -853,7 +878,7 @@ mod tests {
     #[tokio::test]
     async fn promote_names_only_the_current_round() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut ledger = PendingLedger::load(tmp.path()).await.unwrap();
+        let mut ledger = PendingLedger::load(tmp.path(), 7).await.unwrap();
         ledger
             .push(&manifest("orders", vec![101, 102]))
             .await
@@ -891,7 +916,7 @@ mod tests {
     #[tokio::test]
     async fn inverted_outcomes_promote_nothing() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut ledger = PendingLedger::load(tmp.path()).await.unwrap();
+        let mut ledger = PendingLedger::load(tmp.path(), 7).await.unwrap();
         ledger
             .push(&manifest("orders", vec![101, 102]))
             .await
@@ -916,7 +941,7 @@ mod tests {
         use crate::decode::visibility::{PgXactAccum, PgXactPatch};
 
         let tmp = tempfile::tempdir().unwrap();
-        let mut ledger = PendingLedger::load(tmp.path()).await.unwrap();
+        let mut ledger = PendingLedger::load(tmp.path(), 7).await.unwrap();
         ledger.push(&manifest("orders", vec![101])).await.unwrap();
         let accum = PgXactAccum::new();
         let patch = PgXactPatch::new();
@@ -930,11 +955,31 @@ mod tests {
     async fn corrupt_ledger_is_an_error() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(ledger_path(tmp.path()), "version = 1\n[[carry").unwrap();
-        assert!(PendingLedger::load(tmp.path()).await.is_err());
+        assert!(PendingLedger::load(tmp.path(), 7).await.is_err());
         std::fs::write(ledger_path(tmp.path()), "version = 999\n").unwrap();
         assert!(matches!(
-            PendingLedger::load(tmp.path()).await,
+            PendingLedger::load(tmp.path(), 7).await,
             Err(PendingLedgerError::Version(999))
         ));
+    }
+
+    #[tokio::test]
+    async fn unstamped_ledger_upgrades_and_foreign_source_is_an_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            ledger_path(tmp.path()),
+            "version = 1\n[[carry]]\nnamespace = 'public'\nrelname = 'orders'\n\
+             database = 'db'\ntable = 'orders'\nstart_lsn = '0/5000'\noutstanding = [101]\n",
+        )
+        .unwrap();
+        let ledger = PendingLedger::load(tmp.path(), 7).await.unwrap();
+        assert_eq!(ledger.entries()[0].outstanding, [101]);
+        let text = std::fs::read_to_string(ledger_path(tmp.path())).unwrap();
+        assert!(text.contains("system_id = 7"), "{text}");
+        let err = PendingLedger::load(tmp.path(), 8).await.unwrap_err();
+        assert!(
+            err.to_string().contains("belongs to source system 7"),
+            "{err}"
+        );
     }
 }

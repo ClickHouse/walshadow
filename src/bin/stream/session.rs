@@ -9,6 +9,7 @@ use ahash::{HashMap, HashMapExt};
 use anyhow::{Context, Result};
 use tokio::sync::{Mutex, watch};
 use tokio_postgres::types::Oid;
+use tokio_util::sync::CancellationToken;
 use walrus::pg::backup::format_pg_lsn;
 use walshadow::boundary_hold::{BoundaryGateConfig, BoundaryHoldSink, CatalogBoundaryGate};
 use walshadow::ch_emitter::{EmitterConfig, EmitterStats};
@@ -41,15 +42,16 @@ use crate::bootstrap::{
     resolve_shadow_start, run_bootstrap,
 };
 use crate::housekeeping::{
-    SEGMENT_FSYNC_QUEUE, spawn_desc_log_gc, spawn_retention, spawn_segment_fsync,
+    SEGMENT_FSYNC_QUEUE, spawn_desc_log_gc, spawn_segment_fsync, trim_retention,
 };
 use crate::metrics_publish::{
-    DbMetricSources, DrainResident, ShadowMetricsView, SourceSwapView, StageCounters, TimelineView,
+    DbMetricSources, DrainResident, ShadowMetricsView, SourceSwap, StageCounters, TimelineView,
     populate_metrics,
 };
+use crate::runtime_cfg::{or_signal, sighup_reload};
 use crate::shadow_proc::{
-    ShadowLifecycle, bridge_pool_size, build_owned_shadow, open_shadow_sql_client, probe_blocking,
-    start_owned_shadow, walsender_primary_conninfo,
+    OwnedShadow, ShadowLifecycle, bridge_pool_size, build_owned_shadow, open_shadow_sql_client,
+    probe_blocking, start_owned_shadow, walsender_primary_conninfo,
 };
 use crate::sinks::{DaemonSinks, DecoderXactPair};
 use crate::source_db::{
@@ -57,19 +59,22 @@ use crate::source_db::{
     open_source_sql_client,
 };
 use crate::source_recovery::{
-    BARRIER_LOG_INTERVAL, FORK_FENCE_DRAIN, PROMOTION_POLL, PromotionGate, SOURCE_SWAP_RETRY,
-    SourceRecovery, commit_fork_resume, connect_source_waiting, promotion_gate, resume_manifest,
-    resume_source_feed, stream_branch, swap_reason,
+    BARRIER_LOG_INTERVAL, FORK_FENCE_DRAIN, PROMOTION_POLL, PromotionGate, Redial,
+    SOURCE_SWAP_RETRY, SourcePath, SourceRecovery, commit_fork_resume, connect_source_waiting,
+    promotion_gate, resume_manifest, resume_source_feed, stream_branch, swap_reason,
 };
 
 pub(crate) async fn run_session(
     args: &Args,
     metrics: &MetricsRegistry,
     reloader: &Arc<walshadow::control::Reloader>,
-    mut sigterm: tokio::signal::unix::Signal,
+    sighup: tokio::signal::unix::Signal,
+    shutdown: &CancellationToken,
 ) -> Result<()> {
     // Clone the Arc-backed registry so the body's `&metrics` uses are unchanged.
     let metrics = metrics.clone();
+    let mut tasks = SessionTasks::default();
+    tasks.spawn("sighup reload", sighup_reload(sighup, reloader.clone()));
 
     let merged: toml::Table = match args.ch_config.as_deref() {
         Some(p) => walshadow::ch_emitter::load_effective(p, cli_base(args))
@@ -85,7 +90,11 @@ pub(crate) async fn run_session(
         source_conn.slot = args.slot.clone();
     }
     let mut cfg = source_conn.to_pg_config();
-    let mut feed = connect_source_waiting(args, &mut source_conn, &mut cfg).await;
+    let mut feed = or_signal(
+        shutdown,
+        connect_source_waiting(args, &mut source_conn, &mut cfg),
+    )
+    .await?;
 
     let ident = feed.identify_system().await.context("IDENTIFY_SYSTEM")?;
     tracing::info!(
@@ -160,10 +169,7 @@ pub(crate) async fn run_session(
     {
         walshadow::filter::shadow_relations::ShadowRelations::load(dir).await?;
     }
-    let bridge_workers = match shadow_start {
-        ShadowStart::External => 1,
-        _ => bridge_pool_size(ch_config.as_ref()),
-    };
+    let bridge_workers = bridge_pool_size(ch_config.as_ref());
     // Slot before bootstrap
     if let Some(slot) = source_conn.slot.as_deref() {
         feed.ensure_physical_slot(slot)
@@ -180,7 +186,7 @@ pub(crate) async fn run_session(
     // keeps inserter and TOAST totals from resetting at handoff
     let emitter_stats = Arc::new(EmitterStats::default());
     let mut bootstrap_metrics: Option<BootstrapMetrics> = None;
-    let bootstrap_handoff: Option<BootstrapHandoff> = if shadow_start.bootstraps() {
+    let mut bootstrap_handoff: Option<BootstrapHandoff> = if shadow_start.bootstraps() {
         if !args.skip_preflight {
             let source_sql = feed
                 .sql_client()
@@ -201,18 +207,21 @@ pub(crate) async fn run_session(
         } else {
             None
         };
-        let (handoff, stage) = run_bootstrap(
-            &cfg,
-            &mut feed,
-            args,
-            &bootstrap_plan,
-            previous,
-            ch_config.clone(),
-            BootstrapObservers {
-                metrics: &metrics,
-                emitter_stats: emitter_stats.clone(),
-                uptime_from: start_instant,
-            },
+        let (handoff, stage) = or_signal(
+            shutdown,
+            run_bootstrap(
+                &cfg,
+                &mut feed,
+                args,
+                &bootstrap_plan,
+                previous,
+                ch_config.clone(),
+                BootstrapObservers {
+                    metrics: &metrics,
+                    emitter_stats: emitter_stats.clone(),
+                    uptime_from: start_instant,
+                },
+            ),
         )
         .await
         .context("bootstrap")?;
@@ -226,43 +235,37 @@ pub(crate) async fn run_session(
         bootstrap_handoff.as_ref().map(BootstrapHandoff::resume_lsn);
     // Regenerate config because shadow's port, socket, and GUC floor may change
     // Keep shadow alive until pipeline teardown finishes
-    let shadow_lifecycle: Option<ShadowLifecycle> = match &shadow_start {
-        ShadowStart::External => None,
-        ShadowStart::Bootstrap(dir)
-        | ShadowStart::Rebootstrap(dir, _)
-        | ShadowStart::Resume(dir) => {
-            // Reuse shadow instance started during bootstrap
-            let shadow = match bootstrap_handoff.as_ref().and_then(|h| h.shadow.clone()) {
-                Some(running) => running,
-                None => {
-                    let shadow = Arc::new(build_owned_shadow(
-                        args,
-                        &source_conn.dbname,
-                        &source_databases,
-                        dir.clone(),
-                        bridge_workers,
-                    ));
-                    shadow
-                        .write_standby_signal()
-                        .context("write standby.signal")?;
-                    walshadow::ops::stages::SHADOW_REPLAY
-                        .measure(start_owned_shadow(
-                            &shadow,
-                            bootstrap_end_lsn,
-                            Duration::from_secs(args.bootstrap_shadow_replay_timeout),
-                            args.keep_shadow_running,
-                        ))
-                        .await?;
-                    shadow
-                }
-            };
-            Some(ShadowLifecycle::spawn(
-                shadow,
-                walsender_primary_conninfo(args.walsender_bind),
+    // Reuse shadow instance started during bootstrap
+    let owned = match bootstrap_handoff.as_mut().and_then(|h| h.shadow.take()) {
+        Some(running) => running,
+        None => {
+            let owned = OwnedShadow::new(
+                build_owned_shadow(
+                    args,
+                    &source_conn.dbname,
+                    &source_databases,
+                    shadow_start.data_dir().to_path_buf(),
+                    bridge_workers,
+                ),
                 args.keep_shadow_running,
-            ))
+            );
+            owned
+                .shadow
+                .write_standby_signal()
+                .context("write standby.signal")?;
+            walshadow::ops::stages::SHADOW_REPLAY
+                .measure(start_owned_shadow(
+                    &owned.shadow,
+                    bootstrap_end_lsn,
+                    Duration::from_secs(args.bootstrap_shadow_replay_timeout),
+                    args.keep_shadow_running,
+                ))
+                .await?;
+            owned
         }
     };
+    let shadow_lifecycle =
+        ShadowLifecycle::spawn(owned, walsender_primary_conninfo(args.walsender_bind));
     let backup_settings = ch_config.as_ref().and_then(|c| c.backup.clone());
     let start_lsn_override: Option<Pos<Floor>> = args
         .start_lsn
@@ -313,7 +316,7 @@ pub(crate) async fn run_session(
         start_lsn_override,
         bootstrap_resume_lsn.map(Pos::new),
         manifest_at_boot.as_ref().map(|m| m.lsn.emitter_ack),
-        ident.xlogpos,
+        Pos::new(ident.xlogpos),
     );
     let pinned = bootstrap_end_lsn.is_some() || start_lsn_override.is_some();
     let shadow_holds_data = ch_config.as_ref().is_some_and(|c| c.toast.mode.is_shadow());
@@ -330,8 +333,7 @@ pub(crate) async fn run_session(
     let floor_at_boot = manifest_at_boot
         .as_ref()
         .map(|m| m.floor)
-        .filter(|f| !f.is_zero())
-        .map(|f| boot_shadow_floor.bound(f));
+        .filter(|f| !f.is_zero());
     // Archive-end scan only feeds the greenfield clamp (keep archive
     // continuous until live streaming begins: starting after last sealed
     // segment leaves shadow missing WAL; re-read from earlier LSN, CH
@@ -344,7 +346,13 @@ pub(crate) async fn run_session(
     } else {
         None
     };
-    let aligned = manifest::resolve_start(raw_start, floor_at_boot, pinned, archive_end);
+    let aligned = manifest::resolve_start(
+        raw_start,
+        floor_at_boot,
+        pinned,
+        archive_end,
+        boot_shadow_floor,
+    );
     tracing::info!(
         target: "walshadow",
         raw = %raw_start,
@@ -445,10 +453,7 @@ pub(crate) async fn run_session(
         .collect();
 
     let mut stream = WalStream::new(start_timeline, WAL_SEG_SIZE, aligned)?;
-    let mut prefix_dirs = vec![args.out_dir.clone()];
-    if let Some(dir) = shadow_start.data_dir() {
-        prefix_dirs.push(dir.join("pg_wal"));
-    }
+    let prefix_dirs = [args.out_dir.clone(), shadow_start.data_dir().join("pg_wal")];
     stream.preserve_resume_prefix(&prefix_dirs).await?;
     // Shadow must attach to this listener before catalog replay can advance
     let mut shadow_boot = walshadow::shadow_stream::ShadowStreamState::new(
@@ -466,41 +471,26 @@ pub(crate) async fn run_session(
     )
     .await?;
     let shadow_state = Arc::new(Mutex::new(shadow_boot));
-    let walsender_listener = tokio::net::TcpListener::bind(args.walsender_bind)
-        .await
-        .with_context(|| format!("bind walsender at {}", args.walsender_bind))?;
-    let walsender_addr = walsender_listener
-        .local_addr()
-        .context("walsender local_addr")?;
-    drop(walsender_listener); // spawn_listener re-binds at the same addr
-    if let Some(path) = &args.walsender_port_file {
-        tokio::fs::write(path, format!("{}\n", walsender_addr))
-            .await
-            .with_context(|| format!("write walsender port file {}", path.display()))?;
-    }
-    let _walsender_task = walshadow::shadow_stream::spawn_listener(
+    let walsender_addr = args.walsender_bind;
+    let walsender_task = walshadow::shadow_stream::spawn_listener(
         walshadow::shadow_stream::WalSenderAddr::Tcp(walsender_addr),
         shadow_state.clone(),
         Duration::from_millis(50),
     )
     .await
-    .context("spawn walsender listener")?;
-    tracing::info!(
-        target: "walshadow",
-        addr = %walsender_addr,
-        "walsender listening — point shadow's primary_conninfo here",
-    );
+    .with_context(|| format!("bind walsender at {walsender_addr}"))?;
+    tasks.adopt("walsender listener", walsender_task);
+    tracing::info!(target: "walshadow", addr = %walsender_addr, "walsender listening");
     stream.set_bytes_sink(Box::new(walshadow::shadow_stream::ShadowStreamSink::new(
         shadow_state.clone(),
     )));
     // Set address after bind so first connection succeeds
     // Supervisor restarts a shadow that is down, with the address in its conf
-    if let (Some(lifecycle), Some(conninfo)) = (
-        &shadow_lifecycle,
-        walsender_primary_conninfo(args.walsender_bind),
-    ) {
-        probe_blocking(&lifecycle.shadow, move |s| s.point_at_walsender(&conninfo)).await;
-    }
+    let conninfo = walsender_primary_conninfo(walsender_addr);
+    probe_blocking(&shadow_lifecycle.guard.shadow, move |s| {
+        s.point_at_walsender(&conninfo)
+    })
+    .await;
 
     // Seed catalog tracker from source's current pg_class before
     // START_REPLICATION. Closes the "source rotated a mapped catalog above
@@ -668,18 +658,26 @@ pub(crate) async fn run_session(
     if let (Some(end_lsn), Some(resume)) = (bootstrap_end_lsn, bootstrap_resume_lsn) {
         let initial = manifest::Manifest {
             version: manifest::MANIFEST_VERSION,
-            floor: manifest::resolved_floor(resume, end_lsn),
+            // Shadow replayed through end_lsn before handoff, so its bound
+            // never cuts below resume ≤ end_lsn
+            floor: manifest::FloorInputs {
+                resume_safe: Pos::new(resume),
+                filter_durable: Pos::new(end_lsn),
+                shadow: manifest::ShadowFloor::new(shadow_holds_data, end_lsn, 0),
+                ..manifest::FloorInputs::default()
+            }
+            .floor(),
             source: live_identity.clone(),
             wal: manifest::WalBranch {
                 stream_timeline: start_timeline,
             },
             lsn: manifest::LsnSet {
-                source_received: end_lsn.into(),
-                filter_durable: end_lsn.into(),
-                shadow_replay: end_lsn.into(),
-                drain: resume.into(),
-                emitter_ack: resume.into(),
-                shadow_flush: end_lsn.into(),
+                source_received: Pos::new(end_lsn),
+                filter_durable: Pos::new(end_lsn),
+                shadow_replay: Pos::new(end_lsn),
+                drain: Pos::new(resume),
+                emitter_ack: Pos::new(resume),
+                shadow_flush: Pos::new(end_lsn),
             },
         };
         manifest::write(&args.spill_dir, &initial)
@@ -701,10 +699,10 @@ pub(crate) async fn run_session(
     // Check TOAST availability for opt-in and configured relations
     let mut shadow_toast_held = None;
     if shadow_toast {
-        let dir = shadow_start
-            .data_dir()
-            .context("[toast] mode = shadow requires a daemon-owned shadow")?;
-        stream.filter_mut().load_shadow_rels(dir).await?;
+        stream
+            .filter_mut()
+            .load_shadow_rels(shadow_start.data_dir())
+            .await?;
         let rels = stream
             .filter()
             .shadow_rels()
@@ -797,15 +795,20 @@ pub(crate) async fn run_session(
     // replay their drop, so the post-spawn flush below is their only route
     // to the wipe. Loaded in metrics-only runs too (inert without a chunk
     // store), preserved for a later CH run over the same spill dir.
-    let retires = walshadow::toast_retire::RetireLedger::load(&args.spill_dir)
-        .await
-        .context("load toast retire ledger")?;
+    let retires =
+        walshadow::toast_retire::RetireLedger::load(&args.spill_dir, live_identity.system_id)
+            .await
+            .context("load toast retire ledger")?;
     // Pending tables a bootstrap or backup pass left holding undecided rows.
     // Settling needs ClickHouse, so a metrics-only run leaves the ledger for
     // a later CH run over the same spill dir
-    let pending_rows = walshadow::visibility_pending::PendingLedger::load(&args.spill_dir)
-        .await
-        .context("load pending visibility ledger")?;
+    let pending_rows = walshadow::visibility_pending::PendingLedger::load(
+        &args.spill_dir,
+        live_identity.system_id,
+    )
+    .await
+    .context("load pending visibility ledger")?
+    .shared();
     // Layered config resolvers (CLI > TOML), one per database. The SIGHUP
     // task re-reads TOML and republishes each
     let mut config_resolvers: Vec<Arc<ConfigResolver>> = Vec::new();
@@ -857,6 +860,9 @@ pub(crate) async fn run_session(
                 source_major,
                 raw_start,
                 shadow_toast_held: shadow_toast_held.as_ref(),
+                system_id: live_identity.system_id,
+                pending_rows: &pending_rows,
+                tasks: &mut tasks,
             })
             .await
             .with_context(|| format!("wire source database {}", conn.name))?;
@@ -962,7 +968,7 @@ pub(crate) async fn run_session(
             span_registry: span_registry.clone(),
             backfillers: HashMap::new(),
             retires,
-            pending_rows: walshadow::visibility_pending::PendingLedger::empty(),
+            pending_rows: walshadow::visibility_pending::PendingLedger::empty().shared(),
             resume_floor: resume_floor.clone(),
             budget: None,
         }
@@ -978,7 +984,7 @@ pub(crate) async fn run_session(
         .await
         .context("boot flush of due toast-mirror retires")?;
     reorder_sink
-        .settle_pending_boot(args.bootstrap_shadow_data_dir.as_deref())
+        .settle_pending_boot(Some(&args.bootstrap_shadow_data_dir))
         .await
         .context("boot settle of pending backup rows")?;
     reorder_sink
@@ -1051,10 +1057,12 @@ pub(crate) async fn run_session(
     };
     // Segment fsync off the hot path: sink writes+renames, the task fsyncs and
     // publishes `durable_lsn`. Seed at the resume point.
-    let durable_lsn = Arc::new(Monotone::<FilterDurable>::new(stream.dispatched_lsn()));
+    let durable_lsn = Arc::new(Monotone::<FilterDurable>::new(Pos::new(
+        stream.dispatched_lsn(),
+    )));
     let fsync_fatal = walshadow::pipeline::Fatal::new();
     let (fsync_tx, fsync_rx) = tokio::sync::mpsc::channel::<SegFsync>(SEGMENT_FSYNC_QUEUE);
-    let fsync_task = spawn_segment_fsync(
+    let mut fsync_task = spawn_segment_fsync(
         args.out_dir.clone(),
         fsync_rx,
         durable_lsn.clone(),
@@ -1070,7 +1078,7 @@ pub(crate) async fn run_session(
     // Pruner's own cell, not `resume_floor`: dropping it is what tells the gc
     // task the session is done
     let gc_floor = Monotone::<Floor>::default();
-    let gc_task = spawn_desc_log_gc(desc_log.clone(), gc_floor.watch(), gc_fatal.clone());
+    let mut gc_task = spawn_desc_log_gc(desc_log.clone(), gc_floor.watch(), gc_fatal.clone());
     let mut chunk_buf = Vec::with_capacity(64 * 1024);
 
     // Metrics endpoint + control socket + SIGHUP are process-lifetime (bound in
@@ -1079,27 +1087,27 @@ pub(crate) async fn run_session(
     // refreshers exit); mapping/budget live-reload arrives via the WAL overlay.
     let _ = &config_resolvers;
 
-    // Retention sweeper writes shadow's `pg_last_wal_replay_lsn` here;
-    // status loop reads it for the cursor's `shadow_replay_lsn` slot + the
-    // standby-status `apply_lsn` ceiling.
+    // Walreceiver apply LSN (shadow's `GetXLogReplayRecPtr`), joined each pump
+    // iteration; feeds the manifest's `shadow_replay`, the shadow floor, the
+    // standby-status `apply_lsn` ceiling and the retention cut
     let shadow_replay_lsn = Arc::new(Monotone::<ShadowReplay>::default());
     // Aggregate flush across ShadowStreamSink connections, fed into the
     // cursor for shadow's `START_REPLICATION PHYSICAL` resume on restart.
     let shadow_flush_lsn = Arc::new(Monotone::<ShadowFlush>::default());
 
     // Retention sweeper drops filtered segments more than `retention_bytes`
-    // behind shadow's replay LSN. Its poll doubles as the only feed of
-    // `shadow_replay_lsn`, sparing the main loop a second shadow connection.
-    let _retention_task = if args.retention_bytes > 0 {
-        Some(spawn_retention(
-            args.out_dir.clone(),
-            args.retention_bytes,
-            shadow_conninfo.clone(),
-            shadow_replay_lsn.clone(),
-        ))
-    } else {
-        None
-    };
+    // behind shadow's replay LSN
+    if args.retention_bytes > 0 {
+        tasks.spawn(
+            "retention",
+            trim_retention(
+                args.out_dir.clone(),
+                args.retention_bytes,
+                shadow_conninfo.clone(),
+                shadow_replay_lsn.clone(),
+            ),
+        );
+    }
 
     // Block until shadow's walreceiver attaches. `ShadowStreamSink::
     // on_wire_chunk` drops bytes with no connection registered, so a pump
@@ -1130,7 +1138,11 @@ pub(crate) async fn run_session(
                 args.walsender_connect_timeout,
                 agg.accepted_total,
             );
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            or_signal(shutdown, async {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                Ok(())
+            })
+            .await?;
         }
         tracing::info!(
             target: "walshadow",
@@ -1145,7 +1157,7 @@ pub(crate) async fn run_session(
         floor: &resume_floor,
         prefetch: usize::from(args.archive_prefetch),
     };
-    let mut archive = None;
+    let mut path = SourcePath::Live;
     if let Err(e) = feed
         .start_physical_replication(
             source_conn.slot.as_deref(),
@@ -1153,19 +1165,17 @@ pub(crate) async fn run_session(
             start_timeline,
         )
         .await
-        && let Some(recovered) = source_recovery
+    {
+        path = source_recovery
             .recover(
                 e,
                 &cfg,
                 source_conn.slot.as_deref(),
                 stream_branch(&history, live_identity.system_id, &stream),
                 stream.next_lsn(),
-                &mut archive,
+                &mut feed,
             )
-            .await
-            .context("resume WAL source")?
-    {
-        feed = recovered;
+            .await;
     }
 
     let mut segments_shipped = 0u64;
@@ -1191,12 +1201,7 @@ pub(crate) async fn run_session(
     // Pause and the source endpoint are cluster-wide, so the primary's
     // resolver is the one the pump watches
     let pump_config_rx = config_resolvers.first().map(|r| r.subscribe());
-    let mut source_swap_pending = false;
-    let mut source_swap_retry_at: Option<Instant> = None;
-    let mut source_swaps_total = 0u64;
-    let mut source_swap_failures_total = 0u64;
-    // Proof the last swap attempt failed, cleared once one lands
-    let mut source_swap_blocked_on: &'static str = "";
+    let mut swap = SourceSwap::default();
     // Frozen when the pump observes a pause, so a promotion decision reads a
     // frontier that cannot move under it. Cleared on resume: a value left over
     // from an earlier pause is as misleading as a live one
@@ -1224,12 +1229,12 @@ pub(crate) async fn run_session(
     // ancestor's switchpoint an ordinary reconnect has nothing to ask for
     let mut crossing = CrossingState::default();
     let mut barrier_logged: Option<Instant> = None;
-    let shutdown_reason = loop {
-        if archive.is_some() && history.branch_exhausted(stream.timeline(), stream.next_lsn().get())
+    let shutdown_reason = 'pump: loop {
+        if matches!(path, SourcePath::Archive(_))
+            && history.branch_exhausted(stream.timeline(), stream.next_lsn().get())
         {
-            archive = None;
-            crossing.ancestor_ended();
-            crossing.needs_connection();
+            path = SourcePath::Live;
+            crossing.ancestor_ended(true);
         }
         let paused = pump_config_rx
             .as_ref()
@@ -1249,9 +1254,31 @@ pub(crate) async fn run_session(
                 );
                 source_conn = desired;
                 cfg = source_conn.to_pg_config();
-                source_swap_pending = true;
-                source_swap_retry_at = None;
+                swap.requested();
             }
+        }
+        // Lost source redials whatever `[source]` names now, so a repoint made
+        // during an outage is what the next attempt dials
+        if let SourcePath::Redial(redial) = &mut path
+            && let Some(fresh) = source_recovery
+                .redial(
+                    redial,
+                    &cfg,
+                    source_conn.slot.as_deref(),
+                    stream_branch(&history, live_identity.system_id, &stream),
+                    stream.next_lsn(),
+                )
+                .await?
+        {
+            feed = fresh;
+            path = SourcePath::Live;
+            swap.settled();
+            tracing::info!(
+                target: "walshadow",
+                endpoint = source_conn.endpoint(),
+                resume_lsn = %stream.next_lsn(),
+                "source reconnected — resuming replication",
+            );
         }
         // Swap between chunks, so the resume point is the byte-contiguous
         // `next_lsn` and no WalStream state is rebuilt. Old feed stays up
@@ -1262,9 +1289,7 @@ pub(crate) async fn run_session(
         // Not while a crossing is pending: the stream sits at a switchpoint no
         // branch resumes from, and the crossing dials the live endpoint and slot
         // itself, so a repoint made mid-crossing lands there instead.
-        if source_swap_pending
-            && !crossing.pending()
-            && source_swap_retry_at.is_none_or(|at| Instant::now() >= at)
+        if swap.due(Instant::now()) && !crossing.pending() && !matches!(path, SourcePath::Redial(_))
         {
             match resume_source_feed(
                 &cfg,
@@ -1278,11 +1303,9 @@ pub(crate) async fn run_session(
             {
                 Ok(swapped) => {
                     feed = swapped;
-                    archive = None;
-                    source_swap_pending = false;
-                    source_swap_retry_at = None;
-                    source_swaps_total += 1;
-                    source_swap_blocked_on = "";
+                    path = SourcePath::Live;
+                    swap.settled();
+                    swap.swaps += 1;
                     tracing::info!(
                         target: "walshadow",
                         endpoint = source_conn.endpoint(),
@@ -1292,14 +1315,12 @@ pub(crate) async fn run_session(
                     );
                 }
                 Err(e) => {
-                    source_swap_failures_total += 1;
-                    source_swap_retry_at = Some(Instant::now() + SOURCE_SWAP_RETRY);
-                    source_swap_blocked_on = swap_reason(&e);
-                    timeline_stats.record_reason(source_swap_blocked_on);
+                    swap.failed(swap_reason(&e));
+                    timeline_stats.record_reason(swap.blocked_on);
                     tracing::warn!(
                         target: "walshadow",
                         error = %format!("{e:#}"),
-                        reason = source_swap_blocked_on,
+                        reason = swap.blocked_on,
                         endpoint = source_conn.endpoint(),
                         "source endpoint swap failed — staying on current feed",
                     );
@@ -1366,11 +1387,14 @@ pub(crate) async fn run_session(
                 }
             };
         }
-        let shadow_replay = shadow_replay_lsn.get();
         let (shadow_agg, shadow_served_tli) = {
             let state = shadow_state.lock().await;
             (state.aggregate(), state.timeline)
         };
+        if let Some(apply) = shadow_agg.min_apply_lsn {
+            shadow_replay_lsn.join(apply);
+        }
+        let shadow_replay = shadow_replay_lsn.get();
         if let Some(flush) = shadow_agg.min_flush_lsn {
             shadow_flush_lsn.join(flush);
         }
@@ -1384,10 +1408,6 @@ pub(crate) async fn run_session(
         };
         let shadow_floor =
             manifest::ShadowFloor::new(shadow_toast, shadow_replay.get(), shadow_replay_seed);
-        let apply_ceiling = match shadow_replay.get() {
-            0 => shadow_floor.bound(resume_safe_lsn),
-            s => s.min(resume_safe_lsn.get()).into(),
-        };
         let cur = resume_manifest(
             &history,
             &live_identity,
@@ -1419,12 +1439,13 @@ pub(crate) async fn run_session(
         // flush caps physical slot's restart_lsn.
         // Manifest writes are cadence-gated above while keepalive replies inside
         // next_event can send this status at any time.
-        let status = StandbyStatus {
-            write_lsn: received,
-            // Keep source slot behind crash-safe resume floor
-            flush_lsn: resume_floor.get().min(apply_ceiling.retag()),
-            apply_lsn: apply_ceiling,
-        };
+        let status = StandbyStatus::bounded(
+            received,
+            resume_floor.get(),
+            resume_safe_lsn,
+            shadow_replay,
+            shadow_floor,
+        );
         let dispatched_before = stream.dispatched_lsn();
         // Set inside the select arm, acted on once the chunk borrow is released
         let mut ancestor_ended = false;
@@ -1432,11 +1453,12 @@ pub(crate) async fn run_session(
         let mut archived_segment = false;
         let chunk = tokio::select! {
             biased;
-            sig = tokio::signal::ctrl_c() => {
-                sig.context("install ctrl_c handler")?;
-                break "signal";
-            }
-            _ = sigterm.recv() => break "signal",
+            () = shutdown.cancelled() => break "signal",
+            err = tasks.exited() => return Err(err),
+            res = &mut fsync_task => return Err(task_stopped("segment fsync", res, &fsync_fatal)),
+            res = &mut gc_task => return Err(task_stopped("descriptor log gc", res, &gc_fatal)),
+            // Surfaced by the check after the crossing step
+            () = pipeline_handle.fatal.wait() => None,
             // Idle tick so metrics/cursor keep tracking, and so a `paused` flip
             // is picked up promptly.
             _ = tokio::time::sleep(metrics_tick) => None,
@@ -1444,8 +1466,8 @@ pub(crate) async fn run_session(
             // arm and the pump continues from the same LSN. A pending crossing
             // also parks it — that connection is out of COPY until the
             // descendant is requested.
-            result = async { archive.as_mut().unwrap().next().await },
-                if archive.is_some() && !paused && !crossing.pending() => {
+            result = async { path.archive().expect("guarded by arm").next().await },
+                if matches!(path, SourcePath::Archive(_)) && !paused && !crossing.pending() => {
                 match result {
                     Some(Ok((start_lsn, mut bytes))) => {
                         anyhow::ensure!(start_lsn == stream.next_lsn().get(), "archive WAL discontinuity");
@@ -1467,18 +1489,14 @@ pub(crate) async fn run_session(
                             None => "archive reader stopped".to_string(),
                             Some(Ok(_)) => unreachable!(),
                         };
-                        archive = None;
                         tracing::info!(target: "walshadow", reason, "archive ended, reconnecting source");
-                        feed = source_recovery.reconnect_or_operator(
-                            &cfg, source_conn.slot.as_deref(),
-                            stream_branch(&history, live_identity.system_id, &stream),
-                            stream.next_lsn(), &reason,
-                        ).await?;
+                        path = SourcePath::Redial(Redial::now(reason));
                         None
                     }
                 }
             },
-            res = feed.next_event(status, &mut chunk_buf), if archive.is_none() && !paused && !crossing.pending() => match res {
+            res = feed.next_event(status, &mut chunk_buf),
+                if matches!(path, SourcePath::Live) && !paused && !crossing.pending() => match res {
                 Ok(SourceEvent::Wal(c)) => Some(c),
                 Ok(SourceEvent::TimelineEnd) => {
                     ancestor_ended = true;
@@ -1496,63 +1514,43 @@ pub(crate) async fn run_session(
                         finished_timeline = stream.timeline(),
                         "source stream ended where the branch does — crossing",
                     );
-                    crossing.ancestor_ended();
-                    crossing.needs_connection();
+                    crossing.ancestor_ended(true);
                     None
                 }
                 // The source stopped, this consumer did not: reconnect, which
                 // is also how a switchover's demoted primary hands over
-                Ok(SourceEvent::Shutdown) => {
-                    tracing::info!(
-                        target: "walshadow",
-                        resume_lsn = %stream.next_lsn(),
-                        "source shut down its walsender — reconnecting",
-                    );
-                    if let Some(recovered) = source_recovery
+                res => {
+                    let err = match res {
+                        Err(e) => {
+                            tracing::warn!(
+                                target: "walshadow",
+                                error = %e,
+                                resume_lsn = %stream.next_lsn(),
+                                "source stream error — recovering",
+                            );
+                            e
+                        }
+                        _ => {
+                            tracing::info!(
+                                target: "walshadow",
+                                resume_lsn = %stream.next_lsn(),
+                                "source shut down its walsender — reconnecting",
+                            );
+                            anyhow::anyhow!("source walsender exited")
+                        }
+                    };
+                    path = source_recovery
                         .recover(
-                            anyhow::anyhow!("source walsender exited"),
+                            err,
                             &cfg,
                             source_conn.slot.as_deref(),
                             stream_branch(&history, live_identity.system_id, &stream),
                             stream.next_lsn(),
-                            &mut archive,
+                            &mut feed,
                         )
-                        .await? {
-                            feed = recovered;
-                        }
-                    source_swap_pending = false;
-                    source_swap_retry_at = None;
-                    None
-                }
-                Err(e) => {
-                    let resume = stream.next_lsn().get();
-                    tracing::warn!(
-                        target: "walshadow",
-                        error = %e,
-                        resume_lsn = format_pg_lsn(resume).to_string(),
-                        "source stream error — recovering",
-                    );
-                    if let Some(recovered) = source_recovery
-                        .recover(
-                            e,
-                            &cfg,
-                            source_conn.slot.as_deref(),
-                            stream_branch(&history, live_identity.system_id, &stream),
-                            stream.next_lsn(),
-                            &mut archive,
-                        )
-                        .await? {
-                            feed = recovered;
-                        }
-                    // Recovery dialed the live endpoint, so a queued swap is done
-                    source_swap_pending = false;
-                    source_swap_retry_at = None;
-                    let resumed = stream.next_lsn().get();
-                    tracing::info!(
-                        target: "walshadow",
-                        resume_lsn = format_pg_lsn(resumed).to_string(),
-                        "source reconnected — resuming replication",
-                    );
+                        .await;
+                    // Recovery dials the live endpoint, so a queued swap is done
+                    swap.settled();
                     None
                 }
             },
@@ -1582,10 +1580,11 @@ pub(crate) async fn run_session(
         }
         metrics
             .update(|snap| {
-                snap.archive_restore_active = u64::from(archive.is_some());
                 snap.pump_queue_wait_seconds_total =
                     record_sink.decoder_xact.inner.send_wait_seconds();
-                if let Some(reader) = &archive {
+                snap.archive_restore_active = 0;
+                if let SourcePath::Archive(reader) = &path {
+                    snap.archive_restore_active = 1;
                     snap.archive_fetch_seconds_total +=
                         reader.fetch_nanos.swap(0, Ordering::Relaxed) as f64 / 1e9;
                     snap.archive_wait_seconds_total +=
@@ -1597,15 +1596,15 @@ pub(crate) async fn run_session(
             // Answer the backend's CopyDone now, leaving the connection in
             // simple-query mode: that is the state the crossing reads history
             // from, and the state a retry can rebuild by reconnecting
-            if let Err(e) = feed.end_historic_stream().await {
+            let ended = feed.end_historic_stream().await;
+            if let Err(e) = &ended {
                 tracing::warn!(
                     target: "walshadow",
                     error = %format!("{e:#}"),
                     "ending the historic stream failed — reconnecting to cross",
                 );
-                crossing.needs_connection();
             }
-            crossing.ancestor_ended();
+            crossing.ancestor_ended(ended.is_err());
         }
         // Nothing left to stream on the ancestor at its own switchpoint, so
         // only the crossing moves the stream forward. Attempts pace themselves
@@ -1638,7 +1637,7 @@ pub(crate) async fn run_session(
                 }
             }
         }
-        if crossing_due && !crossing.awaiting_connection() && !crossing.has_fork() {
+        if crossing_due && !crossing.awaiting_connection() && crossing.fork().is_none() {
             match switchover
                 .probe(
                     &mut feed,
@@ -1657,7 +1656,7 @@ pub(crate) async fn run_session(
                         switch_lsn = %format_pg_lsn(probed.switch_lsn),
                         "source fork proved — draining the pipeline to it",
                     );
-                    crossing.hold_fork(probed);
+                    crossing.proved(probed);
                 }
                 Err(e) if e.retryable() => {
                     tracing::warn!(
@@ -1673,7 +1672,7 @@ pub(crate) async fn run_session(
         }
         if crossing_due
             && !crossing.awaiting_connection()
-            && let Some(probed) = crossing.take_fork()
+            && let Some(probed) = crossing.fork().cloned()
         {
             // Both fork proofs read the decoder's view, so the pump-side queue
             // drains first: a record still in flight answers for a frontier the
@@ -1690,7 +1689,10 @@ pub(crate) async fn run_session(
                 if n == 0 || fence.elapsed() >= FORK_FENCE_DRAIN {
                     break n;
                 }
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                tokio::select! {
+                    () = shutdown.cancelled() => break 'pump "signal",
+                    () = tokio::time::sleep(Duration::from_millis(10)) => {}
+                }
             };
             // Timeout stops queue drain only, fork guards remain authoritative
             if in_flight != 0 {
@@ -1724,7 +1726,7 @@ pub(crate) async fn run_session(
                 filter_durable: durable,
                 floor: resume_floor.get(),
             }
-            .pending(probed.switch_lsn, WAL_SEG_SIZE);
+            .pending(Pos::new(probed.switch_lsn), WAL_SEG_SIZE);
             if let Some(wait) = waiting_on {
                 // Prod the walreceiver: non-forced replies fire only on flush
                 // progress, and the ancestor's tail may be the last thing left
@@ -1738,7 +1740,6 @@ pub(crate) async fn run_session(
                     );
                     barrier_logged = Some(Instant::now());
                 }
-                crossing.hold_fork(probed);
             } else {
                 barrier_logged = None;
                 let commit = async |resume: walshadow::transition::ForkResume| {
@@ -1748,7 +1749,7 @@ pub(crate) async fn run_session(
                         resume,
                         manifest::LsnSet {
                             // Fork cannot precede last observed source head
-                            source_received: received.get().max(resume.switch_lsn.get()).into(),
+                            source_received: received.max(resume.switch_lsn.retag()),
                             filter_durable: durable,
                             shadow_replay,
                             drain: guards.drain_lsn,
@@ -1793,9 +1794,7 @@ pub(crate) async fn run_session(
                         history = crossed.history;
                         history_tx.send_replace(Arc::new(history.clone()));
                         crossing.committed();
-                        source_swap_pending = false;
-                        source_swap_retry_at = None;
-                        source_swap_blocked_on = "";
+                        swap.settled();
                     }
                     // Lineage, prefix, and publication proofs need an operator; a
                     // source or storage error is worth another attempt. Every
@@ -1810,7 +1809,6 @@ pub(crate) async fn run_session(
                             "timeline crossing failed — retrying",
                         );
                         crossing.retry_from_source(Instant::now() + SOURCE_SWAP_RETRY);
-                        crossing.hold_fork(probed);
                     }
                     Err(e) => crossing.park(e, stream.next_lsn().get(), Some(probed.switch_lsn)),
                 }
@@ -1828,12 +1826,6 @@ pub(crate) async fn run_session(
         // root cause rather than a silently pinned watermark.
         if let Some(msg) = pipeline_handle.fatal.message() {
             anyhow::bail!("decode+insert pipeline failed: {msg}");
-        }
-        if let Some(msg) = fsync_fatal.message() {
-            anyhow::bail!("segment fsync failed: {msg}");
-        }
-        if let Some(msg) = gc_fatal.message() {
-            anyhow::bail!("{msg}");
         }
         // Re-read rather than reuse the top-of-iteration pair: a crossing commits
         // a new floor and branch mid-iteration, and this is what an operator
@@ -1880,7 +1872,7 @@ pub(crate) async fn run_session(
         populate_metrics(
             &metrics,
             received,
-            now_dispatched.into(),
+            Pos::new(now_dispatched),
             shadow_replay,
             drain_for_metric,
             emitter_ack_for_metric,
@@ -1891,12 +1883,7 @@ pub(crate) async fn run_session(
             drain_resident,
             Some(&pipeline_handle.budget),
             decoder_stats,
-            SourceSwapView {
-                swaps: source_swaps_total,
-                failures: source_swap_failures_total,
-                pending: source_swap_pending,
-                blocked_on: source_swap_blocked_on,
-            },
+            &swap,
             TimelineView {
                 source_system_id: live_identity.system_id,
                 source_timeline: stream.timeline(),
@@ -2008,32 +1995,28 @@ pub(crate) async fn run_session(
             inflight_stall_logged = false;
         }
     };
-    drop(archive);
+    drop(path);
     tracing::info!(
         target: "walshadow",
         reason = shutdown_reason,
         out_dir = %args.out_dir.display(),
-        "stopping — flushing partial segment",
+        "stopping",
     );
     let final_timeline = stream.timeline();
     let final_received = stream.next_lsn().get();
-    stream
-        .close(Some(&mut segment_sink), &mut record_sink)
-        .await
-        .context("flush partial segment on shutdown")?;
-    // Drop the sink (closes the fsync queue) and drain the fsync task so the
-    // final partial is durable.
+    // Drop the sink (closes the fsync queue) and drain the fsync task so
+    // sealed segments are durable
     drop(segment_sink);
-    fsync_task.await.ok();
-    if let Some(msg) = fsync_fatal.message() {
-        anyhow::bail!("segment fsync failed: {msg}");
+    let res = fsync_task.await;
+    if res.is_err() || fsync_fatal.is_set() {
+        return Err(task_stopped("segment fsync", res, &fsync_fatal));
     }
     // Close the floor channel and join: nothing else may own desc_log.ckpt
     // after the session returns
     drop(gc_floor);
-    gc_task.await.ok();
-    if let Some(msg) = gc_fatal.message() {
-        anyhow::bail!("{msg}");
+    let res = gc_task.await;
+    if res.is_err() || gc_fatal.is_set() {
+        return Err(task_stopped("descriptor log gc", res, &gc_fatal));
     }
     // Drain queueing worker so enqueued-but-undispatched records run
     // through decoder + xact_drain before exit; surfaces worker-parked errors.
@@ -2042,8 +2025,8 @@ pub(crate) async fn run_session(
         .close()
         .await
         .context("drain queueing decoder sink on shutdown")?;
-    // Worker close dropped the reorder sink, closing the decode job queue.
-    // Drain rest in order (decoders → batcher force-flush → inserters to
+    // Worker close dropped the reorder sink. Drain rest in order
+    // (batcher force-flush → inserters to
     // EndOfStream → ack collector) so no rows are lost + final watermark durable.
     pipeline_handle
         .join()
@@ -2056,9 +2039,7 @@ pub(crate) async fn run_session(
         (drain, b.resume_safe_lsn(ea))
     };
     let shadow_replay = shadow_replay_lsn.get();
-    // `close` zero-pads the final partial to a whole segment, so its fsync
-    // publishes a durable end past what the source actually sent
-    let durable = Pos::new(durable_lsn.get().get().min(final_received));
+    let durable = durable_lsn.get();
     manifest::write(
         &args.spill_dir,
         &resume_manifest(
@@ -2079,8 +2060,97 @@ pub(crate) async fn run_session(
     )
     .await
     .context("write shutdown resume manifest")?;
-    if let Some(lifecycle) = shadow_lifecycle {
-        lifecycle.shutdown().await;
+    shadow_lifecycle.shutdown().await;
+    tasks.shutdown().await
+}
+
+/// Session tasks meant to run until shutdown; any exit before it is fatal
+#[derive(Default)]
+pub(crate) struct SessionTasks {
+    set: tokio::task::JoinSet<()>,
+    names: ahash::HashMap<tokio::task::Id, &'static str>,
+}
+
+impl SessionTasks {
+    pub(crate) fn spawn(
+        &mut self,
+        name: &'static str,
+        task: impl Future<Output = ()> + Send + 'static,
+    ) {
+        let id = self.set.spawn(task).id();
+        self.names.insert(id, name);
     }
-    Ok(())
+
+    /// Supervise a task spawned elsewhere, aborting it with the set
+    pub(crate) fn adopt(&mut self, name: &'static str, handle: tokio::task::JoinHandle<()>) {
+        let handle = tokio_util::task::AbortOnDropHandle::new(handle);
+        self.spawn(name, async move {
+            if let Err(e) = handle.await
+                && e.is_panic()
+            {
+                std::panic::resume_unwind(e.into_panic());
+            }
+        });
+    }
+
+    fn name(&self, id: tokio::task::Id) -> &'static str {
+        self.names.get(&id).copied().unwrap_or("session")
+    }
+
+    /// First task to stop, as the error naming it. Pending while none has
+    async fn exited(&mut self) -> anyhow::Error {
+        match self.set.join_next_with_id().await {
+            Some(Ok((id, ()))) => anyhow::anyhow!("{} task exited", self.name(id)),
+            Some(Err(e)) => anyhow::anyhow!("{} task failed: {e}", self.name(e.id())),
+            None => std::future::pending().await,
+        }
+    }
+
+    /// Abort what still runs, surfacing a task that panicked
+    async fn shutdown(mut self) -> Result<()> {
+        self.set.abort_all();
+        while let Some(res) = self.set.join_next_with_id().await {
+            if let Err(e) = res
+                && e.is_panic()
+            {
+                anyhow::bail!("{} task failed: {e}", self.name(e.id()));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Error for a task that stopped before its shutdown, preferring the fatal
+/// it set on the way out
+pub(crate) fn task_stopped(
+    name: &str,
+    res: Result<(), tokio::task::JoinError>,
+    fatal: &walshadow::pipeline::Fatal,
+) -> anyhow::Error {
+    match (fatal.message(), res) {
+        (Some(msg), _) => anyhow::anyhow!("{name} failed: {msg}"),
+        (None, Ok(())) => anyhow::anyhow!("{name} task exited"),
+        (None, Err(e)) => anyhow::anyhow!("{name} task failed: {e}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn session_tasks_name_the_task_that_stopped() {
+        let mut tasks = SessionTasks::default();
+        tasks.spawn("idle", std::future::pending());
+        tasks.spawn("quits", async {});
+        let err = tasks.exited().await.to_string();
+        assert!(err.contains("quits task exited"), "{err}");
+        tasks.spawn("panics", async { panic!("boom") });
+        let err = tasks.exited().await.to_string();
+        assert!(
+            err.contains("panics task failed") && err.contains("boom"),
+            "{err}"
+        );
+        tasks.shutdown().await.expect("idle task aborts cleanly");
+    }
 }

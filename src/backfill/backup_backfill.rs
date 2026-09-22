@@ -822,7 +822,11 @@ pub async fn fetch_segments(
     for seg in segments {
         let name = seg.format();
         let dst = seg_dir.join(&name);
-        if !dst.exists() {
+        // Fetch renames without fsync, so power loss can leave a short file
+        let whole = tokio::fs::metadata(&dst)
+            .await
+            .is_ok_and(|m| m.len() == WAL_SEG_SIZE);
+        if !whole {
             walrus::pg::wal::fetch::handle(
                 settings,
                 storage.clone(),
@@ -924,7 +928,6 @@ async fn replay_gap(
         state.replay_from = Some(sink.oldest_inflight().await.map_or(end, |l| l.min(end)));
         state.save(dir).await?;
     }
-    pump.close(&mut sink).await?;
     sink.finish()
         .await
         .map_err(|e| anyhow::anyhow!("backup_backfill: finish gap replay: {e}"))
@@ -1073,7 +1076,7 @@ impl PrescanSink {
         }
         // pg_class rows carry oid at data offset 0, pg_attribute rows
         // attrelid at 0 — one decode covers both membership checks
-        match decode_pg_class_tuple(&record.parsed, 0) {
+        match decode_pg_class_tuple(&record.parsed, 0, record.page_magic) {
             DecodeOutcome::Decoded(row) => {
                 if self.filter_oids.contains(&row.oid) {
                     if rel_node == PG_CLASS_RELNODE
@@ -1096,7 +1099,7 @@ impl PrescanSink {
             }
             // Prefix-compressed / short rows hide the oid: can't prove the
             // write isn't a filtered rel's
-            DecodeOutcome::OidInPrefix | DecodeOutcome::Undecoded => {
+            DecodeOutcome::OidInPrefix(_) | DecodeOutcome::Undecoded => {
                 self.skew = Some(format!("undecodable catalog write on relnode {rel_node}"));
             }
         }

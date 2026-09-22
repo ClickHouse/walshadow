@@ -10,7 +10,7 @@ use crate::table_rules::set_if;
 use ahash::HashMap;
 use tokio::sync::RwLock;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TableMapping {
     pub target: TableTarget,
     pub columns: Vec<ColumnMapping>,
@@ -125,7 +125,7 @@ impl DropTableStrategy {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ColumnMapping {
     pub src_attnum: i16,
     pub target_name: String,

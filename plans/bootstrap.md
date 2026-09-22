@@ -58,6 +58,12 @@ Fold live `XLOG_XACT_COMMIT` / `XLOG_XACT_ABORT` outcomes, including subtransact
 into ledger. At boot, recover outcomes from shadow transaction logs for records
 absent from resumed WAL
 
+Live apply and table backup passes share one in-memory ledger. A pass records
+its tables long after its replay cut, so outcomes live apply saw in between
+never reach them; settle those from source `pg_xact_status` right after
+recording. Ledger persistence retries rather than failing: the backfill entry is
+already done, so the ledger alone names the pending tables
+
 Retain required transaction history. Vacuum freezes surviving tuples and removes
 aborted tuples before truncating `pg_xact`, providing evidence for on-page
 visibility decisions. Pending copies receive no such updates: missing status

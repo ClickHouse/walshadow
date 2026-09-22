@@ -299,7 +299,7 @@ mod tests {
             let (config, server) =
                 crate::ch::test_support::retry_server(retries, sql, true, idle).await;
             let client = ChConn::connect(&config).await.unwrap();
-            let (ack, collector) = ack::spawn(Arc::default());
+            let (ack, collector) = ack::spawn(Arc::default(), Fatal::new());
             let stats = Arc::new(EmitterStats::default());
             let mut inserter = Inserter {
                 client,

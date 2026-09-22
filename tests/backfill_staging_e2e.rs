@@ -20,6 +20,7 @@ use walshadow::schema::{RelDescriptor, RelName};
 use walshadow::shadow::Shadow;
 use walshadow::shadow_catalog::ShadowCatalog;
 use walshadow::timeline::TimelineHistory;
+use walshadow::visibility_pending::PendingLedger;
 
 struct Fixture {
     source: Shadow,
@@ -140,9 +141,23 @@ impl Fixture {
                 None,
                 None,
                 source_major,
+                self.system_id(),
+                PendingLedger::load(dir, self.system_id())
+                    .await
+                    .unwrap()
+                    .shared(),
             )
-            .await,
+            .await
+            .unwrap(),
         )
+    }
+
+    fn system_id(&self) -> u64 {
+        self.source
+            .psql_one("SELECT system_identifier FROM pg_control_system()")
+            .unwrap()
+            .parse()
+            .unwrap()
     }
 
     async fn prepare_staging(&self) -> StagingRel {
@@ -489,6 +504,83 @@ async fn failed_backup_defaults_to_copy_at_original_boundary() {
             .query("SELECT id, _lsn FROM default.t FINAL ORDER BY id")
             .unwrap(),
         "1\t100\n2\t200\n3\t100"
+    );
+}
+
+/// Pending tables a backup pass records settle xids live apply already
+/// passed from source `pg_xact`, widened to the current epoch; running xids
+/// stay outstanding for live commits to fold
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn source_decides_ended_pending_xids() {
+    if !fx::requirements_available() {
+        return;
+    }
+    let fx = Fixture::new().await;
+    let cfg = fx::pg_cfg(&fx.source, "pending-xids");
+    let client = walshadow::source_feed::open_sql_client(&cfg).await.unwrap();
+    let running = walshadow::source_feed::open_sql_client(&cfg).await.unwrap();
+    let xid = |rows: Vec<tokio_postgres::SimpleQueryMessage>| -> u32 {
+        rows.into_iter()
+            .find_map(|m| match m {
+                tokio_postgres::SimpleQueryMessage::Row(r) => {
+                    Some(r.get(0).unwrap().parse::<u64>().unwrap() as u32)
+                }
+                _ => None,
+            })
+            .unwrap()
+    };
+    let committed = xid(client.simple_query("SELECT txid_current()").await.unwrap());
+    let aborted = xid(client
+        .simple_query("BEGIN; SELECT txid_current()")
+        .await
+        .unwrap());
+    client.batch_execute("ROLLBACK").await.unwrap();
+    let open = xid(running
+        .simple_query("BEGIN; SELECT txid_current()")
+        .await
+        .unwrap());
+    let mut got = walshadow::copy_backfill::xid_outcomes(&client, &[committed, aborted, open])
+        .await
+        .unwrap();
+    got.sort_unstable();
+    assert_eq!(got, vec![(committed, true), (aborted, false)]);
+    running.batch_execute("COMMIT").await.unwrap();
+}
+
+/// Fallback COPY reads detoasted rows, yet later updates carrying a pointer
+/// unchanged resolve only from the chunk mirror, so it copies the TOAST heap
+/// too, versioned at the load boundary
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failed_backup_copy_fallback_seeds_chunk_mirror() {
+    if !fx::requirements_available() {
+        return;
+    }
+    let fx = Fixture::new().await;
+    fx.source
+        .psql_one(
+            "ALTER TABLE public.t ALTER COLUMN name SET STORAGE EXTERNAL; \
+             UPDATE public.t SET name = repeat('external', 1000) WHERE id = 1",
+        )
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let backfiller = fx.backfiller(dir.path()).await;
+    backfiller
+        .note_opt_in(&fx.desc, InitialLoadMode::ObjectStore, 100)
+        .await;
+    wait_done(&backfiller, dir.path()).await;
+    assert_eq!(
+        fx.ch
+            .query(&format!(
+                "SELECT count(), sum(length(chunk_data)), min(_lsn), max(_lsn) \
+                 FROM default.pg_toast_{} FINAL",
+                fx.desc.toast_oid
+            ))
+            .unwrap(),
+        "5\t8000\t100\t100"
+    );
+    assert_eq!(
+        read_ledger(dir.path())["backfill"][0]["toast_seeded"].as_bool(),
+        Some(true)
     );
 }
 

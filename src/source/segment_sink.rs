@@ -7,13 +7,11 @@ use std::pin::Pin;
 use tokio::sync::mpsc;
 use walrus::pg::wal::segment::SegmentName;
 
-use crate::filter::manifest::Manifest;
 use crate::record::{SegmentSink, SinkError};
 
 pub struct SegFsync {
     pub end_lsn: u64,
     pub seg_path: PathBuf,
-    pub mani_path: PathBuf,
 }
 
 enum Durability {
@@ -50,48 +48,19 @@ impl DirSegmentSink {
         })
     }
 
-    async fn write(
-        &self,
-        seg: &SegmentName,
-        bytes: &[u8],
-        manifest: &Manifest,
-        partial: bool,
-    ) -> Result<(), SinkError> {
+    async fn write(&self, seg: &SegmentName, bytes: &[u8]) -> Result<(), SinkError> {
         let inline = matches!(self.durability, Durability::Inline);
         let name = seg.format();
-        let (seg_path, seg_tmp, mani_path, mani_tmp) = if partial {
-            (
-                self.out_dir.join(format!("{name}.partial")),
-                self.out_dir.join(format!("{name}.partial.tmp")),
-                self.out_dir.join(format!("{name}.partial.manifest.json")),
-                self.out_dir
-                    .join(format!("{name}.partial.manifest.json.tmp")),
-            )
-        } else {
-            let seg_path = self.out_dir.join(&name);
-            let mani_path = self.out_dir.join(format!("{name}.manifest.json"));
-            (
-                seg_path.clone(),
-                seg_path.with_extension("partial"),
-                mani_path.clone(),
-                mani_path.with_extension("manifest.json.partial"),
-            )
-        };
+        let seg_path = self.out_dir.join(&name);
+        // Retention sweeps a temp a crash leaves behind
+        let seg_tmp = self.out_dir.join(format!("{name}.tmp"));
         write_sync_rename(&seg_tmp, &seg_path, bytes, inline).await?;
-        write_sync_rename(
-            &mani_tmp,
-            &mani_path,
-            &serde_json::to_vec_pretty(manifest)?,
-            inline,
-        )
-        .await?;
         match &self.durability {
             Durability::Inline => crate::fs::fsync_dir(&self.out_dir).await?,
             Durability::Background { seg_size, tx } => tx
                 .send(SegFsync {
                     end_lsn: seg.start_lsn(*seg_size) + bytes.len() as u64,
                     seg_path,
-                    mani_path,
                 })
                 .await
                 .map_err(|_| SinkError::Other("segment fsync queue closed".into()))?,
@@ -105,18 +74,8 @@ impl SegmentSink for DirSegmentSink {
         &'a mut self,
         seg: SegmentName,
         bytes: &'a [u8],
-        manifest: &'a Manifest,
     ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
-        Box::pin(async move { self.write(&seg, bytes, manifest, false).await })
-    }
-
-    fn on_partial_segment<'a>(
-        &'a mut self,
-        seg: SegmentName,
-        bytes: &'a [u8],
-        manifest: &'a Manifest,
-    ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
-        Box::pin(async move { self.write(&seg, bytes, manifest, true).await })
+        Box::pin(async move { self.write(&seg, bytes).await })
     }
 }
 

@@ -71,8 +71,6 @@ lsn_kinds! {
 kinds! {
     /// Contiguous done prefix in ack collector seq space
     AckFrontier => "ack_frontier";
-    /// Prefix of seqs fully routed by decode pool
-    PlacedFrontier => "placed_frontier";
     /// Enqueues onto shadow send queues
     QueuedWake => "queued_wake";
     /// Standby status reports plus connection attaches
@@ -116,18 +114,21 @@ impl<K> Default for Pos<K> {
     }
 }
 
+#[cfg(test)]
 impl<K> From<u64> for Pos<K> {
     fn from(raw: u64) -> Self {
         Self::new(raw)
     }
 }
 
+#[cfg(test)]
 impl<K> PartialEq<u64> for Pos<K> {
     fn eq(&self, other: &u64) -> bool {
         self.0 == *other
     }
 }
 
+#[cfg(test)]
 impl<K> PartialOrd<u64> for Pos<K> {
     fn partial_cmp(&self, other: &u64) -> Option<CmpOrdering> {
         Some(self.0.cmp(other))
@@ -192,15 +193,15 @@ pub struct Monotone<K> {
 }
 
 impl<K> Monotone<K> {
-    pub fn new(init: impl Into<Pos<K>>) -> Self {
+    pub fn new(init: Pos<K>) -> Self {
         Self {
-            tx: watch::Sender::new(init.into().get()),
+            tx: watch::Sender::new(init.get()),
             _kind: PhantomData,
         }
     }
 
-    pub fn join(&self, v: impl Into<Pos<K>>) -> Pos<K> {
-        let v = v.into().get();
+    pub fn join(&self, v: Pos<K>) -> Pos<K> {
+        let v = v.get();
         let mut prev = 0;
         self.tx.send_if_modified(|cur| {
             prev = std::mem::replace(cur, (*cur).max(v));
@@ -210,8 +211,7 @@ impl<K> Monotone<K> {
     }
 
     /// Re-anchor after position space changes, such as timeline fork
-    pub fn rebase(&self, v: impl Into<Pos<K>>) -> Pos<K> {
-        let v = v.into();
+    pub fn rebase(&self, v: Pos<K>) -> Pos<K> {
         self.tx.send_replace(v.get());
         v
     }
@@ -235,7 +235,7 @@ impl<K> Monotone<K> {
 
 impl<K> Default for Monotone<K> {
     fn default() -> Self {
-        Self::new(0u64)
+        Self::new(Pos::ZERO)
     }
 }
 
@@ -286,8 +286,8 @@ impl<K> Gate<K> {
     /// Resolve once the cell covers `target`
     ///
     /// Probe before parking, so a move that landed first is not waited out
-    pub async fn wait(&self, target: impl Into<Pos<K>>) -> Result<Pos<K>, GateClosed> {
-        let target = target.into().get();
+    pub async fn wait(&self, target: Pos<K>) -> Result<Pos<K>, GateClosed> {
+        let target = target.get();
         let mut rx = self.rx.clone();
         loop {
             let cur = *rx.borrow_and_update();
@@ -301,7 +301,7 @@ impl<K> Gate<K> {
     /// Resolve on the first move past `seen`, for consumers that redo their
     /// work from current state rather than aiming at a target
     pub async fn advance(&self, seen: Pos<K>) -> Result<Pos<K>, GateClosed> {
-        self.wait(seen.get().saturating_add(1)).await
+        self.wait(Pos::new(seen.get().saturating_add(1))).await
     }
 }
 
@@ -312,9 +312,9 @@ mod tests {
     #[test]
     fn only_rebase_lowers_a_cell() {
         let m: Monotone<Floor> = Monotone::default();
-        assert_eq!(m.join(500u64), 500);
-        assert_eq!(m.join(100u64), 500);
-        assert_eq!(m.rebase(100u64), 100, "fork re-anchors the floor");
+        assert_eq!(m.join(Pos::new(500u64)), 500);
+        assert_eq!(m.join(Pos::new(100u64)), 500);
+        assert_eq!(m.rebase(Pos::new(100u64)), 100, "fork re-anchors the floor");
         assert_eq!(m.get(), 100);
     }
 
@@ -342,8 +342,11 @@ mod tests {
     #[tokio::test]
     async fn gate_opens_on_a_target_already_covered() {
         let m = Monotone::<Drain>::default();
-        m.join(900u64);
-        assert_eq!(m.watch().wait(500u64).await.expect("covered"), 900);
+        m.join(Pos::new(900u64));
+        assert_eq!(
+            m.watch().wait(Pos::new(500u64)).await.expect("covered"),
+            900
+        );
     }
 
     /// Consumers that redo work from current state wake on any move, and on
@@ -367,9 +370,9 @@ mod tests {
     async fn dropping_the_cell_wakes_an_uncovered_waiter() {
         let m = Monotone::<Drain>::default();
         let gate = m.watch();
-        m.join(10u64);
+        m.join(Pos::new(10u64));
         drop(m);
-        assert_eq!(gate.wait(10u64).await.expect("covered"), 10);
-        assert_eq!(gate.wait(11u64).await, Err(GateClosed));
+        assert_eq!(gate.wait(Pos::new(10u64)).await.expect("covered"), 10);
+        assert_eq!(gate.wait(Pos::new(11u64)).await, Err(GateClosed));
     }
 }

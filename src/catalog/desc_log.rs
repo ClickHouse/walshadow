@@ -768,8 +768,7 @@ impl DescriptorLog {
     /// predate the drop, and the floor never exceeds the re-read start).
     /// Batches above the floor survive whole (stubs included) for boot
     /// replay; below it they exist only as carriers of retained entries.
-    pub async fn maybe_gc(&self, floor: impl Into<Pos<Floor>>) -> Result<bool> {
-        let floor = floor.into();
+    pub async fn maybe_gc(&self, floor: Pos<Floor>) -> Result<bool> {
         let w = self.writer.lock().await;
         let tail_bytes = w.tail_len - w.header_len;
         let (retained, dropped_entries) = {
@@ -788,8 +787,7 @@ impl DescriptorLog {
     }
 
     #[cfg(test)]
-    pub async fn force_gc(&self, floor: impl Into<Pos<Floor>>) -> Result<()> {
-        let floor = floor.into();
+    pub async fn force_gc(&self, floor: Pos<Floor>) -> Result<()> {
         let w = self.writer.lock().await;
         let (retained, dropped) = {
             let idx = self.index.read().unwrap();
@@ -1080,17 +1078,29 @@ fn encode_batch(batch: &BatchRecord) -> Vec<u8> {
 }
 
 fn encode_descriptor(out: &mut Vec<u8>, d: &RelDescriptor) {
-    push_u32(out, d.rfn.spc_node);
-    push_u32(out, d.rfn.db_node);
-    push_u32(out, d.rfn.rel_node);
-    push_u32(out, d.oid);
-    push_u32(out, d.toast_oid);
-    push_u32(out, d.namespace_oid);
-    push_str(out, &d.rel_name.namespace);
-    push_str(out, &d.rel_name.name);
-    push_u8(out, d.kind as u8);
-    push_u8(out, d.persistence as u8);
-    match &d.replident {
+    // Exhaustive destructuring: a new field fails to compile until encoded
+    let RelDescriptor {
+        rfn,
+        oid,
+        toast_oid,
+        namespace_oid,
+        rel_name: RelName { namespace, name },
+        kind,
+        persistence,
+        replident,
+        attributes,
+    } = d;
+    push_u32(out, rfn.spc_node);
+    push_u32(out, rfn.db_node);
+    push_u32(out, rfn.rel_node);
+    push_u32(out, *oid);
+    push_u32(out, *toast_oid);
+    push_u32(out, *namespace_oid);
+    push_str(out, namespace);
+    push_str(out, name);
+    push_u8(out, *kind as u8);
+    push_u8(out, *persistence as u8);
+    match replident {
         ReplIdent::Default { pk_attnums } => {
             push_u8(out, 0);
             encode_opt_attnums(out, pk_attnums.as_deref());
@@ -1109,20 +1119,34 @@ fn encode_descriptor(out: &mut Vec<u8>, d: &RelDescriptor) {
             encode_attnums(out, key_attnums);
         }
     }
-    push_u32(out, d.attributes.len() as u32);
-    for a in &d.attributes {
-        push_i16(out, a.attnum);
-        push_str(out, &a.name);
-        push_u32(out, a.type_oid);
-        push_i32(out, a.typmod);
-        push_u8(out, a.not_null as u8);
-        push_u8(out, a.dropped as u8);
-        push_str(out, &a.type_name);
-        push_u8(out, a.type_byval as u8);
-        push_i16(out, a.type_len);
-        push_u8(out, a.type_align as u8);
-        push_u8(out, a.type_storage as u8);
-        push_opt_missing(out, a.missing_default.as_ref());
+    push_u32(out, attributes.len() as u32);
+    for a in attributes {
+        let RelAttr {
+            attnum,
+            name,
+            type_oid,
+            typmod,
+            not_null,
+            dropped,
+            type_name,
+            type_byval,
+            type_len,
+            type_align,
+            type_storage,
+            missing_default,
+        } = a;
+        push_i16(out, *attnum);
+        push_str(out, name);
+        push_u32(out, *type_oid);
+        push_i32(out, *typmod);
+        push_u8(out, *not_null as u8);
+        push_u8(out, *dropped as u8);
+        push_str(out, type_name);
+        push_u8(out, *type_byval as u8);
+        push_i16(out, *type_len);
+        push_u8(out, *type_align as u8);
+        push_u8(out, *type_storage as u8);
+        push_opt_missing(out, missing_default.as_ref());
     }
 }
 
@@ -2103,7 +2127,7 @@ mod tests {
         log.append_batch(batch(60, vec![present(50, &d2)]))
             .await
             .unwrap();
-        log.force_gc(100).await.unwrap();
+        log.force_gc(Pos::new(100)).await.unwrap();
         assert_eq!(log.floor_at_write(), 100);
         // Active-at-floor survives, superseded predecessor dropped
         match log.descriptor_at(rfn(8400), 150) {
@@ -2141,7 +2165,10 @@ mod tests {
         .unwrap();
         let entries = log.gauges().0;
         assert_eq!(entries, GC_DEAD_ENTRIES as u64);
-        assert!(!log.maybe_gc(u64::MAX).await.unwrap(), "nothing superseded");
+        assert!(
+            !log.maybe_gc(Pos::new(u64::MAX)).await.unwrap(),
+            "nothing superseded"
+        );
         assert_eq!(log.gauges().0, entries, "declined GC leaves the index");
         log.append_batch(batch(
             40,
@@ -2151,7 +2178,10 @@ mod tests {
         ))
         .await
         .unwrap();
-        assert!(log.maybe_gc(u64::MAX).await.unwrap(), "predecessors dead");
+        assert!(
+            log.maybe_gc(Pos::new(u64::MAX)).await.unwrap(),
+            "predecessors dead"
+        );
         assert_eq!(
             log.gauges().0,
             GC_DEAD_ENTRIES as u64,
@@ -2170,7 +2200,7 @@ mod tests {
         log.append_batch(batch(60, vec![tombstone(60, 81, 8500, LogValue::Dropped)]))
             .await
             .unwrap();
-        log.force_gc(100).await.unwrap();
+        log.force_gc(Pos::new(100)).await.unwrap();
         // Dropped at floor: whole chain gone, absence is inactive — never
         // the earlier Present
         assert_eq!(log.descriptor_at(rfn(8500), 300), LookupResult::NotCovered);
@@ -2212,7 +2242,7 @@ mod tests {
         ))
         .await
         .unwrap();
-        log.force_gc(100).await.unwrap();
+        log.force_gc(Pos::new(100)).await.unwrap();
         assert_eq!(log.descriptor_at(rfn(8600), 300), LookupResult::NotCovered);
         assert!(matches!(
             log.descriptor_at(rfn(8601), 300),
@@ -2237,7 +2267,7 @@ mod tests {
             .await
             .unwrap();
         log.append_batch(batch(200, vec![])).await.unwrap();
-        log.force_gc(100).await.unwrap();
+        log.force_gc(Pos::new(100)).await.unwrap();
         // Above floor: batch + stub retained for boot replay
         assert_eq!(log.batch_at(150).unwrap().entries.len(), 1);
         assert!(log.batch_at(200).unwrap().entries.is_empty());
@@ -2332,7 +2362,7 @@ mod tests {
         {
             let log = open(tmp.path()).await;
             log.append_batch(b.clone()).await.unwrap();
-            log.force_gc(0).await.unwrap();
+            log.force_gc(Pos::ZERO).await.unwrap();
         }
         // Simulate crash between GC's ckpt write and tail truncate: the
         // batch reappears in the tail
@@ -2507,7 +2537,7 @@ mod tests {
         b.ambiguities
             .push(amb(AmbiguityScope::Rfn(rfn(9500)), 80, 150));
         log.append_batch(b).await.unwrap();
-        log.force_gc(100).await.unwrap();
+        log.force_gc(Pos::new(100)).await.unwrap();
         assert!(matches!(
             log.descriptor_at(rfn(9500), 120),
             LookupResult::Ambiguous(a) if a.from_lsn == 80
@@ -2579,7 +2609,7 @@ mod tests {
                 .push(amb(AmbiguityScope::Rfn(rfn(9900)), 100, 300));
             b.ambiguities.push(amb(AmbiguityScope::Oid(97), 100, 300));
             log.append_batch(b).await.unwrap();
-            log.force_gc(200).await.unwrap();
+            log.force_gc(Pos::new(200)).await.unwrap();
             assert_eq!(log.rfn_ambiguities(rfn(9900)).len(), 1);
             assert_eq!(log.oid_ambiguities(97).len(), 1);
         }
@@ -2634,7 +2664,7 @@ mod tests {
             log.append_batch(batch(100, vec![present(90, &d)]))
                 .await
                 .unwrap();
-            log.force_gc(0).await.unwrap();
+            log.force_gc(Pos::ZERO).await.unwrap();
         }
         // Pre-ambiguity v1 and pre-fence v2 dirs both reject at open, ckpt or
         // tail alike; the explicit epoch reset (--ignore-cursor /

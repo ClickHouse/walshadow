@@ -17,7 +17,8 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
-use crate::pos::{AckFrontier, EmitterAck, Gate, GateClosed, Monotone, PlacedFrontier, Pos};
+use crate::emit::pipeline::Fatal;
+use crate::pos::{AckFrontier, EmitterAck, Gate, GateClosed, Monotone, Pos};
 
 pub enum AckEvent {
     /// In seq order, no gaps. `publish: false` marks a non-final slice of a
@@ -50,7 +51,7 @@ enum SeqFault {
 /// Per-seq progress; placement and acks arrive in either order
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct Progress {
-    /// `None` while waiting on decode, `Some` while waiting on ClickHouse
+    /// `None` until rows are placed, `Some` while waiting on ClickHouse
     rows: Option<u64>,
     acked: u64,
 }
@@ -80,11 +81,6 @@ impl Progress {
     fn is_done(self) -> bool {
         self.rows == Some(self.acked)
     }
-
-    /// Row count reported, safe for the `FlushAll` placement barrier
-    fn is_placed(self) -> bool {
-        self.rows.is_some()
-    }
 }
 
 struct Seq {
@@ -97,7 +93,7 @@ struct Seq {
 pub struct IncompleteSeq {
     pub seq: u64,
     pub commit_lsn: Pos<EmitterAck>,
-    /// `None` while waiting on decode, `Some` while waiting on ClickHouse
+    /// `None` until rows are placed, `Some` while waiting on ClickHouse
     pub rows: Option<u64>,
     pub acked: u64,
 }
@@ -107,10 +103,9 @@ pub struct IncompleteSeq {
 pub struct AckSnapshot {
     pub registered: u64,
     pub frontier: u64,
-    pub placed_frontier: u64,
     pub oldest_incomplete: Option<IncompleteSeq>,
     pub trailing_held: Pos<EmitterAck>,
-    /// Protocol faults, each of which pins a seq forever
+    /// Protocol faults; the first trips pipeline fatal
     pub wedged: u64,
     /// Events for retired seqs, benign: inserter batches straddle retirement
     pub late: u64,
@@ -124,7 +119,7 @@ impl AckSnapshot {
     pub fn stall_reason(&self) -> Option<&'static str> {
         let inc = self.oldest_incomplete?;
         Some(match inc.rows {
-            None => "decode has not reported rows",
+            None => "rows not yet placed",
             Some(_) => "clickhouse has not acked rows",
         })
     }
@@ -134,9 +129,6 @@ pub struct AckState {
     map: BTreeMap<u64, Seq>,
     /// Lowest seq not yet done == count of contiguous done seqs (dense from 0)
     frontier: u64,
-    /// Lowest seq not yet placed. DDL barrier waits on this so `FlushAll`
-    /// can't run ahead of rows still in flight from the decode pool.
-    placed_frontier: u64,
     registered: u64,
     /// Highest publishing `commit_lsn` retired from map
     watermark: u64,
@@ -144,32 +136,32 @@ pub struct AckState {
     trailing: u64,
     emitter_ack: Arc<Monotone<EmitterAck>>,
     frontier_cell: Monotone<AckFrontier>,
-    placed_cell: Monotone<PlacedFrontier>,
     wedged: u64,
     late: u64,
     probe_tx: watch::Sender<AckSnapshot>,
+    /// Tripped on first protocol fault so barrier waits fail instead of hanging
+    fatal: Fatal,
 }
 
 impl AckState {
     fn new(
         emitter_ack: Arc<Monotone<EmitterAck>>,
         frontier_cell: Monotone<AckFrontier>,
-        placed_cell: Monotone<PlacedFrontier>,
         probe_tx: watch::Sender<AckSnapshot>,
+        fatal: Fatal,
     ) -> Self {
         Self {
             map: BTreeMap::new(),
             frontier: 0,
-            placed_frontier: 0,
             registered: 0,
             watermark: 0,
             trailing: 0,
             emitter_ack,
             frontier_cell,
-            placed_cell,
             wedged: 0,
             late: 0,
             probe_tx,
+            fatal,
         }
     }
 
@@ -229,25 +221,21 @@ impl AckState {
         self.wedge(seq, "ack event for an unregistered seq");
     }
 
-    /// Log the first fault only; the rest are noise once the watermark pins
+    /// Fail on first fault: watermark pins here, restart resumes from
+    /// persisted floor and `_lsn` dedup absorbs replayed rows
     fn wedge(&mut self, seq: u64, what: &'static str) {
         self.wedged += 1;
         if self.wedged == 1 {
-            tracing::error!(
-                target: "walshadow::pipeline",
-                seq,
-                frontier = self.frontier,
-                registered = self.registered,
-                "{what} — watermark will pin here",
-            );
+            self.fatal.set(format!(
+                "ack collector: {what} (seq {seq}, frontier {}, registered {})",
+                self.frontier, self.registered,
+            ));
         }
     }
 
     /// Sole writer of every published output, called after every event
     ///
-    /// Both scans resume at their own frontier, never at the done frontier:
-    /// placement runs far ahead of acks, so re-walking that span per event is
-    /// O(N²)
+    /// Scan resumes at the done frontier, so each seq retires once
     fn publish(&mut self) {
         while let Some(s) = self.map.get(&self.frontier) {
             if !s.progress.is_done() {
@@ -260,11 +248,6 @@ impl AckState {
             }
             self.frontier += 1;
         }
-        let mut pf = self.placed_frontier.max(self.frontier);
-        while self.map.get(&pf).is_some_and(|s| s.progress.is_placed()) {
-            pf += 1;
-        }
-        self.placed_frontier = pf;
 
         // Later registrations carry later commit LSNs, so publish trailing only at idle
         let ack = if self.all_done() {
@@ -272,9 +255,8 @@ impl AckState {
         } else {
             self.watermark
         };
-        self.emitter_ack.join(ack);
-        self.frontier_cell.join(self.frontier);
-        self.placed_cell.join(self.placed_frontier);
+        self.emitter_ack.join(Pos::new(ack));
+        self.frontier_cell.join(Pos::new(self.frontier));
         self.probe_tx.send_replace(self.snapshot());
     }
 
@@ -282,9 +264,8 @@ impl AckState {
         AckSnapshot {
             registered: self.registered,
             frontier: self.frontier,
-            placed_frontier: self.placed_frontier,
             oldest_incomplete: self.oldest_incomplete(),
-            trailing_held: self.trailing.into(),
+            trailing_held: Pos::new(self.trailing),
             wedged: self.wedged,
             late: self.late,
         }
@@ -301,7 +282,7 @@ impl AckState {
         let s = self.map.get(&self.frontier)?;
         Some(IncompleteSeq {
             seq: self.frontier,
-            commit_lsn: s.commit_lsn.into(),
+            commit_lsn: Pos::new(s.commit_lsn),
             rows: s.progress.rows,
             acked: s.progress.acked,
         })
@@ -315,7 +296,6 @@ pub struct AckHandle {
     tx: mpsc::UnboundedSender<AckEvent>,
     emitter_ack: Arc<Monotone<EmitterAck>>,
     frontier: Gate<AckFrontier>,
-    placed: Gate<PlacedFrontier>,
     probe: watch::Receiver<AckSnapshot>,
 }
 
@@ -364,23 +344,18 @@ impl AckHandle {
 
     /// Wait until every seq below `seq` is durable on ClickHouse
     pub async fn wait_through(&self, seq: u64) -> Result<(), GateClosed> {
-        self.frontier.wait(seq).await.map(|_| ())
-    }
-
-    /// Wait until every seq below `seq` reports its row count
-    pub async fn wait_placed_through(&self, seq: u64) -> Result<(), GateClosed> {
-        self.placed.wait(seq).await.map(|_| ())
+        self.frontier.wait(Pos::new(seq)).await.map(|_| ())
     }
 }
 
 /// Spawn the collector actor. When all [`AckHandle`] clones drop it drains
-/// and exits, completing the [`JoinHandle`].
-pub fn spawn(emitter_ack: Arc<Monotone<EmitterAck>>) -> (AckHandle, JoinHandle<()>) {
+/// and exits, completing the [`JoinHandle`]. A protocol fault sets `fatal`
+pub fn spawn(emitter_ack: Arc<Monotone<EmitterAck>>, fatal: Fatal) -> (AckHandle, JoinHandle<()>) {
     let (tx, mut rx) = mpsc::unbounded_channel::<AckEvent>();
-    let (frontier_cell, placed_cell) = (Monotone::default(), Monotone::default());
-    let (frontier, placed) = (frontier_cell.watch(), placed_cell.watch());
+    let frontier_cell = Monotone::default();
+    let frontier = frontier_cell.watch();
     let (probe_tx, probe) = watch::channel(AckSnapshot::default());
-    let mut state = AckState::new(emitter_ack.clone(), frontier_cell, placed_cell, probe_tx);
+    let mut state = AckState::new(emitter_ack.clone(), frontier_cell, probe_tx, fatal);
     let handle = tokio::spawn(async move {
         while let Some(ev) = rx.recv().await {
             state.apply(ev);
@@ -391,7 +366,6 @@ pub fn spawn(emitter_ack: Arc<Monotone<EmitterAck>>) -> (AckHandle, JoinHandle<(
             tx,
             emitter_ack,
             frontier,
-            placed,
             probe,
         },
         handle,
@@ -428,34 +402,12 @@ mod tests {
     use super::*;
 
     pub(super) fn state() -> (AckState, Arc<Monotone<EmitterAck>>) {
-        let (s, ack, _) = state_watching_placed();
-        (s, ack)
-    }
-
-    fn state_watching_placed() -> (AckState, Arc<Monotone<EmitterAck>>, Gate<PlacedFrontier>) {
         let ack = Arc::new(Monotone::default());
-        let (frontier, placed) = (Monotone::default(), Monotone::default());
-        let prx = placed.watch();
         let (probe_tx, _probe) = watch::channel(AckSnapshot::default());
         (
-            AckState::new(ack.clone(), frontier, placed, probe_tx),
+            AckState::new(ack.clone(), Monotone::default(), probe_tx, Fatal::new()),
             ack,
-            prx,
         )
-    }
-
-    #[test]
-    fn placed_frontier_tracks_contiguous_placed_seqs() {
-        let (mut s, _ack, prx) = state_watching_placed();
-        s.register(0, 100, true);
-        s.register(1, 200, true);
-        s.register(2, 300, true);
-        s.placed(2, 1);
-        assert_eq!(prx.current(), 0);
-        s.placed(0, 1);
-        assert_eq!(prx.current(), 1, "placed through seq 0");
-        s.placed(1, 1);
-        assert_eq!(prx.current(), 3, "placed through all three");
     }
 
     /// Guard against O(N²) placement scan when placement runs ahead of acks
@@ -481,7 +433,7 @@ mod tests {
         let (mut s, _ack) = state();
         s.register(0, 100, true);
         let snap = s.snapshot();
-        assert_eq!(snap.stall_reason(), Some("decode has not reported rows"));
+        assert_eq!(snap.stall_reason(), Some("rows not yet placed"));
         assert_eq!(
             snap.oldest_incomplete.map(|o| (o.seq, o.rows, o.acked)),
             Some((0, None, 0))
@@ -512,6 +464,7 @@ mod tests {
         s.acked(0, 1);
         let snap = s.snapshot();
         assert_eq!((snap.late, snap.wedged), (1, 0));
+        assert!(!s.fatal.is_set());
     }
 
     #[test]
@@ -519,7 +472,10 @@ mod tests {
         let (mut s, ack) = state();
         s.register(0, 100, true);
         s.placed(0, 2);
+        assert!(!s.fatal.is_set());
         s.placed(0, 5);
+        let first = s.fatal.message().expect("first fault trips fatal");
+        assert!(first.contains("seq placed twice"), "{first}");
         s.acked(0, 3);
         s.register(0, 100, true);
         assert_eq!(s.snapshot().wedged, 3);
@@ -527,6 +483,7 @@ mod tests {
         assert_eq!(ack.get(), 0);
         s.placed(7, 3);
         assert_eq!(s.snapshot().wedged, 4, "seq past the registration frontier");
+        assert_eq!(s.fatal.message(), Some(first), "root cause kept");
     }
 }
 
@@ -712,6 +669,7 @@ mod interleavings {
             0,
             "legal schedule produced a fault: {schedule:?}"
         );
+        assert!(!s.fatal.is_set(), "legal schedule tripped fatal");
     }
 
     #[test]

@@ -431,3 +431,26 @@ The cursor is paired with the relation's filenode. `VACUUM FULL`, `CLUSTER`,
 between chunks restarts the table rather than resuming into pages that no
 longer hold the same rows. Chunk predicates need a TID range scan; leave
 `enable_tidscan` on at the source.
+
+COPY rows arrive detoasted, but later updates that leave a large value
+unchanged carry its TOAST pointer, which resolves only from the chunk mirror.
+In `clickhouse` value mode a COPY load therefore first copies the table's TOAST
+heap into the mirror at `_lsn = S`. For a selection applied live, streaming
+waits at the selection point until that copy finishes, so size maintenance
+windows for large TOAST heaps. A load falling back from `base_backup` or
+`object_store` copies it once COPY starts, after streaming has moved on;
+updates applied in between can still store NULL. The source role needs `USAGE`
+on schema `pg_toast` and `SELECT` on TOAST heaps, which `pg_read_all_data`
+grants; without it the load fails and stays pending. `backfills.toml` records
+the copy, so a restart does not repeat it.
+
+The COPY session pins `TimeZone`, `DateStyle`, `IntervalStyle`,
+`extra_float_digits` and `bytea_output` to the values the shadow bridge worker
+uses, so values selected as text render as streamed rows do regardless of role
+or database defaults.
+
+Spill-dir state files `backfills.toml`, `toast_retires.toml` and
+`visibility_carry.toml` record the source system identifier; boot rejects
+files another source wrote. A file from an older build without the field loads
+once and is rewritten with it. An unreadable `backfills.toml` stops boot:
+removing it re-runs every load and can orphan `__wsstg` staging tables.

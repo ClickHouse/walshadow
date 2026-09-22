@@ -225,22 +225,18 @@ async fn apply(ctx: &SharedCtx, req: &Request<'_>) -> Result<String> {
     }
     let frag = frag_path(&ctx.ch_config);
     let _guard = ctx.frag_lock.lock().await;
-    let prev = tokio::fs::read(&frag).await.ok();
     let mut root = load(&frag).await?;
     crate::ch_emitter::merge_tables(&mut root, req.config.clone());
-    save(&frag, &root).await?;
-    commit_or_rollback(ctx, &frag, prev).await
+    commit(ctx, &frag, &root).await
 }
 
 /// Removes named keys without touching operator-owned base config
 async fn unset(ctx: &SharedCtx, req: &Request<'_>) -> Result<String> {
     let frag = frag_path(&ctx.ch_config);
     let _guard = ctx.frag_lock.lock().await;
-    let prev = tokio::fs::read(&frag).await.ok();
     let mut root = load(&frag).await?;
     apply_mask(&mut root, &req.config);
-    save(&frag, &root).await?;
-    commit_or_rollback(ctx, &frag, prev).await
+    commit(ctx, &frag, &root).await
 }
 
 fn apply_mask(root: &mut Table, mask: &Table) {
@@ -255,23 +251,24 @@ fn apply_mask(root: &mut Table, mask: &Table) {
     }
 }
 
-/// Restores last valid fragment when validation fails
-async fn commit_or_rollback(ctx: &SharedCtx, frag: &Path, prev: Option<Vec<u8>>) -> Result<String> {
-    if let Err(e) = validate(ctx).await {
-        if let Some(bytes) = prev {
-            tokio::fs::write(frag, bytes).await?;
-        } else {
-            tokio::fs::remove_file(frag).await?;
-        }
-        return Err(e).context("rejected: merged config invalid");
-    }
+/// Persist `root` as fragment `frag` only once merged config accepts it, so
+/// file never holds a rejected fragment, not even briefly
+async fn commit(ctx: &SharedCtx, frag: &Path, root: &Table) -> Result<String> {
+    validate(ctx, frag, root)
+        .await
+        .context("rejected: merged config invalid")?;
+    save(frag, root).await?;
     let unfollowed = ctx.reloader.reload().await?;
     Ok(ok_note(&unfollowed))
 }
 
 /// Matches startup validation so accepted fragments remain restart-safe
-async fn validate(ctx: &SharedCtx) -> Result<()> {
-    let merged = get_config(ctx).await?;
+async fn validate(ctx: &SharedCtx, frag: &Path, root: &Table) -> Result<()> {
+    let mut merged = ctx.cli_base.clone();
+    crate::ch_emitter::merge_tables(
+        &mut merged,
+        crate::ch_emitter::load_merged_with(&ctx.ch_config, Some((frag, root))).await?,
+    );
     crate::ch_emitter::EmitterConfig::from_table(&merged)
         .map(|_| ())
         .map_err(|e| anyhow::anyhow!("{e}"))
@@ -591,15 +588,17 @@ async fn load(path: &Path) -> Result<Table> {
 }
 
 async fn save(path: &Path, root: &Table) -> Result<()> {
-    if let Some(dir) = path.parent()
-        && !dir.as_os_str().is_empty()
-    {
-        tokio::fs::create_dir_all(dir).await.ok();
-    }
-    tokio::fs::write(path, toml::to_string(root).context("serialize toml")?)
-        .await
-        .with_context(|| format!("write {}", path.display()))?;
-    Ok(())
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name().and_then(|n| n.to_str())) else {
+        bail!("bad fragment path {}", path.display());
+    };
+    tokio::fs::create_dir_all(dir).await.ok();
+    crate::fs::write_atomic(
+        dir,
+        name,
+        toml::to_string(root).context("serialize toml")?.as_bytes(),
+    )
+    .await
+    .with_context(|| format!("write {}", path.display()))
 }
 
 // TODO: use daemon catalog rather than a second connection per request
@@ -931,17 +930,24 @@ mod tests {
 
     // Invalid fragments must not poison later reloads or starts
     #[tokio::test]
-    async fn apply_rejects_and_rolls_back_invalid() {
+    async fn apply_rejects_invalid_without_writing() {
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("c.sock");
         let _h = serve(sock.clone(), ctx_at(dir.path())).await.unwrap();
         let frag = dir.path().join("ch-config.d/50-api.toml");
 
         assert!(
+            call(&sock, "apply", "[ch]\nport = 70000")
+                .await
+                .starts_with("ERR")
+        );
+        assert!(!frag.exists(), "rejected first apply left a fragment");
+        assert!(
             call(&sock, "apply", "[ch]\nhost = \"ch\"\nport = 9000")
                 .await
                 .starts_with("OK")
         );
+        assert!(!frag.with_extension("toml.tmp").exists());
         assert!(
             call(&sock, "apply", "[ch]\nport = 70000")
                 .await
@@ -949,5 +955,24 @@ mod tests {
         );
         let f = std::fs::read_to_string(&frag).unwrap();
         assert!(f.contains("port = 9000") && !f.contains("70000"), "{f}");
+    }
+
+    // Candidate validates in its lexical slot, so a later fragment still wins
+    #[tokio::test]
+    async fn apply_validates_under_later_fragments() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("c.sock");
+        let _h = serve(sock.clone(), ctx_at(dir.path())).await.unwrap();
+        let confd = dir.path().join("ch-config.d");
+        std::fs::create_dir_all(&confd).unwrap();
+        std::fs::write(confd.join("60-op.toml"), "[ch]\nport = 70000\n").unwrap();
+
+        let resp = call(&sock, "apply", "[ch]\nport = 9000").await;
+        assert!(resp.starts_with("ERR"), "{resp}");
+        assert!(!confd.join("50-api.toml").exists());
+
+        std::fs::write(confd.join("60-op.toml"), "[ch]\nport = 9000\n").unwrap();
+        let resp = call(&sock, "apply", "[ch]\nport = 70000").await;
+        assert!(resp.starts_with("OK"), "{resp}");
     }
 }

@@ -55,8 +55,6 @@ pub(crate) fn build_owned_shadow(
     cfg.ctl_timeout = Duration::from_secs(args.shadow_connect_timeout);
     cfg.user = args.shadow_user.clone();
     cfg.dbname = dbname.to_string();
-    // Only a shadow walshadow started can be given a preload line; External
-    // clusters are the operator's to configure
     let mut bridge = walshadow::shadow::BridgeConf::in_dir(&cfg.socket_dir);
     bridge.socket_path = args.bridge_socket_path();
     bridge.library_dir = args.bridge_lib_dir.clone();
@@ -66,16 +64,12 @@ pub(crate) fn build_owned_shadow(
     Shadow::new(cfg)
 }
 
-/// Return `None` for kernel-assigned port because it may change after
-/// restart. Shadow then reads only archive through `restore_command`
-pub(crate) fn walsender_primary_conninfo(bind: SocketAddr) -> Option<String> {
-    (bind.port() != 0).then(|| {
-        format!(
-            "host={} port={} user=walshadow application_name=shadow sslmode=disable",
-            bind.ip(),
-            bind.port(),
-        )
-    })
+pub(crate) fn walsender_primary_conninfo(bind: SocketAddr) -> String {
+    format!(
+        "host={} port={} user=walshadow application_name=shadow sslmode=disable",
+        bind.ip(),
+        bind.port(),
+    )
 }
 
 /// Start daemon-owned shadow using archived WAL
@@ -91,12 +85,16 @@ pub(crate) async fn start_owned_shadow(
 ) -> Result<()> {
     let s = shadow.clone();
     tokio::task::spawn_blocking(move || -> Result<()> {
+        // Prior daemon may have died mid `pg_ctl start -w`
+        if keep_running
+            && s.wait_started()
+                .context("wait for running shadow startup")?
+        {
+            s.validate_running().context("validate running shadow")?;
+            tracing::info!(target: "walshadow::shadow", "reusing running shadow");
+            return Ok(());
+        }
         if s.is_running().context("shadow status probe")? {
-            if keep_running {
-                s.validate_running().context("validate running shadow")?;
-                tracing::info!(target: "walshadow::shadow", "reusing running shadow");
-                return Ok(());
-            }
             // Adopt only fires after unclean prior exit left the postmaster
             // alive holding stale port/socket/primary_conninfo. Stop so the
             // restart below binds params this daemon connects and streams with;
@@ -128,6 +126,48 @@ pub(crate) async fn start_owned_shadow(
 pub(crate) const SHADOW_PROBE_INTERVAL: Duration = Duration::from_secs(2);
 pub(crate) const SHADOW_RESTART_BACKOFF_MAX: Duration = Duration::from_secs(60);
 
+/// Daemon-owned postmaster, stopped on drop unless `keep_running`. Wraps a
+/// shadow before its start, so every exit path after it stops what started
+pub(crate) struct OwnedShadow {
+    pub(crate) shadow: Arc<Shadow>,
+    pub(crate) keep_running: bool,
+}
+
+impl OwnedShadow {
+    pub(crate) fn new(shadow: Shadow, keep_running: bool) -> Self {
+        Self {
+            shadow: Arc::new(shadow),
+            keep_running,
+        }
+    }
+}
+
+impl Drop for OwnedShadow {
+    fn drop(&mut self) {
+        if self.keep_running {
+            return;
+        }
+        // Daemon is exiting, blocking pg_ctl cannot delay other work
+        match self.shadow.is_running() {
+            Ok(true) => {
+                if let Err(e) = self.shadow.stop() {
+                    tracing::warn!(
+                        target: "walshadow::shadow",
+                        error = %e,
+                        "shadow stop on daemon exit failed",
+                    );
+                }
+            }
+            Ok(false) => {}
+            Err(e) => tracing::warn!(
+                target: "walshadow::shadow",
+                error = %e,
+                "shadow status probe on daemon exit failed",
+            ),
+        }
+    }
+}
+
 /// Supervise daemon-owned shadow, restarting stopped postmaster with
 /// backoff. `ShadowCatalog` reconnects after restart
 /// Read minimum GUC values from `pg_control` before each restart because
@@ -135,19 +175,21 @@ pub(crate) const SHADOW_RESTART_BACKOFF_MAX: Duration = Duration::from_secs(60);
 /// Call `shutdown` on clean exit; Drop is just a fallback, its abort
 /// can race a restart already in flight on the blocking pool
 pub(crate) struct ShadowLifecycle {
-    pub(crate) keep_running: bool,
-    pub(crate) shadow: Arc<Shadow>,
+    pub(crate) guard: OwnedShadow,
     pub(crate) supervisor: Option<tokio::task::JoinHandle<()>>,
     pub(crate) cancel: CancellationToken,
 }
 
 impl ShadowLifecycle {
-    pub(crate) fn spawn(shadow: Arc<Shadow>, conninfo: Option<String>, keep_running: bool) -> Self {
+    pub(crate) fn spawn(guard: OwnedShadow, conninfo: String) -> Self {
         let cancel = CancellationToken::new();
-        let supervisor = tokio::spawn(Self::supervise(shadow.clone(), conninfo, cancel.clone()));
+        let supervisor = tokio::spawn(Self::supervise(
+            guard.shadow.clone(),
+            conninfo,
+            cancel.clone(),
+        ));
         Self {
-            keep_running,
-            shadow,
+            guard,
             supervisor: Some(supervisor),
             cancel,
         }
@@ -155,7 +197,7 @@ impl ShadowLifecycle {
 
     pub(crate) async fn supervise(
         shadow: Arc<Shadow>,
-        conninfo: Option<String>,
+        conninfo: String,
         cancel: CancellationToken,
     ) {
         let mut backoff = Duration::from_secs(1);
@@ -207,7 +249,7 @@ impl ShadowLifecycle {
                     let ci = conninfo.clone();
                     let restarted = probe_blocking(&shadow, move |s| {
                         s.clear_stale_pid()?;
-                        s.start_with_floor_retry(ci.as_deref())
+                        s.start_with_floor_retry(Some(&ci))
                     })
                     .await;
                     if restarted.is_some() {
@@ -237,11 +279,12 @@ impl ShadowLifecycle {
         {
             tracing::warn!(target: "walshadow::shadow", error = %e, "shadow supervisor join failed");
         }
-        if self.keep_running {
+        let guard = &self.guard;
+        if guard.keep_running {
             return;
         }
-        if let Some(true) = probe_blocking(&self.shadow, |s| s.is_running()).await
-            && probe_blocking(&self.shadow, |s| s.stop()).await.is_none()
+        if let Some(true) = probe_blocking(&guard.shadow, |s| s.is_running()).await
+            && probe_blocking(&guard.shadow, |s| s.stop()).await.is_none()
         {
             tracing::warn!(target: "walshadow::shadow", "shadow stop on shutdown failed");
         }
@@ -268,31 +311,11 @@ pub(crate) async fn probe_blocking<T: Send + 'static>(
     }
 }
 
+/// `guard` drops after this, stopping shadow once the supervisor is aborted
 impl Drop for ShadowLifecycle {
     fn drop(&mut self) {
         if let Some(h) = &self.supervisor {
             h.abort();
-        }
-        if self.keep_running {
-            return;
-        }
-        // Daemon is exiting, blocking pg_ctl cannot delay other work
-        match self.shadow.is_running() {
-            Ok(true) => {
-                if let Err(e) = self.shadow.stop() {
-                    tracing::warn!(
-                        target: "walshadow::shadow",
-                        error = %e,
-                        "shadow stop on daemon exit failed",
-                    );
-                }
-            }
-            Ok(false) => {}
-            Err(e) => tracing::warn!(
-                target: "walshadow::shadow",
-                error = %e,
-                "shadow status probe on daemon exit failed",
-            ),
         }
     }
 }
@@ -337,9 +360,8 @@ mod tests {
     }
 
     #[test]
-    fn walsender_conninfo_skipped_on_kernel_picked_port() {
-        assert!(walsender_primary_conninfo("127.0.0.1:0".parse().unwrap()).is_none());
-        let ci = walsender_primary_conninfo("127.0.0.1:5441".parse().unwrap()).unwrap();
+    fn walsender_conninfo_names_bind_address() {
+        let ci = walsender_primary_conninfo("127.0.0.1:5441".parse().unwrap());
         assert!(ci.contains("host=127.0.0.1"), "{ci}");
         assert!(ci.contains("port=5441"), "{ci}");
     }

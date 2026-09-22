@@ -2,7 +2,7 @@
 //! pump does when the source it was reading stops answering or forks.
 
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use tokio_postgres::types::PgLsn;
@@ -18,31 +18,6 @@ use walshadow::wal_stream::WalStream;
 
 use crate::archive::ArchiveFeed;
 use crate::args::{Args, cli_base};
-
-/// Retry transient source failures, stop when source reports missing WAL.
-pub(crate) async fn reconnect_source(
-    cfg: &PgConfig,
-    slot: Option<&str>,
-    resume_lsn: Pos<Floor>,
-    branch: SourceBranch,
-    floor: Pos<Floor>,
-    status_interval: Duration,
-) -> Result<SourceFeed> {
-    use backon::{ExponentialBuilder, Retryable};
-
-    (|| resume_source_feed(cfg, slot, resume_lsn, branch, floor, status_interval))
-        .retry(
-            ExponentialBuilder::default()
-                .with_min_delay(Duration::from_millis(200))
-                .with_max_delay(Duration::from_secs(10))
-                .without_max_times(),
-        )
-        .when(|e: &anyhow::Error| !walshadow::source_feed::is_wal_segment_removed(e))
-        .notify(|e: &anyhow::Error, d: Duration| {
-            tracing::warn!(target: "walshadow", error = %e, retry_in_ms = d.as_millis() as u64, "source reconnect failed — retrying");
-        })
-        .await
-}
 
 /// How long the fork proofs wait for the pump-side queue to drain. Past it the
 /// buffer's own view answers, which reads a still-queued record as a
@@ -164,17 +139,16 @@ pub(crate) fn resume_manifest(
     stream_timeline: u32,
     lsn: manifest::LsnSet,
 ) -> manifest::Manifest {
-    // Never walks back. A crossing commits the fork segment's start, which
-    // `align_down(emitter_ack)` reaches only once descendant WAL fills that
-    // segment; the natural terms must not undo the position a restart
-    // resumes from. A rewind (`--start-lsn`, `--ignore-cursor`) lowers it by
-    // seeding `resume_floor` at the rewind point instead
-    let floor = shadow_floor
-        .bound(manifest::resolved_floor(
-            lsn.emitter_ack,
-            lsn.filter_durable,
-        ))
-        .max(published_floor);
+    // A rewind (`--start-lsn`, `--ignore-cursor`) lowers the floor by seeding
+    // `resume_floor` at the rewind point, never through these terms
+    let floor = manifest::FloorInputs {
+        resume_safe: lsn.emitter_ack,
+        filter_durable: lsn.filter_durable,
+        shadow: shadow_floor,
+        published: published_floor,
+        fork: None,
+    }
+    .floor();
     let floor_timeline = history.floor_branch(
         floor.get(),
         identity.timeline,
@@ -187,7 +161,7 @@ pub(crate) fn resume_manifest(
         source: manifest::SourceIdentity {
             system_id: identity.system_id,
             timeline: floor_timeline,
-            timeline_begin: history.begin_of(floor_timeline).unwrap_or(0).into(),
+            timeline_begin: Pos::new(history.begin_of(floor_timeline).unwrap_or(0)),
         },
         wal: manifest::WalBranch { stream_timeline },
         lsn,
@@ -210,9 +184,17 @@ pub(crate) async fn commit_fork_resume(
     resume_floor: &Monotone<Floor>,
     gc_floor: &Monotone<Floor>,
 ) -> Result<()> {
+    let floor = manifest::FloorInputs {
+        resume_safe: lsn.emitter_ack,
+        filter_durable: lsn.filter_durable,
+        published: resume_floor.get(),
+        fork: Some(resume.floor),
+        ..manifest::FloorInputs::default()
+    }
+    .floor();
     let committed = manifest::Manifest {
         version: manifest::MANIFEST_VERSION,
-        floor: resume.floor,
+        floor,
         source: manifest::SourceIdentity {
             system_id: identity.system_id,
             timeline: resume.timeline,
@@ -229,12 +211,12 @@ pub(crate) async fn commit_fork_resume(
         .await
         .context("write resume manifest at the fork")?;
     // Descendant floor starts new position space
-    resume_floor.rebase(resume.floor);
-    gc_floor.rebase(resume.floor);
+    resume_floor.rebase(floor);
+    gc_floor.rebase(floor);
     tracing::info!(
         target: "walshadow",
         timeline = resume.timeline,
-        floor = %resume.floor,
+        floor = %floor,
         switch_lsn = %resume.switch_lsn,
         "committed the fork resume position",
     );
@@ -253,11 +235,11 @@ pub(crate) async fn connect_source_waiting(
     args: &Args,
     source_conn: &mut SourceConn,
     cfg: &mut PgConfig,
-) -> SourceFeed {
+) -> Result<SourceFeed> {
     loop {
         match SourceFeed::connect(cfg).await {
             Ok(feed) => {
-                return feed.with_status_interval(Duration::from_secs(args.status_interval));
+                return Ok(feed.with_status_interval(Duration::from_secs(args.status_interval)));
             }
             Err(e) => tracing::warn!(
                 target: "walshadow",
@@ -409,7 +391,7 @@ pub(crate) fn prove_branch(
     }
     if !history.proves_ancestor(branch.timeline, resume_lsn) {
         return Err(TransitionError::ResumePastFork {
-            next_lsn: resume_lsn.into(),
+            next_lsn: Pos::new(resume_lsn),
             switch_lsn: history.switchpoint_of(branch.timeline).unwrap_or(0),
         });
     }
@@ -425,6 +407,44 @@ pub(crate) fn swap_reason(err: &anyhow::Error) -> &'static str {
         .unwrap_or("source")
 }
 
+/// Where the pump reads WAL from; `feed` serves only [`Live`](Self::Live)
+pub(crate) enum SourcePath {
+    Live,
+    Archive(ArchiveFeed),
+    Redial(Redial),
+}
+
+impl SourcePath {
+    pub(crate) fn archive(&mut self) -> Option<&mut ArchiveFeed> {
+        match self {
+            Self::Archive(a) => Some(a),
+            _ => None,
+        }
+    }
+}
+
+/// Source lost with no archive to read, redialed each due pump iteration so
+/// the loop keeps publishing, pausing and applying `[source]` repoints
+pub(crate) struct Redial {
+    pub(crate) retry_at: Instant,
+    pub(crate) backoff: Duration,
+    /// Why the archive could not stand in, named if the source cannot serve
+    pub(crate) archive_error: String,
+}
+
+impl Redial {
+    pub(crate) const MIN_BACKOFF: Duration = Duration::from_millis(200);
+    pub(crate) const MAX_BACKOFF: Duration = Duration::from_secs(10);
+
+    pub(crate) fn now(archive_error: String) -> Self {
+        Self {
+            retry_at: Instant::now(),
+            backoff: Self::MIN_BACKOFF,
+            archive_error,
+        }
+    }
+}
+
 pub(crate) struct SourceRecovery<'a> {
     pub(crate) status_interval: Duration,
     pub(crate) backup: Option<&'a walrus::config::Settings>,
@@ -435,11 +455,12 @@ pub(crate) struct SourceRecovery<'a> {
 }
 
 impl SourceRecovery<'_> {
-    /// Try source, otherwise start bounded archive fetches for normal pump. `cfg`, `slot`,
-    /// and `branch` are the live endpoint, slot name, and proved branch, passed
-    /// per call rather than held, so a recovery that starts after a `[source]`
-    /// reload or a crossing dials the new address under the new name and asks
-    /// for the descendant, with the archive read under its segment names.
+    /// Try source, otherwise start bounded archive fetches for normal pump,
+    /// otherwise redial. `cfg`, `slot`, and `branch` are the live endpoint,
+    /// slot name, and proved branch, passed per call rather than held, so a
+    /// recovery that starts after a `[source]` reload or a crossing dials the
+    /// new address under the new name and asks for the descendant, with the
+    /// archive read under its segment names.
     pub(crate) async fn recover(
         &self,
         source_error: anyhow::Error,
@@ -447,8 +468,8 @@ impl SourceRecovery<'_> {
         slot: Option<&str>,
         branch: SourceBranch,
         resume_lsn: Pos<Floor>,
-        archive: &mut Option<ArchiveFeed>,
-    ) -> Result<Option<SourceFeed>> {
+        feed: &mut SourceFeed,
+    ) -> SourcePath {
         // Source first (primary_conninfo analog): a plain drop is usually
         // transient, so try the source again at the exact resume point before
         // reaching for the archive. A removed-WAL (58P01) error means the
@@ -467,7 +488,15 @@ impl SourceRecovery<'_> {
             )
             .await
             {
-                Ok(feed) => return Ok(Some(feed)),
+                Ok(fresh) => {
+                    *feed = fresh;
+                    tracing::info!(
+                        target: "walshadow",
+                        resume_lsn = %resume_lsn,
+                        "source reconnected — resuming replication",
+                    );
+                    return SourcePath::Live;
+                }
                 Err(retry_error) => retry_error,
             }
         };
@@ -478,39 +507,42 @@ impl SourceRecovery<'_> {
             source_missing,
             "source cannot serve the resume point — trying archive",
         );
-        // Archive fallback (restore_command analog). `reconnect_or_operator`
-        // covers every "no archive": a transient error retries the source with
-        // backoff, a removed-WAL error surfaces the operator-action message.
+        // Archive fallback (restore_command analog). Redial covers every "no
+        // archive": a transient error retries the source with backoff, a
+        // removed-WAL error surfaces the operator-action message.
         let archive_error = match self.backup.map(|s| (s, s.build_storage())) {
             None => "no [backup] archive configured".to_string(),
             Some((_, Err(e))) => format!("build archive storage: {e:#}"),
             Some((settings, Ok(storage))) => {
                 tracing::info!(target: "walshadow", resume_lsn = %resume_lsn,
                     prefetch = self.prefetch, "starting archive recovery");
-                *archive = Some(ArchiveFeed::spawn(
+                return SourcePath::Archive(ArchiveFeed::spawn(
                     settings.clone(),
                     storage,
                     branch.timeline,
                     resume_lsn.get(),
                     self.prefetch,
                 ));
-                return Ok(None);
             }
         };
-        self.reconnect_or_operator(cfg, slot, branch, resume_lsn, &archive_error)
-            .await
-            .map(Some)
+        SourcePath::Redial(Redial::now(archive_error))
     }
 
-    pub(crate) async fn reconnect_or_operator(
+    /// One attempt once `redial` is due. Removed WAL needs an operator; any
+    /// other failure backs off for the next iteration. Every attempt goes
+    /// through [`resume_source_feed`]'s proofs
+    pub(crate) async fn redial(
         &self,
+        redial: &mut Redial,
         cfg: &PgConfig,
         slot: Option<&str>,
         branch: SourceBranch,
         resume_lsn: Pos<Floor>,
-        archive_error: &str,
-    ) -> Result<SourceFeed> {
-        reconnect_source(
+    ) -> Result<Option<SourceFeed>> {
+        if Instant::now() < redial.retry_at {
+            return Ok(None);
+        }
+        match resume_source_feed(
             cfg,
             slot,
             resume_lsn,
@@ -519,12 +551,28 @@ impl SourceRecovery<'_> {
             self.status_interval,
         )
         .await
-        .map_err(|source_error| {
-            source_error.context(format!(
-                "source cannot serve WAL at {resume_lsn}; {archive_error}; \
-                 base-backup refresh requires operator action",
-            ))
-        })
+        {
+            Ok(feed) => Ok(Some(feed)),
+            Err(e) if walshadow::source_feed::is_wal_segment_removed(&e) => {
+                Err(e.context(format!(
+                    "source cannot serve WAL at {resume_lsn}; {}; \
+                     base-backup refresh requires operator action",
+                    redial.archive_error,
+                )))
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "walshadow",
+                    error = %e,
+                    endpoint = %format!("{}:{}", cfg.host, cfg.port),
+                    retry_in_ms = redial.backoff.as_millis() as u64,
+                    "source reconnect failed — retrying",
+                );
+                redial.retry_at = Instant::now() + redial.backoff;
+                redial.backoff = (redial.backoff * 2).min(Redial::MAX_BACKOFF);
+                Ok(None)
+            }
+        }
     }
 }
 
@@ -573,7 +621,7 @@ mod tests {
     #[test]
     fn stream_branch_names_the_branch_by_its_switchpoint() {
         let history = TimelineHistory::parse(2, b"1\t0/3000000\tno recovery target\n").unwrap();
-        let stream = WalStream::new(2, WAL_SEG_SIZE, 0x300_0000).unwrap();
+        let stream = WalStream::new(2, WAL_SEG_SIZE, Pos::new(0x300_0000)).unwrap();
         assert_eq!(stream_branch(&history, 7, &stream).begin, 0x300_0000);
     }
 

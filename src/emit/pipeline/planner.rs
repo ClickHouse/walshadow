@@ -163,8 +163,8 @@ impl<'a, V: PlanRouteView> Planner<'a, V> {
                     self.writer.push_heap(&heap, route.as_ref())?;
                 }
                 WalkStep::Heap(mut heap) => {
-                    // Route before validation and detoast, matching the
-                    // decode pool: unmapped rows discard without touching
+                    // Route before validation and detoast: unmapped rows
+                    // discard without touching
                     // the resolver or codec checks. The value permit drops
                     // once bytes land in the plan file
                     let route = self.view.route_for(&heap);

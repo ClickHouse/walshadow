@@ -25,8 +25,8 @@ use crate::emit::ch_emitter::EmitterStats;
 use crate::emit::pipeline::ack::AckHandle;
 use crate::emit::pipeline::batcher::{BatcherMsg, RoutedRow};
 use crate::emit::route::{RouteSnapshot, freeze_routes};
-use crate::filter::manifest::Manifest;
 use crate::mapping::MappingSnapshot;
+use crate::pos::Pos;
 use crate::record::{Record, RecordSink, SegmentSink, SinkError, WAL_SEG_SIZE};
 use crate::schema::{FIRST_NORMAL_OBJECT_ID, RelDescriptor, RelName};
 use crate::source::wal_stream::WalStream;
@@ -535,7 +535,7 @@ impl RecordSink for WalReplaySink {
                         self.buffer
                             .lock()
                             .await
-                            .abort(xid, record.source_lsn, &payload.subxacts)
+                            .abort(xid, Pos::new(record.source_lsn), &payload.subxacts)
                             .await
                             .map_err(SinkError::from)?;
                         self.subxact_tracker.forget_tree(xid);
@@ -566,7 +566,6 @@ impl SegmentSink for DropSegments {
         &'a mut self,
         _seg: SegmentName,
         _bytes: &'a [u8],
-        _manifest: &'a Manifest,
     ) -> Pin<Box<dyn Future<Output = std::result::Result<(), SinkError>> + Send + 'a>> {
         Box::pin(std::future::ready(Ok(())))
     }
@@ -582,9 +581,12 @@ pub struct SegmentPump {
 
 impl SegmentPump {
     pub fn start(first: &SegmentName, target_db_oid: Oid) -> Result<Self> {
-        let mut stream =
-            WalStream::new(first.timeline, WAL_SEG_SIZE, first.start_lsn(WAL_SEG_SIZE))
-                .map_err(|e| anyhow::anyhow!("wal_replay: WalStream: {e}"))?;
+        let mut stream = WalStream::new(
+            first.timeline,
+            WAL_SEG_SIZE,
+            Pos::new(first.start_lsn(WAL_SEG_SIZE)),
+        )
+        .map_err(|e| anyhow::anyhow!("wal_replay: WalStream: {e}"))?;
         stream.filter_mut().set_target_db(target_db_oid);
         Ok(Self {
             stream,
@@ -617,14 +619,6 @@ impl SegmentPump {
             .map_err(|e| anyhow::anyhow!("wal_replay: {}: {e}", seg.format()))?;
         Ok(())
     }
-
-    pub async fn close(self, sink: &mut (dyn RecordSink + Send)) -> Result<()> {
-        self.stream
-            .close(None, sink)
-            .await
-            .map_err(|e| anyhow::anyhow!("wal_replay: close: {e}"))?;
-        Ok(())
-    }
 }
 
 /// Replay fetched segments in LSN order, following each segment's timeline
@@ -640,7 +634,7 @@ pub async fn pump_segments_through(
     for (seg, path) in segments {
         pump.push(seg, path, sink).await?;
     }
-    pump.close(sink).await
+    Ok(())
 }
 
 #[cfg(test)]
@@ -896,7 +890,10 @@ mod tests {
             XactBuffer::new(crate::xact::xact_buffer::XactBufferConfig::new(spill)).unwrap(),
         ));
         let (msg_tx, _msg_rx) = mpsc::channel(8);
-        let (ack, _collector) = ack::spawn(Arc::new(Monotone::<EmitterAck>::new(0)));
+        let (ack, _collector) = ack::spawn(
+            Arc::new(Monotone::<EmitterAck>::default()),
+            crate::emit::pipeline::Fatal::new(),
+        );
         WalReplaySink::new(WalReplayInputs {
             log,
             buffer,
@@ -942,7 +939,10 @@ mod tests {
             XactBuffer::new(crate::xact::xact_buffer::XactBufferConfig::new(spill)).unwrap(),
         ));
         let (msg_tx, _msg_rx) = mpsc::channel(8);
-        let (ack, _collector) = ack::spawn(Arc::new(Monotone::<EmitterAck>::new(0)));
+        let (ack, _collector) = ack::spawn(
+            Arc::new(Monotone::<EmitterAck>::default()),
+            crate::emit::pipeline::Fatal::new(),
+        );
         WalReplaySink::new(WalReplayInputs {
             log: Arc::new(log),
             buffer,

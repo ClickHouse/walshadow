@@ -284,27 +284,22 @@ impl ForkWait {
 impl ForkBarrier {
     /// `None` once every consumer has reached the fork; otherwise what is still
     /// behind.
-    pub fn pending(
-        &self,
-        switch_lsn: impl Into<Pos<Switchpoint>>,
-        seg_size: u64,
-    ) -> Option<ForkWait> {
-        let switch_lsn = switch_lsn.into();
-        // One barrier, three roles: each comparison unwraps the far side once
+    pub fn pending(&self, switch_lsn: Pos<Switchpoint>, seg_size: u64) -> Option<ForkWait> {
+        // One barrier, three roles: retag each term onto barrier's role
         let fork_segment: Pos<Floor> = Pos::new(WalStream::align_down(switch_lsn.get(), seg_size));
-        if self.resume_safe_lsn < fork_segment.get() {
+        if self.resume_safe_lsn.retag() < fork_segment {
             return Some(ForkWait::EmitterAck {
                 acked: self.resume_safe_lsn,
                 fork_segment,
             });
         }
-        if self.shadow_apply_lsn.is_none_or(|a| a < switch_lsn.get()) {
+        if self.shadow_apply_lsn.is_none_or(|a| a.retag() < switch_lsn) {
             return Some(ForkWait::ShadowApply {
                 applied: self.shadow_apply_lsn,
                 fork: switch_lsn,
             });
         }
-        if fork_segment > self.filter_durable.get().max(self.floor.get()) {
+        if fork_segment > self.filter_durable.retag().max(self.floor) {
             return Some(ForkWait::ArchiveSeal {
                 durable: self.filter_durable,
                 fork_segment,
@@ -459,7 +454,7 @@ impl Switchover<'_> {
             .ok_or_else(not_descendant)?;
         // The walsender stops exactly at the switchpoint, so a frontier above
         // it means bytes were read that the descendant branch never had
-        if stream.next_lsn() > switch_lsn {
+        if stream.next_lsn().get() > switch_lsn {
             return Err(TransitionError::ResumePastFork {
                 next_lsn: stream.next_lsn(),
                 switch_lsn,
@@ -713,64 +708,108 @@ pub struct CrossingWedge {
     pub detail: String,
 }
 
-/// Timeline crossing state retained across pump iterations
+/// Pacing of the next crossing attempt
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Attempt {
+    /// Held connection cannot read history, dial a fresh one first
+    pub reconnect: bool,
+    pub retry_at: Option<Instant>,
+}
+
+/// Timeline crossing progress retained across pump iterations. Only
+/// [`Proving`](Self::Proving) holds a fork, so a commit cannot run on an
+/// unproved one
 #[derive(Debug, Default)]
-pub struct CrossingState {
-    pending: bool,
-    reconnect: bool,
-    retry_at: Option<Instant>,
-    wedge: Option<CrossingWedge>,
-    fork: Option<ForkPoint>,
+pub enum CrossingState {
+    #[default]
+    Idle,
+    /// Ancestor ended, fork not proved yet
+    Pending(Attempt),
+    /// Fork proved, pipeline draining to it before the commit
+    Proving { fork: ForkPoint, attempt: Attempt },
+    /// Refused crossing, waits for a pause to re-prove the fork
+    Wedged(CrossingWedge),
 }
 
 impl CrossingState {
-    pub fn ancestor_ended(&mut self) {
-        self.pending = true;
+    pub fn ancestor_ended(&mut self, reconnect: bool) {
+        match self {
+            Self::Idle => {
+                *self = Self::Pending(Attempt {
+                    reconnect,
+                    retry_at: None,
+                })
+            }
+            Self::Pending(a) | Self::Proving { attempt: a, .. } => a.reconnect |= reconnect,
+            Self::Wedged(_) => {}
+        }
     }
 
     pub fn pending(&self) -> bool {
-        self.pending
+        !matches!(self, Self::Idle)
     }
 
     pub fn wedge(&self) -> Option<&CrossingWedge> {
-        self.wedge.as_ref()
+        match self {
+            Self::Wedged(w) => Some(w),
+            _ => None,
+        }
     }
 
-    pub fn needs_connection(&mut self) {
-        self.reconnect = true;
+    pub fn fork(&self) -> Option<&ForkPoint> {
+        match self {
+            Self::Proving { fork, .. } => Some(fork),
+            _ => None,
+        }
+    }
+
+    fn attempt(&self) -> Option<Attempt> {
+        match self {
+            Self::Pending(a) | Self::Proving { attempt: a, .. } => Some(*a),
+            Self::Idle | Self::Wedged(_) => None,
+        }
+    }
+
+    fn attempt_mut(&mut self) -> Option<&mut Attempt> {
+        match self {
+            Self::Pending(a) | Self::Proving { attempt: a, .. } => Some(a),
+            Self::Idle | Self::Wedged(_) => None,
+        }
     }
 
     pub fn awaiting_connection(&self) -> bool {
-        self.reconnect
+        self.attempt().is_some_and(|a| a.reconnect)
     }
 
     pub fn connected(&mut self) {
-        self.reconnect = false;
+        if let Some(a) = self.attempt_mut() {
+            a.reconnect = false;
+        }
     }
 
     pub fn due(&self, now: Instant) -> bool {
-        self.pending && self.wedge.is_none() && self.retry_at.is_none_or(|at| now >= at)
+        self.attempt()
+            .is_some_and(|a| a.retry_at.is_none_or(|at| now >= at))
     }
 
     pub fn retry_at(&mut self, at: Instant) {
-        self.retry_at = Some(at);
+        if let Some(a) = self.attempt_mut() {
+            a.retry_at = Some(at);
+        }
     }
 
+    /// Keeps a proved fork: a retry re-dials, the proof still stands
     pub fn retry_from_source(&mut self, at: Instant) {
-        self.reconnect = true;
-        self.retry_at = Some(at);
+        if let Some(a) = self.attempt_mut() {
+            a.reconnect = true;
+            a.retry_at = Some(at);
+        }
     }
 
-    pub fn hold_fork(&mut self, fork: ForkPoint) {
-        self.fork = Some(fork);
-    }
-
-    pub fn has_fork(&self) -> bool {
-        self.fork.is_some()
-    }
-
-    pub fn take_fork(&mut self) -> Option<ForkPoint> {
-        self.fork.take()
+    pub fn proved(&mut self, fork: ForkPoint) {
+        if let Self::Pending(attempt) = *self {
+            *self = Self::Proving { fork, attempt };
+        }
     }
 
     pub fn park(&mut self, err: TransitionError, consumed: u64, switch_lsn: Option<u64>) {
@@ -787,21 +826,24 @@ impl CrossingState {
             "crossing refused — pump parked; fix what the reason names, then \
              pause and resume to prove the fork again",
         );
-        self.wedge = Some(wedge);
+        *self = Self::Wedged(wedge);
     }
 
+    /// Re-prove from a fresh connection, the ancestor still ended
     pub fn unpark(&mut self) -> Option<CrossingWedge> {
-        let wedge = self.wedge.take()?;
-        self.fork = None;
-        self.reconnect = true;
+        let Self::Wedged(wedge) = self else {
+            return None;
+        };
+        let wedge = wedge.clone();
+        *self = Self::Pending(Attempt {
+            reconnect: true,
+            retry_at: None,
+        });
         Some(wedge)
     }
 
     pub fn committed(&mut self) {
-        self.pending = false;
-        self.reconnect = false;
-        self.retry_at = None;
-        self.fork = None;
+        *self = Self::Idle;
     }
 }
 
@@ -1024,7 +1066,7 @@ mod tests {
 
     #[test]
     fn barrier_opens_once_every_frontier_reaches_the_fork() {
-        assert_eq!(caught_up().pending(SEG + 0x1000, SEG), None);
+        assert_eq!(caught_up().pending(Pos::new(SEG + 0x1000), SEG), None);
     }
 
     /// An unacked commit *inside* the fork segment does not hold the barrier: a
@@ -1037,7 +1079,7 @@ mod tests {
                 resume_safe_lsn: SEG.into(),
                 ..caught_up()
             }
-            .pending(SEG + 0x1000, SEG),
+            .pending(Pos::new(SEG + 0x1000), SEG),
             None,
             "acked exactly at the fork segment's start is enough",
         );
@@ -1046,7 +1088,7 @@ mod tests {
                 resume_safe_lsn: (SEG - 1).into(),
                 ..caught_up()
             }
-            .pending(SEG + 0x1000, SEG),
+            .pending(Pos::new(SEG + 0x1000), SEG),
             Some(ForkWait::EmitterAck {
                 acked: (SEG - 1).into(),
                 fork_segment: SEG.into(),
@@ -1080,7 +1122,7 @@ mod tests {
             ..caught_up()
         };
         assert_eq!(
-            b.pending(SEG + 0x1000, SEG),
+            b.pending(Pos::new(SEG + 0x1000), SEG),
             Some(ForkWait::ArchiveSeal {
                 durable: Pos::ZERO,
                 fork_segment: SEG.into(),
@@ -1091,7 +1133,7 @@ mod tests {
                 floor: SEG.into(),
                 ..b
             }
-            .pending(SEG + 0x1000, SEG),
+            .pending(Pos::new(SEG + 0x1000), SEG),
             None,
             "a floor already at the fork segment needs no seal",
         );
@@ -1128,9 +1170,9 @@ mod tests {
         let now = Instant::now();
         let mut c = CrossingState::default();
         assert!(!c.due(now), "no crossing without an ended ancestor");
-        c.ancestor_ended();
+        c.ancestor_ended(false);
         assert!(c.due(now));
-        c.hold_fork(ForkPoint {
+        c.proved(ForkPoint {
             finished_tli: 1,
             next_tli: 2,
             live_tli: 2,
@@ -1146,7 +1188,7 @@ mod tests {
         assert_eq!(c.wedge().map(|w| w.reason), Some("fork_prefix_mismatch"));
         assert_eq!(c.unpark().map(|w| w.reason), Some("fork_prefix_mismatch"));
         assert!(
-            !c.has_fork() && c.awaiting_connection(),
+            c.fork().is_none() && c.awaiting_connection(),
             "clearing a park re-proves from a fresh connection",
         );
         assert!(c.due(now), "the ancestor still ended");
@@ -1156,10 +1198,39 @@ mod tests {
     }
 
     #[test]
+    fn a_retried_crossing_keeps_its_proved_fork() {
+        let now = Instant::now();
+        let mut c = CrossingState::default();
+        c.proved(ForkPoint {
+            finished_tli: 1,
+            next_tli: 2,
+            live_tli: 2,
+            switch_lsn: 0x300_0000,
+            histories: Vec::new(),
+        });
+        assert!(c.fork().is_none(), "no fork without an ended ancestor");
+        c.ancestor_ended(false);
+        c.proved(ForkPoint {
+            finished_tli: 1,
+            next_tli: 2,
+            live_tli: 2,
+            switch_lsn: 0x300_0000,
+            histories: Vec::new(),
+        });
+        c.retry_from_source(now + std::time::Duration::from_secs(2));
+        assert_eq!(c.fork().map(|f| f.switch_lsn), Some(0x300_0000));
+        assert!(c.awaiting_connection() && !c.due(now));
+        c.ancestor_ended(false);
+        assert!(c.awaiting_connection(), "a repeated end keeps the redial");
+        c.committed();
+        assert!(c.fork().is_none() && !c.pending());
+    }
+
+    #[test]
     fn a_retry_is_due_only_once_its_backoff_elapses() {
         let now = Instant::now();
         let mut c = CrossingState::default();
-        c.ancestor_ended();
+        c.ancestor_ended(false);
         c.retry_from_source(now + std::time::Duration::from_secs(2));
         assert!(c.awaiting_connection());
         assert!(!c.due(now));

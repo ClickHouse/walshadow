@@ -355,15 +355,32 @@ impl DdlApplicator {
     /// Errors propagate; the worker task turns them into
     /// `DecoderSinkError` so the daemon poisons the stream cleanly.
     pub async fn apply(&mut self, event: &SchemaEvent) -> Result<(), EmitterError> {
+        self.apply_under(event, None).await
+    }
+
+    /// Apply under frozen config `frozen`, the version
+    /// [`Self::predict_route_mapping`] planned with; `None` uses live config
+    pub async fn apply_under(
+        &mut self,
+        event: &SchemaEvent,
+        frozen: Option<&ResolvedConfig>,
+    ) -> Result<(), EmitterError> {
         self.refresh_config().await?;
+        let cfg = self.plan_config(frozen);
         match event {
-            SchemaEvent::Added { desc } => self.apply_added(desc).await,
-            SchemaEvent::Changed { old, new, diff } => self.apply_changed(old, new, diff).await,
-            SchemaEvent::Dropped { oid: _, rel_name } => self.apply_dropped(rel_name).await,
+            SchemaEvent::Added { desc } => self.apply_added(desc, &cfg).await,
+            SchemaEvent::Changed { old, new, diff } => {
+                self.apply_changed(old, new, diff, &cfg).await
+            }
+            SchemaEvent::Dropped { oid: _, rel_name } => self.apply_dropped(rel_name, &cfg).await,
         }
     }
 
-    async fn apply_added(&mut self, desc: &RelDescriptor) -> Result<(), EmitterError> {
+    async fn apply_added(
+        &mut self,
+        desc: &RelDescriptor,
+        cfg: &DdlConfig,
+    ) -> Result<(), EmitterError> {
         // Mapped dest created from the mapping when missing; IF NOT EXISTS
         // no-ops an operator-managed table and re-creates after strategy=drop.
         if let Some(m) = self.mapping_for(&desc.rel_name).await {
@@ -372,9 +389,8 @@ impl DdlApplicator {
                 return Ok(());
             }
             self.ensure_database(&m.target.database).await?;
-            let settings = self.config.rules.settings(&desc.rel_name);
-            let sql =
-                render_create_table_from_mapping(desc, &m, &self.config.create_shape(&settings));
+            let settings = cfg.rules.settings(&desc.rel_name);
+            let sql = render_create_table_from_mapping(desc, &m, &cfg.create_shape(&settings));
             self.execute(&sql).await?;
             self.stats.creates_applied += 1;
             // Dest that outlived an older mapping lacks columns routed since
@@ -390,31 +406,17 @@ impl DdlApplicator {
             self.stats.skipped += 1;
             return Ok(());
         }
-        if !self.config.auto_creates(&desc.rel_name) {
-            self.stats.skipped += 1;
-            return Ok(());
-        }
-        // Drives both CREATE TABLE and the row-routing mapping below so
-        // rows and DDL land in the same place
-        let settings = self.config.rules.settings(&desc.rel_name);
-        let target = self.config.create_target(&settings, &desc.rel_name);
-        let shape = self.config.create_shape(&settings);
-        let Some(sql) = render_create_table(desc, &target, &shape, &self.config.column_rules)?
-        else {
+        let Some((sql, mapping)) = derive_added(cfg, desc)? else {
             self.stats.skipped += 1;
             return Ok(());
         };
-        if !self.claims_target(&target, &desc.rel_name).await {
+        if !self.claims_target(&mapping.target, &desc.rel_name).await {
             self.stats.skipped += 1;
             return Ok(());
         }
-        self.ensure_database(&target.database).await?;
+        self.ensure_database(&mapping.target.database).await?;
         self.execute(&sql).await?;
         self.stats.creates_applied += 1;
-        // Auto-derive a TableMapping so the emitter ships rows against
-        // the new CH table without TOML edits
-        let columns = derive_columns_for_mapping(desc, &self.config.column_rules);
-        let mapping = TableMapping { target, columns };
         self.register_mapping(&desc.rel_name, mapping).await;
         Ok(())
     }
@@ -456,6 +458,7 @@ impl DdlApplicator {
         _old: &RelDescriptor,
         new: &RelDescriptor,
         diff: &SchemaDiff,
+        cfg: &DdlConfig,
     ) -> Result<(), EmitterError> {
         let key = new.rel_name.clone();
         let Some((mapped_at, target)) = self.mapping_target(&key).await else {
@@ -501,7 +504,7 @@ impl DdlApplicator {
             let (name, resolved) = apply_column_rule(
                 &att.name,
                 resolved,
-                self.config.column_rules.settings(&new.rel_name, &att.name),
+                cfg.column_rules.settings(&new.rel_name, &att.name),
             );
             let sql = render_add_column(&target, &name, &resolved);
             self.execute(&sql).await?;
@@ -542,16 +545,16 @@ impl DdlApplicator {
         // rows against the new shape without TOML edits; operator-pinned
         // `target_name` overrides survive (only touch entries the
         // applicator could have produced, by src_attnum match)
-        self.fold_mapping_diff(new, diff).await;
+        self.fold_mapping_diff(new, diff, cfg).await;
         Ok(())
     }
 
-    async fn apply_dropped(&mut self, rel: &RelName) -> Result<(), EmitterError> {
+    async fn apply_dropped(&mut self, rel: &RelName, cfg: &DdlConfig) -> Result<(), EmitterError> {
         let Some((_, target)) = self.mapping_target(rel).await else {
             self.stats.skipped += 1;
             return Ok(());
         };
-        match self.config.drop_strategy_for(&rel.namespace) {
+        match cfg.drop_strategy_for(&rel.namespace) {
             DropTableStrategy::Retain => {
                 self.stats.skipped += 1;
                 tracing::info!(
@@ -672,11 +675,11 @@ impl DdlApplicator {
             .unwrap_or_else(|| self.config.clone())
     }
 
-    async fn fold_mapping_diff(&mut self, new: &RelDescriptor, diff: &SchemaDiff) {
+    async fn fold_mapping_diff(&mut self, new: &RelDescriptor, diff: &SchemaDiff, cfg: &DdlConfig) {
         if let Some(r) = &self.resolver {
             r.apply_schema_diff(new, diff).await;
         } else {
-            mutate_mapping_for_diff(&self.mapping, new, diff, &self.config.column_rules).await;
+            mutate_mapping_for_diff(&self.mapping, new, diff, &cfg.column_rules).await;
         }
     }
 
@@ -741,28 +744,10 @@ fn predict_route_effect(
 ) -> Result<Option<(RelName, Option<TableMapping>)>, EmitterError> {
     match event {
         SchemaEvent::Added { desc } => {
-            // `replicate_all` is not predicted: it maps on first sight, which
-            // the executor's own apply covers
-            if mapping.contains_key(&desc.rel_name)
-                || excluded
-                || !(cfg
-                    .auto_create_namespaces
-                    .contains(&*desc.rel_name.namespace)
-                    || cfg.declared_scope(&desc.rel_name) == Some(true))
-            {
+            if mapping.contains_key(&desc.rel_name) || excluded {
                 return Ok(None);
             }
-            let settings = cfg.rules.settings(&desc.rel_name);
-            let target = cfg.create_target(&settings, &desc.rel_name);
-            let shape = cfg.create_shape(&settings);
-            if render_create_table(desc, &target, &shape, &cfg.column_rules)?.is_none() {
-                return Ok(None);
-            }
-            let columns = derive_columns_for_mapping(desc, &cfg.column_rules);
-            Ok(Some((
-                desc.rel_name.clone(),
-                Some(TableMapping { target, columns }),
-            )))
+            Ok(derive_added(cfg, desc)?.map(|(_, m)| (desc.rel_name.clone(), Some(m))))
         }
         SchemaEvent::Changed { new, diff, .. } => {
             let Some(mut m) = mapping.get(&new.rel_name).cloned() else {
@@ -783,6 +768,26 @@ fn predict_route_effect(
             Ok(Some((rel_name.clone(), None)))
         }
     }
+}
+
+/// `CREATE TABLE` plus row-routing mapping `Added` derives for an unmapped,
+/// unexcluded rel, so rows and DDL land in same place. `None` when out of
+/// scope or without a bridgeable shape
+fn derive_added(
+    cfg: &DdlConfig,
+    desc: &RelDescriptor,
+) -> Result<Option<(String, TableMapping)>, EmitterError> {
+    if !cfg.auto_creates(&desc.rel_name) {
+        return Ok(None);
+    }
+    let settings = cfg.rules.settings(&desc.rel_name);
+    let target = cfg.create_target(&settings, &desc.rel_name);
+    let shape = cfg.create_shape(&settings);
+    let Some(sql) = render_create_table(desc, &target, &shape, &cfg.column_rules)? else {
+        return Ok(None);
+    };
+    let columns = derive_columns_for_mapping(desc, &cfg.column_rules);
+    Ok(Some((sql, TableMapping { target, columns })))
 }
 
 /// Reject ALTER continuation after concurrent route republish
@@ -2082,6 +2087,49 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "live handle moved on"
+        );
+    }
+
+    /// Plan-time prediction shares apply's scope: `replicate_all` alone maps
+    /// a fresh user table, so its same-xact rows route
+    #[test]
+    fn prediction_maps_added_under_replicate_all() {
+        let mut cfg = DdlConfig {
+            drop_table_strategy: DropTableStrategy::Retain,
+            auto_create_namespaces: HashSet::new(),
+            replicate_all: true,
+            runtime_config_schema: None,
+            target_database: "default".into(),
+            namespaces: ahash::HashMap::default(),
+            soft_delete: false,
+            system: Arc::default(),
+            rules: Arc::default(),
+            column_rules: Arc::default(),
+        };
+        let added = SchemaEvent::Added {
+            desc: Arc::new(desc(
+                "fresh",
+                vec![att(1, "id", INT4OID, true, None)],
+                Some(vec![1]),
+            )),
+        };
+        let empty = MappingSnapshot::default();
+        let predicted = predict_route_effect(&cfg, &empty, &added, false).unwrap();
+        assert!(
+            matches!(&predicted, Some((r, Some(m))) if &*r.name == "fresh" && m.target.table == "fresh"),
+            "{predicted:?}"
+        );
+        assert!(
+            predict_route_effect(&cfg, &empty, &added, true)
+                .unwrap()
+                .is_none(),
+            "operator opt-out wins"
+        );
+        cfg.replicate_all = false;
+        assert!(
+            predict_route_effect(&cfg, &empty, &added, false)
+                .unwrap()
+                .is_none()
         );
     }
 

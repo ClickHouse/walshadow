@@ -37,7 +37,8 @@
 //! * `filter_durable`: highest segment-boundary LSN
 //!   [`DirSegmentSink`](crate::source::segment_sink::DirSegmentSink) fsynced.
 //!   Doubles as standby-status `flush_lsn` advertised to source.
-//! * `shadow_replay`: shadow PG's `pg_last_wal_replay_lsn()`
+//! * `shadow_replay`: shadow PG's replay LSN, as its walreceiver reports
+//!   `apply_lsn` in standby status
 //! * `drain`: highest commit-record LSN drained out of the xact buffer.
 //!   Strictly higher than `emitter_ack`.
 //! * `emitter_ack`: [`ResumeSafe`], not the live ack behind
@@ -167,13 +168,10 @@ pub fn manifest_path(spill_dir: &Path) -> PathBuf {
 /// clamp folds in at write time. Restart resumes at this floor and every
 /// pruner cuts against it: cut ≤ resume by construction, never by test.
 pub fn resolved_floor(
-    emitter_ack: impl Into<Pos<ResumeSafe>>,
-    filter_durable: impl Into<Pos<FilterDurable>>,
+    emitter_ack: Pos<ResumeSafe>,
+    filter_durable: Pos<FilterDurable>,
 ) -> Pos<Floor> {
-    Pos::new(
-        WalStream::align_down(emitter_ack.into().get(), WAL_SEG_SIZE)
-            .min(filter_durable.into().get()),
-    )
+    Pos::new(WalStream::align_down(emitter_ack.get(), WAL_SEG_SIZE).min(filter_durable.get()))
 }
 
 /// Stream-start selection.
@@ -181,30 +179,43 @@ pub fn resolved_floor(
 /// `pinned` (`--start-lsn` / fresh bootstrap) aligns only: operator
 /// rewind and bootstrap positions outrank archive continuity. Persisted
 /// `floor` wins next (already aligned + archive-clamped; zero = not yet
-/// established). Greenfield aligns then clamps to the sealed archive end
-/// so shadow's `restore_command` never sees a gap.
+/// established), bounded by `shadow`. Greenfield aligns then clamps to the
+/// sealed archive end so shadow's `restore_command` never sees a gap.
 ///
 /// Result may sit below a source slot's `restart_lsn` (floor lags the
 /// live ack by up to one status interval); slot errors surface at
 /// START_REPLICATION, same exposure as the boot-scan clamp had.
 pub fn resolve_start(
-    raw_start: impl Into<Pos<Floor>>,
+    raw_start: Pos<Floor>,
     floor: Option<Pos<Floor>>,
     pinned: bool,
     archive_end: Option<Pos<FilterDurable>>,
+    shadow: ShadowFloor,
 ) -> Pos<Floor> {
-    let aligned = Pos::new(WalStream::align_down(raw_start.into().get(), WAL_SEG_SIZE));
-    if pinned {
-        return aligned;
-    }
-    if let Some(f) = floor.filter(|f| !f.is_zero()) {
-        return f;
-    }
-    // Archive clamp becomes restart floor
-    archive_end
-        .map(Pos::retag)
-        .filter(|end| *end < aligned)
-        .unwrap_or(aligned)
+    let raw_start: Pos<ResumeSafe> = raw_start.retag();
+    const UNBOUNDED: u64 = u64::MAX;
+    let inputs = match floor.filter(|f| !f.is_zero()) {
+        _ if pinned => FloorInputs {
+            resume_safe: raw_start,
+            filter_durable: Pos::new(UNBOUNDED),
+            shadow: ShadowFloor::unbounded(),
+            ..FloorInputs::default()
+        },
+        // Persisted floor already folded ack, archive and shadow at write time
+        Some(f) => FloorInputs {
+            resume_safe: Pos::new(UNBOUNDED),
+            filter_durable: f.retag(),
+            shadow,
+            ..FloorInputs::default()
+        },
+        None => FloorInputs {
+            resume_safe: raw_start,
+            filter_durable: archive_end.unwrap_or(Pos::new(UNBOUNDED)),
+            shadow,
+            ..FloorInputs::default()
+        },
+    };
+    inputs.floor()
 }
 
 /// Resolve WAL resume LSN, precedence order:
@@ -221,17 +232,45 @@ pub fn resolve_resume_lsn(
     start_lsn: Option<Pos<Floor>>,
     bootstrap_end_lsn: Option<Pos<Floor>>,
     manifest_ack_lsn: Option<Pos<ResumeSafe>>,
-    greenfield_head: impl Into<Pos<SourceReceived>>,
+    greenfield_head: Pos<SourceReceived>,
 ) -> Pos<Floor> {
     match (start_lsn, bootstrap_end_lsn, manifest_ack_lsn) {
         (Some(s), _, _) => s,
         (None, Some(l), _) => l,
         (None, None, Some(c)) if !c.is_zero() => c.retag(),
-        (None, None, _) => greenfield_head.into().retag(),
+        (None, None, _) => greenfield_head.retag(),
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+/// Terms a floor answers to, see [`FloorInputs::floor`]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct FloorInputs {
+    pub resume_safe: Pos<ResumeSafe>,
+    pub filter_durable: Pos<FilterDurable>,
+    pub shadow: ShadowFloor,
+    /// Floor already persisted, never walked back
+    pub published: Pos<Floor>,
+    /// Fork segment start a crossing commits behind its barrier
+    pub fork: Option<Pos<Floor>>,
+}
+
+impl FloorInputs {
+    /// Segment-aligned floor at or below `resume_safe`, `filter_durable` and
+    /// `shadow`, raised to `published` so it never walks back. A committed
+    /// `fork` rebases into the descendant's position space instead: the fork
+    /// barrier proved every term reached it, and descendant WAL fills the fork
+    /// segment only later
+    pub fn floor(&self) -> Pos<Floor> {
+        if let Some(fork) = self.fork {
+            return fork;
+        }
+        self.shadow
+            .bound(resolved_floor(self.resume_safe, self.filter_durable))
+            .max(self.published)
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy)]
 pub struct ShadowFloor(Option<u64>);
 
 impl ShadowFloor {
@@ -259,13 +298,12 @@ impl ShadowFloor {
 /// floor. Keep `retention_bytes` behind replay, never past the last
 /// restartpoint REDO (shadow resumes recovery there).
 pub fn retention_cutoff(
-    shadow_replay: impl Into<Pos<ShadowReplay>>,
+    shadow_replay: Pos<ShadowReplay>,
     retention_bytes: u64,
     redo: Option<Pos<ShadowReplay>>,
 ) -> Pos<ShadowReplay> {
     Pos::new(
         shadow_replay
-            .into()
             .get()
             .saturating_sub(retention_bytes)
             .min(redo.map_or(u64::MAX, Pos::get)),
@@ -481,7 +519,10 @@ shadow_flush = \"1234563/0\"
 
     #[test]
     fn floor_aligns_ack_down() {
-        assert_eq!(resolved_floor(2 * SEG + 123, u64::MAX), 2 * SEG);
+        assert_eq!(
+            resolved_floor(Pos::new(2 * SEG + 123), Pos::new(u64::MAX)),
+            2 * SEG
+        );
     }
 
     #[test]
@@ -489,18 +530,27 @@ shadow_flush = \"1234563/0\"
         // PLAN_XACT2 finding 5 core: ack in segment N+2, sealed archive
         // end at N — cut must be N, else restart replays pruned range
         let n = 7 * SEG;
-        assert_eq!(resolved_floor(n + 2 * SEG + 55, n), n);
+        assert_eq!(resolved_floor(Pos::new(n + 2 * SEG + 55), Pos::new(n)), n);
     }
 
     #[test]
     fn floor_zero_before_first_seal() {
-        assert!(resolved_floor(2 * SEG + 1, Pos::ZERO).is_zero());
+        assert!(resolved_floor(Pos::new(2 * SEG + 1), Pos::ZERO).is_zero());
     }
+
+    const OPEN: ShadowFloor = ShadowFloor(None);
 
     #[test]
     fn start_pinned_aligns_only() {
+        let shadow = ShadowFloor(Some(SEG));
         assert_eq!(
-            resolve_start(3 * SEG + 9, Some(SEG.into()), true, Some(SEG.into())),
+            resolve_start(
+                Pos::new(3 * SEG + 9),
+                Some(SEG.into()),
+                true,
+                Some(SEG.into()),
+                shadow
+            ),
             3 * SEG,
         );
     }
@@ -508,40 +558,141 @@ shadow_flush = \"1234563/0\"
     #[test]
     fn start_floor_wins_when_nonzero() {
         assert_eq!(
-            resolve_start(3 * SEG + 9, Some((2 * SEG).into()), false, None),
+            resolve_start(
+                Pos::new(3 * SEG + 9),
+                Some((2 * SEG).into()),
+                false,
+                None,
+                OPEN
+            ),
             2 * SEG
+        );
+        let shadow = ShadowFloor(Some(SEG));
+        assert_eq!(
+            resolve_start(
+                Pos::new(3 * SEG + 9),
+                Some((2 * SEG).into()),
+                false,
+                None,
+                shadow
+            ),
+            SEG,
+            "shadow bounds a persisted floor",
         );
     }
 
     #[test]
     fn start_zero_floor_falls_through_to_archive_clamp() {
         assert_eq!(
-            resolve_start(3 * SEG + 9, Some(Pos::ZERO), false, Some((2 * SEG).into())),
+            resolve_start(
+                Pos::new(3 * SEG + 9),
+                Some(Pos::ZERO),
+                false,
+                Some((2 * SEG).into()),
+                OPEN
+            ),
             2 * SEG,
         );
     }
 
     #[test]
     fn start_greenfield_aligns_and_clamps() {
-        assert_eq!(resolve_start(3 * SEG + 9, None, false, None), 3 * SEG);
         assert_eq!(
-            resolve_start(3 * SEG + 9, None, false, Some((4 * SEG).into())),
+            resolve_start(Pos::new(3 * SEG + 9), None, false, None, OPEN),
             3 * SEG
         );
         assert_eq!(
-            resolve_start(3 * SEG + 9, None, false, Some(SEG.into())),
+            resolve_start(
+                Pos::new(3 * SEG + 9),
+                None,
+                false,
+                Some((4 * SEG).into()),
+                OPEN
+            ),
+            3 * SEG
+        );
+        assert_eq!(
+            resolve_start(Pos::new(3 * SEG + 9), None, false, Some(SEG.into()), OPEN),
             SEG
+        );
+    }
+
+    fn inputs(resume_safe: u64, filter_durable: u64) -> FloorInputs {
+        FloorInputs {
+            resume_safe: resume_safe.into(),
+            filter_durable: filter_durable.into(),
+            ..FloorInputs::default()
+        }
+    }
+
+    #[test]
+    fn floor_stays_under_every_term() {
+        assert_eq!(inputs(5 * SEG + 7, 9 * SEG).floor(), 5 * SEG);
+        assert_eq!(inputs(5 * SEG + 7, 3 * SEG).floor(), 3 * SEG);
+        let shadowed = FloorInputs {
+            shadow: ShadowFloor::new(true, 2 * SEG + 1, 0),
+            ..inputs(5 * SEG + 7, 9 * SEG)
+        };
+        assert_eq!(shadowed.floor(), 2 * SEG);
+        let ignored = FloorInputs {
+            shadow: ShadowFloor::new(false, 2 * SEG + 1, 0),
+            ..inputs(5 * SEG + 7, 9 * SEG)
+        };
+        assert_eq!(
+            ignored.floor(),
+            5 * SEG,
+            "shadow bounds only when it holds data"
+        );
+    }
+
+    #[test]
+    fn floor_never_walks_back_below_published() {
+        let f = FloorInputs {
+            published: (4 * SEG).into(),
+            ..inputs(2 * SEG + 1, 9 * SEG)
+        };
+        assert_eq!(f.floor(), 4 * SEG);
+        let f = FloorInputs {
+            published: (4 * SEG).into(),
+            ..inputs(6 * SEG + 1, 9 * SEG)
+        };
+        assert_eq!(f.floor(), 6 * SEG);
+    }
+
+    #[test]
+    fn fork_rebases_past_every_term() {
+        let f = FloorInputs {
+            published: (8 * SEG).into(),
+            fork: Some((3 * SEG).into()),
+            ..inputs(SEG, SEG)
+        };
+        assert_eq!(f.floor(), 3 * SEG);
+    }
+
+    #[test]
+    fn shadow_floor_prefers_live_over_persisted() {
+        assert_eq!(
+            ShadowFloor::new(true, 0, 0).bound(Pos::<Floor>::new(SEG)),
+            SEG
+        );
+        assert_eq!(
+            ShadowFloor::new(true, 0, 2 * SEG + 3).bound(Pos::<Floor>::new(9 * SEG)),
+            2 * SEG
+        );
+        assert_eq!(
+            ShadowFloor::new(true, 4 * SEG + 3, 2 * SEG).bound(Pos::<Floor>::new(9 * SEG)),
+            4 * SEG
         );
     }
 
     #[test]
     fn retention_cutoff_keeps_window_and_redo() {
-        assert_eq!(retention_cutoff(10 * SEG, 2 * SEG, None), 8 * SEG);
+        assert_eq!(retention_cutoff(Pos::new(10 * SEG), 2 * SEG, None), 8 * SEG);
         assert_eq!(
-            retention_cutoff(10 * SEG, 2 * SEG, Some((5 * SEG).into())),
+            retention_cutoff(Pos::new(10 * SEG), 2 * SEG, Some((5 * SEG).into())),
             5 * SEG
         );
-        assert!(retention_cutoff(SEG, 2 * SEG, None).is_zero());
+        assert!(retention_cutoff(Pos::new(SEG), 2 * SEG, None).is_zero());
     }
 
     #[test]
@@ -551,7 +702,7 @@ shadow_flush = \"1234563/0\"
                 Some(0x10.into()),
                 Some(0x99.into()),
                 Some(0x88.into()),
-                0xFF
+                Pos::new(0xFF)
             ),
             0x10,
         );
@@ -560,7 +711,7 @@ shadow_flush = \"1234563/0\"
     #[test]
     fn resume_lsn_bootstrap_end_outranks_manifest() {
         assert_eq!(
-            resolve_resume_lsn(None, Some(0x99.into()), Some(0x88.into()), 0xFF),
+            resolve_resume_lsn(None, Some(0x99.into()), Some(0x88.into()), Pos::new(0xFF)),
             0x99
         );
     }
@@ -572,7 +723,7 @@ shadow_flush = \"1234563/0\"
         // silently skip [ack, head] WAL)
         let ack = 0xAABB_0000u64;
         let head = 0xFFFF_0000u64;
-        let resume = resolve_resume_lsn(None, None, Some(ack.into()), head);
+        let resume = resolve_resume_lsn(None, None, Some(ack.into()), Pos::new(head));
         assert_eq!(resume, ack, "must resume from durable ack");
         assert!(!resume.is_zero(), "ack seed must not regress to 0");
         assert_ne!(resume.get(), head, "must not skip ahead to source head");
@@ -581,12 +732,18 @@ shadow_flush = \"1234563/0\"
     #[test]
     fn resume_lsn_zero_ack_falls_through_to_greenfield() {
         // ack == 0 is greenfield-equivalent: nothing below head to ship
-        assert_eq!(resolve_resume_lsn(None, None, Some(Pos::ZERO), 0xFF), 0xFF);
+        assert_eq!(
+            resolve_resume_lsn(None, None, Some(Pos::ZERO), Pos::new(0xFF)),
+            0xFF
+        );
     }
 
     #[test]
     fn resume_lsn_greenfield_uses_head() {
-        assert_eq!(resolve_resume_lsn(None, None, None, 0x4242), 0x4242);
+        assert_eq!(
+            resolve_resume_lsn(None, None, None, Pos::new(0x4242)),
+            0x4242
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

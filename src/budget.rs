@@ -18,7 +18,7 @@
 //!   points that can block — drain slice admission (slice heap bytes +
 //!   sealed-generation Mem chunk bytes + row batch Mem bytes),
 //!   bootstrap/backfill row slices. Transferred with ownership through
-//!   `DecodeJob` → routed rows → batcher slabs → in-flight insert blocks,
+//!   planned slice → routed rows → batcher slabs → in-flight insert blocks,
 //!   released when the covering owner drops post-insert-ack. An admitter
 //!   can already hold admission units (a drain's sealed generations), so
 //!   a request above the whole compartment never waits: it passes

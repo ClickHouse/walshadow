@@ -886,9 +886,8 @@ pub fn missing_value_for(att: &RelAttr) -> ColumnValue {
     }
 }
 
-/// The worker and SQL paths encode a default differently (raw vs text) but
-/// resolve to one value, so compare by value; tier-3 stays pending, so equal
-/// source type counts as equal.
+/// Raw and text spell one default differently but resolve to one value, so
+/// compare by value; tier-3 stays pending, so equal source type counts as equal.
 pub fn missing_defaults_equivalent(a: &RelAttr, b: &RelAttr) -> bool {
     use ColumnValue::{PgPending, PgPendingText};
     match (missing_value_for(a), missing_value_for(b)) {

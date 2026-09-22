@@ -110,8 +110,8 @@ fn slot_compatible(o: &RelAttr, n: &RelAttr) -> Result<(), Incompat> {
         return Err(Incompat::Physical("type change"));
     }
     // Tuples shorter than attnum read the missing value; a different one
-    // reinterprets history. Compare by value, not encoding: the worker and
-    // mirror paths spell the same default differently (raw bytes vs text).
+    // reinterprets history. Compare by value, not encoding: a log entry may
+    // still hold the text form of a default shadow now reads raw
     if !crate::decode::heap_decoder::missing_defaults_equivalent(o, n) {
         return Err(Incompat::Physical("missing value change"));
     }

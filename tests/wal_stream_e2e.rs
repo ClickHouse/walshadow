@@ -11,8 +11,7 @@
 //! The test issues DDL + DML on source, then forces a `pg_switch_wal()`
 //! to roll a segment boundary so the filter has a full segment to
 //! produce. After segments land, it re-parses one through wal-rus's
-//! `WalParser` and asserts the manifest agrees with the parser's
-//! record count.
+//! `WalParser`.
 
 #[path = "common/ports.rs"]
 mod ports;
@@ -28,6 +27,7 @@ use walrus::pg::replication::conn::PgConfig;
 use walrus::pg::replication::tls::{SslMode, TlsParams};
 use walrus::pg::wal::segment::DEFAULT_WAL_SEG_SIZE;
 use walrus::pg::walparser::{WAL_PAGE_SIZE, WalParser};
+use walshadow::pos::Pos;
 use walshadow::record::{CollectingRecordSink, MetricsRecordSink, WAL_SEG_SIZE};
 use walshadow::segment_sink::DirSegmentSink;
 use walshadow::shadow::{Shadow, ShadowConfig};
@@ -125,7 +125,7 @@ async fn full_pipeline_source_to_filtered_segments_on_disk() {
         .expect("START_REPLICATION");
 
     let out_dir = tmp.path().join("filtered");
-    let mut stream = WalStream::new(ident.timeline, WAL_SEG_SIZE, aligned).unwrap();
+    let mut stream = WalStream::new(ident.timeline, WAL_SEG_SIZE, Pos::new(aligned)).unwrap();
     let mut records = CollectingRecordSink::default();
     let mut segs = DirSegmentSink::new(out_dir.clone()).expect("open out dir");
     let mut buf = Vec::with_capacity(64 * 1024);
@@ -196,8 +196,7 @@ async fn full_pipeline_source_to_filtered_segments_on_disk() {
         "no segments shipped in 15s — pipeline didn't drain",
     );
 
-    // Sanity: out_dir contains at least one 24-hex segment file plus a
-    // manifest sidecar.
+    // Sanity: out_dir contains at least one 24-hex segment file.
     let mut seg_files = vec![];
     for entry in std::fs::read_dir(&out_dir).unwrap() {
         let e = entry.unwrap();
@@ -226,29 +225,9 @@ async fn full_pipeline_source_to_filtered_segments_on_disk() {
     }
     assert!(count > 0, "filtered segment had zero records");
 
-    // Manifest sidecar exists alongside.
-    let mani_path = seg_files[0]
-        .with_extension("manifest.json")
-        .with_file_name(format!(
-            "{}.manifest.json",
-            seg_files[0].file_name().unwrap().to_string_lossy()
-        ));
-    assert!(
-        mani_path.exists(),
-        "manifest sidecar at {}",
-        mani_path.display(),
-    );
-    let manifest: serde_json::Value =
-        serde_json::from_reader(std::fs::File::open(&mani_path).expect("open manifest"))
-            .expect("parse manifest");
-    assert_eq!(
-        manifest["records"].as_array().unwrap().len(),
-        count,
-        "manifest record count must match WalParser's count on filtered bytes",
-    );
     // RecordSink contract: parsed records arrive at the RecordSink with
-    // their full XLogRecord shape. Prove the wal-rus →
-    // filter_segment → WalStream chain forwards `parsed.header` and
+    // their full XLogRecord shape. Prove the wal-rus → WalStream chain
+    // forwards `parsed.header` and
     // `parsed.blocks` rather than the old scalar-only RecordEvent.
     assert!(!records.records.is_empty(), "RecordSink saw zero records");
     // PG 17 baseline tops out at RmId::LogicalMsg = 21.
@@ -378,7 +357,7 @@ async fn pre_rotated_pg_class_seed_keeps_catalog_writes() {
         .with_status_interval(Duration::from_millis(500));
     let ident = feed.identify_system().await.expect("IDENTIFY_SYSTEM");
     let aligned = WalStream::align_down(ident.xlogpos, WAL_SEG_SIZE);
-    let mut stream = WalStream::new(ident.timeline, WAL_SEG_SIZE, aligned).unwrap();
+    let mut stream = WalStream::new(ident.timeline, WAL_SEG_SIZE, Pos::new(aligned)).unwrap();
 
     // Seed *before* START_REPLICATION. Without this line the test
     // would catch the regression: tracker would never learn the
@@ -640,14 +619,10 @@ async fn sidecar_sql_client_negotiates_tls_over_tcp() {
     eprintln!("sidecar tls e2e: pg_stat_ssl reports version={v}");
 }
 
-/// Shutdown contract: `walshadow-stream` must call `WalStream::close()` on shutdown
-/// so the in-flight partial segment lands on disk rather than evaporating
-/// with the process. Exercises the `close()` path directly (signaling a
-/// subprocess is racy) plus the resume-from-segment-boundary contract
-/// the docstring promises: a fresh `WalStream` at the same aligned LSN
-/// must pump cleanly past the partial without tripping on misalignment.
+/// Shutdown mid-segment writes nothing for the in-flight segment, and a
+/// fresh `WalStream` at the same aligned LSN pumps cleanly through it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn shutdown_writes_partial_segment_and_resume_from_start_lsn_continues() {
+async fn shutdown_mid_segment_then_resume_from_start_lsn_continues() {
     if !pg_available() {
         eprintln!("skip: no initdb on PATH");
         return;
@@ -662,8 +637,7 @@ async fn shutdown_writes_partial_segment_and_resume_from_start_lsn_continues() {
 
     // Create schema only (skip pg_switch_wal so xlogpos stays mid-segment
     // — otherwise START_REPLICATION at the segment boundary has nothing
-    // to ship and we never accumulate bytes into current_buf to write
-    // out as a partial).
+    // to ship and we never accumulate bytes into current_buf).
     source
         .apply_schema_dump(
             "CREATE SCHEMA sd;\n\
@@ -697,7 +671,7 @@ async fn shutdown_writes_partial_segment_and_resume_from_start_lsn_continues() {
         ident.xlogpos,
         aligned,
     );
-    let mut stream = WalStream::new(ident.timeline, WAL_SEG_SIZE, aligned).unwrap();
+    let mut stream = WalStream::new(ident.timeline, WAL_SEG_SIZE, Pos::new(aligned)).unwrap();
 
     feed.start_physical_replication(None, aligned, ident.timeline)
         .await
@@ -734,12 +708,12 @@ async fn shutdown_writes_partial_segment_and_resume_from_start_lsn_continues() {
         chunks_seen += 1;
         // Once next_lsn has caught up to (or past) ident.xlogpos, the
         // source has no more to send for now; bail out.
-        if stream.next_lsn() >= ident.xlogpos {
+        if stream.next_lsn() >= Pos::new(ident.xlogpos) {
             break;
         }
         // Defensive cap: we never expect this in a quiet-source test
         // but if we somehow filled a segment, stop now to avoid a
-        // misleading "no partial" assertion later.
+        // misleading assertion later.
         if chunks_seen >= 64 {
             break;
         }
@@ -752,69 +726,33 @@ async fn shutdown_writes_partial_segment_and_resume_from_start_lsn_continues() {
     let dispatched_at_close = stream.dispatched_lsn();
     let next_at_close = stream.next_lsn();
     assert!(
-        next_at_close > dispatched_at_close,
-        "current_buf must hold ≥1 byte for close() to produce a .partial \
+        next_at_close > Pos::new(dispatched_at_close),
+        "current_buf must hold ≥1 byte at shutdown \
          (dispatched={dispatched_at_close:#X}, next={next_at_close})",
     );
 
-    // Drive the shutdown path. Equivalent to the daemon's ctrl_c branch
-    // calling stream.close(Some(&mut segs), &mut metrics).
-    stream
-        .close(Some(&mut segs), &mut metrics)
-        .await
-        .expect("close writes partial");
-
-    // The partial segment file must exist under <name>.partial, and the
-    // matching complete-segment path must NOT — otherwise shadow PG's
-    // restore_command would treat it as a real segment.
-    let mut partials: Vec<PathBuf> = vec![];
-    for entry in std::fs::read_dir(&out_dir).unwrap() {
-        let e = entry.unwrap();
-        let n = e.file_name().to_string_lossy().into_owned();
-        if n.ends_with(".partial") && !n.ends_with(".manifest.json.partial") {
-            partials.push(e.path());
-        }
-    }
-    assert_eq!(
-        partials.len(),
-        1,
-        "expected exactly one .partial under {} after close(); got {:?}",
-        out_dir.display(),
-        partials,
-    );
-    let partial = &partials[0];
-    let partial_name = partial.file_name().unwrap().to_string_lossy().into_owned();
-    let segname_str = partial_name.strip_suffix(".partial").unwrap();
-    assert_eq!(segname_str.len(), 24, "partial name shape: {partial_name}");
+    // Shutdown drops the in-flight segment: nothing reads a partial one
+    // back, restart re-streams from the segment boundary
+    drop(stream);
+    let leftovers: Vec<_> = std::fs::read_dir(&out_dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
     assert!(
-        !out_dir.join(segname_str).exists(),
-        "complete-segment path leaked alongside partial: {segname_str}",
-    );
-    assert!(
-        out_dir
-            .join(format!("{segname_str}.partial.manifest.json"))
-            .exists(),
-        "partial manifest sidecar missing alongside {partial_name}",
-    );
-    // Partial is exactly one segment's worth, with the tail zero-padded
-    // per `close()`'s contract.
-    let on_disk = std::fs::read(partial).unwrap();
-    assert_eq!(
-        on_disk.len(),
-        WAL_SEG_SIZE as usize,
-        "partial must be padded to segment size",
+        leftovers.is_empty(),
+        "in-flight segment must leave no file: {leftovers:?}"
     );
     drop(feed);
 
     // Resume: fresh SourceFeed + WalStream at the same aligned start
     // LSN. The contract is that --start-lsn at the segment boundary
-    // works; the .partial bytes themselves aren't replayed.
+    // works.
     let mut feed2 = SourceFeed::connect(&pgcfg)
         .await
         .expect("resume feed connect")
         .with_status_interval(Duration::from_millis(500));
     let ident2 = feed2.identify_system().await.expect("IDENTIFY_SYSTEM #2");
-    let mut stream2 = WalStream::new(ident2.timeline, WAL_SEG_SIZE, aligned).unwrap();
+    let mut stream2 = WalStream::new(ident2.timeline, WAL_SEG_SIZE, Pos::new(aligned)).unwrap();
     feed2
         .start_physical_replication(None, aligned, ident2.timeline)
         .await
@@ -887,7 +825,7 @@ async fn shutdown_writes_partial_segment_and_resume_from_start_lsn_continues() {
         "resume RecordSink saw zero records",
     );
     eprintln!(
-        "shutdown drill: partial={partial_name}, resume shipped {resume_segments} segment(s), {} records",
+        "shutdown drill: resume shipped {resume_segments} segment(s), {} records",
         resume_metrics.records.len(),
     );
 }

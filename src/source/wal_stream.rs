@@ -11,11 +11,11 @@
 //!     +--------+--------+  extends StreamingWalker buffer
 //!              | per record completing
 //!              v
-//!         Filter::decide
-//!         /     |        \
-//!        v      v         v
-//!   noop_replace (ToDecoder)  rewrite_record  manifest
-//!              |              (in place)      entry
+//!      Filter::decide_record
+//!         /            \
+//!        v              v
+//!   noop_replace (ToDecoder)  rewrite_record
+//!              |              (in place)
 //!              v
 //!         RecordBytesSink  (shadow wire — §3)
 //!              v
@@ -28,7 +28,7 @@
 //!
 //! Per-record dispatch fires the moment a record's last byte arrives;
 //! segment-level dispatch fires on segment boundary with already-filtered
-//! bytes + accumulated manifest. No re-parse, no second walk.
+//! bytes. No re-parse, no second walk.
 
 use std::path::PathBuf;
 
@@ -38,9 +38,8 @@ use walrus::pg::walparser::{
     ParseError, RmId, X_LOG_RECORD_ALIGNMENT, X_LOG_SWITCH, XLogRecord, parse_record_from_bytes,
 };
 
-use crate::filter::manifest::{Entry, FILTER_VERSION, Kind, Manifest};
+use crate::filter::Filter;
 use crate::filter::rewrite::{RewriteError, noop_replace};
-use crate::filter::{Filter, FilterSnapshot};
 use crate::pos::{Floor, Pos};
 #[cfg(test)]
 use crate::record::{
@@ -116,10 +115,6 @@ pub struct WalStream {
     current_lsn: u64,
     walker: StreamingWalker,
     filter: Filter,
-    /// Reset on segment boundary when `segment_sink.on_segment` lands.
-    pending_entries: Vec<Entry>,
-    /// Filter snapshot at segment start, for manifest deltas
-    stats_at_segment_start: FilterSnapshot,
     /// Defaults to [`NoopBytesSink`]; production swaps in
     /// [`crate::source::shadow_stream::ShadowStreamSink`].
     bytes_sink: Box<dyn RecordBytesSink + Send>,
@@ -152,22 +147,19 @@ impl WalStream {
     pub fn new(
         timeline: u32,
         seg_size: u64,
-        start_lsn: impl Into<Pos<Floor>>,
+        start_lsn: Pos<Floor>,
     ) -> Result<Self, WalStreamError> {
-        let start_lsn = start_lsn.into().get();
+        let start_lsn = start_lsn.get();
         if !start_lsn.is_multiple_of(seg_size) {
             return Err(WalStreamError::UnalignedBase(start_lsn));
         }
-        let filter = Filter::new();
         Ok(Self {
             timeline,
             seg_size,
             next_lsn: start_lsn,
             current_lsn: start_lsn,
             walker: StreamingWalker::new(seg_size as usize),
-            stats_at_segment_start: filter.snapshot(),
-            filter,
-            pending_entries: Vec::new(),
+            filter: Filter::new(),
             bytes_sink: Box::new(NoopBytesSink),
             wire_offset: 0,
             raw_crc: 0,
@@ -270,7 +262,7 @@ impl WalStream {
             cur_lsn += take as u64;
             data = &data[take..];
 
-            if let Err(e) = self.drain_records(Some(record_sink), true).await {
+            if let Err(e) = self.drain_records(record_sink).await {
                 self.poisoned = true;
                 return Err(e);
             }
@@ -296,8 +288,7 @@ impl WalStream {
     /// apply LSN, not against `restore_command` segment landing.
     async fn drain_records(
         &mut self,
-        mut record_sink: Option<&mut (dyn RecordSink + Send)>,
-        emit_wire: bool,
+        record_sink: &mut (dyn RecordSink + Send),
     ) -> Result<(), WalStreamError> {
         loop {
             let completed: CompletedRecord = match self.walker.try_next() {
@@ -346,10 +337,6 @@ impl WalStream {
                 .await
                 .map_err(WalStreamError::ShadowRelations)?;
             let route = verdict.route;
-            let kind = match route {
-                Route::ToShadow | Route::ToBoth => Kind::Kept,
-                Route::ToDecoder => Kind::Dropped,
-            };
             if route == Route::ToDecoder {
                 // `parsed_for_sink` owns the original bytes the decoder
                 // reads, so clobbering the buffer with the NOOP is safe.
@@ -376,18 +363,10 @@ impl WalStream {
                 }
             }
 
-            self.pending_entries.push(Entry {
-                offset: start_offset as u64,
-                len: parsed_for_sink.header.total_record_length,
-                rmid: parsed_for_sink.header.resource_manager_id,
-                info: parsed_for_sink.header.info,
-                kind,
-            });
-
             // Frame buffer[wire_offset..record_end] as one chunk: covers
             // page headers + inter-record padding so shadow's walreceiver
             // sees a stream byte-identical to disk `restore_command`.
-            if emit_wire && record_end > self.wire_offset {
+            if record_end > self.wire_offset {
                 let chunk = &self.walker.buffer()[self.wire_offset..record_end];
                 let start_lsn = self.current_lsn + self.wire_offset as u64;
                 self.bytes_sink.on_wire_chunk(start_lsn, chunk).await?;
@@ -407,9 +386,7 @@ impl WalStream {
                 aborted_tree: verdict.aborted_tree,
                 defer_catalog_decode: verdict.defer_catalog_decode,
             };
-            if let Some(sink) = record_sink.as_deref_mut() {
-                sink.on_record(&record).await?;
-            }
+            record_sink.on_record(&record).await?;
         }
     }
 
@@ -435,7 +412,6 @@ impl WalStream {
             return Ok(false);
         }
         let seg = self.segment_for_lsn(self.current_lsn);
-        let manifest = self.take_manifest(&seg, seg_size);
         // Wire tail: if wire_offset < seg_size, the residual span
         // (alignment pad + page header + in-place-rewritten spanning bytes)
         // must ship before seg-0 closes.
@@ -443,17 +419,16 @@ impl WalStream {
             let trailing_start_lsn = self.current_lsn + self.wire_offset as u64;
             let trailing = &self.walker.buffer()[self.wire_offset..seg_size];
             self.bytes_sink
-                .on_segment_boundary(trailing_start_lsn, trailing)
+                .on_wire_chunk(trailing_start_lsn, trailing)
                 .await?;
         }
         segment_sink
-            .on_segment(seg, &self.walker.buffer()[..seg_size], &manifest)
+            .on_segment(seg, &self.walker.buffer()[..seg_size])
             .await?;
         self.walker.truncate_first_segment();
         self.current_lsn += self.seg_size;
         self.bytes_sink.on_segment_retired(self.current_lsn).await?;
         self.wire_offset = self.wire_offset.saturating_sub(seg_size);
-        self.stats_at_segment_start = self.filter.snapshot();
         Ok(true)
     }
 
@@ -577,67 +552,6 @@ impl WalStream {
         self.seg_size
     }
 
-    fn take_manifest(&mut self, seg: &SegmentName, len: usize) -> Manifest {
-        let mut records = Vec::with_capacity(self.pending_entries.len());
-        let mut future = Vec::new();
-        for entry in std::mem::take(&mut self.pending_entries) {
-            if entry.offset < len as u64 {
-                records.push(entry);
-            } else {
-                future.push(Entry {
-                    offset: entry.offset - len as u64,
-                    ..entry
-                });
-            }
-        }
-        self.pending_entries = future;
-        Manifest {
-            source_segment: seg.format(),
-            filter_version: FILTER_VERSION,
-            records,
-            stats: self
-                .filter
-                .manifest_stats_since(self.stats_at_segment_start),
-        }
-    }
-
-    /// Shutdown flush of the partial segment (no-op if empty). Lands a
-    /// `.partial` via [`SegmentSink::on_partial_segment`] so shadow PG's
-    /// `restore_command` doesn't pick it up as complete.
-    pub async fn close(
-        mut self,
-        mut partial_sink: Option<&mut (dyn SegmentSink + Send)>,
-        _record_sink: &mut (dyn RecordSink + Send),
-    ) -> Result<(), WalStreamError> {
-        // Drain full segments first: buf may exceed seg_size if a record
-        // straddled the boundary at shutdown. These ship as normal (not
-        // `.partial`) files.
-        if let Some(sink) = partial_sink.as_deref_mut() {
-            while self.walker.buffer_len() >= self.seg_size as usize {
-                if !self.try_flush_first_segment(sink).await? {
-                    break;
-                }
-            }
-        }
-        if self.walker.buffer_len() == 0 {
-            return Ok(());
-        }
-        // Zero padding lets shared routing core finish any pending record
-        let seg = self.segment_for_lsn(self.current_lsn);
-        let seg_size = self.seg_size as usize;
-        if self.walker.buffer_len() < seg_size {
-            self.walker
-                .extend(&vec![0; seg_size - self.walker.buffer_len()]);
-        }
-        self.drain_records(None, false).await?;
-        let manifest = self.take_manifest(&seg, seg_size);
-        if let Some(sink) = partial_sink {
-            sink.on_partial_segment(seg, &self.walker.buffer()[..seg_size], &manifest)
-                .await?;
-        }
-        Ok(())
-    }
-
     /// PG `XLogReaderState::EndRecPtr` for a record whose final byte range
     /// is `last_range` (walker-buffer offset + len, base `current_lsn`).
     ///
@@ -674,19 +588,9 @@ impl WalStream {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::filter::manifest::{FILTER_VERSION, ManifestStats};
     use std::pin::Pin;
     use tokio::sync::mpsc;
     use walrus::pg::walparser::RmId;
-
-    fn dummy_manifest() -> Manifest {
-        Manifest {
-            source_segment: "test".into(),
-            filter_version: FILTER_VERSION,
-            records: vec![],
-            stats: ManifestStats::default(),
-        }
-    }
 
     #[test]
     fn align_down_rounds_to_segment_boundary() {
@@ -700,13 +604,13 @@ mod tests {
 
     #[test]
     fn new_rejects_unaligned_base() {
-        let r = WalStream::new(1, WAL_SEG_SIZE, 0x1234);
+        let r = WalStream::new(1, WAL_SEG_SIZE, Pos::new(0x1234));
         assert!(matches!(r, Err(WalStreamError::UnalignedBase(_))));
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn push_misaligned_errors() {
-        let mut ws = WalStream::new(1, WAL_SEG_SIZE, 0).unwrap();
+        let mut ws = WalStream::new(1, WAL_SEG_SIZE, Pos::ZERO).unwrap();
         let mut rec = CollectingRecordSink::default();
         let mut seg = CollectingSegmentSink::default();
         let err = ws
@@ -728,7 +632,6 @@ mod tests {
             &'a mut self,
             _seg: SegmentName,
             _bytes: &'a [u8],
-            _manifest: &'a Manifest,
         ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
             Box::pin(async { Err(SinkError::Other("synthetic segment-sink fail".into())) })
         }
@@ -737,7 +640,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn push_segment_sink_error_poisons_stream() {
         const SEG: u64 = 8192;
-        let mut ws = WalStream::new(1, SEG, 0).unwrap();
+        let mut ws = WalStream::new(1, SEG, Pos::ZERO).unwrap();
         let mut rec = CollectingRecordSink::default();
         let mut seg = ErrSegmentSink;
         let bytes = [0u8; SEG as usize];
@@ -757,7 +660,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn push_walk_error_poisons_stream() {
         const SEG: u64 = 8192;
-        let mut ws = WalStream::new(1, SEG, 0).unwrap();
+        let mut ws = WalStream::new(1, SEG, Pos::ZERO).unwrap();
         let mut rec = CollectingRecordSink::default();
         let mut seg = CollectingSegmentSink::default();
         let mut bytes = vec![0u8; SEG as usize];
@@ -904,51 +807,22 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn dir_sink_writes_segment_and_manifest_atomically() {
+    async fn dir_sink_writes_segment_atomically() {
         let tmp = tempfile::tempdir().unwrap();
         let mut sink = DirSegmentSink::new(tmp.path().to_path_buf()).unwrap();
         let seg = SegmentName::parse("000000010000000000000003").unwrap();
         let bytes = [0xAAu8; 64];
-        let mani = dummy_manifest();
-        sink.on_segment(seg, &bytes, &mani).await.unwrap();
-        let seg_path = tmp.path().join(seg.format());
-        let mani_path = tmp.path().join(format!("{}.manifest.json", seg.format()));
-        assert!(seg_path.exists(), "segment file written");
-        assert!(mani_path.exists(), "manifest sidecar written");
-        let on_disk = std::fs::read(&seg_path).unwrap();
-        assert_eq!(on_disk, bytes);
-        assert!(
-            !tmp.path()
-                .join(format!("{}.partial", seg.format()))
-                .exists()
+        sink.on_segment(seg, &bytes).await.unwrap();
+        let names: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            names,
+            [seg.format().as_str()],
+            "segment alone, no temp or sidecar"
         );
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn dir_sink_partial_segment_lands_with_partial_suffix() {
-        let tmp = tempfile::tempdir().unwrap();
-        let mut sink = DirSegmentSink::new(tmp.path().to_path_buf()).unwrap();
-        let seg = SegmentName::parse("000000010000000000000004").unwrap();
-        let bytes = [0x77u8; 64];
-        let mani = dummy_manifest();
-        sink.on_partial_segment(seg, &bytes, &mani).await.unwrap();
-        let name = seg.format();
-        let partial_path = tmp.path().join(format!("{name}.partial"));
-        let partial_mani_path = tmp.path().join(format!("{name}.partial.manifest.json"));
-        assert!(
-            !tmp.path().join(&name).exists(),
-            "complete-segment path leaked: {name}",
-        );
-        assert!(partial_path.exists(), "partial path written");
-        assert!(partial_mani_path.exists(), "partial manifest written");
-        let on_disk = std::fs::read(&partial_path).unwrap();
-        assert_eq!(on_disk, bytes);
-        assert!(!tmp.path().join(format!("{name}.partial.tmp")).exists());
-        assert!(
-            !tmp.path()
-                .join(format!("{name}.partial.manifest.json.tmp"))
-                .exists()
-        );
+        assert_eq!(std::fs::read(tmp.path().join(seg.format())).unwrap(), bytes);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -959,9 +833,7 @@ mod tests {
             DirSegmentSink::with_durability(tmp.path().to_path_buf(), WAL_SEG_SIZE, tx).unwrap();
         let seg = SegmentName::parse("000000010000000000000003").unwrap();
         let bytes = [0xAAu8; 64];
-        sink.on_segment(seg, &bytes, &dummy_manifest())
-            .await
-            .unwrap();
+        sink.on_segment(seg, &bytes).await.unwrap();
 
         // Written + renamed inline; fsync deferred to the background task.
         let seg_path = tmp.path().join(seg.format());
@@ -975,8 +847,8 @@ mod tests {
     }
 
     /// Contract: a `RecordBytesSink` sees the full wire stream (record
-    /// images + page headers + inter-record padding); chunks + trailing
-    /// sum to seg_size exactly.
+    /// images + page headers + inter-record padding); chunks sum to
+    /// seg_size exactly.
     #[tokio::test(flavor = "current_thread")]
     async fn bytes_sink_receives_full_wire_stream() {
         const SEG: u64 = 8192;
@@ -985,8 +857,7 @@ mod tests {
 
         type WireLog = std::sync::Arc<std::sync::Mutex<Vec<(u64, Vec<u8>)>>>;
         let collector_chunks: WireLog = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let collector_tails: WireLog = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        struct SharedCollector(WireLog, WireLog);
+        struct SharedCollector(WireLog);
         impl RecordBytesSink for SharedCollector {
             fn on_wire_chunk<'a>(
                 &'a mut self,
@@ -998,32 +869,15 @@ mod tests {
                     Ok(())
                 })
             }
-            fn on_segment_boundary<'a>(
-                &'a mut self,
-                start_lsn: u64,
-                trailing_bytes: &'a [u8],
-            ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
-                Box::pin(async move {
-                    self.1
-                        .lock()
-                        .unwrap()
-                        .push((start_lsn, trailing_bytes.to_vec()));
-                    Ok(())
-                })
-            }
         }
 
         let page = synth_two_record_page();
-        let mut ws = WalStream::new(1, SEG, 0).unwrap();
-        ws.set_bytes_sink(Box::new(SharedCollector(
-            collector_chunks.clone(),
-            collector_tails.clone(),
-        )));
+        let mut ws = WalStream::new(1, SEG, Pos::ZERO).unwrap();
+        ws.set_bytes_sink(Box::new(SharedCollector(collector_chunks.clone())));
         ws.push(0, &page, &mut rec, &mut seg).await.unwrap();
         assert!(!rec.records.is_empty(), "record_sink fired");
 
         let chunks = collector_chunks.lock().unwrap();
-        let tails = collector_tails.lock().unwrap();
         let mut reconstructed = Vec::with_capacity(SEG as usize);
         let mut expected_lsn = 0u64;
         for (start, bytes) in chunks.iter() {
@@ -1031,12 +885,8 @@ mod tests {
             reconstructed.extend_from_slice(bytes);
             expected_lsn = start + bytes.len() as u64;
         }
-        assert_eq!(tails.len(), 1);
-        let (tail_start, tail_bytes) = &tails[0];
-        assert_eq!(*tail_start, expected_lsn);
-        reconstructed.extend_from_slice(tail_bytes);
         assert_eq!(reconstructed.len(), SEG as usize, "covers full segment");
-        let (_, seg_bytes, _) = &seg.segments[0];
+        let (_, seg_bytes) = &seg.segments[0];
         assert_eq!(&reconstructed, seg_bytes, "wire bytes match segment bytes");
     }
 
@@ -1234,7 +1084,7 @@ mod tests {
         let page = page_of(&[raw_rec(RmId::Smgr as u8, 0x10, 0, None, Some(&md))], 8192);
         for fail_persist in [false, true] {
             let tmp = tempfile::tempdir().unwrap();
-            let mut stream = WalStream::new(1, 8192, 0u64).unwrap();
+            let mut stream = WalStream::new(1, 8192, Pos::new(0u64)).unwrap();
             stream.filter_mut().keep_user_rels(Default::default(), 0);
             stream
                 .filter_mut()
@@ -1286,7 +1136,7 @@ mod tests {
         // User heap insert in the followed db: dropped, so NOOP-rewritten
         let user = raw_rec(RmId::Heap as u8, 0x00, 8, Some((1663, 5, 50000)), None);
         let page = page_of(&[user], 8192);
-        let mut ws = WalStream::new(1, SEG, 0).unwrap();
+        let mut ws = WalStream::new(1, SEG, Pos::ZERO).unwrap();
         ws.filter_mut().set_target_db(5);
         let mut rec = CollectingRecordSink::default();
         let mut seg = CollectingSegmentSink::default();
@@ -1307,7 +1157,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn fork_prefix_restarts_at_every_segment() {
         const SEG: u64 = 2 * 8192;
-        let mut ws = WalStream::new(1, SEG, 0).unwrap();
+        let mut ws = WalStream::new(1, SEG, Pos::ZERO).unwrap();
         let mut rec = CollectingRecordSink::default();
         let mut seg = CollectingSegmentSink::default();
         let filler = page_of(&[], 8192);
@@ -1329,7 +1179,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn fork_prefix_is_empty_on_a_segment_boundary() {
         const SEG: u64 = 8192;
-        let mut ws = WalStream::new(1, SEG, 0).unwrap();
+        let mut ws = WalStream::new(1, SEG, Pos::ZERO).unwrap();
         let mut rec = CollectingRecordSink::default();
         let mut seg = CollectingSegmentSink::default();
         ws.push(0, &page_of(&[], SEG as usize), &mut rec, &mut seg)
@@ -1350,7 +1200,7 @@ mod tests {
     async fn transition_drops_bytes_past_the_fork_and_renames_the_fork_segment() {
         // Two pages per segment, so one page leaves the fork mid-segment
         const SEG: u64 = 2 * 8192;
-        let mut ws = WalStream::new(1, SEG, 0).unwrap();
+        let mut ws = WalStream::new(1, SEG, Pos::ZERO).unwrap();
         let mut rec = CollectingRecordSink::default();
         let mut seg = CollectingSegmentSink::default();
         ws.push(0, &synth_two_record_page(), &mut rec, &mut seg)
@@ -1377,14 +1227,14 @@ mod tests {
         ws.push(switch_lsn, &tail, &mut rec, &mut seg)
             .await
             .unwrap();
-        let (name, _, _) = &seg.segments[0];
+        let (name, _) = &seg.segments[0];
         assert_eq!(name.timeline, 2, "fork segment carries the descendant name");
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn adopt_relabels_segments_without_dropping_bytes() {
         const SEG: u64 = 8192;
-        let mut ws = WalStream::new(1, SEG, 0).unwrap();
+        let mut ws = WalStream::new(1, SEG, Pos::ZERO).unwrap();
         let mut rec = CollectingRecordSink::default();
         let mut seg = CollectingSegmentSink::default();
         ws.push(0, &synth_two_record_page(), &mut rec, &mut seg)
@@ -1403,7 +1253,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn adopt_refuses_an_older_branch_or_a_mid_segment_position() {
         const SEG: u64 = 2 * 8192;
-        let mut ws = WalStream::new(4, SEG, 0).unwrap();
+        let mut ws = WalStream::new(4, SEG, Pos::ZERO).unwrap();
         assert!(matches!(
             ws.adopt_timeline(4),
             Err(WalStreamError::TimelineNotAbove {
@@ -1428,7 +1278,7 @@ mod tests {
         const SEG: u64 = 8192;
         let mut rec = CollectingRecordSink::default();
         let mut seg = CollectingSegmentSink::default();
-        let mut ws = WalStream::new(4, SEG, 0).unwrap();
+        let mut ws = WalStream::new(4, SEG, Pos::ZERO).unwrap();
         ws.push(0, &synth_two_record_page(), &mut rec, &mut seg)
             .await
             .unwrap();
@@ -1457,7 +1307,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn next_lsn_advances_by_maxaligned_total_len() {
         const SEG: u64 = 8192;
-        let mut ws = WalStream::new(1, SEG, 0).unwrap();
+        let mut ws = WalStream::new(1, SEG, Pos::ZERO).unwrap();
         let mut rec = CollectingRecordSink::default();
         let mut seg = CollectingSegmentSink::default();
         ws.push(0, &synth_two_record_page(), &mut rec, &mut seg)
@@ -1510,7 +1360,7 @@ mod tests {
         page1.extend_from_slice(&record[p0_data..]);
         page1.resize(PAGE, 0);
 
-        let mut ws = WalStream::new(1, SEG, 0).unwrap();
+        let mut ws = WalStream::new(1, SEG, Pos::ZERO).unwrap();
         let mut rec = CollectingRecordSink::default();
         let mut seg = CollectingSegmentSink::default();
         ws.push(0, &page0, &mut rec, &mut seg).await.unwrap();
@@ -1528,7 +1378,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn next_lsn_segment_spanning_record_ends_on_boundary() {
         const SEG: u64 = walrus::pg::walparser::WAL_PAGE_SIZE as u64;
-        let mut ws = WalStream::new(1, SEG, 0).unwrap();
+        let mut ws = WalStream::new(1, SEG, Pos::ZERO).unwrap();
         let mut rec = CollectingRecordSink::default();
         let mut seg = CollectingSegmentSink::default();
         let (page0, page1) = synth_two_page_spanning_record();
@@ -1544,7 +1394,7 @@ mod tests {
         const SEG: u64 = 8192;
         let switch = raw_rec(RmId::Xlog as u8, X_LOG_SWITCH, 0, None, None);
         let page = page_of(&[switch], SEG as usize);
-        let mut ws = WalStream::new(1, SEG, 0).unwrap();
+        let mut ws = WalStream::new(1, SEG, Pos::ZERO).unwrap();
         let mut rec = CollectingRecordSink::default();
         let mut seg = CollectingSegmentSink::default();
         ws.push(0, &page, &mut rec, &mut seg).await.unwrap();
@@ -1601,7 +1451,7 @@ mod tests {
             }
         }
 
-        let mut ws = WalStream::new(1, SEG, 0).unwrap();
+        let mut ws = WalStream::new(1, SEG, Pos::ZERO).unwrap();
         // Live wiring: catalog dirt is admitted only for the followed db
         ws.filter_mut().set_target_db(5);
         ws.set_bytes_sink(Box::new(SpanLog(chunks.clone())));
@@ -1656,10 +1506,12 @@ mod tests {
         assert_eq!(stats.holds.load(std::sync::atomic::Ordering::Relaxed), 0);
 
         // Shadow replays through the commit's EndRecPtr → release.
-        state
-            .lock()
-            .await
-            .observe_status(conn, b_next_lsn, b_next_lsn, b_next_lsn);
+        state.lock().await.observe_status(
+            conn,
+            b_next_lsn,
+            Pos::new(b_next_lsn),
+            Pos::new(b_next_lsn),
+        );
         let (sink, segs_shipped) = pump.await.unwrap();
         assert_eq!(stats.holds.load(std::sync::atomic::Ordering::Relaxed), 1);
         assert_eq!(stats.failures.load(std::sync::atomic::Ordering::Relaxed), 0);
@@ -1698,7 +1550,7 @@ mod tests {
         let page = page_of(&[ins, commit], SEG as usize);
 
         let state = Arc::new(Mutex::new(ShadowStreamState::new(1, "sys".into(), 0, 1024)));
-        let mut ws = WalStream::new(1, SEG, 0).unwrap();
+        let mut ws = WalStream::new(1, SEG, Pos::ZERO).unwrap();
         let q = QueueingRecordSink::spawn(CountingRecordSink::default(), 4, 16, None);
         let gate = CatalogBoundaryGate::new(state, BoundaryGateConfig::default());
         let stats = gate.stats.clone();
@@ -1728,7 +1580,7 @@ mod tests {
             0,
             64 * 1024 * 1024,
         )));
-        let mut ws = WalStream::new(1, SEG, 0).unwrap();
+        let mut ws = WalStream::new(1, SEG, Pos::ZERO).unwrap();
         ws.set_bytes_sink(Box::new(ShadowStreamSink::new(state.clone())));
         let mut rec = CollectingRecordSink::default();
         let mut seg = CollectingSegmentSink::default();
