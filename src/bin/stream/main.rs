@@ -165,6 +165,7 @@ async fn run(mut args: Args) -> Result<()> {
             .clone()
             .context("--control-socket requires --ch-config")?;
         let ctx = SharedCtx {
+            fragment: walshadow::control::fragment_path(&ch_config, &args.control_fragment)?,
             ch_config,
             cli_base: cli_base(&args),
             metrics: metrics.clone(),

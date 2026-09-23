@@ -1,7 +1,8 @@
 //! In-process control plane over a Unix socket
 //!
 //! TOML bodies preserve config types and let one request update several
-//! sections atomically. Mutations only touch `ch-config.d/50-api.toml`, keeping
+//! sections atomically. Mutations only touch one `ch-config.d` fragment,
+//! `50-api.toml` unless `--control-fragment` names another, keeping
 //! operator-owned config read-only. PeerDB shim consumes this protocol
 
 use std::path::{Path, PathBuf};
@@ -79,6 +80,8 @@ impl Reloader {
 #[derive(Clone)]
 pub struct SharedCtx {
     pub ch_config: PathBuf,
+    /// Fragment control mutations write, see [`fragment_path`]
+    pub fragment: PathBuf,
     /// CLI-arg `[source]` / `[ch]` defaults; the config file overrides them,
     /// matching the daemon's connection resolution
     /// (see `ch_emitter::load_effective`).
@@ -223,20 +226,18 @@ async fn apply(ctx: &SharedCtx, req: &Request<'_>) -> Result<String> {
     if req.config.is_empty() {
         bail!("empty apply (send a TOML fragment as the body)");
     }
-    let frag = frag_path(&ctx.ch_config);
     let _guard = ctx.frag_lock.lock().await;
-    let mut root = load(&frag).await?;
+    let mut root = load(&ctx.fragment).await?;
     crate::ch_emitter::merge_tables(&mut root, req.config.clone());
-    commit(ctx, &frag, &root).await
+    commit(ctx, &ctx.fragment, &root).await
 }
 
 /// Removes named keys without touching operator-owned base config
 async fn unset(ctx: &SharedCtx, req: &Request<'_>) -> Result<String> {
-    let frag = frag_path(&ctx.ch_config);
     let _guard = ctx.frag_lock.lock().await;
-    let mut root = load(&frag).await?;
+    let mut root = load(&ctx.fragment).await?;
     apply_mask(&mut root, &req.config);
-    commit(ctx, &frag, &root).await
+    commit(ctx, &ctx.fragment, &root).await
 }
 
 fn apply_mask(root: &mut Table, mask: &Table) {
@@ -274,8 +275,16 @@ async fn validate(ctx: &SharedCtx, frag: &Path, root: &Table) -> Result<()> {
         .map_err(|e| anyhow::anyhow!("{e}"))
 }
 
-fn frag_path(ch_config: &Path) -> PathBuf {
-    ch_config.with_extension("d").join("50-api.toml")
+pub const DEFAULT_FRAGMENT: &str = "50-api.toml";
+
+/// Plain `.toml` name, so reload picks the fragment up in its lexical slot of
+/// the `ch-config.d` directory
+pub fn fragment_path(ch_config: &Path, name: &str) -> Result<PathBuf> {
+    let plain = Path::new(name).file_name().is_some_and(|n| n == name);
+    if !plain || Path::new(name).extension().is_none_or(|e| e != "toml") {
+        bail!("control fragment {name:?} must be a .toml file name without directories");
+    }
+    Ok(ch_config.with_extension("d").join(name))
 }
 
 async fn get_config(ctx: &SharedCtx) -> Result<Table> {
@@ -728,6 +737,7 @@ mod tests {
     fn ctx_at(dir: &Path) -> SharedCtx {
         SharedCtx {
             ch_config: dir.join("ch-config.toml"),
+            fragment: fragment_path(&dir.join("ch-config.toml"), DEFAULT_FRAGMENT).unwrap(),
             cli_base: Table::new(),
             metrics: MetricsRegistry::new(),
             reloader: Arc::new(Reloader::default()),
@@ -926,6 +936,62 @@ mod tests {
         assert!(!std::fs::read_to_string(&frag).unwrap().contains("widgets"));
         // Empty unset is a nop, not an error
         assert!(call(&sock, "unset", "").await.starts_with("OK"));
+    }
+
+    #[test]
+    fn fragment_path_takes_plain_toml_names_only() {
+        let base = Path::new("/etc/walshadow/ch-config.toml");
+        assert_eq!(
+            fragment_path(base, "90-ctl.toml").unwrap(),
+            Path::new("/etc/walshadow/ch-config.d/90-ctl.toml")
+        );
+        for bad in [
+            "../90-ctl.toml",
+            "sub/90-ctl.toml",
+            "/tmp/90-ctl.toml",
+            "90-ctl",
+            "",
+        ] {
+            assert!(fragment_path(base, bad).is_err(), "{bad:?}");
+        }
+    }
+
+    // Supervisor rewrites of the default fragment leave control state alone,
+    // and the later name wins where both set a key
+    #[tokio::test]
+    async fn apply_writes_named_fragment() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("c.sock");
+        let confd = dir.path().join("ch-config.d");
+        std::fs::create_dir_all(&confd).unwrap();
+        std::fs::write(confd.join("50-api.toml"), "[stream]\npaused = false\n").unwrap();
+        let mut ctx = ctx_at(dir.path());
+        ctx.fragment = fragment_path(&ctx.ch_config, "90-ctl.toml").unwrap();
+        let _h = serve(sock.clone(), ctx).await.unwrap();
+
+        assert!(
+            call(&sock, "apply", "[stream]\npaused = true")
+                .await
+                .starts_with("OK")
+        );
+        assert_eq!(
+            std::fs::read_to_string(confd.join("50-api.toml")).unwrap(),
+            "[stream]\npaused = false\n"
+        );
+        let merged = crate::ch_emitter::load_merged_with(&dir.path().join("ch-config.toml"), None)
+            .await
+            .unwrap();
+        assert_eq!(merged["stream"]["paused"].as_bool(), Some(true));
+
+        assert!(
+            call(&sock, "unset", "[stream]\npaused = \"\"")
+                .await
+                .starts_with("OK")
+        );
+        let merged = crate::ch_emitter::load_merged_with(&dir.path().join("ch-config.toml"), None)
+            .await
+            .unwrap();
+        assert_eq!(merged["stream"]["paused"].as_bool(), Some(false));
     }
 
     // Invalid fragments must not poison later reloads or starts

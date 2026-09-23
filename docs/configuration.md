@@ -114,8 +114,8 @@ target_database = "event_store"
 EOF
 ```
 
-Control writes only `50-api.toml` in config fragment directory. Base config
-stays unchanged. Invalid merged config is rejected and previous fragment is
+Control writes `50-api.toml` in config fragment directory, override with
+`--control-fragment`. Invalid merged config is rejected and previous fragment is
 restored
 
 ## Live and startup-only settings

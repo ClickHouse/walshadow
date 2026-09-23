@@ -266,6 +266,11 @@ pub(crate) struct Args {
     /// Control socket path, omit to disable control API
     #[arg(long)]
     pub(crate) control_socket: Option<PathBuf>,
+    /// File name inside `--ch-config`'s `.d` directory that control mutations
+    /// write. Rename it when a supervisor rewrites `50-api.toml` itself, so
+    /// neither clobbers the other; lexical order decides which wins
+    #[arg(long, default_value = walshadow::control::DEFAULT_FRAGMENT)]
+    pub(crate) control_fragment: String,
     /// OTLP/gRPC endpoint for traces, e.g. `http://localhost:4317`. Absent
     /// disables tracing (zero overhead); falls back to
     /// `OTEL_EXPORTER_OTLP_ENDPOINT`. Spans emit at the `walshadow::trace`
