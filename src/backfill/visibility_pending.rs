@@ -28,7 +28,7 @@ use crate::ch::quote_ident;
 use crate::config::ResolvedConfig;
 use crate::decode::heap_decoder::ColumnValue;
 use crate::decode::visibility::{PendingXids, PgXactView, XidStatus};
-use crate::emit::ch_emitter::{EmitterConfig, EmitterStats};
+use crate::emit::ch_emitter::EmitterStats;
 use crate::emit::pipeline::tail::OwnedTail;
 use crate::emit::pipeline::{Fatal, bootstrap};
 use crate::mapping::{ColumnMapping, MappingSnapshot, TableMapping, TableTarget};
@@ -213,7 +213,7 @@ pub struct PendingManifest {
 pub async fn ship(
     pending: PendingSpool,
     live: &MappingSnapshot,
-    emitter: Arc<EmitterConfig>,
+    dest: Arc<crate::config::DestEmitter>,
     stats: Arc<EmitterStats>,
     resolver: ToastResolver,
     config: Option<Arc<ResolvedConfig>>,
@@ -232,7 +232,7 @@ pub async fn ship(
 
     let mut routes: HashMap<RelName, TableMapping> = HashMap::with_capacity(tally.len());
     let mut manifests = Vec::with_capacity(tally.len());
-    let mut sess = StagingSession::connect(emitter.clone())
+    let mut sess = StagingSession::connect(dest.clone())
         .await
         .map_err(|e| format!("pending visibility: connect: {e}"))?;
     for desc in catalog.descriptors() {
@@ -268,7 +268,7 @@ pub async fn ship(
     }
 
     let tail = OwnedTail::spawn(
-        &emitter,
+        dest.clone(),
         1,
         stats.clone(),
         Fatal::new(),
@@ -290,7 +290,7 @@ pub async fn ship(
         stats.clone(),
         resolver,
         bootstrap::Deferral::Local(DeferredSpool::new(deferred, DEFERRED_SPOOL_MEM_MAX)),
-        emitter.row_policy(),
+        dest.current().row_policy(),
         config,
         HashSet::new(),
         None,

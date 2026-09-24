@@ -127,6 +127,7 @@ pub struct SourceDb {
     pub desc_log: Arc<DescriptorLog>,
     /// Mapping rules for this database, other settings are shared across databases
     pub emitter: Arc<EmitterConfig>,
+    pub dest: Arc<crate::config::DestEmitter>,
     pub mapping: MappingHandle,
     /// Without `--ch-config`, live config updates are disabled
     pub resolver: Option<Arc<ConfigResolver>>,
@@ -143,13 +144,15 @@ impl SourceDb {
         config: Option<(Arc<ConfigResolver>, watch::Receiver<Arc<ResolvedConfig>>)>,
     ) -> Self {
         let (resolver, config_rx) = config.map_or((None, None), |(r, rx)| (Some(r), Some(rx)));
+        let emitter = Arc::new(emitter);
         Self {
             name: link.name.clone(),
             oid: link.oid,
             bridge: link.bridge.clone(),
             catalog: link.catalog.clone(),
             desc_log,
-            emitter: Arc::new(emitter),
+            dest: crate::config::DestEmitter::new(emitter.clone(), config_rx.clone()),
+            emitter,
             mapping,
             resolver,
             config_rx,

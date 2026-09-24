@@ -194,6 +194,7 @@ impl PipelineConfig {
             budget,
         } = self;
         let emitter = Arc::new(emitter);
+        let dest = dbs.primary().dest.clone();
         let fatal = Fatal::new();
 
         let budget = match budget {
@@ -208,7 +209,7 @@ impl PipelineConfig {
         } else {
             // Shadow mode requires oracle bridge
             crate::toast::ToastResolver::for_mode(
-                &emitter,
+                dest.clone(),
                 stats.clone(),
                 oracle
                     .as_deref()
@@ -247,7 +248,7 @@ impl PipelineConfig {
         let (msg_tx, ack, tail) = match tail {
             TailKind::ClickHouse => {
                 tail::spawn_with_config(
-                    &emitter,
+                    dest.clone(),
                     inserter_pool_size,
                     stats.clone(),
                     emitter_ack.clone(),
@@ -282,7 +283,7 @@ impl PipelineConfig {
             Some(budget.clone()),
             retires,
             pending_rows,
-            emitter.clone(),
+            dest,
             resume_floor,
         );
 

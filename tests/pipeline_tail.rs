@@ -37,9 +37,15 @@ async fn tail_finish_flushes_and_drains_clean() {
     let fatal = Fatal::new();
     let stats = Arc::new(EmitterStats::default());
     let emitter_ack = Arc::new(Monotone::<EmitterAck>::default());
-    let (msg_tx, ack, parts) = tail::spawn(&emitter(ch_tcp), 2, stats, emitter_ack, fatal.clone())
-        .await
-        .expect("spawn tail");
+    let (msg_tx, ack, parts) = tail::spawn(
+        walshadow::config::DestEmitter::new(std::sync::Arc::new(emitter(ch_tcp)), None),
+        2,
+        stats,
+        emitter_ack,
+        fatal.clone(),
+    )
+    .await
+    .expect("spawn tail");
 
     parts
         .finish(msg_tx, ack, 0, &fatal)
@@ -62,9 +68,15 @@ async fn tail_finish_returns_fatal_message() {
     let fatal = Fatal::new();
     let stats = Arc::new(EmitterStats::default());
     let emitter_ack = Arc::new(Monotone::<EmitterAck>::default());
-    let (msg_tx, ack, parts) = tail::spawn(&emitter(ch_tcp), 2, stats, emitter_ack, fatal.clone())
-        .await
-        .expect("spawn tail");
+    let (msg_tx, ack, parts) = tail::spawn(
+        walshadow::config::DestEmitter::new(std::sync::Arc::new(emitter(ch_tcp)), None),
+        2,
+        stats,
+        emitter_ack,
+        fatal.clone(),
+    )
+    .await
+    .expect("spawn tail");
 
     fatal.set("boom".into());
     let err = parts
@@ -89,9 +101,15 @@ async fn tail_finish_fatal_during_drain() {
     let fatal = Fatal::new();
     let stats = Arc::new(EmitterStats::default());
     let emitter_ack = Arc::new(Monotone::<EmitterAck>::default());
-    let (msg_tx, ack, parts) = tail::spawn(&emitter(ch_tcp), 2, stats, emitter_ack, fatal.clone())
-        .await
-        .expect("spawn tail");
+    let (msg_tx, ack, parts) = tail::spawn(
+        walshadow::config::DestEmitter::new(std::sync::Arc::new(emitter(ch_tcp)), None),
+        2,
+        stats,
+        emitter_ack,
+        fatal.clone(),
+    )
+    .await
+    .expect("spawn tail");
 
     // Flush has no rows so it acks immediately; finish then parks on the
     // durability drain (watermark never reaches u64::MAX). Trip fatal there.

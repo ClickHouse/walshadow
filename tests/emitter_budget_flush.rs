@@ -159,10 +159,15 @@ async fn budget_trips_seal_complete_inserts() {
     let stats = Arc::new(EmitterStats::default());
     let emitter_ack = Arc::new(Monotone::<EmitterAck>::default());
     let fatal = Fatal::new();
-    let (msg_tx, ack, tail_parts) =
-        tail::spawn(&cfg, 1, stats.clone(), emitter_ack.clone(), fatal.clone())
-            .await
-            .expect("spawn tail");
+    let (msg_tx, ack, tail_parts) = tail::spawn(
+        walshadow::config::DestEmitter::new(std::sync::Arc::new(cfg), None),
+        1,
+        stats.clone(),
+        emitter_ack.clone(),
+        fatal.clone(),
+    )
+    .await
+    .expect("spawn tail");
 
     let rel = rel_descriptor();
     let route = walshadow::emit::route::RouteSnapshot::freeze(

@@ -21,7 +21,7 @@ use crate::backfill::wal_replay::{
 use crate::catalog::desc_log::{BatchRecord, DescLogIdentity, DescriptorLog, LogEntry, LogValue};
 use crate::config::ResolvedConfig;
 use crate::decode::visibility::PgXactPatch;
-use crate::emit::ch_emitter::{EmitterConfig, EmitterStats};
+use crate::emit::ch_emitter::EmitterStats;
 use crate::emit::pipeline::Fatal;
 use crate::emit::pipeline::tail::OwnedTail;
 use crate::mapping::MappingHandle;
@@ -39,7 +39,7 @@ const STOP_POLL: Duration = Duration::from_millis(100);
 /// Inputs shared with concurrent bootstrap drain
 #[derive(Clone)]
 pub struct WindowLegConfig {
-    pub emitter: EmitterConfig,
+    pub dest: Arc<crate::config::DestEmitter>,
     pub mapping: MappingHandle,
     pub config: Arc<ResolvedConfig>,
     /// Shared emitter counters
@@ -192,8 +192,8 @@ impl Leg {
 
         let (filter_rfns, targets) = replay_scope(&cfg.catalog);
         let tail = OwnedTail::spawn(
-            &cfg.emitter,
-            cfg.emitter.inserter_pool_size,
+            cfg.dest.clone(),
+            cfg.dest.current().inserter_pool_size,
             cfg.stats.clone(),
             cfg.fatal.clone(),
             None,
@@ -215,10 +215,10 @@ impl Leg {
             mapping: cfg.mapping.snapshot().await,
             stats: cfg.stats.clone(),
             budget: cfg.resolver.budget().cloned(),
-            row_policy: cfg.emitter.row_policy(),
+            row_policy: cfg.dest.current().row_policy(),
             config: Some(cfg.config.clone()),
-            batch_rows: cfg.emitter.drain_batch_rows,
-            batch_bytes: cfg.emitter.drain_batch_bytes,
+            batch_rows: cfg.dest.current().drain_batch_rows,
+            batch_bytes: cfg.dest.current().drain_batch_bytes,
             msg_tx: tail.msg_tx.clone(),
             ack: tail.ack.clone(),
             next_seq: 0,

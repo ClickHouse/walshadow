@@ -139,13 +139,18 @@ pub(crate) async fn build_source_db(input: SourceDbInputs<'_>) -> anyhow::Result
         cfg.replicate_all,
         cfg.runtime_config_schema.clone(),
     );
-    let mut applicator =
-        walshadow::ch_ddl::DdlApplicator::new(&cfg, ddl_cfg, mapping.clone(), config_rx.clone())
-            .await
-            .context("init DDL applicator")?
-            .with_resolver(resolver.clone())
-            .with_oracle(input.oracle.clone())
-            .with_target_owners(conn.oid, input.targets.clone());
+    let dest = walshadow::config::DestEmitter::new(Arc::new(cfg.clone()), Some(config_rx.clone()));
+    let mut applicator = walshadow::ch_ddl::DdlApplicator::new(
+        dest.clone(),
+        ddl_cfg,
+        mapping.clone(),
+        config_rx.clone(),
+    )
+    .await
+    .context("init DDL applicator")?
+    .with_resolver(resolver.clone())
+    .with_oracle(input.oracle.clone())
+    .with_target_owners(conn.oid, input.targets.clone());
     // Backfiller for `initial_load` opt-ins (COPY / backup-sourced):
     // own source session + CH tail per backfill or pass, spill-dir
     // ledger dedups restarts. Wired whenever the emitter runs, since an
@@ -156,7 +161,7 @@ pub(crate) async fn build_source_db(input: SourceDbInputs<'_>) -> anyhow::Result
     let backfiller = Arc::new(
         walshadow::copy_backfill::CopyBackfiller::new(
             pg,
-            cfg.clone(),
+            dest.clone(),
             mapping.clone(),
             input.stats.clone(),
             conn.catalog.clone(),

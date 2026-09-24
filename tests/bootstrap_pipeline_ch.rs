@@ -149,7 +149,7 @@ async fn bootstrap_tail_fans_out_n2() {
     let emitter_ack = Arc::new(Monotone::<EmitterAck>::default());
     let fatal = Fatal::new();
     let (msg_tx, ack, tail) = tail::spawn(
-        &cfg,
+        walshadow::config::DestEmitter::new(std::sync::Arc::new(cfg.clone()), None),
         INSERTERS,
         stats.clone(),
         emitter_ack.clone(),
