@@ -75,7 +75,7 @@ pub use ops::{
 };
 #[doc(hidden)]
 pub use source::{
-    archive_history, boundary_hold, catalog_capture, manifest, queueing_record_sink, segment_sink,
+    archive, boundary_hold, catalog_capture, manifest, queueing_record_sink, segment_sink,
     shadow_stream, source_feed, timeline, transition, wal_stream,
 };
 #[doc(hidden)]

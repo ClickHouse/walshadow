@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use tokio_postgres::types::PgLsn;
 use walrus::pg::replication::conn::PgConfig;
+use walshadow::archive::{Archive, ArchiveFeed};
 use walshadow::config::SourceConn;
 use walshadow::manifest;
 use walshadow::pos::{Floor, Monotone, Pos};
@@ -16,7 +17,6 @@ use walshadow::timeline::TimelineHistory;
 use walshadow::transition::{TransitionError, source_history};
 use walshadow::wal_stream::WalStream;
 
-use crate::archive::ArchiveFeed;
 use crate::args::{Args, cli_base};
 
 /// How long the fork proofs wait for the pump-side queue to drain. Past it the
@@ -411,7 +411,9 @@ pub(crate) fn swap_reason(err: &anyhow::Error) -> &'static str {
 pub(crate) enum SourcePath {
     Live,
     Archive(ArchiveFeed),
-    Redial(Redial),
+    /// Source lost with no archive to read, redialed each due pump iteration so
+    /// the loop keeps publishing, pausing and applying `[source]` repoints
+    Redial,
 }
 
 impl SourcePath {
@@ -423,66 +425,82 @@ impl SourcePath {
     }
 }
 
-/// Source lost with no archive to read, redialed each due pump iteration so
-/// the loop keeps publishing, pausing and applying `[source]` repoints
-pub(crate) struct Redial {
-    pub(crate) retry_at: Instant,
-    pub(crate) backoff: Duration,
-    /// Why the archive could not stand in, named if the source cannot serve
-    pub(crate) archive_error: String,
+/// Redial pacing, held across archive legs so an archive gap waits out the
+/// delay its failed dial set instead of redialing hot
+pub(crate) struct ReconnectBackoff {
+    retry_at: Instant,
+    delay: Duration,
 }
 
-impl Redial {
-    pub(crate) const MIN_BACKOFF: Duration = Duration::from_millis(200);
-    pub(crate) const MAX_BACKOFF: Duration = Duration::from_secs(10);
-
-    pub(crate) fn now(archive_error: String) -> Self {
+impl Default for ReconnectBackoff {
+    fn default() -> Self {
         Self {
             retry_at: Instant::now(),
-            backoff: Self::MIN_BACKOFF,
-            archive_error,
+            delay: Self::MIN,
         }
     }
 }
 
+impl ReconnectBackoff {
+    const MIN: Duration = Duration::from_millis(200);
+    const MAX: Duration = Duration::from_secs(10);
+
+    pub(crate) fn due(&self) -> bool {
+        Instant::now() >= self.retry_at
+    }
+
+    pub(crate) fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    fn failed(&mut self) {
+        self.retry_at = Instant::now() + self.delay;
+        self.delay = (self.delay * 2).min(Self::MAX);
+    }
+}
+
 pub(crate) struct SourceRecovery<'a> {
+    pub(crate) system_id: u64,
     pub(crate) status_interval: Duration,
-    pub(crate) backup: Option<&'a walrus::config::Settings>,
+    pub(crate) backup: Option<&'a Archive>,
     /// Published resume floor, which is what a slot on the far end has to still
     /// reach — the reconnect's own `resume_lsn` sits above it
     pub(crate) floor: &'a Monotone<Floor>,
     pub(crate) prefetch: usize,
+    pub(crate) backoff: ReconnectBackoff,
 }
 
 impl SourceRecovery<'_> {
-    /// Try source, otherwise start bounded archive fetches for normal pump,
-    /// otherwise redial. `cfg`, `slot`, and `branch` are the live endpoint,
-    /// slot name, and proved branch, passed per call rather than held, so a
-    /// recovery that starts after a `[source]` reload or a crossing dials the
-    /// new address under the new name and asks for the descendant, with the
-    /// archive read under its segment names.
-    pub(crate) async fn recover(
-        &self,
-        source_error: anyhow::Error,
-        cfg: &PgConfig,
-        slot: Option<&str>,
-        branch: SourceBranch,
-        resume_lsn: Pos<Floor>,
+    /// Dial source, otherwise start bounded archive fetches for normal pump,
+    /// otherwise redial. `source` and `history` are the live endpoint and
+    /// proved chain, passed per call rather than held, so a recovery that
+    /// starts after a `[source]` reload or a crossing dials the new address
+    /// under the new slot and asks for the descendant, with the archive read
+    /// under its segment names.
+    ///
+    /// `lost` is what ended a live feed, starting a fresh outage. A removed-WAL
+    /// (58P01) loss means source genuinely can't serve resume point, so skip
+    /// straight to archive
+    pub(crate) async fn attempt(
+        &mut self,
+        lost: Option<anyhow::Error>,
+        source: &SourceConn,
+        history: &TimelineHistory,
+        stream: &WalStream,
         feed: &mut SourceFeed,
-    ) -> SourcePath {
-        // Source first (primary_conninfo analog): a plain drop is usually
-        // transient, so try the source again at the exact resume point before
-        // reaching for the archive. A removed-WAL (58P01) error means the
-        // source genuinely can't serve it — skip straight to the archive.
-        let source_missing = walshadow::source_feed::is_wal_segment_removed(&source_error);
-        let reason = if source_missing {
-            source_error
-        } else {
-            match resume_source_feed(
-                cfg,
-                slot,
+    ) -> Result<SourcePath> {
+        if lost.is_some() {
+            self.backoff.reset();
+        }
+        let resume_lsn = stream.next_lsn();
+        // Source first (primary_conninfo analog), plain drop is usually transient
+        let error = match lost {
+            Some(e) if walshadow::source_feed::is_wal_segment_removed(&e) => e,
+            _ => match resume_source_feed(
+                &source.to_pg_config(),
+                source.slot.as_deref(),
                 resume_lsn,
-                branch,
+                stream_branch(history, self.system_id, stream),
                 self.floor.get(),
                 self.status_interval,
             )
@@ -490,88 +508,57 @@ impl SourceRecovery<'_> {
             {
                 Ok(fresh) => {
                     *feed = fresh;
+                    self.backoff.reset();
                     tracing::info!(
                         target: "walshadow",
+                        endpoint = source.endpoint(),
                         resume_lsn = %resume_lsn,
                         "source reconnected — resuming replication",
                     );
-                    return SourcePath::Live;
+                    return Ok(SourcePath::Live);
                 }
-                Err(retry_error) => retry_error,
-            }
+                Err(e) => e,
+            },
         };
         tracing::warn!(
             target: "walshadow",
-            error = %reason,
+            error = %format!("{error:#}"),
+            endpoint = source.endpoint(),
             resume_lsn = %resume_lsn,
-            source_missing,
+            retry_in_ms = self.backoff.delay.as_millis() as u64,
             "source cannot serve the resume point — trying archive",
         );
-        // Archive fallback (restore_command analog). Redial covers every "no
-        // archive": a transient error retries the source with backoff, a
-        // removed-WAL error surfaces the operator-action message.
-        let archive_error = match self.backup.map(|s| (s, s.build_storage())) {
-            None => "no [backup] archive configured".to_string(),
-            Some((_, Err(e))) => format!("build archive storage: {e:#}"),
-            Some((settings, Ok(storage))) => {
-                tracing::info!(target: "walshadow", resume_lsn = %resume_lsn,
-                    prefetch = self.prefetch, "starting archive recovery");
-                return SourcePath::Archive(ArchiveFeed::spawn(
-                    settings.clone(),
-                    storage,
-                    branch.timeline,
-                    resume_lsn.get(),
-                    self.prefetch,
-                ));
-            }
-        };
-        SourcePath::Redial(Redial::now(archive_error))
+        self.fall_back(error, history, stream.timeline(), resume_lsn)
     }
 
-    /// One attempt once `redial` is due. Removed WAL needs an operator; any
-    /// other failure backs off for the next iteration. Every attempt goes
-    /// through [`resume_source_feed`]'s proofs
-    pub(crate) async fn redial(
-        &self,
-        redial: &mut Redial,
-        cfg: &PgConfig,
-        slot: Option<&str>,
-        branch: SourceBranch,
+    /// Archive fallback (restore_command analog). Without an archive, removed
+    /// WAL needs an operator, any other failure redials after backoff
+    fn fall_back(
+        &mut self,
+        error: anyhow::Error,
+        history: &TimelineHistory,
+        timeline: u32,
         resume_lsn: Pos<Floor>,
-    ) -> Result<Option<SourceFeed>> {
-        if Instant::now() < redial.retry_at {
-            return Ok(None);
-        }
-        match resume_source_feed(
-            cfg,
-            slot,
-            resume_lsn,
-            branch,
-            self.floor.get(),
-            self.status_interval,
-        )
-        .await
-        {
-            Ok(feed) => Ok(Some(feed)),
-            Err(e) if walshadow::source_feed::is_wal_segment_removed(&e) => {
-                Err(e.context(format!(
-                    "source cannot serve WAL at {resume_lsn}; {}; \
-                     base-backup refresh requires operator action",
-                    redial.archive_error,
+    ) -> Result<SourcePath> {
+        self.backoff.failed();
+        match self.backup {
+            Some(archive) => {
+                tracing::info!(target: "walshadow", resume_lsn = %resume_lsn,
+                    prefetch = self.prefetch, "starting archive recovery");
+                Ok(SourcePath::Archive(archive.feed(
+                    history.clone(),
+                    timeline,
+                    resume_lsn.get(),
+                    self.prefetch,
                 )))
             }
-            Err(e) => {
-                tracing::warn!(
-                    target: "walshadow",
-                    error = %e,
-                    endpoint = %format!("{}:{}", cfg.host, cfg.port),
-                    retry_in_ms = redial.backoff.as_millis() as u64,
-                    "source reconnect failed — retrying",
-                );
-                redial.retry_at = Instant::now() + redial.backoff;
-                redial.backoff = (redial.backoff * 2).min(Redial::MAX_BACKOFF);
-                Ok(None)
+            None if walshadow::source_feed::is_wal_segment_removed(&error) => {
+                Err(error.context(format!(
+                    "source cannot serve WAL at {resume_lsn}; no [backup] archive configured; \
+                     base-backup refresh requires operator action",
+                )))
             }
+            None => Ok(SourcePath::Redial),
         }
     }
 }
@@ -579,6 +566,105 @@ impl SourceRecovery<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn removed_wal() -> anyhow::Error {
+        walshadow::source_feed::WalSegmentRemoved {
+            error_code: walshadow::source_feed::SQLSTATE_UNDEFINED_FILE.to_string(),
+            message: "requested WAL segment has already been removed".to_string(),
+        }
+        .into()
+    }
+
+    fn slot_too_new() -> anyhow::Error {
+        TransitionError::Slot(walshadow::source_feed::SlotError::TooNew {
+            slot: "walshadow".to_string(),
+            restart_lsn: 0x1_0E00_0490,
+            resume_lsn: 0x6200_0000,
+        })
+        .into()
+    }
+
+    fn recovery<'a>(backup: Option<&'a Archive>, floor: &'a Monotone<Floor>) -> SourceRecovery<'a> {
+        SourceRecovery {
+            system_id: 1,
+            status_interval: Duration::from_secs(10),
+            backup,
+            floor,
+            prefetch: 1,
+            backoff: ReconnectBackoff::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn archive_retries_after_slot_refusal_and_delayed_upload() {
+        let tmp = tempfile::tempdir().unwrap();
+        let settings = walrus::config::Settings {
+            storage: walrus::config::StorageSettings::Fs {
+                path: tmp.path().join("archive").display().to_string(),
+            },
+            ..Default::default()
+        };
+        let floor = Monotone::new(Pos::new(0x6200_0000));
+        let archive = Archive::open(settings.clone()).unwrap();
+        let mut recovery = recovery(Some(&archive), &floor);
+        let history = TimelineHistory::root(1);
+        let resume = Pos::new(0x6200_002A);
+        for attempt in 0..8 {
+            let delay = recovery.backoff.delay;
+            let before = Instant::now();
+            let error = if attempt % 2 == 0 {
+                slot_too_new()
+            } else {
+                removed_wal()
+            };
+            let mut path = recovery.fall_back(error, &history, 1, resume).unwrap();
+            let error = path.archive().unwrap().next().await.unwrap().unwrap_err();
+            assert!(format!("{error:#}").contains("000000010000000000000062"));
+            assert!(recovery.backoff.retry_at >= before + delay);
+            assert_eq!(
+                recovery.backoff.delay,
+                (delay * 2).min(ReconnectBackoff::MAX)
+            );
+        }
+        assert_eq!(recovery.backoff.delay, ReconnectBackoff::MAX);
+
+        let segment = tmp.path().join("000000010000000000000062");
+        std::fs::write(&segment, vec![0x5a; WAL_SEG_SIZE as usize]).unwrap();
+        walrus::pg::wal::push::handle(&settings, settings.build_storage().unwrap(), &segment)
+            .await
+            .unwrap();
+        let mut path = recovery
+            .fall_back(slot_too_new(), &history, 1, resume)
+            .unwrap();
+        let (lsn, bytes) = path.archive().unwrap().next().await.unwrap().unwrap();
+        assert_eq!(lsn, resume.get());
+        assert_eq!(bytes.len(), WAL_SEG_SIZE as usize - 42);
+        assert!(bytes.iter().all(|b| *b == 0x5a));
+        let error = path.archive().unwrap().next().await.unwrap().unwrap_err();
+        assert!(format!("{error:#}").contains("000000010000000000000063"));
+    }
+
+    #[test]
+    fn removed_wal_without_archive_requires_operator() {
+        let floor = Monotone::new(Pos::new(0x6200_0000));
+        let mut recovery = recovery(None, &floor);
+        let history = TimelineHistory::root(1);
+        let Err(error) = recovery.fall_back(removed_wal(), &history, 1, floor.get()) else {
+            panic!("removed WAL without archive must fail");
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("base-backup refresh requires operator action")
+        );
+        assert!(error.to_string().contains("no [backup] archive configured"));
+        assert!(walshadow::source_feed::is_wal_segment_removed(&error));
+        let path = recovery
+            .fall_back(slot_too_new(), &history, 1, floor.get())
+            .unwrap();
+        assert!(matches!(path, SourcePath::Redial));
+        assert!(!recovery.backoff.due());
+    }
 
     /// Two standbys of one primary, promoted independently, are both timeline 2
     /// under one system identifier. The chain places either one, so only where

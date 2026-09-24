@@ -465,7 +465,7 @@ impl Cluster {
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             if let Some(pid) = self.worker_pid()
-                && self.bridge_path().exists()
+                && UnixStream::connect(self.bridge_path()).is_ok()
             {
                 return pid;
             }
