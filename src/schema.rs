@@ -214,7 +214,8 @@ pub struct SchemaDiff {
     pub added_columns: Vec<RelAttr>,
     pub dropped_columns: Vec<i16>,
     pub renamed_columns: Vec<(i16, String, String)>,
-    pub type_changes: Vec<(i16, RelAttr)>,
+    /// `(old, new)` attribute pairs sharing an attnum
+    pub type_changes: Vec<(RelAttr, RelAttr)>,
 }
 
 impl SchemaDiff {
@@ -249,7 +250,7 @@ pub fn compute_schema_diff(old: &RelDescriptor, new: &RelDescriptor) -> SchemaDi
                     || old_attr.typmod != new_attr.typmod
                     || old_attr.not_null != new_attr.not_null
                 {
-                    diff.type_changes.push((new_attr.attnum, new_attr.clone()));
+                    diff.type_changes.push((old_attr.clone(), new_attr.clone()));
                 }
             }
         }
@@ -358,7 +359,7 @@ mod tests {
         let new = mk_desc(16400, vec![mk_attr(1, "c", 20, true)]); // int8
         let d = compute_schema_diff(&old, &new);
         assert_eq!(d.type_changes.len(), 1);
-        assert_eq!(d.type_changes[0].0, 1);
+        assert_eq!(d.type_changes[0].0.type_oid, 23);
         assert_eq!(d.type_changes[0].1.type_oid, 20);
     }
 

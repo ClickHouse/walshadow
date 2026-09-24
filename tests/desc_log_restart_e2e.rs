@@ -110,11 +110,13 @@ fn mappings_for(namespace: &str, table: &str) -> Vec<fx::TableMappingSpec> {
                 src_attnum: 1,
                 target_name: "id".into(),
                 target_type: "Int64".into(),
+                type_pinned: false,
             },
             ColumnMapping {
                 src_attnum: 2,
                 target_name: "v".into(),
                 target_type: "Nullable(String)".into(),
+                type_pinned: false,
             },
         ],
     }]

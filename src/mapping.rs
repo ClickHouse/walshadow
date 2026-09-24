@@ -130,6 +130,8 @@ pub struct ColumnMapping {
     pub src_attnum: i16,
     pub target_name: String,
     pub target_type: String,
+    /// Operator stated type by attnum; source type changes leave it alone
+    pub type_pinned: bool,
 }
 
 /// Names of the columns walshadow appends to every replicated CH table, and
@@ -391,6 +393,7 @@ pub fn map_column(
         src_attnum: attr.attnum,
         target_name,
         target_type: resolved.ch_type,
+        type_pinned: false,
     })
 }
 
@@ -403,12 +406,58 @@ pub fn derive_columns_for_mapping(desc: &RelDescriptor, rules: &ColumnRules) -> 
         .collect()
 }
 
+/// Derive changed target type; preserve existing nullability
+pub fn retyped_target(
+    rel: &RelName,
+    column: &ColumnMapping,
+    new: &RelAttr,
+    key: bool,
+    rules: &ColumnRules,
+) -> Option<String> {
+    let mut ty = map_column(rel, new, key, rules)?.target_type;
+    // ClickHouse cannot cast retained NULLs after PostgreSQL SET NOT NULL
+    if column.target_type.starts_with("Nullable(") && !ty.starts_with("Nullable(") {
+        ty = format!("Nullable({ty})");
+    }
+    (ty != column.target_type).then_some(ty)
+}
+
+pub fn strip_nullable(ty: &str) -> &str {
+    ty.strip_prefix("Nullable(")
+        .and_then(|t| t.strip_suffix(')'))
+        .unwrap_or(ty)
+}
+
+/// Destination column type change planned from a source type change
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Retype {
+    pub src_attnum: i16,
+    pub target_name: String,
+    pub target_type: String,
+    pub kind: RetypeKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetypeKind {
+    Modify,
+    /// Drop then add, rewrite rows refill values
+    Readd,
+}
+
 pub fn fold_diff_into_mapping(
     target: &mut TableMapping,
     new: &RelDescriptor,
     diff: &SchemaDiff,
+    retypes: &[Retype],
     rules: &ColumnRules,
 ) {
+    for retype in retypes {
+        for column in &mut target.columns {
+            if column.src_attnum == retype.src_attnum {
+                column.target_type.clone_from(&retype.target_type);
+            }
+        }
+    }
     for (attnum, old_name, new_name) in &diff.renamed_columns {
         // Preserve configured target name after source rename
         let renamed_to = rules
@@ -695,6 +744,7 @@ mod tests {
                 renamed_columns: vec![],
                 type_changes: vec![],
             },
+            &[],
             &rules,
         );
         assert_eq!(mapping.columns[1].target_type, "Decimal(38, 9)");
@@ -709,6 +759,7 @@ mod tests {
                 src_attnum: 1,
                 target_name: "id_v1".into(),
                 target_type: "Int32".into(),
+                type_pinned: false,
             }],
         };
         let new = events_desc(vec![attr(1, "legacy_id", crate::schema::INT4OID)]);
@@ -721,6 +772,7 @@ mod tests {
                 renamed_columns: vec![(1, "id_v1".into(), "legacy_id".into())],
                 type_changes: vec![],
             },
+            &[],
             &rules,
         );
         assert_eq!(mapping.columns[0].target_name, "id");

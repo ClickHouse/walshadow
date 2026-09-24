@@ -12,7 +12,9 @@ changes after earlier rows and before later rows
 | `ADD COLUMN ... DEFAULT ...` | adds column and carries supported default |
 | `RENAME COLUMN` | renames destination column unless config pins another target name |
 | `DROP COLUMN` | drops automatically mapped destination column, custom target mappings can need cleanup |
-| column type change | logs warning and requires manual migration |
+| `ALTER COLUMN ... TYPE` | updates destination type unless config states one; `USING` is eventually consistent |
+| `DROP NOT NULL` | makes automatically derived destination type `Nullable` |
+| `SET NOT NULL` | preserves existing destination `Nullable` type |
 | `TRUNCATE` | truncates destination table in source order |
 | `DROP TABLE` | retains, warns, or drops destination based on policy |
 | `VACUUM FULL`, `CLUSTER`, rewriting `ALTER` | continues with rewritten source relation |
@@ -22,9 +24,15 @@ storage are not automatically reconciled with destination routing and keys
 Coordinate these changes with an explicit destination and mapping migration
 They are not uniformly rejected before replication continues
 
-Nullability changes use same warning-only path as type changes. Dropping NOT NULL
-on source does not make destination nullable; a subsequent NULL can become a
-destination default. Migrate destination representation before such rows arrive
+Rewriting type changes log every live row with its new value. These rows
+supersede stored versions through `_lsn` deduplication. Until they arrive,
+values reflect what ClickHouse `MODIFY COLUMN` casts to. Conversions without
+cast drop and re-add destination column, eventually filled as rows arrive
+
+ClickHouse can reject key column type changes, including changes to replica
+identity columns used in destination sorting keys. Rejection stops replication
+before column renames, additions, and drops from that schema event. Earlier
+retypes from same event may already have succeeded
 
 ## Configure source table drops
 
@@ -51,10 +59,9 @@ drop_table_strategy = "drop"
 Choose `drop` only when source owns destination lifecycle. ClickHouse
 dependencies and downstream consumers remain operator responsibility
 
-## Change a column type
+## Migrate a rejected key type change
 
-Source type changes never mutate ClickHouse type automatically. Coordinate a
-manual migration:
+When ClickHouse rejects a key type change, coordinate manual migration:
 
 1. Pause walshadow
 2. Wait until `drain` and `emitter_ack` converge in `ctl status`

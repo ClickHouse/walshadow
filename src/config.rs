@@ -36,7 +36,7 @@ use crate::column_rules::{ColumnRule, ColumnRules, ColumnRulesBuilder};
 use crate::emit::ch_emitter::EmitterConfig;
 use crate::filter::shadow_relations::ShadowHeld;
 use crate::mapping::{
-    DropTableStrategy, MappingHandle, NamespaceMapping, TableMapping, TableTarget,
+    DropTableStrategy, MappingHandle, NamespaceMapping, Retype, TableMapping, TableTarget,
     derive_columns_for_mapping, fold_diff_into_mapping,
 };
 use crate::runtime_config::{ConfigEvent, ConfigOverlay, TableRow};
@@ -525,7 +525,12 @@ impl ConfigResolver {
     /// `base` at resolve, so a SIGHUP TOML re-read can't revert the fold).
     /// Unmapped or excluded rels no-op without republish, mirroring
     /// `mutate_mapping_for_diff`'s early return.
-    pub async fn apply_schema_diff(&self, new: &RelDescriptor, diff: &SchemaDiff) {
+    pub async fn apply_schema_diff(
+        &self,
+        new: &RelDescriptor,
+        diff: &SchemaDiff,
+        retypes: &[Retype],
+    ) {
         let mut inner = self.inner.lock().await;
         let rel = &new.rel_name;
         if inner.opt_in.excluded.contains(rel) {
@@ -533,12 +538,12 @@ impl ConfigResolver {
         }
         let rules = self.tx.borrow().column_rules.clone();
         if let Some(m) = inner.opt_in.mappings.get_mut(rel) {
-            fold_diff_into_mapping(m, new, diff, &rules);
+            fold_diff_into_mapping(m, new, diff, retypes, &rules);
         } else if let Some(m) = inner.opt_in.derived.get_mut(rel) {
-            fold_diff_into_mapping(m, new, diff, &rules);
+            fold_diff_into_mapping(m, new, diff, retypes, &rules);
         } else if let Some(base) = inner.base.tables.get(rel) {
             let mut m = base.clone();
-            fold_diff_into_mapping(&mut m, new, diff, &rules);
+            fold_diff_into_mapping(&mut m, new, diff, retypes, &rules);
             inner.opt_in.derived.insert(rel.clone(), m);
         } else {
             return;
@@ -1585,7 +1590,7 @@ mod tests {
             renamed_columns: vec![],
             type_changes: vec![],
         };
-        resolver.apply_schema_diff(&desc, &diff).await;
+        resolver.apply_schema_diff(&desc, &diff, &[]).await;
         let has_note = |m: &HashMap<RelName, TableMapping>| {
             m.get(&RelName::new("public", "events"))
                 .is_some_and(|t| t.columns.iter().any(|c| c.src_attnum == 2))

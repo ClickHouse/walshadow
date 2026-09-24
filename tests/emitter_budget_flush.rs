@@ -89,11 +89,13 @@ fn mapping() -> Arc<TableMapping> {
                 src_attnum: 1,
                 target_name: "id".into(),
                 target_type: "Int32".into(),
+                type_pinned: false,
             },
             ColumnMapping {
                 src_attnum: 2,
                 target_name: "val".into(),
                 target_type: "Nullable(String)".into(),
+                type_pinned: false,
             },
         ],
     })

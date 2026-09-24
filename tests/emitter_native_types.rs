@@ -97,26 +97,31 @@ async fn native_numeric_time_timetz_round_trip() {
                 src_attnum: 1,
                 target_name: "id".into(),
                 target_type: "Int32".into(),
+                type_pinned: false,
             },
             ColumnMapping {
                 src_attnum: 2,
                 target_name: "n".into(),
                 target_type: "Decimal(10, 2)".into(),
+                type_pinned: false,
             },
             ColumnMapping {
                 src_attnum: 3,
                 target_name: "nw".into(),
                 target_type: "Decimal(50, 2)".into(),
+                type_pinned: false,
             },
             ColumnMapping {
                 src_attnum: 4,
                 target_name: "t".into(),
                 target_type: "Time64(6)".into(),
+                type_pinned: false,
             },
             ColumnMapping {
                 src_attnum: 5,
                 target_name: "tz".into(),
                 target_type: "String".into(),
+                type_pinned: false,
             },
         ],
     });

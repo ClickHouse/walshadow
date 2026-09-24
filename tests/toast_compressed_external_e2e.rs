@@ -80,6 +80,7 @@ async fn compressed_external_values_rehydrate() {
         src_attnum: attnum,
         target_name: name.into(),
         target_type: "Nullable(String)".into(),
+        type_pinned: false,
     };
     let mappings = vec![fx::TableMappingSpec {
         source_table: RelName::new("public", "doc"),
@@ -89,6 +90,7 @@ async fn compressed_external_values_rehydrate() {
                 src_attnum: 1,
                 target_name: "id".into(),
                 target_type: "Int32".into(),
+                type_pinned: false,
             },
             column(2, "pglz_body"),
             column(3, "lz4_body"),

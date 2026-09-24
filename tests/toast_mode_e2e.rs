@@ -58,16 +58,19 @@ fn dest_table(ch: &fx::ChServer) -> Vec<fx::TableMappingSpec> {
                 src_attnum: 1,
                 target_name: "id".into(),
                 target_type: "Int32".into(),
+                type_pinned: false,
             },
             ColumnMapping {
                 src_attnum: 2,
                 target_name: "meta".into(),
                 target_type: "Nullable(String)".into(),
+                type_pinned: false,
             },
             ColumnMapping {
                 src_attnum: 3,
                 target_name: "body".into(),
                 target_type: "Nullable(String)".into(),
+                type_pinned: false,
             },
         ],
     }]

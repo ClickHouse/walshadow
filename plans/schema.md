@@ -24,7 +24,7 @@ action. A warning followed by incomplete routing is not rejection
 | Transition | Required decision or test |
 |---|---|
 | Rename table, move table to another schema, rename schema | Move routing by source identity and choose destination rename policy, or reject |
-| Widen or replace a column type | Prove destination representation still fits, otherwise require migration |
+| Widen or replace a column type | Converge through rewrite rows, see [column retype](#column-retype-through-rewrite-rows) |
 | Drop NOT NULL, then insert NULL | Make destination nullable or reject, never silently substitute a default |
 | Change replica identity or remove a destination key column | Preserve a usable destination row key or require rebuild |
 | Create an unlogged table or switch to unlogged | Reject replication scope that cannot receive its row changes |
@@ -36,6 +36,60 @@ Keep supported controls beside rejection cases: column add, rename, drop,
 fast defaults, truncate, rewrite, abort, and savepoint rollback. Test DML on both
 sides of each change. Compare canonical source and destination rows as well as
 destination schema
+
+## Column retype through rewrite rows
+
+Rewriting `ALTER TABLE` fills transient heap `pg_temp_<oid>` through
+`heap_insert`, then swaps filenodes at command end. Its `pg_class.relrewrite`
+identifies owner relation (PostgreSQL `src/backend/commands/tablecmds.c`,
+`ATRewriteTable`). At `wal_level=logical`, each insert logs full new tuple,
+including `USING` results. Logical decoding skips these rows through
+`relrewrite` checks in `src/backend/replication/logical/reorderbuffer.c`.
+`VACUUM FULL` and `CLUSTER` instead write pages through `rewriteheap.c`
+
+Commit resolution associates rewritten filenode with owner. During fold,
+ignore command-boundary descriptors with another OID on that filenode and
+route rows under owner's commit descriptor
+([transaction buffer](../src/xact/xact_buffer.rs)). Owner's schema event uses
+new filenode's storage creation position, before rewrite rows, so destination
+DDL runs first. Rewrite rows cover every live row with newer `_lsn` values
+and supersede stored versions through deduplication. Until then, stored
+versions retain cast values or column defaults
+
+| Destination change | Current selection |
+|---|---|
+| `MODIFY COLUMN` | integer conversions, conversions to `String`, or no source rewrite |
+| `DROP COLUMN` then `ADD COLUMN` | other conversions during rewrite; avoid mutations stalled by unparseable stored values |
+| manual migration | ClickHouse rejects operation, such as unsupported key column retype |
+
+Detect rewrite by comparing old and new filenodes. Type changes without
+rewrite emit no replacement rows. Examples include widening `varchar(10)` to
+`varchar(20)`, `numeric(10,2)` to `numeric(12,2)`, and `timestamp(3)` to
+`timestamp(6)`. Verify destination conversions preserve values in these cases
+
+Plan key rebuilds through bootstrap staging swap ([bootstrap](bootstrap.md),
+[staging](../src/backfill/backfill_staging.rs)): create staging with new schema,
+route complete set of rewrite rows there, then exchange tables at commit.
+Current implementation stops on ClickHouse refusal and requires manual
+migration. For transitions requiring rebuild without rewrite, such as replica
+identity or configured `ORDER BY` changes, populate staging through backfill at
+an LSN
+
+Test or document remaining cases:
+
+- Soft-deleted and superseded versions receive no rewrite rows; retain cast
+  values or defaults
+- Whole-table rewrites can spill transactions and retain multiple destination
+  versions until merges; `MODIFY` mutations compete with inserts
+- Volatile `ADD COLUMN` defaults converge through rewrite rows
+- `REFRESH MATERIALIZED VIEW` also fills transient heap; verify handling of
+  refreshed rows and removal of rows absent from new contents
+
+Cover `int` to `bigint USING w * 10`, `int` to `text`, `text` to `int` with
+values ClickHouse cannot parse, key column `int` to `bigint`, volatile
+`ADD COLUMN` defaults, retype plus rename in one statement, DML after `ALTER`
+in same transaction, restart during rewrite transaction, and rewrite beyond
+spill threshold. Compare canonical source rows against destination `FINAL`
 
 ## Restart and external drift
 

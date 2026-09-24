@@ -88,11 +88,13 @@ async fn parallel_pipeline_schema_evolution_orders_after_data() {
                 src_attnum: 1,
                 target_name: "id".into(),
                 target_type: "Int64".into(),
+                type_pinned: false,
             },
             ColumnMapping {
                 src_attnum: 2,
                 target_name: "payload".into(),
                 target_type: "Nullable(String)".into(),
+                type_pinned: false,
             },
             // No `c` — the barrier's applicator must auto-extend.
         ],
@@ -250,11 +252,13 @@ async fn parallel_pipeline_truncate_orders_after_data() {
                 src_attnum: 1,
                 target_name: "id".into(),
                 target_type: "Int64".into(),
+                type_pinned: false,
             },
             ColumnMapping {
                 src_attnum: 2,
                 target_name: "payload".into(),
                 target_type: "Nullable(String)".into(),
+                type_pinned: false,
             },
         ],
     }];

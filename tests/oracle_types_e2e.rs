@@ -43,6 +43,7 @@ fn col(attnum: i16, name: &str, ty: &str) -> ColumnMapping {
         src_attnum: attnum,
         target_name: name.into(),
         target_type: ty.into(),
+        type_pinned: false,
     }
 }
 

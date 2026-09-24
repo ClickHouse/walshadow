@@ -93,6 +93,7 @@ fn mapping_for(rels: &[(&str, &str)]) -> EmitterConfig {
                     src_attnum: 1,
                     target_name: "id".into(),
                     target_type: "Int64".into(),
+                    type_pinned: false,
                 }],
             },
         );
