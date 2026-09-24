@@ -32,7 +32,7 @@ use clickhouse_c::{Allocator, ColumnBuilder, Kind, TypeAst};
 
 #[cfg(test)]
 use crate::ch::is_retryable;
-use crate::ch::{CompressionChoice, ConnectionConfig, EmitterError, quote_ident};
+use crate::ch::{CompressionChoice, ConnectionConfig, EmitterError, quote_ident, types};
 use crate::column_rules::{ColumnEntry, ColumnRule, ColumnRules};
 #[cfg(test)]
 use crate::decode::decoder_sink::DecoderSinkError;
@@ -1321,14 +1321,8 @@ fn canonical_type(ast: &TypeAst, configured: &str) -> String {
 
 /// CH JSON serialization v1 accepts strings, legacy Object needs a kind prefix
 fn composite_target(ast: &TypeAst) -> bool {
-    let view = ast.view();
-    let inner = if view.kind() == Some(Kind::Nullable) {
-        view.child(0)
-    } else {
-        Some(view)
-    };
     matches!(
-        inner.and_then(|v| v.kind()),
+        types::strip_nullable(ast.view()).kind(),
         Some(Kind::Array | Kind::Map | Kind::Object)
     )
 }
@@ -1532,15 +1526,8 @@ pub(crate) enum ColumnBuf {
 impl ColumnBuf {
     fn new_for_ast(ast: &TypeAst) -> Result<Self, EmitterError> {
         let view = ast.view();
-        let (nullable, inner) = if view.kind() == Some(Kind::Nullable) {
-            (
-                true,
-                view.child(0)
-                    .ok_or_else(|| EmitterError::Type("Nullable type with no child".into()))?,
-            )
-        } else {
-            (false, view)
-        };
+        let nullable = view.kind() == Some(Kind::Nullable);
+        let inner = types::strip_nullable(view);
         // CH parses JSON cells even when null_map marks them NULL
         let absent: &[u8] = if inner.kind() == Some(Kind::Json) {
             b"{}"
@@ -1730,7 +1717,7 @@ pub(crate) fn fresh_buffers(plan: &TablePlan) -> Result<Vec<ColumnBuf>, EmitterE
             } => ColumnBuf::Oracle(OracleColumnBuf::new(
                 source_type_oid,
                 source_typmod,
-                &c.type_repr,
+                c.ast.view(),
             )),
         });
     }
@@ -1886,17 +1873,13 @@ fn name_column(mut e: EmitterError, target: &str) -> EmitterError {
 }
 
 /// PostgreSQL returns literal String cells unchanged
-pub(crate) fn literal_column(
-    buf: &OracleColumnBuf,
-    target_type: &str,
-    n_rows: usize,
-) -> Option<ColumnBuf> {
+pub(crate) fn literal_column(buf: &OracleColumnBuf, n_rows: usize) -> Option<ColumnBuf> {
     if !buf.resolves_batch_locally(n_rows) {
         return None;
     }
     let offsets = Vec::with_capacity(n_rows);
     let data = Vec::new();
-    let mut local = if target_type == "Nullable(String)" {
+    let mut local = if buf.nullable_target() {
         ColumnBuf::NullableString {
             offsets,
             data,
@@ -1966,12 +1949,7 @@ fn push_fixed(buf: &mut ColumnBuf, le: &[u8]) -> Result<(), EmitterError> {
 /// Wire metadata for a (possibly `Nullable`) CH `Decimal`, else `None`.
 /// Peels one `Nullable` layer like [`ColumnBuf::new_for_ast`].
 fn decimal_wire_of(ast: &TypeAst) -> Option<DecimalWire> {
-    let view = ast.view();
-    let inner = if view.kind() == Some(Kind::Nullable) {
-        view.child(0)?
-    } else {
-        view
-    };
+    let inner = types::strip_nullable(ast.view());
     if !matches!(
         inner.kind(),
         Some(Kind::Decimal32 | Kind::Decimal64 | Kind::Decimal128 | Kind::Decimal256)
@@ -1992,12 +1970,7 @@ enum WireShape {
 }
 
 fn wire_shape_of(ast: &TypeAst) -> Option<(WireShape, Kind)> {
-    let view = ast.view();
-    let inner = if view.kind() == Some(Kind::Nullable) {
-        view.child(0)?
-    } else {
-        view
-    };
+    let inner = types::strip_nullable(ast.view());
     let shape = match inner.elem_size() {
         0 => WireShape::Str,
         w => WireShape::Fixed(w),
@@ -2851,7 +2824,7 @@ mod tests {
     /// encoder needs for fixed-shape ColumnBufs.
     #[test]
     fn elem_size_covers_tier1() {
-        let alloc = Allocator::stdlib();
+        let alloc = Allocator::global(&mimalloc::MiMalloc);
         let cases = [
             ("UInt8", 1usize),
             ("Int32", 4),
@@ -2874,10 +2847,10 @@ mod tests {
 
     #[test]
     fn literal_column_requires_string_target_and_rendered_cells() {
-        let mut buf = OracleColumnBuf::new(0, -1, "String");
+        let mut buf = OracleColumnBuf::string(0, -1);
         buf.push(OracleCell::Literal(b"a".to_vec()));
         buf.push(OracleCell::Default);
-        match literal_column(&buf, "String", 2) {
+        match literal_column(&buf, 2) {
             Some(ColumnBuf::String { offsets, data, .. }) => {
                 assert_eq!(data, b"a");
                 assert_eq!(offsets, [1, 1]);
@@ -2885,32 +2858,44 @@ mod tests {
             other => panic!("got {other:?}"),
         }
         for reject in ["Array(String)", "LowCardinality(String)", "JSON", "Int32"] {
-            let mut buf = OracleColumnBuf::new(0, -1, reject);
+            let mut buf = OracleColumnBuf::new(
+                0,
+                -1,
+                TypeAst::parse(reject, Allocator::global(&mimalloc::MiMalloc))
+                    .unwrap()
+                    .view(),
+            );
             buf.push(OracleCell::Literal(b"a".to_vec()));
             buf.push(OracleCell::Default);
             assert!(
-                literal_column(&buf, reject, 2).is_none(),
+                literal_column(&buf, 2).is_none(),
                 "{reject} needs the worker",
             );
         }
         // Cell count must match the batch, else offsets would not
-        assert!(literal_column(&buf, "String", 3).is_none());
+        assert!(literal_column(&buf, 3).is_none());
         for cell in [
             OracleCell::DiskRaw(b"a".to_vec()),
             OracleCell::TextInput(b"a".to_vec()),
         ] {
-            let mut buf = OracleColumnBuf::new(0, -1, "String");
-            buf.push(OracleCell::Literal(b"a".to_vec()));
-            buf.push(cell);
             for target in ["String", "Nullable(String)"] {
-                assert!(literal_column(&buf, target, 2).is_none());
+                let mut buf = OracleColumnBuf::new(
+                    0,
+                    -1,
+                    TypeAst::parse(target, Allocator::global(&mimalloc::MiMalloc))
+                        .unwrap()
+                        .view(),
+                );
+                buf.push(OracleCell::Literal(b"a".to_vec()));
+                buf.push(cell.clone());
+                assert!(literal_column(&buf, 2).is_none());
             }
         }
     }
 
     #[test]
     fn literal_string_cells_stay_off_the_oracle_batch_estimate() {
-        let alloc = Allocator::stdlib();
+        let alloc = Allocator::global(&mimalloc::MiMalloc);
         let mut rel = mk_rel();
         // Source type the local matrix misses, so `name` plans as an oracle
         // column while its String target still renders literals in-daemon
@@ -2957,12 +2942,12 @@ mod tests {
         let ColumnBuf::Oracle(o) = &buffers[1] else {
             panic!("oracle column")
         };
-        assert!(literal_column(o, "Nullable(String)", rows).is_some());
+        assert!(literal_column(o, rows).is_some());
     }
 
     #[test]
     fn new_for_ast_picks_shape_from_chc_type_kind() {
-        let alloc = Allocator::stdlib();
+        let alloc = Allocator::global(&mimalloc::MiMalloc);
         let cases = [
             ("Int32", "Fixed"),
             ("String", "String"),
@@ -3033,7 +3018,7 @@ mod tests {
     #[test]
     fn encode_numeric_into_decimal_and_string() {
         use crate::decode::codecs::NumericKind;
-        let alloc = Allocator::stdlib();
+        let alloc = Allocator::global(&mimalloc::MiMalloc);
         let ast = TypeAst::parse("Decimal(10, 2)", alloc).unwrap();
         let decimal = decimal_wire_of(&ast);
         assert_eq!(
@@ -3105,7 +3090,7 @@ mod tests {
 
     #[test]
     fn encode_time_native_and_timetz_text() {
-        let alloc = Allocator::stdlib();
+        let alloc = Allocator::global(&mimalloc::MiMalloc);
         let micros = 45_296_000_000i64; // 12:34:56
         let ast = TypeAst::parse("Time64(6)", alloc).unwrap();
         let mut buf = ColumnBuf::new_for_ast(&ast).unwrap();
@@ -3142,7 +3127,7 @@ mod tests {
 
     #[test]
     fn table_plan_builds_insert_with_synthetic_columns() {
-        let alloc = Allocator::stdlib();
+        let alloc = Allocator::global(&mimalloc::MiMalloc);
         let rel = mk_rel();
         let m = mk_mapping();
         let plan = TablePlan::build(
@@ -3165,7 +3150,7 @@ mod tests {
 
     #[test]
     fn table_plan_applies_admissible_column_override() {
-        let alloc = Allocator::stdlib();
+        let alloc = Allocator::global(&mimalloc::MiMalloc);
         let rel = mk_rel();
         let mut m = mk_mapping();
         // numeric-shaped default: the plan drill `numeric(38,0)` → `Int128`
@@ -3186,7 +3171,7 @@ mod tests {
 
     #[test]
     fn table_plan_override_keys_on_source_attname_not_target_name() {
-        let alloc = Allocator::stdlib();
+        let alloc = Allocator::global(&mimalloc::MiMalloc);
         let rel = mk_rel();
         let mut m = mk_mapping();
         // Operator-renamed CH column: override still keys on source attname
@@ -3199,7 +3184,7 @@ mod tests {
 
     #[test]
     fn table_plan_keeps_default_on_wire_incompatible_override() {
-        let alloc = Allocator::stdlib();
+        let alloc = Allocator::global(&mimalloc::MiMalloc);
         let rel = mk_rel();
         let m = mk_mapping();
         // encode_value writes int4 as 4 LE bytes; no textualization exists,
@@ -3211,7 +3196,7 @@ mod tests {
 
     #[test]
     fn override_wire_admissibility() {
-        let alloc = Allocator::stdlib();
+        let alloc = Allocator::global(&mimalloc::MiMalloc);
         let p = |s: &str| TypeAst::parse(s, alloc).unwrap();
         // Decimal-encoded source: Decimal / String / signed ints convert
         let dec = p("Decimal(38, 0)");
@@ -3241,7 +3226,7 @@ mod tests {
 
     #[test]
     fn is_deleted_codes_delete_in_trailing_buffer() {
-        let alloc = Allocator::stdlib();
+        let alloc = Allocator::global(&mimalloc::MiMalloc);
         let rel = mk_rel();
         let m = mk_mapping();
         let plan = TablePlan::build(
@@ -3271,7 +3256,7 @@ mod tests {
 
     #[test]
     fn json_target_encodes_locally_and_fills_absent_cells() {
-        let alloc = Allocator::stdlib();
+        let alloc = Allocator::global(&mimalloc::MiMalloc);
         let mut rel = mk_rel();
         rel.attributes[1].type_oid = crate::schema::JSONBOID;
         rel.attributes[1].type_name = "jsonb".into();
@@ -3318,7 +3303,7 @@ mod tests {
     /// replica identity
     #[test]
     fn oracle_row_over_the_seal_threshold_starts_a_new_batch() {
-        let alloc = Allocator::stdlib();
+        let alloc = Allocator::global(&mimalloc::MiMalloc);
         let rel = mk_rel();
         let mut m = mk_mapping();
         m.columns[1].target_type = "Array(Nullable(String))".into();
@@ -3385,7 +3370,7 @@ mod tests {
 
     #[test]
     fn absent_or_null_coerces_to_default_on_non_nullable_target() {
-        let alloc = Allocator::stdlib();
+        let alloc = Allocator::global(&mimalloc::MiMalloc);
         let rel = mk_rel();
         let mut m = mk_mapping();
         m.columns[1].target_type = "String".into();
@@ -3413,7 +3398,7 @@ mod tests {
 
     #[test]
     fn absent_stays_null_on_nullable_target() {
-        let alloc = Allocator::stdlib();
+        let alloc = Allocator::global(&mimalloc::MiMalloc);
         let rel = mk_rel();
         let m = mk_mapping();
         let plan = TablePlan::build(
@@ -3434,7 +3419,7 @@ mod tests {
 
     #[test]
     fn encoder_accumulates_into_typed_buffers() {
-        let alloc = Allocator::stdlib();
+        let alloc = Allocator::global(&mimalloc::MiMalloc);
         let rel = mk_rel();
         let m = mk_mapping();
         let plan = TablePlan::build(
@@ -3836,7 +3821,7 @@ mod tests {
 
     #[test]
     fn plan_renames_synthetic_columns_and_can_drop_the_marker() {
-        let alloc = Allocator::stdlib();
+        let alloc = Allocator::global(&mimalloc::MiMalloc);
         let rel = mk_rel();
         let m = mk_mapping();
         let sys = SystemColumns {

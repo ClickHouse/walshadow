@@ -3,8 +3,9 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use clickhouse_c::{Allocator, Block, BlockOpts, BlockReader, Column, SliceIo};
+use clickhouse_c::{Allocator, Block, BlockOpts, BlockReader, Column, Kind, SliceIo, TypeRef};
 
+use crate::ch::types;
 use crate::decode::heap_decoder::ColumnValue;
 use crate::ops::bridge::{Bridge, BridgeError, MAX_REQUEST_BYTES, request_frame};
 use crate::schema::RelAttr;
@@ -76,6 +77,7 @@ pub struct OracleColumnBuf {
     /// PostgreSQL hands a String target its literal back unchanged, so such
     /// a column resolves in the daemon while every cell is one
     string_target: bool,
+    nullable_target: bool,
     /// Cells no local conversion covers. One is enough to send the whole
     /// column, literals included
     remote_cells: usize,
@@ -85,14 +87,34 @@ pub struct OracleColumnBuf {
 }
 
 impl OracleColumnBuf {
-    pub fn new(source_type_oid: u32, source_typmod: i32, target_type: &str) -> Self {
+    pub fn new(source_type_oid: u32, source_typmod: i32, target_type: TypeRef<'_>) -> Self {
+        Self::with_target(
+            source_type_oid,
+            source_typmod,
+            types::strip_nullable(target_type).kind() == Some(Kind::String),
+            target_type.kind() == Some(Kind::Nullable),
+        )
+    }
+
+    /// Buffer rendering into a non-nullable `String`
+    pub fn string(source_type_oid: u32, source_typmod: i32) -> Self {
+        Self::with_target(source_type_oid, source_typmod, true, false)
+    }
+
+    fn with_target(
+        source_type_oid: u32,
+        source_typmod: i32,
+        string_target: bool,
+        nullable_target: bool,
+    ) -> Self {
         Self {
             source_type_oid,
             source_typmod,
             cells: Vec::new(),
             wire_bytes: 0,
             payload_capacity: 0,
-            string_target: matches!(target_type, "String" | "Nullable(String)"),
+            string_target,
+            nullable_target,
             remote_cells: 0,
             literal_bytes: 0,
         }
@@ -135,6 +157,10 @@ impl OracleColumnBuf {
     /// Column carries `n_rows` cells the daemon can render itself
     pub fn resolves_batch_locally(&self, n_rows: usize) -> bool {
         self.string_target && self.remote_cells == 0 && self.cells.len() == n_rows
+    }
+
+    pub fn nullable_target(&self) -> bool {
+        self.nullable_target
     }
 
     pub fn cells(&self) -> &[OracleCell] {
@@ -315,7 +341,7 @@ impl Oracle {
         source_typmod: i32,
         cell: OracleCell,
     ) -> Result<String, OracleError> {
-        let mut buf = OracleColumnBuf::new(source_type_oid, source_typmod, "String");
+        let mut buf = OracleColumnBuf::string(source_type_oid, source_typmod);
         buf.push(cell);
         let columns = [OracleRequestColumn {
             ordinal: 0,
@@ -324,7 +350,7 @@ impl Oracle {
             buf: &buf,
         }];
         let block = self
-            .encode_batch(db, &columns, 1, Allocator::stdlib())
+            .encode_batch(db, &columns, 1, Allocator::global(&mimalloc::MiMalloc))
             .await?;
         // Single-row String data spans entire slab
         let (_, data) = block
@@ -515,6 +541,7 @@ impl OracleStats {
 mod tests {
     use super::*;
     use crate::ops::bridge::FRAME_PREFIX_BYTES;
+    use clickhouse_c::TypeAst;
 
     fn col<'a>(
         ordinal: u32,
@@ -532,10 +559,22 @@ mod tests {
 
     #[test]
     fn request_frames_metadata_then_row_major_cells() {
-        let mut a = OracleColumnBuf::new(1007, -1, "Array(Int32)");
+        let mut a = OracleColumnBuf::new(
+            1007,
+            -1,
+            TypeAst::parse("Array(Int32)", Allocator::global(&mimalloc::MiMalloc))
+                .unwrap()
+                .view(),
+        );
         a.push(OracleCell::DiskRaw(vec![9, 9]));
         a.push(OracleCell::Default);
-        let mut b = OracleColumnBuf::new(3802, -1, "JSON");
+        let mut b = OracleColumnBuf::new(
+            3802,
+            -1,
+            TypeAst::parse("JSON", Allocator::global(&mimalloc::MiMalloc))
+                .unwrap()
+                .view(),
+        );
         b.push(OracleCell::Literal(b"x".to_vec()));
         b.push(OracleCell::TextInput(b"{}".to_vec()));
         let cols = [col(0, "t", "Array(Int32)", &a), col(3, "j", "JSON", &b)];
@@ -585,7 +624,13 @@ mod tests {
 
     #[test]
     fn request_column_bytes_matches_framed_size() {
-        let mut buf = OracleColumnBuf::new(114, -1, "Nullable(JSON)");
+        let mut buf = OracleColumnBuf::new(
+            114,
+            -1,
+            TypeAst::parse("Nullable(JSON)", Allocator::global(&mimalloc::MiMalloc))
+                .unwrap()
+                .view(),
+        );
         buf.push(OracleCell::Default);
         buf.push(OracleCell::DiskRaw(vec![1, 2, 3]));
         let cols = [col(7, "payload", "Nullable(JSON)", &buf)];

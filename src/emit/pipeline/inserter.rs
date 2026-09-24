@@ -303,7 +303,7 @@ mod tests {
             let stats = Arc::new(EmitterStats::default());
             let mut inserter = Inserter {
                 client,
-                alloc: Allocator::stdlib(),
+                alloc: Allocator::global(&mimalloc::MiMalloc),
                 config,
                 asts: HashMap::new(),
                 ack,

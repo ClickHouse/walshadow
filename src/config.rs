@@ -642,7 +642,7 @@ impl ConfigResolver {
                 continue;
             };
             // Validate syntax now, validate wire compatibility with descriptor
-            let accepted = if TypeAst::parse(ty, Allocator::stdlib()).is_ok() {
+            let accepted = if TypeAst::parse(ty, Allocator::global(&mimalloc::MiMalloc)).is_ok() {
                 Some(ty.as_str())
             } else {
                 column_rules.bump_rejections();

@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use crate::catalog::type_bridge::{self, ResolvedColumn};
+use crate::ch::types;
 use crate::column_rules::{ColumnRule, ColumnRules};
 use crate::runtime_config::InitialLoadMode;
 use crate::schema::{RelAttr, RelDescriptor, RelName, SchemaDiff, replident_key_attnums};
@@ -416,16 +417,10 @@ pub fn retyped_target(
 ) -> Option<String> {
     let mut ty = map_column(rel, new, key, rules)?.target_type;
     // ClickHouse cannot cast retained NULLs after PostgreSQL SET NOT NULL
-    if column.target_type.starts_with("Nullable(") && !ty.starts_with("Nullable(") {
+    if types::is_nullable(&column.target_type) && !types::is_nullable(&ty) {
         ty = format!("Nullable({ty})");
     }
     (ty != column.target_type).then_some(ty)
-}
-
-pub fn strip_nullable(ty: &str) -> &str {
-    ty.strip_prefix("Nullable(")
-        .and_then(|t| t.strip_suffix(')'))
-        .unwrap_or(ty)
 }
 
 /// Destination column type change planned from a source type change

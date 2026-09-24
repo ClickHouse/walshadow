@@ -98,9 +98,9 @@ async fn run(
 
 fn resolve_local_columns(batch: &mut InsertBatch, stats: &EmitterStats) {
     let mut n = 0;
-    for (buf, column) in batch.buffers.iter_mut().zip(&batch.meta.columns) {
+    for buf in &mut batch.buffers {
         if let ColumnBuf::Oracle(o) = buf
-            && let Some(local) = literal_column(o, &column.type_repr, batch.n_rows)
+            && let Some(local) = literal_column(o, batch.n_rows)
         {
             *buf = local;
             n += 1;
@@ -266,7 +266,7 @@ mod tests {
                 inserters: 1,
                 flush_timeout: Duration::from_secs(3600),
             },
-            Allocator::stdlib(),
+            Allocator::global(&mimalloc::MiMalloc),
             fatal.clone(),
             Arc::new(EmitterStats::default()),
             None,
@@ -304,7 +304,7 @@ mod tests {
             "premise: an uncovered source type routes to the oracle",
         );
 
-        let alloc = Allocator::stdlib();
+        let alloc = Allocator::global(&mimalloc::MiMalloc);
         assert!(matches!(
             resolve_oracle(&None, alloc, &batch).await,
             Err(OracleError::Absent(_)),
@@ -353,7 +353,7 @@ mod tests {
         assert!(matches!(batch.buffers[0], ColumnBuf::Oracle(_)));
         assert_eq!(stats.oracle_local_columns.load(Ordering::Relaxed), 0);
         assert!(matches!(
-            resolve_oracle(&None, Allocator::stdlib(), &batch).await,
+            resolve_oracle(&None, Allocator::global(&mimalloc::MiMalloc), &batch).await,
             Err(OracleError::Absent(_)),
         ));
     }
