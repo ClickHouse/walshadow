@@ -477,6 +477,22 @@ swapped = false
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dropped_table_backfill_finishes() {
+    if !fx::requirements_available() {
+        return;
+    }
+    for mode in [InitialLoadMode::Copy, InitialLoadMode::ObjectStore] {
+        let fx = Fixture::new().await;
+        let dir = tempfile::tempdir().unwrap();
+        let backfiller = fx.backfiller(dir.path()).await;
+        fx.source.psql_one("DROP TABLE public.t").unwrap();
+        backfiller.note_opt_in(&fx.desc, mode, 100).await;
+        wait_done(&backfiller, dir.path()).await;
+        assert_eq!(fx.backfiller(dir.path()).await.pending_count(), 0);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn failed_backup_defaults_to_copy_at_original_boundary() {
     if !fx::requirements_available() {
         return;

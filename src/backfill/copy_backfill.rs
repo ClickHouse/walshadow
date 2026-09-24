@@ -1464,11 +1464,24 @@ impl CopyBackfiller {
 
     async fn run(self: Arc<Self>, desc: Arc<RelDescriptor>, s_lsn: Pos<Snapshot>) {
         let res = self.copy_once(&desc, s_lsn).await;
+        let dropped = res.is_err() && self.source_dropped(desc.oid).await;
         let mut inner = self.inner.lock().await;
         inner.active.remove(&desc.rel_name);
         match res {
-            Ok(outcome) => {
-                if let Some(entry) = inner.ledger.entries.get_mut(&desc.rel_name) {
+            Err(e) if !dropped => {
+                // Regime A: a failed backfill never poisons the pump. Entry
+                // stays pending; the next boot's seed re-issues COPY at same S
+                tracing::error!(
+                    target: "walshadow::backfill",
+                    qname = %desc.rel_name,
+                    error = %format!("{e:#}"),
+                    "backfill failed; entry stays pending (re-COPY on next boot)",
+                );
+            }
+            res => {
+                if let Some(entry) = inner.ledger.entries.get_mut(&desc.rel_name)
+                    && entry.s_lsn == s_lsn
+                {
                     entry.done = true;
                     entry.copy = None;
                     if let Err(e) = inner.ledger.persist().await {
@@ -1480,28 +1493,40 @@ impl CopyBackfiller {
                         );
                     }
                 }
-                tracing::info!(
-                    target: "walshadow::backfill",
-                    qname = %desc.rel_name,
-                    rows = outcome.rows,
-                    s_lsn = %s_lsn,
-                    p_hi = %format_pg_lsn(outcome.p_hi),
-                    copied = !outcome.skipped_empty,
-                    "backfill complete; converged once WAL apply passes p_hi",
-                );
-            }
-            // Regime A: a failed backfill never poisons the pump. Entry stays
-            // pending; the next boot's seed re-issues COPY at the same S.
-            Err(e) => {
-                tracing::error!(
-                    target: "walshadow::backfill",
-                    qname = %desc.rel_name,
-                    error = %format!("{e:#}"),
-                    "backfill failed; entry stays pending (re-COPY on next boot)",
-                );
+                if let Ok(outcome) = res {
+                    tracing::info!(
+                        target: "walshadow::backfill",
+                        qname = %desc.rel_name,
+                        rows = outcome.rows,
+                        s_lsn = %s_lsn,
+                        p_hi = %format_pg_lsn(outcome.p_hi),
+                        copied = !outcome.skipped_empty,
+                        "backfill complete; converged once WAL apply passes p_hi",
+                    );
+                } else {
+                    tracing::info!(
+                        target: "walshadow::backfill",
+                        qname = %desc.rel_name,
+                        "source table dropped; skipping backfill",
+                    );
+                }
             }
         }
         self.refresh_gauges(&inner.ledger);
+    }
+
+    /// Probe failure reads as present, so entry stays pending
+    async fn source_dropped(&self, oid: u32) -> bool {
+        let Ok(client) = self.open_copy_client().await else {
+            return false;
+        };
+        client
+            .query_one(
+                "SELECT NOT EXISTS (SELECT 1 FROM pg_class WHERE oid = $1)",
+                &[&oid],
+            )
+            .await
+            .is_ok_and(|row| row.get(0))
     }
 
     async fn copy_once(
