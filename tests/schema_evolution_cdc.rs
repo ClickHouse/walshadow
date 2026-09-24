@@ -266,3 +266,57 @@ async fn nullable_add_column_under_replident_index() {
         "explicit NULL stays NULL",
     );
 }
+
+fn column_type(ch: &fx::ChServer, table: &str, col: &str) -> String {
+    ch.query(&format!(
+        "SELECT type FROM system.columns \
+         WHERE database = 'walshadow_test' AND table = '{table}' AND name = '{col}'"
+    ))
+    .expect("ch system.columns")
+}
+
+/// PostgreSQL rewrite rows carry USING results for every live row
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn alter_column_type_converges_through_rewrite() {
+    if skip_gate() {
+        return;
+    }
+    let (source, shadow, ch, _tmp) = run(
+        fx::Ports::alloc(),
+        "se_ty",
+        "walshadow-se-alter-type",
+        "CREATE SCHEMA se_ty;\n",
+        vec![
+            "CREATE TABLE se_ty.t (id bigint PRIMARY KEY, w int NOT NULL, n bigint, s text, \
+             big text)"
+                .into(),
+            // Keep value large enough for PostgreSQL TOAST storage
+            "INSERT INTO se_ty.t VALUES (1, 7, 8, '12', \
+             (SELECT string_agg(md5(i::text), '') FROM generate_series(1, 200) i)), \
+             (2, 5, NULL, 'abc', 'short')"
+                .into(),
+            "SELECT pg_switch_wal()".into(),
+            "ALTER TABLE se_ty.t ALTER COLUMN w TYPE bigint USING w * 10, \
+             ALTER COLUMN n TYPE text USING 'n' || n, ALTER COLUMN s TYPE int USING length(s)"
+                .into(),
+            "INSERT INTO se_ty.t VALUES (3, 5000000000, 'x', 4, 'after')".into(),
+            "SELECT pg_switch_wal()".into(),
+        ],
+        2,
+    )
+    .await;
+    let _src = fx::StopOnDrop { sh: &source };
+    let _shd = fx::StopOnDrop { sh: &shadow };
+
+    assert_eq!(column_type(&ch, "t", "w"), "Int64");
+    assert_eq!(column_type(&ch, "t", "n"), "Nullable(String)");
+    assert_eq!(column_type(&ch, "t", "s"), "Nullable(Int32)");
+    assert_eq!(
+        ch.query(
+            "SELECT w, n, s, length(big) FROM walshadow_test.t FINAL \
+             WHERE _is_deleted = 0 ORDER BY id"
+        )
+        .unwrap(),
+        "70\tn8\t2\t6400\n50\t\\N\t3\t5\n5000000000\tx\t4\t5",
+    );
+}

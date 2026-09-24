@@ -80,16 +80,19 @@ async fn add_column_default_replicates_pre_alter_default() {
                 src_attnum: 1,
                 target_name: "id".into(),
                 target_type: "Int64".into(),
+                type_pinned: false,
             },
             ColumnMapping {
                 src_attnum: 2,
                 target_name: "payload".into(),
                 target_type: "Nullable(String)".into(),
+                type_pinned: false,
             },
             ColumnMapping {
                 src_attnum: 3,
                 target_name: "c".into(),
                 target_type: "Nullable(Int32)".into(),
+                type_pinned: false,
             },
         ],
     }];

@@ -113,6 +113,7 @@ fn pending_table_mapping(
                 src_attnum: base + 1 + i as i16,
                 target_name: (*name).into(),
                 target_type: (*ty).into(),
+                type_pinned: false,
             }),
     );
     TableMapping {
@@ -792,6 +793,7 @@ mod tests {
                 src_attnum: 1,
                 target_name: "id".into(),
                 target_type: "Int32".into(),
+                type_pinned: false,
             }],
         };
         let rel = manifest("t", Vec::new()).rel;

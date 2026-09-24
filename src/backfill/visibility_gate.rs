@@ -769,6 +769,7 @@ mod tests {
                     src_attnum: 1,
                     target_name: "id".into(),
                     target_type: "Int32".into(),
+                    type_pinned: false,
                 }],
             },
         );
@@ -915,12 +916,14 @@ mod tests {
                 src_attnum: 1,
                 target_name: "id".into(),
                 target_type: "Int32".into(),
+                type_pinned: false,
             }];
             if body_mapped {
                 columns.push(ColumnMapping {
                     src_attnum: 2,
                     target_name: "body".into(),
                     target_type: "String".into(),
+                    type_pinned: false,
                 });
             }
             let mapping = TableMapping {

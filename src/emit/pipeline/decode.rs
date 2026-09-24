@@ -178,6 +178,7 @@ mod tests {
                     src_attnum: 1,
                     target_name: "id".into(),
                     target_type: "Int32".into(),
+                    type_pinned: false,
                 }],
             }),
             Arc::default(),

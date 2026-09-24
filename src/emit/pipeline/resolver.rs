@@ -217,6 +217,7 @@ mod tests {
                     src_attnum: 1,
                     target_name: "geom".into(),
                     target_type: "Nullable(String)".into(),
+                    type_pinned: false,
                 }],
             }),
             Arc::default(),

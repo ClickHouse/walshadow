@@ -79,11 +79,13 @@ async fn parallel_pipeline_replicates_dml() {
                 src_attnum: 1,
                 target_name: "id".into(),
                 target_type: "Int32".into(),
+                type_pinned: false,
             },
             ColumnMapping {
                 src_attnum: 2,
                 target_name: "val".into(),
                 target_type: "Nullable(String)".into(),
+                type_pinned: false,
             },
         ],
     }];
@@ -306,16 +308,19 @@ async fn parallel_pipeline_slices_multi_batch_commit() {
                 src_attnum: 1,
                 target_name: "id".into(),
                 target_type: "Int32".into(),
+                type_pinned: false,
             },
             ColumnMapping {
                 src_attnum: 2,
                 target_name: "val".into(),
                 target_type: "Nullable(String)".into(),
+                type_pinned: false,
             },
             ColumnMapping {
                 src_attnum: 3,
                 target_name: "meta".into(),
                 target_type: "Nullable(String)".into(),
+                type_pinned: false,
             },
         ],
     }];

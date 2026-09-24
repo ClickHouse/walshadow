@@ -168,11 +168,13 @@ async fn schema_rename_reroutes_under_new_namespace() {
                 src_attnum: 1,
                 target_name: "id".into(),
                 target_type: "Int64".into(),
+                type_pinned: false,
             },
             ColumnMapping {
                 src_attnum: 2,
                 target_name: "v".into(),
                 target_type: "Nullable(String)".into(),
+                type_pinned: false,
             },
         ],
     }];

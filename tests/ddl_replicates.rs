@@ -91,11 +91,13 @@ async fn alter_add_column_replicates_without_toml_edit() {
                 src_attnum: 1,
                 target_name: "id".into(),
                 target_type: "Int64".into(),
+                type_pinned: false,
             },
             ColumnMapping {
                 src_attnum: 2,
                 target_name: "payload".into(),
                 target_type: "Nullable(String)".into(),
+                type_pinned: false,
             },
             // No `c` here — applicator must auto-extend.
         ],
@@ -425,11 +427,13 @@ async fn pinned_mapping_create_drop_create_recreates_dest() {
                 src_attnum: 1,
                 target_name: "id".into(),
                 target_type: "Int64".into(),
+                type_pinned: false,
             },
             ColumnMapping {
                 src_attnum: 2,
                 target_name: "body".into(),
                 target_type: "Nullable(String)".into(),
+                type_pinned: false,
             },
         ],
     }];

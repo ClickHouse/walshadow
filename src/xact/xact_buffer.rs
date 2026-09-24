@@ -1829,11 +1829,13 @@ impl MergedDrain {
                 // timeline where it covers the position, the commit-time
                 // resolution otherwise (records before the xact's first
                 // command boundary were written under the pre-xact shape,
-                // which bias-early capture already lands there)
+                // which bias-early capture already lands there). PostgreSQL
+                // make_new_heap creates transient pg_temp_<oid>; rewrite swaps
+                // its filenode into owner resolved at commit
                 let (rel, valid_from) = pending
                     .iter()
                     .rev()
-                    .find(|s| s.valid_from <= raw.source_lsn)
+                    .find(|s| s.valid_from <= raw.source_lsn && s.desc.oid == rel.oid)
                     .map_or((rel.clone(), *valid_from), |s| {
                         (s.desc.clone(), s.valid_from)
                     });
@@ -5228,6 +5230,41 @@ mod tests {
             vec![(100, 2, 0x50), (300, 1, 200)],
             "record before the first boundary keeps the commit resolution",
         );
+        drain.finish().await.unwrap();
+    }
+
+    /// PostgreSQL rewriting ALTER transfers transient heap's filenode to owner
+    #[tokio::test(flavor = "current_thread")]
+    async fn raw_rewrite_rows_fold_under_owner() {
+        let tmp = tempdir().unwrap();
+        let mut b = XactBuffer::new(cfg(tmp.path().to_path_buf())).unwrap();
+        let owner = int4_descriptor(16418);
+        let mut transient = (*owner).clone();
+        transient.oid = 16500;
+        transient.rel_name = crate::schema::RelName::new("public", "pg_temp_16418");
+        let rfn = owner.rfn;
+        b.stash_raw(1, multi_insert_raw(1, 100, 16418, &[7]))
+            .await
+            .unwrap();
+        inject_ordinary_pending(
+            &mut b,
+            rfn,
+            owner.clone(),
+            vec![PendingSlot {
+                valid_from: 60,
+                writer_xid: 1,
+                desc: Arc::new(transient),
+            }],
+        );
+        let mut drain = b.drain_committed(1, 42, 0x2000, &[], false).await.unwrap();
+        let batch = drain
+            .next_batch(8, usize::MAX, None)
+            .await
+            .unwrap()
+            .expect("one slice");
+        assert_eq!(batch.heaps.len(), 1);
+        assert_eq!(batch.heaps[0].descriptor.rel_name, owner.rel_name);
+        assert_eq!(batch.heaps[0].descriptor_valid_from, 0x50);
         drain.finish().await.unwrap();
     }
 

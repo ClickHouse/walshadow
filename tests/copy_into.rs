@@ -77,11 +77,13 @@ async fn copy_into_multi_insert_replicates() {
                 src_attnum: 1,
                 target_name: "id".into(),
                 target_type: "Int64".into(),
+                type_pinned: false,
             },
             ColumnMapping {
                 src_attnum: 2,
                 target_name: "name".into(),
                 target_type: "String".into(),
+                type_pinned: false,
             },
         ],
     }];

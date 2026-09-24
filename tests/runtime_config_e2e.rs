@@ -241,11 +241,13 @@ async fn opt_out_mid_stream_drains_and_halts() {
                 src_attnum: 1,
                 target_name: "id".into(),
                 target_type: "Int64".into(),
+                type_pinned: false,
             },
             ColumnMapping {
                 src_attnum: 2,
                 target_name: "note".into(),
                 target_type: "Nullable(String)".into(),
+                type_pinned: false,
             },
         ],
     }];
@@ -836,11 +838,13 @@ async fn column_target_type_override_reaches_projection() {
                 src_attnum: 1,
                 target_name: "id".into(),
                 target_type: "Int64".into(),
+                type_pinned: false,
             },
             ColumnMapping {
                 src_attnum: 2,
                 target_name: "amount".into(),
                 target_type: "Decimal(38, 0)".into(),
+                type_pinned: false,
             },
         ],
     }];

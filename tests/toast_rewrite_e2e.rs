@@ -140,16 +140,19 @@ async fn vacuum_full_rewrite_and_same_xact_stash() {
                 src_attnum: 1,
                 target_name: "id".into(),
                 target_type: "Int32".into(),
+                type_pinned: false,
             },
             ColumnMapping {
                 src_attnum: 2,
                 target_name: "meta".into(),
                 target_type: "Nullable(String)".into(),
+                type_pinned: false,
             },
             ColumnMapping {
                 src_attnum: 3,
                 target_name: "body".into(),
                 target_type: "Nullable(String)".into(),
+                type_pinned: false,
             },
         ],
     }];
@@ -478,7 +481,7 @@ async fn alter_rewrite_link_swap_retires_old_mirror() {
         shadow_stream_state,
     ) = fx::bootstrap_clusters(
         &tmp,
-        "CREATE TABLE public.doc (id int PRIMARY KEY, body text);\n\
+        "CREATE TABLE public.doc (id int PRIMARY KEY, n int, body text);\n\
          ALTER TABLE public.doc ALTER COLUMN body SET STORAGE EXTERNAL;\n",
         slot.source,
         slot.shadow,
@@ -522,8 +525,8 @@ async fn alter_rewrite_link_swap_retires_old_mirror() {
     let driver = fx::spawn_workload(
         &source,
         vec![
-            format!("INSERT INTO public.doc VALUES (1, {BODY_B_SQL})"),
-            format!("INSERT INTO public.doc VALUES (2, {BODY_C_SQL})"),
+            format!("INSERT INTO public.doc (id, body) VALUES (1, {BODY_B_SQL})"),
+            format!("INSERT INTO public.doc (id, body) VALUES (2, {BODY_C_SQL})"),
             "SELECT pg_switch_wal()".into(),
         ],
     );
@@ -545,7 +548,7 @@ async fn alter_rewrite_link_swap_retires_old_mirror() {
     let driver = fx::spawn_workload(
         &source,
         vec![
-            "ALTER TABLE public.doc ALTER COLUMN id TYPE bigint".into(),
+            "ALTER TABLE public.doc ALTER COLUMN n TYPE bigint".into(),
             "SELECT pg_switch_wal()".into(),
         ],
     );

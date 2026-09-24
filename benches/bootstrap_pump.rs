@@ -139,6 +139,7 @@ fn mapping(filenode: u32, columns: usize) -> TableMapping {
                 src_attnum: i as i16 + 1,
                 target_name: format!("c{i}"),
                 target_type: "Int32".into(),
+                type_pinned: false,
             })
             .collect(),
     }

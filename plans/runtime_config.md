@@ -41,9 +41,73 @@ Test restart and failover with config changes, including settings present only
 on an abandoned branch. Resolve against timeline history, not a bare numeric
 LSN comparison across branches
 
+## Complete destination table definition
+
+Accept complete destination `CREATE TABLE` definitions, including
+column types and clauses, codecs, engine arguments, sorting and primary keys,
+partitioning, sampling, TTL, indexes, projections, and table `SETTINGS`. Preserve
+configured clauses beyond existing mapping fields
+Support both TOML and source config tables
+
+Choose one canonical interface, such as a `create_table` SQL field
+alongside source-to-target mappings. Define interaction with existing structured
+table and column options: reject conflicts or define explicit precedence. Keep
+structured column tuning useful when operators prefer generated DDL
+
+Parse and validate one `CREATE TABLE` statement before executing DDL. Bind
+destination identity explicitly and define handling of database names, cluster
+clauses, and object references. Reject unsupported statement forms with actionable
+diagnostics. Validate mapped columns, writable and computed columns, defaults
+for omitted columns, system columns, and engine/key requirements for replication
+
+Derive wire types from declared columns and check source conversions independently
+of storage clauses. Preserve accepted definition in resolved config snapshots
+used by streaming and initial loads. If bootstrap uses staging tables, define
+how staging and final publication preserve configured schema and settings
+
+Define behavior for an existing destination: compare semantic definitions and
+report drift. `CREATE IF NOT EXISTS` does not validate existing schema. Coordinate
+config edits and source schema changes with [schema planning](schema.md). Classify
+each difference as supported ALTER, explicit migration, or rejection; never drop
+and recreate populated tables implicitly. Preserve ordered application and replay
+behavior across partial DDL failures
+
+Test complete definitions through creation, existing-table validation, backfill,
+source schema evolution, reload, and restart. Check destination metadata as well
+as replicated insert/update/delete results. Cover conflicting config fields,
+unsupported clauses, and invalid mappings before publishing new routing
+
+## Target type and column tuning
+
+Extend column rules beyond target name and target type with destination storage
+tuning, starting with `CODEC` for `String` and other compatible types. Expose
+matching controls in TOML and source config tables, with existing pattern
+matching, precedence, and effective-value diagnostics
+
+Keep target type available independently for type validation and wire encoding
+Represent codec chains and parameters as separate column metadata rather than
+appending unchecked SQL to target type. Evaluate further column options, such
+as column `SETTINGS` and TTL, individually with explicit supported scope
+
+Define inheritance, explicit reset to destination defaults, and invalid-value
+behavior. Validate codec names, parameters, chains, and type compatibility
+against supported ClickHouse versions before publishing config. Distinguish
+column storage codecs from INSERT wire compression
+
+Carry resolved tuning through CREATE TABLE and ADD COLUMN. Coordinate changes
+to existing columns with [schema planning](schema.md): define supported ALTER
+operations, commit ordering, retry behavior, and operator action for unsupported
+changes. State whether changes affect future parts or require explicit rewriting
+of existing data; do not silently schedule mutations
+
+Test string codecs, parameterized codec chains, incompatible
+types, precedence and reset, generated DDL, existing-table changes, and restart
+or replay after partial DDL failure. Verify destination metadata and unchanged
+replicated values. Document syntax and migration behavior once implemented
+
 ## Additional settings
 
-Evaluate per-query ClickHouse settings, engine selection, column exclusion, and
+Evaluate per-query ClickHouse settings, column exclusion, and
 per-table truncate policy only where current rules cannot express required
 behavior. Creation-time settings must not pretend to migrate existing tables
 Validate unsupported changes before routing new rows
