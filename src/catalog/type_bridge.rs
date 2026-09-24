@@ -42,6 +42,7 @@
 //! `ADD COLUMN` defaults with [`column_value_to_sql_literal`]
 
 use crate::ascii_buf::{AsciiArray, AsciiBuf};
+use crate::ch::types;
 use crate::decode::codecs::{format_time_us, timetz_to_text};
 use crate::decode::heap_decoder::{self, ColumnValue};
 use crate::schema::{
@@ -49,6 +50,7 @@ use crate::schema::{
     INT2OID, INT4OID, INT8OID, INTERVALOID, JSONBOID, JSONOID, NAMEOID, NUMERICOID, OIDOID,
     RelAttr, TEXTOID, TIMEOID, TIMESTAMPOID, TIMESTAMPTZOID, TIMETZOID, UUIDOID, VARCHAROID,
 };
+use clickhouse_c::{Allocator, Kind, TypeAst};
 use walrus::time::civil_from_days;
 
 /// PG `VARHDRSZ`, 4-byte varlena header, used by `typmod` packing
@@ -75,8 +77,9 @@ pub enum BridgeError {
 /// `pk_member = true` forces non-nullable: CH refuses `Nullable` in `ORDER BY`
 pub fn map(att: &RelAttr, pk_member: bool) -> Result<ResolvedColumn, BridgeError> {
     let inner = base_type_for(att)?;
-    let nullable =
-        !pk_member && !att.not_null && !inner.starts_with("Array(") && !inner.starts_with("Map(");
+    let nullable = !pk_member
+        && !att.not_null
+        && !matches!(types::kind(&inner), Some(Kind::Array | Kind::Map));
     let ch_type = if nullable {
         format!("Nullable({inner})")
     } else {
@@ -218,7 +221,12 @@ pub fn column_value_to_sql_literal(v: &ColumnValue, ch_inner: &str) -> Option<St
             use crate::decode::codecs::NumericKind;
             match n {
                 NumericKind::Finite(s) => {
-                    if ch_inner.starts_with("Decimal(") {
+                    if matches!(
+                        types::kind(ch_inner),
+                        Some(
+                            Kind::Decimal32 | Kind::Decimal64 | Kind::Decimal128 | Kind::Decimal256
+                        )
+                    ) {
                         Some(s.clone())
                     } else {
                         Some(sql_string_literal(s))
@@ -244,7 +252,7 @@ pub fn column_value_to_sql_literal(v: &ColumnValue, ch_inner: &str) -> Option<St
         }
         ColumnValue::Timestamp(micros) | ColumnValue::TimestampTz(micros) => {
             let txt = render_pg_timestamp(*micros);
-            let prec = parse_datetime64_precision(ch_inner).unwrap_or(6);
+            let prec = datetime64_scale(ch_inner).unwrap_or(6);
             Some(format!(
                 "toDateTime64({}, {prec}, 'UTC')",
                 sql_string_literal(&txt)
@@ -306,10 +314,10 @@ fn render_pg_timestamp(pg_micros: i64) -> AsciiBuf<32> {
     out
 }
 
-fn parse_datetime64_precision(inner: &str) -> Option<i32> {
-    let body = inner.strip_prefix("DateTime64(")?;
-    let comma = body.find(',')?;
-    body[..comma].trim().parse::<i32>().ok()
+fn datetime64_scale(ch_inner: &str) -> Option<i32> {
+    let ast = TypeAst::parse(ch_inner, Allocator::global(&mimalloc::MiMalloc)).ok()?;
+    let view = ast.view();
+    (view.kind() == Some(Kind::DateTime64)).then(|| view.datetime64_scale())
 }
 
 fn format_uuid(b: &[u8; 16]) -> AsciiArray<36> {

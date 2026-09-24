@@ -13,6 +13,7 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use clickhouse_c::{Allocator, TypeAst};
 use tokio_postgres::{Client, NoTls};
 use walshadow::bridge::{
     AttributeRow, Bridge, BridgeError, Catalog, ClassRow, IndexRow, NamespaceRow,
@@ -191,7 +192,7 @@ async fn bytes_through_oracle(bridge: Arc<Bridge>, items: &[(u32, &[u8])]) -> Ve
     let bufs: Vec<OracleColumnBuf> = items
         .iter()
         .map(|(oid, raw)| {
-            let mut b = OracleColumnBuf::new(*oid, -1, "String");
+            let mut b = OracleColumnBuf::string(*oid, -1);
             b.push(OracleCell::DiskRaw(raw.to_vec()));
             b
         })
@@ -213,7 +214,7 @@ async fn bytes_through_oracle(bridge: Arc<Bridge>, items: &[(u32, &[u8])]) -> Ve
             Oracle::ANY_DATABASE,
             &columns,
             1,
-            clickhouse_c::Allocator::stdlib(),
+            clickhouse_c::Allocator::global(&mimalloc::MiMalloc),
         )
         .await
         .expect("oracle answers");
@@ -367,7 +368,7 @@ async fn bridge_native_strings_match_typoutput() {
         (2_147_483_647, &[0x00]),
     ];
     for (oid, raw) in bad {
-        let mut b = OracleColumnBuf::new(oid, -1, "String");
+        let mut b = OracleColumnBuf::string(oid, -1);
         b.push(OracleCell::DiskRaw(raw.to_vec()));
         let columns = [OracleRequestColumn {
             ordinal: 0,
@@ -381,7 +382,7 @@ async fn bridge_native_strings_match_typoutput() {
                     Oracle::ANY_DATABASE,
                     &columns,
                     1,
-                    clickhouse_c::Allocator::stdlib()
+                    clickhouse_c::Allocator::global(&mimalloc::MiMalloc)
                 )
                 .await
                 .is_err(),
@@ -1310,7 +1311,16 @@ async fn bridge_native_hstore_expander_requires_extension_membership() {
     let oid = oid_of_type(&sql, "hstore").await;
     let bridge = Arc::new(dial(&guard.sh).await);
     let oracle = Oracle::new(bridge.clone());
-    let mut buf = OracleColumnBuf::new(oid, -1, "Map(String, Nullable(String))");
+    let mut buf = OracleColumnBuf::new(
+        oid,
+        -1,
+        TypeAst::parse(
+            "Map(String, Nullable(String))",
+            Allocator::global(&mimalloc::MiMalloc),
+        )
+        .unwrap()
+        .view(),
+    );
     buf.push(OracleCell::TextInput(br#""a"=>"one", "b"=>NULL"#.to_vec()));
     buf.push(OracleCell::Default);
     let columns = [OracleRequestColumn {
@@ -1330,7 +1340,7 @@ async fn bridge_native_hstore_expander_requires_extension_membership() {
                 Oracle::ANY_DATABASE,
                 &columns,
                 2,
-                clickhouse_c::Allocator::stdlib(),
+                clickhouse_c::Allocator::global(&mimalloc::MiMalloc),
             )
             .await;
         if attached {
@@ -1551,7 +1561,7 @@ async fn bridge_worker_pool_serves_concurrent_requests() {
     // dispatched, which is the state a shared slot would have to serialize
     const ROWS: usize = 10_000;
     let cells = Arc::new({
-        let mut b = OracleColumnBuf::new(NUMERICOID, -1, "String");
+        let mut b = OracleColumnBuf::string(NUMERICOID, -1);
         for _ in 0..ROWS {
             b.push(OracleCell::DiskRaw(numeric_42()));
         }
@@ -1576,7 +1586,7 @@ async fn bridge_worker_pool_serves_concurrent_requests() {
                         Oracle::ANY_DATABASE,
                         &columns,
                         cells.cells().len(),
-                        clickhouse_c::Allocator::stdlib(),
+                        clickhouse_c::Allocator::global(&mimalloc::MiMalloc),
                     )
                     .await
                     .expect("oracle answers")

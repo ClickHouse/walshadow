@@ -300,7 +300,7 @@ pub fn needs_oracle(
     tables: &MappingSnapshot,
     column_rules: &ColumnRules,
 ) -> bool {
-    let alloc = Allocator::stdlib();
+    let alloc = Allocator::global(&mimalloc::MiMalloc);
     let system = SystemColumns::default();
     catalog.descriptors().any(|desc| {
         tables.get(&desc.rel_name).is_some_and(|mapping| {
@@ -450,7 +450,7 @@ mod tests {
         mapping.columns[0].target_type = "NotAType".into();
         assert!(
             TablePlan::build(
-                Allocator::stdlib(),
+                Allocator::global(&mimalloc::MiMalloc),
                 &desc,
                 mapping,
                 &rules,

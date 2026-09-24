@@ -11,6 +11,7 @@ use thiserror::Error;
 
 #[cfg(test)]
 pub(crate) mod test_support;
+pub mod types;
 
 #[derive(Debug, Error)]
 pub enum EmitterError {

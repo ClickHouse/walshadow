@@ -24,10 +24,13 @@ use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::Duration;
 
+use clickhouse_c::Kind;
 use tokio::sync::watch;
 
 use crate::catalog::type_bridge::{self, ResolvedColumn};
-use crate::ch::{ChConn, EmitterError, connect_client, exec_drain, is_retryable, quote_ident};
+use crate::ch::{
+    ChConn, EmitterError, connect_client, exec_drain, is_retryable, quote_ident, types,
+};
 use crate::column_rules::ColumnRules;
 use crate::config::{ConfigResolver, ResolvedConfig};
 use crate::decode::heap_decoder::{self, ColumnValue};
@@ -35,7 +38,7 @@ use crate::emit::ch_emitter::{EmitterConfig, RetryConfig};
 use crate::mapping::{
     ColumnMapping, DropTableStrategy, MappingHandle, MappingSnapshot, NamespaceMapping, Retype,
     RetypeKind, SystemColumns, TableMapping, TableTarget, TargetOwners, apply_column_rule,
-    derive_columns_for_mapping, fold_diff_into_mapping, retyped_target, strip_nullable,
+    derive_columns_for_mapping, fold_diff_into_mapping, retyped_target,
 };
 use crate::ops::oracle::{Oracle, OracleCell};
 use crate::schema::{
@@ -846,7 +849,8 @@ fn plan_retypes(
         let Some(target_type) = retyped_target(&new.rel_name, column, attr, key, rules) else {
             continue;
         };
-        let infallible = (is_int(old) && is_int(attr)) || strip_nullable(&target_type) == "String";
+        let infallible =
+            (is_int(old) && is_int(attr)) || types::inner_kind(&target_type) == Some(Kind::String);
         retypes.push(Retype {
             src_attnum: attr.attnum,
             target_name: column.target_name.clone(),
@@ -1083,11 +1087,6 @@ fn orderable_system<'a>(sys: &'a SystemColumns, orderable: &mut HashMap<&'a str,
     }
 }
 
-/// ClickHouse rejects Nullable columns in a sorting key
-fn is_nullable(ch_type: &str) -> bool {
-    ch_type.starts_with("Nullable(")
-}
-
 /// `CREATE TABLE IF NOT EXISTS` for an autodiscovered relation. `None`
 /// when a column's type can't be bridged; caller logs + skips.
 pub fn render_create_table(
@@ -1129,14 +1128,14 @@ pub fn render_create_table(
     let mut orderable: HashMap<&str, bool> = HashMap::default();
     orderable_system(&shape.system, &mut orderable);
     for (_, name, r) in &cols {
-        orderable.insert(name, is_nullable(&r.ch_type));
+        orderable.insert(name, types::is_nullable(&r.ch_type));
     }
     // ClickHouse rejects Nullable columns in ORDER BY
     let derived: Vec<String> = pk_attnums
         .iter()
         .filter_map(|a| {
             cols.iter()
-                .find(|(attnum, _, r)| attnum == a && !is_nullable(&r.ch_type))
+                .find(|(attnum, _, r)| attnum == a && !types::is_nullable(&r.ch_type))
                 .map(|(_, name, _)| quote_ident(name))
         })
         .collect();
@@ -1195,7 +1194,7 @@ pub fn render_create_table_from_mapping(
     let mut orderable: HashMap<&str, bool> = HashMap::default();
     orderable_system(&shape.system, &mut orderable);
     for c in &mapping.columns {
-        orderable.insert(&c.target_name, is_nullable(&c.target_type));
+        orderable.insert(&c.target_name, types::is_nullable(&c.target_type));
     }
     let derived: Vec<String> = replident_key_attnums(desc)
         .iter()
@@ -1203,7 +1202,7 @@ pub fn render_create_table_from_mapping(
             mapping
                 .columns
                 .iter()
-                .find(|c| c.src_attnum == *a && !is_nullable(&c.target_type))
+                .find(|c| c.src_attnum == *a && !types::is_nullable(&c.target_type))
                 .map(|c| quote_ident(&c.target_name))
         })
         .collect();

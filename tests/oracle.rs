@@ -89,13 +89,13 @@ async fn oracle_on(sh: &Shadow) -> Oracle {
 }
 
 fn alloc() -> Allocator {
-    Allocator::stdlib()
+    Allocator::global(&mimalloc::MiMalloc)
 }
 
 fn buf(oid: u32, cells: Vec<OracleCell>) -> OracleColumnBuf {
     // Every request here names its own target; the buffer's copy only steers
     // local rendering, which these cases ask the worker for regardless
-    let mut b = OracleColumnBuf::new(oid, -1, "String");
+    let mut b = OracleColumnBuf::string(oid, -1);
     for c in cells {
         b.push(c);
     }

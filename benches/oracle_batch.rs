@@ -191,7 +191,7 @@ fn start_shadow(tmp: &tempfile::TempDir, lib_dir: PathBuf, workers: usize) -> St
 }
 
 fn cells(oid: u32, body: &[u8], rows: usize, literal: bool) -> OracleColumnBuf {
-    let mut buf = OracleColumnBuf::new(oid, -1, "String");
+    let mut buf = OracleColumnBuf::string(oid, -1);
     for _ in 0..rows {
         buf.push(if literal {
             OracleCell::Literal(body.to_vec())
@@ -211,7 +211,12 @@ async fn one_batch(oracle: &Oracle, buf: &OracleColumnBuf, rows: usize) -> Durat
     }];
     let started = Instant::now();
     let block = oracle
-        .encode_batch(Oracle::ANY_DATABASE, &columns, rows, Allocator::stdlib())
+        .encode_batch(
+            Oracle::ANY_DATABASE,
+            &columns,
+            rows,
+            Allocator::global(&mimalloc::MiMalloc),
+        )
         .await
         .expect("oracle answers");
     let elapsed = started.elapsed();
