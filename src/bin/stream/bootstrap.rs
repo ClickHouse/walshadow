@@ -257,9 +257,12 @@ pub(crate) async fn run_bootstrap(
     let shadow_toast_bridge = walshadow::toast::shadow_store::LateBridge::default();
     // Shadow starts before backup WAL processing needs value lookups, so the
     // store reads through a cell this frame binds later
-    let resolver = match &ch_config {
-        Some(cfg) => ToastResolver::for_mode(
-            cfg,
+    let boot_dest = ch_config
+        .as_ref()
+        .map(|cfg| walshadow::config::DestEmitter::new(Arc::new(cfg.clone()), None));
+    let resolver = match (&ch_config, &boot_dest) {
+        (Some(cfg), Some(dest)) => ToastResolver::for_mode(
+            dest.clone(),
             bootstrap_stats.clone(),
             // Backup replay has no pump to sample xid ceilings
             Some(shadow_toast_bridge.clone().into()),
@@ -268,7 +271,7 @@ pub(crate) async fn run_bootstrap(
         .with_budget(walshadow::budget::MemoryBudget::new(
             cfg.resident_payload_max,
         )),
-        None => ToastResolver::disabled(),
+        _ => ToastResolver::disabled(),
     };
     let store_toast = resolver.stores_chunks();
 
@@ -495,6 +498,9 @@ pub(crate) async fn run_bootstrap(
             c.byte_budget = (c.byte_budget / lanes).max(8 << 20);
             c
         };
+        let lane_dest = walshadow::config::DestEmitter::new(Arc::new(lane_cfg.clone()), None);
+        let bootstrap_dest =
+            walshadow::config::DestEmitter::new(Arc::new(emitter_cfg.clone()), None);
 
         // Throwaway watermark: durability proof is `wait_through(K)`, resume
         // LSN is carried via the WAL pipeline's emitter_ack seed (see `run`),
@@ -503,7 +509,7 @@ pub(crate) async fn run_bootstrap(
         for inserters in &per_lane {
             tails.push(
                 OwnedTail::spawn(
-                    &lane_cfg,
+                    lane_dest.clone(),
                     *inserters,
                     stats.clone(),
                     fatal.clone(),
@@ -528,7 +534,7 @@ pub(crate) async fn run_bootstrap(
         // Run WAL window beside page walk when user relations exist
         let mut window_cfg = (!drain_catalog.is_empty()).then(|| {
             walshadow::backfill::bootstrap_window::WindowLegConfig {
-                emitter: emitter_cfg.clone(),
+                dest: bootstrap_dest.clone(),
                 mapping: mapping.clone(),
                 config: resolved.clone(),
                 stats: stats.clone(),
@@ -553,7 +559,7 @@ pub(crate) async fn run_bootstrap(
             catalog: drain_catalog.clone(),
             mapping: routes,
             config: resolved.clone(),
-            emitter: emitter_cfg.clone(),
+            dest: bootstrap_dest.clone(),
             stats: stats.clone(),
             resolver: resolver.clone(),
             skip_initial,
@@ -1238,10 +1244,14 @@ pub(crate) async fn bootstrap_build_mapping(
     };
     // Publish rule-adjusted targets before creating tables
     mapping.publish(merged_tables).await;
-    let mut applicator =
-        walshadow::ch_ddl::DdlApplicator::new(emitter_cfg, ddl_cfg, mapping.clone(), config_rx)
-            .await
-            .context("bootstrap: init DDL applicator")?;
+    let mut applicator = walshadow::ch_ddl::DdlApplicator::new(
+        walshadow::config::DestEmitter::new(Arc::new(emitter_cfg.clone()), Some(config_rx.clone())),
+        ddl_cfg,
+        mapping.clone(),
+        config_rx,
+    )
+    .await
+    .context("bootstrap: init DDL applicator")?;
     for desc in catalog.descriptors() {
         applicator
             .apply(&SchemaEvent::Added { desc: desc.clone() })

@@ -910,7 +910,9 @@ async fn build_pipeline_inner(
         emitter_cfg.replicate_all,
         emitter_cfg.runtime_config_schema.clone(),
     );
-    let applicator = DdlApplicator::new(&emitter_cfg, ddl_cfg, mapping.clone(), config_rx.clone())
+    let dest =
+        walshadow::config::DestEmitter::new(Arc::new(emitter_cfg.clone()), Some(config_rx.clone()));
+    let applicator = DdlApplicator::new(dest.clone(), ddl_cfg, mapping.clone(), config_rx.clone())
         .await
         .expect("ddl applicator init")
         .with_resolver(config_resolver.clone())
@@ -942,7 +944,7 @@ async fn build_pipeline_inner(
             Some(Arc::new(
                 walshadow::copy_backfill::CopyBackfiller::new(
                     pgcfg.clone(),
-                    emitter_cfg.clone(),
+                    dest.clone(),
                     mapping.clone(),
                     stats.clone(),
                     catalog.clone(),
@@ -972,6 +974,7 @@ async fn build_pipeline_inner(
         catalog: catalog.clone(),
         desc_log: desc_log.clone(),
         emitter: Arc::new(emitter_cfg.clone()),
+        dest: dest.clone(),
         mapping,
         resolver: Some(config_resolver.clone()),
         config_rx: Some(config_rx.clone()),

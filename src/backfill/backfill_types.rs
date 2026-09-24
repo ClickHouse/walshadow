@@ -9,7 +9,7 @@ use crate::budget::MemoryBudget;
 use crate::catalog::desc_log::DescriptorLog;
 use crate::catalog::shadow_catalog::ShadowCatalog;
 use crate::config::ResolvedConfig;
-use crate::emit::ch_emitter::{EmitterConfig, EmitterStats};
+use crate::emit::ch_emitter::EmitterStats;
 use crate::mapping::MappingHandle;
 use crate::ops::oracle::Oracle;
 use crate::schema::RelDescriptor;
@@ -23,7 +23,7 @@ pub struct BackupRequest {
 
 pub struct PassContext {
     pub pg: PgConfig,
-    pub emitter: Arc<EmitterConfig>,
+    pub dest: Arc<crate::config::DestEmitter>,
     /// Routing for this pass's rows; staging targets while a pass is
     /// unpublished
     pub mapping: MappingHandle,

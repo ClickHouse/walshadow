@@ -28,7 +28,7 @@ use crate::catalog::pending::PendingCatalog;
 use crate::decode::heap_decoder::{DescribedHeap, HeapOp};
 use crate::decode::visibility::{PgXactPatch, PgXactView, read_pg_xact};
 use crate::emit::ch_ddl::DdlApplicator;
-use crate::emit::ch_emitter::{EmitterConfig, EmitterStats};
+use crate::emit::ch_emitter::EmitterStats;
 use crate::record::{Record, RecordSink, SinkError};
 use crate::schema::{RelDescriptor, RelName, SchemaEvent};
 use ahash::{HashMap, HashMapExt, HashSet, HashSetExt};
@@ -106,8 +106,8 @@ pub struct ReorderSink {
     pending_rows: SharedPendingLedger,
     /// Control connection for the settle statements, opened on first hit
     pending_session: Option<StagingSession>,
-    /// Whole emitter config, kept for that lazy connect
-    emitter: Arc<EmitterConfig>,
+    /// Live destination for that lazy connect
+    dest: Arc<crate::config::DestEmitter>,
     /// Persisted resolved floor (aligned, archive-clamped) — the position
     /// a crash-now restart resumes from. Seeded at the resolved start,
     /// advanced only after each manifest persist.
@@ -162,7 +162,7 @@ impl ReorderSink {
         budget: Option<crate::budget::MemoryBudget>,
         retires: RetireLedger,
         pending_rows: SharedPendingLedger,
-        emitter: Arc<EmitterConfig>,
+        dest: Arc<crate::config::DestEmitter>,
         resume_floor: Arc<Monotone<Floor>>,
     ) -> Self {
         // subscribe() marks the current value seen, so a `ctl reload`
@@ -213,7 +213,7 @@ impl ReorderSink {
             retires,
             pending_rows,
             pending_session: None,
-            emitter,
+            dest,
             resume_floor,
             route_mapping: None,
             route_config: None,
@@ -622,7 +622,7 @@ impl ReorderSink {
         }
         if self.pending_session.is_none() {
             self.pending_session = Some(
-                StagingSession::connect(self.emitter.clone())
+                StagingSession::connect(self.dest.clone())
                     .await
                     .map_err(|e| SinkError::Other(format!("pending visibility: connect: {e}")))?,
             );
@@ -783,7 +783,7 @@ impl ReorderSink {
             self.ack.register_partial(seq, commit_lsn);
         }
         self.stats.queue_jobs_out.fetch_add(1, Ordering::Relaxed);
-        let chunk_rows = self.emitter.decode_chunk_rows;
+        let chunk_rows = self.dest.current().decode_chunk_rows;
         let rows = tokio::select! {
             biased;
             _ = self.fatal.wait() => return Err(self.fatal_err()),

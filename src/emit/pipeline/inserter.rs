@@ -16,8 +16,8 @@ use clickhouse_c::{Allocator, BlockBuilder, ColumnBuilder, TypeAst};
 use tokio::task::JoinHandle;
 
 use crate::ch::{ChConn, EmitterError, drain_to_end_of_stream, with_timeout};
-use crate::config::ResolvedConfig;
-use crate::emit::ch_emitter::{ColumnBuf, EmitterConfig, EmitterStats, build_leaf, build_root};
+use crate::config::DestEmitter;
+use crate::emit::ch_emitter::{ColumnBuf, EmitterStats, build_leaf, build_root};
 use crate::emit::pipeline::Fatal;
 use crate::emit::pipeline::ack::AckHandle;
 use crate::emit::pipeline::batcher::BatchMeta;
@@ -26,22 +26,16 @@ use crate::schema::TableKey;
 use ahash::{HashMap, HashMapExt};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use tokio::sync::watch;
 
 struct Inserter {
     client: ChConn,
     alloc: Allocator,
-    config: EmitterConfig,
     /// Parsed column types per table, refreshed when a batch's `schema_epoch`
     /// changes. `TypeAst` is `Send` but not `Sync`, so each inserter parses
     /// its own.
     asts: HashMap<TableKey, (u64, Vec<TypeAst>)>,
     ack: AckHandle,
     stats: Arc<EmitterStats>,
-    /// Live emitter knobs. `Some` with the overlay active: retry budget +
-    /// compression are re-read at each batch boundary (a compression change
-    /// reconnects, since the codec is fixed at connect).
-    config_rx: Option<watch::Receiver<Arc<ResolvedConfig>>>,
 }
 
 impl Inserter {
@@ -61,14 +55,6 @@ impl Inserter {
         Ok(())
     }
 
-    async fn reconnect(&mut self) -> Result<(), EmitterError> {
-        self.client.dial(&self.config).await?;
-        self.stats
-            .reconnects
-            .fetch_add(self.client.take_dials(), Ordering::Relaxed);
-        Ok(())
-    }
-
     /// Bounded reconnect+retry around one prepared INSERT. Only `bb`
     /// (`Send + Sync`) and `self` cross the awaits, never a bare `&TypeAst`
     /// (`!Sync`), so the task future stays `Send`. The block is unchanged
@@ -78,13 +64,11 @@ impl Inserter {
         sql: &str,
         bb: &BlockBuilder<'_>,
     ) -> Result<(), EmitterError> {
-        let insert_timeout = self.config.insert_timeout;
+        let insert_timeout = self.client.config().insert_timeout;
         let started = std::time::Instant::now();
         let result = self
             .client
             .retry(
-                &self.config,
-                self.config.retry.backoff(),
                 |mut client| async move {
                     let result = with_timeout(insert_timeout, async {
                         client.send_query(sql, None).await?;
@@ -114,58 +98,6 @@ impl Inserter {
 
     async fn run(mut self, rx: async_channel::Receiver<ResolvedBatch>, fatal: Fatal) {
         while let Ok(ResolvedBatch { batch, resolved }) = rx.recv().await {
-            // Live emitter knobs (overlay active): pick up the retry budget and
-            // compression. A compression change needs a fresh client — the codec
-            // is fixed at connect — reconnected here at a batch boundary, never
-            // mid-INSERT. Snapshot into owned values first so no watch borrow is
-            // held across the reconnect's `&mut self`.
-            let live = self.config_rx.as_ref().map(|rx| {
-                let r = rx.borrow();
-                (
-                    r.retry_max_attempts,
-                    r.compression,
-                    (
-                        r.host.clone(),
-                        r.port,
-                        r.database.clone(),
-                        r.user.clone(),
-                        r.password.clone(),
-                        r.secure,
-                    ),
-                )
-            });
-            if let Some((retry_max, compression, (host, port, database, user, password, secure))) =
-                live
-            {
-                self.config.retry.max_attempts = retry_max;
-                // A compression or connection change needs a fresh client (codec
-                // + socket are fixed at connect) — reconnect at the batch
-                // boundary, never mid-INSERT.
-                let mut need_reconnect = false;
-                if compression != self.config.compression {
-                    self.config.compression = compression;
-                    need_reconnect = true;
-                }
-                if host != self.config.host
-                    || port != self.config.port
-                    || database != self.config.database
-                    || user != self.config.user
-                    || password != self.config.password
-                    || secure != self.config.secure
-                {
-                    self.config.host = host;
-                    self.config.port = port;
-                    self.config.database = database;
-                    self.config.user = user;
-                    self.config.password = password;
-                    self.config.secure = secure;
-                    need_reconnect = true;
-                }
-                if need_reconnect && let Err(e) = self.reconnect().await {
-                    fatal.set(format!("inserter live-config reconnect: {e}"));
-                    break;
-                }
-            }
             if let Err(e) = self.ensure_asts(&batch.meta) {
                 fatal.set(format!("inserter type parse: {e}"));
                 break;
@@ -255,30 +187,23 @@ impl Inserter {
     }
 }
 
-pub(crate) struct PoolOptions {
-    pub config_rx: Option<watch::Receiver<Arc<ResolvedConfig>>>,
-}
-
 /// Connect `n` inserters and spawn drain loops
 pub(crate) async fn spawn_pool(
     n: usize,
-    config: &EmitterConfig,
+    dest: Arc<DestEmitter>,
     rx: async_channel::Receiver<ResolvedBatch>,
     ack: AckHandle,
     stats: Arc<EmitterStats>,
     fatal: Fatal,
-    options: PoolOptions,
 ) -> Result<Vec<JoinHandle<()>>, EmitterError> {
     let mut handles = Vec::with_capacity(n.max(1));
     for _ in 0..n.max(1) {
         let inserter = Inserter {
-            client: ChConn::connect(config).await?,
+            client: ChConn::connect(dest.clone()).await?,
             alloc: Allocator::global(&mimalloc::MiMalloc),
-            config: config.clone(),
             asts: HashMap::new(),
             ack: ack.clone(),
             stats: stats.clone(),
-            config_rx: options.config_rx.clone(),
         };
         let rx = rx.clone();
         let fatal = fatal.clone();
@@ -298,17 +223,16 @@ mod tests {
         for (retries, idle) in [(0, false), (1, false), (2, false), (1, true)] {
             let (config, server) =
                 crate::ch::test_support::retry_server(retries, sql, true, idle).await;
-            let client = ChConn::connect(&config).await.unwrap();
+            let dest = DestEmitter::new(Arc::new(config), None);
+            let client = ChConn::connect(dest).await.unwrap();
             let (ack, collector) = ack::spawn(Arc::default(), Fatal::new());
             let stats = Arc::new(EmitterStats::default());
             let mut inserter = Inserter {
                 client,
                 alloc: Allocator::global(&mimalloc::MiMalloc),
-                config,
                 asts: HashMap::new(),
                 ack,
                 stats: stats.clone(),
-                config_rx: None,
             };
             let ast = TypeAst::parse("UInt8", inserter.alloc).unwrap();
             let column = ColumnBuilder::fixed(&[42], 1, 1).unwrap();

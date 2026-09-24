@@ -18,8 +18,9 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::task::AbortOnDropHandle;
 
 use crate::ch::EmitterError;
+use crate::config::DestEmitter;
 use crate::config::ResolvedConfig;
-use crate::emit::ch_emitter::{EmitterConfig, EmitterStats};
+use crate::emit::ch_emitter::EmitterStats;
 use crate::emit::pipeline::ack::{self, AckHandle};
 use crate::emit::pipeline::batcher::{self, BatcherConfig, BatcherMsg, InsertBatch};
 use crate::emit::pipeline::inserter;
@@ -131,7 +132,7 @@ impl OwnedTail {
     }
 
     pub async fn spawn(
-        emitter: &EmitterConfig,
+        dest: Arc<DestEmitter>,
         inserter_pool_size: usize,
         stats: Arc<EmitterStats>,
         fatal: Fatal,
@@ -140,7 +141,7 @@ impl OwnedTail {
         context: &'static str,
     ) -> Result<Self, String> {
         let (msg_tx, ack, parts) = spawn_with_config(
-            emitter,
+            dest,
             inserter_pool_size,
             stats,
             Arc::new(Monotone::<EmitterAck>::default()),
@@ -192,14 +193,14 @@ impl OwnedTail {
 /// open — inserters spin up first (consume-only) so a connect failure aborts
 /// before any other stage starts.
 pub async fn spawn(
-    emitter: &EmitterConfig,
+    dest: Arc<DestEmitter>,
     inserter_pool_size: usize,
     stats: Arc<EmitterStats>,
     emitter_ack: Arc<Monotone<EmitterAck>>,
     fatal: Fatal,
 ) -> Result<(mpsc::Sender<BatcherMsg>, AckHandle, TailParts), EmitterError> {
     spawn_with_config(
-        emitter,
+        dest,
         inserter_pool_size,
         stats,
         emitter_ack,
@@ -256,7 +257,7 @@ pub fn spawn_null(
 /// budgets/flush and the inserter pool re-reads compression/retry from it on
 /// each republish. `None` == boot values only (bootstrap + tests use [`spawn`]).
 pub async fn spawn_with_config(
-    emitter: &EmitterConfig,
+    dest: Arc<DestEmitter>,
     inserter_pool_size: usize,
     stats: Arc<EmitterStats>,
     emitter_ack: Arc<Monotone<EmitterAck>>,
@@ -276,16 +277,14 @@ pub async fn spawn_with_config(
     // One resolved batch per inserter is what keeps every one of them fed
     let (resolved_tx, resolved_rx) = async_channel::bounded::<ResolvedBatch>(n);
 
+    let emitter = dest.current();
     let inserters = inserter::spawn_pool(
         n,
-        emitter,
+        dest,
         resolved_rx,
         ack.clone(),
         stats.clone(),
         fatal.clone(),
-        inserter::PoolOptions {
-            config_rx: config_rx.clone(),
-        },
     )
     .await?;
 

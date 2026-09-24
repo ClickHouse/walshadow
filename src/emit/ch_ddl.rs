@@ -22,7 +22,6 @@
 
 use std::borrow::Cow;
 use std::sync::Arc;
-use std::time::Duration;
 
 use clickhouse_c::Kind;
 use tokio::sync::watch;
@@ -32,9 +31,9 @@ use crate::ch::{
     ChConn, EmitterError, connect_client, exec_drain, is_retryable, quote_ident, types,
 };
 use crate::column_rules::ColumnRules;
-use crate::config::{ConfigResolver, ResolvedConfig};
+use crate::config::{ConfigResolver, DestEmitter, ResolvedConfig};
 use crate::decode::heap_decoder::{self, ColumnValue};
-use crate::emit::ch_emitter::{EmitterConfig, RetryConfig};
+use crate::emit::ch_emitter::EmitterConfig;
 use crate::mapping::{
     ColumnMapping, DropTableStrategy, MappingHandle, MappingSnapshot, NamespaceMapping, Retype,
     RetypeKind, SystemColumns, TableMapping, TableTarget, TargetOwners, apply_column_rule,
@@ -206,13 +205,6 @@ pub struct DdlApplicator {
     /// and the future overlay retarget DDL without a restart.
     config_rx: watch::Receiver<Arc<ResolvedConfig>>,
     mapping: MappingHandle,
-    /// Reconnect params; `refresh_config` updates the connection fields live
-    /// from a republished snapshot and re-dials on change.
-    conn_cfg: EmitterConfig,
-    retry: RetryConfig,
-    /// Per-attempt cap (shares `EmitterConfig::insert_timeout`); a
-    /// half-open CH socket can't park the reorder barrier past this
-    query_timeout: Duration,
     /// Owner of runtime-derived mapping state. Set: auto-created mappings,
     /// diff folds, and DROP forgets record into the resolver so the
     /// republish full-swap preserves them. Unset (bootstrap drain, tests
@@ -241,19 +233,16 @@ pub struct DdlStats {
 
 impl DdlApplicator {
     pub async fn new(
-        emitter_cfg: &EmitterConfig,
+        dest: Arc<DestEmitter>,
         ddl_cfg: DdlConfig,
         mapping: MappingHandle,
         config_rx: watch::Receiver<Arc<ResolvedConfig>>,
     ) -> Result<Self, EmitterError> {
         Ok(Self {
-            client: ChConn::connect(emitter_cfg).await?,
+            client: ChConn::connect(dest).await?,
             config: ddl_cfg,
             config_rx,
             mapping,
-            conn_cfg: emitter_cfg.clone(),
-            retry: emitter_cfg.retry.clone(),
-            query_timeout: emitter_cfg.insert_timeout,
             resolver: None,
             oracle: None,
             ensured_databases: HashSet::new(),
@@ -311,48 +300,19 @@ impl DdlApplicator {
     /// system-column names are boot-only, so they carry over. No-op until the
     /// resolver sends a new value; called at each apply so DDL runs against
     /// the current config.
-    async fn refresh_config(&mut self) -> Result<(), EmitterError> {
+    fn refresh_config(&mut self) {
         if !self.config_rx.has_changed().unwrap_or(false) {
-            return Ok(());
+            return;
         }
-        let (cfg, conn) = {
-            let snap = self.config_rx.borrow_and_update();
-            let cfg = DdlConfig::from_resolved(
-                &snap,
-                self.config.target_database.clone(),
-                self.config.soft_delete,
-                self.config.system.clone(),
-                self.config.replicate_all,
-                self.config.runtime_config_schema.clone(),
-            );
-            let conn = (
-                snap.host.clone(),
-                snap.port,
-                snap.database.clone(),
-                snap.user.clone(),
-                snap.password.clone(),
-                snap.secure,
-            );
-            (cfg, conn)
-        };
-        self.config = cfg;
-        let (host, port, database, user, password, secure) = conn;
-        if host != self.conn_cfg.host
-            || port != self.conn_cfg.port
-            || database != self.conn_cfg.database
-            || user != self.conn_cfg.user
-            || password != self.conn_cfg.password
-            || secure != self.conn_cfg.secure
-        {
-            self.conn_cfg.host = host;
-            self.conn_cfg.port = port;
-            self.conn_cfg.database = database;
-            self.conn_cfg.user = user;
-            self.conn_cfg.password = password;
-            self.conn_cfg.secure = secure;
-            self.client.dial(&self.conn_cfg).await?;
-        }
-        Ok(())
+        let snap = self.config_rx.borrow_and_update();
+        self.config = DdlConfig::from_resolved(
+            &snap,
+            self.config.target_database.clone(),
+            self.config.soft_delete,
+            self.config.system.clone(),
+            self.config.replicate_all,
+            self.config.runtime_config_schema.clone(),
+        );
     }
 
     /// Errors propagate; the worker task turns them into
@@ -368,7 +328,7 @@ impl DdlApplicator {
         event: &SchemaEvent,
         frozen: Option<&ResolvedConfig>,
     ) -> Result<(), EmitterError> {
-        self.refresh_config().await?;
+        self.refresh_config();
         let cfg = self.plan_config(frozen);
         match event {
             SchemaEvent::Added { desc } => self.apply_added(desc, &cfg).await,
@@ -432,7 +392,7 @@ impl DdlApplicator {
     /// has no bridgeable shape (nothing created; caller should not map it).
     /// Idempotent: `IF NOT EXISTS` no-ops a re-create.
     pub async fn ensure_ch_table(&mut self, desc: &RelDescriptor) -> Result<bool, EmitterError> {
-        self.refresh_config().await?;
+        self.refresh_config();
         let settings = self.config.rules.settings(&desc.rel_name);
         let target = self.config.create_target(&settings, &desc.rel_name);
         let shape = self.config.create_shape(&settings);
@@ -728,11 +688,9 @@ impl DdlApplicator {
 
     async fn execute(&mut self, sql: &str) -> Result<(), EmitterError> {
         tracing::debug!(target: "walshadow::ch_ddl", sql = %sql, "applying");
-        let query_timeout = self.query_timeout;
+        let query_timeout = self.client.config().insert_timeout;
         self.client
             .retry_when(
-                &self.conn_cfg,
-                self.retry.backoff(),
                 |e| {
                     is_retryable(e)
                         && !matches!(
@@ -1235,7 +1193,7 @@ mod tests {
                 None,
             );
             let mut applicator = DdlApplicator::new(
-                &config,
+                DestEmitter::new(Arc::new(config), None),
                 ddl,
                 crate::mapping::mapping_handle(HashMap::default()),
                 watch::channel(resolved).1,

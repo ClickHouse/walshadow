@@ -17,10 +17,14 @@ async fn checkpoint_reuses_staging_and_rejects_replaced_table() {
     let ch =
         fx::ChServer::spawn(tempfile::tempdir().unwrap(), ports.ch_tcp, ports.ch_http).unwrap();
     ch.query("CREATE TABLE default.t (id UInt64, value String, _lsn UInt64) ENGINE = ReplacingMergeTree(_lsn) ORDER BY id").unwrap();
-    let emitter = Arc::new(EmitterConfig {
-        port: ports.ch_tcp,
-        ..Default::default()
-    });
+    let dest = walshadow::config::DestEmitter::new(
+        Arc::new(EmitterConfig {
+            port: ports.ch_tcp,
+            ..Default::default()
+        }),
+        None,
+    );
+    let emitter = dest.current();
     let name = RelName::new("public", "t");
     let mapping = mapping_handle(
         [(
@@ -51,7 +55,7 @@ async fn checkpoint_reuses_staging_and_rejects_replaced_table() {
             attributes: Vec::new(),
         }),
     }];
-    let plan = prepare(emitter.clone(), &mapping, &requests, false)
+    let plan = prepare(dest.clone(), &mapping, &requests, false)
         .await
         .unwrap();
     let snapshot = mapping.snapshot().await;
@@ -62,7 +66,7 @@ async fn checkpoint_reuses_staging_and_rejects_replaced_table() {
         &emitter,
         None,
     );
-    let mut session = StagingSession::connect(emitter.clone()).await.unwrap();
+    let mut session = StagingSession::connect(dest.clone()).await.unwrap();
     checkpoint
         .capture_staging(&plan, &mut session)
         .await
@@ -77,7 +81,7 @@ async fn checkpoint_reuses_staging_and_rejects_replaced_table() {
     let resumed = BackupCheckpoint::load(dir.path()).await.unwrap().unwrap();
     assert!(resumed.matches(&checkpoint));
     assert!(resumed.staging_intact(&mut session).await.unwrap());
-    prepare(emitter.clone(), &mapping, &requests, true)
+    prepare(dest.clone(), &mapping, &requests, true)
         .await
         .unwrap();
     assert!(resumed.staging_intact(&mut session).await.unwrap());
@@ -102,6 +106,6 @@ async fn checkpoint_reuses_staging_and_rejects_replaced_table() {
         &emitter,
         None
     )));
-    prepare(emitter, &mapping, &requests, false).await.unwrap();
+    prepare(dest, &mapping, &requests, false).await.unwrap();
     assert!(!resumed.staging_intact(&mut session).await.unwrap());
 }

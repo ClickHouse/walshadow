@@ -65,6 +65,9 @@ impl ChServer {
                 "--prometheus.port=",
                 "--listen_host=127.0.0.1",
                 &format!("--path={}/", data_dir.display()),
+                // Relative to the server's cwd otherwise, which drops SQL-created
+                // users into the crate root and leaks them into the next run
+                &format!("--access_control_path={}/access/", data_dir.display()),
                 &format!("--logger.log={}/server.log", log_dir.display()),
                 &format!("--logger.errorlog={}/error.log", log_dir.display()),
                 "--logger.level=warning",

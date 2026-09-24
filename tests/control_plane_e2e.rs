@@ -50,6 +50,13 @@ impl Harness {
     /// metrics port is up (bootstrap done, shadow serving, WAL pump in
     /// its main loop) and the seed row has drained to CH.
     async fn up(ports: &fx::Ports) -> Result<Self> {
+        Self::up_with_ch_auth(ports, None).await
+    }
+
+    /// `ch_auth` pins `[ch] user`/`password` to a CH user this creates with
+    /// that password, so a drill can rotate the credential underneath the
+    /// running daemon. `None` keeps the passwordless `default` user.
+    async fn up_with_ch_auth(ports: &fx::Ports, ch_auth: Option<(&str, &str)>) -> Result<Self> {
         let tmp = tempfile::tempdir().unwrap();
 
         // Source PG + schema. demo.users is pinned by the base config,
@@ -106,6 +113,16 @@ impl Harness {
                 _commit_ts DateTime64(6, 'UTC'), _is_deleted Bool\
              ) ENGINE = ReplacingMergeTree(_lsn, _is_deleted) ORDER BY id",
         )?;
+        let ch_credentials = match ch_auth {
+            Some((user, password)) => {
+                ch.query(&format!(
+                    "CREATE USER {user} IDENTIFIED WITH plaintext_password BY '{password}'"
+                ))?;
+                ch.query(&format!("GRANT CURRENT GRANTS ON *.* TO {user}"))?;
+                format!("user = \"{user}\"\npassword = \"{password}\"\n")
+            }
+            None => String::new(),
+        };
 
         // Base config (read-only-shaped: the API only ever writes the
         // conf.d fragment beside it). Pins demo.users by columns.
@@ -118,6 +135,7 @@ impl Harness {
                  port = {}\n\
                  database = \"demo\"\n\
                  compression = \"lz4\"\n\
+                 {ch_credentials}\
                  \n\
                  [stream]\n\
                  replicate_all = false\n\
@@ -812,6 +830,75 @@ async fn live_table_opt_in_auto_creates_on_reload() {
         .context("post-opt-in insert did not reach CH")?;
 
         assert!(h.alive(), "daemon exited during opt-in");
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+
+    let stderr = h.teardown();
+    if let Err(e) = result {
+        panic!("{e:#}\n--- daemon stderr ---\n{stderr}");
+    }
+}
+
+/// Rotating the ClickHouse password: the credential the inserter re-dials
+/// with has to come from live config, not from the one it booted on
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ch_password_rotation_via_ctl_keeps_streaming() {
+    if !gated() {
+        return;
+    }
+    let mut h = Harness::up_with_ch_auth(&fx::Ports::alloc(), Some(("ws", "pw1")))
+        .await
+        .expect("bring up harness");
+
+    let result = async {
+        // Baseline under the boot credential.
+        h.psql("UPDATE demo.users SET email = 'pw1@x' WHERE id = 1")?;
+        h.wait_ch(USER_EMAIL, "pw1@x", Duration::from_secs(15))
+            .await
+            .context("baseline row did not reach CH under the boot password")?;
+
+        // Rotate on the server first. An open connection keeps working under
+        // the old credential, so the compression flip rides along to force a
+        // re-dial: it is the dial itself that has to carry the new password.
+        h.ch.query("ALTER USER ws IDENTIFIED WITH plaintext_password BY 'pw2'")?;
+        h.ctl_body(
+            &["apply"],
+            "[ch]\npassword = \"pw2\"\ncompression = \"none\"\n",
+        )?;
+        let frag = fs::read_to_string(&h.frag_path).context("read fragment")?;
+        assert!(frag.contains("pw2"), "fragment: {frag}");
+
+        h.psql("UPDATE demo.users SET email = 'pw2@x' WHERE id = 1")?;
+        h.wait_ch(USER_EMAIL, "pw2@x", Duration::from_secs(30))
+            .await
+            .context("row after the password rotation never reached CH")?;
+        assert!(h.alive(), "daemon exited after the password rotation");
+
+        // An external value dials the TOAST mirror, which is a CH connection
+        // of its own and has to carry the rotated credential too
+        h.psql("UPDATE demo.users SET name = repeat('t', 200000) WHERE id = 1")?;
+        h.wait_ch(
+            "SELECT length(argMax(name, _lsn)) FROM demo.users WHERE _is_deleted = 0 AND id = 1",
+            "200000",
+            Duration::from_secs(30),
+        )
+        .await
+        .context("TOASTed row after the password rotation never reached CH")?;
+        assert!(h.alive(), "daemon exited on the TOAST mirror dial");
+
+        // A credential the server rejects must surface as the inserter's own
+        // refusal, which is what proves the dial reads live config rather than
+        // the value it booted on.
+        h.ctl_body(
+            &["apply"],
+            "[ch]\npassword = \"wrong\"\ncompression = \"lz4\"\n",
+        )?;
+        h.psql("UPDATE demo.users SET email = 'wrong@x' WHERE id = 1")?;
+        h.wait_log("Authentication failed", Duration::from_secs(30))
+            .await
+            .context("a rejected password never reached a re-dial")?;
+
         Ok::<(), anyhow::Error>(())
     }
     .await;

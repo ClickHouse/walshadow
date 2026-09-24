@@ -113,7 +113,10 @@ async fn concurrent_first_puts_create_mirrors_without_retries() {
     let mut cfg = config(ch.port);
     cfg.inserter_pool_size = 4;
     cfg.retry.max_attempts = 0;
-    let store = ClickHouseChunkStore::new(cfg);
+    let store = ClickHouseChunkStore::new(walshadow::config::DestEmitter::new(
+        std::sync::Arc::new(cfg),
+        None,
+    ));
 
     // Failed CREATE must leave its connection ready to retry creation
     assert!(
@@ -150,7 +153,10 @@ async fn ch_chunk_store_put_fetch_roundtrip() {
     ch.query(&format!("CREATE DATABASE IF NOT EXISTS {DB}"))
         .expect("create db");
 
-    let store = ClickHouseChunkStore::new(config(ch.port));
+    let store = ClickHouseChunkStore::new(walshadow::config::DestEmitter::new(
+        std::sync::Arc::new(config(ch.port)),
+        None,
+    ));
 
     // One value's chunks split across two puts (pages / commits); an
     // unrelated value in the same relation; a second relation -> a second
@@ -415,7 +421,10 @@ async fn ch_chunk_store_fetch_many_aligns_and_splits() {
 
     let mut cfg = config(ch.port);
     cfg.inserter_pool_size = 4;
-    let store = ClickHouseChunkStore::new(cfg);
+    let store = ClickHouseChunkStore::new(walshadow::config::DestEmitter::new(
+        std::sync::Arc::new(cfg),
+        None,
+    ));
 
     // 200 single-chunk values: past one query's id width, so a fetch has to
     // split across the pool and merge its splits back
@@ -508,7 +517,10 @@ async fn ch_chunk_store_rewrite_barrier_residuals() {
     ch.query(&format!("CREATE DATABASE IF NOT EXISTS {DB}"))
         .expect("create db");
 
-    let store = ClickHouseChunkStore::new(config(ch.port));
+    let store = ClickHouseChunkStore::new(walshadow::config::DestEmitter::new(
+        std::sync::Arc::new(config(ch.port)),
+        None,
+    ));
     // Old generation: value 7 at (0,1)/(0,2), value 9 dead pre-marker at
     // (0,3), value 11 live at (1,1). The death rides its own put: RMT
     // collapses same-key rows within one inserted block regardless of
@@ -590,7 +602,10 @@ async fn ch_resolver_put_rows_then_fetch_into() {
 
     let cfg = config(ch.port);
     let stats = Arc::new(EmitterStats::default());
-    let resolver = ToastResolver::from_config(&cfg, stats.clone());
+    let resolver = ToastResolver::from_config(
+        walshadow::config::DestEmitter::new(std::sync::Arc::new(cfg), None),
+        stats.clone(),
+    );
     assert!(resolver.stores_chunks());
     drive_store_backed(&resolver, &stats).await;
 }
