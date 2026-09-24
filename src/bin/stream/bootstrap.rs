@@ -1148,6 +1148,7 @@ pub(crate) async fn run_bootstrap(
     Ok((
         BootstrapHandoff {
             end_lsn: outcome.end.end_lsn,
+            timeline: outcome.start.timeline,
             open_floor,
             shadow: running_shadow,
         },
@@ -1181,6 +1182,7 @@ pub(crate) struct BootstrapMetrics {
 pub(crate) struct BootstrapHandoff {
     /// Backup end and shadow state boundary
     pub(crate) end_lsn: u64,
+    pub(crate) timeline: u32,
     /// Earliest record among transactions open at window seal
     pub(crate) open_floor: Option<u64>,
     /// Shadow instance started during bootstrap
@@ -1522,6 +1524,7 @@ mod tests {
     fn bootstrap_handoff_preserves_required_history() {
         let crossing = BootstrapHandoff {
             end_lsn: 0x3000,
+            timeline: 1,
             open_floor: Some(0x1000),
             shadow: None,
         };
@@ -1529,6 +1532,7 @@ mod tests {
 
         let clean = BootstrapHandoff {
             end_lsn: 0x3000,
+            timeline: 1,
             open_floor: None,
             shadow: None,
         };
@@ -1536,6 +1540,7 @@ mod tests {
         assert_eq!(
             BootstrapHandoff {
                 end_lsn: 0x3000,
+                timeline: 1,
                 open_floor: Some(0x4000),
                 shadow: None,
             }

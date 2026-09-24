@@ -233,6 +233,7 @@ pub(crate) async fn run_session(
     let bootstrap_end_lsn: Option<u64> = bootstrap_handoff.as_ref().map(|h| h.end_lsn);
     let bootstrap_resume_lsn: Option<u64> =
         bootstrap_handoff.as_ref().map(BootstrapHandoff::resume_lsn);
+    let bootstrap_timeline: Option<u32> = bootstrap_handoff.as_ref().map(|h| h.timeline);
     // Regenerate config because shadow's port, socket, and GUC floor may change
     // Keep shadow alive until pipeline teardown finishes
     // Reuse shadow instance started during bootstrap
@@ -366,9 +367,8 @@ pub(crate) async fn run_session(
     // stored on an ancestor is served by that ancestor, whatever the live head
     // reports, and a floor at a fork segment's start is served by the descendant
     // whose file holds the ancestor prefix (architecture/recovery.md).
-    let stored_timeline = manifest_at_boot
-        .as_ref()
-        .map(|m| m.source.timeline)
+    let stored_timeline = bootstrap_timeline
+        .or_else(|| manifest_at_boot.as_ref().map(|m| m.source.timeline))
         .unwrap_or(ident.timeline);
     let mut history = load_boot_history(&mut feed, ident.timeline, stored_timeline).await?;
     let start_timeline = match history.resume_branch(stored_timeline, aligned.get(), WAL_SEG_SIZE) {
@@ -401,11 +401,15 @@ pub(crate) async fn run_session(
     // places a descendant, and only the switchpoint separates them. A stored
     // begin is the chain a previous run proved, carried forward
     // (architecture/recovery.md)
-    let stored_begin = manifest_at_boot
-        .as_ref()
-        .map(|m| m.source.timeline_begin.get())
-        .unwrap_or(0);
     let live_begin = history.begin_of(stored_timeline).unwrap_or(0);
+    let stored_begin = if bootstrap_timeline.is_some() {
+        live_begin
+    } else {
+        manifest_at_boot
+            .as_ref()
+            .map(|m| m.source.timeline_begin.get())
+            .unwrap_or(0)
+    };
     match stored_begin {
         0 if stored_timeline > 1 => tracing::warn!(
             target: "walshadow",
@@ -667,7 +671,11 @@ pub(crate) async fn run_session(
                 ..manifest::FloorInputs::default()
             }
             .floor(),
-            source: live_identity.clone(),
+            source: manifest::SourceIdentity {
+                system_id: live_identity.system_id,
+                timeline: start_timeline,
+                timeline_begin: Pos::new(history.begin_of(start_timeline).unwrap_or(0)),
+            },
             wal: manifest::WalBranch {
                 stream_timeline: start_timeline,
             },
