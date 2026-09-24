@@ -34,6 +34,18 @@ position calculations belong in [manifest](../src/source/manifest.rs),
 [source feedback](../src/source/source_feed.rs), and
 [retention](../src/ops/retention.rs)
 
+## Archive recovery
+
+Resolve each archived segment through verified source history. PostgreSQL copies
+ancestor prefix into descendant's fork segment; ancestor archive may contain only
+`.partial`. Stop replay at each switchpoint before adopting descendant timeline
+
+When source retention starts beyond a historical fork, verify repeated prefix
+against archived descendant WAL before committing branch-aware resume state
+Keep lineage, transaction, and replay barriers intact. Resume source replication
+only when slot retention reaches requested position. Retry archive gaps with
+bounded backoff so delayed uploads can unblock recovery
+
 ## Planned source crossing
 
 Pause freezes consumed and received source frontiers while accepted destination

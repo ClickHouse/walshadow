@@ -23,7 +23,7 @@ use walrus::pg::wal::segment::SegmentName;
 use walrus::pg::walparser::Oid;
 use walrus::storage::DynStorage;
 use walrus::storage::fs::FsStorage;
-use walshadow::archive_history;
+use walshadow::archive;
 use walshadow::backfill_bootstrap::seed_catalog_from_source;
 use walshadow::backup_backfill::fetch_segments;
 use walshadow::heap_decoder::{ColumnValue, decode_heap_record};
@@ -235,7 +235,7 @@ async fn gap_replay_crosses_a_promotion() {
         2,
         "source pins the branch, not the archive"
     );
-    archive_history::verify(&settings, &storage, &history)
+    archive::verify_history(&settings, &storage, &history)
         .await
         .expect("archive records the chain the source serves");
     drop(feed);

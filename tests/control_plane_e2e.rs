@@ -19,6 +19,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
+use walrus::pg::wal::segment::SegmentName;
 use walshadow::pg::parse_pg_lsn;
 use walshadow::record::WAL_SEG_SIZE;
 use walshadow::shadow::{Shadow, ShadowConfig};
@@ -1395,6 +1396,89 @@ async fn switchover_crosses_fork_and_keeps_every_row() {
     // Consumer before producer: walshadow caps advertised flush at its durable
     // floor, so its walsender never confirms everything sent and the target's
     // fast shutdown would sit out `wal_sender_timeout` waiting for it
+    let stderr = h.teardown();
+    let _ = target.stop();
+    if let Err(e) = result {
+        panic!("{e:#}\n--- daemon stderr ---\n{stderr}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn archive_crosses_forks_when_ancestor_segments_are_partial_and_slot_is_ahead() {
+    if !gated() {
+        return;
+    }
+    let mut h = Harness::up(&fx::Ports::alloc())
+        .await
+        .expect("bring up harness");
+    let target = h.promotion_target().expect("build promotion target");
+    let result = async {
+        pause_and_stop_writes(&h, &target).await?;
+        h.stop_daemon();
+        promote(&target)?;
+        let fork = parse_pg_lsn(&fork_switch_lsn(&target, 2)?)?;
+        let seg_size = walshadow::record::WAL_SEG_SIZE;
+        let fork_start = fork / seg_size * seg_size;
+        ensure!(fork > fork_start, "need a fork inside a segment");
+        target.psql_one("UPDATE demo.users SET email = 'archive-descendant@x' WHERE id = 1")?;
+        target.stop()?;
+        target.write_standby_signal()?;
+        target.start()?;
+        promote(&target)?;
+        let history = walshadow::timeline::TimelineHistory::parse(3,
+            &fs::read(target.config().data_dir.join("pg_wal/00000003.history"))?)?;
+        let second_fork = history.switchpoint_of(2).context("second fork missing")?;
+        ensure!(second_fork / seg_size == fork / seg_size, "forks must share a segment");
+        target.psql_one("SELECT pg_switch_wal()")?;
+        target.psql_one("CHECKPOINT")?;
+        target.psql_one("SELECT pg_create_physical_replication_slot('archive_resume', true)")?;
+        let retained = parse_pg_lsn(&target.psql_one(
+            "SELECT restart_lsn FROM pg_replication_slots WHERE slot_name = 'archive_resume'"
+        )?)?;
+        ensure!(retained > fork, "slot must sit beyond historical fork");
+        target.psql_one("SELECT pg_switch_wal()")?;
+        let current = target.psql_one("SELECT pg_walfile_name(pg_current_wal_insert_lsn())")?;
+        target.stop()?;
+
+        let archive = h.tmp.path().join("archive");
+        let wal = archive.join("wal_005");
+        fs::create_dir_all(&wal)?;
+        let ancestor_name = walshadow::record::segments_covering(1, fork_start..fork_start + seg_size)[0].format();
+        let current = SegmentName::parse(current.trim())?.start_lsn(seg_size);
+        let pg_wal = target.config().data_dir.join("pg_wal");
+        for entry in fs::read_dir(&pg_wal)? {
+            let entry = entry?;
+            let Ok(seg) = SegmentName::parse(&entry.file_name().to_string_lossy()) else {
+                continue;
+            };
+            let ancestor = seg.timeline < 3;
+            let start = seg.start_lsn(seg_size);
+            if start < current {
+                let archived_name = if ancestor && start == fork_start { format!("{}.partial", seg.format()) } else { seg.format() };
+                fs::copy(entry.path(), wal.join(archived_name))?;
+            }
+            if ancestor {
+                fs::remove_file(entry.path())?;
+            }
+        }
+        ensure!(!wal.join(&ancestor_name).exists(), "ancestor fork segment must be absent");
+        target.start()?;
+        fs::write(&h.frag_path, format!(
+            "[source]\nhost = \"{}\"\nport = {TARGET_PORT}\nslot = \"archive_resume\"\n\n[stream]\npaused = false\n\n[backup]\narchive = \"file://{}\"\n",
+            target.config().socket_dir.display(), archive.display(),
+        ))?;
+        h.start_daemon(Duration::from_secs(60)).await?;
+        h.wait_ch(SECOND_EMAIL, "below-fork@x", Duration::from_secs(60)).await?;
+        h.wait_ch(USER_EMAIL, "archive-descendant@x", Duration::from_secs(60)).await?;
+        h.wait_log("crossing source timeline through archive", Duration::from_secs(60)).await?;
+        h.wait_log("source reconnected", Duration::from_secs(60)).await?;
+        target.psql_one("UPDATE demo.users SET email = 'live-after-archive@x' WHERE id = 1")?;
+        h.wait_ch(USER_EMAIL, "live-after-archive@x", Duration::from_secs(60)).await?;
+        ensure!(h.metric("walshadow_timeline_switches_total")? == 2, "expected two forks");
+        ensure!(h.metric("walshadow_timeline_prefix_bytes_verified_total")? > 0, "prefix was not verified");
+        ensure!(h.alive(), "daemon exited after archive recovery");
+        Ok::<(), anyhow::Error>(())
+    }.await;
     let stderr = h.teardown();
     let _ = target.stop();
     if let Err(e) = result {

@@ -41,6 +41,7 @@ use walrus::pg::backup::format_pg_lsn;
 
 use crate::pos::{Drain, FilterDurable, Floor, Pos, ResumeSafe, ShadowReplay, Switchpoint};
 use crate::record::{RecordSink, SegmentSink};
+use crate::source::archive::Archive;
 use crate::source::shadow_stream::ShadowStreamState;
 use crate::source::source_feed::{SlotError, SourceEvent, SourceFeed, StandbyStatus};
 use crate::source::timeline::{HistoryError, TimelineHistory, history_filename};
@@ -147,6 +148,16 @@ impl TransitionError {
                 | Self::Commit(_)
                 | Self::Slot(SlotError::Query(_))
         )
+    }
+
+    /// Source no longer holds fork segment or slot sits past it, both of which
+    /// archive can stand in for
+    fn archive_can_serve(&self) -> bool {
+        match self {
+            Self::Slot(SlotError::TooNew { .. }) => true,
+            Self::Source(e) => crate::source_feed::is_wal_segment_removed(e),
+            _ => false,
+        }
     }
 }
 
@@ -338,6 +349,15 @@ pub struct ForkResume {
     pub switch_lsn: Pos<Switchpoint>,
 }
 
+/// Where a crossing read descendant's copy of fork prefix
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrefixOrigin {
+    /// Feed is left streaming descendant
+    Live,
+    /// Feed never reached descendant, so source must be redialed
+    Archive,
+}
+
 /// One crossing's outcome. The history comes back with it: the floor timeline
 /// is resolved against this chain, and a caller still holding the pre-fork
 /// history would pin the floor on the ancestor forever.
@@ -349,6 +369,7 @@ pub struct Crossing {
     pub switch_lsn: u64,
     pub prefix_bytes: u64,
     pub history: TimelineHistory,
+    pub prefix_origin: PrefixOrigin,
 }
 
 pub struct Switchover<'a> {
@@ -362,6 +383,7 @@ pub struct Switchover<'a> {
     /// probe can find them.
     pub out_dir: &'a Path,
     pub shadow_state: &'a Arc<Mutex<ShadowStreamState>>,
+    pub backup: Option<&'a Archive>,
 }
 
 impl Switchover<'_> {
@@ -577,28 +599,23 @@ impl Switchover<'_> {
                 to: switch_lsn,
             });
         }
-        // The promotion target's slot has to already reach the position about to
-        // be committed. `START_REPLICATION` would answer for the request alone,
-        // leaving a slot that pins nothing below it to be found at the next
-        // restart (architecture/recovery.md)
-        if let Some(name) = slot {
-            let restart_lsn = feed
-                .prove_physical_slot(name, Pos::new(seg_start), Pos::new(seg_start))
-                .await?;
-            tracing::info!(
-                target: "walshadow",
-                slot = name,
-                restart_lsn = restart_lsn.map(|l| walrus::pg::backup::format_pg_lsn(l).to_string()),
-                resume_lsn = %walrus::pg::backup::format_pg_lsn(seg_start),
-                "target slot reaches the fork resume position",
-            );
-        }
-        feed.start_physical_replication(slot, seg_start, next_tli)
+        let (prefix_bytes, past_fork, prefix_origin) = match self
+            .verify_prefix_live(feed, slot, seg_start, fork, status, ancestor)
             .await
-            .map_err(source)?;
-        let (prefix_bytes, past_fork) = self
-            .verify_prefix(feed, switch_lsn, status, ancestor)
-            .await?;
+        {
+            Ok((prefix_bytes, past_fork)) => (prefix_bytes, past_fork, PrefixOrigin::Live),
+            Err(e)
+                if e.archive_can_serve()
+                    && let Some(archive) = self.backup =>
+            {
+                let (prefix_bytes, past_fork) =
+                    archived_fork_prefix(archive, fork, ancestor).await?;
+                tracing::info!(target: "walshadow", error = %e,
+                    next_timeline = next_tli, "crossing source timeline through archive");
+                (prefix_bytes, past_fork, PrefixOrigin::Archive)
+            }
+            Err(e) => return Err(e),
+        };
         // The hinge. Above this line the stream is still the ancestor's at `F`
         // and every failure re-crosses from there; below it the resume position
         // is the fork segment's start on the descendant
@@ -641,7 +658,41 @@ impl Switchover<'_> {
             switch_lsn,
             prefix_bytes,
             history: fork.live_history().clone(),
+            prefix_origin,
         })
+    }
+
+    /// Stream descendant from fork segment's start and verify its prefix copy.
+    /// Promotion target's slot has to already reach the position about to be
+    /// committed. `START_REPLICATION` would answer for the request alone,
+    /// leaving a slot that pins nothing below it to be found at the next
+    /// restart (architecture/recovery.md)
+    async fn verify_prefix_live(
+        &self,
+        feed: &mut SourceFeed,
+        slot: Option<&str>,
+        seg_start: u64,
+        fork: &ForkPoint,
+        status: StandbyStatus,
+        ancestor: ForkPrefix,
+    ) -> Result<(u64, Vec<u8>), TransitionError> {
+        if let Some(name) = slot {
+            let restart_lsn = feed
+                .prove_physical_slot(name, Pos::new(seg_start), Pos::new(seg_start))
+                .await?;
+            tracing::info!(
+                target: "walshadow",
+                slot = name,
+                restart_lsn = restart_lsn.map(|l| format_pg_lsn(l).to_string()),
+                resume_lsn = %format_pg_lsn(seg_start),
+                "target slot reaches the fork resume position",
+            );
+        }
+        feed.start_physical_replication(slot, seg_start, fork.next_tli)
+            .await
+            .map_err(source)?;
+        self.verify_prefix(feed, fork.switch_lsn, status, ancestor)
+            .await
     }
 
     /// Always restart the descendant at the fork segment's start, matching
@@ -687,14 +738,46 @@ impl Switchover<'_> {
             // until its copy of the prefix has answered for itself
             past_fork.extend_from_slice(&chunk.data[overlap..]);
         }
-        if crc != ancestor.crc {
-            return Err(TransitionError::ForkPrefixMismatch {
-                from: ancestor.from,
-                to: switch_lsn,
-            });
-        }
+        check_prefix(ancestor, crc, switch_lsn)?;
         Ok((switch_lsn - ancestor.from, past_fork))
     }
+}
+
+/// Archive's copy of fork segment, verified against ancestor prefix like
+/// [`Switchover::verify_prefix`], cut at descendant's own switchpoint when both
+/// forks share the segment
+async fn archived_fork_prefix(
+    archive: &Archive,
+    fork: &ForkPoint,
+    ancestor: ForkPrefix,
+) -> Result<(u64, Vec<u8>), TransitionError> {
+    let history = fork.live_history();
+    let (_, mut bytes) = archive
+        .read_segment(history, ancestor.from)
+        .await
+        .map_err(source)?;
+    let prefix = fork.switch_lsn - ancestor.from;
+    check_prefix(
+        ancestor,
+        crc32c::crc32c(&bytes[..prefix as usize]),
+        fork.switch_lsn,
+    )?;
+    if let Some(next_fork) = history.switchpoint_of(fork.next_tli) {
+        bytes.truncate(bytes.len().min((next_fork - ancestor.from) as usize));
+    }
+    bytes.drain(..prefix as usize);
+    Ok((prefix, bytes))
+}
+
+/// Descendant's copy of `[ancestor.from, switch_lsn)` digests to what ancestor fed
+fn check_prefix(ancestor: ForkPrefix, crc: u32, switch_lsn: u64) -> Result<(), TransitionError> {
+    if crc != ancestor.crc {
+        return Err(TransitionError::ForkPrefixMismatch {
+            from: ancestor.from,
+            to: switch_lsn,
+        });
+    }
+    Ok(())
 }
 
 fn source(e: anyhow::Error) -> TransitionError {
@@ -967,6 +1050,60 @@ pub async fn seed_shadow_branches(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn archived_prefix_checks_identity_and_stops_at_next_fork() {
+        let tmp = tempfile::tempdir().unwrap();
+        let settings = walrus::config::Settings {
+            storage: walrus::config::StorageSettings::Fs {
+                path: tmp.path().display().to_string(),
+            },
+            ..Default::default()
+        };
+        let archive = Archive::open(settings).unwrap();
+        let seg_size = crate::record::WAL_SEG_SIZE;
+        let history = TimelineHistory::parse(3, b"1\t0/10000A0\n2\t0/1000140\n").unwrap();
+        let fork = ForkPoint {
+            finished_tli: 1,
+            next_tli: 2,
+            live_tli: 3,
+            switch_lsn: seg_size + 160,
+            histories: vec![history],
+        };
+        let bytes = vec![0x5a; seg_size as usize];
+        let ancestor = ForkPrefix {
+            from: seg_size,
+            through: fork.switch_lsn,
+            crc: crc32c::crc32c(&bytes[..160]),
+        };
+        let wal = tmp.path().join("wal_005");
+        std::fs::create_dir(&wal).unwrap();
+        let segment = wal.join("000000030000000000000001");
+        let error = archived_fork_prefix(&archive, &fork, ancestor)
+            .await
+            .unwrap_err();
+        assert!(error.retryable());
+        std::fs::write(&segment, &bytes).unwrap();
+        let (prefix, tail) = archived_fork_prefix(&archive, &fork, ancestor)
+            .await
+            .unwrap();
+        assert_eq!(prefix, 160);
+        assert_eq!(tail, vec![0x5a; 160]);
+        let wrong = ForkPrefix {
+            crc: ancestor.crc ^ 1,
+            ..ancestor
+        };
+        let error = archived_fork_prefix(&archive, &fork, wrong)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, TransitionError::ForkPrefixMismatch { .. }));
+        assert!(!error.retryable());
+        std::fs::write(&segment, &bytes[..320]).unwrap();
+        let error = archived_fork_prefix(&archive, &fork, ancestor)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("320 bytes"));
+    }
 
     #[test]
     fn every_reason_has_a_label() {

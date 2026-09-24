@@ -1,4 +1,4 @@
-pub mod archive_history;
+pub mod archive;
 pub mod boundary_hold;
 pub mod catalog_capture;
 pub mod manifest;

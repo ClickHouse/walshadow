@@ -30,7 +30,7 @@
 //! using commit LSNs, up to each relation's coverage bound
 //!
 //! Follow promotions along the branch the stream proved, cross-checked against
-//! archived history by [`crate::source::archive_history`] before a gap replay
+//! archived history by [`crate::source::archive::verify_history`] before a gap replay
 //! Reject backups whose redo or finish lies outside that branch
 //!
 //! The pre-scan aborts on gap writes that would invalidate the walk: a
@@ -82,7 +82,7 @@ use crate::filter::pg_class_decoder::{
 use crate::record::{Record, RecordSink, SinkError, WAL_SEG_SIZE, segments_covering_lineage};
 use crate::runtime_config::InitialLoadMode;
 use crate::schema::RelDescriptor;
-use crate::source::archive_history;
+use crate::source::archive;
 use crate::source::timeline::TimelineHistory;
 use crate::ticker::Ticker;
 use crate::toast::ToastResolver;
@@ -200,7 +200,7 @@ async fn run_object_store_pass(ctx: &PassContext, reqs: &[BackupRequest]) -> Res
     let (patch, gap_segments) = if b_redo < s_max {
         // Only a replay leg reads the archive's own WAL, so only it needs the
         // archive to agree on the chain serving those segments
-        archive_history::verify(settings, &storage, &history)
+        archive::verify_history(settings, &storage, &history)
             .await
             .context("backup_backfill: cross-check archived timeline history")?;
         let names =
