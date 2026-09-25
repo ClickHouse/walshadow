@@ -27,13 +27,26 @@ pub(crate) async fn retry_server(
         ..EmitterConfig::default()
     };
     assert!(sql.len() < 128);
-    // Native revision 1, empty query ID/settings, complete stage, no compression
-    let mut expected = vec![1, 0, 0, 2, 0, sql.len() as u8];
+    // Empty query ID, clickhouse-c ClientInfo, no settings or interserver secret,
+    // complete stage, no compression
+    let mut expected = vec![1, 0, 1, 0, 0, 20];
+    expected.extend_from_slice(b"[::ffff:127.0.0.1]:0");
+    expected.extend_from_slice(&[0; 8]);
+    expected.extend_from_slice(&[1, 0, 0, 19]);
+    expected.extend_from_slice(b"clickhouse-c client");
+    expected.extend_from_slice(&[0, 0, 0xc1, 0xa9, 0x03, 0, 0, 0, 0, 0, 0, 0]);
+    expected.extend_from_slice(&[0, 0, 2, 0, sql.len() as u8]);
     expected.extend_from_slice(sql.as_bytes());
-    expected.extend_from_slice(&[2, 0, 0]);
+    // Empty params, then empty Data block with BlockInfo
+    const EMPTY_DATA: &[u8] = &[2, 0, 1, 0, 2, 0xff, 0xff, 0xff, 0xff, 0, 0, 0];
+    expected.push(0);
+    expected.extend_from_slice(EMPTY_DATA);
     if insert {
-        // One UInt8 column x, one row 42, empty input terminator
-        expected.extend_from_slice(b"\x02\x01\x01\x01x\x05UInt8\x2a\x02\x00\x00");
+        // One UInt8 column x without custom serialization, one row 42
+        expected.extend_from_slice(
+            b"\x02\x00\x01\x00\x02\xff\xff\xff\xff\x00\x01\x01\x01x\x05UInt8\x00\x2a",
+        );
+        expected.extend_from_slice(EMPTY_DATA);
     }
     let server = tokio::spawn(async move {
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -44,9 +57,16 @@ pub(crate) async fn retry_server(
                 if connection == 1 {
                     continue;
                 }
-                // Hello: empty name, version 1.0, revision 1
-                stream.write_all(&[0, 0, 1, 0, 1]).await.unwrap();
-                assert_eq!(stream.read_u8().await.unwrap(), 4);
+                // Hello: empty name, version 1.0, revision 54462, empty timezone &
+                // display name, patch 0, no password rules, zero nonce
+                stream
+                    .write_all(&[
+                        0, 0, 1, 0, 0xbe, 0xa9, 0x03, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                    ])
+                    .await
+                    .unwrap();
+                // Empty quota key addendum, then Ping
+                assert_eq!(stream.read_u16().await.unwrap(), 0x0004);
                 stream.write_all(&[4]).await.unwrap();
                 if idle && connection == 0 {
                     continue;
