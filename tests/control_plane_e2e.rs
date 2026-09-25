@@ -51,13 +51,25 @@ impl Harness {
     /// metrics port is up (bootstrap done, shadow serving, WAL pump in
     /// its main loop) and the seed row has drained to CH.
     async fn up(ports: &fx::Ports) -> Result<Self> {
-        Self::up_with_ch_auth(ports, None).await
+        Self::up_with(ports, None, false).await
     }
 
     /// `ch_auth` pins `[ch] user`/`password` to a CH user this creates with
     /// that password, so a drill can rotate the credential underneath the
     /// running daemon. `None` keeps the passwordless `default` user.
     async fn up_with_ch_auth(ports: &fx::Ports, ch_auth: Option<(&str, &str)>) -> Result<Self> {
+        Self::up_with(ports, ch_auth, false).await
+    }
+
+    async fn up_with_archive(ports: &fx::Ports) -> Result<Self> {
+        Self::up_with(ports, None, true).await
+    }
+
+    async fn up_with(
+        ports: &fx::Ports,
+        ch_auth: Option<(&str, &str)>,
+        archive: bool,
+    ) -> Result<Self> {
         let tmp = tempfile::tempdir().unwrap();
 
         // Source PG + schema. demo.users is pinned by the base config,
@@ -114,6 +126,13 @@ impl Harness {
                 _commit_ts DateTime64(6, 'UTC'), _is_deleted Bool\
              ) ENGINE = ReplacingMergeTree(_lsn, _is_deleted) ORDER BY id",
         )?;
+        let backup_section = if archive {
+            let dir = tmp.path().join("archive");
+            fs::create_dir_all(dir.join("wal_005")).context("create archive dir")?;
+            format!("\n[backup]\narchive = \"file://{}\"\n", dir.display())
+        } else {
+            String::new()
+        };
         let ch_credentials = match ch_auth {
             Some((user, password)) => {
                 ch.query(&format!(
@@ -146,7 +165,8 @@ impl Harness {
                    {{ attnum = 1, target = \"id\",    type = \"Int64\"  }},\n  \
                    {{ attnum = 2, target = \"name\",  type = \"String\" }},\n  \
                    {{ attnum = 3, target = \"email\", type = \"String\" }},\n\
-                 ]\n",
+                 ]\n\
+                 {backup_section}",
                 ports.ch_tcp,
             ),
         )
@@ -1568,6 +1588,112 @@ async fn archive_crosses_forks_when_ancestor_segments_are_partial_and_slot_is_ah
     }.await;
     let stderr = h.teardown();
     let _ = target.stop();
+    if let Err(e) = result {
+        panic!("{e:#}\n--- daemon stderr ---\n{stderr}");
+    }
+}
+
+/// Recovery when the source is gone and the chain moved on without it: two
+/// promotions happened elsewhere, so the archive names branches past the
+/// proved chain, and the segment holding the first fork was only ever archived
+/// under the newest branch. Reading it needs the archive's own history files
+/// and a descendant's copy of that segment — a daemon that resolves segments
+/// only through source-verified history loops on "not found in storage".
+///
+/// Crossing onto those branches is out of scope here: a fork is committed
+/// against a live source, so an archive-only daemon recovers within the branch
+/// it proved and then waits for a repoint
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn archive_recovery_discovers_branches_a_dead_source_never_proved() {
+    if !gated() {
+        return;
+    }
+    let mut h = Harness::up_with_archive(&fx::Ports::alloc())
+        .await
+        .expect("bring up harness");
+    let target = h.promotion_target().expect("build promotion target");
+
+    let result = async {
+        pause_and_stop_writes(&h, &target).await?;
+
+        let seg_size = walshadow::record::WAL_SEG_SIZE;
+        promote(&target)?;
+        let first_fork = parse_pg_lsn(&fork_switch_lsn(&target, 2)?)?;
+        let fork_start = first_fork / seg_size * seg_size;
+        ensure!(first_fork > fork_start, "need a fork inside a segment");
+        target.psql_one("UPDATE demo.users SET email = 'on-timeline-two@x' WHERE id = 1")?;
+
+        target.stop()?;
+        target.write_standby_signal()?;
+        target.start()?;
+        promote(&target)?;
+        target.psql_one("UPDATE demo.users SET email = 'on-timeline-three@x' WHERE id = 1")?;
+        target.psql_one("SELECT pg_switch_wal()")?;
+        target.psql_one("CHECKPOINT")?;
+        let current = SegmentName::parse(
+            target
+                .psql_one("SELECT pg_walfile_name(pg_current_wal_insert_lsn())")?
+                .trim(),
+        )?
+        .start_lsn(seg_size);
+        target.stop()?;
+
+        let archive = h.tmp.path().join("archive");
+        let wal = archive.join("wal_005");
+        fs::create_dir_all(&wal)?;
+        let pg_wal = target.config().data_dir.join("pg_wal");
+        for entry in fs::read_dir(&pg_wal)? {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.ends_with(".history") {
+                fs::copy(entry.path(), wal.join(&name))?;
+                continue;
+            }
+            let Ok(seg) = SegmentName::parse(&name) else {
+                continue;
+            };
+            let withheld = seg.start_lsn(seg_size) == fork_start && seg.timeline < 3;
+            if seg.start_lsn(seg_size) < current && !withheld {
+                fs::copy(entry.path(), wal.join(seg.format()))?;
+            }
+        }
+        for tli in [1u32, 2] {
+            let absent =
+                walshadow::record::segments_covering(tli, fork_start..fork_start + seg_size)[0]
+                    .format();
+            ensure!(
+                !wal.join(&absent).exists(),
+                "{absent} must be absent so the read falls back to timeline 3",
+            );
+        }
+        ensure!(
+            wal.join("00000002.history").exists() && wal.join("00000003.history").exists(),
+            "archive must carry the history files the source can no longer serve",
+        );
+        target.start()?;
+
+        ensure!(
+            h.ch_get(SECOND_EMAIL)?.is_empty(),
+            "the paused row must still be held, or the archive read proves nothing",
+        );
+        fs::write(&h.frag_path, "[stream]\npaused = false\n")?;
+        h.sighup()?;
+
+        h.wait_log(
+            "archive history names branches past the proved chain",
+            Duration::from_secs(90),
+        )
+        .await
+        .context("archive history discovery never ran")?;
+        h.wait_ch(SECOND_EMAIL, "below-fork@x", Duration::from_secs(90))
+            .await
+            .context("row inside the withheld fork segment never reached CH")?;
+        ensure!(h.alive(), "daemon exited during archive recovery");
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+
+    let stderr = h.teardown();
     if let Err(e) = result {
         panic!("{e:#}\n--- daemon stderr ---\n{stderr}");
     }

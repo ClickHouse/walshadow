@@ -529,11 +529,12 @@ impl SourceRecovery<'_> {
             "source cannot serve the resume point — trying archive",
         );
         self.fall_back(error, history, stream.timeline(), resume_lsn)
+            .await
     }
 
     /// Archive fallback (restore_command analog). Without an archive, removed
     /// WAL needs an operator, any other failure redials after backoff
-    fn fall_back(
+    async fn fall_back(
         &mut self,
         error: anyhow::Error,
         history: &TimelineHistory,
@@ -543,10 +544,30 @@ impl SourceRecovery<'_> {
         self.backoff.failed();
         match self.backup {
             Some(archive) => {
+                let history = match archive.discover_history(history, resume_lsn.get()).await {
+                    Ok(Some(extended)) => {
+                        tracing::info!(
+                            target: "walshadow",
+                            known_timeline = history.target(),
+                            archive_timeline = extended.target(),
+                            "archive history names branches past the proved chain",
+                        );
+                        extended
+                    }
+                    Ok(None) => history.clone(),
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "walshadow",
+                            error = %format!("{e:#}"),
+                            "archive history unreadable; resolving segments on the proved chain",
+                        );
+                        history.clone()
+                    }
+                };
                 tracing::info!(target: "walshadow", resume_lsn = %resume_lsn,
                     prefetch = self.prefetch, "starting archive recovery");
                 Ok(SourcePath::Archive(archive.feed(
-                    history.clone(),
+                    history,
                     timeline,
                     resume_lsn.get(),
                     self.prefetch,
@@ -617,7 +638,10 @@ mod tests {
             } else {
                 removed_wal()
             };
-            let mut path = recovery.fall_back(error, &history, 1, resume).unwrap();
+            let mut path = recovery
+                .fall_back(error, &history, 1, resume)
+                .await
+                .unwrap();
             let error = path.archive().unwrap().next().await.unwrap().unwrap_err();
             assert!(format!("{error:#}").contains("000000010000000000000062"));
             assert!(recovery.backoff.retry_at >= before + delay);
@@ -635,6 +659,7 @@ mod tests {
             .unwrap();
         let mut path = recovery
             .fall_back(slot_too_new(), &history, 1, resume)
+            .await
             .unwrap();
         let (lsn, bytes) = path.archive().unwrap().next().await.unwrap().unwrap();
         assert_eq!(lsn, resume.get());
@@ -644,12 +669,15 @@ mod tests {
         assert!(format!("{error:#}").contains("000000010000000000000063"));
     }
 
-    #[test]
-    fn removed_wal_without_archive_requires_operator() {
+    #[tokio::test]
+    async fn removed_wal_without_archive_requires_operator() {
         let floor = Monotone::new(Pos::new(0x6200_0000));
         let mut recovery = recovery(None, &floor);
         let history = TimelineHistory::root(1);
-        let Err(error) = recovery.fall_back(removed_wal(), &history, 1, floor.get()) else {
+        let Err(error) = recovery
+            .fall_back(removed_wal(), &history, 1, floor.get())
+            .await
+        else {
             panic!("removed WAL without archive must fail");
         };
         assert!(
@@ -661,6 +689,7 @@ mod tests {
         assert!(walshadow::source_feed::is_wal_segment_removed(&error));
         let path = recovery
             .fall_back(slot_too_new(), &history, 1, floor.get())
+            .await
             .unwrap();
         assert!(matches!(path, SourcePath::Redial));
         assert!(!recovery.backoff.due());

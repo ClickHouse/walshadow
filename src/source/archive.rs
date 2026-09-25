@@ -42,16 +42,53 @@ impl Archive {
         let timeline = history
             .tli_of_segment(seg_start, WAL_SEG_SIZE)
             .context("archive position outside source history")?;
-        let name = segments_covering(timeline, seg_start..seg_start + WAL_SEG_SIZE)[0].format();
-        let mut bytes =
-            walrus::pg::wal::fetch::read_segment(&self.settings, &self.storage, &name).await?;
-        anyhow::ensure!(
-            bytes.len() == WAL_SEG_SIZE as usize,
-            "archived WAL {name} has {} bytes, expected {WAL_SEG_SIZE}",
-            bytes.len(),
-        );
-        bytes.drain(..(lsn - seg_start) as usize);
-        Ok((name, bytes))
+        let mut refused = None;
+        for name in segment_candidates(history, timeline, seg_start) {
+            let attempt =
+                walrus::pg::wal::fetch::read_segment(&self.settings, &self.storage, &name).await;
+            match attempt {
+                Ok(mut bytes) if bytes.len() == WAL_SEG_SIZE as usize => {
+                    bytes.drain(..(lsn - seg_start) as usize);
+                    return Ok((name, bytes));
+                }
+                Ok(bytes) => {
+                    refused.get_or_insert_with(|| {
+                        anyhow::anyhow!(
+                            "archived WAL {name} has {} bytes, expected {WAL_SEG_SIZE}",
+                            bytes.len(),
+                        )
+                    });
+                }
+                Err(e) => {
+                    refused.get_or_insert_with(|| e.context(format!("fetch {name}")));
+                }
+            }
+        }
+        Err(refused.expect("every segment has at least one candidate name"))
+    }
+
+    pub async fn discover_history(
+        &self,
+        known: &TimelineHistory,
+        lsn: u64,
+    ) -> Result<Option<TimelineHistory>> {
+        let mut newest = None;
+        for tli in (known.target() + 1)..=u32::MAX {
+            let name = history_filename(tli);
+            let Ok(raw) =
+                walrus::pg::wal::fetch::read_segment(&self.settings, &self.storage, &name).await
+            else {
+                break;
+            };
+            let parsed =
+                TimelineHistory::parse(tli, &raw).with_context(|| format!("parse {name}"))?;
+            let proved = newest.as_ref().unwrap_or(known);
+            if !extends(proved, &parsed) || parsed.tli_of_point(lsn).is_none() {
+                break;
+            }
+            newest = Some(parsed);
+        }
+        Ok(newest)
     }
 
     /// Prefetch WAL from `start` until `timeline` ends so replay can switch timelines.
@@ -113,6 +150,33 @@ impl Archive {
             fetch_nanos,
         }
     }
+}
+
+fn segment_candidates(history: &TimelineHistory, owner: u32, seg_start: u64) -> Vec<String> {
+    let name_of = |tli| {
+        segments_covering(tli, seg_start..seg_start + WAL_SEG_SIZE)[0]
+            .format()
+            .to_string()
+    };
+    let mut names: Vec<String> = history
+        .entries()
+        .iter()
+        .map(|e| e.tli)
+        .filter(|tli| *tli >= owner)
+        .rev()
+        .map(name_of)
+        .collect();
+    names.push(format!("{}.partial", name_of(owner)));
+    names
+}
+
+fn extends(known: &TimelineHistory, next: &TimelineHistory) -> bool {
+    let mut entries = next.entries().iter();
+    known.entries().iter().all(|entry| {
+        entries.find(|e| e.tli == entry.tli).is_some_and(|found| {
+            found.begin == entry.begin && entry.end.is_none_or(|end| found.end == Some(end))
+        })
+    })
 }
 
 /// Check that archive and source have matching timeline histories, since replay
@@ -235,6 +299,137 @@ mod tests {
                 .unwrap_err();
             assert!(err.to_string().contains("disagrees"), "{err:#}");
         }
+    }
+
+    async fn archive_segment(settings: &Settings, storage: &DynStorage, name: &str, fill: u8) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(name);
+        fs::write(&path, vec![fill; WAL_SEG_SIZE as usize]).unwrap();
+        walrus::pg::wal::push::handle(settings, storage.clone(), &path)
+            .await
+            .unwrap();
+    }
+
+    /// TL4 promoted inside segment 39 and TL5 promoted before it completed, so
+    /// only TL5 copied the whole segment forward
+    #[tokio::test]
+    async fn read_segment_falls_back_to_a_descendants_copy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (settings, storage) = fs_archive(&tmp.path().join("archive"));
+        let history = TimelineHistory::parse(
+            5,
+            b"1\t3/10000000\tpromotion\n\
+              2\t3/20000000\tpromotion\n\
+              3\t3/39000100\tpromotion\n\
+              4\t3/39000900\tpromotion\n",
+        )
+        .unwrap();
+        let seg_start = 0x3_3900_0000u64;
+        archive_segment(&settings, &storage, "000000050000000300000039", 0x5a).await;
+        let archive = Archive {
+            settings: settings.clone(),
+            storage: storage.clone(),
+        };
+        let (name, bytes) = archive.read_segment(&history, seg_start).await.unwrap();
+        assert_eq!(name, "000000050000000300000039");
+        assert_eq!(bytes.len(), WAL_SEG_SIZE as usize);
+        assert!(bytes.iter().all(|b| *b == 0x5a));
+    }
+
+    #[tokio::test]
+    async fn read_segment_falls_back_to_a_partial() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (settings, storage) = fs_archive(&tmp.path().join("archive"));
+        archive_segment(
+            &settings,
+            &storage,
+            "000000010000000000000062.partial",
+            0x17,
+        )
+        .await;
+        let archive = Archive {
+            settings: settings.clone(),
+            storage: storage.clone(),
+        };
+        let (name, bytes) = archive
+            .read_segment(&TimelineHistory::root(1), 0x6200_0000)
+            .await
+            .unwrap();
+        assert_eq!(name, "000000010000000000000062.partial");
+        assert!(bytes.iter().all(|b| *b == 0x17));
+    }
+
+    #[tokio::test]
+    async fn discover_history_extends_the_proved_chain_and_refuses_a_fork() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (settings, storage) = fs_archive(&tmp.path().join("archive"));
+        let known = TimelineHistory::parse(
+            4,
+            b"1\t3/10000000\tpromotion\n2\t3/20000000\tpromotion\n3\t3/39000100\tpromotion\n",
+        )
+        .unwrap();
+        let archive = Archive {
+            settings: settings.clone(),
+            storage: storage.clone(),
+        };
+        let lsn = 0x3_3900_0000u64;
+        assert!(
+            archive
+                .discover_history(&known, lsn)
+                .await
+                .unwrap()
+                .is_none(),
+            "nothing archived past the proved chain",
+        );
+
+        archive_history_file(
+            &settings,
+            &storage,
+            5,
+            "1\t3/10000000\tpromotion\n2\t3/20000000\tpromotion\n3\t3/39000100\tpromotion\n4\t3/39000900\tpromotion\n",
+        )
+        .await;
+        let found = archive
+            .discover_history(&known, lsn)
+            .await
+            .unwrap()
+            .expect("timeline 5 extends the chain");
+        assert_eq!(found.target(), 5);
+        assert_eq!(found.switchpoint_of(4), Some(0x3_3900_0900));
+
+        archive_history_file(
+            &settings,
+            &storage,
+            6,
+            "1\t3/10000000\tpromotion\n2\t3/20000000\tpromotion\n3\t3/39000100\tpromotion\n4\t3/50000000\tpromotion\n5\t3/60000000\tpromotion\n",
+        )
+        .await;
+        assert_eq!(
+            archive
+                .discover_history(&known, lsn)
+                .await
+                .unwrap()
+                .map(|h| h.target()),
+            Some(5),
+            "a chain that moved timeline 4's switchpoint is a different lineage",
+        );
+    }
+
+    #[test]
+    fn segment_candidates_try_the_newest_branch_first() {
+        let history = TimelineHistory::parse(
+            5,
+            b"1\t3/10000000\tpromotion\n2\t3/20000000\tpromotion\n3\t3/39000100\tpromotion\n4\t3/39000900\tpromotion\n",
+        )
+        .unwrap();
+        assert_eq!(
+            segment_candidates(&history, 4, 0x3_3900_0000),
+            [
+                "000000050000000300000039",
+                "000000040000000300000039",
+                "000000040000000300000039.partial",
+            ],
+        );
     }
 
     #[tokio::test]
