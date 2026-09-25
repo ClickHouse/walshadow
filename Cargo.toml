@@ -37,7 +37,7 @@ zstd = ["clickhouse-c-rs/zstd"]
 
 [dependencies]
 wal-rus = "0.3.5"
-clickhouse-c-rs = { version = "0.2.1", default-features = false, features = ["tokio", "tls"] }
+clickhouse-c-rs = { version = "0.2.2", default-features = false, features = ["tokio", "tls"] }
 # hash keys are internal (relfilenodes, oids, xids, names), never network
 # input, so SipHash's HashDoS margin buys nothing at 2-4x per probe
 ahash = "0.8"
@@ -71,10 +71,10 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt", "ansi"] }
 url = "2"
 zstd = "0.14"
-opentelemetry = "0.32"
-opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
-opentelemetry-otlp = { version = "0.32", default-features = false, features = ["grpc-tonic", "trace"] }
-tracing-opentelemetry = { version = "0.33", default-features = false }
+opentelemetry = "0.33"
+opentelemetry_sdk = { version = "0.33", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.33", default-features = false, features = ["grpc-tonic", "trace"] }
+tracing-opentelemetry = { version = "0.34", default-features = false }
 mimalloc = "0.1.52"
 prometheus-client = "0.25.1"
 
