@@ -130,6 +130,11 @@ Apply live:
 - batch sizes, flush timeout, compression, and retry count
 - source and ClickHouse endpoints
 
+`[ch] flush_timeout_ms` defaults to 200 and bounds how long a row waits before
+its INSERT seals, so it sets both replication lag and part rate: one part per
+table per window under continuous load. Raise it to coalesce more rows into
+fewer, larger parts; lower it for tighter lag at the cost of merge pressure
+
 Require restart:
 
 - `replicate_all`

@@ -82,7 +82,7 @@ pub(crate) const DEFAULT_PLAN_DISK_MAX: u64 = 8 << 30; // 8 GiB
 /// Default flush timeout (ms). Holds INSERTs open across xacts, sealing on a
 /// deadline armed at the first row of a fresh INSERT. An explicit `0` keeps the
 /// serial emitter's close-on-every-xact behaviour (bootstrap backfill).
-pub(crate) const DEFAULT_FLUSH_TIMEOUT_MS: u64 = 1000;
+pub(crate) const DEFAULT_FLUSH_TIMEOUT_MS: u64 = 200;
 
 /// Rows coalesced per batcher chunk
 pub(crate) const DEFAULT_DECODE_CHUNK_ROWS: usize = 1024;
@@ -116,8 +116,9 @@ pub struct EmitterConfig {
     /// Hold INSERTs open across xacts. Deadline arms at the first row of a
     /// fresh INSERT and trips at `now + flush_timeout`; on trip the batcher
     /// seals that block, which advances the durable-LSN horizon once the
-    /// insert acks. `Duration::ZERO` (default) takes the pipeline's
-    /// `DEFAULT_PIPELINE_FLUSH` (100 ms), not per-xact INSERTs. Latency
+    /// insert acks. Defaults to 200 ms; an explicit `Duration::ZERO` takes
+    /// the pipeline's `DEFAULT_PIPELINE_FLUSH` (100 ms), not per-xact
+    /// INSERTs. Latency
     /// cap: a buffered row is at most `flush_timeout` from
     /// sealed, since the batcher sleeps to the nearest deadline rather than
     /// scanning on a `flush_timeout` period. Throughput: small commits
@@ -2597,7 +2598,7 @@ mod tests {
         let c = EmitterConfig::from_toml_str("[ch]\nhost = \"h\"\n").expect("parses");
         assert_eq!(c.row_budget, 4_194_304);
         assert_eq!(c.byte_budget, 256 << 20);
-        assert_eq!(c.flush_timeout, Duration::from_millis(1000));
+        assert_eq!(c.flush_timeout, Duration::from_millis(200));
         assert_eq!(c.decoder_pool_size, DEFAULT_DECODER_POOL);
         assert_eq!(c.inserter_pool_size, default_inserter_pool());
         assert!(

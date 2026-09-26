@@ -245,9 +245,9 @@ pub(crate) struct Args {
     /// SIGHUP (atomic mapping swap; connection params stay boot-only).
     #[arg(long)]
     pub(crate) ch_config: Option<PathBuf>,
-    /// CLI override for the TOML's `[ch] flush_timeout_ms`. On the live
-    /// pipeline `0` (default) selects a 100ms partial-batch deadline so
-    /// cold tables can't pin the watermark; positive sets it explicitly.
+    /// CLI override for the TOML's `[ch] flush_timeout_ms`, which defaults to
+    /// 200ms. On the live pipeline an explicit `0` selects a 100ms
+    /// partial-batch deadline so cold tables can't pin the watermark.
     /// No per-xact-close path runs on the live drain (survives only in
     /// bootstrap backfill, forced internally). SIGHUP reads `--ch-config`
     /// only, so use this flag for the boot value when not maintaining the
