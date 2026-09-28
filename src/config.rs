@@ -32,7 +32,7 @@ use walrus::pg::replication::conn::PgConfig;
 use walrus::pg::replication::tls::{SslMode, TlsParams};
 
 use crate::ch::{CompressionChoice, EmitterError};
-use crate::column_rules::{ColumnRule, ColumnRules, ColumnRulesBuilder};
+use crate::column_rules::{ColumnRule, ColumnRules, ColumnRulesBuilder, Substitute};
 use crate::emit::ch_emitter::EmitterConfig;
 use crate::filter::shadow_relations::ShadowHeld;
 use crate::mapping::{
@@ -670,30 +670,38 @@ impl ConfigResolver {
                     continue;
                 }
             };
-            let Some(ty) = &row.target_type else {
-                continue;
-            };
             // Validate syntax now, validate wire compatibility with descriptor
-            let accepted = if TypeAst::parse(ty, Allocator::global(&mimalloc::MiMalloc)).is_ok() {
-                Some(ty.as_str())
-            } else {
+            let target_type = row.target_type.as_deref().and_then(|ty| {
+                if TypeAst::parse(ty, Allocator::global(&mimalloc::MiMalloc)).is_ok() {
+                    return Some(ty);
+                }
                 column_rules.bump_rejections();
                 let prior = prev_columns.accepted_type(rel, attname);
                 tracing::warn!(target: "walshadow::config", qname = %rel, attname = %attname, value = %ty, kept_prior = prior.is_some(), "config_column.target_type rejected: unparseable CH type");
                 prior
-            };
-            if let Some(ty) = accepted {
+            });
+            if let Some(ty) = target_type {
                 column_rules.record_accepted(rel, attname, ty);
-                column_rules.add(
-                    rel,
-                    kind,
-                    attname,
-                    kind,
-                    ColumnRule {
-                        target_type: Some(ty.to_owned()),
-                        ..ColumnRule::default()
-                    },
-                );
+            }
+            // Malformed substitute rejects rather than falls through to a broader one
+            let mut sub = |key: &str, v: &Option<String>| {
+                v.as_deref().map(|v| {
+                    v.parse().unwrap_or_else(|e| {
+                        column_rules.bump_rejections();
+                        tracing::warn!(target: "walshadow::config", qname = %rel, attname = %attname, key, error = %e, "config_column substitute rejected, NaN/Inf stop stream");
+                        Substitute::Reject
+                    })
+                })
+            };
+            let rule = ColumnRule {
+                target_type: target_type.map(str::to_owned),
+                nan: sub("nan", &row.nan),
+                pos_inf: sub("pos_inf", &row.pos_inf),
+                neg_inf: sub("neg_inf", &row.neg_inf),
+                ..ColumnRule::default()
+            };
+            if !rule.is_empty() {
+                column_rules.add(rel, kind, attname, kind, rule);
             }
         }
         let (column_rules, column_rejections) = column_rules.finish();
@@ -1676,6 +1684,61 @@ mod tests {
     }
 
     #[test]
+    fn column_substitutes_overlay_toml_defaults() {
+        use crate::runtime_config::ColumnRow;
+        let base = EmitterConfig::from_toml_str(
+            "[ch]\n\
+             [table.app.\"*\"]\n\
+             match = \"glob\"\n\
+             replicate = true\n\
+             columns = [{ name = \"*\", match = \"glob\", nan = \"0\", pos_inf = \"max\" }]\n",
+        )
+        .unwrap();
+        let rel = RelName::new("app", "events");
+        let mut overlay = ConfigOverlay::default();
+        overlay.columns.insert(
+            (rel.clone(), "amount".into()),
+            ColumnRow {
+                nan: Some("reject".into()),
+                neg_inf: Some("min".into()),
+                ..ColumnRow::default()
+            },
+        );
+        overlay.columns.insert(
+            (rel.clone(), "typo".into()),
+            ColumnRow {
+                nan: Some("zero".into()),
+                ..ColumnRow::default()
+            },
+        );
+        let (r, rej) = ConfigResolver::resolve(
+            &base,
+            &overlay,
+            &CliOverrides::default(),
+            &OptInState::default(),
+            &ColumnRules::default(),
+        );
+        assert_eq!(rej, 1, "malformed substitute rejected");
+        let s = r.column_rules.settings(&rel, "amount");
+        assert_eq!(
+            s.nan,
+            Some(Substitute::Reject),
+            "explicit reject cancels TOML"
+        );
+        assert_eq!(s.pos_inf, Some(Substitute::Max), "unset inherits TOML");
+        assert_eq!(s.neg_inf, Some(Substitute::Min));
+        assert_eq!(
+            r.column_rules.settings(&rel, "typo").nan,
+            Some(Substitute::Reject),
+            "malformed value never falls through to inherited substitute"
+        );
+        assert_eq!(
+            r.column_rules.settings(&rel, "other").nan,
+            Some(Substitute::Literal("0".into()))
+        );
+    }
+
+    #[test]
     fn column_rules_layer_toml_under_a_pattern_overlay_row() {
         use crate::runtime_config::ColumnRow;
         let base = EmitterConfig::from_toml_str(
@@ -1691,6 +1754,7 @@ mod tests {
             ColumnRow {
                 target_type: Some("Int128".into()),
                 match_kind: Some("glob".into()),
+                ..ColumnRow::default()
             },
         );
         let (r, rej) = ConfigResolver::resolve(
@@ -1731,7 +1795,7 @@ mod tests {
             (RelName::new("app", "events"), "amount".into()),
             ColumnRow {
                 target_type: Some("Int128".into()),
-                match_kind: None,
+                ..ColumnRow::default()
             },
         );
         let (r, _) = ConfigResolver::resolve(

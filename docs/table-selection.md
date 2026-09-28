@@ -152,3 +152,56 @@ columns = [
 Avoid `attnum` mappings unless destination projection must stay fixed. An
 `attnum` mapping pins full projection, requires explicit ClickHouse names and
 types, and will not automatically include unrelated source columns
+
+## Replace NaN and infinity
+
+ClickHouse `Decimal` cannot hold PostgreSQL `numeric` `NaN`, `Infinity`, or
+`-Infinity`. By default, encountering any of these values stops replication
+with an error identifying affected column. Map column to `String` to keep
+original text, or choose replacements with `nan`, `pos_inf`, and `neg_inf`:
+
+```toml
+[table.app."*"]
+match = "glob"
+replicate = true
+columns = [
+    { name = "*_amount", match = "glob", nan = "0", pos_inf = "max", neg_inf = "min" },
+]
+```
+
+| Value | Effect |
+|---|---|
+| `reject` | stop replication, default |
+| `null` | write NULL, destination must be `Nullable(Decimal(...))` |
+| `min`, `max` | write smallest or largest value of destination `Decimal(p,s)`, eg `-99999999.99` and `99999999.99` for `Decimal(10,2)` |
+| decimal number | write a fixed value, such as `0` or `-1.5`, that fits destination decimal type without rounding |
+
+Set each replacement independently. For example, a column rule setting only
+`nan` keeps `pos_inf` and `neg_inf` from matching broader rules. Set `reject`
+to stop on that value even when a broader rule supplies a replacement
+
+Numeric replacements apply to `Decimal` columns during initial loads and
+ongoing replication. They do not affect `String` columns or apply to column
+defaults or array elements; see [ClickHouse limits](limitations.md#clickhouse)
+
+For PostgreSQL `date`, `timestamp`, and `timestamptz`, `pos_inf` and
+`neg_inf` also accept `reject` (default) or `null`. NULL substitution requires
+`Nullable(Date32)` or `Nullable(DateTime64(...))`, for example:
+
+```toml
+columns = [
+    { name = "expires_at", type = "Nullable(DateTime64(6, 'UTC'))", pos_inf = "null", neg_inf = "null" },
+]
+```
+
+Temporal infinities stop replication by default. Temporal `min`, `max`, and
+literal substitutes are unsupported. NULL substitution covers local row
+encoding; oracle encoding and fast defaults do not support it. Finite timestamps
+rescale exactly to destination precision; discarded nonzero digits and storage
+overflow reject. Supported calendar ranges are not validated
+
+Choose replacements that fit destination column type. For example, `null`
+requires a nullable column, and `1.230` fits `Decimal(10,2)` but `1.234` does
+not. An invalid setting is rejected when loading config. A recognized
+replacement that does not fit stops replication when affected table first
+receives rows. Review replacements after changing a column's type

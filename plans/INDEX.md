@@ -40,6 +40,7 @@ writes. A documented limitation does not imply code rejects it
 | [Shadow TOAST reclamation](shadow_toast.md) | Keep historical values readable under lag and restart |
 | [Replay callback](custom_rmgr.md) | Reduce measured command-boundary capture stalls |
 | [Dependencies](dependencies.md) | Replace generic protocol code when an adapter preserves behavior |
+| [Value coercion](value_coercion.md) | Validate destination domains and align fast defaults with row substitution |
 | [Tier 2 containers](tier2.md) | Remove shadow round trips for array, map, and vector columns |
 | [Optional capabilities](extensions.md) | Meet a concrete routing, export, vector, or durability requirement |
 

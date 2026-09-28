@@ -33,7 +33,7 @@ use clickhouse_c::{Allocator, ColumnBuilder, Kind, TypeAst};
 #[cfg(test)]
 use crate::ch::is_retryable;
 use crate::ch::{CompressionChoice, ConnectionConfig, EmitterError, quote_ident, types};
-use crate::column_rules::{ColumnEntry, ColumnRule, ColumnRules};
+use crate::column_rules::{ColumnEntry, ColumnRule, ColumnRules, Substitute};
 #[cfg(test)]
 use crate::decode::decoder_sink::DecoderSinkError;
 use crate::decode::heap_decoder::{ColumnValue, CommittedTuple, HeapOp};
@@ -373,11 +373,21 @@ pub(crate) const DEFAULT_IDLE_RECONNECT_SECS: u64 = 30;
 /// Bounded-retry knobs. Retryable error (IO, clickhouse-c protocol,
 /// ServerException) triggers reconnect + retry up to `max_attempts`
 /// with exponential backoff capped at `max_backoff`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(default)]
 pub struct RetryConfig {
     /// Retry budget after initial call, including failed reconnects
+    #[serde(rename = "retry_max_attempts")]
     pub max_attempts: u32,
+    #[serde(
+        rename = "retry_initial_backoff_ms",
+        deserialize_with = "crate::toml_de::de_millis"
+    )]
     pub initial_backoff: std::time::Duration,
+    #[serde(
+        rename = "retry_max_backoff_ms",
+        deserialize_with = "crate::toml_de::de_millis"
+    )]
     pub max_backoff: std::time::Duration,
 }
 
@@ -402,52 +412,11 @@ impl Default for RetryConfig {
 
 impl Default for EmitterConfig {
     fn default() -> Self {
-        Self {
-            host: "localhost".into(),
-            port: 9000,
-            database: "default".into(),
-            user: "default".into(),
-            password: String::new(),
-            secure: false,
-            tls_config: None,
-            compression: CompressionChoice::default(),
-            row_budget: DEFAULT_ROW_BUDGET,
-            byte_budget: DEFAULT_BYTE_BUDGET,
-            flush_timeout: Duration::from_millis(DEFAULT_FLUSH_TIMEOUT_MS),
-            tables: HashMap::new(),
-            table_initial_loads: HashMap::new(),
-            table_entries: Vec::new(),
-            column_entries: Vec::new(),
-            table_opt_ins: HashMap::new(),
-            paused: false,
-            replicate_all: true,
-            pending_capture: Default::default(),
-            namespaces: HashMap::new(),
-            databases: Vec::new(),
-            drop_table_strategy: DropTableStrategy::default(),
-            retry: RetryConfig::default(),
-            insert_timeout: Duration::from_secs(DEFAULT_INSERT_TIMEOUT_SECS),
-            idle_reconnect: Duration::from_secs(DEFAULT_IDLE_RECONNECT_SECS),
-            soft_delete: false,
-            system_columns: Arc::default(),
-            decode_chunk_rows: DEFAULT_DECODE_CHUNK_ROWS,
-            drain_batch_rows: DEFAULT_DRAIN_BATCH_ROWS,
-            drain_batch_bytes: DEFAULT_DRAIN_BATCH_BYTES,
-            plan_disk_max: DEFAULT_PLAN_DISK_MAX,
-            runtime_config_schema: None,
-            source: crate::config::SourceConn::default(),
-            resident_payload_max: default_resident_payload_max(),
-            inline_value_max: DEFAULT_INLINE_VALUE_MAX,
-            value_reserve: DEFAULT_VALUE_RESERVE,
-            inline_value_overflow: InlineValueOverflow::default(),
-            decoder_pool_size: DEFAULT_DECODER_POOL,
-            inserter_pool_size: default_inserter_pool(),
-            decoder_batch_size: DEFAULT_QUEUEING_BATCH_SIZE,
-            decoder_queue_capacity: DEFAULT_QUEUEING_RECORD_SINK_CAPACITY,
-            backup: None,
-            bootstrap: BootstrapSettings::default(),
-            toast: ToastSettings::default(),
-        }
+        Self::from_sections(
+            ChSection::default(),
+            MemorySection::default(),
+            StreamSection::default(),
+        )
     }
 }
 
@@ -627,13 +596,13 @@ impl ConnectionConfig for EmitterConfig {
 #[derive(serde::Deserialize)]
 struct ConfigDocument {
     #[serde(default)]
-    ch: ChPatch,
+    ch: ChSection,
     #[serde(default)]
-    memory: MemoryPatch,
+    memory: MemorySection,
     #[serde(default)]
     runtime_config: RuntimeConfigPatch,
     #[serde(default)]
-    stream: StreamPatch,
+    stream: StreamSection,
     #[serde(default)]
     system_columns: SystemColumns,
     #[serde(default)]
@@ -793,40 +762,84 @@ fn declared_target(
     ))
 }
 
-#[derive(Default, serde::Deserialize)]
-struct ChPatch {
-    host: Option<String>,
-    port: Option<u16>,
-    database: Option<String>,
-    user: Option<String>,
-    password: Option<String>,
-    secure: Option<bool>,
-    #[serde(default, deserialize_with = "crate::toml_de::de_from_str")]
-    compression: Option<CompressionChoice>,
-    row_budget: Option<usize>,
-    byte_budget: Option<usize>,
-    drain_batch_rows: Option<usize>,
-    drain_batch_bytes: Option<usize>,
-    plan_disk_max: Option<u64>,
-    decoder_pool_size: Option<usize>,
-    inserter_pool_size: Option<usize>,
-    decoder_batch_size: Option<usize>,
-    decoder_queue_capacity: Option<usize>,
-    flush_timeout_ms: Option<u64>,
-    retry_max_attempts: Option<u32>,
-    retry_initial_backoff_ms: Option<u64>,
-    retry_max_backoff_ms: Option<u64>,
-    #[serde(default, deserialize_with = "crate::toml_de::de_from_str")]
-    drop_table_strategy: Option<DropTableStrategy>,
-    soft_delete: Option<bool>,
+#[derive(serde::Deserialize)]
+#[serde(default)]
+struct ChSection {
+    host: String,
+    port: u16,
+    database: String,
+    user: String,
+    password: String,
+    secure: bool,
+    #[serde(deserialize_with = "crate::toml_de::de_parse")]
+    compression: CompressionChoice,
+    row_budget: usize,
+    byte_budget: usize,
+    drain_batch_rows: usize,
+    drain_batch_bytes: usize,
+    plan_disk_max: u64,
+    /// Leave zero for bin/stream/args.rs to clamp
+    decoder_pool_size: usize,
+    inserter_pool_size: usize,
+    decoder_batch_size: usize,
+    decoder_queue_capacity: usize,
+    #[serde(
+        rename = "flush_timeout_ms",
+        deserialize_with = "crate::toml_de::de_millis"
+    )]
+    flush_timeout: Duration,
+    #[serde(flatten)]
+    retry: RetryConfig,
+    #[serde(deserialize_with = "crate::toml_de::de_parse")]
+    drop_table_strategy: DropTableStrategy,
+    soft_delete: bool,
 }
 
-#[derive(Default, serde::Deserialize)]
-struct MemoryPatch {
-    resident_payload_max: Option<usize>,
-    inline_value_max: Option<usize>,
-    value_reserve: Option<usize>,
-    inline_value_overflow: Option<InlineValueOverflow>,
+impl Default for ChSection {
+    fn default() -> Self {
+        Self {
+            host: "localhost".into(),
+            port: 9000,
+            database: "default".into(),
+            user: "default".into(),
+            password: String::new(),
+            secure: false,
+            compression: CompressionChoice::default(),
+            row_budget: DEFAULT_ROW_BUDGET,
+            byte_budget: DEFAULT_BYTE_BUDGET,
+            drain_batch_rows: DEFAULT_DRAIN_BATCH_ROWS,
+            drain_batch_bytes: DEFAULT_DRAIN_BATCH_BYTES,
+            plan_disk_max: DEFAULT_PLAN_DISK_MAX,
+            decoder_pool_size: DEFAULT_DECODER_POOL,
+            inserter_pool_size: default_inserter_pool(),
+            decoder_batch_size: DEFAULT_QUEUEING_BATCH_SIZE,
+            decoder_queue_capacity: DEFAULT_QUEUEING_RECORD_SINK_CAPACITY,
+            flush_timeout: Duration::from_millis(DEFAULT_FLUSH_TIMEOUT_MS),
+            retry: RetryConfig::default(),
+            drop_table_strategy: DropTableStrategy::default(),
+            soft_delete: false,
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(default)]
+struct MemorySection {
+    resident_payload_max: usize,
+    inline_value_max: usize,
+    value_reserve: usize,
+    inline_value_overflow: InlineValueOverflow,
+}
+
+impl Default for MemorySection {
+    fn default() -> Self {
+        Self {
+            resident_payload_max: default_resident_payload_max(),
+            inline_value_max: DEFAULT_INLINE_VALUE_MAX,
+            value_reserve: DEFAULT_VALUE_RESERVE,
+            inline_value_overflow: InlineValueOverflow::default(),
+        }
+    }
 }
 
 #[derive(Default, serde::Deserialize)]
@@ -835,12 +848,23 @@ struct RuntimeConfigPatch {
     schema: Option<String>,
 }
 
-#[derive(Default, serde::Deserialize)]
-struct StreamPatch {
-    paused: Option<bool>,
-    replicate_all: Option<bool>,
-    pending_max_boundaries_per_xact: Option<u32>,
-    pending_max_hold_ms: Option<u64>,
+#[derive(serde::Deserialize)]
+#[serde(default)]
+struct StreamSection {
+    paused: bool,
+    replicate_all: bool,
+    #[serde(flatten)]
+    pending_capture: crate::source::catalog_capture::PendingCaptureConfig,
+}
+
+impl Default for StreamSection {
+    fn default() -> Self {
+        Self {
+            paused: false,
+            replicate_all: true,
+            pending_capture: Default::default(),
+        }
+    }
 }
 
 #[derive(Default, serde::Deserialize)]
@@ -894,9 +918,64 @@ struct ColumnPatch {
         deserialize_with = "crate::toml_de::de_from_str"
     )]
     match_kind: Option<MatchKind>,
+    #[serde(default, deserialize_with = "crate::toml_de::de_from_str")]
+    nan: Option<Substitute>,
+    #[serde(default, deserialize_with = "crate::toml_de::de_from_str")]
+    pos_inf: Option<Substitute>,
+    #[serde(default, deserialize_with = "crate::toml_de::de_from_str")]
+    neg_inf: Option<Substitute>,
 }
 
 impl EmitterConfig {
+    fn from_sections(ch: ChSection, memory: MemorySection, stream: StreamSection) -> Self {
+        Self {
+            host: ch.host,
+            port: ch.port,
+            database: ch.database,
+            user: ch.user,
+            password: ch.password,
+            secure: ch.secure,
+            tls_config: None,
+            compression: ch.compression,
+            row_budget: ch.row_budget,
+            byte_budget: ch.byte_budget,
+            flush_timeout: ch.flush_timeout,
+            tables: HashMap::new(),
+            table_initial_loads: HashMap::new(),
+            table_entries: Vec::new(),
+            column_entries: Vec::new(),
+            table_opt_ins: HashMap::new(),
+            paused: stream.paused,
+            replicate_all: stream.replicate_all,
+            pending_capture: stream.pending_capture,
+            namespaces: HashMap::new(),
+            databases: Vec::new(),
+            drop_table_strategy: ch.drop_table_strategy,
+            retry: ch.retry,
+            insert_timeout: Duration::from_secs(DEFAULT_INSERT_TIMEOUT_SECS),
+            idle_reconnect: Duration::from_secs(DEFAULT_IDLE_RECONNECT_SECS),
+            soft_delete: ch.soft_delete,
+            system_columns: Arc::default(),
+            decode_chunk_rows: DEFAULT_DECODE_CHUNK_ROWS,
+            drain_batch_rows: ch.drain_batch_rows,
+            drain_batch_bytes: ch.drain_batch_bytes,
+            plan_disk_max: ch.plan_disk_max,
+            runtime_config_schema: None,
+            source: crate::config::SourceConn::default(),
+            resident_payload_max: memory.resident_payload_max,
+            inline_value_max: memory.inline_value_max,
+            value_reserve: memory.value_reserve,
+            inline_value_overflow: memory.inline_value_overflow,
+            decoder_pool_size: ch.decoder_pool_size,
+            inserter_pool_size: ch.inserter_pool_size,
+            decoder_batch_size: ch.decoder_batch_size,
+            decoder_queue_capacity: ch.decoder_queue_capacity,
+            backup: None,
+            bootstrap: BootstrapSettings::default(),
+            toast: ToastSettings::default(),
+        }
+    }
+
     /// Boot-only row-shape knobs frozen into every route
     pub fn row_policy(&self) -> crate::emit::route::RowPolicy {
         crate::emit::route::RowPolicy {
@@ -937,8 +1016,7 @@ impl EmitterConfig {
     /// ]
     /// ```
     pub fn from_toml_str(s: &str) -> Result<Self, EmitterError> {
-        let root: toml::Table = toml::from_str(s)
-            .map_err(|e: toml::de::Error| EmitterError::Config(format!("toml: {e}")))?;
+        let root: toml::Table = toml::from_str(s).map_err(crate::toml_de::config_error)?;
         Self::from_table(&root)
     }
 
@@ -957,63 +1035,12 @@ impl EmitterConfig {
         let doc: ConfigDocument = toml::Value::Table(root.clone())
             .try_into()
             .map_err(crate::toml_de::config_error)?;
-        let mut out = Self::default();
-        let ch = doc.ch;
-        out.host = ch.host.unwrap_or(out.host);
-        out.port = ch.port.unwrap_or(out.port);
-        out.database = ch.database.unwrap_or(out.database);
-        out.user = ch.user.unwrap_or(out.user);
-        out.password = ch.password.unwrap_or(out.password);
-        out.secure = ch.secure.unwrap_or(out.secure);
-        out.compression = ch.compression.unwrap_or(out.compression);
-        out.row_budget = ch.row_budget.unwrap_or(out.row_budget);
-        out.byte_budget = ch.byte_budget.unwrap_or(out.byte_budget);
-        out.drain_batch_rows = ch.drain_batch_rows.unwrap_or(out.drain_batch_rows);
-        out.drain_batch_bytes = ch.drain_batch_bytes.unwrap_or(out.drain_batch_bytes);
-        out.plan_disk_max = ch.plan_disk_max.unwrap_or(out.plan_disk_max);
-        // Leave zero for bin/stream/args.rs to clamp
-        out.decoder_pool_size = ch.decoder_pool_size.unwrap_or(out.decoder_pool_size);
-        out.inserter_pool_size = ch.inserter_pool_size.unwrap_or(out.inserter_pool_size);
-        out.decoder_batch_size = ch.decoder_batch_size.unwrap_or(out.decoder_batch_size);
-        out.decoder_queue_capacity = ch
-            .decoder_queue_capacity
-            .unwrap_or(out.decoder_queue_capacity);
-        out.flush_timeout = ch
-            .flush_timeout_ms
-            .map_or(out.flush_timeout, Duration::from_millis);
-        out.retry.max_attempts = ch.retry_max_attempts.unwrap_or(out.retry.max_attempts);
-        out.retry.initial_backoff = ch
-            .retry_initial_backoff_ms
-            .map_or(out.retry.initial_backoff, Duration::from_millis);
-        out.retry.max_backoff = ch
-            .retry_max_backoff_ms
-            .map_or(out.retry.max_backoff, Duration::from_millis);
-        out.drop_table_strategy = ch.drop_table_strategy.unwrap_or(out.drop_table_strategy);
-        out.soft_delete = ch.soft_delete.unwrap_or(out.soft_delete);
+        let mut out = Self::from_sections(doc.ch, doc.memory, doc.stream);
         doc.system_columns
             .validate()
             .map_err(EmitterError::Config)?;
         out.system_columns = Arc::new(doc.system_columns);
-        out.resident_payload_max = doc
-            .memory
-            .resident_payload_max
-            .unwrap_or(out.resident_payload_max);
-        out.inline_value_max = doc.memory.inline_value_max.unwrap_or(out.inline_value_max);
-        out.value_reserve = doc.memory.value_reserve.unwrap_or(out.value_reserve);
-        out.inline_value_overflow = doc
-            .memory
-            .inline_value_overflow
-            .unwrap_or(out.inline_value_overflow);
         out.runtime_config_schema = doc.runtime_config.schema;
-        let st = doc.stream;
-        out.paused = st.paused.unwrap_or(out.paused);
-        out.replicate_all = st.replicate_all.unwrap_or(out.replicate_all);
-        out.pending_capture.max_boundaries_per_xact = st
-            .pending_max_boundaries_per_xact
-            .unwrap_or(out.pending_capture.max_boundaries_per_xact);
-        out.pending_capture.max_hold_per_xact = st
-            .pending_max_hold_ms
-            .map_or(out.pending_capture.max_hold_per_xact, Duration::from_millis);
         out.source = doc.source;
         // Unprefixed entries belong to `[source] dbname` whatever database
         // this parse is scoped to, so a prefixed entry for another database
@@ -1178,20 +1205,22 @@ impl EmitterConfig {
                             att_kind.as_str()
                         )));
                     }
-                    if c.target.is_none() && c.target_type.is_none() {
-                        return Err(EmitterError::Config(format!(
-                            "{ctx}: sets neither target nor type"
-                        )));
+                    let rule = ColumnRule {
+                        target_name: c.target,
+                        target_type: c.target_type,
+                        nan: c.nan,
+                        pos_inf: c.pos_inf,
+                        neg_inf: c.neg_inf,
+                    };
+                    if rule.is_empty() {
+                        return Err(EmitterError::Config(format!("{ctx}: sets nothing")));
                     }
                     named.push(ColumnEntry {
                         rel: rel.clone(),
                         rel_kind: kind,
                         attname,
                         att_kind,
-                        rule: ColumnRule {
-                            target_name: c.target,
-                            target_type: c.target_type,
-                        },
+                        rule,
                     });
                 }
             }
@@ -1271,7 +1300,90 @@ pub(crate) struct ColumnPlan {
     pub(crate) type_repr: String,
     pub(crate) ast: TypeAst,
     pub(crate) decimal: Option<DecimalWire>,
+    pub(crate) datetime64_scale: i32,
+    pub(crate) non_finite: NonFinite,
     pub(crate) encoding: ColumnEncoding,
+}
+
+/// Values replacing non-finite numerics or temporal infinities, `None` rejects
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct NonFinite {
+    nan: Option<ColumnValue>,
+    pos_inf: Option<ColumnValue>,
+    neg_inf: Option<ColumnValue>,
+}
+
+impl NonFinite {
+    /// Resolve settings against Decimal or temporal destination once per plan
+    fn compile(rule: &ColumnRule, ast: &TypeAst) -> Result<Self, String> {
+        use crate::decode::codecs::NumericKind;
+        let nullable = ast.view().kind() == Some(Kind::Nullable);
+        let inner = types::strip_nullable(ast.view());
+        let decimal = decimal_wire_of(ast);
+        if decimal.is_none() && !matches!(inner.kind(), Some(Kind::Date32 | Kind::DateTime64)) {
+            return Ok(Self::default());
+        }
+        let precision =
+            usize::try_from(inner.decimal_precision()).map_err(|_| "bad Decimal precision")?;
+        let scale = usize::from(decimal.map_or(0, |w| w.scale));
+        let bound = format!("{}.{}", "9".repeat(precision - scale), "9".repeat(scale));
+        let cell = |key: &str, sub: &Option<Substitute>| {
+            let text = match sub {
+                None | Some(Substitute::Reject) => return Ok(None),
+                Some(Substitute::Null) if nullable => return Ok(Some(ColumnValue::Null)),
+                Some(Substitute::Null) => {
+                    return Err(format!("{key} = \"null\" needs a Nullable destination"));
+                }
+                Some(_) if decimal.is_none() => {
+                    return Err(format!(
+                        "{key}: temporal infinity supports only reject or null"
+                    ));
+                }
+                Some(Substitute::Min) => format!("-{bound}"),
+                Some(Substitute::Max) => bound.clone(),
+                Some(Substitute::Literal(lit)) => lit.clone(),
+            };
+            let (int, frac) = crate::column_rules::decimal_parts(&text).unwrap_or_default();
+            if frac.len() > scale && frac[scale..].bytes().any(|b| b != b'0') {
+                return Err(format!(
+                    "{key} = {text:?}: more than {scale} fractional digits"
+                ));
+            }
+            if int.trim_start_matches('0').len() + scale > precision {
+                return Err(format!(
+                    "{key} = {text:?}: exceeds Decimal({precision}, {scale})"
+                ));
+            }
+            Ok(Some(ColumnValue::Numeric(NumericKind::Finite(text))))
+        };
+        Ok(Self {
+            // Temporal values have no NaN
+            nan: if decimal.is_some() {
+                cell("nan", &rule.nan)?
+            } else {
+                None
+            },
+            pos_inf: cell("pos_inf", &rule.pos_inf)?,
+            neg_inf: cell("neg_inf", &rule.neg_inf)?,
+        })
+    }
+
+    fn substitute<'a>(&'a self, v: &'a ColumnValue) -> &'a ColumnValue {
+        use crate::decode::codecs::NumericKind;
+        let sub = match v {
+            ColumnValue::Numeric(NumericKind::NaN) => &self.nan,
+            ColumnValue::Numeric(NumericKind::PInf)
+            | ColumnValue::Date(i32::MAX)
+            | ColumnValue::Timestamp(i64::MAX)
+            | ColumnValue::TimestampTz(i64::MAX) => &self.pos_inf,
+            ColumnValue::Numeric(NumericKind::NInf)
+            | ColumnValue::Date(i32::MIN)
+            | ColumnValue::Timestamp(i64::MIN)
+            | ColumnValue::TimestampTz(i64::MIN) => &self.neg_inf,
+            _ => return v,
+        };
+        sub.as_ref().unwrap_or(v)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1388,13 +1500,15 @@ impl TablePlan {
                 name: c.target_name.clone(),
                 type_repr: canonical_type(&ast, &c.target_type),
                 encoding: ColumnEncoding::choose(att, &ast),
+                datetime64_scale: types::strip_nullable(ast.view()).datetime64_scale(),
                 ast,
                 decimal,
+                non_finite: NonFinite::default(),
             };
-            if let Some(ty) =
-                att.and_then(|a| column_rules.settings(&rel.rel_name, &a.name).target_type)
-            {
-                let ty = &ty;
+            let settings = att
+                .map(|a| column_rules.settings(&rel.rel_name, &a.name))
+                .unwrap_or_default();
+            if let Some(ty) = &settings.target_type {
                 match TypeAst::parse(ty, alloc) {
                     Ok(oast) => {
                         if let Some(decimal) = override_wire(&plan.ast, &oast) {
@@ -1402,8 +1516,11 @@ impl TablePlan {
                                 name: plan.name,
                                 type_repr: canonical_type(&oast, ty),
                                 encoding: ColumnEncoding::choose(att, &oast),
+                                datetime64_scale: types::strip_nullable(oast.view())
+                                    .datetime64_scale(),
                                 ast: oast,
                                 decimal,
+                                non_finite: NonFinite::default(),
                             };
                         } else {
                             tracing::warn!(
@@ -1426,6 +1543,29 @@ impl TablePlan {
                     ),
                 }
             }
+            let config_err =
+                |e: &str| EmitterError::Config(format!("{}.{}: {e}", rel.rel_name, c.target_name));
+            let source_temporal = att.and_then(|a| match a.type_oid {
+                crate::schema::DATEOID => Some(Kind::Date32),
+                crate::schema::TIMESTAMPOID | crate::schema::TIMESTAMPTZOID => {
+                    Some(Kind::DateTime64)
+                }
+                _ => None,
+            });
+            if plan.encoding == ColumnEncoding::Local
+                && source_temporal.is_some()
+                && types::strip_nullable(plan.ast.view()).kind() != source_temporal
+            {
+                return Err(config_err(
+                    "local temporal encoding needs Date32 or DateTime64 matching source type",
+                ));
+            }
+            plan.non_finite =
+                NonFinite::compile(&settings, &plan.ast).map_err(|e| config_err(&e))?;
+            // Oracle cells never pass through substitution
+            if plan.encoding != ColumnEncoding::Local && plan.non_finite != NonFinite::default() {
+                return Err(config_err("substitution needs local encoding"));
+            }
             columns.push(plan);
             col_sql.push(quote_ident(&c.target_name));
         }
@@ -1436,6 +1576,8 @@ impl TablePlan {
                 ast: TypeAst::parse(ty, alloc)
                     .map_err(|e| EmitterError::Type(format!("{ty}: {e}")))?,
                 decimal: None,
+                datetime64_scale: 0,
+                non_finite: NonFinite::default(),
                 encoding: ColumnEncoding::Local,
             })
         };
@@ -1618,10 +1760,7 @@ impl ColumnBuf {
                 o.push(OracleCell::Default);
                 Ok(())
             }
-            _ => Err(EmitterError::UnsupportedValue {
-                target_column: String::new(),
-                kind: "NULL for non-Nullable column",
-            }),
+            _ => Err(unsupported("NULL for non-Nullable column")),
         }
     }
 
@@ -1670,10 +1809,7 @@ impl ColumnBuf {
                 inner.extend_from_slice(le);
                 Ok(())
             }
-            _ => Err(EmitterError::UnsupportedValue {
-                target_column: String::new(),
-                kind: "fixed-width value into string-shaped buffer",
-            }),
+            _ => Err(unsupported("fixed-width value into string-shaped buffer")),
         }
     }
 
@@ -1695,10 +1831,7 @@ impl ColumnBuf {
                 offsets.push(data.len() as u64);
                 Ok(())
             }
-            _ => Err(EmitterError::UnsupportedValue {
-                target_column: String::new(),
-                kind: "string value into fixed-shaped buffer",
-            }),
+            _ => Err(unsupported("string value into fixed-shaped buffer")),
         }
     }
 }
@@ -1824,22 +1957,21 @@ impl TableEncoder {
         }
         let mut cell_iter = cells.iter_mut();
         for (i, col) in mapping.columns.iter().enumerate() {
-            let decimal = self.plan.columns[i].decimal;
+            let col_plan = &self.plan.columns[i];
             let buf = &mut self.buffers[i];
             if let ColumnBuf::Oracle(o) = buf {
                 let cell = cell_iter.next().expect("one cell per oracle column");
                 o.push(std::mem::replace(cell, OracleCell::Default));
                 continue;
             }
-            match value_of(col) {
+            match value_of(col).map(|v| col_plan.non_finite.substitute(v)) {
                 // Absent / NULL coerces: Nullable target takes NULL,
                 // non-Nullable the type default. Covers key-only delete
                 // tombstones under non-FULL replica identity and NULL
                 // source values mapped onto non-Nullable columns
                 None | Some(ColumnValue::Null) => buf.append_default(),
-                Some(v) => {
-                    encode_value(buf, v, decimal).map_err(|e| name_column(e, &col.target_name))?
-                }
+                Some(v) => encode_value(buf, v, col_plan.decimal, col_plan.datetime64_scale)
+                    .map_err(|e| name_column(e, &col.target_name))?,
             }
         }
         cells.clear();
@@ -1978,22 +2110,16 @@ fn wire_shape_of(ast: &TypeAst) -> Option<(WireShape, Kind)> {
     Some((shape, inner.kind()?))
 }
 
-/// Whether a `config_column.target_type` override may replace `default` in
-/// the encode plan, and the `DecimalWire` the plan should carry if so.
-/// `encode_value` performs no arithmetic conversion — it writes the source
-/// value's natural wire bytes — so an override is admissible only when
-/// those bytes are valid wire data for the override type:
-///
-/// - Decimal-encoded source (`numeric`): any Decimal (the text→scaled path
-///   converts), String (lossless text), or a signed Int32/64/128/256 as a
-///   scale-0 decimal (the plan's acceptance drill: `numeric(38,0)` →
-///   `Int128`). Unsigned ints rejected — a negative value would encode as
-///   wrapped garbage
-/// - String-shaped source: string-shaped override only
-/// - Fixed-width source: same-width non-Decimal override (reinterpretation,
-///   e.g. `Int32` → `UInt32`); Decimal rejected because a nonzero scale
-///   would silently rescale the value
+/// Keep temporal kinds compatible; Decimal conversion also permits String
+/// or signed integers. Other scalar overrides require matching wire shape.
 fn override_wire(default: &TypeAst, over: &TypeAst) -> Option<Option<DecimalWire>> {
+    let source_kind = types::strip_nullable(default.view()).kind();
+    let target_kind = types::strip_nullable(over.view()).kind();
+    if matches!(source_kind, Some(Kind::Date32 | Kind::DateTime64))
+        || matches!(target_kind, Some(Kind::Date32 | Kind::DateTime64))
+    {
+        return (source_kind == target_kind).then_some(None);
+    }
     if decimal_wire_of(default).is_some() {
         if let Some(w) = decimal_wire_of(over) {
             return Some(Some(w));
@@ -2098,10 +2224,7 @@ impl PartialOrd for U256 {
 }
 
 fn decimal_oob() -> EmitterError {
-    EmitterError::UnsupportedValue {
-        target_column: String::new(),
-        kind: "numeric out of range for Decimal column",
-    }
+    unsupported("numeric out of range for Decimal column")
 }
 
 fn decimal_type_error(msg: &str) -> EmitterError {
@@ -2194,10 +2317,35 @@ fn decimal_text_to_scaled_le(
     Ok(out)
 }
 
+fn unsupported(kind: &'static str) -> EmitterError {
+    EmitterError::UnsupportedValue {
+        target_column: String::new(),
+        kind,
+    }
+}
+
+fn timestamp_ticks(pg_us: i64, scale: i32) -> Result<i64, EmitterError> {
+    if !(0..=9).contains(&scale) {
+        return Err(EmitterError::Type("invalid DateTime64 precision".into()));
+    }
+    let unix_us = i128::from(pg_us) + i128::from(DATETIME64_PG_EPOCH_US);
+    let ticks = if scale < 6 {
+        let divisor = 10i128.pow((6 - scale) as u32);
+        if unix_us % divisor != 0 {
+            return Err(unsupported("timestamp precision loss in DateTime64 column"));
+        }
+        unix_us / divisor
+    } else {
+        unix_us * 10i128.pow((scale - 6) as u32)
+    };
+    i64::try_from(ticks).map_err(|_| unsupported("finite timestamp overflows DateTime64 storage"))
+}
+
 fn encode_value(
     buf: &mut ColumnBuf,
     v: &ColumnValue,
     decimal: Option<DecimalWire>,
+    timestamp_scale: i32,
 ) -> Result<(), EmitterError> {
     match v {
         ColumnValue::Null => buf.append_null(),
@@ -2209,15 +2357,22 @@ fn encode_value(
         ColumnValue::Float4(f) => buf.append_fixed_bytes(&f.to_le_bytes()),
         ColumnValue::Float8(f) => buf.append_fixed_bytes(&f.to_le_bytes()),
         ColumnValue::Oid(n) => buf.append_fixed_bytes(&n.to_le_bytes()),
-        // saturating so PG ±infinity dates don't overflow
+        ColumnValue::Date(i32::MIN | i32::MAX)
+        | ColumnValue::Timestamp(i64::MIN | i64::MAX)
+        | ColumnValue::TimestampTz(i64::MIN | i64::MAX) => Err(unsupported(
+            "temporal infinity, set pos_inf/neg_inf to null on a Nullable destination",
+        )),
         ColumnValue::Date(n) => {
-            buf.append_fixed_bytes(&n.saturating_add(DATE32_PG_EPOCH_DAYS).to_le_bytes())
+            let days = n
+                .checked_add(DATE32_PG_EPOCH_DAYS)
+                .ok_or_else(|| unsupported("finite date overflows Date32 epoch conversion"))?;
+            buf.append_fixed_bytes(&days.to_le_bytes())
         }
         // `time` → `Time64(6)`: microseconds since midnight, no epoch offset
         ColumnValue::Time(n) => buf.append_fixed_bytes(&n.to_le_bytes()),
         ColumnValue::Timestamp(n) | ColumnValue::TimestampTz(n) => {
-            let unix_us = n.saturating_add(DATETIME64_PG_EPOCH_US);
-            buf.append_fixed_bytes(&unix_us.to_le_bytes())
+            let ticks = timestamp_ticks(*n, timestamp_scale)?;
+            buf.append_fixed_bytes(&ticks.to_le_bytes())
         }
         // `timetz` → text: CH has no zone-aware time type, text keeps
         // the offset the old fixed encoding dropped
@@ -2232,20 +2387,17 @@ fn encode_value(
             use crate::decode::codecs::NumericKind;
             match decimal {
                 // Decimal column: non-finite (NaN/±Inf) is unrepresentable,
-                // error rather than silently corrupt (operator maps the
-                // column to String to recover)
+                // error rather than silently corrupt unless column sets a
+                // substitute or maps to String
                 Some(decimal) => match n {
                     NumericKind::Finite(s) => {
                         let scaled =
                             decimal_text_to_scaled_le(s, i32::from(decimal.scale), decimal.width)?;
                         buf.append_fixed_bytes(&scaled[..decimal.width.bytes()])
                     }
-                    NumericKind::NaN | NumericKind::PInf | NumericKind::NInf => {
-                        Err(EmitterError::UnsupportedValue {
-                            target_column: String::new(),
-                            kind: "non-finite numeric (NaN/Inf) into Decimal column",
-                        })
-                    }
+                    NumericKind::NaN | NumericKind::PInf | NumericKind::NInf => Err(unsupported(
+                        "non-finite numeric (NaN/Inf) into Decimal column, set nan/pos_inf/neg_inf or map to String",
+                    )),
                 },
                 // String column: lossless text, including NaN/±Inf
                 None => buf.append_string_bytes(n.as_text().as_bytes()),
@@ -2254,18 +2406,14 @@ fn encode_value(
         ColumnValue::Inet(v) => buf.append_string_bytes(v.to_text().as_bytes()),
         ColumnValue::Interval(v) => buf.append_string_bytes(v.to_text().as_bytes()),
         ColumnValue::Bytea(b) => buf.append_string_bytes(b),
-        ColumnValue::ExternalToast(_) => Err(EmitterError::UnsupportedValue {
-            target_column: String::new(),
-            kind: "unresolved TOAST pointer (xact buffer should have reassembled)",
-        }),
+        ColumnValue::ExternalToast(_) => Err(unsupported(
+            "unresolved TOAST pointer (xact buffer should have reassembled)",
+        )),
         ColumnValue::PgPendingText { text, .. } => buf.append_string_bytes(text.as_bytes()),
         // Never interpret raw Datum bytes as local String data
-        ColumnValue::PgPending { .. } | ColumnValue::Unsupported { .. } => {
-            Err(EmitterError::UnsupportedValue {
-                target_column: String::new(),
-                kind: "unresolved source value routed to a local column",
-            })
-        }
+        ColumnValue::PgPending { .. } | ColumnValue::Unsupported { .. } => Err(unsupported(
+            "unresolved source value routed to a local column",
+        )),
     }
 }
 
@@ -2496,8 +2644,12 @@ pub async fn load_merged_with(
     over: Option<(&std::path::Path, &toml::Table)>,
 ) -> Result<toml::Table, EmitterError> {
     let mut root: toml::Table = match tokio::fs::read_to_string(ch_config).await {
-        Ok(s) => toml::from_str(&s).map_err(|e: toml::de::Error| {
-            EmitterError::Config(format!("parse {}: {e}", ch_config.display()))
+        Ok(s) => toml::from_str(&s).map_err(|e| {
+            EmitterError::Config(format!(
+                "parse {}: {}",
+                ch_config.display(),
+                crate::toml_de::message(e)
+            ))
         })?,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => toml::Table::new(),
         Err(e) => {
@@ -2531,8 +2683,12 @@ pub async fn load_merged_with(
         let s = tokio::fs::read_to_string(&p)
             .await
             .map_err(|e| EmitterError::Config(format!("read {}: {e}", p.display())))?;
-        let frag: toml::Table = toml::from_str(&s).map_err(|e: toml::de::Error| {
-            EmitterError::Config(format!("parse {}: {e}", p.display()))
+        let frag: toml::Table = toml::from_str(&s).map_err(|e| {
+            EmitterError::Config(format!(
+                "parse {}: {}",
+                p.display(),
+                crate::toml_de::message(e)
+            ))
         })?;
         merge_tables(&mut root, frag);
     }
@@ -3033,6 +3189,7 @@ mod tests {
             &mut buf,
             &ColumnValue::Numeric(NumericKind::Finite("1.50".into())),
             decimal,
+            6,
         )
         .unwrap();
         match &buf {
@@ -3048,6 +3205,7 @@ mod tests {
                 &mut buf_nan,
                 &ColumnValue::Numeric(NumericKind::NaN),
                 decimal,
+                6,
             )
             .is_err()
         );
@@ -3068,6 +3226,7 @@ mod tests {
                 "123456789012345678901234567890123456789012345678.12".into(),
             )),
             wide_decimal,
+            6,
         )
         .unwrap();
         match &wide_buf {
@@ -3081,7 +3240,7 @@ mod tests {
 
         let sast = TypeAst::parse("String", alloc).unwrap();
         let mut sbuf = ColumnBuf::new_for_ast(&sast).unwrap();
-        encode_value(&mut sbuf, &ColumnValue::Numeric(NumericKind::NaN), None).unwrap();
+        encode_value(&mut sbuf, &ColumnValue::Numeric(NumericKind::NaN), None, 6).unwrap();
         match &sbuf {
             ColumnBuf::String { data, .. } => assert_eq!(data.as_slice(), b"NaN"),
             _ => panic!("expected string-shape buffer"),
@@ -3094,7 +3253,7 @@ mod tests {
         let micros = 45_296_000_000i64; // 12:34:56
         let ast = TypeAst::parse("Time64(6)", alloc).unwrap();
         let mut buf = ColumnBuf::new_for_ast(&ast).unwrap();
-        encode_value(&mut buf, &ColumnValue::Time(micros), None).unwrap();
+        encode_value(&mut buf, &ColumnValue::Time(micros), None, 6).unwrap();
         match &buf {
             ColumnBuf::Fixed { width, bytes } => {
                 assert_eq!(*width, 8);
@@ -3111,6 +3270,7 @@ mod tests {
                 tz_seconds: -7200,
             },
             None,
+            6,
         )
         .unwrap();
         match &sbuf {
@@ -3194,10 +3354,323 @@ mod tests {
         assert_eq!(plan.columns[0].type_repr, "Int32");
     }
 
+    fn non_finite(ty: &str, nan: &str, pos_inf: &str, neg_inf: &str) -> Result<NonFinite, String> {
+        let ast = TypeAst::parse(ty, Allocator::global(&mimalloc::MiMalloc)).unwrap();
+        let rule = ColumnRule {
+            nan: Some(nan.parse()?),
+            pos_inf: Some(pos_inf.parse()?),
+            neg_inf: Some(neg_inf.parse()?),
+            ..ColumnRule::default()
+        };
+        NonFinite::compile(&rule, &ast)
+    }
+
+    fn finite(text: &str) -> Option<ColumnValue> {
+        Some(ColumnValue::Numeric(
+            crate::decode::codecs::NumericKind::Finite(text.into()),
+        ))
+    }
+
+    #[test]
+    fn temporal_infinity_policies_validate_destination() {
+        let alloc = Allocator::global(&mimalloc::MiMalloc);
+        for ty in ["Date32", "DateTime64(3, 'UTC')"] {
+            let ast = TypeAst::parse(ty, alloc).unwrap();
+            for action in ["null", "min", "max", "0"] {
+                let rule = ColumnRule {
+                    pos_inf: Some(action.parse().unwrap()),
+                    ..ColumnRule::default()
+                };
+                assert!(NonFinite::compile(&rule, &ast).is_err());
+            }
+            let nullable = TypeAst::parse(&format!("Nullable({ty})"), alloc).unwrap();
+            let nf = NonFinite::compile(
+                &ColumnRule {
+                    pos_inf: Some(Substitute::Null),
+                    neg_inf: Some(Substitute::Reject),
+                    ..ColumnRule::default()
+                },
+                &nullable,
+            )
+            .unwrap();
+            assert_eq!(nf.pos_inf, Some(ColumnValue::Null));
+            assert_eq!(nf.neg_inf, None);
+            for value in [
+                ColumnValue::Date(i32::MIN + 1),
+                ColumnValue::Date(i32::MAX - 1),
+                ColumnValue::Timestamp(i64::MIN + 1),
+                ColumnValue::TimestampTz(i64::MAX - 1),
+            ] {
+                assert_eq!(nf.substitute(&value), &value);
+            }
+        }
+    }
+
+    #[test]
+    fn temporal_policy_rejects_oracle_encoding() {
+        let mut rel = mk_rel();
+        rel.attributes[0].type_oid = 99999;
+        let mut mapping = mk_mapping();
+        mapping.columns[0].target_type = "Nullable(DateTime64(6, 'UTC'))".into();
+        let mut builder = crate::column_rules::ColumnRulesBuilder::new();
+        builder.add(
+            &rel.rel_name,
+            MatchKind::Exact,
+            "id",
+            MatchKind::Exact,
+            ColumnRule {
+                pos_inf: Some(Substitute::Null),
+                ..ColumnRule::default()
+            },
+        );
+        let result = TablePlan::build(
+            Allocator::global(&mimalloc::MiMalloc),
+            &rel,
+            &mapping,
+            &builder.finish().0,
+            &SystemColumns::default(),
+        );
+        assert!(
+            matches!(result, Err(EmitterError::Config(e)) if e.contains("needs local encoding"))
+        );
+    }
+
+    #[test]
+    fn temporal_infinity_rows_reject_or_write_null() {
+        let alloc = Allocator::global(&mimalloc::MiMalloc);
+        for (ty, oid, values) in [
+            (
+                "Date32",
+                crate::schema::DATEOID,
+                vec![ColumnValue::Date(i32::MIN), ColumnValue::Date(i32::MAX)],
+            ),
+            (
+                "DateTime64(3, 'UTC')",
+                crate::schema::TIMESTAMPOID,
+                vec![
+                    ColumnValue::Timestamp(i64::MIN),
+                    ColumnValue::Timestamp(i64::MAX),
+                ],
+            ),
+            (
+                "DateTime64(6, 'UTC')",
+                crate::schema::TIMESTAMPTZOID,
+                vec![
+                    ColumnValue::TimestampTz(i64::MIN),
+                    ColumnValue::TimestampTz(i64::MAX),
+                ],
+            ),
+        ] {
+            let mut rel = mk_rel();
+            rel.attributes[0].type_oid = oid;
+            rel.attributes[0].type_len = if oid == crate::schema::DATEOID { 4 } else { 8 };
+            let mut mapping = mk_mapping();
+            mapping.columns[0].target_type = format!("Nullable({ty})");
+            for value in values {
+                let mut row = committed(1, None);
+                row.decoded.new.as_mut().unwrap().columns[0] = Some(value);
+                for substitute in [false, true] {
+                    let mut builder = crate::column_rules::ColumnRulesBuilder::new();
+                    if substitute {
+                        builder.add(
+                            &rel.rel_name,
+                            MatchKind::Exact,
+                            "id",
+                            MatchKind::Exact,
+                            ColumnRule {
+                                pos_inf: Some(Substitute::Null),
+                                neg_inf: Some(Substitute::Null),
+                                ..ColumnRule::default()
+                            },
+                        );
+                    }
+                    let plan = TablePlan::build(
+                        alloc,
+                        &rel,
+                        &mapping,
+                        &builder.finish().0,
+                        &SystemColumns::default(),
+                    )
+                    .unwrap();
+                    let mut encoder = TableEncoder::new(plan).unwrap();
+                    let result = encoder.append_row(&row, &mapping, OP_INSERT);
+                    if substitute {
+                        result.unwrap();
+                        let ColumnBuf::NullableFixed {
+                            null_map, inner, ..
+                        } = &encoder.buffers[0]
+                        else {
+                            panic!("nullable temporal buffer")
+                        };
+                        assert_eq!(null_map, &[1]);
+                        assert!(inner.iter().all(|b| *b == 0));
+                    } else {
+                        let err = result.unwrap_err().to_string();
+                        assert!(
+                            err.contains("id") && err.contains("temporal infinity"),
+                            "{err}"
+                        );
+                        assert_eq!(encoder.buffers[0].approx_size(), 0);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn timestamp_rows_use_destination_precision() {
+        let alloc = Allocator::global(&mimalloc::MiMalloc);
+        for scale in [0, 3, 6, 9] {
+            let mut mapping = mk_mapping();
+            mapping.columns[0].target_type = format!("Nullable(DateTime64({scale}, 'UTC'))");
+            let mut rel = mk_rel();
+            rel.attributes[0].type_oid = crate::schema::TIMESTAMPOID;
+            rel.attributes[0].type_len = 8;
+            let plan = TablePlan::build(
+                alloc,
+                &rel,
+                &mapping,
+                &ColumnRules::default(),
+                &SystemColumns::default(),
+            )
+            .unwrap();
+            let mut encoder = TableEncoder::new(plan).unwrap();
+            for seconds in [-1i64, 0, 946_684_800] {
+                let mut row = committed(1, None);
+                row.decoded.new.as_mut().unwrap().columns[0] = Some(ColumnValue::Timestamp(
+                    seconds * 1_000_000 - DATETIME64_PG_EPOCH_US,
+                ));
+                encoder.append_row(&row, &mapping, OP_INSERT).unwrap();
+            }
+            let ColumnBuf::NullableFixed {
+                null_map, inner, ..
+            } = &encoder.buffers[0]
+            else {
+                panic!("nullable timestamp buffer")
+            };
+            assert_eq!(null_map, &[0, 0, 0]);
+            let expected: Vec<u8> = [-1i64, 0, 946_684_800]
+                .into_iter()
+                .flat_map(|s| (s * 10i64.pow(scale)).to_le_bytes())
+                .collect();
+            assert_eq!(inner, &expected);
+        }
+        for us in [-1001, -1, 1, 1001] {
+            let err = timestamp_ticks(us - DATETIME64_PG_EPOCH_US, 3).unwrap_err();
+            assert!(err.to_string().contains("precision loss"));
+        }
+        for us in [-1000, 0, 1000] {
+            assert_eq!(
+                timestamp_ticks(us - DATETIME64_PG_EPOCH_US, 3).unwrap(),
+                us / 1000
+            );
+        }
+        let err = timestamp_ticks(i64::MAX - 1, 6).unwrap_err();
+        assert!(err.to_string().contains("finite timestamp overflows"));
+        assert!(timestamp_ticks(i64::MAX / 1_000_000 * 1_000_000, 0).is_ok());
+        assert!(timestamp_ticks(i64::MIN + 1, 9).is_err());
+    }
+
+    #[test]
+    fn non_finite_substitutes_resolve_against_destination() {
+        let nf = non_finite("Decimal(10, 2)", "0", "1.230", "reject").unwrap();
+        assert_eq!(nf.nan, finite("0"));
+        assert_eq!(nf.pos_inf, finite("1.230"));
+        assert_eq!(nf.neg_inf, None);
+
+        let nf = non_finite("Nullable(Decimal(10, 2))", "null", "reject", "reject").unwrap();
+        assert_eq!(nf.nan, Some(ColumnValue::Null));
+
+        for (ty, nan) in [
+            ("Decimal(10, 2)", "null"),
+            ("Decimal(10, 2)", "1.234"),
+            ("Decimal(10, 2)", "123456789.00"),
+            ("Decimal(10, 2)", "NaN"),
+        ] {
+            assert!(
+                non_finite(ty, nan, "reject", "reject").is_err(),
+                "{ty} nan = {nan:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn bounds_apply_independently_of_non_finite_reason() {
+        let wide = format!("{}.9999", "9".repeat(34));
+        for (ty, bound) in [
+            ("Decimal(10, 2)", "99999999.99"),
+            ("Decimal(38, 4)", &wide),
+            ("Decimal(2, 2)", ".99"),
+            ("Nullable(Decimal(2, 0))", "99."),
+        ] {
+            for (action, literal) in [("min", format!("-{bound}")), ("max", bound.into())] {
+                let nf = non_finite(ty, action, action, action).unwrap();
+                let expected = finite(&literal);
+                assert_eq!(nf.nan, expected);
+                assert_eq!(nf.pos_inf, expected);
+                assert_eq!(nf.neg_inf, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn nan_row_lands_as_configured_substitute() {
+        use crate::decode::codecs::NumericKind;
+        let alloc = Allocator::global(&mimalloc::MiMalloc);
+        let rel = mk_rel();
+        let mut m = mk_mapping();
+        m.columns[0].target_type = "Decimal(10, 2)".into();
+        let mut row = committed(1, None);
+        row.decoded.new.as_mut().expect("insert tuple").columns[0] =
+            Some(ColumnValue::Numeric(NumericKind::NaN));
+
+        let plan = TablePlan::build(
+            alloc,
+            &rel,
+            &m,
+            &ColumnRules::default(),
+            &SystemColumns::default(),
+        )
+        .unwrap();
+        let err = TableEncoder::new(plan)
+            .unwrap()
+            .append_row(&row, &m, OP_INSERT)
+            .unwrap_err();
+        assert!(err.to_string().contains("id"), "{err}");
+
+        let mut b = crate::column_rules::ColumnRulesBuilder::new();
+        b.add(
+            &RelName::new("public", "*"),
+            MatchKind::Glob,
+            "*",
+            MatchKind::Glob,
+            ColumnRule {
+                nan: Some(Substitute::Literal("0".into())),
+                ..ColumnRule::default()
+            },
+        );
+        let rules = b.finish().0;
+        let plan = TablePlan::build(alloc, &rel, &m, &rules, &SystemColumns::default()).unwrap();
+        assert_eq!(
+            plan.columns[1].non_finite,
+            NonFinite::default(),
+            "String column keeps text"
+        );
+        let mut enc = TableEncoder::new(plan).unwrap();
+        enc.append_row(&row, &m, OP_INSERT).unwrap();
+        let ColumnBuf::Fixed { bytes, .. } = &enc.buffers[0] else {
+            panic!("fixed-shape buffer")
+        };
+        assert_eq!(bytes.as_slice(), &0i64.to_le_bytes());
+    }
+
     #[test]
     fn override_wire_admissibility() {
         let alloc = Allocator::global(&mimalloc::MiMalloc);
         let p = |s: &str| TypeAst::parse(s, alloc).unwrap();
+        assert!(override_wire(&p("Date32"), &p("Int32")).is_none());
+        assert!(override_wire(&p("Int64"), &p("DateTime64(6)")).is_none());
+        assert!(override_wire(&p("DateTime64(6)"), &p("Nullable(DateTime64(3))")).is_some());
         // Decimal-encoded source: Decimal / String / signed ints convert
         let dec = p("Decimal(38, 0)");
         assert!(override_wire(&dec, &p("Decimal(38, 2)")).is_some());

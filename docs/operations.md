@@ -178,7 +178,7 @@ boundary capture; archive files provide recovery fallback, not an equivalent
 startup mode. Keep connection timeout enabled and investigate attachment failure
 instead of bypassing it
 
-Walshadow's shadow-facing sender currently trusts its client and lacks TLS/SCRAM
+Walshadow's shadow-facing sender trusts its client and lacks TLS/SCRAM
 Keep that listener on loopback or an otherwise isolated local deployment
 Source PostgreSQL and ClickHouse connection security are separate settings
 

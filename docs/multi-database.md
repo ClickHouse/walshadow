@@ -52,7 +52,7 @@ target_database = "billing_cdc"
 ```
 
 Tables with matching names in different schemas need the same treatment, see
-[current limitations](limitations.md). Config checks cover explicit entries;
+[limitations](limitations.md). Config checks cover explicit entries;
 destinations `replicate_all` derives are claimed as each table is first seen,
 and a second claim on one destination is refused
 
@@ -89,7 +89,7 @@ database. Each database's rows are read over a connection to it, and rows have
 no database column. Install `sql/runtime_config_install.sql` in every database
 you replicate
 
-## Current limits
+## Limits
 
 - Adding or removing a database means restarting walshadow: shadow registers
   its bridge workers at startup. A reload reports the databases it could not
@@ -102,6 +102,3 @@ you replicate
   databases holding one table name claim one ClickHouse table. The first claim
   wins and the second logs an error and stays unreplicated. Name the tables to
   replicate, or give each database its own `target_database`
-
-See [plans/multi_database.md](../plans/multi_database.md) for the load paths
-and metric labels still to cover

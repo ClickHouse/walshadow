@@ -88,8 +88,8 @@ ClickHouse acknowledgement state
 ## Unsupported failover
 
 Unplanned promotion while walshadow is consuming old primary can leave
-transactions or rows beyond fork point. Current release fails closed instead
+transactions or rows beyond fork point. walshadow fails closed instead
 of compensating ClickHouse
 
 Rebuild from known baseline or restore old planned path after unplanned
-promotion. See [Current limits](limitations.md)
+promotion. See [Limits](limitations.md)

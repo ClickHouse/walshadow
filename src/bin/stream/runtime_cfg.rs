@@ -170,12 +170,7 @@ pub(crate) async fn seed_runtime_config(
     }
 
     for row in client
-        .query(
-            &format!(
-                "SELECT namespace, relname, attname, match, target_type FROM {s}.config_column"
-            ),
-            &[],
-        )
+        .query(&format!("SELECT * FROM {s}.config_column"), &[])
         .await
         .context("read config_column")?
     {
@@ -187,6 +182,9 @@ pub(crate) async fn seed_runtime_config(
             ColumnRow {
                 target_type: row.try_get("target_type").ok().flatten(),
                 match_kind: row.try_get("match").ok().flatten(),
+                nan: row.try_get("nan").ok().flatten(),
+                pos_inf: row.try_get("pos_inf").ok().flatten(),
+                neg_inf: row.try_get("neg_inf").ok().flatten(),
             },
         );
     }

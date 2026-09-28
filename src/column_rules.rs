@@ -5,20 +5,64 @@ use ahash::HashMap;
 use crate::schema::RelName;
 use crate::table_rules::{MatchKind, NamePattern, RelMatcher, set_if};
 
+/// Replacement for a source value destination cannot hold
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Substitute {
+    Reject,
+    Null,
+    Min,
+    Max,
+    Literal(String),
+}
+
+impl std::str::FromStr for Substitute {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, String> {
+        Ok(match s {
+            "reject" => Self::Reject,
+            "null" => Self::Null,
+            "min" => Self::Min,
+            "max" => Self::Max,
+            _ if decimal_parts(s).is_some() => Self::Literal(s.to_owned()),
+            _ => {
+                return Err(format!(
+                    "`{s}` is not reject, null, min, max, or a decimal literal"
+                ));
+            }
+        })
+    }
+}
+
+/// Unsigned integer and fraction digits of `-?\d*(\.\d*)?` with at least one digit
+pub(crate) fn decimal_parts(s: &str) -> Option<(&str, &str)> {
+    let body = s.strip_prefix('-').unwrap_or(s);
+    let (int, frac) = body.split_once('.').unwrap_or((body, ""));
+    (!(int.is_empty() && frac.is_empty())
+        && int.bytes().chain(frac.bytes()).all(|b| b.is_ascii_digit()))
+    .then_some((int, frac))
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ColumnRule {
     pub target_name: Option<String>,
     pub target_type: Option<String>,
+    pub nan: Option<Substitute>,
+    pub pos_inf: Option<Substitute>,
+    pub neg_inf: Option<Substitute>,
 }
 
 impl ColumnRule {
     pub fn overlay(&mut self, other: &Self) {
         set_if(&mut self.target_name, &other.target_name);
         set_if(&mut self.target_type, &other.target_type);
+        set_if(&mut self.nan, &other.nan);
+        set_if(&mut self.pos_inf, &other.pos_inf);
+        set_if(&mut self.neg_inf, &other.neg_inf);
     }
 
     pub fn is_empty(&self) -> bool {
-        self.target_name.is_none() && self.target_type.is_none()
+        *self == Self::default()
     }
 }
 
@@ -251,6 +295,7 @@ mod tests {
             ColumnRule {
                 target_name: Some("broad".into()),
                 target_type: Some("String".into()),
+                ..ColumnRule::default()
             },
         );
         b.add(
