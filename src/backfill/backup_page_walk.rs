@@ -403,16 +403,18 @@ pub(crate) fn toast_rows_from_page(
 }
 
 /// Decode one on-page tuple into `(xmin, xmax, infomask, columns)`.
-/// On-disk shape carries a full `HeapTupleHeaderData` (23 bytes); the
-/// shared heap decoder consumes the `xl_heap_header` (5 bytes) shape PG
+/// On-disk shape carries a full `HeapTupleHeaderData` (23 bytes); from
+/// `t_infomask2` on it matches the `xl_heap_header` (5 bytes) shape PG
 /// strips into WAL via
 /// `XLogRegisterBufData(0, tup->t_data + SizeofHeapTupleHeader, ...)`,
-/// so reshape before calling it. `None` on truncated / malformed header.
+/// so the shared heap decoder reads it in place. `None` on truncated /
+/// malformed header.
 pub(crate) fn decode_on_page_tuple(
     tuple: &[u8],
     rel: &RelDescriptor,
 ) -> Option<(u32, u32, u16, Vec<Option<ColumnValue>>)> {
-    use crate::decode::heap_decoder::{HEAP_HASNULL, HEAP_NATTS_MASK, SIZE_OF_HEAP_TUPLE_HEADER};
+    use crate::decode::heap_decoder::SIZE_OF_HEAP_TUPLE_HEADER;
+    const T_INFOMASK2_OFF: usize = 18;
 
     if tuple.len() < SIZE_OF_HEAP_TUPLE_HEADER {
         return None;
@@ -424,38 +426,12 @@ pub(crate) fn decode_on_page_tuple(
     //   t_bits[] 23.. (NULL bitmap, only if HEAP_HASNULL)
     let xmin = u32::from_le_bytes(tuple[0..4].try_into().unwrap());
     let xmax = u32::from_le_bytes(tuple[4..8].try_into().unwrap());
-    let t_infomask2 = u16::from_le_bytes(tuple[18..20].try_into().unwrap());
     let t_infomask = u16::from_le_bytes(tuple[20..22].try_into().unwrap());
     let t_hoff = tuple[22] as usize;
     if t_hoff < SIZE_OF_HEAP_TUPLE_HEADER || t_hoff > tuple.len() {
         return None;
     }
-    let natts = (t_infomask2 & HEAP_NATTS_MASK) as usize;
-    let has_null = t_infomask & HEAP_HASNULL != 0;
-    let bitmap_bytes = if has_null { natts.div_ceil(8) } else { 0 };
-    if tuple.len() < SIZE_OF_HEAP_TUPLE_HEADER + bitmap_bytes {
-        return None;
-    }
-
-    // Synthetic xl_heap_header-prefixed buffer:
-    //   xl_heap_header (5): t_infomask2, t_infomask, t_hoff
-    //   bitmap, then t_bits..t_hoff padding gap, then column data
-    let mut wal_shaped = Vec::with_capacity(5 + (tuple.len() - SIZE_OF_HEAP_TUPLE_HEADER));
-    wal_shaped.extend_from_slice(&t_infomask2.to_le_bytes());
-    wal_shaped.extend_from_slice(&t_infomask.to_le_bytes());
-    wal_shaped.push(t_hoff as u8);
-    if bitmap_bytes > 0 {
-        wal_shaped.extend_from_slice(
-            &tuple[SIZE_OF_HEAP_TUPLE_HEADER..SIZE_OF_HEAP_TUPLE_HEADER + bitmap_bytes],
-        );
-    }
-    let pad_start = SIZE_OF_HEAP_TUPLE_HEADER + bitmap_bytes;
-    if pad_start < t_hoff {
-        wal_shaped.extend_from_slice(&tuple[pad_start..t_hoff]);
-    }
-    wal_shaped.extend_from_slice(&tuple[t_hoff..]);
-
-    match decode_block_data(&wal_shaped, rel) {
+    match decode_block_data(&tuple[T_INFOMASK2_OFF..], rel) {
         Ok(d) => Some((xmin, xmax, t_infomask, d.columns)),
         Err(_) => None,
     }

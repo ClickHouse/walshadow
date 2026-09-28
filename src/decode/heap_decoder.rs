@@ -853,6 +853,14 @@ fn decode_tuple_payload(
         }
 
         let abs = col_data_off + (cur - prefixlen);
+        if att.type_len > 0 && !att.dropped {
+            let len = att.type_len as usize;
+            if let Some(body) = buf.get(abs..abs + len) {
+                columns.push(Some(fixed_value(att, body)));
+                cur += len;
+                continue;
+            }
+        }
         let (value, consumed) = match decode_one_value(att, buf, abs) {
             Ok(v) => v,
             Err(DecodeError::Truncated { .. }) => {
@@ -1074,9 +1082,15 @@ pub(crate) fn decode_one_value(
             have: buf.len().saturating_sub(abs),
         });
     }
-    let body = &buf[abs..abs + len];
+    Ok((fixed_value(att, &buf[abs..abs + len]), len))
+}
 
-    let v = match att.type_oid {
+/// Fixed-width value from its on-disk bytes. Inlined so callers construct
+/// in place: returning a 40-byte enum through memory then reloading it wide
+/// stalls store forwarding, which dominated fixed-width decode
+#[inline(always)]
+fn fixed_value(att: &RelAttr, body: &[u8]) -> ColumnValue {
+    match att.type_oid {
         BOOLOID => ColumnValue::Bool(body[0] != 0),
         CHAROID => ColumnValue::Char(body[0] as i8),
         INT2OID => ColumnValue::Int2(i16::from_le_bytes(body.try_into().unwrap())),
@@ -1107,8 +1121,7 @@ pub(crate) fn decode_one_value(
             type_oid: att.type_oid,
             raw: body.to_vec(),
         },
-    };
-    Ok((v, len))
+    }
 }
 
 /// Skip a dropped column; still read varlena header to advance correctly.
