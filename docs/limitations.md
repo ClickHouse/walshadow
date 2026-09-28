@@ -1,4 +1,4 @@
-# Current limits
+# Limits
 
 Review these limits before production use
 
@@ -13,7 +13,7 @@ Review these limits before production use
 - `wal_level = logical` required
 - every replicated table needs usable replica identity
 - prepared transactions are not supported for production use; commit and abort
-  records are handled, but full restart and bootstrap cases still need validation
+  records are handled, but full restart and bootstrap cases are unvalidated
 - sequence state is not replicated, values already stored in table rows still replicate
 - non-default tablespaces are unsafe for bootstrap and managed-shadow lifecycle
 - unplanned primary promotion is not supported
@@ -29,6 +29,16 @@ and workload limits before attaching
   arrays); the table it creates is empty, and `ADD COLUMN` resolves the
   default through the oracle
 - `time` mapping requires ClickHouse `Time64` support
+- [NaN and infinity substitutes](table-selection.md#replace-nan-and-infinity)
+  for decimals do not apply to column defaults or array elements. Adding a
+  decimal column with a `NaN` default fails in ClickHouse. A decimal array
+  containing `NaN` or either infinity stops replication
+- extra decimal places are discarded without rounding. Values exceeding
+  configured decimal precision may still replicate; replication stops only
+  when a value is too large for underlying decimal storage
+- date and timestamp values are written without checking ClickHouse calendar
+  limits. Values outside supported ranges can return incorrect dates or times
+  without stopping replication
 - same-named tables from different PostgreSQL schemas or databases need
   explicit destination mapping. Config parsing rejects conflicts between
   explicit entries; `replicate_all` names destinations after source tables, so

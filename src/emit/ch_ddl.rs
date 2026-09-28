@@ -1492,8 +1492,8 @@ mod tests {
             "*_amount",
             MatchKind::Glob,
             crate::column_rules::ColumnRule {
-                target_name: None,
                 target_type: Some("Decimal(38, 9)".into()),
+                ..Default::default()
             },
         );
         b.add(
@@ -1503,7 +1503,7 @@ mod tests {
             MatchKind::Exact,
             crate::column_rules::ColumnRule {
                 target_name: Some("order_id".into()),
-                target_type: None,
+                ..Default::default()
             },
         );
         let sql = render_create_table(&d, &dest("db", &d), &shape(false), &b.finish().0)
@@ -1524,8 +1524,8 @@ mod tests {
             "id",
             MatchKind::Exact,
             crate::column_rules::ColumnRule {
-                target_name: None,
                 target_type: Some("Nullable(Int32)".into()),
+                ..Default::default()
             },
         );
         let sql = render_create_table(&d, &dest("db", &d), &shape(false), &b.finish().0)

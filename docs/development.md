@@ -61,3 +61,6 @@ Keep operating instructions in docs, system explanations and diagrams in
 [architecture](../architecture/README.md), and unfinished work in
 [plans](../plans/INDEX.md). Remove completed plans. Link source for low-level
 behavior instead of copying implementation into prose
+
+Describe behavior in present tense. Keep release history and roadmap language
+out of operating guides. State upgrade requirements by version or capability

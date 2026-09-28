@@ -17,7 +17,7 @@
 //! | `numeric(p,s)` | `Decimal(p,s)` (p ≤ 76), else `String` | |
 //! | `varchar(n)`, `bpchar(n)`, `text`, `name` | `String` | CH has no length cap |
 //! | `bytea` | `String` | CH binary lands in String columns |
-//! | `date` | `Date32` | covers PG's -infinity / +infinity edges |
+//! | `date` | `Date32` | infinity requires explicit substitution |
 //! | `time` | `Time64(6)` | microseconds since midnight |
 //! | `timetz` | `String` | preserves UTC offset text |
 //! | `timestamp` / `timestamptz` | `DateTime64(p, 'UTC')` p ≤ 6 | |

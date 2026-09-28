@@ -1,9 +1,20 @@
 use std::str::FromStr;
+use std::time::Duration;
 
 use serde::Deserialize;
 use serde::de::{Deserializer, Error};
 
 use crate::ch::EmitterError;
+
+pub(crate) fn de_parse<'de, D, T>(d: D) -> Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: FromStr,
+    T::Err: std::fmt::Display,
+{
+    let s = String::deserialize(d)?;
+    s.parse().map_err(Error::custom)
+}
 
 pub(crate) fn de_from_str<'de, D, T>(d: D) -> Result<Option<T>, D::Error>
 where
@@ -11,8 +22,11 @@ where
     T: FromStr,
     T::Err: std::fmt::Display,
 {
-    let s = String::deserialize(d)?;
-    s.parse().map(Some).map_err(Error::custom)
+    de_parse(d).map(Some)
+}
+
+pub(crate) fn de_millis<'de, D: Deserializer<'de>>(d: D) -> Result<Duration, D::Error> {
+    u64::deserialize(d).map(Duration::from_millis)
 }
 
 pub(crate) fn de_nonempty<'de, D: Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {

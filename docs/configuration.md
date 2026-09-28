@@ -140,7 +140,7 @@ Require restart:
 - backup and shadow bootstrap choices
 
 Run `walshadow-stream --help` for process and recovery flags. Run
-`walshadow-stream ctl help` for current live-control surface
+`walshadow-stream ctl help` for live-control commands
 
 ## Source-side runtime config
 
@@ -175,6 +175,23 @@ VALUES
 `text[]`, and `lsn`, `xid`, `commit_ts`, `is_deleted` for metadata column names.
 See [Query destination data](destination-tables.md)
 
+Use `config_column` to configure individual columns. Set `namespace` to schema
+name, `relname` to table name, and `attname` to column name. Use `match` for
+name patterns and `target_type` to choose a ClickHouse type. Set `nan`,
+`pos_inf`, and `neg_inf` to choose
+[NaN and infinity substitutes](table-selection.md#replace-nan-and-infinity).
+Leave a field NULL to use its TOML setting. An invalid substitute produces a
+warning and acts as `reject`, even if another rule supplies a valid substitute
+
+Replace `NaN` with zero and infinities with maximum and minimum decimal values:
+
+```sql
+INSERT INTO walshadow.config_column
+    (namespace, relname, attname, nan, pos_inf, neg_inf)
+VALUES
+    ('public', 'orders', 'amount', '0', 'max', 'min');
+```
+
 walshadow reads these tables but never writes them. Keep archive credentials
 and bootstrap configuration in TOML, not source-side tables
 
@@ -195,7 +212,7 @@ can overshoot by one chunk. Smaller seals reduce buffering and create more
 ClickHouse parts; fewer connections reduce concurrent INSERT buffers but can
 reduce throughput
 
-For smaller buffers, retain connection parallelism and restore previous seals:
+For smaller buffers, retain connection parallelism and lower batch limits:
 
 ```toml
 [toast]
@@ -203,8 +220,8 @@ put_batch_rows = 256
 put_batch_bytes = 4194304
 ```
 
-The three buffering settings require positive integers. Existing
-`[bootstrap] lanes` and `[ch] inserter_pool_size` controls remain independent
+The three buffering settings require positive integers.
+`[bootstrap] lanes` and `[ch] inserter_pool_size` controls are independent
 
 ### Value mode
 
@@ -237,7 +254,7 @@ ClickHouse. Choose it only when limits below are acceptable
   large-value storage uses another tablespace. Moving or creating such a table
   after bootstrap is not supported
 
-See [current limitations](limitations.md#shadow-value-mode) before enabling
+See [limitations](limitations.md#shadow-value-mode) before enabling
 this mode
 
 ### Value size cap
@@ -336,11 +353,13 @@ For systemd, install `deploy/walshadow.service.d/process-restart.conf` as
 `systemctl daemon-reload`. Launcher must `exec` walshadow, so MainPID receives
 SIGTERM. Drop-in scopes signals to walshadow; stopping unit deliberately leaves
 shadow running. Stop shadow explicitly with `pg_ctl` when retiring instance.
-An old binary does not honor preservation flag. For first migration, install
-new binary and drop-in, reload systemd, then signal only old MainPID with
+
+When upgrading from a binary without `--keep-shadow-running` support, install
+replacement binary and drop-in, reload systemd, then signal only running MainPID
+with
 `systemctl kill --kill-who=main --signal=SIGKILL walshadow`. Automatic restart
-launches new binary and adopts running shadow. This uses last durable cursor;
-old archive loop may have left it behind. Subsequent upgrades use normal
+launches replacement binary and adopts running shadow from last durable cursor.
+When running binary supports shadow preservation, use normal
 `systemctl restart walshadow` and graceful checkpointing.
 
 `--archive-prefetch` controls concurrent archive downloads, default 4, range
@@ -352,7 +371,7 @@ of the host has room. Segments decode straight into memory over the same
 decrypt and decompress path as `wal-fetch`, so recovery writes no staging files
 and an interrupted leg leaves none behind.
 
-Archive recovery now runs through normal checkpoint, pause, metrics and signal
+Archive recovery runs through normal checkpoint, pause, metrics and signal
 handling. Restart cursor remains bounded by durable WAL, shadow replay and
 oldest unacknowledged transaction. Graceful exit drains pipeline and writes a
 final checkpoint. Prefetched bytes never advance durable cursor.
@@ -404,7 +423,7 @@ Checkpoint after completed batches, targeting 30 seconds between saves. Slow
 fetches or inserts can extend that interval. Restart repeats archive
 validation.
 
-Older runs without a checkpoint still repeat the backup walk. Do not synthesize
+Runs without a checkpoint repeat the backup walk. Do not synthesize
 an offset from read progress: prefetched rows may not have reached ClickHouse.
 Passes producing undecided visibility rows restart their pass from whatever
 walk progress they recorded.
@@ -424,7 +443,7 @@ same `_lsn = S` and collapse.
 
 `[bootstrap] copy_chunk_blocks` sets the chunk size in 8 KiB pages, defaulting
 to 131072 (1 GiB, PostgreSQL's segment size). A table smaller than one chunk
-issues exactly the single unqualified COPY it always did.
+issues a single unqualified COPY.
 
 The cursor is paired with the relation's filenode. `VACUUM FULL`, `CLUSTER`,
 `TRUNCATE` and rewriting `ALTER TABLE` relocate rows, so a filenode change
@@ -451,6 +470,6 @@ or database defaults.
 
 Spill-dir state files `backfills.toml`, `toast_retires.toml` and
 `visibility_carry.toml` record the source system identifier; boot rejects
-files another source wrote. A file from an older build without the field loads
+files another source wrote. A file without the field loads
 once and is rewritten with it. An unreadable `backfills.toml` stops boot:
 removing it re-runs every load and can orphan `__wsstg` staging tables.

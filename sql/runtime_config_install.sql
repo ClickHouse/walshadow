@@ -70,6 +70,9 @@ CREATE TABLE IF NOT EXISTS :"walshadow_schema".config_column (
     attname     text NOT NULL,
     match       text,
     target_type text,                -- ClickHouse type expression
+    nan         text,                -- non-finite numeric into Decimal:
+    pos_inf     text,                -- 'reject' | 'null' | 'min' | 'max' |
+    neg_inf     text,                -- decimal literal; NULL inherits
     PRIMARY KEY (namespace, relname, attname)
 );
 
@@ -88,6 +91,9 @@ ALTER TABLE :"walshadow_schema".config_table ADD COLUMN IF NOT EXISTS xid       
 ALTER TABLE :"walshadow_schema".config_table ADD COLUMN IF NOT EXISTS commit_ts       text;
 ALTER TABLE :"walshadow_schema".config_table ADD COLUMN IF NOT EXISTS is_deleted      text;
 ALTER TABLE :"walshadow_schema".config_column ADD COLUMN IF NOT EXISTS match           text;
+ALTER TABLE :"walshadow_schema".config_column ADD COLUMN IF NOT EXISTS nan             text;
+ALTER TABLE :"walshadow_schema".config_column ADD COLUMN IF NOT EXISTS pos_inf         text;
+ALTER TABLE :"walshadow_schema".config_column ADD COLUMN IF NOT EXISTS neg_inf         text;
 
 -- REPLICA IDENTITY FULL logs the complete old-row image on UPDATE/DELETE, so a
 -- DELETE always carries the key columns the decoder reads (namespace/relname/

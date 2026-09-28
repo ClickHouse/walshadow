@@ -171,5 +171,5 @@ rows. Treat manual mirror cleanup as a recovery-state decision
 
 Inline reconstruction still materializes each value. Values exceeding configured
 limit fail instead of allocating without bound. See command help for TOAST
-memory limits and [current limits](limitations.md#large-values) for generation
+memory limits and [limits](limitations.md#large-values) for generation
 ambiguity during backup

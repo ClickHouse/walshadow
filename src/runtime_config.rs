@@ -152,6 +152,10 @@ impl InitialLoadMode {
 pub struct ColumnRow {
     pub target_type: Option<String>,
     pub match_kind: Option<String>,
+    /// Raw [`crate::column_rules::Substitute`] per non-finite numeric, NULL inherits
+    pub nan: Option<String>,
+    pub pos_inf: Option<String>,
+    pub neg_inf: Option<String>,
 }
 
 /// One applied config change, interpreted from a config-table heap write and
@@ -404,6 +408,9 @@ pub fn interpret(
                 row: ColumnRow {
                     target_type: field_string(rel, &cols, "target_type"),
                     match_kind: field_string(rel, &cols, "match"),
+                    nan: field_string(rel, &cols, "nan"),
+                    pos_inf: field_string(rel, &cols, "pos_inf"),
+                    neg_inf: field_string(rel, &cols, "neg_inf"),
                 },
             })
         }
@@ -760,6 +767,9 @@ mod tests {
                 attr(3, "attname", 25),
                 attr(4, "match", 25),
                 attr(5, "target_type", 25),
+                attr(6, "nan", 25),
+                attr(7, "pos_inf", 25),
+                attr(8, "neg_inf", 25),
             ],
         );
         let new = vec![
@@ -768,6 +778,9 @@ mod tests {
             Some(ColumnValue::Text("*_amount".into())),
             Some(ColumnValue::Text("glob".into())),
             Some(ColumnValue::Text("Decimal(38, 9)".into())),
+            Some(ColumnValue::Text("0".into())),
+            Some(ColumnValue::Text("max".into())),
+            Some(ColumnValue::Null),
         ];
         match interpret(
             ConfigTableKind::Column,
@@ -781,6 +794,9 @@ mod tests {
                 assert_eq!(attname, "*_amount");
                 assert_eq!(row.match_kind.as_deref(), Some("glob"));
                 assert_eq!(row.target_type.as_deref(), Some("Decimal(38, 9)"));
+                assert_eq!(row.nan.as_deref(), Some("0"));
+                assert_eq!(row.pos_inf.as_deref(), Some("max"));
+                assert_eq!(row.neg_inf, None, "NULL inherits");
             }
             other => panic!("expected ColumnUpserted, got {other:?}"),
         }

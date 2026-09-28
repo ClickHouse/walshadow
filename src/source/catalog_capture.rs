@@ -118,11 +118,18 @@ impl CaptureStats {
 
 /// Cost controls on command-boundary capture. Every refusal degrades the
 /// transaction to commit-time capture, which is sound
-#[derive(Debug, Clone, Copy)]
+/// `[stream] pending_max_*` keys
+#[derive(Debug, Clone, Copy, serde::Deserialize)]
+#[serde(default)]
 pub struct PendingCaptureConfig {
     /// Boundaries one transaction may hold for
+    #[serde(rename = "pending_max_boundaries_per_xact")]
     pub max_boundaries_per_xact: u32,
     /// Cumulative parked time one transaction may cost
+    #[serde(
+        rename = "pending_max_hold_ms",
+        deserialize_with = "crate::toml_de::de_millis"
+    )]
     pub max_hold_per_xact: Duration,
 }
 

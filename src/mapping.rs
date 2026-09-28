@@ -686,7 +686,7 @@ mod tests {
             crate::table_rules::MatchKind::Exact,
             crate::column_rules::ColumnRule {
                 target_name: Some("id".into()),
-                target_type: None,
+                ..Default::default()
             },
         );
         b.add(
@@ -695,8 +695,8 @@ mod tests {
             "*_amount",
             crate::table_rules::MatchKind::Glob,
             crate::column_rules::ColumnRule {
-                target_name: None,
                 target_type: Some("Decimal(38, 9)".into()),
+                ..Default::default()
             },
         );
         b.finish().0
