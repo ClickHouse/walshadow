@@ -93,6 +93,7 @@ async fn write_sync_rename(
         .open(tmp)
         .await?;
     file.write_all(bytes).await?;
+    file.flush().await?;
     if fsync {
         file.sync_all().await?;
     }
