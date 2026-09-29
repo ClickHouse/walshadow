@@ -63,7 +63,7 @@ fn emitter(port: u16) -> EmitterConfig {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn partial_transaction_failure_returns_from_live_and_archived_replay() {
-    if !fx::requirements_available() {
+    if !fx::tools::requirements_available() {
         return;
     }
     let ports = fx::Ports::alloc();
@@ -158,12 +158,10 @@ async fn partial_transaction_failure_returns_from_live_and_archived_replay() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn leg_reads_through_end_lsn_inside_its_first_segment() {
-    if !fx::pg_available() {
-        eprintln!("skip: no initdb on PATH");
+    if !fx::tools::pg_available() {
         return;
     }
-    if !fx::clickhouse_available() {
-        eprintln!("skip: no clickhouse binary on PATH");
+    if !fx::tools::clickhouse_available() {
         return;
     }
 

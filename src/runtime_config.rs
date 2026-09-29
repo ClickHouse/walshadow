@@ -192,18 +192,6 @@ pub enum ConfigEvent {
     },
 }
 
-impl ConfigEvent {
-    /// Terse label for tracing/metrics.
-    pub fn kind_str(&self) -> &'static str {
-        match self {
-            Self::GlobalUpserted(_) | Self::GlobalCleared => "global",
-            Self::NamespaceUpserted { .. } | Self::NamespaceRemoved { .. } => "namespace",
-            Self::TableUpserted { .. } | Self::TableRemoved { .. } => "table",
-            Self::ColumnUpserted { .. } | Self::ColumnRemoved { .. } => "column",
-        }
-    }
-}
-
 /// Typed in-memory overlay: the config_* rows as the resolver's layer-2 input.
 /// Re-derivable (boot `SELECT *` + WAL replay), so it holds no checkpoint.
 #[derive(Debug, Clone, Default)]
@@ -521,17 +509,17 @@ mod tests {
             ]),
             None,
         );
-        match interpret(ConfigTableKind::Global, &d, &global_rel()).unwrap() {
-            ConfigEvent::GlobalUpserted(r) => {
-                assert_eq!(r.row_budget, Some(1000));
-                assert_eq!(r.byte_budget, None);
-                assert_eq!(r.flush_timeout_ms, Some(250));
-                assert_eq!(r.compression.as_deref(), Some("zstd"));
-                assert_eq!(r.retry_max_attempts, Some(9));
-                assert_eq!(r.drop_table_strategy.as_deref(), Some("drop"));
-            }
-            other => panic!("expected GlobalUpserted, got {other:?}"),
-        }
+        assert_eq!(
+            interpret(ConfigTableKind::Global, &d, &global_rel()),
+            Some(ConfigEvent::GlobalUpserted(GlobalRow {
+                row_budget: Some(1000),
+                byte_budget: None,
+                flush_timeout_ms: Some(250),
+                compression: Some("zstd".into()),
+                retry_max_attempts: Some(9),
+                drop_table_strategy: Some("drop".into()),
+            })),
+        );
     }
 
     /// `full_image` takes each column from the new image, falling back to the
@@ -557,24 +545,22 @@ mod tests {
             Some(ColumnValue::Int4(5)),
             Some(ColumnValue::Text("retain".into())),
         ];
-        match interpret(
-            ConfigTableKind::Global,
-            &heap(HeapOp::Update, Some(new), Some(old)),
-            &global_rel(),
-        )
-        .unwrap()
-        {
-            ConfigEvent::GlobalUpserted(r) => {
-                assert_eq!(r.byte_budget, Some(2048), "changed column from new image");
-                assert_eq!(r.row_budget, Some(1000), "absent column filled from old");
-                assert_eq!(
-                    r.compression.as_deref(),
-                    Some("lz4"),
-                    "absent, filled from old"
-                );
-            }
-            other => panic!("expected GlobalUpserted, got {other:?}"),
-        }
+        // byte_budget changed in new image, rest filled from old
+        assert_eq!(
+            interpret(
+                ConfigTableKind::Global,
+                &heap(HeapOp::Update, Some(new), Some(old)),
+                &global_rel(),
+            ),
+            Some(ConfigEvent::GlobalUpserted(GlobalRow {
+                row_budget: Some(1000),
+                byte_budget: Some(2048),
+                flush_timeout_ms: Some(250),
+                compression: Some("lz4".into()),
+                retry_max_attempts: Some(5),
+                drop_table_strategy: Some("retain".into()),
+            })),
+        );
     }
 
     #[test]
@@ -652,24 +638,25 @@ mod tests {
             Some(text_array(&["tenant", "id"])),
             Some(text_array(&["tenant"])),
         ];
-        match interpret(
-            ConfigTableKind::Table,
-            &heap(HeapOp::Insert, Some(new), None),
-            &r,
-        )
-        .unwrap()
-        {
-            ConfigEvent::TableUpserted { rel, row } => {
-                assert_eq!(rel, RelName::new("public", "events"));
-                assert_eq!(row.target_database.as_deref(), Some("default"));
-                assert_eq!(row.target_table.as_deref(), Some("events"));
-                assert_eq!(row.replicate, Some(true));
-                assert_eq!(row.initial_load.as_deref(), Some("copy"));
-                assert_eq!(row.order_by.unwrap(), ["tenant", "id"]);
-                assert_eq!(row.primary_key.unwrap(), ["tenant"]);
-            }
-            other => panic!("expected TableUpserted, got {other:?}"),
-        }
+        assert_eq!(
+            interpret(
+                ConfigTableKind::Table,
+                &heap(HeapOp::Insert, Some(new), None),
+                &r,
+            ),
+            Some(ConfigEvent::TableUpserted {
+                rel: RelName::new("public", "events"),
+                row: TableRow {
+                    target_database: Some("default".into()),
+                    target_table: Some("events".into()),
+                    replicate: Some(true),
+                    initial_load: Some("copy".into()),
+                    order_by: Some(vec!["tenant".into(), "id".into()]),
+                    primary_key: Some(vec!["tenant".into()]),
+                    ..TableRow::default()
+                },
+            }),
+        );
     }
 
     /// A pre-opt-in `config_table` row (only target columns, no `replicate`/
@@ -689,19 +676,20 @@ mod tests {
             Some(ColumnValue::Text("events".into())),
             Some(ColumnValue::Text("events".into())),
         ];
-        match interpret(
-            ConfigTableKind::Table,
-            &heap(HeapOp::Insert, Some(new), None),
-            &r,
-        )
-        .unwrap()
-        {
-            ConfigEvent::TableUpserted { row, .. } => {
-                assert_eq!(row.replicate, None);
-                assert_eq!(row.initial_load, None);
-            }
-            other => panic!("expected TableUpserted, got {other:?}"),
-        }
+        assert_eq!(
+            interpret(
+                ConfigTableKind::Table,
+                &heap(HeapOp::Insert, Some(new), None),
+                &r,
+            ),
+            Some(ConfigEvent::TableUpserted {
+                rel: RelName::new("public", "events"),
+                row: TableRow {
+                    target_table: Some("events".into()),
+                    ..TableRow::default()
+                },
+            }),
+        );
     }
 
     #[test]
@@ -725,36 +713,38 @@ mod tests {
             Some(ColumnValue::Text("_peerdb_version".into())),
             Some(ColumnValue::Text(String::new())),
         ];
-        match interpret(
-            ConfigTableKind::Table,
-            &heap(HeapOp::Insert, Some(new.clone()), None),
-            &r,
-        )
-        .unwrap()
-        {
-            ConfigEvent::TableUpserted { rel, row } => {
-                assert_eq!(rel, RelName::new("app", "events_.*"));
-                assert!(row.is_pattern());
-                assert_eq!(row.replicate, Some(true));
-                assert_eq!(row.system.lsn.as_deref(), Some("_peerdb_version"));
-                assert_eq!(row.system.is_deleted.as_deref(), Some(""));
-                assert_eq!(row.system.xid, None, "absent column inherits");
-            }
-            other => panic!("expected TableUpserted, got {other:?}"),
-        }
-        match interpret(
-            ConfigTableKind::Table,
-            &heap(HeapOp::Delete, None, Some(new)),
-            &r,
-        )
-        .unwrap()
-        {
-            ConfigEvent::TableRemoved { rel, pattern } => {
-                assert_eq!(rel, RelName::new("app", "events_.*"));
-                assert!(pattern);
-            }
-            other => panic!("expected TableRemoved, got {other:?}"),
-        }
+        // Absent system columns (xid, commit_ts) inherit
+        assert_eq!(
+            interpret(
+                ConfigTableKind::Table,
+                &heap(HeapOp::Insert, Some(new.clone()), None),
+                &r,
+            ),
+            Some(ConfigEvent::TableUpserted {
+                rel: RelName::new("app", "events_.*"),
+                row: TableRow {
+                    replicate: Some(true),
+                    system: crate::mapping::SystemColumnNames {
+                        lsn: Some("_peerdb_version".into()),
+                        is_deleted: Some(String::new()),
+                        ..Default::default()
+                    },
+                    match_kind: Some("regex".into()),
+                    ..TableRow::default()
+                },
+            }),
+        );
+        assert_eq!(
+            interpret(
+                ConfigTableKind::Table,
+                &heap(HeapOp::Delete, None, Some(new)),
+                &r,
+            ),
+            Some(ConfigEvent::TableRemoved {
+                rel: RelName::new("app", "events_.*"),
+                pattern: true,
+            }),
+        );
     }
 
     #[test]
@@ -782,24 +772,119 @@ mod tests {
             Some(ColumnValue::Text("max".into())),
             Some(ColumnValue::Null),
         ];
-        match interpret(
-            ConfigTableKind::Column,
-            &heap(HeapOp::Insert, Some(new), None),
-            &r,
-        )
-        .unwrap()
-        {
-            ConfigEvent::ColumnUpserted { rel, attname, row } => {
-                assert_eq!(rel, RelName::new("app", "*"));
-                assert_eq!(attname, "*_amount");
-                assert_eq!(row.match_kind.as_deref(), Some("glob"));
-                assert_eq!(row.target_type.as_deref(), Some("Decimal(38, 9)"));
-                assert_eq!(row.nan.as_deref(), Some("0"));
-                assert_eq!(row.pos_inf.as_deref(), Some("max"));
-                assert_eq!(row.neg_inf, None, "NULL inherits");
-            }
-            other => panic!("expected ColumnUpserted, got {other:?}"),
+        // NULL neg_inf inherits
+        assert_eq!(
+            interpret(
+                ConfigTableKind::Column,
+                &heap(HeapOp::Insert, Some(new.clone()), None),
+                &r,
+            ),
+            Some(ConfigEvent::ColumnUpserted {
+                rel: RelName::new("app", "*"),
+                attname: "*_amount".into(),
+                row: ColumnRow {
+                    target_type: Some("Decimal(38, 9)".into()),
+                    match_kind: Some("glob".into()),
+                    nan: Some("0".into()),
+                    pos_inf: Some("max".into()),
+                    neg_inf: None,
+                },
+            }),
+        );
+        assert_eq!(
+            interpret(
+                ConfigTableKind::Column,
+                &heap(HeapOp::Delete, None, Some(new)),
+                &r,
+            ),
+            Some(ConfigEvent::ColumnRemoved {
+                rel: RelName::new("app", "*"),
+                attname: "*_amount".into(),
+            }),
+        );
+    }
+
+    /// Operator-narrowed integer columns still read
+    #[test]
+    fn global_smallint_budget_widens() {
+        let r = rel(CONFIG_GLOBAL, vec![attr(1, "row_budget", 21)]);
+        let d = heap(HeapOp::Insert, Some(vec![Some(ColumnValue::Int2(5))]), None);
+        assert_eq!(
+            interpret(ConfigTableKind::Global, &d, &r),
+            Some(ConfigEvent::GlobalUpserted(GlobalRow {
+                row_budget: Some(5),
+                ..Default::default()
+            })),
+        );
+    }
+
+    #[test]
+    fn truncate_and_unknown_relations_interpret_nothing() {
+        assert_eq!(
+            interpret(
+                ConfigTableKind::Global,
+                &heap(HeapOp::Truncate, None, None),
+                &global_rel()
+            ),
+            None
+        );
+        assert_eq!(
+            ConfigTableKind::from_relname(CONFIG_COLUMN),
+            Some(ConfigTableKind::Column)
+        );
+        assert_eq!(ConfigTableKind::from_relname("config_other"), None);
+    }
+
+    #[test]
+    fn overlay_applies_upserts_and_removals() {
+        let rel = RelName::new("public", "t");
+        let mut overlay = ConfigOverlay::default();
+        for event in [
+            ConfigEvent::GlobalUpserted(GlobalRow {
+                row_budget: Some(7),
+                ..Default::default()
+            }),
+            ConfigEvent::NamespaceUpserted {
+                namespace: "public".into(),
+                row: NamespaceRow::default(),
+            },
+            ConfigEvent::TableUpserted {
+                rel: rel.clone(),
+                row: TableRow::default(),
+            },
+            ConfigEvent::ColumnUpserted {
+                rel: rel.clone(),
+                attname: "c".into(),
+                row: ColumnRow::default(),
+            },
+        ] {
+            overlay.apply(event);
         }
+        assert_eq!(overlay.global.as_ref().unwrap().row_budget, Some(7));
+        assert!(overlay.namespaces.contains_key("public"));
+        assert!(overlay.tables.contains_key(&rel));
+        assert!(overlay.columns.contains_key(&(rel.clone(), "c".into())));
+
+        for event in [
+            ConfigEvent::GlobalCleared,
+            ConfigEvent::NamespaceRemoved {
+                namespace: "public".into(),
+            },
+            ConfigEvent::TableRemoved {
+                rel: rel.clone(),
+                pattern: false,
+            },
+            ConfigEvent::ColumnRemoved {
+                rel: rel.clone(),
+                attname: "c".into(),
+            },
+        ] {
+            overlay.apply(event);
+        }
+        assert!(overlay.global.is_none());
+        assert!(overlay.namespaces.is_empty());
+        assert!(overlay.tables.is_empty());
+        assert!(overlay.columns.is_empty());
     }
 
     #[test]
@@ -809,5 +894,13 @@ mod tests {
         assert_eq!("base_backup".parse(), Ok(InitialLoadMode::BaseBackup));
         assert_eq!("object_store".parse(), Ok(InitialLoadMode::ObjectStore));
         assert!("null".parse::<InitialLoadMode>().is_err());
+        for mode in [
+            InitialLoadMode::None,
+            InitialLoadMode::Copy,
+            InitialLoadMode::BaseBackup,
+            InitialLoadMode::ObjectStore,
+        ] {
+            assert_eq!(mode.as_str().parse(), Ok(mode));
+        }
     }
 }

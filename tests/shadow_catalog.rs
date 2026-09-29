@@ -5,10 +5,13 @@
 //! Skipped silently if `initdb` is not on `$PATH`. Each test spins up a
 //! fresh data directory under a tempdir.
 
+#[path = "common/tools.rs"]
+mod tools;
+use tools::pg_available;
+
 #[path = "common/ports.rs"]
 mod ports;
 
-use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -19,14 +22,6 @@ use walshadow::shadow::{BridgeConf, Shadow, ShadowConfig};
 use walshadow::shadow_catalog::{
     CatalogError, ShadowCatalog, ShadowCatalogConfig, with_transient_retry,
 };
-
-fn pg_available() -> bool {
-    Command::new("initdb")
-        .arg("--version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
 
 fn make_shadow(tmp: &tempfile::TempDir, port: u16) -> Shadow {
     let mut cfg = ShadowConfig::new(tmp.path().join("data"), tmp.path().join("filtered"));
@@ -116,7 +111,6 @@ fn current_db_oid(shadow: &Shadow) -> u32 {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn user_relation_lookup_by_name() {
     if !pg_available() {
-        eprintln!("skip: no initdb on PATH");
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -168,7 +162,6 @@ async fn user_relation_lookup_by_name() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn replay_lsn_gate_times_out_when_not_in_recovery() {
     if !pg_available() {
-        eprintln!("skip: no initdb on PATH");
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -197,7 +190,6 @@ async fn replay_lsn_gate_times_out_when_not_in_recovery() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn catalog_reconnects_after_pg_restart() {
     if !pg_available() {
-        eprintln!("skip: no initdb on PATH");
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -237,7 +229,6 @@ async fn catalog_reconnects_after_pg_restart() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn with_transient_retry_outlasts_a_pg_restart() {
     if !pg_available() {
-        eprintln!("skip: no initdb on PATH");
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -313,7 +304,6 @@ async fn with_transient_retry_outlasts_a_pg_restart() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dropped_column_keeps_physical_slot() {
     if !pg_available() {
-        eprintln!("skip: no initdb on PATH");
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -383,7 +373,6 @@ async fn dropped_column_keeps_physical_slot() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn replident_matrix_default_nothing_full_index() {
     if !pg_available() {
-        eprintln!("skip: no initdb on PATH");
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -487,7 +476,6 @@ async fn replident_matrix_default_nothing_full_index() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fetch_all_descriptors_covers_eligible_kinds() {
     if !pg_available() {
-        eprintln!("skip: no initdb on PATH");
         return;
     }
     let tmp = tempfile::tempdir().unwrap();

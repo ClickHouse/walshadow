@@ -42,7 +42,7 @@ const N_ROWS: i32 = 64;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn direct_bootstrap_ch_end_to_end() {
-    if !fx::requirements_available() {
+    if !fx::tools::requirements_available() {
         return;
     }
 

@@ -128,7 +128,7 @@ fn winning_flag(ch: &fx::ChServer, id: i32) -> String {
 }
 
 fn skip_gate() -> bool {
-    if !fx::requirements_available() {
+    if !fx::tools::requirements_available() {
         return true;
     }
     false

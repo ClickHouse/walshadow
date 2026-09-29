@@ -14,20 +14,6 @@ use walshadow::segment_sink::SegFsync;
 /// Max unsynced segments queued before the pump blocks on `on_segment`;
 pub(crate) const SEGMENT_FSYNC_QUEUE: usize = 64;
 
-#[cfg(target_os = "linux")]
-pub(crate) fn sync_filesystem(fd: std::os::fd::RawFd) -> std::io::Result<()> {
-    if unsafe { libc::syncfs(fd) } == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-pub(crate) fn sync_filesystem(_fd: std::os::fd::RawFd) -> std::io::Result<()> {
-    unreachable!("walshadow-stream is Linux-only")
-}
-
 /// Background segment durability: drain the fsync queue, then `syncfs` the
 /// filesystem holding `out_dir` once per batch — this flushes every written
 /// segment + manifest + the directory entries in one syscall, avoiding the
@@ -46,22 +32,21 @@ pub(crate) fn spawn_segment_fsync(
     durable_lsn: Arc<Monotone<FilterDurable>>,
     fatal: walshadow::pipeline::Fatal,
 ) -> tokio::task::JoinHandle<()> {
-    use std::os::unix::io::AsRawFd;
     tokio::spawn(async move {
         let dir = match std::fs::File::open(&out_dir) {
-            Ok(f) => f,
+            Ok(f) => Arc::new(f),
             Err(e) => {
                 fatal.set(format!("open {} for syncfs: {e}", out_dir.display()));
                 return;
             }
         };
-        let dirfd = dir.as_raw_fd();
         while let Some(item) = rx.recv().await {
             let mut max_lsn = item.end_lsn;
             while let Ok(next) = rx.try_recv() {
                 max_lsn = max_lsn.max(next.end_lsn);
             }
-            let synced = tokio::task::spawn_blocking(move || sync_filesystem(dirfd)).await;
+            let dir = Arc::clone(&dir);
+            let synced = tokio::task::spawn_blocking(move || walshadow::fs::syncfs(&dir)).await;
             match synced {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => {

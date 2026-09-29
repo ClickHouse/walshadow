@@ -8,7 +8,7 @@
 
 use percent_encoding::percent_decode_str;
 use thiserror::Error;
-use tokio_postgres::config::{Host, SslMode};
+use tokio_postgres::config::Host;
 use toml::{Table, Value};
 use url::{ParseError, Url};
 
@@ -65,20 +65,22 @@ pub fn source_table(url: &str) -> Result<Table, DsnError> {
     let mut slot = None;
     let mut host_set = false;
     let mut port_set = false;
-    let mut sslmode_set = false;
+    let mut sslmode = None;
     let mut retained = Vec::new();
     for pair in query.split('&').filter(|s| !s.is_empty()) {
         let (raw_key, raw_value) = pair.split_once('=').unwrap_or((pair, ""));
         let key = decode(url, raw_key)?.to_ascii_lowercase();
         if key == "slot" {
             slot = Some(decode(url, raw_value)?);
+        } else if key == "sslmode" {
+            sslmode = Some(decode(url, raw_value)?);
+            retained.push(format!("{key}={raw_value}"));
         } else if matches!(
             key.as_str(),
-            "sslmode" | "host" | "port" | "user" | "password" | "dbname"
+            "host" | "port" | "user" | "password" | "dbname"
         ) {
             host_set |= key == "host";
             port_set |= key == "port";
-            sslmode_set |= key == "sslmode";
             retained.push(format!("{key}={raw_value}"));
         } else {
             return Err(DsnError::UnknownParam {
@@ -110,20 +112,9 @@ pub fn source_table(url: &str) -> Result<Table, DsnError> {
     if let Some(v) = slot {
         out.insert("slot".into(), v.into());
     }
-    let sslmode = match config.get_ssl_mode() {
-        SslMode::Disable => "disable",
-        SslMode::Prefer => "prefer",
-        SslMode::Require => "require",
-        mode => {
-            return Err(invalid(
-                url,
-                "PostgreSQL",
-                format!("unsupported sslmode {mode:?}"),
-            ));
-        }
-    };
-    if sslmode_set {
-        out.insert("sslmode".into(), sslmode.into());
+    // Parse above accepted it, so it names a mode tokio-postgres supports
+    if let Some(v) = sslmode {
+        out.insert("sslmode".into(), v.into());
     }
 
     let hosts = config.get_hosts();
@@ -440,6 +431,75 @@ mod tests {
         assert!(matches!(
             source_table("postgres://h/d?slot=%FF").unwrap_err(),
             DsnError::BadEncoding(_)
+        ));
+    }
+
+    #[test]
+    fn source_url_repeated_sslmode_keeps_last() {
+        let t = source_table("postgres://h/d?sslmode=require&sslmode=disable").unwrap();
+        assert_eq!(s(&t, "sslmode"), "disable");
+    }
+
+    #[test]
+    fn source_url_rejects_multiple_hosts() {
+        let e = source_table("postgres://h1,h2/d").unwrap_err();
+        assert!(e.to_string().contains("multiple hosts"), "{e}");
+    }
+
+    #[test]
+    fn source_url_without_host_is_rejected() {
+        assert!(matches!(
+            source_table("postgres:///d").unwrap_err(),
+            DsnError::NoHost(_)
+        ));
+    }
+
+    #[test]
+    fn source_url_rejects_zero_port_param() {
+        assert!(matches!(
+            source_table("postgres://h/d?port=0").unwrap_err(),
+            DsnError::BadPort(_)
+        ));
+    }
+
+    #[test]
+    fn ch_url_query_sets_port_and_credentials() {
+        let t = ch_table("clickhouse://ch/?port=9001&user=u&password=p%26q&database=d").unwrap();
+        assert_eq!(i(&t, "port"), 9001);
+        assert_eq!(s(&t, "user"), "u");
+        assert_eq!(s(&t, "password"), "p&q");
+        assert_eq!(s(&t, "database"), "d");
+    }
+
+    #[test]
+    fn ch_url_rejects_unknown_param() {
+        let e = ch_table("clickhouse://ch/db?timeout=5").unwrap_err();
+        assert!(
+            matches!(&e, DsnError::UnknownParam { key, supported, .. }
+                if key == "timeout" && *supported == CH_PARAMS),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn ch_url_rejects_bad_port_and_scheme() {
+        for url in [
+            "clickhouse://ch:0/db",
+            "clickhouse://ch:99999/db",
+            "clickhouse://ch/db?port=x",
+        ] {
+            assert!(
+                matches!(ch_table(url).unwrap_err(), DsnError::BadPort(_)),
+                "{url}"
+            );
+        }
+        assert!(matches!(
+            ch_table("postgres://ch/db").unwrap_err(),
+            DsnError::Scheme { .. }
+        ));
+        assert!(matches!(
+            ch_table("not a url").unwrap_err(),
+            DsnError::Invalid { .. }
         ));
     }
 }

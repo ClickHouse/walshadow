@@ -7,6 +7,9 @@
 
 #![allow(dead_code)]
 
+#[path = "tools.rs"]
+pub mod tools;
+
 use std::cell::RefCell;
 use std::fs;
 use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
@@ -20,16 +23,6 @@ use walshadow::shadow::{BridgeConf, Shadow, ShadowConfig};
 /// Bridge frames are tiny and the worker answers one request per loop pass, so
 /// anything this slow is a wedge, not load
 const IO_BUDGET: Duration = Duration::from_secs(20);
-
-pub fn pg_available() -> bool {
-    Command::new("initdb")
-        .arg("--version")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
 
 /// Build tree holding the module and the fault shim, fed to shadow as
 /// `dynamic_library_path`. Neither is optional, so an unbuilt tree fails

@@ -18,19 +18,20 @@ executable lines for revision under test, no historical percentage serves as
 current baseline. Use function coverage only to find untouched routines; LCOV
 function entries may repeat generic instantiations and do not count missed lines
 
-Add a measured high-water line floor to merged job, raise after each completed
-tier, and finish with a 100% gate. Check integer covered/total equality at final
-gate so rounded percentages cannot hide misses. A per-major `--fail-under-lines`
-check is not equivalent to merged coverage across version-specific branches
+Merged job caps missed lines, unique `(source file, DA line)` entries with zero
+hits, at a measured ceiling. Lower it after each completed tier and finish at
+zero, which is integer covered/total equality. Unlike a percentage or covered
+floor, a missed count neither rounds nor drops when covered code is deleted
+A per-major `--fail-under-lines` check is not equivalent to merged coverage
+across version-specific branches
 
-Audit denominator differences between native llvm-cov summaries, per-major LCOV
-`LF`/`LH` totals, and merged unique `(source file, DA line)` entries before adding
-thresholds. Derive each floor from matching report format
+Per-major LCOV `LF`/`LH` and native llvm-cov summaries count llvm-cov's source
+lines, a larger set than DA entries. Compare DA counts only against the ceiling
 
 Measure [PG module coverage](../pgext/README.md#coverage) separately from Rust
-line target. Merge per-major `coverage-pgext-*` reports while retaining existing
-100% per-major C gate. Retain live/fault tests and C sanitizer campaigns to verify
-module behavior beyond line execution
+line target. Per-major 100% C gate implies merged 100%, so no merged C gate is
+needed. Retain live/fault tests and C sanitizer campaigns to verify module
+behavior beyond line execution
 
 ## Work list
 
@@ -69,12 +70,11 @@ fault boundary and assert contract
 
 ## Sequencing and completion
 
-1. Enforce [CI prerequisites](verification.md#enforce-ci-prerequisites), audit
-   native/merged denominator discrepancy, refresh baseline, and list missed branches
+1. Refresh baseline and list missed branches
 2. Extend live harnesses for staged backfill restart, handoff, and gap replay
 3. Close pure-unit, fixture, schema, bootstrap, and transport gaps
 4. Exercise CLI orchestration and deterministic OS/transport failures
-5. Regenerate reports after each tier, raise floor, and retain regression inputs
+5. Regenerate reports after each tier, lower ceiling, and retain regression inputs
 6. Enforce literal 100% merged line coverage once no missed executable lines remain
 
 Use [semantic fuzzing](fuzzing.md) to discover interactions, then convert useful

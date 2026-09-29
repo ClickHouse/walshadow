@@ -320,6 +320,16 @@ mod tests {
     }
 
     #[test]
+    fn match_kind_label_round_trips() {
+        for kind in [MatchKind::Exact, MatchKind::Glob, MatchKind::Regex] {
+            assert_eq!(kind.as_str().parse(), Ok(kind));
+        }
+        assert_eq!(" GLOB ".parse(), Ok(MatchKind::Glob));
+        assert_eq!("".parse(), Ok(MatchKind::Exact));
+        assert!("like".parse::<MatchKind>().is_err());
+    }
+
+    #[test]
     fn exact_entry_retargets_only_its_relation() {
         let mut b = TableRulesBuilder::new();
         b.add(&rel("public", "events"), MatchKind::Exact, target("ev"));
@@ -425,6 +435,27 @@ mod tests {
         let (rules, rejected) = b.finish();
         assert_eq!(rejected, 2);
         assert!(!rules.has_patterns());
+    }
+
+    #[test]
+    fn colliding_system_rename_rejected() {
+        let mut b = TableRulesBuilder::new();
+        let key = rel("public", "events");
+        b.add(
+            &key,
+            MatchKind::Exact,
+            TableRule {
+                system: SystemColumnNames {
+                    lsn: Some("_xid".into()),
+                    ..SystemColumnNames::default()
+                },
+                target_table: Some("renamed".into()),
+                ..TableRule::default()
+            },
+        );
+        let (rules, rejected) = b.finish();
+        assert_eq!(rejected, 1);
+        assert_eq!(rules.settings(&key).target_table, None);
     }
 
     #[test]

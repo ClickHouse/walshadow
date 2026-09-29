@@ -96,7 +96,7 @@ fn assert_no_mirror(ch: &fx::ChServer, source: &walshadow::shadow::Shadow, stats
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn unchanged_toast_pointer_resolves_out_of_shadow() {
-    if !fx::requirements_available() {
+    if !fx::tools::requirements_available() {
         return;
     }
 
@@ -249,7 +249,7 @@ async fn unchanged_toast_pointer_resolves_out_of_shadow() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn unchanged_toast_pointer_fills_null_without_store() {
-    if !fx::requirements_available() {
+    if !fx::tools::requirements_available() {
         return;
     }
 

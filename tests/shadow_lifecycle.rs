@@ -14,6 +14,10 @@
 //!    replay that WAL into a pre-raise copy → replay pauses → resume for the
 //!    floor → restart on the raised value → operator pause holds.
 
+#[path = "common/tools.rs"]
+mod tools;
+use tools::pg_available;
+
 #[path = "common/ports.rs"]
 mod ports;
 
@@ -23,14 +27,6 @@ use std::time::{Duration, Instant};
 
 use walrus::pg::wal::segment::is_wal_filename;
 use walshadow::shadow::{ResumeOutcome, Shadow, ShadowConfig, SourceGucFloor};
-
-fn pg_available() -> bool {
-    Command::new("initdb")
-        .arg("--version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
 
 fn make_shadow(tmp: &tempfile::TempDir, port: u16) -> Shadow {
     let mut cfg = ShadowConfig::new(tmp.path().join("data"), tmp.path().join("filtered"));
@@ -45,7 +41,6 @@ fn make_shadow(tmp: &tempfile::TempDir, port: u16) -> Shadow {
 #[test]
 fn normal_mode_lifecycle() {
     if !pg_available() {
-        eprintln!("skip: no initdb on PATH");
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -78,7 +73,6 @@ fn normal_mode_lifecycle() {
 #[test]
 fn standby_mode_lifecycle() {
     if !pg_available() {
-        eprintln!("skip: no initdb on PATH");
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -144,7 +138,6 @@ fn standby_mode_lifecycle() {
 #[test]
 fn restore_command_filename_is_segment_relative() {
     if !pg_available() {
-        eprintln!("skip: no initdb on PATH (need to populate postgresql.conf)");
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -175,7 +168,6 @@ fn restore_command_filename_is_segment_relative() {
 #[test]
 fn guc_floor_pause_resumes_then_restarts() {
     if !pg_available() {
-        eprintln!("skip: no initdb on PATH");
         return;
     }
     let tmp = tempfile::tempdir().unwrap();

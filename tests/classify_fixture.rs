@@ -8,6 +8,9 @@
 //! after `capture.sh` get the catalog-fraction-bound assertion the
 //! classifier targets.
 
+#[path = "common/tools.rs"]
+mod tools;
+
 use std::fs::File;
 use std::path::PathBuf;
 use std::process::Command;
@@ -44,11 +47,7 @@ fn walk(bytes: &[u8]) -> anyhow::Result<Summary> {
 async fn catalog_fraction_under_workload_is_bounded() {
     let dir = fixture_dir();
     let seg = dir.join("000000010000000000000001.gz");
-    if !seg.exists() {
-        eprintln!(
-            "skip: no captured segment at {:?}. Run capture.sh to regenerate.",
-            seg
-        );
+    if !tools::fixture(&seg) {
         return;
     }
     let bytes = load_segment(&seg).await.expect("load fixture");
@@ -97,8 +96,7 @@ async fn catalog_fraction_under_workload_is_bounded() {
 fn cli_produces_json_for_fixture() {
     let dir = fixture_dir();
     let seg = dir.join("000000010000000000000001.gz");
-    if !seg.exists() {
-        eprintln!("skip: no captured segment at {:?}", seg);
+    if !tools::fixture(&seg) {
         return;
     }
 
@@ -117,8 +115,7 @@ fn cli_produces_json_for_fixture() {
 fn cli_produces_human_summary_for_fixture() {
     let dir = fixture_dir();
     let seg = dir.join("000000010000000000000001.gz");
-    if !seg.exists() {
-        eprintln!("skip: no captured segment at {:?}", seg);
+    if !tools::fixture(&seg) {
         return;
     }
     let exe = env!("CARGO_BIN_EXE_walshadow-classify");

@@ -109,7 +109,7 @@ fn overlay_ddl_args() -> fx::DdlPipelineArgs {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn opt_in_via_config_table_replicates_new_table() {
-    if !fx::requirements_available() {
+    if !fx::tools::requirements_available() {
         return;
     }
 
@@ -196,7 +196,7 @@ async fn opt_in_via_config_table_replicates_new_table() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn opt_out_mid_stream_drains_and_halts() {
-    if !fx::requirements_available() {
+    if !fx::tools::requirements_available() {
         return;
     }
 
@@ -322,7 +322,7 @@ async fn opt_out_mid_stream_drains_and_halts() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn forward_decl_materializes_on_create_table() {
-    if !fx::requirements_available() {
+    if !fx::tools::requirements_available() {
         return;
     }
 
@@ -424,7 +424,7 @@ async fn forward_decl_materializes_on_create_table() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn opt_in_non_empty_backfills_pre_opt_in_rows() {
-    if !fx::requirements_available() {
+    if !fx::tools::requirements_available() {
         return;
     }
 
@@ -596,7 +596,7 @@ async fn opt_in_non_empty_backfills_pre_opt_in_rows() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn opt_in_then_alter_add_column_reaches_ch() {
-    if !fx::requirements_available() {
+    if !fx::tools::requirements_available() {
         return;
     }
 
@@ -701,7 +701,7 @@ async fn opt_in_then_alter_add_column_reaches_ch() {
 /// drives auto-create, not just the per-table `replicate=true` opt-in.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn auto_create_namespace_via_config_namespace() {
-    if !fx::requirements_available() {
+    if !fx::tools::requirements_available() {
         return;
     }
 
@@ -791,7 +791,7 @@ async fn auto_create_namespace_via_config_namespace() {
 /// dropped one encodes scale-0 `123`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn column_target_type_override_reaches_projection() {
-    if !fx::requirements_available() {
+    if !fx::tools::requirements_available() {
         return;
     }
 
@@ -906,7 +906,7 @@ async fn column_target_type_override_reaches_projection() {
 /// heap rows in WAL routes those rows.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pre_opt_in_xact_discards_post_opt_in_routes() {
-    if !fx::requirements_available() {
+    if !fx::tools::requirements_available() {
         return;
     }
 
@@ -1003,7 +1003,7 @@ async fn pre_opt_in_xact_discards_post_opt_in_routes() {
 /// Drill 9: glob rules scope tables created later
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pattern_row_scopes_tables_by_glob() {
-    if !fx::requirements_available() {
+    if !fx::tools::requirements_available() {
         return;
     }
 
@@ -1094,7 +1094,7 @@ async fn pattern_row_scopes_tables_by_glob() {
 /// `replicate = true` creates, so the CREATE cannot fall back to the PK.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn opt_in_row_pins_order_by_and_primary_key() {
-    if !fx::requirements_available() {
+    if !fx::tools::requirements_available() {
         return;
     }
 
@@ -1184,7 +1184,7 @@ async fn opt_in_row_pins_order_by_and_primary_key() {
 /// columns of an auto-created table (docs/destination-tables.md).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pattern_row_shapes_auto_created_tables() {
-    if !fx::requirements_available() {
+    if !fx::tools::requirements_available() {
         return;
     }
 
@@ -1348,7 +1348,7 @@ async fn copy_load_converges(
 /// against a chunk mirror the load seeded
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn copy_load_resolves_unchanged_toast_after_update() {
-    if !fx::requirements_available() {
+    if !fx::tools::requirements_available() {
         return;
     }
     // 200 md5 digests: 6400 bytes, stored uncompressed out of line
@@ -1395,7 +1395,7 @@ async fn copy_load_resolves_unchanged_toast_after_update() {
 /// same interval read identically
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn copy_load_pins_output_settings() {
-    if !fx::requirements_available() {
+    if !fx::tools::requirements_available() {
         return;
     }
     let schema_sql = format!(

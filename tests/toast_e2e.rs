@@ -35,7 +35,7 @@ const META2_SQL: &str = "repeat('v2-update-', 60)";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn replident_full_unchanged_toast_update() {
-    if !fx::requirements_available() {
+    if !fx::tools::requirements_available() {
         return;
     }
 

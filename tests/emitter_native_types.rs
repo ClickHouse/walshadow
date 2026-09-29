@@ -55,8 +55,7 @@ fn rel_descriptor() -> RelDescriptor {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn native_numeric_time_timetz_round_trip() {
-    if !fx::clickhouse_available() {
-        eprintln!("skip: no clickhouse binary on PATH");
+    if !fx::tools::clickhouse_available() {
         return;
     }
 

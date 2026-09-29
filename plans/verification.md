@@ -5,13 +5,6 @@ coverage reports to find gaps instead of keeping historical line counts or
 lists of already covered functions. Build and test commands live in
 [development guide](../docs/development.md)
 
-## Enforce CI prerequisites
-
-Make missing binaries, module, extensions required by a job, and WAL fixtures
-fail that job. Runtime early returns currently let some unavailable tests look
-successful. Keep optional local skips explicit. Verify active PostgreSQL major
-matches matrix job and coverage merge receives every expected major
-
 ## Pin WAL layouts
 
 Extend generated fixtures with commit records combining subtransactions,

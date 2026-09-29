@@ -50,7 +50,7 @@ fn wait_for_metric(addr: SocketAddr, name: &str, least: u64, timeout: Duration) 
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pending_rows_promote_on_commit_and_never_publish_on_rollback() {
-    if !fx::requirements_available() {
+    if !fx::tools::requirements_available() {
         return;
     }
 

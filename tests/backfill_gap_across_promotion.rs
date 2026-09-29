@@ -159,8 +159,7 @@ impl RecordSink for BranchTally {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn gap_replay_crosses_a_promotion() {
-    if !fx::pg_available() {
-        eprintln!("skip: no initdb on PATH");
+    if !fx::tools::pg_available() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();

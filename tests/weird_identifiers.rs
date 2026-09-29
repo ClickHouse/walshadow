@@ -97,7 +97,7 @@ fn create_ch_dests(ch: &fx::ChServer) {
 }
 
 fn skip_gate() -> bool {
-    if !fx::requirements_available() {
+    if !fx::tools::requirements_available() {
         return true;
     }
     false

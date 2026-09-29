@@ -14,6 +14,9 @@
 
 #![allow(dead_code)]
 
+#[path = "tools.rs"]
+pub mod tools;
+
 #[path = "ports.rs"]
 mod ports;
 #[allow(unused_imports)]
@@ -339,52 +342,6 @@ impl DaemonRun {
         cfg.ctl_timeout = Duration::from_secs(60);
         let _ = Shadow::new(cfg).stop();
     }
-}
-
-/// Skip-gate probe — same shape as `pipeline_e2e.rs::clickhouse_available`.
-pub fn clickhouse_available() -> bool {
-    Command::new("clickhouse")
-        .arg("--version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
-pub fn pg_available() -> bool {
-    Command::new("initdb")
-        .arg("--version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
-pub fn pg_basebackup_available() -> bool {
-    Command::new("pg_basebackup")
-        .arg("--version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
-/// Skip gate every daemon bootstrap drill shares. Names the missing tool.
-pub fn requirements_available() -> bool {
-    for (tool, found) in [
-        ("initdb", pg_available()),
-        ("pg_basebackup", pg_basebackup_available()),
-        ("clickhouse", clickhouse_available()),
-    ] {
-        if !found {
-            eprintln!("skip: no {tool} on PATH");
-            return false;
-        }
-    }
-    true
 }
 
 /// Source cluster under `tmp`, initialised with the bootstrap overrides,

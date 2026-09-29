@@ -4091,12 +4091,11 @@ mod tests {
 
         let mut heap = heap_with_value(1, 0x100, 8);
         heap.decoded.new = Some(toast_ptr_tuple(55));
-        let err = detoast_heap(&mut heap, None, &maps, &capped(InlineValueOverflow::Error))
-            .await
-            .expect_err("error policy rejects oversized value");
+        let result =
+            detoast_heap(&mut heap, None, &maps, &capped(InlineValueOverflow::Error)).await;
         assert!(matches!(
-            err,
-            XactBufferError::ValueTooLarge { rawsize: 4, max: 3 }
+            result,
+            Err(XactBufferError::ValueTooLarge { rawsize: 4, max: 3 })
         ));
         assert_eq!(stats.toast_values_filled_oversize.load(Relaxed), 2);
     }

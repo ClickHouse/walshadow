@@ -24,8 +24,7 @@ fn emitter(port: u16) -> EmitterConfig {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tail_finish_flushes_and_drains_clean() {
-    if !fx::clickhouse_available() {
-        eprintln!("skip: no clickhouse binary on PATH");
+    if !fx::tools::clickhouse_available() {
         return;
     }
     let ch_tmp = tempfile::tempdir().unwrap();
@@ -55,8 +54,7 @@ async fn tail_finish_flushes_and_drains_clean() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tail_finish_returns_fatal_message() {
-    if !fx::clickhouse_available() {
-        eprintln!("skip: no clickhouse binary on PATH");
+    if !fx::tools::clickhouse_available() {
         return;
     }
     let ch_tmp = tempfile::tempdir().unwrap();
@@ -88,8 +86,7 @@ async fn tail_finish_returns_fatal_message() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tail_finish_fatal_during_drain() {
-    if !fx::clickhouse_available() {
-        eprintln!("skip: no clickhouse binary on PATH");
+    if !fx::tools::clickhouse_available() {
         return;
     }
     let ch_tmp = tempfile::tempdir().unwrap();

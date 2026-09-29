@@ -11,6 +11,9 @@
 //! 5. All `Route::ToDecoder` records show as `XLOG_NOOP` (rmid=0, info=0x20)
 //!    in the filtered output.
 
+#[path = "common/tools.rs"]
+mod tools;
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -115,8 +118,7 @@ fn parse_all_records(bytes: &[u8]) -> anyhow::Result<(usize, usize)> {
 #[tokio::test]
 async fn filtered_segment_round_trips_through_wal_parser() {
     let seg = fixture_segment();
-    if !seg.exists() {
-        eprintln!("skip: no captured segment at {:?}", seg);
+    if !tools::fixture(&seg) {
         return;
     }
     let f = filter(&seg).await;
@@ -174,11 +176,7 @@ async fn filtered_segment_round_trips_through_wal_parser() {
 #[tokio::test]
 async fn oltp_workload_keeps_well_under_one_percent() {
     let seg = oltp_segment();
-    if !seg.exists() {
-        eprintln!(
-            "skip: no OLTP fixture at {:?}. Run fixtures/wal/filter/capture.sh",
-            seg
-        );
+    if !tools::fixture(&seg) {
         return;
     }
     let f = filter(&seg).await;

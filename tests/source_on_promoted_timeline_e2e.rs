@@ -104,7 +104,7 @@ fn test_settings(storage_root: PathBuf) -> Settings {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn shadow_streams_from_a_source_booted_on_a_promoted_timeline() {
-    if !fx::requirements_available() {
+    if !fx::tools::requirements_available() {
         return;
     }
 
@@ -248,7 +248,7 @@ async fn shadow_streams_from_a_source_booted_on_a_promoted_timeline() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn bootstrap_from_an_ancestor_backup_crosses_onto_the_live_timeline() {
-    if !fx::requirements_available() {
+    if !fx::tools::requirements_available() {
         return;
     }
 

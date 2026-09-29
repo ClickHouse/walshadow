@@ -30,7 +30,7 @@ use walshadow::schema::RelName;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn add_column_default_replicates_pre_alter_default() {
-    if !fx::requirements_available() {
+    if !fx::tools::requirements_available() {
         return;
     }
 

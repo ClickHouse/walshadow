@@ -2,6 +2,10 @@
 //!
 //! Require `pgext/walshadow.so` built against `initdb` PG major
 
+#[path = "common/tools.rs"]
+mod tools;
+use tools::pg_available;
+
 #[path = "common/ports.rs"]
 mod ports;
 
@@ -9,7 +13,6 @@ use std::fs;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -24,16 +27,6 @@ use walshadow::pg::socket_conninfo;
 use walshadow::schema::{NUMERICOID, ReplIdent};
 use walshadow::shadow::{BridgeConf, Shadow, ShadowConfig};
 use walshadow::shadow_catalog::{CatalogError, ShadowCatalog, ShadowCatalogConfig};
-
-fn pg_available() -> bool {
-    Command::new("initdb")
-        .arg("--version")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
 
 /// Build tree holding `walshadow.so`, fed to shadow as `dynamic_library_path`.
 /// Module is not optional, so an unbuilt tree fails rather than skips
@@ -240,7 +233,6 @@ async fn strings_through_oracle(bridge: Arc<Bridge>, items: &[(u32, &[u8])]) -> 
 #[tokio::test(flavor = "current_thread")]
 async fn bridge_hello_and_encode_native() {
     if !pg_available() {
-        eprintln!("skip: no initdb on PATH");
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -276,7 +268,6 @@ async fn bridge_hello_and_encode_native() {
 #[tokio::test(flavor = "current_thread")]
 async fn bridge_native_strings_match_typoutput() {
     if !pg_available() {
-        eprintln!("skip: no initdb on PATH");
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -395,7 +386,6 @@ async fn bridge_native_strings_match_typoutput() {
 #[tokio::test(flavor = "current_thread")]
 async fn bridge_scans_uncommitted_ddl() {
     if !pg_available() {
-        eprintln!("skip: no initdb on PATH");
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -618,7 +608,6 @@ async fn bridge_scans_uncommitted_ddl() {
 #[tokio::test(flavor = "current_thread")]
 async fn bridge_scans_null_missing_value() {
     if !pg_available() {
-        eprintln!("skip: no initdb on PATH");
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -698,7 +687,6 @@ async fn bridge_scans_null_missing_value() {
 #[tokio::test(flavor = "current_thread")]
 async fn bridge_reconnects_after_worker_exit() {
     if !pg_available() {
-        eprintln!("skip: no initdb on PATH");
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -779,7 +767,6 @@ async fn bridge_reconnects_after_worker_exit() {
 #[tokio::test(flavor = "current_thread")]
 async fn bridge_drops_bad_frames_per_connection() {
     if !pg_available() {
-        eprintln!("skip: no initdb on PATH");
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -819,7 +806,6 @@ async fn bridge_drops_bad_frames_per_connection() {
 #[tokio::test(flavor = "current_thread")]
 async fn bridge_overlay_descriptors_track_open_ddl() {
     if !pg_available() {
-        eprintln!("skip: no initdb on PATH");
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -982,7 +968,6 @@ fn parse_error_frame(body: &[u8]) -> String {
 #[tokio::test(flavor = "current_thread")]
 async fn bridge_error_frames_stay_parseable() {
     if !pg_available() {
-        eprintln!("skip: no initdb on PATH");
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -1025,7 +1010,6 @@ async fn bridge_error_frames_stay_parseable() {
 #[tokio::test(flavor = "current_thread")]
 async fn bridge_fetch_toast_refuses_malformed_frames() {
     if !pg_available() {
-        eprintln!("skip: no initdb on PATH");
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -1243,7 +1227,6 @@ async fn bridge_committed_read_falls_back_when_replay_moves() {
     use std::sync::atomic::Ordering;
 
     if !pg_available() {
-        eprintln!("skip: no initdb on PATH");
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -1290,7 +1273,6 @@ async fn bridge_committed_read_falls_back_when_replay_moves() {
 #[tokio::test(flavor = "current_thread")]
 async fn bridge_native_hstore_expander_requires_extension_membership() {
     if !pg_available() {
-        eprintln!("skip: no initdb on PATH");
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -1383,7 +1365,6 @@ async fn bridge_native_hstore_expander_requires_extension_membership() {
 #[tokio::test(flavor = "current_thread")]
 async fn bridge_scans_multixact_catalog_rows() {
     if !pg_available() {
-        eprintln!("skip: no initdb on PATH");
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -1450,7 +1431,6 @@ async fn bridge_scans_multixact_catalog_rows() {
 #[tokio::test(flavor = "current_thread")]
 async fn bridge_scan_skips_aborted_ddl_debris() {
     if !pg_available() {
-        eprintln!("skip: no initdb on PATH");
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -1486,7 +1466,6 @@ async fn bridge_scan_skips_aborted_ddl_debris() {
 #[tokio::test(flavor = "current_thread")]
 async fn bridge_scan_skips_another_subtransactions_rows() {
     if !pg_available() {
-        eprintln!("skip: no initdb on PATH");
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -1533,7 +1512,6 @@ async fn bridge_scan_skips_another_subtransactions_rows() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn bridge_worker_pool_serves_concurrent_requests() {
     if !pg_available() {
-        eprintln!("skip: no initdb on PATH");
         return;
     }
     const WORKERS: usize = 4;
@@ -1628,7 +1606,6 @@ async fn bridge_worker_pool_serves_concurrent_requests() {
 #[tokio::test(flavor = "current_thread")]
 async fn bridge_scan_refuses_a_locked_catalog_off_the_named_boundary() {
     if !pg_available() {
-        eprintln!("skip: no initdb on PATH");
         return;
     }
     let tmp = tempfile::tempdir().unwrap();

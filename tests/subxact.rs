@@ -510,5 +510,5 @@ async fn many_subxacts_emit_assignment_record() {
 }
 
 fn skip_gate() -> bool {
-    !fx::requirements_available()
+    !fx::tools::requirements_available()
 }

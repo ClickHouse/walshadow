@@ -37,7 +37,7 @@ use walshadow::schema::RelName;
 async fn parallel_pipeline_schema_evolution_orders_after_data() {
     let slot = fx::Ports::alloc();
 
-    if !fx::requirements_available() {
+    if !fx::tools::requirements_available() {
         return;
     }
 
@@ -204,7 +204,7 @@ async fn parallel_pipeline_schema_evolution_orders_after_data() {
 async fn parallel_pipeline_truncate_orders_after_data() {
     let slot = fx::Ports::alloc();
 
-    if !fx::requirements_available() {
+    if !fx::tools::requirements_available() {
         return;
     }
 

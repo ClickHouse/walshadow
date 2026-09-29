@@ -13,10 +13,11 @@
 //! the validation: a real PG18 walreceiver speaks our walsender's
 //! protocol and accepts the handshake.
 //!
-//! Skipped when PG18 binaries are absent or when running in a
-//! sandbox that forbids spawning Postgres.
+//! Skips locally when `initdb` or `pg_ctl` is absent.
 
-use std::path::PathBuf;
+#[path = "common/tools.rs"]
+mod tools;
+
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
@@ -27,57 +28,17 @@ use walshadow::shadow_stream::{
     ShadowStreamState, WALRECEIVER_PROTOCOL_PIN, WalSenderAddr, spawn_listener,
 };
 
-fn pg_binary(name: &str) -> Option<PathBuf> {
-    let from_path = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&from_path) {
-        let candidate = dir.join(name);
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-    }
-    None
-}
-
-fn pg_version_compatible() -> bool {
-    let Ok(out) = std::process::Command::new("initdb")
-        .arg("--version")
-        .output()
-    else {
-        return false;
-    };
-    if !out.status.success() {
-        return false;
-    }
-    let mut s = String::from_utf8_lossy(&out.stdout).to_string();
-    s.push_str(&String::from_utf8_lossy(&out.stderr));
-    s.contains("PostgreSQL")
-}
-
 #[tokio::test(flavor = "current_thread")]
 async fn pg_walreceiver_connects_and_runs_identify_system() {
-    if pg_binary("initdb").is_none() || pg_binary("pg_ctl").is_none() {
-        eprintln!("skip: PG binaries not on PATH");
-        return;
-    }
-    if !pg_version_compatible() {
-        eprintln!("skip: PG version not compatible");
+    if !tools::pg_available() || !tools::on_path("pg_ctl", "--version") {
         return;
     }
 
-    let tmp = match tempfile::tempdir() {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("skip: cannot create tempdir: {e}");
-            return;
-        }
-    };
+    let tmp = tempfile::tempdir().unwrap();
     let standby_data = tmp.path().join("standby");
     let standby_socket_dir = tmp.path().join("sock");
     let standby_log = tmp.path().join("standby.log");
-    if std::fs::create_dir_all(&standby_socket_dir).is_err() {
-        eprintln!("skip: cannot create socket dir");
-        return;
-    }
+    std::fs::create_dir_all(&standby_socket_dir).unwrap();
 
     // Spin up the walsender server first (bootstrap-barrier
     // ordering) so PG's walreceiver doesn't hit
@@ -92,19 +53,13 @@ async fn pg_walreceiver_connects_and_runs_identify_system() {
         0x1234_5678,
         1024 * 1024,
     )));
-    let _handle = match spawn_listener(
+    let _handle = spawn_listener(
         WalSenderAddr::Tcp(format!("127.0.0.1:{walsender_port}").parse().unwrap()),
         state.clone(),
         Duration::from_millis(100),
     )
     .await
-    {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!("skip: walsender listener bind failed: {e}");
-            return;
-        }
-    };
+    .expect("bind walsender listener");
 
     // initdb a fresh standby cluster.
     let initdb_status = std::process::Command::new("initdb")
@@ -112,18 +67,13 @@ async fn pg_walreceiver_connects_and_runs_identify_system() {
         .args(["-U", "postgres", "--auth=trust", "--no-instructions"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status();
-    if !matches!(initdb_status, Ok(s) if s.success()) {
-        eprintln!("skip: initdb failed");
-        return;
-    }
+        .status()
+        .unwrap();
+    assert!(initdb_status.success(), "initdb failed");
 
     // Configure standby: standby.signal + minimal postgresql.conf
     // entry pointing at our walsender.
-    if std::fs::write(standby_data.join("standby.signal"), b"").is_err() {
-        eprintln!("skip: cannot write standby.signal");
-        return;
-    }
+    std::fs::write(standby_data.join("standby.signal"), b"").unwrap();
     let conninfo = format!(
         "host=127.0.0.1 port={walsender_port} user=walshadow application_name=walreceiver_check sslmode=disable"
     );
@@ -147,20 +97,11 @@ async fn pg_walreceiver_connects_and_runs_identify_system() {
          wal_retrieve_retry_interval = 200ms\n",
     );
     use std::io::Write as _;
-    let mut conf_file = match std::fs::OpenOptions::new()
+    let mut conf_file = std::fs::OpenOptions::new()
         .append(true)
         .open(standby_data.join("postgresql.conf"))
-    {
-        Ok(f) => f,
-        Err(e) => {
-            eprintln!("skip: cannot open postgresql.conf: {e}");
-            return;
-        }
-    };
-    if conf_file.write_all(conf.as_bytes()).is_err() {
-        eprintln!("skip: cannot append to postgresql.conf");
-        return;
-    }
+        .unwrap();
+    conf_file.write_all(conf.as_bytes()).unwrap();
     drop(conf_file);
 
     // Start PG; pg_ctl -w blocks until startup is signalled or the

@@ -59,7 +59,7 @@ pub async fn sync_filesystem(dir: &Path) -> io::Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn syncfs(f: &std::fs::File) -> io::Result<()> {
+pub fn syncfs(f: &std::fs::File) -> io::Result<()> {
     use std::os::fd::AsRawFd;
     // SAFETY: `f` owns the fd for the whole call
     if unsafe { libc::syncfs(f.as_raw_fd()) } == 0 {
@@ -70,7 +70,7 @@ fn syncfs(f: &std::fs::File) -> io::Result<()> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn syncfs(_f: &std::fs::File) -> io::Result<()> {
+pub fn syncfs(_f: &std::fs::File) -> io::Result<()> {
     unreachable!("walshadow is Linux-only")
 }
 
@@ -124,5 +124,20 @@ mod tests {
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
         assert!(tmp.path().join("durable.toml").exists());
         reset_dir(&tmp.path().join("absent")).unwrap();
+
+        // Refuse to replace a non-directory
+        let file = tmp.path().join("durable.toml");
+        assert!(reset_dir(&file).is_err());
+        assert!(file.is_file());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sync_filesystem_flushes_existing_dir_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        sync_filesystem(tmp.path()).await.unwrap();
+        let err = sync_filesystem(&tmp.path().join("absent"))
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
     }
 }

@@ -231,7 +231,7 @@ async fn run_ddl_intermix(
     inserter_pool: usize,
     label: &str,
 ) {
-    if !fx::requirements_available() {
+    if !fx::tools::requirements_available() {
         return;
     }
     if !pgbench_available() {

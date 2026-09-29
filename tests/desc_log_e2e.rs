@@ -23,7 +23,7 @@ use walshadow::schema::RelName;
 /// dropping the new column's values.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn prepared_ddl_drains_at_commit_prepared() {
-    if !fx::requirements_available() {
+    if !fx::tools::requirements_available() {
         return;
     }
     let slot = fx::Ports::alloc();
@@ -130,7 +130,7 @@ async fn prepared_ddl_drains_at_commit_prepared() {
 /// mapping keyed under it. With stale descriptors they skip as unmapped.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn schema_rename_reroutes_under_new_namespace() {
-    if !fx::requirements_available() {
+    if !fx::tools::requirements_available() {
         return;
     }
     let slot = fx::Ports::alloc();
@@ -243,7 +243,7 @@ async fn in_place_intervals_compatible_and_ambiguous() {
     use walrus::pg::walparser::RelFileNode;
     use walshadow::desc_log::{AmbiguityReason, LookupResult};
 
-    if !fx::requirements_available() {
+    if !fx::tools::requirements_available() {
         return;
     }
     let slot = fx::Ports::alloc();

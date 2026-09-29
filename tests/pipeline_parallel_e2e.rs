@@ -26,7 +26,7 @@ use walshadow::schema::RelName;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn parallel_pipeline_replicates_dml() {
-    if !fx::requirements_available() {
+    if !fx::tools::requirements_available() {
         return;
     }
 
@@ -259,7 +259,7 @@ const META2_SQL: &str = "repeat('v2-update-', 60)";
 /// the max-`_lsn` row, not NULL-skipping argMax) catches it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn parallel_pipeline_slices_multi_batch_commit() {
-    if !fx::requirements_available() {
+    if !fx::tools::requirements_available() {
         return;
     }
 

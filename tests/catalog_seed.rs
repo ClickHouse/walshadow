@@ -11,24 +11,19 @@
 //! — this stands in for the upstream "source PG", not shadow PG. The
 //! same binary serves both roles.
 
+#[path = "common/tools.rs"]
+mod tools;
+use tools::pg_available;
+
 #[path = "common/ports.rs"]
 mod ports;
 
-use std::process::Command;
 use std::time::Duration;
 
 use tokio_postgres::NoTls;
 use walshadow::catalog_tracker::{CatalogTracker, PG_CLASS_OID};
 use walshadow::pg::socket_conninfo;
 use walshadow::shadow::{Shadow, ShadowConfig};
-
-fn pg_available() -> bool {
-    Command::new("initdb")
-        .arg("--version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
 
 fn make_cluster(tmp: &tempfile::TempDir, port: u16) -> Shadow {
     let mut cfg = ShadowConfig::new(tmp.path().join("data"), tmp.path().join("filtered"));
@@ -91,7 +86,6 @@ async fn connect(sh: &Shadow) -> tokio_postgres::Client {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn seed_picks_up_initial_mapped_catalog_filenodes() {
     if !pg_available() {
-        eprintln!("skip: no initdb on PATH");
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -146,7 +140,6 @@ async fn seed_picks_up_initial_mapped_catalog_filenodes() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn seed_closes_pre_attach_pg_class_rotation_hole() {
     if !pg_available() {
-        eprintln!("skip: no initdb on PATH");
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -215,7 +208,6 @@ async fn seed_closes_pre_attach_pg_class_rotation_hole() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn seed_skips_user_tables() {
     if !pg_available() {
-        eprintln!("skip: no initdb on PATH");
         return;
     }
     let tmp = tempfile::tempdir().unwrap();

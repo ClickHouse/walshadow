@@ -20,12 +20,15 @@
 //!
 //! Skipped silently when `initdb` is not on `$PATH`.
 
+#[path = "common/tools.rs"]
+mod tools;
+use tools::pg_available;
+
 #[path = "common/ports.rs"]
 mod ports;
 
 use std::fs;
 use std::io::Write;
-use std::process::Command;
 use std::time::Duration;
 
 use ahash::{HashSet, HashSetExt};
@@ -42,14 +45,6 @@ use walshadow::shadow::{Shadow, ShadowConfig};
 /// Same row budget as the object-store sibling: one heap page worth so
 /// the page walker has guaranteed bytes without a multi-page sweep.
 const N_ROWS: i32 = 64;
-
-fn pg_available() -> bool {
-    Command::new("initdb")
-        .arg("--version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
 
 fn make_source(tmp: &tempfile::TempDir) -> Shadow {
     let mut cfg = ShadowConfig::new(
@@ -84,7 +79,6 @@ impl Drop for StopOnDrop<'_> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn direct_source_self_hosted_via_replication_protocol() {
     if !pg_available() {
-        eprintln!("skip: no initdb on PATH");
         return;
     }
     let tmp = tempfile::tempdir().unwrap();

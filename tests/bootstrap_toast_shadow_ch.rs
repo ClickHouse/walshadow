@@ -116,7 +116,7 @@ fn write_shadow_toast_config(path: &Path, ch_port: u16, schema: &str) -> Result<
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn bootstrap_renders_external_values_out_of_shadow() {
-    if !fx::requirements_available() {
+    if !fx::tools::requirements_available() {
         return;
     }
 

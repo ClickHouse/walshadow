@@ -131,7 +131,7 @@ jobs:
           exit 1
 
       # classify / filter / xlog_switch / vacuum_full_pg_depend tests
-      # silently skip when no fixture bytes are present. Regenerate
+      # fail when no fixture bytes are present. Regenerate
       # them against the matrix PG major so each job's
       # filter_round_trip + classify_fixture + wal_stream_chunk_boundary
       # actually runs against that major's WAL layout.
@@ -185,7 +185,11 @@ jobs:
           # here on failure. Empty on success; uploaded as a job artifact
           # by the next step when present.
           WALSHADOW_ARTIFACT_DIR: ${{ github.workspace }}/test-artifacts
+          # Missing tool or fixture fails the test instead of skipping it
+          WALSHADOW_REQUIRE_TOOLS: "1"
         run: |
+          initdb --version | grep -Eq '\) ${{ matrix.pg-major }}([.a-z]|$)' \
+            || { echo "::error::initdb on PATH is not PostgreSQL ${{ matrix.pg-major }}"; exit 1; }
           cargo llvm-cov clean --workspace
           cargo llvm-cov nextest --workspace --all-targets --locked \
             --no-report --no-fail-fast
@@ -261,20 +265,33 @@ jobs:
           pattern: coverage-pg[0-9]*
           path: lcov
 
+      # Version branches only count as covered when every major reports
       - name: Merge coverage
         working-directory: walshadow
         run: |
           set -euo pipefail
-          mkdir -p "$GITHUB_WORKSPACE/lcov"
-          mapfile -t inputs < <(find "$GITHUB_WORKSPACE/lcov" -name lcov.info -type f | sort)
-          [ ${#inputs[@]} -gt 0 ] || { echo "::error::no coverage inputs"; exit 1; }
+          inputs=()
+          for m in 16 17 18 19; do
+            f="$GITHUB_WORKSPACE/lcov/coverage-pg$m/lcov.info"
+            [ -s "$f" ] || { echo "::error::missing coverage for pg$m"; exit 1; }
+            inputs+=("$f")
+          done
           printf 'merging %s\n' "${inputs[@]}"
           awk -f ci/lcov_merge.awk "${inputs[@]}" >merged.lcov
 
+      # Lower ceiling as tests land, zero means every DA line hit
       - name: Coverage summary
         working-directory: walshadow
+        env:
+          MAX_MISSED_LINES: 4066
         run: |
-          awk -F: '/^LH:/{h+=$2} /^LF:/{f+=$2} END{if(f>0) printf "merged line coverage: %d/%d = %.2f%%\n",h,f,100*h/f}' merged.lcov
+          awk -F'[:,]' -v max="$MAX_MISSED_LINES" '
+            /^DA:/ { f++; if ($3 > 0) h++ }
+            END {
+              printf "merged line coverage: %d/%d = %.2f%%, %d missed\n", h, f, 100 * h / f, f - h
+              if (f - h > max) { printf "::error::%d missed lines exceeds ceiling %d\n", f - h, max; exit 1 }
+            }
+          ' merged.lcov
 
       - name: Fail on any 0%-coverage file (merged)
         working-directory: walshadow

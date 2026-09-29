@@ -29,24 +29,6 @@ use walshadow::pg::socket_conninfo;
 use walshadow::shadow::{BridgeConf, Shadow, ShadowConfig};
 use walshadow::toast::FetchedValue;
 
-/// Skip line plus `false` when a binary these clusters need is missing
-fn requirements(tools: &[&str]) -> bool {
-    for tool in tools {
-        let found = Command::new(tool)
-            .arg("--version")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        if !found {
-            eprintln!("skip: no {tool} on PATH");
-            return false;
-        }
-    }
-    true
-}
-
 fn wstest_module() -> PathBuf {
     let so = Path::new(env!("CARGO_MANIFEST_DIR")).join("pgext/test/wstest.so");
     assert!(
@@ -243,7 +225,7 @@ impl PinnedHorizon {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn live_value_reads_back_byte_exact() {
-    if !requirements(&["initdb"]) {
+    if !pgext::tools::pg_available() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -265,7 +247,7 @@ async fn live_value_reads_back_byte_exact() {
 /// and `SnapshotToast` reads them despite a committed xmax
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn dead_referrer_still_yields_its_value() {
-    if !requirements(&["initdb"]) {
+    if !pgext::tools::pg_available() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -301,7 +283,7 @@ async fn dead_referrer_still_yields_its_value() {
 /// Verify opportunistic pruning reclaims chunks without VACUUM
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pruning_reclaims_as_soon_as_the_horizon_passes() {
-    if !requirements(&["initdb"]) {
+    if !pgext::tools::pg_available() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -340,7 +322,7 @@ async fn pruning_reclaims_as_soon_as_the_horizon_passes() {
 /// pass as the value. Density plus total size is the whole check
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn partly_reclaimed_run_refuses() {
-    if !requirements(&["initdb"]) {
+    if !pgext::tools::pg_available() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -364,7 +346,7 @@ async fn partly_reclaimed_run_refuses() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn vacuum_rewrite_and_truncate_each_remove_the_value() {
-    if !requirements(&["initdb"]) {
+    if !pgext::tools::pg_available() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -401,7 +383,7 @@ async fn vacuum_rewrite_and_truncate_each_remove_the_value() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn compressed_value_comes_back_stored_not_inflated() {
-    if !requirements(&["initdb"]) {
+    if !pgext::tools::pg_available() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -429,7 +411,7 @@ async fn compressed_value_comes_back_stored_not_inflated() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fetch_refuses_malformed_requests() {
-    if !requirements(&["initdb"]) {
+    if !pgext::tools::pg_available() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -501,7 +483,7 @@ async fn fetch_refuses_malformed_requests() {
 /// plants them
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn planted_chunk_headers_short_reads_compressed_refuses() {
-    if !requirements(&["initdb"]) {
+    if !pgext::tools::pg_available() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -571,7 +553,7 @@ async fn chunks_younger_than_the_ceiling_read_as_a_later_generation() {
     use walshadow::toast::shadow_store::{ShadowRead, ShadowToastStore, bound};
     use walshadow::toast::xid_ceiling::{XidCeiling, follows};
 
-    if !requirements(&["initdb"]) {
+    if !pgext::tools::pg_available() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -671,7 +653,7 @@ async fn chunks_younger_than_the_ceiling_read_as_a_later_generation() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn batch_fetch_aligns_with_its_request() {
-    if !requirements(&["initdb"]) {
+    if !pgext::tools::pg_available() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -868,7 +850,7 @@ async fn clone_standby(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn standby_keeps_the_value_until_the_prune_record_replays() {
-    if !requirements(&["initdb", "pg_basebackup"]) {
+    if !pgext::tools::pg_available() || !pgext::tools::pg_basebackup_available() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -931,7 +913,7 @@ async fn shadow_store_reads_and_refuses_writes() {
     use walshadow::toast::shadow_store::ShadowToastStore;
     use walshadow::toast::{ChunkStore, ChunkStoreError, ToastRow};
 
-    if !requirements(&["initdb"]) {
+    if !pgext::tools::pg_available() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -1027,7 +1009,7 @@ async fn replay_passed_within(standby: &Client, lsn: &str, budget: Duration) -> 
 /// its own reclamation fence.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pg_standby_conflicts_do_not_fence_reclamation() {
-    if !requirements(&["initdb", "pg_basebackup"]) {
+    if !pgext::tools::pg_available() || !pgext::tools::pg_basebackup_available() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -1096,7 +1078,7 @@ async fn store_readiness_distinguishes_primary_standby_and_unbound() {
     use walshadow::toast::shadow_store::{LateBridge, ShadowToastStore};
     use walshadow::toast::{ChunkStore, ChunkStoreError};
 
-    if !requirements(&["initdb", "pg_basebackup"]) {
+    if !pgext::tools::pg_available() || !pgext::tools::pg_basebackup_available() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();

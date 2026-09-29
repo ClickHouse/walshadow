@@ -72,8 +72,7 @@ impl Fixture {
 
 #[test]
 fn read_loop_finishes_partial_and_retried_recv() {
-    if !pgext::pg_available() {
-        eprintln!("skip: no initdb on PATH");
+    if !pgext::tools::pg_available() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -103,8 +102,7 @@ fn read_loop_finishes_partial_and_retried_recv() {
 
 #[test]
 fn read_loop_drops_connections_it_cannot_finish() {
-    if !pgext::pg_available() {
-        eprintln!("skip: no initdb on PATH");
+    if !pgext::tools::pg_available() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -134,8 +132,7 @@ fn read_loop_drops_connections_it_cannot_finish() {
 
 #[test]
 fn write_loop_finishes_partial_and_retried_send() {
-    if !pgext::pg_available() {
-        eprintln!("skip: no initdb on PATH");
+    if !pgext::tools::pg_available() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -158,8 +155,7 @@ fn write_loop_finishes_partial_and_retried_send() {
 
 #[test]
 fn write_loop_drops_connections_it_cannot_finish() {
-    if !pgext::pg_available() {
-        eprintln!("skip: no initdb on PATH");
+    if !pgext::tools::pg_available() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -205,8 +201,7 @@ fn write_loop_drops_connections_it_cannot_finish() {
 
 #[test]
 fn accept_faults_leave_the_connection_array_alone() {
-    if !pgext::pg_available() {
-        eprintln!("skip: no initdb on PATH");
+    if !pgext::tools::pg_available() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -247,8 +242,7 @@ fn accept_faults_leave_the_connection_array_alone() {
 /// error on the connection
 #[test]
 fn shutdown_reaches_the_write_wait() {
-    if !pgext::pg_available() {
-        eprintln!("skip: no initdb on PATH");
+    if !pgext::tools::pg_available() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();

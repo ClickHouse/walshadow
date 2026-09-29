@@ -879,7 +879,7 @@ impl ConfigResolver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime_config::{GlobalRow, NamespaceRow, TableRow};
+    use crate::runtime_config::{ColumnRow, GlobalRow, NamespaceRow, TableRow};
     use ahash::HashMapExt;
 
     fn base_with(drop_strategy: &str) -> EmitterConfig {
@@ -915,6 +915,7 @@ mod tests {
         // CLI beats overlay.
         let cli = CliOverrides {
             drop_table_strategy: Some(DropTableStrategy::Warn),
+            flush_timeout: Some(Duration::from_millis(7)),
             ..Default::default()
         };
         let (r, _) = ConfigResolver::resolve(
@@ -925,6 +926,7 @@ mod tests {
             &ColumnRules::default(),
         );
         assert_eq!(r.drop_table_strategy, DropTableStrategy::Warn);
+        assert_eq!(r.flush_timeout, Duration::from_millis(7));
     }
 
     #[test]
@@ -948,6 +950,7 @@ mod tests {
         let overlay = ConfigOverlay {
             global: Some(GlobalRow {
                 row_budget: Some(1000),
+                byte_budget: Some(4096),
                 flush_timeout_ms: Some(250),
                 compression: Some("none".into()),
                 retry_max_attempts: Some(9),
@@ -964,6 +967,7 @@ mod tests {
         );
         assert_eq!(rej, 0);
         assert_eq!(r.row_budget, 1000);
+        assert_eq!(r.byte_budget, 4096);
         assert_eq!(r.flush_timeout, Duration::from_millis(250));
         assert_eq!(r.compression, CompressionChoice::None);
         assert_eq!(r.retry_max_attempts, 9);
@@ -972,15 +976,32 @@ mod tests {
     #[test]
     fn malformed_overlay_value_rejected_keeps_prior() {
         let base = base_with("retain");
-        let overlay = ConfigOverlay {
+        let mut overlay = ConfigOverlay {
             global: Some(GlobalRow {
                 drop_table_strategy: Some("nonsense".into()),
                 compression: Some("brotli".into()),
                 row_budget: Some(-5),
-                ..Default::default()
+                byte_budget: Some(0),
+                flush_timeout_ms: Some(-1),
+                retry_max_attempts: Some(-1),
             }),
             ..Default::default()
         };
+        overlay.namespaces.insert(
+            "public".into(),
+            NamespaceRow {
+                drop_table_strategy: Some("nonsense".into()),
+                ..Default::default()
+            },
+        );
+        overlay.columns.insert(
+            (RelName::new("public", "t"), "c".into()),
+            ColumnRow {
+                match_kind: Some("bogus".into()),
+                target_type: Some("String".into()),
+                ..Default::default()
+            },
+        );
         let (r, rej) = ConfigResolver::resolve(
             &base,
             &overlay,
@@ -988,11 +1009,16 @@ mod tests {
             &OptInState::default(),
             &ColumnRules::default(),
         );
-        assert_eq!(rej, 3);
+        assert_eq!(rej, 8);
         // Prior (TOML/base) values survive each rejection.
         assert_eq!(r.drop_table_strategy, DropTableStrategy::Retain);
         assert_eq!(r.compression, base.compression);
         assert_eq!(r.row_budget, base.row_budget);
+        assert_eq!(r.byte_budget, base.byte_budget);
+        assert_eq!(r.flush_timeout, base.flush_timeout);
+        assert_eq!(r.retry_max_attempts, base.retry.max_attempts);
+        assert_eq!(r.namespaces["public"].drop_table_strategy, None);
+        assert!(r.column_rules.is_empty());
     }
 
     #[test]
@@ -1011,13 +1037,22 @@ mod tests {
             NamespaceRow {
                 auto_create: Some(true),
                 target_database: Some("default".into()),
-                drop_table_strategy: None,
+                drop_table_strategy: Some("drop".into()),
             },
         );
         overlay.tables.insert(
             RelName::new("public", "events"),
             TableRow {
                 target_database: Some("default".into()),
+                target_table: Some("events_v2".into()),
+                ..Default::default()
+            },
+        );
+        // Target without a mapping stays unmapped rather than opting in
+        overlay.tables.insert(
+            RelName::new("public", "unmapped"),
+            TableRow {
+                target_table: Some("elsewhere".into()),
                 ..Default::default()
             },
         );
@@ -1031,8 +1066,10 @@ mod tests {
         let ns = r.namespaces.get("public").unwrap();
         assert!(ns.auto_create);
         assert_eq!(ns.target_database.as_deref(), Some("default"));
+        assert_eq!(ns.drop_table_strategy, Some(DropTableStrategy::Drop));
         let t = r.tables.get(&RelName::new("public", "events")).unwrap();
-        assert_eq!(t.target, TableTarget::new("default", "events"));
+        assert_eq!(t.target, TableTarget::new("default", "events_v2"));
+        assert!(!r.tables.contains_key(&RelName::new("public", "unmapped")));
         assert_eq!(
             t.columns.len(),
             1,
@@ -1517,6 +1554,17 @@ mod tests {
         );
         assert!(!mapping.with(|m| m.contains_key(&rel)).await);
         assert_eq!(resolver.opt_out_total(), 1);
+        assert!(resolver.is_excluded(&rel).await);
+
+        // Excluded and unmapped rels fold nothing and skip republish
+        let diff = SchemaDiff::default();
+        resolver
+            .apply_schema_diff(&rel_desc("public", "events"), &diff, &[])
+            .await;
+        resolver
+            .apply_schema_diff(&rel_desc("public", "other"), &diff, &[])
+            .await;
+        assert!(!rx.has_changed().unwrap());
     }
 
     #[tokio::test]

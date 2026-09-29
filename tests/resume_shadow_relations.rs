@@ -1,5 +1,8 @@
 //! Replaying heap deltas after dropping their earlier images must stay filtered
 
+#[path = "common/tools.rs"]
+mod tools;
+
 use std::fs;
 use std::io::Write;
 use std::path::Path;
@@ -50,12 +53,7 @@ fn lsn(s: &str) -> u64 {
 
 #[tokio::test]
 async fn retained_routes_prevent_invalid_page_recovery_after_resume() {
-    if !Command::new("initdb")
-        .arg("--version")
-        .output()
-        .is_ok_and(|o| o.status.success())
-    {
-        eprintln!("skip: no initdb on PATH");
+    if !tools::pg_available() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();

@@ -674,7 +674,7 @@ fn spawn_daemon(bin: &str, args: &[String], stderr_path: &Path) -> Result<Child>
 }
 
 fn gated() -> bool {
-    fx::requirements_available()
+    fx::tools::requirements_available()
 }
 
 const USER_EMAIL: &str =
