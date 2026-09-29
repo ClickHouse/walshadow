@@ -1394,6 +1394,13 @@ pub(crate) enum ColumnEncoding {
 }
 
 impl ColumnEncoding {
+    pub(crate) fn label(&self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::Oracle { .. } => "oracle",
+        }
+    }
+
     fn choose(att: Option<&RelAttr>, ast: &TypeAst) -> Self {
         let Some(att) = att else {
             // Predeclared post-ALTER column has only default cells
@@ -2551,6 +2558,9 @@ crate::atomic_stats! {
         /// (memoised)
         pub route_snapshots_mapped,
         pub route_snapshots_unmapped,
+        pub unmapped_rows_by_table: crate::emit::pipeline::row_ledger::TableRowCounts,
+        pub rows_inserted_by_table: crate::emit::pipeline::row_ledger::TableRowCounts,
+        pub cells_inserted_by_type: crate::emit::pipeline::row_ledger::CellCounts,
         /// Commit-resolve raw decode: records by verdict kind, per op
         /// (`raw_decode_records_total{kind,op}`)
         pub raw_decode_toast_ops: crate::decode::heap_decoder::OpCounters,

@@ -71,7 +71,8 @@ pub use emit::{ch_ddl, ch_emitter, pipeline};
 pub use filter::{catalog_tracker, classify, main_data, pg_class_decoder, rewrite};
 #[doc(hidden)]
 pub use ops::{
-    bridge, control, ctl, init, introspect, metrics, oracle, preflight, retention, trace,
+    bridge, control, ctl, init, introspect, log_events, metrics, oracle, preflight, retention,
+    trace,
 };
 #[doc(hidden)]
 pub use source::{

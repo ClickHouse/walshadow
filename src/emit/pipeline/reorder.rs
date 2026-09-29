@@ -30,7 +30,7 @@ use crate::decode::visibility::{PgXactPatch, PgXactView, read_pg_xact};
 use crate::emit::ch_ddl::DdlApplicator;
 use crate::emit::ch_emitter::EmitterStats;
 use crate::record::{Record, RecordSink, SinkError};
-use crate::schema::{RelDescriptor, RelName, SchemaEvent};
+use crate::schema::{RelDescriptor, RelName, SchemaEvent, TableKey};
 use ahash::{HashMap, HashMapExt, HashSet, HashSetExt};
 use tracing::Instrument;
 
@@ -1161,31 +1161,40 @@ impl<'a> ReorderRouteView<'a> {
 impl PlanRouteView for ReorderRouteView<'_> {
     fn route_for(&mut self, heap: &DescribedHeap) -> Option<Arc<RouteSnapshot>> {
         let rel_name = &heap.descriptor.rel_name;
-        if let Some(r) = self.memo.get(rel_name) {
-            return r.clone();
-        }
-        let mapped = match self.overlay.get(rel_name) {
-            Some(o) => o.clone(),
-            None => self.mapping.as_ref().and_then(|m| m.get(rel_name)).cloned(),
-        };
-        let route = mapped.map(|m| {
-            let rules = self
-                .config
-                .as_ref()
-                .map_or_else(Arc::default, |rc| rc.column_rules.clone());
-            let policy = self.row_policy.for_rel(self.config.as_deref(), rel_name);
-            RouteSnapshot::freeze(Arc::new(m), rules, policy)
-        });
-        let result = if route.is_none() {
-            self.stats
-                .unsupported_relations
-                .fetch_add(1, Ordering::Relaxed);
-            &self.stats.route_snapshots_unmapped
+        let route = if let Some(r) = self.memo.get(rel_name) {
+            r.clone()
         } else {
-            &self.stats.route_snapshots_mapped
+            let mapped = match self.overlay.get(rel_name) {
+                Some(o) => o.clone(),
+                None => self.mapping.as_ref().and_then(|m| m.get(rel_name)).cloned(),
+            };
+            let route = mapped.map(|m| {
+                let rules = self
+                    .config
+                    .as_ref()
+                    .map_or_else(Arc::default, |rc| rc.column_rules.clone());
+                let policy = self.row_policy.for_rel(self.config.as_deref(), rel_name);
+                RouteSnapshot::freeze(Arc::new(m), rules, policy)
+            });
+            let result = if route.is_none() {
+                self.stats
+                    .unsupported_relations
+                    .fetch_add(1, Ordering::Relaxed);
+                &self.stats.route_snapshots_unmapped
+            } else {
+                &self.stats.route_snapshots_mapped
+            };
+            result.fetch_add(1, Ordering::Relaxed);
+            self.memo.insert(rel_name.clone(), route.clone());
+            route
         };
-        result.fetch_add(1, Ordering::Relaxed);
-        self.memo.insert(rel_name.clone(), route.clone());
+        if route.is_none() {
+            let key = TableKey::new(heap.descriptor.rfn.db_node, rel_name.clone());
+            self.stats
+                .unmapped_rows_by_table
+                .counter(&key)
+                .fetch_add(1, Ordering::Relaxed);
+        }
         route
     }
 

@@ -428,6 +428,7 @@ pub(crate) async fn run_bootstrap(
                         by_database: vec![boot_db.series()],
                         ..stage_gauges(&StageCounters {
                             emitter: Some(&stats),
+                            db_name: &|_| boot_db.database.clone(),
                             oracle: [None, Some(&oracle_stats)],
                             bootstrap: Some(&progress),
                             bootstrap_attempt: attempt,

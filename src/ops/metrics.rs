@@ -183,6 +183,9 @@ snapshot! {
         /// across databases. `ctl status` reads it; the scrape renders the
         /// per-database split instead
         config_backfills_pending: u64,
+        unmapped_rows_by_table: Vec<(String, String, u64)>,
+        rows_inserted_by_table: Vec<(String, String, u64)>,
+        cells_inserted_by_type: Vec<(String, &'static str, u64)>,
         /// Refusal a crossing parked on, rendered as `crossing_wedged`. The
         /// pump keeps publishing rather than exiting into a restart that
         /// re-crosses and re-fails, so this is how the daemon says it is
@@ -363,6 +366,10 @@ snapshot! {
         "Tuples skipped because the source relation has no mapping in --ch-config.",
     counter emitter_deletes_discarded: u64 =
         "DELETE rows dropped because is_deleted = false leaves no marker column.",
+    counter emitter_retries_attempted_total: u64 =
+        "Failed ClickHouse operations retried, one per failing operation rather than per attempt.",
+    counter emitter_reconnects_total: u64 =
+        "ClickHouse client dials after the first, from retries and live endpoint or compression changes.",
     gauge pump_queue_depth: u64 = "Records buffered between the WAL pump and the queueing worker.",
     counter queue_records_out_total: u64 =
         "Records the queueing/reorder worker has dequeued and dispatched. rate() is the worker's throughput; with pump_queue_depth it tells deep-and-draining from deep-and-stalled.",
@@ -766,6 +773,22 @@ pub(crate) fn counter_series<'a, V: EncodeCounterValue>(
     Ok(())
 }
 
+pub(crate) fn counter_pairs<'a, V: EncodeCounterValue>(
+    enc: &mut DescriptorEncoder<'_>,
+    name: &str,
+    help: &str,
+    keys: [&str; 2],
+    series: impl IntoIterator<Item = ([&'a str; 2], V)>,
+) -> fmt::Result {
+    let mut family = declare(enc, name, help, MetricType::Counter)?;
+    for (values, value) in series {
+        family
+            .encode_family(&[(keys[0], values[0]), (keys[1], values[1])])?
+            .encode_counter::<NoLabelSet, _, u64>(&value, None)?;
+    }
+    Ok(())
+}
+
 pub(crate) fn gauge_series<'a, V: EncodeGaugeValue>(
     enc: &mut DescriptorEncoder<'_>,
     name: &str,
@@ -886,6 +909,26 @@ impl Collector for SnapshotCollector {
 fn encode_snapshot(snap: &MetricsSnapshot, enc: &mut DescriptorEncoder<'_>) -> fmt::Result {
     encode_fields(snap, enc)?;
 
+    counter_pairs(
+        enc,
+        "walshadow_cells_inserted",
+        "Cells inserted per ClickHouse column type, split by whether the shadow oracle encoded them.",
+        ["type", "encoding"],
+        snap.cells_inserted_by_type
+            .iter()
+            .map(|(ty, encoding, n)| ([ty.as_str(), *encoding], *n)),
+    )?;
+
+    counter_pairs(
+        enc,
+        "walshadow_table_rows_inserted",
+        "Rows inserted per source table, initial load and CDC alike.",
+        ["database", "table"],
+        snap.rows_inserted_by_table
+            .iter()
+            .map(|(database, table, n)| ([database.as_str(), table.as_str()], *n)),
+    )?;
+
     gauge(
         enc,
         "walshadow_crossing_wedged",
@@ -940,6 +983,7 @@ pub fn render(snap: MetricsSnapshot) -> String {
     let mut registry = Registry::default();
     registry.register_collector(Box::new(SnapshotCollector(snap)));
     registry.register_collector(Box::new(crate::ops::stages::StageCollector));
+    registry.register_collector(Box::new(crate::ops::log_events::LogEventCollector));
     let mut out = String::with_capacity(16 << 10);
     text::encode(&mut out, &registry).expect("String write cannot fail");
     out
@@ -1015,6 +1059,59 @@ async fn handle_client(
 mod tests {
     use super::*;
 
+    /// Every family encodes through `?`, so a writer that gives out partway
+    /// has to surface as an error rather than a panic or a truncated scrape
+    #[test]
+    fn encode_propagates_a_failing_writer_at_every_family() {
+        struct FailAfter {
+            writes: usize,
+            out: String,
+        }
+        impl fmt::Write for FailAfter {
+            fn write_str(&mut self, s: &str) -> fmt::Result {
+                if self.writes == 0 {
+                    return Err(fmt::Error);
+                }
+                self.writes -= 1;
+                self.out.push_str(s);
+                Ok(())
+            }
+        }
+
+        let mut snap = MetricsSnapshot {
+            crossing_blocked_on: "slot_missing",
+            source_endpoint_swap_blocked_on: "slot_missing",
+            promotion_blocked_on: "not_paused",
+            unmapped_rows_by_table: vec![("app".into(), "public.noise".into(), 5)],
+            rows_inserted_by_table: vec![("app".into(), "public.orders".into(), 9)],
+            cells_inserted_by_type: vec![("String".into(), "local", 9)],
+            by_database: vec![DbSeries {
+                database: "app".into(),
+                ..DbSeries::default()
+            }],
+            ..MetricsSnapshot::default()
+        };
+        snap.records_by_rm_route
+            .insert(("Heap".into(), "to_decoder"), 3);
+
+        let full = render(snap.clone()).len();
+        let mut errors = 0;
+        for writes in 0..64 {
+            let mut w = FailAfter {
+                writes,
+                out: String::new(),
+            };
+            let mut registry = Registry::default();
+            registry.register_collector(Box::new(SnapshotCollector(snap.clone())));
+            registry.register_collector(Box::new(crate::ops::log_events::LogEventCollector));
+            if text::encode(&mut w, &registry).is_err() {
+                errors += 1;
+                assert!(w.out.len() < full, "a failed encode cannot be complete");
+            }
+        }
+        assert_eq!(errors, 64, "every prefix length must surface the failure");
+    }
+
     #[test]
     fn render_includes_help_type_lines() {
         let mut snap = MetricsSnapshot {
@@ -1037,6 +1134,27 @@ mod tests {
         );
         assert!(body.contains("walshadow_xact_active 3"));
         assert!(body.contains("walshadow_uptime_seconds_total 42"));
+    }
+
+    #[test]
+    fn render_labels_per_table_and_cell_series() {
+        let body = render(MetricsSnapshot::default());
+        assert!(
+            !body.contains("walshadow_table_rows_inserted_total{"),
+            "{body}"
+        );
+
+        let body = render(MetricsSnapshot {
+            cells_inserted_by_type: vec![("Decimal(38, 9)".into(), "oracle", 7)],
+            rows_inserted_by_table: vec![("app".into(), "public.orders".into(), 4096)],
+            ..MetricsSnapshot::default()
+        });
+        for want in [
+            "walshadow_cells_inserted_total{type=\"Decimal(38, 9)\",encoding=\"oracle\"} 7",
+            "walshadow_table_rows_inserted_total{database=\"app\",table=\"public.orders\"} 4096",
+        ] {
+            assert!(body.contains(want), "{want} missing from {body}");
+        }
     }
 
     #[test]

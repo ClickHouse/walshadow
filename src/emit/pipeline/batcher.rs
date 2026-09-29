@@ -20,7 +20,7 @@
 
 use std::collections::hash_map::Entry;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use clickhouse_c::Allocator;
@@ -32,7 +32,8 @@ use tokio::time::Instant;
 use crate::config::ResolvedConfig;
 use crate::decode::heap_decoder::{CommittedTuple, HeapOp};
 use crate::emit::ch_emitter::{
-    Append, ColumnBuf, EmitterStats, OP_DELETE, OP_INSERT, OP_UPDATE, TableEncoder, TablePlan,
+    Append, ColumnBuf, ColumnEncoding, EmitterStats, OP_DELETE, OP_INSERT, OP_UPDATE, TableEncoder,
+    TablePlan,
 };
 use crate::emit::pipeline::{DEFAULT_PIPELINE_FLUSH, Fatal};
 use crate::emit::route::RouteSnapshot;
@@ -67,6 +68,7 @@ pub struct RowChunk {
 pub struct ColMeta {
     pub name: String,
     pub type_repr: String,
+    pub cells_inserted: Arc<AtomicU64>,
 }
 
 /// Immutable per-table block shape, shared by every batch of that table
@@ -78,16 +80,26 @@ pub struct BatchMeta {
     /// synthetic ones (lsn, xid, commit_ts, delete marker when configured).
     pub columns: Vec<ColMeta>,
     pub schema_epoch: u64,
+    pub rows_inserted: Arc<AtomicU64>,
 }
 
 impl BatchMeta {
-    fn from_plan(plan: &TablePlan, table_key: TableKey, schema_epoch: u64) -> Self {
+    fn from_plan(
+        plan: &TablePlan,
+        table_key: TableKey,
+        schema_epoch: u64,
+        stats: &EmitterStats,
+    ) -> Self {
+        let col_meta = |name: &String, type_repr: &String, encoding: &ColumnEncoding| ColMeta {
+            name: name.clone(),
+            type_repr: type_repr.clone(),
+            cells_inserted: stats
+                .cells_inserted_by_type
+                .counter(&(type_repr.clone(), encoding.label())),
+        };
         let mut columns = Vec::with_capacity(plan.columns.len() + 4);
         for c in &plan.columns {
-            columns.push(ColMeta {
-                name: c.name.clone(),
-                type_repr: c.type_repr.clone(),
-            });
+            columns.push(col_meta(&c.name, &c.type_repr, &c.encoding));
         }
         for synth in [
             Some(&plan.synth_lsn),
@@ -98,12 +110,10 @@ impl BatchMeta {
         .into_iter()
         .flatten()
         {
-            columns.push(ColMeta {
-                name: synth.name.clone(),
-                type_repr: synth.type_repr.clone(),
-            });
+            columns.push(col_meta(&synth.name, &synth.type_repr, &synth.encoding));
         }
         Self {
+            rows_inserted: stats.rows_inserted_by_table.counter(&table_key),
             table_key,
             insert_sql: plan.insert_sql.clone(),
             columns,
@@ -333,7 +343,12 @@ async fn handle_row(
                 row.route.system_columns(),
             )
             .map_err(|e| e.to_string())?;
-            let meta = Arc::new(BatchMeta::from_plan(&plan, e.key().clone(), ctx.epoch));
+            let meta = Arc::new(BatchMeta::from_plan(
+                &plan,
+                e.key().clone(),
+                ctx.epoch,
+                ctx.stats,
+            ));
             let enc = TableEncoder::new(plan).map_err(|e| e.to_string())?;
             e.insert(Table {
                 enc,
