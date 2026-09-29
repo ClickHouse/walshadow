@@ -54,7 +54,8 @@ use std::sync::Arc;
 
 use thiserror::Error;
 use tokio::fs::{File, OpenOptions};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
+use tokio::task::JoinHandle;
 use walrus::pg::walparser::RelFileNode;
 
 use crate::catalog::desc_log::{decode_descriptor_bytes, encode_descriptor_bytes};
@@ -367,8 +368,9 @@ impl SpillStore {
             .open(&path)
             .await?;
         file.write_all(&header).await?;
+        file.flush().await?;
         Ok(SpillWriter {
-            file,
+            file: Arc::new(file.into_std().await),
             path,
             byte_count: header.len() as u64,
             dict: HashMap::new(),
@@ -536,12 +538,14 @@ impl BodySpoolWriter {
 }
 
 pub struct SpillWriter {
-    file: File,
+    file: Arc<std::fs::File>,
     path: PathBuf,
     byte_count: u64,
     /// Descriptor dictionary ids by log identity, assigned in first-use order
     dict: HashMap<(RelFileNode, u64), u32>,
 }
+
+const SPILL_IO_BUFFER: usize = 256 << 10;
 
 impl SpillWriter {
     pub fn path(&self) -> &Path {
@@ -554,53 +558,85 @@ impl SpillWriter {
 
     pub async fn write(&mut self, entry: &SpillEntry) -> Result<()> {
         let mut body = Vec::with_capacity(128);
+        self.encode(entry, &mut body);
+        wait_write(self.spawn_write(body)).await?;
+        Ok(())
+    }
+
+    /// Encode next buffer while previous one writes on blocking pool
+    pub async fn write_batch(&mut self, entries: Vec<SpillEntry>) -> Result<()> {
+        let mut body = Vec::with_capacity(SPILL_IO_BUFFER);
+        let mut pending = None;
+        for entry in entries {
+            self.encode(&entry, &mut body);
+            if body.len() >= SPILL_IO_BUFFER {
+                let spare = match pending.take() {
+                    Some(write) => wait_write(write).await?,
+                    None => Vec::with_capacity(SPILL_IO_BUFFER),
+                };
+                pending = Some(self.spawn_write(std::mem::replace(&mut body, spare)));
+            }
+        }
+        if let Some(write) = pending {
+            wait_write(write).await?;
+        }
+        wait_write(self.spawn_write(body)).await?;
+        Ok(())
+    }
+
+    fn spawn_write(&mut self, body: Vec<u8>) -> JoinHandle<io::Result<Vec<u8>>> {
+        self.byte_count += body.len() as u64;
+        let file = self.file.clone();
+        tokio::task::spawn_blocking(move || {
+            use std::io::Write;
+            (&*file).write_all(&body)?;
+            Ok(body)
+        })
+    }
+
+    fn encode(&mut self, entry: &SpillEntry, body: &mut Vec<u8>) {
         match entry {
             SpillEntry::Heap(h) => {
                 let key = (h.descriptor.rfn, h.descriptor_valid_from);
                 let next_id = self.dict.len() as u32;
                 let id = *self.dict.entry(key).or_insert(next_id);
                 if id == next_id {
-                    frame_into(&mut body, TAG_DESCRIPTOR, |out| {
+                    frame_into(body, TAG_DESCRIPTOR, |out| {
                         push_u64(out, h.descriptor_valid_from);
                         encode_descriptor_bytes(out, &h.descriptor);
                     });
                 }
-                frame_into(&mut body, TAG_HEAP, |out| {
+                frame_into(body, TAG_HEAP, |out| {
                     push_u32(out, id);
                     encode_heap_into(out, &h.decoded);
                 });
             }
-            SpillEntry::Chunk(c) => {
-                frame_into(&mut body, TAG_CHUNK, |out| encode_chunk_into(out, c))
-            }
-            SpillEntry::ToastDelete(d) => frame_into(&mut body, TAG_TOAST_DELETE, |out| {
+            SpillEntry::Chunk(c) => frame_into(body, TAG_CHUNK, |out| encode_chunk_into(out, c)),
+            SpillEntry::ToastDelete(d) => frame_into(body, TAG_TOAST_DELETE, |out| {
                 encode_toast_delete_into(out, d)
             }),
-            SpillEntry::Raw(r) => frame_into(&mut body, TAG_RAW, |out| encode_raw_into(out, r)),
+            SpillEntry::Raw(r) => frame_into(body, TAG_RAW, |out| encode_raw_into(out, r)),
         }
-        self.file.write_all(&body).await?;
-        self.byte_count += body.len() as u64;
-        Ok(())
     }
 
-    /// Flush + close, return a reader at the start. Caller drives `next()` to
+    /// Close, return a reader at the start. Caller drives `next()` to
     /// `Ok(None)` then `unlink()`. No fsync: restart wipes spill unread
-    pub async fn finish(mut self) -> Result<SpillReader> {
-        self.file.flush().await?;
+    pub async fn finish(self) -> Result<SpillReader> {
         drop(self.file);
-        let file = OpenOptions::new().read(true).open(&self.path).await?;
-        Ok(SpillReader {
-            file,
-            path: self.path,
-            header_checked: false,
-            dict: Vec::new(),
-        })
+        let chunk_size = self.byte_count.min(SPILL_IO_BUFFER as u64) as usize;
+        SpillReader::open(self.path, chunk_size).await
     }
 
     /// Abort path: drop the file unread
     pub async fn unlink(self) -> Result<()> {
         unlink_file(self.file, &self.path).await
     }
+}
+
+async fn wait_write(write: JoinHandle<io::Result<Vec<u8>>>) -> Result<Vec<u8>> {
+    let mut body = write.await.map_err(io::Error::other)??;
+    body.clear();
+    Ok(body)
 }
 
 /// `[tag][u32 len LE][body]`, length back-patched after `f` appends in place
@@ -616,7 +652,7 @@ fn frame_into(out: &mut Vec<u8>, tag: u8, f: impl FnOnce(&mut Vec<u8>)) {
 
 /// Drop `file`, remove `path`, tolerating already-gone (abort races,
 /// crash-cleanup re-runs)
-async fn unlink_file(file: File, path: &Path) -> Result<()> {
+async fn unlink_file<T>(file: T, path: &Path) -> Result<()> {
     drop(file);
     match tokio::fs::remove_file(path).await {
         Ok(()) => Ok(()),
@@ -626,8 +662,12 @@ async fn unlink_file(file: File, path: &Path) -> Result<()> {
 }
 
 pub struct SpillReader {
-    file: File,
     path: PathBuf,
+    buf: Vec<u8>,
+    pos: usize,
+    chunk_size: usize,
+    /// Next chunk reads on blocking pool while current chunk decodes
+    next_chunk: Option<ChunkRead>,
     /// Lazy header check: first `next()` verifies [`SPILL_MAGIC`] + version,
     /// so a stale on-disk spill fails cleanly with [`SpillError::Format`]
     header_checked: bool,
@@ -637,21 +677,57 @@ pub struct SpillReader {
 }
 
 impl SpillReader {
+    async fn open(path: PathBuf, chunk_size: usize) -> Result<Self> {
+        let file = File::open(&path).await?.into_std().await;
+        Ok(Self {
+            path,
+            buf: Vec::new(),
+            pos: 0,
+            chunk_size,
+            next_chunk: Some(read_chunk(file, Vec::new(), chunk_size)),
+            header_checked: false,
+            dict: Vec::new(),
+        })
+    }
+
+    pub(crate) fn buffered_bytes(&self) -> usize {
+        2 * self.chunk_size
+    }
+
+    /// Buffer at least `n` unread bytes, false on EOF first
+    async fn fill(&mut self, n: usize) -> Result<bool> {
+        while self.buf.len() - self.pos < n {
+            let Some(pending) = self.next_chunk.take() else {
+                return Ok(false);
+            };
+            let (file, mut chunk) = pending.await.map_err(io::Error::other)??;
+            if chunk.is_empty() {
+                return Ok(false);
+            }
+            if self.pos == self.buf.len() {
+                std::mem::swap(&mut self.buf, &mut chunk);
+            } else {
+                self.buf.drain(..self.pos);
+                self.buf.extend_from_slice(&chunk);
+            }
+            self.pos = 0;
+            self.next_chunk = Some(read_chunk(file, chunk, self.chunk_size));
+        }
+        Ok(true)
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }
 
     async fn check_header(&mut self) -> Result<()> {
-        let mut buf = [0u8; 4];
-        if let Err(e) = self.file.read_exact(&mut buf).await {
-            return Err(match e.kind() {
-                io::ErrorKind::UnexpectedEof => SpillError::Format {
-                    offset: 0,
-                    detail: "spill file shorter than 4-byte header".into(),
-                },
-                _ => e.into(),
+        if !self.fill(4).await? {
+            return Err(SpillError::Format {
+                offset: 0,
+                detail: "spill file shorter than 4-byte header".into(),
             });
         }
+        let buf = &self.buf[..4];
         if buf[..2] != SPILL_MAGIC {
             return Err(SpillError::Format {
                 offset: 0,
@@ -665,6 +741,7 @@ impl SpillReader {
                 detail: format!("unsupported spill version {version}, expected {SPILL_VERSION}"),
             });
         }
+        self.pos = 4;
         self.header_checked = true;
         Ok(())
     }
@@ -676,19 +753,23 @@ impl SpillReader {
             self.check_header().await?;
         }
         loop {
-            let mut tag_buf = [0u8; 1];
-            match self.file.read_exact(&mut tag_buf).await {
-                Ok(_) => {}
-                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
-                Err(e) => return Err(e.into()),
+            if !self.fill(5).await? {
+                if self.pos == self.buf.len() {
+                    return Ok(None);
+                }
+                return Err(io::Error::from(io::ErrorKind::UnexpectedEof).into());
             }
-            let mut len_buf = [0u8; 4];
-            self.file.read_exact(&mut len_buf).await?;
-            let len = u32::from_le_bytes(len_buf) as usize;
-            let mut body = vec![0u8; len];
-            self.file.read_exact(&mut body).await?;
-            let mut cur = Cursor::new(&body);
-            let entry = match tag_buf[0] {
+            let tag = self.buf[self.pos];
+            let len_bytes = self.buf[self.pos + 1..self.pos + 5].try_into().unwrap();
+            let len = u32::from_le_bytes(len_bytes) as usize;
+            if !self.fill(5 + len).await? {
+                return Err(io::Error::from(io::ErrorKind::UnexpectedEof).into());
+            }
+            let start = self.pos + 5;
+            self.pos = start + len;
+            let body = &self.buf[start..self.pos];
+            let mut cur = Cursor::new(body);
+            let entry = match tag {
                 TAG_HEAP => {
                     let dict_id = cur.u32()? as usize;
                     let h = decode_heap(&mut cur)?;
@@ -740,8 +821,20 @@ impl SpillReader {
     }
 
     pub async fn unlink(self) -> Result<()> {
-        unlink_file(self.file, &self.path).await
+        unlink_file(self.next_chunk, &self.path).await
     }
+}
+
+type ChunkRead = JoinHandle<io::Result<(std::fs::File, Vec<u8>)>>;
+
+fn read_chunk(mut file: std::fs::File, mut chunk: Vec<u8>, size: usize) -> ChunkRead {
+    tokio::task::spawn_blocking(move || {
+        use std::io::Read;
+        chunk.resize(size, 0);
+        let n = file.read(&mut chunk)?;
+        chunk.truncate(n);
+        Ok((file, chunk))
+    })
 }
 
 // ── encoding ────────────────────────────────────────────────────────
@@ -1349,6 +1442,70 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn batch_round_trip_across_buffers_and_descriptor_reuse() {
+        let tmp = tempdir().unwrap();
+        let store = SpillStore::new(tmp.path().to_path_buf()).unwrap();
+        let mut writer = store.writer(42, 0x1000).await.unwrap();
+        let mut expected = Vec::new();
+        for i in 0..600 {
+            let mut heap = sample_heap(42, 0x2000 + i);
+            heap.decoded.new.as_mut().unwrap().columns = vec![Some(ColumnValue::Bytea(vec![
+                i as u8;
+                if i == 300 {
+                    SPILL_IO_BUFFER + 17
+                } else {
+                    1021
+                }
+            ]))];
+            heap.descriptor_valid_from += i % 2;
+            expected.push(SpillEntry::Heap(Box::new(heap)));
+        }
+        writer.write_batch(Vec::new()).await.unwrap();
+        for batch in expected.chunks(137) {
+            writer.write_batch(batch.to_vec()).await.unwrap();
+        }
+        let bytes = writer.byte_count();
+        assert_eq!(writer.dict.len(), 2);
+        let mut reader = writer.finish().await.unwrap();
+        assert_eq!(std::fs::metadata(reader.path()).unwrap().len(), bytes);
+        for entry in expected {
+            assert_eq!(reader.next().await.unwrap(), Some(entry));
+        }
+        assert!(reader.next().await.unwrap().is_none());
+        reader.unlink().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn buffered_reader_rejects_truncated_frame() {
+        let tmp = tempdir().unwrap();
+        let store = SpillStore::new(tmp.path().to_path_buf()).unwrap();
+        for remaining in [1, 3, 5, 31] {
+            let mut writer = store.writer(42, remaining).await.unwrap();
+            writer
+                .write_batch(vec![SpillEntry::Chunk(sample_chunk(
+                    99,
+                    0,
+                    0x2000,
+                    &vec![7; SPILL_IO_BUFFER + 1],
+                ))])
+                .await
+                .unwrap();
+            let mut reader = writer.finish().await.unwrap();
+            let file = OpenOptions::new()
+                .write(true)
+                .open(reader.path())
+                .await
+                .unwrap();
+            file.set_len(4 + remaining).await.unwrap();
+            assert!(matches!(
+                reader.next().await,
+                Err(SpillError::Io(e)) if e.kind() == io::ErrorKind::UnexpectedEof
+            ));
+            reader.unlink().await.unwrap();
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn round_trip_heap_and_chunk() {
         let tmp = tempdir().unwrap();
         let store = SpillStore::new(tmp.path().to_path_buf()).unwrap();
@@ -1623,12 +1780,7 @@ mod tests {
         bytes.extend_from_slice(&SPILL_VERSION.to_le_bytes());
         bytes.extend_from_slice(&[255u8, 0u8, 0u8, 0u8, 0u8]);
         tokio::fs::write(&path, &bytes).await.unwrap();
-        let mut r = SpillReader {
-            file: OpenOptions::new().read(true).open(&path).await.unwrap(),
-            path,
-            header_checked: false,
-            dict: Vec::new(),
-        };
+        let mut r = SpillReader::open(path, SPILL_IO_BUFFER).await.unwrap();
         let err = r.next().await.expect_err("must error on bad tag");
         match err {
             SpillError::Format { detail, .. } => {
@@ -1648,12 +1800,7 @@ mod tests {
         bytes.extend_from_slice(&SPILL_MAGIC);
         bytes.extend_from_slice(&5u16.to_le_bytes());
         tokio::fs::write(&path, &bytes).await.unwrap();
-        let mut r = SpillReader {
-            file: OpenOptions::new().read(true).open(&path).await.unwrap(),
-            path,
-            header_checked: false,
-            dict: Vec::new(),
-        };
+        let mut r = SpillReader::open(path, SPILL_IO_BUFFER).await.unwrap();
         let err = r.next().await.expect_err("must error on old version");
         match err {
             SpillError::Format { detail, .. } => {
@@ -1670,12 +1817,7 @@ mod tests {
         tokio::fs::write(&path, &[0u8, 0u8, 0u8, 0u8])
             .await
             .unwrap();
-        let mut r = SpillReader {
-            file: OpenOptions::new().read(true).open(&path).await.unwrap(),
-            path,
-            header_checked: false,
-            dict: Vec::new(),
-        };
+        let mut r = SpillReader::open(path, SPILL_IO_BUFFER).await.unwrap();
         let err = r.next().await.expect_err("must error on missing magic");
         match err {
             SpillError::Format { detail, .. } => assert!(detail.contains("bad magic"), "{detail}"),
