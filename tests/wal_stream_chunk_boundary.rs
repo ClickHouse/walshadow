@@ -7,6 +7,9 @@
 //!
 //! Skipped silently if the captured fixture is not present.
 
+#[path = "common/tools.rs"]
+mod tools;
+
 use std::path::PathBuf;
 
 use walshadow::pos::Pos;
@@ -80,8 +83,7 @@ async fn run_with_chunk_sizes(bytes: &[u8], seg_size: u64, chunks: &[usize]) -> 
 #[tokio::test(flavor = "current_thread")]
 async fn bulk_and_byte_chunks_emit_identical_record_sequence() {
     let path = fixture_path();
-    if !path.exists() {
-        eprintln!("skip: no captured segment at {path:?}");
+    if !tools::fixture(&path) {
         return;
     }
     let bytes = load_segment(&path).await.expect("load fixture");
@@ -110,8 +112,7 @@ async fn bulk_and_byte_chunks_emit_identical_record_sequence() {
 #[tokio::test(flavor = "current_thread")]
 async fn bulk_and_chunked_emit_identical_segment_bytes() {
     let path = fixture_path();
-    if !path.exists() {
-        eprintln!("skip: no captured segment at {path:?}");
+    if !tools::fixture(&path) {
         return;
     }
     let bytes = load_segment(&path).await.expect("load fixture");
@@ -161,8 +162,7 @@ async fn shadow_stream_sink_receives_byte_exact_wire_stream() {
     use tokio::sync::Mutex;
 
     let path = fixture_path();
-    if !path.exists() {
-        eprintln!("skip: no captured segment at {path:?}");
+    if !tools::fixture(&path) {
         return;
     }
     let bytes = load_segment(&path).await.expect("load fixture");

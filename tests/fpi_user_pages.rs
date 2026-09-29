@@ -14,12 +14,12 @@
 
 #[path = "common/inproc_harness.rs"]
 mod h;
+use h::tools::pg_available;
 
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write as _;
 use std::pin::Pin;
-use std::process::Command;
 use std::time::{Duration, Instant};
 
 use walrus::pg::replication::conn::PgConfig;
@@ -31,14 +31,6 @@ use walshadow::segment_sink::DirSegmentSink;
 use walshadow::shadow::{Shadow, ShadowConfig};
 use walshadow::source_feed::{SourceEvent, SourceFeed, StandbyStatus};
 use walshadow::wal_stream::WalStream;
-
-fn pg_available() -> bool {
-    Command::new("initdb")
-        .arg("--version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
 
 fn make_source(tmp: &tempfile::TempDir) -> Shadow {
     let mut cfg = ShadowConfig::new(tmp.path().join("source-data"), tmp.path().join("filtered"));
@@ -189,7 +181,6 @@ async fn attach(source: &Shadow) -> (SourceFeed, WalStream) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn user_page_images_never_reach_the_shadow() {
     if !pg_available() {
-        eprintln!("skip: no initdb on PATH");
         return;
     }
     let tmp = tempfile::tempdir().unwrap();

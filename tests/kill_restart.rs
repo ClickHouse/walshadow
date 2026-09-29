@@ -369,7 +369,7 @@ async fn kill_restart_post_commit_preserves_end_state() {
 }
 
 async fn drill(strategy: Strategy) {
-    if !fx::requirements_available() {
+    if !fx::tools::requirements_available() {
         return;
     }
 

@@ -100,7 +100,7 @@ fn dropped_from_log(log: &str) -> Option<u64> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn backup_window_wal_never_materialises_the_shadow() {
-    if !fx::requirements_available() {
+    if !fx::tools::requirements_available() {
         return;
     }
 

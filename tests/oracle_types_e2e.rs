@@ -8,8 +8,6 @@
 mod fx;
 
 use fx::spawn_txn;
-use std::path::Path;
-use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -19,23 +17,10 @@ use walshadow::oracle::Oracle;
 use walshadow::schema::RelName;
 
 fn skip_gate() -> bool {
-    if !fx::requirements_available() {
+    if !fx::tools::requirements_available() {
         return true;
     }
     false
-}
-
-fn extension_available(name: &str) -> bool {
-    let out = Command::new("pg_config").arg("--sharedir").output();
-    match out {
-        Ok(o) if o.status.success() => {
-            let dir = String::from_utf8_lossy(&o.stdout).trim().to_string();
-            Path::new(&dir)
-                .join(format!("extension/{name}.control"))
-                .exists()
-        }
-        _ => false,
-    }
 }
 
 fn col(attnum: i16, name: &str, ty: &str) -> ColumnMapping {
@@ -300,8 +285,7 @@ async fn jsonb_fast_default_renders_on_add_column() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn hstore_maps_through_the_extension_expander() {
-    if skip_gate() || !extension_available("hstore") {
-        eprintln!("skip: hstore extension not installed");
+    if skip_gate() || !fx::tools::extension("hstore") {
         return;
     }
     let (source, ch, _tmp) = run_oracle(
@@ -546,8 +530,7 @@ async fn geometric_types_resolve_via_oracle() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pgvector_resolves_via_oracle() {
-    if skip_gate() || !extension_available("vector") {
-        eprintln!("skip: vector extension not installed");
+    if skip_gate() || !fx::tools::extension("vector") {
         return;
     }
     let (source, ch, _tmp) = run_oracle(

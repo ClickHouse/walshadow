@@ -272,14 +272,6 @@ impl MemoryPermit {
     }
 }
 
-impl std::fmt::Debug for MemoryPermit {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("MemoryPermit")
-            .field("bytes", &self.bytes)
-            .finish()
-    }
-}
-
 impl Drop for MemoryPermit {
     fn drop(&mut self) {
         self.inner.cur.fetch_sub(self.bytes, Ordering::Relaxed);

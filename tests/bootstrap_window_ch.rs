@@ -18,7 +18,7 @@ const MAX_RATE_KIB: &str = "32768";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn window_writes_reach_ch() {
-    if !fx::requirements_available() {
+    if !fx::tools::requirements_available() {
         return;
     }
 

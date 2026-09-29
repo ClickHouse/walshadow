@@ -80,8 +80,7 @@ fn open(tmp: &std::path::Path) -> (Cluster, UnixStream) {
 
 #[test]
 fn scan_rejects_arguments_it_cannot_serve() {
-    if !pgext::pg_available() {
-        eprintln!("skip: no initdb on PATH");
+    if !pgext::tools::pg_available() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -114,8 +113,7 @@ fn scan_rejects_arguments_it_cannot_serve() {
 
 #[test]
 fn native_rejects_frames_it_cannot_read() {
-    if !pgext::pg_available() {
-        eprintln!("skip: no initdb on PATH");
+    if !pgext::tools::pg_available() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -197,8 +195,7 @@ fn native_rejects_frames_it_cannot_read() {
 /// itself, since nothing on the wire carries the trailing NUL
 #[test]
 fn native_reconstructs_cstring_bodies() {
-    if !pgext::pg_available() {
-        eprintln!("skip: no initdb on PATH");
+    if !pgext::tools::pg_available() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -225,8 +222,7 @@ fn native_reconstructs_cstring_bodies() {
 /// past the cap
 #[test]
 fn native_refuses_a_block_past_the_response_cap() {
-    if !pgext::pg_available() {
-        eprintln!("skip: no initdb on PATH");
+    if !pgext::tools::pg_available() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -255,8 +251,7 @@ fn native_refuses_a_block_past_the_response_cap() {
 /// find, and a `LowCardinality` is a wrapper the search has to unwrap first
 #[test]
 fn native_looks_through_target_wrappers() {
-    if !pgext::pg_available() {
-        eprintln!("skip: no initdb on PATH");
+    if !pgext::tools::pg_available() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();

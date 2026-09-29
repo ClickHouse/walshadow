@@ -34,12 +34,10 @@ fn socket_url(socket_dir: &std::path::Path, dbname: &str) -> String {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn init_probes_both_ends_and_writes_a_bootable_config() {
-    if !fx::pg_available() {
-        eprintln!("skip: no initdb on PATH");
+    if !fx::tools::pg_available() {
         return;
     }
-    if !fx::clickhouse_available() {
-        eprintln!("skip: no clickhouse binary on PATH");
+    if !fx::tools::clickhouse_available() {
         return;
     }
 

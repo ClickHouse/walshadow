@@ -33,8 +33,7 @@ fn point_at(pg: &Cluster, path: &Path) {
 
 #[test]
 fn listener_refuses_paths_it_does_not_own() {
-    if !pgext::pg_available() {
-        eprintln!("skip: no initdb on PATH");
+    if !pgext::tools::pg_available() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -91,8 +90,7 @@ fn listener_refuses_paths_it_does_not_own() {
 /// news is bind's
 #[test]
 fn listener_bind_reports_bind_errno() {
-    if !pgext::pg_available() {
-        eprintln!("skip: no initdb on PATH");
+    if !pgext::tools::pg_available() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -122,8 +120,7 @@ fn listener_bind_reports_bind_errno() {
 /// further, so each op's first occurrence lands on its own attempt
 #[test]
 fn listener_setup_failures_recover() {
-    if !pgext::pg_available() {
-        eprintln!("skip: no initdb on PATH");
+    if !pgext::tools::pg_available() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -166,8 +163,7 @@ fn listener_setup_failures_recover() {
 /// leave the path alone
 #[test]
 fn listener_probe_failures_preserve_the_path() {
-    if !pgext::pg_available() {
-        eprintln!("skip: no initdb on PATH");
+    if !pgext::tools::pg_available() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();

@@ -2,14 +2,15 @@
 //! against a throwaway source PG. Deterministic replacement for inducing a drop
 //! via a stalled sink + `wal_sender_timeout`.
 //!
-//! Skipped silently when `initdb`/`psql` are absent.
+//! Skips locally when `initdb`/`psql` are absent.
 
 #[path = "common/ports.rs"]
 mod ports;
+#[path = "common/tools.rs"]
+mod tools;
 
 use std::fs;
 use std::io::Write as _;
-use std::process::Command;
 use std::time::Duration;
 
 use walrus::pg::backup::parse_pg_lsn;
@@ -18,13 +19,7 @@ use walshadow::shadow::{Shadow, ShadowConfig};
 use walshadow::source_feed::{SourceFeed, StandbyStatus};
 
 fn tools_available() -> bool {
-    ["initdb", "psql"].iter().all(|bin| {
-        Command::new(bin)
-            .arg("--version")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-    })
+    tools::pg_available() && tools::on_path("psql", "--version")
 }
 
 struct StopOnDrop<'a>(&'a Shadow);
@@ -95,7 +90,6 @@ fn churn_wal(source: &Shadow) {
 #[tokio::test]
 async fn reconnect_resumes_after_walsender_terminated() {
     if !tools_available() {
-        eprintln!("skip: no initdb/psql on PATH");
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -144,7 +138,6 @@ async fn reconnect_resumes_after_walsender_terminated() {
 #[tokio::test]
 async fn recycled_segment_surfaces_58p01() {
     if !tools_available() {
-        eprintln!("skip: no initdb/psql on PATH");
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -205,7 +198,6 @@ async fn recycled_segment_surfaces_58p01() {
 #[tokio::test]
 async fn slot_prevents_segment_recycle() {
     if !tools_available() {
-        eprintln!("skip: no initdb/psql on PATH");
         return;
     }
     let tmp = tempfile::tempdir().unwrap();

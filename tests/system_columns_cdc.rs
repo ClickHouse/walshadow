@@ -20,7 +20,7 @@ use walshadow::table_rules::{MatchKind, TableRule};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn renamed_system_columns_and_operator_keys() {
-    if !fx::requirements_available() {
+    if !fx::tools::requirements_available() {
         return;
     }
 

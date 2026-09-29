@@ -124,8 +124,7 @@ fn tuple(id: i32, source_lsn: u64, commit_lsn: u64) -> CommittedTuple {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn budget_trips_seal_complete_inserts() {
-    if !fx::clickhouse_available() {
-        eprintln!("skip: no clickhouse binary on PATH");
+    if !fx::tools::clickhouse_available() {
         return;
     }
 

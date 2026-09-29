@@ -13,8 +13,7 @@ use walshadow::toast::shadow_landing::{unheld_toast, unserved_rels};
 
 #[tokio::test]
 async fn unheld_toast_names_only_rels_shadow_cannot_serve() {
-    if !fx::pg_available() {
-        eprintln!("skip: no initdb on PATH");
+    if !fx::tools::pg_available() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();

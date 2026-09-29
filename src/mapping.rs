@@ -115,17 +115,6 @@ impl std::str::FromStr for DropTableStrategy {
     }
 }
 
-impl DropTableStrategy {
-    /// Canonical spelling for overlay and CLI values
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Retain => "retain",
-            Self::Drop => "drop",
-            Self::Warn => "warn",
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct ColumnMapping {
     pub src_attnum: i16,
@@ -549,6 +538,8 @@ mod tests {
         assert_eq!(off.names(), ["_lsn", "_xid", "_commit_ts"]);
         let renamed = system_columns("is_deleted = \"gone\"\n").unwrap();
         assert_eq!(renamed.is_deleted.as_deref(), Some("gone"));
+        let on = system_columns("is_deleted = true\n").unwrap();
+        assert_eq!(on.is_deleted.as_deref(), Some("_is_deleted"));
     }
 
     #[test]
@@ -557,6 +548,8 @@ mod tests {
         assert!(system_columns("lsn = \"\"\n").is_err());
         assert!(system_columns("xid = \"_lsn\"\n").is_err());
         assert!(system_columns("lsn = 7\n").is_err());
+        let err = system_columns("is_deleted = 1\n").unwrap_err();
+        assert!(err.contains("expected a string or false"), "{err}");
     }
 
     #[test]
@@ -571,6 +564,36 @@ mod tests {
         assert_eq!(sys.lsn, "_peerdb_version");
         assert_eq!(sys.xid, "_xid", "unnamed column inherits");
         assert!(sys.is_deleted.is_none(), "blank marker drops it");
+
+        let sys = SystemColumns::default().renamed(&SystemColumnNames {
+            xid: Some("_txid".into()),
+            is_deleted: Some("_gone".into()),
+            ..SystemColumnNames::default()
+        });
+        assert_eq!(sys.names(), ["_lsn", "_txid", "_commit_ts", "_gone"]);
+    }
+
+    #[test]
+    fn per_relation_marker_override_parses_bool_or_name() {
+        #[derive(serde::Deserialize)]
+        struct Patch {
+            #[serde(default, deserialize_with = "de_marker_override")]
+            is_deleted: Option<String>,
+        }
+        let parse = |body: &str| {
+            toml::from_str::<Patch>(body)
+                .map(|p| p.is_deleted)
+                .map_err(crate::toml_de::message)
+        };
+        assert_eq!(parse("").unwrap(), None);
+        assert_eq!(parse("is_deleted = false").unwrap().as_deref(), Some(""));
+        assert_eq!(
+            parse("is_deleted = true").unwrap().as_deref(),
+            Some("_is_deleted")
+        );
+        assert_eq!(parse("is_deleted = \"x\"").unwrap().as_deref(), Some("x"));
+        let err = parse("is_deleted = 1").unwrap_err();
+        assert!(err.contains("expected a string or false"), "{err}");
     }
 
     #[test]

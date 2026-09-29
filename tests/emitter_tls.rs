@@ -18,6 +18,10 @@
 
 #![cfg(target_os = "linux")]
 
+#[path = "common/tools.rs"]
+mod tools;
+use tools::on_path;
+
 #[path = "common/ports.rs"]
 mod ports;
 
@@ -46,26 +50,8 @@ const RFN: RelFileNode = RelFileNode {
     rel_node: 16385,
 };
 
-fn on_path(bin: &str, arg: &str) -> bool {
-    Command::new(bin)
-        .arg(arg)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
 fn skip() -> bool {
-    if !on_path("clickhouse", "--version") {
-        eprintln!("skip: no clickhouse binary on PATH");
-        return true;
-    }
-    if !on_path("openssl", "version") {
-        eprintln!("skip: no openssl binary on PATH");
-        return true;
-    }
-    false
+    !on_path("clickhouse", "--version") || !on_path("openssl", "version")
 }
 
 fn openssl(args: &[&std::ffi::OsStr]) {

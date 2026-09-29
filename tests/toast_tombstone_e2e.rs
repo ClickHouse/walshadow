@@ -77,7 +77,7 @@ fn live_values_sql(chunk_table: &str, max_lsn: &str) -> String {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tombstones_supersede_then_truncate_wipes_then_drop_retires() {
-    if !fx::requirements_available() {
+    if !fx::tools::requirements_available() {
         return;
     }
 

@@ -43,13 +43,16 @@
 //! oracle if ever wanted; bootstrap doesn't depend on it. This test runs
 //! purely off `walshadow` + `walrus` crates.
 
+#[path = "common/tools.rs"]
+mod tools;
+use tools::pg_available;
+
 #[path = "common/ports.rs"]
 mod ports;
 
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
-use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -73,14 +76,6 @@ use walshadow::shadow::{Shadow, ShadowConfig};
 /// ~32-byte tuple per row, 8 KiB holds ~250 rows, so 64 is safely on
 /// a single page.
 const N_ROWS: i32 = 64;
-
-fn pg_available() -> bool {
-    Command::new("initdb")
-        .arg("--version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
 
 fn make_source(tmp: &tempfile::TempDir) -> Shadow {
     let mut cfg = ShadowConfig::new(
@@ -133,7 +128,6 @@ fn test_settings(storage_root: PathBuf) -> Settings {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn object_store_source_self_hosted_via_wal_rs_push() {
     if !pg_available() {
-        eprintln!("skip: no initdb on PATH");
         return;
     }
     let tmp = tempfile::tempdir().unwrap();

@@ -118,8 +118,10 @@ fn write_config(path: &Path, ch_port: u16) -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn user_relation_never_materialises_on_the_shadow() {
-    if !fx::pg_available() || !fx::pg_basebackup_available() || !fx::clickhouse_available() {
-        eprintln!("skip: missing initdb / pg_basebackup / clickhouse");
+    if !fx::tools::pg_available()
+        || !fx::tools::pg_basebackup_available()
+        || !fx::tools::clickhouse_available()
+    {
         return;
     }
 

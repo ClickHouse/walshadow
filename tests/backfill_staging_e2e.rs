@@ -214,7 +214,7 @@ async fn wait_done(backfiller: &CopyBackfiller, dir: &Path) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn backup_opt_in_replaces_stale_rows_and_reloads_after_opt_out() {
-    if !fx::requirements_available() {
+    if !fx::tools::requirements_available() {
         return;
     }
     let fx = Fixture::new().await;
@@ -280,7 +280,7 @@ async fn backup_opt_in_replaces_stale_rows_and_reloads_after_opt_out() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn staged_backfill_resumes_each_publish_phase() {
-    if !fx::requirements_available() {
+    if !fx::tools::requirements_available() {
         return;
     }
     let fx = Fixture::new().await;
@@ -373,7 +373,7 @@ fn write_swapped_ledger(dir: &Path, uuid: &str) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn staged_schema_change_discards_load_and_keeps_retry_pending() {
-    if !fx::requirements_available() {
+    if !fx::tools::requirements_available() {
         return;
     }
     let fx = Fixture::new().await;
@@ -437,7 +437,7 @@ async fn staged_schema_change_discards_load_and_keeps_retry_pending() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn resumed_copy_preserves_boundary_and_newer_live_rows() {
-    if !fx::requirements_available() {
+    if !fx::tools::requirements_available() {
         return;
     }
     let mut fx = Fixture::new().await;
@@ -478,7 +478,7 @@ swapped = false
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn dropped_table_backfill_finishes() {
-    if !fx::requirements_available() {
+    if !fx::tools::requirements_available() {
         return;
     }
     for mode in [InitialLoadMode::Copy, InitialLoadMode::ObjectStore] {
@@ -494,7 +494,7 @@ async fn dropped_table_backfill_finishes() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn failed_backup_defaults_to_copy_at_original_boundary() {
-    if !fx::requirements_available() {
+    if !fx::tools::requirements_available() {
         return;
     }
     let fx = Fixture::new().await;
@@ -536,7 +536,7 @@ async fn failed_backup_defaults_to_copy_at_original_boundary() {
 /// stay outstanding for live commits to fold
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn source_decides_ended_pending_xids() {
-    if !fx::requirements_available() {
+    if !fx::tools::requirements_available() {
         return;
     }
     let fx = Fixture::new().await;
@@ -576,7 +576,7 @@ async fn source_decides_ended_pending_xids() {
 /// too, versioned at the load boundary
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn failed_backup_copy_fallback_seeds_chunk_mirror() {
-    if !fx::requirements_available() {
+    if !fx::tools::requirements_available() {
         return;
     }
     let fx = Fixture::new().await;
@@ -610,7 +610,7 @@ async fn failed_backup_copy_fallback_seeds_chunk_mirror() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn failed_backup_can_disable_copy_fallback() {
-    if !fx::requirements_available() {
+    if !fx::tools::requirements_available() {
         return;
     }
     let mut fx = Fixture::new().await;

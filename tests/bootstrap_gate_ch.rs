@@ -76,7 +76,7 @@ fn create_ch_dest_table(ch: &fx::ChServer) -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn dead_and_aborted_tuples_stay_out_of_ch() {
-    if !fx::requirements_available() {
+    if !fx::tools::requirements_available() {
         return;
     }
 

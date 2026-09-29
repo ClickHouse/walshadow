@@ -103,8 +103,7 @@ async fn drive_store_backed(resolver: &ToastResolver, stats: &EmitterStats) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_first_puts_create_mirrors_without_retries() {
-    if !fx::clickhouse_available() {
-        eprintln!("skip: no clickhouse binary on PATH");
+    if !fx::tools::clickhouse_available() {
         return;
     }
     let slot = fx::Ports::alloc();
@@ -143,8 +142,7 @@ async fn concurrent_first_puts_create_mirrors_without_retries() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ch_chunk_store_put_fetch_roundtrip() {
-    if !fx::clickhouse_available() {
-        eprintln!("skip: no clickhouse binary on PATH");
+    if !fx::tools::clickhouse_available() {
         return;
     }
     let slot = fx::Ports::alloc();
@@ -409,8 +407,7 @@ async fn ch_chunk_store_put_fetch_roundtrip() {
 /// back, and every as-of verdict matches the single-value path.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ch_chunk_store_fetch_many_aligns_and_splits() {
-    if !fx::clickhouse_available() {
-        eprintln!("skip: no clickhouse binary on PATH");
+    if !fx::tools::clickhouse_available() {
         return;
     }
     let slot = fx::Ports::alloc();
@@ -507,8 +504,7 @@ async fn ch_chunk_store_fetch_many_aligns_and_splits() {
 /// convergence); missing mirror no-ops.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ch_chunk_store_rewrite_barrier_residuals() {
-    if !fx::clickhouse_available() {
-        eprintln!("skip: no clickhouse binary on PATH");
+    if !fx::tools::clickhouse_available() {
         return;
     }
     let slot = fx::Ports::alloc();
@@ -590,8 +586,7 @@ async fn ch_chunk_store_rewrite_barrier_residuals() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ch_resolver_put_rows_then_fetch_into() {
-    if !fx::clickhouse_available() {
-        eprintln!("skip: no clickhouse binary on PATH");
+    if !fx::tools::clickhouse_available() {
         return;
     }
     let slot = fx::Ports::alloc();

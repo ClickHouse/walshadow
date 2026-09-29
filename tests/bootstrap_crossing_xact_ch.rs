@@ -29,7 +29,7 @@ async fn transaction_open_across_the_handoff_reaches_ch_without_slot() {
 }
 
 async fn crossing_transaction(with_slot: bool) {
-    if !fx::requirements_available() {
+    if !fx::tools::requirements_available() {
         return;
     }
 

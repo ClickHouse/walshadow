@@ -23,7 +23,7 @@ fn col(attnum: i16, name: &str, ty: &str) -> ColumnMapping {
 }
 
 fn skip_gate() -> bool {
-    if !fx::requirements_available() {
+    if !fx::tools::requirements_available() {
         return true;
     }
     false

@@ -15,12 +15,15 @@
 //! `retention::tests::*`); their HTTP/file-system surfaces don't need a
 //! live PG to validate.
 
+#[path = "common/tools.rs"]
+mod tools;
+use tools::pg_available;
+
 #[path = "common/ports.rs"]
 mod ports;
 
 use std::fs;
 use std::io::Write;
-use std::process::Command;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -29,14 +32,6 @@ use walshadow::mapping::{ColumnMapping, TableMapping, TableTarget};
 use walshadow::preflight::{Inputs, PreflightError};
 use walshadow::schema::RelName;
 use walshadow::shadow::{Shadow, ShadowConfig};
-
-fn pg_available() -> bool {
-    Command::new("initdb")
-        .arg("--version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
 
 fn make_pg(tmp: &tempfile::TempDir, name: &str, port: u16) -> Shadow {
     let mut cfg = ShadowConfig::new(
@@ -104,7 +99,6 @@ fn mapping_for(rels: &[(&str, &str)]) -> EmitterConfig {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn preflight_rejects_wal_level_and_missing_replica_identity() {
     if !pg_available() {
-        eprintln!("skip: no initdb on PATH");
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -189,7 +183,6 @@ async fn preflight_rejects_wal_level_and_missing_replica_identity() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn preflight_rejects_old_version_missing_slot_and_unknown_rel() {
     if !pg_available() {
-        eprintln!("skip: no initdb on PATH");
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -262,7 +255,6 @@ async fn preflight_rejects_old_version_missing_slot_and_unknown_rel() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn preflight_passes_once_source_is_logical_and_relations_keyed() {
     if !pg_available() {
-        eprintln!("skip: no initdb on PATH");
         return;
     }
     let tmp = tempfile::tempdir().unwrap();

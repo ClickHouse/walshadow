@@ -39,8 +39,7 @@ fn assert_read_deadline(pg: &pgext::Cluster, ms: u64) {
 
 #[test]
 fn worker_reload_reaches_both_waits() {
-    if !pgext::pg_available() {
-        eprintln!("skip: no initdb on PATH");
+    if !pgext::tools::pg_available() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -80,8 +79,7 @@ fn worker_reload_reaches_both_waits() {
 
 #[test]
 fn worker_shutdown_drops_clients_and_unlinks_socket() {
-    if !pgext::pg_available() {
-        eprintln!("skip: no initdb on PATH");
+    if !pgext::tools::pg_available() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -114,8 +112,7 @@ fn worker_shutdown_drops_clients_and_unlinks_socket() {
 
 #[test]
 fn worker_refuses_ninth_connection() {
-    if !pgext::pg_available() {
-        eprintln!("skip: no initdb on PATH");
+    if !pgext::tools::pg_available() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -161,8 +158,7 @@ fn worker_refuses_ninth_connection() {
 
 #[test]
 fn worker_keeps_serving_around_a_dropped_connection() {
-    if !pgext::pg_available() {
-        eprintln!("skip: no initdb on PATH");
+    if !pgext::tools::pg_available() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -195,8 +191,7 @@ fn worker_keeps_serving_around_a_dropped_connection() {
 /// define, so a bare `LOAD` must leave the cluster exactly as it found it
 #[test]
 fn bare_load_registers_nothing() {
-    if !pgext::pg_available() {
-        eprintln!("skip: no initdb on PATH");
+    if !pgext::tools::pg_available() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -225,8 +220,7 @@ fn bare_load_registers_nothing() {
 /// stops there, since a preloaded module still has to answer for its own GUCs
 #[test]
 fn empty_socket_path_defines_gucs_without_a_worker() {
-    if !pgext::pg_available() {
-        eprintln!("skip: no initdb on PATH");
+    if !pgext::tools::pg_available() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -252,8 +246,7 @@ fn empty_socket_path_defines_gucs_without_a_worker() {
 /// DEBUG1 line and nothing the client can see
 #[test]
 fn worker_serves_a_connection_whose_buffers_cannot_widen() {
-    if !pgext::pg_available() {
-        eprintln!("skip: no initdb on PATH");
+    if !pgext::tools::pg_available() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -277,8 +270,7 @@ fn worker_serves_a_connection_whose_buffers_cannot_widen() {
 /// FATAL before any worker registers, so the cluster never comes up half-wired
 #[test]
 fn unusable_databases_list_refuses_startup() {
-    if !pgext::pg_available() {
-        eprintln!("skip: no initdb on PATH");
+    if !pgext::tools::pg_available() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();

@@ -56,34 +56,37 @@ pub fn segments_covering_lineage(
         .collect()
 }
 
+/// Indexed by rmgr id, in PG `src/include/access/rmgrlist.h` order
+const RMGR_LABELS: [&str; RmId::LogicalMsg as usize + 1] = [
+    "xlog",
+    "xact",
+    "smgr",
+    "clog",
+    "dbase",
+    "tblspc",
+    "multixact",
+    "relmap",
+    "standby",
+    "heap2",
+    "heap",
+    "btree",
+    "hash",
+    "gin",
+    "gist",
+    "seq",
+    "spgist",
+    "brin",
+    "commit_ts",
+    "repl_origin",
+    "generic",
+    "logical_msg",
+];
+
 /// Numeric id fallback for unknown rmgrs
 pub fn rmgr_label(rm: u8) -> String {
-    let named = match rm {
-        x if x == RmId::Xlog as u8 => "xlog",
-        x if x == RmId::Xact as u8 => "xact",
-        x if x == RmId::Smgr as u8 => "smgr",
-        x if x == RmId::Clog as u8 => "clog",
-        x if x == RmId::Dbase as u8 => "dbase",
-        x if x == RmId::Tblspc as u8 => "tblspc",
-        x if x == RmId::MultiXact as u8 => "multixact",
-        x if x == RmId::RelMap as u8 => "relmap",
-        x if x == RmId::Standby as u8 => "standby",
-        x if x == RmId::Heap2 as u8 => "heap2",
-        x if x == RmId::Heap as u8 => "heap",
-        x if x == RmId::Btree as u8 => "btree",
-        x if x == RmId::Hash as u8 => "hash",
-        x if x == RmId::Gin as u8 => "gin",
-        x if x == RmId::Gist as u8 => "gist",
-        x if x == RmId::Seq as u8 => "seq",
-        x if x == RmId::Spgist as u8 => "spgist",
-        x if x == RmId::Brin as u8 => "brin",
-        x if x == RmId::CommitTs as u8 => "commit_ts",
-        x if x == RmId::ReplOrigin as u8 => "repl_origin",
-        x if x == RmId::Generic as u8 => "generic",
-        x if x == RmId::LogicalMsg as u8 => "logical_msg",
-        _ => return format!("rmgr_{rm}"),
-    };
-    named.into()
+    RMGR_LABELS
+        .get(usize::from(rm))
+        .map_or_else(|| format!("rmgr_{rm}"), |label| (*label).into())
 }
 
 #[derive(
@@ -367,24 +370,6 @@ impl SegmentSink for CollectingSegmentSink {
 }
 
 #[derive(Debug, Default)]
-pub struct CollectingBytesSink {
-    pub chunks: Vec<(u64, Vec<u8>)>,
-}
-
-impl RecordBytesSink for CollectingBytesSink {
-    fn on_wire_chunk<'a>(
-        &'a mut self,
-        start_lsn: u64,
-        bytes: &'a [u8],
-    ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
-        Box::pin(async move {
-            self.chunks.push((start_lsn, bytes.to_vec()));
-            Ok(())
-        })
-    }
-}
-
-#[derive(Debug, Default)]
 pub struct NoopBytesSink;
 
 impl RecordBytesSink for NoopBytesSink {
@@ -425,5 +410,14 @@ mod tests {
             .map(|s| s.timeline)
             .collect();
         assert_eq!(tlis, [2, 3]);
+    }
+
+    #[test]
+    fn rmgr_label_names_known_ids_and_falls_back_to_number() {
+        assert_eq!(rmgr_label(RmId::Xlog as u8), "xlog");
+        assert_eq!(rmgr_label(RmId::Heap as u8), "heap");
+        assert_eq!(rmgr_label(RmId::CommitTs as u8), "commit_ts");
+        assert_eq!(rmgr_label(RmId::LogicalMsg as u8), "logical_msg");
+        assert_eq!(rmgr_label(RmId::LogicalMsg as u8 + 1), "rmgr_22");
     }
 }

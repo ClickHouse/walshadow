@@ -33,7 +33,7 @@ use std::time::Duration;
 use walshadow::mapping::NamespaceMapping;
 
 fn skip_gate() -> bool {
-    if !fx::requirements_available() {
+    if !fx::tools::requirements_available() {
         return true;
     }
     false

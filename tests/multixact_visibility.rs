@@ -9,10 +9,13 @@
 //!
 //! Skipped silently when `initdb` is not on `$PATH`.
 
+#[path = "common/tools.rs"]
+mod tools;
+use tools::pg_available;
+
 #[path = "common/ports.rs"]
 mod ports;
 
-use std::process::Command;
 use std::time::Duration;
 
 use walshadow::shadow::{Shadow, ShadowConfig};
@@ -20,14 +23,6 @@ use walshadow::visibility::{
     HEAP_XMAX_IS_MULTI, HEAP_XMIN_COMMITTED, MultiXactUpdater, PgMultiXactAccum, PgXactAccum,
     PgXactPatch, PgXactView, Visibility, tuple_visibility,
 };
-
-fn pg_available() -> bool {
-    Command::new("initdb")
-        .arg("--version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
 
 fn make_cluster(tmp: &tempfile::TempDir, port: u16) -> Shadow {
     let mut cfg = ShadowConfig::new(tmp.path().join("data"), tmp.path().join("filtered"));
@@ -64,7 +59,6 @@ impl Drop for StopOnDrop<'_> {
 #[test]
 fn multixact_updater_matches_live_pg() {
     if !pg_available() {
-        eprintln!("skip: no initdb on PATH");
         return;
     }
     let tmp = tempfile::tempdir().unwrap();

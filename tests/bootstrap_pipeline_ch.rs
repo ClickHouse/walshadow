@@ -102,8 +102,7 @@ fn tuple(rel_node: u32, id: i32) -> BackfillTuple {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn bootstrap_tail_fans_out_n2() {
-    if !fx::clickhouse_available() {
-        eprintln!("skip: no clickhouse binary on PATH");
+    if !fx::tools::clickhouse_available() {
         return;
     }
 

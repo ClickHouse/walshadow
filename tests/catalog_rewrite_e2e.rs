@@ -19,7 +19,7 @@ const PROBE: &str = "SET enable_seqscan = off; SET enable_bitmapscan = off; \
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn catalog_rewrites_keep_shadow_replaying() {
-    if !fx::requirements_available() {
+    if !fx::tools::requirements_available() {
         return;
     }
 

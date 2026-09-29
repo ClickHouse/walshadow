@@ -2,12 +2,15 @@
 //!
 //! Use preloaded worker from `pgext` build tree
 
+#[path = "common/tools.rs"]
+mod tools;
+use tools::pg_available;
+
 #[path = "common/ports.rs"]
 mod ports;
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -22,16 +25,6 @@ use walshadow::shadow::{BridgeConf, Shadow, ShadowConfig};
 /// int4 array, ie `INT4ARRAYOID`
 const INT4ARRAYOID: u32 = 1007;
 const JSONBOID: u32 = 3802;
-
-fn pg_available() -> bool {
-    Command::new("initdb")
-        .arg("--version")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
 
 /// Build tree holding `walshadow.so`, fed to PG as `dynamic_library_path`.
 /// Module is not optional, so an unbuilt tree fails rather than skips
@@ -57,7 +50,6 @@ impl Drop for StopOnDrop {
 /// `None` skips the caller: no PG
 fn start_pg(tmp: &tempfile::TempDir, port: u16) -> Option<StopOnDrop> {
     if !pg_available() {
-        eprintln!("skip: no initdb on PATH");
         return None;
     }
     let mut cfg = ShadowConfig::new(tmp.path().join("data"), tmp.path().join("filtered"));

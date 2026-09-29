@@ -28,7 +28,7 @@ const BODY_SQL: &str = "(SELECT string_agg(md5((i / 2)::text), '') FROM generate
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn compressed_external_values_rehydrate() {
-    if !fx::requirements_available() {
+    if !fx::tools::requirements_available() {
         return;
     }
 

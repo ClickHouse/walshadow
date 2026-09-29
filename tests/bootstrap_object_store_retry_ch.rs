@@ -71,7 +71,7 @@ fn test_settings(storage_root: PathBuf) -> Settings {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn incomplete_object_store_bootstrap_retries_itself() {
-    if !fx::requirements_available() {
+    if !fx::tools::requirements_available() {
         return;
     }
 

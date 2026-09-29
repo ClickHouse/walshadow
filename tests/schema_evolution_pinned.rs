@@ -33,7 +33,7 @@ use walshadow::mapping::TableTarget;
 use walshadow::schema::RelName;
 
 fn skip_if_missing() -> bool {
-    if !fx::requirements_available() {
+    if !fx::tools::requirements_available() {
         return true;
     }
     false

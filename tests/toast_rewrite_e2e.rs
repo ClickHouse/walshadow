@@ -74,7 +74,7 @@ fn live_sum_sql(chunk_table: &str, max_lsn: &str) -> String {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn vacuum_full_rewrite_and_same_xact_stash() {
-    if !fx::requirements_available() {
+    if !fx::tools::requirements_available() {
         return;
     }
 
@@ -466,7 +466,7 @@ async fn vacuum_full_rewrite_and_same_xact_stash() {
 /// fresh mirror — and the old mirror retires through the DROP lifecycle.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn alter_rewrite_link_swap_retires_old_mirror() {
-    if !fx::requirements_available() {
+    if !fx::tools::requirements_available() {
         return;
     }
 

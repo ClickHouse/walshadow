@@ -15,10 +15,13 @@
 //!
 //! Clusters are socket-only, so tests are parallel-safe.
 
+#[path = "common/tools.rs"]
+mod tools;
+use tools::pg_available;
+
 #[path = "common/ports.rs"]
 mod ports;
 
-use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -38,14 +41,6 @@ use walshadow::toast::{ChunkRefMap, MemChunkStore, ToastResolver};
 use walshadow::xact_buffer::{
     WalkStep, XactBuffer, XactBufferConfig, XactBufferError, detoast_heap,
 };
-
-fn pg_available() -> bool {
-    Command::new("initdb")
-        .arg("--version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
 
 fn make_shadow(tmp: &tempfile::TempDir, port: u16) -> Shadow {
     let mut cfg = ShadowConfig::new(tmp.path().join("data"), tmp.path().join("filtered"));
@@ -273,7 +268,6 @@ async fn fixture_shadow_with_things(
     port: u16,
 ) -> Option<(tempfile::TempDir, Shadow, ShadowCatalog, RelFileNode)> {
     if !pg_available() {
-        eprintln!("skip: no initdb on PATH");
         return None;
     }
     let tmp = tempfile::tempdir().unwrap();

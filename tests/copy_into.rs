@@ -28,7 +28,7 @@ const N_ROWS: u32 = 500;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn copy_into_multi_insert_replicates() {
-    if !fx::requirements_available() {
+    if !fx::tools::requirements_available() {
         return;
     }
 

@@ -77,8 +77,7 @@ async fn ids(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn chunked_copy_partitions_by_block_and_repeats_a_resumed_chunk() {
-    if !fx::pg_available() {
-        eprintln!("skip: no initdb on PATH");
+    if !fx::tools::pg_available() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();

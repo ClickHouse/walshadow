@@ -17,6 +17,9 @@
 
 #![allow(dead_code)]
 
+#[path = "tools.rs"]
+pub mod tools;
+
 #[path = "ports.rs"]
 mod ports;
 #[allow(unused_imports)]
@@ -54,54 +57,6 @@ use walshadow::shadow_catalog::{ShadowCatalog, ShadowCatalogConfig};
 use walshadow::source_feed::{SourceEvent, SourceFeed, StandbyStatus};
 use walshadow::wal_stream::WalStream;
 use walshadow::xact_buffer::{BufferingDecoderSink, SubxactTracker, XactBuffer, XactBufferConfig};
-
-// ---------------------------------------------------------------------------
-// Skip-gate probes
-// ---------------------------------------------------------------------------
-
-pub fn pg_available() -> bool {
-    Command::new("initdb")
-        .arg("--version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
-pub fn pg_basebackup_available() -> bool {
-    Command::new("pg_basebackup")
-        .arg("--version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
-pub fn clickhouse_available() -> bool {
-    Command::new("clickhouse")
-        .arg("--version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
-pub fn requirements_available() -> bool {
-    for (tool, found) in [
-        ("initdb", pg_available()),
-        ("pg_basebackup", pg_basebackup_available()),
-        ("clickhouse", clickhouse_available()),
-    ] {
-        if !found {
-            eprintln!("skip: no {tool} on PATH");
-            return false;
-        }
-    }
-    true
-}
 
 // ---------------------------------------------------------------------------
 // PG fixture helpers

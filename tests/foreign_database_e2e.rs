@@ -16,7 +16,7 @@ use walshadow::mapping::NamespaceMapping;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn foreign_database_ddl_and_dml_never_reach_the_followed_output() {
-    if !fx::requirements_available() {
+    if !fx::tools::requirements_available() {
         return;
     }
 

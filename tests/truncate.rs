@@ -27,7 +27,7 @@ use walshadow::schema::RelName;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn truncate_removes_ch_rows() {
-    if !fx::requirements_available() {
+    if !fx::tools::requirements_available() {
         return;
     }
 

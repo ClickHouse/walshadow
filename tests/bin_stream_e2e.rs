@@ -11,6 +11,10 @@
 //!
 //! Skipped silently when `initdb` or `pg_basebackup` aren't on `$PATH`.
 
+#[path = "common/tools.rs"]
+mod tools;
+use tools::{pg_available, pg_basebackup_available};
+
 #[path = "common/ports.rs"]
 mod ports;
 
@@ -25,26 +29,6 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use walshadow::shadow::{BridgeConf, Shadow, ShadowConfig};
-
-fn pg_available() -> bool {
-    Command::new("initdb")
-        .arg("--version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
-fn pg_basebackup_available() -> bool {
-    Command::new("pg_basebackup")
-        .arg("--version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
 
 /// Build tree holding `walshadow.so`, fed to PG as `dynamic_library_path`.
 /// Daemon dials the bridge worker at boot, so an unbuilt module is a failure,
@@ -261,11 +245,9 @@ fn wait_with_timeout(child: &mut Child, deadline: Duration) -> Result<std::proce
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn bin_stream_replicates_segments_and_serves_metrics() {
     if !pg_available() {
-        eprintln!("skip: no initdb on PATH");
         return;
     }
     if !pg_basebackup_available() {
-        eprintln!("skip: no pg_basebackup on PATH");
         return;
     }
     let bridge_lib_dir = pgext_dir();
@@ -629,7 +611,6 @@ fn kill_group(child: &mut Child) {
 #[ignore = "real-PG e2e; run with --ignored. Validates fix-2 (wire reconnect/resume)."]
 async fn wire_drop_midsegment_shadow_resumes_streaming() {
     if !pg_available() || !pg_basebackup_available() {
-        eprintln!("skip: PG binaries not on PATH");
         return;
     }
     let bridge_lib_dir = pgext_dir();
@@ -808,7 +789,6 @@ async fn wire_drop_midsegment_shadow_resumes_streaming() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn process_restart_preserves_shadow_postmaster() {
     if !pg_available() || !pg_basebackup_available() {
-        eprintln!("skip: PostgreSQL binaries unavailable");
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
