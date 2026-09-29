@@ -92,6 +92,10 @@ harness = false
 name = "oracle_batch"
 harness = false
 
+[[bench]]
+name = "xact_spill"
+harness = false
+
 [dev-dependencies]
 tempfile = "3"
 # Enable paused time for batch deadline tests

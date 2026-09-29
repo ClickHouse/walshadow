@@ -27,7 +27,8 @@
 //!
 //! Once `memory_used > config.xact_buffer_max`, flush the largest
 //! in-memory xact to a [`SpillWriter`]; the xact stays open and later
-//! records append to the file. Mirrors PG `ReorderBufferLargestTXN`
+//! records accumulate another memory-budgeted tail before eviction.
+//! Mirrors PG `ReorderBufferLargestTXN`
 //! (`src/backend/replication/logical/reorderbuffer.c`).
 //!
 //! Drain: spilled entries first (older), then in-mem. Eviction always
@@ -1129,19 +1130,10 @@ impl XactBuffer {
         let sz = approximate_size(&entry);
         let raw_sz = matches!(&entry, SpillEntry::Raw(_)).then_some(sz as u64);
         let st = self.state_for(xid, first_lsn);
-        if let Some(spill) = st.spill.as_mut() {
-            // Already spilling: append straight to disk
-            spill.write(&entry).await?;
-            let bc = spill.byte_count();
-            let prev = std::mem::replace(&mut st.spill_bytes, bc);
-            self.stats.spill_bytes_active += bc - prev;
-            self.stats.raw_stash_bytes_spill += raw_sz.unwrap_or(0);
-        } else {
-            st.in_mem.push(entry);
-            st.in_mem_bytes += sz;
-            self.bytes_in_memory += sz;
-            self.stats.raw_stash_bytes_mem += raw_sz.unwrap_or(0);
-        }
+        st.in_mem.push(entry);
+        st.in_mem_bytes += sz;
+        self.bytes_in_memory += sz;
+        self.stats.raw_stash_bytes_mem += raw_sz.unwrap_or(0);
         self.stats.bytes_in_memory = self.bytes_in_memory as u64;
         self.maybe_evict().await?;
         Ok(())
@@ -1156,8 +1148,6 @@ impl XactBuffer {
                 .max_by_key(|(_, s)| s.in_mem_bytes)
                 .map(|(xid, _)| *xid);
             let Some(xid) = largest else {
-                // All active xacts already on disk; caller pushing into
-                // spilled xacts faster than budget allows
                 break;
             };
             self.evict_xact(xid).await?;
@@ -1174,9 +1164,7 @@ impl XactBuffer {
         let writer = st.spill.as_mut().unwrap();
         let drained: Vec<SpillEntry> = std::mem::take(&mut st.in_mem);
         let freed = std::mem::take(&mut st.in_mem_bytes);
-        for entry in drained {
-            writer.write(&entry).await?;
-        }
+        writer.write_batch(drained).await?;
         let bc = writer.byte_count();
         let new_spill_bytes = bc - st.spill_bytes;
         st.spill_bytes = bc;
@@ -1540,6 +1528,9 @@ impl MergeSource {
         // `bytes_in_memory` at commit); spill entries join at decode.
         for e in &in_mem {
             gauge.add(approximate_size(e));
+        }
+        if let Some(r) = &reader {
+            gauge.add(r.buffered_bytes());
         }
         let mut src = Self {
             head: None,
@@ -3661,6 +3652,44 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn repeated_eviction_preserves_spilled_prefix_and_memory_tail() {
+        let tmp = tempdir().unwrap();
+        let mut config = cfg(tmp.path().to_path_buf());
+        let row_bytes = approximate_size(&SpillEntry::Heap(Box::new(heap_with_value(7, 1, 128))));
+        config.xact_buffer_max = 4 * row_bytes;
+        let mut buffer = XactBuffer::new(config).unwrap();
+        for lsn in 1..=12 {
+            for xid in [7, 8] {
+                buffer
+                    .on_heap(heap_with_value(xid, 2 * lsn + u64::from(xid == 8), 128))
+                    .await
+                    .unwrap();
+                assert!(buffer.bytes_in_memory <= 4 * row_bytes);
+            }
+        }
+        assert!(buffer.stats().spill_evictions_total > 2);
+        assert!(
+            buffer
+                .inflight
+                .values()
+                .any(|s| s.spill.is_some() && !s.in_mem.is_empty())
+        );
+        let mut drain = buffer
+            .drain_committed(7, 0, 100, &[8], false)
+            .await
+            .unwrap();
+        assert_eq!(buffer.stats().bytes_in_memory, 0);
+        let mut lsns = Vec::new();
+        while let Some(batch) = drain.next_batch(3, usize::MAX, None).await.unwrap() {
+            lsns.extend(batch.heaps.into_iter().map(|heap| heap.decoded.source_lsn));
+        }
+        assert_eq!(lsns, (2..=25).collect::<Vec<_>>());
+        drain.finish().await.unwrap();
+        assert_eq!(buffer.drain_resident_bytes(), 0);
+        assert!(spill_files(tmp.path()).is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn abort_drops_xact_and_unlinks_spill() {
         let tmp = tempdir().unwrap();
         let mut b = XactBuffer::new(cfg(tmp.path().to_path_buf())).unwrap();
@@ -5512,11 +5541,20 @@ mod tests {
         }
         let total = n * 512;
         let mut drain = b.drain_committed(4, 0, 0x9000, &[], false).await.unwrap();
+        let read_buffers = drain
+            .merged
+            .as_ref()
+            .unwrap()
+            .sources
+            .iter()
+            .filter_map(|s| s.reader.as_ref())
+            .map(|r| r.buffered_bytes() as u64)
+            .sum::<u64>();
         let mut rows = 0usize;
         while let Some(batch) = drain.next_batch(4, usize::MAX, None).await.unwrap() {
             rows += batch.heaps.len();
             assert!(
-                b.drain_resident_bytes() < total / 4,
+                b.drain_resident_bytes() < read_buffers + total / 4,
                 "resident {} vs xact {total}",
                 b.drain_resident_bytes(),
             );
@@ -5527,7 +5565,7 @@ mod tests {
         assert_eq!(rows as u64, n);
         assert!(b.drain_resident_peak() > 0, "gauge saw the merge heads");
         assert!(
-            b.drain_resident_peak() < total / 4,
+            b.drain_resident_peak() < read_buffers + total / 4,
             "peak {} vs xact {total}",
             b.drain_resident_peak(),
         );

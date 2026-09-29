@@ -1,5 +1,27 @@
 # Replication benchmarks
 
+## Transaction spill
+
+Run buffer admission, spill encoding, commit drain, and cleanup without servers:
+
+```sh
+cargo bench --bench xact_spill -- --buffer-bytes 1048576 --rows 7821
+cargo bench --bench xact_spill -- --buffer-bytes 1048576 --rows 781 --transactions 80
+cargo bench --bench xact_spill -- --rows 111108 --transactions 2
+```
+
+Use `--dir` to select filesystem; default `target`. Avoid tmpfs for disk benchmarks.
+Defaults use 1 KiB text payloads and three repeats. Verify every row's payload,
+xid, LSN order, descriptor, and file cleanup. Write timing includes allocation
+and admission; read timing includes reader setup, verified drain, and unlink.
+Report spill bytes alongside throughput: final memory tails can avoid disk.
+Compare equal spill bytes when isolating I/O improvements.
+
+Files follow disposable-spill semantics: no fsync, immediate replay, then unlink.
+Results include page cache and codec costs; they do not measure sustained device
+bandwidth or PostgreSQL-to-ClickHouse lag. Buffer peak reports post-admission
+payload estimates; use process RSS to measure allocator and I/O buffer overhead.
+
 ## Local runs
 
 Start PostgreSQL, ClickHouse, and walshadow with SQL runtime config installed
