@@ -37,7 +37,7 @@ pub const NUMERICOID: u32 = 1700;
 pub const UUIDOID: u32 = 2950;
 pub const JSONBOID: u32 = 3802;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct RelName {
     pub namespace: Arc<str>,
     pub name: Arc<str>,
@@ -60,7 +60,7 @@ impl std::fmt::Display for RelName {
 
 /// Batch identity down the insert path: the same relation name in two source
 /// databases routes to two destinations, so the database is part of the key
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct TableKey {
     pub db_oid: u32,
     pub rel: RelName,

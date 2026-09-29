@@ -1895,6 +1895,13 @@ pub(crate) async fn run_session(
             metrics_dbs.iter().map(DbMetricSources::series).collect(),
             StageCounters {
                 emitter: emitter_stats,
+                db_name: &|oid| {
+                    db_conns
+                        .iter()
+                        .find(|c| c.oid == oid)
+                        .map(|c| c.name.clone())
+                        .unwrap_or_default()
+                },
                 oracle: [oracle_stats, bootstrap_metrics.as_ref().map(|b| &*b.oracle)],
                 bootstrap: bootstrap_metrics.as_ref().map(|b| &b.progress),
                 bootstrap_attempt: 0,

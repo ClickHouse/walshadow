@@ -503,6 +503,18 @@ async fn stream_status(ctx: &SharedCtx) -> Result<String> {
         "backfills_pending".into(),
         (snap.config_backfills_pending as i64).into(),
     );
+    let unmapped: Vec<Value> = snap
+        .unmapped_rows_by_table
+        .iter()
+        .map(|(database, table, rows)| {
+            let mut row = Table::new();
+            row.insert("database".into(), database.clone().into());
+            row.insert("table".into(), table.clone().into());
+            row.insert("rows".into(), (*rows as i64).into());
+            Value::Table(row)
+        })
+        .collect();
+    out.insert("unmapped_tables".into(), Value::Array(unmapped));
     out.insert(
         "lag_bytes".into(),
         (snap.shadow_apply_lag_bytes as i64).into(),

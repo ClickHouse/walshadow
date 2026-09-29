@@ -172,6 +172,14 @@ impl Inserter {
                     self.stats
                         .rows_emitted
                         .fetch_add(batch.n_rows as u64, Ordering::Relaxed);
+                    batch
+                        .meta
+                        .rows_inserted
+                        .fetch_add(batch.n_rows as u64, Ordering::Relaxed);
+                    for col in &batch.meta.columns {
+                        col.cells_inserted
+                            .fetch_add(batch.n_rows as u64, Ordering::Relaxed);
+                    }
                     self.stats.blocks_sent.fetch_add(1, Ordering::Relaxed);
                     self.stats
                         .inserter_batches_in

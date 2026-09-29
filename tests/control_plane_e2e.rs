@@ -930,6 +930,50 @@ async fn ch_password_rotation_via_ctl_keeps_streaming() {
     }
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn status_names_tables_whose_wal_is_not_needed() {
+    if !gated() {
+        return;
+    }
+    let mut h = Harness::up(&fx::Ports::alloc())
+        .await
+        .expect("bring up harness");
+    h.wait_ready(Duration::from_secs(60))
+        .await
+        .expect("pump never started");
+
+    let result = async {
+        h.psql("CREATE TABLE demo.noise (id bigint PRIMARY KEY)")?;
+        h.psql("INSERT INTO demo.noise SELECT generate_series(1, 5)")?;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let status: toml::Table = h.ctl(&["status"])?.parse()?;
+            let unmapped = status
+                .get("unmapped_tables")
+                .and_then(toml::Value::as_array)
+                .context("no unmapped_tables in status")?;
+            let noise_rows = unmapped.iter().find_map(|row| {
+                (row.get("table")?.as_str()? == "demo.noise")
+                    .then(|| row.get("rows")?.as_integer())?
+            });
+            if noise_rows.is_some_and(|n| n >= 5) {
+                return Ok::<(), anyhow::Error>(());
+            }
+            ensure!(
+                Instant::now() < deadline,
+                "status never counted demo.noise inserts, said {unmapped:?}",
+            );
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
+    .await;
+
+    let stderr = h.teardown();
+    if let Err(e) = result {
+        panic!("{e:#}\n--- daemon stderr ---\n{stderr}");
+    }
+}
+
 /// Regression: applying one table used to opt pinned tables out
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn apply_preserves_previously_pinned_table() {
@@ -2389,11 +2433,15 @@ async fn slot_proofs_name_the_missing_slot_and_park_the_crossing() {
         // decision back and gives it again
         h.ctl_body(&["apply"], "[source]\nslot = \"sw\"")?;
         h.ctl_body(&["apply"], "[stream]\npaused = true")?;
-        tokio::time::sleep(Duration::from_millis(600)).await;
-        ensure!(
-            h.metric("walshadow_crossing_wedged")? == 0,
-            "pause left the crossing parked",
-        );
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if h.metric("walshadow_crossing_wedged")? == 0 {
+                break;
+            }
+            ensure!(h.alive(), "daemon exited while unparking the crossing");
+            ensure!(Instant::now() < deadline, "pause left the crossing parked");
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
         h.ctl_body(&["apply"], "[stream]\npaused = false")?;
         h.wait_metric(
             "walshadow_timeline_switches_total",

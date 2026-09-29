@@ -81,6 +81,7 @@ pub(crate) fn init_tracing(
         .with(filter)
         .with(fmt_layer)
         .with(otel_layer)
+        .with(walshadow::log_events::LogEventLayer)
         .try_init();
     provider
 }
