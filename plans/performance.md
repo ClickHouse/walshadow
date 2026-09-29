@@ -60,12 +60,11 @@ or insert latency
 
 Try these in order:
 
-1. Parallelize backup-backfill inserts within existing byte budget
-   [Backup backfill](../src/backfill/backup_backfill.rs) currently starts one
-   inserter even when configured pool size is 16. Compare one versus four workers
-   sharing unchanged encoded-buffer allowance. Measure backfill rows/s separately
-   from WAL progress, plus insert latency, part count, RSS, and durable completion
-   counts. Verify overlapping inserts improve throughput before raising concurrency
+1. Measure backup-backfill insert scaling
+   [Backup backfill](../src/backfill/backup_backfill.rs) already uses configured
+   inserter count capped at three. Compare pool sizes within unchanged byte
+   budget before raising cap. Measure rows/s separately from WAL progress, plus
+   insert latency, part count, RSS, and durable completion counts
 2. Profile serial WAL dispatch, then batch measured hot operations
    [Queue worker](../src/source/queueing_record_sink.rs) receives batches but awaits
    each record individually. Attribute decode, transaction-buffer, commit-drain,

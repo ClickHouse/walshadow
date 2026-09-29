@@ -8,8 +8,8 @@ Do not exclude files or disable coverage without human approval
 ## Measurement and gate
 
 Regenerate coverage with [development recipe](../docs/development.md#wal-fixtures-and-coverage)
-and current [CI matrix](../.github/workflows/ci.yml). Use merged PostgreSQL
-16/17/18 line data for project target; retain per-major reports to find version
+and current [CI matrix](../.github/workflows/ci.yml). Use merged line data from every
+matrix major for project target; retain per-major reports to find version
 branches. Require every expected major's artifact before accepting merged result
 An early-returned integration test does not establish coverage of its scenario
 
@@ -28,9 +28,9 @@ Audit denominator differences between native llvm-cov summaries, per-major LCOV
 thresholds. Derive each floor from matching report format
 
 Measure [PG module coverage](../pgext/README.md#coverage) separately from Rust
-line target. Refresh C baseline from `coverage-pgext-pg16/17/18` artifacts, merge
-per-major C reports, and choose a C coverage floor. Retain live/fault tests and
-C sanitizer campaigns to verify module behavior beyond line execution
+line target. Merge per-major `coverage-pgext-*` reports while retaining existing
+100% per-major C gate. Retain live/fault tests and C sanitizer campaigns to verify
+module behavior beyond line execution
 
 ## Work list
 

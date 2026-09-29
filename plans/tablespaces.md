@@ -34,11 +34,9 @@ Recapture affected descriptors when database default changes
 
 ## Identity and restore seams
 
-Normalize `pg_class.reltablespace = 0` through `pg_database.dattablespace`
-before constructing descriptor keys. WAL locators contain physical tablespace
-OID; zero sentinel is not that identity. Preserve explicit shared-catalog
-tablespace identity. Audit every `CatalogMap` and tracker lookup using only
-`(db_node, rel_node)`, including pending-relation and bootstrap completion maps
+Audit every `CatalogMap` and tracker lookup using only `(db_node, rel_node)`,
+including pending-relation and bootstrap completion maps. Reuse resolved
+tablespace identity from descriptors; preserve explicit shared-catalog identity
 
 Recognize default `base/<db>/<rel>` paths and tablespace archive entries under
 versioned `PG_<major>_<catalog-version>/<db>/<rel>` directories, accounting for

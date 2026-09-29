@@ -1,8 +1,7 @@
 # Complete multi-database loads and observability
 
-Extend current per-database routing work to heap-page bootstrap, backup-based
-table loads, and metrics. Stage 1 covers live replication and `copy` for
-non-primary databases; keep remaining load paths explicit until verified
+Extend [multi-database replication](../docs/multi-database.md) to heap-page
+bootstrap, backup-based table loads, and remaining pipeline metrics
 
 Use [shared constraints](coordination.md) for physical identity and durable
 progress, and [bootstrap visibility](bootstrap.md) for undecided tuples
@@ -41,17 +40,14 @@ target versus unrelated databases, and interrupted loads followed by restart
 Assert destination isolation, final rows, staging cleanup, and resume safety
 Retain [visibility acceptance cases](bootstrap.md#completion) for each load mode
 
-## Database labels on metrics
+## Remaining metric attribution
 
-Add source database labels to metrics with database-owned work in
-[metrics exporter](../src/ops/metrics.rs). Carry attribution through counters and
-gauges, including shared bridge statistics, rather than relabeling aggregate
-values once per database
+Bridge, descriptor, catalog-capture, and config metrics already have database
+labels in [metrics exporter](../src/ops/metrics.rs). Attribute remaining shared
+pipeline counters where work belongs to one database, carrying identity through
+decode, resolution, and insertion instead of relabeling aggregate values
 
-Keep cluster WAL and process-wide resource metrics aggregate. Define label
-identity consistently and bound series by configured databases, avoiding table
-names or arbitrary config values. Preserve cumulative counters across bootstrap
-handoff and document changed series for dashboard consumers
-
-Verify two databases with independent activity produce distinct series, shared
-work is counted once, and single-database operation retains useful metrics
+Keep cluster WAL and process-wide resources aggregate. Reuse configured database
+labels and preserve cumulative counters across bootstrap handoff. Verify shared
+work is counted once and independent database activity produces distinct series
+Document changed series for dashboard consumers

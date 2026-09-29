@@ -24,7 +24,8 @@ and workload limits before attaching
 ## ClickHouse
 
 - destination uses ClickHouse Native protocol
-- source column type changes require manual ClickHouse migration
+- [key column type changes](schema-changes.md#migrate-a-rejected-key-type-change)
+  ClickHouse refuses require manual migration
 - `CREATE TABLE` omits a fast default only shadow PostgreSQL can render (raw
   arrays); the table it creates is empty, and `ADD COLUMN` resolves the
   default through the oracle

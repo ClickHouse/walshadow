@@ -1,5 +1,4 @@
-//! Schema-evolution CDC correctness, end-to-end. DROP/RENAME COLUMN
-//! propagation is unimplemented.
+//! Schema-evolution CDC correctness, end-to-end
 
 #![cfg(target_os = "linux")]
 

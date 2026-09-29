@@ -22,7 +22,8 @@ changes after earlier rows and before later rows
 Table renames, schema moves, replica-identity changes, and switching to unlogged
 storage are not automatically reconciled with destination routing and keys
 Coordinate these changes with an explicit destination and mapping migration
-They are not uniformly rejected before replication continues
+None are rejected. Rows written after a table rename or schema move are
+discarded unless a mapping already names new relation
 
 Rewriting type changes log every live row with its new value. These rows
 supersede stored versions through `_lsn` deduplication. Until they arrive,

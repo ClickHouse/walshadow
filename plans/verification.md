@@ -7,10 +7,6 @@ lists of already covered functions. Build and test commands live in
 
 ## Enforce CI prerequisites
 
-CI already installs PostgreSQL and ClickHouse, builds module, regenerates WAL
-fixtures, and runs PostgreSQL 16/17/18 jobs. Remove claims that these suites are
-not wired into CI
-
 Make missing binaries, module, extensions required by a job, and WAL fixtures
 fail that job. Runtime early returns currently let some unavailable tests look
 successful. Keep optional local skips explicit. Verify active PostgreSQL major
