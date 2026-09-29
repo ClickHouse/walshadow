@@ -2,11 +2,9 @@
 //! relation propagates to ClickHouse without any priming DML.
 //!
 //! `demo.users` is pinned in `ch-config` and gets no traffic before `ALTER TABLE
-//! demo.users ADD COLUMN signup_ts …`. Pre-fix, first descriptor
-//! fetch already carried the post-ALTER shape, `prev_known` was cold for
-//! the oid → `Added` → `apply_added` skips the pinned dest → CH never grew
-//! the column. The startup `seed_baseline` warms `prev_known` with the
-//! boot shape, so the first ALTER diffs as `Changed` and the column lands.
+//! demo.users ADD COLUMN signup_ts …`. Descriptor log holds boot shape as
+//! predecessor, so first ALTER diffs as `Changed` rather than `Added`, which
+//! only ensures already mapped columns and never adds the new one
 //!
 //! Two drills:
 //!

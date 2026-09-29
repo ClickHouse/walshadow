@@ -99,8 +99,7 @@ pub(crate) fn resolve_bootstrap(args: &Args, ch: Option<&EmitterConfig>) -> Resu
     })
 }
 
-/// A data dir holding `PG_VERSION` was initialized by a prior bootstrap (or
-/// external `initdb`), so the shadow can resume rather than reseed.
+/// Check for initialized cluster via `PG_VERSION`
 pub(crate) fn shadow_data_dir_initialized(dir: &std::path::Path) -> bool {
     dir.join("PG_VERSION").exists()
 }
@@ -136,15 +135,11 @@ pub(crate) async fn run_bootstrap(
     let bridge_workers = bridge_pool_size(ch_config.as_ref());
     let shadow_data_dir = args.bootstrap_shadow_data_dir.clone();
 
-    // Never land a base backup onto a dir that already holds a cluster: a
-    // `PG_VERSION` with no completion marker is a crashed bootstrap or a
-    // foreign/externally-seeded dir. Overwriting it would be destructive and
-    // non-recoverable — make the operator clear it (or use `--bootstrap-mode=off`
-    // to resume an externally-managed shadow).
+    // Preserve existing cluster data when no bootstrap attempt owns it
     if previous.is_none() && shadow_data_dir_initialized(&shadow_data_dir) {
         anyhow::bail!(
-            "bootstrap: {} already holds a cluster (PG_VERSION present) but no completed-bootstrap \
-             marker — provide an empty data dir to bootstrap, or --bootstrap-mode=off to resume it",
+            "bootstrap: {} already holds a cluster (PG_VERSION present) but no bootstrap attempt \
+             marker; provide an empty data dir to bootstrap",
             shadow_data_dir.display(),
         );
     }

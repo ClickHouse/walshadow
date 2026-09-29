@@ -228,9 +228,7 @@ pub struct EmitterConfig {
 /// Initialized data dir resumes regardless of mode
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum BootstrapMode {
-    /// Never bootstrap. Without `--bootstrap-shadow-data-dir`, manage shadow
-    /// externally. With data dir, manage initialized cluster but reject
-    /// empty dir
+    /// Resume initialized managed shadow; reject empty data dir
     #[default]
     Off,
     /// Source-PG-driven BASE_BACKUP over the replication protocol,
@@ -261,9 +259,8 @@ impl std::str::FromStr for BootstrapMode {
 /// through to the CLI flag, then to the built-in default — a set key that
 /// the CLI also passes loses to the CLI.
 ///
-/// `shadow_data_dir` stays CLI-only: it decides whether the daemon owns a
-/// shadow at all, and pairs with `--start-lsn` / `--ignore-cursor` as a
-/// per-invocation recovery decision.
+/// Keep `shadow_data_dir` CLI-only alongside `--start-lsn` / `--ignore-cursor`
+/// as a per-invocation recovery decision
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
 pub struct BootstrapSettings {
     /// `mode`: `off` / `direct` / `object_store`. Validated at parse so a typo

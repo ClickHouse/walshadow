@@ -16,7 +16,7 @@ publication, durable progress, physical identity, or pipeline concurrency
 ## Production readiness
 
 Start with small guards against silent divergence and tests of restart behavior
-Resolve bootstrap visibility before relying on backup loads under concurrent
+Prove pending-row recovery before relying on backup loads under concurrent
 writes. A documented limitation does not imply code rejects it
 
 | Plan | Next step |
@@ -24,7 +24,7 @@ writes. A documented limitation does not imply code rejects it
 | [Schema changes](schema.md) | Reject unsupported transitions before destination effects |
 | [Tablespaces](tablespaces.md) | Reject unsafe layouts before bootstrap, then add complete support |
 | [Catalog completeness](catalog.md) | Stop when a surviving relation has lost buffered payload |
-| [Bootstrap visibility](bootstrap.md) | Preserve tuples whose transaction outcome is still unknown |
+| [Bootstrap visibility](bootstrap.md) | Prove pending-row recovery across load modes and restart |
 | [Verification](verification.md) | Enforce CI prerequisites and prove outage, restart, and WAL-version behavior |
 | [100% line coverage](coverage100.md) | Close fixture, live-system, CLI, and fault-path gaps, then enforce 100% |
 

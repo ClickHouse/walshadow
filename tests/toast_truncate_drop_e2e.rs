@@ -1,9 +1,8 @@
 //! TOAST mirror retirement across pipeline restarts (`architecture/values.md`):
 //! owner DROP paths that need a rebuilt pipeline
 //!
-//! * cold-restart DROP — a rebuilt pipeline (empty `prev_known`, no chunk
-//!   decode) still retires the mirror off the `seed_baseline`-warmed
-//!   toast oid
+//! * cold-restart DROP — a rebuilt pipeline with no chunk decode still
+//!   retires the mirror off toast descriptor persisted in descriptor log
 //! * crash-replay — same-xact UPDATE (toast value untouched) + DROP,
 //!   pipeline rebuilt before the floor advances: replay must find the
 //!   mirror intact, destination bytes exact, zero fills
@@ -77,9 +76,8 @@ fn doc_mappings() -> Vec<fx::TableMappingSpec> {
 
 /// Cold-restart DROP: the mirror predates the pipeline (a prior run built
 /// it) and no chunk decode warms the toast descriptor before the owner
-/// DROP. `seed_baseline` must have put owner + toast oids in `prev_known`
-/// for the sweep to surface both; without it the toast `Dropped` never
-/// fires and the mirror leaks indefinitely.
+/// DROP. Descriptor log must hold owner + toast predecessors for replay to
+/// surface both; without them toast `Dropped` never fires and mirror leaks
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cold_restart_drop_retires_mirror() {
     if !fx::requirements_available() {
@@ -116,8 +114,8 @@ async fn cold_restart_drop_retires_mirror() {
     let chunk_table = format!("walshadow_test.pg_toast_{toast_relid}");
 
     // Run 1: populate the mirror, then drain and drop the whole pipeline —
-    // the daemon-restart stand-in (catalog, prev_known, chunk caches all
-    // rebuilt from scratch below).
+    // the daemon-restart stand-in (catalog and chunk caches rebuilt from
+    // scratch below).
     let mut pipeline = fx::build_pipeline_with(
         fx::BuildPipelineArgs {
             tmp: &tmp,
@@ -157,8 +155,8 @@ async fn cold_restart_drop_retires_mirror() {
         .await
         .expect("first pipeline drains clean");
 
-    // Run 2: fresh pipeline, cold prev_known. Only seed_baseline knows the
-    // toast oid — the DROP is the first WAL this pipeline decodes.
+    // Run 2: fresh pipeline. Only descriptor log knows the toast oid, DROP
+    // is the first WAL this pipeline decodes
     let mut pipeline = fx::build_pipeline_with(
         fx::BuildPipelineArgs {
             tmp: &tmp,
@@ -186,8 +184,7 @@ async fn cold_restart_drop_retires_mirror() {
     let shipped = fx::pump_segments(&mut pipeline, 1, Duration::from_secs(45)).await;
     let _ = driver.join();
     assert!(shipped >= 1, "drop segment never shipped");
-    // Queued off the seed_baseline-warmed toast oid, deferred until the
-    // floor passes.
+    // Queued off persisted toast descriptor, deferred until floor passes
     assert_eq!(
         ch.query(&format!("SELECT count() > 0 FROM {chunk_table}"))
             .expect("mirror rows"),
