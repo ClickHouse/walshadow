@@ -3027,7 +3027,7 @@ dependencies = [
 
 [[package]]
 name = "walshadow"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "ahash",
  "anyhow",
@@ -3073,7 +3073,7 @@ dependencies = [
 
 [[package]]
 name = "walshadow-bench"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "ab_glyph",
  "anyhow",

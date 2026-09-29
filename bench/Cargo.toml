@@ -1,9 +1,12 @@
 [package]
 name = "walshadow-bench"
-version = "0.1.0"
+version = "0.1.2"
 edition = "2024"
 description = "Replication-latency benchmarks (Postgres → ClickHouse / PG standby), engine + CLIs"
 license = "AGPL-3.0-only"
+repository = "https://github.com/ClickHouse/walshadow"
+homepage = "https://github.com/ClickHouse/walshadow"
+documentation = "https://github.com/ClickHouse/walshadow/tree/main/docs"
 
 # The shared benchmark engine. Self-contained: talks to Postgres over
 # tokio-postgres and to ClickHouse over a hand-rolled HTTP client, so it pulls
