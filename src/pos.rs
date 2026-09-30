@@ -128,13 +128,6 @@ impl<K> PartialEq<u64> for Pos<K> {
     }
 }
 
-#[cfg(test)]
-impl<K> PartialOrd<u64> for Pos<K> {
-    fn partial_cmp(&self, other: &u64) -> Option<CmpOrdering> {
-        Some(self.0.cmp(other))
-    }
-}
-
 impl<K> PartialEq for Pos<K> {
     fn eq(&self, other: &Self) -> bool {
         self.0 == other.0

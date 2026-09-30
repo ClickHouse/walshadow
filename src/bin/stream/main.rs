@@ -31,6 +31,13 @@ compile_error!(
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+/// Enable every callsite so coverage runs evaluate tracing field expressions
+#[cfg(test)]
+#[ctor::ctor(unsafe)]
+fn enable_tracing() {
+    let _ = tracing::subscriber::set_global_default(tracing_subscriber::registry());
+}
+
 mod archive;
 mod args;
 mod bootstrap;

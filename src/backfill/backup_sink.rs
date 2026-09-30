@@ -213,6 +213,7 @@ impl<T: BackupSink> BackupSink for MultiplexSink<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backfill::backup_source::testing::expect_tap;
     use crate::backfill::pg_path::{BaseRelFile, RelFork, is_system_dir, parse_base_path};
     use std::path::{Path, PathBuf};
 
@@ -379,12 +380,8 @@ mod tests {
             ),
         ];
         for (meta, expected) in cases {
-            assert_eq!(
-                lander.classify(&meta),
-                expected,
-                "classify({}) wrong",
-                meta.path.display()
-            );
+            let path = meta.path.display();
+            assert_eq!(lander.classify(&meta), expected, "classify({path}) wrong");
         }
     }
 
@@ -446,9 +443,7 @@ mod tests {
             FileAction::Keep
         ));
 
-        let FileAction::Tap(mut entry) = mux.begin(&file("base/5/16400")).await.unwrap() else {
-            panic!("user heap must tap");
-        };
+        let mut entry = expect_tap(mux.begin(&file("base/5/16400")).await.unwrap());
         entry.chunk(&[0u8; 1024]).await.unwrap();
         entry.chunk(&[1u8; 512]).await.unwrap();
         entry.end().await.unwrap();

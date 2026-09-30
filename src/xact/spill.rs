@@ -507,15 +507,6 @@ impl BodySpoolWriter {
         Ok(())
     }
 
-    /// Total appended bytes
-    pub fn len(&self) -> u64 {
-        self.len
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-
     /// Reader handle for batch views; outlives writer and unlink
     pub fn shared(&self) -> &Arc<BodySpoolFile> {
         &self.shared
@@ -1576,34 +1567,11 @@ mod tests {
         let bc = w.byte_count();
         assert!(bc > 0);
         let mut r = w.finish().await.unwrap();
-        match r.next().await.unwrap().unwrap() {
-            SpillEntry::Heap(b) => {
-                assert_eq!(b.decoded.xid, 42);
-                assert_eq!(b.decoded.source_lsn, 0x2000);
-                assert_eq!(b.descriptor_valid_from, 0x1000);
-                assert_eq!(b.descriptor, sample_descriptor(16385));
-                assert_eq!(b.decoded.new.as_ref().unwrap().columns.len(), 5);
-                let cols = &b.decoded.new.as_ref().unwrap().columns;
-                assert!(matches!(cols[0], Some(ColumnValue::Int4(7))));
-                assert!(matches!(cols[1], Some(ColumnValue::Text(ref t)) if t == "hello"));
-                assert!(cols[2].is_none());
-                assert!(matches!(cols[3], Some(ColumnValue::Null)));
-                match &cols[4] {
-                    Some(ColumnValue::ExternalToast(p)) => {
-                        assert_eq!(p.va_valueid, 99);
-                        assert_eq!(p.va_rawsize, 1024);
-                    }
-                    other => panic!("expected ExternalToast, got {other:?}"),
-                }
-            }
-            other => panic!("expected Heap, got {other:?}"),
-        }
-        match r.next().await.unwrap().unwrap() {
-            SpillEntry::Chunk(c2) => {
-                assert_eq!(c2, c);
-            }
-            other => panic!("expected Chunk, got {other:?}"),
-        }
+        assert_eq!(
+            r.next().await.unwrap().unwrap(),
+            SpillEntry::Heap(Box::new(h))
+        );
+        assert_eq!(r.next().await.unwrap().unwrap(), SpillEntry::Chunk(c));
         assert!(r.next().await.unwrap().is_none(), "EOF expected");
         r.unlink().await.unwrap();
     }
@@ -1623,10 +1591,7 @@ mod tests {
             .await
             .unwrap();
         let mut r = w.finish().await.unwrap();
-        match r.next().await.unwrap().unwrap() {
-            SpillEntry::ToastDelete(d2) => assert_eq!(d2, d),
-            other => panic!("expected ToastDelete, got {other:?}"),
-        }
+        assert_eq!(r.next().await.unwrap().unwrap(), SpillEntry::ToastDelete(d));
         assert!(r.next().await.unwrap().is_none());
         r.unlink().await.unwrap();
     }
@@ -1663,28 +1628,26 @@ mod tests {
             .await
             .unwrap();
         let mut r = w.finish().await.unwrap();
-        match r.next().await.unwrap().unwrap() {
-            SpillEntry::Raw(got) => {
-                assert_eq!(*got, raw);
-                let rec = got.to_xlog_record();
-                assert_eq!(rec.header.xact_id, 77, "writer xid restored for _xid");
-                assert_eq!(rec.header.resource_manager_id, 10);
-                assert_eq!(rec.header.info, 0x80);
-                assert_eq!(rec.blocks.len(), 1);
-                assert_eq!(rec.blocks[0].header.location.block_no, 3);
-                assert_eq!(rec.blocks[0].header.image_header.hole_length, 7000);
-                assert_eq!(&*rec.main_data, &[1, 0, 8]);
-                assert_eq!(
-                    got.rfn(),
-                    Some(RelFileNode {
-                        spc_node: 1663,
-                        db_node: 5,
-                        rel_node: 24680,
-                    })
-                );
-            }
-            other => panic!("expected Raw, got {other:?}"),
-        }
+        assert_eq!(
+            r.next().await.unwrap().unwrap(),
+            SpillEntry::Raw(Box::new(raw.clone()))
+        );
+        let rec = raw.to_xlog_record();
+        assert_eq!(rec.header.xact_id, 77, "writer xid restored for _xid");
+        assert_eq!(rec.header.resource_manager_id, 10);
+        assert_eq!(rec.header.info, 0x80);
+        assert_eq!(rec.blocks.len(), 1);
+        assert_eq!(rec.blocks[0].header.location.block_no, 3);
+        assert_eq!(rec.blocks[0].header.image_header.hole_length, 7000);
+        assert_eq!(&*rec.main_data, &[1, 0, 8]);
+        assert_eq!(
+            raw.rfn(),
+            Some(RelFileNode {
+                spc_node: 1663,
+                db_node: 5,
+                rel_node: 24680,
+            })
+        );
         assert!(r.next().await.unwrap().is_none());
         r.unlink().await.unwrap();
     }
@@ -1774,7 +1737,6 @@ mod tests {
         let b = w.append(b"world!").unwrap();
         assert_eq!((a.offset, a.len), (0, 5));
         assert_eq!((b.offset, b.len), (5, 6));
-        assert_eq!(w.len(), 11);
         w.flush().unwrap();
         let shared = w.shared().clone();
         assert_eq!(shared.read(a).unwrap(), b"hello");
@@ -1964,9 +1926,9 @@ mod tests {
             "sampled tags are not gapless from {VAL_NULL}"
         );
         let probe = decode_value(&mut Cursor::new(&[next]));
-        let Err(SpillError::Format { detail, .. }) = probe else {
-            panic!("tag {next} decodes, so it needs a round-trip sample here")
-        };
+        let detail = probe
+            .expect_err("decodable tag needs a round-trip sample here")
+            .to_string();
         assert!(
             detail.contains("unknown ColumnValue tag"),
             "tag {next} is live, so it needs a round-trip sample here: {detail}"
@@ -2044,12 +2006,10 @@ mod tests {
     fn decode_value_rejects_unknown_tag() {
         let mut cur = Cursor::new(&[99u8]);
         let err = decode_value(&mut cur).unwrap_err();
-        match err {
-            SpillError::Format { detail, .. } => {
-                assert!(detail.contains("unknown ColumnValue tag"), "{detail}");
-            }
-            other => panic!("expected Format, got {other:?}"),
-        }
+        assert_eq!(
+            err.to_string(),
+            "spill format at offset 1: unknown ColumnValue tag 99"
+        );
     }
 
     #[test]
@@ -2058,12 +2018,10 @@ mod tests {
         let buf = [20u8, 99u8];
         let mut cur = Cursor::new(&buf);
         let err = decode_value(&mut cur).unwrap_err();
-        match err {
-            SpillError::Format { detail, .. } => {
-                assert!(detail.contains("unknown NumericKind tag"), "{detail}");
-            }
-            other => panic!("expected Format, got {other:?}"),
-        }
+        assert_eq!(
+            err.to_string(),
+            "spill format at offset 2: unknown NumericKind tag 99"
+        );
     }
 
     #[test]
@@ -2073,12 +2031,10 @@ mod tests {
         buf.push(99u8);
         let mut cur = Cursor::new(&buf);
         let err = decode_heap(&mut cur).unwrap_err();
-        match err {
-            SpillError::Format { detail, .. } => {
-                assert!(detail.contains("unknown HeapOp tag"), "{detail}");
-            }
-            other => panic!("expected Format, got {other:?}"),
-        }
+        assert_eq!(
+            err.to_string(),
+            "spill format at offset 25: unknown HeapOp tag 99"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

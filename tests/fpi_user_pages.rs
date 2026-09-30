@@ -229,11 +229,15 @@ async fn user_page_images_never_reach_the_shadow() {
              DELETE FROM big WHERE id % 7 = 0;\n\
              CHECKPOINT;\n\
              VACUUM (FREEZE) big;\n\
-             VACUUM FULL big;\n\
-             SELECT pg_switch_wal();\n",
+             VACUUM FULL big;\n",
         )
         .expect("dirty hint bits and vacuum");
+    // Taken before the switch: the next record past it is background WAL,
+    // which can be a bgwriter snapshot interval away
     let target = wal_insert_lsn(&source);
+    source
+        .psql_one("SELECT pg_switch_wal()")
+        .expect("switch wal");
 
     let deadline = Instant::now() + Duration::from_secs(60);
     while census.max_next_lsn < target && Instant::now() < deadline {

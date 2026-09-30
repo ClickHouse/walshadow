@@ -216,10 +216,8 @@ mod tests {
         .expect("place");
         assert_eq!(routed, 1, "insert routed, delete dropped");
         assert_eq!(stats.deletes_discarded.load(Ordering::Relaxed), 1);
-        match msg_rx.recv().await {
-            Some(BatcherMsg::Rows(chunk)) => assert_eq!(chunk.rows.len(), 1),
-            other => panic!("expected one row chunk, got {}", other.is_some()),
-        }
+        let msg = msg_rx.recv().await;
+        assert!(matches!(msg, Some(BatcherMsg::Rows(c)) if c.rows.len() == 1));
 
         // Default policy keeps the marker, so the DELETE rides through
         let marked = route(SystemColumns::default());

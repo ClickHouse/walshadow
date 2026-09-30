@@ -419,6 +419,16 @@ mod tests {
         }
     }
 
+    /// Row the tuple helpers build: zero relname and relnamespace
+    fn decoded(oid: u32, relfilenode: u32) -> DecodeOutcome {
+        DecodeOutcome::Decoded(PgClassRow {
+            oid,
+            relname: [0; NAME_LEN],
+            relnamespace: 0,
+            relfilenode,
+        })
+    }
+
     /// Only `flags` matters to the decoder; other fields stay zero.
     fn xl_heap_update_main_data(flags: u8) -> Vec<u8> {
         let mut md = vec![0u8; SIZE_OF_HEAP_UPDATE];
@@ -430,12 +440,7 @@ mod tests {
     fn decodes_minimal_pg_class_insert() {
         let data = pg_class_insert_block(2615, 30000);
         let rec = record(RmId::Heap, HEAP_INSERT_OP, Vec::new(), data);
-        let row = match decode_pg_class_tuple(&rec, 0, MAGIC) {
-            DecodeOutcome::Decoded(r) => r,
-            other => panic!("expected Decoded, got {other:?}"),
-        };
-        assert_eq!(row.oid, 2615);
-        assert_eq!(row.relfilenode, 30000);
+        assert_eq!(decode_pg_class_tuple(&rec, 0, MAGIC), decoded(2615, 30000));
     }
 
     #[test]
@@ -453,12 +458,7 @@ mod tests {
         v.extend_from_slice(&[0u8; 20]); // cols 3-7
         v.extend_from_slice(&77777u32.to_le_bytes()); // relfilenode
         let rec = record(RmId::Heap, HEAP_INSERT_OP, Vec::new(), v);
-        let row = match decode_pg_class_tuple(&rec, 0, MAGIC) {
-            DecodeOutcome::Decoded(r) => r,
-            other => panic!("expected Decoded, got {other:?}"),
-        };
-        assert_eq!(row.oid, 1234);
-        assert_eq!(row.relfilenode, 77777);
+        assert_eq!(decode_pg_class_tuple(&rec, 0, MAGIC), decoded(1234, 77777));
     }
 
     #[test]
@@ -538,13 +538,7 @@ mod tests {
             xl_heap_update_main_data(0),
             data,
         );
-        match decode_pg_class_tuple(&rec, 0, MAGIC) {
-            DecodeOutcome::Decoded(r) => {
-                assert_eq!(r.oid, 2608);
-                assert_eq!(r.relfilenode, 40000);
-            }
-            other => panic!("expected Decoded, got {other:?}"),
-        }
+        assert_eq!(decode_pg_class_tuple(&rec, 0, MAGIC), decoded(2608, 40000));
     }
 
     #[test]
@@ -623,13 +617,7 @@ mod tests {
             xl_heap_update_main_data(XLH_UPDATE_SUFFIX_FROM_OLD),
             data,
         );
-        match decode_pg_class_tuple(&rec, 0, MAGIC) {
-            DecodeOutcome::Decoded(r) => {
-                assert_eq!(r.oid, 2608);
-                assert_eq!(r.relfilenode, 40000);
-            }
-            other => panic!("expected Decoded, got {other:?}"),
-        }
+        assert_eq!(decode_pg_class_tuple(&rec, 0, MAGIC), decoded(2608, 40000));
     }
 
     #[test]
@@ -733,10 +721,7 @@ mod tests {
     fn inplace_block_data_is_bare_columns() {
         let tail = pg_class_tuple_tail(2608, 40000, 0);
         let rec = record(RmId::Heap, HEAP_INPLACE_OP, vec![1, 0], tail[1..].to_vec());
-        let DecodeOutcome::Decoded(row) = decode_pg_class_tuple(&rec, 0, MAGIC) else {
-            panic!("inplace must decode");
-        };
-        assert_eq!((row.oid, row.relfilenode), (2608, 40000));
+        assert_eq!(decode_pg_class_tuple(&rec, 0, MAGIC), decoded(2608, 40000));
     }
 
     /// Page holding `rows` at offnums 1.., tuples with t_hoff 24
@@ -784,9 +769,6 @@ mod tests {
             info: 0,
         };
         block.image = std::borrow::Cow::Owned(page_with(&[(2608, 40000), (2615, 41000)]));
-        let DecodeOutcome::Decoded(row) = decode_pg_class_tuple(&rec, 0, MAGIC) else {
-            panic!("image must decode");
-        };
-        assert_eq!((row.oid, row.relfilenode), (2615, 41000));
+        assert_eq!(decode_pg_class_tuple(&rec, 0, MAGIC), decoded(2615, 41000));
     }
 }

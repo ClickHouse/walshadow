@@ -288,7 +288,7 @@ where
 }
 
 /// One tar entry through the sink. Factored so callers can drive
-/// non-tar-shaped FileMeta sequences (e.g. inline symlink emission).
+/// non-tar-shaped FileMeta sequences
 pub async fn pump_entry<R>(body: &mut R, meta: &FileMeta, target: &PumpTarget) -> io::Result<()>
 where
     R: AsyncRead + Unpin + ?Sized,
@@ -296,7 +296,7 @@ where
     match target.sink.begin(meta).await? {
         FileAction::Keep => write_kept(body, meta, &target.data_dir).await,
         FileAction::Skip => drain_to_void(body).await,
-        FileAction::Tap(entry) => stream_to_entry(body, meta, entry, &target.stats).await,
+        FileAction::Tap(entry) => stream_to_entry(body, entry, &target.stats).await,
     }
 }
 
@@ -316,17 +316,12 @@ where
 
 async fn stream_to_entry<R>(
     body: &mut R,
-    meta: &FileMeta,
     mut entry: Box<dyn EntrySink>,
     stats: &PumpStats,
 ) -> io::Result<()>
 where
     R: AsyncRead + Unpin + ?Sized,
 {
-    if !matches!(meta.kind, FileKind::File) {
-        drain_to_void(body).await?;
-        return entry.end().await;
-    }
     let mut buf = [0u8; 64 * 1024];
     loop {
         let n = body.read(&mut buf).await?;
@@ -398,35 +393,20 @@ where
     Ok(())
 }
 
-/// Materialize a non-default tablespace symlink and pump it through the
-/// sink. Both production impls get symlinks from inside the data-dir
-/// archive, so this is unused today, exposed for future LocalDir shapes.
-#[allow(dead_code)]
-pub(crate) async fn emit_tablespace_symlink(
-    tablespace: &Tablespace,
-    target: &PumpTarget,
-) -> io::Result<()> {
-    if tablespace.is_default() {
-        return Ok(());
-    }
-    let meta = FileMeta {
-        path: PathBuf::from(format!("pg_tblspc/{}", tablespace.oid)),
-        size: 0,
-        mode: 0o755,
-        kind: FileKind::Symlink {
-            target: PathBuf::from(&tablespace.location),
-        },
-        part: None,
-    };
-    let mut body = tokio::io::empty();
-    pump_entry(&mut body, &meta, target).await
-}
-
 #[cfg(test)]
 pub(crate) mod testing {
     //! Helpers reused across crate tests.
 
     use tokio::io::AsyncWriteExt;
+
+    use super::{EntrySink, FileAction};
+
+    #[track_caller]
+    pub fn expect_tap(action: FileAction) -> Box<dyn EntrySink> {
+        assert_eq!(format!("{action:?}"), "Tap");
+        let FileAction::Tap(e) = action else { panic!() };
+        e
+    }
 
     /// In-memory tar roughly mirroring PG's BASE_BACKUP layout: empty
     /// pg_replslot dir + denylist file inside, global/ catalog,
@@ -490,11 +470,9 @@ mod tests {
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub(crate) enum Event {
-        Start { start_lsn: u64, timeline: u32 },
         Begin { path: PathBuf, action: &'static str },
         Chunk { len: usize },
         End { path: PathBuf },
-        Finish { end_lsn: u64 },
     }
 
     /// Owned per-entry recorder, so the sink itself stays lock-free on the
@@ -526,13 +504,6 @@ mod tests {
 
     #[async_trait]
     impl BackupSink for Arc<RecordingSink> {
-        async fn start(&self, info: &StartInfo) -> io::Result<()> {
-            self.events.lock().unwrap().push(Event::Start {
-                start_lsn: info.start_lsn,
-                timeline: info.timeline,
-            });
-            Ok(())
-        }
         async fn begin(&self, meta: &FileMeta) -> io::Result<FileAction> {
             let s = meta.path.to_string_lossy();
             let action = if s.starts_with("pg_replslot/") {
@@ -564,12 +535,6 @@ mod tests {
                 });
             }
             Ok(action)
-        }
-        async fn finish(&self, info: &EndInfo) -> io::Result<()> {
-            self.events.lock().unwrap().push(Event::Finish {
-                end_lsn: info.end_lsn,
-            });
-            Ok(())
         }
     }
 
@@ -674,16 +639,13 @@ mod tests {
         assert!(!data_dir.join("base/5/16400").exists());
 
         let events = recording.events.lock().unwrap();
-        // Last file event must be pg_control end (contract 3)
-        let last_end = events
-            .iter()
-            .rev()
-            .find_map(|e| match e {
-                Event::End { path } => Some(path.clone()),
-                _ => None,
+        // Last event must be pg_control end (contract 3)
+        assert_eq!(
+            events.last(),
+            Some(&Event::End {
+                path: PathBuf::from("pg_control")
             })
-            .unwrap();
-        assert_eq!(last_end, PathBuf::from("pg_control"));
+        );
         // Tapped chunks sum to the file body length
         let tapped_bytes: usize = events
             .iter()

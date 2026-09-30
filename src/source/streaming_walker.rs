@@ -348,10 +348,7 @@ impl StreamingWalker {
                         page_magic: p.page_magic,
                     }));
                 }
-                if self.page_cursor >= page_end {
-                    self.advance_to_next_page();
-                    continue;
-                }
+                // Fresh page always fits rest of a 24-byte header
                 if take_now == 0 {
                     return None;
                 }

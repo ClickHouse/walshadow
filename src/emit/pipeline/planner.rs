@@ -479,9 +479,7 @@ mod tests {
             .await
             .unwrap()
             .expect("toast row slice");
-        let Err(err) = planner.plan_batch(second).await else {
-            panic!("expected detoast failure");
-        };
+        let err = planner.plan_batch(second).await.unwrap_err();
         assert!(matches!(err, PlanError::Detoast(_)), "{err}");
         drain.finish().await.unwrap();
         drop(planner);
@@ -517,25 +515,18 @@ mod tests {
         let mut planned = 0usize;
         // 1-row slices: valid fanout rows plan before the bad record folds
         let err = loop {
-            match drain.next_batch(1, usize::MAX, None).await {
-                Ok(Some(batch)) => {
-                    planned += batch.heaps.len();
-                    planner.plan_batch(batch).await.unwrap();
-                }
-                Ok(None) => panic!("expected fold failure before EOF"),
+            let batch = match drain.next_batch(1, usize::MAX, None).await {
+                Ok(batch) => batch.expect("fold failure before EOF"),
                 Err(e) => break e,
-            }
+            };
+            planned += batch.heaps.len();
+            planner.plan_batch(batch).await.unwrap();
         };
         assert!(planned >= 1, "earlier valid rows planned before failure");
+        let msg = err.to_string();
         assert!(
-            matches!(
-                &err,
-                XactBufferError::OrdinaryFailClosed {
-                    reason: FailClosedReason::ImageOnly,
-                    ..
-                }
-            ),
-            "{err}"
+            msg.ends_with("failed closed: image-only operation"),
+            "{msg}"
         );
         drop(planner);
         assert!(!path.exists(), "abandoned plan unlinks, nothing to execute");
@@ -583,10 +574,8 @@ mod tests {
         let mut rd = plan.replay().unwrap();
         let mut rows = 0usize;
         while let Some(item) = rd.next_item().unwrap() {
-            let PlanItem::Heap(h) = item else {
-                panic!("no controls planned");
-            };
-            assert!(h.route.is_some());
+            // No controls planned, every heap routed
+            assert!(matches!(item, PlanItem::Heap(h) if h.route.is_some()));
             rows += 1;
         }
         drop(rd);
@@ -746,19 +735,14 @@ mod tests {
             Planner::create(tmp.path().join("1.plan"), 1 << 20, &mut view, &resolver).unwrap();
         let mut drain = b.drain_committed(1, 42, 0x2000, &[], false).await.unwrap();
         while let Some(batch) = drain.next_batch(8, usize::MAX, None).await.unwrap() {
-            let is_final = batch.is_final;
             planner.plan_batch(batch).await.unwrap();
-            if is_final {
-                break;
-            }
         }
         drain.finish().await.unwrap();
         let plan = planner.seal(0x2000, 42).unwrap();
         assert_eq!(plan.heap_count, 1);
         let mut rd = plan.replay().unwrap();
-        let Some(PlanItem::Heap(h)) = rd.next_item().unwrap() else {
-            panic!("expected heap");
-        };
-        assert!(h.route.is_none(), "unmapped discard planned as such");
+        // Unmapped discard planned as such
+        let item = rd.next_item().unwrap();
+        assert!(matches!(item, Some(PlanItem::Heap(h)) if h.route.is_none()));
     }
 }

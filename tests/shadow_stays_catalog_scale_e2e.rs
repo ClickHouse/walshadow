@@ -296,10 +296,7 @@ async fn user_relation_never_materialises_on_the_shadow() {
         Ok(())
     })();
 
-    let _ = guard.into_inner().map(|mut c| {
-        let _ = c.kill();
-        let _ = c.wait();
-    });
+    drop(guard);
     if bootstrap_shadow_data_dir.join("postmaster.pid").exists() {
         let mut shadow_cfg =
             ShadowConfig::new(bootstrap_shadow_data_dir.clone(), shadow_filter_dir.clone());

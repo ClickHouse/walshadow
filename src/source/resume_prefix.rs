@@ -216,14 +216,9 @@ mod tests {
     /// Segment-start page whose first `remaining` bytes continue a record
     /// that began in the preceding segment
     fn page(lsn: u64, remaining: u32, seg_size: u64) -> Vec<u8> {
-        let contrecord = if remaining > 0 {
-            XLP_FIRST_IS_CONT_RECORD
-        } else {
-            0
-        };
         let mut bytes = vec![0; PAGE_SIZE];
         bytes[..2].copy_from_slice(&XLP_PAGE_MAGIC_PG15.to_le_bytes());
-        bytes[2..4].copy_from_slice(&(XLP_LONG_HEADER | contrecord).to_le_bytes());
+        bytes[2..4].copy_from_slice(&(XLP_LONG_HEADER | XLP_FIRST_IS_CONT_RECORD).to_le_bytes());
         bytes[4..8].copy_from_slice(&1u32.to_le_bytes());
         bytes[8..16].copy_from_slice(&lsn.to_le_bytes());
         bytes[XLP_REM_LEN..XLP_REM_LEN + 4].copy_from_slice(&remaining.to_le_bytes());

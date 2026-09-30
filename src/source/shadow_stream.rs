@@ -387,9 +387,6 @@ impl ShadowStreamState {
 
     /// Append contiguous wire bytes; a non-contiguous LSN re-anchors.
     fn retain_wire(&mut self, start_lsn: u64, bytes: &[u8]) {
-        if bytes.is_empty() {
-            return;
-        }
         let buf_end = self.wire_buf_start + self.wire_buf.len() as u64;
         if self.wire_buf.is_empty() || start_lsn != buf_end {
             self.wire_buf.clear();

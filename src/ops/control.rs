@@ -649,18 +649,6 @@ fn set_mode_600(path: &Path) -> Result<()> {
 mod tests {
     use super::*;
 
-    /// Scalar at `[section] key`, for asserting fragment edits
-    fn str_at(root: &Table, section: &str, key: &str) -> String {
-        root.get(section)
-            .and_then(Value::as_table)
-            .and_then(|t| t.get(key))
-            .map(|v| match v {
-                Value::String(s) => s.clone(),
-                other => other.to_string(),
-            })
-            .unwrap_or_default()
-    }
-
     fn cfg(toml: &str) -> Table {
         if toml.is_empty() {
             Table::new()
@@ -735,7 +723,7 @@ mod tests {
             "[source]\nhost = \"h\"\npassword = \"p\"\n[table.demo.a]\nreplicate = true\n[table.demo.b]\nreplicate = true\n",
         );
         apply_mask(&mut root, &cfg("[source]\npassword = \"\""));
-        assert_eq!(str_at(&root, "source", "host"), "h");
+        assert_eq!(root["source"]["host"].as_str(), Some("h"));
         assert!(root["source"].as_table().unwrap().get("password").is_none());
         apply_mask(&mut root, &cfg("[table.demo]\na = \"\"\nmissing = \"\""));
         let demo = root["table"].as_table().unwrap()["demo"]

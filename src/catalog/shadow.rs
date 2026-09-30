@@ -352,6 +352,7 @@ impl Shadow {
                 "--encoding=UTF8",
                 "--locale=C",
                 "--no-instructions",
+                "--no-sync",
             ],
         )?;
         Ok(())
@@ -431,7 +432,8 @@ impl Shadow {
              max_prepared_transactions = {max_prepared_transactions}\n\
              max_locks_per_transaction = {max_locks_per_transaction}\n\
              restore_command = 'cp {filter_dir}/%f %p'\n\
-             recovery_target_timeline = 'latest'\n",
+             recovery_target_timeline = 'latest'\n\
+             wal_retrieve_retry_interval = '100ms'\n",
             sock = self.config.socket_str(),
             port = self.config.port,
             max_connections = floor.max_connections,

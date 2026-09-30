@@ -608,13 +608,8 @@ async fn run_cycle(
         format_pg_lsn(ack),
     );
 
-    // 11. Drain restart daemon for the next cycle. `into_inner` strips
-    //     the guard so we drive the SIGKILL + reap explicitly — letting
-    //     the std::process::Child drop on its own would leak the
-    //     subprocess (Drop doesn't kill).
-    if let Some(c) = restart_guard.into_inner() {
-        kill_and_reap(c);
-    }
+    // 11. Drain restart daemon for the next cycle
+    drop(restart_guard);
 
     eprintln!("kill-restart: cycle ok strategy={strategy:?} run={run}");
     Ok(())

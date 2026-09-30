@@ -73,13 +73,7 @@ pub(crate) const PROMOTION_POLL: Duration = Duration::from_secs(1);
 /// Read the gate off `feed`'s sidecar SQL connection. Only meaningful while
 /// paused: `pause_received` is the frozen head the target has to reach, and an
 /// unfrozen one moves under the decision.
-pub(crate) async fn promotion_gate(
-    feed: &mut SourceFeed,
-    pause_frontier: Option<(u64, u64)>,
-) -> PromotionGate {
-    let Some((_, pause_received)) = pause_frontier else {
-        return PromotionGate::blocked("not_paused");
-    };
+pub(crate) async fn promotion_gate(feed: &mut SourceFeed, pause_received: u64) -> PromotionGate {
     let client = match feed.sql_client().await {
         Ok(c) => c,
         Err(e) => {
@@ -418,10 +412,8 @@ pub(crate) enum SourcePath {
 
 impl SourcePath {
     pub(crate) fn archive(&mut self) -> Option<&mut ArchiveFeed> {
-        match self {
-            Self::Archive(a) => Some(a),
-            _ => None,
-        }
+        let Self::Archive(a) = self else { return None };
+        Some(a)
     }
 }
 
@@ -674,12 +666,11 @@ mod tests {
         let floor = Monotone::new(Pos::new(0x6200_0000));
         let mut recovery = recovery(None, &floor);
         let history = TimelineHistory::root(1);
-        let Err(error) = recovery
+        let error = recovery
             .fall_back(removed_wal(), &history, 1, floor.get())
             .await
-        else {
-            panic!("removed WAL without archive must fail");
-        };
+            .err()
+            .unwrap();
         assert!(
             error
                 .to_string()

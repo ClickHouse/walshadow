@@ -620,21 +620,17 @@ mod tests {
         // Drop sender → final flush + graceful exit
         drop(msg_tx);
 
-        let (mut total, mut s0, mut s1) = (0u64, 0u64, 0u64);
+        let mut total = 0u64;
+        let mut per_seq = std::collections::BTreeMap::new();
         while let Ok(b) = batches_rx.recv().await {
             total += b.n_rows as u64;
             for (seq, n) in b.per_seq {
-                match seq {
-                    0 => s0 += n,
-                    1 => s1 += n,
-                    other => panic!("unexpected seq {other}"),
-                }
+                *per_seq.entry(seq).or_insert(0) += n;
             }
         }
         handle.await.expect("batcher task");
         assert_eq!(total, 5, "all rows sealed exactly once");
-        assert_eq!(s0, 3, "seq 0 rows");
-        assert_eq!(s1, 2, "seq 1 rows");
+        assert_eq!(per_seq, [(0, 3), (1, 2)].into(), "rows per seq");
         assert!(fatal.message().is_none(), "no fatal: {:?}", fatal.message());
     }
 
@@ -670,21 +666,17 @@ mod tests {
             .expect("send chunk");
         drop(msg_tx);
 
-        let (mut total, mut s0, mut s1) = (0u64, 0u64, 0u64);
+        let mut total = 0u64;
+        let mut per_seq = std::collections::BTreeMap::new();
         while let Ok(b) = batches_rx.recv().await {
             total += b.n_rows as u64;
             for (seq, n) in b.per_seq {
-                match seq {
-                    0 => s0 += n,
-                    1 => s1 += n,
-                    other => panic!("unexpected seq {other}"),
-                }
+                *per_seq.entry(seq).or_insert(0) += n;
             }
         }
         handle.await.expect("batcher task");
         assert_eq!(total, 5, "all rows sealed exactly once");
-        assert_eq!(s0, 3, "seq 0 rows");
-        assert_eq!(s1, 2, "seq 1 rows");
+        assert_eq!(per_seq, [(0, 3), (1, 2)].into(), "rows per seq");
         assert!(fatal.message().is_none(), "no fatal: {:?}", fatal.message());
     }
 
@@ -1055,10 +1047,10 @@ mod tests {
             .expect("send row");
         let batch = batches_rx.recv().await.expect("budget batch");
         assert_eq!(batch.n_rows, 1);
+        let elapsed = start.elapsed();
         assert!(
-            start.elapsed() < Duration::from_secs(1),
-            "byte budget sealed at {:?}, not the deadline",
-            start.elapsed()
+            elapsed < Duration::from_secs(1),
+            "byte budget sealed at {elapsed:?}, not the deadline"
         );
         drop(msg_tx);
         handle.await.expect("batcher task");

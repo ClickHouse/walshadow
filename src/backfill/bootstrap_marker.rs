@@ -133,10 +133,6 @@ impl BootstrapMarker {
             .context("bootstrap incomplete without a resolved backup pin; use operator recovery")
     }
 
-    pub fn pinned_backup_name(&self) -> Result<&str> {
-        self.pinned_backup()
-    }
-
     fn check_retry(&self) -> Result<()> {
         self.pinned_backup()?;
         anyhow::ensure!(

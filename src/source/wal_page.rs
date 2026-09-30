@@ -141,18 +141,14 @@ mod tests {
     #[test]
     fn short_header_valid_data_start_aligned() {
         let buf = header(XLP_PAGE_MAGIC_PG15, 0, 0);
-        match parse_page_header(&buf, 0).unwrap() {
+        assert_eq!(
+            parse_page_header(&buf, 0).unwrap(),
             PageHeaderParse::Valid {
-                magic, data_start, ..
-            } => {
-                assert_eq!(magic, XLP_PAGE_MAGIC_PG15);
-                assert_eq!(
-                    data_start,
-                    align_up(SHORT_HEADER_SIZE, X_LOG_RECORD_ALIGNMENT)
-                );
+                magic: XLP_PAGE_MAGIC_PG15,
+                data_start: align_up(SHORT_HEADER_SIZE, X_LOG_RECORD_ALIGNMENT),
+                remaining_data_len: 0,
             }
-            other => panic!("expected Valid, got {other:?}"),
-        }
+        );
     }
 
     #[test]

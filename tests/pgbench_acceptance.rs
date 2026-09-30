@@ -494,15 +494,14 @@ async fn run_ddl_intermix(
         // 14. Force a segment seal so the daemon's pump definitely
         //     reaches every committed row in WAL, then poll the daemon's
         //     `walshadow_emitter_ack_lsn` until it crosses source's
-        //     post-switch `pg_current_wal_lsn`. The switch also moves
-        //     source's insert pointer past its last standby snapshot,
-        //     so bgwriter logs another one within
-        //     `LOG_SNAPSHOT_INTERVAL_MS` — that record is what carries
-        //     the ack over the target. ChildGuard's Drop will SIGKILL
-        //     the daemon once assertions pass.
+        //     pre-switch insert position. The switch record starts there,
+        //     so it carries the ack over the target. A post-switch target
+        //     waits on bgwriter's next standby snapshot instead, up to
+        //     `LOG_SNAPSHOT_INTERVAL_MS`. ChildGuard's Drop stops the
+        //     daemon once assertions pass.
+        let target_lsn_text = psql_source(&source, "SELECT pg_current_wal_insert_lsn()::text")
+            .context("read source LSN")?;
         psql_source(&source, "SELECT pg_switch_wal()").context("pg_switch_wal")?;
-        let target_lsn_text =
-            psql_source(&source, "SELECT pg_current_wal_lsn()::text").context("read source LSN")?;
         let target_lsn =
             walshadow::pg::parse_pg_lsn(&target_lsn_text).context("parse source LSN")?;
         wait_for_metric_lsn(
@@ -592,12 +591,9 @@ async fn run_ddl_intermix(
         Ok(())
     })();
 
-    // Kill daemon before shadow so supervisor cannot restart it
+    // Stop daemon before shadow so supervisor cannot restart it
     // Stop any remaining postmaster before tempdir cleanup
-    let _ = guard.into_inner().map(|mut c| {
-        let _ = c.kill();
-        let _ = c.wait();
-    });
+    drop(guard);
     if bootstrap_shadow_data_dir.join("postmaster.pid").exists() {
         let mut shadow_cfg =
             ShadowConfig::new(bootstrap_shadow_data_dir.clone(), shadow_filter_dir.clone());

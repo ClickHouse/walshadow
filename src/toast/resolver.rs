@@ -161,10 +161,6 @@ pub struct ToastRow<B = Bytes> {
 }
 
 impl<B: From<Bytes>> ToastRow<B> {
-    pub fn from_chunk(c: &ToastChunk) -> Self {
-        Self::with_body(c, c.chunk_data.clone().into())
-    }
-
     pub fn tombstone(d: &ToastDelete) -> Self {
         Self {
             toast_relid: d.toast_relid,
@@ -377,15 +373,17 @@ impl ChunkAssembler {
     }
 }
 
-/// Durable TID-keyed chunk store
+/// Durable TID-keyed chunk store, read-only unless it overrides the writes
 #[async_trait]
 pub trait ChunkStore: Send + Sync {
     /// Whether backend accepts decoded chunk rows
     fn accepts_writes(&self) -> bool {
-        true
+        false
     }
     /// Replay emits byte-identical rows at equal key and version
-    async fn put(&self, rows: &[ToastRow]) -> Result<(), ChunkStoreError>;
+    async fn put(&self, _rows: &[ToastRow]) -> Result<(), ChunkStoreError> {
+        Err(ChunkStoreError::ReadOnly("put"))
+    }
     /// Assemble newest live row per sequence at `max_lsn` against each
     /// pointer's stored size (`va_extsize`) over one mirror's
     /// `(value_id, expected_size)` batch, results aligned with `values`.
@@ -416,17 +414,21 @@ pub trait ChunkStore: Send + Sync {
     ///
     /// Owner TRUNCATE orders destination wipe after replayed fills. DROP callers
     /// wait until persisted replay floor passes dropping commit
-    async fn truncate_mirror(&self, toast_relid: u32) -> Result<(), ChunkStoreError>;
+    async fn truncate_mirror(&self, _toast_relid: u32) -> Result<(), ChunkStoreError> {
+        Err(ChunkStoreError::ReadOnly("truncate_mirror"))
+    }
     /// Rewrite-generation residual deaths `O - B`: tombstone at `commit_lsn`
     /// every TID live as of `marker_lsn` (generation's `XLOG_SMGR_CREATE`)
     /// with no row past it. Caller puts the generation's births first.
     /// Missing mirror is a no-op: nothing lived
     async fn rewrite_barrier(
         &self,
-        toast_relid: u32,
-        marker_lsn: u64,
-        commit_lsn: u64,
-    ) -> Result<(), ChunkStoreError>;
+        _toast_relid: u32,
+        _marker_lsn: u64,
+        _commit_lsn: u64,
+    ) -> Result<(), ChunkStoreError> {
+        Err(ChunkStoreError::ReadOnly("rewrite_barrier"))
+    }
 }
 
 /// In-memory implementation of ClickHouse as-of algorithm
@@ -443,6 +445,10 @@ impl MemChunkStore {
 
 #[async_trait]
 impl ChunkStore for MemChunkStore {
+    fn accepts_writes(&self) -> bool {
+        true
+    }
+
     async fn put(&self, rows: &[ToastRow]) -> Result<(), ChunkStoreError> {
         let mut mirrors = self.mirrors.lock().unwrap();
         for r in rows {
@@ -706,7 +712,8 @@ impl ClickHouseChunkStore {
         let insert_timeout = self.dest.current().insert_timeout;
         state
             .client
-            .retry(
+            .retry_when(
+                |e| is_retryable(e) && !is_missing_mirror(e),
                 |mut client| async move {
                     let result = with_timeout(insert_timeout, async {
                         client.send_query(sql, None).await?;
@@ -902,6 +909,10 @@ fn read_value_block(
 
 #[async_trait]
 impl ChunkStore for ClickHouseChunkStore {
+    fn accepts_writes(&self) -> bool {
+        true
+    }
+
     async fn put(&self, rows: &[ToastRow]) -> Result<(), ChunkStoreError> {
         if rows.is_empty() {
             return Ok(());
@@ -1780,12 +1791,6 @@ mod tests {
 
         #[async_trait]
         impl ChunkStore for ReadOnly {
-            fn accepts_writes(&self) -> bool {
-                false
-            }
-            async fn put(&self, _rows: &[ToastRow]) -> Result<(), ChunkStoreError> {
-                Err(ChunkStoreError::ReadOnly("put"))
-            }
             async fn fetch_many(
                 &self,
                 relid: u32,
@@ -1793,17 +1798,6 @@ mod tests {
                 max_lsn: u64,
             ) -> Result<Vec<FetchedValue>, ChunkStoreError> {
                 self.0.fetch_many(relid, values, max_lsn).await
-            }
-            async fn truncate_mirror(&self, _relid: u32) -> Result<(), ChunkStoreError> {
-                Err(ChunkStoreError::ReadOnly("truncate_mirror"))
-            }
-            async fn rewrite_barrier(
-                &self,
-                _relid: u32,
-                _marker: u64,
-                _commit: u64,
-            ) -> Result<(), ChunkStoreError> {
-                Err(ChunkStoreError::ReadOnly("rewrite_barrier"))
             }
         }
 
@@ -1866,10 +1860,9 @@ mod tests {
 
         let shadow = EmitterConfig::from_toml_str("[toast]\nmode = \"shadow\"\n").unwrap();
         assert!(shadow.toast.mode.is_shadow());
-        let err = match ToastResolver::for_mode(fixed(shadow), stats(), None) {
-            Err(e) => e,
-            Ok(_) => panic!("shadow without a bridge must be a config error"),
-        };
+        let err = ToastResolver::for_mode(fixed(shadow), stats(), None)
+            .err()
+            .expect("shadow without a bridge must be a config error");
         assert!(err.contains("bridge"), "{err}");
 
         let disabled = EmitterConfig::from_toml_str(

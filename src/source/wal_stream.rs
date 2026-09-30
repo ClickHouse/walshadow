@@ -774,10 +774,8 @@ mod tests {
             .on_record(&rec)
             .await
             .expect_err("err propagates from inner sink");
-        match err {
-            SinkError::Other(msg) => assert!(msg.contains("synthetic fail")),
-            _ => panic!("expected SinkError::Other, got {err:?}"),
-        }
+        // `Io` renders with an "io: " prefix
+        assert_eq!(err.to_string(), "synthetic fail at #1");
         assert_eq!(log_before.lock().unwrap().len(), 2);
         assert_eq!(err_seen.load(Ordering::Relaxed), 2);
         assert_eq!(log_after.lock().unwrap().len(), 1);

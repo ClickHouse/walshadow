@@ -696,15 +696,7 @@ impl BackupSink for PageWalkSink {
                 .fetch_add(1, Ordering::Relaxed);
             return Ok(FileAction::Skip);
         }
-        let desc = self.catalog.get(f.db, f.filenode);
-        let is_toast = self.catalog.is_toast(f.db, f.filenode);
-        if is_toast {
-            self.stats
-                .toast_files_observed
-                .fetch_add(1, Ordering::Relaxed);
-        } else if desc.is_some() {
-            self.stats.files_walked.fetch_add(1, Ordering::Relaxed);
-        } else {
+        let Some(desc) = self.catalog.get(f.db, f.filenode) else {
             // Filenode absent from map: seed race (greenfield) or non-opted
             // rel (filtered backfill pass, where this is most files). Skip
             // drains body without page buffering; mux honours the decline
@@ -712,14 +704,15 @@ impl BackupSink for PageWalkSink {
                 .files_skipped_unknown_filenode
                 .fetch_add(1, Ordering::Relaxed);
             return Ok(FileAction::Skip);
-        }
-        let Some(desc) = desc else {
-            // TOAST heap whose descriptor the map lacks; count pages, no walk
-            return Ok(FileAction::Tap(Box::new(PageWalkEntry::counting(
-                f.segno.saturating_mul(RELSEG_BLOCKS),
-                self.stats.clone(),
-            ))));
         };
+        let is_toast = &*desc.rel_name.namespace == PG_TOAST_NS;
+        if is_toast {
+            self.stats
+                .toast_files_observed
+                .fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.stats.files_walked.fetch_add(1, Ordering::Relaxed);
+        }
         let lsn = self
             .lsn_overrides
             .get(&(desc.rfn.db_node, desc.rfn.rel_node))
@@ -789,20 +782,6 @@ pub struct PageWalkEntry {
 }
 
 impl PageWalkEntry {
-    /// Counts pages without decoding them
-    fn counting(block_no: u32, stats: Arc<PageWalkStats>) -> Self {
-        Self {
-            block_no,
-            slab: Vec::with_capacity(SLAB_BYTES + PAGE_BYTES),
-            spare: None,
-            walk: None,
-            out: Out::Captured(Arc::default()),
-            stats,
-            pending: None,
-            finished: None,
-        }
-    }
-
     /// Collect the in-flight walk: recover its slab and ship its tuples.
     /// Shipping here is what carries emitter backpressure back to the read
     async fn join_pending(&mut self) -> io::Result<()> {
@@ -1133,6 +1112,7 @@ mod tests {
     use super::*;
 
     use crate::backfill::backup_source::EndInfo;
+    use crate::backfill::backup_source::testing::expect_tap;
 
     fn ld(a: &AtomicU64) -> u64 {
         a.load(Ordering::Relaxed)
@@ -1140,10 +1120,7 @@ mod tests {
 
     /// `begin` must tap; hands back the owned entry sink
     async fn tap(sink: &PageWalkSink, meta: &FileMeta) -> Box<dyn EntrySink> {
-        match sink.begin(meta).await.unwrap() {
-            FileAction::Tap(e) => e,
-            other => panic!("expected Tap for {}, got {other:?}", meta.path.display()),
-        }
+        expect_tap(sink.begin(meta).await.unwrap())
     }
 
     fn heap_meta(path: &str) -> FileMeta {
@@ -1601,9 +1578,7 @@ mod tests {
             sink.begin(&part("base/5/16400.1")).await.unwrap(),
             FileAction::Skip
         ));
-        let FileAction::Tap(entry) = sink.begin(&part("base/5/16400")).await.unwrap() else {
-            panic!("an unrecorded heap file must tap");
-        };
+        let entry = expect_tap(sink.begin(&part("base/5/16400")).await.unwrap());
         assert!(
             barrier.pop_finished().await.is_none(),
             "nothing reports before its body ends"

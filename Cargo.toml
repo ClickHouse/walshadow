@@ -101,6 +101,8 @@ name = "spool_read"
 harness = false
 
 [dev-dependencies]
+# Pre-main tracing subscriber for tests
+ctor = "1.0.13"
 tempfile = "3"
 # Enable paused time for batch deadline tests
 tokio = { version = "1", features = ["test-util"] }

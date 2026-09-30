@@ -1250,26 +1250,17 @@ mod tests {
     async fn fake_worker(listener: UnixListener, script: Vec<Option<Vec<u8>>>) {
         let mut script = script.into_iter();
         loop {
-            let Ok((mut sock, _)) = listener.accept().await else {
-                return;
-            };
-            loop {
-                let mut hdr = [0u8; 4];
-                if sock.read_exact(&mut hdr).await.is_err() {
-                    break;
-                }
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut hdr = [0u8; 4];
+            while sock.read_exact(&mut hdr).await.is_ok() {
                 let mut body = vec![0u8; u32::from_be_bytes(hdr) as usize];
-                if sock.read_exact(&mut body).await.is_err() {
-                    break;
+                if sock.read_exact(&mut body).await.is_ok()
+                    && let Some(Some(resp)) = script.next()
+                    && sock.write_all(&frame(resp)).await.is_ok()
+                {
+                    continue;
                 }
-                match script.next() {
-                    Some(Some(resp)) => {
-                        if sock.write_all(&frame(resp)).await.is_err() {
-                            break;
-                        }
-                    }
-                    Some(None) | None => break,
-                }
+                break;
             }
         }
     }
@@ -1401,15 +1392,12 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            matches!(
-                err,
-                BridgeError::ReplayMismatch {
-                    expected: 0x4000,
-                    end: 0x5000,
-                    ..
-                }
-            ),
+            matches!(err, BridgeError::ReplayMismatch { .. }),
             "got {err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            "bridge replayed to 4000..5000, expected boundary 4000"
         );
         assert_eq!(bridge.stats.scan_replay_moved.load(Ordering::Relaxed), 1);
     }

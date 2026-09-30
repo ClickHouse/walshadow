@@ -508,11 +508,8 @@ mod tests {
 
     #[tokio::test]
     async fn archive_prefetch_drop_cancels_worker() {
-        let (tx, rx) = tokio::sync::mpsc::channel(1);
-        let task = tokio::spawn(async move {
-            let _tx = tx;
-            std::future::pending::<()>().await;
-        });
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        let task = tokio::spawn(std::future::pending::<()>());
         let abort = task.abort_handle();
         drop(ArchiveFeed {
             wait_nanos: AtomicU64::new(0),

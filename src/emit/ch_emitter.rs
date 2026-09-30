@@ -1455,16 +1455,6 @@ pub(crate) enum DecimalWidth {
 }
 
 impl DecimalWidth {
-    fn from_elem_size(size: usize) -> Option<Self> {
-        Some(match size {
-            4 => Self::D32,
-            8 => Self::D64,
-            16 => Self::D128,
-            32 => Self::D256,
-            _ => return None,
-        })
-    }
-
     fn bytes(self) -> usize {
         self as usize
     }
@@ -1738,36 +1728,6 @@ impl ColumnBuf {
         }
     }
 
-    fn append_null(&mut self) -> Result<(), EmitterError> {
-        match self {
-            Self::NullableFixed {
-                width,
-                null_map,
-                inner,
-            } => {
-                null_map.push(1);
-                inner.extend(std::iter::repeat_n(0u8, *width));
-                Ok(())
-            }
-            Self::NullableString {
-                offsets,
-                data,
-                null_map,
-                absent,
-            } => {
-                null_map.push(1);
-                data.extend_from_slice(absent);
-                offsets.push(data.len() as u64);
-                Ok(())
-            }
-            Self::Oracle(o) => {
-                o.push(OracleCell::Default);
-                Ok(())
-            }
-            _ => Err(unsupported("NULL for non-Nullable column")),
-        }
-    }
-
     /// Use CH type defaults for non-nullable columns, NULL otherwise
     fn append_default(&mut self) {
         match self {
@@ -1780,7 +1740,25 @@ impl ColumnBuf {
                 data.extend_from_slice(absent);
                 offsets.push(data.len() as u64);
             }
-            nullable => nullable.append_null().expect("nullable shape takes NULL"),
+            Self::NullableFixed {
+                width,
+                null_map,
+                inner,
+            } => {
+                null_map.push(1);
+                inner.extend(std::iter::repeat_n(0u8, *width));
+            }
+            Self::NullableString {
+                offsets,
+                data,
+                null_map,
+                absent,
+            } => {
+                null_map.push(1);
+                data.extend_from_slice(absent);
+                offsets.push(data.len() as u64);
+            }
+            Self::Oracle(o) => o.push(OracleCell::Default),
         }
     }
 
@@ -1969,11 +1947,9 @@ impl TableEncoder {
                 continue;
             }
             match value_of(col).map(|v| col_plan.non_finite.substitute(v)) {
-                // Absent / NULL coerces: Nullable target takes NULL,
-                // non-Nullable the type default. Covers key-only delete
-                // tombstones under non-FULL replica identity and NULL
-                // source values mapped onto non-Nullable columns
-                None | Some(ColumnValue::Null) => buf.append_default(),
+                // Absent coerces like NULL, covers key-only delete
+                // tombstones under non-FULL replica identity
+                None => buf.append_default(),
                 Some(v) => encode_value(buf, v, col_plan.decimal, col_plan.datetime64_scale)
                     .map_err(|e| name_column(e, &col.target_name))?,
             }
@@ -2054,28 +2030,25 @@ pub(crate) fn build_leaf(
     })
 }
 
-/// Borrow leaf from storage that outlives returned root
+/// Borrow leaf from storage that outlives returned root, `None` for oracle
+/// columns which carry no local wire shape
 pub(crate) fn build_root<'b>(
     buf: &'b ColumnBuf,
     leaf: Option<&'b ColumnBuilder<'b>>,
     n_rows: usize,
-) -> Result<ColumnBuilder<'b>, EmitterError> {
+) -> Result<Option<ColumnBuilder<'b>>, EmitterError> {
     let wrap = |null_map: &'b [u8]| -> Result<ColumnBuilder<'b>, EmitterError> {
         let leaf = leaf.ok_or_else(|| EmitterError::Type("nullable column without leaf".into()))?;
         Ok(leaf.nullable(null_map)?)
     };
-    Ok(match buf {
+    Ok(Some(match buf {
         ColumnBuf::Fixed { width, bytes } => ColumnBuilder::fixed(bytes, *width, n_rows)?,
         ColumnBuf::String { offsets, data, .. } => ColumnBuilder::string(offsets, data, n_rows)?,
         ColumnBuf::NullableFixed { null_map, .. } | ColumnBuf::NullableString { null_map, .. } => {
             wrap(null_map)?
         }
-        ColumnBuf::Oracle(_) => {
-            return Err(EmitterError::Type(
-                "oracle column has no local wire shape".into(),
-            ));
-        }
-    })
+        ColumnBuf::Oracle(_) => return Ok(None),
+    }))
 }
 
 fn push_fixed(buf: &mut ColumnBuf, le: &[u8]) -> Result<(), EmitterError> {
@@ -2086,15 +2059,16 @@ fn push_fixed(buf: &mut ColumnBuf, le: &[u8]) -> Result<(), EmitterError> {
 /// Peels one `Nullable` layer like [`ColumnBuf::new_for_ast`].
 fn decimal_wire_of(ast: &TypeAst) -> Option<DecimalWire> {
     let inner = types::strip_nullable(ast.view());
-    if !matches!(
-        inner.kind(),
-        Some(Kind::Decimal32 | Kind::Decimal64 | Kind::Decimal128 | Kind::Decimal256)
-    ) {
-        return None;
-    }
+    let width = match inner.kind()? {
+        Kind::Decimal32 => DecimalWidth::D32,
+        Kind::Decimal64 => DecimalWidth::D64,
+        Kind::Decimal128 => DecimalWidth::D128,
+        Kind::Decimal256 => DecimalWidth::D256,
+        _ => return None,
+    };
     Some(DecimalWire {
         scale: u8::try_from(inner.decimal_scale()).ok()?,
-        width: DecimalWidth::from_elem_size(inner.elem_size())?,
+        width,
     })
 }
 
@@ -2130,13 +2104,16 @@ fn override_wire(default: &TypeAst, over: &TypeAst) -> Option<Option<DecimalWire
         }
         return match wire_shape_of(over)? {
             (WireShape::Str, _) => Some(None),
-            (WireShape::Fixed(w), Kind::Int32 | Kind::Int64 | Kind::Int128 | Kind::Int256) => {
-                Some(Some(DecimalWire {
-                    scale: 0,
-                    width: DecimalWidth::from_elem_size(w)?,
-                }))
+            (WireShape::Fixed(_), kind) => {
+                let width = match kind {
+                    Kind::Int32 => DecimalWidth::D32,
+                    Kind::Int64 => DecimalWidth::D64,
+                    Kind::Int128 => DecimalWidth::D128,
+                    Kind::Int256 => DecimalWidth::D256,
+                    _ => return None,
+                };
+                Some(Some(DecimalWire { scale: 0, width }))
             }
-            _ => None,
         };
     }
     match (wire_shape_of(default)?.0, wire_shape_of(over)?.0) {
@@ -2352,7 +2329,11 @@ fn encode_value(
     timestamp_scale: i32,
 ) -> Result<(), EmitterError> {
     match v {
-        ColumnValue::Null => buf.append_null(),
+        // Non-Nullable target takes type default
+        ColumnValue::Null => {
+            buf.append_default();
+            Ok(())
+        }
         ColumnValue::Bool(b) => buf.append_fixed_bytes(&[*b as u8]),
         ColumnValue::Char(c) => buf.append_fixed_bytes(&c.to_le_bytes()),
         ColumnValue::Int2(n) => buf.append_fixed_bytes(&n.to_le_bytes()),
@@ -2592,6 +2573,75 @@ crate::atomic_stats! {
     }
 }
 
+/// Comparable view of a buffer's wire content
+#[cfg(test)]
+#[derive(Debug, PartialEq)]
+pub(crate) enum Wire<'a> {
+    Fixed {
+        width: usize,
+        bytes: &'a [u8],
+    },
+    String {
+        offsets: &'a [u64],
+        data: &'a [u8],
+        absent: &'a [u8],
+    },
+    NullableFixed {
+        width: usize,
+        null_map: &'a [u8],
+        inner: &'a [u8],
+    },
+    NullableString {
+        offsets: &'a [u64],
+        data: &'a [u8],
+        null_map: &'a [u8],
+        absent: &'a [u8],
+    },
+    Oracle(&'a [OracleCell]),
+}
+
+#[cfg(test)]
+impl ColumnBuf {
+    pub(crate) fn wire(&self) -> Wire<'_> {
+        match self {
+            Self::Fixed { width, bytes } => Wire::Fixed {
+                width: *width,
+                bytes,
+            },
+            Self::String {
+                offsets,
+                data,
+                absent,
+            } => Wire::String {
+                offsets,
+                data,
+                absent,
+            },
+            Self::NullableFixed {
+                width,
+                null_map,
+                inner,
+            } => Wire::NullableFixed {
+                width: *width,
+                null_map,
+                inner,
+            },
+            Self::NullableString {
+                offsets,
+                data,
+                null_map,
+                absent,
+            } => Wire::NullableString {
+                offsets,
+                data,
+                null_map,
+                absent,
+            },
+            Self::Oracle(o) => Wire::Oracle(o.cells()),
+        }
+    }
+}
+
 impl std::fmt::Debug for ColumnBuf {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -2783,10 +2833,8 @@ mod tests {
 
     #[test]
     fn decimal_type_error_wraps_message_in_type_variant() {
-        match decimal_type_error("scale out of range") {
-            EmitterError::Type(msg) => assert_eq!(msg, "scale out of range"),
-            other => panic!("expected Type, got {other:?}"),
-        }
+        let e = decimal_type_error("scale out of range");
+        assert_eq!(format!("{e:?}"), r#"Type("scale out of range")"#);
     }
 
     #[test]
@@ -2810,10 +2858,7 @@ mod tests {
     #[test]
     fn emitter_error_converts_into_decoder_observer_error() {
         let d: DecoderSinkError = EmitterError::Type("nope".into()).into();
-        match d {
-            DecoderSinkError::Observer(msg) => assert!(msg.contains("nope"), "{msg}"),
-            other => panic!("expected Observer, got {other:?}"),
-        }
+        assert_eq!(format!("{d:?}"), r#"Observer("type: nope")"#);
     }
 
     fn mk_mapping() -> TableMapping {
@@ -3013,13 +3058,15 @@ mod tests {
         let mut buf = OracleColumnBuf::string(0, -1);
         buf.push(OracleCell::Literal(b"a".to_vec()));
         buf.push(OracleCell::Default);
-        match literal_column(&buf, 2) {
-            Some(ColumnBuf::String { offsets, data, .. }) => {
-                assert_eq!(data, b"a");
-                assert_eq!(offsets, [1, 1]);
+        let lit = literal_column(&buf, 2).expect("renders");
+        assert_eq!(
+            lit.wire(),
+            Wire::String {
+                offsets: &[1, 1],
+                data: b"a",
+                absent: b"",
             }
-            other => panic!("got {other:?}"),
-        }
+        );
         for reject in ["Array(String)", "LowCardinality(String)", "JSON", "Int32"] {
             let mut buf = OracleColumnBuf::new(
                 0,
@@ -3102,34 +3149,38 @@ mod tests {
         );
         let (buffers, rows) = enc.take_block().unwrap();
         assert_eq!(rows, 2);
-        let ColumnBuf::Oracle(o) = &buffers[1] else {
-            panic!("oracle column")
-        };
-        assert!(literal_column(o, rows).is_some());
+        assert!(matches!(buffers[1].wire(), Wire::Oracle(cells) if cells.len() == 2));
+        let oracle = buffers.iter().find_map(|b| match b {
+            ColumnBuf::Oracle(o) => Some(o),
+            _ => None,
+        });
+        assert!(literal_column(oracle.expect("oracle column"), rows).is_some());
     }
 
     #[test]
     fn new_for_ast_picks_shape_from_chc_type_kind() {
         let alloc = Allocator::global(&mimalloc::MiMalloc);
         let cases = [
-            ("Int32", "Fixed"),
-            ("String", "String"),
-            ("Nullable(Int64)", "NullableFixed"),
-            ("Nullable(String)", "NullableString"),
-            ("FixedString(7)", "Fixed"),
-            ("Nullable(FixedString(7))", "NullableFixed"),
+            ("Int32", "Fixed { width: 4, bytes_len: 0 }"),
+            ("String", "String { rows: 0, data_len: 0 }"),
+            (
+                "Nullable(Int64)",
+                "NullableFixed { width: 8, rows: 0, inner_len: 0 }",
+            ),
+            (
+                "Nullable(String)",
+                "NullableString { rows: 0, offsets_len: 0, data_len: 0 }",
+            ),
+            ("FixedString(7)", "Fixed { width: 7, bytes_len: 0 }"),
+            (
+                "Nullable(FixedString(7))",
+                "NullableFixed { width: 7, rows: 0, inner_len: 0 }",
+            ),
         ];
-        for (name, tag) in cases {
+        for (name, shape) in cases {
             let ast = TypeAst::parse(name, alloc).expect("parses");
             let buf = ColumnBuf::new_for_ast(&ast).expect("shape");
-            let actual = match buf {
-                ColumnBuf::Fixed { .. } => "Fixed",
-                ColumnBuf::String { .. } => "String",
-                ColumnBuf::NullableFixed { .. } => "NullableFixed",
-                ColumnBuf::NullableString { .. } => "NullableString",
-                ColumnBuf::Oracle(_) => "Oracle",
-            };
-            assert_eq!(actual, tag, "{name}");
+            assert_eq!(format!("{buf:?}"), shape, "{name}");
         }
     }
 
@@ -3199,13 +3250,13 @@ mod tests {
             6,
         )
         .unwrap();
-        match &buf {
-            ColumnBuf::Fixed { width, bytes } => {
-                assert_eq!(*width, 8);
-                assert_eq!(bytes.as_slice(), &150i64.to_le_bytes());
+        assert_eq!(
+            buf.wire(),
+            Wire::Fixed {
+                width: 8,
+                bytes: &150i64.to_le_bytes(),
             }
-            _ => panic!("expected fixed-shape buffer"),
-        }
+        );
         let mut buf_nan = ColumnBuf::new_for_ast(&ast).unwrap();
         assert!(
             encode_value(
@@ -3227,31 +3278,35 @@ mod tests {
             })
         );
         let mut wide_buf = ColumnBuf::new_for_ast(&wide_ast).unwrap();
+        let wide_text = "123456789012345678901234567890123456789012345678.12";
         encode_value(
             &mut wide_buf,
-            &ColumnValue::Numeric(NumericKind::Finite(
-                "123456789012345678901234567890123456789012345678.12".into(),
-            )),
+            &ColumnValue::Numeric(NumericKind::Finite(wide_text.into())),
             wide_decimal,
             6,
         )
         .unwrap();
-        match &wide_buf {
-            ColumnBuf::Fixed { width, bytes } => {
-                assert_eq!(*width, 32);
-                assert_eq!(bytes.len(), 32);
-                assert!(bytes[16..32].iter().any(|b| *b != 0));
+        let wide_le = decimal_text_to_scaled_le(wide_text, 2, DecimalWidth::D256).unwrap();
+        assert!(wide_le[16..32].iter().any(|b| *b != 0));
+        assert_eq!(
+            wide_buf.wire(),
+            Wire::Fixed {
+                width: 32,
+                bytes: &wide_le,
             }
-            _ => panic!("expected fixed-shape buffer"),
-        }
+        );
 
         let sast = TypeAst::parse("String", alloc).unwrap();
         let mut sbuf = ColumnBuf::new_for_ast(&sast).unwrap();
         encode_value(&mut sbuf, &ColumnValue::Numeric(NumericKind::NaN), None, 6).unwrap();
-        match &sbuf {
-            ColumnBuf::String { data, .. } => assert_eq!(data.as_slice(), b"NaN"),
-            _ => panic!("expected string-shape buffer"),
-        }
+        assert_eq!(
+            sbuf.wire(),
+            Wire::String {
+                offsets: &[3],
+                data: b"NaN",
+                absent: b"",
+            }
+        );
     }
 
     #[test]
@@ -3261,13 +3316,13 @@ mod tests {
         let ast = TypeAst::parse("Time64(6)", alloc).unwrap();
         let mut buf = ColumnBuf::new_for_ast(&ast).unwrap();
         encode_value(&mut buf, &ColumnValue::Time(micros), None, 6).unwrap();
-        match &buf {
-            ColumnBuf::Fixed { width, bytes } => {
-                assert_eq!(*width, 8);
-                assert_eq!(bytes.as_slice(), &micros.to_le_bytes());
+        assert_eq!(
+            buf.wire(),
+            Wire::Fixed {
+                width: 8,
+                bytes: &micros.to_le_bytes(),
             }
-            _ => panic!("expected fixed-shape buffer"),
-        }
+        );
         let sast = TypeAst::parse("String", alloc).unwrap();
         let mut sbuf = ColumnBuf::new_for_ast(&sast).unwrap();
         encode_value(
@@ -3280,10 +3335,14 @@ mod tests {
             6,
         )
         .unwrap();
-        match &sbuf {
-            ColumnBuf::String { data, .. } => assert_eq!(data.as_slice(), b"12:34:56+02"),
-            _ => panic!("expected string-shape buffer"),
-        }
+        assert_eq!(
+            sbuf.wire(),
+            Wire::String {
+                offsets: &[11],
+                data: b"12:34:56+02",
+                absent: b"",
+            }
+        );
     }
 
     #[test]
@@ -3503,14 +3562,15 @@ mod tests {
                     let result = encoder.append_row(&row, &mapping, OP_INSERT);
                     if substitute {
                         result.unwrap();
-                        let ColumnBuf::NullableFixed {
-                            null_map, inner, ..
-                        } = &encoder.buffers[0]
-                        else {
-                            panic!("nullable temporal buffer")
-                        };
-                        assert_eq!(null_map, &[1]);
-                        assert!(inner.iter().all(|b| *b == 0));
+                        let width = rel.attributes[0].type_len as usize;
+                        assert_eq!(
+                            encoder.buffers[0].wire(),
+                            Wire::NullableFixed {
+                                width,
+                                null_map: &[1],
+                                inner: &vec![0; width],
+                            }
+                        );
                     } else {
                         let err = result.unwrap_err().to_string();
                         assert!(
@@ -3549,18 +3609,18 @@ mod tests {
                 ));
                 encoder.append_row(&row, &mapping, OP_INSERT).unwrap();
             }
-            let ColumnBuf::NullableFixed {
-                null_map, inner, ..
-            } = &encoder.buffers[0]
-            else {
-                panic!("nullable timestamp buffer")
-            };
-            assert_eq!(null_map, &[0, 0, 0]);
             let expected: Vec<u8> = [-1i64, 0, 946_684_800]
                 .into_iter()
                 .flat_map(|s| (s * 10i64.pow(scale)).to_le_bytes())
                 .collect();
-            assert_eq!(inner, &expected);
+            assert_eq!(
+                encoder.buffers[0].wire(),
+                Wire::NullableFixed {
+                    width: 8,
+                    null_map: &[0, 0, 0],
+                    inner: &expected,
+                }
+            );
         }
         for us in [-1001, -1, 1, 1001] {
             let err = timestamp_ticks(us - DATETIME64_PG_EPOCH_US, 3).unwrap_err();
@@ -3665,10 +3725,13 @@ mod tests {
         );
         let mut enc = TableEncoder::new(plan).unwrap();
         enc.append_row(&row, &m, OP_INSERT).unwrap();
-        let ColumnBuf::Fixed { bytes, .. } = &enc.buffers[0] else {
-            panic!("fixed-shape buffer")
-        };
-        assert_eq!(bytes.as_slice(), &0i64.to_le_bytes());
+        assert_eq!(
+            enc.buffers[0].wire(),
+            Wire::Fixed {
+                width: 8,
+                bytes: &0i64.to_le_bytes(),
+            }
+        );
     }
 
     #[test]
@@ -3725,13 +3788,13 @@ mod tests {
             .unwrap();
         // _is_deleted is the trailing buffer: 0 for insert, 1 for delete
         let last = enc.buffers.len() - 1;
-        match &enc.buffers[last] {
-            ColumnBuf::Fixed { bytes, width } => {
-                assert_eq!(*width, 1);
-                assert_eq!(bytes, &[0u8, 1]);
+        assert_eq!(
+            enc.buffers[last].wire(),
+            Wire::Fixed {
+                width: 1,
+                bytes: &[0, 1],
             }
-            other => panic!("_is_deleted expected Fixed(1), got {other:?}"),
-        }
+        );
     }
 
     #[test]
@@ -3758,24 +3821,22 @@ mod tests {
                 Some(ColumnValue::Json(r#"{"a": 1}"#.into()));
             enc.append_row(&doc, &m, OP_INSERT).unwrap();
             enc.append_row(&committed(2, None), &m, OP_INSERT).unwrap();
-            match &enc.buffers[1] {
-                ColumnBuf::String {
+            let (offsets, data, absent) = (&[8, 10][..], &br#"{"a": 1}{}"#[..], &b"{}"[..]);
+            let expected = if target == "JSON" {
+                Wire::String {
                     offsets,
                     data,
                     absent,
                 }
-                | ColumnBuf::NullableString {
+            } else {
+                Wire::NullableString {
                     offsets,
                     data,
+                    null_map: &[0, 1],
                     absent,
-                    ..
-                } => {
-                    assert_eq!(*absent, b"{}", "{target}");
-                    assert_eq!(data.as_slice(), br#"{"a": 1}{}"#, "{target}");
-                    assert_eq!(offsets, &[8, 10], "{target}");
                 }
-                other => panic!("{target} took no local shape: {other:?}"),
-            }
+            };
+            assert_eq!(enc.buffers[1].wire(), expected, "{target}");
         }
     }
 
@@ -3867,13 +3928,14 @@ mod tests {
         enc.append_row(&committed_delete(3), &m, OP_DELETE).unwrap();
         // Insert: genuine NULL mapped onto the non-Nullable column
         enc.append_row(&committed(4, None), &m, OP_INSERT).unwrap();
-        match &enc.buffers[1] {
-            ColumnBuf::String { offsets, data, .. } => {
-                assert_eq!(offsets, &[0u64, 0]);
-                assert!(data.is_empty());
+        assert_eq!(
+            enc.buffers[1].wire(),
+            Wire::String {
+                offsets: &[0, 0],
+                data: b"",
+                absent: b"",
             }
-            other => panic!("name expected String, got {other:?}"),
-        }
+        );
     }
 
     #[test]
@@ -3891,10 +3953,15 @@ mod tests {
         .expect("plan builds");
         let mut enc = TableEncoder::new(plan).unwrap();
         enc.append_row(&committed_delete(3), &m, OP_DELETE).unwrap();
-        match &enc.buffers[1] {
-            ColumnBuf::NullableString { null_map, .. } => assert_eq!(null_map, &[1u8]),
-            other => panic!("name expected NullableString, got {other:?}"),
-        }
+        assert_eq!(
+            enc.buffers[1].wire(),
+            Wire::NullableString {
+                offsets: &[0],
+                data: b"",
+                null_map: &[1],
+                absent: b"",
+            }
+        );
     }
 
     #[test]
@@ -3917,44 +3984,39 @@ mod tests {
         enc.append_row(&committed(9, Some("nine")), &m, OP_INSERT)
             .unwrap();
         assert_eq!(enc.rows, 3);
-        match &enc.buffers[0] {
-            ColumnBuf::Fixed { bytes, width } => {
-                assert_eq!(*width, 4);
-                assert_eq!(bytes.len(), 12);
-                assert_eq!(&bytes[0..4], &7i32.to_le_bytes());
-                assert_eq!(&bytes[4..8], &8i32.to_le_bytes());
-                assert_eq!(&bytes[8..12], &9i32.to_le_bytes());
+        let ids: Vec<u8> = [7i32, 8, 9].iter().flat_map(|n| n.to_le_bytes()).collect();
+        assert_eq!(
+            enc.buffers[0].wire(),
+            Wire::Fixed {
+                width: 4,
+                bytes: &ids,
             }
-            other => panic!("col 0 expected Fixed, got {other:?} variant tag"),
-        }
-        match &enc.buffers[1] {
-            ColumnBuf::NullableString {
-                offsets,
-                data,
-                null_map,
-                ..
-            } => {
-                assert_eq!(null_map, &[0u8, 1, 0]);
-                assert_eq!(offsets, &[5u64, 5, 9]);
-                assert_eq!(&data[..], b"sevennine");
+        );
+        assert_eq!(
+            enc.buffers[1].wire(),
+            Wire::NullableString {
+                offsets: &[5, 5, 9],
+                data: b"sevennine",
+                null_map: &[0, 1, 0],
+                absent: b"",
             }
-            other => panic!("col 1 expected NullableString, got {other:?} variant tag"),
-        }
+        );
         let off = m.columns.len();
-        match &enc.buffers[off] {
-            ColumnBuf::Fixed { bytes, .. } => {
-                assert_eq!(bytes.len(), 24);
-                assert_eq!(&bytes[0..8], &0xCAFEu64.to_le_bytes());
+        let lsns = 0xCAFEu64.to_le_bytes().repeat(3);
+        assert_eq!(
+            enc.buffers[off].wire(),
+            Wire::Fixed {
+                width: 8,
+                bytes: &lsns,
             }
-            other => panic!("_lsn expected Fixed, got {other:?} variant tag"),
-        }
-        match &enc.buffers[off + 3] {
-            ColumnBuf::Fixed { bytes, width } => {
-                assert_eq!(*width, 1);
-                assert_eq!(bytes, &[0u8, 0, 0]);
+        );
+        assert_eq!(
+            enc.buffers[off + 3].wire(),
+            Wire::Fixed {
+                width: 1,
+                bytes: &[0, 0, 0],
             }
-            _ => panic!("_is_deleted expected Fixed"),
-        }
+        );
     }
 
     #[test]
@@ -4706,8 +4768,8 @@ mod tests {
 
     #[test]
     fn config_backup_s3_static_creds() {
-        use walrus::config::StorageSettings;
-        use walrus::storage::s3::CredentialSource;
+        use walrus::config::StorageSettings::S3;
+        use walrus::storage::s3::CredentialSource::Static;
         let c = EmitterConfig::from_toml_str(
             "[backup]\n\
              archive = \"s3://my-bucket/walshadow/prefix\"\n\
@@ -4718,33 +4780,25 @@ mod tests {
              secret_key = \"SK\"\n",
         )
         .unwrap();
-        let s3 = match c.backup.expect("backup set").storage {
-            StorageSettings::S3(s3) => s3,
-            other => panic!("expected S3, got {other:?}"),
-        };
+        let storage = c.backup.expect("backup set").storage;
+        let S3(s3) = storage else { panic!() };
         assert_eq!(s3.bucket, "my-bucket");
         assert_eq!(s3.prefix, "walshadow/prefix");
         assert_eq!(s3.region, "eu-west-1");
         assert_eq!(s3.endpoint.as_deref(), Some("https://minio.internal"));
         assert!(s3.force_path_style);
-        match s3.creds {
-            CredentialSource::Static(cr) => {
-                assert_eq!(cr.access_key, "AK");
-                assert_eq!(cr.secret_key, "SK");
-            }
-            other => panic!("expected static creds, got {other:?}"),
-        }
+        let Static(cr) = s3.creds else { panic!() };
+        assert_eq!(cr.access_key, "AK");
+        assert_eq!(cr.secret_key, "SK");
     }
 
     #[test]
     fn config_backup_s3_defaults_region_and_imds() {
-        use walrus::config::StorageSettings;
+        use walrus::config::StorageSettings::S3;
         use walrus::storage::s3::CredentialSource;
         let c = EmitterConfig::from_toml_str("[backup]\narchive = \"s3://b\"\n").unwrap();
-        let s3 = match c.backup.unwrap().storage {
-            StorageSettings::S3(s3) => s3,
-            other => panic!("expected S3, got {other:?}"),
-        };
+        let storage = c.backup.unwrap().storage;
+        let S3(s3) = storage else { panic!() };
         assert_eq!(s3.bucket, "b");
         assert_eq!(s3.prefix, "");
         assert_eq!(s3.region, "us-east-1");
@@ -4753,21 +4807,17 @@ mod tests {
 
     #[test]
     fn config_backup_gcs_and_file() {
-        use walrus::config::StorageSettings;
+        use walrus::config::StorageSettings::{self, Gcs};
         let gcs = EmitterConfig::from_toml_str(
             "[backup]\narchive = \"gs://gb/pre\"\ncredentials_path = \"/sa.json\"\n",
         )
         .unwrap()
         .backup
         .unwrap();
-        match gcs.storage {
-            StorageSettings::Gcs(g) => {
-                assert_eq!(g.bucket, "gb");
-                assert_eq!(g.prefix, "pre");
-                assert_eq!(g.credentials_path.as_deref(), Some("/sa.json"));
-            }
-            other => panic!("expected GCS, got {other:?}"),
-        }
+        let Gcs(g) = gcs.storage else { panic!() };
+        assert_eq!(g.bucket, "gb");
+        assert_eq!(g.prefix, "pre");
+        assert_eq!(g.credentials_path.as_deref(), Some("/sa.json"));
         let fs = EmitterConfig::from_toml_str("[backup]\narchive = \"file:///var/wal\"\n")
             .unwrap()
             .backup

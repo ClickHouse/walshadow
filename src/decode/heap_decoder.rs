@@ -416,9 +416,6 @@ pub fn decode_heap_record(
     rel: &RelDescriptor,
 ) -> Result<DecodedHeaps, DecodeError> {
     let rm = record.header.resource_manager_id;
-    if rm != RmId::Heap as u8 && rm != RmId::Heap2 as u8 {
-        return Ok(SmallVec::new());
-    }
     let info_op = record.header.info & XLOG_HEAP_OPMASK;
     let rfn = record
         .blocks
@@ -427,25 +424,24 @@ pub fn decode_heap_record(
         .unwrap_or_default();
     let xid = record.header.xact_id;
 
-    if rm == RmId::Heap as u8 {
-        match info_op {
-            XLOG_HEAP_INSERT => Ok(smallvec![decode_insert(record, source_lsn, rfn, xid, rel)?]),
-            XLOG_HEAP_UPDATE => Ok(smallvec![decode_update(
-                record, source_lsn, rfn, xid, rel, false,
-            )?]),
-            XLOG_HEAP_HOT_UPDATE => Ok(smallvec![decode_update(
-                record, source_lsn, rfn, xid, rel, true,
-            )?]),
-            XLOG_HEAP_DELETE => Ok(smallvec![
-                decode_delete(record, source_lsn, rfn, xid, rel,)?
-            ]),
-            _ => Ok(SmallVec::new()),
-        }
-    } else {
-        match info_op {
-            XLOG_HEAP2_MULTI_INSERT => decode_multi_insert(record, source_lsn, rfn, xid, rel),
-            _ => Ok(SmallVec::new()),
-        }
+    if rm == RmId::Heap2 as u8 && info_op == XLOG_HEAP2_MULTI_INSERT {
+        return decode_multi_insert(record, source_lsn, rfn, xid, rel);
+    }
+    if rm != RmId::Heap as u8 {
+        return Ok(SmallVec::new());
+    }
+    match info_op {
+        XLOG_HEAP_INSERT => Ok(smallvec![decode_insert(record, source_lsn, rfn, xid, rel)?]),
+        XLOG_HEAP_UPDATE => Ok(smallvec![decode_update(
+            record, source_lsn, rfn, xid, rel, false,
+        )?]),
+        XLOG_HEAP_HOT_UPDATE => Ok(smallvec![decode_update(
+            record, source_lsn, rfn, xid, rel, true,
+        )?]),
+        XLOG_HEAP_DELETE => Ok(smallvec![
+            decode_delete(record, source_lsn, rfn, xid, rel,)?
+        ]),
+        _ => Ok(SmallVec::new()),
     }
 }
 
@@ -990,10 +986,10 @@ fn decoded_size_or_skip(att: &RelAttr) -> Option<usize> {
 /// we can't peek to detect a short varlena header (`att_align_pointer`).
 fn align_for(cur: usize, attalign: char) -> usize {
     match attalign {
-        'c' => cur,
         's' => align_up(cur, 2),
         'i' => align_up(cur, 4),
         'd' => align_up(cur, 8),
+        // TYPALIGN_CHAR, unknown: no-align rather than panic
         _ => cur,
     }
 }
@@ -1022,11 +1018,10 @@ fn att_align_nominal(
         return cur_offset;
     }
     match attalign {
-        'c' => cur_offset,              // TYPALIGN_CHAR
         's' => align_up(cur_offset, 2), // TYPALIGN_SHORT
         'i' => align_up(cur_offset, 4), // TYPALIGN_INT
         'd' => align_up(cur_offset, 8), // TYPALIGN_DOUBLE
-        _ => cur_offset,                // unknown: no-align rather than panic
+        _ => cur_offset,                // TYPALIGN_CHAR, unknown: no-align
     }
 }
 
@@ -1425,11 +1420,8 @@ pub(crate) fn take_toast_chunk_columns(
     let &ColumnValue::Int4(chunk_seq) = cols[1].as_ref()? else {
         return None;
     };
-    let chunk_data = match cols[2].take()? {
-        ColumnValue::Bytea(b) => b,
-        // Text-typed toast chunk: re-encode to bytes (not a normal flow)
-        ColumnValue::Text(s) => s.into_bytes(),
-        _ => return None,
+    let ColumnValue::Bytea(chunk_data) = cols[2].take()? else {
+        return None;
     };
     Some((chunk_id, chunk_seq as u32, chunk_data))
 }
@@ -1626,12 +1618,11 @@ mod tests {
         assert_eq!(v, ColumnValue::Text("cd".into()));
         assert_eq!(n, 3);
         // no terminator before buffer end
-        match decode_cstring(b"hello", 0) {
-            Err(DecodeError::Truncated { offset, need, have }) => {
-                assert_eq!((offset, need, have), (0, 1, 0));
-            }
-            other => panic!("expected Truncated, got {other:?}"),
-        }
+        let err = decode_cstring(b"hello", 0).unwrap_err();
+        assert_eq!(
+            format!("{err:?}"),
+            "Truncated { offset: 0, need: 1, have: 0 }"
+        );
     }
 
     #[test]
@@ -1944,15 +1935,15 @@ mod tests {
         let rec = record_with(RmId::Heap, XLOG_HEAP_INSERT, main_data, payload);
         let out = decode_heap_record(&rec, 0, &rel).unwrap().remove(0);
         let new = out.new.unwrap();
-        match &new.columns[0] {
-            Some(ColumnValue::ExternalToast(p)) => {
-                assert_eq!(p.va_rawsize, 12345);
-                assert_eq!(p.va_extinfo, 678);
-                assert_eq!(p.va_valueid, 12);
-                assert_eq!(p.va_toastrelid, 99);
-            }
-            other => panic!("expected ExternalToast, got {other:?}"),
-        }
+        assert_eq!(
+            new.columns[0],
+            Some(ColumnValue::ExternalToast(ToastPointer {
+                va_rawsize: 12345,
+                va_extinfo: 678,
+                va_valueid: 12,
+                va_toastrelid: 99,
+            }))
+        );
     }
 
     #[test]
@@ -1971,13 +1962,13 @@ mod tests {
         let rec = record_with(RmId::Heap, XLOG_HEAP_INSERT, main_data, payload);
         let out = decode_heap_record(&rec, 0, &rel).unwrap().remove(0);
         let new = out.new.unwrap();
-        match &new.columns[0] {
-            Some(ColumnValue::PgPending { type_oid, raw }) => {
-                assert_eq!(*type_oid, TSVECTOROID);
-                assert_eq!(raw.as_slice(), body);
-            }
-            other => panic!("expected PgPending, got {other:?}"),
-        }
+        assert_eq!(
+            new.columns[0],
+            Some(ColumnValue::PgPending {
+                type_oid: TSVECTOROID,
+                raw: body.to_vec(),
+            })
+        );
     }
 
     #[test]
@@ -2180,13 +2171,14 @@ mod tests {
             TSVECTOROID,
             &short_varlena(&body),
         )));
-        match missing_value_for(&a) {
-            ColumnValue::PgPending { type_oid, raw } => {
-                assert_eq!(type_oid, TSVECTOROID);
-                assert_eq!(raw, body);
+        // Tier-3 fast default stays pending
+        assert_eq!(
+            missing_value_for(&a),
+            ColumnValue::PgPending {
+                type_oid: TSVECTOROID,
+                raw: body.to_vec(),
             }
-            other => panic!("tier-3 fast default must stay pending, got {other:?}"),
-        }
+        );
     }
 
     #[test]
