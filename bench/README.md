@@ -22,6 +22,14 @@ Results include page cache and codec costs; they do not measure sustained device
 bandwidth or PostgreSQL-to-ClickHouse lag. Buffer peak reports post-admission
 payload estimates; use process RSS to measure allocator and I/O buffer overhead.
 
+## Spool replay
+
+Bootstrap deferred spool and emit plan spool, write then verified replay:
+
+```sh
+cargo bench --bench spool_read -- --rows 200000 --payload-bytes 256
+```
+
 ## Local runs
 
 Start PostgreSQL, ClickHouse, and walshadow with SQL runtime config installed

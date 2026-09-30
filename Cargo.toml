@@ -96,6 +96,10 @@ harness = false
 name = "xact_spill"
 harness = false
 
+[[bench]]
+name = "spool_read"
+harness = false
+
 [dev-dependencies]
 tempfile = "3"
 # Enable paused time for batch deadline tests
