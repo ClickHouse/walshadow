@@ -420,8 +420,11 @@ pub fn wait_for_ch_value(ch: &ChServer, sql: &str, want: &str, timeout: Duration
 /// with the daemon's log attached.
 pub fn finish_daemon(guard: ChildGuard, daemon: &DaemonRun, result: Result<()>) {
     if let Some(mut child) = guard.into_inner() {
-        let _ = child.kill();
-        let _ = child.wait();
+        // SIGINT drains and exits, so instrumented builds write their profile
+        let _ = Command::new("kill")
+            .args(["-INT", &child.id().to_string()])
+            .status();
+        let _ = wait_with_timeout(&mut child, Duration::from_secs(15));
     }
     daemon.stop_shadow();
     if let Err(e) = result {
@@ -523,6 +526,9 @@ pub fn append_source_conf(sh: &Shadow) -> Result<()> {
     writeln!(f, "\n# walshadow bootstrap-CH source overrides")?;
     writeln!(f, "wal_level = logical")?;
     writeln!(f, "max_wal_senders = 8")?;
+    // Slotless source: BASE_BACKUP's checkpoint would otherwise recycle the
+    // segment the live window leg starts reading from
+    writeln!(f, "wal_keep_size = '256MB'")?;
     Ok(())
 }
 

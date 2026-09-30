@@ -177,3 +177,97 @@ async fn window_writes_reach_ch() {
 
     fx::finish_daemon(guard, &daemon, result);
 }
+
+/// Live leg dying mid-backup falls back to replaying the WAL the backup
+/// landed, so window commits still reach CH
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn window_replays_landed_wal_when_live_leg_dies() {
+    if !fx::tools::requirements_available() {
+        return;
+    }
+
+    let slot = fx::Ports::alloc();
+    let tmp = tempfile::tempdir().unwrap();
+
+    let source = fx::start_source(&tmp);
+    let _src_stop = fx::StopOnDrop { sh: &source };
+    fx::load_source_workload(&source, "s15", N_ROWS).expect("load source workload");
+
+    let ch_tmp = tempfile::tempdir().unwrap();
+    let ch = fx::ChServer::spawn(ch_tmp, slot.ch_tcp, slot.ch_http).expect("spawn ch");
+    fx::create_ch_dest_table(&ch, "default", "t").expect("create ch table");
+    let ch_config_path = tmp.path().join("ch-config.toml");
+    fx::write_ch_config_toml(
+        &ch_config_path,
+        "127.0.0.1",
+        slot.ch_tcp,
+        "default",
+        &RelName::new("s15", "t"),
+        &TableTarget::new("default", "t"),
+    )
+    .expect("write ch-config");
+
+    let daemon = fx::DaemonRun::prepare(tmp.path(), slot.metrics).expect("daemon layout");
+    let child = daemon
+        .spawn(
+            &source,
+            &ch_config_path,
+            slot.walsender,
+            &["--bootstrap-max-rate-kib", "8192"],
+        )
+        .expect("spawn walshadow-stream");
+    let guard = fx::ChildGuard::new(child);
+
+    let result = (|| -> Result<()> {
+        fx::wait_for_backup_streaming(&source, Duration::from_secs(60))?;
+        // Every walsender but BASE_BACKUP's is the live leg
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while source.psql_one(
+            "SELECT count(pg_terminate_backend(pid)) FROM pg_stat_replication \
+             WHERE state <> 'backup'",
+        )? == "0"
+        {
+            anyhow::ensure!(
+                std::time::Instant::now() < deadline,
+                "live window leg never connected"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        anyhow::ensure!(
+            fx::backup_in_progress(&source),
+            "backup ended before the live leg died"
+        );
+        // Below pump resume, so only window replay can ship it
+        source
+            .apply_schema_dump(
+                "INSERT INTO s15.t SELECT g, 'window-'||g::text \
+                   FROM generate_series(1001, 1100) g;\n\
+                 SELECT pg_switch_wal();\n",
+            )
+            .context("window batch")?;
+
+        daemon
+            .wait_for_log(
+                "replaying the window from the WAL the backup landed",
+                Duration::from_secs(60),
+            )
+            .context("live leg failure never fell back to landed WAL")?;
+        fx::wait_for_listen(daemon.metrics_addr, Duration::from_secs(60))
+            .context("daemon metrics endpoint never came up")?;
+        let src_count = source
+            .psql_one("SELECT count(*) FROM s15.t")
+            .context("source count")?;
+        fx::wait_for_ch_value(
+            &ch,
+            "SELECT count() FROM default.t FINAL WHERE _is_deleted = 0",
+            &src_count,
+            Duration::from_secs(60),
+        )
+        .context("window rows never reached CH")?;
+        fx::assert_ch_matches_source(&ch, &source, "s15.t", "default.t")
+            .context("source vs CH parity after landed-WAL replay")?;
+        Ok(())
+    })();
+
+    fx::finish_daemon(guard, &daemon, result);
+}

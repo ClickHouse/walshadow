@@ -404,11 +404,6 @@ impl Harness {
         fs::create_dir_all(&socket_dir).context("create target socket dir")?;
         fs::create_dir_all(&filtered).context("create target filter dir")?;
 
-        // The harness source keeps no slot, so `-c fast`'s checkpoint recycles
-        // the segment the daemon still streams from
-        self.psql("ALTER SYSTEM SET wal_keep_size = '256MB'")?;
-        self.psql("SELECT pg_reload_conf()")?;
-
         let src = self.source.config();
         let out = Command::new("pg_basebackup")
             .args([
@@ -2176,6 +2171,9 @@ async fn restart_inside_the_fork_barrier_recrosses_and_converges() {
         promote_and_repoint(&h, &target).await?;
         h.shadow_psql("SELECT pg_wal_replay_pause()")
             .context("pause shadow replay")?;
+        h.wait_log("leaving paused", Duration::from_secs(10))
+            .await
+            .context("supervisor never saw the operator pause")?;
         h.ctl_body(&["apply"], "[stream]\npaused = false")?;
         h.wait_log("fork barrier", Duration::from_secs(60))
             .await
