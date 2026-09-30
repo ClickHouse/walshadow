@@ -5,6 +5,68 @@ coverage reports to find gaps instead of keeping historical line counts or
 lists of already covered functions. Build and test commands live in
 [development guide](../docs/development.md)
 
+## Verify value fidelity and recovery
+
+Preserve minimized SQL, effective config,
+generated destination DDL, server/build versions, process exit reason, and
+durable positions in regression fixtures. Run failure cases independently;
+later stale queries after daemon exit do not establish additional failures
+
+WAL probes at `1267db7`, PostgreSQL 18.6 / ClickHouse 26.8.1.951, establish
+compressible TEXT fidelity through 128 MiB and configured 64 MiB cap behavior
+See [verified value gaps](value_coercion.md). Promote those probes into persistent
+regressions; remaining investigation concerns daemon recovery and wider matrix
+Distinguish policy rejection, panic, OOM kill, and query timeout. For rejection,
+prove durable progress cannot skip failed work, unchanged restart fails again,
+and corrected policy plus restart converges. Coordinate diagnostics and policy
+with [value coercion](value_coercion.md), UI checks with
+[runtime configuration](runtime_config.md#operator-health-and-recovery)
+
+Extend existing TOAST and type suites with:
+
+- An 8 KiB, 32 MiB, and 128 MiB ladder for TEXT, JSON/JSONB, INTEGER[], and TEXT[],
+  plus values just below, at, and above configured decoded-size cap. Account for
+  PostgreSQL representation overhead. Exercise compressible and incompressible
+  payloads, NULL/default overflow and error policy, spill, and restart
+- Exact source/destination lengths and content digests for strings; element
+  counts, order, NULL elements, and content for arrays. Test streaming and
+  supported initial-load/value-mode combinations. Check resident memory and
+  progress when one value exceeds normal batch or reserved-memory budgets
+- Extend 32 MiB JSONB verification beyond successful compressible String case:
+  `to_jsonb(repeat('x', 33554432))` and
+  `jsonb_build_object('v', repeat('x', 33554432))` match canonical source lengths
+  and MD5s after WAL replay. Test incompressible bodies, cap boundaries, explicit
+  native JSON mapping, and restart. Do not infer native JSON semantics from
+  automatic String mapping or row count
+
+For a fixture containing 8 KiB, 32 MiB, and 128 MiB TEXT rows, assert total
+length of `167780352` bytes after all inserts succeed. Compare every expected
+key and value separately rather than combining nullable, differently typed
+lengths with `greatest`
+
+Reproduce with `public.doc(id int PRIMARY KEY, meta text, body text)`, default
+EXTENDED storage, and `REPLICA IDENTITY FULL`, using
+[TOAST harness](../tests/toast_e2e.rs). Insert separate transactions containing
+`repeat('x', 8192)`, `repeat('x', 33554432)`, and `repeat('x', 134217728)`, then
+switch WAL and drain. Compare source `length(body), md5(body)` against destination
+`length(body), lower(hex(MD5(body)))` under `FINAL WHERE _is_deleted = 0`
+Repeat with `inline_value_max = 67108864` and each overflow policy. Harness
+`expect` panics on returned errors do not establish daemon panics
+
+Cover transaction and trigger scenarios where regression coverage is missing:
+TRUNCATE between writes to two tables in one spilling transaction, including
+abort and restart; BEFORE-trigger rewrites and suppressed UPDATE/DELETE; and
+AFTER-trigger audit rows. Derive expected audit rows from fixture operations
+and assert final heap effects rather than SQL command tags. Keep numeric boundary,
+signed-zero, and default checks in [value coercion](value_coercion.md#acceptance)
+
+Isolate repeated runs by source and destination identities. If reusing tables,
+wait for cleanup to replicate and verify source emptiness: DELETE can be vetoed
+by a BEFORE trigger and can itself generate audit rows. Source DROP/recreate
+under retain policy does not clear destination; test that behavior separately
+with [schema lifecycle](schema.md). Avoid destination-only resets while old WAL
+or backfill remains active
+
 ## Pin WAL layouts
 
 Extend generated fixtures with commit records combining subtransactions,

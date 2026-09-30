@@ -5,6 +5,12 @@ tablespaces can lose initial rows, and shadow recovery can encounter source
 paths that do not exist locally. See [page walk](../src/backfill/backup_page_walk.rs)
 and [shadow backup sink](../src/backfill/backup_sink.rs)
 
+Reproduced at `1267db7`: insert two descriptors into `CatalogMap` with distinct
+tablespaces and relation OIDs but identical `(db_node, rel_node)`. `len()` is 1
+and lookup returns second descriptor. Key map by full `RelFileNode` before
+accepting those layouts. This is an in-process collision proof; live backup loss
+and shadow path failures still need isolated tablespace fixtures
+
 First reject unsupported layouts before bootstrap changes state. Check database
 default tablespace and backup tablespace metadata, including tablespaces needed
 by managed shadow even when their user tables are not selected. Apply equivalent
@@ -18,9 +24,10 @@ identity includes tablespace, database, and filenode. Descriptor history already
 uses all three; audit catalog tracker and backup maps that still omit tablespace
 Two tablespaces may contain equal database and filenode numbers
 
-Verify direct backup forwards every tablespace archive to its sink. Then teach
-page walk to recognize those files and equivalent object-store paths. A path
-parser alone cannot recover files discarded by backup transport
+`DirectSource` already forwards every `BackupEvent::Archive` to its sink, but
+uses `meta.oid` only for logging. Carry archive identity into sink metadata, then
+teach page walk to recognize those files and equivalent object-store paths
+Prove identity survives transport rather than adding another archive loop
 
 Choose a shadow-local directory mapping and use it consistently during backup
 restore, CREATE TABLESPACE replay, and restart. Any WAL rewrite must preserve

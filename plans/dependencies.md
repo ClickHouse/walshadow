@@ -49,7 +49,7 @@ and [staged publication](shadow_toast.md), including atomic visibility assumptio
 
 Use a shared governor limiter when introducing aggregate read budgets. Current
 `ObjectStoreSource::run` clones Settings for concurrent parts; each
-`Settings::throttle_network` call in wal-rus 0.3.2 constructs an independent
+`Settings::throttle_network` call in locked wal-rus 0.3.5 constructs an independent
 `RateLimited` reader. N active parts can approach N times configured network rate
 Current pacing tracks bytes since reader creation, allows initial read through,
 and accumulates idle credit without an explicit burst bound

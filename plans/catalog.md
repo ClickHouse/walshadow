@@ -11,6 +11,12 @@ A markerless record can be tracked without its payload while its relation is
 unknown. If that relation resolves to an ordinary surviving table at commit,
 resolution currently warns that rows were not mirrored and continues
 
+Reproduced at `1267db7` without PostgreSQL: seed `DescriptorLog` with an ordinary
+relation, call `track_unresolvable(77, 150, rfn)`, then
+`resolve_stash(..., 77, &[], 1000, ...)`. Resolution returns `Ok(())` despite
+missing payload. This establishes missing rejection, not an end-to-end durable
+cursor advance; assert that boundary when adding regression
+
 Return an error for that outcome. Preserve legitimate discard behavior when
 relation was born and dropped within transaction. Test both branches and prove
 failure cannot advance durable progress past lost rows
