@@ -50,7 +50,7 @@ docker compose -f docker/docker-compose.yml \
 docker compose -f docker/docker-compose.yml \
     -f docker/docker-compose.quickstart.yml exec clickhouse \
     clickhouse-client --query \
-    "SELECT id, name, email FROM walshadow.users FINAL ORDER BY id"
+    "SELECT id, name, email FROM walshadow.public_users FINAL ORDER BY id"
 ```
 
 Expected result includes updated address:

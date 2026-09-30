@@ -153,6 +153,7 @@ async fn run_boundary_ddl(held: Held<'_>, d_ddl: &str) -> Result<(), String> {
         NamespaceMapping {
             target_database: Some("walshadow_test".into()),
             auto_create: true,
+            auto_create_name: Some(walshadow::mapping::NameTemplate::parse("$table$").unwrap()),
             drop_table_strategy: None,
             initial_load: None,
         },

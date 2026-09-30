@@ -76,6 +76,7 @@ async fn build_drill(slot: fx::Ports, schema_sql: &str, app_name: &str) -> Drill
         NamespaceMapping {
             target_database: Some("walshadow_test".into()),
             auto_create: true,
+            auto_create_name: Some(walshadow::mapping::NameTemplate::parse("$table$").unwrap()),
             drop_table_strategy: None,
             initial_load: None,
         },

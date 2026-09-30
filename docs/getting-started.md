@@ -97,7 +97,7 @@ Insert or update one selected source row, then query matching ClickHouse table
 ```bash
 clickhouse-client --host ch.internal --database cdc \
     --user default --password secret --query \
-    "SELECT * FROM users FINAL WHERE _is_deleted = 0 ORDER BY id"
+    "SELECT * FROM public_users FINAL WHERE _is_deleted = 0 ORDER BY id"
 ```
 
 `FINAL` resolves versions written during updates or replay. `_is_deleted = 0`

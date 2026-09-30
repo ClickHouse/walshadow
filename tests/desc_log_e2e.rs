@@ -56,6 +56,7 @@ async fn prepared_ddl_drains_at_commit_prepared() {
         walshadow::mapping::NamespaceMapping {
             target_database: Some("walshadow_test".into()),
             auto_create: true,
+            auto_create_name: Some(walshadow::mapping::NameTemplate::parse("$table$").unwrap()),
             drop_table_strategy: None,
             initial_load: None,
         },

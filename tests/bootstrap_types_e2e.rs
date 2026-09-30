@@ -176,7 +176,7 @@ async fn direct_bootstrap_all_types_end_to_end() {
         let deadline = std::time::Instant::now() + Duration::from_secs(90);
         loop {
             let n = ch
-                .query("SELECT count() FROM default.all_types FINAL WHERE _is_deleted = 0")
+                .query("SELECT count() FROM default.public_all_types FINAL WHERE _is_deleted = 0")
                 .unwrap_or_default();
             if n == "1" {
                 break;
@@ -219,7 +219,7 @@ async fn direct_bootstrap_all_types_end_to_end() {
         for (expr, want) in &checks {
             let got = ch
                 .query(&format!(
-                    "SELECT toString({expr}) FROM default.all_types FINAL WHERE id = 1"
+                    "SELECT toString({expr}) FROM default.public_all_types FINAL WHERE id = 1"
                 ))
                 .unwrap_or_default();
             if &got != want {

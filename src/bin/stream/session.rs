@@ -854,15 +854,11 @@ pub(crate) async fn run_session(
         let mut applicators: HashMap<Oid, walshadow::ch_ddl::DdlApplicator> = HashMap::new();
         let mut backfillers: HashMap<Oid, Arc<dyn walshadow::opt_in::Backfiller>> = HashMap::new();
         let mut resolvers: Vec<Arc<ConfigResolver>> = Vec::with_capacity(db_conns.len());
-        // One claim per destination across every database, so `replicate_all`
-        // cannot name one ClickHouse table from two source tables
-        let targets = Arc::new(walshadow::mapping::TargetOwners::default());
         for (i, conn) in db_conns.iter().enumerate() {
             let built = build_source_db(SourceDbInputs {
                 args,
                 conn,
                 primary: i == primary_index,
-                targets: &targets,
                 desc_log: &desc_logs[i],
                 spill_dir: if i == primary_index {
                     args.spill_dir.clone()

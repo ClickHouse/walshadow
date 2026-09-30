@@ -120,7 +120,7 @@ impl Harness {
         let ch = fx::ChServer::spawn(ch_tmp, ports.ch_tcp, ports.ch_http).context("spawn ch")?;
         ch.query("CREATE DATABASE IF NOT EXISTS demo")?;
         ch.query(
-            "CREATE OR REPLACE TABLE demo.users (\
+            "CREATE OR REPLACE TABLE demo.demo_users (\
                 id Int64, name String, email String,\
                 _lsn UInt64, _xid UInt32,\
                 _commit_ts DateTime64(6, 'UTC'), _is_deleted Bool\
@@ -263,7 +263,7 @@ impl Harness {
             .context("daemon metrics endpoint never came up")?;
         // Seed row must be on CH before any drill runs.
         h.wait_ch(
-            "SELECT email FROM demo.users FINAL WHERE _is_deleted = 0 AND id = 1",
+            "SELECT email FROM demo.demo_users FINAL WHERE _is_deleted = 0 AND id = 1",
             "alice@seed",
             Duration::from_secs(30),
         )
@@ -658,10 +658,10 @@ fn gated() -> bool {
 }
 
 const USER_EMAIL: &str =
-    "SELECT argMax(email, _lsn) FROM demo.users WHERE _is_deleted = 0 AND id = 1";
+    "SELECT argMax(email, _lsn) FROM demo.demo_users WHERE _is_deleted = 0 AND id = 1";
 
 const SECOND_EMAIL: &str =
-    "SELECT argMax(email, _lsn) FROM demo.users WHERE _is_deleted = 0 AND id = 2";
+    "SELECT argMax(email, _lsn) FROM demo.demo_users WHERE _is_deleted = 0 AND id = 2";
 
 /// Socket-only, so one fixed number per role is enough (see `common/ports.rs`).
 /// Distinct from source and shadow because a drill can put all three sockets
@@ -787,7 +787,7 @@ async fn live_table_opt_in_auto_creates_on_reload() {
         )?;
         h.psql("INSERT INTO demo.gizmos VALUES (1, 'alpha')")?;
         assert_eq!(
-            h.ch_get("EXISTS TABLE demo.gizmos")?,
+            h.ch_get("EXISTS TABLE demo.demo_gizmos")?,
             "0",
             "gizmos must not exist on CH before opt-in",
         );
@@ -802,19 +802,22 @@ async fn live_table_opt_in_auto_creates_on_reload() {
         let deadline = Instant::now() + Duration::from_secs(45);
         while Instant::now() < deadline {
             h.psql("UPDATE demo.users SET email = 'tick@x' WHERE id = 1")?;
-            if h.ch_get("EXISTS TABLE demo.gizmos").unwrap_or_default() == "1" {
+            if h.ch_get("EXISTS TABLE demo.demo_gizmos")
+                .unwrap_or_default()
+                == "1"
+            {
                 created = true;
                 break;
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
         if !created {
-            bail!("opt-in never auto-created the CH table demo.gizmos");
+            bail!("opt-in never auto-created the CH table demo.demo_gizmos");
         }
 
         // Pre-opt-in row proves copy ran
         h.wait_ch(
-            "SELECT argMax(label, _lsn) FROM demo.gizmos WHERE _is_deleted = 0 AND id = 1",
+            "SELECT argMax(label, _lsn) FROM demo.demo_gizmos WHERE _is_deleted = 0 AND id = 1",
             "alpha",
             Duration::from_secs(20),
         )
@@ -823,7 +826,7 @@ async fn live_table_opt_in_auto_creates_on_reload() {
 
         h.psql("INSERT INTO demo.gizmos VALUES (2, 'beta')")?;
         h.wait_ch(
-            "SELECT argMax(label, _lsn) FROM demo.gizmos WHERE _is_deleted = 0 AND id = 2",
+            "SELECT argMax(label, _lsn) FROM demo.demo_gizmos WHERE _is_deleted = 0 AND id = 2",
             "beta",
             Duration::from_secs(15),
         )
@@ -880,7 +883,7 @@ async fn ch_password_rotation_via_ctl_keeps_streaming() {
         // of its own and has to carry the rotated credential too
         h.psql("UPDATE demo.users SET name = repeat('t', 200000) WHERE id = 1")?;
         h.wait_ch(
-            "SELECT length(argMax(name, _lsn)) FROM demo.users WHERE _is_deleted = 0 AND id = 1",
+            "SELECT length(argMax(name, _lsn)) FROM demo.demo_users WHERE _is_deleted = 0 AND id = 1",
             "200000",
             Duration::from_secs(30),
         )
@@ -1178,7 +1181,7 @@ async fn pause_apply_resume_reroutes_backlog_whole() {
         h.wait_ch(USER_EMAIL, "marker1@x", Duration::from_secs(15))
             .await?;
         assert_eq!(
-            h.ch_get("EXISTS TABLE demo.widgets")?,
+            h.ch_get("EXISTS TABLE demo.demo_widgets")?,
             "0",
             "widgets must not exist on CH before opt-in",
         );
@@ -1199,7 +1202,7 @@ async fn pause_apply_resume_reroutes_backlog_whole() {
 
         // Backlog xact plans after resume → routes under the new config.
         h.wait_ch(
-            "SELECT argMax(label, _lsn) FROM demo.widgets WHERE _is_deleted = 0 AND id = 2",
+            "SELECT argMax(label, _lsn) FROM demo.demo_widgets WHERE _is_deleted = 0 AND id = 2",
             "while-paused",
             Duration::from_secs(30),
         )
@@ -1209,7 +1212,7 @@ async fn pause_apply_resume_reroutes_backlog_whole() {
         // Post-resume stream continues under the same config.
         h.psql("INSERT INTO demo.widgets VALUES (3, 'post-resume')")?;
         h.wait_ch(
-            "SELECT argMax(label, _lsn) FROM demo.widgets WHERE _is_deleted = 0 AND id = 3",
+            "SELECT argMax(label, _lsn) FROM demo.demo_widgets WHERE _is_deleted = 0 AND id = 3",
             "post-resume",
             Duration::from_secs(15),
         )
@@ -1217,7 +1220,7 @@ async fn pause_apply_resume_reroutes_backlog_whole() {
 
         // id=1 was planned pre-pause under the old config: discarded stays
         // discarded, no partial re-plan.
-        let n = h.ch_get("SELECT count() FROM demo.widgets FINAL WHERE _is_deleted = 0")?;
+        let n = h.ch_get("SELECT count() FROM demo.demo_widgets FINAL WHERE _is_deleted = 0")?;
         assert_eq!(n, "2", "exactly the backlog + post-resume rows land");
 
         assert!(h.alive(), "daemon exited during pause/apply/resume");
@@ -1306,7 +1309,7 @@ async fn pause_publishes_frozen_frontier_lsns() {
 /// Newest version of one row, without FINAL so a merge cannot hide a stale
 /// duplicate.
 fn email_of(id: u32) -> String {
-    format!("SELECT argMax(email, _lsn) FROM demo.users WHERE _is_deleted = 0 AND id = {id}")
+    format!("SELECT argMax(email, _lsn) FROM demo.demo_users WHERE _is_deleted = 0 AND id = {id}")
 }
 
 /// Steps 2 to 7 of architecture/recovery.md against standby

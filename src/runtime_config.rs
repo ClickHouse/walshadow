@@ -66,6 +66,9 @@ pub struct GlobalRow {
 pub struct NamespaceRow {
     pub target_database: Option<String>,
     pub auto_create: Option<bool>,
+    /// Raw `$database$`/`$schema$`/`$table$` template for derived destination
+    /// names, parsed at resolver merge
+    pub auto_create_name: Option<String>,
     pub drop_table_strategy: Option<String>,
 }
 
@@ -345,6 +348,7 @@ pub fn interpret(
                 row: NamespaceRow {
                     target_database: field_string(rel, &cols, "target_database"),
                     auto_create: field_bool(rel, &cols, "auto_create"),
+                    auto_create_name: field_string(rel, &cols, "auto_create_name"),
                     drop_table_strategy: field_string(rel, &cols, "drop_table_strategy"),
                 },
             })

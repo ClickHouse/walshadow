@@ -36,7 +36,7 @@ use crate::decode::heap_decoder::{self, ColumnValue};
 use crate::emit::ch_emitter::EmitterConfig;
 use crate::mapping::{
     ColumnMapping, DropTableStrategy, MappingHandle, MappingSnapshot, NamespaceMapping, Retype,
-    RetypeKind, SystemColumns, TableMapping, TableTarget, TargetOwners, apply_column_rule,
+    RetypeKind, SystemColumns, TableMapping, TableTarget, apply_column_rule,
     derive_columns_for_mapping, fold_diff_into_mapping, retyped_target,
 };
 use crate::ops::oracle::{Oracle, OracleCell};
@@ -64,6 +64,9 @@ pub struct DdlConfig {
     /// CH database DDL targets when neither per-table mapping nor source
     /// namespace overrides the destination
     pub target_database: String,
+    /// Source database name, for `$database$` in a namespace's
+    /// `auto_create_name`
+    pub source_database: String,
     /// Per-namespace overrides, fallback to the global fields above when
     /// a namespace has none
     pub namespaces: HashMap<String, NamespaceMapping>,
@@ -86,6 +89,7 @@ impl DdlConfig {
     pub fn from_resolved(
         resolved: &ResolvedConfig,
         target_database: String,
+        source_database: String,
         soft_delete: bool,
         system: Arc<SystemColumns>,
         replicate_all: bool,
@@ -103,6 +107,7 @@ impl DdlConfig {
             replicate_all,
             runtime_config_schema,
             target_database,
+            source_database,
             namespaces: resolved.namespaces.clone(),
             soft_delete,
             system,
@@ -116,6 +121,14 @@ impl DdlConfig {
             .get(namespace)
             .and_then(|n| n.target_database.as_deref())
             .unwrap_or(&self.target_database)
+    }
+
+    fn derived_table_for(&self, rel: &RelName) -> String {
+        self.namespaces
+            .get(&*rel.namespace)
+            .and_then(|n| n.auto_create_name.clone())
+            .unwrap_or_default()
+            .render(&self.source_database, &rel.namespace, &rel.name)
     }
 
     fn drop_strategy_for(&self, namespace: &str) -> DropTableStrategy {
@@ -139,7 +152,7 @@ impl DdlConfig {
             table: settings
                 .target_table
                 .clone()
-                .unwrap_or_else(|| rel.name.to_string()),
+                .unwrap_or_else(|| self.derived_table_for(rel)),
         }
     }
 
@@ -214,10 +227,6 @@ pub struct DdlApplicator {
     /// Shadow PG renderer for tier-3 fast defaults
     oracle: Option<Arc<Oracle>>,
     ensured_databases: HashSet<String>,
-    /// This applicator's source database and the destinations every followed
-    /// database has claimed. Unset for a single database, which owns every
-    /// destination it names
-    owner: Option<(u32, Arc<TargetOwners>)>,
     pub stats: DdlStats,
 }
 
@@ -246,7 +255,6 @@ impl DdlApplicator {
             resolver: None,
             oracle: None,
             ensured_databases: HashSet::new(),
-            owner: None,
             stats: DdlStats::default(),
         })
     }
@@ -261,34 +269,6 @@ impl DdlApplicator {
     pub fn with_oracle(mut self, oracle: Option<Arc<Oracle>>) -> Self {
         self.oracle = oracle;
         self
-    }
-
-    /// Refuse destinations another followed database already writes to
-    pub fn with_target_owners(mut self, db_oid: u32, owners: Arc<TargetOwners>) -> Self {
-        self.owner = Some((db_oid, owners));
-        self
-    }
-
-    /// `false` when another database owns `target`, ie nothing may be created
-    /// or mapped there
-    async fn claims_target(&mut self, target: &TableTarget, rel: &RelName) -> bool {
-        let Some((db_oid, owners)) = &self.owner else {
-            return true;
-        };
-        let Err((owner_db, owner_rel)) = owners.claim(target, *db_oid, rel).await else {
-            return true;
-        };
-        tracing::error!(
-            target: "walshadow::ch_ddl",
-            qname = %rel,
-            db_oid = *db_oid,
-            owner_qname = %owner_rel,
-            owner_db_oid = owner_db,
-            destination = %target.sql(),
-            "another source database already writes this destination; \
-             set target_database or target_table to separate them",
-        );
-        false
     }
 
     pub fn config(&self) -> &DdlConfig {
@@ -308,6 +288,7 @@ impl DdlApplicator {
         self.config = DdlConfig::from_resolved(
             &snap,
             self.config.target_database.clone(),
+            self.config.source_database.clone(),
             self.config.soft_delete,
             self.config.system.clone(),
             self.config.replicate_all,
@@ -347,10 +328,6 @@ impl DdlApplicator {
         // Mapped dest created from the mapping when missing; IF NOT EXISTS
         // no-ops an operator-managed table and re-creates after strategy=drop.
         if let Some(m) = self.mapping_for(&desc.rel_name).await {
-            if !self.claims_target(&m.target, &desc.rel_name).await {
-                self.stats.skipped += 1;
-                return Ok(());
-            }
             self.ensure_database(&m.target.database).await?;
             let settings = cfg.rules.settings(&desc.rel_name);
             let sql = render_create_table_from_mapping(desc, &m, &cfg.create_shape(&settings));
@@ -373,10 +350,6 @@ impl DdlApplicator {
             self.stats.skipped += 1;
             return Ok(());
         };
-        if !self.claims_target(&mapping.target, &desc.rel_name).await {
-            self.stats.skipped += 1;
-            return Ok(());
-        }
         self.ensure_database(&mapping.target.database).await?;
         self.execute(&sql).await?;
         self.stats.creates_applied += 1;
@@ -406,10 +379,6 @@ impl DdlApplicator {
             self.stats.skipped += 1;
             return Ok(false);
         };
-        if !self.claims_target(&target, &desc.rel_name).await {
-            self.stats.skipped += 1;
-            return Ok(false);
-        }
         self.ensure_database(&target.database).await?;
         self.execute(&sql).await?;
         self.stats.creates_applied += 1;
@@ -614,15 +583,7 @@ impl DdlApplicator {
             }
             _ => false,
         };
-        let effect = predict_route_effect(&self.plan_config(config), mapping, event, excluded)?;
-        // Trailing rows of the applying commit route through this prediction,
-        // so it may not name a destination another database owns
-        if let Some((rel, Some(m))) = &effect
-            && !self.claims_target(&m.target, rel).await
-        {
-            return Ok(None);
-        }
-        Ok(effect)
+        predict_route_effect(&self.plan_config(config), mapping, event, excluded)
     }
 
     fn plan_config(&self, frozen: Option<&ResolvedConfig>) -> DdlConfig {
@@ -631,6 +592,7 @@ impl DdlApplicator {
                 DdlConfig::from_resolved(
                     rc,
                     self.config.target_database.clone(),
+                    self.config.source_database.clone(),
                     self.config.soft_delete,
                     self.config.system.clone(),
                     self.config.replicate_all,
@@ -655,9 +617,6 @@ impl DdlApplicator {
     }
 
     async fn forget_mapping(&mut self, rel: &RelName) {
-        if let Some((db_oid, owners)) = &self.owner {
-            owners.release(*db_oid, rel).await;
-        }
         if let Some(r) = &self.resolver {
             r.forget_derived_mapping(rel).await;
         } else {
@@ -1167,7 +1126,7 @@ pub fn render_create_table_from_mapping(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mapping::{ColumnMapping, TableMapping};
+    use crate::mapping::{ColumnMapping, NameTemplate, TableMapping};
     use std::sync::LazyLock;
 
     static SYS: LazyLock<Arc<SystemColumns>> = LazyLock::new(Arc::default);
@@ -1182,6 +1141,7 @@ mod tests {
             let ddl = DdlConfig::from_resolved(
                 &resolved,
                 config.database.clone(),
+                "app".into(),
                 false,
                 SYS.clone(),
                 false,
@@ -1229,6 +1189,78 @@ mod tests {
         assert!(!is_system_namespace("public", Some("walshadow")));
     }
 
+    fn namespaces_with_bare_prefix(cfg: &mut DdlConfig) {
+        cfg.namespaces.insert(
+            "audit".to_string(),
+            crate::mapping::NamespaceMapping {
+                target_database: None,
+                auto_create: true,
+                auto_create_name: Some(NameTemplate::parse("$table$").unwrap()),
+                drop_table_strategy: None,
+                initial_load: None,
+            },
+        );
+    }
+
+    #[test]
+    fn auto_create_name_names_derived_destinations_only() {
+        use crate::mapping::NamespaceMapping;
+        use ahash::{HashMap, HashMapExt};
+        let mut namespaces = HashMap::new();
+        namespaces.insert(
+            "public".to_string(),
+            NamespaceMapping {
+                target_database: None,
+                auto_create: true,
+                auto_create_name: Some(NameTemplate::parse("wh_").unwrap()),
+                drop_table_strategy: None,
+                initial_load: None,
+            },
+        );
+        let mut cfg = DdlConfig {
+            drop_table_strategy: DropTableStrategy::Retain,
+            auto_create_namespaces: HashSet::new(),
+            replicate_all: false,
+            runtime_config_schema: None,
+            target_database: "default".into(),
+            source_database: "app".into(),
+            namespaces,
+            soft_delete: false,
+            system: Arc::default(),
+            rules: Arc::default(),
+            column_rules: Arc::default(),
+        };
+        let derived = cfg.create_target(&TableRule::default(), &RelName::new("public", "orders"));
+        assert_eq!(derived.database, "default");
+        assert_eq!(
+            derived.table, "wh_orders",
+            "an explicit namespace prefix beats the namespace name",
+        );
+
+        let pinned = cfg.create_target(
+            &TableRule {
+                target_table: Some("orders_v2".into()),
+                ..TableRule::default()
+            },
+            &RelName::new("public", "orders"),
+        );
+        assert_eq!(
+            pinned.table, "orders_v2",
+            "an explicit target_table names the destination outright",
+        );
+
+        let unconfigured =
+            cfg.create_target(&TableRule::default(), &RelName::new("audit", "orders"));
+        assert_eq!(
+            unconfigured.table, "audit_orders",
+            "a namespace that sets no prefix derives from its own name",
+        );
+
+        namespaces_with_bare_prefix(&mut cfg);
+        let bare = cfg.create_target(&TableRule::default(), &RelName::new("audit", "orders"));
+        assert_eq!(bare.table, "orders", "an empty prefix opts out");
+    }
+
     #[test]
     fn per_namespace_target_and_drop_override_global() {
         use crate::mapping::NamespaceMapping;
@@ -1239,6 +1271,7 @@ mod tests {
             NamespaceMapping {
                 target_database: Some("warehouse".into()),
                 auto_create: true,
+                auto_create_name: None,
                 drop_table_strategy: Some(DropTableStrategy::Drop),
                 initial_load: None,
             },
@@ -1248,6 +1281,7 @@ mod tests {
             NamespaceMapping {
                 target_database: None,
                 auto_create: true,
+                auto_create_name: None,
                 drop_table_strategy: None,
                 initial_load: None,
             },
@@ -1258,6 +1292,7 @@ mod tests {
             replicate_all: false,
             runtime_config_schema: None,
             target_database: "default".into(),
+            source_database: "app".into(),
             namespaces,
             soft_delete: false,
             system: Arc::default(),
@@ -1284,6 +1319,7 @@ mod tests {
             replicate_all: false,
             runtime_config_schema: None,
             target_database: "default".into(),
+            source_database: "app".into(),
             namespaces: HashMap::new(),
             soft_delete: false,
             system: Arc::default(),
@@ -1377,6 +1413,7 @@ mod tests {
             replicate_all: false,
             runtime_config_schema: Some("walshadow".into()),
             target_database: "default".into(),
+            source_database: "app".into(),
             namespaces: ahash::HashMap::default(),
             soft_delete: false,
             system: Arc::default(),
@@ -1387,7 +1424,7 @@ mod tests {
         assert!(cfg.auto_creates(&events));
         assert_eq!(
             cfg.create_target(&cfg.rules.settings(&events), &events),
-            TableTarget::new("warehouse", "events_1")
+            TableTarget::new("warehouse", "app_events_1")
         );
         assert_eq!(
             cfg.declared_scope(&RelName::new("app", "events_audit")),
@@ -1405,7 +1442,7 @@ mod tests {
         let other = RelName::new("other", "t");
         assert_eq!(
             cfg.create_target(&cfg.rules.settings(&other), &other),
-            TableTarget::new("default", "t")
+            TableTarget::new("default", "other_t")
         );
         let settings = cfg.rules.settings(&other);
         assert_eq!(
@@ -2194,6 +2231,7 @@ mod tests {
             replicate_all: false,
             runtime_config_schema: None,
             target_database: "default".into(),
+            source_database: "app".into(),
             namespaces: ahash::HashMap::default(),
             soft_delete: false,
             system: Arc::default(),
@@ -2228,6 +2266,7 @@ mod tests {
             replicate_all: true,
             runtime_config_schema: None,
             target_database: "default".into(),
+            source_database: "app".into(),
             namespaces: ahash::HashMap::default(),
             soft_delete: false,
             system: Arc::default(),
@@ -2244,7 +2283,7 @@ mod tests {
         let empty = MappingSnapshot::default();
         let predicted = predict_route_effect(&cfg, &empty, &added, false).unwrap();
         assert!(
-            matches!(&predicted, Some((r, Some(m))) if &*r.name == "fresh" && m.target.table == "fresh"),
+            matches!(&predicted, Some((r, Some(m))) if &*r.name == "fresh" && m.target.table == "public_fresh"),
             "{predicted:?}"
         );
         assert!(

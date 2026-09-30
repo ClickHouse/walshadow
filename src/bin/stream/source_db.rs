@@ -26,7 +26,6 @@ pub(crate) struct SourceDbInputs<'a> {
     /// `[source] dbname`: the one database a cluster backup can load
     pub(crate) primary: bool,
     /// Destinations every followed database has claimed
-    pub(crate) targets: &'a Arc<walshadow::mapping::TargetOwners>,
     pub(crate) desc_log: &'a Arc<walshadow::desc_log::DescriptorLog>,
     /// Backfill ledger lives here, beside this database's descriptor log
     pub(crate) spill_dir: PathBuf,
@@ -138,6 +137,7 @@ pub(crate) async fn build_source_db(input: SourceDbInputs<'_>) -> anyhow::Result
     let ddl_cfg = walshadow::ch_ddl::DdlConfig::from_resolved(
         &config_rx.borrow(),
         cfg.database.clone(),
+        cfg.source.dbname.clone(),
         cfg.soft_delete,
         cfg.system_columns.clone(),
         cfg.replicate_all,
@@ -153,8 +153,7 @@ pub(crate) async fn build_source_db(input: SourceDbInputs<'_>) -> anyhow::Result
     .await
     .context("init DDL applicator")?
     .with_resolver(resolver.clone())
-    .with_oracle(input.oracle.clone())
-    .with_target_owners(conn.oid, input.targets.clone());
+    .with_oracle(input.oracle.clone());
     // Backfiller for `initial_load` opt-ins (COPY / backup-sourced):
     // own source session + CH tail per backfill or pass, spill-dir
     // ledger dedups restarts. Wired whenever the emitter runs, since an

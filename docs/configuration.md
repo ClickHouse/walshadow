@@ -175,6 +175,11 @@ VALUES
 `text[]`, and `lsn`, `xid`, `commit_ts`, `is_deleted` for metadata column names.
 See [Query destination data](destination-tables.md)
 
+`config_namespace` carries namespace defaults: `target_database`, `auto_create`,
+`auto_create_name` (the derived-name template, see
+[Name auto-created tables](destination-tables.md#name-auto-created-tables)) and
+`drop_table_strategy`
+
 Use `config_column` to configure individual columns. Set `namespace` to schema
 name, `relname` to table name, and `attname` to column name. Use `match` for
 name patterns and `target_type` to choose a ClickHouse type. Set `nan`,

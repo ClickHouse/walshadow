@@ -34,27 +34,33 @@ the key level decides which one a name means
 Startup checks reject database names missing from `pg_database`, so a typo
 causes an error instead of replicating a database nobody asked for
 
-## Use separate destinations
+## Choose shared or separate destinations
 
-Tables with matching names in different source databases use the same
-ClickHouse table by default. Parsing rejects this conflict:
+Tables with matching names in different source databases land in the same
+ClickHouse table, merging their rows there. Derived names carry `$schema$`, so
+same-named tables in different *schemas* already differ
 
-```text
-`database.billing.table.public.orders` and `table.public.orders` both write to
-cdc.orders, set a different target_database or target_table
-```
+Merging is allowed, not an error. It suits shards of one logical table, where
+every source has the same shape. Rows from different sources interleave by
+`_lsn`, and because `ReplacingMergeTree` keys on the sort key, two sources
+writing the same key values collapse onto each other — give them disjoint keys
+or separate destinations
 
-Set separate destinations for each database, schema, or table:
+Separate per database, schema, or table:
 
 ```toml
 [database.billing.namespace.public]
 target_database = "billing_cdc"
 ```
 
-Tables with matching names in different schemas need the same treatment, see
-[limitations](limitations.md). Config checks cover explicit entries;
-destinations `replicate_all` derives are claimed as each table is first seen,
-and a second claim on one destination is refused
+Or keep one ClickHouse database and separate the names, since `auto_create_name`
+reads `$database$`:
+
+```toml
+[namespace.public]
+auto_create = true
+auto_create_name = "$database$_$schema$_$table$"
+```
 
 ## Run `ctl` against one database
 

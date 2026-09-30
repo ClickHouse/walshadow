@@ -55,6 +55,7 @@ async fn catalog_rewrites_keep_shadow_replaying() {
         NamespaceMapping {
             target_database: Some("walshadow_test".into()),
             auto_create: true,
+            auto_create_name: Some(walshadow::mapping::NameTemplate::parse("$table$").unwrap()),
             drop_table_strategy: None,
             initial_load: None,
         },

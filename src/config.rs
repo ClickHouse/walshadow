@@ -36,8 +36,8 @@ use crate::column_rules::{ColumnRule, ColumnRules, ColumnRulesBuilder, Substitut
 use crate::emit::ch_emitter::EmitterConfig;
 use crate::filter::shadow_relations::ShadowHeld;
 use crate::mapping::{
-    DropTableStrategy, MappingHandle, NamespaceMapping, Retype, TableMapping, TableTarget,
-    derive_columns_for_mapping, fold_diff_into_mapping,
+    DropTableStrategy, MappingHandle, NameTemplate, NamespaceMapping, Retype, TableMapping,
+    TableTarget, derive_columns_for_mapping, fold_diff_into_mapping,
 };
 use crate::runtime_config::{ConfigEvent, ConfigOverlay, TableRow};
 use crate::schema::{RelDescriptor, RelName, SchemaDiff};
@@ -460,7 +460,7 @@ impl ConfigResolver {
                 .unwrap_or_else(|| Self::target_db_for(&inner, &rel.namespace)),
             table: table_override
                 .or(settings.target_table)
-                .unwrap_or_else(|| rel.name.to_string()),
+                .unwrap_or_else(|| Self::target_table_for(&inner, &rel)),
         };
         let column_rules = self.tx.borrow().column_rules.clone();
         let columns = derive_columns_for_mapping(desc, &column_rules);
@@ -586,6 +586,25 @@ impl ConfigResolver {
     /// CH target database for a namespace: per-namespace override (overlay then
     /// TOML) else the global `[ch] database`. Mirrors
     /// [`crate::emit::ch_ddl::DdlConfig::target_database_for`].
+    fn target_table_for(inner: &MergeInputs, rel: &RelName) -> String {
+        let ns = &*rel.namespace;
+        inner
+            .overlay
+            .namespaces
+            .get(ns)
+            .and_then(|r| r.auto_create_name.as_deref())
+            .and_then(|raw| NameTemplate::parse(raw).ok())
+            .or_else(|| {
+                inner
+                    .base
+                    .namespaces
+                    .get(ns)
+                    .and_then(|m| m.auto_create_name.clone())
+            })
+            .unwrap_or_default()
+            .render(&inner.base.source.dbname, ns, &rel.name)
+    }
+
     fn target_db_for(inner: &MergeInputs, namespace: &str) -> String {
         inner
             .overlay
@@ -806,6 +825,15 @@ impl ConfigResolver {
             }
             if let Some(v) = row.auto_create {
                 entry.auto_create = v;
+            }
+            if let Some(v) = &row.auto_create_name {
+                match NameTemplate::parse(v) {
+                    Ok(t) => entry.auto_create_name = Some(t),
+                    Err(e) => {
+                        rejections += 1;
+                        tracing::warn!(target: "walshadow::config", namespace = %ns, error = %e, "config_namespace.auto_create_name rejected");
+                    }
+                }
             }
             if let Some(v) = &row.drop_table_strategy {
                 if let Ok(s) = v.parse::<DropTableStrategy>() {
@@ -1036,6 +1064,7 @@ mod tests {
             "public".into(),
             NamespaceRow {
                 auto_create: Some(true),
+                auto_create_name: Some("$table$".into()),
                 target_database: Some("default".into()),
                 drop_table_strategy: Some("drop".into()),
             },
@@ -1066,6 +1095,11 @@ mod tests {
         let ns = r.namespaces.get("public").unwrap();
         assert!(ns.auto_create);
         assert_eq!(ns.target_database.as_deref(), Some("default"));
+        assert_eq!(
+            ns.auto_create_name,
+            Some(NameTemplate::parse("$table$").unwrap()),
+            "an overlay template reaches the resolved namespace"
+        );
         assert_eq!(ns.drop_table_strategy, Some(DropTableStrategy::Drop));
         let t = r.tables.get(&RelName::new("public", "events")).unwrap();
         assert_eq!(t.target, TableTarget::new("default", "events_v2"));
@@ -1247,6 +1281,7 @@ mod tests {
         let ddl = crate::emit::ch_ddl::DdlConfig::from_resolved(
             &r,
             "db".into(),
+            "app".into(),
             false,
             Arc::default(),
             false,
@@ -1296,6 +1331,7 @@ mod tests {
         let ddl = crate::emit::ch_ddl::DdlConfig::from_resolved(
             &r,
             "db".into(),
+            "app".into(),
             false,
             Arc::default(),
             false,
@@ -1360,8 +1396,16 @@ mod tests {
             &OptInState::default(),
             &ColumnRules::default(),
         );
-        DdlConfig::from_resolved(&r, "db".into(), false, Arc::default(), false, None)
-            .auto_create_namespaces
+        DdlConfig::from_resolved(
+            &r,
+            "db".into(),
+            "app".into(),
+            false,
+            Arc::default(),
+            false,
+            None,
+        )
+        .auto_create_namespaces
     }
 
     #[test]
@@ -1523,11 +1567,52 @@ mod tests {
         let snap = rx.borrow_and_update();
         let rel = RelName::new("public", "events");
         let t = snap.tables.get(&rel).expect("mapping present");
-        assert_eq!(t.target.table, "events", "target derived from descriptor");
+        assert_eq!(
+            t.target.table, "public_events",
+            "routing target must match the name ensure_ch_table created",
+        );
         assert!(!t.columns.is_empty(), "columns derived from descriptor");
         // Fenced routing map written for the decode pool.
         assert!(mapping.with(|m| m.contains_key(&rel)).await);
         assert_eq!(resolver.opt_in_total(), 1);
+    }
+
+    #[tokio::test]
+    async fn opt_in_routing_follows_the_namespace_template() {
+        let base = EmitterConfig::from_toml_str(
+            "[ch]\n\
+             [namespace.audit]\nauto_create = true\nauto_create_name = \"$table$\"\n\
+             [namespace.shop]\nauto_create = true\nauto_create_name = \"wh_\"\n",
+        )
+        .unwrap();
+        let (resolver, mut rx) = ConfigResolver::new(
+            &base,
+            CliOverrides::default(),
+            None,
+            toml::Table::new(),
+            dummy_handles(),
+            ResolverBoot::default(),
+        );
+        for (ns, rel) in [("audit", "events"), ("shop", "items"), ("app", "logs")] {
+            resolver
+                .materialize_opt_in(&rel_desc(ns, rel), None, None)
+                .await;
+            assert!(rx.changed().await.is_ok());
+        }
+        let snap = rx.borrow_and_update();
+        let table_of = |ns: &str, rel: &str| {
+            snap.tables
+                .get(&RelName::new(ns, rel))
+                .map(|t| t.target.table.clone())
+                .unwrap_or_else(|| panic!("{ns}.{rel} unmapped"))
+        };
+        assert_eq!(table_of("audit", "events"), "events", "$table$ is bare");
+        assert_eq!(table_of("shop", "items"), "wh_items");
+        assert_eq!(
+            table_of("app", "logs"),
+            "app_logs",
+            "a namespace with no entry derives from its own name",
+        );
     }
 
     #[tokio::test]

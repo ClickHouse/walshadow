@@ -34,6 +34,9 @@ CREATE TABLE IF NOT EXISTS :"walshadow_schema".config_namespace (
     namespace           text PRIMARY KEY,
     target_database     text,
     auto_create         boolean,
+    auto_create_name    text,        -- derived table name template over
+                                     -- $database$/$schema$/$table$; NULL
+                                     -- means '$schema$_$table$'
     drop_table_strategy text         -- overrides config_global for this namespace
 );
 
@@ -79,6 +82,7 @@ CREATE TABLE IF NOT EXISTS :"walshadow_schema".config_column (
 -- Additive upgrade: columns introduced after the initial config_table shape.
 -- CREATE TABLE IF NOT EXISTS above no-ops on an existing install, so an
 -- upgrading deployment re-runs this to gain the columns the newer daemon reads.
+ALTER TABLE :"walshadow_schema".config_namespace ADD COLUMN IF NOT EXISTS auto_create_name text;
 ALTER TABLE :"walshadow_schema".config_table ADD COLUMN IF NOT EXISTS replicate       boolean;
 ALTER TABLE :"walshadow_schema".config_table ADD COLUMN IF NOT EXISTS initial_load    text;
 ALTER TABLE :"walshadow_schema".config_table ADD COLUMN IF NOT EXISTS target_database text;
