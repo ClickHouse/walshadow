@@ -294,9 +294,6 @@ mod tests {
     #[test]
     fn observer_error_wraps_to_sink_other() {
         let e: SinkError = DecoderSinkError::Observer("boom".into()).into();
-        match e {
-            SinkError::Other(msg) => assert!(msg.contains("boom"), "{msg}"),
-            other => panic!("expected Other, got {other:?}"),
-        }
+        assert_eq!(format!("{e:?}"), r#"Other("observer: boom")"#);
     }
 }

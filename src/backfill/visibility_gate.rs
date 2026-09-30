@@ -521,7 +521,8 @@ mod tests {
     use crate::backfill::backup_page_walk::{
         PAGE_BYTES, PageWalkSink, make_rel, make_rel_named, synth_single_tuple_page,
     };
-    use crate::backfill::backup_source::{BackupSink, FileAction, FileMeta, StartInfo};
+    use crate::backfill::backup_source::testing::expect_tap;
+    use crate::backfill::backup_source::{BackupSink, FileMeta, StartInfo};
     use crate::backfill::spool::DEFERRED_SPOOL_MEM_MAX;
     use crate::backfill::spool::SpoolMark;
     use crate::decode::visibility::{
@@ -593,9 +594,7 @@ mod tests {
                 mode: 0o600,
                 ..Default::default()
             };
-            let FileAction::Tap(mut entry) = sink.begin(&meta).await.unwrap() else {
-                panic!("{path} must tap");
-            };
+            let mut entry = expect_tap(sink.begin(&meta).await.unwrap());
             for page in 0..pages {
                 entry.chunk(&visible_page(page as i32)).await.unwrap();
             }
@@ -817,13 +816,8 @@ mod tests {
         for (want_seq, (ack, ack_task, mut msg_rx)) in [3u64, 7].into_iter().zip(tails) {
             let mut seqs = Vec::new();
             while let Some(msg) = msg_rx.recv().await {
-                match msg {
-                    BatcherMsg::Rows(chunk) => seqs.extend(chunk.rows.iter().map(|r| r.seq)),
-                    BatcherMsg::Row(r) => seqs.push(r.seq),
-                    BatcherMsg::FlushAll(reply) => {
-                        let _ = reply.send(());
-                    }
-                }
+                let BatcherMsg::Rows(c) = msg else { panic!() };
+                seqs.extend(c.rows.iter().map(|r| r.seq));
             }
             assert_eq!(seqs, vec![want_seq; 2], "rows rode their own lane's tail");
             drop(ack);

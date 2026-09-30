@@ -2587,31 +2587,26 @@ impl ValueResolution<'_> {
         type_oid: u32,
     ) -> std::result::Result<ColumnValue, XactBufferError> {
         let key = (p.va_toastrelid, p.va_valueid);
-        let miss = if self.resolver.fill_on_miss() {
-            Some(StoreMiss::NoStore)
+        let cached = if self.resolver.fill_on_miss() {
+            Err(StoreMiss::NoStore)
         } else {
-            let cached = self.cache.get(&key).expect("prefetched with the heap");
-            cached.as_ref().err().copied()
+            let uses = self.uses.get_mut(&key).expect("counted in detoast_heap");
+            *uses -= 1;
+            if *uses > 0 {
+                self.cache.get(&key).cloned()
+            } else {
+                self.cache.remove(&key)
+            }
+            .expect("prefetched with the heap")
         };
-        if let Some(miss) = miss {
-            return fill_store_miss(miss, p, self.resolver, MissPolicy::Streaming)
-                .map_err(XactBufferError::Detoast);
+        match cached {
+            Ok(raw) => {
+                self.retained += raw.len();
+                Ok(detoasted_value(raw, type_oid))
+            }
+            Err(miss) => fill_store_miss(miss, p, self.resolver, MissPolicy::Streaming)
+                .map_err(XactBufferError::Detoast),
         }
-        let uses = self.uses.get_mut(&key).expect("counted in detoast_heap");
-        *uses -= 1;
-        let raw = if *uses > 0 {
-            let Some(Ok(v)) = self.cache.get(&key) else {
-                unreachable!("matched Ok above")
-            };
-            v.clone()
-        } else {
-            let Some(Ok(v)) = self.cache.remove(&key) else {
-                unreachable!("matched Ok above")
-            };
-            v
-        };
-        self.retained += raw.len();
-        Ok(detoasted_value(raw, type_oid))
     }
 }
 
@@ -2629,6 +2624,7 @@ fn first_missing_seq_ref(v: &ValueRef) -> u32 {
 }
 
 /// Chunk coverage outcome, decompression failures remain errors
+#[cfg_attr(test, derive(Debug, PartialEq))]
 pub(crate) enum Reassembled {
     Bytes(Vec<u8>),
     Missing,
@@ -3640,15 +3636,9 @@ mod tests {
     #[test]
     fn xact_buffer_error_converts_to_sink_and_decoder_errors() {
         let s: SinkError = XactBufferError::Observer("boom".into()).into();
-        match s {
-            SinkError::Other(msg) => assert!(msg.contains("boom"), "{msg}"),
-            other => panic!("expected SinkError::Other, got {other:?}"),
-        }
+        assert_eq!(format!("{s:?}"), r#"Other("observer: boom")"#);
         let d: DecoderSinkError = XactBufferError::Observer("boom".into()).into();
-        match d {
-            DecoderSinkError::Observer(msg) => assert!(msg.contains("boom"), "{msg}"),
-            other => panic!("expected DecoderSinkError::Observer, got {other:?}"),
-        }
+        assert_eq!(format!("{d:?}"), r#"Observer("observer: boom")"#);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -3949,13 +3939,13 @@ mod tests {
         );
         // Tier 3 lands as PgPending carrying the body so the oracle resolves
         // it like an inline value, not Unsupported
-        match detoasted_value(b"\x01body".to_vec(), TSVECTOROID) {
-            ColumnValue::PgPending { type_oid, raw } => {
-                assert_eq!(type_oid, TSVECTOROID);
-                assert_eq!(raw, b"\x01body");
+        assert_eq!(
+            detoasted_value(b"\x01body".to_vec(), TSVECTOROID),
+            ColumnValue::PgPending {
+                type_oid: TSVECTOROID,
+                raw: b"\x01body".to_vec(),
             }
-            other => panic!("expected PgPending, got {other:?}"),
-        }
+        );
     }
 
     /// A detoasted jsonb renders through its codec, same as an inline one
@@ -4599,13 +4589,15 @@ mod tests {
         }
     }
 
+    /// Order label of [`dropped_event`] as [`flatten_batch`] renders it
+    fn dropped_label(oid: u32) -> String {
+        format!("{:?}", DrainEntry::Catalog(dropped_event(oid)))
+    }
+
     /// Interleave a batch's events at their local indices with its heaps:
-    /// `e<oid>` / `h<lsn>` labels for order assertions.
+    /// event Debug / `h<lsn>` labels for order assertions.
     fn flatten_batch(batch: &DrainedBatch) -> Vec<String> {
-        let label = |e: &DrainEntry| match e {
-            DrainEntry::Catalog(SchemaEvent::Dropped { oid, .. }) => format!("e{oid}"),
-            other => panic!("unexpected event {other:?}"),
-        };
+        let label = |e: &DrainEntry| format!("{e:?}");
         let mut out = Vec::new();
         let mut ev = 0usize;
         for (i, h) in batch.heaps.iter().enumerate() {
@@ -4636,11 +4628,8 @@ mod tests {
         let mut order: Vec<String> = Vec::new();
         while let Some(batch) = drain.next_batch(8, usize::MAX, None).await.unwrap() {
             order.extend(flatten_batch(&batch));
-            if batch.is_final {
-                break;
-            }
         }
-        assert_eq!(order, ["e7", "h120", "e9"]);
+        assert_eq!(order, [dropped_label(7), "h120".into(), dropped_label(9)]);
         drain.finish().await.unwrap();
     }
 
@@ -4737,9 +4726,11 @@ mod tests {
         b.stash_raw(1, raw).await.unwrap();
         inject_ordinary(&mut b, rfn, rel);
         let mut drain = b.drain_committed(1, 42, 0x2000, &[], false).await.unwrap();
-        let Err(err) = drain.next_batch(8, usize::MAX, None).await else {
-            panic!("expected fail-closed error");
-        };
+        let err = drain
+            .next_batch(8, usize::MAX, None)
+            .await
+            .err()
+            .expect("fail-closed error");
         assert!(
             matches!(
                 err,
@@ -4768,9 +4759,11 @@ mod tests {
             .unwrap();
         inject_ordinary_fenced(&mut b, rfn, rel, None, vec![rfn_ambiguity(rfn, 100, 200)]);
         let mut drain = b.drain_committed(1, 42, 0x2000, &[], false).await.unwrap();
-        let Err(err) = drain.next_batch(8, usize::MAX, None).await else {
-            panic!("expected fenced record to fail closed");
-        };
+        let err = drain
+            .next_batch(8, usize::MAX, None)
+            .await
+            .err()
+            .expect("fenced record to fail closed");
         assert!(
             matches!(
                 err,
@@ -4854,9 +4847,11 @@ mod tests {
         .unwrap();
         let mut b = buffer.lock().await;
         let mut drain = b.drain_committed(1, 42, 0x2F0, &[], false).await.unwrap();
-        let Err(err) = drain.next_batch(8, usize::MAX, None).await else {
-            panic!("expected the log's interval to fence the stashed record");
-        };
+        let err = drain
+            .next_batch(8, usize::MAX, None)
+            .await
+            .err()
+            .expect("the log's interval to fence the stashed record");
         assert!(
             matches!(
                 err,
@@ -4992,9 +4987,11 @@ mod tests {
         b.stash_raw(1, multi_insert_raw(1, 100, 16422, &[1]))
             .await
             .unwrap();
-        let Err(err) = b.drain_committed(1, 42, 0x2000, &[], false).await else {
-            panic!("expected fail-closed with no resolution installed");
-        };
+        let err = b
+            .drain_committed(1, 42, 0x2000, &[], false)
+            .await
+            .err()
+            .expect("fail-closed with no resolution installed");
         assert!(
             matches!(err, XactBufferError::MissingStashResolution { top_xid: 1 }),
             "{err}"
@@ -5031,9 +5028,11 @@ mod tests {
         b.stash_raw(1, raw).await.unwrap();
         inject_ordinary(&mut b, rfn, rel);
         let mut drain = b.drain_committed(1, 42, 0x2000, &[], false).await.unwrap();
-        let Err(err) = drain.next_batch(8, usize::MAX, None).await else {
-            panic!("expected fail-closed error");
-        };
+        let err = drain
+            .next_batch(8, usize::MAX, None)
+            .await
+            .err()
+            .expect("fail-closed error");
         assert!(
             matches!(
                 err,
@@ -5060,9 +5059,11 @@ mod tests {
             .unwrap();
         inject_ordinary(&mut b, rfn, rel);
         let mut drain = b.drain_committed(1, 42, 0x2000, &[], false).await.unwrap();
-        let Err(err) = drain.next_batch(8, usize::MAX, None).await else {
-            panic!("expected foreign-xid error");
-        };
+        let err = drain
+            .next_batch(8, usize::MAX, None)
+            .await
+            .err()
+            .expect("foreign-xid error");
         assert!(
             matches!(err, XactBufferError::ForeignXid { xid: 99, top: 1 }),
             "{err}"
@@ -5148,9 +5149,11 @@ mod tests {
         b.stash_raw(1, raw).await.unwrap();
         inject_ordinary(&mut b, rfn, rel);
         let mut drain = b.drain_committed(1, 42, 0x2000, &[], false).await.unwrap();
-        let Err(err) = drain.next_batch(8, usize::MAX, None).await else {
-            panic!("expected fail-closed error");
-        };
+        let err = drain
+            .next_batch(8, usize::MAX, None)
+            .await
+            .err()
+            .expect("fail-closed error");
         assert!(
             matches!(
                 err,
@@ -5375,11 +5378,18 @@ mod tests {
                 break;
             }
         }
+        let h = |lsn: u64| format!("h{lsn}");
         assert_eq!(
             order,
-            ["h100", "h110", "e7", "h120", "h130", "h140", "e8"]
-                .map(str::to_string)
-                .to_vec(),
+            [
+                h(100),
+                h(110),
+                dropped_label(7),
+                h(120),
+                h(130),
+                h(140),
+                dropped_label(8)
+            ]
         );
         assert!(finals.pop().unwrap(), "last slice flags final");
         assert!(finals.iter().all(|f| !f), "earlier slices non-final");
@@ -5454,10 +5464,10 @@ mod tests {
         assert_eq!((v.run_chunks, v.tail.len()), (0, 2));
         let spool = b2.chunks.iter().find_map(|g| g.spool());
         assert!(spool.is_none(), "no spool below threshold");
-        let Reassembled::Bytes(raw) = reassemble_value_ref(&p, spool, v).unwrap() else {
-            panic!("value visible");
-        };
-        assert_eq!(raw, b"abcd");
+        assert_eq!(
+            reassemble_value_ref(&p, spool, v).unwrap(),
+            Reassembled::Bytes(b"abcd".to_vec())
+        );
         drain.finish().await.unwrap();
     }
 
@@ -5553,10 +5563,10 @@ mod tests {
         let mut rows = 0usize;
         while let Some(batch) = drain.next_batch(4, usize::MAX, None).await.unwrap() {
             rows += batch.heaps.len();
+            let resident = b.drain_resident_bytes();
             assert!(
-                b.drain_resident_bytes() < read_buffers + total / 4,
-                "resident {} vs xact {total}",
-                b.drain_resident_bytes(),
+                resident < read_buffers + total / 4,
+                "resident {resident} vs xact {total}"
             );
             if batch.is_final {
                 break;
@@ -5564,10 +5574,10 @@ mod tests {
         }
         assert_eq!(rows as u64, n);
         assert!(b.drain_resident_peak() > 0, "gauge saw the merge heads");
+        let peak = b.drain_resident_peak();
         assert!(
-            b.drain_resident_peak() < read_buffers + total / 4,
-            "peak {} vs xact {total}",
-            b.drain_resident_peak(),
+            peak < read_buffers + total / 4,
+            "peak {peak} vs xact {total}"
         );
         drain.finish().await.unwrap();
         assert_eq!(b.drain_resident_bytes(), 0, "gauge drains with the drain");
@@ -5685,10 +5695,8 @@ mod tests {
             .find_map(|g| g.get(&(16400, 50)))
             .unwrap();
         assert_eq!((mem_v.run_chunks, mem_v.tail.len()), (0, 1));
-        let Reassembled::Bytes(raw) = reassemble_value_ref(&p(50), spool, mem_v).unwrap() else {
-            panic!("mem value visible");
-        };
-        assert_eq!(raw.len(), 512);
+        let whole = Reassembled::Bytes(body.to_vec());
+        assert_eq!(reassemble_value_ref(&p(50), spool, mem_v).unwrap(), whole);
         let file_v = last
             .chunks
             .iter()
@@ -5698,11 +5706,10 @@ mod tests {
             (file_v.run_chunks, file_v.run.len, file_v.tail.len()),
             (1, 512, 0)
         );
-        let Reassembled::Bytes(raw) = reassemble_value_ref(&p(50 + n - 1), spool, file_v).unwrap()
-        else {
-            panic!("file value visible");
-        };
-        assert_eq!(raw.len(), 512);
+        assert_eq!(
+            reassemble_value_ref(&p(50 + n - 1), spool, file_v).unwrap(),
+            whole
+        );
         // Mirror row refs materialize from the same spool
         let rows = &held.last().unwrap().new_rows;
         for r in rows.iter() {
@@ -5720,11 +5727,10 @@ mod tests {
         );
         // Held readers survive unlink via open fd
         let spool = last.chunks.iter().find_map(|g| g.spool());
-        let Reassembled::Bytes(raw) = reassemble_value_ref(&p(50 + n - 1), spool, file_v).unwrap()
-        else {
-            panic!("read-after-unlink via open fd");
-        };
-        assert_eq!(raw.len(), 512);
+        assert_eq!(
+            reassemble_value_ref(&p(50 + n - 1), spool, file_v).unwrap(),
+            whole
+        );
         held.clear();
         assert_eq!(b.drain_chunk_resident_bytes(), 0);
         assert_eq!(b.drain_row_resident_bytes(), 0);
@@ -5744,9 +5750,11 @@ mod tests {
         b.on_toast_chunk(chunk(51, 0, 102, b"bb"), 9).await.unwrap();
         b.on_heap(heap_with_value(9, 110, 16)).await.unwrap();
         let mut drain = b.drain_committed(9, 0, 0x1000, &[], true).await.unwrap();
-        let Err(err) = drain.next_batch(usize::MAX, usize::MAX, None).await else {
-            panic!("cap breach surfaces");
-        };
+        let err = drain
+            .next_batch(usize::MAX, usize::MAX, None)
+            .await
+            .err()
+            .expect("cap breach surfaces");
         assert!(matches!(
             err,
             XactBufferError::ToastIndexOverflow { max, .. } if max == 3 * CHUNK_REF_META

@@ -606,12 +606,7 @@ mod tests {
         let mut order = Vec::new();
         while let Some(item) = rd.next_item().unwrap() {
             order.push(match item {
-                PlanItem::Control(c) => {
-                    let DrainEntry::Catalog(SchemaEvent::Dropped { oid, .. }) = &c.event else {
-                        panic!("unexpected control");
-                    };
-                    format!("e{oid}")
-                }
+                PlanItem::Control(c) => format!("{:?}", c.event),
                 PlanItem::Heap(h) => {
                     assert!(
                         Arc::ptr_eq(&h.described.descriptor, &plan.descriptors[0].0)
@@ -622,14 +617,24 @@ mod tests {
                         assert!(Arc::ptr_eq(route, &plan.routes[0]));
                     }
                     let new = h.described.decoded.new.as_ref().unwrap();
-                    let Some(ColumnValue::Int4(v)) = new.columns[0] else {
-                        panic!("unexpected column");
-                    };
-                    format!("h{v}{}", if h.route.is_some() { "r" } else { "-" })
+                    let routed = if h.route.is_some() { "r" } else { "-" };
+                    format!("{:?}{routed}", new.columns[0])
                 }
             });
         }
-        assert_eq!(order, ["e1", "h10r", "h20-", "e2", "h30r", "e3"]);
+        let ev = |oid| format!("{:?}", dropped(oid));
+        let heap = |v, routed| format!("{:?}{routed}", Some(ColumnValue::Int4(v)));
+        assert_eq!(
+            order,
+            [
+                ev(1),
+                heap(10, "r"),
+                heap(20, "-"),
+                ev(2),
+                heap(30, "r"),
+                ev(3)
+            ]
+        );
         assert!(plan.path().is_none(), "small plan stays memory-resident");
         drop(rd);
         drop(plan);
@@ -642,6 +647,7 @@ mod tests {
     /// shadow-PG oracle resolves after replay, may lag row's catalog state
     #[test]
     fn pending_values_round_trip() {
+        use PlanItem::Heap;
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("1.plan");
         let mut w = PlanWriter::create(path, 1 << 20, DEFAULT_PLAN_MEM_MAX).unwrap();
@@ -661,9 +667,8 @@ mod tests {
         w.push_heap(&h, Some(&route())).unwrap();
         let plan = w.seal(0x2000, 42).unwrap();
         let mut rd = plan.replay().unwrap();
-        let Some(PlanItem::Heap(out)) = rd.next_item().unwrap() else {
-            panic!("expected heap");
-        };
+        let item = rd.next_item().unwrap();
+        let Some(Heap(out)) = item else { panic!() };
         assert_eq!(out.described.decoded.new.unwrap().columns, cols);
         assert!(rd.next_item().unwrap().is_none());
     }
@@ -682,9 +687,7 @@ mod tests {
         bytes[mid] ^= 0xFF;
         fs::write(&path, &bytes).unwrap();
         let mut rd = plan.replay().unwrap();
-        let Err(err) = rd.next_item() else {
-            panic!("expected corruption error");
-        };
+        let err = rd.next_item().err().expect("corruption error");
         assert!(matches!(err, PlanSpoolError::Corrupt { .. }), "{err}");
     }
 
@@ -701,9 +704,7 @@ mod tests {
         let mut bytes = fs::read(&path).unwrap();
         bytes[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
         fs::write(&path, &bytes).unwrap();
-        let Err(err) = plan.verify() else {
-            panic!("expected format error");
-        };
+        let err = plan.verify().unwrap_err();
         assert!(matches!(err, PlanSpoolError::Format { .. }), "{err}");
     }
 
@@ -723,9 +724,7 @@ mod tests {
         let last_body = bytes.len() - 18; // last heap frame body, before 17-byte seal
         bytes[last_body] ^= 0xFF;
         fs::write(&path, &bytes).unwrap();
-        let Err(err) = plan.verify() else {
-            panic!("expected corruption error");
-        };
+        let err = plan.verify().unwrap_err();
         assert!(matches!(err, PlanSpoolError::Corrupt { .. }), "{err}");
     }
 
@@ -760,9 +759,7 @@ mod tests {
             matches!(rd.next_item(), Ok(Some(PlanItem::Heap(_)))),
             "pre-seal frames intact"
         );
-        let Err(err) = rd.next_item() else {
-            panic!("expected unsealed error");
-        };
+        let err = rd.next_item().err().expect("unsealed error");
         assert!(matches!(err, PlanSpoolError::Unsealed), "{err}");
     }
 
@@ -773,9 +770,7 @@ mod tests {
         let path = tmp.path().join("1.plan");
         let mut w = PlanWriter::create(path.clone(), 16, 0).unwrap();
         let d = descriptor(16500);
-        let Err(err) = w.push_heap(&heap(&d, 100, 10), None) else {
-            panic!("expected budget error");
-        };
+        let err = w.push_heap(&heap(&d, 100, 10), None).unwrap_err();
         assert!(matches!(err, PlanSpoolError::DiskBudget { .. }), "{err}");
         drop(w);
         assert!(!path.exists(), "abandoned plan unlinks");

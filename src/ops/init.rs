@@ -88,12 +88,12 @@ pub async fn run(opts: InitOpts) -> Result<()> {
     let ch_client = crate::ch::connect_client(&ch_cfg)
         .await
         .context("connect ClickHouse")?;
-    match ch_client.server_info() {
-        Some(i) => println!(
+    // chc-rs returns None only before handshake
+    if let Some(i) = ch_client.server_info() {
+        println!(
             "  ✓ reachable, ClickHouse {}.{}.{}",
             i.version_major, i.version_minor, i.version_patch
-        ),
-        None => println!("  ✓ reachable"),
+        );
     }
     if created_db {
         println!("  ✓ created database {}", ch_cfg.database);

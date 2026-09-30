@@ -656,13 +656,11 @@ impl RateEstimator {
     pub fn observe(&mut self, now: Instant, received_lsn: u64) {
         self.samples.push_back((now, received_lsn));
         let cutoff = now.checked_sub(self.window);
-        if let Some(cutoff) = cutoff {
-            while let Some(&(t, _)) = self.samples.front()
-                && t < cutoff
-                && self.samples.len() > 1
-            {
-                self.samples.pop_front();
-            }
+        while let Some(&(t, _)) = self.samples.front()
+            && cutoff.is_some_and(|c| t < c)
+            && self.samples.len() > 1
+        {
+            self.samples.pop_front();
         }
     }
 
@@ -1095,7 +1093,6 @@ mod tests {
             .insert(("Heap".into(), "to_decoder"), 3);
 
         let full = render(snap.clone()).len();
-        let mut errors = 0;
         for writes in 0..64 {
             let mut w = FailAfter {
                 writes,
@@ -1104,12 +1101,10 @@ mod tests {
             let mut registry = Registry::default();
             registry.register_collector(Box::new(SnapshotCollector(snap.clone())));
             registry.register_collector(Box::new(crate::ops::log_events::LogEventCollector));
-            if text::encode(&mut w, &registry).is_err() {
-                errors += 1;
-                assert!(w.out.len() < full, "a failed encode cannot be complete");
-            }
+            let failed = text::encode(&mut w, &registry).is_err();
+            assert!(failed, "prefix length {writes} must surface the failure");
+            assert!(w.out.len() < full, "a failed encode cannot be complete");
         }
-        assert_eq!(errors, 64, "every prefix length must surface the failure");
     }
 
     #[test]

@@ -415,17 +415,11 @@ pub fn wait_for_ch_value(ch: &ChServer, sql: &str, want: &str, timeout: Duration
     }
 }
 
-/// Kill the daemon before the shadow, so its supervisor cannot restart the
-/// postmaster, then stop whatever SIGKILL left behind and report `result`
-/// with the daemon's log attached.
+/// Stop the daemon before the shadow, so its supervisor cannot restart the
+/// postmaster, then stop whatever it left behind and report `result` with
+/// the daemon's log attached.
 pub fn finish_daemon(guard: ChildGuard, daemon: &DaemonRun, result: Result<()>) {
-    if let Some(mut child) = guard.into_inner() {
-        // SIGINT drains and exits, so instrumented builds write their profile
-        let _ = Command::new("kill")
-            .args(["-INT", &child.id().to_string()])
-            .status();
-        let _ = wait_with_timeout(&mut child, Duration::from_secs(15));
-    }
+    drop(guard);
     daemon.stop_shadow();
     if let Err(e) = result {
         panic!("{e:#}\n--- daemon stderr ---\n{}", daemon.stderr());
@@ -626,9 +620,8 @@ pub fn wait_with_timeout(
     bail!("walshadow-stream did not exit within {deadline:?}");
 }
 
-/// RAII wrapper that SIGKILLs the walshadow-stream subprocess on drop
-/// (test failure path). Tests that own a clean exit consume the child
-/// via `wait_with_timeout` first.
+/// RAII wrapper that stops the walshadow-stream subprocess on drop. Tests
+/// that own a clean exit consume the child via `wait_with_timeout` first.
 pub struct ChildGuard {
     pub child: Option<Child>,
 }
@@ -646,8 +639,7 @@ impl ChildGuard {
 impl Drop for ChildGuard {
     fn drop(&mut self) {
         if let Some(mut c) = self.child.take() {
-            let _ = c.kill();
-            let _ = c.wait();
+            tools::stop_gracefully(&mut c);
         }
     }
 }

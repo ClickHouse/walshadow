@@ -490,23 +490,18 @@ impl DdlApplicator {
             self.execute(&sql).await?;
             self.stats.alters_applied += 1;
         }
-        for attnum in &diff.dropped_columns {
-            // diff lists attnums only; resolve CH column name from old descriptor
-            let name = old
-                .attributes
-                .iter()
-                .find(|a| a.attnum == *attnum)
-                .map(|a| a.name.clone());
-            let Some(name) = name else {
-                self.stats.skipped += 1;
-                continue;
-            };
+        // diff lists attnums only; resolve CH column name from old descriptor
+        let dropped = old
+            .attributes
+            .iter()
+            .filter(|a| diff.dropped_columns.contains(&a.attnum));
+        for att in dropped {
             // Surface the drop on CH even if TOML still references the
             // column; emitter then encodes NULL for the vanished attnum
             let sql = format!(
                 "ALTER TABLE {} DROP COLUMN IF EXISTS {}",
                 target,
-                quote_ident(&name)
+                quote_ident(&att.name)
             );
             self.execute(&sql).await?;
             self.stats.alters_applied += 1;

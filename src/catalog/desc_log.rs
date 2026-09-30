@@ -1638,20 +1638,6 @@ impl DescriptorLogs {
         }
         found
     }
-
-    /// `[source] dbname`'s log, for paths that are single-database by
-    /// construction (bootstrap gap replay)
-    pub fn primary(&self) -> &Arc<DescriptorLog> {
-        &self.by_db.first().expect("at least one log").1
-    }
-
-    pub fn all(&self) -> impl Iterator<Item = &Arc<DescriptorLog>> {
-        self.by_db.iter().map(|(_, log)| log)
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.by_db.is_empty()
-    }
 }
 
 #[cfg(test)]
@@ -1808,18 +1794,18 @@ mod tests {
         assert!(!log.is_empty());
         assert_eq!(log.covered_through(), 100);
         assert_eq!(log.head(), 300);
-        match log.descriptor_at(rfn(6001), 179) {
-            LookupResult::Present(d) => assert_eq!(d, d1),
-            other => panic!("expected d1, got {other:?}"),
-        }
-        match log.descriptor_at(rfn(6001), 180) {
-            LookupResult::Present(d) => assert_eq!(d, d2),
-            other => panic!("expected d2, got {other:?}"),
-        }
-        match log.descriptor_by_oid_at(101, u64::MAX) {
-            LookupResult::Present(d) => assert_eq!(d, d2),
-            other => panic!("expected d2 by oid, got {other:?}"),
-        }
+        assert_eq!(
+            log.descriptor_at(rfn(6001), 179),
+            LookupResult::Present(d1.clone())
+        );
+        assert_eq!(
+            log.descriptor_at(rfn(6001), 180),
+            LookupResult::Present(d2.clone())
+        );
+        assert_eq!(
+            log.descriptor_by_oid_at(101, u64::MAX),
+            LookupResult::Present(d2.clone())
+        );
         assert_eq!(log.descriptor_at(rfn(6001), 89), LookupResult::NotCovered);
         assert!(log.batch_at(300).unwrap().entries.is_empty());
         assert!(log.batch_at(150).is_none());
@@ -1947,14 +1933,14 @@ mod tests {
         log.append_batch(batch(100, vec![present(90, &a), present(90, &b)]))
             .await
             .unwrap();
-        match log.descriptor_at(a.rfn, 150) {
-            LookupResult::Present(d) => assert_eq!(d, a),
-            other => panic!("expected a, got {other:?}"),
-        }
-        match log.descriptor_at(b.rfn, 150) {
-            LookupResult::Present(d) => assert_eq!(d, b),
-            other => panic!("expected b, got {other:?}"),
-        }
+        assert_eq!(
+            log.descriptor_at(a.rfn, 150),
+            LookupResult::Present(a.clone())
+        );
+        assert_eq!(
+            log.descriptor_at(b.rfn, 150),
+            LookupResult::Present(b.clone())
+        );
         // Tombstoning one chain leaves the sibling untouched
         log.append_batch(batch(
             200,
@@ -1968,10 +1954,10 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(log.descriptor_at(b.rfn, 200), LookupResult::Dropped);
-        match log.descriptor_at(a.rfn, 200) {
-            LookupResult::Present(d) => assert_eq!(d, a),
-            other => panic!("expected a to survive b's drop, got {other:?}"),
-        }
+        assert_eq!(
+            log.descriptor_at(a.rfn, 200),
+            LookupResult::Present(a.clone())
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2130,10 +2116,10 @@ mod tests {
         log.force_gc(Pos::new(100)).await.unwrap();
         assert_eq!(log.floor_at_write(), 100);
         // Active-at-floor survives, superseded predecessor dropped
-        match log.descriptor_at(rfn(8400), 150) {
-            LookupResult::Present(d) => assert_eq!(d, d2),
-            other => panic!("expected d2, got {other:?}"),
-        }
+        assert_eq!(
+            log.descriptor_at(rfn(8400), 150),
+            LookupResult::Present(d2.clone())
+        );
         assert_eq!(log.descriptor_at(rfn(8400), 20), LookupResult::NotCovered);
         // Batches at/below floor exist only as entry carriers
         assert!(log.batch_at(20).is_none());
@@ -2141,10 +2127,10 @@ mod tests {
         // Survives reopen from ckpt
         drop(log);
         let log = open(tmp.path()).await;
-        match log.descriptor_at(rfn(8400), 150) {
-            LookupResult::Present(d) => assert_eq!(d, d2),
-            other => panic!("expected d2 post-reopen, got {other:?}"),
-        }
+        assert_eq!(
+            log.descriptor_at(rfn(8400), 150),
+            LookupResult::Present(d2.clone())
+        );
     }
 
     /// `maybe_gc`'s threshold counts entries compaction would actually drop,
@@ -2272,10 +2258,10 @@ mod tests {
         assert_eq!(log.batch_at(150).unwrap().entries.len(), 1);
         assert!(log.batch_at(200).unwrap().entries.is_empty());
         // At-floor active entry retained below
-        match log.descriptor_at(rfn(8700), 100) {
-            LookupResult::Present(d) => assert_eq!(d, d1),
-            other => panic!("expected d1 at floor, got {other:?}"),
-        }
+        assert_eq!(
+            log.descriptor_at(rfn(8700), 100),
+            LookupResult::Present(d1.clone())
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2419,10 +2405,10 @@ mod tests {
         b.ambiguities
             .push(amb(AmbiguityScope::Rfn(rfn(9200)), 200, 300));
         log.append_batch(b).await.unwrap();
-        match log.descriptor_at(rfn(9200), 199) {
-            LookupResult::Present(d) => assert_eq!(d, d1),
-            other => panic!("expected d1 before interval, got {other:?}"),
-        }
+        assert_eq!(
+            log.descriptor_at(rfn(9200), 199),
+            LookupResult::Present(d1.clone())
+        );
         // [from, through): from covered, through not
         assert!(matches!(
             log.descriptor_at(rfn(9200), 200),
@@ -2432,10 +2418,10 @@ mod tests {
             log.descriptor_at(rfn(9200), 299),
             LookupResult::Ambiguous(_)
         ));
-        match log.descriptor_at(rfn(9200), 300) {
-            LookupResult::Present(d) => assert_eq!(d, d2),
-            other => panic!("expected d2 at through_lsn, got {other:?}"),
-        }
+        assert_eq!(
+            log.descriptor_at(rfn(9200), 300),
+            LookupResult::Present(d2.clone())
+        );
         // Chain entry inside the interval stays shadowed even though it
         // exists: ambiguity wins over Present
         assert!(matches!(
@@ -2549,10 +2535,10 @@ mod tests {
             log.descriptor_at(rfn(9500), 120),
             LookupResult::Ambiguous(_)
         ));
-        match log.descriptor_at(rfn(9500), 160) {
-            LookupResult::Present(d2) => assert_eq!(d2, d),
-            other => panic!("expected retained Present past interval, got {other:?}"),
-        }
+        assert_eq!(
+            log.descriptor_at(rfn(9500), 160),
+            LookupResult::Present(d.clone())
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -529,8 +529,7 @@ async fn bin_stream_replicates_segments_and_serves_metrics() {
     })();
 
     if !daemon_killed {
-        let _ = child.kill();
-        let _ = child.wait();
+        tools::stop_gracefully(&mut child);
     }
     if let Err(e) = result {
         let stderr = fs::read_to_string(&stderr_path).unwrap_or_default();
@@ -776,8 +775,7 @@ async fn wire_drop_midsegment_shadow_resumes_streaming() {
     if let Some(mut w) = writer {
         kill_group(&mut w);
     }
-    let _ = child.kill();
-    let _ = child.wait();
+    tools::stop_gracefully(&mut child);
     if let Err(e) = result {
         let stderr = fs::read_to_string(&stderr_path).unwrap_or_default();
         let slog = fs::read_to_string(shadow_data.join("startup.log")).unwrap_or_default();
@@ -906,8 +904,7 @@ async fn process_restart_preserves_shadow_postmaster() {
         }
         .await;
         if result.is_err() {
-            let _ = child.kill();
-            let _ = child.wait();
+            tools::stop_gracefully(&mut child);
         }
         assert!(
             result.is_ok(),

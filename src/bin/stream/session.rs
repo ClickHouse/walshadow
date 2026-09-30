@@ -1364,23 +1364,25 @@ pub(crate) async fn run_session(
         // already moved onto the target: replay, receive, and recovery state
         // beside the frozen frontier they have to reach
         // (architecture/recovery.md)
-        if !paused {
+        if let Some((_, pause_received)) = pause_frontier {
+            if promotion_polled_at.is_none_or(|t| t.elapsed() >= PROMOTION_POLL) {
+                promotion_polled_at = Some(Instant::now());
+                promotion = match tokio::time::timeout(
+                    PROMOTION_POLL,
+                    promotion_gate(&mut feed, pause_received),
+                )
+                .await
+                {
+                    Ok(gate) => gate,
+                    Err(_) => {
+                        feed.drop_sql_client();
+                        PromotionGate::unreachable()
+                    }
+                };
+            }
+        } else {
             promotion = PromotionGate::blocked("not_paused");
             promotion_polled_at = None;
-        } else if promotion_polled_at.is_none_or(|t| t.elapsed() >= PROMOTION_POLL) {
-            promotion_polled_at = Some(Instant::now());
-            promotion = match tokio::time::timeout(
-                PROMOTION_POLL,
-                promotion_gate(&mut feed, pause_frontier),
-            )
-            .await
-            {
-                Ok(gate) => gate,
-                Err(_) => {
-                    feed.drop_sql_client();
-                    PromotionGate::unreachable()
-                }
-            };
         }
         let (shadow_agg, shadow_served_tli) = {
             let state = shadow_state.lock().await;
@@ -1449,7 +1451,7 @@ pub(crate) async fn run_session(
         let chunk = tokio::select! {
             biased;
             () = shutdown.cancelled() => break "signal",
-            err = tasks.exited() => return Err(err),
+            Some(err) = tasks.exited() => return Err(err),
             res = &mut fsync_task => return Err(task_stopped("segment fsync", res, &fsync_fatal)),
             res = &mut gc_task => return Err(task_stopped("descriptor log gc", res, &gc_fatal)),
             // Surfaced by the check after the crossing step
@@ -1461,7 +1463,7 @@ pub(crate) async fn run_session(
             // arm and the pump continues from the same LSN. A pending crossing
             // also parks it — that connection is out of COPY until the
             // descendant is requested.
-            result = async { path.archive().expect("guarded by arm").next().await },
+            result = async { path.archive()?.next().await },
                 if matches!(path, SourcePath::Archive(_)) && !paused && !crossing.pending() => {
                 match result {
                     Some(Ok((start_lsn, bytes))) => {
@@ -2092,13 +2094,13 @@ impl SessionTasks {
         self.names.get(&id).copied().unwrap_or("session")
     }
 
-    /// First task to stop, as the error naming it. Pending while none has
-    async fn exited(&mut self) -> anyhow::Error {
-        match self.set.join_next_with_id().await {
-            Some(Ok((id, ()))) => anyhow::anyhow!("{} task exited", self.name(id)),
-            Some(Err(e)) => anyhow::anyhow!("{} task failed: {e}", self.name(e.id())),
-            None => std::future::pending().await,
-        }
+    /// First task to stop, as the error naming it. `None` once the set is empty
+    async fn exited(&mut self) -> Option<anyhow::Error> {
+        let res = self.set.join_next_with_id().await?;
+        Some(match res {
+            Ok((id, ())) => anyhow::anyhow!("{} task exited", self.name(id)),
+            Err(e) => anyhow::anyhow!("{} task failed: {e}", self.name(e.id())),
+        })
     }
 
     /// Abort what still runs, surfacing a task that panicked
@@ -2138,10 +2140,10 @@ mod tests {
         let mut tasks = SessionTasks::default();
         tasks.spawn("idle", std::future::pending());
         tasks.spawn("quits", async {});
-        let err = tasks.exited().await.to_string();
+        let err = tasks.exited().await.unwrap().to_string();
         assert!(err.contains("quits task exited"), "{err}");
         tasks.spawn("panics", async { panic!("boom") });
-        let err = tasks.exited().await.to_string();
+        let err = tasks.exited().await.unwrap().to_string();
         assert!(
             err.contains("panics task failed") && err.contains("boom"),
             "{err}"

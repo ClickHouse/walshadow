@@ -6,9 +6,30 @@
 
 use std::fmt::Display;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
 
 const REQUIRE: &str = "WALSHADOW_REQUIRE_TOOLS";
+
+/// Enable every callsite so coverage runs evaluate tracing field expressions
+#[ctor::ctor(unsafe)]
+fn enable_tracing() {
+    let _ = tracing::subscriber::set_global_default(tracing_subscriber::registry());
+}
+
+/// SIGINT, then SIGKILL if still running after 15 s. Instrumented binaries
+/// write their coverage profile only on exit, never under SIGKILL
+pub fn stop_gracefully(child: &mut Child) {
+    let _ = Command::new("kill")
+        .args(["-INT", &child.id().to_string()])
+        .status();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while matches!(child.try_wait(), Ok(None)) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
 
 /// Report a skip and return `false`, panic when CI requires every tool
 pub fn skip(reason: impl Display) -> bool {

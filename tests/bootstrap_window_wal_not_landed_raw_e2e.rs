@@ -28,8 +28,11 @@ use anyhow::{Context, Result};
 use walshadow::shadow::Shadow;
 
 const ROWS: i32 = 30_000;
-/// 4 MB/s holds the backup open long enough to write a real window
-const MAX_RATE_KIB: &str = "4096";
+/// 8 MB/s holds the backup open long enough to write a real window
+const MAX_RATE_KIB: &str = "8192";
+/// Enough to dirty pages in the window. Each segment of WAL they add rides in
+/// the tar at the rate limit
+const WINDOW_ROUNDS: i32 = 10;
 
 /// `Shadow::initdb` plus `-k`: checksums make every hint-bit set log a page
 /// image, the deployed source's configuration
@@ -157,11 +160,11 @@ async fn backup_window_wal_never_materialises_the_shadow() {
         fx::wait_for_backup_streaming(&source, Duration::from_secs(120))
             .context("BASE_BACKUP never opened")?;
 
-        // Dirty distinct heap pages for as long as the backup runs. With
-        // checksums on, each first touch since the checkpoint carries a page
-        // image, so this is the exact WAL shape that re-materialises a shadow.
+        // Dirty distinct heap pages while the backup runs. With checksums on,
+        // each first touch since the checkpoint carries a page image, so this
+        // is the exact WAL shape that re-materialises a shadow
         let mut round = 0i32;
-        while fx::backup_in_progress(&source) {
+        while round < WINDOW_ROUNDS && fx::backup_in_progress(&source) {
             let from = (round * 500) % ROWS + 1;
             source
                 .apply_schema_dump(&format!(

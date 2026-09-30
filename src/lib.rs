@@ -83,3 +83,10 @@ pub use source::{
 pub use toast::toast_retire;
 #[doc(hidden)]
 pub use xact::{spill, xact_buffer};
+
+/// Enable every callsite so coverage runs evaluate tracing field expressions
+#[cfg(test)]
+#[ctor::ctor(unsafe)]
+fn enable_tracing() {
+    let _ = tracing::subscriber::set_global_default(tracing_subscriber::registry());
+}

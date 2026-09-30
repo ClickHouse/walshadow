@@ -17,7 +17,7 @@ use tokio::task::JoinHandle;
 
 use crate::ch::{ChConn, EmitterError, drain_to_end_of_stream, with_timeout};
 use crate::config::DestEmitter;
-use crate::emit::ch_emitter::{ColumnBuf, EmitterStats, build_leaf, build_root};
+use crate::emit::ch_emitter::{EmitterStats, build_leaf, build_root};
 use crate::emit::pipeline::Fatal;
 use crate::emit::pipeline::ack::AckHandle;
 use crate::emit::pipeline::batcher::BatchMeta;
@@ -123,10 +123,7 @@ impl Inserter {
                     .buffers
                     .iter()
                     .zip(&leaves)
-                    .map(|(buf, leaf)| match buf {
-                        ColumnBuf::Oracle(_) => Ok(None),
-                        _ => build_root(buf, leaf.as_ref(), batch.n_rows).map(Some),
-                    })
+                    .map(|(buf, leaf)| build_root(buf, leaf.as_ref(), batch.n_rows))
                     .collect::<Result<_, _>>()
                 {
                     Ok(v) => v,

@@ -184,11 +184,6 @@ impl Filter {
         self.targets = db_oids.into_iter().collect();
     }
 
-    /// Followed databases, in the order they were set
-    pub fn target_dbs(&self) -> &[u32] {
-        &self.targets
-    }
-
     /// Route `rels` and relations created at or after `from_lsn` to both paths
     ///
     /// `rels` lists files shadow already holds at `from_lsn`
@@ -1271,10 +1266,7 @@ mod tests {
         let mut f = target_filter();
         let mut r = xact_assignment(100, &[101]);
         // Claim two subxids, carry one
-        match &mut r.main_data {
-            std::borrow::Cow::Owned(md) => md[4..8].copy_from_slice(&2i32.to_le_bytes()),
-            _ => unreachable!(),
-        }
+        r.main_data.to_mut()[4..8].copy_from_slice(&2i32.to_le_bytes());
         assert!(f.decide_record(&r, 150, 0xD116).is_err());
     }
 
@@ -1811,10 +1803,7 @@ mod tests {
         let mut f = target_filter();
         let mut r = xact_invals_rec(7, &[(-2, 5, 16400)]);
         // Claim two messages, carry one
-        match &mut r.main_data {
-            std::borrow::Cow::Owned(md) => md[0..4].copy_from_slice(&2i32.to_le_bytes()),
-            _ => unreachable!(),
-        }
+        r.main_data.to_mut()[0..4].copy_from_slice(&2i32.to_le_bytes());
         assert!(f.decide_record(&r, 150, 0xD116).is_err());
     }
 
@@ -1901,31 +1890,12 @@ mod tests {
 
     /// Commit / abort carrying `xl_xact_dbinfo` (`Oid dbId; Oid tsId`), the
     /// committing backend's database
-    fn xact_end_dbinfo(
-        op: u8,
-        xid: u32,
-        db_id: u32,
-        invals: &[(i8, u32, u32)],
-    ) -> XLogRecord<'static> {
-        use crate::decode::wal_xact::{XACT_XINFO_HAS_DBINFO, XACT_XINFO_HAS_INVALS};
+    fn xact_end_dbinfo(op: u8, xid: u32, db_id: u32) -> XLogRecord<'static> {
+        use crate::decode::wal_xact::XACT_XINFO_HAS_DBINFO;
         let mut md: Vec<u8> = 0i64.to_le_bytes().to_vec();
-        let mut xinfo = XACT_XINFO_HAS_DBINFO;
-        if !invals.is_empty() {
-            xinfo |= XACT_XINFO_HAS_INVALS;
-        }
-        md.extend_from_slice(&xinfo.to_le_bytes());
+        md.extend_from_slice(&XACT_XINFO_HAS_DBINFO.to_le_bytes());
         md.extend_from_slice(&db_id.to_le_bytes());
         md.extend_from_slice(&1663u32.to_le_bytes()); // tsId
-        if !invals.is_empty() {
-            md.extend_from_slice(&(invals.len() as i32).to_le_bytes());
-            for &(id, db, rel) in invals {
-                let mut msg = [0u8; 16];
-                msg[0] = id as u8;
-                msg[4..8].copy_from_slice(&db.to_le_bytes());
-                msg[8..12].copy_from_slice(&rel.to_le_bytes());
-                md.extend_from_slice(&msg);
-            }
-        }
         let mut r = rec_with_xid(RmId::Xact, &[], xid);
         r.header.info = op | XLOG_XACT_HAS_INFO;
         r.main_data = std::borrow::Cow::Owned(md);
@@ -1954,7 +1924,7 @@ mod tests {
         );
         let v = f
             .decide_record(
-                &xact_end_dbinfo(XLOG_XACT_COMMIT, 7, FOREIGN_DB, &[]),
+                &xact_end_dbinfo(XLOG_XACT_COMMIT, 7, FOREIGN_DB),
                 200,
                 0xD116,
             )
@@ -1975,7 +1945,7 @@ mod tests {
         assert!(user.defer_catalog_decode, "target DDL fences its own rows");
         let b = f
             .decide_record(
-                &xact_end_dbinfo(XLOG_XACT_COMMIT, 8, TARGET_DB, &[]),
+                &xact_end_dbinfo(XLOG_XACT_COMMIT, 8, TARGET_DB),
                 400,
                 0xD116,
             )
@@ -2000,7 +1970,7 @@ mod tests {
         .unwrap();
         let v = f
             .decide_record(
-                &xact_end_dbinfo(XLOG_XACT_COMMIT, 7, FOREIGN_DB, &[]),
+                &xact_end_dbinfo(XLOG_XACT_COMMIT, 7, FOREIGN_DB),
                 200,
                 0xD116,
             )
@@ -2022,11 +1992,7 @@ mod tests {
                 "filenode tracking stays cluster-wide"
             );
             let v = f
-                .decide_record(
-                    &xact_end_dbinfo(XLOG_XACT_COMMIT, xid, db, &[]),
-                    200,
-                    0xD116,
-                )
+                .decide_record(&xact_end_dbinfo(XLOG_XACT_COMMIT, xid, db), 200, 0xD116)
                 .unwrap();
             assert!(!v.catalog_boundary, "db {db} relmap is not target dirt");
         }
@@ -2041,7 +2007,7 @@ mod tests {
             .unwrap();
         let v = f
             .decide_record(
-                &xact_end_dbinfo(XLOG_XACT_COMMIT, 7, FOREIGN_DB, &[]),
+                &xact_end_dbinfo(XLOG_XACT_COMMIT, 7, FOREIGN_DB),
                 200,
                 0xD116,
             )
@@ -2052,7 +2018,7 @@ mod tests {
         );
         let v = f
             .decide_record(
-                &xact_end_dbinfo(XLOG_XACT_COMMIT, 7, FOREIGN_DB, &[]),
+                &xact_end_dbinfo(XLOG_XACT_COMMIT, 7, FOREIGN_DB),
                 300,
                 0xD116,
             )
@@ -2067,21 +2033,16 @@ mod tests {
             .unwrap();
         let err = f
             .decide_record(
-                &xact_end_dbinfo(XLOG_XACT_COMMIT, 7, FOREIGN_DB, &[]),
+                &xact_end_dbinfo(XLOG_XACT_COMMIT, 7, FOREIGN_DB),
                 200,
                 0xD116,
             )
             .unwrap_err();
-        assert!(
-            matches!(
-                err,
-                XactPayloadError::ForeignScope {
-                    db_id: FOREIGN_DB,
-                    target: TARGET_DB
-                }
-            ),
-            "{err}"
-        );
+        let want = XactPayloadError::ForeignScope {
+            db_id: FOREIGN_DB,
+            target: TARGET_DB,
+        };
+        assert_eq!(err.to_string(), want.to_string());
         let v = f
             .decide_record(&xact_end(XLOG_XACT_COMMIT, 7, &[], None), 300, 0xD116)
             .unwrap();

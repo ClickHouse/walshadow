@@ -46,9 +46,7 @@ pub trait Backfiller: Send + Sync {
 
     /// Why this backfiller cannot serve `mode`, so callers refuse the request
     /// before creating a destination it would leave empty
-    fn refuses(&self, _mode: InitialLoadMode) -> Option<&'static str> {
-        None
-    }
+    fn refuses(&self, mode: InitialLoadMode) -> Option<&'static str>;
 }
 
 /// Dispatch one `config_table` row's inclusion intent. `opt_in_lsn` is the

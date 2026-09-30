@@ -944,14 +944,9 @@ mod tests {
     /// Flatten the drain's coalesced `Rows` chunks back to a row list
     async fn collect_rows(rx: &mut mpsc::Receiver<BatcherMsg>) -> Vec<RoutedRow> {
         let mut rows = Vec::new();
-        while let Some(msg) = rx.recv().await {
-            match msg {
-                BatcherMsg::Rows(chunk) => rows.extend(chunk.rows),
-                BatcherMsg::Row(r) => rows.push(r),
-                BatcherMsg::FlushAll(reply) => {
-                    let _ = reply.send(());
-                }
-            }
+        // Any other message ends collection short of the expected rows
+        while let Some(BatcherMsg::Rows(chunk)) = rx.recv().await {
+            rows.extend(chunk.rows);
         }
         rows
     }
@@ -962,18 +957,12 @@ mod tests {
     /// read-only end-of-backup store
     #[tokio::test(flavor = "current_thread")]
     async fn a_miss_is_fatal_for_a_seeded_mirror_and_superseded_for_a_read_only_store() {
-        use crate::toast::{ChunkStore, ChunkStoreError, MemChunkStore, ToastRow};
+        use crate::toast::{ChunkStore, ChunkStoreError, MemChunkStore};
 
         struct ReadOnly;
 
         #[async_trait::async_trait]
         impl ChunkStore for ReadOnly {
-            fn accepts_writes(&self) -> bool {
-                false
-            }
-            async fn put(&self, _: &[ToastRow]) -> Result<(), ChunkStoreError> {
-                Err(ChunkStoreError::ReadOnly("put"))
-            }
             async fn fetch_many(
                 &self,
                 _: u32,
@@ -982,12 +971,6 @@ mod tests {
             ) -> Result<Vec<FetchedValue>, ChunkStoreError> {
                 // Incomplete value is absent from end-of-backup state
                 Ok(vec![FetchedValue::Mismatch { got: 7984 }; values.len()])
-            }
-            async fn truncate_mirror(&self, _: u32) -> Result<(), ChunkStoreError> {
-                Err(ChunkStoreError::ReadOnly("truncate_mirror"))
-            }
-            async fn rewrite_barrier(&self, _: u32, _: u64, _: u64) -> Result<(), ChunkStoreError> {
-                Err(ChunkStoreError::ReadOnly("rewrite_barrier"))
             }
         }
 
@@ -1024,7 +1007,12 @@ mod tests {
         let stats = Arc::new(EmitterStats::default());
         let read_only = ToastResolver::with_store(Arc::new(ReadOnly), stats.clone());
         assert!(!read_only.stores_chunks() && !read_only.fill_on_miss());
-        let (column, retained) = apply_fetched(short, &ptr, 25, &rel, "body", &read_only)
+        let fetched = read_only
+            .fetch_value(0, 16390, 16402, u64::MAX, 9100)
+            .await
+            .unwrap();
+        assert_eq!(fetched, short);
+        let (column, retained) = apply_fetched(fetched, &ptr, 25, &rel, "body", &read_only)
             .expect("a read-only backend fills instead of failing the load");
         assert_eq!(column, ColumnValue::Null);
         assert_eq!(retained, 0);
@@ -1858,16 +1846,6 @@ mod tests {
         struct FailPrefetch(AtomicU64);
         #[async_trait::async_trait]
         impl ChunkStore for FailPrefetch {
-            async fn truncate_mirror(&self, _: u32) -> Result<(), ChunkStoreError> {
-                Ok(())
-            }
-            async fn rewrite_barrier(&self, _: u32, _: u64, _: u64) -> Result<(), ChunkStoreError> {
-                Ok(())
-            }
-
-            async fn put(&self, _: &[ToastRow]) -> Result<(), ChunkStoreError> {
-                Ok(())
-            }
             async fn fetch_many(
                 &self,
                 _: u32,

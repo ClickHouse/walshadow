@@ -350,10 +350,14 @@ mod tests {
     #[test]
     fn numeric_long_form_truncated_body() {
         let body = NUMERIC_POS.to_le_bytes().to_vec();
-        match decode_numeric(&body) {
-            Err(CodecError::Truncated { offset: 2, .. }) => (),
-            other => panic!("expected Truncated at offset 2, got {other:?}"),
-        }
+        assert_eq!(
+            decode_numeric(&body),
+            Err(CodecError::Truncated {
+                offset: 2,
+                need: 4,
+                have: 2,
+            })
+        );
     }
 
     #[test]

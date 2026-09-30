@@ -393,9 +393,11 @@ impl WalReplaySink {
                         rows_cursor = upto;
                     }
                 }
-                // Live stream owns DDL/config apply
+                // Live stream owns DDL/config apply. xl_heap_truncate carries
+                // no block ref, so never passes the rfn filter
                 WalkStep::Event(DrainEntry::Catalog(_))
-                | WalkStep::Event(DrainEntry::Config(_)) => {}
+                | WalkStep::Event(DrainEntry::Config(_))
+                | WalkStep::Truncate(_) => {}
                 WalkStep::Event(DrainEntry::ToastBarrier {
                     toast_relid,
                     marker_lsn,
@@ -406,11 +408,6 @@ impl WalReplaySink {
                         .rewrite_barrier(toast_relid, marker_lsn, commit_lsn)
                         .await
                         .map_err(|e| SinkError::Other(format!("toast rewrite barrier: {e}")))?;
-                }
-                WalkStep::Truncate(_) => {
-                    // xl_heap_truncate carries no block ref, never passes the
-                    // rfn filter
-                    debug_assert!(false, "TRUNCATE heap in gap replay");
                 }
                 WalkStep::Heap(mut heap) => {
                     let rfn = heap.decoded.rfn;

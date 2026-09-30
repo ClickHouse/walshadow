@@ -276,12 +276,6 @@ impl ShadowCatalog {
         query_with_reconnect!(self, query, statement, params)
     }
 
-    /// Last observed `pg_last_wal_replay_lsn()` (None until shadow replays
-    /// anything, e.g. fresh standby start).
-    pub fn last_observed_replay(&self) -> Option<u64> {
-        self.last_replay_lsn
-    }
-
     /// Wait until shadow's replay LSN ≥ `target`, returning the deciding poll's
     /// LSN. `target = 0` returns on the first non-zero LSN.
     ///

@@ -608,6 +608,10 @@ pub(crate) fn bootstrap_gauges(
 mod tests {
     use super::*;
 
+    fn db_label(oid: u32) -> String {
+        format!("db{oid}")
+    }
+
     /// A partial publish from inside the leg must not blank the fields the
     /// status loop owns, or the leg would look like a dead pipeline
     #[tokio::test]
@@ -671,7 +675,7 @@ mod tests {
                     boundary_hold: &boundary,
                     by_database: Vec::new(),
                     counters: StageCounters {
-                        db_name: &|_| String::new(),
+                        db_name: &db_label,
                         emitter: Some(&emitter),
                         oracle: [None, None],
                         bootstrap: None,
@@ -715,7 +719,7 @@ mod tests {
         let snap = stage_gauges(&StageCounters {
             db_name: &|oid| match oid {
                 5 => "app".to_owned(),
-                _ => format!("db{oid}"),
+                _ => db_label(oid),
             },
             emitter: Some(&emitter),
             oracle: [None, None],
@@ -739,7 +743,7 @@ mod tests {
         use walshadow::record::WAL_SEG_SIZE;
         let emitter = EmitterStats::default();
         let counters = StageCounters {
-            db_name: &|_| String::new(),
+            db_name: &db_label,
             emitter: Some(&emitter),
             oracle: [None, None],
             bootstrap: None,
@@ -794,7 +798,7 @@ mod tests {
         boot_oracle.rows.fetch_add(7, Ordering::Relaxed);
 
         let snap = stage_gauges(&StageCounters {
-            db_name: &|_| String::new(),
+            db_name: &db_label,
             emitter: None,
             oracle: [Some(&live_oracle), Some(&boot_oracle)],
             bootstrap: None,
@@ -806,7 +810,7 @@ mod tests {
         assert_eq!(snap.bootstrap_attempt, 2);
 
         let boot_only = stage_gauges(&StageCounters {
-            db_name: &|_| String::new(),
+            db_name: &db_label,
             emitter: None,
             oracle: [None, Some(&boot_oracle)],
             bootstrap: None,

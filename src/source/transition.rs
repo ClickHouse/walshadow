@@ -1156,11 +1156,10 @@ mod tests {
             TransitionError::Source(anyhow::anyhow!("x")),
         ];
         for e in &errs {
+            let reason = e.reason();
             assert!(
-                SWITCH_FAILURE_REASONS.contains(&e.reason()),
-                "{} → unlabelled reason {}",
-                e,
-                e.reason(),
+                SWITCH_FAILURE_REASONS.contains(&reason),
+                "{e} → unlabelled reason {reason}"
             );
         }
     }

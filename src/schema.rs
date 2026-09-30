@@ -108,16 +108,6 @@ pub enum ReplIdent {
 }
 
 impl ReplIdent {
-    /// `pg_class.relreplident`
-    pub fn to_char(&self) -> char {
-        match self {
-            ReplIdent::Default { .. } => 'd',
-            ReplIdent::Nothing => 'n',
-            ReplIdent::Full { .. } => 'f',
-            ReplIdent::UsingIndex { .. } => 'i',
-        }
-    }
-
     /// Build from `pg_class.relreplident` plus the `pg_index` rows it names:
     /// the primary key for `d`/`f`, the replica-identity index for `i`
     pub fn from_parts(

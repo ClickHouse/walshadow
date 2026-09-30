@@ -273,25 +273,6 @@ impl RecordSink for BoundaryHoldSink {
             self.inner.flush().await
         })
     }
-
-    fn on_idle<'a>(
-        &'a mut self,
-    ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
-        self.inner.on_idle()
-    }
-
-    fn on_close<'a>(
-        &'a mut self,
-    ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
-        self.inner.on_close()
-    }
-
-    fn on_idle_advance<'a>(
-        &'a mut self,
-        lsn: u64,
-    ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
-        self.inner.on_idle_advance(lsn)
-    }
 }
 
 #[cfg(test)]
@@ -396,25 +377,20 @@ mod tests {
             .register_connection(0x1000, 1, None)
             .expect("current timeline");
         let gate = gate_with(s.clone(), Duration::from_secs(5));
+        let queued = s.lock().await.queued();
         let prodded = tokio::spawn({
             let s = s.clone();
             async move {
-                loop {
-                    let drained = s.lock().await.drain_send_queue(id);
-                    if let Some(bytes) = drained {
-                        // 'd' + u32 len + 'k' + wal_end(8) + time(8) + reply(1)
-                        assert_eq!(bytes[5], b'k');
-                        assert_eq!(*bytes.last().unwrap(), 1, "reply requested");
-                        s.lock().await.observe_status(
-                            id,
-                            0x3000,
-                            Pos::new(0x3000),
-                            Pos::new(0x3000),
-                        );
-                        return;
-                    }
-                    tokio::time::sleep(Duration::from_millis(1)).await;
-                }
+                // Wait on listener wake, not runtime task order
+                queued.advance(Pos::ZERO).await.expect("state alive");
+                let bytes = s.lock().await.drain_send_queue(id);
+                let bytes = bytes.expect("keepalive queued before hold parks");
+                // 'd' + u32 len + 'k' + wal_end(8) + time(8) + reply(1)
+                assert_eq!(bytes[5], b'k');
+                assert_eq!(*bytes.last().unwrap(), 1, "reply requested");
+                s.lock()
+                    .await
+                    .observe_status(id, 0x3000, Pos::new(0x3000), Pos::new(0x3000));
             }
         });
         gate.hold(0x2F00, Pos::new(0x3000), || true)

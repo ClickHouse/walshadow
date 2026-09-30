@@ -444,11 +444,9 @@ mod tests {
             log.descriptor_at(d.rfn, from),
             LookupResult::Present(got) if got.rel_name == d.rel_name
         ));
+        let prefix = log.descriptor_at(d.rfn, read_start(from));
         assert!(
-            matches!(
-                log.descriptor_at(d.rfn, read_start(from)),
-                LookupResult::Present(_)
-            ),
+            matches!(prefix, LookupResult::Present(_)),
             "records in the alignment prefix decode too; their commits drop on `from_lsn`",
         );
         assert!(matches!(

@@ -529,23 +529,8 @@ impl Harness {
     /// SIGINT → graceful drain so tracing flushes to the stderr file; SIGKILL
     /// only if it doesn't exit promptly.
     fn stop_daemon(&mut self) {
-        let Some(mut c) = self.child.take() else {
-            return;
-        };
-        let _ = Command::new("kill")
-            .args(["-INT", &c.id().to_string()])
-            .status();
-        let deadline = Instant::now() + Duration::from_secs(15);
-        loop {
-            match c.try_wait() {
-                Ok(Some(_)) => break,
-                _ if Instant::now() >= deadline => {
-                    let _ = c.kill();
-                    let _ = c.wait();
-                    break;
-                }
-                _ => std::thread::sleep(Duration::from_millis(100)),
-            }
+        if let Some(mut c) = self.child.take() {
+            fx::tools::stop_gracefully(&mut c);
         }
     }
 
@@ -905,10 +890,11 @@ async fn ch_password_rotation_via_ctl_keeps_streaming() {
 
         // A credential the server rejects must surface as the inserter's own
         // refusal, which is what proves the dial reads live config rather than
-        // the value it booted on.
+        // the value it booted on. No retries, so the refusal surfaces on the
+        // first dial rather than after the backoff
         h.ctl_body(
             &["apply"],
-            "[ch]\npassword = \"wrong\"\ncompression = \"lz4\"\n",
+            "[ch]\npassword = \"wrong\"\ncompression = \"lz4\"\nretry_max_attempts = 0\n",
         )?;
         h.psql("UPDATE demo.users SET email = 'wrong@x' WHERE id = 1")?;
         h.wait_log("Authentication failed", Duration::from_secs(30))
@@ -1369,7 +1355,7 @@ async fn pause_and_stop_writes(h: &Harness, target: &Shadow) -> Result<()> {
     // 3. A paused walshadow sends no standby status, so its walsender only exits
     //    on `wal_sender_timeout` and fast shutdown waits for that
     h.psql("INSERT INTO demo.users VALUES (2, 'bob', 'below-fork@x')")?;
-    h.psql("ALTER SYSTEM SET wal_sender_timeout = '5s'")?;
+    h.psql("ALTER SYSTEM SET wal_sender_timeout = '1s'")?;
     h.psql("SELECT pg_reload_conf()")?;
     h.source.stop().context("stop source primary")?;
 
@@ -2092,7 +2078,7 @@ async fn restart_while_paused_refreezes_the_frontier_and_still_crosses() {
         // The source is down and `[source]` still names it, so boot waits for
         // the repoint rather than exiting into a supervisor loop
         h.stop_daemon();
-        h.start_daemon(Duration::from_secs(8))
+        h.start_daemon(Duration::from_secs(3))
             .await
             .expect_err("pump must not resume while the source it is pointed at is stopped");
         ensure!(
