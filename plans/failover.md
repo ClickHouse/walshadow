@@ -2,8 +2,7 @@
 
 [Planned switchover](../docs/failover.md) already handles controlled descendant
 timeline crossing, including restart and stable endpoints. Remaining work covers
-unplanned promotion, archive fallback across timelines, and backups taken on
-ancestor timelines. Current crossing design is in
+unplanned promotion and remaining archive/restart fault cases. See
 [recovery architecture](../architecture/recovery.md)
 
 ## Unplanned promotion
@@ -29,22 +28,22 @@ remain errors
 
 ## Archives and backups
 
-Resolve history before fetching segments. Use branch owning each segment and
-each record range, including descendant filename for a fork segment. Validate
-prefix shared with ancestor before accepting it. Do not substitute a partial
-archive file for a complete required segment
+Do not reimplement archive lineage or ancestor-backup replay. PostgreSQL 18.6 /
+ClickHouse 26.8.1.951 tests at `1267db7` pass for ancestor-backup bootstrap,
+[backup gap replay across promotion](../tests/backfill_gap_across_promotion.rs),
+and [control-plane recovery](../tests/control_plane_e2e.rs): descendant copies
+when ancestor segments are partial, two forks within one segment, source slot
+ahead of replay, archive history discovery after source death, and restart inside
+fork barrier
 
-Make verified fork prefix available to archive-only shadow recovery or report
-explicit wait for segment durability. Test restart before segment fills
+Archive discovery after source death proves recovery within already accepted
+branch; it does not authorize crossing onto an unproved live source. Retain that
+distinction when extending recovery
 
-Object-store bootstrap WAL hydration, its window leg, landed-WAL filtering, and
-direct backup from a standby resolve branches through
-[archive history](../src/source/archive_history.rs), on the same rules as the
-table load's gap. A backup's timeline is lineage input, not proof it belongs to
-current source. Reject backups outside ancestry
-
-Once archive fallback covers these cases, prove slotless pause can resume after
-source recycles WAL. Missing history or segments must still stop replication
+Prove slotless pause resumes after source recycles WAL. Add restart with an
+unsealed descendant segment and archive-only shadow recovery, verifying either
+durable fork prefix or explicit wait. Test missing history separately from
+missing segment, including direct backups taken from a standby
 
 ## Transition implementation
 
@@ -65,21 +64,13 @@ aborted continuation evidence expected by PostgreSQL reader, accepting page flag
 alone cannot make shadow cross safely. Test failure without shadow PANIC/FATAL,
 then enable only after source and shadow agree on overwritten LSN
 
-Live archive fallback resolves each segment through the same archive-history
-resolver the table load's gap uses, rather than the branch it happens to stream.
-Resolve filename per segment and owning branch per record range
-Handle multiple forks inside one segment and suppress repeated prefixes only
-after validation, never send prefix twice through filter or decoder. Place
-history files before shadow requests descendant WAL
-
 Keep fork-prefix durability explicit when descendant segment is unsealed
 Coordinate atomic archive publication with [TOAST gate](shadow_toast.md) and
-custom-record [provenance](custom_rmgr.md). Exercise archive-only reconnect at
-fork and missing history separately from missing segment
+custom-record [provenance](custom_rmgr.md)
 
-Sequence ordinary-state fence, overwritten-continuation support, archive lineage
-and fork-prefix durability, then ancestor-backup replay. Keep refusal until each
-enabled case advances source, shadow, and durable floor consistently
+Sequence ordinary-state fence, overwritten-continuation support, and remaining
+fork-prefix durability proofs. Keep refusal until each enabled case advances
+source, shadow, and durable floor consistently
 
 ## Completion
 

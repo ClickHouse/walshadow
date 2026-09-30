@@ -5,6 +5,46 @@ column rules, and destination sorting keys already exist. Current syntax and
 precedence live in [configuration](../docs/configuration.md). Do not duplicate
 that surface here
 
+## Operator health and recovery
+
+Locate UI/integration owning reported sync-time and restart behavior before
+treating it as a reproduced daemon defect. Repository's Grafana dashboard is
+metrics-only; local tests cannot verify external UI freshness. Define status
+contract for consumers before adding another control service
+
+Distinguish process liveness, observation freshness, source receipt, shadow
+replay, and contiguous destination acknowledgement. Derive last successful
+delivery from acknowledged work, never poll time or source activity. Expire
+cached observations to stale/unknown; preserve last known progress and failure
+reason. Keep idle, paused, blocked, recovering, and unavailable states distinct
+
+Expose supervisor-backed restart through owning integration, since dead daemon
+cannot serve its control socket. Preserve persistent state and resume floor;
+show blocked value/config diagnostics and required correction before restart.
+Treat repeated deterministic rejection separately from transient reconnects
+
+Test daemon kill, lost status endpoint, stale cached response, ClickHouse outage,
+intentional pause, and idle source. Assert UI cannot claim fresh destination
+delivery while unavailable or blocked. After correction and restart, require
+acknowledged catch-up before reporting recovery complete
+
+## Expose existing table and schema selection
+
+Reuse `ctl tables`, `ctl add`, namespace config, and glob rules through owning
+integration. Show resolved source/destination identities, exclusions, initial
+load policy, pending load state, and errors
+
+Define schema selection as current plus future eligible tables, with explicit
+exclusions and initial-load choice. Broad scope alone does not backfill existing
+rows. Preview unsupported tables before applying scope; keep commit-ordered
+config and existing load mechanisms
+
+Test populated-table opt-in during writes, schema selection with existing and
+future tables, exclusions, repeated submission, reload, and restart. Compare
+historical plus concurrent rows after loads complete. Extend
+[config tests](../tests/runtime_config_e2e.rs) only where coverage is missing;
+carry UI acceptance into owning integration
+
 ## Source-side commands
 
 Add WAL-carried commands only for operations that do not fit stored config,

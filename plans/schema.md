@@ -10,6 +10,27 @@ Start in [schema comparison](../src/schema.rs),
 [DDL application](../src/emit/ch_ddl.rs). Current operator contract lives in
 [schema changes](../docs/schema-changes.md)
 
+## Reproduced gaps
+
+Checked revision `1267db7` on PostgreSQL 18.6 and ClickHouse 26.8.1.951
+Use [schema harness](../tests/schema_evolution_cdc.rs) with namespace auto-create,
+fresh `probe` schema per case, and `pg_switch_wal()` before and after transition
+Drain pipeline, then compare source with `FINAL WHERE _is_deleted = 0`
+All cases below drain successfully despite different final rows
+
+| Setup and transition | Observed destination | Next step |
+|---|---|---|
+| Create `t(id int PRIMARY KEY, v text)`, insert `(1,'before')`, rename to `renamed`, insert `(2,'after')` | Old destination contains only `(1,'before')` | Emit relation-identity event and rekey route before following rows |
+| Same keyed table, update `id = 2, v = 'after'` | Both `(1,'before')` and `(2,'after')` survive | Emit old-key tombstone and new row under same commit |
+| Create `t(id int, v text)` with `REPLICA IDENTITY FULL`, insert `(1,'before')`, update `v = 'after'` | Both versions survive | Reject missing stable row key until duplicate semantics are defined |
+| Create unlogged keyed table, insert two rows | Destination exists but contains no rows | Reject unlogged scope before destination creation |
+
+Drop/recreate under default retain also leaves both generations' rows. Treat
+that as selected retention policy, not unexplained loss; test explicit warn/drop
+policies separately. Column rename/drop without target-name overrides, `CLUSTER`,
+and automatic nullable widening converged in these probes. Keep mapped-column, pinned-type,
+restart, and combined-transaction cases below
+
 ## Relation renames
 
 Table renames, schema moves, and schema renames change only relation name
@@ -61,7 +82,7 @@ warning followed by incomplete routing is not rejection
 | Drop NOT NULL, then insert NULL | Pinned destination type only warns, and emitter writes type default for NULL into non-Nullable columns. Reject instead of substituting |
 | Create an unlogged table or switch to unlogged | Persistence never reaches schema diff. Reject replication scope that cannot receive its row changes |
 | Attach a populated partition | Define leaf routing and initial load before accepting parent scope |
-| Drop and recreate a name | Test retained destination rows under retain and warn policies |
+| Drop and recreate a name | Verify warn/drop policies and restart preserve chosen generation policy |
 | Drop with CASCADE or a refused RESTRICT | Apply chosen dependent-object policy and preserve unaffected mappings |
 
 Column DDL must address destination columns by mapped name. `DROP COLUMN`
@@ -69,8 +90,8 @@ names old source column, so a column with a configured destination name stays
 in ClickHouse. `RENAME COLUMN` renames to new source name while mapping takes
 column rule's target name
 
-Cover column rename and drop landing in ClickHouse, and `CLUSTER`. Compare
-schema-change tests against canonical source rows, not literals
+Cover configured target names through column rename/drop, including restart
+Compare schema-change tests against canonical source rows, not literals
 
 ## Column retype
 
@@ -94,9 +115,10 @@ Test or document remaining cases:
 - `REFRESH MATERIALIZED VIEW` also fills transient heap; verify handling of
   refreshed rows and removal of rows absent from new contents
 
-Cover `text` to `int` with values ClickHouse cannot parse, key column `int` to
-`bigint` including ClickHouse refusal, volatile `ADD COLUMN` defaults, retype
-plus rename in one statement, DML after rewriting `ALTER` in same transaction,
+Existing `alter_column_type_converges_through_rewrite` passes with source
+`'abc'` rewritten through `USING length(s)` and integer widening. Extend it with
+key column `int` to `bigint` including ClickHouse refusal, volatile `ADD COLUMN`
+defaults, retype plus rename in one statement, DML after rewriting `ALTER` in same transaction,
 restart during rewrite transaction, and rewrite beyond spill threshold. Compare
 canonical source rows against destination `FINAL`
 
