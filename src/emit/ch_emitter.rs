@@ -869,6 +869,7 @@ impl Default for StreamSection {
 struct NamespacePatch {
     target_database: Option<String>,
     auto_create: Option<bool>,
+    auto_create_prefix: Option<String>,
     #[serde(default, deserialize_with = "crate::toml_de::de_from_str")]
     drop_table_strategy: Option<DropTableStrategy>,
     #[serde(default, deserialize_with = "crate::toml_de::de_from_str")]
@@ -1082,6 +1083,7 @@ impl EmitterConfig {
                 NamespaceMapping {
                     target_database: n.target_database,
                     auto_create: n.auto_create.unwrap_or(false),
+                    auto_create_prefix: n.auto_create_prefix,
                     drop_table_strategy: n.drop_table_strategy,
                     initial_load: n.initial_load,
                 },
@@ -2753,6 +2755,25 @@ mod tests {
                 expected.map(Duration::from_secs)
             );
         }
+    }
+
+    #[test]
+    fn namespace_auto_create_prefix_parses() {
+        let c = EmitterConfig::from_toml_str(
+            "[ch]\nhost = \"h\"\n\n[namespace.public]\nauto_create = true\nauto_create_prefix = \"public_\"\n",
+        )
+        .expect("parses");
+        let ns = c.namespaces.get("public").expect("namespace parsed");
+        assert!(ns.auto_create);
+        assert_eq!(ns.auto_create_prefix.as_deref(), Some("public_"));
+        assert_eq!(
+            EmitterConfig::from_toml_str("[ch]\n[namespace.public]\nauto_create = true\n")
+                .expect("parses")
+                .namespaces
+                .get("public")
+                .and_then(|n| n.auto_create_prefix.as_deref()),
+            None,
+        );
     }
 
     #[test]
