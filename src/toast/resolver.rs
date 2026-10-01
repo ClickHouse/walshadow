@@ -721,7 +721,8 @@ impl ClickHouseChunkStore {
                             client.send_data(Some(bb)).await?;
                             client.send_data_end().await?;
                         }
-                        drain_to_end_of_stream(&mut client).await
+                        drain_to_end_of_stream(&mut client).await?;
+                        Ok(())
                     })
                     .await;
                     (client, result)

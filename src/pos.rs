@@ -64,6 +64,9 @@ lsn_kinds! {
     Snapshot => "snapshot";
     /// Segment-aligned, archive-clamped resume and GC floor
     Floor => "floor";
+    /// Unaligned resume pick: operator pin, bootstrap end, durable ack or
+    /// greenfield head, before alignment makes it a [`Floor`]
+    RawStart => "raw_start";
     /// Timeline start or ancestor switchpoint
     Switchpoint => "switchpoint";
 }
@@ -71,10 +74,30 @@ lsn_kinds! {
 kinds! {
     /// Contiguous done prefix in ack collector seq space
     AckFrontier => "ack_frontier";
+}
+
+macro_rules! count_kinds {
+    ($($(#[$m:meta])* $name:ident => $label:literal;)+) => {
+        kinds! { $($(#[$m])* $name => $label;)+ }
+        $(impl CountKind for $name {})+
+    };
+}
+
+count_kinds! {
     /// Enqueues onto shadow send queues
     QueuedWake => "queued_wake";
     /// Standby status reports plus connection attaches
     AppliedWake => "applied_wake";
+}
+
+macro_rules! observed {
+    ($($name:ident),+ $(,)?) => { $(impl ObservedKind for $name {})+ };
+}
+
+observed! {
+    SourceReceived, ShadowReplay, ShadowFlush, ShadowDispatched, Drain, EmitterAck,
+    ResumeSafe, XactFirst, FilterDispatched, Commit, Snapshot, Switchpoint,
+    AckFrontier, QueuedWake, AppliedWake,
 }
 
 pub struct Pos<K>(u64, PhantomData<fn() -> K>);
@@ -175,6 +198,38 @@ impl<'de, K: LsnKind> Deserialize<'de> for Pos<K> {
     }
 }
 
+/// Kinds whose cells advance from any observed value. Durability watermarks
+/// stay off it, their cells advance only through [`Durable`]
+pub trait ObservedKind: PosKind {}
+
+/// Event tally, the only kind [`Monotone::bump`] accepts, so a byte position
+/// can never step forward without a value backing it
+pub trait CountKind: ObservedKind {}
+
+/// Position proven persisted. Constructed only where persistence happens, so
+/// a cell publishing it can never run ahead of what a crash-now restart keeps
+pub struct Durable<K>(Pos<K>);
+
+impl<K> Durable<K> {
+    pub(crate) const fn new(pos: Pos<K>) -> Self {
+        Self(pos)
+    }
+
+    /// Integration tests stand in for persistence they do not run
+    #[cfg(feature = "test-support")]
+    pub const fn assume_for_test(pos: Pos<K>) -> Self {
+        Self(pos)
+    }
+}
+
+impl<K> Clone for Durable<K> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<K> Copy for Durable<K> {}
+
 /// Shared position that only moves forward, with level-triggered waiters
 ///
 /// `join` is the routine mutator: a watermark that can be assigned is one that
@@ -193,7 +248,7 @@ impl<K> Monotone<K> {
         }
     }
 
-    pub fn join(&self, v: Pos<K>) -> Pos<K> {
+    fn advance_to(&self, v: Pos<K>) -> Pos<K> {
         let v = v.get();
         let mut prev = 0;
         self.tx.send_if_modified(|cur| {
@@ -203,15 +258,14 @@ impl<K> Monotone<K> {
         Pos::new(prev.max(v))
     }
 
-    /// Re-anchor after position space changes, such as timeline fork
-    pub fn rebase(&self, v: Pos<K>) -> Pos<K> {
-        self.tx.send_replace(v.get());
-        v
+    pub fn publish(&self, v: Durable<K>) -> Pos<K> {
+        self.advance_to(v.0)
     }
 
-    /// Advance a cell that counts events rather than bytes
-    pub fn bump(&self) {
-        self.tx.send_modify(|cur| *cur += 1);
+    /// Re-anchor after position space changes, such as timeline fork
+    pub fn rebase(&self, v: Durable<K>) -> Pos<K> {
+        self.tx.send_replace(v.0.get());
+        v.0
     }
 
     pub fn get(&self) -> Pos<K> {
@@ -223,6 +277,18 @@ impl<K> Monotone<K> {
             rx: self.tx.subscribe(),
             _kind: PhantomData,
         }
+    }
+}
+
+impl<K: ObservedKind> Monotone<K> {
+    pub fn join(&self, v: Pos<K>) -> Pos<K> {
+        self.advance_to(v)
+    }
+}
+
+impl<K: CountKind> Monotone<K> {
+    pub fn bump(&self) {
+        self.tx.send_modify(|cur| *cur += 1);
     }
 }
 
@@ -250,12 +316,6 @@ impl<K> Clone for Gate<K> {
             rx: self.rx.clone(),
             _kind: PhantomData,
         }
-    }
-}
-
-impl<K: PosKind> fmt::Debug for Gate<K> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.current().fmt(f)
     }
 }
 
@@ -305,9 +365,13 @@ mod tests {
     #[test]
     fn only_rebase_lowers_a_cell() {
         let m: Monotone<Floor> = Monotone::default();
-        assert_eq!(m.join(Pos::new(500u64)), 500);
-        assert_eq!(m.join(Pos::new(100u64)), 500);
-        assert_eq!(m.rebase(Pos::new(100u64)), 100, "fork re-anchors the floor");
+        assert_eq!(m.publish(Durable::new(Pos::new(500u64))), 500);
+        assert_eq!(m.publish(Durable::new(Pos::new(100u64))), 500);
+        assert_eq!(
+            m.rebase(Durable::new(Pos::new(100u64))),
+            100,
+            "fork re-anchors the floor"
+        );
         assert_eq!(m.get(), 100);
     }
 

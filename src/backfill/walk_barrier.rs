@@ -22,6 +22,7 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 
 use crate::backfill::spool::SpoolMark;
+use crate::emit::pipeline::tail::OwnedTail;
 
 /// Seconds between stage publishes and checkpoint writes
 pub const WALK_CHECKPOINT_PERIOD: Duration = Duration::from_secs(30);
@@ -47,10 +48,38 @@ struct PartTally {
 /// Marks and file names a checkpoint may record once the tail proves
 /// `next_seq`
 pub struct WalkProof {
-    pub files: Vec<String>,
-    pub gate_deferred: SpoolMark,
-    pub toast_deferred: SpoolMark,
-    pub next_seq: u64,
+    files: Vec<String>,
+    gate_deferred: SpoolMark,
+    toast_deferred: SpoolMark,
+    next_seq: u64,
+}
+
+/// [`WalkProof`] whose seqs the tail proved durable
+pub struct DurableWalk(WalkProof);
+
+impl WalkProof {
+    #[cfg(test)]
+    pub(crate) fn files(&self) -> &[String] {
+        &self.files
+    }
+
+    pub async fn prove(self, tail: &OwnedTail) -> Result<DurableWalk, String> {
+        tail.checkpoint(self.next_seq).await?;
+        Ok(DurableWalk(self))
+    }
+}
+
+impl DurableWalk {
+    /// Files walked, then gate and drain spool marks
+    pub fn into_parts(self) -> (Vec<String>, SpoolMark, SpoolMark) {
+        let WalkProof {
+            files,
+            gate_deferred,
+            toast_deferred,
+            ..
+        } = self.0;
+        (files, gate_deferred, toast_deferred)
+    }
 }
 
 #[derive(Default)]

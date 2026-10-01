@@ -117,7 +117,7 @@ fn multixact_updater_matches_live_pg() {
     // its delete may predate WAL coverage — must gate, not resurrect
     let mut xact = PgXactAccum::new();
     xact.insert_segment(0, std::fs::read(data_dir.join("pg_xact/0000")).unwrap());
-    let patch = PgXactPatch::new();
+    let patch = PgXactPatch::new().seal();
     let view = PgXactView::new(&xact, &patch).with_multixact(&multi);
     assert_eq!(
         tuple_visibility(

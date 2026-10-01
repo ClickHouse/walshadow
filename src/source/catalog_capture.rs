@@ -58,7 +58,7 @@ use crate::catalog::desc_log::{
     ObservationKind, RelationObservation,
 };
 use crate::catalog::pending::{DegradeReason, PendingCatalog, PendingSlot};
-use crate::catalog::shadow_catalog::{CatalogError, ShadowCatalog};
+use crate::catalog::shadow_catalog::{CatalogError, ParkedAt, ShadowCatalog};
 use crate::filter::SmgrMarkers;
 use crate::ops::bridge::BridgeError;
 use crate::record::{BoundaryInfo, BoundaryKind, SinkError};
@@ -263,12 +263,35 @@ impl CatalogCapture {
         &self,
         info: &BoundaryInfo,
         commit_lsn: u64,
+        parked: &ParkedAt,
+    ) -> Result<(), SinkError> {
+        self.capture(info, commit_lsn, parked.lsn(), Some(parked))
+            .await
+    }
+
+    /// Commit boundary capture declined to park for: answered from the log or
+    /// an empty batch, never a shadow read
+    pub async fn cover_unparked(
+        &self,
+        info: &BoundaryInfo,
+        commit_lsn: u64,
         next_lsn: u64,
+    ) -> Result<(), SinkError> {
+        self.capture(info, commit_lsn, next_lsn, None).await
+    }
+
+    async fn capture(
+        &self,
+        info: &BoundaryInfo,
+        commit_lsn: u64,
+        next_lsn: u64,
+        parked: Option<&ParkedAt>,
     ) -> Result<(), SinkError> {
         use std::sync::atomic::Ordering::Relaxed;
         let start = std::time::Instant::now();
         if let BoundaryKind::Command { writer_xid } = info.kind {
-            let out = self.capture_command(info, writer_xid, next_lsn).await;
+            let parked = parked.ok_or_else(|| unparked_read(next_lsn))?;
+            let out = self.capture_command(info, writer_xid, parked).await;
             self.stats
                 .capture_nanos
                 .fetch_add(start.elapsed().as_nanos() as u64, Relaxed);
@@ -290,7 +313,8 @@ impl CatalogCapture {
             self.cover_stub(commit_lsn, next_lsn).await?;
             Vec::new()
         } else {
-            self.sql_capture(info, commit_lsn, next_lsn).await?
+            let parked = parked.ok_or_else(|| unparked_read(next_lsn))?;
+            self.sql_capture(info, commit_lsn, parked).await?
         };
         if !events.is_empty() {
             let mut buf = self.buffer.lock().await;
@@ -370,15 +394,15 @@ impl CatalogCapture {
         &self,
         info: &BoundaryInfo,
         writer_xid: u32,
-        next_lsn: u64,
+        parked: &ParkedAt,
     ) -> Result<(), SinkError> {
         use std::sync::atomic::Ordering::Relaxed;
+        let next_lsn = parked.lsn();
         let top_xid = info.drain_xid;
         let oids: Vec<Oid> = info.oids.iter().map(|a| a.oid).collect();
         let read = {
             let mut cat = self.catalog.lock().await;
-            cat.fetch_overlay_descriptors(&oids, top_xid, next_lsn)
-                .await
+            cat.fetch_overlay_descriptors(&oids, top_xid, parked).await
         };
         let descs = match read {
             Ok(descs) => descs,
@@ -454,18 +478,19 @@ impl CatalogCapture {
         &self,
         info: &BoundaryInfo,
         commit_lsn: u64,
-        next_lsn: u64,
+        parked: &ParkedAt,
     ) -> Result<Vec<PendingEvent>, SinkError> {
         use std::sync::atomic::Ordering::Relaxed;
+        let next_lsn = parked.lsn();
         self.stats.sql_captures.fetch_add(1, Relaxed);
         let (replay_lsn, descs) = {
             let mut cat = self.catalog.lock().await;
             if info.capture_all {
                 self.stats.capture_all_runs.fetch_add(1, Relaxed);
-                cat.fetch_all_descriptors_at(next_lsn).await
+                cat.fetch_all_descriptors_at(parked).await
             } else {
                 let oids: Vec<Oid> = info.oids.iter().map(|a| a.oid).collect();
-                cat.fetch_descriptors_batch_at(&oids, next_lsn).await
+                cat.fetch_descriptors_batch_at(&oids, parked).await
             }
         }
         .map_err(|e| SinkError::Other(format!("descriptor capture at {commit_lsn:#X}: {e}")))?;
@@ -717,6 +742,12 @@ impl CatalogCapture {
     fn marker_for(&self, rfn: RelFileNode) -> Option<u64> {
         self.markers.lock().expect("smgr markers poisoned").get(rfn)
     }
+}
+
+fn unparked_read(next_lsn: u64) -> SinkError {
+    SinkError::Other(format!(
+        "catalog boundary at {next_lsn:#X} needs a shadow read but replay was not parked"
+    ))
 }
 
 /// Why an overlay read failed, as the transaction's degrade reason. A
@@ -976,10 +1007,22 @@ impl CaptureSet {
         &self,
         info: &BoundaryInfo,
         commit_lsn: u64,
+        parked: &ParkedAt,
+    ) -> Result<(), SinkError> {
+        for capture in self.scoped(info.db_oid) {
+            capture.capture_boundary(info, commit_lsn, parked).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn cover_unparked(
+        &self,
+        info: &BoundaryInfo,
+        commit_lsn: u64,
         next_lsn: u64,
     ) -> Result<(), SinkError> {
         for capture in self.scoped(info.db_oid) {
-            capture.capture_boundary(info, commit_lsn, next_lsn).await?;
+            capture.cover_unparked(info, commit_lsn, next_lsn).await?;
         }
         Ok(())
     }

@@ -7,11 +7,30 @@ use std::pin::Pin;
 use tokio::sync::mpsc;
 use walrus::pg::wal::segment::SegmentName;
 
+use crate::pos::{Durable, FilterDurable, Pos};
 use crate::record::{SegmentSink, SinkError};
 
+/// Renamed segment awaiting filesystem flush
 pub struct SegFsync {
-    pub end_lsn: u64,
-    pub seg_path: PathBuf,
+    end_lsn: Pos<FilterDurable>,
+    seg_path: PathBuf,
+}
+
+impl SegFsync {
+    pub fn end_lsn(&self) -> Pos<FilterDurable> {
+        self.end_lsn
+    }
+
+    pub fn seg_path(&self) -> &Path {
+        &self.seg_path
+    }
+
+    /// `syncfs` the filesystem under `dir`, proving every segment renamed
+    /// there up to `self` durable
+    pub fn syncfs(&self, dir: &std::fs::File) -> std::io::Result<Durable<FilterDurable>> {
+        crate::fs::syncfs(dir)?;
+        Ok(Durable::new(self.end_lsn))
+    }
 }
 
 enum Durability {
@@ -59,7 +78,7 @@ impl DirSegmentSink {
             Durability::Inline => crate::fs::fsync_dir(&self.out_dir).await?,
             Durability::Background { seg_size, tx } => tx
                 .send(SegFsync {
-                    end_lsn: seg.start_lsn(*seg_size) + bytes.len() as u64,
+                    end_lsn: Pos::new(seg.start_lsn(*seg_size) + bytes.len() as u64),
                     seg_path,
                 })
                 .await

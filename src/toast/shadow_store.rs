@@ -122,7 +122,7 @@ impl ShadowToastStore {
     /// stalled replay and restart timeout whenever replay position changes
     async fn await_replay(&self, bridge: &Bridge, through: u64) -> Result<u64, ChunkStoreError> {
         // Primary files are complete before service and have no replay position
-        if through == 0 || !bridge.info().is_some_and(|i| i.in_recovery) {
+        if through == 0 || !bridge.info().in_recovery {
             return Ok(0);
         }
         let mut since = Instant::now();

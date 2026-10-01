@@ -26,7 +26,7 @@ use walshadow::oracle::{Oracle, OracleCell, OracleColumnBuf, OracleRequestColumn
 use walshadow::pg::socket_conninfo;
 use walshadow::schema::{NUMERICOID, ReplIdent};
 use walshadow::shadow::{BridgeConf, Shadow, ShadowConfig};
-use walshadow::shadow_catalog::{CatalogError, ShadowCatalog, ShadowCatalogConfig};
+use walshadow::shadow_catalog::{CatalogError, ParkedAt, ShadowCatalog, ShadowCatalogConfig};
 
 /// Build tree holding `walshadow.so`, fed to shadow as `dynamic_library_path`.
 /// Module is not optional, so an unbuilt tree fails rather than skips
@@ -239,7 +239,7 @@ async fn bridge_hello_and_encode_native() {
     let guard = start_pg(&tmp, ports::PG_SHADOW_PORT);
     let bridge = dial(&guard.sh).await;
 
-    let info = bridge.info().expect("hello");
+    let info = bridge.info();
     assert_eq!(info.proto, PROTO_VERSION);
     assert_eq!(info.projection, PROJECTION_VERSION);
     assert!(info.pg_version_num >= 160000, "{info:?}");
@@ -857,7 +857,7 @@ async fn bridge_overlay_descriptors_track_open_ddl() {
     idle.batch_execute("BEGIN").await.expect("begin idle");
     let idle_xid = top_xid(&idle).await;
     let overlay = cat
-        .fetch_overlay_descriptors(&[oid_t], idle_xid, 0)
+        .fetch_overlay_descriptors(&[oid_t], idle_xid, &ParkedAt::assume_for_test(0))
         .await
         .expect("overlay batch");
     assert_eq!(
@@ -882,7 +882,7 @@ async fn bridge_overlay_descriptors_track_open_ddl() {
     let oid_u = oid_of(&ddl, "fresh.u").await;
 
     let mut descs = cat
-        .fetch_overlay_descriptors(&[oid_t, oid_u], xid, 0)
+        .fetch_overlay_descriptors(&[oid_t, oid_u], xid, &ParkedAt::assume_for_test(0))
         .await
         .expect("overlay under open ddl");
     descs.sort_by_key(|d| d.oid);
@@ -930,7 +930,7 @@ async fn bridge_overlay_descriptors_track_open_ddl() {
     // Replay off the asserted boundary is the caller's whole basis for reading
     // uncommitted rows, so it fails rather than answering
     let err = cat
-        .fetch_overlay_descriptors(&[oid_t], xid, 0x1000)
+        .fetch_overlay_descriptors(&[oid_t], xid, &ParkedAt::assume_for_test(0x1000))
         .await
         .unwrap_err();
     assert!(
@@ -943,7 +943,7 @@ async fn bridge_overlay_descriptors_track_open_ddl() {
 
     ddl.batch_execute("ROLLBACK").await.expect("undo");
     let after = cat
-        .fetch_overlay_descriptors(&[oid_t, oid_u], xid, 0)
+        .fetch_overlay_descriptors(&[oid_t, oid_u], xid, &ParkedAt::assume_for_test(0))
         .await
         .expect("overlay after rollback");
     assert_eq!(after, committed, "aborted tree still visible");
@@ -1258,7 +1258,7 @@ async fn bridge_committed_read_falls_back_when_replay_moves() {
     // The caller holds the boundary an overlay read is about, so nothing else
     // can serve that question
     let err = cat
-        .fetch_overlay_descriptors(&[oid_t], 700, 0x1000)
+        .fetch_overlay_descriptors(&[oid_t], 700, &ParkedAt::assume_for_test(0x1000))
         .await
         .unwrap_err();
     assert!(
@@ -1533,7 +1533,7 @@ async fn bridge_worker_pool_serves_concurrent_requests() {
     assert_eq!(pooled.pool_size(), WORKERS, "one socket per worker");
     assert_eq!(single.pool_size(), 1);
     // Every slot dialled its own HELLO; a mismatch would have failed connect
-    assert!(pooled.info().is_some());
+    assert_eq!(pooled.info(), single.info());
 
     // Wide enough that requests are still overlapping when the last one is
     // dispatched, which is the state a shared slot would have to serialize

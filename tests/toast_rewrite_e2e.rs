@@ -592,7 +592,9 @@ async fn alter_rewrite_link_swap_retires_old_mirror() {
     assert_eq!(stats.toast_mirror_retires.load(Ordering::Relaxed), 0);
     pipeline
         .resume_floor
-        .join(walshadow::pos::Pos::new(u64::MAX));
+        .publish(walshadow::pos::Durable::assume_for_test(
+            walshadow::pos::Pos::new(u64::MAX),
+        ));
     let driver = fx::spawn_workload(
         &source,
         vec![

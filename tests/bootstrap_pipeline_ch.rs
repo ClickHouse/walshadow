@@ -209,9 +209,7 @@ async fn bootstrap_tail_fans_out_n2() {
         "contiguous-done watermark at start_lsn",
     );
 
-    drop(msg_tx);
-    drop(ack);
-    tail.join().await;
+    tail.close(msg_tx, ack).await;
     assert!(fatal.message().is_none(), "no fatal: {:?}", fatal.message());
 
     // Every fed row landed; out-of-order batch completion across the two

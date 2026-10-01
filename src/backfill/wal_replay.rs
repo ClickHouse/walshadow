@@ -22,7 +22,7 @@ use crate::decode::wal_xact::{
     XLOG_XACT_COMMIT_PREPARED, XLOG_XACT_OPMASK, parse_xact_assignment, parse_xact_payload,
 };
 use crate::emit::ch_emitter::EmitterStats;
-use crate::emit::pipeline::ack::AckHandle;
+use crate::emit::pipeline::ack::{AckHandle, OpenSeq, Publish, SeqAlloc};
 use crate::emit::pipeline::batcher::{BatcherMsg, RoutedRow};
 use crate::emit::route::{RouteSnapshot, freeze_routes};
 use crate::mapping::MappingSnapshot;
@@ -101,10 +101,10 @@ pub struct WalReplaySink {
     batch_rows: usize,
     batch_bytes: usize,
     msg_tx: mpsc::Sender<BatcherMsg>,
-    ack: AckHandle,
     patch: Option<Arc<std::sync::Mutex<PgXactPatch>>>,
-    /// Current `(sequence, routed rows)`, registered on first row
-    open: Option<(u64, u64)>,
+    seqs: SeqAlloc,
+    /// Current seq and its routed rows, registered on first row
+    open: Option<(OpenSeq, u64)>,
     /// Rows waiting for next mirror write
     pending_rows: Vec<ToastRow>,
     pending_bytes: usize,
@@ -146,17 +146,14 @@ impl WalReplaySink {
             batch_rows: inputs.batch_rows,
             batch_bytes: inputs.batch_bytes,
             msg_tx: inputs.msg_tx,
-            ack: inputs.ack,
             patch: inputs.patch,
+            seqs: inputs.ack.seqs(inputs.next_seq),
             open: None,
             pending_rows: Vec::new(),
             pending_bytes: 0,
             pending_permits: Vec::new(),
             pending_cap,
-            replay: ReplayStats {
-                next_seq: inputs.next_seq,
-                ..Default::default()
-            },
+            replay: ReplayStats::default(),
         }
     }
 
@@ -173,14 +170,17 @@ impl WalReplaySink {
     }
 
     pub fn stats(&self) -> ReplayStats {
-        self.replay
+        ReplayStats {
+            next_seq: self.seqs.next(),
+            ..self.replay
+        }
     }
 
     /// Mirror writes flushed, seq boundary reported. Commits close their own
     /// seq, so a segment boundary leaves none open
     pub async fn segment_boundary(&mut self) -> std::result::Result<u64, SinkError> {
         self.flush_rows().await?;
-        Ok(self.replay.next_seq)
+        Ok(self.seqs.next())
     }
 
     /// Lowest first-record LSN still buffered. A resume above it would drop
@@ -333,7 +333,7 @@ impl WalReplaySink {
                 .commit(xid, &payload.subxacts);
         }
         // Resolve filenodes invisible at record time before drain
-        resolve_stash(
+        let stash = resolve_stash(
             &self.buffer,
             &self.log,
             &self.pending,
@@ -349,7 +349,7 @@ impl WalReplaySink {
             .lock()
             .await
             .drain_committed(
-                xid,
+                stash,
                 payload.xact_time,
                 record.source_lsn,
                 &payload.subxacts,
@@ -367,7 +367,7 @@ impl WalReplaySink {
         }
         drain.finish().await.map_err(SinkError::from)?;
         if let Some((seq, rows)) = self.open.take() {
-            self.ack.placed(seq, rows);
+            seq.place(rows);
         }
         self.subxact_tracker.forget_tree(xid);
         Ok(())
@@ -397,7 +397,7 @@ impl WalReplaySink {
                 // no block ref, so never passes the rfn filter
                 WalkStep::Event(DrainEntry::Catalog(_))
                 | WalkStep::Event(DrainEntry::Config(_))
-                | WalkStep::Truncate(_) => {}
+                | WalkStep::Truncate { .. } => {}
                 WalkStep::Event(DrainEntry::ToastBarrier {
                     toast_relid,
                     marker_lsn,
@@ -453,16 +453,11 @@ impl WalReplaySink {
                     let value_permit = detoast_heap(&mut heap, spool, &ref_maps, &self.resolver)
                         .await
                         .map_err(SinkError::from)?;
-                    let seq = if let Some((seq, rows)) = &mut self.open {
-                        *rows += 1;
-                        *seq
-                    } else {
-                        let seq = self.replay.next_seq;
-                        self.replay.next_seq += 1;
-                        self.ack.register(seq, commit_lsn);
-                        self.open = Some((seq, 1));
-                        seq
-                    };
+                    let (open, rows) = self
+                        .open
+                        .get_or_insert_with(|| (self.seqs.open(commit_lsn, Publish::Commit), 0));
+                    *rows += 1;
+                    let seq = open.seq();
                     self.msg_tx
                         .send(BatcherMsg::Row(RoutedRow {
                             seq,
@@ -578,7 +573,7 @@ pub struct SegmentPump {
 
 impl SegmentPump {
     pub fn start(first: &SegmentName, target_db_oid: Oid) -> Result<Self> {
-        let mut stream = WalStream::new(
+        let mut stream = WalStream::builder(
             first.timeline,
             WAL_SEG_SIZE,
             Pos::new(first.start_lsn(WAL_SEG_SIZE)),
@@ -586,7 +581,7 @@ impl SegmentPump {
         .map_err(|e| anyhow::anyhow!("wal_replay: WalStream: {e}"))?;
         stream.filter_mut().set_target_db(target_db_oid);
         Ok(Self {
-            stream,
+            stream: stream.start(),
             seg_sink: DropSegments,
         })
     }
@@ -638,7 +633,7 @@ pub async fn pump_segments_through(
 mod tests {
     use super::*;
     use crate::catalog::desc_log::DescLogIdentity;
-    use crate::decode::visibility::{PgXactAccum, PgXactView, XidStatus};
+    use crate::decode::visibility::{PgXactAccum, PgXactView, SealedPatch, XidStatus};
     use crate::decode::wal_xact::{
         XACT_XINFO_HAS_SUBXACTS, XACT_XINFO_HAS_TWOPHASE, XLOG_XACT_HAS_INFO,
     };
@@ -962,7 +957,7 @@ mod tests {
         })
     }
 
-    fn status(patch: &PgXactPatch, xid: u32) -> XidStatus {
+    fn status(patch: &SealedPatch, xid: u32) -> XidStatus {
         let accum = PgXactAccum::new();
         PgXactView::new(&accum, patch).xid_status(xid)
     }
@@ -981,7 +976,7 @@ mod tests {
         ))
         .await
         .unwrap();
-        let patch = patch.lock().unwrap();
+        let patch = std::mem::take(&mut *patch.lock().unwrap()).seal();
         assert_eq!(status(&patch, PREPARED_XID), XidStatus::Committed);
         assert_eq!(status(&patch, PREPARED_SUBXID), XidStatus::Committed);
         assert_ne!(status(&patch, FINISHER_XID), XidStatus::Committed);
@@ -1000,7 +995,7 @@ mod tests {
         ))
         .await
         .unwrap();
-        let patch = patch.lock().unwrap();
+        let patch = std::mem::take(&mut *patch.lock().unwrap()).seal();
         assert_eq!(status(&patch, PREPARED_XID), XidStatus::Aborted);
         assert_ne!(status(&patch, FINISHER_XID), XidStatus::Aborted);
     }

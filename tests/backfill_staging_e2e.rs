@@ -13,7 +13,7 @@ use walshadow::backfill_staging::{self, StagingRel, StagingSession};
 use walshadow::backfill_types::BackupRequest;
 use walshadow::ch_emitter::{EmitterConfig, EmitterStats};
 use walshadow::copy_backfill::CopyBackfiller;
-use walshadow::desc_log::{DescLogIdentity, DescriptorLog};
+use walshadow::desc_log::{BatchRecord, DescLogIdentity, DescriptorLog, LogEntry, LogValue};
 use walshadow::mapping::{ColumnMapping, MappingHandle, TableMapping, TableTarget, mapping_handle};
 use walshadow::runtime_config::InitialLoadMode;
 use walshadow::schema::{RelDescriptor, RelName};
@@ -60,7 +60,7 @@ impl Fixture {
             DescriptorLog::open(
                 &tmp.path().join("descriptors"),
                 DescLogIdentity {
-                    pg_major: bridge.info().unwrap().pg_version_num / 10000,
+                    pg_major: bridge.info().pg_version_num / 10000,
                     system_id: source
                         .psql_one("SELECT system_identifier FROM pg_control_system()")
                         .unwrap(),
@@ -299,6 +299,7 @@ async fn staged_backfill_resumes_each_publish_phase() {
         let dir = tempfile::tempdir().unwrap();
         fx.ch.query("TRUNCATE TABLE default.t").unwrap();
         fx.ch.query("INSERT INTO default.t (id, name, _lsn, _is_deleted) VALUES (9, 'stale', 99, false), (8, 'boundary', 100, false), (2, 'live', 101, false), (3, 'deleted', 102, true)").unwrap();
+        write_held_pending(&fx, dir.path());
         let rel = fx.prepare_staging().await;
         fx.ch.query("INSERT INTO default.t__wsstg (id, name, _lsn) VALUES (1, 'snapshot', 100), (2, 'old', 100), (3, 'old', 100)").unwrap();
         let uuid = session
@@ -308,7 +309,9 @@ async fn staged_backfill_resumes_each_publish_phase() {
             .unwrap();
         write_swapped_ledger(dir.path(), &uuid);
         if phase != "before_exchange" {
-            session.exchange(&rel).await.unwrap();
+            fx.ch
+                .query("EXCHANGE TABLES default.t AND default.t__wsstg")
+                .unwrap();
             assert_eq!(
                 session.table_uuid("default", "t").await.unwrap().as_deref(),
                 Some(uuid.as_str())
@@ -331,13 +334,20 @@ async fn staged_backfill_resumes_each_publish_phase() {
             .note_opt_in(&fx.desc, InitialLoadMode::Copy, 999)
             .await;
         wait_done(&backfiller, dir.path()).await;
-        assert_eq!(fx.rows(), "1\tsnapshot\n2\tlive", "{phase}");
+        assert_eq!(fx.rows(), "1\tsnapshot\n2\tlive\n5\tpending", "{phase}");
         assert_eq!(
             fx.ch
                 .query("SELECT id, max(_lsn), argMax(_is_deleted, _lsn) FROM default.t GROUP BY id ORDER BY id")
                 .unwrap(),
-            "1\t100\tfalse\n2\t101\tfalse\n3\t102\ttrue",
+            "1\t100\tfalse\n2\t101\tfalse\n3\t102\ttrue\n5\t100\tfalse",
             "{phase}"
+        );
+        assert_eq!(fx.ch.query("EXISTS default.t__wspending").unwrap(), "0");
+        assert!(
+            PendingLedger::load(dir.path(), fx.system_id())
+                .await
+                .unwrap()
+                .is_empty()
         );
         assert_eq!(
             session.table_uuid("default", "t__wsstg").await.unwrap(),
@@ -359,12 +369,53 @@ async fn staged_backfill_resumes_each_publish_phase() {
             .note_opt_in(&fx.desc, InitialLoadMode::BaseBackup, 1000)
             .await;
         assert_eq!(restarted.pending_count(), 0);
-        assert_eq!(fx.rows(), "1\tsnapshot\n2\tlive", "{phase}");
+        assert_eq!(fx.rows(), "1\tsnapshot\n2\tlive\n5\tpending", "{phase}");
     }
 }
 
 fn read_ledger(dir: &Path) -> toml::Value {
     toml::from_str(&std::fs::read_to_string(dir.join("backfills.toml")).unwrap()).unwrap()
+}
+
+/// Pass held its pending rows before EXCHANGE; xid 500 committed meanwhile
+fn write_held_pending(fx: &Fixture, dir: &Path) {
+    fx.ch
+        .query("CREATE TABLE default.t__wspending AS default.t ENGINE = MergeTree ORDER BY tuple() PRIMARY KEY tuple() PARTITION BY tuple()")
+        .unwrap();
+    fx.ch
+        .query("ALTER TABLE default.t__wspending ADD COLUMN _ws_xmin UInt32, ADD COLUMN _ws_xmax UInt32, ADD COLUMN _ws_infomask UInt16")
+        .unwrap();
+    fx.ch
+        .query("INSERT INTO default.t__wspending (id, name, _lsn, _ws_xmin) VALUES (5, 'pending', 100, 500)")
+        .unwrap();
+    std::fs::write(
+        walshadow::visibility_pending::ledger_path(dir),
+        format!(
+            "version = 1\nsystem_id = {}\n[[carry]]\nnamespace = 'public'\nrelname = 't'\n\
+             database = 'default'\ntable = 't'\nstart_lsn = '0/64'\ncommitted = [500]\n\
+             held = true\n",
+            fx.system_id()
+        ),
+    )
+    .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn boot_discards_held_pending_without_swap() {
+    if !fx::tools::requirements_available() {
+        return;
+    }
+    let fx = Fixture::new().await;
+    let dir = tempfile::tempdir().unwrap();
+    // Crash after hold, before swap mark, then opt-out drops the backfill entry
+    write_held_pending(&fx, dir.path());
+    fx.backfiller(dir.path()).await;
+    assert!(
+        PendingLedger::load(dir.path(), fx.system_id())
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }
 
 fn write_swapped_ledger(dir: &Path, uuid: &str) {
@@ -397,6 +448,7 @@ async fn staged_schema_change_discards_load_and_keeps_retry_pending() {
         .unwrap()
         .unwrap();
     write_swapped_ledger(dir.path(), &uuid);
+    write_held_pending(&fx, dir.path());
     fx.ch
         .query("ALTER TABLE default.t ADD COLUMN extra String DEFAULT 'new'")
         .unwrap();
@@ -417,6 +469,13 @@ async fn staged_schema_change_discards_load_and_keeps_retry_pending() {
     );
     assert_eq!(backfiller.pending_by_mode(), [0, 1, 0]);
     assert_eq!(fx.rows(), "9\tlive");
+    assert!(
+        PendingLedger::load(dir.path(), fx.system_id())
+            .await
+            .unwrap()
+            .is_empty(),
+        "discarded load never promotes its pending rows"
+    );
     assert_eq!(
         session.table_uuid("default", "t__wsstg").await.unwrap(),
         None
@@ -634,4 +693,96 @@ async fn failed_backup_can_disable_copy_fallback() {
         Some("object_store")
     );
     assert_eq!(fx.rows(), "");
+}
+
+/// Archive every WAL file in source's `pg_wal`, current segment included, so
+/// the gap through the opt-in boundary is fetchable
+async fn archive_wal(
+    source: &Shadow,
+    settings: &walrus::config::Settings,
+    storage: &walrus::storage::DynStorage,
+) {
+    let pg_wal = source.config().data_dir.join("pg_wal");
+    for entry in std::fs::read_dir(pg_wal).unwrap() {
+        let path = entry.unwrap().path();
+        let name = path.file_name().unwrap().to_str().unwrap();
+        if name.len() == 24 && name.chars().all(|c| c.is_ascii_hexdigit()) {
+            walrus::pg::wal::push::handle(settings, storage.clone(), &path)
+                .await
+                .unwrap();
+        }
+    }
+}
+
+/// Backup predates the opt-in: walk loads the backup image, gap replay
+/// carries changes between backup redo and the boundary
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn object_store_opt_in_replays_archive_gap() {
+    if !fx::tools::requirements_available() {
+        return;
+    }
+    let mut fx = Fixture::new().await;
+    // Live capture fills the log in production; replay decodes through it
+    fx.log
+        .seed(
+            BatchRecord {
+                captured_at: 0x1000,
+                commit_lsn: 0,
+                observations: Vec::new(),
+                ambiguities: Vec::new(),
+                entries: vec![Arc::new(LogEntry {
+                    valid_from: 0x1000,
+                    oid: fx.desc.oid,
+                    rfn: fx.desc.rfn,
+                    value: LogValue::Present(fx.desc.clone()),
+                })],
+            },
+            0x1000,
+        )
+        .await
+        .unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let storage: walrus::storage::DynStorage =
+        Arc::new(walrus::storage::fs::FsStorage::new(root.path()).unwrap());
+    let settings = walrus::config::Settings {
+        storage: walrus::config::StorageSettings::Fs {
+            path: root.path().to_string_lossy().into_owned(),
+        },
+        compression: walrus::compression::Method::None,
+        compression_level: 0,
+        ..Default::default()
+    };
+    walrus::pg::backup::push::handle(
+        &settings,
+        storage.clone(),
+        walrus::pg::backup::push::PushArgs::default(),
+        fx::pg_cfg(&fx.source, "backfill-push"),
+    )
+    .await
+    .unwrap();
+    fx.source
+        .psql_one(
+            "UPDATE public.t SET name = 'updated' WHERE id = 1; \
+             DELETE FROM public.t WHERE id = 2; \
+             INSERT INTO public.t VALUES (4, 'four')",
+        )
+        .unwrap();
+    let s_lsn = fx.source.psql_one("SELECT pg_current_wal_lsn()").unwrap();
+    let s_lsn = walrus::pg::backup::parse_pg_lsn(&s_lsn).unwrap();
+    fx.source.psql_one("SELECT pg_switch_wal()").unwrap();
+    archive_wal(&fx.source, &settings, &storage).await;
+    fx.emitter.backup = Some(settings);
+
+    let dir = tempfile::tempdir().unwrap();
+    let backfiller = fx.backfiller(dir.path()).await;
+    backfiller
+        .note_opt_in(&fx.desc, InitialLoadMode::ObjectStore, s_lsn)
+        .await;
+    wait_done(&backfiller, dir.path()).await;
+    assert_eq!(fx.rows(), "1\tupdated\n3\tthree\n4\tfour");
+    assert_eq!(fx.stats.backfill_copy_rows.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        read_ledger(dir.path())["backfill"][0]["mode"].as_str(),
+        Some("object_store")
+    );
 }

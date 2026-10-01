@@ -292,31 +292,42 @@ impl ForkWait {
     }
 }
 
+/// Every consumer has reached the fork at `switch_lsn`, the license
+/// [`Switchover::cross`] takes
+#[derive(Debug)]
+pub struct BarrierOpen {
+    switch_lsn: Pos<Switchpoint>,
+}
+
 impl ForkBarrier {
-    /// `None` once every consumer has reached the fork; otherwise what is still
+    /// Open once every consumer has reached the fork; otherwise what is still
     /// behind.
-    pub fn pending(&self, switch_lsn: Pos<Switchpoint>, seg_size: u64) -> Option<ForkWait> {
+    pub fn open(
+        &self,
+        switch_lsn: Pos<Switchpoint>,
+        seg_size: u64,
+    ) -> Result<BarrierOpen, ForkWait> {
         // One barrier, three roles: retag each term onto barrier's role
         let fork_segment: Pos<Floor> = Pos::new(WalStream::align_down(switch_lsn.get(), seg_size));
         if self.resume_safe_lsn.retag() < fork_segment {
-            return Some(ForkWait::EmitterAck {
+            return Err(ForkWait::EmitterAck {
                 acked: self.resume_safe_lsn,
                 fork_segment,
             });
         }
         if self.shadow_apply_lsn.is_none_or(|a| a.retag() < switch_lsn) {
-            return Some(ForkWait::ShadowApply {
+            return Err(ForkWait::ShadowApply {
                 applied: self.shadow_apply_lsn,
                 fork: switch_lsn,
             });
         }
         if fork_segment > self.filter_durable.retag().max(self.floor) {
-            return Some(ForkWait::ArchiveSeal {
+            return Err(ForkWait::ArchiveSeal {
                 durable: self.filter_durable,
                 fork_segment,
             });
         }
-        None
+        Ok(BarrierOpen { switch_lsn })
     }
 }
 
@@ -344,9 +355,23 @@ impl ForkPoint {
 /// descendant. Nothing published afterwards may leave the floor on the ancestor.
 #[derive(Debug, Clone, Copy)]
 pub struct ForkResume {
-    pub timeline: u32,
-    pub floor: Pos<Floor>,
-    pub switch_lsn: Pos<Switchpoint>,
+    timeline: u32,
+    floor: Pos<Floor>,
+    switch_lsn: Pos<Switchpoint>,
+}
+
+impl ForkResume {
+    pub fn timeline(&self) -> u32 {
+        self.timeline
+    }
+
+    pub fn floor(&self) -> Pos<Floor> {
+        self.floor
+    }
+
+    pub fn switch_lsn(&self) -> Pos<Switchpoint> {
+        self.switch_lsn
+    }
 }
 
 /// Where a crossing read descendant's copy of fork prefix
@@ -495,9 +520,8 @@ impl Switchover<'_> {
     /// live timeline; each call crosses exactly one fork.
     ///
     /// `commit` persists [`ForkResume`] and must not return until it is durable:
-    /// it is the point the stream stops being the ancestor's. The caller runs
-    /// the barrier before getting here, so by now nothing below the fork is in
-    /// flight anywhere.
+    /// it is the point the stream stops being the ancestor's. `open` proves
+    /// nothing below the fork is in flight anywhere.
     ///
     /// `slot` comes per call, not off the struct: it reloads with `[source]`,
     /// so a crossing after a repoint asks the descendant for the slot the
@@ -513,12 +537,18 @@ impl Switchover<'_> {
         status: StandbyStatus,
         guards: ForkGuards,
         fork: &ForkPoint,
+        open: BarrierOpen,
         commit: C,
         stats: &mut TimelineStats,
     ) -> Result<Crossing, TransitionError>
     where
         C: AsyncFnOnce(ForkResume) -> anyhow::Result<()>,
     {
+        debug_assert_eq!(
+            open.switch_lsn.get(),
+            fork.switch_lsn,
+            "barrier for another fork"
+        );
         let started = std::time::Instant::now();
         let out = self
             .cross_inner(
@@ -1202,7 +1232,7 @@ mod tests {
 
     #[test]
     fn barrier_opens_once_every_frontier_reaches_the_fork() {
-        assert_eq!(caught_up().pending(Pos::new(SEG + 0x1000), SEG), None);
+        assert_eq!(caught_up().open(Pos::new(SEG + 0x1000), SEG).err(), None);
     }
 
     /// An unacked commit *inside* the fork segment does not hold the barrier: a
@@ -1215,7 +1245,8 @@ mod tests {
                 resume_safe_lsn: SEG.into(),
                 ..caught_up()
             }
-            .pending(Pos::new(SEG + 0x1000), SEG),
+            .open(Pos::new(SEG + 0x1000), SEG)
+            .err(),
             None,
             "acked exactly at the fork segment's start is enough",
         );
@@ -1224,7 +1255,8 @@ mod tests {
                 resume_safe_lsn: (SEG - 1).into(),
                 ..caught_up()
             }
-            .pending(Pos::new(SEG + 0x1000), SEG),
+            .open(Pos::new(SEG + 0x1000), SEG)
+            .err(),
             Some(ForkWait::EmitterAck {
                 acked: (SEG - 1).into(),
                 fork_segment: SEG.into(),
@@ -1241,7 +1273,7 @@ mod tests {
                 ..caught_up()
             };
             assert_eq!(
-                b.pending(fork, SEG),
+                b.open(fork, SEG).err(),
                 Some(ForkWait::ShadowApply { applied, fork }),
                 "applied {applied:?} must not open the barrier",
             );
@@ -1258,7 +1290,7 @@ mod tests {
             ..caught_up()
         };
         assert_eq!(
-            b.pending(Pos::new(SEG + 0x1000), SEG),
+            b.open(Pos::new(SEG + 0x1000), SEG).err(),
             Some(ForkWait::ArchiveSeal {
                 durable: Pos::ZERO,
                 fork_segment: SEG.into(),
@@ -1269,7 +1301,8 @@ mod tests {
                 floor: SEG.into(),
                 ..b
             }
-            .pending(Pos::new(SEG + 0x1000), SEG),
+            .open(Pos::new(SEG + 0x1000), SEG)
+            .err(),
             None,
             "a floor already at the fork segment needs no seal",
         );

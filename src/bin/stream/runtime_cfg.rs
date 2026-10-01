@@ -7,7 +7,7 @@ use ahash::HashSet;
 use anyhow::Context;
 use tokio::sync::{Mutex, watch};
 use tokio_util::sync::CancellationToken;
-use walshadow::config::{ConfigResolver, ResolvedConfig};
+use walshadow::config::ResolvedConfig;
 use walshadow::mapping::MappingHandle;
 use walshadow::pg::quote_ident;
 use walshadow::runtime_config::InitialLoadMode;
@@ -72,15 +72,17 @@ pub(crate) async fn or_signal<T>(
     }
 }
 
-/// Seed the resolver overlay from source PG's `<schema>.config_*` tables via
-/// the sidecar libpq connection (plan §7). Refuses (Err → daemon exits) when
-/// the schema is named but not installed, or the install is newer than this
-/// daemon understands — explicit opt-in should not silently no-op.
-pub(crate) async fn seed_runtime_config(
+/// Load the resolver's boot overlay from source PG's `<schema>.config_*`
+/// tables via the sidecar libpq connection (plan §7). Refuses (Err → daemon
+/// exits) when the schema is named but not installed, or the install is newer
+/// than this daemon understands — explicit opt-in should not silently no-op.
+pub(crate) async fn load_runtime_config(
     client: &tokio_postgres::Client,
     schema: &str,
-    resolver: &ConfigResolver,
-) -> anyhow::Result<Vec<(RelName, walshadow::runtime_config::TableRow)>> {
+) -> anyhow::Result<(
+    walshadow::runtime_config::ConfigOverlay,
+    Vec<(RelName, walshadow::runtime_config::TableRow)>,
+)> {
     use walshadow::runtime_config::{ColumnRow, ConfigOverlay, GlobalRow, NamespaceRow, TableRow};
     let s = quote_ident(schema);
     let mut overlay = ConfigOverlay::default();
@@ -203,7 +205,6 @@ pub(crate) async fn seed_runtime_config(
         .iter()
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
-    resolver.seed_overlay(overlay).await;
     tracing::info!(
         target: "walshadow::config",
         schema,
@@ -213,7 +214,7 @@ pub(crate) async fn seed_runtime_config(
         columns = n_col,
         "runtime config overlay seeded from source PG",
     );
-    Ok(table_rows)
+    Ok((overlay, table_rows))
 }
 
 pub(crate) async fn apply_toml_initial_loads(

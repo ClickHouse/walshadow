@@ -94,7 +94,7 @@ async fn run_oracle_stats(
         .await
         .expect("bridge connect");
     assert!(
-        bridge.info().expect("hello").in_recovery,
+        bridge.info().in_recovery,
         "shadow must serve decode while in recovery",
     );
     let oracle = Arc::new(Oracle::new(Arc::new(bridge)));

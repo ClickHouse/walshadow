@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::backfill::backfill_staging::{StagingPlan, StagingSession};
 use crate::backfill::backfill_types::{BackupRequest, WalkCounts};
 use crate::backfill::spool::SpoolMark;
+use crate::backfill::walk_barrier::{DurableWalk, WalkBarrier};
 use crate::config::ResolvedConfig;
 use crate::emit::ch_emitter::EmitterConfig;
 use crate::mapping::MappingSnapshot;
@@ -38,16 +39,52 @@ pub fn digest<'a>(parts: impl IntoIterator<Item = &'a [u8]>) -> u64 {
 /// produced is durable in staging or in one of the two spools below
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct WalkState {
-    pub done: bool,
+    done: bool,
     /// Cluster-relative paths, eg `base/5/16400.2`
-    pub files: Vec<String>,
+    files: Vec<String>,
     /// Tar parts holding no SLRU file and no incomplete heap file, so a
     /// resumed walk need not fetch them at all
-    pub parts: Vec<String>,
+    parts: Vec<String>,
     /// Undecided-xid tuples the gate holds for walk EOF
-    pub gate_deferred: SpoolMark,
+    gate_deferred: SpoolMark,
     /// TOAST referrers the drain could not resolve yet
-    pub toast_deferred: SpoolMark,
+    toast_deferred: SpoolMark,
+}
+
+impl WalkState {
+    /// Walk ended; per-file resume is spent
+    pub fn finished() -> Self {
+        Self {
+            done: true,
+            ..Self::default()
+        }
+    }
+
+    pub fn files(&self) -> &[String] {
+        &self.files
+    }
+
+    pub fn parts(&self) -> &[String] {
+        &self.parts
+    }
+
+    pub fn gate_deferred(&self) -> SpoolMark {
+        self.gate_deferred
+    }
+
+    pub fn toast_deferred(&self) -> SpoolMark {
+        self.toast_deferred
+    }
+
+    /// Record a proven walk tick, then the parts it settled
+    pub async fn record(&mut self, walk: DurableWalk, barrier: &WalkBarrier) {
+        let (files, gate_deferred, toast_deferred) = walk.into_parts();
+        self.files.extend(files);
+        self.gate_deferred = gate_deferred;
+        self.toast_deferred = toast_deferred;
+        let recorded = self.files.iter().cloned().collect();
+        self.parts.extend(barrier.settled_parts(&recorded).await);
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

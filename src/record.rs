@@ -180,10 +180,9 @@ pub struct Record<'a> {
     pub next_lsn: u64,
     pub page_magic: u16,
     pub route: Route,
-    /// Commit changed catalog data, so pause publication of later bytes
-    /// until shadow replays through `next_lsn`, except for statistics-only commits
-    pub catalog_boundary: bool,
-    /// Capture input for a catalog boundary; `Some` iff `catalog_boundary`
+    /// Catalog boundary: commit or command changed catalog data, so pause
+    /// publication of later bytes until shadow replays through `next_lsn`,
+    /// except for statistics-only commits
     pub boundary_info: Option<std::sync::Arc<BoundaryInfo>>,
     /// Abort of a catalog-dirty tree: every member the filter drained.
     /// Pending catalog slots those xids wrote drop here, on the pump, ahead
@@ -262,7 +261,6 @@ impl RecordSink for CollectingRecordSink {
                 next_lsn: record.next_lsn,
                 page_magic: record.page_magic,
                 route: record.route,
-                catalog_boundary: record.catalog_boundary,
                 boundary_info: record.boundary_info.clone(),
                 aborted_tree: record.aborted_tree.clone(),
                 defer_catalog_decode: record.defer_catalog_decode,

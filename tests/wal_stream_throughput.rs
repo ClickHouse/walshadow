@@ -162,13 +162,14 @@ async fn run_case(
     record_sink: &mut (dyn RecordSink + Send),
     bytes_sink: Option<Box<dyn walshadow::record::RecordBytesSink + Send>>,
 ) {
-    let mut stream = WalStream::new(1, SEG_SIZE, Pos::ZERO).unwrap();
+    let mut stream = WalStream::builder(1, SEG_SIZE, Pos::ZERO).unwrap();
     if let Some(bs) = bytes_sink {
         stream.set_bytes_sink(bs);
     }
     let mut seg_sink = CollectingSegmentSink::default();
 
     let start = Instant::now();
+    let mut stream = stream.start();
     for i in 0..iterations {
         let lsn = (i as u64) * SEG_SIZE;
         stream
@@ -324,7 +325,6 @@ async fn pump_throughput_breakdown() {
                         next_lsn: r.next_lsn,
                         page_magic: r.page_magic,
                         route: r.route,
-                        catalog_boundary: r.catalog_boundary,
                         boundary_info: r.boundary_info.clone(),
                         aborted_tree: r.aborted_tree.clone(),
                         defer_catalog_decode: r.defer_catalog_decode,

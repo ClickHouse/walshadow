@@ -322,9 +322,10 @@ async fn run_live(
     feed.start_physical_replication(None, begin, timeline)
         .await
         .context("bootstrap window leg: START_REPLICATION")?;
-    let mut stream = WalStream::new(timeline, WAL_SEG_SIZE, Pos::new(begin))
+    let mut stream = WalStream::builder(timeline, WAL_SEG_SIZE, Pos::new(begin))
         .map_err(|e| anyhow::anyhow!("bootstrap window leg: WalStream: {e}"))?;
     stream.filter_mut().set_target_db(leg.db_oid);
+    let mut stream = stream.start();
     let mut seg_sink = DropSegments;
     let mut buf = Vec::new();
 

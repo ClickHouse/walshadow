@@ -104,6 +104,11 @@ impl Pending {
     }
 }
 
+/// [`StreamingWalker::first_segment_ready`] held, so truncation cannot cut
+/// a record whose NOOP rewrite still has to reach seg 0
+#[derive(Debug)]
+pub struct FirstSegmentReady(());
+
 /// Records yield as soon as their last byte arrives
 pub struct StreamingWalker {
     seg_size: usize,
@@ -141,6 +146,7 @@ impl StreamingWalker {
         }
     }
 
+    #[cfg(test)]
     pub fn buffer_len(&self) -> usize {
         self.buf.len()
     }
@@ -169,23 +175,26 @@ impl StreamingWalker {
         self.buf.extend_from_slice(bytes);
     }
 
-    /// Gates first-segment flush: pending with `start_offset < seg_size`
-    /// must complete before the seg ships, so
-    /// [`rewrite_record`](Self::rewrite_record) applies the NOOP across
-    /// both segs uniformly.
+    #[cfg(test)]
     pub fn pending_start_offset(&self) -> Option<usize> {
         self.pending.as_ref().map(|p| p.start_offset)
     }
 
+    /// Gates first-segment flush: segment whole, and no pending record
+    /// starts inside it, so [`rewrite_record`](Self::rewrite_record) applies
+    /// a NOOP across both segs uniformly before seg 0 ships
+    pub fn first_segment_ready(&self) -> Option<FirstSegmentReady> {
+        let spans_out = self
+            .pending
+            .as_ref()
+            .is_some_and(|p| p.start_offset < self.seg_size);
+        (self.buf.len() >= self.seg_size && !spans_out).then_some(FirstSegmentReady(()))
+    }
+
     /// Drop the first `seg_size` bytes, rebasing every walker offset by
-    /// `-seg_size`. Pre: `buf.len() >= seg_size`, any in-flight `pending`
-    /// lives in `[seg_size, buf.len())`.
-    pub fn truncate_first_segment(&mut self) {
+    /// `-seg_size`
+    pub fn truncate_first_segment(&mut self, _ready: FirstSegmentReady) {
         let n = self.seg_size;
-        debug_assert!(self.buf.len() >= n);
-        if let Some(p) = &self.pending {
-            debug_assert!(p.start_offset >= n);
-        }
         self.buf.drain(0..n);
         if let Some(p) = self.pending.as_mut() {
             p.start_offset -= n;
@@ -783,8 +792,10 @@ mod tests {
             );
         }
 
-        assert!(walker.buffer_len() >= PAGE_SIZE);
-        walker.truncate_first_segment();
+        let ready = walker
+            .first_segment_ready()
+            .expect("seg 0 whole, pending past it");
+        walker.truncate_first_segment(ready);
         assert_eq!(walker.buffer_len(), PAGE_SIZE);
         assert!(walker.pending_start_offset().is_none());
         // Sentinel survives at the seg-1 continuation post-truncate.

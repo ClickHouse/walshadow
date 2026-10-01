@@ -20,7 +20,8 @@ use walshadow::metrics::{MetricsRegistry, RateEstimator};
 use walshadow::pg::socket_conninfo;
 use walshadow::pipeline::{PipelineConfig, TailKind};
 use walshadow::pos::{
-    EmitterAck, FilterDurable, Floor, Monotone, Pos, ShadowFlush, ShadowReplay, SourceReceived,
+    EmitterAck, FilterDurable, Floor, Monotone, Pos, RawStart, ShadowFlush, ShadowReplay,
+    SourceReceived,
 };
 use walshadow::queueing_record_sink::{
     DEFAULT_QUEUEING_BATCH_SIZE, DEFAULT_QUEUEING_RECORD_SINK_CAPACITY, QueueingRecordSink,
@@ -61,9 +62,10 @@ use crate::source_db::{
     open_source_sql_client,
 };
 use crate::source_recovery::{
-    BARRIER_LOG_INTERVAL, FORK_FENCE_DRAIN, PROMOTION_POLL, PromotionGate, ReconnectBackoff,
-    SOURCE_SWAP_RETRY, SourcePath, SourceRecovery, commit_fork_resume, connect_source_waiting,
-    promotion_gate, resume_manifest, resume_source_feed, stream_branch, swap_reason,
+    BARRIER_LOG_INTERVAL, FORK_FENCE_DRAIN, PROMOTION_POLL, PauseState, PromotionGate,
+    ReconnectBackoff, SOURCE_SWAP_RETRY, SourcePath, SourceRecovery, commit_fork_resume,
+    connect_source_waiting, promotion_gate, resume_manifest, resume_source_feed, stream_branch,
+    swap_reason,
 };
 
 pub(crate) async fn run_session(
@@ -274,7 +276,7 @@ pub(crate) async fn run_session(
         .and_then(|c| c.backup.clone())
         .map(Archive::open)
         .transpose()?;
-    let start_lsn_override: Option<Pos<Floor>> = args
+    let start_lsn_override: Option<Pos<RawStart>> = args
         .start_lsn
         .as_deref()
         .map(|s| walshadow::pg::parse_pg_lsn(s).context("--start-lsn"))
@@ -462,7 +464,7 @@ pub(crate) async fn run_session(
         .filter(|tli| *tli <= start_timeline)
         .collect();
 
-    let mut stream = WalStream::new(start_timeline, WAL_SEG_SIZE, aligned)?;
+    let mut stream = WalStream::builder(start_timeline, WAL_SEG_SIZE, aligned)?;
     let prefix_dirs = [args.out_dir.clone(), shadow_start.data_dir().join("pg_wal")];
     stream.preserve_resume_prefix(&prefix_dirs).await?;
     // Shadow must attach to this listener before catalog replay can advance
@@ -733,7 +735,8 @@ pub(crate) async fn run_session(
         .map(|c| c.pending_capture)
         .unwrap_or_default();
     let pending_catalog = Arc::new(walshadow::pending::PendingCatalog::default());
-    let smgr_markers = stream.filter_mut().smgr_markers();
+    let smgr_markers = stream.filter().smgr_markers();
+    let mut stream = stream.start();
     // One log per database, each in its own spill subdirectory; the primary
     // keeps the spill root so a single-database resume reads where it wrote
     let mut desc_logs: Vec<Arc<walshadow::desc_log::DescriptorLog>> =
@@ -988,23 +991,18 @@ pub(crate) async fn run_session(
         }
     };
 
-    let (mut reorder_sink, pipeline_handle) = pcfg
+    let (booting_reorder, pipeline_handle) = pcfg
         .spawn(emitter_ack.clone())
         .await
         .context("spawn decode+insert pipeline")?;
     let ack_probe = pipeline_handle.ack_probe.clone();
-    reorder_sink
-        .flush_due_retires()
-        .await
-        .context("boot flush of due toast-mirror retires")?;
-    reorder_sink
-        .settle_pending_boot(Some(&args.bootstrap_shadow_data_dir))
-        .await
-        .context("boot settle of pending backup rows")?;
-    reorder_sink
-        .apply_boot_events(desc_log.active_present_at(raw_start.get()), raw_start.get())
-        .await
-        .context("boot Added pass over descriptor log")?;
+    let reorder_sink = booting_reorder
+        .boot(
+            Some(&args.bootstrap_shadow_data_dir),
+            desc_log.active_present_at(raw_start.get()),
+            raw_start.get(),
+        )
+        .await?;
     let decoder_xact = QueueingRecordSink::spawn(
         DecoderXactPair {
             decoder,
@@ -1211,17 +1209,13 @@ pub(crate) async fn run_session(
     // resolver is the one the pump watches
     let pump_config_rx = config_resolvers.first().map(|r| r.subscribe());
     let mut swap = SourceSwap::default();
-    // Frozen when the pump observes a pause, so a promotion decision reads a
-    // frontier that cannot move under it. Cleared on resume: a value left over
+    // Frontier frozen when the pump observes a pause, so a promotion decision
+    // reads one that cannot move under it. Cleared on resume: a value left over
     // from an earlier pause is as misleading as a live one
-    let mut pause_frontier: Option<(u64, u64)> = None;
-    // A restart mid-pause re-freezes both numbers, conservatively but not
-    // identically, so the pair an operator already read has to be read again
-    let mut pause_refrozen = false;
+    let mut pause = PauseState::Running;
     let mut ever_unpaused = false;
     // Step 5's answer, refreshed while paused off the endpoint the pump holds
-    let mut promotion = PromotionGate::default();
-    let mut promotion_polled_at: Option<Instant> = None;
+    let mut promotion = PromotionGate::blocked("not_paused");
     let switchover = Switchover {
         system_id: live_identity.system_id,
         out_dir: &args.out_dir,
@@ -1331,45 +1325,47 @@ pub(crate) async fn run_session(
         // about, which the target must reach before promotion. Bytes cannot
         // have been consumed without being received, so a source that has not
         // reported a head yet reads as level with the consumed frontier
-        match (paused, pause_frontier) {
-            (true, None) => {
-                pause_frontier = Some((
-                    stream.next_lsn().get(),
-                    received.get().max(stream.next_lsn().get()),
-                ));
-                // A pause this process never saw lifted was taken before it
-                // booted, so these two numbers replace ones an operator may
-                // already hold. Both re-freeze conservatively — consumed drops
-                // back to the floor, received re-derives from the live head —
-                // but a promotion decision has to be taken from the pair on
-                // offer now (architecture/recovery.md)
-                pause_refrozen = !ever_unpaused;
-                let (consumed, head) = pause_frontier.expect("just frozen");
-                tracing::info!(
-                    target: "walshadow",
-                    pause_consumed_lsn = %format_pg_lsn(consumed),
-                    pause_received_lsn = %format_pg_lsn(head),
-                    refrozen = pause_refrozen,
-                    "pause observed — frontier frozen",
-                );
-            }
-            (false, Some(_)) => {
-                pause_frontier = None;
-                pause_refrozen = false;
-            }
-            _ => {}
+        if !paused {
+            pause = PauseState::Running;
+        } else if let PauseState::Running = pause {
+            let consumed = stream.next_lsn().get();
+            let head = received.get().max(consumed);
+            // A pause this process never saw lifted was taken before it
+            // booted, so these two numbers replace ones an operator may
+            // already hold. Both re-freeze conservatively — consumed drops
+            // back to the floor, received re-derives from the live head —
+            // but a promotion decision has to be taken from the pair on
+            // offer now (architecture/recovery.md)
+            let refrozen = !ever_unpaused;
+            tracing::info!(
+                target: "walshadow",
+                pause_consumed_lsn = %format_pg_lsn(consumed),
+                pause_received_lsn = %format_pg_lsn(head),
+                refrozen,
+                "pause observed — frontier frozen",
+            );
+            pause = PauseState::Paused {
+                frontier: (consumed, head),
+                refrozen,
+                polled_at: None,
+            };
         }
         ever_unpaused |= !paused;
         // Step 5 of the protocol, answered off the connection step 4's repoint
         // already moved onto the target: replay, receive, and recovery state
         // beside the frozen frontier they have to reach
         // (architecture/recovery.md)
-        if let Some((_, pause_received)) = pause_frontier {
-            if promotion_polled_at.is_none_or(|t| t.elapsed() >= PROMOTION_POLL) {
-                promotion_polled_at = Some(Instant::now());
+        if let PauseState::Paused {
+            frontier: (_, pause_received),
+            polled_at,
+            ..
+        } = &mut pause
+        {
+            if polled_at.is_none_or(|t| t.elapsed() >= PROMOTION_POLL) {
+                *polled_at = Some(Instant::now());
                 promotion = match tokio::time::timeout(
                     PROMOTION_POLL,
-                    promotion_gate(&mut feed, pause_received),
+                    promotion_gate(&mut feed, *pause_received),
                 )
                 .await
                 {
@@ -1382,7 +1378,6 @@ pub(crate) async fn run_session(
             }
         } else {
             promotion = PromotionGate::blocked("not_paused");
-            promotion_polled_at = None;
         }
         let (shadow_agg, shadow_served_tli) = {
             let state = shadow_state.lock().await;
@@ -1421,17 +1416,15 @@ pub(crate) async fn run_session(
             },
         );
         if last_cursor_write.is_none_or(|t| t.elapsed() >= cursor_write_interval) {
-            manifest::write(&args.spill_dir, &cur)
+            let persisted = manifest::write(&args.spill_dir, &cur)
                 .await
                 .context("write resume manifest")?;
             last_cursor_write = Some(Instant::now());
-            // Publish only after persist: pruners cut against what a
-            // crash-now restart actually resumes from.
-            resume_floor.join(cur.floor);
+            resume_floor.publish(persisted);
             // Descriptor log prunes against the same floor, off this task: a
             // compaction rewrites the whole ckpt inline and would stall WAL
             // consumption past the source's wal_sender_timeout
-            gc_floor.join(cur.floor);
+            gc_floor.publish(persisted);
         }
         // flush caps physical slot's restart_lsn.
         // Manifest writes are cadence-gated above while keepalive replies inside
@@ -1706,27 +1699,32 @@ pub(crate) async fn run_session(
             // so a restart from it loses nothing. The loop keeps publishing
             // meanwhile, so a wait reads as a wait rather than a stall, and the
             // source has stopped producing so nothing queues up behind it
-            let waiting_on = walshadow::transition::ForkBarrier {
+            let open = match (walshadow::transition::ForkBarrier {
                 resume_safe_lsn: resume_safe,
                 shadow_apply_lsn: shadow_agg.min_apply_lsn,
                 filter_durable: durable,
                 floor: resume_floor.get(),
-            }
-            .pending(Pos::new(probed.switch_lsn), WAL_SEG_SIZE);
-            if let Some(wait) = waiting_on {
-                // Prod the walreceiver: non-forced replies fire only on flush
-                // progress, and the ancestor's tail may be the last thing left
-                shadow_state.lock().await.request_status();
-                if barrier_logged.is_none_or(|t| t.elapsed() >= BARRIER_LOG_INTERVAL) {
-                    tracing::info!(
-                        target: "walshadow",
-                        switch_lsn = %format_pg_lsn(probed.switch_lsn),
-                        waiting_on = wait.label(),
-                        "fork barrier: {wait}",
-                    );
-                    barrier_logged = Some(Instant::now());
+            })
+            .open(Pos::new(probed.switch_lsn), WAL_SEG_SIZE)
+            {
+                Ok(open) => Some(open),
+                Err(wait) => {
+                    // Prod the walreceiver: non-forced replies fire only on flush
+                    // progress, and the ancestor's tail may be the last thing left
+                    shadow_state.lock().await.request_status();
+                    if barrier_logged.is_none_or(|t| t.elapsed() >= BARRIER_LOG_INTERVAL) {
+                        tracing::info!(
+                            target: "walshadow",
+                            switch_lsn = %format_pg_lsn(probed.switch_lsn),
+                            waiting_on = wait.label(),
+                            "fork barrier: {wait}",
+                        );
+                        barrier_logged = Some(Instant::now());
+                    }
+                    None
                 }
-            } else {
+            };
+            if let Some(open) = open {
                 barrier_logged = None;
                 let commit = async |resume: walshadow::transition::ForkResume| {
                     commit_fork_resume(
@@ -1735,7 +1733,7 @@ pub(crate) async fn run_session(
                         resume,
                         manifest::LsnSet {
                             // Fork cannot precede last observed source head
-                            source_received: received.max(resume.switch_lsn.retag()),
+                            source_received: received.max(resume.switch_lsn().retag()),
                             filter_durable: durable,
                             shadow_replay,
                             drain: guards.drain_lsn,
@@ -1757,6 +1755,7 @@ pub(crate) async fn run_session(
                         status,
                         guards,
                         &probed,
+                        open,
                         commit,
                         &mut timeline_stats,
                     )
@@ -1882,8 +1881,8 @@ pub(crate) async fn run_session(
                 shadow_replay_timeline: shadow_agg.replay_timeline.unwrap_or(0),
                 floor_lsn: published_floor,
                 stats: timeline_stats,
-                pause_frontier,
-                pause_refrozen,
+                pause_frontier: pause.frontier(),
+                pause_refrozen: pause.refrozen(),
                 wedge: crossing.wedge().cloned(),
                 promotion,
             },

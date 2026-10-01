@@ -22,6 +22,7 @@ use anyhow::{Context, Result, bail};
 use clickhouse_c::{Block, Event};
 
 use crate::backfill::backfill_types::BackupRequest;
+use crate::backfill::copy_backfill::SwapPermit;
 use crate::ch::{ChConn, EmitterError, exec_drain, quote_ident, with_timeout};
 use crate::config::DestEmitter;
 use crate::mapping::{MappingHandle, TableMapping, TableTarget};
@@ -271,7 +272,8 @@ impl StagingSession {
     }
 
     /// Atomic publish; requires an Atomic/Replicated database engine.
-    pub async fn exchange(&mut self, rel: &StagingRel) -> Result<()> {
+    pub async fn exchange(&mut self, permit: SwapPermit<'_>) -> Result<()> {
+        let rel = permit.rel();
         self.exec_once(&format!(
             "EXCHANGE TABLES {} AND {}",
             rel.real_sql(),

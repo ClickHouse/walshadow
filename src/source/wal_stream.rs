@@ -132,6 +132,46 @@ pub struct WalStream {
     resume_prefix: Option<ResumePrefix>,
 }
 
+/// [`WalStream`] before its first push. Swapping the bytes sink mid-stream
+/// would leave bytes already dispatched unreceived by the new sink, and filter
+/// scope set late would misroute records already decided
+pub struct WalStreamBuilder(WalStream);
+
+impl WalStreamBuilder {
+    /// Preserve continuation of a record already rewritten before resume.
+    /// `dirs` rank by trust: the first holding the resume segment wins
+    pub async fn preserve_resume_prefix(&mut self, dirs: &[PathBuf]) -> Result<(), WalStreamError> {
+        let s = &mut self.0;
+        s.resume_prefix = ResumePrefix::load(dirs, s.timeline, s.seg_size, s.next_lsn)
+            .await
+            .map_err(WalStreamError::ResumePrefix)?;
+        if let Some(prefix) = &s.resume_prefix {
+            tracing::info!(
+                start_lsn = format_args!("{:#X}", s.next_lsn),
+                end_lsn = format_args!("{:#X}", prefix.end_lsn()),
+                "preserving filtered resume continuation"
+            );
+        }
+        Ok(())
+    }
+
+    pub fn filter(&self) -> &Filter {
+        &self.0.filter
+    }
+
+    pub fn filter_mut(&mut self) -> &mut Filter {
+        &mut self.0.filter
+    }
+
+    pub fn set_bytes_sink(&mut self, sink: Box<dyn RecordBytesSink + Send>) {
+        self.0.bytes_sink = sink;
+    }
+
+    pub fn start(self) -> WalStream {
+        self.0
+    }
+}
+
 /// Digest of the ancestor bytes a descendant repeats, from
 /// [`WalStream::fork_prefix`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -169,36 +209,19 @@ impl WalStream {
         })
     }
 
-    /// Preserve continuation of a record already rewritten before resume.
-    /// `dirs` rank by trust: the first holding the resume segment wins
-    pub async fn preserve_resume_prefix(&mut self, dirs: &[PathBuf]) -> Result<(), WalStreamError> {
-        self.resume_prefix = ResumePrefix::load(dirs, self.timeline, self.seg_size, self.next_lsn)
-            .await
-            .map_err(WalStreamError::ResumePrefix)?;
-        if let Some(prefix) = &self.resume_prefix {
-            tracing::info!(
-                start_lsn = format_args!("{:#X}", self.next_lsn),
-                end_lsn = format_args!("{:#X}", prefix.end_lsn()),
-                "preserving filtered resume continuation"
-            );
-        }
-        Ok(())
+    /// Stream that needs a bytes sink, resume prefix, or filter scope, all of
+    /// which are fixed before the first [`push`](Self::push)
+    pub fn builder(
+        timeline: u32,
+        seg_size: u64,
+        start_lsn: Pos<Floor>,
+    ) -> Result<WalStreamBuilder, WalStreamError> {
+        Self::new(timeline, seg_size, start_lsn).map(WalStreamBuilder)
     }
 
     /// Stats here are cumulative across every segment this stream processed.
     pub fn filter(&self) -> &Filter {
         &self.filter
-    }
-
-    pub fn filter_mut(&mut self) -> &mut Filter {
-        &mut self.filter
-    }
-
-    /// Must be called before the first [`push`](Self::push); swapping
-    /// mid-stream leaves bytes already dispatched to the prior sink
-    /// unreceived by the new one.
-    pub fn set_bytes_sink(&mut self, sink: Box<dyn RecordBytesSink + Send>) {
-        self.bytes_sink = sink;
     }
 
     pub fn align_down(lsn: u64, seg_size: u64) -> u64 {
@@ -381,7 +404,6 @@ impl WalStream {
                 next_lsn,
                 page_magic,
                 route,
-                catalog_boundary: verdict.catalog_boundary,
                 boundary_info: verdict.boundary,
                 aborted_tree: verdict.aborted_tree,
                 defer_catalog_decode: verdict.defer_catalog_decode,
@@ -403,14 +425,9 @@ impl WalStream {
         segment_sink: &mut (dyn SegmentSink + Send),
     ) -> Result<bool, WalStreamError> {
         let seg_size = self.seg_size as usize;
-        if self.walker.buffer_len() < seg_size {
+        let Some(ready) = self.walker.first_segment_ready() else {
             return Ok(false);
-        }
-        if let Some(pend_off) = self.walker.pending_start_offset()
-            && pend_off < seg_size
-        {
-            return Ok(false);
-        }
+        };
         let seg = self.segment_for_lsn(self.current_lsn);
         // Wire tail: if wire_offset < seg_size, the residual span
         // (alignment pad + page header + in-place-rewritten spanning bytes)
@@ -425,7 +442,7 @@ impl WalStream {
         segment_sink
             .on_segment(seg, &self.walker.buffer()[..seg_size])
             .await?;
-        self.walker.truncate_first_segment();
+        self.walker.truncate_first_segment(ready);
         self.current_lsn += self.seg_size;
         self.bytes_sink.on_segment_retired(self.current_lsn).await?;
         self.wire_offset = self.wire_offset.saturating_sub(seg_size);
@@ -838,10 +855,10 @@ mod tests {
         assert_eq!(std::fs::read(&seg_path).unwrap(), bytes);
         let msg = rx.try_recv().expect("segment enqueued for fsync");
         assert_eq!(
-            msg.end_lsn,
+            msg.end_lsn(),
             seg.start_lsn(WAL_SEG_SIZE) + bytes.len() as u64
         );
-        assert_eq!(msg.seg_path, seg_path);
+        assert_eq!(msg.seg_path(), seg_path);
     }
 
     /// Contract: a `RecordBytesSink` sees the full wire stream (record
@@ -870,8 +887,9 @@ mod tests {
         }
 
         let page = synth_two_record_page();
-        let mut ws = WalStream::new(1, SEG, Pos::ZERO).unwrap();
+        let mut ws = WalStream::builder(1, SEG, Pos::ZERO).unwrap();
         ws.set_bytes_sink(Box::new(SharedCollector(collector_chunks.clone())));
+        let mut ws = ws.start();
         ws.push(0, &page, &mut rec, &mut seg).await.unwrap();
         assert!(!rec.records.is_empty(), "record_sink fired");
 
@@ -1082,7 +1100,7 @@ mod tests {
         let page = page_of(&[raw_rec(RmId::Smgr as u8, 0x10, 0, None, Some(&md))], 8192);
         for fail_persist in [false, true] {
             let tmp = tempfile::tempdir().unwrap();
-            let mut stream = WalStream::new(1, 8192, Pos::new(0u64)).unwrap();
+            let mut stream = WalStream::builder(1, 8192, Pos::new(0u64)).unwrap();
             stream.filter_mut().keep_user_rels(Default::default(), 0);
             stream
                 .filter_mut()
@@ -1098,6 +1116,7 @@ mod tests {
             stream.set_bytes_sink(Box::new(RejectWire(calls.clone())));
             let mut records = CollectingRecordSink::default();
             let mut segments = CollectingSegmentSink::default();
+            let mut stream = stream.start();
             let err = stream
                 .push(0, &page, &mut records, &mut segments)
                 .await
@@ -1134,10 +1153,11 @@ mod tests {
         // User heap insert in the followed db: dropped, so NOOP-rewritten
         let user = raw_rec(RmId::Heap as u8, 0x00, 8, Some((1663, 5, 50000)), None);
         let page = page_of(&[user], 8192);
-        let mut ws = WalStream::new(1, SEG, Pos::ZERO).unwrap();
+        let mut ws = WalStream::builder(1, SEG, Pos::ZERO).unwrap();
         ws.filter_mut().set_target_db(5);
         let mut rec = CollectingRecordSink::default();
         let mut seg = CollectingSegmentSink::default();
+        let mut ws = ws.start();
         ws.push(0, &page, &mut rec, &mut seg).await.unwrap();
 
         let prefix = ws.fork_prefix();
@@ -1449,7 +1469,7 @@ mod tests {
             }
         }
 
-        let mut ws = WalStream::new(1, SEG, Pos::ZERO).unwrap();
+        let mut ws = WalStream::builder(1, SEG, Pos::ZERO).unwrap();
         // Live wiring: catalog dirt is admitted only for the followed db
         ws.filter_mut().set_target_db(5);
         ws.set_bytes_sink(Box::new(SpanLog(chunks.clone())));
@@ -1463,6 +1483,7 @@ mod tests {
         );
         let stats = gate.stats.clone();
         let mut sink = BoundaryHoldSink::new(q, gate);
+        let mut ws = ws.start();
         let pump = tokio::spawn(async move {
             let mut seg = CollectingSegmentSink::default();
             ws.push(0, &page, &mut sink, &mut seg).await.unwrap();
@@ -1578,12 +1599,13 @@ mod tests {
             0,
             64 * 1024 * 1024,
         )));
-        let mut ws = WalStream::new(1, SEG, Pos::ZERO).unwrap();
+        let mut ws = WalStream::builder(1, SEG, Pos::ZERO).unwrap();
         ws.set_bytes_sink(Box::new(ShadowStreamSink::new(state.clone())));
         let mut rec = CollectingRecordSink::default();
         let mut seg = CollectingSegmentSink::default();
 
         let (page0, page1) = synth_two_page_spanning_record();
+        let mut ws = ws.start();
         ws.push(0, &page0, &mut rec, &mut seg).await.unwrap();
         ws.push(SEG, &page1, &mut rec, &mut seg).await.unwrap();
 

@@ -141,10 +141,15 @@ pub async fn connect_client(
     }
 }
 
-pub async fn drain_to_end_of_stream(client: &mut BoxedAsyncClient) -> Result<(), EmitterError> {
+/// Server finished the query; an INSERT's rows are durable
+pub struct EndOfStream(());
+
+pub async fn drain_to_end_of_stream(
+    client: &mut BoxedAsyncClient,
+) -> Result<EndOfStream, EmitterError> {
     loop {
         match client.recv_event().await? {
-            Event::EndOfStream => return Ok(()),
+            Event::EndOfStream => return Ok(EndOfStream(())),
             Event::Exception(exc) => {
                 return Err(EmitterError::ServerException {
                     code: exc.code(),
@@ -176,7 +181,8 @@ pub async fn exec_drain(
 ) -> Result<(), EmitterError> {
     with_timeout(timeout, async {
         client.send_query(sql, None).await?;
-        drain_to_end_of_stream(client).await
+        drain_to_end_of_stream(client).await?;
+        Ok(())
     })
     .await
 }
@@ -224,21 +230,8 @@ impl ChConn {
     }
 
     pub async fn ready(&mut self) -> Result<&mut BoxedAsyncClient, EmitterError> {
-        let config = self.dest.current();
-        let moved = self
-            .dialed
-            .as_ref()
-            .is_none_or(|dialed| !Arc::ptr_eq(dialed, &config));
-        if moved || self.last_used.elapsed() >= config.idle_reconnect() {
-            self.client = None;
-        }
-        if self.client.is_none() {
-            self.client = Some(connect_client(&*config).await?);
-            self.dialed = Some(config);
-            self.last_used = Instant::now();
-            self.dials += 1;
-        }
-        Ok(self.client.as_mut().expect("just connected"))
+        let client = self.take_ready().await?;
+        Ok(self.client.insert(client))
     }
 
     /// Dials since the last call, excluding the one at construction
@@ -305,8 +298,22 @@ impl ChConn {
     }
 
     async fn take_ready(&mut self) -> Result<BoxedAsyncClient, EmitterError> {
-        self.ready().await?;
-        Ok(self.client.take().expect("just connected"))
+        let config = self.dest.current();
+        let moved = self
+            .dialed
+            .as_ref()
+            .is_none_or(|dialed| !Arc::ptr_eq(dialed, &config));
+        if moved || self.last_used.elapsed() >= config.idle_reconnect() {
+            self.client = None;
+        }
+        if let Some(client) = self.client.take() {
+            return Ok(client);
+        }
+        let client = connect_client(&*config).await?;
+        self.dialed = Some(config);
+        self.last_used = Instant::now();
+        self.dials += 1;
+        Ok(client)
     }
 }
 

@@ -351,7 +351,7 @@ async fn pre_rotated_pg_class_seed_keeps_catalog_writes() {
         .with_status_interval(Duration::from_millis(500));
     let ident = feed.identify_system().await.expect("IDENTIFY_SYSTEM");
     let aligned = WalStream::align_down(ident.xlogpos, WAL_SEG_SIZE);
-    let mut stream = WalStream::new(ident.timeline, WAL_SEG_SIZE, Pos::new(aligned)).unwrap();
+    let mut stream = WalStream::builder(ident.timeline, WAL_SEG_SIZE, Pos::new(aligned)).unwrap();
 
     // Seed *before* START_REPLICATION. Without this line the test
     // would catch the regression: tracker would never learn the
@@ -409,6 +409,7 @@ async fn pre_rotated_pg_class_seed_keeps_catalog_writes() {
 
     let deadline = std::time::Instant::now() + Duration::from_secs(15);
     let mut segments_shipped = 0u64;
+    let mut stream = stream.start();
     let mut prev = stream.dispatched_lsn();
     while segments_shipped < 1 && std::time::Instant::now() < deadline {
         let apply_lsn = stream.dispatched_lsn();

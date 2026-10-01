@@ -32,6 +32,7 @@ use crate::backfill::walk_barrier::WalkBarrier;
 use crate::decode::heap_decoder::{
     ColumnValue, CommittedTuple, DecodeError, DecodedHeap, DecodedTuple, HeapOp, decode_block_data,
 };
+use crate::decode::visibility::{PgMultiXactAccum, PgXactAccum, PgXactView, SealedPatch};
 use crate::schema::RelDescriptor;
 use ahash::{HashMap, HashMapExt, HashSet};
 
@@ -461,12 +462,9 @@ pub struct PageWalkSink {
     /// `None` taps everything the catalog map holds. A superset filter, not a
     /// second source of truth: the drain's `skip_initial` stays the authority
     tap_filenodes: Option<Arc<HashSet<(Oid, Oid)>>>,
-    /// `pg_xact/` segments Tap into here for backfill visibility gate
-    /// (architecture/bootstrap.md); `None` (greenfield) keeps Skip.
-    pg_xact: Option<Arc<std::sync::Mutex<crate::decode::visibility::PgXactAccum>>>,
-    /// `pg_multixact/{offsets,members}` segments, for multixact xmax
-    /// resolution in the same gate
-    pg_multixact: Option<Arc<std::sync::Mutex<crate::decode::visibility::PgMultiXactAccum>>>,
+    /// `pg_xact/` and `pg_multixact/` segments Tap into here for backfill
+    /// visibility gate (architecture/bootstrap.md); `None` (greenfield) keeps Skip
+    gate: Option<GateAccums>,
     /// Resumable walk: heap files a checkpoint already proved durable, and the
     /// barrier every other file reports completion through
     resume: Option<WalkResume>,
@@ -507,18 +505,14 @@ impl PageWalkSink {
             captured: Arc::default(),
             store_toast,
             tap_filenodes: None,
-            pg_xact: None,
-            pg_multixact: None,
+            gate: None,
             resume: None,
         }
     }
 
-    /// Collect `pg_xact/` segments for the visibility gate.
-    pub fn with_pg_xact_accum(
-        mut self,
-        accum: Arc<std::sync::Mutex<crate::decode::visibility::PgXactAccum>>,
-    ) -> Self {
-        self.pg_xact = Some(accum);
+    /// Collect `pg_xact/` and `pg_multixact/` segments for the visibility gate
+    pub fn with_gate(mut self, accums: GateAccums) -> Self {
+        self.gate = Some(accums);
         self
     }
 
@@ -553,15 +547,6 @@ impl PageWalkSink {
         entry.1 |= slru;
     }
 
-    /// Collect `pg_multixact/` segments for multixact xmax resolution.
-    pub fn with_pg_multixact_accum(
-        mut self,
-        accum: Arc<std::sync::Mutex<crate::decode::visibility::PgMultiXactAccum>>,
-    ) -> Self {
-        self.pg_multixact = Some(accum);
-        self
-    }
-
     /// Decline filenodes outside `set` at `begin`. Bytes still drain off the
     /// wire; tuples never decode
     pub fn with_tap_filenodes(mut self, set: Arc<HashSet<(Oid, Oid)>>) -> Self {
@@ -594,8 +579,7 @@ impl PageWalkSink {
             captured: Arc::default(),
             store_toast: false,
             tap_filenodes: None,
-            pg_xact: None,
-            pg_multixact: None,
+            gate: None,
             resume: None,
         }
     }
@@ -626,20 +610,15 @@ impl PageWalkSink {
         parse_base_path(&meta.path)
     }
 
-    fn classify_slru(&self, path: &std::path::Path) -> Option<SlruSegment> {
-        if self.pg_xact.is_some()
-            && let Some(segno) = crate::decode::visibility::pg_xact_segno_from_path(path)
-        {
+    fn classify_slru(path: &std::path::Path) -> Option<SlruSegment> {
+        use crate::decode::visibility::MultiXactSegment;
+        if let Some(segno) = crate::decode::visibility::pg_xact_segno_from_path(path) {
             return Some(SlruSegment::PgXact(segno));
         }
-        if self.pg_multixact.is_some() {
-            use crate::decode::visibility::MultiXactSegment;
-            return match crate::decode::visibility::pg_multixact_segno_from_path(path)? {
-                MultiXactSegment::Offsets(s) => Some(SlruSegment::MultiOffsets(s)),
-                MultiXactSegment::Members(s) => Some(SlruSegment::MultiMembers(s)),
-            };
+        match crate::decode::visibility::pg_multixact_segno_from_path(path)? {
+            MultiXactSegment::Offsets(s) => Some(SlruSegment::MultiOffsets(s)),
+            MultiXactSegment::Members(s) => Some(SlruSegment::MultiMembers(s)),
         }
-        None
     }
 }
 
@@ -665,14 +644,14 @@ impl BackupSink for PageWalkSink {
 
     async fn begin(&self, meta: &FileMeta) -> io::Result<FileAction> {
         if matches!(meta.kind, FileKind::File)
-            && let Some(slru) = self.classify_slru(&meta.path)
+            && let Some(gate) = &self.gate
+            && let Some(slru) = Self::classify_slru(&meta.path)
         {
             self.tally(meta, None, true);
             return Ok(FileAction::Tap(Box::new(SlruEntry {
                 seg: slru,
                 buf: Vec::with_capacity(meta.size as usize),
-                pg_xact: self.pg_xact.clone(),
-                pg_multixact: self.pg_multixact.clone(),
+                gate: gate.clone(),
             })));
         }
         let Some(f) = self.classify(meta) else {
@@ -918,8 +897,59 @@ impl EntrySink for PageWalkEntry {
 struct SlruEntry {
     seg: SlruSegment,
     buf: Vec<u8>,
-    pg_xact: Option<Arc<std::sync::Mutex<crate::decode::visibility::PgXactAccum>>>,
-    pg_multixact: Option<Arc<std::sync::Mutex<crate::decode::visibility::PgMultiXactAccum>>>,
+    gate: GateAccums,
+}
+
+/// `pg_xact` and `pg_multixact` accums one gated walk fills
+#[derive(Clone)]
+pub struct GateAccums {
+    pg_xact: Arc<std::sync::Mutex<PgXactAccum>>,
+    pg_multixact: Arc<std::sync::Mutex<PgMultiXactAccum>>,
+}
+
+impl GateAccums {
+    pub fn new(source_major: u32) -> Self {
+        Self {
+            pg_xact: Arc::default(),
+            pg_multixact: Arc::new(std::sync::Mutex::new(PgMultiXactAccum::new(source_major))),
+        }
+    }
+
+    /// Walk reached EOF without error, so every SLRU segment landed
+    pub fn complete(self) -> CompleteAccums {
+        CompleteAccums {
+            pg_xact: std::mem::take(&mut *self.pg_xact.lock().expect("pg_xact accum lock")),
+            pg_multixact: self
+                .pg_multixact
+                .lock()
+                .expect("pg_multixact accum lock")
+                .take(),
+        }
+    }
+}
+
+/// Accums of a finished walk, the only ones deferred tuples resolve against
+pub struct CompleteAccums {
+    pg_xact: PgXactAccum,
+    pg_multixact: PgMultiXactAccum,
+}
+
+impl CompleteAccums {
+    #[cfg(test)]
+    pub(crate) fn from_parts(pg_xact: PgXactAccum, pg_multixact: PgMultiXactAccum) -> Self {
+        Self {
+            pg_xact,
+            pg_multixact,
+        }
+    }
+
+    pub fn segment_count(&self) -> usize {
+        self.pg_xact.segment_count()
+    }
+
+    pub fn view<'a>(&'a self, patch: &'a SealedPatch) -> PgXactView<'a> {
+        PgXactView::new(&self.pg_xact, patch).with_multixact(&self.pg_multixact)
+    }
 }
 
 #[async_trait]
@@ -930,34 +960,16 @@ impl EntrySink for SlruEntry {
     }
 
     async fn end(self: Box<Self>) -> io::Result<()> {
-        let SlruEntry {
-            seg,
-            buf,
-            pg_xact,
-            pg_multixact,
-        } = *self;
+        let SlruEntry { seg, buf, gate } = *self;
+        let multi = || gate.pg_multixact.lock().expect("pg_multixact accum lock");
         match seg {
-            SlruSegment::PgXact(segno) => {
-                if let Some(a) = pg_xact {
-                    a.lock()
-                        .expect("pg_xact accum lock")
-                        .insert_segment(segno, buf);
-                }
-            }
-            SlruSegment::MultiOffsets(segno) => {
-                if let Some(a) = pg_multixact {
-                    a.lock()
-                        .expect("pg_multixact accum lock")
-                        .insert_offsets_segment(segno, buf);
-                }
-            }
-            SlruSegment::MultiMembers(segno) => {
-                if let Some(a) = pg_multixact {
-                    a.lock()
-                        .expect("pg_multixact accum lock")
-                        .insert_members_segment(segno, buf);
-                }
-            }
+            SlruSegment::PgXact(segno) => gate
+                .pg_xact
+                .lock()
+                .expect("pg_xact accum lock")
+                .insert_segment(segno, buf),
+            SlruSegment::MultiOffsets(segno) => multi().insert_offsets_segment(segno, buf),
+            SlruSegment::MultiMembers(segno) => multi().insert_members_segment(segno, buf),
         }
         Ok(())
     }

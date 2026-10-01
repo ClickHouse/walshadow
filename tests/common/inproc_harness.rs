@@ -53,7 +53,7 @@ use walshadow::record::{
 use walshadow::schema::RelName;
 use walshadow::segment_sink::DirSegmentSink;
 use walshadow::shadow::{Shadow, ShadowConfig};
-use walshadow::shadow_catalog::{ShadowCatalog, ShadowCatalogConfig};
+use walshadow::shadow_catalog::{ParkedAt, ShadowCatalog, ShadowCatalogConfig};
 use walshadow::source_feed::{SourceEvent, SourceFeed, StandbyStatus};
 use walshadow::wal_stream::WalStream;
 use walshadow::xact_buffer::{BufferingDecoderSink, SubxactTracker, XactBuffer, XactBufferConfig};
@@ -580,13 +580,15 @@ impl RecordSink for PipelineSinks {
                         .await
                         .map_err(|e| SinkError::Other(format!("harness boundary wait: {e}")))?;
                     self.capture.charge_hold(info, std::time::Duration::ZERO);
+                    // Harness pump withholds successors while this runs
+                    let parked = ParkedAt::assume_for_test(record.next_lsn);
                     self.capture
-                        .capture_boundary(info, record.source_lsn, record.next_lsn)
+                        .capture_boundary(info, record.source_lsn, &parked)
                         .await?;
                 } else if matches!(info.kind, BoundaryKind::Commit) {
                     // Save an empty batch without waiting, as daemon does
                     self.capture
-                        .capture_boundary(info, record.source_lsn, record.next_lsn)
+                        .cover_unparked(info, record.source_lsn, record.next_lsn)
                         .await?;
                 }
             }
@@ -682,7 +684,7 @@ async fn build_pipeline_inner(
         .with_status_interval(Duration::from_millis(500));
     let ident = feed.identify_system().await.expect("IDENTIFY_SYSTEM");
     let aligned = WalStream::align_down(ident.xlogpos, WAL_SEG_SIZE);
-    let mut stream = WalStream::new(ident.timeline, WAL_SEG_SIZE, Pos::new(aligned)).unwrap();
+    let mut stream = WalStream::builder(ident.timeline, WAL_SEG_SIZE, Pos::new(aligned)).unwrap();
     stream.set_bytes_sink(Box::new(walshadow::shadow_stream::ShadowStreamSink::new(
         shadow_stream_state,
     )));
@@ -771,7 +773,7 @@ async fn build_pipeline_inner(
         .await
         .expect("shadow db oid");
     stream.filter_mut().set_target_db(shadow_db_oid);
-    let smgr_markers = stream.filter_mut().smgr_markers();
+    let smgr_markers = stream.filter().smgr_markers();
     let desc_log = Arc::new(
         walshadow::desc_log::DescriptorLog::open(
             &spill_dir,
@@ -852,11 +854,12 @@ async fn build_pipeline_inner(
         None,
         toml::Table::new(),
         mapping.clone(),
+        walshadow::config::ResolverBoot {
+            shadow_toast: stream.filter().shadow_rels().map(|rels| rels.held()),
+            ..Default::default()
+        },
     );
-    // Apply daemon's TOAST admission check to opt-ins
-    if let Some(rels) = stream.filter().shadow_rels() {
-        config_resolver.bind_shadow_toast(rels.held());
-    }
+    let stream = stream.start();
     let ddl_cfg = DdlConfig::from_resolved(
         &config_rx.borrow(),
         emitter_cfg.database.clone(),
@@ -953,20 +956,18 @@ async fn build_pipeline_inner(
         resume_floor: resume_floor.clone(),
         budget: None,
     };
-    let (mut reorder, handle) = pcfg
+    let (booting, handle) = pcfg
         .spawn(emitter_ack.clone())
         .await
         .expect("spawn decode+insert pipeline");
-    // Prior run's drop segment is below the boot head; retire its queued
-    // mirrors now — no commit will replay the drop (mirrors bin/stream/session.rs)
-    reorder
-        .flush_due_retires()
+    let reorder = booting
+        .boot(
+            None,
+            desc_log.active_present_at(ident.xlogpos),
+            ident.xlogpos,
+        )
         .await
-        .expect("boot flush of due toast-mirror retires");
-    reorder
-        .apply_boot_events(desc_log.active_present_at(ident.xlogpos), ident.xlogpos)
-        .await
-        .expect("boot Added pass over descriptor log");
+        .expect("boot reorder sink");
 
     let mut decoder = BufferingDecoderSink::new(
         walshadow::desc_log::DescriptorLogs::single(desc_log.clone()),

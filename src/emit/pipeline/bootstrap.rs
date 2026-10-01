@@ -8,14 +8,15 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::sync::mpsc;
+use walrus::pg::walparser::RelFileNode;
 
 use crate::backfill::backup_page_walk::{BackfillTuple, CatalogMap};
-use crate::backfill::spool::{DeferredReader, DeferredSpool, SpoolMark};
+use crate::backfill::spool::{DeferredReader, DeferredSpool, Replayable, SpoolMark};
 use crate::backfill::walk_barrier::{WALK_CHECKPOINT_PERIOD, WalkBarrier};
 use crate::config::ResolvedConfig;
 use crate::decode::heap_decoder::{ColumnValue, ToastPointer};
 use crate::emit::ch_emitter::EmitterStats;
-use crate::emit::pipeline::ack::AckHandle;
+use crate::emit::pipeline::ack::{AckHandle, OpenSeq, Publish, SeqAlloc};
 use crate::emit::pipeline::batcher::{BatcherMsg, RoutedRow, RowChunk};
 use crate::emit::pipeline::decode::DECODE_CHUNK_BYTES;
 use crate::emit::route::{RouteSnapshot, RowPolicy, freeze_routes};
@@ -66,7 +67,7 @@ impl<'a> DeferredFootprint<'a> {
     }
 
     /// Take over bytes a lane published, so replay releases them
-    fn adopt(stats: &'a EmitterStats, spool: &DeferredSpool) -> Self {
+    fn adopt(stats: &'a EmitterStats, spool: &Replayable) -> Self {
         Self {
             stats,
             resident: spool.resident_bytes() as u64,
@@ -187,9 +188,9 @@ pub async fn drain(
     };
     let routes = freeze_routes(&mapping, config.as_deref(), &row_policy);
     let mut footprint = DeferredFootprint::new(&stats);
-    let mut next_seq = 0;
+    let mut seqs = ack.seqs(0);
     let mut rows_routed = 0;
-    let mut open = None;
+    let mut open: Option<(RelFileNode, OpenSeq, u64)> = None;
     let mut chunk_batch = Vec::new();
     let mut chunk_batch_bytes = 0;
     let mut out = RowBuf::default();
@@ -201,20 +202,20 @@ pub async fn drain(
             let rfn = tuple.rfn;
             let source_lsn = tuple.source_lsn;
 
-            let same = matches!(&open, Some((r, _, _)) if *r == rfn);
-            let seq = if same {
-                open.as_ref().expect("same implies open").1
+            let seq = if let Some((r, seq, _)) = &open
+                && *r == rfn
+            {
+                seq.seq()
             } else {
-                if let Some((_, prev_seq, prev_rows)) = open.take() {
+                if let Some((_, prev, prev_rows)) = open.take() {
                     // Every row of the closing seq on the channel before its
                     // expected count is published
                     out.flush(&msg_tx).await?;
-                    ack.placed(prev_seq, prev_rows);
+                    prev.place(prev_rows);
                 }
-                let s = next_seq;
-                next_seq += 1;
-                ack.register(s, source_lsn);
-                open = Some((rfn, s, 0));
+                let seq = seqs.open(source_lsn, Publish::Commit);
+                let s = seq.seq();
+                open = Some((rfn, seq, 0));
                 s
             };
 
@@ -278,7 +279,7 @@ pub async fn drain(
             }
             out.flush(&msg_tx).await?;
             if let Some((_, seq, rows)) = open.take() {
-                ack.placed(seq, rows);
+                seq.place(rows);
             }
             let mut mark = SpoolMark::default();
             if let Some(spool) = deferred.as_mut() {
@@ -288,13 +289,14 @@ pub async fn drain(
                     .map_err(|e| format!("bootstrap: deferred spool checkpoint: {e}"))?;
                 footprint.publish(spool);
             }
-            b.publish_drain(consumed, next_seq, mark).await;
+            b.publish_drain(consumed, seqs.next(), mark).await;
         }
     }
     out.flush(&msg_tx).await?;
     if let Some((_, seq, rows)) = open.take() {
-        ack.placed(seq, rows);
+        seq.place(rows);
     }
+    let next_seq = seqs.next();
 
     if !chunk_batch.is_empty() {
         flush_chunks(&resolver, &mut chunk_batch).await?;
@@ -312,7 +314,15 @@ pub async fn drain(
         Some(spool) => {
             footprint.hand_off();
             let resolved = resolve_spooled(
-                spool, &routes, &catalog, &msg_tx, &ack, &stats, &resolver, next_seq, None,
+                spool.into(),
+                &routes,
+                &catalog,
+                &msg_tx,
+                &ack,
+                &stats,
+                &resolver,
+                next_seq,
+                None,
             )
             .await?;
             Ok(BootstrapDrainOutcome {
@@ -336,7 +346,7 @@ pub async fn drain(
 /// sibling's chunk files
 #[allow(clippy::too_many_arguments)]
 pub async fn drain_deferred(
-    spool: DeferredSpool,
+    spool: Replayable,
     catalog: &CatalogMap,
     mapping: &MappingSnapshot,
     msg_tx: &mpsc::Sender<BatcherMsg>,
@@ -365,7 +375,7 @@ pub struct ReplayCheckpoint<'a> {
 /// row that routes so an all-unmapped spool leaves no seq to prove
 #[allow(clippy::too_many_arguments)]
 async fn resolve_spooled(
-    spool: DeferredSpool,
+    spool: Replayable,
     routes: &ahash::HashMap<RelName, Arc<RouteSnapshot>>,
     catalog: &CatalogMap,
     msg_tx: &mpsc::Sender<BatcherMsg>,
@@ -387,7 +397,7 @@ async fn resolve_spooled(
     let mut seq = None;
     let mut placed = 0u64;
     let total_bytes = spool.spooled_bytes();
-    let mut next_seq = first_seq;
+    let mut seqs = ack.seqs(first_seq);
     let mut total_placed = 0;
     let mut ticker = Ticker::new(WALK_CHECKPOINT_PERIOD);
     let mut replay = spool
@@ -403,28 +413,19 @@ async fn resolve_spooled(
         let remaining = replay.remaining_file_bytes();
         let (next, routed) = tokio::join!(
             prepare_batch(&mut replay, routes, catalog, stats, resolver),
-            route_batch(
-                batch,
-                &mut out,
-                msg_tx,
-                ack,
-                next_seq,
-                &mut seq,
-                &mut placed
-            ),
+            route_batch(batch, &mut out, msg_tx, &mut seqs, &mut seq, &mut placed),
         );
         routed?;
         progress.advance(remaining);
         if let Some(c) = checkpoint.as_mut() {
             out.flush(msg_tx).await?;
             if let Some(s) = seq.take() {
-                ack.placed(s, placed);
-                next_seq = s + 1;
+                s.place(placed);
             }
             total_placed += placed;
             placed = 0;
             if ticker.fire() {
-                c.tail.checkpoint(next_seq).await?;
+                c.tail.checkpoint(seqs.next()).await?;
                 c.state.offset = total_bytes - remaining;
                 c.state.rows += total_placed;
                 total_placed = 0;
@@ -436,7 +437,7 @@ async fn resolve_spooled(
     out.flush(msg_tx).await?;
     let rows_routed = match checkpoint.as_mut() {
         Some(c) => {
-            c.tail.checkpoint(next_seq).await?;
+            c.tail.checkpoint(seqs.next()).await?;
             c.state.offset = total_bytes;
             c.state.rows += total_placed;
             c.state.save(c.dir).await.map_err(|e| e.to_string())?;
@@ -451,21 +452,17 @@ async fn resolve_spooled(
             placed
         }
     };
-    let next_seq = match seq {
-        Some(s) => {
-            ack.placed(s, placed);
-            s + 1
-        }
-        None => next_seq,
-    };
+    if let Some(s) = seq {
+        s.place(placed);
+    }
     Ok(BootstrapDrainOutcome {
-        next_seq,
+        next_seq: seqs.next(),
         rows_routed,
         deferred: None,
     })
 }
 
-fn bump(open: &mut Option<(walrus::pg::walparser::RelFileNode, u64, u64)>, rows_routed: &mut u64) {
+fn bump(open: &mut Option<(RelFileNode, OpenSeq, u64)>, rows_routed: &mut u64) {
     if let Some(slot) = open.as_mut() {
         slot.2 += 1;
     }
@@ -617,18 +614,16 @@ async fn route_batch(
     batch: ResolvedReplayBatch,
     out: &mut RowBuf,
     msg_tx: &mpsc::Sender<BatcherMsg>,
-    ack: &AckHandle,
-    first_seq: u64,
-    seq: &mut Option<u64>,
+    seqs: &mut SeqAlloc,
+    seq: &mut Option<OpenSeq>,
     placed: &mut u64,
 ) -> Result<(), String> {
     let ResolvedReplayBatch { rows, permit } = batch;
     for row in rows {
         let mut tuple = row.tuple;
-        let at = *seq.get_or_insert_with(|| {
-            ack.register(first_seq, tuple.source_lsn);
-            first_seq
-        });
+        let at = seq
+            .get_or_insert_with(|| seqs.open(tuple.source_lsn, Publish::Commit))
+            .seq();
         render_ext_columns(&row.rel.attributes, &mut tuple.columns);
         out.push(msg_tx, at, row.rel, row.route, tuple, permit.clone())
             .await?;
@@ -1593,7 +1588,7 @@ mod tests {
         );
 
         let resolved = drain_deferred(
-            spool,
+            spool.into(),
             &catalog,
             &mapping,
             &msg_tx,
@@ -1682,7 +1677,7 @@ mod tests {
         for (spool, ack, collector, first_seq) in lanes {
             remaining -= spool.resident_bytes() as u64;
             drain_deferred(
-                spool,
+                spool.into(),
                 &catalog,
                 &mapping,
                 &msg_tx,
@@ -1896,7 +1891,7 @@ mod tests {
             .bootstrap_deferred_spool_bytes
             .store(total, Ordering::Relaxed);
         let result = drain_deferred(
-            spool,
+            spool.into(),
             &catalog,
             &mapping,
             &tail.msg_tx,
@@ -1928,7 +1923,7 @@ mod tests {
             .store(total, Ordering::Relaxed);
         let tail = OwnedTail::null();
         let result = drain_deferred(
-            spool,
+            spool.into(),
             &catalog,
             &mapping,
             &tail.msg_tx,

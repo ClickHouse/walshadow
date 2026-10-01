@@ -71,12 +71,10 @@ impl FilterStats {
 #[derive(Debug, Clone)]
 pub struct Verdict {
     pub route: Route,
-    /// Commit record of a catalog-mutating xact (top, subxact, or prepared
-    /// xid wrote a catalog-touching record), or a command boundary inside
-    /// one. Pump holds shadow publication here
-    /// until replay passes the record's `next_lsn`
-    pub catalog_boundary: bool,
-    /// Capture input; `Some` iff `catalog_boundary`
+    /// Capture input at a commit record of a catalog-mutating xact (top,
+    /// subxact, or prepared xid wrote a catalog-touching record), or a command
+    /// boundary inside one. Pump holds shadow publication here until replay
+    /// passes the record's `next_lsn`
     pub boundary: Option<Arc<BoundaryInfo>>,
     /// Members of a catalog-dirty tree this record aborted
     pub aborted_tree: Option<Arc<Vec<u32>>>,
@@ -375,7 +373,6 @@ impl Filter {
             .record(class, route, record.header.total_record_length as u64);
         Ok(Verdict {
             route,
-            catalog_boundary: end.boundary.is_some(),
             boundary: end.boundary,
             aborted_tree: end.aborted_tree,
             defer_catalog_decode,
@@ -1099,16 +1096,16 @@ mod tests {
         let v = f
             .decide_record(&xact_end(XLOG_XACT_COMMIT, 8, &[], None), 0, 0xD116)
             .unwrap();
-        assert!(!v.catalog_boundary);
+        assert!(!v.boundary.is_some());
         // Catalog-dirty xid 7 commit: boundary, drained after
         let v = f
             .decide_record(&xact_end(XLOG_XACT_COMMIT, 7, &[], None), 0, 0xD116)
             .unwrap();
-        assert!(v.catalog_boundary);
+        assert!(v.boundary.is_some());
         let v = f
             .decide_record(&xact_end(XLOG_XACT_COMMIT, 7, &[], None), 0, 0xD116)
             .unwrap();
-        assert!(!v.catalog_boundary, "dirty mark consumed once");
+        assert!(!v.boundary.is_some(), "dirty mark consumed once");
     }
 
     #[test]
@@ -1119,11 +1116,11 @@ mod tests {
         let v = f
             .decide_record(&xact_end(XLOG_XACT_ABORT, 7, &[], None), 0, 0xD116)
             .unwrap();
-        assert!(!v.catalog_boundary, "rolled-back DDL never holds");
+        assert!(!v.boundary.is_some(), "rolled-back DDL never holds");
         let v = f
             .decide_record(&xact_end(XLOG_XACT_COMMIT, 7, &[], None), 0, 0xD116)
             .unwrap();
-        assert!(!v.catalog_boundary, "abort drained the mark");
+        assert!(!v.boundary.is_some(), "abort drained the mark");
     }
 
     #[test]
@@ -1139,7 +1136,7 @@ mod tests {
                 0xD116,
             )
             .unwrap();
-        assert!(v.catalog_boundary);
+        assert!(v.boundary.is_some());
     }
 
     #[test]
@@ -1179,7 +1176,7 @@ mod tests {
         let v = f
             .decide_record(&xact_end(XLOG_XACT_COMMIT, 100, &[], None), 200, 0xD116)
             .unwrap();
-        assert!(!v.catalog_boundary, "aborted child never bounds");
+        assert!(!v.boundary.is_some(), "aborted child never bounds");
     }
 
     #[test]
@@ -1206,7 +1203,7 @@ mod tests {
         let v = f
             .decide_record(&xact_end(XLOG_XACT_COMMIT, 7, &[], None), 200, 0xD116)
             .unwrap();
-        assert!(!v.catalog_boundary, "prune-only commit never bounds");
+        assert!(!v.boundary.is_some(), "prune-only commit never bounds");
         // Tuple lock and vacuum inplace stats: same treatment
         for info in [XLOG_HEAP_LOCK, XLOG_HEAP_INPLACE] {
             let mut r = rec_with_xid(RmId::Heap, &[(5, 1259)], 8);
@@ -1257,7 +1254,7 @@ mod tests {
                 0xD116,
             )
             .unwrap();
-        assert!(v.catalog_boundary);
+        assert!(v.boundary.is_some());
         assert!(!user(&mut f, 100), "commit clears the tree");
     }
 
@@ -1283,7 +1280,7 @@ mod tests {
                 0xD116,
             )
             .unwrap();
-        assert!(v.catalog_boundary);
+        assert!(v.boundary.is_some());
     }
 
     #[test]
@@ -1297,7 +1294,7 @@ mod tests {
             .decide_record(&xact_end(XLOG_XACT_COMMIT, 9, &[], None), 0, 0xD116)
             .unwrap();
         assert!(
-            v.catalog_boundary,
+            v.boundary.is_some(),
             "VACUUM FULL relmap write holds at commit"
         );
     }
@@ -1315,7 +1312,7 @@ mod tests {
             .decide_record(&xact_end(XLOG_XACT_COMMIT, 7, &[], None), 0, 0xD116)
             .unwrap();
         assert!(
-            !v.catalog_boundary,
+            !v.boundary.is_some(),
             "safe-default keep is not a catalog touch"
         );
     }
@@ -1329,7 +1326,7 @@ mod tests {
         let v = f
             .decide_record(&xact_end(XLOG_XACT_COMMIT, 7, &[], None), 0, 0xD116)
             .unwrap();
-        assert!(v.catalog_boundary);
+        assert!(v.boundary.is_some());
     }
 
     #[test]
@@ -1712,11 +1709,11 @@ mod tests {
         let v = f
             .decide_record(&xact_end(XLOG_XACT_ABORT, 7, &[], None), 200, 0xD116)
             .unwrap();
-        assert!(!v.catalog_boundary);
+        assert!(!v.boundary.is_some());
         let v = f
             .decide_record(&xact_end(XLOG_XACT_COMMIT, 7, &[], None), 300, 0xD116)
             .unwrap();
-        assert!(!v.catalog_boundary, "abort drained the mark");
+        assert!(!v.boundary.is_some(), "abort drained the mark");
     }
 
     #[test]
@@ -1929,7 +1926,7 @@ mod tests {
                 0xD116,
             )
             .unwrap();
-        assert!(!v.catalog_boundary, "foreign commit bounds nothing local");
+        assert!(!v.boundary.is_some(), "foreign commit bounds nothing local");
 
         // Same oid in the followed database: dirt, fence, boundary, and a
         // first touch that owes nothing to the foreign write
@@ -1994,7 +1991,7 @@ mod tests {
             let v = f
                 .decide_record(&xact_end_dbinfo(XLOG_XACT_COMMIT, xid, db), 200, 0xD116)
                 .unwrap();
-            assert!(!v.catalog_boundary, "db {db} relmap is not target dirt");
+            assert!(!v.boundary.is_some(), "db {db} relmap is not target dirt");
         }
     }
 
@@ -2023,7 +2020,7 @@ mod tests {
                 0xD116,
             )
             .unwrap();
-        assert!(!v.catalog_boundary, "commit drained the tree");
+        assert!(!v.boundary.is_some(), "commit drained the tree");
     }
 
     #[test]
@@ -2046,7 +2043,7 @@ mod tests {
         let v = f
             .decide_record(&xact_end(XLOG_XACT_COMMIT, 7, &[], None), 300, 0xD116)
             .unwrap();
-        assert!(!v.catalog_boundary, "drain ran before the scope check");
+        assert!(!v.boundary.is_some(), "drain ran before the scope check");
     }
 
     #[test]

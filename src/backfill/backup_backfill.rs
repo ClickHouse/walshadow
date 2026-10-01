@@ -54,13 +54,14 @@ use walrus::pg::walparser::{Oid, RmId};
 use crate::backfill::backfill_types::{BackupRequest, PassContext, PassOutcome};
 use crate::backfill::backup_checkpoint::{self, BackupCheckpoint, WalkState};
 use crate::backfill::backup_page_walk::{
-    BOOTSTRAP_TUPLE_CHANNEL_CAP, BackfillTuple, CatalogMap, PageWalkSink,
+    BOOTSTRAP_TUPLE_CHANNEL_CAP, BackfillTuple, CatalogMap, CompleteAccums, GateAccums,
+    PageWalkSink,
 };
 use crate::backfill::backup_sentinel::build_lsn_pair;
 use crate::backfill::backup_source::{BackupSink, BackupSource, EndInfo, StartInfo};
 use crate::backfill::backup_source_direct::DirectSource;
 use crate::backfill::backup_source_object_store::ObjectStoreSource;
-use crate::backfill::spool::{DEFERRED_SPOOL_MEM_MAX, DeferredSpool};
+use crate::backfill::spool::{DEFERRED_SPOOL_MEM_MAX, DeferredSpool, Replayable};
 use crate::backfill::visibility_gate::{GateStats, resolve_phase, stream_phase};
 use crate::backfill::visibility_pending::{self, PendingSpool};
 use crate::backfill::wal_replay::{
@@ -68,7 +69,7 @@ use crate::backfill::wal_replay::{
 };
 use crate::backfill::walk_barrier::{WALK_CHECKPOINT_PERIOD, WalkBarrier};
 use crate::decode::heap_decoder::{XLOG_HEAP_OPMASK, XLOG_HEAP_TRUNCATE};
-use crate::decode::visibility::{PgMultiXactAccum, PgXactAccum, PgXactPatch, PgXactView};
+use crate::decode::visibility::{PgXactPatch, SealedPatch};
 use crate::decode::wal_xact::{
     XLOG_XACT_ABORT, XLOG_XACT_ABORT_PREPARED, XLOG_XACT_COMMIT, XLOG_XACT_COMMIT_PREPARED,
     XLOG_XACT_OPMASK, parse_xact_payload,
@@ -122,7 +123,7 @@ async fn run_base_backup_pass(ctx: &PassContext, reqs: &[BackupRequest]) -> Resu
         source,
         reqs,
         &tags,
-        PgXactPatch::new(),
+        SealedPatch::default(),
         None,
         &mut outcome,
         None,
@@ -222,7 +223,7 @@ async fn run_object_store_pass(ctx: &PassContext, reqs: &[BackupRequest]) -> Res
             .context("backup_backfill: gap catalog pre-scan")?;
         (patch, segments)
     } else {
-        (PgXactPatch::new(), Vec::new())
+        (SealedPatch::default(), Vec::new())
     };
     outcome.pg_xact_patch_len = patch.len();
 
@@ -280,7 +281,7 @@ async fn walk_and_ship(
     source: Box<dyn BackupSource>,
     reqs: &[BackupRequest],
     tags: &HashMap<(Oid, Oid), u64>,
-    patch: PgXactPatch,
+    patch: SealedPatch,
     replay: Option<ReplayLeg>,
     outcome: &mut PassOutcome,
     backup_name: Option<String>,
@@ -354,7 +355,7 @@ async fn walk_and_ship(
             checkpoint.backup = backup.clone();
             checkpoint.catalog = catalog;
         }
-        let (drain_outcome, pending) = if checkpoint.ready() {
+        let (drain_outcome, pending, resumed) = if checkpoint.ready() {
             outcome.counts = checkpoint.counts;
             let spool = DeferredSpool::resume(
                 ctx.scratch_dir.join("bootstrap_deferred.bin"),
@@ -368,15 +369,12 @@ async fn walk_and_ship(
             tracing::info!(target: "walshadow::backfill", offset = checkpoint.offset,
             bytes = checkpoint.spool.bytes, "resuming deferred backup replay");
             (
-                bootstrap::BootstrapDrainOutcome {
-                    next_seq: 0,
-                    rows_routed: 0,
-                    deferred: Some(spool),
-                },
+                bootstrap::BootstrapDrainOutcome::default(),
                 PendingSpool::new(ctx.scratch_dir.join("gate_pending.bin"), filter.clone()),
+                Some(spool),
             )
         } else {
-            run_walk(
+            let (drain_outcome, pending) = run_walk(
                 ctx,
                 source,
                 &filter,
@@ -388,7 +386,8 @@ async fn walk_and_ship(
                 backup_name.is_some(),
                 outcome,
             )
-            .await?
+            .await?;
+            (drain_outcome, pending, None)
         };
         let mut next_seq = drain_outcome.next_seq;
         let mut deferred = drain_outcome.deferred;
@@ -413,13 +412,13 @@ async fn walk_and_ship(
             checkpoint.counts = outcome.counts;
             // Per-file resume is spent once the walk ends; drop it rather than
             // carry a path per relation segment through every later save
-            checkpoint.walk = WalkState {
-                done: true,
-                ..Default::default()
-            };
+            checkpoint.walk = WalkState::finished();
             checkpoint.save(&ctx.scratch_dir).await?;
         }
         let resumable = checkpoint.ready();
+        let deferred = deferred
+            .map(Replayable::from)
+            .or(resumed.map(Replayable::from));
         if let Some(spool) = deferred {
             let config = ctx.config_rx.as_ref().map(|rx| rx.borrow().clone());
             let mapping = ctx.mapping.snapshot().await;
@@ -514,7 +513,7 @@ async fn run_walk(
     source: Box<dyn BackupSource>,
     filter: &CatalogMap,
     lsn_overrides: HashMap<(Oid, Oid), u64>,
-    patch: PgXactPatch,
+    patch: SealedPatch,
     resolver: &ToastResolver,
     tail: &OwnedTail,
     checkpoint: &mut BackupCheckpoint,
@@ -528,10 +527,7 @@ async fn run_walk(
     if !resuming {
         checkpoint.walk = Default::default();
     }
-    let pg_xact = Arc::new(std::sync::Mutex::new(PgXactAccum::new()));
-    let pg_multixact = Arc::new(std::sync::Mutex::new(PgMultiXactAccum::new(
-        ctx.source_major,
-    )));
+    let accums = GateAccums::new(ctx.source_major);
     let (walk_tx, walk_rx) = mpsc::channel::<Vec<BackfillTuple>>(BOOTSTRAP_TUPLE_CHANNEL_CAP);
     let (gated_tx, gated_rx) = mpsc::channel::<Vec<BackfillTuple>>(BOOTSTRAP_TUPLE_CHANNEL_CAP);
 
@@ -547,10 +543,10 @@ async fn run_walk(
     let reopened = if resuming {
         tracing::info!(
             target: "walshadow::backfill",
-            files = checkpoint.walk.files.len(),
-            parts = checkpoint.walk.parts.len(),
-            gate_records = checkpoint.walk.gate_deferred.records,
-            toast_records = checkpoint.walk.toast_deferred.records,
+            files = checkpoint.walk.files().len(),
+            parts = checkpoint.walk.parts().len(),
+            gate_records = checkpoint.walk.gate_deferred().records,
+            toast_records = checkpoint.walk.toast_deferred().records,
             "resuming backup page walk",
         );
         reopen_walk_spools(checkpoint, &gate_spool_path, &toast_spool_path)
@@ -587,14 +583,13 @@ async fn run_walk(
     let barrier = resumable.then(|| Arc::new(WalkBarrier::default()));
     let mut walk_sink = PageWalkSink::new(filter.clone(), walk_tx, resolver.stores_chunks())
         .with_stats(ctx.stats.backfill_backup_walk.clone())
-        .with_pg_xact_accum(pg_xact.clone())
-        .with_pg_multixact_accum(pg_multixact.clone())
+        .with_gate(accums.clone())
         .with_lsn_overrides(lsn_overrides);
     if let Some(b) = &barrier {
         walk_sink = walk_sink.with_resume(
             b.clone(),
-            checkpoint.walk.files.iter().cloned().collect(),
-            checkpoint.walk.parts.iter().cloned().collect(),
+            checkpoint.walk.files().iter().cloned().collect(),
+            checkpoint.walk.parts().iter().cloned().collect(),
         );
     }
     let sink: Arc<dyn BackupSink> = Arc::new(walk_sink);
@@ -606,8 +601,6 @@ async fn run_walk(
         walk_rx,
         gated_tx,
         filter.clone(),
-        pg_xact,
-        pg_multixact,
         patch,
         walk_ok_rx,
         gate_spool,
@@ -639,7 +632,7 @@ async fn run_walk(
             => Err(e),
     };
     if run_res.is_ok() {
-        let _ = walk_ok_tx.send(());
+        let _ = walk_ok_tx.send(accums.complete());
     } else {
         drop(walk_ok_tx);
     }
@@ -689,10 +682,8 @@ async fn gate_task(
     mut rx: mpsc::Receiver<Vec<BackfillTuple>>,
     tx: mpsc::Sender<Vec<BackfillTuple>>,
     filter: CatalogMap,
-    pg_xact: Arc<std::sync::Mutex<PgXactAccum>>,
-    pg_multixact: Arc<std::sync::Mutex<PgMultiXactAccum>>,
-    patch: PgXactPatch,
-    walk_ok: oneshot::Receiver<()>,
+    patch: SealedPatch,
+    walk_ok: oneshot::Receiver<CompleteAccums>,
     mut deferred: DeferredSpool,
     mut pending: PendingSpool,
     barrier: Option<Arc<WalkBarrier>>,
@@ -708,17 +699,14 @@ async fn gate_task(
         barrier.as_ref(),
     )
     .await?;
-    if walk_ok.await.is_err() {
+    let Ok(accums) = walk_ok.await else {
         stats.gated += stats.deferred;
         deferred.discard().await;
         // Resolution never ran; shipping reclaims the empty pending row spool
         return Ok((stats, 0, pending));
-    }
-    // Take the accums out so no std guard is held across the sends below
-    let accum = std::mem::take(&mut *pg_xact.lock().expect("pg_xact accum lock"));
-    let multi = pg_multixact.lock().expect("pg_multixact accum lock").take();
-    let segments = accum.segment_count();
-    let view = PgXactView::new(&accum, &patch).with_multixact(&multi);
+    };
+    let segments = accums.segment_count();
+    let view = accums.view(&patch);
     resolve_phase(deferred, &view, &tx, Some(&mut pending), &mut stats).await?;
     Ok((stats, segments, pending))
 }
@@ -734,13 +722,13 @@ async fn reopen_walk_spools(
         DeferredSpool::reopen_at(
             gate_path.to_path_buf(),
             DEFERRED_SPOOL_MEM_MAX,
-            walk.gate_deferred,
+            walk.gate_deferred(),
         )
         .await?,
         DeferredSpool::reopen_at(
             toast_path.to_path_buf(),
             DEFERRED_SPOOL_MEM_MAX,
-            walk.toast_deferred,
+            walk.toast_deferred(),
         )
         .await?,
     ))
@@ -763,17 +751,11 @@ async fn record_walked(
         let Some(proof) = barrier.collect().await else {
             continue;
         };
-        if let Err(e) = tail.checkpoint(proof.next_seq).await {
-            return anyhow::Error::msg(e);
-        }
-        state.walk.files.extend(proof.files);
-        state.walk.gate_deferred = proof.gate_deferred;
-        state.walk.toast_deferred = proof.toast_deferred;
-        let recorded = state.walk.files.iter().cloned().collect();
-        state
-            .walk
-            .parts
-            .extend(barrier.settled_parts(&recorded).await);
+        let walk = match proof.prove(tail).await {
+            Ok(walk) => walk,
+            Err(e) => return anyhow::Error::msg(e),
+        };
+        state.walk.record(walk, barrier).await;
         if let Err(e) = state.save(dir).await {
             return e;
         }
@@ -950,7 +932,7 @@ async fn prescan_gap(
     filter_oids: &HashSet<u32>,
     current_rfns: &HashMap<u32, u32>,
     s_max: u64,
-) -> Result<PgXactPatch> {
+) -> Result<SealedPatch> {
     let mut sink = PrescanSink {
         target_db_oid,
         filter_oids: filter_oids.clone(),
@@ -967,8 +949,7 @@ async fn prescan_gap(
              fresher backup, or use initial_load='copy'"
         );
     }
-    sink.patch.seal();
-    Ok(sink.patch)
+    Ok(sink.patch.seal())
 }
 
 /// `pg_class` / `pg_attribute` initial (mapped) filenodes; a rewrite of the
@@ -1122,6 +1103,7 @@ mod tests {
     use super::*;
     use crate::decode::visibility::{
         HEAP_XMAX_INVALID, HEAP_XMAX_IS_MULTI, HEAP_XMIN_COMMITTED, HEAP_XMIN_INVALID,
+        PgMultiXactAccum, PgXactAccum, PgXactView,
     };
     use crate::decode::wal_xact::{XACT_XINFO_HAS_TWOPHASE, XLOG_XACT_HAS_INFO};
     use crate::record::Route;
@@ -1249,7 +1231,8 @@ mod tests {
         assert!(s.skew.is_none());
         assert_eq!(s.patch.len(), 2);
         let accum = PgXactAccum::new();
-        let view = PgXactView::new(&accum, &s.patch);
+        let patch = std::mem::take(&mut s.patch).seal();
+        let view = PgXactView::new(&accum, &patch);
         assert_eq!(
             view.xid_status(700),
             crate::decode::visibility::XidStatus::Committed
@@ -1288,7 +1271,8 @@ mod tests {
         ));
         assert!(s.skew.is_none());
         let accum = PgXactAccum::new();
-        let view = PgXactView::new(&accum, &s.patch);
+        let patch = std::mem::take(&mut s.patch).seal();
+        let view = PgXactView::new(&accum, &patch);
         assert_eq!(
             view.xid_status(800),
             crate::decode::visibility::XidStatus::Committed
@@ -1297,7 +1281,7 @@ mod tests {
             view.xid_status(801),
             crate::decode::visibility::XidStatus::Aborted
         );
-        assert_eq!(s.patch.len(), 2, "finishing backend's xid stays unpatched");
+        assert_eq!(patch.len(), 2, "finishing backend's xid stays unpatched");
     }
 
     /// Reject truncated subxact payload
@@ -1573,8 +1557,8 @@ mod tests {
     #[tokio::test]
     async fn gate_task_routes_hinted_defers_unhinted_and_resolves_at_eof() {
         let filter = CatalogMap::new();
-        let pg_xact = Arc::new(std::sync::Mutex::new(PgXactAccum::new()));
-        let pg_multixact = Arc::new(std::sync::Mutex::new(PgMultiXactAccum::new(17)));
+        let pg_xact = PgXactAccum::new();
+        let pg_multixact = PgMultiXactAccum::new(17);
         let mut patch = PgXactPatch::new();
         patch.commit(500, &[]);
         patch.abort(600, &[]);
@@ -1589,9 +1573,7 @@ mod tests {
             walk_rx,
             gated_tx,
             filter,
-            pg_xact,
-            pg_multixact,
-            patch,
+            patch.seal(),
             walk_ok_rx,
             DeferredSpool::new(spool_path.clone(), 0),
             test_pending(),
@@ -1618,7 +1600,11 @@ mod tests {
         // Unhinted, gap-aborted writer: deferred, then gated via patch
         walk_tx.send(vec![tuple(16400, 600, 0, 0)]).await.unwrap();
         drop(walk_tx);
-        walk_ok_tx.send(()).unwrap();
+        assert!(
+            walk_ok_tx
+                .send(CompleteAccums::from_parts(pg_xact, pg_multixact))
+                .is_ok()
+        );
 
         let (stats, _segments, _pending) = gate.await.unwrap().unwrap();
         let mut got = Vec::new();
@@ -1639,15 +1625,13 @@ mod tests {
     #[tokio::test]
     async fn gate_task_discards_deferred_without_walk_success() {
         let filter = CatalogMap::new();
-        let pg_xact = Arc::new(std::sync::Mutex::new(PgXactAccum::new()));
-        let pg_multixact = Arc::new(std::sync::Mutex::new(PgMultiXactAccum::new(17)));
         let mut patch = PgXactPatch::new();
         // Patch alone would emit xid 500; failure path must not consult it
         patch.commit(500, &[]);
 
         let (walk_tx, walk_rx) = mpsc::channel(16);
         let (gated_tx, mut gated_rx) = mpsc::channel(16);
-        let (walk_ok_tx, walk_ok_rx) = oneshot::channel::<()>();
+        let (walk_ok_tx, walk_ok_rx) = oneshot::channel::<CompleteAccums>();
         // Threshold 0: discard must unlink the spool file
         let tmp = tempfile::tempdir().unwrap();
         let spool_path = tmp.path().join("gate_deferred.bin");
@@ -1655,9 +1639,7 @@ mod tests {
             walk_rx,
             gated_tx,
             filter,
-            pg_xact,
-            pg_multixact,
-            patch,
+            patch.seal(),
             walk_ok_rx,
             DeferredSpool::new(spool_path.clone(), 0),
             test_pending(),
@@ -1711,8 +1693,8 @@ mod tests {
     #[tokio::test]
     async fn gate_task_gates_multixact_with_committed_updater() {
         let filter = CatalogMap::new();
-        let pg_xact = Arc::new(std::sync::Mutex::new(PgXactAccum::new()));
-        let pg_multixact = Arc::new(std::sync::Mutex::new(multi_with_updater_901()));
+        let pg_xact = PgXactAccum::new();
+        let pg_multixact = multi_with_updater_901();
         let mut patch = PgXactPatch::new();
         patch.commit(901, &[]);
 
@@ -1723,9 +1705,7 @@ mod tests {
             walk_rx,
             gated_tx,
             filter,
-            pg_xact,
-            pg_multixact,
-            patch,
+            patch.seal(),
             walk_ok_rx,
             mem_spool(),
             test_pending(),
@@ -1742,7 +1722,11 @@ mod tests {
             .await
             .unwrap();
         drop(walk_tx);
-        walk_ok_tx.send(()).unwrap();
+        assert!(
+            walk_ok_tx
+                .send(CompleteAccums::from_parts(pg_xact, pg_multixact))
+                .is_ok()
+        );
 
         let (stats, _segments, _pending) = gate.await.unwrap().unwrap();
         assert!(gated_rx.recv().await.is_none(), "dead tuple must not emit");
@@ -1754,9 +1738,9 @@ mod tests {
     #[tokio::test]
     async fn gate_task_errors_on_unresolvable_multixact() {
         let filter = CatalogMap::new();
-        let pg_xact = Arc::new(std::sync::Mutex::new(PgXactAccum::new()));
+        let pg_xact = PgXactAccum::new();
         // Empty accum: mxid below any collected segment ⇒ unresolvable
-        let pg_multixact = Arc::new(std::sync::Mutex::new(PgMultiXactAccum::new(17)));
+        let pg_multixact = PgMultiXactAccum::new(17);
 
         let (walk_tx, walk_rx) = mpsc::channel(16);
         let (gated_tx, _gated_rx) = mpsc::channel(16);
@@ -1765,9 +1749,7 @@ mod tests {
             walk_rx,
             gated_tx,
             filter,
-            pg_xact,
-            pg_multixact,
-            PgXactPatch::new(),
+            SealedPatch::default(),
             walk_ok_rx,
             mem_spool(),
             test_pending(),
@@ -1784,7 +1766,11 @@ mod tests {
             .await
             .unwrap();
         drop(walk_tx);
-        walk_ok_tx.send(()).unwrap();
+        assert!(
+            walk_ok_tx
+                .send(CompleteAccums::from_parts(pg_xact, pg_multixact))
+                .is_ok()
+        );
 
         let err = gate.await.unwrap().map(|_| ()).unwrap_err();
         assert!(err.contains("pg_multixact"), "{err}");

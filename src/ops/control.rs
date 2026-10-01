@@ -772,6 +772,7 @@ mod tests {
             Some(path),
             Table::new(),
             crate::mapping::mapping_handle(Default::default()),
+            crate::config::ResolverBoot::default(),
         );
         let reloader = Reloader::default();
         reloader.set_resolvers(vec![resolver]).await;

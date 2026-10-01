@@ -38,6 +38,7 @@ use walshadow::schema::{RelName, SchemaEvent};
 use walshadow::source_feed::SourceFeed;
 use walshadow::toast::ToastResolver;
 use walshadow::visibility::PgXactPatch;
+use walshadow::visibility_pending::{PendingLedger, PendingRecorded};
 
 use crate::archive::fetch_wal_into_pg_wal;
 use crate::args::{Args, cli_base};
@@ -162,10 +163,6 @@ pub(crate) async fn run_bootstrap(
         .await
         .context("bootstrap: seed catalog filenodes")?;
     let catalog_filenodes: Vec<_> = landing_tracker.nodes().collect();
-    // Filtered at one of two points depending on toast mode, never both:
-    // shadow mode rewrites before its recovery starts mid-bootstrap, other
-    // modes after the window leg has read the raw segments
-    let mut landing_tracker = Some(landing_tracker);
     tracing::info!(
         target: "walshadow::bootstrap",
         relations = catalog_map.len(),
@@ -473,7 +470,11 @@ pub(crate) async fn run_bootstrap(
     let window_scratch = args.spill_dir.join("bootstrap_window");
     tokio::fs::remove_dir_all(&window_scratch).await.ok();
 
-    let (shipped, outcome, window) = if let Some(target) = ch_target {
+    // Landed WAL is filtered at one of two points, never both: shadow mode
+    // rewrites before its recovery starts mid-bootstrap, other modes after the
+    // window leg has read the raw segments. The branch hands back the tracker
+    // it left unused
+    let (shipped, outcome, window, landing_tracker) = if let Some(target) = ch_target {
         let (emitter_cfg, mapping, resolved, skip_initial) = target;
         // Route bootstrap rows through the shared insert tail. Bootstrap
         // is the easy case: every row op=Insert at _lsn = start_lsn, no
@@ -809,12 +810,14 @@ pub(crate) async fn run_bootstrap(
         // Rewrite landed WAL before shadow recovery; backup processing uses copy.
         //
         // Non-shadow toast modes rewrite after reading original `pg_wal` below
-        if shadow_toast {
+        let landing_tracker = if !shadow_toast {
+            Some(landing_tracker)
+        } else {
             let landed = walshadow::backfill::wal_landing::filter_landed_wal(
                 &shadow_data_dir.join("pg_wal"),
                 outcome.start.timeline,
                 outcome.end.end_lsn,
-                landing_tracker.take().expect("landed WAL filtered once"),
+                landing_tracker,
                 Some((shadow_toast_rels, outcome.start.start_lsn)),
             )
             .await
@@ -877,7 +880,8 @@ pub(crate) async fn run_bootstrap(
                 .set(Arc::new(bridge))
                 .ok()
                 .context("bootstrap: shadow TOAST bridge bound twice")?;
-        }
+            None
+        };
 
         // Replay backup WAL before resolving deferred value references
         if let Some(mut cfg) = window_cfg {
@@ -977,7 +981,7 @@ pub(crate) async fn run_bootstrap(
             oracle: oracle.clone(),
             stream_stats: gate_stats,
         });
-        (rows_routed, outcome, window)
+        (rows_routed, outcome, window, landing_tracker)
     } else {
         // Metrics-only skips destination convergence
         let mut observer = MetricsTupleObserver::default();
@@ -986,7 +990,7 @@ pub(crate) async fn run_bootstrap(
         let outcome: BootstrapOutcome = pump_res
             .context("bootstrap pump join")?
             .context("bootstrap pump")?;
-        (shipped, outcome, None)
+        (shipped, outcome, None, Some(landing_tracker))
     };
 
     // Replace live-leg COPY connection and recheck source identity
@@ -1071,7 +1075,7 @@ pub(crate) async fn run_bootstrap(
     tokio::fs::remove_dir_all(&window_scratch).await.ok();
 
     // Non-shadow toast modes rewrite landed WAL after backup processing reads it
-    if let Some(tracker) = landing_tracker.take() {
+    if let Some(tracker) = landing_tracker {
         let landed = walshadow::backfill::wal_landing::filter_landed_wal(
             &shadow_data_dir.join("pg_wal"),
             outcome.start.timeline,
@@ -1093,16 +1097,15 @@ pub(crate) async fn run_bootstrap(
     }
 
     // Resolve deferred tuples after window transaction overlay is complete
-    if let Some(pending) = pending_gate {
-        let mut patch = std::mem::take(&mut *window_patch.lock().expect("window patch lock"));
-        patch.seal();
+    let recorded = if let Some(pending) = pending_gate {
+        let patch = std::mem::take(&mut *window_patch.lock().expect("window patch lock")).seal();
         let (gate, pending_tables) =
             resolve_greenfield(pending, &shadow_data_dir, &patch, source_major)
                 .await
                 .context("bootstrap: visibility gate")?;
         // Persist the ledger before clearing the marker so pending rows
         // already in ClickHouse can be published after restart
-        let mut ledger = walshadow::visibility_pending::PendingLedger::load(
+        let mut ledger = PendingLedger::load(
             &args.spill_dir,
             source_ident
                 .sysid
@@ -1111,12 +1114,10 @@ pub(crate) async fn run_bootstrap(
         )
         .await
         .context("bootstrap: load pending visibility ledger")?;
-        for m in &pending_tables {
-            ledger
-                .push(m)
-                .await
-                .context("bootstrap: persist pending visibility ledger")?;
-        }
+        let recorded = ledger
+            .record(&pending_tables)
+            .await
+            .context("bootstrap: persist pending visibility ledger")?;
         tracing::info!(
             target: "walshadow::bootstrap",
             emitted = gate.emitted,
@@ -1129,7 +1130,10 @@ pub(crate) async fn run_bootstrap(
             patch_xacts = patch.len(),
             "bootstrap visibility gate settled",
         );
-    }
+        recorded
+    } else {
+        PendingRecorded::nothing_pending()
+    };
 
     // PG refuses to start on a data dir whose mode isn't 0700 or 0750.
     // BASE_BACKUP tar carries no entry for the root, so extraction leaves
@@ -1143,8 +1147,7 @@ pub(crate) async fn run_bootstrap(
             .with_context(|| format!("bootstrap: chmod 0700 {}", shadow_data_dir.display()))?;
     }
 
-    bootstrap_marker::ExtractedCheckpoint::clear(&shadow_data_dir).await?;
-    BootstrapMarker::clear(&shadow_data_dir).await?;
+    BootstrapMarker::complete(&shadow_data_dir, recorded).await?;
 
     timing.finish();
     Ok((
@@ -1222,6 +1225,7 @@ pub(crate) async fn bootstrap_build_mapping(
         args.ch_config.clone(),
         cli_base(args),
         mapping.clone(),
+        walshadow::config::ResolverBoot::default(),
     );
     let (ddl_cfg, merged_tables, resolved) = {
         let snap = config_rx.borrow();

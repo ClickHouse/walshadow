@@ -136,9 +136,9 @@ Check candidate gaps against fresh merged report before adding tests
   for `reopen_walk_spools` and ready-checkpoint resume, or hand-seed checkpoints
   as `backup_checkpoint_e2e` does
 - `copy_backfill` pending tables: hold an open xact on target table across a
-  base-backup opt-in, commit or abort after walk, for `record_pending` and
-  `settle_ended_pending`. `copy_chunk_blocks = 1` on a multi-block table for chunk
-  loop and progress ledger. Empty table fast path. Opt-out and CH schema change
+  base-backup opt-in, commit or abort after walk, for `hold_pending`,
+  `release_pending` and `settle_ended_pending`. `copy_chunk_blocks = 1` on a
+  multi-block table for chunk loop and progress ledger. Empty table fast path. Opt-out and CH schema change
   mid-pass for publish/swap edges. Two opt-ins inside coalesce window
 - `copy_backfill` units: `wire_kind` per OID, `decode_field` per type and invalid
   UTF-8, ledger version rejection. Ledger persist failures via fs faults
