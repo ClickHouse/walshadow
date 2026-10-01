@@ -259,9 +259,9 @@ pub enum XactBufferError {
         from_lsn: u64,
         through_lsn: u64,
     },
-    /// Raw entries drained with no commit-time resolution installed: the
+    /// Raw entries drained under [`StashResolved::nothing_stashed`]: the
     /// discard arm would swallow every stashed row, fence included. Fail
-    /// closed — resolve_stash must run for any xact that stashed
+    /// closed, resolve_stash must run for any xact that stashed
     #[error("drain for xact {top_xid} has stashed records but no resolution")]
     MissingStashResolution { top_xid: u32 },
     /// Merged entry carries a writer xid outside the owning xact +
@@ -582,9 +582,24 @@ pub struct StashResolution {
     stats: Option<Arc<EmitterStats>>,
 }
 
+/// Commit-time verdict [`XactBuffer::drain_committed`] consumes, so a drain
+/// cannot run against an unresolved tree or another xid's resolution
+pub struct StashResolved {
+    top_xid: u32,
+    /// `None` asserts the tree stashed nothing, checked at drain
+    res: Option<StashResolution>,
+}
+
+impl StashResolved {
+    /// Drain without resolving; fails closed if the tree stashed after all
+    pub const fn nothing_stashed(top_xid: u32) -> Self {
+        Self { top_xid, res: None }
+    }
+}
+
 /// Resolve the finishing tree's stashed filenodes against the descriptor
 /// log at the commit's `next_lsn` (capture ran inside the boundary hold, so
-/// same-xact CREATE/rewrite descriptors are already covered), install
+/// same-xact CREATE/rewrite descriptors are already covered), return
 /// outcomes for the imminent drain, and queue `O - B` barriers for
 /// marker-proven toast generations. A toast heap without its marker fails
 /// closed ([`XactBufferError::IncompleteToastGeneration`]).
@@ -605,7 +620,7 @@ pub async fn resolve_stash(
     subxids: &[u32],
     next_lsn: u64,
     stats: Arc<EmitterStats>,
-) -> std::result::Result<(), XactBufferError> {
+) -> std::result::Result<StashResolved, XactBufferError> {
     let rfns = {
         let buf = buffer.lock().await;
         let mut xids: Vec<u32> = Vec::with_capacity(1 + subxids.len());
@@ -614,7 +629,10 @@ pub async fn resolve_stash(
         buf.stash_candidates(&xids)
     };
     if rfns.is_empty() {
-        return Ok(());
+        return Ok(StashResolved {
+            top_xid,
+            res: Some(StashResolution::default()),
+        });
     }
     let mut outcomes: HashMap<RelFileNode, StashOutcome> = HashMap::with_capacity(rfns.len());
     let mut barriers: Vec<(u32, u64)> = Vec::with_capacity(rfns.len());
@@ -705,14 +723,13 @@ pub async fn resolve_stash(
     }
     let resolved: Vec<RelFileNode> = rfns.iter().map(|(rfn, _)| *rfn).collect();
     buf.forget_markers(&resolved);
-    buf.install_stash_resolution(
+    Ok(StashResolved {
         top_xid,
-        StashResolution {
+        res: Some(StashResolution {
             outcomes,
             stats: Some(stats),
-        },
-    );
-    Ok(())
+        }),
+    })
 }
 
 /// Whether `rfn` replaced a different live filenode for `oid`, read before
@@ -741,9 +758,6 @@ pub struct XactBuffer {
     /// `markers` (consumed out-of-band, or filenode reused by a later
     /// generation holding its own queue entry)
     marker_order: VecDeque<(RelFileNode, u64)>,
-    /// Commit-time resolution installed by [`resolve_stash`] just before
-    /// the drain pops it, keyed by top xid
-    pending_stash: HashMap<u32, StashResolution>,
     /// Committed transactions waiting for durable acknowledgment
     pending_durable: PendingDurable,
     bytes_in_memory: usize,
@@ -782,7 +796,6 @@ impl XactBuffer {
             inflight: HashMap::new(),
             markers: HashMap::new(),
             marker_order: VecDeque::new(),
-            pending_stash: HashMap::new(),
             pending_durable: PendingDurable::default(),
             bytes_in_memory: 0,
             stats: XactBufferStats::default(),
@@ -1085,11 +1098,6 @@ impl XactBuffer {
         }
     }
 
-    /// Install commit-time resolution for `top_xid`'s imminent drain
-    pub fn install_stash_resolution(&mut self, top_xid: u32, res: StashResolution) {
-        self.pending_stash.insert(top_xid, res);
-    }
-
     /// Drains in `source_lsn` order at commit, so a DDL's `Added`/`Changed`
     /// event lands BEFORE the heap writes that follow it
     pub fn on_schema_event(&mut self, xid: u32, source_lsn: u64, event: SchemaEvent) {
@@ -1158,10 +1166,12 @@ impl XactBuffer {
     async fn evict_xact(&mut self, xid: u32) -> std::result::Result<(), XactBufferError> {
         let st = self.inflight.get_mut(&xid).expect("xid present");
         let first_spill = st.spill.is_none();
-        if first_spill {
-            st.spill = Some(self.store.writer(xid, st.first_lsn.get()).await?);
-        }
-        let writer = st.spill.as_mut().unwrap();
+        let writer = match &mut st.spill {
+            Some(writer) => writer,
+            None => st
+                .spill
+                .insert(self.store.writer(xid, st.first_lsn.get()).await?),
+        };
         let drained: Vec<SpillEntry> = std::mem::take(&mut st.in_mem);
         let freed = std::mem::take(&mut st.in_mem_bytes);
         writer.write_batch(drained).await?;
@@ -1264,7 +1274,7 @@ impl XactBuffer {
     /// owns `emitter_ack_lsn`.
     pub async fn drain_committed(
         &mut self,
-        top_xid: u32,
+        stash: StashResolved,
         commit_ts: i64,
         commit_lsn: u64,
         subxids: &[u32],
@@ -1272,6 +1282,7 @@ impl XactBuffer {
         // when a put consumer exists
         collect_rows: bool,
     ) -> std::result::Result<CommittedDrain, XactBufferError> {
+        let top_xid = stash.top_xid;
         let mut xids: Vec<u32> = Vec::with_capacity(1 + subxids.len());
         xids.push(top_xid);
         xids.extend_from_slice(subxids);
@@ -1289,7 +1300,6 @@ impl XactBuffer {
             return Ok(CommittedDrain {
                 commit_ts,
                 commit_lsn,
-                had_states: false,
                 merged: None,
                 generations: Vec::new(),
             });
@@ -1304,10 +1314,8 @@ impl XactBuffer {
         }
         self.stats.bytes_in_memory = self.bytes_in_memory as u64;
         // Absent resolution would send every Raw entry through fold_raw's
-        // discard arm — fence included. Resolution is installed by
-        // resolve_stash for any tree that stashed, so absence is a wiring
-        // bug, not a verdict
-        let stash = match self.pending_stash.remove(&top_xid) {
+        // discard arm, fence included
+        let stash = match stash.res {
             Some(res) => res,
             None if states.iter().all(|st| st.stash_rfns.is_empty()) => StashResolution::default(),
             None => return Err(XactBufferError::MissingStashResolution { top_xid }),
@@ -1327,7 +1335,6 @@ impl XactBuffer {
         Ok(CommittedDrain {
             commit_ts,
             commit_lsn,
-            had_states: true,
             merged: Some(merged),
             generations: Vec::new(),
         })
@@ -1393,10 +1400,6 @@ impl XactBuffer {
             for rfn in st.stash_rfns.keys() {
                 self.markers.remove(rfn);
             }
-            // A resolution installed for a xid that then aborted must not
-            // outlive it: the next xact reusing the xid would fold its raws
-            // under a foreign descriptor and a foreign fence
-            self.pending_stash.remove(&x);
             any = true;
             self.stats.xacts_active = self.stats.xacts_active.saturating_sub(1);
             self.bytes_in_memory = self.bytes_in_memory.saturating_sub(st.in_mem_bytes);
@@ -1508,14 +1511,19 @@ impl Drop for PendingGauge {
 
 /// Lazy merge source for one xid: spill-reader head (older in WAL order)
 /// chained with the in-mem tail, one decoded entry resident. `pop` refills
-/// from the reader until EOF, then drains `in_mem`. The EOF reader parks in
-/// `spent` so the file unlinks only at [`MergedDrain::finish`],
+/// from the reader until EOF, then drains `in_mem`. The EOF reader parks as
+/// `Spent` so the file unlinks only at [`MergedDrain::finish`],
 /// post-dispatch.
 struct MergeSource {
     head: Option<SpillEntry>,
-    reader: Option<SpillReader>,
-    spent: Option<SpillReader>,
+    spill: SpillSide,
     in_mem: VecDeque<SpillEntry>,
+}
+
+enum SpillSide {
+    Unspilled,
+    Reading(SpillReader),
+    Spent(SpillReader),
 }
 
 impl MergeSource {
@@ -1534,27 +1542,29 @@ impl MergeSource {
         }
         let mut src = Self {
             head: None,
-            reader,
-            spent: None,
+            spill: reader.map_or(SpillSide::Unspilled, SpillSide::Reading),
             in_mem: in_mem.into(),
         };
-        src.refill(gauge).await?;
+        src.head = src.next_entry(gauge).await?;
         Ok(src)
     }
 
-    async fn refill(&mut self, gauge: &mut ResidentGauge) -> std::result::Result<(), SpillError> {
-        debug_assert!(self.head.is_none());
-        if let Some(r) = self.reader.as_mut() {
+    async fn next_entry(
+        &mut self,
+        gauge: &mut ResidentGauge,
+    ) -> std::result::Result<Option<SpillEntry>, SpillError> {
+        if let SpillSide::Reading(r) = &mut self.spill {
             if let Some(entry) = r.next().await? {
                 gauge.add(approximate_size(&entry));
-                self.head = Some(entry);
-                return Ok(());
+                return Ok(Some(entry));
             }
-            self.spent = self.reader.take();
+            if let SpillSide::Reading(r) = std::mem::replace(&mut self.spill, SpillSide::Unspilled)
+            {
+                self.spill = SpillSide::Spent(r);
+            }
         }
         // Already counted at `open`; moving to head keeps it resident
-        self.head = self.in_mem.pop_front();
-        Ok(())
+        Ok(self.in_mem.pop_front())
     }
 
     fn head_lsn(&self) -> Option<u64> {
@@ -1569,7 +1579,7 @@ impl MergeSource {
             return Ok(None);
         };
         gauge.sub(approximate_size(&entry));
-        self.refill(gauge).await?;
+        self.head = self.next_entry(gauge).await?;
         Ok(Some(entry))
     }
 }
@@ -1736,19 +1746,19 @@ impl MergedDrain {
     /// appended once to the body spool past it (resolution map and mirror
     /// rows share either form)
     fn fold_body(&mut self, data: &bytes::Bytes) -> std::result::Result<Body, XactBufferError> {
-        if self.spool.is_none() {
-            if self.mem_body_bytes + data.len() <= self.body_mem_max {
+        let spool = match &mut self.spool {
+            Some(spool) => spool,
+            None if self.mem_body_bytes + data.len() <= self.body_mem_max => {
                 self.mem_body_bytes += data.len();
                 return Ok(Body::Mem(data.clone()));
             }
-            self.spool = Some(BodySpoolWriter::create(
+            None => self.spool.insert(BodySpoolWriter::create(
                 &self.spool_dir,
                 self.spool_xid,
                 self.spool_lsn,
                 Some(self.spool_gauge.clone()),
-            )?);
-        }
-        let spool = self.spool.as_mut().expect("just created");
+            )?),
+        };
         let r = spool.append(data)?;
         Ok(Body::File(r))
     }
@@ -2023,10 +2033,7 @@ impl MergedDrain {
             s.unlink()?;
         }
         for s in self.sources {
-            if let Some(r) = s.spent {
-                r.unlink().await?;
-            }
-            if let Some(r) = s.reader {
+            if let SpillSide::Reading(r) | SpillSide::Spent(r) = s.spill {
                 r.unlink().await?;
             }
         }
@@ -2125,7 +2132,7 @@ pub struct DrainedBatch {
     /// `new_rows` cursor for each TRUNCATE heap
     pub truncate_rows: Vec<usize>,
     /// Last slice of the commit. Only its seq may publish `commit_lsn` in
-    /// the ack (`register` vs `register_partial`): an earlier slice
+    /// the ack (`Publish::Commit` vs `Partial`): an earlier slice
     /// publishing would claim durability for rows still in flight.
     pub is_final: bool,
 }
@@ -2138,7 +2145,11 @@ pub enum WalkStep {
         upto: usize,
     },
     Event(DrainEntry),
-    Truncate(DescribedHeap),
+    /// Follows the `Rows` step sealing `new_rows[..upto]`
+    Truncate {
+        heap: DescribedHeap,
+        upto: usize,
+    },
     Heap(DescribedHeap),
 }
 
@@ -2180,7 +2191,7 @@ impl DrainedBatch {
                     .next()
                     .expect("truncate_rows cursor per Truncate heap");
                 steps.push(WalkStep::Rows { upto });
-                steps.push(WalkStep::Truncate(heap));
+                steps.push(WalkStep::Truncate { heap, upto });
             } else {
                 steps.push(WalkStep::Heap(heap));
             }
@@ -2206,13 +2217,16 @@ impl DrainedBatch {
 pub struct CommittedDrain {
     pub commit_ts: i64,
     pub commit_lsn: u64,
-    /// False for read-only / filter-dropped / unknown xid.
-    pub had_states: bool,
+    /// `None` for read-only / filter-dropped / unknown xid
     merged: Option<MergedDrain>,
     generations: Vec<Arc<ChunkGeneration>>,
 }
 
 impl CommittedDrain {
+    pub fn had_states(&self) -> bool {
+        self.merged.is_some()
+    }
+
     /// Next slice, `None` once exhausted. The slice closes at the first
     /// heap reaching `max_rows` / `max_bytes` (budget is a trigger, not a
     /// hard cap: one oversized row still ships alone). Slices only cut at
@@ -3356,31 +3370,28 @@ pub(crate) mod raw_fixtures {
     /// `Ordinary` verdict for top xid 1, injected directly (no descriptor
     /// log in these fixtures)
     pub(crate) fn inject_ordinary(
-        b: &mut XactBuffer,
         rfn: RelFileNode,
         rel: Arc<crate::schema::RelDescriptor>,
-    ) {
-        inject_ordinary_with_stats(b, rfn, rel, None);
+    ) -> StashResolved {
+        inject_ordinary_with_stats(rfn, rel, None)
     }
 
     pub(crate) fn inject_ordinary_with_stats(
-        b: &mut XactBuffer,
         rfn: RelFileNode,
         rel: Arc<crate::schema::RelDescriptor>,
         stats: Option<Arc<EmitterStats>>,
-    ) {
-        inject_ordinary_fenced(b, rfn, rel, stats, Vec::new());
+    ) -> StashResolved {
+        inject_ordinary_fenced(rfn, rel, stats, Vec::new())
     }
 
     /// `Ordinary` verdict carrying a fence, as `resolve_stash` would attach
     /// it for a filenode with overlapping ambiguity intervals
     pub(crate) fn inject_ordinary_fenced(
-        b: &mut XactBuffer,
         rfn: RelFileNode,
         rel: Arc<crate::schema::RelDescriptor>,
         stats: Option<Arc<EmitterStats>>,
         fence: Vec<Arc<crate::catalog::desc_log::Ambiguity>>,
-    ) {
+    ) -> StashResolved {
         let mut outcomes = HashMap::new();
         outcomes.insert(
             rfn,
@@ -3391,18 +3402,19 @@ pub(crate) mod raw_fixtures {
                 pending: Vec::new(),
             },
         );
-        b.pending_stash
-            .insert(1, StashResolution { outcomes, stats });
+        StashResolved {
+            top_xid: 1,
+            res: Some(StashResolution { outcomes, stats }),
+        }
     }
 
     /// `Ordinary` verdict carrying this xact's own command-boundary shapes,
     /// as `resolve_stash` reads them off the pending catalog
     pub(crate) fn inject_ordinary_pending(
-        b: &mut XactBuffer,
         rfn: RelFileNode,
         rel: Arc<crate::schema::RelDescriptor>,
         pending: Vec<PendingSlot>,
-    ) {
+    ) -> StashResolved {
         let mut outcomes = HashMap::new();
         outcomes.insert(
             rfn,
@@ -3413,13 +3425,13 @@ pub(crate) mod raw_fixtures {
                 pending,
             },
         );
-        b.pending_stash.insert(
-            1,
-            StashResolution {
+        StashResolved {
+            top_xid: 1,
+            res: Some(StashResolution {
                 outcomes,
                 stats: None,
-            },
-        );
+            }),
+        }
     }
 
     /// `[from, through)` interval over one filenode, the shape a physical
@@ -3665,7 +3677,7 @@ mod tests {
                 .any(|s| s.spill.is_some() && !s.in_mem.is_empty())
         );
         let mut drain = buffer
-            .drain_committed(7, 0, 100, &[8], false)
+            .drain_committed(StashResolved::nothing_stashed(7), 0, 100, &[8], false)
             .await
             .unwrap();
         assert_eq!(buffer.stats().bytes_in_memory, 0);
@@ -3727,8 +3739,11 @@ mod tests {
         b.on_heap(heap_with_value(8, 150, 16)).await.unwrap();
         assert_eq!(b.resume_safe_lsn(Pos::new(500)), 100);
         // Keep floor while committed slices remain undurable
-        let drain = b.drain_committed(8, 0, 200, &[], false).await.unwrap();
-        assert!(drain.had_states);
+        let drain = b
+            .drain_committed(StashResolved::nothing_stashed(8), 0, 200, &[], false)
+            .await
+            .unwrap();
+        assert!(drain.had_states());
         drop(drain);
         assert_eq!(
             b.resume_safe_lsn(Pos::new(180)),
@@ -3744,8 +3759,11 @@ mod tests {
         // Drop floor once acknowledgment reaches commit
         assert_eq!(b.resume_safe_lsn(Pos::new(200)), 200);
         // Ignore commits without buffered rows
-        let empty = b.drain_committed(9, 0, 300, &[], false).await.unwrap();
-        assert!(!empty.had_states);
+        let empty = b
+            .drain_committed(StashResolved::nothing_stashed(9), 0, 300, &[], false)
+            .await
+            .unwrap();
+        assert!(!empty.had_states());
         assert_eq!(b.resume_safe_lsn(Pos::new(300)), 300);
     }
 
@@ -3756,7 +3774,10 @@ mod tests {
         // Use earliest record across transaction tree
         b.on_heap(heap_with_value(20, 400, 16)).await.unwrap();
         b.on_heap(heap_with_value(21, 420, 16)).await.unwrap();
-        let drain = b.drain_committed(21, 0, 450, &[20], false).await.unwrap();
+        let drain = b
+            .drain_committed(StashResolved::nothing_stashed(21), 0, 450, &[20], false)
+            .await
+            .unwrap();
         drop(drain);
         assert_eq!(b.resume_safe_lsn(Pos::new(440)), 400);
         assert_eq!(b.resume_safe_lsn(Pos::new(450)), 450);
@@ -4624,7 +4645,10 @@ mod tests {
         // Arrival order 150, 100: 100 must still precede the heap@120
         b.on_schema_event(1, 150, dropped_event(9));
         b.on_schema_event(1, 100, dropped_event(7));
-        let mut drain = b.drain_committed(1, 42, 0x2000, &[], false).await.unwrap();
+        let mut drain = b
+            .drain_committed(StashResolved::nothing_stashed(1), 42, 0x2000, &[], false)
+            .await
+            .unwrap();
         let mut order: Vec<String> = Vec::new();
         while let Some(batch) = drain.next_batch(8, usize::MAX, None).await.unwrap() {
             order.extend(flatten_batch(&batch));
@@ -4649,9 +4673,12 @@ mod tests {
             .unwrap();
         b.on_heap(heap_with_value(1, 200, 16)).await.unwrap();
         b.on_schema_event(1, 100, dropped_event(7));
-        inject_ordinary(&mut b, rfn, rel);
+        let stash = inject_ordinary(rfn, rel);
 
-        let mut drain = b.drain_committed(1, 42, 0x2000, &[8], false).await.unwrap();
+        let mut drain = b
+            .drain_committed(stash, 42, 0x2000, &[8], false)
+            .await
+            .unwrap();
         let batch = drain
             .next_batch(8, usize::MAX, None)
             .await
@@ -4688,8 +4715,11 @@ mod tests {
             .await
             .unwrap();
         let stats = Arc::new(EmitterStats::default());
-        inject_ordinary_with_stats(&mut b, rfn, rel, Some(stats.clone()));
-        let mut drain = b.drain_committed(1, 42, 0x2000, &[], false).await.unwrap();
+        let stash = inject_ordinary_with_stats(rfn, rel, Some(stats.clone()));
+        let mut drain = b
+            .drain_committed(stash, 42, 0x2000, &[], false)
+            .await
+            .unwrap();
         let batch = drain
             .next_batch(2, usize::MAX, None)
             .await
@@ -4724,8 +4754,11 @@ mod tests {
         let mut raw = multi_insert_raw(1, 100, 16411, &[1]);
         raw.main_data[0] = 0;
         b.stash_raw(1, raw).await.unwrap();
-        inject_ordinary(&mut b, rfn, rel);
-        let mut drain = b.drain_committed(1, 42, 0x2000, &[], false).await.unwrap();
+        let stash = inject_ordinary(rfn, rel);
+        let mut drain = b
+            .drain_committed(stash, 42, 0x2000, &[], false)
+            .await
+            .unwrap();
         let err = drain
             .next_batch(8, usize::MAX, None)
             .await
@@ -4757,8 +4790,11 @@ mod tests {
         b.stash_raw(1, multi_insert_raw(1, 150, 16420, &[1]))
             .await
             .unwrap();
-        inject_ordinary_fenced(&mut b, rfn, rel, None, vec![rfn_ambiguity(rfn, 100, 200)]);
-        let mut drain = b.drain_committed(1, 42, 0x2000, &[], false).await.unwrap();
+        let stash = inject_ordinary_fenced(rfn, rel, None, vec![rfn_ambiguity(rfn, 100, 200)]);
+        let mut drain = b
+            .drain_committed(stash, 42, 0x2000, &[], false)
+            .await
+            .unwrap();
         let err = drain
             .next_batch(8, usize::MAX, None)
             .await
@@ -4834,7 +4870,7 @@ mod tests {
             .stash_raw(1, multi_insert_raw(1, 0x200, 16430, &[1]))
             .await
             .unwrap();
-        resolve_stash(
+        let stash = resolve_stash(
             &buffer,
             &log,
             &PendingCatalog::default(),
@@ -4846,7 +4882,10 @@ mod tests {
         .await
         .unwrap();
         let mut b = buffer.lock().await;
-        let mut drain = b.drain_committed(1, 42, 0x2F0, &[], false).await.unwrap();
+        let mut drain = b
+            .drain_committed(stash, 42, 0x2F0, &[], false)
+            .await
+            .unwrap();
         let err = drain
             .next_batch(8, usize::MAX, None)
             .await
@@ -4961,14 +5000,16 @@ mod tests {
         b.stash_raw(1, multi_insert_raw(1, 200, 16421, &[7, 8]))
             .await
             .unwrap();
-        inject_ordinary_fenced(
-            &mut b,
+        let stash = inject_ordinary_fenced(
             rfn,
             rel,
             None,
             vec![rfn_ambiguity(rfn, 100, 200), rfn_ambiguity(rfn, 20, 40)],
         );
-        let mut drain = b.drain_committed(1, 42, 0x2000, &[], false).await.unwrap();
+        let mut drain = b
+            .drain_committed(stash, 42, 0x2000, &[], false)
+            .await
+            .unwrap();
         let batch = drain
             .next_batch(8, usize::MAX, None)
             .await
@@ -4988,7 +5029,7 @@ mod tests {
             .await
             .unwrap();
         let err = b
-            .drain_committed(1, 42, 0x2000, &[], false)
+            .drain_committed(StashResolved::nothing_stashed(1), 42, 0x2000, &[], false)
             .await
             .err()
             .expect("fail-closed with no resolution installed");
@@ -4996,22 +5037,6 @@ mod tests {
             matches!(err, XactBufferError::MissingStashResolution { top_xid: 1 }),
             "{err}"
         );
-    }
-
-    /// An aborted tree's resolution must not linger for the next xact that
-    /// reuses the xid: it would fold raws under a foreign descriptor + fence
-    #[tokio::test(flavor = "current_thread")]
-    async fn abort_drops_installed_resolution() {
-        let tmp = tempdir().unwrap();
-        let mut b = XactBuffer::new(cfg(tmp.path().to_path_buf())).unwrap();
-        let rel = int4_descriptor(16423);
-        let rfn = rel.rfn;
-        b.stash_raw(1, multi_insert_raw(1, 100, 16423, &[1]))
-            .await
-            .unwrap();
-        inject_ordinary(&mut b, rfn, rel);
-        b.abort(1, Pos::new(0x1000), &[]).await.unwrap();
-        assert!(b.pending_stash.is_empty());
     }
 
     /// INPLACE mutates tuple bytes with no decode shape: typed reject, not
@@ -5026,8 +5051,11 @@ mod tests {
         raw.rm = RmId::Heap as u8;
         raw.info = crate::decode::heap_decoder::XLOG_HEAP_INPLACE;
         b.stash_raw(1, raw).await.unwrap();
-        inject_ordinary(&mut b, rfn, rel);
-        let mut drain = b.drain_committed(1, 42, 0x2000, &[], false).await.unwrap();
+        let stash = inject_ordinary(rfn, rel);
+        let mut drain = b
+            .drain_committed(stash, 42, 0x2000, &[], false)
+            .await
+            .unwrap();
         let err = drain
             .next_batch(8, usize::MAX, None)
             .await
@@ -5057,8 +5085,11 @@ mod tests {
         b.stash_raw(1, multi_insert_raw(99, 100, 16417, &[5]))
             .await
             .unwrap();
-        inject_ordinary(&mut b, rfn, rel);
-        let mut drain = b.drain_committed(1, 42, 0x2000, &[], false).await.unwrap();
+        let stash = inject_ordinary(rfn, rel);
+        let mut drain = b
+            .drain_committed(stash, 42, 0x2000, &[], false)
+            .await
+            .unwrap();
         let err = drain
             .next_batch(8, usize::MAX, None)
             .await
@@ -5088,8 +5119,11 @@ mod tests {
         b.stash_raw(1, multi_insert_raw(1, 100, 16413, &[7]))
             .await
             .unwrap();
-        inject_ordinary(&mut b, rfn, rel);
-        let mut drain = b.drain_committed(1, 42, 0x2000, &[], false).await.unwrap();
+        let stash = inject_ordinary(rfn, rel);
+        let mut drain = b
+            .drain_committed(stash, 42, 0x2000, &[], false)
+            .await
+            .unwrap();
         let batch = drain
             .next_batch(8, usize::MAX, None)
             .await
@@ -5147,8 +5181,11 @@ mod tests {
             }],
         };
         b.stash_raw(1, raw).await.unwrap();
-        inject_ordinary(&mut b, rfn, rel);
-        let mut drain = b.drain_committed(1, 42, 0x2000, &[], false).await.unwrap();
+        let stash = inject_ordinary(rfn, rel);
+        let mut drain = b
+            .drain_committed(stash, 42, 0x2000, &[], false)
+            .await
+            .unwrap();
         let err = drain
             .next_batch(8, usize::MAX, None)
             .await
@@ -5178,8 +5215,11 @@ mod tests {
             .await
             .unwrap();
         b.stash_raw(1, update_raw(1, 150, 16415, 9)).await.unwrap();
-        inject_ordinary(&mut b, rfn, rel);
-        let mut drain = b.drain_committed(1, 42, 0x2000, &[], false).await.unwrap();
+        let stash = inject_ordinary(rfn, rel);
+        let mut drain = b
+            .drain_committed(stash, 42, 0x2000, &[], false)
+            .await
+            .unwrap();
         let batch = drain
             .next_batch(8, usize::MAX, None)
             .await
@@ -5229,8 +5269,7 @@ mod tests {
         b.stash_raw(1, multi_insert_raw(1, 300, 16417, &[2]))
             .await
             .unwrap();
-        inject_ordinary_pending(
-            &mut b,
+        let stash = inject_ordinary_pending(
             rfn,
             Arc::new(commit_shape),
             vec![PendingSlot {
@@ -5239,7 +5278,10 @@ mod tests {
                 desc: boundary_shape,
             }],
         );
-        let mut drain = b.drain_committed(1, 42, 0x2000, &[], false).await.unwrap();
+        let mut drain = b
+            .drain_committed(stash, 42, 0x2000, &[], false)
+            .await
+            .unwrap();
         let batch = drain
             .next_batch(8, usize::MAX, None)
             .await
@@ -5277,8 +5319,7 @@ mod tests {
         b.stash_raw(1, multi_insert_raw(1, 100, 16418, &[7]))
             .await
             .unwrap();
-        inject_ordinary_pending(
-            &mut b,
+        let stash = inject_ordinary_pending(
             rfn,
             owner.clone(),
             vec![PendingSlot {
@@ -5287,7 +5328,10 @@ mod tests {
                 desc: Arc::new(transient),
             }],
         );
-        let mut drain = b.drain_committed(1, 42, 0x2000, &[], false).await.unwrap();
+        let mut drain = b
+            .drain_committed(stash, 42, 0x2000, &[], false)
+            .await
+            .unwrap();
         let batch = drain
             .next_batch(8, usize::MAX, None)
             .await
@@ -5323,9 +5367,9 @@ mod tests {
             .collect();
         assert!(spilled.contains(&(8, true)), "{spilled:?}");
         assert!(spilled.contains(&(9, false)), "{spilled:?}");
-        inject_ordinary(&mut b, rfn, rel);
+        let stash = inject_ordinary(rfn, rel);
         let mut drain = b
-            .drain_committed(1, 42, 0x2000, &[8, 9], false)
+            .drain_committed(stash, 42, 0x2000, &[8, 9], false)
             .await
             .unwrap();
         let mut heaps = Vec::new();
@@ -5367,8 +5411,11 @@ mod tests {
         b.on_schema_event(2, 150, dropped_event(8));
         assert!(b.stats().spill_xacts_active >= 1, "xid 1 must spill");
 
-        let mut drain = b.drain_committed(1, 42, 0x2000, &[2], false).await.unwrap();
-        assert!(drain.had_states);
+        let mut drain = b
+            .drain_committed(StashResolved::nothing_stashed(1), 42, 0x2000, &[2], false)
+            .await
+            .unwrap();
+        assert!(drain.had_states());
         let mut order: Vec<String> = Vec::new();
         let mut finals = Vec::new();
         while let Some(batch) = drain.next_batch(2, usize::MAX, None).await.unwrap() {
@@ -5426,7 +5473,10 @@ mod tests {
         .unwrap();
         b.on_heap(heap_with_value(9, 300, 16)).await.unwrap();
 
-        let mut drain = b.drain_committed(9, 0, 0x1000, &[], true).await.unwrap();
+        let mut drain = b
+            .drain_committed(StashResolved::nothing_stashed(9), 0, 0x1000, &[], true)
+            .await
+            .unwrap();
         let b1 = drain
             .next_batch(1, usize::MAX, None)
             .await
@@ -5485,7 +5535,10 @@ mod tests {
         b.on_toast_chunk(chunk(57, 0, 140, b"ef"), 9).await.unwrap();
         b.on_heap(heap_with_value(9, 150, 16)).await.unwrap();
 
-        let mut drain = b.drain_committed(9, 0, 0x1000, &[], true).await.unwrap();
+        let mut drain = b
+            .drain_committed(StashResolved::nothing_stashed(9), 0, 0x1000, &[], true)
+            .await
+            .unwrap();
         let batch = drain
             .next_batch(usize::MAX, usize::MAX, None)
             .await
@@ -5519,7 +5572,10 @@ mod tests {
             b.on_heap(heap_with_value(3, 100 + i, 512)).await.unwrap();
         }
         assert_eq!(spill_files(tmp.path()).len(), 1);
-        let mut drain = b.drain_committed(3, 0, 0x5000, &[], false).await.unwrap();
+        let mut drain = b
+            .drain_committed(StashResolved::nothing_stashed(3), 0, 0x5000, &[], false)
+            .await
+            .unwrap();
         assert_eq!(
             b.stats().spill_bytes_active,
             0,
@@ -5550,14 +5606,23 @@ mod tests {
             b.on_heap(heap_with_value(4, 100 + i, 512)).await.unwrap();
         }
         let total = n * 512;
-        let mut drain = b.drain_committed(4, 0, 0x9000, &[], false).await.unwrap();
+        let mut drain = b
+            .drain_committed(StashResolved::nothing_stashed(4), 0, 0x9000, &[], false)
+            .await
+            .unwrap();
         let read_buffers = drain
             .merged
             .as_ref()
             .unwrap()
             .sources
             .iter()
-            .filter_map(|s| s.reader.as_ref())
+            .filter_map(|s| {
+                if let SpillSide::Reading(r) = &s.spill {
+                    Some(r)
+                } else {
+                    None
+                }
+            })
             .map(|r| r.buffered_bytes() as u64)
             .sum::<u64>();
         let mut rows = 0usize;
@@ -5602,7 +5667,10 @@ mod tests {
             b.on_heap(heap_with_value(9, lsn + 1, 16)).await.unwrap();
         }
         let total = u64::from(n) * (512 + CHUNK_REF_META as u64);
-        let mut drain = b.drain_committed(9, 0, 0x9000, &[], true).await.unwrap();
+        let mut drain = b
+            .drain_committed(StashResolved::nothing_stashed(9), 0, 0x9000, &[], true)
+            .await
+            .unwrap();
         let mut held: Vec<DrainedBatch> = Vec::new();
         while let Some(batch) = drain.next_batch(2, usize::MAX, None).await.unwrap() {
             let is_final = batch.is_final;
@@ -5663,7 +5731,10 @@ mod tests {
                 .unwrap();
             b.on_heap(heap_with_value(9, lsn + 1, 16)).await.unwrap();
         }
-        let mut drain = b.drain_committed(9, 0, 0x9000, &[], true).await.unwrap();
+        let mut drain = b
+            .drain_committed(StashResolved::nothing_stashed(9), 0, 0x9000, &[], true)
+            .await
+            .unwrap();
         let mut held: Vec<DrainedBatch> = Vec::new();
         while let Some(batch) = drain.next_batch(2, usize::MAX, None).await.unwrap() {
             let is_final = batch.is_final;
@@ -5749,7 +5820,10 @@ mod tests {
         b.on_toast_chunk(chunk(50, 0, 100, b"aa"), 9).await.unwrap();
         b.on_toast_chunk(chunk(51, 0, 102, b"bb"), 9).await.unwrap();
         b.on_heap(heap_with_value(9, 110, 16)).await.unwrap();
-        let mut drain = b.drain_committed(9, 0, 0x1000, &[], true).await.unwrap();
+        let mut drain = b
+            .drain_committed(StashResolved::nothing_stashed(9), 0, 0x1000, &[], true)
+            .await
+            .unwrap();
         let err = drain
             .next_batch(usize::MAX, usize::MAX, None)
             .await
@@ -5765,8 +5839,11 @@ mod tests {
     async fn drain_committed_unknown_xid_yields_no_batches() {
         let tmp = tempdir().unwrap();
         let mut b = XactBuffer::new(cfg(tmp.path().to_path_buf())).unwrap();
-        let mut drain = b.drain_committed(999, 0, 0x100, &[], false).await.unwrap();
-        assert!(!drain.had_states);
+        let mut drain = b
+            .drain_committed(StashResolved::nothing_stashed(999), 0, 0x100, &[], false)
+            .await
+            .unwrap();
+        assert!(!drain.had_states());
         assert!(drain.next_batch(10, 1000, None).await.unwrap().is_none());
         drain.finish().await.unwrap();
         assert_eq!(b.stats().commits_unknown_xid, 1);

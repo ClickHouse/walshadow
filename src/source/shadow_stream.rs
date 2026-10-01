@@ -426,8 +426,9 @@ impl ShadowStreamState {
             .map(|(id, c)| (*id, c.dispatched_lsn.get(), c.phase.cut()))
             .collect();
         for (id, conn_offset, ends_at) in targets {
-            let cut = ends_at.map(|s| s.ends_at).filter(|v| *v < end_lsn);
-            let take = cut.unwrap_or(end_lsn).saturating_sub(start_lsn) as usize;
+            let cut = ends_at.filter(|s| s.ends_at < end_lsn);
+            let stop = cut.as_ref().map_or(end_lsn, |s| s.ends_at);
+            let take = stop.saturating_sub(start_lsn) as usize;
             let skip = conn_offset.saturating_sub(start_lsn) as usize;
             let to_send = &bytes[skip.min(take)..take.min(bytes.len())];
             let frame_lsn = start_lsn + skip as u64;
@@ -436,10 +437,10 @@ impl ShadowStreamState {
                     encode_wal_data_frame_into(out, frame_lsn, server_wal_end, to_send);
                 })
             {
-                self.advance_dispatched(id, Pos::new(cut.unwrap_or(end_lsn)));
+                self.advance_dispatched(id, Pos::new(stop));
             }
-            if cut.is_some() {
-                self.end_timeline_for(id, ends_at.expect("cut came from ends_at"));
+            if let Some(switch) = cut {
+                self.end_timeline_for(id, switch);
             }
         }
     }

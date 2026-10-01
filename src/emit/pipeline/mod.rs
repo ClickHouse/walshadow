@@ -124,10 +124,10 @@ pub struct PipelineConfig {
     /// A database with no entry streams from the opt-in LSN only
     pub backfillers: HashMap<Oid, Arc<dyn crate::backfill::opt_in::Backfiller>>,
     /// Durable queue of deferred toast-mirror retires, loaded from the
-    /// spill dir; entries due at resume retire via the post-spawn
-    /// [`reorder::ReorderSink::flush_due_retires`] call
+    /// spill dir; entries due at resume retire in
+    /// [`reorder::BootingReorder::boot`]
     pub retires: crate::toast::toast_retire::RetireLedger,
-    /// Pending backup rows; recover outcomes with [`reorder::ReorderSink::settle_pending_boot`]
+    /// Pending backup rows; [`reorder::BootingReorder::boot`] recovers outcomes
     pub pending_rows: crate::backfill::visibility_pending::SharedPendingLedger,
     /// Persisted resolved floor (aligned, archive-clamped), seeded at the
     /// resolved start; pruners cut against it verbatim
@@ -168,13 +168,13 @@ impl PipelineHandle {
 }
 
 impl PipelineConfig {
-    /// Stand up the pipeline. Returns the reorder sink (drive via the daemon's
-    /// `QueueingRecordSink`) and a handle for shutdown / watermark reads. Fails
+    /// Stand up the pipeline. Returns the reorder sink to boot then drive via
+    /// the daemon's `QueueingRecordSink`, and a handle for shutdown / watermark reads. Fails
     /// only if an inserter connection can't open.
     pub async fn spawn(
         self,
         emitter_ack: Arc<Monotone<EmitterAck>>,
-    ) -> Result<(reorder::ReorderSink, PipelineHandle), EmitterError> {
+    ) -> Result<(reorder::BootingReorder, PipelineHandle), EmitterError> {
         let PipelineConfig {
             emitter,
             decoder_pool_size,
@@ -264,7 +264,7 @@ impl PipelineConfig {
         let ack_probe = ack.probe();
 
         let plan_dir = buffer.lock().await.scratch_dir().to_path_buf();
-        let reorder = reorder::ReorderSink::new(
+        let reorder = reorder::ReorderSink::booting(
             buffer,
             dbs,
             pending,

@@ -26,6 +26,7 @@ use walshadow::ch::CompressionChoice;
 use walshadow::ch_emitter::{EmitterConfig, EmitterStats};
 use walshadow::heap_decoder::{ColumnValue, CommittedTuple, DecodedHeap, DecodedTuple, HeapOp};
 use walshadow::mapping::{ColumnMapping, TableMapping, TableTarget};
+use walshadow::pipeline::ack::Publish;
 use walshadow::pipeline::batcher::{BatcherMsg, RoutedRow};
 use walshadow::pipeline::{Fatal, tail};
 use walshadow::pos::Pos;
@@ -176,11 +177,11 @@ async fn budget_trips_seal_complete_inserts() {
     );
     const N: i32 = 5;
     let commit_lsn = 0xC0FFEE;
-    ack.register(0, commit_lsn);
+    let seq = ack.seqs(0).open(commit_lsn, Publish::Commit);
     for i in 0..N {
         msg_tx
             .send(BatcherMsg::Row(RoutedRow {
-                seq: 0,
+                seq: seq.seq(),
                 rel: rel.clone(),
                 route: route.clone(),
                 committed: tuple(i, 0x1000 + i as u64, commit_lsn),
@@ -189,7 +190,7 @@ async fn budget_trips_seal_complete_inserts() {
             .await
             .expect("route row");
     }
-    ack.placed(0, N as u64);
+    seq.place(N as u64);
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     msg_tx
         .send(BatcherMsg::FlushAll(reply_tx))
@@ -197,9 +198,7 @@ async fn budget_trips_seal_complete_inserts() {
         .expect("send flush");
     reply_rx.await.expect("flush ack");
     ack.wait_through(1).await.expect("ack collector alive");
-    drop(msg_tx);
-    drop(ack);
-    tail_parts.join().await;
+    tail_parts.close(msg_tx, ack).await;
     assert!(fatal.message().is_none(), "no fatal: {:?}", fatal.message());
 
     // The contiguous-done watermark reaches the seq's commit lsn.

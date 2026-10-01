@@ -60,8 +60,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::pos::{
-    Drain, FilterDurable, Floor, LsnKind, Pos, ResumeSafe, ShadowFlush, ShadowReplay,
-    SourceReceived, Switchpoint,
+    Drain, Durable, FilterDurable, Floor, LsnKind, Pos, RawStart, ResumeSafe, ShadowFlush,
+    ShadowReplay, SourceReceived, Switchpoint,
 };
 use crate::record::WAL_SEG_SIZE;
 use crate::source::wal_stream::WalStream;
@@ -186,12 +186,13 @@ pub fn resolved_floor(
 /// live ack by up to one status interval); slot errors surface at
 /// START_REPLICATION, same exposure as the boot-scan clamp had.
 pub fn resolve_start(
-    raw_start: Pos<Floor>,
+    raw_start: Pos<RawStart>,
     floor: Option<Pos<Floor>>,
     pinned: bool,
     archive_end: Option<Pos<FilterDurable>>,
     shadow: ShadowFloor,
 ) -> Pos<Floor> {
+    // Pinned and greenfield picks floor the same way an acked position does
     let raw_start: Pos<ResumeSafe> = raw_start.retag();
     const UNBOUNDED: u64 = u64::MAX;
     let inputs = match floor.filter(|f| !f.is_zero()) {
@@ -229,11 +230,11 @@ pub fn resolve_start(
 /// Seed the live pipeline ack from this value, not zero, so the first status
 /// write cannot discard persisted resume state before WAL re-read catches up
 pub fn resolve_resume_lsn(
-    start_lsn: Option<Pos<Floor>>,
-    bootstrap_end_lsn: Option<Pos<Floor>>,
+    start_lsn: Option<Pos<RawStart>>,
+    bootstrap_end_lsn: Option<Pos<RawStart>>,
     manifest_ack_lsn: Option<Pos<ResumeSafe>>,
     greenfield_head: Pos<SourceReceived>,
-) -> Pos<Floor> {
+) -> Pos<RawStart> {
     match (start_lsn, bootstrap_end_lsn, manifest_ack_lsn) {
         (Some(s), _, _) => s,
         (None, Some(l), _) => l,
@@ -341,10 +342,12 @@ pub async fn load(
 
 /// Crash-safe persist; `spill_dir` must already exist
 /// ([`XactBuffer::new`](crate::xact::xact_buffer::XactBuffer) creates it).
-pub async fn write(spill_dir: &Path, m: &Manifest) -> Result<(), ManifestError> {
+/// Returned floor is what a crash-now restart resumes from, the only thing
+/// pruners may cut against
+pub async fn write(spill_dir: &Path, m: &Manifest) -> Result<Durable<Floor>, ManifestError> {
     let text = toml::to_string(m)?;
     crate::fs::write_atomic(spill_dir, MANIFEST_FILENAME, text.as_bytes()).await?;
-    Ok(())
+    Ok(Durable::new(m.floor))
 }
 
 #[cfg(test)]

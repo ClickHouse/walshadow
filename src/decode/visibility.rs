@@ -349,10 +349,11 @@ impl PgXactPatch {
         self.aborted.extend(subxids);
     }
 
-    /// Run-length encode the ascending stretches once harvesting is done
-    pub fn seal(&mut self) {
+    /// End harvesting, run-length encoding the ascending stretches
+    pub fn seal(mut self) -> SealedPatch {
         self.committed.optimize();
         self.aborted.optimize();
+        SealedPatch(self)
     }
 
     pub fn len(&self) -> usize {
@@ -361,6 +362,20 @@ impl PgXactPatch {
 
     pub fn is_empty(&self) -> bool {
         self.committed.is_empty() && self.aborted.is_empty()
+    }
+}
+
+/// Harvested [`PgXactPatch`], the only form xid resolution reads
+#[derive(Debug, Default)]
+pub struct SealedPatch(PgXactPatch);
+
+impl SealedPatch {
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
     }
 }
 
@@ -373,10 +388,10 @@ pub struct PgXactView<'a> {
 }
 
 impl<'a> PgXactView<'a> {
-    pub fn new(accum: &'a PgXactAccum, patch: &'a PgXactPatch) -> Self {
+    pub fn new(accum: &'a PgXactAccum, patch: &'a SealedPatch) -> Self {
         Self {
             accum,
-            patch,
+            patch: &patch.0,
             multi: None,
         }
     }
@@ -701,6 +716,7 @@ mod tests {
         let mut p = PgXactPatch::new();
         p.commit(100, &[101, 102]);
         p.abort(200, &[]);
+        let p = p.seal();
         let v = PgXactView::new(&a, &p);
         assert_eq!(v.xid_status(100), XidStatus::Committed);
         assert_eq!(v.xid_status(102), XidStatus::Committed, "subxid patched");
@@ -767,7 +783,7 @@ mod tests {
                 (200, TRANSACTION_STATUS_COMMITTED),
             ],
         );
-        let p = PgXactPatch::new();
+        let p = PgXactPatch::new().seal();
         let v = PgXactView::new(&a, &p);
         // xmin committed via pg_xact, no xmax
         assert_eq!(tuple_visibility(100, 0, 0, Some(&v)), Visibility::Emit);
@@ -810,6 +826,7 @@ mod tests {
         let a = accum_with(0, &[]);
         let mut p = PgXactPatch::new();
         p.commit(500, &[]);
+        let p = p.seal();
         let v = PgXactView::new(&a, &p);
         assert_eq!(tuple_visibility(500, 0, 0, Some(&v)), Visibility::Emit);
         // Same for a gap-committed deleter: tuple is dead
@@ -922,7 +939,7 @@ mod tests {
                 (911, TRANSACTION_STATUS_ABORTED),
             ],
         );
-        let p = PgXactPatch::new();
+        let p = PgXactPatch::new().seal();
         let m = mx_accum(
             &[(10, 100), (11, 102), (20, 102), (21, 104), (30, 200)],
             &[
@@ -959,6 +976,7 @@ mod tests {
         // Gap-patch-committed updater: dead
         let mut p3 = PgXactPatch::new();
         p3.commit(950, &[]);
+        let p3 = p3.seal();
         let v3 = PgXactView::new(&a, &p3).with_multixact(&m2);
         assert_eq!(tuple_visibility(100, 10, mask, Some(&v3)), Visibility::Skip);
         // View without pg_multixact: unresolvable, caller aborts
@@ -1030,7 +1048,7 @@ mod tests {
         let accum = read_pg_xact(dir).await.unwrap();
         // No pg_multixact/ at all: a cluster that never made one
         let multi = read_pg_multixact(dir, 17).await.unwrap();
-        let patch = PgXactPatch::new();
+        let patch = PgXactPatch::new().seal();
         let view = PgXactView::new(&accum, &patch).with_multixact(&multi);
 
         assert_eq!(view.xid_status(700), XidStatus::Committed);

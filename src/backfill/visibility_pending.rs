@@ -416,6 +416,10 @@ pub struct PendingEntry {
     pub committed: Vec<u32>,
     #[serde(default)]
     pub aborted: Vec<u32>,
+    /// Awaiting EXCHANGE: outcomes accumulate, promotion waits since the
+    /// swap would discard promoted rows
+    #[serde(default)]
+    pub held: bool,
     /// Limit promotion to newly resolved rows; relearn after crash for retry
     #[serde(skip)]
     fresh_committed: Vec<u32>,
@@ -430,6 +434,10 @@ impl PendingEntry {
             database: self.database.clone(),
             table: self.table.clone(),
         }
+    }
+
+    fn is(&self, rel: &RelName) -> bool {
+        *self.namespace == *rel.namespace && *self.relname == *rel.name
     }
 
     fn note(&mut self, xid: u32, committed: bool) -> bool {
@@ -453,6 +461,16 @@ impl PendingEntry {
 
     fn has_fresh(&self) -> bool {
         !self.fresh_committed.is_empty() || !self.fresh_aborted.is_empty()
+    }
+}
+
+/// Bootstrap's pending tables are durable, so its marker may clear
+pub struct PendingRecorded(());
+
+impl PendingRecorded {
+    /// No visibility gate ran, so no pending table exists
+    pub fn nothing_pending() -> Self {
+        Self(())
     }
 }
 
@@ -548,8 +566,54 @@ impl PendingLedger {
         self.persist().await
     }
 
+    /// [`Self::push`] each manifest under one persist
+    pub async fn record(&mut self, manifests: &[PendingManifest]) -> io::Result<PendingRecorded> {
+        if !manifests.is_empty() {
+            manifests.iter().for_each(|m| self.stage(m));
+            self.persist().await?;
+        }
+        Ok(PendingRecorded(()))
+    }
+
     /// [`Self::push`] without persisting
     pub fn stage(&mut self, manifest: &PendingManifest) {
+        self.stage_entry(manifest, false);
+    }
+
+    /// [`Self::stage`] withholding promotion until [`Self::activate`]
+    pub fn hold(&mut self, manifest: &PendingManifest) {
+        self.stage_entry(manifest, true);
+    }
+
+    /// Release a held entry once its EXCHANGE applied. Nothing promoted
+    /// while held, so every decided xid is fresh
+    pub fn activate(&mut self, rel: &RelName) -> bool {
+        let Some(e) = self.entries.iter_mut().find(|e| e.held && e.is(rel)) else {
+            return false;
+        };
+        e.held = false;
+        e.fresh_committed.clone_from(&e.committed);
+        e.fresh_aborted.clone_from(&e.aborted);
+        true
+    }
+
+    /// Forget a held entry whose load never published; a retry rebuilds it
+    pub fn discard_held(&mut self, rel: &RelName) -> bool {
+        let before = self.entries.len();
+        self.entries.retain(|e| !e.held || !e.is(rel));
+        self.entries.len() != before
+    }
+
+    /// Forget held entries `swapped` rejects. Boot cleanup: a crash between
+    /// hold and swap mark leaves entries no swap resume will activate
+    pub fn discard_held_unless(&mut self, swapped: impl Fn(&RelName) -> bool) -> bool {
+        let before = self.entries.len();
+        self.entries
+            .retain(|e| !e.held || swapped(&RelName::new(&e.namespace, &e.relname)));
+        self.entries.len() != before
+    }
+
+    fn stage_entry(&mut self, manifest: &PendingManifest, held: bool) {
         let mut xids = manifest.xids.clone();
         xids.sort_unstable();
         let entry = PendingEntry {
@@ -561,6 +625,7 @@ impl PendingLedger {
             outstanding: xids,
             committed: Vec::new(),
             aborted: Vec::new(),
+            held,
             fresh_committed: Vec::new(),
             fresh_aborted: Vec::new(),
         };
@@ -623,6 +688,9 @@ pub async fn settle(
 ) -> Result<(), String> {
     let mut done = Vec::new();
     for (i, e) in ledger.entries.iter_mut().enumerate() {
+        if e.held {
+            continue;
+        }
         let rel = e.rel();
         // Crash may follow DROP but precede ledger persist
         if sess
@@ -906,6 +974,31 @@ mod tests {
         assert!(second.ends_with("AND (`_ws_xmax` IN (102))"), "{second}");
     }
 
+    #[tokio::test]
+    async fn held_entry_promotes_every_outcome_once_activated() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ledger = PendingLedger::load(tmp.path(), 7).await.unwrap();
+        ledger.hold(&manifest("orders", vec![101, 102]));
+        ledger.hold(&manifest("items", vec![103]));
+        // Outcome lands while EXCHANGE is outstanding, then restart drops fresh
+        ledger.note(101, &[], true);
+        ledger.persist().await.unwrap();
+        let mut ledger = PendingLedger::load(tmp.path(), 7).await.unwrap();
+        assert!(ledger.entries().iter().all(|e| e.held));
+
+        let orders = RelName::new("public", "orders");
+        assert!(!ledger.discard_held_unless(|_| true));
+        assert!(ledger.discard_held_unless(|r| *r == orders));
+        assert!(!ledger.discard_held(&RelName::new("public", "items")));
+        assert!(ledger.activate(&orders));
+        assert!(!ledger.activate(&orders), "already active");
+        assert!(!ledger.discard_held(&orders), "active entries stay");
+        let e = &ledger.entries()[0];
+        assert!(!e.held);
+        let sql = promote_sql(&e.rel(), e, "`id`");
+        assert!(sql.ends_with("AND (`_ws_xmin` IN (101))"), "{sql}");
+    }
+
     #[test]
     fn pending_create_names_every_key_clause() {
         assert_eq!(
@@ -946,7 +1039,7 @@ mod tests {
         let mut ledger = PendingLedger::load(tmp.path(), 7).await.unwrap();
         ledger.push(&manifest("orders", vec![101])).await.unwrap();
         let accum = PgXactAccum::new();
-        let patch = PgXactPatch::new();
+        let patch = PgXactPatch::new().seal();
         let fold = ledger.note_view(&PgXactView::new(&accum, &patch));
         assert_eq!(fold.settled, 0);
         assert_eq!(fold.undecidable, 1, "an aged-out xid is visible as such");

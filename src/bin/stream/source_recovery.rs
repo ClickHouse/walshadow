@@ -42,9 +42,8 @@ pub(crate) fn stream_branch(
 /// Step 5's gate: what the promotion target owes before it may be promoted,
 /// answered off the source connection walshadow already holds rather than a
 /// second `psql` (architecture/recovery.md).
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 pub(crate) struct PromotionGate {
-    pub(crate) ready: bool,
     /// Term that fails, empty once ready
     pub(crate) blocked_on: &'static str,
     pub(crate) in_recovery: bool,
@@ -56,12 +55,44 @@ impl PromotionGate {
     pub(crate) fn blocked(blocked_on: &'static str) -> Self {
         Self {
             blocked_on,
-            ..Self::default()
+            in_recovery: false,
+            replay_lsn: 0,
+            receive_lsn: 0,
         }
+    }
+
+    pub(crate) fn ready(&self) -> bool {
+        self.blocked_on.is_empty()
     }
 
     pub(crate) fn unreachable() -> Self {
         Self::blocked("source_unreachable")
+    }
+}
+
+/// Pause as the pump last observed it
+pub(crate) enum PauseState {
+    Running,
+    Paused {
+        /// Consumed then received, frozen when the pause was observed
+        frontier: (u64, u64),
+        /// Pause predates this process, so an operator may hold an older pair
+        refrozen: bool,
+        /// Last promotion gate read
+        polled_at: Option<Instant>,
+    },
+}
+
+impl PauseState {
+    pub(crate) fn frontier(&self) -> Option<(u64, u64)> {
+        let Self::Paused { frontier, .. } = self else {
+            return None;
+        };
+        Some(*frontier)
+    }
+
+    pub(crate) fn refrozen(&self) -> bool {
+        matches!(self, Self::Paused { refrozen: true, .. })
     }
 }
 
@@ -109,7 +140,6 @@ pub(crate) async fn promotion_gate(feed: &mut SourceFeed, pause_received: u64) -
         ""
     };
     PromotionGate {
-        ready: blocked_on.is_empty(),
         blocked_on,
         in_recovery,
         replay_lsn,
@@ -167,9 +197,6 @@ pub(crate) fn resume_manifest(
 /// fork is still in flight — the floor's contract is that a restart from it
 /// loses nothing, not that the natural terms have caught up to it
 /// (architecture/recovery.md).
-///
-/// Publishes to the pruners only after the persist, the same order the status
-/// loop uses: a cut must never sit above what a crash-now restart replays from.
 pub(crate) async fn commit_fork_resume(
     spill_dir: &Path,
     identity: &manifest::SourceIdentity,
@@ -182,7 +209,7 @@ pub(crate) async fn commit_fork_resume(
         resume_safe: lsn.emitter_ack,
         filter_durable: lsn.filter_durable,
         published: resume_floor.get(),
-        fork: Some(resume.floor),
+        fork: Some(resume.floor()),
         ..manifest::FloorInputs::default()
     }
     .floor();
@@ -191,27 +218,27 @@ pub(crate) async fn commit_fork_resume(
         floor,
         source: manifest::SourceIdentity {
             system_id: identity.system_id,
-            timeline: resume.timeline,
+            timeline: resume.timeline(),
             // The fork is where the descendant begins, so the next boot can
             // refuse a sibling that shares its number
-            timeline_begin: resume.switch_lsn,
+            timeline_begin: resume.switch_lsn(),
         },
         wal: manifest::WalBranch {
-            stream_timeline: resume.timeline,
+            stream_timeline: resume.timeline(),
         },
         lsn,
     };
-    manifest::write(spill_dir, &committed)
+    let persisted = manifest::write(spill_dir, &committed)
         .await
         .context("write resume manifest at the fork")?;
     // Descendant floor starts new position space
-    resume_floor.rebase(floor);
-    gc_floor.rebase(floor);
+    resume_floor.rebase(persisted);
+    gc_floor.rebase(persisted);
     tracing::info!(
         target: "walshadow",
-        timeline = resume.timeline,
+        timeline = resume.timeline(),
         floor = %floor,
-        switch_lsn = %resume.switch_lsn,
+        switch_lsn = %resume.switch_lsn(),
         "committed the fork resume position",
     );
     Ok(())
@@ -733,7 +760,7 @@ mod tests {
 
     #[test]
     fn promotion_gate_defaults_are_not_ready() {
-        assert!(!PromotionGate::default().ready);
+        assert!(!PromotionGate::blocked("not_paused").ready());
         assert_eq!(
             PromotionGate::blocked("not_paused").blocked_on,
             "not_paused"

@@ -9,15 +9,15 @@ use anyhow::Context;
 use tokio::sync::Mutex;
 use walrus::pg::backup::format_pg_lsn;
 use walshadow::ch_emitter::{EmitterConfig, EmitterStats};
-use walshadow::config::{CliOverrides, ConfigResolver, SourceConn};
-use walshadow::pos::{Floor, Pos};
+use walshadow::config::{CliOverrides, ConfigResolver, ResolverBoot, SourceConn};
+use walshadow::pos::{Floor, Pos, RawStart};
 use walshadow::runtime_config::InitialLoadMode;
 use walshadow::schema::{RelName, SchemaEvent};
 use walshadow::shadow_catalog::ShadowCatalog;
 use walshadow::source_db::{DbLink, SourceDb};
 
 use crate::args::{Args, cli_base};
-use crate::runtime_cfg::{apply_toml_initial_loads, refresh_mapping, seed_runtime_config};
+use crate::runtime_cfg::{apply_toml_initial_loads, load_runtime_config, refresh_mapping};
 use crate::session::SessionTasks;
 
 pub(crate) struct SourceDbInputs<'a> {
@@ -37,7 +37,7 @@ pub(crate) struct SourceDbInputs<'a> {
     pub(crate) budget: &'a walshadow::budget::MemoryBudget,
     pub(crate) stats: &'a Arc<EmitterStats>,
     pub(crate) source_major: u32,
-    pub(crate) raw_start: Pos<Floor>,
+    pub(crate) raw_start: Pos<RawStart>,
     /// Relations shadow can serve TOAST for, absent unless `[toast] mode = shadow`
     pub(crate) shadow_toast_held: Option<&'a walshadow::filter::shadow_relations::ShadowHeld>,
     pub(crate) system_id: u64,
@@ -78,15 +78,33 @@ pub(crate) async fn build_source_db(input: SourceDbInputs<'_>) -> anyhow::Result
             .map(std::time::Duration::from_millis),
         source_slot: args.slot.clone(),
     };
+    // Runtime-config overlay (§7): seed the resolver from this database's
+    // config_* tables over a sidecar libpq connection. Post-seed writes
+    // arrive live off the WAL stream. Refuse to start if the named schema is
+    // not installed — explicit opt-in means the operator expects the overlay
+    // present.
+    let mut overlay = walshadow::runtime_config::ConfigOverlay::default();
+    let mut seeded_table_rows: Vec<(RelName, walshadow::runtime_config::TableRow)> = Vec::new();
+    if let Some(schema) = cfg.runtime_config_schema.clone() {
+        let client = open_source_sql_client(input.source, &conn.name)
+            .await
+            .context("sidecar sql for runtime-config seed")?;
+        (overlay, seeded_table_rows) = load_runtime_config(&client, &schema)
+            .await
+            .context("seed runtime config overlay")?;
+    }
     let (resolver, config_rx) = ConfigResolver::new(
         &cfg,
         cli_overrides,
         args.ch_config.clone(),
         cli_base(args),
         mapping.clone(),
+        ResolverBoot {
+            overlay,
+            shadow_toast: input.shadow_toast_held.cloned(),
+        },
     );
     if let Some(held) = input.shadow_toast_held {
-        resolver.bind_shadow_toast(held.clone());
         // Check configured tables here because they bypass opt-in
         // Preserve exclusions across SIGHUP reloads
         let descs = conn
@@ -105,20 +123,6 @@ pub(crate) async fn build_source_db(input: SourceDbInputs<'_>) -> anyhow::Result
         "mapping refresher",
         refresh_mapping(config_rx.clone(), mapping.clone()),
     );
-    // Runtime-config overlay (§7): before the pump consumes WAL, seed the
-    // resolver from this database's config_* tables over a sidecar libpq
-    // connection. Post-seed writes arrive live off the WAL stream. Refuse
-    // to start if the named schema is not installed — explicit opt-in
-    // means the operator expects the overlay present.
-    let mut seeded_table_rows: Vec<(RelName, walshadow::runtime_config::TableRow)> = Vec::new();
-    if let Some(schema) = cfg.runtime_config_schema.clone() {
-        let client = open_source_sql_client(input.source, &conn.name)
-            .await
-            .context("sidecar sql for runtime-config seed")?;
-        seeded_table_rows = seed_runtime_config(&client, &schema, &resolver)
-            .await
-            .context("seed runtime config overlay")?;
-    }
     {
         let rc = config_rx.borrow();
         cfg.row_budget = rc.row_budget;
@@ -318,8 +322,8 @@ pub(crate) struct DescLogInputs<'a> {
     pub(crate) identity: walshadow::desc_log::DescLogIdentity,
     pub(crate) lineage: &'a [u32],
     pub(crate) manifest_present: bool,
-    pub(crate) start_lsn_override: Option<Pos<Floor>>,
-    pub(crate) raw_start: Pos<Floor>,
+    pub(crate) start_lsn_override: Option<Pos<RawStart>>,
+    pub(crate) raw_start: Pos<RawStart>,
     pub(crate) aligned: Pos<Floor>,
 }
 
@@ -355,7 +359,7 @@ pub(crate) async fn open_db_desc_log(
     );
     if let Some(lsn) = input.start_lsn_override {
         anyhow::ensure!(
-            lsn >= desc_log.floor_at_write(),
+            lsn.get() >= desc_log.floor_at_write().get(),
             "--start-lsn {} below descriptor log floor {}; no shape history \
              survives there — --ignore-cursor or re-bootstrap",
             lsn,

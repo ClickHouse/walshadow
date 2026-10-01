@@ -24,7 +24,7 @@ use walshadow::segment_sink::DirSegmentSink;
 use walshadow::shadow::{Shadow, ShadowConfig};
 use walshadow::shadow_stream::ShadowStreamSink;
 use walshadow::source_feed::{SourceEvent, SourceFeed, StandbyStatus};
-use walshadow::wal_stream::WalStream;
+use walshadow::wal_stream::{WalStream, WalStreamBuilder};
 
 fn make_source(tmp: &tempfile::TempDir, port: u16) -> Shadow {
     let mut cfg = ShadowConfig::new(tmp.path().join("source-data"), tmp.path().join("filtered"));
@@ -360,7 +360,7 @@ async fn phase(
 }
 
 /// Attach replication feed and filter to source
-async fn attach(source: &Shadow, app_name: &str) -> (SourceFeed, WalStream) {
+async fn attach(source: &Shadow, app_name: &str) -> (SourceFeed, WalStreamBuilder) {
     let cfg = source.config();
     let pgcfg = PgConfig {
         host: cfg.socket_dir.to_string_lossy().into_owned(),
@@ -378,7 +378,7 @@ async fn attach(source: &Shadow, app_name: &str) -> (SourceFeed, WalStream) {
         .with_status_interval(Duration::from_millis(500));
     let ident = feed.identify_system().await.expect("IDENTIFY_SYSTEM");
     let aligned = WalStream::align_down(ident.xlogpos, WAL_SEG_SIZE);
-    let mut stream = WalStream::new(ident.timeline, WAL_SEG_SIZE, Pos::new(aligned)).unwrap();
+    let mut stream = WalStream::builder(ident.timeline, WAL_SEG_SIZE, Pos::new(aligned)).unwrap();
     stream.filter_mut().set_target_db(current_db_oid(source));
     {
         let sql_client = feed.sql_client().await.expect("sql client");
@@ -424,7 +424,8 @@ async fn maintenance_traffic_costs_no_catalog_boundary() {
         .expect("seed schema");
 
     let names = Names::load(&source);
-    let (mut feed, mut stream) = attach(&source, "vacuum-census").await;
+    let (mut feed, stream) = attach(&source, "vacuum-census").await;
+    let mut stream = stream.start();
     let mut segs = DirSegmentSink::new(tmp.path().join("out")).expect("out dir");
     let mut buf = Vec::with_capacity(64 * 1024);
 
@@ -536,6 +537,7 @@ async fn maintenance_traffic_parks_the_pump_for_nothing() {
 
     let (mut feed, mut stream) = attach(source, "vacuum-hold").await;
     stream.set_bytes_sink(Box::new(ShadowStreamSink::new(shadow_state.clone())));
+    let mut stream = stream.start();
     let mut segs = DirSegmentSink::new(clusters.shadow_filter_dir.clone()).expect("filter dir");
     let mut buf = Vec::with_capacity(64 * 1024);
     let mut sink = HoldingCensus {

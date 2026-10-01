@@ -25,8 +25,8 @@ use walrus::pg::walparser::RmId;
 use crate::backfill::backfill_staging::StagingSession;
 use crate::backfill::visibility_pending::{self, SharedPendingLedger};
 use crate::catalog::pending::PendingCatalog;
-use crate::decode::heap_decoder::{DescribedHeap, HeapOp};
-use crate::decode::visibility::{PgXactPatch, PgXactView, read_pg_xact};
+use crate::decode::heap_decoder::DescribedHeap;
+use crate::decode::visibility::{PgXactView, SealedPatch, read_pg_xact};
 use crate::emit::ch_ddl::DdlApplicator;
 use crate::emit::ch_emitter::EmitterStats;
 use crate::record::{Record, RecordSink, SinkError};
@@ -43,10 +43,10 @@ use crate::xact::xact_buffer::{DrainEntry, SubxactTracker, XactBuffer};
 
 use crate::config::ResolvedConfig;
 use crate::emit::pipeline::Fatal;
-use crate::emit::pipeline::ack::AckHandle;
+use crate::emit::pipeline::ack::{AckHandle, Publish, SeqAlloc};
 use crate::emit::pipeline::batcher::BatcherMsg;
 use crate::emit::pipeline::decode;
-use crate::emit::pipeline::plan_spool::{PlanItem, SealedPlan};
+use crate::emit::pipeline::plan_spool::{PlanItem, SealedPlan, VerifiedPlan};
 use crate::emit::pipeline::planner::{PlanRouteView, Planner, drain_reason};
 use crate::emit::route::{RouteSnapshot, RoutedHeap, RowPolicy};
 use crate::mapping::{MappingSnapshot, TableMapping};
@@ -112,8 +112,8 @@ pub struct ReorderSink {
     /// a crash-now restart resumes from. Seeded at the resolved start,
     /// advanced only after each manifest persist.
     resume_floor: Arc<Monotone<Floor>>,
-    /// Dense commit-order counter; one seq per dispatched data unit.
-    next_seq: u64,
+    /// One seq per dispatched data unit, in commit order
+    seqs: SeqAlloc,
     /// Drain-slice budget: rows / bytes per [`DrainedBatch`] pulled from the
     /// buffer. Bounds resident decoded rows while a spilled xact streams
     /// back.
@@ -138,9 +138,21 @@ pub struct ReorderSink {
     route_config: Option<Arc<ResolvedConfig>>,
 }
 
+/// Every earlier row is durable on CH, so a DDL, TRUNCATE or config apply
+/// orders strictly after the data before it
+struct Fenced(());
+
+impl Fenced {
+    /// Boot runs before the pump dispatches any row
+    const fn pre_pump() -> Self {
+        Self(())
+    }
+}
+
 impl ReorderSink {
+    /// Sink only usable after [`BootingReorder::boot`]
     #[allow(clippy::too_many_arguments)]
-    pub fn new(
+    pub(super) fn booting(
         buffer: Arc<Mutex<XactBuffer>>,
         dbs: Arc<SourceDbs>,
         pending: Arc<PendingCatalog>,
@@ -164,7 +176,7 @@ impl ReorderSink {
         pending_rows: SharedPendingLedger,
         dest: Arc<crate::config::DestEmitter>,
         resume_floor: Arc<Monotone<Floor>>,
-    ) -> Self {
+    ) -> BootingReorder {
         // subscribe() marks the current value seen, so a `ctl reload`
         // racing pipeline spawn would stay invisible to has_changed —
         // and seeding the applied set from that raced value would record
@@ -192,7 +204,8 @@ impl ReorderSink {
                 (db.oid, scope)
             })
             .collect();
-        Self {
+        let seqs = ack.seqs(0);
+        BootingReorder(Self {
             buffer,
             dbs,
             scopes,
@@ -203,7 +216,7 @@ impl ReorderSink {
             stats,
             resolver,
             fatal,
-            next_seq: 0,
+            seqs,
             batch_rows,
             batch_bytes,
             plan_disk_max,
@@ -217,7 +230,7 @@ impl ReorderSink {
             resume_floor,
             route_mapping: None,
             route_config: None,
-        }
+        })
     }
 
     /// Route-point steps 1–2 close out here: preceding schema/config state is
@@ -374,12 +387,6 @@ impl ReorderSink {
         Ok(())
     }
 
-    fn alloc_seq(&mut self) -> u64 {
-        let s = self.next_seq;
-        self.next_seq += 1;
-        s
-    }
-
     fn fatal_err(&self) -> SinkError {
         SinkError::Other(
             self.fatal
@@ -400,6 +407,7 @@ impl ReorderSink {
     /// poison the sink future's `Send` bound.
     async fn apply_config(
         &mut self,
+        _: Fenced,
         db: Oid,
         event: &ConfigEvent,
         commit_lsn: u64,
@@ -460,10 +468,10 @@ impl ReorderSink {
     }
 
     // Barrier waits prefer concurrent fatal over successful completion
-    /// Block until every seq `< self.next_seq` is durable on CH, or a fatal
-    /// trips (e.g. CH down past the inserter retry budget).
+    /// Block until every opened seq is durable on CH, or a fatal trips (e.g.
+    /// CH down past the inserter retry budget).
     async fn wait_all_durable(&mut self) -> Result<(), SinkError> {
-        let through = self.next_seq;
+        let through = self.seqs.next();
         tokio::select! {
             biased;
             _ = self.fatal.wait() => Err(self.fatal_err()),
@@ -476,13 +484,15 @@ impl ReorderSink {
     /// Fence before applying a DDL event / TRUNCATE so it orders strictly
     /// after all earlier data: seal batcher, wait durable. Rows place inline
     /// before dispatch returns, so `FlushAll` orders after all of them
-    async fn barrier_fence(&mut self) -> Result<(), SinkError> {
+    async fn barrier_fence(&mut self) -> Result<Fenced, SinkError> {
         self.flush_all_batcher().await?;
-        self.wait_all_durable().await
+        self.wait_all_durable().await?;
+        Ok(Fenced(()))
     }
 
     async fn apply_event(
         &mut self,
+        _: Fenced,
         db: Oid,
         event: &SchemaEvent,
         commit_lsn: u64,
@@ -546,10 +556,10 @@ impl ReorderSink {
     /// Boot Added pass: every relation `Present` in the descriptor log at
     /// resume gets an `Added` apply (idempotent `CREATE TABLE IF NOT
     /// EXISTS` + forward-declaration materialise). Runs pre-pump every
-    /// boot, like [`Self::flush_due_retires`] — brownfield auto-create
+    /// boot, like [`Self::flush_due_retires`], brownfield auto-create
     /// tables exist at attach instead of first write, and newly enabled
     /// auto-create/mapping picks up existing rels without log mutation.
-    pub async fn apply_boot_events(
+    async fn apply_boot_events(
         &mut self,
         descs: Vec<Arc<RelDescriptor>>,
         resume_lsn: u64,
@@ -559,8 +569,13 @@ impl ReorderSink {
                 continue;
             }
             let db = desc.rfn.db_node;
-            self.apply_event(db, &SchemaEvent::Added { desc }, resume_lsn)
-                .await?;
+            self.apply_event(
+                Fenced::pre_pump(),
+                db,
+                &SchemaEvent::Added { desc },
+                resume_lsn,
+            )
+            .await?;
         }
         Ok(())
     }
@@ -568,11 +583,11 @@ impl ReorderSink {
     /// Retire below persisted resolved floor
     ///
     /// Restart resumes at the floor, DROP lock excludes later referrers.
-    /// Pub for boot: entries due at resume must retire during standup —
+    /// Boot runs it too: entries due at resume must retire during standup,
     /// their drop never replays, so no commit re-triggers this flush.
     /// Ledger removal persists after each wipe; a crash between re-runs
     /// an idempotent `TRUNCATE` on the emptied mirror
-    pub async fn flush_due_retires(&mut self) -> Result<(), SinkError> {
+    async fn flush_due_retires(&mut self) -> Result<(), SinkError> {
         // Disabled resolver no-ops retire_mirror: flushing would drop ledger
         // entries without wiping mirrors, leaking them for a later CH run
         // over the same spill dir
@@ -620,21 +635,21 @@ impl ReorderSink {
         if ledger.is_empty() {
             return Ok(());
         }
-        if self.pending_session.is_none() {
-            self.pending_session = Some(
+        let sess = match &mut self.pending_session {
+            Some(sess) => sess,
+            None => self.pending_session.insert(
                 StagingSession::connect(self.dest.clone())
                     .await
                     .map_err(|e| SinkError::Other(format!("pending visibility: connect: {e}")))?,
-            );
-        }
-        let sess = self.pending_session.as_mut().expect("just connected");
+            ),
+        };
         visibility_pending::settle(&mut ledger, sess, &self.stats)
             .await
             .map_err(SinkError::Other)
     }
 
     /// Recover outcomes from shadow transaction logs before resumed WAL
-    pub async fn settle_pending_boot(
+    async fn settle_pending_boot(
         &mut self,
         shadow_data_dir: Option<&std::path::Path>,
     ) -> Result<(), SinkError> {
@@ -645,7 +660,7 @@ impl ReorderSink {
             let accum = read_pg_xact(dir).await.map_err(|e| {
                 SinkError::Other(format!("pending visibility: shadow pg_xact: {e}"))
             })?;
-            let patch = PgXactPatch::new();
+            let patch = SealedPatch::default();
             let fold = self
                 .pending_rows
                 .lock()
@@ -684,13 +699,14 @@ impl ReorderSink {
 
     async fn apply_drain_entry(
         &mut self,
+        fenced: Fenced,
         db: Oid,
         entry: &DrainEntry,
         commit_lsn: u64,
     ) -> Result<(), SinkError> {
         match entry {
-            DrainEntry::Catalog(ev) => self.apply_event(db, ev, commit_lsn).await,
-            DrainEntry::Config(ev) => self.apply_config(db, ev, commit_lsn).await,
+            DrainEntry::Catalog(ev) => self.apply_event(fenced, db, ev, commit_lsn).await,
+            DrainEntry::Config(ev) => self.apply_config(fenced, db, ev, commit_lsn).await,
             DrainEntry::ToastBarrier {
                 toast_relid,
                 marker_lsn,
@@ -701,7 +717,7 @@ impl ReorderSink {
         }
     }
 
-    async fn apply_truncate(&mut self, heap: &DescribedHeap) -> Result<(), SinkError> {
+    async fn apply_truncate(&mut self, _: Fenced, heap: &DescribedHeap) -> Result<(), SinkError> {
         let Some(scope) = self.scopes.get_mut(&heap.descriptor.rfn.db_node) else {
             return Ok(());
         };
@@ -764,7 +780,7 @@ impl ReorderSink {
         pending_bytes: &mut usize,
         commit_ts: i64,
         commit_lsn: u64,
-        publish: bool,
+        publish: Publish,
     ) -> Result<(), SinkError> {
         if pending.is_empty() {
             return Ok(());
@@ -776,12 +792,7 @@ impl ReorderSink {
             _ = self.fatal.wait() => return Err(self.fatal_err()),
             p = crate::budget::admit_opt(self.budget.as_ref(), bytes) => p.map(Arc::new),
         };
-        let seq = self.alloc_seq();
-        if publish {
-            self.ack.register(seq, commit_lsn);
-        } else {
-            self.ack.register_partial(seq, commit_lsn);
-        }
+        let seq = self.seqs.open(commit_lsn, publish);
         self.stats.queue_jobs_out.fetch_add(1, Ordering::Relaxed);
         let chunk_rows = self.dest.current().decode_chunk_rows;
         let rows = tokio::select! {
@@ -791,14 +802,14 @@ impl ReorderSink {
                 &self.msg_tx,
                 &self.stats,
                 chunk_rows,
-                seq,
+                seq.seq(),
                 commit_ts,
                 commit_lsn,
                 heaps,
                 permit,
             ) => r.map_err(SinkError::Other)?,
         };
-        self.ack.placed(seq, rows);
+        seq.place(rows);
         Ok(())
     }
 
@@ -812,23 +823,15 @@ impl ReorderSink {
     pub async fn execute_plan(
         &mut self,
         db: Oid,
-        plan: &SealedPlan,
+        plan: &VerifiedPlan,
     ) -> Result<(u64, bool), SinkError> {
         let (commit_ts, commit_lsn) = (plan.commit_ts, plan.commit_lsn);
-        // Mem-resident plans hold the bytes validated at write; file-backed
-        // plans re-read from disk, checksum-verify fully before the first
-        // side effect so corruption fails the whole transaction
-        if plan.path().is_some() {
-            plan.verify()
-                .map_err(|e| SinkError::Other(format!("plan verify: {e}")))?;
-        }
         let mut rd = plan
             .replay()
             .map_err(|e| SinkError::Other(format!("plan replay: {e}")))?;
         let mut pending: Vec<RoutedHeap> = Vec::new();
         let mut pending_bytes = 0usize;
         let mut rows_cursor = 0usize;
-        let mut trunc = plan.truncate_rows.iter().copied();
         let total_rows: usize = plan.row_batches.iter().map(|rb| rb.len()).sum();
         let mut rows_total = 0u64;
         while let Some(item) = rd
@@ -844,25 +847,25 @@ impl ReorderSink {
                         &mut pending_bytes,
                         commit_ts,
                         commit_lsn,
-                        false,
+                        Publish::Partial,
                     )
                     .await?;
-                    self.barrier_fence().await?;
-                    self.apply_drain_entry(db, &c.event, commit_lsn).await?;
+                    let fenced = self.barrier_fence().await?;
+                    self.apply_drain_entry(fenced, db, &c.event, commit_lsn)
+                        .await?;
                 }
-                PlanItem::Heap(h) if matches!(h.described.decoded.op, HeapOp::Truncate) => {
-                    let upto = trunc.next().unwrap_or(rows_cursor);
+                PlanItem::Truncate { heap: h, upto } => {
                     self.put_plan_rows(plan, &mut rows_cursor, upto).await?;
                     self.dispatch_planned(
                         &mut pending,
                         &mut pending_bytes,
                         commit_ts,
                         commit_lsn,
-                        false,
+                        Publish::Partial,
                     )
                     .await?;
-                    self.barrier_fence().await?;
-                    self.apply_truncate(&h.described).await?;
+                    let fenced = self.barrier_fence().await?;
+                    self.apply_truncate(fenced, &h.described).await?;
                 }
                 PlanItem::Heap(h) => {
                     rows_total += 1;
@@ -874,7 +877,7 @@ impl ReorderSink {
                             &mut pending_bytes,
                             commit_ts,
                             commit_lsn,
-                            false,
+                            Publish::Partial,
                         )
                         .await?;
                     }
@@ -883,16 +886,16 @@ impl ReorderSink {
         }
         self.put_plan_rows(plan, &mut rows_cursor, total_rows)
             .await?;
-        let publish = !pending.is_empty();
+        let published = !pending.is_empty();
         self.dispatch_planned(
             &mut pending,
             &mut pending_bytes,
             commit_ts,
             commit_lsn,
-            publish,
+            Publish::Commit,
         )
         .await?;
-        Ok((rows_total, publish))
+        Ok((rows_total, published))
     }
 
     async fn on_commit(
@@ -925,7 +928,7 @@ impl ReorderSink {
             .get(&db)
             .map(|scope| scope.db.desc_log.clone())
             .unwrap_or_else(|| self.dbs.primary().desc_log.clone());
-        crate::xact::xact_buffer::resolve_stash(
+        let stash = crate::xact::xact_buffer::resolve_stash(
             &self.buffer,
             &stash_log,
             &self.pending,
@@ -954,7 +957,7 @@ impl ReorderSink {
         let mut drain = {
             let mut buf = self.buffer.lock().await;
             buf.drain_committed(
-                xid,
+                stash,
                 payload.xact_time,
                 record.source_lsn,
                 &payload.subxacts,
@@ -994,7 +997,7 @@ impl ReorderSink {
         self.reset_route_state(db).await;
         let mut rows_total: u64 = 0;
         let mut published = false;
-        if drain.had_states {
+        if drain.had_states() {
             let plan_path = self.plan_dir.join(format!("xact-{xid}-{commit_lsn}.plan"));
             let plan = {
                 let scope = self.scopes.get_mut(&db);
@@ -1055,6 +1058,10 @@ impl ReorderSink {
                 &self.stats.plan_bytes_mem
             };
             plan_bytes.fetch_add(plan.size_bytes, Ordering::Relaxed);
+            // Corruption fails the whole transaction before any side effect
+            let plan = plan
+                .into_verified()
+                .map_err(|e| SinkError::Other(format!("plan verify: {e}")))?;
             (rows_total, published) = self
                 .execute_plan(db, &plan)
                 .instrument(trace_span!(
@@ -1073,9 +1080,7 @@ impl ReorderSink {
             // rows=0 marker: publishes commit_lsn once every earlier partial
             // segment is durable. Covers empty / read-only commits and plans
             // whose tail is a control or truncate.
-            let seq = self.alloc_seq();
-            self.ack.register(seq, commit_lsn);
-            self.ack.placed(seq, 0);
+            self.seqs.mark(commit_lsn);
         }
         Ok(())
     }
@@ -1088,19 +1093,49 @@ impl ReorderSink {
         // ABORT PREPARED: buffered state keys off the prepared xid
         let xid = payload.twophase_xid.unwrap_or(xid);
         self.note_pending(xid, &payload.subxacts, false).await?;
-        let seq = self.alloc_seq();
-        self.ack.register(seq, record.source_lsn);
+        let seq = self.seqs.open(record.source_lsn, Publish::Commit);
         {
             let mut buf = self.buffer.lock().await;
             buf.abort(xid, Pos::new(record.source_lsn), &payload.subxacts)
                 .await
                 .map_err(SinkError::from)?;
         }
-        self.ack.placed(seq, 0);
+        seq.place(0);
         self.subxact_tracker.lock().await.forget_tree(xid);
         self.pending.forget_tree(xid);
         Ok(())
     }
+}
+
+/// Reorder sink awaiting its boot pass; only [`Self::boot`] yields the
+/// [`RecordSink`]
+pub struct BootingReorder(ReorderSink);
+
+impl BootingReorder {
+    /// Retire due mirrors, recover pending row outcomes, then apply the
+    /// Added pass over relations `present` at `resume_lsn`
+    pub async fn boot(
+        self,
+        shadow_data_dir: Option<&std::path::Path>,
+        present: Vec<Arc<RelDescriptor>>,
+        resume_lsn: u64,
+    ) -> Result<ReorderSink, SinkError> {
+        let mut sink = self.0;
+        sink.flush_due_retires()
+            .await
+            .map_err(|e| boot_step("flush of due toast-mirror retires", e))?;
+        sink.settle_pending_boot(shadow_data_dir)
+            .await
+            .map_err(|e| boot_step("settle of pending backup rows", e))?;
+        sink.apply_boot_events(present, resume_lsn)
+            .await
+            .map_err(|e| boot_step("Added pass over descriptor log", e))?;
+        Ok(sink)
+    }
+}
+
+fn boot_step(step: &str, e: SinkError) -> SinkError {
+    SinkError::Other(format!("boot {step}: {e}"))
 }
 
 /// Route a plan-failure reason label onto its counter
@@ -1277,7 +1312,7 @@ impl RecordSink for ReorderSink {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::decode::heap_decoder::DecodedHeap;
+    use crate::decode::heap_decoder::{DecodedHeap, HeapOp};
     use crate::mapping::TableTarget;
     use crate::xact::xact_buffer::raw_fixtures::int4_descriptor;
 

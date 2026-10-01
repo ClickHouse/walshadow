@@ -23,6 +23,7 @@ use walshadow::ch_emitter::{EmitterConfig, EmitterStats};
 use walshadow::codecs::NumericKind;
 use walshadow::heap_decoder::{ColumnValue, CommittedTuple, DecodedHeap, DecodedTuple, HeapOp};
 use walshadow::mapping::{ColumnMapping, TableMapping, TableTarget};
+use walshadow::pipeline::ack::Publish;
 use walshadow::pipeline::batcher::{BatcherMsg, RoutedRow};
 use walshadow::pipeline::{Fatal, tail};
 use walshadow::pos::{EmitterAck, Monotone};
@@ -168,10 +169,10 @@ async fn native_numeric_time_timetz_round_trip() {
 
     // Drive the single row through the tail: register the seq, route the
     // row, seal with FlushAll, wait for it durable, then drain.
-    ack.register(0, tuple.commit_lsn);
+    let seq = ack.seqs(0).open(tuple.commit_lsn, Publish::Commit);
     msg_tx
         .send(BatcherMsg::Row(RoutedRow {
-            seq: 0,
+            seq: seq.seq(),
             rel,
             route: walshadow::emit::route::RouteSnapshot::freeze(
                 mapping,
@@ -183,7 +184,7 @@ async fn native_numeric_time_timetz_round_trip() {
         }))
         .await
         .expect("route row");
-    ack.placed(0, 1);
+    seq.place(1);
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     msg_tx
         .send(BatcherMsg::FlushAll(reply_tx))
@@ -191,9 +192,7 @@ async fn native_numeric_time_timetz_round_trip() {
         .expect("send flush");
     reply_rx.await.expect("flush ack");
     ack.wait_through(1).await.expect("ack collector alive");
-    drop(msg_tx);
-    drop(ack);
-    tail_parts.join().await;
+    tail_parts.close(msg_tx, ack).await;
     assert!(fatal.message().is_none(), "no fatal: {:?}", fatal.message());
 
     let row = ch

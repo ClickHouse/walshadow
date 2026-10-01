@@ -156,7 +156,7 @@ async fn attach(source: &Shadow) -> (SourceFeed, WalStream) {
         .with_status_interval(Duration::from_millis(500));
     let ident = feed.identify_system().await.expect("IDENTIFY_SYSTEM");
     let aligned = WalStream::align_down(ident.xlogpos, WAL_SEG_SIZE);
-    let mut stream = WalStream::new(ident.timeline, WAL_SEG_SIZE, Pos::new(aligned)).unwrap();
+    let mut stream = WalStream::builder(ident.timeline, WAL_SEG_SIZE, Pos::new(aligned)).unwrap();
     stream.filter_mut().set_target_db(current_db_oid(source));
     {
         let sql_client = feed.sql_client().await.expect("sql client");
@@ -175,7 +175,7 @@ async fn attach(source: &Shadow) -> (SourceFeed, WalStream) {
     feed.start_physical_replication(None, aligned, ident.timeline)
         .await
         .expect("START_REPLICATION");
-    (feed, stream)
+    (feed, stream.start())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

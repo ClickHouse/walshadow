@@ -40,15 +40,16 @@ pub(crate) fn spawn_segment_fsync(
                 return;
             }
         };
-        while let Some(item) = rx.recv().await {
-            let mut max_lsn = item.end_lsn;
+        while let Some(mut last) = rx.recv().await {
             while let Ok(next) = rx.try_recv() {
-                max_lsn = max_lsn.max(next.end_lsn);
+                if next.end_lsn() > last.end_lsn() {
+                    last = next;
+                }
             }
             let dir = Arc::clone(&dir);
-            let synced = tokio::task::spawn_blocking(move || walshadow::fs::syncfs(&dir)).await;
+            let synced = tokio::task::spawn_blocking(move || last.syncfs(&dir)).await;
             match synced {
-                Ok(Ok(())) => {}
+                Ok(Ok(durable)) => durable_lsn.publish(durable),
                 Ok(Err(e)) => {
                     fatal.set(format!("syncfs {}: {e}", out_dir.display()));
                     return;
@@ -57,8 +58,7 @@ pub(crate) fn spawn_segment_fsync(
                     fatal.set(format!("syncfs join {}: {e}", out_dir.display()));
                     return;
                 }
-            }
-            durable_lsn.join(Pos::new(max_lsn));
+            };
         }
     })
 }
@@ -107,20 +107,24 @@ pub(crate) async fn trim_retention(
         if lsn.is_zero() {
             continue;
         }
-        if client.is_none() {
-            match open_retention_client(&shadow_conninfo).await {
-                Ok(c) => client = Some(c),
-                Err(e) => {
+        let conn = if let Some(c) = &mut client {
+            c
+        } else {
+            let Ok(c) = open_retention_client(&shadow_conninfo)
+                .await
+                .inspect_err(|e| {
                     tracing::warn!(
                         target: "walshadow::retention",
                         error = %e,
                         "shadow connect failed; retrying next cycle",
                     );
-                    continue;
-                }
-            }
-        }
-        let redo = match query_redo_lsn(client.as_ref().expect("just set")).await {
+                })
+            else {
+                continue;
+            };
+            client.insert(c)
+        };
+        let redo = match query_redo_lsn(conn).await {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!(target: "walshadow::retention", error = %e, "redo lsn query");

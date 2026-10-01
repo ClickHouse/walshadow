@@ -21,7 +21,7 @@ use crate::backfill::visibility_pending::{PendingManifest, PendingSpool};
 use crate::backfill::walk_barrier::{WALK_CHECKPOINT_PERIOD, WalkBarrier};
 use crate::config::ResolvedConfig;
 use crate::decode::visibility::{
-    HEAP_XMAX_IS_MULTI, PgXactPatch, PgXactView, Visibility, deferred_xids, read_pg_multixact,
+    HEAP_XMAX_IS_MULTI, PgXactView, SealedPatch, Visibility, deferred_xids, read_pg_multixact,
     read_pg_xact, tuple_visibility,
 };
 use crate::emit::ch_emitter::EmitterStats;
@@ -329,7 +329,7 @@ impl GreenfieldSink {
             let row_policy = self.dest.current().row_policy();
             async move {
                 bootstrap::drain_deferred(
-                    lane.spool,
+                    lane.spool.into(),
                     &catalog,
                     &mapping,
                     &lane.msg_tx,
@@ -410,7 +410,7 @@ pub struct PendingGate {
 pub async fn resolve_greenfield(
     gate: PendingGate,
     data_dir: &Path,
-    patch: &PgXactPatch,
+    patch: &SealedPatch,
     source_major: u32,
 ) -> Result<(GateStats, Vec<PendingManifest>)> {
     let PendingGate {
@@ -629,13 +629,13 @@ mod tests {
         );
         barrier.publish_drain(2, 9, SpoolMark::default()).await;
         assert_eq!(
-            barrier.collect().await.unwrap().files,
+            barrier.collect().await.unwrap().files(),
             vec!["base/5/16400".to_string()],
             "the second file's tuple is still undrained"
         );
         barrier.publish_drain(3, 9, SpoolMark::default()).await;
         assert_eq!(
-            barrier.collect().await.unwrap().files,
+            barrier.collect().await.unwrap().files(),
             vec!["base/5/16400.1".to_string()],
         );
     }
@@ -683,7 +683,7 @@ mod tests {
         );
         barrier.publish_drain(2, 4, SpoolMark::default()).await;
         assert_eq!(
-            barrier.collect().await.unwrap().files,
+            barrier.collect().await.unwrap().files(),
             vec!["base/5/16400".to_string()]
         );
     }
@@ -992,7 +992,7 @@ mod tests {
     #[tokio::test]
     async fn several_spools_all_replay_into_one_output() {
         let accum = PgXactAccum::new();
-        let patch = PgXactPatch::new();
+        let patch = SealedPatch::default();
         let multi = PgMultiXactAccum::new(17);
         let view = PgXactView::new(&accum, &patch).with_multixact(&multi);
         let (tx, mut rx) = mpsc::channel(16);
@@ -1039,7 +1039,7 @@ mod tests {
     #[tokio::test]
     async fn in_flight_tuples_reach_pending() {
         let accum = in_progress_accum();
-        let patch = PgXactPatch::new();
+        let patch = SealedPatch::default();
         let multi = PgMultiXactAccum::new(17);
         let view = PgXactView::new(&accum, &patch).with_multixact(&multi);
         let (tx, mut rx) = mpsc::channel(8);
@@ -1079,7 +1079,7 @@ mod tests {
     #[tokio::test]
     async fn in_flight_tuples_without_pending_stay_gated() {
         let accum = in_progress_accum();
-        let patch = PgXactPatch::new();
+        let patch = SealedPatch::default();
         let multi = PgMultiXactAccum::new(17);
         let view = PgXactView::new(&accum, &patch).with_multixact(&multi);
         let (tx, _rx) = mpsc::channel(8);
@@ -1095,7 +1095,7 @@ mod tests {
     #[tokio::test]
     async fn undecidable_multixact_aborts_the_pass() {
         let accum = PgXactAccum::new();
-        let patch = PgXactPatch::new();
+        let patch = SealedPatch::default();
         let multi = PgMultiXactAccum::new(17);
         let view = PgXactView::new(&accum, &patch).with_multixact(&multi);
         let (tx, _rx) = mpsc::channel(4);
@@ -1136,10 +1136,14 @@ mod tests {
                 ..Default::default()
             },
         };
-        let (stats, pending_tables) =
-            resolve_greenfield(pending, Path::new("/nonexistent"), &PgXactPatch::new(), 17)
-                .await
-                .unwrap();
+        let (stats, pending_tables) = resolve_greenfield(
+            pending,
+            Path::new("/nonexistent"),
+            &SealedPatch::default(),
+            17,
+        )
+        .await
+        .unwrap();
         assert_eq!(stats.emitted, 7);
         assert!(pending_tables.is_empty());
     }

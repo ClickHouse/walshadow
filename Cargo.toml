@@ -37,6 +37,7 @@ path = "src/lib.rs"
 default = ["lz4", "zstd"]
 lz4 = ["clickhouse-c-rs/lz4"]
 zstd = ["clickhouse-c-rs/zstd"]
+test-support = []
 
 [dependencies]
 wal-rus = "0.3.5"
@@ -101,6 +102,7 @@ name = "spool_read"
 harness = false
 
 [dev-dependencies]
+walshadow = { path = ".", features = ["test-support"] }
 # Pre-main tracing subscriber for tests
 ctor = "1.0.13"
 tempfile = "3"

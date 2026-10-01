@@ -57,7 +57,7 @@ pub async fn filter_landed_wal(
         return Ok(LandedWalStats::default());
     };
 
-    let mut stream = WalStream::new(
+    let mut stream = WalStream::builder(
         timeline,
         WAL_SEG_SIZE,
         Pos::new(first.start_lsn(WAL_SEG_SIZE)),
@@ -75,6 +75,7 @@ pub async fn filter_landed_wal(
             )
             .await?;
     }
+    let mut stream = stream.start();
 
     let mut records = DropRecords;
     let mut writer = WriteBack {

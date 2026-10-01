@@ -9,7 +9,7 @@ use clap::Parser;
 use walrus::pg::walparser::RelFileNode;
 use walshadow::heap_decoder::{ColumnValue, DecodedHeap, DecodedTuple, DescribedHeap, HeapOp};
 use walshadow::schema::{RelDescriptor, RelName, ReplIdent};
-use walshadow::xact_buffer::{XactBuffer, XactBufferConfig};
+use walshadow::xact_buffer::{StashResolved, XactBuffer, XactBufferConfig};
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -96,7 +96,13 @@ async fn run(args: Args) -> anyhow::Result<()> {
             let start = Instant::now();
             let commit_lsn = u64::from(xid + 1) * (args.rows as u64 + 1);
             let mut drain = buffer
-                .drain_committed(xid, 0, commit_lsn, &[], false)
+                .drain_committed(
+                    StashResolved::nothing_stashed(xid),
+                    0,
+                    commit_lsn,
+                    &[],
+                    false,
+                )
                 .await?;
             let mut rows = 0;
             while let Some(batch) = drain.next_batch(1024, 1 << 20, None).await? {

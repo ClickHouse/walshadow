@@ -355,7 +355,6 @@ impl RecordSink for QueueingRecordSink {
                 next_lsn: record.next_lsn,
                 page_magic: record.page_magic,
                 route: record.route,
-                catalog_boundary: record.catalog_boundary,
                 boundary_info: record.boundary_info.clone(),
                 aborted_tree: record.aborted_tree.clone(),
                 defer_catalog_decode: record.defer_catalog_decode,

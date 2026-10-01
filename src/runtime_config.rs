@@ -4,7 +4,7 @@
 //!
 //! Config rows live in operator-owned `<schema>.config_*` tables on source PG
 //! (see `sql/runtime_config_install.sql`). The daemon reads them at boot
-//! (`SELECT *`, [`crate::config::ConfigResolver::seed_overlay`]) and tracks
+//! (`SELECT *`, [`crate::config::ResolverBoot::overlay`]) and tracks
 //! live edits off the WAL stream: a config-table heap write is detected in the
 //! decode path by resolved qualified name, interpreted here into a
 //! [`ConfigEvent`], and applied at the row's commit LSN.

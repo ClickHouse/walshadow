@@ -62,6 +62,27 @@ pub enum CatalogError {
 
 pub type Result<T> = std::result::Result<T, CatalogError>;
 
+/// Shadow replay parked at one position with every successor byte withheld,
+/// the precondition for pinned catalog reads
+#[derive(Debug)]
+pub struct ParkedAt(u64);
+
+impl ParkedAt {
+    pub(crate) const fn new(lsn: u64) -> Self {
+        Self(lsn)
+    }
+
+    pub const fn lsn(&self) -> u64 {
+        self.0
+    }
+
+    /// Integration tests stand in for a hold they do not run
+    #[cfg(feature = "test-support")]
+    pub const fn assume_for_test(lsn: u64) -> Self {
+        Self(lsn)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ShadowCatalogConfig {
     /// `pg_last_wal_replay_lsn()` poll interval
@@ -331,19 +352,19 @@ impl ShadowCatalog {
         self.fetch_committed(Scope::Eligible, None).await
     }
 
-    /// [`fetch_descriptors_batch`](Self::fetch_descriptors_batch) for a caller
-    /// that has parked replay at `boundary` and withheld every successor byte.
+    /// [`fetch_descriptors_batch`](Self::fetch_descriptors_batch) pinned at
+    /// a [`ParkedAt`] position.
     ///
-    /// Saying so is what keeps the read out of the deadlock: the worker checks
+    /// Parking is what keeps the read out of the deadlock: the worker checks
     /// the position on both sides and may then read a catalog whose lock replay
     /// is holding, and no step falls back to ordinary SQL, whose parse would
     /// queue behind that same lock.
     pub async fn fetch_descriptors_batch_at(
         &mut self,
         oids: &[Oid],
-        boundary: u64,
+        at: &ParkedAt,
     ) -> Result<(u64, Vec<RelDescriptor>)> {
-        self.fetch_committed(Scope::Oids(oids), Some(boundary))
+        self.fetch_committed(Scope::Oids(oids), Some(at.lsn()))
             .await
     }
 
@@ -351,9 +372,9 @@ impl ShadowCatalog {
     /// [`fetch_descriptors_batch_at`](Self::fetch_descriptors_batch_at).
     pub async fn fetch_all_descriptors_at(
         &mut self,
-        boundary: u64,
+        at: &ParkedAt,
     ) -> Result<(u64, Vec<RelDescriptor>)> {
-        self.fetch_committed(Scope::Eligible, Some(boundary)).await
+        self.fetch_committed(Scope::Eligible, Some(at.lsn())).await
     }
 
     /// Committed catalog at one replay position.
@@ -395,9 +416,8 @@ impl ShadowCatalog {
     }
 
     /// Descriptors as transaction `top_xid` sees them, read off shadow's pages
-    /// at `boundary` — the LSN the caller parked replay at. Rows the
-    /// transaction wrote and has not committed are included; rows it deleted
-    /// are not.
+    /// where replay is parked. Rows the transaction wrote and has not
+    /// committed are included; rows it deleted are not.
     ///
     /// Oids absent from `pg_class` are absent from the result, as in
     /// [`Self::fetch_descriptors_batch`].
@@ -405,12 +425,12 @@ impl ShadowCatalog {
         &mut self,
         oids: &[Oid],
         top_xid: u32,
-        boundary: u64,
+        at: &ParkedAt,
     ) -> Result<Vec<RelDescriptor>> {
         let bridge = self.bridge.clone();
         self.stats.fetches += 1;
         let rows = self
-            .scan_rows(&bridge, Scope::Oids(oids), top_xid, Some(boundary))
+            .scan_rows(&bridge, Scope::Oids(oids), top_xid, Some(at.lsn()))
             .await?;
         let db_node = self.current_db_oid().await?;
         let default_tablespace = self.default_tablespace_oid().await?;

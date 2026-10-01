@@ -401,9 +401,7 @@ async fn bench_drain(shape: Shape) -> Report {
     .unwrap();
     let elapsed = started.elapsed().as_secs_f64();
     feeder.await.unwrap();
-    drop(msg_tx);
-    drop(ack);
-    tail.join().await;
+    tail.close(msg_tx, ack).await;
 
     Report {
         label: "drain".into(),

@@ -157,10 +157,10 @@ impl<'a, V: PlanRouteView> Planner<'a, V> {
                     self.view.apply(&e).await.map_err(PlanError::View)?;
                     self.writer.push_control(e, self.rows_base + cursor);
                 }
-                WalkStep::Truncate(heap) => {
-                    self.writer.note_truncate_cursor(self.rows_base + cursor);
+                WalkStep::Truncate { heap, upto } => {
                     let route = self.view.route_for(&heap);
-                    self.writer.push_heap(&heap, route.as_ref())?;
+                    self.writer
+                        .push_truncate(&heap, route.as_ref(), self.rows_base + upto)?;
                 }
                 WalkStep::Heap(mut heap) => {
                     // Route before validation and detoast: unmapped rows
@@ -203,7 +203,7 @@ mod tests {
     use crate::xact::xact_buffer::raw_fixtures::{
         inject_ordinary, int4_descriptor, multi_insert_raw,
     };
-    use crate::xact::xact_buffer::{FailClosedReason, XactBuffer, XactBufferConfig};
+    use crate::xact::xact_buffer::{FailClosedReason, StashResolved, XactBuffer, XactBufferConfig};
     use ahash::{HashMap, HashMapExt, HashSet, HashSetExt};
     use walrus::pg::walparser::RelFileNode;
 
@@ -397,7 +397,10 @@ mod tests {
         let resolver = ToastResolver::disabled();
         let mut planner =
             Planner::create(tmp.path().join("1.plan"), 1 << 20, &mut view, &resolver).unwrap();
-        let mut drain = b.drain_committed(1, 42, 0x2000, &[], false).await.unwrap();
+        let mut drain = b
+            .drain_committed(StashResolved::nothing_stashed(1), 42, 0x2000, &[], false)
+            .await
+            .unwrap();
         // 1-row slices force the multi-batch path
         while let Some(batch) = drain.next_batch(1, usize::MAX, None).await.unwrap() {
             let is_final = batch.is_final;
@@ -416,7 +419,7 @@ mod tests {
         while let Some(item) = rd.next_item().unwrap() {
             order.push(match item {
                 PlanItem::Control(_) => "e".to_string(),
-                PlanItem::Heap(h) => format!(
+                PlanItem::Heap(h) | PlanItem::Truncate { heap: h, .. } => format!(
                     "h{}{}",
                     h.described.decoded.source_lsn,
                     if h.route.is_some() { "r" } else { "-" }
@@ -466,7 +469,10 @@ mod tests {
         );
         let path = tmp.path().join("1.plan");
         let mut planner = Planner::create(path.clone(), 1 << 20, &mut view, &resolver).unwrap();
-        let mut drain = b.drain_committed(1, 42, 0x2000, &[], false).await.unwrap();
+        let mut drain = b
+            .drain_committed(StashResolved::nothing_stashed(1), 42, 0x2000, &[], false)
+            .await
+            .unwrap();
         // 1-row slices: the valid row plans before the toast row fails
         let first = drain
             .next_batch(1, usize::MAX, None)
@@ -501,7 +507,7 @@ mod tests {
         let mut bad = multi_insert_raw(1, 120, 16610, &[3]);
         bad.main_data[0] = 0; // strip CONTAINS_NEW_TUPLE: ImageOnly on fold
         b.stash_raw(1, bad).await.unwrap();
-        inject_ordinary(&mut b, rfn, rel.clone());
+        let stash = inject_ordinary(rfn, rel.clone());
 
         let mut view = MapView {
             routes: HashMap::from_iter([(rel.rel_name.clone(), route())]),
@@ -511,7 +517,10 @@ mod tests {
         let resolver = ToastResolver::disabled();
         let path = tmp.path().join("1.plan");
         let mut planner = Planner::create(path.clone(), 1 << 20, &mut view, &resolver).unwrap();
-        let mut drain = b.drain_committed(1, 42, 0x2000, &[], false).await.unwrap();
+        let mut drain = b
+            .drain_committed(stash, 42, 0x2000, &[], false)
+            .await
+            .unwrap();
         let mut planned = 0usize;
         // 1-row slices: valid fanout rows plan before the bad record folds
         let err = loop {
@@ -556,7 +565,10 @@ mod tests {
         let resolver = ToastResolver::disabled();
         let mut planner =
             Planner::create(tmp.path().join("1.plan"), 1 << 30, &mut view, &resolver).unwrap();
-        let mut drain = b.drain_committed(1, 42, 0x2000, &[], false).await.unwrap();
+        let mut drain = b
+            .drain_committed(StashResolved::nothing_stashed(1), 42, 0x2000, &[], false)
+            .await
+            .unwrap();
         while let Some(batch) = drain.next_batch(1024, usize::MAX, None).await.unwrap() {
             let is_final = batch.is_final;
             planner.plan_batch(batch).await.unwrap();
@@ -631,7 +643,10 @@ mod tests {
         let resolver = ToastResolver::disabled();
         let mut planner =
             Planner::create(tmp.path().join("1.plan"), 1 << 20, &mut view, &resolver).unwrap();
-        let mut drain = b.drain_committed(1, 42, 0x2000, &[], true).await.unwrap();
+        let mut drain = b
+            .drain_committed(StashResolved::nothing_stashed(1), 42, 0x2000, &[], true)
+            .await
+            .unwrap();
         while let Some(batch) = drain.next_batch(1, usize::MAX, None).await.unwrap() {
             let is_final = batch.is_final;
             planner.plan_batch(batch).await.unwrap();
@@ -682,7 +697,10 @@ mod tests {
             let resolver = ToastResolver::disabled();
             let path = tmp.path().join("1.plan");
             let mut planner = Planner::create(path.clone(), 1 << 20, &mut view, &resolver).unwrap();
-            let mut drain = b.drain_committed(1, 42, 0x2000, &[], false).await.unwrap();
+            let mut drain = b
+                .drain_committed(StashResolved::nothing_stashed(1), 42, 0x2000, &[], false)
+                .await
+                .unwrap();
             let batch = drain
                 .next_batch(8, usize::MAX, None)
                 .await
@@ -733,7 +751,10 @@ mod tests {
         let resolver = ToastResolver::disabled();
         let mut planner =
             Planner::create(tmp.path().join("1.plan"), 1 << 20, &mut view, &resolver).unwrap();
-        let mut drain = b.drain_committed(1, 42, 0x2000, &[], false).await.unwrap();
+        let mut drain = b
+            .drain_committed(StashResolved::nothing_stashed(1), 42, 0x2000, &[], false)
+            .await
+            .unwrap();
         while let Some(batch) = drain.next_batch(8, usize::MAX, None).await.unwrap() {
             planner.plan_batch(batch).await.unwrap();
         }

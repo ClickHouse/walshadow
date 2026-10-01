@@ -38,10 +38,16 @@ pub struct TailParts {
 }
 
 impl TailParts {
-    /// Await the drain cascade. Call only after every producer-held `msg_tx`
-    /// and `AckHandle` clone has dropped, else the batcher never sees its
-    /// channel close and this hangs.
-    pub async fn join(self) {
+    /// Drop the spawn-returned producer handles, then await the drain
+    /// cascade. Hangs while any clone handed to a producer stays alive
+    pub async fn close(self, msg_tx: mpsc::Sender<BatcherMsg>, ack: AckHandle) {
+        drop(msg_tx);
+        drop(ack);
+        self.join().await;
+    }
+
+    /// Await the drain cascade once every producer handle has dropped
+    pub(super) async fn join(self) {
         let _ = self.batcher.await;
         for h in self.resolvers {
             let _ = h.await;
@@ -64,9 +70,7 @@ impl TailParts {
         fatal: &Fatal,
     ) -> Result<(), String> {
         flush_and_prove(&msg_tx, &ack, through, fatal).await?;
-        drop(msg_tx);
-        drop(ack);
-        self.join().await;
+        self.close(msg_tx, ack).await;
         if let Some(msg) = fatal.message() {
             return Err(msg);
         }
@@ -181,9 +185,7 @@ impl OwnedTail {
     /// down. Bounded by the inserters' retry policy (a CH outage trips their
     /// fatal, not a hang)
     pub async fn quiesce(self) {
-        drop(self.msg_tx);
-        drop(self.ack);
-        self.parts.join().await;
+        self.parts.close(self.msg_tx, self.ack).await;
     }
 }
 
@@ -227,13 +229,13 @@ pub fn spawn_null(
     let batcher = tokio::spawn(async move {
         while let Some(msg) = msg_rx.recv().await {
             match msg {
-                BatcherMsg::Row(r) => swallow_ack.acked(vec![(r.seq, 1)]),
+                BatcherMsg::Row(r) => swallow_ack.swallowed(vec![(r.seq, 1)]),
                 BatcherMsg::Rows(chunk) => {
                     let mut counts: HashMap<u64, u64> = HashMap::new();
                     for r in &chunk.rows {
                         *counts.entry(r.seq).or_insert(0) += 1;
                     }
-                    swallow_ack.acked(counts.into_iter().collect());
+                    swallow_ack.swallowed(counts.into_iter().collect());
                 }
                 BatcherMsg::FlushAll(reply) => {
                     let _ = reply.send(());

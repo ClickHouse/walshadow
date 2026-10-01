@@ -193,7 +193,9 @@ async fn cold_restart_drop_retires_mirror() {
     );
     pipeline
         .resume_floor
-        .join(walshadow::pos::Pos::new(u64::MAX));
+        .publish(walshadow::pos::Durable::assume_for_test(
+            walshadow::pos::Pos::new(u64::MAX),
+        ));
     let driver = fx::spawn_workload(
         &source,
         vec![

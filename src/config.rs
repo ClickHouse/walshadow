@@ -334,24 +334,36 @@ pub struct ConfigResolver {
     /// exclusions applied.
     opt_in_total: AtomicU64,
     opt_out_total: AtomicU64,
-    /// TOAST heaps shadow can replay, set after filter loads replay eligibility
-    /// Unset outside shadow mode, which reads values from destination mirror
-    shadow_toast: std::sync::OnceLock<ShadowHeld>,
+    shadow_toast: Option<ShadowHeld>,
+}
+
+/// State fixed before the pump consumes WAL
+#[derive(Default)]
+pub struct ResolverBoot {
+    /// Source PG's config tables (`SELECT *` seed, §7). Later writes arrive
+    /// off the WAL stream, so no seed may replace the overlay after boot
+    pub overlay: ConfigOverlay,
+    /// TOAST heaps shadow can replay. `None` outside shadow mode, which reads
+    /// values from destination mirror
+    pub shadow_toast: Option<ShadowHeld>,
 }
 
 impl ConfigResolver {
     /// Build from the boot-parsed [`EmitterConfig`] plus the CLI overlay.
     /// Returns the shared resolver and a receiver seeded with the initial
-    /// (overlay-empty) snapshot; call [`seed_overlay`](Self::seed_overlay)
-    /// before pump start to fold in the source-PG rows.
+    /// snapshot, `boot.overlay` folded in.
     pub fn new(
         base: &EmitterConfig,
         cli: CliOverrides,
         toml_path: Option<PathBuf>,
         cli_base: toml::Table,
         mapping: MappingHandle,
+        boot: ResolverBoot,
     ) -> (Arc<Self>, watch::Receiver<Arc<ResolvedConfig>>) {
-        let overlay = ConfigOverlay::default();
+        let ResolverBoot {
+            overlay,
+            shadow_toast,
+        } = boot;
         let opt_in = OptInState::default();
         let (initial, _) = Self::resolve(base, &overlay, &cli, &opt_in, &ColumnRules::default());
         let (tx, rx) = watch::channel(Arc::new(initial));
@@ -371,19 +383,14 @@ impl ConfigResolver {
             pending_decl: AtomicU64::new(0),
             opt_in_total: AtomicU64::new(0),
             opt_out_total: AtomicU64::new(0),
-            shadow_toast: std::sync::OnceLock::new(),
+            shadow_toast,
         });
         (this, rx)
     }
 
-    /// Set shadow TOAST eligibility once, before first opt-in
-    pub fn bind_shadow_toast(&self, held: ShadowHeld) {
-        let _ = self.shadow_toast.set(held);
-    }
-
     /// `None` unless `[toast] mode = "shadow"`
     pub fn shadow_toast(&self) -> Option<&ShadowHeld> {
-        self.shadow_toast.get()
+        self.shadow_toast.as_ref()
     }
 
     /// Another receiver on the same channel.
@@ -418,13 +425,6 @@ impl ConfigResolver {
     /// Cumulative `replicate=false` / `TableRemoved` exclusions applied.
     pub fn opt_out_total(&self) -> u64 {
         self.opt_out_total.load(Ordering::Relaxed)
-    }
-
-    /// Replace the overlay wholesale (boot `SELECT *` seed, §7) and republish.
-    pub async fn seed_overlay(&self, overlay: ConfigOverlay) {
-        let mut inner = self.inner.lock().await;
-        inner.overlay = overlay;
-        self.republish(&inner).await;
     }
 
     /// Apply one WAL-driven config event at its commit LSN (§6). Mutates the
@@ -1514,6 +1514,7 @@ mod tests {
             None,
             toml::Table::new(),
             mapping.clone(),
+            ResolverBoot::default(),
         );
         resolver
             .materialize_opt_in(&rel_desc("public", "events"), None, None)
@@ -1543,6 +1544,7 @@ mod tests {
             None,
             toml::Table::new(),
             mapping.clone(),
+            ResolverBoot::default(),
         );
         let rel = RelName::new("public", "events");
         assert!(rx.borrow().tables.contains_key(&rel));
@@ -1577,6 +1579,7 @@ mod tests {
             None,
             toml::Table::new(),
             mapping.clone(),
+            ResolverBoot::default(),
         );
         let rel = RelName::new("public", "auto");
         resolver
@@ -1615,6 +1618,7 @@ mod tests {
             None,
             toml::Table::new(),
             mapping.clone(),
+            ResolverBoot::default(),
         );
         let rel = RelName::new("public", "events");
         resolver
@@ -1656,6 +1660,7 @@ mod tests {
             None,
             toml::Table::new(),
             mapping.clone(),
+            ResolverBoot::default(),
         );
         let mut desc = rel_desc("public", "events");
         desc.attributes.push(RelAttr {
@@ -1927,6 +1932,7 @@ mod tests {
             None,
             toml::Table::new(),
             mapping,
+            ResolverBoot::default(),
         );
         let upsert = |ty: &str| ConfigEvent::ColumnUpserted {
             rel: RelName::new("public", "t"),
@@ -1980,6 +1986,7 @@ mod tests {
             None,
             toml::Table::new(),
             mapping,
+            ResolverBoot::default(),
         );
         let rel = RelName::new("app", "later");
         resolver
@@ -1995,15 +2002,6 @@ mod tests {
     async fn seed_and_apply_republish() {
         let base = base_with("retain");
         let mapping = dummy_handles();
-        let (resolver, mut rx) = ConfigResolver::new(
-            &base,
-            CliOverrides::default(),
-            None,
-            toml::Table::new(),
-            mapping,
-        );
-        assert_eq!(rx.borrow().drop_table_strategy, DropTableStrategy::Retain);
-
         let overlay = ConfigOverlay {
             global: Some(GlobalRow {
                 drop_table_strategy: Some("drop".into()),
@@ -2011,8 +2009,17 @@ mod tests {
             }),
             ..Default::default()
         };
-        resolver.seed_overlay(overlay).await;
-        assert!(rx.changed().await.is_ok());
+        let (resolver, mut rx) = ConfigResolver::new(
+            &base,
+            CliOverrides::default(),
+            None,
+            toml::Table::new(),
+            mapping,
+            ResolverBoot {
+                overlay,
+                ..Default::default()
+            },
+        );
         assert_eq!(
             rx.borrow_and_update().drop_table_strategy,
             DropTableStrategy::Drop
@@ -2038,6 +2045,7 @@ mod tests {
             None,
             toml::Table::new(),
             mapping,
+            ResolverBoot::default(),
         );
         resolver.reload().await.unwrap();
         assert_eq!(rx.borrow().drop_table_strategy, DropTableStrategy::Retain);
@@ -2162,6 +2170,7 @@ mod tests {
             Some(path.clone()),
             toml::Table::new(),
             dummy_handles(),
+            ResolverBoot::default(),
         );
         assert_eq!(rx.borrow_and_update().source.host, "pg-a");
 
@@ -2189,6 +2198,7 @@ mod tests {
             Some(path.clone()),
             toml::Table::new(),
             dummy_handles(),
+            ResolverBoot::default(),
         );
         let billing_rels = |rx: &mut watch::Receiver<Arc<ResolvedConfig>>| {
             let snap = rx.borrow_and_update();
@@ -2267,6 +2277,7 @@ mod tests {
             Some(path.clone()),
             toml::Table::new(),
             dummy_handles(),
+            ResolverBoot::default(),
         );
         let held = resolver.inner.lock().await;
         let queued = tokio::spawn({

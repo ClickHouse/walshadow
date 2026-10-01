@@ -1,6 +1,6 @@
 //! Catalog-boundary publication hold.
 //!
-//! At the commit of a catalog-mutating xact ([`Record::catalog_boundary`],
+//! At the commit of a catalog-mutating xact ([`Record::boundary_info`],
 //! stamped by the pump classifier) the pump must not publish successor
 //! bytes until shadow replays through the commit's `next_lsn`
 //! (PG `EndRecPtr`). [`BoundaryHoldSink`] enforces this by blocking inside
@@ -32,6 +32,7 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::Mutex;
 
+use crate::catalog::shadow_catalog::ParkedAt;
 use crate::pos::{Pos, ShadowReplay};
 use crate::record::{BoundaryKind, Record, RecordSink, SinkError};
 use crate::source::catalog_capture::CaptureSet;
@@ -105,7 +106,7 @@ impl CatalogBoundaryGate {
         commit_lsn: u64,
         next_lsn: Pos<ShadowReplay>,
         worker_alive: impl Fn() -> bool,
-    ) -> Result<(), SinkError> {
+    ) -> Result<ParkedAt, SinkError> {
         let applied = self.state.lock().await.applied();
         let start = Instant::now();
         let held = loop {
@@ -145,10 +146,10 @@ impl CatalogBoundaryGate {
             held = ?held,
             "catalog boundary released",
         );
-        Ok(())
+        Ok(ParkedAt::new(next_lsn.get()))
     }
 
-    fn fail(&self, msg: String) -> Result<(), SinkError> {
+    fn fail<T>(&self, msg: String) -> Result<T, SinkError> {
         self.stats.failures.fetch_add(1, Ordering::Relaxed);
         Err(SinkError::Other(msg))
     }
@@ -219,26 +220,21 @@ impl RecordSink for BoundaryHoldSink {
             if let Some(members) = &record.aborted_tree {
                 self.capture.forget_aborted(members);
             }
-            if !record.catalog_boundary {
+            let Some(info) = &record.boundary_info else {
                 return self.inner.on_record(record).await;
-            }
-            let boundary = record.boundary_info.clone();
-            let park = match &boundary {
-                Some(info) if !self.capture.is_empty() => {
-                    self.capture.admits(info, record.next_lsn)
-                }
+            };
+            let park = if self.capture.is_empty() {
                 // Without capture, wait only for commits that change more than statistics
-                Some(info) => matches!(info.kind, BoundaryKind::Commit) && !info.stats_only,
-                None => true,
+                matches!(info.kind, BoundaryKind::Commit) && !info.stats_only
+            } else {
+                self.capture.admits(info, record.next_lsn)
             };
             if !park {
                 // Save an empty batch so restart can replay this commit
                 // without reading catalog state from shadow
-                if let Some(info) = &boundary
-                    && matches!(info.kind, BoundaryKind::Commit)
-                {
+                if matches!(info.kind, BoundaryKind::Commit) {
                     self.capture
-                        .capture_boundary(info, record.source_lsn, record.next_lsn)
+                        .cover_unparked(info, record.source_lsn, record.next_lsn)
                         .await?;
                 }
                 return self.inner.on_record(record).await;
@@ -249,24 +245,25 @@ impl RecordSink for BoundaryHoldSink {
             self.inner.flush().await?;
             let inner = &self.inner;
             let parked = Instant::now();
-            if let Err(hold_err) = self
+            let held = self
                 .gate
                 .hold(record.source_lsn, Pos::new(record.next_lsn), || {
                     inner.worker_alive()
                 })
-                .await
-            {
-                // Prefer the worker's parked root cause over the generic
-                // hold error (empty-buffer flush only drains the err slot)
-                self.inner.flush().await?;
-                return Err(hold_err);
-            }
-            if let Some(info) = &boundary {
-                self.capture.charge_hold(info, parked.elapsed());
-                self.capture
-                    .capture_boundary(info, record.source_lsn, record.next_lsn)
-                    .await?;
-            }
+                .await;
+            let held = match held {
+                Ok(held) => held,
+                Err(hold_err) => {
+                    // Prefer the worker's parked root cause over the generic
+                    // hold error (empty-buffer flush only drains the err slot)
+                    self.inner.flush().await?;
+                    return Err(hold_err);
+                }
+            };
+            self.capture.charge_hold(info, parked.elapsed());
+            self.capture
+                .capture_boundary(info, record.source_lsn, &held)
+                .await?;
             self.inner.on_record(record).await?;
             // Ship the commit immediately: the drain (and its CH effects)
             // must not wait out the accumulator
@@ -465,7 +462,7 @@ mod tests {
 
     #[tokio::test]
     async fn sink_parks_only_at_catalog_boundary() {
-        // DML-only records (catalog_boundary = false) pass straight
+        // DML-only records (no boundary_info) pass straight
         // through with no shadow connection and no timeout
         let s = state();
         let q = QueueingRecordSink::spawn(CountingRecordSink::default(), 4, 16, None);
@@ -493,7 +490,6 @@ mod tests {
         let rec = Record {
             source_lsn: 0x1F00,
             next_lsn: 0x2000,
-            catalog_boundary: true,
             boundary_info: Some(Arc::new(crate::record::BoundaryInfo {
                 kind: BoundaryKind::Command { writer_xid: 7 },
                 ..Default::default()
@@ -519,7 +515,6 @@ mod tests {
         let rec = Record {
             source_lsn: 0x1F00,
             next_lsn: 0x2000,
-            catalog_boundary: true,
             boundary_info: Some(Arc::new(stub)),
             ..Default::default()
         };
@@ -568,7 +563,7 @@ mod tests {
         let rec = Record {
             source_lsn: 0x1F00,
             next_lsn: 0x2000,
-            catalog_boundary: true,
+            boundary_info: Some(Arc::new(crate::record::BoundaryInfo::default())),
             ..Default::default()
         };
         sink.on_record(&rec).await.expect("boundary releases");
@@ -612,7 +607,7 @@ mod tests {
         let rec = Record {
             source_lsn: 0x1F00,
             next_lsn: 0x2000,
-            catalog_boundary: true,
+            boundary_info: Some(Arc::new(crate::record::BoundaryInfo::default())),
             ..Default::default()
         };
         let err = sink.on_record(&rec).await.expect_err("must fail");

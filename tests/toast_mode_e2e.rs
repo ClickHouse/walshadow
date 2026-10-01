@@ -171,7 +171,7 @@ async fn unchanged_toast_pointer_resolves_out_of_shadow() {
     assert!(
         pipeline
             .stream
-            .filter_mut()
+            .filter()
             .shadow_rels()
             .is_some_and(|rels| rels.contains(&(db_oid, toast_filenode))),
         "shadow mode must route the TOAST relation's records to shadow",
@@ -288,7 +288,7 @@ async fn unchanged_toast_pointer_fills_null_without_store() {
     .await;
 
     assert!(
-        pipeline.stream.filter_mut().shadow_rels().is_none(),
+        pipeline.stream.filter().shadow_rels().is_none(),
         "disabled mode must not replay user heaps on shadow",
     );
 

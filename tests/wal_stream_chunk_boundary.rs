@@ -168,7 +168,7 @@ async fn shadow_stream_sink_receives_byte_exact_wire_stream() {
     let bytes = load_segment(&path).await.expect("load fixture");
     let seg_size = bytes.len() as u64;
 
-    let mut stream = WalStream::new(1, seg_size, Pos::ZERO).expect("stream new");
+    let mut stream = WalStream::builder(1, seg_size, Pos::ZERO).expect("stream new");
     let mut rec_sink = CollectingRecordSink::default();
     let mut seg_sink = CollectingSegmentSink::default();
 
@@ -186,6 +186,7 @@ async fn shadow_stream_sink_receives_byte_exact_wire_stream() {
     let sink = ShadowStreamSink::new(state.clone());
     stream.set_bytes_sink(Box::new(sink));
 
+    let mut stream = stream.start();
     for (i, b) in bytes.iter().enumerate() {
         stream
             .push(

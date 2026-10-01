@@ -3091,6 +3091,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "wal-rus",
+ "walshadow",
  "zstd",
 ]
 

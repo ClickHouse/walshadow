@@ -123,7 +123,7 @@ async fn retained_routes_prevent_invalid_page_recovery_after_resume() {
     };
     let bytes = fs::read(raw.join(seg.format())).unwrap();
     for (sh, durable) in [(&bad, false), (&good, true)] {
-        let mut stream = WalStream::new(1, WAL_SEG_SIZE, Pos::new(resume)).unwrap();
+        let mut stream = WalStream::builder(1, WAL_SEG_SIZE, Pos::new(resume)).unwrap();
         if durable {
             stream
                 .filter_mut()
@@ -143,6 +143,7 @@ async fn retained_routes_prevent_invalid_page_recovery_after_resume() {
             .unwrap();
         let mut records = CollectingRecordSink::default();
         let mut sink = DirSegmentSink::new(sh.config().filter_out_dir.clone()).unwrap();
+        let mut stream = stream.start();
         stream
             .push(resume, &bytes, &mut records, &mut sink)
             .await

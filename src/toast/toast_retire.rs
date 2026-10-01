@@ -130,6 +130,7 @@ impl RetireLedger {
         self.entries
             .iter()
             .copied()
+            // Restart resumes at the floor, so a commit below it never replays
             .filter(|&(_, commit_lsn)| commit_lsn.retag() < cut)
             .collect()
     }

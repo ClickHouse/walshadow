@@ -73,8 +73,8 @@ impl DbLink {
             socket = %bridge.path().display(),
             dbname = %cfg.name,
             workers = bridge.pool_size(),
-            pg_version = info.map(|i| i.pg_version_num).unwrap_or(0),
-            in_recovery = info.map(|i| i.in_recovery).unwrap_or(false),
+            pg_version = info.pg_version_num,
+            in_recovery = info.in_recovery,
             "bridge connected",
         );
         let cat_cfg = ShadowCatalogConfig::default();
@@ -92,16 +92,14 @@ impl DbLink {
             .current_database_oid()
             .await
             .with_context(|| format!("shadow database oid for {}", cfg.name))?;
-        if let Some(hello) = info {
-            anyhow::ensure!(
-                hello.datid == oid,
-                "bridge socket {} serves database oid {}, but {} is oid {oid}; \
-                 shadow's walshadow.databases disagrees with this config",
-                bridge.path().display(),
-                hello.datid,
-                cfg.name,
-            );
-        }
+        anyhow::ensure!(
+            info.datid == oid,
+            "bridge socket {} serves database oid {}, but {} is oid {oid}; \
+             shadow's walshadow.databases disagrees with this config",
+            bridge.path().display(),
+            info.datid,
+            cfg.name,
+        );
         tracing::info!(
             target: "walshadow",
             conninfo = %cfg.shadow_conninfo,

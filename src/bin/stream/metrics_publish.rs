@@ -284,7 +284,7 @@ pub(crate) async fn populate_metrics(
         pause_consumed_lsn: timeline_view.pause_frontier.map_or(0, |(c, _)| c),
         pause_received_lsn: timeline_view.pause_frontier.map_or(0, |(_, r)| r),
         pause_refrozen: timeline_view.pause_refrozen,
-        promotion_ready: timeline_view.promotion.ready,
+        promotion_ready: timeline_view.promotion.ready(),
         promotion_blocked_on: timeline_view.promotion.blocked_on,
         promotion_target_in_recovery: timeline_view.promotion.in_recovery,
         promotion_target_replay_lsn: timeline_view.promotion.replay_lsn,
