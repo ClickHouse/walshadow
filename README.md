@@ -1,14 +1,3 @@
-# walshadow
-
-> [!WARNING]
-> **Experimental**
->
-> **Project status: Development Preview**
->
-> walshadow is under active development and being hardened through real-world
-> testing and feedback. We recommend validating it thoroughly with your
-> workloads. Interfaces and behavior may evolve
-
 walshadow replicates PostgreSQL rows into ClickHouse from physical WAL,
 including initial load, continuous changes, schema evolution, restarts, and
 planned source switchover

@@ -15,8 +15,10 @@ move DNS
 - required WAL remains available
 - when using slots, target already has physical slot covering resume position
 
-Physical slots are not synchronized to standbys. Create target slot before
-switchover with storage and WAL coverage appropriate for deployment
+Physical slots are not necessary when using object storage, since archive
+covers WAL retention. Physical slots are not synchronized to standbys. Create
+target slot before switchover with storage and WAL coverage appropriate for
+deployment
 
 ## Procedure
 

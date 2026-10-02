@@ -124,7 +124,9 @@ position. Reserve them for recovery drills or operator-directed rebuilds
 
 ## Retain source WAL
 
-Configure a physical replication slot for routine deployments:
+Configure a physical replication slot when not using object storage. With
+object storage, archive already covers WAL retention and slots are not
+necessary:
 
 ```sql
 SELECT pg_create_physical_replication_slot('walshadow');
@@ -143,9 +145,9 @@ immediately. `init` reports SQL above so slot can exist before daemon starts
 Live source moves never create target slot because a new slot cannot protect
 earlier resume position. Pre-create target slot before planned switchover
 
-Without slot, ensure `wal_keep_size` or continuous archive covers worst-case
-outage and backlog. Missing source WAL stops replication rather than skipping
-data
+Without slot, ensure object-storage archive or `wal_keep_size` covers
+worst-case outage and backlog. Missing source WAL stops replication rather
+than skipping data
 
 ## ClickHouse interruptions
 
