@@ -67,6 +67,7 @@ async fn build_drill_with(
         NamespaceMapping {
             target_database: Some("walshadow_test".into()),
             auto_create: true,
+            auto_create_prefix: Some(String::new()),
             drop_table_strategy: None,
             initial_load: None,
         },

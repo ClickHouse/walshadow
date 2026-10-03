@@ -88,6 +88,7 @@ impl std::fmt::Display for TableTarget {
 pub struct NamespaceMapping {
     pub target_database: Option<String>,
     pub auto_create: bool,
+    pub auto_create_prefix: Option<String>,
     pub drop_table_strategy: Option<DropTableStrategy>,
     pub initial_load: Option<InitialLoadMode>,
 }

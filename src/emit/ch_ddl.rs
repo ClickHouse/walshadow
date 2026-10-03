@@ -52,6 +52,9 @@ use tokio_postgres::types::Oid;
 /// from a republished [`ResolvedConfig`] snapshot at each apply, so SIGHUP
 /// (and the future overlay) retarget namespaces + drop strategy without a
 /// restart.
+/// Prefix derived destination names carry when a namespace sets none
+pub const DEFAULT_AUTO_CREATE_PREFIX: &str = "public_";
+
 #[derive(Debug, Clone)]
 pub struct DdlConfig {
     pub drop_table_strategy: DropTableStrategy,
@@ -118,6 +121,16 @@ impl DdlConfig {
             .unwrap_or(&self.target_database)
     }
 
+    /// Prefix a derived destination name carries; an explicit `target_table`
+    /// names the destination outright and is never prefixed. `""` opts a
+    /// namespace back into bare source names
+    fn auto_create_prefix_for(&self, namespace: &str) -> &str {
+        self.namespaces
+            .get(namespace)
+            .and_then(|n| n.auto_create_prefix.as_deref())
+            .unwrap_or(DEFAULT_AUTO_CREATE_PREFIX)
+    }
+
     fn drop_strategy_for(&self, namespace: &str) -> DropTableStrategy {
         self.namespaces
             .get(namespace)
@@ -136,10 +149,13 @@ impl DdlConfig {
                 .target_database
                 .clone()
                 .unwrap_or_else(|| self.target_database_for(&rel.namespace).to_owned()),
-            table: settings
-                .target_table
-                .clone()
-                .unwrap_or_else(|| rel.name.to_string()),
+            table: settings.target_table.clone().unwrap_or_else(|| {
+                format!(
+                    "{}{}",
+                    self.auto_create_prefix_for(&rel.namespace),
+                    rel.name
+                )
+            }),
         }
     }
 
@@ -1229,6 +1245,74 @@ mod tests {
         assert!(!is_system_namespace("public", Some("walshadow")));
     }
 
+    fn namespaces_with_bare_prefix(cfg: &mut DdlConfig) {
+        cfg.namespaces.insert(
+            "audit".to_string(),
+            crate::mapping::NamespaceMapping {
+                target_database: None,
+                auto_create: true,
+                auto_create_prefix: Some(String::new()),
+                drop_table_strategy: None,
+                initial_load: None,
+            },
+        );
+    }
+
+    #[test]
+    fn auto_create_prefix_names_derived_destinations_only() {
+        use crate::mapping::NamespaceMapping;
+        use ahash::{HashMap, HashMapExt};
+        let mut namespaces = HashMap::new();
+        namespaces.insert(
+            "public".to_string(),
+            NamespaceMapping {
+                target_database: None,
+                auto_create: true,
+                auto_create_prefix: Some("public_".into()),
+                drop_table_strategy: None,
+                initial_load: None,
+            },
+        );
+        let mut cfg = DdlConfig {
+            drop_table_strategy: DropTableStrategy::Retain,
+            auto_create_namespaces: HashSet::new(),
+            replicate_all: false,
+            runtime_config_schema: None,
+            target_database: "default".into(),
+            namespaces,
+            soft_delete: false,
+            system: Arc::default(),
+            rules: Arc::default(),
+            column_rules: Arc::default(),
+        };
+        let derived = cfg.create_target(&TableRule::default(), &RelName::new("public", "orders"));
+        assert_eq!(derived.database, "default");
+        assert_eq!(derived.table, "public_orders");
+
+        let pinned = cfg.create_target(
+            &TableRule {
+                target_table: Some("orders_v2".into()),
+                ..TableRule::default()
+            },
+            &RelName::new("public", "orders"),
+        );
+        assert_eq!(
+            pinned.table, "orders_v2",
+            "an explicit target_table names the destination outright",
+        );
+
+        let unconfigured =
+            cfg.create_target(&TableRule::default(), &RelName::new("audit", "orders"));
+        assert_eq!(
+            unconfigured.table, "public_orders",
+            "a namespace that sets no prefix takes the default",
+        );
+
+        namespaces_with_bare_prefix(&mut cfg);
+        let bare = cfg.create_target(&TableRule::default(), &RelName::new("audit", "orders"));
+        assert_eq!(bare.table, "orders", "an empty prefix opts out");
+    }
+
     #[test]
     fn per_namespace_target_and_drop_override_global() {
         use crate::mapping::NamespaceMapping;
@@ -1239,6 +1323,7 @@ mod tests {
             NamespaceMapping {
                 target_database: Some("warehouse".into()),
                 auto_create: true,
+                auto_create_prefix: None,
                 drop_table_strategy: Some(DropTableStrategy::Drop),
                 initial_load: None,
             },
@@ -1248,6 +1333,7 @@ mod tests {
             NamespaceMapping {
                 target_database: None,
                 auto_create: true,
+                auto_create_prefix: None,
                 drop_table_strategy: None,
                 initial_load: None,
             },
@@ -1387,7 +1473,7 @@ mod tests {
         assert!(cfg.auto_creates(&events));
         assert_eq!(
             cfg.create_target(&cfg.rules.settings(&events), &events),
-            TableTarget::new("warehouse", "events_1")
+            TableTarget::new("warehouse", "public_events_1")
         );
         assert_eq!(
             cfg.declared_scope(&RelName::new("app", "events_audit")),
@@ -1405,7 +1491,7 @@ mod tests {
         let other = RelName::new("other", "t");
         assert_eq!(
             cfg.create_target(&cfg.rules.settings(&other), &other),
-            TableTarget::new("default", "t")
+            TableTarget::new("default", "public_t")
         );
         let settings = cfg.rules.settings(&other);
         assert_eq!(
@@ -2244,7 +2330,7 @@ mod tests {
         let empty = MappingSnapshot::default();
         let predicted = predict_route_effect(&cfg, &empty, &added, false).unwrap();
         assert!(
-            matches!(&predicted, Some((r, Some(m))) if &*r.name == "fresh" && m.target.table == "fresh"),
+            matches!(&predicted, Some((r, Some(m))) if &*r.name == "fresh" && m.target.table == "public_fresh"),
             "{predicted:?}"
         );
         assert!(

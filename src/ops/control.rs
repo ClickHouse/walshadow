@@ -432,7 +432,11 @@ fn status_tables(root: &Table, db: &str, ch_database: &str) -> Vec<Value> {
             let database = block_str("target_database")
                 .or_else(|| namespace_str(root, db, ns, "target_database"))
                 .unwrap_or_else(|| ch_database.to_owned());
-            let table = block_str("target_table").unwrap_or_else(|| rel.to_owned());
+            let table = block_str("target_table").unwrap_or_else(|| {
+                let prefix = namespace_str(root, db, ns, "auto_create_prefix")
+                    .unwrap_or_else(|| crate::ch_ddl::DEFAULT_AUTO_CREATE_PREFIX.to_owned());
+                format!("{prefix}{rel}")
+            });
             let initial_load = block_str("initial_load")
                 .or_else(|| namespace_str(root, db, ns, "initial_load"))
                 .unwrap_or_else(|| "none".into());
@@ -868,7 +872,8 @@ mod tests {
         let orders = entry("app.public.orders");
         assert_eq!(
             orders.get("destination_table").and_then(Value::as_str),
-            Some("cdc.orders")
+            Some("cdc.public_orders"),
+            "a derived name carries the default auto_create_prefix",
         );
         assert_eq!(
             orders.get("initial_load").and_then(Value::as_str),

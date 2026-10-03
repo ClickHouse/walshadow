@@ -215,6 +215,7 @@ async fn create_table_auto_replicates_in_namespace() {
         NamespaceMapping {
             target_database: Some("walshadow_test".into()),
             auto_create: true,
+            auto_create_prefix: Some(String::new()),
             drop_table_strategy: None,
             initial_load: None,
         },
@@ -313,6 +314,7 @@ async fn drop_table_strategy_drop_removes_dest() {
         NamespaceMapping {
             target_database: Some("walshadow_test".into()),
             auto_create: true,
+            auto_create_prefix: Some(String::new()),
             drop_table_strategy: None,
             initial_load: None,
         },
@@ -552,6 +554,7 @@ async fn auto_create_honors_per_namespace_target_database() {
         NamespaceMapping {
             target_database: Some("warehouse".into()),
             auto_create: true,
+            auto_create_prefix: Some(String::new()),
             drop_table_strategy: None,
             initial_load: None,
         },
