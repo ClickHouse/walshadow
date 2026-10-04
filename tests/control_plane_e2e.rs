@@ -1536,6 +1536,132 @@ async fn switchover_crosses_fork_and_keeps_every_row() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unpaused_switchover_stops_promptly_and_crosses_at_the_switchpoint() {
+    check_unpaused_switchover(SwitchoverMode::Repoint).await;
+}
+
+/// With archiving enabled, shutdown starts a new segment for its checkpoint.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn archiving_switchover_crosses_a_fork_segment_with_no_transactions() {
+    check_unpaused_switchover(SwitchoverMode::Archiving).await;
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SwitchoverMode {
+    Repoint,
+    Archiving,
+    SameAddress,
+}
+
+async fn check_unpaused_switchover(mode: SwitchoverMode) {
+    if !gated() {
+        return;
+    }
+    let mut h = Harness::up(&fx::Ports::alloc())
+        .await
+        .expect("bring up harness");
+    let mut target = None;
+    let mut moved = None;
+    let result = async {
+        h.wait_ch(USER_EMAIL, "alice@seed", Duration::from_secs(30))
+            .await
+            .context("seed row backfills")?;
+        if mode == SwitchoverMode::Archiving {
+            h.wait_log(
+                "walsender connected — starting pump",
+                Duration::from_secs(60),
+            )
+            .await
+            .context("pump never started")?;
+            h.psql("ALTER SYSTEM SET archive_mode = on")?;
+            h.psql("ALTER SYSTEM SET archive_command = 'true'")?;
+            h.source.stop().context("stop source to enable archiving")?;
+            h.source.start().context("restart source with archiving")?;
+        }
+        let promoted = target.insert(h.promotion_target()?);
+        h.psql("UPDATE demo.users SET email = 'pre-switchover@x' WHERE id = 1")?;
+        h.psql("INSERT INTO demo.users VALUES (2, 'bob', 'below-fork@x')")?;
+        h.wait_ch(SECOND_EMAIL, "below-fork@x", Duration::from_secs(60))
+            .await
+            .context("row sent through WAL never reached ClickHouse")?;
+
+        let stopping = Instant::now();
+        h.source.stop().context("stop source primary")?;
+        ensure!(
+            stopping.elapsed() < Duration::from_secs(20),
+            "fast shutdown waited {:?} on walshadow's walsender",
+            stopping.elapsed(),
+        );
+        let checkpoint = controldata_checkpoint_lsn(&h.source.config().data_dir)?;
+        if mode == SwitchoverMode::Archiving {
+            ensure!(
+                checkpoint % WAL_SEG_SIZE <= 0x28,
+                "shutdown checkpoint at {checkpoint:#X} does not open a segment",
+            );
+        }
+        // Wait until standby replays checkpoint record, so promotion cannot
+        // fork before WAL already read by walshadow.
+        promoted
+            .wait_for_replay(checkpoint + 1, Duration::from_secs(30))
+            .context("target never replayed the shutdown checkpoint")?;
+        // Promote before reusing address so reconnect sees a primary.
+        promote(promoted)?;
+        let primary = if mode == SwitchoverMode::SameAddress {
+            moved.insert(take_over_source_address(&h, promoted)?)
+        } else {
+            apply_repoint(&h, promoted)?;
+            promoted
+        };
+        h.wait_metric(
+            "walshadow_timeline_switches_total",
+            1,
+            Duration::from_secs(60),
+        )
+        .await
+        .context("reconnect at branch end did not switch timelines")?;
+        if mode == SwitchoverMode::SameAddress {
+            ensure!(
+                h.daemon_log()
+                    .lines()
+                    .any(|line| line.contains("source reconnected")
+                        && line.contains("resume_point=AtSwitchpoint")),
+                "reconnect did not reach branch end:\n{}",
+                h.daemon_log(),
+            );
+        }
+        ensure!(
+            !h.daemon_log().contains("sits past the fork"),
+            "reconnect rejected branch end:\n{}",
+            h.daemon_log(),
+        );
+        primary.psql_one("UPDATE demo.users SET email = 'after-promote@x' WHERE id = 1")?;
+        h.wait_ch(USER_EMAIL, "after-promote@x", Duration::from_secs(60))
+            .await
+            .context("write after promotion never reached ClickHouse")?;
+        ensure!(
+            h.metric("walshadow_source_timeline")? == 2,
+            "still reading previous timeline"
+        );
+        let log = h.shadow_log();
+        ensure!(
+            !log.contains("PANIC"),
+            "shadow log contains a PANIC:\n{log}"
+        );
+        ensure!(h.alive(), "daemon exited while switching timelines");
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+
+    let stderr = h.teardown();
+    if let Some(primary) = moved.or(target) {
+        let _ = primary.stop();
+    }
+    if let Err(e) = result {
+        panic!("{e:#}\n--- daemon stderr ---\n{stderr}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn archive_crosses_forks_when_ancestor_segments_are_partial_and_slot_is_ahead() {
     if !gated() {
         return;
@@ -2534,6 +2660,13 @@ async fn promotion_under_a_stable_endpoint_crosses_without_a_repoint() {
     if let Err(e) = result {
         panic!("{e:#}\n--- daemon stderr ---\n{stderr}");
     }
+}
+
+/// Keep walshadow running through shutdown, then promote standby at same address.
+/// Reconnecting at branch end must switch timelines without restarting walshadow.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reconnect_at_the_switchpoint_crosses_without_a_restart() {
+    check_unpaused_switchover(SwitchoverMode::SameAddress).await;
 }
 
 /// Restart the promotion target on the stopped primary's socket path and port,
