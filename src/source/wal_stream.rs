@@ -285,12 +285,14 @@ impl WalStream {
             cur_lsn += take as u64;
             data = &data[take..];
 
-            if let Err(e) = self.drain_records(record_sink).await {
-                self.poisoned = true;
-                return Err(e);
-            }
-
+            // Drain again after sealing each segment. PostgreSQL may send
+            // XLOG_SWITCH and a shutdown checkpoint in one final chunk,
+            // leaving no later push to process records in next segment.
             loop {
+                if let Err(e) = self.drain_records(record_sink).await {
+                    self.poisoned = true;
+                    return Err(e);
+                }
                 match self.try_flush_first_segment(segment_sink).await {
                     Ok(true) => continue,
                     Ok(false) => break,
@@ -1418,6 +1420,26 @@ mod tests {
         ws.push(0, &page, &mut rec, &mut seg).await.unwrap();
         assert_eq!(rec.records[0].source_lsn, 40);
         assert_eq!(rec.records[0].next_lsn, SEG);
+    }
+
+    /// Process both records when one chunk contains XLOG_SWITCH and next
+    /// segment's first record, as can happen in final WAL sent during shutdown.
+    #[tokio::test(flavor = "current_thread")]
+    async fn push_dispatches_records_past_a_segment_it_seals() {
+        const SEG: u64 = 8192;
+        let switch = raw_rec(RmId::Xlog as u8, X_LOG_SWITCH, 0, None, None);
+        let mut bytes = page_of(std::slice::from_ref(&switch), SEG as usize);
+        bytes.extend(page_of(&[switch], SEG as usize));
+        let mut ws = WalStream::new(1, SEG, Pos::ZERO).unwrap();
+        let mut rec = CollectingRecordSink::default();
+        let mut seg = CollectingSegmentSink::default();
+        ws.push(0, &bytes[..64], &mut rec, &mut seg).await.unwrap();
+        ws.push(64, &bytes[64..SEG as usize + 64], &mut rec, &mut seg)
+            .await
+            .unwrap();
+        assert_eq!(seg.segments.len(), 1, "first segment sealed");
+        let starts: Vec<u64> = rec.records.iter().map(|r| r.source_lsn).collect();
+        assert_eq!(starts, [40, SEG + 40], "record in next segment processed");
     }
 
     /// Bare-DDL commit (catalog write + commit, no replicated rows) parks
