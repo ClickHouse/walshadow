@@ -188,17 +188,30 @@ struct StatusFloors {
     apply: Pos<ResumeSafe>,
 }
 
-/// PG assigns a physical slot's restart_lsn from flush unconditionally
-/// (`PhysicalConfirmReceivedLocation`), so a stale lower value walks the
-/// slot backwards, below recycled WAL it can read as invalidatable under
-/// max_slot_wal_keep_size. Hold each field at its own high-water.
-fn clamp_status(status: StandbyStatus, floors: &mut StatusFloors) -> StandbyStatus {
+/// PostgreSQL sets a physical slot's restart_lsn to any valid flush position
+/// (`PhysicalConfirmReceivedLocation`). Sending a lower value can move slot
+/// behind recycled WAL and make it eligible for invalidation under
+/// max_slot_wal_keep_size. Keep each field at its highest reported value.
+/// Report flush position only when it advances; otherwise send `InvalidXLogRecPtr`.
+/// PostgreSQL leaves slot's `restart_lsn` unchanged for an invalid flush position
+/// (`ProcessStandbyReplyMessage`).
+///
+/// During shutdown, `WalSndDone` waits for acknowledgement of all sent WAL.
+/// An invalid flush position makes it use `write`, as with pg_receivewal.
+/// Repeating a flush position at a segment boundary cannot acknowledge a shutdown
+/// checkpoint ending inside a segment, so source shutdown waits for sender timeout.
+fn prepare_status(status: StandbyStatus, floors: &mut StatusFloors) -> StandbyStatus {
+    let previous_flush = floors.flush;
     floors.write = status.write_lsn.max(floors.write);
     floors.flush = status.flush_lsn.max(floors.flush);
     floors.apply = status.apply_lsn.max(floors.apply);
     StandbyStatus {
         write_lsn: floors.write,
-        flush_lsn: floors.flush,
+        flush_lsn: if floors.flush > previous_flush {
+            floors.flush
+        } else {
+            Pos::ZERO
+        },
         apply_lsn: floors.apply,
     }
 }
@@ -452,7 +465,7 @@ impl SourceFeed {
     }
 
     async fn send_status(&mut self, status: StandbyStatus) -> Result<()> {
-        let held = clamp_status(status, &mut self.floors);
+        let held = prepare_status(status, &mut self.floors);
         let mut payload = build_status_update(
             held.write_lsn.get(),
             held.flush_lsn.get(),
@@ -685,10 +698,10 @@ mod tests {
     }
 
     #[test]
-    fn clamp_keeps_each_field_independent() {
+    fn status_keeps_each_field_independent() {
         let mut floors = StatusFloors::default();
         // leading write must not lift flush/apply
-        let held = clamp_status(
+        let held = prepare_status(
             StandbyStatus {
                 write_lsn: 3000.into(),
                 flush_lsn: 1000.into(),
@@ -698,7 +711,7 @@ mod tests {
         );
         assert_eq!(triple(held), (3000, 1000, 800));
         // higher flush/apply, same write: each rises from its own floor
-        let held = clamp_status(
+        let held = prepare_status(
             StandbyStatus {
                 write_lsn: 3000.into(),
                 flush_lsn: 1500.into(),
@@ -710,9 +723,9 @@ mod tests {
     }
 
     #[test]
-    fn clamp_never_regresses_a_field() {
+    fn status_retains_floors_when_inputs_regress() {
         let mut floors = StatusFloors::default();
-        clamp_status(
+        prepare_status(
             StandbyStatus {
                 write_lsn: 5000.into(),
                 flush_lsn: 4000.into(),
@@ -721,7 +734,7 @@ mod tests {
             &mut floors,
         );
         // stale lower values hold at prior floor
-        let held = clamp_status(
+        let held = prepare_status(
             StandbyStatus {
                 write_lsn: 4500.into(),
                 flush_lsn: 3000.into(),
@@ -729,7 +742,27 @@ mod tests {
             },
             &mut floors,
         );
-        assert_eq!(triple(held), (5000, 4000, 4000));
+        assert_eq!(triple(held), (5000, 0, 4000));
+        assert_eq!(floors.flush.get(), 4000);
+    }
+
+    /// Send an invalid flush position when unchanged, allowing shutdown to use
+    /// `write` for acknowledgement without moving slot's `restart_lsn`.
+    #[test]
+    fn status_reports_flush_only_when_it_advances() {
+        let mut floors = StatusFloors::default();
+        for (flush, expected) in [(0, 0), (2000, 2000), (2000, 0), (1000, 0), (3000, 3000)] {
+            let status = prepare_status(
+                StandbyStatus {
+                    write_lsn: 4000.into(),
+                    flush_lsn: flush.into(),
+                    apply_lsn: 0.into(),
+                },
+                &mut floors,
+            );
+            assert_eq!(status.flush_lsn.get(), expected);
+        }
+        assert_eq!(floors.flush.get(), 3000);
     }
 
     #[test]
