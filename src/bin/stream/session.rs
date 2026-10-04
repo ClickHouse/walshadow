@@ -63,9 +63,9 @@ use crate::source_db::{
 };
 use crate::source_recovery::{
     BARRIER_LOG_INTERVAL, FORK_FENCE_DRAIN, PROMOTION_POLL, PauseState, PromotionGate,
-    ReconnectBackoff, SOURCE_SWAP_RETRY, SourcePath, SourceRecovery, commit_fork_resume,
-    connect_source_waiting, promotion_gate, resume_manifest, resume_source_feed, stream_branch,
-    swap_reason,
+    ReconnectBackoff, ResumePoint, SOURCE_SWAP_RETRY, SourcePath, SourceRecovery,
+    commit_fork_resume, connect_source_waiting, promotion_gate, resume_manifest,
+    resume_source_feed, stream_branch, swap_reason,
 };
 
 pub(crate) async fn run_session(
@@ -1171,6 +1171,12 @@ pub(crate) async fn run_session(
         prefetch: usize::from(args.archive_prefetch),
         backoff: ReconnectBackoff::default(),
     };
+    let mut timeline_stats = TimelineStats {
+        // Off the chain, so a restart after a crossing keeps reporting the fork
+        // it resumed across instead of zero
+        switch_lsn: history.begin_of(start_timeline).unwrap_or(0),
+        ..TimelineStats::default()
+    };
     let mut path = SourcePath::Live;
     if let Err(e) = feed
         .start_physical_replication(
@@ -1181,7 +1187,14 @@ pub(crate) async fn run_session(
         .await
     {
         path = source_recovery
-            .attempt(Some(e), &source_conn, &history, &stream, &mut feed)
+            .attempt(
+                Some(e),
+                &source_conn,
+                &history,
+                &stream,
+                &mut feed,
+                &mut timeline_stats,
+            )
             .await?;
     }
 
@@ -1222,20 +1235,18 @@ pub(crate) async fn run_session(
         shadow_state: &shadow_state,
         backup: archive.as_ref(),
     };
-    let mut timeline_stats = TimelineStats {
-        // Off the chain, so a restart after a crossing keeps reporting the fork
-        // it resumed across instead of zero
-        switch_lsn: history.begin_of(start_timeline).unwrap_or(0),
-        ..TimelineStats::default()
-    };
     // The ancestor ended and the descendant has not been adopted yet. Survives
     // iterations so a source error mid-crossing retries the crossing: at the
     // ancestor's switchpoint an ordinary reconnect has nothing to ask for
     let mut crossing = CrossingState::default();
     let mut barrier_logged: Option<Instant> = None;
     let shutdown_reason = 'pump: loop {
-        // Nothing resumes at a switchpoint, not archive nor redial, only a crossing
-        if !matches!(path, SourcePath::Live)
+        // Switch timelines at a switchpoint. Reconnecting may find a switchpoint
+        // missing from `history`; use that connection to fetch updated history.
+        if matches!(path, SourcePath::AtSwitchpoint) {
+            path = SourcePath::Live;
+            crossing.ancestor_ended(false);
+        } else if !matches!(path, SourcePath::Live)
             && history.branch_exhausted(stream.timeline(), stream.next_lsn().get())
         {
             path = SourcePath::Live;
@@ -1266,7 +1277,14 @@ pub(crate) async fn run_session(
         // during an outage is what the next attempt dials
         if matches!(path, SourcePath::Redial) && source_recovery.backoff.due() {
             path = source_recovery
-                .attempt(None, &source_conn, &history, &stream, &mut feed)
+                .attempt(
+                    None,
+                    &source_conn,
+                    &history,
+                    &stream,
+                    &mut feed,
+                    &mut timeline_stats,
+                )
                 .await?;
             swap.settled();
         }
@@ -1290,15 +1308,21 @@ pub(crate) async fn run_session(
             )
             .await
             {
-                Ok(swapped) => {
+                Ok((swapped, point)) => {
                     feed = swapped;
-                    path = SourcePath::Live;
+                    path = match point {
+                        ResumePoint::OnBranch => SourcePath::Live,
+                        ResumePoint::AtSwitchpoint => SourcePath::AtSwitchpoint,
+                    };
                     swap.settled();
-                    swap.swaps += 1;
+                    if point == ResumePoint::OnBranch {
+                        swap.swaps += 1;
+                    }
                     tracing::info!(
                         target: "walshadow",
                         endpoint = source_conn.endpoint(),
                         resume_lsn = %stream.next_lsn(),
+                        resume_point = ?point,
                         slot = source_conn.slot.as_deref(),
                         "source feed swapped",
                     );
@@ -1526,7 +1550,14 @@ pub(crate) async fn run_session(
                         }
                     };
                     path = source_recovery
-                        .attempt(Some(err), &source_conn, &history, &stream, &mut feed)
+                        .attempt(
+                            Some(err),
+                            &source_conn,
+                            &history,
+                            &stream,
+                            &mut feed,
+                            &mut timeline_stats,
+                        )
                         .await?;
                     // Recovery dials the live endpoint, so a queued swap is done
                     swap.settled();

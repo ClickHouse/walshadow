@@ -14,7 +14,7 @@ use walshadow::pos::{Floor, Monotone, Pos};
 use walshadow::record::WAL_SEG_SIZE;
 use walshadow::source_feed::SourceFeed;
 use walshadow::timeline::TimelineHistory;
-use walshadow::transition::{TransitionError, source_history};
+use walshadow::transition::{TimelineStats, TransitionError, source_history};
 use walshadow::wal_stream::WalStream;
 
 use crate::args::{Args, cli_base};
@@ -321,23 +321,18 @@ pub(crate) struct SourceBranch {
     pub(crate) begin: u64,
 }
 
-/// Dial the source and resume at `resume_lsn`, proving continuity first:
+/// Reconnect and resume at `resume_lsn`. Check cluster identity, branch start,
+/// and resume position before accepting a source, since `[source]` can change
+/// at runtime. Matching timeline numbers alone cannot rule out sibling branches.
+/// Before starting replication, check that configured slot retains WAL at `floor`.
 ///
-/// 1. same cluster, or foreign WAL replays into these artifacts
-/// 2. the live chain places the requested branch where walshadow left it,
-///    which is what separates a descendant from a sibling sharing its number
-/// 3. the requested branch still serves `resume_lsn`
-/// 4. the configured slot reaches `floor`, the position a restart asks for
+/// If source was promoted at an unchanged address, keep reading requested branch
+/// until its switchpoint, then switch timelines without restarting walshadow.
+/// Resume at exact LSN to preserve stream, filter, and catalog state.
 ///
-/// A live timeline *newer* than the requested one is a promotion that landed
-/// under a stable endpoint, so the request stays on the requested branch: the
-/// walsender then ends it at the fork and the crossing takes over, needing no
-/// operator repoint and no daemon restart. `[source]` is live-reloadable, so
-/// the address reached here can differ from the one boot dialed and these
-/// proofs are what make that safe.
-///
-/// Resume is LSN-exact, so `WalStream`, filter, and catalog state stand and no
-/// WAL is re-read.
+/// At a switchpoint, return without START_REPLICATION. Leave connection in
+/// simple-query mode so timeline switching can fetch history and check slot
+/// on descendant timeline.
 pub(crate) async fn resume_source_feed(
     cfg: &PgConfig,
     slot: Option<&str>,
@@ -345,7 +340,7 @@ pub(crate) async fn resume_source_feed(
     branch: SourceBranch,
     floor: Pos<Floor>,
     status_interval: Duration,
-) -> Result<SourceFeed> {
+) -> Result<(SourceFeed, ResumePoint)> {
     let mut feed = SourceFeed::connect(cfg)
         .await
         .with_context(|| format!("connect source {}:{}", cfg.host, cfg.port))?
@@ -364,15 +359,18 @@ pub(crate) async fn resume_source_feed(
         ident.timeline,
         branch.timeline,
     );
-    match source_history(&mut feed, ident.timeline).await? {
+    let point = match source_history(&mut feed, ident.timeline).await? {
         Some(history) => prove_branch(&history, branch, resume_lsn.get())?,
         // Timeline 1 has no history file, and a source serving none for a newer
         // branch can place nothing; only a run that never left the branch it is
         // asking for is provable without one
-        None if ident.timeline == branch.timeline && branch.begin == 0 => {}
+        None if ident.timeline == branch.timeline && branch.begin == 0 => ResumePoint::OnBranch,
         None => Err(TransitionError::HistoryMissing {
             tli: ident.timeline,
         })?,
+    };
+    if point == ResumePoint::AtSwitchpoint {
+        return Ok((feed, point));
     }
     if let Some(name) = slot {
         feed.prove_physical_slot(name, resume_lsn, floor)
@@ -382,18 +380,17 @@ pub(crate) async fn resume_source_feed(
     feed.start_physical_replication(slot, resume_lsn.get(), branch.timeline)
         .await
         .with_context(|| format!("START_REPLICATION at {resume_lsn}"))?;
-    Ok(feed)
+    Ok((feed, point))
 }
 
-/// The live chain has to agree with the branch walshadow is reading, both about
-/// where it began and about it still owning `resume_lsn`. Typed with the
-/// crossing's own vocabulary, so a refused reconnect names the same proof a
-/// refused crossing would.
+/// Check that source history matches branch start and includes `resume_lsn`.
+/// Accept branch end: WAL read up to that point also belongs to descendant.
+/// Use same errors as timeline switching to report failed checks consistently.
 pub(crate) fn prove_branch(
     history: &TimelineHistory,
     branch: SourceBranch,
     resume_lsn: u64,
-) -> Result<(), TransitionError> {
+) -> Result<ResumePoint, TransitionError> {
     let live_begin =
         history
             .begin_of(branch.timeline)
@@ -410,13 +407,26 @@ pub(crate) fn prove_branch(
             live_begin,
         });
     }
+    if history.branch_exhausted(branch.timeline, resume_lsn) {
+        return Ok(ResumePoint::AtSwitchpoint);
+    }
     if !history.proves_ancestor(branch.timeline, resume_lsn) {
         return Err(TransitionError::ResumePastFork {
             next_lsn: Pos::new(resume_lsn),
             switch_lsn: history.switchpoint_of(branch.timeline).unwrap_or(0),
         });
     }
-    Ok(())
+    Ok(ResumePoint::OnBranch)
+}
+
+/// Resume position relative to requested branch
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ResumePoint {
+    /// Requested branch contains WAL at `resume_lsn`
+    OnBranch,
+    /// All WAL on requested branch has been read. At this position, PostgreSQL
+    /// returns next timeline without starting COPY. Switch timelines to continue.
+    AtSwitchpoint,
 }
 
 /// `reason=` label for a refused reconnect. Same vocabulary as a refused
@@ -435,6 +445,9 @@ pub(crate) enum SourcePath {
     /// Source lost with no archive to read, redialed each due pump iteration so
     /// the loop keeps publishing, pausing and applying `[source]` repoints
     Redial,
+    /// Source history places branch end at resume position; local history is
+    /// outdated. Keep `feed` in simple-query mode until timeline switching starts.
+    AtSwitchpoint,
 }
 
 impl SourcePath {
@@ -497,9 +510,9 @@ impl SourceRecovery<'_> {
     /// under the new slot and asks for the descendant, with the archive read
     /// under its segment names.
     ///
-    /// `lost` is what ended a live feed, starting a fresh outage. A removed-WAL
-    /// (58P01) loss means source genuinely can't serve resume point, so skip
-    /// straight to archive
+    /// `lost` records why streaming stopped. If source removed required WAL
+    /// (58P01), try archive immediately. Count failed checks in `stats` so repeated
+    /// reconnect failures appear in switchover metrics as well as logs.
     pub(crate) async fn attempt(
         &mut self,
         lost: Option<anyhow::Error>,
@@ -507,6 +520,7 @@ impl SourceRecovery<'_> {
         history: &TimelineHistory,
         stream: &WalStream,
         feed: &mut SourceFeed,
+        stats: &mut TimelineStats,
     ) -> Result<SourcePath> {
         if lost.is_some() {
             self.backoff.reset();
@@ -525,20 +539,27 @@ impl SourceRecovery<'_> {
             )
             .await
             {
-                Ok(fresh) => {
+                Ok((fresh, point)) => {
                     *feed = fresh;
                     self.backoff.reset();
                     tracing::info!(
                         target: "walshadow",
                         endpoint = source.endpoint(),
                         resume_lsn = %resume_lsn,
-                        "source reconnected — resuming replication",
+                        resume_point = ?point,
+                        "source reconnected",
                     );
-                    return Ok(SourcePath::Live);
+                    return Ok(match point {
+                        ResumePoint::OnBranch => SourcePath::Live,
+                        ResumePoint::AtSwitchpoint => SourcePath::AtSwitchpoint,
+                    });
                 }
                 Err(e) => e,
             },
         };
+        if let Some(refused) = error.downcast_ref::<TransitionError>() {
+            stats.record_reason(refused.reason());
+        }
         tracing::warn!(
             target: "walshadow",
             error = %format!("{error:#}"),
@@ -739,7 +760,7 @@ mod tests {
             begin: 0x300_0000,
         };
         prove_branch(&history, branch, 0x400_0000).expect("still inside timeline 2");
-        let err = prove_branch(&history, branch, 0x500_0000).unwrap_err();
+        let err = prove_branch(&history, branch, 0x500_0001).unwrap_err();
         assert_eq!(err.reason(), "resume_past_fork", "{err}");
         let absent = SourceBranch {
             timeline: 9,
@@ -748,6 +769,36 @@ mod tests {
         assert_eq!(
             prove_branch(&history, absent, 0x100).unwrap_err().reason(),
             "timeline_not_descendant",
+        );
+    }
+
+    /// After a clean switchover, reconnect at branch end must trigger timeline
+    /// switching. Reject sibling branches even when timeline numbers match.
+    #[test]
+    fn prove_branch_hands_the_switchpoint_to_the_crossing() {
+        let history = TimelineHistory::parse(3, b"1\t0/3000000\n2\t0/5000000\n").unwrap();
+        let branch = SourceBranch {
+            system_id: 7,
+            timeline: 2,
+            begin: 0x300_0000,
+        };
+        assert_eq!(
+            prove_branch(&history, branch, 0x400_0000).unwrap(),
+            ResumePoint::OnBranch
+        );
+        assert_eq!(
+            prove_branch(&history, branch, 0x500_0000).unwrap(),
+            ResumePoint::AtSwitchpoint
+        );
+        let sibling = SourceBranch {
+            begin: 0x200_0000,
+            ..branch
+        };
+        assert_eq!(
+            prove_branch(&history, sibling, 0x500_0000)
+                .unwrap_err()
+                .reason(),
+            "sibling_branch",
         );
     }
 
