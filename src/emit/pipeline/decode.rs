@@ -11,7 +11,7 @@ use std::sync::atomic::Ordering;
 
 use tokio::sync::mpsc;
 
-use crate::decode::heap_decoder::{CommittedTuple, HeapOp};
+use crate::decode::heap_decoder::{CommittedTuple, HeapOp, take_key_change_tombstone};
 use crate::emit::ch_emitter::EmitterStats;
 use crate::emit::pipeline::batcher::{BatcherMsg, RoutedRow, RowChunk};
 use crate::emit::route::RoutedHeap;
@@ -79,6 +79,23 @@ pub async fn place_rows(
         }
         if let Some(t) = committed.decoded.old.as_mut() {
             crate::ops::oracle::render_ext_columns(&rel.attributes, &mut t.columns);
+        }
+        if !route.drops_deletes()
+            && let Some(tomb) = take_key_change_tombstone(&mut committed.decoded, &rel)
+        {
+            let tomb = CommittedTuple {
+                decoded: tomb,
+                ..committed
+            };
+            buf_bytes += tomb.decoded.approx_bytes();
+            buf.push(RoutedRow {
+                seq,
+                rel: rel.clone(),
+                route: route.clone(),
+                committed: tomb,
+                value_permit: None,
+            });
+            routed += 1;
         }
         buf_bytes += committed.decoded.approx_bytes();
         buf.push(RoutedRow {
@@ -235,5 +252,60 @@ mod tests {
         .expect("place");
         assert_eq!(routed, 1);
         assert_eq!(stats.deletes_discarded.load(Ordering::Relaxed), 1);
+    }
+
+    /// Emit and count old-key delete marker before new row unless deletes are disabled
+    #[tokio::test]
+    async fn key_change_places_tombstone_first() {
+        let (msg_tx, mut msg_rx) = mpsc::channel(8);
+        let stats = EmitterStats::default();
+        let update = |route| {
+            let mut h = heap(HeapOp::Update, route);
+            h.described.descriptor = Arc::new(RelDescriptor {
+                replident: ReplIdent::Default {
+                    pk_attnums: Some(vec![1]),
+                },
+                ..(*rel()).clone()
+            });
+            h.described.decoded.old = Some(DecodedTuple {
+                columns: vec![Some(ColumnValue::Int4(0))],
+                partial: false,
+            });
+            h
+        };
+        for (system, placed) in [
+            (SystemColumns::default(), 2),
+            (
+                SystemColumns {
+                    is_deleted: None,
+                    ..SystemColumns::default()
+                },
+                1,
+            ),
+        ] {
+            let routed = place_rows(
+                &msg_tx,
+                &stats,
+                8,
+                0,
+                0,
+                0x2000,
+                vec![update(route(system))],
+                None,
+            )
+            .await
+            .expect("place");
+            assert_eq!(routed, placed);
+            let Some(BatcherMsg::Rows(c)) = msg_rx.recv().await else {
+                panic!("rows chunk");
+            };
+            let ops: Vec<_> = c.rows.iter().map(|r| r.committed.decoded.op).collect();
+            let want: &[HeapOp] = if placed == 2 {
+                &[HeapOp::Delete, HeapOp::Update]
+            } else {
+                &[HeapOp::Update]
+            };
+            assert_eq!(ops, want);
+        }
     }
 }

@@ -1161,6 +1161,33 @@ mod tests {
         fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
     }
 
+    /// Poll a starting postmaster until `postmaster.pid` reports ready
+    #[test]
+    fn wait_started_polls_until_ready() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("bin");
+        let data = tmp.path().join("data");
+        fs::create_dir_all(&bin).unwrap();
+        fs::create_dir_all(&data).unwrap();
+        // Count status probes so the test knows a poll sleep happened
+        stub_bin(&bin.join("pg_ctl"), "echo >> \"$2/probes\"");
+        let pid = data.join("postmaster.pid");
+        let pidfile =
+            |status: &str| format!("1\n{}\n0\n5432\n/tmp\n\n0 0\n{status}\n", data.display());
+        fs::write(&pid, pidfile("starting")).unwrap();
+        let mut cfg = ShadowConfig::new(data.clone(), tmp.path().join("filtered"));
+        cfg.pg_bin_dir = Some(bin);
+        cfg.wait_poll = Duration::from_millis(5);
+        let waiter = thread::spawn(move || Shadow::new(cfg).wait_started().unwrap());
+        let probes = || fs::read_to_string(data.join("probes")).map_or(0, |s| s.lines().count());
+        while probes() < 2 && !waiter.is_finished() {
+            thread::sleep(Duration::from_millis(1));
+        }
+        fs::write(&pid, pidfile("ready")).unwrap();
+        assert!(waiter.join().unwrap());
+        assert!(probes() >= 2);
+    }
+
     /// Unreadable running settings must not read as an unraised floor: a
     /// resume there would shut a shadow down for an operator's pause
     #[test]

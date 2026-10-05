@@ -49,6 +49,15 @@ destination tables where they are and starts writing to the new name
 
 Automatically created tables use source row key for `ORDER BY` and
 `ReplacingMergeTree` for convergence after updates, deletes, or daemon replay
+Row key uses primary key columns or index columns chosen by
+`REPLICA IDENTITY USING INDEX`. With `REPLICA IDENTITY FULL` and no primary
+key, it uses every column ClickHouse can sort. This enables
+`allow_nullable_key` and uses first sort column as `PRIMARY KEY`
+
+When an update changes row key, walshadow also writes a delete marker for old
+key. Its version is one less than new row version. With default replica
+identity, PostgreSQL logs only old key columns, so other columns in this marker
+contain defaults or `NULL`
 
 Source columns are followed by four metadata columns:
 
@@ -82,6 +91,12 @@ and enforces no uniqueness. `primary_key` must be a prefix of `order_by`.
 walshadow ignores an invalid `primary_key`, logs a warning, and indexes whole
 sort key. It also ignores an `order_by` naming a missing or `Nullable` column,
 because ClickHouse rejects nullable sort keys, and falls back to source row key
+
+Limit `order_by` to row key columns and columns that never change
+Updating any other `order_by` column leaves old row in place. If `order_by`
+includes non-key columns, changing row key also leaves old row unless
+`REPLICA IDENTITY FULL` is set: other identity modes omit non-key values from
+old-row delete markers
 
 Both settings apply when walshadow creates a table. walshadow never rekeys a
 table ClickHouse already holds, so choose shape before first delivery, or run

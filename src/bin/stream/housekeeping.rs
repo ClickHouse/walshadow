@@ -166,3 +166,31 @@ pub(crate) async fn query_redo_lsn(client: &tokio_postgres::Client) -> Result<Op
     let redo: Option<PgLsn> = row.get(0);
     Ok(redo.map(u64::from))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use walshadow::record::{SegmentSink, WAL_SEG_SIZE, segments_covering};
+    use walshadow::segment_sink::DirSegmentSink;
+
+    /// Drain every queued segment, publishing highest end as durable
+    #[tokio::test]
+    async fn queued_segments_publish_highest_end() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (tx, rx) = tokio::sync::mpsc::channel(SEGMENT_FSYNC_QUEUE);
+        let mut sink =
+            DirSegmentSink::with_durability(tmp.path().to_path_buf(), WAL_SEG_SIZE, tx).unwrap();
+        let segs = segments_covering(1, 0..3 * WAL_SEG_SIZE);
+        for seg in &segs {
+            sink.on_segment(*seg, &[0u8; 64]).await.unwrap();
+        }
+        drop(sink);
+        let durable = Arc::new(Monotone::new(Pos::new(0)));
+        let fatal = walshadow::pipeline::Fatal::new();
+        spawn_segment_fsync(tmp.path().to_path_buf(), rx, durable.clone(), fatal.clone())
+            .await
+            .unwrap();
+        assert_eq!(fatal.message(), None);
+        assert_eq!(durable.get().get(), segs[2].start_lsn(WAL_SEG_SIZE) + 64);
+    }
+}

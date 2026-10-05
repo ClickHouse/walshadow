@@ -320,3 +320,80 @@ async fn alter_column_type_converges_through_rewrite() {
         "70\tn8\t2\t6400\n50\t\\N\t3\t5\n5000000000\tx\t4\t5",
     );
 }
+
+/// Remove old row after key changes, including changes back to original key
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn key_update_retires_old_key() {
+    if skip_gate() {
+        return;
+    }
+    let (source, shadow, ch, _tmp) = run(
+        fx::Ports::alloc(),
+        "se_key",
+        "walshadow-se-key-update",
+        "CREATE SCHEMA se_key;\n",
+        vec![
+            "CREATE TABLE se_key.t (id int PRIMARY KEY, v text)".into(),
+            "INSERT INTO se_key.t VALUES (1, 'a'), (2, 'b'), (3, 'c')".into(),
+            "SELECT pg_switch_wal()".into(),
+            "UPDATE se_key.t SET id = id + 10 WHERE id <= 2".into(),
+            "UPDATE se_key.t SET v = 'c2' WHERE id = 3".into(),
+            "UPDATE se_key.t SET id = 1 WHERE id = 11".into(),
+            "SELECT pg_switch_wal()".into(),
+        ],
+        2,
+    )
+    .await;
+    let _src = fx::StopOnDrop { sh: &source };
+    let _shd = fx::StopOnDrop { sh: &shadow };
+
+    assert_eq!(
+        ch.query("SELECT id, v FROM walshadow_test.t FINAL WHERE _is_deleted = 0 ORDER BY id")
+            .unwrap(),
+        "1\ta\n3\tc2\n12\tb",
+    );
+}
+
+/// With `REPLICA IDENTITY FULL` and no primary key, sort by whole row so
+/// updates and deletes remove old versions
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn keyless_full_identity_converges() {
+    if skip_gate() {
+        return;
+    }
+    let (source, shadow, ch, _tmp) = run(
+        fx::Ports::alloc(),
+        "se_full",
+        "walshadow-se-keyless-full",
+        "CREATE SCHEMA se_full;\n",
+        vec![
+            // Changing replica identity alone does not trigger a schema event
+            "CREATE TABLE se_full.t (k int, v text); ALTER TABLE se_full.t REPLICA IDENTITY FULL"
+                .into(),
+            "INSERT INTO se_full.t VALUES (1, 'a'), (2, 'b'), (3, NULL), (4, 'd')".into(),
+            "SELECT pg_switch_wal()".into(),
+            "UPDATE se_full.t SET v = 'a2' WHERE k = 1".into(),
+            "UPDATE se_full.t SET v = 'x' WHERE k = 3".into(),
+            "DELETE FROM se_full.t WHERE k = 2".into(),
+            "SELECT pg_switch_wal()".into(),
+        ],
+        2,
+    )
+    .await;
+    let _src = fx::StopOnDrop { sh: &source };
+    let _shd = fx::StopOnDrop { sh: &shadow };
+
+    assert_eq!(
+        ch.query(
+            "SELECT sorting_key FROM system.tables \
+             WHERE database = 'walshadow_test' AND name = 't'"
+        )
+        .unwrap(),
+        "k, v",
+    );
+    assert_eq!(
+        ch.query("SELECT k, v FROM walshadow_test.t FINAL WHERE _is_deleted = 0 ORDER BY k")
+            .unwrap(),
+        "1\ta2\n3\tx\n4\td",
+    );
+}

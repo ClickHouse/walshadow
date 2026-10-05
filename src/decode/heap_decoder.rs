@@ -1440,6 +1440,39 @@ pub fn is_replica_identity_attr(replident: &ReplIdent, attnum: i16) -> bool {
     }
 }
 
+/// Build a delete marker when UPDATE changes primary/index key, or any column
+/// under `REPLICA IDENTITY FULL` without a primary key. Use `lsn - 1` so new
+/// row wins if both share a destination key. PostgreSQL default/index identity
+/// logs old values only when key changes or contains TOASTed values
+pub fn take_key_change_tombstone(
+    heap: &mut DecodedHeap,
+    rel: &RelDescriptor,
+) -> Option<DecodedHeap> {
+    let hot = match heap.op {
+        HeapOp::Update => false,
+        HeapOp::HotUpdate => true,
+        _ => return None,
+    };
+    let (old, new) = (heap.old.as_ref()?, heap.new.as_ref()?);
+    let differs = |a: usize| matches!((old.columns.get(a), new.columns.get(a)), (Some(Some(o)), Some(Some(n))) if o != n);
+    let keys = crate::schema::replident_key_attnums(rel);
+    let moved = if keys.is_empty() {
+        matches!(rel.replident, ReplIdent::Full { pk_attnums: None })
+            && (0..new.columns.len()).any(differs)
+    } else {
+        // PostgreSQL HOT updates leave indexed columns unchanged
+        !hot && keys.iter().any(|&a| differs(a as usize - 1))
+    };
+    moved.then(|| DecodedHeap {
+        rfn: heap.rfn,
+        xid: heap.xid,
+        source_lsn: heap.source_lsn - 1,
+        op: HeapOp::Delete,
+        new: None,
+        old: heap.old.take(),
+    })
+}
+
 /// PG `attmissingval`: one-element, no-null `ArrayType`, payload at `MAXALIGN(24)`
 #[cfg(test)]
 pub(crate) fn raw_missing_array(elemtype: u32, elem: &[u8]) -> Vec<u8> {
@@ -2329,5 +2362,111 @@ mod tests {
         assert!(!is_replica_identity_attr(&default_no_pk, 1));
         assert!(is_replica_identity_attr(&idx, 3));
         assert!(!is_replica_identity_attr(&idx, 1));
+    }
+
+    #[test]
+    fn key_change_tombstone_matrix() {
+        let tuple = |id: i32, v: &str| DecodedTuple {
+            columns: vec![
+                Some(ColumnValue::Int4(id)),
+                Some(ColumnValue::Text(v.into())),
+            ],
+            partial: false,
+        };
+        let heap = |op, old: Option<DecodedTuple>| DecodedHeap {
+            rfn: RelFileNode::default(),
+            xid: 7,
+            source_lsn: 0x100,
+            op,
+            new: Some(tuple(2, "b")),
+            old,
+        };
+        let mut rel = descriptor(1, vec![]);
+        let pk = Some(vec![1]);
+        let cases = [
+            (
+                ReplIdent::Default {
+                    pk_attnums: pk.clone(),
+                },
+                HeapOp::Update,
+                Some(tuple(1, "")),
+                true,
+            ),
+            (
+                ReplIdent::Default {
+                    pk_attnums: pk.clone(),
+                },
+                HeapOp::Update,
+                None,
+                false,
+            ),
+            // PostgreSQL logs TOASTed keys even when unchanged
+            (
+                ReplIdent::Default {
+                    pk_attnums: pk.clone(),
+                },
+                HeapOp::Update,
+                Some(tuple(2, "")),
+                false,
+            ),
+            (
+                ReplIdent::Full {
+                    pk_attnums: pk.clone(),
+                },
+                HeapOp::Update,
+                Some(tuple(2, "a")),
+                false,
+            ),
+            (
+                ReplIdent::Full {
+                    pk_attnums: pk.clone(),
+                },
+                HeapOp::HotUpdate,
+                Some(tuple(1, "a")),
+                false,
+            ),
+            (
+                ReplIdent::Full { pk_attnums: None },
+                HeapOp::HotUpdate,
+                Some(tuple(2, "a")),
+                true,
+            ),
+            (
+                ReplIdent::Full { pk_attnums: None },
+                HeapOp::Update,
+                Some(tuple(2, "b")),
+                false,
+            ),
+            (
+                ReplIdent::Full { pk_attnums: None },
+                HeapOp::Delete,
+                Some(tuple(2, "a")),
+                false,
+            ),
+            (
+                ReplIdent::UsingIndex {
+                    index_oid: 9,
+                    key_attnums: vec![2],
+                },
+                HeapOp::Update,
+                Some(tuple(2, "a")),
+                true,
+            ),
+        ];
+        for (replident, op, old, split) in cases {
+            rel.replident = replident;
+            let mut h = heap(op, old.clone());
+            let tomb = take_key_change_tombstone(&mut h, &rel);
+            assert_eq!(tomb.is_some(), split, "{:?} {op:?} {old:?}", rel.replident);
+            let Some(tomb) = tomb else {
+                assert_eq!(h.old, old);
+                continue;
+            };
+            assert_eq!(
+                (tomb.op, tomb.source_lsn, tomb.xid),
+                (HeapOp::Delete, 0xff, 7)
+            );
+            assert_eq!((tomb.old, tomb.new, h.old), (old, None, None));
+        }
     }
 }

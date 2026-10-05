@@ -41,8 +41,8 @@ use crate::mapping::{
 };
 use crate::ops::oracle::{Oracle, OracleCell};
 use crate::schema::{
-    INT2OID, INT4OID, INT8OID, MissingDefault, RelAttr, RelDescriptor, RelName, SchemaDiff,
-    SchemaEvent, replident_key_attnums,
+    INT2OID, INT4OID, INT8OID, MissingDefault, RelAttr, RelDescriptor, RelName, ReplIdent,
+    SchemaDiff, SchemaEvent, replident_key_attnums,
 };
 use crate::table_rules::{TableRule, TableRules};
 use ahash::{HashMap, HashSet, HashSetExt};
@@ -903,7 +903,7 @@ async fn resolve_disk_default<'a>(
 fn render_create_sql(
     target: &str,
     mut col_defs: Vec<String>,
-    key_names: Vec<String>,
+    key: SortKey,
     shape: &CreateShape<'_>,
 ) -> String {
     let sys = &shape.system;
@@ -928,14 +928,16 @@ fn render_create_sql(
         }
         None => lsn.clone(),
     };
-    let keys = if key_names.is_empty() {
+    let keys = if key.names.is_empty() {
         vec![lsn]
     } else {
-        key_names
+        key.names
     };
     // CH indexes the PRIMARY KEY prefix of the sorting key; a non-prefix is a
     // CREATE-time error there, so drop it and let the key default to ORDER BY
     let primary_key = match shape.primary_key {
+        // Indexing whole rows stores every column value at each granule boundary
+        [] if key.whole_row => format!("\nPRIMARY KEY ({})", keys[0]),
         [] => String::new(),
         pk if pk
             .iter()
@@ -955,10 +957,59 @@ fn render_create_sql(
         }
     };
     let order_by = keys.join(", ");
+    let settings = if key.nullable {
+        "\nSETTINGS allow_nullable_key = 1"
+    } else {
+        ""
+    };
     format!(
-        "CREATE TABLE IF NOT EXISTS {target} (\n  {}\n) ENGINE = ReplacingMergeTree({engine_args})\nORDER BY ({order_by}){primary_key}",
+        "CREATE TABLE IF NOT EXISTS {target} (\n  {}\n) ENGINE = ReplacingMergeTree({engine_args})\nORDER BY ({order_by}){primary_key}{settings}",
         col_defs.join(",\n  ")
     )
+}
+
+/// Quoted `ORDER BY` columns; use LSN when empty
+#[derive(Debug, Default)]
+struct SortKey {
+    names: Vec<String>,
+    /// Use whole row for `REPLICA IDENTITY FULL` without primary key
+    whole_row: bool,
+    /// Nullable columns require `allow_nullable_key`
+    nullable: bool,
+}
+
+impl SortKey {
+    /// Derive sort key from replica identity and destination columns. Exclude
+    /// nullable columns unless using whole row with `allow_nullable_key`.
+    /// Whole-row keys exclude types ClickHouse cannot sort
+    fn derive<'a>(
+        desc: &RelDescriptor,
+        cols: impl Iterator<Item = (i16, &'a str, &'a str)> + Clone,
+    ) -> Self {
+        if matches!(desc.replident, ReplIdent::Full { pk_attnums: None }) {
+            let mut key = SortKey {
+                whole_row: true,
+                ..SortKey::default()
+            };
+            for (_, name, ty) in cols.filter(|(_, _, ty)| types::sortable(ty)) {
+                key.nullable |= types::is_nullable(ty);
+                key.names.push(quote_ident(name));
+            }
+            return key;
+        }
+        let names = replident_key_attnums(desc)
+            .iter()
+            .filter_map(|a| {
+                cols.clone()
+                    .find(|(attnum, _, ty)| attnum == a && !types::is_nullable(ty))
+                    .map(|(_, name, _)| quote_ident(name))
+            })
+            .collect();
+        SortKey {
+            names,
+            ..SortKey::default()
+        }
+    }
 }
 
 /// Operator `ORDER BY` names → quoted key list. `orderable` maps every
@@ -970,8 +1021,8 @@ fn resolve_order_by(
     target: &str,
     order_by: &[String],
     orderable: &HashMap<&str, bool>,
-    derived: Vec<String>,
-) -> Vec<String> {
+    derived: SortKey,
+) -> SortKey {
     if order_by.is_empty() {
         return derived;
     }
@@ -989,7 +1040,10 @@ fn resolve_order_by(
         };
         keys.push(quote_ident(name));
     }
-    keys
+    SortKey {
+        names: keys,
+        ..SortKey::default()
+    }
 }
 
 /// System columns are always non-nullable, so any of them may sort
@@ -1042,17 +1096,13 @@ pub fn render_create_table(
     for (_, name, r) in &cols {
         orderable.insert(name, types::is_nullable(&r.ch_type));
     }
-    // ClickHouse rejects Nullable columns in ORDER BY
-    let derived: Vec<String> = pk_attnums
-        .iter()
-        .filter_map(|a| {
-            cols.iter()
-                .find(|(attnum, _, r)| attnum == a && !types::is_nullable(&r.ch_type))
-                .map(|(_, name, _)| quote_ident(name))
-        })
-        .collect();
-    let key_names = resolve_order_by(&target, shape.order_by, &orderable, derived);
-    Ok(Some(render_create_sql(&target, col_defs, key_names, shape)))
+    let derived = SortKey::derive(
+        desc,
+        cols.iter()
+            .map(|(attnum, name, r)| (*attnum, name.as_str(), r.ch_type.as_str())),
+    );
+    let key = resolve_order_by(&target, shape.order_by, &orderable, derived);
+    Ok(Some(render_create_sql(&target, col_defs, key, shape)))
 }
 
 /// CH `UNKNOWN_DATABASE`
@@ -1108,19 +1158,16 @@ pub fn render_create_table_from_mapping(
     for c in &mapping.columns {
         orderable.insert(&c.target_name, types::is_nullable(&c.target_type));
     }
-    let derived: Vec<String> = replident_key_attnums(desc)
-        .iter()
-        .filter_map(|a| {
-            mapping
-                .columns
-                .iter()
-                .find(|c| c.src_attnum == *a && !types::is_nullable(&c.target_type))
-                .map(|c| quote_ident(&c.target_name))
-        })
-        .collect();
+    let derived = SortKey::derive(
+        desc,
+        mapping
+            .columns
+            .iter()
+            .map(|c| (c.src_attnum, c.target_name.as_str(), c.target_type.as_str())),
+    );
     let target = mapping.target.sql();
-    let key_names = resolve_order_by(&target, shape.order_by, &orderable, derived);
-    render_create_sql(&target, col_defs, key_names, shape)
+    let key = resolve_order_by(&target, shape.order_by, &orderable, derived);
+    render_create_sql(&target, col_defs, key, shape)
 }
 
 #[cfg(test)]
@@ -1673,6 +1720,63 @@ mod tests {
         .unwrap();
         assert!(sql.ends_with("ORDER BY (`id`)"), "{sql}");
         assert!(!sql.contains("ORDER BY _lsn"), "{sql}");
+    }
+
+    #[test]
+    fn render_create_table_full_replica_identity_without_pk_orders_by_whole_row() {
+        let mut d = desc(
+            "ledger",
+            vec![
+                att(1, "k", INT4OID, true, None),
+                att(2, "v", TEXTOID, false, None),
+            ],
+            None,
+        );
+        d.replident = ReplIdent::Full { pk_attnums: None };
+        let sql = render_create_table(
+            &d,
+            &dest("default", &d),
+            &shape(false),
+            &ColumnRules::default(),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(sql.contains("`v` Nullable(String)"), "{sql}");
+        assert!(
+            sql.ends_with(
+                "ORDER BY (`k`, `v`)\nPRIMARY KEY (`k`)\nSETTINGS allow_nullable_key = 1"
+            ),
+            "{sql}"
+        );
+
+        // Exclude JSON from sort key; use configured primary key
+        let m = TableMapping {
+            target: dest("default", &d),
+            columns: vec![
+                ColumnMapping {
+                    src_attnum: 1,
+                    target_name: "k".into(),
+                    target_type: "Int32".into(),
+                    type_pinned: false,
+                },
+                ColumnMapping {
+                    src_attnum: 2,
+                    target_name: "v".into(),
+                    target_type: "JSON".into(),
+                    type_pinned: true,
+                },
+            ],
+        };
+        let primary_key = vec!["k".to_string()];
+        let sql = render_create_table_from_mapping(
+            &d,
+            &m,
+            &CreateShape {
+                primary_key: &primary_key,
+                ..shape(false)
+            },
+        );
+        assert!(sql.ends_with("ORDER BY (`k`)\nPRIMARY KEY (`k`)"), "{sql}");
     }
 
     #[test]
