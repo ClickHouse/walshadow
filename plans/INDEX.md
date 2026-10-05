@@ -23,7 +23,7 @@ writes. A documented limitation does not imply code rejects it
 |---|---|
 | [Value coercion](value_coercion.md) | Reject Decimal precision loss and signedness corruption; fix String NaN defaults; prove rejection recovery |
 | [Runtime configuration](runtime_config.md) | Locate owning UI and reproduce stale/dead state; expose existing controls there |
-| [Schema changes](schema.md) | Fix rename routing and changed-key tombstones; reject keyless/unlogged gaps before effects |
+| [Schema changes](schema.md) | Fix routing after renames and handling of replica identity changes; define policy for sort key changes; reject unlogged tables before destination changes |
 | [Tablespaces](tablespaces.md) | Reject unsafe layouts before bootstrap, then add complete support |
 | [Catalog completeness](catalog.md) | Stop when a surviving relation has lost buffered payload |
 | [Bootstrap visibility](bootstrap.md) | Prove pending-row recovery across load modes and restart |

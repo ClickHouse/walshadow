@@ -12,6 +12,13 @@ Every selected table needs one of:
 Tables with `REPLICA IDENTITY NOTHING`, or default identity without a primary
 key, cannot replicate deletes correctly and fail preflight
 
+`REPLICA IDENTITY FULL` without a primary key sorts destination rows by every
+column ClickHouse can sort. Rows with identical sort values become one row,
+and deleting one deletes all matches. ClickHouse rejects dropping, renaming,
+or changing types of sort key columns, so those source changes stop
+replication. Add a primary key or configure `order_by`; see
+[sort key](destination-tables.md#choose-sort-key)
+
 ## Replicate all user tables
 
 `replicate_all` defaults to `true`. It covers current and future user tables,

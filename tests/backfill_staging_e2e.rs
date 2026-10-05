@@ -290,6 +290,7 @@ async fn staged_backfill_resumes_each_publish_phase() {
     ))
     .await
     .unwrap();
+    let system_id = fx.system_id();
     for phase in [
         "before_exchange",
         "after_exchange",
@@ -334,6 +335,18 @@ async fn staged_backfill_resumes_each_publish_phase() {
             .note_opt_in(&fx.desc, InitialLoadMode::Copy, 999)
             .await;
         wait_done(&backfiller, dir.path()).await;
+        // Done mark lands before pending rows settle
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !PendingLedger::load(dir.path(), system_id)
+                .await
+                .unwrap()
+                .is_empty()
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("pending rows settle");
         assert_eq!(fx.rows(), "1\tsnapshot\n2\tlive\n5\tpending", "{phase}");
         assert_eq!(
             fx.ch
@@ -343,12 +356,6 @@ async fn staged_backfill_resumes_each_publish_phase() {
             "{phase}"
         );
         assert_eq!(fx.ch.query("EXISTS default.t__wspending").unwrap(), "0");
-        assert!(
-            PendingLedger::load(dir.path(), fx.system_id())
-                .await
-                .unwrap()
-                .is_empty()
-        );
         assert_eq!(
             session.table_uuid("default", "t__wsstg").await.unwrap(),
             None

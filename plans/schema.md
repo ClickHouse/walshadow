@@ -21,8 +21,6 @@ All cases below drain successfully despite different final rows
 | Setup and transition | Observed destination | Next step |
 |---|---|---|
 | Create `t(id int PRIMARY KEY, v text)`, insert `(1,'before')`, rename to `renamed`, insert `(2,'after')` | Old destination contains only `(1,'before')` | Emit relation-identity event and rekey route before following rows |
-| Same keyed table, update `id = 2, v = 'after'` | Both `(1,'before')` and `(2,'after')` survive | Emit old-key tombstone and new row under same commit |
-| Create `t(id int, v text)` with `REPLICA IDENTITY FULL`, insert `(1,'before')`, update `v = 'after'` | Both versions survive | Reject missing stable row key until duplicate semantics are defined |
 | Create unlogged keyed table, insert two rows | Destination exists but contains no rows | Reject unlogged scope before destination creation |
 
 Drop/recreate under default retain also leaves both generations' rows. Treat
@@ -51,25 +49,74 @@ as opt-in. Decide explicitly:
 
 ## Row keys
 
-UPDATE emits only new tuple. When an update changes destination key, row under
-old key never receives a delete marker. PostgreSQL logs old key
-(`XLH_UPDATE_CONTAINS_OLD_KEY`), or old tuple under `REPLICA IDENTITY FULL`
-Emit delete for old key plus insert for new row. Test `UPDATE t SET id = id + 1`
+Keep destination sort key aligned with replica identity:
 
-`REPLICA IDENTITY FULL` without primary key derives no key, so destination sorts
-on `_lsn` and updates and deletes never converge. Sort on whole row instead:
+- Changes to replica identity and removal of key columns do not trigger schema
+  events. A table created before setting `REPLICA IDENTITY FULL` keeps
+  `ORDER BY _lsn`. Preserve a usable destination row key or require a rebuild
+- If configured `order_by` includes a non-key column, updating that column
+  leaves old row in place. Changing row key also leaves old row unless identity
+  is `FULL`, because other modes log only old key values. Reject this
+  configuration or require `FULL`
 
-- Every update changes key, so this depends on key-change split above
-- Identical rows collapse to one, and deleting one duplicate deletes all
-  Document or reject; `ctid` moves on update and rewrite, so cannot break ties
-- Nullable columns need `allow_nullable_key`; exclude or reject unsortable
-  types such as `Map` and `JSON`
-- Keep primary index small with a short `PRIMARY KEY` prefix
-- Column add extends key in same `ALTER`; drop or retype of a key column
-  requires rebuild
+### Sort key column changes
 
-Detect replica-identity changes and key column removal. Neither reaches schema
-diff. Preserve a usable destination row key or require rebuild
+ClickHouse rejects dropping or renaming sort key columns, and type changes
+that require more than a metadata update (`ALTER_OF_COLUMN_IS_FORBIDDEN`).
+This affects primary key columns and, with `REPLICA IDENTITY FULL` and no
+primary key, every column used for sorting. Rejection fails `ddl apply` and
+stops replication
+
+Restart replays schema event from `emitter_ack`. Each column `ALTER` uses
+`IF [NOT] EXISTS`, so manually rebuilding destination with new schema should
+let replay skip completed changes. Verify this for `MODIFY COLUMN`: ClickHouse
+also rejects replaying it on a rebuilt key column. Operator docs cover only
+type changes; document drops and renames too. Type changes report rebuild
+instructions, but drops and renames report raw server errors
+
+When whole row acts as key, changing its columns changes row identity.
+Rewriting stored rows is required to update their keys. Handle each operation:
+
+| Operation | Proposed handling |
+|---|---|
+| rename | Keep old ClickHouse column name as a configured name would. Replication stays correct, but destination name differs from source. Apply to primary key columns too; no policy needed |
+| add | Adding without `MODIFY ORDER BY` lets delete marker and new row share a key, so newer version wins. Rows differing only in new column become one row. Alternatively, extend key in same `ALTER` (`ADD COLUMN …, MODIFY ORDER BY (…, c)`) without rebuilding |
+| drop | Apply configured policy |
+| change type | Apply configured policy |
+
+Add a policy per table or namespace, such as `sort_key_change`, defaulting to
+`fail`:
+
+- `fail`: stop and report affected table, column, and rebuild steps
+- `keep`: on drop, keep ClickHouse column and fill it with defaults. Rows
+  inserted after drop replicate correctly. Updating or deleting earlier rows
+  leaves stale versions because old-row delete markers lack dropped values
+  and cannot match old keys. On type change, keep old ClickHouse type and
+  convert incoming values. Reject values it cannot represent; see
+  [value coercion](value_coercion.md)
+- `rebuild`: when processing schema event, create a replacement table with
+  explicit key clauses (`CREATE … AS` copies old keys). Copy selected columns
+  with `INSERT … SELECT`, preserving `_lsn`, version, and delete columns.
+  Swap tables with `EXCHANGE TABLES`, then drop old table. See
+  [column retype](#column-retype) for staging and swap steps
+
+Rebuild constraints:
+
+- Pause pipeline while ClickHouse copies rows; disk usage doubles during copy
+- `EXCHANGE TABLES` requires an Atomic or Replicated database
+- Materialized views and grants refer to old table UUID; verify views survive swap
+- After a crash, inspect destination schema during replay to resume rebuild
+- If ClickHouse `CAST` differs from PostgreSQL conversion, including `USING`,
+  rewritten rows get different key values and leave duplicates
+
+Do not rely on dropped column values remaining in PostgreSQL rows. Although
+`FULL` logs those values and decoder could use old type to build matching
+delete markers, `VACUUM FULL` and table rewrites clear them without emitting
+replacement rows. Later delete markers would no longer match stored rows
+
+Test each policy with column drops, renames, and type changes on tables using
+whole rows as keys. Then update and delete rows inserted before and after each
+change. Restart during rebuild and compare source rows with destination `FINAL`
 
 ## Other transitions
 

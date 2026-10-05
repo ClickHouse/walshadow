@@ -34,3 +34,25 @@ pub fn strip_nullable(view: TypeRef<'_>) -> TypeRef<'_> {
         view
     }
 }
+
+/// ClickHouse sort keys require comparable types without nested
+/// Variant/Dynamic/JSON; see `KeyDescription::getKeyFromAST`
+pub fn sortable(ty: &str) -> bool {
+    TypeAst::parse(ty, Allocator::global(&mimalloc::MiMalloc))
+        .is_ok_and(|ast| sortable_view(ast.view()))
+}
+
+fn sortable_view(view: TypeRef<'_>) -> bool {
+    !matches!(
+        view.kind(),
+        None | Some(
+            Kind::Variant
+                | Kind::Dynamic
+                | Kind::Json
+                | Kind::Object
+                | Kind::AggregateFunction
+                | Kind::SimpleAggregateFunction
+                | Kind::QBit
+        )
+    ) && (0..view.n_children()).all(|i| view.child(i).is_some_and(sortable_view))
+}

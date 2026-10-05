@@ -15,7 +15,7 @@ use walrus::pg::walparser::{Oid, RmId};
 use crate::budget::{MemoryBudget, MemoryPermit, acquire_opt};
 use crate::catalog::desc_log::{DescriptorLog, DescriptorLogs};
 use crate::config::ResolvedConfig;
-use crate::decode::heap_decoder::CommittedTuple;
+use crate::decode::heap_decoder::{CommittedTuple, take_key_change_tombstone};
 use crate::decode::visibility::PgXactPatch;
 use crate::decode::wal_xact::{
     XLOG_XACT_ABORT, XLOG_XACT_ABORT_PREPARED, XLOG_XACT_ASSIGNMENT, XLOG_XACT_COMMIT,
@@ -458,6 +458,25 @@ impl WalReplaySink {
                         .get_or_insert_with(|| (self.seqs.open(commit_lsn, Publish::Commit), 0));
                     *rows += 1;
                     let seq = open.seq();
+                    if !route.drops_deletes()
+                        && let Some(tomb) = take_key_change_tombstone(&mut heap.decoded, &rel)
+                    {
+                        *rows += 1;
+                        self.msg_tx
+                            .send(BatcherMsg::Row(RoutedRow {
+                                seq,
+                                rel: rel.clone(),
+                                route: route.clone(),
+                                committed: CommittedTuple {
+                                    decoded: tomb,
+                                    commit_ts,
+                                    commit_lsn,
+                                },
+                                value_permit: None,
+                            }))
+                            .await
+                            .map_err(|_| SinkError::Other("wal_replay: tail closed".into()))?;
+                    }
                     self.msg_tx
                         .send(BatcherMsg::Row(RoutedRow {
                             seq,

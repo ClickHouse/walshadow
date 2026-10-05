@@ -31,7 +31,9 @@ values reflect what ClickHouse `MODIFY COLUMN` casts to. Conversions without
 cast drop and re-add destination column, eventually filled as rows arrive
 
 ClickHouse can reject key column type changes, including changes to replica
-identity columns used in destination sorting keys. Rejection stops replication
+identity columns used in destination sort keys. It also refuses to drop or
+rename sort key columns. With `REPLICA IDENTITY FULL` and no primary key, this
+applies to every column used for sorting. Rejection stops replication
 before column renames, additions, and drops from that schema event. Earlier
 retypes from same event may already have succeeded
 

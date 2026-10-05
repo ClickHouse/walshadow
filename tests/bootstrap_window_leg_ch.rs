@@ -209,8 +209,10 @@ async fn leg_reads_through_end_lsn_inside_its_first_segment() {
         let ident = feed.identify_system().await.context("IDENTIFY_SYSTEM")?;
         let from_lsn = ident.xlogpos;
 
+        // Key change during replay must retire old key
         sql.batch_execute(&format!(
-            "INSERT INTO {SCHEMA}.t SELECT g, 'leg-'||g::text FROM generate_series(1, {N_ROWS}) g"
+            "INSERT INTO {SCHEMA}.t SELECT g, 'leg-'||g::text FROM generate_series(1, {N_ROWS}) g;
+             UPDATE {SCHEMA}.t SET id = id + {N_ROWS} WHERE id = 1"
         ))
         .await
         .context("window INSERT")?;
@@ -271,14 +273,10 @@ async fn leg_reads_through_end_lsn_inside_its_first_segment() {
         let patched = patch.lock().unwrap().len();
         ensure!(patched >= 1, "leg patched no commit");
         let n = ch
-            .query(&format!(
-                "SELECT count() FROM walshadow_test.t FINAL WHERE id <= {N_ROWS}"
-            ))
+            .query("SELECT count(), min(id), max(id) FROM walshadow_test.t FINAL")
             .context("ch count")?;
-        ensure!(
-            n == N_ROWS.to_string(),
-            "CH holds {n} of {N_ROWS} window rows"
-        );
+        let want = format!("{N_ROWS}\t2\t{}", N_ROWS + 1);
+        ensure!(n == want, "CH holds {n:?}, want {want:?}");
         Ok(())
     }
     .await;

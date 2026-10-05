@@ -2099,12 +2099,11 @@ async fn status_answers_the_promotion_gate_before_the_promotion() {
             "an unpaused pump has no frozen frontier to gate against",
         );
         pause_and_stop_writes(&h, &target).await?;
-        // `[source]` still names the old primary, which is no standby — and now
-        // not even up
+        // `[source]` still names the old primary, which is now down
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
             let blocked = h.status_field("promotion_blocked_on")?;
-            if blocked == "source_unreachable" || blocked == "not_a_standby" {
+            if blocked == "source_unreachable" {
                 break;
             }
             ensure!(
@@ -2113,6 +2112,9 @@ async fn status_answers_the_promotion_gate_before_the_promotion() {
             );
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
+        // Later polls redial the sidecar rather than reuse a dead client
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        ensure!(h.status_field("promotion_blocked_on")? == "source_unreachable");
         ensure!(h.status_field("promotion_ready")? == "false");
 
         repoint(&h, &target, 1).await?;
