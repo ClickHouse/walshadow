@@ -6,8 +6,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use backon::BackoffBuilder;
-use clickhouse_c::{AsyncClient, BoxedAsyncClient, ClientOpts, Codec, Compression, Event};
+use clickhouse_c::tls::rustls::pki_types::ServerName;
+use clickhouse_c::{
+    AsyncClient, BoxedAsyncClient, ClientOpts, Codec, Compression, ErrorKind, Event,
+};
 use thiserror::Error;
+use tokio::net::TcpStream;
+use tokio_rustls::TlsConnector;
 
 use crate::config::DestEmitter;
 use crate::emit::ch_emitter::EmitterConfig;
@@ -18,8 +23,12 @@ pub mod types;
 
 #[derive(Debug, Error)]
 pub enum EmitterError {
-    #[error("clickhouse-c: {0}")]
+    #[error(transparent)]
     Client(#[from] clickhouse_c::Error),
+    #[error(
+        "connection closed before ClickHouse hello reply, check service is running and its IP access list admits this host"
+    )]
+    HelloDropped(#[source] clickhouse_c::Error),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
     #[error("config: {0}")]
@@ -128,17 +137,30 @@ pub async fn connect_client(
         .user(config.user())
         .password(config.password());
     opts.compression = compression.to_wire();
-    let addr = (config.host(), config.port());
-    if config.secure() {
+    let sock = TcpStream::connect((config.host(), config.port())).await?;
+    sock.set_nodelay(true)?;
+    let client = if config.secure() {
         let tls = config
             .tls_config()
             .unwrap_or_else(clickhouse_c::tls::default_config);
-        let client = AsyncClient::connect_tls(addr, config.host(), opts, codec, tls).await?;
-        Ok(client.boxed())
+        let server_name = ServerName::try_from(config.host().to_owned())
+            .map_err(|e| EmitterError::Config(format!("TLS server name: {e}")))?;
+        let stream = TlsConnector::from(tls)
+            .connect(server_name, sock)
+            .await
+            .map_err(|e| std::io::Error::new(e.kind(), format!("TLS handshake: {e}")))?;
+        AsyncClient::handshake_on(stream, opts, codec)
+            .await
+            .map(AsyncClient::boxed)
     } else {
-        let client = AsyncClient::connect(addr, opts, codec).await?;
-        Ok(client.boxed())
-    }
+        AsyncClient::handshake_on(sock, opts, codec)
+            .await
+            .map(AsyncClient::boxed)
+    };
+    client.map_err(|e| match e.kind {
+        ErrorKind::Io | ErrorKind::Eof => EmitterError::HelloDropped(e),
+        _ => e.into(),
+    })
 }
 
 /// Server finished the query; an INSERT's rows are durable
@@ -322,6 +344,7 @@ pub fn is_retryable(error: &EmitterError) -> bool {
         error,
         EmitterError::Io(_)
             | EmitterError::Client(_)
+            | EmitterError::HelloDropped(_)
             | EmitterError::ServerException { .. }
             | EmitterError::Timeout { .. }
     )
@@ -362,5 +385,32 @@ mod tests {
         assert_eq!(CompressionChoice::None.to_wire(), Compression::None);
         assert_eq!(CompressionChoice::Lz4.to_wire(), Compression::Lz4);
         assert_eq!(CompressionChoice::Zstd.to_wire(), Compression::Zstd);
+    }
+
+    /// ClickHouse Cloud's ingress drops a client its IP access list refuses
+    /// after accepting the connection, with no server exception to report
+    #[tokio::test]
+    async fn hello_drop_names_likely_causes() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let config = EmitterConfig {
+            host: "127.0.0.1".into(),
+            port: listener.local_addr().unwrap().port(),
+            ..EmitterConfig::default()
+        };
+        let server = tokio::spawn(async move { drop(listener.accept().await.unwrap()) });
+        let Err(e) = connect_client(&config).await else {
+            panic!("handshake succeeded against a dropped connection");
+        };
+        server.await.unwrap();
+        assert!(matches!(e, EmitterError::HelloDropped(_)), "{e:?}");
+        assert!(is_retryable(&e));
+        assert!(e.to_string().contains("IP access list"), "{e}");
+    }
+
+    #[test]
+    fn client_error_prefix_appears_once() {
+        let e = EmitterError::from(clickhouse_c::Error::from(std::io::Error::other("reset")));
+        assert_eq!(e.to_string(), "clickhouse-c: Io: reset");
+        assert!(std::error::Error::source(&e).is_none());
     }
 }

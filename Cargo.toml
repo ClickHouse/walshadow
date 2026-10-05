@@ -69,6 +69,7 @@ smallvec = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "net", "fs", "sync", "signal", "io-util"] }
 tokio-postgres = "0.7"
+tokio-rustls = { version = "0.26", default-features = false }
 tokio-util = { version = "0.7", features = ["io", "rt"] }
 toml = { version = "1", default-features = false, features = ["parse", "display", "serde"] }
 tracing = "0.1"
