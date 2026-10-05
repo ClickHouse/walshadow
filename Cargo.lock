@@ -3084,6 +3084,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-postgres",
+ "tokio-rustls",
  "tokio-util",
  "toml",
  "tracing",

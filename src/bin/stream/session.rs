@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 
 use ahash::{HashMap, HashMapExt};
 use anyhow::{Context, Result};
+use backon::{ExponentialBuilder, Retryable};
 use tokio::sync::{Mutex, watch};
 use tokio_postgres::types::Oid;
 use tokio_util::sync::CancellationToken;
@@ -67,6 +68,30 @@ use crate::source_recovery::{
     commit_fork_resume, connect_source_waiting, promotion_gate, resume_manifest,
     resume_source_feed, stream_branch, swap_reason,
 };
+
+/// Wait out an unreachable ClickHouse at boot rather than exit, which leaves
+/// a supervisor restart-looping the daemon until the destination returns
+async fn ensure_boot_database_waiting(cfg: &EmitterConfig) -> Result<()> {
+    (|| walshadow::ch_ddl::ensure_boot_database(cfg))
+        .retry(
+            ExponentialBuilder::default()
+                .with_min_delay(Duration::from_millis(200))
+                .with_max_delay(Duration::from_secs(10))
+                .without_max_times(),
+        )
+        .when(walshadow::ch::is_retryable)
+        .notify(|e, _| {
+            tracing::warn!(
+                target: "walshadow",
+                error = %e,
+                host = %cfg.host,
+                port = cfg.port,
+                "ClickHouse unreachable, waiting for it",
+            );
+        })
+        .await?;
+    Ok(())
+}
 
 pub(crate) async fn run_session(
     args: &Args,
@@ -131,9 +156,7 @@ pub(crate) async fn run_session(
     // bootstrap insert tail is first, and its failure there reads as a
     // bootstrap fault rather than a missing destination
     if let Some(cfg) = ch_config.as_ref() {
-        walshadow::ch_ddl::ensure_boot_database(cfg)
-            .await
-            .with_context(|| format!("reach ClickHouse {}:{}", cfg.host, cfg.port))?;
+        or_signal(shutdown, ensure_boot_database_waiting(cfg)).await?;
     }
     // QueueingRecordSink knobs feed both the CH and metrics-only pipelines,
     // so resolve here while `ch_config` is still in scope (it is consumed
@@ -2164,6 +2187,25 @@ pub(crate) fn task_stopped(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn boot_redials_clickhouse_that_drops_connections() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let cfg = EmitterConfig {
+            host: "127.0.0.1".into(),
+            port: listener.local_addr().unwrap().port(),
+            ..EmitterConfig::default()
+        };
+        let accepts = async {
+            for _ in 0..2 {
+                drop(listener.accept().await.unwrap());
+            }
+        };
+        tokio::select! {
+            _ = ensure_boot_database_waiting(&cfg) => panic!("boot proceeded without ClickHouse"),
+            () = accepts => {}
+        }
+    }
 
     #[tokio::test]
     async fn session_tasks_name_the_task_that_stopped() {
