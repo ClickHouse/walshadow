@@ -25,6 +25,7 @@
 //! queued barrier work — only shadow replay of already-shipped bytes.
 
 use std::future::Future;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -34,7 +35,7 @@ use tokio::sync::Mutex;
 
 use crate::catalog::shadow_catalog::ParkedAt;
 use crate::pos::{Pos, ShadowReplay};
-use crate::record::{BoundaryKind, Record, RecordSink, SinkError};
+use crate::record::{BoundaryKind, Record, RecordSink, Route, SinkError};
 use crate::source::catalog_capture::CaptureSet;
 use crate::source::queueing_record_sink::QueueingRecordSink;
 use crate::source::shadow_stream::ShadowStreamState;
@@ -155,6 +156,73 @@ impl CatalogBoundaryGate {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct PendingDatabase {
+    pub oid: u32,
+    pub name: String,
+    pub visible_at: u64,
+    pub bridge_socket: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DatabaseAttach {
+    pub oid: u32,
+    pub name: String,
+    pub lsn: u64,
+}
+
+pub type AttachSlot = Arc<std::sync::Mutex<Option<DatabaseAttach>>>;
+
+#[derive(Debug, Clone, Default)]
+pub struct PendingDatabases {
+    waiting: Vec<PendingDatabase>,
+    attach_timeout: Duration,
+    attached: AttachSlot,
+}
+
+impl PendingDatabases {
+    pub fn new(
+        waiting: Vec<PendingDatabase>,
+        attach_timeout: Duration,
+        attached: AttachSlot,
+    ) -> Self {
+        Self {
+            waiting,
+            attach_timeout,
+            attached,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.waiting.is_empty()
+    }
+
+    fn hit(&self, record: &Record<'_>) -> Option<&PendingDatabase> {
+        self.waiting.iter().find(|p| {
+            record.source_lsn >= p.visible_at
+                || (!matches!(record.route, Route::ToShadow)
+                    && record
+                        .parsed
+                        .blocks
+                        .iter()
+                        .any(|b| b.header.location.rel.db_node == p.oid))
+        })
+    }
+}
+
+async fn bridge_listening(path: &Path, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if tokio::net::UnixStream::connect(path).await.is_ok() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
 /// [`QueueingRecordSink`] wrapper enacting the hold. At a catalog boundary:
 /// force-flush the pump-side batch (predecessors must not strand in the
 /// accumulator while the pump parks — and the flush surfaces any parked
@@ -178,6 +246,7 @@ pub struct BoundaryHoldSink {
     pub gate: CatalogBoundaryGate,
     /// Empty = hold-only (tests / capture-less harnesses)
     pub capture: CaptureSet,
+    pub pending: PendingDatabases,
 }
 
 impl BoundaryHoldSink {
@@ -186,12 +255,63 @@ impl BoundaryHoldSink {
             inner,
             gate,
             capture: CaptureSet::default(),
+            pending: PendingDatabases::default(),
         }
     }
 
     pub fn with_capture(mut self, capture: CaptureSet) -> Self {
         self.capture = capture;
         self
+    }
+
+    pub fn with_pending(mut self, pending: PendingDatabases) -> Self {
+        self.pending = pending;
+        self
+    }
+
+    async fn attach_pending(
+        &mut self,
+        db: PendingDatabase,
+        record: &Record<'_>,
+    ) -> Result<(), SinkError> {
+        self.inner.flush().await?;
+        let inner = &self.inner;
+        let held = self
+            .gate
+            .hold(record.source_lsn, Pos::new(record.next_lsn), || {
+                inner.worker_alive()
+            })
+            .await;
+        if let Err(hold_err) = held {
+            self.inner.flush().await?;
+            return Err(hold_err);
+        }
+        if !bridge_listening(&db.bridge_socket, self.pending.attach_timeout).await {
+            return Err(SinkError::Other(format!(
+                "database {} (oid {}) is on the source, but the shadow replayed through \
+                 {:#X} and its bridge at {} never came up: the shadow lacks the database \
+                 (dropped and recreated after the backup?) or its bridge worker fails, \
+                 see the shadow's startup.log",
+                db.name,
+                db.oid,
+                record.next_lsn,
+                db.bridge_socket.display(),
+            )));
+        }
+        tracing::info!(
+            target: "walshadow",
+            database = %db.name,
+            oid = db.oid,
+            lsn = format_args!("{:#X}", record.source_lsn),
+            "shadow replayed a pending database's creation; restarting the session to follow it",
+        );
+        let msg = format!("attaching database {} at {:#X}", db.name, record.source_lsn);
+        *self.pending.attached.lock().expect("attach slot poisoned") = Some(DatabaseAttach {
+            oid: db.oid,
+            name: db.name,
+            lsn: record.source_lsn,
+        });
+        Err(SinkError::Other(msg))
     }
 
     pub fn in_flight(&self) -> u64 {
@@ -217,6 +337,9 @@ impl RecordSink for BoundaryHoldSink {
         record: &'a Record<'a>,
     ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
         Box::pin(async move {
+            if let Some(db) = self.pending.hit(record).cloned() {
+                return self.attach_pending(db, record).await;
+            }
             if let Some(members) = &record.aborted_tree {
                 self.capture.forget_aborted(members);
             }

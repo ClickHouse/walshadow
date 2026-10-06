@@ -57,6 +57,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use clap::Parser;
 use tokio::sync::Mutex;
+use walshadow::boundary_hold::AttachSlot;
 use walshadow::metrics::MetricsRegistry;
 
 use crate::args::{Args, InitArgs, cli_base, url_base, validate_transport_args};
@@ -188,5 +189,23 @@ async fn run(mut args: Args) -> Result<()> {
         None
     };
 
-    run_session(&args, &metrics, &reloader, sighup, &shutdown).await
+    let mut sighup = sighup;
+    loop {
+        let attach: AttachSlot = Arc::default();
+        let result = run_session(&args, &metrics, &reloader, sighup, &shutdown, &attach).await;
+        let Some(attached) = attach.lock().expect("attach slot poisoned").take() else {
+            return result;
+        };
+        tracing::info!(
+            target: "walshadow",
+            database = %attached.name,
+            oid = attached.oid,
+            lsn = format_args!("{:#X}", attached.lsn),
+            "restarting the session to follow a database the shadow now holds",
+        );
+        args.ignore_cursor = false;
+        args.start_lsn = None;
+        sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+            .context("reinstall SIGHUP")?;
+    }
 }

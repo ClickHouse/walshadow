@@ -338,8 +338,9 @@ pub(crate) async fn open_db_desc_log(
     // read uncovered intervals. `--ignore-cursor` discards both.
     let log_files_present = dir.join(walshadow::desc_log::TAIL_FILE).exists()
         || dir.join(walshadow::desc_log::CKPT_FILE).exists();
+    let attaching = dir.join(ATTACH_MARKER).exists();
     anyhow::ensure!(
-        !input.manifest_present || log_files_present || args.ignore_cursor,
+        !input.manifest_present || log_files_present || attaching || args.ignore_cursor,
         "manifest present but descriptor log missing in {}; \
          re-bootstrap or pass --ignore-cursor",
         dir.display(),
@@ -418,7 +419,26 @@ pub(crate) async fn open_db_desc_log(
             "descriptor log seeded",
         );
     }
+    if attaching {
+        tokio::fs::remove_file(dir.join(ATTACH_MARKER))
+            .await
+            .with_context(|| format!("clear attach marker in {}", dir.display()))?;
+    }
     Ok(desc_log)
+}
+
+pub(crate) const ATTACH_MARKER: &str = "attach-pending";
+
+pub(crate) async fn list_databases(
+    client: &tokio_postgres::Client,
+) -> anyhow::Result<ahash::HashMap<String, u32>> {
+    let rows = client
+        .query("SELECT datname::text, oid::int8 FROM pg_database", &[])
+        .await?;
+    Ok(rows
+        .iter()
+        .map(|r| (r.get::<_, String>(0), r.get::<_, i64>(1) as u32))
+        .collect())
 }
 
 /// Source sidecar connection to one database, for config seeding and COPY

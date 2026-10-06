@@ -145,6 +145,7 @@ pub struct Filter {
     /// Databases that need table metadata updates, empty disables capture
     /// Continue routing WAL and tracking catalog files for all databases
     targets: Vec<u32>,
+    creating_dbs: HashMap<u32, u32>,
     shadow_rels: Option<ShadowRelations>,
     /// Xid ceilings the shadow TOAST store reads. Absent for offline
     /// filters, which serve no reads
@@ -161,6 +162,7 @@ impl Filter {
             observed_from_xid: None,
             smgr_markers: Arc::new(Mutex::new(SmgrMarkers::default())),
             targets: Vec::new(),
+            creating_dbs: HashMap::default(),
             shadow_rels: None,
             xid_ceiling: None,
         }
@@ -334,6 +336,11 @@ impl Filter {
             self.observe_from_xid(next_xid);
         }
         let xid = record.header.xact_id;
+        if xid != 0
+            && let Some(db) = created_database(record)
+        {
+            self.creating_dbs.insert(xid, db);
+        }
         if let Some(ceiling) = &self.xid_ceiling {
             ceiling.observe(source_lsn, xid);
         }
@@ -347,7 +354,9 @@ impl Filter {
         // Foreign and shared catalog writes route to shadow and update the
         // cluster-wide tracker above, but feed no descriptor of the
         // followed database, so they must not dirty its capture tree
-        if let Some(db) = catalog_touch_db.filter(|db| xid != 0 && self.is_target_db(*db)) {
+        if let Some(db) = catalog_touch_db.filter(|db| {
+            xid != 0 && self.is_target_db(*db) && self.creating_dbs.get(&xid) != Some(db)
+        }) {
             let dirty = self.dirty.touch(xid, source_lsn);
             dirty.direct_write = true;
             if let Some(have) = dirty.db
@@ -422,6 +431,7 @@ impl Filter {
         }
         let payload = parse_xact_payload(info, &record.main_data, page_magic)?;
         let header_xid = record.header.xact_id;
+        self.creating_dbs.remove(&header_xid);
         let (merged, members) =
             self.dirty
                 .drain_tree(header_xid, payload.twophase_xid, &payload.subxacts);
@@ -683,6 +693,21 @@ impl Default for Filter {
         Self::new()
     }
 }
+
+fn created_database(record: &XLogRecord) -> Option<u32> {
+    if record.header.resource_manager_id != RmId::Dbase as u8 {
+        return None;
+    }
+    let op = record.header.info & 0xF0;
+    if op != XLOG_DBASE_CREATE_FILE_COPY && op != XLOG_DBASE_CREATE_WAL_LOG {
+        return None;
+    }
+    let db = record.main_data.get(..4)?;
+    Some(u32::from_le_bytes(db.try_into().ok()?))
+}
+
+const XLOG_DBASE_CREATE_FILE_COPY: u8 = 0x00;
+const XLOG_DBASE_CREATE_WAL_LOG: u8 = 0x10;
 
 fn any_block_is_catalog(tracker: &CatalogTracker, blocks: &[XLogRecordBlock]) -> bool {
     blocks.iter().any(|b| {
@@ -2021,6 +2046,45 @@ mod tests {
             )
             .unwrap();
         assert!(!v.boundary.is_some(), "commit drained the tree");
+    }
+
+    fn dbase_create(db: u32, xid: u32) -> XLogRecord<'static> {
+        let mut r = rec_with_xid(RmId::Dbase, &[], xid);
+        r.header.info = XLOG_DBASE_CREATE_WAL_LOG;
+        let mut md = db.to_le_bytes().to_vec();
+        md.extend_from_slice(&1663u32.to_le_bytes());
+        r.main_data = std::borrow::Cow::Owned(md);
+        r
+    }
+
+    #[test]
+    fn creating_the_target_database_is_not_a_foreign_scope() {
+        let mut f = target_filter();
+        f.decide_record(&dbase_create(TARGET_DB, 7), 50, 0xD116)
+            .unwrap();
+        f.decide_record(&pg_class_write(TARGET_DB, 7, 16400), 100, 0xD116)
+            .unwrap();
+        let v = f
+            .decide_record(
+                &xact_end_dbinfo(XLOG_XACT_COMMIT, 7, FOREIGN_DB),
+                200,
+                0xD116,
+            )
+            .unwrap();
+        assert!(v.boundary.is_none());
+        f.decide_record(&pg_class_write(TARGET_DB, 8, 16401), 300, 0xD116)
+            .unwrap();
+        let err = f
+            .decide_record(
+                &xact_end_dbinfo(XLOG_XACT_COMMIT, 8, FOREIGN_DB),
+                400,
+                0xD116,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, XactPayloadError::ForeignScope { .. }),
+            "{err}"
+        );
     }
 
     #[test]
