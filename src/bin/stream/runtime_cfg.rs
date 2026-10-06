@@ -122,8 +122,8 @@ pub(crate) async fn load_runtime_config(
     for row in client
         .query(
             &format!(
-                "SELECT namespace, target_database, auto_create, drop_table_strategy \
-                 FROM {s}.config_namespace"
+                "SELECT namespace, target_database, auto_create, auto_create_name, \
+                 drop_table_strategy FROM {s}.config_namespace"
             ),
             &[],
         )
@@ -136,6 +136,7 @@ pub(crate) async fn load_runtime_config(
             NamespaceRow {
                 target_database: row.get("target_database"),
                 auto_create: row.get("auto_create"),
+                auto_create_name: row.get("auto_create_name"),
                 drop_table_strategy: row.get("drop_table_strategy"),
             },
         );

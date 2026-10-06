@@ -432,7 +432,12 @@ fn status_tables(root: &Table, db: &str, ch_database: &str) -> Vec<Value> {
             let database = block_str("target_database")
                 .or_else(|| namespace_str(root, db, ns, "target_database"))
                 .unwrap_or_else(|| ch_database.to_owned());
-            let table = block_str("target_table").unwrap_or_else(|| rel.to_owned());
+            let table = block_str("target_table").unwrap_or_else(|| {
+                namespace_str(root, db, ns, "auto_create_name")
+                    .and_then(|raw| crate::mapping::NameTemplate::parse(&raw).ok())
+                    .unwrap_or_default()
+                    .render(db, ns, rel)
+            });
             let initial_load = block_str("initial_load")
                 .or_else(|| namespace_str(root, db, ns, "initial_load"))
                 .unwrap_or_else(|| "none".into());
@@ -840,9 +845,12 @@ mod tests {
                 "[source]\ndbname = \"app\"\n\
                  [ch]\ndatabase = \"cdc\"\n\
                  [namespace.shop]\ntarget_database = \"warehouse\"\n\
+                 [namespace.audit]\nauto_create_name = \"$table$\"\n\
                  [table.public.orders]\nreplicate = true\ninitial_load = \"copy\"\n\
                  [table.public.audit]\nreplicate = false\n\
-                 [table.shop.items]\nreplicate = true\ntarget_table = \"line_items\"\n"
+                 [table.shop.items]\nreplicate = true\ntarget_table = \"line_items\"\n\
+                 [table.shop.prices]\nreplicate = true\n\
+                 [table.audit.events]\nreplicate = true\n"
             )
             .await
             .starts_with("OK")
@@ -863,12 +871,27 @@ mod tests {
                 .cloned()
                 .unwrap_or_else(|| panic!("{source} missing from {status}"))
         };
-        assert_eq!(tables.len(), 2, "{status}");
+        assert_eq!(tables.len(), 4, "{status}");
 
         let orders = entry("app.public.orders");
         assert_eq!(
             orders.get("destination_table").and_then(Value::as_str),
-            Some("cdc.orders")
+            Some("cdc.public_orders"),
+            "a derived name carries the source namespace as its prefix",
+        );
+        assert_eq!(
+            entry("app.shop.prices")
+                .get("destination_table")
+                .and_then(Value::as_str),
+            Some("warehouse.shop_prices"),
+            "the prefix follows the source namespace, not `public`",
+        );
+        assert_eq!(
+            entry("app.audit.events")
+                .get("destination_table")
+                .and_then(Value::as_str),
+            Some("cdc.events"),
+            "a `$table$` auto_create_name derives a bare name",
         );
         assert_eq!(
             orders.get("initial_load").and_then(Value::as_str),

@@ -52,6 +52,7 @@ async fn foreign_database_ddl_and_dml_never_reach_the_followed_output() {
         NamespaceMapping {
             target_database: Some("walshadow_test".into()),
             auto_create: true,
+            auto_create_name: Some(walshadow::mapping::NameTemplate::parse("$table$").unwrap()),
             drop_table_strategy: None,
             initial_load: None,
         },

@@ -2,10 +2,48 @@
 
 walshadow creates ClickHouse tables in configured `[ch] database` unless a
 namespace or table rule chooses another database. Destination table name
-defaults to source relation name
+defaults to `<source namespace>_<source relation>`, so `public.orders` lands as
+`public_orders` and `audit.orders` as `audit_orders` — same-named tables from
+different PostgreSQL schemas never collide
 
-Map same-named tables from different PostgreSQL schemas to distinct ClickHouse
-tables or databases to avoid collisions
+## Name auto-created tables
+
+`auto_create_name` sets the derived name per namespace as a template over
+`$database$` (source database), `$schema$` (source namespace) and `$table$`
+(source relation). Default is `$schema$_$table$`
+
+```toml
+[namespace.audit]
+auto_create = true
+auto_create_name = "$database$_$schema$_$table$"   # audit.orders -> app_audit_orders
+
+[namespace.shop]
+auto_create = true
+auto_create_name = "$table$_v2"                    # shop.orders -> orders_v2
+
+[namespace.public]
+auto_create = true
+auto_create_name = "$table$"                       # public.orders -> orders
+```
+
+A template naming no `$table$` is read as a prefix, so `wh_` means
+`wh_$table$` and `""` means `$table$`. Write `$$` for a literal `$`. An unknown
+placeholder or an unterminated `$` is a config error, and in the
+`config_namespace` overlay it is rejected with a warning, leaving the previous
+value in place
+
+| `auto_create_name` | `app`, `audit.orders` becomes |
+|---|---|
+| unset | `audit_orders` |
+| `$schema$_` | `audit_orders` |
+| `$database$_$schema$_$table$` | `app_audit_orders` |
+| `$table$_v2` | `orders_v2` |
+| `wh_` | `wh_orders` |
+| `""` or `$table$` | `orders` |
+
+`target_table` names a destination outright and ignores the template. The
+template applies when the table is created, so changing it leaves existing
+destination tables where they are and starts writing to the new name
 
 ## Generated shape
 

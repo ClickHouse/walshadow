@@ -194,7 +194,7 @@ async fn backup_window_wal_never_materialises_the_shadow() {
         // byte assertions below are about a bootstrap that actually finished
         fx::wait_for_ch_value(
             &ch,
-            "SELECT count() FROM default.big FINAL WHERE id = 2000001",
+            "SELECT count() FROM default.public_big FINAL WHERE id = 2000001",
             "1",
             Duration::from_secs(180),
         )
@@ -204,7 +204,7 @@ async fn backup_window_wal_never_materialises_the_shadow() {
             .context("source count")?;
         fx::wait_for_ch_value(
             &ch,
-            "SELECT count() FROM default.big FINAL WHERE _is_deleted = 0",
+            "SELECT count() FROM default.public_big FINAL WHERE _is_deleted = 0",
             src_count.trim(),
             Duration::from_secs(180),
         )

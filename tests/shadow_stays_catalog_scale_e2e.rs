@@ -223,7 +223,7 @@ async fn user_relation_never_materialises_on_the_shadow() {
         let deadline = Instant::now() + Duration::from_secs(180);
         loop {
             let n = ch
-                .query("SELECT count() FROM default.big")
+                .query("SELECT count() FROM default.public_big")
                 .unwrap_or_default();
             if n == ROWS.to_string() {
                 break;
@@ -272,7 +272,7 @@ async fn user_relation_never_materialises_on_the_shadow() {
         let deadline = Instant::now() + Duration::from_secs(180);
         loop {
             let n = ch
-                .query("SELECT count() FROM default.big FINAL WHERE id = 2000001")
+                .query("SELECT count() FROM default.public_big FINAL WHERE id = 2000001")
                 .unwrap_or_default();
             if n == "1" {
                 break;

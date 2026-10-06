@@ -735,30 +735,6 @@ fn reject_backup_loads(db: &str, entries: &DbEntries) -> Result<(), EmitterError
     Ok(())
 }
 
-/// Resolve ClickHouse destination to check for conflicting mappings
-/// Skip patterns and entries with replication disabled
-fn declared_target(
-    ch_database: &str,
-    schema_database: Option<&str>,
-    rel: &str,
-    t: &TablePatch,
-) -> Option<(String, String)> {
-    if t.replicate == Some(false)
-        || matches!(t.match_kind, Some(MatchKind::Glob | MatchKind::Regex))
-    {
-        return None;
-    }
-    let database = t
-        .target_database
-        .clone()
-        .or_else(|| schema_database.map(str::to_owned))
-        .unwrap_or_else(|| ch_database.to_owned());
-    Some((
-        database,
-        t.target_table.clone().unwrap_or_else(|| rel.to_owned()),
-    ))
-}
-
 #[derive(serde::Deserialize)]
 #[serde(default)]
 struct ChSection {
@@ -869,6 +845,7 @@ impl Default for StreamSection {
 struct NamespacePatch {
     target_database: Option<String>,
     auto_create: Option<bool>,
+    auto_create_name: Option<String>,
     #[serde(default, deserialize_with = "crate::toml_de::de_from_str")]
     drop_table_strategy: Option<DropTableStrategy>,
     #[serde(default, deserialize_with = "crate::toml_de::de_from_str")]
@@ -1068,62 +1045,32 @@ impl EmitterConfig {
             reject_backup_loads(db, entries)?;
         }
         let local = buckets.remove(&scope).unwrap_or_default();
-        // Entries of the scoped database read back as the operator wrote them
-        let local_ctx = |ns: &str, name: &str| {
-            if scope == default_db {
-                format!("table.{ns}.{name}")
-            } else {
-                format!("database.{scope}.table.{ns}.{name}")
-            }
-        };
         for (ns, n) in local.namespace {
+            let auto_create_name = n
+                .auto_create_name
+                .as_deref()
+                .map(crate::mapping::NameTemplate::parse)
+                .transpose()
+                .map_err(|e| {
+                    EmitterError::Config(format!("`namespace.{ns}.auto_create_name`: {e}"))
+                })?;
             out.namespaces.insert(
                 ns,
                 NamespaceMapping {
                     target_database: n.target_database,
                     auto_create: n.auto_create.unwrap_or(false),
+                    auto_create_name,
                     drop_table_strategy: n.drop_table_strategy,
                     initial_load: n.initial_load,
                 },
             );
         }
-        // Prevent processes from writing different source tables to one destination
-        let mut owners: HashMap<(String, String), String> = HashMap::new();
         for (ns, rels) in local.table {
             for (name, t) in rels {
-                let schema_db = out
-                    .namespaces
-                    .get(&ns)
-                    .and_then(|n| n.target_database.clone());
-                if let Some(target) =
-                    declared_target(&out.database, schema_db.as_deref(), &name, &t)
-                {
-                    owners.insert(target, local_ctx(&ns, &name));
-                }
                 out.fold_table_entry(&ns, name, t)?;
             }
         }
-        for (db, entries) in buckets {
-            for (ns, rels) in &entries.table {
-                let schema_db = entries
-                    .namespace
-                    .get(ns)
-                    .and_then(|n| n.target_database.as_deref());
-                for (name, t) in rels {
-                    let Some(target) = declared_target(&out.database, schema_db, name, t) else {
-                        continue;
-                    };
-                    let ctx = format!("database.{db}.table.{ns}.{name}");
-                    if let Some(owner) = owners.get(&target) {
-                        return Err(EmitterError::Config(format!(
-                            "`{ctx}` and `{owner}` both write to {}.{}, set a different \
-                             target_database or target_table",
-                            target.0, target.1
-                        )));
-                    }
-                    owners.insert(target, ctx);
-                }
-            }
+        for db in buckets.into_keys() {
             out.databases.push(db);
         }
         out.databases
@@ -1263,7 +1210,13 @@ impl EmitterConfig {
                     .and_then(|n| n.target_database.clone())
             })
             .unwrap_or_else(|| self.database.clone());
-        let table = rule.target_table.unwrap_or(name);
+        let table = rule.target_table.unwrap_or_else(|| {
+            self.namespaces
+                .get(ns)
+                .and_then(|n| n.auto_create_name.clone())
+                .unwrap_or_default()
+                .render(&self.source.dbname, ns, &name)
+        });
         self.tables.insert(
             rel.clone(),
             TableMapping {
@@ -2806,6 +2759,53 @@ mod tests {
     }
 
     #[test]
+    fn namespace_auto_create_name_parses() {
+        let parse = |toml: &str| {
+            EmitterConfig::from_toml_str(toml)
+                .expect("parses")
+                .namespaces
+                .get("public")
+                .expect("namespace parsed")
+                .auto_create_name
+                .clone()
+        };
+        let rendered = |toml: &str| {
+            parse(toml)
+                .unwrap_or_default()
+                .render("app", "public", "orders")
+        };
+        assert_eq!(
+            parse("[ch]\n[namespace.public]\nauto_create = true\n"),
+            None,
+            "an absent template derives from the namespace name",
+        );
+        for (template, want) in [
+            ("", "orders"),
+            ("wh_", "wh_orders"),
+            ("$schema$_", "public_orders"),
+            ("$table$_v2", "orders_v2"),
+            ("$database$_$schema$_$table$", "app_public_orders"),
+            ("$$lit$$_$table$", "$lit$_orders"),
+        ] {
+            let toml = format!(
+                "[ch]\n[namespace.public]\nauto_create = true\nauto_create_name = \"{template}\"\n"
+            );
+            assert_eq!(rendered(&toml), want, "template {template:?}");
+        }
+        for bad in ["$nope$_$table$", "$table$_$unclosed"] {
+            let toml = format!(
+                "[ch]\n[namespace.public]\nauto_create = true\nauto_create_name = \"{bad}\"\n"
+            );
+            let err = EmitterConfig::from_toml_str(&toml).expect_err("rejects");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("namespace.public.auto_create_name"),
+                "{bad:?} names the key: {msg}"
+            );
+        }
+    }
+
+    #[test]
     fn defaults_match_high_throughput_profile() {
         let c = EmitterConfig::from_toml_str("[ch]\nhost = \"h\"\n").expect("parses");
         assert_eq!(c.row_budget, 4_194_304);
@@ -4097,8 +4097,8 @@ mod tests {
         );
         let rel = RelName::new("public", "foo");
         let t = c.tables.get(&rel).expect("mapping present");
-        // target_database/target_table omitted: [ch] database + source relname
-        assert_eq!(t.target, TableTarget::new("default", "foo"));
+        // target_database/target_table omitted: [ch] database + derived name
+        assert_eq!(t.target, TableTarget::new("default", "public_foo"));
         assert_eq!(t.columns.len(), 2);
         assert_eq!(t.columns[0].src_attnum, 1);
         assert_eq!(t.columns[1].target_type, "Nullable(String)");
@@ -4430,10 +4430,10 @@ mod tests {
         .unwrap();
         let dotted_ns = c.tables.get(&RelName::new("a.b", "c")).expect("a.b / c");
         let dotted_rel = c.tables.get(&RelName::new("a", "b.c")).expect("a / b.c");
-        assert_eq!(dotted_ns.target, TableTarget::new("default", "c"));
-        assert_eq!(dotted_rel.target, TableTarget::new("default", "b.c"));
+        assert_eq!(dotted_ns.target, TableTarget::new("default", "a.b_c"));
+        assert_eq!(dotted_rel.target, TableTarget::new("default", "a_b.c"));
         // Interpolation quotes the dot inside the identifier
-        assert_eq!(dotted_rel.target.sql(), "`default`.`b.c`");
+        assert_eq!(dotted_rel.target.sql(), "`default`.`a_b.c`");
     }
 
     /// Database prefixes preserve table identity within source database
@@ -4568,27 +4568,24 @@ mod tests {
         assert_eq!(c.databases, vec!["app".to_string(), "billing".to_string()]);
     }
 
-    /// Reject mappings that mix source databases in one ClickHouse table
+    /// Two source databases may share one ClickHouse table: rows merge there
     #[test]
-    fn cross_database_destination_collision_is_rejected() {
-        let msg = EmitterConfig::from_toml_str(
-            "[ch]\n\
+    fn cross_database_destination_collision_is_allowed() {
+        let shared = "[ch]\n\
              database = \"cdc\"\n\
              [source]\n\
              dbname = \"app\"\n\
              [table.public.orders]\n\
              replicate = true\n\
              [database.billing.table.public.orders]\n\
-             replicate = true\n",
-        )
-        .expect_err("collides")
-        .to_string();
-        assert!(
-            msg.contains("`database.billing.table.public.orders`"),
-            "{msg}"
+             replicate = true\n";
+        let c = EmitterConfig::from_toml_str(shared).expect("merging destinations is allowed");
+        assert_eq!(c.databases, vec!["app".to_string(), "billing".to_string()]);
+        assert_eq!(
+            c.table_entries.iter().map(|(r, ..)| r).collect::<Vec<_>>(),
+            vec![&RelName::new("public", "orders")],
+            "this process still scopes to its own database",
         );
-        assert!(msg.contains("`table.public.orders`"), "{msg}");
-        assert!(msg.contains("cdc.orders"), "{msg}");
         for distinct in [
             "target_database = \"billing_cdc\"",
             "target_table = \"billing_orders\"",

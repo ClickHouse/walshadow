@@ -121,7 +121,7 @@ fn create_pgbench_ch_tables(ch: &fx::ChServer, database: &str) -> Result<()> {
     // catalog has no attnum=5 pre-ALTER); post-ALTER UPDATE WAL records
     // arrive with c=7 (item 1 attmissingval substitution).
     ch.query(&format!(
-        "CREATE OR REPLACE TABLE {database}.pgbench_accounts (\
+        "CREATE OR REPLACE TABLE {database}.public_pgbench_accounts (\
             aid Int32, bid Int32, abalance Int32, filler String, c Nullable(Int32),\
             _lsn UInt64, _xid UInt32,\
             _commit_ts DateTime64(6, 'UTC'), _is_deleted Bool\
@@ -132,14 +132,14 @@ fn create_pgbench_ch_tables(ch: &fx::ChServer, database: &str) -> Result<()> {
     // comment: only pgbench_accounts.filler gets blank-padded; the
     // other three default to NULL).
     ch.query(&format!(
-        "CREATE OR REPLACE TABLE {database}.pgbench_branches (\
+        "CREATE OR REPLACE TABLE {database}.public_pgbench_branches (\
             bid Int32, bbalance Int32, filler Nullable(String),\
             _lsn UInt64, _xid UInt32,\
             _commit_ts DateTime64(6, 'UTC'), _is_deleted Bool\
          ) ENGINE = ReplacingMergeTree(_lsn, _is_deleted) ORDER BY bid"
     ))?;
     ch.query(&format!(
-        "CREATE OR REPLACE TABLE {database}.pgbench_tellers (\
+        "CREATE OR REPLACE TABLE {database}.public_pgbench_tellers (\
             tid Int32, bid Int32, tbalance Int32, filler Nullable(String),\
             _lsn UInt64, _xid UInt32,\
             _commit_ts DateTime64(6, 'UTC'), _is_deleted Bool\
@@ -148,7 +148,7 @@ fn create_pgbench_ch_tables(ch: &fx::ChServer, database: &str) -> Result<()> {
     // pgbench_history has no PK; order by (tid, mtime, aid) for FINAL
     // merges, lean on `_lsn` for ReplacingMergeTree's version semantics.
     ch.query(&format!(
-        "CREATE OR REPLACE TABLE {database}.pgbench_history (\
+        "CREATE OR REPLACE TABLE {database}.public_pgbench_history (\
             tid Int32, bid Int32, aid Int32, delta Int32,\
             mtime DateTime64(6), filler Nullable(String),\
             _lsn UInt64, _xid UInt32,\
@@ -386,10 +386,14 @@ async fn run_ddl_intermix(
         //    0 history rows. The bootstrap drains asynchronously, so poll CH
         //    until it matches rather than racing an immediate assert.
         for (src_table, ch_table, expected) in [
-            ("pgbench_accounts", "default.pgbench_accounts", 100_000_u64),
-            ("pgbench_branches", "default.pgbench_branches", 1),
-            ("pgbench_tellers", "default.pgbench_tellers", 10),
-            ("pgbench_history", "default.pgbench_history", 0),
+            (
+                "pgbench_accounts",
+                "default.public_pgbench_accounts",
+                100_000_u64,
+            ),
+            ("pgbench_branches", "default.public_pgbench_branches", 1),
+            ("pgbench_tellers", "default.public_pgbench_tellers", 10),
+            ("pgbench_history", "default.public_pgbench_history", 0),
         ] {
             let src = psql_source(&source, &format!("SELECT count(*) FROM {src_table}"))?;
             anyhow::ensure!(
@@ -521,15 +525,27 @@ async fn run_ddl_intermix(
             "pgbench_tellers",
             "pgbench_history",
         ] {
-            let _ = ch.query(&format!("OPTIMIZE TABLE default.{t} FINAL"));
+            let _ = ch.query(&format!("OPTIMIZE TABLE default.public_{t} FINAL"));
         }
 
         // 16. Parity assertions per table.
         for (src_table, ch_table, sum_col) in [
-            ("pgbench_accounts", "default.pgbench_accounts", "abalance"),
-            ("pgbench_branches", "default.pgbench_branches", "bbalance"),
-            ("pgbench_tellers", "default.pgbench_tellers", "tbalance"),
-            ("pgbench_history", "default.pgbench_history", "delta"),
+            (
+                "pgbench_accounts",
+                "default.public_pgbench_accounts",
+                "abalance",
+            ),
+            (
+                "pgbench_branches",
+                "default.public_pgbench_branches",
+                "bbalance",
+            ),
+            (
+                "pgbench_tellers",
+                "default.public_pgbench_tellers",
+                "tbalance",
+            ),
+            ("pgbench_history", "default.public_pgbench_history", "delta"),
         ] {
             let src_count = psql_source(&source, &format!("SELECT count(*) FROM {src_table}"))?;
             let ch_count = ch.query(&format!(
@@ -571,7 +587,7 @@ async fn run_ddl_intermix(
         //     substitution path fired end-to-end), (b) no row has c set
         //     to anything other than 7 or NULL.
         let updated_count = ch.query(
-            "SELECT count() FROM default.pgbench_accounts FINAL \
+            "SELECT count() FROM default.public_pgbench_accounts FINAL \
              WHERE _is_deleted = 0 AND c IS NOT NULL",
         )?;
         anyhow::ensure!(
@@ -580,7 +596,7 @@ async fn run_ddl_intermix(
              default substitution did not fire (updated_count={updated_count})"
         );
         let off_value = ch.query(
-            "SELECT count() FROM default.pgbench_accounts FINAL \
+            "SELECT count() FROM default.public_pgbench_accounts FINAL \
              WHERE _is_deleted = 0 AND c IS NOT NULL AND c != 7",
         )?;
         anyhow::ensure!(

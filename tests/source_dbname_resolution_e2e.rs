@@ -204,9 +204,12 @@ async fn shadow_catalog_follows_applied_source_dbname() {
 
         let deadline = Instant::now() + Duration::from_secs(90);
         loop {
-            if ch.query("EXISTS TABLE default.dup").unwrap_or_default() == "1"
+            if ch
+                .query("EXISTS TABLE default.public_dup")
+                .unwrap_or_default()
+                == "1"
                 && ch
-                    .query("SELECT b FROM default.dup FINAL WHERE a = 1")
+                    .query("SELECT b FROM default.public_dup FINAL WHERE a = 1")
                     .unwrap_or_default()
                     == "from-duptest"
             {
@@ -216,7 +219,8 @@ async fn shadow_catalog_follows_applied_source_dbname() {
                 Instant::now() < deadline,
                 "bootstrap did not load duptest's row (saw {:?}); the shadow \
                  catalog is resolved against the wrong database",
-                ch.query("SELECT b FROM default.dup FINAL WHERE a = 1").ok(),
+                ch.query("SELECT b FROM default.public_dup FINAL WHERE a = 1")
+                    .ok(),
             );
             std::thread::sleep(Duration::from_millis(200));
         }
@@ -238,7 +242,7 @@ async fn shadow_catalog_follows_applied_source_dbname() {
         let deadline = Instant::now() + Duration::from_secs(90);
         loop {
             let mine = ch
-                .query("SELECT b FROM default.dup FINAL WHERE a = 2")
+                .query("SELECT b FROM default.public_dup FINAL WHERE a = 2")
                 .unwrap_or_default();
             anyhow::ensure!(
                 mine != "cdc-postgres",
@@ -272,7 +276,7 @@ async fn shadow_catalog_follows_applied_source_dbname() {
              database's pre-boot row must not appear"
         );
         anyhow::ensure!(
-            ch.query("SELECT count() FROM default.dup FINAL")
+            ch.query("SELECT count() FROM default.public_dup FINAL")
                 .unwrap_or_default()
                 == "2",
             "duptest's destination holds its own two rows and no others"

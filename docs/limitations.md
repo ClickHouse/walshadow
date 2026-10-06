@@ -40,11 +40,12 @@ and workload limits before attaching
 - date and timestamp values are written without checking ClickHouse calendar
   limits. Values outside supported ranges can return incorrect dates or times
   without stopping replication
-- same-named tables from different PostgreSQL schemas or databases need
-  explicit destination mapping. Config parsing rejects conflicts between
-  explicit entries; `replicate_all` names destinations after source tables, so
-  the second table to claim one destination is refused with an error and left
-  unreplicated until it names its own `target_database` or `target_table`
+- same-named tables from different PostgreSQL databases share one destination
+  and merge their rows into it, silently. Derived names carry `$schema$`, so
+  schemas do not collide, but databases do. Separate them with
+  `target_database`, `target_table`, or an `auto_create_name` carrying
+  `$database$`, see
+  [Choose shared or separate destinations](multi-database.md)
 - `base_backup` and `object_store` table loads publish with staging-table swap, database must support `EXCHANGE TABLES`
 - backup rows inserted into staging do not fire destination materialized views, live rows copied back after swap can fire twice
 

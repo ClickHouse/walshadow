@@ -203,7 +203,7 @@ async fn bootstrap_survives_extension_absent_from_oracle() {
         let deadline = Instant::now() + Duration::from_secs(90);
         loop {
             let n = ch
-                .query("SELECT count() FROM default.t FINAL WHERE _is_deleted = 0")
+                .query("SELECT count() FROM default.public_t FINAL WHERE _is_deleted = 0")
                 .unwrap_or_default();
             if n == "1" {
                 break;
@@ -221,7 +221,7 @@ async fn bootstrap_survives_extension_absent_from_oracle() {
         }
         // The oracle-routed enum column must still resolve.
         let feel = ch
-            .query("SELECT feel FROM default.t FINAL WHERE id = 1")
+            .query("SELECT feel FROM default.public_t FINAL WHERE id = 1")
             .context("read enum column from CH")?;
         if feel != "happy" {
             anyhow::bail!("enum column not decoded: feel = {feel:?}");

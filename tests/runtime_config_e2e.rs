@@ -47,8 +47,8 @@
 //!    * Operator inserts `config_namespace (auto_create=true)`, no
 //!      `config_table` row and no TOML mapping.
 //!    * Source `CREATE TABLE` in the namespace + INSERT.
-//!    * Expect: the namespace flag alone auto-creates the CH table and the
-//!      row lands.
+//!    * Expect: the namespace flag alone auto-creates the CH table, named
+//!      `app_thing` off the source namespace, and the row lands.
 //!
 //! 8. `pre_opt_in_xact_discards_post_opt_in_routes`
 //!    * No TOML mapping, no `initial_load`: a row committed before the
@@ -175,19 +175,19 @@ async fn opt_in_via_config_table_replicates_new_table() {
 
     let tbls = ch
         .query(
-            "SELECT name FROM system.tables WHERE database = 'walshadow_test' AND name = 'events'",
+            "SELECT name FROM system.tables WHERE database = 'walshadow_test' AND name = 'app_events'",
         )
         .expect("ch table existence");
-    assert_eq!(tbls, "events", "opt-in must auto-create the CH table");
+    assert_eq!(tbls, "app_events", "opt-in must auto-create the CH table");
 
     let n = ch
-        .query("SELECT count() FROM walshadow_test.events FINAL WHERE _is_deleted = 0")
+        .query("SELECT count() FROM walshadow_test.app_events FINAL WHERE _is_deleted = 0")
         .expect("ch count");
     assert_eq!(n, "1", "post-opt-in insert must reach CH");
 
     let body = ch
         .query(
-            "SELECT argMax(body, _lsn) FROM walshadow_test.events \
+            "SELECT argMax(body, _lsn) FROM walshadow_test.app_events \
              WHERE _is_deleted = 0 AND id = 1",
         )
         .expect("ch body");
@@ -377,7 +377,7 @@ async fn forward_decl_materializes_on_create_table() {
     // Parked: nothing materialised yet.
     let pre = ch
         .query(
-            "SELECT count() FROM system.tables WHERE database = 'walshadow_test' AND name = 'later'",
+            "SELECT count() FROM system.tables WHERE database = 'walshadow_test' AND name = 'app_later'",
         )
         .expect("ch system.tables");
     assert_eq!(pre, "0", "forward-decl must not create a CH table yet");
@@ -405,17 +405,17 @@ async fn forward_decl_materializes_on_create_table() {
 
     let tbls = ch
         .query(
-            "SELECT name FROM system.tables WHERE database = 'walshadow_test' AND name = 'later'",
+            "SELECT name FROM system.tables WHERE database = 'walshadow_test' AND name = 'app_later'",
         )
         .expect("ch table existence");
     assert_eq!(
-        tbls, "later",
+        tbls, "app_later",
         "CREATE TABLE must materialise the parked opt-in"
     );
 
     let body = ch
         .query(
-            "SELECT argMax(body, _lsn) FROM walshadow_test.later \
+            "SELECT argMax(body, _lsn) FROM walshadow_test.app_later \
              WHERE _is_deleted = 0 AND id = 1",
         )
         .expect("ch body");
@@ -524,7 +524,7 @@ async fn opt_in_non_empty_backfills_pre_opt_in_rows() {
     let mut n = String::new();
     while std::time::Instant::now() < deadline {
         n = ch
-            .query("SELECT count(DISTINCT id) FROM walshadow_test.inventory FINAL WHERE _is_deleted = 0")
+            .query("SELECT count(DISTINCT id) FROM walshadow_test.app_inventory FINAL WHERE _is_deleted = 0")
             .unwrap_or_default();
         if n == "5" {
             break;
@@ -538,7 +538,7 @@ async fn opt_in_non_empty_backfills_pre_opt_in_rows() {
         .query(
             "SELECT argMax(name, _lsn), argMax(price, _lsn), argMax(added_at, _lsn), \
                     argMax(meta, _lsn) \
-             FROM walshadow_test.inventory WHERE _is_deleted = 0 AND id = 2",
+             FROM walshadow_test.app_inventory WHERE _is_deleted = 0 AND id = 2",
         )
         .expect("ch backfilled row");
     assert_eq!(bolt, "bolt\t12.5\t2024-01-02 03:04:06.000000\t{\"b\": 2}");
@@ -547,7 +547,7 @@ async fn opt_in_non_empty_backfills_pre_opt_in_rows() {
     let big = ch
         .query(
             "SELECT length(argMax(blob, _lsn)), length(argMax(note, _lsn)) \
-             FROM walshadow_test.inventory WHERE _is_deleted = 0 AND id = 2",
+             FROM walshadow_test.app_inventory WHERE _is_deleted = 0 AND id = 2",
         )
         .expect("ch large values");
     assert_eq!(big, "30000\t120000");
@@ -557,7 +557,7 @@ async fn opt_in_non_empty_backfills_pre_opt_in_rows() {
         .query(
             "SELECT argMaxIf(weight, _lsn, id = 2), argMaxIf(weight, _lsn, id = 3), \
                     argMaxIf(weight, _lsn, id = 4) \
-             FROM walshadow_test.inventory WHERE _is_deleted = 0",
+             FROM walshadow_test.app_inventory WHERE _is_deleted = 0",
         )
         .expect("ch numeric specials");
     assert_eq!(weights, "NaN\tInfinity\t-Infinity");
@@ -567,7 +567,7 @@ async fn opt_in_non_empty_backfills_pre_opt_in_rows() {
         .query(
             "SELECT argMax(name, _lsn), isNull(argMax(added_at, _lsn)), \
                     isNull(argMax(meta, _lsn)) \
-             FROM walshadow_test.inventory WHERE _is_deleted = 0 AND id = 3",
+             FROM walshadow_test.app_inventory WHERE _is_deleted = 0 AND id = 3",
         )
         .expect("ch null row");
     assert_eq!(crate_row, "crate\t1\t1");
@@ -575,7 +575,7 @@ async fn opt_in_non_empty_backfills_pre_opt_in_rows() {
     // Post-opt-in UPDATE (commit_lsn > S) beats the COPY baseline.
     let anvil = ch
         .query(
-            "SELECT argMax(name, _lsn) FROM walshadow_test.inventory \
+            "SELECT argMax(name, _lsn) FROM walshadow_test.app_inventory \
              WHERE _is_deleted = 0 AND id = 1",
         )
         .expect("ch mutated row");
@@ -587,7 +587,7 @@ async fn opt_in_non_empty_backfills_pre_opt_in_rows() {
     // Post-opt-in INSERT streams via WAL, no COPY involvement.
     let dowel = ch
         .query(
-            "SELECT argMax(name, _lsn) FROM walshadow_test.inventory \
+            "SELECT argMax(name, _lsn) FROM walshadow_test.app_inventory \
              WHERE _is_deleted = 0 AND id = 100",
         )
         .expect("ch streamed row");
@@ -670,7 +670,7 @@ async fn opt_in_then_alter_add_column_reaches_ch() {
     let qty_col = ch
         .query(
             "SELECT count() FROM system.columns \
-             WHERE database = 'walshadow_test' AND table = 'gadgets' AND name = 'qty'",
+             WHERE database = 'walshadow_test' AND table = 'app_gadgets' AND name = 'qty'",
         )
         .expect("ch column existence");
     assert_eq!(qty_col, "1", "post-opt-in ALTER must ADD COLUMN on CH");
@@ -679,7 +679,7 @@ async fn opt_in_then_alter_add_column_reaches_ch() {
     let post = ch
         .query(
             "SELECT argMax(name, _lsn), argMax(qty, _lsn) \
-             FROM walshadow_test.gadgets WHERE _is_deleted = 0 AND id = 2",
+             FROM walshadow_test.app_gadgets WHERE _is_deleted = 0 AND id = 2",
         )
         .expect("ch post-alter row");
     assert_eq!(post, "post-alter\t7");
@@ -688,7 +688,7 @@ async fn opt_in_then_alter_add_column_reaches_ch() {
     let pre = ch
         .query(
             "SELECT argMax(name, _lsn), isNull(argMax(qty, _lsn)) \
-             FROM walshadow_test.gadgets WHERE _is_deleted = 0 AND id = 1",
+             FROM walshadow_test.app_gadgets WHERE _is_deleted = 0 AND id = 1",
         )
         .expect("ch pre-alter row");
     assert_eq!(pre, "pre-alter\t1");
@@ -766,17 +766,18 @@ async fn auto_create_namespace_via_config_namespace() {
 
     let tbls = ch
         .query(
-            "SELECT name FROM system.tables WHERE database = 'walshadow_test' AND name = 'thing'",
+            "SELECT name FROM system.tables \
+             WHERE database = 'walshadow_test' AND name = 'app_thing'",
         )
         .expect("ch table existence");
     assert_eq!(
-        tbls, "thing",
-        "config_namespace.auto_create must create the CH table"
+        tbls, "app_thing",
+        "config_namespace.auto_create must create the CH table, named from the namespace"
     );
 
     let body = ch
         .query(
-            "SELECT argMax(body, _lsn) FROM walshadow_test.thing \
+            "SELECT argMax(body, _lsn) FROM walshadow_test.app_thing \
              WHERE _is_deleted = 0 AND id = 1",
         )
         .expect("ch body");
@@ -982,18 +983,18 @@ async fn pre_opt_in_xact_discards_post_opt_in_routes() {
     assert!(discarded >= 1, "pre-opt-in xact must be a counted discard");
 
     let n = ch
-        .query("SELECT count() FROM walshadow_test.metrics FINAL WHERE _is_deleted = 0")
+        .query("SELECT count() FROM walshadow_test.app_metrics FINAL WHERE _is_deleted = 0")
         .expect("ch count");
     assert_eq!(n, "1", "exactly the post-opt-in row lands");
 
     let gone = ch
-        .query("SELECT count() FROM walshadow_test.metrics WHERE id = 1")
+        .query("SELECT count() FROM walshadow_test.app_metrics WHERE id = 1")
         .expect("ch pre-opt-in row");
     assert_eq!(gone, "0", "pre-opt-in row must never reach CH");
 
     let v = ch
         .query(
-            "SELECT argMax(v, _lsn) FROM walshadow_test.metrics \
+            "SELECT argMax(v, _lsn) FROM walshadow_test.app_metrics \
              WHERE _is_deleted = 0 AND id = 2",
         )
         .expect("ch v");
@@ -1072,7 +1073,7 @@ async fn pattern_row_scopes_tables_by_glob() {
 
     let body = ch
         .query(
-            "SELECT argMax(body, _lsn) FROM walshadow_test.events_2026 \
+            "SELECT argMax(body, _lsn) FROM walshadow_test.app_events_2026 \
              WHERE _is_deleted = 0 AND id = 1",
         )
         .expect("ch body");
@@ -1166,13 +1167,13 @@ async fn opt_in_row_pins_order_by_and_primary_key() {
     pipeline.shutdown().await.expect("pipeline drains clean");
 
     let ddl = ch
-        .query("SHOW CREATE TABLE walshadow_test.keyed")
+        .query("SHOW CREATE TABLE walshadow_test.app_keyed")
         .expect("show create");
     assert!(ddl.contains("ORDER BY (tenant, id)"), "{ddl}");
     assert!(ddl.contains("PRIMARY KEY (tenant)"), "{ddl}");
 
     let n = ch
-        .query("SELECT count() FROM walshadow_test.keyed FINAL WHERE _is_deleted = 0")
+        .query("SELECT count() FROM walshadow_test.app_keyed FINAL WHERE _is_deleted = 0")
         .expect("ch count");
     assert_eq!(n, "1", "post-opt-in insert must reach CH");
 }
@@ -1251,7 +1252,7 @@ async fn pattern_row_shapes_auto_created_tables() {
     pipeline.shutdown().await.expect("pipeline drains clean");
 
     let ddl = ch
-        .query("SHOW CREATE TABLE walshadow_test.events_2026")
+        .query("SHOW CREATE TABLE walshadow_test.app_events_2026")
         .expect("show create");
     assert!(ddl.contains("`_peerdb_version` UInt64"), "{ddl}");
     assert!(!ddl.contains("_is_deleted"), "marker dropped: {ddl}");
@@ -1259,13 +1260,15 @@ async fn pattern_row_shapes_auto_created_tables() {
 
     // A relation the pattern misses keeps the cluster-wide names
     let other = ch
-        .query("SHOW CREATE TABLE walshadow_test.orders")
+        .query("SHOW CREATE TABLE walshadow_test.app_orders")
         .expect("show create");
     assert!(other.contains("`_lsn` UInt64"), "{other}");
     assert!(other.contains("_is_deleted"), "{other}");
 
     let body = ch
-        .query("SELECT argMax(body, _peerdb_version) FROM walshadow_test.events_2026 WHERE id = 1")
+        .query(
+            "SELECT argMax(body, _peerdb_version) FROM walshadow_test.app_events_2026 WHERE id = 1",
+        )
         .expect("ch body");
     assert_eq!(body, "shaped", "rows INSERT under the renamed columns");
 }
@@ -1372,7 +1375,7 @@ async fn copy_load_resolves_unchanged_toast_after_update() {
             "SELECT pg_switch_wal()".into(),
         ],
         "walshadow-copy-toast",
-        "SELECT count() FROM walshadow_test.docs FINAL WHERE _is_deleted = 0",
+        "SELECT count() FROM walshadow_test.app_docs FINAL WHERE _is_deleted = 0",
         "2",
     )
     .await;
@@ -1381,7 +1384,7 @@ async fn copy_load_resolves_unchanged_toast_after_update() {
     let doc = ch
         .query(
             "SELECT tag, length(big), substring(big, 1, 32), substring(big, 6369, 32) \
-             FROM walshadow_test.docs FINAL WHERE _is_deleted = 0 AND id = 1",
+             FROM walshadow_test.app_docs FINAL WHERE _is_deleted = 0 AND id = 1",
         )
         .expect("ch updated row");
     assert_eq!(
@@ -1416,7 +1419,7 @@ async fn copy_load_pins_output_settings() {
         ],
         "walshadow-copy-settings",
         "SELECT groupArray(span) FROM \
-         (SELECT span FROM walshadow_test.spans FINAL WHERE _is_deleted = 0 ORDER BY id)",
+         (SELECT span FROM walshadow_test.app_spans FINAL WHERE _is_deleted = 0 ORDER BY id)",
         "['1 day 02:03:04','1 day 02:03:04']",
     )
     .await;
