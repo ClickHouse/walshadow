@@ -1232,12 +1232,7 @@ pub(crate) async fn bootstrap_build_mapping(
         (
             walshadow::ch_ddl::DdlConfig::from_resolved(
                 &snap,
-                emitter_cfg.database.clone(),
-                emitter_cfg.source.dbname.clone(),
-                emitter_cfg.soft_delete,
-                emitter_cfg.system_columns.clone(),
-                emitter_cfg.replicate_all,
-                emitter_cfg.runtime_config_schema.clone(),
+                walshadow::ch_ddl::DdlBoot::from_emitter(emitter_cfg),
             ),
             Arc::new(snap.tables.clone()),
             snap.clone(),

@@ -8,9 +8,21 @@ different PostgreSQL schemas never collide
 
 ## Name auto-created tables
 
-`auto_create_name` sets the derived name per namespace as a template over
-`$database$` (source database), `$schema$` (source namespace) and `$table$`
-(source relation). Default is `$schema$_$table$`
+A derived name is a template over `$database$` (source database), `$schema$`
+(source namespace) and `$table$` (source relation). Default is
+`$schema$_$table$`
+
+`[stream] auto_create_name_all` sets it for every namespace, which is the one
+to reach for beside `replicate_all`: a namespace with no entry of its own still
+auto-creates under it
+
+```toml
+[stream]
+replicate_all = true
+auto_create_name_all = "$database$_$schema$_"   # audit.orders -> app_audit_orders
+```
+
+`auto_create_name` overrides it for one namespace
 
 ```toml
 [namespace.audit]
@@ -41,8 +53,11 @@ value in place
 | `wh_` | `wh_orders` |
 | `""` or `$table$` | `orders` |
 
-`target_table` names a destination outright and ignores the template. The
-template applies when the table is created, so changing it leaves existing
+Precedence is `target_table`, then the namespace's `auto_create_name`, then
+`[stream] auto_create_name_all`, then `$schema$_$table$`. `target_table`
+names a destination outright and ignores the template
+
+The template applies when the table is created, so changing it leaves existing
 destination tables where they are and starts writing to the new name
 
 ## Generated shape

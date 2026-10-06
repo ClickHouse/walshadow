@@ -204,6 +204,17 @@ async fn wait_done(backfiller: &CopyBackfiller, dir: &Path) {
     })
     .await
     .expect("backfill completes");
+    // `publish` marks the backfill done before `settle` promotes what the load
+    // held, so the carry ledger draining is what says those rows landed
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while std::fs::read_to_string(walshadow::visibility_pending::ledger_path(dir))
+            .is_ok_and(|l| l.contains("[[carry]]"))
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("pending visibility settles");
     let ledger = read_ledger(dir);
     let entry = &ledger["backfill"][0];
     assert_eq!(entry["done"].as_bool(), Some(true));

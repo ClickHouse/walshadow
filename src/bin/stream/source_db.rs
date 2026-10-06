@@ -136,12 +136,7 @@ pub(crate) async fn build_source_db(input: SourceDbInputs<'_>) -> anyhow::Result
     // snapshot; refreshes per apply as the resolver republishes.
     let ddl_cfg = walshadow::ch_ddl::DdlConfig::from_resolved(
         &config_rx.borrow(),
-        cfg.database.clone(),
-        cfg.source.dbname.clone(),
-        cfg.soft_delete,
-        cfg.system_columns.clone(),
-        cfg.replicate_all,
-        cfg.runtime_config_schema.clone(),
+        walshadow::ch_ddl::DdlBoot::from_emitter(&cfg),
     );
     let dest = walshadow::config::DestEmitter::new(Arc::new(cfg.clone()), Some(config_rx.clone()));
     let mut applicator = walshadow::ch_ddl::DdlApplicator::new(

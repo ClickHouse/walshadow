@@ -601,6 +601,7 @@ impl ConfigResolver {
                     .get(ns)
                     .and_then(|m| m.auto_create_name.clone())
             })
+            .or_else(|| inner.base.auto_create_name_all.clone())
             .unwrap_or_default()
             .render(&inner.base.source.dbname, ns, &rel.name)
     }
@@ -1280,12 +1281,15 @@ mod tests {
         assert_eq!(s.replicate, Some(true), "TOML scope still applies");
         let ddl = crate::emit::ch_ddl::DdlConfig::from_resolved(
             &r,
-            "db".into(),
-            "app".into(),
-            false,
-            Arc::default(),
-            false,
-            None,
+            crate::ch_ddl::DdlBoot {
+                target_database: "db".into(),
+                source_database: "app".into(),
+                soft_delete: false,
+                system: Arc::default(),
+                replicate_all: false,
+                auto_create_name_all: None,
+                runtime_config_schema: None,
+            },
         );
         assert_eq!(ddl.declared_scope(&rel), Some(true));
     }
@@ -1330,12 +1334,15 @@ mod tests {
         // A row reaches the DDL applicator through the resolved snapshot
         let ddl = crate::emit::ch_ddl::DdlConfig::from_resolved(
             &r,
-            "db".into(),
-            "app".into(),
-            false,
-            Arc::default(),
-            false,
-            None,
+            crate::ch_ddl::DdlBoot {
+                target_database: "db".into(),
+                source_database: "app".into(),
+                soft_delete: false,
+                system: Arc::default(),
+                replicate_all: false,
+                auto_create_name_all: None,
+                runtime_config_schema: None,
+            },
         );
         let settings = ddl.rules.settings(&events);
         let shape = ddl.create_shape(&settings);
@@ -1398,12 +1405,15 @@ mod tests {
         );
         DdlConfig::from_resolved(
             &r,
-            "db".into(),
-            "app".into(),
-            false,
-            Arc::default(),
-            false,
-            None,
+            crate::ch_ddl::DdlBoot {
+                target_database: "db".into(),
+                source_database: "app".into(),
+                soft_delete: false,
+                system: Arc::default(),
+                replicate_all: false,
+                auto_create_name_all: None,
+                runtime_config_schema: None,
+            },
         )
         .auto_create_namespaces
     }
