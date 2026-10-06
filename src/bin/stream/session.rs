@@ -12,7 +12,10 @@ use tokio_postgres::types::Oid;
 use tokio_util::sync::CancellationToken;
 use walrus::pg::backup::format_pg_lsn;
 use walshadow::archive::Archive;
-use walshadow::boundary_hold::{BoundaryGateConfig, BoundaryHoldSink, CatalogBoundaryGate};
+use walshadow::boundary_hold::{
+    AttachSlot, BoundaryGateConfig, BoundaryHoldSink, CatalogBoundaryGate, PendingDatabase,
+    PendingDatabases,
+};
 use walshadow::ch_emitter::{EmitterConfig, EmitterStats};
 use walshadow::config::{ConfigResolver, SourceConn};
 use walshadow::manifest;
@@ -58,8 +61,8 @@ use crate::shadow_proc::{
 };
 use crate::sinks::{DaemonSinks, DecoderXactPair};
 use crate::source_db::{
-    DescLogInputs, SourceDbInputs, build_source_db, metrics_only_db, open_db_desc_log,
-    open_source_sql_client,
+    ATTACH_MARKER, DescLogInputs, SourceDbInputs, build_source_db, list_databases, metrics_only_db,
+    open_db_desc_log, open_source_sql_client,
 };
 use crate::source_recovery::{
     BARRIER_LOG_INTERVAL, FORK_FENCE_DRAIN, PROMOTION_POLL, PauseState, PromotionGate,
@@ -74,6 +77,7 @@ pub(crate) async fn run_session(
     reloader: &Arc<walshadow::control::Reloader>,
     sighup: tokio::signal::unix::Signal,
     shutdown: &CancellationToken,
+    attach: &AttachSlot,
 ) -> Result<()> {
     // Clone the Arc-backed registry so the body's `&metrics` uses are unchanged.
     let metrics = metrics.clone();
@@ -545,9 +549,12 @@ pub(crate) async fn run_session(
         .shadow_socket_dir
         .to_str()
         .context("shadow-socket-dir not UTF-8")?;
-    let mut db_conns: Vec<DbLink> = Vec::with_capacity(source_databases.len());
-    for (index, name) in source_databases.iter().enumerate() {
-        // Same document per database, scoped to that database's entries
+    let primary_position = source_databases
+        .iter()
+        .position(|db| *db == source_conn.dbname)
+        .unwrap_or(0);
+    let link_for = |index: usize| -> Result<_> {
+        let name = &source_databases[index];
         let emitter = match ch_config.as_ref() {
             Some(_) => Some(finish_ch_config(
                 EmitterConfig::for_database(&merged, name)
@@ -557,10 +564,15 @@ pub(crate) async fn run_session(
             None => None,
         };
         let conninfo = socket_conninfo(socket_dir, args.shadow_port, &args.shadow_user, name);
-        db_conns.push(
+        Ok((name, emitter, conninfo))
+    };
+    let mut links: Vec<Option<DbLink>> = (0..source_databases.len()).map(|_| None).collect();
+    {
+        let (name, emitter, conninfo) = link_for(primary_position)?;
+        links[primary_position] = Some(
             DbLink::connect(DbLinkConfig {
                 name,
-                index,
+                index: primary_position,
                 workers: bridge_workers,
                 bridge_path: &bridge_path,
                 shadow_conninfo: &conninfo,
@@ -570,9 +582,91 @@ pub(crate) async fn run_session(
             .await?,
         );
     }
-    let primary_index = source_databases
+    let mut pending_dbs: Vec<PendingDatabase> = Vec::new();
+    if source_databases.len() > 1 {
+        let shadow_dbs = list_databases(
+            &open_shadow_sql_client(
+                &args.shadow_socket_dir,
+                args.shadow_port,
+                &args.shadow_user,
+                &source_conn.dbname,
+            )
+            .await?,
+        )
+        .await
+        .context("list shadow databases")?;
+        let source_sql = feed
+            .sql_client()
+            .await
+            .context("source sidecar sql for database list")?;
+        let visible_at = source_sql
+            .query_one("SELECT pg_current_wal_lsn()::text", &[])
+            .await
+            .context("source WAL position for database list")?;
+        let visible_at = walshadow::pg::parse_pg_lsn(visible_at.get::<_, &str>(0))
+            .context("parse source WAL position")?;
+        let source_dbs = list_databases(source_sql)
+            .await
+            .context("list source databases")?;
+        for (index, link) in links.iter_mut().enumerate() {
+            if index == primary_position {
+                continue;
+            }
+            let (name, emitter, conninfo) = link_for(index)?;
+            let source_oid = *source_dbs
+                .get(name.as_str())
+                .with_context(|| format!("database {name} is configured but not on the source"))?;
+            match shadow_dbs.get(name.as_str()) {
+                Some(&oid) if oid == source_oid => {
+                    *link = Some(
+                        DbLink::connect(DbLinkConfig {
+                            name,
+                            index,
+                            workers: bridge_workers,
+                            bridge_path: &bridge_path,
+                            shadow_conninfo: &conninfo,
+                            budget: connect_budget,
+                            emitter,
+                        })
+                        .await?,
+                    );
+                }
+                Some(&oid) => anyhow::bail!(
+                    "database {name} is oid {source_oid} on the source but oid {oid} on the \
+                     shadow: it was recreated after the shadow's backup, re-bootstrap"
+                ),
+                None => {
+                    let dir = args.spill_dir.join(format!("db-{source_oid}"));
+                    tokio::fs::create_dir_all(&dir)
+                        .await
+                        .with_context(|| format!("create {}", dir.display()))?;
+                    tokio::fs::write(dir.join(ATTACH_MARKER), b"")
+                        .await
+                        .with_context(|| format!("mark {} as attaching", dir.display()))?;
+                    tracing::warn!(
+                        target: "walshadow",
+                        database = %name,
+                        oid = source_oid,
+                        visible_at = %format_pg_lsn(visible_at),
+                        "database not in the shadow yet; following it once the shadow replays its creation",
+                    );
+                    pending_dbs.push(PendingDatabase {
+                        oid: source_oid,
+                        name: name.clone(),
+                        visible_at,
+                        bridge_socket: walshadow::bridge::slot_path(
+                            &bridge_path,
+                            index * bridge_workers.clamp(1, walshadow::bridge::MAX_BRIDGE_WORKERS),
+                        ),
+                    });
+                }
+            }
+        }
+    }
+    let db_conns: Vec<DbLink> = links.into_iter().flatten().collect();
+    let primary_index = db_conns
         .iter()
-        .position(|db| *db == source_conn.dbname)
+        .position(|db| db.name == source_conn.dbname)
         .unwrap_or(0);
     let shadow_conninfo = socket_conninfo(
         args.shadow_socket_dir
@@ -1059,7 +1153,13 @@ pub(crate) async fn run_session(
             backfiller: copy_backfillers.get(&conn.oid).cloned(),
         })
         .collect();
-    let decoder_xact = BoundaryHoldSink::new(decoder_xact, boundary_gate).with_capture(captures);
+    let decoder_xact = BoundaryHoldSink::new(decoder_xact, boundary_gate)
+        .with_capture(captures)
+        .with_pending(PendingDatabases::new(
+            pending_dbs,
+            connect_budget,
+            attach.clone(),
+        ));
     let mut record_sink = DaemonSinks {
         metrics: MetricsRecordSink::default(),
         decoder_xact,
