@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
 use walrus::pg::wal::segment::SegmentName;
+use walshadow::crash_test::Point;
 use walshadow::pg::parse_pg_lsn;
 use walshadow::record::WAL_SEG_SIZE;
 use walshadow::shadow::{Shadow, ShadowConfig};
@@ -646,6 +647,7 @@ fn spawn_daemon(bin: &str, args: &[String], stderr_path: &Path) -> Result<Child>
     Command::new(bin)
         .args(args)
         .env("RUST_LOG", "warn,walshadow=info")
+        .env("WALSHADOW_TEST_CRASH", stderr_path.with_extension("arm"))
         .stdout(Stdio::null())
         .stderr(Stdio::from(stderr_file))
         .process_group(0)
@@ -2790,4 +2792,170 @@ async fn a_sibling_timeline_two_is_refused_against_its_switchpoint() {
     if let Err(e) = result {
         panic!("{e:#}\n--- daemon stderr ---\n{stderr}");
     }
+}
+
+async fn check_ddl_crash(point: Point, applied_columns: u64) {
+    use std::os::unix::process::ExitStatusExt;
+    use walshadow::desc_log::{DescLogIdentity, DescriptorLog};
+    use walshadow::manifest::Manifest;
+
+    if !gated() {
+        return;
+    }
+    let mut h = Harness::up(&fx::Ports::alloc())
+        .await
+        .expect("bring up harness");
+    let result = async {
+        h.wait_ready(Duration::from_secs(60)).await?;
+        h.ctl_body(&["apply"], "[table.demo.crash_t]\nreplicate = true")?;
+        h.ctl(&["reload"])?;
+        h.psql(
+            "CREATE TABLE demo.crash_t (id bigint PRIMARY KEY, v text); \
+             INSERT INTO demo.crash_t VALUES (1, 'before')",
+        )?;
+        h.wait_ch(
+            "SELECT v FROM demo.demo_crash_t FINAL WHERE id = 1",
+            "before",
+            Duration::from_secs(60),
+        )
+        .await?;
+        let arm = h.stderr_path.with_extension("arm");
+        fs::write(&arm, format!("{point:?}"))?;
+        h.psql(
+            "ALTER TABLE demo.crash_t ADD COLUMN a bigint, \
+                                      ADD COLUMN b text",
+        )?;
+        h.psql("INSERT INTO demo.crash_t VALUES (2, 'after', 8, 'new')")?;
+        if point == Point::AfterManifest {
+            h.psql("SELECT pg_switch_wal()")?;
+        }
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while h.alive() {
+            ensure!(
+                Instant::now() < deadline,
+                "crash point {point:?} never fired"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let status = h.child.take().context("daemon missing")?.wait()?;
+        ensure!(
+            status.signal() == Some(libc::SIGKILL),
+            "unexpected exit: {status}"
+        );
+        let commit: u64 = fs::read_to_string(arm.with_extension("hit"))?.parse()?;
+        let spill = h.tmp.path().join("spill");
+        let manifest: Manifest = toml::from_str(&fs::read_to_string(spill.join("manifest.toml"))?)?;
+        ensure!(
+            (manifest.floor.get() >= commit) == (point == Point::AfterManifest),
+            "unexpected durable floor {} at commit {commit} ({point:?})",
+            manifest.floor.get(),
+        );
+        if point != Point::AfterManifest {
+            ensure!(
+                manifest.lsn.emitter_ack.get() < commit,
+                "ack reached manifest before crash"
+            );
+        }
+        let log = DescriptorLog::open(
+            &spill,
+            DescLogIdentity {
+                pg_major: h.psql("SHOW server_version_num")?.parse::<u32>()? / 10000,
+                system_id: h.psql("SELECT system_identifier FROM pg_control_system()")?,
+                timeline: 1,
+                db_oid: h
+                    .psql("SELECT oid FROM pg_database WHERE datname = 'postgres'")?
+                    .parse()?,
+                wal_seg_size: WAL_SEG_SIZE as u32,
+            },
+        )
+        .await?;
+        let desc = log
+            .active_present_at(u64::MAX)
+            .into_iter()
+            .find(|desc| desc.rel_name.name.as_ref() == "crash_t")
+            .context("missing table descriptor")?;
+        let stored_columns = desc
+            .attributes
+            .iter()
+            .filter(|att| matches!(att.name.as_ref(), "a" | "b"))
+            .count();
+        ensure!(
+            stored_columns
+                == if point == Point::BeforeDescriptor {
+                    0
+                } else {
+                    2
+                },
+            "unexpected descriptor at {point:?}: {stored_columns} added columns"
+        );
+        ensure!(
+            log.floor_at_write().get() < commit,
+            "descriptor GC passed crash boundary"
+        );
+        drop(log);
+        let added = "SELECT count() FROM system.columns WHERE database = 'demo' \
+                     AND table = 'demo_crash_t' AND name IN ('a', 'b')";
+        ensure!(
+            h.ch_get(added)? == applied_columns.to_string(),
+            "wrong partial DDL at {point:?}"
+        );
+        fs::remove_file(arm)?;
+        h.start_daemon(Duration::from_secs(120)).await?;
+        h.wait_ch(added, "2", Duration::from_secs(60)).await?;
+        let rows = "SELECT id, v, a, b FROM demo.demo_crash_t FINAL ORDER BY id FORMAT TSV";
+        h.wait_ch(
+            rows,
+            "1\tbefore\t\\N\t\\N\n2\tafter\t8\tnew",
+            Duration::from_secs(60),
+        )
+        .await?;
+        h.psql("INSERT INTO demo.crash_t VALUES (3, 'live', 9, 'restart')")?;
+        h.wait_ch(
+            rows,
+            "1\tbefore\t\\N\t\\N\n2\tafter\t8\tnew\n3\tlive\t9\trestart",
+            Duration::from_secs(60),
+        )
+        .await?;
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    let stderr = h.teardown();
+    if let Err(e) = result {
+        panic!("{point:?}: {e:#}\n--- daemon stderr ---\n{stderr}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ddl_crash_before_descriptor_append() {
+    check_ddl_crash(Point::BeforeDescriptor, 0).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ddl_crash_after_descriptor_fsync_before_queue() {
+    check_ddl_crash(Point::AfterDescriptor, 0).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ddl_crash_after_queue_before_clickhouse() {
+    check_ddl_crash(Point::BeforeDdl, 0).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ddl_crash_after_first_alter() {
+    check_ddl_crash(Point::AfterAlter, 1).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ddl_crash_after_complete_ddl_before_ack() {
+    check_ddl_crash(Point::AfterDdl, 2).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ddl_crash_after_ack_before_manifest() {
+    check_ddl_crash(Point::AfterAck, 2).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ddl_crash_after_manifest_before_descriptor_gc() {
+    check_ddl_crash(Point::AfterManifest, 2).await;
 }

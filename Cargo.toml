@@ -39,6 +39,10 @@ lz4 = ["clickhouse-c-rs/lz4"]
 zstd = ["clickhouse-c-rs/zstd"]
 test-support = []
 
+[lints.rust]
+# cargo-llvm-cov passes --cfg=coverage
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(coverage)"] }
+
 [dependencies]
 wal-rus = "0.3.5"
 clickhouse-c-rs = { version = "0.2.2", default-features = false, features = ["tokio", "tls"] }
