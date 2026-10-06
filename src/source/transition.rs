@@ -1002,18 +1002,11 @@ pub async fn load_boot_history(
     Ok(TimelineHistory::root(live_timeline))
 }
 
-/// History bytes for `tli`: the chain already holds the target's, every
-/// ancestor comes off the source
-async fn branch_history(
-    feed: &mut SourceFeed,
-    history: &TimelineHistory,
-    tli: u32,
-) -> Result<Vec<u8>> {
-    if tli == history.target() {
-        return Ok(history.raw().to_vec());
-    }
-    feed.timeline_history(tli)
-        .await?
+/// History bytes for `tli`: each ancestor's file is a prefix of the target's
+fn branch_history(history: &TimelineHistory, tli: u32) -> Result<Vec<u8>> {
+    history
+        .raw_for(tli)
+        .map(<[u8]>::to_vec)
         .with_context(|| format!("history_missing: timeline {tli}"))
 }
 
@@ -1031,7 +1024,6 @@ async fn persist_history(out_dir: &Path, tli: u32, raw: &[u8]) -> Result<()> {
 /// Re-advertise crossings floor passed before shadow
 pub async fn seed_shadow_branches(
     state: &mut ShadowStreamState,
-    feed: &mut SourceFeed,
     history: &TimelineHistory,
     out_dir: &Path,
     through: u32,
@@ -1042,7 +1034,7 @@ pub async fn seed_shadow_branches(
     // unprovable branch the boot path already warned about) has none to offer.
     let boot = state.timeline;
     if boot > 1 {
-        let raw = branch_history(feed, history, boot).await?;
+        let raw = branch_history(history, boot)?;
         if raw.is_empty() {
             tracing::warn!(
                 target: "walshadow",
@@ -1063,7 +1055,7 @@ pub async fn seed_shadow_branches(
         let switch_lsn = history
             .begin_of(next)
             .with_context(|| format!("timeline {next} has no switchpoint in the chain"))?;
-        let raw = branch_history(feed, history, next).await?;
+        let raw = branch_history(history, next)?;
         persist_history(out_dir, next, &raw).await?;
         state.advertise_timeline(next, switch_lsn, raw);
         tracing::info!(
@@ -1080,6 +1072,27 @@ pub async fn seed_shadow_branches(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn seed_ancestor_histories_without_source_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let history = TimelineHistory::parse(
+            4,
+            b"1\t0/1000000\tfirst\n2\t0/2000000\tsecond\n3\t0/3000000\tthird\n",
+        )
+        .unwrap();
+        let mut state = ShadowStreamState::new(2, "123".into(), 0x1000000, 1024);
+        seed_shadow_branches(&mut state, &history, tmp.path(), 4)
+            .await
+            .unwrap();
+        assert_eq!(state.timeline, 4);
+        for tli in [2, 3, 4] {
+            let bytes = tokio::fs::read(tmp.path().join(history_filename(tli)))
+                .await
+                .unwrap();
+            assert_eq!(bytes, history.raw_for(tli).unwrap());
+        }
+    }
 
     #[tokio::test]
     async fn archived_prefix_checks_identity_and_stops_at_next_fork() {
