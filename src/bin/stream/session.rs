@@ -19,6 +19,8 @@ use walshadow::boundary_hold::{
 };
 use walshadow::ch_emitter::{EmitterConfig, EmitterStats};
 use walshadow::config::{ConfigResolver, SourceConn};
+#[cfg(feature = "test-support")]
+use walshadow::crash_test;
 use walshadow::manifest;
 use walshadow::metrics::{MetricsRegistry, RateEstimator};
 use walshadow::pg::socket_conninfo;
@@ -1602,6 +1604,8 @@ pub(crate) async fn run_session(
             let persisted = manifest::write(&args.spill_dir, &cur)
                 .await
                 .context("write resume manifest")?;
+            #[cfg(feature = "test-support")]
+            crash_test::hit(crash_test::Point::AfterManifest, cur.floor.get());
             last_cursor_write = Some(Instant::now());
             resume_floor.publish(persisted);
             // Descriptor log prunes against the same floor, off this task: a

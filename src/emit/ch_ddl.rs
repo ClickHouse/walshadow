@@ -32,6 +32,8 @@ use crate::ch::{
 };
 use crate::column_rules::ColumnRules;
 use crate::config::{ConfigResolver, DestEmitter, ResolvedConfig};
+#[cfg(feature = "test-support")]
+use crate::crash_test;
 use crate::decode::heap_decoder::{self, ColumnValue};
 use crate::emit::ch_emitter::EmitterConfig;
 use crate::mapping::{
@@ -691,7 +693,12 @@ impl DdlApplicator {
                     );
                 },
             )
-            .await
+            .await?;
+        #[cfg(feature = "test-support")]
+        if sql.starts_with("ALTER TABLE ") {
+            crash_test::hit(crash_test::Point::AfterAlter, u64::MAX);
+        }
+        Ok(())
     }
 }
 

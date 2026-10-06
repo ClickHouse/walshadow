@@ -34,6 +34,8 @@ pub mod catalog;
 pub mod ch;
 pub mod column_rules;
 pub mod config;
+#[cfg(feature = "test-support")]
+pub mod crash_test;
 pub mod decode;
 pub mod dsn;
 pub mod emit;

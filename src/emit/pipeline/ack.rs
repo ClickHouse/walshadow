@@ -24,6 +24,8 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
 use crate::ch::EndOfStream;
+#[cfg(feature = "test-support")]
+use crate::crash_test;
 use crate::emit::pipeline::Fatal;
 use crate::pos::{AckFrontier, EmitterAck, Gate, GateClosed, Monotone, Pos};
 
@@ -263,6 +265,8 @@ impl AckState {
             self.watermark
         };
         self.emitter_ack.join(Pos::new(ack));
+        #[cfg(feature = "test-support")]
+        crash_test::hit(crash_test::Point::AfterAck, ack);
         self.frontier_cell.join(Pos::new(self.frontier));
         self.probe_tx.send_replace(self.snapshot());
     }

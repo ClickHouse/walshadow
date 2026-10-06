@@ -59,6 +59,8 @@ use crate::catalog::desc_log::{
 };
 use crate::catalog::pending::{DegradeReason, PendingCatalog, PendingSlot};
 use crate::catalog::shadow_catalog::{CatalogError, ParkedAt, ShadowCatalog};
+#[cfg(feature = "test-support")]
+use crate::crash_test;
 use crate::filter::SmgrMarkers;
 use crate::ops::bridge::BridgeError;
 use crate::record::{BoundaryInfo, BoundaryKind, SinkError};
@@ -726,10 +728,17 @@ impl CatalogCapture {
             ambiguities,
             entries,
         };
+        #[cfg(feature = "test-support")]
+        {
+            crash_test::capture(commit_lsn);
+            crash_test::hit(crash_test::Point::BeforeDescriptor, commit_lsn);
+        }
         self.log
             .append_batch(batch.clone())
             .await
             .map_err(|e| SinkError::Other(format!("descriptor log append: {e}")))?;
+        #[cfg(feature = "test-support")]
+        crash_test::hit(crash_test::Point::AfterDescriptor, commit_lsn);
         // Events off the appended batch, the same derivation a restart runs:
         // one boundary cannot mean two schema histories.
         // `predecessor_before` reads strictly older batches, so the append

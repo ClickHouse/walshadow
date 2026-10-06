@@ -25,6 +25,8 @@ use walrus::pg::walparser::RmId;
 use crate::backfill::backfill_staging::StagingSession;
 use crate::backfill::visibility_pending::{self, SharedPendingLedger};
 use crate::catalog::pending::PendingCatalog;
+#[cfg(feature = "test-support")]
+use crate::crash_test;
 use crate::decode::heap_decoder::DescribedHeap;
 use crate::decode::visibility::{PgXactView, SealedPatch, read_pg_xact};
 use crate::emit::ch_ddl::DdlApplicator;
@@ -517,10 +519,14 @@ impl ReorderSink {
         } else {
             None
         };
+        #[cfg(feature = "test-support")]
+        crash_test::hit(crash_test::Point::BeforeDdl, commit_lsn);
         applicator
             .apply_under(event, frozen)
             .await
             .map_err(|e| SinkError::Other(format!("ddl apply: {e}")))?;
+        #[cfg(feature = "test-support")]
+        crash_test::hit(crash_test::Point::AfterDdl, commit_lsn);
         if let Some((rel, m)) = predicted {
             let after = mapping.snapshot().await;
             debug_assert_eq!(
