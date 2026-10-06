@@ -31,6 +31,12 @@ deployment
 
    Record `pause_consumed_lsn` and `pause_received_lsn`
 
+   Pause leaves the replication stream, so the old primary's walsender exits
+   on its own and step 2's fast shutdown does not wait out
+   `wal_sender_timeout`. Resume redials from the same position. Without a
+   replication slot the source may recycle WAL across a long pause; resume
+   then reads the gap from the archive, or stops if neither holds it
+
 2. Stop writes on old primary, using application fencing or PostgreSQL fast shutdown
 
 3. Repoint walshadow while target is still in recovery

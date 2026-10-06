@@ -116,7 +116,7 @@ pub enum SourceEvent<'a> {
     Wal(WalChunk<'a>),
     /// Backend `CopyDone`: the requested timeline is historic and reached its
     /// switchpoint. Only this ending sends one. The connection stays in COPY
-    /// until [`end_historic_stream`](SourceFeed::end_historic_stream) answers.
+    /// until [`end_stream`](SourceFeed::end_stream) answers.
     TimelineEnd,
     /// `WalSndDone` sends a bare `CommandComplete` from inside COPY, then
     /// exits — no `CopyDone` before it and no `ReadyForQuery` after. A parser
@@ -449,8 +449,8 @@ impl SourceFeed {
     /// `TIMELINE_HISTORY` instead, which the crossing has to parse anyway to
     /// prove lineage and to hand the shadow a history file — a row that only
     /// restates it saves nothing.
-    pub async fn end_historic_stream(&mut self) -> Result<()> {
-        self.conn.end_copy().await.context("end historic COPY")
+    pub async fn end_stream(&mut self) -> Result<()> {
+        self.conn.end_copy().await.context("end replication COPY")
     }
 
     /// `TIMELINE_HISTORY <tli>` → the file's exact bytes. `Ok(None)` when the
