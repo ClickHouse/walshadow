@@ -1539,6 +1539,57 @@ async fn switchover_crosses_fork_and_keeps_every_row() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn paused_source_shuts_down_promptly_and_resume_redials() {
+    if !gated() {
+        return;
+    }
+    let mut h = Harness::up(&fx::Ports::alloc())
+        .await
+        .expect("bring up harness");
+    let result = async {
+        h.wait_ch(USER_EMAIL, "alice@seed", Duration::from_secs(30))
+            .await
+            .context("seed row backfills")?;
+        h.psql("UPDATE demo.users SET email = 'pre-pause@x' WHERE id = 1")?;
+        h.wait_ch(USER_EMAIL, "pre-pause@x", Duration::from_secs(30))
+            .await
+            .context("pre-pause row never reached CH")?;
+
+        h.ctl_body(&["apply"], "[stream]\npaused = true")?;
+        ensure!(h.status_field("paused")? == "true", "apply did not pause");
+        h.wait_log(
+            "pause left the source stream so the source can shut down",
+            Duration::from_secs(30),
+        )
+        .await
+        .context("pause never left the source stream")?;
+
+        let stopping = Instant::now();
+        h.source.stop().context("stop paused source primary")?;
+        let waited = stopping.elapsed();
+        ensure!(
+            waited < Duration::from_secs(20),
+            "fast shutdown waited {waited:?} on a paused walshadow",
+        );
+
+        h.source.start().context("restart source")?;
+        h.ctl_body(&["apply"], "[stream]\npaused = false")?;
+        h.psql("UPDATE demo.users SET email = 'post-resume@x' WHERE id = 1")?;
+        h.wait_ch(USER_EMAIL, "post-resume@x", Duration::from_secs(60))
+            .await
+            .context("resume did not redial the source")?;
+        ensure!(h.alive(), "daemon exited across the paused shutdown");
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+
+    let stderr = h.teardown();
+    if let Err(e) = result {
+        panic!("{e:#}\n--- daemon stderr ---\n{stderr}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn unpaused_switchover_stops_promptly_and_crosses_at_the_switchpoint() {
     check_unpaused_switchover(SwitchoverMode::Repoint).await;
 }

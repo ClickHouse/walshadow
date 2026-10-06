@@ -1338,6 +1338,8 @@ pub(crate) async fn run_session(
     // reads one that cannot move under it. Cleared on resume: a value left over
     // from an earlier pause is as misleading as a live one
     let mut pause = PauseState::Running;
+    let mut pause_left_stream = false;
+    let mut resume_restreams = false;
     let mut ever_unpaused = false;
     // Step 5's answer, refreshed while paused off the endpoint the pump holds
     let mut promotion = PromotionGate::blocked("not_paused");
@@ -1368,6 +1370,50 @@ pub(crate) async fn run_session(
             .as_ref()
             .map(|rx| rx.borrow().paused)
             .unwrap_or(false);
+        if paused && !pause_left_stream && matches!(path, SourcePath::Live) && !crossing.pending() {
+            pause_left_stream = true;
+            resume_restreams = true;
+            if let Err(e) = feed.end_stream().await {
+                tracing::warn!(
+                    target: "walshadow",
+                    error = %format!("{e:#}"),
+                    "leaving the source stream for a pause failed; resume redials",
+                );
+            } else {
+                tracing::info!(
+                    target: "walshadow",
+                    resume_lsn = %stream.next_lsn(),
+                    "pause left the source stream so the source can shut down",
+                );
+            }
+        } else if !paused && pause_left_stream {
+            pause_left_stream = false;
+            if std::mem::take(&mut resume_restreams) {
+                let restarted = feed
+                    .start_physical_replication(
+                        source_conn.slot.as_deref(),
+                        stream.next_lsn().get(),
+                        stream.timeline(),
+                    )
+                    .await;
+                if let Err(e) = restarted {
+                    tracing::warn!(
+                        target: "walshadow",
+                        error = %format!("{e:#}"),
+                        resume_lsn = %stream.next_lsn(),
+                        "resuming the source stream failed — redialing",
+                    );
+                    path = SourcePath::Redial;
+                    source_recovery.backoff.reset();
+                } else {
+                    tracing::info!(
+                        target: "walshadow",
+                        resume_lsn = %stream.next_lsn(),
+                        "resume re-entered the source stream",
+                    );
+                }
+            }
+        }
         // Slot changes require reconnect because START_REPLICATION binds slot
         if let Some(rx) = pump_config_rx.as_ref() {
             let desired = rx.borrow().source.clone();
@@ -1426,6 +1472,7 @@ pub(crate) async fn run_session(
                         ResumePoint::OnBranch => SourcePath::Live,
                         ResumePoint::AtSwitchpoint => SourcePath::AtSwitchpoint,
                     };
+                    resume_restreams = false;
                     swap.settled();
                     if point == ResumePoint::OnBranch {
                         swap.swaps += 1;
@@ -1718,7 +1765,7 @@ pub(crate) async fn run_session(
             // Answer the backend's CopyDone now, leaving the connection in
             // simple-query mode: that is the state the crossing reads history
             // from, and the state a retry can rebuild by reconnecting
-            let ended = feed.end_historic_stream().await;
+            let ended = feed.end_stream().await;
             if let Err(e) = &ended {
                 tracing::warn!(
                     target: "walshadow",
