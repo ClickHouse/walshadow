@@ -2409,8 +2409,17 @@ async fn prefetch_store_values(
     let mut wanted: HashMap<u32, HashMap<u32, ToastPointer>> = HashMap::new();
     for p in pointers {
         let key = (p.va_toastrelid, p.va_valueid);
-        if chunk_maps.iter().any(|m| m.contains_key(&key)) {
-            continue;
+        if let Some(v) = chunk_maps.iter().find_map(|m| m.get(&key)) {
+            if !observed_mid_value(v) {
+                continue;
+            }
+            tracing::warn!(
+                target: "walshadow::toast",
+                toast_relid = p.va_toastrelid,
+                value_id = p.va_valueid,
+                first_seq = v.tail.keys().next().copied(),
+                "toast value's leading chunks precede the stream start; resolving it from the store",
+            );
         }
         wanted
             .entry(p.va_toastrelid)
@@ -2554,7 +2563,9 @@ impl ValueResolution<'_> {
             }
             let type_oid = rel.attributes.get(idx).map(|a| a.type_oid).unwrap_or(0);
             let key = (p.va_toastrelid, p.va_valueid);
-            if let Some(v) = self.xact_maps.iter().find_map(|m| m.get(&key)) {
+            if let Some(v) = self.xact_maps.iter().find_map(|m| m.get(&key))
+                && !observed_mid_value(v)
+            {
                 match reassemble_value_ref(&p, self.spool, v)? {
                     Reassembled::Bytes(raw) => {
                         self.retained += raw.len();
@@ -2622,6 +2633,17 @@ impl ValueResolution<'_> {
                 .map_err(XactBufferError::Detoast),
         }
     }
+}
+
+fn observed_mid_value(v: &ValueRef) -> bool {
+    if v.run_chunks > 0 {
+        return false;
+    }
+    let mut seqs = v.tail.keys().copied();
+    let Some(first) = seqs.next() else {
+        return false;
+    };
+    first > 0 && seqs.zip(first + 1..).all(|(seq, want)| seq == want)
 }
 
 /// First seq missing from a ref value's dense coverage, for the error
@@ -4235,6 +4257,44 @@ mod tests {
                 assert!(errs.is_empty(), "{policy:?}: {errs:?}");
             }
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn value_observed_mid_write_resolves_from_store() {
+        let rel = bytea_rel();
+        let stats = Arc::new(crate::emit::ch_emitter::EmitterStats::default());
+        let resolver =
+            ToastResolver::with_store(Arc::new(crate::toast::MemChunkStore::new()), stats.clone());
+        let key = (16500u32, 55u32);
+
+        let tail_only = mem_refs(key, &[(1, b"cd")]);
+        let maps = [&tail_only];
+        let mut t = toast_ptr_tuple(55);
+        let cache = HashMap::from_iter([(key, Ok(b"abcd".to_vec()))]);
+        seeded(&resolver, None, &maps, cache)
+            .resolve_tuple(&mut t, &rel)
+            .unwrap();
+        assert_eq!(t.columns[0], Some(ColumnValue::Bytea(b"abcd".to_vec())));
+
+        let gapped_tail = mem_refs(key, &[(1, b"c"), (3, b"d")]);
+        let maps = [&gapped_tail];
+        let mut t = toast_ptr_tuple(55);
+        let err = seeded(&resolver, None, &maps, HashMap::new())
+            .resolve_tuple(&mut t, &rel)
+            .expect_err("a gap after the first observed chunk stays loud");
+        assert!(
+            matches!(err, XactBufferError::MissingToastChunk { .. }),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn observed_mid_value_needs_a_dense_tail_after_seq_zero() {
+        let key = (16500u32, 55u32);
+        let v = |chunks: &[(u32, &'static [u8])]| mem_refs(key, chunks).remove(&key).unwrap();
+        assert!(observed_mid_value(&v(&[(2, b"a"), (3, b"b")])));
+        assert!(!observed_mid_value(&v(&[(0, b"a"), (1, b"b")])));
+        assert!(!observed_mid_value(&v(&[(2, b"a"), (4, b"b")])));
     }
 
     /// Miss policy split: in-xact gap stays a hard error; a store-side miss
