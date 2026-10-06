@@ -53,14 +53,17 @@ Separate per database, schema, or table:
 target_database = "billing_cdc"
 ```
 
-Or keep one ClickHouse database and separate the names, since `auto_create_name`
-reads `$database$`:
+Or keep one ClickHouse database and separate the names, since the derived-name
+template reads `$database$`:
 
 ```toml
-[namespace.public]
-auto_create = true
-auto_create_name = "$database$_$schema$_$table$"
+[stream]
+auto_create_name_all = "$database$_$schema$_"
 ```
+
+`[stream] auto_create_name_all` covers every namespace, including ones no
+`[namespace.*]` entry names and ones created later, which is what
+`replicate_all` needs
 
 ## Run `ctl` against one database
 

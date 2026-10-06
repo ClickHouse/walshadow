@@ -434,6 +434,13 @@ fn status_tables(root: &Table, db: &str, ch_database: &str) -> Vec<Value> {
                 .unwrap_or_else(|| ch_database.to_owned());
             let table = block_str("target_table").unwrap_or_else(|| {
                 namespace_str(root, db, ns, "auto_create_name")
+                    .or_else(|| {
+                        root.get("stream")
+                            .and_then(Value::as_table)
+                            .and_then(|t| t.get("auto_create_name_all"))
+                            .and_then(Value::as_str)
+                            .map(str::to_owned)
+                    })
                     .and_then(|raw| crate::mapping::NameTemplate::parse(&raw).ok())
                     .unwrap_or_default()
                     .render(db, ns, rel)
@@ -844,6 +851,7 @@ mod tests {
                 "apply",
                 "[source]\ndbname = \"app\"\n\
                  [ch]\ndatabase = \"cdc\"\n\
+                 [stream]\nauto_create_name_all = \"$database$_$schema$_\"\n\
                  [namespace.shop]\ntarget_database = \"warehouse\"\n\
                  [namespace.audit]\nauto_create_name = \"$table$\"\n\
                  [table.public.orders]\nreplicate = true\ninitial_load = \"copy\"\n\
@@ -876,15 +884,15 @@ mod tests {
         let orders = entry("app.public.orders");
         assert_eq!(
             orders.get("destination_table").and_then(Value::as_str),
-            Some("cdc.public_orders"),
-            "a derived name carries the source namespace as its prefix",
+            Some("cdc.app_public_orders"),
+            "a derived name takes the cluster-wide template",
         );
         assert_eq!(
             entry("app.shop.prices")
                 .get("destination_table")
                 .and_then(Value::as_str),
-            Some("warehouse.shop_prices"),
-            "the prefix follows the source namespace, not `public`",
+            Some("warehouse.app_shop_prices"),
+            "the cluster-wide template reaches every namespace",
         );
         assert_eq!(
             entry("app.audit.events")

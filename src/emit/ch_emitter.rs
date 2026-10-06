@@ -138,6 +138,11 @@ pub struct EmitterConfig {
     /// `[stream] replicate_all` (default true): replicate every user table in
     /// non-system namespaces. Per-table `replicate = false` still opts out.
     pub replicate_all: bool,
+    /// `[stream] auto_create_name_all`: derived-name template for every
+    /// namespace, which a `[namespace.*]` entry overrides. `None` is
+    /// `$schema$_$table$`. The knob `replicate_all` needs: a namespace with no
+    /// entry of its own still auto-creates under it
+    pub auto_create_name_all: Option<crate::mapping::NameTemplate>,
     /// Pending capture cost controls, boot-only
     pub pending_capture: crate::source::catalog_capture::PendingCaptureConfig,
     /// Per-namespace defaults keyed on PG schema name; per-table
@@ -826,6 +831,7 @@ struct RuntimeConfigPatch {
 struct StreamSection {
     paused: bool,
     replicate_all: bool,
+    auto_create_name_all: Option<String>,
     #[serde(flatten)]
     pending_capture: crate::source::catalog_capture::PendingCaptureConfig,
 }
@@ -835,6 +841,7 @@ impl Default for StreamSection {
         Self {
             paused: false,
             replicate_all: true,
+            auto_create_name_all: None,
             pending_capture: Default::default(),
         }
     }
@@ -921,6 +928,7 @@ impl EmitterConfig {
             table_opt_ins: HashMap::new(),
             paused: stream.paused,
             replicate_all: stream.replicate_all,
+            auto_create_name_all: None,
             pending_capture: stream.pending_capture,
             namespaces: HashMap::new(),
             databases: Vec::new(),
@@ -1009,7 +1017,13 @@ impl EmitterConfig {
         let doc: ConfigDocument = toml::Value::Table(root.clone())
             .try_into()
             .map_err(crate::toml_de::config_error)?;
+        let prefix_all = doc.stream.auto_create_name_all.clone();
         let mut out = Self::from_sections(doc.ch, doc.memory, doc.stream);
+        out.auto_create_name_all = prefix_all
+            .as_deref()
+            .map(crate::mapping::NameTemplate::parse)
+            .transpose()
+            .map_err(|e| EmitterError::Config(format!("`stream.auto_create_name_all`: {e}")))?;
         doc.system_columns
             .validate()
             .map_err(EmitterError::Config)?;
@@ -2821,6 +2835,33 @@ mod tests {
         assert_eq!(c.decoder_batch_size, 512);
         assert_eq!(c.decoder_queue_capacity, 131_072);
         assert!(c.replicate_all);
+    }
+
+    #[test]
+    fn stream_auto_create_name_all_parses_and_rejects() {
+        let c = EmitterConfig::from_toml_str(
+            "[ch]\nhost = \"h\"\n[stream]\nauto_create_name_all = \"$database$_$schema$_\"\n",
+        )
+        .expect("parses");
+        assert_eq!(
+            c.auto_create_name_all
+                .expect("template parsed")
+                .render("app", "audit", "orders"),
+            "app_audit_orders",
+        );
+        assert!(
+            EmitterConfig::from_toml_str("[ch]\nhost = \"h\"\n")
+                .expect("parses")
+                .auto_create_name_all
+                .is_none(),
+            "absent leaves the built-in default",
+        );
+        let err = EmitterConfig::from_toml_str(
+            "[ch]\nhost = \"h\"\n[stream]\nauto_create_name_all = \"$nope$\"\n",
+        )
+        .expect_err("rejects")
+        .to_string();
+        assert!(err.contains("stream.auto_create_name_all"), "{err}");
     }
 
     #[test]

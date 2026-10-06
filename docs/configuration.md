@@ -178,7 +178,8 @@ See [Query destination data](destination-tables.md)
 `config_namespace` carries namespace defaults: `target_database`, `auto_create`,
 `auto_create_name` (the derived-name template, see
 [Name auto-created tables](destination-tables.md#name-auto-created-tables)) and
-`drop_table_strategy`
+`drop_table_strategy`. The cluster-wide `[stream] auto_create_name_all` is
+boot-only, like `replicate_all`, so the overlay has no column for it
 
 Use `config_column` to configure individual columns. Set `namespace` to schema
 name, `relname` to table name, and `attname` to column name. Use `match` for

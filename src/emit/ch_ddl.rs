@@ -35,9 +35,9 @@ use crate::config::{ConfigResolver, DestEmitter, ResolvedConfig};
 use crate::decode::heap_decoder::{self, ColumnValue};
 use crate::emit::ch_emitter::EmitterConfig;
 use crate::mapping::{
-    ColumnMapping, DropTableStrategy, MappingHandle, MappingSnapshot, NamespaceMapping, Retype,
-    RetypeKind, SystemColumns, TableMapping, TableTarget, apply_column_rule,
-    derive_columns_for_mapping, fold_diff_into_mapping, retyped_target,
+    ColumnMapping, DropTableStrategy, MappingHandle, MappingSnapshot, NameTemplate,
+    NamespaceMapping, Retype, RetypeKind, SystemColumns, TableMapping, TableTarget,
+    apply_column_rule, derive_columns_for_mapping, fold_diff_into_mapping, retyped_target,
 };
 use crate::ops::oracle::{Oracle, OracleCell};
 use crate::schema::{
@@ -59,6 +59,9 @@ pub struct DdlConfig {
     /// automatically (`auto_create = true`)
     pub auto_create_namespaces: HashSet<String>,
     pub replicate_all: bool,
+    /// `[stream] auto_create_name_all`, the template a namespace with no
+    /// entry of its own derives from
+    pub auto_create_name_all: Option<NameTemplate>,
     /// Excluded from `replicate_all` so the overlay's `config_*` tables aren't swept in
     pub runtime_config_schema: Option<String>,
     /// CH database DDL targets when neither per-table mapping nor source
@@ -81,20 +84,45 @@ pub struct DdlConfig {
     pub column_rules: Arc<ColumnRules>,
 }
 
+/// Knobs the resolver does not republish, so a caller threads them through
+/// each [`DdlConfig::from_resolved`] unchanged.
+#[derive(Debug, Clone)]
+pub struct DdlBoot {
+    pub target_database: String,
+    pub source_database: String,
+    pub soft_delete: bool,
+    pub system: Arc<SystemColumns>,
+    pub replicate_all: bool,
+    pub auto_create_name_all: Option<NameTemplate>,
+    pub runtime_config_schema: Option<String>,
+}
+
+impl DdlBoot {
+    pub fn from_emitter(cfg: &crate::emit::ch_emitter::EmitterConfig) -> Self {
+        Self {
+            target_database: cfg.database.clone(),
+            source_database: cfg.source.dbname.clone(),
+            soft_delete: cfg.soft_delete,
+            system: cfg.system_columns.clone(),
+            replicate_all: cfg.replicate_all,
+            auto_create_name_all: cfg.auto_create_name_all.clone(),
+            runtime_config_schema: cfg.runtime_config_schema.clone(),
+        }
+    }
+}
+
 impl DdlConfig {
-    /// Build from a resolved snapshot. `target_database`, `soft_delete`,
-    /// `system`, `replicate_all` and `runtime_config_schema` are boot-only
-    /// knobs the resolver does not republish, so callers thread them through
-    /// unchanged.
-    pub fn from_resolved(
-        resolved: &ResolvedConfig,
-        target_database: String,
-        source_database: String,
-        soft_delete: bool,
-        system: Arc<SystemColumns>,
-        replicate_all: bool,
-        runtime_config_schema: Option<String>,
-    ) -> Self {
+    /// Build from a resolved snapshot and the boot-only knobs beside it.
+    pub fn from_resolved(resolved: &ResolvedConfig, boot: DdlBoot) -> Self {
+        let DdlBoot {
+            target_database,
+            source_database,
+            soft_delete,
+            system,
+            replicate_all,
+            auto_create_name_all,
+            runtime_config_schema,
+        } = boot;
         let auto_create_namespaces: HashSet<String> = resolved
             .namespaces
             .iter()
@@ -105,6 +133,7 @@ impl DdlConfig {
             drop_table_strategy: resolved.drop_table_strategy,
             auto_create_namespaces,
             replicate_all,
+            auto_create_name_all,
             runtime_config_schema,
             target_database,
             source_database,
@@ -113,6 +142,18 @@ impl DdlConfig {
             system,
             rules: resolved.rules.clone(),
             column_rules: resolved.column_rules.clone(),
+        }
+    }
+
+    pub fn boot(&self) -> DdlBoot {
+        DdlBoot {
+            target_database: self.target_database.clone(),
+            source_database: self.source_database.clone(),
+            soft_delete: self.soft_delete,
+            system: self.system.clone(),
+            replicate_all: self.replicate_all,
+            auto_create_name_all: self.auto_create_name_all.clone(),
+            runtime_config_schema: self.runtime_config_schema.clone(),
         }
     }
 
@@ -127,6 +168,7 @@ impl DdlConfig {
         self.namespaces
             .get(&*rel.namespace)
             .and_then(|n| n.auto_create_name.clone())
+            .or_else(|| self.auto_create_name_all.clone())
             .unwrap_or_default()
             .render(&self.source_database, &rel.namespace, &rel.name)
     }
@@ -285,15 +327,7 @@ impl DdlApplicator {
             return;
         }
         let snap = self.config_rx.borrow_and_update();
-        self.config = DdlConfig::from_resolved(
-            &snap,
-            self.config.target_database.clone(),
-            self.config.source_database.clone(),
-            self.config.soft_delete,
-            self.config.system.clone(),
-            self.config.replicate_all,
-            self.config.runtime_config_schema.clone(),
-        );
+        self.config = DdlConfig::from_resolved(&snap, self.config.boot());
     }
 
     /// Errors propagate; the worker task turns them into
@@ -588,17 +622,7 @@ impl DdlApplicator {
 
     fn plan_config(&self, frozen: Option<&ResolvedConfig>) -> DdlConfig {
         frozen
-            .map(|rc| {
-                DdlConfig::from_resolved(
-                    rc,
-                    self.config.target_database.clone(),
-                    self.config.source_database.clone(),
-                    self.config.soft_delete,
-                    self.config.system.clone(),
-                    self.config.replicate_all,
-                    self.config.runtime_config_schema.clone(),
-                )
-            })
+            .map(|rc| DdlConfig::from_resolved(rc, self.config.boot()))
             .unwrap_or_else(|| self.config.clone())
     }
 
@@ -1126,7 +1150,7 @@ pub fn render_create_table_from_mapping(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mapping::{ColumnMapping, NameTemplate, TableMapping};
+    use crate::mapping::{ColumnMapping, TableMapping};
     use std::sync::LazyLock;
 
     static SYS: LazyLock<Arc<SystemColumns>> = LazyLock::new(Arc::default);
@@ -1140,12 +1164,15 @@ mod tests {
             let resolved = Arc::new(ResolvedConfig::default());
             let ddl = DdlConfig::from_resolved(
                 &resolved,
-                config.database.clone(),
-                "app".into(),
-                false,
-                SYS.clone(),
-                false,
-                None,
+                DdlBoot {
+                    target_database: config.database.clone(),
+                    source_database: "app".into(),
+                    soft_delete: false,
+                    system: SYS.clone(),
+                    replicate_all: false,
+                    auto_create_name_all: None,
+                    runtime_config_schema: None,
+                },
             );
             let mut applicator = DdlApplicator::new(
                 DestEmitter::new(Arc::new(config), None),
@@ -1221,6 +1248,7 @@ mod tests {
             drop_table_strategy: DropTableStrategy::Retain,
             auto_create_namespaces: HashSet::new(),
             replicate_all: false,
+            auto_create_name_all: None,
             runtime_config_schema: None,
             target_database: "default".into(),
             source_database: "app".into(),
@@ -1262,6 +1290,46 @@ mod tests {
     }
 
     #[test]
+    fn auto_create_name_all_covers_namespaces_with_no_entry() {
+        use crate::mapping::NameTemplate;
+        let mut cfg = DdlConfig {
+            drop_table_strategy: DropTableStrategy::Retain,
+            auto_create_namespaces: HashSet::new(),
+            replicate_all: true,
+            auto_create_name_all: Some(NameTemplate::parse("$database$_$schema$_$table$").unwrap()),
+            runtime_config_schema: None,
+            target_database: "default".into(),
+            source_database: "app".into(),
+            namespaces: HashMap::default(),
+            soft_delete: false,
+            system: Arc::default(),
+            rules: Arc::default(),
+            column_rules: Arc::default(),
+        };
+        let derived = cfg.create_target(&TableRule::default(), &RelName::new("audit", "orders"));
+        assert_eq!(
+            derived.table, "app_audit_orders",
+            "a namespace with no entry takes the cluster-wide template",
+        );
+
+        namespaces_with_bare_prefix(&mut cfg);
+        let overridden = cfg.create_target(&TableRule::default(), &RelName::new("audit", "orders"));
+        assert_eq!(
+            overridden.table, "orders",
+            "a namespace entry beats the cluster-wide template",
+        );
+
+        let pinned = cfg.create_target(
+            &TableRule {
+                target_table: Some("orders_v2".into()),
+                ..TableRule::default()
+            },
+            &RelName::new("shop", "orders"),
+        );
+        assert_eq!(pinned.table, "orders_v2", "target_table still wins");
+    }
+
+    #[test]
     fn per_namespace_target_and_drop_override_global() {
         use crate::mapping::NamespaceMapping;
         use ahash::{HashMap, HashMapExt};
@@ -1290,6 +1358,7 @@ mod tests {
             drop_table_strategy: DropTableStrategy::Retain,
             auto_create_namespaces: HashSet::new(),
             replicate_all: false,
+            auto_create_name_all: None,
             runtime_config_schema: None,
             target_database: "default".into(),
             source_database: "app".into(),
@@ -1317,6 +1386,7 @@ mod tests {
             drop_table_strategy: DropTableStrategy::Retain,
             auto_create_namespaces: HashSet::new(),
             replicate_all: false,
+            auto_create_name_all: None,
             runtime_config_schema: None,
             target_database: "default".into(),
             source_database: "app".into(),
@@ -1411,6 +1481,7 @@ mod tests {
             drop_table_strategy: DropTableStrategy::Retain,
             auto_create_namespaces: HashSet::new(),
             replicate_all: false,
+            auto_create_name_all: None,
             runtime_config_schema: Some("walshadow".into()),
             target_database: "default".into(),
             source_database: "app".into(),
@@ -2229,6 +2300,7 @@ mod tests {
             drop_table_strategy: DropTableStrategy::Drop,
             auto_create_namespaces: HashSet::new(),
             replicate_all: false,
+            auto_create_name_all: None,
             runtime_config_schema: None,
             target_database: "default".into(),
             source_database: "app".into(),
@@ -2264,6 +2336,7 @@ mod tests {
             drop_table_strategy: DropTableStrategy::Retain,
             auto_create_namespaces: HashSet::new(),
             replicate_all: true,
+            auto_create_name_all: None,
             runtime_config_schema: None,
             target_database: "default".into(),
             source_database: "app".into(),
