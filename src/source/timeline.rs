@@ -155,6 +155,26 @@ impl TimelineHistory {
         &self.raw
     }
 
+    /// PostgreSQL's writeTimeLineHistory copies parent history before appending its fork.
+    pub fn raw_for(&self, tli: u32) -> Option<&[u8]> {
+        if tli == self.target {
+            return Some(&self.raw);
+        }
+        // Oldest listed timeline has no parent line proving where it began
+        if self.entries[0].tli >= tli {
+            return None;
+        }
+        let mut offset = 0;
+        for line in self.raw.split_inclusive(|byte| *byte == b'\n') {
+            let text = String::from_utf8_lossy(line);
+            if text.split_whitespace().next().and_then(|f| f.parse().ok()) == Some(tli) {
+                return Some(&self.raw[..offset]);
+            }
+            offset += line.len();
+        }
+        None
+    }
+
     pub fn entries(&self) -> &[HistoryEntry] {
         &self.entries
     }
@@ -289,6 +309,32 @@ mod tests {
             ],
         );
         assert_eq!(h.raw(), SAMPLE.as_bytes(), "bytes kept verbatim");
+    }
+
+    #[test]
+    fn ancestor_history_is_descendant_prefix() {
+        let raw =
+            b"# history\r\n1\t0/3000000\tfirst\r\n\r\n2\t0/5000000\tsecond\n4\t0/7000000\tlast";
+        let history = TimelineHistory::parse(7, raw).unwrap();
+        assert_eq!(
+            history.raw_for(2),
+            Some(b"# history\r\n1\t0/3000000\tfirst\r\n\r\n".as_slice())
+        );
+        assert_eq!(
+            history.raw_for(4),
+            Some(b"# history\r\n1\t0/3000000\tfirst\r\n\r\n2\t0/5000000\tsecond\n".as_slice())
+        );
+        assert_eq!(history.raw_for(7), Some(raw.as_slice()));
+        for tli in [0, 1, 3, 8] {
+            assert_eq!(history.raw_for(tli), None);
+        }
+    }
+
+    #[test]
+    fn ancestor_history_requires_parent_proof() {
+        let history = TimelineHistory::parse(4, b"2\t0/5000000\treason\n").unwrap();
+        assert_eq!(history.raw_for(2), None);
+        assert_eq!(TimelineHistory::root(4).raw_for(2), None);
     }
 
     #[test]

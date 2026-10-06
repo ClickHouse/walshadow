@@ -497,14 +497,7 @@ pub(crate) async fn run_session(
         aligned.get(),
         args.walsender_slow_threshold,
     );
-    seed_shadow_branches(
-        &mut shadow_boot,
-        &mut feed,
-        &history,
-        &args.out_dir,
-        start_timeline,
-    )
-    .await?;
+    seed_shadow_branches(&mut shadow_boot, &history, &args.out_dir, start_timeline).await?;
     let shadow_state = Arc::new(Mutex::new(shadow_boot));
     let walsender_addr = args.walsender_bind;
     let walsender_task = walshadow::shadow_stream::spawn_listener(
