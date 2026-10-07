@@ -61,7 +61,11 @@ impl DbLink {
             .await
             .with_context(|| {
                 format!(
-                    "connect bridge for database {} at {}",
+                    "connect bridge for database {} at {}. The socket is registered by \
+                     the shadow's bridge worker for that database, so it is absent \
+                     while the shadow has no such database — replay creates one the \
+                     source made after the base backup, but a data dir provisioned for \
+                     another source never gains it and needs a reset",
                     cfg.name,
                     cfg.bridge_path.display()
                 )

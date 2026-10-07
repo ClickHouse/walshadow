@@ -286,11 +286,17 @@ pub struct HealthReport {
 
 pub struct Shadow {
     config: ShadowConfig,
+    /// Database the cluster-level probes connect to, resolved once. See
+    /// [`Shadow::probe_one`]
+    probe_db: std::sync::OnceLock<String>,
 }
 
 impl Shadow {
     pub fn new(config: ShadowConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            probe_db: std::sync::OnceLock::new(),
+        }
     }
 
     pub fn config(&self) -> &ShadowConfig {
@@ -302,20 +308,20 @@ impl Shadow {
         if !self.is_in_recovery()? {
             return Err(ShadowError::NotInRecovery);
         }
-        let actual = self.psql_one("SHOW data_directory")?;
+        let actual = self.probe_one("SHOW data_directory")?;
         if fs::canonicalize(actual)? != fs::canonicalize(&self.config.data_dir)? {
             return Err(ShadowError::Incompatible("data_directory differs".into()));
         }
         let restore = format!("cp {}/%f %p", self.config.filter_out_dir.display());
-        if self.psql_one("SHOW restore_command")? != restore {
+        if self.probe_one("SHOW restore_command")? != restore {
             return Err(ShadowError::Incompatible("restore_command differs".into()));
         }
         if let Some(bridge) = &self.config.bridge {
-            if self.psql_one("SHOW walshadow.socket_path")? != bridge.socket_path.to_string_lossy()
+            if self.probe_one("SHOW walshadow.socket_path")? != bridge.socket_path.to_string_lossy()
             {
                 return Err(ShadowError::Incompatible("bridge socket differs".into()));
             }
-            let workers = self.psql_one("SHOW walshadow.bridge_workers")?;
+            let workers = self.probe_one("SHOW walshadow.bridge_workers")?;
             if workers
                 .parse::<usize>()
                 .ok()
@@ -468,7 +474,7 @@ impl Shadow {
     /// gain a line per boot
     pub fn point_at_walsender(&self, conninfo: &str) -> Result<()> {
         if self
-            .psql_one("SHOW primary_conninfo")
+            .probe_one("SHOW primary_conninfo")
             .is_ok_and(|cur| cur == conninfo)
         {
             return Ok(());
@@ -667,6 +673,30 @@ impl Shadow {
     /// Trimmed stdout of one statement. `-tAXq` keeps each row
     /// unadorned.
     pub fn psql_one(&self, sql: &str) -> Result<String> {
+        self.psql_in(self.config.dbname.as_str(), sql)
+    }
+
+    /// `SHOW`, recovery state, and shared-catalog reads are cluster-wide, so
+    /// they must not need the source's database to be present: a shadow
+    /// provisioned for another `dbname` would otherwise fail every probe with
+    /// `database "..." does not exist` rather than the mismatch itself.
+    /// Prefers `postgres`, falling back to the configured database
+    pub fn probe_one(&self, sql: &str) -> Result<String> {
+        if let Some(db) = self.probe_db.get() {
+            return self.psql_in(db, sql);
+        }
+        // `template1` is deliberately not a candidate: a session on it blocks
+        // `CREATE DATABASE` replay, and on a standby that stalls recovery
+        let db = match self.psql_in("postgres", "SELECT 1") {
+            Ok(_) => "postgres".to_owned(),
+            Err(_) => self.config.dbname.clone(),
+        };
+        let db = self.probe_db.get_or_init(|| db);
+        self.psql_in(db, sql)
+    }
+
+    /// Every cluster-level probe reads the shadow through here
+    fn psql_in(&self, dbname: &str, sql: &str) -> Result<String> {
         let out = Command::new(self.config.bin("psql"))
             .args([
                 "-h",
@@ -676,7 +706,7 @@ impl Shadow {
                 "-U",
                 self.config.user.as_str(),
                 "-d",
-                self.config.dbname.as_str(),
+                dbname,
                 "-tAXq",
                 "-c",
                 sql,
@@ -691,7 +721,7 @@ impl Shadow {
     /// binary-upgrade dump can actually build here.
     pub fn available_extensions(&self) -> Result<ahash::HashSet<String>> {
         let raw = self
-            .psql_one("SELECT coalesce(string_agg(name, ','), '') FROM pg_available_extensions")?;
+            .probe_one("SELECT coalesce(string_agg(name, ','), '') FROM pg_available_extensions")?;
         Ok(raw
             .split(',')
             .map(str::trim)
@@ -701,7 +731,7 @@ impl Shadow {
     }
 
     pub fn is_in_recovery(&self) -> Result<bool> {
-        match self.psql_one("SELECT pg_is_in_recovery()")?.as_str() {
+        match self.probe_one("SELECT pg_is_in_recovery()")?.as_str() {
             "t" => Ok(true),
             "f" => Ok(false),
             other => Err(ShadowError::PsqlParse(format!(
@@ -713,7 +743,7 @@ impl Shadow {
     /// `pg_last_wal_replay_lsn()`; `None` on `NULL` (normal-mode
     /// cluster, or standby that has not replayed anything).
     pub fn last_replay_lsn(&self) -> Result<Option<u64>> {
-        let s = self.psql_one("SELECT pg_last_wal_replay_lsn()")?;
+        let s = self.probe_one("SELECT pg_last_wal_replay_lsn()")?;
         if s.is_empty() {
             return Ok(None);
         }
@@ -723,6 +753,16 @@ impl Shadow {
     }
 
     /// Block until in recovery and replay LSN ≥ `target`, or `timeout`.
+    pub fn has_database(&self) -> Result<bool> {
+        // `standard_conforming_strings` is on by default, so doubling the
+        // quote is the whole escape
+        let literal = self.config.dbname.replace('\'', "''");
+        let present = self.probe_one(&format!(
+            "SELECT EXISTS (SELECT 1 FROM pg_database WHERE datname = '{literal}')"
+        ))?;
+        Ok(present == "t")
+    }
+
     pub fn wait_for_replay(&self, target: u64, timeout: Duration) -> Result<u64> {
         let start = Instant::now();
         loop {
@@ -754,7 +794,7 @@ impl Shadow {
     /// value from `pg_control`. An operator `pg_wal_replay_pause` (or a
     /// recovery-target pause) leaves floor equal to running, so it holds
     pub fn try_pg_wal_replay_resume(&self) -> Result<ResumeOutcome> {
-        if self.psql_one("SELECT pg_get_wal_replay_pause_state()")? == "not paused" {
+        if self.probe_one("SELECT pg_get_wal_replay_pause_state()")? == "not paused" {
             return Ok(ResumeOutcome::NotPaused);
         }
         if !self
@@ -763,7 +803,7 @@ impl Shadow {
         {
             return Ok(ResumeOutcome::PausedForeign);
         }
-        self.psql_one("SELECT pg_wal_replay_resume()")?;
+        self.probe_one("SELECT pg_wal_replay_resume()")?;
         Ok(ResumeOutcome::ResumedForFloor)
     }
 
@@ -771,7 +811,7 @@ impl Shadow {
     /// [`control_guc_floor`](Self::control_guc_floor) to tell a floor-raise
     /// pause apart from other replay pauses
     fn running_guc_floor(&self) -> Result<SourceGucFloor> {
-        let row = self.psql_one(
+        let row = self.probe_one(
             "SELECT current_setting('max_connections'), \
              current_setting('max_worker_processes'), \
              current_setting('max_wal_senders'), \
@@ -799,12 +839,12 @@ impl Shadow {
     pub fn health(&self) -> Result<HealthReport> {
         let in_recovery = self.is_in_recovery()?;
         let replay_lsn = self.last_replay_lsn()?;
-        let count_s = self.psql_one("SELECT count(*) FROM pg_class")?;
+        let count_s = self.probe_one("SELECT count(*) FROM pg_class")?;
         let pg_class_count = count_s
             .parse::<u64>()
             .map_err(|e| ShadowError::PsqlParse(format!("count(*) FROM pg_class: {e}")))?;
         let pg_proc_relname =
-            self.psql_one("SELECT relname FROM pg_class WHERE oid = 'pg_proc'::regclass")?;
+            self.probe_one("SELECT relname FROM pg_class WHERE oid = 'pg_proc'::regclass")?;
         Ok(HealthReport {
             in_recovery,
             replay_lsn,

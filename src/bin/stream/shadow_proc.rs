@@ -91,6 +91,7 @@ pub(crate) async fn start_owned_shadow(
                 .context("wait for running shadow startup")?
         {
             s.validate_running().context("validate running shadow")?;
+            warn_database_absent(&s);
             tracing::info!(target: "walshadow::shadow", "reusing running shadow");
             return Ok(());
         }
@@ -117,6 +118,7 @@ pub(crate) async fn start_owned_shadow(
                 "shadow caught up to bootstrap end_lsn",
             );
         }
+        warn_database_absent(&s);
         Ok(())
     })
     .await
@@ -317,6 +319,20 @@ impl Drop for ShadowLifecycle {
         if let Some(h) = &self.supervisor {
             h.abort();
         }
+    }
+}
+
+/// A shadow missing the applied `[source] dbname` cannot serve its bridge, but
+/// a database the source created after the base backup arrives with replay —
+/// so this is a warning at startup, and the bridge connect is what refuses
+fn warn_database_absent(shadow: &walshadow::shadow::Shadow) {
+    if let Ok(false) = shadow.has_database() {
+        tracing::warn!(
+            target: "walshadow::shadow",
+            dbname = shadow.config().dbname.as_str(),
+            "shadow holds no such database yet; replay has to create it before the \
+             bridge can attach. A data dir provisioned for another source never will",
+        );
     }
 }
 
