@@ -5,6 +5,7 @@
 //! `50-api.toml` unless `--control-fragment` names another, keeping
 //! operator-owned config read-only. PeerDB shim consumes this protocol
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -18,6 +19,7 @@ use toml::{Table, Value};
 use walrus::pg::backup::format_pg_lsn;
 
 use crate::config::SourceConn;
+use crate::emit::ch_emitter::{InstanceConfig, instance_database};
 use crate::introspect;
 use crate::metrics::MetricsRegistry;
 use crate::schema::RelName;
@@ -424,14 +426,24 @@ fn namespace_str(root: &Table, db: &str, namespace: &str, key: &str) -> Option<S
         .map(str::to_owned)
 }
 
-fn status_tables(root: &Table, db: &str, ch_database: &str) -> Vec<Value> {
+fn status_tables(
+    root: &Table,
+    db: &str,
+    ch_database: &str,
+    instances: &BTreeMap<String, InstanceConfig>,
+) -> Vec<Value> {
     replicated_entries(root, db)
         .into_iter()
         .map(|(ns, rel, block)| {
             let block_str = |key: &str| block.get(key).and_then(Value::as_str).map(str::to_owned);
+            let instance = block_str("target_instance").unwrap_or_else(|| "default".into());
             let database = block_str("target_database")
                 .or_else(|| namespace_str(root, db, ns, "target_database"))
-                .unwrap_or_else(|| ch_database.to_owned());
+                .unwrap_or_else(|| {
+                    instance_database(instances, ch_database, Some(&instance))
+                        .unwrap_or(ch_database)
+                        .to_owned()
+                });
             let table = block_str("target_table").unwrap_or_else(|| {
                 namespace_str(root, db, ns, "auto_create_name")
                     .or_else(|| {
@@ -454,6 +466,7 @@ fn status_tables(root: &Table, db: &str, ch_database: &str) -> Vec<Value> {
                 "destination_table".into(),
                 format!("{database}.{table}").into(),
             );
+            entry.insert("destination_instance".into(), instance.into());
             entry.insert("initial_load".into(), initial_load.into());
             entry.insert("cdc".into(), true.into());
             Value::Table(entry)
@@ -483,6 +496,12 @@ async fn stream_status(ctx: &SharedCtx) -> Result<String> {
         .and_then(Value::as_str)
         .unwrap_or("default")
         .to_string();
+    let instances: BTreeMap<String, InstanceConfig> = root
+        .get("ch")
+        .and_then(|ch| ch.get("instances"))
+        .cloned()
+        .and_then(|v| v.try_into().ok())
+        .unwrap_or_default();
     // One entry per database, each holding that database's selected tables
     let per_db: Vec<Value> = databases(&root)
         .iter()
@@ -491,14 +510,14 @@ async fn stream_status(ctx: &SharedCtx) -> Result<String> {
             row.insert("dbname".into(), db.clone().into());
             row.insert(
                 "tables".into(),
-                Value::Array(status_tables(&root, db, &ch_database)),
+                Value::Array(status_tables(&root, db, &ch_database, &instances)),
             );
             Value::Table(row)
         })
         .collect();
     // Flat list stays the primary database's, which is what a single-database
     // deployment reports
-    let tables = status_tables(&root, dbname(&root), &ch_database);
+    let tables = status_tables(&root, dbname(&root), &ch_database, &instances);
     let snap = ctx.metrics.snapshot().await;
     let mut out = Table::new();
     out.insert("paused".into(), paused.into());

@@ -30,7 +30,7 @@ use tokio::sync::watch;
 
 use crate::catalog::type_bridge::{self, ResolvedColumn};
 use crate::ch::{
-    ChConn, EmitterError, connect_client, exec_drain, is_retryable, quote_ident, types,
+    ChConn, EmitterError, connect_creating_database, exec_drain, is_retryable, quote_ident, types,
 };
 use crate::column_rules::ColumnRules;
 use crate::config::{ConfigResolver, DestEmitter, ResolvedConfig};
@@ -41,7 +41,7 @@ use crate::emit::ch_emitter::EmitterConfig;
 use crate::mapping::{
     ColumnMapping, DropTableStrategy, MappingHandle, MappingSnapshot, NameTemplate,
     NamespaceMapping, Retype, RetypeKind, SystemColumns, TableMapping, TableTarget, Tee,
-    apply_column_rule, fold_diff_into_mapping, retyped_target,
+    apply_column_rule, fold_diff_into_mapping, named_instance, retyped_target,
 };
 use crate::ops::oracle::{Oracle, OracleCell};
 use crate::schema::{
@@ -49,7 +49,7 @@ use crate::schema::{
     SchemaDiff, SchemaEvent, replident_key_attnums,
 };
 use crate::table_rules::{TableRule, TableRules};
-use ahash::{HashMap, HashSet, HashSetExt};
+use ahash::{HashMap, HashSet};
 use tokio_postgres::types::Oid;
 
 /// Knobs that don't ride the INSERT pump. [`DdlApplicator`] rebuilds them
@@ -58,6 +58,7 @@ use tokio_postgres::types::Oid;
 /// restart.
 #[derive(Debug, Clone)]
 pub struct DdlConfig {
+    pub instances: std::collections::BTreeMap<String, crate::emit::ch_emitter::InstanceConfig>,
     pub drop_table_strategy: DropTableStrategy,
     /// Namespaces whose `Added` events run `CREATE TABLE IF NOT EXISTS`
     /// automatically (`auto_create = true`)
@@ -104,7 +105,7 @@ pub struct DdlBoot {
 impl DdlBoot {
     pub fn from_emitter(cfg: &crate::emit::ch_emitter::EmitterConfig) -> Self {
         Self {
-            target_database: cfg.database.clone(),
+            target_database: cfg.conn.database.clone(),
             source_database: cfg.source.dbname.clone(),
             soft_delete: cfg.soft_delete,
             system: cfg.system_columns.clone(),
@@ -134,6 +135,7 @@ impl DdlConfig {
             .map(|(k, _)| k.clone())
             .collect();
         Self {
+            instances: resolved.instances.clone(),
             drop_table_strategy: resolved.drop_table_strategy,
             auto_create_namespaces,
             replicate_all,
@@ -161,11 +163,14 @@ impl DdlConfig {
         }
     }
 
-    fn target_database_for(&self, namespace: &str) -> &str {
-        self.namespaces
-            .get(namespace)
-            .and_then(|n| n.target_database.as_deref())
-            .unwrap_or(&self.target_database)
+    fn target_database_for(&self, namespace: &str, instance: Option<&str>) -> &str {
+        crate::emit::ch_emitter::default_database(
+            &self.namespaces,
+            &self.instances,
+            &self.target_database,
+            namespace,
+            instance,
+        )
     }
 
     fn derived_table_for(&self, rel: &RelName) -> String {
@@ -191,10 +196,11 @@ impl DdlConfig {
 
     fn create_target(&self, settings: &TableRule, rel: &RelName) -> TableTarget {
         TableTarget {
-            database: settings
-                .target_database
-                .clone()
-                .unwrap_or_else(|| self.target_database_for(&rel.namespace).to_owned()),
+            instance: settings.target_instance.clone().and_then(named_instance),
+            database: settings.target_database.clone().unwrap_or_else(|| {
+                self.target_database_for(&rel.namespace, settings.target_instance.as_deref())
+                    .to_owned()
+            }),
             table: settings
                 .target_table
                 .clone()
@@ -288,7 +294,7 @@ pub struct DdlApplicator {
     resolver: Option<Arc<ConfigResolver>>,
     /// Shadow PG renderer for tier-3 fast defaults
     oracle: Option<Arc<Oracle>>,
-    ensured_databases: HashSet<String>,
+    ensured_databases: HashMap<(Option<String>, String), Arc<EmitterConfig>>,
     pub stats: DdlStats,
 }
 
@@ -316,7 +322,7 @@ impl DdlApplicator {
             mapping,
             resolver: None,
             oracle: None,
-            ensured_databases: HashSet::new(),
+            ensured_databases: HashMap::default(),
             stats: DdlStats::default(),
         })
     }
@@ -401,9 +407,12 @@ impl DdlApplicator {
         };
         let settings = cfg.rules.settings(&desc.rel_name);
         let shape = cfg.create_shape(&settings);
-        self.ensure_database(&mapping.target.database).await?;
-        self.execute(&render_create_table(desc, &cols, &mapping.target, &shape))
-            .await?;
+        self.ensure_database(&mapping.target).await?;
+        self.execute(
+            &mapping.target,
+            &render_create_table(desc, &cols, &mapping.target, &shape),
+        )
+        .await?;
         self.stats.creates_applied += 1;
         self.create_tees(desc, &mapping, &cols, &shape).await?;
         self.register_mapping(&desc.rel_name, mapping).await;
@@ -418,12 +427,12 @@ impl DdlApplicator {
         target: &TableTarget,
         shape: &CreateShape<'_>,
     ) -> Result<(), EmitterError> {
-        self.ensure_database(&target.database).await?;
-        self.execute(&render_create_table(desc, cols, target, shape))
+        self.ensure_database(target).await?;
+        self.execute(target, &render_create_table(desc, cols, target, shape))
             .await?;
         self.stats.creates_applied += 1;
         if let Some(sql) = render_add_columns(cols, target) {
-            self.execute(&sql).await?;
+            self.execute(target, &sql).await?;
             self.stats.alters_applied += 1;
         }
         Ok(())
@@ -438,7 +447,7 @@ impl DdlApplicator {
         shape: &CreateShape<'_>,
     ) -> Result<(), EmitterError> {
         for tee in &mapping.tees {
-            let target = tee.target(&mapping.target.database);
+            let target = tee.target(&mapping.target);
             self.create_dest(desc, cols, &target, &shape.for_tee(tee))
                 .await?;
         }
@@ -466,8 +475,8 @@ impl DdlApplicator {
             self.stats.skipped += 1;
             return Ok(false);
         };
-        self.ensure_database(&target.database).await?;
-        self.execute(&render_create_table(desc, &cols, &target, &shape))
+        self.ensure_database(&target).await?;
+        self.execute(&target, &render_create_table(desc, &cols, &target, &shape))
             .await?;
         self.stats.creates_applied += 1;
         let mapping = TableMapping {
@@ -493,7 +502,7 @@ impl DdlApplicator {
             self.stats.skipped += 1;
             return Ok(());
         };
-        let targets: Vec<String> = mapping.targets().map(|t| t.sql()).collect();
+        let targets: Vec<TableTarget> = mapping.targets().collect();
         // ClickHouse can reject key retypes; defer renames, additions, and drops
         ensure_unmoved(&self.mapping, &key, &mapped_at).await?;
         let columns = &mapping.columns;
@@ -568,9 +577,9 @@ impl DdlApplicator {
         Ok(())
     }
 
-    async fn alter(&mut self, targets: &[String], clause: &str) -> Result<(), EmitterError> {
+    async fn alter(&mut self, targets: &[TableTarget], clause: &str) -> Result<(), EmitterError> {
         for target in targets {
-            self.execute(&format!("ALTER TABLE {target} {clause}"))
+            self.execute(target, &format!("ALTER TABLE {} {clause}", target.sql()))
                 .await?;
             self.stats.alters_applied += 1;
         }
@@ -607,7 +616,7 @@ impl DdlApplicator {
             DropTableStrategy::Drop => {
                 for target in mapping.targets() {
                     let sql = format!("DROP TABLE IF EXISTS {}", target.sql());
-                    self.execute(&sql).await?;
+                    self.execute(&target, &sql).await?;
                     self.stats.drops_applied += 1;
                 }
                 // Forget the runtime-derived entry so a future Added
@@ -630,7 +639,7 @@ impl DdlApplicator {
             return Ok(());
         };
         for target in mapping.targets() {
-            self.execute(&format!("TRUNCATE TABLE {}", target.sql()))
+            self.execute(&target, &format!("TRUNCATE TABLE {}", target.sql()))
                 .await?;
         }
         Ok(())
@@ -720,17 +729,32 @@ impl DdlApplicator {
     /// barrier and ack frontier indefinitely. Every emitted statement is
     /// idempotent (`IF [NOT] EXISTS`, `RENAME COLUMN IF EXISTS`,
     /// `TRUNCATE`), so a reconnect resends and CH no-ops the second apply.
-    async fn ensure_database(&mut self, db: &str) -> Result<(), EmitterError> {
-        if self.ensured_databases.contains(db) {
+    async fn ensure_database(&mut self, target: &TableTarget) -> Result<(), EmitterError> {
+        self.client.select(target.instance.as_deref())?;
+        let config = self.client.config();
+        let key = (target.instance.clone(), target.database.clone());
+        if self
+            .ensured_databases
+            .get(&key)
+            .is_some_and(|old| Arc::ptr_eq(old, &config))
+        {
             return Ok(());
         }
-        let sql = format!("CREATE DATABASE IF NOT EXISTS {}", quote_ident(db));
-        self.execute(&sql).await?;
-        self.ensured_databases.insert(db.to_owned());
+        let sql = format!(
+            "CREATE DATABASE IF NOT EXISTS {}",
+            quote_ident(&target.database)
+        );
+        self.execute_selected(&sql).await?;
+        self.ensured_databases.insert(key, config);
         Ok(())
     }
 
-    async fn execute(&mut self, sql: &str) -> Result<(), EmitterError> {
+    async fn execute(&mut self, target: &TableTarget, sql: &str) -> Result<(), EmitterError> {
+        self.client.select(target.instance.as_deref())?;
+        self.execute_selected(sql).await
+    }
+
+    async fn execute_selected(&mut self, sql: &str) -> Result<(), EmitterError> {
         tracing::debug!(target: "walshadow::ch_ddl", sql = %sql, "applying");
         let query_timeout = self.client.config().insert_timeout;
         self.client
@@ -1243,45 +1267,30 @@ fn render_create_table(
     render_create_sql(&target, col_defs, key, shape)
 }
 
-/// CH `UNKNOWN_DATABASE`
-const UNKNOWN_DATABASE: i32 = 81;
-
 /// Create `[ch] database` when the server doesn't have it, over a session on
 /// `default` — every other client names it in the handshake, which CH refuses
 /// outright for an absent database, so no connected client can create its own.
 /// `Ok(false)` when it was already there. Sibling databases (per-namespace
 /// `target_database`) go through the applicator's own `ensure_database` instead
 pub async fn ensure_boot_database(cfg: &EmitterConfig) -> Result<bool, EmitterError> {
-    match connect_client(cfg).await {
-        Ok(_) => Ok(false),
-        Err(EmitterError::Client(e)) if e.server_code == UNKNOWN_DATABASE => {
-            let mut on_default = cfg.clone();
-            on_default.database = "default".into();
-            let mut client = connect_client(&on_default).await?;
-            exec_drain(
-                &mut client,
-                &format!(
-                    "CREATE DATABASE IF NOT EXISTS {}",
-                    quote_ident(&cfg.database)
-                ),
-                cfg.insert_timeout,
-            )
-            .await?;
-            tracing::info!(
-                target: "walshadow::ch_ddl",
-                database = %cfg.database,
-                "created destination database",
-            );
-            Ok(true)
-        }
-        Err(e) => Err(e),
+    let mut created = ensure_instance_database(cfg).await?;
+    for instance in cfg.instances.values() {
+        created |= ensure_instance_database(&instance.apply(cfg)).await?;
     }
+    Ok(created)
+}
+
+async fn ensure_instance_database(cfg: &EmitterConfig) -> Result<bool, EmitterError> {
+    connect_creating_database(cfg)
+        .await
+        .map(|(_, created)| created)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::mapping::{ColumnMapping, TableMapping, derive_columns_for_mapping};
+    use ahash::HashSetExt;
     use std::sync::LazyLock;
 
     static SYS: LazyLock<Arc<SystemColumns>> = LazyLock::new(Arc::default);
@@ -1296,7 +1305,7 @@ mod tests {
             let ddl = DdlConfig::from_resolved(
                 &resolved,
                 DdlBoot {
-                    target_database: config.database.clone(),
+                    target_database: config.conn.database.clone(),
                     source_database: "app".into(),
                     soft_delete: false,
                     system: SYS.clone(),
@@ -1313,7 +1322,13 @@ mod tests {
             )
             .await
             .unwrap();
-            assert_eq!(applicator.execute(sql).await.is_ok(), retries == 2 || idle);
+            assert_eq!(
+                applicator
+                    .execute(&TableTarget::new("default", "t"), sql)
+                    .await
+                    .is_ok(),
+                retries == 2 || idle
+            );
             server.await.unwrap();
         }
     }
@@ -1330,10 +1345,9 @@ mod tests {
     fn render_from_mapping(
         desc: &RelDescriptor,
         mapping: &TableMapping,
-        target: &TableTarget,
         shape: &CreateShape<'_>,
     ) -> String {
-        render_create_table(desc, &mapping_columns(mapping), target, shape)
+        render_create_table(desc, &mapping_columns(mapping), &mapping.target, shape)
     }
 
     fn dest(database: &str, desc: &RelDescriptor) -> TableTarget {
@@ -1395,6 +1409,7 @@ mod tests {
             },
         );
         let mut cfg = DdlConfig {
+            instances: Default::default(),
             drop_table_strategy: DropTableStrategy::Retain,
             auto_create_namespaces: HashSet::new(),
             replicate_all: false,
@@ -1443,6 +1458,7 @@ mod tests {
     fn auto_create_name_all_covers_namespaces_with_no_entry() {
         use crate::mapping::NameTemplate;
         let mut cfg = DdlConfig {
+            instances: Default::default(),
             drop_table_strategy: DropTableStrategy::Retain,
             auto_create_namespaces: HashSet::new(),
             replicate_all: true,
@@ -1505,6 +1521,7 @@ mod tests {
             },
         );
         let cfg = DdlConfig {
+            instances: Default::default(),
             drop_table_strategy: DropTableStrategy::Retain,
             auto_create_namespaces: HashSet::new(),
             replicate_all: false,
@@ -1518,9 +1535,9 @@ mod tests {
             rules: Arc::default(),
             column_rules: Arc::default(),
         };
-        assert_eq!(cfg.target_database_for("analytics"), "warehouse");
-        assert_eq!(cfg.target_database_for("logs"), "default");
-        assert_eq!(cfg.target_database_for("unconfigured"), "default");
+        assert_eq!(cfg.target_database_for("analytics", None), "warehouse");
+        assert_eq!(cfg.target_database_for("logs", None), "default");
+        assert_eq!(cfg.target_database_for("unconfigured", None), "default");
         assert_eq!(cfg.drop_strategy_for("analytics"), DropTableStrategy::Drop);
         assert_eq!(cfg.drop_strategy_for("logs"), DropTableStrategy::Retain);
         assert_eq!(
@@ -1533,6 +1550,7 @@ mod tests {
     fn with_drop_strategy_overrides_global_default() {
         use ahash::{HashMap, HashMapExt};
         let cfg = DdlConfig {
+            instances: Default::default(),
             drop_table_strategy: DropTableStrategy::Retain,
             auto_create_namespaces: HashSet::new(),
             replicate_all: false,
@@ -1628,6 +1646,7 @@ mod tests {
         let (rules, rejected) = b.finish();
         assert_eq!(rejected, 0);
         let cfg = DdlConfig {
+            instances: Default::default(),
             drop_table_strategy: DropTableStrategy::Retain,
             auto_create_namespaces: HashSet::new(),
             replicate_all: false,
@@ -1939,7 +1958,6 @@ mod tests {
         let sql = render_from_mapping(
             &d,
             &m,
-            &m.target,
             &CreateShape {
                 primary_key: &primary_key,
                 engine: None,
@@ -2137,7 +2155,7 @@ mod tests {
             ],
             tees: Vec::new(),
         };
-        let sql = render_from_mapping(&d, &m, &m.target, &shape(false));
+        let sql = render_from_mapping(&d, &m, &shape(false));
         assert!(
             sql.contains("CREATE TABLE IF NOT EXISTS `warehouse`.`orders_pinned`"),
             "{sql}"
@@ -2162,7 +2180,7 @@ mod tests {
             }],
             tees: Vec::new(),
         };
-        let sql = render_from_mapping(&d, &m, &m.target, &shape(false));
+        let sql = render_from_mapping(&d, &m, &shape(false));
         assert!(sql.ends_with("ORDER BY (`_lsn`)"), "{sql}");
     }
 
@@ -2344,7 +2362,6 @@ mod tests {
         let sql = render_from_mapping(
             &d,
             &m,
-            &m.target,
             &CreateShape {
                 system: SYS.clone(),
                 soft_delete: false,
@@ -2533,6 +2550,7 @@ mod tests {
         let frozen = handle.snapshot().await;
         handle.publish(Arc::new(ahash::HashMap::default())).await;
         let cfg = DdlConfig {
+            instances: Default::default(),
             drop_table_strategy: DropTableStrategy::Drop,
             auto_create_namespaces: HashSet::new(),
             replicate_all: false,
@@ -2569,6 +2587,7 @@ mod tests {
     #[test]
     fn prediction_maps_added_under_replicate_all() {
         let mut cfg = DdlConfig {
+            instances: Default::default(),
             drop_table_strategy: DropTableStrategy::Retain,
             auto_create_namespaces: HashSet::new(),
             replicate_all: true,

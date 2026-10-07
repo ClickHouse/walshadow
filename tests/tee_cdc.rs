@@ -15,6 +15,15 @@ use walshadow::table_rules::{MatchKind, TableRule};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tee_receives_rows_and_ddl() {
+    run(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn named_instances_receive_rows_and_ddl() {
+    run(true).await;
+}
+
+async fn run(named: bool) {
     if !fx::tools::requirements_available() {
         return;
     }
@@ -44,7 +53,23 @@ async fn tee_receives_rows_and_ddl() {
     ch.query("CREATE DATABASE IF NOT EXISTS walshadow_test")
         .expect("create db");
 
-    let mut ddl_args = fx::DdlPipelineArgs::default();
+    let remote_ports = fx::Ports::alloc();
+    let remote = named.then(|| {
+        let ch = fx::ChServer::spawn(
+            tempfile::tempdir().unwrap(),
+            remote_ports.ch_tcp,
+            remote_ports.ch_http,
+        )
+        .unwrap();
+        ch.query("CREATE DATABASE walshadow_test").unwrap();
+        ch
+    });
+    let primary = remote.as_ref().unwrap_or(&ch);
+
+    let mut ddl_args = fx::DdlPipelineArgs {
+        drop_table_strategy: Some(walshadow::mapping::DropTableStrategy::Drop),
+        ..Default::default()
+    };
     ddl_args.namespaces.insert(
         "sc".into(),
         NamespaceMapping {
@@ -70,10 +95,37 @@ async fn tee_receives_rows_and_ddl() {
             ddl: Some(ddl_args),
         },
         |cfg| {
+            if named {
+                cfg.instances.insert(
+                    "warehouse".into(),
+                    walshadow::ch_emitter::InstanceConfig {
+                        host: "127.0.0.1".into(),
+                        port: remote_ports.ch_tcp,
+                        database: "walshadow_test".into(),
+                        ..Default::default()
+                    },
+                );
+            }
+            for name in ["truncated", "dropped"] {
+                cfg.table_entries.push((
+                    RelName::new("sc", name),
+                    MatchKind::Exact,
+                    TableRule {
+                        target_instance: named.then(|| "warehouse".into()),
+                        tee: Some(vec![Tee {
+                            instance: named.then(|| "default".into()),
+                            table: format!("{name}_copy"),
+                            ..Default::default()
+                        }]),
+                        ..Default::default()
+                    },
+                ));
+            }
             cfg.table_entries.push((
                 RelName::new("sc", "t"),
                 MatchKind::Exact,
                 TableRule {
+                    target_instance: named.then(|| "warehouse".into()),
                     tee: Some(vec![
                         Tee {
                             table: "t_audit".into(),
@@ -82,6 +134,7 @@ async fn tee_receives_rows_and_ddl() {
                             ..Tee::default()
                         },
                         Tee {
+                            instance: named.then(|| "default".into()),
                             database: Some("walshadow_replica".into()),
                             table: "t".into(),
                             ..Tee::default()
@@ -103,6 +156,10 @@ async fn tee_receives_rows_and_ddl() {
             "ALTER TABLE sc.t ADD COLUMN note text".into(),
             "INSERT INTO sc.t VALUES (3, 'c', 'n')".into(),
             "DELETE FROM sc.t WHERE id = 2".into(),
+            "CREATE TABLE sc.truncated (id bigint PRIMARY KEY); INSERT INTO sc.truncated VALUES (1)".into(),
+            "TRUNCATE sc.truncated".into(),
+            "CREATE TABLE sc.dropped (id bigint PRIMARY KEY); INSERT INTO sc.dropped VALUES (1)".into(),
+            "DROP TABLE sc.dropped".into(),
             "SELECT pg_switch_wal()".into(),
         ],
     );
@@ -120,15 +177,15 @@ async fn tee_receives_rows_and_ddl() {
 
     let live = "SELECT arrayStringConcat(groupArray(concat(toString(id), ':', body, ':', \
                 ifNull(note, '-'))), ',') FROM (SELECT * FROM {} FINAL ORDER BY id)";
-    for table in ["walshadow_test.t", "walshadow_replica.t"] {
+    for (server, table) in [(primary, "walshadow_test.t"), (&ch, "walshadow_replica.t")] {
         assert_eq!(
-            ch.query(&live.replace("{}", table)).expect("live rows"),
+            server.query(&live.replace("{}", table)).expect("live rows"),
             "1:a2:-,3:c:n",
             "{table}"
         );
     }
 
-    let audit = ch
+    let audit = primary
         .query(
             "SELECT arrayStringConcat(groupArray(concat(toString(id), ':', ifNull(body, ''), ':', \
              toString(_is_deleted))), ',') FROM \
@@ -139,19 +196,49 @@ async fn tee_receives_rows_and_ddl() {
         audit, "1:a:false,2:b:false,1:a2:false,3:c:false,2::true",
         "every version kept"
     );
-    let ddl = ch
+    let ddl = primary
         .query("SHOW CREATE TABLE walshadow_test.t_audit")
         .expect("show create");
     assert!(ddl.contains("ENGINE = MergeTree"), "{ddl}");
     assert!(ddl.contains("ORDER BY (id, _lsn)"), "{ddl}");
-    assert_eq!(
-        ch.query(
-            "SELECT count() FROM system.columns WHERE name = 'note' \
+    for (server, expected) in if named {
+        vec![(primary, "2"), (&ch, "1")]
+    } else {
+        vec![(&ch, "3")]
+    } {
+        assert_eq!(
+            server
+                .query(
+                    "SELECT count() FROM system.columns WHERE name = 'note' \
              AND (database, table) IN (('walshadow_test', 't'), \
              ('walshadow_test', 't_audit'), ('walshadow_replica', 't'))"
-        )
-        .expect("note columns"),
-        "3",
-        "ADD COLUMN reached every target"
-    );
+                )
+                .unwrap(),
+            expected,
+            "ADD COLUMN reached every target"
+        );
+    }
+    for (server, table) in [(primary, "truncated"), (&ch, "truncated_copy")] {
+        assert_eq!(
+            server
+                .query(&format!("SELECT count() FROM walshadow_test.{table}"))
+                .unwrap(),
+            "0"
+        );
+    }
+    for (server, table) in [(primary, "dropped"), (&ch, "dropped_copy")] {
+        assert_eq!(
+            server
+                .query(&format!("EXISTS TABLE walshadow_test.{table}"))
+                .unwrap(),
+            "0"
+        );
+    }
+    if named {
+        assert_eq!(ch.query("EXISTS TABLE walshadow_test.t").unwrap(), "0");
+        assert_eq!(
+            primary.query("EXISTS TABLE walshadow_replica.t").unwrap(),
+            "0"
+        );
+    }
 }

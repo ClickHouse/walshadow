@@ -86,7 +86,7 @@ use crate::decode::heap_decoder::ColumnValue;
 use crate::emit::ch_emitter::{EmitterStats, ToastMode};
 use crate::emit::pipeline::tail::OwnedTail;
 use crate::emit::pipeline::{Fatal, bootstrap};
-use crate::mapping::MappingHandle;
+use crate::mapping::{MappingHandle, TableTarget};
 use crate::ops::oracle::Oracle;
 use crate::pg::{current_wal_lsn, quote_ident};
 use crate::pos::{Pos, Snapshot};
@@ -159,6 +159,8 @@ struct LedgerEntry {
     /// whether the exchange applied
     #[serde(default)]
     staging_uuid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    staging_target: Option<TableTarget>,
     /// Resumable COPY cursor: filenode the cursor was measured against, and
     /// the next heap block to read. A rewrite changes the filenode, which
     /// retires the cursor instead of skipping relocated rows
@@ -192,6 +194,7 @@ enum Phase {
     },
     /// Staging uuid recorded before the exchange
     Swapped {
+        staging_target: Option<TableTarget>,
         staging_uuid: String,
     },
     Done,
@@ -269,7 +272,10 @@ impl Ledger {
                 let rel = RelName::new(&e.namespace, &e.relname);
                 let phase = match (e.done, e.swapped, e.staging_uuid) {
                     (true, ..) => Phase::Done,
-                    (false, true, Some(staging_uuid)) => Phase::Swapped { staging_uuid },
+                    (false, true, Some(staging_uuid)) => Phase::Swapped {
+                        staging_uuid,
+                        staging_target: e.staging_target,
+                    },
                     (false, true, None) => {
                         return Err(invalid(format!("{rel} swapped without staging uuid")));
                     }
@@ -308,7 +314,7 @@ impl Ledger {
                 .map(|(rel, rec)| {
                     let (staging_uuid, copy) = match &rec.phase {
                         Phase::Pending { copy } => (None, *copy),
-                        Phase::Swapped { staging_uuid } => (Some(staging_uuid.clone()), None),
+                        Phase::Swapped { staging_uuid, .. } => (Some(staging_uuid.clone()), None),
                         Phase::Done => (None, None),
                     };
                     LedgerEntry {
@@ -319,6 +325,10 @@ impl Ledger {
                         mode: rec.mode.as_str().into(),
                         swapped: staging_uuid.is_some(),
                         staging_uuid,
+                        staging_target: match &rec.phase {
+                            Phase::Swapped { staging_target, .. } => staging_target.clone(),
+                            _ => None,
+                        },
                         copy_relfilenode: copy.map(|c| c.relfilenode),
                         copy_next_block: copy.map(|c| c.next_block),
                         toast_seeded: rec.toast_seeded,
@@ -941,10 +951,14 @@ impl CopyBackfiller {
             // withheld — resume the swap tail, never re-load (the staging
             // name may hold the only copy of the live-window rows)
             let resume = inner.ledger.entries.get(&rel).and_then(|r| {
-                let Phase::Swapped { staging_uuid } = &r.phase else {
+                let Phase::Swapped {
+                    staging_uuid,
+                    staging_target,
+                } = &r.phase
+                else {
                     return None;
                 };
-                Some((r.s_lsn, staging_uuid.clone()))
+                Some((r.s_lsn, staging_uuid.clone(), staging_target.clone()))
             });
             let mut spawn_pass = false;
             if resume.is_none()
@@ -963,9 +977,12 @@ impl CopyBackfiller {
             }
             (s_lsn, mode, spawn_pass, resume)
         };
-        if let Some((s_lsn, staging_uuid)) = resume {
+        if let Some((s_lsn, staging_uuid, staging_target)) = resume {
             let this = self.clone();
-            tokio::spawn(async move { this.resume_swap(rel, s_lsn, staging_uuid).await });
+            tokio::spawn(async move {
+                this.resume_swap(rel, s_lsn, staging_uuid, staging_target)
+                    .await
+            });
             return;
         }
         match mode {
@@ -1386,6 +1403,7 @@ impl CopyBackfiller {
     /// or DDL moved the destination shape mid-pass (the loaded copy has the
     /// pre-DDL shape; entry stays pending, next boot re-loads).
     async fn swap_rel(&self, sess: &mut StagingSession, rel: &StagingRel) -> anyhow::Result<bool> {
+        sess.select(rel.target.instance.as_deref())?;
         if !self.mapping.with(|m| m.contains_key(&rel.rel)).await {
             sess.drop_staging(rel).await?;
             tracing::info!(
@@ -1395,9 +1413,11 @@ impl CopyBackfiller {
             );
             return Ok(false);
         }
-        let real_fp = sess.schema_fingerprint(&rel.database, &rel.table).await?;
+        let real_fp = sess
+            .schema_fingerprint(&rel.target.database, &rel.target.table)
+            .await?;
         let staging_fp = sess
-            .schema_fingerprint(&rel.database, &rel.staging_table())
+            .schema_fingerprint(&rel.target.database, &rel.staging_table())
             .await?;
         if real_fp != staging_fp {
             sess.drop_staging(rel).await?;
@@ -1409,7 +1429,7 @@ impl CopyBackfiller {
             return Ok(false);
         }
         let uuid = sess
-            .table_uuid(&rel.database, &rel.staging_table())
+            .table_uuid(&rel.target.database, &rel.staging_table())
             .await?
             .context("staging table missing before exchange")?;
         // Persist precedes EXCHANGE: post-swap the staging name holds the
@@ -1447,8 +1467,12 @@ impl CopyBackfiller {
         name: RelName,
         s_lsn: Pos<Snapshot>,
         staging_uuid: String,
+        staging_target: Option<TableTarget>,
     ) {
-        if let Err(e) = self.resume_swap_inner(&name, s_lsn, &staging_uuid).await {
+        if let Err(e) = self
+            .resume_swap_inner(&name, s_lsn, &staging_uuid, staging_target)
+            .await
+        {
             tracing::error!(
                 target: "walshadow::backfill",
                 qname = %name,
@@ -1466,22 +1490,31 @@ impl CopyBackfiller {
         name: &RelName,
         s_lsn: Pos<Snapshot>,
         staging_uuid: &str,
+        staging_target: Option<TableTarget>,
     ) -> anyhow::Result<()> {
-        let target = self
-            .mapping
-            .with(|m| m.get(name).map(|t| t.target.clone()))
-            .await
-            .with_context(|| format!("swapped entry {name} unmapped; staging table orphaned"))?;
+        let target = match staging_target {
+            Some(target) => target,
+            None => self
+                .mapping
+                .with(|m| m.get(name).map(|t| t.target.clone()))
+                .await
+                .with_context(|| {
+                    format!("swapped entry {name} unmapped; staging table orphaned")
+                })?,
+        };
         let rel = StagingRel {
             rel: name.clone(),
-            database: target.database,
-            table: target.table,
+            target,
             s_lsn: s_lsn.get(),
         };
         let mut sess = StagingSession::connect(self.dest.clone())
             .await?
             .with_rules(self.table_rules());
-        match sess.table_uuid(&rel.database, &rel.staging_table()).await? {
+        sess.select(rel.target.instance.as_deref())?;
+        match sess
+            .table_uuid(&rel.target.database, &rel.staging_table())
+            .await?
+        {
             None => {
                 self.activate_pending(name).await;
                 self.mark_done_entry(name).await;
@@ -1490,9 +1523,11 @@ impl CopyBackfiller {
             }
             Some(u) if u == staging_uuid => {
                 // Schema may have moved while down — same gate as the pass
-                let real_fp = sess.schema_fingerprint(&rel.database, &rel.table).await?;
+                let real_fp = sess
+                    .schema_fingerprint(&rel.target.database, &rel.target.table)
+                    .await?;
                 let staging_fp = sess
-                    .schema_fingerprint(&rel.database, &rel.staging_table())
+                    .schema_fingerprint(&rel.target.database, &rel.staging_table())
                     .await?;
                 if real_fp != staging_fp {
                     sess.drop_staging(&rel).await?;
@@ -1524,7 +1559,13 @@ impl CopyBackfiller {
         let name = &rel.rel;
         let mut inner = self.inner.lock().await;
         let rec = inner.ledger.entries.get_mut(name)?;
-        let prior = std::mem::replace(&mut rec.phase, Phase::Swapped { staging_uuid: uuid });
+        let prior = std::mem::replace(
+            &mut rec.phase,
+            Phase::Swapped {
+                staging_uuid: uuid,
+                staging_target: Some(rel.target.clone()),
+            },
+        );
         if let Err(e) = inner.ledger.persist().await {
             tracing::warn!(
                 target: "walshadow::backfill",
@@ -2108,6 +2149,7 @@ mod tests {
             },
             LedgerRec {
                 phase: Phase::Swapped {
+                    staging_target: None,
                     staging_uuid: "uuid".into(),
                 },
                 ..pending.clone()
@@ -2190,6 +2232,10 @@ mod tests {
                 s_lsn: 0x2000.into(),
                 mode: InitialLoadMode::ObjectStore,
                 phase: Phase::Swapped {
+                    staging_target: Some(TableTarget {
+                        instance: Some("archive".into()),
+                        ..TableTarget::new("history", "orders")
+                    }),
                     staging_uuid: "a-uuid".into(),
                 },
                 toast_seeded: false,
@@ -2218,6 +2264,10 @@ mod tests {
         assert_eq!(
             mid.phase,
             Phase::Swapped {
+                staging_target: Some(TableTarget {
+                    instance: Some("archive".into()),
+                    ..TableTarget::new("history", "orders")
+                }),
                 staging_uuid: "a-uuid".into()
             },
             "swap phase round-trips"

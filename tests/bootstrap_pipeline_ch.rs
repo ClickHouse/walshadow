@@ -26,7 +26,7 @@ use std::time::Duration;
 use walrus::pg::walparser::RelFileNode;
 use walshadow::backup_page_walk::{BackfillTuple, CatalogMap};
 use walshadow::ch::CompressionChoice;
-use walshadow::ch_emitter::{EmitterConfig, EmitterStats};
+use walshadow::ch_emitter::{EmitterConfig, EmitterStats, InstanceConfig};
 use walshadow::heap_decoder::ColumnValue;
 use walshadow::mapping::{ColumnMapping, TableMapping, TableTarget};
 use walshadow::pipeline::batcher::BatcherMsg;
@@ -127,10 +127,13 @@ async fn bootstrap_tail_fans_out_n2() {
     // Small row_budget so each rfn's single seq spans many batches that
     // fan across the two inserter connections and ack out of order.
     let mut cfg = EmitterConfig {
-        host: "127.0.0.1".into(),
-        port: slot.ch_tcp,
-        database: "walshadow_test".into(),
-        compression: CompressionChoice::None,
+        conn: InstanceConfig {
+            host: "127.0.0.1".into(),
+            port: slot.ch_tcp,
+            database: "walshadow_test".into(),
+            compression: CompressionChoice::None,
+            ..Default::default()
+        },
         row_budget: 4,
         flush_timeout: Duration::from_millis(50),
         ..Default::default()

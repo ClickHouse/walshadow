@@ -33,33 +33,27 @@ use ahash::{HashMap, HashMapExt, HashSet};
 /// recovery finds the prior attempt's table
 pub const STAGING_SUFFIX: &str = "__wsstg";
 
-/// One rel's swap identities. `database`/`table` are the unquoted
-/// destination parts; `s_lsn` drives the copy-back filter.
+/// One rel's swap identities; `s_lsn` drives the copy-back filter
 #[derive(Debug, Clone)]
 pub struct StagingRel {
     pub rel: RelName,
-    pub database: String,
-    pub table: String,
+    pub target: TableTarget,
     pub s_lsn: u64,
 }
 
 impl StagingRel {
     pub fn staging_table(&self) -> String {
-        format!("{}{STAGING_SUFFIX}", self.table)
+        format!("{}{STAGING_SUFFIX}", self.target.table)
     }
 
     pub fn real_sql(&self) -> String {
-        format!(
-            "{}.{}",
-            quote_ident(&self.database),
-            quote_ident(&self.table)
-        )
+        self.target.sql()
     }
 
     pub fn staging_sql(&self) -> String {
         format!(
             "{}.{}",
-            quote_ident(&self.database),
+            quote_ident(&self.target.database),
             quote_ident(&self.staging_table())
         )
     }
@@ -101,8 +95,7 @@ pub async fn prepare(
         };
         let rel = StagingRel {
             rel: name.clone(),
-            database: m.target.database.clone(),
-            table: m.target.table.clone(),
+            target: m.target.clone(),
             s_lsn: r.s_lsn,
         };
         if !reuse {
@@ -113,7 +106,10 @@ pub async fn prepare(
         staged.insert(
             name.clone(),
             TableMapping {
-                target: TableTarget::new(&rel.database, &rel.staging_table()),
+                target: TableTarget {
+                    table: rel.staging_table(),
+                    ..m.target.clone()
+                },
                 columns: m.columns.clone(),
                 // Write load rows directly to tees; staging swap replaces only main destination
                 tees: m.tees.clone(),
@@ -145,6 +141,11 @@ impl StagingSession {
             client,
             rules: None,
         })
+    }
+
+    pub fn select(&mut self, instance: Option<&str>) -> Result<()> {
+        self.client.select(instance)?;
+        Ok(())
     }
 
     pub fn with_rules(mut self, rules: Option<Arc<crate::table_rules::TableRules>>) -> Self {
@@ -231,6 +232,7 @@ impl StagingSession {
     }
 
     pub async fn rebuild_staging(&mut self, rel: &StagingRel) -> Result<()> {
+        self.select(rel.target.instance.as_deref())?;
         self.exec_retry(&format!("DROP TABLE IF EXISTS {}", rel.staging_sql()))
             .await?;
         // IF NOT EXISTS only shields an ambiguous-timeout resend; the table
@@ -244,6 +246,7 @@ impl StagingSession {
     }
 
     pub async fn drop_staging(&mut self, rel: &StagingRel) -> Result<()> {
+        self.select(rel.target.instance.as_deref())?;
         self.exec_retry(&format!("DROP TABLE IF EXISTS {}", rel.staging_sql()))
             .await
     }
@@ -276,6 +279,7 @@ impl StagingSession {
     /// Atomic publish; requires an Atomic/Replicated database engine.
     pub async fn exchange(&mut self, permit: SwapPermit<'_>) -> Result<()> {
         let rel = permit.rel();
+        self.select(rel.target.instance.as_deref())?;
         self.exec_once(&format!(
             "EXCHANGE TABLES {} AND {}",
             rel.real_sql(),
@@ -290,19 +294,20 @@ impl StagingSession {
     /// back. Column list is the intersection (destination order) so DDL
     /// applied to the destination after the swap can't block the copy-back.
     pub async fn copy_back(&mut self, rel: &StagingRel) -> Result<()> {
+        self.select(rel.target.instance.as_deref())?;
         let real_cols = self
             .query_strings(&format!(
                 "SELECT name FROM system.columns WHERE database = {} AND table = {} \
                  ORDER BY position",
-                sql_str(&rel.database),
-                sql_str(&rel.table)
+                sql_str(&rel.target.database),
+                sql_str(&rel.target.table)
             ))
             .await?;
         let staging_cols: HashSet<String> = self
             .query_strings(&format!(
                 "SELECT name FROM system.columns WHERE database = {} AND table = {} \
                  ORDER BY position",
-                sql_str(&rel.database),
+                sql_str(&rel.target.database),
                 sql_str(&rel.staging_table())
             ))
             .await?
@@ -401,8 +406,7 @@ mod tests {
     fn staging_rel_renders_sql_names() {
         let rel = StagingRel {
             rel: RelName::new("public", "orders"),
-            database: "db".into(),
-            table: "orders".into(),
+            target: TableTarget::new("db", "orders"),
             s_lsn: 0x5000,
         };
         assert_eq!(rel.real_sql(), "`db`.`orders`");

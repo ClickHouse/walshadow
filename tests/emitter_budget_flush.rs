@@ -23,7 +23,7 @@ use std::sync::atomic::Ordering;
 
 use walrus::pg::walparser::RelFileNode;
 use walshadow::ch::CompressionChoice;
-use walshadow::ch_emitter::{EmitterConfig, EmitterStats};
+use walshadow::ch_emitter::{EmitterConfig, EmitterStats, InstanceConfig};
 use walshadow::heap_decoder::{ColumnValue, CommittedTuple, DecodedHeap, DecodedTuple, HeapOp};
 use walshadow::mapping::{ColumnMapping, TableMapping, TableTarget};
 use walshadow::pipeline::ack::Publish;
@@ -149,10 +149,13 @@ async fn budget_trips_seal_complete_inserts() {
     // Trip the batcher after every 2 rows so a 5-row seq seals 3 blocks
     // (2 budget trips + the final FlushAll).
     let cfg = EmitterConfig {
-        host: "127.0.0.1".into(),
-        port: slot.ch_tcp,
-        database: "walshadow_test".into(),
-        compression: CompressionChoice::Lz4,
+        conn: InstanceConfig {
+            host: "127.0.0.1".into(),
+            port: slot.ch_tcp,
+            database: "walshadow_test".into(),
+            compression: CompressionChoice::Lz4,
+            ..Default::default()
+        },
         row_budget: 2,
         ..Default::default()
     };

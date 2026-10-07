@@ -89,8 +89,8 @@ async fn ensure_boot_database_waiting(cfg: &EmitterConfig) -> Result<()> {
             tracing::warn!(
                 target: "walshadow",
                 error = %e,
-                host = %cfg.host,
-                port = cfg.port,
+                host = %cfg.conn.host,
+                port = cfg.conn.port,
                 "ClickHouse unreachable, waiting for it",
             );
         })
@@ -954,7 +954,7 @@ pub(crate) async fn run_session(
             .emitter
             .clone()
             .expect("[ch] present");
-        let addr = format!("{}:{}", emitter_cfg.host, emitter_cfg.port);
+        let addr = format!("{}:{}", emitter_cfg.conn.host, emitter_cfg.conn.port);
         let stats = emitter_stats.clone();
         emitter_stats_handle = Some(stats.clone());
         // One validated resident-payload pool for the pipeline and every
@@ -999,7 +999,7 @@ pub(crate) async fn run_session(
                 emitter_cfg.row_budget = rc.row_budget;
                 emitter_cfg.byte_budget = rc.byte_budget;
                 emitter_cfg.flush_timeout = rc.flush_timeout;
-                emitter_cfg.compression = rc.compression;
+                emitter_cfg.conn.compression = rc.conn.compression;
                 emitter_cfg.retry.max_attempts = rc.retry_max_attempts;
             }
             if let Some(applicator) = built.applicator {
@@ -2327,13 +2327,17 @@ pub(crate) fn task_stopped(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use walshadow::ch_emitter::InstanceConfig;
 
     #[tokio::test]
     async fn boot_redials_clickhouse_that_drops_connections() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let cfg = EmitterConfig {
-            host: "127.0.0.1".into(),
-            port: listener.local_addr().unwrap().port(),
+            conn: InstanceConfig {
+                host: "127.0.0.1".into(),
+                port: listener.local_addr().unwrap().port(),
+                ..Default::default()
+            },
             ..EmitterConfig::default()
         };
         let accepts = async {

@@ -6,7 +6,7 @@ use std::sync::Arc;
 use walshadow::backfill_staging::{StagingSession, prepare};
 use walshadow::backfill_types::BackupRequest;
 use walshadow::backup_checkpoint::BackupCheckpoint;
-use walshadow::ch_emitter::EmitterConfig;
+use walshadow::ch_emitter::{EmitterConfig, InstanceConfig};
 use walshadow::mapping::{TableMapping, TableTarget, mapping_handle};
 use walshadow::runtime_config::InitialLoadMode;
 use walshadow::schema::{RelDescriptor, RelName, ReplIdent};
@@ -19,7 +19,10 @@ async fn checkpoint_reuses_staging_and_rejects_replaced_table() {
     ch.query("CREATE TABLE default.t (id UInt64, value String, _lsn UInt64) ENGINE = ReplacingMergeTree(_lsn) ORDER BY id").unwrap();
     let dest = walshadow::config::DestEmitter::new(
         Arc::new(EmitterConfig {
-            port: ports.ch_tcp,
+            conn: InstanceConfig {
+                port: ports.ch_tcp,
+                ..Default::default()
+            },
             ..Default::default()
         }),
         None,

@@ -39,7 +39,7 @@ use crate::decode::decoder_sink::DecoderSinkError;
 use crate::decode::heap_decoder::{ColumnValue, CommittedTuple, HeapOp};
 use crate::mapping::{
     ColumnMapping, DropTableStrategy, NamespaceMapping, SystemColumnNames, SystemColumns,
-    TableMapping, TableTarget,
+    TableMapping, TableTarget, named_instance,
 };
 use crate::ops::bridge::MAX_REQUEST_BYTES;
 use crate::ops::oracle::{
@@ -87,6 +87,34 @@ pub(crate) const DEFAULT_FLUSH_TIMEOUT_MS: u64 = 1000;
 /// Rows coalesced per batcher chunk
 pub(crate) const DEFAULT_DECODE_CHUNK_ROWS: usize = 1024;
 
+/// Database of `instance`: `[ch] database` for default, None when unknown
+pub fn instance_database<'a>(
+    instances: &'a BTreeMap<String, InstanceConfig>,
+    default_db: &'a str,
+    instance: Option<&str>,
+) -> Option<&'a str> {
+    match instance {
+        None | Some("default") => Some(default_db),
+        Some(name) => instances.get(name).map(|c| c.database.as_str()),
+    }
+}
+
+/// Database for a table without `target_database`: namespace
+/// `target_database`, else instance's database, else `[ch] database`
+pub fn default_database<'a>(
+    namespaces: &'a HashMap<String, NamespaceMapping>,
+    instances: &'a BTreeMap<String, InstanceConfig>,
+    default_db: &'a str,
+    namespace: &str,
+    instance: Option<&str>,
+) -> &'a str {
+    namespaces
+        .get(namespace)
+        .and_then(|n| n.target_database.as_deref())
+        .or_else(|| instance_database(instances, default_db, instance))
+        .unwrap_or(default_db)
+}
+
 /// Per-replica connection + mapping config. TOML `[ch]` table holds
 /// connection params, `[table.<namespace>.<relname>]` blocks declare
 /// per-relation mapping; parse via [`EmitterConfig::from_toml_str`].
@@ -95,22 +123,14 @@ pub(crate) const DEFAULT_DECODE_CHUNK_ROWS: usize = 1024;
 /// database of the cluster; entries outside `[database.*]` use `[source] dbname`
 #[derive(Debug, Clone)]
 pub struct EmitterConfig {
-    pub host: String,
-    pub port: u16,
-    pub database: String,
-    pub user: String,
-    pub password: String,
-    /// Wrap native protocol in TLS (rustls, public webpki roots). Set
-    /// for ClickHouse Cloud, whose secure native port (9440) speaks
-    /// native-over-TLS. SNI + cert verification key off `host`.
-    pub secure: bool,
+    pub instances: BTreeMap<String, InstanceConfig>,
+    pub conn: InstanceConfig,
     /// Custom rustls roots/config for `secure` path: private CA, pinned
     /// self-signed cert, or mTLS. `None` uses public webpki roots via
     /// [`clickhouse_c::tls::default_config`]. Not parsed from TOML;
     /// carried through reconnect + DDL applicator so every CH socket
     /// pins the same roots.
     pub tls_config: Option<Arc<clickhouse_c::tls::rustls::ClientConfig>>,
-    pub compression: CompressionChoice,
     pub row_budget: usize,
     pub byte_budget: usize,
     /// Hold INSERTs open across xacts. Deadline arms at the first row of a
@@ -559,27 +579,27 @@ fn parse_backup(bk: &BackupSection) -> Result<walrus::config::Settings, EmitterE
 
 impl ConnectionConfig for EmitterConfig {
     fn host(&self) -> &str {
-        &self.host
+        &self.conn.host
     }
 
     fn port(&self) -> u16 {
-        self.port
+        self.conn.port
     }
 
     fn database(&self) -> &str {
-        &self.database
+        &self.conn.database
     }
 
     fn user(&self) -> &str {
-        &self.user
+        &self.conn.user
     }
 
     fn password(&self) -> &str {
-        &self.password
+        &self.conn.password
     }
 
     fn secure(&self) -> bool {
-        self.secure
+        self.conn.secure
     }
 
     fn tls_config(&self) -> Option<Arc<clickhouse_c::tls::rustls::ClientConfig>> {
@@ -587,7 +607,7 @@ impl ConnectionConfig for EmitterConfig {
     }
 
     fn compression(&self) -> CompressionChoice {
-        self.compression
+        self.conn.compression
     }
 
     fn idle_reconnect(&self) -> Duration {
@@ -740,9 +760,50 @@ fn reject_backup_loads(db: &str, entries: &DbEntries) -> Result<(), EmitterError
     Ok(())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct InstanceConfig {
+    pub host: String,
+    pub port: u16,
+    pub database: String,
+    pub user: String,
+    pub password: String,
+    /// Wrap native protocol in TLS (rustls, public webpki roots). Set
+    /// for ClickHouse Cloud, whose secure native port (9440) speaks
+    /// native-over-TLS. SNI + cert verification key off `host`.
+    pub secure: bool,
+    #[serde(deserialize_with = "crate::toml_de::de_parse")]
+    pub compression: CompressionChoice,
+}
+
+impl Default for InstanceConfig {
+    fn default() -> Self {
+        let ch = ChSection::default();
+        Self {
+            host: ch.host,
+            port: ch.port,
+            database: ch.database,
+            user: ch.user,
+            password: ch.password,
+            secure: ch.secure,
+            compression: ch.compression,
+        }
+    }
+}
+
+impl InstanceConfig {
+    pub fn apply(&self, base: &EmitterConfig) -> EmitterConfig {
+        EmitterConfig {
+            conn: self.clone(),
+            ..base.clone()
+        }
+    }
+}
+
 #[derive(serde::Deserialize)]
 #[serde(default)]
 struct ChSection {
+    instances: BTreeMap<String, InstanceConfig>,
     host: String,
     port: u16,
     database: String,
@@ -776,6 +837,7 @@ struct ChSection {
 impl Default for ChSection {
     fn default() -> Self {
         Self {
+            instances: BTreeMap::new(),
             host: "localhost".into(),
             port: 9000,
             database: "default".into(),
@@ -862,6 +924,7 @@ struct NamespacePatch {
 #[derive(Default, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct TablePatch {
+    target_instance: Option<String>,
     replicate: Option<bool>,
     target_database: Option<String>,
     target_table: Option<String>,
@@ -912,14 +975,17 @@ struct ColumnPatch {
 impl EmitterConfig {
     fn from_sections(ch: ChSection, memory: MemorySection, stream: StreamSection) -> Self {
         Self {
-            host: ch.host,
-            port: ch.port,
-            database: ch.database,
-            user: ch.user,
-            password: ch.password,
-            secure: ch.secure,
+            instances: ch.instances,
+            conn: InstanceConfig {
+                host: ch.host,
+                port: ch.port,
+                database: ch.database,
+                user: ch.user,
+                password: ch.password,
+                secure: ch.secure,
+                compression: ch.compression,
+            },
             tls_config: None,
-            compression: ch.compression,
             row_budget: ch.row_budget,
             byte_budget: ch.byte_budget,
             flush_timeout: ch.flush_timeout,
@@ -958,6 +1024,15 @@ impl EmitterConfig {
             bootstrap: BootstrapSettings::default(),
             toast: ToastSettings::default(),
         }
+    }
+
+    pub fn instance_database(&self, instance: Option<&str>) -> Result<&str, EmitterError> {
+        instance_database(&self.instances, &self.conn.database, instance).ok_or_else(|| {
+            EmitterError::Config(format!(
+                "unknown ClickHouse instance `{}`",
+                instance.unwrap_or_default()
+            ))
+        })
     }
 
     /// Boot-only row-shape knobs frozen into every route
@@ -1023,6 +1098,19 @@ impl EmitterConfig {
             .map_err(crate::toml_de::config_error)?;
         let prefix_all = doc.stream.auto_create_name_all.clone();
         let mut out = Self::from_sections(doc.ch, doc.memory, doc.stream);
+        for (name, instance) in &out.instances {
+            if name.is_empty() || name == "default" {
+                return Err(EmitterError::Config(format!(
+                    "ch.instances.{name}: reserved instance name"
+                )));
+            }
+            if instance.host.is_empty() || instance.port == 0 {
+                return Err(EmitterError::Config(format!(
+                    "ch.instances.{name}: host and port must be nonempty"
+                )));
+            }
+            instance.compression.build_codec()?;
+        }
         out.auto_create_name_all = prefix_all
             .as_deref()
             .map(crate::mapping::NameTemplate::parse)
@@ -1103,11 +1191,18 @@ impl EmitterConfig {
         &mut self,
         ns: &str,
         name: String,
-        t: TablePatch,
+        mut t: TablePatch,
     ) -> Result<(), EmitterError> {
         let rel = RelName::new(ns, &name);
         let ctx = format!("table.{ns}.{name}");
         let kind = t.match_kind.unwrap_or(MatchKind::Exact);
+        self.instance_database(t.target_instance.as_deref())?;
+        for tee in t.tee.iter_mut().flatten() {
+            let database = self.instance_database(tee.instance.as_deref())?;
+            if tee.instance.is_some() && tee.database.is_none() {
+                tee.database = Some(database.to_owned());
+            }
+        }
         let replicate = t.replicate;
         let system = SystemColumnNames {
             lsn: t.lsn,
@@ -1123,6 +1218,7 @@ impl EmitterConfig {
             )));
         }
         let rule = TableRule {
+            target_instance: t.target_instance,
             system,
             target_database: t.target_database,
             target_table: t.target_table,
@@ -1228,14 +1324,16 @@ impl EmitterConfig {
         if replicate == Some(false) {
             return Ok(());
         }
-        let database = rule
-            .target_database
-            .or_else(|| {
-                self.namespaces
-                    .get(ns)
-                    .and_then(|n| n.target_database.clone())
-            })
-            .unwrap_or_else(|| self.database.clone());
+        let database = rule.target_database.unwrap_or_else(|| {
+            default_database(
+                &self.namespaces,
+                &self.instances,
+                &self.conn.database,
+                ns,
+                rule.target_instance.as_deref(),
+            )
+            .to_owned()
+        });
         let table = rule.target_table.unwrap_or_else(|| {
             self.namespaces
                 .get(ns)
@@ -1246,7 +1344,11 @@ impl EmitterConfig {
         self.tables.insert(
             rel.clone(),
             TableMapping {
-                target: TableTarget { database, table },
+                target: TableTarget {
+                    instance: rule.target_instance.and_then(named_instance),
+                    database,
+                    table,
+                },
                 columns: pinned,
                 tees: rule.tee.unwrap_or_default(),
             },
@@ -1269,7 +1371,13 @@ pub(crate) struct TablePlan {
     pub(crate) synth_is_deleted: Option<ColumnPlan>,
     /// Format once to avoid rebuilding SQL for each row. Main destination
     /// first, then each tee
-    pub(crate) insert_sql: Vec<String>,
+    pub(crate) inserts: Vec<InsertQuery>,
+}
+
+#[derive(Debug, Clone)]
+pub struct InsertQuery {
+    pub instance: Option<String>,
+    pub sql: String,
 }
 
 pub(crate) struct ColumnPlan {
@@ -1576,7 +1684,13 @@ impl TablePlan {
             synth_xid,
             synth_commit_ts,
             synth_is_deleted,
-            insert_sql: mapping.targets().map(|t| insert(&t)).collect(),
+            inserts: mapping
+                .targets()
+                .map(|t| InsertQuery {
+                    sql: insert(&t),
+                    instance: t.instance,
+                })
+                .collect(),
         })
     }
 
@@ -3417,17 +3531,17 @@ mod tests {
             &SystemColumns::default(),
         )
         .expect("plan builds");
-        let [insert_sql] = plan.insert_sql.as_slice() else {
-            panic!("one target: {:?}", plan.insert_sql)
+        let [insert_sql] = plan.inserts.as_slice() else {
+            panic!("one target: {:?}", plan.inserts)
         };
-        assert!(insert_sql.contains("INSERT INTO `default`.`foo`"));
-        assert!(insert_sql.contains("`id`"));
-        assert!(insert_sql.contains("`name`"));
-        assert!(insert_sql.contains("`_lsn`"));
-        assert!(insert_sql.contains("`_xid`"));
-        assert!(insert_sql.contains("`_commit_ts`"));
-        assert!(insert_sql.contains("`_is_deleted`"));
-        assert!(insert_sql.ends_with(") FORMAT Native"));
+        assert!(insert_sql.sql.contains("INSERT INTO `default`.`foo`"));
+        assert!(insert_sql.sql.contains("`id`"));
+        assert!(insert_sql.sql.contains("`name`"));
+        assert!(insert_sql.sql.contains("`_lsn`"));
+        assert!(insert_sql.sql.contains("`_xid`"));
+        assert!(insert_sql.sql.contains("`_commit_ts`"));
+        assert!(insert_sql.sql.contains("`_is_deleted`"));
+        assert!(insert_sql.sql.ends_with(") FORMAT Native"));
     }
 
     #[test]
@@ -3454,12 +3568,14 @@ mod tests {
             &SystemColumns::default(),
         )
         .unwrap();
-        let [primary, tees @ ..] = plan.insert_sql.as_slice() else {
+        let [primary, tees @ ..] = plan.inserts.as_slice() else {
             panic!("primary first")
         };
-        let cols = primary.strip_prefix("INSERT INTO `default`.`foo` ");
+        let cols = primary.sql.strip_prefix("INSERT INTO `default`.`foo` ");
         assert_eq!(
-            tees,
+            tees.iter()
+                .map(|query| query.sql.clone())
+                .collect::<Vec<_>>(),
             [
                 format!("INSERT INTO `default`.`foo_audit` {}", cols.unwrap()),
                 format!("INSERT INTO `wh`.`foo` {}", cols.unwrap()),
@@ -3873,7 +3989,7 @@ mod tests {
             &SystemColumns::default(),
         )
         .expect("plan builds");
-        assert!(plan.insert_sql[0].contains("`_is_deleted`"));
+        assert!(plan.inserts[0].sql.contains("`_is_deleted`"));
         let mut enc = TableEncoder::new(plan).unwrap();
         enc.append_row(&committed(1, Some("a")), &m, OP_INSERT)
             .unwrap();
@@ -4157,17 +4273,18 @@ mod tests {
             ]
         "#;
         let c = EmitterConfig::from_toml_str(src).expect("parses");
-        assert_eq!(c.host, "ch.example.com");
-        assert_eq!(c.port, 9000);
-        assert_eq!(c.database, "default");
-        assert_eq!(c.user, "ingest");
-        assert_eq!(c.password, "secret");
-        assert!(c.secure);
-        assert_eq!(c.compression, CompressionChoice::Lz4);
+        assert_eq!(c.conn.host, "ch.example.com");
+        assert_eq!(c.conn.port, 9000);
+        assert_eq!(c.conn.database, "default");
+        assert_eq!(c.conn.user, "ingest");
+        assert_eq!(c.conn.password, "secret");
+        assert!(c.conn.secure);
+        assert_eq!(c.conn.compression, CompressionChoice::Lz4);
         // Omitting `secure` defaults to plaintext
         assert!(
             !EmitterConfig::from_toml_str("[ch]\nhost = \"h\"\n")
                 .unwrap()
+                .conn
                 .secure
         );
         assert_eq!(c.row_budget, 1024);
@@ -4457,6 +4574,53 @@ mod tests {
     }
 
     #[test]
+    fn named_instances_resolve_and_validate() {
+        let cfg = EmitterConfig::from_toml_str(
+            r#"
+            [ch]
+            database = "main"
+            [ch.instances.archive]
+            host = "archive.internal"
+            database = "history"
+            [table.public.events]
+            target_instance = "archive"
+            tee = [
+                { table = "local_copy" },
+                { instance = "default", table = "default_copy" },
+                { instance = "archive", database = "audit", table = "log" },
+            ]
+            columns = [{ attnum = 1, target = "id", type = "Int32" }]
+        "#,
+        )
+        .unwrap();
+        let m = &cfg.tables[&RelName::new("public", "events")];
+        let targets: Vec<_> = m.targets().collect();
+        assert_eq!(
+            targets
+                .iter()
+                .map(|t| t.instance.as_deref())
+                .collect::<Vec<_>>(),
+            [Some("archive"), Some("archive"), None, Some("archive")]
+        );
+        assert_eq!(
+            targets
+                .iter()
+                .map(|t| t.database.as_str())
+                .collect::<Vec<_>>(),
+            ["history", "history", "main", "audit"]
+        );
+        for config in [
+            "[table.public.t]\ntarget_instance = 'missing'",
+            "[table.public.t]\ntee = [{ instance = 'missing', table = 't' }]",
+            "[ch.instances.default]\nhost = 'localhost'",
+            "[ch.instances.a]\nport = 0",
+            "[ch.instances.a]\nhots = 'typo'",
+        ] {
+            assert!(EmitterConfig::from_toml_str(config).is_err(), "{config}");
+        }
+    }
+
+    #[test]
     fn tee_parses_on_exact_entries_only() {
         let c = EmitterConfig::from_toml_str(
             "[ch]\n\
@@ -4504,9 +4668,11 @@ mod tests {
         let plan =
             TablePlan::build(alloc, &rel, &m, &ColumnRules::default(), &sys).expect("plan builds");
         assert!(
-            plan.insert_sql[0].ends_with("`_v`, `_x`, `_at`) FORMAT Native"),
+            plan.inserts[0]
+                .sql
+                .ends_with("`_v`, `_x`, `_at`) FORMAT Native"),
             "{:?}",
-            plan.insert_sql
+            plan.inserts
         );
         assert!(plan.synth_is_deleted.is_none());
         let enc = TableEncoder::new(plan).expect("encoder");
@@ -4873,8 +5039,8 @@ mod tests {
         assert_eq!(ch["port"].as_integer(), Some(9000));
         assert_eq!(ch["database"].as_str(), Some("demo"));
         let cfg = EmitterConfig::from_table(&merged).unwrap();
-        assert_eq!(cfg.host, "fifty");
-        assert_eq!(cfg.database, "demo");
+        assert_eq!(cfg.conn.host, "fifty");
+        assert_eq!(cfg.conn.database, "demo");
     }
 
     #[tokio::test]

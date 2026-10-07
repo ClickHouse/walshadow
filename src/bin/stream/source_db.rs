@@ -127,7 +127,7 @@ pub(crate) async fn build_source_db(input: SourceDbInputs<'_>) -> anyhow::Result
         cfg.row_budget = rc.row_budget;
         cfg.byte_budget = rc.byte_budget;
         cfg.flush_timeout = rc.flush_timeout;
-        cfg.compression = rc.compression;
+        cfg.conn.compression = rc.conn.compression;
         cfg.retry.max_attempts = rc.retry_max_attempts;
     }
     // DDL applicator owned by the reorder coordinator so ALTER /

@@ -81,6 +81,7 @@ impl NamePattern {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TableRule {
+    pub target_instance: Option<String>,
     /// Per-relation renames of the columns walshadow appends, layered over
     /// `[system_columns]` at `CREATE TABLE` and at every route freeze
     pub system: SystemColumnNames,
@@ -104,6 +105,7 @@ pub struct TableRule {
 impl TableRule {
     pub fn from_row(row: &TableRow) -> Self {
         Self {
+            target_instance: None,
             system: row.system.clone(),
             target_database: row.target_database.clone(),
             target_table: row.target_table.clone(),
@@ -128,6 +130,7 @@ impl TableRule {
 
     pub fn overlay(&mut self, other: &Self) {
         self.system.overlay(&other.system);
+        set_if(&mut self.target_instance, &other.target_instance);
         set_if(&mut self.target_database, &other.target_database);
         set_if(&mut self.target_table, &other.target_table);
         set_if(&mut self.replicate, &other.replicate);

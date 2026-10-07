@@ -102,8 +102,9 @@ impl Inserter {
         bb: &BlockBuilder<'_>,
     ) -> Result<EndOfStream, EmitterError> {
         let mut durable = None;
-        for sql in &meta.insert_sql {
-            durable = Some(self.send_with_retry(sql, bb).await?);
+        for query in &meta.inserts {
+            self.client.select(query.instance.as_deref())?;
+            durable = Some(self.send_with_retry(&query.sql, bb).await?);
         }
         durable.ok_or_else(|| EmitterError::Config("batch has no INSERT target".into()))
     }
