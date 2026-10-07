@@ -83,8 +83,8 @@ Source columns are followed by four metadata columns:
 | `_commit_ts` | `DateTime64(6, 'UTC')` | source commit time |
 | `_is_deleted` | `Bool` | delete marker |
 
-Rename these columns, drop the delete marker, or pin the sort key with
-settings below
+Rename these columns, drop the delete marker, pin the sort key, or pick engine
+with settings below
 
 ## Choose sort key
 
@@ -126,6 +126,28 @@ UPDATE walshadow.config_table
 SET order_by = ARRAY['tenant_id', 'id'], primary_key = ARRAY['tenant_id']
 WHERE namespace = 'public' AND relname = 'events';
 ```
+
+## Choose engine
+
+walshadow creates tables as `ReplacingMergeTree(_lsn, _is_deleted)`. Set
+`engine` to pick another ClickHouse engine:
+
+```toml
+[table.public.events]
+engine = "Null"
+
+[table.public.metrics]
+engine = "CoalescingMergeTree"
+```
+
+walshadow renders `engine` verbatim, except an engine name ending in
+`ReplacingMergeTree` gains walshadow's version and delete marker args. Only
+engines ending in `MergeTree` get `ORDER BY`, `PRIMARY KEY`, and `SETTINGS`, as
+other engines reject them. Engines other than `ReplacingMergeTree` do not
+collapse updates, deletes, or replayed rows
+
+Like sort key, `engine` applies only when walshadow creates a table. Source-side
+rows set it in `config_table.engine`
 
 ## Rename metadata columns
 

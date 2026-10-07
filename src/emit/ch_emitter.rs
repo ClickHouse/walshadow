@@ -869,6 +869,7 @@ struct TablePatch {
     initial_load: Option<InitialLoadMode>,
     order_by: Option<Vec<String>>,
     primary_key: Option<Vec<String>>,
+    engine: Option<String>,
     /// Same four keys as `[system_columns]`, for this entry's relations alone
     lsn: Option<String>,
     xid: Option<String>,
@@ -990,6 +991,7 @@ impl EmitterConfig {
     /// target_table = "foo"         # optional: source relname
     /// order_by = ["id"]            # optional: CH ORDER BY, else replica identity
     /// primary_key = ["id"]         # optional: index prefix of order_by
+    /// engine = "MergeTree"         # optional: CH engine, else ReplacingMergeTree
     /// lsn = "_peerdb_version"      # optional: per-relation system column
     /// is_deleted = false           # renames, same keys as [system_columns]
     /// columns = [
@@ -1120,6 +1122,7 @@ impl EmitterConfig {
             initial_load: t.initial_load.map(|m| m.as_str().to_string()),
             order_by: t.order_by,
             primary_key: t.primary_key,
+            engine: t.engine,
         };
         self.table_entries.push((rel.clone(), kind, rule.clone()));
         let mut pinned = Vec::new();
@@ -4374,11 +4377,13 @@ mod tests {
             "[ch]\n\
              [table.public.events]\n\
              order_by = [\"tenant\", \"id\"]\n\
-             primary_key = [\"tenant\"]\n",
+             primary_key = [\"tenant\"]\n\
+             engine = \"Null\"\n",
         )
         .unwrap();
         let rel = RelName::new("public", "events");
         let (_, _, rule) = &c.table_entries[0];
+        assert_eq!(rule.engine.as_deref(), Some("Null"));
         assert_eq!(
             rule.order_by.as_deref(),
             Some(["tenant".to_string(), "id".to_string()].as_slice())

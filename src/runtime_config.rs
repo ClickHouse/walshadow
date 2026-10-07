@@ -91,6 +91,8 @@ pub struct TableRow {
     pub order_by: Option<Vec<String>>,
     /// CH `PRIMARY KEY` sparse-index prefix. Ignored unless prefix of `ORDER BY`
     pub primary_key: Option<Vec<String>>,
+    /// CH engine for this table's `CREATE`. NULL keeps startup TOML value
+    pub engine: Option<String>,
     /// Per-relation renames of the columns walshadow appends. NULL on a column
     /// inherits `[system_columns]`; `is_deleted = ''` drops the marker
     pub system: crate::mapping::SystemColumnNames,
@@ -375,6 +377,7 @@ pub fn interpret(
                     initial_load: field_string(rel, &cols, "initial_load"),
                     order_by: field_string_array(rel, &cols, "order_by"),
                     primary_key: field_string_array(rel, &cols, "primary_key"),
+                    engine: field_string(rel, &cols, "engine"),
                     system: crate::mapping::SystemColumnNames {
                         lsn: field_string(rel, &cols, "lsn"),
                         xid: field_string(rel, &cols, "xid"),

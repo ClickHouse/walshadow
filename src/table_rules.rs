@@ -94,6 +94,9 @@ pub struct TableRule {
     /// CH `PRIMARY KEY`: the sparse-index prefix CH indexes, not a uniqueness
     /// constraint. CH requires a prefix of the effective `ORDER BY`
     pub primary_key: Option<Vec<String>>,
+    /// CH engine at `CREATE TABLE`, verbatim except a bare `*ReplacingMergeTree`
+    /// gains version and delete marker args
+    pub engine: Option<String>,
 }
 
 impl TableRule {
@@ -106,6 +109,7 @@ impl TableRule {
             initial_load: row.initial_load.clone(),
             order_by: row.order_by.clone(),
             primary_key: row.primary_key.clone(),
+            engine: row.engine.clone(),
         }
     }
 
@@ -127,6 +131,7 @@ impl TableRule {
         set_if(&mut self.initial_load, &other.initial_load);
         set_if(&mut self.order_by, &other.order_by);
         set_if(&mut self.primary_key, &other.primary_key);
+        set_if(&mut self.engine, &other.engine);
     }
 }
 
