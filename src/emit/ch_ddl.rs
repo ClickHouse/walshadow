@@ -207,6 +207,7 @@ impl DdlConfig {
             soft_delete: self.soft_delete,
             order_by: settings.order_by.as_deref().unwrap_or_default(),
             primary_key: settings.primary_key.as_deref().unwrap_or_default(),
+            engine: settings.engine.as_deref(),
         }
     }
 
@@ -243,6 +244,8 @@ pub struct CreateShape<'a> {
     /// Operator `PRIMARY KEY`: the sparse-index prefix CH indexes, not a
     /// uniqueness constraint. Empty leaves it equal to `ORDER BY`
     pub primary_key: &'a [String],
+    /// Operator engine, `None` for `ReplacingMergeTree`
+    pub engine: Option<&'a str>,
 }
 
 pub(crate) fn is_system_namespace(ns: &str, runtime_config_schema: Option<&str>) -> bool {
@@ -959,6 +962,28 @@ fn render_create_sql(
         }
         None => lsn.clone(),
     };
+    let engine = shape.engine.map_or("ReplacingMergeTree", str::trim);
+    // Bare `*ReplacingMergeTree` gets version and delete marker args; any
+    // other engine renders verbatim
+    let engine = if engine.ends_with("ReplacingMergeTree") {
+        format!("{engine}({engine_args})")
+    } else {
+        engine.to_owned()
+    };
+    let head = format!(
+        "CREATE TABLE IF NOT EXISTS {target} (\n  {}\n) ENGINE = {engine}",
+        col_defs.join(",\n  ")
+    );
+    // Only MergeTree family takes sorting key clauses, eg Null rejects them
+    if !engine
+        .split('(')
+        .next()
+        .unwrap_or_default()
+        .trim_end()
+        .ends_with("MergeTree")
+    {
+        return head;
+    }
     let keys = if key.names.is_empty() {
         vec![lsn]
     } else {
@@ -993,10 +1018,7 @@ fn render_create_sql(
     } else {
         ""
     };
-    format!(
-        "CREATE TABLE IF NOT EXISTS {target} (\n  {}\n) ENGINE = ReplacingMergeTree({engine_args})\nORDER BY ({order_by}){primary_key}{settings}",
-        col_defs.join(",\n  ")
-    )
+    format!("{head}\nORDER BY ({order_by}){primary_key}{settings}")
 }
 
 /// Quoted `ORDER BY` columns; use LSN when empty
@@ -1252,6 +1274,7 @@ mod tests {
             soft_delete,
             order_by: &[],
             primary_key: &[],
+            engine: None,
         }
     }
     use crate::schema::{INT4OID, TEXTOID, TIMESTAMPTZOID};
@@ -1851,6 +1874,7 @@ mod tests {
             &m,
             &CreateShape {
                 primary_key: &primary_key,
+                engine: None,
                 ..shape(false)
             },
         );
@@ -1908,6 +1932,44 @@ mod tests {
         assert!(sql.contains("ENGINE = ReplacingMergeTree(`_lsn`)"));
         assert!(!sql.contains("ReplacingMergeTree(`_lsn`, `_is_deleted`)"));
         assert!(sql.ends_with("ORDER BY (`id`)"));
+    }
+
+    #[test]
+    fn engine_override_renders_verbatim() {
+        let d = desc(
+            "orders",
+            vec![
+                att(1, "id", INT4OID, true, None),
+                att(2, "body", TEXTOID, false, None),
+            ],
+            Some(vec![1]),
+        );
+        let render = |engine| {
+            let shape = CreateShape {
+                engine: Some(engine),
+                ..shape(false)
+            };
+            render_create_table(&d, &dest("default", &d), &shape, &ColumnRules::default())
+                .unwrap()
+                .unwrap()
+        };
+        let sql = render("CoalescingMergeTree");
+        assert!(
+            sql.contains("ENGINE = CoalescingMergeTree\nORDER BY (`id`)"),
+            "{sql}"
+        );
+        let sql = render("ReplicatedReplacingMergeTree");
+        assert!(
+            sql.contains("ENGINE = ReplicatedReplacingMergeTree(`_lsn`, `_is_deleted`)\n"),
+            "{sql}"
+        );
+        let sql = render("ReplacingMergeTree(`_lsn`)");
+        assert!(
+            sql.contains("ENGINE = ReplacingMergeTree(`_lsn`)\nORDER BY"),
+            "{sql}"
+        );
+        let sql = render("Null");
+        assert!(sql.ends_with(") ENGINE = Null"), "{sql}");
     }
 
     #[test]
@@ -2059,6 +2121,7 @@ mod tests {
                 soft_delete: false,
                 order_by: &[],
                 primary_key: &[],
+                engine: None,
             },
             &ColumnRules::default(),
         )
@@ -2094,6 +2157,7 @@ mod tests {
                 soft_delete: false,
                 order_by: &[],
                 primary_key: &[],
+                engine: None,
             },
             &ColumnRules::default(),
         )
@@ -2123,6 +2187,7 @@ mod tests {
                 soft_delete: false,
                 order_by: &order_by,
                 primary_key: &[],
+                engine: None,
             },
             &ColumnRules::default(),
         )
@@ -2150,6 +2215,7 @@ mod tests {
                     soft_delete: false,
                     order_by: &keys,
                     primary_key: &[],
+                    engine: None,
                 },
                 &ColumnRules::default(),
             )
@@ -2179,6 +2245,7 @@ mod tests {
                     soft_delete: false,
                     order_by: &order_by,
                     primary_key,
+                    engine: None,
                 },
                 &ColumnRules::default(),
             )
@@ -2224,6 +2291,7 @@ mod tests {
                 soft_delete: false,
                 order_by: &order_by,
                 primary_key: &["tenant".to_string()],
+                engine: None,
             },
         );
         assert!(

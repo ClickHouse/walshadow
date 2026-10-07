@@ -161,6 +161,7 @@ pub(crate) async fn load_runtime_config(
                 initial_load: row.try_get("initial_load").ok().flatten(),
                 order_by: row.try_get("order_by").ok().flatten(),
                 primary_key: row.try_get("primary_key").ok().flatten(),
+                engine: row.try_get("engine").ok().flatten(),
                 system: walshadow::mapping::SystemColumnNames {
                     lsn: row.try_get("lsn").ok().flatten(),
                     xid: row.try_get("xid").ok().flatten(),

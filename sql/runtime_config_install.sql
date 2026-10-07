@@ -59,6 +59,8 @@ CREATE TABLE IF NOT EXISTS :"walshadow_schema".config_table (
                                      -- inherits, empty array derives
     primary_key     text[],          -- ClickHouse PRIMARY KEY; must prefix
                                      -- order_by
+    engine          text,            -- ClickHouse engine; NULL inherits
+                                     -- ReplacingMergeTree
     lsn             text,            -- per-relation names for the columns
     xid             text,            -- walshadow appends; NULL inherits
     commit_ts       text,            -- [system_columns]
@@ -89,6 +91,7 @@ ALTER TABLE :"walshadow_schema".config_table ADD COLUMN IF NOT EXISTS target_dat
 ALTER TABLE :"walshadow_schema".config_table ADD COLUMN IF NOT EXISTS target_table    text;
 ALTER TABLE :"walshadow_schema".config_table ADD COLUMN IF NOT EXISTS order_by        text[];
 ALTER TABLE :"walshadow_schema".config_table ADD COLUMN IF NOT EXISTS primary_key     text[];
+ALTER TABLE :"walshadow_schema".config_table ADD COLUMN IF NOT EXISTS engine          text;
 ALTER TABLE :"walshadow_schema".config_table ADD COLUMN IF NOT EXISTS match           text;
 ALTER TABLE :"walshadow_schema".config_table ADD COLUMN IF NOT EXISTS lsn             text;
 ALTER TABLE :"walshadow_schema".config_table ADD COLUMN IF NOT EXISTS xid             text;

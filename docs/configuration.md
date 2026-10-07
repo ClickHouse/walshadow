@@ -172,7 +172,7 @@ VALUES
 ```
 
 `config_table` also carries destination shape: `order_by` and `primary_key` as
-`text[]`, and `lsn`, `xid`, `commit_ts`, `is_deleted` for metadata column names.
+`text[]`, `engine`, and `lsn`, `xid`, `commit_ts`, `is_deleted` for metadata column names.
 See [Query destination data](destination-tables.md)
 
 `config_namespace` carries namespace defaults: `target_database`, `auto_create`,
