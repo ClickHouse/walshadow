@@ -220,6 +220,7 @@ mod tests {
                     target_type: "Nullable(String)".into(),
                     type_pinned: false,
                 }],
+                tees: Vec::new(),
             }),
             Arc::default(),
             Default::default(),

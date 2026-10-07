@@ -1326,6 +1326,7 @@ mod tests {
         TableMapping {
             target: TableTarget::new("db", &rel.name),
             columns: Vec::new(),
+            tees: Vec::new(),
         }
     }
 

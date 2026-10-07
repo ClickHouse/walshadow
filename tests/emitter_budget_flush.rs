@@ -99,6 +99,7 @@ fn mapping() -> Arc<TableMapping> {
                 type_pinned: false,
             },
         ],
+        tees: Vec::new(),
     })
 }
 

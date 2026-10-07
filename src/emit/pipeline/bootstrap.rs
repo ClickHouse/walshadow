@@ -1080,6 +1080,7 @@ mod tests {
                 target_type: "Int32".into(),
                 type_pinned: false,
             }],
+            tees: Vec::new(),
         }
     }
 
@@ -1142,6 +1143,7 @@ mod tests {
                 target_type: "String".into(),
                 type_pinned: false,
             }],
+            tees: Vec::new(),
         }
     }
 

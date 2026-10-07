@@ -770,6 +770,7 @@ mod tests {
                     target_type: "Int32".into(),
                     type_pinned: false,
                 }],
+                tees: Vec::new(),
             },
         );
         let sink = GreenfieldSink {
@@ -923,6 +924,7 @@ mod tests {
             let mapping = TableMapping {
                 target: TableTarget::new("default", "t"),
                 columns,
+                tees: Vec::new(),
             };
             let row = |value, infomask| BackfillTuple {
                 columns: vec![Some(ColumnValue::Int4(1)), Some(value)],

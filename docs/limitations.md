@@ -68,6 +68,7 @@ insert batch
 - committed end state converges by source row key and `_lsn`
 - updates from different tables inside one PostgreSQL transaction may become visible in ClickHouse at different moments
 - restart can resend acknowledged-nearby rows, generated table engine deduplicates them during merge or `FINAL`
+- `tee` tables using engines other than `ReplacingMergeTree` keep duplicate rows after retries
 - destination queries without `FINAL` can observe multiple row versions until background merge
 - bounded ClickHouse retry exhaustion stops daemon, supervisor restart continues from persisted floor
 

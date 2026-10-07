@@ -618,6 +618,7 @@ mod tests {
             Arc::new(TableMapping {
                 target: TableTarget::new("db", "t"),
                 columns: Vec::new(),
+                tees: Vec::new(),
             }),
             Arc::default(),
             Default::default(),

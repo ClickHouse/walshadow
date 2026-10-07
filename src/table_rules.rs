@@ -5,7 +5,7 @@ use std::sync::Arc;
 use globset::{Glob, GlobMatcher};
 use regex_automata::meta::Regex;
 
-use crate::mapping::{SystemColumnNames, SystemColumns};
+use crate::mapping::{SystemColumnNames, SystemColumns, Tee};
 use crate::runtime_config::TableRow;
 use crate::schema::RelName;
 
@@ -97,6 +97,8 @@ pub struct TableRule {
     /// CH engine at `CREATE TABLE`, verbatim except a bare `*ReplacingMergeTree`
     /// gains version and delete marker args
     pub engine: Option<String>,
+    /// Configure in TOML on exact table entries only
+    pub tee: Option<Vec<Tee>>,
 }
 
 impl TableRule {
@@ -110,6 +112,7 @@ impl TableRule {
             order_by: row.order_by.clone(),
             primary_key: row.primary_key.clone(),
             engine: row.engine.clone(),
+            tee: None,
         }
     }
 
@@ -132,6 +135,7 @@ impl TableRule {
         set_if(&mut self.order_by, &other.order_by);
         set_if(&mut self.primary_key, &other.primary_key);
         set_if(&mut self.engine, &other.engine);
+        set_if(&mut self.tee, &other.tee);
     }
 }
 

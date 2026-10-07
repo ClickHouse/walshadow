@@ -361,6 +361,7 @@ mod tests {
         let mapping = TableMapping {
             target: TableTarget::new("default", "foo"),
             columns: derive_columns_for_mapping(&desc, rules),
+            tees: Vec::new(),
         };
         let mut tables = HashMap::default();
         tables.insert(desc.rel_name.clone(), mapping);

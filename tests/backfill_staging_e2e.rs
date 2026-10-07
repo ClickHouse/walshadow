@@ -103,6 +103,7 @@ impl Fixture {
                             type_pinned: false,
                         },
                     ],
+                    tees: Vec::new(),
                 },
             )]
             .into_iter()

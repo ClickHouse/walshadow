@@ -197,6 +197,7 @@ mod tests {
                     target_type: "Int32".into(),
                     type_pinned: false,
                 }],
+                tees: Vec::new(),
             }),
             Arc::default(),
             RowPolicy {

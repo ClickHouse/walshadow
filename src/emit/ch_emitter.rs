@@ -870,6 +870,7 @@ struct TablePatch {
     order_by: Option<Vec<String>>,
     primary_key: Option<Vec<String>>,
     engine: Option<String>,
+    tee: Option<Vec<crate::mapping::Tee>>,
     /// Same four keys as `[system_columns]`, for this entry's relations alone
     lsn: Option<String>,
     xid: Option<String>,
@@ -992,6 +993,7 @@ impl EmitterConfig {
     /// order_by = ["id"]            # optional: CH ORDER BY, else replica identity
     /// primary_key = ["id"]         # optional: index prefix of order_by
     /// engine = "MergeTree"         # optional: CH engine, else ReplacingMergeTree
+    /// tee = [{ table = "foo_audit", engine = "MergeTree" }]  # optional: extra destinations
     /// lsn = "_peerdb_version"      # optional: per-relation system column
     /// is_deleted = false           # renames, same keys as [system_columns]
     /// columns = [
@@ -1114,6 +1116,12 @@ impl EmitterConfig {
             is_deleted: t.is_deleted,
         };
         system.validate(&ctx).map_err(EmitterError::Config)?;
+        if t.tee.is_some() && kind != MatchKind::Exact {
+            return Err(EmitterError::Config(format!(
+                "{ctx}.tee: a `match = \"{}\"` entry would merge every matched table into one tee",
+                kind.as_str()
+            )));
+        }
         let rule = TableRule {
             system,
             target_database: t.target_database,
@@ -1123,6 +1131,7 @@ impl EmitterConfig {
             order_by: t.order_by,
             primary_key: t.primary_key,
             engine: t.engine,
+            tee: t.tee,
         };
         self.table_entries.push((rel.clone(), kind, rule.clone()));
         let mut pinned = Vec::new();
@@ -1239,6 +1248,7 @@ impl EmitterConfig {
             TableMapping {
                 target: TableTarget { database, table },
                 columns: pinned,
+                tees: rule.tee.unwrap_or_default(),
             },
         );
         if let Some(mode) = rule.initial_load {
@@ -1257,8 +1267,9 @@ pub(crate) struct TablePlan {
     /// Delete marker `Bool` (1 on delete, else 0), appended last. `None` when
     /// `[system_columns] is_deleted = false` drops it
     pub(crate) synth_is_deleted: Option<ColumnPlan>,
-    /// Pre-formatted so on-tuple paths don't reassemble per row
-    pub(crate) insert_sql: String,
+    /// Format once to avoid rebuilding SQL for each row. Main destination
+    /// first, then each tee
+    pub(crate) insert_sql: Vec<String>,
 }
 
 pub(crate) struct ColumnPlan {
@@ -1557,18 +1568,15 @@ impl TablePlan {
         col_sql.push(quote_ident(&synth_xid.name));
         col_sql.push(quote_ident(&synth_commit_ts.name));
         col_sql.extend(synth_is_deleted.iter().map(|c| quote_ident(&c.name)));
-        let insert_sql = format!(
-            "INSERT INTO {} ({}) FORMAT Native",
-            mapping.target.sql(),
-            col_sql.join(", "),
-        );
+        let col_sql = col_sql.join(", ");
+        let insert = |t: &TableTarget| format!("INSERT INTO {} ({col_sql}) FORMAT Native", t.sql());
         Ok(Self {
             columns,
             synth_lsn,
             synth_xid,
             synth_commit_ts,
             synth_is_deleted,
-            insert_sql,
+            insert_sql: mapping.targets().map(|t| insert(&t)).collect(),
         })
     }
 
@@ -2922,6 +2930,7 @@ mod tests {
                     type_pinned: false,
                 },
             ],
+            tees: Vec::new(),
         }
     }
 
@@ -3408,14 +3417,54 @@ mod tests {
             &SystemColumns::default(),
         )
         .expect("plan builds");
-        assert!(plan.insert_sql.contains("INSERT INTO `default`.`foo`"));
-        assert!(plan.insert_sql.contains("`id`"));
-        assert!(plan.insert_sql.contains("`name`"));
-        assert!(plan.insert_sql.contains("`_lsn`"));
-        assert!(plan.insert_sql.contains("`_xid`"));
-        assert!(plan.insert_sql.contains("`_commit_ts`"));
-        assert!(plan.insert_sql.contains("`_is_deleted`"));
-        assert!(plan.insert_sql.ends_with(") FORMAT Native"));
+        let [insert_sql] = plan.insert_sql.as_slice() else {
+            panic!("one target: {:?}", plan.insert_sql)
+        };
+        assert!(insert_sql.contains("INSERT INTO `default`.`foo`"));
+        assert!(insert_sql.contains("`id`"));
+        assert!(insert_sql.contains("`name`"));
+        assert!(insert_sql.contains("`_lsn`"));
+        assert!(insert_sql.contains("`_xid`"));
+        assert!(insert_sql.contains("`_commit_ts`"));
+        assert!(insert_sql.contains("`_is_deleted`"));
+        assert!(insert_sql.ends_with(") FORMAT Native"));
+    }
+
+    #[test]
+    fn table_plan_sends_same_columns_to_each_tee() {
+        use crate::mapping::Tee;
+        let alloc = Allocator::global(&mimalloc::MiMalloc);
+        let mut m = mk_mapping();
+        m.tees = vec![
+            Tee {
+                table: "foo_audit".into(),
+                ..Tee::default()
+            },
+            Tee {
+                database: Some("wh".into()),
+                table: "foo".into(),
+                ..Tee::default()
+            },
+        ];
+        let plan = TablePlan::build(
+            alloc,
+            &mk_rel(),
+            &m,
+            &ColumnRules::default(),
+            &SystemColumns::default(),
+        )
+        .unwrap();
+        let [primary, tees @ ..] = plan.insert_sql.as_slice() else {
+            panic!("primary first")
+        };
+        let cols = primary.strip_prefix("INSERT INTO `default`.`foo` ");
+        assert_eq!(
+            tees,
+            [
+                format!("INSERT INTO `default`.`foo_audit` {}", cols.unwrap()),
+                format!("INSERT INTO `wh`.`foo` {}", cols.unwrap()),
+            ]
+        );
     }
 
     #[test]
@@ -3824,7 +3873,7 @@ mod tests {
             &SystemColumns::default(),
         )
         .expect("plan builds");
-        assert!(plan.insert_sql.contains("`_is_deleted`"));
+        assert!(plan.insert_sql[0].contains("`_is_deleted`"));
         let mut enc = TableEncoder::new(plan).unwrap();
         enc.append_row(&committed(1, Some("a")), &m, OP_INSERT)
             .unwrap();
@@ -4408,6 +4457,40 @@ mod tests {
     }
 
     #[test]
+    fn tee_parses_on_exact_entries_only() {
+        let c = EmitterConfig::from_toml_str(
+            "[ch]\n\
+             [table.public.events]\n\
+             columns = [{ attnum = 1, target = \"id\", type = \"Int32\" }]\n\
+             [[table.public.events.tee]]\n\
+             table = \"events_audit\"\n\
+             engine = \"MergeTree\"\n\
+             order_by = [\"id\", \"_lsn\"]\n",
+        )
+        .unwrap();
+        let m = &c.tables[&RelName::new("public", "events")];
+        assert_eq!(m.tees.len(), 1);
+        assert_eq!(m.tees[0].engine.as_deref(), Some("MergeTree"));
+        assert_eq!(
+            m.tee_targets().collect::<Vec<_>>(),
+            [TableTarget::new("default", "events_audit")]
+        );
+        let err = EmitterConfig::from_toml_str(
+            "[ch]\n[table.public.\"ev_*\"]\nmatch = \"glob\"\ntee = [{ table = \"audit\" }]\n",
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("merge every matched table"),
+            "{err}"
+        );
+        assert!(
+            EmitterConfig::from_toml_str("[ch]\n[table.public.t]\ntee = [{ engine = \"Log\" }]\n")
+                .is_err(),
+            "tee needs a table"
+        );
+    }
+
+    #[test]
     fn plan_renames_synthetic_columns_and_can_drop_the_marker() {
         let alloc = Allocator::global(&mimalloc::MiMalloc);
         let rel = mk_rel();
@@ -4421,9 +4504,8 @@ mod tests {
         let plan =
             TablePlan::build(alloc, &rel, &m, &ColumnRules::default(), &sys).expect("plan builds");
         assert!(
-            plan.insert_sql
-                .ends_with("`_v`, `_x`, `_at`) FORMAT Native"),
-            "{}",
+            plan.insert_sql[0].ends_with("`_v`, `_x`, `_at`) FORMAT Native"),
+            "{:?}",
             plan.insert_sql
         );
         assert!(plan.synth_is_deleted.is_none());

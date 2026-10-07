@@ -115,6 +115,8 @@ pub async fn prepare(
             TableMapping {
                 target: TableTarget::new(&rel.database, &rel.staging_table()),
                 columns: m.columns.clone(),
+                // Write load rows directly to tees; staging swap replaces only main destination
+                tees: m.tees.clone(),
             },
         );
         rels.push(rel);

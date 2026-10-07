@@ -142,6 +142,7 @@ fn mapping(filenode: u32, columns: usize) -> TableMapping {
                 type_pinned: false,
             })
             .collect(),
+        tees: Vec::new(),
     }
 }
 

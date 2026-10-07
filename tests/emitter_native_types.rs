@@ -124,6 +124,7 @@ async fn native_numeric_time_timetz_round_trip() {
                 type_pinned: false,
             },
         ],
+        tees: Vec::new(),
     });
 
     let stats = Arc::new(EmitterStats::default());

@@ -464,10 +464,14 @@ impl ConfigResolver {
         };
         let column_rules = self.tx.borrow().column_rules.clone();
         let columns = derive_columns_for_mapping(desc, &column_rules);
-        inner
-            .opt_in
-            .mappings
-            .insert(rel.clone(), TableMapping { target, columns });
+        inner.opt_in.mappings.insert(
+            rel.clone(),
+            TableMapping {
+                target,
+                columns,
+                tees: settings.tee.unwrap_or_default(),
+            },
+        );
         inner.opt_in.derived.remove(&rel);
         inner.opt_in.excluded.remove(&rel);
         inner.opt_in.pending_decl.remove(&rel);
@@ -854,6 +858,7 @@ impl ConfigResolver {
             if let Some(t) = settings.target_table {
                 m.target.table = t;
             }
+            m.tees = settings.tee.unwrap_or_default();
         }
         for (rel, row) in &overlay.tables {
             let names_target = row.target_database.is_some() || row.target_table.is_some();
@@ -1538,6 +1543,7 @@ mod tests {
             TableMapping {
                 target: TableTarget::new("default", "events"),
                 columns: Vec::new(),
+                tees: Vec::new(),
             },
         );
         opt_in.excluded.insert(RelName::new("public", "keep"));
@@ -1585,6 +1591,33 @@ mod tests {
         // Fenced routing map written for the decode pool.
         assert!(mapping.with(|m| m.contains_key(&rel)).await);
         assert_eq!(resolver.opt_in_total(), 1);
+    }
+
+    #[tokio::test]
+    async fn opt_in_tees_follow_table_rule() {
+        let base = EmitterConfig::from_toml_str(
+            "[ch]\n\
+             [table.public.events]\nreplicate = true\n\
+             tee = [{ database = \"audit\", table = \"events_log\" }]\n",
+        )
+        .unwrap();
+        let (resolver, rx) = ConfigResolver::new(
+            &base,
+            CliOverrides::default(),
+            None,
+            toml::Table::new(),
+            dummy_handles(),
+            ResolverBoot::default(),
+        );
+        resolver
+            .materialize_opt_in(&rel_desc("public", "events"), None, None)
+            .await;
+        let snap = rx.borrow();
+        let t = &snap.tables[&RelName::new("public", "events")];
+        assert_eq!(
+            t.tee_targets().collect::<Vec<_>>(),
+            [TableTarget::new("audit", "events_log")]
+        );
     }
 
     #[tokio::test]
@@ -1683,6 +1716,7 @@ mod tests {
                 TableMapping {
                     target: TableTarget::new("default", "auto"),
                     columns: Vec::new(),
+                    tees: Vec::new(),
                 },
             )
             .await;

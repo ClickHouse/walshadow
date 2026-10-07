@@ -6,6 +6,13 @@ a deployment promotes one into a standalone implementation plan
 
 ## Multiple ClickHouse destinations
 
+Use `tee` on a table entry to copy rows into more tables in one ClickHouse
+cluster. All destinations share columns and receive the same batch over one
+connection. walshadow acknowledges a batch after every destination receives
+it. Schema changes, `TRUNCATE`, staging loads, and rows released from pending
+tables also reach every destination. If one destination fails, all must wait.
+The following proposals cover separate connections or independent progress
+
 Start with separate daemons when destinations need independent failure handling
 Integrated fan-out is useful only when sharing source WAL, shadow, and decode
 cost outweighs coupling destinations

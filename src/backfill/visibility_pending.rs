@@ -62,6 +62,8 @@ pub struct PendingRel {
     pub rel: RelName,
     pub database: String,
     pub table: String,
+    /// Also copy rows here when releasing them from pending tables
+    pub tees: Vec<TableTarget>,
 }
 
 impl PendingRel {
@@ -75,6 +77,10 @@ impl PendingRel {
             quote_ident(&self.database),
             quote_ident(&self.table)
         )
+    }
+
+    fn targets_sql(&self) -> impl Iterator<Item = String> + '_ {
+        std::iter::once(self.target_sql()).chain(self.tees.iter().map(TableTarget::sql))
     }
 
     pub fn pending_sql(&self) -> String {
@@ -119,6 +125,8 @@ fn pending_table_mapping(
     TableMapping {
         target: TableTarget::new(&pending.database, &pending.pending_table()),
         columns,
+        // Undecided rows reach tees only through promotion
+        tees: Vec::new(),
     }
 }
 
@@ -252,6 +260,7 @@ pub async fn ship(
             rel: desc.rel_name.clone(),
             database: m.target.database.clone(),
             table: m.target.table.clone(),
+            tees: m.tee_targets().collect(),
         };
         rebuild_pending(&mut sess, &rel).await?;
         routes.insert(desc.rel_name.clone(), pending_table_mapping(m, desc, &rel));
@@ -407,6 +416,8 @@ pub struct PendingEntry {
     pub relname: String,
     pub database: String,
     pub table: String,
+    #[serde(default)]
+    pub tees: Vec<TableTarget>,
     /// Preserve load version through promotion
     pub start_lsn: Pos<Snapshot>,
     /// Deciding xids whose outcome is still unknown
@@ -433,6 +444,7 @@ impl PendingEntry {
             rel: RelName::new(&self.namespace, &self.relname),
             database: self.database.clone(),
             table: self.table.clone(),
+            tees: self.tees.clone(),
         }
     }
 
@@ -621,6 +633,7 @@ impl PendingLedger {
             relname: manifest.rel.rel.name.to_string(),
             database: manifest.rel.database.clone(),
             table: manifest.rel.table.clone(),
+            tees: manifest.rel.tees.clone(),
             start_lsn: Pos::new(manifest.start_lsn),
             outstanding: xids,
             committed: Vec::new(),
@@ -735,14 +748,16 @@ async fn promote(
     entry: &PendingEntry,
 ) -> Result<(), String> {
     let list = shared_columns(sess, rel).await?;
-    let sql = promote_sql(rel, entry, &list);
-    sess.exec_retry(&sql).await.map_err(|e| e.to_string())
+    for target in rel.targets_sql() {
+        let sql = promote_sql(&target, rel, entry, &list);
+        sess.exec_retry(&sql).await.map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
-fn promote_sql(rel: &PendingRel, entry: &PendingEntry, list: &str) -> String {
+fn promote_sql(target: &str, rel: &PendingRel, entry: &PendingEntry, list: &str) -> String {
     format!(
-        "INSERT INTO {} ({list}) SELECT {list} FROM {} WHERE {} AND {} AND {}",
-        rel.target_sql(),
+        "INSERT INTO {target} ({list}) SELECT {list} FROM {} WHERE {} AND {} AND {}",
         rel.pending_sql(),
         settled_side(XMIN_COLUMN, &entry.committed),
         settled_side(XMAX_COLUMN, &entry.aborted),
@@ -828,6 +843,7 @@ mod tests {
                 rel: RelName::new("public", rel),
                 database: "db".into(),
                 table: rel.into(),
+                tees: Vec::new(),
             },
             start_lsn: 0x5000,
             xids,
@@ -863,6 +879,7 @@ mod tests {
                 target_type: "Int32".into(),
                 type_pinned: false,
             }],
+            tees: Vec::new(),
         };
         let rel = manifest("t", Vec::new()).rel;
         let pending = pending_table_mapping(&m, &desc, &rel);
@@ -925,6 +942,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ledger_keeps_tees_for_promotion() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ledger = PendingLedger::load(tmp.path(), 7).await.unwrap();
+        let mut m = manifest("orders", vec![101]);
+        m.rel.tees = vec![TableTarget::new("audit", "orders_log")];
+        ledger.push(&m).await.unwrap();
+        let reloaded = PendingLedger::load(tmp.path(), 7).await.unwrap();
+        assert_eq!(
+            reloaded.entries()[0]
+                .rel()
+                .targets_sql()
+                .collect::<Vec<_>>(),
+            ["`db`.`orders`", "`audit`.`orders_log`"]
+        );
+    }
+
+    #[tokio::test]
     async fn promote_selects_only_settled_rows() {
         let tmp = tempfile::tempdir().unwrap();
         let mut ledger = PendingLedger::load(tmp.path(), 7).await.unwrap();
@@ -936,7 +970,7 @@ mod tests {
         ledger.note(102, &[], false);
         let entry = &ledger.entries()[0];
         assert_eq!(
-            promote_sql(&entry.rel(), entry, "`id`, `_lsn`"),
+            promote_sql("`db`.`orders`", &entry.rel(), entry, "`id`, `_lsn`"),
             "INSERT INTO `db`.`orders` (`id`, `_lsn`) \
              SELECT `id`, `_lsn` FROM `db`.`orders__wspending` \
              WHERE (`_ws_xmin` = 0 OR `_ws_xmin` IN (101)) \
@@ -957,7 +991,7 @@ mod tests {
         ledger.note(101, &[], true);
         let first = {
             let e = &ledger.entries()[0];
-            promote_sql(&e.rel(), e, "`id`")
+            promote_sql("`db`.`orders`", &e.rel(), e, "`id`")
         };
         assert!(first.ends_with("AND (`_ws_xmin` IN (101))"), "{first}");
 
@@ -965,7 +999,7 @@ mod tests {
         ledger.note(102, &[], false);
         let second = {
             let e = &ledger.entries()[0];
-            promote_sql(&e.rel(), e, "`id`")
+            promote_sql("`db`.`orders`", &e.rel(), e, "`id`")
         };
         assert!(
             second.contains("(`_ws_xmin` = 0 OR `_ws_xmin` IN (101))"),
@@ -995,7 +1029,7 @@ mod tests {
         assert!(!ledger.discard_held(&orders), "active entries stay");
         let e = &ledger.entries()[0];
         assert!(!e.held);
-        let sql = promote_sql(&e.rel(), e, "`id`");
+        let sql = promote_sql("`db`.`orders`", &e.rel(), e, "`id`");
         assert!(sql.ends_with("AND (`_ws_xmin` IN (101))"), "{sql}");
     }
 
@@ -1019,7 +1053,7 @@ mod tests {
         ledger.note(101, &[], false);
         ledger.note(102, &[], true);
         let entry = &ledger.entries()[0];
-        let sql = promote_sql(&entry.rel(), entry, "`id`");
+        let sql = promote_sql("`db`.`orders`", &entry.rel(), entry, "`id`");
         // Rows waiting on 101's commit or 102's abort match neither side
         assert!(
             sql.contains("(`_ws_xmin` = 0 OR `_ws_xmin` IN (102))"),
