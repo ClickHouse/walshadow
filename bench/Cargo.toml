@@ -1,6 +1,6 @@
 [package]
 name = "walshadow-bench"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 description = "Replication-latency benchmarks (Postgres → ClickHouse / PG standby), engine + CLIs"
 license = "AGPL-3.0-only"
