@@ -334,6 +334,7 @@ async fn emitter_tls_round_trip() {
                 type_pinned: false,
             },
         ],
+        tees: Vec::new(),
     });
 
     // Every inserter in the pool connects via `connect_client` →

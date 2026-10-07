@@ -56,6 +56,7 @@ fn emitter(port: u16) -> EmitterConfig {
                     type_pinned: false,
                 },
             ],
+            tees: Vec::new(),
         },
     );
     cfg

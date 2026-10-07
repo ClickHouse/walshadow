@@ -32,6 +32,7 @@ async fn checkpoint_reuses_staging_and_rejects_replaced_table() {
             TableMapping {
                 target: TableTarget::new("default", "t"),
                 columns: Vec::new(),
+                tees: Vec::new(),
             },
         )]
         .into_iter()

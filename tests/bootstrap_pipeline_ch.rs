@@ -80,6 +80,7 @@ fn id_mapping(target_table: &str) -> TableMapping {
             target_type: "Int32".into(),
             type_pinned: false,
         }],
+        tees: Vec::new(),
     }
 }
 

@@ -75,7 +75,7 @@ pub struct ColMeta {
 /// until a barrier rebuilds it (bumping `schema_epoch`).
 pub struct BatchMeta {
     pub table_key: TableKey,
-    pub insert_sql: String,
+    pub insert_sql: Vec<String>,
     /// Order matches `InsertBatch::buffers`: mapped columns then the
     /// synthetic ones (lsn, xid, commit_ts, delete marker when configured).
     pub columns: Vec<ColMeta>,
@@ -546,6 +546,7 @@ mod tests {
                     target_type: "Int32".into(),
                     type_pinned: false,
                 }],
+                tees: Vec::new(),
             }),
             Arc::default(),
             Default::default(),
@@ -724,6 +725,7 @@ mod tests {
                     target_type: "Int32".into(),
                     type_pinned: false,
                 }],
+                tees: Vec::new(),
             }),
             Arc::new(rules.finish().0),
             Default::default(),
@@ -1000,6 +1002,7 @@ mod tests {
                         target_type: "String".into(),
                         type_pinned: false,
                     }],
+                    tees: Vec::new(),
                 }),
                 Arc::default(),
                 Default::default(),

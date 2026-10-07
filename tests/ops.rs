@@ -90,6 +90,7 @@ fn mapping_for(rels: &[(&str, &str)]) -> EmitterConfig {
                     target_type: "Int64".into(),
                     type_pinned: false,
                 }],
+                tees: Vec::new(),
             },
         );
     }

@@ -15,9 +15,47 @@ use tokio::sync::RwLock;
 pub struct TableMapping {
     pub target: TableTarget,
     pub columns: Vec<ColumnMapping>,
+    /// Copy rows and schema changes from `target` to these destinations
+    pub tees: Vec<Tee>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+impl TableMapping {
+    pub fn tee_targets(&self) -> impl Iterator<Item = TableTarget> + '_ {
+        self.tees.iter().map(|t| t.target(&self.target.database))
+    }
+
+    /// Return main destination followed by each tee
+    pub fn targets(&self) -> impl Iterator<Item = TableTarget> + '_ {
+        std::iter::once(self.target.clone()).chain(self.tee_targets())
+    }
+}
+
+/// Copy rows into an extra table, such as a MergeTree audit log.
+/// Share columns with main destination; apply engine and keys only
+/// when creating table
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Tee {
+    /// `None` shares primary's database
+    pub database: Option<String>,
+    pub table: String,
+    pub engine: Option<String>,
+    #[serde(default)]
+    pub order_by: Vec<String>,
+    #[serde(default)]
+    pub primary_key: Vec<String>,
+}
+
+impl Tee {
+    pub fn target(&self, primary_database: &str) -> TableTarget {
+        TableTarget::new(
+            self.database.as_deref().unwrap_or(primary_database),
+            &self.table,
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct TableTarget {
     pub database: String,
     pub table: String,
@@ -694,6 +732,7 @@ mod tests {
             TableMapping {
                 target: TableTarget::new("db", "t"),
                 columns: vec![],
+                tees: Vec::new(),
             },
         )]);
         (rel, map)
@@ -803,6 +842,7 @@ mod tests {
         let mut mapping = TableMapping {
             target: TableTarget::new("db", "events"),
             columns: derive_columns_for_mapping(&old, &rules),
+            tees: Vec::new(),
         };
         let added = attr(2, "gross_amount", crate::schema::NUMERICOID);
         let new = events_desc(vec![
@@ -835,6 +875,7 @@ mod tests {
                 target_type: "Int32".into(),
                 type_pinned: false,
             }],
+            tees: Vec::new(),
         };
         let new = events_desc(vec![attr(1, "legacy_id", crate::schema::INT4OID)]);
         fold_diff_into_mapping(

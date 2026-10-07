@@ -749,6 +749,7 @@ async fn build_pipeline_inner(
             TableMapping {
                 target: spec.target_table,
                 columns: spec.columns,
+                tees: Vec::new(),
             },
         );
     }

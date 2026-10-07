@@ -149,6 +149,44 @@ collapse updates, deletes, or replayed rows
 Like sort key, `engine` applies only when walshadow creates a table. Source-side
 rows set it in `config_table.engine`
 
+## Copy rows into more tables
+
+Set `tee` to copy rows into additional ClickHouse tables. For example, keep
+an audit log of every row version alongside a table that removes duplicates:
+
+```toml
+[table.public.orders]
+replicate = true
+tee = [
+    { table = "orders_audit", engine = "MergeTree", order_by = ["id", "_lsn"] },
+    { database = "replica", table = "orders" },
+]
+```
+
+Each tee uses the same columns and metadata columns as its main destination
+and receives the same schema changes. `database` defaults to the destination's
+database. `engine`, `order_by`, and `primary_key` apply only when walshadow
+creates a tee table, just as for the main destination. A `MergeTree` tee stores
+updates as new rows and deletes as rows with `_is_deleted = true`
+
+walshadow sends each batch to the main destination, then to each tee. It
+acknowledges source WAL after every table receives the batch. After a restart,
+walshadow may resend a batch. `ReplacingMergeTree` removes duplicate row
+versions; other engines keep both copies. When reading those tables, remove
+duplicates using row key and `_lsn`. Source `TRUNCATE` also empties tee tables.
+Source `DROP TABLE` drops them when `drop_table_strategy = "drop"`
+
+Initial loads from backups also write rows into tees. Replacing a destination
+with its staging table affects only the main destination, so failed or retried
+loads can leave extra rows in tees
+
+Set `tee` on an exact `[table.*]` entry in TOML. Pattern entries reject it
+because every matching source table would write to the same tee table.
+`config_table` has no `tee` column. walshadow creates tee tables alongside the
+main destination on source `CREATE TABLE`. It also creates them at startup
+for entries that set `replicate = true` or specify `columns`. For other tables
+already replicating, create tee tables before adding them to configuration
+
 ## Rename metadata columns
 
 `[system_columns]` renames appended columns for every table. walshadow reads it

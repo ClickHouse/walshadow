@@ -94,6 +94,20 @@ impl Inserter {
         result
     }
 
+    /// Acknowledge after every destination receives batch. Failure can cause
+    /// replay of entire batch, including rows already delivered
+    async fn send_all(
+        &mut self,
+        meta: &BatchMeta,
+        bb: &BlockBuilder<'_>,
+    ) -> Result<EndOfStream, EmitterError> {
+        let mut durable = None;
+        for sql in &meta.insert_sql {
+            durable = Some(self.send_with_retry(sql, bb).await?);
+        }
+        durable.ok_or_else(|| EmitterError::Config("batch has no INSERT target".into()))
+    }
+
     async fn run(mut self, rx: async_channel::Receiver<ResolvedBatch>, fatal: Fatal) {
         while let Ok(ResolvedBatch { batch, resolved }) = rx.recv().await {
             let (epoch, asts) = match self.take_asts(&batch.meta) {
@@ -153,7 +167,7 @@ impl Inserter {
                     Ordering::Relaxed,
                 );
                 match appended {
-                    Ok(()) => self.send_with_retry(&batch.meta.insert_sql, &bb).await,
+                    Ok(()) => self.send_all(&batch.meta, &bb).await,
                     Err(e) => Err(e),
                 }
             };
