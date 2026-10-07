@@ -15,7 +15,7 @@ use walshadow::bootstrap_window::{
     WindowLegConfig, replay_segments, segments_in_dir, stream_window,
 };
 use walshadow::ch::CompressionChoice;
-use walshadow::ch_emitter::{EmitterConfig, EmitterStats};
+use walshadow::ch_emitter::{EmitterConfig, EmitterStats, InstanceConfig};
 use walshadow::config::ResolvedConfig;
 use walshadow::mapping::{ColumnMapping, TableMapping, TableTarget};
 use walshadow::pipeline::Fatal;
@@ -31,10 +31,13 @@ const N_ROWS: i32 = 100;
 
 fn emitter(port: u16) -> EmitterConfig {
     let mut cfg = EmitterConfig {
-        host: "127.0.0.1".into(),
-        port,
-        database: "walshadow_test".into(),
-        compression: CompressionChoice::None,
+        conn: InstanceConfig {
+            host: "127.0.0.1".into(),
+            port,
+            database: "walshadow_test".into(),
+            compression: CompressionChoice::None,
+            ..Default::default()
+        },
         flush_timeout: Duration::from_millis(50),
         ..Default::default()
     };

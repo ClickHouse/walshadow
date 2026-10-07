@@ -39,7 +39,7 @@ use tokio::sync::Mutex;
 
 use walshadow::ch::CompressionChoice;
 use walshadow::ch_ddl::{DdlApplicator, DdlConfig};
-use walshadow::ch_emitter::{EmitterConfig, EmitterStats};
+use walshadow::ch_emitter::{EmitterConfig, EmitterStats, InstanceConfig};
 use walshadow::mapping::{
     ColumnMapping, DropTableStrategy, NamespaceMapping, TableMapping, TableTarget,
 };
@@ -737,10 +737,13 @@ async fn build_pipeline_inner(
     let xact_buffer = Arc::new(Mutex::new(xact_buffer));
 
     let mut emitter_cfg = EmitterConfig {
-        host: "127.0.0.1".into(),
-        port: ch_tcp_port,
-        database: ch_database.into(),
-        compression: CompressionChoice::Lz4,
+        conn: InstanceConfig {
+            host: "127.0.0.1".into(),
+            port: ch_tcp_port,
+            database: ch_database.into(),
+            compression: CompressionChoice::Lz4,
+            ..Default::default()
+        },
         ..Default::default()
     };
     for spec in mappings {

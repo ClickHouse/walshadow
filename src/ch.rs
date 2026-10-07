@@ -115,6 +115,9 @@ impl CompressionChoice {
     }
 }
 
+/// ClickHouse UNKNOWN_DATABASE
+pub const UNKNOWN_DATABASE: i32 = 81;
+
 pub trait ConnectionConfig {
     fn host(&self) -> &str;
     fn port(&self) -> u16;
@@ -209,13 +212,55 @@ pub async fn exec_drain(
     .await
 }
 
-/// Connection owned by its retry loop. A cleared client redials on next use,
-/// so a failed reconnect spends retry budget instead of aborting the caller.
-pub struct ChConn {
-    dest: Arc<DestEmitter>,
+/// Connect to `cfg.database`, first creating it over a session on `default`
+/// when absent, since CH refuses a handshake naming a missing database.
+/// `true` when it was created
+pub async fn connect_creating_database(
+    cfg: &EmitterConfig,
+) -> Result<(BoxedAsyncClient, bool), EmitterError> {
+    match connect_client(cfg).await {
+        Err(EmitterError::Client(e)) if e.server_code == UNKNOWN_DATABASE => {}
+        result => return result.map(|client| (client, false)),
+    }
+    let mut on_default = cfg.clone();
+    on_default.conn.database = "default".into();
+    let mut client = connect_client(&on_default).await?;
+    exec_drain(
+        &mut client,
+        &format!(
+            "CREATE DATABASE IF NOT EXISTS {}",
+            quote_ident(&cfg.conn.database)
+        ),
+        cfg.insert_timeout,
+    )
+    .await?;
+    tracing::info!(database = %cfg.conn.database, "created destination database");
+    Ok((connect_client(cfg).await?, true))
+}
+
+struct Connection {
     client: Option<BoxedAsyncClient>,
     dialed: Option<Arc<EmitterConfig>>,
     last_used: Instant,
+}
+
+impl Default for Connection {
+    fn default() -> Self {
+        Self {
+            client: None,
+            dialed: None,
+            last_used: Instant::now(),
+        }
+    }
+}
+
+/// Cache one connection per destination; retry and idle expiry apply independently.
+pub struct ChConn {
+    instance: Option<String>,
+    selected: Option<Arc<EmitterConfig>>,
+    active: Connection,
+    parked: std::collections::HashMap<Option<String>, Connection>,
+    dest: Arc<DestEmitter>,
     dials: u64,
 }
 
@@ -224,9 +269,10 @@ impl ChConn {
     pub fn deferred(dest: Arc<DestEmitter>) -> Self {
         Self {
             dest,
-            client: None,
-            dialed: None,
-            last_used: Instant::now(),
+            instance: None,
+            selected: None,
+            active: Connection::default(),
+            parked: Default::default(),
             dials: 0,
         }
     }
@@ -241,19 +287,34 @@ impl ChConn {
 
     /// Live config this connection dials and reads its knobs from
     pub fn config(&self) -> Arc<EmitterConfig> {
-        self.dest.current()
+        self.selected.clone().unwrap_or_else(|| self.dest.current())
+    }
+
+    pub fn select(&mut self, instance: Option<&str>) -> Result<(), EmitterError> {
+        let config = instance.map(|name| self.dest.instance(name)).transpose()?;
+        if self.instance.as_deref() != instance {
+            let next = self
+                .parked
+                .remove(&instance.map(str::to_owned))
+                .unwrap_or_default();
+            let previous = std::mem::replace(&mut self.active, next);
+            self.parked.insert(self.instance.take(), previous);
+            self.instance = instance.map(str::to_owned);
+        }
+        self.selected = config;
+        Ok(())
     }
 
     /// Redial now, for settings fixed at connect (codec, host, credentials)
     pub async fn dial(&mut self) -> Result<(), EmitterError> {
-        self.client = None;
+        self.active.client = None;
         self.ready().await?;
         Ok(())
     }
 
     pub async fn ready(&mut self) -> Result<&mut BoxedAsyncClient, EmitterError> {
         let client = self.take_ready().await?;
-        Ok(self.client.insert(client))
+        Ok(self.active.client.insert(client))
     }
 
     /// Dials since the last call, excluding the one at construction
@@ -289,16 +350,16 @@ impl ChConn {
     where
         Fut: Future<Output = (BoxedAsyncClient, Result<T, EmitterError>)>,
     {
-        let mut backoff = self.dest.current().retry.backoff().build();
+        let mut backoff = self.config().retry.backoff().build();
         let mut attempt = 0u32;
         loop {
             let error = match self.take_ready().await {
                 Ok(client) => {
                     let (client, result) = op(client).await;
-                    self.client = Some(client);
+                    self.active.client = Some(client);
                     match result {
                         Ok(value) => {
-                            self.last_used = Instant::now();
+                            self.active.last_used = Instant::now();
                             return Ok(value);
                         }
                         Err(e) => e,
@@ -314,26 +375,34 @@ impl ChConn {
             };
             on_retry(&error, attempt);
             attempt += 1;
-            self.client = None;
+            self.active.client = None;
             tokio::time::sleep(delay).await;
         }
     }
 
     async fn take_ready(&mut self) -> Result<BoxedAsyncClient, EmitterError> {
-        let config = self.dest.current();
+        if let Some(name) = &self.instance {
+            self.selected = Some(self.dest.instance(name)?);
+        }
+        let config = self.config();
         let moved = self
+            .active
             .dialed
             .as_ref()
             .is_none_or(|dialed| !Arc::ptr_eq(dialed, &config));
-        if moved || self.last_used.elapsed() >= config.idle_reconnect() {
-            self.client = None;
+        if moved || self.active.last_used.elapsed() >= config.idle_reconnect() {
+            self.active.client = None;
         }
-        if let Some(client) = self.client.take() {
+        if let Some(client) = self.active.client.take() {
             return Ok(client);
         }
-        let client = connect_client(&*config).await?;
-        self.dialed = Some(config);
-        self.last_used = Instant::now();
+        let client = if self.instance.is_some() {
+            connect_creating_database(&config).await?.0
+        } else {
+            connect_client(&*config).await?
+        };
+        self.active.dialed = Some(config);
+        self.active.last_used = Instant::now();
         self.dials += 1;
         Ok(client)
     }
@@ -357,6 +426,7 @@ pub fn quote_ident(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::emit::ch_emitter::InstanceConfig;
 
     /// `compression = "none"` still has to decode a compressed response: the
     /// wire flag says what we send, not what the server answers in. A server
@@ -393,8 +463,11 @@ mod tests {
     async fn hello_drop_names_likely_causes() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let config = EmitterConfig {
-            host: "127.0.0.1".into(),
-            port: listener.local_addr().unwrap().port(),
+            conn: InstanceConfig {
+                host: "127.0.0.1".into(),
+                port: listener.local_addr().unwrap().port(),
+                ..Default::default()
+            },
             ..EmitterConfig::default()
         };
         let server = tokio::spawn(async move { drop(listener.accept().await.unwrap()) });

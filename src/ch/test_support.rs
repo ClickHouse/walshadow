@@ -5,7 +5,7 @@ use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 
 use crate::ch::CompressionChoice;
-use crate::emit::ch_emitter::{EmitterConfig, RetryConfig};
+use crate::emit::ch_emitter::{EmitterConfig, InstanceConfig, RetryConfig};
 
 pub(crate) async fn retry_server(
     max_attempts: u32,
@@ -15,9 +15,12 @@ pub(crate) async fn retry_server(
 ) -> (EmitterConfig, JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let config = EmitterConfig {
-        host: "127.0.0.1".into(),
-        port: listener.local_addr().unwrap().port(),
-        compression: CompressionChoice::None,
+        conn: InstanceConfig {
+            host: "127.0.0.1".into(),
+            port: listener.local_addr().unwrap().port(),
+            compression: CompressionChoice::None,
+            ..Default::default()
+        },
         retry: RetryConfig {
             max_attempts,
             initial_backoff: Duration::from_millis(1),

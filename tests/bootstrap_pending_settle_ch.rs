@@ -50,6 +50,15 @@ fn wait_for_metric(addr: SocketAddr, name: &str, least: u64, timeout: Duration) 
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pending_rows_promote_on_commit_and_never_publish_on_rollback() {
+    run(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pending_rows_promote_on_distinct_instances() {
+    run(true).await;
+}
+
+async fn run(named: bool) {
     if !fx::tools::requirements_available() {
         return;
     }
@@ -63,8 +72,16 @@ async fn pending_rows_promote_on_commit_and_never_publish_on_rollback() {
     fx::load_source_workload(&source, SCHEMA, N_ROWS).expect("load source workload");
 
     let ch_tmp = tempfile::tempdir().unwrap();
-    let ch = fx::ChServer::spawn(ch_tmp, slot.ch_tcp, slot.ch_http).expect("spawn ch");
-    create_keyed_dest_table(&ch).expect("create ch table");
+    let local = fx::ChServer::spawn(ch_tmp, slot.ch_tcp, slot.ch_http).expect("spawn ch");
+    create_keyed_dest_table(&local).expect("create ch table");
+    let ports = fx::Ports::alloc();
+    let remote = named.then(|| {
+        let ch =
+            fx::ChServer::spawn(tempfile::tempdir().unwrap(), ports.ch_tcp, ports.ch_http).unwrap();
+        create_keyed_dest_table(&ch).unwrap();
+        ch
+    });
+    let ch = remote.as_ref().unwrap_or(&local);
 
     let ch_config_path = tmp.path().join("ch-config.toml");
     fx::write_ch_config_toml(
@@ -76,6 +93,20 @@ async fn pending_rows_promote_on_commit_and_never_publish_on_rollback() {
         &TableTarget::new("default", "t"),
     )
     .expect("write ch-config");
+    if named {
+        let mut config = std::fs::read_to_string(&ch_config_path).unwrap();
+        config.push_str(&format!(
+            r#"
+            target_instance = "archive"
+            tee = [{{instance = "default", table = "t"}}]
+            [ch.instances.archive]
+            host = "127.0.0.1"
+            port = {}
+        "#,
+            ports.ch_tcp
+        ));
+        std::fs::write(&ch_config_path, config).unwrap();
+    }
 
     // Backup checkpoint flushes open writers' tuples below redo point
     let committer = open_sql_client(&fx::pg_cfg(&source, "pending-committer"))
@@ -152,7 +183,7 @@ async fn pending_rows_promote_on_commit_and_never_publish_on_rollback() {
             .context("ROLLBACK")?;
 
         fx::wait_for_ch_value(
-            &ch,
+            ch,
             "SELECT count() FROM default.t FINAL WHERE id BETWEEN 1001 AND 1010",
             "10",
             Duration::from_secs(90),
@@ -160,7 +191,7 @@ async fn pending_rows_promote_on_commit_and_never_publish_on_rollback() {
         .context("committed pending rows never promoted")?;
 
         fx::wait_for_ch_value(
-            &ch,
+            ch,
             "SELECT count() FROM system.tables WHERE database = 'default' \
              AND name = 't__wspending'",
             "0",
@@ -195,8 +226,17 @@ async fn pending_rows_promote_on_commit_and_never_publish_on_rollback() {
             "shadow pg_xact covered every deciding xid, metric {undecidable:?}"
         );
 
-        fx::assert_ch_matches_source(&ch, &source, &format!("{SCHEMA}.t"), "default.t")
-            .context("source vs CH parity after settling")
+        for server in [ch, &local] {
+            fx::wait_for_ch_value(
+                server,
+                "EXISTS TABLE default.t__wspending",
+                "0",
+                Duration::from_secs(30),
+            )?;
+            fx::assert_ch_matches_source(server, &source, &format!("{SCHEMA}.t"), "default.t")
+                .context("source vs CH parity after settling")?;
+        }
+        Ok(())
     }
     .await;
 

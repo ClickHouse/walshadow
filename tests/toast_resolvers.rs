@@ -24,7 +24,7 @@ mod fx;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use walshadow::ch_emitter::{EmitterConfig, EmitterStats};
+use walshadow::ch_emitter::{EmitterConfig, EmitterStats, InstanceConfig};
 use walshadow::spill::ToastDelete;
 use walshadow::toast::{
     ChunkStore, ChunkStoreError, ClickHouseChunkStore, FetchedValue, ToastResolver, ToastRow,
@@ -59,9 +59,12 @@ fn tomb(relid: u32, tid: (u32, u16), lsn: u64) -> ToastRow {
 
 fn config(port: u16) -> EmitterConfig {
     EmitterConfig {
-        host: "127.0.0.1".into(),
-        port,
-        database: DB.into(),
+        conn: InstanceConfig {
+            host: "127.0.0.1".into(),
+            port,
+            database: DB.into(),
+            ..Default::default()
+        },
         ..EmitterConfig::default()
     }
 }

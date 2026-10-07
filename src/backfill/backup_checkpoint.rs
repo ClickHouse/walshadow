@@ -217,10 +217,11 @@ impl BackupCheckpoint {
         for rel in &plan.rels {
             let table = rel.staging_table();
             let uuid = session
-                .table_uuid(&rel.database, &table)
+                .table_uuid(&rel.target.database, &table)
                 .await?
                 .context("staging table disappeared before checkpoint")?;
-            self.staging.push((rel.database.clone(), table, uuid));
+            self.staging
+                .push((rel.target.database.clone(), table, uuid));
         }
         Ok(())
     }

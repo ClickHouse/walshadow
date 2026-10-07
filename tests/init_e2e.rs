@@ -97,8 +97,8 @@ async fn init_probes_both_ends_and_writes_a_bootable_config() {
     assert_eq!(conn.dbname, "postgres");
 
     let cfg = EmitterConfig::from_table(&root).expect("[ch]");
-    assert_eq!(cfg.port, slot.ch_tcp);
-    assert_eq!(cfg.database, "cdc");
+    assert_eq!(cfg.conn.port, slot.ch_tcp);
+    assert_eq!(cfg.conn.database, "cdc");
 
     let users = cfg
         .table_opt_ins

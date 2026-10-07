@@ -7,17 +7,20 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use walshadow::ch::CompressionChoice;
-use walshadow::ch_emitter::{EmitterConfig, EmitterStats};
+use walshadow::ch_emitter::{EmitterConfig, EmitterStats, InstanceConfig};
 use walshadow::pipeline::Fatal;
 use walshadow::pipeline::tail;
 use walshadow::pos::{EmitterAck, Monotone};
 
 fn emitter(port: u16) -> EmitterConfig {
     EmitterConfig {
-        host: "127.0.0.1".into(),
-        port,
-        database: "walshadow_test".into(),
-        compression: CompressionChoice::Lz4,
+        conn: InstanceConfig {
+            host: "127.0.0.1".into(),
+            port,
+            database: "walshadow_test".into(),
+            compression: CompressionChoice::Lz4,
+            ..Default::default()
+        },
         ..Default::default()
     }
 }

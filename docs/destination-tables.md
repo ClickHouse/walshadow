@@ -149,6 +149,58 @@ collapse updates, deletes, or replayed rows
 Like sort key, `engine` applies only when walshadow creates a table. Source-side
 rows set it in `config_table.engine`
 
+## Route to named ClickHouse instances
+
+One walshadow process can send rows from one PostgreSQL instance to multiple
+ClickHouse instances. Keep `[ch]` as default destination and add named connections:
+
+```toml
+[ch]
+host = "ch-primary.internal"
+database = "cdc"
+
+[ch.instances.archive]
+host = "ch-archive.internal"
+port = 9440
+secure = true
+user = "archive_writer"
+password = "secret"
+database = "history"
+
+[table.public.orders]
+replicate = true
+target_instance = "archive"
+tee = [
+    { instance = "default", table = "orders" },
+    { table = "orders_audit", engine = "MergeTree" },
+]
+```
+
+Set `target_instance` to choose a named connection for a table. Both exact
+and pattern rules support this setting. Omit it or use `"default"` to select
+`[ch]`. Set `target_database` or a namespace database override to use a database
+other than that connection's default
+
+By default, a tee uses its main destination's instance and database. Set
+`instance` to choose another connection and use its default database. Set
+`database` to override that choice. In this example, orders and audit tables
+use `archive`, and another copy of orders goes to `[ch]`
+
+Named connections accept `host`, `port`, `database`, `user`, `password`, `secure`,
+and `compression`, with the same defaults as `[ch]`. Credentials from `[ch]`
+are not reused for named connections. All destinations share pipeline limits,
+pool sizes, retry settings, and column layout. Reload TOML to
+update connection names and table mappings. `config_table` has no instance
+column. `default` is reserved, and unknown names cause configuration errors
+
+Each destination receives rows, initial loads, schema changes, `TRUNCATE`, and
+`DROP TABLE` when configured. Each inserter opens connections as needed.
+walshadow acknowledges source WAL after every destination receives the batch,
+so an unavailable destination stops progress for all. Writes across instances
+are not atomic: some destinations can receive rows before others, and retries
+can send those rows again. TOAST mirrors stay on `[ch]` and supply values for
+decoding rows sent to every instance
+
 ## Copy rows into more tables
 
 Set `tee` to copy rows into additional ClickHouse tables. For example, keep

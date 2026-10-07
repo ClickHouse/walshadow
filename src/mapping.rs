@@ -21,7 +21,7 @@ pub struct TableMapping {
 
 impl TableMapping {
     pub fn tee_targets(&self) -> impl Iterator<Item = TableTarget> + '_ {
-        self.tees.iter().map(|t| t.target(&self.target.database))
+        self.tees.iter().map(|t| t.target(&self.target))
     }
 
     /// Return main destination followed by each tee
@@ -36,7 +36,8 @@ impl TableMapping {
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Tee {
-    /// `None` shares primary's database
+    pub instance: Option<String>,
+    /// When unset, use main destination database or explicit `instance` default
     pub database: Option<String>,
     pub table: String,
     pub engine: Option<String>,
@@ -47,16 +48,30 @@ pub struct Tee {
 }
 
 impl Tee {
-    pub fn target(&self, primary_database: &str) -> TableTarget {
-        TableTarget::new(
-            self.database.as_deref().unwrap_or(primary_database),
-            &self.table,
-        )
+    pub fn target(&self, primary: &TableTarget) -> TableTarget {
+        TableTarget {
+            instance: self
+                .instance
+                .clone()
+                .map_or_else(|| primary.instance.clone(), named_instance),
+            database: self
+                .database
+                .clone()
+                .unwrap_or_else(|| primary.database.clone()),
+            table: self.table.clone(),
+        }
     }
+}
+
+/// Map explicit `default` to None so TableTarget spells default instance one way
+pub fn named_instance(name: String) -> Option<String> {
+    (name != "default").then_some(name)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct TableTarget {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance: Option<String>,
     pub database: String,
     pub table: String,
 }
@@ -64,6 +79,7 @@ pub struct TableTarget {
 impl TableTarget {
     pub fn new(database: &str, table: &str) -> Self {
         Self {
+            instance: None,
             database: database.into(),
             table: table.into(),
         }

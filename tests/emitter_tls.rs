@@ -2,7 +2,7 @@
 //! spawned `clickhouse server` listening on a secure native port with a
 //! self-signed cert.
 //!
-//! Exercises the production `EmitterConfig { secure: true, .. }` path
+//! Exercises the production `InstanceConfig { secure: true, .. }` path
 //! through the inserter pool: `tail::spawn` → `inserter::spawn_pool` →
 //! `connect_client` → `AsyncClient::connect_tls`. The
 //! self-signed CA is pinned into the rustls root store via
@@ -36,7 +36,7 @@ use std::time::{Duration, Instant};
 use clickhouse_c::tls::{self, rustls};
 use walrus::pg::walparser::RelFileNode;
 use walshadow::ch::CompressionChoice;
-use walshadow::ch_emitter::{EmitterConfig, EmitterStats};
+use walshadow::ch_emitter::{EmitterConfig, EmitterStats, InstanceConfig};
 use walshadow::heap_decoder::{ColumnValue, CommittedTuple, DecodedHeap, DecodedTuple, HeapOp};
 use walshadow::mapping::{ColumnMapping, TableMapping, TableTarget};
 use walshadow::pipeline::ack::Publish;
@@ -308,12 +308,15 @@ async fn emitter_tls_round_trip() {
     // tls_config pins the self-signed CA; default_config (public roots)
     // would reject it.
     let cfg = EmitterConfig {
-        host: "localhost".into(),
-        port: ch.secure_port,
-        database: "walshadow_test".into(),
-        secure: true,
+        conn: InstanceConfig {
+            host: "localhost".into(),
+            port: ch.secure_port,
+            database: "walshadow_test".into(),
+            secure: true,
+            compression: CompressionChoice::Lz4,
+            ..Default::default()
+        },
         tls_config: Some(ch.pinned_config()),
-        compression: CompressionChoice::Lz4,
         ..Default::default()
     };
     // The batcher builds its plan from the `RoutedRow`'s mapping.

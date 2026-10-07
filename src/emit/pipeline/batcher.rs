@@ -75,7 +75,7 @@ pub struct ColMeta {
 /// until a barrier rebuilds it (bumping `schema_epoch`).
 pub struct BatchMeta {
     pub table_key: TableKey,
-    pub insert_sql: Vec<String>,
+    pub inserts: Vec<crate::emit::ch_emitter::InsertQuery>,
     /// Order matches `InsertBatch::buffers`: mapped columns then the
     /// synthetic ones (lsn, xid, commit_ts, delete marker when configured).
     pub columns: Vec<ColMeta>,
@@ -115,7 +115,7 @@ impl BatchMeta {
         Self {
             rows_inserted: stats.rows_inserted_by_table.counter(&table_key),
             table_key,
-            insert_sql: plan.insert_sql.clone(),
+            inserts: plan.inserts.clone(),
             columns,
             schema_epoch,
         }

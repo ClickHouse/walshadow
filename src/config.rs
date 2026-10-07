@@ -33,11 +33,11 @@ use walrus::pg::replication::tls::{SslMode, TlsParams};
 
 use crate::ch::{CompressionChoice, EmitterError};
 use crate::column_rules::{ColumnRule, ColumnRules, ColumnRulesBuilder, Substitute};
-use crate::emit::ch_emitter::EmitterConfig;
+use crate::emit::ch_emitter::{EmitterConfig, InstanceConfig, default_database};
 use crate::filter::shadow_relations::ShadowHeld;
 use crate::mapping::{
     DropTableStrategy, MappingHandle, NameTemplate, NamespaceMapping, Retype, TableMapping,
-    TableTarget, derive_columns_for_mapping, fold_diff_into_mapping,
+    TableTarget, derive_columns_for_mapping, fold_diff_into_mapping, named_instance,
 };
 use crate::runtime_config::{ConfigEvent, ConfigOverlay, TableRow};
 use crate::schema::{RelDescriptor, RelName, SchemaDiff};
@@ -139,6 +139,7 @@ impl SourceConn {
 /// so a snapshot is internally consistent — no per-field tearing.
 #[derive(Debug, Clone)]
 pub struct ResolvedConfig {
+    pub instances: std::collections::BTreeMap<String, crate::emit::ch_emitter::InstanceConfig>,
     /// Per-relation destination mapping
     pub tables: HashMap<RelName, TableMapping>,
     /// Per-namespace defaults keyed on PG schema name
@@ -153,17 +154,11 @@ pub struct ResolvedConfig {
     pub byte_budget: usize,
     /// Hold-open / idle flush deadline (live)
     pub flush_timeout: Duration,
-    /// Per-INSERT wire compression (live: inserter rebuilds its codec on change)
-    pub compression: CompressionChoice,
     /// CH client retry budget (live: inserter reads per attempt loop)
     pub retry_max_attempts: u32,
-    /// CH connection (live: inserter + DDL applicator reconnect on change).
-    pub host: String,
-    pub port: u16,
-    pub database: String,
-    pub user: String,
-    pub password: String,
-    pub secure: bool,
+    /// CH connection (live: inserter + DDL applicator reconnect on change,
+    /// inserter rebuilds its codec on compression change)
+    pub conn: InstanceConfig,
     /// Source PostgreSQL connection and slot, live via config reload
     pub source: SourceConn,
     /// Columns-less `[table.*]` opt-in intents (live: reorder coordinator
@@ -175,25 +170,15 @@ pub struct ResolvedConfig {
 
 impl ResolvedConfig {
     pub fn dest_conn_eq(&self, cfg: &EmitterConfig) -> bool {
-        cfg.host == self.host
-            && cfg.port == self.port
-            && cfg.database == self.database
-            && cfg.user == self.user
-            && cfg.password == self.password
-            && cfg.secure == self.secure
-            && cfg.compression == self.compression
+        cfg.instances == self.instances
+            && cfg.conn == self.conn
             && cfg.retry.max_attempts == self.retry_max_attempts
     }
 
     fn overlay_dest(&self, base: &EmitterConfig) -> EmitterConfig {
         let mut out = EmitterConfig {
-            host: self.host.clone(),
-            port: self.port,
-            database: self.database.clone(),
-            user: self.user.clone(),
-            password: self.password.clone(),
-            secure: self.secure,
-            compression: self.compression,
+            instances: self.instances.clone(),
+            conn: self.conn.clone(),
             ..base.clone()
         };
         out.retry.max_attempts = self.retry_max_attempts;
@@ -201,7 +186,13 @@ impl ResolvedConfig {
     }
 }
 
+struct NamedEmitter {
+    base: Arc<EmitterConfig>,
+    config: Arc<EmitterConfig>,
+}
+
 pub struct DestEmitter {
+    named: std::sync::Mutex<HashMap<String, NamedEmitter>>,
     base: Arc<EmitterConfig>,
     live: Option<watch::Receiver<Arc<ResolvedConfig>>>,
     current: std::sync::Mutex<Arc<EmitterConfig>>,
@@ -213,6 +204,7 @@ impl DestEmitter {
         live: Option<watch::Receiver<Arc<ResolvedConfig>>>,
     ) -> Arc<Self> {
         Arc::new(Self {
+            named: Default::default(),
             current: std::sync::Mutex::new(base.clone()),
             base,
             live,
@@ -228,6 +220,29 @@ impl DestEmitter {
             *current = Arc::new(live.overlay_dest(&self.base));
         }
         current.clone()
+    }
+
+    pub fn instance(&self, name: &str) -> Result<Arc<EmitterConfig>, EmitterError> {
+        let base = self.current();
+        let settings = base
+            .instances
+            .get(name)
+            .ok_or_else(|| EmitterError::Config(format!("unknown ClickHouse instance `{name}`")))?;
+        let mut named = self.named.lock().expect("named emitter poisoned");
+        if let Some(entry) = named.get(name)
+            && Arc::ptr_eq(&entry.base, &base)
+        {
+            return Ok(entry.config.clone());
+        }
+        let config = Arc::new(settings.apply(&base));
+        named.insert(
+            name.to_owned(),
+            NamedEmitter {
+                base,
+                config: config.clone(),
+            },
+        );
+        Ok(config)
     }
 
     pub fn base(&self) -> &Arc<EmitterConfig> {
@@ -455,9 +470,18 @@ impl ConfigResolver {
         // Keep routing target aligned with DDL target
         let settings = self.tx.borrow().rules.settings(&rel);
         let target = TableTarget {
-            database: db_override
-                .or(settings.target_database)
-                .unwrap_or_else(|| Self::target_db_for(&inner, &rel.namespace)),
+            instance: settings.target_instance.clone().and_then(named_instance),
+            database: db_override.or(settings.target_database).unwrap_or_else(|| {
+                let resolved = self.tx.borrow();
+                default_database(
+                    &resolved.namespaces,
+                    &resolved.instances,
+                    &resolved.conn.database,
+                    &rel.namespace,
+                    settings.target_instance.as_deref(),
+                )
+                .to_owned()
+            }),
             table: table_override
                 .or(settings.target_table)
                 .unwrap_or_else(|| Self::target_table_for(&inner, &rel)),
@@ -587,9 +611,6 @@ impl ConfigResolver {
         self.republish(&inner).await;
     }
 
-    /// CH target database for a namespace: per-namespace override (overlay then
-    /// TOML) else the global `[ch] database`. Mirrors
-    /// [`crate::emit::ch_ddl::DdlConfig::target_database_for`].
     fn target_table_for(inner: &MergeInputs, rel: &RelName) -> String {
         let ns = &*rel.namespace;
         inner
@@ -608,22 +629,6 @@ impl ConfigResolver {
             .or_else(|| inner.base.auto_create_name_all.clone())
             .unwrap_or_default()
             .render(&inner.base.source.dbname, ns, &rel.name)
-    }
-
-    fn target_db_for(inner: &MergeInputs, namespace: &str) -> String {
-        inner
-            .overlay
-            .namespaces
-            .get(namespace)
-            .and_then(|r| r.target_database.clone())
-            .or_else(|| {
-                inner
-                    .base
-                    .namespaces
-                    .get(namespace)
-                    .and_then(|m| m.target_database.clone())
-            })
-            .unwrap_or_else(|| inner.base.database.clone())
     }
 
     /// Rebuild the resolved snapshot, write the fenced routing map, publish.
@@ -731,6 +736,7 @@ impl ConfigResolver {
         let (column_rules, column_rejections) = column_rules.finish();
         rejections += column_rejections;
         let mut rc = ResolvedConfig {
+            instances: base.instances.clone(),
             tables: base.tables.clone(),
             namespaces: base.namespaces.clone(),
             column_rules: Arc::new(column_rules),
@@ -739,14 +745,8 @@ impl ConfigResolver {
             row_budget: base.row_budget,
             byte_budget: base.byte_budget,
             flush_timeout: base.flush_timeout,
-            compression: base.compression,
             retry_max_attempts: base.retry.max_attempts,
-            host: base.host.clone(),
-            port: base.port,
-            database: base.database.clone(),
-            user: base.user.clone(),
-            password: base.password.clone(),
-            secure: base.secure,
+            conn: base.conn.clone(),
             source: base.source.clone(),
             table_opt_ins: base.table_opt_ins.clone(),
             paused: base.paused,
@@ -814,7 +814,7 @@ impl ConfigResolver {
                 // codec (e.g. zstd with the feature off) is rejected here, never
                 // surfaced as a fatal when the inserter reconnects.
                 match v.parse().map(|c: CompressionChoice| (c, c.build_codec())) {
-                    Ok((c, Ok(_))) => rc.compression = c,
+                    Ok((c, Ok(_))) => rc.conn.compression = c,
                     _ => {
                         rejections += 1;
                         tracing::warn!(target: "walshadow::config", value = %v, "config_global.compression rejected");
@@ -852,8 +852,27 @@ impl ConfigResolver {
 
         for (rel, m) in rc.tables.iter_mut() {
             let settings = rules.settings(rel);
+            let instance = settings.target_instance.map_or_else(
+                || {
+                    base.tables
+                        .get(rel)
+                        .and_then(|table| table.target.instance.clone())
+                },
+                named_instance,
+            );
+            let instance_changed = m.target.instance != instance;
+            m.target.instance = instance;
             if let Some(db) = settings.target_database {
                 m.target.database = db;
+            } else if instance_changed {
+                m.target.database = default_database(
+                    &rc.namespaces,
+                    &rc.instances,
+                    &rc.conn.database,
+                    &rel.namespace,
+                    m.target.instance.as_deref(),
+                )
+                .to_owned();
             }
             if let Some(t) = settings.target_table {
                 m.target.table = t;
@@ -925,6 +944,84 @@ mod tests {
 
     fn dummy_handles() -> MappingHandle {
         crate::mapping::mapping_handle(HashMap::new())
+    }
+
+    #[test]
+    fn pattern_routes_pinned_table_to_instance_database() {
+        let base = EmitterConfig::from_toml_str(
+            r#"
+            [ch.instances.archive]
+            database = "history"
+            [table.public."*"]
+            match = "glob"
+            target_instance = "archive"
+            [table.public.events]
+            columns = [{attnum = 1, target = "id", type = "Int32"}]
+        "#,
+        )
+        .unwrap();
+        let (resolved, _) = ConfigResolver::resolve(
+            &base,
+            &ConfigOverlay::default(),
+            &CliOverrides::default(),
+            &OptInState::default(),
+            &ColumnRules::default(),
+        );
+        let target = &resolved.tables[&RelName::new("public", "events")].target;
+        assert_eq!(target.instance.as_deref(), Some("archive"));
+        assert_eq!(target.database, "history");
+        let opt_in = OptInState {
+            derived: resolved.tables.clone(),
+            ..Default::default()
+        };
+        let mut base = base;
+        base.table_entries.clear();
+        let (resolved, _) = ConfigResolver::resolve(
+            &base,
+            &ConfigOverlay::default(),
+            &CliOverrides::default(),
+            &opt_in,
+            &ColumnRules::default(),
+        );
+        let target = &resolved.tables[&RelName::new("public", "events")].target;
+        assert_eq!(target.instance, None);
+        assert_eq!(target.database, "default");
+    }
+
+    #[test]
+    fn named_connections_reload_without_inheriting_credentials() {
+        let base = Arc::new(
+            EmitterConfig::from_toml_str(
+                r#"
+            [ch]
+            user = "primary"
+            password = "primary_secret"
+            [ch.instances.archive]
+            host = "archive.internal"
+        "#,
+            )
+            .unwrap(),
+        );
+        let (mut resolved, _) = ConfigResolver::resolve(
+            &base,
+            &ConfigOverlay::default(),
+            &CliOverrides::default(),
+            &OptInState::default(),
+            &ColumnRules::default(),
+        );
+        let (tx, rx) = watch::channel(Arc::new(resolved.clone()));
+        let dest = DestEmitter::new(base, Some(rx));
+        let first = dest.instance("archive").unwrap();
+        assert_eq!(first.conn.user, "default");
+        assert!(first.conn.password.is_empty());
+        assert!(Arc::ptr_eq(&first, &dest.instance("archive").unwrap()));
+        resolved.instances.get_mut("archive").unwrap().host = "new.internal".into();
+        tx.send(Arc::new(resolved)).unwrap();
+        let next = dest.instance("archive").unwrap();
+        assert_eq!(next.conn.host, "new.internal");
+        assert!(!Arc::ptr_eq(&first, &next));
+        assert_eq!(dest.current().conn.user, "primary");
+        assert!(dest.instance("missing").is_err());
     }
 
     #[test]
@@ -1003,7 +1100,7 @@ mod tests {
         assert_eq!(r.row_budget, 1000);
         assert_eq!(r.byte_budget, 4096);
         assert_eq!(r.flush_timeout, Duration::from_millis(250));
-        assert_eq!(r.compression, CompressionChoice::None);
+        assert_eq!(r.conn.compression, CompressionChoice::None);
         assert_eq!(r.retry_max_attempts, 9);
     }
 
@@ -1046,7 +1143,7 @@ mod tests {
         assert_eq!(rej, 8);
         // Prior (TOML/base) values survive each rejection.
         assert_eq!(r.drop_table_strategy, DropTableStrategy::Retain);
-        assert_eq!(r.compression, base.compression);
+        assert_eq!(r.conn.compression, base.conn.compression);
         assert_eq!(r.row_budget, base.row_budget);
         assert_eq!(r.byte_budget, base.byte_budget);
         assert_eq!(r.flush_timeout, base.flush_timeout);
@@ -2354,43 +2451,25 @@ mod tests {
             EmitterConfig::from_toml_str("[ch]\nhost = \"ch-a\"\nport = 9000\nrow_budget = 4321\n")
                 .unwrap();
         let live = ResolvedConfig {
-            host: "ch-b".into(),
-            port: 9440,
-            database: "db".into(),
-            user: "u".into(),
-            password: "p".into(),
-            secure: true,
+            conn: InstanceConfig {
+                host: "ch-b".into(),
+                port: 9440,
+                database: "db".into(),
+                user: "u".into(),
+                password: "p".into(),
+                secure: true,
+                ..Default::default()
+            },
             ..ResolvedConfig::default()
         };
 
         let out = live.overlay_dest(&boot);
-        assert_eq!(out.host, "ch-b");
-        assert_eq!(out.port, 9440);
-        assert!(out.secure);
+        assert_eq!(out.conn.host, "ch-b");
+        assert_eq!(out.conn.port, 9440);
+        assert!(out.conn.secure);
         assert_eq!(out.row_budget, boot.row_budget);
         assert!(!live.dest_conn_eq(&boot));
         assert!(live.dest_conn_eq(&out));
-    }
-
-    /// The reverse drift: a moved field the comparison skips never reaches the
-    /// sessions, which keep dialling the old endpoint
-    #[test]
-    fn dest_conn_eq_notices_every_overlaid_field() {
-        let live = ResolvedConfig::default();
-        let base = live.overlay_dest(&EmitterConfig::default());
-        let moves: [fn(&mut EmitterConfig); 6] = [
-            |c| c.host.push('x'),
-            |c| c.port += 1,
-            |c| c.database.push('x'),
-            |c| c.user.push('x'),
-            |c| c.password.push('x'),
-            |c| c.secure = !c.secure,
-        ];
-        for apply in moves {
-            let mut moved = base.clone();
-            apply(&mut moved);
-            assert!(!live.dest_conn_eq(&moved));
-        }
     }
 
     /// A reload queued behind another publishes what it reads once it holds

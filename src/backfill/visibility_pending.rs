@@ -60,33 +60,43 @@ const PENDING_SLAB_ROWS: usize = 256;
 #[derive(Debug, Clone)]
 pub struct PendingRel {
     pub rel: RelName,
-    pub database: String,
-    pub table: String,
+    pub target: TableTarget,
     /// Also copy rows here when releasing them from pending tables
     pub tees: Vec<TableTarget>,
 }
 
 impl PendingRel {
     pub fn pending_table(&self) -> String {
-        format!("{}{PENDING_SUFFIX}", self.table)
+        format!("{}{PENDING_SUFFIX}", self.target.table)
     }
 
     pub fn target_sql(&self) -> String {
-        format!(
-            "{}.{}",
-            quote_ident(&self.database),
-            quote_ident(&self.table)
-        )
+        self.target.sql()
     }
 
-    fn targets_sql(&self) -> impl Iterator<Item = String> + '_ {
-        std::iter::once(self.target_sql()).chain(self.tees.iter().map(TableTarget::sql))
+    fn targets(&self) -> impl Iterator<Item = TableTarget> + '_ {
+        std::iter::once(self.target.clone()).chain(self.tees.iter().cloned())
+    }
+
+    fn remote_copies(&self) -> impl Iterator<Item = PendingRel> + '_ {
+        self.tees
+            .iter()
+            .filter(|t| t.instance != self.target.instance)
+            .map(|t| self.for_target(t))
+    }
+
+    fn for_target(&self, target: &TableTarget) -> Self {
+        Self {
+            rel: self.rel.clone(),
+            target: target.clone(),
+            tees: Vec::new(),
+        }
     }
 
     pub fn pending_sql(&self) -> String {
         format!(
             "{}.{}",
-            quote_ident(&self.database),
+            quote_ident(&self.target.database),
             quote_ident(&self.pending_table())
         )
     }
@@ -123,10 +133,21 @@ fn pending_table_mapping(
             }),
     );
     TableMapping {
-        target: TableTarget::new(&pending.database, &pending.pending_table()),
+        target: TableTarget {
+            instance: pending.target.instance.clone(),
+            ..TableTarget::new(&pending.target.database, &pending.pending_table())
+        },
         columns,
-        // Undecided rows reach tees only through promotion
-        tees: Vec::new(),
+        // Store pending rows on each destination instance so INSERT SELECT can read them
+        tees: pending
+            .remote_copies()
+            .map(|rel| crate::mapping::Tee {
+                instance: Some(rel.target.instance.unwrap_or_else(|| "default".into())),
+                database: Some(rel.target.database),
+                table: format!("{}{PENDING_SUFFIX}", rel.target.table),
+                ..Default::default()
+            })
+            .collect(),
     }
 }
 
@@ -258,11 +279,13 @@ pub async fn ship(
         };
         let rel = PendingRel {
             rel: desc.rel_name.clone(),
-            database: m.target.database.clone(),
-            table: m.target.table.clone(),
+            target: m.target.clone(),
             tees: m.tee_targets().collect(),
         };
         rebuild_pending(&mut sess, &rel).await?;
+        for remote in rel.remote_copies() {
+            rebuild_pending(&mut sess, &remote).await?;
+        }
         routes.insert(desc.rel_name.clone(), pending_table_mapping(m, desc, &rel));
         manifests.push(PendingManifest {
             rel,
@@ -368,6 +391,8 @@ fn pending_create_sql(rel: &PendingRel) -> String {
 }
 
 async fn rebuild_pending(sess: &mut StagingSession, rel: &PendingRel) -> Result<(), String> {
+    sess.select(rel.target.instance.as_deref())
+        .map_err(|e| e.to_string())?;
     let pending = rel.pending_sql();
     sess.exec_retry(&format!("DROP TABLE IF EXISTS {pending}"))
         .await
@@ -414,8 +439,8 @@ struct PendingFile {
 pub struct PendingEntry {
     pub namespace: String,
     pub relname: String,
-    pub database: String,
-    pub table: String,
+    #[serde(flatten)]
+    pub target: TableTarget,
     #[serde(default)]
     pub tees: Vec<TableTarget>,
     /// Preserve load version through promotion
@@ -442,8 +467,7 @@ impl PendingEntry {
     fn rel(&self) -> PendingRel {
         PendingRel {
             rel: RelName::new(&self.namespace, &self.relname),
-            database: self.database.clone(),
-            table: self.table.clone(),
+            target: self.target.clone(),
             tees: self.tees.clone(),
         }
     }
@@ -631,8 +655,7 @@ impl PendingLedger {
         let entry = PendingEntry {
             namespace: manifest.rel.rel.namespace.to_string(),
             relname: manifest.rel.rel.name.to_string(),
-            database: manifest.rel.database.clone(),
-            table: manifest.rel.table.clone(),
+            target: manifest.rel.target.clone(),
             tees: manifest.rel.tees.clone(),
             start_lsn: Pos::new(manifest.start_lsn),
             outstanding: xids,
@@ -705,9 +728,11 @@ pub async fn settle(
             continue;
         }
         let rel = e.rel();
+        sess.select(rel.target.instance.as_deref())
+            .map_err(|err| err.to_string())?;
         // Crash may follow DROP but precede ledger persist
         if sess
-            .table_uuid(&e.database, &rel.pending_table())
+            .table_uuid(&e.target.database, &rel.pending_table())
             .await
             .map_err(|err| format!("pending visibility: {}: {err}", rel.pending_sql()))?
             .is_none()
@@ -723,9 +748,13 @@ pub async fn settle(
         if !e.outstanding.is_empty() {
             continue;
         }
-        sess.exec_retry(&format!("DROP TABLE IF EXISTS {}", rel.pending_sql()))
-            .await
-            .map_err(|err| err.to_string())?;
+        for copy in rel.remote_copies().chain(std::iter::once(rel.clone())) {
+            sess.select(copy.target.instance.as_deref())
+                .map_err(|err| err.to_string())?;
+            sess.exec_retry(&format!("DROP TABLE IF EXISTS {}", copy.pending_sql()))
+                .await
+                .map_err(|err| err.to_string())?;
+        }
         stats.pending_tables_dropped.fetch_add(1, Ordering::Relaxed);
         done.push(i);
     }
@@ -747,9 +776,24 @@ async fn promote(
     rel: &PendingRel,
     entry: &PendingEntry,
 ) -> Result<(), String> {
-    let list = shared_columns(sess, rel).await?;
-    for target in rel.targets_sql() {
-        let sql = promote_sql(&target, rel, entry, &list);
+    for target in rel.targets() {
+        let copy = if target.instance == rel.target.instance {
+            rel.clone()
+        } else {
+            rel.for_target(&target)
+        };
+        sess.select(copy.target.instance.as_deref())
+            .map_err(|e| e.to_string())?;
+        if sess
+            .table_uuid(&copy.target.database, &copy.pending_table())
+            .await
+            .map_err(|e| e.to_string())?
+            .is_none()
+        {
+            continue;
+        }
+        let list = shared_columns(sess, &copy).await?;
+        let sql = promote_sql(&target.sql(), &copy, entry, &list);
         sess.exec_retry(&sql).await.map_err(|e| e.to_string())?;
     }
     Ok(())
@@ -770,8 +814,8 @@ async fn shared_columns(sess: &mut StagingSession, rel: &PendingRel) -> Result<S
         .query_strings(&format!(
             "SELECT name FROM system.columns WHERE database = {} AND table = {} \
              ORDER BY position",
-            sql_str(&rel.database),
-            sql_str(&rel.table)
+            sql_str(&rel.target.database),
+            sql_str(&rel.target.table)
         ))
         .await
         .map_err(|e| e.to_string())?;
@@ -779,7 +823,7 @@ async fn shared_columns(sess: &mut StagingSession, rel: &PendingRel) -> Result<S
         .query_strings(&format!(
             "SELECT name FROM system.columns WHERE database = {} AND table = {} \
              ORDER BY position",
-            sql_str(&rel.database),
+            sql_str(&rel.target.database),
             sql_str(&rel.pending_table())
         ))
         .await
@@ -841,8 +885,7 @@ mod tests {
         PendingManifest {
             rel: PendingRel {
                 rel: RelName::new("public", rel),
-                database: "db".into(),
-                table: rel.into(),
+                target: TableTarget::new("db", rel),
                 tees: Vec::new(),
             },
             start_lsn: 0x5000,
@@ -946,13 +989,24 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut ledger = PendingLedger::load(tmp.path(), 7).await.unwrap();
         let mut m = manifest("orders", vec![101]);
-        m.rel.tees = vec![TableTarget::new("audit", "orders_log")];
+        m.rel.target.instance = Some("warehouse".into());
+        m.rel.tees = vec![TableTarget {
+            instance: Some("archive".into()),
+            ..TableTarget::new("audit", "orders_log")
+        }];
         ledger.push(&m).await.unwrap();
         let reloaded = PendingLedger::load(tmp.path(), 7).await.unwrap();
+        let rel = reloaded.entries()[0].rel();
+        assert_eq!(rel.target.instance.as_deref(), Some("warehouse"));
+        let copies: Vec<_> = rel.remote_copies().collect();
+        assert_eq!(copies.len(), 1);
+        assert_eq!(copies[0].target.instance.as_deref(), Some("archive"));
+        assert_eq!(copies[0].pending_sql(), "`audit`.`orders_log__wspending`");
         assert_eq!(
             reloaded.entries()[0]
                 .rel()
-                .targets_sql()
+                .targets()
+                .map(|t| t.sql())
                 .collect::<Vec<_>>(),
             ["`db`.`orders`", "`audit`.`orders_log`"]
         );

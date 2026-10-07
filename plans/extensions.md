@@ -6,12 +6,8 @@ a deployment promotes one into a standalone implementation plan
 
 ## Multiple ClickHouse destinations
 
-Use `tee` on a table entry to copy rows into more tables in one ClickHouse
-cluster. All destinations share columns and receive the same batch over one
-connection. walshadow acknowledges a batch after every destination receives
-it. Schema changes, `TRUNCATE`, staging loads, and rows released from pending
-tables also reach every destination. If one destination fails, all must wait.
-The following proposals cover separate connections or independent progress
+Teeing to multiple tables in one ClickHouse cluster exists. The following
+proposals cover separate connections or independent progress
 
 Start with separate daemons when destinations need independent failure handling
 Integrated fan-out is useful only when sharing source WAL, shadow, and decode
@@ -27,11 +23,11 @@ Equal keys from two source tables must not accidentally collapse. Define DDL
 ownership and per-destination policy before moving routes live. Test partial
 destination failure, restart, and route changes with in-flight work
 
-Proposed route result is zero or more `(DestinationId, target)` pairs. Give each
-stable destination ID its own connection settings, batcher/inserter pool, DDL
-applicator, budgets, and contiguous acknowledgement state. Key encoding plans by
-destination plus table. Compose per-destination completion with existing
-per-inserter sequence counts before allowing global floor to advance
+Proposed route result is zero or more `(DestinationId, target)` pairs. Give
+each stable destination ID its own connection settings, batcher/inserter pool,
+DDL applicator, budgets, and contiguous acknowledgement state. Key encoding
+plans by destination plus table. Compose per-destination completion with
+existing per-inserter sequence counts before allowing global floor to advance
 
 Ship coupled retention first if integrated fan-out is justified: all required
 destinations bound progress, with explicit lag/disk limits. Independent progress
@@ -43,7 +39,7 @@ Per-destination cursor positions can avoid replay to destinations already ahead
 A global minimum is usable only when every replayed effect remains idempotent,
 including DDL and routing changes. Version cursor format and map legacy state
 to default destination. Keep endpoint credentials local; expose logical route
-rules through [runtime config](runtime_config.md) after default-only path works
+rules through [runtime config](runtime_config.md)
 
 Fan-in needs source identity in destination key when source key domains overlap
 `_lsn` and `_xid` do not by themselves prevent equal primary keys from collapsing

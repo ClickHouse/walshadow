@@ -480,7 +480,7 @@ pub(crate) async fn run_bootstrap(
         // is the easy case: every row op=Insert at _lsn = start_lsn, no
         // aborts / TRUNCATE / DDL. Keep operator's flush_timeout; tail
         // defaults 0 to its own partial-flush deadline.
-        let addr = format!("{}:{}", emitter_cfg.host, emitter_cfg.port);
+        let addr = format!("{}:{}", emitter_cfg.conn.host, emitter_cfg.conn.port);
         let stats = bootstrap_stats.clone();
         // Window leg shares the tail's fatal, so a CH outage stops both
         let fatal = Fatal::new();

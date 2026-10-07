@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use walrus::pg::walparser::RelFileNode;
 use walshadow::ch::CompressionChoice;
-use walshadow::ch_emitter::{EmitterConfig, EmitterStats};
+use walshadow::ch_emitter::{EmitterConfig, EmitterStats, InstanceConfig};
 use walshadow::codecs::NumericKind;
 use walshadow::heap_decoder::{ColumnValue, CommittedTuple, DecodedHeap, DecodedTuple, HeapOp};
 use walshadow::mapping::{ColumnMapping, TableMapping, TableTarget};
@@ -80,10 +80,13 @@ async fn native_numeric_time_timetz_round_trip() {
     .expect("create dest table");
 
     let cfg = EmitterConfig {
-        host: "127.0.0.1".into(),
-        port: slot.ch_tcp,
-        database: "walshadow_test".into(),
-        compression: CompressionChoice::Lz4,
+        conn: InstanceConfig {
+            host: "127.0.0.1".into(),
+            port: slot.ch_tcp,
+            database: "walshadow_test".into(),
+            compression: CompressionChoice::Lz4,
+            ..Default::default()
+        },
         ..Default::default()
     };
 

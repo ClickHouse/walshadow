@@ -622,7 +622,7 @@ impl ClickHouseChunkStore {
     fn toast_table(&self, toast_relid: u32) -> String {
         format!(
             "{}.{}",
-            quote_ident(&self.dest.current().database),
+            quote_ident(&self.dest.current().conn.database),
             quote_ident(&format!("pg_toast_{toast_relid}"))
         )
     }
@@ -1399,6 +1399,7 @@ mod tests {
     }
 
     use super::*;
+    use crate::emit::ch_emitter::InstanceConfig;
 
     fn row(value_id: u32, seq: u32, tid: (u32, u16), lsn: u64, body: &[u8]) -> ToastRow {
         ToastRow {
@@ -2124,7 +2125,10 @@ mod tests {
     #[test]
     fn ch_store_renders_toast_schema_and_sql() {
         let cfg = EmitterConfig {
-            database: "wh".into(),
+            conn: InstanceConfig {
+                database: "wh".into(),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let store = ClickHouseChunkStore::new(fixed(cfg));

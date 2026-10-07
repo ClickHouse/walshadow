@@ -11,7 +11,7 @@ use std::time::Duration;
 use tokio::sync::{Mutex, watch};
 use walshadow::backfill_staging::{self, StagingRel, StagingSession};
 use walshadow::backfill_types::BackupRequest;
-use walshadow::ch_emitter::{EmitterConfig, EmitterStats};
+use walshadow::ch_emitter::{EmitterConfig, EmitterStats, InstanceConfig};
 use walshadow::copy_backfill::CopyBackfiller;
 use walshadow::desc_log::{BatchRecord, DescLogIdentity, DescriptorLog, LogEntry, LogValue};
 use walshadow::mapping::{ColumnMapping, MappingHandle, TableMapping, TableTarget, mapping_handle};
@@ -77,7 +77,10 @@ impl Fixture {
             fx::ChServer::spawn(tempfile::tempdir().unwrap(), ports.ch_tcp, ports.ch_http).unwrap();
         fx::create_ch_dest_table(&ch, "default", "t").unwrap();
         let emitter = EmitterConfig {
-            port: ports.ch_tcp,
+            conn: InstanceConfig {
+                port: ports.ch_tcp,
+                ..Default::default()
+            },
             inserter_pool_size: 4,
             byte_budget: 1 << 20,
             row_budget: 1,
@@ -222,6 +225,66 @@ async fn wait_done(backfiller: &CopyBackfiller, dir: &Path) {
     assert_eq!(entry["swapped"].as_bool(), Some(false));
     assert!(entry.get("staging_uuid").is_none());
     assert_eq!(backfiller.pending_by_mode(), [0, 0, 0]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn staging_follows_named_instance() {
+    if !fx::tools::requirements_available() {
+        return;
+    }
+    let mut fixture = Fixture::new().await;
+    let ports = fx::Ports::alloc();
+    let remote =
+        fx::ChServer::spawn(tempfile::tempdir().unwrap(), ports.ch_tcp, ports.ch_http).unwrap();
+    fx::create_ch_dest_table(&remote, "default", "t").unwrap();
+    fixture.emitter.instances.insert(
+        "archive".into(),
+        walshadow::ch_emitter::InstanceConfig {
+            host: "127.0.0.1".into(),
+            port: ports.ch_tcp,
+            database: "history".into(),
+            ..Default::default()
+        },
+    );
+    fixture
+        .mapping
+        .mutate(|map| {
+            Arc::make_mut(map)
+                .get_mut(&fixture.desc.rel_name)
+                .unwrap()
+                .target
+                .instance = Some("archive".into());
+        })
+        .await;
+    let rel = fixture.prepare_staging().await;
+    assert_eq!(rel.target.instance.as_deref(), Some("archive"));
+    assert_eq!(remote.query("EXISTS DATABASE history").unwrap(), "1");
+    assert_eq!(
+        fixture.ch.query("EXISTS TABLE default.t__wsstg").unwrap(),
+        "0"
+    );
+    remote
+        .query("INSERT INTO default.t__wsstg (id, name, _lsn) VALUES (7, 'live', 101)")
+        .unwrap();
+    let mut session = StagingSession::connect(walshadow::config::DestEmitter::new(
+        Arc::new(fixture.emitter.clone()),
+        None,
+    ))
+    .await
+    .unwrap();
+    session.copy_back(&rel).await.unwrap();
+    assert_eq!(
+        remote
+            .query("SELECT id, name FROM default.t FINAL")
+            .unwrap(),
+        "7\tlive"
+    );
+    assert_eq!(
+        fixture.ch.query("SELECT count() FROM default.t").unwrap(),
+        "0"
+    );
+    session.drop_staging(&rel).await.unwrap();
+    assert_eq!(remote.query("EXISTS TABLE default.t__wsstg").unwrap(), "0");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

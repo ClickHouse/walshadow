@@ -81,7 +81,7 @@ pub async fn run(opts: InitOpts) -> Result<()> {
     let ch = crate::dsn::ch_table(&ch_url)?;
     let ch_cfg = EmitterConfig::from_table(&wrap("ch", ch.clone()))
         .map_err(|e| anyhow::anyhow!("[ch] {e}"))?;
-    println!("\ndestination {}:{}", ch_cfg.host, ch_cfg.port);
+    println!("\ndestination {}:{}", ch_cfg.conn.host, ch_cfg.conn.port);
     let created_db = crate::ch_ddl::ensure_boot_database(&ch_cfg)
         .await
         .context("connect ClickHouse")?;
@@ -96,7 +96,7 @@ pub async fn run(opts: InitOpts) -> Result<()> {
         );
     }
     if created_db {
-        println!("  ✓ created database {}", ch_cfg.database);
+        println!("  ✓ created database {}", ch_cfg.conn.database);
     }
 
     let listed = introspect::tables(&client, opts.namespace.as_deref())
@@ -563,8 +563,8 @@ mod tests {
         assert_eq!(conn.port, 5433);
         assert_eq!(conn.dbname, "app");
         let ch = EmitterConfig::from_table(&doc).unwrap();
-        assert_eq!(ch.host, "ch");
-        assert_eq!(ch.port, 9440);
-        assert!(ch.secure);
+        assert_eq!(ch.conn.host, "ch");
+        assert_eq!(ch.conn.port, 9440);
+        assert!(ch.conn.secure);
     }
 }
