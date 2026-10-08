@@ -405,7 +405,7 @@ impl WalReplaySink {
                     // Barrier reads rows from current rewrite
                     self.flush_rows().await?;
                     self.resolver
-                        .rewrite_barrier(toast_relid, marker_lsn, commit_lsn)
+                        .rewrite_barrier(self.log.db_oid(), toast_relid, marker_lsn, commit_lsn)
                         .await
                         .map_err(|e| SinkError::Other(format!("toast rewrite barrier: {e}")))?;
                 }
@@ -774,11 +774,17 @@ mod tests {
 
         // Referrer bound is the walk's `start_lsn`, above the page version
         assert_eq!(
-            store.fetch(rel.oid, 7, 0x6800, 10).await.unwrap(),
+            store
+                .fetch(rel.rfn.db_node, rel.oid, 7, 0x6800, 10)
+                .await
+                .unwrap(),
             FetchedValue::Assembled(b"firstthird".to_vec()),
         );
         assert_eq!(
-            store.fetch(rel.oid, 8, 0x6800, 4).await.unwrap(),
+            store
+                .fetch(rel.rfn.db_node, rel.oid, 8, 0x6800, 4)
+                .await
+                .unwrap(),
             FetchedValue::Assembled(b"only".to_vec()),
         );
     }
@@ -811,7 +817,10 @@ mod tests {
         assert_eq!(stats.toast_chunk_puts.load(Ordering::Relaxed), 1);
         for value_id in [7, 8] {
             assert_eq!(
-                store.fetch(rel.oid, value_id, 0x6800, 4).await.unwrap(),
+                store
+                    .fetch(rel.rfn.db_node, rel.oid, value_id, 0x6800, 4)
+                    .await
+                    .unwrap(),
                 FetchedValue::Assembled(b"body".to_vec()),
             );
         }

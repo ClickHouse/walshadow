@@ -4,7 +4,7 @@
 //! no-store policy (put no-op, fetch_into false, fill-on-miss).
 //!
 //! The ClickHouse chunk-store backend additionally runs against a real
-//! ClickHouse: TID-keyed rows mirror `pg_toast_<relid>` relations, `put`
+//! ClickHouse: store rows by TID in `pg_toast_<dboid>_<relid>` mirrors. `put`
 //! writes chunk births + delete tombstones, `fetch` resolves per-TID as-of
 //! state at the referring LSN into the reassembler's `(seq -> bytes)` map.
 //! Pins the v2 schema (`ReplacingMergeTree(_lsn, _is_deleted)` ordered by
@@ -35,9 +35,11 @@ fn assembled(body: &[u8]) -> FetchedValue {
 }
 
 const DB: &str = "walshadow_toast_test";
+const SRC_DB: u32 = 16384;
 
 fn row(relid: u32, value_id: u32, seq: u32, tid: (u32, u16), lsn: u64, body: &[u8]) -> ToastRow {
     ToastRow {
+        db_oid: SRC_DB,
         toast_relid: relid,
         blkno: tid.0,
         offnum: tid.1,
@@ -50,6 +52,7 @@ fn row(relid: u32, value_id: u32, seq: u32, tid: (u32, u16), lsn: u64, body: &[u
 
 fn tomb(relid: u32, tid: (u32, u16), lsn: u64) -> ToastRow {
     ToastRow::tombstone(&ToastDelete {
+        db_oid: SRC_DB,
         toast_relid: relid,
         blkno: tid.0,
         offnum: tid.1,
@@ -90,7 +93,7 @@ async fn drive_store_backed(resolver: &ToastResolver, stats: &EmitterStats) {
     // Pre-window re-emit: the in-xact buffer missed these chunks, so the
     // reassembler rehydrates the value from the store.
     let got = resolver
-        .fetch_value(0, 16700, 42, u64::MAX, 11)
+        .fetch_value(SRC_DB, 16700, 42, u64::MAX, 11)
         .await
         .unwrap();
     assert_eq!(got, Some(assembled(b"hello world")));
@@ -98,7 +101,7 @@ async fn drive_store_backed(resolver: &ToastResolver, stats: &EmitterStats) {
 
     // Genuine miss -> Missing (caller fills + counts).
     let miss = resolver
-        .fetch_value(0, 16700, 404, u64::MAX, 11)
+        .fetch_value(SRC_DB, 16700, 404, u64::MAX, 11)
         .await
         .unwrap();
     assert_eq!(miss, Some(FetchedValue::Missing));
@@ -137,7 +140,7 @@ async fn concurrent_first_puts_create_mirrors_without_retries() {
             result.unwrap();
         }
         assert_eq!(
-            store.fetch(relid, 7, u64::MAX, 8).await.unwrap(),
+            store.fetch(SRC_DB, relid, 7, u64::MAX, 8).await.unwrap(),
             assembled(b"abababab")
         );
     }
@@ -174,7 +177,7 @@ async fn ch_chunk_store_put_fetch_roundtrip() {
     // (the design's superseded-fill case). Freeze the mirror — targeted, and
     // only once the first put created it: a global STOP MERGES doesn't cover
     // tables created after it. Re-enabled before the merge stage.
-    ch.query(&format!("SYSTEM STOP MERGES {DB}.pg_toast_16500"))
+    ch.query(&format!("SYSTEM STOP MERGES {DB}.pg_toast_{SRC_DB}_16500"))
         .expect("stop merges");
     store
         .put(&[row(16500, 7, 2, (1, 3), 0x1002, b"\x00\xff\x01")])
@@ -192,38 +195,41 @@ async fn ch_chunk_store_put_fetch_roundtrip() {
 
     // Reassembly-shaped fetch: dense seqs assembled in order, raw-byte
     // transparent.
-    let got = store.fetch(16500, 7, u64::MAX, 8).await.unwrap();
+    let got = store.fetch(SRC_DB, 16500, 7, u64::MAX, 8).await.unwrap();
     assert_eq!(got, assembled(b"abcde\x00\xff\x01"));
 
     assert_eq!(
-        store.fetch(16500, 9, u64::MAX, 2).await.unwrap(),
+        store.fetch(SRC_DB, 16500, 9, u64::MAX, 2).await.unwrap(),
         assembled(b"zz")
     );
     assert_eq!(
-        store.fetch(16600, 3, u64::MAX, 3).await.unwrap(),
+        store.fetch(SRC_DB, 16600, 3, u64::MAX, 3).await.unwrap(),
         assembled(b"xyz")
     );
 
     // Bound below every row -> no generation visible yet.
     assert_eq!(
-        store.fetch(16500, 7, 0x0fff, 8).await.unwrap(),
+        store.fetch(SRC_DB, 16500, 7, 0x0fff, 8).await.unwrap(),
         FetchedValue::Missing
     );
     // Table exists, no such value_id -> Missing (caller decides fill vs error).
     assert_eq!(
-        store.fetch(16500, 999, u64::MAX, 1).await.unwrap(),
+        store.fetch(SRC_DB, 16500, 999, u64::MAX, 1).await.unwrap(),
         FetchedValue::Missing
     );
     // Relation never received a chunk -> no CH table -> hard error, fast
     // (no retry): mirror absence is never proof of supersession.
     assert!(matches!(
-        store.fetch(70000, 1, u64::MAX, 1).await,
-        Err(ChunkStoreError::MissingMirror(70000))
+        store.fetch(SRC_DB, 70000, 1, u64::MAX, 1).await,
+        Err(ChunkStoreError::MissingMirror {
+            db_oid: SRC_DB,
+            toast_relid: 70000
+        })
     ));
 
     // Rows really landed on CH, in the mirrored table.
     assert_eq!(
-        ch.query(&format!("SELECT count() FROM {DB}.pg_toast_16500"))
+        ch.query(&format!("SELECT count() FROM {DB}.pg_toast_{SRC_DB}_16500"))
             .unwrap(),
         "4"
     );
@@ -234,8 +240,10 @@ async fn ch_chunk_store_put_fetch_roundtrip() {
         .await
         .unwrap();
     assert_eq!(
-        ch.query(&format!("SELECT count() FROM {DB}.pg_toast_16500 FINAL"))
-            .unwrap(),
+        ch.query(&format!(
+            "SELECT count() FROM {DB}.pg_toast_{SRC_DB}_16500 FINAL"
+        ))
+        .unwrap(),
         "4",
         "re-emit dedups under (TID, _lsn)"
     );
@@ -243,12 +251,12 @@ async fn ch_chunk_store_put_fetch_roundtrip() {
     // Death of value 9: a tombstone at its TID. Visible history is as-of.
     store.put(&[tomb(16500, (3, 1), 0x1800)]).await.unwrap();
     assert_eq!(
-        store.fetch(16500, 9, 0x17FF, 2).await.unwrap(),
+        store.fetch(SRC_DB, 16500, 9, 0x17FF, 2).await.unwrap(),
         assembled(b"zz"),
         "referrer before the death still resolves"
     );
     assert_eq!(
-        store.fetch(16500, 9, u64::MAX, 2).await.unwrap(),
+        store.fetch(SRC_DB, 16500, 9, u64::MAX, 2).await.unwrap(),
         FetchedValue::Missing,
         "dead past its tombstone"
     );
@@ -260,15 +268,15 @@ async fn ch_chunk_store_put_fetch_roundtrip() {
         .await
         .unwrap();
     assert_eq!(
-        store.fetch(16500, 13, u64::MAX, 6).await.unwrap(),
+        store.fetch(SRC_DB, 16500, 13, u64::MAX, 6).await.unwrap(),
         assembled(b"reborn")
     );
     assert_eq!(
-        store.fetch(16500, 9, u64::MAX, 2).await.unwrap(),
+        store.fetch(SRC_DB, 16500, 9, u64::MAX, 2).await.unwrap(),
         FetchedValue::Missing
     );
     assert_eq!(
-        store.fetch(16500, 9, 0x17FF, 2).await.unwrap(),
+        store.fetch(SRC_DB, 16500, 9, 0x17FF, 2).await.unwrap(),
         assembled(b"zz")
     );
 
@@ -293,26 +301,28 @@ async fn ch_chunk_store_put_fetch_roundtrip() {
         ])
         .await
         .unwrap();
-    let old = store.fetch(16500, 11, 0x3400, 12).await.unwrap();
+    let old = store.fetch(SRC_DB, 16500, 11, 0x3400, 12).await.unwrap();
     assert_eq!(
         old,
         assembled(b"g1-0g1-1g1-2"),
         "older referrer keeps first generation"
     );
     // Dead generation's seq 2 dropped: only g2 assembles at head
-    let regen = store.fetch(16500, 11, u64::MAX, 8).await.unwrap();
+    let regen = store.fetch(SRC_DB, 16500, 11, u64::MAX, 8).await.unwrap();
     assert_eq!(regen, assembled(b"g2-0g2-1"));
 
     // Merge is the reclaimer: OPTIMIZE FINAL collapses superseded versions
     // per TID (dead chunk_data reclaimed, tombstones retained), and fetch
     // stays correct over the merged parts.
-    ch.query(&format!("SYSTEM START MERGES {DB}.pg_toast_16500"))
+    ch.query(&format!("SYSTEM START MERGES {DB}.pg_toast_{SRC_DB}_16500"))
         .expect("start merges");
-    ch.query(&format!("OPTIMIZE TABLE {DB}.pg_toast_16500 FINAL"))
-        .unwrap();
+    ch.query(&format!(
+        "OPTIMIZE TABLE {DB}.pg_toast_{SRC_DB}_16500 FINAL"
+    ))
+    .unwrap();
     assert_eq!(
         ch.query(&format!(
-            "SELECT count() FROM {DB}.pg_toast_16500 WHERE chunk_id = 11 AND _is_deleted = 0"
+            "SELECT count() FROM {DB}.pg_toast_{SRC_DB}_16500 WHERE chunk_id = 11 AND _is_deleted = 0"
         ))
         .unwrap(),
         "2",
@@ -320,45 +330,48 @@ async fn ch_chunk_store_put_fetch_roundtrip() {
     );
     assert_eq!(
         ch.query(&format!(
-            "SELECT count() FROM {DB}.pg_toast_16500 WHERE chunk_id = 9"
+            "SELECT count() FROM {DB}.pg_toast_{SRC_DB}_16500 WHERE chunk_id = 9"
         ))
         .unwrap(),
         "0",
         "tombstoned value's data row merged away"
     );
     assert_eq!(
-        store.fetch(16500, 11, u64::MAX, 8).await.unwrap(),
+        store.fetch(SRC_DB, 16500, 11, u64::MAX, 8).await.unwrap(),
         assembled(b"g2-0g2-1"),
         "fetch over merged parts"
     );
     // Collapsed history: the lagging bound now misses — the documented
     // superseded-fill case, Missing not error.
     assert_eq!(
-        store.fetch(16500, 11, 0x3400, 12).await.unwrap(),
+        store.fetch(SRC_DB, 16500, 11, 0x3400, 12).await.unwrap(),
         FetchedValue::Missing
     );
     assert_eq!(
-        store.fetch(16500, 9, 0x17FF, 2).await.unwrap(),
+        store.fetch(SRC_DB, 16500, 9, 0x17FF, 2).await.unwrap(),
         FetchedValue::Missing
     );
 
     // Mirror wipe (owner TRUNCATE / retired toast rel): rows gone, table
     // kept — fetch turns Missing (superseded fill), never MissingMirror.
-    store.truncate_mirror(16600).await.unwrap();
+    store.truncate_mirror(SRC_DB, 16600).await.unwrap();
     assert_eq!(
-        store.fetch(16600, 3, u64::MAX, 3).await.unwrap(),
+        store.fetch(SRC_DB, 16600, 3, u64::MAX, 3).await.unwrap(),
         FetchedValue::Missing
     );
     assert_eq!(
-        ch.query(&format!("SELECT count() FROM {DB}.pg_toast_16600"))
+        ch.query(&format!("SELECT count() FROM {DB}.pg_toast_{SRC_DB}_16600"))
             .unwrap(),
         "0"
     );
     // Never-created mirror stays missing (TRUNCATE ... IF EXISTS no-op).
-    store.truncate_mirror(70000).await.unwrap();
+    store.truncate_mirror(SRC_DB, 70000).await.unwrap();
     assert!(matches!(
-        store.fetch(70000, 1, u64::MAX, 1).await,
-        Err(ChunkStoreError::MissingMirror(70000))
+        store.fetch(SRC_DB, 70000, 1, u64::MAX, 1).await,
+        Err(ChunkStoreError::MissingMirror {
+            db_oid: SRC_DB,
+            toast_relid: 70000
+        })
     ));
     // Post-wipe births repopulate the kept table.
     store
@@ -366,7 +379,7 @@ async fn ch_chunk_store_put_fetch_roundtrip() {
         .await
         .unwrap();
     assert_eq!(
-        store.fetch(16600, 5, u64::MAX, 9).await.unwrap(),
+        store.fetch(SRC_DB, 16600, 5, u64::MAX, 9).await.unwrap(),
         assembled(b"post-wipe")
     );
 
@@ -391,14 +404,17 @@ async fn ch_chunk_store_put_fetch_roundtrip() {
     }
     let expected: Vec<u8> = (0..n).map(|i| b'a' + (i % 26) as u8).collect();
     assert_eq!(
-        store.fetch(16500, 21, u64::MAX, n as usize).await.unwrap(),
+        store
+            .fetch(SRC_DB, 16500, 21, u64::MAX, n as usize)
+            .await
+            .unwrap(),
         FetchedValue::Assembled(expected),
         "value assembled across block boundaries"
     );
     // Wrong pointer size against the same run: deviation fills, not errors
     assert_eq!(
         store
-            .fetch(16500, 21, u64::MAX, n as usize + 1)
+            .fetch(SRC_DB, 16500, 21, u64::MAX, n as usize + 1)
             .await
             .unwrap(),
         FetchedValue::Mismatch { got: n as usize }
@@ -444,7 +460,7 @@ async fn ch_chunk_store_fetch_many_aligns_and_splits() {
     store.put(&rows).await.unwrap();
     // Value 5 dies and a later value is born at its TID. Freeze merges so
     // the pre-death bound still has history to read
-    ch.query(&format!("SYSTEM STOP MERGES {DB}.pg_toast_16900"))
+    ch.query(&format!("SYSTEM STOP MERGES {DB}.pg_toast_{SRC_DB}_16900"))
         .expect("stop merges");
     store.put(&[tomb(16900, (0, 6), 0x2000)]).await.unwrap();
     store
@@ -464,7 +480,10 @@ async fn ch_chunk_store_fetch_many_aligns_and_splits() {
         (7, 9),
     ];
     assert_eq!(
-        store.fetch_many(16900, &want, u64::MAX).await.unwrap(),
+        store
+            .fetch_many(SRC_DB, 16900, &want, u64::MAX)
+            .await
+            .unwrap(),
         vec![
             assembled(b"v200"),
             assembled(b"v1"),
@@ -479,19 +498,25 @@ async fn ch_chunk_store_fetch_many_aligns_and_splits() {
     // not yet born
     assert_eq!(
         store
-            .fetch_many(16900, &[(5, 2), (301, 6)], 0x1fff)
+            .fetch_many(SRC_DB, 16900, &[(5, 2), (301, 6)], 0x1fff)
             .await
             .unwrap(),
         vec![assembled(b"v5"), FetchedValue::Missing],
     );
     // Never-populated mirror stays a hard error through the batch path
     assert!(matches!(
-        store.fetch_many(70000, &[(1, 1)], u64::MAX).await,
-        Err(ChunkStoreError::MissingMirror(70000))
+        store.fetch_many(SRC_DB, 70000, &[(1, 1)], u64::MAX).await,
+        Err(ChunkStoreError::MissingMirror {
+            db_oid: SRC_DB,
+            toast_relid: 70000
+        })
     ));
 
     let all: Vec<(u32, usize)> = (1..=200).map(|id| (id, body(id).len())).collect();
-    let got = store.fetch_many(16900, &all, u64::MAX).await.unwrap();
+    let got = store
+        .fetch_many(SRC_DB, 16900, &all, u64::MAX)
+        .await
+        .unwrap();
     for (&(id, _), got) in all.iter().zip(got) {
         let expected = match id {
             5 => FetchedValue::Missing,
@@ -533,7 +558,7 @@ async fn ch_chunk_store_rewrite_barrier_residuals() {
         ])
         .await
         .unwrap();
-    ch.query(&format!("SYSTEM STOP MERGES {DB}.pg_toast_16800"))
+    ch.query(&format!("SYSTEM STOP MERGES {DB}.pg_toast_{SRC_DB}_16800"))
         .expect("stop merges");
     store.put(&[tomb(16800, (0, 3), 0x1500)]).await.unwrap();
     // Rewrite generation reuses (0,1) for value 7's single chunk.
@@ -541,50 +566,193 @@ async fn ch_chunk_store_rewrite_barrier_residuals() {
         .put(&[row(16800, 7, 0, (0, 1), 0x3000, b"a2")])
         .await
         .unwrap();
-    store.rewrite_barrier(16800, 0x2000, 0x4000).await.unwrap();
+    store
+        .rewrite_barrier(SRC_DB, 16800, 0x2000, 0x4000)
+        .await
+        .unwrap();
 
     // Residuals: (0,2) and (1,1) die at the commit LSN; reused (0,1) and
     // pre-marker-dead (0,3) untouched.
     assert_eq!(
         ch.query(&format!(
             "SELECT groupArray((blkno, offnum)) FROM (\
-               SELECT blkno, offnum FROM {DB}.pg_toast_16800 \
+               SELECT blkno, offnum FROM {DB}.pg_toast_{SRC_DB}_16800 \
                WHERE _lsn = 16384 AND _is_deleted = 1 ORDER BY blkno, offnum)"
         ))
         .unwrap(),
         "[(0,2),(1,1)]"
     );
     assert_eq!(
-        store.fetch(16800, 7, u64::MAX, 2).await.unwrap(),
+        store.fetch(SRC_DB, 16800, 7, u64::MAX, 2).await.unwrap(),
         assembled(b"a2"),
         "reused TID survives at its birth version"
     );
     assert_eq!(
-        store.fetch(16800, 11, u64::MAX, 1).await.unwrap(),
+        store.fetch(SRC_DB, 16800, 11, u64::MAX, 1).await.unwrap(),
         FetchedValue::Missing
     );
     // Pre-rewrite window intact: no destructive step ran.
     assert_eq!(
-        store.fetch(16800, 7, 0x1fff, 2).await.unwrap(),
+        store.fetch(SRC_DB, 16800, 7, 0x1fff, 2).await.unwrap(),
         assembled(b"ab")
     );
     assert_eq!(
-        store.fetch(16800, 9, 0x14ff, 1).await.unwrap(),
+        store.fetch(SRC_DB, 16800, 9, 0x14ff, 1).await.unwrap(),
         assembled(b"c")
     );
 
     // Replay re-run: prior residuals sit past the marker, nothing inserts.
-    store.rewrite_barrier(16800, 0x2000, 0x4000).await.unwrap();
+    store
+        .rewrite_barrier(SRC_DB, 16800, 0x2000, 0x4000)
+        .await
+        .unwrap();
     assert_eq!(
         ch.query(&format!(
-            "SELECT count() FROM {DB}.pg_toast_16800 WHERE _lsn = 16384"
+            "SELECT count() FROM {DB}.pg_toast_{SRC_DB}_16800 WHERE _lsn = 16384"
         ))
         .unwrap(),
         "2",
         "barrier re-run must insert nothing"
     );
     // Never-populated mirror: no table, nothing lived, no-op.
-    store.rewrite_barrier(70000, 0x10, 0x20).await.unwrap();
+    store
+        .rewrite_barrier(SRC_DB, 70000, 0x10, 0x20)
+        .await
+        .unwrap();
+}
+
+/// Keep mirrors separate when source databases reuse relation OIDs, value IDs, and TIDs
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ch_chunk_store_isolates_source_databases() {
+    if !fx::tools::clickhouse_available() {
+        return;
+    }
+    let slot = fx::Ports::alloc();
+    let ch_tmp = tempfile::tempdir().unwrap();
+    let ch = fx::ChServer::spawn(ch_tmp, slot.ch_tcp, slot.ch_http).expect("spawn ch");
+    ch.query(&format!("CREATE DATABASE IF NOT EXISTS {DB}"))
+        .expect("create db");
+    let store = ClickHouseChunkStore::new(walshadow::config::DestEmitter::new(
+        std::sync::Arc::new(config(ch.port)),
+        None,
+    ));
+    const OTHER_DB: u32 = SRC_DB + 1;
+    let other = |r: ToastRow| ToastRow {
+        db_oid: OTHER_DB,
+        ..r
+    };
+    store
+        .put(&[
+            row(16500, 7, 0, (1, 1), 0x1000, b"first"),
+            other(row(16500, 7, 0, (1, 1), 0x1000, b"other")),
+            other(row(16500, 8, 0, (1, 2), 0x1000, b"tail")),
+        ])
+        .await
+        .unwrap();
+    assert_eq!(
+        ch.query(&format!(
+            "SELECT groupArray(name) FROM (SELECT name FROM system.tables \
+             WHERE database = '{DB}' ORDER BY name)"
+        ))
+        .unwrap(),
+        format!(
+            "['{}','{}']",
+            walshadow::toast::mirror_table_name(SRC_DB, 16500),
+            walshadow::toast::mirror_table_name(OTHER_DB, 16500)
+        )
+    );
+    for (db_oid, body) in [(SRC_DB, &b"first"[..]), (OTHER_DB, b"other")] {
+        assert_eq!(
+            store.fetch(db_oid, 16500, 7, u64::MAX, 5).await.unwrap(),
+            assembled(body)
+        );
+    }
+    // Catch cross-database reads: SRC_DB's barrier would delete OTHER_DB's (1,2)
+    store
+        .rewrite_barrier(SRC_DB, 16500, 0x2000, 0x3000)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.fetch(OTHER_DB, 16500, 8, u64::MAX, 4).await.unwrap(),
+        assembled(b"tail")
+    );
+    store.truncate_mirror(OTHER_DB, 16500).await.unwrap();
+    assert_eq!(
+        store.fetch(OTHER_DB, 16500, 7, u64::MAX, 5).await.unwrap(),
+        FetchedValue::Missing
+    );
+    assert_eq!(
+        store.fetch(SRC_DB, 16500, 7, 0x2fff, 5).await.unwrap(),
+        assembled(b"first")
+    );
+}
+
+/// Rename older mirrors when following one database; reject ambiguous ownership
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn legacy_mirrors_rename_to_sole_database() {
+    if !fx::tools::clickhouse_available() {
+        return;
+    }
+    let slot = fx::Ports::alloc();
+    let ch_tmp = tempfile::tempdir().unwrap();
+    let ch = fx::ChServer::spawn(ch_tmp, slot.ch_tcp, slot.ch_http).expect("spawn ch");
+    ch.query(&format!("CREATE DATABASE IF NOT EXISTS {DB}"))
+        .expect("create db");
+    let cfg = config(ch.port);
+    let store = ClickHouseChunkStore::new(walshadow::config::DestEmitter::new(
+        std::sync::Arc::new(cfg.clone()),
+        None,
+    ));
+    store
+        .put(&[
+            row(16500, 7, 0, (1, 1), 0x1000, b"seven"),
+            row(16600, 8, 0, (1, 1), 0x1000, b"eight"),
+        ])
+        .await
+        .unwrap();
+    for relid in [16500, 16600] {
+        ch.query(&format!(
+            "RENAME TABLE {DB}.pg_toast_{SRC_DB}_{relid} TO {DB}.pg_toast_{relid}"
+        ))
+        .unwrap();
+    }
+    let err = walshadow::toast::adopt_legacy_mirrors(&cfg, None)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("pg_toast_16500, pg_toast_16600"), "{err}");
+
+    assert_eq!(
+        walshadow::toast::adopt_legacy_mirrors(&cfg, Some(SRC_DB))
+            .await
+            .unwrap(),
+        2
+    );
+    let fresh = ClickHouseChunkStore::new(walshadow::config::DestEmitter::new(
+        std::sync::Arc::new(cfg.clone()),
+        None,
+    ));
+    assert_eq!(
+        fresh.fetch(SRC_DB, 16500, 7, u64::MAX, 5).await.unwrap(),
+        assembled(b"seven")
+    );
+    assert_eq!(
+        walshadow::toast::adopt_legacy_mirrors(&cfg, Some(SRC_DB))
+            .await
+            .unwrap(),
+        0,
+        "rerun finds nothing to rename"
+    );
+
+    ch.query(&format!(
+        "CREATE TABLE {DB}.pg_toast_16500 AS {DB}.pg_toast_{SRC_DB}_16500"
+    ))
+    .unwrap();
+    let err = walshadow::toast::adopt_legacy_mirrors(&cfg, Some(SRC_DB))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("already exists"), "{err}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -625,7 +793,7 @@ async fn disabled_resolver_no_store_fills_on_miss() {
     // No store to hydrate from: None even for a just-put value.
     assert!(
         resolver
-            .fetch_value(0, 16700, 42, u64::MAX, 5)
+            .fetch_value(SRC_DB, 16700, 42, u64::MAX, 5)
             .await
             .unwrap()
             .is_none()

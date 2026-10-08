@@ -7,7 +7,7 @@
 //!
 //! - every live external value reaches ClickHouse byte-identical
 //! - dead and aborted generations still do not
-//! - `toast_chunk_puts` is zero and no `pg_toast_*` table appears in CH
+//! - `toast_chunk_puts` is zero and no `pg_toast_*` mirror appears in CH
 //! - page-walk rows use deferred lookup
 //! - shadow starts during bootstrap and replays to `end_lsn`
 //!
@@ -241,7 +241,13 @@ async fn bootstrap_renders_external_values_out_of_shadow() {
                 "SELECT reltoastrelid FROM pg_class WHERE oid = '{schema}.t'::regclass"
             ))
             .context("source toast relid")?;
-        let mirror = format!("pg_toast_{}", toast_relid.trim());
+        let db_oid = source
+            .psql_one("SELECT oid FROM pg_database WHERE datname = current_database()")
+            .context("source database oid")?;
+        let mirror = walshadow::toast::mirror_table_name(
+            db_oid.trim().parse()?,
+            toast_relid.trim().parse()?,
+        );
         let created = ch
             .query(&format!(
                 "SELECT count() FROM system.tables \
@@ -264,9 +270,6 @@ async fn bootstrap_renders_external_values_out_of_shadow() {
 
         // Shadow scans the landed heap through its index, so both files must
         // sit in its data directory
-        let db_oid = source
-            .psql_one("SELECT oid FROM pg_database WHERE datname = current_database()")
-            .context("source database oid")?;
         let toast_relid = toast_relid.trim();
         for (what, sql) in [
             (

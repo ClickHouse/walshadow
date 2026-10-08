@@ -245,6 +245,7 @@ impl RawRecord {
 /// `(toast_relid, value_id)`, concatenates by `chunk_seq` at drain.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ToastChunk {
+    pub db_oid: u32,
     pub toast_relid: u32,
     pub value_id: u32,
     /// 0-based, PG writes sequentially
@@ -261,6 +262,7 @@ pub struct ToastChunk {
 /// Deleted TOAST tuple TID, one tombstone per chunk
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ToastDelete {
+    pub db_oid: u32,
     pub toast_relid: u32,
     pub blkno: u32,
     pub offnum: u16,
@@ -282,10 +284,11 @@ pub const SPILL_MAGIC: [u8; 2] = *b"WS";
 /// v2 added `HeapOp::Truncate` body encoding. v3 added chunk TIDs and
 /// `ToastDelete` entries. v4 added `TAG_RAW` stashed records. v5 added
 /// the `TAG_DESCRIPTOR` dictionary (Heap bodies reference descriptors by dict
-/// id). v6 added writer xid to heap + raw bodies. `DrainEntry` events
+/// id). v6 added writer xid to heap + raw bodies. v7 added database OID to
+/// chunk and `ToastDelete` bodies. `DrainEntry` events
 /// (Catalog, ToastBarrier, Config/Signal) are drain-time, never spilled,
 /// so they don't touch this format
-pub const SPILL_VERSION: u16 = 6;
+pub const SPILL_VERSION: u16 = 7;
 
 /// Wire tags, one block per tag space so encode and decode read off the same
 /// table. Renumbering is a body-encoding change: bump [`SPILL_VERSION`]
@@ -1077,7 +1080,8 @@ pub(crate) fn encode_value(out: &mut Vec<u8>, v: &ColumnValue) {
 }
 
 fn encode_chunk_into(out: &mut Vec<u8>, c: &ToastChunk) {
-    out.reserve(40 + c.chunk_data.len());
+    out.reserve(44 + c.chunk_data.len());
+    push_u32(out, c.db_oid);
     push_u32(out, c.toast_relid);
     push_u32(out, c.value_id);
     push_u32(out, c.chunk_seq);
@@ -1088,6 +1092,7 @@ fn encode_chunk_into(out: &mut Vec<u8>, c: &ToastChunk) {
 }
 
 fn encode_toast_delete_into(out: &mut Vec<u8>, d: &ToastDelete) {
+    push_u32(out, d.db_oid);
     push_u32(out, d.toast_relid);
     push_u32(out, d.blkno);
     push_u16(out, d.offnum);
@@ -1339,6 +1344,7 @@ pub(crate) fn decode_value(c: &mut Cursor) -> Result<ColumnValue> {
 }
 
 fn decode_chunk(c: &mut Cursor) -> Result<ToastChunk> {
+    let db_oid = c.u32()?;
     let toast_relid = c.u32()?;
     let value_id = c.u32()?;
     let chunk_seq = c.u32()?;
@@ -1347,6 +1353,7 @@ fn decode_chunk(c: &mut Cursor) -> Result<ToastChunk> {
     let offnum = c.u16()?;
     let chunk_data = bytes::Bytes::from(c.bytes()?);
     Ok(ToastChunk {
+        db_oid,
         toast_relid,
         value_id,
         chunk_seq,
@@ -1359,6 +1366,7 @@ fn decode_chunk(c: &mut Cursor) -> Result<ToastChunk> {
 
 fn decode_toast_delete(c: &mut Cursor) -> Result<ToastDelete> {
     Ok(ToastDelete {
+        db_oid: c.u32()?,
         toast_relid: c.u32()?,
         blkno: c.u32()?,
         offnum: c.u16()?,
@@ -1476,6 +1484,7 @@ mod tests {
 
     fn sample_chunk(value_id: u32, seq: u32, lsn: u64, body: &[u8]) -> ToastChunk {
         ToastChunk {
+            db_oid: 0,
             toast_relid: 16400,
             value_id,
             chunk_seq: seq,
@@ -1582,6 +1591,7 @@ mod tests {
         let store = SpillStore::new(tmp.path().to_path_buf()).unwrap();
         let mut w = store.writer(7, 0x100).await.unwrap();
         let d = ToastDelete {
+            db_oid: 0,
             toast_relid: 16400,
             blkno: 3,
             offnum: 9,

@@ -182,13 +182,16 @@ async fn replident_full_unchanged_toast_update() {
 
     // Chunk mirror landed in CH under the source's toast relid with the v2
     // store-created schema: TID key + tombstone column.
-    let toast_relid = source
-        .psql_one("SELECT reltoastrelid FROM pg_class WHERE oid = 'public.doc'::regclass")
-        .expect("source toast relid");
+    let mirror = source
+        .psql_one(
+            "SELECT 'pg_toast_' || d.oid || '_' || c.reltoastrelid FROM pg_class c, pg_database d \
+             WHERE c.oid = 'public.doc'::regclass AND d.datname = current_database()",
+        )
+        .expect("source toast mirror");
     assert_eq!(
         ch.query(&format!(
             "SELECT groupArray(name) FROM system.columns \
-             WHERE database = 'walshadow_test' AND table = 'pg_toast_{toast_relid}'"
+             WHERE database = 'walshadow_test' AND table = '{mirror}'"
         ))
         .expect("mirror columns"),
         "['blkno','offnum','chunk_id','chunk_seq','chunk_data','_lsn','_is_deleted']"

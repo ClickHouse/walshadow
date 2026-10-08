@@ -19,11 +19,10 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
-use clickhouse_c::{Block, Event};
 
 use crate::backfill::backfill_types::BackupRequest;
 use crate::backfill::copy_backfill::SwapPermit;
-use crate::ch::{ChConn, EmitterError, exec_drain, quote_ident, with_timeout};
+use crate::ch::{ChConn, EmitterError, exec_drain, query_strings, quote_ident};
 use crate::config::DestEmitter;
 use crate::mapping::{MappingHandle, TableMapping, TableTarget};
 use crate::schema::RelName;
@@ -204,31 +203,9 @@ impl StagingSession {
     /// Single-column String SELECT, one attempt under the timeout.
     pub(crate) async fn query_strings(&mut self, sql: &str) -> Result<Vec<String>> {
         let timeout = self.client.config().insert_timeout;
-        let client = self
-            .client
-            .ready()
+        async { query_strings(self.client.ready().await?, sql, timeout).await }
             .await
-            .map_err(|e| anyhow::anyhow!("backfill_staging: {sql}: {e}"))?;
-        with_timeout(timeout, async {
-            client.send_query(sql, None).await?;
-            let mut out = Vec::new();
-            loop {
-                match client.recv_event().await? {
-                    Event::Data(block) => read_string_column(&block, &mut out)?,
-                    Event::EndOfStream => break,
-                    Event::Exception(exc) => {
-                        return Err(EmitterError::ServerException {
-                            code: exc.code(),
-                            message: String::from_utf8_lossy(exc.display_text()).into_owned(),
-                        });
-                    }
-                    _ => {}
-                }
-            }
-            Ok::<_, EmitterError>(out)
-        })
-        .await
-        .map_err(|e| anyhow::anyhow!("backfill_staging: {sql}: {e}"))
+            .map_err(|e| anyhow::anyhow!("backfill_staging: {sql}: {e}"))
     }
 
     pub async fn rebuild_staging(&mut self, rel: &StagingRel) -> Result<()> {
@@ -335,27 +312,6 @@ impl StagingSession {
         ))
         .await
     }
-}
-
-/// Append one Data block's single String column into `out`; the 0-row
-/// header block contributes nothing.
-fn read_string_column(block: &Block, out: &mut Vec<String>) -> Result<(), EmitterError> {
-    let n = block.n_rows();
-    if n == 0 {
-        return Ok(());
-    }
-    let col = block
-        .column(0)
-        .ok_or_else(|| EmitterError::Type("backfill_staging: missing result column".into()))?;
-    let (offsets, data) = col
-        .string()
-        .ok_or_else(|| EmitterError::Type("backfill_staging: result column not String".into()))?;
-    for i in 0..n {
-        let start = if i == 0 { 0 } else { offsets[i - 1] as usize };
-        let end = offsets[i] as usize;
-        out.push(String::from_utf8_lossy(&data[start..end]).into_owned());
-    }
-    Ok(())
 }
 
 /// CH single-quoted string literal.

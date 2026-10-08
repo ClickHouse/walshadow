@@ -195,6 +195,37 @@ pub(crate) async fn run_session(
         source_databases.len(),
         walshadow::bridge::MAX_BRIDGE_DATABASES,
     );
+    // Assign older TOAST mirrors and retire entries to sole followed database
+    // TODO(0.2.0): remove with adopt_legacy_mirrors and legacy ledger load
+    let legacy_owner: Option<u32> = if source_databases.len() == 1 {
+        let row = feed
+            .sql_client()
+            .await?
+            .query_one(
+                "SELECT oid::oid FROM pg_database WHERE datname = current_database()",
+                &[],
+            )
+            .await
+            .context("source database oid")?;
+        Some(row.get(0))
+    } else {
+        None
+    };
+    if let Some(cfg) = ch_config
+        .as_ref()
+        .filter(|c| c.toast.mode == walshadow::ch_emitter::ToastMode::Clickhouse)
+    {
+        let renamed = walshadow::toast::adopt_legacy_mirrors(cfg, legacy_owner)
+            .await
+            .context("rename TOAST mirrors")?;
+        if renamed > 0 {
+            tracing::info!(
+                target: "walshadow",
+                renamed,
+                "renamed TOAST mirrors to include source database oid",
+            );
+        }
+    }
     let bootstrap_plan = resolve_bootstrap(args, ch_config.as_ref())?;
     let shadow_start = resolve_shadow_start(args, bootstrap_plan.mode)?;
     if ch_config.as_ref().is_some_and(|c| c.toast.mode.is_shadow())
@@ -924,10 +955,13 @@ pub(crate) async fn run_session(
     // replay their drop, so the post-spawn flush below is their only route
     // to the wipe. Loaded in metrics-only runs too (inert without a chunk
     // store), preserved for a later CH run over the same spill dir.
-    let retires =
-        walshadow::toast_retire::RetireLedger::load(&args.spill_dir, live_identity.system_id)
-            .await
-            .context("load toast retire ledger")?;
+    let retires = walshadow::toast_retire::RetireLedger::load(
+        &args.spill_dir,
+        live_identity.system_id,
+        legacy_owner,
+    )
+    .await
+    .context("load toast retire ledger")?;
     // Pending tables a bootstrap or backup pass left holding undecided rows.
     // Settling needs ClickHouse, so a metrics-only run leaves the ledger for
     // a later CH run over the same spill dir

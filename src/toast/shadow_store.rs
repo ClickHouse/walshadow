@@ -188,6 +188,7 @@ impl ChunkStore for ShadowToastStore {
     /// record, so reaching this position makes value available
     async fn fetch_many(
         &self,
+        _db_oid: u32,
         toast_relid: u32,
         values: &[(u32, usize)],
         max_lsn: u64,

@@ -3080,6 +3080,7 @@ impl RecordSink for BufferingDecoderSink {
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             buf.on_toast_delete(
                                 crate::xact::spill::ToastDelete {
+                                    db_oid: rel.rfn.db_node,
                                     toast_relid: rel.oid,
                                     blkno,
                                     offnum,
@@ -3217,6 +3218,7 @@ fn decode_stashed_toast(
             HeapOp::Delete => {
                 if let Some((blkno, offnum)) = tid {
                     out.push(StashedToastOp::Delete(ToastDelete {
+                        db_oid: rel.rfn.db_node,
                         toast_relid: rel.oid,
                         blkno,
                         offnum,
@@ -3270,6 +3272,7 @@ fn decode_image_insert(
         return Ok(Vec::new());
     };
     Ok(vec![StashedToastOp::Chunk(ToastChunk {
+        db_oid: rel.rfn.db_node,
         toast_relid: rel.oid,
         value_id,
         chunk_seq,
@@ -3298,6 +3301,7 @@ fn toast_chunk_from_decoded(
         crate::decode::heap_decoder::take_toast_chunk_columns(&mut d.new.as_mut()?.columns)?;
     let (blkno, offnum) = tid.unwrap_or((0, 0));
     Some(ToastChunk {
+        db_oid: rel.rfn.db_node,
         toast_relid: rel.oid,
         value_id,
         chunk_seq,
@@ -4424,6 +4428,7 @@ mod tests {
         let store = Arc::new(MemChunkStore::new());
         store
             .put(&[ToastRow {
+                db_oid: 0,
                 toast_relid: 16500,
                 blkno: 1,
                 offnum: 1,
@@ -4483,6 +4488,7 @@ mod tests {
         use crate::toast::{ChunkStore, MemChunkStore, ToastRow};
         let store = Arc::new(MemChunkStore::new());
         let row = |chunk_id: u32, blkno: u32| ToastRow {
+            db_oid: 0,
             toast_relid: 16500,
             blkno,
             offnum: 1,
@@ -4652,6 +4658,7 @@ mod tests {
 
     fn chunk(value_id: u32, seq: u32, lsn: u64, body: &[u8]) -> ToastChunk {
         ToastChunk {
+            db_oid: 0,
             toast_relid: 16400,
             value_id,
             chunk_seq: seq,
@@ -5522,6 +5529,7 @@ mod tests {
         b.on_heap(heap_with_value(9, 110, 16)).await.unwrap();
         b.on_toast_delete(
             crate::xact::spill::ToastDelete {
+                db_oid: 0,
                 toast_relid: 16400,
                 blkno: 7,
                 offnum: 3,
