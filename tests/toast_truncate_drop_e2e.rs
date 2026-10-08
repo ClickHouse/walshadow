@@ -108,10 +108,13 @@ async fn cold_restart_drop_retires_mirror() {
     let ch = fx::ChServer::spawn(ch_tmp, slot.ch_tcp, slot.ch_http).expect("spawn ch");
     create_doc_dest(&ch);
 
-    let toast_relid = source
-        .psql_one("SELECT reltoastrelid FROM pg_class WHERE oid = 'public.doc'::regclass")
-        .expect("source toast relid");
-    let chunk_table = format!("walshadow_test.pg_toast_{toast_relid}");
+    let mirror = source
+        .psql_one(
+            "SELECT 'pg_toast_' || d.oid || '_' || c.reltoastrelid FROM pg_class c, pg_database d \
+             WHERE c.oid = 'public.doc'::regclass AND d.datname = current_database()",
+        )
+        .expect("source toast mirror");
+    let chunk_table = format!("walshadow_test.{mirror}");
 
     // Run 1: populate the mirror, then drain and drop the whole pipeline —
     // the daemon-restart stand-in (catalog and chunk caches rebuilt from
@@ -216,7 +219,7 @@ async fn cold_restart_drop_retires_mirror() {
     assert_eq!(
         ch.query(&format!(
             "SELECT count() FROM system.tables \
-             WHERE database = 'walshadow_test' AND name = 'pg_toast_{toast_relid}'"
+             WHERE database = 'walshadow_test' AND name = '{mirror}'"
         ))
         .expect("mirror existence"),
         "1",
@@ -268,10 +271,13 @@ async fn drop_crash_replay_keeps_referrer_bytes() {
     let ch = fx::ChServer::spawn(ch_tmp, slot.ch_tcp, slot.ch_http).expect("spawn ch");
     create_doc_dest(&ch);
 
-    let toast_relid = source
-        .psql_one("SELECT reltoastrelid FROM pg_class WHERE oid = 'public.doc'::regclass")
-        .expect("source toast relid");
-    let chunk_table = format!("walshadow_test.pg_toast_{toast_relid}");
+    let mirror = source
+        .psql_one(
+            "SELECT 'pg_toast_' || d.oid || '_' || c.reltoastrelid FROM pg_class c, pg_database d \
+             WHERE c.oid = 'public.doc'::regclass AND d.datname = current_database()",
+        )
+        .expect("source toast mirror");
+    let chunk_table = format!("walshadow_test.{mirror}");
     // Dest keys on (id, _lsn): both row versions persist as history. The
     // invariant is bodies stay full-length — a replayed fill would surface
     // as a NULL body at v2's `_lsn`.
@@ -432,10 +438,13 @@ async fn drop_retire_survives_restart_from_ledger() {
     let ch = fx::ChServer::spawn(ch_tmp, slot.ch_tcp, slot.ch_http).expect("spawn ch");
     create_doc_dest(&ch);
 
-    let toast_relid = source
-        .psql_one("SELECT reltoastrelid FROM pg_class WHERE oid = 'public.doc'::regclass")
-        .expect("source toast relid");
-    let chunk_table = format!("walshadow_test.pg_toast_{toast_relid}");
+    let mirror = source
+        .psql_one(
+            "SELECT 'pg_toast_' || d.oid || '_' || c.reltoastrelid FROM pg_class c, pg_database d \
+             WHERE c.oid = 'public.doc'::regclass AND d.datname = current_database()",
+        )
+        .expect("source toast mirror");
+    let chunk_table = format!("walshadow_test.{mirror}");
     let spill_dir = tmp.path().join("spill");
 
     let build = |state, app_name| {
@@ -503,7 +512,7 @@ async fn drop_retire_survives_restart_from_ledger() {
     pipeline.shutdown().await.expect("first pipeline drains");
     assert_eq!(stats.toast_mirror_retires.load(Ordering::Relaxed), 0);
     assert_eq!(
-        walshadow::toast_retire::RetireLedger::load(&spill_dir, system_id)
+        walshadow::toast_retire::RetireLedger::load(&spill_dir, system_id, None)
             .await
             .expect("read ledger")
             .entries()
@@ -523,7 +532,7 @@ async fn drop_retire_survives_restart_from_ledger() {
     assert_eq!(
         ch.query(&format!(
             "SELECT count() FROM system.tables \
-             WHERE database = 'walshadow_test' AND name = 'pg_toast_{toast_relid}'"
+             WHERE database = 'walshadow_test' AND name = '{mirror}'"
         ))
         .expect("mirror existence"),
         "1",
@@ -534,7 +543,7 @@ async fn drop_retire_survives_restart_from_ledger() {
         1
     );
     assert!(
-        walshadow::toast_retire::RetireLedger::load(&spill_dir, system_id)
+        walshadow::toast_retire::RetireLedger::load(&spill_dir, system_id, None)
             .await
             .expect("read ledger")
             .is_empty(),

@@ -653,6 +653,7 @@ pub async fn copy_toast_into(
         let chunk_data = bytes::Bytes::copy_from_slice(field(3)?);
         batch_bytes += chunk_data.len();
         batch.push(ToastRow {
+            db_oid: desc.rfn.db_node,
             toast_relid,
             blkno: u32::from_be_bytes(tid[..4].try_into().expect("4 bytes")),
             offnum: u16::from_be_bytes(tid[4..].try_into().expect("2 bytes")),

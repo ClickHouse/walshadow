@@ -56,7 +56,7 @@ use crate::pos::{Floor, Monotone, Pos};
 use crate::runtime_config::{ConfigEvent, TableRow};
 use crate::source_db::{SourceDb, SourceDbs};
 use crate::toast::ToastResolver;
-use crate::toast::toast_retire::RetireLedger;
+use crate::toast::toast_retire::{RetireEntry, RetireLedger};
 use tokio_postgres::types::Oid;
 
 /// One followed database's ClickHouse-side state. Every transaction writes
@@ -552,7 +552,11 @@ impl ReorderSink {
             && self.resolver.stores_chunks()
         {
             self.retires
-                .push(*oid, Pos::new(commit_lsn))
+                .push(RetireEntry {
+                    db_oid: db,
+                    toast_relid: *oid,
+                    commit_lsn: Pos::new(commit_lsn),
+                })
                 .await
                 .map_err(|e| SinkError::Other(format!("toast retire ledger: {e}")))?;
         }
@@ -601,13 +605,13 @@ impl ReorderSink {
             return Ok(());
         }
         let cut = self.resume_floor.get();
-        for (oid, commit_lsn) in self.retires.due(cut) {
+        for entry in self.retires.due(cut) {
             self.resolver
-                .retire_mirror(oid)
+                .retire_mirror(entry.db_oid, entry.toast_relid)
                 .await
                 .map_err(|e| SinkError::Other(format!("toast mirror retire: {e}")))?;
             self.retires
-                .remove(oid, commit_lsn)
+                .remove(entry)
                 .await
                 .map_err(|e| SinkError::Other(format!("toast retire ledger: {e}")))?;
         }
@@ -693,12 +697,13 @@ impl ReorderSink {
     /// already flushed its births
     async fn apply_toast_barrier(
         &mut self,
+        db: Oid,
         toast_relid: u32,
         marker_lsn: u64,
         commit_lsn: u64,
     ) -> Result<(), SinkError> {
         self.resolver
-            .rewrite_barrier(toast_relid, marker_lsn, commit_lsn)
+            .rewrite_barrier(db, toast_relid, marker_lsn, commit_lsn)
             .await
             .map_err(|e| SinkError::Other(format!("toast rewrite barrier: {e}")))
     }
@@ -717,7 +722,7 @@ impl ReorderSink {
                 toast_relid,
                 marker_lsn,
             } => {
-                self.apply_toast_barrier(*toast_relid, *marker_lsn, commit_lsn)
+                self.apply_toast_barrier(db, *toast_relid, *marker_lsn, commit_lsn)
                     .await
             }
         }
@@ -743,7 +748,7 @@ impl ReorderSink {
         // the descriptor carries the owner's toast oid
         if self.resolver.stores_chunks() && rel.toast_oid != 0 {
             self.resolver
-                .truncate_mirror(rel.toast_oid)
+                .truncate_mirror(rel.rfn.db_node, rel.toast_oid)
                 .await
                 .map_err(|e| SinkError::Other(format!("toast mirror truncate: {e}")))?;
         }

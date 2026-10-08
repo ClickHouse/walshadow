@@ -158,10 +158,10 @@ async fn dead_and_aborted_external_values_stay_out_of_ch() {
         );
 
         // Every live row deferred, so its chunks are in the mirror
-        let toast_relid = source
-            .psql_one("SELECT reltoastrelid FROM pg_class WHERE oid = 's19.t'::regclass")
-            .context("source toast relid")?;
-        let mirror = format!("pg_toast_{toast_relid}");
+        let mirror = source
+            .psql_one("SELECT 'pg_toast_' || d.oid || '_' || c.reltoastrelid FROM pg_class c, pg_database d \
+             WHERE c.oid = 's19.t'::regclass AND d.datname = current_database()")
+            .context("source toast mirror")?;
         let created = ch
             .query(&format!(
                 "SELECT count() FROM system.tables \

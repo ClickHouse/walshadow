@@ -229,7 +229,7 @@ pub async fn drain(
             }
 
             if catalog.is_toast(rfn.db_node, rfn.rel_node) {
-                if let Some(row) = row_from_columns(tuple, rel.oid) {
+                if let Some(row) = row_from_columns(tuple, rfn.db_node, rel.oid) {
                     chunk_batch_bytes += row.chunk_data.len();
                     chunk_batch.push(row);
                     if resolver.put_limit_reached(chunk_batch.len(), chunk_batch_bytes) {
@@ -862,11 +862,12 @@ async fn flush_chunks(resolver: &ToastResolver, batch: &mut Vec<ToastRow>) -> Re
 }
 
 /// Convert PostgreSQL TOAST tuple shape into mirror row
-fn row_from_columns(mut tuple: BackfillTuple, toast_relid: u32) -> Option<ToastRow> {
+fn row_from_columns(mut tuple: BackfillTuple, db_oid: u32, toast_relid: u32) -> Option<ToastRow> {
     let (chunk_id, chunk_seq, chunk_data) =
         crate::decode::heap_decoder::take_toast_chunk_columns(&mut tuple.columns)?;
     debug_assert_ne!(tuple.offnum, 0, "walked toast tuple without TID");
     Some(ToastRow {
+        db_oid,
         toast_relid,
         blkno: tuple.blkno,
         offnum: tuple.offnum,
@@ -960,6 +961,7 @@ mod tests {
         impl ChunkStore for ReadOnly {
             async fn fetch_many(
                 &self,
+                _: u32,
                 _: u32,
                 values: &[(u32, usize)],
                 _: u64,
@@ -1846,6 +1848,7 @@ mod tests {
             async fn fetch_many(
                 &self,
                 _: u32,
+                _: u32,
                 values: &[(u32, usize)],
                 _: u64,
             ) -> Result<Vec<FetchedValue>, ChunkStoreError> {
@@ -1964,7 +1967,7 @@ mod tests {
             let store = Arc::new(MemChunkStore::new());
             let chunk = toast_chunk_tuple(16500, 1, 0, body);
             store
-                .put(&[row_from_columns(chunk, 16500).unwrap()])
+                .put(&[row_from_columns(chunk, db_oid, 16500).unwrap()])
                 .await
                 .unwrap();
             stores.push((db_oid, store as Arc<dyn ChunkStore>));

@@ -103,10 +103,13 @@ async fn vacuum_full_rewrite_and_same_xact_stash() {
     let ch = fx::ChServer::spawn(ch_tmp, slot.ch_tcp, slot.ch_http).expect("spawn ch");
     ch.query("CREATE DATABASE IF NOT EXISTS walshadow_test")
         .expect("create db");
-    let toast_relid = source
-        .psql_one("SELECT reltoastrelid FROM pg_class WHERE oid = 'public.doc'::regclass")
-        .expect("source toast relid");
-    let chunk_table = format!("walshadow_test.pg_toast_{toast_relid}");
+    let mirror = source
+        .psql_one(
+            "SELECT 'pg_toast_' || d.oid || '_' || c.reltoastrelid FROM pg_class c, pg_database d \
+             WHERE c.oid = 'public.doc'::regclass AND d.datname = current_database()",
+        )
+        .expect("source toast mirror");
+    let chunk_table = format!("walshadow_test.{mirror}");
     // Pre-create the mirror + freeze merges: the pre-rewrite as-of
     // assertions below need history intact, and a global STOP MERGES
     // doesn't cover tables created after it.
@@ -368,15 +371,15 @@ async fn vacuum_full_rewrite_and_same_xact_stash() {
     let shipped = fx::pump_segments(&mut pipeline, 1, Duration::from_secs(45)).await;
     let _ = driver.join();
     assert!(shipped >= 1, "create+insert segment never shipped");
-    let toast2 = source
-        .psql_one("SELECT reltoastrelid FROM pg_class WHERE oid = 'public.doc2'::regclass")
+    let mirror2 = source
+        .psql_one(
+            "SELECT 'pg_toast_' || d.oid || '_' || c.reltoastrelid FROM pg_class c, pg_database d \
+             WHERE c.oid = 'public.doc2'::regclass AND d.datname = current_database()",
+        )
         .expect("doc2 toast relid");
     fx::wait_query(
         &ch,
-        &live_sum_sql(
-            &format!("walshadow_test.pg_toast_{toast2}"),
-            "18446744073709551615",
-        ),
+        &live_sum_sql(&format!("walshadow_test.{mirror2}"), "18446744073709551615"),
         &format!("1\t{BODY_E_LEN}"),
         "same-xact CREATE + INSERT chunks never reached a fresh mirror",
     )
@@ -496,10 +499,13 @@ async fn alter_rewrite_link_swap_retires_old_mirror() {
     ch.query("CREATE DATABASE IF NOT EXISTS walshadow_test")
         .expect("create db");
 
-    let old_toast = source
-        .psql_one("SELECT reltoastrelid FROM pg_class WHERE oid = 'public.doc'::regclass")
+    let old_mirror = source
+        .psql_one(
+            "SELECT 'pg_toast_' || d.oid || '_' || c.reltoastrelid FROM pg_class c, pg_database d \
+             WHERE c.oid = 'public.doc'::regclass AND d.datname = current_database()",
+        )
         .expect("old toast relid");
-    let old_table = format!("walshadow_test.pg_toast_{old_toast}");
+    let old_table = format!("walshadow_test.{old_mirror}");
 
     // No dest mapping: main rows are unsupported-relation no-ops; the toast
     // mirror flows regardless. `ddl` arms the pg_class-delete sweep the
@@ -556,17 +562,20 @@ async fn alter_rewrite_link_swap_retires_old_mirror() {
     let _ = driver.join();
     assert!(shipped >= 1, "alter segment never shipped");
 
-    let new_toast = source
-        .psql_one("SELECT reltoastrelid FROM pg_class WHERE oid = 'public.doc'::regclass")
+    let new_mirror = source
+        .psql_one(
+            "SELECT 'pg_toast_' || d.oid || '_' || c.reltoastrelid FROM pg_class c, pg_database d \
+             WHERE c.oid = 'public.doc'::regclass AND d.datname = current_database()",
+        )
         .expect("new toast relid");
     assert_ne!(
-        old_toast, new_toast,
+        old_mirror, new_mirror,
         "link swap keeps the transient toast oid"
     );
     fx::wait_query(
         &ch,
         &live_sum_sql(
-            &format!("walshadow_test.pg_toast_{new_toast}"),
+            &format!("walshadow_test.{new_mirror}"),
             "18446744073709551615",
         ),
         &live_bc,
@@ -615,7 +624,7 @@ async fn alter_rewrite_link_swap_retires_old_mirror() {
     assert_eq!(
         ch.query(&format!(
             "SELECT count() FROM system.tables \
-             WHERE database = 'walshadow_test' AND name = 'pg_toast_{old_toast}'"
+             WHERE database = 'walshadow_test' AND name = '{old_mirror}'"
         ))
         .expect("old mirror existence"),
         "1",

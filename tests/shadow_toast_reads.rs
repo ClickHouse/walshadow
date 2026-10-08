@@ -610,7 +610,7 @@ async fn chunks_younger_than_the_ceiling_read_as_a_later_generation() {
     let earlier = store(before);
     assert_eq!(
         earlier
-            .fetch(v.toast_relid, reissued, 0, 10)
+            .fetch(0, v.toast_relid, reissued, 0, 10)
             .await
             .expect("fetch under the earlier ceiling"),
         FetchedValue::Generation,
@@ -618,7 +618,7 @@ async fn chunks_younger_than_the_ceiling_read_as_a_later_generation() {
     );
     assert_eq!(
         earlier
-            .fetch(v.toast_relid, reissued, 0, 9)
+            .fetch(0, v.toast_relid, reissued, 0, 9)
             .await
             .expect("fetch a torn replacement"),
         FetchedValue::Generation,
@@ -628,7 +628,7 @@ async fn chunks_younger_than_the_ceiling_read_as_a_later_generation() {
     let later = store(after);
     assert_eq!(
         later
-            .fetch(v.toast_relid, reissued, 0, 10)
+            .fetch(0, v.toast_relid, reissued, 0, 10)
             .await
             .expect("fetch under the later ceiling"),
         FetchedValue::Assembled(b"helloworld".to_vec()),
@@ -636,14 +636,14 @@ async fn chunks_younger_than_the_ceiling_read_as_a_later_generation() {
     );
     assert!(
         matches!(
-            later.fetch(v.toast_relid, reissued, 0, 9).await,
+            later.fetch(0, v.toast_relid, reissued, 0, 9).await,
             Ok(FetchedValue::Mismatch { got: 10 })
         ),
         "without detected reuse, wrong size remains a mismatch",
     );
     assert_eq!(
         later
-            .fetch(v.toast_relid, v.value_id, 0, v.extsize)
+            .fetch(0, v.toast_relid, v.value_id, 0, v.extsize)
             .await
             .expect("fetch the original"),
         FetchedValue::Assembled(v.raw.clone().into_bytes()),
@@ -925,28 +925,28 @@ async fn shadow_store_reads_and_refuses_writes() {
     let store = ShadowToastStore::new(bridge);
     assert_eq!(
         store
-            .fetch(v.toast_relid, v.value_id, 0, v.extsize)
+            .fetch(0, v.toast_relid, v.value_id, 0, v.extsize)
             .await
             .expect("fetch"),
         FetchedValue::Assembled(v.raw.clone().into_bytes()),
     );
     assert_eq!(
         store
-            .fetch(v.toast_relid, v.value_id.wrapping_add(7919), 0, 8)
+            .fetch(0, v.toast_relid, v.value_id.wrapping_add(7919), 0, 8)
             .await
             .expect("absent id"),
         FetchedValue::Missing,
     );
     assert!(matches!(
         store
-            .fetch(v.toast_relid, v.value_id, 0, v.extsize - 1)
+            .fetch(0, v.toast_relid, v.value_id, 0, v.extsize - 1)
             .await
             .expect("size disagreement"),
         FetchedValue::Mismatch { .. }
     ));
     assert!(
         store
-            .fetch_many(v.toast_relid, &[], 0)
+            .fetch_many(0, v.toast_relid, &[], 0)
             .await
             .unwrap()
             .is_empty()
@@ -954,11 +954,15 @@ async fn shadow_store_reads_and_refuses_writes() {
     // A relation shadow no longer has reads as superseded, the same as its
     // truncated chunks would
     assert_eq!(
-        store.fetch(999_999, 1, 0, 8).await.expect("gone relation"),
+        store
+            .fetch(0, 999_999, 1, 0, 8)
+            .await
+            .expect("gone relation"),
         FetchedValue::Missing,
     );
 
     let row = ToastRow {
+        db_oid: 0,
         toast_relid: v.toast_relid,
         blkno: 0,
         offnum: 1,
@@ -969,9 +973,9 @@ async fn shadow_store_reads_and_refuses_writes() {
     };
     for e in [
         store.put(&[row]).await.unwrap_err(),
-        store.truncate_mirror(v.toast_relid).await.unwrap_err(),
+        store.truncate_mirror(0, v.toast_relid).await.unwrap_err(),
         store
-            .rewrite_barrier(v.toast_relid, 1, 2)
+            .rewrite_barrier(0, v.toast_relid, 1, 2)
             .await
             .unwrap_err(),
     ] {
@@ -1094,7 +1098,7 @@ async fn store_readiness_distinguishes_primary_standby_and_unbound() {
         ShadowToastStore::late(unbound.clone()).with_replay_wait_max(Duration::from_millis(300));
     let started = Instant::now();
     let err = parked
-        .fetch(v.toast_relid, v.value_id, 0, v.extsize)
+        .fetch(0, v.toast_relid, v.value_id, 0, v.extsize)
         .await
         .expect_err("an unbound store cannot read");
     assert!(
@@ -1114,7 +1118,7 @@ async fn store_readiness_distinguishes_primary_standby_and_unbound() {
     );
     assert!(matches!(
         parked
-            .fetch(v.toast_relid, v.value_id, 0, v.extsize)
+            .fetch(0, v.toast_relid, v.value_id, 0, v.extsize)
             .await
             .expect("bound store reads"),
         FetchedValue::Assembled(_)
@@ -1125,7 +1129,7 @@ async fn store_readiness_distinguishes_primary_standby_and_unbound() {
     let started = Instant::now();
     assert!(matches!(
         parked
-            .fetch(v.toast_relid, v.value_id, u64::MAX, v.extsize)
+            .fetch(0, v.toast_relid, v.value_id, u64::MAX, v.extsize)
             .await
             .expect("a primary does not wait for replay"),
         FetchedValue::Assembled(_)
@@ -1145,14 +1149,14 @@ async fn store_readiness_distinguishes_primary_standby_and_unbound() {
         ShadowToastStore::new(Arc::new(sb_bridge)).with_replay_wait_max(Duration::from_millis(300));
     assert!(matches!(
         on_standby
-            .fetch(v.toast_relid, v.value_id, 0, v.extsize)
+            .fetch(0, v.toast_relid, v.value_id, 0, v.extsize)
             .await
             .expect("standby reads at its own position"),
         FetchedValue::Assembled(_)
     ));
     let started = Instant::now();
     let err = on_standby
-        .fetch(v.toast_relid, v.value_id, u64::MAX, v.extsize)
+        .fetch(0, v.toast_relid, v.value_id, u64::MAX, v.extsize)
         .await
         .expect_err("a standby must honour a floor it cannot reach");
     assert!(
@@ -1169,7 +1173,7 @@ async fn store_readiness_distinguishes_primary_standby_and_unbound() {
     let started = Instant::now();
     assert!(
         ShadowToastStore::late(LateBridge::default())
-            .fetch_many(v.toast_relid, &[], u64::MAX)
+            .fetch_many(0, v.toast_relid, &[], u64::MAX)
             .await
             .expect("empty batch short-circuits everything")
             .is_empty()

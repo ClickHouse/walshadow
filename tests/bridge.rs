@@ -1188,7 +1188,7 @@ async fn shadow_store_read_survives_worker_restart() {
     );
     let read = tokio::spawn({
         let store = store.clone();
-        async move { store.fetch_many(16500, &[(7, 4)], 0x2000).await }
+        async move { store.fetch_many(0, 16500, &[(7, 4)], 0x2000).await }
     });
 
     // Polls see 0x1000, then worker stops accepting connections
@@ -1214,7 +1214,7 @@ async fn shadow_store_read_survives_worker_restart() {
     worker.await.ok();
     let store = ShadowToastStore::new(bridge).with_replay_wait_max(Duration::from_millis(300));
     let err = store
-        .fetch_many(16500, &[(7, 4)], 0x4000)
+        .fetch_many(0, 16500, &[(7, 4)], 0x4000)
         .await
         .expect_err("no worker ever answers");
     assert!(err.to_string().contains("unreachable"), "{err}");

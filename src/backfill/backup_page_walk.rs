@@ -391,6 +391,7 @@ pub(crate) fn toast_rows_from_page(
             continue;
         };
         rows.push(crate::toast::ToastRow {
+            db_oid: rel.rfn.db_node,
             toast_relid: rel.oid,
             blkno,
             offnum,

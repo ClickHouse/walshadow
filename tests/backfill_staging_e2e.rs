@@ -737,8 +737,8 @@ async fn failed_backup_copy_fallback_seeds_chunk_mirror() {
         fx.ch
             .query(&format!(
                 "SELECT count(), sum(length(chunk_data)), min(_lsn), max(_lsn) \
-                 FROM default.pg_toast_{} FINAL",
-                fx.desc.toast_oid
+                 FROM default.{} FINAL",
+                walshadow::toast::mirror_table_name(fx.desc.rfn.db_node, fx.desc.toast_oid)
             ))
             .unwrap(),
         "5\t8000\t100\t100"

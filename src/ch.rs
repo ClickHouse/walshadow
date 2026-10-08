@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use backon::BackoffBuilder;
 use clickhouse_c::tls::rustls::pki_types::ServerName;
 use clickhouse_c::{
-    AsyncClient, BoxedAsyncClient, ClientOpts, Codec, Compression, ErrorKind, Event,
+    AsyncClient, Block, BoxedAsyncClient, ClientOpts, Codec, Compression, ErrorKind, Event,
 };
 use thiserror::Error;
 use tokio::net::TcpStream;
@@ -210,6 +210,53 @@ pub async fn exec_drain(
         Ok(())
     })
     .await
+}
+
+/// Single-column String SELECT, one attempt under `timeout`
+pub async fn query_strings(
+    client: &mut BoxedAsyncClient,
+    sql: &str,
+    timeout: Duration,
+) -> Result<Vec<String>, EmitterError> {
+    with_timeout(timeout, async {
+        client.send_query(sql, None).await?;
+        let mut out = Vec::new();
+        loop {
+            match client.recv_event().await? {
+                Event::Data(block) => read_string_column(&block, &mut out)?,
+                Event::EndOfStream => return Ok(out),
+                Event::Exception(exc) => {
+                    return Err(EmitterError::ServerException {
+                        code: exc.code(),
+                        message: String::from_utf8_lossy(exc.display_text()).into_owned(),
+                    });
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+}
+
+/// Append one Data block's single String column into `out`; the 0-row
+/// header block contributes nothing.
+fn read_string_column(block: &Block, out: &mut Vec<String>) -> Result<(), EmitterError> {
+    let n = block.n_rows();
+    if n == 0 {
+        return Ok(());
+    }
+    let col = block
+        .column(0)
+        .ok_or_else(|| EmitterError::Type("missing result column".into()))?;
+    let (offsets, data) = col
+        .string()
+        .ok_or_else(|| EmitterError::Type("result column not String".into()))?;
+    for i in 0..n {
+        let start = if i == 0 { 0 } else { offsets[i - 1] as usize };
+        let end = offsets[i] as usize;
+        out.push(String::from_utf8_lossy(&data[start..end]).into_owned());
+    }
+    Ok(())
 }
 
 /// Connect to `cfg.database`, first creating it over a session on `default`

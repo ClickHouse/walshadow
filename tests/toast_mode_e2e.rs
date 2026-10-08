@@ -80,13 +80,16 @@ fn dest_table(ch: &fx::ChServer) -> Vec<fx::TableMappingSpec> {
 fn assert_no_mirror(ch: &fx::ChServer, source: &walshadow::shadow::Shadow, stats: &EmitterStats) {
     assert_eq!(stats.toast_chunk_puts.load(Ordering::Relaxed), 0);
     assert_eq!(stats.toast_chunks_stored.load(Ordering::Relaxed), 0);
-    let toast_relid = source
-        .psql_one("SELECT reltoastrelid FROM pg_class WHERE oid = 'public.doc'::regclass")
-        .expect("source toast relid");
+    let mirror = source
+        .psql_one(
+            "SELECT 'pg_toast_' || d.oid || '_' || c.reltoastrelid FROM pg_class c, pg_database d \
+             WHERE c.oid = 'public.doc'::regclass AND d.datname = current_database()",
+        )
+        .expect("source toast mirror");
     assert_eq!(
         ch.query(&format!(
             "SELECT count() FROM system.tables \
-             WHERE database = 'walshadow_test' AND name = 'pg_toast_{toast_relid}'"
+             WHERE database = 'walshadow_test' AND name = '{mirror}'"
         ))
         .expect("mirror presence"),
         "0",

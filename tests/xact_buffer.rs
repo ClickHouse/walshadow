@@ -602,6 +602,7 @@ async fn detoast_concatenates_uncompressed_chunks_into_text() {
     for (seq, body) in [(0u32, &b"Hell"[..]), (1, b"o, "), (2, b"wor")] {
         b.on_toast_chunk(
             ToastChunk {
+                db_oid: 0,
                 toast_relid: toast_oid,
                 value_id: 55,
                 chunk_seq: seq,
@@ -668,6 +669,7 @@ async fn detoast_missing_chunk_seq_errors_clearly() {
     for (seq, body) in [(0u32, &b"AAA"[..]), (2, b"CCC")] {
         b.on_toast_chunk(
             ToastChunk {
+                db_oid: 0,
                 toast_relid: toast_oid,
                 value_id: 1,
                 chunk_seq: seq,

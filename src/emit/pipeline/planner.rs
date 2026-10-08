@@ -607,6 +607,7 @@ mod tests {
         for (seq, lsn) in [(0u32, 100u64), (1, 102)] {
             b.on_toast_chunk(
                 ToastChunk {
+                    db_oid: 0,
                     toast_relid: 16606,
                     value_id: 50,
                     chunk_seq: seq,
