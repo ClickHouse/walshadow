@@ -329,6 +329,54 @@ pub(crate) async fn run_session(
             owned
         }
     };
+    let stand_in = stand_in_primary(&owned.shadow, &source_conn.dbname).await;
+    let (owned, source_databases) = if let Some(name) = &stand_in {
+        let substituted: Vec<String> = source_databases
+            .iter()
+            .map(|db| {
+                if *db == source_conn.dbname {
+                    name.clone()
+                } else {
+                    db.clone()
+                }
+            })
+            .collect();
+        tracing::warn!(
+            target: "walshadow",
+            absent = source_conn.dbname.as_str(),
+            stand_in = name.as_str(),
+            "shadow holds no such database; following {} until replay creates it",
+            name,
+        );
+        owned
+            .shadow
+            .stop()
+            .context("stop shadow to restand its bridge")?;
+        let owned = OwnedShadow::new(
+            build_owned_shadow(
+                args,
+                name,
+                &substituted,
+                shadow_start.data_dir().to_path_buf(),
+                bridge_workers,
+            ),
+            args.keep_shadow_running,
+        );
+        owned
+            .shadow
+            .write_standby_signal()
+            .context("write standby.signal")?;
+        start_owned_shadow(
+            &owned.shadow,
+            None,
+            Duration::from_secs(args.bootstrap_shadow_replay_timeout),
+            args.keep_shadow_running,
+        )
+        .await?;
+        (owned, substituted)
+    } else {
+        (owned, source_databases)
+    };
     let shadow_lifecycle =
         ShadowLifecycle::spawn(owned, walsender_primary_conninfo(args.walsender_bind));
     let archive = ch_config
@@ -598,9 +646,12 @@ pub(crate) async fn run_session(
         .shadow_socket_dir
         .to_str()
         .context("shadow-socket-dir not UTF-8")?;
+    let primary_dbname = stand_in
+        .clone()
+        .unwrap_or_else(|| source_conn.dbname.clone());
     let primary_position = source_databases
         .iter()
-        .position(|db| *db == source_conn.dbname)
+        .position(|db| *db == primary_dbname)
         .unwrap_or(0);
     let link_for = |index: usize| -> Result<_> {
         let name = &source_databases[index];
@@ -632,13 +683,47 @@ pub(crate) async fn run_session(
         );
     }
     let mut pending_dbs: Vec<PendingDatabase> = Vec::new();
+    if stand_in.is_some() {
+        tokio::fs::write(args.spill_dir.join(ATTACH_MARKER), b"")
+            .await
+            .with_context(|| format!("mark {} as attaching", args.spill_dir.display()))?;
+        let source_sql = feed
+            .sql_client()
+            .await
+            .context("source sidecar sql for the absent database")?;
+        let visible_at = source_sql
+            .query_one("SELECT pg_current_wal_lsn()::text", &[])
+            .await
+            .context("source WAL position for the absent database")?;
+        let visible_at = walshadow::pg::parse_pg_lsn(visible_at.get::<_, &str>(0))
+            .context("parse source WAL position")?;
+        let oid = *list_databases(source_sql)
+            .await
+            .context("list source databases")?
+            .get(source_conn.dbname.as_str())
+            .with_context(|| {
+                format!(
+                    "database {} is configured but not on the source",
+                    source_conn.dbname
+                )
+            })?;
+        pending_dbs.push(PendingDatabase {
+            oid,
+            name: source_conn.dbname.clone(),
+            visible_at,
+            bridge_socket: walshadow::bridge::slot_path(
+                &bridge_path,
+                primary_position * bridge_workers.clamp(1, walshadow::bridge::MAX_BRIDGE_WORKERS),
+            ),
+        });
+    }
     if source_databases.len() > 1 {
         let shadow_dbs = list_databases(
             &open_shadow_sql_client(
                 &args.shadow_socket_dir,
                 args.shadow_port,
                 &args.shadow_user,
-                &source_conn.dbname,
+                &primary_dbname,
             )
             .await?,
         )
@@ -723,7 +808,7 @@ pub(crate) async fn run_session(
             .context("shadow-socket-dir not UTF-8")?,
         args.shadow_port,
         &args.shadow_user,
-        &source_conn.dbname,
+        &primary_dbname,
     );
     let bridge = db_conns[primary_index].bridge.clone();
     let primary_db_oid = db_conns[primary_index].oid;
@@ -740,7 +825,7 @@ pub(crate) async fn run_session(
             &args.shadow_socket_dir,
             args.shadow_port,
             &args.shadow_user,
-            &source_conn.dbname,
+            &primary_dbname,
         )
         .await?;
         let mut report = walshadow::preflight::run(walshadow::preflight::Inputs {
@@ -884,8 +969,8 @@ pub(crate) async fn run_session(
     // keeps the spill root so a single-database resume reads where it wrote
     let mut desc_logs: Vec<Arc<walshadow::desc_log::DescriptorLog>> =
         Vec::with_capacity(db_conns.len());
-    for (i, conn) in db_conns.iter().enumerate() {
-        let dir = if i == primary_index {
+    for conn in db_conns.iter() {
+        let dir = if conn.name == source_conn.dbname {
             args.spill_dir.clone()
         } else {
             let dir = args.spill_dir.join(format!("db-{}", conn.oid));
@@ -982,12 +1067,7 @@ pub(crate) async fn run_session(
         HashMap::new();
 
     let pcfg = if ch_config.is_some() {
-        // Cluster-wide knobs come off the primary's copy: every database
-        // parsed the same `[ch]`, `[memory]` and `[stream]` document
-        let mut emitter_cfg = db_conns[primary_index]
-            .emitter
-            .clone()
-            .expect("[ch] present");
+        let mut emitter_cfg = ch_config.clone().expect("[ch] present");
         let addr = format!("{}:{}", emitter_cfg.conn.host, emitter_cfg.conn.port);
         let stats = emitter_stats.clone();
         emitter_stats_handle = Some(stats.clone());
@@ -1006,7 +1086,7 @@ pub(crate) async fn run_session(
                 conn,
                 primary: i == primary_index,
                 desc_log: &desc_logs[i],
-                spill_dir: if i == primary_index {
+                spill_dir: if conn.name == source_conn.dbname {
                     args.spill_dir.clone()
                 } else {
                     args.spill_dir.join(format!("db-{}", conn.oid))
@@ -2356,6 +2436,21 @@ pub(crate) fn task_stopped(
         (None, Ok(())) => anyhow::anyhow!("{name} task exited"),
         (None, Err(e)) => anyhow::anyhow!("{name} task failed: {e}"),
     }
+}
+
+async fn stand_in_primary(shadow: &Arc<walshadow::shadow::Shadow>, absent: &str) -> Option<String> {
+    if probe_blocking(shadow, |s| s.has_database()).await != Some(false) {
+        return None;
+    }
+    let want = absent.to_owned();
+    probe_blocking(shadow, move |s| {
+        s.probe_one(
+            "SELECT datname FROM pg_database WHERE datallowconn AND NOT datistemplate \
+             ORDER BY datname = 'postgres' DESC, oid LIMIT 1",
+        )
+    })
+    .await
+    .filter(|name| !name.is_empty() && *name != want)
 }
 
 #[cfg(test)]
