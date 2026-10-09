@@ -47,7 +47,10 @@ export WALSHADOW_CH_URL='clickhouse://default:secret@ch.internal:9000/cdc'
 ```
 
 Use `clickhouses://` for ClickHouse Native over TLS. Default secure port is
-9440, default plaintext port is 9000
+9440, default plaintext port is 9000. When the host differs from the name on
+the server certificate, add `?tls_server_name=<name>` so the TLS handshake
+sends that name as SNI and verifies the certificate against it. The same
+setting is `tls_server_name` under `[ch]` in the config file
 
 Set `PG_MAJOR` to source PostgreSQL major. Physical bootstrap cannot cross
 major versions

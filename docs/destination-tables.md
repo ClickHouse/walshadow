@@ -187,10 +187,10 @@ By default, a tee uses its main destination's instance and database. Set
 use `archive`, and another copy of orders goes to `[ch]`
 
 Named connections accept `host`, `port`, `database`, `user`, `password`, `secure`,
-and `compression`, with the same defaults as `[ch]`. Credentials from `[ch]`
-are not reused for named connections. All destinations share pipeline limits,
-pool sizes, retry settings, and column layout. Reload TOML to
-update connection names and table mappings. `config_table` has no instance
+`tls_server_name`, and `compression`, with the same defaults as `[ch]`.
+Credentials from `[ch]` are not reused for named connections. All destinations
+share pipeline limits, pool sizes, retry settings, and column layout. Reload
+TOML to update connection names and table mappings. `config_table` has no instance
 column. `default` is reserved, and unknown names cause configuration errors
 
 Each destination receives rows, initial loads, schema changes, `TRUNCATE`, and
