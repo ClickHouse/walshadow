@@ -36,6 +36,12 @@ PG_CONFIG ?= pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)
 
+CLANG_FORMAT ?= clang-format-22
+
+.PHONY: format # Format .c and .h files to project standard in .clang-format.
+format: $(wildcard *.c *.h)
+	@$(CLANG_FORMAT) --style=file:.clang-format -i $^
+
 # PGXS tracks no header deps, and a stale object against a bumped
 # WS_PROTO_VERSION links a worker the daemon then refuses
 $(OBJS): walshadow.h
