@@ -362,12 +362,13 @@ pub(crate) fn page_max_offnum(page: &[u8]) -> u16 {
 
 /// Version every tuple on the page predates. In a restored image this is
 /// the version before the carrying record: PG assembles the image inside
-/// the critical section, `PageSetLSN` runs after `XLogInsert` returns
+/// the critical section, `PageSetLSN` runs after `XLogInsert` returns.
+/// `pd_lsn` is `PageXLogRecPtr`, high word (`xlogid`) first
 pub(crate) fn page_pd_lsn(page: &[u8]) -> u64 {
     if page.len() < SIZE_OF_PAGE_HEADER {
         return 0;
     }
-    u64::from_le_bytes(page[0..8].try_into().unwrap())
+    u64::from_le_bytes(page[0..8].try_into().unwrap()).rotate_left(32)
 }
 
 /// Chunk rows a TOAST page holds, TID-keyed and dated `lsn`
@@ -1015,7 +1016,7 @@ pub(crate) fn synth_toast_chunk_page(
     pd_lsn: u64,
 ) -> [u8; PAGE_BYTES] {
     let mut page = [0u8; PAGE_BYTES];
-    page[0..8].copy_from_slice(&pd_lsn.to_le_bytes());
+    page[0..8].copy_from_slice(&pd_lsn.rotate_left(32).to_le_bytes());
     let mut upper = PAGE_BYTES;
     for (i, (chunk_id, chunk_seq, body)) in chunks.iter().enumerate() {
         let len = 24 + 4 + 4 + 1 + body.len();
@@ -1229,6 +1230,15 @@ mod tests {
         assert!(out.is_empty());
         assert_eq!(tally.tuples_skipped_lp_flag, 1);
         assert_eq!(tally.tuples_emitted, 0);
+    }
+
+    /// Header bytes from a PG 18 heap page that `page_header()` reports as
+    /// lsn 13/1085150
+    #[test]
+    fn page_pd_lsn_reads_xlogid_then_xrecoff() {
+        let mut page = [0u8; PAGE_BYTES];
+        page[0..8].copy_from_slice(&[0x13, 0x00, 0x00, 0x00, 0x50, 0x51, 0x08, 0x01]);
+        assert_eq!(page_pd_lsn(&page), 0x13_0108_5150);
     }
 
     /// A restored image mirrors every chunk on the page, not only the tuple
