@@ -235,8 +235,7 @@ pub(crate) struct Args {
     /// Startup removes transient transaction spill only
     #[arg(long)]
     pub(crate) spill_dir: PathBuf,
-    /// In-memory xact buffer budget in bytes. Default matches PG's
-    /// `logical_decoding_work_mem` (64 MiB).
+    /// In-memory xact buffer budget in bytes, shared across open transactions
     #[arg(long, default_value_t = walshadow::xact_buffer::DEFAULT_XACT_BUFFER_MAX)]
     pub(crate) xact_buffer_max: usize,
     /// CH-Native emitter config (TOML). Set → drained tuples ship to
