@@ -72,9 +72,7 @@ pub(crate) const DEFAULT_ROW_BUDGET: usize = 4_194_304;
 pub(crate) const DEFAULT_BYTE_BUDGET: usize = 256 << 20; // 256 MiB
 
 /// Default commit-drain slice budgets
-/// ([`crate::xact::xact_buffer::CommittedDrain::next_batch`]). Bytes sized at
-/// half the default `xact_buffer_max`: a slice plus the one loading behind
-/// it stay within the ingest budget.
+/// ([`crate::xact::xact_buffer::CommittedDrain::next_batch`])
 pub(crate) const DEFAULT_DRAIN_BATCH_ROWS: usize = 65_536;
 pub(crate) const DEFAULT_DRAIN_BATCH_BYTES: usize = 32 << 20; // 32 MiB
 pub(crate) const DEFAULT_PLAN_DISK_MAX: u64 = 8 << 30; // 8 GiB

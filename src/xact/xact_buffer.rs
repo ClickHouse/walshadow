@@ -78,9 +78,8 @@ use ahash::{HashMap, HashMapExt};
 
 use std::pin::Pin;
 
-/// Matches PG `logical_decoding_work_mem` default 64 MiB
-/// (`src/backend/utils/misc/guc_tables.c`)
-pub const DEFAULT_XACT_BUFFER_MAX: usize = 64 * 1024 * 1024;
+/// Shared across every open xact, not per-xact
+pub const DEFAULT_XACT_BUFFER_MAX: usize = 512 * 1024 * 1024;
 
 /// Maps PG subxact xids to top-level xid, built from
 /// `XLOG_XACT_ASSIGNMENT` (info `0x50`) records.
