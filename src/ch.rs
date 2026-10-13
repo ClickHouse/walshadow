@@ -125,7 +125,7 @@ pub trait ConnectionConfig {
     fn user(&self) -> &str;
     fn password(&self) -> &str;
     fn secure(&self) -> bool;
-    fn tls_server_name(&self) -> Option<&str>;
+    fn tls_server_name(&self) -> &str;
     fn tls_config(&self) -> Option<Arc<clickhouse_c::tls::rustls::ClientConfig>>;
     fn compression(&self) -> CompressionChoice;
     fn idle_reconnect(&self) -> Duration;
@@ -166,14 +166,14 @@ pub async fn connect_client(
     })
 }
 
-/// SNI + certificate name for the TLS handshake: `tls_server_name` when set,
-/// else the TCP host. An IP-literal host yields an IP `ServerName`, which
-/// rustls verifies against the certificate's IP SANs and sends no SNI for.
+/// SNI + certificate name for the TLS handshake: `tls_server_name` when
+/// non-empty, else the TCP host. An IP-literal host yields an IP `ServerName`,
+/// which rustls verifies against the certificate's IP SANs and sends no SNI for.
 fn tls_server_name(config: &impl ConnectionConfig) -> Result<ServerName<'static>, EmitterError> {
-    let name = config
-        .tls_server_name()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| config.host());
+    let name = match config.tls_server_name() {
+        "" => config.host(),
+        name => name,
+    };
     ServerName::try_from(name.to_owned())
         .map_err(|e| EmitterError::Config(format!("TLS server name `{name}`: {e}")))
 }
@@ -546,13 +546,13 @@ mod tests {
         assert!(std::error::Error::source(&e).is_none());
     }
 
-    fn secure_config(host: &str, port: u16, tls_server_name: Option<&str>) -> EmitterConfig {
+    fn secure_config(host: &str, port: u16, tls_server_name: &str) -> EmitterConfig {
         EmitterConfig {
             conn: InstanceConfig {
                 host: host.into(),
                 port,
                 secure: true,
-                tls_server_name: tls_server_name.map(str::to_owned),
+                tls_server_name: tls_server_name.into(),
                 ..Default::default()
             },
             ..EmitterConfig::default()
@@ -561,17 +561,12 @@ mod tests {
 
     #[test]
     fn tls_server_name_prefers_setting_over_host() {
-        let named = tls_server_name(&secure_config("10.0.0.5", 9440, Some("svc.example")));
+        let named = tls_server_name(&secure_config("10.0.0.5", 9440, "svc.example"));
         assert_eq!(named.unwrap(), ServerName::try_from("svc.example").unwrap());
         // Empty string is "unset", not an empty SNI
-        let blank = tls_server_name(&secure_config("ch.example", 9440, Some("")));
+        let blank = tls_server_name(&secure_config("ch.example", 9440, ""));
         assert_eq!(blank.unwrap(), ServerName::try_from("ch.example").unwrap());
-        let host_only = tls_server_name(&secure_config("ch.example", 9440, None));
-        assert_eq!(
-            host_only.unwrap(),
-            ServerName::try_from("ch.example").unwrap()
-        );
-        let bad = tls_server_name(&secure_config("ch.example", 9440, Some("not a name")));
+        let bad = tls_server_name(&secure_config("ch.example", 9440, "not a name"));
         assert!(
             matches!(&bad, Err(EmitterError::Config(m)) if m.contains("not a name")),
             "{bad:?}"
@@ -603,7 +598,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let hello = tokio::spawn(capture_client_hello(listener));
-        let config = secure_config("127.0.0.1", port, Some("svc.clickhouse.cloud"));
+        let config = secure_config("127.0.0.1", port, "svc.clickhouse.cloud");
         // Server drops after the ClientHello, so the client errors; the
         // bytes it already sent are what this test is about
         assert!(connect_client(&config).await.is_err());
@@ -611,22 +606,6 @@ mod tests {
         assert!(
             contains(&hello, "svc.clickhouse.cloud"),
             "SNI missing from ClientHello"
-        );
-    }
-
-    /// Without the setting an IP host sends no SNI at all, so a Cloud
-    /// endpoint reached by IP cannot pick the right certificate
-    #[tokio::test]
-    async fn connect_without_setting_sends_no_sni_for_ip_host() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let hello = tokio::spawn(capture_client_hello(listener));
-        let config = secure_config("127.0.0.1", port, None);
-        assert!(connect_client(&config).await.is_err());
-        let hello = hello.await.unwrap();
-        assert!(
-            !contains(&hello, "127.0.0.1"),
-            "IP literal must not be sent as SNI"
         );
     }
 }

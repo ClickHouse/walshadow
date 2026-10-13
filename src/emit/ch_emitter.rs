@@ -602,8 +602,8 @@ impl ConnectionConfig for EmitterConfig {
         self.conn.secure
     }
 
-    fn tls_server_name(&self) -> Option<&str> {
-        self.conn.tls_server_name.as_deref()
+    fn tls_server_name(&self) -> &str {
+        &self.conn.tls_server_name
     }
 
     fn tls_config(&self) -> Option<Arc<clickhouse_c::tls::rustls::ClientConfig>> {
@@ -779,9 +779,9 @@ pub struct InstanceConfig {
     pub secure: bool,
     /// Name sent as TLS SNI and matched against the server certificate
     /// when `secure`. Lets `host` be an IP or another DNS name while the
-    /// handshake still names what the certificate was issued for. `None`
+    /// handshake still names what the certificate was issued for. Empty
     /// uses `host`.
-    pub tls_server_name: Option<String>,
+    pub tls_server_name: String,
     #[serde(deserialize_with = "crate::toml_de::de_parse")]
     pub compression: CompressionChoice,
 }
@@ -821,7 +821,7 @@ struct ChSection {
     user: String,
     password: String,
     secure: bool,
-    tls_server_name: Option<String>,
+    tls_server_name: String,
     #[serde(deserialize_with = "crate::toml_de::de_parse")]
     compression: CompressionChoice,
     row_budget: usize,
@@ -856,7 +856,7 @@ impl Default for ChSection {
             user: "default".into(),
             password: String::new(),
             secure: false,
-            tls_server_name: None,
+            tls_server_name: String::new(),
             compression: CompressionChoice::default(),
             row_budget: DEFAULT_ROW_BUDGET,
             byte_budget: DEFAULT_BYTE_BUDGET,
@@ -4294,15 +4294,12 @@ mod tests {
         assert_eq!(c.conn.user, "ingest");
         assert_eq!(c.conn.password, "secret");
         assert!(c.conn.secure);
-        assert_eq!(
-            c.conn.tls_server_name.as_deref(),
-            Some("svc.clickhouse.cloud")
-        );
+        assert_eq!(c.conn.tls_server_name, "svc.clickhouse.cloud");
         assert_eq!(c.conn.compression, CompressionChoice::Lz4);
         // Omitting `secure` defaults to plaintext, and SNI falls back to `host`
         let plain = EmitterConfig::from_toml_str("[ch]\nhost = \"h\"\n").unwrap();
         assert!(!plain.conn.secure);
-        assert_eq!(plain.conn.tls_server_name, None);
+        assert_eq!(plain.conn.tls_server_name, "");
         // Named instances take the same key
         let named = EmitterConfig::from_toml_str(
             "[ch]\nhost = \"h\"\n[ch.instances.cloud]\nhost = \"10.0.0.5\"\nsecure = true\n\
@@ -4310,8 +4307,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            named.instances["cloud"].tls_server_name.as_deref(),
-            Some("svc.clickhouse.cloud")
+            named.instances["cloud"].tls_server_name,
+            "svc.clickhouse.cloud"
         );
         assert_eq!(c.row_budget, 1024);
         assert_eq!(c.byte_budget, 4096);
