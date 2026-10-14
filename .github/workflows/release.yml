@@ -10,13 +10,15 @@ name: Release
 # Each arch builds natively on its own runner, same as docker.yml. Dynamic
 # glibc link: the binaries need liblz4.so.1 / libzstd.so.1 at runtime and a
 # glibc no newer than the oldest consumer's. The clickgres walshadow VM image
-# is Ubuntu 22.04 (glibc 2.35), so these build on 22.04 runners; moving them
-# forward strands every VM already running that image.
+# is Ubuntu 22.04 (glibc 2.35), so the unsuffixed archives build on 22.04
+# runners; moving them forward strands every VM already running that image.
+# Ubuntu 26.04 builds alongside them under an `-ubuntu26.04` suffix, for
+# images new enough to prefer a native build.
 #
-# Archive layout: walshadow-<version>-<target>/{walshadow-*,LICENSE,README.md}
-# and walshadow-pgext-<version>-pg<major>-<target>/{walshadow.so,LICENSE},
-# where <version> is the tag without its `v`, or `sha-<short>` on main, the
-# same commit tag scheme docker.yml uses.
+# Archive layout: walshadow-<version>-<target>[-ubuntu26.04]/{walshadow-*,
+# LICENSE,README.md} and walshadow-pgext-<version>-pg<major>-<target>[
+# -ubuntu26.04]/{walshadow.so,LICENSE}, where <version> is the tag without its
+# `v`, or `sha-<short>` on main, the same commit tag scheme docker.yml uses.
 #
 # pgext ships per PG major because it is compiled against that major's server
 # headers. The majors here are the ones the VM image caches; a shadow running
@@ -45,16 +47,24 @@ permissions:
 
 jobs:
   build:
-    name: ${{ matrix.target }}
+    name: ${{ matrix.image.target }} ${{ matrix.image.runner }}
     strategy:
       fail-fast: false
       matrix:
-        include:
+        image:
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-22.04
+            suffix: ""
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-22.04-arm
-    runs-on: ${{ matrix.runner }}
+            suffix: ""
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-26.04
+            suffix: -ubuntu26.04
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-26.04-arm
+            suffix: -ubuntu26.04
+    runs-on: ${{ matrix.image.runner }}
     timeout-minutes: 45
 
     steps:
@@ -65,7 +75,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
+          targets: ${{ matrix.image.target }}
 
       # The runner image belongs in the key: rust-cache keys on runner.os and
       # the host triple, both identical across ubuntu releases, so a cache
@@ -75,7 +85,7 @@ jobs:
       - name: Cargo cache
         uses: Swatinem/rust-cache@v2
         with:
-          key: release-${{ matrix.target }}-${{ matrix.runner }}
+          key: release-${{ matrix.image.target }}-${{ matrix.image.runner }}
 
       - name: Install C deps (lz4 + zstd for clickhouse-c-rs)
         run: |
@@ -101,18 +111,18 @@ jobs:
             version="sha-$(git rev-parse --short HEAD)"
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "archive=walshadow-$version-${{ matrix.target }}" >> "$GITHUB_OUTPUT"
+          echo "archive=walshadow-$version-${{ matrix.image.target }}${{ matrix.image.suffix }}" >> "$GITHUB_OUTPUT"
 
       # `-p walshadow --bins`: the bench workspace member has bins too, keep
       # them out of the release. build.rs picks up the git sha for --version.
       - name: Build
-        run: cargo build --release --locked -p walshadow --bins --target ${{ matrix.target }}
+        run: cargo build --release --locked -p walshadow --bins --target ${{ matrix.image.target }}
 
       - name: Smoke test
         run: |
           set -euo pipefail
           for bin in walshadow-stream walshadow-classify walshadow-filter; do
-            "target/${{ matrix.target }}/release/$bin" --version
+            "target/${{ matrix.image.target }}/release/$bin" --version
           done
 
       - name: Package
@@ -121,7 +131,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "dist/$ARCHIVE"
-          cp target/${{ matrix.target }}/release/walshadow-{stream,classify,filter} \
+          cp target/${{ matrix.image.target }}/release/walshadow-{stream,classify,filter} \
              LICENSE README.md "dist/$ARCHIVE/"
           tar -czf "dist/$ARCHIVE.tar.gz" -C dist "$ARCHIVE"
           ls -l dist/*.tar.gz
@@ -135,18 +145,25 @@ jobs:
           retention-days: 30
 
   pgext:
-    name: pgext pg${{ matrix.pg-major }} ${{ matrix.target }}
+    name: pgext pg${{ matrix.pg-major }} ${{ matrix.image.target }} ${{ matrix.image.runner }}
     strategy:
       fail-fast: false
       matrix:
         pg-major: [16, 17, 18]
-        target: [x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu]
-        include:
+        image:
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-22.04
+            suffix: ""
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-22.04-arm
-    runs-on: ${{ matrix.runner }}
+            suffix: ""
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-26.04
+            suffix: -ubuntu26.04
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-26.04-arm
+            suffix: -ubuntu26.04
+    runs-on: ${{ matrix.image.runner }}
     timeout-minutes: 30
 
     steps:
@@ -184,7 +201,7 @@ jobs:
           else
             version="sha-$(git rev-parse --short HEAD)"
           fi
-          echo "archive=walshadow-pgext-$version-pg${{ matrix.pg-major }}-${{ matrix.target }}" >> "$GITHUB_OUTPUT"
+          echo "archive=walshadow-pgext-$version-pg${{ matrix.pg-major }}-${{ matrix.image.target }}${{ matrix.image.suffix }}" >> "$GITHUB_OUTPUT"
 
       # with_llvm=no matches the VM image build: no bitcode, so no clang
       # matching the server's LLVM is needed.
