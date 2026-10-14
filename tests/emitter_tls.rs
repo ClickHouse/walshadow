@@ -278,6 +278,7 @@ fn rel_descriptor() -> RelDescriptor {
         rel_name: RelName::new("public", "things"),
         kind: 'r',
         persistence: 'p',
+        ancestors: Vec::new(),
         replident: ReplIdent::Default { pk_attnums: None },
         attributes: vec![],
     }

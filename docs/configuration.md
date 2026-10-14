@@ -123,9 +123,10 @@ restored
 Apply live:
 
 - table and column rules
-- per-table metadata column names, `order_by`, and `primary_key`, applied when
-  walshadow creates a table, see [Query destination data](destination-tables.md)
-- namespace destinations and drop policy
+- per-table metadata column names, `order_by`, `primary_key`, and
+  `partition_by`, applied when walshadow creates a table, see
+  [Query destination data](destination-tables.md)
+- namespace destinations, drop policy, and detach policy
 - pause state
 - batch sizes, flush timeout, compression, and retry count
 - source and ClickHouse endpoints
@@ -171,15 +172,18 @@ VALUES
     ('public', 'orders', true, 'copy');
 ```
 
-`config_table` also carries destination shape: `order_by` and `primary_key` as
-`text[]`, `engine`, and `lsn`, `xid`, `commit_ts`, `is_deleted` for metadata column names.
+`config_table` also configures destination tables: `order_by` and `primary_key`
+as `text[]`, `engine`, and `partition_by`. Use `route` to control
+[partition routing](table-selection.md#replicate-partitioned-tables), and
+`lsn`, `xid`, `commit_ts`, `is_deleted`, and `leaf` to name metadata columns.
 See [Query destination data](destination-tables.md)
 
 `config_namespace` carries namespace defaults: `target_database`, `auto_create`,
 `auto_create_name` (the derived-name template, see
-[Name auto-created tables](destination-tables.md#name-auto-created-tables)) and
-`drop_table_strategy`. The cluster-wide `[stream] auto_create_name_all` is
-boot-only, like `replicate_all`, so the overlay has no column for it
+[Name auto-created tables](destination-tables.md#name-auto-created-tables)),
+`drop_table_strategy`, and `detach_strategy`. Cluster-wide
+`[stream] auto_create_name_all` applies only at startup, like `replicate_all`,
+so runtime configuration has no column for it
 
 Use `config_column` to configure individual columns. Set `namespace` to schema
 name, `relname` to table name, and `attname` to column name. Use `match` for

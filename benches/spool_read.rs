@@ -111,6 +111,7 @@ fn plan(args: &Args, repeat: usize) -> anyhow::Result<()> {
         rel_name: RelName::new("public", "spool_bench"),
         kind: 'r',
         persistence: 'p',
+        ancestors: Vec::new(),
         replident: ReplIdent::Default { pk_attnums: None },
         attributes: Vec::new(),
     });

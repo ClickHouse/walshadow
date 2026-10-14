@@ -11,6 +11,10 @@
 //!
 //! Each statement also runs against every tee of the relation.
 //!
+//! A partition routed to its root has no separate destination. Apply row
+//! removal for `DETACH`, `DROP TABLE`, and `TRUNCATE` to root's destination
+//! using source partition OID.
+//!
 //! Opens its own `BoxedAsyncClient` (separate from the INSERT pump) so DDL
 //! doesn't ride the INSERT backpressure path.
 //!
@@ -37,18 +41,20 @@ use crate::config::{ConfigResolver, DestEmitter, ResolvedConfig};
 #[cfg(feature = "test-support")]
 use crate::crash_test;
 use crate::decode::heap_decoder::{self, ColumnValue};
-use crate::emit::ch_emitter::EmitterConfig;
+use crate::emit::ch_emitter::{DATETIME64_PG_EPOCH_US, EmitterConfig};
+use crate::emit::route::{Routing, routing};
 use crate::mapping::{
     ColumnMapping, DropTableStrategy, MappingHandle, MappingSnapshot, NameTemplate,
     NamespaceMapping, Retype, RetypeKind, SystemColumns, TableMapping, TableTarget, Tee,
     apply_column_rule, fold_diff_into_mapping, named_instance, retyped_target,
 };
 use crate::ops::oracle::{Oracle, OracleCell};
+use crate::runtime_config::InitialLoadMode;
 use crate::schema::{
-    INT2OID, INT4OID, INT8OID, MissingDefault, RelAttr, RelDescriptor, RelName, ReplIdent,
-    SchemaDiff, SchemaEvent, replident_key_attnums,
+    DroppedPartition, INT2OID, INT4OID, INT8OID, MissingDefault, RelAttr, RelDescriptor, RelName,
+    ReplIdent, SchemaDiff, SchemaEvent, replident_key_attnums,
 };
-use crate::table_rules::{TableRule, TableRules};
+use crate::table_rules::{PartitionRoute, TableRule, TableRules};
 use ahash::{HashMap, HashSet};
 use tokio_postgres::types::Oid;
 
@@ -60,6 +66,7 @@ use tokio_postgres::types::Oid;
 pub struct DdlConfig {
     pub instances: std::collections::BTreeMap<String, crate::emit::ch_emitter::InstanceConfig>,
     pub drop_table_strategy: DropTableStrategy,
+    pub detach_strategy: DropTableStrategy,
     /// Namespaces whose `Added` events run `CREATE TABLE IF NOT EXISTS`
     /// automatically (`auto_create = true`)
     pub auto_create_namespaces: HashSet<String>,
@@ -137,6 +144,7 @@ impl DdlConfig {
         Self {
             instances: resolved.instances.clone(),
             drop_table_strategy: resolved.drop_table_strategy,
+            detach_strategy: resolved.detach_strategy,
             auto_create_namespaces,
             replicate_all,
             auto_create_name_all,
@@ -189,6 +197,29 @@ impl DdlConfig {
             .unwrap_or(self.drop_table_strategy)
     }
 
+    fn detach_strategy_for(&self, namespace: &str) -> DropTableStrategy {
+        self.namespaces
+            .get(namespace)
+            .and_then(|n| n.detach_strategy)
+            .unwrap_or(self.detach_strategy)
+    }
+
+    /// Resolve rules for a relation with its own destination. Partitions
+    /// get separate destinations through `route = "self"`
+    pub(crate) fn rule_for(&self, desc: &RelDescriptor) -> TableRule {
+        self.rules.settings_for(desc)
+    }
+
+    /// Resolve rules for destination owner `root`. Ancestor descriptors
+    /// omit their own ancestors; use `ancestors` to identify nested roots
+    fn owner_rule(&self, ancestors: &[Arc<RelDescriptor>], root: &RelDescriptor) -> TableRule {
+        if ancestors.last().is_some_and(|top| top.oid != root.oid) {
+            self.rules.partition_settings(&root.rel_name)
+        } else {
+            self.rules.settings(&root.rel_name)
+        }
+    }
+
     pub fn with_drop_strategy(mut self, s: DropTableStrategy) -> Self {
         self.drop_table_strategy = s;
         self
@@ -216,6 +247,7 @@ impl DdlConfig {
             order_by: settings.order_by.as_deref().unwrap_or_default(),
             primary_key: settings.primary_key.as_deref().unwrap_or_default(),
             engine: settings.engine.as_deref(),
+            partition_by: settings.partition_by.as_deref(),
         }
     }
 
@@ -231,14 +263,32 @@ impl DdlConfig {
         }
     }
 
-    fn auto_creates(&self, rel: &RelName) -> bool {
-        if let Some(replicate) = self.declared_scope(rel) {
-            return replicate;
+    /// Explicit `replicate` wins, except system relations never opt in.
+    /// Partitions need `route = "self"` to get their own destinations
+    fn auto_creates(&self, desc: &RelDescriptor) -> bool {
+        if !matches!(routing(desc, Some(&self.rules)), Routing::Own) {
+            return false;
         }
-        self.auto_create_namespaces.contains(&*rel.namespace)
-            || (self.replicate_all
-                && !is_system_namespace(&rel.namespace, self.runtime_config_schema.as_deref()))
+        let rel = &desc.rel_name;
+        let system = is_system_namespace(&rel.namespace, self.runtime_config_schema.as_deref());
+        match self.rule_for(desc).replicate {
+            Some(true) if !system => true,
+            Some(false) => false,
+            _ => {
+                self.auto_create_namespaces.contains(&*rel.namespace)
+                    || (self.replicate_all && !system)
+            }
+        }
     }
+}
+
+/// Source position used to version delete markers from schema changes
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Stamp {
+    pub lsn: u64,
+    pub xid: u32,
+    /// Microseconds since the PostgreSQL epoch
+    pub commit_ts: i64,
 }
 
 /// Destination-shape inputs for one `CREATE TABLE`
@@ -254,6 +304,8 @@ pub struct CreateShape<'a> {
     pub primary_key: &'a [String],
     /// Operator engine, `None` for `ReplacingMergeTree`
     pub engine: Option<&'a str>,
+    /// Configured `PARTITION BY` expression, used as written
+    pub partition_by: Option<&'a str>,
 }
 
 impl CreateShape<'_> {
@@ -265,6 +317,7 @@ impl CreateShape<'_> {
             order_by: &tee.order_by,
             primary_key: &tee.primary_key,
             engine: tee.engine.as_deref(),
+            partition_by: None,
         }
     }
 }
@@ -295,6 +348,9 @@ pub struct DdlApplicator {
     /// Shadow PG renderer for tier-3 fast defaults
     oracle: Option<Arc<Oracle>>,
     ensured_databases: HashMap<(Option<String>, String), Arc<EmitterConfig>>,
+    /// Last destination truncated in full, with source record position.
+    /// Partitions share this record and need no separate delete markers
+    truncated: Option<(u64, TableTarget)>,
     pub stats: DdlStats,
 }
 
@@ -323,6 +379,7 @@ impl DdlApplicator {
             resolver: None,
             oracle: None,
             ensured_databases: HashMap::default(),
+            truncated: None,
             stats: DdlStats::default(),
         })
     }
@@ -356,27 +413,37 @@ impl DdlApplicator {
         self.config = DdlConfig::from_resolved(&snap, self.config.boot());
     }
 
-    /// Errors propagate; the worker task turns them into
-    /// `DecoderSinkError` so the daemon poisons the stream cleanly.
-    pub async fn apply(&mut self, event: &SchemaEvent) -> Result<(), EmitterError> {
-        self.apply_under(event, None).await
+    /// Create destination for a relation present before streaming
+    pub async fn add(&mut self, desc: &RelDescriptor) -> Result<(), EmitterError> {
+        self.refresh_config();
+        let cfg = self.config.clone();
+        self.apply_added(desc, &cfg).await
     }
 
     /// Apply under frozen config `frozen`, the version
-    /// [`Self::predict_route_mapping`] planned with; `None` uses live config
-    pub async fn apply_under(
+    /// [`Self::predict_route_mapping`] planned with; `None` uses live config.
+    /// `stamp` versions partition delete markers
+    pub async fn apply_at(
         &mut self,
         event: &SchemaEvent,
         frozen: Option<&ResolvedConfig>,
+        stamp: Stamp,
     ) -> Result<(), EmitterError> {
         self.refresh_config();
         let cfg = self.plan_config(frozen);
         match event {
             SchemaEvent::Added { desc } => self.apply_added(desc, &cfg).await,
             SchemaEvent::Changed { old, new, diff } => {
-                self.apply_changed(old, new, diff, &cfg).await
+                self.apply_changed(old, new, diff, &cfg, stamp).await
             }
-            SchemaEvent::Dropped { oid: _, rel_name } => self.apply_dropped(rel_name, &cfg).await,
+            SchemaEvent::Dropped {
+                rel_name,
+                partition,
+                ..
+            } => {
+                self.apply_dropped(rel_name, partition.as_ref(), &cfg, stamp)
+                    .await
+            }
         }
     }
 
@@ -385,10 +452,18 @@ impl DdlApplicator {
         desc: &RelDescriptor,
         cfg: &DdlConfig,
     ) -> Result<(), EmitterError> {
+        match routing(desc, Some(&cfg.rules)) {
+            Routing::Own => {}
+            Routing::Ancestor(root) => return self.admit_partition(desc, root, cfg).await,
+            Routing::Excluded => {
+                self.stats.skipped += 1;
+                return Ok(());
+            }
+        }
         // Mapped dest created from the mapping when missing; IF NOT EXISTS
         // no-ops an operator-managed table and re-creates after strategy=drop.
         if let Some(m) = self.mapping_for(&desc.rel_name).await {
-            let settings = cfg.rules.settings(&desc.rel_name);
+            let settings = cfg.rule_for(desc);
             let shape = cfg.create_shape(&settings);
             let cols = mapping_columns(&m);
             self.create_dest(desc, &cols, &m.target, &shape).await?;
@@ -397,7 +472,7 @@ impl DdlApplicator {
         }
         // Operator opt-out (`replicate=false`) beats namespace auto_create:
         // no CH mirror, no mapping
-        if self.is_excluded(&desc.rel_name).await {
+        if self.is_excluded(desc).await {
             self.stats.skipped += 1;
             return Ok(());
         }
@@ -405,7 +480,7 @@ impl DdlApplicator {
             self.stats.skipped += 1;
             return Ok(());
         };
-        let settings = cfg.rules.settings(&desc.rel_name);
+        let settings = cfg.rule_for(desc);
         let shape = cfg.create_shape(&settings);
         self.ensure_database(&mapping.target).await?;
         self.execute(
@@ -415,7 +490,7 @@ impl DdlApplicator {
         .await?;
         self.stats.creates_applied += 1;
         self.create_tees(desc, &mapping, &cols, &shape).await?;
-        self.register_mapping(&desc.rel_name, mapping).await;
+        self.register_mapping(desc, mapping).await;
         Ok(())
     }
 
@@ -432,6 +507,15 @@ impl DdlApplicator {
             .await?;
         self.stats.creates_applied += 1;
         if let Some(sql) = render_add_columns(cols, target) {
+            self.execute(target, &sql).await?;
+            self.stats.alters_applied += 1;
+        }
+        if let Some(leaf) = leaf_column(desc, shape) {
+            let sql = format!(
+                "ALTER TABLE {} ADD COLUMN IF NOT EXISTS {} UInt32",
+                target.sql(),
+                quote_ident(leaf)
+            );
             self.execute(target, &sql).await?;
             self.stats.alters_applied += 1;
         }
@@ -463,7 +547,7 @@ impl DdlApplicator {
     /// Idempotent: `IF NOT EXISTS` no-ops a re-create.
     pub async fn ensure_ch_table(&mut self, desc: &RelDescriptor) -> Result<bool, EmitterError> {
         self.refresh_config();
-        let settings = self.config.rules.settings(&desc.rel_name);
+        let settings = self.config.rule_for(desc);
         let target = self.config.create_target(&settings, &desc.rel_name);
         let shape = self.config.create_shape(&settings);
         let Some(cols) = descriptor_columns(desc, &self.config.column_rules) else {
@@ -494,7 +578,35 @@ impl DdlApplicator {
         new: &RelDescriptor,
         diff: &SchemaDiff,
         cfg: &DdlConfig,
+        stamp: Stamp,
     ) -> Result<(), EmitterError> {
+        if old.is_partition() || new.is_partition() {
+            let before = routing(old, Some(&cfg.rules));
+            let after = routing(new, Some(&cfg.rules));
+            if let Routing::Ancestor(left) = before
+                && !matches!(after, Routing::Ancestor(root) if root.oid == left.oid)
+            {
+                let strategy = cfg.detach_strategy_for(&left.rel_name.namespace);
+                self.leave_root(old, left, strategy, "DETACH", cfg, stamp)
+                    .await?;
+            }
+            match after {
+                // Keep previous destination without further writes
+                Routing::Ancestor(root) => return self.admit_partition(new, root, cfg).await,
+                Routing::Excluded => {
+                    self.stats.skipped += 1;
+                    return Ok(());
+                }
+                // Schema changes while attached did not update old mapping
+                Routing::Own if !matches!(before, Routing::Own) => {
+                    if self.mapping_for(&new.rel_name).await.is_some() {
+                        self.forget_mapping(&new.rel_name).await;
+                    }
+                    return self.apply_added(new, cfg).await;
+                }
+                Routing::Own => {}
+            }
+        }
         let key = new.rel_name.clone();
         let Some((mapped_at, mapping)) = self.mapping_snapshot(&key).await else {
             // No target, can't ALTER; `Added` handles the
@@ -586,7 +698,33 @@ impl DdlApplicator {
         Ok(())
     }
 
-    async fn apply_dropped(&mut self, rel: &RelName, cfg: &DdlConfig) -> Result<(), EmitterError> {
+    async fn apply_dropped(
+        &mut self,
+        rel: &RelName,
+        partition: Option<&DroppedPartition>,
+        cfg: &DdlConfig,
+        stamp: Stamp,
+    ) -> Result<(), EmitterError> {
+        if let Some(p) = partition {
+            match routing(&p.desc, Some(&cfg.rules)) {
+                Routing::Own => {}
+                Routing::Excluded => {
+                    self.stats.skipped += 1;
+                    return Ok(());
+                }
+                // Apply root's drop policy once for entire destination
+                Routing::Ancestor(root) if p.dropped.contains(&root.oid) => {
+                    self.stats.skipped += 1;
+                    return Ok(());
+                }
+                Routing::Ancestor(root) => {
+                    let strategy = cfg.drop_strategy_for(&root.rel_name.namespace);
+                    return self
+                        .leave_root(&p.desc, root, strategy, "DROP TABLE", cfg, stamp)
+                        .await;
+                }
+            }
+        }
         let Some((_, mapping)) = self.mapping_snapshot(rel).await else {
             self.stats.skipped += 1;
             return Ok(());
@@ -633,14 +771,180 @@ impl DdlApplicator {
     /// `TRUNCATE TABLE <target>`, no-op for unmapped relations. Reorder
     /// coordinator calls this inside a barrier (after earlier data is
     /// durable) so the truncate orders correctly against inserts despite
-    /// the otherwise out-of-order pipeline.
-    pub async fn truncate(&mut self, rel: &RelName) -> Result<(), EmitterError> {
-        let Some((_, mapping)) = self.mapping_snapshot(rel).await else {
+    /// the otherwise out-of-order pipeline. A partition routed to its root
+    /// adds delete markers for its rows there
+    pub async fn truncate(&mut self, desc: &RelDescriptor, at: Stamp) -> Result<(), EmitterError> {
+        self.refresh_config();
+        let cfg = self.config.clone();
+        match routing(desc, Some(&cfg.rules)) {
+            Routing::Own => {}
+            Routing::Excluded => return Ok(()),
+            // A partitioned relation holds no rows; its partitions share
+            // the record
+            Routing::Ancestor(_) if desc.kind == 'p' => return Ok(()),
+            Routing::Ancestor(root) => {
+                let Some(mapping) = self.mapping_for(&root.rel_name).await else {
+                    return Ok(());
+                };
+                if self
+                    .truncated
+                    .as_ref()
+                    .is_some_and(|(lsn, t)| *lsn == at.lsn && *t == mapping.target)
+                {
+                    return Ok(());
+                }
+                return self
+                    .remove_partition_rows(root, desc, &mapping, at, "TRUNCATE", &cfg)
+                    .await;
+            }
+        }
+        let Some((_, mapping)) = self.mapping_snapshot(&desc.rel_name).await else {
             return Ok(());
         };
         for target in mapping.targets() {
             self.execute(&target, &format!("TRUNCATE TABLE {}", target.sql()))
                 .await?;
+        }
+        self.truncated = Some((at.lsn, mapping.target));
+        Ok(())
+    }
+
+    /// Check routing requirements. Return `false` for excluded partitions
+    /// and partitions using root's destination
+    pub async fn owns_destination(&mut self, desc: &RelDescriptor) -> Result<bool, EmitterError> {
+        self.refresh_config();
+        let cfg = self.config.clone();
+        match routing(desc, Some(&cfg.rules)) {
+            Routing::Own => Ok(true),
+            Routing::Excluded => Ok(false),
+            Routing::Ancestor(root) => self.admit_partition(desc, root, &cfg).await.map(|()| false),
+        }
+    }
+
+    /// Use root's `initial_load` for attached rows, defaulting to `copy`
+    pub async fn partition_load(&mut self, desc: &RelDescriptor) -> InitialLoadMode {
+        self.refresh_config();
+        let cfg = self.config.clone();
+        let Routing::Ancestor(root) = routing(desc, Some(&cfg.rules)) else {
+            return InitialLoadMode::None;
+        };
+        if self.mapping_for(&root.rel_name).await.is_none() {
+            return InitialLoadMode::None;
+        }
+        cfg.owner_rule(&desc.ancestors, root)
+            .initial_load
+            .and_then(|m| m.parse().ok())
+            .or_else(|| {
+                cfg.namespaces
+                    .get(&*root.rel_name.namespace)
+                    .and_then(|n| n.initial_load)
+            })
+            .unwrap_or(InitialLoadMode::Copy)
+    }
+
+    /// Check whether a partition can use `root`'s destination.
+    /// Skip check until that destination exists
+    async fn admit_partition(
+        &mut self,
+        desc: &RelDescriptor,
+        root: &RelDescriptor,
+        cfg: &DdlConfig,
+    ) -> Result<(), EmitterError> {
+        if self.mapping_for(&root.rel_name).await.is_none() {
+            self.stats.skipped += 1;
+            return Ok(());
+        }
+        check_partition(desc, root, &cfg.rules)
+    }
+
+    /// Retain or remove departing partition's rows according to `strategy`
+    async fn leave_root(
+        &mut self,
+        leaving: &RelDescriptor,
+        root: &RelDescriptor,
+        strategy: DropTableStrategy,
+        what: &str,
+        cfg: &DdlConfig,
+        at: Stamp,
+    ) -> Result<(), EmitterError> {
+        let rel = &leaving.rel_name;
+        let Some(mapping) = self.mapping_for(&root.rel_name).await else {
+            self.stats.skipped += 1;
+            return Ok(());
+        };
+        match strategy {
+            DropTableStrategy::Retain => {
+                self.stats.skipped += 1;
+                tracing::info!(
+                    target: "walshadow::ch_ddl",
+                    partition = %rel,
+                    root = %root.rel_name,
+                    dest = %mapping.target,
+                    "{what} of partition; rows retained in root destination",
+                );
+                Ok(())
+            }
+            DropTableStrategy::Warn => {
+                self.stats.skipped += 1;
+                tracing::warn!(
+                    target: "walshadow::ch_ddl",
+                    partition = %rel,
+                    root = %root.rel_name,
+                    dest = %mapping.target,
+                    "{what} of partition; rows retained in root destination",
+                );
+                Ok(())
+            }
+            DropTableStrategy::Drop => {
+                self.remove_partition_rows(root, leaving, &mapping, at, what, cfg)
+                    .await
+            }
+        }
+    }
+
+    /// Remove partition `leaf`'s rows from `root`'s destinations before `at`.
+    /// Insert delete markers where supported; use lightweight `DELETE` on
+    /// other MergeTree engines. Limit removal to `at.lsn` so replay writes
+    /// identical markers and preserves later rows
+    async fn remove_partition_rows(
+        &mut self,
+        root: &RelDescriptor,
+        leaving: &RelDescriptor,
+        mapping: &TableMapping,
+        at: Stamp,
+        what: &str,
+        cfg: &DdlConfig,
+    ) -> Result<(), EmitterError> {
+        let settings = cfg.owner_rule(&leaving.ancestors, root);
+        let (root, leaf) = (&root.rel_name, leaving.oid);
+        let system = settings.system_columns(&cfg.system);
+        let Some(leaf_col) = system.leaf.as_deref() else {
+            return Err(EmitterError::Config(format!(
+                "{what} of partition {leaf} of `{root}` needs the partition column; \
+                 re-enable `leaf` in [system_columns] or on `{root}`"
+            )));
+        };
+        let destinations = std::iter::once((mapping.target.clone(), settings.engine.clone()))
+            .chain(
+                mapping
+                    .tees
+                    .iter()
+                    .map(|t| (t.target(&mapping.target), t.engine.clone())),
+            );
+        for (target, engine) in destinations {
+            let Some(sql) = partition_removal_sql(
+                &target,
+                engine.as_deref(),
+                mapping,
+                &system,
+                leaf_col,
+                leaf,
+                at,
+            ) else {
+                continue;
+            };
+            self.execute(&target, &sql).await?;
+            self.stats.alters_applied += 1;
         }
         Ok(())
     }
@@ -660,21 +964,21 @@ impl DdlApplicator {
     /// Operator opt-out (`replicate=false`); nothing excluded without a
     /// resolver. `&mut self` like siblings: `&self` across await would
     /// demand `DdlApplicator: Sync`, blocked by chc client's raw pointer
-    async fn is_excluded(&mut self, rel: &RelName) -> bool {
+    async fn is_excluded(&mut self, desc: &RelDescriptor) -> bool {
         if let Some(r) = &self.resolver {
-            r.is_excluded(rel).await
+            r.is_excluded(desc).await
         } else {
             false
         }
     }
 
     /// Route writes through resolver so derived mappings survive republish
-    async fn register_mapping(&mut self, rel: &RelName, mapping: TableMapping) {
+    async fn register_mapping(&mut self, desc: &RelDescriptor, mapping: TableMapping) {
         if let Some(r) = &self.resolver {
-            r.register_derived_mapping(rel, mapping).await;
+            r.register_derived_mapping(desc, mapping).await;
         } else {
             self.mapping
-                .mutate(|m| Arc::make_mut(m).insert(rel.clone(), mapping))
+                .mutate(|m| Arc::make_mut(m).insert(desc.rel_name.clone(), mapping))
                 .await;
         }
     }
@@ -687,8 +991,10 @@ impl DdlApplicator {
     ) -> Result<Option<(RelName, Option<TableMapping>)>, EmitterError> {
         // Resolver owns opt-outs, frozen routing state does not include them
         let excluded = match event {
-            SchemaEvent::Added { desc } if !mapping.contains_key(&desc.rel_name) => {
-                self.is_excluded(&desc.rel_name).await
+            SchemaEvent::Added { desc } | SchemaEvent::Changed { new: desc, .. }
+                if !mapping.contains_key(&desc.rel_name) =>
+            {
+                self.is_excluded(desc).await
             }
             _ => false,
         };
@@ -807,6 +1113,20 @@ fn predict_route_effect(
             Ok(derive_added(cfg, desc).map(|(_, m)| (desc.rel_name.clone(), Some(m))))
         }
         SchemaEvent::Changed { old, new, diff } => {
+            if old.is_partition() || new.is_partition() {
+                match routing(new, Some(&cfg.rules)) {
+                    Routing::Ancestor(_) | Routing::Excluded => return Ok(None),
+                    Routing::Own if !matches!(routing(old, Some(&cfg.rules)), Routing::Own) => {
+                        if mapping.contains_key(&new.rel_name) || excluded {
+                            return Ok(None);
+                        }
+                        return Ok(
+                            derive_added(cfg, new).map(|(_, m)| (new.rel_name.clone(), Some(m)))
+                        );
+                    }
+                    Routing::Own => {}
+                }
+            }
             let Some(mut m) = mapping.get(&new.rel_name).cloned() else {
                 return Ok(None);
             };
@@ -832,10 +1152,10 @@ fn predict_route_effect(
 /// unexcluded rel, so rows and DDL land in same place. `None` when out of
 /// scope or without a bridgeable shape
 fn derive_added(cfg: &DdlConfig, desc: &RelDescriptor) -> Option<(Vec<DestColumn>, TableMapping)> {
-    if !cfg.auto_creates(&desc.rel_name) {
+    if !cfg.auto_creates(desc) {
         return None;
     }
-    let settings = cfg.rules.settings(&desc.rel_name);
+    let settings = cfg.rule_for(desc);
     let cols = descriptor_columns(desc, &cfg.column_rules)?;
     let mapping = TableMapping {
         target: cfg.create_target(&settings, &desc.rel_name),
@@ -843,6 +1163,148 @@ fn derive_added(cfg: &DdlConfig, desc: &RelDescriptor) -> Option<(Vec<DestColumn
         tees: settings.tee.clone().unwrap_or_default(),
     };
     Some((cols, mapping))
+}
+
+/// Reject partitions with separate destination settings, missing WAL, or
+/// delete records missing columns required by root's destination key
+fn check_partition(
+    desc: &RelDescriptor,
+    root: &RelDescriptor,
+    rules: &TableRules,
+) -> Result<(), EmitterError> {
+    let below = std::iter::once(desc).chain(
+        desc.ancestors
+            .iter()
+            .map(Arc::as_ref)
+            .take_while(|a| a.oid != root.oid),
+    );
+    for node in below {
+        let exact = rules.exact_settings(&node.rel_name);
+        if exact.route != Some(PartitionRoute::Self_) && exact.shapes_destination() {
+            return Err(EmitterError::Config(format!(
+                "`{}` routes to partitioned table `{}`; its entry may set only `replicate` \
+                 and `route`, or `route = \"self\"` to own a destination",
+                node.rel_name, root.rel_name
+            )));
+        }
+    }
+    if desc.persistence == 'u' {
+        return Err(EmitterError::Config(format!(
+            "unlogged partition `{}` of `{}` writes no WAL; make it logged or exclude it \
+             with `replicate = false`",
+            desc.rel_name, root.rel_name
+        )));
+    }
+    let covered = match (key_columns(root), logged_columns(desc)) {
+        (KeyColumns::Absent, _) | (_, KeyColumns::WholeRow) => true,
+        (KeyColumns::WholeRow, _) | (_, KeyColumns::Absent) => false,
+        (KeyColumns::Named(key), KeyColumns::Named(logged)) => {
+            key.iter().all(|k| logged.contains(k))
+        }
+    };
+    if covered {
+        return Ok(());
+    }
+    let hint = if matches!(root.replident, ReplIdent::Full { pk_attnums: None }) {
+        "; REPLICA IDENTITY does not recurse, so set FULL on each partition too"
+    } else {
+        ""
+    };
+    Err(EmitterError::Config(format!(
+        "partition `{}` logs deletes by fewer columns than `{}` keys its destination on{hint}",
+        desc.rel_name, root.rel_name
+    )))
+}
+
+enum KeyColumns<'a> {
+    Absent,
+    WholeRow,
+    Named(Vec<&'a str>),
+}
+
+fn named_columns<'a>(desc: &'a RelDescriptor, attnums: &[i16]) -> KeyColumns<'a> {
+    KeyColumns::Named(
+        attnums
+            .iter()
+            .filter_map(|n| desc.live_attr(*n).map(|a| a.name.as_str()))
+            .collect(),
+    )
+}
+
+/// Sort columns derived from `desc`'s replica identity
+fn key_columns(desc: &RelDescriptor) -> KeyColumns<'_> {
+    match &desc.replident {
+        ReplIdent::Full { pk_attnums: None } => KeyColumns::WholeRow,
+        ReplIdent::Default { pk_attnums: None } | ReplIdent::Nothing => KeyColumns::Absent,
+        _ => named_columns(desc, replident_key_attnums(desc)),
+    }
+}
+
+/// Columns PostgreSQL logs in `desc`'s delete and key-changing update records
+fn logged_columns(desc: &RelDescriptor) -> KeyColumns<'_> {
+    if matches!(desc.replident, ReplIdent::Full { .. }) {
+        KeyColumns::WholeRow
+    } else {
+        key_columns(desc)
+    }
+}
+
+/// Extract engine name, defaulting to `ReplacingMergeTree`
+fn engine_family(engine: Option<&str>) -> &str {
+    engine.map_or("ReplacingMergeTree", |e| {
+        e.split('(').next().unwrap_or_default().trim()
+    })
+}
+
+/// Build SQL to remove partition `leaf`'s rows before `at.lsn` from `target`.
+/// Return `None` for engines without row removal, such as `Null`
+fn partition_removal_sql(
+    target: &TableTarget,
+    engine: Option<&str>,
+    mapping: &TableMapping,
+    system: &SystemColumns,
+    leaf_col: &str,
+    leaf: Oid,
+    at: Stamp,
+) -> Option<String> {
+    let family = engine_family(engine);
+    if !family.ends_with("MergeTree") {
+        return None;
+    }
+    let t = target.sql();
+    let leaf_col = quote_ident(leaf_col);
+    let lsn = quote_ident(&system.lsn);
+    let scope = format!("{leaf_col} = {leaf} AND {lsn} < {}", at.lsn);
+    let Some(marker) = system
+        .is_deleted
+        .as_deref()
+        .filter(|_| family.ends_with("ReplacingMergeTree"))
+    else {
+        return Some(format!("DELETE FROM {t} WHERE {scope}"));
+    };
+    let marker = quote_ident(marker);
+    let list = mapping
+        .columns
+        .iter()
+        .map(|c| quote_ident(&c.target_name))
+        .chain([leaf_col])
+        .collect::<Vec<_>>()
+        .join(", ");
+    let unix_us = at.commit_ts.saturating_add(DATETIME64_PG_EPOCH_US);
+    Some(format!(
+        "INSERT INTO {t} ({list}, {lsn}, {}, {}, {marker}) \
+         SELECT {list}, toUInt64({}), toUInt32({}), fromUnixTimestamp64Micro(toInt64({unix_us}), 'UTC'), true \
+         FROM {t} FINAL WHERE {scope} AND NOT {marker}",
+        quote_ident(&system.xid),
+        quote_ident(&system.commit_ts),
+        at.lsn,
+        at.xid,
+    ))
+}
+
+/// Name of `UInt32` partition column in a partitioned table's destination
+fn leaf_column<'a>(desc: &RelDescriptor, shape: &'a CreateShape<'_>) -> Option<&'a str> {
+    shape.system.leaf.as_deref().filter(|_| desc.kind == 'p')
 }
 
 /// ClickHouse `ALTER_OF_COLUMN_IS_FORBIDDEN`, including rejected key retypes
@@ -1110,13 +1572,7 @@ fn render_create_sql(
         col_defs.join(",\n  ")
     );
     // Only MergeTree family takes sorting key clauses, eg Null rejects them
-    if !engine
-        .split('(')
-        .next()
-        .unwrap_or_default()
-        .trim_end()
-        .ends_with("MergeTree")
-    {
+    if !engine_family(Some(&engine)).ends_with("MergeTree") {
         return head;
     }
     let keys = if key.names.is_empty() {
@@ -1153,7 +1609,11 @@ fn render_create_sql(
     } else {
         ""
     };
-    format!("{head}\nORDER BY ({order_by}){primary_key}{settings}")
+    let partition_by = shape
+        .partition_by
+        .map(|p| format!("\nPARTITION BY {p}"))
+        .unwrap_or_default();
+    format!("{head}{partition_by}\nORDER BY ({order_by}){primary_key}{settings}")
 }
 
 /// Quoted `ORDER BY` columns; use LSN when empty
@@ -1252,9 +1712,13 @@ fn render_create_table(
     shape: &CreateShape<'_>,
 ) -> String {
     let target = target.sql();
-    let col_defs: Vec<String> = cols.iter().map(DestColumn::def).collect();
+    let mut col_defs: Vec<String> = cols.iter().map(DestColumn::def).collect();
     let mut orderable: HashMap<&str, bool> = HashMap::default();
     orderable_system(&shape.system, &mut orderable);
+    if let Some(leaf) = leaf_column(desc, shape) {
+        col_defs.push(format!("{} UInt32", quote_ident(leaf)));
+        orderable.insert(leaf, false);
+    }
     for c in cols {
         orderable.insert(&c.name, types::is_nullable(&c.resolved.ch_type));
     }
@@ -1263,8 +1727,36 @@ fn render_create_table(
         cols.iter()
             .map(|c| (c.attnum, c.name.as_str(), c.resolved.ch_type.as_str())),
     );
+    if desc.kind == 'p' && !shape.order_by.is_empty() {
+        warn_partition_order_by(&target, desc, cols, shape.order_by);
+    }
     let key = resolve_order_by(&target, shape.order_by, &orderable, derived);
     render_create_sql(&target, col_defs, key, shape)
+}
+
+/// Unique keys include every partition column. Omitting root key columns
+/// from sort key can merge rows from different partitions
+fn warn_partition_order_by(
+    target: &str,
+    desc: &RelDescriptor,
+    cols: &[DestColumn],
+    order_by: &[String],
+) {
+    let missing: Vec<&str> = replident_key_attnums(desc)
+        .iter()
+        .filter_map(|a| cols.iter().find(|c| c.attnum == *a))
+        .map(|c| c.name.as_str())
+        .filter(|name| !order_by.iter().any(|o| o == name))
+        .collect();
+    if !missing.is_empty() {
+        tracing::warn!(
+            target: "walshadow::ch_ddl",
+            table = %target,
+            missing = ?missing,
+            "order_by omits key columns of a partitioned table; rows of different \
+             partitions sharing order_by values collapse into one",
+        );
+    }
 }
 
 /// Create `[ch] database` when the server doesn't have it, over a session on
@@ -1362,6 +1854,7 @@ mod tests {
             order_by: &[],
             primary_key: &[],
             engine: None,
+            partition_by: None,
         }
     }
     use crate::schema::{INT4OID, TEXTOID, TIMESTAMPTZOID};
@@ -1388,6 +1881,7 @@ mod tests {
                 auto_create: true,
                 auto_create_name: Some(NameTemplate::parse("$table$").unwrap()),
                 drop_table_strategy: None,
+                detach_strategy: None,
                 initial_load: None,
             },
         );
@@ -1405,12 +1899,14 @@ mod tests {
                 auto_create: true,
                 auto_create_name: Some(NameTemplate::parse("wh_").unwrap()),
                 drop_table_strategy: None,
+                detach_strategy: None,
                 initial_load: None,
             },
         );
         let mut cfg = DdlConfig {
             instances: Default::default(),
             drop_table_strategy: DropTableStrategy::Retain,
+            detach_strategy: DropTableStrategy::Retain,
             auto_create_namespaces: HashSet::new(),
             replicate_all: false,
             auto_create_name_all: None,
@@ -1460,6 +1956,7 @@ mod tests {
         let mut cfg = DdlConfig {
             instances: Default::default(),
             drop_table_strategy: DropTableStrategy::Retain,
+            detach_strategy: DropTableStrategy::Retain,
             auto_create_namespaces: HashSet::new(),
             replicate_all: true,
             auto_create_name_all: Some(NameTemplate::parse("$database$_$schema$_$table$").unwrap()),
@@ -1507,6 +2004,7 @@ mod tests {
                 auto_create: true,
                 auto_create_name: None,
                 drop_table_strategy: Some(DropTableStrategy::Drop),
+                detach_strategy: None,
                 initial_load: None,
             },
         );
@@ -1517,12 +2015,14 @@ mod tests {
                 auto_create: true,
                 auto_create_name: None,
                 drop_table_strategy: None,
+                detach_strategy: None,
                 initial_load: None,
             },
         );
         let cfg = DdlConfig {
             instances: Default::default(),
             drop_table_strategy: DropTableStrategy::Retain,
+            detach_strategy: DropTableStrategy::Retain,
             auto_create_namespaces: HashSet::new(),
             replicate_all: false,
             auto_create_name_all: None,
@@ -1552,6 +2052,7 @@ mod tests {
         let cfg = DdlConfig {
             instances: Default::default(),
             drop_table_strategy: DropTableStrategy::Retain,
+            detach_strategy: DropTableStrategy::Retain,
             auto_create_namespaces: HashSet::new(),
             replicate_all: false,
             auto_create_name_all: None,
@@ -1604,6 +2105,7 @@ mod tests {
             rel_name: RelName::new("public", name),
             kind: 'r',
             persistence: 'p',
+            ancestors: Vec::new(),
             replident: ReplIdent::Default { pk_attnums: pk },
             attributes: attrs,
         }
@@ -1648,6 +2150,7 @@ mod tests {
         let cfg = DdlConfig {
             instances: Default::default(),
             drop_table_strategy: DropTableStrategy::Retain,
+            detach_strategy: DropTableStrategy::Retain,
             auto_create_namespaces: HashSet::new(),
             replicate_all: false,
             auto_create_name_all: None,
@@ -1660,8 +2163,13 @@ mod tests {
             rules: Arc::new(rules),
             column_rules: Arc::default(),
         };
+        let auto_creates = |namespace: &str, name: &str| {
+            let mut desc = crate::schema::int4_rel(16384, name, 'r', &[]);
+            desc.rel_name = RelName::new(namespace, name);
+            cfg.auto_creates(&desc)
+        };
         let events = RelName::new("app", "events_1");
-        assert!(cfg.auto_creates(&events));
+        assert!(auto_creates("app", "events_1"));
         assert_eq!(
             cfg.create_target(&cfg.rules.settings(&events), &events),
             TableTarget::new("warehouse", "app_events_1")
@@ -1671,9 +2179,9 @@ mod tests {
             Some(false),
             "guardrail beats the matching opt-in"
         );
-        assert!(!cfg.auto_creates(&RelName::new("app", "events_audit")));
+        assert!(!auto_creates("app", "events_audit"));
         assert_eq!(cfg.declared_scope(&RelName::new("walshadow", "x")), None);
-        assert!(!cfg.auto_creates(&RelName::new("pg_catalog", "pg_class")));
+        assert!(!auto_creates("pg_catalog", "pg_class"));
         let settings = cfg.rules.settings(&events);
         let shape = cfg.create_shape(&settings);
         assert_eq!(shape.system.lsn, "_peerdb_version");
@@ -2191,6 +2699,7 @@ mod tests {
             xid: "_xid".into(),
             commit_ts: "_peerdb_synced_at".into(),
             is_deleted: Some("_peerdb_is_deleted".into()),
+            leaf: None,
         };
         let d = desc("t", vec![att(1, "id", INT4OID, true, None)], Some(vec![1]));
         let sql = render_from_desc(
@@ -2202,6 +2711,7 @@ mod tests {
                 order_by: &[],
                 primary_key: &[],
                 engine: None,
+                partition_by: None,
             },
             &ColumnRules::default(),
         )
@@ -2237,6 +2747,7 @@ mod tests {
                 order_by: &[],
                 primary_key: &[],
                 engine: None,
+                partition_by: None,
             },
             &ColumnRules::default(),
         )
@@ -2266,6 +2777,7 @@ mod tests {
                 order_by: &order_by,
                 primary_key: &[],
                 engine: None,
+                partition_by: None,
             },
             &ColumnRules::default(),
         )
@@ -2293,6 +2805,7 @@ mod tests {
                     order_by: &keys,
                     primary_key: &[],
                     engine: None,
+                    partition_by: None,
                 },
                 &ColumnRules::default(),
             )
@@ -2322,6 +2835,7 @@ mod tests {
                     order_by: &order_by,
                     primary_key,
                     engine: None,
+                    partition_by: None,
                 },
                 &ColumnRules::default(),
             )
@@ -2368,6 +2882,7 @@ mod tests {
                 order_by: &order_by,
                 primary_key: &["tenant".to_string()],
                 engine: None,
+                partition_by: None,
             },
         );
         assert!(
@@ -2552,6 +3067,7 @@ mod tests {
         let cfg = DdlConfig {
             instances: Default::default(),
             drop_table_strategy: DropTableStrategy::Drop,
+            detach_strategy: DropTableStrategy::Retain,
             auto_create_namespaces: HashSet::new(),
             replicate_all: false,
             auto_create_name_all: None,
@@ -2567,6 +3083,7 @@ mod tests {
         let dropped = SchemaEvent::Dropped {
             oid: 16400,
             rel_name: rel.clone(),
+            partition: None,
         };
         let predicted = predict_route_effect(&cfg, &frozen, &dropped, false).unwrap();
         assert!(
@@ -2589,6 +3106,7 @@ mod tests {
         let mut cfg = DdlConfig {
             instances: Default::default(),
             drop_table_strategy: DropTableStrategy::Retain,
+            detach_strategy: DropTableStrategy::Retain,
             auto_create_namespaces: HashSet::new(),
             replicate_all: true,
             auto_create_name_all: None,
@@ -2661,5 +3179,280 @@ mod tests {
         // Unmapped relation: early return
         let ghost = desc("ghost", vec![att(1, "id", INT4OID, true, None)], None);
         mutate_mapping_for_diff(&handle, &ghost, &diff, &[], &ColumnRules::default()).await;
+    }
+
+    /// `m (id, region)` keyed on both, partitioned into `m_eu`
+    fn partition_pair() -> (RelDescriptor, RelDescriptor) {
+        let mut m = crate::schema::int4_rel(16480, "m", 'p', &[(1, "id"), (2, "region")]);
+        m.replident = ReplIdent::Default {
+            pk_attnums: Some(vec![1, 2]),
+        };
+        let mut leaf = crate::schema::int4_rel(16500, "m_eu", 'r', &[(1, "region"), (2, "id")]);
+        leaf.replident = ReplIdent::Default {
+            pk_attnums: Some(vec![2, 1]),
+        };
+        leaf.ancestors = vec![m.as_ancestor()];
+        (m, leaf)
+    }
+
+    fn rules_with(name: &str, rule: TableRule) -> TableRules {
+        let mut b = crate::table_rules::TableRulesBuilder::new();
+        b.add(&RelName::new("public", name), MatchKind::Exact, rule);
+        b.finish().0
+    }
+
+    #[test]
+    fn partition_admission_checks_entry_storage_and_key() {
+        let (m, leaf) = partition_pair();
+        let none = TableRules::default();
+        check_partition(&leaf, &m, &none).expect("matching key by name");
+
+        let shaped = rules_with(
+            "m_eu",
+            TableRule {
+                order_by: Some(vec!["id".into()]),
+                ..TableRule::default()
+            },
+        );
+        let err = check_partition(&leaf, &m, &shaped).unwrap_err().to_string();
+        assert!(err.contains("may set only"), "{err}");
+
+        let unlogged = RelDescriptor {
+            persistence: 'u',
+            ..leaf.clone()
+        };
+        let err = check_partition(&unlogged, &m, &none)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unlogged partition"), "{err}");
+
+        let narrow = RelDescriptor {
+            replident: ReplIdent::UsingIndex {
+                index_oid: 1,
+                key_attnums: vec![2],
+            },
+            ..leaf.clone()
+        };
+        let err = check_partition(&narrow, &m, &none).unwrap_err().to_string();
+        assert!(err.contains("fewer columns"), "{err}");
+        let keyless = RelDescriptor {
+            replident: ReplIdent::Default { pk_attnums: None },
+            ..m.clone()
+        };
+        check_partition(&narrow, &keyless, &none).expect("keyless root needs no logged key");
+        let full = RelDescriptor {
+            replident: ReplIdent::Full { pk_attnums: None },
+            ..narrow
+        };
+        check_partition(&full, &m, &none).expect("FULL logs every column");
+
+        let whole_root = RelDescriptor {
+            replident: ReplIdent::Full { pk_attnums: None },
+            ..m.clone()
+        };
+        let err = check_partition(&leaf, &whole_root, &none)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("does not recurse"), "{err}");
+    }
+
+    #[test]
+    fn partition_removal_tombstones_or_deletes_per_engine() {
+        let mapping = TableMapping {
+            target: TableTarget::new("db", "m"),
+            columns: vec![
+                DestColumn {
+                    attnum: 1,
+                    name: "id".into(),
+                    resolved: ResolvedColumn {
+                        ch_type: "Int32".into(),
+                        default_sql: None,
+                    },
+                }
+                .mapping(),
+            ],
+            tees: Vec::new(),
+        };
+        let at = Stamp {
+            lsn: 0x500,
+            xid: 7,
+            commit_ts: 0,
+        };
+        let sys = SystemColumns::default();
+        let target = mapping.target.clone();
+        let tombstone =
+            partition_removal_sql(&target, None, &mapping, &sys, "_leaf_oid", 16500, at).unwrap();
+        assert_eq!(
+            tombstone,
+            "INSERT INTO `db`.`m` (`id`, `_leaf_oid`, `_lsn`, `_xid`, `_commit_ts`, `_is_deleted`) \
+             SELECT `id`, `_leaf_oid`, toUInt64(1280), toUInt32(7), \
+             fromUnixTimestamp64Micro(toInt64(946684800000000), 'UTC'), true \
+             FROM `db`.`m` FINAL WHERE `_leaf_oid` = 16500 AND `_lsn` < 1280 AND NOT `_is_deleted`"
+        );
+        let delete = |engine, sys: &SystemColumns| {
+            partition_removal_sql(&target, engine, &mapping, sys, "_leaf_oid", 16500, at)
+        };
+        let expected = "DELETE FROM `db`.`m` WHERE `_leaf_oid` = 16500 AND `_lsn` < 1280";
+        assert_eq!(delete(Some("MergeTree"), &sys).as_deref(), Some(expected));
+        let no_marker = SystemColumns {
+            is_deleted: None,
+            ..SystemColumns::default()
+        };
+        assert_eq!(delete(None, &no_marker).as_deref(), Some(expected));
+        assert!(delete(Some("Null"), &sys).is_none());
+        assert!(
+            delete(Some("ReplacingMergeTree(_lsn, _is_deleted)"), &sys)
+                .unwrap()
+                .starts_with("INSERT"),
+            "verbatim replacing engine still resolves by marker"
+        );
+    }
+
+    #[test]
+    fn partitioned_root_destination_carries_partition_column() {
+        let (m, _) = partition_pair();
+        let partitioned = CreateShape {
+            partition_by: Some("intDiv(id, 1000)"),
+            ..shape(false)
+        };
+        let sql =
+            render_from_desc(&m, &dest("db", &m), &partitioned, &ColumnRules::default()).unwrap();
+        assert!(sql.contains("`_leaf_oid` UInt32"), "{sql}");
+        assert!(
+            sql.contains("\nPARTITION BY intDiv(id, 1000)\nORDER BY (`id`, `region`)"),
+            "{sql}"
+        );
+        let off = CreateShape {
+            system: Arc::new(SystemColumns {
+                leaf: None,
+                ..SystemColumns::default()
+            }),
+            ..partitioned
+        };
+        let sql = render_from_desc(&m, &dest("db", &m), &off, &ColumnRules::default()).unwrap();
+        assert!(!sql.contains("_leaf_oid"), "{sql}");
+        let plain = desc("t", vec![att(1, "id", INT4OID, true, None)], Some(vec![1]));
+        let sql = render_from_desc(
+            &plain,
+            &dest("db", &plain),
+            &shape(false),
+            &ColumnRules::default(),
+        )
+        .unwrap();
+        assert!(
+            !sql.contains("_leaf_oid"),
+            "only partitioned tables carry it: {sql}"
+        );
+    }
+
+    #[test]
+    fn partition_order_by_may_name_the_partition_column() {
+        let (m, _) = partition_pair();
+        let render = |order_by: &[String]| {
+            let shape = CreateShape {
+                order_by,
+                ..shape(false)
+            };
+            render_from_desc(&m, &dest("db", &m), &shape, &ColumnRules::default()).unwrap()
+        };
+        let sql = render(&["_leaf_oid".to_owned(), "id".to_owned(), "region".to_owned()]);
+        assert!(
+            sql.contains("ORDER BY (`_leaf_oid`, `id`, `region`)"),
+            "{sql}"
+        );
+        let sql = render(&["id".to_owned()]);
+        assert!(
+            sql.ends_with("ORDER BY (`id`)"),
+            "key column omitted with a warning: {sql}"
+        );
+    }
+
+    /// `ATTACH` uses root's mapping; `DETACH` creates an independent mapping
+    #[test]
+    fn prediction_follows_partition_relinks() {
+        let (m, leaf) = partition_pair();
+        let cfg = DdlConfig {
+            instances: Default::default(),
+            drop_table_strategy: DropTableStrategy::Retain,
+            detach_strategy: DropTableStrategy::Retain,
+            auto_create_namespaces: HashSet::new(),
+            replicate_all: true,
+            auto_create_name_all: None,
+            runtime_config_schema: None,
+            target_database: "default".into(),
+            source_database: "app".into(),
+            namespaces: ahash::HashMap::default(),
+            soft_delete: false,
+            system: Arc::default(),
+            rules: Arc::default(),
+            column_rules: Arc::default(),
+        };
+        let standalone = Arc::new(RelDescriptor {
+            ancestors: Vec::new(),
+            ..leaf.clone()
+        });
+        let empty = MappingSnapshot::default();
+        let added = SchemaEvent::Added {
+            desc: Arc::new(leaf.clone()),
+        };
+        assert!(
+            predict_route_effect(&cfg, &empty, &added, false)
+                .unwrap()
+                .is_none()
+        );
+        let root = SchemaEvent::Added {
+            desc: Arc::new(m.clone()),
+        };
+        assert!(
+            predict_route_effect(&cfg, &empty, &root, false)
+                .unwrap()
+                .is_some()
+        );
+        let attach = SchemaEvent::Changed {
+            old: standalone.clone(),
+            new: Arc::new(leaf.clone()),
+            diff: SchemaDiff::default(),
+        };
+        assert!(
+            predict_route_effect(&cfg, &empty, &attach, false)
+                .unwrap()
+                .is_none()
+        );
+        let own = DdlConfig {
+            rules: Arc::new(rules_with(
+                "m_eu",
+                TableRule {
+                    route: Some(PartitionRoute::Self_),
+                    ..TableRule::default()
+                },
+            )),
+            ..cfg.clone()
+        };
+        let altered = SchemaEvent::Changed {
+            old: Arc::new(leaf.clone()),
+            new: Arc::new(leaf.clone()),
+            diff: SchemaDiff::default(),
+        };
+        assert!(
+            predict_route_effect(&own, &empty, &altered, false)
+                .unwrap()
+                .is_none(),
+            "unmapped partition with its own destination"
+        );
+        let detach = SchemaEvent::Changed {
+            old: Arc::new(leaf),
+            new: standalone,
+            diff: SchemaDiff::default(),
+        };
+        let predicted = predict_route_effect(&cfg, &empty, &detach, false).unwrap();
+        assert!(
+            matches!(&predicted, Some((r, Some(_))) if &*r.name == "m_eu"),
+            "{predicted:?}"
+        );
+        assert!(
+            predict_route_effect(&cfg, &empty, &detach, true)
+                .unwrap()
+                .is_none()
+        );
     }
 }

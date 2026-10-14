@@ -48,6 +48,7 @@ fn rel_descriptor() -> Arc<RelDescriptor> {
         rel_name: RelName::new("public", "foo"),
         kind: 'r',
         persistence: 'p',
+        ancestors: Vec::new(),
         replident: ReplIdent::Default { pk_attnums: None },
         attributes: vec![
             RelAttr {

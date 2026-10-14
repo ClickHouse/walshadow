@@ -106,6 +106,8 @@ pub struct NamespaceMapping {
     pub auto_create: bool,
     pub auto_create_name: Option<NameTemplate>,
     pub drop_table_strategy: Option<DropTableStrategy>,
+    /// What `DETACH PARTITION` does to rows the partition routed to its root
+    pub detach_strategy: Option<DropTableStrategy>,
     pub initial_load: Option<InitialLoadMode>,
 }
 
@@ -242,6 +244,10 @@ pub struct SystemColumns {
     /// `emitter_deletes_discarded`) — for append-only destinations
     #[serde(deserialize_with = "de_delete_marker")]
     pub is_deleted: Option<String>,
+    /// Source partition OID, appended only on partitioned-root destinations.
+    /// `None` leaves it out, which rules out partition-scoped row removal
+    #[serde(deserialize_with = "de_leaf")]
+    pub leaf: Option<String>,
 }
 
 impl Default for SystemColumns {
@@ -251,16 +257,29 @@ impl Default for SystemColumns {
             xid: "_xid".into(),
             commit_ts: "_commit_ts".into(),
             is_deleted: Some("_is_deleted".into()),
+            leaf: Some("_leaf_oid".into()),
         }
     }
 }
 
 /// `is_deleted = false` (or an empty name) drops the delete marker
 fn de_delete_marker<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    de_optional_column(d, SystemColumns::default().is_deleted)
+}
+
+/// `leaf = false` (or an empty name) drops the partition column
+fn de_leaf<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    de_optional_column(d, SystemColumns::default().leaf)
+}
+
+fn de_optional_column<'de, D: serde::Deserializer<'de>>(
+    d: D,
+    default: Option<String>,
+) -> Result<Option<String>, D::Error> {
     use serde::Deserialize;
     match toml::Value::deserialize(d)? {
         toml::Value::Boolean(false) => Ok(None),
-        toml::Value::Boolean(true) => Ok(SystemColumns::default().is_deleted),
+        toml::Value::Boolean(true) => Ok(default),
         toml::Value::String(name) => Ok((!name.is_empty()).then_some(name)),
         v => Err(serde::de::Error::custom(format!(
             "expected a string or false, got {}",
@@ -282,7 +301,8 @@ impl SystemColumns {
                 return Err(format!("system_columns.{key}: name must not be empty"));
             }
         }
-        let names = self.names();
+        let mut names = self.names();
+        names.extend(self.leaf.as_deref());
         for (i, a) in names.iter().enumerate() {
             if names[i + 1..].contains(a) {
                 return Err(format!("system_columns: `{a}` named twice"));
@@ -336,6 +356,18 @@ impl SystemColumns {
             Some(name) if !out.names()[..3].contains(&name) => out.is_deleted = Some(name.into()),
             _ => {}
         }
+        if out
+            .leaf
+            .as_deref()
+            .is_some_and(|l| out.names().contains(&l))
+        {
+            out.leaf = None;
+        }
+        match names.leaf.as_deref() {
+            Some("") => out.leaf = None,
+            Some(name) if !out.names().contains(&name) => out.leaf = Some(name.into()),
+            _ => {}
+        }
         out
     }
 }
@@ -351,6 +383,8 @@ pub struct SystemColumnNames {
     pub xid: Option<String>,
     pub commit_ts: Option<String>,
     pub is_deleted: Option<String>,
+    /// Blank drops the partition column, as for `is_deleted`
+    pub leaf: Option<String>,
 }
 
 impl SystemColumnNames {
@@ -359,6 +393,7 @@ impl SystemColumnNames {
             && self.xid.is_none()
             && self.commit_ts.is_none()
             && self.is_deleted.is_none()
+            && self.leaf.is_none()
     }
 
     pub fn overlay(&mut self, other: &Self) {
@@ -366,6 +401,7 @@ impl SystemColumnNames {
         set_if(&mut self.xid, &other.xid);
         set_if(&mut self.commit_ts, &other.commit_ts);
         set_if(&mut self.is_deleted, &other.is_deleted);
+        set_if(&mut self.leaf, &other.leaf);
     }
 
     /// Reject a set naming one column twice, or renaming onto a name another
@@ -388,6 +424,11 @@ impl SystemColumnNames {
                 return Err(format!("{ctx}: `{want}` names two system columns"));
             }
         }
+        if let Some(want) = self.leaf.as_deref().filter(|n| !n.is_empty())
+            && renamed.leaf.as_deref() != Some(want)
+        {
+            return Err(format!("{ctx}: `{want}` names two system columns"));
+        }
         Ok(())
     }
 }
@@ -397,10 +438,24 @@ impl SystemColumnNames {
 pub(crate) fn de_marker_override<'de, D: serde::Deserializer<'de>>(
     d: D,
 ) -> Result<Option<String>, D::Error> {
+    de_column_override(d, SystemColumns::default().is_deleted)
+}
+
+/// Per-relation partition column, read like [`de_marker_override`]
+pub(crate) fn de_leaf_override<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<String>, D::Error> {
+    de_column_override(d, SystemColumns::default().leaf)
+}
+
+fn de_column_override<'de, D: serde::Deserializer<'de>>(
+    d: D,
+    default: Option<String>,
+) -> Result<Option<String>, D::Error> {
     use serde::Deserialize;
     match toml::Value::deserialize(d)? {
         toml::Value::Boolean(false) => Ok(Some(String::new())),
-        toml::Value::Boolean(true) => Ok(SystemColumns::default().is_deleted),
+        toml::Value::Boolean(true) => Ok(default),
         toml::Value::String(name) => Ok(Some(name)),
         v => Err(serde::de::Error::custom(format!(
             "expected a string or false, got {}",
@@ -663,6 +718,52 @@ mod tests {
     }
 
     #[test]
+    fn partition_column_renames_disables_and_refuses_collisions() {
+        assert_eq!(
+            system_columns("").unwrap().leaf.as_deref(),
+            Some("_leaf_oid")
+        );
+        assert!(system_columns("leaf = false\n").unwrap().leaf.is_none());
+        assert_eq!(
+            system_columns("leaf = \"_part\"\n")
+                .unwrap()
+                .leaf
+                .as_deref(),
+            Some("_part")
+        );
+        assert!(system_columns("leaf = \"_lsn\"\n").is_err());
+
+        let renamed = SystemColumns::default().renamed(&SystemColumnNames {
+            leaf: Some("_p".into()),
+            ..SystemColumnNames::default()
+        });
+        assert_eq!(renamed.leaf.as_deref(), Some("_p"));
+        let dropped = SystemColumns::default().renamed(&SystemColumnNames {
+            leaf: Some(String::new()),
+            ..SystemColumnNames::default()
+        });
+        assert!(dropped.leaf.is_none());
+        let onto_lsn = SystemColumnNames {
+            leaf: Some("_lsn".into()),
+            ..SystemColumnNames::default()
+        };
+        assert!(onto_lsn.validate("table.public.t").is_err());
+        assert_eq!(
+            SystemColumns::default().renamed(&onto_lsn).leaf.as_deref(),
+            Some("_leaf_oid"),
+            "a colliding rename is skipped"
+        );
+        let lsn_takes_leaf = SystemColumns::default().renamed(&SystemColumnNames {
+            lsn: Some("_leaf_oid".into()),
+            ..SystemColumnNames::default()
+        });
+        assert!(
+            lsn_takes_leaf.leaf.is_none(),
+            "never two columns of one name"
+        );
+    }
+
+    #[test]
     fn per_relation_rename_inherits_unnamed_columns() {
         let names = SystemColumnNames {
             lsn: Some("_peerdb_version".into()),
@@ -806,6 +907,7 @@ mod tests {
             rel_name: RelName::new("app", "events"),
             kind: 'r',
             persistence: 'p',
+            ancestors: Vec::new(),
             replident: crate::schema::ReplIdent::Default { pk_attnums: None },
             attributes: attrs,
         }

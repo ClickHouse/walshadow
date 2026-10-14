@@ -112,8 +112,8 @@ pub struct BootstrapOutcome {
 /// referring rows would fail resolution mid-drain. Fail open, walk everything.
 pub fn tap_filenode_set(
     catalog: &CatalogMap,
-    routed: impl Fn(&RelName) -> bool,
-    walked: impl Fn(&RelName) -> bool,
+    routed: impl Fn(&RelDescriptor) -> bool,
+    walked: impl Fn(&RelDescriptor) -> bool,
 ) -> Option<ahash::HashSet<(Oid, Oid)>> {
     use ahash::HashSetExt;
     let by_oid: ahash::HashMap<Oid, (Oid, Oid)> = catalog
@@ -122,10 +122,10 @@ pub fn tap_filenode_set(
         .collect();
     let mut set = ahash::HashSet::new();
     for d in catalog.descriptors() {
-        if !routed(&d.rel_name) {
+        if !routed(d) {
             continue;
         }
-        if walked(&d.rel_name) {
+        if walked(d) {
             set.insert((d.rfn.db_node, d.rfn.rel_node));
         }
         if d.toast_oid == 0 {
@@ -297,7 +297,8 @@ pub async fn drain_backfill<O: TupleObserver + ?Sized>(
 /// upfront. Mirrors `ShadowCatalog::{fetch_by_rfn,fetch_attributes,
 /// fetch_replident}` (shadow_catalog.rs) but eager rather than lazy by
 /// filenode. Wrap in [`seed_in_snapshot`] when DDL quiescence isn't external.
-/// Filenode 0 (partitioned parents, views) has no heap to page-walk; skipped.
+/// Partitioned tables have no heap; they land as roots for destination
+/// creation and as ancestors of their partitions
 pub async fn seed_catalog_from_source(client: &Client) -> Result<CatalogMap> {
     let db_oid = current_database_oid(client).await?;
     let rows = client
@@ -314,16 +315,19 @@ pub async fn seed_catalog_from_source(client: &Client) -> Result<CatalogMap> {
                 coalesce(nullif(c.reltablespace, 0), \
                          (SELECT dattablespace FROM pg_database \
                           WHERE datname = current_database()))::oid, \
-                coalesce(pg_relation_filenode(c.oid), 0)::oid \
+                coalesce(pg_relation_filenode(c.oid), 0)::oid, \
+                (SELECT i.inhparent FROM pg_inherits i \
+                 WHERE i.inhrelid = c.oid AND c.relispartition)::oid \
              FROM pg_class c \
              JOIN pg_namespace n ON n.oid = c.relnamespace \
-             WHERE c.oid >= 16384 AND c.relkind IN ('r', 't', 'm')",
+             WHERE c.oid >= 16384 AND c.relkind IN ('r', 't', 'm', 'p')",
             &[],
         )
         .await
         .context("bootstrap: enumerate user relations on source")?;
 
-    let mut map = CatalogMap::new();
+    let mut by_oid: ahash::HashMap<Oid, (Arc<RelDescriptor>, Option<Oid>)> =
+        ahash::HashMap::default();
     for row in rows {
         let oid: Oid = row.get(0);
         let namespace_oid: Oid = row.get(1);
@@ -335,8 +339,8 @@ pub async fn seed_catalog_from_source(client: &Client) -> Result<CatalogMap> {
         let toast_oid: Oid = row.get(7);
         let spc_node: Oid = row.get(8);
         let rel_node: Oid = row.get(9);
-        if rel_node == 0 {
-            // No heap to page-walk (partitioned parent / view / sequence)
+        let parent: Option<Oid> = row.get(10);
+        if rel_node == 0 && kind != 'p' {
             continue;
         }
         let rfn = RelFileNode {
@@ -356,8 +360,25 @@ pub async fn seed_catalog_from_source(client: &Client) -> Result<CatalogMap> {
             persistence,
             replident,
             attributes,
+            ancestors: Vec::new(),
         };
-        map.insert(Arc::new(desc));
+        by_oid.insert(oid, (Arc::new(desc), parent));
+    }
+
+    let mut map = CatalogMap::new();
+    for (desc, parent) in by_oid.values() {
+        let mut desc = (**desc).clone();
+        let mut next = *parent;
+        while let Some((ancestor, up)) = next.and_then(|p| by_oid.get(&p)) {
+            desc.ancestors.push(ancestor.clone());
+            next = *up;
+        }
+        let desc = Arc::new(desc);
+        if desc.kind == 'p' {
+            map.insert_partitioned(desc);
+        } else {
+            map.insert(desc);
+        }
     }
     tracing::info!(
         target = "walshadow::backfill_bootstrap",

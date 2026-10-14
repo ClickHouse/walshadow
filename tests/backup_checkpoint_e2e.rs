@@ -55,6 +55,7 @@ async fn checkpoint_reuses_staging_and_rejects_replaced_table() {
             rel_name: name,
             kind: 'r',
             persistence: 'p',
+            ancestors: Vec::new(),
             replident: ReplIdent::Nothing,
             attributes: Vec::new(),
         }),

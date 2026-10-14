@@ -41,6 +41,7 @@
 #include "catalog/pg_attribute.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_index.h"
+#include "catalog/pg_inherits.h"
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_type.h"
 #include "libpq/pqformat.h"
@@ -256,6 +257,7 @@ ws_emit_class(StringInfo out, HeapTuple tup, TupleDesc desc) {
     ws_put_oid(out, f->reltoastrelid);
     ws_put_oid(out, f->reltablespace);
     ws_put_oid(out, f->relfilenode);
+    ws_put_bool(out, f->relispartition);
 }
 
 static void
@@ -311,6 +313,14 @@ ws_emit_index(StringInfo out, HeapTuple tup, TupleDesc desc) {
 }
 
 static void
+ws_emit_inherits(StringInfo out, HeapTuple tup, TupleDesc desc) {
+    Form_pg_inherits f = (Form_pg_inherits)GETSTRUCT(tup);
+
+    ws_put_oid(out, f->inhrelid);
+    ws_put_oid(out, f->inhparent);
+}
+
+static void
 ws_emit_namespace(StringInfo out, HeapTuple tup, TupleDesc desc) {
     Form_pg_namespace f = (Form_pg_namespace)GETSTRUCT(tup);
 
@@ -346,7 +356,7 @@ ws_catalog_plan(WsCatalog cat, WsCatalogPlan* plan) {
         plan->indexid    = ClassOidIndexId;
         plan->keyattno   = Anum_pg_class_oid;
         plan->min_attnum = 0;
-        plan->ncols      = 9;
+        plan->ncols      = 10;
         plan->emit       = ws_emit_class;
         return true;
     case WS_CAT_ATTRIBUTE:
@@ -364,6 +374,14 @@ ws_catalog_plan(WsCatalog cat, WsCatalogPlan* plan) {
         plan->min_attnum = 0;
         plan->ncols      = 5;
         plan->emit       = ws_emit_index;
+        return true;
+    case WS_CAT_INHERITS:
+        plan->relid      = InheritsRelationId;
+        plan->indexid    = InheritsRelidSeqnoIndexId;
+        plan->keyattno   = Anum_pg_inherits_inhrelid;
+        plan->min_attnum = 0;
+        plan->ncols      = 2;
+        plan->emit       = ws_emit_inherits;
         return true;
     case WS_CAT_NAMESPACE:
         plan->relid      = NamespaceRelationId;

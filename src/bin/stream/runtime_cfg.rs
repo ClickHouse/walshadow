@@ -93,10 +93,7 @@ pub(crate) async fn load_runtime_config(
     // 0 rows (greenfield) is fine — all TOML defaults then apply.
     if let Some(row) = client
         .query_opt(
-            &format!(
-                "SELECT row_budget, byte_budget, flush_timeout_ms, compression, \
-                 retry_max_attempts, drop_table_strategy FROM {s}.config_global WHERE id = 1"
-            ),
+            &format!("SELECT * FROM {s}.config_global WHERE id = 1"),
             &[],
         )
         .await
@@ -116,17 +113,12 @@ pub(crate) async fn load_runtime_config(
                 .get::<_, Option<i32>>("retry_max_attempts")
                 .map(i64::from),
             drop_table_strategy: row.get("drop_table_strategy"),
+            detach_strategy: row.try_get("detach_strategy").ok().flatten(),
         });
     }
 
     for row in client
-        .query(
-            &format!(
-                "SELECT namespace, target_database, auto_create, auto_create_name, \
-                 drop_table_strategy FROM {s}.config_namespace"
-            ),
-            &[],
-        )
+        .query(&format!("SELECT * FROM {s}.config_namespace"), &[])
         .await
         .context("read config_namespace")?
     {
@@ -138,6 +130,7 @@ pub(crate) async fn load_runtime_config(
                 auto_create: row.get("auto_create"),
                 auto_create_name: row.get("auto_create_name"),
                 drop_table_strategy: row.get("drop_table_strategy"),
+                detach_strategy: row.try_get("detach_strategy").ok().flatten(),
             },
         );
     }
@@ -162,11 +155,14 @@ pub(crate) async fn load_runtime_config(
                 order_by: row.try_get("order_by").ok().flatten(),
                 primary_key: row.try_get("primary_key").ok().flatten(),
                 engine: row.try_get("engine").ok().flatten(),
+                partition_by: row.try_get("partition_by").ok().flatten(),
+                route: row.try_get("route").ok().flatten(),
                 system: walshadow::mapping::SystemColumnNames {
                     lsn: row.try_get("lsn").ok().flatten(),
                     xid: row.try_get("xid").ok().flatten(),
                     commit_ts: row.try_get("commit_ts").ok().flatten(),
                     is_deleted: row.try_get("is_deleted").ok().flatten(),
+                    leaf: row.try_get("leaf").ok().flatten(),
                 },
                 match_kind: row.try_get("match").ok().flatten(),
             },

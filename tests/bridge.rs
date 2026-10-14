@@ -826,7 +826,10 @@ async fn bridge_overlay_descriptors_track_open_ddl() {
              ALTER TABLE app.m ADD COLUMN v numeric[] DEFAULT '{1.5}';
              ALTER TABLE app.m ADD COLUMN at timestamp DEFAULT '2024-01-02 03:04:05';
              ALTER TABLE app.m ADD COLUMN ok bool DEFAULT 'yes';
-             ALTER TABLE app.m DROP COLUMN gone;",
+             ALTER TABLE app.m DROP COLUMN gone;
+             CREATE TABLE app.p (id int, r int) PARTITION BY LIST (r);
+             CREATE TABLE app.p1 PARTITION OF app.p FOR VALUES IN (1) PARTITION BY LIST (id);
+             CREATE TABLE app.p11 PARTITION OF app.p1 FOR VALUES IN (1);",
         )
         .await
         .expect("committed setup");
@@ -841,7 +844,22 @@ async fn bridge_overlay_descriptors_track_open_ddl() {
         .await
         .expect("mirroring statement");
     assert_eq!(stated, committed, "statement diverged from the worker");
-    assert_eq!(mirror.stats().mirror_fetches, 1);
+    let oid_leaf = oid_of(&setup, "app.p11").await;
+    let (_, leaf) = mirror
+        .fetch_descriptors_batch(&[oid_leaf])
+        .await
+        .expect("mirrored partition");
+    assert_eq!(
+        leaf,
+        cat.fetch_descriptors_batch(&[oid_leaf]).await.unwrap().1
+    );
+    let chain: Vec<&str> = leaf[0]
+        .ancestors
+        .iter()
+        .map(|a| &*a.rel_name.name)
+        .collect();
+    assert_eq!(chain, ["p1", "p"]);
+    assert_eq!(mirror.stats().mirror_fetches, 2);
     let sorted = |(_, mut descs): (u64, Vec<walshadow::schema::RelDescriptor>)| {
         descs.sort_by_key(|d| d.oid);
         descs

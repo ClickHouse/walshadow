@@ -25,7 +25,7 @@ use crate::toast::FetchedValue;
 /// Frame and op layouts. Must equal `WS_PROTO_VERSION` in `pgext/walshadow.h`
 pub const PROTO_VERSION: u32 = 7;
 /// Catalog column plans. Must equal `WS_PROJECTION_VERSION`
-pub const PROJECTION_VERSION: u32 = 1;
+pub const PROJECTION_VERSION: u32 = 2;
 
 /// Match `WS_MAX_REQUEST_BYTES`
 pub const MAX_REQUEST_BYTES: usize = 256 * 1024 * 1024;
@@ -88,6 +88,7 @@ pub enum Catalog {
     Index = 3,
     Namespace = 4,
     Type = 5,
+    Inherits = 6,
 }
 
 impl Catalog {
@@ -100,6 +101,7 @@ impl Catalog {
             3 => Some(Catalog::Index),
             4 => Some(Catalog::Namespace),
             5 => Some(Catalog::Type),
+            6 => Some(Catalog::Inherits),
             _ => None,
         }
     }
@@ -107,10 +109,10 @@ impl Catalog {
     /// Columns the worker projects. Bump [`PROJECTION_VERSION`] on any change
     pub fn ncols(self) -> usize {
         match self {
-            Catalog::Class => 9,
+            Catalog::Class => 10,
             Catalog::Attribute => 12,
             Catalog::Index => 5,
-            Catalog::Namespace | Catalog::Type => 2,
+            Catalog::Namespace | Catalog::Type | Catalog::Inherits => 2,
         }
     }
 }
@@ -912,6 +914,7 @@ pub struct ClassRow {
     /// The column, not `pg_relation_filenode()`: that goes through relcache and
     /// would not see the overlay. User relations are never mapped
     pub relfilenode: u32,
+    pub relispartition: bool,
 }
 
 impl ScanRow for ClassRow {
@@ -928,6 +931,7 @@ impl ScanRow for ClassRow {
             reltoastrelid: field(row, 6)?.parse().map_err(|_| bad(row, 6))?,
             reltablespace: field(row, 7)?.parse().map_err(|_| bad(row, 7))?,
             relfilenode: field(row, 8)?.parse().map_err(|_| bad(row, 8))?,
+            relispartition: pg_bool(row, 9)?,
         })
     }
 }
@@ -995,6 +999,24 @@ impl ScanRow for IndexRow {
             indisprimary: pg_bool(row, 2)?,
             indisreplident: pg_bool(row, 3)?,
             indkey,
+        })
+    }
+}
+
+/// `pg_inherits` row; a partition has exactly one
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InheritsRow {
+    pub inhrelid: u32,
+    pub inhparent: u32,
+}
+
+impl ScanRow for InheritsRow {
+    const CATALOG: Catalog = Catalog::Inherits;
+
+    fn parse(row: &[Option<String>]) -> Result<Self, BridgeError> {
+        Ok(Self {
+            inhrelid: field(row, 0)?.parse().map_err(|_| bad(row, 0))?,
+            inhparent: field(row, 1)?.parse().map_err(|_| bad(row, 1))?,
         })
     }
 }
@@ -1155,10 +1177,12 @@ mod tests {
 
     #[test]
     fn class_row_parses_projection_order() {
-        let row: Vec<Option<String>> = ["16384", "2200", "t", "r", "p", "d", "16387", "0", "16384"]
-            .iter()
-            .map(|s| Some((*s).to_string()))
-            .collect();
+        let row: Vec<Option<String>> = [
+            "16384", "2200", "t", "r", "p", "d", "16387", "0", "16384", "f",
+        ]
+        .iter()
+        .map(|s| Some((*s).to_string()))
+        .collect();
         let parsed = ClassRow::parse(&row).unwrap();
         assert_eq!(parsed.oid, 16384);
         assert_eq!(parsed.relname, "t");
@@ -1201,11 +1225,12 @@ mod tests {
             Catalog::Index,
             Catalog::Namespace,
             Catalog::Type,
+            Catalog::Inherits,
         ] {
             assert_eq!(Catalog::from_id(cat as u8), Some(cat));
         }
         assert_eq!(Catalog::from_id(0), None);
-        assert_eq!(Catalog::from_id(6), None);
+        assert_eq!(Catalog::from_id(7), None);
     }
 
     #[test]

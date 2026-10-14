@@ -132,6 +132,7 @@ async fn chunked_copy_partitions_by_block_and_repeats_a_resumed_chunk() {
         rel_name: RelName::new(SCHEMA, "chunks"),
         kind: 'r',
         persistence: 'p',
+        ancestors: Vec::new(),
         replident: ReplIdent::Nothing,
         attributes: vec![attr(1, "id", INT8OID), attr(2, "payload", TEXTOID)],
     });

@@ -76,6 +76,7 @@ use crate::decode::wal_xact::{
 };
 use crate::emit::pipeline::tail::OwnedTail;
 use crate::emit::pipeline::{Fatal, bootstrap};
+use crate::emit::route::freeze_routes;
 use crate::filter::main_data::{parse_xl_heap_truncate, parse_xl_relmap_update};
 use crate::filter::pg_class_decoder::{
     DecodeOutcome, decode_pg_class_tuple, info_carries_new_tuple_heap,
@@ -610,14 +611,19 @@ async fn run_walk(
     let drain = tokio::spawn(bootstrap::drain(
         gated_rx,
         filter.clone(),
-        ctx.mapping.snapshot().await,
+        freeze_routes(
+            &ctx.mapping.snapshot().await,
+            ctx.config_rx
+                .as_ref()
+                .map(|rx| rx.borrow().clone())
+                .as_deref(),
+            &ctx.dest.current().row_policy(),
+        ),
         tail.msg_tx.clone(),
         tail.ack.clone(),
         ctx.stats.clone(),
         resolver.clone(),
         bootstrap::Deferral::Handback(toast_spool),
-        ctx.dest.current().row_policy(),
-        ctx.config_rx.as_ref().map(|rx| rx.borrow().clone()),
         HashSet::new(),
         barrier.clone(),
     ));

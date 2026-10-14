@@ -302,12 +302,16 @@ pub fn needs_oracle(
 ) -> bool {
     let alloc = Allocator::global(&mimalloc::MiMalloc);
     let system = SystemColumns::default();
-    catalog.descriptors().any(|desc| {
-        tables.get(&desc.rel_name).is_some_and(|mapping| {
-            TablePlan::build(alloc, desc, mapping, column_rules, &system)
-                .map_or(true, |plan| plan.needs_oracle())
+    // Partitions encode under their root's mapping and column types
+    catalog
+        .partitioned()
+        .chain(catalog.descriptors())
+        .any(|desc| {
+            tables.get(&desc.rel_name).is_some_and(|mapping| {
+                TablePlan::build(alloc, desc, mapping, column_rules, &system)
+                    .map_or(true, |plan| plan.needs_oracle())
+            })
         })
-    })
 }
 
 #[cfg(test)]
@@ -352,6 +356,7 @@ mod tests {
             rel_name: RelName::new("public", "foo"),
             kind: 'r',
             persistence: 'p',
+            ancestors: Vec::new(),
             replident: ReplIdent::Default { pk_attnums: None },
             attributes: attrs,
         }

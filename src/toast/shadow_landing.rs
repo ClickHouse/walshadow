@@ -202,6 +202,7 @@ mod tests {
             rel_name: RelName::new("pg_toast", &format!("pg_toast_{rel_node}")),
             kind,
             persistence: 'p',
+            ancestors: Vec::new(),
             replident: ReplIdent::Default { pk_attnums: None },
             attributes: Vec::new(),
         }

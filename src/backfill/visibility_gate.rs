@@ -30,6 +30,7 @@ use crate::emit::pipeline::batcher::BatcherMsg;
 use crate::emit::pipeline::bootstrap::BootstrapDrainOutcome;
 use crate::emit::pipeline::tail::OwnedTail;
 use crate::emit::pipeline::{Fatal, bootstrap};
+use crate::emit::route::freeze_routes;
 use crate::mapping::MappingSnapshot;
 use crate::schema::RelName;
 use crate::ticker::Ticker;
@@ -291,7 +292,11 @@ impl GreenfieldSink {
             lanes.push(bootstrap::drain(
                 rx,
                 self.catalog.clone(),
-                self.mapping.clone(),
+                freeze_routes(
+                    &self.mapping,
+                    Some(&*self.config),
+                    &self.dest.current().row_policy(),
+                ),
                 msg_tx,
                 ack,
                 self.stats.clone(),
@@ -303,8 +308,6 @@ impl GreenfieldSink {
                         .map_err(|e| format!("bootstrap: reopen handback spool: {e}"))?,
                     None => DeferredSpool::new(spool, DEFERRED_SPOOL_MEM_MAX),
                 }),
-                self.dest.current().row_policy(),
-                Some(self.config.clone()),
                 self.skip_initial.clone(),
                 None,
             ));

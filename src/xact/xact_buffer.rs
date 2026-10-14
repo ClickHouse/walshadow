@@ -396,7 +396,7 @@ pub enum DrainEntry {
     Catalog(SchemaEvent),
     /// Source-PG config-table write, applied at its position to the resolver
     /// so trailing rows in the same xact route against the post-config shape.
-    Config(ConfigEvent),
+    Config(Box<ConfigEvent>),
     /// Residual `O - B` deaths for one resolved rewrite generation, queued
     /// at commit LSN so it drains after every stashed birth. Applied via
     /// [`ToastResolver::rewrite_barrier`] once the generation's rows are put.
@@ -1106,7 +1106,7 @@ impl XactBuffer {
     /// Config-table write, interleaved into the drain at its `source_lsn` so it
     /// applies before the heap writes it precedes in WAL (plan §6)
     pub fn on_config_event(&mut self, xid: u32, source_lsn: u64, event: ConfigEvent) {
-        self.push_drain_entry(xid, source_lsn, DrainEntry::Config(event));
+        self.push_drain_entry(xid, source_lsn, DrainEntry::Config(Box::new(event)));
     }
 
     /// Queue a rewrite generation's residual-death barrier at commit LSN,
@@ -3330,6 +3330,7 @@ pub(crate) mod raw_fixtures {
             rel_name: crate::schema::RelName::new("public", "copy_t"),
             kind: 'r',
             persistence: 'p',
+            ancestors: Vec::new(),
             replident: crate::schema::ReplIdent::Full { pk_attnums: None },
             attributes: vec![crate::schema::RelAttr {
                 attnum: 1,
@@ -3577,6 +3578,7 @@ mod tests {
             rel_name: crate::schema::RelName::new("public", "buf_t"),
             kind: 'r',
             persistence: 'p',
+            ancestors: Vec::new(),
             replident: crate::schema::ReplIdent::Full { pk_attnums: None },
             attributes: vec![],
         })
@@ -3896,6 +3898,7 @@ mod tests {
             rel_name: RelName::new("pg_toast", "pg_toast_16385"),
             kind: 't',
             persistence: 'p',
+            ancestors: Vec::new(),
             replident: ReplIdent::Default { pk_attnums: None },
             attributes: vec![
                 RelAttr {
@@ -4020,6 +4023,7 @@ mod tests {
             rel_name: RelName::new("public", "t"),
             kind: 'r',
             persistence: 'p',
+            ancestors: Vec::new(),
             replident: ReplIdent::Default { pk_attnums: None },
             attributes: vec![crate::schema::RelAttr {
                 attnum: 1,
@@ -4673,6 +4677,7 @@ mod tests {
         SchemaEvent::Dropped {
             oid,
             rel_name: RelName::new("public", &format!("t{oid}")),
+            partition: None,
         }
     }
 

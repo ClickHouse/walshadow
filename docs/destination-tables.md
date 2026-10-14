@@ -83,6 +83,10 @@ Source columns are followed by four metadata columns:
 | `_commit_ts` | `DateTime64(6, 'UTC')` | source commit time |
 | `_is_deleted` | `Bool` | delete marker |
 
+Destinations of partitioned tables add `_leaf_oid UInt32` to identify source
+partition holding each row. This OID stays unchanged across `RENAME` and
+failover. It identifies a partition only within its source database
+
 Rename these columns, drop the delete marker, pin the sort key, or pick engine
 with settings below
 
@@ -126,6 +130,13 @@ UPDATE walshadow.config_table
 SET order_by = ARRAY['tenant_id', 'id'], primary_key = ARRAY['tenant_id']
 WHERE namespace = 'public' AND relname = 'events';
 ```
+
+Set `partition_by` to add a ClickHouse `PARTITION BY` expression when creating
+a destination. walshadow does not derive this expression from source
+partitioning. Include `_leaf_oid` to read fewer parts when removing a source
+partition's rows. walshadow warns if `order_by` omits key columns of a
+partitioned table: rows from different partitions with matching sort keys
+can merge into one row
 
 ## Choose engine
 
@@ -262,6 +273,9 @@ never renames a column in an existing ClickHouse table. Renaming for an existing
 destination also needs `ALTER TABLE ... RENAME COLUMN` in ClickHouse
 
 ## Drop the delete marker
+
+Set `leaf = false` to omit `_leaf_oid`, or use `leaf` to rename it like other
+metadata columns
 
 Set `is_deleted = false` for an append-only destination. This drops the marker
 column and discards source `DELETE` rows, counting them in

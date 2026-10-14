@@ -180,6 +180,7 @@ mod tests {
             rel_name: RelName::new("public", "t"),
             kind: 'r',
             persistence: 'p',
+            ancestors: Vec::new(),
             replident: ReplIdent::Default { pk_attnums: None },
             attributes,
         }

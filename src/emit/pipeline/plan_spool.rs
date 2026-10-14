@@ -577,6 +577,7 @@ mod tests {
             rel_name: RelName::new("public", &format!("t{rel_node}")),
             kind: 'r',
             persistence: 'p',
+            ancestors: Vec::new(),
             replident: crate::schema::ReplIdent::Full { pk_attnums: None },
             attributes: vec![RelAttr {
                 attnum: 1,
@@ -629,6 +630,7 @@ mod tests {
         DrainEntry::Catalog(SchemaEvent::Dropped {
             oid,
             rel_name: RelName::new("public", &format!("t{oid}")),
+            partition: None,
         })
     }
 

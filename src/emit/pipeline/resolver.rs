@@ -195,6 +195,7 @@ mod tests {
             rel_name: RelName::new("public", "g"),
             kind: 'r',
             persistence: 'p',
+            ancestors: Vec::new(),
             replident: ReplIdent::Default { pk_attnums: None },
             attributes: vec![RelAttr {
                 attnum: 1,
