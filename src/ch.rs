@@ -587,10 +587,6 @@ mod tests {
         body
     }
 
-    fn contains(hay: &[u8], needle: &str) -> bool {
-        hay.windows(needle.len()).any(|w| w == needle.as_bytes())
-    }
-
     /// The host dialed may differ from the name on the certificate;
     /// `tls_server_name` must be what the ClientHello carries
     #[tokio::test]
@@ -598,13 +594,14 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let hello = tokio::spawn(capture_client_hello(listener));
-        let config = secure_config("127.0.0.1", port, "svc.clickhouse.cloud");
+        let sni = "svc.clickhouse.cloud";
+        let config = secure_config("127.0.0.1", port, sni);
         // Server drops after the ClientHello, so the client errors; the
         // bytes it already sent are what this test is about
         assert!(connect_client(&config).await.is_err());
         let hello = hello.await.unwrap();
         assert!(
-            contains(&hello, "svc.clickhouse.cloud"),
+            hello.windows(sni.len()).any(|w| w == sni.as_bytes()),
             "SNI missing from ClientHello"
         );
     }
