@@ -110,6 +110,7 @@ fn descriptor(filenode: u32, columns: usize) -> Arc<RelDescriptor> {
         rel_name: RelName::new("public", &format!("t{filenode}")),
         kind: 'r',
         persistence: 'p',
+        ancestors: Vec::new(),
         replident: ReplIdent::Default { pk_attnums: None },
         attributes: (0..columns)
             .map(|i| RelAttr {
@@ -387,14 +388,12 @@ async fn bench_drain(shape: Shape) -> Report {
     let outcome = bootstrap::drain(
         tup_rx,
         catalog,
-        routes,
+        walshadow::emit::route::freeze_routes(&routes, None, &Default::default()),
         msg_tx.clone(),
         ack.clone(),
         stats.clone(),
         ToastResolver::disabled(),
         bootstrap::Deferral::Rejected,
-        Default::default(),
-        None,
         ahash::HashSet::default(),
         None,
     )

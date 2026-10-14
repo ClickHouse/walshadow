@@ -57,6 +57,7 @@ async fn renamed_system_columns_and_operator_keys() {
             auto_create: true,
             auto_create_name: Some(walshadow::mapping::NameTemplate::parse("$table$").unwrap()),
             drop_table_strategy: None,
+            detach_strategy: None,
             initial_load: None,
         },
     );
@@ -80,6 +81,7 @@ async fn renamed_system_columns_and_operator_keys() {
                 xid: "_x".into(),
                 commit_ts: "_peerdb_synced_at".into(),
                 is_deleted: None,
+                leaf: None,
             });
             // Reverse of the declared PK, so the key can only come from config
             cfg.table_entries.push((

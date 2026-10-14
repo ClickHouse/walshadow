@@ -1429,6 +1429,7 @@ mod tests {
             rel_name: crate::schema::RelName::new("public", "spill_t"),
             kind: 'r',
             persistence: 'p',
+            ancestors: Vec::new(),
             replident: crate::schema::ReplIdent::Full {
                 pk_attnums: Some(vec![1]),
             },

@@ -16,6 +16,12 @@ Review these limits before production use
   records are handled, but full restart and bootstrap cases are unvalidated
 - sequence state is not replicated, values already stored in table rows still replicate
 - non-default tablespaces are unsafe for bootstrap and managed-shadow lifecycle
+- partitions replicate through their root only; see
+  [partitioned tables](table-selection.md#replicate-partitioned-tables). Root
+  renames, root replica identity changes, and attaching a partitioned table as
+  subtree leave partitions using old root information until each
+  partition's next schema change. A deployment bootstrapped before partition
+  routing refuses to start once its database holds a partition; re-bootstrap it
 - unplanned primary promotion is not supported
 
 Unsupported behavior is not uniformly rejected at startup. Review source schema

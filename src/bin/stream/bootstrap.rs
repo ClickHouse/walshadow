@@ -29,12 +29,13 @@ use walshadow::bootstrap_marker::{self, BootstrapMarker};
 use walshadow::ch_emitter::{BootstrapMode, EmitterConfig, EmitterStats};
 use walshadow::config::{CliOverrides, ConfigResolver, cli_over_toml};
 use walshadow::decoder_sink::MetricsTupleObserver;
+use walshadow::emit::route::routing;
 use walshadow::mapping::MappingHandle;
 use walshadow::metrics::{MetricsRegistry, MetricsSnapshot};
 use walshadow::pipeline::Fatal;
 use walshadow::pipeline::tail::OwnedTail;
 use walshadow::runtime_config::InitialLoadMode;
-use walshadow::schema::{RelName, SchemaEvent};
+use walshadow::schema::RelDescriptor;
 use walshadow::source_feed::SourceFeed;
 use walshadow::toast::ToastResolver;
 use walshadow::visibility::PgXactPatch;
@@ -278,7 +279,11 @@ pub(crate) async fn run_bootstrap(
             let skip_initial: HashSet<_> = drain_catalog
                 .descriptors()
                 .filter_map(|d| {
-                    let rn = &d.rel_name;
+                    // A partition loads as its root's `initial_load` says
+                    let rn = &routing(d, Some(&resolved.rules))
+                        .owner(d)
+                        .unwrap_or(d)
+                        .rel_name;
                     let table_mode = emitter_cfg
                         .table_opt_ins
                         .get(rn)
@@ -294,7 +299,7 @@ pub(crate) async fn run_bootstrap(
                                 == Some(InitialLoadMode::None)
                         }
                     };
-                    none.then(|| rn.clone())
+                    none.then(|| d.rel_name.clone())
                 })
                 .collect();
             Some((emitter_cfg, mapping, resolved, skip_initial))
@@ -307,8 +312,12 @@ pub(crate) async fn run_bootstrap(
     let (tap_filenodes, needs_oracle, routes) = match &ch_target {
         Some((_, mapping, resolved, skip_initial)) => {
             let routed = mapping.snapshot().await;
-            let is_routed = |rn: &RelName| routed.contains_key(rn);
-            let walked = |rn: &RelName| is_routed(rn) && !skip_initial.contains(rn);
+            let is_routed = |d: &RelDescriptor| {
+                routing(d, Some(&resolved.rules))
+                    .owner(d)
+                    .is_some_and(|o| routed.contains_key(&o.rel_name))
+            };
+            let walked = |d: &RelDescriptor| is_routed(d) && !skip_initial.contains(&d.rel_name);
             (
                 walshadow::backfill_bootstrap::tap_filenode_set(&drain_catalog, is_routed, walked)
                     .map(Arc::new),
@@ -1248,9 +1257,12 @@ pub(crate) async fn bootstrap_build_mapping(
     )
     .await
     .context("bootstrap: init DDL applicator")?;
-    for desc in catalog.descriptors() {
+    // Partitions check against their root's destination, so roots first
+    let mut descs: Vec<_> = catalog.partitioned().chain(catalog.descriptors()).collect();
+    descs.sort_by_key(|d| d.ancestors.len());
+    for desc in descs {
         applicator
-            .apply(&SchemaEvent::Added { desc: desc.clone() })
+            .add(desc)
             .await
             .with_context(|| format!("bootstrap: ensure CH table {}", desc.rel_name))?;
     }

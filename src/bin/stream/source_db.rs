@@ -12,7 +12,7 @@ use walshadow::ch_emitter::{EmitterConfig, EmitterStats};
 use walshadow::config::{CliOverrides, ConfigResolver, ResolverBoot, SourceConn};
 use walshadow::pos::{Floor, Pos, RawStart};
 use walshadow::runtime_config::InitialLoadMode;
-use walshadow::schema::{RelName, SchemaEvent};
+use walshadow::schema::RelName;
 use walshadow::shadow_catalog::ShadowCatalog;
 use walshadow::source_db::{DbLink, SourceDb};
 
@@ -272,13 +272,10 @@ pub(crate) async fn build_source_db(input: SourceDbInputs<'_>) -> anyhow::Result
         .await
         .context("resolve descriptors for pinned mappings")?;
     for desc in descs {
-        let rel = desc.rel_name.clone();
         applicator
-            .apply(&SchemaEvent::Added {
-                desc: Arc::new(desc),
-            })
+            .add(&desc)
             .await
-            .with_context(|| format!("ensure CH dest for pinned mapping {rel}"))?;
+            .with_context(|| format!("ensure CH dest for pinned mapping {}", desc.rel_name))?;
     }
     Ok(BuiltSourceDb {
         db: Arc::new(SourceDb::new(
@@ -346,6 +343,18 @@ pub(crate) async fn open_db_desc_log(
         ] {
             let _ = tokio::fs::remove_file(dir.join(f)).await;
         }
+    }
+    if walshadow::desc_log::DescriptorLog::predates_partitions(dir).await?
+        && let Some(d) = (input.catalog.lock().await.fetch_all_descriptors().await?.1)
+            .into_iter()
+            .find(|d| d.is_partition())
+    {
+        anyhow::bail!(
+            "descriptor log for database {} predates partition routing and {} is a \
+             partition; re-bootstrap",
+            input.dbname,
+            d.rel_name,
+        );
     }
     let desc_log = Arc::new(
         walshadow::desc_log::DescriptorLog::open_on_branch(dir, input.identity, input.lineage)

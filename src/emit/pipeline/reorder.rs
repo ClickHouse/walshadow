@@ -29,7 +29,7 @@ use crate::catalog::pending::PendingCatalog;
 use crate::crash_test;
 use crate::decode::heap_decoder::DescribedHeap;
 use crate::decode::visibility::{PgXactView, SealedPatch, read_pg_xact};
-use crate::emit::ch_ddl::DdlApplicator;
+use crate::emit::ch_ddl::{DdlApplicator, Stamp};
 use crate::emit::ch_emitter::EmitterStats;
 use crate::record::{Record, RecordSink, SinkError};
 use crate::schema::{RelDescriptor, RelName, SchemaEvent, TableKey};
@@ -50,7 +50,7 @@ use crate::emit::pipeline::batcher::BatcherMsg;
 use crate::emit::pipeline::decode;
 use crate::emit::pipeline::plan_spool::{PlanItem, SealedPlan, VerifiedPlan};
 use crate::emit::pipeline::planner::{PlanRouteView, Planner, drain_reason};
-use crate::emit::route::{RouteSnapshot, RoutedHeap, RowPolicy};
+use crate::emit::route::{RouteSnapshot, RoutedHeap, RowPolicy, route_via};
 use crate::mapping::{MappingSnapshot, TableMapping};
 use crate::pos::{Floor, Monotone, Pos};
 use crate::runtime_config::{ConfigEvent, TableRow};
@@ -497,13 +497,15 @@ impl ReorderSink {
         _: Fenced,
         db: Oid,
         event: &SchemaEvent,
-        commit_lsn: u64,
+        at: Stamp,
     ) -> Result<(), SinkError> {
+        let commit_lsn = at.lsn;
         let Some(scope) = self.scopes.get_mut(&db) else {
             return Ok(());
         };
         let resolver_cfg = scope.db.resolver.clone();
         let mapping = scope.db.mapping.clone();
+        let backfiller = scope.backfiller.clone();
         let Some(applicator) = scope.applicator.as_mut() else {
             return Ok(());
         };
@@ -522,7 +524,7 @@ impl ReorderSink {
         #[cfg(feature = "test-support")]
         crash_test::hit(crash_test::Point::BeforeDdl, commit_lsn);
         applicator
-            .apply_under(event, frozen)
+            .apply_at(event, frozen, at)
             .await
             .map_err(|e| SinkError::Other(format!("ddl apply: {e}")))?;
         #[cfg(feature = "test-support")]
@@ -534,6 +536,15 @@ impl ReorderSink {
                 m.as_ref(),
                 "{rel}: apply diverged from plan"
             );
+        }
+        // `ATTACH` brings rows that never streamed into the root's destination
+        if let SchemaEvent::Changed { old, new, .. } = event
+            && new.is_partition()
+            && old.parent_oid() != new.parent_oid()
+            && let Some(backfiller) = backfiller
+        {
+            let mode = applicator.partition_load(new).await;
+            backfiller.note_opt_in(new.clone(), mode, commit_lsn).await;
         }
         // A `CREATE TABLE` for a forward-declared opt-in materialises here, in
         // the same barrier before this xact's trailing rows dispatch.
@@ -547,7 +558,7 @@ impl ReorderSink {
         // Immediate DROP wipe corrupts same-LSN replay fills. Ledger fsync
         // here precedes this commit's ack publication, so any persisted
         // cursor whose floor passed the drop already holds the entry.
-        if let SchemaEvent::Dropped { oid, rel_name } = event
+        if let SchemaEvent::Dropped { oid, rel_name, .. } = event
             && &*rel_name.namespace == "pg_toast"
             && self.resolver.stores_chunks()
         {
@@ -571,9 +582,11 @@ impl ReorderSink {
     /// auto-create/mapping picks up existing rels without log mutation.
     async fn apply_boot_events(
         &mut self,
-        descs: Vec<Arc<RelDescriptor>>,
+        mut descs: Vec<Arc<RelDescriptor>>,
         resume_lsn: u64,
     ) -> Result<(), SinkError> {
+        // Validate partitions against root destinations after creating roots
+        descs.sort_by_key(|d| d.ancestors.len());
         for desc in descs {
             if desc.kind == 't' {
                 continue;
@@ -583,7 +596,10 @@ impl ReorderSink {
                 Fenced::pre_pump(),
                 db,
                 &SchemaEvent::Added { desc },
-                resume_lsn,
+                Stamp {
+                    lsn: resume_lsn,
+                    ..Stamp::default()
+                },
             )
             .await?;
         }
@@ -713,10 +729,11 @@ impl ReorderSink {
         fenced: Fenced,
         db: Oid,
         entry: &DrainEntry,
-        commit_lsn: u64,
+        at: Stamp,
     ) -> Result<(), SinkError> {
+        let commit_lsn = at.lsn;
         match entry {
-            DrainEntry::Catalog(ev) => self.apply_event(fenced, db, ev, commit_lsn).await,
+            DrainEntry::Catalog(ev) => self.apply_event(fenced, db, ev, at).await,
             DrainEntry::Config(ev) => self.apply_config(fenced, db, ev, commit_lsn).await,
             DrainEntry::ToastBarrier {
                 toast_relid,
@@ -728,7 +745,12 @@ impl ReorderSink {
         }
     }
 
-    async fn apply_truncate(&mut self, _: Fenced, heap: &DescribedHeap) -> Result<(), SinkError> {
+    async fn apply_truncate(
+        &mut self,
+        _: Fenced,
+        heap: &DescribedHeap,
+        commit_ts: i64,
+    ) -> Result<(), SinkError> {
         let Some(scope) = self.scopes.get_mut(&heap.descriptor.rfn.db_node) else {
             return Ok(());
         };
@@ -739,8 +761,13 @@ impl ReorderSink {
         // so the rotation's drain-time Retired answer no longer needs a
         // predecessor walk here
         let rel = &heap.descriptor;
+        let at = Stamp {
+            lsn: heap.decoded.source_lsn,
+            xid: heap.decoded.xid,
+            commit_ts,
+        };
         applicator
-            .truncate(&rel.rel_name)
+            .truncate(rel, at)
             .await
             .map_err(|e| SinkError::Other(format!("ch truncate: {e}")))?;
         self.stats.truncates_emitted.fetch_add(1, Ordering::Relaxed);
@@ -834,9 +861,15 @@ impl ReorderSink {
     pub async fn execute_plan(
         &mut self,
         db: Oid,
+        xid: u32,
         plan: &VerifiedPlan,
     ) -> Result<(u64, bool), SinkError> {
         let (commit_ts, commit_lsn) = (plan.commit_ts, plan.commit_lsn);
+        let at = Stamp {
+            lsn: commit_lsn,
+            xid,
+            commit_ts,
+        };
         let mut rd = plan
             .replay()
             .map_err(|e| SinkError::Other(format!("plan replay: {e}")))?;
@@ -862,8 +895,7 @@ impl ReorderSink {
                     )
                     .await?;
                     let fenced = self.barrier_fence().await?;
-                    self.apply_drain_entry(fenced, db, &c.event, commit_lsn)
-                        .await?;
+                    self.apply_drain_entry(fenced, db, &c.event, at).await?;
                 }
                 PlanItem::Truncate { heap: h, upto } => {
                     self.put_plan_rows(plan, &mut rows_cursor, upto).await?;
@@ -876,7 +908,7 @@ impl ReorderSink {
                     )
                     .await?;
                     let fenced = self.barrier_fence().await?;
-                    self.apply_truncate(fenced, &h.described).await?;
+                    self.apply_truncate(fenced, &h.described, commit_ts).await?;
                 }
                 PlanItem::Heap(h) => {
                     rows_total += 1;
@@ -1074,7 +1106,7 @@ impl ReorderSink {
                 .into_verified()
                 .map_err(|e| SinkError::Other(format!("plan verify: {e}")))?;
             (rows_total, published) = self
-                .execute_plan(db, &plan)
+                .execute_plan(db, xid, &plan)
                 .instrument(trace_span!(
                     !txn.is_none(),
                     parent: &txn,
@@ -1178,7 +1210,10 @@ pub struct ReorderRouteView<'a> {
     config: Option<Arc<ResolvedConfig>>,
     /// Catalog fold above `mapping`; `None` value = locally dropped
     overlay: HashMap<RelName, Option<TableMapping>>,
+    /// Routes by row relation, partitions resolved through their root
     memo: HashMap<RelName, Option<Arc<RouteSnapshot>>>,
+    /// Routes by owning relation
+    owned: HashMap<RelName, Option<Arc<RouteSnapshot>>>,
     row_policy: RowPolicy,
     applicator: Option<&'a mut DdlApplicator>,
     stats: Arc<EmitterStats>,
@@ -1197,10 +1232,33 @@ impl<'a> ReorderRouteView<'a> {
             config,
             overlay: HashMap::new(),
             memo: HashMap::new(),
+            owned: HashMap::new(),
             row_policy,
             applicator,
             stats,
         }
+    }
+}
+
+impl ReorderRouteView<'_> {
+    fn owned_route(&mut self, rel_name: &RelName) -> Option<Arc<RouteSnapshot>> {
+        if let Some(r) = self.owned.get(rel_name) {
+            return r.clone();
+        }
+        let mapped = match self.overlay.get(rel_name) {
+            Some(o) => o.clone(),
+            None => self.mapping.as_ref().and_then(|m| m.get(rel_name)).cloned(),
+        };
+        let route = mapped.map(|m| {
+            let rules = self
+                .config
+                .as_ref()
+                .map_or_else(Arc::default, |rc| rc.column_rules.clone());
+            let policy = self.row_policy.for_rel(self.config.as_deref(), rel_name);
+            RouteSnapshot::freeze(Arc::new(m), rules, policy)
+        });
+        self.owned.insert(rel_name.clone(), route.clone());
+        route
     }
 }
 
@@ -1210,17 +1268,9 @@ impl PlanRouteView for ReorderRouteView<'_> {
         let route = if let Some(r) = self.memo.get(rel_name) {
             r.clone()
         } else {
-            let mapped = match self.overlay.get(rel_name) {
-                Some(o) => o.clone(),
-                None => self.mapping.as_ref().and_then(|m| m.get(rel_name)).cloned(),
-            };
-            let route = mapped.map(|m| {
-                let rules = self
-                    .config
-                    .as_ref()
-                    .map_or_else(Arc::default, |rc| rc.column_rules.clone());
-                let policy = self.row_policy.for_rel(self.config.as_deref(), rel_name);
-                RouteSnapshot::freeze(Arc::new(m), rules, policy)
+            let rules = self.config.as_ref().map(|rc| rc.rules.clone());
+            let route = route_via(&heap.descriptor, rules.as_deref(), |owner| {
+                self.owned_route(owner)
             });
             let result = if route.is_none() {
                 self.stats
@@ -1250,6 +1300,8 @@ impl PlanRouteView for ReorderRouteView<'_> {
             // no route effect
             return Ok(());
         };
+        // Schema events can change partition descriptors or root mappings
+        self.memo.clear();
         let mapping = self.mapping.clone().unwrap_or_default();
         let config = self.config.clone();
         let Some(app) = self.applicator.as_deref_mut() else {
@@ -1260,7 +1312,7 @@ impl PlanRouteView for ReorderRouteView<'_> {
             .await
             .map_err(|e| e.to_string())?
         {
-            self.memo.remove(&rel);
+            self.owned.remove(&rel);
             self.overlay.insert(rel, m);
         }
         Ok(())

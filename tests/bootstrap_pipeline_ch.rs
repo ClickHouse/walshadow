@@ -27,6 +27,7 @@ use walrus::pg::walparser::RelFileNode;
 use walshadow::backup_page_walk::{BackfillTuple, CatalogMap};
 use walshadow::ch::CompressionChoice;
 use walshadow::ch_emitter::{EmitterConfig, EmitterStats, InstanceConfig};
+use walshadow::emit::route::freeze_routes;
 use walshadow::heap_decoder::ColumnValue;
 use walshadow::mapping::{ColumnMapping, TableMapping, TableTarget};
 use walshadow::pipeline::batcher::BatcherMsg;
@@ -52,6 +53,7 @@ fn rel(rel_node: u32, name: &str) -> Arc<RelDescriptor> {
         rel_name: RelName::new("public", name),
         kind: 'r',
         persistence: 'p',
+        ancestors: Vec::new(),
         replident: ReplIdent::Default { pk_attnums: None },
         attributes: vec![RelAttr {
             attnum: 1,
@@ -176,14 +178,12 @@ async fn bootstrap_tail_fans_out_n2() {
     let drain = tokio::spawn(bootstrap::drain(
         tup_rx,
         catalog,
-        mapping,
+        freeze_routes(&mapping, None, &Default::default()),
         msg_tx.clone(),
         ack.clone(),
         stats.clone(),
         ToastResolver::disabled(),
         bootstrap::Deferral::Rejected,
-        Default::default(),
-        None,
         ahash::HashSet::default(),
         None,
     ));

@@ -155,6 +155,7 @@ async fn run_boundary_ddl(held: Held<'_>, d_ddl: &str) -> Result<(), String> {
             auto_create: true,
             auto_create_name: Some(walshadow::mapping::NameTemplate::parse("$table$").unwrap()),
             drop_table_strategy: None,
+            detach_strategy: None,
             initial_load: None,
         },
     );

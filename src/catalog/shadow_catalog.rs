@@ -28,8 +28,8 @@ use tokio_postgres::{Client, NoTls, Row};
 use walrus::pg::walparser::RelFileNode;
 
 use crate::ops::bridge::{
-    AttributeRow, Bridge, BridgeError, Catalog, ClassRow, IndexRow, MAX_SCAN_OIDS, NamespaceRow,
-    ScanRow, TypeRow,
+    AttributeRow, Bridge, BridgeError, Catalog, ClassRow, IndexRow, InheritsRow, MAX_SCAN_OIDS,
+    NamespaceRow, ScanRow, TypeRow,
 };
 #[cfg(test)]
 use crate::pg::socket_conninfo;
@@ -482,12 +482,14 @@ impl ShadowCatalog {
                 ..Default::default()
             });
         }
+        let requested = match scope {
+            Scope::Oids(_) => Some(class.iter().map(|c| c.oid).collect()),
+            Scope::Eligible => None,
+        };
+        let inherits = scan_ancestors(bridge, top_xid, &mut class, &mut pin).await?;
         // Whole-catalog pg_attribute is a seqscan of the biggest catalog there
         // is, and pg_class already named every relation worth scoping to
-        let oids: Vec<Oid> = match scope {
-            Scope::Oids(_) => scoped,
-            Scope::Eligible => class.iter().map(|c| c.oid).collect(),
-        };
+        let oids: Vec<Oid> = class.iter().map(|c| c.oid).collect();
         let attrs: Vec<AttributeRow> = scan_pinned(bridge, top_xid, &oids, &mut pin).await?;
         let indexes: Vec<IndexRow> = scan_pinned(bridge, top_xid, &oids, &mut pin).await?;
 
@@ -530,8 +532,10 @@ impl ShadowCatalog {
             class,
             attrs,
             indexes,
+            inherits,
             namespaces,
             types,
+            requested,
             replay_lsn: pinned,
         })
     }
@@ -545,6 +549,9 @@ impl ShadowCatalog {
             Scope::Eligible => self.query_retry(&MIRROR_ALL_SQL, &[]).await?,
         };
         let mut out = DescriptorRows::from_mirror(&rows)?;
+        if let Scope::Oids(oids) = scope {
+            out.requested = Some(oids.iter().copied().collect());
+        }
         let bridge = self.bridge.clone();
         raw_missing_values(&bridge, &mut out.attrs).await?;
         Ok(out)
@@ -707,8 +714,13 @@ const NO_REPLAY: &str = "0/0";
 /// to snapshot acquisition as one statement allows.
 fn mirror_sql(scope_pred: &str) -> String {
     format!(
-        "WITH scoped AS MATERIALIZED (\
-             SELECT c.* FROM pg_class c WHERE {scope_pred}\
+        "WITH RECURSIVE tree(oid) AS (\
+             SELECT c.oid FROM pg_class c WHERE {scope_pred} \
+             UNION SELECT i.inhparent FROM tree t \
+             JOIN pg_class c ON c.oid = t.oid AND c.relispartition \
+             JOIN pg_inherits i ON i.inhrelid = t.oid\
+         ), scoped AS MATERIALIZED (\
+             SELECT c.* FROM pg_class c WHERE c.oid IN (SELECT oid FROM tree)\
          ), att AS MATERIALIZED (\
              SELECT a.* FROM pg_attribute a JOIN scoped s ON s.oid = a.attrelid \
              WHERE a.attnum >= 1\
@@ -718,7 +730,8 @@ fn mirror_sql(scope_pred: &str) -> String {
              format('%s', c.oid), format('%s', c.relnamespace), format('%s', c.relname), \
              format('%s', c.relkind), format('%s', c.relpersistence), \
              format('%s', c.relreplident), format('%s', c.reltoastrelid), \
-             format('%s', c.reltablespace), format('%s', c.relfilenode)] \
+             format('%s', c.reltablespace), format('%s', c.relfilenode), \
+             format('%s', c.relispartition)] \
            FROM scoped c \
          UNION ALL SELECT {attribute}, ARRAY[\
              format('%s', a.attrelid), format('%s', a.attnum), format('%s', a.attname), \
@@ -732,6 +745,9 @@ fn mirror_sql(scope_pred: &str) -> String {
              format('%s', i.indisprimary), format('%s', i.indisreplident), \
              format('%s', i.indkey)] \
            FROM pg_index i JOIN scoped s ON s.oid = i.indrelid \
+         UNION ALL SELECT {inherits}, ARRAY[\
+             format('%s', i.inhrelid), format('%s', i.inhparent)] \
+           FROM pg_inherits i JOIN scoped s ON s.oid = i.inhrelid AND s.relispartition \
          UNION ALL SELECT {namespace}, ARRAY[format('%s', n.oid), format('%s', n.nspname)] \
            FROM pg_namespace n WHERE n.oid IN (SELECT relnamespace FROM scoped) \
          UNION ALL SELECT {typ}, ARRAY[format('%s', t.oid), format('%s', t.typname)] \
@@ -741,6 +757,7 @@ fn mirror_sql(scope_pred: &str) -> String {
         class = Catalog::Class as u8,
         attribute = Catalog::Attribute as u8,
         index = Catalog::Index as u8,
+        inherits = Catalog::Inherits as u8,
         namespace = Catalog::Namespace as u8,
         typ = Catalog::Type as u8,
     )
@@ -838,6 +855,43 @@ async fn scan_pinned<R: ScanRow>(
     Ok(out)
 }
 
+/// Add partition ancestors to `class` and return their `pg_inherits` links.
+/// Read one tree level per round
+async fn scan_ancestors(
+    bridge: &Bridge,
+    top_xid: u32,
+    class: &mut Vec<ClassRow>,
+    pin: &mut Option<u64>,
+) -> Result<Vec<InheritsRow>> {
+    let mut known: BTreeSet<Oid> = class.iter().map(|c| c.oid).collect();
+    let mut frontier: Vec<Oid> = class
+        .iter()
+        .filter(|c| c.relispartition)
+        .map(|c| c.oid)
+        .collect();
+    let mut inherits = Vec::new();
+    while !frontier.is_empty() {
+        let rows: Vec<InheritsRow> = scan_pinned(bridge, top_xid, &frontier, pin).await?;
+        let parents: Vec<Oid> = rows
+            .iter()
+            .map(|r| r.inhparent)
+            .filter(|p| known.insert(*p))
+            .collect();
+        inherits.extend(rows);
+        if parents.is_empty() {
+            break;
+        }
+        let more: Vec<ClassRow> = scan_pinned(bridge, top_xid, &parents, pin).await?;
+        frontier = more
+            .iter()
+            .filter(|c| c.relispartition)
+            .map(|c| c.oid)
+            .collect();
+        class.extend(more);
+    }
+    Ok(inherits)
+}
+
 /// One descriptor read's rows, laid out as `SCAN` projections in
 /// `pgext/overlay.c`.
 #[derive(Default)]
@@ -845,8 +899,12 @@ struct DescriptorRows {
     class: Vec<ClassRow>,
     attrs: Vec<AttributeRow>,
     indexes: Vec<IndexRow>,
+    inherits: Vec<InheritsRow>,
     namespaces: HashMap<Oid, String>,
     types: HashMap<Oid, String>,
+    /// Requested relations. Other `class` rows supply ancestor information.
+    /// Use `None` to keep every row
+    requested: Option<BTreeSet<Oid>>,
     replay_lsn: u64,
 }
 
@@ -875,6 +933,7 @@ impl DescriptorRows {
                 Catalog::Class => out.class.push(ClassRow::parse(&cols)?),
                 Catalog::Attribute => out.attrs.push(AttributeRow::parse(&cols)?),
                 Catalog::Index => out.indexes.push(IndexRow::parse(&cols)?),
+                Catalog::Inherits => out.inherits.push(InheritsRow::parse(&cols)?),
                 Catalog::Namespace => {
                     let row = NamespaceRow::parse(&cols)?;
                     out.namespaces.insert(row.oid, row.nspname);
@@ -903,7 +962,7 @@ impl DescriptorRows {
                 .push(index);
         }
         let mut seen = BTreeSet::new();
-        let mut out = Vec::with_capacity(self.class.len());
+        let mut built: HashMap<Oid, Arc<RelDescriptor>> = HashMap::with_capacity(self.class.len());
         for row in &self.class {
             // Two rows for one oid is the overlay's visibility predicate
             // failing to apply the transaction's own delete, ie a descriptor
@@ -914,15 +973,47 @@ impl DescriptorRows {
                     row.oid
                 )));
             }
-            out.push(descriptor_from_rows(
-                row,
-                attrs_by_rel.get(&row.oid).map_or(&[][..], Vec::as_slice),
-                indexes_by_rel.get(&row.oid).map_or(&[][..], Vec::as_slice),
-                &self.namespaces,
-                &self.types,
-                db_node,
-                default_tablespace,
-            )?);
+            built.insert(
+                row.oid,
+                Arc::new(descriptor_from_rows(
+                    row,
+                    attrs_by_rel.get(&row.oid).map_or(&[][..], Vec::as_slice),
+                    indexes_by_rel.get(&row.oid).map_or(&[][..], Vec::as_slice),
+                    &self.namespaces,
+                    &self.types,
+                    db_node,
+                    default_tablespace,
+                )?),
+            );
+        }
+        let parent_of: HashMap<Oid, Oid> = self
+            .inherits
+            .iter()
+            .map(|i| (i.inhrelid, i.inhparent))
+            .collect();
+        let partitions: BTreeSet<Oid> = self
+            .class
+            .iter()
+            .filter(|row| row.relispartition)
+            .map(|row| row.oid)
+            .collect();
+        let mut out = Vec::with_capacity(self.class.len());
+        for row in &self.class {
+            let oid = row.oid;
+            if self.requested.as_ref().is_some_and(|r| !r.contains(&oid)) {
+                continue;
+            }
+            let mut desc = (*built[&oid]).clone();
+            let mut at = oid;
+            while partitions.contains(&at)
+                && let Some(parent) = parent_of.get(&at)
+                && let Some(ancestor) = built.get(parent)
+                && desc.ancestors.len() < self.class.len()
+            {
+                desc.ancestors.push(ancestor.clone());
+                at = *parent;
+            }
+            out.push(desc);
         }
         Ok(out)
     }
@@ -1023,6 +1114,7 @@ fn descriptor_from_rows(
         rel_name: RelName::new(namespace_name, &class.relname),
         kind: class.relkind,
         persistence: class.relpersistence,
+        ancestors: Vec::new(),
         replident,
         attributes,
     })
@@ -1083,6 +1175,7 @@ mod tests {
             reltoastrelid: 16387,
             reltablespace: 0,
             relfilenode: 16384,
+            relispartition: false,
         }
     }
 
@@ -1213,6 +1306,67 @@ mod tests {
                 key_attnums: vec![2, 3],
             }
         );
+    }
+
+    /// Root `m` > sub-parent `a` > leaf `a1`, plus a legacy `INHERITS`
+    /// child whose `pg_inherits` row names no partition parent
+    #[test]
+    fn assemble_chains_partition_ancestors_and_drops_unrequested() {
+        let class = |oid, relname: &str, relkind, relispartition| ClassRow {
+            oid,
+            relname: relname.into(),
+            relkind,
+            relispartition,
+            ..class_row()
+        };
+        let attrs = |oid| AttributeRow {
+            attrelid: oid,
+            ..attr_row(1, "id", 23)
+        };
+        let rows = DescriptorRows {
+            class: vec![
+                class(16500, "a1", 'r', true),
+                class(16510, "kid", 'r', false),
+                class(16490, "a", 'p', true),
+                class(16480, "m", 'p', false),
+            ],
+            attrs: [16500, 16510, 16490, 16480].map(attrs).to_vec(),
+            inherits: vec![
+                InheritsRow {
+                    inhrelid: 16500,
+                    inhparent: 16490,
+                },
+                InheritsRow {
+                    inhrelid: 16490,
+                    inhparent: 16480,
+                },
+                InheritsRow {
+                    inhrelid: 16510,
+                    inhparent: 16480,
+                },
+            ],
+            namespaces: names(&[(2200, "public")]),
+            types: names(&[(23, "int4")]),
+            requested: Some([16500, 16510].into_iter().collect()),
+            ..DescriptorRows::default()
+        };
+        let descs = rows.assemble(5, DEFAULT_TABLESPACE).unwrap();
+        let by_name = |n: &str| descs.iter().find(|d| &*d.rel_name.name == n);
+        assert!(
+            by_name("m").is_none() && by_name("a").is_none(),
+            "ancestors only complete"
+        );
+        let leaf = by_name("a1").expect("leaf");
+        let chain: Vec<&str> = leaf.ancestors.iter().map(|a| &*a.rel_name.name).collect();
+        assert_eq!(chain, ["a", "m"], "parent first");
+        assert!(leaf.ancestors.iter().all(|a| !a.is_partition()));
+        assert!(!by_name("kid").expect("inheritance child").is_partition());
+
+        let nameless = DescriptorRows {
+            class: vec![class_row()],
+            ..DescriptorRows::default()
+        };
+        assert!(nameless.assemble(5, DEFAULT_TABLESPACE).is_err());
     }
 
     #[test]

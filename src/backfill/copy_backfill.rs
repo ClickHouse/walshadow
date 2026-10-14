@@ -86,6 +86,7 @@ use crate::decode::heap_decoder::ColumnValue;
 use crate::emit::ch_emitter::{EmitterStats, ToastMode};
 use crate::emit::pipeline::tail::OwnedTail;
 use crate::emit::pipeline::{Fatal, bootstrap};
+use crate::emit::route::{Routing, freeze_routes, routing};
 use crate::mapping::{MappingHandle, TableTarget};
 use crate::ops::oracle::Oracle;
 use crate::pg::{current_wal_lsn, quote_ident};
@@ -915,6 +916,40 @@ impl CopyBackfiller {
         if mode == InitialLoadMode::None {
             return;
         }
+        if desc.kind == 'p' {
+            // No rows of its own: load each partition routed to it
+            let rules = self.table_rules();
+            let partitions: Vec<_> = self
+                .log
+                .active_present_at(opt_in_lsn)
+                .into_iter()
+                .filter(|d| d.kind != 'p')
+                .filter(|d| {
+                    matches!(routing(d, rules.as_deref()), Routing::Ancestor(r) if r.oid == desc.oid)
+                })
+                .collect();
+            for partition in &partitions {
+                Box::pin(self.note_opt_in(partition, mode, opt_in_lsn)).await;
+            }
+            return;
+        }
+        // Backup loads publish by table exchange, which would discard the
+        // rows other partitions put in a shared destination
+        let shared = matches!(
+            routing(desc, self.table_rules().as_deref()),
+            Routing::Ancestor(_)
+        );
+        let mode = if shared && mode != InitialLoadMode::Copy {
+            tracing::info!(
+                target: "walshadow::backfill",
+                qname = %desc.rel_name,
+                requested = mode.as_str(),
+                "partition loads by copy",
+            );
+            InitialLoadMode::Copy
+        } else {
+            mode
+        };
         let rel = desc.rel_name.clone();
         let (s_lsn, mode, spawn_pass, resume) = {
             let mut inner = self.inner.lock().await;
@@ -1811,14 +1846,19 @@ impl CopyBackfiller {
         let drain = tokio::spawn(bootstrap::drain(
             tup_rx,
             catalog,
-            self.mapping.snapshot().await,
+            freeze_routes(
+                &self.mapping.snapshot().await,
+                self.config_rx
+                    .as_ref()
+                    .map(|rx| rx.borrow().clone())
+                    .as_deref(),
+                &self.dest.current().row_policy(),
+            ),
             tail.msg_tx.clone(),
             tail.ack.clone(),
             self.stats.clone(),
             ToastResolver::disabled(),
             bootstrap::Deferral::Rejected,
-            self.dest.current().row_policy(),
-            self.config_rx.as_ref().map(|rx| rx.borrow().clone()),
             HashSet::new(),
             None,
         ));
@@ -2043,6 +2083,7 @@ mod tests {
             rel_name: RelName::new("app", "orders"),
             kind: 'r',
             persistence: 'p',
+            ancestors: Vec::new(),
             replident: ReplIdent::Default { pk_attnums: None },
             attributes: attrs,
         }

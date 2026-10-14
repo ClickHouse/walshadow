@@ -64,9 +64,9 @@ use crate::crash_test;
 use crate::filter::SmgrMarkers;
 use crate::ops::bridge::BridgeError;
 use crate::record::{BoundaryInfo, BoundaryKind, SinkError};
-use crate::schema::{RelDescriptor, SchemaEvent, compute_schema_diff};
+use crate::schema::{DroppedPartition, RelDescriptor, SchemaEvent, compute_schema_diff};
 use crate::xact::xact_buffer::XactBuffer;
-use ahash::{HashMap, HashMapExt};
+use ahash::{HashMap, HashMapExt, HashSet};
 
 crate::atomic_stats! {
     pub struct CaptureStats {
@@ -352,6 +352,12 @@ impl CatalogCapture {
                 last_for_oid.insert(entry.oid, at);
             }
         }
+        let dropped_here: HashSet<Oid> = batch
+            .entries
+            .iter()
+            .filter(|e| matches!(e.value, LogValue::Dropped))
+            .map(|e| e.oid)
+            .collect();
         let mut out = Vec::with_capacity(last_for_oid.len());
         for (at, entry) in batch.entries.iter().enumerate() {
             if last_for_oid.get(&entry.oid) != Some(&at) {
@@ -378,6 +384,15 @@ impl CatalogCapture {
                             event: SchemaEvent::Dropped {
                                 oid: entry.oid,
                                 rel_name: old.rel_name.clone(),
+                                partition: old.is_partition().then(|| DroppedPartition {
+                                    desc: old.clone(),
+                                    dropped: old
+                                        .ancestors
+                                        .iter()
+                                        .map(|a| a.oid)
+                                        .filter(|oid| dropped_here.contains(oid))
+                                        .collect(),
+                                }),
                             },
                         });
                     }
@@ -822,7 +837,9 @@ fn in_place_verdict(
 }
 
 /// Added / Changed for heap kinds; toast shape changes are internal (chunk
-/// layout is fixed), only its Dropped feeds the retire ledger.
+/// layout is fixed), only its Dropped feeds the retire ledger. Partition
+/// trees also report `ATTACH` / `DETACH` and identity or persistence
+/// changes, which decide whether a partition may route to its root
 fn diff_event(pred: Option<&RelDescriptor>, desc: &Arc<RelDescriptor>) -> Option<SchemaEvent> {
     if desc.kind == 't' {
         return None;
@@ -831,7 +848,12 @@ fn diff_event(pred: Option<&RelDescriptor>, desc: &Arc<RelDescriptor>) -> Option
         None => Some(SchemaEvent::Added { desc: desc.clone() }),
         Some(old) => {
             let diff = compute_schema_diff(old, desc);
-            (!diff.is_empty()).then(|| SchemaEvent::Changed {
+            let tree = old.is_partition() || desc.is_partition() || desc.kind == 'p';
+            let relinked = tree
+                && (old.parent_oid() != desc.parent_oid()
+                    || old.replident != desc.replident
+                    || old.persistence != desc.persistence);
+            (!diff.is_empty() || relinked).then(|| SchemaEvent::Changed {
                 old: Arc::new(old.clone()),
                 new: desc.clone(),
                 diff,
@@ -858,6 +880,7 @@ mod tests {
             rel_name: RelName::new("public", name),
             kind: 'r',
             persistence: 'p',
+            ancestors: Vec::new(),
             replident: ReplIdent::Default { pk_attnums: None },
             attributes: vec![RelAttr {
                 attnum: 1,
@@ -941,6 +964,47 @@ mod tests {
         assert_eq!(from, 500);
         assert!(published.is_empty(), "empty run needs no fence");
         assert!(incompat.is_some_and(|i| i.is_physical()));
+    }
+
+    /// `ATTACH` and identity changes alter no column, yet decide routing
+    #[test]
+    fn partition_relinks_surface_as_changed() {
+        let root = Arc::new(RelDescriptor {
+            kind: 'p',
+            ..rel(23, 4, "m")
+        });
+        let standalone = rel(23, 4, "t");
+        let attached = Arc::new(RelDescriptor {
+            ancestors: vec![root.as_ancestor()],
+            ..standalone.clone()
+        });
+        assert!(matches!(
+            diff_event(Some(&standalone), &attached),
+            Some(SchemaEvent::Changed { diff, .. }) if diff.is_empty()
+        ));
+        assert!(matches!(
+            diff_event(Some(&attached), &Arc::new(standalone.clone())),
+            Some(SchemaEvent::Changed { .. })
+        ));
+        assert!(diff_event(Some(&attached), &attached).is_none());
+        let full = Arc::new(RelDescriptor {
+            replident: crate::schema::ReplIdent::Full { pk_attnums: None },
+            ..(*attached).clone()
+        });
+        assert!(diff_event(Some(&attached), &full).is_some());
+        let unlogged = Arc::new(RelDescriptor {
+            persistence: 'u',
+            ..(*root).clone()
+        });
+        assert!(diff_event(Some(&root), &unlogged).is_some());
+        let plain_full = Arc::new(RelDescriptor {
+            replident: crate::schema::ReplIdent::Full { pk_attnums: None },
+            ..standalone.clone()
+        });
+        assert!(
+            diff_event(Some(&standalone), &plain_full).is_none(),
+            "outside partition trees identity stays silent"
+        );
     }
 
     #[test]

@@ -284,6 +284,7 @@ mod tests {
             rel_name: RelName::new("public", &format!("t{rel_node}")),
             kind: 'r',
             persistence: 'p',
+            ancestors: Vec::new(),
             replident: crate::schema::ReplIdent::Full { pk_attnums: None },
             attributes: vec![RelAttr {
                 attnum: 1,
@@ -384,6 +385,7 @@ mod tests {
             SchemaEvent::Dropped {
                 oid: 16600,
                 rel_name: rel.rel_name.clone(),
+                partition: None,
             },
         );
         b.on_heap(heap(&rel, 200, ColumnValue::Int4(3)))
@@ -630,6 +632,7 @@ mod tests {
             SchemaEvent::Dropped {
                 oid: 16699,
                 rel_name: RelName::new("public", "other"),
+                partition: None,
             },
         );
         let mut truncate = heap(&rel, 105, ColumnValue::Int4(0));

@@ -19,7 +19,7 @@ use crate::emit::ch_emitter::EmitterStats;
 use crate::emit::pipeline::ack::{AckHandle, OpenSeq, Publish, SeqAlloc};
 use crate::emit::pipeline::batcher::{BatcherMsg, RoutedRow, RowChunk};
 use crate::emit::pipeline::decode::DECODE_CHUNK_BYTES;
-use crate::emit::route::{RouteSnapshot, RowPolicy, freeze_routes};
+use crate::emit::route::{FrozenRoutes, RouteSnapshot, RowPolicy, freeze_routes};
 use crate::mapping::{MappingSnapshot, TableMapping};
 use crate::ops::oracle::render_ext_columns;
 use crate::schema::{RelDescriptor, RelName};
@@ -170,14 +170,12 @@ pub enum Deferral {
 pub async fn drain(
     mut rx: mpsc::Receiver<Vec<BackfillTuple>>,
     catalog: CatalogMap,
-    mapping: MappingSnapshot,
+    routes: FrozenRoutes,
     msg_tx: mpsc::Sender<BatcherMsg>,
     ack: AckHandle,
     stats: Arc<EmitterStats>,
     resolver: ToastResolver,
     deferral: Deferral,
-    row_policy: RowPolicy,
-    config: Option<Arc<ResolvedConfig>>,
     skip_initial: HashSet<RelName>,
     barrier: Option<Arc<WalkBarrier>>,
 ) -> Result<BootstrapDrainOutcome, String> {
@@ -186,7 +184,6 @@ pub async fn drain(
         Deferral::Local(spool) => (Some(spool), false),
         Deferral::Handback(spool) => (Some(spool), true),
     };
-    let routes = freeze_routes(&mapping, config.as_deref(), &row_policy);
     let mut footprint = DeferredFootprint::new(&stats);
     let mut seqs = ack.seqs(0);
     let mut rows_routed = 0;
@@ -240,7 +237,7 @@ pub async fn drain(
                 continue;
             }
 
-            let Some(route) = routes.get(&rel.rel_name).cloned() else {
+            let Some(route) = routes.route(&rel) else {
                 stats.unsupported_relations.fetch_add(1, Ordering::Relaxed);
                 continue;
             };
@@ -376,7 +373,7 @@ pub struct ReplayCheckpoint<'a> {
 #[allow(clippy::too_many_arguments)]
 async fn resolve_spooled(
     spool: Replayable,
-    routes: &ahash::HashMap<RelName, Arc<RouteSnapshot>>,
+    routes: &FrozenRoutes,
     catalog: &CatalogMap,
     msg_tx: &mpsc::Sender<BatcherMsg>,
     ack: &AckHandle,
@@ -587,7 +584,7 @@ struct ResolvedReplayBatch {
 /// Read one batch and resolve its values; `None` at spool end
 async fn prepare_batch(
     replay: &mut DeferredReader,
-    routes: &ahash::HashMap<RelName, Arc<RouteSnapshot>>,
+    routes: &FrozenRoutes,
     catalog: &CatalogMap,
     stats: &EmitterStats,
     resolver: &ToastResolver,
@@ -636,7 +633,7 @@ async fn route_batch(
 /// mapped relation owns. Value caps are checked here, before any fetch
 async fn next_batch(
     replay: &mut DeferredReader,
-    routes: &ahash::HashMap<RelName, Arc<RouteSnapshot>>,
+    routes: &FrozenRoutes,
     catalog: &CatalogMap,
     stats: &EmitterStats,
     resolver: &ToastResolver,
@@ -658,7 +655,7 @@ async fn next_batch(
             stats.unsupported_relations.fetch_add(1, Ordering::Relaxed);
             continue;
         };
-        let Some(route) = routes.get(&rel.rel_name).cloned() else {
+        let Some(route) = routes.route(&rel) else {
             stats.unsupported_relations.fetch_add(1, Ordering::Relaxed);
             continue;
         };
@@ -1055,6 +1052,7 @@ mod tests {
             rel_name: RelName::new("public", &name),
             kind: 'r',
             persistence: 'p',
+            ancestors: Vec::new(),
             replident: ReplIdent::Default { pk_attnums: None },
             attributes: vec![RelAttr {
                 attnum: 1,
@@ -1118,6 +1116,7 @@ mod tests {
             rel_name: RelName::new("public", &name),
             kind: 'r',
             persistence: 'p',
+            ancestors: Vec::new(),
             replident: ReplIdent::Default { pk_attnums: None },
             attributes: vec![RelAttr {
                 attnum: 1,
@@ -1166,6 +1165,7 @@ mod tests {
             rel_name: RelName::new("pg_toast", &name),
             kind: 't',
             persistence: 'p',
+            ancestors: Vec::new(),
             replident: ReplIdent::Default { pk_attnums: None },
             attributes: vec![],
         })
@@ -1239,14 +1239,12 @@ mod tests {
         let err = drain(
             rx,
             catalog,
-            mapping,
+            freeze_routes(&mapping, None, &RowPolicy::default()),
             msg_tx,
             ack,
             stats.clone(),
             ToastResolver::with_store(Arc::new(MemChunkStore::new()), stats),
             Deferral::Rejected,
-            Default::default(),
-            None,
             HashSet::new(),
             None,
         )
@@ -1285,14 +1283,12 @@ mod tests {
         let drain_task = tokio::spawn(drain(
             tup_rx,
             catalog,
-            mapping,
+            freeze_routes(&mapping, None, &RowPolicy::default()),
             msg_tx,
             ack.clone(),
             stats.clone(),
             ToastResolver::disabled(),
             Deferral::Local(mem_spool()),
-            Default::default(),
-            None,
             HashSet::new(),
             None,
         ));
@@ -1339,14 +1335,12 @@ mod tests {
         let drain_task = tokio::spawn(drain(
             tup_rx,
             catalog,
-            mapping,
+            freeze_routes(&mapping, None, &RowPolicy::default()),
             msg_tx,
             ack.clone(),
             stats.clone(),
             ToastResolver::disabled(),
             Deferral::Local(mem_spool()),
-            Default::default(),
-            None,
             HashSet::new(),
             None,
         ));
@@ -1391,14 +1385,12 @@ mod tests {
         let drain_task = tokio::spawn(drain(
             tup_rx,
             catalog,
-            mapping,
+            freeze_routes(&mapping, None, &RowPolicy::default()),
             msg_tx,
             ack.clone(),
             stats.clone(),
             resolver,
             Deferral::Local(mem_spool()),
-            Default::default(),
-            None,
             HashSet::new(),
             None,
         ));
@@ -1447,14 +1439,12 @@ mod tests {
         let drain_task = tokio::spawn(drain(
             tup_rx,
             catalog,
-            mapping,
+            freeze_routes(&mapping, None, &RowPolicy::default()),
             msg_tx,
             ack.clone(),
             stats.clone(),
             resolver,
             Deferral::Local(mem_spool()),
-            Default::default(),
-            None,
             HashSet::new(),
             None,
         ));
@@ -1510,7 +1500,7 @@ mod tests {
         let drain_task = tokio::spawn(drain(
             tup_rx,
             catalog,
-            mapping,
+            freeze_routes(&mapping, None, &RowPolicy::default()),
             msg_tx,
             ack.clone(),
             stats.clone(),
@@ -1520,8 +1510,6 @@ mod tests {
                 spool_tmp.path().join("bootstrap_deferred.bin"),
                 0,
             )),
-            Default::default(),
-            None,
             HashSet::new(),
             None,
         ));
@@ -1569,14 +1557,12 @@ mod tests {
         let mut outcome = drain(
             tup_rx,
             catalog.clone(),
-            mapping.clone(),
+            freeze_routes(&mapping, None, &RowPolicy::default()),
             msg_tx.clone(),
             ack.clone(),
             stats.clone(),
             resolver.clone(),
             Deferral::Handback(mem_spool()),
-            Default::default(),
-            None,
             HashSet::new(),
             None,
         )
@@ -1653,14 +1639,12 @@ mod tests {
             let mut outcome = drain(
                 tup_rx,
                 catalog.clone(),
-                mapping.clone(),
+                freeze_routes(&mapping, None, &RowPolicy::default()),
                 msg_tx.clone(),
                 ack.clone(),
                 stats.clone(),
                 resolver.clone(),
                 Deferral::Handback(mem_spool()),
-                Default::default(),
-                None,
                 HashSet::new(),
                 None,
             )
@@ -1735,14 +1719,12 @@ mod tests {
         let drain_task = tokio::spawn(drain(
             tup_rx,
             catalog,
-            mapping,
+            freeze_routes(&mapping, None, &RowPolicy::default()),
             msg_tx,
             ack.clone(),
             stats.clone(),
             ToastResolver::with_store(store, stats.clone()),
             Deferral::Local(mem_spool()),
-            Default::default(),
-            None,
             HashSet::new(),
             None,
         ));
@@ -1798,7 +1780,7 @@ mod tests {
         let drain_task = tokio::spawn(drain(
             tup_rx,
             catalog,
-            mapping,
+            freeze_routes(&mapping, None, &RowPolicy::default()),
             msg_tx,
             ack.clone(),
             stats.clone(),
@@ -1807,8 +1789,6 @@ mod tests {
                 spool_tmp.path().join("bootstrap_deferred.bin"),
                 0,
             )),
-            Default::default(),
-            None,
             HashSet::new(),
             None,
         ));
@@ -2055,7 +2035,7 @@ mod tests {
         let drain_task = tokio::spawn(drain(
             tup_rx,
             catalog,
-            mapping,
+            freeze_routes(&mapping, None, &RowPolicy::default()),
             msg_tx,
             ack.clone(),
             stats.clone(),
@@ -2064,8 +2044,6 @@ mod tests {
                 spool_tmp.path().join("bootstrap_deferred.bin"),
                 0,
             )),
-            Default::default(),
-            None,
             HashSet::new(),
             None,
         ));

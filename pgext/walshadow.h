@@ -10,7 +10,7 @@
  * of an unchanged layout changes */
 #define WS_PROTO_VERSION 7
 /* Bumped when any catalog projection changes shape */
-#define WS_PROJECTION_VERSION 1
+#define WS_PROJECTION_VERSION 2
 
 /* request opcodes */
 #define WS_OP_HELLO 0x01
@@ -53,6 +53,7 @@ typedef enum WsCatalog {
     WS_CAT_INDEX     = 3,
     WS_CAT_NAMESPACE = 4,
     WS_CAT_TYPE      = 5,
+    WS_CAT_INHERITS  = 6,
 } WsCatalog;
 
 extern void

@@ -139,6 +139,8 @@ impl BackfillTuple {
 #[derive(Debug, Default, Clone)]
 pub struct CatalogMap {
     by_filenode: HashMap<(Oid, Oid), Arc<RelDescriptor>>,
+    /// Heapless, so outside the filenode index
+    partitioned: Vec<Arc<RelDescriptor>>,
 }
 
 impl CatalogMap {
@@ -151,8 +153,17 @@ impl CatalogMap {
             .insert((desc.rfn.db_node, desc.rfn.rel_node), desc);
     }
 
+    pub fn insert_partitioned(&mut self, desc: Arc<RelDescriptor>) {
+        self.partitioned.push(desc);
+    }
+
     pub fn get(&self, db_node: Oid, rel_node: Oid) -> Option<Arc<RelDescriptor>> {
         self.by_filenode.get(&(db_node, rel_node)).cloned()
+    }
+
+    /// Partitioned tables, which own destinations but no heap
+    pub fn partitioned(&self) -> impl Iterator<Item = &Arc<RelDescriptor>> {
+        self.partitioned.iter()
     }
 
     pub fn descriptors(&self) -> impl Iterator<Item = &Arc<RelDescriptor>> {
@@ -1056,6 +1067,7 @@ pub(crate) fn make_rel() -> RelDescriptor {
         rel_name: RelName::new("public", "t"),
         kind: 'r',
         persistence: 'p',
+        ancestors: Vec::new(),
         replident: ReplIdent::Default { pk_attnums: None },
         attributes: vec![RelAttr {
             attnum: 1,

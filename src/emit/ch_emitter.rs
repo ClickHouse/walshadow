@@ -50,7 +50,7 @@ use crate::schema::{RelAttr, RelDescriptor, RelName};
 use crate::source::queueing_record_sink::{
     DEFAULT_QUEUEING_BATCH_SIZE, DEFAULT_QUEUEING_RECORD_SINK_CAPACITY,
 };
-use crate::table_rules::{MatchKind, TableRule};
+use crate::table_rules::{MatchKind, PartitionRoute, TableRule};
 use ahash::{HashMap, HashMapExt};
 
 /// Microseconds between PG `TimestampTz` epoch (2000-01-01 UTC) and Unix
@@ -172,6 +172,9 @@ pub struct EmitterConfig {
     /// Global `--drop-table-strategy` default; per-namespace override
     /// via `[namespace.<ns>] drop_table_strategy = ...`
     pub drop_table_strategy: DropTableStrategy,
+    /// `[ch] detach_strategy`: rows a detached partition leaves in its root's
+    /// destination, overridable per namespace
+    pub detach_strategy: DropTableStrategy,
     pub retry: RetryConfig,
     /// Wall-clock limit for one INSERT attempt. If connection stalls
     /// mid-INSERT, return retryable [`EmitterError::Timeout`] so inserter
@@ -829,6 +832,8 @@ struct ChSection {
     retry: RetryConfig,
     #[serde(deserialize_with = "crate::toml_de::de_parse")]
     drop_table_strategy: DropTableStrategy,
+    #[serde(deserialize_with = "crate::toml_de::de_parse")]
+    detach_strategy: DropTableStrategy,
     soft_delete: bool,
 }
 
@@ -855,6 +860,7 @@ impl Default for ChSection {
             flush_timeout: Duration::from_millis(DEFAULT_FLUSH_TIMEOUT_MS),
             retry: RetryConfig::default(),
             drop_table_strategy: DropTableStrategy::default(),
+            detach_strategy: DropTableStrategy::default(),
             soft_delete: false,
         }
     }
@@ -916,6 +922,8 @@ struct NamespacePatch {
     #[serde(default, deserialize_with = "crate::toml_de::de_from_str")]
     drop_table_strategy: Option<DropTableStrategy>,
     #[serde(default, deserialize_with = "crate::toml_de::de_from_str")]
+    detach_strategy: Option<DropTableStrategy>,
+    #[serde(default, deserialize_with = "crate::toml_de::de_from_str")]
     initial_load: Option<InitialLoadMode>,
 }
 
@@ -931,13 +939,18 @@ struct TablePatch {
     order_by: Option<Vec<String>>,
     primary_key: Option<Vec<String>>,
     engine: Option<String>,
+    partition_by: Option<String>,
+    #[serde(default, deserialize_with = "crate::toml_de::de_from_str")]
+    route: Option<PartitionRoute>,
     tee: Option<Vec<crate::mapping::Tee>>,
-    /// Same four keys as `[system_columns]`, for this entry's relations alone
+    /// Same keys as `[system_columns]`, for this entry's relations alone
     lsn: Option<String>,
     xid: Option<String>,
     commit_ts: Option<String>,
     #[serde(default, deserialize_with = "crate::mapping::de_marker_override")]
     is_deleted: Option<String>,
+    #[serde(default, deserialize_with = "crate::mapping::de_leaf_override")]
+    leaf: Option<String>,
     #[serde(
         rename = "match",
         default,
@@ -999,6 +1012,7 @@ impl EmitterConfig {
             namespaces: HashMap::new(),
             databases: Vec::new(),
             drop_table_strategy: ch.drop_table_strategy,
+            detach_strategy: ch.detach_strategy,
             retry: ch.retry,
             insert_timeout: Duration::from_secs(DEFAULT_INSERT_TIMEOUT_SECS),
             idle_reconnect: Duration::from_secs(DEFAULT_IDLE_RECONNECT_SECS),
@@ -1165,6 +1179,7 @@ impl EmitterConfig {
                     auto_create: n.auto_create.unwrap_or(false),
                     auto_create_name,
                     drop_table_strategy: n.drop_table_strategy,
+                    detach_strategy: n.detach_strategy,
                     initial_load: n.initial_load,
                 },
             );
@@ -1207,6 +1222,7 @@ impl EmitterConfig {
             xid: t.xid,
             commit_ts: t.commit_ts,
             is_deleted: t.is_deleted,
+            leaf: t.leaf,
         };
         system.validate(&ctx).map_err(EmitterError::Config)?;
         if t.tee.is_some() && kind != MatchKind::Exact {
@@ -1225,6 +1241,8 @@ impl EmitterConfig {
             order_by: t.order_by,
             primary_key: t.primary_key,
             engine: t.engine,
+            partition_by: t.partition_by,
+            route: t.route,
             tee: t.tee,
         };
         self.table_entries.push((rel.clone(), kind, rule.clone()));
@@ -1364,9 +1382,12 @@ pub(crate) struct TablePlan {
     pub(crate) synth_lsn: ColumnPlan,
     pub(crate) synth_xid: ColumnPlan,
     pub(crate) synth_commit_ts: ColumnPlan,
-    /// Delete marker `Bool` (1 on delete, else 0), appended last. `None` when
+    /// Delete marker `Bool` (1 on delete, else 0). `None` when
     /// `[system_columns] is_deleted = false` drops it
     pub(crate) synth_is_deleted: Option<ColumnPlan>,
+    /// Source partition `UInt32`, appended last on partitioned-root
+    /// destinations
+    pub(crate) synth_leaf: Option<ColumnPlan>,
     /// Format once to avoid rebuilding SQL for each row. Main destination
     /// first, then each tee
     pub(crate) inserts: Vec<InsertQuery>,
@@ -1562,6 +1583,45 @@ impl TablePlan {
         column_rules: &ColumnRules,
         system: &SystemColumns,
     ) -> Result<Self, EmitterError> {
+        Self::build_owned(
+            alloc,
+            rel,
+            &rel.rel_name,
+            mapping,
+            column_rules,
+            system,
+            None,
+        )
+    }
+
+    /// Plan for rows routed by `route`: a partition's rows encode under
+    /// its root's column rules and stamp the partition column
+    pub(crate) fn for_route(
+        alloc: Allocator,
+        rel: &RelDescriptor,
+        route: &crate::emit::route::RouteSnapshot,
+    ) -> Result<Self, EmitterError> {
+        let system = route.system_columns();
+        Self::build_owned(
+            alloc,
+            rel,
+            route.owner(&rel.rel_name),
+            &route.mapping,
+            &route.column_rules,
+            system,
+            route.partition.as_ref().and(system.leaf.as_deref()),
+        )
+    }
+
+    fn build_owned(
+        alloc: Allocator,
+        rel: &RelDescriptor,
+        owner: &RelName,
+        mapping: &TableMapping,
+        column_rules: &ColumnRules,
+        system: &SystemColumns,
+        leaf: Option<&str>,
+    ) -> Result<Self, EmitterError> {
         let mut columns = Vec::with_capacity(mapping.columns.len());
         let mut col_sql = Vec::with_capacity(mapping.columns.len() + 4);
         // Mapping attnums absent from the catalog descriptor are not a
@@ -1587,7 +1647,7 @@ impl TablePlan {
                 non_finite: NonFinite::default(),
             };
             let settings = att
-                .map(|a| column_rules.settings(&rel.rel_name, &a.name))
+                .map(|a| column_rules.settings(owner, &a.name))
                 .unwrap_or_default();
             if let Some(ty) = &settings.target_type {
                 match TypeAst::parse(ty, alloc) {
@@ -1670,10 +1730,12 @@ impl TablePlan {
             .as_deref()
             .map(|name| mk(name, "Bool"))
             .transpose()?;
+        let synth_leaf = leaf.map(|name| mk(name, "UInt32")).transpose()?;
         col_sql.push(quote_ident(&synth_lsn.name));
         col_sql.push(quote_ident(&synth_xid.name));
         col_sql.push(quote_ident(&synth_commit_ts.name));
         col_sql.extend(synth_is_deleted.iter().map(|c| quote_ident(&c.name)));
+        col_sql.extend(synth_leaf.iter().map(|c| quote_ident(&c.name)));
         let col_sql = col_sql.join(", ");
         let insert = |t: &TableTarget| format!("INSERT INTO {} ({col_sql}) FORMAT Native", t.sql());
         Ok(Self {
@@ -1682,6 +1744,7 @@ impl TablePlan {
             synth_xid,
             synth_commit_ts,
             synth_is_deleted,
+            synth_leaf,
             inserts: mapping
                 .targets()
                 .map(|t| InsertQuery {
@@ -1944,6 +2007,12 @@ pub(crate) fn fresh_buffers(plan: &TablePlan) -> Result<Vec<ColumnBuf>, EmitterE
             bytes: Vec::new(),
         }); // delete marker Bool (1 wire byte, same as UInt8)
     }
+    if plan.synth_leaf.is_some() {
+        buffers.push(ColumnBuf::Fixed {
+            width: 4,
+            bytes: Vec::new(),
+        }); // partition UInt32
+    }
     Ok(buffers)
 }
 
@@ -1980,12 +2049,24 @@ impl TableEncoder {
         Ok((old, rows))
     }
 
-    /// Return [`Append::Full`] without mutation when oracle threshold is hit
+    #[cfg(test)]
     pub fn append_row(
         &mut self,
         committed: &CommittedTuple,
         mapping: &TableMapping,
         op_code: i8,
+    ) -> Result<Append, EmitterError> {
+        self.append_routed(committed, mapping, op_code, None)
+    }
+
+    /// Append one row, stamping `leaf` into the partition column. Return
+    /// [`Append::Full`] without mutation when oracle threshold is hit
+    pub fn append_routed(
+        &mut self,
+        committed: &CommittedTuple,
+        mapping: &TableMapping,
+        op_code: i8,
+        leaf: Option<u32>,
     ) -> Result<Append, EmitterError> {
         let decoded = &committed.decoded;
         let side = match decoded.op {
@@ -2053,9 +2134,14 @@ impl TableEncoder {
         push_fixed(&mut self.buffers[off + 1], &decoded.xid.to_le_bytes())?;
         let unix_us = committed.commit_ts.saturating_add(DATETIME64_PG_EPOCH_US);
         push_fixed(&mut self.buffers[off + 2], &unix_us.to_le_bytes())?;
+        let mut next = off + 3;
         if self.plan.synth_is_deleted.is_some() {
             let is_deleted: u8 = (op_code == OP_DELETE).into();
-            push_fixed(&mut self.buffers[off + 3], &is_deleted.to_le_bytes())?;
+            push_fixed(&mut self.buffers[next], &is_deleted.to_le_bytes())?;
+            next += 1;
+        }
+        if self.plan.synth_leaf.is_some() {
+            push_fixed(&mut self.buffers[next], &leaf.unwrap_or(0).to_le_bytes())?;
         }
         self.rows += 1;
         self.approx_bytes = self.buffers.iter().map(ColumnBuf::approx_size).sum();
@@ -3078,6 +3164,7 @@ mod tests {
             rel_name: RelName::new("public", "foo"),
             kind: 'r',
             persistence: 'p',
+            ancestors: Vec::new(),
             replident: ReplIdent::Default { pk_attnums: None },
             attributes: vec![
                 RelAttr {
@@ -4662,6 +4749,7 @@ mod tests {
             xid: "_x".into(),
             commit_ts: "_at".into(),
             is_deleted: None,
+            leaf: None,
         };
         let plan =
             TablePlan::build(alloc, &rel, &m, &ColumnRules::default(), &sys).expect("plan builds");
@@ -4676,6 +4764,65 @@ mod tests {
         let enc = TableEncoder::new(plan).expect("encoder");
         // Mapped columns plus three synthetic, no marker buffer
         assert_eq!(enc.buffers.len(), m.columns.len() + 3);
+    }
+
+    /// A partition's rows encode under its root's column rules and stamp
+    /// the partition column after the system columns
+    #[test]
+    fn partition_route_plans_and_stamps_the_partition_column() {
+        use crate::emit::route::{PartitionOf, RouteSnapshot, RowPolicy};
+        let alloc = Allocator::global(&mimalloc::MiMalloc);
+        let leaf = RelDescriptor {
+            rel_name: RelName::new("public", "foo_1"),
+            ..mk_rel()
+        };
+        let root = RelName::new("public", "foo");
+        let mut rules = crate::column_rules::ColumnRulesBuilder::new();
+        rules.add(
+            &root,
+            MatchKind::Exact,
+            "name",
+            MatchKind::Exact,
+            ColumnRule {
+                target_type: Some("LowCardinality(Nullable(String))".into()),
+                ..ColumnRule::default()
+            },
+        );
+        let route = RouteSnapshot::freeze(
+            Arc::new(mk_mapping()),
+            Arc::new(rules.finish().0),
+            RowPolicy::default(),
+        )
+        .with_partition(PartitionOf {
+            root,
+            leaf: 16999,
+            shared: true,
+        });
+        let plan = TablePlan::for_route(alloc, &leaf, &route).expect("plan builds");
+        assert!(
+            plan.inserts[0]
+                .sql
+                .ends_with("`_is_deleted`, `_leaf_oid`) FORMAT Native"),
+            "{:?}",
+            plan.inserts
+        );
+        assert_eq!(
+            plan.columns[1].type_repr, "LowCardinality(Nullable(String))",
+            "root's column rule applies"
+        );
+        let mut enc = TableEncoder::new(plan).expect("encoder");
+        enc.append_routed(
+            &committed(1, Some("a")),
+            &route.mapping,
+            OP_INSERT,
+            Some(16999),
+        )
+        .unwrap();
+        assert!(
+            matches!(enc.buffers.last(), Some(ColumnBuf::Fixed { width: 4, bytes })
+                if bytes[..] == 16999u32.to_le_bytes()),
+            "partition column is UInt32"
+        );
     }
 
     #[test]
@@ -5223,5 +5370,34 @@ mod tests {
             ),
             (DropTableStrategy::Drop, Some(DropTableStrategy::Warn))
         );
+    }
+
+    #[test]
+    fn config_parses_partition_settings() {
+        EmitterConfig::from_toml_str("[table.public.m]\nleaf = 7\n").expect_err("leaf = 7");
+        let c = EmitterConfig::from_toml_str(
+            "[ch]\ndetach_strategy = \"drop\"\n\
+             [namespace.sales]\ndetach_strategy = \"warn\"\n\
+             [system_columns]\nleaf = \"_part\"\n\
+             [table.public.m]\npartition_by = \"toYYYYMM(ts)\"\nleaf = false\n\
+             [table.public.\"m_*\"]\nmatch = \"glob\"\nroute = \"self\"\n",
+        )
+        .expect("parses");
+        assert_eq!(c.detach_strategy, DropTableStrategy::Drop);
+        assert_eq!(
+            c.namespaces["sales"].detach_strategy,
+            Some(DropTableStrategy::Warn)
+        );
+        assert_eq!(c.system_columns.leaf.as_deref(), Some("_part"));
+        let rule = |name: &str| {
+            c.table_entries
+                .iter()
+                .find(|(rel, ..)| &*rel.name == name)
+                .map(|(_, _, rule)| rule.clone())
+                .unwrap()
+        };
+        assert_eq!(rule("m").partition_by.as_deref(), Some("toYYYYMM(ts)"));
+        assert_eq!(rule("m").system.leaf.as_deref(), Some(""));
+        assert_eq!(rule("m_*").route, Some(PartitionRoute::Self_));
     }
 }

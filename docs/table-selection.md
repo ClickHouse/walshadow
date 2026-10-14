@@ -127,6 +127,59 @@ Patterns match whole names. Exact entries apply after patterns. Explicit exact
 entry can override pattern result, while matching exclusion blocks broader
 opt-ins
 
+## Replicate partitioned tables
+
+Declarative partitions replicate into root table's destination, like
+PostgreSQL publications with `publish_via_partition_root`. Partitions have no
+separate destination. For nested partitions, root is topmost partitioned
+table. Root settings determine which tables replicate, destination name, and
+destination columns
+
+```toml
+[table.app.events]
+replicate = true
+initial_load = "copy"
+order_by = ["tenant_id", "id", "created_at"]
+partition_by = "toYYYYMM(created_at)"
+```
+
+By default, glob and regex entries skip partitions. `replicate_all` and broad
+patterns include partitions through root settings. An exact entry for a
+partition may set `replicate` and `route`; other settings stop replication
+
+| Partition entry | Effect |
+|---|---|
+| none | rows go to root's destination |
+| `replicate = false` | partition's rows are not replicated |
+| `route = "self"` | partition, and every partition below it, gets its own destination and rules |
+
+`route = "self"` on a glob entry gives matching partitions their own
+destinations:
+
+```toml
+[table.app."events_hot_*"]
+match = "glob"
+route = "self"
+```
+
+Rows carry source partition OID in `_leaf_oid`, see
+[metadata columns](destination-tables.md#generated-shape). Legacy `INHERITS`
+children stay independent tables. Foreign partitions write no WAL and are
+skipped. Unlogged partitions stop replication unless excluded with
+`replicate = false`
+
+Every partition must log all columns needed to identify deleted rows in
+root's destination. Use a primary key or `REPLICA IDENTITY USING INDEX` index
+covering those columns, or use `FULL` to log every column. `REPLICA IDENTITY`
+does not apply recursively: if root uses `FULL` without a primary key, set
+`FULL` on each partition too. Replication stops if a partition omits required
+columns
+
+Initial load of a partitioned table copies each partition separately with
+`COPY … FROM ONLY`. Backup load modes use `copy` for partitions too: replacing
+a shared destination with a staging table would discard other partitions'
+rows
+
 ## Rename targets or columns
 
 Map one table without pinning source shape:

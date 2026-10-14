@@ -128,7 +128,6 @@ warning followed by incomplete routing is not rejection
 |---|---|
 | Drop NOT NULL, then insert NULL | Pinned destination type only warns, and emitter writes type default for NULL into non-Nullable columns. Reject instead of substituting |
 | Create an unlogged table or switch to unlogged | Persistence never reaches schema diff. Reject replication scope that cannot receive its row changes |
-| Attach a populated partition | Define leaf routing and initial load before accepting parent scope |
 | Drop and recreate a name | Verify warn/drop policies and restart preserve chosen generation policy |
 | Drop with CASCADE or a refused RESTRICT | Apply chosen dependent-object policy and preserve unaffected mappings |
 

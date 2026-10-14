@@ -26,7 +26,9 @@ CREATE TABLE IF NOT EXISTS :"walshadow_schema".config_global (
     flush_timeout_ms    bigint,
     compression         text,        -- none / lz4 / zstd
     retry_max_attempts  integer,
-    drop_table_strategy text         -- retain / drop / warn
+    drop_table_strategy text,        -- retain / drop / warn
+    detach_strategy     text         -- detached partition's existing rows:
+                                     -- retain / drop / warn
 );
 
 -- Per-namespace defaults, keyed on source PG schema name.
@@ -37,7 +39,8 @@ CREATE TABLE IF NOT EXISTS :"walshadow_schema".config_namespace (
     auto_create_name    text,        -- derived table name template over
                                      -- $database$/$schema$/$table$; NULL
                                      -- means '$schema$_$table$'
-    drop_table_strategy text         -- overrides config_global for this namespace
+    drop_table_strategy text,        -- overrides config_global for this namespace
+    detach_strategy     text         -- overrides config_global for this namespace
 );
 
 -- Per-relation destination mapping, keyed on (namespace, relname) (not
@@ -61,10 +64,16 @@ CREATE TABLE IF NOT EXISTS :"walshadow_schema".config_table (
                                      -- order_by
     engine          text,            -- ClickHouse engine; NULL inherits
                                      -- ReplacingMergeTree
+    partition_by    text,            -- ClickHouse PARTITION BY expression
+    route           text,            -- partition destination: 'root' (default)
+                                     -- uses root's destination; 'self' uses
+                                     -- a separate destination
     lsn             text,            -- per-relation names for the columns
     xid             text,            -- walshadow appends; NULL inherits
     commit_ts       text,            -- [system_columns]
     is_deleted      text,            -- '' drops the marker (and DELETE rows)
+    leaf            text,            -- partition OID column on a partitioned
+                                     -- root's destination; '' drops it
     PRIMARY KEY (namespace, relname)
 );
 
@@ -84,7 +93,9 @@ CREATE TABLE IF NOT EXISTS :"walshadow_schema".config_column (
 -- Additive upgrade: columns introduced after the initial config_table shape.
 -- CREATE TABLE IF NOT EXISTS above no-ops on an existing install, so an
 -- upgrading deployment re-runs this to gain the columns the newer daemon reads.
+ALTER TABLE :"walshadow_schema".config_global ADD COLUMN IF NOT EXISTS detach_strategy text;
 ALTER TABLE :"walshadow_schema".config_namespace ADD COLUMN IF NOT EXISTS auto_create_name text;
+ALTER TABLE :"walshadow_schema".config_namespace ADD COLUMN IF NOT EXISTS detach_strategy text;
 ALTER TABLE :"walshadow_schema".config_table ADD COLUMN IF NOT EXISTS replicate       boolean;
 ALTER TABLE :"walshadow_schema".config_table ADD COLUMN IF NOT EXISTS initial_load    text;
 ALTER TABLE :"walshadow_schema".config_table ADD COLUMN IF NOT EXISTS target_database text;
@@ -97,6 +108,9 @@ ALTER TABLE :"walshadow_schema".config_table ADD COLUMN IF NOT EXISTS lsn       
 ALTER TABLE :"walshadow_schema".config_table ADD COLUMN IF NOT EXISTS xid             text;
 ALTER TABLE :"walshadow_schema".config_table ADD COLUMN IF NOT EXISTS commit_ts       text;
 ALTER TABLE :"walshadow_schema".config_table ADD COLUMN IF NOT EXISTS is_deleted      text;
+ALTER TABLE :"walshadow_schema".config_table ADD COLUMN IF NOT EXISTS partition_by    text;
+ALTER TABLE :"walshadow_schema".config_table ADD COLUMN IF NOT EXISTS route           text;
+ALTER TABLE :"walshadow_schema".config_table ADD COLUMN IF NOT EXISTS leaf            text;
 ALTER TABLE :"walshadow_schema".config_column ADD COLUMN IF NOT EXISTS match           text;
 ALTER TABLE :"walshadow_schema".config_column ADD COLUMN IF NOT EXISTS nan             text;
 ALTER TABLE :"walshadow_schema".config_column ADD COLUMN IF NOT EXISTS pos_inf         text;

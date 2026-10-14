@@ -57,6 +57,7 @@ async fn catalog_rewrites_keep_shadow_replaying() {
             auto_create: true,
             auto_create_name: Some(walshadow::mapping::NameTemplate::parse("$table$").unwrap()),
             drop_table_strategy: None,
+            detach_strategy: None,
             initial_load: None,
         },
     );

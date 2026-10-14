@@ -217,6 +217,7 @@ async fn create_table_auto_replicates_in_namespace() {
             auto_create: true,
             auto_create_name: Some(walshadow::mapping::NameTemplate::parse("$table$").unwrap()),
             drop_table_strategy: None,
+            detach_strategy: None,
             initial_load: None,
         },
     );
@@ -316,6 +317,7 @@ async fn drop_table_strategy_drop_removes_dest() {
             auto_create: true,
             auto_create_name: Some(walshadow::mapping::NameTemplate::parse("$table$").unwrap()),
             drop_table_strategy: None,
+            detach_strategy: None,
             initial_load: None,
         },
     );
@@ -556,6 +558,7 @@ async fn auto_create_honors_per_namespace_target_database() {
             auto_create: true,
             auto_create_name: Some(walshadow::mapping::NameTemplate::parse("$table$").unwrap()),
             drop_table_strategy: None,
+            detach_strategy: None,
             initial_load: None,
         },
     );

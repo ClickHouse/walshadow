@@ -41,7 +41,7 @@ use crate::mapping::{
 };
 use crate::runtime_config::{ConfigEvent, ConfigOverlay, TableRow};
 use crate::schema::{RelDescriptor, RelName, SchemaDiff};
-use crate::table_rules::{MatchKind, TableRules, TableRulesBuilder};
+use crate::table_rules::{MatchKind, TableRule, TableRules, TableRulesBuilder};
 use ahash::{HashMap, HashSet};
 
 #[derive(Clone, PartialEq, Eq, serde::Deserialize)]
@@ -148,6 +148,8 @@ pub struct ResolvedConfig {
     pub rules: Arc<TableRules>,
     /// Global DROP TABLE fallback, overridden per namespace
     pub drop_table_strategy: DropTableStrategy,
+    /// Global `DETACH PARTITION` fallback, overridden per namespace
+    pub detach_strategy: DropTableStrategy,
     /// Emitter batch-seal row trigger (live: batcher reads per seal decision)
     pub row_budget: usize,
     /// Emitter batch-seal byte trigger (live)
@@ -166,9 +168,17 @@ pub struct ResolvedConfig {
     pub table_opt_ins: HashMap<RelName, TableRow>,
     /// `[stream] paused` (live: pump idles when true).
     pub paused: bool,
+    /// Mapped relations that are declarative partitions, so rules resolve
+    /// by name the way their DDL did
+    pub partitions: HashSet<RelName>,
 }
 
 impl ResolvedConfig {
+    /// Table rule for a relation known by name
+    pub fn rule(&self, rel: &RelName) -> TableRule {
+        self.rules.settings_of(rel, self.partitions.contains(rel))
+    }
+
     pub fn dest_conn_eq(&self, cfg: &EmitterConfig) -> bool {
         cfg.instances == self.instances
             && cfg.conn == self.conn
@@ -308,6 +318,19 @@ struct OptInState {
     /// `replicate=true` rows whose rel isn't known yet (forward-declared),
     /// materialised when the matching `CREATE TABLE` arrives.
     pending_decl: HashMap<RelName, TableRow>,
+    /// Mapped relations that are declarative partitions. Plain patterns skip
+    /// them, so resolve must know which names they are
+    partitions: HashSet<RelName>,
+}
+
+impl OptInState {
+    fn note_partition(&mut self, desc: &RelDescriptor) {
+        if desc.is_partition() {
+            self.partitions.insert(desc.rel_name.clone());
+        } else {
+            self.partitions.remove(&desc.rel_name);
+        }
+    }
 }
 
 /// The mutable merge inputs, behind one lock so an apply is atomic against a
@@ -468,7 +491,7 @@ impl ConfigResolver {
         let mut inner = self.inner.lock().await;
         let rel = desc.rel_name.clone();
         // Keep routing target aligned with DDL target
-        let settings = self.tx.borrow().rules.settings(&rel);
+        let settings = self.tx.borrow().rules.settings_for(desc);
         let target = TableTarget {
             instance: settings.target_instance.clone().and_then(named_instance),
             database: db_override.or(settings.target_database).unwrap_or_else(|| {
@@ -499,6 +522,7 @@ impl ConfigResolver {
         inner.opt_in.derived.remove(&rel);
         inner.opt_in.excluded.remove(&rel);
         inner.opt_in.pending_decl.remove(&rel);
+        inner.opt_in.note_partition(desc);
         self.pending_decl
             .store(inner.opt_in.pending_decl.len() as u64, Ordering::Relaxed);
         self.opt_in_total.fetch_add(1, Ordering::Relaxed);
@@ -515,6 +539,7 @@ impl ConfigResolver {
         inner.opt_in.mappings.remove(rel);
         inner.opt_in.derived.remove(rel);
         inner.opt_in.pending_decl.remove(rel);
+        inner.opt_in.partitions.remove(rel);
         inner.opt_in.excluded.insert(rel.clone());
         self.pending_decl
             .store(inner.opt_in.pending_decl.len() as u64, Ordering::Relaxed);
@@ -541,19 +566,24 @@ impl ConfigResolver {
         row
     }
 
-    pub async fn is_excluded(&self, rel: &RelName) -> bool {
-        if self.inner.lock().await.opt_in.excluded.contains(rel) {
-            return true;
-        }
-        self.tx.borrow().rules.settings(rel).replicate == Some(false)
+    pub async fn is_excluded(&self, desc: &RelDescriptor) -> bool {
+        let excluded = self
+            .inner
+            .lock()
+            .await
+            .opt_in
+            .excluded
+            .contains(&desc.rel_name);
+        excluded || self.tx.borrow().rules.settings_for(desc).replicate == Some(false)
     }
 
     /// Record an applicator-derived mapping (`auto_create` CREATE TABLE) so
     /// it survives republish, write the fenced routing map, republish. Runs
     /// inside the reorder barrier like the DDL that produced it.
-    pub async fn register_derived_mapping(&self, rel: &RelName, mapping: TableMapping) {
+    pub async fn register_derived_mapping(&self, desc: &RelDescriptor, mapping: TableMapping) {
         let mut inner = self.inner.lock().await;
-        inner.opt_in.derived.insert(rel.clone(), mapping);
+        inner.opt_in.derived.insert(desc.rel_name.clone(), mapping);
+        inner.opt_in.note_partition(desc);
         self.republish(&inner).await;
     }
 
@@ -568,6 +598,7 @@ impl ConfigResolver {
         let mut inner = self.inner.lock().await;
         inner.opt_in.derived.remove(rel);
         inner.opt_in.mappings.remove(rel);
+        inner.opt_in.partitions.remove(rel);
         if let Some(row) = inner.overlay.tables.get(rel)
             && row.replicate == Some(true)
         {
@@ -608,6 +639,7 @@ impl ConfigResolver {
         } else {
             return;
         }
+        inner.opt_in.note_partition(new);
         self.republish(&inner).await;
     }
 
@@ -742,6 +774,7 @@ impl ConfigResolver {
             column_rules: Arc::new(column_rules),
             rules: rules.clone(),
             drop_table_strategy: base.drop_table_strategy,
+            detach_strategy: base.detach_strategy,
             row_budget: base.row_budget,
             byte_budget: base.byte_budget,
             flush_timeout: base.flush_timeout,
@@ -750,6 +783,7 @@ impl ConfigResolver {
             source: base.source.clone(),
             table_opt_ins: base.table_opt_ins.clone(),
             paused: base.paused,
+            partitions: opt_in.partitions.clone(),
         };
 
         // Runtime-derived layers (before the overlay target loop so a
@@ -771,6 +805,14 @@ impl ConfigResolver {
                 } else {
                     rejections += 1;
                     tracing::warn!(target: "walshadow::config", value = %v, "config_global.drop_table_strategy rejected");
+                }
+            }
+            if let Some(v) = &g.detach_strategy {
+                if let Ok(s) = v.parse::<DropTableStrategy>() {
+                    rc.detach_strategy = s;
+                } else {
+                    rejections += 1;
+                    tracing::warn!(target: "walshadow::config", value = %v, "config_global.detach_strategy rejected");
                 }
             }
             if let Some(v) = g.row_budget {
@@ -848,10 +890,19 @@ impl ConfigResolver {
                     tracing::warn!(target: "walshadow::config", namespace = %ns, value = %v, "config_namespace.drop_table_strategy rejected");
                 }
             }
+            if let Some(v) = &row.detach_strategy {
+                if let Ok(s) = v.parse::<DropTableStrategy>() {
+                    entry.detach_strategy = Some(s);
+                } else {
+                    rejections += 1;
+                    tracing::warn!(target: "walshadow::config", namespace = %ns, value = %v, "config_namespace.detach_strategy rejected");
+                }
+            }
         }
 
+        let settings_of = |rel: &RelName| rules.settings_of(rel, rc.partitions.contains(rel));
         for (rel, m) in rc.tables.iter_mut() {
-            let settings = rules.settings(rel);
+            let settings = settings_of(rel);
             let instance = settings.target_instance.map_or_else(
                 || {
                     base.tables
@@ -895,7 +946,7 @@ impl ConfigResolver {
             rc.tables.remove(rel);
         }
         rc.tables
-            .retain(|rel, _| rules.settings(rel).replicate != Some(false));
+            .retain(|rel, _| settings_of(rel).replicate != Some(false));
 
         // Layer 1: CLI (top). Survives SIGHUP + stale overlay rows.
         if let Some(v) = cli.drop_table_strategy {
@@ -1030,6 +1081,7 @@ mod tests {
         let overlay = ConfigOverlay {
             global: Some(GlobalRow {
                 drop_table_strategy: Some("drop".into()),
+                detach_strategy: Some("warn".into()),
                 ..Default::default()
             }),
             ..Default::default()
@@ -1043,6 +1095,7 @@ mod tests {
             &ColumnRules::default(),
         );
         assert_eq!(r.drop_table_strategy, DropTableStrategy::Drop);
+        assert_eq!(r.detach_strategy, DropTableStrategy::Warn);
         // CLI beats overlay.
         let cli = CliOverrides {
             drop_table_strategy: Some(DropTableStrategy::Warn),
@@ -1110,6 +1163,7 @@ mod tests {
         let mut overlay = ConfigOverlay {
             global: Some(GlobalRow {
                 drop_table_strategy: Some("nonsense".into()),
+                detach_strategy: Some("nonsense".into()),
                 compression: Some("brotli".into()),
                 row_budget: Some(-5),
                 byte_budget: Some(0),
@@ -1122,6 +1176,7 @@ mod tests {
             "public".into(),
             NamespaceRow {
                 drop_table_strategy: Some("nonsense".into()),
+                detach_strategy: Some("nonsense".into()),
                 ..Default::default()
             },
         );
@@ -1140,9 +1195,10 @@ mod tests {
             &OptInState::default(),
             &ColumnRules::default(),
         );
-        assert_eq!(rej, 8);
+        assert_eq!(rej, 10);
         // Prior (TOML/base) values survive each rejection.
         assert_eq!(r.drop_table_strategy, DropTableStrategy::Retain);
+        assert_eq!(r.detach_strategy, DropTableStrategy::Retain);
         assert_eq!(r.conn.compression, base.conn.compression);
         assert_eq!(r.row_budget, base.row_budget);
         assert_eq!(r.byte_budget, base.byte_budget);
@@ -1170,6 +1226,7 @@ mod tests {
                 auto_create_name: Some("$table$".into()),
                 target_database: Some("default".into()),
                 drop_table_strategy: Some("drop".into()),
+                detach_strategy: Some("drop".into()),
             },
         );
         overlay.tables.insert(
@@ -1204,6 +1261,7 @@ mod tests {
             "an overlay template reaches the resolved namespace"
         );
         assert_eq!(ns.drop_table_strategy, Some(DropTableStrategy::Drop));
+        assert_eq!(ns.detach_strategy, Some(DropTableStrategy::Drop));
         let t = r.tables.get(&RelName::new("public", "events")).unwrap();
         assert_eq!(t.target, TableTarget::new("default", "events_v2"));
         assert!(!r.tables.contains_key(&RelName::new("public", "unmapped")));
@@ -1606,6 +1664,7 @@ mod tests {
             rel_name: RelName::new(namespace, name),
             kind: 'r',
             persistence: 'p',
+            ancestors: Vec::new(),
             replident: ReplIdent::Default { pk_attnums: None },
             attributes: vec![RelAttr {
                 attnum: 1,
@@ -1717,6 +1776,77 @@ mod tests {
         );
     }
 
+    fn partition_desc(namespace: &str, name: &str) -> RelDescriptor {
+        let mut root = rel_desc(namespace, "m");
+        root.kind = 'p';
+        let mut leaf = rel_desc(namespace, name);
+        leaf.oid = 30001;
+        leaf.rfn.rel_node = 30001;
+        leaf.ancestors = vec![Arc::new(root)];
+        leaf
+    }
+
+    /// Plain patterns skip a `route = "self"` partition at CREATE. Its
+    /// mapping must resolve the same way, or republish retargets or drops it
+    #[tokio::test]
+    async fn partition_mapping_resolves_like_its_ddl() {
+        let base = EmitterConfig::from_toml_str(
+            "[ch]\n\
+             [table.app.\"*\"]\nmatch = \"glob\"\nreplicate = false\n\
+             target_database = \"wide\"\nlsn = \"_v\"\n\
+             [table.app.p]\nroute = \"self\"\n",
+        )
+        .unwrap();
+        let (resolver, rx) = ConfigResolver::new(
+            &base,
+            CliOverrides::default(),
+            None,
+            toml::Table::new(),
+            dummy_handles(),
+            ResolverBoot::default(),
+        );
+        let p = partition_desc("app", "p");
+        assert!(
+            !resolver.is_excluded(&p).await,
+            "barring glob skips partitions"
+        );
+        assert!(resolver.is_excluded(&rel_desc("app", "t")).await);
+
+        resolver.materialize_opt_in(&p, None, None).await;
+        {
+            let snap = rx.borrow();
+            let m = snap
+                .tables
+                .get(&p.rel_name)
+                .expect("mapping survives retain");
+            assert_ne!(m.target.database, "wide", "glob target skipped");
+            let policy = crate::emit::route::RowPolicy::default();
+            assert_eq!(
+                policy.for_rel(Some(&snap), &p.rel_name).system.lsn,
+                "_lsn",
+                "glob rename skipped at freeze as at CREATE"
+            );
+        }
+        resolver
+            .apply_config_event(ConfigEvent::GlobalCleared)
+            .await;
+        let database = rx.borrow().tables[&p.rel_name].target.database.clone();
+        assert_ne!(database, "wide", "republish keeps the partition's rules");
+
+        // Detached, the relation is a plain table the glob now bars
+        resolver
+            .register_derived_mapping(
+                &rel_desc("app", "p"),
+                TableMapping {
+                    target: TableTarget::new("default", "p"),
+                    columns: Vec::new(),
+                    tees: Vec::new(),
+                },
+            )
+            .await;
+        assert!(!rx.borrow().tables.contains_key(&p.rel_name));
+    }
+
     #[tokio::test]
     async fn opt_in_routing_follows_the_namespace_template() {
         let base = EmitterConfig::from_toml_str(
@@ -1781,7 +1911,7 @@ mod tests {
         );
         assert!(!mapping.with(|m| m.contains_key(&rel)).await);
         assert_eq!(resolver.opt_out_total(), 1);
-        assert!(resolver.is_excluded(&rel).await);
+        assert!(resolver.is_excluded(&rel_desc("public", "events")).await);
 
         // Excluded and unmapped rels fold nothing and skip republish
         let diff = SchemaDiff::default();
@@ -1809,7 +1939,7 @@ mod tests {
         let rel = RelName::new("public", "auto");
         resolver
             .register_derived_mapping(
-                &rel,
+                &rel_desc("public", "auto"),
                 TableMapping {
                     target: TableTarget::new("default", "auto"),
                     columns: Vec::new(),
@@ -2231,6 +2361,7 @@ mod tests {
         let overlay = ConfigOverlay {
             global: Some(GlobalRow {
                 drop_table_strategy: Some("drop".into()),
+                detach_strategy: None,
                 ..Default::default()
             }),
             ..Default::default()

@@ -31,6 +31,7 @@ use crate::decode::visibility::{PendingXids, PgXactView, XidStatus};
 use crate::emit::ch_emitter::EmitterStats;
 use crate::emit::pipeline::tail::OwnedTail;
 use crate::emit::pipeline::{Fatal, bootstrap};
+use crate::emit::route::{FrozenRoutes, PartitionOf, RouteSnapshot, partition_mapping, routing};
 use crate::mapping::{ColumnMapping, MappingSnapshot, TableMapping, TableTarget};
 use crate::ops::oracle::Oracle;
 use crate::pos::{Pos, Snapshot};
@@ -63,11 +64,16 @@ pub struct PendingRel {
     pub target: TableTarget,
     /// Also copy rows here when releasing them from pending tables
     pub tees: Vec<TableTarget>,
+    /// Partition OID used to stage rows separately from siblings sharing `target`
+    pub leaf: Option<u32>,
 }
 
 impl PendingRel {
     pub fn pending_table(&self) -> String {
-        format!("{}{PENDING_SUFFIX}", self.target.table)
+        match self.leaf {
+            Some(leaf) => format!("{}{PENDING_SUFFIX}_{leaf}", self.target.table),
+            None => format!("{}{PENDING_SUFFIX}", self.target.table),
+        }
     }
 
     pub fn target_sql(&self) -> String {
@@ -90,6 +96,7 @@ impl PendingRel {
             rel: self.rel.clone(),
             target: target.clone(),
             tees: Vec::new(),
+            leaf: self.leaf,
         }
     }
 
@@ -142,9 +149,9 @@ fn pending_table_mapping(
         tees: pending
             .remote_copies()
             .map(|rel| crate::mapping::Tee {
+                table: rel.pending_table(),
                 instance: Some(rel.target.instance.unwrap_or_else(|| "default".into())),
                 database: Some(rel.target.database),
-                table: format!("{}{PENDING_SUFFIX}", rel.target.table),
                 ..Default::default()
             })
             .collect(),
@@ -259,16 +266,27 @@ pub async fn ship(
         return Ok(Vec::new());
     }
 
-    let mut routes: HashMap<RelName, TableMapping> = HashMap::with_capacity(tally.len());
+    let rules = config.as_ref().map(|rc| rc.rules.clone());
+    let row_policy = dest.current().row_policy();
+    let column_rules = config
+        .as_ref()
+        .map_or_else(Arc::default, |rc| rc.column_rules.clone());
+    let mut routes: ahash::HashMap<RelName, Arc<RouteSnapshot>> =
+        ahash::HashMap::with_capacity(tally.len());
     let mut manifests = Vec::with_capacity(tally.len());
     let mut sess = StagingSession::connect(dest.clone())
         .await
         .map_err(|e| format!("pending visibility: connect: {e}"))?;
     for desc in catalog.descriptors() {
-        let Some(counted) = tally.get(&desc.rel_name) else {
+        // Excluded partitions have no owner and no tapped rows
+        let (Some(counted), Some(owner)) = (
+            tally.get(&desc.rel_name),
+            routing(desc, rules.as_deref()).owner(desc),
+        ) else {
             continue;
         };
-        let Some(m) = live.get(&desc.rel_name) else {
+        let leaf = (owner.oid != desc.oid).then_some(desc.oid);
+        let Some(m) = live.get(&owner.rel_name) else {
             // Unmapped at resolution: rows had nowhere to publish either
             tracing::warn!(
                 target: "walshadow::visibility_pending",
@@ -277,16 +295,36 @@ pub async fn ship(
             );
             continue;
         };
+        let m = if leaf.is_some() {
+            &partition_mapping(m, owner, desc)
+        } else {
+            m
+        };
         let rel = PendingRel {
             rel: desc.rel_name.clone(),
             target: m.target.clone(),
             tees: m.tee_targets().collect(),
+            leaf,
         };
         rebuild_pending(&mut sess, &rel).await?;
         for remote in rel.remote_copies() {
             rebuild_pending(&mut sess, &remote).await?;
         }
-        routes.insert(desc.rel_name.clone(), pending_table_mapping(m, desc, &rel));
+        let route = RouteSnapshot::freeze(
+            Arc::new(pending_table_mapping(m, desc, &rel)),
+            column_rules.clone(),
+            row_policy.for_rel(config.as_deref(), &owner.rel_name),
+        );
+        let route = if let Some(leaf) = leaf {
+            route.with_partition(PartitionOf {
+                root: owner.rel_name.clone(),
+                leaf,
+                shared: false,
+            })
+        } else {
+            route
+        };
+        routes.insert(desc.rel_name.clone(), route);
         manifests.push(PendingManifest {
             rel,
             start_lsn: counted.start_lsn,
@@ -316,14 +354,12 @@ pub async fn ship(
     let drain = tokio::spawn(bootstrap::drain(
         rx,
         catalog,
-        Arc::new(routes),
+        FrozenRoutes::pinned(routes),
         tail.msg_tx.clone(),
         tail.ack.clone(),
         stats.clone(),
         resolver,
         bootstrap::Deferral::Local(DeferredSpool::new(deferred, DEFERRED_SPOOL_MEM_MAX)),
-        dest.current().row_policy(),
-        config,
         HashSet::new(),
         None,
     ));
@@ -443,9 +479,11 @@ pub struct PendingEntry {
     pub target: TableTarget,
     #[serde(default)]
     pub tees: Vec<TableTarget>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub leaf: Option<u32>,
     /// Preserve load version through promotion
     pub start_lsn: Pos<Snapshot>,
-    /// Deciding xids whose outcome is still unknown
+    /// Sorted deciding xids whose outcome is still unknown
     #[serde(default)]
     pub outstanding: Vec<u32>,
     #[serde(default)]
@@ -469,6 +507,7 @@ impl PendingEntry {
             rel: RelName::new(&self.namespace, &self.relname),
             target: self.target.clone(),
             tees: self.tees.clone(),
+            leaf: self.leaf,
         }
     }
 
@@ -477,10 +516,10 @@ impl PendingEntry {
     }
 
     fn note(&mut self, xid: u32, committed: bool) -> bool {
-        let Some(i) = self.outstanding.iter().position(|x| *x == xid) else {
+        let Ok(i) = self.outstanding.binary_search(&xid) else {
             return false;
         };
-        self.outstanding.swap_remove(i);
+        self.outstanding.remove(i);
         self.decided(xid, committed);
         true
     }
@@ -538,11 +577,15 @@ impl PendingLedger {
         let path = ledger_path(spill_dir);
         match tokio::fs::read_to_string(&path).await {
             Ok(text) => {
-                let file: PendingFile = toml::from_str(&text)?;
+                let mut file: PendingFile = toml::from_str(&text)?;
                 if file.version != PENDING_LEDGER_VERSION {
                     return Err(PendingLedgerError::Version(file.version));
                 }
                 let unstamped = crate::fs::check_source(&path, file.system_id, system_id)?;
+                // v0.1 ledger files may hold outstanding unsorted
+                for e in &mut file.entries {
+                    e.outstanding.sort_unstable();
+                }
                 ledger.entries = file.entries;
                 if unstamped {
                     ledger.persist().await?;
@@ -657,6 +700,7 @@ impl PendingLedger {
             relname: manifest.rel.rel.name.to_string(),
             target: manifest.rel.target.clone(),
             tees: manifest.rel.tees.clone(),
+            leaf: manifest.rel.leaf,
             start_lsn: Pos::new(manifest.start_lsn),
             outstanding: xids,
             committed: Vec::new(),
@@ -887,6 +931,7 @@ mod tests {
                 rel: RelName::new("public", rel),
                 target: TableTarget::new("db", rel),
                 tees: Vec::new(),
+                leaf: None,
             },
             start_lsn: 0x5000,
             xids,

@@ -7,7 +7,7 @@ use regex_automata::meta::Regex;
 
 use crate::mapping::{SystemColumnNames, SystemColumns, Tee};
 use crate::runtime_config::TableRow;
-use crate::schema::RelName;
+use crate::schema::{RelDescriptor, RelName};
 
 /// Overwrite only where the narrower layer states a value
 pub(crate) fn set_if<T: Clone>(dst: &mut Option<T>, src: &Option<T>) {
@@ -46,6 +46,27 @@ impl MatchKind {
             Self::Exact => "exact",
             Self::Glob => "glob",
             Self::Regex => "regex",
+        }
+    }
+}
+
+/// Where a declarative partition's rows land
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PartitionRoute {
+    /// Topmost ancestor, unless a closer relation uses `Self_`
+    Root,
+    /// This relation's own destination, for its whole subtree
+    Self_,
+}
+
+impl std::str::FromStr for PartitionRoute {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "root" => Ok(Self::Root),
+            "self" => Ok(Self::Self_),
+            other => Err(format!("unknown route `{other}` (expected root / self)")),
         }
     }
 }
@@ -98,12 +119,17 @@ pub struct TableRule {
     /// CH engine at `CREATE TABLE`, verbatim except a bare `*ReplacingMergeTree`
     /// gains version and delete marker args
     pub engine: Option<String>,
+    /// ClickHouse `PARTITION BY` expression, used as written at table creation
+    pub partition_by: Option<String>,
+    pub route: Option<PartitionRoute>,
     /// Configure in TOML on exact table entries only
     pub tee: Option<Vec<Tee>>,
 }
 
 impl TableRule {
-    pub fn from_row(row: &TableRow) -> Self {
+    /// Rule from a runtime row. `route` arrives parsed so the builder counts
+    /// a rejected value
+    pub fn from_row(row: &TableRow, route: Option<PartitionRoute>) -> Self {
         Self {
             target_instance: None,
             system: row.system.clone(),
@@ -114,6 +140,8 @@ impl TableRule {
             order_by: row.order_by.clone(),
             primary_key: row.primary_key.clone(),
             engine: row.engine.clone(),
+            partition_by: row.partition_by.clone(),
+            route,
             tee: None,
         }
     }
@@ -138,7 +166,38 @@ impl TableRule {
         set_if(&mut self.order_by, &other.order_by);
         set_if(&mut self.primary_key, &other.primary_key);
         set_if(&mut self.engine, &other.engine);
+        set_if(&mut self.partition_by, &other.partition_by);
+        set_if(&mut self.route, &other.route);
         set_if(&mut self.tee, &other.tee);
+    }
+
+    /// Settings beyond `replicate` and `route`, unsupported for partitions
+    /// using root's destination
+    pub fn shapes_destination(&self) -> bool {
+        let Self {
+            target_instance,
+            system,
+            target_database,
+            target_table,
+            replicate: _,
+            initial_load,
+            order_by,
+            primary_key,
+            engine,
+            partition_by,
+            route: _,
+            tee,
+        } = self;
+        target_instance.is_some()
+            || !system.is_empty()
+            || target_database.is_some()
+            || target_table.is_some()
+            || initial_load.is_some()
+            || order_by.is_some()
+            || primary_key.is_some()
+            || engine.is_some()
+            || partition_by.is_some()
+            || tee.is_some()
     }
 }
 
@@ -191,14 +250,17 @@ pub struct TableRules {
 }
 
 impl TableRules {
-    /// Merged rule plus whether a pattern entry contributed
-    fn merge(&self, rel: &RelName) -> (TableRule, bool) {
+    /// Merged rule plus whether a pattern entry contributed. Patterns reach a
+    /// partition only by setting `route = "self"`
+    fn merge(&self, rel: &RelName, partition: bool) -> (TableRule, bool) {
         let mut merged = TableRule::default();
         let mut from_pattern = false;
         let mut barred = false;
         let mut literal_replicate = None;
         for (matcher, rule) in &self.rules {
-            if !matcher.matches(rel) {
+            if !matcher.matches(rel)
+                || (partition && matcher.is_pattern() && rule.route != Some(PartitionRoute::Self_))
+            {
                 continue;
             }
             merged.overlay(rule);
@@ -216,12 +278,38 @@ impl TableRules {
         (merged, from_pattern)
     }
 
+    /// Merged rule. Plain patterns skip a declarative `partition`
+    pub fn settings_of(&self, rel: &RelName, partition: bool) -> TableRule {
+        self.merge(rel, partition).0
+    }
+
     pub fn settings(&self, rel: &RelName) -> TableRule {
-        self.merge(rel).0
+        self.merge(rel, false).0
+    }
+
+    /// [`Self::settings_of`] by descriptor
+    pub fn settings_for(&self, desc: &RelDescriptor) -> TableRule {
+        self.settings_of(&desc.rel_name, desc.is_partition())
+    }
+
+    /// [`Self::settings`] for a declarative partition
+    pub fn partition_settings(&self, rel: &RelName) -> TableRule {
+        self.merge(rel, true).0
+    }
+
+    /// Use only exact entries, which name individual relations
+    pub fn exact_settings(&self, rel: &RelName) -> TableRule {
+        let mut merged = TableRule::default();
+        for (matcher, rule) in &self.rules {
+            if !matcher.is_pattern() && matcher.matches(rel) {
+                merged.overlay(rule);
+            }
+        }
+        merged
     }
 
     fn pattern_scope(&self, rel: &RelName) -> Option<TableRow> {
-        let (rule, from_pattern) = self.merge(rel);
+        let (rule, from_pattern) = self.merge(rel, false);
         (from_pattern && rule.replicate.is_some()).then(|| TableRow {
             target_database: rule.target_database,
             target_table: rule.target_table,
@@ -299,7 +387,15 @@ impl TableRulesBuilder {
                 return;
             }
         };
-        self.add(key, kind, TableRule::from_row(row));
+        let route = match row.route.as_deref().map(str::parse).transpose() {
+            Ok(route) => route,
+            Err(e) => {
+                tracing::warn!(target: "walshadow::config", qname = %key, error = %e, "config_table.route rejected");
+                self.rejections += 1;
+                None
+            }
+        };
+        self.add(key, kind, TableRule::from_row(row, route));
     }
 
     pub fn finish(mut self) -> (TableRules, u64) {
@@ -617,5 +713,73 @@ mod tests {
         assert_eq!(" Regex ".parse::<MatchKind>().unwrap(), MatchKind::Regex);
         assert_eq!("glob".parse::<MatchKind>().unwrap(), MatchKind::Glob);
         assert!("like".parse::<MatchKind>().is_err());
+    }
+
+    #[test]
+    fn partitions_take_patterns_only_with_route_self() {
+        let mut b = TableRulesBuilder::new();
+        b.add(
+            &rel("app", "*"),
+            MatchKind::Glob,
+            TableRule {
+                replicate: Some(false),
+                ..target("wide")
+            },
+        );
+        b.add(
+            &rel("app", "hot_*"),
+            MatchKind::Glob,
+            TableRule {
+                route: Some(PartitionRoute::Self_),
+                ..TableRule::default()
+            },
+        );
+        b.add(
+            &rel("app", "m_eu"),
+            MatchKind::Exact,
+            TableRule {
+                replicate: Some(true),
+                ..TableRule::default()
+            },
+        );
+        let (rules, rejected) = b.finish();
+        assert_eq!(rejected, 0);
+        let eu = rel("app", "m_eu");
+        assert_eq!(rules.settings(&eu).target_table.as_deref(), Some("wide"));
+        let partition = rules.partition_settings(&eu);
+        assert_eq!(
+            partition.target_table, None,
+            "plain pattern skips partitions"
+        );
+        assert_eq!(partition.replicate, Some(true));
+        assert!(!rules.exact_settings(&eu).shapes_destination());
+        let hot = rules.partition_settings(&rel("app", "hot_1"));
+        assert_eq!(hot.route, Some(PartitionRoute::Self_));
+        assert_eq!(
+            hot.replicate, None,
+            "barring pattern does not reach a partition"
+        );
+    }
+
+    #[test]
+    fn partition_route_parses() {
+        assert_eq!(" SELF ".parse(), Ok(PartitionRoute::Self_));
+        let row = TableRow {
+            route: Some("bogus".into()),
+            partition_by: Some("toYYYYMM(ts)".into()),
+            ..TableRow::default()
+        };
+        let key = rel("public", "m");
+        let mut b = TableRulesBuilder::new();
+        b.add_row(&key, &row);
+        let (rules, rejected) = b.finish();
+        assert_eq!(rejected, 1, "invalid route counts as a rejection");
+        let rule = rules.settings(&key);
+        assert_eq!(rule.route, None, "invalid route is dropped");
+        assert_eq!(
+            rule.partition_by.as_deref(),
+            Some("toYYYYMM(ts)"),
+            "rest of the row stands"
+        );
     }
 }

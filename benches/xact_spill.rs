@@ -55,6 +55,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
         rel_name: RelName::new("public", "spill_bench"),
         kind: 'r',
         persistence: 'p',
+        ancestors: Vec::new(),
         replident: ReplIdent::Default { pk_attnums: None },
         attributes: Vec::new(),
     });

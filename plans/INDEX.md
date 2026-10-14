@@ -34,6 +34,7 @@ writes. A documented limitation does not imply code rejects it
 
 | Plan | Reason to take it up |
 |---|---|
+| [Partitioned tables](partitions.md) | Update partition ancestors after root changes; reject schema changes during root loads |
 | [Multi-database loads and metrics](multi_database.md) | Extend heap-page bootstrap and backup loads beyond primary database, attribute metrics |
 | [Fuzzing](fuzzing.md) | Find parser and schema-transition interactions beyond fixed regressions |
 | [Performance](performance.md) | Establish healthy sustained WAL baseline with exact reconciliation before tuning |

@@ -24,11 +24,11 @@ use crate::decode::wal_xact::{
 use crate::emit::ch_emitter::EmitterStats;
 use crate::emit::pipeline::ack::{AckHandle, OpenSeq, Publish, SeqAlloc};
 use crate::emit::pipeline::batcher::{BatcherMsg, RoutedRow};
-use crate::emit::route::{RouteSnapshot, freeze_routes};
+use crate::emit::route::{FrozenRoutes, freeze_routes};
 use crate::mapping::MappingSnapshot;
 use crate::pos::Pos;
 use crate::record::{Record, RecordSink, SegmentSink, SinkError, WAL_SEG_SIZE};
-use crate::schema::{FIRST_NORMAL_OBJECT_ID, RelDescriptor, RelName};
+use crate::schema::{FIRST_NORMAL_OBJECT_ID, RelDescriptor};
 use crate::source::wal_stream::WalStream;
 use crate::toast::{ChunkRefMap, ToastResolver, ToastRow, ToastRowRef};
 use crate::xact::spill::BodySpoolFile;
@@ -94,7 +94,7 @@ pub struct WalReplaySink {
     /// See [`WalReplayInputs::whole_db_filter`]
     whole_db_filter: bool,
     /// Routes frozen at replay start from the mapping + config snapshots
-    routes: HashMap<RelName, Arc<RouteSnapshot>>,
+    routes: FrozenRoutes,
     stats: Arc<EmitterStats>,
     budget: Option<MemoryBudget>,
     /// Drain-slice budget, same knobs as the pipeline reorder
@@ -425,7 +425,7 @@ impl WalReplaySink {
                         self.replay.commits_past_through += 1;
                         continue;
                     }
-                    let Some(route) = self.routes.get(&rel.rel_name).cloned() else {
+                    let Some(route) = self.routes.route(rel) else {
                         self.stats
                             .unsupported_relations
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);

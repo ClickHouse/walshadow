@@ -59,6 +59,7 @@ pub struct GlobalRow {
     pub compression: Option<String>,
     pub retry_max_attempts: Option<i64>,
     pub drop_table_strategy: Option<String>,
+    pub detach_strategy: Option<String>,
 }
 
 /// `config_namespace` row (key = `namespace`).
@@ -70,6 +71,7 @@ pub struct NamespaceRow {
     /// names, parsed at resolver merge
     pub auto_create_name: Option<String>,
     pub drop_table_strategy: Option<String>,
+    pub detach_strategy: Option<String>,
 }
 
 /// `config_table` row (key = `(namespace, relname)`).
@@ -93,6 +95,10 @@ pub struct TableRow {
     pub primary_key: Option<Vec<String>>,
     /// CH engine for this table's `CREATE`. NULL keeps startup TOML value
     pub engine: Option<String>,
+    /// CH `PARTITION BY` for this table's `CREATE`. NULL keeps startup TOML value
+    pub partition_by: Option<String>,
+    /// Raw `root` / `self` partition routing, parsed at resolver merge
+    pub route: Option<String>,
     /// Per-relation renames of the columns walshadow appends. NULL on a column
     /// inherits `[system_columns]`; `is_deleted = ''` drops the marker
     pub system: crate::mapping::SystemColumnNames,
@@ -338,6 +344,7 @@ pub fn interpret(
                 compression: field_string(rel, &cols, "compression"),
                 retry_max_attempts: field_i64(rel, &cols, "retry_max_attempts"),
                 drop_table_strategy: field_string(rel, &cols, "drop_table_strategy"),
+                detach_strategy: field_string(rel, &cols, "detach_strategy"),
             }))
         }
         ConfigTableKind::Namespace => {
@@ -352,6 +359,7 @@ pub fn interpret(
                     auto_create: field_bool(rel, &cols, "auto_create"),
                     auto_create_name: field_string(rel, &cols, "auto_create_name"),
                     drop_table_strategy: field_string(rel, &cols, "drop_table_strategy"),
+                    detach_strategy: field_string(rel, &cols, "detach_strategy"),
                 },
             })
         }
@@ -378,11 +386,14 @@ pub fn interpret(
                     order_by: field_string_array(rel, &cols, "order_by"),
                     primary_key: field_string_array(rel, &cols, "primary_key"),
                     engine: field_string(rel, &cols, "engine"),
+                    partition_by: field_string(rel, &cols, "partition_by"),
+                    route: field_string(rel, &cols, "route"),
                     system: crate::mapping::SystemColumnNames {
                         lsn: field_string(rel, &cols, "lsn"),
                         xid: field_string(rel, &cols, "xid"),
                         commit_ts: field_string(rel, &cols, "commit_ts"),
                         is_deleted: field_string(rel, &cols, "is_deleted"),
+                        leaf: field_string(rel, &cols, "leaf"),
                     },
                     match_kind: field_string(rel, &cols, "match"),
                 },
@@ -449,6 +460,7 @@ mod tests {
             rel_name: RelName::new("walshadow", name),
             kind: 'r',
             persistence: 'p',
+            ancestors: Vec::new(),
             replident: ReplIdent::Full { pk_attnums: None },
             attributes: attrs,
         }
@@ -525,6 +537,7 @@ mod tests {
                 compression: Some("zstd".into()),
                 retry_max_attempts: Some(9),
                 drop_table_strategy: Some("drop".into()),
+                detach_strategy: None,
             })),
         );
     }
@@ -566,6 +579,7 @@ mod tests {
                 compression: Some("lz4".into()),
                 retry_max_attempts: Some(5),
                 drop_table_strategy: Some("retain".into()),
+                detach_strategy: None,
             })),
         );
     }
@@ -750,6 +764,68 @@ mod tests {
             Some(ConfigEvent::TableRemoved {
                 rel: RelName::new("app", "events_.*"),
                 pattern: true,
+            }),
+        );
+    }
+
+    #[test]
+    fn partition_settings_interpret_from_overlay_rows() {
+        let table = rel(
+            CONFIG_TABLE,
+            vec![
+                attr(1, "namespace", 25),
+                attr(2, "relname", 25),
+                attr(3, "route", 25),
+                attr(4, "partition_by", 25),
+                attr(5, "leaf", 25),
+            ],
+        );
+        let new = vec![
+            Some(ColumnValue::Text("app".into())),
+            Some(ColumnValue::Text("m".into())),
+            Some(ColumnValue::Text("self".into())),
+            Some(ColumnValue::Text("toYYYYMM(ts)".into())),
+            Some(ColumnValue::Text("_part".into())),
+        ];
+        assert_eq!(
+            interpret(
+                ConfigTableKind::Table,
+                &heap(HeapOp::Insert, Some(new), None),
+                &table,
+            ),
+            Some(ConfigEvent::TableUpserted {
+                rel: RelName::new("app", "m"),
+                row: TableRow {
+                    route: Some("self".into()),
+                    partition_by: Some("toYYYYMM(ts)".into()),
+                    system: crate::mapping::SystemColumnNames {
+                        leaf: Some("_part".into()),
+                        ..Default::default()
+                    },
+                    ..TableRow::default()
+                },
+            }),
+        );
+        let namespace = rel(
+            CONFIG_NAMESPACE,
+            vec![attr(1, "namespace", 25), attr(2, "detach_strategy", 25)],
+        );
+        let new = vec![
+            Some(ColumnValue::Text("app".into())),
+            Some(ColumnValue::Text("drop".into())),
+        ];
+        assert_eq!(
+            interpret(
+                ConfigTableKind::Namespace,
+                &heap(HeapOp::Insert, Some(new), None),
+                &namespace,
+            ),
+            Some(ConfigEvent::NamespaceUpserted {
+                namespace: "app".into(),
+                row: NamespaceRow {
+                    detach_strategy: Some("drop".into()),
+                    ..NamespaceRow::default()
+                },
             }),
         );
     }

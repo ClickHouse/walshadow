@@ -35,6 +35,7 @@ use crate::schema::{RelDescriptor, RelName};
 
 #[async_trait]
 pub trait Backfiller: Send + Sync {
+    /// No-op for `InitialLoadMode::None`
     async fn note_opt_in(
         self: Arc<Self>,
         desc: Arc<RelDescriptor>,
@@ -169,7 +170,7 @@ async fn opt_in_known(
         );
         return Ok(());
     }
-    if !applicator.ensure_ch_table(desc).await? {
+    if !applicator.owns_destination(desc).await? || !applicator.ensure_ch_table(desc).await? {
         return Ok(());
     }
     resolver
