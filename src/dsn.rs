@@ -43,7 +43,7 @@ pub enum DsnError {
 }
 
 const PG_PARAMS: &str = "sslmode, slot, host, port, user, password, dbname";
-const CH_PARAMS: &str = "secure, compression, database, user, password, port";
+const CH_PARAMS: &str = "secure, tls_server_name, compression, database, user, password, port";
 
 /// `postgres://user:pass@host:5432/dbname?sslmode=require&slot=walshadow`
 ///
@@ -191,7 +191,7 @@ pub fn ch_table(url: &str) -> Result<Table, DsnError> {
         let k = decode(url, raw_key)?.to_ascii_lowercase();
         let v = decode(url, raw_value)?;
         match k.as_str() {
-            "compression" | "database" | "user" | "password" => {
+            "compression" | "database" | "user" | "password" | "tls_server_name" => {
                 out.insert(k, v.into());
             }
             "secure" => {
@@ -397,6 +397,20 @@ mod tests {
         assert_eq!(i(&t, "port"), 9440);
         assert_eq!(t.get("secure").and_then(Value::as_bool), Some(true));
         assert_eq!(s(&t, "compression"), "zstd");
+    }
+
+    #[test]
+    fn ch_url_tls_server_name_param() {
+        let t =
+            ch_table("clickhouses://u:p@10.0.0.5/db?tls_server_name=svc.clickhouse.cloud").unwrap();
+        assert_eq!(s(&t, "host"), "10.0.0.5");
+        assert_eq!(s(&t, "tls_server_name"), "svc.clickhouse.cloud");
+        assert!(
+            ch_table("clickhouse://ch/db")
+                .unwrap()
+                .get("tls_server_name")
+                .is_none()
+        );
     }
 
     #[test]
