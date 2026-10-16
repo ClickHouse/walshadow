@@ -238,6 +238,7 @@ ws_append_default(pgch_writer* w, size_t col, const WsNativeCol* c) {
     case CHC_NULLABLE:
     case CHC_ARRAY:
     case CHC_MAP:
+    case CHC_QBIT:
         pgch_append_datum(w, col, (Datum)0, c->native_oid, true);
         return;
     case CHC_STRING:

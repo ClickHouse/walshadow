@@ -18,7 +18,7 @@
 //! | `varchar(n)`, `bpchar(n)`, `text`, `name` | `String` | CH has no length cap |
 //! | `bytea` | `String` | CH binary lands in String columns |
 //! | `date` | `Date32` | infinity requires explicit substitution |
-//! | `time` | `Time64(6)` | microseconds since midnight |
+//! | `time(p)` | `Time64(p)` | p ≤ 6, microseconds since midnight |
 //! | `timetz` | `String` | preserves UTC offset text |
 //! | `timestamp` / `timestamptz` | `DateTime64(p, 'UTC')` p ≤ 6 | |
 //! | `interval` | `String` | |
@@ -57,8 +57,8 @@ use walrus::time::civil_from_days;
 const VARHDRSZ: i32 = 4;
 /// CH `Decimal256` precision ceiling
 const CH_DECIMAL_MAX_PRECISION: i32 = 76;
-/// CH `DateTime64` max fractional precision
-const CH_DATETIME64_MAX_PRECISION: i32 = 6;
+/// PG `MAX_TIMESTAMP_PRECISION` and `MAX_TIME_PRECISION`
+const PG_TEMPORAL_MAX_PRECISION: i32 = 6;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedColumn {
@@ -106,12 +106,9 @@ pub fn base_type_for(att: &RelAttr) -> Result<String, BridgeError> {
         NUMERICOID => numeric_ch_type(att.typmod),
         TEXTOID | VARCHAROID | BPCHAROID | NAMEOID | BYTEAOID => "String".into(),
         DATEOID => "Date32".into(),
-        // `time` microseconds-since-midnight == CH `Time64(6)` tick. CH 25.x
-        // gates Time64 behind `enable_time_time64_type=1`; dest server must
-        // enable or time-column create/insert fails. `timetz` carries a UTC
-        // offset CH time types can't store, so stays text; `interval` has no
-        // CH analog
-        TIMEOID => "Time64(6)".into(),
+        // CH 25.x requires `enable_time_time64_type=1` for Time64.
+        // CH time types cannot store `timetz` UTC offsets or intervals
+        TIMEOID => format!("Time64({})", temporal_precision(att.typmod)),
         TIMETZOID | INTERVALOID => "String".into(),
         TIMESTAMPOID | TIMESTAMPTZOID => datetime64_ch_type(att.typmod),
         UUIDOID => "UUID".into(),
@@ -190,16 +187,18 @@ fn numeric_ch_type(typmod: i32) -> String {
     format!("Decimal({precision}, {scale})")
 }
 
-/// `timestamp(p)` / `timestamptz(p)` → `DateTime64(p, 'UTC')`. typmod packs
-/// fractional precision 0..=6. Pinned UTC: PG `timestamptz` storage is epoch
-/// microseconds, not zoned
+/// Use UTC: PG stores `timestamptz` as microseconds since epoch, without a time zone
 fn datetime64_ch_type(typmod: i32) -> String {
-    let precision = if (0..=CH_DATETIME64_MAX_PRECISION).contains(&typmod) {
+    format!("DateTime64({}, 'UTC')", temporal_precision(typmod))
+}
+
+/// PG stores fractional precision (0..=6) in typmod for time and timestamp types
+fn temporal_precision(typmod: i32) -> i32 {
+    if (0..=PG_TEMPORAL_MAX_PRECISION).contains(&typmod) {
         typmod
     } else {
-        CH_DATETIME64_MAX_PRECISION
-    };
-    format!("DateTime64({precision}, 'UTC')")
+        PG_TEMPORAL_MAX_PRECISION
+    }
 }
 
 /// Render PG-decoded value as CH SQL literal for after `DEFAULT `. `None`
@@ -606,6 +605,10 @@ mod tests {
         assert_eq!(
             base_type_for(&attr(TIMEOID, -1, true, None)).unwrap(),
             "Time64(6)"
+        );
+        assert_eq!(
+            base_type_for(&attr(TIMEOID, 0, true, None)).unwrap(),
+            "Time64(0)"
         );
         assert_eq!(
             base_type_for(&attr(TIMETZOID, -1, true, None)).unwrap(),

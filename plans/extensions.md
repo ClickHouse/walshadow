@@ -108,16 +108,17 @@ promotion-target precondition
 
 ## QBit vector storage
 
-Current type mapping uses Array(Float32) for vector and halfvec. PostgreSQL
-conversion has replaced old manual halfvec decoding path; do not reimplement
-that removed decoder. Existing vector test covers text output, so add explicit
-array-target coverage before changing storage representation
+Map `vector` and `halfvec` to `Array(Float32)` by default. Keep using PostgreSQL
+to convert `halfvec`; do not restore manual decoding. Use column rules to choose
+`Array(Float64)`, `Array(BFloat16)`, or `QBit(T, N)` for `vector`; `halfvec`
+overrides need pg-clickhouse-c support first. Oracle uses pg-clickhouse-c
+to encode each type and rejects QBit vectors whose dimension differs from `N`
 
-Evaluate QBit only after native-protocol insertion, dimensions, required server
-settings, and version compatibility are tested. Distinguish destination storage
-type from wire representation. Preserve variable-dimension fallback and existing
-tables. Make halfvec precision loss explicit if choosing BFloat16, never treat
-IEEE half and BFloat16 bits as interchangeable
+QBit is beta and enabled by default in ClickHouse 26.1+. In 25.10, enable it with
+`allow_experimental_qbit_type`. Before making QBit default for `vector(N)`,
+require a compatible server version. Keep `Array(Float32)` for vectors without
+a fixed dimension and for existing tables. BFloat16 discards trailing Float32
+bits. IEEE half and BFloat16 use different formats; do not copy bits between them
 
 ## Other opt-in behavior
 
