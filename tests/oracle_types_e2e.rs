@@ -567,6 +567,47 @@ async fn pgvector_resolves_via_oracle() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pgvector_fills_float_arrays_and_qbit() {
+    if skip_gate() || !fx::tools::extension("vector") {
+        return;
+    }
+    let (source, ch, _tmp) = run_oracle(
+        fx::Ports::alloc(),
+        "walshadow-oracle-qbit",
+        "CREATE EXTENSION vector;\n\
+         CREATE TABLE public.vec (id int PRIMARY KEY, v vector(3));\n",
+        "CREATE OR REPLACE TABLE walshadow_test.vec (\
+            id Int32, q QBit(Float32, 3), d Array(Float64), b Array(BFloat16),\
+            _lsn UInt64, _xid UInt32, _commit_ts DateTime64(6, 'UTC'), _is_deleted Bool\
+         ) ENGINE = ReplacingMergeTree(_lsn, _is_deleted) ORDER BY id",
+        vec![fx::TableMappingSpec {
+            source_table: RelName::new("public", "vec"),
+            target_table: TableTarget::new("walshadow_test", "vec"),
+            columns: vec![
+                col(1, "id", "Int32"),
+                col(2, "q", "QBit(Float32, 3)"),
+                col(2, "d", "Array(Float64)"),
+                col(2, "b", "Array(BFloat16)"),
+            ],
+        }],
+        "INSERT INTO public.vec VALUES (1, '[1,2.5,-3]'), (2, '[1.1,0,0]');\n\
+         SELECT pg_switch_wal();\n",
+    )
+    .await;
+    let _src = fx::StopOnDrop { sh: &source };
+
+    assert_eq!(
+        ch.query(
+            "SELECT id, q, d, b FROM walshadow_test.vec FINAL \
+             WHERE _is_deleted = 0 ORDER BY id"
+        )
+        .unwrap(),
+        "1\t[1,2.5,-3]\t[1,2.5,-3]\t[1,2.5,-3]\n\
+         2\t[1.1,0,0]\t[1.100000023841858,0,0]\t[1.09375,0,0]",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn array_update_under_rif_resolves_old_tuple() {
     if skip_gate() {
         return;

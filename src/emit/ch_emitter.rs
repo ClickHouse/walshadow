@@ -1547,7 +1547,7 @@ fn canonical_type(ast: &TypeAst, configured: &str) -> String {
 fn composite_target(ast: &TypeAst) -> bool {
     matches!(
         types::strip_nullable(ast.view()).kind(),
-        Some(Kind::Array | Kind::Map | Kind::Object)
+        Some(Kind::Array | Kind::Map | Kind::Object | Kind::QBit)
     )
 }
 
@@ -2269,9 +2269,8 @@ fn wire_shape_of(ast: &TypeAst) -> Option<(WireShape, Kind)> {
 fn override_wire(default: &TypeAst, over: &TypeAst) -> Option<Option<DecimalWire>> {
     let source_kind = types::strip_nullable(default.view()).kind();
     let target_kind = types::strip_nullable(over.view()).kind();
-    if matches!(source_kind, Some(Kind::Date32 | Kind::DateTime64))
-        || matches!(target_kind, Some(Kind::Date32 | Kind::DateTime64))
-    {
+    let temporal = |k| matches!(k, Some(Kind::Date32 | Kind::DateTime64 | Kind::Time64));
+    if temporal(source_kind) || temporal(target_kind) {
         return (source_kind == target_kind).then_some(None);
     }
     if decimal_wire_of(default).is_some() {
@@ -2482,20 +2481,24 @@ fn unsupported(kind: &'static str) -> EmitterError {
 }
 
 fn timestamp_ticks(pg_us: i64, scale: i32) -> Result<i64, EmitterError> {
+    micros_to_ticks(
+        i128::from(pg_us) + i128::from(DATETIME64_PG_EPOCH_US),
+        scale,
+    )
+}
+
+/// Convert microseconds to `DateTime64(scale)` or `Time64(scale)` ticks
+fn micros_to_ticks(us: i128, scale: i32) -> Result<i64, EmitterError> {
     if !(0..=9).contains(&scale) {
-        return Err(EmitterError::Type("invalid DateTime64 precision".into()));
+        return Err(EmitterError::Type("invalid temporal precision".into()));
     }
-    let unix_us = i128::from(pg_us) + i128::from(DATETIME64_PG_EPOCH_US);
     let ticks = if scale < 6 {
         let divisor = 10i128.pow((6 - scale) as u32);
-        if unix_us % divisor != 0 {
-            return Err(unsupported("timestamp precision loss in DateTime64 column"));
-        }
-        unix_us / divisor
+        us / divisor
     } else {
-        unix_us * 10i128.pow((scale - 6) as u32)
+        us * 10i128.pow((scale - 6) as u32)
     };
-    i64::try_from(ticks).map_err(|_| unsupported("finite timestamp overflows DateTime64 storage"))
+    i64::try_from(ticks).map_err(|_| unsupported("finite temporal value overflows storage"))
 }
 
 fn encode_value(
@@ -2529,8 +2532,11 @@ fn encode_value(
                 .ok_or_else(|| unsupported("finite date overflows Date32 epoch conversion"))?;
             buf.append_fixed_bytes(&days.to_le_bytes())
         }
-        // `time` → `Time64(6)`: microseconds since midnight, no epoch offset
-        ColumnValue::Time(n) => buf.append_fixed_bytes(&n.to_le_bytes()),
+        // PG time counts microseconds since midnight, without an epoch offset
+        ColumnValue::Time(n) => {
+            let ticks = micros_to_ticks(i128::from(*n), timestamp_scale)?;
+            buf.append_fixed_bytes(&ticks.to_le_bytes())
+        }
         ColumnValue::Timestamp(n) | ColumnValue::TimestampTz(n) => {
             let ticks = timestamp_ticks(*n, timestamp_scale)?;
             buf.append_fixed_bytes(&ticks.to_le_bytes())
@@ -3575,6 +3581,16 @@ mod tests {
                 bytes: &micros.to_le_bytes(),
             }
         );
+        let ast = TypeAst::parse("Time64(3)", alloc).unwrap();
+        let mut buf = ColumnBuf::new_for_ast(&ast).unwrap();
+        encode_value(&mut buf, &ColumnValue::Time(micros + 7_999), None, 3).unwrap();
+        assert_eq!(
+            buf.wire(),
+            Wire::Fixed {
+                width: 8,
+                bytes: &(micros / 1_000 + 7).to_le_bytes(),
+            }
+        );
         let sast = TypeAst::parse("String", alloc).unwrap();
         let mut sbuf = ColumnBuf::new_for_ast(&sast).unwrap();
         encode_value(
@@ -3916,18 +3932,14 @@ mod tests {
                 }
             );
         }
-        for us in [-1001, -1, 1, 1001] {
-            let err = timestamp_ticks(us - DATETIME64_PG_EPOCH_US, 3).unwrap_err();
-            assert!(err.to_string().contains("precision loss"));
-        }
-        for us in [-1000, 0, 1000] {
+        for us in [-1999, -1001, -1000, -1, 0, 1, 1000, 1001, 1999] {
             assert_eq!(
                 timestamp_ticks(us - DATETIME64_PG_EPOCH_US, 3).unwrap(),
                 us / 1000
             );
         }
         let err = timestamp_ticks(i64::MAX - 1, 6).unwrap_err();
-        assert!(err.to_string().contains("finite timestamp overflows"));
+        assert!(err.to_string().contains("overflows storage"));
         assert!(timestamp_ticks(i64::MAX / 1_000_000 * 1_000_000, 0).is_ok());
         assert!(timestamp_ticks(i64::MIN + 1, 9).is_err());
     }
@@ -4035,6 +4047,11 @@ mod tests {
         assert!(override_wire(&p("Date32"), &p("Int32")).is_none());
         assert!(override_wire(&p("Int64"), &p("DateTime64(6)")).is_none());
         assert!(override_wire(&p("DateTime64(6)"), &p("Nullable(DateTime64(3))")).is_some());
+        assert!(override_wire(&p("Time64(6)"), &p("Time64(3)")).is_some());
+        assert!(override_wire(&p("Time64(6)"), &p("Int64")).is_none());
+        let vector = p("Array(Float32)");
+        assert!(override_wire(&vector, &p("QBit(Float32, 3)")).is_some());
+        assert!(override_wire(&vector, &p("Array(BFloat16)")).is_some());
         // Decimal-encoded source: Decimal / String / signed ints convert
         let dec = p("Decimal(38, 0)");
         assert!(override_wire(&dec, &p("Decimal(38, 2)")).is_some());

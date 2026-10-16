@@ -332,8 +332,8 @@ Common mappings include:
 | `numeric(p,s)` | `Decimal(p,s)` up to precision 76, otherwise `String` |
 | `text`, `varchar`, `char`, `name`, `bytea` | `String` |
 | `date` | `Date32` |
-| `time` | `Time64(6)` |
-| `timestamp`, `timestamptz` | `DateTime64(..., 'UTC')` |
+| `time(p)` | `Time64(p)` |
+| `timestamp(p)`, `timestamptz(p)` | `DateTime64(p, 'UTC')` |
 | `uuid` | `UUID` |
 | `json`, `jsonb` | `String` |
 | `hstore` | `Map(String, Nullable(String))` |
@@ -346,8 +346,12 @@ Nullable source columns become `Nullable(...)` unless used as ClickHouse sort
 keys. ClickHouse deployments using PostgreSQL `time` columns must enable
 `Time64` support
 
-Override inferred type with name-based column rule, see
-[Select tables](table-selection.md#rename-targets-or-columns)
+Use a column rule to override an inferred type; see
+[Select tables](table-selection.md#rename-targets-or-columns). For pgvector
+`vector` columns, choose `Array(Float64)`, `Array(BFloat16)`, or `QBit(T, N)` as
+well. For QBit, `N` must match vector dimension. BFloat16 keeps only first 16
+bits of each Float32 value. NULL vectors become zero vectors in QBit columns
+that do not allow NULL
 
 ## Large toasted values
 
