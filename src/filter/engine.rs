@@ -267,6 +267,12 @@ impl Filter {
         Ok(())
     }
 
+    pub(crate) fn shadow_rels_dirty(&self) -> bool {
+        self.shadow_rels
+            .as_ref()
+            .is_some_and(ShadowRelations::dirty)
+    }
+
     pub(crate) async fn flush_shadow_rels(&mut self) -> anyhow::Result<()> {
         if let Some(rels) = &mut self.shadow_rels {
             rels.flush().await?;

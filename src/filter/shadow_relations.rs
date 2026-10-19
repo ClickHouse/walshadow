@@ -145,6 +145,10 @@ impl ShadowRelations {
         self.flush().await
     }
 
+    pub(crate) fn dirty(&self) -> bool {
+        self.dirty && self.dir.is_some()
+    }
+
     pub(crate) async fn flush(&mut self) -> Result<()> {
         let Some(dir) = self.dir.as_ref().filter(|_| self.dirty) else {
             return Ok(());
