@@ -377,10 +377,22 @@ pub(crate) async fn populate_pipeline_metrics(
         xacts_committed_total: xact_stats.committed_xacts_total,
         xacts_aborted_total: xact_stats.aborted_xacts_total,
         decoder_decoded_total: decoder_stats.decoded.load(Ordering::Relaxed),
+        decoder_records_by_op: [
+            &decoder_stats.inserts,
+            &decoder_stats.updates,
+            &decoder_stats.hot_updates,
+            &decoder_stats.deletes,
+            &decoder_stats.truncates,
+        ]
+        .map(|n| n.load(Ordering::Relaxed)),
         decoder_partial_total: decoder_stats.partial.load(Ordering::Relaxed),
         decoder_toast_chunks_total: decoder_stats.toast_chunks_buffered.load(Ordering::Relaxed),
         decoder_toast_malformed_total: decoder_stats.toast_chunks_malformed.load(Ordering::Relaxed),
         decoder_toast_deletes_total: decoder_stats.toast_chunk_deletes.load(Ordering::Relaxed),
+        decoder_catalog_not_found_total: decoder_stats.catalog_not_found.load(Ordering::Relaxed),
+        decoder_skipped_op_total: decoder_stats.skipped_op.load(Ordering::Relaxed),
+        decoder_skipped_no_block_total: decoder_stats.skipped_no_block.load(Ordering::Relaxed),
+        skipped_records_by_rel: skipped_by_rel(decoder_stats, counters.db_name),
         toast_stash_buffered_total: decoder_stats.toast_stash_buffered.load(Ordering::Relaxed),
         raw_stash_deferred_total: decoder_stats.raw_stash_deferred.load(Ordering::Relaxed),
         raw_stash_records_by_kind_op: [
@@ -441,6 +453,30 @@ pub(crate) fn stage_gauges(v: &StageCounters<'_>) -> MetricsSnapshot {
 }
 
 const UNMAPPED_STATUS_ROWS: usize = 20;
+
+fn skipped_by_rel(
+    stats: &walshadow::decoder_sink::DecoderStats,
+    db_name: &(dyn Fn(u32) -> String + Sync),
+) -> Vec<walshadow::metrics::SkippedRel> {
+    let mut per_reason = ahash::HashMap::<_, usize>::default();
+    stats
+        .skipped_by_rel
+        .snapshot()
+        .into_iter()
+        .filter(|(key, _)| {
+            let seen = per_reason.entry(key.reason).or_default();
+            *seen += 1;
+            *seen <= UNMAPPED_STATUS_ROWS
+        })
+        .map(|(key, records)| walshadow::metrics::SkippedRel {
+            database: db_name(key.db_oid),
+            rel_node: key.rel_node.to_string(),
+            op: key.op,
+            reason: key.reason.label(),
+            records,
+        })
+        .collect()
+}
 
 pub(crate) fn stage_gauges_on(v: &StageCounters<'_>, base: MetricsSnapshot) -> MetricsSnapshot {
     let (proc_cpu, proc_rss, proc_threads) = read_process_stats();

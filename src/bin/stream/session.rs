@@ -1025,6 +1025,10 @@ pub(crate) async fn run_session(
         decoder = decoder.with_span_registry(reg.clone());
     }
     let decoder_stats_handle = decoder.stats_handle();
+    stream
+        .filter_mut()
+        .set_skip_stats(decoder_stats_handle.clone());
+    let skip_attribution_stats = decoder_stats_handle.clone();
 
     let mut emitter_stats_handle: Option<Arc<EmitterStats>> = None;
     // Seed at resume point so first status write cannot replace persisted ack
@@ -1452,6 +1456,19 @@ pub(crate) async fn run_session(
     // Pause and the source endpoint are cluster-wide, so the primary's
     // resolver is the one the pump watches
     let pump_config_rx = config_resolvers.first().map(|r| r.subscribe());
+    if let Some(mut rx) = config_resolvers.first().map(|r| r.subscribe()) {
+        tokio::spawn(async move {
+            loop {
+                let on = rx.borrow_and_update().skip_attribution;
+                skip_attribution_stats
+                    .attribute_skips
+                    .store(on, std::sync::atomic::Ordering::Relaxed);
+                if rx.changed().await.is_err() {
+                    break;
+                }
+            }
+        });
+    }
     let mut swap = SourceSwap::default();
     // Frontier frozen when the pump observes a pause, so a promotion decision
     // reads one that cannot move under it. Cleared on resume: a value left over

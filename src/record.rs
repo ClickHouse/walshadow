@@ -82,6 +82,13 @@ const RMGR_LABELS: [&str; RmId::LogicalMsg as usize + 1] = [
     "logical_msg",
 ];
 
+pub fn rmgr_name(rm: u8) -> &'static str {
+    RMGR_LABELS
+        .get(usize::from(rm))
+        .copied()
+        .unwrap_or("unknown")
+}
+
 /// Numeric id fallback for unknown rmgrs
 pub fn rmgr_label(rm: u8) -> String {
     RMGR_LABELS

@@ -168,6 +168,7 @@ pub struct ResolvedConfig {
     pub table_opt_ins: HashMap<RelName, TableRow>,
     /// `[stream] paused` (live: pump idles when true).
     pub paused: bool,
+    pub skip_attribution: bool,
     /// Mapped relations that are declarative partitions, so rules resolve
     /// by name the way their DDL did
     pub partitions: HashSet<RelName>,
@@ -783,6 +784,7 @@ impl ConfigResolver {
             source: base.source.clone(),
             table_opt_ins: base.table_opt_ins.clone(),
             paused: base.paused,
+            skip_attribution: base.skip_attribution,
             partitions: opt_in.partitions.clone(),
         };
 
@@ -2536,6 +2538,34 @@ mod tests {
             .unwrap();
         resolver.reload().await.unwrap();
         assert_eq!(rx.borrow_and_update().source.host, "pg-b");
+    }
+
+    #[tokio::test]
+    async fn reload_toggles_skip_attribution() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ch-config.toml");
+        tokio::fs::write(&path, "[ch]\nhost = \"ch\"\n")
+            .await
+            .unwrap();
+        let base = EmitterConfig::from_toml_str("[ch]\nhost = \"ch\"\n").unwrap();
+        let (resolver, mut rx) = ConfigResolver::new(
+            &base,
+            CliOverrides::default(),
+            Some(path.clone()),
+            toml::Table::new(),
+            dummy_handles(),
+            ResolverBoot::default(),
+        );
+        assert!(!rx.borrow_and_update().skip_attribution);
+
+        tokio::fs::write(
+            &path,
+            "[ch]\nhost = \"ch\"\n[stream]\nskip_attribution = true\n",
+        )
+        .await
+        .unwrap();
+        resolver.reload().await.unwrap();
+        assert!(rx.borrow_and_update().skip_attribution);
     }
 
     /// A reload republishes each database's own entries, not the primary's

@@ -546,6 +546,20 @@ async fn stream_status(ctx: &SharedCtx) -> Result<String> {
         })
         .collect();
     out.insert("unmapped_tables".into(), Value::Array(unmapped));
+    let skipped: Vec<Value> = snap
+        .skipped_records_by_rel
+        .iter()
+        .map(|skip| {
+            let mut row = Table::new();
+            row.insert("database".into(), skip.database.clone().into());
+            row.insert("rel_node".into(), skip.rel_node.clone().into());
+            row.insert("op".into(), skip.op.into());
+            row.insert("reason".into(), skip.reason.into());
+            row.insert("records".into(), (skip.records as i64).into());
+            Value::Table(row)
+        })
+        .collect();
+    out.insert("skipped_relations".into(), Value::Array(skipped));
     out.insert(
         "lag_bytes".into(),
         (snap.shadow_apply_lag_bytes as i64).into(),

@@ -24,6 +24,7 @@ use crate::decode::wal_xact::{
 };
 use tokio_postgres::Client;
 
+use crate::decode::decoder_sink::{DecoderStats, SkipReason, SkippedRecord};
 use crate::filter::catalog_tracker::{CatalogTracker, SeedError};
 use crate::filter::classify::{Class, classify};
 use crate::filter::dirty_tree::{DirtyState, DirtyTree};
@@ -150,6 +151,7 @@ pub struct Filter {
     /// Xid ceilings the shadow TOAST store reads. Absent for offline
     /// filters, which serve no reads
     xid_ceiling: Option<Arc<XidCeiling>>,
+    skip_stats: Option<Arc<DecoderStats>>,
 }
 
 impl Filter {
@@ -165,7 +167,41 @@ impl Filter {
             creating_dbs: HashMap::default(),
             shadow_rels: None,
             xid_ceiling: None,
+            skip_stats: None,
         }
+    }
+
+    pub fn set_skip_stats(&mut self, stats: Arc<DecoderStats>) {
+        self.skip_stats = Some(stats);
+    }
+
+    fn note_index_drop(&self, record: &XLogRecord, source_lsn: u64) {
+        let Some(stats) = self
+            .skip_stats
+            .as_ref()
+            .filter(|s| s.attribute_skips.load(std::sync::atomic::Ordering::Relaxed))
+        else {
+            return;
+        };
+        let rm = record.header.resource_manager_id;
+        if !is_index_rmgr(rm) {
+            return;
+        }
+        let rel = record
+            .blocks
+            .first()
+            .map(|b| b.header.location.rel)
+            .or_else(|| main_data::relation_for_empty(record))
+            .unwrap_or_default();
+        stats.skip(SkippedRecord {
+            reason: SkipReason::IndexDropped,
+            db_oid: rel.db_node,
+            rel_node: rel.rel_node,
+            rm,
+            info: record.header.info,
+            xid: record.header.xact_id,
+            lsn: source_lsn,
+        });
     }
 
     /// Feed xid ceilings for shadow TOAST generation checks
@@ -380,6 +416,9 @@ impl Filter {
         let end = self.observe_xact_end(record, source_lsn, page_magic)?;
         self.stats
             .record(class, route, record.header.total_record_length as u64);
+        if route == Route::ToDecoder {
+            self.note_index_drop(record, source_lsn);
+        }
         Ok(Verdict {
             route,
             boundary: end.boundary,
@@ -709,6 +748,20 @@ fn created_database(record: &XLogRecord) -> Option<u32> {
 const XLOG_DBASE_CREATE_FILE_COPY: u8 = 0x00;
 const XLOG_DBASE_CREATE_WAL_LOG: u8 = 0x10;
 
+fn is_index_rmgr(rm: u8) -> bool {
+    [
+        RmId::Btree,
+        RmId::Hash,
+        RmId::Gin,
+        RmId::Gist,
+        RmId::Spgist,
+        RmId::Brin,
+        RmId::Generic,
+    ]
+    .into_iter()
+    .any(|id| id as u8 == rm)
+}
+
 fn any_block_is_catalog(tracker: &CatalogTracker, blocks: &[XLogRecordBlock]) -> bool {
     blocks.iter().any(|b| {
         let r = b.header.location.rel;
@@ -968,6 +1021,33 @@ mod tests {
         let mut f = target_filter();
         let r = rec(RmId::Heap, &[(5, 20000)]);
         assert_eq!(f.decide(&r), Route::ToDecoder);
+    }
+
+    #[test]
+    fn dropped_index_record_lands_in_skip_ledger() {
+        use crate::decode::decoder_sink::SkipKey;
+        let mut f = target_filter();
+        let stats = Arc::new(DecoderStats::default());
+        stats
+            .attribute_skips
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        f.set_skip_stats(stats.clone());
+        assert_eq!(f.decide(&rec(RmId::Btree, &[(5, 20001)])), Route::ToDecoder);
+        assert_eq!(f.decide(&rec(RmId::Btree, &[(5, 20001)])), Route::ToDecoder);
+        assert_eq!(f.decide(&rec(RmId::Heap, &[(5, 20000)])), Route::ToDecoder);
+        assert_eq!(f.decide(&rec(RmId::Btree, &[(5, 1259)])), Route::ToShadow);
+        assert_eq!(
+            stats.skipped_by_rel.snapshot(),
+            vec![(
+                SkipKey {
+                    db_oid: 5,
+                    rel_node: 20001,
+                    op: "btree",
+                    reason: SkipReason::IndexDropped,
+                },
+                2,
+            )],
+        );
     }
 
     #[test]
