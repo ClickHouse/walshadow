@@ -172,7 +172,22 @@ struct Table {
     slice_permits: Vec<Arc<crate::budget::MemoryPermit>>,
     value_permits: Vec<Arc<crate::budget::MemoryPermit>>,
     deadline: Option<Instant>,
+    /// Last seal was by budget: rows come in bulk, so the partial batch
+    /// seals once input idles instead of waiting out `flush_timeout`
+    bulk: bool,
 }
+
+impl Table {
+    fn due(&self, idle_at: Option<Instant>) -> Option<Instant> {
+        match (self.deadline, idle_at) {
+            (Some(d), Some(idle)) if self.bulk => Some(d.min(idle)),
+            (d, _) => d,
+        }
+    }
+}
+
+/// Fraction of `flush_timeout` that input must idle before a bulk table seals
+const BULK_IDLE_DIVISOR: u32 = 10;
 
 struct BatchOutput {
     sender: async_channel::Sender<InsertBatch>,
@@ -217,8 +232,9 @@ pub(crate) fn spawn(
         let deadline = tokio::time::sleep(Duration::ZERO);
         tokio::pin!(deadline);
         let mut armed: Option<Instant> = None;
+        let mut idle_at: Option<Instant> = None;
         loop {
-            let next = tables.values().filter_map(|t| t.deadline).min();
+            let next = tables.values().filter_map(|t| t.due(idle_at)).min();
             if next != armed {
                 armed = next;
                 if let Some(at) = next {
@@ -230,6 +246,7 @@ pub(crate) fn spawn(
                     Some(BatcherMsg::Row(r)) => {
                         let live = effective_cfg(&cfg, snapshot(config_rx.as_ref()).as_deref());
                         let ctx = RowCtx { cfg: live, out: &out, alloc, epoch, stats };
+                        idle_at = Some(Instant::now() + live.flush_timeout / BULK_IDLE_DIVISOR);
                         if let Err(e) = handle_row(&mut tables, &ctx, r, None).await {
                             fatal.set(format!("batcher: {e}"));
                             break;
@@ -238,6 +255,7 @@ pub(crate) fn spawn(
                     Some(BatcherMsg::Rows(chunk)) => {
                         let live = effective_cfg(&cfg, snapshot(config_rx.as_ref()).as_deref());
                         let ctx = RowCtx { cfg: live, out: &out, alloc, epoch, stats };
+                        idle_at = Some(Instant::now() + live.flush_timeout / BULK_IDLE_DIVISOR);
                         if let Err(e) = handle_rows(&mut tables, &ctx, chunk).await {
                             fatal.set(format!("batcher: {e}"));
                             break;
@@ -246,6 +264,7 @@ pub(crate) fn spawn(
                     Some(BatcherMsg::Chunks(chunks)) => {
                         let live = effective_cfg(&cfg, snapshot(config_rx.as_ref()).as_deref());
                         let ctx = RowCtx { cfg: live, out: &out, alloc, epoch, stats };
+                        idle_at = Some(Instant::now() + live.flush_timeout / BULK_IDLE_DIVISOR);
                         let mut res = Ok(());
                         for chunk in chunks {
                             res = handle_rows(&mut tables, &ctx, chunk).await;
@@ -274,7 +293,7 @@ pub(crate) fn spawn(
                     }
                 },
                 () = &mut deadline, if armed.is_some() => {
-                    if let Err(e) = flush_due(&mut tables, &out, Instant::now(), stats).await {
+                    if let Err(e) = flush_due(&mut tables, &out, Instant::now(), idle_at, stats).await {
                         fatal.set(format!("batcher deadline flush: {e}"));
                         break;
                     }
@@ -374,6 +393,7 @@ async fn handle_row(
                 slice_permits: Vec::new(),
                 value_permits: Vec::new(),
                 deadline: None,
+                bulk: false,
             })
         }
     };
@@ -391,7 +411,7 @@ async fn handle_row(
         .append_routed(&row.committed, &row.route.mapping, op, leaf)
         .map_err(|e| e.to_string())?;
     if append == Append::Full {
-        emit_batch(t, ctx.out, ctx.stats).await?;
+        emit_batch(t, ctx.out, true, ctx.stats).await?;
         t.enc
             .append_routed(&row.committed, &row.route.mapping, op, leaf)
             .map_err(|e| e.to_string())?;
@@ -431,13 +451,13 @@ async fn handle_row(
     t.allocated_bytes = bytes;
     let batch_limit = ctx.cfg.byte_budget.min(ctx.out.batch_limit);
     if t.enc.rows >= ctx.cfg.row_budget || bytes >= batch_limit {
-        emit_batch(t, ctx.out, ctx.stats).await?;
+        emit_batch(t, ctx.out, true, ctx.stats).await?;
     }
     if ctx.out.partial_bytes.load(Ordering::Relaxed)
         >= ctx.cfg.byte_budget.min(ctx.out.budget.total())
     {
         for table in tables.values_mut() {
-            emit_batch(table, ctx.out, ctx.stats).await?;
+            emit_batch(table, ctx.out, true, ctx.stats).await?;
         }
     }
     Ok(())
@@ -447,7 +467,13 @@ async fn handle_row(
 /// inserter. No-op when empty. Bumps `insertbatch_batches_out` once the batch
 /// is on the inserter channel (the inserter bumps `inserter_batches_in` once it
 /// drains).
-async fn emit_batch(t: &mut Table, out: &BatchOutput, stats: &EmitterStats) -> Result<(), String> {
+async fn emit_batch(
+    t: &mut Table,
+    out: &BatchOutput,
+    bulk: bool,
+    stats: &EmitterStats,
+) -> Result<(), String> {
+    t.bulk = bulk;
     out.partial_bytes
         .fetch_sub(std::mem::take(&mut t.allocated_bytes), Ordering::Relaxed);
     let (buffers, n_rows) = t.enc.take_block().map_err(|e| e.to_string())?;
@@ -488,11 +514,12 @@ async fn flush_due(
     tables: &mut HashMap<TableKey, Table>,
     out: &BatchOutput,
     now: Instant,
+    idle_at: Option<Instant>,
     stats: &EmitterStats,
 ) -> Result<(), String> {
     for t in tables.values_mut() {
-        if t.deadline.is_some_and(|d| now >= d) {
-            emit_batch(t, out, stats).await?;
+        if t.due(idle_at).is_some_and(|d| now >= d) {
+            emit_batch(t, out, false, stats).await?;
         }
     }
     Ok(())
@@ -508,7 +535,7 @@ async fn flush_all(
 ) -> Result<(), String> {
     for t in tables.values_mut() {
         if t.enc.rows > 0 {
-            emit_batch(t, out, stats).await?;
+            emit_batch(t, out, false, stats).await?;
         }
     }
     tables.clear();
@@ -967,6 +994,43 @@ mod tests {
         assert!(
             (Duration::from_millis(1400)..Duration::from_millis(1500)).contains(&second_at),
             "table b flushed at {second_at:?}"
+        );
+        drop(msg_tx);
+        handle.await.expect("batcher task");
+        assert!(fatal.message().is_none());
+    }
+
+    /// Once a table seals by budget, its remainder seals a tenth of
+    /// `flush_timeout` after input stops; the next partial batch, no longer
+    /// bulk, waits out the full timeout again
+    #[tokio::test(start_paused = true)]
+    async fn bulk_remainder_seals_when_input_idles() {
+        let cfg = BatcherConfig {
+            row_budget: 2,
+            ..partial_block_cfg(Duration::from_secs(1))
+        };
+        let (msg_tx, batches_rx, fatal, handle) = spawn_deadline_batcher(cfg, None);
+        let seal = async |ids: std::ops::Range<i32>| {
+            for id in ids {
+                msg_tx.send(BatcherMsg::Row(row(0, id))).await.unwrap();
+            }
+            let sent = Instant::now();
+            loop {
+                let batch = batches_rx.recv().await.expect("batch");
+                if batch.n_rows == 1 {
+                    return sent.elapsed();
+                }
+            }
+        };
+        let idle = seal(0..3).await;
+        assert!(
+            (Duration::from_millis(100)..Duration::from_millis(150)).contains(&idle),
+            "bulk remainder sealed after {idle:?}"
+        );
+        let trickle = seal(3..4).await;
+        assert!(
+            (Duration::from_secs(1)..Duration::from_millis(1100)).contains(&trickle),
+            "trickle row sealed after {trickle:?}"
         );
         drop(msg_tx);
         handle.await.expect("batcher task");
