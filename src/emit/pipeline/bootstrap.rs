@@ -208,7 +208,7 @@ pub async fn drain(
                     // Every row of the closing seq on the channel before its
                     // expected count is published
                     out.flush(&msg_tx).await?;
-                    prev.place(prev_rows);
+                    seqs.place(prev, prev_rows);
                 }
                 let seq = seqs.open(source_lsn, Publish::Commit);
                 let s = seq.seq();
@@ -276,7 +276,7 @@ pub async fn drain(
             }
             out.flush(&msg_tx).await?;
             if let Some((_, seq, rows)) = open.take() {
-                seq.place(rows);
+                seqs.place(seq, rows);
             }
             let mut mark = SpoolMark::default();
             if let Some(spool) = deferred.as_mut() {
@@ -291,7 +291,7 @@ pub async fn drain(
     }
     out.flush(&msg_tx).await?;
     if let Some((_, seq, rows)) = open.take() {
-        seq.place(rows);
+        seqs.place(seq, rows);
     }
     let next_seq = seqs.next();
 
@@ -415,7 +415,7 @@ async fn resolve_spooled(
         progress.advance(remaining);
         if let Some(c) = checkpoint.as_mut() {
             if let Some(s) = seq.take() {
-                s.place(placed);
+                seqs.place(s, placed);
             }
             total_placed += placed;
             placed = 0;
@@ -447,7 +447,7 @@ async fn resolve_spooled(
         }
     };
     if let Some(s) = seq {
-        s.place(placed);
+        seqs.place(s, placed);
     }
     Ok(BootstrapDrainOutcome {
         next_seq: seqs.next(),
