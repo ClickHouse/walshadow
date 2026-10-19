@@ -1,6 +1,8 @@
 pub mod archive;
 pub mod boundary_hold;
 pub mod catalog_capture;
+#[cfg(test)]
+mod header_only_tests;
 pub mod manifest;
 pub mod queueing_record_sink;
 mod resume_prefix;

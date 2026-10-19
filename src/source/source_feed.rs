@@ -15,9 +15,9 @@ use tokio::time::Instant;
 use tokio_postgres::config::SslMode as TpSslMode;
 use tokio_postgres::types::PgLsn;
 use tokio_postgres::{Client, NoTls};
-use walrus::pg::backup::{format_pg_lsn, parse_pg_lsn};
+use walrus::pg::backup::format_pg_lsn;
 use walrus::pg::replication::conn::{
-    PgConfig, ReplicationConn, error_code, error_message, message_kind,
+    PgConfig, ReplicationConn, SystemIdentity, error_code, error_message, message_kind,
 };
 use walrus::pg::replication::stream::{Frame, build_status_update, decode_frame};
 use walrus::pg::replication::tls::{SocketStream, SslMode, maybe_upgrade};
@@ -229,14 +229,6 @@ fn build_start_replication_cmd(slot: Option<&str>, start_lsn: u64, timeline: u32
     }
 }
 
-/// `IDENTIFY_SYSTEM` result.
-#[derive(Debug, Clone)]
-pub struct SystemIdentity {
-    pub sysid: String,
-    pub timeline: u32,
-    pub xlogpos: u64,
-}
-
 /// Replication-mode source connection. Lazily opens a sidecar
 /// non-replication `tokio_postgres::Client` for SQL the
 /// replication-mode connection cannot serve (eg
@@ -295,45 +287,7 @@ impl SourceFeed {
     }
 
     pub async fn identify_system(&mut self) -> Result<SystemIdentity> {
-        self.conn.send_query("IDENTIFY_SYSTEM").await?;
-        let mut sysid = String::new();
-        let mut timeline: u32 = 0;
-        let mut xlogpos: u64 = 0;
-        loop {
-            match self.conn.recv_message().await? {
-                Message::RowDescription(_) => {}
-                Message::DataRow(row) => {
-                    use fallible_iterator::FallibleIterator as _;
-                    let buf = row.buffer_bytes().clone();
-                    let mut ranges = row.ranges();
-                    let mut idx = 0;
-                    while let Some(r) = ranges.next()? {
-                        if let Some(range) = r {
-                            let v = std::str::from_utf8(&buf[range])?;
-                            match idx {
-                                0 => sysid = v.to_string(),
-                                1 => timeline = v.parse().context("timeline parse")?,
-                                2 => xlogpos = parse_pg_lsn(v)?,
-                                _ => {}
-                            }
-                        }
-                        idx += 1;
-                    }
-                }
-                Message::CommandComplete(_) => {}
-                Message::ReadyForQuery(_) => break,
-                Message::ErrorResponse(e) => bail!("IDENTIFY_SYSTEM: {}", error_message(&e)),
-                _ => continue,
-            }
-        }
-        if sysid.is_empty() || timeline == 0 {
-            bail!("IDENTIFY_SYSTEM returned an empty result");
-        }
-        Ok(SystemIdentity {
-            sysid,
-            timeline,
-            xlogpos,
-        })
+        self.conn.identify_system().await
     }
 
     /// `START_REPLICATION PHYSICAL <slot>? <start_lsn> TIMELINE <tli>`.

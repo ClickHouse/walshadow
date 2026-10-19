@@ -153,7 +153,7 @@ async fn session_body(
     let ident = feed.identify_system().await.context("IDENTIFY_SYSTEM")?;
     tracing::info!(
         target: "walshadow",
-        sysid = %ident.sysid,
+        sysid = ident.system_id,
         timeline = ident.timeline,
         xlogpos = format_pg_lsn(ident.xlogpos).to_string(),
         "source identified",
@@ -411,7 +411,7 @@ async fn session_body(
         .map(Pos::new);
 
     let live_identity = manifest::SourceIdentity {
-        system_id: ident.sysid.parse().context("IDENTIFY_SYSTEM sysid")?,
+        system_id: ident.system_id,
         timeline: ident.timeline,
         timeline_begin: Pos::ZERO,
     };
@@ -597,7 +597,7 @@ async fn session_body(
     // Shadow must attach to this listener before catalog replay can advance
     let mut shadow_boot = walshadow::shadow_stream::ShadowStreamState::new(
         history.shadow_boot_branch(stored_timeline, aligned.get(), start_timeline),
-        ident.sysid.clone(),
+        ident.system_id.to_string(),
         aligned.get(),
         args.walsender_slow_threshold,
     );
@@ -961,6 +961,11 @@ async fn session_body(
     stream
         .filter_mut()
         .set_target_dbs(db_conns.iter().map(|conn| conn.oid));
+    // Decoder and reorder skip header-routed records; a pending database
+    // attaches on any record's block locators
+    if pending_dbs.is_empty() {
+        stream.filter_mut().enable_header_routing();
+    }
     let shadow_toast = ch_config.as_ref().is_some_and(|c| c.toast.mode.is_shadow());
     // Check TOAST availability for opt-in and configured relations
     let mut shadow_toast_held = None;
@@ -1009,7 +1014,7 @@ async fn session_body(
                 catalog: &conn.catalog,
                 identity: walshadow::desc_log::DescLogIdentity {
                     pg_major: source_major,
-                    system_id: ident.sysid.clone(),
+                    system_id: ident.system_id.to_string(),
                     // Resume branch, which a crossing moves without moving the
                     // log: the stored header names wherever the log last
                     // rewrote itself, so `lineage` is what places it

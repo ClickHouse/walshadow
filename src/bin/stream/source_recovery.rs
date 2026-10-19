@@ -346,7 +346,7 @@ pub(crate) async fn resume_source_feed(
         .with_context(|| format!("connect source {}:{}", cfg.host, cfg.port))?
         .with_status_interval(status_interval);
     let ident = feed.identify_system().await.context("IDENTIFY_SYSTEM")?;
-    let system_id: u64 = ident.sysid.parse().context("IDENTIFY_SYSTEM sysid")?;
+    let system_id = ident.system_id;
     anyhow::ensure!(
         system_id == branch.system_id,
         "source is system {system_id}, artifacts belong to {}",

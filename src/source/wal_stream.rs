@@ -355,43 +355,28 @@ impl WalStream {
             let page_magic = completed.page_magic;
             let byte_ranges = completed.byte_ranges.clone();
             let last_range = byte_ranges.last().copied().unwrap_or((0, 0));
-            let record_end = last_range.0 + last_range.1;
-
-            // Inner scope confines walker-buffer borrows to the filter
-            // call. Materialise to `'static` so the `ToDecoder` in-place
-            // NOOP below can take `&mut self.walker` without conflict,
-            // and so the decoder reads the original bytes after the
-            // shadow stream is clobbered.
-            let verdict;
-            let parsed_for_sink: XLogRecord<'static>;
-            {
-                let parsed = parse_record_from_bytes(
-                    completed.logical_bytes(self.walker.buffer()),
-                    completed.page_magic,
-                )
-                .map_err(|source| WalStreamError::Parse {
-                    offset: start_offset,
-                    source,
-                })?;
-                verdict = self
-                    .filter
-                    .decide_record(&parsed, self.current_lsn + start_offset as u64, page_magic)
-                    .map_err(|source| WalStreamError::Payload {
-                        offset: start_offset,
-                        source,
-                    })?;
-                // `rewrite_record` below mutates walker.buf that `parsed`
-                // views; dispatch needs the original parse, not post-rewrite.
-                parsed_for_sink = parsed.into_owned();
-            }
-            self.filter
-                .flush_shadow_rels()
-                .await
-                .map_err(WalStreamError::ShadowRelations)?;
-            let route = verdict.route;
-            if route == Route::ToDecoder {
-                // `parsed_for_sink` owns the original bytes the decoder
-                // reads, so clobbering the buffer with the NOOP is safe.
+            let source_lsn = self.current_lsn + start_offset as u64;
+            let record = if let Some(parsed) = self.filter.route_from_header(
+                completed.logical_bytes(self.walker.buffer()),
+                page_magic,
+                source_lsn,
+            ) {
+                Record {
+                    next_lsn: self.end_rec_ptr(&last_range, &parsed),
+                    defer_catalog_decode: self.filter.decide_from_header(&parsed, source_lsn),
+                    parsed,
+                    source_lsn,
+                    page_magic,
+                    route: Route::ToDecoder,
+                    boundary_info: None,
+                    aborted_tree: None,
+                }
+            } else {
+                self.decide(&completed, source_lsn, &last_range).await?
+            };
+            if record.route == Route::ToDecoder {
+                // `record` owns the original bytes the decoder reads, so
+                // clobbering the buffer with the NOOP is safe.
                 match completed.stitched_bytes {
                     // Cross-page: stitch → NOOP → scatter back across
                     // `byte_ranges`.
@@ -414,20 +399,7 @@ impl WalStream {
                     }
                 }
             }
-
-            self.staged_end = self.staged_end.max(record_end);
-            let source_lsn = self.current_lsn + start_offset as u64;
-            let next_lsn = self.end_rec_ptr(&last_range, &parsed_for_sink);
-            let record = Record {
-                parsed: parsed_for_sink,
-                source_lsn,
-                next_lsn,
-                page_magic,
-                route,
-                boundary_info: verdict.boundary,
-                aborted_tree: verdict.aborted_tree,
-                defer_catalog_decode: verdict.defer_catalog_decode,
-            };
+            self.staged_end = self.staged_end.max(last_range.0 + last_range.1);
             let parks = record_sink.may_park(&record);
             self.staged.push(record);
             if parks
@@ -437,6 +409,44 @@ impl WalStream {
                 self.dispatch_staged(record_sink).await?;
             }
         }
+    }
+
+    /// Full parse and routing verdict of `completed`
+    async fn decide(
+        &mut self,
+        completed: &CompletedRecord,
+        source_lsn: u64,
+        last_range: &(usize, usize),
+    ) -> Result<Record<'static>, WalStreamError> {
+        let offset = completed.start_offset;
+        let page_magic = completed.page_magic;
+        // Materialise to `'static` so the in-place NOOP can take
+        // `&mut self.walker`, and the decoder reads the original bytes
+        // after the shadow stream is clobbered
+        let (verdict, parsed) = {
+            let parsed =
+                parse_record_from_bytes(completed.logical_bytes(self.walker.buffer()), page_magic)
+                    .map_err(|source| WalStreamError::Parse { offset, source })?;
+            let verdict = self
+                .filter
+                .decide_record(&parsed, source_lsn, page_magic)
+                .map_err(|source| WalStreamError::Payload { offset, source })?;
+            (verdict, parsed.into_owned())
+        };
+        self.filter
+            .flush_shadow_rels()
+            .await
+            .map_err(WalStreamError::ShadowRelations)?;
+        Ok(Record {
+            next_lsn: self.end_rec_ptr(last_range, &parsed),
+            parsed,
+            source_lsn,
+            page_magic,
+            route: verdict.route,
+            boundary_info: verdict.boundary,
+            aborted_tree: verdict.aborted_tree,
+            defer_catalog_decode: verdict.defer_catalog_decode,
+        })
     }
 
     /// Ship staged records' bytes, then hand the records to `record_sink`
