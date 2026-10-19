@@ -240,6 +240,12 @@ pub trait RecordSink: Send {
         true
     }
 
+    /// Permit payload removal after routing. `record` contains only header,
+    /// xids and verdict; return false when dispatch needs blocks or main data.
+    fn header_only(&self, _record: &Record<'_>) -> bool {
+        false
+    }
+
     /// Whether `on_record` may wait on shadow replaying this record's bytes.
     /// The pump ships bytes through such a record, and none past it, before
     /// dispatching it; records answering `false` may dispatch after bytes of

@@ -328,6 +328,11 @@ impl BoundaryHoldSink {
 }
 
 impl RecordSink for BoundaryHoldSink {
+    /// A pending database attaches on a record's blocks
+    fn header_only(&self, record: &Record<'_>) -> bool {
+        self.pending.waiting.is_empty() && self.inner.header_only(record)
+    }
+
     fn may_park(&self, record: &Record<'_>) -> bool {
         record.boundary_info.is_some()
             || record.aborted_tree.is_some()

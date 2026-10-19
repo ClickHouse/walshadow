@@ -1,6 +1,7 @@
 //! Header-only pump path against the full parse over captured WAL: the
-//! walk reads what the parser reads, and a stream taking the fast path
-//! emits the same bytes, stats, xid ceilings and verdicts
+//! walk reads what the parser reads, and a stream handing sinks header-only
+//! records emits the same bytes, stats, xid ceilings and verdicts, stripping
+//! exactly the records no sink wants
 
 use std::future::Future;
 use std::path::PathBuf;
@@ -15,7 +16,7 @@ use crate::emit::pipeline::reorder::ReorderSink;
 use crate::filter::FilterStats;
 use crate::filter::header_walk;
 use crate::pos::Pos;
-use crate::record::{CollectingSegmentSink, Done, Record, RecordSink, Route, SinkError};
+use crate::record::{CollectingSegmentSink, Done, Record, RecordSink, SinkError};
 use crate::source::streaming_walker::StreamingWalker;
 use crate::source::wal_stream::WalStream;
 use crate::toast::xid_ceiling::XidCeiling;
@@ -38,9 +39,13 @@ fn unwanted(record: &Record<'_>) -> bool {
 }
 
 #[derive(Default)]
-struct Collect(Vec<Record<'static>>);
+struct Collect(Vec<Record<'static>>, bool);
 
 impl RecordSink for Collect {
+    fn header_only(&self, record: &Record<'_>) -> bool {
+        self.1 && unwanted(record)
+    }
+
     fn on_record<'a>(
         &'a mut self,
         record: &'a Record<'a>,
@@ -66,7 +71,7 @@ async fn pump(name: SegmentName, seg: &[u8], header_only: bool) -> Pumped {
         builder.filter_mut().enable_header_routing();
     }
     let mut stream = builder.start();
-    let mut sink = Collect::default();
+    let mut sink = Collect(Vec::new(), header_only);
     let mut segments = CollectingSegmentSink::default();
     stream
         .push(start, seg, &mut sink, &mut segments)
@@ -150,14 +155,11 @@ async fn header_only_path_matches_full_parse() {
             assert_eq!(s.boundary_info.is_some(), f.boundary_info.is_some());
             assert_eq!(s.aborted_tree.is_some(), f.aborted_tree.is_some());
             assert_eq!(slow.xids.at(s.source_lsn), fast.xids.at(s.source_lsn));
-            if f.parsed.blocks.len() != s.parsed.blocks.len() {
-                header_only += 1;
-                assert_eq!(s.route, Route::ToDecoder);
-                assert!(
-                    unwanted(s),
-                    "header-only record at {:#X} is wanted",
-                    s.source_lsn
-                );
+            let payload = |r: &Record| r.parsed.blocks.len() + r.parsed.main_data.len();
+            if payload(s) > 0 {
+                let stripped = payload(f) == 0;
+                header_only += usize::from(stripped);
+                assert_eq!(stripped, unwanted(s), "record at {:#X}", s.source_lsn);
             }
         }
     }

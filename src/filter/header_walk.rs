@@ -74,6 +74,17 @@ pub(crate) fn walk(
     Some(record)
 }
 
+/// `record` without its block references and payloads
+pub(crate) fn header_part(record: &XLogRecord) -> XLogRecord<'static> {
+    XLogRecord {
+        header: record.header.clone(),
+        main_data_len: record.main_data_len,
+        origin: record.origin,
+        toplevel_xid: record.toplevel_xid,
+        ..Default::default()
+    }
+}
+
 /// Image length of a consistent block image header
 fn image_header(c: &mut &[u8], page_magic: u16) -> Option<u16> {
     let mut h = XLogRecordBlockImageHeader {
