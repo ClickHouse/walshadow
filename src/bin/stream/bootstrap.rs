@@ -551,7 +551,7 @@ pub(crate) async fn run_bootstrap(
                 patch: window_patch.clone(),
                 catalog: drain_catalog.clone(),
                 pg_major: source_major,
-                system_id: source_ident.sysid.clone(),
+                system_id: source_ident.system_id.to_string(),
                 timeline: source_ident.timeline,
                 wind_down: Duration::from_secs(args.bootstrap_wind_down_secs),
             }
@@ -1018,12 +1018,12 @@ pub(crate) async fn run_bootstrap(
             .await
             .context("bootstrap: IDENTIFY_SYSTEM after the window leg")?;
         anyhow::ensure!(
-            now.sysid == source_ident.sysid && now.timeline == source_ident.timeline,
+            now.system_id == source_ident.system_id && now.timeline == source_ident.timeline,
             "source identity moved during bootstrap: system {} timeline {} when the backup \
              opened, system {} timeline {} now",
-            source_ident.sysid,
+            source_ident.system_id,
             source_ident.timeline,
-            now.sysid,
+            now.system_id,
             now.timeline,
         );
     }
@@ -1114,15 +1114,9 @@ pub(crate) async fn run_bootstrap(
                 .context("bootstrap: visibility gate")?;
         // Persist the ledger before clearing the marker so pending rows
         // already in ClickHouse can be published after restart
-        let mut ledger = PendingLedger::load(
-            &args.spill_dir,
-            source_ident
-                .sysid
-                .parse()
-                .context("IDENTIFY_SYSTEM sysid")?,
-        )
-        .await
-        .context("bootstrap: load pending visibility ledger")?;
+        let mut ledger = PendingLedger::load(&args.spill_dir, source_ident.system_id)
+            .await
+            .context("bootstrap: load pending visibility ledger")?;
         let recorded = ledger
             .record(&pending_tables)
             .await

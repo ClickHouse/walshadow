@@ -125,7 +125,7 @@ async fn partial_transaction_failure_returns_from_live_and_archived_replay() {
         patch: Arc::new(std::sync::Mutex::new(PgXactPatch::new())),
         catalog,
         pg_major: (feed.server_version_num() / 10000) as u32,
-        system_id: ident.sysid,
+        system_id: ident.system_id.to_string(),
         timeline: ident.timeline,
     };
     let (_stop_tx, stop_rx) = tokio::sync::watch::channel(Some(end));
@@ -252,7 +252,7 @@ async fn leg_reads_through_end_lsn_inside_its_first_segment() {
             patch: patch.clone(),
             catalog,
             pg_major: (feed.server_version_num() / 10000) as u32,
-            system_id: ident.sysid.clone(),
+            system_id: ident.system_id.to_string(),
             timeline: ident.timeline,
         };
         let leg = tokio::time::timeout(

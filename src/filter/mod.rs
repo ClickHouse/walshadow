@@ -7,6 +7,7 @@ pub mod shadow_relations;
 
 mod dirty_tree;
 mod engine;
+pub(crate) mod header_walk;
 
 #[doc(hidden)]
 pub use engine::*;

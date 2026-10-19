@@ -29,6 +29,7 @@ use tokio_postgres::Client;
 use tokio_postgres::types::Oid;
 use walrus::pg::walparser::{RmId, XLogRecord};
 
+use crate::cursor::Cursor;
 use crate::decode::fpi::restore_block_image;
 use crate::decode::wal_xact::{XLOG_XACT_ABORT, XLOG_XACT_COMMIT, XLOG_XACT_OPMASK};
 use crate::filter::main_data::{
@@ -389,10 +390,7 @@ impl CatalogTracker {
         for block in &record.blocks {
             let loc = block.header.location;
             let (db, rel, blk) = (loc.rel.db_node, loc.rel.rel_node, loc.block_no);
-            if !block.header.has_image()
-                || !(self.is_pg_class_relfilenode(db, rel)
-                    || self.pg_class_transient.get(&db) == Some(&rel))
-            {
+            if !block.header.has_image() || !self.reads_image(db, rel) {
                 continue;
             }
             self.catalog_slots
@@ -407,6 +405,11 @@ impl CatalogTracker {
                 }
             }
         }
+    }
+
+    /// Whether a page image of this relation teaches pg_class slots
+    pub fn reads_image(&self, db: u32, rel: u32) -> bool {
+        self.is_pg_class_relfilenode(db, rel) || self.pg_class_transient.get(&db) == Some(&rel)
     }
 
     /// Return true for a statistics catalog filenode
@@ -464,21 +467,17 @@ impl CatalogTracker {
             return None;
         }
         let dbid = header.dbid;
-        let map =
-            &md[XL_RELMAP_UPDATE_HEADER_SIZE..XL_RELMAP_UPDATE_HEADER_SIZE + REL_MAP_FILE_SIZE];
-        let magic = i32::from_le_bytes(map[0..4].try_into().unwrap());
-        if magic != RELMAPPER_FILEMAGIC {
+        let mut map = &md[XL_RELMAP_UPDATE_HEADER_SIZE..];
+        if map.i32()? != RELMAPPER_FILEMAGIC {
             return None;
         }
-        let num_mappings = i32::from_le_bytes(map[4..8].try_into().unwrap()) as usize;
+        let num_mappings = map.i32()? as usize;
         if num_mappings > MAX_MAPPINGS {
             return None;
         }
-        let mappings = &map[8..8 + MAX_MAPPINGS * 8];
-        for i in 0..num_mappings {
-            let off = i * 8;
-            let mapoid = u32::from_le_bytes(mappings[off..off + 4].try_into().unwrap());
-            let filenum = u32::from_le_bytes(mappings[off + 4..off + 8].try_into().unwrap());
+        for _ in 0..num_mappings {
+            let mapoid = map.u32()?;
+            let filenum = map.u32()?;
             if mapoid != 0 && filenum != 0 {
                 self.nodes.insert((dbid, filenum));
                 if mapoid == PG_CLASS_OID {

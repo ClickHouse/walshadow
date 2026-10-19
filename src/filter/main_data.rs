@@ -47,6 +47,8 @@
 
 use walrus::pg::walparser::{RelFileNode, RmId, XLogRecord};
 
+use crate::cursor::Cursor;
+
 /// `XLOG_HEAP2_NEW_CID` info byte
 pub const XLOG_HEAP2_NEW_CID: u8 = 0x70;
 /// `XLOG_BTREE_REUSE_PAGE` info byte
@@ -54,10 +56,6 @@ pub const XLOG_BTREE_REUSE_PAGE: u8 = 0xD0;
 const NEW_CID_LOCATOR_OFFSET: usize = 16;
 const NEW_CID_MIN_SIZE: usize = 34;
 const BTREE_REUSE_PAGE_MIN_SIZE: usize = 25;
-
-/// `SizeOfHeapTruncate = offsetof(xl_heap_truncate, relids)`: 9 bytes
-/// dbId+nrelids+flags + 3 trailing pad so relids (4-byte `Oid`) aligns
-const HEAP_TRUNCATE_HEADER_SIZE: usize = 12;
 
 /// `xl_heap_truncate.flags` bits (heapam_xlog.h)
 pub const XLH_TRUNCATE_CASCADE: u8 = 1 << 0;
@@ -74,22 +72,12 @@ pub struct HeapTruncate {
 
 /// Layout (PG `heapam_xlog.h`):
 /// `Oid dbId; uint32 nrelids; uint8 flags; Oid relids[nrelids]`
-pub fn parse_xl_heap_truncate(md: &[u8]) -> Option<HeapTruncate> {
-    if md.len() < HEAP_TRUNCATE_HEADER_SIZE {
-        return None;
-    }
-    let db_oid = u32::from_le_bytes(md[0..4].try_into().unwrap());
-    let nrelids = u32::from_le_bytes(md[4..8].try_into().unwrap()) as usize;
-    let flags = md[8];
-    let expected = HEAP_TRUNCATE_HEADER_SIZE + nrelids * 4;
-    if md.len() < expected {
-        return None;
-    }
-    let mut relids = Vec::with_capacity(nrelids);
-    for i in 0..nrelids {
-        let off = HEAP_TRUNCATE_HEADER_SIZE + i * 4;
-        relids.push(u32::from_le_bytes(md[off..off + 4].try_into().unwrap()));
-    }
+pub fn parse_xl_heap_truncate(mut md: &[u8]) -> Option<HeapTruncate> {
+    let db_oid = md.u32()?;
+    let nrelids = md.u32()?;
+    let flags = md.u8()?;
+    md.skip(3)?; // pad so 4-byte relids align, part of `SizeOfHeapTruncate`
+    let relids = (0..nrelids).map(|_| md.u32()).collect::<Option<_>>()?;
     Some(HeapTruncate {
         db_oid,
         flags,
@@ -127,23 +115,12 @@ pub struct RelmapUpdate {
     pub nbytes: usize,
 }
 
-pub fn parse_xl_relmap_update(md: &[u8]) -> Option<RelmapUpdate> {
-    if md.len() < XL_RELMAP_UPDATE_HEADER_SIZE {
-        return None;
-    }
+pub fn parse_xl_relmap_update(mut md: &[u8]) -> Option<RelmapUpdate> {
     Some(RelmapUpdate {
-        dbid: u32::from_le_bytes(md[0..4].try_into().unwrap()),
-        tsid: u32::from_le_bytes(md[4..8].try_into().unwrap()),
-        nbytes: usize::try_from(i32::from_le_bytes(md[8..12].try_into().unwrap())).ok()?,
+        dbid: md.u32()?,
+        tsid: md.u32()?,
+        nbytes: usize::try_from(md.i32()?).ok()?,
     })
-}
-
-fn read_locator(md: &[u8], off: usize) -> RelFileNode {
-    RelFileNode {
-        spc_node: u32::from_le_bytes(md[off..off + 4].try_into().unwrap()),
-        db_node: u32::from_le_bytes(md[off + 4..off + 8].try_into().unwrap()),
-        rel_node: u32::from_le_bytes(md[off + 8..off + 12].try_into().unwrap()),
-    }
 }
 
 /// `XLOG_SMGR_CREATE` info byte (PG `catalog/storage_xlog.h`)
@@ -153,12 +130,8 @@ pub const MAIN_FORKNUM: i32 = 0;
 
 /// Layout (PG `catalog/storage_xlog.h`):
 /// `xl_smgr_create { RelFileLocator rlocator; ForkNumber forknum }`
-pub fn parse_xl_smgr_create(md: &[u8]) -> Option<(RelFileNode, i32)> {
-    if md.len() < 16 {
-        return None;
-    }
-    let forknum = i32::from_le_bytes(md[12..16].try_into().unwrap());
-    Some((read_locator(md, 0), forknum))
+pub fn parse_xl_smgr_create(mut md: &[u8]) -> Option<(RelFileNode, i32)> {
+    Some((md.rel_file_node()?, md.i32()?))
 }
 
 /// Pull `RelFileLocator` from an Empty-class record's main_data for known
@@ -166,18 +139,18 @@ pub fn parse_xl_smgr_create(md: &[u8]) -> Option<(RelFileNode, i32)> {
 pub fn relation_for_empty(record: &XLogRecord) -> Option<RelFileNode> {
     let rmid = record.header.resource_manager_id;
     let info_high = record.header.info & 0xF0;
-    let md = &record.main_data;
+    let mut md: &[u8] = &record.main_data;
     if rmid == RmId::Heap2 as u8 && info_high == XLOG_HEAP2_NEW_CID {
         if md.len() < NEW_CID_MIN_SIZE {
             return None;
         }
-        return Some(read_locator(md, NEW_CID_LOCATOR_OFFSET));
+        return md.get(NEW_CID_LOCATOR_OFFSET..)?.rel_file_node();
     }
     if rmid == RmId::Btree as u8 && info_high == XLOG_BTREE_REUSE_PAGE {
         if md.len() < BTREE_REUSE_PAGE_MIN_SIZE {
             return None;
         }
-        return Some(read_locator(md, 0));
+        return md.rel_file_node();
     }
     None
 }

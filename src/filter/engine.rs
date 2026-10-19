@@ -14,7 +14,9 @@ use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use walrus::pg::walparser::{RelFileNode, RmId, XLogRecord, XLogRecordBlock};
+use walrus::pg::walparser::{
+    RelFileNode, RmId, XLogRecord, XLogRecordBlock, read_xlog_record_header,
+};
 
 use crate::decode::heap_decoder::{XLOG_HEAP_INPLACE, XLOG_HEAP_OPMASK};
 use crate::decode::wal_xact::{
@@ -26,8 +28,9 @@ use tokio_postgres::Client;
 
 use crate::decode::decoder_sink::{DecoderStats, SkipReason};
 use crate::filter::catalog_tracker::{CatalogTracker, SeedError};
-use crate::filter::classify::{Class, classify};
+use crate::filter::classify::{Class, XLOG_FPI, XLOG_FPI_FOR_HINT, classify};
 use crate::filter::dirty_tree::{DirtyState, DirtyTree};
+use crate::filter::header_walk;
 use crate::filter::main_data;
 use crate::filter::shadow_relations::ShadowRelations;
 use crate::record::{AffectedOid, BoundaryInfo, BoundaryKind, Route, rmgr_label};
@@ -35,7 +38,7 @@ use crate::schema::FIRST_NORMAL_OBJECT_ID;
 use crate::toast::xid_ceiling::{XidCeiling, follows};
 use ahash::{HashMap, HashSet, HashSetExt};
 
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct FilterStats {
     pub kept: u64,
     pub dropped: u64,
@@ -152,6 +155,7 @@ pub struct Filter {
     /// filters, which serve no reads
     xid_ceiling: Option<Arc<XidCeiling>>,
     skip_stats: Option<Arc<DecoderStats>>,
+    header_routing: bool,
 }
 
 impl Filter {
@@ -168,6 +172,7 @@ impl Filter {
             shadow_rels: None,
             xid_ceiling: None,
             skip_stats: None,
+            header_routing: false,
         }
     }
 
@@ -200,6 +205,13 @@ impl Filter {
             rel.db_node,
             rel.rel_node,
         );
+    }
+
+    /// Let [`route_from_header`](Self::route_from_header) skip the full parse.
+    /// Only for record sinks that read nothing past the header of the
+    /// records it answers
+    pub fn enable_header_routing(&mut self) {
+        self.header_routing = true;
     }
 
     /// Feed xid ceilings for shadow TOAST generation checks
@@ -423,6 +435,66 @@ impl Filter {
             aborted_tree: end.aborted_tree,
             defer_catalog_decode,
         })
+    }
+
+    /// Header-only stand-in for a record [`decide_record`](Self::decide_record)
+    /// would route `ToDecoder` while changing nothing but xid state and
+    /// stats: an index, sequence, generic or page-image record whose every
+    /// block is a user relation outside `shadow_rels`. `None` asks for the
+    /// full parse, as does a filter without
+    /// [`enable_header_routing`](Self::enable_header_routing)
+    pub fn route_from_header(
+        &self,
+        bytes: &[u8],
+        page_magic: u16,
+        source_lsn: u64,
+    ) -> Option<XLogRecord<'static>> {
+        if !self.header_routing {
+            return None;
+        }
+        let header = read_xlog_record_header(&mut &*bytes).ok()?;
+        let rm = header.resource_manager_id;
+        let page_image =
+            rm == RmId::Xlog as u8 && matches!(header.info & 0xF0, XLOG_FPI | XLOG_FPI_FOR_HINT);
+        if !page_image && rm != RmId::Seq as u8 && !is_index_rmgr(rm) {
+            return None;
+        }
+        // Skip attribution names an index record's relation from its parsed blocks
+        if self
+            .skip_stats
+            .as_ref()
+            .is_some_and(|s| s.attribute_skips.load(std::sync::atomic::Ordering::Relaxed))
+        {
+            return None;
+        }
+        let mut blocks = 0;
+        let record = header_walk::walk(header, bytes, page_magic, |rel| {
+            let (db, rel) = (rel.db_node, rel.rel_node);
+            blocks += 1;
+            rel != 0
+                && !self.tracker.is_catalog(db, rel)
+                && !self.tracker.is_opaque_catalog(db, rel)
+                && !self.tracker.reads_image(db, rel)
+                && !self.keeps_user_rel(db, rel, source_lsn)
+        })?;
+        (blocks > 0).then_some(record)
+    }
+
+    /// [`decide_record`](Self::decide_record) for a
+    /// [`route_from_header`](Self::route_from_header) record. Returns its
+    /// `defer_catalog_decode`
+    pub fn decide_from_header(&mut self, record: &XLogRecord, source_lsn: u64) -> bool {
+        let xid = record.header.xact_id;
+        if let Some(ceiling) = &self.xid_ceiling {
+            ceiling.observe(source_lsn, xid);
+        }
+        self.dirty.link(xid, record.toplevel_xid);
+        self.stats.record(
+            Class::User,
+            Route::ToDecoder,
+            record.header.total_record_length as u64,
+        );
+        self.dirty.is_dirty(xid)
     }
 
     /// Drain dirty xids at commit / abort. Commit of any dirty xid (top,

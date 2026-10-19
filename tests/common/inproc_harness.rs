@@ -805,7 +805,7 @@ async fn build_pipeline_inner(
             &spill_dir,
             walshadow::desc_log::DescLogIdentity {
                 pg_major: (feed.server_version_num() / 10000) as u32,
-                system_id: ident.sysid.clone(),
+                system_id: ident.system_id.to_string(),
                 timeline: ident.timeline,
                 db_oid: shadow_db_oid,
                 wal_seg_size: WAL_SEG_SIZE as u32,
@@ -908,7 +908,7 @@ async fn build_pipeline_inner(
         ident.xlogpos,
         WAL_SEG_SIZE,
     ))));
-    let system_id: u64 = ident.sysid.parse().expect("sysid");
+    let system_id = ident.system_id;
     let retires = walshadow::toast_retire::RetireLedger::load(&spill_dir, system_id, None)
         .await
         .expect("load toast retire ledger");

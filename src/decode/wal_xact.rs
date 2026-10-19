@@ -1,5 +1,6 @@
 //! Transaction WAL record parsing
 
+use crate::cursor::Cursor;
 use crate::filter::catalog_tracker::PG_NAMESPACE_OID;
 
 pub(crate) const XLOG_XACT_OPMASK: u8 = 0x70;
@@ -107,11 +108,11 @@ impl XactPayloadError {
 }
 
 pub(crate) fn parse_xact_assignment(mut data: &[u8]) -> Option<(u32, Vec<u32>)> {
-    let top = take_u32(&mut data)?;
+    let top = data.u32()?;
     let count = take_count(&mut data)?;
     let mut subs = Vec::with_capacity(count);
     for _ in 0..count {
-        subs.push(take_u32(&mut data)?);
+        subs.push(data.u32()?);
     }
     Some((top, subs))
 }
@@ -152,7 +153,9 @@ fn take_invals(
         // "which catalog" is recoverable), -1 catalog, -2 relcache, -3
         // smgr, -4 relmap, -5 snapshot, -6 relsync (PG 18; skipping costs
         // nothing on older majors where it cannot occur)
-        let msg: [u8; 16] = take(data).ok_or_else(|| XactPayloadError::new("inval msg"))?;
+        let msg: [u8; 16] = data
+            .take()
+            .ok_or_else(|| XactPayloadError::new("inval msg"))?;
         let db_id = u32::from_le_bytes(msg[4..8].try_into().unwrap());
         let arg = u32::from_le_bytes(msg[8..12].try_into().unwrap());
         match msg[0] as i8 {
@@ -187,19 +190,22 @@ pub(crate) fn parse_xact_payload(
     page_magic: u16,
 ) -> Result<XactCommitPayload, XactPayloadError> {
     let mut out = XactCommitPayload {
-        xact_time: take_i64(&mut data).ok_or_else(|| XactPayloadError::new("xact_time"))?,
+        xact_time: data
+            .take()
+            .map(i64::from_le_bytes)
+            .ok_or_else(|| XactPayloadError::new("xact_time"))?,
         ..Default::default()
     };
     let xinfo = if info & XLOG_XACT_HAS_INFO != 0 {
-        take_u32(&mut data).ok_or_else(|| XactPayloadError::new("xinfo"))?
+        data.u32().ok_or_else(|| XactPayloadError::new("xinfo"))?
     } else {
         0
     };
     // `xl_xact_dbinfo { Oid dbId; Oid tsId }`: database of the committing
     // backend, the scope any catalog dirt this tree holds must match
     if xinfo & XACT_XINFO_HAS_DBINFO != 0 {
-        let db_id = take_u32(&mut data).ok_or_else(|| XactPayloadError::new("dbinfo"))?;
-        if take_u32(&mut data).is_none() {
+        let db_id = data.u32().ok_or_else(|| XactPayloadError::new("dbinfo"))?;
+        if data.u32().is_none() {
             return Err(XactPayloadError::new("dbinfo"));
         }
         out.db_id = Some(db_id);
@@ -208,7 +214,7 @@ pub(crate) fn parse_xact_payload(
         let count = take_count(&mut data).ok_or_else(|| XactPayloadError::new("subxact count"))?;
         let mut subs = Vec::with_capacity(count);
         for _ in 0..count {
-            subs.push(take_u32(&mut data).ok_or_else(|| XactPayloadError::new("subxact"))?);
+            subs.push(data.u32().ok_or_else(|| XactPayloadError::new("subxact"))?);
         }
         out.subxacts = subs;
     }
@@ -227,8 +233,10 @@ pub(crate) fn parse_xact_payload(
         take_invals(&mut data, page_magic, &mut out.invals)?;
     }
     if xinfo & XACT_XINFO_HAS_TWOPHASE != 0 {
-        out.twophase_xid =
-            Some(take_u32(&mut data).ok_or_else(|| XactPayloadError::new("twophase xid"))?);
+        out.twophase_xid = Some(
+            data.u32()
+                .ok_or_else(|| XactPayloadError::new("twophase xid"))?,
+        );
         if xinfo & XACT_XINFO_HAS_GID != 0 {
             let end = data
                 .iter()
@@ -243,30 +251,8 @@ pub(crate) fn parse_xact_payload(
     Ok(out)
 }
 
-fn take<const N: usize>(data: &mut &[u8]) -> Option<[u8; N]> {
-    let (value, rest) = data.split_at_checked(N)?;
-    *data = rest;
-    value.try_into().ok()
-}
-
-fn take_u32(data: &mut &[u8]) -> Option<u32> {
-    Some(u32::from_le_bytes(take(data)?))
-}
-
-fn take_i64(data: &mut &[u8]) -> Option<i64> {
-    Some(i64::from_le_bytes(take(data)?))
-}
-
 fn take_count(data: &mut &[u8]) -> Option<usize> {
-    usize::try_from(i32::from_le_bytes(take(data)?)).ok()
-}
-
-fn skip(data: &mut &[u8], count: usize) -> bool {
-    let Some((_, rest)) = data.split_at_checked(count) else {
-        return false;
-    };
-    *data = rest;
-    true
+    usize::try_from(data.i32()?).ok()
 }
 
 fn skip_counted(data: &mut &[u8], xinfo: u32, flag: u32, width: usize) -> bool {
@@ -275,7 +261,7 @@ fn skip_counted(data: &mut &[u8], xinfo: u32, flag: u32, width: usize) -> bool {
     }
     take_count(data)
         .and_then(|count| count.checked_mul(width))
-        .is_some_and(|bytes| skip(data, bytes))
+        .is_some_and(|bytes| data.skip(bytes).is_some())
 }
 
 #[cfg(test)]

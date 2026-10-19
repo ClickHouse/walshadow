@@ -443,12 +443,7 @@ impl Switchover<'_> {
     ) -> Result<ForkPoint, TransitionError> {
         let finished_tli = stream.timeline();
         let ident = feed.identify_system().await.map_err(source)?;
-        let live: u64 = ident.sysid.parse().map_err(|e| {
-            source(anyhow::anyhow!(
-                "IDENTIFY_SYSTEM sysid {:?}: {e}",
-                ident.sysid
-            ))
-        })?;
+        let live = ident.system_id;
         if live != self.system_id {
             return Err(TransitionError::ForeignSystem {
                 stored: self.system_id,
