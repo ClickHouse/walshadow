@@ -226,6 +226,7 @@ impl QueueingRecordSink {
                             park_err_and_drain(e, n, &mut rx).await;
                             break 'outer;
                         }
+                        tokio::task::spawn_blocking(move || drop((batch, pre)));
                         processed_w.fetch_add(n + skipped, Ordering::Relaxed);
                         in_flight_w.fetch_sub(n, Ordering::Relaxed);
                         if last_yield.elapsed() >= YIELD_INTERVAL {
