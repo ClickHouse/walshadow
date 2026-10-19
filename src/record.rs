@@ -1,6 +1,5 @@
 //! WAL record hand-off contracts
 
-use std::collections::BTreeMap;
 use std::future::{self, Future};
 use std::pin::Pin;
 
@@ -344,23 +343,34 @@ impl RecordSink for CountingRecordSink {
     }
 }
 
-#[derive(Debug, Default)]
+/// Per-record counters on the pump, indexed by rmgr id and route so a bump
+/// is one array add
+#[derive(Debug)]
 pub struct MetricsRecordSink {
-    pub by_rm_route: BTreeMap<(u8, Route), u64>,
+    counts: [[u64; 3]; 256],
     pub total: u64,
+}
+
+impl Default for MetricsRecordSink {
+    fn default() -> Self {
+        Self {
+            counts: [[0; 3]; 256],
+            total: 0,
+        }
+    }
 }
 
 impl MetricsRecordSink {
     pub fn summary(&self) -> String {
         use std::fmt::Write as _;
         let mut summary = format!("total={}", self.total);
-        for ((rm, route), count) in &self.by_rm_route {
+        for (rm, route, count) in self.by_rm_route() {
             let route = match route {
                 Route::ToShadow => "to_shadow",
                 Route::ToDecoder => "to_decoder",
                 Route::ToBoth => "to_both",
             };
-            write!(summary, " {}/{}={count}", rmgr_label(*rm), route).unwrap();
+            write!(summary, " {}/{}={count}", rmgr_label(rm), route).unwrap();
         }
         summary
     }
@@ -368,11 +378,19 @@ impl MetricsRecordSink {
 
 impl MetricsRecordSink {
     pub fn observe(&mut self, record: &Record<'_>) {
-        *self
-            .by_rm_route
-            .entry((record.parsed.header.resource_manager_id, record.route))
-            .or_default() += 1;
+        self.counts[record.parsed.header.resource_manager_id as usize][record.route as usize] += 1;
         self.total += 1;
+    }
+
+    /// Nonzero counts in (rmgr, route) order
+    pub fn by_rm_route(&self) -> impl Iterator<Item = (u8, Route, u64)> + '_ {
+        const ROUTES: [Route; 3] = [Route::ToShadow, Route::ToDecoder, Route::ToBoth];
+        (0..=u8::MAX).flat_map(move |rm| {
+            ROUTES
+                .into_iter()
+                .map(move |route| (rm, route, self.counts[rm as usize][route as usize]))
+                .filter(|(_, _, n)| *n != 0)
+        })
     }
 }
 
