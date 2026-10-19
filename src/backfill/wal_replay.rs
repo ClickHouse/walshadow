@@ -367,7 +367,7 @@ impl WalReplaySink {
         }
         drain.finish().await.map_err(SinkError::from)?;
         if let Some((seq, rows)) = self.open.take() {
-            seq.place(rows);
+            self.seqs.place(seq, rows);
         }
         self.subxact_tracker.forget_tree(xid);
         Ok(())

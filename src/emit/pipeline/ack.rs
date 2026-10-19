@@ -8,11 +8,13 @@
 //! One commit may span several seqs. Only the final seq publishes its
 //! `commit_lsn`, earlier slices gate contiguity via [`Publish::Partial`]
 //!
-//! [`SeqAlloc::open`] is the only registration path. An allocator and its
-//! seqs send only to the collector that made them, and [`OpenSeq::place`]
-//! consumes its seq. Types do not stop two allocators overlapping or a seq
-//! dropping unplaced: collector fails on a repeat registration, and an
-//! unplaced seq pins the frontier where [`AckSnapshot::stall_reason`] names it
+//! Use [`SeqAlloc::open`] to register sequences and [`SeqAlloc::place`] to
+//! report their row counts. Each allocator sends events to its original
+//! collector. Keep sequence numbers unique and place each sequence through
+//! its original allocator. Rust does not enforce these rules or require
+//! placement. Collector rejects duplicate registrations. Dropping a sequence
+//! before placement blocks acknowledgments; [`AckSnapshot::stall_reason`]
+//! explains why progress stopped
 //!
 //! [`AckHandle::acked`] takes the [`EndOfStream`] proof, so only a drained
 //! INSERT acks
@@ -417,10 +419,7 @@ impl SeqAlloc {
         } else {
             let _ = self.tx.send(ev);
         }
-        OpenSeq {
-            tx: self.tx.clone(),
-            seq,
-        }
+        OpenSeq(seq)
     }
 
     /// Ordering marker carrying no rows
@@ -429,12 +428,14 @@ impl SeqAlloc {
         self.place(seq, 0);
     }
 
-    /// [`OpenSeq::place`], held while this allocator holds
-    pub fn place(&mut self, seq: OpenSeq, rows: u64) {
-        let Some(held) = &mut self.held else {
-            return seq.place(rows);
-        };
-        held.placed.push(AckEvent::Placed { seq: seq.seq, rows });
+    /// Send all rows of `seq` to batcher channel before reporting row count
+    pub fn place(&mut self, OpenSeq(seq): OpenSeq, rows: u64) {
+        let ev = AckEvent::Placed { seq, rows };
+        if let Some(held) = &mut self.held {
+            held.placed.push(ev);
+        } else {
+            let _ = self.tx.send(ev);
+        }
     }
 
     /// Held registrations must reach the collector before their rows reach
@@ -464,22 +465,11 @@ impl SeqAlloc {
 /// Registered seq awaiting its row count
 #[must_use = "an unplaced seq pins the ack frontier"]
 #[derive(Debug)]
-pub struct OpenSeq {
-    tx: mpsc::UnboundedSender<AckEvent>,
-    seq: u64,
-}
+pub struct OpenSeq(u64);
 
 impl OpenSeq {
     pub const fn seq(&self) -> u64 {
-        self.seq
-    }
-
-    /// Every row of this seq must already be on the batcher channel
-    pub fn place(self, rows: u64) {
-        let _ = self.tx.send(AckEvent::Placed {
-            seq: self.seq,
-            rows,
-        });
+        self.0
     }
 }
 
