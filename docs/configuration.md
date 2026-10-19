@@ -130,6 +130,10 @@ Apply live:
 - pause state
 - batch sizes, flush timeout, compression, and retry count
 - source and ClickHouse endpoints
+- `[stream] skip_attribution` (default `false`): count skipped and
+  filter-dropped records per relation in
+  `walshadow_decoder_skipped_records_total`. Costs a map lookup per ignored
+  record, dropped index records included
 
 Require restart:
 

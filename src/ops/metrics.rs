@@ -186,6 +186,7 @@ snapshot! {
         unmapped_rows_by_table: Vec<(String, String, u64)>,
         rows_inserted_by_table: Vec<(String, String, u64)>,
         cells_inserted_by_type: Vec<(String, &'static str, u64)>,
+        skipped_records_by_rel: Vec<SkippedRel>,
         /// Refusal a crossing parked on, rendered as `crossing_wedged`. The
         /// pump keeps publishing rather than exiting into a restart that
         /// re-crosses and re-fails, so this is how the daemon says it is
@@ -290,6 +291,9 @@ snapshot! {
     counter xacts_committed_total: u64 = "Total xacts drained as commits since daemon start.",
     counter xacts_aborted_total: u64 = "Total xacts dropped as aborts since daemon start.",
     counter decoder_decoded_total: u64 = "Heap records decoded since daemon start.",
+    counter decoder_records_by_op: [u64; 5]
+        ["op" = ["insert", "update", "hot_update", "delete", "truncate"]] =
+        "Decoded heap row changes by operation.",
     counter decoder_partial_total: u64 = "Decoded tuples with prefix/suffix-from-old elided columns.",
     counter decoder_toast_chunks_total: u64 =
         "TOAST chunks routed into the xact buffer's chunk slot.",
@@ -297,6 +301,12 @@ snapshot! {
         "TOAST inserts the decoder couldn't reinterpret as a chunk.",
     counter decoder_toast_deletes_total: u64 =
         "DELETE records on toast relations, buffered as tombstone rows.",
+    counter decoder_catalog_not_found_total: u64 =
+        "Heap records skipped because no descriptor covered their relfilenode.",
+    counter decoder_skipped_op_total: u64 =
+        "Heap records that decoded to no row change.",
+    counter decoder_skipped_no_block_total: u64 =
+        "Heap records skipped for carrying no block reference.",
     counter toast_chunks_stored_total: u64 =
         "TOAST chunk rows persisted to the CH store; the bootstrap's TOAST-phase progress signal.",
     counter toast_chunk_puts_total: u64 =
@@ -472,6 +482,15 @@ snapshot! {
         "Catalog-boundary holds woken with an error (worker death, walreceiver loss, timeout).",
     counter catalog_boundary_hold_seconds_total: f64 =
         "Cumulative seconds the pump parked in released catalog-boundary holds.",
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct SkippedRel {
+    pub database: String,
+    pub rel_node: String,
+    pub op: &'static str,
+    pub reason: &'static str,
+    pub records: u64,
 }
 
 /// Declares [`DbSeries`] and the families a scrape renders off it, one
@@ -771,17 +790,18 @@ pub(crate) fn counter_series<'a, V: EncodeCounterValue>(
     Ok(())
 }
 
-pub(crate) fn counter_pairs<'a, V: EncodeCounterValue>(
+pub(crate) fn counter_pairs<'a, V: EncodeCounterValue, const N: usize>(
     enc: &mut DescriptorEncoder<'_>,
     name: &str,
     help: &str,
-    keys: [&str; 2],
-    series: impl IntoIterator<Item = ([&'a str; 2], V)>,
+    keys: [&str; N],
+    series: impl IntoIterator<Item = ([&'a str; N], V)>,
 ) -> fmt::Result {
     let mut family = declare(enc, name, help, MetricType::Counter)?;
     for (values, value) in series {
+        let labels: [(&str, &str); N] = std::array::from_fn(|i| (keys[i], values[i]));
         family
-            .encode_family(&[(keys[0], values[0]), (keys[1], values[1])])?
+            .encode_family(&labels)?
             .encode_counter::<NoLabelSet, _, u64>(&value, None)?;
     }
     Ok(())
@@ -925,6 +945,19 @@ fn encode_snapshot(snap: &MetricsSnapshot, enc: &mut DescriptorEncoder<'_>) -> f
         snap.rows_inserted_by_table
             .iter()
             .map(|(database, table, n)| ([database.as_str(), table.as_str()], *n)),
+    )?;
+
+    counter_pairs(
+        enc,
+        "walshadow_decoder_skipped_records",
+        "Records skipped by the decoder or dropped by the filter, by relfilenode, op and reason. Heaviest series only.",
+        ["database", "rel_node", "op", "reason"],
+        snap.skipped_records_by_rel.iter().map(|r| {
+            (
+                [r.database.as_str(), r.rel_node.as_str(), r.op, r.reason],
+                r.records,
+            )
+        }),
     )?;
 
     gauge(
@@ -1142,11 +1175,19 @@ mod tests {
         let body = render(MetricsSnapshot {
             cells_inserted_by_type: vec![("Decimal(38, 9)".into(), "oracle", 7)],
             rows_inserted_by_table: vec![("app".into(), "public.orders".into(), 4096)],
+            skipped_records_by_rel: vec![SkippedRel {
+                database: "app".into(),
+                rel_node: "16400".into(),
+                op: "update",
+                reason: "not_covered",
+                records: 3,
+            }],
             ..MetricsSnapshot::default()
         });
         for want in [
             "walshadow_cells_inserted_total{type=\"Decimal(38, 9)\",encoding=\"oracle\"} 7",
             "walshadow_table_rows_inserted_total{database=\"app\",table=\"public.orders\"} 4096",
+            "walshadow_decoder_skipped_records_total{database=\"app\",rel_node=\"16400\",op=\"update\",reason=\"not_covered\"} 3",
         ] {
             assert!(body.contains(want), "{want} missing from {body}");
         }
@@ -1263,6 +1304,7 @@ mod tests {
         let mut snap = MetricsSnapshot {
             raw_stash_bytes_by_storage: [11, 12],
             raw_decode_rows_by_op: [1, 2, 3, 4, 5, 6, 7],
+            decoder_records_by_op: [41, 42, 43, 44, 45],
             raw_pending_rows: 13,
             raw_pending_bytes: 14,
             by_database: vec![DbSeries {
@@ -1295,6 +1337,7 @@ mod tests {
             body.contains("walshadow_raw_decode_records_total{kind=\"ordinary\",op=\"update\"} 34")
         );
         assert!(body.contains("walshadow_raw_decode_rows_total{op=\"multi_insert\"} 6"));
+        assert!(body.contains("walshadow_decoder_records_total{op=\"hot_update\"} 43"));
         assert!(body.contains("walshadow_raw_pending_rows 13"));
         assert!(body.contains("walshadow_raw_pending_bytes 14"));
         // Published intervals and lookups landing in one stay distinct

@@ -224,6 +224,10 @@ impl WalStream {
         &self.filter
     }
 
+    pub fn filter_mut(&mut self) -> &mut Filter {
+        &mut self.filter
+    }
+
     pub fn align_down(lsn: u64, seg_size: u64) -> u64 {
         lsn - (lsn % seg_size)
     }

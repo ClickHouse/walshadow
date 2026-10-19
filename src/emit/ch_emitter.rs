@@ -153,6 +153,7 @@ pub struct EmitterConfig {
     /// `[stream] paused`: pump idles (stops consuming source WAL) when true.
     /// Live via reload.
     pub paused: bool,
+    pub skip_attribution: bool,
     /// `[stream] replicate_all` (default true): replicate every user table in
     /// non-system namespaces. Per-table `replicate = false` still opts out.
     pub replicate_all: bool,
@@ -909,6 +910,7 @@ struct RuntimeConfigPatch {
 #[serde(default)]
 struct StreamSection {
     paused: bool,
+    skip_attribution: bool,
     replicate_all: bool,
     auto_create_name_all: Option<String>,
     #[serde(flatten)]
@@ -919,6 +921,7 @@ impl Default for StreamSection {
     fn default() -> Self {
         Self {
             paused: false,
+            skip_attribution: false,
             replicate_all: true,
             auto_create_name_all: None,
             pending_capture: Default::default(),
@@ -1020,6 +1023,7 @@ impl EmitterConfig {
             column_entries: Vec::new(),
             table_opt_ins: HashMap::new(),
             paused: stream.paused,
+            skip_attribution: stream.skip_attribution,
             replicate_all: stream.replicate_all,
             auto_create_name_all: None,
             pending_capture: stream.pending_capture,
@@ -4378,6 +4382,7 @@ mod tests {
 
             [stream]
             paused = true
+            skip_attribution = true
             replicate_all = false
             pending_max_boundaries_per_xact = 22
             pending_max_hold_ms = 23
@@ -4424,6 +4429,8 @@ mod tests {
         assert_eq!(c.retry.max_backoff, Duration::from_millis(19));
         assert_eq!(c.runtime_config_schema.as_deref(), Some("ws"));
         assert!(c.paused);
+        assert!(c.skip_attribution);
+        assert!(!plain.skip_attribution);
         assert!(!c.replicate_all);
         assert_eq!(c.pending_capture.max_boundaries_per_xact, 22);
         assert_eq!(

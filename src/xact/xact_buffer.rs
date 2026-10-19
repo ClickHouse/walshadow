@@ -51,7 +51,7 @@ use crate::catalog::desc_log::{
     Ambiguity, DescriptorLog, DescriptorLogs, LogEntry, LogValue, LookupResult,
 };
 use crate::catalog::pending::{PendingCatalog, PendingSlot};
-use crate::decode::decoder_sink::{DecoderSinkError, DecoderStats};
+use crate::decode::decoder_sink::{DecoderSinkError, DecoderStats, SkipReason, SkippedRecord};
 use crate::decode::heap_decoder::{
     ColumnValue, DecodedHeap, DescribedHeap, HeapOp, ToastPointer, decode_heap_record,
 };
@@ -2799,8 +2799,7 @@ impl BufferingDecoderSink {
         } else {
             buf.track_unresolvable(xid, record.source_lsn, rfn);
             self.stats
-                .catalog_not_found
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                .skip(SkippedRecord::on(record, SkipReason::Unresolvable, rfn));
         }
         Ok(())
     }
@@ -2812,9 +2811,12 @@ impl BufferingDecoderSink {
         let Some(parsed) =
             crate::filter::main_data::parse_xl_heap_truncate(&record.parsed.main_data)
         else {
-            self.stats
-                .skipped_op
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.stats.skip(SkippedRecord::of(
+                record,
+                SkipReason::TruncateUnparsed,
+                0,
+                0,
+            ));
             return Ok(());
         };
         let xid = record.parsed.header.xact_id;
@@ -2839,9 +2841,12 @@ impl BufferingDecoderSink {
                     // its OIDs name nothing here, whatever they collide with
                     Err(LookupResult::ForeignDb) => break,
                     Err(_) => {
-                        self.stats
-                            .catalog_not_found
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        self.stats.skip(SkippedRecord::of(
+                            record,
+                            SkipReason::TruncateRelMissing,
+                            parsed.db_oid,
+                            relid,
+                        ));
                         continue;
                     }
                 };
@@ -2914,8 +2919,7 @@ impl RecordSink for BufferingDecoderSink {
             }
             let Some(rfn) = record.parsed.blocks.first().map(|b| b.header.location.rel) else {
                 self.stats
-                    .skipped_no_block
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    .skip(SkippedRecord::of(record, SkipReason::NoBlock, 0, 0));
                 return Ok(());
             };
             let txn_xid = record.parsed.header.xact_id;
@@ -2957,8 +2961,7 @@ impl RecordSink for BufferingDecoderSink {
             // Unfollowed database: same skip a foreign-db lookup takes
             let Some(log) = self.logs.lookup(rfn.db_node) else {
                 self.stats
-                    .catalog_not_found
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    .skip(SkippedRecord::on(record, SkipReason::UnfollowedDb, rfn));
                 return Ok(());
             };
             // Wait-free interval lookup: every record reaching this worker
@@ -2973,16 +2976,14 @@ impl RecordSink for BufferingDecoderSink {
                 // counted row skip, never a stash or a fatal
                 Err(LookupResult::ForeignDb) => {
                     self.stats
-                        .catalog_not_found
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        .skip(SkippedRecord::on(record, SkipReason::ForeignDb, rfn));
                     return Ok(());
                 }
                 Err(LookupResult::NotCovered)
                     if record.source_lsn <= log.covered_through() || txn_xid == 0 =>
                 {
                     self.stats
-                        .catalog_not_found
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        .skip(SkippedRecord::on(record, SkipReason::NotCovered, rfn));
                     return Ok(());
                 }
                 // Filenode invisible at record LSN: created by this
@@ -3016,8 +3017,7 @@ impl RecordSink for BufferingDecoderSink {
                 // the row never outlives the commit — skip
                 Err(LookupResult::Retired) => {
                     self.stats
-                        .catalog_not_found
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        .skip(SkippedRecord::on(record, SkipReason::Retired, rfn));
                     return Ok(());
                 }
             };
@@ -3032,8 +3032,7 @@ impl RecordSink for BufferingDecoderSink {
             };
             if decoded_set.is_empty() {
                 self.stats
-                    .skipped_op
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    .skip(SkippedRecord::on(record, SkipReason::NoTuple, rfn));
                 return Ok(());
             }
             // Runtime-config overlay: config-table heap writes never reach CH.
