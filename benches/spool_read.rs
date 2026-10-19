@@ -120,7 +120,7 @@ fn plan(args: &Args, repeat: usize) -> anyhow::Result<()> {
     let mut writer = PlanWriter::create(dir.path().join("plan.spool"), u64::MAX, 1 << 20)?;
     for i in 0..args.rows {
         writer.push_heap(
-            &DescribedHeap {
+            DescribedHeap {
                 decoded: DecodedHeap {
                     rfn: rfn(),
                     xid: 7,

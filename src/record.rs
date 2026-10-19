@@ -9,6 +9,7 @@ use thiserror::Error;
 use walrus::pg::wal::segment::SegmentName;
 use walrus::pg::walparser::{RmId, XLogRecord};
 
+use crate::decode::heap_decoder::Predecoded;
 use crate::source::timeline::TimelineHistory;
 
 pub const WAL_SEG_SIZE: u64 = walrus::pg::wal::segment::DEFAULT_WAL_SEG_SIZE;
@@ -208,23 +209,37 @@ pub trait RecordSink: Send {
         record: &'a Record<'a>,
     ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>>;
 
-    /// Synchronous pre-filter: `false` lets a dispatcher skip `on_record`
-    /// entirely, sparing its boxed future and poll cycle. Position tracking
+    /// Pre-filter: `false` lets a dispatcher skip `on_record` entirely,
+    /// sparing its boxed future and poll cycle. Pure in the record, so a
+    /// dispatcher may evaluate it before the sink's own task sees the record
+    /// (the queueing pump never clones a skipped record). Position tracking
     /// still observes every record, so skipping cannot move the resume floor.
-    fn wants(&self, _record: &Record<'_>) -> bool {
+    fn wants(_record: &Record<'_>) -> bool
+    where
+        Self: Sized,
+    {
         true
     }
 
-    /// One boxed future per batch rather than per record; order preserved
+    /// Whether `on_record` may wait on shadow replaying this record's bytes.
+    /// The pump ships bytes through such a record, and none past it, before
+    /// dispatching it; records answering `false` may dispatch after bytes of
+    /// their successors are already on the wire
+    fn may_park(&self, _record: &Record<'_>) -> bool {
+        true
+    }
+
+    /// One boxed future per batch rather than per record; order preserved.
+    /// `pre` holds tuples a dispatcher decoded ahead, off this sink's task,
+    /// by batch index; empty when nothing was decoded ahead, and sinks
+    /// without a decode step drop it
     fn on_records<'a>(
         &'a mut self,
         batch: &'a [Record<'a>],
+        _pre: &'a mut [Option<Predecoded>],
     ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
         Box::pin(async move {
             for record in batch {
-                if !self.wants(record) {
-                    continue;
-                }
                 self.on_record(record).await?;
             }
             Ok(())
@@ -339,19 +354,35 @@ impl MetricsRecordSink {
     }
 }
 
+impl MetricsRecordSink {
+    pub fn observe(&mut self, record: &Record<'_>) {
+        *self
+            .by_rm_route
+            .entry((record.parsed.header.resource_manager_id, record.route))
+            .or_default() += 1;
+        self.total += 1;
+    }
+}
+
 impl RecordSink for MetricsRecordSink {
     fn on_record<'a>(
         &'a mut self,
         record: &'a Record<'a>,
     ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
-        Box::pin(async move {
-            *self
-                .by_rm_route
-                .entry((record.parsed.header.resource_manager_id, record.route))
-                .or_default() += 1;
-            self.total += 1;
-            Ok(())
-        })
+        self.observe(record);
+        Box::pin(Done)
+    }
+}
+
+/// Already-complete sink future. Zero-sized, so boxing it never allocates:
+/// a sink finishing synchronously costs its caller no heap traffic
+pub struct Done;
+
+impl Future for Done {
+    type Output = Result<(), SinkError>;
+
+    fn poll(self: Pin<&mut Self>, _: &mut std::task::Context<'_>) -> std::task::Poll<Self::Output> {
+        std::task::Poll::Ready(Ok(()))
     }
 }
 

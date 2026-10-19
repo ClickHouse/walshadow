@@ -198,6 +198,20 @@ impl MemoryBudget {
         self.permit(bytes, units, units)
     }
 
+    /// [`Self::admit`] without waiting: `None` when either compartment is short
+    pub fn try_admit(&self, bytes: usize) -> Option<MemoryPermit> {
+        if bytes > self.inner.admission_max {
+            self.inner.overshoots.fetch_add(1, Ordering::Relaxed);
+            return Some(self.permit(bytes, 0, 0));
+        }
+        let units = units_for(bytes);
+        let admission = self.inner.admission.try_acquire_many(units).ok()?;
+        let pool = self.inner.sem.try_acquire_many(units).ok()?;
+        admission.forget();
+        pool.forget();
+        Some(self.permit(bytes, units, units))
+    }
+
     fn permit(&self, bytes: usize, units: u32, admission_units: u32) -> MemoryPermit {
         let now = self.inner.cur.fetch_add(bytes as u64, Ordering::Relaxed) + bytes as u64;
         self.inner.peak.fetch_max(now, Ordering::Relaxed);

@@ -147,6 +147,8 @@ pub enum BatcherMsg {
     /// dominant coordination cost under sustained load. Rows may carry
     /// different `seq`s; batcher routes each independently.
     Rows(RowChunk),
+    /// Placements staged across commits, one hop for the lot
+    Chunks(Vec<RowChunk>),
     /// Seal every open table, push to inserters, reply. Barrier (drain before
     /// DDL/TRUNCATE) and shutdown.
     FlushAll(oneshot::Sender<()>),
@@ -237,6 +239,21 @@ pub(crate) fn spawn(
                         let live = effective_cfg(&cfg, snapshot(config_rx.as_ref()).as_deref());
                         let ctx = RowCtx { cfg: live, out: &out, alloc, epoch, stats };
                         if let Err(e) = handle_rows(&mut tables, &ctx, chunk).await {
+                            fatal.set(format!("batcher: {e}"));
+                            break;
+                        }
+                    }
+                    Some(BatcherMsg::Chunks(chunks)) => {
+                        let live = effective_cfg(&cfg, snapshot(config_rx.as_ref()).as_deref());
+                        let ctx = RowCtx { cfg: live, out: &out, alloc, epoch, stats };
+                        let mut res = Ok(());
+                        for chunk in chunks {
+                            res = handle_rows(&mut tables, &ctx, chunk).await;
+                            if res.is_err() {
+                                break;
+                            }
+                        }
+                        if let Err(e) = res {
                             fatal.set(format!("batcher: {e}"));
                             break;
                         }

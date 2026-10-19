@@ -3,17 +3,15 @@
 //! Planning already detoasted and routed every heap, so reorder places
 //! each dispatched seq inline: narrow local extensions render here,
 //! deletes drop for destinations without a delete marker, and rows chunk
-//! onto the shared batcher channel in dispatch order. Oracle resolution
-//! happens later, in the inserter.
+//! into the caller's staging list, shipped onto the shared batcher channel
+//! in dispatch order. Oracle resolution happens later, in the inserter.
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use tokio::sync::mpsc;
-
 use crate::decode::heap_decoder::{CommittedTuple, HeapOp, take_key_change_tombstone};
 use crate::emit::ch_emitter::EmitterStats;
-use crate::emit::pipeline::batcher::{BatcherMsg, RoutedRow, RowChunk};
+use crate::emit::pipeline::batcher::{RoutedRow, RowChunk};
 use crate::emit::route::RoutedHeap;
 
 /// Byte half of dual trigger with configured row cap. Bounds channel item for
@@ -22,27 +20,15 @@ use crate::emit::route::RoutedHeap;
 /// unchanged.
 pub const DECODE_CHUNK_BYTES: usize = 4 << 20;
 
-/// `Err` means the batcher channel closed (tail tripped fatal).
-async fn route_chunk(
-    msg_tx: &mpsc::Sender<BatcherMsg>,
-    rows: Vec<RoutedRow>,
-    permit: Option<Arc<crate::budget::MemoryPermit>>,
-) -> Result<(), String> {
-    msg_tx
-        .send(BatcherMsg::Rows(RowChunk { rows, permit }))
-        .await
-        .map_err(|_| "batcher channel closed".to_string())
-}
-
-/// Chunk every routed heap of one seq onto the batcher channel. Returns
-/// rows routed (the `R` the collector compares against).
+/// Chunk every routed heap of one seq onto `staged`. Returns rows routed
+/// (the `R` the collector compares against).
 ///
-/// Every routed row is on the channel by return, so the caller's `Placed`
-/// and any later `FlushAll` order after them. `route = None`
-/// (deterministically unmapped, counted at planning) discards here.
+/// Caller ships `staged` before the seq's `Placed` and any later
+/// `FlushAll`. `route = None` (deterministically unmapped, counted at
+/// planning) discards here.
 #[allow(clippy::too_many_arguments)]
-pub async fn place_rows(
-    msg_tx: &mpsc::Sender<BatcherMsg>,
+pub fn place_rows(
+    staged: &mut Vec<RowChunk>,
     stats: &EmitterStats,
     chunk_rows: usize,
     seq: u64,
@@ -50,7 +36,7 @@ pub async fn place_rows(
     commit_lsn: u64,
     heaps: Vec<RoutedHeap>,
     permit: Option<Arc<crate::budget::MemoryPermit>>,
-) -> Result<u64, String> {
+) -> u64 {
     stats.decode_jobs_in.fetch_add(1, Ordering::Relaxed);
     let mut routed = 0u64;
     let mut heaps = heaps.into_iter();
@@ -107,16 +93,19 @@ pub async fn place_rows(
         });
         routed += 1;
         if buf.len() >= chunk_rows || buf_bytes >= DECODE_CHUNK_BYTES {
-            route_chunk(msg_tx, std::mem::take(&mut buf), permit.clone()).await?;
+            staged.push(RowChunk {
+                rows: std::mem::take(&mut buf),
+                permit: permit.clone(),
+            });
             buf.reserve(chunk_rows.min(heaps.len()));
             buf_bytes = 0;
         }
     }
     if !buf.is_empty() {
-        route_chunk(msg_tx, buf, permit).await?;
+        staged.push(RowChunk { rows: buf, permit });
     }
     stats.decode_rows_out.fetch_add(routed, Ordering::Relaxed);
-    Ok(routed)
+    routed
 }
 
 #[cfg(test)]
@@ -212,14 +201,14 @@ mod tests {
     /// drop here, before the placed count the ack collector reconciles
     #[tokio::test]
     async fn deletes_drop_when_marker_disabled() {
-        let (msg_tx, mut msg_rx) = mpsc::channel(8);
+        let mut staged = Vec::new();
         let stats = EmitterStats::default();
         let no_marker = route(SystemColumns {
             is_deleted: None,
             ..SystemColumns::default()
         });
         let routed = place_rows(
-            &msg_tx,
+            &mut staged,
             &stats,
             8,
             0,
@@ -230,18 +219,15 @@ mod tests {
                 heap(HeapOp::Delete, no_marker),
             ],
             None,
-        )
-        .await
-        .expect("place");
+        );
         assert_eq!(routed, 1, "insert routed, delete dropped");
         assert_eq!(stats.deletes_discarded.load(Ordering::Relaxed), 1);
-        let msg = msg_rx.recv().await;
-        assert!(matches!(msg, Some(BatcherMsg::Rows(c)) if c.rows.len() == 1));
+        assert!(matches!(&staged[..], [c] if c.rows.len() == 1));
 
         // Default policy keeps the marker, so the DELETE rides through
         let marked = route(SystemColumns::default());
         let routed = place_rows(
-            &msg_tx,
+            &mut staged,
             &stats,
             8,
             1,
@@ -249,9 +235,7 @@ mod tests {
             0x3000,
             vec![heap(HeapOp::Delete, marked)],
             None,
-        )
-        .await
-        .expect("place");
+        );
         assert_eq!(routed, 1);
         assert_eq!(stats.deletes_discarded.load(Ordering::Relaxed), 1);
     }
@@ -259,7 +243,6 @@ mod tests {
     /// Emit and count old-key delete marker before new row unless deletes are disabled
     #[tokio::test]
     async fn key_change_places_tombstone_first() {
-        let (msg_tx, mut msg_rx) = mpsc::channel(8);
         let stats = EmitterStats::default();
         let update = |route| {
             let mut h = heap(HeapOp::Update, route);
@@ -285,8 +268,9 @@ mod tests {
                 1,
             ),
         ] {
+            let mut staged = Vec::new();
             let routed = place_rows(
-                &msg_tx,
+                &mut staged,
                 &stats,
                 8,
                 0,
@@ -294,12 +278,10 @@ mod tests {
                 0x2000,
                 vec![update(route(system))],
                 None,
-            )
-            .await
-            .expect("place");
+            );
             assert_eq!(routed, placed);
-            let Some(BatcherMsg::Rows(c)) = msg_rx.recv().await else {
-                panic!("rows chunk");
+            let [c] = &staged[..] else {
+                panic!("one rows chunk");
             };
             let ops: Vec<_> = c.rows.iter().map(|r| r.committed.decoded.op).collect();
             let want: &[HeapOp] = if placed == 2 {

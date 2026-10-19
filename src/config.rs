@@ -206,7 +206,8 @@ pub struct DestEmitter {
     named: std::sync::Mutex<HashMap<String, NamedEmitter>>,
     base: Arc<EmitterConfig>,
     live: Option<watch::Receiver<Arc<ResolvedConfig>>>,
-    current: std::sync::Mutex<Arc<EmitterConfig>>,
+    /// Live snapshot last compared against, and the config it produced
+    current: std::sync::Mutex<(Option<Arc<ResolvedConfig>>, Arc<EmitterConfig>)>,
 }
 
 impl DestEmitter {
@@ -216,7 +217,7 @@ impl DestEmitter {
     ) -> Arc<Self> {
         Arc::new(Self {
             named: Default::default(),
-            current: std::sync::Mutex::new(base.clone()),
+            current: std::sync::Mutex::new((None, base.clone())),
             base,
             live,
         })
@@ -224,13 +225,18 @@ impl DestEmitter {
 
     pub fn current(&self) -> Arc<EmitterConfig> {
         let mut current = self.current.lock().expect("dest emitter poisoned");
+        let (seen, config) = &mut *current;
         let Some(live) = self.live.as_ref().map(|rx| rx.borrow().clone()) else {
-            return current.clone();
+            return config.clone();
         };
-        if !live.dest_conn_eq(&current) {
-            *current = Arc::new(live.overlay_dest(&self.base));
+        // Same snapshot as last call: skip the connection comparison
+        if !seen.as_ref().is_some_and(|s| Arc::ptr_eq(s, &live)) {
+            if !live.dest_conn_eq(config) {
+                *config = Arc::new(live.overlay_dest(&self.base));
+            }
+            *seen = Some(live);
         }
-        current.clone()
+        config.clone()
     }
 
     pub fn instance(&self, name: &str) -> Result<Arc<EmitterConfig>, EmitterError> {

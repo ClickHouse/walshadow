@@ -1,7 +1,8 @@
 //! Transient validated plan spool — side-effect-free transaction planning.
 //!
 //! Planning writes one plan per committed transaction: high-volume heap
-//! entries stream through a checksummed spool file while bounded metadata
+//! entries stay typed in memory until the plan outgrows its memory cap,
+//! then stream through a checksummed spool file while bounded metadata
 //! stays resident in the plan header — descriptor dictionary, route table,
 //! control entries — matching the live buffer's position that control
 //! state per xact stays small. Replay after a successful seal walks heaps
@@ -21,7 +22,7 @@
 use std::fs::{self, File};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 
 use thiserror::Error;
 
@@ -37,9 +38,13 @@ pub const PLAN_MAGIC: [u8; 2] = *b"WP";
 pub const PLAN_VERSION: u16 = 1;
 
 /// Plans at or below this stay memory-resident: the common
-/// single-statement commit never touches the filesystem. Larger plans
-/// spill to the file at `path` (bounded by the disk cap)
+/// single-statement commit never touches the filesystem or the codec.
+/// Larger plans spill to the file at `path` (bounded by the disk cap)
 pub const DEFAULT_PLAN_MEM_MAX: u64 = 1 << 20;
+
+/// Resident cost charged per typed heap on top of its values, standing in
+/// for the frame a spilled heap would take
+const MEM_FRAME_OVERHEAD: u64 = 64;
 
 const TAG_HEAP: u8 = 0;
 const TAG_SEAL: u8 = 1;
@@ -73,31 +78,46 @@ impl From<SpillError> for PlanSpoolError {
 
 pub type Result<T> = std::result::Result<T, PlanSpoolError>;
 
-/// Streams one transaction's validated heaps to disk while accumulating the
-/// bounded plan header. Dropped unsealed (any planning error), the file
-/// unlinks and nothing replays
-enum PlanSink {
-    Mem(Vec<u8>),
-    File(BufWriter<File>),
+/// Spool file location, formatted only once a plan spills
+pub enum PlanPath {
+    At(PathBuf),
+    Xact {
+        dir: Arc<Path>,
+        xid: u32,
+        commit_lsn: u64,
+    },
 }
 
-impl PlanSink {
-    fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
+impl PlanPath {
+    fn resolve(&self) -> PathBuf {
         match self {
-            Self::Mem(v) => {
-                v.extend_from_slice(buf);
-                Ok(())
-            }
-            Self::File(f) => f.write_all(buf),
+            Self::At(p) => p.clone(),
+            Self::Xact {
+                dir,
+                xid,
+                commit_lsn,
+            } => dir.join(format!("xact-{xid}-{commit_lsn}.plan")),
         }
     }
 }
 
+impl From<PathBuf> for PlanPath {
+    fn from(p: PathBuf) -> Self {
+        Self::At(p)
+    }
+}
+
+/// Streams one transaction's validated heaps, typed in memory or to disk,
+/// while accumulating the bounded plan header. Dropped unsealed (any
+/// planning error), the file unlinks and nothing replays
+enum PlanSink {
+    Mem(Vec<RoutedHeap>),
+    File(BufWriter<File>, PathBuf),
+}
+
 pub struct PlanWriter {
     sink: PlanSink,
-    path: PathBuf,
-    /// File exists on disk (spilled); unsealed drop unlinks only then
-    spilled: bool,
+    path: PlanPath,
     mem_max: u64,
     cap: u64,
     bytes: u64,
@@ -120,14 +140,10 @@ pub struct PlanWriter {
 impl PlanWriter {
     /// Starts memory-resident; the file at `path` is only created if the
     /// plan outgrows `mem_max`
-    pub fn create(path: PathBuf, cap: u64, mem_max: u64) -> Result<Self> {
-        let mut sink = PlanSink::Mem(Vec::new());
-        sink.write_all(&PLAN_MAGIC)?;
-        sink.write_all(&PLAN_VERSION.to_le_bytes())?;
+    pub fn create(path: impl Into<PlanPath>, cap: u64, mem_max: u64) -> Result<Self> {
         Ok(Self {
-            sink,
-            path,
-            spilled: false,
+            sink: PlanSink::Mem(Vec::new()),
+            path: path.into(),
             mem_max,
             cap,
             bytes: 4,
@@ -150,9 +166,59 @@ impl PlanWriter {
         self.bytes
     }
 
-    /// Append one validated heap with the route it planned under. Descriptor
-    /// and route dedup by Arc identity into the plan header
+    /// Append one validated heap with the route it planned under. Spilled
+    /// heaps dedup descriptor and route by Arc identity into the plan header
     pub fn push_heap(
+        &mut self,
+        heap: DescribedHeap,
+        route: Option<Arc<RouteSnapshot>>,
+    ) -> Result<()> {
+        let routed = route.is_some();
+        if let PlanSink::Mem(_) = &self.sink {
+            let needed = self.bytes + MEM_FRAME_OVERHEAD + heap.decoded.approx_bytes() as u64;
+            if needed > self.mem_max {
+                self.spill()?;
+            } else if needed > self.cap {
+                return Err(PlanSpoolError::DiskBudget {
+                    needed,
+                    cap: self.cap,
+                });
+            }
+        }
+        if let PlanSink::Mem(heaps) = &mut self.sink {
+            self.bytes += MEM_FRAME_OVERHEAD + heap.decoded.approx_bytes() as u64;
+            heaps.push(RoutedHeap {
+                described: heap,
+                route,
+            });
+        } else {
+            self.encode_heap(&heap, route.as_ref())?;
+        }
+        self.heap_count += 1;
+        if routed {
+            self.routed_count += 1;
+        }
+        Ok(())
+    }
+
+    /// Move resident heaps into a fresh spool file; later heaps append there
+    fn spill(&mut self) -> Result<()> {
+        let path = self.path.resolve();
+        let mut f = BufWriter::new(File::create(&path)?);
+        f.write_all(&PLAN_MAGIC)?;
+        f.write_all(&PLAN_VERSION.to_le_bytes())?;
+        let PlanSink::Mem(heaps) = std::mem::replace(&mut self.sink, PlanSink::File(f, path))
+        else {
+            unreachable!("spill runs once, from memory");
+        };
+        self.bytes = 4;
+        for h in heaps {
+            self.encode_heap(&h.described, h.route.as_ref())?;
+        }
+        Ok(())
+    }
+
+    fn encode_heap(
         &mut self,
         heap: &DescribedHeap,
         route: Option<&Arc<RouteSnapshot>>,
@@ -187,12 +253,7 @@ impl PlanWriter {
         spill::encode_heap_into(&mut body, &heap.decoded);
         let res = self.write_frame(&body, false);
         self.scratch = body;
-        res?;
-        self.heap_count += 1;
-        if route.is_some() {
-            self.routed_count += 1;
-        }
-        Ok(())
+        res
     }
 
     /// Pin a control entry before the next heap: replay yields it ahead of
@@ -219,8 +280,8 @@ impl PlanWriter {
     /// puts rows up to `upto` before applying the truncate
     pub fn push_truncate(
         &mut self,
-        heap: &DescribedHeap,
-        route: Option<&Arc<RouteSnapshot>>,
+        heap: DescribedHeap,
+        route: Option<Arc<RouteSnapshot>>,
         upto: usize,
     ) -> Result<()> {
         self.push_heap(heap, route)?;
@@ -231,17 +292,19 @@ impl PlanWriter {
     /// Write the seal frame and freeze the header. Seal is exempt from the
     /// disk budget so a boundary-sized transaction still closes cleanly
     pub fn seal(mut self, commit_lsn: u64, commit_ts: i64) -> Result<SealedPlan> {
-        let mut body = std::mem::take(&mut self.scratch);
-        body.clear();
-        body.push(TAG_SEAL);
-        body.extend_from_slice(&self.heap_count.to_le_bytes());
-        self.write_frame(&body, true)?;
-        let store = match &mut self.sink {
-            PlanSink::Mem(buf) => PlanStore::Mem(std::mem::take(buf)),
-            PlanSink::File(f) => {
-                f.flush()?;
-                PlanStore::File(std::mem::take(&mut self.path))
-            }
+        let store = if let PlanSink::Mem(heaps) = &mut self.sink {
+            PlanStore::Mem(StdMutex::new(std::mem::take(heaps)))
+        } else {
+            let mut body = std::mem::take(&mut self.scratch);
+            body.clear();
+            body.push(TAG_SEAL);
+            body.extend_from_slice(&self.heap_count.to_le_bytes());
+            self.write_frame(&body, true)?;
+            let PlanSink::File(f, path) = &mut self.sink else {
+                unreachable!("memory plans sealed above");
+            };
+            f.flush()?;
+            PlanStore::File(std::mem::take(path))
         };
         self.sealed = true;
         Ok(SealedPlan {
@@ -267,17 +330,15 @@ impl PlanWriter {
                 cap: self.cap,
             });
         }
-        if needed > self.mem_max
-            && let PlanSink::Mem(buf) = &self.sink
-        {
-            let mut f = BufWriter::new(File::create(&self.path)?);
-            f.write_all(buf)?;
-            self.sink = PlanSink::File(f);
-            self.spilled = true;
+        if let PlanSink::Mem(_) = &self.sink {
+            self.spill()?;
         }
-        self.sink.write_all(&(body.len() as u32).to_le_bytes())?;
-        self.sink.write_all(&crc32c::crc32c(body).to_le_bytes())?;
-        self.sink.write_all(body)?;
+        let PlanSink::File(f, _) = &mut self.sink else {
+            unreachable!("spilled above");
+        };
+        f.write_all(&(body.len() as u32).to_le_bytes())?;
+        f.write_all(&crc32c::crc32c(body).to_le_bytes())?;
+        f.write_all(body)?;
         self.bytes = needed;
         Ok(())
     }
@@ -285,16 +346,18 @@ impl PlanWriter {
 
 impl Drop for PlanWriter {
     fn drop(&mut self) {
-        if !self.sealed && self.spilled {
-            let _ = fs::remove_file(&self.path);
+        if !self.sealed
+            && let PlanSink::File(_, path) = &self.sink
+        {
+            let _ = fs::remove_file(path);
         }
     }
 }
 
-/// Backing bytes of a sealed plan: memory for small plans, the spool
-/// file once spilled
+/// Backing heaps of a sealed plan: typed in memory for small plans, taken
+/// by the one replay; the spool file once spilled
 enum PlanStore {
-    Mem(Vec<u8>),
+    Mem(StdMutex<Vec<RoutedHeap>>),
     File(PathBuf),
 }
 
@@ -317,7 +380,8 @@ pub struct SealedPlan {
     pub heap_count: u64,
     /// `heap_count` minus unmapped discards; feeds `xact_plan_rows`
     pub routed_count: u64,
-    /// Sealed frame bytes, header + seal included; feeds `xact_plan_bytes`
+    /// Sealed frame bytes, header + seal included, or the resident estimate
+    /// of a memory plan; feeds `xact_plan_bytes`
     pub size_bytes: u64,
     pub commit_lsn: u64,
     pub commit_ts: i64,
@@ -332,11 +396,33 @@ impl SealedPlan {
         }
     }
 
+    /// Memory plans hand their heaps to the first replay only
     pub fn replay(&self) -> Result<PlanReader<'_>> {
-        let mut input: Box<dyn Read + Send + '_> = match &self.store {
-            PlanStore::Mem(buf) => Box::new(std::io::Cursor::new(buf.as_slice())),
-            PlanStore::File(p) => Box::new(BufReader::new(File::open(p)?)),
+        let input = match &self.store {
+            PlanStore::Mem(heaps) => {
+                let heaps = std::mem::take(&mut *heaps.lock().expect("plan heaps poisoned"));
+                if heaps.len() as u64 != self.heap_count {
+                    return Err(PlanSpoolError::Format {
+                        detail: "memory plan already replayed".into(),
+                    });
+                }
+                PlanInput::Mem(heaps.into_iter())
+            }
+            PlanStore::File(p) => PlanInput::File(Self::open_file(p)?),
         };
+        Ok(PlanReader {
+            plan: self,
+            input,
+            offset: 4,
+            next_heap: 0,
+            next_control: 0,
+            next_truncate: 0,
+            done: false,
+        })
+    }
+
+    fn open_file(path: &Path) -> Result<BufReader<File>> {
+        let mut input = BufReader::new(File::open(path)?);
         let mut header = [0u8; 4];
         read_or_unsealed(&mut input, &mut header)?;
         if header[..2] != PLAN_MAGIC {
@@ -350,15 +436,7 @@ impl SealedPlan {
                 detail: format!("unsupported plan version {version}, expected {PLAN_VERSION}"),
             });
         }
-        Ok(PlanReader {
-            plan: self,
-            input,
-            offset: 4,
-            next_heap: 0,
-            next_control: 0,
-            next_truncate: 0,
-            done: false,
-        })
+        Ok(input)
     }
 
     /// Walk every frame without acting on it: checksums, id resolution,
@@ -371,7 +449,7 @@ impl SealedPlan {
         Ok(())
     }
 
-    /// Mem-resident plans hold the bytes validated at write; file-backed
+    /// Mem-resident plans hold the heaps validated at write; file-backed
     /// plans re-read from disk, so they walk [`Self::verify`] first
     pub fn into_verified(self) -> Result<VerifiedPlan> {
         if self.path().is_some() {
@@ -411,12 +489,17 @@ pub enum PlanItem<'p> {
     },
 }
 
-/// Linear replay over a [`SealedPlan`]: verifies every frame checksum,
-/// resolves dictionary/route ids against the header, interleaves controls
-/// at their pinned positions
+enum PlanInput {
+    Mem(std::vec::IntoIter<RoutedHeap>),
+    File(BufReader<File>),
+}
+
+/// Linear replay over a [`SealedPlan`]: verifies every spooled frame
+/// checksum, resolves dictionary/route ids against the header, interleaves
+/// controls at their pinned positions
 pub struct PlanReader<'p> {
     plan: &'p SealedPlan,
-    input: Box<dyn Read + Send + 'p>,
+    input: PlanInput,
     offset: u64,
     next_heap: u64,
     next_control: usize,
@@ -435,9 +518,39 @@ impl<'p> PlanReader<'p> {
         if self.done {
             return Ok(None);
         }
+        let heap = match &mut self.input {
+            PlanInput::Mem(heaps) => heaps.next(),
+            PlanInput::File(_) => self.next_frame()?,
+        };
+        let Some(heap) = heap else {
+            self.done = true;
+            return self.next_item();
+        };
+        self.next_heap += 1;
+        if heap.described.decoded.op != HeapOp::Truncate {
+            return Ok(Some(PlanItem::Heap(heap)));
+        }
+        let Some(&upto) = self.plan.truncate_rows.get(self.next_truncate) else {
+            return Err(PlanSpoolError::Format {
+                detail: format!(
+                    "truncate heap {} has no mirror-row fence, header has {}",
+                    self.next_truncate,
+                    self.plan.truncate_rows.len(),
+                ),
+            });
+        };
+        self.next_truncate += 1;
+        Ok(Some(PlanItem::Truncate { heap, upto }))
+    }
+
+    /// Next spooled heap, `None` past a seal that cross-checks clean
+    fn next_frame(&mut self) -> Result<Option<RoutedHeap>> {
+        let PlanInput::File(input) = &mut self.input else {
+            unreachable!("frames only spool to file");
+        };
         let frame_offset = self.offset;
         let mut fixed = [0u8; 8];
-        read_or_unsealed(&mut self.input, &mut fixed)?;
+        read_or_unsealed(input, &mut fixed)?;
         let len = u32::from_le_bytes(fixed[..4].try_into().unwrap()) as usize;
         let crc = u32::from_le_bytes(fixed[4..].try_into().unwrap());
         // Length sits outside the body checksum, so bound it against the
@@ -452,7 +565,7 @@ impl<'p> PlanReader<'p> {
             });
         }
         let mut body = vec![0u8; len];
-        read_or_unsealed(&mut self.input, &mut body)?;
+        read_or_unsealed(input, &mut body)?;
         self.offset += 8 + len as u64;
         if crc32c::crc32c(&body) != crc {
             return Err(PlanSpoolError::Corrupt {
@@ -490,27 +603,14 @@ impl<'p> PlanReader<'p> {
                     };
                     Some(r.clone())
                 };
-                self.next_heap += 1;
-                let heap = RoutedHeap {
+                Ok(Some(RoutedHeap {
                     described: DescribedHeap {
                         decoded,
                         descriptor,
                         descriptor_valid_from: valid_from,
                     },
                     route,
-                };
-                if heap.described.decoded.op != HeapOp::Truncate {
-                    return Ok(Some(PlanItem::Heap(heap)));
-                }
-                let Some(&upto) = self.plan.truncate_rows.get(self.next_truncate) else {
-                    return Err(format(format!(
-                        "truncate heap {} has no mirror-row fence, header has {}",
-                        self.next_truncate,
-                        self.plan.truncate_rows.len(),
-                    )));
-                };
-                self.next_truncate += 1;
-                Ok(Some(PlanItem::Truncate { heap, upto }))
+                }))
             }
             Some(&TAG_SEAL) => {
                 let count = u64::from_le_bytes(
@@ -533,11 +633,10 @@ impl<'p> PlanReader<'p> {
                     )));
                 }
                 let mut probe = [0u8; 1];
-                if self.input.read(&mut probe)? != 0 {
+                if input.read(&mut probe)? != 0 {
                     return Err(format("trailing bytes after seal".into()));
                 }
-                self.done = true;
-                self.next_item()
+                Ok(None)
             }
             Some(&tag) => Err(format(format!("unknown plan frame tag {tag}"))),
             None => Err(format("empty plan frame".into())),
@@ -639,62 +738,106 @@ mod tests {
     /// table deduped to one entry each per identity
     #[test]
     fn round_trip_orders_heaps_and_controls() {
+        for mem_max in [DEFAULT_PLAN_MEM_MAX, 0] {
+            let tmp = tempfile::tempdir().unwrap();
+            let path = tmp.path().join("1.plan");
+            let mut w = PlanWriter::create(path.clone(), 1 << 20, mem_max).unwrap();
+            let (d1, d2) = (descriptor(16500), descriptor(16501));
+            let r = route();
+            w.push_control(dropped(1), 0);
+            w.push_heap(heap(&d1, 100, 10), Some(r.clone())).unwrap();
+            w.push_heap(heap(&d2, 110, 20), None).unwrap();
+            w.push_control(dropped(2), 0);
+            w.push_heap(heap(&d1, 120, 30), Some(r.clone())).unwrap();
+            w.push_control(dropped(3), 0);
+            let plan = w.seal(0x2000, 42).unwrap();
+            let spilled = mem_max == 0;
+            if spilled {
+                assert_eq!(plan.descriptors.len(), 2, "dict deduped");
+                assert_eq!(plan.routes.len(), 1, "route table deduped");
+            }
+            assert_eq!(plan.heap_count, 3);
+            assert_eq!(plan.routed_count, 2, "unmapped discard not counted");
+            assert!(plan.size_bytes > 0);
+            assert_eq!((plan.commit_lsn, plan.commit_ts), (0x2000, 42));
+
+            let mut rd = plan.replay().unwrap();
+            let mut order = Vec::new();
+            while let Some(item) = rd.next_item().unwrap() {
+                order.push(match item {
+                    PlanItem::Control(c) => format!("{:?}", c.event),
+                    PlanItem::Heap(h) | PlanItem::Truncate { heap: h, .. } => {
+                        assert!(
+                            Arc::ptr_eq(&h.described.descriptor, &d1)
+                                || Arc::ptr_eq(&h.described.descriptor, &d2),
+                            "descriptor identity survives the plan"
+                        );
+                        if let Some(route) = &h.route {
+                            assert!(Arc::ptr_eq(route, &r));
+                        }
+                        let new = h.described.decoded.new.as_ref().unwrap();
+                        let routed = if h.route.is_some() { "r" } else { "-" };
+                        format!("{:?}{routed}", new.columns[0])
+                    }
+                });
+            }
+            let ev = |oid| format!("{:?}", dropped(oid));
+            let heap = |v, routed| format!("{:?}{routed}", Some(ColumnValue::Int4(v)));
+            assert_eq!(
+                order,
+                [
+                    ev(1),
+                    heap(10, "r"),
+                    heap(20, "-"),
+                    ev(2),
+                    heap(30, "r"),
+                    ev(3)
+                ]
+            );
+            assert_eq!(plan.path().is_some(), spilled);
+            drop(rd);
+            drop(plan);
+            assert!(!path.exists(), "no file outlives the plan");
+        }
+    }
+
+    /// Memory plans hand their heaps over once; a second replay must not
+    /// read as an empty transaction
+    #[test]
+    fn memory_plan_replays_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut w =
+            PlanWriter::create(tmp.path().join("1.plan"), 1 << 20, DEFAULT_PLAN_MEM_MAX).unwrap();
+        w.push_heap(heap(&descriptor(16500), 100, 10), None)
+            .unwrap();
+        let plan = w.seal(0x2000, 42).unwrap();
+        let mut rd = plan.replay().unwrap();
+        while rd.next_item().unwrap().is_some() {}
+        let err = plan.replay().err().expect("second replay");
+        assert!(err.to_string().contains("already replayed"), "{err}");
+    }
+
+    /// Plan outgrowing its memory cap moves resident heaps into the file in
+    /// order, ahead of later heaps
+    #[test]
+    fn spill_preserves_resident_heaps() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("1.plan");
-        let mut w = PlanWriter::create(path.clone(), 1 << 20, DEFAULT_PLAN_MEM_MAX).unwrap();
-        let (d1, d2) = (descriptor(16500), descriptor(16501));
-        let r = route();
-        w.push_control(dropped(1), 0);
-        w.push_heap(&heap(&d1, 100, 10), Some(&r)).unwrap();
-        w.push_heap(&heap(&d2, 110, 20), None).unwrap();
-        w.push_control(dropped(2), 0);
-        w.push_heap(&heap(&d1, 120, 30), Some(&r)).unwrap();
-        w.push_control(dropped(3), 0);
-        let plan = w.seal(0x2000, 42).unwrap();
-        assert_eq!(plan.descriptors.len(), 2, "dict deduped");
-        assert_eq!(plan.routes.len(), 1, "route table deduped");
-        assert_eq!(plan.heap_count, 3);
-        assert_eq!(plan.routed_count, 2, "unmapped discard not counted");
-        assert!(plan.size_bytes > 0);
-        assert_eq!((plan.commit_lsn, plan.commit_ts), (0x2000, 42));
-
-        let mut rd = plan.replay().unwrap();
-        let mut order = Vec::new();
-        while let Some(item) = rd.next_item().unwrap() {
-            order.push(match item {
-                PlanItem::Control(c) => format!("{:?}", c.event),
-                PlanItem::Heap(h) | PlanItem::Truncate { heap: h, .. } => {
-                    assert!(
-                        Arc::ptr_eq(&h.described.descriptor, &plan.descriptors[0].0)
-                            || Arc::ptr_eq(&h.described.descriptor, &plan.descriptors[1].0),
-                        "descriptor resolves through the header table"
-                    );
-                    if let Some(route) = &h.route {
-                        assert!(Arc::ptr_eq(route, &plan.routes[0]));
-                    }
-                    let new = h.described.decoded.new.as_ref().unwrap();
-                    let routed = if h.route.is_some() { "r" } else { "-" };
-                    format!("{:?}{routed}", new.columns[0])
-                }
-            });
+        let mut w = PlanWriter::create(path.clone(), 1 << 20, 2 * MEM_FRAME_OVERHEAD + 8).unwrap();
+        let d = descriptor(16500);
+        for v in 0..4 {
+            w.push_heap(heap(&d, 100 + v as u64, v), None).unwrap();
         }
-        let ev = |oid| format!("{:?}", dropped(oid));
-        let heap = |v, routed| format!("{:?}{routed}", Some(ColumnValue::Int4(v)));
-        assert_eq!(
-            order,
-            [
-                ev(1),
-                heap(10, "r"),
-                heap(20, "-"),
-                ev(2),
-                heap(30, "r"),
-                ev(3)
-            ]
-        );
-        assert!(plan.path().is_none(), "small plan stays memory-resident");
-        drop(rd);
-        drop(plan);
-        assert!(!path.exists(), "no file was ever created");
+        let plan = w.seal(0x2000, 42).unwrap();
+        assert!(path.exists(), "spilled past the memory cap");
+        assert_eq!(plan.size_bytes, fs::read(&path).unwrap().len() as u64);
+        let mut rd = plan.replay().unwrap();
+        let mut seen = Vec::new();
+        while let Some(PlanItem::Heap(h)) = rd.next_item().unwrap() {
+            seen.push(h.described.decoded.new.unwrap().columns[0].clone());
+        }
+        let want: Vec<_> = (0..4).map(|v| Some(ColumnValue::Int4(v))).collect();
+        assert_eq!(seen, want);
     }
 
     /// Oracle-pending values (`PgPending` / `Unsupported`) round-trip
@@ -720,7 +863,7 @@ mod tests {
         ];
         let mut h = heap(&d, 100, 0);
         h.decoded.new.as_mut().unwrap().columns = cols.clone();
-        w.push_heap(&h, Some(&route())).unwrap();
+        w.push_heap(h, Some(route())).unwrap();
         let plan = w.seal(0x2000, 42).unwrap();
         let mut rd = plan.replay().unwrap();
         let item = rd.next_item().unwrap();
@@ -736,7 +879,7 @@ mod tests {
         let path = tmp.path().join("1.plan");
         let mut w = PlanWriter::create(path.clone(), 1 << 20, 0).unwrap();
         let d = descriptor(16500);
-        w.push_heap(&heap(&d, 100, 10), None).unwrap();
+        w.push_heap(heap(&d, 100, 10), None).unwrap();
         let plan = w.seal(0x2000, 42).unwrap();
         let mut bytes = fs::read(&path).unwrap();
         let mid = 4 + 8 + 5; // into the first frame body
@@ -755,7 +898,7 @@ mod tests {
         let path = tmp.path().join("1.plan");
         let mut w = PlanWriter::create(path.clone(), 1 << 20, 0).unwrap();
         let d = descriptor(16500);
-        w.push_heap(&heap(&d, 100, 10), None).unwrap();
+        w.push_heap(heap(&d, 100, 10), None).unwrap();
         let plan = w.seal(0x2000, 42).unwrap();
         let mut bytes = fs::read(&path).unwrap();
         bytes[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
@@ -771,8 +914,8 @@ mod tests {
         let path = tmp.path().join("1.plan");
         let mut w = PlanWriter::create(path.clone(), 1 << 20, 0).unwrap();
         let d = descriptor(16500);
-        w.push_heap(&heap(&d, 100, 10), None).unwrap();
-        w.push_heap(&heap(&d, 110, 20), None).unwrap();
+        w.push_heap(heap(&d, 100, 10), None).unwrap();
+        w.push_heap(heap(&d, 110, 20), None).unwrap();
         let plan = w.seal(0x2000, 42).unwrap();
         plan.verify().unwrap();
         let mut bytes = fs::read(&path).unwrap();
@@ -791,7 +934,7 @@ mod tests {
         let path = tmp.path().join("1.plan");
         let mut w = PlanWriter::create(path.clone(), 1 << 20, 0).unwrap();
         let d = descriptor(16500);
-        w.push_heap(&heap(&d, 100, 10), None).unwrap();
+        w.push_heap(heap(&d, 100, 10), None).unwrap();
         let plan = w.seal(0x2000, 42).unwrap();
         assert!(path.exists(), "mem_max 0 forced file mode");
         drop(plan);
@@ -805,7 +948,7 @@ mod tests {
         let path = tmp.path().join("1.plan");
         let mut w = PlanWriter::create(path.clone(), 1 << 20, 0).unwrap();
         let d = descriptor(16500);
-        w.push_heap(&heap(&d, 100, 10), None).unwrap();
+        w.push_heap(heap(&d, 100, 10), None).unwrap();
         let heaps_only = w.bytes();
         let plan = w.seal(0x2000, 42).unwrap();
         let bytes = fs::read(&path).unwrap();
@@ -819,22 +962,19 @@ mod tests {
         assert!(matches!(err, PlanSpoolError::Unsealed), "{err}");
     }
 
-    /// Replay a memory plan after `tamper`, returning the first error
+    /// Replay a spilled plan after `tamper`, returning the first error
     fn replay_err(
         push: impl FnOnce(&mut PlanWriter),
         tamper: impl FnOnce(&mut SealedPlan, &mut Vec<u8>),
     ) -> PlanSpoolError {
         let tmp = tempfile::tempdir().unwrap();
-        let mut w =
-            PlanWriter::create(tmp.path().join("1.plan"), 1 << 20, DEFAULT_PLAN_MEM_MAX).unwrap();
+        let path = tmp.path().join("1.plan");
+        let mut w = PlanWriter::create(path.clone(), 1 << 20, 0).unwrap();
         push(&mut w);
         let mut plan = w.seal(0x2000, 42).unwrap();
-        let mut buf = match std::mem::replace(&mut plan.store, PlanStore::Mem(Vec::new())) {
-            PlanStore::Mem(buf) => buf,
-            PlanStore::File(_) => unreachable!("small plan stays in memory"),
-        };
+        let mut buf = fs::read(&path).unwrap();
         tamper(&mut plan, &mut buf);
-        plan.store = PlanStore::Mem(buf);
+        fs::write(&path, &buf).unwrap();
         let mut rd = match plan.replay() {
             Ok(rd) => rd,
             Err(e) => return e,
@@ -855,7 +995,7 @@ mod tests {
         let r = route();
         let mut truncate = heap(&d, 100, 10);
         truncate.decoded.op = HeapOp::Truncate;
-        let one = |w: &mut PlanWriter| w.push_heap(&heap(&d, 100, 10), None).unwrap();
+        let one = |w: &mut PlanWriter| w.push_heap(heap(&d, 100, 10), None).unwrap();
         let mut trailing_heap = vec![TAG_HEAP];
         trailing_heap.extend_from_slice(&0u32.to_le_bytes());
         trailing_heap.extend_from_slice(&ROUTE_NONE.to_le_bytes());
@@ -871,13 +1011,13 @@ mod tests {
             (
                 "route id",
                 replay_err(
-                    |w| w.push_heap(&heap(&d, 100, 10), Some(&r)).unwrap(),
+                    |w| w.push_heap(heap(&d, 100, 10), Some(r.clone())).unwrap(),
                     |p, _| p.routes.clear(),
                 ),
             ),
             (
                 "no mirror-row fence",
-                replay_err(|w| w.push_heap(&truncate, None).unwrap(), |_, _| {}),
+                replay_err(|w| w.push_heap(truncate.clone(), None).unwrap(), |_, _| {}),
             ),
             ("seal count", replay_err(one, |p, _| p.heap_count += 1)),
             (
@@ -933,7 +1073,7 @@ mod tests {
         let path = tmp.path().join("1.plan");
         let mut w = PlanWriter::create(path.clone(), 16, 0).unwrap();
         let d = descriptor(16500);
-        let err = w.push_heap(&heap(&d, 100, 10), None).unwrap_err();
+        let err = w.push_heap(heap(&d, 100, 10), None).unwrap_err();
         assert!(matches!(err, PlanSpoolError::DiskBudget { .. }), "{err}");
         drop(w);
         assert!(!path.exists(), "abandoned plan unlinks");

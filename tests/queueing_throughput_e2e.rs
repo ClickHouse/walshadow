@@ -23,7 +23,9 @@ use walshadow::shadow::Shadow;
 
 const COLUMNS: usize = 38;
 const CLIENTS: usize = 16;
-const RUN_SECONDS: u64 = 20;
+const RUN_SECONDS: u64 = 40;
+const DRAIN_WARMUP_SECONDS: u64 = 2;
+const DRAIN_SECONDS: u64 = 6;
 
 fn psql_source(source: &Shadow, sql: &str) -> Result<String> {
     let out = Command::new("psql")
@@ -226,7 +228,10 @@ fn report(a: &Sample, b: &Sample) {
     if waits > 0.0 {
         println!("  us per acquire      {:>12.1}", wait_busy / waits * 1e6);
     }
-    println!("  pump_queue_depth    {:>12} (end)", b.pump_queue_depth);
+    println!(
+        "  pump_queue_depth    {:>12} -> {}",
+        a.pump_queue_depth, b.pump_queue_depth
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -246,6 +251,9 @@ async fn queueing_worker_throughput_under_tiny_transactions() {
     source.start().expect("start source");
     let _src_stop = fx::StopOnDrop { sh: &source };
 
+    // Backlog outgrows the fixture's 256MB keep, slotless source would recycle it
+    psql_source(&source, "ALTER SYSTEM SET wal_keep_size = '8GB'").expect("wal_keep_size");
+    psql_source(&source, "SELECT pg_reload_conf()").expect("reload");
     create_source_table(&source).expect("create source table");
 
     let ch_tmp = tempfile::tempdir().unwrap();
@@ -328,6 +336,11 @@ async fn queueing_worker_throughput_under_tiny_transactions() {
         fx::wait_for_listen(metrics_addr, Duration::from_secs(300))
             .context("daemon metrics endpoint never came up")?;
 
+        // Stopped daemon lets WAL pile up on the source, so the drain after
+        // SIGCONT runs with the queue pinned: records_out then measures the
+        // serial worker, not the source's commit rate
+        std::thread::sleep(Duration::from_secs(3));
+        let pid = guard.child.as_ref().unwrap().id() as libc::pid_t;
         let bench = Command::new("pgbench")
             .args([
                 "-h",
@@ -352,13 +365,10 @@ async fn queueing_worker_throughput_under_tiny_transactions() {
             .stderr(Stdio::piped())
             .spawn()
             .context("spawn pgbench")?;
-
-        std::thread::sleep(Duration::from_secs(5));
-        let first = sample(metrics_addr)?;
-        std::thread::sleep(Duration::from_secs(RUN_SECONDS - 8));
-        let second = sample(metrics_addr)?;
-
-        let out = bench.wait_with_output().context("pgbench wait")?;
+        unsafe { libc::kill(pid, libc::SIGSTOP) };
+        let out = bench.wait_with_output();
+        unsafe { libc::kill(pid, libc::SIGCONT) };
+        let out = out.context("pgbench wait")?;
         anyhow::ensure!(
             out.status.success(),
             "pgbench failed: {}",
@@ -369,6 +379,11 @@ async fn queueing_worker_throughput_under_tiny_transactions() {
                 println!("  pgbench: {line}");
             }
         }
+
+        std::thread::sleep(Duration::from_secs(DRAIN_WARMUP_SECONDS));
+        let first = sample(metrics_addr)?;
+        std::thread::sleep(Duration::from_secs(DRAIN_SECONDS));
+        let second = sample(metrics_addr)?;
         report(&first, &second);
         let rows = psql_source(&source, "SELECT count(*) FROM steps")?;
         println!("  source rows         {rows:>12}");

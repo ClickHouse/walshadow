@@ -53,7 +53,7 @@ use crate::catalog::desc_log::{
 use crate::catalog::pending::{PendingCatalog, PendingSlot};
 use crate::decode::decoder_sink::{DecoderSinkError, DecoderStats, SkipReason, SkippedRecord};
 use crate::decode::heap_decoder::{
-    ColumnValue, DecodedHeap, DescribedHeap, HeapOp, ToastPointer, decode_heap_record,
+    ColumnValue, DecodedHeap, DescribedHeap, HeapOp, Predecoded, ToastPointer, decode_heap_record,
 };
 #[cfg(test)]
 use crate::decode::wal_xact::{
@@ -1155,7 +1155,10 @@ impl XactBuffer {
         self.bytes_in_memory += sz;
         self.stats.raw_stash_bytes_mem += raw_sz.unwrap_or(0);
         self.stats.bytes_in_memory = self.bytes_in_memory as u64;
-        self.maybe_evict().await?;
+        if self.bytes_in_memory > self.config.xact_buffer_max {
+            // Boxed: eviction spills, kilobytes deep, off every record future
+            Box::pin(self.maybe_evict()).await?;
+        }
         Ok(())
     }
 
@@ -1218,19 +1221,14 @@ impl XactBuffer {
         let mut gauge = self.drain_gauge(&self.drain_head_resident);
         let mut sources = Vec::with_capacity(states.len());
         let mut events = Vec::with_capacity(states.len());
+        // States split first so none stays live across the spill await below
+        let mut parts = Vec::with_capacity(states.len());
         for mut st in states {
-            let reader = match st.spill.take() {
-                Some(writer) => {
-                    let bc = writer.byte_count();
-                    self.stats.spill_bytes_active =
-                        self.stats.spill_bytes_active.saturating_sub(bc);
-                    self.stats.spill_xacts_active = self.stats.spill_xacts_active.saturating_sub(1);
-                    Some(writer.finish().await?)
-                }
-                None => None,
-            };
-            let in_mem = std::mem::take(&mut st.in_mem);
-            sources.push(MergeSource::open(reader, in_mem, &mut gauge).await?);
+            if let Some(writer) = &st.spill {
+                let bc = writer.byte_count();
+                self.stats.spill_bytes_active = self.stats.spill_bytes_active.saturating_sub(bc);
+                self.stats.spill_xacts_active = self.stats.spill_xacts_active.saturating_sub(1);
+            }
             // Two producers push events: the worker at observe order and
             // the pump at capture time keyed bias-early valid_from — LSN
             // order is not arrival order. Stable sort keeps same-LSN
@@ -1238,6 +1236,16 @@ impl XactBuffer {
             let mut evs = std::mem::take(&mut st.events);
             evs.sort_by_key(|(lsn, _)| *lsn);
             events.push(evs.into());
+            parts.push((st.spill.take(), std::mem::take(&mut st.in_mem)));
+        }
+        for (spill, in_mem) in parts {
+            sources.push(match spill {
+                None => MergeSource::open_mem(in_mem, &mut gauge),
+                // Boxed: spill flush and reads stay off the per-commit future
+                Some(writer) => {
+                    Box::pin(MergeSource::open_spilled(writer, in_mem, &mut gauge)).await?
+                }
+            });
         }
         Ok(MergedDrain {
             sources,
@@ -1349,7 +1357,7 @@ impl XactBuffer {
         Ok(CommittedDrain {
             commit_ts,
             commit_lsn,
-            merged: Some(merged),
+            merged: Some(Box::new(merged)),
             generations: Vec::new(),
         })
     }
@@ -1543,22 +1551,33 @@ enum SpillSide {
 }
 
 impl MergeSource {
-    async fn open(
-        reader: Option<SpillReader>,
-        in_mem: Vec<SpillEntry>,
-        gauge: &mut ResidentGauge,
-    ) -> std::result::Result<Self, SpillError> {
-        // Tail entries are resident from the start (they left the buffer's
-        // `bytes_in_memory` at commit); spill entries join at decode.
+    /// Tail entries are resident from the start (they left the buffer's
+    /// `bytes_in_memory` at commit); spill entries join at decode
+    fn open_mem(in_mem: Vec<SpillEntry>, gauge: &mut ResidentGauge) -> Self {
         for e in &in_mem {
             gauge.add(approximate_size(e));
         }
-        if let Some(r) = &reader {
-            gauge.add(r.buffered_bytes());
+        let mut in_mem: VecDeque<SpillEntry> = in_mem.into();
+        Self {
+            head: in_mem.pop_front(),
+            spill: SpillSide::Unspilled,
+            in_mem,
         }
+    }
+
+    async fn open_spilled(
+        writer: SpillWriter,
+        in_mem: Vec<SpillEntry>,
+        gauge: &mut ResidentGauge,
+    ) -> std::result::Result<Self, SpillError> {
+        let reader = writer.finish().await?;
+        for e in &in_mem {
+            gauge.add(approximate_size(e));
+        }
+        gauge.add(reader.buffered_bytes());
         let mut src = Self {
             head: None,
-            spill: reader.map_or(SpillSide::Unspilled, SpillSide::Reading),
+            spill: SpillSide::Reading(reader),
             in_mem: in_mem.into(),
         };
         src.head = src.next_entry(gauge).await?;
@@ -2234,7 +2253,8 @@ pub struct CommittedDrain {
     pub commit_ts: i64,
     pub commit_lsn: u64,
     /// `None` for read-only / filter-dropped / unknown xid
-    merged: Option<MergedDrain>,
+    /// Boxed so the commit path moves a pointer, not the merge state
+    merged: Option<Box<MergedDrain>>,
     generations: Vec<Arc<ChunkGeneration>>,
 }
 
@@ -2307,6 +2327,17 @@ impl CommittedDrain {
             m.finish().await?;
         }
         Ok(())
+    }
+
+    /// Files on disk for [`Self::finish`] to unlink; without any, dropping
+    /// the drain is the whole finish
+    pub fn spilled(&self) -> bool {
+        self.merged.as_ref().is_some_and(|m| {
+            m.spool.is_some()
+                || m.sources
+                    .iter()
+                    .any(|s| !matches!(s.spill, SpillSide::Unspilled))
+        })
     }
 }
 
@@ -2390,6 +2421,15 @@ pub fn heap_reads_toast(heap: &DescribedHeap) -> bool {
 
 /// Append every on-disk toast pointer; carries `va_extinfo`/`va_rawsize`
 /// so store fetch can cap allocation.
+/// Whether [`detoast_heap`] has a value to resolve
+pub fn needs_detoast(heap: &DescribedHeap) -> bool {
+    [&heap.decoded.new, &heap.decoded.old]
+        .into_iter()
+        .flatten()
+        .flat_map(|t| &t.columns)
+        .any(|c| matches!(c, Some(ColumnValue::ExternalToast(_))))
+}
+
 fn collect_toast_pointers(
     t: Option<&crate::decode::heap_decoder::DecodedTuple>,
     out: &mut Vec<ToastPointer>,
@@ -2760,13 +2800,49 @@ impl BufferingDecoderSink {
     /// Timed acquire of the shared buffer mutex, so contention with the commit
     /// drain is measurable rather than inferred
     async fn lock_buffer(&self) -> tokio::sync::MutexGuard<'_, XactBuffer> {
+        self.stats.buffer_lock_waits.fetch_add(1, Ordering::Relaxed);
+        // Uncontended acquire blocks for nothing, so skip the clock
+        if let Ok(guard) = self.buffer.try_lock() {
+            return guard;
+        }
         let started = std::time::Instant::now();
         let guard = self.buffer.lock().await;
         self.stats
             .buffer_lock_wait_nanos
             .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
-        self.stats.buffer_lock_waits.fetch_add(1, Ordering::Relaxed);
         guard
+    }
+
+    /// Pure decode half of [`RecordSink::on_record`], for a dispatcher to run
+    /// ahead of the worker. `None` wherever the worker would not decode
+    /// against a live descriptor; the worker re-resolves and keeps the
+    /// result only on the same descriptor version
+    pub fn predecoder(&self) -> impl Fn(&Record<'_>) -> Option<Predecoded> + Send + Sync + 'static {
+        let logs = self.logs.clone();
+        move |record| {
+            let rm = record.parsed.header.resource_manager_id;
+            if rm != RmId::Heap as u8 && rm != RmId::Heap2 as u8 {
+                return None;
+            }
+            if rm == RmId::Heap as u8
+                && record.parsed.header.info & crate::decode::heap_decoder::XLOG_HEAP_OPMASK
+                    == crate::decode::heap_decoder::XLOG_HEAP_TRUNCATE
+            {
+                return None;
+            }
+            if !matches!(record.route, Route::ToDecoder | Route::ToBoth)
+                || record.defer_catalog_decode
+            {
+                return None;
+            }
+            let rfn = record.parsed.blocks.first()?.header.location.rel;
+            let (rel, valid_from) = logs
+                .get(rfn.db_node)?
+                .peek_spanned(rfn, record.source_lsn)
+                .ok()?;
+            let set = decode_heap_record(&record.parsed, record.source_lsn, &rel).ok()?;
+            Some(Predecoded::new(rel, valid_from, set))
+        }
     }
 
     pub fn new(logs: DescriptorLogs, buffer: Arc<Mutex<XactBuffer>>) -> Self {
@@ -2915,37 +2991,34 @@ impl BufferingDecoderSink {
 }
 
 impl BufferingDecoderSink {
-    async fn handle(&mut self, record: &Record<'_>) -> std::result::Result<(), SinkError> {
+    async fn handle(
+        &mut self,
+        record: &Record<'_>,
+        pre: Option<Predecoded>,
+    ) -> std::result::Result<(), SinkError> {
+        if !Self::wants(record) {
+            return Ok(());
+        }
         let rm = record.parsed.header.resource_manager_id;
-        // TRUNCATE rides Route::ToShadow (shadow replays it) but the
-        // decoder still fans out per-relid HeapOp::Truncate for CH.
-        // Handle before the Drop gate, regardless of filter score.
-        if rm == RmId::Heap as u8 {
-            let info_op = record.parsed.header.info & crate::decode::heap_decoder::XLOG_HEAP_OPMASK;
-            if info_op == crate::decode::heap_decoder::XLOG_HEAP_TRUNCATE {
-                return self.handle_truncate(record).await;
-            }
-        }
-        // Main-fork creation marker, also Route::ToShadow: gates stash
-        // admission and proves generation completeness for the rewrite
-        // barrier (records on a filenode cannot precede its creation)
-        if rm == RmId::Smgr as u8
-            && record.parsed.header.info & 0xF0 == crate::filter::main_data::XLOG_SMGR_CREATE
-            && let Some((rfn, fork)) =
-                crate::filter::main_data::parse_xl_smgr_create(&record.parsed.main_data)
-            && fork == crate::filter::main_data::MAIN_FORKNUM
+        if rm == RmId::Heap as u8
+            && record.parsed.header.info & crate::decode::heap_decoder::XLOG_HEAP_OPMASK
+                == crate::decode::heap_decoder::XLOG_HEAP_TRUNCATE
         {
-            self.lock_buffer().await.note_smgr_create(
-                record.parsed.header.xact_id,
-                rfn,
-                record.source_lsn,
-            );
-            return Ok(());
+            return Box::pin(self.handle_truncate(record)).await;
         }
-        if !matches!(record.route, Route::ToDecoder | Route::ToBoth) {
-            return Ok(());
-        }
-        if rm != RmId::Heap as u8 && rm != RmId::Heap2 as u8 {
+        // Gates stash admission and proves generation completeness for the
+        // rewrite barrier (records on a filenode cannot precede its creation)
+        if rm == RmId::Smgr as u8 {
+            if let Some((rfn, fork)) =
+                crate::filter::main_data::parse_xl_smgr_create(&record.parsed.main_data)
+                && fork == crate::filter::main_data::MAIN_FORKNUM
+            {
+                self.lock_buffer().await.note_smgr_create(
+                    record.parsed.header.xact_id,
+                    rfn,
+                    record.source_lsn,
+                );
+            }
             return Ok(());
         }
         let Some(rfn) = record.parsed.blocks.first().map(|b| b.header.location.rel) else {
@@ -2986,7 +3059,7 @@ impl BufferingDecoderSink {
             && maybe_stashed
             && self.lock_buffer().await.is_stash_candidate(txn_xid, rfn)
         {
-            return self.stash_invisible(record, rfn).await;
+            return Box::pin(self.stash_invisible(record, rfn)).await;
         }
         let sampled = self
             .span_registry
@@ -3031,7 +3104,7 @@ impl BufferingDecoderSink {
             // still-open xact (same-xact CREATE / TRUNCATE / rewrite
             // generation) or already superseded — resolve at commit
             Err(LookupResult::NotCovered | LookupResult::Dropped) => {
-                return self.stash_invisible(record, rfn).await;
+                return Box::pin(self.stash_invisible(record, rfn)).await;
             }
             // Inside a published interval: reachable on a re-read whose
             // start sits past the dirty tree's first touch, so the
@@ -3051,7 +3124,7 @@ impl BufferingDecoderSink {
                     }
                     .into());
                 }
-                return self.stash_invisible(record, rfn).await;
+                return Box::pin(self.stash_invisible(record, rfn)).await;
             }
             // Rotated away: every record on this rfn precedes the
             // rotation (AccessExclusiveLock), so a Retired answer means
@@ -3063,7 +3136,9 @@ impl BufferingDecoderSink {
                 return Ok(());
             }
         };
-        let decoded_set = {
+        let decoded_set = if let Some(set) = pre.and_then(|p| p.take_if(&rel, rel_valid_from)) {
+            set
+        } else {
             let _decode = decode_parent.as_ref().map(|p| {
                 tracing::info_span!(target: "walshadow::trace", parent: p, "decode").entered()
             });
@@ -3186,9 +3261,28 @@ impl BufferingDecoderSink {
 }
 
 impl RecordSink for BufferingDecoderSink {
-    fn wants(&self, record: &Record<'_>) -> bool {
-        let rm = record.parsed.header.resource_manager_id;
-        rm == RmId::Heap as u8 || rm == RmId::Heap2 as u8 || rm == RmId::Smgr as u8
+    fn wants(record: &Record<'_>) -> bool {
+        use crate::decode::heap_decoder::{
+            XLOG_HEAP_CONFIRM, XLOG_HEAP_LOCK, XLOG_HEAP_OPMASK, XLOG_HEAP_TRUNCATE,
+            XLOG_HEAP2_MULTI_INSERT,
+        };
+        let header = &record.parsed.header;
+        let rm = header.resource_manager_id;
+        let op = header.info & XLOG_HEAP_OPMASK;
+        let routed = matches!(record.route, Route::ToDecoder | Route::ToBoth);
+        if rm == RmId::Heap as u8 {
+            // TRUNCATE rides Route::ToShadow (shadow replays it) but still
+            // fans out per-relid HeapOp::Truncate for CH. LOCK and CONFIRM
+            // change no row; other ops reach the stash's fail-closed check
+            op == XLOG_HEAP_TRUNCATE || routed && op != XLOG_HEAP_LOCK && op != XLOG_HEAP_CONFIRM
+        } else if rm == RmId::Heap2 as u8 {
+            // Other Heap2 ops are page maintenance
+            routed && op == XLOG_HEAP2_MULTI_INSERT
+        } else {
+            // Main-fork creation marker, also Route::ToShadow
+            rm == RmId::Smgr as u8
+                && header.info & 0xF0 == crate::filter::main_data::XLOG_SMGR_CREATE
+        }
     }
 
     fn on_record<'a>(
@@ -3196,17 +3290,19 @@ impl RecordSink for BufferingDecoderSink {
         record: &'a Record<'a>,
     ) -> Pin<Box<dyn std::future::Future<Output = std::result::Result<(), SinkError>> + Send + 'a>>
     {
-        Box::pin(self.handle(record))
+        Box::pin(self.handle(record, None))
     }
 
     fn on_records<'a>(
         &'a mut self,
         batch: &'a [Record<'a>],
+        pre: &'a mut [Option<Predecoded>],
     ) -> Pin<Box<dyn std::future::Future<Output = std::result::Result<(), SinkError>> + Send + 'a>>
     {
         Box::pin(async move {
-            for record in batch {
-                self.handle(record).await?;
+            for (i, record) in batch.iter().enumerate() {
+                let pre = pre.get_mut(i).and_then(Option::take);
+                self.handle(record, pre).await?;
             }
             Ok(())
         })

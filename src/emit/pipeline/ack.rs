@@ -29,6 +29,7 @@ use crate::crash_test;
 use crate::emit::pipeline::Fatal;
 use crate::pos::{AckFrontier, EmitterAck, Gate, GateClosed, Monotone, Pos};
 
+#[derive(Debug)]
 pub enum AckEvent {
     /// In seq order, no gaps. `publish: false` marks a non-final slice of a
     /// multi-seq commit: done-ness gates contiguity, `commit_lsn` never
@@ -49,6 +50,8 @@ pub enum AckEvent {
     Trailing {
         lsn: u64,
     },
+    /// Events applied in order, published once
+    Batch(Vec<AckEvent>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -175,6 +178,11 @@ impl AckState {
     }
 
     pub fn apply(&mut self, ev: AckEvent) {
+        self.step_event(ev);
+        self.publish();
+    }
+
+    fn step_event(&mut self, ev: AckEvent) {
         match ev {
             AckEvent::Register {
                 seq,
@@ -188,8 +196,12 @@ impl AckState {
                 }
             }
             AckEvent::Trailing { lsn } => self.trailing = self.trailing.max(lsn),
+            AckEvent::Batch(evs) => {
+                for ev in evs {
+                    self.step_event(ev);
+                }
+            }
         }
-        self.publish();
     }
 
     fn open_seq(&mut self, seq: u64, commit_lsn: u64, publish: bool) {
@@ -349,6 +361,7 @@ impl AckHandle {
         SeqAlloc {
             tx: self.tx.clone(),
             next: first,
+            held: None,
         }
     }
 }
@@ -367,9 +380,25 @@ pub enum Publish {
 pub struct SeqAlloc {
     tx: mpsc::UnboundedSender<AckEvent>,
     next: u64,
+    /// Events awaiting [`Self::send_registered`] / [`Self::send_placed`];
+    /// `None` sends each as it happens
+    held: Option<Held>,
+}
+
+#[derive(Debug, Default)]
+struct Held {
+    registered: Vec<AckEvent>,
+    placed: Vec<AckEvent>,
 }
 
 impl SeqAlloc {
+    /// Hold registrations and placements for bulk sends, so a run of small
+    /// commits wakes the collector once rather than twice per seq
+    pub fn held(mut self) -> Self {
+        self.held = Some(Held::default());
+        self
+    }
+
     /// One past the last opened seq
     pub const fn next(&self) -> u64 {
         self.next
@@ -378,11 +407,16 @@ impl SeqAlloc {
     pub fn open(&mut self, commit_lsn: u64, publish: Publish) -> OpenSeq {
         let seq = self.next;
         self.next += 1;
-        let _ = self.tx.send(AckEvent::Register {
+        let ev = AckEvent::Register {
             seq,
             commit_lsn,
             publish: publish == Publish::Commit,
-        });
+        };
+        if let Some(held) = &mut self.held {
+            held.registered.push(ev);
+        } else {
+            let _ = self.tx.send(ev);
+        }
         OpenSeq {
             tx: self.tx.clone(),
             seq,
@@ -391,7 +425,39 @@ impl SeqAlloc {
 
     /// Ordering marker carrying no rows
     pub fn mark(&mut self, commit_lsn: u64) {
-        self.open(commit_lsn, Publish::Commit).place(0);
+        let seq = self.open(commit_lsn, Publish::Commit);
+        self.place(seq, 0);
+    }
+
+    /// [`OpenSeq::place`], held while this allocator holds
+    pub fn place(&mut self, seq: OpenSeq, rows: u64) {
+        let Some(held) = &mut self.held else {
+            return seq.place(rows);
+        };
+        held.placed.push(AckEvent::Placed { seq: seq.seq, rows });
+    }
+
+    /// Held registrations must reach the collector before their rows reach
+    /// the batcher, else an insert ack can beat its seq's registration
+    pub fn send_registered(&mut self) {
+        if let Some(held) = &mut self.held
+            && !held.registered.is_empty()
+        {
+            let _ = self
+                .tx
+                .send(AckEvent::Batch(std::mem::take(&mut held.registered)));
+        }
+    }
+
+    /// Held placements go once their rows are on the batcher channel
+    pub fn send_placed(&mut self) {
+        if let Some(held) = &mut self.held
+            && !held.placed.is_empty()
+        {
+            let _ = self
+                .tx
+                .send(AckEvent::Batch(std::mem::take(&mut held.placed)));
+        }
     }
 }
 

@@ -1231,6 +1231,7 @@ pub(crate) async fn run_session(
             raw_start.get(),
         )
         .await?;
+    let predecode = Arc::new(decoder.predecoder());
     let decoder_xact = QueueingRecordSink::spawn(
         DecoderXactPair {
             decoder,
@@ -1239,7 +1240,8 @@ pub(crate) async fn run_session(
         decoder_batch_size,
         decoder_queue_capacity,
         span_registry.clone(),
-    );
+    )
+    .with_predecode(predecode);
     let boundary_gate = CatalogBoundaryGate::new(
         shadow_state.clone(),
         BoundaryGateConfig {
