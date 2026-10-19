@@ -3451,7 +3451,7 @@ impl RecordSink for BufferingDecoderSink {
     ) -> Pin<Box<dyn std::future::Future<Output = std::result::Result<(), SinkError>> + Send + 'a>>
     {
         Box::pin(async move {
-            for (i, record) in batch.iter().enumerate() {
+            for (i, record) in batch.iter().enumerate().filter(|(_, r)| Self::wants(r)) {
                 let pre = pre.get_mut(i).and_then(Option::take);
                 self.handle(record, pre).await?;
             }
