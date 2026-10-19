@@ -39,6 +39,7 @@ use walshadow::segment_sink::{DirSegmentSink, SegFsync};
 use walshadow::source_db::{DbLink, DbLinkConfig, SourceDb, SourceDbs};
 use walshadow::source_feed::{SourceEvent, SourceFeed, StandbyStatus};
 use walshadow::timeline::TimelineHistory;
+use walshadow::trace::TxnSpanRegistry;
 use walshadow::transition::{
     CrossingState, ForkGuards, PrefixOrigin, Switchover, TimelineStats, load_boot_history,
     seed_shadow_branches,
@@ -904,7 +905,14 @@ async fn session_body(
         xact_buf_cfg.drain_batch_rows = cfg.drain_batch_rows;
         xact_buf_cfg.drain_batch_bytes = cfg.drain_batch_bytes;
     }
-    let xact_buffer = XactBuffer::new(xact_buf_cfg).context("init xact buffer / spill dir")?;
+    // Txn-span registry, shared by pump + decoder + buffer; `Some` only with OTLP on
+    let span_registry = (args.otlp_endpoint.is_some()
+        || std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").is_ok())
+    .then(TxnSpanRegistry::new);
+    let mut xact_buffer = XactBuffer::new(xact_buf_cfg).context("init xact buffer / spill dir")?;
+    if let Some(reg) = &span_registry {
+        xact_buffer = xact_buffer.with_span_registry(reg.clone());
+    }
     xact_buffer
         .clear_spill_dir()
         .context("clear stale spill files")?;
@@ -1034,13 +1042,6 @@ async fn session_body(
     let desc_log = desc_logs[primary_index].clone();
     let all_desc_logs = walshadow::desc_log::DescriptorLogs::new(desc_logs.clone());
 
-    // Txn-span registry, shared by pump + decoder; `Some` only with OTLP on.
-    let span_registry =
-        if args.otlp_endpoint.is_some() || std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").is_ok() {
-            Some(xact_buffer.lock().await.span_registry())
-        } else {
-            None
-        };
     let stash_live = xact_buffer.lock().await.stash_live();
     let mut decoder = BufferingDecoderSink::new(all_desc_logs.clone(), xact_buffer.clone())
         .with_stash_live(stash_live);
