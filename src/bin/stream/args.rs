@@ -139,7 +139,10 @@ pub(crate) struct Args {
     /// segment boundary.
     #[arg(long, value_parser = walshadow::pg::parse_pg_lsn)]
     pub(crate) start_lsn: Option<u64>,
-    #[arg(long, default_value_t = 10)]
+
+    /// Seconds between periodic standby status replies and resume manifest writes.
+    /// Must be positive. PostgreSQL retains WAL until status replies allow removal.
+    #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u64).range(1..))]
     pub(crate) status_interval: u64,
 
     /// Concurrent archive fetches, each holding at most one WAL segment.
