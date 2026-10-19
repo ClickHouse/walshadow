@@ -404,6 +404,17 @@ impl RecordSink for BoundaryHoldSink {
             self.inner.flush().await
         })
     }
+
+    fn on_record_owned(
+        &mut self,
+        record: Record<'static>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + '_>> {
+        if !self.may_park(&record) {
+            return self.inner.on_record_owned(record);
+        }
+        // Rare, so parking keeps its one by-reference path
+        Box::pin(async move { self.on_record(&record).await })
+    }
 }
 
 #[cfg(test)]

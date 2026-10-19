@@ -184,7 +184,7 @@ mod tests {
         for seg in &segs {
             sink.on_segment(*seg, &[0u8; 64]).await.unwrap();
         }
-        drop(sink);
+        sink.close().await.unwrap();
         let durable = Arc::new(Monotone::new(Pos::new(0)));
         let fatal = walshadow::pipeline::Fatal::new();
         spawn_segment_fsync(tmp.path().to_path_buf(), rx, durable.clone(), fatal.clone())

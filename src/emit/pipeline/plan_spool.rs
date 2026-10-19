@@ -126,10 +126,11 @@ pub struct PlanWriter {
     routed_count: u64,
     sealed: bool,
     /// Dictionary ids by `(descriptor Arc identity, valid_from)`; the held
-    /// Arc in `descriptors` keeps each pointer live and unique
-    desc_ids: HashMap<(usize, u64), u32>,
+    /// Arc in `descriptors` keeps each pointer live and unique. Built at
+    /// spill, memory plans never seed a hasher
+    desc_ids: Option<HashMap<(usize, u64), u32>>,
     descriptors: Vec<(Arc<RelDescriptor>, u64)>,
-    route_ids: HashMap<usize, u32>,
+    route_ids: Option<HashMap<usize, u32>>,
     routes: Vec<Arc<RouteSnapshot>>,
     controls: Vec<OrderedEvent>,
     row_batches: Vec<ToastRowBatch>,
@@ -150,9 +151,9 @@ impl PlanWriter {
             heap_count: 0,
             routed_count: 0,
             sealed: false,
-            desc_ids: HashMap::new(),
+            desc_ids: None,
             descriptors: Vec::new(),
-            route_ids: HashMap::new(),
+            route_ids: None,
             routes: Vec::new(),
             controls: Vec::new(),
             row_batches: Vec::new(),
@@ -174,8 +175,9 @@ impl PlanWriter {
         route: Option<Arc<RouteSnapshot>>,
     ) -> Result<()> {
         let routed = route.is_some();
+        let heap = RoutedHeap::new(heap, route);
         if let PlanSink::Mem(_) = &self.sink {
-            let needed = self.bytes + MEM_FRAME_OVERHEAD + heap.decoded.approx_bytes() as u64;
+            let needed = self.bytes + MEM_FRAME_OVERHEAD + heap.bytes as u64;
             if needed > self.mem_max {
                 self.spill()?;
             } else if needed > self.cap {
@@ -186,13 +188,10 @@ impl PlanWriter {
             }
         }
         if let PlanSink::Mem(heaps) = &mut self.sink {
-            self.bytes += MEM_FRAME_OVERHEAD + heap.decoded.approx_bytes() as u64;
-            heaps.push(RoutedHeap {
-                described: heap,
-                route,
-            });
+            self.bytes += MEM_FRAME_OVERHEAD + heap.bytes as u64;
+            heaps.push(heap);
         } else {
-            self.encode_heap(&heap, route.as_ref())?;
+            self.encode_heap(&heap.described, heap.route.as_ref())?;
         }
         self.heap_count += 1;
         if routed {
@@ -228,15 +227,20 @@ impl PlanWriter {
             heap.descriptor_valid_from,
         );
         let next_id = self.descriptors.len() as u32;
-        let dict_id = *self.desc_ids.entry(desc_key).or_insert_with(|| {
-            self.descriptors
-                .push((heap.descriptor.clone(), heap.descriptor_valid_from));
-            next_id
-        });
+        let dict_id = *self
+            .desc_ids
+            .get_or_insert_with(HashMap::new)
+            .entry(desc_key)
+            .or_insert_with(|| {
+                self.descriptors
+                    .push((heap.descriptor.clone(), heap.descriptor_valid_from));
+                next_id
+            });
         let route_id = if let Some(r) = route {
             let next_id = self.routes.len() as u32;
             *self
                 .route_ids
+                .get_or_insert_with(HashMap::new)
                 .entry(Arc::as_ptr(r) as usize)
                 .or_insert_with(|| {
                     self.routes.push(r.clone());
@@ -603,14 +607,14 @@ impl<'p> PlanReader<'p> {
                     };
                     Some(r.clone())
                 };
-                Ok(Some(RoutedHeap {
-                    described: DescribedHeap {
+                Ok(Some(RoutedHeap::new(
+                    DescribedHeap {
                         decoded,
                         descriptor,
                         descriptor_valid_from: valid_from,
                     },
                     route,
-                }))
+                )))
             }
             Some(&TAG_SEAL) => {
                 let count = u64::from_le_bytes(

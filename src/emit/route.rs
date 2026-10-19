@@ -288,6 +288,20 @@ impl FrozenRoutes {
 pub struct RoutedHeap {
     pub described: DescribedHeap,
     pub route: Option<Arc<RouteSnapshot>>,
+    /// [`DecodedHeap::approx_bytes`](crate::decode::heap_decoder::DecodedHeap::approx_bytes)
+    /// measured once, as every stage downstream budgets by it
+    pub bytes: usize,
+}
+
+impl RoutedHeap {
+    pub fn new(described: DescribedHeap, route: Option<Arc<RouteSnapshot>>) -> Self {
+        let bytes = described.decoded.approx_bytes();
+        Self {
+            described,
+            route,
+            bytes,
+        }
+    }
 }
 
 #[cfg(test)]

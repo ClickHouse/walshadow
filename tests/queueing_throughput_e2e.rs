@@ -23,7 +23,7 @@ use walshadow::shadow::Shadow;
 
 const COLUMNS: usize = 38;
 const CLIENTS: usize = 16;
-const RUN_SECONDS: u64 = 40;
+const RUN_SECONDS: u64 = 80;
 const DRAIN_WARMUP_SECONDS: u64 = 2;
 const DRAIN_SECONDS: u64 = 6;
 

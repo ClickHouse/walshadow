@@ -53,6 +53,8 @@ pub fn place_rows(
             continue;
         }
         let heap = envelope.described;
+        // Ext render and tombstone split leave payload roughly unchanged
+        buf_bytes += envelope.bytes;
         let rel = heap.descriptor;
         let mut committed = CommittedTuple {
             decoded: heap.decoded,
@@ -73,7 +75,6 @@ pub fn place_rows(
                 decoded: tomb,
                 ..committed
             };
-            buf_bytes += tomb.decoded.approx_bytes();
             buf.push(RoutedRow {
                 seq,
                 rel: rel.clone(),
@@ -83,7 +84,6 @@ pub fn place_rows(
             });
             routed += 1;
         }
-        buf_bytes += committed.decoded.approx_bytes();
         buf.push(RoutedRow {
             seq,
             rel,
@@ -160,8 +160,8 @@ mod tests {
             HeapOp::Delete => (None, tuple),
             _ => (tuple, None),
         };
-        RoutedHeap {
-            described: DescribedHeap {
+        RoutedHeap::new(
+            DescribedHeap {
                 decoded: DecodedHeap {
                     rfn: RFN,
                     xid: 7,
@@ -173,8 +173,8 @@ mod tests {
                 descriptor: rel(),
                 descriptor_valid_from: 0x40,
             },
-            route: Some(route),
-        }
+            Some(route),
+        )
     }
 
     fn route(system: SystemColumns) -> Arc<RouteSnapshot> {

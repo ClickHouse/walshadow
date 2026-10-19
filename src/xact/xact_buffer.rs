@@ -413,6 +413,8 @@ struct XactState {
     /// WAL-order by arrival
     in_mem: Vec<SpillEntry>,
     in_mem_bytes: usize,
+    /// Every entry so far is a non-truncate heap
+    plain: bool,
     /// `None` until first eviction
     spill: Option<SpillWriter>,
     spill_bytes: u64,
@@ -431,7 +433,7 @@ struct XactState {
 }
 
 impl XactState {
-    fn new(first_lsn: u64, span: tracing::Span) -> Self {
+    fn new(first_lsn: u64, span: tracing::Span, hasher: ahash::RandomState) -> Self {
         let wait_span = trace_span!(
             !span.is_none(),
             parent: &span,
@@ -442,10 +444,11 @@ impl XactState {
             first_lsn: Pos::new(first_lsn),
             in_mem: Vec::new(),
             in_mem_bytes: 0,
+            plain: true,
             spill: None,
             spill_bytes: 0,
             events: Vec::new(),
-            stash_rfns: HashMap::new(),
+            stash_rfns: HashMap::with_hasher(hasher),
             span,
             _wait_span: wait_span,
         }
@@ -993,6 +996,8 @@ impl XactBuffer {
             self.stats.xacts_total += 1;
         }
         let registry = &self.span_registry;
+        // Cloned, a fresh seed per xact shows in profiles
+        let hasher = self.inflight.hasher().clone();
         self.inflight.entry(xid).or_insert_with(|| {
             let span = registry.adopt(xid).unwrap_or_else(|| {
                 if registry.is_sampled(xid) {
@@ -1001,7 +1006,7 @@ impl XactBuffer {
                     tracing::Span::none()
                 }
             });
-            XactState::new(first_lsn, span)
+            XactState::new(first_lsn, span, hasher)
         })
     }
 
@@ -1087,6 +1092,14 @@ impl XactBuffer {
     /// Union of stash candidates across the finishing tree, rfn-ordered for
     /// deterministic resolution; marks merge (min LSN, sticky payload_free)
     pub fn stash_candidates(&self, xids: &[u32]) -> Vec<(RelFileNode, StashMark)> {
+        let stashed = |x: &u32| {
+            self.inflight
+                .get(x)
+                .is_some_and(|st| !st.stash_rfns.is_empty())
+        };
+        if !xids.iter().any(stashed) {
+            return Vec::new();
+        }
         let mut merged: HashMap<RelFileNode, StashMark> = HashMap::new();
         for x in xids {
             if let Some(st) = self.inflight.get(x) {
@@ -1149,7 +1162,9 @@ impl XactBuffer {
     ) -> std::result::Result<(), XactBufferError> {
         let sz = approximate_size(&entry);
         let raw_sz = matches!(&entry, SpillEntry::Raw(_)).then_some(sz as u64);
+        let plain = matches!(&entry, SpillEntry::Heap(h) if h.decoded.op != HeapOp::Truncate);
         let st = self.state_for(xid, first_lsn);
+        st.plain &= plain;
         st.in_mem.push(entry);
         st.in_mem_bytes += sz;
         self.bytes_in_memory += sz;
@@ -1342,6 +1357,30 @@ impl XactBuffer {
             None if states.iter().all(|st| st.stash_rfns.is_empty()) => StashResolution::default(),
             None => return Err(XactBufferError::MissingStashResolution { top_xid }),
         };
+        // Lone in-memory xact of plain heaps: arrival is WAL order, nothing
+        // to merge, fold or fence
+        if let [st] = states.as_mut_slice()
+            && st.plain
+            && st.spill.is_none()
+            && st.events.is_empty()
+        {
+            let heaps = std::mem::take(&mut st.in_mem)
+                .into_iter()
+                .map(|entry| {
+                    let SpillEntry::Heap(h) = entry else {
+                        unreachable!("plain state holds heaps only");
+                    };
+                    *h
+                })
+                .collect();
+            self.stats.committed_xacts_total += 1;
+            return Ok(CommittedDrain {
+                commit_ts,
+                commit_lsn,
+                merged: Some(Drained::Heaps(heaps)),
+                generations: Vec::new(),
+            });
+        }
         let allowed_xids = xids.iter().copied().collect();
         let merged = self
             .open_drain(
@@ -1357,7 +1396,7 @@ impl XactBuffer {
         Ok(CommittedDrain {
             commit_ts,
             commit_lsn,
-            merged: Some(Box::new(merged)),
+            merged: Some(Drained::Merged(Box::new(merged))),
             generations: Vec::new(),
         })
     }
@@ -2049,7 +2088,7 @@ impl MergedDrain {
         ToastRowBatch {
             rows: std::mem::take(&mut self.rows),
             spool: self.spool_handle(),
-            _resident: resident,
+            resident: Some(resident),
         }
     }
 
@@ -2116,10 +2155,11 @@ impl std::ops::Deref for ChunkGeneration {
 /// WAL-ordered mirror row refs with their resident-gauge share (ref
 /// metadata only — Mem bodies are shared with the generation's map and
 /// charged there); bytes count until the batch drops after its store put.
+#[derive(Default)]
 pub struct ToastRowBatch {
     rows: Vec<ToastRowRef>,
     spool: Option<Arc<BodySpoolFile>>,
-    _resident: ResidentGauge,
+    resident: Option<ResidentGauge>,
 }
 
 impl ToastRowBatch {
@@ -2130,7 +2170,7 @@ impl ToastRowBatch {
     /// Gauged resident bytes (ref metadata; bodies count under the
     /// owning generation)
     pub fn resident_bytes(&self) -> usize {
-        self._resident.held as usize
+        self.resident.as_ref().map_or(0, |g| g.held as usize)
     }
 }
 
@@ -2253,9 +2293,15 @@ pub struct CommittedDrain {
     pub commit_ts: i64,
     pub commit_lsn: u64,
     /// `None` for read-only / filter-dropped / unknown xid
-    /// Boxed so the commit path moves a pointer, not the merge state
-    merged: Option<Box<MergedDrain>>,
+    merged: Option<Drained>,
     generations: Vec<Arc<ChunkGeneration>>,
+}
+
+enum Drained {
+    /// Boxed so the commit path moves a pointer, not the merge state
+    Merged(Box<MergedDrain>),
+    /// WAL-ordered heaps needing no merge, taken whole by the first slice
+    Heaps(Vec<DescribedHeap>),
 }
 
 impl CommittedDrain {
@@ -2274,8 +2320,20 @@ impl CommittedDrain {
         max_bytes: usize,
         budget: Option<&crate::budget::MemoryBudget>,
     ) -> std::result::Result<Option<DrainedBatch>, XactBufferError> {
-        let Some(m) = self.merged.as_mut() else {
-            return Ok(None);
+        let m = match self.merged.as_mut() {
+            None => return Ok(None),
+            Some(Drained::Merged(m)) => m,
+            Some(Drained::Heaps(heaps)) if heaps.is_empty() => return Ok(None),
+            Some(Drained::Heaps(heaps)) => {
+                return Ok(Some(DrainedBatch {
+                    heaps: std::mem::take(heaps),
+                    ordered_events: Vec::new(),
+                    chunks: Vec::new(),
+                    new_rows: ToastRowBatch::default(),
+                    truncate_rows: Vec::new(),
+                    is_final: true,
+                }));
+            }
         };
         let mut heaps: Vec<DescribedHeap> = Vec::new();
         let mut ordered_events: Vec<OrderedEvent> = Vec::new();
@@ -2323,7 +2381,7 @@ impl CommittedDrain {
     /// error path drop instead: files stay for inspection, startup wipe +
     /// redecode-from-ack cover replay.
     pub async fn finish(mut self) -> std::result::Result<(), XactBufferError> {
-        if let Some(m) = self.merged.take() {
+        if let Some(Drained::Merged(m)) = self.merged.take() {
             m.finish().await?;
         }
         Ok(())
@@ -2332,12 +2390,13 @@ impl CommittedDrain {
     /// Files on disk for [`Self::finish`] to unlink; without any, dropping
     /// the drain is the whole finish
     pub fn spilled(&self) -> bool {
-        self.merged.as_ref().is_some_and(|m| {
-            m.spool.is_some()
-                || m.sources
-                    .iter()
-                    .any(|s| !matches!(s.spill, SpillSide::Unspilled))
-        })
+        let Some(Drained::Merged(m)) = &self.merged else {
+            return false;
+        };
+        m.spool.is_some()
+            || m.sources
+                .iter()
+                .any(|s| !matches!(s.spill, SpillSide::Unspilled))
     }
 }
 
@@ -5847,10 +5906,10 @@ mod tests {
             .drain_committed(StashResolved::nothing_stashed(4), 0, 0x9000, &[], false)
             .await
             .unwrap();
-        let read_buffers = drain
-            .merged
-            .as_ref()
-            .unwrap()
+        let Some(Drained::Merged(merged)) = &drain.merged else {
+            panic!("spilled xact drains through the merge");
+        };
+        let read_buffers = merged
             .sources
             .iter()
             .filter_map(|s| {

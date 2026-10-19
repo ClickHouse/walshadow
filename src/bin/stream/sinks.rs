@@ -115,4 +115,15 @@ impl RecordSink for DaemonSinks {
         // Inner future as is: one boxed future per record, not one per layer
         self.decoder_xact.on_record(record)
     }
+
+    fn on_record_owned(
+        &mut self,
+        record: Record<'static>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + '_>> {
+        if let Some(reg) = &self.span_registry {
+            reg.open(record.parsed.header.xact_id, record.source_lsn);
+        }
+        self.metrics.observe(&record);
+        self.decoder_xact.on_record_owned(record)
+    }
 }

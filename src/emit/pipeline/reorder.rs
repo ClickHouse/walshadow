@@ -990,7 +990,7 @@ impl ReorderSink {
                 }
                 PlanItem::Heap(h) => {
                     rows_total += 1;
-                    pending_bytes += h.described.approx_bytes();
+                    pending_bytes += h.bytes;
                     pending.push(h);
                     if pending.len() >= self.batch_rows || pending_bytes >= self.batch_bytes {
                         self.dispatch_planned(
@@ -1131,20 +1131,26 @@ impl ReorderSink {
                     .as_ref()
                     .map(|scope| scope.db.row_policy())
                     .unwrap_or_default();
-                let cached = self.route_cache.take().filter(|c| {
-                    c.matches(db, &self.route_mapping, &self.route_config, &row_policy)
-                });
+                let maps = match self.route_cache.take() {
+                    Some(c)
+                        if c.matches(db, &self.route_mapping, &self.route_config, &row_policy) =>
+                    {
+                        c.maps
+                    }
+                    Some(mut c) => {
+                        c.maps.clear();
+                        c.maps
+                    }
+                    None => RouteMaps::default(),
+                };
                 let mut view = ReorderRouteView::new(
                     self.route_mapping.clone(),
                     self.route_config.clone(),
                     row_policy.clone(),
                     scope.and_then(|scope| scope.applicator.as_mut()),
                     self.stats.clone(),
+                    maps,
                 );
-                if let Some(c) = cached {
-                    view.memo = c.memo;
-                    view.owned = c.owned;
-                }
                 let resolver = self.resolver.clone();
                 let (batch_rows, batch_bytes) = (self.batch_rows, self.batch_bytes);
                 let budget = self.budget.clone();
@@ -1182,14 +1188,19 @@ impl ReorderSink {
                     SinkError::Other(format!("plan seal: {e}"))
                 })?;
                 // Folded catalog events make routes this transaction's own
-                if view.overlay.is_empty() {
+                let ReorderRouteView {
+                    mapping,
+                    config,
+                    maps,
+                    ..
+                } = view;
+                if maps.overlay.is_empty() {
                     self.route_cache = Some(RouteCache {
                         db,
-                        mapping: view.mapping.take(),
-                        config: view.config.take(),
+                        mapping,
+                        config,
                         policy: row_policy,
-                        memo: std::mem::take(&mut view.memo),
-                        owned: std::mem::take(&mut view.owned),
+                        maps,
                     });
                 }
                 plan
@@ -1311,8 +1322,7 @@ struct RouteCache {
     mapping: Option<MappingSnapshot>,
     config: Option<Arc<ResolvedConfig>>,
     policy: RowPolicy,
-    memo: HashMap<RelName, (Arc<RelDescriptor>, Option<Arc<RouteSnapshot>>)>,
-    owned: HashMap<RelName, Option<Arc<RouteSnapshot>>>,
+    maps: RouteMaps,
 }
 
 impl RouteCache {
@@ -1348,6 +1358,16 @@ impl RouteCache {
 pub struct ReorderRouteView<'a> {
     mapping: Option<MappingSnapshot>,
     config: Option<Arc<ResolvedConfig>>,
+    maps: RouteMaps,
+    row_policy: RowPolicy,
+    applicator: Option<&'a mut DdlApplicator>,
+    stats: Arc<EmitterStats>,
+}
+
+/// Lookups a route view fills. Outlive the view so later commits skip
+/// rebuilding them, or at least their allocation and hasher seeding
+#[derive(Default)]
+pub struct RouteMaps {
     /// Catalog fold above `mapping`; `None` value = locally dropped
     overlay: HashMap<RelName, Option<Arc<TableMapping>>>,
     /// Routes by row relation, partitions resolved through their root. The
@@ -1356,9 +1376,14 @@ pub struct ReorderRouteView<'a> {
     memo: HashMap<RelName, (Arc<RelDescriptor>, Option<Arc<RouteSnapshot>>)>,
     /// Routes by owning relation
     owned: HashMap<RelName, Option<Arc<RouteSnapshot>>>,
-    row_policy: RowPolicy,
-    applicator: Option<&'a mut DdlApplicator>,
-    stats: Arc<EmitterStats>,
+}
+
+impl RouteMaps {
+    fn clear(&mut self) {
+        self.overlay.clear();
+        self.memo.clear();
+        self.owned.clear();
+    }
 }
 
 impl<'a> ReorderRouteView<'a> {
@@ -1368,13 +1393,12 @@ impl<'a> ReorderRouteView<'a> {
         row_policy: RowPolicy,
         applicator: Option<&'a mut DdlApplicator>,
         stats: Arc<EmitterStats>,
+        maps: RouteMaps,
     ) -> Self {
         Self {
             mapping,
             config,
-            overlay: HashMap::new(),
-            memo: HashMap::new(),
-            owned: HashMap::new(),
+            maps,
             row_policy,
             applicator,
             stats,
@@ -1384,10 +1408,10 @@ impl<'a> ReorderRouteView<'a> {
 
 impl ReorderRouteView<'_> {
     fn owned_route(&mut self, rel_name: &RelName) -> Option<Arc<RouteSnapshot>> {
-        if let Some(r) = self.owned.get(rel_name) {
+        if let Some(r) = self.maps.owned.get(rel_name) {
             return r.clone();
         }
-        let mapped = if let Some(o) = self.overlay.get(rel_name) {
+        let mapped = if let Some(o) = self.maps.overlay.get(rel_name) {
             o.clone()
         } else {
             self.mapping.as_ref().and_then(|m| m.get(rel_name)).cloned()
@@ -1400,7 +1424,7 @@ impl ReorderRouteView<'_> {
             let policy = self.row_policy.for_rel(self.config.as_deref(), rel_name);
             RouteSnapshot::freeze(m, rules, policy)
         });
-        self.owned.insert(rel_name.clone(), route.clone());
+        self.maps.owned.insert(rel_name.clone(), route.clone());
         route
     }
 }
@@ -1408,7 +1432,7 @@ impl ReorderRouteView<'_> {
 impl PlanRouteView for ReorderRouteView<'_> {
     fn route_for(&mut self, heap: &DescribedHeap) -> Option<Arc<RouteSnapshot>> {
         let rel_name = &heap.descriptor.rel_name;
-        let route = if let Some((desc, r)) = self.memo.get(rel_name)
+        let route = if let Some((desc, r)) = self.maps.memo.get(rel_name)
             && Arc::ptr_eq(desc, &heap.descriptor)
         {
             r.clone()
@@ -1426,7 +1450,8 @@ impl PlanRouteView for ReorderRouteView<'_> {
                 &self.stats.route_snapshots_mapped
             };
             result.fetch_add(1, Ordering::Relaxed);
-            self.memo
+            self.maps
+                .memo
                 .insert(rel_name.clone(), (heap.descriptor.clone(), route.clone()));
             route
         };
@@ -1447,7 +1472,7 @@ impl PlanRouteView for ReorderRouteView<'_> {
             return Ok(());
         };
         // Schema events can change partition descriptors or root mappings
-        self.memo.clear();
+        self.maps.memo.clear();
         let mapping = self.mapping.clone().unwrap_or_default();
         let config = self.config.clone();
         let Some(app) = self.applicator.as_deref_mut() else {
@@ -1458,8 +1483,8 @@ impl PlanRouteView for ReorderRouteView<'_> {
             .await
             .map_err(|e| e.to_string())?
         {
-            self.owned.remove(&rel);
-            self.overlay.insert(rel, m.map(Arc::new));
+            self.maps.owned.remove(&rel);
+            self.maps.overlay.insert(rel, m.map(Arc::new));
         }
         Ok(())
     }
@@ -1592,6 +1617,7 @@ mod tests {
             RowPolicy::default(),
             None,
             stats,
+            RouteMaps::default(),
         );
         assert!(view.route_for(&heap_of(&planned)).is_some());
         assert!(view.route_for(&heap_of(&added)).is_none());

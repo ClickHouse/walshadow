@@ -1448,6 +1448,9 @@ pub(crate) async fn run_session(
     // Fast metrics-refresh tick (decoupled from cursor/status): an idle source
     // would otherwise freeze the /metrics snapshot while the pipeline drains.
     let metrics_tick = Duration::from_millis(250);
+    // Streaming publish cadence; idle ticks and segment advances always publish
+    const PUBLISH_MIN_INTERVAL: Duration = Duration::from_millis(50);
+    let mut last_publish = Instant::now();
     // Inflight-stall watchdog: xacts_active > 0 with stalled
     // `emitter_ack_lsn` dumps the parked xids holding the slot. One-shot
     // per stall, re-arms when ack advances.
@@ -1871,6 +1874,7 @@ pub(crate) async fn run_session(
                 }
             },
         };
+        let idle = chunk.is_none();
         let server_end = chunk
             .as_ref()
             .map(|c| c.server_wal_end)
@@ -2153,6 +2157,14 @@ pub(crate) async fn run_session(
         if let Some(msg) = pipeline_handle.fatal.message() {
             anyhow::bail!("decode+insert pipeline failed: {msg}");
         }
+        let now_dispatched = stream.dispatched_lsn();
+        let advanced = now_dispatched != prev_dispatched;
+        // Streaming iterates per walsender message; publishing each time reads
+        // /proc and takes the xact buffer lock from the worker
+        if !idle && !advanced && last_publish.elapsed() < PUBLISH_MIN_INTERVAL {
+            continue;
+        }
+        last_publish = Instant::now();
         // Re-read rather than reuse the top-of-iteration pair: a crossing commits
         // a new floor and branch mid-iteration, and this is what an operator
         // watches to know the crossing is durable
@@ -2163,8 +2175,6 @@ pub(crate) async fn run_session(
             stream.timeline(),
             WAL_SEG_SIZE,
         );
-        let now_dispatched = stream.dispatched_lsn();
-        let advanced = now_dispatched != prev_dispatched;
         let (xact_stats, drain_resident, xact_line) = {
             let b = xact_buffer.lock().await;
             let stats = b.stats().clone();
@@ -2337,9 +2347,12 @@ pub(crate) async fn run_session(
     );
     let final_timeline = stream.timeline();
     let final_received = stream.next_lsn().get();
-    // Drop the sink (closes the fsync queue) and drain the fsync task so
-    // sealed segments are durable
-    drop(segment_sink);
+    // Close the sink (finishes its write, closes the fsync queue) and drain
+    // the fsync task so sealed segments are durable
+    segment_sink
+        .close()
+        .await
+        .context("write final filtered segment")?;
     let res = fsync_task.await;
     if res.is_err() || fsync_fatal.is_set() {
         return Err(task_stopped("segment fsync", res, &fsync_fatal));

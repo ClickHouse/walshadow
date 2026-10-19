@@ -426,6 +426,51 @@ impl Drop for QueueingRecordSink {
     }
 }
 
+enum Admit {
+    Dead,
+    Skip { ship: bool },
+    Take,
+}
+
+impl QueueingRecordSink {
+    /// Whether to buffer `record`; a skipped one only advances position
+    fn admit(&mut self, record: &Record<'_>) -> Admit {
+        // Closed channel means the worker parked an error or died
+        if !self.worker_alive() {
+            return Admit::Dead;
+        }
+        if !(self.wants)(record) {
+            self.skipped += 1;
+            self.skipped_lsn = self.skipped_lsn.max(record.source_lsn);
+            // Ship position-only runs too, so the idle ack keeps moving
+            return Admit::Skip {
+                ship: self.skipped >= self.batch_size as u64,
+            };
+        }
+        Admit::Take
+    }
+
+    /// Act on `admit`, owning the record only when buffering it
+    fn enqueue(
+        &mut self,
+        admit: Admit,
+        own: impl FnOnce() -> Record<'static>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + '_>> {
+        match admit {
+            Admit::Dead => Box::pin(async move { self.flush().await }),
+            Admit::Skip { ship: true } => Box::pin(self.flush_buf()),
+            Admit::Skip { ship: false } => Box::pin(Done),
+            Admit::Take => {
+                self.buf.push(own());
+                if self.buf.len() >= self.batch_size {
+                    return Box::pin(self.flush_buf());
+                }
+                Box::pin(Done)
+            }
+        }
+    }
+}
+
 impl RecordSink for QueueingRecordSink {
     /// Backpressure parks on the worker, never on shadow replay
     fn may_park(&self, _record: &Record<'_>) -> bool {
@@ -436,33 +481,16 @@ impl RecordSink for QueueingRecordSink {
         &'a mut self,
         record: &'a Record<'a>,
     ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
-        // Closed channel means the worker parked an error or died
-        if !self.worker_alive() {
-            return Box::pin(async move { self.flush().await });
-        }
-        if !(self.wants)(record) {
-            self.skipped += 1;
-            self.skipped_lsn = self.skipped_lsn.max(record.source_lsn);
-            // Ship position-only runs too, so the idle ack keeps moving
-            if self.skipped >= self.batch_size as u64 {
-                return Box::pin(self.flush_buf());
-            }
-            return Box::pin(Done);
-        }
-        self.buf.push(Record {
-            parsed: record.parsed.clone().into_owned(),
-            source_lsn: record.source_lsn,
-            next_lsn: record.next_lsn,
-            page_magic: record.page_magic,
-            route: record.route,
-            boundary_info: record.boundary_info.clone(),
-            aborted_tree: record.aborted_tree.clone(),
-            defer_catalog_decode: record.defer_catalog_decode,
-        });
-        if self.buf.len() >= self.batch_size {
-            return Box::pin(self.flush_buf());
-        }
-        Box::pin(Done)
+        let admit = self.admit(record);
+        self.enqueue(admit, || record.to_static())
+    }
+
+    fn on_record_owned(
+        &mut self,
+        record: Record<'static>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + '_>> {
+        let admit = self.admit(&record);
+        self.enqueue(admit, || record)
     }
 }
 

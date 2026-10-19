@@ -169,6 +169,21 @@ pub struct AffectedOid {
     pub pg_class_touch: Option<u64>,
 }
 
+impl Record<'_> {
+    pub fn to_static(&self) -> Record<'static> {
+        Record {
+            parsed: self.parsed.clone().into_owned(),
+            source_lsn: self.source_lsn,
+            next_lsn: self.next_lsn,
+            page_magic: self.page_magic,
+            route: self.route,
+            boundary_info: self.boundary_info.clone(),
+            aborted_tree: self.aborted_tree.clone(),
+            defer_catalog_decode: self.defer_catalog_decode,
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum SinkError {
     #[error("io: {0}")]
@@ -208,6 +223,15 @@ pub trait RecordSink: Send {
         &'a mut self,
         record: &'a Record<'a>,
     ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>>;
+
+    /// [`on_record`](Self::on_record) for a dispatcher done with the record,
+    /// so a sink keeping it skips the copy
+    fn on_record_owned(
+        &mut self,
+        record: Record<'static>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + '_>> {
+        Box::pin(async move { self.on_record(&record).await })
+    }
 
     /// Pre-filter: `false` lets a dispatcher skip `on_record` entirely,
     /// sparing its boxed future and poll cycle. Pure in the record, so a
@@ -273,6 +297,7 @@ pub trait RecordBytesSink: Send {
         bytes: &'a [u8],
     ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>>;
 
+    /// WAL below `_new_start_lsn` is in place on disk
     fn on_segment_retired<'a>(
         &'a mut self,
         _new_start_lsn: u64,
@@ -282,6 +307,8 @@ pub trait RecordBytesSink: Send {
 }
 
 pub trait SegmentSink {
+    /// Persist `bytes` as `seg`. May return while `seg` is still writing, but
+    /// only once every earlier segment is in place
     fn on_segment<'a>(
         &'a mut self,
         seg: SegmentName,
@@ -299,19 +326,8 @@ impl RecordSink for CollectingRecordSink {
         &'a mut self,
         record: &'a Record<'a>,
     ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
-        Box::pin(async move {
-            self.records.push(Record {
-                parsed: record.parsed.clone().into_owned(),
-                source_lsn: record.source_lsn,
-                next_lsn: record.next_lsn,
-                page_magic: record.page_magic,
-                route: record.route,
-                boundary_info: record.boundary_info.clone(),
-                aborted_tree: record.aborted_tree.clone(),
-                defer_catalog_decode: record.defer_catalog_decode,
-            });
-            Ok(())
-        })
+        self.records.push(record.to_static());
+        Box::pin(Done)
     }
 }
 

@@ -439,7 +439,7 @@ impl WalStream {
             self.wire_offset = self.staged_end;
         }
         for record in self.staged.drain(..) {
-            record_sink.on_record(&record).await?;
+            record_sink.on_record_owned(record).await?;
         }
         Ok(())
     }
@@ -475,8 +475,9 @@ impl WalStream {
             .on_segment(seg, &self.walker.buffer()[..seg_size])
             .await?;
         self.walker.truncate_first_segment(ready);
-        self.current_lsn += self.seg_size;
+        // Sink may still be writing this segment, so shadow's backfill keeps it
         self.bytes_sink.on_segment_retired(self.current_lsn).await?;
+        self.current_lsn += self.seg_size;
         self.wire_offset = self.wire_offset.saturating_sub(seg_size);
         self.staged_end = self.staged_end.saturating_sub(seg_size);
         Ok(true)
@@ -874,16 +875,18 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn dir_sink_with_durability_writes_inline_and_enqueues_fsync() {
+    async fn dir_sink_with_durability_writes_behind_and_enqueues_fsync() {
         let tmp = tempfile::tempdir().unwrap();
         let (tx, mut rx) = mpsc::channel::<SegFsync>(4);
         let mut sink =
             DirSegmentSink::with_durability(tmp.path().to_path_buf(), WAL_SEG_SIZE, tx).unwrap();
         let seg = SegmentName::parse("000000010000000000000003").unwrap();
+        let next = SegmentName::parse("000000010000000000000004").unwrap();
         let bytes = [0xAAu8; 64];
         sink.on_segment(seg, &bytes).await.unwrap();
+        // Next segment reuses the buffer, so `seg` must be in place by now
+        sink.on_segment(next, &[0xBBu8; 64]).await.unwrap();
 
-        // Written + renamed inline; fsync deferred to the background task.
         let seg_path = tmp.path().join(seg.format());
         assert_eq!(std::fs::read(&seg_path).unwrap(), bytes);
         let msg = rx.try_recv().expect("segment enqueued for fsync");
@@ -892,6 +895,17 @@ mod tests {
             seg.start_lsn(WAL_SEG_SIZE) + bytes.len() as u64
         );
         assert_eq!(msg.seg_path(), seg_path);
+
+        sink.close().await.unwrap();
+        assert_eq!(
+            std::fs::read(tmp.path().join(next.format())).unwrap(),
+            [0xBBu8; 64]
+        );
+        assert_eq!(
+            rx.recv().await.unwrap().seg_path(),
+            tmp.path().join(next.format())
+        );
+        assert!(rx.recv().await.is_none(), "close drops the fsync sender");
     }
 
     /// Contract: a `RecordBytesSink` sees the full wire stream (record
@@ -1664,8 +1678,9 @@ mod tests {
 
         let len = state.lock().await.wire_buf_len() as u64;
         assert!(
-            len <= SEG,
-            "wire_buf retained {len} bytes across a straddling boundary (> {SEG})",
+            len <= 2 * SEG,
+            "wire_buf retained {len} bytes across a straddling boundary (> {})",
+            2 * SEG,
         );
     }
 }
