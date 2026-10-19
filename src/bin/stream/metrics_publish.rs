@@ -367,16 +367,16 @@ pub(crate) async fn populate_pipeline_metrics(
     use std::collections::BTreeMap;
     use walshadow::record::rmgr_label;
     let mut by_rm = BTreeMap::new();
-    for ((rm, route), n) in &rec_metrics.by_rm_route {
+    for (rm, route, n) in rec_metrics.by_rm_route() {
         let key = (
-            rmgr_label(*rm).to_string(),
+            rmgr_label(rm).to_string(),
             match route {
                 walshadow::record::Route::ToShadow => "to_shadow",
                 walshadow::record::Route::ToDecoder => "to_decoder",
                 walshadow::record::Route::ToBoth => "to_both",
             },
         );
-        by_rm.insert(key, *n);
+        by_rm.insert(key, n);
     }
     let snap = MetricsSnapshot {
         records_by_rm_route: by_rm,

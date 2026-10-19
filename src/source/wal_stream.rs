@@ -872,9 +872,15 @@ mod tests {
             sink.on_record(r).await.unwrap();
         }
         assert_eq!(sink.total, 4);
-        assert_eq!(sink.by_rm_route[&(RmId::Heap as u8, Route::ToShadow)], 2,);
-        assert_eq!(sink.by_rm_route[&(RmId::Heap as u8, Route::ToDecoder)], 1,);
-        assert_eq!(sink.by_rm_route[&(RmId::Xact as u8, Route::ToShadow)], 1,);
+        let counts: Vec<_> = sink.by_rm_route().collect();
+        assert_eq!(
+            counts,
+            [
+                (RmId::Xact as u8, Route::ToShadow, 1),
+                (RmId::Heap as u8, Route::ToShadow, 2),
+                (RmId::Heap as u8, Route::ToDecoder, 1),
+            ]
+        );
         let summary = sink.summary();
         assert!(summary.starts_with("total=4"), "got {summary:?}");
         assert!(summary.contains("heap/to_shadow=2"), "got {summary:?}");
