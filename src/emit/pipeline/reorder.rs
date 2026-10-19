@@ -1565,7 +1565,7 @@ impl RecordSink for ReorderSink {
         _pre: &'a mut [Option<Predecoded>],
     ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
         Box::pin(async move {
-            for record in batch {
+            for record in batch.iter().filter(|r| Self::wants(r)) {
                 self.handle(record).await?;
             }
             self.out.ship().await
