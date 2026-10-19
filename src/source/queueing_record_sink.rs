@@ -451,6 +451,11 @@ impl QueueingRecordSink {
 }
 
 impl RecordSink for QueueingRecordSink {
+    /// A record the inner sink skips only moves position
+    fn header_only(&self, record: &Record<'_>) -> bool {
+        !(self.wants)(record)
+    }
+
     /// Backpressure parks on the worker, never on shadow replay
     fn may_park(&self, _record: &Record<'_>) -> bool {
         false

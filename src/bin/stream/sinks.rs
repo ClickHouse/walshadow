@@ -106,6 +106,11 @@ impl DaemonSinks {
 }
 
 impl RecordSink for DaemonSinks {
+    /// Metrics and spans read only the header
+    fn header_only(&self, record: &Record<'_>) -> bool {
+        self.decoder_xact.header_only(record)
+    }
+
     fn may_park(&self, record: &Record<'_>) -> bool {
         self.decoder_xact.may_park(record)
     }
