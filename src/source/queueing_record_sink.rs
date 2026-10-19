@@ -33,7 +33,7 @@ use tokio::task::JoinHandle;
 use tracing::Instrument;
 
 use crate::ops::trace::TxnSpanRegistry;
-use crate::record::{Record, RecordSink, SinkError, rmgr_label};
+use crate::record::{Record, RecordSink, SinkError};
 
 /// Records batched before a channel send. Amortises per-send overhead
 /// (atomic + alloc + wakeup).
@@ -157,28 +157,12 @@ impl QueueingRecordSink {
                             async {
                                 let mut max_lsn: u64 = 0;
                                 for record in &batch {
-                                    // Position first: skipping dispatch below
-                                    // must not hold back the idle ack.
                                     max_lsn = max_lsn.max(record.source_lsn);
-                                    if !inner.wants(record) {
-                                        continue;
+                                    if let Some(reg) = reg_w.as_ref() {
+                                        reg.note_popped(record.parsed.header.xact_id);
                                     }
-                                    // Open the `txn` span; verdict gates the
-                                    // per-record spans.
-                                    let sampled = reg_w.as_ref().is_some_and(|reg| {
-                                        reg.note_popped(record.parsed.header.xact_id)
-                                    });
-                                    // One `record` span per record; `rm` tells
-                                    // heap from commit records apart.
-                                    let rec_span = trace_span!(
-                                        sampled,
-                                        "record",
-                                        lsn = record.source_lsn,
-                                        xid = record.parsed.header.xact_id,
-                                        rm = rmgr_label(record.parsed.header.resource_manager_id),
-                                    );
-                                    inner.on_record(record).instrument(rec_span).await?;
                                 }
+                                inner.on_records(&batch).await?;
                                 // Advance idle ack past trailing non-commit WAL
                                 // (`max_lsn` = dispatched high-water).
                                 inner.on_idle_advance(max_lsn).await

@@ -45,6 +45,19 @@ impl<D: RecordSink + Send> RecordSink for DecoderXactPair<D> {
         })
     }
 
+    /// Absorbs every heap record before draining any commit in the batch:
+    /// stronger than the per-record order, and a commit only drains its own
+    fn on_records<'a>(
+        &'a mut self,
+        batch: &'a [Record<'a>],
+    ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
+        Box::pin(async move {
+            self.decoder.on_records(batch).await?;
+            self.xact_drain.on_records(batch).await?;
+            Ok(())
+        })
+    }
+
     fn on_idle<'a>(
         &'a mut self,
     ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
@@ -105,6 +118,22 @@ impl RecordSink for DaemonSinks {
             }
             self.metrics.on_record(record).await?;
             self.decoder_xact.on_record(record).await?;
+            Ok(())
+        })
+    }
+
+    fn on_records<'a>(
+        &'a mut self,
+        batch: &'a [Record<'a>],
+    ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
+        Box::pin(async move {
+            for record in batch {
+                if let Some(reg) = &self.span_registry {
+                    reg.open(record.parsed.header.xact_id, record.source_lsn);
+                }
+                self.metrics.on_record(record).await?;
+            }
+            self.decoder_xact.on_records(batch).await?;
             Ok(())
         })
     }

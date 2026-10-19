@@ -1014,7 +1014,9 @@ pub(crate) async fn run_session(
         } else {
             None
         };
-    let mut decoder = BufferingDecoderSink::new(all_desc_logs.clone(), xact_buffer.clone());
+    let stash_live = xact_buffer.lock().await.stash_live();
+    let mut decoder = BufferingDecoderSink::new(all_desc_logs.clone(), xact_buffer.clone())
+        .with_stash_live(stash_live);
     if let Some(schema) = ch_config
         .as_ref()
         .and_then(|c| c.runtime_config_schema.as_deref())

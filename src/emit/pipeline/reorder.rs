@@ -1320,34 +1320,46 @@ impl PlanRouteView for ReorderRouteView<'_> {
     }
 }
 
+impl ReorderSink {
+    async fn handle(&mut self, record: &Record<'_>) -> Result<(), SinkError> {
+        if record.parsed.header.resource_manager_id != RmId::Xact as u8 {
+            return Ok(());
+        }
+        let info = record.parsed.header.info;
+        let op = info & XLOG_XACT_OPMASK;
+        let xid = record.parsed.header.xact_id;
+        match op {
+            XLOG_XACT_COMMIT | XLOG_XACT_COMMIT_PREPARED => self.on_commit(xid, info, record).await,
+            XLOG_XACT_ABORT | XLOG_XACT_ABORT_PREPARED => self.on_abort(xid, info, record).await,
+            XLOG_XACT_ASSIGNMENT => {
+                if let Some((xtop, subs)) = parse_xact_assignment(&record.parsed.main_data) {
+                    self.subxact_tracker.lock().await.assign(xtop, &subs);
+                }
+                Ok(())
+            }
+            // PREPARE allocates no seq; COMMIT_PREPARED drains it later
+            _ => Ok(()),
+        }
+    }
+}
+
 impl RecordSink for ReorderSink {
     fn on_record<'a>(
         &'a mut self,
         record: &'a Record<'a>,
     ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
+        Box::pin(self.handle(record))
+    }
+
+    fn on_records<'a>(
+        &'a mut self,
+        batch: &'a [Record<'a>],
+    ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
         Box::pin(async move {
-            if record.parsed.header.resource_manager_id != RmId::Xact as u8 {
-                return Ok(());
+            for record in batch {
+                self.handle(record).await?;
             }
-            let info = record.parsed.header.info;
-            let op = info & XLOG_XACT_OPMASK;
-            let xid = record.parsed.header.xact_id;
-            match op {
-                XLOG_XACT_COMMIT | XLOG_XACT_COMMIT_PREPARED => {
-                    self.on_commit(xid, info, record).await
-                }
-                XLOG_XACT_ABORT | XLOG_XACT_ABORT_PREPARED => {
-                    self.on_abort(xid, info, record).await
-                }
-                XLOG_XACT_ASSIGNMENT => {
-                    if let Some((xtop, subs)) = parse_xact_assignment(&record.parsed.main_data) {
-                        self.subxact_tracker.lock().await.assign(xtop, &subs);
-                    }
-                    Ok(())
-                }
-                // PREPARE allocates no seq; COMMIT_PREPARED drains it later
-                _ => Ok(()),
-            }
+            Ok(())
         })
     }
 

@@ -202,7 +202,7 @@ pub struct Record<'a> {
     pub defer_catalog_decode: bool,
 }
 
-pub trait RecordSink {
+pub trait RecordSink: Send {
     fn on_record<'a>(
         &'a mut self,
         record: &'a Record<'a>,
@@ -213,6 +213,22 @@ pub trait RecordSink {
     /// still observes every record, so skipping cannot move the resume floor.
     fn wants(&self, _record: &Record<'_>) -> bool {
         true
+    }
+
+    /// One boxed future per batch rather than per record; order preserved
+    fn on_records<'a>(
+        &'a mut self,
+        batch: &'a [Record<'a>],
+    ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
+        Box::pin(async move {
+            for record in batch {
+                if !self.wants(record) {
+                    continue;
+                }
+                self.on_record(record).await?;
+            }
+            Ok(())
+        })
     }
 
     fn on_idle<'a>(
