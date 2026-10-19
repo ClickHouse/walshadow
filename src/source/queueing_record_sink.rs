@@ -412,6 +412,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn skipped_records_advance_position() {
+        struct Selective(Arc<StdMutex<Vec<u64>>>);
+
+        impl RecordSink for Selective {
+            fn wants(&self, _record: &Record<'_>) -> bool {
+                false
+            }
+
+            fn on_record<'a>(
+                &'a mut self,
+                _record: &'a Record<'a>,
+            ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
+                panic!("unexpected dispatch");
+            }
+
+            fn on_idle_advance<'a>(
+                &'a mut self,
+                lsn: u64,
+            ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
+                Box::pin(async move {
+                    self.0.lock().unwrap().push(lsn);
+                    Ok(())
+                })
+            }
+        }
+
+        let positions = Arc::new(StdMutex::new(Vec::new()));
+        let mut q = QueueingRecordSink::spawn(Selective(positions.clone()), 2, 8, None);
+        let processed = q.processed.clone();
+        let in_flight = q.in_flight.clone();
+        for lsn in [10, 20, 30, 40] {
+            q.on_record(&synth(lsn)).await.expect("send");
+        }
+        q.close().await.expect("close");
+
+        assert_eq!(*positions.lock().unwrap(), [20, 40]);
+        assert_eq!(processed.load(Ordering::Relaxed), 4);
+        assert_eq!(in_flight.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
     async fn surfaces_worker_error() {
         struct Fail;
         impl RecordSink for Fail {

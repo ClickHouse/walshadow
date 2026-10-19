@@ -1322,7 +1322,7 @@ impl PlanRouteView for ReorderRouteView<'_> {
 
 impl ReorderSink {
     async fn handle(&mut self, record: &Record<'_>) -> Result<(), SinkError> {
-        if record.parsed.header.resource_manager_id != RmId::Xact as u8 {
+        if !self.wants(record) {
             return Ok(());
         }
         let info = record.parsed.header.info;
@@ -1344,6 +1344,10 @@ impl ReorderSink {
 }
 
 impl RecordSink for ReorderSink {
+    fn wants(&self, record: &Record<'_>) -> bool {
+        record.parsed.header.resource_manager_id == RmId::Xact as u8
+    }
+
     fn on_record<'a>(
         &'a mut self,
         record: &'a Record<'a>,

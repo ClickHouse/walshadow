@@ -5,7 +5,6 @@ use std::sync::Arc;
 use anyhow::Result;
 use std::future::Future;
 use std::pin::Pin;
-use walrus::pg::walparser::RmId;
 use walshadow::boundary_hold::BoundaryHoldSink;
 use walshadow::record::{MetricsRecordSink, Record, RecordSink, SinkError};
 use walshadow::xact_buffer::BufferingDecoderSink;
@@ -22,16 +21,8 @@ pub(crate) struct DecoderXactPair<D: RecordSink + Send> {
 }
 
 impl<D: RecordSink + Send> RecordSink for DecoderXactPair<D> {
-    /// Only Heap/Heap2 (tuples, TRUNCATE), Xact (commit/abort/assignment) and
-    /// Smgr (main-fork create) reach past either inner sink's opening guard.
-    /// Index and xlog traffic is ~47% of records and is discarded there, so
-    /// skipping it here costs nothing downstream.
     fn wants(&self, record: &Record<'_>) -> bool {
-        let rm = record.parsed.header.resource_manager_id;
-        rm == RmId::Heap as u8
-            || rm == RmId::Heap2 as u8
-            || rm == RmId::Xact as u8
-            || rm == RmId::Smgr as u8
+        self.decoder.wants(record) || self.xact_drain.wants(record)
     }
 
     fn on_record<'a>(
@@ -39,8 +30,12 @@ impl<D: RecordSink + Send> RecordSink for DecoderXactPair<D> {
         record: &'a Record<'a>,
     ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
         Box::pin(async move {
-            self.decoder.on_record(record).await?;
-            self.xact_drain.on_record(record).await?;
+            if self.decoder.wants(record) {
+                self.decoder.on_record(record).await?;
+            }
+            if self.xact_drain.wants(record) {
+                self.xact_drain.on_record(record).await?;
+            }
             Ok(())
         })
     }

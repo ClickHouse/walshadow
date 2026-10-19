@@ -3186,6 +3186,11 @@ impl BufferingDecoderSink {
 }
 
 impl RecordSink for BufferingDecoderSink {
+    fn wants(&self, record: &Record<'_>) -> bool {
+        let rm = record.parsed.header.resource_manager_id;
+        rm == RmId::Heap as u8 || rm == RmId::Heap2 as u8 || rm == RmId::Smgr as u8
+    }
+
     fn on_record<'a>(
         &'a mut self,
         record: &'a Record<'a>,
