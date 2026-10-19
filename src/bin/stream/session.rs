@@ -1434,6 +1434,9 @@ pub(crate) async fn run_session(
     // only delays slot advance, never overshoots it.
     let cursor_write_interval = Duration::from_secs(args.status_interval);
     let mut last_cursor_write: Option<Instant> = None;
+    // A shadow catching up through `restore_command` holds no stream, so its
+    // replay has to be polled or the floor freezes
+    let mut shadow_replay_poll = walshadow::ticker::Ticker::new(cursor_write_interval);
     // Fast metrics-refresh tick (decoupled from cursor/status): an idle source
     // would otherwise freeze the /metrics snapshot while the pipeline drains.
     let metrics_tick = Duration::from_millis(250);
@@ -1684,6 +1687,11 @@ pub(crate) async fn run_session(
         };
         if let Some(apply) = shadow_agg.min_apply_lsn {
             shadow_replay_lsn.join(apply);
+        } else if shadow_replay_poll.fire()
+            && let Some(Some(lsn)) =
+                probe_blocking(&shadow_lifecycle.guard.shadow, |s| s.last_replay_lsn()).await
+        {
+            shadow_replay_lsn.join(Pos::new(lsn));
         }
         let shadow_replay = shadow_replay_lsn.get();
         if let Some(flush) = shadow_agg.min_flush_lsn {
@@ -2009,7 +2017,7 @@ pub(crate) async fn run_session(
             // source has stopped producing so nothing queues up behind it
             let open = match (walshadow::transition::ForkBarrier {
                 resume_safe_lsn: resume_safe,
-                shadow_apply_lsn: shadow_agg.min_apply_lsn,
+                shadow_apply_lsn: (shadow_replay.get() != 0).then_some(shadow_replay),
                 filter_durable: durable,
                 floor: resume_floor.get(),
             })
@@ -2158,7 +2166,7 @@ pub(crate) async fn run_session(
         let decoder_stats: &walshadow::decoder_sink::DecoderStats = &record_sink.decoder_stats;
         let emitter_stats: Option<&walshadow::ch_emitter::EmitterStats> =
             record_sink.emitter_stats.as_deref();
-        let shadow_apply_lsn = shadow_agg.min_apply_lsn.map_or(0, Pos::get);
+        let shadow_apply_lsn = shadow_replay.get();
         let lag_bytes = received.get().saturating_sub(shadow_apply_lsn);
         rate_estimator.observe(Instant::now(), received.get());
         let lag_seconds = rate_estimator.seconds_for(lag_bytes);
