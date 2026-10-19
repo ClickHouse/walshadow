@@ -334,7 +334,11 @@ impl SourceFeed {
                 "source replication receive timeout"
             );
             let status_interval = self.status_interval.min(RECEIVE_TIMEOUT / 2);
-            if self.last_status.elapsed() >= status_interval {
+            // PostgreSQL's walreceiver reports WAL progress without waiting.
+            let advanced = status.write_lsn > self.floors.write
+                || status.flush_lsn > self.floors.flush
+                || status.apply_lsn > self.floors.apply;
+            if advanced || self.last_status.elapsed() >= status_interval {
                 self.send_status(status).await?;
             }
             let status_due = self.last_status + status_interval;
@@ -645,6 +649,79 @@ mod tests {
                 Ok(Ok(event)) => panic!("unexpected event: {event:?}"),
             }
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn advances_are_reported_without_waiting_for_status_interval() {
+        let (feed, mut server) = mock_feed().await;
+        let mut feed = feed.with_status_interval(Duration::from_secs(10));
+        let replies = tokio::spawn(async move {
+            let mut reported = Vec::new();
+            while let Ok(tag) = server.read_u8().await {
+                assert_eq!(tag, b'd');
+                let len = server.read_u32().await.unwrap() as usize;
+                let mut body = vec![0; len - 4];
+                server.read_exact(&mut body).await.unwrap();
+                reported.push((
+                    u64::from_be_bytes(body[1..9].try_into().unwrap()),
+                    u64::from_be_bytes(body[9..17].try_into().unwrap()),
+                    u64::from_be_bytes(body[17..25].try_into().unwrap()),
+                ));
+            }
+            reported
+        });
+        let mut buf = Vec::new();
+        for (write, flush, apply) in [
+            (100, 0, 0),
+            (100, 0, 100),
+            (100, 100, 100),
+            (200, 100, 100),
+            (200, 100, 200),
+            (200, 200, 200),
+        ] {
+            let status = StandbyStatus {
+                write_lsn: Pos::new(write),
+                flush_lsn: Pos::new(flush),
+                apply_lsn: Pos::new(apply),
+            };
+            for _ in 0..2 {
+                let poll = feed.next_event(status, &mut buf);
+                let timed_out = tokio::time::timeout(Duration::from_millis(100), poll).await;
+                assert!(timed_out.is_err());
+            }
+        }
+        drop(feed);
+        assert_eq!(
+            replies.await.unwrap(),
+            [
+                (100, 0, 0),
+                (100, 0, 100),
+                (100, 100, 100),
+                (200, 0, 100),
+                (200, 0, 200),
+                (200, 200, 200),
+            ]
+        );
+    }
+
+    /// Read buffered WAL even when status replies are due on every loop.
+    #[tokio::test(start_paused = true)]
+    async fn zero_interval_reads_buffered_wal() {
+        let (feed, mut server) = mock_feed().await;
+        let mut feed = feed.with_status_interval(Duration::ZERO);
+        let mut frame = vec![b'w'];
+        for field in [16u64, 19, 0] {
+            frame.extend_from_slice(&field.to_be_bytes());
+        }
+        frame.extend_from_slice(b"wal");
+        backend(&mut server, b'd', &frame).await;
+        let mut buf = Vec::new();
+        let poll = feed.next_event(StandbyStatus::default(), &mut buf);
+        let event = tokio::time::timeout(Duration::from_secs(1), poll).await;
+        assert!(
+            matches!(event, Ok(Ok(SourceEvent::Wal(w))) if w.start_lsn == 16 && w.data == b"wal"),
+            "{event:?}"
+        );
     }
 
     fn triple(s: StandbyStatus) -> (u64, u64, u64) {
