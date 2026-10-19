@@ -776,9 +776,8 @@ pub struct XactBuffer {
     stats: XactBufferStats,
     /// Shared with the WAL pump: the pump opens a `txn` span here at first
     /// sighting of an xid, and `absorb` adopts it so the span starts at
-    /// WAL-read rather than at buffering. Empty (and unused) when tracing
-    /// is off — `absorb` then mints its own span.
-    span_registry: TxnSpanRegistry,
+    /// WAL-read rather than at buffering. `None` with tracing off
+    span_registry: Option<TxnSpanRegistry>,
     /// Bytes resident inside an active commit drain (merge heads + in-mem
     /// tail + chunk generations + mirror rows, until each consumer drops
     /// its share). Arc'd so a detached [`CommittedDrain`] keeps accounting
@@ -812,7 +811,7 @@ impl XactBuffer {
             pending_durable: PendingDurable::default(),
             bytes_in_memory: 0,
             stats: XactBufferStats::default(),
-            span_registry: TxnSpanRegistry::new(),
+            span_registry: None,
             drain_resident: Arc::new(AtomicU64::new(0)),
             drain_resident_peak: Arc::new(AtomicU64::new(0)),
             drain_head_resident: Arc::new(AtomicU64::new(0)),
@@ -864,10 +863,10 @@ impl XactBuffer {
         self.drain_resident_peak.load(Ordering::Relaxed)
     }
 
-    /// Clone of the [`TxnSpanRegistry`] the pump pushes `txn` spans into.
-    /// Wire this into the pump-side record sink so spans open at WAL read.
-    pub fn span_registry(&self) -> TxnSpanRegistry {
-        self.span_registry.clone()
+    /// Adopt `txn` spans the pump opens into `registry` at WAL read
+    pub fn with_span_registry(mut self, registry: TxnSpanRegistry) -> Self {
+        self.span_registry = Some(registry);
+        self
     }
 
     /// Wipe scratch left by a prior crash. Cursor file guarantees on-disk
@@ -1006,13 +1005,16 @@ impl XactBuffer {
         // shows in profiles
         let hasher = self.inflight.hasher().clone();
         self.inflight.entry(xid).or_insert_with(|| {
-            let span = registry.adopt(xid).unwrap_or_else(|| {
-                if registry.is_sampled(xid) {
-                    new_txn_span(xid, first_lsn)
-                } else {
-                    tracing::Span::none()
-                }
-            });
+            let span = registry
+                .as_ref()
+                .and_then(|registry| {
+                    registry.adopt(xid).or_else(|| {
+                        registry
+                            .is_sampled(xid)
+                            .then(|| new_txn_span(xid, first_lsn))
+                    })
+                })
+                .unwrap_or_else(tracing::Span::none);
             XactState::new(first_lsn, span, hasher)
         })
     }
@@ -1455,7 +1457,9 @@ impl XactBuffer {
         // Drop any pump-opened span handles for the aborted tree. The
         // per-xid XactState (with its own clone) is removed + dropped in
         // the loop below, closing the span as aborted.
-        self.span_registry.prune(&xids);
+        if let Some(registry) = &self.span_registry {
+            registry.prune(&xids);
+        }
 
         let mut any = false;
         for x in xids {
@@ -3023,7 +3027,7 @@ impl BufferingDecoderSink {
 
     /// Wire the [`TxnSpanRegistry`] so per-record decode spans nest under the
     /// xact's `txn` span. Pass the same registry the WAL pump registers xids
-    /// into ([`XactBuffer::span_registry`]).
+    /// into ([`XactBuffer::with_span_registry`]).
     pub fn with_span_registry(mut self, registry: TxnSpanRegistry) -> Self {
         self.span_registry = Some(registry);
         self
@@ -3837,17 +3841,6 @@ mod tests {
         reg.prune(&[42]);
         assert!(reg.txn_span(42).is_none());
         assert!(!reg.is_sampled(42));
-    }
-
-    #[test]
-    fn xact_buffer_exposes_span_registry() {
-        let _g = crate::ops::trace::SAMPLE_TEST_GUARD.blocking_lock();
-        crate::ops::trace::set_sample_ratio(1.0);
-        let tmp = tempdir().unwrap();
-        let buf = XactBuffer::new(XactBufferConfig::new(tmp.path().to_path_buf())).unwrap();
-        let reg = buf.span_registry();
-        reg.open(7, 1);
-        assert!(reg.is_sampled(7));
     }
 
     fn cfg(dir: PathBuf) -> XactBufferConfig {
