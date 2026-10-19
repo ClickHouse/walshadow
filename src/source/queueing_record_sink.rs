@@ -165,7 +165,7 @@ impl QueueingRecordSink {
                     in_flight_w.fetch_sub(n, Ordering::Relaxed);
                     rx.close();
                     while let Some(rest) = rx.recv().await {
-                        in_flight_w.fetch_sub(rest.len, Ordering::Relaxed);
+                        in_flight_w.fetch_sub(rest.len + rest.skipped, Ordering::Relaxed);
                     }
                 };
             let mut last_yield = Instant::now();
@@ -184,7 +184,7 @@ impl QueueingRecordSink {
                                 Ok(decoded) => decoded,
                                 Err(e) => {
                                     let e = SinkError::Other(format!("predecode job: {e}"));
-                                    park_err_and_drain(e, n, &mut rx).await;
+                                    park_err_and_drain(e, n + skipped, &mut rx).await;
                                     break 'outer;
                                 }
                             },
@@ -223,11 +223,11 @@ impl QueueingRecordSink {
                         .instrument(queuingthread)
                         .await;
                         if let Err(e) = outcome {
-                            park_err_and_drain(e, n, &mut rx).await;
+                            park_err_and_drain(e, n + skipped, &mut rx).await;
                             break 'outer;
                         }
                         processed_w.fetch_add(n + skipped, Ordering::Relaxed);
-                        in_flight_w.fetch_sub(n, Ordering::Relaxed);
+                        in_flight_w.fetch_sub(n + skipped, Ordering::Relaxed);
                         if last_yield.elapsed() >= YIELD_INTERVAL {
                             tokio::task::yield_now().await;
                             last_yield = Instant::now();
@@ -280,9 +280,10 @@ impl QueueingRecordSink {
         self
     }
 
-    /// Pump-queue depth: in-channel + pump-side buffer, for metrics.
+    /// Pump-queue depth: in-channel + pump-side buffer, skipped records
+    /// included since their positions still wait on the worker
     pub fn in_flight(&self) -> u64 {
-        self.in_flight.load(Ordering::Relaxed) + self.buf.len() as u64
+        self.in_flight.load(Ordering::Relaxed) + self.buf.len() as u64 + self.skipped
     }
 
     /// Records the worker has dispatched (see the `processed` field).
@@ -330,7 +331,7 @@ impl QueueingRecordSink {
             }
         }
         let n = batch.len() as u64;
-        self.in_flight.fetch_add(n, Ordering::Relaxed);
+        self.in_flight.fetch_add(n + skipped, Ordering::Relaxed);
         let tx = self
             .tx
             .as_ref()
@@ -361,7 +362,7 @@ impl QueueingRecordSink {
             .send_wait_nanos
             .saturating_add(started.elapsed().as_nanos() as u64);
         if sent.is_err() {
-            self.in_flight.fetch_sub(n, Ordering::Relaxed);
+            self.in_flight.fetch_sub(n + skipped, Ordering::Relaxed);
             return Err(self.worker_stopped());
         }
         Ok(())
@@ -584,6 +585,7 @@ mod tests {
         let in_flight = q.in_flight.clone();
         for lsn in [10, 20, 30, 40] {
             q.on_record(&synth(lsn)).await.expect("send");
+            assert_eq!(q.in_flight(), lsn / 10);
         }
         q.close().await.expect("close");
 
