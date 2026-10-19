@@ -182,7 +182,8 @@ async fn budget_trips_seal_complete_inserts() {
     );
     const N: i32 = 5;
     let commit_lsn = 0xC0FFEE;
-    let seq = ack.seqs(0).open(commit_lsn, Publish::Commit);
+    let mut seqs = ack.seqs(0);
+    let seq = seqs.open(commit_lsn, Publish::Commit);
     for i in 0..N {
         msg_tx
             .send(BatcherMsg::Row(RoutedRow {
@@ -195,7 +196,8 @@ async fn budget_trips_seal_complete_inserts() {
             .await
             .expect("route row");
     }
-    seq.place(N as u64);
+    seqs.place(seq, N as u64);
+    drop(seqs);
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     msg_tx
         .send(BatcherMsg::FlushAll(reply_tx))

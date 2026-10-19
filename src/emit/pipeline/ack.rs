@@ -9,7 +9,7 @@
 //! `commit_lsn`, earlier slices gate contiguity via [`Publish::Partial`]
 //!
 //! [`SeqAlloc::open`] is the only registration path. An allocator and its
-//! seqs send only to the collector that made them, and [`OpenSeq::place`]
+//! seqs send only to the collector that made them, and [`SeqAlloc::place`]
 //! consumes its seq. Types do not stop two allocators overlapping or a seq
 //! dropping unplaced: collector fails on a repeat registration, and an
 //! unplaced seq pins the frontier where [`AckSnapshot::stall_reason`] names it
@@ -417,10 +417,7 @@ impl SeqAlloc {
         } else {
             let _ = self.tx.send(ev);
         }
-        OpenSeq {
-            tx: self.tx.clone(),
-            seq,
-        }
+        OpenSeq { seq }
     }
 
     /// Ordering marker carrying no rows
@@ -429,12 +426,16 @@ impl SeqAlloc {
         self.place(seq, 0);
     }
 
-    /// [`OpenSeq::place`], held while this allocator holds
+    /// Consume `seq` with its row count, held while this allocator holds.
+    /// Every row of the seq must already be on the batcher channel
     pub fn place(&mut self, seq: OpenSeq, rows: u64) {
-        let Some(held) = &mut self.held else {
-            return seq.place(rows);
-        };
-        held.placed.push(AckEvent::Placed { seq: seq.seq, rows });
+        let ev = AckEvent::Placed { seq: seq.seq, rows };
+        match &mut self.held {
+            Some(held) => held.placed.push(ev),
+            None => {
+                let _ = self.tx.send(ev);
+            }
+        }
     }
 
     /// Held registrations must reach the collector before their rows reach
@@ -465,21 +466,12 @@ impl SeqAlloc {
 #[must_use = "an unplaced seq pins the ack frontier"]
 #[derive(Debug)]
 pub struct OpenSeq {
-    tx: mpsc::UnboundedSender<AckEvent>,
     seq: u64,
 }
 
 impl OpenSeq {
     pub const fn seq(&self) -> u64 {
         self.seq
-    }
-
-    /// Every row of this seq must already be on the batcher channel
-    pub fn place(self, rows: u64) {
-        let _ = self.tx.send(AckEvent::Placed {
-            seq: self.seq,
-            rows,
-        });
     }
 }
 
