@@ -676,7 +676,7 @@ impl ConfigResolver {
         );
         self.rejections.store(rejections, Ordering::Relaxed);
         self.mapping
-            .publish(Arc::new(resolved.tables.clone()))
+            .publish(Arc::new(crate::mapping::shared(resolved.tables.clone())))
             .await;
         tracing::info!(
             target: "walshadow::config",
@@ -2042,7 +2042,7 @@ mod tests {
             type_changes: vec![],
         };
         resolver.apply_schema_diff(&desc, &diff, &[]).await;
-        let has_note = |m: &HashMap<RelName, TableMapping>| {
+        let has_note = |m: &HashMap<RelName, Arc<TableMapping>>| {
             m.get(&RelName::new("public", "events"))
                 .is_some_and(|t| t.columns.iter().any(|c| c.src_attnum == 2))
         };

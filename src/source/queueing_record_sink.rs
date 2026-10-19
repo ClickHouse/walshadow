@@ -157,12 +157,17 @@ impl QueueingRecordSink {
                             async {
                                 let mut max_lsn: u64 = 0;
                                 for record in &batch {
+                                    // Position first: skipping dispatch below
+                                    // must not hold back the idle ack.
+                                    max_lsn = max_lsn.max(record.source_lsn);
+                                    if !inner.wants(record) {
+                                        continue;
+                                    }
                                     // Open the `txn` span; verdict gates the
                                     // per-record spans.
                                     let sampled = reg_w.as_ref().is_some_and(|reg| {
                                         reg.note_popped(record.parsed.header.xact_id)
                                     });
-                                    max_lsn = max_lsn.max(record.source_lsn);
                                     // One `record` span per record; `rm` tells
                                     // heap from commit records apart.
                                     let rec_span = trace_span!(

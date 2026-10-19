@@ -270,7 +270,9 @@ pub(crate) async fn refresh_mapping(
     // Boot value already seeded into `mapping`; react to republishes.
     while config_rx.changed().await.is_ok() {
         let tables = config_rx.borrow_and_update().tables.clone();
-        mapping.publish(Arc::new(tables)).await;
+        mapping
+            .publish(Arc::new(walshadow::mapping::shared(tables)))
+            .await;
         tracing::info!(
             target: "walshadow::config",
             "routing map refreshed from resolved config",

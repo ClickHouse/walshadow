@@ -466,7 +466,7 @@ fn de_column_override<'de, D: serde::Deserializer<'de>>(
 
 /// Immutable routing-map version. Planners snapshot one per transaction so a
 /// concurrent republish can't split a transaction across mapping versions
-pub type MappingSnapshot = Arc<HashMap<RelName, TableMapping>>;
+pub type MappingSnapshot = Arc<HashMap<RelName, Arc<TableMapping>>>;
 
 pub type MappingHandle = Arc<MappingCell>;
 
@@ -504,8 +504,14 @@ impl MappingCell {
 
 pub fn mapping_handle(tables: HashMap<RelName, TableMapping>) -> MappingHandle {
     Arc::new(MappingCell {
-        inner: RwLock::new(Arc::new(tables)),
+        inner: RwLock::new(Arc::new(shared(tables))),
     })
+}
+
+/// Wrap each mapping once at publish so routing clones a refcount rather than
+/// the column vector on every commit
+pub fn shared(tables: HashMap<RelName, TableMapping>) -> HashMap<RelName, Arc<TableMapping>> {
+    tables.into_iter().map(|(k, v)| (k, Arc::new(v))).collect()
 }
 
 /// CH name and type a rule states for an attribute, falling back to the
@@ -872,7 +878,7 @@ mod tests {
         // Republish shape: full inner-Arc swap
         let planned = handle.snapshot().await;
         let (rel2, map2) = one_table();
-        handle.publish(Arc::new(map2)).await;
+        handle.publish(Arc::new(shared(map2))).await;
         assert!(!planned.contains_key(&rel2), "snapshot predates the swap");
         assert!(handle.with(|m| m.contains_key(&rel2)).await);
     }

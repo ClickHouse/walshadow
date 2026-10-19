@@ -229,7 +229,7 @@ pub fn freeze_routes(
             let policy = row_policy.for_rel(config, name);
             (
                 name.clone(),
-                RouteSnapshot::freeze(Arc::new(m.clone()), rules.clone(), policy),
+                RouteSnapshot::freeze(m.clone(), rules.clone(), policy),
             )
         })
         .collect();
@@ -415,11 +415,11 @@ mod tests {
         let mapping: crate::mapping::MappingSnapshot = Arc::new(
             [(
                 m.rel_name.clone(),
-                TableMapping {
+                Arc::new(TableMapping {
                     target: TableTarget::new("db", "m"),
                     columns: Vec::new(),
                     tees: Vec::new(),
-                },
+                }),
             )]
             .into_iter()
             .collect(),

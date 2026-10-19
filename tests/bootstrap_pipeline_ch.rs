@@ -148,7 +148,7 @@ async fn bootstrap_tail_fans_out_n2() {
     let mut catalog = CatalogMap::new();
     catalog.insert(rel(16400, "foo"));
     catalog.insert(rel(16401, "baz"));
-    let mapping = std::sync::Arc::new(cfg.tables.clone());
+    let mapping = std::sync::Arc::new(walshadow::mapping::shared(cfg.tables.clone()));
 
     let stats = Arc::new(EmitterStats::default());
     let emitter_ack = Arc::new(Monotone::<EmitterAck>::default());

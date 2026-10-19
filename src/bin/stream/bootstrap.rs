@@ -1243,7 +1243,7 @@ pub(crate) async fn bootstrap_build_mapping(
                 &snap,
                 walshadow::ch_ddl::DdlBoot::from_emitter(emitter_cfg),
             ),
-            Arc::new(snap.tables.clone()),
+            Arc::new(walshadow::mapping::shared(snap.tables.clone())),
             snap.clone(),
         )
     };

@@ -372,7 +372,7 @@ mod tests {
         tables.insert(desc.rel_name.clone(), mapping);
         let mut catalog = CatalogMap::new();
         catalog.insert(Arc::new(desc));
-        (catalog, Arc::new(tables))
+        (catalog, Arc::new(crate::mapping::shared(tables)))
     }
 
     fn override_rule(attname: &str, target_type: &str) -> ColumnRules {
@@ -452,8 +452,9 @@ mod tests {
         let rules = ColumnRules::default();
         let desc = rel(vec![attr(1, "id", INT4OID, "int4", 4)]);
         let (catalog, mut tables) = bridged(desc.clone(), &rules);
-        let mapping = Arc::make_mut(&mut tables).get_mut(&desc.rel_name).unwrap();
-        mapping.columns[0].target_type = "NotAType".into();
+        let entry = Arc::make_mut(&mut tables).get_mut(&desc.rel_name).unwrap();
+        Arc::make_mut(entry).columns[0].target_type = "NotAType".into();
+        let mapping = entry.as_ref();
         assert!(
             TablePlan::build(
                 Allocator::global(&mimalloc::MiMalloc),

@@ -208,6 +208,13 @@ pub trait RecordSink {
         record: &'a Record<'a>,
     ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>>;
 
+    /// Synchronous pre-filter: `false` lets a dispatcher skip `on_record`
+    /// entirely, sparing its boxed future and poll cycle. Position tracking
+    /// still observes every record, so skipping cannot move the resume floor.
+    fn wants(&self, _record: &Record<'_>) -> bool {
+        true
+    }
+
     fn on_idle<'a>(
         &'a mut self,
     ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {

@@ -778,7 +778,7 @@ mod tests {
         );
         let sink = GreenfieldSink {
             catalog,
-            mapping: Arc::new(tables),
+            mapping: Arc::new(crate::mapping::shared(tables)),
             config: Arc::new(ResolvedConfig::default()),
             dest: crate::config::DestEmitter::new(Arc::default(), None),
             stats: Arc::new(EmitterStats::default()),

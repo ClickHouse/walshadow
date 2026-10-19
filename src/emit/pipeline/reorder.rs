@@ -532,7 +532,7 @@ impl ReorderSink {
         if let Some((rel, m)) = predicted {
             let after = mapping.snapshot().await;
             debug_assert_eq!(
-                after.get(&rel),
+                after.get(&rel).map(|a| a.as_ref()),
                 m.as_ref(),
                 "{rel}: apply diverged from plan"
             );
@@ -1209,7 +1209,7 @@ pub struct ReorderRouteView<'a> {
     mapping: Option<MappingSnapshot>,
     config: Option<Arc<ResolvedConfig>>,
     /// Catalog fold above `mapping`; `None` value = locally dropped
-    overlay: HashMap<RelName, Option<TableMapping>>,
+    overlay: HashMap<RelName, Option<Arc<TableMapping>>>,
     /// Routes by row relation, partitions resolved through their root
     memo: HashMap<RelName, Option<Arc<RouteSnapshot>>>,
     /// Routes by owning relation
@@ -1245,9 +1245,10 @@ impl ReorderRouteView<'_> {
         if let Some(r) = self.owned.get(rel_name) {
             return r.clone();
         }
-        let mapped = match self.overlay.get(rel_name) {
-            Some(o) => o.clone(),
-            None => self.mapping.as_ref().and_then(|m| m.get(rel_name)).cloned(),
+        let mapped = if let Some(o) = self.overlay.get(rel_name) {
+            o.clone()
+        } else {
+            self.mapping.as_ref().and_then(|m| m.get(rel_name)).cloned()
         };
         let route = mapped.map(|m| {
             let rules = self
@@ -1255,7 +1256,7 @@ impl ReorderRouteView<'_> {
                 .as_ref()
                 .map_or_else(Arc::default, |rc| rc.column_rules.clone());
             let policy = self.row_policy.for_rel(self.config.as_deref(), rel_name);
-            RouteSnapshot::freeze(Arc::new(m), rules, policy)
+            RouteSnapshot::freeze(m, rules, policy)
         });
         self.owned.insert(rel_name.clone(), route.clone());
         route
@@ -1313,7 +1314,7 @@ impl PlanRouteView for ReorderRouteView<'_> {
             .map_err(|e| e.to_string())?
         {
             self.owned.remove(&rel);
-            self.overlay.insert(rel, m);
+            self.overlay.insert(rel, m.map(Arc::new));
         }
         Ok(())
     }
@@ -1427,7 +1428,7 @@ mod tests {
         handle
             .publish(Arc::new(HashMap::from_iter([(
                 added.clone(),
-                mapping_for(&added),
+                Arc::new(mapping_for(&added)),
             )])))
             .await;
 

@@ -2738,6 +2738,18 @@ pub struct BufferingDecoderSink {
 }
 
 impl BufferingDecoderSink {
+    /// Timed acquire of the shared buffer mutex, so contention with the commit
+    /// drain is measurable rather than inferred
+    async fn lock_buffer(&self) -> tokio::sync::MutexGuard<'_, XactBuffer> {
+        let started = std::time::Instant::now();
+        let guard = self.buffer.lock().await;
+        self.stats
+            .buffer_lock_wait_nanos
+            .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        self.stats.buffer_lock_waits.fetch_add(1, Ordering::Relaxed);
+        guard
+    }
+
     pub fn new(logs: DescriptorLogs, buffer: Arc<Mutex<XactBuffer>>) -> Self {
         Self {
             logs,
@@ -2783,7 +2795,7 @@ impl BufferingDecoderSink {
         rfn: walrus::pg::walparser::RelFileNode,
     ) -> std::result::Result<(), SinkError> {
         let xid = record.parsed.header.xact_id;
-        let mut buf = self.buffer.lock().await;
+        let mut buf = self.lock_buffer().await;
         if buf.marker_lsn(rfn).is_some() {
             let raw = crate::xact::spill::RawRecord::from_parsed(
                 &record.parsed,
@@ -2864,7 +2876,7 @@ impl BufferingDecoderSink {
                 old: None,
             };
             self.stats.record(&decoded);
-            let mut buf = self.buffer.lock().await;
+            let mut buf = self.lock_buffer().await;
             buf.on_heap(DescribedHeap {
                 decoded,
                 descriptor: rel,
@@ -2904,7 +2916,7 @@ impl RecordSink for BufferingDecoderSink {
                     crate::filter::main_data::parse_xl_smgr_create(&record.parsed.main_data)
                 && fork == crate::filter::main_data::MAIN_FORKNUM
             {
-                self.buffer.lock().await.note_smgr_create(
+                self.lock_buffer().await.note_smgr_create(
                     record.parsed.header.xact_id,
                     rfn,
                     record.source_lsn,
@@ -2935,7 +2947,7 @@ impl RecordSink for BufferingDecoderSink {
                 );
                 raw.drop_redundant_images();
                 let (rm, info) = (raw.rm, raw.info);
-                let mut buf = self.buffer.lock().await;
+                let mut buf = self.lock_buffer().await;
                 buf.stash_raw(txn_xid, raw).await.map_err(SinkError::from)?;
                 self.stats
                     .raw_stash_deferred
@@ -2946,7 +2958,7 @@ impl RecordSink for BufferingDecoderSink {
             // Known-invisible filenode for this xact (already stashed or
             // marker-registered): its pg_class row stays MVCC-invisible
             // until commit, so the log has no entry yet either
-            if txn_xid != 0 && self.buffer.lock().await.is_stash_candidate(txn_xid, rfn) {
+            if txn_xid != 0 && self.lock_buffer().await.is_stash_candidate(txn_xid, rfn) {
                 return self.stash_invisible(record, rfn).await;
             }
             let sampled = self
@@ -3000,7 +3012,7 @@ impl RecordSink for BufferingDecoderSink {
                 // there, which is the silent row loss the fence exists to
                 // stop
                 Err(LookupResult::Ambiguous(a)) => {
-                    let marker = self.buffer.lock().await.marker_lsn(rfn);
+                    let marker = self.lock_buffer().await.marker_lsn(rfn);
                     if marker.is_none() {
                         return Err(XactBufferError::StashAmbiguous {
                             rel_node: rfn.rel_node,
@@ -3044,7 +3056,7 @@ impl RecordSink for BufferingDecoderSink {
                 && &*rel.rel_name.namespace == schema
                 && let Some(kind) = ConfigTableKind::from_relname(&rel.rel_name.name)
             {
-                let mut buf = self.buffer.lock().await;
+                let mut buf = self.lock_buffer().await;
                 for decoded in &decoded_set {
                     if let Some(ev) = crate::runtime_config::interpret(kind, decoded, &rel) {
                         buf.on_config_event(decoded.xid, decoded.source_lsn, ev);
@@ -3063,7 +3075,7 @@ impl RecordSink for BufferingDecoderSink {
             async move {
                 // Lock once per record (not per tuple); on_heap/on_toast_chunk
                 // never touch the catalog, so no buffer→catalog inversion.
-                let mut buf = self.buffer.lock().await;
+                let mut buf = self.lock_buffer().await;
                 for decoded in decoded_set {
                     self.stats.record(&decoded);
                     if rel.kind == 't' {

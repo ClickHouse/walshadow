@@ -1071,8 +1071,8 @@ mod tests {
         })
     }
 
-    fn mapping_for(rel_node: u32) -> TableMapping {
-        TableMapping {
+    fn mapping_for(rel_node: u32) -> Arc<TableMapping> {
+        Arc::new(TableMapping {
             target: TableTarget::new("default", &format!("t{rel_node}")),
             columns: vec![ColumnMapping {
                 src_attnum: 1,
@@ -1081,7 +1081,7 @@ mod tests {
                 type_pinned: false,
             }],
             tees: Vec::new(),
-        }
+        })
     }
 
     fn tuple(rel_node: u32, id: i32) -> BackfillTuple {
@@ -1135,8 +1135,8 @@ mod tests {
         })
     }
 
-    fn bytea_mapping_for(rel_node: u32) -> TableMapping {
-        TableMapping {
+    fn bytea_mapping_for(rel_node: u32) -> Arc<TableMapping> {
+        Arc::new(TableMapping {
             target: TableTarget::new("default", &format!("t{rel_node}")),
             columns: vec![ColumnMapping {
                 src_attnum: 1,
@@ -1145,7 +1145,7 @@ mod tests {
                 type_pinned: false,
             }],
             tees: Vec::new(),
-        }
+        })
     }
 
     /// `pg_toast` rel so [`CatalogMap::is_toast`] fires; `oid` matches the
@@ -1954,7 +1954,7 @@ mod tests {
             let mut tuple = bytea_toast_tuple(16400, 16500, 1);
             tuple.rfn.db_node = db_oid;
             let route = RouteSnapshot::freeze(
-                Arc::new(bytea_mapping_for(16400)),
+                bytea_mapping_for(16400),
                 Arc::default(),
                 RowPolicy::default(),
             );
