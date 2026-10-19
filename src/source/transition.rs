@@ -217,7 +217,8 @@ pub struct ForkBarrier {
     /// [`XactBuffer::resume_safe_lsn`]:
     ///     crate::xact::xact_buffer::XactBuffer::resume_safe_lsn
     pub resume_safe_lsn: Pos<ResumeSafe>,
-    /// Shadow's aggregate apply LSN; `None` with no walreceiver attached.
+    /// Shadow's replay LSN from standby status or a direct poll; `None` when
+    /// no position is known, which holds the barrier.
     pub shadow_apply_lsn: Option<Pos<ShadowReplay>>,
     /// Highest fsynced sealed-segment boundary.
     pub filter_durable: Pos<FilterDurable>,
@@ -266,7 +267,7 @@ impl std::fmt::Display for ForkWait {
             ),
             Self::ShadowApply { applied, fork } => match applied {
                 Some(a) => write!(f, "shadow applied {a}, fork at {:#X}", fork.get()),
-                None => write!(f, "no walreceiver attached, fork at {:#X}", fork.get()),
+                None => write!(f, "shadow replay unknown, fork at {:#X}", fork.get()),
             },
             Self::ArchiveSeal {
                 durable,
