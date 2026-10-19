@@ -482,19 +482,14 @@ mod tests {
             .drain_committed(StashResolved::nothing_stashed(1), 42, 0x2000, &[], false)
             .await
             .unwrap();
-        // 1-row slices: the valid row plans before the toast row fails
-        let first = drain
+        // In-memory xact arrives whole: the valid row plans before the
+        // toast row fails within the same slice
+        let batch = drain
             .next_batch(1, usize::MAX, None)
             .await
             .unwrap()
-            .expect("valid row slice");
-        planner.plan_batch(first).await.unwrap();
-        let second = drain
-            .next_batch(1, usize::MAX, None)
-            .await
-            .unwrap()
-            .expect("toast row slice");
-        let err = planner.plan_batch(second).await.unwrap_err();
+            .expect("heap slice");
+        let err = planner.plan_batch(batch).await.unwrap_err();
         assert!(matches!(err, PlanError::Detoast(_)), "{err}");
         drain.finish().await.unwrap();
         drop(planner);
