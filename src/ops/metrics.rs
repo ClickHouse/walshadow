@@ -217,7 +217,17 @@ snapshot! {
     }
 
     gauge source_received_lsn: Pos<SourceReceived> =
-        "Source PG's most recent server_wal_end seen on the replication socket.",
+        "Source head as last reported on the replication socket (server_wal_end), floored at the filter dispatch frontier; not WAL held locally. Archive recovery does not move the reported head, so it reads the dispatch frontier there.",
+    /// Raw `server_wal_end` of the latest keepalive or XLogData, with no
+    /// floor. NaN until one arrives, and frozen while archive recovery feeds
+    /// the pump since the socket is idle
+    gauge source_server_wal_end_lsn: f64 =
+        "Latest server_wal_end seen from the source socket; NaN before the first message, not updated during archive recovery.",
+    /// `server_wal_end` minus each position, all read at one instant by the
+    /// pump so a scrape cannot skew them. Saturates at 0, NaN with the
+    /// server_wal_end it derives from
+    gauge source_lag_bytes: [f64; 3] ["to" = SOURCE_LAG_TARGETS] =
+        "Bytes from source_server_wal_end_lsn to the emitter ack, filter dispatch and durably shipped (fsynced) positions, computed together in-process.",
     /// Last segment-boundary LSN dispatched downstream; becomes durable once
     /// segment fsync lands
     gauge filter_lsn: Pos<FilterDispatched> =
@@ -737,6 +747,22 @@ const PLAN_FAILURE_REASONS: [&str; 11] = [
     "drain",
 ];
 
+/// `to=` label order of `MetricsSnapshot::source_lag_bytes`
+const SOURCE_LAG_TARGETS: [&str; 3] = ["ack", "filter", "shipped"];
+
+/// `(server_wal_end, lag to each of ack, filter, shipped)`. `wal_end` 0 means
+/// the socket has reported nothing, which reads as NaN rather than a lag
+/// equal to the whole position
+pub fn source_lag(wal_end: u64, positions: [u64; 3]) -> (f64, [f64; 3]) {
+    if wal_end == 0 {
+        return (f64::NAN, [f64::NAN; 3]);
+    }
+    (
+        wal_end as f64,
+        positions.map(|p| wal_end.saturating_sub(p) as f64),
+    )
+}
+
 /// `mode=` label order of [`DbSeries::config_backfills_pending_by_mode`]
 const BACKFILL_MODES: [&str; 3] = ["copy", "base_backup", "object_store"];
 
@@ -1142,6 +1168,33 @@ mod tests {
             assert!(failed, "prefix length {writes} must surface the failure");
             assert!(w.out.len() < full, "a failed encode cannot be complete");
         }
+    }
+
+    #[test]
+    fn source_lag_is_computed_together_and_saturates() {
+        let (end, lag) = source_lag(1_000, [400, 900, 1_200]);
+        assert_eq!(end, 1_000.0);
+        assert_eq!(lag, [600.0, 100.0, 0.0]);
+        let (end, lag) = source_lag(0, [5, 5, 5]);
+        assert!(end.is_nan() && lag.iter().all(|v| v.is_nan()));
+        let body = render(MetricsSnapshot {
+            source_server_wal_end_lsn: end,
+            source_lag_bytes: lag,
+            ..MetricsSnapshot::default()
+        });
+        assert!(body.contains("walshadow_source_server_wal_end_lsn NaN"));
+        assert!(body.contains("walshadow_source_lag_bytes{to=\"ack\"} NaN"));
+
+        let (server_wal_end_lsn, source_lag_bytes) = source_lag(1_000, [400, 900, 1_000]);
+        let body = render(MetricsSnapshot {
+            source_server_wal_end_lsn: server_wal_end_lsn,
+            source_lag_bytes,
+            ..MetricsSnapshot::default()
+        });
+        assert!(body.contains("walshadow_source_server_wal_end_lsn 1000"));
+        assert!(body.contains("walshadow_source_lag_bytes{to=\"ack\"} 600"));
+        assert!(body.contains("walshadow_source_lag_bytes{to=\"filter\"} 100"));
+        assert!(body.contains("walshadow_source_lag_bytes{to=\"shipped\"} 0"));
     }
 
     #[test]

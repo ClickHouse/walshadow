@@ -2208,6 +2208,8 @@ pub(crate) async fn run_session(
         populate_metrics(
             &metrics,
             received,
+            feed.last_server_wal_end(),
+            durable_lsn.get().get(),
             Pos::new(now_dispatched),
             shadow_replay,
             drain_for_metric,

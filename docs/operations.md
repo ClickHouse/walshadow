@@ -41,6 +41,18 @@ toward `source_received`. Short differences are expected while batches flush
 
 ## Monitor with Prometheus and Grafana
 
+Source position metrics, all from walshadow's own view:
+
+| Metric | Meaning |
+|---|---|
+| `walshadow_source_server_wal_end_lsn` | newest `server_wal_end` heard from the source socket; `NaN` before the first message, and frozen while archive recovery feeds the pump |
+| `walshadow_source_lag_bytes{to="ack\|filter\|shipped"}` | that position minus the ClickHouse ack, filter dispatch, and fsynced shipped positions, read at one instant; `NaN` with the position |
+| `walshadow_source_received_lsn` | the reported source head floored at the filter dispatch frontier, not WAL held locally |
+
+Prefer `walshadow_source_lag_bytes` to subtracting `walshadow_emitter_ack_lsn`
+from a primary LSN scraped elsewhere, which shows scrape-skew sawtooth at high
+WAL rates.
+
 Set `--metrics-bind` to expose OpenMetrics text metrics, which Prometheus
 scrapes directly. Counter series carry `_total`. Docker deployment uses port
 9484 and includes optional provisioned dashboard
