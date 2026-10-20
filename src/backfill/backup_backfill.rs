@@ -1960,7 +1960,7 @@ mod tests {
         let tail = OwnedTail::null();
         // Second registration of seq 0 wedges the ack collector
         for _ in 0..2 {
-            tail.ack.seqs(0).mark(0);
+            tail.ack.seqs(0).mark(0, None);
         }
         let barrier = WalkBarrier::new(std::time::Duration::from_millis(1));
         barrier

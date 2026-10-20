@@ -2315,6 +2315,7 @@ async fn session_body(
         // drained, not the top-of-iteration values.
         let emitter_ack_for_metric = emitter_ack.get();
         let drain_for_metric = xact_stats.drain_lsn;
+        let ack_commit_ts = ack_probe.borrow().ack_commit_ts;
         let streaming =
             path.mode(paused, crossing.pending()) == walshadow::metrics::SourceMode::Streaming;
         let source_wal_end = streaming.then(|| feed.last_server_wal_end());
@@ -2326,6 +2327,8 @@ async fn session_body(
             shadow_replay,
             drain_for_metric,
             emitter_ack_for_metric,
+            ack_commit_ts,
+            stream.filter().stats().last_commit_ts,
             &record_sink.metrics,
             record_sink.decoder_xact.in_flight(),
             record_sink.decoder_xact.processed(),
