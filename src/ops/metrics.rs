@@ -465,6 +465,8 @@ snapshot! {
     /// chain reads differently from one that merely survived
     gauge shadow_replay_timeline: u32 = "Timeline the shadow is replaying.",
     /// `source_received_lsn - min_apply_lsn` across active shadow walreceivers.
+    /// Holds its last value while no apply LSN is known (before the first
+    /// walreceiver status after a daemon start).
     /// Caller saturates to 0 when shadow is ahead; passes `source_received_lsn`
     /// when none connected (disconnect = max lag)
     gauge shadow_apply_lag_bytes: u64 =
