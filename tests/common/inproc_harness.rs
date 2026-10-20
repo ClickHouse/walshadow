@@ -634,8 +634,17 @@ impl Pipeline {
     }
 }
 
+/// Resource caps tests shrink to reach spill and admission-wait paths
+/// without a large workload
+#[derive(Default)]
+pub struct PipelineKnobs {
+    pub xact_buffer_max: Option<usize>,
+    /// Replaces the pool `build_budget` sizes from the emitter config
+    pub budget: Option<walshadow::budget::MemoryBudget>,
+}
+
 pub async fn build_pipeline(args: BuildPipelineArgs<'_>) -> Pipeline {
-    build_pipeline_inner(args, |_| {}, None).await
+    build_pipeline_inner(args, |_| {}, None, PipelineKnobs::default()).await
 }
 
 /// `build_pipeline` with final say over the emitter config (eg `[toast]`
@@ -645,7 +654,16 @@ pub async fn build_pipeline_with(
     args: BuildPipelineArgs<'_>,
     tune: impl FnOnce(&mut EmitterConfig),
 ) -> Pipeline {
-    build_pipeline_inner(args, tune, None).await
+    build_pipeline_inner(args, tune, None, PipelineKnobs::default()).await
+}
+
+/// `build_pipeline_with` under shrunken resource caps
+pub async fn build_pipeline_knobs(
+    args: BuildPipelineArgs<'_>,
+    tune: impl FnOnce(&mut EmitterConfig),
+    knobs: PipelineKnobs,
+) -> Pipeline {
+    build_pipeline_inner(args, tune, None, knobs).await
 }
 
 /// `build_pipeline` with the oracle wired in, so oracle-routed columns convert
@@ -657,13 +675,14 @@ pub async fn build_pipeline_tuned(
     tune: impl FnOnce(&mut EmitterConfig),
     oracle: Option<Arc<walshadow::oracle::Oracle>>,
 ) -> Pipeline {
-    build_pipeline_inner(args, tune, oracle).await
+    build_pipeline_inner(args, tune, oracle, PipelineKnobs::default()).await
 }
 
 async fn build_pipeline_inner(
     args: BuildPipelineArgs<'_>,
     tune: impl FnOnce(&mut EmitterConfig),
     oracle: Option<Arc<walshadow::oracle::Oracle>>,
+    knobs: PipelineKnobs,
 ) -> Pipeline {
     let BuildPipelineArgs {
         tmp,
@@ -732,7 +751,10 @@ async fn build_pipeline_inner(
 
     let spill_dir = tmp.path().join("spill");
     fs::create_dir_all(&spill_dir).unwrap();
-    let xact_buf_cfg = XactBufferConfig::new(spill_dir.clone());
+    let mut xact_buf_cfg = XactBufferConfig::new(spill_dir.clone());
+    if let Some(max) = knobs.xact_buffer_max {
+        xact_buf_cfg.xact_buffer_max = max;
+    }
     let xact_buffer = XactBuffer::new(xact_buf_cfg).expect("xact buffer");
     let xact_buffer = Arc::new(Mutex::new(xact_buffer));
 
@@ -954,7 +976,7 @@ async fn build_pipeline_inner(
         retires,
         pending_rows,
         resume_floor: resume_floor.clone(),
-        budget: None,
+        budget: knobs.budget,
     };
     let (booting, handle) = pcfg
         .spawn(emitter_ack.clone())

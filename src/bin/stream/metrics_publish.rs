@@ -563,13 +563,6 @@ pub(crate) fn stage_gauges_on(v: &StageCounters<'_>, base: MetricsSnapshot) -> M
                 |s| &s.plan_failures_drain,
             ],
         ),
-        route_snapshots_by_result: emitter_counts(
-            v.emitter,
-            [
-                |s| &s.route_snapshots_mapped,
-                |s| &s.route_snapshots_unmapped,
-            ],
-        ),
         raw_decode_records_by_kind_op: [
             emitter_ops(|s| &s.raw_decode_toast_ops),
             emitter_ops(|s| &s.raw_decode_ordinary_ops),

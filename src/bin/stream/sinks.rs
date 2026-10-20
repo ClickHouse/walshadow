@@ -30,10 +30,7 @@ impl<D: RecordSink + Send> RecordSink for DecoderXactPair<D> {
         &'a mut self,
         record: &'a Record<'a>,
     ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
-        Box::pin(async move {
-            self.decoder.on_record(record).await?;
-            self.xact_drain.on_record(record).await
-        })
+        self.on_records(std::slice::from_ref(record), &mut [])
     }
 
     /// Absorbs every heap record before draining any commit in the batch:
@@ -98,6 +95,16 @@ pub(crate) struct DaemonSinks {
     pub(crate) span_registry: Option<walshadow::trace::TxnSpanRegistry>,
 }
 
+impl DaemonSinks {
+    fn observe(&mut self, record: &Record<'_>) {
+        // Register at WAL read (pre-channel) so the span covers the queue wait.
+        if let Some(reg) = &self.span_registry {
+            reg.open(record.parsed.header.xact_id, record.source_lsn);
+        }
+        self.metrics.observe(record);
+    }
+}
+
 impl RecordSink for DaemonSinks {
     fn may_park(&self, record: &Record<'_>) -> bool {
         self.decoder_xact.may_park(record)
@@ -107,11 +114,7 @@ impl RecordSink for DaemonSinks {
         &'a mut self,
         record: &'a Record<'a>,
     ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
-        // Register at WAL read (pre-channel) so the span covers the queue wait.
-        if let Some(reg) = &self.span_registry {
-            reg.open(record.parsed.header.xact_id, record.source_lsn);
-        }
-        self.metrics.observe(record);
+        self.observe(record);
         // Inner future as is: one boxed future per record, not one per layer
         self.decoder_xact.on_record(record)
     }
@@ -120,10 +123,7 @@ impl RecordSink for DaemonSinks {
         &mut self,
         record: Record<'static>,
     ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + '_>> {
-        if let Some(reg) = &self.span_registry {
-            reg.open(record.parsed.header.xact_id, record.source_lsn);
-        }
-        self.metrics.observe(&record);
+        self.observe(&record);
         self.decoder_xact.on_record_owned(record)
     }
 }

@@ -16,7 +16,7 @@ use crate::catalog::shadow_catalog::CatalogError;
 use crate::ch::EmitterError;
 use crate::decode::heap_decoder::{CommittedTuple, DecodeError};
 use crate::record::SinkError;
-use walrus::pg::walparser::RmId;
+use walrus::pg::walparser::{RmId, XLogRecordHeader};
 
 #[derive(Debug, Error)]
 pub enum DecoderSinkError {
@@ -72,16 +72,15 @@ crate::atomic_stats! {
         /// WAL elided columns via `XLH_UPDATE_PREFIX_FROM_OLD` /
         /// `..._SUFFIX_FROM_OLD`; xact buffer reassembles from prev tuple image
         pub partial,
-        /// `record.parsed.blocks` empty: no relation. Heap LOCK / INPLACE /
-        /// TRUNCATE land here under the silent-skip policy
+        /// Heap record with empty `record.parsed.blocks`, so no relation
         pub skipped_no_block,
         /// [`ShadowCatalog`](crate::catalog::shadow_catalog::ShadowCatalog) returned
         /// `NotFoundByFilenode`. Causes: replay-LSN gate ahead of catalog
         /// mutation, mapping rotation, race with `seed_from_source`. Not
         /// retried, xact buffer can reorder
         pub catalog_not_found,
-        /// `User` relation but rmgr/info combo outside the type matrix
-        /// (MULTI_INSERT, HEAP2 PRUNE, etc)
+        /// Heap record or TRUNCATE that yielded no row change. LOCK, CONFIRM
+        /// and heap2 page maintenance never reach here, `wants` drops them
         pub skipped_op,
         /// `XLOG_HEAP_TRUNCATE` fanned out to per-relid `HeapOp::Truncate`
         pub truncates,
@@ -114,6 +113,7 @@ crate::atomic_stats! {
         /// says whether that mutex is the serial stage's limit
         pub buffer_lock_waits,
         pub buffer_lock_wait_nanos,
+        /// `[stream] skip_attribution`: attribute expected skips too
         pub attribute_skips: std::sync::atomic::AtomicBool,
         pub skipped_by_rel: SkipCounts,
     }
@@ -171,45 +171,6 @@ pub struct SkipKey {
 
 pub type SkipCounts = crate::emit::pipeline::row_ledger::KeyedCounts<SkipKey>;
 
-#[derive(Debug, Clone, Copy)]
-pub struct SkippedRecord {
-    pub reason: SkipReason,
-    pub db_oid: u32,
-    pub rel_node: u32,
-    pub rm: u8,
-    pub info: u8,
-    pub xid: u32,
-    pub lsn: u64,
-}
-
-impl SkippedRecord {
-    pub fn of(
-        record: &crate::record::Record<'_>,
-        reason: SkipReason,
-        db_oid: u32,
-        rel_node: u32,
-    ) -> Self {
-        let header = &record.parsed.header;
-        Self {
-            reason,
-            db_oid,
-            rel_node,
-            rm: header.resource_manager_id,
-            info: header.info,
-            xid: header.xact_id,
-            lsn: record.source_lsn,
-        }
-    }
-
-    pub fn on(
-        record: &crate::record::Record<'_>,
-        reason: SkipReason,
-        rfn: walrus::pg::walparser::RelFileNode,
-    ) -> Self {
-        Self::of(record, reason, rfn.db_node, rfn.rel_node)
-    }
-}
-
 #[derive(Debug, Default)]
 pub struct MetricsTupleObserver {
     pub stats: DecoderStats,
@@ -265,9 +226,22 @@ impl DecoderStats {
         }
     }
 
-    pub fn skip(&self, s: SkippedRecord) {
-        use crate::decode::heap_decoder::{HEAP_OP_LABELS, heap_op_index};
-        let aggregate = match s.reason {
+    /// Unexpected reasons always attribute, they signal row loss. Expected
+    /// ones attribute only under `attribute_skips`, so with it off they cost
+    /// one bump and one load
+    #[inline(always)]
+    pub fn skip(
+        &self,
+        reason: SkipReason,
+        header: &XLogRecordHeader,
+        lsn: u64,
+        db_oid: u32,
+        rel_node: u32,
+    ) {
+        if !reason.expected() || self.attribute_skips.load(Ordering::Relaxed) {
+            self.attribute_skip(reason, header, lsn, db_oid, rel_node);
+        }
+        let aggregate = match reason {
             SkipReason::NoBlock => Some(&self.skipped_no_block),
             SkipReason::TruncateUnparsed | SkipReason::NoTuple => Some(&self.skipped_op),
             SkipReason::IndexDropped => None,
@@ -276,48 +250,56 @@ impl DecoderStats {
         if let Some(aggregate) = aggregate {
             aggregate.fetch_add(1, Ordering::Relaxed);
         }
-        if !self.attribute_skips.load(Ordering::Relaxed) {
-            return;
-        }
-        let op = if s.rm == RmId::Heap as u8 || s.rm == RmId::Heap2 as u8 {
-            HEAP_OP_LABELS[heap_op_index(s.rm, s.info)]
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn attribute_skip(
+        &self,
+        reason: SkipReason,
+        header: &XLogRecordHeader,
+        lsn: u64,
+        db_oid: u32,
+        rel_node: u32,
+    ) {
+        use crate::decode::heap_decoder::{HEAP_OP_LABELS, heap_op_index};
+        let (rm, info) = (header.resource_manager_id, header.info);
+        let op = if rm == RmId::Heap as u8 || rm == RmId::Heap2 as u8 {
+            HEAP_OP_LABELS[heap_op_index(rm, info)]
         } else {
-            crate::record::rmgr_name(s.rm)
+            crate::record::rmgr_name(rm)
         };
         let key = SkipKey {
-            db_oid: s.db_oid,
-            rel_node: s.rel_node,
+            db_oid,
+            rel_node,
             op,
-            reason: s.reason,
+            reason,
         };
-        let prior = self
-            .skipped_by_rel
-            .counter(&key)
-            .fetch_add(1, Ordering::Relaxed);
-        if prior == 0 && !s.reason.expected() {
+        let prior = self.skipped_by_rel.bump(&key);
+        if prior == 0 && !reason.expected() {
             tracing::warn!(
                 target: "walshadow::decoder",
-                db_oid = s.db_oid,
-                rel_node = s.rel_node,
-                rm = s.rm,
-                info = s.info,
+                db_oid,
+                rel_node,
+                rm,
+                info,
                 op,
-                reason = s.reason.label(),
-                xid = s.xid,
-                lsn = %walrus::pg::backup::format_pg_lsn(s.lsn),
+                reason = reason.label(),
+                xid = header.xact_id,
+                lsn = %walrus::pg::backup::format_pg_lsn(lsn),
                 "first record skipped for relation",
             );
         } else {
             tracing::debug!(
                 target: "walshadow::decoder",
-                db_oid = s.db_oid,
-                rel_node = s.rel_node,
-                rm = s.rm,
-                info = s.info,
+                db_oid,
+                rel_node,
+                rm,
+                info,
                 op,
-                reason = s.reason.label(),
-                xid = s.xid,
-                lsn = %walrus::pg::backup::format_pg_lsn(s.lsn),
+                reason = reason.label(),
+                xid = header.xact_id,
+                lsn = %walrus::pg::backup::format_pg_lsn(lsn),
                 skipped = prior + 1,
                 "record skipped",
             );
@@ -452,50 +434,43 @@ mod tests {
 
     #[test]
     fn skip_splits_by_relation_and_reason() {
-        use walrus::pg::walparser::RmId;
         let s = DecoderStats::default();
-        s.skip(SkippedRecord {
-            reason: SkipReason::NotCovered,
-            db_oid: 5,
-            rel_node: 16399,
-            rm: RmId::Heap as u8,
-            info: 0,
-            xid: 7,
-            lsn: 0x1000,
-        });
-        assert!(s.skipped_by_rel.snapshot().is_empty(), "off by default");
-        assert_eq!(s.catalog_not_found.load(Ordering::Relaxed), 1);
-        s.catalog_not_found.store(0, Ordering::Relaxed);
-        s.attribute_skips.store(true, Ordering::Relaxed);
-        let skip = |reason, rel_node| SkippedRecord {
-            reason,
-            db_oid: 5,
-            rel_node,
-            rm: RmId::Heap as u8,
+        let header = XLogRecordHeader {
+            resource_manager_id: RmId::Heap as u8,
             info: crate::decode::heap_decoder::XLOG_HEAP_INSERT,
-            xid: 7,
-            lsn: 0x1000,
+            xact_id: 7,
+            ..Default::default()
         };
-        s.skip(skip(SkipReason::NotCovered, 16400));
-        s.skip(skip(SkipReason::NotCovered, 16400));
-        s.skip(skip(SkipReason::Retired, 16401));
-        s.skip(skip(SkipReason::NoTuple, 16400));
-        s.skip(skip(SkipReason::NoBlock, 0));
-        let ld = |a: &AtomicU64| a.load(Ordering::Relaxed);
-        assert_eq!(ld(&s.catalog_not_found), 3);
-        assert_eq!(ld(&s.skipped_op), 1);
-        assert_eq!(ld(&s.skipped_no_block), 1);
+        let skip = |reason, rel_node| s.skip(reason, &header, 0x1000, 5, rel_node);
         let key = |rel_node, reason| SkipKey {
             db_oid: 5,
             rel_node,
             op: "insert",
             reason,
         };
+        skip(SkipReason::Retired, 16399);
+        skip(SkipReason::NotCovered, 16399);
+        assert_eq!(
+            s.skipped_by_rel.snapshot(),
+            vec![(key(16399, SkipReason::NotCovered), 1)],
+            "flag off attributes only unexpected reasons",
+        );
+        s.attribute_skips.store(true, Ordering::Relaxed);
+        skip(SkipReason::NotCovered, 16400);
+        skip(SkipReason::NotCovered, 16400);
+        skip(SkipReason::Retired, 16401);
+        skip(SkipReason::NoTuple, 16400);
+        skip(SkipReason::NoBlock, 0);
+        let ld = |a: &AtomicU64| a.load(Ordering::Relaxed);
+        assert_eq!(ld(&s.catalog_not_found), 5);
+        assert_eq!(ld(&s.skipped_op), 1);
+        assert_eq!(ld(&s.skipped_no_block), 1);
         assert_eq!(
             s.skipped_by_rel.snapshot(),
             vec![
                 (key(16400, SkipReason::NotCovered), 2),
                 (key(0, SkipReason::NoBlock), 1),
+                (key(16399, SkipReason::NotCovered), 1),
                 (key(16400, SkipReason::NoTuple), 1),
                 (key(16401, SkipReason::Retired), 1),
             ],

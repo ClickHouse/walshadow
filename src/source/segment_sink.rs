@@ -6,6 +6,7 @@ use std::pin::Pin;
 
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+use tokio_util::task::TaskTracker;
 use walrus::pg::wal::segment::SegmentName;
 
 use crate::pos::{Durable, FilterDurable, Pos};
@@ -39,6 +40,8 @@ enum Durability {
     Background {
         seg_size: u64,
         tx: mpsc::Sender<SegFsync>,
+        /// Owner waits out a write `close()` never joined
+        io: TaskTracker,
         /// Previous segment's write, yielding its buffer back for reuse
         in_flight: Option<JoinHandle<Result<Vec<u8>, SinkError>>>,
     },
@@ -62,6 +65,7 @@ impl DirSegmentSink {
         out_dir: PathBuf,
         seg_size: u64,
         tx: mpsc::Sender<SegFsync>,
+        io: TaskTracker,
     ) -> Result<Self, SinkError> {
         std::fs::create_dir_all(&out_dir)?;
         Ok(Self {
@@ -69,6 +73,7 @@ impl DirSegmentSink {
             durability: Durability::Background {
                 seg_size,
                 tx,
+                io,
                 in_flight: None,
             },
         })
@@ -92,6 +97,7 @@ impl DirSegmentSink {
         let Durability::Background {
             seg_size,
             tx,
+            io,
             in_flight,
         } = &mut self.durability
         else {
@@ -112,7 +118,7 @@ impl DirSegmentSink {
             seg_path,
         };
         let tx = tx.clone();
-        *in_flight = Some(tokio::task::spawn_blocking(move || {
+        *in_flight = Some(io.spawn_blocking(move || {
             std::fs::write(&seg_tmp, &buf)?;
             std::fs::rename(&seg_tmp, &fsync.seg_path)?;
             tx.blocking_send(fsync)
@@ -153,4 +159,39 @@ async fn write_sync_rename(tmp: &Path, final_path: &Path, bytes: &[u8]) -> Resul
     drop(file);
     tokio::fs::rename(tmp, final_path).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::record::WAL_SEG_SIZE;
+
+    /// Full fsync queue parks write after rename, so only tracking keeps it
+    /// visible once sink drops without `close()`
+    #[tokio::test]
+    async fn dropped_sink_leaves_write_tracked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (tx, mut rx) = mpsc::channel(1);
+        let filler = SegFsync {
+            end_lsn: Pos::new(0),
+            seg_path: PathBuf::new(),
+        };
+        tx.send(filler).await.unwrap();
+        let io = TaskTracker::new();
+        let mut sink =
+            DirSegmentSink::with_durability(tmp.path().to_path_buf(), WAL_SEG_SIZE, tx, io.clone())
+                .unwrap();
+        let seg = SegmentName::parse("000000010000000000000003").unwrap();
+        let bytes = [0xAAu8; 64];
+        sink.on_segment(seg, &bytes).await.unwrap();
+        drop(sink);
+        io.close();
+        assert_eq!(io.len(), 1);
+        rx.recv().await.unwrap();
+        io.wait().await;
+        let seg_path = tmp.path().join(seg.format());
+        assert_eq!(rx.recv().await.unwrap().seg_path(), seg_path);
+        assert_eq!(std::fs::read(&seg_path).unwrap(), bytes);
+        assert!(!tmp.path().join(format!("{}.tmp", seg.format())).exists());
+    }
 }

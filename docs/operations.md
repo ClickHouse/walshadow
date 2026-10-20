@@ -60,6 +60,10 @@ Watch:
 - pending backfills
 - timeline crossing and endpoint swap failures
 
+If decoder queue stays deep, check `walshadow_queue_records_out_total` for
+progress. Use rate of `walshadow_decoder_buffer_lock_wait_seconds_total` to
+measure time spent waiting for transaction buffer lock
+
 Metrics for work a source database owns carry a `database=` label: bridge
 requests, descriptor log and capture counters, and config overlay counters.
 Sum them when a panel wants one number for the daemon. Cluster WAL positions,

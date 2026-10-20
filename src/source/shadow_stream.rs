@@ -538,9 +538,12 @@ impl ShadowStreamState {
     }
 
     /// Swap queued bytes into `buf`, leaving its cleared capacity for the
-    /// pump to fill instead of regrowing a fresh queue
+    /// pump to fill instead of regrowing a fresh queue. Capacity past a few
+    /// source chunks is backfill or burst residue, released here
     pub fn swap_send_queue(&mut self, id: u64, buf: &mut Vec<u8>) {
+        const KEEP: usize = 1 << 20;
         buf.clear();
+        buf.shrink_to(KEEP);
         if let Some(q) = self.send_queues.get_mut(&id) {
             std::mem::swap(q, buf);
         }
@@ -1281,6 +1284,33 @@ mod tests {
             .expect("current timeline");
         let q = s.drain_send_queue(id).expect("reconnect backfilled");
         assert_eq!(&q[WIRE_HDR..], b"AAAABBBB", "backfill must be gap-free");
+    }
+
+    /// Backfill-sized queue capacity does not ride the swap buffers for the
+    /// connection's lifetime
+    #[tokio::test(flavor = "current_thread")]
+    async fn swap_releases_backfill_capacity() {
+        let state = Arc::new(Mutex::new(ShadowStreamState::new(
+            1,
+            "12345".into(),
+            0x1000,
+            16 << 20,
+        )));
+        let mut sink = ShadowStreamSink::new(state.clone());
+        let wal = vec![7u8; 4 << 20];
+        sink.on_wire_chunk(0x1000, &wal).await.unwrap();
+        let mut s = state.lock().await;
+        let id = s
+            .register_connection(0x1000, 1, None)
+            .expect("current timeline");
+        let mut pending = Vec::new();
+        s.swap_send_queue(id, &mut pending);
+        assert!(pending.len() > wal.len(), "backfill queued");
+        s.swap_send_queue(id, &mut pending);
+        assert!(pending.is_empty());
+        s.swap_send_queue(id, &mut pending);
+        assert!(pending.capacity() <= 1 << 20, "{}", pending.capacity());
+        assert!(s.send_queues[&id].capacity() <= 1 << 20);
     }
 
     #[tokio::test(flavor = "current_thread")]

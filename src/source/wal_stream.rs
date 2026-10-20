@@ -54,6 +54,12 @@ use crate::source::resume_prefix::ResumePrefix;
 use crate::source::segment_sink::{DirSegmentSink, SegFsync};
 use crate::source::streaming_walker::{CompletedRecord, StreamingWalker, WalkError};
 
+/// Staging bounds. Replay pushes whole segments, so without them a full
+/// segment of records stages before shadow sees a byte; byte bound matches
+/// walsender's `MAX_SEND_SIZE` so replay ships at streaming cadence
+const STAGED_MAX_BYTES: usize = 128 * 1024;
+const STAGED_MAX_RECORDS: usize = 4096;
+
 #[derive(Debug, Error)]
 pub enum WalStreamError {
     #[error("walk segment {seg}: {source}")]
@@ -323,9 +329,10 @@ impl WalStream {
     /// apply LSN, not against `restore_command` segment landing.
     ///
     /// Records stage until one may park on shadow replay
-    /// ([`RecordSink::may_park`]) or the walker runs dry; then their bytes
-    /// ship as one chunk and they dispatch in order. A parking record ends
-    /// its run, so no successor byte reaches the wire while it holds
+    /// ([`RecordSink::may_park`]), staging crosses a bound, or the walker
+    /// runs dry; then their bytes ship as one chunk and they dispatch in
+    /// order. A parking record ends its run, so no successor byte reaches
+    /// the wire while it holds
     async fn drain_records(
         &mut self,
         record_sink: &mut (dyn RecordSink + Send),
@@ -418,7 +425,10 @@ impl WalStream {
             };
             let parks = record_sink.may_park(&record);
             self.staged.push(record);
-            if parks {
+            if parks
+                || self.staged.len() >= STAGED_MAX_RECORDS
+                || self.staged_end - self.wire_offset >= STAGED_MAX_BYTES
+            {
                 self.dispatch_staged(record_sink).await?;
             }
         }
@@ -878,8 +888,10 @@ mod tests {
     async fn dir_sink_with_durability_writes_behind_and_enqueues_fsync() {
         let tmp = tempfile::tempdir().unwrap();
         let (tx, mut rx) = mpsc::channel::<SegFsync>(4);
+        let io = tokio_util::task::TaskTracker::new();
         let mut sink =
-            DirSegmentSink::with_durability(tmp.path().to_path_buf(), WAL_SEG_SIZE, tx).unwrap();
+            DirSegmentSink::with_durability(tmp.path().to_path_buf(), WAL_SEG_SIZE, tx, io)
+                .unwrap();
         let seg = SegmentName::parse("000000010000000000000003").unwrap();
         let next = SegmentName::parse("000000010000000000000004").unwrap();
         let bytes = [0xAAu8; 64];
@@ -1682,5 +1694,107 @@ mod tests {
             "wire_buf retained {len} bytes across a straddling boundary (> {})",
             2 * SEG,
         );
+    }
+
+    /// Push one segment of inert records packed exactly into pages, since
+    /// walker reads a zero page tail as end of WAL. Returns
+    /// `(wire chunk len, records dispatched after it)` per chunk and total
+    /// record count
+    async fn whole_segment_runs(seg: u64, record_len: usize) -> (Vec<(usize, usize)>, usize) {
+        use walrus::pg::walparser::{WAL_PAGE_SIZE, XLP_PAGE_MAGIC_PG15};
+        const PAGE: usize = WAL_PAGE_SIZE as usize;
+        // Header 24 bytes, short data block 2 bytes
+        let clog = |len: usize| {
+            let data = (len > 24).then(|| vec![0; len - 26]);
+            raw_rec(RmId::Clog as u8, 0, 0, None, data.as_deref())
+        };
+        let fill = |mut room: usize| {
+            let mut records = Vec::new();
+            while room > record_len + 64 {
+                records.push(clog(record_len));
+                room -= record_len;
+            }
+            while room > 64 {
+                records.push(clog(24));
+                room -= 24;
+            }
+            records.push(clog(room));
+            records
+        };
+        let mut bytes = page_of(&fill(PAGE - 40), PAGE);
+        bytes[24..28].copy_from_slice(&(seg as u32).to_le_bytes());
+        let mut total = fill(PAGE - 40).len();
+        for i in 1..seg as usize / PAGE {
+            bytes.extend_from_slice(&XLP_PAGE_MAGIC_PG15.to_le_bytes());
+            bytes.extend_from_slice(&0u16.to_le_bytes()); // short header
+            bytes.extend_from_slice(&1u32.to_le_bytes()); // timeline
+            bytes.extend_from_slice(&((i * PAGE) as u64).to_le_bytes());
+            bytes.extend_from_slice(&0u32.to_le_bytes()); // remaining_data_len
+            bytes.extend_from_slice(&[0u8; 4]); // pad to 24
+            let records = fill(PAGE - 24);
+            total += records.len();
+            bytes.extend(records.concat());
+        }
+        assert_eq!(bytes.len(), seg as usize);
+
+        type Runs = std::sync::Arc<std::sync::Mutex<Vec<(usize, usize)>>>;
+        let runs: Runs = Runs::default();
+        struct ChunkLog(Runs);
+        impl RecordBytesSink for ChunkLog {
+            fn on_wire_chunk<'a>(
+                &'a mut self,
+                _start_lsn: u64,
+                bytes: &'a [u8],
+            ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
+                self.0.lock().unwrap().push((bytes.len(), 0));
+                Box::pin(std::future::ready(Ok(())))
+            }
+        }
+        struct NeverParks(Runs);
+        impl RecordSink for NeverParks {
+            fn on_record<'a>(
+                &'a mut self,
+                _record: &'a Record<'a>,
+            ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
+                self.0.lock().unwrap().last_mut().unwrap().1 += 1;
+                Box::pin(std::future::ready(Ok(())))
+            }
+
+            fn may_park(&self, _record: &Record<'_>) -> bool {
+                false
+            }
+        }
+
+        let mut ws = WalStream::builder(1, seg, Pos::ZERO).unwrap();
+        ws.set_bytes_sink(Box::new(ChunkLog(runs.clone())));
+        let mut ws = ws.start();
+        let mut segs = CollectingSegmentSink::default();
+        ws.push(0, &bytes, &mut NeverParks(runs.clone()), &mut segs)
+            .await
+            .unwrap();
+        assert_eq!(segs.segments.len(), 1);
+        let runs = runs.lock().unwrap().clone();
+        (runs, total)
+    }
+
+    /// Replay pushes a whole segment at once; staging must still dispatch
+    /// in bounded runs rather than once at segment end. Small records trip
+    /// record bound, large records byte bound
+    #[tokio::test(flavor = "current_thread")]
+    async fn whole_segment_push_dispatches_in_bounded_runs() {
+        const SEG: u64 = 32 * 8192;
+        for record_len in [24, 280] {
+            let (runs, total) = whole_segment_runs(SEG, record_len).await;
+            let dispatches: Vec<_> = runs.iter().filter(|(_, n)| *n > 0).collect();
+            assert!(
+                dispatches.len() > 1,
+                "one dispatch for {record_len}B records"
+            );
+            assert_eq!(dispatches.iter().map(|(_, n)| n).sum::<usize>(), total);
+            for &&(len, n) in &dispatches {
+                assert!(n <= STAGED_MAX_RECORDS, "{n} records staged");
+                assert!(len < STAGED_MAX_BYTES + record_len, "{len} bytes staged");
+            }
+        }
     }
 }

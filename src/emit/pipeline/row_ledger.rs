@@ -38,6 +38,20 @@ impl<K: Eq + Hash + Ord + Clone> KeyedCounts<K> {
             .clone()
     }
 
+    /// Add one, returning the prior count. Skips the handle's refcount
+    /// traffic for callers that don't hold it
+    pub fn bump(&self, key: &K) -> u64 {
+        if let Some(n) = self.counts.read().expect("keyed counts lock").get(key) {
+            return n.fetch_add(1, Ordering::Relaxed);
+        }
+        self.counts
+            .write()
+            .expect("keyed counts lock")
+            .entry(key.clone())
+            .or_default()
+            .fetch_add(1, Ordering::Relaxed)
+    }
+
     /// Heaviest first
     pub fn snapshot(&self) -> Vec<(K, u64)> {
         let mut rows: Vec<_> = self

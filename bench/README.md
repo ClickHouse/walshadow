@@ -30,6 +30,11 @@ Bootstrap deferred spool and emit plan spool, write then verified replay:
 cargo bench --bench spool_read -- --rows 200000 --payload-bytes 256
 ```
 
+## pgbench workload
+
+Small-transaction source load for queueing worker throughput, see
+[pgbench/README.md](pgbench/README.md)
+
 ## Local runs
 
 Start PostgreSQL, ClickHouse, and walshadow with SQL runtime config installed

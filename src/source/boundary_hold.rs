@@ -193,10 +193,6 @@ impl PendingDatabases {
         }
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.waiting.is_empty()
-    }
-
     fn hit(&self, record: &Record<'_>) -> Option<&PendingDatabase> {
         self.waiting.iter().find(|p| {
             record.source_lsn >= p.visible_at
@@ -388,8 +384,8 @@ impl RecordSink for BoundaryHoldSink {
             let held = match held {
                 Ok(held) => held,
                 Err(hold_err) => {
-                    // Prefer the worker's parked root cause over the generic
-                    // hold error (empty-buffer flush only drains the err slot)
+                    // Dead worker fails flush with its own error, so hold error
+                    // only surfaces on timeout
                     self.inner.flush().await?;
                     return Err(hold_err);
                 }
@@ -757,5 +753,80 @@ mod tests {
         };
         let err = sink.on_record(&rec).await.expect_err("must fail");
         assert!(err.to_string().contains("boom"), "{err}");
+    }
+
+    fn boundary() -> Record<'static> {
+        Record {
+            source_lsn: 0x1F00,
+            next_lsn: 0x2000,
+            boundary_info: Some(Arc::new(crate::record::BoundaryInfo::default())),
+            ..Default::default()
+        }
+    }
+
+    /// Database visible from LSN 0 whose bridge never listens
+    fn pending_sink(gate: CatalogBoundaryGate) -> BoundaryHoldSink {
+        let q = QueueingRecordSink::spawn(CountingRecordSink::default(), 4, 16, None);
+        let db = PendingDatabase {
+            oid: 5,
+            name: "late".into(),
+            visible_at: 0,
+            bridge_socket: PathBuf::new(),
+        };
+        BoundaryHoldSink::new(q, gate).with_pending(PendingDatabases::new(
+            vec![db],
+            Duration::ZERO,
+            AttachSlot::default(),
+        ))
+    }
+
+    #[tokio::test]
+    async fn sink_boundary_timeout_surfaces_hold_error() {
+        // No walreceiver, worker alive: hold's own error is the cause
+        let q = QueueingRecordSink::spawn(CountingRecordSink::default(), 4, 16, None);
+        let mut sink = BoundaryHoldSink::new(q, gate_with(state(), Duration::from_millis(10)));
+        let err = sink.on_record(&boundary()).await.expect_err("timeout");
+        assert!(err.to_string().contains("timed out"), "{err}");
+        sink.close().await.expect("close");
+    }
+
+    #[tokio::test]
+    async fn pending_attach_timeout_surfaces_hold_error() {
+        let mut sink = pending_sink(gate_with(state(), Duration::from_millis(10)));
+        let err = sink.on_record(&boundary()).await.expect_err("timeout");
+        assert!(err.to_string().contains("timed out"), "{err}");
+        sink.close().await.expect("close");
+    }
+
+    #[tokio::test]
+    async fn pending_attach_fails_when_bridge_never_listens() {
+        let s = state();
+        let id = s
+            .lock()
+            .await
+            .register_connection(0x1000, 1, None)
+            .expect("current timeline");
+        s.lock()
+            .await
+            .observe_status(id, 0x2000, Pos::new(0x2000), Pos::new(0x2000));
+        let mut sink = pending_sink(gate_with(s, Duration::from_secs(5)));
+        let err = sink.on_record(&boundary()).await.expect_err("no bridge");
+        assert!(err.to_string().contains("never came up"), "{err}");
+        assert!(sink.pending.attached.lock().unwrap().is_none());
+        sink.close().await.expect("close");
+    }
+
+    #[tokio::test]
+    async fn aborted_tree_without_boundary_forwards() {
+        let q = QueueingRecordSink::spawn(CountingRecordSink::default(), 1, 4, None);
+        let mut sink = BoundaryHoldSink::new(q, gate_with(state(), Duration::from_millis(10)));
+        let rec = Record {
+            aborted_tree: Some(Arc::new(vec![7])),
+            ..Default::default()
+        };
+        assert!(sink.may_park(&rec));
+        sink.on_record(&rec).await.expect("forwarded");
+        assert_eq!(sink.gate.stats.failures.load(Ordering::Relaxed), 0);
+        sink.close().await.expect("close");
     }
 }
