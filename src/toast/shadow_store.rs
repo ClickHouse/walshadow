@@ -114,24 +114,19 @@ impl ShadowToastStore {
     /// does not require more pump progress.
     ///
     /// Poll here instead of blocking worker, which must remain available for
-    /// catalog reads. Return replay floor for standby request. Return zero for
-    /// primary, which has no replay position.
+    /// catalog reads.
     ///
     /// Supervisor restarts postmaster after a GUC floor change stops it
     /// Worker socket cannot accept connections during restart. Treat that like
     /// stalled replay and restart timeout whenever replay position changes
-    async fn await_replay(&self, bridge: &Bridge, through: u64) -> Result<u64, ChunkStoreError> {
-        // Primary files are complete before service and have no replay position
-        if through == 0 || !bridge.info().in_recovery {
-            return Ok(0);
-        }
+    async fn await_replay(&self, bridge: &Bridge, through: u64) -> Result<(), ChunkStoreError> {
         let mut since = Instant::now();
         let mut last: Option<u64> = None;
         let mut unreachable = false;
         let mut poll = REPLAY_POLL;
         loop {
             match bridge.replay_lsn().await {
-                Ok(at) if at >= through => return Ok(through),
+                Ok(at) if at >= through => return Ok(()),
                 Ok(at) => {
                     if unreachable || last != Some(at) {
                         since = Instant::now();
@@ -197,22 +192,46 @@ impl ChunkStore for ShadowToastStore {
             return Ok(Vec::new());
         }
         let bridge = self.bridge().await?;
-        // Wait once for complete batch
-        let floor = self.await_replay(bridge, max_lsn).await?;
         // Batch bound is the newest referring record, so its ceiling covers
         // every value here
         let ceiling = self.read.ceiling.at(max_lsn);
-        let mut out = Vec::with_capacity(values.len());
-        // Split resolver batch to satisfy wire limits
-        for slice in request_slices(values) {
-            let got = bridge
-                .fetch_toast(toast_relid, slice, floor)
-                .await
-                .map_err(|e| ChunkStoreError::Shadow(e.to_string()))?;
-            out.extend(got.into_iter().map(|c| judge(c, ceiling)));
+        // Primary files are complete before service, and a primary's replay
+        // position stays where crash recovery ended
+        let floor = if bridge.info().in_recovery {
+            max_lsn
+        } else {
+            0
+        };
+        // Worker refuses a floor above its replay position, so read first and
+        // wait for replay only once refused or unreachable. Wait and read once
+        // more for a restart that rewinds replay between the wait and the read
+        let mut waits = 0;
+        loop {
+            match read_values(bridge, toast_relid, values, floor, ceiling).await {
+                Err(BridgeError::Remote(_) | BridgeError::Io(_)) if floor != 0 && waits < 2 => {
+                    waits += 1;
+                }
+                got => return got.map_err(|e| ChunkStoreError::Shadow(e.to_string())),
+            }
+            self.await_replay(bridge, floor).await?;
         }
-        Ok(out)
     }
+}
+
+/// Split resolver batch to satisfy wire limits
+async fn read_values(
+    bridge: &Bridge,
+    toast_relid: u32,
+    values: &[(u32, usize)],
+    floor: u64,
+    ceiling: u32,
+) -> Result<Vec<FetchedValue>, BridgeError> {
+    let mut out = Vec::with_capacity(values.len());
+    for slice in request_slices(values) {
+        let got = bridge.fetch_toast(toast_relid, slice, floor).await?;
+        out.extend(got.into_iter().map(|c| judge(c, ceiling)));
+    }
+    Ok(out)
 }
 
 /// Detect reused IDs from chunks newer than referring record
@@ -296,6 +315,41 @@ mod tests {
             FetchedValue::Generation,
             "xid order wraps",
         );
+    }
+
+    /// Standby refuses reads above its replay position. A read polls replay
+    /// only after a refusal, then retries, once more for a restart between
+    /// the poll and the read, and then returns the refusal
+    #[tokio::test(flavor = "current_thread")]
+    async fn refused_read_waits_for_replay_and_retries() {
+        use crate::ops::bridge::tests::{
+            fetch_body, hello_body, lsn_body, remote_body, spawn_worker,
+        };
+        use crate::ops::bridge::{Op, PROJECTION_VERSION, PROTO_VERSION};
+        use std::sync::atomic::Ordering;
+        for refusals in 0..4u64 {
+            let mut script = vec![Some(hello_body(PROTO_VERSION, PROJECTION_VERSION))];
+            for i in 0..refusals {
+                script.push(Some(remote_body("replay below the requested floor")));
+                if i < 2 {
+                    script.push(Some(lsn_body(0x2000)));
+                }
+            }
+            script.push(Some(fetch_body(&[b"v"])));
+            let (_tmp, path) = spawn_worker(script);
+            let bridge = Arc::new(Bridge::connect(&path).await.unwrap());
+            let store = ShadowToastStore::new(bridge.clone()).with_replay_wait_max(REPLAY_POLL);
+            let got = store.fetch(0, 1, 7, 0x2000, 1).await;
+            if refusals < 3 {
+                assert_eq!(got.unwrap(), FetchedValue::Assembled(b"v".to_vec()));
+            } else {
+                let err = got.unwrap_err().to_string();
+                assert!(err.contains("below the requested"), "{err}");
+            }
+            let sent = |op: Op| bridge.stats.requests[op.slot()].load(Ordering::Relaxed);
+            assert_eq!(sent(Op::ReplayLsn), refusals.min(2), "{refusals} refusals");
+            assert_eq!(sent(Op::FetchToast), refusals.min(2) + 1);
+        }
     }
 
     #[test]

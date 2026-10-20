@@ -67,7 +67,7 @@ pub const OP_COUNT: usize = OP_LABELS.len();
 
 impl Op {
     /// Index into the per-op stat arrays, parallel to [`OP_LABELS`]
-    fn slot(self) -> usize {
+    pub(crate) fn slot(self) -> usize {
         self as usize - 1
     }
 
@@ -1153,7 +1153,7 @@ fn text(b: &[u8]) -> Result<String, BridgeError> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use tokio::net::UnixListener;
 
@@ -1267,13 +1267,41 @@ mod tests {
         out
     }
 
-    fn hello_body(proto: u32, projection: u32) -> Vec<u8> {
+    /// Standby worker's `HELLO`
+    pub(crate) fn hello_body(proto: u32, projection: u32) -> Vec<u8> {
         let mut b = vec![0u8];
         b.extend_from_slice(&proto.to_be_bytes());
         b.extend_from_slice(&projection.to_be_bytes());
         b.extend_from_slice(&170004u32.to_be_bytes());
         b.push(1);
         b.extend_from_slice(&16384u32.to_be_bytes());
+        b
+    }
+
+    pub(crate) fn lsn_body(lsn: u64) -> Vec<u8> {
+        let mut b = vec![0u8];
+        b.extend_from_slice(&lsn.to_be_bytes());
+        b
+    }
+
+    /// Error status, as the worker answers any request it refuses
+    pub(crate) fn remote_body(msg: &str) -> Vec<u8> {
+        let mut b = vec![1u8];
+        b.extend_from_slice(&(msg.len() as u32).to_be_bytes());
+        b.extend_from_slice(msg.as_bytes());
+        b
+    }
+
+    /// `FETCH_TOAST` answer of whole values without chunk `xmin`
+    pub(crate) fn fetch_body(values: &[&[u8]]) -> Vec<u8> {
+        let mut b = vec![0u8];
+        b.extend_from_slice(&(values.len() as u32).to_be_bytes());
+        for v in values {
+            b.push(0);
+            b.extend_from_slice(&0u32.to_be_bytes());
+            b.extend_from_slice(&(v.len() as u32).to_be_bytes());
+            b.extend_from_slice(v);
+        }
         b
     }
 
@@ -1297,7 +1325,7 @@ mod tests {
         }
     }
 
-    fn spawn_worker(script: Vec<Option<Vec<u8>>>) -> (tempfile::TempDir, PathBuf) {
+    pub(crate) fn spawn_worker(script: Vec<Option<Vec<u8>>>) -> (tempfile::TempDir, PathBuf) {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("bridge.sock");
         let listener = UnixListener::bind(&path).unwrap();
@@ -1454,12 +1482,9 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn remote_error_status_keeps_bridge_up() {
-        let mut body = vec![1u8];
-        body.extend_from_slice(&5u32.to_be_bytes());
-        body.extend_from_slice(b"nope!");
         let (_tmp, path) = spawn_worker(vec![
             Some(hello_body(PROTO_VERSION, PROJECTION_VERSION)),
-            Some(body),
+            Some(remote_body("nope!")),
         ]);
 
         let bridge = Bridge::connect(&path).await.unwrap();
@@ -1471,14 +1496,12 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn dropped_connection_reconnects_and_retries() {
-        let mut lsn = vec![0u8];
-        lsn.extend_from_slice(&0xdeadu64.to_be_bytes());
         let (_tmp, path) = spawn_worker(vec![
             Some(hello_body(PROTO_VERSION, PROJECTION_VERSION)),
             // worker exits mid-request
             None,
             Some(hello_body(PROTO_VERSION, PROJECTION_VERSION)),
-            Some(lsn),
+            Some(lsn_body(0xdead)),
         ]);
 
         let bridge = Bridge::connect(&path).await.unwrap();

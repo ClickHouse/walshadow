@@ -1163,6 +1163,14 @@ fn spawn_toast_worker(
                     Some(&0x04) => {
                         body.extend_from_slice(&lsn.load(Ordering::Relaxed).to_be_bytes())
                     }
+                    // Refuse a floor above replay, as `ws_handle_fetch_toast` does
+                    _ if u64::from_be_bytes(req[1..9].try_into().unwrap())
+                        > lsn.load(Ordering::Relaxed) =>
+                    {
+                        body = vec![1];
+                        body.extend_from_slice(&5u32.to_be_bytes());
+                        body.extend_from_slice(b"below");
+                    }
                     _ => {
                         body.extend_from_slice(&1u32.to_be_bytes());
                         body.push(0);

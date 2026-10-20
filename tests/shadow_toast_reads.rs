@@ -923,9 +923,11 @@ async fn shadow_store_reads_and_refuses_writes() {
     let v = seed_value(&sql, "t_store", "repeat('ab', 120000)", true).await;
 
     let store = ShadowToastStore::new(bridge);
+    // A primary's replay position stays where crash recovery ended, so the
+    // store must read at floor 0 whatever the bound
     assert_eq!(
         store
-            .fetch(0, v.toast_relid, v.value_id, 0, v.extsize)
+            .fetch(0, v.toast_relid, v.value_id, u64::MAX, v.extsize)
             .await
             .expect("fetch"),
         FetchedValue::Assembled(v.raw.clone().into_bytes()),
