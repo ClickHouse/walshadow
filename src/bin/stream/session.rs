@@ -117,7 +117,7 @@ async fn await_walreceiver(
         // `accepted` separates "shadow never dialed" from "shadow dialed
         // and stalled in the handshake" — the latter reads as the former
         // without it, since only START_REPLICATION registers a connection
-        let (secs, accepted) = (timeout.as_secs(), agg.accepted_total);
+        let (secs, accepted) = (timeout.as_secs(), agg.accepted());
         anyhow::ensure!(
             start.elapsed() < timeout,
             "no walreceiver streaming from walsender {walsender_addr} within \
@@ -2346,7 +2346,9 @@ async fn session_body(
             ShadowMetricsView {
                 apply_lag,
                 active_connections: shadow_agg.active_connections as u64,
-                dropped_total: shadow_agg.dropped_total,
+                socket_events: shadow_agg.socket_events,
+                backfill_bytes_total: shadow_agg.backfill_bytes_total,
+                send_queue_bytes: shadow_agg.send_queue_bytes,
             },
             &boundary_hold_stats,
             metrics_dbs.iter().map(DbMetricSources::series).collect(),
