@@ -130,10 +130,11 @@ Apply live:
 - pause state
 - batch sizes, flush timeout, compression, and retry count
 - source and ClickHouse endpoints
-- `[stream] skip_attribution` (default `false`): count skipped and
+- `[stream] skip_attribution` (default `false`): count expected skips and
   filter-dropped records per relation in
-  `walshadow_decoder_skipped_records_total`. Costs a map lookup per ignored
-  record, dropped index records included
+  `walshadow_decoder_skipped_records_total`. Adds a map lookup per counted
+  record. Skips that can lose rows are always counted and logged as warnings.
+  Row locks and page maintenance are not counted
 
 Require restart:
 

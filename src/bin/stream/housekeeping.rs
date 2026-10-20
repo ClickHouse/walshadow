@@ -73,8 +73,9 @@ pub(crate) fn spawn_desc_log_gc(
     desc_log: Arc<walshadow::desc_log::DescriptorLog>,
     floor: Gate<Floor>,
     fatal: walshadow::pipeline::Fatal,
+    io: &tokio_util::task::TaskTracker,
 ) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
+    io.spawn(async move {
         let mut cut = floor.current();
         loop {
             if let Err(e) = desc_log.maybe_gc(cut).await {
@@ -178,8 +179,10 @@ mod tests {
     async fn queued_segments_publish_highest_end() {
         let tmp = tempfile::tempdir().unwrap();
         let (tx, rx) = tokio::sync::mpsc::channel(SEGMENT_FSYNC_QUEUE);
+        let io = tokio_util::task::TaskTracker::new();
         let mut sink =
-            DirSegmentSink::with_durability(tmp.path().to_path_buf(), WAL_SEG_SIZE, tx).unwrap();
+            DirSegmentSink::with_durability(tmp.path().to_path_buf(), WAL_SEG_SIZE, tx, io)
+                .unwrap();
         let segs = segments_covering(1, 0..3 * WAL_SEG_SIZE);
         for seg in &segs {
             sink.on_segment(*seg, &[0u8; 64]).await.unwrap();
@@ -192,5 +195,31 @@ mod tests {
             .unwrap();
         assert_eq!(fatal.message(), None);
         assert_eq!(durable.get().get(), segs[2].start_lsn(WAL_SEG_SIZE) + 64);
+    }
+
+    /// Session wrapper's wait covers gc until its floor cell drops
+    #[tokio::test]
+    async fn desc_log_gc_tracked_until_floor_drops() {
+        let tmp = tempfile::tempdir().unwrap();
+        let identity = walshadow::desc_log::DescLogIdentity {
+            pg_major: 17,
+            system_id: "7300000000000000001".into(),
+            timeline: 1,
+            db_oid: 5,
+            wal_seg_size: WAL_SEG_SIZE as u32,
+        };
+        let log = walshadow::desc_log::DescriptorLog::open(tmp.path(), identity)
+            .await
+            .unwrap();
+        let floor = Monotone::<Floor>::default();
+        let fatal = walshadow::pipeline::Fatal::new();
+        let io = tokio_util::task::TaskTracker::new();
+        let gc = spawn_desc_log_gc(Arc::new(log), floor.watch(), fatal.clone(), &io);
+        io.close();
+        assert_eq!(io.len(), 1);
+        drop(floor);
+        io.wait().await;
+        assert!(gc.is_finished());
+        assert_eq!(fatal.message(), None);
     }
 }

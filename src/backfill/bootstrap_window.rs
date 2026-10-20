@@ -185,8 +185,12 @@ impl Leg {
             .await
             .with_context(|| format!("create {}", spill.display()))?;
         let buffer = Arc::new(Mutex::new(
-            XactBuffer::new(XactBufferConfig::new(spill))
-                .map_err(|e| anyhow::anyhow!("bootstrap window leg: xact buffer: {e}"))?,
+            XactBuffer::new(XactBufferConfig {
+                drain_batch_rows: cfg.dest.current().drain_batch_rows,
+                drain_batch_bytes: cfg.dest.current().drain_batch_bytes,
+                ..XactBufferConfig::new(spill)
+            })
+            .map_err(|e| anyhow::anyhow!("bootstrap window leg: xact buffer: {e}"))?,
         ));
         buffer.lock().await.clear_spill_dir().await.ok();
 

@@ -143,7 +143,6 @@ struct Sample {
     inserter_ch_ms: u64,
     pump_queue_depth: u64,
     xacts_committed: u64,
-    route_snapshots: u64,
     lock_waits: u64,
     lock_wait_ms: u64,
 }
@@ -172,11 +171,6 @@ fn sample(addr: SocketAddr) -> Result<Sample> {
         inserter_ch_ms: ch_seconds,
         pump_queue_depth: get("walshadow_pump_queue_depth"),
         xacts_committed: get("walshadow_xacts_committed_total"),
-        route_snapshots: body
-            .lines()
-            .filter(|l| l.starts_with("walshadow_route_snapshots_total"))
-            .filter_map(|l| l.rsplit_once(' ').and_then(|(_, v)| v.parse::<u64>().ok()))
-            .sum(),
         lock_waits: get("walshadow_decoder_buffer_lock_waits_total"),
         lock_wait_ms: body
             .lines()
@@ -206,10 +200,6 @@ fn report(a: &Sample, b: &Sample) {
     println!(
         "  pg commits          {:>12.0} xact/s",
         per_s(a.xacts_committed, b.xacts_committed)
-    );
-    println!(
-        "  route snapshots     {:>12.0} /s",
-        per_s(a.route_snapshots, b.route_snapshots)
     );
     println!("  emitter rows        {:>12.0} rows/s", rows);
     println!("  inserts             {:>12.1} /s", inserts);

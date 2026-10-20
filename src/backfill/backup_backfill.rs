@@ -850,8 +850,12 @@ async fn replay_gap(
     let spill = ctx.scratch_dir.join("replay_spill");
     tokio::fs::create_dir_all(&spill).await.ok();
     let buffer = Arc::new(Mutex::new(
-        XactBuffer::new(XactBufferConfig::new(spill))
-            .map_err(|e| anyhow::anyhow!("backup_backfill: replay xact buffer: {e}"))?,
+        XactBuffer::new(XactBufferConfig {
+            drain_batch_rows: ctx.dest.current().drain_batch_rows,
+            drain_batch_bytes: ctx.dest.current().drain_batch_bytes,
+            ..XactBufferConfig::new(spill)
+        })
+        .map_err(|e| anyhow::anyhow!("backup_backfill: replay xact buffer: {e}"))?,
     ));
     buffer.lock().await.clear_spill_dir().await.ok();
 

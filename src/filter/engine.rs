@@ -24,7 +24,7 @@ use crate::decode::wal_xact::{
 };
 use tokio_postgres::Client;
 
-use crate::decode::decoder_sink::{DecoderStats, SkipReason, SkippedRecord};
+use crate::decode::decoder_sink::{DecoderStats, SkipReason};
 use crate::filter::catalog_tracker::{CatalogTracker, SeedError};
 use crate::filter::classify::{Class, classify};
 use crate::filter::dirty_tree::{DirtyState, DirtyTree};
@@ -193,15 +193,13 @@ impl Filter {
             .map(|b| b.header.location.rel)
             .or_else(|| main_data::relation_for_empty(record))
             .unwrap_or_default();
-        stats.skip(SkippedRecord {
-            reason: SkipReason::IndexDropped,
-            db_oid: rel.db_node,
-            rel_node: rel.rel_node,
-            rm,
-            info: record.header.info,
-            xid: record.header.xact_id,
-            lsn: source_lsn,
-        });
+        stats.skip(
+            SkipReason::IndexDropped,
+            &record.header,
+            source_lsn,
+            rel.db_node,
+            rel.rel_node,
+        );
     }
 
     /// Feed xid ceilings for shadow TOAST generation checks

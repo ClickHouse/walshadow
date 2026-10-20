@@ -308,7 +308,7 @@ snapshot! {
     counter decoder_catalog_not_found_total: u64 =
         "Heap records skipped because no descriptor covered their relfilenode.",
     counter decoder_skipped_op_total: u64 =
-        "Heap records that decoded to no row change.",
+        "Heap records that decoded to no row change. LOCK, CONFIRM and heap2 page maintenance drop earlier, uncounted.",
     counter decoder_skipped_no_block_total: u64 =
         "Heap records skipped for carrying no block reference.",
     counter toast_chunks_stored_total: u64 =
@@ -361,8 +361,6 @@ snapshot! {
     /// view, drain]`, rendered `reason=` labelled
     counter xact_plan_failures_by_reason: [u64; 11] ["reason" = PLAN_FAILURE_REASONS] =
         "Planning-stage failures; the whole transaction emits nothing.",
-    counter route_snapshots_by_result: [u64; 2] ["result" = ["mapped", "unmapped"]] =
-        "Plan-time route resolutions, one per relation per transaction.",
     counter raw_stash_bytes_by_storage: [u64; 2] ["storage" = ["mem", "spill"]] =
         "Cumulative raw-stash payload bytes by first landing.",
     counter raw_decode_rows_by_op: [u64; 7] ["op" = HEAP_OP_LABELS] =
@@ -1203,7 +1201,6 @@ mod tests {
             xact_plan_rows: 9,
             xact_plan_bytes_by_storage: [100, 200],
             xact_plan_failures_by_reason: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
-            route_snapshots_by_result: [7, 8],
             ..MetricsSnapshot::default()
         };
         let body = render(snap);
@@ -1218,8 +1215,6 @@ mod tests {
             );
             assert!(body.contains(&want), "{want}");
         }
-        assert!(body.contains("walshadow_route_snapshots_total{result=\"mapped\"} 7"));
-        assert!(body.contains("walshadow_route_snapshots_total{result=\"unmapped\"} 8"));
     }
 
     /// Bootstrap stage attribution reaches `/metrics`. `BootstrapOutcome`

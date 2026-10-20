@@ -26,7 +26,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 
 use thiserror::Error;
 
-use crate::decode::heap_decoder::{DescribedHeap, HeapOp};
+use crate::decode::heap_decoder::{ColumnValue, DescribedHeap, HeapOp};
 use crate::emit::route::{RouteSnapshot, RoutedHeap};
 use crate::schema::RelDescriptor;
 use crate::xact::spill::{self, Cursor, SpillError};
@@ -45,6 +45,18 @@ pub const DEFAULT_PLAN_MEM_MAX: u64 = 1 << 20;
 /// Resident cost charged per typed heap on top of its values, standing in
 /// for the frame a spilled heap would take
 const MEM_FRAME_OVERHEAD: u64 = 64;
+
+/// Resident cost of a typed heap: values count payload only, so add each
+/// column slot, else narrow wide rows overrun `mem_max` several times
+fn mem_cost(heap: &RoutedHeap) -> u64 {
+    let d = &heap.described.decoded;
+    let slots = [&d.new, &d.old]
+        .into_iter()
+        .flatten()
+        .map(|t| t.columns.len())
+        .sum::<usize>();
+    MEM_FRAME_OVERHEAD + (heap.bytes + slots * std::mem::size_of::<Option<ColumnValue>>()) as u64
+}
 
 const TAG_HEAP: u8 = 0;
 const TAG_SEAL: u8 = 1;
@@ -176,19 +188,15 @@ impl PlanWriter {
     ) -> Result<()> {
         let routed = route.is_some();
         let heap = RoutedHeap::new(heap, route);
-        if let PlanSink::Mem(_) = &self.sink {
-            let needed = self.bytes + MEM_FRAME_OVERHEAD + heap.bytes as u64;
-            if needed > self.mem_max {
-                self.spill()?;
-            } else if needed > self.cap {
-                return Err(PlanSpoolError::DiskBudget {
-                    needed,
-                    cap: self.cap,
-                });
-            }
+        // Resident estimate overstates encoded size, so enforce disk cap
+        // only against encoded frames
+        if let PlanSink::Mem(_) = &self.sink
+            && self.bytes + mem_cost(&heap) > self.mem_max.min(self.cap)
+        {
+            self.spill()?;
         }
         if let PlanSink::Mem(heaps) = &mut self.sink {
-            self.bytes += MEM_FRAME_OVERHEAD + heap.bytes as u64;
+            self.bytes += mem_cost(&heap);
             heaps.push(heap);
         } else {
             self.encode_heap(&heap.described, heap.route.as_ref())?;
@@ -446,19 +454,19 @@ impl SealedPlan {
     /// Walk every frame without acting on it: checksums, id resolution,
     /// seal cross-check. Executors verify file-backed plans before the
     /// first side effect so disk corruption fails the whole transaction
-    /// instead of a prefix emitting
+    /// instead of a prefix emitting. Memory plans hold heaps validated at
+    /// write, nothing to cross-check, and replay would consume them
     pub fn verify(&self) -> Result<()> {
+        if self.path().is_none() {
+            return Ok(());
+        }
         let mut rd = self.replay()?;
         while rd.next_item()?.is_some() {}
         Ok(())
     }
 
-    /// Mem-resident plans hold the heaps validated at write; file-backed
-    /// plans re-read from disk, so they walk [`Self::verify`] first
     pub fn into_verified(self) -> Result<VerifiedPlan> {
-        if self.path().is_some() {
-            self.verify()?;
-        }
+        self.verify()?;
         Ok(VerifiedPlan(self))
     }
 }
@@ -662,7 +670,7 @@ fn read_or_unsealed(r: &mut impl Read, buf: &mut [u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::decode::heap_decoder::{ColumnValue, DecodedHeap, DecodedTuple, HeapOp};
+    use crate::decode::heap_decoder::{DecodedHeap, DecodedTuple, HeapOp};
     use crate::mapping::{TableMapping, TableTarget};
     use crate::schema::{INT4OID, RelAttr, RelDescriptor, RelName, SchemaEvent};
     use walrus::pg::walparser::RelFileNode;
@@ -805,8 +813,8 @@ mod tests {
         }
     }
 
-    /// Memory plans hand their heaps over once; a second replay must not
-    /// read as an empty transaction
+    /// Memory plans hand their heaps to replay once, not verify; a second
+    /// replay must not read as an empty transaction
     #[test]
     fn memory_plan_replays_once() {
         let tmp = tempfile::tempdir().unwrap();
@@ -815,7 +823,9 @@ mod tests {
         w.push_heap(heap(&descriptor(16500), 100, 10), None)
             .unwrap();
         let plan = w.seal(0x2000, 42).unwrap();
+        plan.verify().unwrap();
         let mut rd = plan.replay().unwrap();
+        assert!(rd.next_item().unwrap().is_some(), "verify left heaps");
         while rd.next_item().unwrap().is_some() {}
         let err = plan.replay().err().expect("second replay");
         assert!(err.to_string().contains("already replayed"), "{err}");
@@ -827,8 +837,9 @@ mod tests {
     fn spill_preserves_resident_heaps() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("1.plan");
-        let mut w = PlanWriter::create(path.clone(), 1 << 20, 2 * MEM_FRAME_OVERHEAD + 8).unwrap();
         let d = descriptor(16500);
+        let resident_max = 2 * mem_cost(&RoutedHeap::new(heap(&d, 0, 0), None));
+        let mut w = PlanWriter::create(path.clone(), 1 << 20, resident_max).unwrap();
         for v in 0..4 {
             w.push_heap(heap(&d, 100 + v as u64, v), None).unwrap();
         }
@@ -842,6 +853,48 @@ mod tests {
         }
         let want: Vec<_> = (0..4).map(|v| Some(ColumnValue::Int4(v))).collect();
         assert_eq!(seen, want);
+    }
+
+    /// Wide narrow-typed rows charge per column slot, so a plan whose
+    /// payload alone fits the memory cap still spills
+    #[test]
+    fn wide_rows_charge_column_slots() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("1.plan");
+        let mut w = PlanWriter::create(path.clone(), 1 << 30, DEFAULT_PLAN_MEM_MAX).unwrap();
+        let d = descriptor(16500);
+        let mut payload = 0;
+        for v in 0..64 {
+            let mut h = heap(&d, 100 + v as u64, v);
+            h.decoded.new.as_mut().unwrap().columns = vec![Some(ColumnValue::Int4(v)); 1000];
+            payload += MEM_FRAME_OVERHEAD + h.decoded.approx_bytes() as u64;
+            w.push_heap(h, None).unwrap();
+        }
+        assert!(payload < DEFAULT_PLAN_MEM_MAX);
+        let plan = w.seal(0x2000, 42).unwrap();
+        assert!(
+            plan.path().is_some(),
+            "column slots pushed plan past mem cap"
+        );
+        assert!(path.exists());
+    }
+
+    /// Disk cap applies to encoded bytes: a wide row whose resident
+    /// estimate exceeds the cap still plans when its frame fits
+    #[test]
+    fn disk_cap_measures_encoded_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("1.plan");
+        let cap = 16 << 10;
+        let mut w = PlanWriter::create(path.clone(), cap, DEFAULT_PLAN_MEM_MAX).unwrap();
+        let d = descriptor(16500);
+        let mut h = heap(&d, 100, 0);
+        h.decoded.new.as_mut().unwrap().columns = vec![Some(ColumnValue::Int4(7)); 1000];
+        assert!(mem_cost(&RoutedHeap::new(h.clone(), None)) > cap);
+        w.push_heap(h, None).unwrap();
+        let plan = w.seal(0x2000, 42).unwrap();
+        assert!(plan.size_bytes <= cap);
+        assert!(path.exists());
     }
 
     /// Oracle-pending values (`PgPending` / `Unsupported`) round-trip

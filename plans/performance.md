@@ -87,12 +87,12 @@ Try these in order:
    inserter count capped at three. Compare pool sizes within unchanged byte
    budget before raising cap. Measure rows/s separately from WAL progress, plus
    insert latency, part count, RSS, and durable completion counts
-2. Profile serial WAL dispatch, then batch measured hot operations
-   [Queue worker](../src/source/queueing_record_sink.rs) receives batches but awaits
-   each record individually. Attribute decode, transaction-buffer, commit-drain,
-   shadow-replay waits, and downstream waits before changing execution. Amortize
-   hot operations across records where possible while preserving commit/DDL order,
-   byte-before-record reachability, and contiguous durable acknowledgements
+2. Profile serial WAL dispatch before splitting it further
+   [Queue worker](../src/source/queueing_record_sink.rs) now dispatches batches
+   with heap decode started ahead of dispatch. Measure transaction buffer lock
+   waits, commit draining, shadow replay, and downstream waits before changing
+   execution. Preserve commit/DDL order, byte-before-record reachability, and
+   contiguous durable acknowledgements
 
 ## Bootstrap worker shape
 

@@ -47,7 +47,7 @@ use crate::emit::route::RouteSnapshot;
 use crate::toast::{ChunkRefMap, ToastResolver};
 use crate::xact::xact_buffer::{
     DrainEntry, DrainWalk, DrainedBatch, FailClosedReason, WalkStep, XactBufferError, detoast_heap,
-    needs_detoast,
+    heap_reads_toast,
 };
 
 /// Planner's window onto route state. Implementations resolve from frozen
@@ -177,7 +177,7 @@ impl<'a, V: PlanRouteView> Planner<'a, V> {
                                 lsn: heap.decoded.source_lsn,
                             });
                         }
-                        if needs_detoast(&heap) {
+                        if heap_reads_toast(&heap) {
                             Box::pin(detoast_heap(&mut heap, spool, &ref_maps, self.resolver))
                                 .await?;
                         }
@@ -449,7 +449,11 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn detoast_failure_in_last_row_abandons_plan() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut b = XactBuffer::new(cfg(tmp.path().to_path_buf())).unwrap();
+        let mut b = XactBuffer::new(XactBufferConfig {
+            drain_batch_rows: 1,
+            ..cfg(tmp.path().to_path_buf())
+        })
+        .unwrap();
         let rel = descriptor(16601, TEXTOID);
         b.on_heap(heap(&rel, 90, ColumnValue::Text("ok".into())))
             .await
@@ -482,14 +486,19 @@ mod tests {
             .drain_committed(StashResolved::nothing_stashed(1), 42, 0x2000, &[], false)
             .await
             .unwrap();
-        // In-memory xact arrives whole: the valid row plans before the
-        // toast row fails within the same slice
-        let batch = drain
+        // 1-row slices: the valid row plans before the toast row fails
+        let first = drain
             .next_batch(1, usize::MAX, None)
             .await
             .unwrap()
-            .expect("heap slice");
-        let err = planner.plan_batch(batch).await.unwrap_err();
+            .expect("valid row slice");
+        planner.plan_batch(first).await.unwrap();
+        let second = drain
+            .next_batch(1, usize::MAX, None)
+            .await
+            .unwrap()
+            .expect("toast row slice");
+        let err = planner.plan_batch(second).await.unwrap_err();
         assert!(matches!(err, PlanError::Detoast(_)), "{err}");
         drain.finish().await.unwrap();
         drop(planner);

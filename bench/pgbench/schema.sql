@@ -1,6 +1,5 @@
--- Source schema for the walshadow throughput repro. Mirrors the shape measured
--- on pwbs0g27sykp6qtt4qq9zsa1k2 / terracotta: 38-column hot table, a handful of
--- indexes, ~24 tables total.
+-- Source schema for the walshadow throughput workload: 38-column hot table,
+-- a handful of indexes, ~24 tables total.
 --
 -- Index count is the main throughput dial. Each index adds one WAL record and
 -- one page write per row, so it multiplies walshadow's record rate while also
@@ -9,8 +8,8 @@
 
 CREATE SCHEMA IF NOT EXISTS public;
 
-DROP TABLE IF EXISTS tc_workflow_run_steps CASCADE;
-CREATE TABLE tc_workflow_run_steps (
+DROP TABLE IF EXISTS bench_workflow_run_steps CASCADE;
+CREATE TABLE bench_workflow_run_steps (
     id              bigserial PRIMARY KEY,
     run_id          bigint      NOT NULL,
     workflow_id     bigint      NOT NULL,
@@ -37,7 +36,7 @@ CREATE TABLE tc_workflow_run_steps (
     exit_code       int4,
     is_terminal     boolean     NOT NULL DEFAULT false,
     is_cached       boolean     NOT NULL DEFAULT false,
-    region          text        NOT NULL DEFAULT 'us-east-2',
+    region          text        NOT NULL DEFAULT 'region-a',
     runner          text        NOT NULL DEFAULT 'default',
     version         int4        NOT NULL DEFAULT 1,
     trace_id        text,
@@ -50,12 +49,12 @@ CREATE TABLE tc_workflow_run_steps (
     created_at      timestamptz NOT NULL DEFAULT now(),
     updated_at      timestamptz NOT NULL DEFAULT now()
 );
-CREATE INDEX tc_wrs_run_id      ON tc_workflow_run_steps (run_id);
-CREATE INDEX tc_wrs_workflow_id ON tc_workflow_run_steps (workflow_id);
-ALTER TABLE tc_workflow_run_steps ALTER COLUMN input SET STORAGE EXTERNAL;
+CREATE INDEX bench_wrs_run_id      ON bench_workflow_run_steps (run_id);
+CREATE INDEX bench_wrs_workflow_id ON bench_workflow_run_steps (workflow_id);
+ALTER TABLE bench_workflow_run_steps ALTER COLUMN input SET STORAGE EXTERNAL;
 
-DROP TABLE IF EXISTS tc_workflow_runs CASCADE;
-CREATE TABLE tc_workflow_runs (
+DROP TABLE IF EXISTS bench_workflow_runs CASCADE;
+CREATE TABLE bench_workflow_runs (
     id            bigserial PRIMARY KEY,
     workflow_id   bigint      NOT NULL,
     tenant_id     bigint      NOT NULL DEFAULT 0,
@@ -76,10 +75,10 @@ CREATE TABLE tc_workflow_runs (
     created_at    timestamptz NOT NULL DEFAULT now(),
     updated_at    timestamptz NOT NULL DEFAULT now()
 );
-CREATE INDEX tc_wr_workflow_id ON tc_workflow_runs (workflow_id);
+CREATE INDEX bench_wr_workflow_id ON bench_workflow_runs (workflow_id);
 
-DROP TABLE IF EXISTS tc_data_list_chunks CASCADE;
-CREATE TABLE tc_data_list_chunks (
+DROP TABLE IF EXISTS bench_data_list_chunks CASCADE;
+CREATE TABLE bench_data_list_chunks (
     id          bigserial PRIMARY KEY,
     list_id     bigint      NOT NULL,
     chunk_index int4        NOT NULL,
@@ -88,10 +87,10 @@ CREATE TABLE tc_data_list_chunks (
     checksum    text,
     created_at  timestamptz NOT NULL DEFAULT now()
 );
-CREATE INDEX tc_dlc_list_id ON tc_data_list_chunks (list_id, chunk_index);
+CREATE INDEX bench_dlc_list_id ON bench_data_list_chunks (list_id, chunk_index);
 
-DROP TABLE IF EXISTS tc_data_lists CASCADE;
-CREATE TABLE tc_data_lists (
+DROP TABLE IF EXISTS bench_data_lists CASCADE;
+CREATE TABLE bench_data_lists (
     id          bigserial PRIMARY KEY,
     tenant_id   bigint      NOT NULL DEFAULT 0,
     name        text        NOT NULL,
@@ -101,23 +100,23 @@ CREATE TABLE tc_data_lists (
     updated_at  timestamptz NOT NULL DEFAULT now()
 );
 
-DROP TABLE IF EXISTS tc_workflow_nodes CASCADE;
-CREATE TABLE tc_workflow_nodes (
+DROP TABLE IF EXISTS bench_workflow_nodes CASCADE;
+CREATE TABLE bench_workflow_nodes (
     id bigserial PRIMARY KEY, workflow_id bigint NOT NULL, kind text NOT NULL,
     config jsonb, created_at timestamptz NOT NULL DEFAULT now());
 
-DROP TABLE IF EXISTS tc_workflow_edges CASCADE;
-CREATE TABLE tc_workflow_edges (
+DROP TABLE IF EXISTS bench_workflow_edges CASCADE;
+CREATE TABLE bench_workflow_edges (
     id bigserial PRIMARY KEY, workflow_id bigint NOT NULL, from_node bigint NOT NULL,
     to_node bigint NOT NULL, condition jsonb);
 
-DROP TABLE IF EXISTS tc_workflow_snapshots CASCADE;
-CREATE TABLE tc_workflow_snapshots (
+DROP TABLE IF EXISTS bench_workflow_snapshots CASCADE;
+CREATE TABLE bench_workflow_snapshots (
     id bigserial PRIMARY KEY, workflow_id bigint NOT NULL, version int4 NOT NULL,
     document jsonb, created_at timestamptz NOT NULL DEFAULT now());
 
-DROP TABLE IF EXISTS tc_workflow_test_samples CASCADE;
-CREATE TABLE tc_workflow_test_samples (
+DROP TABLE IF EXISTS bench_workflow_test_samples CASCADE;
+CREATE TABLE bench_workflow_test_samples (
     id bigserial PRIMARY KEY, workflow_id bigint NOT NULL, sample jsonb,
     created_at timestamptz NOT NULL DEFAULT now());
 
@@ -126,8 +125,8 @@ DECLARE i int;
 BEGIN
   FOR i IN 1..16 LOOP
     EXECUTE format(
-      'DROP TABLE IF EXISTS tc_aux_%s CASCADE;
-       CREATE TABLE tc_aux_%s (
+      'DROP TABLE IF EXISTS bench_aux_%s CASCADE;
+       CREATE TABLE bench_aux_%s (
          id bigserial PRIMARY KEY, tenant_id bigint NOT NULL DEFAULT 0,
          label text, body jsonb, created_at timestamptz NOT NULL DEFAULT now());', i, i);
   END LOOP;
@@ -137,7 +136,8 @@ END $$;
 DO $$
 DECLARE t record;
 BEGIN
-  FOR t IN SELECT tablename FROM pg_tables WHERE schemaname = 'public' LOOP
+  FOR t IN SELECT tablename FROM pg_tables
+           WHERE schemaname = 'public' AND tablename LIKE 'bench\_%' LOOP
     EXECUTE format('ALTER TABLE public.%I REPLICA IDENTITY FULL', t.tablename);
   END LOOP;
 END $$;

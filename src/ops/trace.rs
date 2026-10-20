@@ -10,6 +10,10 @@ use ahash::HashMap;
 static SAMPLE_RATIO: AtomicU64 = AtomicU64::new(0x3FF0_0000_0000_0000);
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
+// Serializes tests touching SAMPLE_RATIO or COUNTER; tokio so async tests hold it across awaits
+#[cfg(test)]
+pub(crate) static SAMPLE_TEST_GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 pub fn set_sample_ratio(ratio: f64) {
     SAMPLE_RATIO.store(ratio.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
 }
@@ -177,12 +181,9 @@ pub struct InflightSnapshotEntry {
 mod tests {
     use super::*;
 
-    // Serialized: the ratio is a process global.
-    static GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     #[test]
     fn ratio_endpoints_and_distribution() {
-        let _g = GUARD.lock().unwrap();
+        let _g = SAMPLE_TEST_GUARD.blocking_lock();
 
         set_sample_ratio(1.0);
         assert!((0..1000).all(|_| should_sample()));

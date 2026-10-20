@@ -11,6 +11,7 @@ use backon::{ExponentialBuilder, Retryable};
 use tokio::sync::{Mutex, watch};
 use tokio_postgres::types::Oid;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 use walrus::pg::backup::format_pg_lsn;
 use walshadow::archive::Archive;
 use walshadow::boundary_hold::{
@@ -98,6 +99,8 @@ async fn ensure_boot_database_waiting(cfg: &EmitterConfig) -> Result<()> {
     Ok(())
 }
 
+/// Wait out tracked I/O on every exit, attach restart reopens same files
+/// in-process
 pub(crate) async fn run_session(
     args: &Args,
     metrics: &MetricsRegistry,
@@ -105,6 +108,22 @@ pub(crate) async fn run_session(
     sighup: tokio::signal::unix::Signal,
     shutdown: &CancellationToken,
     attach: &AttachSlot,
+) -> Result<()> {
+    let io = TaskTracker::new();
+    let res = session_body(args, metrics, reloader, sighup, shutdown, attach, &io).await;
+    io.close();
+    io.wait().await;
+    res
+}
+
+async fn session_body(
+    args: &Args,
+    metrics: &MetricsRegistry,
+    reloader: &Arc<walshadow::control::Reloader>,
+    sighup: tokio::signal::unix::Signal,
+    shutdown: &CancellationToken,
+    attach: &AttachSlot,
+    io: &TaskTracker,
 ) -> Result<()> {
     // Clone the Arc-backed registry so the body's `&metrics` uses are unchanged.
     let metrics = metrics.clone();
@@ -877,10 +896,14 @@ pub(crate) async fn run_session(
     // advance identical filter and decode paths.
     // Spill dir wiped every startup: cursor file commits drains
     // atomically, so leftover spill from a prior crash is redundant or stale.
-    let xact_buf_cfg = XactBufferConfig {
+    let mut xact_buf_cfg = XactBufferConfig {
         xact_buffer_max: args.xact_buffer_max,
         ..XactBufferConfig::new(args.spill_dir.clone())
     };
+    if let Some(cfg) = ch_config.as_ref() {
+        xact_buf_cfg.drain_batch_rows = cfg.drain_batch_rows;
+        xact_buf_cfg.drain_batch_bytes = cfg.drain_batch_bytes;
+    }
     let xact_buffer = XactBuffer::new(xact_buf_cfg).context("init xact buffer / spill dir")?;
     xact_buffer
         .clear_spill_dir()
@@ -1317,7 +1340,7 @@ pub(crate) async fn run_session(
         fsync_fatal.clone(),
     );
     let mut segment_sink =
-        DirSegmentSink::with_durability(args.out_dir.clone(), WAL_SEG_SIZE, fsync_tx)
+        DirSegmentSink::with_durability(args.out_dir.clone(), WAL_SEG_SIZE, fsync_tx, io.clone())
             .context("open out-dir")?;
     // Descriptor-log GC off the pump task: the pump publishes each persisted
     // floor, the task compacts. Coalesces by construction — a watch holds
@@ -1326,7 +1349,7 @@ pub(crate) async fn run_session(
     // Pruner's own cell, not `resume_floor`: dropping it is what tells the gc
     // task the session is done
     let gc_floor = Monotone::<Floor>::default();
-    let mut gc_task = spawn_desc_log_gc(desc_log.clone(), gc_floor.watch(), gc_fatal.clone());
+    let mut gc_task = spawn_desc_log_gc(desc_log.clone(), gc_floor.watch(), gc_fatal.clone(), io);
     let mut chunk_buf = Vec::with_capacity(64 * 1024);
 
     // Metrics endpoint + control socket + SIGHUP are process-lifetime (bound in

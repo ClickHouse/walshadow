@@ -10,7 +10,7 @@
 \set cost random(100, 9000000)
 \set tin random(0, 8000)
 \set tout random(0, 8000)
-INSERT INTO tc_workflow_run_steps
+INSERT INTO bench_workflow_run_steps
   (run_id, workflow_id, node_id, step_index, attempt, status, kind, started_at,
    finished_at, duration_ms, retry_count, priority, shard, tenant_id, cost_micros,
    tokens_in, tokens_out, bytes_in, bytes_out, exit_code, is_terminal, region,
@@ -21,7 +21,7 @@ SELECT
    CASE WHEN :attempt::int = 0 THEN 'succeeded' ELSE 'retried' END, 'task',
    now() - (:dur::text || ' ms')::interval, now(), :dur::int, :attempt::int,
    :prio::int, :shard::int, :tenant::bigint, :cost::bigint,
-   :tin::int, :tout::int, :tin::int * 4, :tout::int * 4, 0, true, 'us-east-2',
+   :tin::int, :tout::int, :tin::int * 4, :tout::int * 4, 0, true, 'region-a',
    'runner-' || :shard::text, md5((:run_id::bigint + g)::text), md5(:node_id::text),
    md5((:run_id::bigint + g)::text || :step_index::text),
    jsonb_build_object('args', :step_index::int),

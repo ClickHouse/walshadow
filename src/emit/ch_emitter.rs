@@ -2735,10 +2735,6 @@ crate::atomic_stats! {
         pub plan_failures_partial_update,
         pub plan_failures_view,
         pub plan_failures_drain,
-        /// Plan-time route resolutions, one per relation per transaction
-        /// (memoised)
-        pub route_snapshots_mapped,
-        pub route_snapshots_unmapped,
         pub unmapped_rows_by_table: crate::emit::pipeline::row_ledger::TableRowCounts,
         pub rows_inserted_by_table: crate::emit::pipeline::row_ledger::TableRowCounts,
         pub cells_inserted_by_type: crate::emit::pipeline::row_ledger::CellCounts,

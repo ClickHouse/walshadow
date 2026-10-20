@@ -27,6 +27,9 @@ also retains selected physical data, see [shadow TOAST storage](shadow-toast.md)
 records to no-ops for shadow replay. Shadow receives filtered bytes through
 walshadow's sender, with local segments as archive fallback
 
+Filtered segments are written in the background. Durable position advances
+only after those writes reach disk
+
 `CatalogCapture` holds publication at schema boundaries, reads shadow at an
 exact replay position, persists descriptors, and attaches `SchemaEvent` to
 `XactBuffer`. Queued row processing uses that history when decoding and
@@ -45,6 +48,12 @@ Sequence numbers identify work slices, not necessarily whole transactions
 Only a commit's final slice publishes its LSN, after all earlier work finishes
 Bounded queues and a shared payload budget limit work in flight; transaction
 and plan data can spill to disk
+
+Queue worker runs on a dedicated thread and receives batches with heap decode
+started ahead of dispatch. It checks decoded results against descriptor history
+and decodes again if needed. Commits drain only their own transaction trees.
+Consecutive small commits can share row chunks while retaining separate
+acknowledgements
 
 ## Design boundaries
 

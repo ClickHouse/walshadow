@@ -190,10 +190,6 @@ async fn interleaved_clean_xact_unaffected_by_dirty_tree() {
         emitter_stats.plan_bytes_mem.load(Ordering::Relaxed) > 0,
         "small plans stay memory-resident",
     );
-    assert!(
-        emitter_stats.route_snapshots_mapped.load(Ordering::Relaxed) >= 1,
-        "plan-time route resolution counted",
-    );
 }
 
 /// Catalog touch inside a subxact dirties the whole known tree: child row

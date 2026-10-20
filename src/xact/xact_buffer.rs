@@ -51,7 +51,7 @@ use crate::catalog::desc_log::{
     Ambiguity, DescriptorLog, DescriptorLogs, LogEntry, LogValue, LookupResult,
 };
 use crate::catalog::pending::{PendingCatalog, PendingSlot};
-use crate::decode::decoder_sink::{DecoderSinkError, DecoderStats, SkipReason, SkippedRecord};
+use crate::decode::decoder_sink::{DecoderSinkError, DecoderStats, SkipReason};
 use crate::decode::heap_decoder::{
     ColumnValue, DecodedHeap, DescribedHeap, HeapOp, Predecoded, ToastPointer, decode_heap_record,
 };
@@ -178,6 +178,10 @@ pub struct XactBufferConfig {
     pub toast_body_mem_max: usize,
     /// Per-drain chunk/row-ref metadata cap
     pub toast_index_mem_max: usize,
+    /// Caller's commit-drain slice budget. A lone in-memory xact within it
+    /// skips the merge, larger ones slice through it
+    pub drain_batch_rows: usize,
+    pub drain_batch_bytes: usize,
 }
 
 impl XactBufferConfig {
@@ -187,6 +191,8 @@ impl XactBufferConfig {
             spill_dir,
             toast_body_mem_max: TOAST_BODY_SPOOL_MEM_MAX,
             toast_index_mem_max: TOAST_INDEX_MEM_MAX,
+            drain_batch_rows: crate::emit::ch_emitter::DEFAULT_DRAIN_BATCH_ROWS,
+            drain_batch_bytes: crate::emit::ch_emitter::DEFAULT_DRAIN_BATCH_BYTES,
         }
     }
 }
@@ -996,7 +1002,8 @@ impl XactBuffer {
             self.stats.xacts_total += 1;
         }
         let registry = &self.span_registry;
-        // Cloned, a fresh seed per xact shows in profiles
+        // Stash map reuses inflight map's seeds, drawing fresh ones per xact
+        // shows in profiles
         let hasher = self.inflight.hasher().clone();
         self.inflight.entry(xid).or_insert_with(|| {
             let span = registry.adopt(xid).unwrap_or_else(|| {
@@ -1357,12 +1364,14 @@ impl XactBuffer {
             None if states.iter().all(|st| st.stash_rfns.is_empty()) => StashResolution::default(),
             None => return Err(XactBufferError::MissingStashResolution { top_xid }),
         };
-        // Lone in-memory xact of plain heaps: arrival is WAL order, nothing
-        // to merge, fold or fence
+        // Lone in-memory xact of plain heaps fitting one slice: arrival is
+        // WAL order, nothing to merge, fold, fence or slice
         if let [st] = states.as_mut_slice()
             && st.plain
             && st.spill.is_none()
             && st.events.is_empty()
+            && st.in_mem.len() <= self.config.drain_batch_rows
+            && st.in_mem_bytes <= self.config.drain_batch_bytes
         {
             let heaps = std::mem::take(&mut st.in_mem)
                 .into_iter()
@@ -2300,7 +2309,7 @@ pub struct CommittedDrain {
 enum Drained {
     /// Boxed so the commit path moves a pointer, not the merge state
     Merged(Box<MergedDrain>),
-    /// WAL-ordered heaps needing no merge, taken whole by the first slice
+    /// WAL-ordered heaps needing no merge, within one slice's budget
     Heaps(Vec<DescribedHeap>),
 }
 
@@ -2320,6 +2329,21 @@ impl CommittedDrain {
         max_bytes: usize,
         budget: Option<&crate::budget::MemoryBudget>,
     ) -> std::result::Result<Option<DrainedBatch>, XactBufferError> {
+        self.next_batch_admitting(max_rows, max_bytes, async |bytes| {
+            Ok(crate::budget::admit_opt(budget, bytes).await)
+        })
+        .await
+    }
+
+    /// [`Self::next_batch`] with caller admitting a sealed chunk generation.
+    /// Caller holding admission permits must release them before waiting,
+    /// else a request its own permits block never returns
+    pub async fn next_batch_admitting<E: From<XactBufferError>>(
+        &mut self,
+        max_rows: usize,
+        max_bytes: usize,
+        admit: impl AsyncFnOnce(usize) -> std::result::Result<Option<crate::budget::MemoryPermit>, E>,
+    ) -> std::result::Result<Option<DrainedBatch>, E> {
         let m = match self.merged.as_mut() {
             None => return Ok(None),
             Some(Drained::Merged(m)) => m,
@@ -2361,7 +2385,7 @@ impl CommittedDrain {
         let sealed_empty = sealed.map.is_empty();
         let new_rows = m.take_rows();
         if !sealed_empty {
-            sealed._permit = crate::budget::admit_opt(budget, sealed.resident_bytes()).await;
+            sealed._permit = admit(sealed.resident_bytes()).await?;
             self.generations.push(Arc::new(sealed));
         }
         if heaps.is_empty() && ordered_events.is_empty() && sealed_empty && new_rows.is_empty() {
@@ -2479,16 +2503,7 @@ pub fn heap_reads_toast(heap: &DescribedHeap) -> bool {
 }
 
 /// Append every on-disk toast pointer; carries `va_extinfo`/`va_rawsize`
-/// so store fetch can cap allocation.
-/// Whether [`detoast_heap`] has a value to resolve
-pub fn needs_detoast(heap: &DescribedHeap) -> bool {
-    [&heap.decoded.new, &heap.decoded.old]
-        .into_iter()
-        .flatten()
-        .flat_map(|t| &t.columns)
-        .any(|c| matches!(c, Some(ColumnValue::ExternalToast(_))))
-}
-
+/// so store fetch can cap allocation
 fn collect_toast_pointers(
     t: Option<&crate::decode::heap_decoder::DecodedTuple>,
     out: &mut Vec<ToastPointer>,
@@ -2945,6 +2960,13 @@ impl BufferingDecoderSink {
         self.stats.clone()
     }
 
+    #[inline(always)]
+    fn skip(&self, reason: SkipReason, record: &Record<'_>, rfn: RelFileNode) {
+        let header = &record.parsed.header;
+        let (db, rel) = (rfn.db_node, rfn.rel_node);
+        self.stats.skip(reason, header, record.source_lsn, db, rel);
+    }
+
     /// Stash raw inputs for a record whose filenode is invisible at record
     /// time. Marker-proven filenodes keep payload for commit-time decode
     /// ([`resolve_stash`]); markerless ones are tracked payload-free so a
@@ -2970,8 +2992,7 @@ impl BufferingDecoderSink {
             self.stats.raw_stash_marker_ops.bump(rm, info);
         } else {
             buf.track_unresolvable(xid, record.source_lsn, rfn);
-            self.stats
-                .skip(SkippedRecord::on(record, SkipReason::Unresolvable, rfn));
+            self.skip(SkipReason::Unresolvable, record, rfn);
         }
         Ok(())
     }
@@ -2983,12 +3004,13 @@ impl BufferingDecoderSink {
         let Some(parsed) =
             crate::filter::main_data::parse_xl_heap_truncate(&record.parsed.main_data)
         else {
-            self.stats.skip(SkippedRecord::of(
-                record,
+            self.stats.skip(
                 SkipReason::TruncateUnparsed,
+                &record.parsed.header,
+                record.source_lsn,
                 0,
                 0,
-            ));
+            );
             return Ok(());
         };
         let xid = record.parsed.header.xact_id;
@@ -3013,12 +3035,13 @@ impl BufferingDecoderSink {
                     // its OIDs name nothing here, whatever they collide with
                     Err(LookupResult::ForeignDb) => break,
                     Err(_) => {
-                        self.stats.skip(SkippedRecord::of(
-                            record,
+                        self.stats.skip(
                             SkipReason::TruncateRelMissing,
+                            &record.parsed.header,
+                            record.source_lsn,
                             parsed.db_oid,
                             relid,
-                        ));
+                        );
                         continue;
                     }
                 };
@@ -3081,9 +3104,7 @@ impl BufferingDecoderSink {
             return Ok(());
         }
         let Some(rfn) = record.parsed.blocks.first().map(|b| b.header.location.rel) else {
-            self.stats
-                .skipped_no_block
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.skip(SkipReason::NoBlock, record, RelFileNode::default());
             return Ok(());
         };
         let txn_xid = record.parsed.header.xact_id;
@@ -3130,9 +3151,7 @@ impl BufferingDecoderSink {
             .and_then(|r| r.decode_parent(txn_xid));
         // Unfollowed database: same skip a foreign-db lookup takes
         let Some(log) = self.logs.lookup(rfn.db_node) else {
-            self.stats
-                .catalog_not_found
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.skip(SkipReason::UnfollowedDb, record, rfn);
             return Ok(());
         };
         // Wait-free interval lookup: every record reaching this worker
@@ -3146,17 +3165,13 @@ impl BufferingDecoderSink {
             // Foreign db / rel that died before the coverage horizon:
             // counted row skip, never a stash or a fatal
             Err(LookupResult::ForeignDb) => {
-                self.stats
-                    .catalog_not_found
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.skip(SkipReason::ForeignDb, record, rfn);
                 return Ok(());
             }
             Err(LookupResult::NotCovered)
                 if record.source_lsn <= log.covered_through() || txn_xid == 0 =>
             {
-                self.stats
-                    .catalog_not_found
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.skip(SkipReason::NotCovered, record, rfn);
                 return Ok(());
             }
             // Filenode invisible at record LSN: created by this
@@ -3189,9 +3204,7 @@ impl BufferingDecoderSink {
             // rotation (AccessExclusiveLock), so a Retired answer means
             // the row never outlives the commit — skip
             Err(LookupResult::Retired) => {
-                self.stats
-                    .catalog_not_found
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.skip(SkipReason::Retired, record, rfn);
                 return Ok(());
             }
         };
@@ -3207,9 +3220,7 @@ impl BufferingDecoderSink {
             }
         };
         if decoded_set.is_empty() {
-            self.stats
-                .skipped_op
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.skip(SkipReason::NoTuple, record, rfn);
             return Ok(());
         }
         // Runtime-config overlay: config-table heap writes never reach CH.
@@ -3723,6 +3734,7 @@ mod tests {
 
     #[test]
     fn txn_span_registry_full_lifecycle() {
+        let _g = crate::ops::trace::SAMPLE_TEST_GUARD.blocking_lock();
         crate::ops::trace::set_sample_ratio(1.0);
         let reg = TxnSpanRegistry::new();
 
@@ -3752,6 +3764,7 @@ mod tests {
 
     #[test]
     fn xact_buffer_exposes_span_registry() {
+        let _g = crate::ops::trace::SAMPLE_TEST_GUARD.blocking_lock();
         crate::ops::trace::set_sample_ratio(1.0);
         let tmp = tempdir().unwrap();
         let buf = XactBuffer::new(XactBufferConfig::new(tmp.path().to_path_buf())).unwrap();
@@ -5200,18 +5213,12 @@ mod tests {
         );
     }
 
-    /// Relation OIDs can match across databases. Verify TRUNCATE records only
-    /// affect relations in configured database
-    #[tokio::test(flavor = "current_thread")]
-    async fn truncate_of_foreign_db_never_fans_out() {
+    /// Log for db 5 holding `rel` from 0x100
+    async fn single_rel_log(dir: &std::path::Path, rel: &Arc<RelDescriptor>) -> Arc<DescriptorLog> {
         use crate::catalog::desc_log::{BatchRecord, DescLogIdentity, LogEntry, LogValue};
-        use crate::record::Route;
-        use walrus::pg::walparser::{XLogRecord, XLogRecordHeader};
-
-        let log_dir = tempdir().unwrap();
         let log = Arc::new(
             DescriptorLog::open(
-                log_dir.path(),
+                dir,
                 DescLogIdentity {
                     pg_major: 17,
                     system_id: "7".into(),
@@ -5223,7 +5230,6 @@ mod tests {
             .await
             .unwrap(),
         );
-        let rel = int4_descriptor(16440);
         log.append_batch(BatchRecord {
             captured_at: 0x100,
             commit_lsn: 0xF0,
@@ -5238,6 +5244,19 @@ mod tests {
         })
         .await
         .unwrap();
+        log
+    }
+
+    /// Relation OIDs can match across databases. Verify TRUNCATE records only
+    /// affect relations in configured database
+    #[tokio::test(flavor = "current_thread")]
+    async fn truncate_of_foreign_db_never_fans_out() {
+        use crate::record::Route;
+        use walrus::pg::walparser::{XLogRecord, XLogRecordHeader};
+
+        let log_dir = tempdir().unwrap();
+        let rel = int4_descriptor(16440);
+        let log = single_rel_log(log_dir.path(), &rel).await;
 
         let truncate_record = |db_oid: u32| {
             let mut md = db_oid.to_le_bytes().to_vec();
@@ -5282,6 +5301,78 @@ mod tests {
 
         sink.on_record(&truncate_record(5)).await.unwrap();
         assert_eq!(sink.stats().truncates.load(Ordering::Relaxed), 1);
+    }
+
+    /// Per-record path skips land in the per-relation ledger by reason,
+    /// unexpected ones even with attribution off
+    #[tokio::test(flavor = "current_thread")]
+    async fn heap_skips_attribute_by_reason() {
+        use crate::decode::decoder_sink::SkipKey;
+        use crate::record::Route;
+        use walrus::pg::walparser::{
+            BlockLocation, XLogRecord, XLogRecordBlock, XLogRecordBlockHeader, XLogRecordHeader,
+        };
+
+        let log_dir = tempdir().unwrap();
+        let log = single_rel_log(log_dir.path(), &int4_descriptor(16450)).await;
+        let insert = |db_node: u32, rel_node: u32| Record {
+            parsed: XLogRecord {
+                header: XLogRecordHeader {
+                    resource_manager_id: RmId::Heap as u8,
+                    info: crate::decode::heap_decoder::XLOG_HEAP_INSERT,
+                    ..Default::default()
+                },
+                blocks: vec![XLogRecordBlock {
+                    header: XLogRecordBlockHeader {
+                        location: BlockLocation {
+                            rel: RelFileNode {
+                                spc_node: 1663,
+                                db_node,
+                                rel_node,
+                            },
+                            block_no: 0,
+                        },
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            source_lsn: 0x200,
+            route: Route::ToDecoder,
+            ..Default::default()
+        };
+        let spill_dir = tempdir().unwrap();
+        let buffer = Arc::new(Mutex::new(
+            XactBuffer::new(cfg(spill_dir.path().to_path_buf())).unwrap(),
+        ));
+        let mut sink = BufferingDecoderSink::new(DescriptorLogs::single(log), buffer);
+        let key = |db_oid, rel_node, reason| SkipKey {
+            db_oid,
+            rel_node,
+            op: "insert",
+            reason,
+        };
+
+        sink.on_record(&insert(9, 16450)).await.unwrap();
+        sink.on_record(&insert(5, 16499)).await.unwrap();
+        assert_eq!(
+            sink.stats().skipped_by_rel.snapshot(),
+            vec![(key(5, 16499, SkipReason::NotCovered), 1)],
+            "flag off attributes only unexpected reasons",
+        );
+
+        sink.stats().attribute_skips.store(true, Ordering::Relaxed);
+        sink.on_record(&insert(9, 16450)).await.unwrap();
+        sink.on_record(&insert(5, 16499)).await.unwrap();
+        assert_eq!(sink.stats().catalog_not_found.load(Ordering::Relaxed), 4);
+        assert_eq!(
+            sink.stats().skipped_by_rel.snapshot(),
+            vec![
+                (key(5, 16499, SkipReason::NotCovered), 2),
+                (key(9, 16450, SkipReason::UnfollowedDb), 1),
+            ],
+        );
     }
 
     /// Half-open: `through_lsn` is the first LSN the final descriptor proves,
@@ -5887,8 +5978,76 @@ mod tests {
             1,
             "file persists until finish"
         );
+        assert!(drain.spilled(), "reorder finishes only a spilled drain");
         drain.finish().await.unwrap();
         assert!(spill_files(tmp.path()).is_empty());
+    }
+
+    /// Reorder drops an unspilled drain without `finish`, so a memory-only
+    /// merge of top and subxact must leave nothing on disk
+    #[tokio::test(flavor = "current_thread")]
+    async fn unspilled_merge_leaves_no_files_on_drop() {
+        let tmp = tempdir().unwrap();
+        let mut b = XactBuffer::new(cfg(tmp.path().to_path_buf())).unwrap();
+        b.on_heap(heap_with_value(3, 100, 16)).await.unwrap();
+        b.on_heap(heap_with_value(4, 110, 16)).await.unwrap();
+        let mut drain = b
+            .drain_committed(StashResolved::nothing_stashed(3), 0, 0x5000, &[4], false)
+            .await
+            .unwrap();
+        assert!(matches!(drain.merged, Some(Drained::Merged(_))));
+        let batch = drain
+            .next_batch(8, usize::MAX, None)
+            .await
+            .unwrap()
+            .expect("one slice");
+        assert_eq!(batch.heaps.len(), 2);
+        assert!(!drain.spilled());
+        drop(drain);
+        assert!(spill_files(tmp.path()).is_empty());
+    }
+
+    /// Lone in-memory xact skips the merge only within the slice budget;
+    /// past it, slicing and drain-resident gauge follow the merge
+    #[tokio::test(flavor = "current_thread")]
+    async fn lone_xact_over_slice_budget_merges() {
+        let tmp = tempdir().unwrap();
+        let mut b = XactBuffer::new(XactBufferConfig {
+            drain_batch_rows: 4,
+            ..XactBufferConfig::new(tmp.path().to_path_buf())
+        })
+        .unwrap();
+        for i in 0..4 {
+            b.on_heap(heap_with_value(5, 100 + i, 16)).await.unwrap();
+        }
+        let drain = b
+            .drain_committed(StashResolved::nothing_stashed(5), 0, 0x6000, &[], false)
+            .await
+            .unwrap();
+        assert!(matches!(drain.merged, Some(Drained::Heaps(_))));
+
+        for i in 0..10 {
+            b.on_heap(heap_with_value(6, 200 + i, 16)).await.unwrap();
+        }
+        let mut drain = b
+            .drain_committed(StashResolved::nothing_stashed(6), 0, 0x7000, &[], false)
+            .await
+            .unwrap();
+        assert!(matches!(drain.merged, Some(Drained::Merged(_))));
+        assert!(b.drain_resident_bytes() > 0, "gauge holds unsliced heaps");
+        let mut lsns = Vec::new();
+        let mut finals = Vec::new();
+        while let Some(batch) = drain.next_batch(4, usize::MAX, None).await.unwrap() {
+            lsns.extend(batch.heaps.iter().map(|h| h.decoded.source_lsn));
+            finals.push(batch.is_final);
+            if batch.is_final {
+                break;
+            }
+        }
+        assert_eq!(lsns, (200..210).collect::<Vec<_>>());
+        assert_eq!(finals, [false, false, true]);
+        drain.finish().await.unwrap();
+        assert_eq!(b.drain_resident_bytes(), 0);
     }
 
     /// The drain-resident gauge bounds what the merge holds: for a fully
@@ -5998,6 +6157,48 @@ mod tests {
         assert_eq!(b.drain_resident_bytes(), 0);
     }
 
+    /// Sealed chunk generations admit through the caller, whose error ends
+    /// the pull
+    #[tokio::test(flavor = "current_thread")]
+    async fn drain_admits_sealed_generations_through_caller() {
+        let tmp = tempdir().unwrap();
+        let mut b = XactBuffer::new(cfg(tmp.path().to_path_buf())).unwrap();
+        let body = [7u8; 512];
+        for i in 0..4u32 {
+            let lsn = 100 + 2 * u64::from(i);
+            b.on_toast_chunk(chunk(50 + i, 0, lsn, &body), 9)
+                .await
+                .unwrap();
+            b.on_heap(heap_with_value(9, lsn + 1, 16)).await.unwrap();
+        }
+        let mut drain = b
+            .drain_committed(StashResolved::nothing_stashed(9), 0, 0x9000, &[], true)
+            .await
+            .unwrap();
+        let budget = crate::budget::MemoryBudget::new(1 << 20);
+        let mut asked = Vec::new();
+        let batch = drain
+            .next_batch_admitting(2, usize::MAX, async |bytes| {
+                asked.push(bytes);
+                Ok::<_, XactBufferError>(Some(budget.admit(bytes).await))
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(batch.chunks.len(), 1);
+        assert_eq!(asked, [2 * (512 + CHUNK_REF_META)]);
+        assert_eq!(budget.resident_bytes(), asked[0] as u64);
+        let Err(err) = drain
+            .next_batch_admitting(2, usize::MAX, async |_| {
+                Err(SinkError::Other("pool closed".into()))
+            })
+            .await
+        else {
+            panic!("admission error ignored");
+        };
+        assert!(matches!(err, SinkError::Other(m) if m == "pool closed"));
+    }
+
     fn toastbody_files(dir: &std::path::Path) -> Vec<String> {
         std::fs::read_dir(crate::fs::scratch_dir(dir))
             .unwrap()
@@ -6082,6 +6283,7 @@ mod tests {
         for r in rows.iter() {
             assert_eq!(r.materialize(rows.spool()).unwrap().chunk_data.len(), 512);
         }
+        assert!(drain.spilled());
         drain.finish().await.unwrap();
         assert_eq!(
             b.toast_spool_bytes(),
@@ -6144,5 +6346,135 @@ mod tests {
         drain.finish().await.unwrap();
         assert_eq!(b.stats().commits_unknown_xid, 1);
         assert_eq!(b.stats().drain_lsn, 0x100);
+    }
+
+    /// Decoder skips the stash lock while the lock-free count reads zero, so
+    /// every commit, abort and subxact abort must give back what it marked
+    #[tokio::test(flavor = "current_thread")]
+    async fn stash_live_balances_across_commit_and_aborts() {
+        let tmp = tempdir().unwrap();
+        let mut b = XactBuffer::new(cfg(tmp.path().to_path_buf())).unwrap();
+        let live = b.stash_live();
+        let rfn = |rel_node| RelFileNode {
+            spc_node: 1663,
+            db_node: 5,
+            rel_node,
+        };
+        let rel = int4_descriptor(16470);
+        let rel_rfn = rel.rfn;
+        b.stash_raw(1, multi_insert_raw(1, 100, 16470, &[1]))
+            .await
+            .unwrap();
+        b.stash_raw(1, multi_insert_raw(1, 110, 16470, &[2]))
+            .await
+            .unwrap();
+        b.track_unresolvable(1, 120, rfn(16471));
+        assert_eq!(
+            live.load(Ordering::Relaxed),
+            2,
+            "repeat filenode counts once"
+        );
+        b.track_unresolvable(2, 130, rfn(16472));
+        b.track_unresolvable(3, 140, rfn(16473));
+        b.track_unresolvable(4, 150, rfn(16474));
+        b.track_unresolvable(4, 160, rfn(16475));
+        assert_eq!(live.load(Ordering::Relaxed), 6);
+
+        b.abort(4, Pos::new(0x200), &[]).await.unwrap();
+        assert_eq!(live.load(Ordering::Relaxed), 4, "subxact abort");
+        b.abort(2, Pos::new(0x210), &[]).await.unwrap();
+        assert_eq!(live.load(Ordering::Relaxed), 3, "top abort");
+
+        let mut drain = b
+            .drain_committed(inject_ordinary(rel_rfn, rel), 0, 0x300, &[], false)
+            .await
+            .unwrap();
+        let batch = drain
+            .next_batch(8, usize::MAX, None)
+            .await
+            .unwrap()
+            .expect("stashed rows drain");
+        assert_eq!(batch.heaps.len(), 2);
+        drain.finish().await.unwrap();
+        assert_eq!(live.load(Ordering::Relaxed), 1, "commit");
+
+        let stash = StashResolved {
+            top_xid: 3,
+            res: Some(StashResolution::default()),
+        };
+        b.drain_committed(stash, 0, 0x310, &[], false)
+            .await
+            .unwrap()
+            .finish()
+            .await
+            .unwrap();
+        assert_eq!(live.load(Ordering::Relaxed), 0);
+        assert!(!b.is_stash_candidate(1, rel_rfn));
+    }
+
+    /// Predecode reads the log off the worker, so a result for another
+    /// descriptor generation is discarded and the record decodes again
+    #[tokio::test(flavor = "current_thread")]
+    async fn predecoded_set_used_only_for_same_descriptor() {
+        use crate::record::Route;
+
+        let log_dir = tempdir().unwrap();
+        let rel = int4_descriptor(16480);
+        let log = single_rel_log(log_dir.path(), &rel).await;
+        let (logged, valid_from) = log.descriptor_at_spanned(rel.rfn, 0x200).unwrap();
+        let spill_dir = tempdir().unwrap();
+        let buffer = Arc::new(Mutex::new(
+            XactBuffer::new(cfg(spill_dir.path().to_path_buf())).unwrap(),
+        ));
+        let mut sink = BufferingDecoderSink::new(DescriptorLogs::single(log), buffer.clone());
+
+        let raws: Vec<RawRecord> = (1..=4)
+            .map(|v| multi_insert_raw(1, 0x200 + v as u64, 16480, &[v]))
+            .collect();
+        let batch: Vec<Record<'_>> = raws
+            .iter()
+            .map(|raw| Record {
+                parsed: raw.to_xlog_record(),
+                source_lsn: raw.source_lsn,
+                route: Route::ToDecoder,
+                ..Default::default()
+            })
+            .collect();
+        assert!(
+            sink.predecoder()(&batch[0]).is_some(),
+            "covered heap record predecodes"
+        );
+        let decoy_raw = multi_insert_raw(1, 0x200, 16480, &[99]);
+        let decoy = |rel: &Arc<RelDescriptor>, valid_from| {
+            let set = decode_heap_record(&decoy_raw.to_xlog_record(), 0x200, rel).unwrap();
+            Some(Predecoded::new(rel.clone(), valid_from, set))
+        };
+        let mut pre = vec![
+            decoy(&logged, valid_from),
+            decoy(&Arc::new((*logged).clone()), valid_from),
+            decoy(&logged, valid_from + 1),
+            None,
+        ];
+        sink.on_records(&batch, &mut pre).await.unwrap();
+
+        let mut drain = buffer
+            .lock()
+            .await
+            .drain_committed(StashResolved::nothing_stashed(1), 0, 0x300, &[], false)
+            .await
+            .unwrap();
+        let out = drain
+            .next_batch(8, usize::MAX, None)
+            .await
+            .unwrap()
+            .expect("one slice");
+        let values: Vec<_> = out
+            .heaps
+            .iter()
+            .map(|h| h.decoded.new.as_ref().unwrap().columns[0].clone())
+            .collect();
+        let int4 = |v| Some(ColumnValue::Int4(v));
+        assert_eq!(values, [int4(99), int4(2), int4(3), int4(4)]);
+        drain.finish().await.unwrap();
     }
 }
