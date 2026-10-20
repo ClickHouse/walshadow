@@ -10,6 +10,8 @@
 //! ```
 //! body bytes first, then header[0..20] (xl_tot_len through xl_rmid + 2 pad).
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use walrus::pg::walparser::{
     RmId, X_LOG_RECORD_HEADER_SIZE, XLR_BLOCK_ID_DATA_LONG, XLR_BLOCK_ID_DATA_SHORT,
 };
@@ -26,6 +28,23 @@ const MIN_SHORT_BODY: usize = 2;
 const MIN_LONG_BODY: usize = 5;
 /// SHORT length is 8-bit, so body must fit `2 + 255`.
 const MAX_SHORT_BODY: usize = MIN_SHORT_BODY + u8::MAX as usize;
+
+/// CRC32C over a NOOP body, by body length: the body is a function of its
+/// length, so a hit leaves only the header to hash. High bit marks filled
+static NOOP_BODY_CRC: [AtomicU64; 8192] = [const { AtomicU64::new(0) }; 8192];
+
+fn noop_body_crc(body: &[u8]) -> u32 {
+    let Some(slot) = NOOP_BODY_CRC.get(body.len()) else {
+        return crc32c::crc32c(body);
+    };
+    let cached = slot.load(Ordering::Relaxed);
+    if cached >> 32 != 0 {
+        return cached as u32;
+    }
+    let crc = crc32c::crc32c(body);
+    slot.store(1 << 32 | u64::from(crc), Ordering::Relaxed);
+    crc
+}
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum RewriteError {
@@ -69,7 +88,7 @@ pub fn noop_replace(record_bytes: &mut [u8]) -> Result<(), RewriteError> {
         body[1..5].copy_from_slice(&((body_len - MIN_LONG_BODY) as u32).to_le_bytes());
     }
 
-    let crc = compute_crc(record_bytes);
+    let crc = crc32c::crc32c_append(noop_body_crc(body), &record_bytes[..CRC_OFFSET]);
     record_bytes[CRC_OFFSET..CRC_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
     Ok(())
 }
@@ -142,6 +161,16 @@ mod tests {
         noop_replace(&mut bytes).unwrap();
         let crc = u32::from_le_bytes(bytes[CRC_OFFSET..CRC_OFFSET + 4].try_into().unwrap());
         assert_eq!(crc, compute_crc(&bytes));
+    }
+
+    #[test]
+    fn cached_body_crc_holds_across_headers() {
+        for (body_len, prev) in [(300, 1), (300, 0xFEED), (9000, 2), (9000, 3)] {
+            let mut bytes = build_record(body_len, prev);
+            noop_replace(&mut bytes).unwrap();
+            let crc = u32::from_le_bytes(bytes[CRC_OFFSET..CRC_OFFSET + 4].try_into().unwrap());
+            assert_eq!(crc, compute_crc(&bytes), "body {body_len} prev {prev:#x}");
+        }
     }
 
     #[test]

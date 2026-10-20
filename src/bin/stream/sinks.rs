@@ -6,6 +6,7 @@ use anyhow::Result;
 use std::future::Future;
 use std::pin::Pin;
 use walshadow::boundary_hold::BoundaryHoldSink;
+use walshadow::heap_decoder::Predecoded;
 use walshadow::record::{MetricsRecordSink, Record, RecordSink, SinkError};
 use walshadow::xact_buffer::BufferingDecoderSink;
 
@@ -21,13 +22,30 @@ pub(crate) struct DecoderXactPair<D: RecordSink + Send> {
 }
 
 impl<D: RecordSink + Send> RecordSink for DecoderXactPair<D> {
+    fn wants(record: &Record<'_>) -> bool {
+        BufferingDecoderSink::wants(record) || D::wants(record)
+    }
+
     fn on_record<'a>(
         &'a mut self,
         record: &'a Record<'a>,
     ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
         Box::pin(async move {
             self.decoder.on_record(record).await?;
-            self.xact_drain.on_record(record).await?;
+            self.xact_drain.on_record(record).await
+        })
+    }
+
+    /// Absorbs every heap record before draining any commit in the batch:
+    /// stronger than the per-record order, and a commit only drains its own
+    fn on_records<'a>(
+        &'a mut self,
+        batch: &'a [Record<'a>],
+        pre: &'a mut [Option<Predecoded>],
+    ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
+        Box::pin(async move {
+            self.decoder.on_records(batch, pre).await?;
+            self.xact_drain.on_records(batch, &mut []).await?;
             Ok(())
         })
     }
@@ -81,18 +99,31 @@ pub(crate) struct DaemonSinks {
 }
 
 impl RecordSink for DaemonSinks {
+    fn may_park(&self, record: &Record<'_>) -> bool {
+        self.decoder_xact.may_park(record)
+    }
+
     fn on_record<'a>(
         &'a mut self,
         record: &'a Record<'a>,
     ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
-        Box::pin(async move {
-            // Register at WAL read (pre-channel) so the span covers the queue wait.
-            if let Some(reg) = &self.span_registry {
-                reg.open(record.parsed.header.xact_id, record.source_lsn);
-            }
-            self.metrics.on_record(record).await?;
-            self.decoder_xact.on_record(record).await?;
-            Ok(())
-        })
+        // Register at WAL read (pre-channel) so the span covers the queue wait.
+        if let Some(reg) = &self.span_registry {
+            reg.open(record.parsed.header.xact_id, record.source_lsn);
+        }
+        self.metrics.observe(record);
+        // Inner future as is: one boxed future per record, not one per layer
+        self.decoder_xact.on_record(record)
+    }
+
+    fn on_record_owned(
+        &mut self,
+        record: Record<'static>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + '_>> {
+        if let Some(reg) = &self.span_registry {
+            reg.open(record.parsed.header.xact_id, record.source_lsn);
+        }
+        self.metrics.observe(&record);
+        self.decoder_xact.on_record_owned(record)
     }
 }

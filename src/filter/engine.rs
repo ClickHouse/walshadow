@@ -1201,7 +1201,7 @@ mod tests {
         let v = f
             .decide_record(&xact_end(XLOG_XACT_COMMIT, 8, &[], None), 0, 0xD116)
             .unwrap();
-        assert!(!v.boundary.is_some());
+        assert!(v.boundary.is_none());
         // Catalog-dirty xid 7 commit: boundary, drained after
         let v = f
             .decide_record(&xact_end(XLOG_XACT_COMMIT, 7, &[], None), 0, 0xD116)
@@ -1210,7 +1210,7 @@ mod tests {
         let v = f
             .decide_record(&xact_end(XLOG_XACT_COMMIT, 7, &[], None), 0, 0xD116)
             .unwrap();
-        assert!(!v.boundary.is_some(), "dirty mark consumed once");
+        assert!(v.boundary.is_none(), "dirty mark consumed once");
     }
 
     #[test]
@@ -1221,11 +1221,11 @@ mod tests {
         let v = f
             .decide_record(&xact_end(XLOG_XACT_ABORT, 7, &[], None), 0, 0xD116)
             .unwrap();
-        assert!(!v.boundary.is_some(), "rolled-back DDL never holds");
+        assert!(v.boundary.is_none(), "rolled-back DDL never holds");
         let v = f
             .decide_record(&xact_end(XLOG_XACT_COMMIT, 7, &[], None), 0, 0xD116)
             .unwrap();
-        assert!(!v.boundary.is_some(), "abort drained the mark");
+        assert!(v.boundary.is_none(), "abort drained the mark");
     }
 
     #[test]
@@ -1281,7 +1281,7 @@ mod tests {
         let v = f
             .decide_record(&xact_end(XLOG_XACT_COMMIT, 100, &[], None), 200, 0xD116)
             .unwrap();
-        assert!(!v.boundary.is_some(), "aborted child never bounds");
+        assert!(v.boundary.is_none(), "aborted child never bounds");
     }
 
     #[test]
@@ -1308,7 +1308,7 @@ mod tests {
         let v = f
             .decide_record(&xact_end(XLOG_XACT_COMMIT, 7, &[], None), 200, 0xD116)
             .unwrap();
-        assert!(!v.boundary.is_some(), "prune-only commit never bounds");
+        assert!(v.boundary.is_none(), "prune-only commit never bounds");
         // Tuple lock and vacuum inplace stats: same treatment
         for info in [XLOG_HEAP_LOCK, XLOG_HEAP_INPLACE] {
             let mut r = rec_with_xid(RmId::Heap, &[(5, 1259)], 8);
@@ -1417,7 +1417,7 @@ mod tests {
             .decide_record(&xact_end(XLOG_XACT_COMMIT, 7, &[], None), 0, 0xD116)
             .unwrap();
         assert!(
-            !v.boundary.is_some(),
+            v.boundary.is_none(),
             "safe-default keep is not a catalog touch"
         );
     }
@@ -1814,11 +1814,11 @@ mod tests {
         let v = f
             .decide_record(&xact_end(XLOG_XACT_ABORT, 7, &[], None), 200, 0xD116)
             .unwrap();
-        assert!(!v.boundary.is_some());
+        assert!(v.boundary.is_none());
         let v = f
             .decide_record(&xact_end(XLOG_XACT_COMMIT, 7, &[], None), 300, 0xD116)
             .unwrap();
-        assert!(!v.boundary.is_some(), "abort drained the mark");
+        assert!(v.boundary.is_none(), "abort drained the mark");
     }
 
     #[test]
@@ -2031,7 +2031,7 @@ mod tests {
                 0xD116,
             )
             .unwrap();
-        assert!(!v.boundary.is_some(), "foreign commit bounds nothing local");
+        assert!(v.boundary.is_none(), "foreign commit bounds nothing local");
 
         // Same oid in the followed database: dirt, fence, boundary, and a
         // first touch that owes nothing to the foreign write
@@ -2096,7 +2096,7 @@ mod tests {
             let v = f
                 .decide_record(&xact_end_dbinfo(XLOG_XACT_COMMIT, xid, db), 200, 0xD116)
                 .unwrap();
-            assert!(!v.boundary.is_some(), "db {db} relmap is not target dirt");
+            assert!(v.boundary.is_none(), "db {db} relmap is not target dirt");
         }
     }
 
@@ -2125,7 +2125,7 @@ mod tests {
                 0xD116,
             )
             .unwrap();
-        assert!(!v.boundary.is_some(), "commit drained the tree");
+        assert!(v.boundary.is_none(), "commit drained the tree");
     }
 
     fn dbase_create(db: u32, xid: u32) -> XLogRecord<'static> {
@@ -2187,7 +2187,7 @@ mod tests {
         let v = f
             .decide_record(&xact_end(XLOG_XACT_COMMIT, 7, &[], None), 300, 0xD116)
             .unwrap();
-        assert!(!v.boundary.is_some(), "drain ran before the scope check");
+        assert!(v.boundary.is_none(), "drain ran before the scope check");
     }
 
     #[test]

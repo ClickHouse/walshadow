@@ -953,12 +953,14 @@ impl DdlApplicator {
     /// re-check for displacement
     async fn mapping_snapshot(&mut self, rel: &RelName) -> Option<(MappingSnapshot, TableMapping)> {
         let at = self.mapping.snapshot().await;
-        let mapping = at.get(rel).cloned()?;
+        let mapping = at.get(rel).map(|m| m.as_ref().clone())?;
         Some((at, mapping))
     }
 
     async fn mapping_for(&mut self, rel: &RelName) -> Option<TableMapping> {
-        self.mapping.with(|m| m.get(rel).cloned()).await
+        self.mapping
+            .with(|m| m.get(rel).map(|t| t.as_ref().clone()))
+            .await
     }
 
     /// Operator opt-out (`replicate=false`); nothing excluded without a
@@ -978,7 +980,7 @@ impl DdlApplicator {
             r.register_derived_mapping(desc, mapping).await;
         } else {
             self.mapping
-                .mutate(|m| Arc::make_mut(m).insert(desc.rel_name.clone(), mapping))
+                .mutate(|m| Arc::make_mut(m).insert(desc.rel_name.clone(), Arc::new(mapping)))
                 .await;
         }
     }
@@ -1127,7 +1129,7 @@ fn predict_route_effect(
                     Routing::Own => {}
                 }
             }
-            let Some(mut m) = mapping.get(&new.rel_name).cloned() else {
+            let Some(mut m) = mapping.get(&new.rel_name).map(|m| m.as_ref().clone()) else {
                 return Ok(None);
             };
             let retypes = plan_retypes(old, new, diff, &m.columns, &cfg.column_rules);
@@ -1396,7 +1398,7 @@ async fn mutate_mapping_for_diff(
     mapping
         .mutate(|m| {
             if let Some(target_mapping) = Arc::make_mut(m).get_mut(&new.rel_name) {
-                fold_diff_into_mapping(target_mapping, new, diff, retypes, rules);
+                fold_diff_into_mapping(Arc::make_mut(target_mapping), new, diff, retypes, rules);
             }
         })
         .await;

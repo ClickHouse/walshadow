@@ -510,9 +510,19 @@ impl DescriptorLog {
         rfn: RelFileNode,
         lsn: u64,
     ) -> std::result::Result<(Arc<RelDescriptor>, u64), LookupResult> {
-        use std::sync::atomic::Ordering::Relaxed;
+        let result = self.peek_spanned(rfn, lsn);
+        self.count_spanned(&result);
+        result
+    }
+
+    /// [`Self::descriptor_at_spanned`] without lookup stats, for a speculative
+    /// caller whose answer the counted lookup confirms later
+    pub fn peek_spanned(
+        &self,
+        rfn: RelFileNode,
+        lsn: u64,
+    ) -> std::result::Result<(Arc<RelDescriptor>, u64), LookupResult> {
         if rfn.db_node != 0 && rfn.db_node != self.identity.db_oid {
-            self.stats.lookups_foreign_db.fetch_add(1, Relaxed);
             return Err(LookupResult::ForeignDb);
         }
         let idx = self.index.read().unwrap();
@@ -521,14 +531,12 @@ impl DescriptorLog {
         // the locator's own db_node, so a shared relation (db_node 0) skips
         // this database's Database-scoped intervals — shared catalogs carry
         // no descriptors, so no such interval can name their rows
-        let result = ambiguity_covering(idx.amb_rfn.get(&rfn), lsn)
+        ambiguity_covering(idx.amb_rfn.get(&rfn), lsn)
             .or_else(|| ambiguity_covering(idx.amb_db.get(&rfn.db_node), lsn))
             .map_or_else(
                 || lookup_spanned(idx.by_rfn.get(&rfn), lsn),
                 |a| Err(LookupResult::Ambiguous(a)),
-            );
-        self.count_spanned(&result);
-        result
+            )
     }
 
     /// Oid lookup for a caller that already proved the oid belongs to this

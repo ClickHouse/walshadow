@@ -263,7 +263,7 @@ impl PipelineConfig {
         };
         let ack_probe = ack.probe();
 
-        let plan_dir = buffer.lock().await.scratch_dir().to_path_buf();
+        let plan_dir = Arc::from(buffer.lock().await.scratch_dir());
         let reorder = reorder::ReorderSink::booting(
             buffer,
             dbs,

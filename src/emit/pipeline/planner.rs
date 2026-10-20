@@ -37,17 +37,17 @@
 //! - planned schema transition reproducible → control entries carry
 //!   `SchemaEvent` values (old + new descriptors) into replay verbatim
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::decode::heap_decoder::DescribedHeap;
 use crate::emit::pipeline::plan_spool::{
-    DEFAULT_PLAN_MEM_MAX, PlanSpoolError, PlanWriter, SealedPlan,
+    DEFAULT_PLAN_MEM_MAX, PlanPath, PlanSpoolError, PlanWriter, SealedPlan,
 };
 use crate::emit::route::RouteSnapshot;
 use crate::toast::{ChunkRefMap, ToastResolver};
 use crate::xact::xact_buffer::{
     DrainEntry, DrainWalk, DrainedBatch, FailClosedReason, WalkStep, XactBufferError, detoast_heap,
+    needs_detoast,
 };
 
 /// Planner's window onto route state. Implementations resolve from frozen
@@ -123,7 +123,7 @@ pub struct Planner<'a, V> {
 
 impl<'a, V: PlanRouteView> Planner<'a, V> {
     pub fn create(
-        path: PathBuf,
+        path: impl Into<PlanPath>,
         disk_cap: u64,
         view: &'a mut V,
         resolver: &'a ToastResolver,
@@ -154,13 +154,16 @@ impl<'a, V: PlanRouteView> Planner<'a, V> {
             match step {
                 WalkStep::Rows { upto } => cursor = cursor.max(upto),
                 WalkStep::Event(e) => {
-                    self.view.apply(&e).await.map_err(PlanError::View)?;
+                    // Boxed: rare, and deep enough to bloat every plan future
+                    Box::pin(self.view.apply(&e))
+                        .await
+                        .map_err(PlanError::View)?;
                     self.writer.push_control(e, self.rows_base + cursor);
                 }
                 WalkStep::Truncate { heap, upto } => {
                     let route = self.view.route_for(&heap);
                     self.writer
-                        .push_truncate(&heap, route.as_ref(), self.rows_base + upto)?;
+                        .push_truncate(heap, route, self.rows_base + upto)?;
                 }
                 WalkStep::Heap(mut heap) => {
                     // Route before validation and detoast: unmapped rows
@@ -174,9 +177,12 @@ impl<'a, V: PlanRouteView> Planner<'a, V> {
                                 lsn: heap.decoded.source_lsn,
                             });
                         }
-                        detoast_heap(&mut heap, spool, &ref_maps, self.resolver).await?;
+                        if needs_detoast(&heap) {
+                            Box::pin(detoast_heap(&mut heap, spool, &ref_maps, self.resolver))
+                                .await?;
+                        }
                     }
-                    self.writer.push_heap(&heap, route.as_ref())?;
+                    self.writer.push_heap(heap, route)?;
                 }
             }
         }
@@ -476,19 +482,14 @@ mod tests {
             .drain_committed(StashResolved::nothing_stashed(1), 42, 0x2000, &[], false)
             .await
             .unwrap();
-        // 1-row slices: the valid row plans before the toast row fails
-        let first = drain
+        // In-memory xact arrives whole: the valid row plans before the
+        // toast row fails within the same slice
+        let batch = drain
             .next_batch(1, usize::MAX, None)
             .await
             .unwrap()
-            .expect("valid row slice");
-        planner.plan_batch(first).await.unwrap();
-        let second = drain
-            .next_batch(1, usize::MAX, None)
-            .await
-            .unwrap()
-            .expect("toast row slice");
-        let err = planner.plan_batch(second).await.unwrap_err();
+            .expect("heap slice");
+        let err = planner.plan_batch(batch).await.unwrap_err();
         assert!(matches!(err, PlanError::Detoast(_)), "{err}");
         drain.finish().await.unwrap();
         drop(planner);

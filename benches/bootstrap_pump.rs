@@ -347,7 +347,7 @@ async fn bench_drain(shape: Shape) -> Report {
         catalog.insert(r.clone());
         tables.insert(r.rel_name.clone(), mapping(r.oid, shape.columns));
     }
-    let routes = Arc::new(tables.into_iter().collect());
+    let routes = Arc::new(walshadow::mapping::shared(tables));
 
     let (msg_tx, ack, tail) = walshadow::pipeline::tail::spawn_null(
         Arc::new(Monotone::<EmitterAck>::default()),

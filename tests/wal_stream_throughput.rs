@@ -349,3 +349,134 @@ async fn pump_throughput_breakdown() {
         .await;
     }
 }
+
+fn build_index_record(rel_node: u32, block_no: u32, xid: u32, main_data: &[u8]) -> Vec<u8> {
+    let body_len = 1 + 1 + 2 + 12 + 4 + 1 + 4 + main_data.len();
+    let total = X_LOG_RECORD_HEADER_SIZE + body_len;
+    let mut v = Vec::with_capacity(total);
+    write_header(&mut v, total as u32, 0x00, RmId::Btree as u8, xid);
+    v.push(0);
+    v.push(0);
+    v.extend_from_slice(&0u16.to_le_bytes());
+    v.extend_from_slice(&1663u32.to_le_bytes());
+    v.extend_from_slice(&TEST_DB_NODE.to_le_bytes());
+    v.extend_from_slice(&rel_node.to_le_bytes());
+    v.extend_from_slice(&block_no.to_le_bytes());
+    v.push(XLR_BLOCK_ID_DATA_LONG);
+    v.extend_from_slice(&(main_data.len() as u32).to_le_bytes());
+    v.extend_from_slice(main_data);
+    finalise_crc(&mut v);
+    v
+}
+
+fn build_segment_of(seg_size: usize, index_records: bool) -> (Vec<u8>, u64) {
+    let main_data = b"\x00\x00\x02\x00".to_vec();
+    let mut buf = Vec::with_capacity(seg_size);
+    buf.extend_from_slice(&XLP_PAGE_MAGIC_PG15.to_le_bytes());
+    buf.extend_from_slice(&XLP_LONG_HEADER.to_le_bytes());
+    buf.extend_from_slice(&1u32.to_le_bytes());
+    buf.extend_from_slice(&0u64.to_le_bytes());
+    buf.extend_from_slice(&0u32.to_le_bytes());
+    buf.extend_from_slice(&12345u64.to_le_bytes());
+    buf.extend_from_slice(&(seg_size as u32).to_le_bytes());
+    buf.extend_from_slice(&8192u32.to_le_bytes());
+    buf.extend_from_slice(&[0u8; 4]);
+
+    let mut records = 0u64;
+    let mut xid = 1u32;
+    let mut block_no = 0u32;
+    while buf.len() < seg_size - 80 {
+        let rel = TEST_REL_NODE_BASE + (records as u32 % 16);
+        let rec = if index_records {
+            build_index_record(rel, block_no, xid, &main_data)
+        } else {
+            build_heap_insert(rel, block_no, xid, &main_data)
+        };
+        if buf.len() + rec.len() + 8 > seg_size {
+            break;
+        }
+        buf.extend_from_slice(&rec);
+        let pad = (8 - (buf.len() % 8)) % 8;
+        buf.extend(std::iter::repeat_n(0u8, pad));
+        records += 1;
+        xid = xid.wrapping_add(1);
+        block_no = block_no.wrapping_add(1);
+    }
+    buf.resize(seg_size, 0);
+    (buf, records)
+}
+
+struct DispatchShapeSink {
+    dispatched: u64,
+}
+
+impl RecordSink for DispatchShapeSink {
+    fn on_record<'a>(
+        &'a mut self,
+        r: &'a Record<'a>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
+        Box::pin(async move {
+            decoder_layer(r).await?;
+            reorder_layer(r).await?;
+            self.dispatched += 1;
+            Ok(())
+        })
+    }
+}
+
+fn decoder_layer<'a>(
+    r: &'a Record<'a>,
+) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
+    Box::pin(async move {
+        let rm = r.parsed.header.resource_manager_id;
+        if rm != RmId::Heap as u8 && rm != RmId::Heap2 as u8 {
+            return Ok(());
+        }
+        std::hint::black_box(r.parsed.blocks.first().map(|b| b.header.location.rel));
+        Ok(())
+    })
+}
+
+fn reorder_layer<'a>(
+    r: &'a Record<'a>,
+) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
+    Box::pin(async move {
+        if r.parsed.header.resource_manager_id != RmId::Xact as u8 {
+            return Ok(());
+        }
+        Ok(())
+    })
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "diagnostic microbenchmark — run with `cargo test --release --test wal_stream_throughput -- --ignored --nocapture`"]
+async fn inert_vs_heap_dispatch_cost() {
+    for (label, index_records) in [("heap-only", false), ("btree-only", true)] {
+        let (seg, records) = build_segment_of(SEG_SIZE as usize, index_records);
+        println!(
+            "\n {label}: {} records/segment, avg {:.0} bytes/record",
+            records,
+            seg.len() as f64 / records as f64,
+        );
+        let state = Arc::new(Mutex::new(ShadowStreamState::new(
+            1,
+            "12345".into(),
+            0,
+            64 * 1024 * 1024,
+        )));
+        let mut queueing =
+            QueueingRecordSink::spawn(DispatchShapeSink { dispatched: 0 }, 256, 16_384, None);
+        let bs: Box<dyn walshadow::record::RecordBytesSink + Send> =
+            Box::new(ShadowStreamSink::new(state.clone()));
+        run_case(
+            "queueing(3-layer) + shadow",
+            &seg,
+            records,
+            ITERATIONS,
+            &mut queueing,
+            Some(bs),
+        )
+        .await;
+        queueing.close().await.unwrap();
+    }
+}

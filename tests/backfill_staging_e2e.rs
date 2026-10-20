@@ -249,11 +249,10 @@ async fn staging_follows_named_instance() {
     fixture
         .mapping
         .mutate(|map| {
-            Arc::make_mut(map)
+            let entry = Arc::make_mut(map)
                 .get_mut(&fixture.desc.rel_name)
-                .unwrap()
-                .target
-                .instance = Some("archive".into());
+                .expect("fixture mapping present");
+            Arc::make_mut(entry).target.instance = Some("archive".into());
         })
         .await;
     let rel = fixture.prepare_staging().await;

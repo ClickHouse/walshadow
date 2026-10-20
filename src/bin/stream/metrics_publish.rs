@@ -385,6 +385,11 @@ pub(crate) async fn populate_pipeline_metrics(
             &decoder_stats.truncates,
         ]
         .map(|n| n.load(Ordering::Relaxed)),
+        decoder_buffer_lock_waits_total: decoder_stats.buffer_lock_waits.load(Ordering::Relaxed),
+        decoder_buffer_lock_wait_seconds_total: decoder_stats
+            .buffer_lock_wait_nanos
+            .load(Ordering::Relaxed) as f64
+            / 1e9,
         decoder_partial_total: decoder_stats.partial.load(Ordering::Relaxed),
         decoder_toast_chunks_total: decoder_stats.toast_chunks_buffered.load(Ordering::Relaxed),
         decoder_toast_malformed_total: decoder_stats.toast_chunks_malformed.load(Ordering::Relaxed),

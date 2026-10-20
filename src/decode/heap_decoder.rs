@@ -64,6 +64,7 @@
 //! can key on it.
 
 use std::borrow::Cow;
+use std::sync::Arc;
 
 use smallvec::{SmallVec, smallvec};
 use thiserror::Error;
@@ -79,6 +80,32 @@ use crate::schema::{
 /// SmallVec sized at 1: single-row INSERT/UPDATE/DELETE stays stack-allocated,
 /// only MULTI_INSERT with ntuples > 1 spills.
 pub type DecodedHeaps = SmallVec<[DecodedHeap; 1]>;
+
+/// Tuples of one record decoded ahead of the serial worker against the
+/// descriptor resolved then. Decoding is pure in (record, descriptor), so
+/// they stand in for the worker's own decode when its lookup lands on the
+/// same descriptor version
+#[derive(Debug)]
+pub struct Predecoded {
+    rel: Arc<RelDescriptor>,
+    valid_from: u64,
+    set: DecodedHeaps,
+}
+
+impl Predecoded {
+    pub fn new(rel: Arc<RelDescriptor>, valid_from: u64, set: DecodedHeaps) -> Self {
+        Self {
+            rel,
+            valid_from,
+            set,
+        }
+    }
+
+    /// Tuples, if decoded against `rel` valid from `valid_from`
+    pub fn take_if(self, rel: &Arc<RelDescriptor>, valid_from: u64) -> Option<DecodedHeaps> {
+        (Arc::ptr_eq(&self.rel, rel) && self.valid_from == valid_from).then_some(self.set)
+    }
+}
 
 /// PG `SizeOfHeapHeader`.
 pub const SIZE_OF_HEAP_HEADER: usize = 5;

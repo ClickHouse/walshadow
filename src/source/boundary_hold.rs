@@ -332,10 +332,21 @@ impl BoundaryHoldSink {
 }
 
 impl RecordSink for BoundaryHoldSink {
+    fn may_park(&self, record: &Record<'_>) -> bool {
+        record.boundary_info.is_some()
+            || record.aborted_tree.is_some()
+            || self.pending.hit(record).is_some()
+    }
+
     fn on_record<'a>(
         &'a mut self,
         record: &'a Record<'a>,
     ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
+        // Common record: nothing to attach, forget or hold, so pass the inner
+        // future through instead of boxing a hold-sized one around it
+        if !self.may_park(record) {
+            return self.inner.on_record(record);
+        }
         Box::pin(async move {
             if let Some(db) = self.pending.hit(record).cloned() {
                 return self.attach_pending(db, record).await;
@@ -392,6 +403,17 @@ impl RecordSink for BoundaryHoldSink {
             // must not wait out the accumulator
             self.inner.flush().await
         })
+    }
+
+    fn on_record_owned(
+        &mut self,
+        record: Record<'static>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + '_>> {
+        if !self.may_park(&record) {
+            return self.inner.on_record_owned(record);
+        }
+        // Rare, so parking keeps its one by-reference path
+        Box::pin(async move { self.on_record(&record).await })
     }
 }
 
@@ -692,11 +714,11 @@ mod tests {
         sink.on_record(&rec).await.expect("boundary releases");
         releaser.await.unwrap();
         // Forced flush shipped the sub-batch-size buffer to the worker
-        for _ in 0..100 {
+        for _ in 0..1000 {
             if *counter.lock().unwrap() == 1 {
                 break;
             }
-            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(1)).await;
         }
         assert_eq!(*counter.lock().unwrap(), 1, "commit reached the worker");
         sink.close().await.expect("close");

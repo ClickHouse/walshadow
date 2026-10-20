@@ -188,9 +188,10 @@ pub struct ShadowStreamState {
     /// `walshadow_shadow_stream_dropped_connections_total` gauge.
     dropped_total: u64,
     accepted_total: u64,
-    /// Current segment's wire bytes `[wire_buf_start, server_wal_end]`, used to
+    /// Wire bytes `[wire_buf_start, server_wal_end]` not yet on disk, used to
     /// backfill a reconnect behind the live head (else it gets an unappliable
-    /// gap and strands at segment boundaries). Reset per segment.
+    /// gap and strands at segment boundaries). Spans up to two segments while
+    /// the last sealed one writes
     wire_buf: Vec<u8>,
     wire_buf_start: u64,
     /// Wakes the listener to write now rather than on its batching tick;
@@ -496,7 +497,7 @@ impl ShadowStreamState {
             let end = (pos + FRAME).min(backfill.len());
             let frame_lsn = start_lsn + pos as u64;
             let chunk = &backfill[pos..end];
-            // Uncapped: a reconnect backfill is bounded (≤ one segment) and
+            // Uncapped: a reconnect backfill is bounded (≤ two segments) and
             // required for recovery, so it must not trip the slow-client cap.
             self.frame_copy_data(id, None, |out| {
                 encode_wal_data_frame_into(out, frame_lsn, server_wal_end, chunk);
@@ -534,6 +535,15 @@ impl ShadowStreamState {
     /// Listener pulls framed bytes out of here.
     pub fn drain_send_queue(&mut self, id: u64) -> Option<Vec<u8>> {
         self.send_queues.remove(&id)
+    }
+
+    /// Swap queued bytes into `buf`, leaving its cleared capacity for the
+    /// pump to fill instead of regrowing a fresh queue
+    pub fn swap_send_queue(&mut self, id: u64, buf: &mut Vec<u8>) {
+        buf.clear();
+        if let Some(q) = self.send_queues.get_mut(&id) {
+            std::mem::swap(q, buf);
+        }
     }
 
     #[cfg(test)]
@@ -869,20 +879,19 @@ where
     // subscribe, and those bytes must not be swallowed
     let queued = state.lock().await.queued();
     let mut woke_at = Pos::ZERO;
+    let mut pending = Vec::new();
     loop {
         tokio::select! {
             Ok(seen) = queued.advance(woke_at) => {
                 woke_at = seen;
-                let pending = state.lock().await.drain_send_queue(id);
-                if let Some(bytes) = pending
-                    && !bytes.is_empty()
-                {
-                    conn.write_framed(&bytes).await?;
+                state.lock().await.swap_send_queue(id, &mut pending);
+                if !pending.is_empty() {
+                    conn.write_framed(&pending).await?;
                     last_write = tokio::time::Instant::now();
                 }
             }
             _ = ticker.tick() => {
-                let pending = {
+                {
                     let mut s = state.lock().await;
                     if last_write.elapsed() >= KEEPALIVE_IDLE {
                         let server_wal_end = s.server_wal_end.get();
@@ -890,13 +899,11 @@ where
                             encode_keepalive_frame_into(out, server_wal_end, false);
                         });
                     }
-                    s.drain_send_queue(id)
-                };
-                if let Some(bytes) = pending
-                    && !bytes.is_empty()
-                {
+                    s.swap_send_queue(id, &mut pending);
+                }
+                if !pending.is_empty() {
                     // Queue holds fully-framed CopyData envelopes
-                    conn.write_framed(&bytes).await?;
+                    conn.write_framed(&pending).await?;
                     last_write = tokio::time::Instant::now();
                 }
             }

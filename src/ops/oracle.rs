@@ -479,20 +479,17 @@ fn decode_block(
 
 /// Render PostGIS 2-D points as WKT, typoutput yields HEXEWKB
 pub fn render_ext_columns(attrs: &[RelAttr], columns: &mut [Option<ColumnValue>]) {
-    for att in attrs {
-        if att.dropped || !matches!(att.type_name.as_str(), "geography" | "geometry") {
-            continue;
-        }
-        let Ok(idx) = usize::try_from(att.attnum - 1) else {
-            continue;
-        };
-        let Some(cell) = columns.get_mut(idx) else {
-            continue;
-        };
+    // Scan cells first: attribute type names sit behind a pointer per column
+    for (idx, cell) in columns.iter_mut().enumerate() {
         let Some(ColumnValue::PgPending { raw, .. }) = cell.as_ref() else {
             continue;
         };
-        if let Some(text) = gserialized_point_to_wkt(raw) {
+        let is_geo = attrs.iter().any(|att| {
+            !att.dropped
+                && usize::try_from(att.attnum - 1) == Ok(idx)
+                && matches!(att.type_name.as_str(), "geography" | "geometry")
+        });
+        if is_geo && let Some(text) = gserialized_point_to_wkt(raw) {
             *cell = Some(ColumnValue::Text(text));
         }
     }
