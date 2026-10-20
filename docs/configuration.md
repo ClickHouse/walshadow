@@ -141,7 +141,7 @@ Require restart:
 - runtime-config schema
 - cluster-wide `[system_columns]` names
 - soft-delete mode and TOAST buffering settings
-- worker-pool sizes and memory limits
+- worker-pool sizes, `--worker-threads`, and memory limits
 - backup and shadow bootstrap choices
 
 Run `walshadow-stream --help` for process and recovery flags. Run

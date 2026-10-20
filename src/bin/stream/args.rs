@@ -280,6 +280,10 @@ pub(crate) struct Args {
     /// (see `trace::should_sample`), so per-record span cost scales with it.
     #[arg(long, default_value_t = 0.01)]
     pub(crate) trace_sample_ratio: f64,
+    /// Tokio runtime worker threads. Absent defers to tokio:
+    /// `TOKIO_WORKER_THREADS`, else one per CPU
+    #[arg(long)]
+    pub(crate) worker_threads: Option<NonZeroUsize>,
     /// WAL retention horizon in bytes. Segments older than
     /// `shadow_replay_lsn - retention_bytes` deleted every trim cycle.
     /// `0` disables trim.
