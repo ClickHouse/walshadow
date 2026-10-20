@@ -47,7 +47,7 @@ unexpected_cfgs = { level = "warn", check-cfg = ["cfg(coverage)"] }
 unused_async = "warn"
 
 [dependencies]
-wal-rus = "0.3.5"
+wal-rus = "0.3.8"
 clickhouse-c-rs = { version = "0.2.2", default-features = false, features = ["tokio", "tls"] }
 # hash keys are internal (relfilenodes, oids, xids, names), never network
 # input, so SipHash's HashDoS margin buys nothing at 2-4x per probe

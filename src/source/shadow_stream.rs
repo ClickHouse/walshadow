@@ -11,8 +11,9 @@
 //! history), a reconnect lands *behind* the head; [`ShadowStreamState`] retains
 //! the current segment's wire bytes and backfills `[reconnect_lsn, head]` on
 //! connect so the stream stays contiguous. Older complete segments come from
-//! the archive (`restore_command`); only the in-progress segment — which the
-//! archive lacks — must come over the wire.
+//! the archive (`restore_command`), so a start below the retained bytes is
+//! refused rather than answered from the head; only the in-progress segment,
+//! which the archive lacks, must come over the wire.
 
 use std::future::Future;
 use std::io;
@@ -26,6 +27,7 @@ use smallvec::SmallVec;
 use thiserror::Error;
 use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
 use tokio::sync::Mutex;
+use walrus::pg::backup::format_pg_lsn;
 use walrus::pg::replication::server::{
     self, ServerError, TimelineSwitch, WalSenderConn, decode_standby_status,
 };
@@ -149,6 +151,34 @@ pub struct AggregateLsn {
     /// what separates a shadow that followed a crossing from one that only
     /// survived it.
     pub replay_timeline: Option<u32>,
+}
+
+/// Why a `START_REPLICATION` gets an `ErrorResponse` instead of a stream
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum Refused {
+    /// Ahead of what this walsender has, or a branch it never knew. Another
+    /// branch's bytes would be WAL the client's own history rejects
+    #[error("requested timeline {0} is not in this server's history")]
+    Timeline(u32),
+    /// Below the retained bytes, so in the archive. Bytes from the head would
+    /// leave a hole the client's startup process opens as streamed and PANICs
+    /// on (PG `xlogrecovery.c` `WaitForWALToBecomeAvailable`)
+    #[error(
+        "requested WAL segment at {} has already been removed, this walsender retains WAL from {}",
+        format_pg_lsn(*.start),
+        format_pg_lsn(*.retained)
+    )]
+    Archived { start: u64, retained: u64 },
+}
+
+impl Refused {
+    /// SQLSTATE a PG walsender sends for the same refusal
+    fn sqlstate(&self) -> &'static str {
+        match self {
+            Self::Timeline(_) => "XX000",
+            Self::Archived { .. } => crate::source_feed::SQLSTATE_UNDEFINED_FILE,
+        }
+    }
 }
 
 #[derive(Debug, Error)]
@@ -282,10 +312,7 @@ impl ShadowStreamState {
         self.accepted_total += 1;
     }
 
-    /// `None` refuses a `START_REPLICATION` for a branch this walsender cannot
-    /// serve — a timeline ahead of what it has, or one it never knew. Answering
-    /// with another branch's bytes would have the client write WAL its own
-    /// history rejects.
+    /// Refuse a `START_REPLICATION` this walsender cannot serve gap-free
     ///
     /// `ends_at` comes from the handshake, which resolved the request against
     /// [`identity`](Self::identity): a historic connection streams to that
@@ -295,9 +322,15 @@ impl ShadowStreamState {
         start_lsn: u64,
         timeline: u32,
         ends_at: Option<TimelineSwitch>,
-    ) -> Option<u64> {
+    ) -> Result<u64, Refused> {
         if ends_at.is_none() && timeline != 0 && timeline != self.timeline {
-            return None;
+            return Err(Refused::Timeline(timeline));
+        }
+        if start_lsn < self.wire_buf_start {
+            return Err(Refused::Archived {
+                start: start_lsn,
+                retained: self.wire_buf_start,
+            });
         }
         let id = self.next_conn_id;
         self.next_conn_id += 1;
@@ -313,7 +346,7 @@ impl ShadowStreamState {
         }
         // New connection can lower aggregate without status progress
         self.applied.bump();
-        Some(id)
+        Ok(id)
     }
 
     /// What the handshake answers `IDENTIFY_SYSTEM`, `TIMELINE_HISTORY`, and a
@@ -386,13 +419,19 @@ impl ShadowStreamState {
         self.wake_listener();
     }
 
-    /// Append contiguous wire bytes; a non-contiguous LSN re-anchors.
+    /// Append wire bytes, replacing any retained from `start_lsn` on, as when a
+    /// rebuilt `WalStream` replays its segment. A gap would break the
+    /// `Refused::Archived` premise that everything below `wire_buf_start` is in
+    /// the archive
     fn retain_wire(&mut self, start_lsn: u64, bytes: &[u8]) {
-        let buf_end = self.wire_buf_start + self.wire_buf.len() as u64;
-        if self.wire_buf.is_empty() || start_lsn != buf_end {
-            self.wire_buf.clear();
-            self.wire_buf_start = start_lsn;
-        }
+        let end = self.wire_buf_start + self.wire_buf.len() as u64;
+        debug_assert!(
+            (self.wire_buf_start..=end).contains(&start_lsn),
+            "wire chunk at {start_lsn:#X} outside retained {:#X}..={end:#X}",
+            self.wire_buf_start
+        );
+        self.wire_buf
+            .truncate((start_lsn - self.wire_buf_start) as usize);
         self.wire_buf.extend_from_slice(bytes);
     }
 
@@ -482,7 +521,7 @@ impl ShadowStreamState {
             .map(|s| s.ends_at);
         let head = self.server_wal_end.get();
         let server_wal_end = ends_at.map_or(head, |v| v.min(head));
-        if start_lsn >= server_wal_end || start_lsn < self.wire_buf_start {
+        if start_lsn >= server_wal_end {
             return;
         }
         let off = (start_lsn - self.wire_buf_start) as usize;
@@ -817,15 +856,23 @@ where
             let mut s = state.lock().await;
             s.register_connection(started.start_lsn, started.timeline, started.ends_at)
         };
-        let Some(id) = registered else {
-            tracing::warn!(
-                target: "walshadow",
-                start_lsn = format!("{:#X}", started.start_lsn),
-                requested_timeline = started.timeline,
-                served_timeline = identity.timeline,
-                "walsender refused START_REPLICATION for an unserved timeline",
-            );
-            return Ok(());
+        let id = match registered {
+            Ok(id) => id,
+            Err(refused) => {
+                tracing::warn!(
+                    target: "walshadow",
+                    start_lsn = format!("{:#X}", started.start_lsn),
+                    requested_timeline = started.timeline,
+                    served_timeline = identity.timeline,
+                    error = %refused,
+                    "walsender refused START_REPLICATION",
+                );
+                // Inside CopyBoth, where PG's walsender reports a removed segment
+                let mut err = bytes::BytesMut::new();
+                server::encode_error_response(&mut err, refused.sqlstate(), &refused.to_string());
+                conn.write_framed(&err).await?;
+                return Ok(());
+            }
         };
         tracing::info!(
             target: "walshadow",
@@ -1099,16 +1146,17 @@ mod tests {
     #[test]
     fn refuses_a_timeline_this_walsender_never_served() {
         let mut s = fresh_state();
-        assert!(
-            s.register_connection(0x1000, 7, None).is_none(),
+        assert_eq!(
+            s.register_connection(0x1000, 7, None),
+            Err(Refused::Timeline(7)),
             "a branch the handshake could not place cannot be answered",
         );
         assert!(
-            s.register_connection(0x1004, 1, None).is_some(),
+            s.register_connection(0x1004, 1, None).is_ok(),
             "the current branch connects",
         );
         assert!(
-            s.register_connection(0x1004, 0, None).is_some(),
+            s.register_connection(0x1004, 0, None).is_ok(),
             "an unspecified timeline takes the current branch",
         );
     }
@@ -1269,21 +1317,18 @@ mod tests {
     // send_time(8) = 30 bytes; payload follows.
     const WIRE_HDR: usize = 30;
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn reconnect_behind_head_is_backfilled_contiguously() {
-        let state = Arc::new(Mutex::new(fresh_state())); // current_lsn = 0x1000
-        let mut sink = ShadowStreamSink::new(state.clone());
-        sink.on_wire_chunk(0x1000, b"AAAA").await.unwrap();
-        sink.on_wire_chunk(0x1004, b"BBBB").await.unwrap(); // head = 0x1008
-
-        // A reconnect behind the head gets the whole [reconnect_lsn, head] range
-        // from the retained buffer — not just future bytes (which would gap).
-        let mut s = state.lock().await;
-        let id = s
-            .register_connection(0x1000, 1, None)
-            .expect("current timeline");
-        let q = s.drain_send_queue(id).expect("reconnect backfilled");
-        assert_eq!(&q[WIRE_HDR..], b"AAAABBBB", "backfill must be gap-free");
+    /// `(lsn, payload length)` of each `'w'` frame in a send queue
+    fn frames(mut q: &[u8]) -> Vec<(u64, usize)> {
+        let mut out = Vec::new();
+        while !q.is_empty() {
+            let len = 1 + u32::from_be_bytes(q[1..5].try_into().unwrap()) as usize;
+            if q[5] == b'w' {
+                let lsn = u64::from_be_bytes(q[6..14].try_into().unwrap());
+                out.push((lsn, len - WIRE_HDR));
+            }
+            q = &q[len..];
+        }
+        out
     }
 
     /// Backfill-sized queue capacity does not ride the swap buffers for the
@@ -1313,44 +1358,47 @@ mod tests {
         assert!(s.send_queues[&id].capacity() <= 1 << 20);
     }
 
+    /// Every stream the walsender accepts is gap-free from its start, through
+    /// backfill and live bytes alike; only a start below the retained bytes is
+    /// refused, never answered from further on
     #[tokio::test(flavor = "current_thread")]
-    async fn connect_at_head_has_no_backfill() {
-        let state = Arc::new(Mutex::new(fresh_state()));
-        let mut sink = ShadowStreamSink::new(state.clone());
-        sink.on_wire_chunk(0x1000, b"AAAA").await.unwrap(); // head = 0x1004
-        let mut s = state.lock().await;
-        let id = s
-            .register_connection(0x1004, 1, None)
-            .expect("current timeline"); // caught up
-        assert!(
-            s.drain_send_queue(id).is_none(),
-            "nothing to backfill at head"
-        );
+    async fn accepted_streams_are_contiguous_from_their_start() {
+        for start in (0x1000..=0x100c).step_by(2) {
+            let state = Arc::new(Mutex::new(fresh_state()));
+            let mut sink = ShadowStreamSink::new(state.clone());
+            sink.on_wire_chunk(0x1000, b"AAAABBBB").await.unwrap();
+            sink.on_segment_retired(0x1004).await.unwrap();
+            let registered = state.lock().await.register_connection(start, 1, None);
+            sink.on_wire_chunk(0x1008, b"CCCC").await.unwrap();
+            let Ok(id) = registered else {
+                assert!(start < 0x1004, "{start:#X} refused: {registered:?}");
+                continue;
+            };
+            assert!(
+                start >= 0x1004,
+                "{start:#X} accepted below the retained bytes"
+            );
+            let queued = state.lock().await.drain_send_queue(id).unwrap_or_default();
+            let end = frames(&queued).into_iter().fold(start, |next, (lsn, len)| {
+                assert_eq!(lsn, next, "gap in the stream from {start:#X}");
+                next + len as u64
+            });
+            assert_eq!(end, start.max(0x100c), "stream from {start:#X} stops short");
+        }
     }
 
+    /// A rebuilt `WalStream` replays its segment over retained bytes, which
+    /// keeps `wire_buf_start` and the backfill gap-free
     #[tokio::test(flavor = "current_thread")]
-    async fn backfill_scoped_to_current_segment() {
-        let state = Arc::new(Mutex::new(fresh_state())); // current_lsn = 0x1000
+    async fn replay_over_retained_bytes_keeps_backfill() {
+        let state = Arc::new(Mutex::new(fresh_state()));
         let mut sink = ShadowStreamSink::new(state.clone());
-        sink.on_wire_chunk(0x1000, b"AAAA").await.unwrap();
-        sink.on_segment_retired(0x1004).await.unwrap(); // trims completed segment
-        sink.on_wire_chunk(0x1004, b"CCCC").await.unwrap(); // new segment, head = 0x1008
-
+        sink.on_wire_chunk(0x1000, b"AAAABBBB").await.unwrap();
+        sink.on_wire_chunk(0x1000, b"AAAABBBBCCCC").await.unwrap();
         let mut s = state.lock().await;
-        // Old (completed) segment is restore_command's job — not backfilled.
-        let old = s
-            .register_connection(0x1000, 1, None)
-            .expect("current timeline");
-        assert!(
-            s.drain_send_queue(old).is_none(),
-            "completed segment not backfilled"
-        );
-        // Current segment is served from the buffer.
-        let cur = s
-            .register_connection(0x1004, 1, None)
-            .expect("current timeline");
-        let q = s.drain_send_queue(cur).expect("current-segment backfill");
-        assert_eq!(&q[WIRE_HDR..], b"CCCC");
+        let id = s.register_connection(0x1004, 1, None).unwrap();
+        let q = s.drain_send_queue(id).expect("backfill");
+        assert_eq!(&q[WIRE_HDR..], b"BBBBCCCC");
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1373,12 +1421,5 @@ mod tests {
             .expect("current timeline");
         let q = s.drain_send_queue(cur).expect("in-progress backfill kept");
         assert_eq!(&q[WIRE_HDR..], b"BBBB", "no gap after trim");
-        let old = s
-            .register_connection(0x1000, 1, None)
-            .expect("current timeline");
-        assert!(
-            s.drain_send_queue(old).is_none(),
-            "completed segment falls to restore_command"
-        );
     }
 }

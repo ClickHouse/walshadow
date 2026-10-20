@@ -116,11 +116,7 @@ async fn retained_routes_prevent_invalid_page_recovery_after_resume() {
     // Match an omitted heap later recreated by recovery plumbing
     fs::write(good.config().data_dir.join(format!("base/{db}/{rel}")), []).unwrap();
     copy_dir(&good.config().data_dir, &bad.config().data_dir);
-    let seg = SegmentName {
-        timeline: 1,
-        log_id: (resume >> 32) as u32,
-        seg_no: ((resume & 0xffff_ffff) / WAL_SEG_SIZE) as u32,
-    };
+    let seg = SegmentName::from_lsn(1, resume, WAL_SEG_SIZE);
     let bytes = fs::read(raw.join(seg.format())).unwrap();
     for (sh, durable) in [(&bad, false), (&good, true)] {
         let mut stream = WalStream::builder(1, WAL_SEG_SIZE, Pos::new(resume)).unwrap();

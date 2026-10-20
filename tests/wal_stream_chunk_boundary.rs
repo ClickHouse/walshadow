@@ -10,7 +10,7 @@
 #[path = "common/tools.rs"]
 mod tools;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use walshadow::pos::Pos;
 use walshadow::record::{CollectingRecordSink, CollectingSegmentSink, Record};
@@ -24,6 +24,17 @@ use segment::load_segment;
 fn fixture_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("fixtures/wal/classify/segments/000000010000000000000001.gz")
+}
+
+/// Fixture with trimmed zero pages restored up to a power-of-two segment size
+async fn load_fixture(path: &Path) -> Vec<u8> {
+    let mut bytes = load_segment(path).await.expect("load fixture");
+    assert!(
+        bytes.len().is_multiple_of(8192),
+        "fixture must be page-aligned"
+    );
+    bytes.resize(bytes.len().next_power_of_two(), 0);
+    bytes
 }
 
 /// Stable fingerprint of a `Record`. Filter is deterministic so any
@@ -86,11 +97,7 @@ async fn bulk_and_byte_chunks_emit_identical_record_sequence() {
     if !tools::fixture(&path) {
         return;
     }
-    let bytes = load_segment(&path).await.expect("load fixture");
-    assert!(
-        bytes.len().is_multiple_of(8192),
-        "fixture must be page-aligned"
-    );
+    let bytes = load_fixture(&path).await;
     let seg_size = bytes.len() as u64;
 
     let bulk = run_with_chunk_sizes(&bytes, seg_size, &[bytes.len()]).await;
@@ -115,7 +122,7 @@ async fn bulk_and_chunked_emit_identical_segment_bytes() {
     if !tools::fixture(&path) {
         return;
     }
-    let bytes = load_segment(&path).await.expect("load fixture");
+    let bytes = load_fixture(&path).await;
     let seg_size = bytes.len() as u64;
 
     let mut stream_bulk = WalStream::new(1, seg_size, Pos::ZERO).unwrap();
@@ -165,7 +172,7 @@ async fn shadow_stream_sink_receives_byte_exact_wire_stream() {
     if !tools::fixture(&path) {
         return;
     }
-    let bytes = load_segment(&path).await.expect("load fixture");
+    let bytes = load_fixture(&path).await;
     let seg_size = bytes.len() as u64;
 
     let mut stream = WalStream::builder(1, seg_size, Pos::ZERO).expect("stream new");

@@ -96,6 +96,8 @@ pub enum WalStreamError {
     ForkBehindDispatched { switch_lsn: u64, dispatched: u64 },
     #[error("base lsn {0:#X} not segment-aligned")]
     UnalignedBase(u64),
+    #[error("segment size {0} is not a power of two")]
+    SegSize(u64),
     #[error("sink: {0}")]
     Sink(#[from] SinkError),
     #[error("shadow replay eligibility: {0:#}")]
@@ -199,6 +201,9 @@ impl WalStream {
         seg_size: u64,
         start_lsn: Pos<Floor>,
     ) -> Result<Self, WalStreamError> {
+        if !seg_size.is_power_of_two() {
+            return Err(WalStreamError::SegSize(seg_size));
+        }
         let start_lsn = start_lsn.get();
         if !start_lsn.is_multiple_of(seg_size) {
             return Err(WalStreamError::UnalignedBase(start_lsn));
@@ -636,13 +641,7 @@ impl WalStream {
     }
 
     fn segment_for_lsn(&self, lsn: u64) -> SegmentName {
-        let seg_no = lsn / self.seg_size;
-        let xlog_segs_per_xlog_id = 0x1_0000_0000u64 / self.seg_size;
-        SegmentName {
-            timeline: self.timeline,
-            log_id: (seg_no / xlog_segs_per_xlog_id) as u32,
-            seg_no: (seg_no % xlog_segs_per_xlog_id) as u32,
-        }
+        SegmentName::from_lsn(self.timeline, lsn, self.seg_size)
     }
 }
 
@@ -667,6 +666,14 @@ mod tests {
     fn new_rejects_unaligned_base() {
         let r = WalStream::new(1, WAL_SEG_SIZE, Pos::new(0x1234));
         assert!(matches!(r, Err(WalStreamError::UnalignedBase(_))));
+    }
+
+    #[test]
+    fn new_rejects_non_power_of_two_seg_size() {
+        for seg_size in [0, 3 * 8192] {
+            let r = WalStream::new(1, seg_size, Pos::ZERO);
+            assert!(matches!(r, Err(WalStreamError::SegSize(s)) if s == seg_size));
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -9,7 +9,9 @@ use futures::{StreamExt, stream as futures_stream};
 use walrus::config::Settings;
 use walrus::storage::DynStorage;
 
-use crate::record::{WAL_SEG_SIZE, segments_covering};
+use walrus::pg::wal::segment::SegmentName;
+
+use crate::record::WAL_SEG_SIZE;
 use crate::source::timeline::{TimelineHistory, history_filename};
 
 /// Initialize archive storage once so invalid `[backup]` settings fail at startup.
@@ -154,7 +156,7 @@ impl Archive {
 
 fn segment_candidates(history: &TimelineHistory, owner: u32, seg_start: u64) -> Vec<String> {
     let name_of = |tli| {
-        segments_covering(tli, seg_start..seg_start + WAL_SEG_SIZE)[0]
+        SegmentName::from_lsn(tli, seg_start, WAL_SEG_SIZE)
             .format()
             .to_string()
     };
@@ -456,8 +458,7 @@ mod tests {
         };
         let storage = settings.build_storage().unwrap();
         for index in [0u64, 1, 3] {
-            let name =
-                segments_covering(1, index * WAL_SEG_SIZE..(index + 1) * WAL_SEG_SIZE)[0].format();
+            let name = SegmentName::from_lsn(1, index * WAL_SEG_SIZE, WAL_SEG_SIZE).format();
             let path = tmp.path().join(name);
             fs::write(&path, vec![index as u8; WAL_SEG_SIZE as usize]).unwrap();
             walrus::pg::wal::push::handle(&settings, storage.clone(), &path)
