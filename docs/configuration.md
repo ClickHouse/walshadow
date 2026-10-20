@@ -424,8 +424,18 @@ measures filter/dispatch time including downstream backpressure. Compare rates
 with archive segments and queue depth to locate remaining serialization.
 
 `walshadow_archive_wait_seconds_total` measures pump waits for prefetched WAL;
-`walshadow_pump_queue_wait_seconds_total` measures sends blocked behind decoder.
-These distinguish insufficient fetch concurrency from downstream backpressure.
+`walshadow_worker_seconds_total{worker="pump",state="blocked_out"}` measures
+sends blocked behind the decoder queue. These distinguish insufficient fetch
+concurrency from downstream backpressure.
+
+`walshadow_worker_seconds_total{worker,state}` is the wall time of every serial
+worker (`pump`, `queue`, `batcher`, `inserter` summed over the pool, and
+`backup_tap`, `backup_walk` during a bootstrap) split into disjoint states:
+`busy` (its own work), `idle` (waiting for input), `blocked_in` (waiting on a
+result it already requested, the queue worker's predecode job) and
+`blocked_out` (waiting to hand work downstream). One worker sums to ~1 s/s; the
+worker whose `busy` is near 1 s/s is the bottleneck. `queue` busy includes TOAST
+fetches; subtract `rate(walshadow_toast_value_fetch_seconds_total)` for the rest.
 
 ### Object-store backfill restart
 

@@ -56,8 +56,8 @@ use crate::housekeeping::{
     SEGMENT_FSYNC_QUEUE, spawn_desc_log_gc, spawn_segment_fsync, trim_retention,
 };
 use crate::metrics_publish::{
-    DbMetricSources, DrainResident, ShadowMetricsView, SourceSwap, StageCounters, TimelineView,
-    populate_metrics, shadow_apply_lag,
+    DbMetricSources, DrainResident, PumpClock, ShadowMetricsView, SourceSwap, StageCounters,
+    TimelineView, pipeline_worker_seconds, populate_metrics, shadow_apply_lag,
 };
 use crate::runtime_cfg::{or_signal, sighup_reload};
 use crate::shadow_proc::{
@@ -1527,6 +1527,10 @@ async fn session_body(
     // iterations so a source error mid-crossing retries the crossing: at the
     // ancestor's switchpoint an ordinary reconnect has nothing to ask for
     let mut crossing = CrossingState::default();
+    let mut pump_clock = PumpClock {
+        busy_secs: 0.0,
+        idle_secs: 0.0,
+    };
     let mut barrier_logged: Option<Instant> = None;
     let shutdown_reason = 'pump: loop {
         // Switch timelines at a switchpoint. Reconnecting may find a switchpoint
@@ -1809,6 +1813,7 @@ async fn session_body(
         let mut ancestor_ended = false;
         let archived_bytes;
         let mut archived_segment = false;
+        let waiting = Instant::now();
         let chunk = tokio::select! {
             biased;
             () = shutdown.cancelled() => break "signal",
@@ -1909,6 +1914,7 @@ async fn session_body(
                 }
             },
         };
+        pump_clock.idle_secs += waiting.elapsed().as_secs_f64();
         let idle = chunk.is_none();
         let server_end = chunk
             .as_ref()
@@ -1916,6 +1922,7 @@ async fn session_body(
             .unwrap_or(received.get());
         if let Some(chunk) = chunk {
             let replay_started = Instant::now();
+            let send_wait_before = record_sink.decoder_xact.inner.send_wait_seconds();
             stream
                 .push(
                     chunk.start_lsn,
@@ -1924,6 +1931,8 @@ async fn session_body(
                     &mut segment_sink,
                 )
                 .await?;
+            let send_wait = record_sink.decoder_xact.inner.send_wait_seconds() - send_wait_before;
+            pump_clock.busy_secs += (replay_started.elapsed().as_secs_f64() - send_wait).max(0.0);
             if archived_segment {
                 metrics
                     .update(|snap| {
@@ -1935,8 +1944,12 @@ async fn session_body(
         }
         metrics
             .update(|snap| {
-                snap.pump_queue_wait_seconds_total =
-                    record_sink.decoder_xact.inner.send_wait_seconds();
+                snap.worker_seconds = pipeline_worker_seconds(
+                    &pump_clock,
+                    record_sink.decoder_xact.inner.send_wait_seconds(),
+                    record_sink.decoder_xact.inner.worker_clock().seconds(),
+                    record_sink.emitter_stats.as_deref(),
+                );
                 snap.archive_restore_active = 0;
                 if let SourcePath::Archive(reader) = &path {
                     snap.archive_restore_active = 1;

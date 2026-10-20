@@ -39,6 +39,74 @@ use crate::ops::bridge::{OP_COUNT, OP_LABELS};
 use crate::pos::{Drain, EmitterAck, FilterDispatched, Floor, Pos, ShadowReplay, SourceReceived};
 use crate::source::transition::SWITCH_FAILURE_REASONS;
 
+#[macro_export]
+macro_rules! label_class {
+    ($(#[$attr:meta])* $vis:vis enum $Name:ident { $($(#[$vattr:meta])* $Variant:ident => $label:literal),+ $(,)? }) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        $(#[$attr])*
+        $vis enum $Name {
+            $($(#[$vattr])* $Variant),+
+        }
+
+        impl $Name {
+            pub const COUNT: usize = [$($label),+].len();
+            pub const LABELS: [&'static str; Self::COUNT] = [$($label),+];
+            pub const ALL: [Self; Self::COUNT] = [$(Self::$Variant),+];
+
+            pub fn index(self) -> usize {
+                self as usize
+            }
+
+            pub fn label(self) -> &'static str {
+                Self::LABELS[self.index()]
+            }
+
+            pub fn one_hot(self) -> [u64; Self::COUNT] {
+                std::array::from_fn(|i| u64::from(i == self.index()))
+            }
+        }
+    };
+    ($(#[$attr:meta])* $vis:vis enum $Name:ident { $($(#[$vattr:meta])* $Variant:ident => ($group:literal, $label:literal)),+ $(,)? }) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        $(#[$attr])*
+        $vis enum $Name {
+            $($(#[$vattr])* $Variant),+
+        }
+
+        impl $Name {
+            pub const COUNT: usize = [$($label),+].len();
+            pub const GROUPS: [&'static str; Self::COUNT] = [$($group),+];
+            pub const LABELS: [&'static str; Self::COUNT] = [$($label),+];
+            pub const ALL: [Self; Self::COUNT] = [$(Self::$Variant),+];
+
+            pub fn index(self) -> usize {
+                self as usize
+            }
+
+            pub fn group(self) -> &'static str {
+                Self::GROUPS[self.index()]
+            }
+
+            pub fn label(self) -> &'static str {
+                Self::LABELS[self.index()]
+            }
+
+            pub fn pair(self) -> [&'static str; 2] {
+                [self.group(), self.label()]
+            }
+        }
+    };
+}
+
+label_class! {
+    pub enum WorkerState {
+        Busy => "busy",
+        Idle => "idle",
+        BlockedIn => "blocked_in",
+        BlockedOut => "blocked_out",
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum MetricsError {
     #[error("io: {0}")]
@@ -196,6 +264,9 @@ snapshot! {
         rows_inserted_by_table: Vec<(String, String, u64)>,
         cells_inserted_by_type: Vec<(String, &'static str, u64)>,
         skipped_records_by_rel: Vec<SkippedRel>,
+        /// `(worker, state, seconds)` for every serial worker, rendered
+        /// `walshadow_worker_seconds_total{worker,state}`
+        worker_seconds: Vec<(&'static str, WorkerState, f64)>,
         /// Refusal a crossing parked on, rendered as `crossing_wedged`. The
         /// pump keeps publishing rather than exiting into a restart that
         /// re-crosses and re-fails, so this is how the daemon says it is
@@ -290,12 +361,6 @@ snapshot! {
     counter bootstrap_files_walked: u64 = "User-heap segments the bootstrap walk decoded.",
     counter bootstrap_files_skipped_unmapped: u64 =
         "User-heap segments declined at begin because no mapped relation owns them; their bytes drain unread.",
-    counter bootstrap_decode_seconds: f64 =
-        "Cumulative CPU inside the bootstrap page walk, tuple decode included.",
-    counter bootstrap_tap_seconds: f64 =
-        "Cumulative time bootstrap tap readers spent inside the sink: page framing, decode, channel send. Against bootstrap_decode_seconds this is the tap's own overhead.",
-    counter bootstrap_channel_block_seconds: f64 =
-        "Cumulative time the bootstrap walk spent waiting for a free tuple-channel slot, i.e. emitter drain time seen by the walk.",
     counter spill_evictions_total: u64 = "Total evictions in→spill since daemon start.",
     counter xacts_committed_total: u64 = "Total xacts drained as commits since daemon start.",
     counter xacts_aborted_total: u64 = "Total xacts dropped as aborts since daemon start.",
@@ -455,8 +520,6 @@ snapshot! {
         "Summed archive fetch durations, including download, decompression and local staging; overlapping fetches add.",
     counter archive_wait_seconds_total: f64 =
         "Pump time awaiting next prefetched WAL segment, including waits spanning status ticks.",
-    counter pump_queue_wait_seconds_total: f64 =
-        "Pump time sending batches into bounded decoder queue.",
     counter archive_replay_seconds_total: f64 =
         "Time filtering and dispatching archived WAL, including downstream backpressure.",
     gauge archive_restore_active: u64 =
@@ -1001,6 +1064,16 @@ fn encode_snapshot(snap: &MetricsSnapshot, enc: &mut DescriptorEncoder<'_>) -> f
         u64::from(!snap.crossing_blocked_on.is_empty()),
     )?;
 
+    counter_pairs(
+        enc,
+        "walshadow_worker_seconds_total",
+        "Wall time of each serial worker by state: busy is doing its own work, idle is waiting for input, blocked_in is waiting on a result it already requested, blocked_out is waiting to hand work downstream. States are disjoint, so one worker sums to about 1 s/s; busy near 1 s/s names the bottleneck. Workers: pump, queue, batcher, inserter (summed over the pool), backup_tap, backup_walk.",
+        ["worker", "state"],
+        snap.worker_seconds
+            .iter()
+            .map(|(worker, state, secs)| ([*worker, state.label()], *secs)),
+    )?;
+
     // rmgr names come out of the fixed resource-manager table, so label values
     // need no escaping the encoder does not do
     let mut records = declare(
@@ -1251,9 +1324,24 @@ mod tests {
             xact_plan_rows: 9,
             xact_plan_bytes_by_storage: [100, 200],
             xact_plan_failures_by_reason: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+            worker_seconds: vec![
+                ("queue", WorkerState::Busy, 1.5),
+                ("queue", WorkerState::Idle, 2.5),
+                ("pump", WorkerState::BlockedOut, 0.25),
+            ],
             ..MetricsSnapshot::default()
         };
         let body = render(snap);
+        assert!(body.contains("# TYPE walshadow_worker_seconds counter"));
+        assert!(
+            body.contains("walshadow_worker_seconds_total{worker=\"queue\",state=\"busy\"} 1.5")
+        );
+        assert!(
+            body.contains("walshadow_worker_seconds_total{worker=\"queue\",state=\"idle\"} 2.5")
+        );
+        assert!(body.contains(
+            "walshadow_worker_seconds_total{worker=\"pump\",state=\"blocked_out\"} 0.25"
+        ));
         assert!(body.contains("# TYPE walshadow_xact_plan_bytes counter"));
         assert!(body.contains("walshadow_xact_plan_bytes_total{storage=\"mem\"} 100"));
         assert!(body.contains("walshadow_xact_plan_bytes_total{storage=\"file\"} 200"));
@@ -1280,9 +1368,7 @@ mod tests {
             bootstrap_bytes_tapped: 1 << 30,
             bootstrap_pages_walked: 131_072,
             bootstrap_files_skipped_unmapped: 297,
-            bootstrap_decode_seconds: 12.5,
-            bootstrap_channel_block_seconds: 3.25,
-            bootstrap_tap_seconds: 0.0,
+            worker_seconds: vec![("backup_walk", WorkerState::BlockedOut, 3.25)],
             inserter_ch_seconds_total: 41.5,
             oracle_resolve_seconds_total: 8.25,
             ..MetricsSnapshot::default()
@@ -1296,9 +1382,7 @@ mod tests {
             "walshadow_bootstrap_bytes_tapped_total 1073741824",
             "walshadow_bootstrap_pages_walked_total 131072",
             "walshadow_bootstrap_files_skipped_unmapped_total 297",
-            "walshadow_bootstrap_decode_seconds_total 12.5",
-            "walshadow_bootstrap_channel_block_seconds_total 3.25",
-            "walshadow_bootstrap_tap_seconds_total 0.0",
+            "walshadow_worker_seconds_total{worker=\"backup_walk\",state=\"blocked_out\"} 3.25",
             "walshadow_inserter_ch_seconds_total 41.5",
             "walshadow_oracle_resolve_seconds_total 8.25",
         ] {
