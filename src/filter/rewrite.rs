@@ -1,5 +1,5 @@
-//! Replace a dropped record's body with an `XLOG_NOOP` of identical
-//! `xl_tot_len` so the `xl_prev` chain stays valid, then recompute CRC32C.
+//! `XLOG_NOOP` records covering the bytes of dropped records, so the
+//! `xl_prev` chain and every LSN stay valid, with PG's CRC32C.
 //!
 //! CRC32C scheme matches PG `src/backend/access/transam/xlog.c`:
 //! ```c
@@ -10,6 +10,7 @@
 //! ```
 //! body bytes first, then header[0..20] (xl_tot_len through xl_rmid + 2 pad).
 
+use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use walrus::pg::walparser::{
@@ -33,18 +34,24 @@ const MAX_SHORT_BODY: usize = MIN_SHORT_BODY + u8::MAX as usize;
 /// length, so a hit leaves only the header to hash. High bit marks filled
 static NOOP_BODY_CRC: [AtomicU64; 8192] = [const { AtomicU64::new(0) }; 8192];
 
-fn noop_body_crc(body: &[u8]) -> u32 {
-    let Some(slot) = NOOP_BODY_CRC.get(body.len()) else {
-        return crc32c::crc32c(body);
+/// CRC32C of a NOOP body of `len` bytes starting with `marker`, the rest
+/// zero: cached below 8 KiB, extended over the zeros on a miss and past it
+fn noop_body_crc(marker: &[u8], len: usize) -> u32 {
+    let extend = || crc32c_zeros(crc32c::crc32c(marker), len - marker.len());
+    let Some(slot) = NOOP_BODY_CRC.get(len) else {
+        return extend();
     };
     let cached = slot.load(Ordering::Relaxed);
     if cached >> 32 != 0 {
         return cached as u32;
     }
-    let crc = crc32c::crc32c(body);
+    let crc = extend();
     slot.store(1 << 32 | u64::from(crc), Ordering::Relaxed);
     crc
 }
+
+/// Header and longest main-data marker: every later NOOP byte is zero
+pub const NOOP_PREFIX: usize = X_LOG_RECORD_HEADER_SIZE + MIN_LONG_BODY;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum RewriteError {
@@ -52,44 +59,49 @@ pub enum RewriteError {
     TooSmall(u32),
 }
 
+/// First bytes of an `XLOG_NOOP` of `total` logical bytes pointing back at
+/// `xl_prev`; the bytes past its marker, and past `total`, are zero
+pub fn noop_prefix(total: usize, xl_prev: u64) -> Result<[u8; NOOP_PREFIX], RewriteError> {
+    let body_len = total.saturating_sub(X_LOG_RECORD_HEADER_SIZE);
+    if body_len < MIN_SHORT_BODY {
+        return Err(RewriteError::TooSmall(total as u32));
+    }
+    let mut p = [0u8; NOOP_PREFIX];
+    p[0..4].copy_from_slice(&(total as u32).to_le_bytes());
+    p[8..16].copy_from_slice(&xl_prev.to_le_bytes());
+    p[16] = XLOG_NOOP;
+    p[17] = RmId::Xlog as u8;
+    let marker = if body_len <= MAX_SHORT_BODY {
+        p[24] = XLR_BLOCK_ID_DATA_SHORT;
+        p[25] = (body_len - MIN_SHORT_BODY) as u8;
+        MIN_SHORT_BODY
+    } else {
+        p[24] = XLR_BLOCK_ID_DATA_LONG;
+        p[25..29].copy_from_slice(&((body_len - MIN_LONG_BODY) as u32).to_le_bytes());
+        MIN_LONG_BODY
+    };
+    let header = X_LOG_RECORD_HEADER_SIZE;
+    let body = noop_body_crc(&p[header..header + marker], body_len);
+    let crc = crc32c::crc32c_append(body, &p[..CRC_OFFSET]);
+    p[CRC_OFFSET..CRC_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
+    Ok(p)
+}
+
 /// Rewrite in place to an XLOG_NOOP of the same `xl_tot_len`, preserving
-/// `xl_prev` so the chain stays intact. Recomputes CRC32C.
+/// `xl_prev` so the chain stays intact.
 ///
-/// `record_bytes` is the logical record (no page boundaries); caller
-/// scatters it back into the segment if the record spans pages.
+/// `record_bytes` is the logical record (no page boundaries).
 pub fn noop_replace(record_bytes: &mut [u8]) -> Result<(), RewriteError> {
     let xl_tot_len = u32::from_le_bytes(record_bytes[0..4].try_into().unwrap());
-    let total = xl_tot_len as usize;
-    if total != record_bytes.len() {
+    if xl_tot_len as usize != record_bytes.len() {
         // Incomplete record, treat as malformed.
         return Err(RewriteError::TooSmall(xl_tot_len));
     }
-    let body_len = total.saturating_sub(X_LOG_RECORD_HEADER_SIZE);
-    if body_len < MIN_SHORT_BODY {
-        return Err(RewriteError::TooSmall(xl_tot_len));
-    }
-
-    // Keep xl_tot_len (0..4) and xl_prev (8..16); rewrite the rest.
-    record_bytes[4..8].fill(0); // xl_xid
-    record_bytes[16] = XLOG_NOOP; // info
-    record_bytes[17] = RmId::Xlog as u8; // rmid
-    record_bytes[18] = 0; // pad
-    record_bytes[19] = 0; // pad
-    record_bytes[20..24].fill(0); // crc
-
-    let body = &mut record_bytes[X_LOG_RECORD_HEADER_SIZE..];
-    body.fill(0);
-    if body_len <= MAX_SHORT_BODY {
-        body[0] = XLR_BLOCK_ID_DATA_SHORT;
-        body[1] = (body_len - MIN_SHORT_BODY) as u8;
-    } else {
-        // body_len >= 258 > MIN_LONG_BODY, so the LONG length always fits.
-        body[0] = XLR_BLOCK_ID_DATA_LONG;
-        body[1..5].copy_from_slice(&((body_len - MIN_LONG_BODY) as u32).to_le_bytes());
-    }
-
-    let crc = crc32c::crc32c_append(noop_body_crc(body), &record_bytes[..CRC_OFFSET]);
-    record_bytes[CRC_OFFSET..CRC_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
+    let xl_prev = u64::from_le_bytes(record_bytes[8..16].try_into().unwrap());
+    let prefix = noop_prefix(record_bytes.len(), xl_prev)?;
+    let n = NOOP_PREFIX.min(record_bytes.len());
+    record_bytes.fill(0);
+    record_bytes[..n].copy_from_slice(&prefix[..n]);
     Ok(())
 }
 
@@ -99,6 +111,54 @@ pub fn compute_crc(record_bytes: &[u8]) -> u32 {
     crc = crc32c::crc32c_append(crc, &record_bytes[X_LOG_RECORD_HEADER_SIZE..]);
     crc = crc32c::crc32c_append(crc, &record_bytes[..CRC_OFFSET]);
     crc
+}
+
+/// CRC32C of the bytes `crc` covers followed by `n` zero bytes, one table
+/// step per set bit of `n`
+pub fn crc32c_zeros(crc: u32, n: usize) -> u32 {
+    let mut reg = !crc;
+    let mut bits = n;
+    while bits != 0 {
+        let t = &ZEROS[bits.trailing_zeros() as usize];
+        reg = t[0][reg as u8 as usize]
+            ^ t[1][(reg >> 8) as u8 as usize]
+            ^ t[2][(reg >> 16) as u8 as usize]
+            ^ t[3][(reg >> 24) as usize];
+        bits &= bits - 1;
+    }
+    !reg
+}
+
+/// GF(2) operator on a CRC32C register: column i is the image of bit i
+type Operator = [u32; 32];
+
+/// Operators appending 2^k zero bytes to a register, as one table per
+/// register byte so applying one is four lookups
+static ZEROS: LazyLock<Vec<[[u32; 256]; 4]>> = LazyLock::new(|| {
+    // One zero bit shifts the reflected register right, folding in the
+    // polynomial on a carry; three squarings make it one zero byte
+    let mut op: Operator = std::array::from_fn(|i| if i == 0 { 0x82F6_3B78 } else { 1 << (i - 1) });
+    for _ in 0..3 {
+        op = square(&op);
+    }
+    (0..u32::BITS)
+        .map(|_| {
+            let tables =
+                std::array::from_fn(|j| std::array::from_fn(|b| apply(&op, (b as u32) << (8 * j))));
+            op = square(&op);
+            tables
+        })
+        .collect()
+});
+
+fn apply(op: &Operator, v: u32) -> u32 {
+    (0..32)
+        .filter(|i| v >> i & 1 != 0)
+        .fold(0, |sum, i| sum ^ op[i])
+}
+
+fn square(op: &Operator) -> Operator {
+    std::array::from_fn(|i| apply(op, op[i]))
 }
 
 #[cfg(test)]
@@ -126,50 +186,53 @@ mod tests {
         bytes
     }
 
-    #[test]
-    fn noop_replaces_user_record_short_body() {
-        let mut bytes = build_record(50, 0xdeadbeefcafebabe);
-        let prev_orig = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
-        noop_replace(&mut bytes).unwrap();
-        assert_eq!(
-            u64::from_le_bytes(bytes[8..16].try_into().unwrap()),
-            prev_orig
-        );
-        assert_eq!(bytes[16], XLOG_NOOP);
-        assert_eq!(bytes[17], RmId::Xlog as u8);
-        let parsed = parse_record_from_bytes(&bytes, XLP_PAGE_MAGIC_PG15).unwrap();
-        assert_eq!(parsed.header.info, XLOG_NOOP);
-        assert_eq!(parsed.header.total_record_length, bytes.len() as u32);
-        assert_eq!(parsed.blocks.len(), 0);
-        assert_eq!(parsed.main_data_len as usize, 50 - MIN_SHORT_BODY);
+    /// splitmix64 step: deterministic sample stream
+    fn mix(x: &mut u64) -> u64 {
+        *x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let z = (*x ^ (*x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        let z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    /// Lengths around every marker switch and power of two, plus a spread
+    fn lengths() -> impl Iterator<Item = usize> {
+        let mut seed = 7;
+        (0..20)
+            .flat_map(|k| [(1 << k) - 1, 1 << k, (1 << k) + 1])
+            .chain(250..270)
+            .chain((0..2000).map(move |_| (mix(&mut seed) % (1 << 20)) as usize))
     }
 
     #[test]
-    fn noop_replaces_user_record_long_body() {
-        // body_len > 257 forces the LONG marker
-        let mut bytes = build_record(1000, 0x42);
-        noop_replace(&mut bytes).unwrap();
-        let parsed = parse_record_from_bytes(&bytes, XLP_PAGE_MAGIC_PG15).unwrap();
-        assert_eq!(parsed.header.info, XLOG_NOOP);
-        assert_eq!(parsed.main_data_len as usize, 1000 - MIN_LONG_BODY);
+    fn zero_extension_matches_hashing_the_zeros() {
+        let zeros = vec![0u8; 1 << 20];
+        let mut seed = 1;
+        for n in lengths() {
+            let crc = mix(&mut seed) as u32;
+            assert_eq!(
+                crc32c_zeros(crc, n),
+                crc32c::crc32c_append(crc, &zeros[..n]),
+                "n={n}"
+            );
+        }
     }
 
     #[test]
-    fn noop_recomputes_crc() {
-        let mut bytes = build_record(50, 0x1234);
-        bytes[CRC_OFFSET..CRC_OFFSET + 4].copy_from_slice(&0xDEADBEEFu32.to_le_bytes());
-        noop_replace(&mut bytes).unwrap();
-        let crc = u32::from_le_bytes(bytes[CRC_OFFSET..CRC_OFFSET + 4].try_into().unwrap());
-        assert_eq!(crc, compute_crc(&bytes));
-    }
-
-    #[test]
-    fn cached_body_crc_holds_across_headers() {
-        for (body_len, prev) in [(300, 1), (300, 0xFEED), (9000, 2), (9000, 3)] {
-            let mut bytes = build_record(body_len, prev);
+    fn noop_of_any_length_parses_with_a_valid_crc() {
+        let mut seed = 2;
+        // The second pass reads the cache
+        let lengths = lengths().chain(lengths());
+        for len in lengths.filter(|l| *l >= X_LOG_RECORD_HEADER_SIZE + MIN_SHORT_BODY) {
+            let prev = mix(&mut seed);
+            let mut bytes = build_record(len - X_LOG_RECORD_HEADER_SIZE, prev);
             noop_replace(&mut bytes).unwrap();
-            let crc = u32::from_le_bytes(bytes[CRC_OFFSET..CRC_OFFSET + 4].try_into().unwrap());
-            assert_eq!(crc, compute_crc(&bytes), "body {body_len} prev {prev:#x}");
+            let parsed = parse_record_from_bytes(&bytes, XLP_PAGE_MAGIC_PG15).unwrap();
+            assert_eq!(parsed.header.info, XLOG_NOOP);
+            assert_eq!(parsed.header.resource_manager_id, RmId::Xlog as u8);
+            assert_eq!(parsed.header.prev_record_ptr, prev);
+            assert_eq!(parsed.header.total_record_length as usize, len);
+            assert!(parsed.blocks.is_empty());
+            assert_eq!(parsed.header.crc32_hash, compute_crc(&bytes), "len={len}");
         }
     }
 
