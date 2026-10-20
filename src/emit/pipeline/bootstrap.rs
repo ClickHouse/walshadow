@@ -210,7 +210,7 @@ pub async fn drain(
                     out.flush(&msg_tx).await?;
                     seqs.place(prev, prev_rows);
                 }
-                let seq = seqs.open(source_lsn, Publish::Commit);
+                let seq = seqs.open(source_lsn, None, Publish::Commit);
                 let s = seq.seq();
                 open = Some((rfn, seq, 0));
                 s
@@ -618,7 +618,7 @@ async fn route_batch(
     for row in rows {
         let mut tuple = row.tuple;
         let at = seq
-            .get_or_insert_with(|| seqs.open(tuple.source_lsn, Publish::Commit))
+            .get_or_insert_with(|| seqs.open(tuple.source_lsn, None, Publish::Commit))
             .seq();
         render_ext_columns(&row.rel.attributes, &mut tuple.columns);
         out.push(msg_tx, at, row.rel, row.route, tuple, permit.clone())

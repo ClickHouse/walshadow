@@ -915,7 +915,7 @@ impl ReorderSink {
         let heaps = std::mem::take(pending);
         let bytes = std::mem::take(pending_bytes);
         let permit = self.out.admit(bytes).await?.map(Arc::new);
-        let seq = self.out.seqs.open(commit_lsn, publish);
+        let seq = self.out.seqs.open(commit_lsn, Some(commit_ts), publish);
         self.stats.queue_jobs_out.fetch_add(1, Ordering::Relaxed);
         let chunk_rows = self.dest.current().decode_chunk_rows;
         let rows = decode::place_rows(
@@ -1258,7 +1258,7 @@ impl ReorderSink {
             // rows=0 marker: publishes commit_lsn once every earlier partial
             // segment is durable. Covers empty / read-only commits and plans
             // whose tail is a control or truncate.
-            self.out.seqs.mark(commit_lsn);
+            self.out.seqs.mark(commit_lsn, Some(commit_ts));
         }
         Ok(())
     }
@@ -1271,7 +1271,7 @@ impl ReorderSink {
         // ABORT PREPARED: buffered state keys off the prepared xid
         let xid = payload.twophase_xid.unwrap_or(xid);
         self.note_pending(xid, &payload.subxacts, false).await?;
-        let seq = self.out.seqs.open(record.source_lsn, Publish::Commit);
+        let seq = self.out.seqs.open(record.source_lsn, None, Publish::Commit);
         {
             let mut buf = self.buffer.lock().await;
             buf.abort(xid, Pos::new(record.source_lsn), &payload.subxacts)

@@ -63,6 +63,12 @@ macro_rules! encode_metric {
             gauge($enc, $name, $help, $value)?
         }
     };
+    // Same for a commit time not seen yet: a 0 sample reads as 56 years of lag
+    ($enc:expr, commit_ts, $name:expr, $help:expr, $value:expr) => {
+        if let Some(pg_us) = $value {
+            gauge($enc, $name, $help, unix_seconds(pg_us))?
+        }
+    };
     ($enc:expr, counter, $name:expr, $help:expr, $value:expr, $key:literal, $labels:expr) => {
         counter_series($enc, $name, $help, $key, $labels.into_iter().zip($value))?
     };
@@ -236,6 +242,13 @@ snapshot! {
     lsn decoder_commit_lsn: Pos<Drain> = "Highest commit LSN drained out of the xact buffer.",
     /// Live insert watermark, unlike manifest's resume-safe `emitter_ack`
     lsn emitter_ack_lsn: Pos<EmitterAck> = "Contiguous-done watermark from the insert pipeline.",
+    /// `xact_time` in PG epoch µs. `time() - ack_ts` over-reads on an idle
+    /// source; `source_last_commit_ts - ack_ts` does not
+    commit_ts emitter_ack_commit_timestamp_seconds: Option<i64> =
+        "Commit time (Unix seconds) of the newest transaction ClickHouse has acked.",
+    /// `xact_time` in PG epoch µs, read where the pump routes the commit record
+    commit_ts source_last_commit_timestamp_seconds: Option<i64> =
+        "Commit time (Unix seconds) of the newest source transaction the pump has read.",
     lsn floor_lsn: Pos<Floor> = "Durable resume floor: restart resumes here and pruners cut to it.",
     gauge xact_active: u64 = "Active transactions buffered in memory or on spill.",
     gauge xact_bytes_in_memory: u64 = "Bytes held in memory across all buffered xacts.",
@@ -501,6 +514,11 @@ snapshot! {
         "Catalog-boundary holds woken with an error (worker death, walreceiver loss, timeout).",
     counter catalog_boundary_hold_seconds_total: f64 =
         "Cumulative seconds the pump parked in released catalog-boundary holds.",
+}
+
+/// `TimestampTz` (microseconds since 2000-01-01) as Unix seconds
+fn unix_seconds(pg_us: i64) -> f64 {
+    pg_us.saturating_add(walrus::pg::replication::PG_EPOCH_USEC) as f64 / 1e6
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -1494,6 +1512,27 @@ mod tests {
         let body = render(snap);
         assert!(
             body.contains("walshadow_shadow_apply_lag_seconds inf"),
+            "{body}"
+        );
+    }
+
+    #[test]
+    fn render_omits_commit_timestamps_until_the_first() {
+        let body = render(MetricsSnapshot {
+            // 2000-01-01T00:00:00Z plus 1.5 s
+            emitter_ack_commit_timestamp_seconds: Some(1_500_000),
+            ..MetricsSnapshot::default()
+        });
+        assert!(
+            body.contains("# TYPE walshadow_emitter_ack_commit_timestamp_seconds gauge"),
+            "{body}"
+        );
+        assert!(
+            body.contains("walshadow_emitter_ack_commit_timestamp_seconds 946684801.5"),
+            "{body}"
+        );
+        assert!(
+            !body.contains("walshadow_source_last_commit_timestamp_seconds"),
             "{body}"
         );
     }
