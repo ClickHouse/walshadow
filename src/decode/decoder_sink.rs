@@ -108,9 +108,12 @@ crate::atomic_stats! {
         /// `toast_stash_buffered`
         pub raw_stash_marker_ops: crate::decode::heap_decoder::OpCounters,
         /// Acquisitions of the shared xact-buffer mutex from the per-record
-        /// path, and nanoseconds blocked on them. rate(nanos)/1e9 is how many
-        /// workers' worth of time the lock costs; against the drain's hold it
-        /// says whether that mutex is the serial stage's limit
+        /// path (`buffer_lock_acquires`), the subset that found it held and
+        /// had to block (`buffer_lock_waits`), and nanoseconds blocked on
+        /// those. rate(nanos)/1e9 is how many workers' worth of time the lock
+        /// costs; against the drain's hold it says whether that mutex is the
+        /// serial stage's limit
+        pub buffer_lock_acquires,
         pub buffer_lock_waits,
         pub buffer_lock_wait_nanos,
         /// `[stream] skip_attribution`: attribute expected skips too

@@ -294,10 +294,12 @@ snapshot! {
     counter decoder_records_by_op: [u64; 5]
         ["op" = ["insert", "update", "hot_update", "delete", "truncate"]] =
         "Decoded heap row changes by operation.",
+    counter decoder_buffer_lock_acquires_total: u64 =
+        "Acquisitions of the shared xact-buffer mutex from the per-record decode path, contended or not.",
     counter decoder_buffer_lock_waits_total: u64 =
-        "Acquisitions of the shared xact-buffer mutex from the per-record decode path.",
+        "Acquisitions of the shared xact-buffer mutex that found it held and had to block (a subset of acquires).",
     counter decoder_buffer_lock_wait_seconds_total: f64 =
-        "Cumulative time the per-record decode path blocked on the xact-buffer mutex. rate() is workers' worth of time lost to it; divided by the waits counter it is per-acquire latency.",
+        "Cumulative time the per-record decode path blocked on the xact-buffer mutex. rate() is workers' worth of time lost to it; divided by the waits counter it is per-wait latency.",
     counter decoder_partial_total: u64 = "Decoded tuples with prefix/suffix-from-old elided columns.",
     counter decoder_toast_chunks_total: u64 =
         "TOAST chunks routed into the xact buffer's chunk slot.",
