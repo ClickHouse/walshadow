@@ -115,6 +115,10 @@ struct ConnState {
     flush_lsn: Pos<ShadowFlush>,
     /// Last `apply_lsn` from the client's `'r'` standby status.
     apply_lsn: Pos<ShadowReplay>,
+    /// Bytes queued to catch up a reconnected client. Exclude from
+    /// `slow_threshold` until listener drains queue: reconnecting alone
+    /// does not mean client is slow.
+    backfill_queued: usize,
     phase: Phase,
 }
 
@@ -124,6 +128,7 @@ impl ConnState {
             dispatched_lsn: Pos::new(start_lsn),
             flush_lsn: Pos::new(start_lsn),
             apply_lsn: Pos::new(start_lsn),
+            backfill_queued: 0,
             phase: Phase::Streaming(ends_at),
         }
     }
@@ -543,6 +548,9 @@ impl ShadowStreamState {
             });
             pos = end;
         }
+        if let Some(c) = self.connections.get_mut(&id) {
+            c.backfill_queued = self.send_queues.get(&id).map_or(0, Vec::len);
+        }
         self.advance_dispatched(id, Pos::new(server_wal_end));
     }
 
@@ -551,6 +559,13 @@ impl ShadowStreamState {
         self.send_queues.remove(&id);
         // Removing laggard can raise aggregate and release hold
         self.applied.bump();
+    }
+
+    /// Clear backfill count after listener drains queue.
+    fn taken(&mut self, id: u64) {
+        if let Some(c) = self.connections.get_mut(&id) {
+            c.backfill_queued = 0;
+        }
     }
 
     /// Record an inbound `'r'` standby status.
@@ -573,6 +588,7 @@ impl ShadowStreamState {
 
     /// Listener pulls framed bytes out of here.
     pub fn drain_send_queue(&mut self, id: u64) -> Option<Vec<u8>> {
+        self.taken(id);
         self.send_queues.remove(&id)
     }
 
@@ -585,6 +601,7 @@ impl ShadowStreamState {
         buf.shrink_to(KEEP);
         if let Some(q) = self.send_queues.get_mut(&id) {
             std::mem::swap(q, buf);
+            self.taken(id);
         }
     }
 
@@ -620,6 +637,7 @@ impl ShadowStreamState {
         cap: Option<usize>,
         build_body: impl FnOnce(&mut Vec<u8>),
     ) -> bool {
+        let backfill = self.connections.get(&id).map_or(0, |c| c.backfill_queued);
         let q = self.send_queues.entry(id).or_default();
         let envelope_start = q.len();
         q.push(b'd');
@@ -629,7 +647,7 @@ impl ShadowStreamState {
         build_body(q);
         let payload_len = 4 + (q.len() - body_start);
         if let Some(cap) = cap
-            && envelope_start + 1 + payload_len > cap
+            && envelope_start.saturating_sub(backfill) + 1 + payload_len > cap
         {
             q.truncate(envelope_start);
             if let Some(c) = self.connections.get_mut(&id)
@@ -1399,6 +1417,20 @@ mod tests {
         let id = s.register_connection(0x1004, 1, None).unwrap();
         let q = s.drain_send_queue(id).expect("backfill");
         assert_eq!(&q[WIRE_HDR..], b"BBBBCCCC");
+    }
+
+    /// Allow reconnect backfill above threshold, but still limit new queued bytes.
+    #[test]
+    fn backfill_is_exempt_from_slow_threshold() {
+        let mut s = ShadowStreamState::new(1, "x".into(), 0, WIRE_HDR + 8);
+        s.dispatch_wire(0, b"AAAABBBBCCCCDDDD");
+        let id = s.register_connection(0, 1, None).unwrap();
+        s.dispatch_wire(16, b"EEEEEEEE");
+        s.swap_send_queue(id, &mut Vec::new());
+        s.dispatch_wire(24, b"FFFFFFFF");
+        assert_eq!(s.aggregate().dropped_total, 0);
+        s.dispatch_wire(32, b"GGGGGGGG");
+        assert_eq!(s.aggregate().dropped_total, 1);
     }
 
     #[tokio::test(flavor = "current_thread")]
