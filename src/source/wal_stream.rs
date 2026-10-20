@@ -14,7 +14,8 @@
 //!      Filter::decide_record
 //!         /            \
 //!        v              v
-//!   noop_replace (ToDecoder)  rewrite_record
+//!   NOOP over dropped runs   xl_prev past
+//!     (ToDecoder, noop_run)   a merged run
 //!              |              (in place)
 //!              v
 //!         RecordBytesSink  (shadow wire — §3)
@@ -39,7 +40,7 @@ use walrus::pg::walparser::{
 };
 
 use crate::filter::Filter;
-use crate::filter::rewrite::{RewriteError, noop_replace};
+use crate::filter::rewrite::RewriteError;
 use crate::pos::{Floor, Pos};
 #[cfg(test)]
 use crate::record::{
@@ -49,7 +50,8 @@ use crate::record::{
 use crate::record::{
     NoopBytesSink, Record, RecordBytesSink, RecordSink, Route, SegmentSink, SinkError,
 };
-use crate::source::resume_prefix::ResumePrefix;
+use crate::source::noop_run::{NoopRun, Pieces, Retained};
+use crate::source::resume_prefix::{ResumePrefix, retained_ends};
 #[cfg(test)]
 use crate::source::segment_sink::{DirSegmentSink, SegFsync};
 use crate::source::streaming_walker::{CompletedRecord, StreamingWalker, WalkError};
@@ -88,6 +90,8 @@ pub enum WalStreamError {
     ForkAboveFrontier { switch_lsn: u64, next_lsn: u64 },
     #[error("fork at {switch_lsn:#X} is behind bytes already dispatched through {dispatched:#X}")]
     ForkBehindDispatched { switch_lsn: u64, dispatched: u64 },
+    #[error("fork at {switch_lsn:#X} is inside a run of dropped records ending at {run_end:#X}")]
+    ForkInsideRun { switch_lsn: u64, run_end: u64 },
     #[error("base lsn {0:#X} not segment-aligned")]
     UnalignedBase(u64),
     #[error("sink: {0}")]
@@ -125,6 +129,13 @@ pub struct WalStream {
     /// of their bytes; shipped as one wire chunk ahead of their dispatch
     staged: Vec<Record<'static>>,
     staged_end: usize,
+    /// Dropped records whose shared NOOP waits on the run's end. Their
+    /// bytes and dispatch hold until it closes
+    run: NoopRun,
+    /// A closed run holds a record that may park: dispatch it before
+    /// shipping anything later
+    run_parked: bool,
+    retained: Retained,
     /// CRC32C of the raw source bytes consumed in the current segment,
     /// `[raw_crc_from, next_lsn)`. What a fork verify compares against: the
     /// walker buffer cannot answer, because every dropped record is rewritten
@@ -142,10 +153,19 @@ pub struct WalStream {
 pub struct WalStreamBuilder(WalStream);
 
 impl WalStreamBuilder {
-    /// Preserve continuation of a record already rewritten before resume.
+    /// Preserve continuation of a record already rewritten before resume,
+    /// and the record boundaries of the segments copied there.
     /// `dirs` rank by trust: the first holding the resume segment wins
     pub async fn preserve_resume_prefix(&mut self, dirs: &[PathBuf]) -> Result<(), WalStreamError> {
         let s = &mut self.0;
+        let mut until = 0;
+        for dir in dirs {
+            let end = crate::ops::retention::max_segment_end(dir)
+                .await
+                .map_err(|e| WalStreamError::ResumePrefix(e.into()))?;
+            until = until.max(end.map_or(0, |e| e.get()));
+        }
+        s.retained = Retained::new(dirs, until);
         s.resume_prefix = ResumePrefix::load(dirs, s.timeline, s.seg_size, s.next_lsn)
             .await
             .map_err(WalStreamError::ResumePrefix)?;
@@ -208,6 +228,9 @@ impl WalStream {
             wire_offset: 0,
             staged: Vec::new(),
             staged_end: 0,
+            run: NoopRun::default(),
+            run_parked: false,
+            retained: Retained::default(),
             raw_crc: 0,
             raw_crc_from: start_lsn,
             poisoned: false,
@@ -330,6 +353,9 @@ impl WalStream {
         &mut self,
         record_sink: &mut (dyn RecordSink + Send),
     ) -> Result<(), WalStreamError> {
+        if self.run_parked {
+            self.dispatch_staged(record_sink).await?;
+        }
         loop {
             let completed: CompletedRecord = match self.walker.try_next() {
                 Some(Ok(r)) => r,
@@ -368,7 +394,7 @@ impl WalStream {
                         offset: start_offset,
                         source,
                     })?;
-                // `rewrite_record` below mutates walker.buf that `parsed`
+                // The NOOP rewrite below mutates walker.buf that `parsed`
                 // views; dispatch needs the original parse, not post-rewrite.
                 parsed_for_sink = parsed.into_owned();
             }
@@ -377,35 +403,9 @@ impl WalStream {
                 .await
                 .map_err(WalStreamError::ShadowRelations)?;
             let route = verdict.route;
-            if route == Route::ToDecoder {
-                // `parsed_for_sink` owns the original bytes the decoder
-                // reads, so clobbering the buffer with the NOOP is safe.
-                match completed.stitched_bytes {
-                    // Cross-page: stitch → NOOP → scatter back across
-                    // `byte_ranges`.
-                    Some(mut bytes) => {
-                        noop_replace(&mut bytes).map_err(|source| WalStreamError::Rewrite {
-                            offset: start_offset,
-                            source,
-                        })?;
-                        self.walker.rewrite_record(&byte_ranges, &bytes);
-                    }
-                    // Single-page: contiguous, NOOP in place.
-                    None => {
-                        let (off, len) = byte_ranges[0];
-                        self.walker
-                            .rewrite_record_in_place(off, len, noop_replace)
-                            .map_err(|source| WalStreamError::Rewrite {
-                                offset: start_offset,
-                                source,
-                            })?;
-                    }
-                }
-            }
-
-            self.staged_end = self.staged_end.max(record_end);
             let source_lsn = self.current_lsn + start_offset as u64;
             let next_lsn = self.end_rec_ptr(&last_range, &parsed_for_sink);
+            let source_prev = parsed_for_sink.header.prev_record_ptr;
             let record = Record {
                 parsed: parsed_for_sink,
                 source_lsn,
@@ -417,30 +417,91 @@ impl WalStream {
                 defer_catalog_decode: verdict.defer_catalog_decode,
             };
             let parks = record_sink.may_park(&record);
+
+            // `record` owns the original bytes the decoder reads, so the
+            // buffer can take the NOOP
+            let joins =
+                route == Route::ToDecoder && next_lsn / self.seg_size == source_lsn / self.seg_size;
+            let seg = Self::align_down(source_lsn, self.seg_size);
+            if self.retained.wants(seg) {
+                // Boxed, so the drain loop's state does not carry a file read
+                let read = retained_ends(&self.retained.dirs, self.timeline, self.seg_size, seg);
+                let ends = Box::pin(read).await.map_err(WalStreamError::ResumePrefix)?;
+                self.retained.load(seg, ends);
+            }
+            if (self.retained.boundary(source_lsn) || self.run.ends_before(source_lsn, joins))
+                && self.close_run()?
+            {
+                self.dispatch_staged(record_sink).await?;
+            }
+            let xl_prev = self.run.prev(source_prev);
+            let pieces: Pieces = byte_ranges
+                .iter()
+                .map(|&(off, len)| (self.current_lsn + off as u64, len))
+                .collect();
+            let base = self.current_lsn;
+            if joins {
+                self.run.join(pieces, xl_prev, parks);
+            } else if route == Route::ToDecoder {
+                NoopRun::replace(self.walker.buffer_mut(), base, &pieces, xl_prev).map_err(
+                    |source| WalStreamError::Rewrite {
+                        offset: start_offset,
+                        source,
+                    },
+                )?;
+            } else if xl_prev != source_prev {
+                NoopRun::repoint(self.walker.buffer_mut(), base, &pieces, xl_prev);
+            }
+
+            self.staged_end = self.staged_end.max(record_end);
             self.staged.push(record);
-            if parks {
+            let closes = joins && NoopRun::closes_after(source_lsn, next_lsn);
+            if (closes && self.close_run()?) || (!closes && parks) {
                 self.dispatch_staged(record_sink).await?;
             }
         }
     }
 
-    /// Ship staged records' bytes, then hand the records to `record_sink`
+    /// Rewrite the open run. `true` when a member may park, so it has to
+    /// dispatch before any successor's bytes reach the wire
+    fn close_run(&mut self) -> Result<bool, WalStreamError> {
+        let offset = self
+            .run
+            .start()
+            .map_or(0, |s| (s - self.current_lsn) as usize);
+        let closed = self
+            .run
+            .close(self.walker.buffer_mut(), self.current_lsn)
+            .map_err(|source| WalStreamError::Rewrite { offset, source })?;
+        self.run_parked |= closed == Some(true);
+        Ok(self.run_parked)
+    }
+
+    /// Ship staged records' bytes, then hand the records to `record_sink`.
+    /// An open run's members wait for its NOOP
     async fn dispatch_staged(
         &mut self,
         record_sink: &mut (dyn RecordSink + Send),
     ) -> Result<(), WalStreamError> {
-        // Frame buffer[wire_offset..staged_end] as one chunk: covers page
+        // Frame buffer[wire_offset..ship_end] as one chunk: covers page
         // headers + inter-record padding so shadow's walreceiver sees a
         // stream byte-identical to disk `restore_command`.
-        if self.staged_end > self.wire_offset {
-            let chunk = &self.walker.buffer()[self.wire_offset..self.staged_end];
+        let ship_end = self.run.ship_limit().map_or(self.staged_end, |s| {
+            self.staged_end.min((s - self.current_lsn) as usize)
+        });
+        if ship_end > self.wire_offset {
+            let chunk = &self.walker.buffer()[self.wire_offset..ship_end];
             let start_lsn = self.current_lsn + self.wire_offset as u64;
             self.bytes_sink.on_wire_chunk(start_lsn, chunk).await?;
-            self.wire_offset = self.staged_end;
+            self.wire_offset = ship_end;
         }
-        for record in self.staged.drain(..) {
+        let ready = self.run.start().map_or(self.staged.len(), |s| {
+            self.staged.partition_point(|r| r.source_lsn < s)
+        });
+        for record in self.staged.drain(..ready) {
             record_sink.on_record_owned(record).await?;
         }
+        self.run_parked = false;
         Ok(())
     }
 
@@ -449,9 +510,9 @@ impl WalStream {
     /// if a seg shipped.
     ///
     /// Spanning case (pending seg-0 → seg-1): wait. Once the record
-    /// completes, [`rewrite_record`](StreamingWalker::rewrite_record)
-    /// applies the NOOP uniformly across both segs, then the next call
-    /// ships seg-0 with rewritten partial bytes.
+    /// completes, its NOOP covers both segs, then the next call ships seg-0
+    /// with rewritten partial bytes. A run still open in seg-0 ends at the
+    /// zero tail, and closes here.
     async fn try_flush_first_segment(
         &mut self,
         segment_sink: &mut (dyn SegmentSink + Send),
@@ -461,6 +522,13 @@ impl WalStream {
             return Ok(false);
         };
         let seg = self.segment_for_lsn(self.current_lsn);
+        if self
+            .run
+            .start()
+            .is_some_and(|s| s < self.current_lsn + self.seg_size)
+        {
+            self.close_run()?;
+        }
         // Wire tail: if wire_offset < seg_size, the residual span
         // (alignment pad + page header + in-place-rewritten spanning bytes)
         // must ship before seg-0 closes.
@@ -520,6 +588,14 @@ impl WalStream {
             return Err(WalStreamError::ForkBehindDispatched {
                 switch_lsn,
                 dispatched: self.current_lsn + self.wire_offset as u64,
+            });
+        }
+        // A run open below the fork stays open: a restart reads the
+        // descendant's copy of this segment and merges across the fork too
+        if let Some(run_end) = self.run.end().filter(|e| *e > switch_lsn) {
+            return Err(WalStreamError::ForkInsideRun {
+                switch_lsn,
+                run_end,
             });
         }
         self.walker
@@ -1198,8 +1274,10 @@ mod tests {
         // Two pages per segment, so one page leaves the digest open mid-segment
         const SEG: u64 = 2 * 8192;
         // User heap insert in the followed db: dropped, so NOOP-rewritten
+        // once the kept record after it ends its run
         let user = raw_rec(RmId::Heap as u8, 0x00, 8, Some((1663, 5, 50000)), None);
-        let page = page_of(&[user], 8192);
+        let kept = raw_rec(RmId::Clog as u8, 0, 0, None, None);
+        let page = page_of(&[user, kept], 8192);
         let mut ws = WalStream::builder(1, SEG, Pos::ZERO).unwrap();
         ws.filter_mut().set_target_db(5);
         let mut rec = CollectingRecordSink::default();

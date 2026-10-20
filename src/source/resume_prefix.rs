@@ -5,9 +5,10 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail, ensure};
 use walrus::pg::wal::segment::SegmentName;
-use walrus::pg::walparser::XLP_FIRST_IS_CONT_RECORD;
+use walrus::pg::walparser::{X_LOG_RECORD_ALIGNMENT, XLP_FIRST_IS_CONT_RECORD};
 
-use super::wal_page::{PAGE_SIZE, PageHeaderParse, parse_page_header};
+use super::streaming_walker::StreamingWalker;
+use super::wal_page::{PAGE_SIZE, PageHeaderParse, align_up, parse_page_header};
 
 pub(super) struct ResumePrefix {
     start_lsn: u64,
@@ -134,6 +135,55 @@ impl ResumePrefix {
     }
 }
 
+/// Aligned ends of the records a retained copy of the segment at
+/// `seg_start` holds. The shadow or the archive already has those bytes, so
+/// a resumed stream ends a NOOP run at each, whatever layout wrote them: an
+/// older release's one NOOP per record, or bootstrap's copy cut at the backup
+/// end. `None` when no copy holds the segment
+pub(super) async fn retained_ends(
+    dirs: &[PathBuf],
+    timeline: u32,
+    seg_size: u64,
+    seg_start: u64,
+) -> Result<Option<Vec<u64>>> {
+    for dir in dirs {
+        let path = segment_path(dir, timeline, seg_size, seg_start);
+        if let Some(segment) = read_segment(&path, seg_size).await?
+            && let Some(ends) = record_ends(&segment, seg_start)
+        {
+            return Ok(Some(ends));
+        }
+    }
+    Ok(None)
+}
+
+/// Through the last valid record: none past a page of another segment, as a
+/// recycled file holds, or off the `xl_prev` chain, as stale bytes past what
+/// a walreceiver wrote are. `None` when the first page is already invalid
+fn record_ends(segment: &[u8], seg_start: u64) -> Option<Vec<u64>> {
+    let valid = (0..segment.len())
+        .step_by(PAGE_SIZE)
+        .find(|&page| page_address(segment, page) != seg_start + page as u64)
+        .unwrap_or(segment.len());
+    if valid == 0 {
+        return None;
+    }
+    let mut walker = StreamingWalker::new(segment.len());
+    walker.extend(&segment[..valid]);
+    let (mut ends, mut prev) = (Vec::new(), None);
+    while let Some(Ok(record)) = walker.try_next() {
+        let bytes = record.logical_bytes(walker.buffer());
+        let xl_prev = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
+        if prev.is_some_and(|p| p != xl_prev) {
+            break;
+        }
+        let (off, len) = *record.byte_ranges.last().unwrap();
+        ends.push(seg_start + align_up(off + len, X_LOG_RECORD_ALIGNMENT) as u64);
+        prev = Some(seg_start + record.start_offset as u64);
+    }
+    Some(ends)
+}
+
 /// `None` when the segment is absent; a retained one is always whole
 async fn read_segment(path: &Path, seg_size: u64) -> Result<Option<Vec<u8>>> {
     let bytes = match tokio::fs::read(path).await {
@@ -188,7 +238,6 @@ mod tests {
     use crate::record::{
         CollectingRecordSink, CollectingSegmentSink, RecordBytesSink, SinkError, WAL_SEG_SIZE,
     };
-    use crate::source::wal_page::align_up;
     use crate::source::wal_stream::{WalStream, WalStreamError};
 
     /// Every fixture page sits at a segment start, so all carry long headers

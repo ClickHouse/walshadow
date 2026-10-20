@@ -5,11 +5,11 @@
 //!
 //! Assertions:
 //! 1. Filtered segment is the same length as the source (byte-preserving).
-//! 2. Every record re-parses through wal-rus's `WalParser` without error.
+//! 2. Every record re-parses through wal-rus's `WalParser` and `pg_waldump`.
 //! 3. Filter emits one record per source record.
 //! 4. Filter dropped >0 user records on a non-DDL-heavy workload.
-//! 5. All `Route::ToDecoder` records show as `XLOG_NOOP` (rmid=0, info=0x20)
-//!    in the filtered output.
+//! 5. Kept records stay, and runs of `Route::ToDecoder` records show as
+//!    fewer `XLOG_NOOP`s (rmid=0, info=0x20) in the filtered output.
 
 #[path = "common/tools.rs"]
 mod tools;
@@ -49,6 +49,7 @@ fn xlog_switch_segment() -> PathBuf {
 
 /// One segment through the streaming filter
 struct Filtered {
+    name: String,
     source: Vec<u8>,
     out: Vec<u8>,
     seg_start: u64,
@@ -57,6 +58,31 @@ struct Filtered {
 }
 
 impl Filtered {
+    /// `pg_waldump` reads every filtered record, CRC and `xl_prev` checked
+    fn waldump(&self, expected: usize) {
+        if !tools::on_path("pg_waldump", "--version") {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(&self.name), &self.out).unwrap();
+        let lsn = |l: u64| format!("{:X}/{:X}", l >> 32, l as u32);
+        let first = self.records.first().unwrap().source_lsn;
+        let end = self.records.last().unwrap().next_lsn;
+        let out = Command::new("pg_waldump")
+            .arg("-p")
+            .arg(dir.path())
+            .args(["-s", &lsn(first), "-e", &lsn(end)])
+            .output()
+            .expect("run pg_waldump");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "pg_waldump: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(stdout.lines().count(), expected, "pg_waldump record count");
+    }
+
     fn dropped(&self) -> usize {
         self.records
             .iter()
@@ -82,6 +108,7 @@ async fn filter(path: &Path) -> Filtered {
         .expect("filter");
     let (_, out) = segments.segments.pop().expect("segment sealed");
     Filtered {
+        name: name[..24].to_string(),
         source,
         out,
         seg_start,
@@ -132,6 +159,7 @@ async fn filtered_segment_round_trips_through_wal_parser() {
 
     // (2) Re-parses cleanly. (3) Record count matches filter output.
     let (filtered_count, noops) = parse_all_records(&f.out).expect("re-parse filtered segment");
+    f.waldump(filtered_count);
     let stats = f.stream.filter().stats();
     eprintln!(
         "fixture: source {} bytes, {} records (kept {}, dropped {}, undecoded-pg_class {})",
@@ -146,9 +174,9 @@ async fn filtered_segment_round_trips_through_wal_parser() {
             .pg_class_writes_undecoded,
     );
     assert_eq!(
-        filtered_count,
-        f.records.len(),
-        "WalParser record count != filtered record count"
+        filtered_count - noops,
+        f.records.len() - f.dropped(),
+        "WalParser kept count != filter kept count"
     );
 
     // (4) Filter dropped >0 user records on this fixture.
@@ -157,11 +185,11 @@ async fn filtered_segment_round_trips_through_wal_parser() {
         "filter dropped zero records — bug in classifier?"
     );
 
-    // (5) Number of NOOP records in filtered stream == dropped.
-    assert_eq!(
-        noops,
-        f.dropped(),
-        "noop count in filtered stream does not match dropped"
+    // (5) Runs of dropped records merge into fewer NOOPs
+    assert!(
+        noops < f.dropped(),
+        "{noops} NOOPs for {} dropped records",
+        f.dropped()
     );
 
     // Source segment was also parseable (it's a real PG capture).
@@ -199,8 +227,13 @@ async fn oltp_workload_keeps_well_under_one_percent() {
 
     // Re-parse filtered output.
     let (filtered_count, noops) = parse_all_records(&f.out).expect("re-parse filtered");
-    assert_eq!(filtered_count, total);
-    assert_eq!(noops, f.dropped());
+    assert_eq!(filtered_count - noops, kept);
+    assert!(
+        noops < f.dropped() / 4,
+        "{noops} NOOPs for {} dropped",
+        f.dropped()
+    );
+    f.waldump(filtered_count);
 }
 
 /// A real PG `pg_switch_wal()` lands an XLOG_SWITCH (rmgr 0, info 0x40) in

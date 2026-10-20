@@ -7,7 +7,7 @@
 //! complete. Buffer keeps accumulating so
 //! [`DirSegmentSink`](crate::source::segment_sink::DirSegmentSink) sees a
 //! full 16 MiB segment byte-for-byte at segment end, including in-place
-//! noop rewrites applied via [`rewrite_record`](StreamingWalker::rewrite_record).
+//! noop rewrites applied via [`buffer_mut`](StreamingWalker::buffer_mut).
 
 use smallvec::{SmallVec, smallvec};
 use walrus::pg::walparser::{X_LOG_RECORD_ALIGNMENT, X_LOG_RECORD_HEADER_SIZE};
@@ -181,8 +181,8 @@ impl StreamingWalker {
     }
 
     /// Gates first-segment flush: segment whole, and no pending record
-    /// starts inside it, so [`rewrite_record`](Self::rewrite_record) applies
-    /// a NOOP across both segs uniformly before seg 0 ships
+    /// starts inside it, so a NOOP rewrite applies across both segs
+    /// uniformly before seg 0 ships
     pub fn first_segment_ready(&self) -> Option<FirstSegmentReady> {
         let spans_out = self
             .pending
@@ -242,6 +242,7 @@ impl StreamingWalker {
 
     /// Scatter `new_logical` back into the buffer at `byte_ranges`. Its
     /// length must equal the original record length.
+    #[cfg(test)]
     pub fn rewrite_record(&mut self, byte_ranges: &ByteRanges, new_logical: &[u8]) {
         let mut cursor = 0;
         for &(off, len) in byte_ranges {
@@ -251,15 +252,9 @@ impl StreamingWalker {
         debug_assert_eq!(cursor, new_logical.len());
     }
 
-    /// In-place variant for a single-page record contiguous at `off`
-    /// (`stitched_bytes: None`); skips the cross-page copy-out + scatter-back.
-    pub fn rewrite_record_in_place<E>(
-        &mut self,
-        off: usize,
-        len: usize,
-        rewrite: impl FnOnce(&mut [u8]) -> Result<(), E>,
-    ) -> Result<(), E> {
-        rewrite(&mut self.buf[off..off + len])
+    /// Rewrite record bytes in place; page headers must stay as they are
+    pub fn buffer_mut(&mut self) -> &mut [u8] {
+        &mut self.buf
     }
 
     /// Reset for the next segment. `Vec::clear` retains the 16 MiB
