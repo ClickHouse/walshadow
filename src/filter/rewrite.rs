@@ -105,6 +105,20 @@ pub fn noop_replace(record_bytes: &mut [u8]) -> Result<(), RewriteError> {
     Ok(())
 }
 
+/// Point a record header at `xl_prev`. CRC32C is linear and `xl_prev` ends
+/// 4 bytes before the hashed bytes do, so the CRC moves by the CRC of the
+/// change alone, without rehashing the body
+pub fn patch_prev(header: &mut [u8; X_LOG_RECORD_HEADER_SIZE], xl_prev: u64) {
+    let old = u64::from_le_bytes(header[8..16].try_into().unwrap());
+    let mut delta = [0u8; 12];
+    delta[..8].copy_from_slice(&(old ^ xl_prev).to_le_bytes());
+    // From a zero register: `crc32c_append` inverts on entry and exit
+    let shift = !crc32c::crc32c_append(!0, &delta);
+    let crc = u32::from_le_bytes(header[CRC_OFFSET..].try_into().unwrap()) ^ shift;
+    header[8..16].copy_from_slice(&xl_prev.to_le_bytes());
+    header[CRC_OFFSET..].copy_from_slice(&crc.to_le_bytes());
+}
+
 /// PG-compatible CRC32C over a record: body then header[0..20].
 pub fn compute_crc(record_bytes: &[u8]) -> u32 {
     let mut crc = 0u32;
@@ -233,6 +247,28 @@ mod tests {
             assert_eq!(parsed.header.total_record_length as usize, len);
             assert!(parsed.blocks.is_empty());
             assert_eq!(parsed.header.crc32_hash, compute_crc(&bytes), "len={len}");
+        }
+    }
+
+    #[test]
+    fn patched_prev_keeps_the_crc_valid() {
+        let mut seed = 3;
+        for len in lengths().take(200).filter(|l| *l >= 2) {
+            let mut bytes = build_record(len, mix(&mut seed));
+            for b in &mut bytes[X_LOG_RECORD_HEADER_SIZE..] {
+                *b = mix(&mut seed) as u8;
+            }
+            let crc = compute_crc(&bytes);
+            bytes[CRC_OFFSET..CRC_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
+            let prev = mix(&mut seed);
+            let header: &mut [u8; X_LOG_RECORD_HEADER_SIZE] =
+                (&mut bytes[..X_LOG_RECORD_HEADER_SIZE]).try_into().unwrap();
+            patch_prev(header, prev);
+            assert_eq!(bytes[8..16], prev.to_le_bytes());
+            assert_eq!(
+                bytes[CRC_OFFSET..CRC_OFFSET + 4],
+                compute_crc(&bytes).to_le_bytes()
+            );
         }
     }
 
