@@ -110,6 +110,50 @@ pub(crate) fn read_process_stats() -> (f64, u64, u64) {
     (cpu, field("VmRSS:") * 1024, field("Threads:"))
 }
 
+/// `(thread name, CPU seconds, thread count)` from one `/proc/self/task/<tid>/stat`
+/// per thread, summed by name. The stat comm is the thread name `comm` holds.
+/// A thread that exits mid-scan or fails to parse is skipped, never an error
+pub(crate) fn read_thread_cpu() -> Vec<(String, f64, u64)> {
+    let Ok(dir) = std::fs::read_dir("/proc/self/task") else {
+        return Vec::new();
+    };
+    let stats = dir
+        .flatten()
+        .filter_map(|t| std::fs::read_to_string(t.path().join("stat")).ok());
+    aggregate_thread_cpu(stats)
+}
+
+/// Sums the `stat` lines by comm. Assumes `CLK_TCK` 100 like
+/// [`read_process_stats`]. Output is name-sorted
+fn aggregate_thread_cpu(stats: impl IntoIterator<Item = String>) -> Vec<(String, f64, u64)> {
+    const CLK_TCK: f64 = 100.0;
+    let mut by_name: std::collections::BTreeMap<String, (u64, u64)> = Default::default();
+    for s in stats {
+        // comm sits between the first '(' and last ')' and may hold spaces
+        // or parens; utime/stime are then indices 11 and 12 after it
+        let Some((head, rest)) = s.rsplit_once(')') else {
+            continue;
+        };
+        let Some((_, name)) = head.split_once('(') else {
+            continue;
+        };
+        let f: Vec<&str> = rest.split_whitespace().collect();
+        let (Some(Ok(utime)), Some(Ok(stime))) = (
+            f.get(11).map(|v| v.parse::<u64>()),
+            f.get(12).map(|v| v.parse::<u64>()),
+        ) else {
+            continue;
+        };
+        let e = by_name.entry(name.to_owned()).or_default();
+        e.0 += utime + stime;
+        e.1 += 1;
+    }
+    by_name
+        .into_iter()
+        .map(|(name, (ticks, n))| (name, ticks as f64 / CLK_TCK, n))
+        .collect()
+}
+
 /// Stats handles one source database owns. A scrape renders each as its own
 /// `database=` labelled series, so a quiet database reads as quiet rather
 /// than hiding inside a cluster total
@@ -593,6 +637,7 @@ pub(crate) fn stage_gauges_on(v: &StageCounters<'_>, base: MetricsSnapshot) -> M
         process_cpu_seconds_total: proc_cpu,
         process_resident_memory_bytes: proc_rss,
         process_threads: proc_threads,
+        thread_cpu: read_thread_cpu(),
         emitter_xacts_total: emitter(|s| &s.xacts_committed),
         emitter_unsupported_relations: emitter(|s| &s.unsupported_relations),
         emitter_deletes_discarded: emitter(|s| &s.deletes_discarded),
@@ -648,6 +693,38 @@ pub(crate) fn bootstrap_gauges(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn thread_cpu_sums_by_comm_and_skips_malformed() {
+        let line = |tid: u32, comm: &str, ut: u64, st: u64| {
+            format!(
+                "{tid} ({comm}) S 1 1 1 0 -1 4194560 0 0 0 0 {ut} {st} 0 0 20 0 1 0 100 0 0 18446744073709551615"
+            )
+        };
+        let got = aggregate_thread_cpu([
+            line(1, "walshadow-strea", 150, 50),
+            line(2, "tokio-rt-worker", 100, 20),
+            line(3, "tokio-rt-worker", 30, 0),
+            line(4, "weird (a) b", 5, 5),
+            "5 (truncated) S 1".to_owned(),
+            "garbage".to_owned(),
+        ]);
+        assert_eq!(
+            got,
+            vec![
+                ("tokio-rt-worker".to_owned(), 1.5, 2),
+                ("walshadow-strea".to_owned(), 2.0, 1),
+                ("weird (a) b".to_owned(), 0.1, 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn thread_cpu_reads_live_proc() {
+        if cfg!(target_os = "linux") {
+            assert!(read_thread_cpu().iter().map(|t| t.2).sum::<u64>() >= 1);
+        }
+    }
 
     fn db_label(oid: u32) -> String {
         format!("db{oid}")

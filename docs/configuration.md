@@ -328,7 +328,10 @@ This pool is separate from decoded-payload admission to avoid circular waits.
 Live byte-budget reductions lower flush thresholds; increasing sealed-buffer
 capacity requires restarting walshadow
 
-`walshadow_process_threads` reports OS threads
+`walshadow_process_threads` reports OS threads.
+`walshadow_thread_cpu_seconds_total{thread}` and `walshadow_threads{thread}`
+break CPU and thread count down by thread name (`/proc/self/task`, Linux
+only), e.g. `rate(walshadow_thread_cpu_seconds_total[2m])`
 
 ## Backup archive
 

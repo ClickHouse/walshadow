@@ -187,6 +187,9 @@ snapshot! {
         rows_inserted_by_table: Vec<(String, String, u64)>,
         cells_inserted_by_type: Vec<(String, &'static str, u64)>,
         skipped_records_by_rel: Vec<SkippedRel>,
+        /// `(thread name, CPU seconds, thread count)` per `/proc/self/task`
+        /// comm, rendered as `thread_cpu_seconds_total` and `threads`
+        thread_cpu: Vec<(String, f64, u64)>,
         /// Refusal a crossing parked on, rendered as `crossing_wedged`. The
         /// pump keeps publishing rather than exiting into a restart that
         /// re-crosses and re-fails, so this is how the daemon says it is
@@ -985,6 +988,25 @@ fn encode_snapshot(snap: &MetricsSnapshot, enc: &mut DescriptorEncoder<'_>) -> f
             .encode_counter::<NoLabelSet, _, u64>(n, None)?;
     }
 
+    counter_series(
+        enc,
+        "walshadow_thread_cpu_seconds_total",
+        "User+system CPU seconds by thread name (/proc/self/task comm); threads sharing a name, such as the tokio workers, are summed. Linux only.",
+        "thread",
+        snap.thread_cpu
+            .iter()
+            .map(|(name, cpu, _)| (name.as_str(), *cpu)),
+    )?;
+    gauge_series(
+        enc,
+        "walshadow_threads",
+        "Live OS threads by thread name (/proc/self/task comm). Linux only.",
+        "thread",
+        snap.thread_cpu
+            .iter()
+            .map(|(name, _, n)| (name.as_str(), *n)),
+    )?;
+
     counter_kind_op(
         enc,
         "walshadow_raw_stash_records_total",
@@ -1156,6 +1178,7 @@ mod tests {
         snap.records_by_rm_route
             .insert(("Heap".into(), "to_decoder"), 17);
 
+        snap.thread_cpu = vec![("tokio-rt-worker".into(), 1.5, 4)];
         let body = render(snap);
         assert!(body.contains("# HELP walshadow_source_received_lsn"));
         assert!(body.contains("# TYPE walshadow_source_received_lsn gauge"));
@@ -1164,6 +1187,10 @@ mod tests {
         assert!(
             body.contains("walshadow_filter_records_total{rmgr=\"Heap\",route=\"to_decoder\"} 17")
         );
+        assert!(
+            body.contains("walshadow_thread_cpu_seconds_total{thread=\"tokio-rt-worker\"} 1.5")
+        );
+        assert!(body.contains("walshadow_threads{thread=\"tokio-rt-worker\"} 4"));
         assert!(body.contains("walshadow_xact_active 3"));
         assert!(body.contains("walshadow_uptime_seconds_total 42"));
     }
