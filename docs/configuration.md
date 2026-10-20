@@ -431,8 +431,25 @@ measures filter/dispatch time including downstream backpressure. Compare rates
 with archive segments and queue depth to locate remaining serialization.
 
 `walshadow_archive_wait_seconds_total` measures pump waits for prefetched WAL;
-`walshadow_pump_queue_wait_seconds_total` measures sends blocked behind decoder.
-These distinguish insufficient fetch concurrency from downstream backpressure.
+`walshadow_worker_seconds_total{worker="pump",state="blocked_out"}` measures
+sends blocked behind the decoder queue. These distinguish insufficient fetch
+concurrency from downstream backpressure.
+
+`walshadow_worker_seconds_total{worker,state}` is the wall time of every serial
+worker (`pump`, `queue`, `batcher`, `inserter` summed over the pool, and
+`backup_tap`, `backup_walk` during a bootstrap) split into states: `busy` (its
+own work), `idle` (waiting for input), `blocked_in` (waiting on a result it
+already requested: the queue's decode job, the pump's catalog boundary hold)
+and `blocked_out` (waiting to hand work downstream or for its memory budget). For
+`pump` and `queue` the states are disjoint and sum to ~1 s/s; the worker whose
+`busy` is near 1 s/s is the bottleneck. `batcher` is summed over every running
+tail: one live, more during a bootstrap or backfill. Time is credited when a
+span ends, so a stall longer than the scrape interval reads 0 and then one
+burst. The oracle resolver pool between batcher and inserter has no row:
+`batcher` `blocked_out` with idle inserters points at it. `inserter` busy includes
+the ClickHouse round trip, failed attempts included. `backup_tap` and
+`backup_walk` run once per backup part in parallel, and `backup_tap` busy
+includes its wait on `backup_walk`. `queue` busy includes TOAST fetches.
 
 ### Object-store backfill restart
 

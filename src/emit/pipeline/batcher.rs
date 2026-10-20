@@ -319,6 +319,7 @@ struct BatchOutput {
     budget: crate::budget::MemoryBudget,
     partial_bytes: AtomicUsize,
     batch_limit: usize,
+    sent_nanos: AtomicU64,
 }
 
 /// Per-message routing state shared by every row of one `BatcherMsg`
@@ -347,6 +348,7 @@ pub(crate) fn spawn(
             budget: crate::budget::MemoryBudget::new(cfg.byte_budget.max(1)),
             partial_bytes: AtomicUsize::new(0),
             batch_limit: (cfg.byte_budget / cfg.inserters.max(1)).max(1),
+            sent_nanos: AtomicU64::new(0),
         };
         let mut tables = Tables::default();
         let mut epoch: u64 = 0;
@@ -365,55 +367,65 @@ pub(crate) fn spawn(
                     deadline.as_mut().reset(at);
                 }
             }
+            let waiting = Instant::now();
+            let clock = BatcherClock { stats, out: &out };
             tokio::select! {
-                msg = msg_rx.recv() => match msg {
-                    Some(BatcherMsg::Rows(chunk)) => {
-                        let live = effective_cfg(&cfg, snapshot(config_rx.as_ref()).as_deref());
-                        let ctx = RowCtx { cfg: live, out: &out, alloc, epoch, stats };
-                        if let Err(e) = handle_rows(&mut tables, &ctx, chunk).await {
-                            fatal.set(format!("batcher: {e}"));
-                            break;
-                        }
-                    }
-                    Some(BatcherMsg::Chunks(chunks)) => {
-                        let live = effective_cfg(&cfg, snapshot(config_rx.as_ref()).as_deref());
-                        let ctx = RowCtx { cfg: live, out: &out, alloc, epoch, stats };
-                        let mut res = Ok(());
-                        for chunk in chunks {
-                            res = handle_rows(&mut tables, &ctx, chunk).await;
-                            if res.is_err() {
+                msg = msg_rx.recv() => {
+                    let busy = clock.woke(waiting);
+                    match msg {
+                        Some(BatcherMsg::Rows(chunk)) => {
+                            let live = effective_cfg(&cfg, snapshot(config_rx.as_ref()).as_deref());
+                            let ctx = RowCtx { cfg: live, out: &out, alloc, epoch, stats };
+                            if let Err(e) = handle_rows(&mut tables, &ctx, chunk).await {
+                                fatal.set(format!("batcher: {e}"));
                                 break;
                             }
                         }
-                        if let Err(e) = res {
-                            fatal.set(format!("batcher: {e}"));
+                        Some(BatcherMsg::Chunks(chunks)) => {
+                            let live = effective_cfg(&cfg, snapshot(config_rx.as_ref()).as_deref());
+                            let ctx = RowCtx { cfg: live, out: &out, alloc, epoch, stats };
+                            let mut res = Ok(());
+                            for chunk in chunks {
+                                res = handle_rows(&mut tables, &ctx, chunk).await;
+                                if res.is_err() {
+                                    break;
+                                }
+                            }
+                            if let Err(e) = res {
+                                fatal.set(format!("batcher: {e}"));
+                                break;
+                            }
+                        }
+                        Some(BatcherMsg::FlushAll(reply)) => {
+                            if let Err(e) = flush_all(&mut tables, &out, &mut epoch, stats).await {
+                                fatal.set(format!("batcher barrier flush: {e}"));
+                                break;
+                            }
+                            let _ = reply.send(());
+                        }
+                        // All senders dropped: final flush
+                        None => {
+                            if let Err(e) = flush_all(&mut tables, &out, &mut epoch, stats).await {
+                                fatal.set(format!("batcher final flush: {e}"));
+                            }
                             break;
                         }
                     }
-                    Some(BatcherMsg::FlushAll(reply)) => {
-                        if let Err(e) = flush_all(&mut tables, &out, &mut epoch, stats).await {
-                            fatal.set(format!("batcher barrier flush: {e}"));
-                            break;
-                        }
-                        let _ = reply.send(());
-                    }
-                    // All senders dropped: final flush
-                    None => {
-                        if let Err(e) = flush_all(&mut tables, &out, &mut epoch, stats).await {
-                            fatal.set(format!("batcher final flush: {e}"));
-                        }
-                        break;
-                    }
-                },
+                    clock.done(busy);
+                }
                 () = &mut deadline, if armed.is_some() => {
+                    let busy = clock.woke(waiting);
                     if let Err(e) = flush_due(&mut tables.open, &out, Instant::now(), stats).await {
                         fatal.set(format!("batcher deadline flush: {e}"));
                         break;
                     }
+                    clock.done(busy);
                 }
                 // Apply changed limits to next message. Tables that already
                 // contain rows keep their current deadlines
-                _ = config_changed(&mut config_rx) => {}
+                _ = config_changed(&mut config_rx) => {
+                    clock.done(clock.woke(waiting));
+                }
             }
         }
     })
@@ -569,6 +581,7 @@ async fn emit_batch(t: &mut Table, out: &BatchOutput, stats: &EmitterStats) -> R
     permits.append(&mut t.value_permits);
     let bytes = buffers.iter().map(ColumnBuf::allocated_bytes).sum();
     // Separate pool avoids waiting on decoded payload held by this batch
+    let sending = Instant::now();
     let encoded = out.budget.acquire(bytes).await;
     let batch = InsertBatch {
         meta: t.meta.clone(),
@@ -582,10 +595,47 @@ async fn emit_batch(t: &mut Table, out: &BatchOutput, stats: &EmitterStats) -> R
         .send(batch)
         .await
         .map_err(|_| "inserter queue closed".to_string())?;
+    let sent = sending.elapsed().as_nanos() as u64;
+    out.sent_nanos.fetch_add(sent, Ordering::Relaxed);
+    stats.batcher_send_nanos.fetch_add(sent, Ordering::Relaxed);
     stats
         .insertbatch_batches_out
         .fetch_add(1, Ordering::Relaxed);
     Ok(())
+}
+
+struct BatcherClock<'a> {
+    stats: &'a EmitterStats,
+    out: &'a BatchOutput,
+}
+
+struct BatcherBusy {
+    since: Instant,
+    sent_before: u64,
+}
+
+impl BatcherClock<'_> {
+    fn woke(&self, waiting: Instant) -> BatcherBusy {
+        self.stats
+            .batcher_idle_nanos
+            .fetch_add(waiting.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        BatcherBusy {
+            since: Instant::now(),
+            sent_before: self.out.sent_nanos.load(Ordering::Relaxed),
+        }
+    }
+
+    fn done(&self, busy: BatcherBusy) {
+        let sent = self
+            .out
+            .sent_nanos
+            .load(Ordering::Relaxed)
+            .saturating_sub(busy.sent_before);
+        let elapsed = busy.since.elapsed().as_nanos() as u64;
+        self.stats
+            .batcher_busy_nanos
+            .fetch_add(elapsed.saturating_sub(sent), Ordering::Relaxed);
+    }
 }
 
 /// Flush tables whose deadlines have passed. `emit_batch` clears each deadline,

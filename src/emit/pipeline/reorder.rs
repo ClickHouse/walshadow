@@ -18,6 +18,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::time::Instant;
 
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use walrus::pg::walparser::RmId;
@@ -367,6 +368,7 @@ struct Outbox {
     /// Global resident-payload pool; slice and chunk generation admission
     /// acquired here, riding rows to insert ack. `None` = unmetered (tests)
     budget: Option<crate::budget::MemoryBudget>,
+    stats: Arc<EmitterStats>,
 }
 
 impl Outbox {
@@ -383,20 +385,31 @@ impl Outbox {
             return Ok(Some(p));
         }
         self.flush_pending().await?;
-        tokio::select! {
+        let waiting = Instant::now();
+        let admitted = tokio::select! {
             biased;
             msg = self.fatal.wait() => Err(SinkError::Other(msg)),
             p = budget.admit(bytes) => Ok(Some(p)),
-        }
+        };
+        self.blocked(waiting);
+        admitted
+    }
+
+    fn blocked(&self, since: Instant) {
+        self.stats
+            .queue_blocked_out_nanos
+            .fetch_add(since.elapsed().as_nanos() as u64, Ordering::Relaxed);
     }
 
     /// Batcher exits only past a fatal or after this sink drops its sender
     async fn send(&mut self, msg: BatcherMsg) -> Result<(), SinkError> {
+        let waiting = Instant::now();
         let sent = tokio::select! {
             biased;
             msg = self.fatal.wait() => return Err(SinkError::Other(msg)),
             r = self.msg_tx.send(msg) => r,
         };
+        self.blocked(waiting);
         sent.map_err(|_| SinkError::Other("batcher channel closed".into()))
     }
 }
@@ -498,6 +511,7 @@ impl ReorderSink {
                 staged_rows: 0,
                 staged_bytes: 0,
                 budget,
+                stats: stats.clone(),
             },
             stats,
             resolver,
@@ -563,11 +577,14 @@ impl ReorderSink {
         self.out.flush_pending().await?;
         let (tx, rx) = oneshot::channel();
         self.out.send(BatcherMsg::FlushAll(tx)).await?;
-        tokio::select! {
+        let waiting = Instant::now();
+        let flushed = tokio::select! {
             biased;
             msg = self.out.fatal.wait() => Err(SinkError::Other(msg)),
             r = rx => r.map_err(|_| SinkError::Other("batcher dropped flush ack".into())),
-        }
+        };
+        self.out.blocked(waiting);
+        flushed
     }
 
     // Barrier waits prefer concurrent fatal over successful completion
@@ -576,11 +593,14 @@ impl ReorderSink {
     async fn wait_all_durable(&mut self) -> Result<(), SinkError> {
         self.out.flush_pending().await?;
         let through = self.out.seqs.next();
-        tokio::select! {
+        let waiting = Instant::now();
+        let durable = tokio::select! {
             biased;
             msg = self.out.fatal.wait() => Err(SinkError::Other(msg)),
             r = self.ack.wait_through(through) => r.map_err(SinkError::ctx(format_args!("durability barrier through {through}"))),
-        }
+        };
+        self.out.blocked(waiting);
+        durable
     }
 
     /// Fence before applying a DDL event / TRUNCATE so it orders strictly
@@ -1771,6 +1791,7 @@ mod tests {
             staged_rows: 0,
             staged_bytes: 0,
             budget: Some(budget.clone()),
+            stats: Arc::default(),
         };
         (out, tail)
     }

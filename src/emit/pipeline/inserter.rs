@@ -86,11 +86,9 @@ impl Inserter {
         self.stats
             .reconnects
             .fetch_add(self.client.take_dials(), Ordering::Relaxed);
-        if result.is_ok() {
-            self.stats
-                .inserter_ch_nanos
-                .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
-        }
+        self.stats
+            .inserter_ch_nanos
+            .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
         result
     }
 
@@ -110,7 +108,14 @@ impl Inserter {
     }
 
     async fn run(mut self, rx: async_channel::Receiver<ResolvedBatch>, fatal: Fatal) {
-        while let Ok(ResolvedBatch { batch, resolved }) = rx.recv().await {
+        loop {
+            let waiting = std::time::Instant::now();
+            let Ok(ResolvedBatch { batch, resolved }) = rx.recv().await else {
+                break;
+            };
+            self.stats
+                .inserter_idle_nanos
+                .fetch_add(waiting.elapsed().as_nanos() as u64, Ordering::Relaxed);
             let (epoch, asts) = match self.take_asts(&batch.meta) {
                 Ok(asts) => asts,
                 Err(e) => {
