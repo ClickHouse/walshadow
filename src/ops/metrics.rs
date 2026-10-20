@@ -59,6 +59,10 @@ macro_rules! label_class {
             pub fn label(self) -> &'static str {
                 Self::LABELS[self.index()]
             }
+
+            pub fn one_hot(self) -> [u64; Self::COUNT] {
+                std::array::from_fn(|i| u64::from(i == self.index()))
+            }
         }
     };
     ($(#[$attr:meta])* $vis:vis enum $Name:ident { $($(#[$vattr:meta])* $Variant:ident => ($group:literal, $label:literal)),+ $(,)? }) => {
@@ -99,6 +103,28 @@ label_class! {
         Idle => "idle",
         BlockedIn => "blocked_in",
         BlockedOut => "blocked_out",
+    }
+}
+
+label_class! {
+    #[derive(Default)]
+    pub enum SourceMode {
+        #[default]
+        Streaming => "streaming",
+        Archive => "archive",
+        Reconnecting => "reconnecting",
+        Crossing => "crossing",
+        Paused => "paused",
+        InitialLoad => "initial_load",
+    }
+}
+
+label_class! {
+    pub enum ErrorKind {
+        SourceWalRemoved => ("source", "wal_removed"),
+        SourceDisconnect => ("source", "disconnect"),
+        SourceWalsenderExit => ("source", "walsender_exit"),
+        SourceOther => ("source", "other"),
     }
 }
 
@@ -252,6 +278,9 @@ snapshot! {
         /// `(worker, state, seconds)` for every serial worker, rendered
         /// `walshadow_worker_seconds_total{worker,state}`
         worker_seconds: Vec<(&'static str, WorkerState, f64)>,
+        /// Failures by [`ErrorKind`], rendered
+        /// `walshadow_errors_total{component,kind}`
+        errors: [u64; ErrorKind::COUNT],
         /// Refusal a crossing parked on, rendered as `crossing_wedged`. The
         /// pump keeps publishing rather than exiting into a restart that
         /// re-crosses and re-fails, so this is how the daemon says it is
@@ -509,6 +538,8 @@ snapshot! {
         "Time filtering and dispatching archived WAL, including downstream backpressure.",
     gauge archive_restore_active: u64 =
         "1 while consuming prefetched archive WAL through the normal pump.",
+    gauge source_mode: [u64; SourceMode::COUNT] ["mode" = SourceMode::LABELS] =
+        "1 for what the daemon is doing, 0 for the rest: initial_load while the bootstrap builds ClickHouse from a backup, then the pump's state: streaming from the source, catching up from the archive, reconnecting (the first connect at start included), crossing timelines (waiting at the switch included), or paused by an operator. paused outranks archive and crossing.",
     counter source_endpoint_swaps_total: u64 =
         "Source feeds swapped onto a reloaded `[source]` endpoint or slot.",
     counter source_endpoint_swap_failures_total: u64 =
@@ -1032,6 +1063,17 @@ fn encode_snapshot(snap: &MetricsSnapshot, enc: &mut DescriptorEncoder<'_>) -> f
         .worker_seconds
         .iter()
         .map(|(worker, state, secs)| ([*worker, state.label()], *secs));
+    let error_rows = ErrorKind::ALL
+        .into_iter()
+        .map(|e| (e.pair(), snap.errors[e.index()]));
+    counter_pairs(
+        enc,
+        "walshadow_errors_total",
+        "Failures by component and kind. source: one per lost or refused stream, wal_removed is SQLSTATE 58P01 (the source recycled WAL walshadow still needed, counted once per outage whether the stream or a redial reports it), disconnect an I/O failure, peer close or receive timeout, walsender_exit a clean end of stream, other anything else. Other redial failures during an outage are not counted.",
+        ["component", "kind"],
+        error_rows,
+    )?;
+
     counter_pairs(
         enc,
         "walshadow_worker_seconds_total",
@@ -1457,6 +1499,27 @@ mod tests {
         assert!(dupes.is_empty(), "families declared twice: {dupes:?}");
         let helps = body.lines().filter(|l| l.starts_with("# HELP ")).count();
         assert_eq!(helps, seen.len(), "one HELP per TYPE");
+    }
+
+    #[test]
+    fn render_emits_source_mode_families() {
+        let snap = MetricsSnapshot {
+            source_mode: SourceMode::Archive.one_hot(),
+            errors: [2, 3, 6, 4],
+            ..MetricsSnapshot::default()
+        };
+        let body = render(snap);
+        assert!(body.contains("walshadow_source_mode{mode=\"archive\"} 1"));
+        assert!(body.contains("walshadow_source_mode{mode=\"streaming\"} 0"));
+        assert!(body.contains("walshadow_source_mode{mode=\"initial_load\"} 0"));
+        assert!(body.contains("# TYPE walshadow_errors counter"));
+        assert!(
+            body.contains("walshadow_errors_total{component=\"source\",kind=\"wal_removed\"} 2")
+        );
+        assert!(
+            body.contains("walshadow_errors_total{component=\"source\",kind=\"walsender_exit\"} 6")
+        );
+        assert!(body.contains("walshadow_errors_total{component=\"source\",kind=\"other\"} 4"));
     }
 
     #[test]
