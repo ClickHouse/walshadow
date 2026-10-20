@@ -37,6 +37,7 @@ use crate::catalog::pending::DegradeReason;
 use crate::decode::heap_decoder::HEAP_OP_LABELS;
 use crate::ops::bridge::{OP_COUNT, OP_LABELS};
 use crate::pos::{Drain, EmitterAck, FilterDispatched, Floor, Pos, ShadowReplay, SourceReceived};
+use crate::source::shadow_stream::Disconnect;
 use crate::source::transition::SWITCH_FAILURE_REASONS;
 
 #[derive(Debug, Error)]
@@ -480,6 +481,17 @@ snapshot! {
     /// Cumulative connections dropped by `slow_threshold` overflow
     counter shadow_stream_dropped_connections_total: u64 =
         "Connections dropped by slow-client cutoff since daemon start.",
+    counter shadow_stream_connections_total: u64 =
+        "Sockets accepted by walshadow's walsender, including ones that never reach START_REPLICATION.",
+    counter shadow_stream_disconnects_total_by_reason: [u64; Disconnect::COUNT]
+        ["reason" = Disconnect::LABELS] =
+        "Walsender sockets ended, by reason: slow_client (send queue cap), client_closed, error (I/O, handshake, refused START_REPLICATION).",
+    counter shadow_stream_backfill_bytes_total: u64 =
+        "WAL bytes replayed from the retained wire buffer to reconnecting walreceivers.",
+    counter shadow_stream_start_before_buffer_total: u64 =
+        "START_REPLICATION requests below the retained wire buffer while behind the head, served without backfill.",
+    gauge shadow_stream_send_queue_bytes: u64 =
+        "Largest unsent walsender queue across connections; compare to the slow-client cap.",
     counter catalog_boundary_holds_total: u64 =
         "Publication holds released at catalog-mutating commit boundaries.",
     counter catalog_boundary_hold_failures_total: u64 =
@@ -1435,6 +1447,11 @@ mod tests {
             shadow_apply_lag_seconds: 1.23456,
             shadow_stream_active_connections: 2,
             shadow_stream_dropped_connections_total: 5,
+            shadow_stream_connections_total: 9,
+            shadow_stream_disconnects_total_by_reason: [5, 3, 1],
+            shadow_stream_backfill_bytes_total: 4096,
+            shadow_stream_start_before_buffer_total: 2,
+            shadow_stream_send_queue_bytes: 777,
             ..MetricsSnapshot::default()
         };
         let body = render(snap);
@@ -1450,6 +1467,17 @@ mod tests {
         assert!(body.contains("# HELP walshadow_shadow_stream_dropped_connections"));
         assert!(body.contains("# TYPE walshadow_shadow_stream_dropped_connections counter"));
         assert!(body.contains("walshadow_shadow_stream_dropped_connections_total 5"));
+        assert!(body.contains("walshadow_shadow_stream_connections_total 9"));
+        assert!(
+            body.contains("walshadow_shadow_stream_disconnects_total{reason=\"slow_client\"} 5")
+        );
+        assert!(
+            body.contains("walshadow_shadow_stream_disconnects_total{reason=\"client_closed\"} 3")
+        );
+        assert!(body.contains("walshadow_shadow_stream_disconnects_total{reason=\"error\"} 1"));
+        assert!(body.contains("walshadow_shadow_stream_backfill_bytes_total 4096"));
+        assert!(body.contains("walshadow_shadow_stream_start_before_buffer_total 2"));
+        assert!(body.contains("walshadow_shadow_stream_send_queue_bytes 777"));
     }
 
     /// Unknown rate stays infinite on the wire. prometheus-client spells it

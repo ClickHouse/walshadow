@@ -367,6 +367,11 @@ async fn bin_stream_replicates_segments_and_serves_metrics() {
             "walshadow_shadow_apply_lag_seconds",
             "walshadow_shadow_stream_active_connections",
             "walshadow_shadow_stream_dropped_connections_total",
+            "walshadow_shadow_stream_connections_total",
+            "walshadow_shadow_stream_disconnects_total",
+            "walshadow_shadow_stream_backfill_bytes_total",
+            "walshadow_shadow_stream_start_before_buffer_total",
+            "walshadow_shadow_stream_send_queue_bytes",
         ] {
             assert!(
                 body.contains(name),
