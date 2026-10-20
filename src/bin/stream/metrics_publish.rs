@@ -10,7 +10,9 @@ use walshadow::boundary_hold::BoundaryHoldStats;
 use walshadow::ch_emitter::EmitterStats;
 use walshadow::config::ConfigResolver;
 use walshadow::metrics::WorkerState;
-use walshadow::metrics::{DbSeries, MetricsRegistry, MetricsSnapshot, RateEstimator};
+use walshadow::metrics::{
+    DbSeries, MetricsRegistry, MetricsSnapshot, RateEstimator, source_server_wal_end,
+};
 use walshadow::pipeline::row_ledger::TableRowCounts;
 use walshadow::pos::{
     Drain, EmitterAck, FilterDispatched, Floor, Pos, ShadowReplay, SourceReceived,
@@ -259,6 +261,7 @@ impl DrainResident {
 pub(crate) async fn populate_metrics(
     registry: &MetricsRegistry,
     source_received_lsn: Pos<SourceReceived>,
+    source_wal_end: Option<u64>,
     filter_lsn: Pos<FilterDispatched>,
     shadow_replay_lsn: Pos<ShadowReplay>,
     decoder_commit_lsn: Pos<Drain>,
@@ -283,6 +286,7 @@ pub(crate) async fn populate_metrics(
         .unwrap_or((prev.shadow_apply_lag_bytes, prev.shadow_apply_lag_seconds));
     let base = MetricsSnapshot {
         source_received_lsn,
+        source_server_wal_end_lsn: source_server_wal_end(source_wal_end),
         filter_lsn,
         shadow_replay_lsn,
         decoder_commit_lsn,

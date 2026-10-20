@@ -571,8 +571,12 @@ pub fn parse_metric(body: &str, name: &str) -> Option<u64> {
             continue;
         }
         let head = line.split_once(' ').map(|(h, _)| h)?;
-        let stem = head.split_once('{').map(|(s, _)| s).unwrap_or(head);
-        if stem != name {
+        let key = if name.contains('{') {
+            head
+        } else {
+            head.split_once('{').map(|(s, _)| s).unwrap_or(head)
+        };
+        if key != name {
             continue;
         }
         let value_str = line.rsplit_once(' ').map(|(_, v)| v)?;

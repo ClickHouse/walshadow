@@ -355,7 +355,7 @@ pub async fn run(
                 bail!("daemon restarted while seeding");
             }
             if sample
-                .get("walshadow_floor_lsn")
+                .get("walshadow_position_lsn{at=\"floor\"}")
                 .is_some_and(|value| *value >= target as f64)
                 && sample.get("walshadow_config_backfills_pending") == Some(&0.0)
             {

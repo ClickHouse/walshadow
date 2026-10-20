@@ -166,7 +166,7 @@ fn sample(addr: SocketAddr) -> Result<Sample> {
     Ok(Sample {
         at: Instant::now(),
         queue_records_out: get("walshadow_queue_records_out_total"),
-        filter_lsn: get("walshadow_filter_lsn"),
+        filter_lsn: get("walshadow_position_lsn{at=\"filter\"}"),
         emitter_rows: get("walshadow_emitter_rows_total"),
         inserter_batches: get("walshadow_inserter_batches_in_total"),
         inserter_ch_ms: ch_seconds,
