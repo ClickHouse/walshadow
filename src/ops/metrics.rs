@@ -17,6 +17,7 @@ use std::fmt;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use prometheus_client::collector::Collector;
@@ -172,6 +173,9 @@ macro_rules! encode_metric {
     };
     ($enc:expr, gauge, $name:expr, $help:expr, $value:expr) => {
         gauge($enc, $name, $help, $value)?
+    };
+    ($enc:expr, histogram, $name:expr, $help:expr, $value:expr) => {
+        histogram($enc, $name, $help, &$value)?
     };
     ($enc:expr, counter, $name:expr, $help:expr, $value:expr, $key:literal, $labels:expr) => {
         counter_series($enc, $name, $help, $key, $labels.into_iter().zip($value))?
@@ -447,6 +451,8 @@ snapshot! {
         "Values read from the store ahead of planning, off the serial path. The fetch counters include these reads.",
     counter toast_value_wait_seconds: f64 =
         "Cumulative wall-clock planning spent waiting on values read ahead of it, apart from the store time those reads count in toast_value_fetch_seconds.",
+    histogram toast_values_per_fetch: HistogramSnapshot =
+        "Values requested per chunk-store fetch round trip; the distribution behind the batching factor toast_values_fetched_total / toast_value_fetch_batches_total.",
     counter toast_image_rows_mirrored_total: u64 =
         "Chunk rows mirrored from restored page images during a backup window; non-zero means the backup copied TOAST pages mid-write.",
     counter toast_values_filled_superseded_total: u64 =
@@ -670,6 +676,9 @@ db_snapshot! {
         /// but not yet complete. Only `ctl status` reads it; the scrape
         /// renders the `mode=` split beside it
         config_backfills_pending: u64,
+        /// Bridge round-trip wall time per request and op, lock wait
+        /// included, rendered `walshadow_request_duration_seconds{target="bridge",op}`
+        request_duration_seconds: [HistogramSnapshot; OP_COUNT],
     }
 
     gauge bridge_up: u64 =
@@ -951,6 +960,110 @@ pub(crate) fn gauge_series<'a, V: EncodeGaugeValue>(
     Ok(())
 }
 
+/// Fixed-bucket histogram observed lock-free off the hot path: one relaxed
+/// `fetch_add` per bucket and sum. `N` finite upper bounds starting at
+/// `FIRST` and doubling, in the owner's integer unit (nanoseconds, values),
+/// plus an implicit `+Inf` bucket. A scrape racing an observation can see the
+/// count one ahead of the sum
+#[derive(Debug)]
+pub struct Histogram<const FIRST: u64, const N: usize> {
+    /// Per-bucket, not cumulative; the encoder accumulates
+    counts: [AtomicU64; N],
+    overflow: AtomicU64,
+    sum: AtomicU64,
+}
+
+impl<const FIRST: u64, const N: usize> Default for Histogram<FIRST, N> {
+    fn default() -> Self {
+        Self {
+            counts: std::array::from_fn(|_| AtomicU64::new(0)),
+            overflow: AtomicU64::new(0),
+            sum: AtomicU64::new(0),
+        }
+    }
+}
+
+impl<const FIRST: u64, const N: usize> Histogram<FIRST, N> {
+    fn bound(i: usize) -> u64 {
+        FIRST << i
+    }
+
+    /// A sample lands in the first bucket with `v <= bound`
+    pub fn observe(&self, v: u64) {
+        let i = (0..N).find(|i| v <= Self::bound(*i));
+        let bucket = i.map_or(&self.overflow, |i| &self.counts[i]);
+        bucket.fetch_add(1, Ordering::Relaxed);
+        self.sum.fetch_add(v, Ordering::Relaxed);
+    }
+
+    /// Bounds and sum divided by `scale` into the exported unit
+    pub fn snapshot(&self, scale: f64) -> HistogramSnapshot {
+        let mut buckets: Vec<(f64, u64)> = self
+            .counts
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (Self::bound(i) as f64 / scale, c.load(Ordering::Relaxed)))
+            .collect();
+        buckets.push((f64::INFINITY, self.overflow.load(Ordering::Relaxed)));
+        HistogramSnapshot {
+            count: buckets.iter().map(|(_, c)| c).sum(),
+            sum: self.sum.load(Ordering::Relaxed) as f64 / scale,
+            buckets,
+        }
+    }
+}
+
+/// A [`Histogram`] read at scrape time: per-bucket counts under finite upper
+/// bounds, closed by an `f64::INFINITY` bucket that renders as `+Inf`. Empty until
+/// something publishes one
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct HistogramSnapshot {
+    pub buckets: Vec<(f64, u64)>,
+    pub sum: f64,
+    pub count: u64,
+}
+
+impl HistogramSnapshot {
+    /// Buckets as rendered: a snapshot nobody published still closes with
+    /// `+Inf`, which every histogram sample needs
+    fn encoded_buckets(&self) -> &[(f64, u64)] {
+        if self.buckets.is_empty() {
+            &[(f64::INFINITY, 0)]
+        } else {
+            &self.buckets
+        }
+    }
+
+    /// Fold another histogram over the same bounds in, as one database's
+    /// bootstrap and live bridges share a series
+    pub fn merge(&mut self, other: HistogramSnapshot) {
+        if self.buckets.is_empty() {
+            *self = other;
+            return;
+        }
+        debug_assert_eq!(self.buckets.len(), other.buckets.len());
+        for (mine, theirs) in self.buckets.iter_mut().zip(other.buckets) {
+            mine.1 += theirs.1;
+        }
+        self.sum += other.sum;
+        self.count += other.count;
+    }
+}
+
+pub(crate) fn histogram(
+    enc: &mut DescriptorEncoder<'_>,
+    name: &str,
+    help: &str,
+    value: &HistogramSnapshot,
+) -> fmt::Result {
+    declare(enc, name, help, MetricType::Histogram)?.encode_histogram::<NoLabelSet>(
+        value.sum,
+        value.count,
+        value.encoded_buckets(),
+        None,
+    )
+}
+
 /// `kind=`/`op=` grid over [`HEAP_OP_LABELS`]
 fn counter_kind_op(
     enc: &mut DescriptorEncoder<'_>,
@@ -1191,7 +1304,24 @@ fn encode_snapshot(snap: &MetricsSnapshot, enc: &mut DescriptorEncoder<'_>) -> f
     .encode_family(&[("system_id", snap.source_system_id)])?
     .encode_gauge(&1u64)?;
 
-    encode_db_fields(&snap.by_database, enc)
+    encode_db_fields(&snap.by_database, enc)?;
+
+    let mut durations = declare(
+        enc,
+        "walshadow_request_duration_seconds",
+        "Round-trip wall time of requests to an external service, by target and op. bridge is the pgext bridge worker over its socket, lock wait included; it gives the quantiles the per-op seconds and request counters can only average.",
+        MetricType::Histogram,
+    )?;
+    for db in &snap.by_database {
+        let database = db.database.as_str();
+        for (op, value) in OP_LABELS.iter().zip(&db.request_duration_seconds) {
+            let labels = [("database", database), ("target", "bridge"), ("op", *op)];
+            let mut series = durations.encode_family(&labels)?;
+            let buckets = value.encoded_buckets();
+            series.encode_histogram::<NoLabelSet>(value.sum, value.count, buckets, None)?;
+        }
+    }
+    Ok(())
 }
 
 /// Snapshot families, stage timings, then the OpenMetrics `# EOF` marker
@@ -1717,6 +1847,69 @@ mod tests {
     }
 
     #[test]
+    fn histograms_render_cumulative_buckets_per_series() {
+        let h = Histogram::<10, 3>::default();
+        for v in [5, 10, 11, 20, 5000] {
+            h.observe(v);
+        }
+        let snap = h.snapshot(1.0);
+        assert_eq!(snap.count, 5);
+        assert_eq!(snap.sum, 5046.0);
+        assert_eq!(
+            snap.buckets.iter().map(|b| b.1).collect::<Vec<_>>(),
+            [2, 2, 0, 1]
+        );
+
+        let mut folded = HistogramSnapshot::default();
+        folded.merge(snap.clone());
+        folded.merge(snap.clone());
+        assert_eq!(folded.count, 10);
+        assert_eq!(folded.buckets[1].1, 4);
+
+        let mut bridge = [
+            HistogramSnapshot::default(),
+            HistogramSnapshot::default(),
+            HistogramSnapshot::default(),
+            HistogramSnapshot::default(),
+            HistogramSnapshot::default(),
+        ];
+        bridge[1] = snap.clone();
+        let body = render(MetricsSnapshot {
+            toast_values_per_fetch: snap,
+            by_database: vec![DbSeries {
+                database: "app".into(),
+                request_duration_seconds: bridge,
+                ..DbSeries::default()
+            }],
+            ..MetricsSnapshot::default()
+        });
+        let latency = crate::bridge::RequestLatency::default();
+        latency.observe(6_400_000);
+        let latency = latency.snapshot(1e9);
+        assert_eq!(latency.buckets[0].0, 0.000025);
+        assert_eq!(latency.buckets[8], (0.0064, 1));
+        let op = OP_LABELS[1];
+        for want in [
+            "# TYPE walshadow_toast_values_per_fetch histogram".to_string(),
+            "walshadow_toast_values_per_fetch_bucket{le=\"10.0\"} 2".to_string(),
+            "walshadow_toast_values_per_fetch_bucket{le=\"20.0\"} 4".to_string(),
+            "walshadow_toast_values_per_fetch_bucket{le=\"+Inf\"} 5".to_string(),
+            "walshadow_toast_values_per_fetch_count 5".to_string(),
+            "# TYPE walshadow_request_duration_seconds histogram".to_string(),
+            format!(
+                "walshadow_request_duration_seconds_bucket{{le=\"40.0\",database=\"app\",target=\"bridge\",op=\"{op}\"}} 4"
+            ),
+            format!(
+                "walshadow_request_duration_seconds_count{{database=\"app\",target=\"bridge\",op=\"{op}\"}} 5"
+            ),
+        ] {
+            assert!(body.contains(&want), "missing {want}\n{body}");
+        }
+    }
+
+    /// A database name is a PG identifier, so a quote in it must not end the
+    /// label and truncate the scrape
+    #[test]
     fn render_escapes_a_database_label() {
         let body = render(MetricsSnapshot {
             by_database: vec![DbSeries {
@@ -1894,7 +2087,7 @@ mod tests {
             if let Some(rest) = line.strip_prefix("# TYPE ") {
                 let (name, kind) = rest.split_once(' ').expect("TYPE keyword");
                 assert_eq!(name, helped, "TYPE without its own HELP: {line}");
-                assert!(matches!(kind, "counter" | "gauge"), "{line}");
+                assert!(matches!(kind, "counter" | "gauge" | "histogram"), "{line}");
                 declared = Some((name, kind));
                 continue;
             }
@@ -1904,11 +2097,20 @@ mod tests {
                 None => (head, ""),
             };
             let (family, kind) = declared.expect("sample ahead of its declaration");
-            let want = match kind {
-                "counter" => format!("{family}_total"),
-                _ => family.to_owned(),
-            };
-            assert_eq!(name, want, "sample outside its family: {line}");
+            if kind == "histogram" {
+                assert!(
+                    ["_sum", "_count", "_bucket"]
+                        .iter()
+                        .any(|suffix| name == format!("{family}{suffix}")),
+                    "sample outside its family: {line}"
+                );
+            } else {
+                let want = match kind {
+                    "counter" => format!("{family}_total"),
+                    _ => family.to_owned(),
+                };
+                assert_eq!(name, want, "sample outside its family: {line}");
+            }
             for label in labels.split_terminator(',') {
                 let (key, val) = label.split_once('=').expect("key=value label");
                 assert!(!key.is_empty(), "{line}");

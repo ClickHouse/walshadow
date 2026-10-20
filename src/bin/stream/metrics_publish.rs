@@ -11,7 +11,8 @@ use walshadow::ch_emitter::EmitterStats;
 use walshadow::config::ConfigResolver;
 use walshadow::metrics::WorkerState;
 use walshadow::metrics::{
-    DbSeries, MetricsRegistry, MetricsSnapshot, RateEstimator, source_server_wal_end,
+    DbSeries, HistogramSnapshot, MetricsRegistry, MetricsSnapshot, RateEstimator,
+    source_server_wal_end,
 };
 use walshadow::pipeline::row_ledger::TableRowCounts;
 use walshadow::pos::{
@@ -162,6 +163,15 @@ impl DbMetricSources {
         let bridge_op_seconds = |pick: fn(&BridgeStats) -> &[AtomicU64; OP_COUNT]| {
             bridge_ops(pick).map(|nanos| nanos as f64 / 1e9)
         };
+        let bridge_latency = || -> [HistogramSnapshot; OP_COUNT] {
+            std::array::from_fn(|i| {
+                let mut folded = HistogramSnapshot::default();
+                for s in self.bridge.iter().flatten() {
+                    folded.merge(s.request_latency[i].snapshot(1e9));
+                }
+                folded
+            })
+        };
         let log_stats = self.desc_log.as_ref().map(|log| log.stats_handle());
         let log = |pick: fn(&DescLogStats) -> &AtomicU64| -> u64 {
             log_stats.as_ref().map_or(0, |s| ld(pick(s)))
@@ -183,6 +193,7 @@ impl DbMetricSources {
             bridge_requests_by_op: bridge_ops(|s| &s.requests),
             bridge_errors_by_op: bridge_ops(|s| &s.errors),
             bridge_request_seconds_by_op: bridge_op_seconds(|s| &s.request_nanos),
+            request_duration_seconds: bridge_latency(),
             bridge_lock_wait_seconds_by_op: bridge_op_seconds(|s| &s.lock_wait_nanos),
             bridge_service_seconds_by_op: bridge_op_seconds(|s| &s.service_nanos),
             bridge_request_bytes_by_op: bridge_ops(|s| &s.request_bytes),
@@ -564,6 +575,9 @@ pub(crate) fn stage_gauges_on(v: &StageCounters<'_>, base: MetricsSnapshot) -> M
         toast_value_fetch_seconds: emitter_seconds(|s| &s.toast_value_fetch_nanos),
         toast_values_read_ahead_total: emitter(|s| &s.toast_values_read_ahead),
         toast_value_wait_seconds: emitter_seconds(|s| &s.toast_value_wait_nanos),
+        toast_values_per_fetch: v.emitter.map_or_else(HistogramSnapshot::default, |s| {
+            s.toast_values_per_fetch.snapshot(1.0)
+        }),
         toast_image_rows_mirrored_total: emitter(|s| &s.toast_image_rows_mirrored),
         toast_values_filled_superseded_total: emitter(|s| &s.toast_values_filled_superseded),
         toast_values_filled_mismatch_total: emitter(|s| &s.toast_values_filled_mismatch),
@@ -1103,6 +1117,7 @@ mod tests {
         let bump = |s: &BridgeStats, n: u64| {
             s.up.store(1, Ordering::Relaxed);
             s.requests[encode].fetch_add(n, Ordering::Relaxed);
+            s.request_latency[encode].observe(30_000);
             s.native_bytes.fetch_add(n, Ordering::Relaxed);
         };
         let (live, boot) = (
@@ -1124,6 +1139,10 @@ mod tests {
         let handed_over = sources([Some(live.clone()), Some(boot.clone())]).series();
         assert_eq!(handed_over.database, "app");
         assert_eq!(handed_over.bridge_native_bytes_total, 7);
+        assert_eq!(
+            handed_over.request_duration_seconds[encode].count, 2,
+            "both bridges' latency samples fold into one histogram"
+        );
         assert_eq!(
             handed_over.bridge_requests_by_op[encode], 7,
             "both bridges' requests land on the database's series"
