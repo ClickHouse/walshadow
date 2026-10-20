@@ -30,7 +30,7 @@ use walshadow::config::{CliOverrides, ConfigResolver, cli_over_toml};
 use walshadow::decoder_sink::MetricsTupleObserver;
 use walshadow::emit::route::routing;
 use walshadow::mapping::MappingHandle;
-use walshadow::metrics::{MetricsRegistry, MetricsSnapshot};
+use walshadow::metrics::{MetricsRegistry, MetricsSnapshot, SourceMode};
 use walshadow::pipeline::Fatal;
 use walshadow::pipeline::tail::OwnedTail;
 use walshadow::runtime_config::InitialLoadMode;
@@ -450,6 +450,7 @@ pub(crate) async fn run_bootstrap(
                 metrics
                     .set(MetricsSnapshot {
                         by_database: vec![boot_db.series()],
+                        source_mode: SourceMode::InitialLoad.one_hot(),
                         ..stage_gauges(&StageCounters {
                             emitter: Some(&stats),
                             db_name: &|_| boot_db.database.clone(),

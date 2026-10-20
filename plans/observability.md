@@ -43,7 +43,7 @@ expected siblings is too narrow.
 |---|---|---|---|
 | `position_lsn` | `at` | source_head, received, filter, decoder_commit, ack, shadow_replay, floor, pause_consumed, pause_received, promotion_target_replay, promotion_target_receive, timeline_switch | complete |
 | `commit_timestamp_seconds` | `at` | source, ack | shadow_replay once the pump keeps an LSN→commit-time ring |
-| `source_mode` | `mode` | the seven one-hot states, Initial load included | complete |
+| `source_mode` | `mode` | the six one-hot states, `initial_load` included | complete |
 | `stage_active`, `stage_seconds_total`, `stage_completed_total`, `stage_interrupted_total` | `stage`, `title`, `order` | ten stages | copy and publish phases as the table backfill grows |
 | `stage_count` | `stage`, `title`, `order`, `measure` | work_total, work_done, rows | complete |
 | `worker_seconds_total` | `worker`, `state` | pump, queue, batcher, inserter, backup_tap, backup_walk × busy, idle, blocked_in, blocked_out | reorder if it ever leaves the queue worker |
@@ -67,7 +67,7 @@ family they read.
 | `shadow_apply_lag_bytes` | derive: `position_lsn` received minus shadow_replay |
 | `shadow_apply_lag_seconds` | derive from `commit_timestamp_seconds{at="shadow_replay"}` once it exists; the bytes÷rate estimate explodes when the pump's intake stops, and `WalshadowApplyLagSeconds` carries a `< +Inf` workaround for it |
 | `emitter_rows_total` | derive: sum of `table_rows_inserted_total` |
-| `archive_restore_active` | derive: `source_mode{mode="Catching up from archive"}` |
+| `archive_restore_active` | derive: `source_mode{mode="archive"}` |
 | `bootstrap_bytes_tapped`, `backfill_backup_bytes_total`, `backfill_copy_bytes_total`, `timeline_prefix_bytes_verified_total` | `wal_bytes_total{flow}` |
 | `archive_wal_segments_total` | `wal_bytes_total{flow="archive_fetched"}` in bytes |
 | `xact_bytes_in_memory`, `spill_bytes_active`, `drain_resident_bytes`, `drain_chunk_resident_bytes`, `drain_row_resident_bytes`, `toast_xact_spool_bytes`, `resident_payload_bytes`, `resident_payload_peak_bytes`, `raw_pending_bytes`, `desc_log_tail_bytes` | `buffer_bytes{buffer}` |
@@ -90,10 +90,10 @@ with the debug tier available on a flag.
 
 - `WalshadowNotReplicating` signal 1 reads `position_lsn{at="received"} == bool
   0`; the member is omitted at LSN 0, so the signal cannot fire. Replace
-  it with `source_mode{mode="Reconnecting to source"} == 1` held for the window.
+  it with `source_mode{mode="reconnecting"} == 1` held for the window.
 - `WalshadowNotReplicating` signal 3 (`shadow_stream_active_connections == 0`)
   fires through every archive catch-up after a bootstrap; suppress on
-  `source_mode{mode="Catching up from archive"}` as well as on the bootstrap
+  `source_mode{mode="archive"}` as well as on the bootstrap
   and copy stages, or export one health gauge with a reason label.
 - `WalshadowClickHouseLag` on `commit_timestamp_seconds{at="source"} -
   ignoring(at) commit_timestamp_seconds{at="ack"}` is blind during an archive

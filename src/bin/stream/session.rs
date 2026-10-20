@@ -72,8 +72,9 @@ use crate::source_db::{
 };
 use crate::source_recovery::{
     BARRIER_LOG_INTERVAL, PROMOTION_POLL, PauseState, PromotionGate, ReconnectBackoff, ResumePoint,
-    SOURCE_SWAP_RETRY, SourcePath, SourceRecovery, commit_fork_resume, connect_source_waiting,
-    promotion_gate, resume_manifest, resume_source_feed, stream_branch, swap_reason,
+    SOURCE_SWAP_RETRY, SourceModeStats, SourcePath, SourceRecovery, commit_fork_resume,
+    connect_source_waiting, promotion_gate, resume_manifest, resume_source_feed, stream_branch,
+    stream_error_kind, swap_reason,
 };
 
 /// Wait out an unreachable ClickHouse at boot rather than exit, which leaves
@@ -297,6 +298,9 @@ async fn session_body(
         source_conn.slot = args.slot.clone();
     }
     let mut cfg = source_conn.to_pg_config();
+    metrics
+        .update(|snap| snap.source_mode = walshadow::metrics::SourceMode::Reconnecting.one_hot())
+        .await;
     let mut feed = or_signal(
         shutdown,
         connect_source_waiting(args, &mut source_conn, &mut cfg, SOURCE_SWAP_RETRY),
@@ -1479,7 +1483,9 @@ async fn session_body(
         floor: &resume_floor,
         prefetch: usize::from(args.archive_prefetch),
         backoff: ReconnectBackoff::default(),
+        mode_stats: SourceModeStats::default(),
     };
+    source_recovery.mode_stats.errors = metrics.snapshot().await.errors;
     let mut timeline_stats = TimelineStats {
         // Off the chain, so a restart after a crossing keeps reporting the fork
         // it resumed across instead of zero
@@ -1495,6 +1501,9 @@ async fn session_body(
         )
         .await
     {
+        source_recovery
+            .mode_stats
+            .note_stream_error(stream_error_kind(Some(&e)));
         path = source_recovery
             .attempt(
                 Some(e),
@@ -1627,6 +1636,9 @@ async fn session_body(
                         resume_lsn = %stream.next_lsn(),
                         "resuming the source stream failed — redialing",
                     );
+                    source_recovery
+                        .mode_stats
+                        .note_stream_error(stream_error_kind(Some(&e)));
                     path = SourcePath::Redial;
                     source_recovery.backoff.reset();
                 } else {
@@ -1916,6 +1928,7 @@ async fn session_body(
                 res => {
                     let err = match res {
                         Err(e) => {
+                            source_recovery.mode_stats.note_stream_error(stream_error_kind(Some(&e)));
                             tracing::warn!(
                                 target: "walshadow",
                                 error = %e,
@@ -1925,6 +1938,7 @@ async fn session_body(
                             e
                         }
                         _ => {
+                            source_recovery.mode_stats.note_stream_error(stream_error_kind(None));
                             tracing::info!(
                                 target: "walshadow",
                                 resume_lsn = %stream.next_lsn(),
@@ -2003,8 +2017,13 @@ async fn session_body(
                     .await;
             }
         }
+        source_recovery
+            .mode_stats
+            .observe(path.mode(paused, crossing.pending()));
         metrics
             .update(|snap| {
+                snap.source_mode = source_recovery.mode_stats.gauge();
+                snap.errors = source_recovery.mode_stats.errors;
                 merge_worker_seconds(
                     &mut snap.worker_seconds,
                     pipeline_worker_seconds(

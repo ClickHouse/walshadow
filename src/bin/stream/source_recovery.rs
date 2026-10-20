@@ -10,6 +10,7 @@ use walrus::pg::replication::conn::PgConfig;
 use walshadow::archive::{Archive, ArchiveFeed};
 use walshadow::config::SourceConn;
 use walshadow::manifest;
+use walshadow::metrics::{ErrorKind, SourceMode};
 use walshadow::pos::{Floor, Monotone, Pos};
 use walshadow::record::WAL_SEG_SIZE;
 use walshadow::source_feed::SourceFeed;
@@ -449,9 +450,70 @@ pub(crate) enum SourcePath {
 }
 
 impl SourcePath {
+    pub(crate) fn mode(&self, paused: bool, crossing_pending: bool) -> SourceMode {
+        match self {
+            Self::Redial => SourceMode::Reconnecting,
+            _ if paused => SourceMode::Paused,
+            Self::Archive(_) => SourceMode::Archive,
+            Self::AtSwitchpoint => SourceMode::Crossing,
+            Self::Live if crossing_pending => SourceMode::Crossing,
+            Self::Live => SourceMode::Streaming,
+        }
+    }
+
     pub(crate) fn archive(&mut self) -> Option<&mut ArchiveFeed> {
         let Self::Archive(a) = self else { return None };
         Some(a)
+    }
+}
+
+pub(crate) fn stream_error_kind(err: Option<&anyhow::Error>) -> ErrorKind {
+    match err {
+        Some(e) if walshadow::source_feed::is_wal_segment_removed(e) => ErrorKind::SourceWalRemoved,
+        Some(e) if is_disconnect(e) => ErrorKind::SourceDisconnect,
+        Some(_) => ErrorKind::SourceOther,
+        None => ErrorKind::SourceWalsenderExit,
+    }
+}
+
+fn is_disconnect(err: &anyhow::Error) -> bool {
+    err.chain().any(|c| {
+        c.is::<std::io::Error>() || {
+            let text = c.to_string();
+            text.contains("connection closed unexpectedly") || text.contains("receive timeout")
+        }
+    })
+}
+
+#[derive(Default)]
+pub(crate) struct SourceModeStats {
+    mode: SourceMode,
+    pub(crate) errors: [u64; ErrorKind::COUNT],
+    removal_noted: bool,
+}
+
+impl SourceModeStats {
+    pub(crate) fn observe(&mut self, mode: SourceMode) {
+        self.mode = mode;
+    }
+
+    pub(crate) fn note_stream_error(&mut self, kind: ErrorKind) {
+        self.removal_noted |= kind == ErrorKind::SourceWalRemoved;
+        self.errors[kind.index()] += 1;
+    }
+
+    pub(crate) fn note_redial(&mut self, wal_removed: bool) {
+        if wal_removed && !self.removal_noted {
+            self.note_stream_error(ErrorKind::SourceWalRemoved);
+        }
+    }
+
+    pub(crate) fn reconnected(&mut self) {
+        self.removal_noted = false;
+    }
+
+    pub(crate) fn gauge(&self) -> [u64; SourceMode::COUNT] {
+        self.mode.one_hot()
     }
 }
 
@@ -498,6 +560,7 @@ pub(crate) struct SourceRecovery<'a> {
     pub(crate) floor: &'a Monotone<Floor>,
     pub(crate) prefetch: usize,
     pub(crate) backoff: ReconnectBackoff,
+    pub(crate) mode_stats: SourceModeStats,
 }
 
 impl SourceRecovery<'_> {
@@ -540,6 +603,7 @@ impl SourceRecovery<'_> {
                 Ok((fresh, point)) => {
                     *feed = fresh;
                     self.backoff.reset();
+                    self.mode_stats.reconnected();
                     tracing::info!(
                         target: "walshadow",
                         endpoint = source.endpoint(),
@@ -552,7 +616,11 @@ impl SourceRecovery<'_> {
                         ResumePoint::AtSwitchpoint => SourcePath::AtSwitchpoint,
                     });
                 }
-                Err(e) => e,
+                Err(e) => {
+                    let removed = walshadow::source_feed::is_wal_segment_removed(&e);
+                    self.mode_stats.note_redial(removed);
+                    e
+                }
             },
         };
         if let Some(refused) = error.downcast_ref::<TransitionError>() {
@@ -651,6 +719,7 @@ mod tests {
             floor,
             prefetch: 1,
             backoff: ReconnectBackoff::default(),
+            mode_stats: SourceModeStats::default(),
         }
     }
 
@@ -794,6 +863,69 @@ mod tests {
             .unwrap();
         assert!(matches!(path, SourcePath::Redial));
         assert!(!recovery.backoff.due());
+    }
+
+    #[test]
+    fn mode_precedence_and_error_classes() {
+        let mut stats = SourceModeStats::default();
+        assert_eq!(stats.gauge(), SourceMode::Streaming.one_hot());
+        stats.observe(SourceMode::Streaming);
+        stats.observe(SourceMode::Archive);
+        stats.observe(SourceMode::Archive);
+        stats.observe(SourceMode::Reconnecting);
+        stats.observe(SourceMode::Streaming);
+        assert_eq!(stats.gauge(), SourceMode::Streaming.one_hot());
+        assert_eq!(
+            SourceMode::Archive.one_hot()[SourceMode::Archive.index()],
+            1
+        );
+        assert_eq!(SourceMode::Archive.label(), "archive");
+        stats.observe(SourceMode::Paused);
+        assert_eq!(stats.gauge(), SourceMode::Paused.one_hot());
+        assert_eq!(
+            stream_error_kind(Some(&removed_wal())),
+            ErrorKind::SourceWalRemoved
+        );
+        let io: anyhow::Error = std::io::Error::from(std::io::ErrorKind::ConnectionReset).into();
+        assert_eq!(stream_error_kind(Some(&io)), ErrorKind::SourceDisconnect);
+        assert_eq!(stream_error_kind(None), ErrorKind::SourceWalsenderExit);
+        assert_eq!(
+            stream_error_kind(Some(&anyhow::anyhow!("boom"))),
+            ErrorKind::SourceOther
+        );
+        assert_eq!(ErrorKind::SourceOther.pair(), ["source", "other"]);
+        let removed = ErrorKind::SourceWalRemoved.index();
+        let mut outage = SourceModeStats::default();
+        outage.note_redial(false);
+        assert_eq!(outage.errors[removed], 0);
+        outage.note_redial(true);
+        outage.note_redial(true);
+        assert_eq!(outage.errors[removed], 1);
+        outage.reconnected();
+        outage.note_stream_error(ErrorKind::SourceWalRemoved);
+        outage.note_redial(true);
+        assert_eq!(outage.errors[removed], 2);
+        assert_eq!(
+            SourcePath::Redial.mode(true, true),
+            SourceMode::Reconnecting
+        );
+        assert_eq!(SourcePath::Live.mode(true, true), SourceMode::Paused);
+        assert_eq!(SourcePath::Live.mode(false, true), SourceMode::Crossing);
+        assert_eq!(
+            SourcePath::AtSwitchpoint.mode(false, false),
+            SourceMode::Crossing
+        );
+        assert_eq!(
+            SourcePath::AtSwitchpoint.mode(true, false),
+            SourceMode::Paused
+        );
+        for text in [
+            "postgres connection closed unexpectedly",
+            "source replication receive timeout",
+        ] {
+            let err = anyhow::anyhow!(text).context("next event");
+            assert_eq!(stream_error_kind(Some(&err)), ErrorKind::SourceDisconnect);
+        }
     }
 
     /// Two standbys of one primary, promoted independently, are both timeline 2
