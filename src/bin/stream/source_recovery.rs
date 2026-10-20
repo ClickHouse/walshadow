@@ -10,6 +10,7 @@ use walrus::pg::replication::conn::PgConfig;
 use walshadow::archive::{Archive, ArchiveFeed};
 use walshadow::config::SourceConn;
 use walshadow::manifest;
+use walshadow::metrics::{ErrorKind, SourceMode};
 use walshadow::pos::{Floor, Monotone, Pos};
 use walshadow::record::WAL_SEG_SIZE;
 use walshadow::source_feed::SourceFeed;
@@ -451,9 +452,49 @@ pub(crate) enum SourcePath {
 }
 
 impl SourcePath {
+    pub(crate) fn mode(&self, paused: bool, crossing_pending: bool) -> SourceMode {
+        match self {
+            Self::Redial => SourceMode::Reconnecting,
+            Self::Archive(_) => SourceMode::Archive,
+            Self::AtSwitchpoint => SourceMode::Switchpoint,
+            Self::Live if paused => SourceMode::Paused,
+            Self::Live if crossing_pending => SourceMode::Crossing,
+            Self::Live => SourceMode::Streaming,
+        }
+    }
+
     pub(crate) fn archive(&mut self) -> Option<&mut ArchiveFeed> {
         let Self::Archive(a) = self else { return None };
         Some(a)
+    }
+}
+
+pub(crate) fn stream_error_kind(err: Option<&anyhow::Error>) -> ErrorKind {
+    match err {
+        Some(e) if walshadow::source_feed::is_wal_segment_removed(e) => ErrorKind::SourceWalRemoved,
+        Some(e) if e.chain().any(|c| c.is::<std::io::Error>()) => ErrorKind::SourceDisconnect,
+        Some(_) => ErrorKind::SourceOther,
+        None => ErrorKind::SourceWalsenderExit,
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct SourceModeStats {
+    mode: SourceMode,
+    pub(crate) errors: [u64; ErrorKind::COUNT],
+}
+
+impl SourceModeStats {
+    pub(crate) fn observe(&mut self, mode: SourceMode) {
+        self.mode = mode;
+    }
+
+    pub(crate) fn note_stream_error(&mut self, kind: ErrorKind) {
+        self.errors[kind.index()] += 1;
+    }
+
+    pub(crate) fn gauge(&self) -> [u64; SourceMode::COUNT] {
+        self.mode.one_hot()
     }
 }
 
@@ -737,6 +778,47 @@ mod tests {
     /// Two standbys of one primary, promoted independently, are both timeline 2
     /// under one system identifier. The chain places either one, so only where
     /// the branch begins refuses the wrong one
+    #[test]
+    fn mode_stats_count_changes_and_classify_errors() {
+        let mut stats = SourceModeStats::default();
+        assert_eq!(stats.gauge(), SourceMode::Streaming.one_hot());
+        stats.observe(SourceMode::Streaming);
+        stats.observe(SourceMode::Archive);
+        stats.observe(SourceMode::Archive);
+        stats.observe(SourceMode::Reconnecting);
+        stats.observe(SourceMode::Streaming);
+        assert_eq!(stats.gauge(), SourceMode::Streaming.one_hot());
+        assert_eq!(
+            SourceMode::Archive.one_hot()[SourceMode::Archive.index()],
+            1
+        );
+        assert_eq!(SourceMode::Archive.label(), "Catching up from archive");
+        stats.observe(SourceMode::Paused);
+        assert_eq!(stats.gauge(), SourceMode::Paused.one_hot());
+        assert_eq!(
+            stream_error_kind(Some(&removed_wal())),
+            ErrorKind::SourceWalRemoved
+        );
+        let io: anyhow::Error = std::io::Error::from(std::io::ErrorKind::ConnectionReset).into();
+        assert_eq!(stream_error_kind(Some(&io)), ErrorKind::SourceDisconnect);
+        assert_eq!(stream_error_kind(None), ErrorKind::SourceWalsenderExit);
+        assert_eq!(
+            stream_error_kind(Some(&anyhow::anyhow!("boom"))),
+            ErrorKind::SourceOther
+        );
+        assert_eq!(ErrorKind::SourceOther.pair(), ["source", "other"]);
+        assert_eq!(
+            SourcePath::Redial.mode(true, true),
+            SourceMode::Reconnecting
+        );
+        assert_eq!(SourcePath::Live.mode(true, true), SourceMode::Paused);
+        assert_eq!(SourcePath::Live.mode(false, true), SourceMode::Crossing);
+        assert_eq!(
+            SourcePath::AtSwitchpoint.mode(false, false),
+            SourceMode::Switchpoint
+        );
+    }
+
     #[test]
     fn prove_branch_refuses_a_sibling_sharing_the_branch_number() {
         let ours = TimelineHistory::parse(2, b"1\t0/3000000\tno recovery target\n").unwrap();
