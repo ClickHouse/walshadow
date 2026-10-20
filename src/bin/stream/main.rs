@@ -51,6 +51,7 @@ mod source_db;
 mod source_recovery;
 mod tracing_setup;
 
+use std::num::NonZeroUsize;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -65,23 +66,36 @@ use crate::runtime_cfg::spawn_shutdown_signals;
 use crate::session::run_session;
 use crate::tracing_setup::init_tracing;
 
-#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     // `ctl` client mode is detected before daemon-arg parsing so it needn't
     // supply the daemon's required args.
     let argv: Vec<String> = std::env::args().collect();
     if argv.get(1).map(String::as_str) == Some("ctl") {
         let rest = std::iter::once(format!("{} ctl", argv[0])).chain(argv.into_iter().skip(2));
         let (socket, command) = walshadow::ctl::Cli::parse_from(rest).into_parts()?;
-        return run_ctl(&socket, command).await;
+        return runtime(NonZeroUsize::new(1))?.block_on(run_ctl(&socket, command));
     }
     if argv.get(1).map(String::as_str) == Some("init") {
         let rest = std::iter::once(format!("{} init", argv[0])).chain(argv.into_iter().skip(2));
         let opts = InitArgs::parse_from(rest).into_opts();
-        init_tracing(None);
-        return walshadow::init::run(opts).await;
+        return runtime(None)?.block_on(async {
+            init_tracing(None);
+            walshadow::init::run(opts).await
+        });
     }
     let args = Args::parse();
+    runtime(args.worker_threads)?.block_on(daemon(args))
+}
+
+fn runtime(workers: Option<NonZeroUsize>) -> std::io::Result<tokio::runtime::Runtime> {
+    let mut rt = tokio::runtime::Builder::new_multi_thread();
+    if let Some(n) = workers {
+        rt.worker_threads(n.get());
+    }
+    rt.enable_all().build()
+}
+
+async fn daemon(args: Args) -> Result<()> {
     walshadow::trace::set_sample_ratio(args.trace_sample_ratio);
     // `--otlp-endpoint` wins; otherwise honor the conventional env var.
     let otlp_endpoint = args
