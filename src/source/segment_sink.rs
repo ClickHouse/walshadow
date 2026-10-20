@@ -34,13 +34,18 @@ impl SegFsync {
     }
 }
 
+/// Segment copy and its compact form, reused across writes
+type Buffers = (Vec<u8>, Vec<u8>);
+
 enum Durability {
     Inline,
+    /// The daemon's sink: writes behind the pump, in the compact form
+    /// `walshadow-stream restore-wal` expands for the shadow
     Background {
         seg_size: u64,
         tx: mpsc::Sender<SegFsync>,
-        /// Previous segment's write, yielding its buffer back for reuse
-        in_flight: Option<JoinHandle<Result<Vec<u8>, SinkError>>>,
+        /// Previous segment's write, yielding its buffers back for reuse
+        in_flight: Option<JoinHandle<Result<Buffers, SinkError>>>,
     },
 }
 
@@ -101,9 +106,9 @@ impl DirSegmentSink {
         // Copy out so pump keeps streaming while a blocking thread writes.
         // One write in flight: returning here proves every earlier segment
         // renamed into place
-        let mut buf = match in_flight.take() {
+        let (mut buf, mut file) = match in_flight.take() {
             Some(write) => join_write(write).await?,
-            None => Vec::with_capacity(bytes.len()),
+            None => (Vec::with_capacity(bytes.len()), Vec::new()),
         };
         buf.clear();
         buf.extend_from_slice(bytes);
@@ -113,17 +118,18 @@ impl DirSegmentSink {
         };
         let tx = tx.clone();
         *in_flight = Some(tokio::task::spawn_blocking(move || {
-            std::fs::write(&seg_tmp, &buf)?;
+            crate::compact::segment_file(&buf, &mut file);
+            std::fs::write(&seg_tmp, &file)?;
             std::fs::rename(&seg_tmp, &fsync.seg_path)?;
             tx.blocking_send(fsync)
                 .map_err(|_| SinkError::Other("segment fsync queue closed".into()))?;
-            Ok(buf)
+            Ok((buf, file))
         }));
         Ok(())
     }
 }
 
-async fn join_write(write: JoinHandle<Result<Vec<u8>, SinkError>>) -> Result<Vec<u8>, SinkError> {
+async fn join_write(write: JoinHandle<Result<Buffers, SinkError>>) -> Result<Buffers, SinkError> {
     write
         .await
         .map_err(|e| SinkError::Other(format!("segment write task: {e}")))?

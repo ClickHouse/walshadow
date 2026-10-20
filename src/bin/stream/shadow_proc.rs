@@ -50,6 +50,7 @@ pub(crate) fn build_owned_shadow(
     workers: usize,
 ) -> Shadow {
     let mut cfg = ShadowConfig::new(data_dir, args.out_dir.clone());
+    cfg.restore_bin = Some(own_binary());
     cfg.port = args.shadow_port;
     cfg.socket_dir = args.shadow_socket_dir.clone();
     cfg.ctl_timeout = Duration::from_secs(args.shadow_connect_timeout);
@@ -62,6 +63,16 @@ pub(crate) fn build_owned_shadow(
     bridge.databases = databases.to_vec();
     cfg.bridge = Some(bridge);
     Shadow::new(cfg)
+}
+
+/// This binary, whose `restore-wal` serves the shadow's `restore_command`.
+/// Once a package upgrade replaces it, `/proc/self/exe` names the unlinked
+/// file while the path holds its successor
+fn own_binary() -> PathBuf {
+    let exe = std::env::current_exe().expect("path of the running binary");
+    exe.to_str()
+        .and_then(|p| p.strip_suffix(" (deleted)"))
+        .map_or_else(|| exe.clone(), PathBuf::from)
 }
 
 pub(crate) fn walsender_primary_conninfo(bind: SocketAddr) -> String {

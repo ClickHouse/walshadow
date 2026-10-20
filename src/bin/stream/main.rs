@@ -3,7 +3,7 @@
 //! Connects to source PG in replication mode, `IDENTIFY_SYSTEM` then
 //! `START_REPLICATION PHYSICAL` (optionally bound to a permanent slot),
 //! filters every WAL byte, writes filtered segments shadow PG reads via
-//! `restore_command`.
+//! `restore_command` (`walshadow-stream restore-wal <src> <dst>`).
 //!
 //! ```text
 //! walshadow-stream \
@@ -74,6 +74,23 @@ async fn main() -> Result<()> {
         let rest = std::iter::once(format!("{} ctl", argv[0])).chain(argv.into_iter().skip(2));
         let (socket, command) = walshadow::ctl::Cli::parse_from(rest).into_parts()?;
         return run_ctl(&socket, command).await;
+    }
+    // The managed shadow's `restore_command`
+    if let [_, cmd, src, dst] = argv.as_slice()
+        && cmd == "restore-wal"
+    {
+        // PostgreSQL signals the command's process group as it shuts down;
+        // run the few milliseconds to exit rather than die partway through it
+        for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGQUIT] {
+            // SAFETY: SIG_IGN installs no handler
+            unsafe { libc::signal(signal, libc::SIG_IGN) };
+        }
+        let seg_size = walshadow::record::WAL_SEG_SIZE as usize;
+        return Ok(walshadow::compact::restore(
+            src.as_ref(),
+            dst.as_ref(),
+            seg_size,
+        )?);
     }
     if argv.get(1).map(String::as_str) == Some("init") {
         let rest = std::iter::once(format!("{} init", argv[0])).chain(argv.into_iter().skip(2));

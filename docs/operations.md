@@ -113,6 +113,12 @@ Keep descriptor history, backfill ledgers, and deferred TOAST retirement state
 alongside manifest. Do not clean spill directory wholesale between starts
 Daemon removes transient transaction spill itself and reconstructs it from WAL
 
+The filtered WAL directory stores each segment with its zero runs elided,
+mostly the bodies of dropped records. The shadow's `restore_command` expands
+them with `walshadow-stream restore-wal <src> <dst>`. Earlier releases read only
+full segments: before downgrading, expand the directory in place with the same
+command
+
 Filtered-WAL cleanup also preserves shadow restartpoint. Do not delete segments
 solely because current replay position is newer; restarted shadow may still
 need them. Disabling configured retention leaves filtered segments on disk

@@ -367,3 +367,65 @@ async fn cli_prints_stats_line_without_quiet() {
     );
     assert!(stderr.contains("records"), "got {stderr:?}");
 }
+
+/// The compact form of filtered fixtures expands back to the same bytes from
+/// any cut, page and record boundaries included, and `restore-wal` rebuilds
+/// the full segment the shadow's `restore_command` must hand PostgreSQL
+#[tokio::test]
+async fn compact_segments_expand_to_the_filtered_bytes() {
+    use walshadow::compact;
+    let exe = env!("CARGO_BIN_EXE_walshadow-stream");
+    let dir = tempfile::tempdir().unwrap();
+    for path in [fixture_segment(), oltp_segment(), xlog_switch_segment()] {
+        if !tools::fixture(&path) {
+            return;
+        }
+        let f = filter(&path).await;
+        let page = WAL_PAGE_SIZE as usize;
+        // Every page start and record-aligned offset after its header,
+        // through the whole segment once
+        let starts = (0..f.out.len()).step_by(page).flat_map(|p| [p, p + 24]);
+        let lengths = [1, page + 5, 3 * page].into_iter().cycle();
+        for (a, len) in starts.zip(lengths).chain([(0, f.out.len())]) {
+            let b = (a + len).min(f.out.len());
+            let mut packed = Vec::new();
+            compact::encode(&f.out[a..b], &mut packed);
+            let mut out = Vec::new();
+            compact::expand(&packed, b - a, &mut out).unwrap();
+            assert!(out == f.out[a..b], "{}: {a:#X}..{b:#X}", f.name);
+        }
+        let mut file = Vec::new();
+        compact::segment_file(&f.out, &mut file);
+        eprintln!(
+            "{}: compact {} of {} bytes",
+            f.name,
+            file.len(),
+            f.out.len()
+        );
+        let (src, dst) = (dir.path().join(&f.name), dir.path().join("RECOVERYXLOG"));
+        std::fs::write(&src, &file).unwrap();
+        let status = Command::new(exe)
+            .args(["restore-wal".as_ref(), src.as_os_str(), dst.as_os_str()])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert!(std::fs::read(&dst).unwrap() == f.out, "{} restored", f.name);
+    }
+    let history = dir.path().join("00000002.history");
+    std::fs::write(&history, "1\t0/3000000\tno recovery target specified\n").unwrap();
+    let copy = dir.path().join("RECOVERYHISTORY");
+    let restore = |src: &Path| {
+        Command::new(exe)
+            .args(["restore-wal".as_ref(), src.as_os_str(), copy.as_os_str()])
+            .output()
+            .unwrap()
+    };
+    assert!(restore(&history).status.success());
+    assert_eq!(
+        std::fs::read(&copy).unwrap(),
+        std::fs::read(&history).unwrap()
+    );
+    // PostgreSQL reads 1 as "not archived" and anything above 125 as fatal
+    let missing = restore(&dir.path().join("000000010000000000000009"));
+    assert_eq!(missing.status.code(), Some(1));
+}
