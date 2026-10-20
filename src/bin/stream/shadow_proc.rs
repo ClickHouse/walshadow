@@ -10,7 +10,7 @@ use tokio_util::sync::CancellationToken;
 use walrus::pg::backup::format_pg_lsn;
 use walshadow::ch_emitter::EmitterConfig;
 use walshadow::pg::socket_conninfo;
-use walshadow::shadow::{ResumeOutcome, Shadow, ShadowConfig};
+use walshadow::shadow::{ResumeOutcome, Shadow, ShadowConfig, ShadowSettings};
 
 use crate::args::Args;
 
@@ -42,14 +42,20 @@ pub(crate) fn bridge_pool_size(ch_config: Option<&EmitterConfig>) -> usize {
         .clamp(1, walshadow::bridge::MAX_BRIDGE_WORKERS)
 }
 
+pub(crate) fn shadow_settings(ch_config: Option<&EmitterConfig>) -> ShadowSettings {
+    ch_config.map_or_else(ShadowSettings::default, |c| c.shadow.clone())
+}
+
 pub(crate) fn build_owned_shadow(
     args: &Args,
     dbname: &str,
     databases: &[String],
     data_dir: PathBuf,
     workers: usize,
+    settings: &ShadowSettings,
 ) -> Shadow {
     let mut cfg = ShadowConfig::new(data_dir, args.out_dir.clone());
+    cfg.settings = settings.clone();
     cfg.port = args.shadow_port;
     cfg.socket_dir = args.shadow_socket_dir.clone();
     cfg.ctl_timeout = Duration::from_secs(args.shadow_connect_timeout);
@@ -342,13 +348,16 @@ mod tests {
     use crate::args::args_from;
 
     #[test]
-    fn owned_shadow_sizes_bridge_from_inserter_config() {
+    fn owned_shadow_takes_bridge_and_settings_from_config() {
         let tmp = tempfile::tempdir().unwrap();
         let args = args_from(&[]);
         for (toml, expect) in [
             (None, Some(1)),
             (Some("[ch]"), None),
-            (Some("[ch]\ninserter_pool_size = 5"), Some(5)),
+            (
+                Some("[ch]\ninserter_pool_size = 5\n[shadow]\nshared_buffers = \"1GB\""),
+                Some(5),
+            ),
             (Some("[ch]\ninserter_pool_size = 16"), Some(8)),
         ] {
             let config = toml.map(|t| EmitterConfig::from_toml_str(t).unwrap());
@@ -363,6 +372,7 @@ mod tests {
                 &["postgres".to_string()],
                 tmp.path().to_path_buf(),
                 workers,
+                &shadow_settings(config.as_ref()),
             );
             let floor = walshadow::shadow::SourceGucFloor {
                 max_worker_processes: 1,
@@ -372,6 +382,8 @@ mod tests {
             let conf = std::fs::read_to_string(tmp.path().join("postgresql.conf")).unwrap();
             assert!(conf.contains(&format!("walshadow.bridge_workers = {workers}\n")));
             assert!(conf.contains(&format!("max_worker_processes = {slots}\n")));
+            let sized = toml.is_some_and(|t| t.contains("[shadow]"));
+            assert_eq!(conf.contains("shared_buffers = '1GB'\n"), sized, "{conf}");
         }
     }
 

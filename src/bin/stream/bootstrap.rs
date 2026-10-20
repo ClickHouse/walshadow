@@ -44,7 +44,9 @@ use walshadow::visibility_pending::{PendingLedger, PendingRecorded};
 use crate::archive::fetch_wal_into_pg_wal;
 use crate::args::{Args, cli_base};
 use crate::metrics_publish::{DbMetricSources, StageCounters, stage_gauges};
-use crate::shadow_proc::{OwnedShadow, bridge_pool_size, build_owned_shadow, start_owned_shadow};
+use crate::shadow_proc::{
+    OwnedShadow, bridge_pool_size, build_owned_shadow, shadow_settings, start_owned_shadow,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BootstrapPlan {
@@ -135,6 +137,7 @@ pub(crate) async fn run_bootstrap(
     } = observers;
     let timing = walshadow::ops::stages::BOOTSTRAP.start();
     let bridge_workers = bridge_pool_size(ch_config.as_ref());
+    let shadow_settings = shadow_settings(ch_config.as_ref());
     let shadow_data_dir = args.bootstrap_shadow_data_dir.clone();
 
     // Preserve existing cluster data when no bootstrap attempt owns it
@@ -861,6 +864,7 @@ pub(crate) async fn run_bootstrap(
                     &shadow_databases,
                     shadow_data_dir.clone(),
                     bridge_workers,
+                    &shadow_settings,
                 ),
                 args.keep_shadow_running,
             ));

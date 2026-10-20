@@ -31,6 +31,9 @@ use thiserror::Error;
 
 use crate::source::shadow_stream::WALRECEIVER_PROTOCOL_PIN;
 
+mod settings;
+pub use settings::ShadowSettings;
+
 #[derive(Debug, Error)]
 pub enum ShadowError {
     #[error("io: {0}")]
@@ -173,6 +176,8 @@ pub struct ShadowConfig {
     /// `walshadow.so` is missing still starts. Preloading a library PG cannot
     /// resolve is a startup failure, not a warning
     pub bridge: Option<BridgeConf>,
+    /// `[shadow]` settings, written ahead of the ones walshadow owns
+    pub settings: ShadowSettings,
 }
 
 impl ShadowConfig {
@@ -192,6 +197,7 @@ impl ShadowConfig {
             user: "postgres".to_string(),
             dbname: "postgres".to_string(),
             bridge: None,
+            settings: ShadowSettings::default(),
         }
     }
 
@@ -403,7 +409,8 @@ impl Shadow {
     }
 
     /// Replace data dir config with walshadow settings
-    /// Write base, recovery, and minimum GUC settings to `postgresql.conf`
+    /// Write `[shadow]`, base, recovery, and minimum GUC settings to
+    /// `postgresql.conf`
     /// Empty `postgresql.auto.conf` so source `ALTER SYSTEM` settings from
     /// BASE_BACKUP cannot override them. Allow trusted socket connections
     /// in `pg_hba.conf` and empty `pg_ident.conf`
@@ -421,6 +428,7 @@ impl Shadow {
             .expect("non-utf8 filter_out_dir");
         let mut conf = format!(
             "# walshadow-owned conf, regenerated each boot\n\
+             {settings}\
              hot_standby = on\n\
              wal_level = replica\n\
              autovacuum = off\n\
@@ -429,9 +437,6 @@ impl Shadow {
              listen_addresses = ''\n\
              unix_socket_directories = '{sock}'\n\
              port = {port}\n\
-             shared_buffers = 256MB\n\
-             max_wal_size = 512MB\n\
-             min_wal_size = 128MB\n\
              max_connections = {max_connections}\n\
              max_worker_processes = {max_worker_processes}\n\
              max_wal_senders = {max_wal_senders}\n\
@@ -440,6 +445,7 @@ impl Shadow {
              restore_command = 'cp {filter_dir}/%f %p'\n\
              recovery_target_timeline = 'latest'\n\
              wal_retrieve_retry_interval = '100ms'\n",
+            settings = self.config.settings.conf_text(),
             sock = self.config.socket_str(),
             port = self.config.port,
             max_connections = floor.max_connections,
@@ -1162,19 +1168,57 @@ mod tests {
         assert!(data_dir.join("pg_ident.conf").exists());
     }
 
+    /// Every line walshadow writes is one `[shadow]` cannot override, and
+    /// every `[shadow]` setting lands once with its value, whatever the
+    /// bridge and walsender
     #[test]
-    fn materialize_conf_skips_conninfo_when_absent() {
+    fn materialize_conf_writes_each_setting_once() {
         let tmp = tempfile::tempdir().unwrap();
         let data_dir = tmp.path().join("data");
         fs::create_dir_all(&data_dir).unwrap();
-        let cfg = ShadowConfig::new(data_dir.clone(), tmp.path().join("filtered"));
-        let shadow = Shadow::new(cfg);
-        shadow
-            .materialize_conf(&SourceGucFloor::default(), None)
-            .unwrap();
-        let conf = fs::read_to_string(data_dir.join("postgresql.conf")).unwrap();
-        assert!(!conf.contains("primary_conninfo"), "{conf}");
-        assert!(conf.contains("restore_command"), "{conf}");
+        let overrides = "shared_buffers = \"1GB\"\nwal_init_zero = true\n\
+                         checkpoint_timeout = \"15min\"\n\"ext.knob\" = 500";
+        let mut lib_bridge = BridgeConf::in_dir(tmp.path());
+        lib_bridge.library_dir = Some(tmp.path().join("lib"));
+        for settings in [
+            ShadowSettings::default(),
+            ShadowSettings::parse(&overrides.parse().unwrap()).unwrap(),
+        ] {
+            for bridge in [
+                None,
+                Some(BridgeConf::in_dir(tmp.path())),
+                Some(lib_bridge.clone()),
+            ] {
+                for conninfo in [None, Some("host=127.0.0.1 port=5441 user=walshadow")] {
+                    let mut cfg = ShadowConfig::new(data_dir.clone(), tmp.path().join("filtered"));
+                    cfg.settings = settings.clone();
+                    cfg.bridge = bridge.clone();
+                    Shadow::new(cfg)
+                        .materialize_conf(&SourceGucFloor::default(), conninfo)
+                        .unwrap();
+                    let conf = fs::read_to_string(data_dir.join("postgresql.conf")).unwrap();
+                    let mut seen = std::collections::BTreeSet::new();
+                    for line in conf
+                        .lines()
+                        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                    {
+                        let (name, value) = line.split_once(" = ").unwrap();
+                        assert!(seen.insert(name), "{name} twice in\n{conf}");
+                        match settings.iter().find(|(k, _)| *k == name) {
+                            Some((_, v)) => assert_eq!(value, format!("'{v}'")),
+                            None => {
+                                let entry = toml::Table::from_iter([(name.into(), "x".into())]);
+                                let refused = ShadowSettings::parse(&entry)
+                                    .is_err_and(|e| e.contains("walshadow sets this"));
+                                assert!(refused, "[shadow] can override {name}");
+                            }
+                        }
+                    }
+                    assert_eq!(seen.contains("primary_conninfo"), conninfo.is_some());
+                    assert!(settings.iter().all(|(k, _)| seen.contains(k)), "{conf}");
+                }
+            }
+        }
     }
 
     #[test]

@@ -249,6 +249,9 @@ pub struct EmitterConfig {
     /// Boot-only, CLI overrides TOML
     pub bootstrap: BootstrapSettings,
     pub toast: ToastSettings,
+    /// `[shadow]`: managed shadow `postgresql.conf` settings, applied when
+    /// walshadow starts it
+    pub shadow: crate::shadow::ShadowSettings,
 }
 
 /// Choose bootstrap source for empty shadow data dir
@@ -640,6 +643,8 @@ struct ConfigDocument {
     bootstrap: BootstrapSettings,
     #[serde(default)]
     toast: ToastSettings,
+    #[serde(default)]
+    shadow: toml::Table,
     /// `[namespace.<schema>]`
     #[serde(default)]
     namespace: BTreeMap<String, NamespacePatch>,
@@ -1053,6 +1058,7 @@ impl EmitterConfig {
             backup: None,
             bootstrap: BootstrapSettings::default(),
             toast: ToastSettings::default(),
+            shadow: Default::default(),
         }
     }
 
@@ -1163,6 +1169,8 @@ impl EmitterConfig {
         }
         out.bootstrap = doc.bootstrap;
         out.toast = doc.toast;
+        out.shadow =
+            crate::shadow::ShadowSettings::parse(&doc.shadow).map_err(EmitterError::Config)?;
         let mut buckets = doc.database;
         if let Some(db) = buckets.keys().next()
             && default_db.is_empty()
@@ -5403,6 +5411,8 @@ mod tests {
             "[namespace.sales]\ndrop_table_strategy = \"dorp\"\n",
             "[table.public.orders]\ninitial_load = \"cpoy\"\n",
             "[table.public.orders]\nmatch = \"like\"\n",
+            "[shadow]\nfsync = false\n",
+            "[shadow]\nshared_buffers = \"4gb\"\n",
         ] {
             EmitterConfig::from_toml_str(src).expect_err(src);
         }

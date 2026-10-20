@@ -68,7 +68,8 @@ replacing `.toml` with `.d`, for example `ch-config.d/*.toml`
 
 Invalid values and incompatible mapping fields fail validation instead of
 falling back silently. Unknown keys in `[table.*]`, `[namespace.*]`, and
-`[database.*]` are errors; other sections ignore them, so check spelling there
+`[database.*]` are errors, and shadow refuses to start on a `[shadow]` key
+PostgreSQL does not know; other sections ignore them, so check spelling there
 when a setting has no effect
 
 ## Precedence
@@ -143,6 +144,8 @@ Require restart:
 - soft-delete mode and TOAST buffering settings
 - worker-pool sizes and memory limits
 - backup and shadow bootstrap choices
+- `[shadow]` PostgreSQL settings, see
+  [Shadow PostgreSQL settings](#shadow-postgresql-settings)
 
 Run `walshadow-stream --help` for process and recovery flags. Run
 `walshadow-stream ctl help` for live-control commands
@@ -329,6 +332,88 @@ Live byte-budget reductions lower flush thresholds; increasing sealed-buffer
 capacity requires restarting walshadow
 
 `walshadow_process_threads` reports OS threads
+
+## Shadow PostgreSQL settings
+
+walshadow rewrites managed shadow's `postgresql.conf` and empties
+`postgresql.auto.conf` each time it starts shadow, so `ALTER SYSTEM` on shadow
+does not survive a restart. Set shadow settings in `[shadow]` instead. Keys are
+PostgreSQL setting names; values are strings, numbers, or booleans
+
+```toml
+[shadow]
+shared_buffers = "4GB"
+max_wal_size = "16GB"
+checkpoint_timeout = "15min"
+effective_io_concurrency = 64
+```
+
+| `[shadow]` setting | Default | PostgreSQL default |
+|---|---:|---:|
+| `shared_buffers` | an eighth of memory, 256MB to 8GB | `128MB` |
+| `max_wal_size` | `8GB` | `1GB` |
+| `min_wal_size` | `128MB` | `80MB` |
+| `wal_init_zero` | `off` | `on` |
+| `wal_recycle` | `on` | `on` |
+
+Other settings pass through. walshadow rejects names that are not lowercase
+setting names, and requires a unit on `shared_buffers`, `max_wal_size`,
+`min_wal_size`, and `checkpoint_timeout`, because PostgreSQL reads a bare
+number in each setting's base unit, 8 kB pages for `shared_buffers`. Units are
+case-sensitive: `B`, `kB`, `MB`, `GB`, `TB` and `us`, `ms`, `s`, `min`, `h`,
+`d`. PostgreSQL validates every value when shadow starts, and a rejected value
+fails startup with shadow's log in the error
+
+walshadow refuses settings it derives itself: `hot_standby`, `wal_level`,
+`fsync`, `full_page_writes`, `autovacuum`, `listen_addresses`,
+`unix_socket_directories`, `port`, `restore_command`,
+`wal_retrieve_retry_interval`, `shared_preload_libraries`,
+`dynamic_library_path`, the `max_connections`, `max_worker_processes`,
+`max_wal_senders`, `max_prepared_transactions`, and `max_locks_per_transaction`
+values source requires, any name starting with `primary_`, `recovery_`, or
+`walshadow.`, and `config_file`, `data_directory`, `hba_file`, `ident_file`,
+and the `include` directives
+
+Settings apply when walshadow starts or restarts shadow. A shadow adopted with
+`--keep-shadow-running` keeps its running settings until it restarts
+
+### WAL writes
+
+Shadow writes every WAL byte walshadow streams to it. With `wal_init_zero = on`
+PostgreSQL first zero-fills each new 16 MiB segment, doubling those writes
+whenever no recycled segment is ready. `off` writes only each segment's last
+byte, so the filesystem allocates blocks as WAL arrives. On ext4 and XFS this
+stays crash-safe, because `fdatasync` makes the allocation durable with the
+data; a full disk then fails a WAL write instead of a segment's creation.
+Allocating as WAL arrives adds some write latency, which can show in TOAST
+reads on a disk with spare bandwidth; once disk bandwidth is the limit, the
+doubled writes cost far more. Set `wal_init_zero = true` where disk bandwidth
+is plentiful or space must be reserved ahead. On copy-on-write filesystems
+such as ZFS and btrfs also set `wal_recycle = false`
+
+Shadow can only recycle a segment within `max_wal_size` of its last
+restartpoint, and it can only restart at a checkpoint replayed from source.
+With a small budget, a backlog drains past that window, so restartpoints
+remove old segments and every new one is created. Each restartpoint triggered
+by WAL volume also writes out dirty buffers, up to `shared_buffers`. The 8 GB
+default cuts how often that happens when WAL arrives fast and leaves
+restartpoints to `checkpoint_timeout` below about 14 MB/s of WAL. `pg_wal` can
+grow to about `max_wal_size` under sustained WAL, more when source checkpoints
+are rare, so leave that room on shadow's disk. A larger value also lengthens
+shadow crash recovery, which replays WAL since the last restartpoint
+
+### Shadow memory
+
+In `shadow` value mode, shadow serves TOAST reads and holds the TOAST pages
+replay writes, so buffers that miss cost both reads and evictions of dirty
+pages. The `shared_buffers` default takes an eighth of the cgroup memory
+limit, or of host memory without one, from 256MB up to 8GB. Like
+`[memory] resident_payload_max`, which takes half by default, it assumes a
+dedicated host or container; set both explicitly in shared environments. A
+shadow that holds only catalogs touches few buffers and leaves the rest
+unallocated, unless the host has free huge pages, which PostgreSQL then
+reserves for all of `shared_buffers`. Raise `max_wal_size` with
+`shared_buffers`: a restartpoint can write all of it
 
 ## Backup archive
 

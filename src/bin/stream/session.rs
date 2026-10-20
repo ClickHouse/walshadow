@@ -60,7 +60,7 @@ use crate::metrics_publish::{
 use crate::runtime_cfg::{or_signal, sighup_reload};
 use crate::shadow_proc::{
     OwnedShadow, ShadowLifecycle, bridge_pool_size, build_owned_shadow, open_shadow_sql_client,
-    probe_blocking, start_owned_shadow, walsender_primary_conninfo,
+    probe_blocking, shadow_settings, start_owned_shadow, walsender_primary_conninfo,
 };
 use crate::sinks::{DaemonSinks, DecoderXactPair};
 use crate::source_db::{
@@ -234,6 +234,7 @@ pub(crate) async fn run_session(
         walshadow::filter::shadow_relations::ShadowRelations::load(dir).await?;
     }
     let bridge_workers = bridge_pool_size(ch_config.as_ref());
+    let shadow_settings = shadow_settings(ch_config.as_ref());
     // Slot before bootstrap
     if let Some(slot) = source_conn.slot.as_deref() {
         feed.ensure_physical_slot(slot)
@@ -311,6 +312,7 @@ pub(crate) async fn run_session(
                     &source_databases,
                     shadow_start.data_dir().to_path_buf(),
                     bridge_workers,
+                    &shadow_settings,
                 ),
                 args.keep_shadow_running,
             );
@@ -359,6 +361,7 @@ pub(crate) async fn run_session(
                 &substituted,
                 shadow_start.data_dir().to_path_buf(),
                 bridge_workers,
+                &shadow_settings,
             ),
             args.keep_shadow_running,
         );

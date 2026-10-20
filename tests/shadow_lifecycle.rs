@@ -26,7 +26,7 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use walrus::pg::wal::segment::is_wal_filename;
-use walshadow::shadow::{ResumeOutcome, Shadow, ShadowConfig, SourceGucFloor};
+use walshadow::shadow::{ResumeOutcome, Shadow, ShadowConfig, ShadowSettings, SourceGucFloor};
 
 fn make_shadow(tmp: &tempfile::TempDir, port: u16) -> Shadow {
     let mut cfg = ShadowConfig::new(tmp.path().join("data"), tmp.path().join("filtered"));
@@ -76,7 +76,15 @@ fn standby_mode_lifecycle() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
-    let shadow = make_shadow(&tmp, ports::PG_SHADOW_PORT);
+    let mut cfg = make_shadow(&tmp, ports::PG_SHADOW_PORT).config().clone();
+    cfg.settings = ShadowSettings::parse(
+        &"shared_buffers = \"64MB\"\ncheckpoint_timeout = \"15min\"\n\
+          effective_io_concurrency = 64\ncluster_name = \"it's a\\\\b\""
+            .parse()
+            .unwrap(),
+    )
+    .unwrap();
+    let shadow = Shadow::new(cfg);
 
     shadow.initdb().expect("initdb");
     shadow.write_base_conf().expect("write conf");
@@ -117,6 +125,11 @@ fn standby_mode_lifecycle() {
         .wait_for_replay(0, Duration::from_secs(30))
         .expect("wait_for_replay");
     eprintln!("standby replay LSN: {:#X}", lsn);
+
+    for (name, value) in shadow.config().settings.iter() {
+        let live = shadow.probe_one(&format!("SHOW {name}")).expect("SHOW");
+        assert_eq!(live, value, "{name}");
+    }
 
     let h = shadow.health().expect("health post");
     assert!(h.in_recovery, "standby.signal cluster must be in recovery");
