@@ -28,7 +28,9 @@ pub(crate) struct ShadowMetricsView {
     /// yet, so the gauges keep their last value
     pub(crate) apply_lag: Option<(u64, f64)>,
     pub(crate) active_connections: u64,
-    pub(crate) dropped_total: u64,
+    pub(crate) socket_events: [u64; walshadow::shadow_stream::SocketEvent::COUNT],
+    pub(crate) backfill_bytes_total: u64,
+    pub(crate) send_queue_bytes: u64,
 }
 
 /// Apply lag against the source head. A zero `shadow_replay` means no walreceiver
@@ -313,7 +315,9 @@ pub(crate) async fn populate_metrics(
         shadow_apply_lag_bytes: apply_lag_bytes,
         shadow_apply_lag_seconds: apply_lag_seconds,
         shadow_stream_active_connections: shadow_view.active_connections,
-        shadow_stream_dropped_connections_total: shadow_view.dropped_total,
+        shadow_stream_sockets_by_event: shadow_view.socket_events,
+        wal_bytes: [shadow_view.backfill_bytes_total],
+        buffer_bytes: [shadow_view.send_queue_bytes],
         ..registry.snapshot().await
     };
     populate_pipeline_metrics(

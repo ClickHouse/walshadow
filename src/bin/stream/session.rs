@@ -1415,7 +1415,7 @@ async fn session_body(
                  holds require a live wire — point shadow's primary_conninfo here \
                  or raise --walsender-connect-timeout",
                 args.walsender_connect_timeout,
-                agg.accepted_total,
+                agg.accepted(),
             );
             or_signal(shutdown, async {
                 tokio::time::sleep(Duration::from_millis(100)).await;
@@ -2289,7 +2289,9 @@ async fn session_body(
             ShadowMetricsView {
                 apply_lag,
                 active_connections: shadow_agg.active_connections as u64,
-                dropped_total: shadow_agg.dropped_total,
+                socket_events: shadow_agg.socket_events,
+                backfill_bytes_total: shadow_agg.backfill_bytes_total,
+                send_queue_bytes: shadow_agg.send_queue_bytes,
             },
             &boundary_hold_stats,
             metrics_dbs.iter().map(DbMetricSources::series).collect(),
