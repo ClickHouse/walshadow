@@ -41,7 +41,7 @@ expected siblings is too narrow.
 
 | Family | Labels | Members today | Expected members |
 |---|---|---|---|
-| `position_lsn` | `at` | source_head, received, filter, decoder_commit, ack, shadow_replay, floor, pause_consumed, pause_received, promotion_target_replay, promotion_target_receive, timeline_switch | complete |
+| `position_lsn` | `at` | source_head, received, filter, decoder_commit, ack, shadow_replay, floor, pause_consumed, pause_received, promotion_target_replay, promotion_target_receive, timeline_switch, catalog_boundary_stalled | complete |
 | `commit_timestamp_seconds` | `at` | source, ack | shadow_replay once the pump keeps an LSN→commit-time ring |
 | `source_mode` | `mode` | the six one-hot states, `initial_load` included | complete |
 | `stage_active`, `stage_seconds_total`, `stage_completed_total`, `stage_interrupted_total` | `stage`, `title`, `order` | ten stages | copy and publish phases as the table backfill grows |

@@ -41,6 +41,25 @@ toward `source_received`. Short differences are expected while batches flush
 
 ## Monitor with Prometheus and Grafana
 
+WAL positions are one family, `walshadow_position_lsn{at}`, all from
+walshadow's own view and all written in one status tick:
+
+| `at` | Meaning |
+|---|---|
+| `source_head` | newest `server_wal_end` heard from the source socket; present only while `walshadow_source_mode{mode="streaming"}` is 1: archive catch-up, reconnects, pauses and timeline crossings leave it out, and so does a fresh connection until its first message. After a pause or a crossing on the same connection it shows the previous head until the next message |
+| `received` | the further of the reported source head and the pump's dispatch frontier (what the pump has pushed into the decode queue), not WAL held locally |
+| `filter`, `decoder_commit`, `ack` | filter dispatch, highest drained commit, and ClickHouse ack positions |
+| `shadow_replay`, `floor` | shadow Postgres replay position and the durable resume floor |
+| `pause_consumed`, `pause_received`, `promotion_target_replay`, `promotion_target_receive`, `timeline_switch` | present only during a pause, a promotion check, or after a timeline crossing |
+| `catalog_boundary_stalled` | replay target of a catalog boundary the shadow has not reached; present only while one is stalled |
+
+A member is absent while its position is unknown. Because every member comes
+from the same tick, `walshadow_position_lsn{at="source_head"} - ignoring(at)
+walshadow_position_lsn{at="ack"}` has no scrape skew, while subtracting the ack from a
+primary LSN scraped elsewhere shows a sawtooth at high WAL rates. A gap in
+`source_head` means walshadow cannot see the source head, not that it has
+caught up.
+
 Set `--metrics-bind` to expose OpenMetrics text metrics, which Prometheus
 scrapes directly. Counter series carry `_total`. Docker deployment uses port
 9484 and includes optional provisioned dashboard
