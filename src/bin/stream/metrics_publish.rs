@@ -21,7 +21,7 @@ use crate::source_recovery::{PromotionGate, SOURCE_SWAP_RETRY};
 
 /// Shadow-side numbers for the metrics publish step, from
 /// [`ShadowStreamState::aggregate`](walshadow::shadow_stream::ShadowStreamState::aggregate)
-/// + the daemon's [`RateEstimator`](walshadow::metrics::RateEstimator).
+/// + the daemon's [`RateEstimator`].
 pub(crate) struct ShadowMetricsView {
     /// `(bytes, seconds)`, `None` while the shadow has reported no apply LSN
     /// yet, so the gauges keep their last value
