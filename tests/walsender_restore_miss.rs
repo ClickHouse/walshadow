@@ -101,7 +101,7 @@ async fn restore_miss_below_the_backfill_never_panics_shadow() {
     let mut tail = Some(tail);
     loop {
         let agg = state.lock().await.aggregate();
-        if agg.accepted_total > 0 && !sealed.exists() {
+        if agg.accepted() > 0 && !sealed.exists() {
             std::fs::copy(src_wal.join(segment_name(missed)), &sealed).unwrap();
         }
         if agg.active_connections > 0

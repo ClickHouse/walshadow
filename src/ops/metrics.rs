@@ -37,6 +37,7 @@ use crate::catalog::pending::DegradeReason;
 use crate::decode::heap_decoder::HEAP_OP_LABELS;
 use crate::ops::bridge::{OP_COUNT, OP_LABELS};
 use crate::pos::{Drain, EmitterAck, FilterDispatched, Floor, Pos, ShadowReplay, SourceReceived};
+use crate::source::shadow_stream::SocketEvent;
 use crate::source::transition::SWITCH_FAILURE_REASONS;
 
 #[macro_export]
@@ -96,6 +97,18 @@ macro_rules! label_class {
             }
         }
     };
+}
+
+label_class! {
+    pub enum WalFlow {
+        WalsenderBackfill => "walsender_backfill",
+    }
+}
+
+label_class! {
+    pub enum Buffer {
+        WalsenderSendQueue => "walsender_send_queue",
+    }
 }
 
 label_class! {
@@ -293,6 +306,11 @@ snapshot! {
         /// Failures by [`ErrorKind`], rendered
         /// `walshadow_errors_total{component,kind}`
         errors: [u64; ErrorKind::COUNT],
+        /// Postgres data moved, by [`WalFlow`], rendered
+        /// `walshadow_wal_bytes_total{flow}`
+        wal_bytes: [u64; WalFlow::COUNT],
+        /// Data held, by [`Buffer`], rendered `walshadow_buffer_bytes{buffer}`
+        buffer_bytes: [u64; Buffer::COUNT],
         /// Refusal a crossing parked on, rendered as `crossing_wedged`. The
         /// pump keeps publishing rather than exiting into a restart that
         /// re-crosses and re-fails, so this is how the daemon says it is
@@ -598,9 +616,9 @@ snapshot! {
         "Estimated seconds shadow trails source, by source byte rate over last 30s.",
     gauge shadow_stream_active_connections: u64 =
         "Currently-attached walreceiver connections to walshadow's walsender.",
-    /// Cumulative connections dropped by `slow_threshold` overflow
-    counter shadow_stream_dropped_connections_total: u64 =
-        "Connections dropped by slow-client cutoff since daemon start.",
+    counter shadow_stream_sockets_by_event: [u64; SocketEvent::COUNT]
+        ["event" = SocketEvent::LABELS] =
+        "Walsender socket lifecycle events: accepted (entered the handshake, START_REPLICATION or not), closed_slow_client (dropped at the send queue cap), closed_by_client (clean hangup), closed_error (handshake, I/O, protocol failure or refused START_REPLICATION). accepted minus the closed events is sockets alive.",
     counter catalog_boundary_holds_total: u64 =
         "Publication holds released at catalog-mutating commit boundaries.",
     counter catalog_boundary_hold_failures_total: u64 =
@@ -1100,6 +1118,26 @@ fn encode_snapshot(snap: &MetricsSnapshot, enc: &mut DescriptorEncoder<'_>) -> f
         ErrorKind::ALL
             .into_iter()
             .map(|e| (e.pair(), snap.errors[e.index()])),
+    )?;
+
+    counter_series(
+        enc,
+        "walshadow_wal_bytes_total",
+        "Postgres data moved, by flow. walsender_backfill is WAL replayed from the retained wire buffer to a reconnecting shadow walreceiver.",
+        "flow",
+        WalFlow::ALL
+            .into_iter()
+            .map(|f| (f.label(), snap.wal_bytes[f.index()])),
+    )?;
+
+    gauge_series(
+        enc,
+        "walshadow_buffer_bytes",
+        "Data held right now, by buffer. walsender_send_queue is the largest unsent walsender queue across connections, read against the slow-client cap.",
+        "buffer",
+        Buffer::ALL
+            .into_iter()
+            .map(|b| (b.label(), snap.buffer_bytes[b.index()])),
     )?;
 
     counter_pairs(
@@ -1622,7 +1660,9 @@ mod tests {
             shadow_apply_lag_bytes: 12345,
             shadow_apply_lag_seconds: 1.23456,
             shadow_stream_active_connections: 2,
-            shadow_stream_dropped_connections_total: 5,
+            shadow_stream_sockets_by_event: [9, 5, 3, 1],
+            wal_bytes: [4096],
+            buffer_bytes: [777],
             ..MetricsSnapshot::default()
         };
         let body = render(snap);
@@ -1635,9 +1675,19 @@ mod tests {
         assert!(body.contains("# HELP walshadow_shadow_stream_active_connections"));
         assert!(body.contains("# TYPE walshadow_shadow_stream_active_connections gauge"));
         assert!(body.contains("walshadow_shadow_stream_active_connections 2"));
-        assert!(body.contains("# HELP walshadow_shadow_stream_dropped_connections"));
-        assert!(body.contains("# TYPE walshadow_shadow_stream_dropped_connections counter"));
-        assert!(body.contains("walshadow_shadow_stream_dropped_connections_total 5"));
+        assert!(body.contains("# TYPE walshadow_shadow_stream_sockets counter"));
+        assert!(body.contains("walshadow_shadow_stream_sockets_total{event=\"accepted\"} 9"));
+        assert!(
+            body.contains("walshadow_shadow_stream_sockets_total{event=\"closed_slow_client\"} 5")
+        );
+        assert!(
+            body.contains("walshadow_shadow_stream_sockets_total{event=\"closed_by_client\"} 3")
+        );
+        assert!(body.contains("walshadow_shadow_stream_sockets_total{event=\"closed_error\"} 1"));
+        assert!(body.contains("# TYPE walshadow_wal_bytes counter"));
+        assert!(body.contains("walshadow_wal_bytes_total{flow=\"walsender_backfill\"} 4096"));
+        assert!(body.contains("# TYPE walshadow_buffer_bytes gauge"));
+        assert!(body.contains("walshadow_buffer_bytes{buffer=\"walsender_send_queue\"} 777"));
     }
 
     /// Unknown rate stays infinite on the wire. prometheus-client spells it
