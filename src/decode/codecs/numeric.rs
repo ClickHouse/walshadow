@@ -151,7 +151,7 @@ pub fn decode_numeric(body: &[u8]) -> Result<NumericKind, CodecError> {
             dscale,
             digits,
         } => {
-            let mut out = String::with_capacity(numeric_text_len(weight, dscale));
+            let mut out = String::with_capacity(finite_text_len(neg, weight, dscale, digits));
             render_numeric(neg, weight, dscale, digits, &mut out);
             Ok(NumericKind::Finite(out))
         }
@@ -173,10 +173,42 @@ pub(crate) fn render_numeric_text(body: &[u8], out: &mut String) -> Result<(), C
     Ok(())
 }
 
-/// `get_str_from_var`'s own sizing: sign, the integer groups, point, `dscale`
-fn numeric_text_len(weight: i32, dscale: i32) -> usize {
-    let int_chars = ((weight + 1) * 4).max(1);
-    (int_chars + dscale) as usize + 6
+/// [`decode_numeric`] text length without rendering
+pub fn numeric_text_len(body: &[u8]) -> Result<usize, CodecError> {
+    Ok(match parse_numeric(body)? {
+        Numeric::Special(kind) => kind.as_text().len(),
+        Numeric::Finite {
+            neg,
+            weight,
+            dscale,
+            digits,
+        } => finite_text_len(neg, weight, dscale, digits),
+    })
+}
+
+/// [`render_numeric`] length: sign, integer digits, point, `dscale`
+fn finite_text_len(neg: bool, weight: i32, dscale: i32, digits: &[[u8; 2]]) -> usize {
+    let int_chars = match usize::try_from(weight) {
+        Ok(weight) => 4 - lead_zeros(&digit_group(digits, 0)) + 4 * weight,
+        Err(_) => 1,
+    };
+    let frac_chars = if dscale > 0 { 1 + dscale as usize } else { 0 };
+    usize::from(neg) + int_chars + frac_chars
+}
+
+/// Group `d` as 4 decimal chars. Digits past stored ones read as zero, as do
+/// negative indexes a negative weight asks of the fraction
+fn digit_group(digits: &[[u8; 2]], d: i32) -> [u8; 4] {
+    let dig = usize::try_from(d)
+        .ok()
+        .and_then(|i| digits.get(i))
+        .map_or(0, |raw| i16::from_le_bytes(*raw).max(0) as u16);
+    dec_digits(dig)
+}
+
+/// Leading group prints unpadded, so all but its last zero drops
+fn lead_zeros(lead: &[u8; 4]) -> usize {
+    lead.iter().take(3).take_while(|&&c| c == b'0').count()
 }
 
 /// 4 decimal chars for one base-10000 `NumericDigit` (DEC_DIGITS == 4)
@@ -197,15 +229,7 @@ fn push_ascii(out: &mut String, chars: &[u8]) {
 
 /// Mirrors `get_str_from_var` in `numeric.c` (DEC_DIGITS == 4 branch)
 fn render_numeric(neg: bool, weight: i32, dscale: i32, digits: &[[u8; 2]], out: &mut String) {
-    // digits past the stored ones read as zero, as do the negative indexes a
-    // negative weight asks of the fraction
-    let group = |d: i32| -> [u8; 4] {
-        let dig = usize::try_from(d)
-            .ok()
-            .and_then(|i| digits.get(i))
-            .map_or(0, |raw| i16::from_le_bytes(*raw).max(0) as u16);
-        dec_digits(dig)
-    };
+    let group = |d: i32| digit_group(digits, d);
 
     if neg {
         out.push('-');
@@ -214,10 +238,8 @@ fn render_numeric(neg: bool, weight: i32, dscale: i32, digits: &[[u8; 2]], out: 
     if weight < 0 {
         out.push('0');
     } else {
-        // leading group prints unpadded, so all but its last zero drops
         let lead = group(0);
-        let zeros = lead.iter().take(3).take_while(|&&c| c == b'0').count();
-        push_ascii(out, &lead[zeros..]);
+        push_ascii(out, &lead[lead_zeros(&lead)..]);
         for d in 1..=weight {
             push_ascii(out, &group(d));
         }
@@ -374,6 +396,32 @@ mod tests {
             decode_numeric(&body).unwrap(),
             NumericKind::Finite("5.0000".into())
         );
+    }
+
+    #[test]
+    fn numeric_text_len_matches_render() {
+        let bodies = [
+            short_numeric(false, 0, 0, &[42]),
+            short_numeric(true, 0, 0, &[7]),
+            short_numeric(false, 0, 1, &[1, 5000]),
+            short_numeric(false, 0, 0, &[]),
+            short_numeric(false, -1, 1, &[5000]),
+            short_numeric(true, -2, 6, &[12]),
+            short_numeric(false, 0, 4, &[5]),
+            long_numeric(false, 1, 0, &[1, 2345]),
+            long_numeric(false, 2, 0, &[1]),
+            long_numeric(true, 0, 0, &[9999]),
+            NUMERIC_NAN.to_le_bytes().to_vec(),
+            NUMERIC_NINF.to_le_bytes().to_vec(),
+        ];
+        for body in bodies {
+            let text = decode_numeric(&body).unwrap();
+            assert_eq!(
+                numeric_text_len(&body),
+                Ok(text.as_text().len()),
+                "{text:?}"
+            );
+        }
     }
 
     #[test]

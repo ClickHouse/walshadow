@@ -153,7 +153,11 @@ async fn unchanged_toast_pointer_resolves_out_of_shadow() {
             app_name: "walshadow-toast-shadow-backend",
             ddl: None,
         },
-        |cfg| cfg.toast.mode = ToastMode::Shadow,
+        |cfg| {
+            cfg.toast.mode = ToastMode::Shadow;
+            // Pin foreground reads to exercise generation checks
+            cfg.toast.read_ahead = Some(false);
+        },
         Some(oracle),
     )
     .await;

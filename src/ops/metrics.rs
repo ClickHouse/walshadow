@@ -327,6 +327,10 @@ snapshot! {
         "Store fetch round trips. Against toast_values_fetched_total this is values per query, the deferred-resolution batching factor.",
     counter toast_value_fetch_seconds: f64 =
         "Cumulative wall-clock inside chunk-store fetches. Divided by toast_value_fetch_batches_total this is per-query latency.",
+    counter toast_values_read_ahead_total: u64 =
+        "Values read from the store ahead of planning, off the serial path. The fetch counters include these reads.",
+    counter toast_value_wait_seconds: f64 =
+        "Cumulative wall-clock planning spent waiting on values read ahead of it, apart from the store time those reads count in toast_value_fetch_seconds.",
     counter toast_image_rows_mirrored_total: u64 =
         "Chunk rows mirrored from restored page images during a backup window; non-zero means the backup copied TOAST pages mid-write.",
     counter toast_values_filled_superseded_total: u64 =

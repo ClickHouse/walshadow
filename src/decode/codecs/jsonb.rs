@@ -10,7 +10,10 @@
 //! Only the root may carry `JB_FSCALAR`, PG's shape for a bare scalar: a
 //! one-element array printed without its brackets.
 
-use super::{CodecError, numeric::render_numeric_text};
+use super::{
+    CodecError,
+    numeric::{numeric_text_len, render_numeric_text},
+};
 
 const JB_CMASK: u32 = 0x0FFF_FFFF;
 const JB_FSCALAR: u32 = 0x1000_0000;
@@ -30,9 +33,74 @@ const JSONB_MAX_DEPTH: usize = 1000;
 
 /// Decode `jsonb` varlena body to PG `jsonb_out` text (`JsonbToCString`)
 pub fn decode_jsonb(body: &[u8]) -> Result<String, CodecError> {
-    let mut out = String::with_capacity(body.len());
+    decode_jsonb_with_capacity(body, body.len())
+}
+
+/// [`decode_jsonb`] into a buffer sized by [`jsonb_text_len`]
+pub fn decode_jsonb_with_capacity(body: &[u8], capacity: usize) -> Result<String, CodecError> {
+    let mut out = String::with_capacity(capacity);
     render_jsonb_container(body, 0, &mut out)?;
     Ok(out)
+}
+
+/// [`decode_jsonb`] length without rendering. Text may outgrow its body,
+/// escapes take up to six bytes
+pub fn jsonb_text_len(body: &[u8]) -> Result<usize, CodecError> {
+    let mut len = TextLen(0);
+    render_jsonb_container(body, 0, &mut len)?;
+    Ok(len.0)
+}
+
+trait Out: Sized {
+    fn push_str(&mut self, s: &str) -> Result<(), CodecError>;
+    fn numeric(&mut self, body: &[u8]) -> Result<(), CodecError>;
+
+    fn string(&mut self, raw: &[u8]) -> Result<(), CodecError> {
+        render_jsonb_string(raw, self)
+    }
+}
+
+impl Out for String {
+    fn push_str(&mut self, s: &str) -> Result<(), CodecError> {
+        String::push_str(self, s);
+        Ok(())
+    }
+
+    fn numeric(&mut self, body: &[u8]) -> Result<(), CodecError> {
+        render_numeric_text(body, self)
+    }
+}
+
+struct TextLen(usize);
+
+impl Out for TextLen {
+    fn push_str(&mut self, s: &str) -> Result<(), CodecError> {
+        self.0 += s.len();
+        Ok(())
+    }
+
+    fn numeric(&mut self, body: &[u8]) -> Result<(), CodecError> {
+        self.0 += numeric_text_len(body)?;
+        Ok(())
+    }
+
+    /// Counts in passes that vectorize, most strings escape nothing
+    fn string(&mut self, raw: &[u8]) -> Result<(), CodecError> {
+        let escaped = raw
+            .iter()
+            .filter(|&&b| b < b' ' || b == b'"' || b == b'\\')
+            .count();
+        let wide = if escaped == 0 {
+            0
+        } else {
+            raw.iter()
+                .filter(|&&b| b < b' ' && !matches!(b, 0x8 | 0xc | b'\n' | b'\r' | b'\t'))
+                .count()
+        };
+        // Quotes, then one extra byte per escape and four more per `\u00XX`
+        self.0 += 2 + raw.len() + escaped + 4 * wide;
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -118,7 +186,7 @@ impl Walk<'_> {
 fn render_jsonb_container(
     container: &[u8],
     depth: usize,
-    out: &mut String,
+    out: &mut impl Out,
 ) -> Result<(), CodecError> {
     if depth > JSONB_MAX_DEPTH {
         return Err(CodecError::BadJsonbContainer("nesting past depth bound"));
@@ -136,32 +204,32 @@ fn render_jsonb_container(
         let pairs = n_children / 2;
         let mut keys = jb.walk(0);
         let mut values = jb.walk(pairs);
-        out.push('{');
+        out.push_str("{")?;
         for i in 0..pairs {
             if i > 0 {
-                out.push_str(", ");
+                out.push_str(", ")?;
             }
             let (key_entry, key) = keys.next_child()?;
             if key_entry & JENTRY_TYPEMASK != JENTRY_ISSTRING {
                 return Err(CodecError::BadJsonbContainer("object key is not a string"));
             }
-            render_jsonb_string(&jb.data[key], out)?;
-            out.push_str(": ");
+            out.string(&jb.data[key])?;
+            out.push_str(": ")?;
             let (entry, range) = values.next_child()?;
             render_jsonb_value(entry, jb.data, range, depth, out)?;
         }
-        out.push('}');
+        out.push_str("}")?;
     } else {
         let mut items = jb.walk(0);
-        out.push('[');
+        out.push_str("[")?;
         for i in 0..n_children {
             if i > 0 {
-                out.push_str(", ");
+                out.push_str(", ")?;
             }
             let (entry, range) = items.next_child()?;
             render_jsonb_value(entry, jb.data, range, depth, out)?;
         }
-        out.push(']');
+        out.push_str("]")?;
     }
     Ok(())
 }
@@ -171,7 +239,7 @@ fn render_jsonb_value(
     data: &[u8],
     range: std::ops::Range<usize>,
     depth: usize,
-    out: &mut String,
+    out: &mut impl Out,
 ) -> Result<(), CodecError> {
     let (start, end) = (range.start, range.end);
     // PG `fillJsonbValue`: numeric and container children start `INTALIGN`ed,
@@ -181,7 +249,7 @@ fn render_jsonb_value(
             .ok_or(CodecError::BadJsonbContainer("aligned child past end"))
     };
     match entry & JENTRY_TYPEMASK {
-        JENTRY_ISSTRING => render_jsonb_string(&data[start..end], out)?,
+        JENTRY_ISSTRING => out.string(&data[start..end])?,
         JENTRY_ISNUMERIC => {
             // Whole `Numeric` datum, 4-byte varlena header included: PG
             // detoasts before storing, so the header is never the short form
@@ -189,11 +257,11 @@ fn render_jsonb_value(
             let body = datum
                 .get(4..)
                 .ok_or(CodecError::BadJsonbContainer("numeric child past end"))?;
-            render_numeric_text(body, out)?;
+            out.numeric(body)?;
         }
-        JENTRY_ISBOOL_TRUE => out.push_str("true"),
-        JENTRY_ISBOOL_FALSE => out.push_str("false"),
-        JENTRY_ISNULL => out.push_str("null"),
+        JENTRY_ISBOOL_TRUE => out.push_str("true")?,
+        JENTRY_ISBOOL_FALSE => out.push_str("false")?,
+        JENTRY_ISNULL => out.push_str("null")?,
         JENTRY_ISCONTAINER => render_jsonb_container(aligned()?, depth + 1, out)?,
         _ => return Err(CodecError::BadJsonbContainer("unknown child type")),
     }
@@ -203,36 +271,36 @@ fn render_jsonb_value(
 /// PG `escape_json_char`: two-character escapes for backspace, form feed,
 /// newline, carriage return, tab, quote and backslash, `\uXXXX` for the rest
 /// below `0x20`, every other byte verbatim
-fn render_jsonb_string(raw: &[u8], out: &mut String) -> Result<(), CodecError> {
+fn render_jsonb_string(raw: &[u8], out: &mut impl Out) -> Result<(), CodecError> {
     let s =
         std::str::from_utf8(raw).map_err(|_| CodecError::BadJsonbContainer("string not utf8"))?;
-    out.push('"');
+    out.push_str("\"")?;
     // escapes are ASCII, so each run between them is a char-boundary slice
     let mut run = 0;
     for (i, b) in s.bytes().enumerate() {
         if b >= b' ' && b != b'"' && b != b'\\' {
             continue;
         }
-        out.push_str(&s[run..i]);
+        out.push_str(&s[run..i])?;
         run = i + 1;
         match b {
-            0x8 => out.push_str("\\b"),
-            0xc => out.push_str("\\f"),
-            b'\n' => out.push_str("\\n"),
-            b'\r' => out.push_str("\\r"),
-            b'\t' => out.push_str("\\t"),
-            b'"' => out.push_str("\\\""),
-            b'\\' => out.push_str("\\\\"),
+            0x8 => out.push_str("\\b")?,
+            0xc => out.push_str("\\f")?,
+            b'\n' => out.push_str("\\n")?,
+            b'\r' => out.push_str("\\r")?,
+            b'\t' => out.push_str("\\t")?,
+            b'"' => out.push_str("\\\"")?,
+            b'\\' => out.push_str("\\\\")?,
             // control byte below 0x20, so one nibble of it is already known
             _ => {
-                out.push_str(if b < 0x10 { "\\u000" } else { "\\u001" });
-                out.push(b"0123456789abcdef"[(b & 0xf) as usize] as char);
+                let hex = (b & 0xf) as usize;
+                out.push_str(if b < 0x10 { "\\u000" } else { "\\u001" })?;
+                out.push_str(&"0123456789abcdef"[hex..=hex])?;
             }
         }
     }
-    out.push_str(&s[run..]);
-    out.push('"');
-    Ok(())
+    out.push_str(&s[run..])?;
+    out.push_str("\"")
 }
 
 #[cfg(test)]
@@ -318,6 +386,20 @@ mod tests {
     fn jsonb_renders_what_pg_jsonb_out_renders() {
         for (hex, want) in JSONB_VECTORS {
             assert_eq!(&decode_jsonb(&varlena_body(hex)).expect(hex), want, "{hex}");
+        }
+    }
+
+    #[test]
+    fn jsonb_text_len_matches_render() {
+        for (hex, want) in JSONB_VECTORS {
+            let body = varlena_body(hex);
+            let len = jsonb_text_len(&body).expect(hex);
+            let text = decode_jsonb_with_capacity(&body, len).expect(hex);
+            assert_eq!(
+                (text.as_str(), text.capacity()),
+                (*want, want.len()),
+                "{hex}"
+            );
         }
     }
 

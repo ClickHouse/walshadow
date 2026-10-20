@@ -11,8 +11,8 @@ mod uuid;
 
 pub use inet::{InetValue, PGSQL_AF_INET, PGSQL_AF_INET6, decode_inet};
 pub use interval::{IntervalValue, decode_interval};
-pub use jsonb::decode_jsonb;
-pub use numeric::{NumericKind, decode_numeric};
+pub use jsonb::{decode_jsonb, decode_jsonb_with_capacity, jsonb_text_len};
+pub use numeric::{NumericKind, decode_numeric, numeric_text_len};
 pub use text_array::decode_text_array;
 pub(crate) use time::{format_time_us, timetz_to_text};
 pub(crate) use uuid::uuid_to_ch_wire;

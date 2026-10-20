@@ -22,6 +22,7 @@ use crate::decode::heap_decoder::{
     ColumnValue, ToastPointer, VARLENA_EXTSIZE_BITS, VARLENA_EXTSIZE_MASK, decompress_varlena,
 };
 use crate::emit::ch_emitter::{EmitterConfig, EmitterStats, InlineValueOverflow, ToastMode};
+use crate::toast::read_ahead::{PendingReads, ReadValue, retained_bytes};
 use crate::xact::spill::{BodyRef, BodySpoolFile, ToastChunk, ToastDelete};
 use ahash::{HashMap, HashMapExt, HashSet, HashSetExt};
 
@@ -124,6 +125,40 @@ pub(crate) fn check_value_caps(
 /// Convert raw TOAST bytes through inline varlena decoder
 pub(crate) fn detoasted_value(raw: Vec<u8>, type_oid: u32) -> ColumnValue {
     crate::decode::heap_decoder::varlena_to_value(type_oid, std::borrow::Cow::Owned(raw))
+}
+
+/// [`detoasted_value`] and bytes it holds, `None` unless `fits` admits decode
+/// peak. JSONB and numeric text may outgrow raw, so measure before rendering
+pub(crate) fn detoasted_within(
+    raw: Vec<u8>,
+    type_oid: u32,
+    fits: impl FnOnce(usize) -> bool,
+) -> Option<(ColumnValue, usize)> {
+    use crate::decode::codecs::{decode_jsonb_with_capacity, jsonb_text_len, numeric_text_len};
+    use crate::schema::{JSONBOID, NUMERICOID};
+    let text_len = match type_oid {
+        JSONBOID => jsonb_text_len(&raw).ok(),
+        NUMERICOID => numeric_text_len(&raw).ok(),
+        _ => None,
+    };
+    if !fits(raw.len().max(text_len.unwrap_or(0))) {
+        return None;
+    }
+    let value = if type_oid == JSONBOID
+        && let Some(len) = text_len
+        && let Ok(text) = decode_jsonb_with_capacity(&raw, len)
+    {
+        ColumnValue::Json(text)
+    } else {
+        detoasted_value(raw, type_oid)
+    };
+    let held = value.approx_bytes();
+    Some((value, held))
+}
+
+/// [`detoasted_within`] for leaf holders, whose retained bytes settle after
+pub(crate) fn detoasted_sized(raw: Vec<u8>, type_oid: u32) -> (ColumnValue, usize) {
+    detoasted_within(raw, type_oid, |_| true).expect("admits every size")
 }
 
 /// Convert stored bytes to raw bytes using pointer compression method
@@ -1113,6 +1148,8 @@ pub struct ToastResolver {
     /// Leaf permits for per-value transients (assembly, decompress, JIT
     /// materialization); `None` = unmetered (serial/metrics-only paths)
     budget: Option<crate::budget::MemoryBudget>,
+    /// Pending reads consumed by commit-ordered planning
+    ahead: Option<Arc<std::sync::Mutex<PendingReads>>>,
 }
 
 impl ToastResolver {
@@ -1126,6 +1163,7 @@ impl ToastResolver {
             inline_value_max: usize::MAX,
             overflow: InlineValueOverflow::default(),
             budget: None,
+            ahead: None,
         }
     }
 
@@ -1186,6 +1224,7 @@ impl ToastResolver {
             inline_value_max: emitter.inline_value_max,
             overflow: emitter.inline_value_overflow,
             budget: None,
+            ahead: None,
         }
     }
 
@@ -1200,6 +1239,7 @@ impl ToastResolver {
             inline_value_max: usize::MAX,
             overflow: InlineValueOverflow::default(),
             budget: None,
+            ahead: None,
         }
     }
 
@@ -1211,10 +1251,127 @@ impl ToastResolver {
         self
     }
 
-    /// Leaf-permit pool, attached at pipeline spawn
+    /// Resident-payload pool, attached at pipeline spawn
     pub fn with_budget(mut self, budget: crate::budget::MemoryBudget) -> Self {
+        self.ahead = None;
         self.budget = Some(budget);
         self
+    }
+
+    pub fn with_read_ahead(mut self) -> Self {
+        self.ahead = None;
+        if self.fill_on_miss() {
+            return self;
+        }
+        let Some(budget) = self.budget.clone() else {
+            return self;
+        };
+        let pending = Arc::new(std::sync::Mutex::new(PendingReads::new(budget.clone())));
+        budget.register_reclaimer(&pending);
+        self.ahead = Some(pending);
+        self
+    }
+
+    fn pending(&self) -> Option<std::sync::MutexGuard<'_, PendingReads>> {
+        Some(self.ahead.as_ref()?.lock().expect("pending reads"))
+    }
+
+    pub fn read_ahead(&self, db_oid: u32, p: ToastPointer, type_oid: u32, lsn: u64) {
+        if self.value_oversize(&p) {
+            return;
+        }
+        let Some(mut pending) = self.pending() else {
+            return;
+        };
+        let budget = pending.budget().clone();
+        // Pending reads own task abort handle, so task must not hold them
+        let this = Self {
+            ahead: None,
+            ..self.clone()
+        };
+        pending.reserve(db_oid, &p, type_oid, lsn, |mut permit| async move {
+            this.stats
+                .toast_values_read_ahead
+                .fetch_add(1, Ordering::Relaxed);
+            let raw = this.read_raw(db_oid, p, lsn).await?;
+            // Rendering may expand past fetch transients
+            let fits = |rendered: usize| {
+                let need = retained_bytes(rendered, &p);
+                if need > permit.bytes() {
+                    let Some(more) = budget.try_speculate((need - permit.bytes()) as usize) else {
+                        return false;
+                    };
+                    permit.absorb(more);
+                }
+                true
+            };
+            let (value, held) = detoasted_within(raw, type_oid, fits)?;
+            permit.shrink(retained_bytes(held, &p));
+            Some(ReadValue { value, permit })
+        });
+    }
+
+    async fn read_raw(&self, db_oid: u32, p: ToastPointer, lsn: u64) -> Option<Vec<u8>> {
+        let got = self
+            .fetch_value(
+                db_oid,
+                p.va_toastrelid,
+                p.va_valueid,
+                lsn,
+                pointer_extsize(&p),
+            )
+            .await
+            .ok()??;
+        let FetchedValue::Assembled(stored) = got else {
+            return None;
+        };
+        finish_value(&p, stored).ok()
+    }
+
+    pub async fn fill_ahead(
+        &self,
+        db_oid: u32,
+        t: &mut crate::decode::heap_decoder::DecodedTuple,
+        rel: &crate::schema::RelDescriptor,
+        lsn: u64,
+        permit: &mut Option<crate::budget::MemoryPermit>,
+    ) {
+        for (col, attr) in t.columns.iter_mut().zip(&rel.attributes) {
+            let Some(ColumnValue::ExternalToast(p)) = col else {
+                continue;
+            };
+            let Some(slot) = self
+                .pending()
+                .and_then(|mut c| c.take(db_oid, p, attr.type_oid, lsn))
+            else {
+                continue;
+            };
+            let started = std::time::Instant::now();
+            let value = slot.take().await;
+            self.stats
+                .toast_value_wait_nanos
+                .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            if let Some(ReadValue {
+                value,
+                permit: read,
+            }) = value
+            {
+                crate::budget::absorb_into(permit, read);
+                *col = Some(value);
+            }
+        }
+    }
+
+    pub fn forget_reads<'a>(&self, keys: impl IntoIterator<Item = &'a (u32, u32)>) {
+        if let Some(mut pending) = self.pending() {
+            keys.into_iter().for_each(|k| pending.forget(*k));
+        }
+    }
+
+    pub fn clear_reads(&self) {
+        if let Some(mut pending) = self.pending() {
+            pending.clear();
+        }
     }
 
     pub fn with_stats(mut self, stats: Arc<EmitterStats>) -> Self {
@@ -2365,6 +2522,269 @@ mod tests {
              ORDER BY `chunk_id`, `chunk_seq`\n\
              SETTINGS max_block_size = 1024"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reads_ahead_stay_bounded_while_reads_stall() {
+        use crate::toast::read_ahead::{AHEAD_QUEUE, AHEAD_READS};
+        struct Stalled(tokio::sync::Semaphore);
+        #[async_trait]
+        impl ChunkStore for Stalled {
+            async fn fetch_many(
+                &self,
+                _db_oid: u32,
+                _toast_relid: u32,
+                values: &[(u32, usize)],
+                _max_lsn: u64,
+            ) -> Result<Vec<FetchedValue>, ChunkStoreError> {
+                drop(self.0.acquire().await);
+                Ok(values.iter().map(|_| assembled(b"v")).collect())
+            }
+        }
+        let store = Arc::new(Stalled(tokio::sync::Semaphore::new(0)));
+        let stats = Arc::new(EmitterStats::default());
+        let r = ToastResolver::with_store(store.clone(), stats.clone())
+            .with_budget(crate::budget::MemoryBudget::with_leaf_reserve(
+                1 << 30,
+                64 << 20,
+            ))
+            .with_read_ahead();
+        let tasks = || {
+            tokio::runtime::Handle::current()
+                .metrics()
+                .num_alive_tasks()
+        };
+        let idle = tasks();
+        for id in 1..=10_000 {
+            r.read_ahead(
+                0,
+                ToastPointer {
+                    va_rawsize: VARHDRSZ + 1,
+                    va_extinfo: 1,
+                    va_valueid: id,
+                    va_toastrelid: 16500,
+                },
+                crate::schema::TEXTOID,
+                0x100,
+            );
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(tasks(), idle + AHEAD_READS + AHEAD_QUEUE);
+        assert_eq!(
+            stats.toast_values_read_ahead.load(Ordering::Relaxed),
+            AHEAD_READS as u64
+        );
+        store.0.add_permits(1);
+        let fetched = || stats.toast_values_fetched.load(Ordering::Relaxed);
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while tasks() > idle || fetched() < (AHEAD_READS + AHEAD_QUEUE) as u64 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("queued reads finish");
+        assert_eq!(fetched(), (AHEAD_READS + AHEAD_QUEUE) as u64);
+        assert_eq!(
+            stats.toast_value_fetch_batches.load(Ordering::Relaxed),
+            fetched()
+        );
+        assert_eq!(
+            stats.toast_values_read_ahead.load(Ordering::Relaxed),
+            fetched()
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn foreground_admission_reclaims_completed_and_blocked_reads() {
+        struct Store {
+            blocked: bool,
+        }
+        #[async_trait]
+        impl ChunkStore for Store {
+            async fn fetch_many(
+                &self,
+                _: u32,
+                _: u32,
+                values: &[(u32, usize)],
+                _: u64,
+            ) -> Result<Vec<FetchedValue>, ChunkStoreError> {
+                if self.blocked {
+                    std::future::pending::<()>().await;
+                }
+                Ok(values.iter().map(|_| assembled(b"v")).collect())
+            }
+        }
+        for blocked in [false, true] {
+            let budget = crate::budget::MemoryBudget::with_leaf_reserve(4096, 2048);
+            let stats = Arc::new(EmitterStats::default());
+            let resolver = ToastResolver::with_store(Arc::new(Store { blocked }), stats.clone())
+                .with_budget(budget.clone())
+                .with_read_ahead();
+            for id in 1..=2 {
+                resolver.read_ahead(
+                    0,
+                    ToastPointer {
+                        va_rawsize: VARHDRSZ + 1,
+                        va_extinfo: 1,
+                        va_valueid: id,
+                        va_toastrelid: 16500,
+                    },
+                    crate::schema::TEXTOID,
+                    1,
+                );
+            }
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                while stats.toast_values_read_ahead.load(Ordering::Relaxed) != 2
+                    || !blocked && stats.toast_values_fetched.load(Ordering::Relaxed) != 2
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(budget.resident_bytes() > 0);
+            let next = ToastPointer {
+                va_rawsize: VARHDRSZ + 1,
+                va_extinfo: 1,
+                va_valueid: 3,
+                va_toastrelid: 16500,
+            };
+            resolver.read_ahead(0, next, crate::schema::TEXTOID, 2);
+            assert!(
+                resolver
+                    .pending()
+                    .unwrap()
+                    .take(0, &next, crate::schema::TEXTOID, 2)
+                    .is_none(),
+                "unconsumed slots exhaust admission"
+            );
+            let leaf = budget.acquire(2048).await;
+            let foreground =
+                tokio::time::timeout(std::time::Duration::from_secs(1), budget.admit(2048))
+                    .await
+                    .expect("foreground reclaims speculative admission");
+            assert_eq!(budget.resident_bytes(), 4096);
+            assert_eq!(budget.overshoots_total(), 0);
+            drop(foreground);
+            drop(leaf);
+            assert_eq!(budget.resident_bytes(), 0);
+            assert!(budget.peak_bytes() <= budget.total() as u64);
+            resolver.read_ahead(0, next, crate::schema::TEXTOID, 2);
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                while stats.toast_values_read_ahead.load(Ordering::Relaxed) != 3 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("read ahead resumes after foreground reclaim");
+            assert!(
+                resolver
+                    .pending()
+                    .unwrap()
+                    .take(0, &next, crate::schema::TEXTOID, 2)
+                    .is_some()
+            );
+        }
+    }
+
+    /// Escaped JSON renders to six bytes per control byte, past fetch transients,
+    /// into exactly the capacity admitted ahead of rendering
+    #[tokio::test(flavor = "current_thread")]
+    async fn rendered_growth_tops_up_or_discards_read() {
+        struct Store(Vec<u8>);
+        #[async_trait]
+        impl ChunkStore for Store {
+            async fn fetch_many(
+                &self,
+                _: u32,
+                _: u32,
+                values: &[(u32, usize)],
+                _: u64,
+            ) -> Result<Vec<FetchedValue>, ChunkStoreError> {
+                Ok(values.iter().map(|_| assembled(&self.0)).collect())
+            }
+        }
+        let mut body = 0x5000_0001u32.to_le_bytes().to_vec();
+        body.extend_from_slice(&4096u32.to_le_bytes());
+        body.extend_from_slice(&[1; 4096]);
+        let p = ToastPointer {
+            va_rawsize: body.len() as i32 + VARHDRSZ,
+            va_extinfo: body.len() as u32,
+            va_valueid: 1,
+            va_toastrelid: 16500,
+        };
+        for (total, fits) in [(1 << 20, true), (64 << 10, false)] {
+            let budget = crate::budget::MemoryBudget::with_leaf_reserve(total, 32 << 10);
+            let r = ToastResolver::with_store(
+                Arc::new(Store(body.clone())),
+                Arc::new(EmitterStats::default()),
+            )
+            .with_budget(budget.clone())
+            .with_read_ahead();
+            r.read_ahead(0, p, crate::schema::JSONBOID, 1);
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+            }
+            let slot = r.pending().unwrap().take(0, &p, crate::schema::JSONBOID, 1);
+            let read = slot.unwrap().take().await;
+            assert_eq!(read.is_some(), fits);
+            if let Some(ReadValue { value, permit }) = read {
+                let ColumnValue::Json(s) = value else {
+                    panic!("jsonb renders as Json, got {value:?}");
+                };
+                assert_eq!((s.len(), s.capacity()), (24578, 24578));
+                assert!(permit.bytes() >= 2 * 24578);
+            }
+            assert_eq!(budget.resident_bytes(), 0);
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dropping_read_ahead_cancels_blocked_reads() {
+        struct Stalled;
+        #[async_trait]
+        impl ChunkStore for Stalled {
+            async fn fetch_many(
+                &self,
+                _: u32,
+                _: u32,
+                _: &[(u32, usize)],
+                _: u64,
+            ) -> Result<Vec<FetchedValue>, ChunkStoreError> {
+                std::future::pending().await
+            }
+        }
+        let stats = Arc::new(EmitterStats::default());
+        let r = ToastResolver::with_store(Arc::new(Stalled), stats.clone())
+            .with_budget(crate::budget::MemoryBudget::with_leaf_reserve(
+                1 << 20,
+                64 << 10,
+            ))
+            .with_read_ahead();
+        r.read_ahead(
+            0,
+            ToastPointer {
+                va_rawsize: VARHDRSZ + 1,
+                va_extinfo: 1,
+                va_valueid: 1,
+                va_toastrelid: 16500,
+            },
+            crate::schema::TEXTOID,
+            1,
+        );
+        while stats.toast_values_read_ahead.load(Ordering::Relaxed) == 0 {
+            tokio::task::yield_now().await;
+        }
+        let budget = r.pending().unwrap().budget().clone();
+        assert!(budget.resident_bytes() > 0);
+        drop(r);
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while budget.resident_bytes() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("session drop cancels reads and releases bytes");
     }
 
     #[test]

@@ -25,7 +25,7 @@ use crate::ops::oracle::render_ext_columns;
 use crate::schema::{RelDescriptor, RelName};
 use crate::ticker::Ticker;
 use crate::toast::{
-    FetchedValue, ToastResolver, ToastRow, check_value_caps, detoasted_value, finish_value,
+    FetchedValue, ToastResolver, ToastRow, check_value_caps, detoasted_sized, finish_value,
     pointer_extsize,
 };
 use crate::xact::xact_buffer::{MissPolicy, StoreMiss, fill_store_miss};
@@ -787,8 +787,7 @@ fn apply_fetched(
     let miss = match StoreMiss::split(fetched) {
         Ok(stored) => {
             let raw = finish_value(p, stored).map_err(|e| e.to_string())?;
-            let retained = raw.len();
-            return Ok((detoasted_value(raw, type_oid), retained));
+            return Ok(detoasted_sized(raw, type_oid));
         }
         Err(miss) => miss,
     };

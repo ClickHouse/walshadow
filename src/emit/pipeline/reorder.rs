@@ -322,6 +322,11 @@ impl ReorderSink {
         })
     }
 
+    /// Resolver shared with predecode for TOAST read-ahead
+    pub fn planning_resolver(&self) -> ToastResolver {
+        self.resolver.clone()
+    }
+
     /// Route-point steps 1–2 close out here: preceding schema/config state is
     /// applied, so drop memoized routes and freeze mapping + resolved-config
     /// versions for the next interval. Per commit this is the

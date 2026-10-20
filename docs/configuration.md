@@ -220,6 +220,7 @@ Tune chunk-store buffering independently of inserter count, restart daemon to ap
 | `put_batch_rows` | 65,536 | Seal chunk INSERT after this many rows |
 | `put_batch_bytes` | 67,108,864 | Seal chunk INSERT after this many body bytes |
 | `connections` | `ch.inserter_pool_size` | Limit concurrent chunk-store connections |
+| `read_ahead` | `true` | Fetch and decode external values ahead of planning |
 
 Both seals apply to bootstrap and WAL chunk writes. Each bootstrap drain holds
 its own batch, so more lanes can multiply buffered chunk bodies. A byte seal
@@ -237,6 +238,19 @@ put_batch_bytes = 4194304
 
 The three buffering settings require positive integers.
 `[bootstrap] lanes` and `[ch] inserter_pool_size` controls are independent
+
+Read-ahead overlaps external-value reads and decoding with WAL processing.
+It allows one concurrent read per bridge worker and up to 4096 queued requests.
+Set `[toast] read_ahead = false` to disable it.
+
+Read-ahead shares `[memory] resident_payload_max` with foreground processing.
+It preserves foreground value-reserve space and yields memory when foreground
+work needs it. Requests that cannot fit, have not started when needed, or fail
+to resolve a value fall back to foreground resolution.
+
+Use `toast_values_read_ahead_total` to count reads started early and
+`toast_value_wait_seconds` to measure planning's wait for their results.
+Fetch counters include reads started early.
 
 ### Value mode
 
