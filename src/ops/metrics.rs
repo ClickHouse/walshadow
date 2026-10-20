@@ -39,6 +39,20 @@ use crate::ops::bridge::{OP_COUNT, OP_LABELS};
 use crate::pos::{Drain, EmitterAck, FilterDispatched, Floor, Pos, ShadowReplay, SourceReceived};
 use crate::source::transition::SWITCH_FAILURE_REASONS;
 
+/// `mode=` label order of `MetricsSnapshot::source_mode`: where the pump reads
+/// WAL from, or why it is not reading
+pub const SOURCE_MODES: [&str; 6] = [
+    "streaming",
+    "archive",
+    "reconnecting",
+    "switchpoint",
+    "crossing",
+    "paused",
+];
+
+/// `kind=` label order of `MetricsSnapshot::source_stream_errors_total`
+pub const STREAM_ERROR_KINDS: [&str; 3] = ["wal_removed", "disconnect", "other"];
+
 #[derive(Debug, Error)]
 pub enum MetricsError {
     #[error("io: {0}")]
@@ -187,6 +201,9 @@ snapshot! {
         rows_inserted_by_table: Vec<(String, String, u64)>,
         cells_inserted_by_type: Vec<(String, &'static str, u64)>,
         skipped_records_by_rel: Vec<SkippedRel>,
+        /// `[from][to]` over [`SOURCE_MODES`] for each mode change the pump made,
+        /// rendered `from=`/`to=` labelled
+        source_mode_transitions: [[u64; SOURCE_MODES.len()]; SOURCE_MODES.len()],
         /// Refusal a crossing parked on, rendered as `crossing_wedged`. The
         /// pump keeps publishing rather than exiting into a restart that
         /// re-crosses and re-fails, so this is how the daemon says it is
@@ -433,6 +450,14 @@ snapshot! {
         "Time filtering and dispatching archived WAL, including downstream backpressure.",
     gauge archive_restore_active: u64 =
         "1 while consuming prefetched archive WAL through the normal pump.",
+    /// Exactly one series is 1; order matches [`SOURCE_MODES`]
+    gauge source_mode: [u64; SOURCE_MODES.len()] ["mode" = SOURCE_MODES] =
+        "1 for the mode the pump is in: streaming from the source, replaying the archive, redialing a lost source, waiting at a switchpoint, crossing a timeline, or paused.",
+    /// Source streams that ended under the pump; order matches
+    /// [`STREAM_ERROR_KINDS`]
+    counter source_stream_errors_total: [u64; STREAM_ERROR_KINDS.len()]
+        ["kind" = STREAM_ERROR_KINDS] =
+        "Source stream losses: WAL already removed (SQLSTATE 58P01), connection drop or walsender exit, or any other error.",
     counter source_endpoint_swaps_total: u64 =
         "Source feeds swapped onto a reloaded `[source]` endpoint or slot.",
     counter source_endpoint_swap_failures_total: u64 =
@@ -985,6 +1010,20 @@ fn encode_snapshot(snap: &MetricsSnapshot, enc: &mut DescriptorEncoder<'_>) -> f
             .encode_counter::<NoLabelSet, _, u64>(n, None)?;
     }
 
+    counter_pairs(
+        enc,
+        "walshadow_source_mode_transitions_total",
+        "Pump mode changes, from one source mode to another.",
+        ["from", "to"],
+        SOURCE_MODES.into_iter().enumerate().flat_map(|(f, from)| {
+            SOURCE_MODES
+                .into_iter()
+                .enumerate()
+                .filter(move |(t, _)| *t != f)
+                .map(move |(t, to)| ([from, to], snap.source_mode_transitions[f][t]))
+        }),
+    )?;
+
     counter_kind_op(
         enc,
         "walshadow_raw_stash_records_total",
@@ -1301,6 +1340,27 @@ mod tests {
         assert!(dupes.is_empty(), "families declared twice: {dupes:?}");
         let helps = body.lines().filter(|l| l.starts_with("# HELP ")).count();
         assert_eq!(helps, seen.len(), "one HELP per TYPE");
+    }
+
+    #[test]
+    fn render_emits_source_mode_families() {
+        let mut snap = MetricsSnapshot {
+            source_mode: [0, 1, 0, 0, 0, 0],
+            source_stream_errors_total: [2, 3, 4],
+            ..MetricsSnapshot::default()
+        };
+        snap.source_mode_transitions[0][1] = 5; // streaming -> archive
+        let body = render(snap);
+        assert!(body.contains("walshadow_source_mode{mode=\"archive\"} 1"));
+        assert!(body.contains("walshadow_source_mode{mode=\"streaming\"} 0"));
+        assert!(body.contains("walshadow_source_stream_errors_total{kind=\"wal_removed\"} 2"));
+        assert!(body.contains("walshadow_source_stream_errors_total{kind=\"other\"} 4"));
+        assert!(body.contains(
+            "walshadow_source_mode_transitions_total{from=\"streaming\",to=\"archive\"} 5"
+        ));
+        assert!(body.contains(
+            "walshadow_source_mode_transitions_total{from=\"archive\",to=\"streaming\"} 0"
+        ));
     }
 
     #[test]
