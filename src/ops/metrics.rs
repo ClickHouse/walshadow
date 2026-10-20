@@ -427,6 +427,12 @@ snapshot! {
         "Pump time awaiting next prefetched WAL segment, including waits spanning status ticks.",
     counter pump_queue_wait_seconds_total: f64 =
         "Pump time sending batches into bounded decoder queue.",
+    /// Serial queue worker wall time `[busy, idle, predecode_wait]`, rendered
+    /// `phase=` labelled; disjoint, so they sum to ~1 s/s while the worker lives
+    counter queue_worker_seconds_by_phase: [f64; 3] ["phase" = ["busy", "idle", "predecode_wait"]] =
+        "Serial queue worker wall time by phase. busy is inside the sink (decode, planning, TOAST fetch; subtract walshadow_toast_value_fetch_seconds_total for the rest), idle is waiting on the channel, predecode_wait is awaiting the blocking-pool predecode job.",
+    gauge queue_worker_batch_records: u64 =
+        "Wanted records in the last batch the serial queue worker dequeued.",
     counter archive_replay_seconds_total: f64 =
         "Time filtering and dispatching archived WAL, including downstream backpressure.",
     gauge archive_restore_active: u64 =
@@ -1201,9 +1207,14 @@ mod tests {
             xact_plan_rows: 9,
             xact_plan_bytes_by_storage: [100, 200],
             xact_plan_failures_by_reason: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+            queue_worker_seconds_by_phase: [1.5, 2.5, 0.0],
+            queue_worker_batch_records: 512,
             ..MetricsSnapshot::default()
         };
         let body = render(snap);
+        assert!(body.contains("walshadow_queue_worker_seconds_total{phase=\"busy\"} 1.5"));
+        assert!(body.contains("walshadow_queue_worker_seconds_total{phase=\"idle\"} 2.5"));
+        assert!(body.contains("walshadow_queue_worker_batch_records 512"));
         assert!(body.contains("# TYPE walshadow_xact_plan_bytes counter"));
         assert!(body.contains("walshadow_xact_plan_bytes_total{storage=\"mem\"} 100"));
         assert!(body.contains("walshadow_xact_plan_bytes_total{storage=\"file\"} 200"));

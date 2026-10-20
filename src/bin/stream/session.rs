@@ -1925,6 +1925,9 @@ async fn session_body(
             .update(|snap| {
                 snap.pump_queue_wait_seconds_total =
                     record_sink.decoder_xact.inner.send_wait_seconds();
+                let clock = record_sink.decoder_xact.inner.worker_clock();
+                snap.queue_worker_seconds_by_phase = clock.seconds();
+                snap.queue_worker_batch_records = clock.batch_records.load(Ordering::Relaxed);
                 snap.archive_restore_active = 0;
                 if let SourcePath::Archive(reader) = &path {
                     snap.archive_restore_active = 1;
