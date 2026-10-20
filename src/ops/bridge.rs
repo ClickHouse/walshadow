@@ -20,6 +20,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::sync::Mutex;
 
+use crate::ops::metrics::Histogram;
 use crate::toast::FetchedValue;
 
 /// Frame and op layouts. Must equal `WS_PROTO_VERSION` in `pgext/walshadow.h`
@@ -258,6 +259,20 @@ pub struct ScanResult {
     pub rows: Vec<Vec<Option<String>>>,
 }
 
+/// Upper bounds of the bridge request-latency buckets: 25us doubling to
+/// 102.4ms, which spans a local socket round trip through a worker stalled on
+/// slow storage. Slower requests land in `+Inf`
+pub const REQUEST_LATENCY_BOUNDS_NANOS: [u64; REQUEST_LATENCY_BUCKETS] = {
+    let mut bounds = [0; REQUEST_LATENCY_BUCKETS];
+    let mut i = 0;
+    while i < REQUEST_LATENCY_BUCKETS {
+        bounds[i] = 25_000 << i;
+        i += 1;
+    }
+    bounds
+};
+pub const REQUEST_LATENCY_BUCKETS: usize = 13;
+
 crate::atomic_stats! {
     pub struct BridgeStats {
         /// 1 while the last transport attempt succeeded
@@ -276,6 +291,9 @@ crate::atomic_stats! {
         pub requests: [AtomicU64; OP_COUNT],
         pub errors: [AtomicU64; OP_COUNT],
         pub request_nanos: [AtomicU64; OP_COUNT],
+        /// Distribution behind `request_nanos`, bucketed by
+        /// [`REQUEST_LATENCY_BOUNDS_NANOS`]
+        pub request_latency: [Histogram<REQUEST_LATENCY_BUCKETS>; OP_COUNT],
         /// Queued behind another caller's request on the one socket. Against
         /// `service_nanos` this is what says whether the worker is the
         /// limiter or the funnel in front of it is
@@ -744,7 +762,9 @@ impl Bridge {
 fn record<T>(stats: &BridgeStats, op: Op, started: Instant, res: &Result<T, BridgeError>) {
     let slot = op.slot();
     stats.requests[slot].fetch_add(1, Ordering::Relaxed);
-    stats.request_nanos[slot].fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    let nanos = started.elapsed().as_nanos() as u64;
+    stats.request_nanos[slot].fetch_add(nanos, Ordering::Relaxed);
+    stats.request_latency[slot].observe(&REQUEST_LATENCY_BOUNDS_NANOS, nanos);
     if res.is_err() {
         stats.errors[slot].fetch_add(1, Ordering::Relaxed);
     }

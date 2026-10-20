@@ -2637,6 +2637,13 @@ fn oracle_cell(v: Option<&ColumnValue>, source_type_oid: u32) -> Result<OracleCe
     })
 }
 
+/// Upper bounds of the values-per-fetch buckets: 1 doubling to 256, where
+/// one means no batching and the top is past a typical deferred-resolution
+/// batch
+pub const TOAST_FETCH_VALUES_BOUNDS: [u64; TOAST_FETCH_VALUES_BUCKETS] =
+    [1, 2, 4, 8, 16, 32, 64, 128, 256];
+pub const TOAST_FETCH_VALUES_BUCKETS: usize = 9;
+
 crate::atomic_stats! {
     /// CH emitter counters. `fetch_add(_, Relaxed)`; status loop reads
     /// via `.load(Relaxed)`.
@@ -2670,6 +2677,9 @@ crate::atomic_stats! {
         /// Store fetch round trips; a batch covers many values
         pub toast_value_fetch_batches,
         pub toast_value_fetch_nanos,
+        /// Values requested per store fetch, bucketed by
+        /// [`TOAST_FETCH_VALUES_BOUNDS`]
+        pub toast_values_per_fetch: crate::ops::metrics::Histogram<TOAST_FETCH_VALUES_BUCKETS>,
         /// Toasted values NULL/default-filled because no store could rebuild
         /// them (disabled mode). Surfaced, never silent
         pub toast_values_filled_default,
