@@ -163,3 +163,58 @@ Keep stdout logs and adjacent `provenance.txt` for revision attribution
 
 Stage metrics cover bootstrap, shadow replay, COPY, insert flush, publication,
 and settlement, include waits and overlap, so do not sum into wall-time percentages
+
+## Production-shaped drain (ceramic)
+
+`bench/ceramic/` replays a fixed WAL backlog shaped after a production
+workload whose serial queue worker stays pinned while the process uses
+little CPU. Each status transition there is a non-HOT update that leaves an
+out-of-line jsonb value unchanged. walshadow then fetches that value from
+the shadow, one row at a time on the worker. Each fetch is a bridge
+`fetch_toast` plus `replay_lsn` round trip. The worker also handles the many
+records it discards (row locks, index inserts).
+
+```sh
+bench/ceramic/prepare.sh <oldest-tree>       # golden snapshot, once
+DAEMON_CPUS=0-7 SRC_CPUS=8-15 CH_CPUS=16-23 bench/ceramic/run.sh <tree>
+bench/ceramic/ab.sh <treeA> <treeB> 4         # interleaved, mean ± stdev, B/A
+```
+
+Needs PostgreSQL 18 (source and shadow share the major; `PG=17` works),
+its server dev package for the pgext build, pgbench and a `clickhouse`
+binary. `prepare.sh` seeds the source (24 tables, the hot one with six
+btree indexes including two partial on status, lz4 nested jsonb two and
+one TOAST chunks wide), bootstraps a shadow in `[toast] mode = "shadow"`,
+stops the daemon and generates about 5.6M records of WAL behind it. It
+keeps the result as a golden snapshot: shadow, out, spill and source WAL on
+`DISK` (a real disk), and the source data files, sockets and its own
+ClickHouse on `SHM` (tmpfs). `run.sh` restores the snapshot (WAL segments
+are hard-linked), starts the daemon pinned and resumes it from the persisted
+floor. It then drains the identical backlog and appends one line to
+`$DISK/results.tsv`. One run takes about 35 s; run-to-run noise is 1-3%.
+Ports default to 62432-62441 and 62484.
+
+Bootstrap the golden with the oldest tree under comparison: newer trees
+resume its state. Swap `SCHEMA`, `SEED` or `WORKLOAD` for other shapes.
+`UPD_RECENT_FRAC` (default 0.5) aims that share of transitions at
+recently inserted rows instead of random seeded ones. `UPD_REPEAT`
+(default 3.5) sets transitions per insert. `CHECKPOINT_S` sets the FPI
+share.
+
+Summary line fields, all over the window from the first to the last record
+out:
+
+- `rec/s`, `B/rec`: worker throughput and backlog bytes per record
+- `<thread>=%core/ns-per-record`: `tokio` sums the runtime workers, and
+  `cores` is the whole daemon
+- `wait`: pump seconds per second blocked on the full worker queue
+- `f`: TOAST values fetched per record. `c_fetch` is the time per fetch,
+  and `fetch s/s` is the share of wall time spent fetching. Bridge
+  `fetch_toast` and `replay_lsn` are per-call latencies
+- `ack_tail`: time from the last record out to replay at the end LSN
+  reaching the source
+
+The worker model is `rec/s = 1 / (c_rec + f * c_fetch)`. `c_rec` is the
+per-record cost without fetching, so `1/rec_s - f * c_fetch` estimates it.
+A fix that batches or overlaps fetches shows up as a drop in `fetch s/s`
+and `c_fetch`. One that cheapens discarded records shows up in `c_rec`.
