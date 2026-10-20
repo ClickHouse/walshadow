@@ -9,6 +9,7 @@ use walshadow::backfill_bootstrap::BootstrapProgress;
 use walshadow::boundary_hold::BoundaryHoldStats;
 use walshadow::ch_emitter::EmitterStats;
 use walshadow::config::ConfigResolver;
+use walshadow::metrics::WorkerState;
 use walshadow::metrics::{DbSeries, MetricsRegistry, MetricsSnapshot, RateEstimator};
 use walshadow::pipeline::row_ledger::TableRowCounts;
 use walshadow::pos::{
@@ -663,11 +664,66 @@ pub(crate) fn bootstrap_gauges(
         bootstrap_tuples_emitted: ld(&p.page_walk.tuples_emitted),
         bootstrap_files_walked: ld(&p.page_walk.files_walked),
         bootstrap_files_skipped_unmapped: ld(&p.page_walk.files_skipped_unmapped),
-        bootstrap_decode_seconds: ld(&p.page_walk.decode_nanos) as f64 / 1e9,
-        bootstrap_tap_seconds: ld(&p.pump.sink_chunk_nanos) as f64 / 1e9,
-        bootstrap_channel_block_seconds: ld(&p.page_walk.channel_block_nanos) as f64 / 1e9,
+        worker_seconds: vec![
+            (
+                "backup_tap",
+                WorkerState::Busy,
+                secs(&p.pump.sink_chunk_nanos),
+            ),
+            (
+                "backup_walk",
+                WorkerState::Busy,
+                secs(&p.page_walk.decode_nanos),
+            ),
+            (
+                "backup_walk",
+                WorkerState::BlockedOut,
+                secs(&p.page_walk.channel_block_nanos),
+            ),
+        ],
         ..base
     }
+}
+
+fn secs(nanos: &AtomicU64) -> f64 {
+    nanos.load(Ordering::Relaxed) as f64 / 1e9
+}
+
+pub(crate) struct PumpClock {
+    pub(crate) busy_secs: f64,
+    pub(crate) idle_secs: f64,
+}
+
+pub(crate) fn pipeline_worker_seconds(
+    pump: &PumpClock,
+    pump_send_wait_secs: f64,
+    queue: [f64; 3],
+    emitter: Option<&EmitterStats>,
+) -> Vec<(&'static str, WorkerState, f64)> {
+    use WorkerState::{BlockedIn, BlockedOut, Busy, Idle};
+    let [queue_busy, queue_idle, queue_predecode] = queue;
+    let mut out = vec![
+        ("pump", Busy, pump.busy_secs),
+        ("pump", Idle, pump.idle_secs),
+        ("pump", BlockedOut, pump_send_wait_secs),
+        ("queue", Busy, queue_busy),
+        ("queue", Idle, queue_idle),
+        ("queue", BlockedIn, queue_predecode),
+    ];
+    if let Some(s) = emitter {
+        out.extend([
+            ("batcher", Busy, secs(&s.batcher_busy_nanos)),
+            ("batcher", Idle, secs(&s.batcher_idle_nanos)),
+            ("batcher", BlockedOut, secs(&s.batcher_send_nanos)),
+            (
+                "inserter",
+                Busy,
+                secs(&s.inserter_encode_nanos) + secs(&s.inserter_ch_nanos),
+            ),
+            ("inserter", Idle, secs(&s.inserter_idle_nanos)),
+        ]);
+    }
+    out
 }
 
 #[cfg(test)]
