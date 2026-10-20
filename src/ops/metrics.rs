@@ -477,6 +477,8 @@ snapshot! {
         "Estimated seconds shadow trails source, by source byte rate over last 30s.",
     gauge shadow_stream_active_connections: u64 =
         "Currently-attached walreceiver connections to walshadow's walsender.",
+    gauge shadow_stream_compact_connections: u64 =
+        "Attached walreceivers that expand compact WAL frames.",
     /// Cumulative connections dropped by `slow_threshold` overflow
     counter shadow_stream_dropped_connections_total: u64 =
         "Connections dropped by slow-client cutoff since daemon start.",
@@ -1434,6 +1436,7 @@ mod tests {
             shadow_apply_lag_bytes: 12345,
             shadow_apply_lag_seconds: 1.23456,
             shadow_stream_active_connections: 2,
+            shadow_stream_compact_connections: 1,
             shadow_stream_dropped_connections_total: 5,
             ..MetricsSnapshot::default()
         };
@@ -1447,6 +1450,7 @@ mod tests {
         assert!(body.contains("# HELP walshadow_shadow_stream_active_connections"));
         assert!(body.contains("# TYPE walshadow_shadow_stream_active_connections gauge"));
         assert!(body.contains("walshadow_shadow_stream_active_connections 2"));
+        assert!(body.contains("walshadow_shadow_stream_compact_connections 1"));
         assert!(body.contains("# HELP walshadow_shadow_stream_dropped_connections"));
         assert!(body.contains("# TYPE walshadow_shadow_stream_dropped_connections counter"));
         assert!(body.contains("walshadow_shadow_stream_dropped_connections_total 5"));

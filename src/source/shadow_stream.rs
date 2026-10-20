@@ -36,6 +36,7 @@ use crate::pos::{
     SourceReceived,
 };
 use crate::record::{RecordBytesSink, SinkError};
+use crate::source::compact;
 use ahash::{HashMap, HashMapExt};
 
 /// libpq environment for shadow's walreceiver. This walsender speaks protocol
@@ -114,16 +115,28 @@ struct ConnState {
     /// Last `apply_lsn` from the client's `'r'` standby status.
     apply_lsn: Pos<ShadowReplay>,
     phase: Phase,
+    /// Client asked for compact `'z'` frames ([`compact::STREAM_SLOT`])
+    compact: bool,
 }
 
 impl ConnState {
-    fn fresh(start_lsn: u64, ends_at: Option<TimelineSwitch>) -> Self {
+    fn fresh(start_lsn: u64, ends_at: Option<TimelineSwitch>, compact: bool) -> Self {
         Self {
             dispatched_lsn: Pos::new(start_lsn),
             flush_lsn: Pos::new(start_lsn),
             apply_lsn: Pos::new(start_lsn),
             phase: Phase::Streaming(ends_at),
+            compact,
         }
+    }
+}
+
+/// Frame `data` from `start_lsn` as XLogData, compact when the client expands it
+fn wal_frame(out: &mut Vec<u8>, compact: bool, start_lsn: u64, wal_end: u64, data: &[u8]) {
+    if compact {
+        compact::encode_frame_into(out, start_lsn, wal_end, data);
+    } else {
+        encode_wal_data_frame_into(out, start_lsn, wal_end, data);
     }
 }
 
@@ -136,6 +149,8 @@ pub struct AggregateLsn {
     pub min_apply_lsn: Option<Pos<ShadowReplay>>,
     /// Connections past `START_REPLICATION`, the only ones carrying LSNs.
     pub active_connections: usize,
+    /// Those streaming compact frames to a walreceiver that expands them
+    pub compact_connections: usize,
     /// Monotonic count of sockets that entered the handshake. Above
     /// `active_connections` means a client is connected but stalled before
     /// `START_REPLICATION`, which reads as "nothing attached" otherwise.
@@ -268,6 +283,11 @@ impl ShadowStreamState {
             min_flush_lsn: (active > 0).then_some(min_flush),
             min_apply_lsn: (active > 0).then_some(min_apply),
             active_connections: active,
+            compact_connections: self
+                .connections
+                .values()
+                .filter(|c| c.compact && !c.phase.is_closing())
+                .count(),
             accepted_total: self.accepted_total,
             dropped_total: self.dropped_total,
             replay_timeline: (active > 0).then_some(branch),
@@ -296,13 +316,25 @@ impl ShadowStreamState {
         timeline: u32,
         ends_at: Option<TimelineSwitch>,
     ) -> Option<u64> {
+        self.register_stream(start_lsn, timeline, ends_at, false)
+    }
+
+    /// [`register_connection`](Self::register_connection) for a client that
+    /// may expand `compact` frames
+    pub fn register_stream(
+        &mut self,
+        start_lsn: u64,
+        timeline: u32,
+        ends_at: Option<TimelineSwitch>,
+        compact: bool,
+    ) -> Option<u64> {
         if ends_at.is_none() && timeline != 0 && timeline != self.timeline {
             return None;
         }
         let id = self.next_conn_id;
         self.next_conn_id += 1;
         self.connections
-            .insert(id, ConnState::fresh(start_lsn, ends_at));
+            .insert(id, ConnState::fresh(start_lsn, ends_at, compact));
         self.backfill_connection(id, start_lsn);
         // Reconnecting at or past the switchpoint: nothing left on this branch,
         // so end it now rather than idling until the next dispatch
@@ -427,6 +459,7 @@ impl ShadowStreamState {
             .map(|(id, c)| (*id, c.dispatched_lsn.get(), c.phase.cut()))
             .collect();
         for (id, conn_offset, ends_at) in targets {
+            let compact = self.connections[&id].compact;
             let cut = ends_at.filter(|s| s.ends_at < end_lsn);
             let stop = cut.as_ref().map_or(end_lsn, |s| s.ends_at);
             let take = stop.saturating_sub(start_lsn) as usize;
@@ -435,7 +468,7 @@ impl ShadowStreamState {
             let frame_lsn = start_lsn + skip as u64;
             if !to_send.is_empty()
                 && self.enqueue_copy_data_with(id, |out| {
-                    encode_wal_data_frame_into(out, frame_lsn, server_wal_end, to_send);
+                    wal_frame(out, compact, frame_lsn, server_wal_end, to_send);
                 })
             {
                 self.advance_dispatched(id, Pos::new(stop));
@@ -475,11 +508,11 @@ impl ShadowStreamState {
     /// A historic connection stops at its switchpoint: past it the retained
     /// bytes belong to the descendant.
     fn backfill_connection(&mut self, id: u64, start_lsn: u64) {
-        let ends_at = self
-            .connections
-            .get(&id)
-            .and_then(|c| c.phase.cut())
-            .map(|s| s.ends_at);
+        let Some(conn) = self.connections.get(&id) else {
+            return;
+        };
+        let compact = conn.compact;
+        let ends_at = conn.phase.cut().map(|s| s.ends_at);
         let head = self.server_wal_end.get();
         let server_wal_end = ends_at.map_or(head, |v| v.min(head));
         if start_lsn >= server_wal_end || start_lsn < self.wire_buf_start {
@@ -500,7 +533,7 @@ impl ShadowStreamState {
             // Uncapped: a reconnect backfill is bounded (≤ two segments) and
             // required for recovery, so it must not trip the slow-client cap.
             self.frame_copy_data(id, None, |out| {
-                encode_wal_data_frame_into(out, frame_lsn, server_wal_end, chunk);
+                wal_frame(out, compact, frame_lsn, server_wal_end, chunk);
             });
             pos = end;
         }
@@ -544,6 +577,17 @@ impl ShadowStreamState {
         if let Some(q) = self.send_queues.get_mut(&id) {
             std::mem::swap(q, buf);
         }
+    }
+
+    /// Queue a raw CopyData payload to every client, as if this walsender
+    /// framed it
+    #[cfg(feature = "test-support")]
+    pub fn inject(&mut self, payload: &[u8]) {
+        let ids: Vec<u64> = self.connections.keys().copied().collect();
+        for id in ids {
+            self.frame_copy_data(id, None, |out| out.extend_from_slice(payload));
+        }
+        self.wake_listener();
     }
 
     #[cfg(test)]
@@ -810,9 +854,15 @@ where
     // One socket can carry several streams: a historic one ends at its
     // switchpoint, and the client immediately asks for the branch that took over
     loop {
+        let compact = started.slot.as_deref() == Some(compact::STREAM_SLOT);
         let registered = {
             let mut s = state.lock().await;
-            s.register_connection(started.start_lsn, started.timeline, started.ends_at)
+            s.register_stream(
+                started.start_lsn,
+                started.timeline,
+                started.ends_at,
+                compact,
+            )
         };
         let Some(id) = registered else {
             tracing::warn!(
@@ -830,6 +880,7 @@ where
             start_lsn = format!("{:#X}", started.start_lsn),
             timeline = started.timeline,
             ends_at = started.ends_at.map(|s| format!("{:#X}", s.ends_at)),
+            compact,
             "walsender START_REPLICATION accepted",
         );
         let outcome = run_connection_loop(&mut conn, state.clone(), id, flush_interval).await;
@@ -1260,6 +1311,74 @@ mod tests {
         // + start_lsn(8) + server_wal_end(8) + send_time(8) = 30 bytes
         assert_eq!(&qa[30..], bytes);
         assert_eq!(&qb[30..], bytes);
+    }
+
+    /// `(start_lsn, bytes)` of each XLogData frame in a send queue, `'z'`
+    /// frames expanded as the shadow's walreceiver wrapper does
+    fn frames(mut queue: &[u8]) -> Vec<(u64, Vec<u8>)> {
+        let mut out = Vec::new();
+        while !queue.is_empty() {
+            let len = u32::from_be_bytes(queue[1..5].try_into().unwrap()) as usize;
+            let (msg, rest) = queue[5..].split_at(len - 4);
+            queue = rest;
+            let lsn = u64::from_be_bytes(msg[1..9].try_into().unwrap());
+            let data = match msg[0] {
+                b'w' => msg[25..].to_vec(),
+                b'z' => {
+                    let want = u32::from_be_bytes(msg[25..29].try_into().unwrap());
+                    let mut data = Vec::new();
+                    compact::expand(&msg[29..], want as usize, &mut data).unwrap();
+                    data
+                }
+                _ => continue,
+            };
+            out.push((lsn, data));
+        }
+        out
+    }
+
+    /// A compact client reads the bytes a plain one does, live or backfilled
+    /// from any LSN, and only the frames shrink
+    #[tokio::test(flavor = "current_thread")]
+    async fn compact_frames_expand_to_the_plain_stream() {
+        let state = Arc::new(Mutex::new(fresh_state()));
+        let mut sink = ShadowStreamSink::new(state.clone());
+        let mut seed = 5u64;
+        let mut wire = Vec::new();
+        let mut lsn = 0x1000;
+        let mut ids = Vec::new();
+        for round in 0..40 {
+            let len = (crate::source::wal_gen::mix(&mut seed) % 20_000) as usize;
+            let chunk: Vec<u8> = (0..len)
+                .map(|i| if i % 700 < 60 { (i % 251) as u8 } else { 0 })
+                .collect();
+            sink.on_wire_chunk(lsn, &chunk).await.unwrap();
+            wire.extend_from_slice(&chunk);
+            lsn += len as u64;
+            // Clients joining behind the head, mid-chunk included
+            let at = 0x1000 + crate::source::wal_gen::mix(&mut seed) % (lsn - 0x1000);
+            let mut s = state.lock().await;
+            let plain = s.register_stream(at, 1, None, false).unwrap();
+            let compact = s.register_stream(at, 1, None, true).unwrap();
+            ids.push((at, plain, compact, round));
+        }
+        let mut s = state.lock().await;
+        assert_eq!(s.aggregate().compact_connections, ids.len());
+        for (at, plain, compact, round) in ids {
+            let (p, c) = (s.drain_send_queue(plain), s.drain_send_queue(compact));
+            let (p, c) = (p.unwrap_or_default(), c.unwrap_or_default());
+            assert!(c.len() < p.len() / 4 || p.is_empty(), "round {round}");
+            let expanded = frames(&c);
+            assert_eq!(frames(&p), expanded, "round {round}");
+            let mut next = at;
+            for (frame_lsn, data) in &expanded {
+                assert_eq!(*frame_lsn, next, "contiguous");
+                let off = (next - 0x1000) as usize;
+                assert!(data[..] == wire[off..off + data.len()]);
+                next += data.len() as u64;
+            }
+            assert_eq!(next, lsn, "round {round} reaches the head");
+        }
     }
 
     // 'w' frame prefix: 'd'(1) + len(4) + 'w'(1) + start_lsn(8) + wal_end(8) +

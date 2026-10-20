@@ -833,6 +833,7 @@ _PG_init(void) {
     if (!process_shared_preload_libraries_in_progress) {
         return;
     }
+    ws_walrcv_init();
 
     DefineCustomStringVariable(
         "walshadow.socket_path",

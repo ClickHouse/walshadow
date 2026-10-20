@@ -26,6 +26,7 @@ pub(crate) struct ShadowMetricsView {
     pub(crate) apply_lag_bytes: u64,
     pub(crate) apply_lag_seconds: f64,
     pub(crate) active_connections: u64,
+    pub(crate) compact_connections: u64,
     pub(crate) dropped_total: u64,
 }
 
@@ -292,6 +293,7 @@ pub(crate) async fn populate_metrics(
         shadow_apply_lag_bytes: shadow_view.apply_lag_bytes,
         shadow_apply_lag_seconds: shadow_view.apply_lag_seconds,
         shadow_stream_active_connections: shadow_view.active_connections,
+        shadow_stream_compact_connections: shadow_view.compact_connections,
         shadow_stream_dropped_connections_total: shadow_view.dropped_total,
         ..registry.snapshot().await
     };
