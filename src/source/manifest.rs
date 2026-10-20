@@ -42,7 +42,7 @@
 //! * `drain`: highest commit-record LSN drained out of the xact buffer.
 //!   Strictly higher than `emitter_ack`.
 //! * `emitter_ack`: [`ResumeSafe`], not the live ack behind
-//!   `walshadow_emitter_ack_lsn`. Slot-advance ceiling.
+//!   `walshadow_position_lsn{at="ack"}`. Slot-advance ceiling.
 //! * `shadow_flush`: min `flush_lsn` from inbound `'r'` standby status
 //!   across active shadow streaming connections. On restart, resume
 //!   position walsender hands shadow via `START_REPLICATION PHYSICAL

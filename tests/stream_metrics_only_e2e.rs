@@ -84,7 +84,7 @@ async fn metrics_only_bootstrap_streams_and_reports_open_xact() {
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             let body = fx::http_get(daemon.metrics_addr, "/metrics")?;
-            let ack = fx::parse_metric(&body, "walshadow_emitter_ack_lsn");
+            let ack = fx::parse_metric(&body, "walshadow_position_lsn{at=\"ack\"}");
             if ack.is_some_and(|a| a >= applied) {
                 break;
             }

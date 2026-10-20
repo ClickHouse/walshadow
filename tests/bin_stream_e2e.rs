@@ -363,7 +363,7 @@ async fn bin_stream_replicates_segments_and_serves_metrics() {
         //    well-known walshadow_ counters.
         let body = http_get(metrics_addr, "/metrics").context("metrics scrape")?;
         assert!(
-            body.contains("walshadow_source_received_lsn") || body.contains("walshadow_uptime"),
+            body.contains("walshadow_position_lsn") || body.contains("walshadow_uptime"),
             "expected walshadow_* counter in /metrics body: {body}",
         );
         // Shadow apply-lag surface is part of the static
@@ -382,7 +382,7 @@ async fn bin_stream_replicates_segments_and_serves_metrics() {
             );
         }
         // Absent until the session's first status write publishes a position
-        let ack_at_boot = metric_u64(&body, "walshadow_emitter_ack_lsn").unwrap_or(0);
+        let ack_at_boot = metric_u64(&body, "walshadow_position_lsn{at=\"ack\"}").unwrap_or(0);
 
         // 6. Drive workload. The daemon filters user-heap WAL records
         //    (rmgr=HEAP, class=User → replaced with XLOG_NOOP) — only
@@ -415,7 +415,7 @@ async fn bin_stream_replicates_segments_and_serves_metrics() {
             ],
         )?;
 
-        let stalled_lsn = "walshadow_catalog_boundary_stalled_lsn";
+        let stalled_lsn = "walshadow_position_lsn{at=\"catalog_boundary_stalled\"}";
         let deadline = Instant::now() + Duration::from_secs(15);
         while metric_u64(&http_get(metrics_addr, "/metrics")?, stalled_lsn).unwrap_or(0) == 0 {
             if Instant::now() >= deadline {
@@ -439,8 +439,9 @@ async fn bin_stream_replicates_segments_and_serves_metrics() {
         loop {
             let body = http_get(metrics_addr, "/metrics").context("ack poll scrape")?;
             // LSN gauges stay absent while their position is unknown
-            let ack = metric_u64(&body, "walshadow_emitter_ack_lsn").unwrap_or(0);
-            let replay = metric_u64(&body, "walshadow_shadow_replay_lsn").unwrap_or(0);
+            let ack = metric_u64(&body, "walshadow_position_lsn{at=\"ack\"}").unwrap_or(0);
+            let replay =
+                metric_u64(&body, "walshadow_position_lsn{at=\"shadow_replay\"}").unwrap_or(0);
             if ack > ack_at_boot && replay > 0 && metric_u64(&body, stalled_lsn).unwrap_or(0) == 0 {
                 break;
             }
@@ -941,7 +942,11 @@ async fn process_restart_preserves_shadow_postmaster() {
                 while http_get(metrics_addr, "/metrics")
                     .ok()
                     .and_then(|body| {
-                        metric_u64(&body, "walshadow_catalog_boundary_stalled_lsn").ok()
+                        metric_u64(
+                            &body,
+                            "walshadow_position_lsn{at=\"catalog_boundary_stalled\"}",
+                        )
+                        .ok()
                     })
                     .unwrap_or(0)
                     == 0
