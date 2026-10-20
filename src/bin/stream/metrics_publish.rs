@@ -405,6 +405,9 @@ pub(crate) async fn populate_pipeline_metrics(
             &decoder_stats.truncates,
         ]
         .map(|n| n.load(Ordering::Relaxed)),
+        decoder_buffer_lock_acquires_total: decoder_stats
+            .buffer_lock_acquires
+            .load(Ordering::Relaxed),
         decoder_buffer_lock_waits_total: decoder_stats.buffer_lock_waits.load(Ordering::Relaxed),
         decoder_buffer_lock_wait_seconds_total: decoder_stats
             .buffer_lock_wait_nanos

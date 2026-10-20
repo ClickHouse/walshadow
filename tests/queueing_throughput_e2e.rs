@@ -143,6 +143,7 @@ struct Sample {
     inserter_ch_ms: u64,
     pump_queue_depth: u64,
     xacts_committed: u64,
+    lock_acquires: u64,
     lock_waits: u64,
     lock_wait_ms: u64,
 }
@@ -171,6 +172,7 @@ fn sample(addr: SocketAddr) -> Result<Sample> {
         inserter_ch_ms: ch_seconds,
         pump_queue_depth: get("walshadow_pump_queue_depth"),
         xacts_committed: get("walshadow_xacts_committed_total"),
+        lock_acquires: get("walshadow_decoder_buffer_lock_acquires_total"),
         lock_waits: get("walshadow_decoder_buffer_lock_waits_total"),
         lock_wait_ms: body
             .lines()
@@ -208,15 +210,17 @@ fn report(a: &Sample, b: &Sample) {
         println!("  ms per INSERT       {:>12.0}", ch_busy / inserts * 1000.0);
     }
     println!("  ch in-flight        {:>12.2} of 16", ch_busy);
+    let acquires = per_s(a.lock_acquires, b.lock_acquires);
     let waits = per_s(a.lock_waits, b.lock_waits);
     let wait_busy = per_s(a.lock_wait_ms, b.lock_wait_ms) / 1000.0;
+    println!("  buffer lock acquires{:>12.0} /s", acquires);
     println!("  buffer lock waits   {:>12.0} /s", waits);
     println!(
         "  buffer lock blocked {:>12.3} s/s  <-- 1.0 = one worker fully blocked",
         wait_busy
     );
     if waits > 0.0 {
-        println!("  us per acquire      {:>12.1}", wait_busy / waits * 1e6);
+        println!("  us per wait         {:>12.1}", wait_busy / waits * 1e6);
     }
     println!(
         "  pump_queue_depth    {:>12} -> {}",

@@ -2874,11 +2874,14 @@ impl BufferingDecoderSink {
     /// Timed acquire of the shared buffer mutex, so contention with the commit
     /// drain is measurable rather than inferred
     async fn lock_buffer(&self) -> tokio::sync::MutexGuard<'_, XactBuffer> {
-        self.stats.buffer_lock_waits.fetch_add(1, Ordering::Relaxed);
+        self.stats
+            .buffer_lock_acquires
+            .fetch_add(1, Ordering::Relaxed);
         // Uncontended acquire blocks for nothing, so skip the clock
         if let Ok(guard) = self.buffer.try_lock() {
             return guard;
         }
+        self.stats.buffer_lock_waits.fetch_add(1, Ordering::Relaxed);
         let started = std::time::Instant::now();
         let guard = self.buffer.lock().await;
         self.stats
@@ -5373,6 +5376,34 @@ mod tests {
                 (key(9, 16450, SkipReason::UnfollowedDb), 1),
             ],
         );
+    }
+
+    /// Uncontended acquires count as acquires only; a held mutex also counts
+    /// one wait and accrues blocked time
+    #[tokio::test(flavor = "current_thread")]
+    async fn lock_buffer_counts_waits_only_when_contended() {
+        let spill_dir = tempdir().unwrap();
+        let buffer = Arc::new(Mutex::new(
+            XactBuffer::new(cfg(spill_dir.path().to_path_buf())).unwrap(),
+        ));
+        let log_dir = tempdir().unwrap();
+        let log = single_rel_log(log_dir.path(), &int4_descriptor(16430)).await;
+        let sink = BufferingDecoderSink::new(DescriptorLogs::single(log), buffer.clone());
+        let stats = sink.stats();
+
+        drop(sink.lock_buffer().await);
+        assert_eq!(stats.buffer_lock_acquires.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.buffer_lock_waits.load(Ordering::Relaxed), 0);
+
+        // yield_now pends once, so lock_buffer sees mutex held whichever branch polls first
+        let held = buffer.lock().await;
+        tokio::join!(async { drop(sink.lock_buffer().await) }, async {
+            tokio::task::yield_now().await;
+            drop(held);
+        });
+        assert_eq!(stats.buffer_lock_acquires.load(Ordering::Relaxed), 2);
+        assert_eq!(stats.buffer_lock_waits.load(Ordering::Relaxed), 1);
+        assert!(stats.buffer_lock_wait_nanos.load(Ordering::Relaxed) > 0);
     }
 
     /// Half-open: `through_lsn` is the first LSN the final descriptor proves,
