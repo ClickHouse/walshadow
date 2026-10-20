@@ -250,7 +250,7 @@ async fn drain_all(
         let spool = walk.chunks.iter().find_map(|g| g.spool());
         for step in walk.steps {
             if let WalkStep::Heap(mut heap) = step {
-                detoast_heap(&mut heap, spool, &ref_maps, resolver).await?;
+                detoast_heap(&mut heap, spool, &ref_maps, resolver, None).await?;
                 out.push(CommittedTuple {
                     decoded: heap.decoded,
                     commit_ts: drain.commit_ts,

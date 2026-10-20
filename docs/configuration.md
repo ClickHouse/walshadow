@@ -220,7 +220,6 @@ Tune chunk-store buffering independently of inserter count, restart daemon to ap
 | `put_batch_rows` | 65,536 | Seal chunk INSERT after this many rows |
 | `put_batch_bytes` | 67,108,864 | Seal chunk INSERT after this many body bytes |
 | `connections` | `ch.inserter_pool_size` | Limit concurrent chunk-store connections |
-| `value_cache_bytes` | 1,073,741,824 | Keep decoded values for later row versions, 0 disables |
 
 Both seals apply to bootstrap and WAL chunk writes. Each bootstrap drain holds
 its own batch, so more lanes can multiply buffered chunk bodies. A byte seal
@@ -238,13 +237,6 @@ put_batch_bytes = 4194304
 
 The three buffering settings require positive integers.
 `[bootstrap] lanes` and `[ch] inserter_pool_size` controls are independent
-
-An update that leaves a large value unchanged carries the same pointer, so the
-row needs the value again. `value_cache_bytes` bounds decoded values kept from
-the transaction WAL and earlier reads, least recently used out, so such rows
-skip the read and the decode. The cache is outside `[memory]`
-`resident_payload_max`. `toast_value_cache_hits_total` counts values served
-from it
 
 ### Value mode
 
@@ -315,14 +307,23 @@ increment `memory_budget_overshoots_total`; waits behind them increment
 `memory_budget_big_leaf_waits_total`. Raise `value_reserve` when these waits are
 common and more memory is available
 
+An update that leaves a large value unchanged carries the same pointer, so the
+row needs the value again. `[memory] toast_cache_max` (default 0, off) keeps
+decoded values from transaction WAL and earlier reads, least recently used
+out, so such rows skip the store read and the decode.
+`toast_cache_hits_total` counts values served from it. Its bytes come out
+of `resident_payload_max` at startup, whether or not the cache fills
+
 ```toml
 [memory]
 resident_payload_max = 1073741824
 value_reserve = 67108864
+toast_cache_max = 268435456
 ```
 
-Both settings apply at startup. Total reserved memory must fit within half of
-`resident_payload_max`, and remaining memory must hold one pending batch.
+These settings apply at startup. Total reserved memory must fit within half of
+`resident_payload_max` less `toast_cache_max`, and remaining memory must hold
+one pending batch.
 walshadow rejects invalid combinations
 
 ClickHouse tails bound sealed encoder buffers by startup `[ch] byte_budget`,

@@ -68,7 +68,7 @@ use crate::runtime_config::{ConfigEvent, ConfigTableKind};
 use crate::schema::{RelDescriptor, SchemaEvent};
 use crate::toast::{
     Body, ChunkRefMap, FetchedValue, ToastResolver, ToastRowRef, ToastValueError, ValueRef,
-    check_value_caps, detoasted_value, finish_value, pointer_extsize,
+    check_value_caps, detoasted_value, finish_value, pointer_extsize, toast_cache::ToastCache,
 };
 use crate::xact::spill::{
     BodySpoolFile, BodySpoolWriter, RawRecord, SpillEntry, SpillError, SpillReader, SpillStore,
@@ -2438,17 +2438,25 @@ pub async fn detoast_heap(
     // parallel path)
     chunk_maps: &[&ChunkRefMap],
     resolver: &ToastResolver,
+    // Commit-ordered planning only, see [`crate::toast::toast_cache`]
+    mut toast_cache: Option<&mut ToastCache>,
 ) -> std::result::Result<Option<crate::budget::MemoryPermit>, XactBufferError> {
     // Attached at decode: same descriptor interpretation from decode to
     // detoast regardless of captures landing in between
     let rel = heap.descriptor.clone();
     let db = heap.decoded.rfn.db_node;
     // Values an earlier row version resolved skip store and decode both
-    let cached: usize = [heap.decoded.new.as_mut(), heap.decoded.old.as_mut()]
-        .into_iter()
-        .flatten()
-        .map(|t| resolver.fill_cached(db, t, &rel))
-        .sum();
+    let mut cached = 0;
+    if let Some(c) = toast_cache.as_deref_mut() {
+        for t in [heap.decoded.new.as_mut(), heap.decoded.old.as_mut()]
+            .into_iter()
+            .flatten()
+        {
+            let (hits, bytes) = c.fill(db, t, &rel);
+            resolver.note_cache_hits(hits);
+            cached += bytes;
+        }
+    }
     let mut pointers: Vec<ToastPointer> = Vec::new();
     collect_toast_pointers(heap.decoded.new.as_ref(), &mut pointers);
     collect_toast_pointers(heap.decoded.old.as_ref(), &mut pointers);
@@ -2476,6 +2484,7 @@ pub async fn detoast_heap(
         spool,
         xact_maps: chunk_maps,
         resolver,
+        toast_cache,
         db,
         uses,
         cache,
@@ -2671,6 +2680,7 @@ struct ValueResolution<'a> {
     spool: Option<&'a BodySpoolFile>,
     xact_maps: &'a [&'a ChunkRefMap],
     resolver: &'a ToastResolver,
+    toast_cache: Option<&'a mut ToastCache>,
     db: u32,
     /// Pointer occurrences per key across both tuples, sizing cache
     /// retention (last use moves instead of cloning)
@@ -2703,7 +2713,9 @@ impl ValueResolution<'_> {
                     Reassembled::Bytes(raw) => {
                         self.retained += raw.len();
                         let value = detoasted_value(raw, type_oid);
-                        self.resolver.remember_value(self.db, &p, type_oid, &value);
+                        if let Some(c) = self.toast_cache.as_deref_mut() {
+                            c.put(self.db, &p, type_oid, &value);
+                        }
                         *col = Some(value);
                     }
                     // Disabled mode: surface the unresolvable value as
@@ -2763,7 +2775,9 @@ impl ValueResolution<'_> {
             Ok(raw) => {
                 self.retained += raw.len();
                 let value = detoasted_value(raw, type_oid);
-                self.resolver.remember_value(self.db, p, type_oid, &value);
+                if let Some(c) = self.toast_cache.as_deref_mut() {
+                    c.put(self.db, p, type_oid, &value);
+                }
                 Ok(value)
             }
             Err(miss) => fill_store_miss(miss, p, self.resolver, MissPolicy::Streaming)
@@ -4395,7 +4409,7 @@ mod tests {
         heap.decoded.new = Some(toast_ptr_tuple(55));
         heap.decoded.old = Some(toast_ptr_tuple(55));
         let resolver = capped(InlineValueOverflow::Null);
-        detoast_heap(&mut heap, None, &maps, &resolver)
+        detoast_heap(&mut heap, None, &maps, &resolver, None)
             .await
             .expect("fills instead of failing");
         for t in [&heap.decoded.new, &heap.decoded.old] {
@@ -4407,8 +4421,14 @@ mod tests {
 
         let mut heap = heap_with_value(1, 0x100, 8);
         heap.decoded.new = Some(toast_ptr_tuple(55));
-        let result =
-            detoast_heap(&mut heap, None, &maps, &capped(InlineValueOverflow::Error)).await;
+        let result = detoast_heap(
+            &mut heap,
+            None,
+            &maps,
+            &capped(InlineValueOverflow::Error),
+            None,
+        )
+        .await;
         assert!(matches!(
             result,
             Err(XactBufferError::ValueTooLarge { rawsize: 4, max: 3 })
@@ -4452,6 +4472,7 @@ mod tests {
             spool,
             xact_maps,
             resolver,
+            toast_cache: None,
             db: 0,
             uses: HashMap::from_iter([((16500u32, 55u32), 1)]),
             cache,
@@ -4705,6 +4726,7 @@ mod tests {
             spool: None,
             xact_maps: &[],
             resolver: &resolver,
+            toast_cache: None,
             db: 0,
             uses: HashMap::from_iter([((16500u32, 55u32), 2)]),
             cache,

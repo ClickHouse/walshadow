@@ -55,8 +55,8 @@ use crate::mapping::{MappingSnapshot, TableMapping};
 use crate::pos::{Floor, Monotone, Pos};
 use crate::runtime_config::{ConfigEvent, TableRow};
 use crate::source_db::{SourceDb, SourceDbs};
-use crate::toast::ToastResolver;
 use crate::toast::toast_retire::{RetireEntry, RetireLedger};
+use crate::toast::{ToastResolver, toast_cache::ToastCache};
 use tokio_postgres::types::Oid;
 
 /// One followed database's ClickHouse-side state. Every transaction writes
@@ -114,6 +114,9 @@ pub struct ReorderSink {
     stats: Arc<EmitterStats>,
     /// TOAST chunk resolver: planning detoast, mirror puts, retires
     resolver: ToastResolver,
+    /// Decoded values kept across commits, fresh per sink so a resumed
+    /// session holds nothing from before its resume point
+    toast_cache: Option<ToastCache>,
     /// Retires wait until persisted replay floor passes dropping commit;
     /// ledger persists queue so a stop inside the wait window can't leak
     /// the mirror (resume never replays the drop)
@@ -247,6 +250,7 @@ impl ReorderSink {
         msg_tx: mpsc::Sender<BatcherMsg>,
         stats: Arc<EmitterStats>,
         resolver: ToastResolver,
+        toast_cache: Option<ToastCache>,
         mut backfillers: HashMap<Oid, Arc<dyn crate::backfill::opt_in::Backfiller>>,
         fatal: Fatal,
         span_registry: Option<TxnSpanRegistry>,
@@ -306,6 +310,7 @@ impl ReorderSink {
             },
             stats,
             resolver,
+            toast_cache,
             batch_rows,
             batch_bytes,
             plan_disk_max,
@@ -1173,12 +1178,12 @@ impl ReorderSink {
                 let out = &mut self.out;
                 let stats = self.stats.clone();
                 let mut planner =
-                    Planner::create(plan_path, self.plan_disk_max, &mut view, &resolver).map_err(
-                        |e| {
+                    Planner::create(plan_path, self.plan_disk_max, &mut view, &resolver)
+                        .map_err(|e| {
                             bump_plan_failure(&stats, e.reason());
                             SinkError::Other(format!("plan open: {e}"))
-                        },
-                    )?;
+                        })?
+                        .with_toast_cache(db, self.toast_cache.as_mut());
                 loop {
                     let Some(batch) = drain
                         .next_batch_admitting(batch_rows, batch_bytes, async |bytes| {

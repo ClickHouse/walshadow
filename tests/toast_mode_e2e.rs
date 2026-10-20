@@ -153,11 +153,7 @@ async fn unchanged_toast_pointer_resolves_out_of_shadow() {
             app_name: "walshadow-toast-shadow-backend",
             ddl: None,
         },
-        |cfg| {
-            cfg.toast.mode = ToastMode::Shadow;
-            // Value cache would serve the unchanged pointer; pin the read
-            cfg.toast.value_cache_bytes = Some(0);
-        },
+        |cfg| cfg.toast.mode = ToastMode::Shadow,
         Some(oracle),
     )
     .await;

@@ -22,7 +22,6 @@ use crate::decode::heap_decoder::{
     ColumnValue, ToastPointer, VARLENA_EXTSIZE_BITS, VARLENA_EXTSIZE_MASK, decompress_varlena,
 };
 use crate::emit::ch_emitter::{EmitterConfig, EmitterStats, InlineValueOverflow, ToastMode};
-use crate::toast::value_cache::ValueCache;
 use crate::xact::spill::{BodyRef, BodySpoolFile, ToastChunk, ToastDelete};
 use ahash::{HashMap, HashMapExt, HashSet, HashSetExt};
 
@@ -1114,8 +1113,6 @@ pub struct ToastResolver {
     /// Leaf permits for per-value transients (assembly, decompress, JIT
     /// materialization); `None` = unmetered (serial/metrics-only paths)
     budget: Option<crate::budget::MemoryBudget>,
-    /// Commit-ordered planning only, see [`crate::toast::value_cache`]
-    values: Option<Arc<std::sync::Mutex<ValueCache>>>,
 }
 
 impl ToastResolver {
@@ -1129,7 +1126,6 @@ impl ToastResolver {
             inline_value_max: usize::MAX,
             overflow: InlineValueOverflow::default(),
             budget: None,
-            values: None,
         }
     }
 
@@ -1190,7 +1186,6 @@ impl ToastResolver {
             inline_value_max: emitter.inline_value_max,
             overflow: emitter.inline_value_overflow,
             budget: None,
-            values: None,
         }
     }
 
@@ -1205,7 +1200,6 @@ impl ToastResolver {
             inline_value_max: usize::MAX,
             overflow: InlineValueOverflow::default(),
             budget: None,
-            values: None,
         }
     }
 
@@ -1221,61 +1215,6 @@ impl ToastResolver {
     pub fn with_budget(mut self, budget: crate::budget::MemoryBudget) -> Self {
         self.budget = Some(budget);
         self
-    }
-
-    /// Fresh value cache for one commit-ordered planner
-    pub fn with_value_cache(mut self, bytes: usize) -> Self {
-        self.values = Some(Arc::new(std::sync::Mutex::new(ValueCache::new(bytes))));
-        self
-    }
-
-    fn cache(&self) -> Option<std::sync::MutexGuard<'_, ValueCache>> {
-        Some(self.values.as_ref()?.lock().expect("value cache"))
-    }
-
-    /// Replace each external column an earlier row version resolved with
-    /// its value, returning the bytes served
-    pub fn fill_cached(
-        &self,
-        db_oid: u32,
-        t: &mut crate::decode::heap_decoder::DecodedTuple,
-        rel: &crate::schema::RelDescriptor,
-    ) -> usize {
-        let Some(mut cache) = self.cache() else {
-            return 0;
-        };
-        let mut served = 0;
-        for (col, attr) in t.columns.iter_mut().zip(&rel.attributes) {
-            if let Some(ColumnValue::ExternalToast(p)) = col
-                && let Some(v) = cache.get(db_oid, p, attr.type_oid)
-            {
-                served += v.approx_bytes();
-                *col = Some(v);
-                self.stats
-                    .toast_value_cache_hits
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-        }
-        served
-    }
-
-    pub fn remember_value(&self, db_oid: u32, p: &ToastPointer, type_oid: u32, v: &ColumnValue) {
-        if let Some(mut c) = self.cache() {
-            c.put(db_oid, p, type_oid, v);
-        }
-    }
-
-    /// Forget `(toast_relid, value_id)` keys whose chunks a commit wrote
-    pub fn forget_values<'a>(&self, keys: impl IntoIterator<Item = &'a (u32, u32)>) {
-        if let Some(mut c) = self.cache() {
-            keys.into_iter().for_each(|k| c.forget(*k));
-        }
-    }
-
-    pub fn clear_values(&self) {
-        if let Some(mut c) = self.cache() {
-            c.clear();
-        }
     }
 
     pub fn with_stats(mut self, stats: Arc<EmitterStats>) -> Self {
@@ -1562,6 +1501,10 @@ impl ToastResolver {
 
     pub fn note_fetch_miss(&self) {
         self.stats.toast_fetch_miss.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn note_cache_hits(&self, n: u64) {
+        self.stats.toast_cache_hits.fetch_add(n, Ordering::Relaxed);
     }
 }
 

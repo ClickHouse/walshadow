@@ -264,16 +264,8 @@ impl PipelineConfig {
         let ack_probe = ack.probe();
 
         let plan_dir = Arc::from(buffer.lock().await.scratch_dir());
-        let cache_bytes = emitter
-            .toast
-            .value_cache_bytes
-            .unwrap_or(crate::toast::value_cache::VALUE_CACHE_BYTES);
-        // Each sink plans one commit-ordered stream, so it owns a fresh cache
-        let planning = if cache_bytes == 0 || resolver.fill_on_miss() {
-            resolver.clone()
-        } else {
-            resolver.clone().with_value_cache(cache_bytes)
-        };
+        let toast_cache = (emitter.toast_cache_max > 0 && !resolver.fill_on_miss())
+            .then(|| crate::toast::toast_cache::ToastCache::new(emitter.toast_cache_max));
         let reorder = reorder::ReorderSink::booting(
             buffer,
             dbs,
@@ -283,7 +275,8 @@ impl PipelineConfig {
             ack,
             msg_tx,
             stats,
-            planning,
+            resolver.clone(),
+            toast_cache,
             backfillers,
             fatal.clone(),
             span_registry,
@@ -318,16 +311,23 @@ pub fn build_budget(
     emitter: &EmitterConfig,
     decoders: usize,
 ) -> Result<crate::budget::MemoryBudget, String> {
-    let reserve = leaf_reserve_for(
-        emitter.resident_payload_max,
-        emitter.value_reserve,
-        decoders,
-    )?;
+    // TOAST cache keeps its share for the process lifetime, so it comes out
+    // of the pool up front instead of holding permits drains may wait on
+    let pool = emitter
+        .resident_payload_max
+        .checked_sub(emitter.toast_cache_max)
+        .ok_or_else(|| {
+            format!(
+                "toast_cache_max {} above resident_payload_max {}",
+                emitter.toast_cache_max, emitter.resident_payload_max,
+            )
+        })?;
+    let reserve = leaf_reserve_for(pool, emitter.value_reserve, decoders)?;
     // Progress invariant: a drain admits slices while holding its sealed
     // generations (bounded by the body-spool + index caps), so the
     // compartment must fit both plus slice headroom or a mid-drain admit
     // could wait on units the drain itself holds
-    let admission_max = emitter.resident_payload_max - reserve;
+    let admission_max = pool - reserve;
     let drain_floor = crate::xact::xact_buffer::TOAST_BODY_SPOOL_MEM_MAX
         + crate::xact::xact_buffer::TOAST_INDEX_MEM_MAX
         + 2 * emitter.drain_batch_bytes;
@@ -335,12 +335,11 @@ pub fn build_budget(
         return Err(format!(
             "admission compartment {admission_max} below drain floor {drain_floor} \
              (body spool cap + index cap + 2x drain_batch_bytes); raise \
-             resident_payload_max or lower drain_batch_bytes",
+             resident_payload_max or lower drain_batch_bytes or toast_cache_max",
         ));
     }
     Ok(crate::budget::MemoryBudget::with_leaf_reserve(
-        emitter.resident_payload_max,
-        reserve,
+        pool, reserve,
     ))
 }
 
@@ -349,16 +348,17 @@ pub fn build_budget(
 /// Keep reserve below half of pool so pipeline can accept nonempty batches.
 /// Values larger than reserve run one at a time
 pub fn leaf_reserve_for(
-    resident_payload_max: usize,
+    pool: usize,
     value_reserve: usize,
     decoders: usize,
 ) -> Result<usize, String> {
     let reserve = decoders.max(1).saturating_mul(value_reserve);
-    if reserve > resident_payload_max / 2 {
+    if reserve > pool / 2 {
         return Err(format!(
             "value_reserve needs {reserve} bytes for {} decoders, more than half of \
-             resident_payload_max {resident_payload_max}; raise resident_payload_max \
-             or lower value_reserve or decoder_pool_size",
+             payload pool {pool} (resident_payload_max less toast_cache_max); raise \
+             resident_payload_max or lower value_reserve, decoder_pool_size or \
+             toast_cache_max",
             decoders.max(1),
         ));
     }
@@ -392,6 +392,21 @@ mod tests {
             ..Default::default()
         };
         assert!(build_budget(&cfg, 4).is_ok());
+    }
+
+    /// TOAST cache comes out of the pool before reserve and drain checks
+    #[test]
+    fn toast_cache_shrinks_the_pool() {
+        let mut cfg = crate::emit::ch_emitter::EmitterConfig {
+            resident_payload_max: 1 << 30,
+            toast_cache_max: 256 << 20,
+            ..Default::default()
+        };
+        assert_eq!(build_budget(&cfg, 1).unwrap().total(), 768 << 20);
+        cfg.toast_cache_max = (1 << 30) + 1;
+        assert!(build_budget(&cfg, 1).is_err());
+        cfg.toast_cache_max = 1000 << 20;
+        assert!(build_budget(&cfg, 1).is_err());
     }
 
     /// Admission must fit one drain's retained state plus slice headroom,

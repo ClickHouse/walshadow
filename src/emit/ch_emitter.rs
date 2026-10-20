@@ -222,6 +222,9 @@ pub struct EmitterConfig {
     pub inline_value_max: usize,
     /// `[memory] value_reserve`: memory reserved per decoder for one value
     pub value_reserve: usize,
+    /// `[memory] toast_cache_max`: decoded values kept for later row
+    /// versions, taken out of `resident_payload_max`; 0 disables
+    pub toast_cache_max: usize,
     /// `[memory] inline_value_overflow`: action for oversized values
     pub inline_value_overflow: InlineValueOverflow,
     /// `[ch] decoder_pool_size`: concurrent value resolutions, each holding
@@ -354,8 +357,6 @@ pub struct ToastSettings {
     pub connections: Option<NonZeroUsize>,
     #[serde(default)]
     pub mode: ToastMode,
-    /// Decoded value bytes kept for later row versions, 0 disables
-    pub value_cache_bytes: Option<usize>,
 }
 
 pub(crate) const DEFAULT_INLINE_VALUE_MAX: usize = 1 << 30;
@@ -888,6 +889,7 @@ struct MemorySection {
     resident_payload_max: usize,
     inline_value_max: usize,
     value_reserve: usize,
+    toast_cache_max: usize,
     inline_value_overflow: InlineValueOverflow,
 }
 
@@ -897,6 +899,7 @@ impl Default for MemorySection {
             resident_payload_max: default_resident_payload_max(),
             inline_value_max: DEFAULT_INLINE_VALUE_MAX,
             value_reserve: DEFAULT_VALUE_RESERVE,
+            toast_cache_max: 0,
             inline_value_overflow: InlineValueOverflow::default(),
         }
     }
@@ -1047,6 +1050,7 @@ impl EmitterConfig {
             resident_payload_max: memory.resident_payload_max,
             inline_value_max: memory.inline_value_max,
             value_reserve: memory.value_reserve,
+            toast_cache_max: memory.toast_cache_max,
             inline_value_overflow: memory.inline_value_overflow,
             decoder_pool_size: ch.decoder_pool_size,
             inserter_pool_size: ch.inserter_pool_size,
@@ -2672,8 +2676,8 @@ crate::atomic_stats! {
         /// Store fetch round trips; a batch covers many values
         pub toast_value_fetch_batches,
         pub toast_value_fetch_nanos,
-        /// Values served by the value cache instead of the store
-        pub toast_value_cache_hits,
+        /// Values served by the TOAST cache instead of the store
+        pub toast_cache_hits,
         /// Toasted values NULL/default-filled because no store could rebuild
         /// them (disabled mode). Surfaced, never silent
         pub toast_values_filled_default,
@@ -4462,18 +4466,21 @@ mod tests {
              resident_payload_max = 1048576\n\
              inline_value_max = 65536\n\
              value_reserve = 4096\n\
+             toast_cache_max = 8192\n\
              inline_value_overflow = \"error\"\n",
         )
         .unwrap();
         assert_eq!(c.resident_payload_max, 1 << 20);
         assert_eq!(c.inline_value_max, 64 << 10);
         assert_eq!(c.value_reserve, 4 << 10);
+        assert_eq!(c.toast_cache_max, 8 << 10);
         assert_eq!(c.inline_value_overflow, InlineValueOverflow::Error);
         // Omitted section keeps defaults
         let d = EmitterConfig::from_toml_str("[ch]\n").unwrap();
         assert_eq!(d.resident_payload_max, default_resident_payload_max());
         assert_eq!(d.inline_value_max, DEFAULT_INLINE_VALUE_MAX);
         assert_eq!(d.value_reserve, DEFAULT_VALUE_RESERVE);
+        assert_eq!(d.toast_cache_max, 0);
         assert_eq!(d.inline_value_overflow, InlineValueOverflow::Null);
     }
 

@@ -450,9 +450,10 @@ impl WalReplaySink {
                     if heap_reads_toast(&heap) {
                         self.flush_rows().await?;
                     }
-                    let value_permit = detoast_heap(&mut heap, spool, &ref_maps, &self.resolver)
-                        .await
-                        .map_err(SinkError::from)?;
+                    let value_permit =
+                        detoast_heap(&mut heap, spool, &ref_maps, &self.resolver, None)
+                            .await
+                            .map_err(SinkError::from)?;
                     let (open, rows) = self
                         .open
                         .get_or_insert_with(|| (self.seqs.open(commit_lsn, Publish::Commit), 0));
