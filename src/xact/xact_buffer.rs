@@ -68,7 +68,7 @@ use crate::runtime_config::{ConfigEvent, ConfigTableKind};
 use crate::schema::{RelDescriptor, SchemaEvent};
 use crate::toast::{
     Body, ChunkRefMap, FetchedValue, ToastResolver, ToastRowRef, ToastValueError, ValueRef,
-    check_value_caps, detoasted_value, finish_value, pointer_extsize,
+    check_value_caps, detoasted_sized, finish_value, pointer_extsize,
 };
 use crate::xact::spill::{
     BodySpoolFile, BodySpoolWriter, RawRecord, SpillEntry, SpillError, SpillReader, SpillStore,
@@ -2439,11 +2439,24 @@ pub async fn detoast_heap(
     chunk_maps: &[&ChunkRefMap],
     resolver: &ToastResolver,
 ) -> std::result::Result<Option<crate::budget::MemoryPermit>, XactBufferError> {
+    // Attached at decode: same descriptor interpretation from decode to
+    // detoast regardless of captures landing in between
+    let rel = heap.descriptor.clone();
+    let db = heap.decoded.rfn.db_node;
+    // Transfer speculative values before admitting foreground resolution
+    let lsn = heap.decoded.source_lsn;
+    let mut ahead = None;
+    for t in [heap.decoded.new.as_mut(), heap.decoded.old.as_mut()]
+        .into_iter()
+        .flatten()
+    {
+        resolver.fill_ahead(db, t, &rel, lsn, &mut ahead).await;
+    }
     let mut pointers: Vec<ToastPointer> = Vec::new();
     collect_toast_pointers(heap.decoded.new.as_ref(), &mut pointers);
     collect_toast_pointers(heap.decoded.old.as_ref(), &mut pointers);
     if pointers.is_empty() {
-        return Ok(None);
+        return Ok(ahead);
     }
     let leaf_need = check_value_caps(
         pointers.iter().copied(),
@@ -2456,21 +2469,11 @@ pub async fn detoast_heap(
     // resolution peak (every retained decoded value + the largest
     // single-value transient), shrunk to retained bytes before return
     let mut leaf = crate::budget::acquire_opt(resolver.budget(), leaf_need).await;
-    // Attached at decode: same descriptor interpretation from decode to
-    // detoast regardless of captures landing in between
-    let rel = heap.descriptor.clone();
     let mut uses: HashMap<(u32, u32), u32> = HashMap::with_capacity(pointers.len());
     for p in &pointers {
         *uses.entry((p.va_toastrelid, p.va_valueid)).or_default() += 1;
     }
-    let cache = prefetch_store_values(
-        &pointers,
-        chunk_maps,
-        resolver,
-        heap.decoded.rfn.db_node,
-        heap.decoded.source_lsn,
-    )
-    .await?;
+    let cache = prefetch_store_values(&pointers, chunk_maps, resolver, db, lsn).await?;
     let mut res = ValueResolution {
         spool,
         xact_maps: chunk_maps,
@@ -2487,6 +2490,9 @@ pub async fn detoast_heap(
     }
     if let Some(p) = leaf.as_mut() {
         p.shrink(res.retained as u64);
+    }
+    if let Some(ahead) = ahead {
+        crate::budget::absorb_into(&mut leaf, ahead);
     }
     Ok(leaf)
 }
@@ -2698,8 +2704,9 @@ impl ValueResolution<'_> {
             {
                 match reassemble_value_ref(&p, self.spool, v)? {
                     Reassembled::Bytes(raw) => {
-                        self.retained += raw.len();
-                        *col = Some(detoasted_value(raw, type_oid));
+                        let (value, held) = detoasted_sized(raw, type_oid);
+                        self.retained += held;
+                        *col = Some(value);
                     }
                     // Disabled mode: surface the unresolvable value as
                     // NULL/default downstream (`append_default`), counted,
@@ -2756,8 +2763,9 @@ impl ValueResolution<'_> {
         };
         match cached {
             Ok(raw) => {
-                self.retained += raw.len();
-                Ok(detoasted_value(raw, type_oid))
+                let (value, held) = detoasted_sized(raw, type_oid);
+                self.retained += held;
+                Ok(value)
             }
             Err(miss) => fill_store_miss(miss, p, self.resolver, MissPolicy::Streaming)
                 .map_err(XactBufferError::Detoast),
@@ -2850,6 +2858,65 @@ pub(crate) fn reassemble_value_ref(
     Ok(Reassembled::Bytes(finish_value(p, concat)?))
 }
 
+#[derive(Default)]
+struct RecentToastBirths {
+    order: VecDeque<(u32, u32)>,
+    counts: ahash::HashMap<(u32, u32), usize>,
+}
+
+impl RecentToastBirths {
+    fn insert(&mut self, key: (u32, u32)) {
+        if self.order.len() == 1024 {
+            let oldest = self.order.pop_front().unwrap();
+            let count = self.counts.get_mut(&oldest).unwrap();
+            *count -= 1;
+            if *count == 0 {
+                self.counts.remove(&oldest);
+            }
+        }
+        self.order.push_back(key);
+        *self.counts.entry(key).or_default() += 1;
+    }
+}
+
+/// Start store reads of the values updated and deleted rows keep. An insert,
+/// and a value born just before its row, carries its chunks in its own WAL
+fn read_ahead_kept(
+    ahead: &ToastResolver,
+    rel: &RelDescriptor,
+    set: &crate::decode::heap_decoder::DecodedHeaps,
+    born: &std::sync::Mutex<RecentToastBirths>,
+) {
+    for d in set {
+        if rel.kind == 't' {
+            if let Some(Some(ColumnValue::Oid(id))) = d.new.as_ref().and_then(|t| t.columns.first())
+            {
+                born.lock()
+                    .expect("recent toast births")
+                    .insert((rel.oid, *id));
+            }
+            continue;
+        }
+        if d.op == HeapOp::Insert {
+            continue;
+        }
+        for t in [&d.new, &d.old].into_iter().flatten() {
+            for (col, attr) in t.columns.iter().zip(&rel.attributes) {
+                if let &Some(ColumnValue::ExternalToast(p)) = col {
+                    let recent = born
+                        .lock()
+                        .expect("recent toast births")
+                        .counts
+                        .contains_key(&(p.va_toastrelid, p.va_valueid));
+                    if !recent {
+                        ahead.read_ahead(d.rfn.db_node, p, attr.type_oid, d.source_lsn);
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Decodes `Route::ToDecoder` user-heap records into the xact buffer.
 /// Toast-relation INSERTs (`rel.kind == 't'`) reinterpret as
 /// [`ToastChunk`]; semantic errors absorb into [`DecoderStats`] rather
@@ -2890,12 +2957,18 @@ impl BufferingDecoderSink {
         guard
     }
 
-    /// Pure decode half of [`RecordSink::on_record`], for a dispatcher to run
+    /// Decode half of [`RecordSink::on_record`], for a dispatcher to run
     /// ahead of the worker. `None` wherever the worker would not decode
     /// against a live descriptor; the worker re-resolves and keeps the
     /// result only on the same descriptor version
-    pub fn predecoder(&self) -> impl Fn(&Record<'_>) -> Option<Predecoded> + Send + Sync + 'static {
+    ///
+    /// Starts the store reads of values updated rows keep, through `ahead`
+    pub fn predecoder(
+        &self,
+        ahead: ToastResolver,
+    ) -> impl Fn(&Record<'_>) -> Option<Predecoded> + Send + Sync + 'static {
         let logs = self.logs.clone();
+        let born = std::sync::Mutex::new(RecentToastBirths::default());
         move |record| {
             let rm = record.parsed.header.resource_manager_id;
             if rm != RmId::Heap as u8 && rm != RmId::Heap2 as u8 {
@@ -2918,6 +2991,7 @@ impl BufferingDecoderSink {
                 .peek_spanned(rfn, record.source_lsn)
                 .ok()?;
             let set = decode_heap_record(&record.parsed, record.source_lsn, &rel).ok()?;
+            read_ahead_kept(&ahead, &rel, &set, &born);
             Some(Predecoded::new(rel, valid_from, set))
         }
     }
@@ -4216,36 +4290,88 @@ mod tests {
     }
 
     #[test]
-    fn detoasted_value_routes_tier3_like_inline() {
+    fn detoasted_sized_routes_tier3_like_inline() {
         use crate::schema::{BYTEAOID, TEXTOID};
         /// Fringe varlena type with no local codec
         const TSVECTOROID: u32 = 3614;
         assert!(
-            matches!(detoasted_value(b"raw".to_vec(), BYTEAOID), ColumnValue::Bytea(b) if b == b"raw")
+            matches!(detoasted_sized(b"raw".to_vec(), BYTEAOID), (ColumnValue::Bytea(b), 3) if b == b"raw")
         );
         assert!(
-            matches!(detoasted_value(b"hi".to_vec(), TEXTOID), ColumnValue::Text(s) if s == "hi")
+            matches!(detoasted_sized(b"hi".to_vec(), TEXTOID), (ColumnValue::Text(s), 2) if s == "hi")
         );
         // Tier 3 lands as PgPending carrying the body so the oracle resolves
         // it like an inline value, not Unsupported
         assert_eq!(
-            detoasted_value(b"\x01body".to_vec(), TSVECTOROID),
-            ColumnValue::PgPending {
-                type_oid: TSVECTOROID,
-                raw: b"\x01body".to_vec(),
-            }
+            detoasted_sized(b"\x01body".to_vec(), TSVECTOROID),
+            (
+                ColumnValue::PgPending {
+                    type_oid: TSVECTOROID,
+                    raw: b"\x01body".to_vec(),
+                },
+                5
+            )
         );
     }
 
-    /// A detoasted jsonb renders through its codec, same as an inline one
+    /// Numeric text outgrows its base-10000 digits, so admission sees text size
+    #[test]
+    fn detoasted_numeric_admits_its_text() {
+        use crate::schema::NUMERICOID;
+        // 10^12: long form, weight 3, one digit group
+        let raw = vec![0, 0, 3, 0, 1, 0];
+        let text = "1000000000000";
+        assert_eq!(
+            crate::toast::detoasted_within(raw.clone(), NUMERICOID, |peak| {
+                assert_eq!(peak, text.len());
+                false
+            }),
+            None
+        );
+        assert_eq!(
+            detoasted_sized(raw, NUMERICOID),
+            (
+                ColumnValue::Numeric(crate::decode::codecs::NumericKind::Finite(text.into())),
+                text.len()
+            )
+        );
+    }
+
+    /// A detoasted jsonb renders through its codec, same as an inline one,
+    /// holding exactly its text
     #[test]
     fn detoasted_jsonb_renders_its_document() {
+        use crate::schema::JSONBOID;
+        let empty = 0x2000_0000u32.to_le_bytes().to_vec();
         assert_eq!(
-            detoasted_value(
-                0x2000_0000u32.to_le_bytes().to_vec(),
-                crate::schema::JSONBOID
-            ),
-            ColumnValue::Json("{}".into()),
+            detoasted_sized(empty, JSONBOID),
+            (ColumnValue::Json("{}".into()), 2)
+        );
+        let mut escaped = 0x5000_0001u32.to_le_bytes().to_vec();
+        escaped.extend_from_slice(&4u32.to_le_bytes());
+        escaped.extend_from_slice(&[1; 4]);
+        let text = r#""\u0001\u0001\u0001\u0001""#;
+        assert_eq!(
+            detoasted_sized(escaped.clone(), JSONBOID),
+            (ColumnValue::Json(text.into()), text.len())
+        );
+        assert_eq!(
+            crate::toast::detoasted_within(escaped, JSONBOID, |peak| {
+                assert_eq!(peak, text.len(), "text outgrows its 12 raw bytes");
+                false
+            }),
+            None
+        );
+        let malformed = vec![0u8; 3];
+        assert_eq!(
+            detoasted_sized(malformed.clone(), JSONBOID),
+            (
+                ColumnValue::Unsupported {
+                    type_oid: JSONBOID,
+                    raw: malformed
+                },
+                3
+            )
         );
     }
 
@@ -4292,6 +4418,62 @@ mod tests {
             }))],
             partial: false,
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn read_ahead_transfers_into_foreground_admission() {
+        use crate::toast::{ChunkStore, MemChunkStore, ToastRow};
+        let store = Arc::new(MemChunkStore::new());
+        store
+            .put(&[ToastRow {
+                db_oid: 5,
+                toast_relid: 16500,
+                blkno: 1,
+                offnum: 1,
+                chunk_id: 55,
+                chunk_seq: 0,
+                chunk_data: bytes::Bytes::from_static(b"abcd"),
+                lsn: 1,
+            }])
+            .await
+            .unwrap();
+        let stats = Arc::new(crate::emit::ch_emitter::EmitterStats::default());
+        let budget = crate::budget::MemoryBudget::with_leaf_reserve(2048, 1024);
+        let resolver = ToastResolver::with_store(store, stats.clone())
+            .with_budget(budget.clone())
+            .with_read_ahead();
+        let tuple = toast_ptr_tuple(55);
+        let Some(ColumnValue::ExternalToast(p)) = tuple.columns[0] else {
+            panic!("pointer")
+        };
+        resolver.read_ahead(5, p, crate::schema::BYTEAOID, 0x100);
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while stats.toast_values_fetched.load(Ordering::Relaxed) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let held = budget.acquire(1024).await;
+        let mut heap = heap_with_value(1, 0x100, 0);
+        heap.descriptor = Arc::new(bytea_rel());
+        heap.decoded.new = Some(tuple);
+        let resolve = tokio::spawn(async move {
+            let permit = detoast_heap(&mut heap, None, &[], &resolver).await.unwrap();
+            (heap, permit)
+        });
+        let (heap, permit) = resolve.await.unwrap();
+        assert_eq!(
+            heap.decoded.new.as_ref().unwrap().columns[0],
+            Some(ColumnValue::Bytea(b"abcd".to_vec()))
+        );
+        assert!(budget.resident_bytes() >= 1024 + 4);
+        assert_eq!(budget.waits_total(), 0);
+        assert_eq!(stats.toast_values_fetched.load(Ordering::Relaxed), 1);
+        drop(held);
+        drop(heap);
+        drop(permit);
+        assert_eq!(budget.resident_bytes(), 0);
     }
 
     /// Ref map of memory bodies for one value's `(seq, body)` chunks
@@ -6443,6 +6625,22 @@ mod tests {
         assert!(!b.is_stash_candidate(1, rel_rfn));
     }
 
+    #[test]
+    fn recent_toast_births_keep_duplicate_until_last_entry_evicted() {
+        let mut born = RecentToastBirths::default();
+        born.insert((1, 1));
+        born.insert((1, 1));
+        for id in 2..=1024 {
+            born.insert((1, id));
+        }
+        assert!(born.counts.contains_key(&(1, 1)));
+        assert_eq!(born.order.len(), 1024);
+        born.insert((2, 1));
+        assert!(!born.counts.contains_key(&(1, 1)));
+        assert!(born.counts.contains_key(&(2, 1)));
+        assert_eq!(born.counts.len(), 1024);
+    }
+
     /// Predecode reads the log off the worker, so a result for another
     /// descriptor generation is discarded and the record decodes again
     #[tokio::test(flavor = "current_thread")]
@@ -6472,7 +6670,7 @@ mod tests {
             })
             .collect();
         assert!(
-            sink.predecoder()(&batch[0]).is_some(),
+            sink.predecoder(ToastResolver::disabled())(&batch[0]).is_some(),
             "covered heap record predecodes"
         );
         let decoy_raw = multi_insert_raw(1, 0x200, 16480, &[99]);

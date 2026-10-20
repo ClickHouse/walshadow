@@ -181,7 +181,8 @@ async fn tombstones_supersede_then_truncate_wipes_then_drop_retires() {
             app_name: "walshadow-toast-tombstone",
             ddl: Some(fx::DdlPipelineArgs::default()),
         },
-        move |_cfg| {},
+        // Pin foreground mirror reads to exercise missing history
+        move |cfg| cfg.toast.read_ahead = Some(false),
     )
     .await;
     let stats = pipeline.stats.clone();

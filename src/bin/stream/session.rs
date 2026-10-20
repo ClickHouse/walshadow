@@ -1254,7 +1254,7 @@ async fn session_body(
             raw_start.get(),
         )
         .await?;
-    let predecode = Arc::new(decoder.predecoder());
+    let predecode = Arc::new(decoder.predecoder(reorder_sink.planning_resolver()));
     let decoder_xact = QueueingRecordSink::spawn(
         DecoderXactPair {
             decoder,

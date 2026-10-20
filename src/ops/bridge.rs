@@ -683,8 +683,16 @@ impl Bridge {
             held.duration_since(started).as_nanos() as u64,
             Ordering::Relaxed,
         );
-        let mut res = match guard.as_mut() {
-            Some(stream) => round_trip(stream, &frame, &mut body).await,
+        // Out of the slot until answered: a caller dropped mid-call closes the
+        // socket, else its answer would wait there for the next request
+        let mut res = match guard.take() {
+            Some(mut stream) => {
+                let res = round_trip(&mut stream, &frame, &mut body).await;
+                if !is_transport_error(&res) {
+                    *guard = Some(stream);
+                }
+                res
+            }
             None => Err(BridgeError::Io(io::Error::new(
                 io::ErrorKind::NotConnected,
                 "bridge disconnected",
@@ -693,7 +701,6 @@ impl Bridge {
         // A worker exit drops the socket and `bgw_restart_time` brings it back.
         // Every op is read-only, so replaying one costs nothing
         if is_transport_error(&res) {
-            *guard = None;
             self.stats.reconnects.fetch_add(1, Ordering::Relaxed);
             match self.dial(slot).await {
                 Ok(mut stream) => {
@@ -1508,5 +1515,27 @@ pub(crate) mod tests {
         assert_eq!(bridge.replay_lsn().await.unwrap(), 0xdead);
         assert_eq!(bridge.stats.reconnects.load(Ordering::Relaxed), 1);
         assert!(bridge.is_up());
+    }
+
+    /// One poll sends the request, then the call drops before its answer
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_call_leaves_no_answer_for_the_next() {
+        let (_tmp, path) = spawn_worker(vec![
+            Some(hello_body(PROTO_VERSION, PROJECTION_VERSION)),
+            Some(lsn_body(0x1000)),
+            Some(hello_body(PROTO_VERSION, PROJECTION_VERSION)),
+            Some(lsn_body(0x2000)),
+        ]);
+
+        let bridge = Bridge::connect(&path).await.unwrap();
+        let mut call = Box::pin(bridge.replay_lsn());
+        std::future::poll_fn(|cx| {
+            assert!(call.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        drop(call);
+        assert_eq!(bridge.replay_lsn().await.unwrap(), 0x2000);
+        assert_eq!(bridge.stats.reconnects.load(Ordering::Relaxed), 1);
     }
 }

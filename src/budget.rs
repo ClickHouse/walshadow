@@ -34,6 +34,10 @@
 //!   without a reserve have no admission users (leaf-only pools, eg the
 //!   bootstrap tail) and clamp to the whole pool instead.
 //!
+//! Speculative reads use admission permits without waiting or overshooting.
+//! Foreground admission reclaims pending results before waiting and blocks
+//! new speculation until admitted. Consumed results transfer their permits.
+//!
 //! ## Large values run one at a time
 //!
 //! Only reserve size counts against pool for larger values. A separate permit
@@ -49,12 +53,24 @@
 //! KiB granularity: tokio semaphore permits are u32-bounded per acquire,
 //! KiB units cover pools to 4 TiB.
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 
 use tokio::sync::Semaphore;
 
 const GRANULARITY: usize = 1024;
+
+pub(crate) trait Reclaim: Send + Sync {
+    fn reclaim(&self);
+}
+
+struct AdmissionWait<'a>(&'a AtomicUsize);
+
+impl Drop for AdmissionWait<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
 
 struct Inner {
     /// Whole pool; every permit holds units here
@@ -74,6 +90,8 @@ struct Inner {
     waits: AtomicU64,
     overshoots: AtomicU64,
     big_leaf_waits: AtomicU64,
+    admission_waiters: AtomicUsize,
+    reclaimers: Mutex<Vec<Weak<dyn Reclaim>>>,
 }
 
 /// Shared byte pool; clone hands out the same budget
@@ -108,6 +126,8 @@ impl MemoryBudget {
                 waits: AtomicU64::new(0),
                 overshoots: AtomicU64::new(0),
                 big_leaf_waits: AtomicU64::new(0),
+                admission_waiters: AtomicUsize::new(0),
+                reclaimers: Mutex::new(Vec::new()),
             }),
         }
     }
@@ -192,6 +212,12 @@ impl MemoryBudget {
             self.inner.overshoots.fetch_add(1, Ordering::Relaxed);
             return self.permit(bytes, 0, 0);
         }
+        if let Some(permit) = self.try_admit(bytes) {
+            return permit;
+        }
+        self.inner.admission_waiters.fetch_add(1, Ordering::SeqCst);
+        let _priority = AdmissionWait(&self.inner.admission_waiters);
+        self.reclaim();
         let units = units_for(bytes);
         Self::sem_units(&self.inner.admission, units, &self.inner.waits).await;
         Self::sem_units(&self.inner.sem, units, &self.inner.waits).await;
@@ -210,6 +236,41 @@ impl MemoryBudget {
         admission.forget();
         pool.forget();
         Some(self.permit(bytes, units, units))
+    }
+
+    /// Speculative admission never waits or overshoots, and yields to foreground waiters.
+    pub(crate) fn try_speculate(&self, bytes: usize) -> Option<MemoryPermit> {
+        if bytes > self.inner.admission_max
+            || bytes as u64 > (self.inner.total as u64).saturating_sub(self.resident_bytes())
+            || self.inner.admission_waiters.load(Ordering::SeqCst) != 0
+        {
+            return None;
+        }
+        let permit = self.try_admit(bytes)?;
+        if self.inner.admission_waiters.load(Ordering::SeqCst) != 0
+            || self.resident_bytes() > self.inner.total as u64
+        {
+            return None;
+        }
+        Some(permit)
+    }
+
+    pub(crate) fn register_reclaimer<T: Reclaim + 'static>(&self, reclaimer: &Arc<T>) {
+        let reclaimer: Arc<dyn Reclaim> = reclaimer.clone();
+        let mut reclaimers = self.inner.reclaimers.lock().expect("budget reclaimers");
+        reclaimers.retain(|r| r.strong_count() != 0);
+        reclaimers.push(Arc::downgrade(&reclaimer));
+    }
+
+    fn reclaim(&self) {
+        let reclaimers: Vec<_> = {
+            let mut reclaimers = self.inner.reclaimers.lock().expect("budget reclaimers");
+            reclaimers.retain(|r| r.strong_count() != 0);
+            reclaimers.iter().filter_map(Weak::upgrade).collect()
+        };
+        for reclaimer in reclaimers {
+            reclaimer.reclaim();
+        }
     }
 
     fn permit(&self, bytes: usize, units: u32, admission_units: u32) -> MemoryPermit {
@@ -237,6 +298,15 @@ pub async fn admit_opt(budget: Option<&MemoryBudget>, bytes: usize) -> Option<Me
     Some(budget?.admit(bytes).await)
 }
 
+/// [`MemoryPermit::absorb`] into an optional permit, taking `other` when empty
+pub(crate) fn absorb_into(into: &mut Option<MemoryPermit>, other: MemoryPermit) {
+    if let Some(p) = into {
+        p.absorb(other);
+    } else {
+        *into = Some(other);
+    }
+}
+
 /// Owned share of the pool, released on drop. Move it with the bytes it
 /// covers (batch hand-off transfers the permit, not the accounting)
 pub struct MemoryPermit {
@@ -252,6 +322,19 @@ pub struct MemoryPermit {
 impl MemoryPermit {
     pub fn bytes(&self) -> u64 {
         self.bytes
+    }
+
+    pub(crate) fn absorb(&mut self, mut other: Self) {
+        assert!(Arc::ptr_eq(&self.inner, &other.inner), "different budgets");
+        assert!(!(self.big_leaf && other.big_leaf), "multiple large leaves");
+        self.bytes += other.bytes;
+        self.units += other.units;
+        self.admission_units += other.admission_units;
+        self.big_leaf |= other.big_leaf;
+        other.bytes = 0;
+        other.units = 0;
+        other.admission_units = 0;
+        other.big_leaf = false;
     }
 
     /// Release the over-reserve once retained bytes are known: a permit
@@ -399,6 +482,80 @@ mod tests {
     #[test]
     fn host_memory_limit_reads_this_host() {
         assert_ne!(host_memory_limit(), Some(0));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn speculation_preserves_leaf_reserve_and_never_overshoots() {
+        let b = MemoryBudget::with_leaf_reserve(64 << 10, 32 << 10);
+        assert!(b.try_speculate((32 << 10) + 1).is_none());
+        let speculative = b.try_speculate(32 << 10).unwrap();
+        assert!(b.try_speculate(1).is_none());
+        let leaf = b.acquire(32 << 10).await;
+        assert_eq!(b.resident_bytes(), 64 << 10);
+        assert_eq!(b.overshoots_total(), 0);
+        assert_eq!(b.waits_total(), 0);
+        drop(speculative);
+        drop(leaf);
+        assert_eq!(b.resident_bytes(), 0);
+        let oversized = b.admit(128 << 10).await;
+        assert!(b.try_speculate(1).is_none());
+        assert_eq!(b.overshoots_total(), 1);
+        drop(oversized);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn foreground_waiter_blocks_speculation_until_cancellation() {
+        let b = MemoryBudget::with_leaf_reserve(4096, 2048);
+        let held = b.admit(2048).await;
+        let waiting_budget = b.clone();
+        let waiter = tokio::spawn(async move { waiting_budget.admit(2048).await });
+        while b.inner.admission_waiters.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+        assert!(b.try_speculate(0).is_none());
+        waiter.abort();
+        assert!(matches!(waiter.await, Err(e) if e.is_cancelled()));
+        assert_eq!(b.inner.admission_waiters.load(Ordering::SeqCst), 0);
+        drop(held);
+        assert!(b.try_speculate(2048).is_some());
+        assert_eq!(b.resident_bytes(), 0);
+    }
+
+    #[test]
+    fn try_admit_keeps_speculation() {
+        struct Count(AtomicU64);
+        impl Reclaim for Count {
+            fn reclaim(&self) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let b = MemoryBudget::with_leaf_reserve(4096, 2048);
+        let count = Arc::new(Count(AtomicU64::new(0)));
+        b.register_reclaimer(&count);
+        let speculative = b.try_speculate(2048).unwrap();
+        assert!(b.try_admit(1).is_none());
+        assert_eq!(count.0.load(Ordering::Relaxed), 0);
+        drop(speculative);
+        assert!(b.try_admit(1).is_some());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn transferred_admission_and_leaf_release_original_compartments() {
+        let b = MemoryBudget::with_leaf_reserve(8192, 4096);
+        let mut speculative = b.try_speculate(4096).unwrap();
+        speculative.shrink(1024);
+        let mut leaf = b.acquire(4096).await;
+        leaf.shrink(1024);
+        let resident = b.resident_bytes();
+        leaf.absorb(speculative);
+        assert_eq!(b.resident_bytes(), resident);
+        assert_eq!(leaf.bytes(), 2048);
+        let admission = b.try_admit(3072).unwrap();
+        assert!(b.try_speculate(1).is_none());
+        drop(leaf);
+        assert!(b.try_speculate(1024).is_some());
+        drop(admission);
+        assert_eq!(b.resident_bytes(), 0);
     }
 
     #[tokio::test(flavor = "current_thread")]

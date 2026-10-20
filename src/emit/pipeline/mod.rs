@@ -264,6 +264,11 @@ impl PipelineConfig {
         let ack_probe = ack.probe();
 
         let plan_dir = Arc::from(buffer.lock().await.scratch_dir());
+        let planning = if emitter.toast.read_ahead.unwrap_or(true) {
+            resolver.clone().with_read_ahead()
+        } else {
+            resolver.clone()
+        };
         let reorder = reorder::ReorderSink::booting(
             buffer,
             dbs,
@@ -273,7 +278,7 @@ impl PipelineConfig {
             ack,
             msg_tx,
             stats,
-            resolver.clone(),
+            planning,
             backfillers,
             fatal.clone(),
             span_registry,

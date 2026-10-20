@@ -354,6 +354,8 @@ pub struct ToastSettings {
     pub connections: Option<NonZeroUsize>,
     #[serde(default)]
     pub mode: ToastMode,
+    /// Start speculative TOAST reads before planning
+    pub read_ahead: Option<bool>,
 }
 
 pub(crate) const DEFAULT_INLINE_VALUE_MAX: usize = 1 << 30;
@@ -2670,6 +2672,10 @@ crate::atomic_stats! {
         /// Store fetch round trips; a batch covers many values
         pub toast_value_fetch_batches,
         pub toast_value_fetch_nanos,
+        /// Store reads started ahead of planning, off the serial path
+        pub toast_values_read_ahead,
+        /// Planning blocked on reads started ahead of it
+        pub toast_value_wait_nanos,
         /// Toasted values NULL/default-filled because no store could rebuild
         /// them (disabled mode). Surfaced, never silent
         pub toast_values_filled_default,
