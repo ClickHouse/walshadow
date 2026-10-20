@@ -66,6 +66,57 @@ enum Records {
     Decoding(JoinHandle<(Vec<Record<'static>>, Vec<Option<Predecoded>>)>),
 }
 
+/// Worker wall time by phase. Phases are disjoint, so they sum to the worker's
+/// wall time. Written once per phase change by the worker, read at status-tick
+/// cadence by the daemon.
+#[derive(Debug, Default)]
+pub struct WorkerClock {
+    /// Inside `on_records`/`on_idle_advance`/`on_idle`; includes TOAST fetches
+    pub busy_nanos: AtomicU64,
+    /// Parked in the channel wait
+    pub idle_nanos: AtomicU64,
+    /// Awaiting the blocking-pool predecode job of a dequeued batch
+    pub predecode_wait_nanos: AtomicU64,
+    pub blocked_out_nanos: AtomicU64,
+    blocked_source: std::sync::OnceLock<Arc<AtomicU64>>,
+}
+
+impl WorkerClock {
+    fn add(counter: &AtomicU64, since: Instant) {
+        counter.fetch_add(since.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    }
+
+    pub fn watch_blocked(&self, source: Arc<AtomicU64>) {
+        let _ = self.blocked_source.set(source);
+    }
+
+    fn blocked_now(&self) -> u64 {
+        self.blocked_source
+            .get()
+            .map_or(0, |b| b.load(Ordering::Relaxed))
+    }
+
+    fn add_busy(&self, since: Instant, blocked_before: u64) {
+        let blocked = self.blocked_now().saturating_sub(blocked_before);
+        let elapsed = since.elapsed().as_nanos() as u64;
+        self.busy_nanos
+            .fetch_add(elapsed.saturating_sub(blocked), Ordering::Relaxed);
+        self.blocked_out_nanos
+            .fetch_add(blocked.min(elapsed), Ordering::Relaxed);
+    }
+
+    /// Seconds `[busy, idle, predecode_wait, blocked_out]`
+    pub fn seconds(&self) -> [f64; 4] {
+        [
+            &self.busy_nanos,
+            &self.idle_nanos,
+            &self.predecode_wait_nanos,
+            &self.blocked_out_nanos,
+        ]
+        .map(|n| n.load(Ordering::Relaxed) as f64 / 1e9)
+    }
+}
+
 /// One channel message: wanted records plus the position of those the inner
 /// sink's [`RecordSink::wants`] skipped pump-side
 struct Batch {
@@ -96,6 +147,7 @@ pub struct QueueingRecordSink {
     /// queue from a stalled one.
     processed: Arc<AtomicU64>,
     send_wait_nanos: u64,
+    clock: Arc<WorkerClock>,
     worker: Option<JoinHandle<()>>,
     /// Per-txn span map; `Some` only with OTLP on. `flush_buf` stamps each
     /// shipped record's ship instant (`note_shipped`).
@@ -148,6 +200,8 @@ impl QueueingRecordSink {
         let err_w = err.clone();
         let in_flight_w = in_flight.clone();
         let processed_w = processed.clone();
+        let clock = Arc::new(WorkerClock::default());
+        let clock_w = clock.clone();
         let reg_w = span_registry.clone();
         let idle_interval = idle_interval.max(Duration::from_millis(1));
         // Unconstrained: the worker's per-record mutex awaits exhaust the coop
@@ -168,7 +222,10 @@ impl QueueingRecordSink {
                 };
             let mut last_yield = Instant::now();
             'outer: loop {
-                match tokio::time::timeout(idle_interval, rx.recv()).await {
+                let waiting = Instant::now();
+                let received = tokio::time::timeout(idle_interval, rx.recv()).await;
+                WorkerClock::add(&clock_w.idle_nanos, waiting);
+                match received {
                     Ok(Some(Batch {
                         shipped: enqueued,
                         records,
@@ -176,10 +233,14 @@ impl QueueingRecordSink {
                         skipped,
                         skipped_lsn,
                     })) => {
+                        let predecoding = Instant::now();
                         let (batch, mut pre) = match records {
                             Records::Ready(batch) => (batch, Vec::new()),
                             Records::Decoding(job) => match job.await {
-                                Ok(decoded) => decoded,
+                                Ok(decoded) => {
+                                    WorkerClock::add(&clock_w.predecode_wait_nanos, predecoding);
+                                    decoded
+                                }
                                 Err(e) => {
                                     let e = SinkError::Other(format!("predecode job: {e}"));
                                     park_err_and_drain(e, n + skipped, &mut rx).await;
@@ -187,6 +248,8 @@ impl QueueingRecordSink {
                                 }
                             },
                         };
+                        let busy = Instant::now();
+                        let blocked_before = clock_w.blocked_now();
                         // Batch spans only when some record is sampled.
                         let batch_sampled = reg_w.as_ref().is_some_and(|reg| {
                             batch
@@ -224,6 +287,7 @@ impl QueueingRecordSink {
                             park_err_and_drain(e, n + skipped, &mut rx).await;
                             break 'outer;
                         }
+                        clock_w.add_busy(busy, blocked_before);
                         processed_w.fetch_add(n + skipped, Ordering::Relaxed);
                         in_flight_w.fetch_sub(n + skipped, Ordering::Relaxed);
                         if last_yield.elapsed() >= YIELD_INTERVAL {
@@ -245,10 +309,13 @@ impl QueueingRecordSink {
                     Err(_) => {
                         // Idle wakeup: drive time-based inner work
                         // (CH emitter flush deadline).
+                        let busy = Instant::now();
+                        let blocked_before = clock_w.blocked_now();
                         if let Err(e) = inner.on_idle().await {
                             park_err_and_drain(e, 0, &mut rx).await;
                             break 'outer;
                         }
+                        clock_w.add_busy(busy, blocked_before);
                     }
                 }
             }
@@ -265,6 +332,7 @@ impl QueueingRecordSink {
             in_flight,
             processed,
             send_wait_nanos: 0,
+            clock,
             worker: Some(worker),
             span_registry,
         }
@@ -291,6 +359,11 @@ impl QueueingRecordSink {
 
     pub fn send_wait_seconds(&self) -> f64 {
         self.send_wait_nanos as f64 / 1e9
+    }
+
+    /// Worker wall-time accounting; see [`WorkerClock`].
+    pub fn worker_clock(&self) -> &WorkerClock {
+        &self.clock
     }
 
     /// False once the worker task ended: fatal-error drain closes the
@@ -552,6 +625,80 @@ mod tests {
         q.close().await.expect("close");
         let lsns: Vec<u64> = collected.lock().unwrap().iter().map(|&(l, _)| l).collect();
         assert_eq!(lsns, (1..=8).collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
+    async fn worker_clock_accounts_busy_and_idle() {
+        struct Slow;
+        impl RecordSink for Slow {
+            fn on_record<'a>(
+                &'a mut self,
+                _r: &'a Record<'a>,
+            ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
+                Box::pin(async move {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    Ok(())
+                })
+            }
+        }
+        let mut q = QueueingRecordSink::spawn(Slow, 1, 4, None);
+        // Worker idles before the first batch arrives
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        q.on_record(&synth(1)).await.expect("send");
+        let clock = q.clock.clone();
+        q.close().await.expect("close");
+        let [busy, idle, predecode, _] = clock.seconds();
+        assert!(busy >= 0.02, "busy {busy}");
+        assert!(idle >= 0.02, "idle {idle}");
+        assert_eq!(predecode, 0.0);
+    }
+
+    #[tokio::test]
+    async fn worker_clock_moves_downstream_wait_out_of_busy() {
+        struct Blocks(Arc<AtomicU64>);
+        impl RecordSink for Blocks {
+            fn on_record<'a>(
+                &'a mut self,
+                _r: &'a Record<'a>,
+            ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
+                Box::pin(async move {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    self.0.fetch_add(15_000_000, Ordering::Relaxed);
+                    Ok(())
+                })
+            }
+        }
+        let blocked = Arc::new(AtomicU64::new(0));
+        let mut q = QueueingRecordSink::spawn(Blocks(blocked.clone()), 1, 4, None);
+        q.worker_clock().watch_blocked(blocked);
+        q.on_record(&synth(1)).await.expect("send");
+        let clock = q.clock.clone();
+        q.close().await.expect("close");
+        let [busy, _, _, blocked_out] = clock.seconds();
+        assert_eq!(blocked_out, 0.015);
+        assert!(busy > 0.0, "busy {busy}");
+    }
+
+    #[tokio::test]
+    async fn worker_clock_accounts_blocked_in() {
+        struct Fast;
+        impl RecordSink for Fast {
+            fn on_record<'a>(
+                &'a mut self,
+                _r: &'a Record<'a>,
+            ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
+                Box::pin(Done)
+            }
+        }
+        let mut q = QueueingRecordSink::spawn(Fast, 1, 4, None).with_predecode(Arc::new(|_| {
+            std::thread::sleep(Duration::from_millis(20));
+            None
+        }));
+        q.on_record(&synth(1)).await.expect("send");
+        let clock = q.clock.clone();
+        q.close().await.expect("close");
+        let [_, _, blocked_in, _] = clock.seconds();
+        assert!(blocked_in > 0.0, "blocked_in {blocked_in}");
     }
 
     #[tokio::test]

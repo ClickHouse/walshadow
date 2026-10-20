@@ -9,6 +9,7 @@ use walshadow::backfill_bootstrap::BootstrapProgress;
 use walshadow::boundary_hold::BoundaryHoldStats;
 use walshadow::ch_emitter::EmitterStats;
 use walshadow::config::ConfigResolver;
+use walshadow::metrics::WorkerState;
 use walshadow::metrics::{DbSeries, MetricsRegistry, MetricsSnapshot, RateEstimator};
 use walshadow::pipeline::row_ledger::TableRowCounts;
 use walshadow::pos::{
@@ -640,7 +641,7 @@ pub(crate) fn stage_gauges_on(v: &StageCounters<'_>, base: MetricsSnapshot) -> M
         oracle_errors_total: oracle(|s| &s.errors),
         uptime_seconds: v.uptime_secs,
         bootstrap_attempt: v.bootstrap_attempt,
-        ..bootstrap_gauges(v.bootstrap, base)
+        ..bootstrap_gauges(v.bootstrap, v.emitter, base)
     }
 }
 
@@ -649,12 +650,38 @@ pub(crate) fn stage_gauges_on(v: &StageCounters<'_>, base: MetricsSnapshot) -> M
 /// attributable after the fact
 pub(crate) fn bootstrap_gauges(
     progress: Option<&BootstrapProgress>,
+    emitter: Option<&EmitterStats>,
     base: MetricsSnapshot,
 ) -> MetricsSnapshot {
     let Some(p) = progress else {
         return base;
     };
     let ld = |a: &AtomicU64| a.load(Ordering::Relaxed);
+    let mut base = base;
+    let mut worker_seconds = std::mem::take(&mut base.worker_seconds);
+    if let Some(s) = emitter {
+        merge_worker_seconds(&mut worker_seconds, emitter_worker_seconds(s).to_vec());
+    }
+    merge_worker_seconds(
+        &mut worker_seconds,
+        vec![
+            (
+                "backup_tap",
+                WorkerState::Busy,
+                secs(&p.pump.sink_chunk_nanos),
+            ),
+            (
+                "backup_walk",
+                WorkerState::Busy,
+                secs(&p.page_walk.decode_nanos),
+            ),
+            (
+                "backup_walk",
+                WorkerState::BlockedOut,
+                secs(&p.page_walk.channel_block_nanos),
+            ),
+        ],
+    );
     MetricsSnapshot {
         bootstrap_parts_total: ld(&p.pump.parts_total),
         bootstrap_parts_done: ld(&p.pump.parts_done),
@@ -663,11 +690,84 @@ pub(crate) fn bootstrap_gauges(
         bootstrap_tuples_emitted: ld(&p.page_walk.tuples_emitted),
         bootstrap_files_walked: ld(&p.page_walk.files_walked),
         bootstrap_files_skipped_unmapped: ld(&p.page_walk.files_skipped_unmapped),
-        bootstrap_decode_seconds: ld(&p.page_walk.decode_nanos) as f64 / 1e9,
-        bootstrap_tap_seconds: ld(&p.pump.sink_chunk_nanos) as f64 / 1e9,
-        bootstrap_channel_block_seconds: ld(&p.page_walk.channel_block_nanos) as f64 / 1e9,
+        worker_seconds,
         ..base
     }
+}
+
+pub(crate) fn merge_worker_seconds(
+    into: &mut Vec<(&'static str, WorkerState, f64)>,
+    fresh: Vec<(&'static str, WorkerState, f64)>,
+) {
+    for row in fresh {
+        if let Some(slot) = into.iter_mut().find(|(w, s, _)| *w == row.0 && *s == row.1) {
+            slot.2 = row.2;
+        } else {
+            into.push(row);
+        }
+    }
+}
+
+fn secs(nanos: &AtomicU64) -> f64 {
+    nanos.load(Ordering::Relaxed) as f64 / 1e9
+}
+
+pub(crate) struct PumpClock {
+    pub(crate) busy_secs: f64,
+    pub(crate) idle_secs: f64,
+    pub(crate) hold_secs: f64,
+    pub(crate) lap: Instant,
+    pub(crate) waited_secs: f64,
+}
+
+impl PumpClock {
+    pub(crate) fn lap(&mut self, send_wait_secs: f64) {
+        let now = Instant::now();
+        let spent = now.duration_since(self.lap).as_secs_f64();
+        self.lap = now;
+        let waited = self.idle_secs + self.hold_secs + send_wait_secs;
+        self.busy_secs += (spent - (waited - self.waited_secs)).max(0.0);
+        self.waited_secs = waited;
+    }
+}
+
+pub(crate) fn pipeline_worker_seconds(
+    pump: &PumpClock,
+    pump_send_wait_secs: f64,
+    queue: [f64; 4],
+    emitter: Option<&EmitterStats>,
+) -> Vec<(&'static str, WorkerState, f64)> {
+    use WorkerState::{BlockedIn, BlockedOut, Busy, Idle};
+    let [queue_busy, queue_idle, queue_predecode, queue_blocked_out] = queue;
+    let mut out = vec![
+        ("pump", Busy, pump.busy_secs),
+        ("pump", Idle, pump.idle_secs),
+        ("pump", BlockedIn, pump.hold_secs),
+        ("pump", BlockedOut, pump_send_wait_secs),
+        ("queue", Busy, queue_busy),
+        ("queue", Idle, queue_idle),
+        ("queue", BlockedIn, queue_predecode),
+        ("queue", BlockedOut, queue_blocked_out),
+    ];
+    if let Some(s) = emitter {
+        out.extend(emitter_worker_seconds(s));
+    }
+    out
+}
+
+fn emitter_worker_seconds(s: &EmitterStats) -> [(&'static str, WorkerState, f64); 5] {
+    use WorkerState::{BlockedOut, Busy, Idle};
+    [
+        ("batcher", Busy, secs(&s.batcher_busy_nanos)),
+        ("batcher", Idle, secs(&s.batcher_idle_nanos)),
+        ("batcher", BlockedOut, secs(&s.batcher_send_nanos)),
+        (
+            "inserter",
+            Busy,
+            secs(&s.inserter_encode_nanos) + secs(&s.inserter_ch_nanos),
+        ),
+        ("inserter", Idle, secs(&s.inserter_idle_nanos)),
+    ]
 }
 
 #[cfg(test)]
@@ -714,6 +814,56 @@ mod tests {
         let snap = registry.snapshot().await;
         assert_eq!(snap.emitter_rows_total, 17);
         assert_eq!(snap.archive_restore_active, 1);
+    }
+
+    #[test]
+    fn bootstrap_gauges_keep_pipeline_worker_rows() {
+        let progress = BootstrapProgress::default();
+        progress
+            .pump
+            .sink_chunk_nanos
+            .store(2_000_000_000, Ordering::Relaxed);
+        let base = MetricsSnapshot {
+            worker_seconds: vec![
+                ("queue", WorkerState::Busy, 1.5),
+                ("backup_tap", WorkerState::Busy, 1.0),
+            ],
+            ..MetricsSnapshot::default()
+        };
+        let emitter = EmitterStats::default();
+        let mut pump = PumpClock {
+            busy_secs: 1.0,
+            idle_secs: 0.0,
+            hold_secs: 0.25,
+            lap: Instant::now() - Duration::from_secs(2),
+            waited_secs: 0.0,
+        };
+        pump.lap(0.0);
+        assert!(pump.busy_secs >= 2.75, "{}", pump.busy_secs);
+        pump.busy_secs = 1.0;
+        let rows = pipeline_worker_seconds(&pump, 0.0, [1.5, 0.0, 0.0, 0.5], Some(&emitter));
+        assert!(rows.contains(&("queue", WorkerState::Busy, 1.5)));
+        assert!(rows.contains(&("queue", WorkerState::BlockedOut, 0.5)));
+        assert!(rows.contains(&("pump", WorkerState::BlockedIn, 0.25)));
+        let during_bootstrap =
+            bootstrap_gauges(Some(&progress), Some(&emitter), MetricsSnapshot::default());
+        assert!(
+            during_bootstrap
+                .worker_seconds
+                .iter()
+                .any(|(worker, ..)| *worker == "inserter")
+        );
+        let snap = bootstrap_gauges(Some(&progress), None, base);
+        assert_eq!(snap.worker_seconds[0], ("queue", WorkerState::Busy, 1.5));
+        assert_eq!(
+            snap.worker_seconds[1],
+            ("backup_tap", WorkerState::Busy, 2.0)
+        );
+        assert_eq!(snap.worker_seconds.len(), 4);
+        let mut rows = snap.worker_seconds;
+        merge_worker_seconds(&mut rows, vec![("queue", WorkerState::Busy, 3.0)]);
+        assert_eq!(rows[0], ("queue", WorkerState::Busy, 3.0));
+        assert_eq!(rows.len(), 4);
     }
 
     #[tokio::test]

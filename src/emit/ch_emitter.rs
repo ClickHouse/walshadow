@@ -2641,6 +2641,11 @@ crate::atomic_stats! {
         pub backfill_backup_pump: Arc<crate::backfill::backup_source::PumpStats>,
         pub backfill_backup_walk: Arc<crate::backfill::backup_page_walk::PageWalkStats>,
         pub blocks_sent,
+        pub inserter_idle_nanos,
+        pub batcher_busy_nanos,
+        pub batcher_idle_nanos,
+        pub batcher_send_nanos,
+        pub queue_blocked_out_nanos: Arc<std::sync::atomic::AtomicU64>,
         pub xacts_committed,
         pub unsupported_relations,
         /// DELETE rows dropped because `[system_columns] is_deleted = false`

@@ -28,7 +28,7 @@ count, so run in same region as source
 |---|---|
 | `walshadow_queue_records_out_total` | serial worker throughput, the ceiling being measured |
 | `walshadow_pump_queue_depth` | out of 131072; near cap means worker is the constraint |
-| `walshadow_pump_queue_wait_seconds_total` | rate() is fraction of time pump is blocked |
+| `walshadow_worker_seconds_total{worker="pump",state="blocked_out"}` | rate() is fraction of time pump is blocked |
 | `node_disk_io_time_seconds_total` on shadow data device | rate() near 1.0 means measuring disk, not walshadow |
 
 Check disk before believing any result. A 5m `rate()` takes five minutes to

@@ -29,6 +29,7 @@ writes. A documented limitation does not imply code rejects it
 | [Bootstrap visibility](bootstrap.md) | Prove pending-row recovery across load modes and restart |
 | [Bootstrap ordering](bootstrap_ordering.md) | Extend TOAST reads at page LSN and replacement evidence to per-table and pending loads |
 | [Verification](verification.md) | Prove value fidelity and restart without skipping WAL |
+| [Observability model](observability.md) | Migrate pre-existing families into the classes, add the debug exposition flag, fix the three alerts the model exposes |
 
 ## Further work
 
