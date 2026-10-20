@@ -423,7 +423,7 @@ fn run_ddl_intermix(ports: fx::Ports, decoder_pool: usize, inserter_pool: usize,
         )?)?;
         wait_for_metric_lsn(
             metrics_addr,
-            "walshadow_source_received_lsn",
+            "walshadow_position_lsn{at=\"received\"}",
             bootstrap_lsn,
             Duration::from_secs(120),
         )
@@ -505,7 +505,7 @@ fn run_ddl_intermix(ports: fx::Ports, decoder_pool: usize, inserter_pool: usize,
             walshadow::pg::parse_pg_lsn(&target_lsn_text).context("parse source LSN")?;
         wait_for_metric_lsn(
             metrics_addr,
-            "walshadow_emitter_ack_lsn",
+            "walshadow_position_lsn{at=\"ack\"}",
             target_lsn,
             Duration::from_secs(60),
         )

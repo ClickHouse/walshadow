@@ -2258,9 +2258,14 @@ async fn session_body(
         // drained, not the top-of-iteration values.
         let emitter_ack_for_metric = emitter_ack.get();
         let drain_for_metric = xact_stats.drain_lsn;
+        let source_wal_end = match path {
+            SourcePath::Archive(_) => None,
+            _ => Some(feed.last_server_wal_end()),
+        };
         populate_metrics(
             &metrics,
             received,
+            source_wal_end,
             Pos::new(now_dispatched),
             shadow_replay,
             drain_for_metric,

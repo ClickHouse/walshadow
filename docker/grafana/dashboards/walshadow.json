@@ -210,7 +210,7 @@
       },
       "targets": [
         {
-          "expr": "clamp_min(walshadow_source_received_lsn - walshadow_emitter_ack_lsn, 0)",
+          "expr": "walshadow_source_lag_bytes{to=\"ack\"}",
           "instant": true,
           "legendFormat": "backlog",
           "refId": "A"
@@ -638,7 +638,7 @@
           "refId": "B"
         },
         {
-          "expr": "clamp_min(walshadow_source_received_lsn - walshadow_emitter_ack_lsn, 0)",
+          "expr": "walshadow_source_lag_bytes{to=\"ack\"}",
           "legendFormat": "source to ClickHouse ack",
           "refId": "C"
         }
