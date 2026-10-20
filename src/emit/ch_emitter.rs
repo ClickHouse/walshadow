@@ -2631,6 +2631,10 @@ fn oracle_cell(v: Option<&ColumnValue>, source_type_oid: u32) -> Result<OracleCe
     })
 }
 
+/// Values-per-fetch buckets: 1 doubling to 256, where one means no batching
+/// and the top is past a typical deferred-resolution batch
+pub type ValuesPerFetch = crate::ops::metrics::Histogram<1, 9>;
+
 crate::atomic_stats! {
     /// CH emitter counters. `fetch_add(_, Relaxed)`; status loop reads
     /// via `.load(Relaxed)`.
@@ -2673,6 +2677,8 @@ crate::atomic_stats! {
         pub toast_values_read_ahead,
         /// Planning blocked on reads started ahead of it
         pub toast_value_wait_nanos,
+        /// Values requested per store fetch
+        pub toast_values_per_fetch: ValuesPerFetch,
         /// Toasted values NULL/default-filled because no store could rebuild
         /// them (disabled mode). Surfaced, never silent
         pub toast_values_filled_default,
