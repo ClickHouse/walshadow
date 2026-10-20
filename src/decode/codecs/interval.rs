@@ -31,38 +31,39 @@ pub fn decode_interval(body: &[u8]) -> Result<IntervalValue, CodecError> {
     })
 }
 
-/// One `years`/`mons`/`days` field, space-separated from what precedes it
-fn push_unit<const N: usize>(out: &mut AsciiBuf<N>, n: i32, singular: &str, plural: &str) {
-    if !out.is_empty() {
-        out.push(b' ');
-    }
-    out.push_int(n.into());
-    out.push(b' ');
-    out.push_str(if n.unsigned_abs() == 1 {
-        singular
-    } else {
-        plural
-    });
-}
-
 impl IntervalValue {
     /// PG `interval_out` with `IntervalStyle = postgres`
     pub fn to_text(&self) -> AsciiBuf<80> {
         let mut out = AsciiBuf::new();
-        let years = self.months / 12;
-        let mons = self.months % 12;
-        if years != 0 {
-            push_unit(&mut out, years, "year", "years");
-        }
-        if mons != 0 {
-            push_unit(&mut out, mons, "mon", "mons");
-        }
-        if self.days != 0 {
-            push_unit(&mut out, self.days, "day", "days");
+        let mut previous_negative = false;
+        for (n, unit) in [
+            (self.months / 12, "year"),
+            (self.months % 12, "mon"),
+            (self.days, "day"),
+        ] {
+            if n == 0 {
+                continue;
+            }
+            if !out.is_empty() {
+                out.push(b' ');
+            }
+            if previous_negative && n > 0 {
+                out.push(b'+');
+            }
+            out.push_int(n.into());
+            out.push(b' ');
+            out.push_str(unit);
+            if n != 1 {
+                out.push(b's');
+            }
+            previous_negative = n < 0;
         }
         if self.micros != 0 || out.is_empty() {
             if !out.is_empty() {
                 out.push(b' ');
+            }
+            if previous_negative && self.micros > 0 {
+                out.push(b'+');
             }
             write_time_us(&mut out, self.micros);
         }
@@ -129,7 +130,7 @@ mod tests {
             }
             .to_text()
             .as_str(),
-            "-1 mon",
+            "-1 mons",
         );
 
         assert!(decode_interval(&[0u8; 8]).is_err());
@@ -194,6 +195,30 @@ mod tests {
             micros: 1_000,
         };
         assert_eq!(v.to_text().as_str(), "00:00:00.001");
+    }
+
+    #[test]
+    fn interval_negative_fields_match_interval_out() {
+        for (months, days, micros, expected) in [
+            (0, -1, 0, "-1 days"),
+            (-1, 0, 0, "-1 mons"),
+            (-12, 0, 0, "-1 years"),
+            (-13, 0, 0, "-1 years -1 mons"),
+            (0, -1, 10_800_000_000, "-1 days +03:00:00"),
+            (-1, 2, 0, "-1 mons +2 days"),
+            (0, 1, -10_800_000_000, "1 day -03:00:00"),
+            (0, -1, -10_800_000_000, "-1 days -03:00:00"),
+            (-1, 2, 10_800_000_000, "-1 mons +2 days 03:00:00"),
+            (-1, 0, 10_800_000_000, "-1 mons +03:00:00"),
+            (11, 0, 0, "11 mons"),
+        ] {
+            let value = IntervalValue {
+                months,
+                days,
+                micros,
+            };
+            assert_eq!(value.to_text().as_str(), expected);
+        }
     }
 
     /// Longest output `interval_out` can produce, against the buffer bound
