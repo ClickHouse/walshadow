@@ -129,6 +129,13 @@ label_class! {
 }
 
 label_class! {
+    pub enum CommitPoint {
+        Source => "source",
+        Ack => "ack",
+    }
+}
+
+label_class! {
     pub enum WorkerState {
         Busy => "busy",
         Idle => "idle",
@@ -352,6 +359,12 @@ snapshot! {
         pause_consumed_lsn: u64,
         pause_received_lsn: u64,
         catalog_boundary_stalled_lsn: u64,
+        /// `xact_time` in PG epoch µs of the newest commit ClickHouse acked
+        /// and the newest the pump read, rendered
+        /// `walshadow_commit_timestamp_seconds{at}` in Unix seconds, each
+        /// only once a commit has been seen
+        emitter_ack_commit_timestamp_seconds: Option<i64>,
+        source_last_commit_timestamp_seconds: Option<i64>,
     }
 
     gauge xact_active: u64 = "Active transactions buffered in memory or on spill.",
@@ -617,6 +630,11 @@ snapshot! {
         "Catalog-boundary holds interrupted by decoder worker failure.",
     counter catalog_boundary_hold_seconds_total: f64 =
         "Cumulative seconds the pump parked in released catalog-boundary holds.",
+}
+
+/// `TimestampTz` (microseconds since 2000-01-01) as Unix seconds
+fn unix_seconds(pg_us: i64) -> f64 {
+    pg_us.saturating_add(walrus::pg::replication::PG_EPOCH_USEC) as f64 / 1e6
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -1265,6 +1283,24 @@ fn encode_snapshot(snap: &MetricsSnapshot, enc: &mut DescriptorEncoder<'_>) -> f
         "WAL byte positions, all published in one status tick so any two subtract without scrape skew. source_head is the newest server_wal_end heard on the source socket (present only while walshadow_source_mode is streaming: archive catch-up, reconnects, pauses and timeline crossings leave it out, and so does a fresh connection until its first message; after a pause or crossing on the same connection it holds the previous head until the next message); received the source head floored at the filter dispatch frontier; filter the last dispatched filtered byte; decoder_commit the highest commit drained; ack the ClickHouse watermark; shadow_replay the shadow Postgres replay position; floor the durable resume floor. pause_consumed and pause_received are the frontiers frozen by a pause, promotion_target_replay and promotion_target_receive the target's positions read while paused, timeline_switch the fork of the last crossing, catalog_boundary_stalled the replay target of a catalog boundary the shadow has not reached. A member is absent while its position is unknown (0).",
         "at",
         known_positions,
+    )?;
+
+    let commit_clocks = [
+        (
+            CommitPoint::Source,
+            snap.source_last_commit_timestamp_seconds,
+        ),
+        (CommitPoint::Ack, snap.emitter_ack_commit_timestamp_seconds),
+    ];
+    let known_clocks = commit_clocks
+        .into_iter()
+        .filter_map(|(at, ts)| ts.map(|pg_us| (at.label(), unix_seconds(pg_us))));
+    gauge_series(
+        enc,
+        "walshadow_commit_timestamp_seconds",
+        "Commit time in Unix seconds of the newest transaction at each point: source is the newest commit record the pump has read off the source, ack the newest transaction ClickHouse has acked. source minus ack is how far ClickHouse is behind what the pump has read, correct on an idle source but blind to WAL the pump has yet to read; time() minus ack covers that too and also counts source idleness. A member is absent until its first commit.",
+        "at",
+        known_clocks,
     )?;
 
     let mut records = declare(
@@ -1997,6 +2033,27 @@ mod tests {
         let body = render(snap);
         assert!(
             body.contains("walshadow_shadow_apply_lag_seconds inf"),
+            "{body}"
+        );
+    }
+
+    #[test]
+    fn render_omits_commit_timestamps_until_the_first() {
+        let body = render(MetricsSnapshot {
+            // 2000-01-01T00:00:00Z plus 1.5 s
+            emitter_ack_commit_timestamp_seconds: Some(1_500_000),
+            ..MetricsSnapshot::default()
+        });
+        assert!(
+            body.contains("# TYPE walshadow_commit_timestamp_seconds gauge"),
+            "{body}"
+        );
+        assert!(
+            body.contains("walshadow_commit_timestamp_seconds{at=\"ack\"} 946684801.5"),
+            "{body}"
+        );
+        assert!(
+            !body.contains("walshadow_commit_timestamp_seconds{at=\"source\"}"),
             "{body}"
         );
     }

@@ -60,6 +60,21 @@ primary LSN scraped elsewhere shows a sawtooth at high WAL rates. A gap in
 `source_head` means walshadow cannot see the source head, not that it has
 caught up.
 
+Lag in time rather than bytes:
+
+| `walshadow_commit_timestamp_seconds{at}` | Meaning |
+|---|---|
+| `at="source"` | commit time of the newest source transaction the pump has read; absent until the first commit |
+| `at="ack"` | commit time of the newest transaction ClickHouse has acknowledged; advances when `position_lsn{at="ack"}` passes a commit and holds while the ack moves over idle WAL, absent until the first acked commit |
+
+`commit_timestamp_seconds{at="source"} - ignoring(at) commit_timestamp_seconds{at="ack"}`
+is how far ClickHouse is behind what the pump has read, and stays correct while
+the source is idle. It does not include WAL the pump has yet to read, so it
+under-reports during archive catch-up or a restart catch-up.
+`time() - commit_timestamp_seconds{at="ack"}` covers that too, and also counts
+source idleness as lag. The two views answer different questions: bytes say how
+much WAL is still to process, seconds say how stale the destination is.
+
 Set `--metrics-bind` to expose OpenMetrics text metrics, which Prometheus
 scrapes directly. Counter series carry `_total`. Docker deployment uses port
 9484 and includes optional provisioned dashboard
