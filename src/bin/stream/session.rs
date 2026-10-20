@@ -55,7 +55,7 @@ use crate::housekeeping::{
 };
 use crate::metrics_publish::{
     DbMetricSources, DrainResident, ShadowMetricsView, SourceSwap, StageCounters, TimelineView,
-    populate_metrics,
+    populate_metrics, shadow_apply_lag,
 };
 use crate::runtime_cfg::{or_signal, sighup_reload};
 use crate::shadow_proc::{
@@ -2198,9 +2198,8 @@ pub(crate) async fn run_session(
         let emitter_stats: Option<&walshadow::ch_emitter::EmitterStats> =
             record_sink.emitter_stats.as_deref();
         let shadow_apply_lsn = shadow_replay.get();
-        let lag_bytes = received.get().saturating_sub(shadow_apply_lsn);
         rate_estimator.observe(Instant::now(), received.get());
-        let lag_seconds = rate_estimator.seconds_for(lag_bytes);
+        let apply_lag = shadow_apply_lag(received.get(), shadow_apply_lsn, &rate_estimator);
         // Post-worker snapshots so the metric reflects what the worker
         // drained, not the top-of-iteration values.
         let emitter_ack_for_metric = emitter_ack.get();
@@ -2234,8 +2233,7 @@ pub(crate) async fn run_session(
                 promotion,
             },
             ShadowMetricsView {
-                apply_lag_bytes: lag_bytes,
-                apply_lag_seconds: lag_seconds,
+                apply_lag,
                 active_connections: shadow_agg.active_connections as u64,
                 dropped_total: shadow_agg.dropped_total,
             },
