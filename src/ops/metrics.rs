@@ -130,6 +130,13 @@ label_class! {
 }
 
 label_class! {
+    pub enum CommitPoint {
+        Source => "source",
+        Ack => "ack",
+    }
+}
+
+label_class! {
     pub enum WorkerState {
         Busy => "busy",
         Idle => "idle",
@@ -192,6 +199,12 @@ macro_rules! encode_metric {
     };
     ($enc:expr, histogram, $name:expr, $help:expr, $value:expr) => {
         histogram($enc, $name, $help, &$value)?
+    };
+    // Same for a commit time not seen yet: a 0 sample reads as 56 years of lag
+    ($enc:expr, commit_ts, $name:expr, $help:expr, $value:expr) => {
+        if let Some(pg_us) = $value {
+            gauge($enc, $name, $help, unix_seconds(pg_us))?
+        }
     };
     ($enc:expr, counter, $name:expr, $help:expr, $value:expr, $key:literal, $labels:expr) => {
         counter_series($enc, $name, $help, $key, $labels.into_iter().zip($value))?
@@ -382,6 +395,12 @@ snapshot! {
         timeline_switch_lsn: u64,
         pause_consumed_lsn: u64,
         pause_received_lsn: u64,
+        /// `xact_time` in PG epoch µs of the newest commit ClickHouse acked
+        /// and the newest the pump read, rendered
+        /// `walshadow_commit_timestamp_seconds{at}` in Unix seconds, each
+        /// only once a commit has been seen
+        emitter_ack_commit_timestamp_seconds: Option<i64>,
+        source_last_commit_timestamp_seconds: Option<i64>,
     }
 
     gauge xact_active: u64 = "Active transactions buffered in memory or on spill.",
@@ -647,6 +666,11 @@ snapshot! {
         "Catalog-boundary holds woken with an error (worker death, walreceiver loss, timeout).",
     counter catalog_boundary_hold_seconds_total: f64 =
         "Cumulative seconds the pump parked in released catalog-boundary holds.",
+}
+
+/// `TimestampTz` (microseconds since 2000-01-01) as Unix seconds
+fn unix_seconds(pg_us: i64) -> f64 {
+    pg_us.saturating_add(walrus::pg::replication::PG_EPOCH_USEC) as f64 / 1e6
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -1301,6 +1325,20 @@ fn encode_snapshot(snap: &MetricsSnapshot, enc: &mut DescriptorEncoder<'_>) -> f
             .into_iter()
             .filter(|(_, lsn)| *lsn != 0)
             .map(|(at, lsn)| (at.label(), lsn)),
+    )?;
+
+    let commit_clocks = [
+        (CommitPoint::Source, snap.source_last_commit_timestamp_seconds),
+        (CommitPoint::Ack, snap.emitter_ack_commit_timestamp_seconds),
+    ];
+    gauge_series(
+        enc,
+        "walshadow_commit_timestamp_seconds",
+        "Commit time in Unix seconds of the newest transaction at each point: source is the newest commit record the pump has read off the source, ack the newest transaction ClickHouse has acked. source minus ack is how far behind the source's clock ClickHouse is and stays correct on an idle source; time() minus ack also counts source idleness. A member is absent until its first commit.",
+        "at",
+        commit_clocks
+            .into_iter()
+            .filter_map(|(at, ts)| ts.map(|pg_us| (at.label(), unix_seconds(pg_us)))),
     )?;
 
     // rmgr names come out of the fixed resource-manager table, so label values
@@ -1986,6 +2024,28 @@ mod tests {
             body.contains("walshadow_shadow_apply_lag_seconds inf"),
             "{body}"
         );
+    }
+
+    #[test]
+    fn render_omits_commit_timestamps_until_the_first() {
+        let body = render(MetricsSnapshot {
+            // 2000-01-01T00:00:00Z plus 1.5 s
+            emitter_ack_commit_timestamp_seconds: Some(1_500_000),
+            ..MetricsSnapshot::default()
+        });
+        assert!(
+            body.contains("# TYPE walshadow_commit_timestamp_seconds gauge"),
+            "{body}"
+        );
+        assert!(
+            body.contains("walshadow_commit_timestamp_seconds{at=\"ack\"} 946684801.5"),
+            "{body}"
+        );
+        assert!(
+            !body.contains("walshadow_commit_timestamp_seconds{at=\"source\"}"),
+            "{body}"
+        );
+        assert!(!body.contains("walshadow_emitter_ack_commit_timestamp_seconds"));
     }
 
     #[test]
