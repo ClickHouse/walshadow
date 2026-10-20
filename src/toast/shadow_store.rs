@@ -10,6 +10,7 @@
 //! reject decoded `ToastRow` values.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -70,6 +71,12 @@ impl From<&crate::ops::oracle::Oracle> for ShadowRead {
 pub struct ShadowToastStore {
     read: ShadowRead,
     replay_wait_max: Duration,
+    /// Highest replay position already observed, and the reconnect count it
+    /// was observed under. Replay only advances within one connection, so a
+    /// bound at or below the mark needs no round trip; a reconnect may have
+    /// restarted the shadow at an earlier restartpoint, which retires it
+    replay_seen: AtomicU64,
+    replay_seen_epoch: AtomicU64,
 }
 
 impl ShadowToastStore {
@@ -82,12 +89,22 @@ impl ShadowToastStore {
         Self {
             read: read.into(),
             replay_wait_max: REPLAY_WAIT_MAX,
+            replay_seen: AtomicU64::new(0),
+            replay_seen_epoch: AtomicU64::new(u64::MAX),
         }
     }
 
     pub fn with_replay_wait_max(mut self, max: Duration) -> Self {
         self.replay_wait_max = max;
         self
+    }
+
+    fn note_replay(&self, epoch: u64, at: u64) {
+        if self.replay_seen_epoch.swap(epoch, Ordering::Relaxed) != epoch {
+            self.replay_seen.store(at, Ordering::Relaxed);
+            return;
+        }
+        self.replay_seen.fetch_max(at, Ordering::Relaxed);
     }
 
     /// Return bound bridge or wait until readiness deadline
@@ -125,13 +142,25 @@ impl ShadowToastStore {
         if through == 0 || !bridge.info().in_recovery {
             return Ok(0);
         }
+        let epoch = bridge.stats.reconnects.load(Ordering::Relaxed);
+        // Epoch read either side of the mark: a reconnect landing between them
+        // retires the mark rather than letting it vouch for a restarted shadow
+        if self.replay_seen_epoch.load(Ordering::Relaxed) == epoch
+            && through <= self.replay_seen.load(Ordering::Relaxed)
+            && self.replay_seen_epoch.load(Ordering::Relaxed) == epoch
+        {
+            return Ok(through);
+        }
         let mut since = Instant::now();
         let mut last: Option<u64> = None;
         let mut unreachable = false;
         let mut poll = REPLAY_POLL;
         loop {
             match bridge.replay_lsn().await {
-                Ok(at) if at >= through => return Ok(through),
+                Ok(at) if at >= through => {
+                    self.note_replay(epoch, at);
+                    return Ok(through);
+                }
                 Ok(at) => {
                     if unreachable || last != Some(at) {
                         since = Instant::now();
