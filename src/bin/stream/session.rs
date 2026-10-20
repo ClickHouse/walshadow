@@ -71,9 +71,9 @@ use crate::source_db::{
 };
 use crate::source_recovery::{
     BARRIER_LOG_INTERVAL, FORK_FENCE_DRAIN, PROMOTION_POLL, PauseState, PromotionGate,
-    ReconnectBackoff, ResumePoint, SOURCE_SWAP_RETRY, SourcePath, SourceRecovery,
+    ReconnectBackoff, ResumePoint, SOURCE_SWAP_RETRY, SourceModeStats, SourcePath, SourceRecovery,
     commit_fork_resume, connect_source_waiting, promotion_gate, resume_manifest,
-    resume_source_feed, stream_branch, swap_reason,
+    resume_source_feed, stream_branch, stream_error_kind, swap_reason,
 };
 
 /// Wait out an unreachable ClickHouse at boot rather than exit, which leaves
@@ -1527,6 +1527,7 @@ async fn session_body(
     // iterations so a source error mid-crossing retries the crossing: at the
     // ancestor's switchpoint an ordinary reconnect has nothing to ask for
     let mut crossing = CrossingState::default();
+    let mut mode_stats = SourceModeStats::default();
     let mut pump_clock = PumpClock {
         busy_secs: 0.0,
         idle_secs: 0.0,
@@ -1881,6 +1882,7 @@ async fn session_body(
                 res => {
                     let err = match res {
                         Err(e) => {
+                            mode_stats.note_stream_error(stream_error_kind(Some(&e)));
                             tracing::warn!(
                                 target: "walshadow",
                                 error = %e,
@@ -1890,6 +1892,7 @@ async fn session_body(
                             e
                         }
                         _ => {
+                            mode_stats.note_stream_error(stream_error_kind(None));
                             tracing::info!(
                                 target: "walshadow",
                                 resume_lsn = %stream.next_lsn(),
@@ -1942,8 +1945,11 @@ async fn session_body(
                     .await;
             }
         }
+        mode_stats.observe(path.mode(paused, crossing.pending()));
         metrics
             .update(|snap| {
+                snap.source_mode = mode_stats.gauge();
+                snap.errors = mode_stats.errors;
                 snap.worker_seconds = pipeline_worker_seconds(
                     &pump_clock,
                     record_sink.decoder_xact.inner.send_wait_seconds(),
