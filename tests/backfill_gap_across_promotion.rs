@@ -74,12 +74,7 @@ fn db_oid(sh: &Shadow) -> Oid {
 
 /// Derive from LSN, `pg_walfile_name` reports preceding segment at a boundary
 fn current_segment(sh: &Shadow) -> SegmentName {
-    let lsn = wal_lsn(sh);
-    SegmentName {
-        timeline: timeline_of(sh),
-        log_id: (lsn >> 32) as u32,
-        seg_no: ((lsn & 0xFFFF_FFFF) / WAL_SEG_SIZE) as u32,
-    }
+    SegmentName::from_lsn(timeline_of(sh), wal_lsn(sh), WAL_SEG_SIZE)
 }
 
 /// Archive history and completed segments on current timeline

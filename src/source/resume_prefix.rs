@@ -161,14 +161,7 @@ fn page_address(segment: &[u8], page: usize) -> u64 {
 }
 
 fn segment_path(dir: &Path, timeline: u32, seg_size: u64, lsn: u64) -> PathBuf {
-    dir.join(
-        SegmentName {
-            timeline,
-            log_id: (lsn >> 32) as u32,
-            seg_no: ((lsn & 0xffff_ffff) / seg_size) as u32,
-        }
-        .format(),
-    )
+    dir.join(SegmentName::from_lsn(timeline, lsn, seg_size).format())
 }
 
 #[cfg(test)]

@@ -18,11 +18,7 @@ pub const WAL_SEG_SIZE: u64 = walrus::pg::wal::segment::DEFAULT_WAL_SEG_SIZE;
 /// `range.end` needs no further segment; inclusive callers pass
 /// `end.saturating_add(1)`
 pub fn segments_covering(timeline: u32, range: std::ops::Range<u64>) -> Vec<SegmentName> {
-    let mut cur = SegmentName {
-        timeline,
-        log_id: (range.start >> 32) as u32,
-        seg_no: ((range.start & 0xFFFF_FFFF) / WAL_SEG_SIZE) as u32,
-    };
+    let mut cur = SegmentName::from_lsn(timeline, range.start, WAL_SEG_SIZE);
     let segment_count = range
         .end
         .saturating_sub(cur.start_lsn(WAL_SEG_SIZE))

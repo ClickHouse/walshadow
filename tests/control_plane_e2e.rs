@@ -1757,7 +1757,7 @@ async fn archive_crosses_forks_when_ancestor_segments_are_partial_and_slot_is_ah
         let archive = h.tmp.path().join("archive");
         let wal = archive.join("wal_005");
         fs::create_dir_all(&wal)?;
-        let ancestor_name = walshadow::record::segments_covering(1, fork_start..fork_start + seg_size)[0].format();
+        let ancestor_name = SegmentName::from_lsn(1, fork_start, seg_size).format();
         let current = SegmentName::parse(current.trim())?.start_lsn(seg_size);
         let pg_wal = target.config().data_dir.join("pg_wal");
         for entry in fs::read_dir(&pg_wal)? {
@@ -1865,9 +1865,7 @@ async fn archive_recovery_discovers_branches_a_dead_source_never_proved() {
             }
         }
         for tli in [1u32, 2] {
-            let absent =
-                walshadow::record::segments_covering(tli, fork_start..fork_start + seg_size)[0]
-                    .format();
+            let absent = SegmentName::from_lsn(tli, fork_start, seg_size).format();
             ensure!(
                 !wal.join(&absent).exists(),
                 "{absent} must be absent so the read falls back to timeline 3",
