@@ -1,6 +1,7 @@
 pub mod archive;
 pub mod boundary_hold;
 pub mod catalog_capture;
+pub mod compact;
 pub mod manifest;
 mod noop_run;
 pub mod queueing_record_sink;

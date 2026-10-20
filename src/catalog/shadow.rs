@@ -157,6 +157,9 @@ pub struct ShadowConfig {
     pub socket_dir: PathBuf,
     /// Source path for shadow's `restore_command`.
     pub filter_out_dir: PathBuf,
+    /// `walshadow-stream` binary whose `restore-wal` expands compact
+    /// segments; `None` restores with `cp`
+    pub restore_bin: Option<PathBuf>,
     /// `None` resolves binaries via `$PATH`.
     pub pg_bin_dir: Option<PathBuf>,
     /// `pg_ctl -t`, both start and stop.
@@ -186,12 +189,21 @@ impl ShadowConfig {
             port: 55434,
             socket_dir,
             filter_out_dir,
+            restore_bin: None,
             pg_bin_dir: None,
             ctl_timeout: Duration::from_secs(60),
             wait_poll: Duration::from_millis(200),
             user: "postgres".to_string(),
             dbname: "postgres".to_string(),
             bridge: None,
+        }
+    }
+
+    pub fn restore_command(&self) -> String {
+        let dir = self.filter_out_dir.display();
+        match &self.restore_bin {
+            Some(bin) => format!("\"{}\" restore-wal {dir}/%f %p", bin.display()),
+            None => format!("cp {dir}/%f %p"),
         }
     }
 
@@ -312,10 +324,6 @@ impl Shadow {
         if fs::canonicalize(actual)? != fs::canonicalize(&self.config.data_dir)? {
             return Err(ShadowError::Incompatible("data_directory differs".into()));
         }
-        let restore = format!("cp {}/%f %p", self.config.filter_out_dir.display());
-        if self.probe_one("SHOW restore_command")? != restore {
-            return Err(ShadowError::Incompatible("restore_command differs".into()));
-        }
         if let Some(bridge) = &self.config.bridge {
             if self.probe_one("SHOW walshadow.socket_path")? != bridge.socket_path.to_string_lossy()
             {
@@ -414,11 +422,6 @@ impl Shadow {
         floor: &SourceGucFloor,
         primary_conninfo: Option<&str>,
     ) -> Result<()> {
-        let filter_dir = self
-            .config
-            .filter_out_dir
-            .to_str()
-            .expect("non-utf8 filter_out_dir");
         let mut conf = format!(
             "# walshadow-owned conf, regenerated each boot\n\
              hot_standby = on\n\
@@ -437,7 +440,6 @@ impl Shadow {
              max_wal_senders = {max_wal_senders}\n\
              max_prepared_transactions = {max_prepared_transactions}\n\
              max_locks_per_transaction = {max_locks_per_transaction}\n\
-             restore_command = 'cp {filter_dir}/%f %p'\n\
              recovery_target_timeline = 'latest'\n\
              wal_retrieve_retry_interval = '100ms'\n",
             sock = self.config.socket_str(),
@@ -449,8 +451,12 @@ impl Shadow {
             max_prepared_transactions = floor.max_prepared_transactions,
             max_locks_per_transaction = floor.max_locks_per_transaction,
         );
+        conf.push_str(&conf_line(
+            "restore_command",
+            &self.config.restore_command(),
+        ));
         if let Some(conninfo) = primary_conninfo {
-            conf.push_str(&primary_conninfo_line(conninfo));
+            conf.push_str(&conf_line("primary_conninfo", conninfo));
         }
         conf.push_str(&self.config.bridge_conf());
         let d = &self.config.data_dir;
@@ -469,19 +475,29 @@ impl Shadow {
         Ok(())
     }
 
-    /// Set `primary_conninfo` and reload running shadow. Appends, so an
-    /// adopted shadow — whose conf this daemon never regenerated — must not
-    /// gain a line per boot
+    /// Set `primary_conninfo` and `restore_command` and reload running
+    /// shadow. Appends, so an adopted shadow — whose conf this daemon never
+    /// regenerated — must not gain a line per boot
     pub fn point_at_walsender(&self, conninfo: &str) -> Result<()> {
-        if self
-            .probe_one("SHOW primary_conninfo")
-            .is_ok_and(|cur| cur == conninfo)
-        {
+        let restore = self.config.restore_command();
+        let lines: String = [
+            ("primary_conninfo", conninfo),
+            ("restore_command", restore.as_str()),
+        ]
+        .into_iter()
+        .filter(|(key, value)| {
+            !self
+                .probe_one(&format!("SHOW {key}"))
+                .is_ok_and(|cur| cur == *value)
+        })
+        .map(|(key, value)| conf_line(key, value))
+        .collect();
+        if lines.is_empty() {
             return Ok(());
         }
         let conf_path = self.config.data_dir.join("postgresql.conf");
         let mut f = fs::OpenOptions::new().append(true).open(&conf_path)?;
-        f.write_all(primary_conninfo_line(conninfo).as_bytes())?;
+        f.write_all(lines.as_bytes())?;
         self.run("pg_ctl", ["-D", self.config.data_str(), "reload"])?;
         Ok(())
     }
@@ -895,8 +911,8 @@ impl Shadow {
     }
 }
 
-fn primary_conninfo_line(conninfo: &str) -> String {
-    format!("primary_conninfo = '{}'\n", conninfo.replace('\'', "''"))
+fn conf_line(key: &str, value: &str) -> String {
+    format!("{key} = '{}'\n", value.replace('\'', "''"))
 }
 
 /// Parse required GUC values from `pg_controldata`
@@ -1174,7 +1190,27 @@ mod tests {
             .unwrap();
         let conf = fs::read_to_string(data_dir.join("postgresql.conf")).unwrap();
         assert!(!conf.contains("primary_conninfo"), "{conf}");
-        assert!(conf.contains("restore_command"), "{conf}");
+        assert!(conf.contains("restore_command = 'cp "), "{conf}");
+    }
+
+    #[test]
+    fn restore_command_expands_compact_segments_through_the_daemon() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+        let mut cfg = ShadowConfig::new(data_dir.clone(), "/var/lib/ws/filtered".into());
+        cfg.restore_bin = Some("/usr/bin/walshadow-stream".into());
+        Shadow::new(cfg)
+            .materialize_conf(&SourceGucFloor::default(), None)
+            .unwrap();
+        let conf = fs::read_to_string(data_dir.join("postgresql.conf")).unwrap();
+        assert!(
+            conf.contains(
+                "restore_command = '\"/usr/bin/walshadow-stream\" restore-wal \
+                 /var/lib/ws/filtered/%f %p'"
+            ),
+            "{conf}"
+        );
     }
 
     #[test]

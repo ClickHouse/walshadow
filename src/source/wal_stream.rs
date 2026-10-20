@@ -964,7 +964,12 @@ mod tests {
         sink.on_segment(next, &[0xBBu8; 64]).await.unwrap();
 
         let seg_path = tmp.path().join(seg.format());
-        assert_eq!(std::fs::read(&seg_path).unwrap(), bytes);
+        let read = |path: &std::path::Path| {
+            let file = std::fs::read(path).unwrap();
+            assert!(file.starts_with(crate::compact::MAGIC), "stored compact");
+            crate::compact::unpack(file, 64).unwrap()
+        };
+        assert_eq!(read(&seg_path), bytes);
         let msg = rx.try_recv().expect("segment enqueued for fsync");
         assert_eq!(
             msg.end_lsn(),
@@ -973,10 +978,7 @@ mod tests {
         assert_eq!(msg.seg_path(), seg_path);
 
         sink.close().await.unwrap();
-        assert_eq!(
-            std::fs::read(tmp.path().join(next.format())).unwrap(),
-            [0xBBu8; 64]
-        );
+        assert_eq!(read(&tmp.path().join(next.format())), [0xBBu8; 64]);
         assert_eq!(
             rx.recv().await.unwrap().seg_path(),
             tmp.path().join(next.format())

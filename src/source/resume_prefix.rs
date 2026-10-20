@@ -187,7 +187,8 @@ fn record_ends(segment: &[u8], seg_start: u64) -> Option<Vec<u64>> {
 /// `None` when the segment is absent; a retained one is always whole
 async fn read_segment(path: &Path, seg_size: u64) -> Result<Option<Vec<u8>>> {
     let bytes = match tokio::fs::read(path).await {
-        Ok(bytes) => bytes,
+        Ok(bytes) => super::compact::unpack(bytes, seg_size as usize)
+            .with_context(|| format!("expand {}", path.display()))?,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
     };

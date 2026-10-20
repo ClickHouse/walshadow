@@ -354,13 +354,12 @@ cloud credentials. When using static S3 credentials, set both `access_key` and
 
 Pass `--keep-shadow-running` or set `WALSHADOW_KEEP_SHADOW_RUNNING=true` to
 leave managed shadow PostgreSQL running when walshadow exits. On startup,
-walshadow checks recovery mode, data directory, restore command and bridge
-configuration before adopting it, and fails startup rather than restarting
-PostgreSQL. A changed shadow port or socket directory surfaces as a connection
+walshadow checks recovery mode, data directory and bridge configuration before
+adopting it, and fails startup rather than restarting PostgreSQL. A changed shadow port or socket directory surfaces as a connection
 failure during that check, not as a named mismatch. Extension replacement and
 increases in bridge worker count still require a separately planned PostgreSQL
-restart. `primary_conninfo` needs no restart: walshadow repoints an adopted
-shadow at its own walsender by reload.
+restart. `primary_conninfo` and `restore_command` need no restart: walshadow
+repoints an adopted shadow at its own walsender and filtered WAL by reload.
 
 For systemd, install `deploy/walshadow.service.d/process-restart.conf` as
 `/etc/systemd/system/walshadow.service.d/process-restart.conf` and run
