@@ -7,9 +7,9 @@ use std::time::Instant;
 
 use walshadow::backfill_bootstrap::BootstrapProgress;
 use walshadow::boundary_hold::BoundaryHoldStats;
-use walshadow::ch_emitter::EmitterStats;
+use walshadow::ch_emitter::{EmitterStats, TOAST_FETCH_VALUES_BOUNDS};
 use walshadow::config::ConfigResolver;
-use walshadow::metrics::{DbSeries, MetricsRegistry, MetricsSnapshot};
+use walshadow::metrics::{DbSeries, HistogramSnapshot, MetricsRegistry, MetricsSnapshot};
 use walshadow::pipeline::row_ledger::TableRowCounts;
 use walshadow::pos::{
     Drain, EmitterAck, FilterDispatched, Floor, Pos, ShadowReplay, SourceReceived,
@@ -128,7 +128,7 @@ impl DbMetricSources {
     /// Zero rather than absent for a handle this phase has not built yet,
     /// which reads the same as not yet counted
     pub(crate) fn series(&self) -> DbSeries {
-        use walshadow::bridge::{BridgeStats, OP_COUNT};
+        use walshadow::bridge::{BridgeStats, OP_COUNT, REQUEST_LATENCY_BOUNDS_NANOS};
         use walshadow::catalog_capture::CaptureStats;
         use walshadow::desc_log::DescLogStats;
         let ld = |a: &AtomicU64| a.load(Ordering::Relaxed);
@@ -140,6 +140,15 @@ impl DbMetricSources {
         };
         let bridge_op_seconds = |pick: fn(&BridgeStats) -> &[AtomicU64; OP_COUNT]| {
             bridge_ops(pick).map(|nanos| nanos as f64 / 1e9)
+        };
+        let bridge_latency = || -> [HistogramSnapshot; OP_COUNT] {
+            std::array::from_fn(|i| {
+                let mut folded = HistogramSnapshot::default();
+                for s in self.bridge.iter().flatten() {
+                    folded.merge(s.request_latency[i].snapshot(&REQUEST_LATENCY_BOUNDS_NANOS, 1e9));
+                }
+                folded
+            })
         };
         let log_stats = self.desc_log.as_ref().map(|log| log.stats_handle());
         let log = |pick: fn(&DescLogStats) -> &AtomicU64| -> u64 {
@@ -162,6 +171,7 @@ impl DbMetricSources {
             bridge_requests_by_op: bridge_ops(|s| &s.requests),
             bridge_errors_by_op: bridge_ops(|s| &s.errors),
             bridge_request_seconds_by_op: bridge_op_seconds(|s| &s.request_nanos),
+            bridge_request_duration_seconds_by_op: bridge_latency(),
             bridge_lock_wait_seconds_by_op: bridge_op_seconds(|s| &s.lock_wait_nanos),
             bridge_service_seconds_by_op: bridge_op_seconds(|s| &s.service_nanos),
             bridge_request_bytes_by_op: bridge_ops(|s| &s.request_bytes),
@@ -530,6 +540,10 @@ pub(crate) fn stage_gauges_on(v: &StageCounters<'_>, base: MetricsSnapshot) -> M
         toast_values_fetched_total: emitter(|s| &s.toast_values_fetched),
         toast_value_fetch_batches_total: emitter(|s| &s.toast_value_fetch_batches),
         toast_value_fetch_seconds: emitter_seconds(|s| &s.toast_value_fetch_nanos),
+        toast_values_per_fetch: v.emitter.map_or_else(HistogramSnapshot::default, |s| {
+            s.toast_values_per_fetch
+                .snapshot(&TOAST_FETCH_VALUES_BOUNDS, 1.0)
+        }),
         toast_image_rows_mirrored_total: emitter(|s| &s.toast_image_rows_mirrored),
         toast_values_filled_superseded_total: emitter(|s| &s.toast_values_filled_superseded),
         toast_values_filled_mismatch_total: emitter(|s| &s.toast_values_filled_mismatch),
@@ -873,6 +887,8 @@ mod tests {
         let bump = |s: &BridgeStats, n: u64| {
             s.up.store(1, Ordering::Relaxed);
             s.requests[encode].fetch_add(n, Ordering::Relaxed);
+            s.request_latency[encode]
+                .observe(&walshadow::bridge::REQUEST_LATENCY_BOUNDS_NANOS, 30_000);
             s.native_bytes.fetch_add(n, Ordering::Relaxed);
         };
         let (live, boot) = (
@@ -894,6 +910,10 @@ mod tests {
         let handed_over = sources([Some(live.clone()), Some(boot.clone())]).series();
         assert_eq!(handed_over.database, "app");
         assert_eq!(handed_over.bridge_native_bytes_total, 7);
+        assert_eq!(
+            handed_over.bridge_request_duration_seconds_by_op[encode].count, 2,
+            "both bridges' latency samples fold into one histogram"
+        );
         assert_eq!(
             handed_over.bridge_requests_by_op[encode], 7,
             "both bridges' requests land on the database's series"

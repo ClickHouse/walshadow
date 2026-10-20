@@ -1331,6 +1331,10 @@ impl ToastResolver {
         self.stats
             .toast_value_fetch_batches
             .fetch_add(1, Ordering::Relaxed);
+        self.stats.toast_values_per_fetch.observe(
+            &crate::emit::ch_emitter::TOAST_FETCH_VALUES_BOUNDS,
+            values.len() as u64,
+        );
         let assembled = got
             .iter()
             .filter(|v| matches!(v, FetchedValue::Assembled(_)))
@@ -2123,6 +2127,11 @@ mod tests {
             1,
             "miss does not count as fetched"
         );
+        // Both lookups were one-value fetches, miss included
+        let per_fetch = stats
+            .toast_values_per_fetch
+            .snapshot(&crate::emit::ch_emitter::TOAST_FETCH_VALUES_BOUNDS, 1.0);
+        assert_eq!((per_fetch.count, per_fetch.buckets[0].1), (2, 2));
     }
 
     #[tokio::test]
