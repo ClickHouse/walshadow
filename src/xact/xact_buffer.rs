@@ -2439,45 +2439,47 @@ pub async fn detoast_heap(
     chunk_maps: &[&ChunkRefMap],
     resolver: &ToastResolver,
 ) -> std::result::Result<Option<crate::budget::MemoryPermit>, XactBufferError> {
+    // Attached at decode: same descriptor interpretation from decode to
+    // detoast regardless of captures landing in between
+    let rel = heap.descriptor.clone();
+    let db = heap.decoded.rfn.db_node;
+    // Values an earlier row version resolved skip store and decode both
+    let cached: usize = [heap.decoded.new.as_mut(), heap.decoded.old.as_mut()]
+        .into_iter()
+        .flatten()
+        .map(|t| resolver.fill_cached(db, t, &rel))
+        .sum();
     let mut pointers: Vec<ToastPointer> = Vec::new();
     collect_toast_pointers(heap.decoded.new.as_ref(), &mut pointers);
     collect_toast_pointers(heap.decoded.old.as_ref(), &mut pointers);
-    if pointers.is_empty() {
+    if pointers.is_empty() && cached == 0 {
         return Ok(None);
     }
     let leaf_need = check_value_caps(
         pointers.iter().copied(),
         resolver.inline_value_max(),
         resolver.overflow(),
-    )?;
+    )? + cached;
     // Oversized values need no fetch under null policy
     pointers.retain(|p| !resolver.value_oversize(p));
     // One leaf at a time per worker: reserved for the heap's aggregate
     // resolution peak (every retained decoded value + the largest
     // single-value transient), shrunk to retained bytes before return
     let mut leaf = crate::budget::acquire_opt(resolver.budget(), leaf_need).await;
-    // Attached at decode: same descriptor interpretation from decode to
-    // detoast regardless of captures landing in between
-    let rel = heap.descriptor.clone();
     let mut uses: HashMap<(u32, u32), u32> = HashMap::with_capacity(pointers.len());
     for p in &pointers {
         *uses.entry((p.va_toastrelid, p.va_valueid)).or_default() += 1;
     }
-    let cache = prefetch_store_values(
-        &pointers,
-        chunk_maps,
-        resolver,
-        heap.decoded.rfn.db_node,
-        heap.decoded.source_lsn,
-    )
-    .await?;
+    let cache =
+        prefetch_store_values(&pointers, chunk_maps, resolver, db, heap.decoded.source_lsn).await?;
     let mut res = ValueResolution {
         spool,
         xact_maps: chunk_maps,
         resolver,
+        db,
         uses,
         cache,
-        retained: 0,
+        retained: cached,
     };
     if let Some(t) = heap.decoded.new.as_mut() {
         res.resolve_tuple(t, &rel)?;
@@ -2669,6 +2671,7 @@ struct ValueResolution<'a> {
     spool: Option<&'a BodySpoolFile>,
     xact_maps: &'a [&'a ChunkRefMap],
     resolver: &'a ToastResolver,
+    db: u32,
     /// Pointer occurrences per key across both tuples, sizing cache
     /// retention (last use moves instead of cloning)
     uses: HashMap<(u32, u32), u32>,
@@ -2699,7 +2702,9 @@ impl ValueResolution<'_> {
                 match reassemble_value_ref(&p, self.spool, v)? {
                     Reassembled::Bytes(raw) => {
                         self.retained += raw.len();
-                        *col = Some(detoasted_value(raw, type_oid));
+                        let value = detoasted_value(raw, type_oid);
+                        self.resolver.remember_value(self.db, &p, type_oid, &value);
+                        *col = Some(value);
                     }
                     // Disabled mode: surface the unresolvable value as
                     // NULL/default downstream (`append_default`), counted,
@@ -2757,7 +2762,9 @@ impl ValueResolution<'_> {
         match cached {
             Ok(raw) => {
                 self.retained += raw.len();
-                Ok(detoasted_value(raw, type_oid))
+                let value = detoasted_value(raw, type_oid);
+                self.resolver.remember_value(self.db, p, type_oid, &value);
+                Ok(value)
             }
             Err(miss) => fill_store_miss(miss, p, self.resolver, MissPolicy::Streaming)
                 .map_err(XactBufferError::Detoast),
@@ -4445,6 +4452,7 @@ mod tests {
             spool,
             xact_maps,
             resolver,
+            db: 0,
             uses: HashMap::from_iter([((16500u32, 55u32), 1)]),
             cache,
             retained: 0,
@@ -4697,6 +4705,7 @@ mod tests {
             spool: None,
             xact_maps: &[],
             resolver: &resolver,
+            db: 0,
             uses: HashMap::from_iter([((16500u32, 55u32), 2)]),
             cache,
             retained: 0,

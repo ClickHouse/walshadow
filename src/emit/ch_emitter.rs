@@ -354,6 +354,8 @@ pub struct ToastSettings {
     pub connections: Option<NonZeroUsize>,
     #[serde(default)]
     pub mode: ToastMode,
+    /// Decoded value bytes kept for later row versions, 0 disables
+    pub value_cache_bytes: Option<usize>,
 }
 
 pub(crate) const DEFAULT_INLINE_VALUE_MAX: usize = 1 << 30;
@@ -2670,6 +2672,8 @@ crate::atomic_stats! {
         /// Store fetch round trips; a batch covers many values
         pub toast_value_fetch_batches,
         pub toast_value_fetch_nanos,
+        /// Values served by the value cache instead of the store
+        pub toast_value_cache_hits,
         /// Toasted values NULL/default-filled because no store could rebuild
         /// them (disabled mode). Surfaced, never silent
         pub toast_values_filled_default,

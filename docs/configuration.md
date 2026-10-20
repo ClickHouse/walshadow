@@ -220,6 +220,7 @@ Tune chunk-store buffering independently of inserter count, restart daemon to ap
 | `put_batch_rows` | 65,536 | Seal chunk INSERT after this many rows |
 | `put_batch_bytes` | 67,108,864 | Seal chunk INSERT after this many body bytes |
 | `connections` | `ch.inserter_pool_size` | Limit concurrent chunk-store connections |
+| `value_cache_bytes` | 1,073,741,824 | Keep decoded values for later row versions, 0 disables |
 
 Both seals apply to bootstrap and WAL chunk writes. Each bootstrap drain holds
 its own batch, so more lanes can multiply buffered chunk bodies. A byte seal
@@ -237,6 +238,13 @@ put_batch_bytes = 4194304
 
 The three buffering settings require positive integers.
 `[bootstrap] lanes` and `[ch] inserter_pool_size` controls are independent
+
+An update that leaves a large value unchanged carries the same pointer, so the
+row needs the value again. `value_cache_bytes` bounds decoded values kept from
+the transaction WAL and earlier reads, least recently used out, so such rows
+skip the read and the decode. The cache is outside `[memory]`
+`resident_payload_max`. `toast_value_cache_hits_total` counts values served
+from it
 
 ### Value mode
 

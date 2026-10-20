@@ -553,6 +553,7 @@ pub(crate) fn stage_gauges_on(v: &StageCounters<'_>, base: MetricsSnapshot) -> M
         toast_values_fetched_total: emitter(|s| &s.toast_values_fetched),
         toast_value_fetch_batches_total: emitter(|s| &s.toast_value_fetch_batches),
         toast_value_fetch_seconds: emitter_seconds(|s| &s.toast_value_fetch_nanos),
+        toast_value_cache_hits_total: emitter(|s| &s.toast_value_cache_hits),
         toast_image_rows_mirrored_total: emitter(|s| &s.toast_image_rows_mirrored),
         toast_values_filled_superseded_total: emitter(|s| &s.toast_values_filled_superseded),
         toast_values_filled_mismatch_total: emitter(|s| &s.toast_values_filled_mismatch),

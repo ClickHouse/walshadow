@@ -119,6 +119,8 @@ pub struct Planner<'a, V> {
     /// Mirror rows carried by earlier batches; batch-relative row indices
     /// re-base against this
     rows_base: usize,
+    /// Chunk generations whose value ids the resolver already forgot
+    generations_seen: usize,
 }
 
 impl<'a, V: PlanRouteView> Planner<'a, V> {
@@ -133,6 +135,7 @@ impl<'a, V: PlanRouteView> Planner<'a, V> {
             view,
             resolver,
             rows_base: 0,
+            generations_seen: 0,
         })
     }
 
@@ -146,6 +149,11 @@ impl<'a, V: PlanRouteView> Planner<'a, V> {
             is_final: _,
         } = batch.into_walk();
         let ref_maps: Vec<&ChunkRefMap> = chunks.iter().map(|g| g.map()).collect();
+        // Chunks born here start a new value under their id
+        for map in ref_maps.iter().skip(self.generations_seen) {
+            self.resolver.forget_values(map.keys());
+        }
+        self.generations_seen = ref_maps.len();
         // One spool per xact; generations sealed before spooling carry None
         let spool = chunks.iter().find_map(|g| g.spool());
         // Batch-relative mirror rows sealed so far
@@ -154,6 +162,7 @@ impl<'a, V: PlanRouteView> Planner<'a, V> {
             match step {
                 WalkStep::Rows { upto } => cursor = cursor.max(upto),
                 WalkStep::Event(e) => {
+                    self.resolver.clear_values();
                     // Boxed: rare, and deep enough to bloat every plan future
                     Box::pin(self.view.apply(&e))
                         .await
@@ -161,6 +170,7 @@ impl<'a, V: PlanRouteView> Planner<'a, V> {
                     self.writer.push_control(e, self.rows_base + cursor);
                 }
                 WalkStep::Truncate { heap, upto } => {
+                    self.resolver.clear_values();
                     let route = self.view.route_for(&heap);
                     self.writer
                         .push_truncate(heap, route, self.rows_base + upto)?;
@@ -780,5 +790,262 @@ mod tests {
         // Unmapped discard planned as such
         let item = rd.next_item().unwrap();
         assert!(matches!(item, Some(PlanItem::Heap(h)) if h.route.is_none()));
+    }
+
+    /// Model shadow, replayed ahead of planning: value bodies still in the
+    /// toast index, dead or alive, with the LSN their chunks were born at.
+    /// Chunks born after the referring row read as a later generation, as
+    /// the xid ceiling judges them
+    #[derive(Default)]
+    struct ModelStore(std::sync::Mutex<HashMap<u32, (Vec<u8>, u64)>>);
+
+    #[async_trait::async_trait]
+    impl crate::toast::ChunkStore for ModelStore {
+        async fn fetch_many(
+            &self,
+            _db_oid: u32,
+            _toast_relid: u32,
+            values: &[(u32, usize)],
+            max_lsn: u64,
+        ) -> Result<Vec<crate::toast::FetchedValue>, crate::toast::ChunkStoreError> {
+            use crate::toast::FetchedValue;
+            let index = self.0.lock().unwrap();
+            Ok(values
+                .iter()
+                .map(|(id, _)| match index.get(id) {
+                    Some((_, born)) if *born > max_lsn => FetchedValue::Generation,
+                    Some((body, _)) => FetchedValue::Assembled(body.clone()),
+                    None => FetchedValue::Missing,
+                })
+                .collect())
+        }
+    }
+
+    /// Value of every planned row, in plan order
+    async fn plan_values(
+        b: &mut XactBuffer,
+        xid: u32,
+        rel: &Arc<RelDescriptor>,
+        resolver: &ToastResolver,
+        dir: &std::path::Path,
+    ) -> Vec<ColumnValue> {
+        let mut view = MapView {
+            routes: HashMap::from_iter([(rel.rel_name.clone(), route())]),
+            dropped: HashSet::new(),
+            applied: Vec::new(),
+        };
+        let path = dir.join(format!("{xid}.plan"));
+        let mut planner = Planner::create(path, 1 << 20, &mut view, resolver).unwrap();
+        let commit = u64::from(xid) << 12 | 0x100;
+        let stash = StashResolved::nothing_stashed(xid);
+        let mut drain = b
+            .drain_committed(stash, 0, commit, &[], false)
+            .await
+            .unwrap();
+        while let Some(batch) = drain.next_batch(1, usize::MAX, None).await.unwrap() {
+            let is_final = batch.is_final;
+            planner.plan_batch(batch).await.unwrap();
+            if is_final {
+                break;
+            }
+        }
+        drain.finish().await.unwrap();
+        let plan = planner.seal(commit, 0).unwrap();
+        let mut rd = plan.replay().unwrap();
+        let mut out = Vec::new();
+        while let Some(item) = rd.next_item().unwrap() {
+            if let PlanItem::Heap(h) = item {
+                let d = h.described.decoded;
+                let t = d.new.or(d.old).expect("row image");
+                out.push(t.columns[0].clone().expect("column"));
+            }
+        }
+        out
+    }
+
+    /// Value ids come from a tiny wrapping OID space, as in PostgreSQL only
+    /// once every chunk of the previous value is vacuumed, truncated or
+    /// rewritten away; rewrites assign ids no WAL birth shows. Shadow
+    /// replays up to a few commits ahead of planning. Whatever the
+    /// sequence, lead and budget, a row planned through the value cache
+    /// carries the value its pointer names at that commit whenever a store
+    /// read at planning does, and NULL at worst
+    #[tokio::test(flavor = "current_thread")]
+    async fn value_cache_plans_what_the_store_holds() {
+        const TOAST: u32 = 16700;
+        const OIDS: u32 = 5;
+        let tmp = tempfile::tempdir().unwrap();
+        let rel = descriptor(16699, TEXTOID);
+        let text = |body: &[u8]| ColumnValue::Text(String::from_utf8(body.to_vec()).unwrap());
+        let row = |xid, lsn, op, vid| {
+            let t = Some(DecodedTuple {
+                columns: vec![Some(ColumnValue::ExternalToast(ToastPointer {
+                    va_rawsize: 12,
+                    va_extinfo: 8,
+                    va_valueid: vid,
+                    va_toastrelid: TOAST,
+                }))],
+                partial: false,
+            });
+            let delete = op == HeapOp::Delete;
+            DescribedHeap {
+                decoded: DecodedHeap {
+                    rfn: rel.rfn,
+                    xid,
+                    source_lsn: lsn,
+                    op,
+                    new: if delete { None } else { t.clone() },
+                    old: if delete { t } else { None },
+                },
+                descriptor: rel.clone(),
+                descriptor_valid_from: 0x40,
+            }
+        };
+        let (mut hits, mut exact) = (0, 0);
+        for seed in 1..=200u64 {
+            let mut rng = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            let mut below = |n: u64| {
+                rng ^= rng << 13;
+                rng ^= rng >> 7;
+                rng ^= rng << 17;
+                (rng % n) as u32
+            };
+            let store = Arc::new(ModelStore::default());
+            let stats = Arc::new(crate::emit::ch_emitter::EmitterStats::default());
+            let plain = ToastResolver::with_store(store.clone(), stats.clone());
+            // Room for 2 entries, or for every value
+            let budget = [300, 1 << 20][seed as usize % 2];
+            let cached = plain.clone().with_value_cache(budget);
+            let lead = below(4) as usize;
+            let dir = tmp.path().join(seed.to_string());
+            std::fs::create_dir(&dir).unwrap();
+            let mut bufs =
+                [cfg(dir.clone()), cfg(dir.clone())].map(|c| XactBuffer::new(c).unwrap());
+            let mut index: HashMap<u32, (Vec<u8>, u64)> = HashMap::new();
+            let mut dead: HashSet<u32> = HashSet::new();
+            let mut rows: Vec<u32> = Vec::new();
+            let mut next_oid = 1;
+            let mut queued = std::collections::VecDeque::new();
+            for c in 0..80u32 {
+                let (xid, lsn) = (c + 10, u64::from(c + 10) << 12);
+                let mut new_oid = |index: &HashMap<u32, (Vec<u8>, u64)>, taken: &[u32]| {
+                    (0..OIDS).find_map(|_| {
+                        let o = next_oid;
+                        next_oid = next_oid % OIDS + 1;
+                        (!index.contains_key(&o) && !taken.contains(&o)).then_some(o)
+                    })
+                };
+                let mut want = Vec::new();
+                let mut events = Vec::new();
+                let pick = (!rows.is_empty()).then(|| below(rows.len() as u64) as usize);
+                match (below(10), pick) {
+                    (0..=2, _) | (6, Some(_)) => {
+                        let Some(vid) = new_oid(&index, &[]) else {
+                            continue;
+                        };
+                        let body = format!("v{c:03}s{seed:03}").into_bytes();
+                        index.insert(vid, (body.clone(), lsn));
+                        want.push(text(&body));
+                        events.push((Some((vid, body)), row(xid, lsn + 8, HeapOp::Insert, vid)));
+                        match pick {
+                            // Value change: old id dies with the update
+                            Some(r) if below(2) == 0 => {
+                                dead.insert(rows[r]);
+                                events[0].1.decoded.op = HeapOp::Update;
+                                rows[r] = vid;
+                            }
+                            _ => rows.push(vid),
+                        }
+                    }
+                    (3..=5, Some(r)) => {
+                        want.push(text(&index[&rows[r]].0));
+                        events.push((None, row(xid, lsn, HeapOp::Update, rows[r])));
+                    }
+                    (7, Some(r)) => {
+                        let vid = rows.swap_remove(r);
+                        want.push(text(&index[&vid].0));
+                        events.push((None, row(xid, lsn, HeapOp::Delete, vid)));
+                        dead.insert(vid);
+                    }
+                    (8, _) => {
+                        index.retain(|vid, _| !dead.contains(vid));
+                        dead.clear();
+                    }
+                    (9, _) if below(2) == 0 => {
+                        let mut t = row(xid, lsn, HeapOp::Truncate, 0);
+                        t.decoded.new = None;
+                        events.push((None, t));
+                        index.clear();
+                        dead.clear();
+                        rows.clear();
+                        // Rows a later TRUNCATE supersedes discard unplanned
+                        while below(2) == 0
+                            && let Some(vid) = new_oid(&index, &[])
+                        {
+                            index.insert(vid, (format!("t{c:03}v{vid:03}").into_bytes(), lsn));
+                            rows.push(vid);
+                        }
+                    }
+                    (9, _) => {
+                        // Rewrite keeps live values, some under fresh ids
+                        index.retain(|vid, _| !dead.contains(vid));
+                        dead.clear();
+                        for r in 0..rows.len() {
+                            if below(2) == 0
+                                && let Some(vid) = new_oid(&index, &rows)
+                            {
+                                let (body, _) = index.remove(&rows[r]).unwrap();
+                                index.insert(vid, (body, lsn));
+                                rows[r] = vid;
+                            }
+                        }
+                        for b in &mut bufs {
+                            b.on_toast_barrier(xid, lsn, TOAST, lsn);
+                        }
+                    }
+                    _ => continue,
+                }
+                *store.0.lock().unwrap() = index.clone();
+                for (born, h) in &events {
+                    for b in &mut bufs {
+                        if let Some((vid, body)) = born {
+                            let chunk = crate::xact::spill::ToastChunk {
+                                db_oid: rel.rfn.db_node,
+                                toast_relid: TOAST,
+                                value_id: *vid,
+                                chunk_seq: 0,
+                                source_lsn: lsn,
+                                blkno: 0,
+                                offnum: 1,
+                                chunk_data: body.clone().into(),
+                            };
+                            b.on_toast_chunk(chunk, xid).await.unwrap();
+                        }
+                        b.on_heap(h.clone()).await.unwrap();
+                    }
+                }
+                queued.push_back((xid, want));
+                while queued.len() > lead || (c == 79 && !queued.is_empty()) {
+                    let (xid, want) = queued.pop_front().unwrap();
+                    let [b0, b1] = &mut bufs;
+                    let read = plan_values(b0, xid, &rel, &plain, &dir).await;
+                    let served = plan_values(b1, xid, &rel, &cached, &dir).await;
+                    for ((w, r), s) in want.iter().zip(&read).zip(&served) {
+                        assert!(
+                            s == w || r != w && *s == ColumnValue::Null,
+                            "seed {seed} xid {xid}: {s:?} {r:?} {w:?}"
+                        );
+                        exact += usize::from(s == w && r != w);
+                    }
+                }
+            }
+            hits += stats
+                .toast_value_cache_hits
+                .load(std::sync::atomic::Ordering::Relaxed);
+        }
+        assert!(
+            hits > 1000 && exact > 10,
+            "{hits} cache hits, {exact} past a store miss"
+        );
     }
 }

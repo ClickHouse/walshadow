@@ -264,6 +264,16 @@ impl PipelineConfig {
         let ack_probe = ack.probe();
 
         let plan_dir = Arc::from(buffer.lock().await.scratch_dir());
+        let cache_bytes = emitter
+            .toast
+            .value_cache_bytes
+            .unwrap_or(crate::toast::value_cache::VALUE_CACHE_BYTES);
+        // Each sink plans one commit-ordered stream, so it owns a fresh cache
+        let planning = if cache_bytes == 0 || resolver.fill_on_miss() {
+            resolver.clone()
+        } else {
+            resolver.clone().with_value_cache(cache_bytes)
+        };
         let reorder = reorder::ReorderSink::booting(
             buffer,
             dbs,
@@ -273,7 +283,7 @@ impl PipelineConfig {
             ack,
             msg_tx,
             stats,
-            resolver.clone(),
+            planning,
             backfillers,
             fatal.clone(),
             span_registry,

@@ -181,7 +181,8 @@ async fn tombstones_supersede_then_truncate_wipes_then_drop_retires() {
             app_name: "walshadow-toast-tombstone",
             ddl: Some(fx::DdlPipelineArgs::default()),
         },
-        move |_cfg| {},
+        // Value cache would serve the unchanged pointers; pin mirror reads
+        move |cfg| cfg.toast.value_cache_bytes = Some(0),
     )
     .await;
     let stats = pipeline.stats.clone();
