@@ -2237,6 +2237,7 @@ pub(crate) async fn run_session(
                 apply_lag_bytes: lag_bytes,
                 apply_lag_seconds: lag_seconds,
                 active_connections: shadow_agg.active_connections as u64,
+                compact_connections: shadow_agg.compact_connections as u64,
                 dropped_total: shadow_agg.dropped_total,
             },
             &boundary_hold_stats,

@@ -26,6 +26,10 @@
 /* chunks found, but sequence or total size does not match pointer */
 #define WS_FETCH_MISMATCH 0x02
 
+/* START_REPLICATION slot asking the daemon for compact 'z' frames; kept in
+ * step with STREAM_SLOT in src/source/compact.rs */
+#define WS_COMPACT_SLOT "walshadow_compact"
+
 /* Maximum values sharing one FETCH_TOAST replay bound */
 #define WS_MAX_FETCH_VALUES 1024
 
@@ -58,6 +62,10 @@ typedef enum WsCatalog {
 
 extern void
 ws_handle_encode_native(StringInfo req, StringInfo resp);
+
+/* walrcv.c */
+extern void
+ws_walrcv_init(void);
 
 /* toast.c */
 extern void

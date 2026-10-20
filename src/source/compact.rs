@@ -4,13 +4,24 @@
 //!
 //! The payload is pairs of LEB128 lengths, `literal` then `zeros`, each
 //! literal followed by its bytes, until the expanded length is reached.
+//!
+//! The shadow stream carries it too: a walreceiver wrapped by the shadow's
+//! `walshadow.so` names [`STREAM_SLOT`] in `START_REPLICATION` and gets `'z'`
+//! frames, each an XLogData header, the expanded length and the payload,
+//! which the wrapper expands back into the `'w'` frame PostgreSQL reads.
 
 use std::io;
 use std::path::Path;
 
+use walrus::pg::replication::stream::now_pg_microseconds;
+
 /// Leads a compact segment file. A WAL segment starts with page magic
 /// `0xD1xx`, so neither is mistaken for the other
 pub const MAGIC: &[u8; 4] = b"WSZ1";
+
+/// Slot a shadow's wrapped walreceiver names to ask for `'z'` frames. Kept
+/// in step with `WS_COMPACT_SLOT` in `pgext/walshadow.h`
+pub const STREAM_SLOT: &str = "walshadow_compact";
 
 /// Shorter zero runs stay literal: a pair costs at least two bytes
 const MIN_ZEROS: usize = 16;
@@ -64,6 +75,16 @@ pub fn unpack(file: Vec<u8>, seg_size: usize) -> Result<Vec<u8>, Corrupt> {
     let mut out = Vec::with_capacity(seg_size);
     expand(payload, seg_size, &mut out)?;
     Ok(out)
+}
+
+/// Append a `'z'` frame carrying `data` from `start_lsn`
+pub fn encode_frame_into(out: &mut Vec<u8>, start_lsn: u64, server_wal_end: u64, data: &[u8]) {
+    out.push(b'z');
+    out.extend_from_slice(&start_lsn.to_be_bytes());
+    out.extend_from_slice(&server_wal_end.to_be_bytes());
+    out.extend_from_slice(&now_pg_microseconds().to_be_bytes());
+    out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+    encode(data, out);
 }
 
 /// Compact segment file contents
