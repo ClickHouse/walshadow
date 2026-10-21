@@ -132,7 +132,7 @@ async fn run_drill<F: FnOnce(&Shadow) -> std::thread::JoinHandle<()>>(
     (source, ch, tmp, tempfile::tempdir().unwrap())
 }
 
-async fn assert_ch_rows(ch: &fx::ChServer, expected: &[(i64, &str)]) {
+fn assert_ch_rows(ch: &fx::ChServer, expected: &[(i64, &str)]) {
     let ch_count = ch
         .query("SELECT count() FROM walshadow_test.s14_sub_t FINAL WHERE _is_deleted = 0")
         .expect("ch count");
@@ -190,7 +190,7 @@ async fn savepoint_rollback_discards_subxact_writes() {
         .psql_one("SELECT count(*) FROM s14.sub_t")
         .expect("source count");
     assert_eq!(src_count, "2", "source must hold id=1 + id=3");
-    assert_ch_rows(&ch, &[(1, "R1"), (3, "R3")]).await;
+    assert_ch_rows(&ch, &[(1, "R1"), (3, "R3")]);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -218,7 +218,7 @@ async fn savepoint_release_commits_subxact_writes() {
         .psql_one("SELECT count(*) FROM s14.sub_t")
         .expect("source count");
     assert_eq!(src_count, "2");
-    assert_ch_rows(&ch, &[(1, "R1"), (2, "R2")]).await;
+    assert_ch_rows(&ch, &[(1, "R1"), (2, "R2")]);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -250,7 +250,7 @@ async fn orm_nested_savepoints_only_post_savepoint_writes_survive() {
         .psql_one("SELECT count(*) FROM s14.sub_t")
         .expect("source count");
     assert_eq!(src_count, "2", "source must hold id=1 + id=4");
-    assert_ch_rows(&ch, &[(1, "R1"), (4, "R4")]).await;
+    assert_ch_rows(&ch, &[(1, "R1"), (4, "R4")]);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -287,7 +287,7 @@ async fn top_abort_with_subxacts_discards_everything() {
     assert_eq!(src_count, "1", "only the sentinel INSERT survives");
     // The aborted xact's id=1/R1, id=2/R2 (sub), id=3/R3 (post-RELEASE
     // on top) must all be discarded — only the sentinel reaches CH.
-    assert_ch_rows(&ch, &[(99, "sentinel")]).await;
+    assert_ch_rows(&ch, &[(99, "sentinel")]);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -367,7 +367,7 @@ async fn iud_in_aborted_top_xact_leaves_rows_untouched() {
         source.psql_one("SELECT count(*) FROM s14.sub_t").unwrap(),
         "2",
     );
-    assert_ch_rows(&ch, &[(1, "orig1"), (2, "orig2")]).await;
+    assert_ch_rows(&ch, &[(1, "orig1"), (2, "orig2")]);
     assert_eq!(
         ch.query("SELECT argMax(_is_deleted, _lsn) FROM walshadow_test.s14_sub_t WHERE id = 2")
             .unwrap(),

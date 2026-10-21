@@ -396,9 +396,8 @@ async fn handle_row(
             .append_routed(&row.committed, &row.route.mapping, op, leaf)
             .map_err(|e| e.to_string())?;
     }
-    // Every row of a chunk shares one permit, so the tail entry settles it:
-    // pushes for this table come only from this table's rows, and a seal
-    // clears the list so the next batch takes its own hold
+    // Rows sharing a permit arrive consecutively, so check only last entry.
+    // Sealing clears permit lists so each batch retains its own permits
     if let Some(p) = slice_permit
         && t.slice_permits
             .last()
@@ -406,7 +405,11 @@ async fn handle_row(
     {
         t.slice_permits.push(p.clone());
     }
-    if let Some(p) = row.value_permit {
+    if let Some(p) = row.value_permit
+        && t.value_permits
+            .last()
+            .is_none_or(|held| !Arc::ptr_eq(held, &p))
+    {
         t.value_permits.push(p);
     }
     match t.seq_counts.last_mut() {
@@ -1003,7 +1006,7 @@ mod tests {
         let (tx, rx, fatal, handle) = spawn_deadline_batcher(
             BatcherConfig {
                 row_budget: 1,
-                byte_budget: 1024,
+                byte_budget: 1,
                 inserters: 1,
                 flush_timeout: Duration::from_secs(60),
             },

@@ -194,11 +194,7 @@ async fn run(mut args: Args) -> Result<()> {
             reloader: reloader.clone(),
             frag_lock: Arc::new(Mutex::new(())),
         };
-        Some(
-            walshadow::control::serve(sock, ctx)
-                .await
-                .context("bind control socket")?,
-        )
+        Some(walshadow::control::serve(sock, ctx).context("bind control socket")?)
     } else {
         None
     };

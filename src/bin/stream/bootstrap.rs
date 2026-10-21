@@ -311,7 +311,7 @@ pub(crate) async fn run_bootstrap(
     // Metrics-only (no CH) has no mapping to filter against, so it walks all
     let (tap_filenodes, needs_oracle, routes) = match &ch_target {
         Some((_, mapping, resolved, skip_initial)) => {
-            let routed = mapping.snapshot().await;
+            let routed = mapping.snapshot();
             let is_routed = |d: &RelDescriptor| {
                 routing(d, Some(&resolved.rules))
                     .owner(d)
@@ -1248,7 +1248,7 @@ pub(crate) async fn bootstrap_build_mapping(
         )
     };
     // Publish rule-adjusted targets before creating tables
-    mapping.publish(merged_tables).await;
+    mapping.publish(merged_tables);
     let mut applicator = walshadow::ch_ddl::DdlApplicator::new(
         walshadow::config::DestEmitter::new(Arc::new(emitter_cfg.clone()), Some(config_rx.clone())),
         ddl_cfg,

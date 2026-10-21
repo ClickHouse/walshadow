@@ -422,7 +422,7 @@ async fn walk_and_ship(
             .or(resumed.map(Replayable::from));
         if let Some(spool) = deferred {
             let config = ctx.config_rx.as_ref().map(|rx| rx.borrow().clone());
-            let mapping = ctx.mapping.snapshot().await;
+            let mapping = ctx.mapping.snapshot();
             let replay_checkpoint = resumable.then_some(bootstrap::ReplayCheckpoint {
                 state: &mut checkpoint,
                 dir: &ctx.scratch_dir,
@@ -492,7 +492,7 @@ async fn walk_and_ship(
     // Record their manifests after publishing the pass
     outcome.pending_tables = visibility_pending::ship(
         pending,
-        &ctx.published.snapshot().await,
+        &ctx.published.snapshot(),
         ctx.dest.clone(),
         ctx.stats.clone(),
         resolver,
@@ -612,7 +612,7 @@ async fn run_walk(
         gated_rx,
         filter.clone(),
         freeze_routes(
-            &ctx.mapping.snapshot().await,
+            &ctx.mapping.snapshot(),
             ctx.config_rx
                 .as_ref()
                 .map(|rx| rx.borrow().clone())
@@ -857,7 +857,7 @@ async fn replay_gap(
         })
         .map_err(|e| anyhow::anyhow!("backup_backfill: replay xact buffer: {e}"))?,
     ));
-    buffer.lock().await.clear_spill_dir().await.ok();
+    buffer.lock().await.clear_spill_dir().ok();
 
     // Include opted-in main and TOAST filenodes
     let mut filter_rfns: HashSet<(Oid, Oid)> = targets.keys().copied().collect();
@@ -883,7 +883,7 @@ async fn replay_gap(
         from_lsn,
         // Filter is the opted-in set, so unfiltered rels are deliberate
         whole_db_filter: false,
-        mapping: ctx.mapping.snapshot().await,
+        mapping: ctx.mapping.snapshot(),
         stats: ctx.stats.clone(),
         budget: ctx.budget.clone(),
         row_policy: ctx.dest.current().row_policy(),

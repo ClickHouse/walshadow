@@ -63,7 +63,7 @@ async fn checkpoint_reuses_staging_and_rejects_replaced_table() {
     let plan = prepare(dest.clone(), &mapping, &requests, false)
         .await
         .unwrap();
-    let snapshot = mapping.snapshot().await;
+    let snapshot = mapping.snapshot();
     let mut checkpoint = BackupCheckpoint::new(
         InitialLoadMode::ObjectStore,
         &requests,

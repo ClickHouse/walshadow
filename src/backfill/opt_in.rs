@@ -170,7 +170,7 @@ async fn opt_in_known(
         );
         return Ok(());
     }
-    if !applicator.owns_destination(desc).await? || !applicator.ensure_ch_table(desc).await? {
+    if !applicator.owns_destination(desc)? || !applicator.ensure_ch_table(desc).await? {
         return Ok(());
     }
     resolver

@@ -481,7 +481,7 @@ impl ConfigResolver {
     pub async fn apply_config_event(&self, event: ConfigEvent) {
         let mut inner = self.inner.lock().await;
         inner.overlay.apply(event);
-        self.republish(&inner).await;
+        self.republish(&inner);
     }
 
     /// Bring `desc` into scope (`replicate=true`, rel known): derive a mapping
@@ -533,7 +533,7 @@ impl ConfigResolver {
         self.pending_decl
             .store(inner.opt_in.pending_decl.len() as u64, Ordering::Relaxed);
         self.opt_in_total.fetch_add(1, Ordering::Relaxed);
-        self.republish(&inner).await;
+        self.republish(&inner);
     }
 
     /// Take a rel out of scope (`replicate=false` / `TableRemoved`): drop its
@@ -551,7 +551,7 @@ impl ConfigResolver {
         self.pending_decl
             .store(inner.opt_in.pending_decl.len() as u64, Ordering::Relaxed);
         self.opt_out_total.fetch_add(1, Ordering::Relaxed);
-        self.republish(&inner).await;
+        self.republish(&inner);
     }
 
     /// Park a `replicate=true` row whose rel isn't known yet; materialised when
@@ -591,7 +591,7 @@ impl ConfigResolver {
         let mut inner = self.inner.lock().await;
         inner.opt_in.derived.insert(desc.rel_name.clone(), mapping);
         inner.opt_in.note_partition(desc);
-        self.republish(&inner).await;
+        self.republish(&inner);
     }
 
     /// Forget a runtime-derived mapping (source DROP TABLE under
@@ -614,7 +614,7 @@ impl ConfigResolver {
             self.pending_decl
                 .store(inner.opt_in.pending_decl.len() as u64, Ordering::Relaxed);
         }
-        self.republish(&inner).await;
+        self.republish(&inner);
     }
 
     /// Fold an ALTER diff into the layer owning the rel's mapping so the
@@ -647,7 +647,7 @@ impl ConfigResolver {
             return;
         }
         inner.opt_in.note_partition(new);
-        self.republish(&inner).await;
+        self.republish(&inner);
     }
 
     fn target_table_for(inner: &MergeInputs, rel: &RelName) -> String {
@@ -671,7 +671,7 @@ impl ConfigResolver {
     }
 
     /// Rebuild the resolved snapshot, write the fenced routing map, publish.
-    async fn republish(&self, inner: &MergeInputs) {
+    fn republish(&self, inner: &MergeInputs) {
         let prev = self.tx.borrow().clone();
         let (resolved, rejections) = Self::resolve(
             &inner.base,
@@ -682,8 +682,7 @@ impl ConfigResolver {
         );
         self.rejections.store(rejections, Ordering::Relaxed);
         self.mapping
-            .publish(Arc::new(crate::mapping::shared(resolved.tables.clone())))
-            .await;
+            .publish(Arc::new(crate::mapping::shared(resolved.tables.clone())));
         tracing::info!(
             target: "walshadow::config",
             opt_ins = resolved.table_opt_ins.len(),
@@ -983,7 +982,7 @@ impl ConfigResolver {
         let merged = crate::ch_emitter::load_effective(path, self.cli_base.clone()).await?;
         // This resolver's own database, not whichever one `[source]` names
         inner.base = EmitterConfig::for_database(&merged, &self.dbname)?;
-        self.republish(&inner).await;
+        self.republish(&inner);
         Ok(())
     }
 }
@@ -1753,7 +1752,7 @@ mod tests {
         );
         assert!(!t.columns.is_empty(), "columns derived from descriptor");
         // Fenced routing map written for the decode pool.
-        assert!(mapping.with(|m| m.contains_key(&rel)).await);
+        assert!(mapping.with(|m| m.contains_key(&rel)));
         assert_eq!(resolver.opt_in_total(), 1);
     }
 
@@ -1917,7 +1916,7 @@ mod tests {
             !rx.borrow_and_update().tables.contains_key(&rel),
             "opt-out drops the mapping"
         );
-        assert!(!mapping.with(|m| m.contains_key(&rel)).await);
+        assert!(!mapping.with(|m| m.contains_key(&rel)));
         assert_eq!(resolver.opt_out_total(), 1);
         assert!(resolver.is_excluded(&rel_desc("public", "events")).await);
 
@@ -1957,17 +1956,17 @@ mod tests {
             .await;
         assert!(rx.changed().await.is_ok());
         assert!(rx.borrow_and_update().tables.contains_key(&rel));
-        assert!(mapping.with(|m| m.contains_key(&rel)).await);
+        assert!(mapping.with(|m| m.contains_key(&rel)));
         // Unrelated overlay apply full-swaps handle, derived mapping must survive
         resolver
             .apply_config_event(ConfigEvent::GlobalCleared)
             .await;
         assert!(rx.changed().await.is_ok());
         assert!(rx.borrow_and_update().tables.contains_key(&rel));
-        assert!(mapping.with(|m| m.contains_key(&rel)).await);
+        assert!(mapping.with(|m| m.contains_key(&rel)));
         // Source DROP TABLE under strategy=Drop forgets it everywhere
         resolver.forget_derived_mapping(&rel).await;
-        assert!(!mapping.with(|m| m.contains_key(&rel)).await);
+        assert!(!mapping.with(|m| m.contains_key(&rel)));
         assert!(rx.changed().await.is_ok());
         assert!(!rx.borrow_and_update().tables.contains_key(&rel));
     }
@@ -1997,11 +1996,11 @@ mod tests {
         resolver
             .materialize_opt_in(&rel_desc("public", "events"), None, None)
             .await;
-        assert!(mapping.with(|m| m.contains_key(&rel)).await);
+        assert!(mapping.with(|m| m.contains_key(&rel)));
         // Source DROP under strategy=Drop: mapping forgotten, opt-in row
         // re-parked so the next CREATE re-materialises it
         resolver.forget_derived_mapping(&rel).await;
-        assert!(!mapping.with(|m| m.contains_key(&rel)).await);
+        assert!(!mapping.with(|m| m.contains_key(&rel)));
         assert_eq!(resolver.pending_decl_count(), 1);
         let row = resolver.take_pending_decl(&rel).await.expect("re-parked");
         assert_eq!(row.replicate, Some(true));
@@ -2052,15 +2051,12 @@ mod tests {
             m.get(&RelName::new("public", "events"))
                 .is_some_and(|t| t.columns.iter().any(|c| c.src_attnum == 2))
         };
-        assert!(
-            mapping.with(|m| has_note(m)).await,
-            "fold reaches the handle"
-        );
+        assert!(mapping.with(|m| has_note(m)), "fold reaches the handle");
         resolver
             .apply_config_event(ConfigEvent::GlobalCleared)
             .await;
         assert!(
-            mapping.with(|m| has_note(m)).await,
+            mapping.with(|m| has_note(m)),
             "fold survives the republish full-swap"
         );
     }

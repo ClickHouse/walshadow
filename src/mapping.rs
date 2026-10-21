@@ -1,6 +1,6 @@
 //! ClickHouse destination mapping vocabulary
 
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use crate::catalog::type_bridge::{self, ResolvedColumn};
 use crate::ch::types;
@@ -9,7 +9,6 @@ use crate::runtime_config::InitialLoadMode;
 use crate::schema::{RelAttr, RelDescriptor, RelName, SchemaDiff, replident_key_attnums};
 use crate::table_rules::set_if;
 use ahash::HashMap;
-use tokio::sync::RwLock;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct TableMapping {
@@ -478,27 +477,35 @@ pub struct MappingCell {
 }
 
 impl MappingCell {
-    pub async fn with<R>(&self, f: impl FnOnce(&MappingSnapshot) -> R) -> R {
-        f(&*self.inner.read().await)
+    pub fn with<R>(&self, f: impl FnOnce(&MappingSnapshot) -> R) -> R {
+        f(&self.read())
     }
 
-    pub async fn snapshot(&self) -> MappingSnapshot {
-        self.inner.read().await.clone()
+    pub fn snapshot(&self) -> MappingSnapshot {
+        self.read().clone()
     }
 
     /// `false` once a fold or republish displaced `at`. Holding `at` keeps
     /// its allocation alive and forces `Arc::make_mut` to clone, so pointer
     /// identity answers "has the map moved since I looked?"
-    pub async fn unmoved(&self, at: &MappingSnapshot) -> bool {
-        Arc::ptr_eq(&*self.inner.read().await, at)
+    pub fn unmoved(&self, at: &MappingSnapshot) -> bool {
+        Arc::ptr_eq(&self.read(), at)
     }
 
-    pub async fn mutate<R>(&self, f: impl FnOnce(&mut MappingSnapshot) -> R) -> R {
-        f(&mut *self.inner.write().await)
+    pub fn mutate<R>(&self, f: impl FnOnce(&mut MappingSnapshot) -> R) -> R {
+        f(&mut self.write())
     }
 
-    pub async fn publish(&self, tables: MappingSnapshot) {
-        *self.inner.write().await = tables;
+    pub fn publish(&self, tables: MappingSnapshot) {
+        *self.write() = tables;
+    }
+
+    fn read(&self) -> RwLockReadGuard<'_, MappingSnapshot> {
+        self.inner.read().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn write(&self) -> RwLockWriteGuard<'_, MappingSnapshot> {
+        self.inner.write().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
@@ -868,19 +875,16 @@ mod tests {
         let (rel, map) = one_table();
         let handle = mapping_handle(map);
         // Applicator shape: make_mut clones out from under held snapshots
-        let planned: MappingSnapshot = handle.snapshot().await;
-        handle.mutate(|m| Arc::make_mut(m).remove(&rel)).await;
+        let planned: MappingSnapshot = handle.snapshot();
+        handle.mutate(|m| Arc::make_mut(m).remove(&rel));
         assert!(planned.contains_key(&rel), "snapshot keeps its version");
-        assert!(
-            !handle.with(|m| m.contains_key(&rel)).await,
-            "handle moved on"
-        );
+        assert!(!handle.with(|m| m.contains_key(&rel)), "handle moved on");
         // Republish shape: full inner-Arc swap
-        let planned = handle.snapshot().await;
+        let planned = handle.snapshot();
         let (rel2, map2) = one_table();
-        handle.publish(Arc::new(shared(map2))).await;
+        handle.publish(Arc::new(shared(map2)));
         assert!(!planned.contains_key(&rel2), "snapshot predates the swap");
-        assert!(handle.with(|m| m.contains_key(&rel2)).await);
+        assert!(handle.with(|m| m.contains_key(&rel2)));
     }
 
     fn attr(attnum: i16, name: &str, type_oid: u32) -> crate::schema::RelAttr {

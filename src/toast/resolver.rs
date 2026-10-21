@@ -2614,24 +2614,22 @@ mod tests {
                 Ok(values.iter().map(|_| assembled(b"v")).collect())
             }
         }
+        // Each read reserves 3.5 KiB and retains 2 KiB, so two retained reads
+        // leave less than one reservation of 7 KiB admission
+        let pointer = |id| ToastPointer {
+            va_rawsize: VARHDRSZ + 1024,
+            va_extinfo: 1024,
+            va_valueid: id,
+            va_toastrelid: 16500,
+        };
         for blocked in [false, true] {
-            let budget = crate::budget::MemoryBudget::with_leaf_reserve(4096, 2048);
+            let budget = crate::budget::MemoryBudget::with_leaf_reserve(9216, 2048);
             let stats = Arc::new(EmitterStats::default());
             let resolver = ToastResolver::with_store(Arc::new(Store { blocked }), stats.clone())
                 .with_budget(budget.clone())
                 .with_read_ahead();
             for id in 1..=2 {
-                resolver.read_ahead(
-                    0,
-                    ToastPointer {
-                        va_rawsize: VARHDRSZ + 1,
-                        va_extinfo: 1,
-                        va_valueid: id,
-                        va_toastrelid: 16500,
-                    },
-                    crate::schema::TEXTOID,
-                    1,
-                );
+                resolver.read_ahead(0, pointer(id), crate::schema::TEXTOID, 1);
             }
             tokio::time::timeout(std::time::Duration::from_secs(1), async {
                 while stats.toast_values_read_ahead.load(Ordering::Relaxed) != 2
@@ -2643,12 +2641,7 @@ mod tests {
             .await
             .unwrap();
             assert!(budget.resident_bytes() > 0);
-            let next = ToastPointer {
-                va_rawsize: VARHDRSZ + 1,
-                va_extinfo: 1,
-                va_valueid: 3,
-                va_toastrelid: 16500,
-            };
+            let next = pointer(3);
             resolver.read_ahead(0, next, crate::schema::TEXTOID, 2);
             assert!(
                 resolver
@@ -2660,10 +2653,10 @@ mod tests {
             );
             let leaf = budget.acquire(2048).await;
             let foreground =
-                tokio::time::timeout(std::time::Duration::from_secs(1), budget.admit(2048))
+                tokio::time::timeout(std::time::Duration::from_secs(1), budget.admit(7168))
                     .await
                     .expect("foreground reclaims speculative admission");
-            assert_eq!(budget.resident_bytes(), 4096);
+            assert_eq!(budget.resident_bytes(), budget.total() as u64);
             assert_eq!(budget.overshoots_total(), 0);
             drop(foreground);
             drop(leaf);

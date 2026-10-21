@@ -225,12 +225,7 @@ fn pgbench_init(source: &Shadow, scale: u32) -> Result<()> {
 /// concurrent `BoxedAsyncClient`s for both bootstrap and WAL under the DDL
 /// barrier, asserting out-of-order INSERTs across connections stay
 /// `_lsn`-correct (the parity oracle at the end).
-async fn run_ddl_intermix(
-    ports: fx::Ports,
-    decoder_pool: usize,
-    inserter_pool: usize,
-    label: &str,
-) {
+fn run_ddl_intermix(ports: fx::Ports, decoder_pool: usize, inserter_pool: usize, label: &str) {
     if !fx::tools::requirements_available() {
         return;
     }
@@ -633,7 +628,7 @@ async fn run_ddl_intermix(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pgbench_acceptance_ddl_intermix() {
-    run_ddl_intermix(fx::Ports::alloc(), 1, 1, "pgbench_acceptance_ddl_intermix").await;
+    run_ddl_intermix(fx::Ports::alloc(), 1, 1, "pgbench_acceptance_ddl_intermix");
 }
 
 /// Same drill at decoder/inserter pool 2/2 — the live daemon coverage for
@@ -646,8 +641,7 @@ async fn pgbench_acceptance_ddl_intermix_pooled() {
         2,
         2,
         "pgbench_acceptance_ddl_intermix_pooled",
-    )
-    .await;
+    );
 }
 
 /// Poll a `std::process::Child` until exit or timeout. Mirrors
