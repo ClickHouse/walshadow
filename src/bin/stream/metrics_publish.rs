@@ -28,6 +28,11 @@ pub(crate) struct ShadowMetricsView {
     pub(crate) apply_lag: Option<(u64, f64)>,
     pub(crate) active_connections: u64,
     pub(crate) dropped_total: u64,
+    pub(crate) accepted_total: u64,
+    pub(crate) disconnects_total: [u64; walshadow::shadow_stream::Disconnect::COUNT],
+    pub(crate) backfill_bytes_total: u64,
+    pub(crate) start_before_buffer_total: u64,
+    pub(crate) send_queue_bytes: u64,
 }
 
 /// Apply lag against the source head. A zero `shadow_replay` means no walreceiver
@@ -313,6 +318,11 @@ pub(crate) async fn populate_metrics(
         shadow_apply_lag_seconds: apply_lag_seconds,
         shadow_stream_active_connections: shadow_view.active_connections,
         shadow_stream_dropped_connections_total: shadow_view.dropped_total,
+        shadow_stream_connections_total: shadow_view.accepted_total,
+        shadow_stream_disconnects_total_by_reason: shadow_view.disconnects_total,
+        shadow_stream_backfill_bytes_total: shadow_view.backfill_bytes_total,
+        shadow_stream_start_before_buffer_total: shadow_view.start_before_buffer_total,
+        shadow_stream_send_queue_bytes: shadow_view.send_queue_bytes,
         ..registry.snapshot().await
     };
     populate_pipeline_metrics(
