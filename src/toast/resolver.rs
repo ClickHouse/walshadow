@@ -630,23 +630,22 @@ pub async fn adopt_legacy_mirrors(
                 .join(", pg_toast_"),
         )));
     };
-    let renames = legacy
-        .iter()
-        .map(|&relid| {
-            format!(
-                "{} TO {}",
+    // One statement per table: a Shared database refuses a multi-table RENAME
+    // (`DB::Exception: ... does not support renaming of multiple tables in
+    // single query`). Losing the group's atomicity is safe because the legacy
+    // scan above runs on every start, so a partial pass finishes on the next
+    for &relid in &legacy {
+        crate::ch::exec_drain(
+            &mut client,
+            &format!(
+                "RENAME TABLE {} TO {}",
                 quote_ident(&format!("pg_toast_{relid}")),
                 quote_ident(&mirror_table_name(owner, relid))
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
-    crate::ch::exec_drain(
-        &mut client,
-        &format!("RENAME TABLE {renames}"),
-        cfg.insert_timeout,
-    )
-    .await?;
+            ),
+            cfg.insert_timeout,
+        )
+        .await?;
+    }
     Ok(legacy.len())
 }
 
