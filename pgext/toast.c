@@ -42,6 +42,9 @@
 #define WS_TOAST_ATT_SEQ 2
 #define WS_TOAST_ATT_DATA 3
 
+/* Per-value result, newest xmin and length */
+#define WS_FETCH_HDR_BYTES 9
+
 /*
  * Assemble one value's chunk run, appending
  * `[result:u8][newest xmin:u32][len:u32][stored bytes]` to `out`.
@@ -49,7 +52,11 @@
  * Accept only consecutive chunk_seq values starting at zero and exact expected
  * size, matching mirror validation. Same checks reject partially pruned runs
  * and interleaved generations under reused IDs. Include newest xmin to detect
- * replacements these checks cannot distinguish
+ * replacements these checks cannot distinguish.
+ *
+ * Chunks append in place until run breaks or passes expected size, so caller's
+ * pre-sized buffer never grows, even when a reused ID's newer generation is
+ * larger. Length keeps counting so a mismatch reports full assembled size
  */
 static void
 ws_fetch_one(
@@ -64,13 +71,15 @@ ws_fetch_one(
     SysScanDesc toastscan;
     HeapTuple ttup;
     TupleDesc tupdesc = RelationGetDescr(toastrel);
-    StringInfoData body;
+    int hdr           = out->len;
+    int end;
     int32 nchunks        = 0;
+    uint32 got           = 0;
     bool dense           = true;
     TransactionId newest = InvalidTransactionId;
     uint8 result;
 
-    initStringInfo(&body);
+    appendStringInfoSpaces(out, WS_FETCH_HDR_BYTES);
     ScanKeyInit(
         &toastkey,
         (AttrNumber)WS_TOAST_ATT_ID,
@@ -127,26 +136,30 @@ ws_fetch_one(
             dense = false;
         }
         nchunks++;
-        appendBinaryStringInfo(&body, chunkdata, chunksize);
+        got += (uint32)chunksize;
+        if (dense && got <= expected) {
+            appendBinaryStringInfo(out, chunkdata, chunksize);
+        }
     }
     systable_endscan_ordered(toastscan);
 
     if (nchunks == 0) {
         result = WS_FETCH_MISSING;
-    } else if (!dense || (uint32)body.len != expected) {
+    } else if (!dense || got != expected) {
         result = WS_FETCH_MISMATCH;
     } else {
         result = WS_FETCH_OK;
     }
 
     /* Report assembled length on failure, include bytes only on success */
-    pq_sendbyte(out, result);
-    pq_sendint32(out, (uint32)newest);
-    pq_sendint32(out, (uint32)body.len);
+    end      = out->len;
+    out->len = hdr;
+    pq_writeint8(out, result);
+    pq_writeint32(out, (uint32)newest);
+    pq_writeint32(out, got);
     if (result == WS_FETCH_OK) {
-        pq_sendbytes(out, body.data, body.len);
+        out->len = end;
     }
-    pfree(body.data);
 }
 
 void
@@ -161,7 +174,6 @@ ws_handle_fetch_toast(StringInfo req, StringInfo resp) {
     int num_indexes;
     int validIndex;
     SnapshotData snap = { 0 };
-    StringInfoData vals;
     uint64 replay_lsn;
     Size want = 0;
     uint32 i;
@@ -250,15 +262,14 @@ ws_handle_fetch_toast(StringInfo req, StringInfo resp) {
      */
     snap.snapshot_type = SNAPSHOT_TOAST;
 
-    initStringInfo(&vals);
+    /* Error mid-scan is safe, ws_dispatch resets resp before reporting */
+    pq_sendbyte(resp, WS_STATUS_OK);
+    pq_sendint32(resp, nvalues);
+    enlargeStringInfo(resp, (int)(want + WS_FETCH_HDR_BYTES * nvalues));
     for (i = 0; i < nvalues; i++) {
-        ws_fetch_one(toastrel, toastidxs[validIndex], &snap, ids[i], sizes[i], &vals);
+        ws_fetch_one(toastrel, toastidxs[validIndex], &snap, ids[i], sizes[i], resp);
     }
 
     toast_close_indexes(toastidxs, num_indexes, AccessShareLock);
     table_close(toastrel, AccessShareLock);
-
-    pq_sendbyte(resp, WS_STATUS_OK);
-    pq_sendint32(resp, nvalues);
-    pq_sendbytes(resp, vals.data, vals.len);
 }
