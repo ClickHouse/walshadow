@@ -907,7 +907,6 @@ async fn session_body(
     let xact_buffer = XactBuffer::new(xact_buf_cfg).context("init xact buffer / spill dir")?;
     xact_buffer
         .clear_spill_dir()
-        .await
         .context("clear stale spill files")?;
     let xact_buffer = Arc::new(Mutex::new(xact_buffer));
     tracing::info!(

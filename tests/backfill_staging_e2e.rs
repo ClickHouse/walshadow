@@ -181,7 +181,7 @@ impl Fixture {
         assert_eq!(plan.rels.len(), 1);
         let rel = plan.rels.pop().unwrap();
         assert_eq!(
-            plan.mapping.snapshot().await[&rel.rel].target.table,
+            plan.mapping.snapshot()[&rel.rel].target.table,
             rel.staging_table()
         );
         rel
@@ -246,15 +246,12 @@ async fn staging_follows_named_instance() {
             ..Default::default()
         },
     );
-    fixture
-        .mapping
-        .mutate(|map| {
-            let entry = Arc::make_mut(map)
-                .get_mut(&fixture.desc.rel_name)
-                .expect("fixture mapping present");
-            Arc::make_mut(entry).target.instance = Some("archive".into());
-        })
-        .await;
+    fixture.mapping.mutate(|map| {
+        let entry = Arc::make_mut(map)
+            .get_mut(&fixture.desc.rel_name)
+            .expect("fixture mapping present");
+        Arc::make_mut(entry).target.instance = Some("archive".into());
+    });
     let rel = fixture.prepare_staging().await;
     assert_eq!(rel.target.instance.as_deref(), Some("archive"));
     assert_eq!(remote.query("EXISTS DATABASE history").unwrap(), "1");

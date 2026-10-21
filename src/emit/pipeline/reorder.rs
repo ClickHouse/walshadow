@@ -332,21 +332,14 @@ impl ReorderSink {
     /// versions for the next interval. Per commit this is the
     /// whole-transaction snapshot; a non-WAL-positioned republish landing
     /// mid-plan can't reroute rows already planned or split the transaction.
-    async fn reset_route_state(&mut self, db: Oid) {
-        // Read the handles out before the await: a borrow of the scope held
-        // across one would put the applicator's `!Sync` client in the sink
-        // future
-        let scoped = self.scopes.get(&db).map(|scope| {
-            let config = scope.reload_rx.as_ref().map(|rx| rx.borrow().clone());
-            (scope.db.mapping.clone(), config)
-        });
-        let Some((mapping, config)) = scoped else {
+    fn reset_route_state(&mut self, db: Oid) {
+        let Some(scope) = self.scopes.get(&db) else {
             self.route_mapping = None;
             self.route_config = None;
             return;
         };
-        self.route_mapping = Some(mapping.snapshot().await);
-        self.route_config = config;
+        self.route_mapping = Some(scope.db.mapping.snapshot());
+        self.route_config = scope.reload_rx.as_ref().map(|rx| rx.borrow().clone());
     }
 
     /// Apply a live config reload's table opt-in/opt-out diff at a commit
@@ -609,7 +602,7 @@ impl ReorderSink {
         let frozen = self.route_config.as_deref();
         // Pinned mappings outlive DROP, so only Added/Changed must match
         let predicted = if cfg!(debug_assertions) && !matches!(event, SchemaEvent::Dropped { .. }) {
-            let before = mapping.snapshot().await;
+            let before = mapping.snapshot();
             applicator
                 .predict_route_mapping(event, &before, frozen)
                 .await
@@ -626,7 +619,7 @@ impl ReorderSink {
         #[cfg(feature = "test-support")]
         crash_test::hit(crash_test::Point::AfterDdl, commit_lsn);
         if let Some((rel, m)) = predicted {
-            let after = mapping.snapshot().await;
+            let after = mapping.snapshot();
             debug_assert_eq!(
                 after.get(&rel).map(|a| a.as_ref()),
                 m.as_ref(),
@@ -639,7 +632,7 @@ impl ReorderSink {
             && old.parent_oid() != new.parent_oid()
             && let Some(backfiller) = backfiller
         {
-            let mode = applicator.partition_load(new).await;
+            let mode = applicator.partition_load(new);
             backfiller.note_opt_in(new.clone(), mode, commit_lsn).await;
         }
         // A `CREATE TABLE` for a forward-declared opt-in materialises here, in
@@ -1138,7 +1131,7 @@ impl ReorderSink {
         // One route state per transaction: a mid-commit config republish
         // can't split this xact's rows across two route versions. In-walk
         // catalog events fold into the plan-time view, not shared state.
-        self.reset_route_state(db).await;
+        self.reset_route_state(db);
         let mut rows_total: u64 = 0;
         let mut published = false;
         if drain.had_states() {
@@ -1646,7 +1639,7 @@ mod tests {
 
         let stats = Arc::new(EmitterStats::default());
         let mut view = ReorderRouteView::new(
-            Some(handle.snapshot().await),
+            Some(handle.snapshot()),
             None,
             RowPolicy::default(),
             None,
@@ -1656,12 +1649,10 @@ mod tests {
         assert!(view.route_for(&heap_of(&planned)).is_some());
         assert!(view.route_for(&heap_of(&added)).is_none());
 
-        handle
-            .publish(Arc::new(HashMap::from_iter([(
-                added.clone(),
-                Arc::new(mapping_for(&added)),
-            )])))
-            .await;
+        handle.publish(Arc::new(HashMap::from_iter([(
+            added.clone(),
+            Arc::new(mapping_for(&added)),
+        )])));
 
         assert!(
             view.route_for(&heap_of(&planned)).is_some(),
@@ -1680,7 +1671,7 @@ mod tests {
         let rel = RelName::new("public", "t");
         let handle =
             crate::mapping::mapping_handle(HashMap::from_iter([(rel.clone(), mapping_for(&rel))]));
-        let mapping = Some(handle.snapshot().await);
+        let mapping = Some(handle.snapshot());
         let config = Some(Arc::new(ResolvedConfig::default()));
         let policy = RowPolicy::default();
         let cache = RouteCache {
@@ -1692,7 +1683,7 @@ mod tests {
         };
         assert!(cache.matches(5, &mapping, &config, &policy));
         assert!(
-            cache.matches(5, &Some(handle.snapshot().await), &config, &policy),
+            cache.matches(5, &Some(handle.snapshot()), &config, &policy),
             "unchanged handle snapshots the same version"
         );
         assert!(!cache.matches(6, &mapping, &config, &policy));
@@ -1718,13 +1709,11 @@ mod tests {
         };
         assert!(!cache.matches(5, &mapping, &config, &renamed));
 
-        handle
-            .publish(Arc::new(HashMap::from_iter([(
-                rel.clone(),
-                Arc::new(mapping_for(&rel)),
-            )])))
-            .await;
-        assert!(!cache.matches(5, &Some(handle.snapshot().await), &config, &policy));
+        handle.publish(Arc::new(HashMap::from_iter([(
+            rel.clone(),
+            Arc::new(mapping_for(&rel)),
+        )])));
+        assert!(!cache.matches(5, &Some(handle.snapshot()), &config, &policy));
     }
 
     /// Memoized routes carried into the next commit answer only for the
@@ -1734,7 +1723,7 @@ mod tests {
         let rel = RelName::new("public", "t");
         let handle =
             crate::mapping::mapping_handle(HashMap::from_iter([(rel.clone(), mapping_for(&rel))]));
-        let snapshot = handle.snapshot().await;
+        let snapshot = handle.snapshot();
         let stats = Arc::new(EmitterStats::default());
         let heap = heap_of(&rel);
         let memoized = |view: &ReorderRouteView, desc: &Arc<RelDescriptor>| {

@@ -192,7 +192,7 @@ impl Leg {
             })
             .map_err(|e| anyhow::anyhow!("bootstrap window leg: xact buffer: {e}"))?,
         ));
-        buffer.lock().await.clear_spill_dir().await.ok();
+        buffer.lock().await.clear_spill_dir().ok();
 
         let (filter_rfns, targets) = replay_scope(&cfg.catalog);
         let tail = OwnedTail::spawn(
@@ -216,7 +216,7 @@ impl Leg {
             from_lsn,
             // Unknown user filenodes imply window DDL
             whole_db_filter: true,
-            mapping: cfg.mapping.snapshot().await,
+            mapping: cfg.mapping.snapshot(),
             stats: cfg.stats.clone(),
             budget: cfg.resolver.budget().cloned(),
             row_policy: cfg.dest.current().row_policy(),

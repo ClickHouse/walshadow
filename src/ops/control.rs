@@ -160,7 +160,7 @@ fn ok_toml(t: &Table) -> String {
 
 /// Bind the control socket (unlinking any stale one, 0600) and serve one
 /// request per connection until the runtime tears down.
-pub async fn serve(path: PathBuf, ctx: SharedCtx) -> Result<tokio::task::JoinHandle<()>> {
+pub fn serve(path: PathBuf, ctx: SharedCtx) -> Result<tokio::task::JoinHandle<()>> {
     if let Some(dir) = path.parent()
         && !dir.as_os_str().is_empty()
     {
@@ -836,7 +836,7 @@ mod tests {
     async fn apply_show_status_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("c.sock");
-        let _h = serve(sock.clone(), ctx_at(dir.path())).await.unwrap();
+        let _h = serve(sock.clone(), ctx_at(dir.path())).unwrap();
 
         assert!(
             call(
@@ -876,7 +876,7 @@ mod tests {
     async fn status_tables_name_both_ends_and_both_phases() {
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("c.sock");
-        let _h = serve(sock.clone(), ctx_at(dir.path())).await.unwrap();
+        let _h = serve(sock.clone(), ctx_at(dir.path())).unwrap();
 
         assert!(
             call(
@@ -962,7 +962,7 @@ mod tests {
             "[table.demo.users]\ncolumns = [{ attnum = 1, target = \"id\", type = \"Int64\" }]\n",
         )
         .unwrap();
-        let _h = serve(sock.clone(), ctx_at(dir.path())).await.unwrap();
+        let _h = serve(sock.clone(), ctx_at(dir.path())).unwrap();
         let frag = dir.path().join("ch-config.d/50-api.toml");
 
         assert!(
@@ -1032,7 +1032,7 @@ mod tests {
         std::fs::write(confd.join("50-api.toml"), "[stream]\npaused = false\n").unwrap();
         let mut ctx = ctx_at(dir.path());
         ctx.fragment = fragment_path(&ctx.ch_config, "90-ctl.toml").unwrap();
-        let _h = serve(sock.clone(), ctx).await.unwrap();
+        let _h = serve(sock.clone(), ctx).unwrap();
 
         assert!(
             call(&sock, "apply", "[stream]\npaused = true")
@@ -1064,7 +1064,7 @@ mod tests {
     async fn apply_rejects_invalid_without_writing() {
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("c.sock");
-        let _h = serve(sock.clone(), ctx_at(dir.path())).await.unwrap();
+        let _h = serve(sock.clone(), ctx_at(dir.path())).unwrap();
         let frag = dir.path().join("ch-config.d/50-api.toml");
 
         assert!(
@@ -1093,7 +1093,7 @@ mod tests {
     async fn apply_validates_under_later_fragments() {
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("c.sock");
-        let _h = serve(sock.clone(), ctx_at(dir.path())).await.unwrap();
+        let _h = serve(sock.clone(), ctx_at(dir.path())).unwrap();
         let confd = dir.path().join("ch-config.d");
         std::fs::create_dir_all(&confd).unwrap();
         std::fs::write(confd.join("60-op.toml"), "[ch]\nport = 70000\n").unwrap();

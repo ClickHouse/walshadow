@@ -390,7 +390,6 @@ async fn resolve_spooled(
     );
     // Released on drop, so a failed replay gives its bytes back too
     let _footprint = DeferredFootprint::adopt(stats, &spool);
-    let mut out = RowBuf::default();
     let mut seq = None;
     let mut placed = 0u64;
     let total_bytes = spool.spooled_bytes();
@@ -410,12 +409,11 @@ async fn resolve_spooled(
         let remaining = replay.remaining_file_bytes();
         let (next, routed) = tokio::join!(
             prepare_batch(&mut replay, routes, catalog, stats, resolver),
-            route_batch(batch, &mut out, msg_tx, &mut seqs, &mut seq, &mut placed),
+            route_batch(batch, msg_tx, &mut seqs, &mut seq, &mut placed),
         );
         routed?;
         progress.advance(remaining);
         if let Some(c) = checkpoint.as_mut() {
-            out.flush(msg_tx).await?;
             if let Some(s) = seq.take() {
                 s.place(placed);
             }
@@ -431,7 +429,6 @@ async fn resolve_spooled(
         }
         ready = next?;
     }
-    out.flush(msg_tx).await?;
     let rows_routed = match checkpoint.as_mut() {
         Some(c) => {
             c.tail.checkpoint(seqs.next()).await?;
@@ -606,16 +603,18 @@ async fn prepare_batch(
     }))
 }
 
-/// Route a resolved batch's rows, each under the replay's trailing seq
+/// Route a resolved batch's rows, each under the replay's trailing seq.
+/// Every row reaches the batcher before return: a buffered row pins the
+/// batch's leaf permit, which the next batch's acquire may wait on
 async fn route_batch(
     batch: ResolvedReplayBatch,
-    out: &mut RowBuf,
     msg_tx: &mpsc::Sender<BatcherMsg>,
     seqs: &mut SeqAlloc,
     seq: &mut Option<OpenSeq>,
     placed: &mut u64,
 ) -> Result<(), String> {
     let ResolvedReplayBatch { rows, permit } = batch;
+    let mut out = RowBuf::default();
     for row in rows {
         let mut tuple = row.tuple;
         let at = seq
@@ -626,7 +625,7 @@ async fn route_batch(
             .await?;
         *placed += 1;
     }
-    Ok(())
+    out.flush(msg_tx).await
 }
 
 /// Read referrers until the batch seals or the spool ends, dropping rows no
@@ -1808,6 +1807,84 @@ mod tests {
             stats.toast_value_fetch_batches.load(Ordering::Relaxed),
             2,
             "row cap sealed a second batch, one round trip each",
+        );
+        drop(ack);
+        collector.await.unwrap();
+    }
+
+    /// Next batch's leaf acquire may wait on the routed batch's permit, so
+    /// no routed row may sit in the coalescing buffer across it
+    #[tokio::test]
+    async fn deferred_replay_prefetch_never_waits_on_unsent_rows() {
+        // 3.5 MiB values: buffer flushes every 2 rows, fetch cap seals 19
+        const VALUE: usize = 7 << 19;
+        let rows = 20;
+        let mut catalog = CatalogMap::new();
+        catalog.insert(bytea_rel(16400));
+        catalog.insert(toast_rel(16500));
+        let mut tables = HashMap::new();
+        tables.insert(RelName::new("public", "t16400"), bytea_mapping_for(16400));
+        let mapping = Arc::new(tables);
+
+        let (ack, collector) = ack::spawn(Arc::new(crate::pos::Monotone::default()), Fatal::new());
+        let (msg_tx, mut msg_rx) = mpsc::channel::<BatcherMsg>(64);
+        let (tup_tx, tup_rx) = mpsc::channel::<Vec<BackfillTuple>>(4);
+        let spool_tmp = tempfile::tempdir().unwrap();
+        let chunks = (0..rows)
+            .map(|i| {
+                let mut t = toast_chunk_tuple(16500, i + 1, 0, &vec![b'x'; VALUE]);
+                t.blkno = i;
+                t
+            })
+            .collect();
+        tup_tx.send(chunks).await.unwrap();
+        let referrers = (0..rows)
+            .map(|i| {
+                let mut t = bytea_toast_tuple(16400, 16500, i + 1);
+                if let Some(ColumnValue::ExternalToast(p)) = &mut t.columns[0] {
+                    p.va_rawsize = VALUE as i32 + 4;
+                    p.va_extinfo = VALUE as u32;
+                }
+                t
+            })
+            .collect();
+        tup_tx.send(referrers).await.unwrap();
+        drop(tup_tx);
+
+        let stats = Arc::new(EmitterStats::default());
+        let resolver = ToastResolver::with_store(Arc::new(MemChunkStore::new()), stats.clone())
+            .with_budget(crate::budget::MemoryBudget::new(2 << 20));
+        let drain_task = tokio::spawn(drain(
+            tup_rx,
+            catalog,
+            freeze_routes(&mapping, None, &RowPolicy::default()),
+            msg_tx,
+            ack.clone(),
+            stats.clone(),
+            resolver,
+            Deferral::Local(DeferredSpool::new(
+                spool_tmp.path().join("bootstrap_deferred.bin"),
+                0,
+            )),
+            HashSet::new(),
+            None,
+        ));
+        // Drop rows on receipt, as insert ack would
+        let mut routed = 0;
+        let count = async {
+            while let Some(BatcherMsg::Rows(chunk)) = msg_rx.recv().await {
+                routed += chunk.rows.len();
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), count)
+            .await
+            .expect("replay finishes");
+        assert_eq!(routed, rows as usize);
+        drain_task.await.unwrap().unwrap();
+        assert_eq!(
+            stats.toast_value_fetch_batches.load(Ordering::Relaxed),
+            2,
+            "fetch cap sealed a second batch",
         );
         drop(ack);
         collector.await.unwrap();

@@ -43,6 +43,9 @@ test-support = []
 # cargo-llvm-cov passes --cfg=coverage
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(coverage)"] }
 
+[lints.clippy]
+unused_async = "warn"
+
 [dependencies]
 wal-rus = "0.3.5"
 clickhouse-c-rs = { version = "0.2.2", default-features = false, features = ["tokio", "tls"] }

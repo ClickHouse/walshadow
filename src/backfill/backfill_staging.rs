@@ -79,7 +79,7 @@ pub async fn prepare(
 ) -> Result<StagingPlan> {
     let mut sess = StagingSession::connect(dest).await?;
     // Freeze routing for entire staging plan
-    let live_map = live.snapshot().await;
+    let live_map = live.snapshot();
     let mut staged: HashMap<RelName, TableMapping> = HashMap::with_capacity(reqs.len());
     let mut rels = Vec::with_capacity(reqs.len());
     for r in reqs {

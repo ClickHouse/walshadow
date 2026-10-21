@@ -1196,7 +1196,7 @@ impl CopyBackfiller {
         let mut checkpoint = BackupCheckpoint::new(
             mode,
             reqs,
-            &self.mapping.snapshot().await,
+            &self.mapping.snapshot(),
             &emitter,
             config.as_deref(),
         );
@@ -1440,7 +1440,7 @@ impl CopyBackfiller {
     /// pre-DDL shape; entry stays pending, next boot re-loads).
     async fn swap_rel(&self, sess: &mut StagingSession, rel: &StagingRel) -> anyhow::Result<bool> {
         sess.select(rel.target.instance.as_deref())?;
-        if !self.mapping.with(|m| m.contains_key(&rel.rel)).await {
+        if !self.mapping.with(|m| m.contains_key(&rel.rel)) {
             sess.drop_staging(rel).await?;
             tracing::info!(
                 target: "walshadow::backfill",
@@ -1533,7 +1533,6 @@ impl CopyBackfiller {
             None => self
                 .mapping
                 .with(|m| m.get(name).map(|t| t.target.clone()))
-                .await
                 .with_context(|| {
                     format!("swapped entry {name} unmapped; staging table orphaned")
                 })?,
@@ -1847,7 +1846,7 @@ impl CopyBackfiller {
             tup_rx,
             catalog,
             freeze_routes(
-                &self.mapping.snapshot().await,
+                &self.mapping.snapshot(),
                 self.config_rx
                     .as_ref()
                     .map(|rx| rx.borrow().clone())

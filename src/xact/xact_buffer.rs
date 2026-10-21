@@ -874,7 +874,7 @@ impl XactBuffer {
     /// state was either drained-to-CH or replayable from `decoder_lsn`, so
     /// scratch is always safe to wipe at startup. Caller invokes once before
     /// any `on_*`.
-    pub async fn clear_spill_dir(&self) -> std::result::Result<(), XactBufferError> {
+    pub fn clear_spill_dir(&self) -> std::result::Result<(), XactBufferError> {
         Ok(self.store.clear()?)
     }
 
