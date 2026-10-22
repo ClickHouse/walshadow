@@ -170,7 +170,7 @@ mod tests {
         ColumnValue, CommittedTuple, DecodedHeap, DecodedTuple, HeapOp,
     };
     use crate::emit::ch_emitter::Wire;
-    use crate::emit::pipeline::batcher::{BatcherConfig, BatcherMsg, RoutedRow};
+    use crate::emit::pipeline::batcher::{BatcherConfig, BatcherMsg, RoutedRow, RowChunk};
     use crate::emit::route::RouteSnapshot;
     use crate::mapping::{ColumnMapping, TableMapping, TableTarget};
     use crate::schema::{RelAttr, RelDescriptor, RelName, ReplIdent};
@@ -274,9 +274,11 @@ mod tests {
             Arc::new(EmitterStats::default()),
             None,
         );
-        for r in rows {
-            msg_tx.send(BatcherMsg::Row(r)).await.expect("send row");
-        }
+        let chunk = RowChunk { rows, permit: None };
+        msg_tx
+            .send(BatcherMsg::Rows(chunk))
+            .await
+            .expect("send rows");
         let (reply_tx, reply_rx) = oneshot::channel();
         msg_tx
             .send(BatcherMsg::FlushAll(reply_tx))

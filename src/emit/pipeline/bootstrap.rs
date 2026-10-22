@@ -17,8 +17,7 @@ use crate::config::ResolvedConfig;
 use crate::decode::heap_decoder::{ColumnValue, ToastPointer};
 use crate::emit::ch_emitter::EmitterStats;
 use crate::emit::pipeline::ack::{AckHandle, OpenSeq, Publish, SeqAlloc};
-use crate::emit::pipeline::batcher::{BatcherMsg, RoutedRow, RowChunk};
-use crate::emit::pipeline::decode::DECODE_CHUNK_BYTES;
+use crate::emit::pipeline::batcher::{BatcherClosed, BatcherMsg, RowBuf};
 use crate::emit::route::{FrozenRoutes, RouteSnapshot, RowPolicy, freeze_routes};
 use crate::mapping::{MappingSnapshot, TableMapping};
 use crate::ops::oracle::render_ext_columns;
@@ -30,11 +29,6 @@ use crate::toast::{
 };
 use crate::xact::xact_buffer::{MissPolicy, StoreMiss, fill_store_miss};
 use ahash::{HashMap, HashMapExt, HashSet};
-
-/// Rows per `BatcherMsg::Rows` from the bootstrap drain. Fixed rather than
-/// config-driven: bootstrap rows are uniform inserts, and the byte trigger
-/// covers the fat-row case
-const DRAIN_CHUNK_ROWS: usize = 1024;
 
 /// Completion frontier for `FlushAll` and resume advance
 #[derive(Debug, Default)]
@@ -207,7 +201,7 @@ pub async fn drain(
                 if let Some((_, prev, prev_rows)) = open.take() {
                     // Every row of the closing seq on the channel before its
                     // expected count is published
-                    out.flush(&msg_tx).await?;
+                    out.flush(&msg_tx).await.map_err(closed)?;
                     seqs.place(prev, prev_rows);
                 }
                 let seq = seqs.open(source_lsn, Publish::Commit);
@@ -262,7 +256,10 @@ pub async fn drain(
                     .map(Arc::new);
             }
             render_ext_columns(&rel.attributes, &mut tuple.columns);
-            out.push(&msg_tx, seq, rel, route, tuple, permit).await?;
+            let committed = tuple.into_committed_insert();
+            out.push(&msg_tx, seq, rel, route, committed, permit)
+                .await
+                .map_err(closed)?;
             bump(&mut open, &mut rows_routed);
         }
         // Resumable walk: close the seq space and fsync the spool so the
@@ -274,7 +271,7 @@ pub async fn drain(
                 flush_chunks(&resolver, &mut chunk_batch).await?;
                 chunk_batch_bytes = 0;
             }
-            out.flush(&msg_tx).await?;
+            out.flush(&msg_tx).await.map_err(closed)?;
             if let Some((_, seq, rows)) = open.take() {
                 seqs.place(seq, rows);
             }
@@ -289,7 +286,7 @@ pub async fn drain(
             b.publish_drain(consumed, seqs.next(), mark).await;
         }
     }
-    out.flush(&msg_tx).await?;
+    out.flush(&msg_tx).await.map_err(closed)?;
     if let Some((_, seq, rows)) = open.take() {
         seqs.place(seq, rows);
     }
@@ -463,54 +460,8 @@ fn bump(open: &mut Option<(RelFileNode, OpenSeq, u64)>, rows_routed: &mut u64) {
     *rows_routed += 1;
 }
 
-/// Coalesces routed rows into one `BatcherMsg::Rows` per
-/// [`DECODE_CHUNK_BYTES`]-shaped trigger, the same amortization streaming
-/// placement gets. Rows of different seqs may share a chunk; the batcher
-/// routes each independently
-#[derive(Default)]
-struct RowBuf {
-    rows: Vec<RoutedRow>,
-    bytes: usize,
-}
-
-impl RowBuf {
-    async fn push(
-        &mut self,
-        msg_tx: &mpsc::Sender<BatcherMsg>,
-        seq: u64,
-        rel: Arc<RelDescriptor>,
-        route: Arc<RouteSnapshot>,
-        tuple: BackfillTuple,
-        value_permit: Option<Arc<crate::budget::MemoryPermit>>,
-    ) -> Result<(), String> {
-        let committed = tuple.into_committed_insert();
-        self.bytes += committed.decoded.approx_bytes();
-        self.rows.push(RoutedRow {
-            seq,
-            rel,
-            route,
-            committed,
-            value_permit,
-        });
-        if self.rows.len() >= DRAIN_CHUNK_ROWS || self.bytes >= DECODE_CHUNK_BYTES {
-            self.flush(msg_tx).await?;
-        }
-        Ok(())
-    }
-
-    async fn flush(&mut self, msg_tx: &mpsc::Sender<BatcherMsg>) -> Result<(), String> {
-        if self.rows.is_empty() {
-            return Ok(());
-        }
-        self.bytes = 0;
-        msg_tx
-            .send(BatcherMsg::Rows(RowChunk {
-                rows: std::mem::take(&mut self.rows),
-                permit: None,
-            }))
-            .await
-            .map_err(|_| "bootstrap: batcher channel closed".to_string())
-    }
+fn closed(e: BatcherClosed) -> String {
+    format!("bootstrap: {e}")
 }
 
 const REPLAY_BATCH_ROWS: usize = 65536;
@@ -621,11 +572,19 @@ async fn route_batch(
             .get_or_insert_with(|| seqs.open(tuple.source_lsn, Publish::Commit))
             .seq();
         render_ext_columns(&row.rel.attributes, &mut tuple.columns);
-        out.push(msg_tx, at, row.rel, row.route, tuple, permit.clone())
-            .await?;
+        out.push(
+            msg_tx,
+            at,
+            row.rel,
+            row.route,
+            tuple.into_committed_insert(),
+            permit.clone(),
+        )
+        .await
+        .map_err(closed)?;
         *placed += 1;
     }
-    out.flush(msg_tx).await
+    out.flush(msg_tx).await.map_err(closed)
 }
 
 /// Read referrers until the batch seals or the spool ends, dropping rows no
@@ -943,6 +902,7 @@ mod tests {
     }
 
     use super::*;
+    use crate::emit::pipeline::batcher::RoutedRow;
 
     /// Distinguish missing data in walk-seeded store from superseded value in
     /// read-only end-of-backup store

@@ -23,7 +23,7 @@ use crate::decode::wal_xact::{
 };
 use crate::emit::ch_emitter::EmitterStats;
 use crate::emit::pipeline::ack::{AckHandle, OpenSeq, Publish, SeqAlloc};
-use crate::emit::pipeline::batcher::{BatcherMsg, RoutedRow};
+use crate::emit::pipeline::batcher::{BatcherClosed, BatcherMsg, RowBuf};
 use crate::emit::route::{FrozenRoutes, freeze_routes};
 use crate::mapping::MappingSnapshot;
 use crate::pos::Pos;
@@ -101,6 +101,8 @@ pub struct WalReplaySink {
     batch_rows: usize,
     batch_bytes: usize,
     msg_tx: mpsc::Sender<BatcherMsg>,
+    /// Rows of the open seq not yet on the batcher channel
+    out: RowBuf,
     patch: Option<Arc<std::sync::Mutex<PgXactPatch>>>,
     seqs: SeqAlloc,
     /// Current seq and its routed rows, registered on first row
@@ -114,6 +116,10 @@ pub struct WalReplaySink {
     /// held batch never withholds bytes a drain admit waits on
     pending_cap: usize,
     replay: ReplayStats,
+}
+
+fn tail_closed(_: BatcherClosed) -> SinkError {
+    SinkError::Other("wal_replay: tail closed".into())
 }
 
 impl WalReplaySink {
@@ -146,6 +152,7 @@ impl WalReplaySink {
             batch_rows: inputs.batch_rows,
             batch_bytes: inputs.batch_bytes,
             msg_tx: inputs.msg_tx,
+            out: RowBuf::default(),
             patch: inputs.patch,
             seqs: inputs.ack.seqs(inputs.next_seq),
             open: None,
@@ -366,6 +373,7 @@ impl WalReplaySink {
                 .await?;
         }
         drain.finish().await.map_err(SinkError::from)?;
+        self.out.flush(&self.msg_tx).await.map_err(tail_closed)?;
         if let Some((seq, rows)) = self.open.take() {
             self.seqs.place(seq, rows);
         }
@@ -462,35 +470,38 @@ impl WalReplaySink {
                         && let Some(tomb) = take_key_change_tombstone(&mut heap.decoded, &rel)
                     {
                         *rows += 1;
-                        self.msg_tx
-                            .send(BatcherMsg::Row(RoutedRow {
-                                seq,
-                                rel: rel.clone(),
-                                route: route.clone(),
-                                committed: CommittedTuple {
-                                    decoded: tomb,
-                                    commit_ts,
-                                    commit_lsn,
-                                },
-                                value_permit: None,
-                            }))
+                        let tomb = CommittedTuple {
+                            decoded: tomb,
+                            commit_ts,
+                            commit_lsn,
+                        };
+                        self.out
+                            .push(&self.msg_tx, seq, rel.clone(), route.clone(), tomb, None)
                             .await
-                            .map_err(|_| SinkError::Other("wal_replay: tail closed".into()))?;
+                            .map_err(tail_closed)?;
                     }
-                    self.msg_tx
-                        .send(BatcherMsg::Row(RoutedRow {
+                    let committed = CommittedTuple {
+                        decoded: heap.decoded,
+                        commit_ts,
+                        commit_lsn,
+                    };
+                    let pinned = value_permit.is_some();
+                    self.out
+                        .push(
+                            &self.msg_tx,
                             seq,
                             rel,
                             route,
-                            committed: CommittedTuple {
-                                decoded: heap.decoded,
-                                commit_ts,
-                                commit_lsn,
-                            },
-                            value_permit: value_permit.map(Arc::new),
-                        }))
+                            committed,
+                            value_permit.map(Arc::new),
+                        )
                         .await
-                        .map_err(|_| SinkError::Other("wal_replay: tail closed".into()))?;
+                        .map_err(tail_closed)?;
+                    // Buffered, a leaf permit could pin bytes the next acquire
+                    // waits on
+                    if pinned {
+                        self.out.flush(&self.msg_tx).await.map_err(tail_closed)?;
+                    }
                     self.replay.rows_replayed += 1;
                 }
             }

@@ -35,6 +35,7 @@ use crate::emit::ch_emitter::{
     Append, ColumnBuf, ColumnEncoding, EmitterStats, OP_DELETE, OP_INSERT, OP_UPDATE, TableEncoder,
     TablePlan,
 };
+use crate::emit::pipeline::decode::DECODE_CHUNK_BYTES;
 use crate::emit::pipeline::{DEFAULT_PIPELINE_FLUSH, Fatal};
 use crate::emit::route::RouteSnapshot;
 use crate::schema::{RelDescriptor, TableKey};
@@ -56,11 +57,66 @@ pub struct RoutedRow {
 /// One decode slice's rows under the admission permit covering them.
 /// Registers once per table the chunk touches, so neither the permit's
 /// refcount nor the holder list scales with row count.
+#[derive(Default)]
 pub struct RowChunk {
     pub rows: Vec<RoutedRow>,
     /// Released post-insert-ack, when every covering `InsertBatch` drops
     pub permit: Option<Arc<crate::budget::MemoryPermit>>,
 }
+
+/// Rows per chunk a [`RowBuf`] ships. Fixed rather than config-driven:
+/// backfill rows are uniform, and the byte trigger covers the fat-row case
+const ROW_BUF_ROWS: usize = 1024;
+
+/// Coalesces routed rows into one `BatcherMsg::Rows` per `ROW_BUF_ROWS`
+/// rows or [`DECODE_CHUNK_BYTES`], the same amortization streaming placement
+/// gets. Rows of different seqs may share a chunk; the batcher routes each
+/// independently
+#[derive(Default)]
+pub struct RowBuf {
+    chunk: RowChunk,
+    bytes: usize,
+}
+
+impl RowBuf {
+    pub async fn push(
+        &mut self,
+        msg_tx: &mpsc::Sender<BatcherMsg>,
+        seq: u64,
+        rel: Arc<RelDescriptor>,
+        route: Arc<RouteSnapshot>,
+        committed: CommittedTuple,
+        value_permit: Option<Arc<crate::budget::MemoryPermit>>,
+    ) -> Result<(), BatcherClosed> {
+        self.bytes += committed.decoded.approx_bytes();
+        self.chunk.rows.push(RoutedRow {
+            seq,
+            rel,
+            route,
+            committed,
+            value_permit,
+        });
+        if self.chunk.rows.len() >= ROW_BUF_ROWS || self.bytes >= DECODE_CHUNK_BYTES {
+            self.flush(msg_tx).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn flush(&mut self, msg_tx: &mpsc::Sender<BatcherMsg>) -> Result<(), BatcherClosed> {
+        if self.chunk.rows.is_empty() {
+            return Ok(());
+        }
+        self.bytes = 0;
+        msg_tx
+            .send(BatcherMsg::Rows(std::mem::take(&mut self.chunk)))
+            .await
+            .map_err(|_| BatcherClosed)
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("batcher channel closed")]
+pub struct BatcherClosed;
 
 /// Per-column name + CH type string. Inserter parses `type_repr` into its
 /// own `TypeAst` (`Send` but not `Sync`, so unshareable).
@@ -140,8 +196,6 @@ pub(crate) struct InsertBatch {
 /// process ahead of rows enqueued before it — else flush seals a partial set
 /// and falsely signals "earlier data sealed", pinning the durability wait.
 pub enum BatcherMsg {
-    /// Single row (bootstrap drain). One channel hop + wakeup per row.
-    Row(RoutedRow),
     /// Chunk of rows from one placement (see `decode::DECODE_CHUNK_BYTES`),
     /// amortizing the per-row channel-send + cross-thread wakeup — the
     /// dominant coordination cost under sustained load. Rows may carry
@@ -227,14 +281,6 @@ pub(crate) fn spawn(
             }
             tokio::select! {
                 msg = msg_rx.recv() => match msg {
-                    Some(BatcherMsg::Row(r)) => {
-                        let live = effective_cfg(&cfg, snapshot(config_rx.as_ref()).as_deref());
-                        let ctx = RowCtx { cfg: live, out: &out, alloc, epoch, stats };
-                        if let Err(e) = handle_row(&mut tables, &ctx, r, None).await {
-                            fatal.set(format!("batcher: {e}"));
-                            break;
-                        }
-                    }
                     Some(BatcherMsg::Rows(chunk)) => {
                         let live = effective_cfg(&cfg, snapshot(config_rx.as_ref()).as_deref());
                         let ctx = RowCtx { cfg: live, out: &out, alloc, epoch, stats };
@@ -582,6 +628,13 @@ mod tests {
         routed_row(rel_named(table), route_named(table), seq, id)
     }
 
+    fn one(row: RoutedRow) -> BatcherMsg {
+        BatcherMsg::Rows(RowChunk {
+            rows: vec![row],
+            permit: None,
+        })
+    }
+
     fn routed_row(
         rel: Arc<RelDescriptor>,
         route: Arc<RouteSnapshot>,
@@ -637,16 +690,10 @@ mod tests {
             None,
         );
         for id in 0..3 {
-            msg_tx
-                .send(BatcherMsg::Row(row(0, id)))
-                .await
-                .expect("send seq0");
+            msg_tx.send(one(row(0, id))).await.expect("send seq0");
         }
         for id in 0..2 {
-            msg_tx
-                .send(BatcherMsg::Row(row(1, id)))
-                .await
-                .expect("send seq1");
+            msg_tx.send(one(row(1, id))).await.expect("send seq1");
         }
         // Drop sender → final flush + graceful exit
         drop(msg_tx);
@@ -760,7 +807,7 @@ mod tests {
             Arc::new(rules.finish().0),
             Default::default(),
         );
-        msg_tx.send(BatcherMsg::Row(r)).await.expect("send row");
+        msg_tx.send(one(r)).await.expect("send row");
         drop(msg_tx);
         let batch = batches_rx.recv().await.expect("one batch");
         assert_eq!(batch.meta.columns[0].name, "id");
@@ -808,7 +855,7 @@ mod tests {
                 shared,
             });
             let row = routed_row(rel_named(&format!("m_{leaf}")), route, 0, leaf as i32);
-            msg_tx.send(BatcherMsg::Row(row)).await.expect("send row");
+            msg_tx.send(one(row)).await.expect("send row");
         }
         drop(msg_tx);
         let mut batches = Vec::new();
@@ -857,10 +904,7 @@ mod tests {
             Arc::new(EmitterStats::default()),
             None,
         );
-        msg_tx
-            .send(BatcherMsg::Row(row(0, 1)))
-            .await
-            .expect("send row");
+        msg_tx.send(one(row(0, 1))).await.expect("send row");
         let (reply_tx, reply_rx) = oneshot::channel();
         msg_tx
             .send(BatcherMsg::FlushAll(reply_tx))
@@ -921,10 +965,7 @@ mod tests {
         // of phase with the deadline
         tokio::time::sleep(Duration::from_millis(600)).await;
         let sent = Instant::now();
-        msg_tx
-            .send(BatcherMsg::Row(row(0, 1)))
-            .await
-            .expect("send row");
+        msg_tx.send(one(row(0, 1))).await.expect("send row");
         let batch = batches_rx.recv().await.expect("deadline batch");
         let waited = sent.elapsed();
         assert_eq!(batch.n_rows, 1);
@@ -944,15 +985,9 @@ mod tests {
         let (msg_tx, batches_rx, fatal, handle) =
             spawn_deadline_batcher(partial_block_cfg(Duration::from_secs(1)), None);
         let start = Instant::now();
-        msg_tx
-            .send(BatcherMsg::Row(row_for("a", 0, 1)))
-            .await
-            .expect("send a");
+        msg_tx.send(one(row_for("a", 0, 1))).await.expect("send a");
         tokio::time::sleep(Duration::from_millis(400)).await;
-        msg_tx
-            .send(BatcherMsg::Row(row_for("b", 0, 2)))
-            .await
-            .expect("send b");
+        msg_tx.send(one(row_for("b", 0, 2))).await.expect("send b");
 
         let first = batches_rx.recv().await.expect("first batch");
         let first_at = start.elapsed();
@@ -980,15 +1015,9 @@ mod tests {
         let (msg_tx, batches_rx, fatal, handle) =
             spawn_deadline_batcher(partial_block_cfg(Duration::from_secs(1)), None);
         let start = Instant::now();
-        msg_tx
-            .send(BatcherMsg::Row(row(0, 1)))
-            .await
-            .expect("send first");
+        msg_tx.send(one(row(0, 1))).await.expect("send first");
         tokio::time::sleep(Duration::from_millis(500)).await;
-        msg_tx
-            .send(BatcherMsg::Row(row(0, 2)))
-            .await
-            .expect("send second");
+        msg_tx.send(one(row(0, 2))).await.expect("send second");
         let batch = batches_rx.recv().await.expect("deadline batch");
         let waited = start.elapsed();
         assert_eq!(batch.n_rows, 2, "both rows in one block");
@@ -1012,9 +1041,9 @@ mod tests {
             },
             None,
         );
-        tx.send(BatcherMsg::Row(row(0, 1))).await.unwrap();
+        tx.send(one(row(0, 1))).await.unwrap();
         let first = rx.recv().await.unwrap();
-        tx.send(BatcherMsg::Row(row(1, 2))).await.unwrap();
+        tx.send(one(row(1, 2))).await.unwrap();
         let (reply, mut flushed) = oneshot::channel();
         tx.send(BatcherMsg::FlushAll(reply)).await.unwrap();
         assert!(
@@ -1046,9 +1075,7 @@ mod tests {
             None,
         );
         for i in 0..40 {
-            tx.send(BatcherMsg::Row(row_for(&format!("t{i}"), i, 1)))
-                .await
-                .unwrap();
+            tx.send(one(row_for(&format!("t{i}"), i, 1))).await.unwrap();
         }
         let first = tokio::time::timeout(Duration::from_secs(1), rx.recv())
             .await
@@ -1101,7 +1128,7 @@ mod tests {
             );
             r.committed.decoded.new.as_mut().unwrap().columns =
                 vec![Some(ColumnValue::Text("x".repeat(64 << 10)))];
-            tx.send(BatcherMsg::Row(r)).await.unwrap();
+            tx.send(one(r)).await.unwrap();
         }
         let first = rx.recv().await.unwrap();
         assert!(first._encoded.bytes() >= 64 << 10);
@@ -1152,7 +1179,7 @@ mod tests {
             );
             r.committed.decoded.new.as_mut().unwrap().columns =
                 vec![Some(ColumnValue::Text(big.clone()))];
-            tx.send(BatcherMsg::Row(r)).await.unwrap();
+            tx.send(one(r)).await.unwrap();
         }
         drop(tx);
         let per_seq: Vec<_> = [rx.recv().await.unwrap(), rx.recv().await.unwrap()]
@@ -1176,10 +1203,7 @@ mod tests {
             None,
         );
         let start = Instant::now();
-        msg_tx
-            .send(BatcherMsg::Row(row(0, 1)))
-            .await
-            .expect("send row");
+        msg_tx.send(one(row(0, 1))).await.expect("send row");
         let batch = batches_rx.recv().await.expect("budget batch");
         assert_eq!(batch.n_rows, 1);
         let elapsed = start.elapsed();
@@ -1217,20 +1241,14 @@ mod tests {
         let (msg_tx, batches_rx, fatal, handle) =
             spawn_deadline_batcher(partial_block_cfg(Duration::from_secs(1)), Some(cfg_rx));
         let start = Instant::now();
-        msg_tx
-            .send(BatcherMsg::Row(row_for("a", 0, 1)))
-            .await
-            .expect("send a");
+        msg_tx.send(one(row_for("a", 0, 1))).await.expect("send a");
         // Let the batcher arm table a under the 1 s timeout
         tokio::time::sleep(Duration::from_millis(100)).await;
         cfg_tx.send_replace(Arc::new(ResolvedConfig {
             flush_timeout: Duration::from_millis(200),
             ..Default::default()
         }));
-        msg_tx
-            .send(BatcherMsg::Row(row_for("b", 0, 2)))
-            .await
-            .expect("send b");
+        msg_tx.send(one(row_for("b", 0, 2))).await.expect("send b");
 
         let first = batches_rx.recv().await.expect("first batch");
         let first_at = start.elapsed();
