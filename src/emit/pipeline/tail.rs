@@ -240,7 +240,6 @@ pub fn spawn_null(
     let batcher = tokio::spawn(async move {
         while let Some(msg) = msg_rx.recv().await {
             match msg {
-                BatcherMsg::Row(r) => swallow_ack.swallowed(vec![(r.seq, 1)]),
                 BatcherMsg::Rows(chunk) => swallow(&swallow_ack, [chunk]),
                 BatcherMsg::Chunks(chunks) => swallow(&swallow_ack, chunks),
                 BatcherMsg::FlushAll(reply) => {

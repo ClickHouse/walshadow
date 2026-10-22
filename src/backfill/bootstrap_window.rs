@@ -23,6 +23,7 @@ use crate::config::ResolvedConfig;
 use crate::decode::visibility::PgXactPatch;
 use crate::emit::ch_emitter::EmitterStats;
 use crate::emit::pipeline::Fatal;
+use crate::emit::pipeline::ack::BufferedRowSender;
 use crate::emit::pipeline::tail::OwnedTail;
 use crate::mapping::MappingHandle;
 use crate::pos::Pos;
@@ -373,6 +374,10 @@ async fn run_live(
                 let (lsn, data) = (chunk.start_lsn, chunk.data);
                 if let Err(e) = stream.push(lsn, data, &mut leg.sink, &mut seg_sink).await {
                     break Err(anyhow::anyhow!("bootstrap window leg: push: {e}"));
+                }
+                // Bound row wait on a quiet source; under load a chunk spans many commits
+                if let Err(e) = leg.sink.flush_pending().await {
+                    break Err(anyhow::anyhow!("bootstrap window leg: flush: {e}"));
                 }
             }
             Ok(SourceEvent::TimelineEnd) => {

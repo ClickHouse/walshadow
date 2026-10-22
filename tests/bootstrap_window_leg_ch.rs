@@ -102,12 +102,12 @@ async fn partial_transaction_failure_returns_from_live_and_archived_replay() {
     let catalog = seed_catalog_from_source(&sql).await.unwrap();
     let mut feed = SourceFeed::connect(&pg).await.unwrap();
     let ident = feed.identify_system().await.unwrap();
-    sql.batch_execute(&format!(
-        "BEGIN; INSERT INTO {SCHEMA}.t VALUES (1, 'inline');
-         UPDATE {SCHEMA}.t SET id=id WHERE id=2; COMMIT"
-    ))
-    .await
-    .unwrap();
+    sql.batch_execute(&format!("INSERT INTO {SCHEMA}.t VALUES (1, 'inline')"))
+        .await
+        .unwrap();
+    sql.batch_execute(&format!("UPDATE {SCHEMA}.t SET id=id WHERE id=2"))
+        .await
+        .unwrap();
     let end = walshadow::pg::current_wal_lsn(&sql).await.unwrap();
     sql.batch_execute("SELECT pg_switch_wal()").await.unwrap();
     let stats = Arc::new(EmitterStats::default());

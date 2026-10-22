@@ -47,7 +47,7 @@ use crate::xact::xact_buffer::{
 
 use crate::config::ResolvedConfig;
 use crate::emit::pipeline::Fatal;
-use crate::emit::pipeline::ack::{AckHandle, Publish, SeqAlloc};
+use crate::emit::pipeline::ack::{AckHandle, BufferedRowSender, Publish, SeqAlloc};
 use crate::emit::pipeline::batcher::{BatcherMsg, RowChunk};
 use crate::emit::pipeline::decode;
 use crate::emit::pipeline::plan_spool::{PlanItem, PlanPath, PlanTable, PlannedHeap, SealedPlan};
@@ -159,7 +159,7 @@ struct Outbox {
     /// enqueued rows.
     msg_tx: mpsc::Sender<BatcherMsg>,
     fatal: Fatal,
-    /// One seq per dispatched data unit, in commit order. Held: events ship
+    /// One seq per dispatched data unit, in commit order. Buffer events to send
     /// with [`Self::staged`]
     seqs: SeqAlloc,
     /// Placed rows not yet on the batcher channel, shipped per worker batch
@@ -193,33 +193,33 @@ impl Outbox {
         if let Some(p) = budget.try_admit(bytes) {
             return Ok(Some(p));
         }
-        self.ship().await?;
+        self.flush_pending().await?;
         tokio::select! {
             biased;
             _ = self.fatal.wait() => Err(self.fatal_err()),
             p = budget.admit(bytes) => Ok(Some(p)),
         }
     }
+}
 
-    /// Send staged rows with their held seq events: registrations first so
-    /// no insert ack beats them, placements once rows are on the channel
-    async fn ship(&mut self) -> Result<(), SinkError> {
-        self.seqs.send_registered();
-        if !self.staged.is_empty() {
-            let chunks = std::mem::take(&mut self.staged);
-            self.staged_rows = 0;
-            self.staged_bytes = 0;
-            let sent = tokio::select! {
-                biased;
-                _ = self.fatal.wait() => return Err(self.fatal_err()),
-                r = self.msg_tx.send(BatcherMsg::Chunks(chunks)) => r,
-            };
-            if sent.is_err() {
-                return Err(SinkError::Other("batcher channel closed".into()));
-            }
+impl BufferedRowSender for Outbox {
+    fn seqs(&mut self) -> &mut SeqAlloc {
+        &mut self.seqs
+    }
+
+    async fn send_rows(&mut self) -> Result<(), SinkError> {
+        if self.staged.is_empty() {
+            return Ok(());
         }
-        self.seqs.send_placed();
-        Ok(())
+        let chunks = std::mem::take(&mut self.staged);
+        self.staged_rows = 0;
+        self.staged_bytes = 0;
+        let sent = tokio::select! {
+            biased;
+            _ = self.fatal.wait() => return Err(self.fatal_err()),
+            r = self.msg_tx.send(BatcherMsg::Chunks(chunks)) => r,
+        };
+        sent.map_err(|_| SinkError::Other("batcher channel closed".into()))
     }
 }
 
@@ -289,7 +289,7 @@ impl ReorderSink {
                 (db.oid, scope)
             })
             .collect();
-        let seqs = ack.seqs(0).held();
+        let seqs = ack.seqs(0).buffer_events();
         BootingReorder(Self {
             buffer,
             dbs,
@@ -541,7 +541,7 @@ impl ReorderSink {
     /// Seal every batcher table and wait for the reply. Sent on the shared row
     /// channel so it orders after every row enqueued before it.
     async fn flush_all_batcher(&mut self) -> Result<(), SinkError> {
-        self.out.ship().await?;
+        self.out.flush_pending().await?;
         let (tx, rx) = oneshot::channel();
         if self
             .out
@@ -563,7 +563,7 @@ impl ReorderSink {
     /// Block until every opened seq is durable on CH, or a fatal trips (e.g.
     /// CH down past the inserter retry budget).
     async fn wait_all_durable(&mut self) -> Result<(), SinkError> {
-        self.out.ship().await?;
+        self.out.flush_pending().await?;
         let through = self.out.seqs.next();
         tokio::select! {
             biased;
@@ -937,7 +937,7 @@ impl ReorderSink {
         out.staged_rows += rows as usize;
         out.staged_bytes += bytes;
         if out.staged_rows >= chunk_rows || out.staged_bytes >= decode::DECODE_CHUNK_BYTES {
-            out.ship().await?;
+            out.flush_pending().await?;
         }
         Ok(())
     }
@@ -1548,7 +1548,7 @@ impl RecordSink for ReorderSink {
     fn on_close<'a>(
         &'a mut self,
     ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
-        Box::pin(self.out.ship())
+        Box::pin(self.out.flush_pending())
     }
 
     fn on_record<'a>(
@@ -1557,7 +1557,7 @@ impl RecordSink for ReorderSink {
     ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
         Box::pin(async move {
             self.handle(record).await?;
-            self.out.ship().await
+            self.out.flush_pending().await
         })
     }
 
@@ -1570,7 +1570,7 @@ impl RecordSink for ReorderSink {
             for record in batch.iter().filter(|r| Self::wants(r)) {
                 self.handle(record).await?;
             }
-            self.out.ship().await
+            self.out.flush_pending().await
         })
     }
 
@@ -1797,7 +1797,7 @@ mod tests {
         let out = Outbox {
             msg_tx,
             fatal: fatal.clone(),
-            seqs: ack.seqs(0).held(),
+            seqs: ack.seqs(0).buffer_events(),
             staged: Vec::new(),
             staged_rows: 0,
             staged_bytes: 0,
