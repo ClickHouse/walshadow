@@ -24,7 +24,7 @@ use crate::decode::wal_xact::{
 use crate::emit::ch_emitter::EmitterStats;
 use crate::emit::pipeline::ack::{AckHandle, BufferedRowSender, OpenSeq, Publish, SeqAlloc};
 use crate::emit::pipeline::batcher::{BatcherClosed, BatcherMsg, RowBuffer};
-use crate::emit::route::{FrozenRoutes, RouteSnapshot, freeze_routes};
+use crate::emit::route::{RouteSnapshot, freeze_routes};
 use crate::mapping::MappingSnapshot;
 use crate::pos::Pos;
 use crate::record::{Record, RecordSink, SegmentSink, SinkError, WAL_SEG_SIZE};
@@ -89,12 +89,11 @@ pub struct WalReplaySink {
     subxact_tracker: SubxactTracker,
     resolver: ToastResolver,
     filter_rfns: HashSet<(Oid, Oid)>,
-    targets: ReplayTargets,
+    /// Share targets so replay can borrow them across mutable calls
+    targets: Arc<HashMap<(Oid, Oid), ReplayTarget>>,
     from_lsn: u64,
     /// See [`WalReplayInputs::whole_db_filter`]
     whole_db_filter: bool,
-    /// Routes frozen at replay start from the mapping + config snapshots
-    routes: FrozenRoutes,
     stats: Arc<EmitterStats>,
     budget: Option<MemoryBudget>,
     /// Drain-slice budget, same knobs as the pipeline reorder
@@ -118,6 +117,14 @@ pub struct WalReplaySink {
     replay: ReplayStats,
 }
 
+/// Relation and route captured at replay start
+struct ReplayTarget {
+    rel: Arc<RelDescriptor>,
+    /// Last commit LSN to replay, inclusive
+    through: u64,
+    route: Option<Arc<RouteSnapshot>>,
+}
+
 fn tail_closed(_: BatcherClosed) -> SinkError {
     SinkError::Other("wal_replay: tail closed".into())
 }
@@ -128,6 +135,26 @@ impl WalReplaySink {
             .resolver
             .budget()
             .map_or(usize::MAX, MemoryBudget::leaf_max);
+        let routes = freeze_routes(
+            &inputs.mapping,
+            inputs.config.as_deref(),
+            &inputs.row_policy,
+        );
+        let targets = inputs
+            .targets
+            .into_iter()
+            .map(|(key, (rel, through))| {
+                let route = routes.route(&rel);
+                (
+                    key,
+                    ReplayTarget {
+                        rel,
+                        through,
+                        route,
+                    },
+                )
+            })
+            .collect();
         Self {
             decoder: BufferingDecoderSink::new(
                 DescriptorLogs::single(inputs.log.clone()),
@@ -139,14 +166,9 @@ impl WalReplaySink {
             subxact_tracker: SubxactTracker::new(),
             resolver: inputs.resolver,
             filter_rfns: inputs.filter_rfns,
-            targets: inputs.targets,
+            targets: Arc::new(targets),
             from_lsn: inputs.from_lsn,
             whole_db_filter: inputs.whole_db_filter,
-            routes: freeze_routes(
-                &inputs.mapping,
-                inputs.config.as_deref(),
-                &inputs.row_policy,
-            ),
             stats: inputs.stats,
             budget: inputs.budget,
             batch_rows: inputs.batch_rows,
@@ -213,15 +235,11 @@ impl WalReplaySink {
     async fn emit(
         &mut self,
         seq: u64,
-        rel: Arc<RelDescriptor>,
-        route: Arc<RouteSnapshot>,
+        table: (&Arc<RelDescriptor>, &Arc<RouteSnapshot>),
         committed: CommittedTuple,
         value_permit: Option<Arc<MemoryPermit>>,
     ) -> std::result::Result<(), SinkError> {
-        if self
-            .row_buffer
-            .stage(seq, rel, route, committed, value_permit)
-        {
+        if self.row_buffer.stage(seq, table, committed, value_permit) {
             self.flush_pending().await?;
         }
         Ok(())
@@ -406,6 +424,7 @@ impl WalReplaySink {
         commit_lsn: u64,
     ) -> std::result::Result<(), SinkError> {
         let walk = batch.into_walk();
+        let targets = Arc::clone(&self.targets);
         let ref_maps: Vec<&ChunkRefMap> = walk.chunks.iter().map(|g| g.map()).collect();
         // One spool per transaction
         let spool = walk.chunks.iter().find_map(|g| g.spool());
@@ -438,8 +457,7 @@ impl WalReplaySink {
                 WalkStep::Heap(mut heap) => {
                     let rfn = heap.decoded.rfn;
                     // Decode TOAST chunks, route through parent row
-                    let Some((rel, through)) = self.targets.get(&(rfn.db_node, rfn.rel_node))
-                    else {
+                    let Some(target) = targets.get(&(rfn.db_node, rfn.rel_node)) else {
                         continue;
                     };
                     if commit_lsn <= self.from_lsn {
@@ -447,11 +465,11 @@ impl WalReplaySink {
                         self.replay.commits_below_from += 1;
                         continue;
                     }
-                    if commit_lsn > *through {
+                    if commit_lsn > target.through {
                         self.replay.commits_past_through += 1;
                         continue;
                     }
-                    let Some(route) = self.routes.route(rel) else {
+                    let Some(route) = &target.route else {
                         self.stats
                             .unsupported_relations
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -466,7 +484,7 @@ impl WalReplaySink {
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         continue;
                     }
-                    let rel = rel.clone();
+                    let rel = &target.rel;
                     // Make earlier commits available before resolving values.
                     // Inline-only heaps read nothing: flushing for them
                     // shreds the batch on a row-heavy segment. Gate stays
@@ -485,7 +503,7 @@ impl WalReplaySink {
                     *rows += 1;
                     let seq = open.seq();
                     if !route.drops_deletes()
-                        && let Some(tomb) = take_key_change_tombstone(&mut heap.decoded, &rel)
+                        && let Some(tomb) = take_key_change_tombstone(&mut heap.decoded, rel)
                     {
                         *rows += 1;
                         let tomb = CommittedTuple {
@@ -493,15 +511,14 @@ impl WalReplaySink {
                             commit_ts,
                             commit_lsn,
                         };
-                        self.emit(seq, rel.clone(), route.clone(), tomb, None)
-                            .await?;
+                        self.emit(seq, (rel, route), tomb, None).await?;
                     }
                     let committed = CommittedTuple {
                         decoded: heap.decoded,
                         commit_ts,
                         commit_lsn,
                     };
-                    self.emit(seq, rel, route, committed, value_permit.map(Arc::new))
+                    self.emit(seq, (rel, route), committed, value_permit.map(Arc::new))
                         .await?;
                     self.replay.rows_replayed += 1;
                 }

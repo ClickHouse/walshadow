@@ -170,7 +170,9 @@ mod tests {
         ColumnValue, CommittedTuple, DecodedHeap, DecodedTuple, HeapOp,
     };
     use crate::emit::ch_emitter::Wire;
-    use crate::emit::pipeline::batcher::{BatcherConfig, BatcherMsg, RoutedRow, RowChunk};
+    use crate::emit::pipeline::batcher::{
+        BatcherConfig, BatcherMsg, RoutedRow, RowChunk, RowTable,
+    };
     use crate::emit::route::RouteSnapshot;
     use crate::mapping::{ColumnMapping, TableMapping, TableTarget};
     use crate::schema::{RelAttr, RelDescriptor, RelName, ReplIdent};
@@ -182,7 +184,7 @@ mod tests {
     /// the daemon: the shape a PostGIS 2-D point takes
     const GEOM_OID: u32 = 999_999;
 
-    fn wkt_row(seq: u64, text: Option<&str>) -> RoutedRow {
+    fn wkt_table() -> RowTable {
         let rel = Arc::new(RelDescriptor {
             rfn: RelFileNode {
                 spc_node: 1663,
@@ -226,10 +228,13 @@ mod tests {
             Arc::default(),
             Default::default(),
         );
+        RowTable { rel, route }
+    }
+
+    fn wkt_row(seq: u64, text: Option<&str>) -> RoutedRow {
         RoutedRow {
             seq,
-            rel,
-            route,
+            table: 0,
             committed: CommittedTuple {
                 decoded: DecodedHeap {
                     rfn: RelFileNode {
@@ -274,7 +279,11 @@ mod tests {
             Arc::new(EmitterStats::default()),
             None,
         );
-        let chunk = RowChunk { rows, permit: None };
+        let chunk = RowChunk {
+            tables: vec![wkt_table()],
+            rows,
+            permit: None,
+        };
         msg_tx
             .send(BatcherMsg::Rows(chunk))
             .await
