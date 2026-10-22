@@ -5,7 +5,6 @@ use std::sync::Arc;
 use tokio_postgres::types::Oid;
 
 use crate::column_rules::ColumnRules;
-use crate::decode::heap_decoder::DescribedHeap;
 use crate::mapping::{ColumnMapping, SystemColumns, TableMapping, TableTarget};
 use crate::schema::{RelDescriptor, RelName};
 use crate::table_rules::{PartitionRoute, TableRules};
@@ -278,29 +277,6 @@ impl FrozenRoutes {
                 })
             })
             .clone()
-    }
-}
-
-/// Described heap plus its resolved route. `route = None` means the relation
-/// is deterministically unmapped at that interval — a normal counted discard,
-/// distinct from a missing descriptor
-#[derive(Debug)]
-pub struct RoutedHeap {
-    pub described: DescribedHeap,
-    pub route: Option<Arc<RouteSnapshot>>,
-    /// [`DecodedHeap::approx_bytes`](crate::decode::heap_decoder::DecodedHeap::approx_bytes)
-    /// measured once, as every stage downstream budgets by it
-    pub bytes: usize,
-}
-
-impl RoutedHeap {
-    pub fn new(described: DescribedHeap, route: Option<Arc<RouteSnapshot>>) -> Self {
-        let bytes = described.decoded.approx_bytes();
-        Self {
-            described,
-            route,
-            bytes,
-        }
     }
 }
 
