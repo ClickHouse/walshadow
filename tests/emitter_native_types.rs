@@ -24,7 +24,7 @@ use walshadow::codecs::NumericKind;
 use walshadow::heap_decoder::{ColumnValue, CommittedTuple, DecodedHeap, DecodedTuple, HeapOp};
 use walshadow::mapping::{ColumnMapping, TableMapping, TableTarget};
 use walshadow::pipeline::ack::Publish;
-use walshadow::pipeline::batcher::{BatcherMsg, RoutedRow, RowChunk};
+use walshadow::pipeline::batcher::{BatcherMsg, RoutedRow, RowChunk, RowTable};
 use walshadow::pipeline::{Fatal, tail};
 use walshadow::pos::{EmitterAck, Monotone};
 use walshadow::schema::{RelDescriptor, RelName, ReplIdent};
@@ -91,7 +91,7 @@ async fn native_numeric_time_timetz_round_trip() {
         ..Default::default()
     };
 
-    // The batcher builds its plan from the `RoutedRow`'s mapping (not
+    // The batcher builds its plan from the chunk's `RowTable` mapping (not
     // `cfg.tables`), so the destination shape lives here.
     let rel = Arc::new(rel_descriptor());
     let mapping = Arc::new(TableMapping {
@@ -178,14 +178,17 @@ async fn native_numeric_time_timetz_round_trip() {
     let seq = seqs.open(tuple.commit_lsn, Publish::Commit);
     msg_tx
         .send(BatcherMsg::Rows(RowChunk {
-            rows: vec![RoutedRow {
-                seq: seq.seq(),
+            tables: vec![RowTable {
                 rel,
                 route: walshadow::emit::route::RouteSnapshot::freeze(
                     mapping,
                     Arc::default(),
                     Default::default(),
                 ),
+            }],
+            rows: vec![RoutedRow {
+                seq: seq.seq(),
+                table: 0,
                 committed: tuple,
                 value_permit: None,
             }],

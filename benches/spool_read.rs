@@ -119,27 +119,26 @@ fn plan(args: &Args, repeat: usize) -> anyhow::Result<()> {
     let start = Instant::now();
     let mut writer = PlanWriter::create(dir.path().join("plan.spool"), u64::MAX, 1 << 20)?;
     for i in 0..args.rows {
-        writer.push_heap(
-            DescribedHeap {
-                decoded: DecodedHeap {
-                    rfn: rfn(),
-                    xid: 7,
-                    source_lsn: i as u64,
-                    op: HeapOp::Insert,
-                    new: Some(DecodedTuple {
-                        columns: vec![
-                            Some(ColumnValue::Int4(i as i32)),
-                            Some(ColumnValue::Text(payload.clone())),
-                        ],
-                        partial: false,
-                    }),
-                    old: None,
-                },
-                descriptor: descriptor.clone(),
-                descriptor_valid_from: 1,
+        let heap = DescribedHeap {
+            decoded: DecodedHeap {
+                rfn: rfn(),
+                xid: 7,
+                source_lsn: i as u64,
+                op: HeapOp::Insert,
+                new: Some(DecodedTuple {
+                    columns: vec![
+                        Some(ColumnValue::Int4(i as i32)),
+                        Some(ColumnValue::Text(payload.clone())),
+                    ],
+                    partial: false,
+                }),
+                old: None,
             },
-            None,
-        )?;
+            descriptor: descriptor.clone(),
+            descriptor_valid_from: 1,
+        };
+        let table = writer.table(&heap, || None);
+        writer.push_heap(heap.decoded, table)?;
     }
     let sealed = writer.seal(u64::MAX, 0)?;
     let write = start.elapsed();
@@ -153,7 +152,7 @@ fn plan(args: &Args, repeat: usize) -> anyhow::Result<()> {
         let PlanItem::Heap(h) = item else {
             unreachable!()
         };
-        assert_eq!(h.described.decoded.source_lsn, n as u64);
+        assert_eq!(h.decoded.source_lsn, n as u64);
         n += 1;
     }
     let replay = start.elapsed();

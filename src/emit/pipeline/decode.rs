@@ -11,8 +11,8 @@ use std::sync::atomic::Ordering;
 
 use crate::decode::heap_decoder::{CommittedTuple, HeapOp, take_key_change_tombstone};
 use crate::emit::ch_emitter::EmitterStats;
-use crate::emit::pipeline::batcher::{RoutedRow, RowChunk};
-use crate::emit::route::RoutedHeap;
+use crate::emit::pipeline::batcher::{RoutedRow, RowChunk, RowTable};
+use crate::emit::pipeline::plan_spool::{PlanTable, PlannedHeap};
 
 /// Byte half of dual trigger with configured row cap. Bounds channel item for
 /// fat detoasted rows that would pin many MiB before row cap fires; above
@@ -20,12 +20,12 @@ use crate::emit::route::RoutedHeap;
 /// unchanged.
 pub const DECODE_CHUNK_BYTES: usize = 4 << 20;
 
-/// Chunk every routed heap of one seq onto `staged`. Returns rows routed
+/// Chunk every planned heap of one seq onto `staged`. Returns rows routed
 /// (the `R` the collector compares against).
 ///
 /// Caller ships `staged` before the seq's `Placed` and any later
-/// `FlushAll`. `route = None` (deterministically unmapped, counted at
-/// planning) discards here.
+/// `FlushAll`. Heaps of an unmapped table (counted at planning) discard
+/// here.
 #[allow(clippy::too_many_arguments)]
 pub fn place_rows(
     staged: &mut Vec<RowChunk>,
@@ -34,28 +34,46 @@ pub fn place_rows(
     seq: u64,
     commit_ts: i64,
     commit_lsn: u64,
-    heaps: Vec<RoutedHeap>,
+    tables: &[PlanTable],
+    heaps: Vec<PlannedHeap>,
     permit: Option<Arc<crate::budget::MemoryPermit>>,
 ) -> u64 {
     stats.decode_jobs_in.fetch_add(1, Ordering::Relaxed);
     let mut routed = 0u64;
     let mut heaps = heaps.into_iter();
-    let mut buf: Vec<RoutedRow> = Vec::with_capacity(chunk_rows.min(heaps.len()));
-    let mut buf_bytes = 0usize;
-    while let Some(envelope) = heaps.next() {
-        let Some(route) = envelope.route else {
+    let mut chunk = RowChunk {
+        rows: Vec::with_capacity(chunk_rows.min(heaps.len())),
+        ..Default::default()
+    };
+    let mut chunk_bytes = 0usize;
+    // Plan table to index in `chunk.tables`, reset per chunk
+    let mut slots = vec![u32::MAX; tables.len()];
+    while let Some(heap) = heaps.next() {
+        let PlanTable {
+            descriptor: rel,
+            route: Some(route),
+            ..
+        } = &tables[heap.table as usize]
+        else {
             continue;
         };
         // No delete-marker column: a DELETE would land as a phantom insert of
         // the old image, so drop it (append-only destination)
-        if route.drops_deletes() && matches!(envelope.described.decoded.op, HeapOp::Delete) {
+        if route.drops_deletes() && matches!(heap.decoded.op, HeapOp::Delete) {
             stats.deletes_discarded.fetch_add(1, Ordering::Relaxed);
             continue;
         }
-        let heap = envelope.described;
         // Ext render and tombstone split leave payload roughly unchanged
-        buf_bytes += envelope.bytes;
-        let rel = heap.descriptor;
+        chunk_bytes += heap.bytes;
+        let slot = &mut slots[heap.table as usize];
+        if *slot == u32::MAX {
+            *slot = chunk.tables.len() as u32;
+            chunk.tables.push(RowTable {
+                rel: rel.clone(),
+                route: route.clone(),
+            });
+        }
+        let table = *slot;
         let mut committed = CommittedTuple {
             decoded: heap.decoded,
             commit_ts,
@@ -69,40 +87,43 @@ pub fn place_rows(
             crate::ops::oracle::render_ext_columns(&rel.attributes, &mut t.columns);
         }
         if !route.drops_deletes()
-            && let Some(tomb) = take_key_change_tombstone(&mut committed.decoded, &rel)
+            && let Some(tomb) = take_key_change_tombstone(&mut committed.decoded, rel)
         {
             let tomb = CommittedTuple {
                 decoded: tomb,
                 ..committed
             };
-            buf.push(RoutedRow {
+            chunk.rows.push(RoutedRow {
                 seq,
-                rel: rel.clone(),
-                route: route.clone(),
+                table,
                 committed: tomb,
                 value_permit: None,
             });
             routed += 1;
         }
-        buf.push(RoutedRow {
+        chunk.rows.push(RoutedRow {
             seq,
-            rel,
-            route,
+            table,
             committed,
             value_permit: None,
         });
         routed += 1;
-        if buf.len() >= chunk_rows || buf_bytes >= DECODE_CHUNK_BYTES {
+        if chunk.rows.len() >= chunk_rows || chunk_bytes >= DECODE_CHUNK_BYTES {
+            let next = RowChunk {
+                rows: Vec::with_capacity(chunk_rows.min(heaps.len())),
+                ..Default::default()
+            };
             staged.push(RowChunk {
-                rows: std::mem::take(&mut buf),
                 permit: permit.clone(),
+                ..std::mem::replace(&mut chunk, next)
             });
-            buf.reserve(chunk_rows.min(heaps.len()));
-            buf_bytes = 0;
+            slots.fill(u32::MAX);
+            chunk_bytes = 0;
         }
     }
-    if !buf.is_empty() {
-        staged.push(RowChunk { rows: buf, permit });
+    if !chunk.rows.is_empty() {
+        chunk.permit = permit;
+        staged.push(chunk);
     }
     stats.decode_rows_out.fetch_add(routed, Ordering::Relaxed);
     routed
@@ -111,7 +132,7 @@ pub fn place_rows(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::decode::heap_decoder::{ColumnValue, DecodedHeap, DecodedTuple, DescribedHeap};
+    use crate::decode::heap_decoder::{ColumnValue, DecodedHeap, DecodedTuple};
     use crate::emit::route::{RouteSnapshot, RowPolicy};
     use crate::mapping::{ColumnMapping, SystemColumns, TableMapping, TableTarget};
     use crate::schema::{RelAttr, RelDescriptor, RelName, ReplIdent};
@@ -151,7 +172,7 @@ mod tests {
         })
     }
 
-    fn heap(op: HeapOp, route: Arc<RouteSnapshot>) -> RoutedHeap {
+    fn heap(op: HeapOp) -> PlannedHeap {
         let tuple = Some(DecodedTuple {
             columns: vec![Some(ColumnValue::Int4(1))],
             partial: false,
@@ -160,21 +181,28 @@ mod tests {
             HeapOp::Delete => (None, tuple),
             _ => (tuple, None),
         };
-        RoutedHeap::new(
-            DescribedHeap {
-                decoded: DecodedHeap {
-                    rfn: RFN,
-                    xid: 7,
-                    source_lsn: 0x1000,
-                    op,
-                    new,
-                    old,
-                },
-                descriptor: rel(),
-                descriptor_valid_from: 0x40,
-            },
-            Some(route),
-        )
+        let decoded = DecodedHeap {
+            rfn: RFN,
+            xid: 7,
+            source_lsn: 0x1000,
+            op,
+            new,
+            old,
+        };
+        PlannedHeap {
+            bytes: decoded.approx_bytes(),
+            decoded,
+            table: 0,
+        }
+    }
+
+    fn table(descriptor: Arc<RelDescriptor>, route: Arc<RouteSnapshot>) -> [PlanTable; 1] {
+        [PlanTable {
+            descriptor,
+            valid_from: 0x40,
+            route: Some(route),
+            heaps: 0,
+        }]
     }
 
     fn route(system: SystemColumns) -> Arc<RouteSnapshot> {
@@ -214,10 +242,8 @@ mod tests {
             0,
             0,
             0x2000,
-            vec![
-                heap(HeapOp::Insert, no_marker.clone()),
-                heap(HeapOp::Delete, no_marker),
-            ],
+            &table(rel(), no_marker),
+            vec![heap(HeapOp::Insert), heap(HeapOp::Delete)],
             None,
         );
         assert_eq!(routed, 1, "insert routed, delete dropped");
@@ -233,7 +259,8 @@ mod tests {
             1,
             0,
             0x3000,
-            vec![heap(HeapOp::Delete, marked)],
+            &table(rel(), marked),
+            vec![heap(HeapOp::Delete)],
             None,
         );
         assert_eq!(routed, 1);
@@ -244,15 +271,15 @@ mod tests {
     #[tokio::test]
     async fn key_change_places_tombstone_first() {
         let stats = EmitterStats::default();
-        let update = |route| {
-            let mut h = heap(HeapOp::Update, route);
-            h.described.descriptor = Arc::new(RelDescriptor {
-                replident: ReplIdent::Default {
-                    pk_attnums: Some(vec![1]),
-                },
-                ..(*rel()).clone()
-            });
-            h.described.decoded.old = Some(DecodedTuple {
+        let keyed = Arc::new(RelDescriptor {
+            replident: ReplIdent::Default {
+                pk_attnums: Some(vec![1]),
+            },
+            ..(*rel()).clone()
+        });
+        let update = || {
+            let mut h = heap(HeapOp::Update);
+            h.decoded.old = Some(DecodedTuple {
                 columns: vec![Some(ColumnValue::Int4(0))],
                 partial: false,
             });
@@ -276,7 +303,8 @@ mod tests {
                 0,
                 0,
                 0x2000,
-                vec![update(route(system))],
+                &table(keyed.clone(), route(system)),
+                vec![update()],
                 None,
             );
             assert_eq!(routed, placed);
