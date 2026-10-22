@@ -373,8 +373,8 @@ async fn bin_stream_replicates_segments_and_serves_metrics() {
                 "expected {name} in /metrics body: {body}",
             );
         }
-        let ack_at_boot = metric_u64(&body, "walshadow_emitter_ack_lsn")
-            .context("emitter_ack gauge in first scrape")?;
+        // Absent until the session's first status write publishes a position
+        let ack_at_boot = metric_u64(&body, "walshadow_emitter_ack_lsn").unwrap_or(0);
 
         // 6. Drive workload. The daemon filters user-heap WAL records
         //    (rmgr=HEAP, class=User → replaced with XLOG_NOOP) — only
@@ -400,10 +400,9 @@ async fn bin_stream_replicates_segments_and_serves_metrics() {
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
         loop {
             let body = http_get(metrics_addr, "/metrics").context("ack poll scrape")?;
-            let ack = metric_u64(&body, "walshadow_emitter_ack_lsn")
-                .context("emitter_ack gauge in poll scrape")?;
-            let replay = metric_u64(&body, "walshadow_shadow_replay_lsn")
-                .context("shadow_replay gauge in poll scrape")?;
+            // LSN gauges stay absent while their position is unknown
+            let ack = metric_u64(&body, "walshadow_emitter_ack_lsn").unwrap_or(0);
+            let replay = metric_u64(&body, "walshadow_shadow_replay_lsn").unwrap_or(0);
             if ack > ack_at_boot && replay > 0 {
                 break;
             }

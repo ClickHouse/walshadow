@@ -54,6 +54,15 @@ macro_rules! encode_metric {
     ($enc:expr, gauge, $name:expr, $help:expr, $value:expr) => {
         gauge($enc, $name, $help, $value)?
     };
+    // LSN 0 is InvalidXLogRecPtr: the position is not known yet, eg the
+    // default snapshot served from process start until the session's first
+    // status write. A 0 sample between real LSNs reads as a ~80 TB jump to
+    // deriv() and lag queries, so the sample is left out instead
+    ($enc:expr, lsn, $name:expr, $help:expr, $value:expr) => {
+        if $value.get() != 0 {
+            gauge($enc, $name, $help, $value)?
+        }
+    };
     ($enc:expr, counter, $name:expr, $help:expr, $value:expr, $key:literal, $labels:expr) => {
         counter_series($enc, $name, $help, $key, $labels.into_iter().zip($value))?
     };
@@ -216,18 +225,18 @@ snapshot! {
         promotion_target_receive_lsn: u64,
     }
 
-    gauge source_received_lsn: Pos<SourceReceived> =
+    lsn source_received_lsn: Pos<SourceReceived> =
         "Source PG's most recent server_wal_end seen on the replication socket.",
     /// Last segment-boundary LSN dispatched downstream; becomes durable once
     /// segment fsync lands
-    gauge filter_lsn: Pos<FilterDispatched> =
+    lsn filter_lsn: Pos<FilterDispatched> =
         "LSN of the last filtered WAL byte the daemon has dispatched.",
-    gauge shadow_replay_lsn: Pos<ShadowReplay> =
+    lsn shadow_replay_lsn: Pos<ShadowReplay> =
         "Shadow PG's pg_last_wal_replay_lsn(), polled at status cadence.",
-    gauge decoder_commit_lsn: Pos<Drain> = "Highest commit LSN drained out of the xact buffer.",
+    lsn decoder_commit_lsn: Pos<Drain> = "Highest commit LSN drained out of the xact buffer.",
     /// Live insert watermark, unlike manifest's resume-safe `emitter_ack`
-    gauge emitter_ack_lsn: Pos<EmitterAck> = "Contiguous-done watermark from the insert pipeline.",
-    gauge floor_lsn: Pos<Floor> = "Durable resume floor: restart resumes here and pruners cut to it.",
+    lsn emitter_ack_lsn: Pos<EmitterAck> = "Contiguous-done watermark from the insert pipeline.",
+    lsn floor_lsn: Pos<Floor> = "Durable resume floor: restart resumes here and pruners cut to it.",
     gauge xact_active: u64 = "Active transactions buffered in memory or on spill.",
     gauge xact_bytes_in_memory: u64 = "Bytes held in memory across all buffered xacts.",
     gauge spill_xacts_active: u64 = "Xacts with at least one entry currently in their spill file.",
@@ -1141,6 +1150,24 @@ mod tests {
             let failed = text::encode(&mut w, &registry).is_err();
             assert!(failed, "prefix length {writes} must surface the failure");
             assert!(w.out.len() < full, "a failed encode cannot be complete");
+        }
+    }
+
+    #[test]
+    fn render_omits_unknown_lsn_gauges() {
+        let body = render(MetricsSnapshot {
+            emitter_ack_lsn: 0x47FD_FB00_0000.into(),
+            ..MetricsSnapshot::default()
+        });
+        assert!(body.contains("walshadow_emitter_ack_lsn 79156163379200"));
+        for name in [
+            "walshadow_source_received_lsn",
+            "walshadow_filter_lsn",
+            "walshadow_shadow_replay_lsn",
+            "walshadow_decoder_commit_lsn",
+            "walshadow_floor_lsn",
+        ] {
+            assert!(!body.contains(name), "{name} rendered at LSN 0: {body}");
         }
     }
 
