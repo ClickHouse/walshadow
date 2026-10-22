@@ -17,7 +17,7 @@ use crate::config::ResolvedConfig;
 use crate::decode::heap_decoder::{ColumnValue, ToastPointer};
 use crate::emit::ch_emitter::EmitterStats;
 use crate::emit::pipeline::ack::{AckHandle, OpenSeq, Publish, SeqAlloc};
-use crate::emit::pipeline::batcher::{BatcherClosed, BatcherMsg, RowBuf};
+use crate::emit::pipeline::batcher::{BatcherClosed, BatcherMsg, RowBuf, RowTable};
 use crate::emit::route::{FrozenRoutes, RouteSnapshot, RowPolicy, freeze_routes};
 use crate::mapping::{MappingSnapshot, TableMapping};
 use crate::ops::oracle::render_ext_columns;
@@ -181,7 +181,7 @@ pub async fn drain(
     let mut footprint = DeferredFootprint::new(&stats);
     let mut seqs = ack.seqs(0);
     let mut rows_routed = 0;
-    let mut open: Option<(RelFileNode, OpenSeq, u64)> = None;
+    let mut open: Option<Run> = None;
     let mut chunk_batch = Vec::new();
     let mut chunk_batch_bytes = 0;
     let mut out = RowBuf::default();
@@ -189,54 +189,45 @@ pub async fn drain(
     let mut ticker = Ticker::new(WALK_CHECKPOINT_PERIOD);
     while let Some(batch) = rx.recv().await {
         consumed += batch.len() as u64;
-        for tuple in batch {
+        for mut tuple in batch {
             let rfn = tuple.rfn;
-            let source_lsn = tuple.source_lsn;
-
-            let seq = if let Some((r, seq, _)) = &open
-                && *r == rfn
-            {
-                seq.seq()
-            } else {
-                if let Some((_, prev, prev_rows)) = open.take() {
-                    // Every row of the closing seq on the channel before its
-                    // expected count is published
-                    out.flush(&msg_tx).await.map_err(closed)?;
-                    seqs.place(prev, prev_rows);
-                }
-                let seq = seqs.open(source_lsn, Publish::Commit);
-                let s = seq.seq();
-                open = Some((rfn, seq, 0));
-                s
-            };
-
-            let Some(rel) = catalog.get(rfn.db_node, rfn.rel_node) else {
-                stats.unsupported_relations.fetch_add(1, Ordering::Relaxed);
-                continue;
-            };
-
-            if skip_initial.contains(&rel.rel_name) {
-                continue;
-            }
-
-            if catalog.is_toast(rfn.db_node, rfn.rel_node) {
-                if let Some(row) = row_from_columns(tuple, rfn.db_node, rel.oid) {
-                    chunk_batch_bytes += row.chunk_data.len();
-                    chunk_batch.push(row);
-                    if resolver.put_limit_reached(chunk_batch.len(), chunk_batch_bytes) {
-                        flush_chunks(&resolver, &mut chunk_batch).await?;
-                        chunk_batch_bytes = 0;
+            let run = match &mut open {
+                Some(run) if run.rfn == rfn => run,
+                slot => {
+                    if let Some(prev) = slot.take() {
+                        // Every row of the closing seq on the channel before
+                        // its expected count is published
+                        out.flush(&msg_tx).await.map_err(closed)?;
+                        seqs.place(prev.seq, prev.rows);
                     }
+                    slot.insert(Run {
+                        rfn,
+                        seq: seqs.open(tuple.source_lsn, Publish::Commit),
+                        rows: 0,
+                        target: Target::resolve(&catalog, &routes, &skip_initial, rfn),
+                    })
                 }
-                continue;
-            }
-
-            let Some(route) = routes.route(&rel) else {
-                stats.unsupported_relations.fetch_add(1, Ordering::Relaxed);
-                continue;
+            };
+            let (rel, route) = match &run.target {
+                Target::Routed(rel, route) => (rel, route),
+                Target::Unsupported => {
+                    stats.unsupported_relations.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+                Target::Skipped => continue,
+                Target::Toast(toast_relid) => {
+                    if let Some(row) = row_from_columns(tuple, rfn.db_node, *toast_relid) {
+                        chunk_batch_bytes += row.chunk_data.len();
+                        chunk_batch.push(row);
+                        if resolver.put_limit_reached(chunk_batch.len(), chunk_batch_bytes) {
+                            flush_chunks(&resolver, &mut chunk_batch).await?;
+                            chunk_batch_bytes = 0;
+                        }
+                    }
+                    continue;
+                }
             };
 
-            let mut tuple = tuple;
             let mut permit = None;
             if tuple.has_mapped_external(&route.mapping) {
                 // Defer until page walk has populated or started backing store
@@ -251,16 +242,17 @@ pub async fn drain(
                     footprint.publish(spool);
                     continue;
                 }
-                permit = resolve_or_fill_toast(&mut tuple, &rel, &route.mapping, &resolver)
+                permit = resolve_or_fill_toast(&mut tuple, rel, &route.mapping, &resolver)
                     .await?
                     .map(Arc::new);
             }
             render_ext_columns(&rel.attributes, &mut tuple.columns);
             let committed = tuple.into_committed_insert();
-            out.push(&msg_tx, seq, rel, route, committed, permit)
+            out.push(&msg_tx, run.seq.seq(), (rel, route), committed, permit)
                 .await
                 .map_err(closed)?;
-            bump(&mut open, &mut rows_routed);
+            run.rows += 1;
+            rows_routed += 1;
         }
         // Resumable walk: close the seq space and fsync the spool so the
         // checkpointer can name every tuple consumed so far durable
@@ -272,8 +264,8 @@ pub async fn drain(
                 chunk_batch_bytes = 0;
             }
             out.flush(&msg_tx).await.map_err(closed)?;
-            if let Some((_, seq, rows)) = open.take() {
-                seqs.place(seq, rows);
+            if let Some(run) = open.take() {
+                seqs.place(run.seq, run.rows);
             }
             let mut mark = SpoolMark::default();
             if let Some(spool) = deferred.as_mut() {
@@ -287,8 +279,8 @@ pub async fn drain(
         }
     }
     out.flush(&msg_tx).await.map_err(closed)?;
-    if let Some((_, seq, rows)) = open.take() {
-        seqs.place(seq, rows);
+    if let Some(run) = open.take() {
+        seqs.place(run.seq, run.rows);
     }
     let next_seq = seqs.next();
 
@@ -453,15 +445,49 @@ async fn resolve_spooled(
     })
 }
 
-fn bump(open: &mut Option<(RelFileNode, OpenSeq, u64)>, rows_routed: &mut u64) {
-    if let Some(slot) = open.as_mut() {
-        slot.2 += 1;
-    }
-    *rows_routed += 1;
-}
-
 fn closed(e: BatcherClosed) -> String {
     format!("bootstrap: {e}")
+}
+
+/// Seq and destination of the relfilenode the drain is walking
+struct Run {
+    rfn: RelFileNode,
+    seq: OpenSeq,
+    rows: u64,
+    target: Target,
+}
+
+/// What a relfilenode's walked tuples become, resolved once per run
+enum Target {
+    /// No descriptor or no route, counted per tuple
+    Unsupported,
+    /// Loaded by the caller
+    Skipped,
+    /// TOAST heap whose chunks feed the store under this toast relid
+    Toast(u32),
+    Routed(Arc<RelDescriptor>, Arc<RouteSnapshot>),
+}
+
+impl Target {
+    fn resolve(
+        catalog: &CatalogMap,
+        routes: &FrozenRoutes,
+        skip_initial: &HashSet<RelName>,
+        rfn: RelFileNode,
+    ) -> Self {
+        let Some(rel) = catalog.get(rfn.db_node, rfn.rel_node) else {
+            return Self::Unsupported;
+        };
+        if skip_initial.contains(&rel.rel_name) {
+            return Self::Skipped;
+        }
+        if catalog.is_toast(rfn.db_node, rfn.rel_node) {
+            return Self::Toast(rel.oid);
+        }
+        routes
+            .route(&rel)
+            .map_or(Self::Unsupported, |route| Self::Routed(rel, route))
+    }
 }
 
 const REPLAY_BATCH_ROWS: usize = 65536;
@@ -475,6 +501,9 @@ type ValueKey = (u32, u32, u32, u64);
 /// Routed referrers awaiting their values, with the leaf bytes resolving
 /// them peaks at
 struct ReplayBatch {
+    /// Relations rows index; the spool keeps walk order, so rows arrive in
+    /// runs per relation
+    tables: Vec<RowTable>,
     rows: Vec<ReplayRow>,
     /// Leaf permit bytes: what the round's values retain plus its largest
     /// decompression transient
@@ -485,8 +514,8 @@ struct ReplayBatch {
 
 struct ReplayRow {
     tuple: BackfillTuple,
-    rel: Arc<RelDescriptor>,
-    route: Arc<RouteSnapshot>,
+    /// Index into the batch's `tables`
+    table: u32,
     pointers: Vec<PointerSite>,
 }
 
@@ -525,6 +554,7 @@ fn fill_oversize(
 
 /// Batch whose values are resolved, holding the leaf permit its rows ride
 struct ResolvedReplayBatch {
+    tables: Vec<RowTable>,
     rows: Vec<ReplayRow>,
     permit: Option<Arc<crate::budget::MemoryPermit>>,
 }
@@ -549,6 +579,7 @@ async fn prepare_batch(
         p.shrink(retained as u64);
     }
     Ok(Some(ResolvedReplayBatch {
+        tables: batch.tables,
         rows: batch.rows,
         permit: leaf.map(Arc::new),
     }))
@@ -564,21 +595,25 @@ async fn route_batch(
     seq: &mut Option<OpenSeq>,
     placed: &mut u64,
 ) -> Result<(), String> {
-    let ResolvedReplayBatch { rows, permit } = batch;
-    let mut out = RowBuf::default();
+    let ResolvedReplayBatch {
+        tables,
+        rows,
+        permit,
+    } = batch;
+    let mut out = RowBuf::new(permit);
     for row in rows {
         let mut tuple = row.tuple;
         let at = seq
             .get_or_insert_with(|| seqs.open(tuple.source_lsn, Publish::Commit))
             .seq();
-        render_ext_columns(&row.rel.attributes, &mut tuple.columns);
+        let RowTable { rel, route } = &tables[row.table as usize];
+        render_ext_columns(&rel.attributes, &mut tuple.columns);
         out.push(
             msg_tx,
             at,
-            row.rel,
-            row.route,
+            (rel, route),
             tuple.into_committed_insert(),
-            permit.clone(),
+            None,
         )
         .await
         .map_err(closed)?;
@@ -597,10 +632,12 @@ async fn next_batch(
     resolver: &ToastResolver,
 ) -> Result<ReplayBatch, String> {
     let mut batch = ReplayBatch {
+        tables: Vec::new(),
         rows: Vec::new(),
         need: 0,
         resident: 0,
     };
+    let mut run: Option<(RelFileNode, Option<u32>)> = None;
     while batch.rows.len() < REPLAY_BATCH_ROWS && batch.need + batch.resident < REPLAY_FETCH_BYTES {
         let Some(mut tuple) = replay
             .next()
@@ -609,14 +646,26 @@ async fn next_batch(
         else {
             break;
         };
-        let Some(rel) = catalog.get(tuple.rfn.db_node, tuple.rfn.rel_node) else {
+        let table = match run {
+            Some((rfn, table)) if rfn == tuple.rfn => table,
+            _ => {
+                let rfn = tuple.rfn;
+                let table = catalog
+                    .get(rfn.db_node, rfn.rel_node)
+                    .and_then(|rel| Some((routes.route(&rel)?, rel)))
+                    .map(|(route, rel)| {
+                        batch.tables.push(RowTable { rel, route });
+                        (batch.tables.len() - 1) as u32
+                    });
+                run = Some((rfn, table));
+                table
+            }
+        };
+        let Some(table) = table else {
             stats.unsupported_relations.fetch_add(1, Ordering::Relaxed);
             continue;
         };
-        let Some(route) = routes.route(&rel) else {
-            stats.unsupported_relations.fetch_add(1, Ordering::Relaxed);
-            continue;
-        };
+        let route = &batch.tables[table as usize].route;
         let mut pointers = mapped_pointers(&tuple, &route.mapping);
         batch.need += check_value_caps(
             pointers.iter().map(|site| site.p),
@@ -628,8 +677,7 @@ async fn next_batch(
         batch.resident += crate::backfill::spool::approx_bytes(&tuple);
         batch.rows.push(ReplayRow {
             tuple,
-            rel,
-            route,
+            table,
             pointers,
         });
     }
@@ -643,11 +691,11 @@ async fn resolve_batch(batch: &mut ReplayBatch, resolver: &ToastResolver) -> Res
     let mut retained = 0usize;
     for ReplayRow {
         tuple,
-        rel,
-        route,
+        table,
         pointers,
     } in &mut batch.rows
     {
+        let RowTable { rel, route } = &batch.tables[*table as usize];
         for site in pointers.iter() {
             let key = (
                 tuple.rfn.db_node,
@@ -1975,6 +2023,7 @@ mod tests {
 
         let mut stores = Vec::new();
         let mut batch = ReplayBatch {
+            tables: Vec::new(),
             rows: Vec::new(),
             need: 0,
             resident: 0,
@@ -1995,10 +2044,13 @@ mod tests {
                 RowPolicy::default(),
             );
             let pointers = mapped_pointers(&tuple, &route.mapping);
-            batch.rows.push(ReplayRow {
-                tuple,
+            batch.tables.push(RowTable {
                 rel: bytea_rel(16400),
                 route,
+            });
+            batch.rows.push(ReplayRow {
+                tuple,
+                table: batch.tables.len() as u32 - 1,
                 pointers,
             });
         }

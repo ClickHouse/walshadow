@@ -1823,8 +1823,8 @@ mod tests {
         let (mut out, _tail) = outbox(&budget, &fatal);
         let staged = budget.try_admit(768 << 10).unwrap();
         out.staged.push(RowChunk {
-            rows: Vec::new(),
             permit: Some(Arc::new(staged)),
+            ..Default::default()
         });
         let permit = tokio::time::timeout(Duration::from_secs(5), out.admit(512 << 10))
             .await

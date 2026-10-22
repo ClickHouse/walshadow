@@ -27,7 +27,7 @@ use walshadow::ch_emitter::{EmitterConfig, EmitterStats, InstanceConfig};
 use walshadow::heap_decoder::{ColumnValue, CommittedTuple, DecodedHeap, DecodedTuple, HeapOp};
 use walshadow::mapping::{ColumnMapping, TableMapping, TableTarget};
 use walshadow::pipeline::ack::Publish;
-use walshadow::pipeline::batcher::{BatcherMsg, RoutedRow, RowChunk};
+use walshadow::pipeline::batcher::{BatcherMsg, RoutedRow, RowChunk, RowTable};
 use walshadow::pipeline::{Fatal, tail};
 use walshadow::pos::Pos;
 use walshadow::pos::{EmitterAck, Monotone};
@@ -174,7 +174,6 @@ async fn budget_trips_seal_complete_inserts() {
     .await
     .expect("spawn tail");
 
-    let rel = rel_descriptor();
     let route = walshadow::emit::route::RouteSnapshot::freeze(
         mapping(),
         Arc::default(),
@@ -187,14 +186,20 @@ async fn budget_trips_seal_complete_inserts() {
     let rows = (0..N)
         .map(|i| RoutedRow {
             seq: seq.seq(),
-            rel: rel.clone(),
-            route: route.clone(),
+            table: 0,
             committed: tuple(i, 0x1000 + i as u64, commit_lsn),
             value_permit: None,
         })
         .collect();
     msg_tx
-        .send(BatcherMsg::Rows(RowChunk { rows, permit: None }))
+        .send(BatcherMsg::Rows(RowChunk {
+            tables: vec![RowTable {
+                rel: rel_descriptor(),
+                route,
+            }],
+            rows,
+            permit: None,
+        }))
         .await
         .expect("route rows");
     seqs.place(seq, N as u64);

@@ -11,7 +11,7 @@ use std::sync::atomic::Ordering;
 
 use crate::decode::heap_decoder::{CommittedTuple, HeapOp, take_key_change_tombstone};
 use crate::emit::ch_emitter::EmitterStats;
-use crate::emit::pipeline::batcher::{RoutedRow, RowChunk};
+use crate::emit::pipeline::batcher::{RoutedRow, RowChunk, RowTable};
 use crate::emit::pipeline::plan_spool::{PlanTable, PlannedHeap};
 
 /// Byte half of dual trigger with configured row cap. Bounds channel item for
@@ -41,8 +41,13 @@ pub fn place_rows(
     stats.decode_jobs_in.fetch_add(1, Ordering::Relaxed);
     let mut routed = 0u64;
     let mut heaps = heaps.into_iter();
-    let mut buf: Vec<RoutedRow> = Vec::with_capacity(chunk_rows.min(heaps.len()));
-    let mut buf_bytes = 0usize;
+    let mut chunk = RowChunk {
+        rows: Vec::with_capacity(chunk_rows.min(heaps.len())),
+        ..Default::default()
+    };
+    let mut chunk_bytes = 0usize;
+    // Plan table to index in `chunk.tables`, reset per chunk
+    let mut slots = vec![u32::MAX; tables.len()];
     while let Some(heap) = heaps.next() {
         let PlanTable {
             descriptor: rel,
@@ -59,7 +64,16 @@ pub fn place_rows(
             continue;
         }
         // Ext render and tombstone split leave payload roughly unchanged
-        buf_bytes += heap.bytes;
+        chunk_bytes += heap.bytes;
+        let slot = &mut slots[heap.table as usize];
+        if *slot == u32::MAX {
+            *slot = chunk.tables.len() as u32;
+            chunk.tables.push(RowTable {
+                rel: rel.clone(),
+                route: route.clone(),
+            });
+        }
+        let table = *slot;
         let mut committed = CommittedTuple {
             decoded: heap.decoded,
             commit_ts,
@@ -79,34 +93,37 @@ pub fn place_rows(
                 decoded: tomb,
                 ..committed
             };
-            buf.push(RoutedRow {
+            chunk.rows.push(RoutedRow {
                 seq,
-                rel: rel.clone(),
-                route: route.clone(),
+                table,
                 committed: tomb,
                 value_permit: None,
             });
             routed += 1;
         }
-        buf.push(RoutedRow {
+        chunk.rows.push(RoutedRow {
             seq,
-            rel: rel.clone(),
-            route: route.clone(),
+            table,
             committed,
             value_permit: None,
         });
         routed += 1;
-        if buf.len() >= chunk_rows || buf_bytes >= DECODE_CHUNK_BYTES {
+        if chunk.rows.len() >= chunk_rows || chunk_bytes >= DECODE_CHUNK_BYTES {
+            let next = RowChunk {
+                rows: Vec::with_capacity(chunk_rows.min(heaps.len())),
+                ..Default::default()
+            };
             staged.push(RowChunk {
-                rows: std::mem::take(&mut buf),
                 permit: permit.clone(),
+                ..std::mem::replace(&mut chunk, next)
             });
-            buf.reserve(chunk_rows.min(heaps.len()));
-            buf_bytes = 0;
+            slots.fill(u32::MAX);
+            chunk_bytes = 0;
         }
     }
-    if !buf.is_empty() {
-        staged.push(RowChunk { rows: buf, permit });
+    if !chunk.rows.is_empty() {
+        chunk.permit = permit;
+        staged.push(chunk);
     }
     stats.decode_rows_out.fetch_add(routed, Ordering::Relaxed);
     routed
