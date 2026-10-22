@@ -44,6 +44,7 @@ use crate::emit::pipeline::plan_spool::{
     DEFAULT_PLAN_MEM_MAX, PlanPath, PlanSpoolError, PlanWriter, SealedPlan,
 };
 use crate::emit::route::RouteSnapshot;
+use crate::schema::RelDescriptor;
 use crate::toast::{ChunkRefMap, ToastResolver};
 use crate::xact::xact_buffer::{
     DrainEntry, DrainWalk, DrainedBatch, FailClosedReason, WalkStep, XactBufferError, detoast_heap,
@@ -54,9 +55,12 @@ use crate::xact::xact_buffer::{
 /// versions and fold in-walk control entries into their LOCAL view only —
 /// global mapping/config/ClickHouse changes belong to the executor at
 /// replay. `route_for` returning `None` is the deterministic unmapped
-/// discard, counted by the implementation
+/// discard. A plan asks once per descriptor version between control
+/// entries, and reports what it discarded through `unmapped` once sealed
 pub trait PlanRouteView {
     fn route_for(&mut self, heap: &DescribedHeap) -> Option<Arc<RouteSnapshot>>;
+    /// `heaps` rows of `rel` a sealed plan discards as unmapped
+    fn unmapped(&mut self, rel: &RelDescriptor, heaps: u64);
     /// Fold control entry into local view without mutating shared route state
     fn apply(
         &mut self,
@@ -129,14 +133,14 @@ impl<'a, V: PlanRouteView> Planner<'a, V> {
         disk_cap: u64,
         view: &'a mut V,
         resolver: &'a ToastResolver,
-    ) -> Result<Self, PlanError> {
-        Ok(Self {
-            writer: PlanWriter::create(path, disk_cap, DEFAULT_PLAN_MEM_MAX)?,
+    ) -> Self {
+        Self {
+            writer: PlanWriter::create(path, disk_cap, DEFAULT_PLAN_MEM_MAX),
             view,
             resolver,
             rows_base: 0,
             generations_seen: 0,
-        })
+        }
     }
 
     /// Fold one drained batch. Chunk generations release with the batch —
@@ -171,17 +175,17 @@ impl<'a, V: PlanRouteView> Planner<'a, V> {
                 }
                 WalkStep::Truncate { heap, upto } => {
                     self.resolver.clear_reads();
-                    let route = self.view.route_for(&heap);
+                    let table = self.writer.table(&heap, || self.view.route_for(&heap));
                     self.writer
-                        .push_truncate(heap, route, self.rows_base + upto)?;
+                        .push_truncate(heap.decoded, table, self.rows_base + upto)?;
                 }
                 WalkStep::Heap(mut heap) => {
                     // Route before validation and detoast: unmapped rows
                     // discard without touching
                     // the resolver or codec checks. The value permit drops
                     // once bytes land in the plan file
-                    let route = self.view.route_for(&heap);
-                    if route.is_some() {
+                    let table = self.writer.table(&heap, || self.view.route_for(&heap));
+                    if self.writer.routed(table) {
                         if heap.decoded.new.as_ref().is_some_and(|t| t.partial) {
                             return Err(PlanError::PartialUpdate {
                                 lsn: heap.decoded.source_lsn,
@@ -192,7 +196,7 @@ impl<'a, V: PlanRouteView> Planner<'a, V> {
                                 .await?;
                         }
                     }
-                    self.writer.push_heap(heap, route)?;
+                    self.writer.push_heap(heap.decoded, table)?;
                 }
             }
         }
@@ -203,7 +207,13 @@ impl<'a, V: PlanRouteView> Planner<'a, V> {
 
     /// Freeze the validated plan for the executor
     pub fn seal(self, commit_lsn: u64, commit_ts: i64) -> Result<SealedPlan, PlanError> {
-        Ok(self.writer.seal(commit_lsn, commit_ts)?)
+        let plan = self.writer.seal(commit_lsn, commit_ts)?;
+        for t in &plan.tables {
+            if t.route.is_none() {
+                self.view.unmapped(&t.descriptor, t.heaps);
+            }
+        }
+        Ok(plan)
     }
 }
 
@@ -355,6 +365,7 @@ mod tests {
         routes: HashMap<RelName, Arc<RouteSnapshot>>,
         dropped: HashSet<u32>,
         applied: Vec<u32>,
+        unmapped: Vec<(u32, u64)>,
     }
 
     impl PlanRouteView for MapView {
@@ -363,6 +374,10 @@ mod tests {
                 return None;
             }
             self.routes.get(&heap.descriptor.rel_name).cloned()
+        }
+
+        fn unmapped(&mut self, rel: &RelDescriptor, heaps: u64) {
+            self.unmapped.push((rel.oid, heaps));
         }
 
         async fn apply(&mut self, entry: &DrainEntry) -> Result<(), String> {
@@ -412,10 +427,10 @@ mod tests {
             routes: HashMap::from_iter([(rel.rel_name.clone(), route())]),
             dropped: HashSet::new(),
             applied: Vec::new(),
+            unmapped: Vec::new(),
         };
         let resolver = ToastResolver::disabled();
-        let mut planner =
-            Planner::create(tmp.path().join("1.plan"), 1 << 20, &mut view, &resolver).unwrap();
+        let mut planner = Planner::create(tmp.path().join("1.plan"), 1 << 20, &mut view, &resolver);
         let mut drain = b
             .drain_committed(StashResolved::nothing_stashed(1), 42, 0x2000, &[], false)
             .await
@@ -431,6 +446,7 @@ mod tests {
         drain.finish().await.unwrap();
         let plan = planner.seal(0x2000, 42).unwrap();
         assert_eq!(view.applied, [16600], "event folded into local view");
+        assert_eq!(view.unmapped, [(16600, 1)], "discard counted at seal");
         assert_eq!((plan.commit_lsn, plan.commit_ts), (0x2000, 42));
 
         let mut rd = plan.replay().unwrap();
@@ -440,15 +456,19 @@ mod tests {
                 PlanItem::Control(_) => "e".to_string(),
                 PlanItem::Heap(h) | PlanItem::Truncate { heap: h, .. } => format!(
                     "h{}{}",
-                    h.described.decoded.source_lsn,
-                    if h.route.is_some() { "r" } else { "-" }
+                    h.decoded.source_lsn,
+                    if rd.tables[h.table as usize].route.is_some() {
+                        "r"
+                    } else {
+                        "-"
+                    }
                 ),
             });
         }
         assert_eq!(
             order,
-            ["h100r", "h120r", "e", "h200-"],
-            "post-event heap plans unmapped under the folded view"
+            ["h100r", "h120r", "e"],
+            "heap after schema event has no mapping and is discarded"
         );
     }
 
@@ -485,13 +505,14 @@ mod tests {
             routes: HashMap::from_iter([(rel.rel_name.clone(), route())]),
             dropped: HashSet::new(),
             applied: Vec::new(),
+            unmapped: Vec::new(),
         };
         let resolver = ToastResolver::with_store(
             Arc::new(crate::toast::MemChunkStore::new()),
             Arc::new(crate::emit::ch_emitter::EmitterStats::default()),
         );
         let path = tmp.path().join("1.plan");
-        let mut planner = Planner::create(path.clone(), 1 << 20, &mut view, &resolver).unwrap();
+        let mut planner = Planner::create(path.clone(), 1 << 20, &mut view, &resolver);
         let mut drain = b
             .drain_committed(StashResolved::nothing_stashed(1), 42, 0x2000, &[], false)
             .await
@@ -536,10 +557,11 @@ mod tests {
             routes: HashMap::from_iter([(rel.rel_name.clone(), route())]),
             dropped: HashSet::new(),
             applied: Vec::new(),
+            unmapped: Vec::new(),
         };
         let resolver = ToastResolver::disabled();
         let path = tmp.path().join("1.plan");
-        let mut planner = Planner::create(path.clone(), 1 << 20, &mut view, &resolver).unwrap();
+        let mut planner = Planner::create(path.clone(), 1 << 20, &mut view, &resolver);
         let mut drain = b
             .drain_committed(stash, 42, 0x2000, &[], false)
             .await
@@ -584,10 +606,10 @@ mod tests {
             routes: HashMap::from_iter([(rel.rel_name.clone(), route())]),
             dropped: HashSet::new(),
             applied: Vec::new(),
+            unmapped: Vec::new(),
         };
         let resolver = ToastResolver::disabled();
-        let mut planner =
-            Planner::create(tmp.path().join("1.plan"), 1 << 30, &mut view, &resolver).unwrap();
+        let mut planner = Planner::create(tmp.path().join("1.plan"), 1 << 30, &mut view, &resolver);
         let mut drain = b
             .drain_committed(StashResolved::nothing_stashed(1), 42, 0x2000, &[], false)
             .await
@@ -605,12 +627,13 @@ mod tests {
             plan.path().is_some(),
             "plan crossed mem threshold into file spool"
         );
-        plan.verify().unwrap();
         let mut rd = plan.replay().unwrap();
         let mut rows = 0usize;
         while let Some(item) = rd.next_item().unwrap() {
             // No controls planned, every heap routed
-            assert!(matches!(item, PlanItem::Heap(h) if h.route.is_some()));
+            assert!(
+                matches!(item, PlanItem::Heap(h) if rd.tables[h.table as usize].route.is_some())
+            );
             rows += 1;
         }
         drop(rd);
@@ -664,10 +687,10 @@ mod tests {
             routes: HashMap::from_iter([(rel.rel_name.clone(), route())]),
             dropped: HashSet::new(),
             applied: Vec::new(),
+            unmapped: Vec::new(),
         };
         let resolver = ToastResolver::disabled();
-        let mut planner =
-            Planner::create(tmp.path().join("1.plan"), 1 << 20, &mut view, &resolver).unwrap();
+        let mut planner = Planner::create(tmp.path().join("1.plan"), 1 << 20, &mut view, &resolver);
         let mut drain = b
             .drain_committed(StashResolved::nothing_stashed(1), 42, 0x2000, &[], true)
             .await
@@ -718,10 +741,11 @@ mod tests {
                 },
                 dropped: HashSet::new(),
                 applied: Vec::new(),
+                unmapped: Vec::new(),
             };
             let resolver = ToastResolver::disabled();
             let path = tmp.path().join("1.plan");
-            let mut planner = Planner::create(path.clone(), 1 << 20, &mut view, &resolver).unwrap();
+            let mut planner = Planner::create(path.clone(), 1 << 20, &mut view, &resolver);
             let mut drain = b
                 .drain_committed(StashResolved::nothing_stashed(1), 42, 0x2000, &[], false)
                 .await
@@ -743,7 +767,8 @@ mod tests {
             } else {
                 res.unwrap();
                 let plan = planner.seal(0x2000, 42).unwrap();
-                assert_eq!(plan.heap_count, 1, "unmapped partial plans as discard");
+                assert_eq!(plan.heap_count, 0, "unmapped partial heap is discarded");
+                assert_eq!(plan.tables[0].heaps, 1);
             }
         }
     }
@@ -772,10 +797,10 @@ mod tests {
             routes: HashMap::new(),
             dropped: HashSet::new(),
             applied: Vec::new(),
+            unmapped: Vec::new(),
         };
         let resolver = ToastResolver::disabled();
-        let mut planner =
-            Planner::create(tmp.path().join("1.plan"), 1 << 20, &mut view, &resolver).unwrap();
+        let mut planner = Planner::create(tmp.path().join("1.plan"), 1 << 20, &mut view, &resolver);
         let mut drain = b
             .drain_committed(StashResolved::nothing_stashed(1), 42, 0x2000, &[], false)
             .await
@@ -785,11 +810,11 @@ mod tests {
         }
         drain.finish().await.unwrap();
         let plan = planner.seal(0x2000, 42).unwrap();
-        assert_eq!(plan.heap_count, 1);
-        let mut rd = plan.replay().unwrap();
-        // Unmapped discard planned as such
-        let item = rd.next_item().unwrap();
-        assert!(matches!(item, Some(PlanItem::Heap(h)) if h.route.is_none()));
+        assert_eq!(
+            plan.heap_count, 0,
+            "unmapped heap is counted without being stored"
+        );
+        assert_eq!(plan.tables[0].heaps, 1);
     }
 
     /// Model shadow, replayed ahead of planning: value bodies still in the
@@ -833,9 +858,10 @@ mod tests {
             routes: HashMap::from_iter([(rel.rel_name.clone(), route())]),
             dropped: HashSet::new(),
             applied: Vec::new(),
+            unmapped: Vec::new(),
         };
         let path = dir.join(format!("{xid}.plan"));
-        let mut planner = Planner::create(path, 1 << 20, &mut view, resolver).unwrap();
+        let mut planner = Planner::create(path, 1 << 20, &mut view, resolver);
         let commit = u64::from(xid) << 12 | 0x100;
         let stash = StashResolved::nothing_stashed(xid);
         let mut drain = b
@@ -855,7 +881,7 @@ mod tests {
         let mut out = Vec::new();
         while let Some(item) = rd.next_item().unwrap() {
             if let PlanItem::Heap(h) = item {
-                let d = h.described.decoded;
+                let d = h.decoded;
                 let t = d.new.or(d.old).expect("row image");
                 out.push(t.columns[0].clone().expect("column"));
             }

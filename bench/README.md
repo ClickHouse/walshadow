@@ -24,11 +24,27 @@ payload estimates; use process RSS to measure allocator and I/O buffer overhead.
 
 ## Spool replay
 
-Bootstrap deferred spool and emit plan spool, write then verified replay:
+Measure writes and replay for bootstrap deferred spool and emit plan spool:
 
 ```sh
 cargo bench --bench spool_read -- --rows 200000 --payload-bytes 256
+cargo bench --bench spool_read -- --plan-only --planner --mapped --rows 1000 --payload-bytes 0
+cargo bench --bench spool_read -- --plan-only --planner --mapped --rows 200000 --payload-bytes 256 --relations 8 --control-every 10000
 ```
+
+Use `--planner` to run `Planner::plan_batch` before replay and place replayed rows
+in batches. Use `--mapped` to assign frozen routes. By default, heaps have no
+mapping: planning counts and discards them without writing them to spool.
+Use `--relations` to cycle through relation descriptors, one per row.
+Use `--control-every` to insert unrelated schema controls and clear cached routes.
+Use `--plan-only` to skip deferred spool measurements. Plans spill to disk when
+they exceed default 1 MiB memory limit.
+
+Read `plan_total` for combined write and replay time per sample, including row
+placement with `--planner`. For plans in memory, byte counts estimate memory use;
+for spilled plans, they report encoded file size. Route caching measures descriptor
+identity checks and reuse of cached references. Measurements exclude mapping
+resolution, WAL draining, TOAST I/O, control execution, and PostgreSQL/ClickHouse I/O.
 
 ## pgbench workload
 

@@ -15,7 +15,7 @@
 //! ```text
 //! [2 bytes "WS" magic] [u16 LE version] then repeating:
 //! [u8 tag] [u32 len LE] [body of `len` bytes]
-//!   TAG_HEAP         (body = u32 dict id + encoded DecodedHeap)
+//!   TAG_HEAP         (body = u32 dict id + encoded DecodedHeap, rfn from dict)
 //!   TAG_CHUNK        (body = encoded ToastChunk)
 //!   TAG_TOAST_DELETE (body = encoded ToastDelete)
 //!   TAG_RAW          (body = encoded RawRecord)
@@ -285,10 +285,11 @@ pub const SPILL_MAGIC: [u8; 2] = *b"WS";
 /// `ToastDelete` entries. v4 added `TAG_RAW` stashed records. v5 added
 /// the `TAG_DESCRIPTOR` dictionary (Heap bodies reference descriptors by dict
 /// id). v6 added writer xid to heap + raw bodies. v7 added database OID to
-/// chunk and `ToastDelete` bodies. `DrainEntry` events
+/// chunk and `ToastDelete` bodies. v8 dropped heap rfn, restored from the
+/// dict descriptor. `DrainEntry` events
 /// (Catalog, ToastBarrier, Config/Signal) are drain-time, never spilled,
 /// so they don't touch this format
-pub const SPILL_VERSION: u16 = 7;
+pub const SPILL_VERSION: u16 = 8;
 
 /// Wire tags, one block per tag space so encode and decode read off the same
 /// table. Renumbering is a body-encoding change: bump [`SPILL_VERSION`]
@@ -737,7 +738,6 @@ impl SpillReader {
             let entry = match tag {
                 TAG_HEAP => {
                     let dict_id = cur.u32()? as usize;
-                    let h = decode_heap(&mut cur)?;
                     let Some((descriptor, valid_from)) = self.dict.get(dict_id).cloned() else {
                         return Err(SpillError::Format {
                             offset: cur.pos,
@@ -748,7 +748,7 @@ impl SpillReader {
                         });
                     };
                     SpillEntry::Heap(Box::new(DescribedHeap {
-                        decoded: h,
+                        decoded: decode_heap(&mut cur, descriptor.rfn)?,
                         descriptor,
                         descriptor_valid_from: valid_from,
                     }))
@@ -913,11 +913,9 @@ fn push_str(out: &mut Vec<u8>, s: &str) {
     push_bytes(out, s.as_bytes());
 }
 
-/// Shared with the plan spool: one heap's frame-body bytes
+/// Shared with the plan spool: heap body without rfn, which readers take
+/// from the heap's descriptor
 pub(crate) fn encode_heap_into(out: &mut Vec<u8>, h: &DecodedHeap) {
-    push_u32(out, h.rfn.spc_node);
-    push_u32(out, h.rfn.db_node);
-    push_u32(out, h.rfn.rel_node);
     push_u32(out, h.xid);
     push_u64(out, h.source_lsn);
     let op_byte: u8 = match h.op {
@@ -1137,10 +1135,6 @@ impl<'a> Cursor<'a> {
         Self { buf, pos: 0 }
     }
 
-    pub(crate) fn remaining(&self) -> usize {
-        self.buf.len() - self.pos
-    }
-
     fn need(&mut self, n: usize) -> Result<&'a [u8]> {
         if self.pos + n > self.buf.len() {
             return Err(SpillError::Format {
@@ -1153,29 +1147,33 @@ impl<'a> Cursor<'a> {
         Ok(s)
     }
 
+    fn take<const N: usize>(&mut self) -> Result<[u8; N]> {
+        Ok(self.need(N)?.try_into().unwrap())
+    }
+
     pub(crate) fn u8(&mut self) -> Result<u8> {
-        Ok(self.need(1)?[0])
+        self.take().map(|[b]| b)
     }
     pub(crate) fn u16(&mut self) -> Result<u16> {
-        Ok(u16::from_le_bytes(self.need(2)?.try_into().unwrap()))
+        self.take().map(u16::from_le_bytes)
     }
     pub(crate) fn u32(&mut self) -> Result<u32> {
-        Ok(u32::from_le_bytes(self.need(4)?.try_into().unwrap()))
+        self.take().map(u32::from_le_bytes)
     }
     fn i32(&mut self) -> Result<i32> {
-        Ok(i32::from_le_bytes(self.need(4)?.try_into().unwrap()))
+        self.take().map(i32::from_le_bytes)
     }
     pub(crate) fn u64(&mut self) -> Result<u64> {
-        Ok(u64::from_le_bytes(self.need(8)?.try_into().unwrap()))
+        self.take().map(u64::from_le_bytes)
     }
     fn i64(&mut self) -> Result<i64> {
-        Ok(i64::from_le_bytes(self.need(8)?.try_into().unwrap()))
+        self.take().map(i64::from_le_bytes)
     }
     fn f32(&mut self) -> Result<f32> {
-        Ok(f32::from_le_bytes(self.need(4)?.try_into().unwrap()))
+        self.take().map(f32::from_le_bytes)
     }
     fn f64(&mut self) -> Result<f64> {
-        Ok(f64::from_le_bytes(self.need(8)?.try_into().unwrap()))
+        self.take().map(f64::from_le_bytes)
     }
     pub(crate) fn bytes(&mut self) -> Result<Vec<u8>> {
         let n = self.u32()? as usize;
@@ -1190,10 +1188,7 @@ impl<'a> Cursor<'a> {
     }
 }
 
-pub(crate) fn decode_heap(c: &mut Cursor) -> Result<DecodedHeap> {
-    let spc_node = c.u32()?;
-    let db_node = c.u32()?;
-    let rel_node = c.u32()?;
+pub(crate) fn decode_heap(c: &mut Cursor, rfn: RelFileNode) -> Result<DecodedHeap> {
     let xid = c.u32()?;
     let source_lsn = c.u64()?;
     let op = match c.u8()? {
@@ -1212,11 +1207,7 @@ pub(crate) fn decode_heap(c: &mut Cursor) -> Result<DecodedHeap> {
     let new = decode_opt_tuple(c)?;
     let old = decode_opt_tuple(c)?;
     Ok(DecodedHeap {
-        rfn: RelFileNode {
-            spc_node,
-            db_node,
-            rel_node,
-        },
+        rfn,
         xid,
         source_lsn,
         op,
@@ -2037,14 +2028,14 @@ mod tests {
 
     #[test]
     fn decode_heap_rejects_unknown_op_tag() {
-        // 4 u32 (spc/db/rel/xid) + u64 source_lsn = 24 bytes, then bad op 99
-        let mut buf = vec![0u8; 24];
+        // u32 xid + u64 source_lsn = 12 bytes, then bad op 99
+        let mut buf = vec![0u8; 12];
         buf.push(99u8);
         let mut cur = Cursor::new(&buf);
-        let err = decode_heap(&mut cur).unwrap_err();
+        let err = decode_heap(&mut cur, RelFileNode::default()).unwrap_err();
         assert_eq!(
             err.to_string(),
-            "spill format at offset 25: unknown HeapOp tag 99"
+            "spill format at offset 13: unknown HeapOp tag 99"
         );
     }
 
