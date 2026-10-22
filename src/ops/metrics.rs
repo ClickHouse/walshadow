@@ -397,7 +397,8 @@ snapshot! {
         "Failed ClickHouse operations retried, one per failing operation rather than per attempt.",
     counter emitter_reconnects_total: u64 =
         "ClickHouse client dials after the first, from retries and live endpoint or compression changes.",
-    gauge pump_queue_depth: u64 = "Records buffered between the WAL pump and the queueing worker.",
+    gauge pump_queue_depth: u64 =
+        "Records buffered between the WAL pump and the queueing worker, counting those the worker only takes the position of.",
     counter queue_records_out_total: u64 =
         "Records the queueing/reorder worker has dequeued and dispatched. rate() is the worker's throughput; with pump_queue_depth it tells deep-and-draining from deep-and-stalled.",
     counter queue_jobs_out_total: u64 =
