@@ -70,9 +70,9 @@ use crate::source_db::{
 };
 use crate::source_recovery::{
     BARRIER_LOG_INTERVAL, FORK_FENCE_DRAIN, PROMOTION_POLL, PauseState, PromotionGate,
-    ReconnectBackoff, ResumePoint, SOURCE_SWAP_RETRY, SourcePath, SourceRecovery,
+    ReconnectBackoff, ResumePoint, SOURCE_SWAP_RETRY, SourceModeStats, SourcePath, SourceRecovery,
     commit_fork_resume, connect_source_waiting, promotion_gate, resume_manifest,
-    resume_source_feed, stream_branch, swap_reason,
+    resume_source_feed, stream_branch, stream_error_kind, swap_reason,
 };
 
 /// Wait out an unreachable ClickHouse at boot rather than exit, which leaves
@@ -1523,6 +1523,7 @@ async fn session_body(
     // iterations so a source error mid-crossing retries the crossing: at the
     // ancestor's switchpoint an ordinary reconnect has nothing to ask for
     let mut crossing = CrossingState::default();
+    let mut mode_stats = SourceModeStats::default();
     let mut barrier_logged: Option<Instant> = None;
     let shutdown_reason = 'pump: loop {
         // Switch timelines at a switchpoint. Reconnecting may find a switchpoint
@@ -1868,6 +1869,7 @@ async fn session_body(
                 res => {
                     let err = match res {
                         Err(e) => {
+                            mode_stats.stream_errors[stream_error_kind(Some(&e))] += 1;
                             tracing::warn!(
                                 target: "walshadow",
                                 error = %e,
@@ -1877,6 +1879,7 @@ async fn session_body(
                             e
                         }
                         _ => {
+                            mode_stats.stream_errors[stream_error_kind(None)] += 1;
                             tracing::info!(
                                 target: "walshadow",
                                 resume_lsn = %stream.next_lsn(),
@@ -1925,8 +1928,12 @@ async fn session_body(
                     .await;
             }
         }
+        mode_stats.observe(path.mode(paused, crossing.pending()));
         metrics
             .update(|snap| {
+                snap.source_mode = mode_stats.gauge();
+                snap.source_mode_transitions = mode_stats.transitions;
+                snap.source_stream_errors_total = mode_stats.stream_errors;
                 snap.pump_queue_wait_seconds_total =
                     record_sink.decoder_xact.inner.send_wait_seconds();
                 snap.archive_restore_active = 0;
