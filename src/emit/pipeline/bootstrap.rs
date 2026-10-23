@@ -24,8 +24,8 @@ use crate::ops::oracle::render_ext_columns;
 use crate::schema::{RelDescriptor, RelName};
 use crate::ticker::Ticker;
 use crate::toast::{
-    FetchedValue, ToastResolver, ToastRow, check_value_caps, detoasted_sized, finish_value,
-    pointer_extsize,
+    ChunkStoreError, FetchedValue, ToastResolver, ToastRow, check_value_caps, detoasted_sized,
+    finish_value, pointer_extsize,
 };
 use crate::xact::xact_buffer::{MissPolicy, StoreMiss, fill_store_miss};
 use ahash::{HashMap, HashMapExt, HashSet};
@@ -182,8 +182,7 @@ pub async fn drain(
     let mut seqs = ack.seqs(0);
     let mut rows_routed = 0;
     let mut open: Option<(RelFileNode, OpenSeq, u64)> = None;
-    let mut chunk_batch = Vec::new();
-    let mut chunk_batch_bytes = 0;
+    let mut puts = resolver.chunk_puts();
     let mut row_buffer = RowBuffer::default();
     let mut consumed = 0u64;
     let mut ticker = Ticker::new(WALK_CHECKPOINT_PERIOD);
@@ -221,12 +220,7 @@ pub async fn drain(
 
             if catalog.is_toast(rfn.db_node, rfn.rel_node) {
                 if let Some(row) = row_from_columns(tuple, rfn.db_node, rel.oid) {
-                    chunk_batch_bytes += row.chunk_data.len();
-                    chunk_batch.push(row);
-                    if resolver.put_limit_reached(chunk_batch.len(), chunk_batch_bytes) {
-                        flush_chunks(&resolver, &mut chunk_batch).await?;
-                        chunk_batch_bytes = 0;
-                    }
+                    puts.push(row).await.map_err(put_err)?;
                 }
                 continue;
             }
@@ -268,10 +262,8 @@ pub async fn drain(
         if let Some(b) = &barrier
             && ticker.fire()
         {
-            if !chunk_batch.is_empty() {
-                flush_chunks(&resolver, &mut chunk_batch).await?;
-                chunk_batch_bytes = 0;
-            }
+            // Durable files must include their chunks
+            puts.flush().await.map_err(put_err)?;
             row_buffer.flush(&msg_tx).await.map_err(closed)?;
             if let Some((_, seq, rows)) = open.take() {
                 seqs.place(seq, rows);
@@ -293,9 +285,7 @@ pub async fn drain(
     }
     let next_seq = seqs.next();
 
-    if !chunk_batch.is_empty() {
-        flush_chunks(&resolver, &mut chunk_batch).await?;
-    }
+    puts.flush().await.map_err(put_err)?;
 
     match deferred.take().filter(|s| s.records() > 0) {
         Some(spool) if handback => {
@@ -807,14 +797,8 @@ async fn resolve_or_fill_toast(
     Ok(leaf)
 }
 
-/// Replay tombstones supersede walk rows for dead referrers
-async fn flush_chunks(resolver: &ToastResolver, batch: &mut Vec<ToastRow>) -> Result<(), String> {
-    resolver
-        .put(batch)
-        .await
-        .map_err(|e| format!("bootstrap: toast store put: {e}"))?;
-    batch.clear();
-    Ok(())
+fn put_err(e: ChunkStoreError) -> String {
+    format!("bootstrap: toast store put: {e}")
 }
 
 /// Convert PostgreSQL TOAST tuple shape into mirror row
@@ -994,7 +978,7 @@ mod tests {
     use crate::emit::pipeline::batcher::BatcherMsg;
     use crate::emit::pipeline::{Fatal, ack};
     use crate::schema::{RelAttr, RelDescriptor, RelName, ReplIdent};
-    use crate::toast::MemChunkStore;
+    use crate::toast::{GatedStore, MemChunkStore};
     use ahash::{HashMap, HashMapExt, HashSetExt};
     use walrus::pg::walparser::RelFileNode;
 
@@ -1484,6 +1468,142 @@ mod tests {
         assert_eq!(cols[0], Some(ColumnValue::Bytea(b"hello".to_vec())));
         assert_eq!(stats.toast_chunks_stored.load(Ordering::Relaxed), 1);
         assert_eq!(stats.toast_values_fetched.load(Ordering::Relaxed), 1);
+        drop(ack);
+        collector.await.unwrap();
+    }
+
+    fn gated_drain(
+        tup_rx: mpsc::Receiver<Vec<BackfillTuple>>,
+        msg_tx: mpsc::Sender<BatcherMsg>,
+        ack: AckHandle,
+        store: Arc<GatedStore>,
+        put_batch_rows: usize,
+        barrier: Option<Arc<WalkBarrier>>,
+    ) -> tokio::task::JoinHandle<Result<BootstrapDrainOutcome, String>> {
+        let mut catalog = CatalogMap::new();
+        catalog.insert(rel(16400));
+        catalog.insert(toast_rel(16500));
+        let mapping = Arc::new(
+            [(RelName::new("public", "t16400"), mapping_for(16400))]
+                .into_iter()
+                .collect(),
+        );
+        let stats = Arc::new(EmitterStats::default());
+        let resolver =
+            ToastResolver::with_store(store, stats.clone()).with_put_batch_rows(put_batch_rows);
+        tokio::spawn(drain(
+            tup_rx,
+            catalog,
+            freeze_routes(&mapping, None, &RowPolicy::default()),
+            msg_tx,
+            ack,
+            stats,
+            resolver,
+            Deferral::Local(mem_spool()),
+            HashSet::new(),
+            barrier,
+        ))
+    }
+
+    /// Heap rows behind a gated put still reach the batcher
+    #[tokio::test]
+    async fn drain_reads_past_inflight_put() {
+        let (ack, collector) = ack::spawn(Arc::new(crate::pos::Monotone::default()), Fatal::new());
+        let (msg_tx, mut msg_rx) = mpsc::channel(64);
+        let (tup_tx, tup_rx) = mpsc::channel(64);
+        tup_tx
+            .send(vec![
+                toast_chunk_tuple(16500, 1, 0, b"a"),
+                tuple(16400, 1),
+                tuple(16400, 2),
+                toast_chunk_tuple(16500, 2, 0, b"b"),
+            ])
+            .await
+            .unwrap();
+        drop(tup_tx);
+        let store = Arc::new(GatedStore::new());
+        let drain_task = gated_drain(tup_rx, msg_tx, ack.clone(), store.clone(), 1, None);
+
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(5), msg_rx.recv())
+            .await
+            .expect("heap rows stuck behind gated put");
+        let Some(BatcherMsg::Rows(chunk)) = msg else {
+            panic!("expected heap rows");
+        };
+        assert_eq!(chunk.rows.len(), 2);
+        assert_eq!(store.permits.available_permits(), 0, "no put landed yet");
+
+        store.permits.add_permits(2);
+        drain_task.await.unwrap().unwrap();
+        assert_eq!(store.puts_started.load(Ordering::Relaxed), 2);
+        drop(ack);
+        collector.await.unwrap();
+    }
+
+    /// Checkpoint publishes drain progress only after chunks land
+    #[tokio::test(start_paused = true)]
+    async fn drain_checkpoint_waits_for_puts() {
+        let (ack, collector) = ack::spawn(Arc::new(crate::pos::Monotone::default()), Fatal::new());
+        let (msg_tx, _msg_rx) = mpsc::channel(64);
+        let (tup_tx, tup_rx) = mpsc::channel(64);
+        let barrier = Arc::new(WalkBarrier::default());
+        barrier
+            .publish_gate(vec![("f".into(), 2)], SpoolMark::default())
+            .await;
+        let store = Arc::new(GatedStore::new());
+        let drain_task = gated_drain(
+            tup_rx,
+            msg_tx,
+            ack.clone(),
+            store.clone(),
+            usize::MAX,
+            Some(barrier.clone()),
+        );
+
+        // Paused clock: polls sleep instead of spin so a stall trips timeout
+        let poll = std::time::Duration::from_millis(1);
+        let deadline = std::time::Duration::from_secs(5);
+        tup_tx
+            .send(vec![toast_chunk_tuple(16500, 1, 0, b"a")])
+            .await
+            .unwrap();
+        // Drain's ticker starts before the clock moves
+        tokio::time::timeout(deadline, async {
+            while tup_tx.capacity() < tup_tx.max_capacity() {
+                tokio::time::sleep(poll).await;
+            }
+        })
+        .await
+        .expect("drain took first batch");
+        tokio::time::advance(WALK_CHECKPOINT_PERIOD).await;
+        tup_tx.send(vec![tuple(16400, 1)]).await.unwrap();
+        tokio::time::timeout(deadline, async {
+            while store.puts_started.load(Ordering::Relaxed) == 0 {
+                tokio::time::sleep(poll).await;
+            }
+        })
+        .await
+        .expect("checkpoint submitted chunks");
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        assert!(
+            barrier.collect().await.is_none(),
+            "drain published before its chunks landed"
+        );
+
+        store.permits.add_permits(1);
+        let proof = tokio::time::timeout(deadline, async {
+            loop {
+                if let Some(proof) = barrier.collect().await {
+                    break proof;
+                }
+                tokio::time::sleep(poll).await;
+            }
+        })
+        .await
+        .expect("drain published after chunks landed");
+        assert_eq!(proof.files(), ["f"]);
+        drop(tup_tx);
+        drain_task.await.unwrap().unwrap();
         drop(ack);
         collector.await.unwrap();
     }
