@@ -48,6 +48,8 @@ pub struct FilterStats {
     pub kept_user: u64,
     pub kept_special: u64,
     pub kept_empty: u64,
+    /// Newest commit record `xact_time` (PG epoch µs) routed
+    pub last_commit_ts: Option<i64>,
 }
 
 impl FilterStats {
@@ -539,6 +541,9 @@ impl Filter {
             return Ok(XactEnd::default());
         }
         let payload = parse_xact_payload(info, &record.main_data, page_magic)?;
+        if is_commit {
+            self.stats.last_commit_ts = self.stats.last_commit_ts.max(Some(payload.xact_time));
+        }
         let header_xid = record.header.xact_id;
         self.creating_dbs.remove(&header_xid);
         let (merged, members) =
@@ -1281,6 +1286,26 @@ mod tests {
             .decide_record(&xact_end(XLOG_XACT_COMMIT, 7, &[], None), 0, 0xD116)
             .unwrap();
         assert!(v.boundary.is_none(), "dirty mark consumed once");
+    }
+
+    #[test]
+    fn last_commit_ts_tracks_newest_commit_only() {
+        let at = |op, xid, ts: i64| {
+            let mut r = xact_end(op, xid, &[], None);
+            r.main_data.to_mut()[..8].copy_from_slice(&ts.to_le_bytes());
+            r
+        };
+        let mut f = target_filter();
+        assert_eq!(f.stats().last_commit_ts, None);
+        f.decide_record(&at(XLOG_XACT_ABORT, 6, 100), 0, 0xD116)
+            .unwrap();
+        assert_eq!(f.stats().last_commit_ts, None);
+        f.decide_record(&at(XLOG_XACT_COMMIT, 7, 300), 0, 0xD116)
+            .unwrap();
+        // Backends stamp xact_time before inserting WAL, so commits can land out of order
+        f.decide_record(&at(XLOG_XACT_COMMIT, 8, 200), 0, 0xD116)
+            .unwrap();
+        assert_eq!(f.stats().last_commit_ts, Some(300));
     }
 
     #[test]

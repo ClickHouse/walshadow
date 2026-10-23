@@ -453,9 +453,9 @@ impl WalReplaySink {
                     let value_permit = detoast_heap(&mut heap, spool, &ref_maps, &self.resolver)
                         .await
                         .map_err(SinkError::from)?;
-                    let (open, rows) = self
-                        .open
-                        .get_or_insert_with(|| (self.seqs.open(commit_lsn, Publish::Commit), 0));
+                    let (open, rows) = self.open.get_or_insert_with(|| {
+                        (self.seqs.open(commit_lsn, None, Publish::Commit), 0)
+                    });
                     *rows += 1;
                     let seq = open.seq();
                     if !route.drops_deletes()

@@ -183,7 +183,7 @@ async fn budget_trips_seal_complete_inserts() {
     const N: i32 = 5;
     let commit_lsn = 0xC0FFEE;
     let mut seqs = ack.seqs(0);
-    let seq = seqs.open(commit_lsn, Publish::Commit);
+    let seq = seqs.open(commit_lsn, None, Publish::Commit);
     for i in 0..N {
         msg_tx
             .send(BatcherMsg::Row(RoutedRow {

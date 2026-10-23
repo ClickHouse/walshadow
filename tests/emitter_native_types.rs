@@ -175,7 +175,7 @@ async fn native_numeric_time_timetz_round_trip() {
     // Drive the single row through the tail: register the seq, route the
     // row, seal with FlushAll, wait for it durable, then drain.
     let mut seqs = ack.seqs(0);
-    let seq = seqs.open(tuple.commit_lsn, Publish::Commit);
+    let seq = seqs.open(tuple.commit_lsn, None, Publish::Commit);
     msg_tx
         .send(BatcherMsg::Row(RoutedRow {
             seq: seq.seq(),

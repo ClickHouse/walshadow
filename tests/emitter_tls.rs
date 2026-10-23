@@ -376,7 +376,7 @@ async fn emitter_tls_round_trip() {
         commit_lsn: 0xABCD,
     };
     let mut seqs = ack.seqs(0);
-    let seq = seqs.open(tuple.commit_lsn, Publish::Commit);
+    let seq = seqs.open(tuple.commit_lsn, None, Publish::Commit);
     msg_tx
         .send(BatcherMsg::Row(RoutedRow {
             seq: seq.seq(),

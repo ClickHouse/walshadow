@@ -39,6 +39,9 @@ pub enum AckEvent {
     Register {
         seq: u64,
         commit_lsn: u64,
+        /// Commit record's `xact_time` (PG epoch µs); `None` for aborts and
+        /// bootstrap seqs, which carry no source commit time
+        commit_ts: Option<i64>,
         publish: bool,
     },
     Placed {
@@ -99,6 +102,7 @@ impl Progress {
 
 struct Seq {
     commit_lsn: u64,
+    commit_ts: Option<i64>,
     publish: bool,
     progress: Progress,
 }
@@ -119,6 +123,9 @@ pub struct AckSnapshot {
     pub frontier: u64,
     pub oldest_incomplete: Option<IncompleteSeq>,
     pub trailing_held: Pos<EmitterAck>,
+    /// `xact_time` (PG epoch µs) of the newest commit the watermark has
+    /// retired; `None` until the first one
+    pub ack_commit_ts: Option<i64>,
     /// Protocol faults; the first trips pipeline fatal
     pub wedged: u64,
     /// Events for retired seqs, benign: inserter batches straddle retirement
@@ -146,6 +153,8 @@ pub struct AckState {
     registered: u64,
     /// Highest publishing `commit_lsn` retired from map
     watermark: u64,
+    /// Newest published commit time, advances with `watermark`
+    watermark_ts: Option<i64>,
     /// Retained across events because quiescent source cannot resend it
     trailing: u64,
     emitter_ack: Arc<Monotone<EmitterAck>>,
@@ -169,6 +178,7 @@ impl AckState {
             frontier: 0,
             registered: 0,
             watermark: 0,
+            watermark_ts: None,
             trailing: 0,
             emitter_ack,
             frontier_cell,
@@ -189,8 +199,9 @@ impl AckState {
             AckEvent::Register {
                 seq,
                 commit_lsn,
+                commit_ts,
                 publish,
-            } => self.open_seq(seq, commit_lsn, publish),
+            } => self.open_seq(seq, commit_lsn, commit_ts, publish),
             AckEvent::Placed { seq, rows } => self.step(seq, |p| p.place(rows)),
             AckEvent::Acked { counts } => {
                 for (seq, n) in counts {
@@ -206,7 +217,7 @@ impl AckState {
         }
     }
 
-    fn open_seq(&mut self, seq: u64, commit_lsn: u64, publish: bool) {
+    fn open_seq(&mut self, seq: u64, commit_lsn: u64, commit_ts: Option<i64>, publish: bool) {
         // Preserve live counts, never resurrect retired seqs
         if seq < self.frontier || self.map.contains_key(&seq) {
             self.wedge(seq, "seq registered twice");
@@ -216,6 +227,7 @@ impl AckState {
             seq,
             Seq {
                 commit_lsn,
+                commit_ts,
                 publish,
                 progress: Progress::default(),
             },
@@ -264,10 +276,11 @@ impl AckState {
             if !s.progress.is_done() {
                 break;
             }
-            let (publish, commit_lsn) = (s.publish, s.commit_lsn);
+            let (publish, commit_lsn, commit_ts) = (s.publish, s.commit_lsn, s.commit_ts);
             self.map.remove(&self.frontier);
             if publish {
                 self.watermark = self.watermark.max(commit_lsn);
+                self.watermark_ts = self.watermark_ts.max(commit_ts);
             }
             self.frontier += 1;
         }
@@ -291,6 +304,7 @@ impl AckState {
             frontier: self.frontier,
             oldest_incomplete: self.oldest_incomplete(),
             trailing_held: Pos::new(self.trailing),
+            ack_commit_ts: self.watermark_ts,
             wedged: self.wedged,
             late: self.late,
         }
@@ -406,12 +420,15 @@ impl SeqAlloc {
         self.next
     }
 
-    pub fn open(&mut self, commit_lsn: u64, publish: Publish) -> OpenSeq {
+    /// `commit_ts` is the commit record's `xact_time`, which the ack frontier
+    /// carries once the seq publishes
+    pub fn open(&mut self, commit_lsn: u64, commit_ts: Option<i64>, publish: Publish) -> OpenSeq {
         let seq = self.next;
         self.next += 1;
         let ev = AckEvent::Register {
             seq,
             commit_lsn,
+            commit_ts,
             publish: publish == Publish::Commit,
         };
         if let Some(held) = &mut self.held {
@@ -423,8 +440,8 @@ impl SeqAlloc {
     }
 
     /// Ordering marker carrying no rows
-    pub fn mark(&mut self, commit_lsn: u64) {
-        let seq = self.open(commit_lsn, Publish::Commit);
+    pub fn mark(&mut self, commit_lsn: u64, commit_ts: Option<i64>) {
+        let seq = self.open(commit_lsn, commit_ts, Publish::Commit);
         self.place(seq, 0);
     }
 
@@ -499,10 +516,11 @@ pub fn spawn(emitter_ack: Arc<Monotone<EmitterAck>>, fatal: Fatal) -> (AckHandle
 
 #[cfg(test)]
 impl AckState {
-    fn register(&mut self, seq: u64, commit_lsn: u64, publish: bool) {
+    fn register(&mut self, seq: u64, commit_lsn: u64, commit_ts: Option<i64>, publish: bool) {
         self.apply(AckEvent::Register {
             seq,
             commit_lsn,
+            commit_ts,
             publish,
         });
     }
@@ -541,7 +559,7 @@ mod tests {
         let (mut s, ack) = state();
         let n = 50_000u64;
         for seq in 0..n {
-            s.register(seq, (seq + 1) * 10, true);
+            s.register(seq, (seq + 1) * 10, None, true);
             s.placed(seq, 1);
         }
         assert_eq!(ack.get(), 0);
@@ -556,7 +574,7 @@ mod tests {
     #[test]
     fn probe_names_what_holds_the_watermark() {
         let (mut s, _ack) = state();
-        s.register(0, 100, true);
+        s.register(0, 100, None, true);
         let snap = s.snapshot();
         assert_eq!(snap.stall_reason(), Some("rows not yet placed"));
         assert_eq!(
@@ -581,9 +599,41 @@ mod tests {
     }
 
     #[test]
+    fn commit_ts_advances_with_the_contiguous_frontier() {
+        let (mut s, ack) = state();
+        assert_eq!(s.snapshot().ack_commit_ts, None);
+        s.register(0, 100, Some(1_000), true);
+        s.register(1, 200, Some(2_000), true);
+        s.placed(0, 1);
+        s.placed(1, 1);
+        // seq 1 done first: seq 0 gates both the LSN and its timestamp
+        s.acked(1, 1);
+        assert_eq!((ack.get().get(), s.snapshot().ack_commit_ts), (0, None));
+        s.acked(0, 1);
+        assert_eq!(
+            (ack.get().get(), s.snapshot().ack_commit_ts),
+            (200, Some(2_000))
+        );
+    }
+
+    #[test]
+    fn partial_slices_and_untimed_seqs_do_not_move_commit_ts() {
+        let (mut s, _ack) = state();
+        s.register(0, 100, Some(1_000), true);
+        // non-final slice of a later commit, then an abort-style untimed seq
+        s.register(1, 200, Some(5_000), false);
+        s.register(2, 300, None, true);
+        for seq in 0..3 {
+            s.placed(seq, 1);
+            s.acked(seq, 1);
+        }
+        assert_eq!(s.snapshot().ack_commit_ts, Some(1_000));
+    }
+
+    #[test]
     fn events_for_retired_seqs_are_benign() {
         let (mut s, _ack) = state();
-        s.register(0, 100, true);
+        s.register(0, 100, None, true);
         s.placed(0, 1);
         s.acked(0, 1);
         s.acked(0, 1);
@@ -595,14 +645,14 @@ mod tests {
     #[test]
     fn illegal_transitions_pin_the_seq_instead_of_being_absorbed() {
         let (mut s, ack) = state();
-        s.register(0, 100, true);
+        s.register(0, 100, None, true);
         s.placed(0, 2);
         assert!(!s.fatal.is_set());
         s.placed(0, 5);
         let first = s.fatal.message().expect("first fault trips fatal");
         assert!(first.contains("seq placed twice"), "{first}");
         s.acked(0, 3);
-        s.register(0, 100, true);
+        s.register(0, 100, None, true);
         assert_eq!(s.snapshot().wedged, 3);
         assert!(!s.all_done(), "a faulted seq stays incomplete");
         assert_eq!(ack.get(), 0);
@@ -755,6 +805,7 @@ mod interleavings {
             Ev::Reg { seq, lsn, publish } => AckEvent::Register {
                 seq,
                 commit_lsn: lsn,
+                commit_ts: None,
                 publish,
             },
             Ev::Place { seq, rows } => AckEvent::Placed { seq, rows },

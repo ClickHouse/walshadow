@@ -2239,6 +2239,8 @@ async fn session_body(
             shadow_replay,
             drain_for_metric,
             emitter_ack_for_metric,
+            ack_probe.borrow().ack_commit_ts,
+            stream.filter().stats().last_commit_ts,
             &record_sink.metrics,
             record_sink.decoder_xact.in_flight(),
             record_sink.decoder_xact.processed(),
