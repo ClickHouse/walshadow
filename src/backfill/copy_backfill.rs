@@ -641,8 +641,7 @@ pub async fn copy_toast_into(
     let stream = BinaryCopyOutStream::new(copy, &[Type::BYTEA; 4]);
     futures::pin_mut!(stream);
     let mut chunks = 0u64;
-    let mut batch: Vec<ToastRow> = Vec::new();
-    let mut batch_bytes = 0usize;
+    let mut puts = resolver.chunk_puts();
     while let Some(row) = stream.next().await {
         let row = row.context("backfill: TOAST COPY stream")?;
         let field = |i: usize| -> anyhow::Result<&[u8]> {
@@ -651,9 +650,7 @@ pub async fn copy_toast_into(
                 .context("backfill: NULL TOAST column")
         };
         let tid = fixed::<6>(field(0)?, "ctid").map_err(anyhow::Error::msg)?;
-        let chunk_data = bytes::Bytes::copy_from_slice(field(3)?);
-        batch_bytes += chunk_data.len();
-        batch.push(ToastRow {
+        puts.push(ToastRow {
             db_oid: desc.rfn.db_node,
             toast_relid,
             blkno: u32::from_be_bytes(tid[..4].try_into().expect("4 bytes")),
@@ -662,17 +659,13 @@ pub async fn copy_toast_into(
             chunk_seq: u32::from_be_bytes(
                 fixed(field(2)?, "chunk_seq").map_err(anyhow::Error::msg)?,
             ),
-            chunk_data,
+            chunk_data: bytes::Bytes::copy_from_slice(field(3)?),
             lsn,
-        });
+        })
+        .await?;
         chunks += 1;
-        if resolver.put_limit_reached(batch.len(), batch_bytes) {
-            resolver.put(&batch).await?;
-            batch.clear();
-            batch_bytes = 0;
-        }
     }
-    resolver.put(&batch).await?;
+    puts.flush().await?;
     Ok(chunks)
 }
 

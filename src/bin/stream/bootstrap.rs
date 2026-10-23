@@ -637,15 +637,7 @@ pub(crate) async fn run_bootstrap(
             )));
         }
         let gate = async move {
-            let mut rx = rx;
-            let mut at = 0usize;
-            while let Some(slab) = rx.recv().await {
-                let lane = at % gate_txs.len();
-                at += 1;
-                if gate_txs[lane].send(slab).await.is_err() {
-                    break;
-                }
-            }
+            dispatch(rx, &gate_txs).await;
             drop(gate_txs);
             let mut stats = GateStats::default();
             let mut spools = Vec::with_capacity(gate_handles.len());
@@ -1328,6 +1320,26 @@ pub(crate) fn paths_overlap(a: &Path, b: &Path) -> bool {
     }
 }
 
+/// Send each slab to first lane with room, probing from round-robin cursor
+///
+/// Lane choice is free: gate lanes run without a walk barrier, and deferred
+/// spools reopen by recorded count, so no tuple is bound to a lane index
+async fn dispatch<T>(
+    mut rx: tokio::sync::mpsc::Receiver<T>,
+    lanes: &[tokio::sync::mpsc::Sender<T>],
+) {
+    let mut at = 0;
+    while let Some(slab) = rx.recv().await {
+        let probe = (0..lanes.len()).map(|k| Box::pin(lanes[(at + k) % lanes.len()].reserve()));
+        // Closed lane: stop, lane join surfaces its error
+        let (Ok(permit), k, _) = futures::future::select_all(probe).await else {
+            return;
+        };
+        permit.send(slab);
+        at = (at + k + 1) % lanes.len();
+    }
+}
+
 /// Inserter count is the demand on the oracle: one bridge worker and one
 /// resolver per inserter is what keeps a batch resolving while the others
 /// insert
@@ -1390,6 +1402,53 @@ mod tests {
                 "pool {pool} over {lanes} lanes must sum to the pool, got {split:?}",
             );
         }
+    }
+
+    async fn dispatch_all(slabs: &[u32], lanes: &[tokio::sync::mpsc::Sender<u32>]) {
+        let (tx, rx) = tokio::sync::mpsc::channel(slabs.len());
+        for &s in slabs {
+            tx.send(s).await.unwrap();
+        }
+        drop(tx);
+        dispatch(rx, lanes).await;
+    }
+
+    #[tokio::test]
+    async fn dispatch_skips_full_lane() {
+        let (l0, mut r0) = tokio::sync::mpsc::channel(1);
+        let (l1, mut r1) = tokio::sync::mpsc::channel(1);
+        let lanes = [l0, l1];
+        let lane1 = async {
+            let mut got = Vec::new();
+            while got.len() < 3 {
+                got.push(r1.recv().await.unwrap());
+            }
+            got
+        };
+        let (got, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(lane1, dispatch_all(&[1, 2, 3, 4], &lanes))
+        })
+        .await
+        .expect("dispatch blocked on full lane");
+        assert_eq!(got, [2, 3, 4]);
+        assert_eq!(r0.try_recv(), Ok(1));
+    }
+
+    #[tokio::test]
+    async fn dispatch_round_robins_when_idle() {
+        let (txs, mut rxs): (Vec<_>, Vec<_>) =
+            (0..3).map(|_| tokio::sync::mpsc::channel(2)).unzip();
+        dispatch_all(&[1, 2, 3, 4, 5, 6], &txs).await;
+        for (rx, want) in rxs.iter_mut().zip([[1, 4], [2, 5], [3, 6]]) {
+            assert_eq!([rx.try_recv(), rx.try_recv()], want.map(Ok));
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_stops_on_closed_lane() {
+        let (txs, rxs): (Vec<_>, Vec<_>) = (0..2).map(|_| tokio::sync::mpsc::channel(1)).unzip();
+        drop(rxs);
+        dispatch_all(&[1], &txs).await;
     }
 
     #[test]

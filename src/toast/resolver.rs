@@ -12,6 +12,7 @@ use clickhouse_c::{Allocator, Block, BlockBuilder, ColumnBuilder, Event, TypeAst
 use futures::stream::StreamExt;
 use thiserror::Error;
 use tokio::sync::Mutex;
+use tokio_util::task::AbortOnDropHandle;
 
 use bytes::Bytes;
 
@@ -1242,6 +1243,12 @@ impl ToastResolver {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_put_batch_rows(mut self, rows: usize) -> Self {
+        self.put_batch_rows = rows;
+        self
+    }
+
     pub fn with_database_stores(
         mut self,
         stores: impl IntoIterator<Item = (u32, Arc<dyn ChunkStore>)>,
@@ -1521,6 +1528,16 @@ impl ToastResolver {
         Ok(())
     }
 
+    /// Overlapping puts for a caller that keeps filling batches meanwhile
+    pub fn chunk_puts(&self) -> ChunkPuts {
+        ChunkPuts {
+            resolver: self.clone(),
+            batch: Vec::new(),
+            batch_bytes: 0,
+            inflight: None,
+        }
+    }
+
     /// [`Self::put_batched`] over row refs: materialize each slice just in
     /// time so resident bodies peak at one sealed slice, covered by one
     /// leaf permit acquired before the reads
@@ -1660,6 +1677,121 @@ impl ToastResolver {
     }
 }
 
+/// Batches rows into [`ToastResolver::put`]s running off caller's task
+///
+/// Depth 1: [`ClickHouseChunkStore`] serializes puts per mirror on one
+/// connection, so a second in-flight put would only queue on that lock.
+/// Dropping discards buffered rows and aborts the in-flight put
+pub struct ChunkPuts {
+    resolver: ToastResolver,
+    batch: Vec<ToastRow>,
+    batch_bytes: usize,
+    inflight: Option<AbortOnDropHandle<Result<(), ChunkStoreError>>>,
+}
+
+impl ChunkPuts {
+    /// Buffer `row`, starting a put once batch reaches put limit. Cancelled
+    /// push keeps `row` buffered
+    pub async fn push(&mut self, row: ToastRow) -> Result<(), ChunkStoreError> {
+        self.batch_bytes += row.chunk_data.len();
+        self.batch.push(row);
+        if self
+            .resolver
+            .put_limit_reached(self.batch.len(), self.batch_bytes)
+        {
+            self.submit().await?;
+        }
+        Ok(())
+    }
+
+    /// Every pushed row stored
+    pub async fn flush(&mut self) -> Result<(), ChunkStoreError> {
+        self.submit().await?;
+        self.join().await
+    }
+
+    async fn submit(&mut self) -> Result<(), ChunkStoreError> {
+        if self.batch.is_empty() {
+            return Ok(());
+        }
+        self.join().await?;
+        let rows = std::mem::take(&mut self.batch);
+        self.batch_bytes = 0;
+        let resolver = self.resolver.clone();
+        self.inflight = Some(AbortOnDropHandle::new(tokio::spawn(async move {
+            resolver.put(&rows).await
+        })));
+        Ok(())
+    }
+
+    async fn join(&mut self) -> Result<(), ChunkStoreError> {
+        // Await in place so a cancelled caller leaves the put running
+        let Some(put) = &mut self.inflight else {
+            return Ok(());
+        };
+        let joined = put.await;
+        self.inflight = None;
+        joined.map_err(|e| match e.try_into_panic() {
+            Ok(panic) => std::panic::resume_unwind(panic),
+            // Runtime shutting down
+            Err(e) => ChunkStoreError::Clickhouse(e.to_string()),
+        })?
+    }
+}
+
+/// Store whose puts and fetches each wait on a permit, for observing calls
+/// in flight. Fetches assemble every value as `v`
+#[cfg(test)]
+pub(crate) struct GatedStore {
+    pub inner: MemChunkStore,
+    pub permits: tokio::sync::Semaphore,
+    pub puts_started: AtomicUsize,
+    pub fail: bool,
+}
+
+#[cfg(test)]
+impl GatedStore {
+    pub fn new() -> Self {
+        Self {
+            inner: MemChunkStore::new(),
+            permits: tokio::sync::Semaphore::new(0),
+            puts_started: AtomicUsize::new(0),
+            fail: false,
+        }
+    }
+}
+
+#[cfg(test)]
+#[async_trait]
+impl ChunkStore for GatedStore {
+    fn accepts_writes(&self) -> bool {
+        true
+    }
+
+    async fn put(&self, rows: &[ToastRow]) -> Result<(), ChunkStoreError> {
+        self.puts_started.fetch_add(1, Ordering::Relaxed);
+        self.permits.acquire().await.unwrap().forget();
+        if self.fail {
+            return Err(ChunkStoreError::Clickhouse("gated failure".into()));
+        }
+        self.inner.put(rows).await
+    }
+
+    async fn fetch_many(
+        &self,
+        _: u32,
+        _: u32,
+        values: &[(u32, usize)],
+        _: u64,
+    ) -> Result<Vec<FetchedValue>, ChunkStoreError> {
+        self.permits.acquire().await.unwrap().forget();
+        Ok(values
+            .iter()
+            .map(|_| FetchedValue::Assembled(b"v".to_vec()))
+            .collect())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     fn fixed(cfg: EmitterConfig) -> Arc<crate::config::DestEmitter> {
@@ -1668,6 +1800,7 @@ mod tests {
 
     use super::*;
     use crate::emit::ch_emitter::InstanceConfig;
+    use std::time::Duration;
 
     fn row(value_id: u32, seq: u32, tid: (u32, u16), lsn: u64, body: &[u8]) -> ToastRow {
         ToastRow {
@@ -1684,6 +1817,62 @@ mod tests {
 
     fn assembled(body: &[u8]) -> FetchedValue {
         FetchedValue::Assembled(body.to_vec())
+    }
+
+    /// Put per pushed row
+    fn gated_puts(store: GatedStore) -> (Arc<GatedStore>, ChunkPuts) {
+        let store = Arc::new(store);
+        let resolver =
+            ToastResolver::with_store(store.clone(), Arc::default()).with_put_batch_rows(1);
+        (store, resolver.chunk_puts())
+    }
+
+    #[tokio::test]
+    async fn push_returns_while_put_runs() {
+        let (store, mut puts) = gated_puts(GatedStore::new());
+        puts.push(row(7, 0, (1, 1), 1, b"a")).await.unwrap();
+        tokio::task::yield_now().await;
+        assert_eq!(store.puts_started.load(Ordering::Relaxed), 1);
+        assert!(matches!(
+            store.inner.fetch(0, 16500, 7, u64::MAX, 1).await,
+            Err(ChunkStoreError::MissingMirror { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn push_waits_for_predecessor() {
+        let (store, mut puts) = gated_puts(GatedStore::new());
+        puts.push(row(7, 0, (1, 1), 1, b"a")).await.unwrap();
+        tokio::time::timeout(
+            Duration::from_millis(50),
+            puts.push(row(8, 0, (1, 2), 1, b"b")),
+        )
+        .await
+        .expect_err("second put must wait out the first");
+        store.permits.add_permits(2);
+        tokio::time::timeout(Duration::from_secs(5), puts.flush())
+            .await
+            .expect("puts landed")
+            .unwrap();
+        assert_eq!(store.puts_started.load(Ordering::Relaxed), 2);
+        for (id, body) in [(7, b"a"), (8, b"b")] {
+            assert_eq!(
+                store.inner.fetch(0, 16500, id, u64::MAX, 1).await.unwrap(),
+                assembled(body)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn flush_surfaces_put_error() {
+        let (store, mut puts) = gated_puts(GatedStore {
+            fail: true,
+            ..GatedStore::new()
+        });
+        store.permits.add_permits(1);
+        puts.push(row(7, 0, (1, 1), 1, b"a")).await.unwrap();
+        let err = puts.flush().await.unwrap_err();
+        assert!(err.to_string().contains("gated failure"), "{err}");
     }
 
     const PG_LZ4_CHUNKS: &[u8] = include_bytes!("testdata/compressed_external_lz4.bin");
@@ -2526,21 +2715,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn reads_ahead_stay_bounded_while_reads_stall() {
         use crate::toast::read_ahead::{AHEAD_QUEUE, AHEAD_READS};
-        struct Stalled(tokio::sync::Semaphore);
-        #[async_trait]
-        impl ChunkStore for Stalled {
-            async fn fetch_many(
-                &self,
-                _db_oid: u32,
-                _toast_relid: u32,
-                values: &[(u32, usize)],
-                _max_lsn: u64,
-            ) -> Result<Vec<FetchedValue>, ChunkStoreError> {
-                drop(self.0.acquire().await);
-                Ok(values.iter().map(|_| assembled(b"v")).collect())
-            }
-        }
-        let store = Arc::new(Stalled(tokio::sync::Semaphore::new(0)));
+        let store = Arc::new(GatedStore::new());
         let stats = Arc::new(EmitterStats::default());
         let r = ToastResolver::with_store(store.clone(), stats.clone())
             .with_budget(crate::budget::MemoryBudget::with_leaf_reserve(
@@ -2573,7 +2748,9 @@ mod tests {
             stats.toast_values_read_ahead.load(Ordering::Relaxed),
             AHEAD_READS as u64
         );
-        store.0.add_permits(1);
+        store
+            .permits
+            .add_permits(tokio::sync::Semaphore::MAX_PERMITS);
         let fetched = || stats.toast_values_fetched.load(Ordering::Relaxed);
         tokio::time::timeout(std::time::Duration::from_secs(10), async {
             while tasks() > idle || fetched() < (AHEAD_READS + AHEAD_QUEUE) as u64 {
@@ -2595,24 +2772,6 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn foreground_admission_reclaims_completed_and_blocked_reads() {
-        struct Store {
-            blocked: bool,
-        }
-        #[async_trait]
-        impl ChunkStore for Store {
-            async fn fetch_many(
-                &self,
-                _: u32,
-                _: u32,
-                values: &[(u32, usize)],
-                _: u64,
-            ) -> Result<Vec<FetchedValue>, ChunkStoreError> {
-                if self.blocked {
-                    std::future::pending::<()>().await;
-                }
-                Ok(values.iter().map(|_| assembled(b"v")).collect())
-            }
-        }
         // Each read reserves 3.5 KiB and retains 2 KiB, so two retained reads
         // leave less than one reservation of 7 KiB admission
         let pointer = |id| ToastPointer {
@@ -2624,7 +2783,13 @@ mod tests {
         for blocked in [false, true] {
             let budget = crate::budget::MemoryBudget::with_leaf_reserve(9216, 2048);
             let stats = Arc::new(EmitterStats::default());
-            let resolver = ToastResolver::with_store(Arc::new(Store { blocked }), stats.clone())
+            let store = GatedStore::new();
+            if !blocked {
+                store
+                    .permits
+                    .add_permits(tokio::sync::Semaphore::MAX_PERMITS);
+            }
+            let resolver = ToastResolver::with_store(Arc::new(store), stats.clone())
                 .with_budget(budget.clone())
                 .with_read_ahead();
             for id in 1..=2 {
@@ -2733,21 +2898,8 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn dropping_read_ahead_cancels_blocked_reads() {
-        struct Stalled;
-        #[async_trait]
-        impl ChunkStore for Stalled {
-            async fn fetch_many(
-                &self,
-                _: u32,
-                _: u32,
-                _: &[(u32, usize)],
-                _: u64,
-            ) -> Result<Vec<FetchedValue>, ChunkStoreError> {
-                std::future::pending().await
-            }
-        }
         let stats = Arc::new(EmitterStats::default());
-        let r = ToastResolver::with_store(Arc::new(Stalled), stats.clone())
+        let r = ToastResolver::with_store(Arc::new(GatedStore::new()), stats.clone())
             .with_budget(crate::budget::MemoryBudget::with_leaf_reserve(
                 1 << 20,
                 64 << 10,
