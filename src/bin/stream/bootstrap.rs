@@ -1290,7 +1290,13 @@ pub(crate) fn resolve_shadow_start(args: &Args, mode: BootstrapMode) -> Result<S
         ("--out-dir", &args.out_dir),
         ("--spill-dir", &args.spill_dir),
         ("--shadow-socket-dir", &args.shadow_socket_dir),
-    ] {
+    ]
+    .into_iter()
+    .chain(
+        args.shadow_conf_dir
+            .iter()
+            .map(|d| ("--shadow-conf-dir", d)),
+    ) {
         anyhow::ensure!(
             !paths_overlap(dir, other),
             "--bootstrap-shadow-data-dir {} overlaps {flag} {}",
@@ -1529,6 +1535,22 @@ mod tests {
                 ]);
                 assert!(shadow_start(&args).is_err());
             }
+        }
+    }
+
+    /// Recreating shadow deletes files inside its data directory
+    #[test]
+    fn shadow_start_rejects_conf_dir_in_data_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        for (conf, ok) in [("data/conf.d", false), ("conf.d", true)] {
+            let args = args_from(&[
+                "--bootstrap-shadow-data-dir",
+                data.to_str().unwrap(),
+                "--shadow-conf-dir",
+                tmp.path().join(conf).to_str().unwrap(),
+            ]);
+            assert_eq!(shadow_start(&args).is_ok(), ok, "{conf}");
         }
     }
 

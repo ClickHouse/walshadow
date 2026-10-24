@@ -143,7 +143,7 @@ Require restart:
 - cluster-wide `[system_columns]` names
 - soft-delete mode and TOAST buffering settings
 - worker-pool sizes, `--worker-threads`, and memory limits
-- backup and shadow bootstrap choices
+- backup and shadow bootstrap choices, `--shadow-conf-dir`
 
 Run `walshadow-stream --help` for process and recovery flags. Run
 `walshadow-stream ctl help` for live-control commands
@@ -344,6 +344,36 @@ Live byte-budget reductions lower flush thresholds; increasing sealed-buffer
 capacity requires restarting walshadow
 
 `walshadow_process_threads` reports OS threads
+
+## Shadow PostgreSQL settings
+
+walshadow rewrites shadow's `postgresql.conf` and clears
+`postgresql.auto.conf` each time it starts shadow. Changes made with
+`ALTER SYSTEM` are lost on restart. To keep custom settings across restarts,
+set `--shadow-conf-dir` to a directory of `*.conf` files. Shadow loads these
+files through PostgreSQL's `include_dir` setting
+
+```text
+# /etc/walshadow/shadow.d/tune.conf
+shared_buffers = '4GB'
+max_wal_size = '16GB'
+checkpoint_timeout = '15min'
+```
+
+Use these files to override walshadow's defaults: `shared_buffers = 256MB`,
+`max_wal_size = 512MB` and `min_wal_size = 128MB`. walshadow writes required
+settings after `include_dir`, so custom files cannot override recovery,
+sockets, `fsync` or bridge loading settings. PostgreSQL gives no warning
+when a later setting overrides an earlier one. Check `pg_settings.sourcefile`
+on shadow if a custom setting has no effect
+
+Use an existing directory outside `--bootstrap-shadow-data-dir` to keep
+configuration files from being deleted when walshadow recreates shadow
+
+Shadow reads these files at startup. Run `SELECT pg_reload_conf()` to apply
+changes to settings that support reloading. When walshadow connects to an
+already running shadow with `--keep-shadow-running`, new settings take effect
+after shadow restarts
 
 ## Backup archive
 
