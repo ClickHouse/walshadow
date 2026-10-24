@@ -70,14 +70,7 @@ impl InetValue {
     pub fn to_text(&self) -> AsciiBuf<48> {
         let mut out = AsciiBuf::new();
         match self.family {
-            PGSQL_AF_INET => {
-                for (i, octet) in self.addr.iter().take(4).enumerate() {
-                    if i > 0 {
-                        out.push(b'.');
-                    }
-                    out.push_uint(u64::from(*octet), 1);
-                }
-            }
+            PGSQL_AF_INET => write_ipv4(&mut out, &self.addr),
             PGSQL_AF_INET6 => write_ipv6(&mut out, &self.addr),
             _ => out.push(b'?'),
         }
@@ -94,8 +87,19 @@ impl InetValue {
     }
 }
 
+fn write_ipv4<const N: usize>(out: &mut AsciiBuf<N>, bytes: &[u8]) {
+    for (i, octet) in bytes.iter().take(4).enumerate() {
+        if i > 0 {
+            out.push(b'.');
+        }
+        out.push_uint(u64::from(*octet), 1);
+    }
+}
+
 /// IPv6 matching PG `inet_net_ntop`: RFC 5952 canonical form (lower-case hex,
-/// no per-group leading zeros, `::` collapses longest run of >= 2 zero groups)
+/// no per-group leading zeros, `::` collapses longest run of >= 2 zero groups).
+/// IPv4-compatible `::a.b.c.d` and IPv4-mapped `::ffff:a.b.c.d` keep their
+/// trailing dotted quad
 fn write_ipv6<const N: usize>(out: &mut AsciiBuf<N>, bytes: &[u8]) {
     let Some(addr) = bytes.first_chunk::<16>() else {
         out.push(b'?');
@@ -133,6 +137,13 @@ fn write_ipv6<const N: usize>(out: &mut AsciiBuf<N>, bytes: &[u8]) {
         }
         if !out.is_empty() && !out.ends_with(':') {
             out.push(b':');
+        }
+        if k == 6
+            && best_start == Some(0)
+            && (best_len == 6 || (best_len == 5 && groups[5] == 0xffff))
+        {
+            write_ipv4(out, &addr[12..]);
+            break;
         }
         out.push_hex(groups[k]);
         k += 1;
@@ -232,6 +243,22 @@ mod tests {
         }
         let v = decode_inet(&body, false).unwrap();
         assert_eq!(v.to_text().as_str(), "1:2:3:4:5:6:7:8");
+    }
+
+    #[test]
+    fn inet_ipv6_embedded_ipv4_keeps_dotted_quad() {
+        let v6 = |prefix: &[u8], bits: u8| {
+            let mut body = vec![PGSQL_AF_INET6, bits];
+            body.extend_from_slice(&[0u8; 10]);
+            body.extend_from_slice(prefix);
+            body.extend_from_slice(&[192, 168, 0, 1]);
+            decode_inet(&body, false).unwrap().to_text()
+        };
+        assert_eq!(v6(&[0xff, 0xff], 128).as_str(), "::ffff:192.168.0.1");
+        assert_eq!(v6(&[0xff, 0xff], 120).as_str(), "::ffff:192.168.0.1/120");
+        assert_eq!(v6(&[0, 0], 128).as_str(), "::192.168.0.1");
+        // only the all-zero or ffff-mapped prefix keeps the quad
+        assert_eq!(v6(&[0xff, 0xfe], 128).as_str(), "::fffe:c0a8:1");
     }
 
     /// Longest output `inet_out` can produce, against the buffer bound
