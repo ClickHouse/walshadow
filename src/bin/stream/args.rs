@@ -313,6 +313,11 @@ pub(crate) struct Args {
     /// config, starts and supervises postmaster, then stops it on exit
     #[arg(long)]
     pub(crate) bootstrap_shadow_data_dir: PathBuf,
+    /// Load custom shadow settings from `*.conf` files in this directory.
+    /// Override defaults, but preserve settings required by walshadow.
+    /// Use a directory outside shadow's data directory to avoid deletion
+    #[arg(long, value_parser = absolute_path)]
+    pub(crate) shadow_conf_dir: Option<PathBuf>,
     /// Object-store backup name. `LATEST` resolves to newest sentinel;
     /// otherwise the literal `base_TTTTTTTTLLLLLLLLSSSSSSSS` form. Unset
     /// falls through to `[bootstrap] backup_name`, then to `LATEST`.
@@ -352,6 +357,11 @@ pub(crate) struct Args {
     /// Abort daemon when timeout expires
     #[arg(long, default_value_t = 300)]
     pub(crate) bootstrap_shadow_replay_timeout: u64,
+}
+
+/// PostgreSQL resolves relative `include_dir` paths from its data directory
+fn absolute_path(s: &str) -> std::io::Result<PathBuf> {
+    std::path::absolute(s)
 }
 
 impl Args {
