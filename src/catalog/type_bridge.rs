@@ -260,7 +260,11 @@ pub fn column_value_to_sql_literal(v: &ColumnValue, ch_inner: &str) -> Option<St
         ColumnValue::Interval(v) => Some(sql_string_literal(&v.to_text())),
         ColumnValue::Inet(v) => Some(sql_string_literal(&v.to_text())),
         ColumnValue::Uuid(b) => Some(format!("toUUID({})", sql_string_literal(&format_uuid(b)))),
-        ColumnValue::PgPendingText { text, .. } => Some(sql_bytes_literal(text.as_bytes())),
+        ColumnValue::PgPendingText { text, .. } => match types::kind(ch_inner) {
+            Some(Kind::Array) if text == "{}" => Some("[]".into()),
+            Some(Kind::Array | Kind::Map | Kind::Object | Kind::QBit) => None,
+            _ => Some(sql_bytes_literal(text.as_bytes())),
+        },
         ColumnValue::PgPending { .. }
         | ColumnValue::ExternalToast(_)
         | ColumnValue::Unsupported { .. } => None,
@@ -677,6 +681,24 @@ mod tests {
         .unwrap();
         let d = r.default_sql.expect("default rendered");
         assert!(d.starts_with("unhex('"), "{d}");
+    }
+
+    #[test]
+    fn empty_array_default_renders_ch_array_not_byte_literal() {
+        let mut a = attr(1009, -1, true, Some("{}"));
+        a.type_name = "_text".into();
+        let r = map(&a, false).unwrap();
+        assert_eq!(r.ch_type, "Array(Nullable(String))");
+        assert_eq!(r.default_sql.as_deref(), Some("[]"));
+    }
+
+    #[test]
+    fn non_empty_array_default_drops_rather_than_emitting_a_string() {
+        let mut a = attr(1009, -1, true, Some("{a,b}"));
+        a.type_name = "_text".into();
+        let r = map(&a, false).unwrap();
+        assert_eq!(r.ch_type, "Array(Nullable(String))");
+        assert_eq!(r.default_sql, None);
     }
 
     /// Fringe varlena type with no local codec
