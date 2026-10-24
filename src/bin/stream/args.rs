@@ -314,6 +314,11 @@ pub(crate) struct Args {
     /// config, starts and supervises postmaster, then stops it on exit
     #[arg(long)]
     pub(crate) bootstrap_shadow_data_dir: PathBuf,
+    /// Load shadow PostgreSQL settings from `*.conf` files.
+    /// Required walshadow settings take precedence.
+    /// Use a separate directory from `--bootstrap-shadow-data-dir`
+    #[arg(long, value_parser = absolute_path)]
+    pub(crate) shadow_conf_dir: Option<PathBuf>,
     /// Object-store backup name. `LATEST` resolves to newest sentinel;
     /// otherwise the literal `base_TTTTTTTTLLLLLLLLSSSSSSSS` form. Unset
     /// falls through to `[bootstrap] backup_name`, then to `LATEST`.
@@ -349,6 +354,11 @@ pub(crate) struct Args {
     /// archiving to that same bucket.
     #[arg(long, default_value_t = false)]
     pub(crate) bootstrap_wal_from_archive: bool,
+}
+
+/// PostgreSQL resolves relative `include_dir` paths from the including file's directory
+fn absolute_path(s: &str) -> std::io::Result<PathBuf> {
+    std::path::absolute(s)
 }
 
 impl Args {
