@@ -286,10 +286,10 @@ pub const SPILL_MAGIC: [u8; 2] = *b"WS";
 /// the `TAG_DESCRIPTOR` dictionary (Heap bodies reference descriptors by dict
 /// id). v6 added writer xid to heap + raw bodies. v7 added database OID to
 /// chunk and `ToastDelete` bodies. v8 dropped heap rfn, restored from the
-/// dict descriptor. `DrainEntry` events
-/// (Catalog, ToastBarrier, Config/Signal) are drain-time, never spilled,
-/// so they don't touch this format
-pub const SPILL_VERSION: u16 = 8;
+/// dict descriptor. v9 stored inet addr as fixed 16 bytes. `DrainEntry`
+/// events (Catalog, ToastBarrier, Config/Signal) are drain-time, never
+/// spilled, so they don't touch this format
+pub const SPILL_VERSION: u16 = 9;
 
 /// Wire tags, one block per tag space so encode and decode read off the same
 /// table. Renumbering is a body-encoding change: bump [`SPILL_VERSION`]
@@ -1052,7 +1052,7 @@ pub(crate) fn encode_value(out: &mut Vec<u8>, v: &ColumnValue) {
             push_u8(out, v.family);
             push_u8(out, v.bits);
             push_u8(out, v.is_cidr as u8);
-            push_bytes(out, &v.addr);
+            out.extend_from_slice(&v.addr);
         }
         ColumnValue::Interval(v) => {
             push_u8(out, VAL_INTERVAL);
@@ -1295,7 +1295,7 @@ pub(crate) fn decode_value(c: &mut Cursor) -> Result<ColumnValue> {
             let family = c.u8()?;
             let bits = c.u8()?;
             let is_cidr = c.u8()? != 0;
-            let addr = c.bytes()?;
+            let addr = c.take()?;
             ColumnValue::Inet(crate::decode::codecs::InetValue {
                 family,
                 bits,
@@ -1890,7 +1890,7 @@ mod tests {
                 family: PGSQL_AF_INET6,
                 bits: 128,
                 is_cidr: false,
-                addr: vec![0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01],
+                addr: [0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01],
             }),
             ColumnValue::Interval(IntervalValue {
                 months: -3,

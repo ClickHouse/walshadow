@@ -313,7 +313,7 @@ impl ColumnValue {
             ColumnValue::TimeTz { .. } => 12,
             ColumnValue::Uuid(_) => 16,
             ColumnValue::Interval(_) => 16,
-            ColumnValue::Inet(v) => 3 + v.addr.len(),
+            ColumnValue::Inet(_) => 19,
             ColumnValue::Numeric(NumericKind::Finite(s)) => s.len(),
             ColumnValue::Numeric(_) => 0,
             ColumnValue::Name(s) | ColumnValue::Text(s) | ColumnValue::Json(s) => s.len(),
