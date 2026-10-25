@@ -2365,6 +2365,7 @@ async fn session_body(
         }
     };
     drop(path);
+    pipeline_handle.stop_retries();
     tracing::info!(
         target: "walshadow",
         reason = shutdown_reason,

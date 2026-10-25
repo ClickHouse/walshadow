@@ -18,11 +18,10 @@ use std::sync::atomic::Ordering;
 
 use backon::Retryable;
 use clickhouse_c::Allocator;
-use tokio::sync::watch;
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 use crate::ch::EmitterError;
-use crate::config::ResolvedConfig;
 use crate::emit::ch_emitter::{ColumnBuf, EmitterStats, RetryConfig, literal_column};
 use crate::emit::pipeline::Fatal;
 use crate::emit::pipeline::batcher::InsertBatch;
@@ -39,11 +38,11 @@ pub(crate) struct ResolvedBatch {
 #[derive(Clone)]
 pub(crate) struct ResolverOptions {
     pub oracle: Option<Arc<Oracle>>,
-    /// Boot budget for oracle transport retries, re-read from `config_rx`
+    /// Backoff between oracle transport retries
     pub retry: RetryConfig,
     pub stats: Arc<EmitterStats>,
     pub fatal: Fatal,
-    pub config_rx: Option<watch::Receiver<Arc<ResolvedConfig>>>,
+    pub stop_retries: CancellationToken,
 }
 
 /// Spawn `n` resolvers over the shared batch queue. Drops the sender it was
@@ -66,27 +65,26 @@ async fn run(
 ) {
     let ResolverOptions {
         oracle,
-        mut retry,
+        retry,
         stats,
         fatal,
-        config_rx,
+        stop_retries,
     } = opts;
     let alloc = Allocator::global(&mimalloc::MiMalloc);
     while let Ok(mut batch) = rx.recv().await {
-        if let Some(rx) = config_rx.as_ref() {
-            retry.max_attempts = rx.borrow().retry_max_attempts;
-        }
         resolve_local_columns(&mut batch, &stats);
         let started = std::time::Instant::now();
-        let resolved = match resolve_oracle_with_retry(&oracle, alloc, &batch, &retry, &stats).await
-        {
-            Ok(v) => v,
-            Err(e) => {
-                // Seq stays unacknowledged, so a restart replays it
-                fatal.set(format!("oracle resolve: {e}"));
-                return;
-            }
-        };
+        let resolved =
+            match resolve_oracle_with_retry(&oracle, alloc, &batch, &retry, &stats, &stop_retries)
+                .await
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    // Seq stays unacknowledged, so a restart replays it
+                    fatal.set(format!("oracle resolve: {e}"));
+                    return;
+                }
+            };
         stats
             .oracle_resolve_nanos
             .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -111,17 +109,28 @@ fn resolve_local_columns(batch: &mut InsertBatch, stats: &EmitterStats) {
     }
 }
 
-/// Retry transport failures only
+/// Retry transport failures until teardown
 async fn resolve_oracle_with_retry(
     oracle: &Option<Arc<Oracle>>,
     alloc: Allocator,
     batch: &InsertBatch,
     retry: &RetryConfig,
     stats: &EmitterStats,
+    stop_retries: &CancellationToken,
 ) -> Result<Option<OracleBlock>, EmitterError> {
+    let cancel_sleep = stop_retries.clone();
     (|| resolve_oracle(oracle, alloc, batch))
-        .retry(retry.backoff())
-        .when(OracleError::retryable)
+        .retry(retry.backoff().without_max_times())
+        .when(|e: &OracleError| e.retryable() && !stop_retries.is_cancelled())
+        .sleep(move |delay| {
+            let cancel = cancel_sleep.clone();
+            async move {
+                tokio::select! {
+                    () = cancel.cancelled() => {},
+                    () = tokio::time::sleep(delay) => {},
+                }
+            }
+        })
         .notify(|_, _| {
             stats.retries_attempted.fetch_add(1, Ordering::Relaxed);
         })
@@ -335,6 +344,74 @@ mod tests {
         );
         resolve_local_columns(&mut batch, &stats);
         assert_eq!(stats.oracle_local_columns.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn refused_bridge_retries_until_teardown() {
+        use crate::ops::bridge::tests::{hello_body, spawn_worker};
+        use crate::ops::bridge::{Bridge, PROJECTION_VERSION, PROTO_VERSION};
+
+        // Worker answers HELLO once, then drops every connection
+        let (_tmp, path) = spawn_worker(vec![Some(hello_body(PROTO_VERSION, PROJECTION_VERSION))]);
+        let oracle = Some(Arc::new(Oracle::new(Arc::new(
+            Bridge::connect(&path).await.unwrap(),
+        ))));
+        let batch = seal(vec![wkt_row(0, Some("POINT(1 2)"))]).await;
+        let retry = RetryConfig {
+            max_attempts: 1,
+            initial_backoff: Duration::from_secs(3600),
+            max_backoff: Duration::from_secs(3600),
+        };
+        let stats = EmitterStats::default();
+        let stop_retries = CancellationToken::new();
+        let alloc = Allocator::global(&mimalloc::MiMalloc);
+        let resolve =
+            resolve_oracle_with_retry(&oracle, alloc, &batch, &retry, &stats, &stop_retries);
+        tokio::pin!(resolve);
+        for _ in 0..3 {
+            tokio::select! {
+                _ = &mut resolve => panic!("gave up before teardown"),
+                () = tokio::time::sleep(Duration::from_secs(3601)) => {},
+            }
+        }
+        assert!(stats.retries_attempted.load(Ordering::Relaxed) > u64::from(retry.max_attempts));
+        stop_retries.cancel();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), resolve)
+                .await
+                .expect("cancel retry backoff")
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_error_fails_without_retry() {
+        use crate::ops::bridge::tests::{hello_body, remote_body, spawn_worker};
+        use crate::ops::bridge::{Bridge, PROJECTION_VERSION, PROTO_VERSION};
+
+        let (_tmp, path) = spawn_worker(vec![
+            Some(hello_body(PROTO_VERSION, PROJECTION_VERSION)),
+            Some(remote_body("conversion failed")),
+        ]);
+        let oracle = Some(Arc::new(Oracle::new(Arc::new(
+            Bridge::connect(&path).await.unwrap(),
+        ))));
+        let batch = seal(vec![wkt_row(0, Some("POINT(1 2)"))]).await;
+        let stats = EmitterStats::default();
+        let alloc = Allocator::global(&mimalloc::MiMalloc);
+        assert!(
+            resolve_oracle_with_retry(
+                &oracle,
+                alloc,
+                &batch,
+                &RetryConfig::default(),
+                &stats,
+                &CancellationToken::new(),
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(stats.retries_attempted.load(Ordering::Relaxed), 0);
     }
 
     /// A cell PG must convert keeps the whole column in the request, even
