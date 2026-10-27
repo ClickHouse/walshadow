@@ -40,6 +40,11 @@ module in batches. PostgreSQL interprets source type and module produces Native
 columns for destination insertion. Batch conversion avoids a database round trip
 per row and keeps type semantics in PostgreSQL
 
+Conversion workers run between batcher and inserters, so PostgreSQL conversion
+overlaps ClickHouse insertion. Batches carrying only local columns pass through
+without a PostgreSQL request. Inserters combine local and converted columns into
+complete Native blocks and retain them across insert retries
+
 Conversion failure stops batch with column and row context. Module pins output
 settings to make conversion reproducible. Greenfield bootstrap uses a temporary
 PostgreSQL instance because managed shadow is not ready yet
@@ -61,6 +66,7 @@ type's default when target is not Nullable. See
 
 Start in [TOAST resolver](../src/toast/resolver.rs),
 [retirement ledger](../src/toast/toast_retire.rs),
+[conversion pool](../src/emit/pipeline/resolver.rs),
 [conversion client](../src/ops/oracle.rs), and
 [PostgreSQL module](../pgext/worker.c). Build instructions live in
 [module guide](../pgext/README.md), PostgreSQL-backed storage in

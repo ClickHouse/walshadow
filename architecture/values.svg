@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1120" height="920" viewBox="0 0 1120 920" role="img" aria-labelledby="title desc">
   <title id="title">TOAST resolution and PostgreSQL type conversion</title>
-  <desc id="desc">Transaction heaps and TOAST chunks enter planning and resolution. ToastResolver reads or writes versioned ClickHouse mirrors for values outside the current transaction. InsertBatcher stores locally encoded column slabs or Oracle cells. Inserter sends one ENCODE_NATIVE request per batch to shadow, validates returned Native columns, combines them with local slabs and sends the complete ClickHouse INSERT.</desc>
+  <desc id="desc">Transaction heaps and TOAST chunks enter planning and resolution. ToastResolver reads or writes versioned ClickHouse mirrors for values outside the current transaction. InsertBatcher stores locally encoded column slabs or Oracle cells. A separate conversion pool sends ENCODE_NATIVE requests to shadow and validates returned Native columns. Inserters combine them with local columns and send complete ClickHouse INSERTs.</desc>
   <defs>
     <marker id="data" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 1 1 L 9 5 L 1 9" fill="none" stroke="#A3A9CE" stroke-width="1.5"/></marker>
     <marker id="control" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 1 1 L 9 5 L 1 9" fill="none" stroke="#E49B5D" stroke-width="1.5"/></marker>
@@ -26,22 +26,23 @@
   <text x="816" y="114" class="">ClickHouse chunk history</text>
   <text x="816" y="138" class="">Births / tombstones by LSN</text>
   <path d="M 320 101 H 408" fill="none" stroke="#A3A9CE" stroke-width="1.8" marker-end="url(#data)"/>
-  <path d="M 712 101 H 800" fill="none" stroke="#85B695" stroke-width="1.8" marker-end="url(#catalog)" marker-start="url(#catalog)"/>
+  <path d="M 712 101 H 800" fill="none" stroke="#A3A9CE" stroke-width="1.8" marker-end="url(#data)" marker-start="url(#data)"/>
   <text x="728" y="81" class="label">put/fetch</text>
   <path d="M 560 154 V 252" fill="none" stroke="#A3A9CE" stroke-width="1.8" marker-end="url(#data)"/>
-  <text x="576" y="197" class="label">DecodeJob → decoded RowChunk</text>
+  <text x="576" y="197" class="label">Rows placed inline, in commit order</text>
   <rect x="48" y="252" width="1024" height="84" fill="#292522" stroke="#867462" stroke-width="1.3"/>
   <text x="64" y="281" class="name">InsertBatcher / TableEncoder</text>
   <text x="64" y="305" class="">ColumnEncoding selects local slabs or Oracle cells; both remain in one sealed InsertBatch</text>
+  <rect x="392" y="352" width="336" height="356" fill="#34302C" stroke="#867462" stroke-width="1.3" stroke-dasharray="6 5"/>
   <path d="M 184 336 V 392" fill="none" stroke="#A3A9CE" stroke-width="1.8" marker-end="url(#data)"/>
-  <path d="M 560 336 V 392" fill="none" stroke="#A3A9CE" stroke-width="1.8" marker-end="url(#data)"/>
+  <path d="M 560 336 V 352" fill="none" stroke="#A3A9CE" stroke-width="1.8" marker-end="url(#data)"/>
   <rect x="48" y="392" width="272" height="88" fill="#292522" stroke="#867462" stroke-width="1.3"/>
   <text x="64" y="421" class="name">ColumnBuf</text>
   <text x="64" y="445" class="">Local encoded columns</text>
+  <text x="408" y="380" class="group">Conversion pool</text>
   <rect x="408" y="392" width="304" height="88" fill="#292522" stroke="#867462" stroke-width="1.3"/>
   <text x="424" y="421" class="name">ColumnBuf::Oracle</text>
   <text x="424" y="445" class="">Raw Datum / text / default</text>
-  <text x="424" y="469" class="">Inserter calls encode_batch</text>
   <rect x="784" y="352" width="304" height="180" fill="#34302C" stroke="#867462" stroke-width="1.3" stroke-dasharray="6 5"/>
   <text x="798" y="378" class="group">Shadow PostgreSQL</text>
   <rect x="800" y="392" width="272" height="116" fill="#273142" stroke="#867462" stroke-width="1.3"/>
@@ -49,16 +50,16 @@
   <text x="816" y="445" class="">Bridge: ENCODE_NATIVE</text>
   <text x="816" y="469" class="">One request per batch</text>
   <text x="816" y="493" class="">Return partial Native block</text>
-  <path d="M 712 432 H 800" fill="none" stroke="#85B695" stroke-width="1.8" marker-end="url(#catalog)"/>
+  <path d="M 712 432 H 800" fill="none" stroke="#A3A9CE" stroke-width="1.8" marker-end="url(#data)"/>
   <rect x="408" y="576" width="304" height="116" fill="#292522" stroke="#867462" stroke-width="1.3"/>
   <text x="424" y="605" class="name">Native response checks</text>
   <text x="424" y="629" class="">Validate row count, names,</text>
   <text x="424" y="653" class="">column types and block shape</text>
-  <path d="M 936 508 V 634 H 712" fill="none" stroke="#85B695" stroke-width="1.8" marker-end="url(#catalog)"/>
+  <path d="M 936 508 V 634 H 712" fill="none" stroke="#A3A9CE" stroke-width="1.8" marker-end="url(#data)"/>
   <text x="785" y="610" class="label">Native columns</text>
   <rect x="48" y="616" width="272" height="116" fill="#292522" stroke="#867462" stroke-width="1.3"/>
-  <text x="64" y="645" class="name">BlockBuilder</text>
-  <text x="64" y="669" class="">Local + returned columns</text>
+  <text x="64" y="645" class="name">Inserter</text>
+  <text x="64" y="669" class="">Combine Native columns</text>
   <text x="64" y="693" class="">Retain block across retries</text>
   <path d="M 184 480 V 616" fill="none" stroke="#A3A9CE" stroke-width="1.8" marker-end="url(#data)"/>
   <path d="M 408 658 H 320" fill="none" stroke="#A3A9CE" stroke-width="1.8" marker-end="url(#data)"/>
