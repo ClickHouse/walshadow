@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1120" height="1024" viewBox="0 0 1120 1024" role="img" aria-labelledby="title desc">
   <title id="title">Catalog capture and DDL ordering</title>
-  <desc id="desc">At a catalog boundary the pump holds later publication, allows shadow replay through that boundary, scans pinned descriptors, persists history and attaches schema events before forwarding the commit. ReorderSink waits for decode placement, flushes batches, waits for durable inserts, then applies DDL or TRUNCATE on its separate ClickHouse connection.</desc>
+  <desc id="desc">At a catalog boundary the pump holds later publication, allows shadow replay through that boundary, scans pinned descriptors, persists history and attaches schema events before forwarding the commit. ReorderSink sends staged rows, flushes batches, waits for durable inserts, then applies DDL or TRUNCATE on its separate ClickHouse connection.</desc>
   <defs>
     <marker id="data" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 1 1 L 9 5 L 1 9" fill="none" stroke="#A3A9CE" stroke-width="1.5"/></marker>
     <marker id="control" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 1 1 L 9 5 L 1 9" fill="none" stroke="#E49B5D" stroke-width="1.5"/></marker>
@@ -43,12 +43,12 @@
   <text x="32" y="582" class="group">DDL / TRUNCATE barrier in ReorderSink</text>
   <text x="96" y="625" class="group" text-anchor="middle">ReorderSink</text>
   <path d="M 96 648 V 1000" fill="none" stroke="#867462" stroke-width="1.5" stroke-dasharray="5 5"/>
-  <text x="552" y="625" class="group" text-anchor="middle">Decode / batcher / ack</text>
+  <text x="552" y="625" class="group" text-anchor="middle">Insert pipeline</text>
   <path d="M 552 648 V 1000" fill="none" stroke="#867462" stroke-width="1.5" stroke-dasharray="5 5"/>
   <text x="984" y="625" class="group" text-anchor="middle">ClickHouse</text>
   <path d="M 984 648 V 1000" fill="none" stroke="#867462" stroke-width="1.5" stroke-dasharray="5 5"/>
-  <path d="M 96 686 H 552" fill="none" stroke="#E49B5D" stroke-width="1.8" marker-end="url(#control)" stroke-dasharray="6 4"/>
-  <text x="324.0" y="674" class="label" text-anchor="middle">Wait until earlier seqs are Placed</text>
+  <path d="M 96 686 H 552" fill="none" stroke="#A3A9CE" stroke-width="1.8" marker-end="url(#data)"/>
+  <text x="324.0" y="674" class="label" text-anchor="middle">Send staged rows to batcher</text>
   <path d="M 96 754 H 552" fill="none" stroke="#E49B5D" stroke-width="1.8" marker-end="url(#control)" stroke-dasharray="6 4"/>
   <text x="324.0" y="742" class="label" text-anchor="middle">FlushAll, seal earlier rows</text>
   <path d="M 552 822 H 96" fill="none" stroke="#E49B5D" stroke-width="1.8" marker-end="url(#control)" stroke-dasharray="6 4"/>

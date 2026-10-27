@@ -27,10 +27,16 @@ ClickHouse mirror mode
 
 ## Reads and retention
 
-Resolver waits until shadow has replayed referring record, then asks extension
-to read and validate stored chunks. Rust side decompresses value and checks raw
-size. Shadow is read-only from resolver perspective; decoded chunk writes never
-go back into PostgreSQL
+Resolver asks extension to read chunks with referring record's position as
+minimum replay bound. Extension refuses reads ahead of replay; resolver then
+waits and retries. Rust side decompresses value and checks raw size. Shadow is
+read-only from resolver perspective; decoded chunk writes never go back into
+PostgreSQL
+
+Bounded speculative reads fetch and decompress values ahead of commit planning.
+Planning consumes matching results or resolves values normally. Chunk births
+and schema barriers invalidate speculative reads; these reads do not prevent
+shadow reclamation
 
 Reads select database-specific bridge using referring row’s database OID.
 Batched bootstrap lookups include database OID in value keys, so identical

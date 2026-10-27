@@ -67,8 +67,8 @@
   <path d="M 440 602 H 368" fill="none" stroke="#85B695" stroke-width="1.8" marker-end="url(#catalog)"/>
   <text x="376" y="583" class="label">lookup</text>
   <rect x="80" y="688" width="648" height="104" fill="#292522" stroke="#867462" stroke-width="1.3"/>
-  <text x="96" y="717" class="name">ReorderSink → parallel commit pipeline</text>
-  <text x="96" y="741" class="">DecodeJob → decode[M] → InsertBatcher → inserter[N]</text>
+  <text x="96" y="717" class="name">ReorderSink → commit pipeline</text>
+  <text x="96" y="741" class="">Inline rows → batcher → conversion pool → inserters</text>
   <text x="96" y="765" class="">SchemaEvent / TRUNCATE use an ordered DDL barrier</text>
   <path d="M 224 632 V 688" fill="none" stroke="#A3A9CE" stroke-width="1.8" marker-end="url(#data)"/>
   <path d="M 584 640 V 688" fill="none" stroke="#85B695" stroke-width="1.8" marker-end="url(#catalog)"/>

@@ -37,12 +37,14 @@ planning committed transactions
 
 ## Commit pipeline
 
-![Commit pipeline: bounded DecodeJob queue fans out to M workers, rows merge through one batcher, InsertBatch queue fans out to N inserters, and separate Register, Placed and Acked events advance a contiguous watermark](workers.svg)
+![Commit pipeline: reorder places rows inline, one batcher feeds a conversion pool and ClickHouse inserters, and acknowledgements advance a contiguous watermark](workers.svg)
 
 `BufferingDecoderSink` and `ReorderSink` share one record-queue worker
 `ReorderSink` plans each commit and places its rows onto the batcher in order
-`[ch].inserter_pool_size` sizes the inserter pool
-Each inserter owns a ClickHouse connection and can take any sealed batch
+Batcher seals per-table batches. A separate conversion pool resolves PostgreSQL
+types before inserters send complete Native blocks. Conversion concurrency
+matches oracle capacity; `[ch].inserter_pool_size` sizes the inserter pool
+Each inserter owns a ClickHouse connection and takes any ready batch
 
 Sequence numbers identify work slices, not necessarily whole transactions
 Only a commit's final slice publishes its LSN, after all earlier work finishes
@@ -67,7 +69,7 @@ acknowledgements
 
 Streaming wiring lives in [stream/](../src/bin/stream/), queue ownership
 in [queueing_record_sink.rs](../src/source/queueing_record_sink.rs), and pool
-assembly in [pipeline/mod.rs](../src/emit/pipeline/mod.rs)
+assembly in [pipeline/tail.rs](../src/emit/pipeline/tail.rs)
 
 ## Diagram sources
 
