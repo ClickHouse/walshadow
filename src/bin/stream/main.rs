@@ -61,7 +61,9 @@ use tokio::sync::Mutex;
 use walshadow::boundary_hold::AttachSlot;
 use walshadow::metrics::MetricsRegistry;
 
-use crate::args::{Args, InitArgs, cli_base, url_base, validate_transport_args};
+use crate::args::{
+    Args, InitArgs, cli_base, url_base, validate_scratch_dir, validate_transport_args,
+};
 use crate::runtime_cfg::spawn_shutdown_signals;
 use crate::session::run_session;
 use crate::tracing_setup::init_tracing;
@@ -158,6 +160,7 @@ async fn run(mut args: Args) -> Result<()> {
 
     args.url_base = url_base(&args)?;
     validate_transport_args(&args)?;
+    validate_scratch_dir(&args)?;
     let sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
         .inspect_err(|e| {
             tracing::warn!(

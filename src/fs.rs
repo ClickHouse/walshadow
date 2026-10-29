@@ -4,20 +4,28 @@ use std::path::{Path, PathBuf};
 use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
 
-/// Process-local scratch under durable `root`: contents rebuild from WAL at
-/// restart, so boot wipes it wholesale and nothing fsyncs into it
+/// Default scratch path under durable `root`. Startup clears contents and
+/// rebuilds them from WAL, so files need no fsync
 pub fn scratch_dir(root: &Path) -> PathBuf {
     root.join("scratch")
 }
 
-/// Wipe and recreate `dir` wholesale
+/// Empty `dir`, creating it if absent. Preserve directory so it can be a mount point
 pub fn reset_dir(dir: &Path) -> io::Result<()> {
-    match std::fs::remove_dir_all(dir) {
-        Ok(()) => {}
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return std::fs::create_dir_all(dir),
         Err(e) => return Err(e),
+    };
+    for entry in entries {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            std::fs::remove_dir_all(entry.path())?;
+        } else {
+            std::fs::remove_file(entry.path())?;
+        }
     }
-    std::fs::create_dir_all(dir)
+    Ok(())
 }
 
 /// Persist directory entry updates
@@ -115,13 +123,17 @@ mod tests {
 
     #[test]
     fn reset_dir_wipes_nested_contents() {
+        use std::os::unix::fs::MetadataExt;
         let tmp = tempfile::tempdir().unwrap();
         let dir = scratch_dir(tmp.path());
         std::fs::create_dir_all(dir.join("nested")).unwrap();
         std::fs::write(dir.join("nested/a.bin"), b"x").unwrap();
         std::fs::write(tmp.path().join("durable.toml"), b"x").unwrap();
+        let ino = std::fs::metadata(&dir).unwrap().ino();
         reset_dir(&dir).unwrap();
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        // Preserve inode so mount points stay mounted
+        assert_eq!(std::fs::metadata(&dir).unwrap().ino(), ino);
         assert!(tmp.path().join("durable.toml").exists());
         reset_dir(&tmp.path().join("absent")).unwrap();
 

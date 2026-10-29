@@ -114,8 +114,13 @@ Normal stop and start resumes from persisted manifest. Keep together:
 - config and fragment directory
 
 Keep descriptor history, backfill ledgers, and deferred TOAST retirement state
-alongside manifest. Do not clean spill directory wholesale between starts
-Daemon removes transient transaction spill itself and reconstructs it from WAL
+alongside manifest. Do not empty spill directory between starts.
+Daemon clears scratch directory at startup and rebuilds transaction spill from WAL
+
+`--scratch-dir` defaults to `<spill-dir>/scratch`. It holds temporary transaction
+spill, body spools and insert plans. Use local temporary storage or a separate
+mount point if desired. Scratch directory must not contain spill directory or
+overlap filtered WAL, shadow data or socket directories
 
 Filtered-WAL cleanup also preserves shadow restartpoint. Do not delete segments
 solely because current replay position is newer; restarted shadow may still

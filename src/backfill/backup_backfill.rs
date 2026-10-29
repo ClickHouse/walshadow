@@ -857,7 +857,7 @@ async fn replay_gap(
         })
         .map_err(|e| anyhow::anyhow!("backup_backfill: replay xact buffer: {e}"))?,
     ));
-    buffer.lock().await.clear_spill_dir().ok();
+    buffer.lock().await.clear_scratch_dir().ok();
 
     // Include opted-in main and TOAST filenodes
     let mut filter_rfns: HashSet<(Oid, Oid)> = targets.keys().copied().collect();

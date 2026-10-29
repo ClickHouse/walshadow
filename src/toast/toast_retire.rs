@@ -1,6 +1,6 @@
-//! Durable queue of deferred toast-mirror retirements. Lives at
-//! `{spill_dir}/toast_retires.toml` beside `manifest.toml` (survives
-//! `clear_spill_dir`, which wipes only `scratch/`).
+//! Durable queue of deferred toast-mirror retirements, stored at
+//! `{spill_dir}/toast_retires.toml` beside `manifest.toml`.
+//! Scratch cleanup leaves this queue intact.
 //!
 //! A toast rel's `Dropped` only queues its retire; the wipe defers until
 //! the persisted resolved floor passes the dropping commit. The floor

@@ -895,11 +895,11 @@ async fn session_body(
 
     // START_REPLICATION runs after sinks are built so archive fallback can
     // advance identical filter and decode paths.
-    // Spill dir wiped every startup: cursor file commits drains
-    // atomically, so leftover spill from a prior crash is redundant or stale.
+    // Cursor records completed drains atomically; replay WAL to rebuild
+    // pending transactions after clearing scratch at startup.
     let mut xact_buf_cfg = XactBufferConfig {
         xact_buffer_max: args.xact_buffer_max,
-        ..XactBufferConfig::new(args.spill_dir.clone())
+        ..XactBufferConfig::new(args.scratch_dir())
     };
     if let Some(cfg) = ch_config.as_ref() {
         xact_buf_cfg.drain_batch_rows = cfg.drain_batch_rows;
@@ -909,20 +909,22 @@ async fn session_body(
     let span_registry = (args.otlp_endpoint.is_some()
         || std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").is_ok())
     .then(TxnSpanRegistry::new);
-    let mut xact_buffer = XactBuffer::new(xact_buf_cfg).context("init xact buffer / spill dir")?;
+    let mut xact_buffer = XactBuffer::new(xact_buf_cfg)
+        .context("initialize transaction buffer and scratch directory")?;
     if let Some(reg) = &span_registry {
         xact_buffer = xact_buffer.with_span_registry(reg.clone());
     }
     xact_buffer
-        .clear_spill_dir()
-        .context("clear stale spill files")?;
-    let xact_buffer = Arc::new(Mutex::new(xact_buffer));
+        .clear_scratch_dir()
+        .context("clear scratch directory")?;
     tracing::info!(
         target: "walshadow",
         spill_dir = %args.spill_dir.display(),
+        scratch_dir = %xact_buffer.scratch_dir().display(),
         xact_buffer_max = args.xact_buffer_max,
-        "spill dir ready",
+        "spill and scratch directories ready",
     );
+    let xact_buffer = Arc::new(Mutex::new(xact_buffer));
 
     // Persist handoff before streaming can advance manifest
     if let (Some(end_lsn), Some(resume)) = (bootstrap_end_lsn, bootstrap_resume_lsn) {

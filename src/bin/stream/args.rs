@@ -13,6 +13,8 @@ use walshadow::mapping::DropTableStrategy;
 use walshadow::retention::DEFAULT_RETENTION_BYTES;
 use walshadow::schema::RelName;
 
+use crate::bootstrap::paths_overlap;
+
 /// `cli_over_toml` plus a ≥1 clamp for pool/batch sizes.
 pub(crate) fn positive_usize(name: &str, cli: Option<usize>, toml: usize) -> usize {
     match cli_over_toml(cli, Some(toml)).unwrap_or(toml) {
@@ -231,10 +233,13 @@ pub(crate) struct Args {
     /// throughput lever. Only with `--ch-config`.
     #[arg(long)]
     pub(crate) inserter_pool_size: Option<usize>,
-    /// Xact / TOAST spill and durable recovery state directory
-    /// Startup removes transient transaction spill only
+    /// Durable recovery state directory
     #[arg(long)]
     pub(crate) spill_dir: PathBuf,
+    /// Temporary transaction spill, body spool and plan directory, cleared at startup.
+    /// Defaults to `<spill-dir>/scratch`; may be a mount point
+    #[arg(long)]
+    pub(crate) scratch_dir: Option<PathBuf>,
     /// In-memory xact buffer budget in bytes, shared across open transactions
     #[arg(long, default_value_t = walshadow::xact_buffer::DEFAULT_XACT_BUFFER_MAX)]
     pub(crate) xact_buffer_max: usize,
@@ -360,6 +365,12 @@ impl Args {
             .clone()
             .unwrap_or_else(|| self.shadow_socket_dir.join("walshadow-bridge.sock"))
     }
+
+    pub(crate) fn scratch_dir(&self) -> PathBuf {
+        self.scratch_dir
+            .clone()
+            .unwrap_or_else(|| walshadow::fs::scratch_dir(&self.spill_dir))
+    }
 }
 
 /// `[source]` + `[ch]` defaults from the CLI args — the base layer under the
@@ -427,6 +438,33 @@ pub(crate) fn validate_transport_args(args: &Args) -> Result<()> {
             target: "walshadow",
             shadow_dbname = %db,
             "--shadow-dbname is deprecated and ignored; the shadow catalog follows the applied [source] dbname",
+        );
+    }
+    Ok(())
+}
+
+/// Reject scratch paths that could erase recovery state at startup
+pub(crate) fn validate_scratch_dir(args: &Args) -> Result<()> {
+    let scratch = std::path::absolute(args.scratch_dir())?;
+    anyhow::ensure!(
+        !std::path::absolute(&args.spill_dir)?.starts_with(&scratch),
+        "--scratch-dir {} contains --spill-dir {}",
+        scratch.display(),
+        args.spill_dir.display(),
+    );
+    for (flag, other) in [
+        ("--out-dir", &args.out_dir),
+        ("--shadow-socket-dir", &args.shadow_socket_dir),
+        (
+            "--bootstrap-shadow-data-dir",
+            &args.bootstrap_shadow_data_dir,
+        ),
+    ] {
+        anyhow::ensure!(
+            !paths_overlap(&scratch, other),
+            "--scratch-dir {} overlaps {flag} {}",
+            scratch.display(),
+            other.display(),
         );
     }
     Ok(())
@@ -519,5 +557,25 @@ mod tests {
             "archive-only escape hatch must fail startup",
         );
         assert!(validate_transport_args(&args_from(&["--catalog-hold-timeout", "0"])).is_err());
+    }
+
+    #[test]
+    fn scratch_dir_defaults_under_spill_and_rejects_durable_overlap() {
+        let args = args_from(&[]);
+        assert_eq!(args.scratch_dir(), PathBuf::from("/tmp/spill/scratch"));
+        assert!(validate_scratch_dir(&args).is_ok());
+        assert!(validate_scratch_dir(&args_from(&["--scratch-dir", "/mnt/nvme"])).is_ok());
+        for dir in [
+            "/tmp/spill",
+            "/tmp",
+            "/tmp/out/x",
+            "/tmp/shadow-data",
+            "/tmp/sock",
+        ] {
+            assert!(
+                validate_scratch_dir(&args_from(&["--scratch-dir", dir])).is_err(),
+                "{dir} must be rejected",
+            );
+        }
     }
 }
