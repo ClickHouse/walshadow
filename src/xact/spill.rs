@@ -1179,11 +1179,14 @@ impl<'a> Cursor<'a> {
         Ok(self.need(n)?.to_vec())
     }
     fn string(&mut self) -> Result<String> {
-        let bs = self.bytes()?;
-        String::from_utf8(bs).map_err(|e| SpillError::Format {
-            offset: self.pos,
-            detail: format!("utf8: {e}"),
-        })
+        let n = self.u32()? as usize;
+        let bs = self.need(n)?;
+        simdutf8::compat::from_utf8(bs)
+            .map(str::to_owned)
+            .map_err(|e| SpillError::Format {
+                offset: self.pos,
+                detail: format!("utf8: {e}"),
+            })
     }
 }
 
@@ -2000,7 +2003,10 @@ mod tests {
         let buf = [2u8, 0, 0, 0, 0xFF, 0xFE];
         let mut cur = Cursor::new(&buf);
         let err = cur.string().unwrap_err();
-        assert!(matches!(err, SpillError::Format { .. }));
+        assert_eq!(
+            err.to_string(),
+            "spill format at offset 6: utf8: invalid utf-8 sequence of 1 bytes from index 0"
+        );
     }
 
     #[test]

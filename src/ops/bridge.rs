@@ -1156,7 +1156,9 @@ impl<'a> Cursor<'a> {
 
 /// Shadow is always initdb'd UTF8, and the SQL path constrains the same way
 fn text(b: &[u8]) -> Result<String, BridgeError> {
-    String::from_utf8(b.to_vec()).map_err(|_| BridgeError::Protocol("non-UTF8 payload".to_string()))
+    simdutf8::basic::from_utf8(b)
+        .map(str::to_owned)
+        .map_err(|_| BridgeError::Protocol("non-UTF8 payload".to_string()))
 }
 
 #[cfg(test)]

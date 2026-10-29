@@ -1315,7 +1315,9 @@ impl<'a> Cur<'a> {
     fn string(&mut self) -> Result<String> {
         let n = self.u32()? as usize;
         let bs = self.need(n)?;
-        String::from_utf8(bs.to_vec()).map_err(|e| self.corrupt(format!("utf8: {e}")))
+        simdutf8::compat::from_utf8(bs)
+            .map(str::to_owned)
+            .map_err(|e| self.corrupt(format!("utf8: {e}")))
     }
     fn opt_missing(&mut self) -> Result<Option<MissingDefault>> {
         Ok(match self.u8()? {
