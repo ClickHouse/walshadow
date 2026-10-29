@@ -751,7 +751,7 @@ async fn build_pipeline_inner(
 
     let spill_dir = tmp.path().join("spill");
     fs::create_dir_all(&spill_dir).unwrap();
-    let mut xact_buf_cfg = XactBufferConfig::new(spill_dir.clone());
+    let mut xact_buf_cfg = XactBufferConfig::new(walshadow::fs::scratch_dir(&spill_dir));
     if let Some(max) = knobs.xact_buffer_max {
         xact_buf_cfg.xact_buffer_max = max;
     }

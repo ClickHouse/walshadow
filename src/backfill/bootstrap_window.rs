@@ -193,7 +193,7 @@ impl Leg {
             })
             .map_err(|e| anyhow::anyhow!("bootstrap window leg: xact buffer: {e}"))?,
         ));
-        buffer.lock().await.clear_spill_dir().ok();
+        buffer.lock().await.clear_scratch_dir().ok();
 
         let (filter_rfns, targets) = replay_scope(&cfg.catalog);
         let tail = OwnedTail::spawn(

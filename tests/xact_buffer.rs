@@ -748,7 +748,7 @@ async fn abort_drops_xact_and_unlinks_spill_against_real_shadow() {
     }
     assert!(b.stats().spill_xacts_active >= 1);
     b.abort(11, Pos::new(200), &[]).await.unwrap();
-    let leftover: Vec<_> = std::fs::read_dir(walshadow::fs::scratch_dir(&spill_dir))
+    let leftover: Vec<_> = std::fs::read_dir(&spill_dir)
         .unwrap()
         .filter_map(|e| e.ok())
         .filter(|e| e.file_name().to_string_lossy().starts_with("xid-"))

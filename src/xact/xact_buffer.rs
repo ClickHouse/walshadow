@@ -172,8 +172,8 @@ const CHUNK_REF_META: usize = 64;
 pub struct XactBufferConfig {
     /// In-memory budget across all active xacts before eviction
     pub xact_buffer_max: usize,
-    /// Per-xid spill files land here
-    pub spill_dir: PathBuf,
+    /// Transaction spill, body spool and plan directory, cleared at startup
+    pub scratch_dir: PathBuf,
     /// Per-drain memory-held chunk body budget before body spooling
     pub toast_body_mem_max: usize,
     /// Per-drain chunk/row-ref metadata cap
@@ -185,10 +185,10 @@ pub struct XactBufferConfig {
 }
 
 impl XactBufferConfig {
-    pub fn new(spill_dir: PathBuf) -> Self {
+    pub fn new(scratch_dir: PathBuf) -> Self {
         Self {
             xact_buffer_max: DEFAULT_XACT_BUFFER_MAX,
-            spill_dir,
+            scratch_dir,
             toast_body_mem_max: TOAST_BODY_SPOOL_MEM_MAX,
             toast_index_mem_max: TOAST_INDEX_MEM_MAX,
             drain_batch_rows: crate::emit::ch_emitter::DEFAULT_DRAIN_BATCH_ROWS,
@@ -800,7 +800,7 @@ pub struct XactBuffer {
 
 impl XactBuffer {
     pub fn new(config: XactBufferConfig) -> std::result::Result<Self, XactBufferError> {
-        let store = SpillStore::new(crate::fs::scratch_dir(&config.spill_dir))?;
+        let store = SpillStore::new(config.scratch_dir.clone())?;
         Ok(Self {
             config,
             store,
@@ -869,16 +869,14 @@ impl XactBuffer {
         self
     }
 
-    /// Wipe scratch left by a prior crash. Cursor file guarantees on-disk
-    /// state was either drained-to-CH or replayable from `decoder_lsn`, so
-    /// scratch is always safe to wipe at startup. Caller invokes once before
-    /// any `on_*`.
-    pub fn clear_spill_dir(&self) -> std::result::Result<(), XactBufferError> {
+    /// Clear scratch files at startup. Cursor guarantees data is already
+    /// written to ClickHouse or can be replayed from `decoder_lsn`.
+    /// Call once before any `on_*` method
+    pub fn clear_scratch_dir(&self) -> std::result::Result<(), XactBufferError> {
         Ok(self.store.clear()?)
     }
 
-    /// Scratch directory under spill dir, shared by spill, body spool and
-    /// plan files
+    /// Directory for transaction spill, body spool and plan files
     pub fn scratch_dir(&self) -> &Path {
         self.store.dir()
     }
@@ -4033,11 +4031,10 @@ mod tests {
             b.on_heap(heap_with_value(11, 100 + i, 256)).await.unwrap();
         }
         assert!(b.stats().spill_xacts_active >= 1, "spill must engage");
-        let spill_dir = crate::fs::scratch_dir(tmp.path());
-        let before: Vec<_> = std::fs::read_dir(&spill_dir).unwrap().collect();
+        let before: Vec<_> = std::fs::read_dir(tmp.path()).unwrap().collect();
         assert!(!before.is_empty(), "spill file present");
         b.abort(11, Pos::new(200), &[]).await.unwrap();
-        let after: Vec<_> = std::fs::read_dir(&spill_dir)
+        let after: Vec<_> = std::fs::read_dir(tmp.path())
             .unwrap()
             .filter_map(|e| e.ok())
             .filter(|e| e.file_name().to_string_lossy().starts_with("xid-"))
@@ -4137,7 +4134,7 @@ mod tests {
         for i in 0..3 {
             b.on_heap(heap_with_value(2, 200 + i, 128)).await.unwrap();
         }
-        let by_filename: Vec<String> = std::fs::read_dir(crate::fs::scratch_dir(tmp.path()))
+        let by_filename: Vec<String> = std::fs::read_dir(tmp.path())
             .unwrap()
             .filter_map(|e| e.ok())
             .map(|e| e.file_name().to_string_lossy().into_owned())
@@ -6147,7 +6144,7 @@ mod tests {
     }
 
     fn spill_files(dir: &std::path::Path) -> Vec<String> {
-        std::fs::read_dir(crate::fs::scratch_dir(dir))
+        std::fs::read_dir(dir)
             .unwrap()
             .filter_map(|e| e.ok())
             .map(|e| e.file_name().to_string_lossy().into_owned())
@@ -6406,7 +6403,7 @@ mod tests {
     }
 
     fn toastbody_files(dir: &std::path::Path) -> Vec<String> {
-        std::fs::read_dir(crate::fs::scratch_dir(dir))
+        std::fs::read_dir(dir)
             .unwrap()
             .filter_map(|e| e.ok())
             .map(|e| e.file_name().to_string_lossy().into_owned())

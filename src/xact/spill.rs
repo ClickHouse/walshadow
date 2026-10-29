@@ -378,9 +378,8 @@ impl SpillStore {
         })
     }
 
-    /// Wipe store dir wholesale. Crash-recovery contract: on-disk state is
-    /// always drained-into-CH or replayable from the cursor's `decoder_lsn`,
-    /// so prior-crash leftovers are safe to discard
+    /// Empty store directory. Data is already written to ClickHouse or can
+    /// be replayed from cursor's `decoder_lsn`, so crash leftovers are safe to remove
     pub fn clear(&self) -> Result<()> {
         Ok(crate::fs::reset_dir(&self.dir)?)
     }
