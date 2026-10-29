@@ -64,6 +64,7 @@
 //! can key on it.
 
 use std::borrow::Cow;
+use std::string::FromUtf8Error;
 use std::sync::Arc;
 
 use smallvec::{SmallVec, smallvec};
@@ -1333,11 +1334,21 @@ fn decode_varlena(
 pub(crate) fn varlena_to_value(type_oid: u32, body: Cow<[u8]>) -> ColumnValue {
     match type_oid {
         BYTEAOID => ColumnValue::Bytea(body.into_owned()),
-        TEXTOID | VARCHAROID | BPCHAROID => match String::from_utf8(body.into_owned()) {
-            Ok(s) => ColumnValue::Text(s),
+        TEXTOID | VARCHAROID | BPCHAROID | JSONOID => {
+            // Owned arm keeps detoasted buffer rather than copy it
+            let text = match body {
+                Cow::Borrowed(b) => simdutf8::basic::from_utf8(b)
+                    .map(str::to_owned)
+                    .map_err(|_| b.to_vec()),
+                Cow::Owned(v) => String::from_utf8(v).map_err(FromUtf8Error::into_bytes),
+            };
             // PG validates UTF-8 on input; surface bytea not crash if ever invalid
-            Err(e) => ColumnValue::Bytea(e.into_bytes()),
-        },
+            match text {
+                Ok(s) if type_oid == JSONOID => ColumnValue::Json(s),
+                Ok(s) => ColumnValue::Text(s),
+                Err(b) => ColumnValue::Bytea(b),
+            }
+        }
         NUMERICOID => match crate::decode::codecs::decode_numeric(&body) {
             Ok(v) => ColumnValue::Numeric(v),
             Err(_) => ColumnValue::Unsupported {
@@ -1351,10 +1362,6 @@ pub(crate) fn varlena_to_value(type_oid: u32, body: Cow<[u8]>) -> ColumnValue {
                 type_oid,
                 raw: body.into_owned(),
             },
-        },
-        JSONOID => match String::from_utf8(body.into_owned()) {
-            Ok(s) => ColumnValue::Json(s),
-            Err(e) => ColumnValue::Bytea(e.into_bytes()),
         },
         JSONBOID => match crate::decode::codecs::decode_jsonb(&body) {
             Ok(s) => ColumnValue::Json(s),
@@ -1426,7 +1433,7 @@ fn decode_cstring(buf: &[u8], abs: usize) -> Result<(ColumnValue, usize), Decode
         });
     }
     let body = &buf[abs..end];
-    let value = std::str::from_utf8(body)
+    let value = simdutf8::basic::from_utf8(body)
         .map(|s| ColumnValue::Text(s.to_owned()))
         .unwrap_or_else(|_| ColumnValue::Bytea(body.to_vec()));
     Ok((value, (end - abs) + 1)) // include trailing NUL
@@ -1663,6 +1670,45 @@ mod tests {
             }],
             main_data: std::borrow::Cow::Owned(main_data),
             ..Default::default()
+        }
+    }
+
+    #[test]
+    fn varlena_text_preserves_bytes_and_owned_buffers() {
+        let suffixes: &[&[u8]] = &[
+            b"",
+            "é😀".as_bytes(),
+            &[0xff],
+            &[0xc0, 0xaf],
+            &[0xed, 0xa0, 0x80],
+            &[0xf0, 0x9f, 0x98],
+        ];
+        for type_oid in [TEXTOID, VARCHAROID, BPCHAROID, JSONOID] {
+            for prefix in [0, 63, 64, 65, 127, 128, 129] {
+                for suffix in suffixes {
+                    let mut raw = vec![b'a'; prefix];
+                    raw.extend_from_slice(suffix);
+                    let expected = match String::from_utf8(raw.clone()) {
+                        Ok(s) if type_oid == JSONOID => ColumnValue::Json(s),
+                        Ok(s) => ColumnValue::Text(s),
+                        Err(_) => ColumnValue::Bytea(raw.clone()),
+                    };
+                    for body in [Cow::Borrowed(raw.as_slice()), Cow::Owned(raw.clone())] {
+                        let owned = matches!(body, Cow::Owned(_));
+                        let ptr = body.as_ptr();
+                        let value = varlena_to_value(type_oid, body);
+                        assert_eq!(value, expected);
+                        if owned {
+                            let result_ptr = match &value {
+                                ColumnValue::Text(s) | ColumnValue::Json(s) => s.as_ptr(),
+                                ColumnValue::Bytea(b) => b.as_ptr(),
+                                _ => unreachable!(),
+                            };
+                            assert_eq!(result_ptr, ptr);
+                        }
+                    }
+                }
+            }
         }
     }
 

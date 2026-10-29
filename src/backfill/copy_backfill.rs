@@ -682,7 +682,8 @@ fn fixed<const N: usize>(raw: &[u8], what: &str) -> Result<[u8; N], String> {
 }
 
 fn text_or_bytea(raw: &[u8], wrap: fn(String) -> ColumnValue) -> ColumnValue {
-    std::str::from_utf8(raw).map_or_else(|_| ColumnValue::Bytea(raw.to_vec()), |s| wrap(s.into()))
+    simdutf8::basic::from_utf8(raw)
+        .map_or_else(|_| ColumnValue::Bytea(raw.to_vec()), |s| wrap(s.into()))
 }
 
 /// Decode non-NULL wire field into heap-decoder value shape
@@ -706,7 +707,7 @@ fn decode_field(kind: WireKind, type_oid: u32, raw: &[u8]) -> Result<ColumnValue
         WireKind::Bytea => ColumnValue::Bytea(raw.to_vec()),
         WireKind::Text => text_or_bytea(raw, ColumnValue::Text),
         // Preserve source type for typinput
-        WireKind::CastText => match std::str::from_utf8(raw) {
+        WireKind::CastText => match simdutf8::basic::from_utf8(raw) {
             Ok(s) => ColumnValue::PgPendingText {
                 type_oid,
                 text: s.to_owned(),
@@ -717,7 +718,8 @@ fn decode_field(kind: WireKind, type_oid: u32, raw: &[u8]) -> Result<ColumnValue
         WireKind::Json => text_or_bytea(raw, ColumnValue::Json),
         // numeric_out text form; specials carry their flag
         WireKind::NumericText => {
-            let s = std::str::from_utf8(raw).map_err(|_| "numeric::text not utf8".to_string())?;
+            let s = simdutf8::basic::from_utf8(raw)
+                .map_err(|_| "numeric::text not utf8".to_string())?;
             ColumnValue::Numeric(match s {
                 "NaN" => NumericKind::NaN,
                 "Infinity" => NumericKind::PInf,

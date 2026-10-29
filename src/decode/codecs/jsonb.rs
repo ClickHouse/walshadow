@@ -10,6 +10,9 @@
 //! Only the root may carry `JB_FSCALAR`, PG's shape for a bare scalar: a
 //! one-element array printed without its brackets.
 
+use fearless_simd::{Level, dispatch, prelude::*};
+use fearless_simd_macros::simd;
+
 use super::{
     CodecError,
     numeric::{numeric_text_len, render_numeric_text},
@@ -84,23 +87,73 @@ impl Out for TextLen {
         Ok(())
     }
 
-    /// Counts in passes that vectorize, most strings escape nothing
+    #[inline(always)]
     fn string(&mut self, raw: &[u8]) -> Result<(), CodecError> {
-        let escaped = raw
-            .iter()
-            .filter(|&&b| b < b' ' || b == b'"' || b == b'\\')
-            .count();
-        let wide = if escaped == 0 {
-            0
-        } else {
-            raw.iter()
-                .filter(|&&b| b < b' ' && !matches!(b, 0x8 | 0xc | b'\n' | b'\r' | b'\t'))
-                .count()
-        };
         // Quotes, then one extra byte per escape and four more per `\u00XX`
-        self.0 += 2 + raw.len() + escaped + 4 * wide;
-        Ok(())
+        self.0 += 2 + raw.len();
+        for_each_escape_block(raw, |_, escaped, wide| {
+            self.0 += (escaped.count_ones() + 4 * wide.count_ones()) as usize;
+            Ok(())
+        })
     }
+}
+
+/// Visits `raw` a vector at a time as (offset, escaped, wide), bit per byte:
+/// `escaped` marks bytes `escape_json_char` rewrites, `wide` those taking
+/// `\u00XX`
+fn for_each_escape_block(
+    raw: &[u8],
+    visit: impl FnMut(usize, u64, u64) -> Result<(), CodecError>,
+) -> Result<(), CodecError> {
+    dispatch!(Level::new(), simd => escape_blocks(simd, raw, visit))
+}
+
+#[simd]
+fn escape_blocks<S: Simd>(
+    simd: S,
+    raw: &[u8],
+    mut visit: impl FnMut(usize, u64, u64) -> Result<(), CodecError>,
+) -> Result<(), CodecError> {
+    let len = S::u8s::LEN;
+    let Some(last) = raw.len().checked_sub(len) else {
+        let (mut escaped, mut wide) = (0, 0);
+        for (i, &b) in raw.iter().enumerate() {
+            escaped |= u64::from(b < b' ' || b == b'"' || b == b'\\') << i;
+            wide |= u64::from(b < b' ' && !matches!(b, 0x8 | 0xc | b'\n' | b'\r' | b'\t')) << i;
+        }
+        return visit(0, escaped, wide);
+    };
+    let mut blocks = raw.chunks_exact(len);
+    for (index, block) in blocks.by_ref().enumerate() {
+        let (escaped, wide) = escape_masks(simd, block);
+        visit(index * len, escaped, wide)?;
+    }
+    let rest = blocks.remainder().len();
+    if rest > 0 {
+        // last vector overlaps blocks already visited, drop their lanes
+        let (escaped, wide) = escape_masks(simd, &raw[last..]);
+        visit(
+            raw.len() - rest,
+            escaped >> (len - rest),
+            wide >> (len - rest),
+        )?;
+    }
+    Ok(())
+}
+
+#[inline(always)]
+fn escape_masks<S: Simd>(simd: S, block: &[u8]) -> (u64, u64) {
+    let bytes = S::u8s::from_slice(simd, block);
+    let control = bytes.simd_lt(b' ');
+    let escaped = control | bytes.simd_eq(b'"') | bytes.simd_eq(b'\\');
+    let wide = if control.any_true() {
+        // \b \t \n \f \r: 0x8..=0xd less vertical tab
+        let short = (bytes - 0x8).simd_lt(6) & !bytes.simd_eq(0xb);
+        (control & !short).to_bitmask()
+    } else {
+        0
+    };
+    (escaped.to_bitmask(), wide)
 }
 
 #[derive(Clone, Copy)]
@@ -272,33 +325,39 @@ fn render_jsonb_value(
 /// newline, carriage return, tab, quote and backslash, `\uXXXX` for the rest
 /// below `0x20`, every other byte verbatim
 fn render_jsonb_string(raw: &[u8], out: &mut impl Out) -> Result<(), CodecError> {
-    let s =
-        std::str::from_utf8(raw).map_err(|_| CodecError::BadJsonbContainer("string not utf8"))?;
+    let s = simdutf8::basic::from_utf8(raw)
+        .map_err(|_| CodecError::BadJsonbContainer("string not utf8"))?;
     out.push_str("\"")?;
     // escapes are ASCII, so each run between them is a char-boundary slice
     let mut run = 0;
-    for (i, b) in s.bytes().enumerate() {
-        if b >= b' ' && b != b'"' && b != b'\\' {
-            continue;
-        }
-        out.push_str(&s[run..i])?;
-        run = i + 1;
-        match b {
-            0x8 => out.push_str("\\b")?,
-            0xc => out.push_str("\\f")?,
-            b'\n' => out.push_str("\\n")?,
-            b'\r' => out.push_str("\\r")?,
-            b'\t' => out.push_str("\\t")?,
-            b'"' => out.push_str("\\\"")?,
-            b'\\' => out.push_str("\\\\")?,
-            // control byte below 0x20, so one nibble of it is already known
-            _ => {
-                let hex = (b & 0xf) as usize;
-                out.push_str(if b < 0x10 { "\\u000" } else { "\\u001" })?;
-                out.push_str(&"0123456789abcdef"[hex..=hex])?;
+    for_each_escape_block(
+        raw,
+        #[inline(always)]
+        |offset, mut escaped, _| {
+            while escaped != 0 {
+                let i = offset + escaped.trailing_zeros() as usize;
+                escaped &= escaped - 1;
+                out.push_str(&s[run..i])?;
+                run = i + 1;
+                match raw[i] {
+                    0x8 => out.push_str("\\b")?,
+                    0xc => out.push_str("\\f")?,
+                    b'\n' => out.push_str("\\n")?,
+                    b'\r' => out.push_str("\\r")?,
+                    b'\t' => out.push_str("\\t")?,
+                    b'"' => out.push_str("\\\"")?,
+                    b'\\' => out.push_str("\\\\")?,
+                    // control byte below 0x20, so one nibble of it is already known
+                    b => {
+                        let hex = (b & 0xf) as usize;
+                        out.push_str(if b < 0x10 { "\\u000" } else { "\\u001" })?;
+                        out.push_str(&"0123456789abcdef"[hex..=hex])?;
+                    }
+                }
             }
-        }
-    }
+            Ok(())
+        },
+    )?;
     out.push_str(&s[run..])?;
     out.push_str("\"")
 }
@@ -410,6 +469,94 @@ mod tests {
         body.extend_from_slice(&0x0000_0003u32.to_le_bytes());
         body.extend_from_slice(b"abc");
         assert_eq!(decode_jsonb(&body).unwrap(), r#""abc""#);
+    }
+
+    #[test]
+    fn jsonb_strings_match_json_across_vector_boundaries() {
+        for offset in 0..64 {
+            for len in [0, 1, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129, 255] {
+                let text: String = (0..=127)
+                    .map(char::from)
+                    .chain("é中😀".chars())
+                    .cycle()
+                    .skip(offset)
+                    .take(len)
+                    .collect();
+                let raw = text.as_bytes();
+                let expected = serde_json::to_string(&text).unwrap();
+                let mut out = String::new();
+                render_jsonb_string(raw, &mut out).unwrap();
+                assert_eq!(out, expected, "offset={offset} len={len}");
+                let mut size = TextLen(0);
+                size.string(raw).unwrap();
+                assert_eq!(size.0, out.len(), "offset={offset} len={len}");
+            }
+        }
+        for offset in [15, 31, 63, 127] {
+            let mut raw = vec![b'x'; 256];
+            raw[offset] = 0xff;
+            assert_eq!(
+                render_jsonb_string(&raw, &mut String::new()),
+                Err(CodecError::BadJsonbContainer("string not utf8"))
+            );
+        }
+    }
+
+    fn check_simd<S: Simd>(simd: S) {
+        let bytes: Vec<u8> = (0..=255).cycle().take(512).collect();
+        for offset in 0..64 {
+            for len in 0..=129 {
+                let raw = &bytes[offset..offset + len];
+                let expected: Vec<_> = raw
+                    .iter()
+                    .enumerate()
+                    .filter(|&(_, &b)| b < b' ' || b == b'"' || b == b'\\')
+                    .map(|(i, &b)| {
+                        (
+                            i,
+                            b < b' ' && !matches!(b, 0x8 | 0xc | b'\n' | b'\r' | b'\t'),
+                        )
+                    })
+                    .collect();
+                let mut found = Vec::new();
+                escape_blocks(simd, raw, |offset, escaped, wide| {
+                    for lane in (0..64).filter(|lane| escaped >> lane & 1 != 0) {
+                        found.push((offset + lane, wide >> lane & 1 != 0));
+                    }
+                    Ok(())
+                })
+                .unwrap();
+                assert_eq!(found, expected, "offset={offset} len={len}");
+            }
+        }
+        let mut calls = 0;
+        assert_eq!(
+            escape_blocks(simd, &[b'"'; 256], |_, _, _| {
+                calls += 1;
+                Err(CodecError::BadJsonbContainer("stop"))
+            }),
+            Err(CodecError::BadJsonbContainer("stop"))
+        );
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn jsonb_escape_masks_match_scalar_on_supported_backends() {
+        dispatch!(Level::baseline(), simd => check_simd(simd));
+        let level = Level::new();
+        dispatch!(level, simd => check_simd(simd));
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        {
+            if let Some(simd) = level.as_sse4_2() {
+                check_simd(simd);
+            }
+            if let Some(simd) = level.as_avx2() {
+                check_simd(simd);
+            }
+            if let Some(simd) = level.as_avx512() {
+                check_simd(simd);
+            }
+        }
     }
 
     #[test]

@@ -47,7 +47,7 @@ unexpected_cfgs = { level = "warn", check-cfg = ["cfg(coverage)"] }
 unused_async = "warn"
 
 [dependencies]
-wal-rus = "0.4"
+wal-rus = "0.4.1"
 clickhouse-c-rs = { version = "0.2.2", default-features = false, features = ["tokio", "tls"] }
 # hash keys are internal (relfilenodes, oids, xids, names), never network
 # input, so SipHash's HashDoS margin buys nothing at 2-4x per probe
@@ -61,6 +61,8 @@ bytes = "1"
 clap = { version = "4", features = ["derive", "env"] }
 crc32c = "0.6"
 fallible-iterator = "0.2"
+fearless_simd = "1.2"
+fearless_simd_macros = "0.1"
 futures = "0.3"
 libc = "0.2"
 lz4 = "1"
@@ -69,9 +71,10 @@ percent-encoding = "2"
 postgres-protocol = "0.6"
 globset = "0.4"
 regex-automata = "0.4"
-roaring = "0.11"
+roaring = "0.12"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+simdutf8 = "0.1"
 smallvec = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "net", "fs", "sync", "signal", "io-util"] }
@@ -107,6 +110,10 @@ harness = false
 
 [[bench]]
 name = "spool_read"
+harness = false
+
+[[bench]]
+name = "jsonb"
 harness = false
 
 [dev-dependencies]
