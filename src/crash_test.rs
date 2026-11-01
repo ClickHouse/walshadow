@@ -1,6 +1,6 @@
 //! Process crash injection for daemon integration tests.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -16,6 +16,7 @@ pub enum Point {
     AfterDdl,
     AfterAck,
     AfterManifest,
+    BootstrapHandoff,
 }
 
 #[cfg(coverage)]
@@ -40,16 +41,32 @@ pub fn hit(point: Point, lsn: u64) {
         return;
     }
     let path = arm().expect("capture stored commit without arm");
-    if std::fs::read_to_string(path).is_ok_and(|armed| armed == format!("{point:?}")) {
-        std::fs::write(path.with_extension("hit"), commit.to_string())
-            .expect("record crash boundary");
-        // SIGKILL skips atexit, where llvm-cov would otherwise dump counters
-        #[cfg(coverage)]
-        unsafe {
-            __llvm_profile_write_file()
-        };
-        // SIGKILL prevents unwinding, shutdown drains, and final manifest writes.
-        unsafe { libc::raise(libc::SIGKILL) };
-        unreachable!("SIGKILL returned");
+    if armed_at(path, &point) {
+        crash(path, commit);
     }
+}
+
+/// Inject crash without a commit LSN, such as after bootstrap
+pub fn hit_now(point: Point) {
+    if let Some(path) = arm()
+        && armed_at(path, &point)
+    {
+        crash(path, 0);
+    }
+}
+
+fn armed_at(path: &Path, point: &Point) -> bool {
+    std::fs::read_to_string(path).is_ok_and(|armed| armed == format!("{point:?}"))
+}
+
+fn crash(path: &Path, commit: u64) -> ! {
+    std::fs::write(path.with_extension("hit"), commit.to_string()).expect("record crash boundary");
+    // SIGKILL skips atexit, where llvm-cov would otherwise dump counters
+    #[cfg(coverage)]
+    unsafe {
+        __llvm_profile_write_file()
+    };
+    // SIGKILL prevents unwinding, shutdown drains, and final manifest writes.
+    unsafe { libc::raise(libc::SIGKILL) };
+    unreachable!("SIGKILL returned");
 }
