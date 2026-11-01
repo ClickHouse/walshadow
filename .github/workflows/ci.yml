@@ -141,7 +141,7 @@ jobs:
       - name: Install PostgreSQL ${{ matrix.pg-major }} (PGDG)
         run: |
           sudo systemctl stop postgresql 2>/dev/null || true
-          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+          curl -fsSL --retry 5 --retry-all-errors https://www.postgresql.org/media/keys/ACCC4CF8.asc \
             | sudo gpg --dearmor -o /usr/share/keyrings/postgres-archive-keyring.gpg
           echo "deb [signed-by=/usr/share/keyrings/postgres-archive-keyring.gpg] https://apt.postgresql.org/pub/repos/apt/ $(lsb_release -cs)-pgdg main ${{ matrix.pg-major }}" \
             | sudo tee /etc/apt/sources.list.d/pgdg.list
@@ -163,7 +163,7 @@ jobs:
       - name: Install ClickHouse (server + client)
         run: |
           sudo apt-get install -y apt-transport-https ca-certificates
-          curl -fsSL https://packages.clickhouse.com/rpm/lts/repodata/repomd.xml.key \
+          curl -fsSL --retry 5 --retry-all-errors https://packages.clickhouse.com/rpm/lts/repodata/repomd.xml.key \
             | sudo gpg --dearmor -o /usr/share/keyrings/clickhouse-keyring.gpg
           echo "deb [signed-by=/usr/share/keyrings/clickhouse-keyring.gpg] https://packages.clickhouse.com/deb stable main" \
             | sudo tee /etc/apt/sources.list.d/clickhouse.list

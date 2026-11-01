@@ -1137,16 +1137,18 @@ pub(crate) async fn run_bootstrap(
             .context(format!("bootstrap: chmod 0700 {dir}"))?;
     }
 
-    BootstrapMarker::complete(&shadow_data_dir, recorded).await?;
+    let handoff = bootstrap_marker::Handoff {
+        end_lsn: outcome.end.end_lsn,
+        timeline: outcome.start.timeline,
+        open_floor,
+    };
+    BootstrapMarker::hand_off(&shadow_data_dir, handoff, recorded).await?;
+    #[cfg(feature = "test-support")]
+    walshadow::crash_test::hit_now(walshadow::crash_test::Point::BootstrapHandoff);
 
     timing.finish();
     Ok((
-        BootstrapHandoff {
-            end_lsn: outcome.end.end_lsn,
-            timeline: outcome.start.timeline,
-            open_floor,
-            shadow: running_shadow,
-        },
+        BootstrapHandoff::new(handoff, running_shadow),
         BootstrapMetrics {
             progress,
             oracle: oracle_stats,
@@ -1185,6 +1187,15 @@ pub(crate) struct BootstrapHandoff {
 }
 
 impl BootstrapHandoff {
+    pub(crate) fn new(handoff: bootstrap_marker::Handoff, shadow: Option<OwnedShadow>) -> Self {
+        Self {
+            end_lsn: handoff.end_lsn,
+            timeline: handoff.timeline,
+            open_floor: handoff.open_floor,
+            shadow,
+        }
+    }
+
     /// Source or archive must retain crossing transaction records
     pub(crate) fn resume_lsn(&self) -> u64 {
         self.open_floor.unwrap_or(self.end_lsn).min(self.end_lsn)
@@ -1256,6 +1267,8 @@ pub(crate) async fn bootstrap_build_mapping(
 pub(crate) enum ShadowStart {
     Bootstrap(PathBuf),
     Rebootstrap(PathBuf, BootstrapMarker),
+    /// Load finished, streaming never persisted its resume state
+    Handoff(PathBuf, bootstrap_marker::Handoff),
     Resume(PathBuf),
 }
 
@@ -1266,7 +1279,10 @@ impl ShadowStart {
 
     pub(crate) fn data_dir(&self) -> &Path {
         match self {
-            Self::Bootstrap(d) | Self::Rebootstrap(d, _) | Self::Resume(d) => d,
+            Self::Bootstrap(d)
+            | Self::Rebootstrap(d, _)
+            | Self::Handoff(d, _)
+            | Self::Resume(d) => d,
         }
     }
 }
@@ -1284,6 +1300,15 @@ pub(crate) fn resolve_shadow_start(args: &Args, mode: BootstrapMode) -> Result<S
             dir.display(),
             other.display(),
         );
+    }
+    if let Some(handoff) = bootstrap_marker::handed_off(dir)? {
+        tracing::info!(
+            target: "walshadow::bootstrap",
+            data_dir = %dir.display(),
+            end_lsn = %format_pg_lsn(handoff.end_lsn),
+            "resuming streaming after bootstrap",
+        );
+        return Ok(ShadowStart::Handoff(dir.clone(), handoff));
     }
     if let Some(marker) = bootstrap_marker::pending_attempt(dir, mode)? {
         return Ok(ShadowStart::Rebootstrap(dir.clone(), marker));
