@@ -18,6 +18,7 @@ use crate::backfill::backup_page_walk::{BOOTSTRAP_TUPLE_CHANNEL_CAP, BackfillTup
 use crate::backfill::bootstrap_marker::SpooledRecords;
 use crate::backfill::spool::{DEFERRED_SPOOL_MEM_MAX, DeferredSpool};
 use crate::backfill::visibility_pending::{PendingManifest, PendingSpool};
+use crate::backfill::wal_replay::WindowRewrites;
 use crate::backfill::walk_barrier::{WALK_CHECKPOINT_PERIOD, WalkBarrier};
 use crate::config::ResolvedConfig;
 use crate::decode::visibility::{
@@ -262,6 +263,7 @@ pub struct GreenfieldSink {
     /// Holds each lane's deferred-referrer spool
     pub scratch_dir: PathBuf,
     pub inherit_spools: Vec<SpooledRecords>,
+    pub rewrites: Arc<WindowRewrites>,
 }
 
 pub struct DrainLanes {
@@ -330,6 +332,7 @@ impl GreenfieldSink {
             let resolver = self.resolver.clone();
             let config = self.config.clone();
             let row_policy = self.dest.current().row_policy();
+            let rewrites = self.rewrites.clone();
             async move {
                 bootstrap::drain_deferred(
                     lane.spool.into(),
@@ -343,6 +346,7 @@ impl GreenfieldSink {
                     Some(&config),
                     lane.first_seq,
                     None,
+                    Some(&rewrites),
                 )
                 .await
             }
@@ -718,6 +722,7 @@ mod tests {
             skip_initial: HashSet::new(),
             scratch_dir: tmp.path().to_path_buf(),
             inherit_spools: Vec::new(),
+            rewrites: Default::default(),
         };
         let (ack, ack_task) = crate::emit::pipeline::ack::spawn(
             Arc::new(Default::default()),
@@ -786,6 +791,7 @@ mod tests {
             skip_initial: HashSet::new(),
             scratch_dir: tmp.path().to_path_buf(),
             inherit_spools: Vec::new(),
+            rewrites: Default::default(),
         };
 
         let row = |id| BackfillTuple {
@@ -1133,6 +1139,7 @@ mod tests {
                 resolver: ToastResolver::disabled(),
                 skip_initial: HashSet::new(),
                 inherit_spools: Vec::new(),
+                rewrites: Default::default(),
                 scratch_dir: std::env::temp_dir(),
             },
             oracle: None,

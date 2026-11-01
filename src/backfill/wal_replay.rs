@@ -10,12 +10,14 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use tokio::sync::{Mutex, mpsc};
 use walrus::pg::wal::segment::SegmentName;
-use walrus::pg::walparser::{Oid, RmId};
+use walrus::pg::walparser::{Oid, RelFileNode, RmId};
 
 use crate::budget::{MemoryBudget, MemoryPermit, acquire_opt};
 use crate::catalog::desc_log::{DescriptorLog, DescriptorLogs};
 use crate::config::ResolvedConfig;
-use crate::decode::heap_decoder::{CommittedTuple, take_key_change_tombstone};
+use crate::decode::heap_decoder::{
+    ColumnValue, CommittedTuple, DecodedHeap, take_key_change_tombstone,
+};
 use crate::decode::visibility::PgXactPatch;
 use crate::decode::wal_xact::{
     XLOG_XACT_ABORT, XLOG_XACT_ABORT_PREPARED, XLOG_XACT_ASSIGNMENT, XLOG_XACT_COMMIT,
@@ -65,6 +67,69 @@ pub struct WalReplayInputs {
     pub next_seq: u64,
     /// Commit/abort overlay for walked-tuple visibility
     pub patch: Option<Arc<std::sync::Mutex<PgXactPatch>>>,
+    pub rewrites: Option<Arc<WindowRewrites>>,
+}
+
+/// Track replayed row versions with external values by relation, transaction,
+/// and replica identity key. Matching backup rows can be skipped if their values
+/// cannot be reassembled
+#[derive(Debug, Default)]
+pub struct WindowRewrites(std::sync::Mutex<HashSet<(Oid, Oid, u32, String)>>);
+
+impl WindowRewrites {
+    pub(crate) fn record(&self, rel: &RelDescriptor, heap: &DecodedHeap) {
+        let Some(new) = &heap.new else {
+            return;
+        };
+        if let Some(key) = identity_key(rel, &new.columns) {
+            self.0.lock().expect("window rewrites").insert((
+                heap.rfn.db_node,
+                heap.rfn.rel_node,
+                heap.xid,
+                key,
+            ));
+        }
+    }
+
+    /// Discard records from failed replay; rows may not have reached destination
+    pub fn clear(&self) {
+        self.0.lock().expect("window rewrites").clear();
+    }
+
+    pub fn rewrote(
+        &self,
+        rel: &RelDescriptor,
+        rfn: RelFileNode,
+        xmin: u32,
+        columns: &[Option<ColumnValue>],
+    ) -> bool {
+        identity_key(rel, columns).is_some_and(|key| {
+            self.0.lock().expect("window rewrites").contains(&(
+                rfn.db_node,
+                rfn.rel_node,
+                xmin,
+                key,
+            ))
+        })
+    }
+}
+
+fn identity_key(rel: &RelDescriptor, columns: &[Option<ColumnValue>]) -> Option<String> {
+    let keys = crate::schema::replident_key_attnums(rel);
+    if keys.is_empty() {
+        return None;
+    }
+    let mut key = String::new();
+    for &attnum in keys {
+        match columns.get(usize::try_from(attnum).ok()?.checked_sub(1)?)? {
+            None | Some(ColumnValue::ExternalToast(_)) => return None,
+            Some(v) => {
+                use std::fmt::Write;
+                write!(key, "{v:?}\0").expect("write to String");
+            }
+        }
+    }
+    Some(key)
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -116,6 +181,7 @@ pub struct WalReplaySink {
     /// held batch never withholds bytes a drain admit waits on
     pending_cap: usize,
     replay: ReplayStats,
+    rewrites: Option<Arc<WindowRewrites>>,
 }
 
 fn tail_closed(_: BatcherClosed) -> SinkError {
@@ -161,6 +227,7 @@ impl WalReplaySink {
             pending_permits: Vec::new(),
             pending_cap,
             replay: ReplayStats::default(),
+            rewrites: inputs.rewrites,
         }
     }
 
@@ -474,6 +541,9 @@ impl WalReplaySink {
                     // store-bound pointers would hold pending leaf permits
                     // across that acquire, which can wait on them
                     if heap_reads_toast(&heap) {
+                        if let Some(rewrites) = &self.rewrites {
+                            rewrites.record(&rel, &heap.decoded);
+                        }
                         self.flush_rows().await?;
                     }
                     let value_permit = detoast_heap(&mut heap, spool, &ref_maps, &self.resolver)
@@ -975,6 +1045,7 @@ mod tests {
             ack,
             next_seq: 0,
             patch: None,
+            rewrites: None,
         })
     }
 
@@ -1044,6 +1115,7 @@ mod tests {
             ack,
             next_seq: 0,
             patch,
+            rewrites: None,
         });
         (sink, buffer, msg_rx)
     }

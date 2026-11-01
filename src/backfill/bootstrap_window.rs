@@ -16,7 +16,8 @@ use walrus::pg::walparser::Oid;
 
 use crate::backfill::backup_page_walk::CatalogMap;
 use crate::backfill::wal_replay::{
-    DropSegments, ReplayStats, ReplayTargets, WalReplayInputs, WalReplaySink, pump_segments_through,
+    DropSegments, ReplayStats, ReplayTargets, WalReplayInputs, WalReplaySink, WindowRewrites,
+    pump_segments_through,
 };
 use crate::catalog::desc_log::{BatchRecord, DescLogIdentity, DescriptorLog, LogEntry, LogValue};
 use crate::config::ResolvedConfig;
@@ -60,6 +61,7 @@ pub struct WindowLegConfig {
     pub system_id: String,
     pub timeline: u32,
     pub wind_down: Duration,
+    pub rewrites: Arc<WindowRewrites>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -228,6 +230,7 @@ impl Leg {
             ack: tail.ack.clone(),
             next_seq: 0,
             patch: Some(cfg.patch.clone()),
+            rewrites: Some(cfg.rewrites.clone()),
         });
         Ok(Self { sink, tail, db_oid })
     }

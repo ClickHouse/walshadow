@@ -344,6 +344,8 @@ snapshot! {
         "Chunk rows mirrored from restored page images during a backup window; non-zero means the backup copied TOAST pages mid-write.",
     counter toast_values_filled_superseded_total: u64 =
         "Store-mode values filled after their history merge-collapsed.",
+    counter toast_baseline_rows_superseded_total: u64 =
+        "Backup rows skipped after value reassembly failed and backup-window replay wrote matching row versions.",
     counter toast_values_filled_mismatch_total: u64 =
         "Store-mode values filled off a dense-but-short store run (partial collapse or generation mixing).",
     counter toast_values_filled_generation_total: u64 =

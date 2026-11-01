@@ -114,6 +114,7 @@ async fn partial_transaction_failure_returns_from_live_and_archived_replay() {
     let emitter = emitter(ports.ch_tcp);
     let cfg = WindowLegConfig {
         wind_down: Duration::from_secs(5),
+        rewrites: Default::default(),
         mapping: walshadow::mapping::mapping_handle(emitter.tables.clone()),
         dest: walshadow::config::DestEmitter::new(Arc::new(emitter), None),
         config: Arc::new(ResolvedConfig::default()),
@@ -241,6 +242,7 @@ async fn leg_reads_through_end_lsn_inside_its_first_segment() {
         let patch = Arc::new(std::sync::Mutex::new(PgXactPatch::new()));
         let cfg = WindowLegConfig {
             wind_down: Duration::from_secs(5),
+            rewrites: Default::default(),
             dest: walshadow::config::DestEmitter::new(Arc::new(emitter(slot.ch_tcp)), None),
             mapping: walshadow::mapping::mapping_handle(emitter(slot.ch_tcp).tables),
             config: Arc::new(ResolvedConfig::default()),

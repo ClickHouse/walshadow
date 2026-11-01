@@ -17,6 +17,18 @@ pub struct BootstrapMarker {
     pub attempts: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backup_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff: Option<Handoff>,
+}
+
+/// Keep bootstrap position until streaming saves its manifest and descriptor log
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Handoff {
+    pub end_lsn: u64,
+    pub timeline: u32,
+    /// Earliest record among transactions open at window seal
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open_floor: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -109,10 +121,21 @@ impl BootstrapMarker {
             .context("persist bootstrap marker")
     }
 
-    /// End the attempt. Pending rows already in ClickHouse must be recorded
-    /// first, so a restart can still publish them
-    pub async fn complete(dir: &Path, _: PendingRecorded) -> Result<()> {
-        ExtractedCheckpoint::clear(dir).await?;
+    /// Record pending rows first so restart can publish them.
+    /// Keep marker until streaming saves its resume state
+    pub async fn hand_off(dir: &Path, handoff: Handoff, _: PendingRecorded) -> Result<()> {
+        let marker = Self::read(dir)?.context("bootstrap marker vanished before handoff")?;
+        Self {
+            handoff: Some(handoff),
+            ..marker
+        }
+        .write(dir)
+        .await?;
+        ExtractedCheckpoint::clear(dir).await
+    }
+
+    /// Clear marker after streaming saves its manifest and descriptor log
+    pub async fn complete(dir: &Path) -> Result<()> {
         Self::clear(dir).await
     }
 
@@ -129,6 +152,7 @@ impl BootstrapMarker {
         Self {
             attempts: self.attempts + 1,
             backup_name: self.backup_name.clone(),
+            handoff: None,
         }
     }
 
@@ -152,8 +176,12 @@ impl BootstrapMarker {
     }
 }
 
+pub fn handed_off(dir: &Path) -> Result<Option<Handoff>> {
+    Ok(BootstrapMarker::read(dir)?.and_then(|m| m.handoff))
+}
+
 pub fn pending_attempt(dir: &Path, mode: BootstrapMode) -> Result<Option<BootstrapMarker>> {
-    let Some(marker) = BootstrapMarker::read(dir)? else {
+    let Some(marker) = BootstrapMarker::read(dir)?.filter(|m| m.handoff.is_none()) else {
         return Ok(None);
     };
     anyhow::ensure!(
@@ -271,6 +299,7 @@ async fn first_attempt(data_dir: &Path, pin: Option<String>) -> Result<Bootstrap
     let marker = BootstrapMarker {
         attempts: 1,
         backup_name: pin,
+        handoff: None,
     };
     marker.write(data_dir).await?;
     Ok(marker)
@@ -309,6 +338,7 @@ mod tests {
         BootstrapMarker {
             attempts,
             backup_name: Some("base_original".into()),
+            handoff: None,
         }
     }
 
@@ -323,6 +353,44 @@ mod tests {
         assert_eq!(BootstrapMarker::read(dir).unwrap(), Some(pinned(2)));
         BootstrapMarker::clear(dir).await.unwrap();
         assert_eq!(BootstrapMarker::read(dir).unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn handoff_outlives_the_attempt_until_streaming_completes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        pinned(2).write(dir).await.unwrap();
+        ExtractedCheckpoint {
+            backup_name: "base_original".into(),
+            start_lsn: 0x100,
+            end_lsn: 0x200,
+            timeline: 1,
+            deferred_spools: Vec::new(),
+            handback_spools: Vec::new(),
+        }
+        .write(dir)
+        .await
+        .unwrap();
+        let handoff = Handoff {
+            end_lsn: 0x200,
+            timeline: 1,
+            open_floor: Some(0x180),
+        };
+        BootstrapMarker::hand_off(dir, handoff, PendingRecorded::nothing_pending())
+            .await
+            .unwrap();
+        assert_eq!(ExtractedCheckpoint::read(dir).unwrap(), None);
+        assert_eq!(handed_off(dir).unwrap(), Some(handoff));
+        assert_eq!(BootstrapMarker::read(dir).unwrap().unwrap().attempts, 2);
+        for mode in [
+            BootstrapMode::Off,
+            BootstrapMode::Direct,
+            BootstrapMode::ObjectStore,
+        ] {
+            assert_eq!(pending_attempt(dir, mode).unwrap(), None);
+        }
+        BootstrapMarker::complete(dir).await.unwrap();
+        assert_eq!(handed_off(dir).unwrap(), None);
     }
 
     #[test]
@@ -378,6 +446,7 @@ mod tests {
             BootstrapMarker {
                 attempts: 1,
                 backup_name,
+                handoff: None,
             }
             .write(tmp.path())
             .await
@@ -517,6 +586,7 @@ mod tests {
             let unpinned = BootstrapMarker {
                 attempts: 1,
                 backup_name: None,
+                handoff: None,
             };
             assert!(
                 resolve_backup(&storage, configured, Some(&unpinned))
