@@ -1,19 +1,4 @@
-//! Greenfield Direct bootstrap must not abort on a source extension that is
-//! irrelevant to type translation and absent from the bootstrap oracle's host.
-//!
-//! `pg_dump --binary-upgrade` recreates every source extension's members
-//! inline, including C functions that load `$libdir/<ext>`. The throwaway
-//! bootstrap oracle runs on walshadow's own host, where such an extension's
-//! `.so` need not exist — applying the dump then dies with
-//! `could not access file "<ext>"` and takes the whole bootstrap with it, even
-//! when no mapped column uses the extension's types.
-//!
-//! Repro without a second machine: give the SOURCE a private extension via
-//! `extension_control_path` + `dynamic_library_path` (PG18+), so it lives in a
-//! temp dir the oracle's default paths never see. An enum column forces the
-//! oracle to be provisioned; the extension itself is unused. On the buggy tree
-//! the bootstrap aborts and the row never reaches ClickHouse; the fix drops the
-//! unavailable extension from the dump and the row lands.
+//! Require source extension libraries on bootstrap oracle host, even when unused
 
 #![cfg(target_os = "linux")]
 
@@ -24,9 +9,11 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
+use walshadow::backfill::bootstrap_oracle::BootstrapOracle;
+use walshadow::shadow::{Shadow, ShadowConfig};
 
 const STUB_C: &str = "\
 #include \"postgres.h\"\n\
@@ -113,23 +100,9 @@ fn build_stub(tmp: &Path) -> Result<Option<(PathBuf, PathBuf)>> {
     Ok(Some((tmp.join("ctl"), lib)))
 }
 
-fn write_autocreate_config(path: &Path, ch_port: u16) -> Result<()> {
-    let body = format!(
-        "[ch]\n\
-         host = \"127.0.0.1\"\n\
-         port = {ch_port}\n\
-         database = \"default\"\n\
-         compression = \"lz4\"\n\
-         \n\
-         [table.\"public\".\"t\"]\n\
-         replicate = true\n"
-    );
-    fs::write(path, body).context("write ch-config")
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn bootstrap_survives_extension_absent_from_oracle() {
-    if !fx::tools::requirements_available() {
+#[tokio::test]
+async fn bootstrap_requires_source_extension_library() {
+    if !fx::tools::pg_available() {
         return;
     }
     // extension_control_path (the no-root way to give only the source a private
@@ -151,15 +124,11 @@ async fn bootstrap_survives_extension_absent_from_oracle() {
         }
     };
 
-    let slot = fx::Ports::alloc();
-
     let source = fx::make_source(&tmp);
     source.initdb().expect("initdb source");
     source.write_base_conf().expect("source base conf");
-    fx::append_source_conf(&source).expect("append source conf");
     {
-        // Only the source sees `stub`; the daemon's bootstrap oracle uses
-        // default paths, so it is absent from the oracle's pg_available_extensions.
+        // PostgreSQL 18+ permits source-only extension paths without root
         let conf = source.config().data_dir.join("postgresql.conf");
         let mut f = fs::OpenOptions::new().append(true).open(&conf).unwrap();
         writeln!(
@@ -173,61 +142,38 @@ async fn bootstrap_survives_extension_absent_from_oracle() {
     source.start().expect("start source");
     let _src_stop = fx::StopOnDrop { sh: &source };
 
-    // `stub` is irrelevant to translation — no column uses its type. The enum
-    // column is what forces the bootstrap oracle to be provisioned at all.
     source
-        .apply_schema_dump(
-            "CREATE EXTENSION stub;\n\
-             CREATE TYPE mood AS ENUM ('happy', 'sad');\n\
-             CREATE TABLE public.t (id int PRIMARY KEY, name text, feel mood);\n\
-             ALTER TABLE public.t REPLICA IDENTITY FULL;\n\
-             INSERT INTO public.t VALUES (1, 'hello', 'happy');\n\
-             CHECKPOINT;\n\
-             SELECT pg_switch_wal();\n",
-        )
-        .expect("load workload");
+        .apply_schema_dump("CREATE EXTENSION stub;")
+        .expect("install source extension");
 
-    let ch_tmp = tempfile::tempdir().unwrap();
-    let ch = fx::ChServer::spawn(ch_tmp, slot.ch_tcp, slot.ch_http).expect("spawn ch");
+    let base_dir = tmp.path().join("oracle");
+    let conninfo = format!(
+        "host={} port={} user=postgres dbname=postgres",
+        source.config().socket_dir.display(),
+        source.config().port,
+    );
+    let Err(err) = BootstrapOracle::provision(
+        base_dir.clone(),
+        conninfo,
+        None,
+        None,
+        1,
+        Duration::from_secs(10),
+    )
+    .await
+    else {
+        panic!("bootstrap accepted missing source extension library");
+    };
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("install source extension libraries"),
+        "{message}"
+    );
+    assert!(
+        message.contains("could not access file \"stub\""),
+        "{message}"
+    );
 
-    let ch_config = tmp.path().join("ch-config.toml");
-    write_autocreate_config(&ch_config, slot.ch_tcp).expect("write ch-config");
-
-    let daemon = fx::DaemonRun::prepare(tmp.path(), slot.metrics).expect("prepare daemon");
-    let child = daemon
-        .spawn(&source, &ch_config, slot.walsender, &[])
-        .expect("spawn walshadow-stream");
-    let guard = fx::ChildGuard::new(child);
-
-    let result = (|| -> Result<()> {
-        let deadline = Instant::now() + Duration::from_secs(90);
-        loop {
-            let n = ch
-                .query("SELECT count() FROM default.public_t FINAL WHERE _is_deleted = 0")
-                .unwrap_or_default();
-            if n == "1" {
-                break;
-            }
-            if daemon.stderr().contains("could not access file") {
-                anyhow::bail!(
-                    "bootstrap aborted on `stub`, an extension it does not need to translate any \
-                     mapped column"
-                );
-            }
-            if Instant::now() >= deadline {
-                anyhow::bail!("bootstrap row never reached ClickHouse (last count {n:?})");
-            }
-            std::thread::sleep(Duration::from_millis(250));
-        }
-        // The oracle-routed enum column must still resolve.
-        let feel = ch
-            .query("SELECT feel FROM default.public_t FINAL WHERE id = 1")
-            .context("read enum column from CH")?;
-        if feel != "happy" {
-            anyhow::bail!("enum column not decoded: feel = {feel:?}");
-        }
-        Ok(())
-    })();
-
-    fx::finish_daemon(guard, &daemon, result);
+    let oracle = Shadow::new(ShadowConfig::new(base_dir.join("pg"), base_dir));
+    assert!(!oracle.is_running().expect("oracle status"));
 }
