@@ -24,7 +24,8 @@ Rows carrying external values wait for the chunk mirror the walk and the window
 leg write. Window page images refill chunks a page copied mid-write lost, every
 tuple an image carries and not only the one its record names, so resolution
 waits for both every walk lane and the window leg. A value the mirror cannot
-reassemble stops the load rather than substituting one
+reassemble stops loading unless window replay already wrote that row version.
+In that case, discard backup copy and keep replayed row
 
 Rows written before backup redo can remain undecided after handoff. Retain them
 in pending tables beside destinations until commit or abort decides visibility.

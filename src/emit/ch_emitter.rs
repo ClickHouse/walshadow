@@ -2680,6 +2680,8 @@ crate::atomic_stats! {
         /// them (disabled mode). Surfaced, never silent
         pub toast_values_filled_default,
         pub toast_values_filled_superseded,
+        /// Backup rows skipped after value reassembly failed and replay wrote replacements
+        pub toast_baseline_rows_superseded,
         pub toast_values_filled_mismatch,
         /// Shadow values replaced with a fill after detecting value-ID reuse
         pub toast_values_filled_generation,

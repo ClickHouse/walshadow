@@ -249,7 +249,7 @@ async fn session_body(
     let bootstrap_plan = resolve_bootstrap(args, ch_config.as_ref())?;
     let shadow_start = resolve_shadow_start(args, bootstrap_plan.mode)?;
     if ch_config.as_ref().is_some_and(|c| c.toast.mode.is_shadow())
-        && let ShadowStart::Resume(dir) = &shadow_start
+        && let ShadowStart::Resume(dir) | ShadowStart::Handoff(dir, _) = &shadow_start
     {
         walshadow::filter::shadow_relations::ShadowRelations::load(dir).await?;
     }
@@ -311,6 +311,8 @@ async fn session_body(
         .context("bootstrap")?;
         bootstrap_metrics = Some(stage);
         Some(handoff)
+    } else if let ShadowStart::Handoff(_, handoff) = &shadow_start {
+        Some(BootstrapHandoff::new(*handoff, None))
     } else {
         None
     };
@@ -1033,7 +1035,8 @@ async fn session_body(
                     wal_seg_size: WAL_SEG_SIZE as u32,
                 },
                 lineage: &lineage,
-                manifest_present: manifest_at_boot.is_some(),
+                // A crash after saving manifest can leave descriptor logs missing
+                manifest_present: manifest_at_boot.is_some() && bootstrap_end_lsn.is_none(),
                 start_lsn_override,
                 raw_start,
                 aligned,
@@ -1042,6 +1045,10 @@ async fn session_body(
         );
     }
     let desc_log = desc_logs[primary_index].clone();
+    // Manifest and descriptor logs now preserve resume position
+    if bootstrap_end_lsn.is_some() {
+        walshadow::bootstrap_marker::BootstrapMarker::complete(shadow_start.data_dir()).await?;
+    }
     let all_desc_logs = walshadow::desc_log::DescriptorLogs::new(desc_logs.clone());
 
     let stash_live = xact_buffer.lock().await.stash_live();

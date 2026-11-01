@@ -537,6 +537,7 @@ pub(crate) async fn run_bootstrap(
             "bootstrap insert tail started",
         );
 
+        let rewrites = Arc::new(walshadow::backfill::wal_replay::WindowRewrites::default());
         // Run WAL window beside page walk when user relations exist
         let mut window_cfg = (!drain_catalog.is_empty()).then(|| {
             walshadow::backfill::bootstrap_window::WindowLegConfig {
@@ -554,6 +555,7 @@ pub(crate) async fn run_bootstrap(
                 system_id: source_ident.system_id.to_string(),
                 timeline: source_ident.timeline,
                 wind_down: Duration::from_secs(args.bootstrap_wind_down_secs),
+                rewrites: rewrites.clone(),
             }
         });
         let live_cfg = window_cfg.clone().filter(|_| plan.live_window_leg(args));
@@ -574,6 +576,7 @@ pub(crate) async fn run_bootstrap(
                 .as_ref()
                 .map(|done| done.handback_spools.clone())
                 .unwrap_or_default(),
+            rewrites: rewrites.clone(),
         };
 
         // Gate page tuples, defer unknowns until transaction logs land
@@ -707,6 +710,7 @@ pub(crate) async fn run_bootstrap(
                         "live backup-window leg failed; replaying the window from the \
                          WAL the backup landed",
                     );
+                    rewrites.clear();
                     window_leg_error = Some(e);
                     None
                 }
@@ -1142,16 +1146,17 @@ pub(crate) async fn run_bootstrap(
             .with_context(|| format!("bootstrap: chmod 0700 {}", shadow_data_dir.display()))?;
     }
 
-    BootstrapMarker::complete(&shadow_data_dir, recorded).await?;
+    let handoff = bootstrap_marker::Handoff {
+        end_lsn: outcome.end.end_lsn,
+        timeline: outcome.start.timeline,
+        open_floor,
+    };
+    BootstrapMarker::hand_off(&shadow_data_dir, handoff, recorded).await?;
+    walshadow::crash_test::hit_now(walshadow::crash_test::Point::BootstrapHandoff);
 
     timing.finish();
     Ok((
-        BootstrapHandoff {
-            end_lsn: outcome.end.end_lsn,
-            timeline: outcome.start.timeline,
-            open_floor,
-            shadow: running_shadow,
-        },
+        BootstrapHandoff::new(handoff, running_shadow),
         BootstrapMetrics {
             progress,
             oracle: oracle_stats,
@@ -1190,6 +1195,15 @@ pub(crate) struct BootstrapHandoff {
 }
 
 impl BootstrapHandoff {
+    pub(crate) fn new(handoff: bootstrap_marker::Handoff, shadow: Option<OwnedShadow>) -> Self {
+        Self {
+            end_lsn: handoff.end_lsn,
+            timeline: handoff.timeline,
+            open_floor: handoff.open_floor,
+            shadow,
+        }
+    }
+
     /// Source or archive must retain crossing transaction records
     pub(crate) fn resume_lsn(&self) -> u64 {
         self.open_floor.unwrap_or(self.end_lsn).min(self.end_lsn)
@@ -1261,6 +1275,8 @@ pub(crate) async fn bootstrap_build_mapping(
 pub(crate) enum ShadowStart {
     Bootstrap(PathBuf),
     Rebootstrap(PathBuf, BootstrapMarker),
+    /// Load finished, streaming never persisted its resume state
+    Handoff(PathBuf, bootstrap_marker::Handoff),
     Resume(PathBuf),
 }
 
@@ -1271,7 +1287,10 @@ impl ShadowStart {
 
     pub(crate) fn data_dir(&self) -> &Path {
         match self {
-            Self::Bootstrap(d) | Self::Rebootstrap(d, _) | Self::Resume(d) => d,
+            Self::Bootstrap(d)
+            | Self::Rebootstrap(d, _)
+            | Self::Handoff(d, _)
+            | Self::Resume(d) => d,
         }
     }
 }
@@ -1289,6 +1308,15 @@ pub(crate) fn resolve_shadow_start(args: &Args, mode: BootstrapMode) -> Result<S
             dir.display(),
             other.display(),
         );
+    }
+    if let Some(handoff) = bootstrap_marker::handed_off(dir)? {
+        tracing::info!(
+            target: "walshadow::bootstrap",
+            data_dir = %dir.display(),
+            end_lsn = %format_pg_lsn(handoff.end_lsn),
+            "resuming streaming after bootstrap",
+        );
+        return Ok(ShadowStart::Handoff(dir.clone(), handoff));
     }
     if let Some(marker) = bootstrap_marker::pending_attempt(dir, mode)? {
         return Ok(ShadowStart::Rebootstrap(dir.clone(), marker));

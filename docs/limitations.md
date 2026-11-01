@@ -76,6 +76,9 @@ insert batch
 - restart can resend acknowledged-nearby rows, generated table engine deduplicates them during merge or `FINAL`
 - `tee` tables using engines other than `ReplacingMergeTree` keep duplicate rows after retries
 - destination queries without `FINAL` can observe multiple row versions until background merge
+- initial-load rows use backup start as `_lsn` and can show stale or incorrect
+  values until backup-window replay writes newer row versions, see
+  [large values](#large-values)
 - bounded ClickHouse retry exhaustion stops daemon, supervisor restart continues from persisted floor
 
 ## Initial loads
@@ -94,8 +97,12 @@ insert batch
 - restored TOAST page images in backup-window WAL mirror every chunk they
   carry, repairing pages the backup copied mid-write. They date from the page's
   own version, so walked chunks never outrank them
-- an external value the mirror cannot reassemble stops the load rather than
-  substituting one; rerun against a fresher backup, or load the table with
+- greenfield bootstrap skips backup rows with external values it cannot
+  reassemble only if backup-window replay wrote matching row versions.
+  Matches require same transaction ID and replica identity key within a
+  relation. Skipped rows increment
+  `walshadow_toast_baseline_rows_superseded_total`. Other failures stop loading,
+  as do all such failures during per-table loads. Use a newer backup or
   `initial_load = 'copy'`
 - a multixact xmax the backup's `pg_multixact` cannot bound stops the load, with
   the same remedies
@@ -137,11 +144,14 @@ Default `clickhouse` value mode uses persistent TOAST chunk mirrors. Missing
 required mirror tables stop replication, see
 [large toasted values](destination-tables.md#large-toasted-values)
 
-Reused TOAST value IDs can leave ambiguous generations in backup chunk mirrors
-when hint bits do not prove older chunks dead. Baseline rows and later
-unchanged-pointer updates both resolve from those mirrors. Chunk lookup orders
-by `(ver, blkno, offnum)` for determinism, not generation correctness: a newer
-generation at a lower TID can lose when versions tie
+PostgreSQL reuses a TOAST value ID only after all chunks of its previous value
+are gone. During backup, chunk mirrors can contain both old and new values
+under that ID. Initial-load rows look up values as of backup start, so chunks
+from restored page images can cause them to read an old value. Backup-window
+replay writes correct values at commit LSN. If reassembly fails, greenfield
+bootstrap skips a backup row only when replay wrote a matching row version.
+After replay, `FINAL` returns correct values; reads without it can still return
+old values until merges finish
 
 ### Shadow value mode
 

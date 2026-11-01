@@ -26,11 +26,11 @@ rows and deferred TOAST. Scratch writes alone cannot acknowledge deferred tuples
 
 ## Completion
 
-Extend [pending-row settlement test](../tests/bootstrap_pending_settle_ch.rs)
-beyond direct-bootstrap INSERT commit and rollback. Cover UPDATE and DELETE,
-multixact updaters, subtransactions, deferred external values, and transactions
-begun inside backup window. Repeat for object-store bootstrap and per-table
-backup loads with explicit retained-history assumptions
+[Pending-row tests](../tests/bootstrap_pending_shapes_ch.rs) cover updates,
+deletes, multixact updaters, subtransactions, and external values during direct
+bootstrap. Add transactions begun during backup. Repeat for object-store
+bootstrap and per-table backup loads, stating which WAL history must remain
+available
 
 Restart before settlement and after promotion but before ledger persistence.
 Interrupt pending-table cleanup and staged publication. Cover outcomes arriving
@@ -46,11 +46,12 @@ convergence boundaries
 
 Backup-based initial loads issue no source SQL scans for user rows. Explicit
 `initial_load = "copy"` still scans selected table and remains `init`'s default.
-Baseline external values in backup modes resolve from walked chunk mirrors,
-so reused TOAST generations need a physical proof of age: backup transaction
-logs and tuple-location order do not
-establish it, and no source read compensates. Keep WAL replay ordered behind
-required chunk history
+Backup rows read external values from chunk mirrors populated during page walk.
+Greenfield bootstrap skips a row whose value cannot be reassembled only when
+backup-window replay wrote a matching row version. Per-table loads resolve
+deferred values before gap replay, so these failures still stop loading.
+Resolve them after gap replay to allow skipping rows already replayed there.
+Keep WAL replay behind required chunk writes
 
 Eliminating all source SQL also requires descriptors from landed catalogs, an
 OID-consistent type converter without source pg_dump, and alternatives for slot,

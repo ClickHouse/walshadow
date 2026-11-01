@@ -440,6 +440,8 @@ async fn walk_and_ship(
                 config.as_deref(),
                 next_seq,
                 replay_checkpoint,
+                // Gap replay has not run yet
+                None,
             )
             .await
             .map_err(anyhow::Error::msg)?;
@@ -895,6 +897,7 @@ async fn replay_gap(
         next_seq,
         // Pre-scan already harvested transaction patch
         patch: None,
+        rewrites: None,
     });
     let Some((first, _)) = segments.first() else {
         return sink

@@ -12,6 +12,7 @@ use walrus::pg::walparser::RelFileNode;
 
 use crate::backfill::backup_page_walk::{BackfillTuple, CatalogMap};
 use crate::backfill::spool::{DeferredReader, DeferredSpool, Replayable, SpoolMark};
+use crate::backfill::wal_replay::WindowRewrites;
 use crate::backfill::walk_barrier::{WALK_CHECKPOINT_PERIOD, WalkBarrier};
 use crate::config::ResolvedConfig;
 use crate::decode::heap_decoder::{ColumnValue, ToastPointer};
@@ -298,18 +299,15 @@ pub async fn drain(
         }
         Some(spool) => {
             footprint.hand_off();
-            let resolved = resolve_spooled(
-                spool.into(),
-                &routes,
-                &catalog,
-                &msg_tx,
-                &ack,
-                &stats,
-                &resolver,
-                next_seq,
-                None,
-            )
-            .await?;
+            let fetch = BatchFetch {
+                routes: &routes,
+                catalog: &catalog,
+                stats: &stats,
+                resolver: &resolver,
+                rewrites: None,
+            };
+            let resolved =
+                resolve_spooled(spool.into(), &fetch, &msg_tx, &ack, next_seq, None).await?;
             Ok(BootstrapDrainOutcome {
                 next_seq: resolved.next_seq,
                 rows_routed: rows_routed + resolved.rows_routed,
@@ -342,12 +340,25 @@ pub async fn drain_deferred(
     config: Option<&ResolvedConfig>,
     first_seq: u64,
     checkpoint: Option<ReplayCheckpoint<'_>>,
+    rewrites: Option<&WindowRewrites>,
 ) -> Result<BootstrapDrainOutcome, String> {
     let routes = freeze_routes(mapping, config, row_policy);
-    resolve_spooled(
-        spool, &routes, catalog, msg_tx, ack, stats, resolver, first_seq, checkpoint,
-    )
-    .await
+    let fetch = BatchFetch {
+        routes: &routes,
+        catalog,
+        stats,
+        resolver,
+        rewrites,
+    };
+    resolve_spooled(spool, &fetch, msg_tx, ack, first_seq, checkpoint).await
+}
+
+struct BatchFetch<'a> {
+    routes: &'a FrozenRoutes,
+    catalog: &'a CatalogMap,
+    stats: &'a EmitterStats,
+    resolver: &'a ToastResolver,
+    rewrites: Option<&'a WindowRewrites>,
 }
 
 pub struct ReplayCheckpoint<'a> {
@@ -358,18 +369,15 @@ pub struct ReplayCheckpoint<'a> {
 
 /// Route spooled referrers under one trailing seq, registered on the first
 /// row that routes so an all-unmapped spool leaves no seq to prove
-#[allow(clippy::too_many_arguments)]
 async fn resolve_spooled(
     spool: Replayable,
-    routes: &FrozenRoutes,
-    catalog: &CatalogMap,
+    fetch: &BatchFetch<'_>,
     msg_tx: &mpsc::Sender<BatcherMsg>,
     ack: &AckHandle,
-    stats: &EmitterStats,
-    resolver: &ToastResolver,
     first_seq: u64,
     mut checkpoint: Option<ReplayCheckpoint<'_>>,
 ) -> Result<BootstrapDrainOutcome, String> {
+    let stats = fetch.stats;
     tracing::info!(
         target: "walshadow::bootstrap",
         deferred = spool.records(),
@@ -392,11 +400,11 @@ async fn resolve_spooled(
     progress.advance(replay.remaining_file_bytes());
     // Read and fetch the next batch while this one routes: spool reads and
     // inserts otherwise leave the store pool idle
-    let mut ready = prepare_batch(&mut replay, routes, catalog, stats, resolver).await?;
+    let mut ready = prepare_batch(&mut replay, fetch).await?;
     while let Some(batch) = ready.take() {
         let remaining = replay.remaining_file_bytes();
         let (next, routed) = tokio::join!(
-            prepare_batch(&mut replay, routes, catalog, stats, resolver),
+            prepare_batch(&mut replay, fetch),
             route_batch(batch, msg_tx, &mut seqs, &mut seq, &mut placed),
         );
         routed?;
@@ -523,19 +531,17 @@ struct ResolvedReplayBatch {
 /// Read one batch and resolve its values; `None` at spool end
 async fn prepare_batch(
     replay: &mut DeferredReader,
-    routes: &FrozenRoutes,
-    catalog: &CatalogMap,
-    stats: &EmitterStats,
-    resolver: &ToastResolver,
+    fetch: &BatchFetch<'_>,
 ) -> Result<Option<ResolvedReplayBatch>, String> {
-    let mut batch = next_batch(replay, routes, catalog, stats, resolver).await?;
+    let resolver = fetch.resolver;
+    let mut batch = next_batch(replay, fetch.routes, fetch.catalog, fetch.stats, resolver).await?;
     if batch.rows.is_empty() {
         return Ok(None);
     }
     // One permit per batch: every value a round fetched stays resident
     // until its row routes, so the rows share what survives
     let mut leaf = crate::budget::acquire_opt(resolver.budget(), batch.need).await;
-    let retained = resolve_batch(&mut batch, resolver).await?;
+    let retained = resolve_batch(&mut batch, fetch).await?;
     if let Some(p) = leaf.as_mut() {
         p.shrink(retained as u64);
     }
@@ -630,16 +636,30 @@ async fn next_batch(
 
 /// Fetch the batch's values, one round trip per mirror and bound, then
 /// detoast every referrer's columns. Returns the bytes the rows retain
-async fn resolve_batch(batch: &mut ReplayBatch, resolver: &ToastResolver) -> Result<usize, String> {
+///
+/// Reusing a TOAST ID requires removing its previous chunks. Mixed values in
+/// backup mirrors therefore involve a row written during backup. Skip a row
+/// whose value cannot be reassembled only if replay wrote a matching version
+async fn resolve_batch(batch: &mut ReplayBatch, fetch: &BatchFetch<'_>) -> Result<usize, String> {
+    let resolver = fetch.resolver;
     let mut values = fetch_batch_values(batch, resolver).await?;
     let mut retained = 0usize;
-    for ReplayRow {
-        tuple,
-        rel,
-        route,
-        pointers,
-    } in &mut batch.rows
+    let mut superseded = Vec::new();
+    for (
+        i,
+        ReplayRow {
+            tuple,
+            rel,
+            route,
+            pointers,
+        },
+    ) in batch.rows.iter_mut().enumerate()
     {
+        let rewrote = |tuple: &BackfillTuple| {
+            fetch
+                .rewrites
+                .is_some_and(|r| r.rewrote(rel, tuple.rfn, tuple.xid, &tuple.columns))
+        };
         for site in pointers.iter() {
             let key = (
                 tuple.rfn.db_node,
@@ -650,10 +670,25 @@ async fn resolve_batch(batch: &mut ReplayBatch, resolver: &ToastResolver) -> Res
             let fetched = values.take(key);
             let type_oid = rel.attributes.get(site.idx).map_or(0, |a| a.type_oid);
             let target = &route.mapping.columns[site.col].target_name;
-            let (column, bytes) = apply_fetched(fetched, &site.p, type_oid, rel, target, resolver)?;
+            let (column, bytes) =
+                match apply_fetched(fetched, &site.p, type_oid, rel, target, resolver) {
+                    Ok(applied) => applied,
+                    Err(_) if rewrote(tuple) => {
+                        superseded.push(i);
+                        break;
+                    }
+                    Err(e) => return Err(e),
+                };
             retained += bytes;
             tuple.columns[site.idx] = Some(column);
         }
+    }
+    fetch
+        .stats
+        .toast_baseline_rows_superseded
+        .fetch_add(superseded.len() as u64, Ordering::Relaxed);
+    for i in superseded.into_iter().rev() {
+        batch.rows.remove(i);
     }
     Ok(retained)
 }
@@ -888,6 +923,7 @@ mod tests {
     }
 
     use super::*;
+    use crate::decode::heap_decoder::{DecodedHeap, DecodedTuple, HeapOp};
     use crate::emit::pipeline::batcher::RoutedRow;
 
     /// Distinguish missing data in walk-seeded store from superseded value in
@@ -1669,6 +1705,7 @@ mod tests {
             None,
             outcome.next_seq,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -1755,6 +1792,7 @@ mod tests {
                 &Default::default(),
                 None,
                 first_seq,
+                None,
                 None,
             )
             .await
@@ -2049,6 +2087,7 @@ mod tests {
                 dir: dir.path(),
                 tail: &tail,
             }),
+            None,
         )
         .await;
         assert!(result.unwrap_err().contains("injected prefetch failure"));
@@ -2081,6 +2120,7 @@ mod tests {
                 dir: dir.path(),
                 tail: &tail,
             }),
+            None,
         )
         .await
         .unwrap();
@@ -2089,6 +2129,121 @@ mod tests {
         assert_eq!(result.next_seq, 1);
         assert!(path.exists(), "retain spool until pass publishes");
         tail.finish(result.next_seq).await.unwrap();
+    }
+
+    fn fetch_with<'a>(
+        resolver: &'a ToastResolver,
+        stats: &'a EmitterStats,
+        rewrites: Option<&'a WindowRewrites>,
+    ) -> BatchFetch<'a> {
+        static ROUTES: std::sync::LazyLock<FrozenRoutes> = std::sync::LazyLock::new(|| {
+            freeze_routes(&MappingSnapshot::default(), None, &RowPolicy::default())
+        });
+        static CATALOG: std::sync::LazyLock<CatalogMap> = std::sync::LazyLock::new(CatalogMap::new);
+        BatchFetch {
+            routes: &ROUTES,
+            catalog: &CATALOG,
+            stats,
+            resolver,
+            rewrites,
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_value_drops_only_window_rewritten_rows() {
+        let mut rel = (*bytea_rel(16400)).clone();
+        rel.replident = ReplIdent::Default {
+            pk_attnums: Some(vec![2]),
+        };
+        rel.attributes.push(RelAttr {
+            attnum: 2,
+            name: "id".into(),
+            type_oid: 23,
+            type_name: "int4".into(),
+            type_byval: true,
+            type_len: 4,
+            type_storage: 'p',
+            ..rel.attributes[0].clone()
+        });
+        let rel = Arc::new(rel);
+        let batch = |id: i32| {
+            let mut tuple = bytea_toast_tuple(16400, 16500, 1);
+            tuple.columns.push(Some(ColumnValue::Int4(id)));
+            let route = RouteSnapshot::freeze(
+                bytea_mapping_for(16400),
+                Arc::default(),
+                RowPolicy::default(),
+            );
+            let pointers = mapped_pointers(&tuple, &route.mapping);
+            ReplayBatch {
+                rows: vec![ReplayRow {
+                    tuple,
+                    rel: rel.clone(),
+                    route,
+                    pointers,
+                }],
+                need: 0,
+                resident: 0,
+            }
+        };
+        // Seed mirror without value 1
+        let store = Arc::new(MemChunkStore::new());
+        crate::toast::ChunkStore::put(
+            &*store,
+            &[row_from_columns(toast_chunk_tuple(16500, 2, 0, b"other"), 5, 16500).unwrap()],
+        )
+        .await
+        .unwrap();
+        let stats = Arc::new(EmitterStats::default());
+        let resolver = ToastResolver::with_store(store, stats.clone());
+        let rewrites = WindowRewrites::default();
+        let window = |id: i32, xid: u32| DecodedHeap {
+            rfn: rel.rfn,
+            xid,
+            source_lsn: 0x2000,
+            op: HeapOp::Insert,
+            new: Some(DecodedTuple {
+                columns: batch(id).rows[0].tuple.columns.clone(),
+                partial: false,
+            }),
+            old: None,
+        };
+        // Same key with a different transaction ID identifies another row version
+        rewrites.record(&rel, &window(7, 98));
+        let err = resolve_batch(
+            &mut batch(7),
+            &fetch_with(&resolver, &stats, Some(&rewrites)),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("value_id=1"), "{err}");
+
+        rewrites.record(&rel, &window(7, 99));
+        let mut kept = batch(8);
+        assert!(
+            resolve_batch(&mut kept, &fetch_with(&resolver, &stats, Some(&rewrites)))
+                .await
+                .is_err(),
+            "a different key must still fail"
+        );
+        let mut dropped = batch(7);
+        resolve_batch(
+            &mut dropped,
+            &fetch_with(&resolver, &stats, Some(&rewrites)),
+        )
+        .await
+        .unwrap();
+        assert!(dropped.rows.is_empty());
+        assert_eq!(
+            stats.toast_baseline_rows_superseded.load(Ordering::Relaxed),
+            1
+        );
+        assert!(
+            resolve_batch(&mut batch(7), &fetch_with(&resolver, &stats, None))
+                .await
+                .is_err(),
+            "missing replay must still fail"
+        );
     }
 
     #[tokio::test]
@@ -2124,9 +2279,12 @@ mod tests {
                 pointers,
             });
         }
+        let stats = EmitterStats::default();
         let resolver = ToastResolver::with_store(stores[0].1.clone(), Arc::default())
             .with_database_stores(stores);
-        resolve_batch(&mut batch, &resolver).await.unwrap();
+        resolve_batch(&mut batch, &fetch_with(&resolver, &stats, None))
+            .await
+            .unwrap();
         for (row, expected) in batch.rows.iter().zip([b"first", b"other"]) {
             assert_eq!(
                 row.tuple.columns[0],
