@@ -478,8 +478,9 @@ pub fn is_retryable(error: &EmitterError) -> bool {
     )
 }
 
+/// CH parses backslash escapes inside backticks, so `\` needs escaping too
 pub fn quote_ident(name: &str) -> String {
-    format!("`{}`", name.replace('`', "``"))
+    format!("`{}`", name.replace('\\', "\\\\").replace('`', "``"))
 }
 
 #[cfg(test)]

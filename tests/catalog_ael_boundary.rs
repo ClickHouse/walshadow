@@ -23,8 +23,9 @@
 
 #[path = "common/inproc_harness.rs"]
 mod fx;
+#[path = "common/pgext_libs.rs"]
+mod pgext_libs;
 
-use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use walshadow::mapping::NamespaceMapping;
@@ -38,18 +39,6 @@ const HOLD_SECS: u64 = 90;
 /// Capture is a few local round trips; a fixed budget well above that turns
 /// the deadlock into a test failure instead of a hung run.
 const CAPTURE_BUDGET: Duration = Duration::from_secs(25);
-
-fn wstest_module() -> PathBuf {
-    let so = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("pgext/test")
-        .join("wstest.so");
-    assert!(
-        so.is_file(),
-        "{} missing, run `make -C pgext/test`",
-        so.display()
-    );
-    so
-}
 
 /// Tracks per-record progress: `WalStream::dispatched_lsn` only moves at
 /// segment boundaries, so it cannot tell a stalled pump from a few KB of WAL.
@@ -120,7 +109,7 @@ async fn run_boundary(held: Held<'_>) -> Result<(), String> {
 /// `d_ddl`: transaction D's catalog mutation, whose boundary lands between V's
 /// lock and V's commit.
 async fn run_boundary_ddl(held: Held<'_>, d_ddl: &str) -> Result<(), String> {
-    let so = wstest_module();
+    let so = pgext_libs::wstest_module();
     let ports = fx::Ports::alloc();
     let tmp = tempfile::tempdir().unwrap();
 
