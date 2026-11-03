@@ -1259,6 +1259,7 @@ async fn session_body(
             raw_start.get(),
         )
         .await?;
+    let mirror_resolver = reorder_sink.planning_resolver();
     let predecode = Arc::new(decoder.predecoder(reorder_sink.planning_resolver()));
     let decoder_xact = QueueingRecordSink::spawn(
         DecoderXactPair {
@@ -1775,6 +1776,10 @@ async fn session_body(
             },
         );
         if last_cursor_write.is_none_or(|t| t.elapsed() >= cursor_write_interval) {
+            mirror_resolver
+                .flush_mirror()
+                .await
+                .context("flush TOAST mirror before publishing the floor")?;
             let persisted = manifest::write(&args.spill_dir, &cur)
                 .await
                 .context("write resume manifest")?;

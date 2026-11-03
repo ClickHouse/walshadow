@@ -6,6 +6,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use clickhouse_c::{Allocator, Block, BlockBuilder, ColumnBuilder, Event, TypeAst};
@@ -1132,6 +1133,93 @@ impl ChunkStore for ClickHouseChunkStore {
     }
 }
 
+pub const MIRROR_FLUSH_INTERVAL: Duration = Duration::from_secs(1);
+
+#[derive(Default)]
+struct PendingMirror {
+    rows: Vec<ToastRow>,
+    bytes: usize,
+    permits: Vec<crate::budget::MemoryPermit>,
+    tids: HashSet<(u32, u32, u32, u16)>,
+    ticking: bool,
+    failed: Option<String>,
+}
+
+impl PendingMirror {
+    fn collides(&self, batch: &[ToastRow]) -> bool {
+        batch.iter().any(|r| self.tids.contains(&tid_of(r)))
+    }
+
+    fn push(
+        &mut self,
+        batch: Vec<ToastRow>,
+        bytes: usize,
+        permit: Option<crate::budget::MemoryPermit>,
+    ) {
+        self.tids.extend(batch.iter().map(tid_of));
+        self.rows.extend(batch);
+        self.bytes += bytes;
+        self.permits.extend(permit);
+    }
+
+    fn take(&mut self) -> (Vec<ToastRow>, Vec<crate::budget::MemoryPermit>) {
+        self.bytes = 0;
+        self.tids.clear();
+        (
+            std::mem::take(&mut self.rows),
+            std::mem::take(&mut self.permits),
+        )
+    }
+}
+
+fn tid_of(r: &ToastRow) -> (u32, u32, u32, u16) {
+    (r.db_oid, r.toast_relid, r.blkno, r.offnum)
+}
+
+async fn put_rows(
+    store: &dyn ChunkStore,
+    stats: &EmitterStats,
+    rows: &[ToastRow],
+) -> Result<(), ChunkStoreError> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let started = std::time::Instant::now();
+    store.put(rows).await?;
+    stats
+        .toast_chunk_put_nanos
+        .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    stats.toast_chunk_puts.fetch_add(1, Ordering::Relaxed);
+    let tombstones = rows.iter().filter(|r| r.is_tombstone()).count() as u64;
+    stats
+        .toast_chunks_stored
+        .fetch_add(rows.len() as u64 - tombstones, Ordering::Relaxed);
+    stats
+        .toast_tombstones_stored
+        .fetch_add(tombstones, Ordering::Relaxed);
+    Ok(())
+}
+
+async fn put_rows_batched(
+    store: &dyn ChunkStore,
+    stats: &EmitterStats,
+    limits: (usize, usize),
+    rows: &[ToastRow],
+) -> Result<(), ChunkStoreError> {
+    let reached = |n: usize, bytes: usize| n >= limits.0 || bytes >= limits.1;
+    let mut start = 0usize;
+    let mut bytes = 0usize;
+    for (i, r) in rows.iter().enumerate() {
+        if i > start && reached(i - start, bytes) {
+            put_rows(store, stats, &rows[start..i]).await?;
+            start = i;
+            bytes = 0;
+        }
+        bytes += r.chunk_data.len();
+    }
+    put_rows(store, stats, &rows[start..]).await
+}
+
 /// TOAST resolution policy and optional store
 #[derive(Clone)]
 pub struct ToastResolver {
@@ -1149,6 +1237,7 @@ pub struct ToastResolver {
     budget: Option<crate::budget::MemoryBudget>,
     /// Pending reads consumed by commit-ordered planning
     ahead: Option<Arc<std::sync::Mutex<PendingReads>>>,
+    pending: Arc<tokio::sync::Mutex<PendingMirror>>,
 }
 
 impl ToastResolver {
@@ -1163,6 +1252,7 @@ impl ToastResolver {
             overflow: InlineValueOverflow::default(),
             budget: None,
             ahead: None,
+            pending: Arc::default(),
         }
     }
 
@@ -1224,6 +1314,7 @@ impl ToastResolver {
             overflow: emitter.inline_value_overflow,
             budget: None,
             ahead: None,
+            pending: Arc::default(),
         }
     }
 
@@ -1239,6 +1330,7 @@ impl ToastResolver {
             overflow: InlineValueOverflow::default(),
             budget: None,
             ahead: None,
+            pending: Arc::default(),
         }
     }
 
@@ -1477,6 +1569,7 @@ impl ToastResolver {
             })?,
             None => store,
         };
+        self.flush_mirror().await?;
         let started = std::time::Instant::now();
         let got = store
             .fetch_many(db_oid, toast_relid, values, max_lsn)
@@ -1502,23 +1595,7 @@ impl ToastResolver {
         let Some(store) = &self.store else {
             return Ok(());
         };
-        if rows.is_empty() {
-            return Ok(());
-        }
-        let started = std::time::Instant::now();
-        store.put(rows).await?;
-        self.stats
-            .toast_chunk_put_nanos
-            .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
-        self.stats.toast_chunk_puts.fetch_add(1, Ordering::Relaxed);
-        let tombstones = rows.iter().filter(|r| r.is_tombstone()).count() as u64;
-        self.stats
-            .toast_chunks_stored
-            .fetch_add(rows.len() as u64 - tombstones, Ordering::Relaxed);
-        self.stats
-            .toast_tombstones_stored
-            .fetch_add(tombstones, Ordering::Relaxed);
-        Ok(())
+        put_rows(store.as_ref(), &self.stats, rows).await
     }
 
     /// [`Self::put_batched`] over row refs: materialize each slice just in
@@ -1540,30 +1617,86 @@ impl ToastResolver {
                 bytes += rows[end].chunk_data.len();
                 end += 1;
             }
-            let _leaf = crate::budget::acquire_opt(self.budget.as_ref(), bytes).await;
+            let leaf = crate::budget::acquire_opt(self.budget.as_ref(), bytes).await;
             let mut batch: Vec<ToastRow> = Vec::with_capacity(end - start);
             for r in &rows[start..end] {
                 batch.push(r.materialize(spool)?);
             }
-            self.put(&batch).await?;
+            let mut pending = self.pending.lock().await;
+            if pending.collides(&batch) {
+                self.flush_locked(&mut pending).await?;
+            }
+            pending.push(batch, bytes, leaf);
+            if self.put_limit_reached(pending.rows.len(), pending.bytes) {
+                self.flush_locked(&mut pending).await?;
+            } else if !pending.ticking {
+                pending.ticking = true;
+                self.spawn_mirror_timer();
+            }
             start = end;
         }
         Ok(())
     }
 
+    pub async fn flush_mirror(&self) -> Result<(), ChunkStoreError> {
+        let mut pending = self.pending.lock().await;
+        self.flush_locked(&mut pending).await
+    }
+
+    async fn flush_locked(&self, pending: &mut PendingMirror) -> Result<(), ChunkStoreError> {
+        if let Some(e) = pending.failed.take() {
+            return Err(ChunkStoreError::Clickhouse(e));
+        }
+        let Some(store) = &self.store else {
+            return Ok(());
+        };
+        if pending.rows.is_empty() {
+            return Ok(());
+        }
+        let (rows, permits) = pending.take();
+        let put = put_rows_batched(store.as_ref(), &self.stats, self.put_limits(), &rows).await;
+        drop(permits);
+        put
+    }
+
+    fn spawn_mirror_timer(&self) {
+        let Some(store) = self.store.clone() else {
+            return;
+        };
+        let stats = self.stats.clone();
+        let limits = self.put_limits();
+        let weak = Arc::downgrade(&self.pending);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(MIRROR_FLUSH_INTERVAL).await;
+                let Some(pending) = weak.upgrade() else {
+                    return;
+                };
+                let mut pending = pending.lock().await;
+                if pending.rows.is_empty() {
+                    continue;
+                }
+                let (rows, permits) = pending.take();
+                let put = put_rows_batched(store.as_ref(), &stats, limits, &rows).await;
+                drop(permits);
+                if let Err(e) = put {
+                    tracing::error!(target: "walshadow", error = %e, "toast mirror flush");
+                    pending.failed.get_or_insert_with(|| e.to_string());
+                }
+            }
+        });
+    }
+
     /// [`Self::put`] in WAL-order slices sealed at configured row or byte limit
     pub async fn put_batched(&self, rows: &[ToastRow]) -> Result<(), ChunkStoreError> {
-        let mut start = 0usize;
-        let mut bytes = 0usize;
-        for (i, r) in rows.iter().enumerate() {
-            if i > start && self.put_limit_reached(i - start, bytes) {
-                self.put(&rows[start..i]).await?;
-                start = i;
-                bytes = 0;
-            }
-            bytes += r.chunk_data.len();
-        }
-        self.put(&rows[start..]).await
+        let Some(store) = &self.store else {
+            return Ok(());
+        };
+        put_rows_batched(store.as_ref(), &self.stats, self.put_limits(), rows).await
+    }
+
+    fn put_limits(&self) -> (usize, usize) {
+        (self.put_batch_rows, self.put_batch_bytes)
     }
 
     async fn clear_mirror(
@@ -1575,6 +1708,7 @@ impl ToastResolver {
         let Some(store) = &self.store.as_ref().filter(|s| s.accepts_writes()) else {
             return Ok(());
         };
+        self.flush_mirror().await?;
         store.truncate_mirror(db_oid, toast_relid).await?;
         metric.fetch_add(1, Ordering::Relaxed);
         Ok(())
@@ -1612,6 +1746,7 @@ impl ToastResolver {
         let Some(store) = &self.store.as_ref().filter(|s| s.accepts_writes()) else {
             return Ok(());
         };
+        self.flush_mirror().await?;
         store
             .rewrite_barrier(db_oid, toast_relid, marker_lsn, commit_lsn)
             .await?;
@@ -2102,6 +2237,7 @@ mod tests {
         r.put_row_refs(Some(w.shared().as_ref()), &refs)
             .await
             .unwrap();
+        r.flush_mirror().await.unwrap();
         let got = store.fetch(0, 16500, 7, u64::MAX, 12).await.unwrap();
         assert_eq!(got, assembled(b"aaaabbbbcccc"));
         // Tombstone materializes bodiless, no spool needed
@@ -2238,6 +2374,7 @@ mod tests {
             lsn: 0x1000,
         }];
         r.put_row_refs(None, &refs).await.unwrap();
+        r.flush_mirror().await.unwrap();
         assert_eq!(
             store.fetch(0, 16500, 7, u64::MAX, 2 << 10).await.unwrap(),
             assembled(&[0u8; 2 << 10])
@@ -2360,6 +2497,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mirror_rows_batch_across_commits_until_a_trigger() {
+        let store = Arc::new(MemChunkStore::new());
+        let stats = Arc::new(EmitterStats::default());
+        let r = ToastResolver::with_store(store.clone(), stats.clone());
+        let one = |seq: u32| {
+            [ToastRowRef {
+                db_oid: 0,
+                toast_relid: 16500,
+                blkno: 1,
+                offnum: 1 + seq as u16,
+                chunk_id: 7,
+                chunk_seq: seq,
+                chunk_data: Body::Mem(Bytes::from_static(b"ab")),
+                lsn: 0x1000 + u64::from(seq),
+            }]
+        };
+        for seq in 0..5 {
+            r.put_row_refs(None, &one(seq)).await.unwrap();
+        }
+        assert_eq!(
+            stats.toast_chunk_puts.load(Ordering::Relaxed),
+            0,
+            "five commits well under the limit issue no INSERT"
+        );
+
+        assert!(
+            r.fetch_values(0, 16500, &[(7, 10)], u64::MAX)
+                .await
+                .unwrap()
+                .is_some(),
+            "a store read must see the rows buffered before it"
+        );
+        assert_eq!(
+            stats.toast_chunk_puts.load(Ordering::Relaxed),
+            1,
+            "the read flushed all five as one INSERT"
+        );
+        assert_eq!(
+            store.fetch(0, 16500, 7, u64::MAX, 10).await.unwrap(),
+            assembled(&b"ab".repeat(5))
+        );
+
+        r.put_row_refs(None, &one(5)).await.unwrap();
+        r.flush_mirror().await.unwrap();
+        assert_eq!(
+            stats.toast_chunk_puts.load(Ordering::Relaxed),
+            2,
+            "the floor flush drains the tail"
+        );
+        r.flush_mirror().await.unwrap();
+        assert_eq!(
+            stats.toast_chunk_puts.load(Ordering::Relaxed),
+            2,
+            "flushing an empty buffer issues nothing"
+        );
+    }
+
+    #[tokio::test]
     async fn put_batched_preserves_order_across_slices() {
         let store = Arc::new(MemChunkStore::new());
         let stats = Arc::new(EmitterStats::default());
@@ -2427,6 +2622,7 @@ mod tests {
                     let rows: Vec<_> = refs.iter().map(|r| r.materialize(None).unwrap()).collect();
                     resolver.put_batched(&rows).await.unwrap();
                 }
+                resolver.flush_mirror().await.unwrap();
                 assert_eq!(stats.toast_chunk_puts.load(Ordering::Relaxed), puts);
                 assert_eq!(
                     store.fetch(0, 16500, 7, u64::MAX, 14).await.unwrap(),
