@@ -146,7 +146,8 @@ async fn cold_restart_drop_retires_mirror() {
     let shipped = fx::pump_segments(&mut pipeline, 1, Duration::from_secs(45)).await;
     let _ = driver.join();
     assert!(shipped >= 1, "no segments shipped in 45s");
-    fx::wait_query(
+    fx::wait_mirror(
+        &pipeline,
         &ch,
         &format!("SELECT countDistinct(chunk_id) FROM {chunk_table}"),
         "1",
@@ -209,7 +210,8 @@ async fn cold_restart_drop_retires_mirror() {
     let shipped = fx::pump_segments(&mut pipeline, 1, Duration::from_secs(45)).await;
     let _ = driver.join();
     assert!(shipped >= 1, "post-floor poke segment never shipped");
-    fx::wait_query(
+    fx::wait_mirror(
+        &pipeline,
         &ch,
         &format!("SELECT count() FROM {chunk_table}"),
         "0",
@@ -484,7 +486,8 @@ async fn drop_retire_survives_restart_from_ledger() {
     let shipped = fx::pump_segments(&mut pipeline, 1, Duration::from_secs(45)).await;
     let _ = driver.join();
     assert!(shipped >= 1, "seed segment never shipped");
-    fx::wait_query(
+    fx::wait_mirror(
+        &pipeline,
         &ch,
         &format!("SELECT countDistinct(chunk_id) FROM {chunk_table}"),
         "1",

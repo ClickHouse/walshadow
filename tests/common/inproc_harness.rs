@@ -1143,8 +1143,28 @@ pub async fn pump_segments_res(
 /// Poll `sql` until it returns `want` or the deadline passes (commit drains
 /// land asynchronously after a segment ships).
 pub async fn wait_query(ch: &ChServer, sql: &str, want: &str, what: &str) {
+    poll_query(ch, sql, want, what, None).await
+}
+
+/// [`wait_query`] over TOAST mirror tables, flushing pending mirror rows each
+/// poll as daemon does before publishing a checkpoint
+pub async fn wait_mirror(pipeline: &Pipeline, ch: &ChServer, sql: &str, want: &str, what: &str) {
+    let toast = pipeline.sinks.reorder.planning_resolver();
+    poll_query(ch, sql, want, what, Some(&toast)).await
+}
+
+async fn poll_query(
+    ch: &ChServer,
+    sql: &str,
+    want: &str,
+    what: &str,
+    toast: Option<&walshadow::toast::ToastResolver>,
+) {
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
+        if let Some(toast) = toast {
+            toast.flush_mirror().await.expect("flush TOAST mirror");
+        }
         let got = ch.query(sql).unwrap_or_else(|_| "<query failed>".into());
         if got == want {
             return;

@@ -202,7 +202,8 @@ async fn vacuum_full_rewrite_and_same_xact_stash() {
 
     // A dead, B + C live.
     let live_bc = format!("2\t{}", BODY_B_LEN + BODY_C_LEN);
-    fx::wait_query(
+    fx::wait_mirror(
+        &pipeline,
         &ch,
         &live_sum_sql(&chunk_table, "18446744073709551615"),
         &live_bc,
@@ -236,7 +237,8 @@ async fn vacuum_full_rewrite_and_same_xact_stash() {
 
     // New generation converges to the same live set: reused TIDs supersede
     // through higher `_lsn`, residual old TIDs die at commit.
-    fx::wait_query(
+    fx::wait_mirror(
+        &pipeline,
         &ch,
         &live_sum_sql(&chunk_table, "18446744073709551615"),
         &live_bc,
@@ -329,7 +331,8 @@ async fn vacuum_full_rewrite_and_same_xact_stash() {
     let shipped = fx::pump_segments(&mut pipeline, 1, Duration::from_secs(45)).await;
     let _ = driver.join();
     assert!(shipped >= 1, "truncate segment never shipped");
-    fx::wait_query(
+    fx::wait_mirror(
+        &pipeline,
         &ch,
         &format!(
             "SELECT countDistinct(chunk_id), sum(length(chunk_data)), \
@@ -377,7 +380,8 @@ async fn vacuum_full_rewrite_and_same_xact_stash() {
              WHERE c.oid = 'public.doc2'::regclass AND d.datname = current_database()",
         )
         .expect("doc2 toast relid");
-    fx::wait_query(
+    fx::wait_mirror(
+        &pipeline,
         &ch,
         &live_sum_sql(&format!("walshadow_test.{mirror2}"), "18446744073709551615"),
         &format!("1\t{BODY_E_LEN}"),
@@ -540,7 +544,8 @@ async fn alter_rewrite_link_swap_retires_old_mirror() {
     let _ = driver.join();
     assert!(shipped >= 1, "no segments shipped in 45s");
     let live_bc = format!("2\t{}", BODY_B_LEN + BODY_C_LEN);
-    fx::wait_query(
+    fx::wait_mirror(
+        &pipeline,
         &ch,
         &live_sum_sql(&old_table, "18446744073709551615"),
         &live_bc,
@@ -572,7 +577,8 @@ async fn alter_rewrite_link_swap_retires_old_mirror() {
         old_mirror, new_mirror,
         "link swap keeps the transient toast oid"
     );
-    fx::wait_query(
+    fx::wait_mirror(
+        &pipeline,
         &ch,
         &live_sum_sql(
             &format!("walshadow_test.{new_mirror}"),
@@ -614,7 +620,8 @@ async fn alter_rewrite_link_swap_retires_old_mirror() {
     let shipped = fx::pump_segments(&mut pipeline, 1, Duration::from_secs(45)).await;
     let _ = driver.join();
     assert!(shipped >= 1, "post-floor poke segment never shipped");
-    fx::wait_query(
+    fx::wait_mirror(
+        &pipeline,
         &ch,
         &format!("SELECT count() FROM {old_table}"),
         "0",
