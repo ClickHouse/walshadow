@@ -19,7 +19,7 @@ mod pgext;
 mod ports;
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
@@ -28,16 +28,6 @@ use walshadow::bridge::{Bridge, BridgeError};
 use walshadow::pg::socket_conninfo;
 use walshadow::shadow::{BridgeConf, Shadow, ShadowConfig};
 use walshadow::toast::FetchedValue;
-
-fn wstest_module() -> PathBuf {
-    let so = Path::new(env!("CARGO_MANIFEST_DIR")).join("pgext/test/wstest.so");
-    assert!(
-        so.is_file(),
-        "{} missing, run `make -C pgext/test`",
-        so.display()
-    );
-    so
-}
 
 /// Autovacuum off throughout, so every reclamation in here is one the test
 /// asked for and a Missing names the operation that caused it
@@ -499,7 +489,7 @@ async fn planted_chunk_headers_short_reads_compressed_refuses() {
         &format!(
             "CREATE FUNCTION ws_test_plant_toast_chunk(oid, oid, int, bytea, bool) \
              RETURNS void AS '{}', 'ws_test_plant_toast_chunk' LANGUAGE c",
-            wstest_module().display()
+            pgext::libs::wstest_module().display()
         ),
     )
     .await;
@@ -567,7 +557,7 @@ async fn chunks_younger_than_the_ceiling_read_as_a_later_generation() {
         &format!(
             "CREATE FUNCTION ws_test_plant_toast_chunk(oid, oid, int, bytea, bool) \
              RETURNS void AS '{}', 'ws_test_plant_toast_chunk' LANGUAGE c",
-            wstest_module().display()
+            pgext::libs::wstest_module().display()
         ),
     )
     .await;

@@ -7,8 +7,12 @@
 
 #![allow(dead_code)]
 
+#[path = "pgext_libs.rs"]
+pub mod libs;
 #[path = "tools.rs"]
 pub mod tools;
+
+pub use libs::pgext_dir;
 
 use std::cell::RefCell;
 use std::fs;
@@ -23,20 +27,6 @@ use walshadow::shadow::{BridgeConf, Shadow, ShadowConfig};
 /// Bridge frames are tiny and the worker answers one request per loop pass, so
 /// anything this slow is a wedge, not load
 const IO_BUDGET: Duration = Duration::from_secs(20);
-
-/// Build tree holding the module and the fault shim, fed to shadow as
-/// `dynamic_library_path`. Neither is optional, so an unbuilt tree fails
-/// rather than skips
-pub fn pgext_dir() -> PathBuf {
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("pgext");
-    for (lib, how) in [
-        ("walshadow.so", "make -C pgext"),
-        ("faultshim.so", "make -C pgext faultshim.so"),
-    ] {
-        assert!(dir.join(lib).is_file(), "pgext/{lib} missing, run `{how}`");
-    }
-    dir
-}
 
 // ---------------------------------------------------------------------------
 // scripted faults

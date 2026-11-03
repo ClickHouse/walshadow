@@ -2,11 +2,11 @@
 
 Build Rust binaries with `cargo build --release`. Build PostgreSQL module before
 integration tests, using server headers for PostgreSQL major under test
-See [module build guide](../pgext/README.md) for PG_CONFIG and installation
+Build uses `pg_config` on PATH. See [module build guide](../pgext/README.md)
+to override `PG_CONFIG` or install module
 
 ```bash
-make -C pgext
-make -C pgext faultshim.so
+make -C pgext test-deps
 cargo nextest run --workspace --all-targets --locked
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
@@ -48,7 +48,7 @@ make -C pgext coverage-html
 Install GCC, matching `gcov`, and `gcovr` for
 [PG module coverage](../pgext/README.md#coverage) of `pgext/*.c` and `pgext/*.h`
 
-CI merges coverage across PostgreSQL 16, 17, 18, and 19. Use fresh line-coverage
+CI merges coverage across its PostgreSQL test matrix. Use fresh line-coverage
 reports to locate missing behavior; exported function counts can include generic
 instantiations. Do not disable lints or coverage to make a report pass
 

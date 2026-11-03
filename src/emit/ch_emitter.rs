@@ -3637,6 +3637,8 @@ mod tests {
     fn quote_ident_escapes_backticks() {
         assert_eq!(quote_ident("foo"), "`foo`");
         assert_eq!(quote_ident("a`b"), "`a``b`");
+        assert_eq!(quote_ident("a\\b"), "`a\\\\b`");
+        assert_eq!(quote_ident("a\\"), "`a\\\\`");
     }
 
     #[test]

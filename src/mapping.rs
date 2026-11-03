@@ -3,7 +3,7 @@
 use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use crate::catalog::type_bridge::{self, ResolvedColumn};
-use crate::ch::types;
+use crate::ch::{quote_ident, types};
 use crate::column_rules::{ColumnRule, ColumnRules};
 use crate::runtime_config::InitialLoadMode;
 use crate::schema::{RelAttr, RelDescriptor, RelName, SchemaDiff, replident_key_attnums};
@@ -634,10 +634,6 @@ pub fn fold_diff_into_mapping(
             target.columns.push(column);
         }
     }
-}
-
-fn quote_ident(name: &str) -> String {
-    format!("`{}`", name.replace('`', "``"))
 }
 
 #[cfg(test)]

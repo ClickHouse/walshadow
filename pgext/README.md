@@ -26,7 +26,9 @@ runtime image build never compiles it:
 make -C pgext faultshim.so
 ```
 
-`coverage-build` builds both
+`coverage-build` builds both. `test-deps` builds everything the Rust test suite
+loads, fault shim and `pgext/test/wstest.so` included, and rebuilds from clean
+when `PG_CONFIG` names a different server than the last build
 
 ## Fault injection
 
@@ -116,9 +118,7 @@ reaches:
 Restore ordinary build after gathering coverage:
 
 ```sh
-make -C pgext clean
-make -C pgext
-make -C pgext faultshim.so
+make -C pgext test-deps
 ```
 
 ## Loading
