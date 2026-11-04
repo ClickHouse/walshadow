@@ -146,4 +146,28 @@ mod tests {
     fn nothing_identity_never_has_a_key() {
         assert!(!table('n', true).has_row_key());
     }
+
+    #[test]
+    fn row_key_note_names_each_identity() {
+        let notes = [
+            ('d', true),
+            ('d', false),
+            ('n', false),
+            ('f', false),
+            ('i', false),
+            ('?', false),
+        ]
+        .map(|(ident, pk)| table(ident, pk).row_key_note());
+        assert_eq!(
+            notes,
+            [
+                "primary key",
+                "no primary key — add one, or SET REPLICA IDENTITY FULL",
+                "REPLICA IDENTITY NOTHING — deletes cannot be replicated",
+                "REPLICA IDENTITY FULL",
+                "REPLICA IDENTITY USING INDEX",
+                "unknown replica identity",
+            ]
+        );
+    }
 }
