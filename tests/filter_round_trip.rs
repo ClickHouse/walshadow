@@ -285,7 +285,7 @@ async fn vacuum_full_pg_depend_keeps_every_rebuilt_catalog_write() {
 async fn writes_filtered_segment_via_cli() {
     let seg = xlog_switch_segment();
     let out_dir = tempfile::tempdir().unwrap();
-    let exe = env!("CARGO_BIN_EXE_walshadow-filter");
+    let exe = std::env::var("CARGO_BIN_EXE_walshadow-filter").unwrap();
     let out = Command::new(exe)
         .arg("--in")
         .arg(&seg)
@@ -314,7 +314,7 @@ async fn writes_filtered_segment_via_cli() {
 async fn cli_prints_stats_line_without_quiet() {
     let seg = xlog_switch_segment();
     let out_dir = tempfile::tempdir().unwrap();
-    let exe = env!("CARGO_BIN_EXE_walshadow-filter");
+    let exe = std::env::var("CARGO_BIN_EXE_walshadow-filter").unwrap();
     let out = Command::new(exe)
         .arg("--in")
         .arg(&seg)

@@ -188,7 +188,7 @@ impl DaemonFlags {
 }
 
 fn spawn_daemon(flags: &DaemonFlags, stderr_path: &Path) -> Result<Child> {
-    let bin = env!("CARGO_BIN_EXE_walshadow-stream");
+    let bin = std::env::var("CARGO_BIN_EXE_walshadow-stream").unwrap();
     let stderr_file = fs::File::create(stderr_path).context("open daemon stderr log")?;
     let child = Command::new(bin)
         .args(flags.args())

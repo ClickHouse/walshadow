@@ -15,8 +15,74 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Rust build does not depend on PG major, so build instrumented tests once
+  # and let each matrix job run them from a nextest archive
+  build:
+    name: build tests (instrumented)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    # Coverage reads __llvm_cov sections, not DWARF. Line tables keep
+    # backtraces readable while shrinking archive
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+    outputs:
+      toolchain: ${{ steps.toolchain.outputs.version }}
+
+    steps:
+      - name: Checkout walshadow
+        uses: actions/checkout@v7
+        with:
+          path: walshadow
+          submodules: recursive
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+
+      # Test jobs install this exact version, profraw format follows LLVM
+      - name: Record toolchain
+        id: toolchain
+        run: echo "version=$(rustc --version | cut -d' ' -f2)" >> "$GITHUB_OUTPUT"
+
+      - name: Install cargo-llvm-cov + cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov,cargo-nextest
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: walshadow
+          key: cov
+
+      - name: Install C deps (lz4 + zstd for clickhouse-c-rs)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential liblz4-dev libzstd-dev
+
+      # Archived binaries keep compile time paths, so tests read
+      # CARGO_BIN_EXE_* at runtime. Source must sit at same path in test jobs
+      - name: Build + archive tests
+        working-directory: walshadow
+        run: |
+          cargo llvm-cov nextest-archive --workspace --all-targets --locked \
+            --archive-file "$RUNNER_TEMP/tests.tar.zst"
+
+      - name: Upload test archive
+        uses: actions/upload-artifact@v7
+        with:
+          name: nextest-archive
+          path: ${{ runner.temp }}/tests.tar.zst
+          # Already zstd
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 1
+
   test:
-    name: build + e2e (pg${{ matrix.pg-major }})
+    name: e2e (pg${{ matrix.pg-major }})
+    needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 60
 
@@ -45,8 +111,9 @@ jobs:
           submodules: recursive
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ needs.build.outputs.toolchain }}
           # cargo-llvm-cov uses tools from this component.
           components: llvm-tools-preview
 
@@ -56,14 +123,6 @@ jobs:
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-llvm-cov,cargo-nextest
-
-      - name: Cargo cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: walshadow
-          # Key on PG major so a feature/test-config change for one
-          # major doesn't poison the others' caches.
-          key: cov-pg${{ matrix.pg-major }}
 
       - name: Install C deps (lz4 + zstd for clickhouse-c-rs)
         run: |
@@ -159,6 +218,12 @@ jobs:
           sudo make PG_CONFIG=$PG_CONFIG COVERAGE=1 CC=gcc install
           make -C test PG_CONFIG=$PG_CONFIG
 
+      - name: Download test archive
+        uses: actions/download-artifact@v8
+        with:
+          name: nextest-archive
+          path: ${{ runner.temp }}
+
       # Each e2e test stages a source + shadow PG cluster on disk; the
       # runner's root fs is small, so point TMPDIR at the larger /mnt volume.
       - name: Set TMPDIR to /mnt
@@ -188,8 +253,8 @@ jobs:
         run: |
           initdb --version | grep -Eq '\) ${{ matrix.pg-major }}([.a-z]|$)' \
             || { echo "::error::initdb on PATH is not PostgreSQL ${{ matrix.pg-major }}"; exit 1; }
-          cargo llvm-cov clean --workspace
-          cargo llvm-cov nextest --workspace --all-targets --locked \
+          mkdir -p target/llvm-cov-target
+          cargo llvm-cov nextest --archive-file "$RUNNER_TEMP/tests.tar.zst" \
             --no-report --no-fail-fast
 
       - name: PG module coverage
@@ -220,13 +285,15 @@ jobs:
         if: ${{ !cancelled() }}
         continue-on-error: true
         working-directory: walshadow
-        run: cargo llvm-cov report --summary-only
+        run: cargo llvm-cov report --nextest-archive-file "$RUNNER_TEMP/tests.tar.zst" --summary-only
 
       - name: Coverage lcov.info
         if: ${{ !cancelled() }}
         continue-on-error: true
         working-directory: walshadow
-        run: cargo llvm-cov report --lcov --output-path lcov.info
+        run: |
+          cargo llvm-cov report --nextest-archive-file "$RUNNER_TEMP/tests.tar.zst" \
+            --lcov --output-path lcov.info
 
       - name: Upload lcov
         if: ${{ !cancelled() }}
