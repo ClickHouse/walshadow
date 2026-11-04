@@ -100,7 +100,7 @@ fn cli_produces_json_for_fixture() {
         return;
     }
 
-    let exe = env!("CARGO_BIN_EXE_walshadow-classify");
+    let exe = std::env::var("CARGO_BIN_EXE_walshadow-classify").unwrap();
     let out = Command::new(exe).arg("--json").arg(&seg).output().unwrap();
     assert!(
         out.status.success(),
@@ -118,7 +118,7 @@ fn cli_produces_human_summary_for_fixture() {
     if !tools::fixture(&seg) {
         return;
     }
-    let exe = env!("CARGO_BIN_EXE_walshadow-classify");
+    let exe = std::env::var("CARGO_BIN_EXE_walshadow-classify").unwrap();
     let out = Command::new(exe).arg(&seg).output().unwrap();
     assert!(
         out.status.success(),

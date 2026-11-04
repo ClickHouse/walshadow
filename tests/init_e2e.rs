@@ -141,7 +141,8 @@ fn init_bin(
     env_url: Option<&str>,
     bins: &std::path::Path,
 ) -> (bool, String, String) {
-    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_walshadow-stream"));
+    let mut cmd =
+        std::process::Command::new(std::env::var("CARGO_BIN_EXE_walshadow-stream").unwrap());
     cmd.arg("init")
         .args(args)
         .env("PATH", bins)

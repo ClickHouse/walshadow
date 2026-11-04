@@ -187,7 +187,7 @@ impl Harness {
 
         // Long-lived daemon: no --max-segments, so run_session streams
         // forever and the tests drive it live.
-        let bin = env!("CARGO_BIN_EXE_walshadow-stream").to_string();
+        let bin = std::env::var("CARGO_BIN_EXE_walshadow-stream").unwrap();
         // Shadow is daemon-owned, so the daemon writes the preload line itself
         // and only needs to be told where the un-installed module sits
         let pgext_dir = fx::pgext_dir();
@@ -1031,6 +1031,13 @@ async fn ctl_introspects_source_catalog() {
             &["id integer not null", "v text"],
         )?;
 
+        // Reload only learns which databases are followed once the session
+        // wires its resolvers, after bootstrap lands
+        h.wait_log(
+            "parallel decode+insert pipeline starting",
+            Duration::from_secs(30),
+        )
+        .await?;
         let added = h.ctl(&[
             "add",
             "app",

@@ -80,7 +80,7 @@ async fn optin_initial_load_none_skips_snapshot_but_streams_cdc() {
     let spill_dir = tmp.path().join("spill");
     fs::create_dir_all(&spill_dir).unwrap();
 
-    let bin = env!("CARGO_BIN_EXE_walshadow-stream");
+    let bin = std::env::var("CARGO_BIN_EXE_walshadow-stream").unwrap();
     let stderr_path = tmp.path().join("daemon.stderr.log");
     let stderr_file = fs::File::create(&stderr_path).expect("open daemon stderr log");
     let metrics_addr: SocketAddr = format!("127.0.0.1:{}", slot.metrics).parse().unwrap();

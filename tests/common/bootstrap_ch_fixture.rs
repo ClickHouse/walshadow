@@ -261,7 +261,7 @@ impl DaemonRun {
     ) -> Result<Child> {
         let stderr = fs::File::create(&self.stderr_path)
             .with_context(|| format!("create {}", self.stderr_path.display()))?;
-        Command::new(env!("CARGO_BIN_EXE_walshadow-stream"))
+        Command::new(std::env::var("CARGO_BIN_EXE_walshadow-stream").unwrap())
             .args([
                 "--host",
                 source.config().socket_dir.to_str().unwrap(),
