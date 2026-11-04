@@ -14,7 +14,9 @@ expected major's artifact before accepting merged result. An early-returned
 integration test does not establish coverage of its scenario
 
 Merged job caps missed lines, unique `(source file, DA line)` entries with zero
-hits, at 3115. Lower ceiling after each measured batch and finish at zero.
+hits, at `MAX_MISSED_LINES` in CI. Lower ceiling after each measured batch and
+finish at zero. Leave headroom for timing arms that flip between runs (about
+ten lines, in `shadow_proc` supervise and `shadow_stream` connection loop)
 Per-major LCOV `LF`/`LH` and native llvm-cov summaries count a larger set than DA
 entries, compare DA counts only against ceiling
 
@@ -23,7 +25,9 @@ stays out of Rust target
 
 LCOV covers `src/**`, including in-file `#[cfg(test)]` modules; integration
 tests under `tests/` are not counted. Generate fresh merged PG16/17/18/19
-coverage to establish hit/total counts and rank remaining misses
+coverage to establish hit/total counts and rank remaining misses. Latest main
+CI run carries `coverage-merged` (`merged.lcov`) and per-major `coverage-pgNN`
+artifacts, `gh run download <id> -n coverage-merged` fetches them
 
 ## Coverage conventions
 
@@ -82,7 +86,6 @@ place of a directory, read-only directory. CI runs as non-root, so permission
 faults hold
 
 Missing:
-- Unix-socket walreceiver client for `shadow_stream` Unix listener
 - Storage injection into object-store backfill pass, today built from settings
 - Retention trim interval, hard-coded, so the housekeeping loop never iterates in
   a test. Take interval from config or a hidden flag
@@ -92,6 +95,36 @@ Missing:
 ## Work list by area
 
 Check candidate gaps against fresh merged report before adding tests
+
+### Visibility
+
+Visibility verdicts are a frequent source of bugs, so rank these ahead of line
+count. Each scenario asserts CH end state against source, not just execution
+- Multixact xmax in base backup: rows share-locked by two concurrent xacts
+  before backup, so gate emits a tuple with `HEAP_XMAX_IS_MULTI` in stream and
+  resolve phases of `visibility_gate`
+- Wraparound drills via `pg_resetwal` on a fresh stopped cluster before daemon
+  attaches, so no WAL discontinuity reaches walshadow or shadow:
+  - `-m` just below 2^32, then multixacts crossing it, so `updater` reads
+    `mxid + 1` wrapping past FirstMultiXactId
+  - `-x`/`-e` across an epoch with pending xids open across opt-in
+  - jump counters then `VACUUM FREEZE` every database, so pg_xact and
+    pg_multixact truncate below a still-referenced id: `SlruRead::Truncated`,
+    `MemberRead::Truncated`, `MultiXactUpdater::Unresolvable`
+  - mxid allocated in an offsets segment past the copied ones reads
+    `Unwritten`, hence `Covered`
+
+  Zero-fill SLRU segment each new counter lands in, as PG
+  `src/test/modules/test_slru/t/002_multixact_wraparound.pl` does. Derive
+  segment names from counters, PG 19 widens multixact offsets. Every drill
+  owns its cluster in a per-test temp dir, so stopping it holds one `clusters`
+  slot and blocks no other test. PGDG ships no `xid_wraparound` module, so
+  `pg_resetwal` is the only path on CI majors
+- `visibility_pending::note_view` committed and aborted folds: resume with
+  pending xids outstanding whose outcome WAL precedes resume point, decided
+  from shadow pg_xact view
+- `visibility_pending` ship with no mapping, over slab size, disjoint columns,
+  settle after pending table dropped. `note_view`, empty `fresh_side` as units
 
 ### CLI and ops
 
@@ -111,17 +144,12 @@ Check candidate gaps against fresh merged report before adding tests
   branch and non-descendant boots, multi-db preflight, crossing retry/park and
   walsender reconnect via `control_plane_e2e` promotion drills. `task_stopped`,
   `SessionTasks::exited` outcomes and `adopt`/`shutdown` panic arms are units
-- `ops::control` introspection verbs (`tables`, `schemas`, `columns`,
-  `--database`): add missing `ctl` calls to `control_plane_e2e`. Covers
-  `ctl` render, `introspect`. Pure `ok_with`, malformed dispatch, `pg_connect`
-  empty host are units
-- `ops::init`: `remedy` per `PreflightError`, `select_tables`/`resolve_url` under
-  non-tty stdin, non-superuser source role in `init_e2e`. Spawn `init` subcommand
-  once to cover `InitArgs::into_opts` and dispatch. TTY picker needs a pty
+- `ops::control` pure `ok_with`, malformed dispatch, `pg_connect` empty host
+  as units
+- `ops::init` TTY picker and URL prompt need a pty, `BadReplicaIdentity` remedy
+  needs `ch_config` passed to source pre-flight
 - `ops::oracle` Native block decode validation and cell-count check as units.
   `text_value` via ADD COLUMN with oracle-rendered default
-- `tracing_setup` OTLP branch: spawn with an unreachable `--otlp-endpoint`,
-  invalid endpoint for parse error
 - `shadow_proc` supervise restart/backoff: immediate-stop shadow postmaster under
   graceful run, `probe_blocking` Err/panic as units
 - `preflight::bootstrap` window-leg sender check and `wal_from_archive` against CI PG
@@ -145,8 +173,6 @@ Check candidate gaps against fresh merged report before adding tests
 - `wal_replay`: window leg with toasted update, >64 subxacts, VACUUM FULL of
   toasted table, DELETE under append-only mapping, DDL inside window. Extend
   `bootstrap_window_ch`
-- `visibility_pending` ship with no mapping, over slab size, disjoint columns,
-  settle after pending table dropped. `note_view`, empty `fresh_side` as units
 - `bootstrap_marker` `ExtractedCheckpoint` write/read and `resumable_extraction`
   with no pin, mismatched pin, missing spool, valid checkpoint as units
 - `backup_page_walk` short page, bad line pointer, bad `t_hoff`, offnum bounds as
@@ -194,7 +220,8 @@ Check candidate gaps against fresh merged report before adding tests
 - `desc_log` decoder rejections: write log, patch magic, tag, CRC, header,
   identity fields, unknown kinds, reopen. Round-trip rare variants
 - `shadow_stream` state edges as units on `ShadowStreamState`, slow-client cap
-  with small threshold, Unix listener needs Unix walreceiver client
+  with small threshold. No product path constructs `WalSenderAddr::Unix`,
+  remove variant and its listener
 - `catalog::shadow` via fake `pg_bin_dir`, `wait_for_replay` timeout,
   `validate_running` mismatches in `shadow_lifecycle`
 - `streaming_walker` ShortRecord, ZeroRecord, zero tail, oversize continuation,
@@ -211,12 +238,13 @@ Check candidate gaps against fresh merged report before adding tests
 ## Sequencing
 
 1. Measure merged coverage, prune covered candidates and rank
-   remaining misses; lower 3115 ceiling if measured result permits
+   remaining misses; lower ceiling if measured result permits
 2. Pure units: decoders, corruption replays, parsers, Display, CLI args
 3. Seam lifts: mock walsender, `retry_server` codes, retention interval, storage
    injection
-4. Live scenarios: object-store backfill pass and resume, runtime config seed,
-   control verbs, window-leg shapes, pending tables, promotion drills
+4. Live scenarios: visibility and wraparound drills, object-store backfill pass
+   and resume, runtime config seed, window-leg shapes, pending tables,
+   promotion drills
 5. Fault arms left after above, via fs layout faults and new seams
 6. Enforce literal zero missed once no DA line remains uncovered
 

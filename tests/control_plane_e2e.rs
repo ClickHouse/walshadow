@@ -960,6 +960,201 @@ async fn status_names_tables_whose_wal_is_not_needed() {
     }
 }
 
+/// Match `ctl` reply to `want` line by line, collapsing runs of whitespace
+/// since `ctl` pads table columns to their widest cell
+fn ensure_lines(what: &str, out: &str, want: &[&str]) -> Result<()> {
+    let got: Vec<String> = out
+        .lines()
+        .map(|l| l.split_whitespace().collect::<Vec<_>>().join(" "))
+        .collect();
+    let missing: Vec<&str> = want
+        .iter()
+        .copied()
+        .filter(|w| !got.iter().any(|g| g == w))
+        .collect();
+    let extra: Vec<&str> = got
+        .iter()
+        .map(String::as_str)
+        .filter(|g| !want.contains(g))
+        .collect();
+    ensure!(
+        missing.is_empty() && extra.is_empty(),
+        "{what}: missing {missing:?}, extra {extra:?} in:\n{out}"
+    );
+    ensure!(got == want, "{what}: want order {want:?} in:\n{out}");
+    Ok(())
+}
+
+/// Picker verbs read source catalog over SQL, `--database` reads a database
+/// this process does not follow, and a reload naming that database says so
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ctl_introspects_source_catalog() {
+    if !gated() {
+        return;
+    }
+    let mut h = Harness::up(&fx::Ports::alloc())
+        .await
+        .expect("bring up harness");
+
+    let result = async {
+        h.source.apply_schema_dump(
+            "CREATE TABLE demo.bare (n int);\n\
+             CREATE DATABASE other;\n\
+             \\c other\n\
+             CREATE SCHEMA app;\n\
+             CREATE TABLE app.t (id int PRIMARY KEY, v text);\n\
+             ALTER TABLE app.t REPLICA IDENTITY NOTHING;\n",
+        )?;
+
+        let demo_tables = ["demo bare no row key", "* demo users identity f"];
+        ensure_lines("tables demo", &h.ctl(&["tables", "demo"])?, &demo_tables)?;
+        ensure_lines("tables", &h.ctl(&["tables"])?, &demo_tables)?;
+        ensure_lines("schemas", &h.ctl(&["schemas"])?, &["demo", "public"])?;
+        ensure_lines(
+            "columns",
+            &h.ctl(&["columns", "demo", "users"])?,
+            &[
+                "id bigint not null",
+                "name text not null",
+                "email text not null",
+            ],
+        )?;
+
+        ensure_lines(
+            "schemas other",
+            &h.ctl(&["schemas", "--database", "other"])?,
+            &["app", "public"],
+        )?;
+        ensure_lines(
+            "columns other",
+            &h.ctl(&["columns", "app", "t", "--database", "other"])?,
+            &["id integer not null", "v text"],
+        )?;
+
+        let added = h.ctl(&[
+            "add",
+            "app",
+            "t",
+            "--database",
+            "other",
+            "--initial-load",
+            "none",
+        ])?;
+        ensure!(
+            added == "config names other this process does not follow; restart to replicate",
+            "add other: {added}"
+        );
+        ensure_lines(
+            "tables other",
+            &h.ctl(&["tables", "app", "--database", "other"])?,
+            &["* app t no row key"],
+        )?;
+        let status: toml::Table = h.ctl(&["status"])?.parse()?;
+        let other: Vec<&str> = status
+            .get("databases")
+            .and_then(toml::Value::as_array)
+            .context("no databases in status")?
+            .iter()
+            .filter(|db| db.get("dbname").and_then(toml::Value::as_str) == Some("other"))
+            .filter_map(|db| db.get("tables").and_then(toml::Value::as_array))
+            .flatten()
+            .filter_map(|t| t.get("source_table").and_then(toml::Value::as_str))
+            .collect();
+        ensure!(other == ["other.app.t"], "status other tables: {status}");
+
+        h.sighup()?;
+        h.wait_log(
+            "config names databases this process does not follow",
+            Duration::from_secs(10),
+        )
+        .await?;
+        h.ctl(&["remove", "app", "t", "--database", "other"])?;
+
+        let show: toml::Table = h.ctl(&["show"])?.parse()?;
+        let replicate_all = show
+            .get("stream")
+            .and_then(|s| s.get("replicate_all"))
+            .and_then(toml::Value::as_bool);
+        ensure!(replicate_all == Some(false), "show: {show}");
+        let err = h.ctl(&["bogus"]).unwrap_err().to_string();
+        ensure!(err.contains("unknown command bogus"), "bogus verb: {err}");
+
+        // Unparseable fragment fails reload, daemon keeps serving
+        let broken = h.frag_path.with_file_name("60-broken.toml");
+        fs::write(&broken, "[stream\n").context("write broken fragment")?;
+        h.sighup()?;
+        h.wait_log("reload failed", Duration::from_secs(10)).await?;
+        fs::remove_file(&broken).context("remove broken fragment")?;
+        h.psql("UPDATE demo.users SET email = 'after-introspect@x' WHERE id = 1")?;
+        h.wait_ch(USER_EMAIL, "after-introspect@x", Duration::from_secs(15))
+            .await?;
+        ensure!(h.alive(), "daemon exited");
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+
+    let stderr = h.teardown();
+    if let Err(e) = result {
+        panic!("{e:#}\n--- daemon stderr ---\n{stderr}");
+    }
+}
+
+/// OTLP export never blocks the pipeline: an unreachable collector still
+/// opens a span per sampled txn, and an endpoint the exporter rejects boots
+/// without traces
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn otlp_export_failures_keep_streaming() {
+    if !gated() {
+        return;
+    }
+    let mut h = Harness::up(&fx::Ports::alloc())
+        .await
+        .expect("bring up harness");
+
+    let result = async {
+        // Nothing listens on port 1, so every export is refused
+        h.args.extend(
+            [
+                "--otlp-endpoint",
+                "http://127.0.0.1:1",
+                "--trace-sample-ratio",
+                "1",
+            ]
+            .map(String::from),
+        );
+        h.restart(Duration::from_secs(60)).await?;
+        h.psql("UPDATE demo.users SET email = 'traced@x' WHERE id = 1")?;
+        h.psql("BEGIN; UPDATE demo.users SET email = 'aborted@x' WHERE id = 1; ROLLBACK")?;
+        h.psql("UPDATE demo.users SET email = 'traced-after-abort@x' WHERE id = 1")?;
+        h.wait_ch(USER_EMAIL, "traced-after-abort@x", Duration::from_secs(15))
+            .await?;
+
+        let endpoint = h
+            .args
+            .iter()
+            .position(|a| a == "--otlp-endpoint")
+            .context("otlp flag")?;
+        h.args[endpoint + 1] = "::not a uri::".into();
+        h.restart(Duration::from_secs(60)).await?;
+        h.wait_log(
+            "OTLP exporter init failed for ::not a uri::",
+            Duration::from_secs(10),
+        )
+        .await?;
+        h.psql("UPDATE demo.users SET email = 'untraced@x' WHERE id = 1")?;
+        h.wait_ch(USER_EMAIL, "untraced@x", Duration::from_secs(15))
+            .await?;
+        ensure!(h.alive(), "daemon exited");
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+
+    let stderr = h.teardown();
+    if let Err(e) = result {
+        panic!("{e:#}\n--- daemon stderr ---\n{stderr}");
+    }
+}
+
 /// Regression: applying one table used to opt pinned tables out
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn apply_preserves_previously_pinned_table() {

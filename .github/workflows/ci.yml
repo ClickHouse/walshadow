@@ -281,7 +281,7 @@ jobs:
       - name: Coverage summary
         working-directory: walshadow
         env:
-          MAX_MISSED_LINES: 2950
+          MAX_MISSED_LINES: 2470
         run: |
           awk -F'[:,]' -v max="$MAX_MISSED_LINES" '
             /^DA:/ { f++; if ($3 > 0) h++ }

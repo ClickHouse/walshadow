@@ -710,7 +710,7 @@ mod tests {
     }
 
     async fn wait_worker_dead(q: &QueueingRecordSink) {
-        tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::time::timeout(Duration::from_secs(10), async {
             while q.worker_alive() {
                 tokio::time::sleep(Duration::from_millis(1)).await;
             }

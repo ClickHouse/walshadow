@@ -133,3 +133,160 @@ async fn init_probes_both_ends_and_writes_a_bootable_config() {
     .expect_err("existing config is not overwritten");
     assert!(again.to_string().contains("--force"), "{again}");
 }
+
+/// `walshadow-stream init` with stdin closed, PATH holding only `bins`.
+/// Returns (success, stdout, stderr)
+fn init_bin(
+    args: &[&str],
+    env_url: Option<&str>,
+    bins: &std::path::Path,
+) -> (bool, String, String) {
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_walshadow-stream"));
+    cmd.arg("init")
+        .args(args)
+        .env("PATH", bins)
+        .env_remove(walshadow::init::PG_URL_ENV)
+        .env_remove(walshadow::init::CH_URL_ENV)
+        .env_remove("WALSHADOW_CH_CONFIG")
+        .stdin(std::process::Stdio::null());
+    if let Some(url) = env_url {
+        cmd.env(walshadow::init::PG_URL_ENV, url);
+    }
+    let out = cmd.output().expect("spawn init");
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// Spawned `init` on a source the daemon cannot use yet: every finding comes
+/// with its fix, and paths that would prompt refuse without a terminal
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn init_subcommand_reports_fixes_without_a_terminal() {
+    if !fx::tools::pg_available() {
+        return;
+    }
+    if !fx::tools::clickhouse_available() {
+        return;
+    }
+
+    let slot = fx::Ports::alloc();
+    let tmp = tempfile::tempdir().unwrap();
+
+    // Base conf only: wal_level = replica, max_wal_senders = 0
+    let source = fx::make_source(&tmp);
+    source.initdb().expect("initdb source");
+    source.write_base_conf().expect("source base conf");
+    source.start().expect("start source");
+    let _src_stop = fx::StopOnDrop { sh: &source };
+    source
+        .apply_schema_dump(
+            "CREATE ROLE app LOGIN;\n\
+             CREATE SCHEMA app AUTHORIZATION app;\n\
+             CREATE SCHEMA empty;\n\
+             CREATE TABLE app.users (id int4 PRIMARY KEY, name text);\n",
+        )
+        .expect("source schema");
+
+    let ch_tmp = tempfile::tempdir().unwrap();
+    let _ch = fx::ChServer::spawn(ch_tmp, slot.ch_tcp, slot.ch_http).expect("spawn ch");
+    let ch_url = format!("clickhouse://default@127.0.0.1:{}/cdc", slot.ch_tcp);
+    let encoded = source
+        .config()
+        .socket_dir
+        .to_str()
+        .unwrap()
+        .replace('/', "%2F");
+    let app_url = format!(
+        "postgres://app@/postgres?host={encoded}&port={}&sslmode=disable&slot=absent",
+        fx::PG_SOURCE_PORT
+    );
+
+    // Empty PATH: no `initdb` for the shadow major check
+    let no_bins = tmp.path().join("no-bins");
+    fs::create_dir_all(&no_bins).unwrap();
+    // `initdb` of a major no source runs
+    let old_bins = tmp.path().join("old-bins");
+    fs::create_dir_all(&old_bins).unwrap();
+    let fake_initdb = old_bins.join("initdb");
+    fs::write(
+        &fake_initdb,
+        "#!/bin/sh\necho 'initdb (PostgreSQL) 9.6.24'\n",
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&fake_initdb, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let config = tmp.path().join("etc/walshadow/ch-config.toml");
+    let config_arg = config.to_str().unwrap();
+
+    let (ok, _, err) = init_bin(&["--config", config_arg], None, &no_bins);
+    assert!(!ok);
+    assert!(err.contains("no Source Postgres URL"), "{err}");
+
+    let (ok, _, err) = init_bin(&["--config", config_arg], Some(&app_url), &no_bins);
+    assert!(!ok);
+    assert!(err.contains("no ClickHouse URL"), "{err}");
+
+    let base = ["--config", config_arg, "--ch-url", ch_url.as_str()];
+    let (ok, _, err) = init_bin(
+        &[&base[..], &["--table", "app", "nope"][..]].concat(),
+        Some(&app_url),
+        &no_bins,
+    );
+    assert!(!ok);
+    assert!(err.contains("app.nope not found on source"), "{err}");
+
+    let (ok, out, err) = init_bin(
+        &[
+            &base[..],
+            &["--table", "app", "users", "--initial-load", "none"][..],
+        ]
+        .concat(),
+        Some(&app_url),
+        &old_bins,
+    );
+    assert!(ok, "{err}");
+    for want in [
+        "ALTER SYSTEM SET wal_level = logical;",
+        "SELECT pg_create_physical_replication_slot('absent');",
+        "✗ app lacks REPLICATION",
+        "ALTER ROLE app REPLICATION;",
+        "✗ max_wal_senders = 0",
+        "shadow binaries are PostgreSQL 9, source is",
+        "fix the ✗ items above first",
+    ] {
+        assert!(out.contains(want), "missing {want:?} in:\n{out}");
+    }
+    let root: toml::Table = fs::read_to_string(&config).unwrap().parse().unwrap();
+    let cfg = EmitterConfig::from_table(&root).expect("[ch]");
+    let users = cfg
+        .table_opt_ins
+        .get(&RelName::new("app", "users"))
+        .expect("named table opted in");
+    assert_eq!(users.initial_load.as_deref(), Some("none"));
+
+    let (ok, out, err) = init_bin(
+        &[
+            &base[..],
+            &["--force", "--all-tables", "--schema", "empty"][..],
+        ]
+        .concat(),
+        Some(&app_url),
+        &no_bins,
+    );
+    assert!(ok, "{err}");
+    assert!(out.contains("no `initdb` on PATH"), "{out}");
+    assert!(out.contains("no tables selected"), "{out}");
+
+    let (ok, _, err) = init_bin(
+        &[&base[..], &["--force"][..]].concat(),
+        Some(&app_url),
+        &no_bins,
+    );
+    assert!(!ok);
+    assert!(err.contains("no terminal for the table picker"), "{err}");
+}
