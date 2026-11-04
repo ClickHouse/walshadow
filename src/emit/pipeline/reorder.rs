@@ -1548,7 +1548,13 @@ impl RecordSink for ReorderSink {
     fn on_close<'a>(
         &'a mut self,
     ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
-        Box::pin(self.out.flush_pending())
+        Box::pin(async move {
+            self.resolver
+                .flush_mirror()
+                .await
+                .map_err(|e| SinkError::Other(format!("toast store flush: {e}")))?;
+            self.out.flush_pending().await
+        })
     }
 
     fn on_record<'a>(

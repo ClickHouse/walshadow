@@ -266,6 +266,18 @@ impl MemoryBudget {
         permit
     }
 
+    /// [`Self::acquire`] without waiting: `None` when pool is short or
+    /// `bytes` would overshoot leaf reserve
+    pub fn try_acquire(&self, bytes: usize) -> Option<MemoryPermit> {
+        if bytes > self.inner.leaf_max {
+            return None;
+        }
+        let units = units_for(bytes);
+        self.inner
+            .try_take(word(units, 0), Queue::Pool.bit())
+            .then(|| self.permit(bytes, units, 0))
+    }
+
     /// Reserve `bytes` at pipeline entry from `total - leaf_reserve`.
     /// Take units from both compartments together when available. Otherwise,
     /// wait for admission units before pool units to prevent deadlocks.

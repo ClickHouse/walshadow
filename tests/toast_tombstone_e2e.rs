@@ -216,7 +216,8 @@ async fn tombstones_supersede_then_truncate_wipes_then_drop_retires() {
 
     // Rows ride commit drains; poll until all three values + both deaths'
     // tombstones landed (A + C are 5 chunks each at ~2KB chunk size).
-    fx::wait_query(
+    fx::wait_mirror(
+        &pipeline,
         &ch,
         &format!(
             "SELECT countDistinct(chunk_id) - 1, countIf(_is_deleted = 1) \
@@ -374,7 +375,8 @@ async fn tombstones_supersede_then_truncate_wipes_then_drop_retires() {
     let _ = driver.join();
     assert!(shipped >= 1, "truncate segment never shipped");
     // Whole-table sums: merge-stable (post-wipe rows are single-version).
-    fx::wait_query(
+    fx::wait_mirror(
+        &pipeline,
         &ch,
         &format!(
             "SELECT countDistinct(chunk_id), sum(length(chunk_data)), \
@@ -435,7 +437,8 @@ async fn tombstones_supersede_then_truncate_wipes_then_drop_retires() {
     let shipped = fx::pump_segments(&mut pipeline, 1, Duration::from_secs(45)).await;
     let _ = driver.join();
     assert!(shipped >= 1, "post-floor poke segment never shipped");
-    fx::wait_query(
+    fx::wait_mirror(
+        &pipeline,
         &ch,
         &format!("SELECT count() FROM {chunk_table}"),
         "0",

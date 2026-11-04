@@ -1133,6 +1133,89 @@ impl ChunkStore for ClickHouseChunkStore {
     }
 }
 
+#[derive(Default)]
+struct PendingMirror {
+    rows: Vec<ToastRow>,
+    bytes: usize,
+    permits: Vec<crate::budget::MemoryPermit>,
+    tids: HashSet<(u32, u32, u32, u16)>,
+    /// First INSERT error, returned by every later flush
+    failed: Option<String>,
+}
+
+impl PendingMirror {
+    fn collides(&self, batch: &[ToastRow]) -> bool {
+        batch.iter().any(|r| self.tids.contains(&tid_of(r)))
+    }
+
+    fn push(
+        &mut self,
+        batch: Vec<ToastRow>,
+        bytes: usize,
+        permit: Option<crate::budget::MemoryPermit>,
+    ) {
+        self.tids.extend(batch.iter().map(tid_of));
+        self.rows.extend(batch);
+        self.bytes += bytes;
+        self.permits.extend(permit);
+    }
+
+    fn clear(&mut self) {
+        self.rows.clear();
+        self.permits.clear();
+        self.tids.clear();
+        self.bytes = 0;
+    }
+}
+
+fn tid_of(r: &ToastRow) -> (u32, u32, u32, u16) {
+    (r.db_oid, r.toast_relid, r.blkno, r.offnum)
+}
+
+async fn put_rows(
+    store: &dyn ChunkStore,
+    stats: &EmitterStats,
+    rows: &[ToastRow],
+) -> Result<(), ChunkStoreError> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let started = std::time::Instant::now();
+    store.put(rows).await?;
+    stats
+        .toast_chunk_put_nanos
+        .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    stats.toast_chunk_puts.fetch_add(1, Ordering::Relaxed);
+    let tombstones = rows.iter().filter(|r| r.is_tombstone()).count() as u64;
+    stats
+        .toast_chunks_stored
+        .fetch_add(rows.len() as u64 - tombstones, Ordering::Relaxed);
+    stats
+        .toast_tombstones_stored
+        .fetch_add(tombstones, Ordering::Relaxed);
+    Ok(())
+}
+
+async fn put_rows_batched(
+    store: &dyn ChunkStore,
+    stats: &EmitterStats,
+    limits: (usize, usize),
+    rows: &[ToastRow],
+) -> Result<(), ChunkStoreError> {
+    let reached = |n: usize, bytes: usize| n >= limits.0 || bytes >= limits.1;
+    let mut start = 0usize;
+    let mut bytes = 0usize;
+    for (i, r) in rows.iter().enumerate() {
+        if i > start && reached(i - start, bytes) {
+            put_rows(store, stats, &rows[start..i]).await?;
+            start = i;
+            bytes = 0;
+        }
+        bytes += r.chunk_data.len();
+    }
+    put_rows(store, stats, &rows[start..]).await
+}
+
 /// TOAST resolution policy and optional store
 #[derive(Clone)]
 pub struct ToastResolver {
@@ -1150,6 +1233,7 @@ pub struct ToastResolver {
     budget: Option<crate::budget::MemoryBudget>,
     /// Pending reads consumed by commit-ordered planning
     ahead: Option<Arc<std::sync::Mutex<PendingReads>>>,
+    pending: Arc<tokio::sync::Mutex<PendingMirror>>,
 }
 
 impl ToastResolver {
@@ -1164,6 +1248,7 @@ impl ToastResolver {
             overflow: InlineValueOverflow::default(),
             budget: None,
             ahead: None,
+            pending: Arc::default(),
         }
     }
 
@@ -1225,6 +1310,7 @@ impl ToastResolver {
             overflow: emitter.inline_value_overflow,
             budget: None,
             ahead: None,
+            pending: Arc::default(),
         }
     }
 
@@ -1240,6 +1326,7 @@ impl ToastResolver {
             overflow: InlineValueOverflow::default(),
             budget: None,
             ahead: None,
+            pending: Arc::default(),
         }
     }
 
@@ -1318,17 +1405,17 @@ impl ToastResolver {
     }
 
     async fn read_raw(&self, db_oid: u32, p: ToastPointer, lsn: u64) -> Option<Vec<u8>> {
+        // Unflushed mirror rows read as a miss, foreground resolution refetches
         let got = self
-            .fetch_value(
+            .fetch_stored(
                 db_oid,
                 p.va_toastrelid,
-                p.va_valueid,
+                &[(p.va_valueid, pointer_extsize(&p))],
                 lsn,
-                pointer_extsize(&p),
             )
             .await
             .ok()??;
-        let FetchedValue::Assembled(stored) = got else {
+        let Some(FetchedValue::Assembled(stored)) = got.into_iter().next() else {
             return None;
         };
         finish_value(&p, stored).ok()
@@ -1472,6 +1559,19 @@ impl ToastResolver {
         values: &[(u32, usize)],
         max_lsn: u64,
     ) -> Result<Option<Vec<FetchedValue>>, ChunkStoreError> {
+        self.flush_mirror().await?;
+        self.fetch_stored(db_oid, toast_relid, values, max_lsn)
+            .await
+    }
+
+    /// [`Self::fetch_values`] blind to unflushed mirror rows
+    async fn fetch_stored(
+        &self,
+        db_oid: u32,
+        toast_relid: u32,
+        values: &[(u32, usize)],
+        max_lsn: u64,
+    ) -> Result<Option<Vec<FetchedValue>>, ChunkStoreError> {
         let Some(store) = &self.store else {
             return Ok(None);
         };
@@ -1509,23 +1609,7 @@ impl ToastResolver {
         let Some(store) = &self.store else {
             return Ok(());
         };
-        if rows.is_empty() {
-            return Ok(());
-        }
-        let started = std::time::Instant::now();
-        store.put(rows).await?;
-        self.stats
-            .toast_chunk_put_nanos
-            .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
-        self.stats.toast_chunk_puts.fetch_add(1, Ordering::Relaxed);
-        let tombstones = rows.iter().filter(|r| r.is_tombstone()).count() as u64;
-        self.stats
-            .toast_chunks_stored
-            .fetch_add(rows.len() as u64 - tombstones, Ordering::Relaxed);
-        self.stats
-            .toast_tombstones_stored
-            .fetch_add(tombstones, Ordering::Relaxed);
-        Ok(())
+        put_rows(store.as_ref(), &self.stats, rows).await
     }
 
     /// Overlapping puts for a caller that keeps filling batches meanwhile
@@ -1557,30 +1641,67 @@ impl ToastResolver {
                 bytes += rows[end].chunk_data.len();
                 end += 1;
             }
-            let _leaf = crate::budget::acquire_opt(self.budget.as_ref(), bytes).await;
+            // Pending rows hold leaves only a flush releases
+            let mut leaf = self.budget.as_ref().and_then(|b| b.try_acquire(bytes));
+            if leaf.is_none()
+                && let Some(budget) = &self.budget
+            {
+                self.flush_mirror().await?;
+                leaf = Some(budget.acquire(bytes).await);
+            }
             let mut batch: Vec<ToastRow> = Vec::with_capacity(end - start);
             for r in &rows[start..end] {
                 batch.push(r.materialize(spool)?);
             }
-            self.put(&batch).await?;
+            let mut pending = self.pending.lock().await;
+            if pending.collides(&batch) {
+                self.flush_locked(&mut pending).await?;
+            }
+            pending.push(batch, bytes, leaf);
+            if self.put_limit_reached(pending.rows.len(), pending.bytes) {
+                self.flush_locked(&mut pending).await?;
+            }
             start = end;
         }
         Ok(())
     }
 
+    pub async fn flush_mirror(&self) -> Result<(), ChunkStoreError> {
+        let mut pending = self.pending.lock().await;
+        self.flush_locked(&mut pending).await
+    }
+
+    async fn flush_locked(&self, pending: &mut PendingMirror) -> Result<(), ChunkStoreError> {
+        if let Some(e) = &pending.failed {
+            return Err(ChunkStoreError::Clickhouse(e.clone()));
+        }
+        let Some(store) = &self.store else {
+            return Ok(());
+        };
+        let put = put_rows_batched(
+            store.as_ref(),
+            &self.stats,
+            self.put_limits(),
+            &pending.rows,
+        );
+        if let Err(e) = put.await {
+            pending.failed = Some(e.to_string());
+            return Err(e);
+        }
+        pending.clear();
+        Ok(())
+    }
+
     /// [`Self::put`] in WAL-order slices sealed at configured row or byte limit
     pub async fn put_batched(&self, rows: &[ToastRow]) -> Result<(), ChunkStoreError> {
-        let mut start = 0usize;
-        let mut bytes = 0usize;
-        for (i, r) in rows.iter().enumerate() {
-            if i > start && self.put_limit_reached(i - start, bytes) {
-                self.put(&rows[start..i]).await?;
-                start = i;
-                bytes = 0;
-            }
-            bytes += r.chunk_data.len();
-        }
-        self.put(&rows[start..]).await
+        let Some(store) = &self.store else {
+            return Ok(());
+        };
+        put_rows_batched(store.as_ref(), &self.stats, self.put_limits(), rows).await
+    }
+
+    fn put_limits(&self) -> (usize, usize) {
+        (self.put_batch_rows, self.put_batch_bytes)
     }
 
     async fn clear_mirror(
@@ -1592,6 +1713,7 @@ impl ToastResolver {
         let Some(store) = &self.store.as_ref().filter(|s| s.accepts_writes()) else {
             return Ok(());
         };
+        self.flush_mirror().await?;
         store.truncate_mirror(db_oid, toast_relid).await?;
         metric.fetch_add(1, Ordering::Relaxed);
         Ok(())
@@ -1629,6 +1751,7 @@ impl ToastResolver {
         let Some(store) = &self.store.as_ref().filter(|s| s.accepts_writes()) else {
             return Ok(());
         };
+        self.flush_mirror().await?;
         store
             .rewrite_barrier(db_oid, toast_relid, marker_lsn, commit_lsn)
             .await?;
@@ -2291,6 +2414,7 @@ mod tests {
         r.put_row_refs(Some(w.shared().as_ref()), &refs)
             .await
             .unwrap();
+        r.flush_mirror().await.unwrap();
         let got = store.fetch(0, 16500, 7, u64::MAX, 12).await.unwrap();
         assert_eq!(got, assembled(b"aaaabbbbcccc"));
         // Tombstone materializes bodiless, no spool needed
@@ -2427,6 +2551,7 @@ mod tests {
             lsn: 0x1000,
         }];
         r.put_row_refs(None, &refs).await.unwrap();
+        r.flush_mirror().await.unwrap();
         assert_eq!(
             store.fetch(0, 16500, 7, u64::MAX, 2 << 10).await.unwrap(),
             assembled(&[0u8; 2 << 10])
@@ -2548,6 +2673,152 @@ mod tests {
         drop(a);
     }
 
+    fn mirror_ref(seq: u32, body: &'static [u8]) -> [ToastRowRef; 1] {
+        [ToastRowRef {
+            db_oid: 0,
+            toast_relid: 16500,
+            blkno: 1,
+            offnum: 1 + seq as u16,
+            chunk_id: 7,
+            chunk_seq: seq,
+            chunk_data: Body::Mem(Bytes::from_static(body)),
+            lsn: 0x1000 + u64::from(seq),
+        }]
+    }
+
+    #[tokio::test]
+    async fn mirror_rows_batch_across_commits_until_a_trigger() {
+        let store = Arc::new(MemChunkStore::new());
+        let stats = Arc::new(EmitterStats::default());
+        let r = ToastResolver::with_store(store.clone(), stats.clone());
+        let one = |seq| mirror_ref(seq, b"ab");
+        for seq in 0..5 {
+            r.put_row_refs(None, &one(seq)).await.unwrap();
+        }
+        assert_eq!(
+            stats.toast_chunk_puts.load(Ordering::Relaxed),
+            0,
+            "five commits well under the limit issue no INSERT"
+        );
+
+        assert!(
+            r.fetch_values(0, 16500, &[(7, 10)], u64::MAX)
+                .await
+                .unwrap()
+                .is_some(),
+            "a store read must see the rows buffered before it"
+        );
+        assert_eq!(
+            stats.toast_chunk_puts.load(Ordering::Relaxed),
+            1,
+            "the read flushed all five as one INSERT"
+        );
+        assert_eq!(
+            store.fetch(0, 16500, 7, u64::MAX, 10).await.unwrap(),
+            assembled(&b"ab".repeat(5))
+        );
+
+        r.put_row_refs(None, &one(5)).await.unwrap();
+        r.flush_mirror().await.unwrap();
+        assert_eq!(
+            stats.toast_chunk_puts.load(Ordering::Relaxed),
+            2,
+            "the floor flush drains the tail"
+        );
+        r.flush_mirror().await.unwrap();
+        assert_eq!(
+            stats.toast_chunk_puts.load(Ordering::Relaxed),
+            2,
+            "flushing an empty buffer issues nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn speculative_reads_leave_mirror_rows_pending() {
+        let store = Arc::new(MemChunkStore::new());
+        let stats = Arc::new(EmitterStats::default());
+        let r = ToastResolver::with_store(store.clone(), stats.clone())
+            .with_budget(crate::budget::MemoryBudget::new(1 << 20))
+            .with_read_ahead();
+        r.put_row_refs(None, &mirror_ref(0, b"ab")).await.unwrap();
+        r.read_ahead(
+            0,
+            ToastPointer {
+                va_rawsize: VARHDRSZ + 2,
+                va_extinfo: 2,
+                va_valueid: 7,
+                va_toastrelid: 16500,
+            },
+            crate::schema::TEXTOID,
+            0x2000,
+        );
+        // Store read misses within same poll on current_thread runtime
+        while stats.toast_values_read_ahead.load(Ordering::Relaxed) == 0 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(stats.toast_chunk_puts.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            r.fetch_value(0, 16500, 7, 0x2000, 2).await.unwrap(),
+            Some(assembled(b"ab")),
+            "foreground read flushes first"
+        );
+        assert_eq!(stats.toast_chunk_puts.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn leaf_held_by_pending_rows_flushes_instead_of_waiting() {
+        const BODY: &[u8] = &[0u8; 768];
+        let stats = Arc::new(EmitterStats::default());
+        let r = ToastResolver::with_store(Arc::new(MemChunkStore::new()), stats.clone())
+            .with_budget(crate::budget::MemoryBudget::new(1024));
+        r.put_row_refs(None, &mirror_ref(0, BODY)).await.unwrap();
+        assert_eq!(stats.toast_chunk_puts.load(Ordering::Relaxed), 0);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            r.put_row_refs(None, &mirror_ref(1, BODY)),
+        )
+        .await
+        .expect("leaf acquire waited on pending rows")
+        .unwrap();
+        assert_eq!(stats.toast_chunk_puts.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn failed_mirror_flush_stays_failed_and_keeps_rows() {
+        #[derive(Default)]
+        struct Failing(AtomicUsize);
+        #[async_trait]
+        impl ChunkStore for Failing {
+            fn accepts_writes(&self) -> bool {
+                true
+            }
+            async fn put(&self, _rows: &[ToastRow]) -> Result<(), ChunkStoreError> {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                Err(ChunkStoreError::Clickhouse("down".into()))
+            }
+            async fn fetch_many(
+                &self,
+                _db_oid: u32,
+                _toast_relid: u32,
+                _values: &[(u32, usize)],
+                _max_lsn: u64,
+            ) -> Result<Vec<FetchedValue>, ChunkStoreError> {
+                unreachable!()
+            }
+        }
+        let store = Arc::new(Failing::default());
+        let budget = crate::budget::MemoryBudget::new(1 << 20);
+        let r =
+            ToastResolver::with_store(store.clone(), Arc::default()).with_budget(budget.clone());
+        r.put_row_refs(None, &mirror_ref(0, b"ab")).await.unwrap();
+        let held = budget.resident_bytes();
+        assert!(held > 0);
+        assert!(r.flush_mirror().await.is_err());
+        assert!(r.flush_mirror().await.is_err());
+        assert_eq!(store.0.load(Ordering::Relaxed), 1, "no retry after failure");
+        assert_eq!(budget.resident_bytes(), held, "rows outlive failed INSERT");
+    }
+
     #[tokio::test]
     async fn put_batched_preserves_order_across_slices() {
         let store = Arc::new(MemChunkStore::new());
@@ -2616,6 +2887,7 @@ mod tests {
                     let rows: Vec<_> = refs.iter().map(|r| r.materialize(None).unwrap()).collect();
                     resolver.put_batched(&rows).await.unwrap();
                 }
+                resolver.flush_mirror().await.unwrap();
                 assert_eq!(stats.toast_chunk_puts.load(Ordering::Relaxed), puts);
                 assert_eq!(
                     store.fetch(0, 16500, 7, u64::MAX, 14).await.unwrap(),
