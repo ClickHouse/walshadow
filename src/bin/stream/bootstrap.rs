@@ -607,6 +607,7 @@ pub(crate) async fn run_bootstrap(
                 tokio::fs::remove_file(&spool_path).await.ok();
             }
             let catalog = drain_catalog.clone();
+            let gate_counters = bootstrap_stats.clone();
             gate_handles.push(tokio_util::task::AbortOnDropHandle::new(tokio::spawn(
                 async move {
                     let mut spool = match inherit {
@@ -629,6 +630,7 @@ pub(crate) async fn run_bootstrap(
                         &catalog,
                         &mut spool,
                         &mut gate_stats,
+                        &gate_counters,
                         None,
                     )
                     .await
@@ -924,6 +926,12 @@ pub(crate) async fn run_bootstrap(
         // Referrers the lanes handed back. One lane reaching its end proves
         // nothing about a sibling's chunk puts, so resolution waits for all
         // of them, then replays each spool on the tail that drained it
+        let coverage = window.as_mut().map(|w| {
+            Arc::new(walshadow::emit::pipeline::bootstrap::WindowCoverage {
+                page_bound: resolver.stores_chunks(),
+                replaced: std::mem::take(&mut w.replaced),
+            })
+        });
         let mut handback = Vec::with_capacity(lanes);
         let mut handback_at = Vec::with_capacity(lanes);
         for (i, outcome) in drain_outcome.iter_mut().enumerate() {
@@ -940,7 +948,7 @@ pub(crate) async fn run_bootstrap(
         }
         let mut deferred_rows = 0;
         if !handback.is_empty() {
-            match sink.resolve_deferred(handback).await {
+            match sink.resolve_deferred(handback, coverage.clone()).await {
                 Ok(resolved) => {
                     for (i, lane) in handback_at.into_iter().zip(resolved) {
                         drain_outcome[i].next_seq = lane.next_seq;
@@ -981,6 +989,7 @@ pub(crate) async fn run_bootstrap(
             sink,
             oracle: oracle.clone(),
             stream_stats: gate_stats,
+            coverage,
         });
         (rows_routed, outcome, window, landing_tracker)
     } else {
@@ -1060,8 +1069,8 @@ pub(crate) async fn run_bootstrap(
         .context("bootstrap: hydrate shadow pg_wal from object store")?;
     }
 
-    let open_floor = window.and_then(|w| w.open_floor);
-    if let Some(w) = window {
+    let open_floor = window.as_ref().and_then(|w| w.open_floor);
+    if let Some(w) = &window {
         tracing::info!(
             target: "walshadow::bootstrap",
             from_lsn = format_pg_lsn(w.from_lsn).to_string(),

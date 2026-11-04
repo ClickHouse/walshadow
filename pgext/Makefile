@@ -56,8 +56,7 @@ native.o: $(wildcard $(PGCH_DIR)/*.h $(PGCH_DIR)/clickhouse-c/*.h)
 faultshim.so: faultshim.c
 	$(CC) -O2 -Wall -Wextra -fPIC -shared -o $@ $< -ldl
 
-# Everything the Rust test suite loads: module, fault shim, test-only module.
-# Rebuilds from clean when PG_CONFIG names a different server than last build
+# Build Rust test modules; clean when PostgreSQL version changes
 PG_STAMP = .pg_version
 PG_VERSION := $(shell $(PG_CONFIG) --version)
 

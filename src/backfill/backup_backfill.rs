@@ -74,6 +74,7 @@ use crate::decode::wal_xact::{
     XLOG_XACT_ABORT, XLOG_XACT_ABORT_PREPARED, XLOG_XACT_COMMIT, XLOG_XACT_COMMIT_PREPARED,
     XLOG_XACT_OPMASK, parse_xact_payload,
 };
+use crate::emit::ch_emitter::EmitterStats;
 use crate::emit::pipeline::tail::OwnedTail;
 use crate::emit::pipeline::{Fatal, bootstrap};
 use crate::emit::route::freeze_routes;
@@ -440,6 +441,7 @@ async fn walk_and_ship(
                 config.as_deref(),
                 next_seq,
                 replay_checkpoint,
+                None,
             )
             .await
             .map_err(anyhow::Error::msg)?;
@@ -606,6 +608,7 @@ async fn run_walk(
         walk_ok_rx,
         gate_spool,
         PendingSpool::new(pending_spool_path, filter.clone()),
+        ctx.stats.clone(),
         barrier.clone(),
     ));
     let drain = tokio::spawn(bootstrap::drain(
@@ -692,6 +695,7 @@ async fn gate_task(
     walk_ok: oneshot::Receiver<CompleteAccums>,
     mut deferred: DeferredSpool,
     mut pending: PendingSpool,
+    counters: Arc<EmitterStats>,
     barrier: Option<Arc<WalkBarrier>>,
 ) -> Result<(GateStats, usize, PendingSpool), String> {
     let mut stats = GateStats::default();
@@ -702,6 +706,7 @@ async fn gate_task(
         &filter,
         &mut deferred,
         &mut stats,
+        &counters,
         barrier.as_ref(),
     )
     .await?;
@@ -895,6 +900,7 @@ async fn replay_gap(
         next_seq,
         // Pre-scan already harvested transaction patch
         patch: None,
+        track_replaced: false,
     });
     let Some((first, _)) = segments.first() else {
         return sink
@@ -1541,6 +1547,7 @@ mod tests {
             xmax,
             infomask,
             source_lsn: 0x1000,
+            page_lsn: 0,
             blkno: 0,
             offnum: 0,
             columns: Vec::new(),
@@ -1587,6 +1594,7 @@ mod tests {
             walk_ok_rx,
             DeferredSpool::new(spool_path.clone(), 0),
             test_pending(),
+            Arc::default(),
             None,
         ));
 
@@ -1653,6 +1661,7 @@ mod tests {
             walk_ok_rx,
             DeferredSpool::new(spool_path.clone(), 0),
             test_pending(),
+            Arc::default(),
             None,
         ));
 
@@ -1719,6 +1728,7 @@ mod tests {
             walk_ok_rx,
             mem_spool(),
             test_pending(),
+            Arc::default(),
             None,
         ));
 
@@ -1763,6 +1773,7 @@ mod tests {
             walk_ok_rx,
             mem_spool(),
             test_pending(),
+            Arc::default(),
             None,
         ));
 

@@ -27,6 +27,7 @@ writes. A documented limitation does not imply code rejects it
 | [Tablespaces](tablespaces.md) | Reject unsafe layouts before bootstrap, then add complete support |
 | [Catalog completeness](catalog.md) | Stop when a surviving relation has lost buffered payload |
 | [Bootstrap visibility](bootstrap.md) | Prove pending-row recovery across load modes and restart |
+| [Bootstrap ordering](bootstrap_ordering.md) | Extend TOAST reads at page LSN and replacement evidence to per-table and pending loads |
 | [Verification](verification.md) | Prove value fidelity and restart without skipping WAL |
 | [100% line coverage](coverage100.md) | Close fixture, live-system, CLI, and fault-path gaps, then enforce 100% |
 

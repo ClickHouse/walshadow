@@ -20,11 +20,18 @@ and spill constrain memory while backup and insertion proceed independently
 Shadow is not ready during this phase. A temporary PostgreSQL instance built
 from source schema converts values that need PostgreSQL's type machinery
 
-Rows carrying external values wait for the chunk mirror the walk and the window
-leg write. Window page images refill chunks a page copied mid-write lost, every
-tuple an image carries and not only the one its record names, so resolution
-waits for both every walk lane and the window leg. A value the mirror cannot
-reassemble stops the load rather than substituting one
+Rows with external values wait until page walk and window replay finish writing
+chunk mirrors. Window page images restore missing chunks from every tuple on
+each image, including tuples outside that WAL record's operation, except slot an
+insert fills, which mirrors at insert LSN. Committed window inserts hide walked
+copies of their slots below insert LSN, so a copy taken after value-ID reuse
+cannot splice into reads of older value. Read mirrors at heap page LSN or backup
+start, whichever is later: late page copies can reference chunks recovered only
+by window WAL, while later reads could see a reused value ID. Keep backup start
+as row version and resume position. If a value cannot be reassembled, drop its
+row only when window replay emitted a tombstone or newer version for that
+tuple's slot. Otherwise retry all row values at backup start and stop loading if
+they remain unreadable
 
 Rows written before backup redo can remain undecided after handoff. Retain them
 in pending tables beside destinations until commit or abort decides visibility.

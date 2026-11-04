@@ -320,7 +320,6 @@ async fn emitter_tls_round_trip() {
         tls_config: Some(ch.pinned_config()),
         ..Default::default()
     };
-    // Build batcher's plan from chunk's mapping
     let rel = Arc::new(rel_descriptor());
     let mapping = Arc::new(TableMapping {
         target: TableTarget::new("walshadow_test", "things"),

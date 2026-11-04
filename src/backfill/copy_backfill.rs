@@ -569,6 +569,7 @@ pub async fn copy_rows_into(
             xmax: 0,
             infomask: 0,
             source_lsn: lsn,
+            page_lsn: 0,
             // COPY rows have no on-page TID
             blkno: 0,
             offnum: 0,

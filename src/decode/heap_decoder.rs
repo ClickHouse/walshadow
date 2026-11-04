@@ -194,6 +194,7 @@ pub const XLH_UPDATE_SUFFIX_FROM_OLD: u8 = 1 << 6;
 // xl_heap_delete.flags bit positions.
 pub const XLH_DELETE_CONTAINS_OLD_TUPLE: u8 = 1 << 1;
 pub const XLH_DELETE_CONTAINS_OLD_KEY: u8 = 1 << 2;
+pub const XLH_DELETE_IS_SUPER: u8 = 1 << 3;
 
 // xl_heap_insert.flags bits — only XLH_INSERT_CONTAINS_NEW_TUPLE is read.
 pub const XLH_INSERT_CONTAINS_NEW_TUPLE: u8 = 1 << 3;
