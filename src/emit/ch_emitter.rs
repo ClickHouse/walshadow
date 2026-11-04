@@ -2686,6 +2686,12 @@ crate::atomic_stats! {
         /// Oversized values replaced under `inline_value_overflow = "null"`
         pub toast_values_filled_oversize,
         pub toast_fetch_miss,
+        pub bootstrap_replay_covered_rows,
+        pub gate_emitted,
+        pub gate_gated,
+        pub gate_deferred,
+        pub gate_chunks_gated,
+        pub gate_multixact_emitted,
         /// Chunk rows mirrored from a restored TOAST page image, repairing
         /// backup page copies read mid-write
         pub toast_image_rows_mirrored,

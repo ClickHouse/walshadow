@@ -607,6 +607,7 @@ pub(crate) async fn run_bootstrap(
                 tokio::fs::remove_file(&spool_path).await.ok();
             }
             let catalog = drain_catalog.clone();
+            let gate_counters = bootstrap_stats.clone();
             gate_handles.push(tokio_util::task::AbortOnDropHandle::new(tokio::spawn(
                 async move {
                     let mut spool = match inherit {
@@ -629,6 +630,7 @@ pub(crate) async fn run_bootstrap(
                         &catalog,
                         &mut spool,
                         &mut gate_stats,
+                        &gate_counters,
                         None,
                     )
                     .await

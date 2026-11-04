@@ -9,6 +9,7 @@
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use anyhow::Result;
 use tokio::sync::mpsc;
@@ -59,6 +60,7 @@ pub async fn stream_phase(
     catalog: &CatalogMap,
     deferred: &mut DeferredSpool,
     stats: &mut GateStats,
+    counters: &EmitterStats,
     barrier: Option<&Arc<WalkBarrier>>,
 ) -> Result<(), String> {
     let mut forwarded = 0u64;
@@ -79,6 +81,7 @@ pub async fn stream_phase(
             if catalog.is_toast(t.rfn.db_node, t.rfn.rel_node) {
                 if tuple_visibility(t.xid, t.xmax, t.infomask, None) == Visibility::Skip {
                     stats.chunks_gated += 1;
+                    counters.gate_chunks_gated.fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
                 pass.push(t);
@@ -89,16 +92,26 @@ pub async fn stream_phase(
                 Visibility::Emit => {
                     if t.infomask & HEAP_XMAX_IS_MULTI != 0 {
                         stats.multixact_emitted += 1;
+                        counters
+                            .gate_multixact_emitted
+                            .fetch_add(1, Ordering::Relaxed);
                     }
                     stats.emitted += 1;
+                    counters.gate_emitted.fetch_add(1, Ordering::Relaxed);
                     pass.push(t);
                 }
-                Visibility::Skip => stats.gated += 1,
+                Visibility::Skip => {
+                    stats.gated += 1;
+                    counters.gate_gated.fetch_add(1, Ordering::Relaxed);
+                }
                 // Multixact verdict requires complete view
-                Visibility::Defer | Visibility::Unresolvable => deferred
-                    .push(t)
-                    .await
-                    .map_err(|e| format!("visibility gate: deferred spool: {e}"))?,
+                Visibility::Defer | Visibility::Unresolvable => {
+                    counters.gate_deferred.fetch_add(1, Ordering::Relaxed);
+                    deferred
+                        .push(t)
+                        .await
+                        .map_err(|e| format!("visibility gate: deferred spool: {e}"))?
+                }
             }
         }
         if !pass.is_empty() {
@@ -614,6 +627,7 @@ mod tests {
             &catalog,
             &mut spool,
             &mut stats,
+            &EmitterStats::default(),
             Some(&barrier),
         )
         .await
@@ -671,6 +685,7 @@ mod tests {
             &catalog,
             &mut spool,
             &mut stats,
+            &EmitterStats::default(),
             Some(&barrier),
         )
         .await
@@ -871,9 +886,17 @@ mod tests {
 
         let mut stats = GateStats::default();
         let mut spool = spool_of(Vec::new()).await;
-        stream_phase(&mut walk_rx, &tx, catalog, &mut spool, &mut stats, None)
-            .await
-            .unwrap();
+        stream_phase(
+            &mut walk_rx,
+            &tx,
+            catalog,
+            &mut spool,
+            &mut stats,
+            &EmitterStats::default(),
+            None,
+        )
+        .await
+        .unwrap();
         drop(tx);
 
         let mut passed = Vec::new();

@@ -350,6 +350,20 @@ snapshot! {
         "Shadow values replaced with a fill after detecting value-ID reuse.",
     counter toast_values_filled_oversize_total: u64 =
         "Values over inline_value_max replaced with NULL or a column default.",
+    counter toast_fetch_miss_total: u64 =
+        "TOAST resolution failures caused by missing chunks or size mismatches.",
+    counter bootstrap_replay_covered_rows_total: u64 =
+        "Backup rows dropped at deferred TOAST resolve because their value was minted inside the backup window: the backup copied the heap page after the row landed but the TOAST file before its chunks did, and the WAL leg re-emitted the row. Non-zero means a torn backup copy, repaired.",
+    counter bootstrap_gate_emitted_total: u64 =
+        "Heap tuples forwarded by bootstrap visibility gate using hint bits.",
+    counter bootstrap_gate_gated_total: u64 =
+        "Heap tuples dropped by bootstrap visibility gate using hint bits.",
+    counter bootstrap_gate_deferred_total: u64 =
+        "Heap tuples with undecided hint-bit visibility, spooled for transaction-status checks.",
+    counter bootstrap_gate_chunks_gated_total: u64 =
+        "TOAST chunk tuples excluded from mirror writes because hint bits proved them dead.",
+    counter bootstrap_gate_multixact_emitted_total: u64 =
+        "Heap tuples forwarded by hint-bit visibility checks with multixact xmax.",
     counter toast_mirror_truncates_total: u64 =
         "Mirror wipes from owner TRUNCATE, applied at the reorder barrier.",
     counter toast_mirror_retires_total: u64 =
