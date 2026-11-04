@@ -45,7 +45,6 @@ pub fn place_rows(
         ..Default::default()
     };
     let mut chunk_bytes = 0usize;
-    // Map each plan table to its index in current chunk
     let mut slots = vec![u32::MAX; tables.len()];
     while let Some(heap) = heaps.next() {
         let PlanTable {

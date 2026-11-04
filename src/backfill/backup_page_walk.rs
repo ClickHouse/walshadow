@@ -93,6 +93,9 @@ pub struct BackfillTuple {
     /// `t_infomask` hint bits
     pub infomask: u16,
     pub source_lsn: u64,
+    /// Copied heap page's `pd_lsn`, or 0 without a page. TOAST writes precede
+    /// heap inserts; TOAST deletes follow heap deletes, so reads here match heap state
+    pub page_lsn: u64,
     /// On-page TID; toast tuples become store rows keyed on it
     /// ([`crate::toast::ToastRow`])
     pub blkno: u32,
@@ -298,6 +301,7 @@ impl<'a> PageWalker<'a> {
             });
         }
         let n_slots = (pd_lower as usize - SIZE_OF_PAGE_HEADER) / SIZE_OF_ITEM_ID;
+        let page_lsn = page_pd_lsn(page);
         tally.pages_walked += 1;
         tally.slots_seen += n_slots as u64;
         out.reserve(n_slots);
@@ -325,6 +329,7 @@ impl<'a> PageWalker<'a> {
                         xmax,
                         infomask,
                         source_lsn: self.source_lsn,
+                        page_lsn,
                         blkno: block_no,
                         // OffsetNumber is 1-based (PG off/itemid.h)
                         offnum: (i + 1) as u16,

@@ -29,7 +29,7 @@ use crate::xact::spill::{
 use walrus::pg::walparser::RelFileNode;
 
 const SPOOL_MAGIC: [u8; 2] = *b"WD";
-const SPOOL_VERSION: u16 = 1;
+const SPOOL_VERSION: u16 = 2;
 /// Default in-memory prefix budget before records spill to file
 pub const DEFERRED_SPOOL_MEM_MAX: usize = 8 << 20;
 
@@ -485,6 +485,7 @@ fn encode_record(value: &BackfillTuple, out: &mut Vec<u8>) {
     push_u32(out, value.xmax);
     push_u16(out, value.infomask);
     push_u64(out, value.source_lsn);
+    push_u64(out, value.page_lsn);
     push_u32(out, value.blkno);
     push_u16(out, value.offnum);
     push_u32(out, value.columns.len() as u32);
@@ -510,6 +511,7 @@ fn decode_record(buf: &[u8]) -> Result<BackfillTuple> {
     let xmax = c.u32()?;
     let infomask = c.u16()?;
     let source_lsn = c.u64()?;
+    let page_lsn = c.u64()?;
     let blkno = c.u32()?;
     let offnum = c.u16()?;
     let ncols = c.u32()? as usize;
@@ -526,6 +528,7 @@ fn decode_record(buf: &[u8]) -> Result<BackfillTuple> {
         xmax,
         infomask,
         source_lsn,
+        page_lsn,
         blkno,
         offnum,
         columns,
@@ -605,7 +608,8 @@ mod tests {
             .into_reader()
             .await
             .unwrap();
-        assert_eq!(reader.next().await.unwrap().unwrap().source_lsn, 20);
+        let next = reader.next().await.unwrap().unwrap();
+        assert_eq!((next.source_lsn, next.page_lsn), (20, 20 + 0x100));
         assert!(reader.next().await.unwrap().is_none());
         assert!(
             DeferredSpool::resume(path.clone(), mark, mark.bytes + 1)
@@ -628,6 +632,7 @@ mod tests {
             xmax: 0,
             infomask: 0x0900,
             source_lsn: lsn,
+            page_lsn: lsn + 0x100,
             blkno: 3,
             offnum: 7,
             columns: vec![

@@ -16,7 +16,8 @@ use walrus::pg::walparser::Oid;
 
 use crate::backfill::backup_page_walk::CatalogMap;
 use crate::backfill::wal_replay::{
-    DropSegments, ReplayStats, ReplayTargets, WalReplayInputs, WalReplaySink, pump_segments_through,
+    DropSegments, HeapTid, ReplayStats, ReplayTargets, WalReplayInputs, WalReplaySink,
+    pump_segments_through,
 };
 use crate::catalog::desc_log::{BatchRecord, DescLogIdentity, DescriptorLog, LogEntry, LogValue};
 use crate::config::ResolvedConfig;
@@ -62,9 +63,11 @@ pub struct WindowLegConfig {
     pub wind_down: Duration,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WindowLegStats {
     pub replay: ReplayStats,
+    /// See [`WalReplaySink::take_replaced`]
+    pub replaced: HashSet<HeapTid>,
     /// Walk coverage floor, read starts at previous segment boundary
     pub from_lsn: u64,
     /// One past the last byte the leg covered
@@ -228,6 +231,7 @@ impl Leg {
             ack: tail.ack.clone(),
             next_seq: 0,
             patch: Some(cfg.patch.clone()),
+            track_replaced: true,
         });
         Ok(Self { sink, tail, db_oid })
     }
@@ -236,7 +240,12 @@ impl Leg {
     ///
     /// `handoff` bounds the open-xact report: the pump rebuilds anything
     /// opened above it on its own
-    async fn close(self, from_lsn: u64, through_lsn: u64, handoff: u64) -> Result<WindowLegStats> {
+    async fn close(
+        mut self,
+        from_lsn: u64,
+        through_lsn: u64,
+        handoff: u64,
+    ) -> Result<WindowLegStats> {
         let open_floor = self
             .sink
             .xacts_opened_below(handoff)
@@ -244,6 +253,7 @@ impl Leg {
             .into_iter()
             .map(|(_, first_lsn)| first_lsn)
             .min();
+        let replaced = self.sink.take_replaced();
         let replay = match self.sink.finish().await {
             Ok(replay) => replay,
             Err(e) => {
@@ -257,6 +267,7 @@ impl Leg {
             .map_err(anyhow::Error::msg)?;
         Ok(WindowLegStats {
             replay,
+            replaced,
             from_lsn,
             through_lsn,
             open_floor,

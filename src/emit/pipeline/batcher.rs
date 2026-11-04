@@ -69,7 +69,6 @@ pub struct RowChunk {
 }
 
 impl RowChunk {
-    /// Reuse last entry if relation and route match; otherwise append a new entry
     fn table(&mut self, rel: &Arc<RelDescriptor>, route: &Arc<RouteSnapshot>) -> u32 {
         if !self
             .tables
@@ -276,7 +275,6 @@ struct Table {
     deadline: Option<Instant>,
 }
 
-/// Look up encoder slots once per chunk table, then index them for each row
 #[derive(Default)]
 struct Tables {
     slots: HashMap<TableKey, usize>,

@@ -280,8 +280,8 @@ impl QueueingRecordSink {
         self
     }
 
-    /// Pump-queue depth: in-channel + pump-side buffer, skipped records
-    /// included since their positions still wait on the worker
+    /// Queued and buffered records, including skipped records whose positions
+    /// still await worker acknowledgement
     pub fn in_flight(&self) -> u64 {
         self.in_flight.load(Ordering::Relaxed) + self.buf.len() as u64 + self.skipped
     }

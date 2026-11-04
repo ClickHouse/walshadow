@@ -353,7 +353,7 @@ snapshot! {
     counter toast_fetch_miss_total: u64 =
         "TOAST resolution failures caused by missing chunks or size mismatches.",
     counter bootstrap_replay_covered_rows_total: u64 =
-        "Backup rows dropped at deferred TOAST resolve because their value was minted inside the backup window: the backup copied the heap page after the row landed but the TOAST file before its chunks did, and the WAL leg re-emitted the row. Non-zero means a torn backup copy, repaired.",
+        "Backup rows dropped during deferred TOAST resolution because values were unreadable and window replay emitted a tombstone or newer version for each tuple's slot.",
     counter bootstrap_gate_emitted_total: u64 =
         "Heap tuples forwarded by bootstrap visibility gate using hint bits.",
     counter bootstrap_gate_gated_total: u64 =
@@ -412,7 +412,7 @@ snapshot! {
     counter emitter_reconnects_total: u64 =
         "ClickHouse client dials after the first, from retries and live endpoint or compression changes.",
     gauge pump_queue_depth: u64 =
-        "Records buffered between the WAL pump and the queueing worker, counting those the worker only takes the position of.",
+        "Records buffered between WAL pump and queueing worker, including records processed only for their positions.",
     counter queue_records_out_total: u64 =
         "Records the queueing/reorder worker has dequeued and dispatched. rate() is the worker's throughput; with pump_queue_depth it tells deep-and-draining from deep-and-stalled.",
     counter queue_jobs_out_total: u64 =

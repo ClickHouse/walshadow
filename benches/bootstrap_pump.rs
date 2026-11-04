@@ -369,6 +369,7 @@ async fn bench_drain(shape: Shape) -> Report {
                         xmax: 0,
                         infomask: 0,
                         source_lsn: START_LSN,
+                        page_lsn: 0,
                         blkno: (i / 100) as u32,
                         offnum: (i % 100) as u16 + 1,
                         columns: (0..columns)

@@ -441,6 +441,7 @@ async fn walk_and_ship(
                 config.as_deref(),
                 next_seq,
                 replay_checkpoint,
+                None,
             )
             .await
             .map_err(anyhow::Error::msg)?;
@@ -899,6 +900,7 @@ async fn replay_gap(
         next_seq,
         // Pre-scan already harvested transaction patch
         patch: None,
+        track_replaced: false,
     });
     let Some((first, _)) = segments.first() else {
         return sink
@@ -1545,6 +1547,7 @@ mod tests {
             xmax,
             infomask,
             source_lsn: 0x1000,
+            page_lsn: 0,
             blkno: 0,
             offnum: 0,
             columns: Vec::new(),

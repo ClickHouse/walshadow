@@ -1,8 +1,8 @@
 //! Bootstrap page-walk producer
 //!
-//! Every row uses `start_lsn`. Persist TOAST mirrors before resolving deferred
-//! referrers. Caller waits through synthetic sequence frontier before advancing
-//! resume LSN to backup end
+//! Keep `start_lsn` as row version and sequence position. Persist TOAST mirrors
+//! before resolving deferred values, which may read past `start_lsn`. Wait for
+//! synthetic sequences to become durable before advancing resume LSN to backup end
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -12,6 +12,7 @@ use walrus::pg::walparser::RelFileNode;
 
 use crate::backfill::backup_page_walk::{BackfillTuple, CatalogMap};
 use crate::backfill::spool::{DeferredReader, DeferredSpool, Replayable, SpoolMark};
+use crate::backfill::wal_replay::HeapTid;
 use crate::backfill::walk_barrier::{WALK_CHECKPOINT_PERIOD, WalkBarrier};
 use crate::config::ResolvedConfig;
 use crate::decode::heap_decoder::{ColumnValue, ToastPointer};
@@ -29,6 +30,25 @@ use crate::toast::{
 };
 use crate::xact::xact_buffer::{MissPolicy, StoreMiss, fill_store_miss};
 use ahash::{HashMap, HashMapExt, HashSet};
+
+/// Window replay coverage for deferred TOAST reads. Row versions and sequence
+/// positions remain at `start_lsn`
+#[derive(Debug, Default)]
+pub struct WindowCoverage {
+    /// Read mirrors at heap page LSN after replay through backup end.
+    /// Disabled for shadow, whose bound is a replay floor
+    pub page_bound: bool,
+    /// Slots with a tombstone or newer row version emitted by window replay
+    pub replaced: HashSet<HeapTid>,
+}
+
+fn lookup_bound(tuple: &BackfillTuple, coverage: Option<&WindowCoverage>) -> u64 {
+    if coverage.is_some_and(|c| c.page_bound) {
+        tuple.source_lsn.max(tuple.page_lsn)
+    } else {
+        tuple.source_lsn
+    }
+}
 
 /// Completion frontier for `FlushAll` and resume advance
 #[derive(Debug, Default)]
@@ -299,6 +319,7 @@ pub async fn drain(
                 &resolver,
                 next_seq,
                 None,
+                None,
             )
             .await?;
             Ok(BootstrapDrainOutcome {
@@ -333,10 +354,11 @@ pub async fn drain_deferred(
     config: Option<&ResolvedConfig>,
     first_seq: u64,
     checkpoint: Option<ReplayCheckpoint<'_>>,
+    coverage: Option<&WindowCoverage>,
 ) -> Result<BootstrapDrainOutcome, String> {
     let routes = freeze_routes(mapping, config, row_policy);
     resolve_spooled(
-        spool, &routes, catalog, msg_tx, ack, stats, resolver, first_seq, checkpoint,
+        spool, &routes, catalog, msg_tx, ack, stats, resolver, first_seq, checkpoint, coverage,
     )
     .await
 }
@@ -360,13 +382,17 @@ async fn resolve_spooled(
     resolver: &ToastResolver,
     first_seq: u64,
     mut checkpoint: Option<ReplayCheckpoint<'_>>,
+    coverage: Option<&WindowCoverage>,
 ) -> Result<BootstrapDrainOutcome, String> {
     tracing::info!(
         target: "walshadow::bootstrap",
         deferred = spool.records(),
         spooled_bytes = spool.spooled_bytes(),
+        page_bound = coverage.is_some_and(|c| c.page_bound),
+        replaced_slots = coverage.map(|c| c.replaced.len()),
         "resolving deferred TOAST tuples from chunk store",
     );
+    let covered_before = stats.bootstrap_replay_covered_rows.load(Ordering::Relaxed);
     // Released on drop, so a failed replay gives its bytes back too
     let _footprint = DeferredFootprint::adopt(stats, &spool);
     let mut seq = None;
@@ -383,11 +409,11 @@ async fn resolve_spooled(
     progress.advance(replay.remaining_file_bytes());
     // Read and fetch the next batch while this one routes: spool reads and
     // inserts otherwise leave the store pool idle
-    let mut ready = prepare_batch(&mut replay, routes, catalog, stats, resolver).await?;
+    let mut ready = prepare_batch(&mut replay, routes, catalog, stats, resolver, coverage).await?;
     while let Some(batch) = ready.take() {
         let remaining = replay.remaining_file_bytes();
         let (next, routed) = tokio::join!(
-            prepare_batch(&mut replay, routes, catalog, stats, resolver),
+            prepare_batch(&mut replay, routes, catalog, stats, resolver, coverage),
             route_batch(batch, msg_tx, &mut seqs, &mut seq, &mut placed),
         );
         routed?;
@@ -428,6 +454,15 @@ async fn resolve_spooled(
     if let Some(s) = seq {
         seqs.place(s, placed);
     }
+    let covered = stats.bootstrap_replay_covered_rows.load(Ordering::Relaxed) - covered_before;
+    if covered > 0 {
+        tracing::info!(
+            target: "walshadow::bootstrap",
+            rows = covered,
+            "deferred referrers dropped: their TOAST values were unreadable, and window \
+             replay emitted a tombstone or newer version for each walked tuple",
+        );
+    }
     Ok(BootstrapDrainOutcome {
         next_seq: seqs.next(),
         rows_routed,
@@ -439,7 +474,6 @@ fn closed(e: BatcherClosed) -> String {
     format!("bootstrap: {e}")
 }
 
-/// Track consecutive tuples from one relation file
 struct Run {
     rfn: RelFileNode,
     seq: OpenSeq,
@@ -447,7 +481,6 @@ struct Run {
     target: Target,
 }
 
-/// Decide how to handle tuples once per relation file run
 enum Target {
     /// Count each tuple with a missing descriptor or route
     Unsupported,
@@ -491,8 +524,7 @@ type ValueKey = (u32, u32, u32, u64);
 /// Routed referrers awaiting their values, with the leaf bytes resolving
 /// them peaks at
 struct ReplayBatch {
-    /// Share metadata across consecutive rows from one relation.
-    /// Spool preserves scan order
+    /// Spool preserves relation scan order, so consecutive rows share metadata
     tables: Vec<RowTable>,
     rows: Vec<ReplayRow>,
     /// Leaf permit bytes: what the round's values retain plus its largest
@@ -507,6 +539,7 @@ struct ReplayRow {
     /// Index into containing batch's `tables`
     table: u32,
     pointers: Vec<PointerSite>,
+    replay_covered: bool,
 }
 
 /// Mapped external pointer: its tuple column, its mapping column (the miss
@@ -556,6 +589,7 @@ async fn prepare_batch(
     catalog: &CatalogMap,
     stats: &EmitterStats,
     resolver: &ToastResolver,
+    coverage: Option<&WindowCoverage>,
 ) -> Result<Option<ResolvedReplayBatch>, String> {
     let mut batch = next_batch(replay, routes, catalog, stats, resolver).await?;
     if batch.rows.is_empty() {
@@ -564,7 +598,7 @@ async fn prepare_batch(
     // One permit per batch: every value a round fetched stays resident
     // until its row routes, so the rows share what survives
     let mut leaf = crate::budget::acquire_opt(resolver.budget(), batch.need).await;
-    let retained = resolve_batch(&mut batch, resolver).await?;
+    let retained = resolve_batch(&mut batch, resolver, stats, coverage).await?;
     if let Some(p) = leaf.as_mut() {
         p.shrink(retained as u64);
     }
@@ -592,6 +626,9 @@ async fn route_batch(
     } = batch;
     let mut row_buffer = RowBuffer::new(permit);
     for row in rows {
+        if row.replay_covered {
+            continue;
+        }
         let mut tuple = row.tuple;
         let at = seq
             .get_or_insert_with(|| seqs.open(tuple.source_lsn, Publish::Commit))
@@ -670,31 +707,73 @@ async fn next_batch(
             tuple,
             table,
             pointers,
+            replay_covered: false,
         });
     }
     Ok(batch)
 }
 
-/// Fetch the batch's values, one round trip per mirror and bound, then
-/// detoast every referrer's columns. Returns the bytes the rows retain
-async fn resolve_batch(batch: &mut ReplayBatch, resolver: &ToastResolver) -> Result<usize, String> {
-    let mut values = fetch_batch_values(batch, resolver).await?;
+/// Resolve all values before applying miss policy so column order cannot
+/// affect row survival. Retry unreadable, unreplaced rows at `start_lsn`:
+/// window deletes may have removed values that existed at load version
+async fn resolve_batch(
+    batch: &mut ReplayBatch,
+    resolver: &ToastResolver,
+    stats: &EmitterStats,
+    coverage: Option<&WindowCoverage>,
+) -> Result<usize, String> {
+    let rows = &batch.rows;
+    let mut values = fetch_values_at(
+        rows.iter()
+            .map(|row| (row, lookup_bound(&row.tuple, coverage))),
+        resolver,
+    )
+    .await?;
+    let mut fetched: Vec<_> = rows
+        .iter()
+        .map(|row| values.take_row(row, lookup_bound(&row.tuple, coverage)))
+        .collect();
+    let replaced = |tuple: &BackfillTuple| {
+        coverage.is_some_and(|c| c.replaced.contains(&(tuple.rfn, tuple.blkno, tuple.offnum)))
+    };
+    let retry: Vec<usize> = (0..rows.len())
+        .filter(|&i| {
+            let tuple = &rows[i].tuple;
+            unreadable(&fetched[i])
+                && !replaced(tuple)
+                && lookup_bound(tuple, coverage) != tuple.source_lsn
+        })
+        .collect();
+    if !retry.is_empty() {
+        let mut again = fetch_values_at(
+            retry.iter().map(|&i| (&rows[i], rows[i].tuple.source_lsn)),
+            resolver,
+        )
+        .await?;
+        for &i in &retry {
+            fetched[i] = again.take_row(&rows[i], rows[i].tuple.source_lsn);
+        }
+    }
     let mut retained = 0usize;
-    for ReplayRow {
-        tuple,
-        table,
-        pointers,
-    } in &mut batch.rows
+    for (
+        ReplayRow {
+            tuple,
+            table,
+            pointers,
+            replay_covered,
+        },
+        fetched,
+    ) in batch.rows.iter_mut().zip(fetched)
     {
+        if unreadable(&fetched) && replaced(tuple) {
+            stats
+                .bootstrap_replay_covered_rows
+                .fetch_add(1, Ordering::Relaxed);
+            *replay_covered = true;
+            continue;
+        }
         let RowTable { rel, route } = &batch.tables[*table as usize];
-        for site in pointers.iter() {
-            let key = (
-                tuple.rfn.db_node,
-                site.p.va_toastrelid,
-                site.p.va_valueid,
-                tuple.source_lsn,
-            );
-            let fetched = values.take(key);
+        for (site, fetched) in pointers.iter().zip(fetched) {
             let type_oid = rel.attributes.get(site.idx).map_or(0, |a| a.type_oid);
             let target = &route.mapping.columns[site.col].target_name;
             let (column, bytes) = apply_fetched(fetched, &site.p, type_oid, rel, target, resolver)?;
@@ -703,6 +782,13 @@ async fn resolve_batch(batch: &mut ReplayBatch, resolver: &ToastResolver) -> Res
         }
     }
     Ok(retained)
+}
+
+fn unreadable(fetched: &[Option<FetchedValue>]) -> bool {
+    fetched.iter().any(|f| {
+        f.as_ref()
+            .is_some_and(|v| !matches!(v, FetchedValue::Assembled(_)))
+    })
 }
 
 /// A batch's values, with how many referrers each one still owes
@@ -724,24 +810,34 @@ impl FetchedValues {
             values.get(&key).cloned()
         }
     }
+
+    fn take_row(&mut self, row: &ReplayRow, bound: u64) -> Vec<Option<FetchedValue>> {
+        row.pointers
+            .iter()
+            .map(|site| value_key(row, site, bound))
+            .map(|key| self.take(key))
+            .collect()
+    }
 }
 
-/// Distinct values a batch needs, fetched per mirror and bound
-async fn fetch_batch_values(
-    batch: &ReplayBatch,
+fn value_key(row: &ReplayRow, site: &PointerSite, bound: u64) -> ValueKey {
+    (
+        row.tuple.rfn.db_node,
+        site.p.va_toastrelid,
+        site.p.va_valueid,
+        bound,
+    )
+}
+
+async fn fetch_values_at<'a>(
+    rows: impl Iterator<Item = (&'a ReplayRow, u64)>,
     resolver: &ToastResolver,
 ) -> Result<FetchedValues, String> {
     let mut uses: HashMap<ValueKey, u32> = HashMap::new();
     let mut wanted: HashMap<(u32, u32, u64), Vec<(u32, usize)>> = HashMap::new();
-    for row in &batch.rows {
-        let bound = row.tuple.source_lsn;
+    for (row, bound) in rows {
         for site in &row.pointers {
-            let key = (
-                row.tuple.rfn.db_node,
-                site.p.va_toastrelid,
-                site.p.va_valueid,
-                bound,
-            );
+            let key = value_key(row, site, bound);
             let seen = uses.entry(key).or_default();
             *seen += 1;
             if *seen == 1 {
@@ -1086,6 +1182,7 @@ mod tests {
             xmax: 0,
             infomask: 0,
             source_lsn: 0x1000,
+            page_lsn: 0,
             blkno: 0,
             offnum: 0,
             columns: vec![Some(ColumnValue::Int4(id))],
@@ -1176,6 +1273,7 @@ mod tests {
             xmax: 0,
             infomask: 0,
             source_lsn: 0x1000,
+            page_lsn: 0,
             blkno: 0,
             offnum: 0,
             columns: vec![Some(ColumnValue::ExternalToast(ToastPointer {
@@ -1200,6 +1298,7 @@ mod tests {
             xmax: 0,
             infomask: 0,
             source_lsn: 0x1000,
+            page_lsn: 0,
             blkno: 1,
             offnum: 1,
             columns: vec![
@@ -1716,6 +1815,7 @@ mod tests {
             None,
             outcome.next_seq,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -1733,6 +1833,197 @@ mod tests {
         assert_eq!(cols[0], Some(ColumnValue::Bytea(b"hello".to_vec())));
         drop(ack);
         collector.await.unwrap();
+    }
+
+    /// Page LSN separates reused TOAST IDs without changing row version.
+    /// Retry unreadable, unreplaced rows at backup start. Drop replaced rows
+    /// with unreadable values regardless of column order
+    #[tokio::test]
+    async fn window_coverage_reads_at_page_lsn_and_drops_only_replaced_rows() {
+        const WINDOW: u64 = 0x2000;
+        const LATE: u64 = WINDOW + 0x100;
+        let mut rel = (*bytea_rel(16400)).clone();
+        let mut attr = rel.attributes[0].clone();
+        attr.attnum = 2;
+        attr.name = "c".into();
+        rel.attributes.push(attr);
+        let mut catalog = CatalogMap::new();
+        catalog.insert(Arc::new(rel));
+        catalog.insert(toast_rel(16500));
+        let mut table = (*bytea_mapping_for(16400)).clone();
+        let mut col = table.columns[0].clone();
+        col.src_attnum = 2;
+        col.target_name = "c".into();
+        table.columns.push(col);
+        let mapping: MappingSnapshot = Arc::new(
+            [(RelName::new("public", "t16400"), Arc::new(table))]
+                .into_iter()
+                .collect(),
+        );
+        let chunk = |value_id: u32, offnum: u16, body: &[u8], lsn: u64| ToastRow {
+            db_oid: 5,
+            toast_relid: 16500,
+            blkno: 1,
+            offnum,
+            chunk_id: value_id,
+            chunk_seq: 0,
+            chunk_data: bytes::Bytes::copy_from_slice(body),
+            lsn,
+        };
+        // IDs: 1 unchanged, 2 created in window, 3 deleted in window,
+        // 4 deleted and reused in window with equal size
+        let rows = [
+            chunk(1, 1, b"hello", 0),
+            chunk(2, 2, b"world", WINDOW),
+            chunk(3, 3, b"gone!", 0),
+            chunk(0, 3, b"", WINDOW),
+            chunk(4, 4, b"olden", 0),
+            chunk(0, 4, b"", WINDOW),
+            chunk(4, 5, b"newer", WINDOW + 0x80),
+        ];
+        let slot = (
+            RelFileNode {
+                spc_node: 1663,
+                db_node: 5,
+                rel_node: 16400,
+            },
+            0,
+            7,
+        );
+        let replaced = || WindowCoverage {
+            page_bound: true,
+            replaced: [slot].into_iter().collect(),
+        };
+        let unreplaced = || WindowCoverage {
+            page_bound: true,
+            replaced: HashSet::default(),
+        };
+        enum Want {
+            Routed(&'static [u8], &'static [u8]),
+            Dropped,
+            Fatal,
+        }
+        let cases = [
+            (
+                (1, 2),
+                LATE,
+                Some(unreplaced()),
+                Want::Routed(b"hello", b"world"),
+            ),
+            ((1, 2), LATE, None, Want::Fatal),
+            ((1, 2), 0, Some(unreplaced()), Want::Fatal),
+            ((3, 1), LATE, Some(replaced()), Want::Dropped),
+            ((1, 3), LATE, Some(replaced()), Want::Dropped),
+            (
+                (3, 1),
+                LATE,
+                Some(unreplaced()),
+                Want::Routed(b"gone!", b"hello"),
+            ),
+            (
+                (1, 3),
+                LATE,
+                Some(unreplaced()),
+                Want::Routed(b"hello", b"gone!"),
+            ),
+            (
+                (4, 3),
+                LATE,
+                Some(unreplaced()),
+                Want::Routed(b"olden", b"gone!"),
+            ),
+            (
+                (1, 1),
+                LATE,
+                Some(replaced()),
+                Want::Routed(b"hello", b"hello"),
+            ),
+            (
+                (4, 1),
+                0,
+                Some(replaced()),
+                Want::Routed(b"olden", b"hello"),
+            ),
+            (
+                (4, 1),
+                LATE,
+                Some(unreplaced()),
+                Want::Routed(b"newer", b"hello"),
+            ),
+        ];
+        for ((b, c), page_lsn, coverage, want) in cases {
+            let label = format!("values=({b}, {c}) page_lsn={page_lsn:#x} coverage={coverage:?}");
+            let stats = Arc::new(EmitterStats::default());
+            let resolver = ToastResolver::with_store(Arc::new(MemChunkStore::new()), stats.clone());
+            resolver.put(&rows).await.unwrap();
+            let (ack, collector) =
+                ack::spawn(Arc::new(crate::pos::Monotone::default()), Fatal::new());
+            let (msg_tx, mut msg_rx) = mpsc::channel::<BatcherMsg>(64);
+            let mut referrer = bytea_toast_tuple(16400, 16500, b);
+            referrer.columns.push(referrer.columns[0].clone());
+            let Some(Some(ColumnValue::ExternalToast(p))) = referrer.columns.get_mut(1) else {
+                unreachable!()
+            };
+            p.va_valueid = c;
+            (referrer.blkno, referrer.offnum) = (slot.1, slot.2);
+            referrer.page_lsn = page_lsn;
+            let mut spool = mem_spool();
+            spool.push(referrer).await.unwrap();
+            let result = drain_deferred(
+                spool.into(),
+                &catalog,
+                &mapping,
+                &msg_tx,
+                &ack,
+                &stats,
+                &resolver,
+                &Default::default(),
+                None,
+                0,
+                None,
+                coverage.as_ref(),
+            )
+            .await;
+            drop(msg_tx);
+            let routed = collect_rows(&mut msg_rx).await;
+            let covered = stats.bootstrap_replay_covered_rows.load(Ordering::Relaxed);
+            match want {
+                Want::Routed(b, c) => {
+                    let resolved = result.unwrap_or_else(|e| panic!("{label}: {e}"));
+                    assert_eq!(resolved.rows_routed, 1, "{label}");
+                    let row = &routed[0].committed;
+                    assert_eq!(
+                        (row.decoded.source_lsn, row.commit_lsn),
+                        (0x1000, 0x1000),
+                        "{label}: load version moved with lookup bound"
+                    );
+                    let cols = &row.decoded.new.as_ref().unwrap().columns;
+                    assert_eq!(
+                        cols[..],
+                        [
+                            Some(ColumnValue::Bytea(b.to_vec())),
+                            Some(ColumnValue::Bytea(c.to_vec()))
+                        ],
+                        "{label}"
+                    );
+                    assert_eq!(covered, 0, "{label}");
+                }
+                Want::Dropped => {
+                    let resolved = result.unwrap_or_else(|e| panic!("{label}: {e}"));
+                    assert_eq!(resolved.rows_routed, 0, "{label}");
+                    assert!(routed.is_empty(), "{label}");
+                    assert_eq!(covered, 1, "{label}");
+                    assert_eq!(stats.toast_fetch_miss.load(Ordering::Relaxed), 0, "{label}");
+                }
+                Want::Fatal => {
+                    result.expect_err(&label);
+                    assert!(routed.is_empty(), "{label}");
+                    assert_eq!(covered, 0, "{label}");
+                }
+            }
+            drop(ack);
+            collector.await.unwrap();
+        }
     }
 
     /// Lanes share one gauge pair, so each charges its own spool and a
@@ -1802,6 +2093,7 @@ mod tests {
                 &Default::default(),
                 None,
                 first_seq,
+                None,
                 None,
             )
             .await
@@ -2096,6 +2388,7 @@ mod tests {
                 dir: dir.path(),
                 tail: &tail,
             }),
+            None,
         )
         .await;
         assert!(result.unwrap_err().contains("injected prefetch failure"));
@@ -2128,6 +2421,7 @@ mod tests {
                 dir: dir.path(),
                 tail: &tail,
             }),
+            None,
         )
         .await
         .unwrap();
@@ -2173,11 +2467,14 @@ mod tests {
                 tuple,
                 table: batch.tables.len() as u32 - 1,
                 pointers,
+                replay_covered: false,
             });
         }
         let resolver = ToastResolver::with_store(stores[0].1.clone(), Arc::default())
             .with_database_stores(stores);
-        resolve_batch(&mut batch, &resolver).await.unwrap();
+        resolve_batch(&mut batch, &resolver, &EmitterStats::default(), None)
+            .await
+            .unwrap();
         for (row, expected) in batch.rows.iter().zip([b"first", b"other"]) {
             assert_eq!(
                 row.tuple.columns[0],

@@ -979,6 +979,7 @@ mod tests {
             xmax: 200,
             infomask: 0x0100,
             source_lsn: 0x5000,
+            page_lsn: 0,
             blkno: 0,
             offnum: 0,
             columns: vec![Some(ColumnValue::Int4(1))],

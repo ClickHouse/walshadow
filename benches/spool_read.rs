@@ -100,6 +100,7 @@ async fn deferred(args: &Args, repeat: usize) -> anyhow::Result<()> {
                 xmax: 0,
                 infomask: 0,
                 source_lsn: i as u64,
+                page_lsn: 0,
                 blkno: i as u32,
                 offnum: 1,
                 columns: vec![

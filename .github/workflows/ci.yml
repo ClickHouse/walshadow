@@ -148,9 +148,9 @@ jobs:
       # Build walshadow.so before the e2e suite: the bridge tests point
       # dynamic_library_path at the build tree, so `make` alone is what they
       # need. `make install` additionally proves the target docker relies on.
-      # pgext/test is never installed: tests load it into their *source*
-      # cluster for primitives SQL cannot express, eg VACUUM's lock lifetime.
-      # Not `test-deps`, it would rebuild over the instrumented objects
+      # Load pgext/test in source clusters for primitives SQL cannot express,
+      # such as VACUUM's lock lifetime. Keep it uninstalled.
+      # Build it separately: test-deps would replace coverage objects
       - name: Build + install walshadow PG module (e2e oracle path)
         working-directory: walshadow/pgext
         run: |
