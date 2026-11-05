@@ -29,7 +29,7 @@ use walrus::pg::replication::conn::PgConfig;
 use walrus::pg::wal;
 use walrus::storage::DynStorage;
 use walrus::storage::fs::FsStorage;
-use walshadow::bootstrap_marker::BootstrapMarker;
+use walshadow::bootstrap_marker::{BootstrapMarker, ExtractedCheckpoint};
 use walshadow::mapping::TableTarget;
 use walshadow::schema::RelName;
 use walshadow::shadow::Shadow;
@@ -188,6 +188,16 @@ async fn killed_object_store_bootstrap_finishes_after_restart() {
         Some(backup_name.as_str()),
         "the first attempt must pin what it resolved, so the retry reloads it",
     );
+    // Rows reach ClickHouse during extraction, so a slow poll can see them
+    // only after the extraction checkpoint landed, which licenses resuming
+    let restart_path = if ExtractedCheckpoint::read(&daemon.shadow_data_dir)
+        .expect("read the extraction checkpoint")
+        .is_some()
+    {
+        "resuming an incomplete bootstrap past extraction"
+    } else {
+        "discarding an incomplete bootstrap"
+    };
 
     let second = daemon
         .spawn_mode(
@@ -228,8 +238,8 @@ async fn killed_object_store_bootstrap_finishes_after_restart() {
         }
         let log = daemon.stderr();
         anyhow::ensure!(
-            log.contains("discarding an incomplete bootstrap"),
-            "restart did not re-extract; it took some other path:\n{log}",
+            log.contains(restart_path),
+            "restart did not log {restart_path:?}:\n{log}",
         );
         Ok(())
     })();
