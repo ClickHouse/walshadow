@@ -265,7 +265,7 @@ pub fn column_value_to_sql_literal(v: &ColumnValue, ch_inner: &str) -> Option<St
         ColumnValue::Interval(v) => Some(sql_string_literal(&v.to_text())),
         ColumnValue::Inet(v) => Some(sql_string_literal(&v.to_text())),
         ColumnValue::Uuid(b) => Some(format!("toUUID({})", sql_string_literal(&format_uuid(b)))),
-        ColumnValue::PgPendingText { text, .. } => Some(sql_bytes_literal(text.as_bytes())),
+        ColumnValue::PgPendingText { text, .. } => pending_text_literal(text, ch_inner),
         ColumnValue::PgPending { .. }
         | ColumnValue::ExternalToast(_)
         | ColumnValue::Unsupported { .. } => None,
@@ -349,6 +349,71 @@ fn sql_string_literal(s: &str) -> String {
     }
     out.push('\'');
     out
+}
+
+/// PG text of a type only shadow PG decodes. CH casts a default to its column
+/// type, which parses most PG text forms as is, but not an array's `{…}` nor
+/// the UTC offset `timestamptz_out` appends (`+00`)
+fn pending_text_literal(text: &str, ch_inner: &str) -> Option<String> {
+    match types::kind(ch_inner) {
+        Some(Kind::Array) => {
+            let items: Vec<String> = pg_array_items(text)?
+                .iter()
+                .map(|item| {
+                    item.as_deref()
+                        .map_or_else(|| "NULL".into(), sql_string_literal)
+                })
+                .collect();
+            Some(format!("[{}]", items.join(", ")))
+        }
+        // BC and ±infinity have no DateTime64 form
+        Some(Kind::DateTime64) if text.ends_with(" BC") || text.ends_with("infinity") => None,
+        Some(Kind::DateTime64) => Some(format!(
+            "parseDateTime64BestEffort({}, {}, 'UTC')",
+            sql_string_literal(text),
+            datetime64_scale(ch_inner).unwrap_or(6)
+        )),
+        _ => Some(sql_bytes_literal(text.as_bytes())),
+    }
+}
+
+/// Elements of a one-dimensional `array_out` text (`{1,NULL,"a b"}`), `None`
+/// for any other shape, eg multidimensional or with explicit bounds
+fn pg_array_items(text: &str) -> Option<Vec<Option<String>>> {
+    let body = text.strip_prefix('{')?.strip_suffix('}')?;
+    let mut items = Vec::new();
+    if body.is_empty() {
+        return Some(items);
+    }
+    let mut chars = body.chars().peekable();
+    loop {
+        let item = if chars.next_if_eq(&'"').is_some() {
+            let mut item = String::new();
+            loop {
+                match chars.next()? {
+                    '\\' => item.push(chars.next()?),
+                    '"' => break,
+                    c => item.push(c),
+                }
+            }
+            Some(item)
+        } else {
+            let mut raw = String::new();
+            while let Some(c) = chars.next_if(|&c| c != ',') {
+                if matches!(c, '{' | '}' | '"') {
+                    return None;
+                }
+                raw.push(c);
+            }
+            (!raw.eq_ignore_ascii_case("NULL")).then_some(raw)
+        };
+        items.push(item);
+        match chars.next() {
+            None => return Some(items),
+            Some(',') => {}
+            Some(_) => return None,
+        }
+    }
 }
 
 /// Raw bytes as CH binary literal via `unhex('…')`; round-trip safe for
@@ -673,17 +738,6 @@ mod tests {
         assert_eq!(r.default_sql.as_deref(), Some("false"));
     }
 
-    #[test]
-    fn default_for_timestamp_renders_text_bytes() {
-        let r = map(
-            &attr(TIMESTAMPTZOID, 6, true, Some("2024-01-02 03:04:05+00")),
-            false,
-        )
-        .unwrap();
-        let d = r.default_sql.expect("default rendered");
-        assert!(d.starts_with("unhex('"), "{d}");
-    }
-
     /// Fringe varlena type with no local codec
     const TSVECTOROID: u32 = 3614;
 
@@ -818,5 +872,71 @@ mod tests {
         assert_eq!(datetime64_ch_type(6), "DateTime64(6, 'UTC')");
         assert_eq!(datetime64_ch_type(9), "DateTime64(6, 'UTC')");
         assert_eq!(datetime64_ch_type(-1), "DateTime64(6, 'UTC')");
+    }
+
+    fn array_attr(type_name: &str, missing: &str) -> RelAttr {
+        RelAttr {
+            type_name: type_name.into(),
+            type_byval: false,
+            type_len: -1,
+            ..attr(0, -1, true, Some(missing))
+        }
+    }
+
+    #[test]
+    fn timestamptz_text_default_parses_the_utc_offset() {
+        let r = map(
+            &attr(
+                TIMESTAMPTZOID,
+                -1,
+                true,
+                Some("2026-08-27 12:47:00.842306+00"),
+            ),
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            r.default_sql.as_deref(),
+            Some("parseDateTime64BestEffort('2026-08-27 12:47:00.842306+00', 6, 'UTC')")
+        );
+        let r = map(
+            &attr(TIMESTAMPOID, 3, true, Some("2024-01-01 00:00:00")),
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            r.default_sql.as_deref(),
+            Some("parseDateTime64BestEffort('2024-01-01 00:00:00', 3, 'UTC')")
+        );
+        for text in ["infinity", "-infinity", "0044-03-15 12:00:00+00 BC"] {
+            let r = map(&attr(TIMESTAMPTZOID, -1, true, Some(text)), false).unwrap();
+            assert_eq!(r.default_sql, None, "{text}");
+        }
+    }
+
+    #[test]
+    fn array_text_default_renders_a_clickhouse_array() {
+        for (type_name, text, expected) in [
+            ("_int4", "{90}", Some("['90']")),
+            ("_int8", "{1,NULL,-3}", Some("['1', NULL, '-3']")),
+            (
+                "_text",
+                r#"{"x y","q\"\\",NULL,"NULL",it's}"#,
+                Some(r#"['x y', 'q"\\', NULL, 'NULL', 'it''s']"#),
+            ),
+            ("_int4", "{}", Some("[]")),
+            ("_int4", "{{1,2},{3,4}}", None),
+            ("_int4", "[0:1]={1,2}", None),
+            ("_text", r#"{"unterminated}"#, None),
+        ] {
+            let r = map(&array_attr(type_name, text), false).unwrap();
+            assert_eq!(r.default_sql.as_deref(), expected, "{type_name} {text}");
+        }
+    }
+
+    #[test]
+    fn other_pending_text_defaults_cast_from_their_text() {
+        let r = map(&attr(NUMERICOID, -1, true, Some("3.14")), false).unwrap();
+        assert_eq!(r.default_sql.as_deref(), Some("unhex('332e3134')"));
     }
 }
