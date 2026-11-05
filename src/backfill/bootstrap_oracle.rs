@@ -68,6 +68,7 @@ impl BootstrapOracle {
                     .context("pg_dump --binary-upgrade")?;
                 filter_out_extensions(&raw, &unavailable)
             };
+            let dump = drop_unwrapped_foreign_servers(&dump);
             a.apply_schema_dump(&dump).context("apply schema")?;
             a.stop().context("stop -b")?;
 
@@ -236,7 +237,12 @@ fn filter_out_extensions(dump: &str, excluded: &[String]) -> String {
         return dump.to_string();
     }
     let excluded: ahash::HashSet<&str> = excluded.iter().map(String::as_str).collect();
-    let lines: Vec<&str> = dump.lines().collect();
+    drop_entries(dump, |seg| should_drop_entry(seg, &excluded))
+}
+
+/// Entries of a dump, each with whether it opens with a header; the first may
+/// be a headerless preamble
+fn entries<'a>(lines: &'a [&'a str]) -> Vec<(bool, &'a [&'a str])> {
     let n = lines.len();
     let is_header = |i: usize| {
         i + 2 < n
@@ -244,16 +250,25 @@ fn filter_out_extensions(dump: &str, excluded: &[String]) -> String {
             && lines[i + 1].starts_with("-- Name: ")
             && lines[i + 2] == "--"
     };
-
     let mut starts = vec![0usize];
     starts.extend((0..n).filter(|&i| is_header(i)));
     starts.dedup();
+    starts
+        .iter()
+        .enumerate()
+        .map(|(k, &start)| {
+            let end = starts.get(k + 1).copied().unwrap_or(n);
+            (is_header(start), &lines[start..end])
+        })
+        .collect()
+}
 
-    let mut out: Vec<&str> = Vec::with_capacity(n);
-    for (k, &start) in starts.iter().enumerate() {
-        let end = starts.get(k + 1).copied().unwrap_or(n);
-        let seg = &lines[start..end];
-        if is_header(start) && should_drop_entry(seg, &excluded) {
+/// Drop each headed entry `drop` selects, keeping its top-level `SET`s
+fn drop_entries(dump: &str, drop: impl Fn(&[&str]) -> bool) -> String {
+    let lines: Vec<&str> = dump.lines().collect();
+    let mut out: Vec<&str> = Vec::with_capacity(lines.len());
+    for (headed, seg) in entries(&lines) {
+        if headed && drop(seg) {
             out.extend(
                 seg.iter()
                     .copied()
@@ -291,6 +306,82 @@ fn should_drop_entry(seg: &[&str], excluded: &ahash::HashSet<&str>) -> bool {
             .strip_prefix("ALTER EXTENSION ")
             .and_then(|r| r.split_whitespace().next())
             .is_some_and(|ext| excluded.contains(ext.trim_matches('"')))
+    })
+}
+
+/// `(name, type, schema)` from an entry's `-- Name: …; Type: …; Schema: …` header
+fn entry_header<'a>(seg: &[&'a str]) -> Option<(&'a str, &'a str, &'a str)> {
+    let meta = seg.get(1)?.strip_prefix("-- Name: ")?;
+    let (name, rest) = meta.split_once("; Type: ")?;
+    let (typ, rest) = rest.split_once("; Schema: ")?;
+    Some((name, typ, rest.split(';').next()?))
+}
+
+/// Drop foreign servers whose wrapper the dump never creates, eg one from an
+/// excluded extension, with their user mappings, foreign tables and comments.
+/// Applying any of them fails on the missing wrapper. Other objects that
+/// depend on those foreign tables, such as views, are left in place.
+fn drop_unwrapped_foreign_servers(dump: &str) -> String {
+    let lines: Vec<&str> = dump.lines().collect();
+    let headed: Vec<_> = entries(&lines)
+        .into_iter()
+        .filter_map(|(h, seg)| h.then(|| entry_header(seg).map(|hd| (hd, seg)))?)
+        .collect();
+    let unquote = |s: &'_ str| s.trim().trim_end_matches(';').trim_matches('"').to_owned();
+    let wrappers: ahash::HashSet<String> = headed
+        .iter()
+        .filter(|((_, typ, _), _)| *typ == "FOREIGN DATA WRAPPER")
+        .map(|((name, ..), _)| (*name).to_owned())
+        .collect();
+    let unwrapped: ahash::HashSet<&str> = headed
+        .iter()
+        .filter(|((_, typ, _), _)| *typ == "SERVER")
+        .filter_map(|((name, ..), seg)| {
+            let fdw = seg.iter().find_map(|l| {
+                let (_, rest) = l
+                    .strip_prefix("CREATE SERVER ")?
+                    .split_once(" FOREIGN DATA WRAPPER ")?;
+                rest.split_whitespace().next().map(unquote)
+            })?;
+            (!wrappers.contains(&fdw)).then_some(*name)
+        })
+        .collect();
+    if unwrapped.is_empty() {
+        return dump.to_string();
+    }
+    let tables: ahash::HashSet<(&str, &str)> = headed
+        .iter()
+        .filter(|((_, typ, _), seg)| {
+            *typ == "FOREIGN TABLE"
+                && seg.iter().any(|l| {
+                    l.strip_prefix("SERVER ")
+                        .is_some_and(|s| unwrapped.contains(unquote(s).as_str()))
+                })
+        })
+        .map(|((name, _, schema), _)| (*schema, *name))
+        .collect();
+    drop_entries(dump, |seg| {
+        let Some((name, typ, schema)) = entry_header(seg) else {
+            return false;
+        };
+        let table = |t: &str| tables.contains(&(schema, t));
+        match typ {
+            "SERVER" => unwrapped.contains(name),
+            "USER MAPPING" => name
+                .rsplit_once(" SERVER ")
+                .is_some_and(|(_, s)| unwrapped.contains(s)),
+            "FOREIGN TABLE" => table(name),
+            "COMMENT" => {
+                name.strip_prefix("SERVER ")
+                    .is_some_and(|s| unwrapped.contains(s))
+                    || name.strip_prefix("FOREIGN TABLE ").is_some_and(table)
+                    || name
+                        .strip_prefix("COLUMN ")
+                        .and_then(|c| c.rsplit_once('.'))
+                        .is_some_and(|(t, _)| table(t))
+            }
+            _ => false,
+        }
     })
 }
 
@@ -596,5 +687,155 @@ CREATE TABLE public.app (
                 );
             }
         }
+    }
+
+    /// `pg_dump --binary-upgrade --exclude-extension=postgres_fdw` layout (PG18):
+    /// the wrapper is gone, its server and dependents remain
+    const FDW_DUMP: &str = "\
+SET statement_timeout = 0;
+
+--
+-- Name: ch; Type: SCHEMA; Schema: -; Owner: -
+--
+
+CREATE SCHEMA ch;
+
+
+--
+-- Name: keep_fdw; Type: FOREIGN DATA WRAPPER; Schema: -; Owner: -
+--
+
+CREATE FOREIGN DATA WRAPPER keep_fdw;
+
+
+--
+-- Name: chsrv; Type: SERVER; Schema: -; Owner: -
+--
+
+CREATE SERVER chsrv FOREIGN DATA WRAPPER postgres_fdw OPTIONS (
+    dbname 'x'
+);
+
+
+--
+-- Name: SERVER chsrv; Type: COMMENT; Schema: -; Owner: -
+--
+
+COMMENT ON SERVER chsrv IS 's';
+
+
+--
+-- Name: kept; Type: SERVER; Schema: -; Owner: -
+--
+
+CREATE SERVER kept FOREIGN DATA WRAPPER \"keep_fdw\";
+
+
+--
+-- Name: USER MAPPING postgres SERVER chsrv; Type: USER MAPPING; Schema: -; Owner: -
+--
+
+CREATE USER MAPPING FOR postgres SERVER chsrv OPTIONS (
+    \"user\" 'u'
+);
+
+
+--
+-- Name: USER MAPPING public SERVER kept; Type: USER MAPPING; Schema: -; Owner: -
+--
+
+CREATE USER MAPPING FOR public SERVER kept;
+
+
+--
+-- Name: events; Type: FOREIGN TABLE; Schema: ch; Owner: -
+--
+
+CREATE FOREIGN TABLE ch.events (
+    id integer DEFAULT 1,
+    name text
+)
+SERVER chsrv
+OPTIONS (
+    table_name 'ev'
+);
+ALTER FOREIGN TABLE ONLY ch.events ALTER COLUMN name OPTIONS (
+    column_name 'nm'
+);
+
+
+--
+-- Name: FOREIGN TABLE events; Type: COMMENT; Schema: ch; Owner: -
+--
+
+COMMENT ON FOREIGN TABLE ch.events IS 'c';
+
+
+--
+-- Name: COLUMN events.name; Type: COMMENT; Schema: ch; Owner: -
+--
+
+COMMENT ON COLUMN ch.events.name IS 'cc';
+
+
+--
+-- Name: remote; Type: FOREIGN TABLE; Schema: public; Owner: -
+--
+
+CREATE FOREIGN TABLE public.remote (
+    id integer
+)
+SERVER kept;
+
+
+SET default_table_access_method = heap;
+
+--
+-- Name: app; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.app (
+    id integer NOT NULL
+);
+";
+
+    #[test]
+    fn unwrapped_server_and_its_dependents_are_dropped() {
+        let out = drop_unwrapped_foreign_servers(FDW_DUMP);
+        assert!(!out.contains("chsrv"), "server, comment, user mapping gone");
+        assert!(
+            !out.contains("ch.events"),
+            "foreign table and its comments gone"
+        );
+        for kept in [
+            "CREATE SCHEMA ch;",
+            "CREATE FOREIGN DATA WRAPPER keep_fdw;",
+            "CREATE SERVER kept FOREIGN DATA WRAPPER \"keep_fdw\";",
+            "CREATE USER MAPPING FOR public SERVER kept;",
+            "CREATE FOREIGN TABLE public.remote (",
+            "CREATE TABLE public.app (",
+            "SET statement_timeout = 0;",
+            "SET default_table_access_method = heap;",
+        ] {
+            assert!(out.contains(kept), "{kept}");
+        }
+    }
+
+    #[test]
+    fn dump_without_unwrapped_servers_is_unchanged() {
+        let wrapped = FDW_DUMP.replace("WRAPPER postgres_fdw", "WRAPPER keep_fdw");
+        assert_eq!(drop_unwrapped_foreign_servers(&wrapped), wrapped);
+        assert_eq!(drop_unwrapped_foreign_servers(DUMP), DUMP);
+    }
+
+    #[test]
+    fn same_named_foreign_table_in_another_schema_is_kept() {
+        let dump = format!(
+            "{FDW_DUMP}\n--\n-- Name: events; Type: FOREIGN TABLE; Schema: public; Owner: -\n--\n\n\
+             CREATE FOREIGN TABLE public.events (\n    id integer\n)\nSERVER kept;\n"
+        );
+        let out = drop_unwrapped_foreign_servers(&dump);
+        assert!(out.contains("CREATE FOREIGN TABLE public.events ("));
+        assert!(!out.contains("ch.events"));
     }
 }
