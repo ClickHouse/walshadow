@@ -45,6 +45,7 @@ use crate::ascii_buf::{AsciiArray, AsciiBuf};
 use crate::ch::types;
 use crate::decode::codecs::{format_time_us, timetz_to_text};
 use crate::decode::heap_decoder::{self, ColumnValue};
+use crate::emit::ch_emitter::DATE32_PG_EPOCH_DAYS;
 use crate::schema::{
     BOOLOID, BPCHAROID, BYTEAOID, CHAROID, CIDROID, DATEOID, FLOAT4OID, FLOAT8OID, INETOID,
     INT2OID, INT4OID, INT8OID, INTERVALOID, JSONBOID, JSONOID, NAMEOID, NUMERICOID, OIDOID,
@@ -240,7 +241,11 @@ pub fn column_value_to_sql_literal(v: &ColumnValue, ch_inner: &str) -> Option<St
             Some(sql_string_literal(s))
         }
         ColumnValue::Bytea(b) => Some(sql_bytes_literal(b)),
-        ColumnValue::Date(days) => Some(format!("toDate32({days})")),
+        // PG counts days from 2000-01-01, `toDate32` from 1970-01-01
+        ColumnValue::Date(days) => Some(format!(
+            "toDate32({})",
+            i64::from(*days) + i64::from(DATE32_PG_EPOCH_DAYS)
+        )),
         ColumnValue::Time(micros) => {
             let txt = format_time_us(*micros);
             Some(sql_string_literal(&txt))
@@ -762,6 +767,15 @@ mod tests {
             "PG epoch should render as 2000-01-01: {lit}"
         );
         assert!(lit.ends_with(", 6, 'UTC')"), "{lit}");
+    }
+
+    #[test]
+    fn column_value_date_shifts_to_unix_epoch() {
+        // 2024-01-01 is day 8766 after 2000-01-01, day 19723 after 1970-01-01
+        let lit = column_value_to_sql_literal(&ColumnValue::Date(8766), "Date32").unwrap();
+        assert_eq!(lit, "toDate32(19723)");
+        let lit = column_value_to_sql_literal(&ColumnValue::Date(0), "Date32").unwrap();
+        assert_eq!(lit, "toDate32(10957)");
     }
 
     #[test]
