@@ -44,7 +44,9 @@ async fn broad_type_fidelity() {
         n numeric(10,2), nbig numeric(50,2), nhuge numeric(90,4),\
         d date, tm time, tmz timetz,\
         ts timestamp, tstz timestamptz,\
-        u uuid, ip inet, j json, iv interval);\n";
+        u uuid, ip inet, j json, iv interval,\
+        nm name, x xid, c cid, x8 xid8, l pg_lsn, m money,\
+        mac macaddr, mac8 macaddr8, ti tid);\n";
 
     let slot = fx::Ports::alloc();
     let tmp = tempfile::tempdir().unwrap();
@@ -75,6 +77,8 @@ async fn broad_type_fidelity() {
             d Date32, tm Time64(6), tmz String,\
             ts DateTime64(6, 'UTC'), tstz DateTime64(6, 'UTC'),\
             u UUID, ip String, j String, iv String,\
+            nm String, x UInt32, c UInt32, x8 UInt64, l UInt64, m Int64,\
+            mac String, mac8 String, ti String,\
             _lsn UInt64, _xid UInt32,\
             _commit_ts DateTime64(6, 'UTC'), _is_deleted Bool\
          ) ENGINE = ReplacingMergeTree(_lsn, _is_deleted) ORDER BY id",
@@ -107,6 +111,15 @@ async fn broad_type_fidelity() {
             col(20, "ip", "String"),
             col(21, "j", "String"),
             col(22, "iv", "String"),
+            col(23, "nm", "String"),
+            col(24, "x", "UInt32"),
+            col(25, "c", "UInt32"),
+            col(26, "x8", "UInt64"),
+            col(27, "l", "UInt64"),
+            col(28, "m", "Int64"),
+            col(29, "mac", "String"),
+            col(30, "mac8", "String"),
+            col(31, "ti", "String"),
         ],
     }];
 
@@ -138,7 +151,9 @@ async fn broad_type_fidelity() {
             '2026-06-24', '12:34:56', '12:34:56+02',\
             '2026-06-24 12:34:56', '2026-06-24 12:34:56+00',\
             '00112233-4455-6677-8899-aabbccddeeff', '192.168.0.1', '{\"k\":1}',\
-            '1 year 2 mons 3 days 04:05:06'\
+            '1 year 2 mons 3 days 04:05:06',\
+            'pg_class', '4000000000', '7', '18446744073709551615', '16/B374D848', -1234.56,\
+            '08:00:2B:01:02:03', '08:00:2b:ff:fe:01:02:03', '(5,3)'\
          );\n\
          SELECT pg_switch_wal();\n",
     );
@@ -164,7 +179,9 @@ async fn broad_type_fidelity() {
                 toString(n), toString(nbig), nhuge,\
                 toString(d), toString(tm), tmz,\
                 toString(ts), toString(tstz),\
-                toString(u), ip, j, iv \
+                toString(u), ip, j, iv,\
+                nm, toString(x), toString(c), toString(x8), toString(l), toString(m),\
+                mac, mac8, ti \
              FROM walshadow_test.types_t FINAL WHERE id = 1 AND _is_deleted = 0",
         )
         .expect("ch select");
@@ -194,6 +211,15 @@ async fn broad_type_fidelity() {
         ("ip", "192.168.0.1"),
         ("j", "{\"k\":1}"),
         ("iv", "1 year 2 mons 3 days 04:05:06"),
+        ("nm", "pg_class"),
+        ("x", "4000000000"),
+        ("c", "7"),
+        ("x8", "18446744073709551615"),
+        ("l", "97500059720"),
+        ("m", "-123456"),
+        ("mac", "08:00:2b:01:02:03"),
+        ("mac8", "08:00:2b:ff:fe:01:02:03"),
+        ("ti", "(5,3)"),
     ];
     assert_eq!(cols.len(), want.len(), "column count (got {got:?})");
     for (i, (name, expect)) in want.iter().enumerate() {

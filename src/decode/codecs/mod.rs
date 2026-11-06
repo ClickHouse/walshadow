@@ -1,6 +1,7 @@
 //! PG datum decoders and output formatters, grouped by type family
 //! Decode varlena bodies without outer headers, fixed-width datums as stored
 
+mod fixed;
 mod inet;
 mod interval;
 mod jsonb;
@@ -9,6 +10,9 @@ mod text_array;
 mod time;
 mod uuid;
 
+pub(crate) use fixed::{
+    decode_tid, macaddr_to_text, macaddr8_to_text, parse_macaddr, parse_tid, tid_to_text,
+};
 pub use inet::{InetValue, PGSQL_AF_INET, PGSQL_AF_INET6, decode_inet};
 pub use interval::{IntervalValue, decode_interval};
 pub use jsonb::{decode_jsonb, decode_jsonb_with_capacity, jsonb_text_len};
