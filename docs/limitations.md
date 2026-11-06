@@ -6,6 +6,8 @@ Review these limits before production use
 
 - PostgreSQL 16, 17, 18, and 19, daemon rejects unaudited majors
 - shadow PostgreSQL major must match source major
+- walshadow host needs shared libraries for every source extension, matching
+  source versions
 - one process replicates every database its config names
   ([several databases](multi-database.md)); adding or removing one needs a
   restart, and existing rows load from a backup only for the database
@@ -67,7 +69,6 @@ insert batch
   mapping; map the column to a matching nested `Array(Array(...))` instead
 - greenfield bootstrap runs before the shadow exists, so it starts a throwaway
   PostgreSQL instance from source schema to convert them, which requires `pg_dump`
-  Schema objects for extensions unavailable on daemon host are omitted
 
 ## Ordering and consistency
 

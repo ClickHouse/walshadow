@@ -12,6 +12,7 @@ Prepare:
 - ClickHouse Native endpoint
 - PostgreSQL account with `REPLICATION` and read access to selected tables
 - Matching PostgreSQL major for walshadow image
+- Shared libraries for every source extension, matching source versions
 
 Source must use `wal_level = logical` and at least two WAL senders for
 concurrent streaming and base backup. Each selected table needs a usable row

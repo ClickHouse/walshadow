@@ -245,17 +245,11 @@ async fn bootstrap_oracle_reports_source_errors() {
         .sh
         .psql_one("CREATE ROLE restricted LOGIN; CREATE TABLE private (id int)")
         .unwrap();
-    for (user, database, stage, expected) in [
-        (
-            "postgres",
-            "missing",
-            "source extensions query failed:",
-            "database \"missing\" does not exist",
-        ),
+    for (user, database, expected) in [
+        ("postgres", "missing", "database \"missing\" does not exist"),
         (
             "restricted",
             "postgres",
-            "pg_dump failed:",
             "permission denied for table private",
         ),
     ] {
@@ -282,7 +276,7 @@ async fn bootstrap_oracle_reports_source_errors() {
         .expect("provision fails");
         let msg = format!("{err:#}");
         assert!(msg.contains("bootstrap oracle provision:"), "{msg}");
-        assert!(msg.contains(stage), "{msg}");
+        assert!(msg.contains("pg_dump failed:"), "{msg}");
         assert!(msg.contains(expected), "{msg}");
         assert!(!base.join("sock/walshadow-bridge.sock").exists());
         drop(guard);
