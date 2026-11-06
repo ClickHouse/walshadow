@@ -446,17 +446,17 @@ impl<'a> TupleBuild<'a> for DecodedTuple {
 }
 
 /// Tuple image borrowing its record. Indexed by attnum-1 like
-/// [`DecodedTuple::columns`]
+/// [`DecodedTuple::columns`]; inline up to 32 attributes
 #[derive(Clone, Debug, PartialEq)]
 pub struct TupleView<'a> {
-    pub datums: Vec<DatumRef<'a>>,
+    pub datums: SmallVec<[DatumRef<'a>; 32]>,
     pub partial: bool,
 }
 
 impl<'a> TupleBuild<'a> for TupleView<'a> {
     fn with_capacity(n: usize) -> Self {
         Self {
-            datums: Vec::with_capacity(n),
+            datums: SmallVec::with_capacity(n),
             partial: false,
         }
     }
@@ -530,7 +530,7 @@ pub fn decode_heap_record(
         .map(|b| b.header.location.rel)
         .unwrap_or_default();
     let xid = record.header.xact_id;
-    Ok(parse_heap_record::<DecodedTuple>(record, rel)?
+    Ok(parse_heap_record::<DecodedTuple>(record.into(), rel)?
         .into_iter()
         .map(|images| DecodedHeap {
             rfn,
@@ -545,10 +545,31 @@ pub fn decode_heap_record(
 
 /// [`decode_heap_record`] borrowing attribute bytes from `record`
 pub fn view_heap_record<'a>(
-    record: &'a XLogRecord<'_>,
+    record: impl Into<HeapRecordBytes<'a>>,
     rel: &RelDescriptor,
 ) -> Result<SmallVec<[HeapImages<TupleView<'a>>; 1]>, DecodeError> {
-    parse_heap_record(record, rel)
+    parse_heap_record(record.into(), rel)
+}
+
+/// Record fields heap decode reads
+#[derive(Clone, Copy, Debug)]
+pub struct HeapRecordBytes<'a> {
+    pub rm: u8,
+    pub info: u8,
+    pub main_data: &'a [u8],
+    /// Block 0 registered data
+    pub block: Option<&'a [u8]>,
+}
+
+impl<'a> From<&'a XLogRecord<'_>> for HeapRecordBytes<'a> {
+    fn from(record: &'a XLogRecord<'_>) -> Self {
+        Self {
+            rm: record.header.resource_manager_id,
+            info: record.header.info,
+            main_data: &record.main_data,
+            block: record.blocks.first().map(|b| &b.data[..]),
+        }
+    }
 }
 
 /// Validate `record` as [`decode_heap_record`] would, without building cells
@@ -556,15 +577,15 @@ pub fn scan_heap_record(
     record: &XLogRecord<'_>,
     rel: &RelDescriptor,
 ) -> Result<SmallVec<[HeapImages<TupleShape>; 1]>, DecodeError> {
-    parse_heap_record(record, rel)
+    parse_heap_record(record.into(), rel)
 }
 
 fn parse_heap_record<'a, T: TupleBuild<'a>>(
-    record: &'a XLogRecord<'_>,
+    record: HeapRecordBytes<'a>,
     rel: &RelDescriptor,
 ) -> Result<SmallVec<[HeapImages<T>; 1]>, DecodeError> {
-    let rm = record.header.resource_manager_id;
-    let info_op = record.header.info & XLOG_HEAP_OPMASK;
+    let rm = record.rm;
+    let info_op = record.info & XLOG_HEAP_OPMASK;
     if rm == RmId::Heap2 as u8 && info_op == XLOG_HEAP2_MULTI_INSERT {
         return decode_multi_insert(record, rel);
     }
@@ -592,10 +613,10 @@ pub const SIZE_OF_MULTI_INSERT_TUPLE: usize = 7;
 pub const XLOG_HEAP_INIT_PAGE: u8 = 0x80;
 
 fn decode_multi_insert<'a, T: TupleBuild<'a>>(
-    record: &'a XLogRecord<'_>,
+    record: HeapRecordBytes<'a>,
     rel: &RelDescriptor,
 ) -> Result<SmallVec<[HeapImages<T>; 1]>, DecodeError> {
-    let md = &record.main_data;
+    let md = record.main_data;
     if md.len() < SIZE_OF_HEAP_MULTI_INSERT {
         return Err(DecodeError::Truncated {
             offset: 0,
@@ -619,7 +640,7 @@ fn decode_multi_insert<'a, T: TupleBuild<'a>>(
     if flags & XLH_INSERT_CONTAINS_NEW_TUPLE == 0 {
         return Ok(SmallVec::new());
     }
-    let init_page = record.header.info & XLOG_HEAP_INIT_PAGE != 0;
+    let init_page = record.info & XLOG_HEAP_INIT_PAGE != 0;
     // Non-init_page: main_data continues with offsets[ntuples] of u16.
     // Values unneeded (block 0 carries tuples in order); length-check only
     let expected_md_min = if init_page {
@@ -635,10 +656,9 @@ fn decode_multi_insert<'a, T: TupleBuild<'a>>(
         });
     }
 
-    let Some(block) = record.blocks.first() else {
+    let Some(data) = record.block else {
         return Ok(SmallVec::new());
     };
-    let data: &'a [u8] = &block.data;
     let mut cursor = 0usize;
     let mut out = SmallVec::with_capacity(ntuples);
     for _ in 0..ntuples {
@@ -681,13 +701,13 @@ fn decode_multi_insert<'a, T: TupleBuild<'a>>(
 }
 
 fn decode_insert<'a, T: TupleBuild<'a>>(
-    record: &'a XLogRecord<'_>,
+    record: HeapRecordBytes<'a>,
     rel: &RelDescriptor,
 ) -> Result<HeapImages<T>, DecodeError> {
     // PG always references target page; emit empty new rather than fail
     // the stream
-    let new = match record.blocks.first() {
-        Some(block) => Some(decode_tuple_payload(&block.data, 0, rel, 0)?),
+    let new = match record.block {
+        Some(data) => Some(decode_tuple_payload(data, 0, rel, 0)?),
         None => None,
     };
     Ok(HeapImages {
@@ -698,7 +718,7 @@ fn decode_insert<'a, T: TupleBuild<'a>>(
 }
 
 fn decode_update<'a, T: TupleBuild<'a>>(
-    record: &'a XLogRecord<'_>,
+    record: HeapRecordBytes<'a>,
     rel: &RelDescriptor,
     hot: bool,
 ) -> Result<HeapImages<T>, DecodeError> {
@@ -715,8 +735,7 @@ fn decode_update<'a, T: TupleBuild<'a>>(
     let has_old_tuple = flags & XLH_UPDATE_CONTAINS_OLD_TUPLE != 0;
     let has_old_key = flags & XLH_UPDATE_CONTAINS_OLD_KEY != 0;
 
-    let new = if let Some(b) = record.blocks.first() {
-        let data: &'a [u8] = &b.data;
+    let new = if let Some(data) = record.block {
         let mut cursor = 0;
         let prefixlen = if has_prefix {
             read_u16(data, &mut cursor)? as usize
@@ -737,7 +756,7 @@ fn decode_update<'a, T: TupleBuild<'a>>(
     };
 
     let old = if has_old_tuple || has_old_key {
-        decode_old_tuple_from_main_data(&record.main_data, SIZE_OF_HEAP_UPDATE, rel)?
+        decode_old_tuple_from_main_data(record.main_data, SIZE_OF_HEAP_UPDATE, rel)?
     } else {
         None
     };
@@ -751,7 +770,7 @@ fn decode_update<'a, T: TupleBuild<'a>>(
 }
 
 fn decode_delete<'a, T: TupleBuild<'a>>(
-    record: &'a XLogRecord<'_>,
+    record: HeapRecordBytes<'a>,
     rel: &RelDescriptor,
 ) -> Result<HeapImages<T>, DecodeError> {
     if record.main_data.len() < SIZE_OF_HEAP_DELETE {
@@ -764,7 +783,7 @@ fn decode_delete<'a, T: TupleBuild<'a>>(
     let flags = record.main_data[7]; // xl_heap_delete.flags (after xmax:4 + offnum:2 + infobits:1)
     let has_old = flags & (XLH_DELETE_CONTAINS_OLD_TUPLE | XLH_DELETE_CONTAINS_OLD_KEY) != 0;
     let old = if has_old {
-        decode_old_tuple_from_main_data(&record.main_data, SIZE_OF_HEAP_DELETE, rel)?
+        decode_old_tuple_from_main_data(record.main_data, SIZE_OF_HEAP_DELETE, rel)?
     } else {
         None
     };
@@ -1190,17 +1209,18 @@ pub fn datum_value(att: &RelAttr, datum: DatumRef<'_>) -> Option<ColumnValue> {
         DatumRef::Missing => missing_value_for(att),
         DatumRef::Fixed(body) => fixed_value(att, body),
         DatumRef::Varlena(body) => varlena_to_value(att.type_oid, Cow::Borrowed(body)),
-        DatumRef::Compressed {
-            method,
-            raw_len,
-            body,
-            datum,
-        } => decompress_varlena(method, body, raw_len)
-            .map(|out| varlena_to_value(att.type_oid, Cow::Owned(out)))
-            .unwrap_or_else(|| ColumnValue::Unsupported {
-                type_oid: att.type_oid,
-                raw: datum.to_vec(),
-            }),
+        DatumRef::Compressed(datum) => {
+            // Reader checked datum spans header and va_tcinfo
+            let tcinfo = u32::from_le_bytes(datum[4..8].try_into().unwrap());
+            let method = (tcinfo >> VARLENA_EXTSIZE_BITS) as u8;
+            let raw_len = (tcinfo & VARLENA_EXTSIZE_MASK) as usize;
+            decompress_varlena(method, &datum[8..], raw_len)
+                .map(|out| varlena_to_value(att.type_oid, Cow::Owned(out)))
+                .unwrap_or_else(|| ColumnValue::Unsupported {
+                    type_oid: att.type_oid,
+                    raw: datum.to_vec(),
+                })
+        }
         DatumRef::External(p) => ColumnValue::ExternalToast(p),
         DatumRef::Cstring(body) => simdutf8::basic::from_utf8(body)
             .map(|s| ColumnValue::Text(s.to_owned()))
@@ -1237,7 +1257,7 @@ pub fn datum_view<'a>(
             type_oid: att.type_oid,
             raw,
         },
-        DatumRef::Missing | DatumRef::Compressed { .. } => return Err(AllocatingDecode),
+        DatumRef::Missing | DatumRef::Compressed(_) => return Err(AllocatingDecode),
     }))
 }
 
@@ -1422,14 +1442,7 @@ fn read_varlena(buf: &[u8], abs: usize) -> Result<(DatumRef<'_>, usize), DecodeE
                 have: total,
             });
         }
-        let tcinfo = u32::from_le_bytes(buf[abs + 4..abs + 8].try_into().unwrap());
-        let datum = DatumRef::Compressed {
-            method: (tcinfo >> VARLENA_EXTSIZE_BITS) as u8,
-            raw_len: (tcinfo & VARLENA_EXTSIZE_MASK) as usize,
-            body: &buf[abs + 8..abs + total],
-            datum: &buf[abs..abs + total],
-        };
-        return Ok((datum, total));
+        return Ok((DatumRef::Compressed(&buf[abs..abs + total]), total));
     }
     Ok((DatumRef::Varlena(&buf[abs + 4..abs + total]), total))
 }

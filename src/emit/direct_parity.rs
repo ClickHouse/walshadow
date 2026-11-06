@@ -831,3 +831,122 @@ fn view_matches_owned_decode_for_records() {
         Some(ColumnValue::Text("value".into()))
     );
 }
+
+/// Operation with new and old tuple bytes
+type Change = (HeapOp, Option<Vec<u8>>, Option<Vec<u8>>);
+
+/// Plan row changes both ways; segments must carry identical rows
+fn plan_both(rel: &RelDescriptor, targets: &[&str], changes: &[Change]) {
+    use crate::emit::pipeline::plan_spool::{PlanItem, PlanWriter, ViewChange};
+    use crate::emit::route::RouteSnapshot;
+    let rel = std::sync::Arc::new(rel.clone());
+    let route = RouteSnapshot::freeze(
+        std::sync::Arc::new(mapping_of(&rel, targets)),
+        std::sync::Arc::default(),
+        Default::default(),
+    );
+    let tmp = tempfile::tempdir().unwrap();
+    let mut out = Vec::new();
+    for views in [false, true] {
+        let mut w = PlanWriter::create(tmp.path().join(format!("{views}.plan")), 1 << 20, 1 << 20)
+            .for_commit(9);
+        let table = w.table(&rel, 1, || Some(route.clone()));
+        for (i, (op, new, old)) in changes.iter().enumerate() {
+            let lsn = 0x1000 + 0x10 * i as u64;
+            if views {
+                let new = new.as_ref().map(|d| view_block_data(d, &rel).unwrap());
+                let old = old.as_ref().map(|d| view_block_data(d, &rel).unwrap());
+                let change = ViewChange {
+                    op: *op,
+                    xid: 5,
+                    source_lsn: lsn,
+                    new: new.as_ref(),
+                    old: old.as_ref(),
+                };
+                w.push_views(change, table).unwrap();
+            } else {
+                let decoded = DecodedHeap {
+                    rfn: rel.rfn,
+                    xid: 5,
+                    source_lsn: lsn,
+                    op: *op,
+                    new: new.as_ref().map(|d| decode_block_data(d, &rel).unwrap()),
+                    old: old.as_ref().map(|d| decode_block_data(d, &rel).unwrap()),
+                };
+                w.push_cells(decoded, table).unwrap();
+            }
+        }
+        let mut rd = w.seal(0x2000, 9).unwrap().replay().unwrap();
+        let mut bytes = Vec::new();
+        while let Some(item) = rd.next_item().unwrap() {
+            if let PlanItem::Segment(s) = item {
+                bytes.extend(s.chunks.iter().map(|c| (c.rows(), c.to_bytes())));
+            }
+        }
+        out.push(bytes);
+    }
+    assert_eq!(out[0], out[1]);
+    assert!(!out[0].is_empty());
+}
+
+#[test]
+fn plan_views_match_cells_for_row_changes() {
+    let int4 = |v: i32| v.to_le_bytes();
+    let f8 = |v: f64| v.to_le_bytes();
+    let txt = |s: &str| short(s.as_bytes());
+    for replident in [
+        ReplIdent::Full { pk_attnums: None },
+        ReplIdent::Default {
+            pk_attnums: Some(vec![1]),
+        },
+    ] {
+        let mut r = rel(vec![
+            attr(1, INT4OID, 4, 'i', "int4"),
+            attr(2, FLOAT8OID, 8, 'd', "float8"),
+            attr(3, TEXTOID, -1, 'i', "text"),
+        ]);
+        r.replident = replident;
+        let attrs = r.attributes.clone();
+        let row = |id: i32, f: f64, t: &str| {
+            tuple(
+                &attrs,
+                3,
+                &[Some(&int4(id)[..]), Some(&f8(f)[..]), Some(&txt(t)[..])],
+            )
+        };
+        let nan = f64::from_bits(0x7ff8_0000_0000_0001);
+        plan_both(
+            &r,
+            &["Int32", "Float64", "String"],
+            &[
+                (HeapOp::Insert, Some(row(1, 1.0, "a")), None),
+                // Key change splits into delete marker plus new row
+                (
+                    HeapOp::Update,
+                    Some(row(2, 1.0, "a")),
+                    Some(row(1, 1.0, "a")),
+                ),
+                // Same key, other columns change
+                (
+                    HeapOp::Update,
+                    Some(row(2, 2.0, "b")),
+                    Some(row(2, 1.0, "a")),
+                ),
+                // NaN never equals itself
+                (
+                    HeapOp::Update,
+                    Some(row(2, nan, "b")),
+                    Some(row(2, nan, "b")),
+                ),
+                (
+                    HeapOp::HotUpdate,
+                    Some(row(2, 3.0, "c")),
+                    Some(row(2, nan, "b")),
+                ),
+                (HeapOp::Update, Some(row(3, 3.0, "c")), None),
+                (HeapOp::Delete, None, Some(row(3, 3.0, "c"))),
+                (HeapOp::Delete, None, None),
+            ],
+        );
+    }
+}

@@ -10,10 +10,11 @@ use walrus::pg::walparser::{
     BlockLocation, RelFileNode, RmId, XLogRecord, XLogRecordBlock, XLogRecordBlockHeader,
     XLogRecordHeader,
 };
-use walshadow::heap_decoder::ColumnValue;
+use walshadow::decode::datum::DatumRef;
+use walshadow::heap_decoder::view_heap_record;
 use walshadow::schema::{RelAttr, RelDescriptor, RelName, ReplIdent, TEXTOID};
 use walshadow::spill::{DescribedInput, HeapInput};
-use walshadow::xact_buffer::{StashResolved, XactBuffer, XactBufferConfig};
+use walshadow::xact_buffer::{DrainHeap, StashResolved, XactBuffer, XactBufferConfig};
 
 #[path = "common/alloc_meter.rs"]
 mod alloc_meter;
@@ -152,17 +153,21 @@ async fn run(args: Args) -> anyhow::Result<()> {
             let mut rows = 0;
             while let Some(batch) = drain.next_batch(1024, 1 << 20, None).await? {
                 for heap in batch.heaps {
-                    assert_eq!(heap.decoded.xid, xid);
+                    let DrainHeap::Input(input) = heap else {
+                        panic!("ordinary rows drain as inputs");
+                    };
+                    assert_eq!(input.input.xid, xid);
                     assert_eq!(
-                        heap.decoded.source_lsn,
+                        input.input.source_lsn,
                         u64::from(xid) * (args.rows as u64 + 1) + rows
                     );
-                    assert_eq!(heap.descriptor.as_ref(), descriptor.as_ref());
-                    assert_eq!(heap.descriptor_valid_from, 1);
-                    let tuple = heap.decoded.new.unwrap();
-                    assert_eq!(tuple.columns.len(), 1);
+                    assert_eq!(input.descriptor.as_ref(), descriptor.as_ref());
+                    assert_eq!(input.descriptor_valid_from, 1);
+                    let record = input.input.to_xlog_record(descriptor.rfn);
+                    let images = view_heap_record(&record, &descriptor)?;
+                    let datums = &images[0].new.as_ref().expect("insert image").datums;
                     assert!(
-                        matches!(&tuple.columns[0], Some(ColumnValue::Text(s)) if s == &payload)
+                        matches!(datums[..], [DatumRef::Varlena(b)] if b == payload.as_bytes())
                     );
                     rows += 1;
                 }

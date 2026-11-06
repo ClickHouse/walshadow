@@ -158,6 +158,65 @@ fn entry_lsn(e: &SpillEntry) -> u64 {
     }
 }
 
+/// One drained row change: cells for truncates, stash-resolved records and
+/// directly buffered heaps; record bytes for covered inputs, which planning
+/// encodes without building cells
+#[derive(Debug, Clone, PartialEq)]
+pub enum DrainHeap {
+    Cells(DescribedHeap),
+    Input(Box<DescribedInput>),
+}
+
+impl DrainHeap {
+    pub fn descriptor(&self) -> &Arc<RelDescriptor> {
+        match self {
+            Self::Cells(h) => &h.descriptor,
+            Self::Input(i) => &i.descriptor,
+        }
+    }
+
+    pub fn descriptor_valid_from(&self) -> u64 {
+        match self {
+            Self::Cells(h) => h.descriptor_valid_from,
+            Self::Input(i) => i.descriptor_valid_from,
+        }
+    }
+
+    pub fn source_lsn(&self) -> u64 {
+        match self {
+            Self::Cells(h) => h.decoded.source_lsn,
+            Self::Input(i) => i.input.source_lsn,
+        }
+    }
+
+    pub fn is_truncate(&self) -> bool {
+        matches!(self, Self::Cells(h) if h.decoded.op == HeapOp::Truncate)
+    }
+
+    pub fn approx_bytes(&self) -> usize {
+        match self {
+            Self::Cells(h) => h.approx_bytes(),
+            Self::Input(i) => i.approx_bytes(),
+        }
+    }
+
+    /// Row changes this entry yields
+    pub fn rows(&self) -> usize {
+        match self {
+            Self::Cells(_) => 1,
+            Self::Input(i) => usize::from(i.input.tuples),
+        }
+    }
+
+    /// Owned cells per tuple, through the cell adapter
+    pub fn into_cells(self) -> std::result::Result<SmallVec<[DescribedHeap; 1]>, XactBufferError> {
+        match self {
+            Self::Cells(h) => Ok(smallvec::smallvec![h]),
+            Self::Input(i) => input_heaps(&i),
+        }
+    }
+}
+
 /// Heaps an entry yields at drain
 fn entry_rows(e: &SpillEntry) -> usize {
     match e {
@@ -1431,8 +1490,8 @@ impl XactBuffer {
         {
             let mut heaps = Vec::with_capacity(st.in_mem.len());
             for entry in std::mem::take(&mut st.in_mem) {
-                match entry {
-                    SpillEntry::Heap(h) => heaps.push(*h),
+                heaps.push(match entry {
+                    SpillEntry::Heap(h) => DrainHeap::Cells(*h),
                     SpillEntry::Input(i) => {
                         if !xids.contains(&i.input.xid) {
                             return Err(XactBufferError::ForeignXid {
@@ -1440,10 +1499,10 @@ impl XactBuffer {
                                 top: top_xid,
                             });
                         }
-                        heaps.extend(input_heaps(&i)?);
+                        DrainHeap::Input(i)
                     }
                     _ => unreachable!("plain state holds heaps and inputs only"),
-                }
+                });
             }
             self.stats.committed_xacts_total += 1;
             return Ok(CommittedDrain {
@@ -1734,6 +1793,7 @@ impl MergeSource {
 
 enum MergeItem {
     Heap(Box<DescribedHeap>),
+    Input(Box<DescribedInput>),
     /// Boxed: a config row carries every per-relation setting, so the variant
     /// dwarfs the heap pointer the merge yields per row
     Event(Box<DrainEntry>),
@@ -1861,23 +1921,14 @@ impl MergedDrain {
                         SpillEntry::Chunk(c) => self.fold_chunk(c)?,
                         SpillEntry::ToastDelete(d) => self.fold_delete(d)?,
                         SpillEntry::Raw(raw) => self.fold_raw(&raw)?,
-                        SpillEntry::Input(i) => self.fold_input(&i)?,
+                        SpillEntry::Input(i) => {
+                            self.check_owned(i.input.xid)?;
+                            return Ok(Some(MergeItem::Input(i)));
+                        }
                     }
                 }
             }
         }
-    }
-
-    /// Queue an input's tuples like a resolved raw record's
-    fn fold_input(&mut self, i: &DescribedInput) -> std::result::Result<(), XactBufferError> {
-        self.check_owned(i.input.xid)?;
-        for heap in input_heaps(i)? {
-            let sz = heap.approx_bytes();
-            self.gauge.add(sz);
-            self.pending_gauge.add(sz);
-            self.pending_heaps.push_back(Box::new(heap));
-        }
-        Ok(())
     }
 
     fn check_owned(&self, xid: u32) -> std::result::Result<(), XactBufferError> {
@@ -2281,7 +2332,7 @@ pub struct OrderedEvent {
 /// slice a barrier the reorder coordinator serializes against ClickHouse.
 pub struct DrainedBatch {
     /// `source_lsn` ASC within the slice; later slices strictly follow.
-    pub heaps: Vec<DescribedHeap>,
+    pub heaps: Vec<DrainHeap>,
     pub ordered_events: Vec<OrderedEvent>,
     /// Chunk generations sealed so far, oldest first. A chunk's WAL position
     /// precedes its referrer, so every heap's value lives in exactly one
@@ -2299,6 +2350,18 @@ pub struct DrainedBatch {
     pub is_final: bool,
 }
 
+impl DrainedBatch {
+    /// Owned cells of every row change, inputs decoded through the cell
+    /// adapter
+    pub fn cells(&self) -> std::result::Result<Vec<DescribedHeap>, XactBufferError> {
+        let mut out = Vec::with_capacity(self.heaps.len());
+        for h in &self.heaps {
+            out.extend(h.clone().into_cells()?);
+        }
+        Ok(out)
+    }
+}
+
 /// One step of a [`DrainedBatch`] apply plan (see [`DrainedBatch::into_walk`]).
 pub enum WalkStep {
     /// Seal store rows: put `new_rows[cursor..upto]` before the next step
@@ -2312,7 +2375,7 @@ pub enum WalkStep {
         heap: DescribedHeap,
         upto: usize,
     },
-    Heap(DescribedHeap),
+    Heap(DrainHeap),
 }
 
 /// [`DrainedBatch`] decomposed into its apply plan plus the payload fields
@@ -2348,14 +2411,15 @@ impl DrainedBatch {
                 steps.push(WalkStep::Rows { upto: e.row_idx });
                 steps.push(WalkStep::Event(e.event));
             }
-            if matches!(heap.decoded.op, HeapOp::Truncate) {
-                let upto = trunc
-                    .next()
-                    .expect("truncate_rows cursor per Truncate heap");
-                steps.push(WalkStep::Rows { upto });
-                steps.push(WalkStep::Truncate { heap, upto });
-            } else {
-                steps.push(WalkStep::Heap(heap));
+            match heap {
+                DrainHeap::Cells(heap) if heap.decoded.op == HeapOp::Truncate => {
+                    let upto = trunc
+                        .next()
+                        .expect("truncate_rows cursor per Truncate heap");
+                    steps.push(WalkStep::Rows { upto });
+                    steps.push(WalkStep::Truncate { heap, upto });
+                }
+                heap => steps.push(WalkStep::Heap(heap)),
             }
         }
         for e in events {
@@ -2388,7 +2452,7 @@ enum Drained {
     /// Boxed so the commit path moves a pointer, not the merge state
     Merged(Box<MergedDrain>),
     /// WAL-ordered heaps needing no merge, within one slice's budget
-    Heaps(Vec<DescribedHeap>),
+    Heaps(Vec<DrainHeap>),
 }
 
 impl CommittedDrain {
@@ -2437,7 +2501,7 @@ impl CommittedDrain {
                 }));
             }
         };
-        let mut heaps: Vec<DescribedHeap> = Vec::new();
+        let mut heaps: Vec<DrainHeap> = Vec::new();
         let mut ordered_events: Vec<OrderedEvent> = Vec::new();
         let mut truncate_rows: Vec<usize> = Vec::new();
         let mut bytes = 0usize;
@@ -2454,7 +2518,11 @@ impl CommittedDrain {
                         truncate_rows.push(m.rows.len());
                     }
                     bytes += h.approx_bytes();
-                    heaps.push(*h);
+                    heaps.push(DrainHeap::Cells(*h));
+                }
+                Some(MergeItem::Input(i)) => {
+                    bytes += i.approx_bytes();
+                    heaps.push(DrainHeap::Input(i));
                 }
             }
         }
@@ -4120,7 +4188,13 @@ mod tests {
         assert_eq!(buffer.stats().bytes_in_memory, 0);
         let mut lsns = Vec::new();
         while let Some(batch) = drain.next_batch(3, usize::MAX, None).await.unwrap() {
-            lsns.extend(batch.heaps.into_iter().map(|heap| heap.decoded.source_lsn));
+            lsns.extend(
+                batch
+                    .cells()
+                    .unwrap()
+                    .into_iter()
+                    .map(|heap| heap.decoded.source_lsn),
+            );
         }
         assert_eq!(lsns, (2..=25).collect::<Vec<_>>());
         drain.finish().await.unwrap();
@@ -5209,7 +5283,7 @@ mod tests {
         let label = |e: &DrainEntry| format!("{e:?}");
         let mut out = Vec::new();
         let mut ev = 0usize;
-        for (i, h) in batch.heaps.iter().enumerate() {
+        for (i, h) in batch.cells().unwrap().iter().enumerate() {
             while ev < batch.ordered_events.len() && batch.ordered_events[ev].heap_idx <= i {
                 out.push(label(&batch.ordered_events[ev].event));
                 ev += 1;
@@ -5278,16 +5352,24 @@ mod tests {
             batch.ordered_events[0].heap_idx, 0,
             "same-LSN event precedes the fanout"
         );
-        assert_eq!(batch.heaps.len(), 4, "3 fanned-out tuples + later heap");
+        assert_eq!(
+            batch.cells().unwrap().len(),
+            4,
+            "3 fanned-out tuples + later heap"
+        );
         for (i, expected) in [100i32, 200, 300].iter().enumerate() {
-            let h = &batch.heaps[i];
+            let h = &batch.cells().unwrap()[i];
             assert_eq!(h.decoded.source_lsn, 100);
             assert_eq!(h.decoded.xid, 8, "writer xid survives subxact merge");
             assert_eq!(h.descriptor_valid_from, 0x50);
             let new = h.decoded.new.as_ref().unwrap();
             assert_eq!(new.columns[0], Some(ColumnValue::Int4(*expected)));
         }
-        assert_eq!(batch.heaps[3].decoded.source_lsn, 200, "fanout first");
+        assert_eq!(
+            batch.cells().unwrap()[3].decoded.source_lsn,
+            200,
+            "fanout first"
+        );
         drain.finish().await.unwrap();
     }
 
@@ -5313,7 +5395,7 @@ mod tests {
             .await
             .unwrap()
             .expect("first slice");
-        assert_eq!(batch.heaps.len(), 2);
+        assert_eq!(batch.cells().unwrap().len(), 2);
         assert_eq!(b.raw_pending_rows(), 1, "third fanned tuple still queued");
         assert!(b.raw_pending_bytes() > 0);
         let ops = stats.raw_decode_ordinary_ops.load();
@@ -5325,7 +5407,7 @@ mod tests {
             .unwrap()
             .expect("final slice");
         assert!(batch.is_final);
-        assert_eq!(batch.heaps.len(), 1);
+        assert_eq!(batch.cells().unwrap().len(), 1);
         assert_eq!(b.raw_pending_rows(), 0);
         assert_eq!(b.raw_pending_bytes(), 0);
         drain.finish().await.unwrap();
@@ -5709,7 +5791,11 @@ mod tests {
             .await
             .unwrap()
             .expect("one slice");
-        assert_eq!(batch.heaps.len(), 2, "record at through_lsn decodes");
+        assert_eq!(
+            batch.cells().unwrap().len(),
+            2,
+            "record at through_lsn decodes"
+        );
         drain.finish().await.unwrap();
     }
 
@@ -5824,8 +5910,13 @@ mod tests {
             .unwrap()
             .expect("one slice");
         assert!(batch.is_final);
-        assert_eq!(batch.heaps.len(), 1, "maintenance skipped, row kept");
-        let new = batch.heaps[0].decoded.new.as_ref().unwrap();
+        assert_eq!(
+            batch.cells().unwrap().len(),
+            1,
+            "maintenance skipped, row kept"
+        );
+        let cells = batch.cells().unwrap();
+        let new = cells[0].decoded.new.as_ref().unwrap();
         assert_eq!(new.columns[0], Some(ColumnValue::Int4(7)));
         drain.finish().await.unwrap();
     }
@@ -5921,7 +6012,8 @@ mod tests {
             .expect("one slice");
         assert!(batch.is_final);
         let ops: Vec<_> = batch
-            .heaps
+            .cells()
+            .unwrap()
             .iter()
             .map(|h| (h.decoded.source_lsn, h.decoded.op))
             .collect();
@@ -5935,7 +6027,12 @@ mod tests {
             ],
         );
         assert_eq!(
-            batch.heaps[3].decoded.new.as_ref().unwrap().columns[0],
+            batch.cells().unwrap()[3]
+                .decoded
+                .new
+                .as_ref()
+                .unwrap()
+                .columns[0],
             Some(ColumnValue::Int4(9)),
         );
         drain.finish().await.unwrap();
@@ -5982,7 +6079,8 @@ mod tests {
             .unwrap()
             .expect("one slice");
         let shapes: Vec<(u64, usize, u64)> = batch
-            .heaps
+            .cells()
+            .unwrap()
             .iter()
             .map(|h| {
                 (
@@ -6031,9 +6129,12 @@ mod tests {
             .await
             .unwrap()
             .expect("one slice");
-        assert_eq!(batch.heaps.len(), 1);
-        assert_eq!(batch.heaps[0].descriptor.rel_name, owner.rel_name);
-        assert_eq!(batch.heaps[0].descriptor_valid_from, 0x50);
+        assert_eq!(batch.cells().unwrap().len(), 1);
+        assert_eq!(
+            batch.cells().unwrap()[0].descriptor.rel_name,
+            owner.rel_name
+        );
+        assert_eq!(batch.cells().unwrap()[0].descriptor_valid_from, 0x50);
         drain.finish().await.unwrap();
     }
 
@@ -6070,7 +6171,8 @@ mod tests {
         while let Some(batch) = drain.next_batch(64, usize::MAX, None).await.unwrap() {
             heaps.extend(
                 batch
-                    .heaps
+                    .cells()
+                    .unwrap()
                     .iter()
                     .map(|h| (h.decoded.source_lsn, h.decoded.xid)),
             );
@@ -6309,7 +6411,7 @@ mod tests {
             .await
             .unwrap()
             .expect("one slice");
-        assert_eq!(batch.heaps.len(), 2);
+        assert_eq!(batch.cells().unwrap().len(), 2);
         assert!(!drain.spilled());
         drop(drain);
         assert!(spill_files(tmp.path()).is_empty());
@@ -6346,7 +6448,7 @@ mod tests {
         let mut lsns = Vec::new();
         let mut finals = Vec::new();
         while let Some(batch) = drain.next_batch(4, usize::MAX, None).await.unwrap() {
-            lsns.extend(batch.heaps.iter().map(|h| h.decoded.source_lsn));
+            lsns.extend(batch.cells().unwrap().iter().map(|h| h.decoded.source_lsn));
             finals.push(batch.is_final);
             if batch.is_final {
                 break;
@@ -6390,7 +6492,7 @@ mod tests {
             .sum::<u64>();
         let mut rows = 0usize;
         while let Some(batch) = drain.next_batch(4, usize::MAX, None).await.unwrap() {
-            rows += batch.heaps.len();
+            rows += batch.cells().unwrap().len();
             let resident = b.drain_resident_bytes();
             assert!(
                 resident < read_buffers + total / 4,
@@ -6702,7 +6804,7 @@ mod tests {
             .await
             .unwrap()
             .expect("stashed rows drain");
-        assert_eq!(batch.heaps.len(), 2);
+        assert_eq!(batch.cells().unwrap().len(), 2);
         drain.finish().await.unwrap();
         assert_eq!(live.load(Ordering::Relaxed), 1, "commit");
 
@@ -6788,7 +6890,8 @@ mod tests {
             .unwrap()
             .expect("one slice");
         let values: Vec<_> = out
-            .heaps
+            .cells()
+            .unwrap()
             .iter()
             .map(|h| h.decoded.new.as_ref().unwrap().columns[0].clone())
             .collect();
@@ -6798,9 +6901,10 @@ mod tests {
             [int4(1), int4(10), int4(2), int4(20), int4(3), int4(30)]
         );
         assert!(
-            out.heaps
+            out.cells()
+                .unwrap()
                 .iter()
-                .all(|h| Arc::ptr_eq(&h.descriptor, &out.heaps[0].descriptor))
+                .all(|h| Arc::ptr_eq(&h.descriptor, &out.cells().unwrap()[0].descriptor))
         );
         drain.finish().await.unwrap();
     }

@@ -34,13 +34,10 @@ use clickhouse_c::{Allocator, ColumnBuilder, Kind, TypeAst};
 use crate::ch::is_retryable;
 use crate::ch::{CompressionChoice, ConnectionConfig, EmitterError, quote_ident, types};
 use crate::column_rules::{ColumnEntry, ColumnRule, ColumnRules, Substitute};
-#[cfg(test)]
-use crate::decode::datum::DatumRef;
-use crate::decode::datum::ValueRef;
+use crate::decode::datum::{DatumRef, ValueRef};
 #[cfg(test)]
 use crate::decode::decoder_sink::DecoderSinkError;
 use crate::decode::heap_decoder::{ColumnValue, CommittedTuple, HeapOp};
-#[cfg(test)]
 use crate::decode::heap_decoder::{datum_value, datum_view};
 use crate::mapping::{
     ColumnMapping, DropTableStrategy, NamespaceMapping, SystemColumnNames, SystemColumns,
@@ -2039,6 +2036,189 @@ impl ColumnBuf {
         }
     }
 
+    /// Same wire layout, so `other` can follow these rows
+    fn same_shape(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Fixed { width: a, .. }, Self::Fixed { width: b, .. })
+            | (Self::NullableFixed { width: a, .. }, Self::NullableFixed { width: b, .. }) => {
+                a == b
+            }
+            (Self::String { absent: a, .. }, Self::String { absent: b, .. })
+            | (Self::NullableString { absent: a, .. }, Self::NullableString { absent: b, .. }) => {
+                a == b
+            }
+            (Self::Oracle(a), Self::Oracle(b)) => a.same_column(b),
+            _ => false,
+        }
+    }
+
+    /// Append `other`'s rows; caller checked [`Self::same_shape`]
+    fn extend(&mut self, other: Self) {
+        let rebase = |offsets: &mut Vec<u64>, base: usize, more: Vec<u64>| {
+            offsets.extend(more.into_iter().map(|o| o + base as u64));
+        };
+        match (self, other) {
+            (Self::Fixed { bytes, .. }, Self::Fixed { bytes: more, .. }) => {
+                bytes.extend_from_slice(&more);
+            }
+            (
+                Self::String { offsets, data, .. },
+                Self::String {
+                    offsets: more,
+                    data: more_data,
+                    ..
+                },
+            ) => {
+                rebase(offsets, data.len(), more);
+                data.extend_from_slice(&more_data);
+            }
+            (
+                Self::NullableFixed {
+                    null_map, inner, ..
+                },
+                Self::NullableFixed {
+                    null_map: more_nulls,
+                    inner: more,
+                    ..
+                },
+            ) => {
+                null_map.extend_from_slice(&more_nulls);
+                inner.extend_from_slice(&more);
+            }
+            (
+                Self::NullableString {
+                    offsets,
+                    data,
+                    null_map,
+                    ..
+                },
+                Self::NullableString {
+                    offsets: more,
+                    data: more_data,
+                    null_map: more_nulls,
+                    ..
+                },
+            ) => {
+                rebase(offsets, data.len(), more);
+                data.extend_from_slice(&more_data);
+                null_map.extend_from_slice(&more_nulls);
+            }
+            (Self::Oracle(a), Self::Oracle(b)) => a.append(b),
+            _ => unreachable!("chunk shape checked before merge"),
+        }
+    }
+
+    pub(crate) fn encode_into(&self, out: &mut Vec<u8>) {
+        use crate::xact::spill::{push_bytes, push_u8, push_u32};
+        let offsets = |out: &mut Vec<u8>, offsets: &[u64]| {
+            push_u32(out, offsets.len() as u32);
+            for o in offsets {
+                out.extend_from_slice(&o.to_le_bytes());
+            }
+        };
+        match self {
+            Self::Fixed { width, bytes } => {
+                push_u8(out, 0);
+                push_u32(out, *width as u32);
+                push_bytes(out, bytes);
+            }
+            Self::String {
+                offsets: o,
+                data,
+                absent,
+            } => {
+                push_u8(out, 1);
+                push_u8(out, u8::from(!absent.is_empty()));
+                offsets(out, o);
+                push_bytes(out, data);
+            }
+            Self::NullableFixed {
+                width,
+                null_map,
+                inner,
+            } => {
+                push_u8(out, 2);
+                push_u32(out, *width as u32);
+                push_bytes(out, null_map);
+                push_bytes(out, inner);
+            }
+            Self::NullableString {
+                offsets: o,
+                data,
+                null_map,
+                absent,
+            } => {
+                push_u8(out, 3);
+                push_u8(out, u8::from(!absent.is_empty()));
+                offsets(out, o);
+                push_bytes(out, data);
+                push_bytes(out, null_map);
+            }
+            Self::Oracle(o) => {
+                push_u8(out, 4);
+                o.encode_into(out);
+            }
+        }
+    }
+
+    pub(crate) fn decode(
+        c: &mut crate::xact::spill::Cursor<'_>,
+    ) -> Result<Self, crate::xact::spill::SpillError> {
+        let absent = |c: &mut crate::xact::spill::Cursor<'_>| {
+            Ok::<&'static [u8], crate::xact::spill::SpillError>(if c.u8()? != 0 {
+                b"{}"
+            } else {
+                b""
+            })
+        };
+        let offsets = |c: &mut crate::xact::spill::Cursor<'_>| {
+            let n = c.u32()? as usize;
+            Ok::<_, crate::xact::spill::SpillError>(
+                c.need(n * 8)?
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
+                    .map(|b| u64::from_le_bytes(*b))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        Ok(match c.u8()? {
+            0 => Self::Fixed {
+                width: c.u32()? as usize,
+                bytes: c.bytes()?,
+            },
+            1 => {
+                let absent = absent(c)?;
+                Self::String {
+                    offsets: offsets(c)?,
+                    data: c.bytes()?,
+                    absent,
+                }
+            }
+            2 => Self::NullableFixed {
+                width: c.u32()? as usize,
+                null_map: c.bytes()?,
+                inner: c.bytes()?,
+            },
+            3 => {
+                let absent = absent(c)?;
+                Self::NullableString {
+                    offsets: offsets(c)?,
+                    data: c.bytes()?,
+                    null_map: c.bytes()?,
+                    absent,
+                }
+            }
+            4 => Self::Oracle(OracleColumnBuf::decode(c)?),
+            tag => {
+                return Err(crate::xact::spill::SpillError::Format {
+                    offset: 0,
+                    detail: format!("unknown column buffer tag {tag}"),
+                });
+            }
+        })
+    }
+
     fn append_string_bytes(&mut self, raw: &[u8]) -> Result<(), EmitterError> {
         match self {
             Self::String { offsets, data, .. } => {
@@ -2140,6 +2320,50 @@ impl TableEncoder {
         Ok((old, rows))
     }
 
+    /// Whether `block` lays out the same columns as these buffers
+    pub(crate) fn accepts(&self, block: &[ColumnBuf]) -> bool {
+        block.len() == self.buffers.len()
+            && self.buffers.iter().zip(block).all(|(a, b)| a.same_shape(b))
+    }
+
+    /// Append rows another encoder of this shape sealed. Leaves `block`
+    /// untouched on [`Append::Full`], empties it otherwise
+    pub(crate) fn append_block(
+        &mut self,
+        block: &mut Vec<ColumnBuf>,
+        rows: usize,
+    ) -> Result<Append, EmitterError> {
+        if !self.accepts(block) {
+            return Err(EmitterError::Type(
+                "encoded chunk layout differs from its batch".into(),
+            ));
+        }
+        let oracle_bytes = self.oracle_overhead
+            + self
+                .buffers
+                .iter()
+                .zip(block.iter())
+                .map(|(a, b)| match (a, b) {
+                    (ColumnBuf::Oracle(a), ColumnBuf::Oracle(b)) => a.request_bytes_with(b),
+                    _ => 0,
+                })
+                .sum::<usize>();
+        if self.rows > 0 && oracle_bytes > ORACLE_BATCH_SEAL_BYTES {
+            return Ok(Append::Full);
+        }
+        if self.rows == 0 {
+            std::mem::swap(&mut self.buffers, block);
+        } else {
+            for (buf, more) in self.buffers.iter_mut().zip(block.drain(..)) {
+                buf.extend(more);
+            }
+        }
+        self.rows += rows;
+        self.oracle_bytes = oracle_bytes;
+        self.approx_bytes = self.buffers.iter().map(ColumnBuf::approx_size).sum();
+        Ok(Append::Done)
+    }
+
     #[cfg(test)]
     pub fn append_row(
         &mut self,
@@ -2185,7 +2409,6 @@ impl TableEncoder {
 
     /// [`Self::append_routed`] reading one image of `rel` in place. Values
     /// whose decode allocates, and PostGIS renders, build in row scratch
-    #[cfg(test)]
     pub(crate) fn append_view(
         &mut self,
         rel: &RelDescriptor,
@@ -2293,7 +2516,6 @@ impl TableEncoder {
                     buf.append_default();
                     Ok(())
                 }
-                #[cfg(test)]
                 Cell::Le(le) => buf.append_fixed_bytes(le),
                 Cell::Value(v) => encode_value(
                     buf,
@@ -2338,8 +2560,80 @@ pub(crate) enum Cell<'a> {
     Absent,
     Value(ValueRef<'a>),
     /// Little-endian bytes [`Direct::Copy`] proved match column storage
-    #[cfg(test)]
     Le(&'a [u8]),
+}
+
+/// Rows of one plan table encoded at planning. Relation and route travel
+/// once per chunk so the batcher keys and plans its destination
+pub struct EncodedChunk {
+    pub(crate) rel: Arc<RelDescriptor>,
+    pub(crate) route: Arc<crate::emit::route::RouteSnapshot>,
+    pub(crate) buffers: Vec<ColumnBuf>,
+    pub(crate) rows: usize,
+}
+
+impl EncodedChunk {
+    pub fn rows(&self) -> usize {
+        self.rows
+    }
+
+    pub fn allocated_bytes(&self) -> usize {
+        self.buffers.iter().map(ColumnBuf::allocated_bytes).sum()
+    }
+
+    pub fn rel_oid(&self) -> u32 {
+        self.rel.oid
+    }
+
+    /// Append `other`'s rows; `false` leaves both untouched when layouts differ
+    pub fn merge(&mut self, other: Self) -> bool {
+        let same = self.buffers.len() == other.buffers.len()
+            && self
+                .buffers
+                .iter()
+                .zip(&other.buffers)
+                .all(|(a, b)| a.same_shape(b));
+        if same {
+            for (buf, more) in self.buffers.iter_mut().zip(other.buffers) {
+                buf.extend(more);
+            }
+            self.rows += other.rows;
+        }
+        same
+    }
+
+    /// Wire content as a plan spool frame body
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.encode_into(&mut out);
+        out
+    }
+
+    pub(crate) fn encode_into(&self, out: &mut Vec<u8>) {
+        crate::xact::spill::push_u32(out, self.rows as u32);
+        crate::xact::spill::push_u32(out, self.buffers.len() as u32);
+        for b in &self.buffers {
+            b.encode_into(out);
+        }
+    }
+
+    pub(crate) fn decode(
+        rel: Arc<RelDescriptor>,
+        route: Arc<crate::emit::route::RouteSnapshot>,
+        c: &mut crate::xact::spill::Cursor<'_>,
+    ) -> Result<Self, crate::xact::spill::SpillError> {
+        let rows = c.u32()? as usize;
+        let n = c.u32()? as usize;
+        let buffers = (0..n)
+            .map(|_| ColumnBuf::decode(c))
+            .collect::<Result<_, _>>()?;
+        Ok(Self {
+            rel,
+            route,
+            buffers,
+            rows,
+        })
+    }
 }
 
 /// Per-row synthetic column inputs
@@ -2809,7 +3103,6 @@ fn oracle_cell(cell: Cell<'_>, source_type_oid: u32) -> Result<OracleCell, Emitt
     let v = match cell {
         Cell::Absent => return Ok(OracleCell::Default),
         Cell::Value(v) => v,
-        #[cfg(test)]
         Cell::Le(_) => return Err(mismatch(0)),
     };
     Ok(match v {
@@ -2941,6 +3234,8 @@ crate::atomic_stats! {
         pub plan_failures_detoast,
         pub plan_failures_partial_update,
         pub plan_failures_view,
+        /// Row values a mapped column cannot encode
+        pub plan_failures_encode,
         pub plan_failures_drain,
         pub unmapped_rows_by_table: crate::emit::pipeline::row_ledger::TableRowCounts,
         pub rows_inserted_by_table: crate::emit::pipeline::row_ledger::TableRowCounts,
