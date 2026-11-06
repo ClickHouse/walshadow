@@ -2541,6 +2541,7 @@ fn encode_value(
         ColumnValue::Float4(f) => buf.append_fixed_bytes(&f.to_le_bytes()),
         ColumnValue::Float8(f) => buf.append_fixed_bytes(&f.to_le_bytes()),
         ColumnValue::Oid(n) => buf.append_fixed_bytes(&n.to_le_bytes()),
+        ColumnValue::Oid8(n) => buf.append_fixed_bytes(&n.to_le_bytes()),
         ColumnValue::Date(i32::MIN | i32::MAX)
         | ColumnValue::Timestamp(i64::MIN | i64::MAX)
         | ColumnValue::TimestampTz(i64::MIN | i64::MAX) => Err(unsupported(
@@ -2591,6 +2592,15 @@ fn encode_value(
             }
         }
         ColumnValue::Inet(v) => buf.append_string_bytes(v.to_text().as_bytes()),
+        ColumnValue::MacAddr(b) => {
+            buf.append_string_bytes(crate::decode::codecs::macaddr_to_text(b).as_bytes())
+        }
+        ColumnValue::MacAddr8(b) => {
+            buf.append_string_bytes(crate::decode::codecs::macaddr8_to_text(b).as_bytes())
+        }
+        ColumnValue::Tid { block, offset } => {
+            buf.append_string_bytes(crate::decode::codecs::tid_to_text(*block, *offset).as_bytes())
+        }
         ColumnValue::Interval(v) => buf.append_string_bytes(v.to_text().as_bytes()),
         ColumnValue::Bytea(b) => buf.append_string_bytes(b),
         ColumnValue::ExternalToast(_) => Err(unsupported(

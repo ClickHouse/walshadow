@@ -336,6 +336,10 @@ const VAL_INTERVAL: u8 = 22;
 const VAL_JSON: u8 = 23;
 const VAL_PG_PENDING: u8 = 24;
 const VAL_PG_PENDING_TEXT: u8 = 25;
+const VAL_OID8: u8 = 26;
+const VAL_MACADDR: u8 = 27;
+const VAL_MACADDR8: u8 = 28;
+const VAL_TID: u8 = 29;
 
 /// [`crate::decode::codecs::NumericKind`], inside a [`VAL_NUMERIC`] body
 const NUM_FINITE: u8 = 0;
@@ -984,6 +988,23 @@ pub(crate) fn encode_value(out: &mut Vec<u8>, v: &ColumnValue) {
             push_u8(out, VAL_OID);
             push_u32(out, *i);
         }
+        ColumnValue::Oid8(i) => {
+            push_u8(out, VAL_OID8);
+            push_u64(out, *i);
+        }
+        ColumnValue::MacAddr(b) => {
+            push_u8(out, VAL_MACADDR);
+            out.extend_from_slice(b);
+        }
+        ColumnValue::MacAddr8(b) => {
+            push_u8(out, VAL_MACADDR8);
+            out.extend_from_slice(b);
+        }
+        ColumnValue::Tid { block, offset } => {
+            push_u8(out, VAL_TID);
+            push_u32(out, *block);
+            push_u16(out, *offset);
+        }
         ColumnValue::Date(i) => {
             push_u8(out, VAL_DATE);
             push_i32(out, *i);
@@ -1247,6 +1268,14 @@ pub(crate) fn decode_value(c: &mut Cursor) -> Result<ColumnValue> {
         VAL_FLOAT4 => ColumnValue::Float4(c.f32()?),
         VAL_FLOAT8 => ColumnValue::Float8(c.f64()?),
         VAL_OID => ColumnValue::Oid(c.u32()?),
+        VAL_OID8 => ColumnValue::Oid8(c.u64()?),
+        VAL_MACADDR => ColumnValue::MacAddr(c.need(6)?.try_into().unwrap()),
+        VAL_MACADDR8 => ColumnValue::MacAddr8(c.need(8)?.try_into().unwrap()),
+        VAL_TID => {
+            let block = c.u32()?;
+            let offset = c.u16()?;
+            ColumnValue::Tid { block, offset }
+        }
         VAL_DATE => ColumnValue::Date(c.i32()?),
         VAL_TIME => ColumnValue::Time(c.i64()?),
         VAL_TIMESTAMP => ColumnValue::Timestamp(c.i64()?),
@@ -1828,6 +1857,10 @@ mod tests {
             ColumnValue::Float4(_) => VAL_FLOAT4,
             ColumnValue::Float8(_) => VAL_FLOAT8,
             ColumnValue::Oid(_) => VAL_OID,
+            ColumnValue::Oid8(_) => VAL_OID8,
+            ColumnValue::MacAddr(_) => VAL_MACADDR,
+            ColumnValue::MacAddr8(_) => VAL_MACADDR8,
+            ColumnValue::Tid { .. } => VAL_TID,
             ColumnValue::Date(_) => VAL_DATE,
             ColumnValue::Time(_) => VAL_TIME,
             ColumnValue::Timestamp(_) => VAL_TIMESTAMP,
@@ -1862,6 +1895,13 @@ mod tests {
             ColumnValue::Float4(std::f32::consts::PI),
             ColumnValue::Float8(std::f64::consts::E),
             ColumnValue::Oid(0xDEADBEEF),
+            ColumnValue::Oid8(u64::MAX),
+            ColumnValue::MacAddr([1, 2, 3, 4, 5, 6]),
+            ColumnValue::MacAddr8([1, 2, 3, 4, 5, 6, 7, 8]),
+            ColumnValue::Tid {
+                block: u32::MAX,
+                offset: 7,
+            },
             ColumnValue::Date(-1),
             ColumnValue::Time(86_400_000_000),
             ColumnValue::Timestamp(-1),
