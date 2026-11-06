@@ -173,6 +173,8 @@ pub struct ShadowConfig {
     /// `walshadow.so` is missing still starts. Preloading a library PG cannot
     /// resolve is a startup failure, not a warning
     pub bridge: Option<BridgeConf>,
+    /// Load custom settings after defaults, before settings required by walshadow
+    pub conf_dir: Option<PathBuf>,
 }
 
 impl ShadowConfig {
@@ -192,6 +194,7 @@ impl ShadowConfig {
             user: "postgres".to_string(),
             dbname: "postgres".to_string(),
             bridge: None,
+            conf_dir: None,
         }
     }
 
@@ -403,7 +406,7 @@ impl Shadow {
     }
 
     /// Replace data dir config with walshadow settings
-    /// Write base, recovery, and minimum GUC settings to `postgresql.conf`
+    /// Write defaults, `include_dir`, then required settings to `postgresql.conf`
     /// Empty `postgresql.auto.conf` so source `ALTER SYSTEM` settings from
     /// BASE_BACKUP cannot override them. Allow trusted socket connections
     /// in `pg_hba.conf` and empty `pg_ident.conf`
@@ -419,8 +422,16 @@ impl Shadow {
             .filter_out_dir
             .to_str()
             .expect("non-utf8 filter_out_dir");
+        let include = self.config.conf_dir.as_deref().map_or(String::new(), |d| {
+            let d = d.to_str().expect("non-utf8 conf_dir");
+            format!("include_dir = '{}'\n", d.replace('\'', "''"))
+        });
         let mut conf = format!(
             "# walshadow-owned conf, regenerated each boot\n\
+             shared_buffers = 256MB\n\
+             max_wal_size = 512MB\n\
+             min_wal_size = 128MB\n\
+             {include}\
              hot_standby = on\n\
              wal_level = replica\n\
              autovacuum = off\n\
@@ -429,9 +440,6 @@ impl Shadow {
              listen_addresses = ''\n\
              unix_socket_directories = '{sock}'\n\
              port = {port}\n\
-             shared_buffers = 256MB\n\
-             max_wal_size = 512MB\n\
-             min_wal_size = 128MB\n\
              max_connections = {max_connections}\n\
              max_worker_processes = {max_worker_processes}\n\
              max_wal_senders = {max_wal_senders}\n\
@@ -1175,6 +1183,23 @@ mod tests {
         let conf = fs::read_to_string(data_dir.join("postgresql.conf")).unwrap();
         assert!(!conf.contains("primary_conninfo"), "{conf}");
         assert!(conf.contains("restore_command"), "{conf}");
+    }
+
+    /// PostgreSQL uses last value when a setting appears more than once
+    #[test]
+    fn materialize_conf_includes_conf_dir_between_defaults_and_owned() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+        let mut cfg = ShadowConfig::new(data_dir.clone(), tmp.path().join("filtered"));
+        cfg.conf_dir = Some(PathBuf::from("/etc/it's"));
+        Shadow::new(cfg)
+            .materialize_conf(&SourceGucFloor::default(), None)
+            .unwrap();
+        let conf = fs::read_to_string(data_dir.join("postgresql.conf")).unwrap();
+        let at = |s: &str| conf.find(s).unwrap_or_else(|| panic!("no {s} in {conf}"));
+        let include = at("include_dir = '/etc/it''s'\n");
+        assert!(at("shared_buffers") < include && include < at("hot_standby"));
     }
 
     #[test]

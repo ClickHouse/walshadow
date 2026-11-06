@@ -55,6 +55,7 @@ pub(crate) fn build_owned_shadow(
     cfg.ctl_timeout = Duration::from_secs(args.shadow_connect_timeout);
     cfg.user = args.shadow_user.clone();
     cfg.dbname = dbname.to_string();
+    cfg.conf_dir = args.shadow_conf_dir.clone();
     let mut bridge = walshadow::shadow::BridgeConf::in_dir(&cfg.socket_dir);
     bridge.socket_path = args.bridge_socket_path();
     bridge.library_dir = args.bridge_lib_dir.clone();
