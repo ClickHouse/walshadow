@@ -93,9 +93,10 @@ use crate::pg::{current_wal_lsn, quote_ident};
 use crate::pos::{Pos, Snapshot};
 use crate::runtime_config::InitialLoadMode;
 use crate::schema::{
-    BOOLOID, BPCHAROID, BYTEAOID, CHAROID, DATEOID, FLOAT4OID, FLOAT8OID, INT2OID, INT4OID,
-    INT8OID, JSONBOID, JSONOID, NAMEOID, NUMERICOID, OIDOID, RelDescriptor, RelName, TEXTOID,
-    TIMEOID, TIMESTAMPOID, TIMESTAMPTZOID, UUIDOID, VARCHAROID,
+    BOOLOID, BPCHAROID, BYTEAOID, CHAROID, CIDOID, DATEOID, FLOAT4OID, FLOAT8OID, INT2OID, INT4OID,
+    INT8OID, JSONBOID, JSONOID, MONEYOID, NAMEOID, NUMERICOID, OID8OID, OIDOID, PG_LSNOID,
+    RelDescriptor, RelName, TEXTOID, TIMEOID, TIMESTAMPOID, TIMESTAMPTZOID, UUIDOID, VARCHAROID,
+    XID8OID, XIDOID,
 };
 use crate::source::source_feed::open_sql_client;
 use crate::toast::{ToastResolver, ToastRow};
@@ -404,6 +405,7 @@ enum WireKind {
     Int4,
     Int8,
     Oid,
+    Oid8,
     Float4,
     Float8,
     Date,
@@ -437,8 +439,9 @@ fn wire_kind(type_oid: u32) -> Option<WireKind> {
         CHAROID => WireKind::Char,
         INT2OID => WireKind::Int2,
         INT4OID => WireKind::Int4,
-        INT8OID => WireKind::Int8,
-        OIDOID => WireKind::Oid,
+        INT8OID | MONEYOID => WireKind::Int8,
+        OIDOID | XIDOID | CIDOID => WireKind::Oid,
+        OID8OID | XID8OID | PG_LSNOID => WireKind::Oid8,
         FLOAT4OID => WireKind::Float4,
         FLOAT8OID => WireKind::Float8,
         DATEOID => WireKind::Date,
@@ -689,6 +692,7 @@ fn decode_field(kind: WireKind, type_oid: u32, raw: &[u8]) -> Result<ColumnValue
         WireKind::Int4 => ColumnValue::Int4(i32::from_be_bytes(fixed(raw, "int4")?)),
         WireKind::Int8 => ColumnValue::Int8(i64::from_be_bytes(fixed(raw, "int8")?)),
         WireKind::Oid => ColumnValue::Oid(u32::from_be_bytes(fixed(raw, "oid")?)),
+        WireKind::Oid8 => ColumnValue::Oid8(u64::from_be_bytes(fixed(raw, "oid8")?)),
         WireKind::Float4 => ColumnValue::Float4(f32::from_be_bytes(fixed(raw, "float4")?)),
         WireKind::Float8 => ColumnValue::Float8(f64::from_be_bytes(fixed(raw, "float8")?)),
         WireKind::Date => ColumnValue::Date(i32::from_be_bytes(fixed(raw, "date")?)),

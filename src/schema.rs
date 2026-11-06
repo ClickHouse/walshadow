@@ -19,10 +19,16 @@ pub const INT2OID: u32 = 21;
 pub const INT4OID: u32 = 23;
 pub const TEXTOID: u32 = 25;
 pub const OIDOID: u32 = 26;
+pub const TIDOID: u32 = 27;
+pub const XIDOID: u32 = 28;
+pub const CIDOID: u32 = 29;
 pub const JSONOID: u32 = 114;
 pub const CIDROID: u32 = 650;
 pub const FLOAT4OID: u32 = 700;
 pub const FLOAT8OID: u32 = 701;
+pub const MACADDR8OID: u32 = 774;
+pub const MONEYOID: u32 = 790;
+pub const MACADDROID: u32 = 829;
 pub const INETOID: u32 = 869;
 pub const TEXTARRAYOID: u32 = 1009;
 pub const BPCHAROID: u32 = 1042;
@@ -35,7 +41,11 @@ pub const INTERVALOID: u32 = 1186;
 pub const TIMETZOID: u32 = 1266;
 pub const NUMERICOID: u32 = 1700;
 pub const UUIDOID: u32 = 2950;
+pub const PG_LSNOID: u32 = 3220;
 pub const JSONBOID: u32 = 3802;
+pub const XID8OID: u32 = 5069;
+/// PG 19+
+pub const OID8OID: u32 = 6437;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct RelName {

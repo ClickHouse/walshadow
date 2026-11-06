@@ -72,10 +72,11 @@ use thiserror::Error;
 use walrus::pg::walparser::{RelFileNode, RmId, XLogRecord};
 
 use crate::schema::{
-    BOOLOID, BPCHAROID, BYTEAOID, CHAROID, CIDROID, DATEOID, FLOAT4OID, FLOAT8OID, INETOID,
-    INT2OID, INT4OID, INT8OID, INTERVALOID, JSONBOID, JSONOID, MissingDefault, NAMEOID, NUMERICOID,
-    OIDOID, RelAttr, RelDescriptor, ReplIdent, TEXTOID, TIMEOID, TIMESTAMPOID, TIMESTAMPTZOID,
-    TIMETZOID, UUIDOID, VARCHAROID,
+    BOOLOID, BPCHAROID, BYTEAOID, CHAROID, CIDOID, CIDROID, DATEOID, FLOAT4OID, FLOAT8OID, INETOID,
+    INT2OID, INT4OID, INT8OID, INTERVALOID, JSONBOID, JSONOID, MACADDR8OID, MACADDROID, MONEYOID,
+    MissingDefault, NAMEOID, NUMERICOID, OID8OID, OIDOID, PG_LSNOID, RelAttr, RelDescriptor,
+    ReplIdent, TEXTOID, TIDOID, TIMEOID, TIMESTAMPOID, TIMESTAMPTZOID, TIMETZOID, UUIDOID,
+    VARCHAROID, XID8OID, XIDOID,
 };
 
 /// SmallVec sized at 1: single-row INSERT/UPDATE/DELETE stays stack-allocated,
@@ -235,7 +236,16 @@ pub enum ColumnValue {
     Int8(i64),
     Float4(f32),
     Float8(f64),
+    /// `oid`, `xid`, `cid`
     Oid(u32),
+    /// `oid8`, `xid8`, `pg_lsn`
+    Oid8(u64),
+    MacAddr([u8; 6]),
+    MacAddr8([u8; 8]),
+    Tid {
+        block: u32,
+        offset: u16,
+    },
     /// `date`, days since PG epoch 2000-01-01, negative for pre-epoch.
     Date(i32),
     /// `time`, microseconds since midnight. Legacy float8 storage
@@ -303,12 +313,15 @@ impl ColumnValue {
             ColumnValue::Null => 0,
             ColumnValue::Bool(_) | ColumnValue::Char(_) => 1,
             ColumnValue::Int2(_) => 2,
+            ColumnValue::MacAddr(_) | ColumnValue::Tid { .. } => 6,
             ColumnValue::Int4(_)
             | ColumnValue::Float4(_)
             | ColumnValue::Oid(_)
             | ColumnValue::Date(_) => 4,
             ColumnValue::Int8(_)
             | ColumnValue::Float8(_)
+            | ColumnValue::Oid8(_)
+            | ColumnValue::MacAddr8(_)
             | ColumnValue::Time(_)
             | ColumnValue::Timestamp(_)
             | ColumnValue::TimestampTz(_) => 8,
@@ -986,11 +999,27 @@ pub(crate) fn missing_value_from_text(type_oid: u32, text: &str) -> ColumnValue 
             .parse::<f64>()
             .map(ColumnValue::Float8)
             .unwrap_or(ColumnValue::Null),
-        OIDOID => text
+        OIDOID | XIDOID | CIDOID => text
             .parse::<u32>()
             .map(ColumnValue::Oid)
             .unwrap_or(ColumnValue::Null),
+        OID8OID | XID8OID => text
+            .parse::<u64>()
+            .map(ColumnValue::Oid8)
+            .unwrap_or(ColumnValue::Null),
+        PG_LSNOID => crate::pg::parse_pg_lsn(text)
+            .map(ColumnValue::Oid8)
+            .unwrap_or(ColumnValue::Null),
         TEXTOID | VARCHAROID | BPCHAROID | NAMEOID => ColumnValue::Text(text.to_owned()),
+        MACADDROID => crate::decode::codecs::parse_macaddr(text)
+            .map(ColumnValue::MacAddr)
+            .unwrap_or(ColumnValue::Null),
+        MACADDR8OID => crate::decode::codecs::parse_macaddr(text)
+            .map(ColumnValue::MacAddr8)
+            .unwrap_or(ColumnValue::Null),
+        TIDOID => crate::decode::codecs::parse_tid(text)
+            .map(|(block, offset)| ColumnValue::Tid { block, offset })
+            .unwrap_or(ColumnValue::Null),
         // `jsonb` arrives as `jsonb_out` text, already what the emitter ships
         JSONOID | JSONBOID => ColumnValue::Json(text.to_owned()),
         // attmissingval text requires typinput
@@ -1119,10 +1148,31 @@ fn fixed_value(att: &RelAttr, body: &[u8]) -> ColumnValue {
         CHAROID => ColumnValue::Char(body[0] as i8),
         INT2OID => ColumnValue::Int2(i16::from_le_bytes(body.try_into().unwrap())),
         INT4OID => ColumnValue::Int4(i32::from_le_bytes(body.try_into().unwrap())),
-        INT8OID => ColumnValue::Int8(i64::from_le_bytes(body.try_into().unwrap())),
+        // `money` counts minor units, scale set by source `lc_monetary`
+        INT8OID | MONEYOID => ColumnValue::Int8(i64::from_le_bytes(body.try_into().unwrap())),
         FLOAT4OID => ColumnValue::Float4(f32::from_le_bytes(body.try_into().unwrap())),
         FLOAT8OID => ColumnValue::Float8(f64::from_le_bytes(body.try_into().unwrap())),
-        OIDOID => ColumnValue::Oid(u32::from_le_bytes(body.try_into().unwrap())),
+        OIDOID | XIDOID | CIDOID => ColumnValue::Oid(u32::from_le_bytes(body.try_into().unwrap())),
+        OID8OID | XID8OID | PG_LSNOID => {
+            ColumnValue::Oid8(u64::from_le_bytes(body.try_into().unwrap()))
+        }
+        // NUL-padded to NAMEDATALEN
+        NAMEOID => {
+            let end = body.iter().position(|&b| b == 0).unwrap_or(body.len());
+            match simdutf8::basic::from_utf8(&body[..end]) {
+                Ok(s) => ColumnValue::Name(s.to_owned()),
+                Err(_) => ColumnValue::Unsupported {
+                    type_oid: att.type_oid,
+                    raw: body.to_vec(),
+                },
+            }
+        }
+        MACADDROID => ColumnValue::MacAddr(body.try_into().unwrap()),
+        MACADDR8OID => ColumnValue::MacAddr8(body.try_into().unwrap()),
+        TIDOID => {
+            let (block, offset) = crate::decode::codecs::decode_tid(body.try_into().unwrap());
+            ColumnValue::Tid { block, offset }
+        }
         DATEOID => ColumnValue::Date(i32::from_le_bytes(body.try_into().unwrap())),
         TIMEOID => ColumnValue::Time(i64::from_le_bytes(body.try_into().unwrap())),
         TIMESTAMPOID => ColumnValue::Timestamp(i64::from_le_bytes(body.try_into().unwrap())),
@@ -1407,6 +1457,16 @@ pub(crate) fn local_matrix_covers(type_oid: u32, type_len: i16) -> bool {
                 | FLOAT4OID
                 | FLOAT8OID
                 | OIDOID
+                | XIDOID
+                | CIDOID
+                | OID8OID
+                | XID8OID
+                | PG_LSNOID
+                | MONEYOID
+                | NAMEOID
+                | MACADDROID
+                | MACADDR8OID
+                | TIDOID
                 | DATEOID
                 | TIMEOID
                 | TIMESTAMPOID
@@ -2217,6 +2277,82 @@ mod tests {
     }
 
     #[test]
+    fn fixed_system_types_decode_values() {
+        let cases: [(u32, Vec<u8>, char, ColumnValue); 7] = [
+            (
+                XIDOID,
+                7u32.to_le_bytes().to_vec(),
+                'i',
+                ColumnValue::Oid(7),
+            ),
+            (
+                PG_LSNOID,
+                0x16_B374_D848u64.to_le_bytes().to_vec(),
+                'd',
+                ColumnValue::Oid8(0x16_B374_D848),
+            ),
+            (
+                MONEYOID,
+                (-123_456i64).to_le_bytes().to_vec(),
+                'd',
+                ColumnValue::Int8(-123_456),
+            ),
+            (
+                NAMEOID,
+                {
+                    let mut b = b"pg_class".to_vec();
+                    b.resize(64, 0);
+                    b
+                },
+                'c',
+                ColumnValue::Name("pg_class".into()),
+            ),
+            (
+                MACADDROID,
+                vec![0x08, 0x00, 0x2b, 0x01, 0x02, 0xab],
+                'i',
+                ColumnValue::MacAddr([0x08, 0x00, 0x2b, 0x01, 0x02, 0xab]),
+            ),
+            (
+                MACADDR8OID,
+                vec![0x08, 0x00, 0x2b, 0xff, 0xfe, 0x01, 0x02, 0x03],
+                'i',
+                ColumnValue::MacAddr8([0x08, 0x00, 0x2b, 0xff, 0xfe, 0x01, 0x02, 0x03]),
+            ),
+            (
+                TIDOID,
+                vec![0, 0, 5, 0, 3, 0],
+                's',
+                ColumnValue::Tid {
+                    block: 5,
+                    offset: 3,
+                },
+            ),
+        ];
+        for (oid, body, align, want) in cases {
+            let att = rel_attr(1, "c", oid, body.len() as i16, align);
+            let (v, n) = decode_one_value(&att, &body, 0).expect("decodes");
+            assert_eq!((v, n), (want, body.len()), "oid {oid}");
+        }
+    }
+
+    #[test]
+    fn missing_value_text_parses_system_types() {
+        let mut lsn = rel_attr(1, "l", PG_LSNOID, 8, 'd');
+        lsn.missing_default = Some("16/B374D848".into());
+        assert_eq!(missing_value_for(&lsn), ColumnValue::Oid8(0x16_B374_D848));
+        let mut x8 = rel_attr(1, "x", XID8OID, 8, 'd');
+        x8.missing_default = Some("18446744073709551615".into());
+        assert_eq!(missing_value_for(&x8), ColumnValue::Oid8(u64::MAX));
+        let mut mac = rel_attr(1, "m", MACADDROID, 6, 'i');
+        mac.missing_default = Some("08:00:2b:01:02:03".into());
+        assert_eq!(
+            missing_value_for(&mac),
+            ColumnValue::MacAddr([0x08, 0x00, 0x2b, 0x01, 0x02, 0x03])
+        );
+    }
+
+    #[test]
     fn missing_value_for_type_matrix() {
         let mut bool_att = rel_attr(1, "b", BOOLOID, 1, 'c');
         bool_att.missing_default = Some("t".into());
@@ -2351,7 +2487,7 @@ mod tests {
 
     #[test]
     fn local_matrix_agrees_with_decoder() {
-        let fixed: [(u32, i16); 17] = [
+        let fixed: [(u32, i16); 26] = [
             (BOOLOID, 1),
             (CHAROID, 1),
             (INT2OID, 2),
@@ -2368,6 +2504,15 @@ mod tests {
             (UUIDOID, 16),
             (INTERVALOID, 16),
             (NAMEOID, 64),
+            (XIDOID, 4),
+            (CIDOID, 4),
+            (OID8OID, 8),
+            (XID8OID, 8),
+            (PG_LSNOID, 8),
+            (MONEYOID, 8),
+            (MACADDROID, 6),
+            (MACADDR8OID, 8),
+            (TIDOID, 6),
             (2202, 4),
         ];
         for (oid, len) in fixed {
