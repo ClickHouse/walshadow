@@ -161,6 +161,8 @@ fn run_pg_dump(conninfo: &str, password: Option<&str>, exclude: &[String]) -> Re
         "--schema-only",
         "--no-owner",
         "--no-privileges",
+        "--no-publications",
+        "--no-subscriptions",
     ]);
     for ext in exclude {
         cmd.arg(format!("--exclude-extension={ext}"));
