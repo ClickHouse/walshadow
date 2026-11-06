@@ -52,7 +52,7 @@ logs and tuple-location order do not
 establish it, and no source read compensates. Keep WAL replay ordered behind
 required chunk history
 
-Eliminating all source SQL also requires descriptors from landed catalogs, an
-OID-consistent type converter without source pg_dump, and alternatives for slot,
-preflight, and runtime-config queries. Keep these dependencies explicit. Landing
-all user heaps in shadow to serve COPY would change it into a full replica
+To remove all source SQL, also build descriptors from copied catalogs, convert
+types while preserving source OIDs without reading source catalogs, and replace
+slot, preflight, and runtime-config queries. Keep these dependencies explicit.
+Copying all user heaps into shadow to serve COPY would make it a full replica

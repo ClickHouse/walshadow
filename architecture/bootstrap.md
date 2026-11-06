@@ -17,8 +17,9 @@ Concurrent WAL replay covers changes during backup. Walked rows carry an older
 coverage version so later committed changes win at destination. Bounded channels
 and spill constrain memory while backup and insertion proceed independently
 
-Shadow is not ready during this phase. A temporary PostgreSQL instance built
-from source schema converts values that need PostgreSQL's type machinery
+Shadow is not ready during this phase. Start temporary PostgreSQL and copy source
+catalog rows needed to convert mapped column types. Use this instance for values
+that need PostgreSQL's type conversion
 
 Rows with external values wait until page walk and window replay finish writing
 chunk mirrors. Window page images restore missing chunks from every tuple on
