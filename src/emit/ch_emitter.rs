@@ -3268,6 +3268,12 @@ crate::atomic_stats! {
         /// Oracle-routed columns the daemon built itself: rendered cells
         /// against a `String` target, which PG would hand straight back
         pub oracle_local_columns,
+        /// Serialized Native block bytes before and after resident
+        /// compression; their ratio is what retained output saves
+        pub resident_raw_bytes,
+        pub resident_stored_bytes,
+        /// Resolver time serializing and compressing sealed blocks
+        pub resident_seal_nanos,
     }
 }
 

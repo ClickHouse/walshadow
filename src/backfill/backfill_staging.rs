@@ -337,7 +337,7 @@ mod tests {
         let sql = "DROP TABLE IF EXISTS staging";
         for retries in 0..=2 {
             let (config, server) =
-                crate::ch::test_support::retry_server(retries, sql, false, false).await;
+                crate::ch::test_support::retry_server(retries, sql, 0, false).await;
             let mut session = StagingSession::connect(DestEmitter::new(Arc::new(config), None))
                 .await
                 .unwrap();
@@ -349,7 +349,7 @@ mod tests {
     #[tokio::test]
     async fn exchange_ambiguity_does_not_retry() {
         let sql = "EXCHANGE TABLES staging AND live";
-        let (config, server) = crate::ch::test_support::retry_server(2, sql, false, false).await;
+        let (config, server) = crate::ch::test_support::retry_server(2, sql, 0, false).await;
         let mut session = StagingSession::connect(DestEmitter::new(Arc::new(config), None))
             .await
             .unwrap();

@@ -7,10 +7,11 @@ use tokio::task::JoinHandle;
 use crate::ch::CompressionChoice;
 use crate::emit::ch_emitter::{EmitterConfig, InstanceConfig, RetryConfig};
 
+/// Server expecting `sql` then `blocks` one-row Data blocks per attempt
 pub(crate) async fn retry_server(
     max_attempts: u32,
     sql: &str,
-    insert: bool,
+    blocks: usize,
     idle: bool,
 ) -> (EmitterConfig, JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -44,11 +45,13 @@ pub(crate) async fn retry_server(
     const EMPTY_DATA: &[u8] = &[2, 0, 1, 0, 2, 0xff, 0xff, 0xff, 0xff, 0, 0, 0];
     expected.push(0);
     expected.extend_from_slice(EMPTY_DATA);
-    if insert {
+    for _ in 0..blocks {
         // One UInt8 column x without custom serialization, one row 42
         expected.extend_from_slice(
             b"\x02\x00\x01\x00\x02\xff\xff\xff\xff\x00\x01\x01\x01x\x05UInt8\x00\x2a",
         );
+    }
+    if blocks > 0 {
         expected.extend_from_slice(EMPTY_DATA);
     }
     let server = tokio::spawn(async move {
