@@ -27,7 +27,7 @@ use crate::backfill::visibility_pending::{self, SharedPendingLedger};
 use crate::catalog::pending::PendingCatalog;
 #[cfg(feature = "test-support")]
 use crate::crash_test;
-use crate::decode::heap_decoder::{DecodedHeap, DescribedHeap, Predecoded};
+use crate::decode::heap_decoder::{DecodedHeap, DescribedHeap};
 use crate::decode::visibility::{PgXactView, SealedPatch, read_pg_xact};
 use crate::emit::ch_ddl::{DdlApplicator, Stamp};
 use crate::emit::ch_emitter::EmitterStats;
@@ -324,7 +324,7 @@ impl ReorderSink {
         })
     }
 
-    /// Resolver shared with predecode for TOAST read-ahead
+    /// Resolver shared with prescan for TOAST read-ahead
     pub fn planning_resolver(&self) -> ToastResolver {
         self.resolver.clone()
     }
@@ -1570,7 +1570,6 @@ impl RecordSink for ReorderSink {
     fn on_records<'a>(
         &'a mut self,
         batch: &'a [Record<'a>],
-        _pre: &'a mut [Option<Predecoded>],
     ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
         Box::pin(async move {
             for record in batch.iter().filter(|r| Self::wants(r)) {

@@ -213,17 +213,21 @@ impl DecoderStats {
     /// Single source of truth for the `HeapOp → counter` mapping; all decoder
     /// dispatch sites route through here.
     pub fn record(&self, decoded: &crate::decode::heap_decoder::DecodedHeap) {
+        let partial = decoded.new.as_ref().is_some_and(|t| t.partial)
+            || decoded.old.as_ref().is_some_and(|t| t.partial);
+        self.record_op(decoded.op, partial);
+    }
+
+    pub fn record_op(&self, op: crate::decode::heap_decoder::HeapOp, partial: bool) {
         use crate::decode::heap_decoder::HeapOp;
         self.decoded.fetch_add(1, Ordering::Relaxed);
-        match decoded.op {
+        match op {
             HeapOp::Insert => self.inserts.fetch_add(1, Ordering::Relaxed),
             HeapOp::Update => self.updates.fetch_add(1, Ordering::Relaxed),
             HeapOp::HotUpdate => self.hot_updates.fetch_add(1, Ordering::Relaxed),
             HeapOp::Delete => self.deletes.fetch_add(1, Ordering::Relaxed),
             HeapOp::Truncate => self.truncates.fetch_add(1, Ordering::Relaxed),
         };
-        let partial = decoded.new.as_ref().is_some_and(|t| t.partial)
-            || decoded.old.as_ref().is_some_and(|t| t.partial);
         if partial {
             self.partial.fetch_add(1, Ordering::Relaxed);
         }

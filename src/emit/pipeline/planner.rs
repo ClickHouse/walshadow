@@ -892,7 +892,7 @@ mod tests {
     /// Value ids come from a tiny wrapping OID space, as in PostgreSQL only
     /// once every chunk of the previous value is vacuumed, truncated or
     /// rewritten away; rewrites assign ids no WAL birth shows. Shadow and
-    /// predecode run up to a few commits ahead of planning. Whatever the
+    /// prescan run up to a few commits ahead of planning. Whatever the
     /// sequence, lead and budget, a row using read-ahead carries the value
     /// its pointer names at that commit whenever a store read at planning
     /// does, and NULL at worst
@@ -1050,7 +1050,7 @@ mod tests {
                     events.push((None, h));
                 }
                 for (born, h) in &events {
-                    // Predecode reads ahead the values rows keep
+                    // Prescan reads ahead the values rows keep
                     if born.is_none()
                         && let Some(t) = h.decoded.new.as_ref().or(h.decoded.old.as_ref())
                         && let Some(ColumnValue::ExternalToast(p)) = t.columns[0]
