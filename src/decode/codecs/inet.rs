@@ -18,7 +18,7 @@ use crate::ascii_buf::AsciiBuf;
 pub const PGSQL_AF_INET: u8 = 2;
 pub const PGSQL_AF_INET6: u8 = 3;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InetValue {
     pub family: u8,
     pub bits: u8,

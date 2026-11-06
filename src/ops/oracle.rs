@@ -481,7 +481,7 @@ fn decode_block(
 pub fn render_ext_columns(attrs: &[RelAttr], columns: &mut [Option<ColumnValue>]) {
     // Scan cells first: attribute type names sit behind a pointer per column
     for (idx, cell) in columns.iter_mut().enumerate() {
-        let Some(ColumnValue::PgPending { raw, .. }) = cell.as_ref() else {
+        let Some(ColumnValue::PgPending { .. }) = cell.as_ref() else {
             continue;
         };
         let is_geo = attrs.iter().any(|att| {
@@ -489,9 +489,18 @@ pub fn render_ext_columns(attrs: &[RelAttr], columns: &mut [Option<ColumnValue>]
                 && usize::try_from(att.attnum - 1) == Ok(idx)
                 && matches!(att.type_name.as_str(), "geography" | "geometry")
         });
-        if is_geo && let Some(text) = gserialized_point_to_wkt(raw) {
-            *cell = Some(ColumnValue::Text(text));
+        if is_geo && let Some(v) = cell.as_mut() {
+            render_ext_value(v);
         }
+    }
+}
+
+/// Render one PostGIS cell, see [`render_ext_columns`]
+pub(crate) fn render_ext_value(cell: &mut ColumnValue) {
+    if let ColumnValue::PgPending { raw, .. } = cell
+        && let Some(text) = gserialized_point_to_wkt(raw)
+    {
+        *cell = ColumnValue::Text(text);
     }
 }
 

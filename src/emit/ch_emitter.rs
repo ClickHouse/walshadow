@@ -35,8 +35,13 @@ use crate::ch::is_retryable;
 use crate::ch::{CompressionChoice, ConnectionConfig, EmitterError, quote_ident, types};
 use crate::column_rules::{ColumnEntry, ColumnRule, ColumnRules, Substitute};
 #[cfg(test)]
+use crate::decode::datum::DatumRef;
+use crate::decode::datum::ValueRef;
+#[cfg(test)]
 use crate::decode::decoder_sink::DecoderSinkError;
 use crate::decode::heap_decoder::{ColumnValue, CommittedTuple, HeapOp};
+#[cfg(test)]
+use crate::decode::heap_decoder::{datum_value, datum_view};
 use crate::mapping::{
     ColumnMapping, DropTableStrategy, NamespaceMapping, SystemColumnNames, SystemColumns,
     TableMapping, TableTarget, named_instance,
@@ -52,6 +57,7 @@ use crate::source::queueing_record_sink::{
 };
 use crate::table_rules::{MatchKind, PartitionRoute, TableRule};
 use ahash::{HashMap, HashMapExt};
+use smallvec::SmallVec;
 
 /// Microseconds between PG `TimestampTz` epoch (2000-01-01 UTC) and Unix
 /// epoch. CH `DateTime64(6)` is Unix microseconds; PG commit-record
@@ -1428,6 +1434,62 @@ pub(crate) struct ColumnPlan {
     pub(crate) datetime64_scale: i32,
     pub(crate) non_finite: NonFinite,
     pub(crate) encoding: ColumnEncoding,
+    /// Source attribute feeding this column, `None` when descriptor lacks it
+    pub(crate) source: Option<SourceColumn>,
+}
+
+/// Per-row handling of a source attribute, compiled with its target
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SourceColumn {
+    /// attnum - 1, indexes tuple images
+    pub(crate) index: usize,
+    pub(crate) direct: Direct,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Direct {
+    /// Stored little-endian bytes already match target storage
+    Copy,
+    /// Decode through shared value policy
+    Value,
+    /// PostGIS point rendered as WKT, typoutput yields HEXEWKB
+    Wkt,
+}
+
+impl Direct {
+    fn choose(att: &RelAttr, plan: &ColumnPlan) -> Self {
+        use crate::schema::{
+            CHAROID, CIDOID, FLOAT4OID, FLOAT8OID, INT2OID, INT4OID, INT8OID, MONEYOID, OID8OID,
+            OIDOID, PG_LSNOID, XID8OID, XIDOID,
+        };
+        if matches!(att.type_name.as_str(), "geography" | "geometry") {
+            return Self::Wkt;
+        }
+        if plan.encoding != ColumnEncoding::Local {
+            return Self::Value;
+        }
+        // Equal width alone is no proof: signedness, float layout, and
+        // epoch all differ between same-sized types
+        let storage = match att.type_oid {
+            CHAROID => Kind::Int8,
+            INT2OID => Kind::Int16,
+            INT4OID => Kind::Int32,
+            INT8OID | MONEYOID => Kind::Int64,
+            FLOAT4OID => Kind::Float32,
+            FLOAT8OID => Kind::Float64,
+            OIDOID | XIDOID | CIDOID => Kind::UInt32,
+            OID8OID | XID8OID | PG_LSNOID => Kind::UInt64,
+            _ => return Self::Value,
+        };
+        let inner = types::strip_nullable(plan.ast.view());
+        if inner.kind() == Some(storage)
+            && usize::try_from(att.type_len).is_ok_and(|n| n == inner.elem_size())
+        {
+            Self::Copy
+        } else {
+            Self::Value
+        }
+    }
 }
 
 /// Values replacing non-finite numerics or temporal infinities, `None` rejects
@@ -1493,21 +1555,21 @@ impl NonFinite {
         })
     }
 
-    fn substitute<'a>(&'a self, v: &'a ColumnValue) -> &'a ColumnValue {
+    fn substitute<'a>(&'a self, v: ValueRef<'a>) -> ValueRef<'a> {
         use crate::decode::codecs::NumericKind;
         let sub = match v {
-            ColumnValue::Numeric(NumericKind::NaN) => &self.nan,
-            ColumnValue::Numeric(NumericKind::PInf)
-            | ColumnValue::Date(i32::MAX)
-            | ColumnValue::Timestamp(i64::MAX)
-            | ColumnValue::TimestampTz(i64::MAX) => &self.pos_inf,
-            ColumnValue::Numeric(NumericKind::NInf)
-            | ColumnValue::Date(i32::MIN)
-            | ColumnValue::Timestamp(i64::MIN)
-            | ColumnValue::TimestampTz(i64::MIN) => &self.neg_inf,
+            ValueRef::Numeric(NumericKind::NaN) => &self.nan,
+            ValueRef::Numeric(NumericKind::PInf)
+            | ValueRef::Date(i32::MAX)
+            | ValueRef::Timestamp(i64::MAX)
+            | ValueRef::TimestampTz(i64::MAX) => &self.pos_inf,
+            ValueRef::Numeric(NumericKind::NInf)
+            | ValueRef::Date(i32::MIN)
+            | ValueRef::Timestamp(i64::MIN)
+            | ValueRef::TimestampTz(i64::MIN) => &self.neg_inf,
             _ => return v,
         };
-        sub.as_ref().unwrap_or(v)
+        sub.as_ref().map_or(v, ColumnValue::view)
     }
 }
 
@@ -1665,6 +1727,7 @@ impl TablePlan {
                 ast,
                 decimal,
                 non_finite: NonFinite::default(),
+                source: None,
             };
             let settings = att
                 .map(|a| column_rules.settings(owner, &a.name))
@@ -1682,6 +1745,7 @@ impl TablePlan {
                                 ast: oast,
                                 decimal,
                                 non_finite: NonFinite::default(),
+                                source: None,
                             };
                         } else {
                             tracing::warn!(
@@ -1727,6 +1791,12 @@ impl TablePlan {
             if plan.encoding != ColumnEncoding::Local && plan.non_finite != NonFinite::default() {
                 return Err(config_err("substitution needs local encoding"));
             }
+            plan.source = att.and_then(|a| {
+                Some(SourceColumn {
+                    index: usize::try_from(c.src_attnum - 1).ok()?,
+                    direct: Direct::choose(a, &plan),
+                })
+            });
             columns.push(plan);
             col_sql.push(quote_ident(&c.target_name));
         }
@@ -1740,6 +1810,7 @@ impl TablePlan {
                 datetime64_scale: 0,
                 non_finite: NonFinite::default(),
                 encoding: ColumnEncoding::Local,
+                source: None,
             })
         };
         let synth_lsn = mk(&system.lsn, "UInt64")?;
@@ -2093,33 +2164,111 @@ impl TableEncoder {
             HeapOp::Delete => decoded.old.as_ref(),
             _ => decoded.new.as_ref(),
         };
-        let value_of = |col: &ColumnMapping| {
-            side.and_then(|t| t.columns.get((col.src_attnum - 1) as usize))
-                .and_then(|opt| opt.as_ref())
+        let cells: SmallVec<[Cell<'_>; 16]> = mapping
+            .columns
+            .iter()
+            .map(|col| {
+                side.and_then(|t| t.columns.get((col.src_attnum - 1) as usize))
+                    .and_then(Option::as_ref)
+                    .map_or(Cell::Absent, |v| Cell::Value(v.view()))
+            })
+            .collect();
+        let stamp = RowStamp {
+            source_lsn: decoded.source_lsn,
+            xid: decoded.xid,
+            commit_ts: committed.commit_ts,
+            op_code,
+            leaf,
         };
+        self.append_cells(&cells, &stamp)
+    }
+
+    /// [`Self::append_routed`] reading one image of `rel` in place. Values
+    /// whose decode allocates, and PostGIS renders, build in row scratch
+    #[cfg(test)]
+    pub(crate) fn append_view(
+        &mut self,
+        rel: &RelDescriptor,
+        datums: &[DatumRef<'_>],
+        stamp: &RowStamp,
+    ) -> Result<Append, EmitterError> {
+        enum Slot<'a> {
+            Cell(Cell<'a>),
+            Owned(usize),
+        }
+        let mut owned: SmallVec<[ColumnValue; 2]> = SmallVec::new();
+        let mut own = |v: ColumnValue| {
+            owned.push(v);
+            Slot::Owned(owned.len() - 1)
+        };
+        let slots: SmallVec<[Slot<'_>; 16]> = self
+            .plan
+            .columns
+            .iter()
+            .map(|c| {
+                let Some((src, &datum)) =
+                    c.source.and_then(|src| Some((src, datums.get(src.index)?)))
+                else {
+                    return Slot::Cell(Cell::Absent);
+                };
+                let att = &rel.attributes[src.index];
+                match (src.direct, datum) {
+                    (Direct::Copy, DatumRef::Fixed(le)) => Slot::Cell(Cell::Le(le)),
+                    (Direct::Wkt, _) => match datum_value(att, datum) {
+                        None => Slot::Cell(Cell::Absent),
+                        Some(mut v) => {
+                            crate::ops::oracle::render_ext_value(&mut v);
+                            own(v)
+                        }
+                    },
+                    _ => match datum_view(att, datum) {
+                        Ok(v) => Slot::Cell(v.map_or(Cell::Absent, Cell::Value)),
+                        Err(_) => {
+                            own(datum_value(att, datum).expect("allocating datum is present"))
+                        }
+                    },
+                }
+            })
+            .collect();
+        let cells: SmallVec<[Cell<'_>; 16]> = slots
+            .iter()
+            .map(|s| match s {
+                Slot::Cell(c) => *c,
+                Slot::Owned(i) => Cell::Value(owned[*i].view()),
+            })
+            .collect();
+        self.append_cells(&cells, stamp)
+    }
+
+    /// Append one row of cells in `plan.columns` order
+    fn append_cells(
+        &mut self,
+        cells: &[Cell<'_>],
+        stamp: &RowStamp,
+    ) -> Result<Append, EmitterError> {
         // Size oracle cells before mutating column buffers
-        let mut cells = std::mem::take(&mut self.oracle_cells);
-        cells.clear();
+        let mut oracle = std::mem::take(&mut self.oracle_cells);
+        oracle.clear();
         let mut row_oracle_bytes = 0usize;
         // Literals bound for a String target never reach the request, so they
         // owe it nothing until a cell needing conversion strands them
         let mut stranded_bytes = 0usize;
-        for (i, col) in mapping.columns.iter().enumerate() {
+        for (i, cell) in cells.iter().enumerate() {
             if let ColumnBuf::Oracle(o) = &self.buffers[i] {
-                let cell = oracle_cell(value_of(col), o.source_type_oid)
-                    .map_err(|e| name_column(e, &col.target_name))?;
+                let cell = oracle_cell(*cell, o.source_type_oid)
+                    .map_err(|e| name_column(e, &self.plan.columns[i].name))?;
                 if !o.resolves_locally(&cell) {
                     row_oracle_bytes += cell.wire_bytes();
                     stranded_bytes += o.stranded_bytes();
                 }
-                cells.push(cell);
+                oracle.push(cell);
             }
         }
         if self.rows > 0
             && self.oracle_bytes + row_oracle_bytes + stranded_bytes > ORACLE_BATCH_SEAL_BYTES
         {
-            cells.clear();
-            self.oracle_cells = cells;
+            oracle.clear();
+            self.oracle_cells = oracle;
             return Ok(Append::Full);
         }
         // Enforce hard frame cap even for first row
@@ -2128,45 +2277,78 @@ impl TableEncoder {
                 "row needs {row_oracle_bytes} oracle bytes, one request carries {MAX_REQUEST_BYTES}"
             )));
         }
-        let mut cell_iter = cells.iter_mut();
-        for (i, col) in mapping.columns.iter().enumerate() {
+        let mut oracle_iter = oracle.iter_mut();
+        for (i, cell) in cells.iter().enumerate() {
             let col_plan = &self.plan.columns[i];
             let buf = &mut self.buffers[i];
             if let ColumnBuf::Oracle(o) = buf {
-                let cell = cell_iter.next().expect("one cell per oracle column");
+                let cell = oracle_iter.next().expect("one cell per oracle column");
                 o.push(std::mem::replace(cell, OracleCell::Default));
                 continue;
             }
-            match value_of(col).map(|v| col_plan.non_finite.substitute(v)) {
+            match *cell {
                 // Absent coerces like NULL, covers key-only delete
                 // tombstones under non-FULL replica identity
-                None => buf.append_default(),
-                Some(v) => encode_value(buf, v, col_plan.decimal, col_plan.datetime64_scale)
-                    .map_err(|e| name_column(e, &col.target_name))?,
+                Cell::Absent => {
+                    buf.append_default();
+                    Ok(())
+                }
+                #[cfg(test)]
+                Cell::Le(le) => buf.append_fixed_bytes(le),
+                Cell::Value(v) => encode_value(
+                    buf,
+                    col_plan.non_finite.substitute(v),
+                    col_plan.decimal,
+                    col_plan.datetime64_scale,
+                ),
             }
+            .map_err(|e| name_column(e, &col_plan.name))?;
         }
-        cells.clear();
-        self.oracle_cells = cells;
+        oracle.clear();
+        self.oracle_cells = oracle;
         self.oracle_bytes += row_oracle_bytes + stranded_bytes;
         // Synthetic columns: lsn, xid, commit_ts (unix micros), delete marker
-        let off = mapping.columns.len();
-        push_fixed(&mut self.buffers[off], &decoded.source_lsn.to_le_bytes())?;
-        push_fixed(&mut self.buffers[off + 1], &decoded.xid.to_le_bytes())?;
-        let unix_us = committed.commit_ts.saturating_add(DATETIME64_PG_EPOCH_US);
+        let off = cells.len();
+        push_fixed(&mut self.buffers[off], &stamp.source_lsn.to_le_bytes())?;
+        push_fixed(&mut self.buffers[off + 1], &stamp.xid.to_le_bytes())?;
+        let unix_us = stamp.commit_ts.saturating_add(DATETIME64_PG_EPOCH_US);
         push_fixed(&mut self.buffers[off + 2], &unix_us.to_le_bytes())?;
         let mut next = off + 3;
         if self.plan.synth_is_deleted.is_some() {
-            let is_deleted: u8 = (op_code == OP_DELETE).into();
+            let is_deleted: u8 = (stamp.op_code == OP_DELETE).into();
             push_fixed(&mut self.buffers[next], &is_deleted.to_le_bytes())?;
             next += 1;
         }
         if self.plan.synth_leaf.is_some() {
-            push_fixed(&mut self.buffers[next], &leaf.unwrap_or(0).to_le_bytes())?;
+            push_fixed(
+                &mut self.buffers[next],
+                &stamp.leaf.unwrap_or(0).to_le_bytes(),
+            )?;
         }
         self.rows += 1;
         self.approx_bytes = self.buffers.iter().map(ColumnBuf::approx_size).sum();
         Ok(Append::Done)
     }
+}
+
+/// One mapped cell ready to encode
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Cell<'a> {
+    /// Absent from image, coerces like NULL
+    Absent,
+    Value(ValueRef<'a>),
+    /// Little-endian bytes [`Direct::Copy`] proved match column storage
+    #[cfg(test)]
+    Le(&'a [u8]),
+}
+
+/// Per-row synthetic column inputs
+pub(crate) struct RowStamp {
+    pub(crate) source_lsn: u64,
+    pub(crate) xid: u32,
+    pub(crate) commit_ts: i64,
+    pub(crate) op_code: i8,
+    pub(crate) leaf: Option<u32>,
 }
 
 fn name_column(mut e: EmitterError, target: &str) -> EmitterError {
@@ -2523,55 +2705,55 @@ fn micros_to_ticks(us: i128, scale: i32) -> Result<i64, EmitterError> {
 
 fn encode_value(
     buf: &mut ColumnBuf,
-    v: &ColumnValue,
+    v: ValueRef<'_>,
     decimal: Option<DecimalWire>,
     timestamp_scale: i32,
 ) -> Result<(), EmitterError> {
     match v {
         // Non-Nullable target takes type default
-        ColumnValue::Null => {
+        ValueRef::Null => {
             buf.append_default();
             Ok(())
         }
-        ColumnValue::Bool(b) => buf.append_fixed_bytes(&[*b as u8]),
-        ColumnValue::Char(c) => buf.append_fixed_bytes(&c.to_le_bytes()),
-        ColumnValue::Int2(n) => buf.append_fixed_bytes(&n.to_le_bytes()),
-        ColumnValue::Int4(n) => buf.append_fixed_bytes(&n.to_le_bytes()),
-        ColumnValue::Int8(n) => buf.append_fixed_bytes(&n.to_le_bytes()),
-        ColumnValue::Float4(f) => buf.append_fixed_bytes(&f.to_le_bytes()),
-        ColumnValue::Float8(f) => buf.append_fixed_bytes(&f.to_le_bytes()),
-        ColumnValue::Oid(n) => buf.append_fixed_bytes(&n.to_le_bytes()),
-        ColumnValue::Oid8(n) => buf.append_fixed_bytes(&n.to_le_bytes()),
-        ColumnValue::Date(i32::MIN | i32::MAX)
-        | ColumnValue::Timestamp(i64::MIN | i64::MAX)
-        | ColumnValue::TimestampTz(i64::MIN | i64::MAX) => Err(unsupported(
+        ValueRef::Bool(b) => buf.append_fixed_bytes(&[b as u8]),
+        ValueRef::Char(c) => buf.append_fixed_bytes(&c.to_le_bytes()),
+        ValueRef::Int2(n) => buf.append_fixed_bytes(&n.to_le_bytes()),
+        ValueRef::Int4(n) => buf.append_fixed_bytes(&n.to_le_bytes()),
+        ValueRef::Int8(n) => buf.append_fixed_bytes(&n.to_le_bytes()),
+        ValueRef::Float4(f) => buf.append_fixed_bytes(&f.to_le_bytes()),
+        ValueRef::Float8(f) => buf.append_fixed_bytes(&f.to_le_bytes()),
+        ValueRef::Oid(n) => buf.append_fixed_bytes(&n.to_le_bytes()),
+        ValueRef::Oid8(n) => buf.append_fixed_bytes(&n.to_le_bytes()),
+        ValueRef::Date(i32::MIN | i32::MAX)
+        | ValueRef::Timestamp(i64::MIN | i64::MAX)
+        | ValueRef::TimestampTz(i64::MIN | i64::MAX) => Err(unsupported(
             "temporal infinity, set pos_inf/neg_inf to null on a Nullable destination",
         )),
-        ColumnValue::Date(n) => {
+        ValueRef::Date(n) => {
             let days = n
                 .checked_add(DATE32_PG_EPOCH_DAYS)
                 .ok_or_else(|| unsupported("finite date overflows Date32 epoch conversion"))?;
             buf.append_fixed_bytes(&days.to_le_bytes())
         }
         // PG time counts microseconds since midnight, without an epoch offset
-        ColumnValue::Time(n) => {
-            let ticks = micros_to_ticks(i128::from(*n), timestamp_scale)?;
+        ValueRef::Time(n) => {
+            let ticks = micros_to_ticks(i128::from(n), timestamp_scale)?;
             buf.append_fixed_bytes(&ticks.to_le_bytes())
         }
-        ColumnValue::Timestamp(n) | ColumnValue::TimestampTz(n) => {
-            let ticks = timestamp_ticks(*n, timestamp_scale)?;
+        ValueRef::Timestamp(n) | ValueRef::TimestampTz(n) => {
+            let ticks = timestamp_ticks(n, timestamp_scale)?;
             buf.append_fixed_bytes(&ticks.to_le_bytes())
         }
         // `timetz` → text: CH has no zone-aware time type, text keeps
         // the offset the old fixed encoding dropped
-        ColumnValue::TimeTz { micros, tz_seconds } => buf.append_string_bytes(
-            crate::decode::codecs::timetz_to_text(*micros, *tz_seconds).as_bytes(),
+        ValueRef::TimeTz { micros, tz_seconds } => buf.append_string_bytes(
+            crate::decode::codecs::timetz_to_text(micros, tz_seconds).as_bytes(),
         ),
-        ColumnValue::Uuid(b) => buf.append_fixed_bytes(&crate::decode::codecs::uuid_to_ch_wire(b)),
-        ColumnValue::Name(s) | ColumnValue::Text(s) | ColumnValue::Json(s) => {
+        ValueRef::Uuid(b) => buf.append_fixed_bytes(&crate::decode::codecs::uuid_to_ch_wire(&b)),
+        ValueRef::Name(s) | ValueRef::Text(s) | ValueRef::Json(s) => {
             buf.append_string_bytes(s.as_bytes())
         }
-        ColumnValue::Numeric(n) => {
+        ValueRef::Numeric(n) => {
             use crate::decode::codecs::NumericKind;
             match decimal {
                 // Decimal column: non-finite (NaN/±Inf) is unrepresentable,
@@ -2591,31 +2773,31 @@ fn encode_value(
                 None => buf.append_string_bytes(n.as_text().as_bytes()),
             }
         }
-        ColumnValue::Inet(v) => buf.append_string_bytes(v.to_text().as_bytes()),
-        ColumnValue::MacAddr(b) => {
-            buf.append_string_bytes(crate::decode::codecs::macaddr_to_text(b).as_bytes())
+        ValueRef::Inet(v) => buf.append_string_bytes(v.to_text().as_bytes()),
+        ValueRef::MacAddr(b) => {
+            buf.append_string_bytes(crate::decode::codecs::macaddr_to_text(&b).as_bytes())
         }
-        ColumnValue::MacAddr8(b) => {
-            buf.append_string_bytes(crate::decode::codecs::macaddr8_to_text(b).as_bytes())
+        ValueRef::MacAddr8(b) => {
+            buf.append_string_bytes(crate::decode::codecs::macaddr8_to_text(&b).as_bytes())
         }
-        ColumnValue::Tid { block, offset } => {
-            buf.append_string_bytes(crate::decode::codecs::tid_to_text(*block, *offset).as_bytes())
+        ValueRef::Tid { block, offset } => {
+            buf.append_string_bytes(crate::decode::codecs::tid_to_text(block, offset).as_bytes())
         }
-        ColumnValue::Interval(v) => buf.append_string_bytes(v.to_text().as_bytes()),
-        ColumnValue::Bytea(b) => buf.append_string_bytes(b),
-        ColumnValue::ExternalToast(_) => Err(unsupported(
+        ValueRef::Interval(v) => buf.append_string_bytes(v.to_text().as_bytes()),
+        ValueRef::Bytea(b) => buf.append_string_bytes(b),
+        ValueRef::ExternalToast(_) => Err(unsupported(
             "unresolved TOAST pointer (xact buffer should have reassembled)",
         )),
-        ColumnValue::PgPendingText { text, .. } => buf.append_string_bytes(text.as_bytes()),
+        ValueRef::PgPendingText { text, .. } => buf.append_string_bytes(text.as_bytes()),
         // Never interpret raw Datum bytes as local String data
-        ColumnValue::PgPending { .. } | ColumnValue::Unsupported { .. } => Err(unsupported(
+        ValueRef::PgPending { .. } | ValueRef::Unsupported { .. } => Err(unsupported(
             "unresolved source value routed to a local column",
         )),
     }
 }
 
 /// Map NULL, absent, and unlogged fields to default cells
-fn oracle_cell(v: Option<&ColumnValue>, source_type_oid: u32) -> Result<OracleCell, EmitterError> {
+fn oracle_cell(cell: Cell<'_>, source_type_oid: u32) -> Result<OracleCell, EmitterError> {
     let mismatch = |got: u32| EmitterError::UnsupportedValue {
         target_column: String::new(),
         kind: if got == 0 {
@@ -2624,28 +2806,31 @@ fn oracle_cell(v: Option<&ColumnValue>, source_type_oid: u32) -> Result<OracleCe
             "source type oid differs from the planned one"
         },
     };
+    let v = match cell {
+        Cell::Absent => return Ok(OracleCell::Default),
+        Cell::Value(v) => v,
+        #[cfg(test)]
+        Cell::Le(_) => return Err(mismatch(0)),
+    };
     Ok(match v {
-        None | Some(ColumnValue::Null) => OracleCell::Default,
-        Some(ColumnValue::PgPending { type_oid, raw })
-        | Some(ColumnValue::Unsupported { type_oid, raw }) => {
-            if *type_oid != source_type_oid {
-                return Err(mismatch(*type_oid));
+        ValueRef::Null => OracleCell::Default,
+        ValueRef::PgPending { type_oid, raw } | ValueRef::Unsupported { type_oid, raw } => {
+            if type_oid != source_type_oid {
+                return Err(mismatch(type_oid));
             }
-            OracleCell::DiskRaw(raw.clone())
+            OracleCell::DiskRaw(raw.to_vec())
         }
-        Some(ColumnValue::PgPendingText { type_oid, text }) => {
-            if *type_oid != source_type_oid {
-                return Err(mismatch(*type_oid));
+        ValueRef::PgPendingText { type_oid, text } => {
+            if type_oid != source_type_oid {
+                return Err(mismatch(type_oid));
             }
             OracleCell::TextInput(text.as_bytes().to_vec())
         }
         // jsonb needs typinput to reconstruct binary storage from document text
-        Some(ColumnValue::Json(s)) => OracleCell::TextInput(s.as_bytes().to_vec()),
+        ValueRef::Json(s) => OracleCell::TextInput(s.as_bytes().to_vec()),
         // PostGIS WKT must bypass HEXEWKB typoutput
-        Some(ColumnValue::Text(s)) | Some(ColumnValue::Name(s)) => {
-            OracleCell::Literal(s.as_bytes().to_vec())
-        }
-        Some(_) => return Err(mismatch(0)),
+        ValueRef::Text(s) | ValueRef::Name(s) => OracleCell::Literal(s.as_bytes().to_vec()),
+        _ => return Err(mismatch(0)),
     })
 }
 
@@ -2998,6 +3183,15 @@ pub async fn load_effective(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn encode_value(
+        buf: &mut ColumnBuf,
+        v: &ColumnValue,
+        decimal: Option<DecimalWire>,
+        timestamp_scale: i32,
+    ) -> Result<(), EmitterError> {
+        super::encode_value(buf, v.view(), decimal, timestamp_scale)
+    }
     use crate::backfill::copy_backfill::COPY_CHUNK_BLOCKS;
     use crate::decode::heap_decoder::{DecodedHeap, DecodedTuple};
     use backon::BackoffBuilder;
@@ -3815,7 +4009,7 @@ mod tests {
                 ColumnValue::Timestamp(i64::MIN + 1),
                 ColumnValue::TimestampTz(i64::MAX - 1),
             ] {
-                assert_eq!(nf.substitute(&value), &value);
+                assert_eq!(nf.substitute(value.view()), value.view());
             }
         }
     }
