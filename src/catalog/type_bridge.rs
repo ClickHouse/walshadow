@@ -107,7 +107,7 @@ pub fn base_type_for(att: &RelAttr) -> Result<String, BridgeError> {
         NUMERICOID => numeric_ch_type(att.typmod),
         TEXTOID | VARCHAROID | BPCHAROID | NAMEOID | BYTEAOID => "String".into(),
         DATEOID => "Date32".into(),
-        // CH 25.x requires `enable_time_time64_type=1` for Time64.
+        // `ch::connect_client` sets `enable_time_time64_type` that Time64 DDL needs.
         // CH time types cannot store `timetz` UTC offsets or intervals
         TIMEOID => format!("Time64({})", temporal_precision(att.typmod)),
         TIMETZOID | INTERVALOID => "String".into(),

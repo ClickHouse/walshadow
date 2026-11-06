@@ -343,8 +343,8 @@ Common mappings include:
 | `inet`, `cidr`, `interval`, unknown types | `String` |
 
 Nullable source columns become `Nullable(...)` unless used as ClickHouse sort
-keys. ClickHouse deployments using PostgreSQL `time` columns must enable
-`Time64` support
+keys. PostgreSQL `time` columns need ClickHouse 25.6+ for `Time64`; walshadow
+sets `enable_time_time64_type` on its ClickHouse sessions
 
 Use a column rule to override an inferred type; see
 [Select tables](table-selection.md#rename-targets-or-columns). For pgvector
