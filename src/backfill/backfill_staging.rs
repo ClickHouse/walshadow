@@ -334,7 +334,7 @@ mod tests {
         let sql = "DROP TABLE IF EXISTS staging";
         for retries in 0..=2 {
             let (config, server) =
-                crate::ch::test_support::retry_server(retries, sql, 0, false, None).await;
+                crate::ch::test_support::retry_server(retries, sql, true, 0, false, None).await;
             let mut session = StagingSession::connect(DestEmitter::new(Arc::new(config), None))
                 .await
                 .unwrap();
@@ -346,7 +346,8 @@ mod tests {
     #[tokio::test]
     async fn exchange_ambiguity_does_not_retry() {
         let sql = "EXCHANGE TABLES staging AND live";
-        let (config, server) = crate::ch::test_support::retry_server(2, sql, 0, false, None).await;
+        let (config, server) =
+            crate::ch::test_support::retry_server(2, sql, true, 0, false, None).await;
         let mut session = StagingSession::connect(DestEmitter::new(Arc::new(config), None))
             .await
             .unwrap();
@@ -358,7 +359,8 @@ mod tests {
     #[tokio::test]
     async fn prepare_names_the_rel_whose_staging_rebuild_failed() {
         let sql = "DROP TABLE IF EXISTS `db`.`t__wsstg`";
-        let (config, server) = crate::ch::test_support::retry_server(0, sql, 0, false, None).await;
+        let (config, server) =
+            crate::ch::test_support::retry_server(0, sql, true, 0, false, None).await;
         let desc = crate::backfill::backup_page_walk::make_rel_named(
             16400,
             16400,
@@ -395,7 +397,8 @@ mod tests {
     #[tokio::test]
     async fn failed_query_names_its_sql() {
         let sql = "SELECT name FROM system.tables";
-        let (config, server) = crate::ch::test_support::retry_server(0, sql, 0, false, None).await;
+        let (config, server) =
+            crate::ch::test_support::retry_server(0, sql, false, 0, false, None).await;
         let mut session = StagingSession::connect(DestEmitter::new(Arc::new(config), None))
             .await
             .unwrap();

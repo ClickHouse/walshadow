@@ -250,3 +250,47 @@ async fn native_numeric_time_timetz_round_trip() {
         "123456789012345678901234567890123456789012345678.12"
     );
 }
+
+/// walshadow's DDL enables `Time64` itself, so it works, `CREATE … AS` clones
+/// included, for a user whose profile leaves it off
+#[tokio::test]
+async fn ddl_creates_time64_without_profile_setting() {
+    if !fx::tools::clickhouse_available() {
+        return;
+    }
+
+    let slot = fx::Ports::alloc();
+    let ch_tmp = tempfile::tempdir().unwrap();
+    let ch = fx::ChServer::spawn(ch_tmp, slot.ch_tcp, slot.ch_http).expect("spawn ch");
+    let cfg = EmitterConfig {
+        conn: InstanceConfig {
+            host: "127.0.0.1".into(),
+            port: slot.ch_tcp,
+            database: "default".into(),
+            user: "no_time64".into(),
+            ..Default::default()
+        },
+        compression: CompressionChoice::None,
+        ..Default::default()
+    };
+    let mut client = walshadow::ch::connect_client(&cfg).await.expect("connect");
+    for sql in [
+        "CREATE TABLE shifts (id Int32, starts Nullable(Time64(6))) \
+         ENGINE = ReplacingMergeTree ORDER BY (id, starts) SETTINGS allow_nullable_key = 1",
+        "CREATE TABLE shifts__wsstaging AS shifts",
+        "ALTER TABLE shifts ADD COLUMN ends Time64(3)",
+    ] {
+        walshadow::ch::exec_drain(&mut client, sql)
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    let engine = ch
+        .query("SELECT engine_full FROM system.tables WHERE name = 'shifts__wsstaging'")
+        .expect("read staging engine");
+    assert!(
+        engine.starts_with(
+            "ReplacingMergeTree ORDER BY (id, starts) SETTINGS allow_nullable_key = 1"
+        ),
+        "{engine}"
+    );
+}
