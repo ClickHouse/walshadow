@@ -581,73 +581,79 @@ impl WalReplaySink {
                         .await
                         .map_err(|e| SinkError::Other(format!("toast rewrite barrier: {e}")))?;
                 }
-                WalkStep::Heap(mut heap) => {
-                    let rfn = heap.decoded.rfn;
-                    // Decode TOAST chunks, route through parent row
-                    let Some(target) = targets.get(&(rfn.db_node, rfn.rel_node)) else {
-                        continue;
-                    };
-                    if commit_lsn <= self.from_lsn {
-                        // Walked pages cover commits through from_lsn
-                        self.replay.commits_below_from += 1;
-                        continue;
-                    }
-                    if commit_lsn > target.through {
-                        self.replay.commits_past_through += 1;
-                        continue;
-                    }
-                    let Some(route) = &target.route else {
-                        self.stats
-                            .unsupported_relations
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        continue;
-                    };
-                    // Skip deletes for append-only destinations
-                    if route.drops_deletes()
-                        && matches!(heap.decoded.op, crate::decode::heap_decoder::HeapOp::Delete)
-                    {
-                        self.stats
-                            .deletes_discarded
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        continue;
-                    }
-                    let rel = &target.rel;
-                    // Make earlier commits available before resolving values.
-                    // Inline-only heaps read nothing: flushing for them
-                    // shreds the batch on a row-heavy segment. Gate stays
-                    // as wide as detoast's leaf acquire: narrowing it to
-                    // store-bound pointers would hold pending leaf permits
-                    // across that acquire, which can wait on them
-                    if heap_reads_toast(&heap) {
-                        self.flush_rows().await?;
-                    }
-                    let value_permit = detoast_heap(&mut heap, spool, &ref_maps, &self.resolver)
-                        .await
-                        .map_err(SinkError::from)?;
-                    let (open, rows) = self
-                        .open
-                        .get_or_insert_with(|| (self.seqs.open(commit_lsn, Publish::Commit), 0));
-                    *rows += 1;
-                    let seq = open.seq();
-                    if !route.drops_deletes()
-                        && let Some(tomb) = take_key_change_tombstone(&mut heap.decoded, rel)
-                    {
+                WalkStep::Heap(drained) => {
+                    for mut heap in drained.into_cells().map_err(SinkError::from)? {
+                        let rfn = heap.decoded.rfn;
+                        // Decode TOAST chunks, route through parent row
+                        let Some(target) = targets.get(&(rfn.db_node, rfn.rel_node)) else {
+                            continue;
+                        };
+                        if commit_lsn <= self.from_lsn {
+                            // Walked pages cover commits through from_lsn
+                            self.replay.commits_below_from += 1;
+                            continue;
+                        }
+                        if commit_lsn > target.through {
+                            self.replay.commits_past_through += 1;
+                            continue;
+                        }
+                        let Some(route) = &target.route else {
+                            self.stats
+                                .unsupported_relations
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            continue;
+                        };
+                        // Skip deletes for append-only destinations
+                        if route.drops_deletes()
+                            && matches!(
+                                heap.decoded.op,
+                                crate::decode::heap_decoder::HeapOp::Delete
+                            )
+                        {
+                            self.stats
+                                .deletes_discarded
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            continue;
+                        }
+                        let rel = &target.rel;
+                        // Make earlier commits available before resolving values.
+                        // Inline-only heaps read nothing: flushing for them
+                        // shreds the batch on a row-heavy segment. Gate stays
+                        // as wide as detoast's leaf acquire: narrowing it to
+                        // store-bound pointers would hold pending leaf permits
+                        // across that acquire, which can wait on them
+                        if heap_reads_toast(&heap) {
+                            self.flush_rows().await?;
+                        }
+                        let value_permit =
+                            detoast_heap(&mut heap, spool, &ref_maps, &self.resolver)
+                                .await
+                                .map_err(SinkError::from)?;
+                        let (open, rows) = self.open.get_or_insert_with(|| {
+                            (self.seqs.open(commit_lsn, Publish::Commit), 0)
+                        });
                         *rows += 1;
-                        let tomb = CommittedTuple {
-                            decoded: tomb,
+                        let seq = open.seq();
+                        if !route.drops_deletes()
+                            && let Some(tomb) = take_key_change_tombstone(&mut heap.decoded, rel)
+                        {
+                            *rows += 1;
+                            let tomb = CommittedTuple {
+                                decoded: tomb,
+                                commit_ts,
+                                commit_lsn,
+                            };
+                            self.emit(seq, (rel, route), tomb, None).await?;
+                        }
+                        let committed = CommittedTuple {
+                            decoded: heap.decoded,
                             commit_ts,
                             commit_lsn,
                         };
-                        self.emit(seq, (rel, route), tomb, None).await?;
+                        self.emit(seq, (rel, route), committed, value_permit.map(Arc::new))
+                            .await?;
+                        self.replay.rows_replayed += 1;
                     }
-                    let committed = CommittedTuple {
-                        decoded: heap.decoded,
-                        commit_ts,
-                        commit_lsn,
-                    };
-                    self.emit(seq, (rel, route), committed, value_permit.map(Arc::new))
-                        .await?;
-                    self.replay.rows_replayed += 1;
                 }
             }
         }

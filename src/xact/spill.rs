@@ -126,6 +126,17 @@ impl HeapInput {
         std::mem::size_of::<Self>() + self.bytes.len()
     }
 
+    /// Fields heap decode reads, borrowed without building a record
+    pub fn record_bytes(&self) -> crate::decode::heap_decoder::HeapRecordBytes<'_> {
+        let (main_data, data) = self.bytes.split_at(self.main_len as usize);
+        crate::decode::heap_decoder::HeapRecordBytes {
+            rm: self.rm,
+            info: self.info,
+            main_data,
+            block: self.has_block.then_some(data),
+        }
+    }
+
     /// Borrowed record targeting `rfn` for the shared heap decoder
     pub fn to_xlog_record(&self, rfn: RelFileNode) -> walrus::pg::walparser::XLogRecord<'_> {
         use walrus::pg::walparser::{
@@ -1056,7 +1067,7 @@ pub(crate) fn push_u16(out: &mut Vec<u8>, v: u16) {
 pub(crate) fn push_u32(out: &mut Vec<u8>, v: u32) {
     out.extend_from_slice(&v.to_le_bytes());
 }
-fn push_i32(out: &mut Vec<u8>, v: i32) {
+pub(crate) fn push_i32(out: &mut Vec<u8>, v: i32) {
     out.extend_from_slice(&v.to_le_bytes());
 }
 pub(crate) fn push_u64(out: &mut Vec<u8>, v: u64) {
@@ -1065,7 +1076,7 @@ pub(crate) fn push_u64(out: &mut Vec<u8>, v: u64) {
 fn push_i64(out: &mut Vec<u8>, v: i64) {
     out.extend_from_slice(&v.to_le_bytes());
 }
-fn push_bytes(out: &mut Vec<u8>, b: &[u8]) {
+pub(crate) fn push_bytes(out: &mut Vec<u8>, b: &[u8]) {
     push_u32(out, b.len() as u32);
     out.extend_from_slice(b);
 }
@@ -1324,7 +1335,7 @@ impl<'a> Cursor<'a> {
         Self { buf, pos: 0 }
     }
 
-    fn need(&mut self, n: usize) -> Result<&'a [u8]> {
+    pub(crate) fn need(&mut self, n: usize) -> Result<&'a [u8]> {
         if self.pos + n > self.buf.len() {
             return Err(SpillError::Format {
                 offset: self.pos,
@@ -1349,7 +1360,7 @@ impl<'a> Cursor<'a> {
     pub(crate) fn u32(&mut self) -> Result<u32> {
         self.take().map(u32::from_le_bytes)
     }
-    fn i32(&mut self) -> Result<i32> {
+    pub(crate) fn i32(&mut self) -> Result<i32> {
         self.take().map(i32::from_le_bytes)
     }
     pub(crate) fn u64(&mut self) -> Result<u64> {

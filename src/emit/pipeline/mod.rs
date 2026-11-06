@@ -13,7 +13,6 @@
 pub mod ack;
 pub mod batcher;
 pub mod bootstrap;
-pub mod decode;
 pub mod inserter;
 pub mod plan_spool;
 pub mod planner;

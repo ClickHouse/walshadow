@@ -18,13 +18,8 @@ pub enum DatumRef<'a> {
     Fixed(&'a [u8]),
     /// Uncompressed varlena body
     Varlena(&'a [u8]),
-    /// Inline compressed varlena; `datum` spans header and body
-    Compressed {
-        method: u8,
-        raw_len: usize,
-        body: &'a [u8],
-        datum: &'a [u8],
-    },
+    /// Inline compressed varlena: 4-byte header, `va_tcinfo`, codec body
+    Compressed(&'a [u8]),
     External(ToastPointer),
     /// `typlen = -2` body without trailing NUL
     Cstring(&'a [u8]),

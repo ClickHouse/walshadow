@@ -224,6 +224,18 @@ fn swallow(ack: &AckHandle, chunks: impl IntoIterator<Item = batcher::RowChunk>)
     ack.swallowed(counts.into_iter().collect());
 }
 
+/// [`swallow`] for planned segments
+fn swallow_segments(ack: &AckHandle, segments: Vec<batcher::PlacedSegment>) {
+    let mut counts: HashMap<u64, u64> = HashMap::new();
+    for s in segments {
+        let rows = s.chunks.iter().map(|c| c.rows() as u64).sum::<u64>();
+        if rows > 0 {
+            *counts.entry(s.seq).or_insert(0) += rows;
+        }
+    }
+    ack.swallowed(counts.into_iter().collect());
+}
+
 /// Metrics-only tail: ack collector + one swallow task, zero CH
 /// connections. Every routed row acks at swallow (permits release on
 /// drop) so nothing can pin the watermark; `FlushAll` replies
@@ -241,7 +253,7 @@ pub fn spawn_null(
         while let Some(msg) = msg_rx.recv().await {
             match msg {
                 BatcherMsg::Rows(chunk) => swallow(&swallow_ack, [chunk]),
-                BatcherMsg::Chunks(chunks) => swallow(&swallow_ack, chunks),
+                BatcherMsg::Segments(segments) => swallow_segments(&swallow_ack, segments),
                 BatcherMsg::FlushAll(reply) => {
                     let _ = reply.send(());
                 }

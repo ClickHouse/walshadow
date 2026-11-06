@@ -249,7 +249,10 @@ async fn drain_all(
         let ref_maps: Vec<&ChunkRefMap> = walk.chunks.iter().map(|g| g.map()).collect();
         let spool = walk.chunks.iter().find_map(|g| g.spool());
         for step in walk.steps {
-            if let WalkStep::Heap(mut heap) = step {
+            let WalkStep::Heap(drained) = step else {
+                continue;
+            };
+            for mut heap in drained.into_cells()? {
                 detoast_heap(&mut heap, spool, &ref_maps, resolver).await?;
                 out.push(CommittedTuple {
                     decoded: heap.decoded,

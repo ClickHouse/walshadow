@@ -592,6 +592,7 @@ pub(crate) fn stage_gauges_on(v: &StageCounters<'_>, base: MetricsSnapshot) -> M
                 |s| &s.plan_failures_detoast,
                 |s| &s.plan_failures_partial_update,
                 |s| &s.plan_failures_view,
+                |s| &s.plan_failures_encode,
                 |s| &s.plan_failures_drain,
             ],
         ),

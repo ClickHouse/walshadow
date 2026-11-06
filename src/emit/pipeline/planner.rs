@@ -39,16 +39,18 @@
 
 use std::sync::Arc;
 
-use crate::decode::heap_decoder::DescribedHeap;
+use crate::decode::datum::DatumRef;
+use crate::decode::heap_decoder::view_heap_record;
 use crate::emit::pipeline::plan_spool::{
-    DEFAULT_PLAN_MEM_MAX, PlanPath, PlanSpoolError, PlanWriter, SealedPlan,
+    DEFAULT_PLAN_MEM_MAX, PlanPath, PlanSpoolError, PlanWriter, SealedPlan, ViewChange,
 };
 use crate::emit::route::RouteSnapshot;
 use crate::schema::RelDescriptor;
 use crate::toast::{ChunkRefMap, ToastResolver};
+use crate::xact::spill::DescribedInput;
 use crate::xact::xact_buffer::{
-    DrainEntry, DrainWalk, DrainedBatch, FailClosedReason, WalkStep, XactBufferError, detoast_heap,
-    heap_reads_toast,
+    DrainEntry, DrainHeap, DrainWalk, DrainedBatch, FailClosedReason, WalkStep, XactBufferError,
+    detoast_heap, heap_reads_toast,
 };
 
 /// Planner's window onto route state. Implementations resolve from frozen
@@ -58,7 +60,7 @@ use crate::xact::xact_buffer::{
 /// discard. A plan asks once per descriptor version between control
 /// entries, and reports what it discarded through `unmapped` once sealed
 pub trait PlanRouteView {
-    fn route_for(&mut self, heap: &DescribedHeap) -> Option<Arc<RouteSnapshot>>;
+    fn route_for(&mut self, rel: &Arc<RelDescriptor>) -> Option<Arc<RouteSnapshot>>;
     /// `heaps` rows of `rel` a sealed plan discards as unmapped
     fn unmapped(&mut self, rel: &RelDescriptor, heaps: u64);
     /// Fold control entry into local view without mutating shared route state
@@ -86,6 +88,7 @@ impl PlanError {
     /// `reason=` label for `xact_plan_failures_total`
     pub fn reason(&self) -> &'static str {
         match self {
+            Self::Spool(PlanSpoolError::Encode(_)) => "encode",
             Self::Spool(_) => "spool",
             Self::Detoast(e) => drain_reason(e),
             Self::PartialUpdate { .. } => "partial_update",
@@ -128,14 +131,19 @@ pub struct Planner<'a, V> {
 }
 
 impl<'a, V: PlanRouteView> Planner<'a, V> {
+    /// `segment` bounds rows and bytes dispatched as one seq
     pub fn create(
         path: impl Into<PlanPath>,
         disk_cap: u64,
+        segment: (usize, usize),
+        commit_ts: i64,
         view: &'a mut V,
         resolver: &'a ToastResolver,
     ) -> Self {
         Self {
-            writer: PlanWriter::create(path, disk_cap, DEFAULT_PLAN_MEM_MAX),
+            writer: PlanWriter::create(path, disk_cap, DEFAULT_PLAN_MEM_MAX)
+                .with_segment_limits(segment.0, segment.1)
+                .for_commit(commit_ts),
             view,
             resolver,
             rows_base: 0,
@@ -171,38 +179,103 @@ impl<'a, V: PlanRouteView> Planner<'a, V> {
                     Box::pin(self.view.apply(&e))
                         .await
                         .map_err(PlanError::View)?;
-                    self.writer.push_control(e, self.rows_base + cursor);
+                    self.writer.push_control(e, self.rows_base + cursor)?;
                 }
                 WalkStep::Truncate { heap, upto } => {
                     self.resolver.clear_reads();
-                    let table = self.writer.table(&heap, || self.view.route_for(&heap));
+                    let table =
+                        self.writer
+                            .table(&heap.descriptor, heap.descriptor_valid_from, || {
+                                self.view.route_for(&heap.descriptor)
+                            });
                     self.writer
                         .push_truncate(heap.decoded, table, self.rows_base + upto)?;
                 }
-                WalkStep::Heap(mut heap) => {
+                WalkStep::Heap(drained) => {
                     // Route before validation and detoast: unmapped rows
-                    // discard without touching
-                    // the resolver or codec checks. The value permit drops
-                    // once bytes land in the plan file
-                    let table = self.writer.table(&heap, || self.view.route_for(&heap));
-                    if self.writer.routed(table) {
+                    // discard without touching the resolver or codec checks
+                    let rel = drained.descriptor().clone();
+                    let table = self
+                        .writer
+                        .table(&rel, drained.descriptor_valid_from(), || {
+                            self.view.route_for(&rel)
+                        });
+                    if !self.writer.routed(table) {
+                        self.writer.discard(table, drained.rows() as u64);
+                        continue;
+                    }
+                    let drained = match drained {
+                        DrainHeap::Input(input) => {
+                            if self.plan_views(&input, &rel, table)? {
+                                continue;
+                            }
+                            DrainHeap::Input(input)
+                        }
+                        cells => cells,
+                    };
+                    for mut heap in drained.into_cells()? {
                         if heap.decoded.new.as_ref().is_some_and(|t| t.partial) {
                             return Err(PlanError::PartialUpdate {
                                 lsn: heap.decoded.source_lsn,
                             });
                         }
                         if heap_reads_toast(&heap) {
+                            // Value permit drops once bytes land in the plan
                             Box::pin(detoast_heap(&mut heap, spool, &ref_maps, self.resolver))
                                 .await?;
                         }
+                        self.writer.push_cells(heap.decoded, table)?;
                     }
-                    self.writer.push_heap(heap.decoded, table)?;
                 }
             }
         }
         self.rows_base += new_rows.len();
         self.writer.push_rows(new_rows);
         Ok(())
+    }
+
+    /// Encode an input from tuple images in place; `false` when an image
+    /// holds external values, which only owned cells detoast
+    fn plan_views(
+        &mut self,
+        input: &DescribedInput,
+        rel: &Arc<RelDescriptor>,
+        table: u32,
+    ) -> Result<bool, PlanError> {
+        let images = view_heap_record(input.input.record_bytes(), rel).map_err(|e| {
+            XactBufferError::OrdinaryFailClosed {
+                relid: rel.oid,
+                lsn: input.input.source_lsn,
+                rm: input.input.rm,
+                info: input.input.info,
+                reason: FailClosedReason::Malformed(e.to_string()),
+            }
+        })?;
+        let external = images.iter().any(|h| {
+            [&h.new, &h.old]
+                .into_iter()
+                .flatten()
+                .any(|t| t.datums.iter().any(|d| matches!(d, DatumRef::External(_))))
+        });
+        if external {
+            return Ok(false);
+        }
+        for h in &images {
+            if h.new.as_ref().is_some_and(|t| t.partial) {
+                return Err(PlanError::PartialUpdate {
+                    lsn: input.input.source_lsn,
+                });
+            }
+            let change = ViewChange {
+                op: h.op,
+                xid: input.input.xid,
+                source_lsn: input.input.source_lsn,
+                new: h.new.as_ref(),
+                old: h.old.as_ref(),
+            };
+            self.writer.push_views(change, table)?;
+        }
+        Ok(true)
     }
 
     /// Freeze the validated plan for the executor
@@ -221,7 +294,7 @@ impl<'a, V: PlanRouteView> Planner<'a, V> {
 mod tests {
     use super::*;
     use crate::decode::heap_decoder::{
-        ColumnValue, DecodedHeap, DecodedTuple, HeapOp, ToastPointer,
+        ColumnValue, DecodedHeap, DecodedTuple, DescribedHeap, HeapOp, ToastPointer,
     };
     use crate::emit::pipeline::plan_spool::PlanItem;
     use crate::mapping::{TableMapping, TableTarget};
@@ -359,6 +432,48 @@ mod tests {
         )
     }
 
+    /// Route carrying source column 1 as `Nullable(String)`
+    fn text_route() -> Arc<RouteSnapshot> {
+        RouteSnapshot::freeze(
+            Arc::new(TableMapping {
+                target: TableTarget::new("db", "t"),
+                columns: vec![crate::mapping::ColumnMapping {
+                    src_attnum: 1,
+                    target_name: "v".into(),
+                    target_type: "Nullable(String)".into(),
+                    type_pinned: false,
+                }],
+                tees: Vec::new(),
+            }),
+            Arc::default(),
+            Default::default(),
+        )
+    }
+
+    fn planner<'a>(
+        path: impl Into<PlanPath>,
+        cap: u64,
+        segment_rows: usize,
+        view: &'a mut MapView,
+        resolver: &'a ToastResolver,
+    ) -> Planner<'a, MapView> {
+        Planner::create(path, cap, (segment_rows, usize::MAX), 42, view, resolver)
+    }
+
+    /// `_lsn` of every row in `chunk`, after `mapped` columns
+    fn lsns(chunk: &crate::emit::ch_emitter::EncodedChunk, mapped: usize) -> Vec<u64> {
+        let crate::emit::ch_emitter::Wire::Fixed { bytes, .. } = chunk.buffers[mapped].wire()
+        else {
+            panic!("lsn column is fixed width");
+        };
+        bytes
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|b| u64::from_le_bytes(*b))
+            .collect()
+    }
+
     /// Fixed-map view: routes by rel name until a Dropped event for the oid
     /// folds in, then unmapped. Records applied entries
     struct MapView {
@@ -369,11 +484,11 @@ mod tests {
     }
 
     impl PlanRouteView for MapView {
-        fn route_for(&mut self, heap: &DescribedHeap) -> Option<Arc<RouteSnapshot>> {
-            if self.dropped.contains(&heap.descriptor.oid) {
+        fn route_for(&mut self, rel: &Arc<RelDescriptor>) -> Option<Arc<RouteSnapshot>> {
+            if self.dropped.contains(&rel.oid) {
                 return None;
             }
-            self.routes.get(&heap.descriptor.rel_name).cloned()
+            self.routes.get(&rel.rel_name).cloned()
         }
 
         fn unmapped(&mut self, rel: &RelDescriptor, heaps: u64) {
@@ -430,7 +545,7 @@ mod tests {
             unmapped: Vec::new(),
         };
         let resolver = ToastResolver::disabled();
-        let mut planner = Planner::create(tmp.path().join("1.plan"), 1 << 20, &mut view, &resolver);
+        let mut planner = planner(tmp.path().join("1.plan"), 1 << 20, 1, &mut view, &resolver);
         let mut drain = b
             .drain_committed(StashResolved::nothing_stashed(1), 42, 0x2000, &[], false)
             .await
@@ -452,9 +567,14 @@ mod tests {
         let mut rd = plan.replay().unwrap();
         let mut order = Vec::new();
         while let Some(item) = rd.next_item().unwrap() {
-            order.push(match item {
-                PlanItem::Control(_) => "e".to_string(),
-                PlanItem::Heap(h) | PlanItem::Truncate { heap: h, .. } => format!(
+            match item {
+                PlanItem::Control { .. } => order.push("e".to_string()),
+                PlanItem::Segment(s) => {
+                    for c in &s.chunks {
+                        order.extend(lsns(c, 0).iter().map(|lsn| format!("h{lsn}r")));
+                    }
+                }
+                PlanItem::Truncate { heap: h, .. } => order.push(format!(
                     "h{}{}",
                     h.decoded.source_lsn,
                     if rd.tables[h.table as usize].route.is_some() {
@@ -462,8 +582,8 @@ mod tests {
                     } else {
                         "-"
                     }
-                ),
-            });
+                )),
+            }
         }
         assert_eq!(
             order,
@@ -512,7 +632,7 @@ mod tests {
             Arc::new(crate::emit::ch_emitter::EmitterStats::default()),
         );
         let path = tmp.path().join("1.plan");
-        let mut planner = Planner::create(path.clone(), 1 << 20, &mut view, &resolver);
+        let mut planner = planner(path.clone(), 1 << 20, usize::MAX, &mut view, &resolver);
         let mut drain = b
             .drain_committed(StashResolved::nothing_stashed(1), 42, 0x2000, &[], false)
             .await
@@ -561,7 +681,7 @@ mod tests {
         };
         let resolver = ToastResolver::disabled();
         let path = tmp.path().join("1.plan");
-        let mut planner = Planner::create(path.clone(), 1 << 20, &mut view, &resolver);
+        let mut planner = planner(path.clone(), 1 << 20, usize::MAX, &mut view, &resolver);
         let mut drain = b
             .drain_committed(stash, 42, 0x2000, &[], false)
             .await
@@ -595,7 +715,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut b = XactBuffer::new(cfg(tmp.path().to_path_buf())).unwrap();
         let rel = descriptor(16612, INT4OID);
-        const ROWS: usize = 32 * 1024;
+        // Encoded rows of empty mappings cost about 21 bytes each
+        const ROWS: usize = 64 * 1024;
         for i in 0..ROWS {
             b.on_heap(heap(&rel, 100 + i as u64, ColumnValue::Int4(i as i32)))
                 .await
@@ -609,7 +730,13 @@ mod tests {
             unmapped: Vec::new(),
         };
         let resolver = ToastResolver::disabled();
-        let mut planner = Planner::create(tmp.path().join("1.plan"), 1 << 30, &mut view, &resolver);
+        let mut planner = planner(
+            tmp.path().join("1.plan"),
+            1 << 30,
+            4096,
+            &mut view,
+            &resolver,
+        );
         let mut drain = b
             .drain_committed(StashResolved::nothing_stashed(1), 42, 0x2000, &[], false)
             .await
@@ -628,16 +755,20 @@ mod tests {
             "plan crossed mem threshold into file spool"
         );
         let mut rd = plan.replay().unwrap();
-        let mut rows = 0usize;
+        let mut rows = 0u64;
         while let Some(item) = rd.next_item().unwrap() {
-            // No controls planned, every heap routed
-            assert!(
-                matches!(item, PlanItem::Heap(h) if rd.tables[h.table as usize].route.is_some())
+            // No controls planned, every row routed
+            let PlanItem::Segment(s) = item else {
+                panic!("segments only");
+            };
+            assert_eq!(
+                s.rows,
+                s.chunks.iter().map(|c| c.rows() as u64).sum::<u64>()
             );
-            rows += 1;
+            rows += s.rows;
         }
         drop(rd);
-        assert_eq!(rows, ROWS);
+        assert_eq!(rows, ROWS as u64);
     }
 
     /// Mirror-row refs and fences survive multi-batch planning re-based to
@@ -690,7 +821,13 @@ mod tests {
             unmapped: Vec::new(),
         };
         let resolver = ToastResolver::disabled();
-        let mut planner = Planner::create(tmp.path().join("1.plan"), 1 << 20, &mut view, &resolver);
+        let mut planner = planner(
+            tmp.path().join("1.plan"),
+            1 << 20,
+            usize::MAX,
+            &mut view,
+            &resolver,
+        );
         let mut drain = b
             .drain_committed(StashResolved::nothing_stashed(1), 42, 0x2000, &[], true)
             .await
@@ -706,16 +843,20 @@ mod tests {
         let plan = planner.seal(0x2000, 42).unwrap();
         let total_rows: usize = plan.row_batches.iter().map(|rb| rb.len()).sum();
         assert_eq!(total_rows, 2, "both chunk births carried");
-        assert_eq!(plan.heap_count, 3, "2 inserts + truncate");
-        assert_eq!(plan.controls.len(), 1);
+        assert_eq!(plan.routed_count(), 3, "2 inserts + truncate");
+        let mut rd = plan.replay().unwrap();
+        let mut fences = Vec::new();
+        while let Some(item) = rd.next_item().unwrap() {
+            match item {
+                PlanItem::Control { row_idx, .. } => fences.push(("event", row_idx)),
+                PlanItem::Truncate { upto, .. } => fences.push(("truncate", upto)),
+                PlanItem::Segment(_) => {}
+            }
+        }
         assert_eq!(
-            plan.controls[0].row_idx, 2,
-            "event fence re-based to plan-global rows"
-        );
-        assert_eq!(
-            plan.truncate_rows,
-            vec![2],
-            "truncate fence re-based to plan-global rows"
+            fences,
+            [("event", 2), ("truncate", 2)],
+            "fences re-based to plan-global rows"
         );
     }
 
@@ -745,7 +886,7 @@ mod tests {
             };
             let resolver = ToastResolver::disabled();
             let path = tmp.path().join("1.plan");
-            let mut planner = Planner::create(path.clone(), 1 << 20, &mut view, &resolver);
+            let mut planner = planner(path.clone(), 1 << 20, usize::MAX, &mut view, &resolver);
             let mut drain = b
                 .drain_committed(StashResolved::nothing_stashed(1), 42, 0x2000, &[], false)
                 .await
@@ -767,7 +908,7 @@ mod tests {
             } else {
                 res.unwrap();
                 let plan = planner.seal(0x2000, 42).unwrap();
-                assert_eq!(plan.heap_count, 0, "unmapped partial heap is discarded");
+                assert_eq!(plan.routed_rows, 0, "unmapped partial heap is discarded");
                 assert_eq!(plan.tables[0].heaps, 1);
             }
         }
@@ -800,7 +941,13 @@ mod tests {
             unmapped: Vec::new(),
         };
         let resolver = ToastResolver::disabled();
-        let mut planner = Planner::create(tmp.path().join("1.plan"), 1 << 20, &mut view, &resolver);
+        let mut planner = planner(
+            tmp.path().join("1.plan"),
+            1 << 20,
+            usize::MAX,
+            &mut view,
+            &resolver,
+        );
         let mut drain = b
             .drain_committed(StashResolved::nothing_stashed(1), 42, 0x2000, &[], false)
             .await
@@ -811,7 +958,7 @@ mod tests {
         drain.finish().await.unwrap();
         let plan = planner.seal(0x2000, 42).unwrap();
         assert_eq!(
-            plan.heap_count, 0,
+            plan.routed_rows, 0,
             "unmapped heap is counted without being stored"
         );
         assert_eq!(plan.tables[0].heaps, 1);
@@ -855,13 +1002,13 @@ mod tests {
         dir: &std::path::Path,
     ) -> Vec<ColumnValue> {
         let mut view = MapView {
-            routes: HashMap::from_iter([(rel.rel_name.clone(), route())]),
+            routes: HashMap::from_iter([(rel.rel_name.clone(), text_route())]),
             dropped: HashSet::new(),
             applied: Vec::new(),
             unmapped: Vec::new(),
         };
         let path = dir.join(format!("{xid}.plan"));
-        let mut planner = Planner::create(path, 1 << 20, &mut view, resolver);
+        let mut planner = planner(path, 1 << 20, usize::MAX, &mut view, resolver);
         let commit = u64::from(xid) << 12 | 0x100;
         let stash = StashResolved::nothing_stashed(xid);
         let mut drain = b
@@ -880,10 +1027,27 @@ mod tests {
         let mut rd = plan.replay().unwrap();
         let mut out = Vec::new();
         while let Some(item) = rd.next_item().unwrap() {
-            if let PlanItem::Heap(h) = item {
-                let d = h.decoded;
-                let t = d.new.or(d.old).expect("row image");
-                out.push(t.columns[0].clone().expect("column"));
+            let PlanItem::Segment(s) = item else { continue };
+            for c in &s.chunks {
+                let crate::emit::ch_emitter::Wire::NullableString {
+                    offsets,
+                    data,
+                    null_map,
+                    ..
+                } = c.buffers[0].wire()
+                else {
+                    panic!("text column");
+                };
+                let mut start = 0;
+                for (end, null) in offsets.iter().zip(null_map) {
+                    let body = &data[start..*end as usize];
+                    start = *end as usize;
+                    out.push(if *null == 1 {
+                        ColumnValue::Null
+                    } else {
+                        ColumnValue::Text(String::from_utf8(body.to_vec()).unwrap())
+                    });
+                }
             }
         }
         out

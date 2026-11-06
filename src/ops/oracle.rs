@@ -174,6 +174,92 @@ impl OracleColumnBuf {
     pub fn approx_size(&self) -> usize {
         self.wire_bytes
     }
+
+    /// Request bytes this column adds: none while it resolves locally,
+    /// every cell once one needs conversion
+    pub fn request_bytes(&self) -> usize {
+        if self.remote_cells == 0 {
+            0
+        } else {
+            self.wire_bytes
+        }
+    }
+
+    /// Request bytes once `other`'s cells follow these
+    pub fn request_bytes_with(&self, other: &Self) -> usize {
+        if self.remote_cells + other.remote_cells == 0 {
+            0
+        } else {
+            self.wire_bytes + other.wire_bytes
+        }
+    }
+
+    /// Same source type and target, so cells of both share one request column
+    pub fn same_column(&self, other: &Self) -> bool {
+        (
+            self.source_type_oid,
+            self.source_typmod,
+            self.string_target,
+            self.nullable_target,
+        ) == (
+            other.source_type_oid,
+            other.source_typmod,
+            other.string_target,
+            other.nullable_target,
+        )
+    }
+
+    /// Append `other`'s cells, which must target the same column
+    pub fn append(&mut self, other: Self) {
+        self.cells.reserve(other.cells.len());
+        for cell in other.cells {
+            self.push(cell);
+        }
+    }
+
+    pub(crate) fn encode_into(&self, out: &mut Vec<u8>) {
+        use crate::xact::spill::{push_bytes, push_i32, push_u8, push_u32};
+        push_u32(out, self.source_type_oid);
+        push_i32(out, self.source_typmod);
+        push_u8(out, u8::from(self.string_target));
+        push_u8(out, u8::from(self.nullable_target));
+        push_u32(out, self.cells.len() as u32);
+        for cell in &self.cells {
+            let (tag, body) = match cell {
+                OracleCell::Default => (0, &[][..]),
+                OracleCell::DiskRaw(b) => (1, &b[..]),
+                OracleCell::TextInput(b) => (2, &b[..]),
+                OracleCell::Literal(b) => (3, &b[..]),
+            };
+            push_u8(out, tag);
+            if tag != 0 {
+                push_bytes(out, body);
+            }
+        }
+    }
+
+    pub(crate) fn decode(
+        c: &mut crate::xact::spill::Cursor<'_>,
+    ) -> Result<Self, crate::xact::spill::SpillError> {
+        let mut buf = Self::with_target(c.u32()?, c.i32()?, c.u8()? != 0, c.u8()? != 0);
+        let n = c.u32()? as usize;
+        buf.cells.reserve(n.min(1 << 20));
+        for _ in 0..n {
+            buf.push(match c.u8()? {
+                0 => OracleCell::Default,
+                1 => OracleCell::DiskRaw(c.bytes()?),
+                2 => OracleCell::TextInput(c.bytes()?),
+                3 => OracleCell::Literal(c.bytes()?),
+                tag => {
+                    return Err(crate::xact::spill::SpillError::Format {
+                        offset: 0,
+                        detail: format!("unknown oracle cell tag {tag}"),
+                    });
+                }
+            });
+        }
+        Ok(buf)
+    }
 }
 
 pub struct OracleRequestColumn<'a> {
