@@ -1,19 +1,9 @@
-//! Greenfield Direct bootstrap must not abort on a source extension that is
-//! irrelevant to type translation and absent from the bootstrap oracle's host.
+//! Allow greenfield direct bootstrap when an unused source extension is absent
+//! from bootstrap oracle's host
 //!
-//! `pg_dump --binary-upgrade` recreates every source extension's members
-//! inline, including C functions that load `$libdir/<ext>`. The throwaway
-//! bootstrap oracle runs on walshadow's own host, where such an extension's
-//! `.so` need not exist — applying the dump then dies with
-//! `could not access file "<ext>"` and takes the whole bootstrap with it, even
-//! when no mapped column uses the extension's types.
-//!
-//! Repro without a second machine: give the SOURCE a private extension via
-//! `extension_control_path` + `dynamic_library_path` (PG18+), so it lives in a
-//! temp dir the oracle's default paths never see. An enum column forces the
-//! oracle to be provisioned; the extension itself is unused. On the buggy tree
-//! the bootstrap aborts and the row never reaches ClickHouse; the fix drops the
-//! unavailable extension from the dump and the row lands.
+//! Use `extension_control_path` and `dynamic_library_path` (PG18+) to make an
+//! extension available only on source. Use an enum column to require oracle
+//! setup. Leave extension unused so bootstrap never needs to load its library
 
 #![cfg(target_os = "linux")]
 
@@ -158,8 +148,7 @@ async fn bootstrap_survives_extension_absent_from_oracle() {
     source.write_base_conf().expect("source base conf");
     fx::append_source_conf(&source).expect("append source conf");
     {
-        // Only the source sees `stub`; the daemon's bootstrap oracle uses
-        // default paths, so it is absent from the oracle's pg_available_extensions.
+        // Keep `stub` outside bootstrap oracle's default extension and library paths
         let conf = source.config().data_dir.join("postgresql.conf");
         let mut f = fs::OpenOptions::new().append(true).open(&conf).unwrap();
         writeln!(

@@ -13,7 +13,6 @@ use std::fs;
 use walrus::pg::backup::format_pg_lsn;
 use walrus::pg::replication::base_backup::BaseBackupOpts;
 use walrus::pg::replication::conn::PgConfig;
-use walrus::pg::replication::tls::SslMode;
 use walrus::time::Timestamp;
 use walshadow::backfill::visibility_gate::{
     DeferredLane, GateStats, GreenfieldSink, PendingGate, resolve_greenfield, stream_phase,
@@ -343,28 +342,14 @@ pub(crate) async fn run_bootstrap(
         ahash::HashSet::default()
     };
 
-    // Off the backup window: provisioning is an initdb + pg_dump + apply +
-    // restart, and doing it after `BASE_BACKUP` opens parks a live backup
-    // through all of it — in object-store mode against walrus's 60 s request
-    // cap
+    // Set up oracle before opening BASE_BACKUP to avoid holding backup open
+    // during initdb, startup and catalog copy. Walrus caps object-store requests at 60 s
     let bootstrap_oracle = if needs_oracle {
-        let source_conninfo = format!(
-            "host={} port={} user={} dbname={} sslmode={}",
-            src_cfg.host,
-            src_cfg.port,
-            src_cfg.user,
-            src_cfg.database,
-            if src_cfg.sslmode == SslMode::Disable {
-                "disable"
-            } else {
-                "prefer"
-            },
-        );
         Some(
             walshadow::backfill::bootstrap_oracle::BootstrapOracle::provision(
                 args.spill_dir.join("bootstrap_oracle"),
-                source_conninfo,
-                src_cfg.password.clone(),
+                sql_client,
+                &walshadow::backfill::bootstrap_oracle::mapped_types(&drain_catalog, &routes),
                 args.bridge_lib_dir.clone(),
                 bridge_workers,
                 Duration::from_secs(args.shadow_connect_timeout),
