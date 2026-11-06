@@ -39,6 +39,7 @@ writes. A documented limitation does not imply code rejects it
 | [Multi-database loads and metrics](multi_database.md) | Extend heap-page bootstrap and backup loads beyond primary database, attribute metrics |
 | [Fuzzing](fuzzing.md) | Find parser and schema-transition interactions beyond fixed regressions |
 | [Performance](performance.md) | Establish healthy sustained WAL baseline with exact reconciliation before tuning |
+| [Direct Native encoding](native_encoding.md) | Build on `more-types`: retain compact PG inputs, transcode into column chunks, compress sealed output |
 | [Failover](failover.md) | Fence unplanned promotion and prove remaining archive/restart fault cases |
 | [Shadow TOAST reclamation](shadow_toast.md) | Keep historical values readable under lag and restart |
 | [Replay callback](custom_rmgr.md) | Reduce measured command-boundary capture stalls |
