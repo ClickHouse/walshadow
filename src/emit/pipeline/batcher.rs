@@ -238,17 +238,28 @@ impl BatchMeta {
     }
 }
 
-/// One independently-durable INSERT's worth of rows. `buffers` are owned
-/// column slabs an inserter rebuilds a `BlockBuilder` over; `per_seq` tags
-/// which xacts' rows it carries for ack accounting.
+/// Rows per Native block; an INSERT carries several under its own limits
+pub(crate) const NATIVE_BLOCK_ROWS: usize = 1 << 20;
+/// Uncompressed column bytes per Native block
+pub(crate) const NATIVE_BLOCK_BYTES: usize = 16 << 20;
+
+/// Owned column slabs of one Native block
+pub(crate) struct BlockSlabs {
+    pub(crate) buffers: Vec<ColumnBuf>,
+    pub(crate) n_rows: usize,
+}
+
+/// One independently-durable INSERT's worth of rows in one or more blocks;
+/// `per_seq` tags which xacts' rows it carries for ack accounting.
 pub(crate) struct InsertBatch {
     pub(crate) meta: Arc<BatchMeta>,
-    pub(crate) buffers: Vec<ColumnBuf>,
+    pub(crate) blocks: Vec<BlockSlabs>,
     pub(crate) n_rows: usize,
     pub(crate) per_seq: Vec<(u64, u64)>,
     /// Admission permit shares covering these rows, dropped post-insert-ack
-    _permits: Vec<Arc<crate::budget::MemoryPermit>>,
-    _encoded: crate::budget::MemoryPermit,
+    pub(crate) permits: Vec<Arc<crate::budget::MemoryPermit>>,
+    /// Output bytes held, shrunk once blocks compress
+    pub(crate) encoded: crate::budget::MemoryPermit,
 }
 
 /// Rows and `FlushAll` share one FIFO channel so a barrier's flush can never
@@ -278,13 +289,40 @@ pub struct BatcherConfig {
 }
 
 struct Table {
+    /// Open block
     enc: TableEncoder,
+    /// Blocks sealed into the open INSERT
+    sealed: Vec<BlockSlabs>,
+    sealed_rows: usize,
+    sealed_bytes: usize,
     allocated_bytes: usize,
     meta: Arc<BatchMeta>,
     seq_counts: Vec<(u64, u64)>,
     slice_permits: Vec<Arc<crate::budget::MemoryPermit>>,
     value_permits: Vec<Arc<crate::budget::MemoryPermit>>,
     deadline: Option<Instant>,
+}
+
+impl Table {
+    /// Rows in the open INSERT
+    fn rows(&self) -> usize {
+        self.sealed_rows + self.enc.rows
+    }
+
+    /// Close the open block into the open INSERT
+    fn seal_block(&mut self) -> Result<(), String> {
+        if self.enc.rows == 0 {
+            return Ok(());
+        }
+        let (buffers, n_rows) = self.enc.take_block().map_err(|e| e.to_string())?;
+        self.sealed_rows += n_rows;
+        self.sealed_bytes += buffers
+            .iter()
+            .map(ColumnBuf::allocated_bytes)
+            .sum::<usize>();
+        self.sealed.push(BlockSlabs { buffers, n_rows });
+        Ok(())
+    }
 }
 
 #[derive(Default)]
@@ -307,6 +345,9 @@ impl Tables {
         let (enc, meta) = table_encoder(ctx, e.key().clone(), t)?;
         self.open.push(Table {
             enc,
+            sealed: Vec::new(),
+            sealed_rows: 0,
+            sealed_bytes: 0,
             allocated_bytes: 0,
             meta,
             seq_counts: Vec::new(),
@@ -514,7 +555,7 @@ async fn handle_row(
         .append_routed(&row.committed, &route.mapping, op, leaf)
         .map_err(|e| e.to_string())?;
     if append == Append::Full {
-        emit_batch(t, ctx.out, ctx.stats).await?;
+        t.seal_block()?;
         t.enc
             .append_routed(&row.committed, &route.mapping, op, leaf)
             .map_err(|e| e.to_string())?;
@@ -556,7 +597,7 @@ async fn handle_segment(
             .map_err(|e| e.to_string())?
             == Append::Full
         {
-            emit_batch(t, ctx.out, ctx.stats).await?;
+            t.seal_block()?;
             t.enc
                 .append_block(&mut chunk.buffers, rows)
                 .map_err(|e| e.to_string())?;
@@ -601,18 +642,21 @@ async fn appended(
     if t.deadline.is_none() {
         t.deadline = Some(Instant::now() + ctx.cfg.flush_timeout);
     }
-    let bytes = t
-        .enc
-        .buffers
-        .iter()
-        .map(ColumnBuf::allocated_bytes)
-        .sum::<usize>();
+    if t.enc.rows >= NATIVE_BLOCK_ROWS || t.enc.approx_bytes >= NATIVE_BLOCK_BYTES {
+        t.seal_block()?;
+    }
+    let bytes = t.sealed_bytes
+        + t.enc
+            .buffers
+            .iter()
+            .map(ColumnBuf::allocated_bytes)
+            .sum::<usize>();
     ctx.out
         .partial_bytes
         .fetch_add(bytes - t.allocated_bytes, Ordering::Relaxed);
     t.allocated_bytes = bytes;
     let batch_limit = ctx.cfg.byte_budget.min(ctx.out.batch_limit);
-    if t.enc.rows >= ctx.cfg.row_budget || bytes >= batch_limit {
+    if t.rows() >= ctx.cfg.row_budget || bytes >= batch_limit {
         emit_batch(t, ctx.out, ctx.stats).await?;
     }
     if ctx.out.partial_bytes.load(Ordering::Relaxed)
@@ -632,8 +676,13 @@ async fn appended(
 async fn emit_batch(t: &mut Table, out: &BatchOutput, stats: &EmitterStats) -> Result<(), String> {
     out.partial_bytes
         .fetch_sub(std::mem::take(&mut t.allocated_bytes), Ordering::Relaxed);
-    let (buffers, n_rows) = t.enc.take_block().map_err(|e| e.to_string())?;
+    t.seal_block()?;
     t.deadline = None;
+    let blocks = std::mem::take(&mut t.sealed);
+    let (n_rows, bytes) = (
+        std::mem::take(&mut t.sealed_rows),
+        std::mem::take(&mut t.sealed_bytes),
+    );
     if n_rows == 0 {
         t.seq_counts.clear();
         t.slice_permits.clear();
@@ -643,16 +692,15 @@ async fn emit_batch(t: &mut Table, out: &BatchOutput, stats: &EmitterStats) -> R
     let per_seq = std::mem::take(&mut t.seq_counts);
     let mut permits = std::mem::take(&mut t.slice_permits);
     permits.append(&mut t.value_permits);
-    let bytes = buffers.iter().map(ColumnBuf::allocated_bytes).sum();
     // Separate pool avoids waiting on decoded payload held by this batch
     let encoded = out.budget.acquire(bytes).await;
     let batch = InsertBatch {
         meta: t.meta.clone(),
-        buffers,
+        blocks,
         n_rows,
         per_seq,
-        _permits: permits,
-        _encoded: encoded,
+        permits,
+        encoded,
     };
     out.sender
         .send(batch)
@@ -689,7 +737,7 @@ async fn flush_all(
     stats: &EmitterStats,
 ) -> Result<(), String> {
     for t in &mut tables.open {
-        if t.enc.rows > 0 {
+        if t.rows() > 0 {
             emit_batch(t, out, stats).await?;
         }
     }
@@ -1314,7 +1362,7 @@ mod tests {
             tx.send(one(rel, route, r)).await.unwrap();
         }
         let first = rx.recv().await.unwrap();
-        assert!(first._encoded.bytes() >= 64 << 10);
+        assert!(first.encoded.bytes() >= 64 << 10);
         assert!(
             tokio::time::timeout(Duration::from_millis(20), rx.recv())
                 .await
@@ -1403,7 +1451,8 @@ mod tests {
             assert_eq!(b.n_rows, 4);
             assert_eq!(b.per_seq, [(0, 2), (1, 1), (2, 1)]);
             wires.push(
-                b.buffers
+                b.blocks[0]
+                    .buffers
                     .iter()
                     .map(|c| format!("{:?}", c.wire()))
                     .collect::<Vec<_>>(),
@@ -1415,9 +1464,9 @@ mod tests {
     }
 
     /// Chunk that would push oracle cells past the seal threshold opens the
-    /// next batch whole
+    /// next block of the same INSERT
     #[tokio::test]
-    async fn oracle_seal_moves_chunk_to_next_batch() {
+    async fn oracle_seal_moves_chunk_to_next_block() {
         let (tx, rx, fatal, handle) =
             spawn_deadline_batcher(partial_block_cfg(Duration::from_secs(60)), None);
         let big = "x".repeat(crate::ops::oracle::ORACLE_BATCH_SEAL_BYTES * 3 / 5);
@@ -1428,17 +1477,21 @@ mod tests {
                 .unwrap();
         }
         drop(tx);
-        let per_seq: Vec<_> = [rx.recv().await.unwrap(), rx.recv().await.unwrap()]
-            .map(|b| b.per_seq)
-            .into();
-        assert_eq!(per_seq, [vec![(0, 1)], vec![(1, 1)]]);
+        let b = rx.recv().await.unwrap();
+        assert!(rx.recv().await.is_err(), "one INSERT");
+        assert_eq!(b.per_seq, [(0, 1), (1, 1)]);
+        assert_eq!(
+            b.blocks.iter().map(|b| b.n_rows).collect::<Vec<_>>(),
+            [1, 1]
+        );
         handle.await.unwrap();
         assert!(!fatal.is_set());
     }
 
-    /// Row that would push oracle cells past the seal threshold opens the next batch
+    /// Row that would push oracle cells past the seal threshold opens the
+    /// next block of the same INSERT
     #[tokio::test]
-    async fn oracle_seal_moves_row_to_next_batch() {
+    async fn oracle_seal_moves_row_to_next_block() {
         let (tx, rx, fatal, handle) =
             spawn_deadline_batcher(partial_block_cfg(Duration::from_secs(60)), None);
         let big = "x".repeat(crate::ops::oracle::ORACLE_BATCH_SEAL_BYTES * 3 / 5);
@@ -1450,10 +1503,13 @@ mod tests {
             tx.send(one(rel, route, r)).await.unwrap();
         }
         drop(tx);
-        let per_seq: Vec<_> = [rx.recv().await.unwrap(), rx.recv().await.unwrap()]
-            .map(|b| b.per_seq)
-            .into();
-        assert_eq!(per_seq, [vec![(0, 1)], vec![(1, 1)]]);
+        let b = rx.recv().await.unwrap();
+        assert!(rx.recv().await.is_err(), "one INSERT");
+        assert_eq!(b.per_seq, [(0, 1), (1, 1)]);
+        assert_eq!(
+            b.blocks.iter().map(|b| b.n_rows).collect::<Vec<_>>(),
+            [1, 1]
+        );
         handle.await.unwrap();
         assert!(!fatal.is_set());
     }

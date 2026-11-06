@@ -316,6 +316,7 @@ pub async fn spawn_with_config(
         resolver::ResolverOptions {
             oracle,
             retry: emitter.retry.clone(),
+            codec: emitter.conn.compression,
             stats: stats.clone(),
             fatal: fatal.clone(),
             config_rx: config_rx.clone(),

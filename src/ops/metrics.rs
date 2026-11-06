@@ -430,7 +430,13 @@ snapshot! {
     counter inserter_ch_seconds_total: f64 =
         "Cumulative inserter time inside the ClickHouse INSERT round trip. Against inserter_pool_size x uptime this is CH-side utilization.",
     counter inserter_encode_seconds_total: f64 =
-        "Cumulative inserter time rebuilding the Native block over a batch's owned slabs.",
+        "Cumulative inserter time decompressing and decoding sealed blocks to send them.",
+    counter resident_seal_seconds_total: f64 =
+        "Cumulative resolver time serializing and compressing sealed Native blocks.",
+    counter resident_raw_bytes_total: u64 =
+        "Serialized Native block bytes sealed for insertion, before resident compression.",
+    counter resident_stored_bytes_total: u64 =
+        "Bytes those sealed blocks held while awaiting insertion; raw over stored is the resident compression ratio.",
     counter oracle_resolve_seconds_total: f64 =
         "Cumulative resolver time inside the oracle round trip. Overlaps inserter_ch_seconds_total, so the larger of the two is the tail's limiter.",
     counter process_cpu_seconds_total: f64 =

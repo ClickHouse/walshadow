@@ -339,6 +339,14 @@ sealed batch can hold one additional batch. A single oversized row may exceed
 these limits. Oracle responses and native client buffers remain additional costs
 
 Sealed-buffer permits stay held through resolution, retries and insert completion.
+After resolution each Native block is serialized once and compressed with
+`[ch] compression`, and its permit shrinks to compressed bytes; blocks that do
+not shrink stay uncompressed. Each inserter decompresses one block at a time to
+send it, so one block of scratch per inserter adds to these limits. An INSERT
+carries several blocks, sealed at 1,048,576 rows or 16 MiB of column bytes and
+when oracle request size fills, while batch limits still bound each INSERT.
+`walshadow_resident_raw_bytes_total` over `walshadow_resident_stored_bytes_total`
+reports achieved compression
 This pool is separate from decoded-payload admission to avoid circular waits.
 Live byte-budget reductions lower flush thresholds; increasing sealed-buffer
 capacity requires restarting walshadow
