@@ -24,8 +24,12 @@ use walshadow::spool::DeferredSpool;
 use walshadow::toast::ToastResolver;
 use walshadow::xact_buffer::{DrainEntry, DrainedBatch, OrderedEvent};
 
+#[path = "common/alloc_meter.rs"]
+mod alloc_meter;
+
 #[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+static GLOBAL: alloc_meter::Metered<mimalloc::MiMalloc> =
+    alloc_meter::Metered::new(mimalloc::MiMalloc);
 
 #[derive(Debug, Parser)]
 struct Args {
@@ -91,6 +95,7 @@ async fn deferred(args: &Args, repeat: usize) -> anyhow::Result<()> {
     let dir = tempfile::tempdir_in(&args.dir)?;
     let payload = "x".repeat(args.payload_bytes);
     let mut spool = DeferredSpool::new(dir.path().join("deferred.spool"), 1 << 20);
+    let base = GLOBAL.reset_peak();
     let start = Instant::now();
     for i in 0..args.rows {
         spool
@@ -113,17 +118,25 @@ async fn deferred(args: &Args, repeat: usize) -> anyhow::Result<()> {
     let bytes = spool.spooled_bytes();
     let mut reader = spool.into_reader().await?;
     let write = start.elapsed();
+    let spooled = GLOBAL.snapshot().since(base);
+    let base = GLOBAL.reset_peak();
     let start = Instant::now();
     let mut n = 0;
     while let Some(t) = reader.next().await? {
         assert_eq!(t.xid, n as u32);
-        assert!(matches!(&t.columns[1], Some(ColumnValue::Text(s)) if s.len() == payload.len()));
+        assert!(matches!(
+            t.columns.as_slice(),
+            [Some(ColumnValue::Int4(v)), Some(ColumnValue::Text(s))]
+                if *v == n as i32 && *s == payload
+        ));
         n += 1;
     }
     reader.finish().await?;
     let read = start.elapsed();
+    let replayed = GLOBAL.snapshot().since(base);
     assert_eq!(n, args.rows);
     report("deferred", repeat, n, bytes, write, read);
+    println!("deferred_alloc repeat={repeat} spool {spooled} replay {replayed}");
     Ok(())
 }
 
@@ -226,6 +239,7 @@ async fn plan(args: &Args, repeat: usize) -> anyhow::Result<()> {
         calls: 0,
     };
     let resolver = ToastResolver::disabled();
+    let base = GLOBAL.reset_peak();
     let start = Instant::now();
     let sealed = if args.planner {
         let mut planner = Planner::create(
@@ -274,12 +288,14 @@ async fn plan(args: &Args, repeat: usize) -> anyhow::Result<()> {
         writer.seal(u64::MAX, 0)?
     };
     let write = start.elapsed();
+    let planned = GLOBAL.snapshot().since(base);
     let (size_bytes, spilled) = (sealed.size_bytes, sealed.path().is_some());
     let stats = EmitterStats::default();
     let mut staged = Vec::new();
     let mut pending = Vec::with_capacity(4096);
     let mut routed = 0;
     let mut controls = 0;
+    let base = GLOBAL.reset_peak();
     let start = Instant::now();
     let mut rd = sealed.replay()?;
     let mut n = 0;
@@ -290,6 +306,12 @@ async fn plan(args: &Args, repeat: usize) -> anyhow::Result<()> {
                 assert_eq!(h.decoded.source_lsn, n as u64);
                 assert_eq!(h.decoded.rfn, descriptors[n % descriptors.len()].rfn);
                 assert_eq!(h.decoded.xid, 7 + (n % 4) as u32);
+                let columns = &h.decoded.new.as_ref().expect("insert image").columns;
+                assert!(matches!(
+                    columns.as_slice(),
+                    [Some(ColumnValue::Int4(v)), Some(ColumnValue::Text(s))]
+                        if *v == n as i32 && *s == payload
+                ));
                 n += 1;
                 if args.planner {
                     pending.push(h);
@@ -332,6 +354,7 @@ async fn plan(args: &Args, repeat: usize) -> anyhow::Result<()> {
         assert_eq!(routed, if args.mapped { args.rows as u64 } else { 0 });
     }
     let replay = start.elapsed();
+    let replayed = GLOBAL.snapshot().since(base);
     assert_eq!(n, if args.mapped { args.rows } else { 0 });
     assert_eq!(
         controls,
@@ -361,7 +384,7 @@ async fn plan(args: &Args, repeat: usize) -> anyhow::Result<()> {
         + (args.rows % interval).min(descriptors.len());
     assert_eq!(view.calls, expected_calls);
     println!(
-        "plan_total repeat={repeat} total_s={:.6} route_calls={} tables={} routed={routed} spilled={}",
+        "plan_total repeat={repeat} total_s={:.6} route_calls={} tables={} routed={routed} spilled={} plan {planned} replay {replayed}",
         (write + replay).as_secs_f64(),
         view.calls,
         rd.tables.len(),
