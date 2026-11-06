@@ -171,6 +171,43 @@ struct OpenTable {
     enc: TableEncoder,
 }
 
+/// Empty encoders kept across plans, so a route compiles its table plan
+/// once rather than per transaction. One per relation name: a new
+/// descriptor or route version replaces the old
+#[derive(Default)]
+pub struct EncoderCache {
+    entries: Vec<CachedEncoder>,
+}
+
+struct CachedEncoder {
+    rel: Arc<RelDescriptor>,
+    route: Arc<RouteSnapshot>,
+    enc: TableEncoder,
+}
+
+impl EncoderCache {
+    fn take(
+        &mut self,
+        rel: &Arc<RelDescriptor>,
+        route: &Arc<RouteSnapshot>,
+    ) -> Option<TableEncoder> {
+        let i = self
+            .entries
+            .iter()
+            .position(|e| Arc::ptr_eq(&e.rel, rel) && Arc::ptr_eq(&e.route, route))?;
+        Some(self.entries.swap_remove(i).enc)
+    }
+
+    fn put(&mut self, rel: Arc<RelDescriptor>, route: Arc<RouteSnapshot>, enc: TableEncoder) {
+        self.entries.retain(|e| e.rel.rel_name != rel.rel_name);
+        self.entries.push(CachedEncoder { rel, route, enc });
+    }
+
+    pub fn clear(&mut self) {
+        self.entries.clear();
+    }
+}
+
 /// Streams one transaction's validated rows into column chunks, in memory
 /// or on disk, while accumulating the bounded plan header. Dropped unsealed
 /// (any planning error), the file unlinks and nothing replays
@@ -192,6 +229,7 @@ pub struct PlanWriter {
     /// second live table appears, so single-relation plans never hash
     table_ids: Option<HashMap<(usize, u64), u32>>,
     open: Vec<OpenTable>,
+    encoders: EncoderCache,
     /// Chunks of the open segment sealed early at an oracle frame limit
     sealed: Vec<(u32, EncodedChunk)>,
     commit_ts: i64,
@@ -221,6 +259,7 @@ impl PlanWriter {
             last_table: 0,
             table_ids: None,
             open: Vec::new(),
+            encoders: EncoderCache::default(),
             sealed: Vec::new(),
             commit_ts: 0,
             open_rows: 0,
@@ -244,6 +283,12 @@ impl PlanWriter {
     /// Commit timestamp stamped on every planned row
     pub fn for_commit(mut self, commit_ts: i64) -> Self {
         self.commit_ts = commit_ts;
+        self
+    }
+
+    /// Reuse encoders an earlier plan returned through [`Self::seal_keeping`]
+    pub fn with_encoders(mut self, encoders: EncoderCache) -> Self {
+        self.encoders = encoders;
         self
     }
 
@@ -383,11 +428,13 @@ impl PlanWriter {
             None => {
                 let t = &self.tables[table as usize];
                 let route = t.route.as_ref().expect("routed table");
-                let plan = TablePlan::for_route(self.alloc, &t.descriptor, route)?;
-                self.open.push(OpenTable {
-                    table,
-                    enc: TableEncoder::new(plan)?,
-                });
+                let enc = match self.encoders.take(&t.descriptor, route) {
+                    Some(enc) => enc,
+                    None => {
+                        TableEncoder::new(TablePlan::for_route(self.alloc, &t.descriptor, route)?)?
+                    }
+                };
+                self.open.push(OpenTable { table, enc });
                 self.open.len() - 1
             }
         };
@@ -542,8 +589,24 @@ impl PlanWriter {
     }
 
     /// Flush spool file and finalize plan metadata
-    pub fn seal(mut self, commit_lsn: u64, commit_ts: i64) -> Result<SealedPlan> {
+    pub fn seal(self, commit_lsn: u64, commit_ts: i64) -> Result<SealedPlan> {
+        self.seal_keeping(commit_lsn, commit_ts)
+            .map(|(plan, _)| plan)
+    }
+
+    /// [`Self::seal`], returning emptied encoders for the next plan
+    pub fn seal_keeping(
+        mut self,
+        commit_lsn: u64,
+        commit_ts: i64,
+    ) -> Result<(SealedPlan, EncoderCache)> {
         self.seal_segment()?;
+        let mut encoders = std::mem::take(&mut self.encoders);
+        for o in self.open.drain(..) {
+            let t = &self.tables[o.table as usize];
+            let route = t.route.clone().expect("routed table");
+            encoders.put(t.descriptor.clone(), route, o.enc);
+        }
         let file = match self.file.take() {
             None => None,
             Some((mut out, file)) => {
@@ -551,7 +614,7 @@ impl PlanWriter {
                 Some(file)
             }
         };
-        Ok(SealedPlan {
+        let plan = SealedPlan {
             file,
             steps: self.steps,
             tables: self.tables,
@@ -561,7 +624,8 @@ impl PlanWriter {
             size_bytes: self.bytes,
             commit_lsn,
             commit_ts,
-        })
+        };
+        Ok((plan, encoders))
     }
 }
 
@@ -1125,6 +1189,39 @@ mod tests {
             seen.extend(rows(&s.chunks).into_iter().map(|r| r.0.unwrap()));
         }
         assert_eq!(seen, (0..64).collect::<Vec<_>>());
+    }
+
+    /// Sealing returns emptied encoders that serve the next plan under the
+    /// same route; another route version compiles its own
+    #[test]
+    fn encoders_carry_across_plans() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (d, r) = (descriptor(16500), route());
+        let mut encoders = EncoderCache::default();
+        let routes = [r.clone(), r, route()];
+        for (i, route) in routes.into_iter().enumerate() {
+            let mut w = PlanWriter::create(tmp.path().join(format!("{i}.plan")), 1 << 20, 1 << 20)
+                .with_encoders(encoders);
+            let cached = w.encoders.entries.len();
+            push(
+                &mut w,
+                &d,
+                heap(&d, 100 + i as u64, i as i32),
+                Some(route.clone()),
+            )
+            .unwrap();
+            let reused = cached - w.encoders.entries.len();
+            assert_eq!((cached, reused), [(0, 0), (1, 1), (1, 0)][i]);
+            let plan;
+            (plan, encoders) = w.seal_keeping(0x2000, 42).unwrap();
+            assert_eq!(encoders.entries.len(), 1);
+            assert!(Arc::ptr_eq(&encoders.entries[0].route, &route));
+            let mut rd = plan.replay().unwrap();
+            let Some(PlanItem::Segment(s)) = rd.next_item().unwrap() else {
+                panic!("one segment");
+            };
+            assert_eq!(rows(&s.chunks), [(Some(i as i32), 100 + i as u64, 7, 0)]);
+        }
     }
 
     /// Oracle cells and strings survive the spool byte-identical
