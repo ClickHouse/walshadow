@@ -1,19 +1,9 @@
-//! Greenfield Direct bootstrap must not abort on a source extension that is
-//! irrelevant to type translation and absent from the bootstrap oracle's host.
+//! Allow greenfield direct bootstrap when an unused source extension is absent
+//! from bootstrap oracle's host
 //!
-//! `pg_dump --binary-upgrade` recreates every source extension's members
-//! inline, including C functions that load `$libdir/<ext>`. The throwaway
-//! bootstrap oracle runs on walshadow's own host, where such an extension's
-//! `.so` need not exist — applying the dump then dies with
-//! `could not access file "<ext>"` and takes the whole bootstrap with it, even
-//! when no mapped column uses the extension's types.
-//!
-//! Repro without a second machine: give the SOURCE a private extension via
-//! `extension_control_path` + `dynamic_library_path` (PG18+), so it lives in a
-//! temp dir the oracle's default paths never see. An enum column forces the
-//! oracle to be provisioned; the extension itself is unused. On the buggy tree
-//! the bootstrap aborts and the row never reaches ClickHouse; the fix drops the
-//! unavailable extension from the dump and the row lands.
+//! Use `extension_control_path` and `dynamic_library_path` (PG18+) to make an
+//! extension available only on source. Use an enum column to require oracle
+//! setup. Leave extension unused so bootstrap never needs to load its library
 
 #![cfg(target_os = "linux")]
 
@@ -108,7 +98,9 @@ fn build_stub(tmp: &Path) -> Result<Option<(PathBuf, PathBuf)>> {
     // dynamic_library_path; the oracle's default path never finds it.
     fs::write(
         ctl.join("stub--1.0.sql"),
-        "CREATE FUNCTION stub_noop() RETURNS int4 AS 'stub', 'stub_noop' LANGUAGE c;\n",
+        "CREATE FUNCTION stub_noop() RETURNS int4 AS 'stub', 'stub_noop' LANGUAGE c;\n\
+         CREATE FUNCTION stub_fdw_handler() RETURNS fdw_handler AS 'stub', 'stub_noop' LANGUAGE c;\n\
+         CREATE FOREIGN DATA WRAPPER stub_fdw HANDLER stub_fdw_handler;\n",
     )?;
     Ok(Some((tmp.join("ctl"), lib)))
 }
@@ -129,6 +121,31 @@ fn write_autocreate_config(path: &Path, ch_port: u16) -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn bootstrap_survives_extension_absent_from_oracle() {
+    run_with_source_objects("");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bootstrap_survives_foreign_objects_on_wrapper_absent_from_oracle() {
+    run_with_source_objects(
+        "CREATE SERVER ch1 FOREIGN DATA WRAPPER stub_fdw OPTIONS (host 'ch1');\n\
+         CREATE SERVER ch2 FOREIGN DATA WRAPPER stub_fdw OPTIONS (host 'ch2');\n\
+         COMMENT ON SERVER ch1 IS 'first';\n\
+         CREATE USER MAPPING FOR PUBLIC SERVER ch1 OPTIONS (user 'u');\n\
+         CREATE USER MAPPING FOR CURRENT_USER SERVER ch2;\n\
+         CREATE FOREIGN TABLE public.remote (id int OPTIONS (column_name 'rid'), feel mood) \
+             SERVER ch1 OPTIONS (table_name 'events');\n\
+         COMMENT ON FOREIGN TABLE public.remote IS 'remote events';\n\
+         COMMENT ON COLUMN public.remote.id IS 'remote id';\n\
+         CREATE VIEW public.remote_v AS SELECT id, feel FROM public.remote;\n\
+         CREATE EXTENSION postgres_fdw;\n\
+         CREATE SERVER pg1 FOREIGN DATA WRAPPER postgres_fdw OPTIONS (dbname 'postgres');\n\
+         CREATE USER MAPPING FOR PUBLIC SERVER pg1;\n\
+         CREATE FOREIGN TABLE public.pg_remote (id int, feel mood) SERVER pg1 \
+             OPTIONS (table_name 't');\n",
+    );
+}
+
+fn run_with_source_objects(objects: &str) {
     if !fx::tools::requirements_available() {
         return;
     }
@@ -158,8 +175,7 @@ async fn bootstrap_survives_extension_absent_from_oracle() {
     source.write_base_conf().expect("source base conf");
     fx::append_source_conf(&source).expect("append source conf");
     {
-        // Only the source sees `stub`; the daemon's bootstrap oracle uses
-        // default paths, so it is absent from the oracle's pg_available_extensions.
+        // Keep `stub` outside bootstrap oracle's default extension and library paths
         let conf = source.config().data_dir.join("postgresql.conf");
         let mut f = fs::OpenOptions::new().append(true).open(&conf).unwrap();
         writeln!(
@@ -176,15 +192,16 @@ async fn bootstrap_survives_extension_absent_from_oracle() {
     // `stub` is irrelevant to translation — no column uses its type. The enum
     // column is what forces the bootstrap oracle to be provisioned at all.
     source
-        .apply_schema_dump(
+        .apply_schema_dump(&format!(
             "CREATE EXTENSION stub;\n\
              CREATE TYPE mood AS ENUM ('happy', 'sad');\n\
              CREATE TABLE public.t (id int PRIMARY KEY, name text, feel mood);\n\
              ALTER TABLE public.t REPLICA IDENTITY FULL;\n\
+             {objects}\
              INSERT INTO public.t VALUES (1, 'hello', 'happy');\n\
              CHECKPOINT;\n\
              SELECT pg_switch_wal();\n",
-        )
+        ))
         .expect("load workload");
 
     let ch_tmp = tempfile::tempdir().unwrap();

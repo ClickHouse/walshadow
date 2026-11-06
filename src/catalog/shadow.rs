@@ -510,17 +510,9 @@ impl Shadow {
     }
 
     pub fn start(&self) -> Result<()> {
-        self.start_with_opts(None)
-    }
-
-    pub fn start_binary_upgrade(&self) -> Result<()> {
-        self.start_with_opts(Some("-b"))
-    }
-
-    fn start_with_opts(&self, pg_opts: Option<&str>) -> Result<()> {
         let log = self.config.data_dir.join("startup.log");
         let log_str = log.to_str().expect("non-utf8 log path");
-        let mut args: Vec<&str> = vec![
+        let args = [
             "-D",
             self.config.data_str(),
             "-l",
@@ -528,12 +520,8 @@ impl Shadow {
             "-w",
             "-t",
             "86400",
+            "start",
         ];
-        if let Some(o) = pg_opts {
-            args.push("-o");
-            args.push(o);
-        }
-        args.push("start");
         let res = self.run_env("pg_ctl", args, &[WALRECEIVER_PROTOCOL_PIN]);
         if let Err(ShadowError::Process {
             cmd,
@@ -714,20 +702,6 @@ impl Shadow {
             .output()?;
         let out = self.check("psql -c", out)?;
         Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
-    }
-
-    /// Extension names with a control file in this install
-    /// (`pg_available_extensions`) — ie the ones `CREATE EXTENSION` and the
-    /// binary-upgrade dump can actually build here.
-    pub fn available_extensions(&self) -> Result<ahash::HashSet<String>> {
-        let raw = self
-            .probe_one("SELECT coalesce(string_agg(name, ','), '') FROM pg_available_extensions")?;
-        Ok(raw
-            .split(',')
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(String::from)
-            .collect())
     }
 
     pub fn is_in_recovery(&self) -> Result<bool> {

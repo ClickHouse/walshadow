@@ -13,10 +13,10 @@ database in [bootstrap drain](../src/emit/pipeline/bootstrap.rs). Select matchin
 mapping rules and type-conversion bridge using tuple's database identity
 Preserve database identity through deferred TOAST replay and completion tracking
 
-Include every followed database in temporary PostgreSQL instance provisioned by
-[bootstrap oracle](../src/backfill/bootstrap_oracle.rs). Restore each database's
-schema and required types separately, then connect conversion workers to matching
-database. Do not let single-bridge fallback convert another database's values
+Add every followed database to temporary PostgreSQL started by
+[bootstrap oracle](../src/backfill/bootstrap_oracle.rs). Copy catalog rows needed
+for type conversion into each database, then connect conversion workers to
+matching database. Do not let single-bridge fallback convert another database's values
 
 Prove existing rows from primary and non-primary databases reach configured
 destinations. Cover matching schema/table names and overlapping relation and type

@@ -16,7 +16,8 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use clickhouse_c::Allocator;
-use walshadow::backfill::bootstrap_oracle::BootstrapOracle;
+use tokio_postgres::{Client, NoTls};
+use walshadow::backfill::bootstrap_oracle::{BootstrapOracle, ORACLE_PORT, ORACLE_USER};
 use walshadow::bridge::{Bridge, BridgeError, FRAME_PREFIX_BYTES, request_frame};
 use walshadow::oracle::{Oracle, OracleCell, OracleColumnBuf, OracleRequestColumn};
 use walshadow::schema::NUMERICOID;
@@ -94,6 +95,29 @@ fn buf(oid: u32, cells: Vec<OracleCell>) -> OracleColumnBuf {
     b
 }
 
+async fn source_client(source: &Shadow, user: &str, application_name: &str) -> Client {
+    let conninfo = format!(
+        "{} application_name={application_name}",
+        walshadow::pg::socket_conninfo(
+            source.config().socket_dir.to_str().unwrap(),
+            source.config().port,
+            user,
+            "postgres",
+        )
+    );
+    let (client, conn) = tokio_postgres::connect(&conninfo, NoTls).await.unwrap();
+    tokio::spawn(conn);
+    client
+}
+
+fn oracle_shadow(base: &Path) -> Shadow {
+    let mut cfg = ShadowConfig::new(base.join("pg"), base.to_path_buf());
+    cfg.socket_dir = base.join("sock");
+    cfg.port = ORACLE_PORT;
+    cfg.user = ORACLE_USER.into();
+    Shadow::new(cfg)
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn bootstrap_oracle_preserves_types_and_removes_cluster() {
     let tmp = tempfile::tempdir().unwrap();
@@ -103,13 +127,268 @@ async fn bootstrap_oracle_preserves_types_and_removes_cluster() {
     source
         .sh
         .psql_one(
-            "CREATE TYPE mood AS ENUM ('quiet', 'busy');
+            "DROP SCHEMA public CASCADE;
+             CREATE SCHEMA public;
+             CREATE ROLE typeowner;
+             CREATE ROLE restricted LOGIN;
+             CREATE TYPE mood AS ENUM ('quiet', 'busy');
+             ALTER TYPE mood OWNER TO typeowner;
              CREATE EXTENSION hstore;
-             CREATE TABLE t (m mood, h hstore);
-             INSERT INTO t VALUES ('busy', '\"a\"=>\"one\", \"b\"=>NULL');
-             CREATE ROLE bootstrap LOGIN SUPERUSER PASSWORD 'bootstrap-password'",
+             CREATE COLLATION fold (provider = libc, locale = 'C');
+             CREATE DOMAIN label AS text COLLATE fold;
+             CREATE TYPE pair AS (a int, gone int, b label);
+             ALTER TYPE pair DROP ATTRIBUTE gone;
+             CREATE TYPE span AS RANGE (subtype = float8);
+             CREATE TABLE other (a int, gone text, c mood);
+             ALTER TABLE other DROP COLUMN gone;
+             CREATE TYPE flag AS ENUM ('on');
+             CREATE FUNCTION flag_int(flag) RETURNS int LANGUAGE plpgsql AS $$BEGIN RETURN 1; END$$;
+             CREATE CAST (flag AS int) WITH FUNCTION flag_int(flag);
+             CREATE OPERATOR CLASS text_order FOR TYPE text USING btree
+                 AS FUNCTION 1 bttextcmp(text, text);
+             CREATE TYPE textspan AS RANGE (subtype = text, subtype_opclass = text_order);
+             CREATE TABLE t (m mood, h hstore, p pair, s span, o other, f flag, ts textspan);
+             INSERT INTO t (m, h) VALUES ('busy', '\"a\"=>\"one\", \"b\"=>NULL')",
         )
         .unwrap();
+    let source_oid = |sql: &str| -> u32 { source.sh.psql_one(sql).unwrap().parse().unwrap() };
+    let oid = source_oid("SELECT 'mood'::regtype::oid");
+    let enum_oid = source_oid(
+        "SELECT oid FROM pg_enum WHERE enumtypid = 'mood'::regtype AND enumlabel = 'busy'",
+    );
+    let hstore_oid = source_oid("SELECT 'hstore'::regtype::oid");
+    let public_oid = source_oid("SELECT 'public'::regnamespace::oid");
+    let plpgsql_oid = source_oid("SELECT oid FROM pg_language WHERE lanname = 'plpgsql'");
+    let types: Vec<u32> = source
+        .sh
+        .psql_one(
+            "SELECT string_agg(atttypid::text, ',') FROM pg_attribute \
+             WHERE attrelid = 't'::regclass AND attnum > 0",
+        )
+        .unwrap()
+        .split(',')
+        .map(|t| t.parse().unwrap())
+        .collect();
+
+    // Require only catalog access for setup, without table privileges
+    let client = source_client(&source.sh, "restricted", "oracle-seed").await;
+    let base = tmp.path().join("oracle");
+    fs::create_dir_all(&base).unwrap();
+    fs::write(base.join("stale"), "stale").unwrap();
+    let bootstrap = BootstrapOracle::provision(
+        base.clone(),
+        &client,
+        &types,
+        Some(pgext_dir()),
+        1,
+        Duration::from_secs(20),
+    )
+    .await
+    .unwrap();
+    assert!(!base.join("stale").exists());
+    let shadow = oracle_shadow(&base);
+    assert!(shadow.is_running().unwrap());
+    for (sql, expected) in [
+        ("SELECT 'mood'::regtype::oid", oid.to_string()),
+        ("SELECT 'hstore'::regtype::oid", hstore_oid.to_string()),
+        ("SELECT 'public'::regnamespace::oid", public_oid.to_string()),
+        (
+            "SELECT oid FROM pg_language WHERE lanname = 'plpgsql'",
+            plpgsql_oid.to_string(),
+        ),
+        ("SELECT 'on'::flag::int", "1".into()),
+        ("SELECT '[a,c)'::textspan", "[a,c)".into()),
+        (
+            "SELECT typowner::regrole FROM pg_type WHERE oid = 'mood'::regtype",
+            "typeowner".into(),
+        ),
+        (
+            "SELECT collname FROM pg_collation \
+             WHERE oid = (SELECT typcollation FROM pg_type WHERE oid = 'label'::regtype)",
+            "fold".into(),
+        ),
+        ("SELECT 'busy'::mood", "busy".into()),
+        ("SELECT '(1,x)'::pair", "(1,x)".into()),
+        ("SELECT '(1,busy)'::other", "(1,busy)".into()),
+        ("SELECT '[1.5,2)'::span", "[1.5,2)".into()),
+        ("SELECT '{[1,2)}'::span_multirange", "{[1,2)}".into()),
+        (
+            "SELECT relkind FROM pg_class WHERE oid = 'other'::regclass",
+            "c".into(),
+        ),
+        (
+            "SELECT to_regclass('t') IS NULL AND to_regclass('private') IS NULL",
+            "t".into(),
+        ),
+    ] {
+        assert_eq!(shadow.psql_one(sql).unwrap(), expected, "{sql}");
+    }
+
+    let mood = buf(
+        oid,
+        vec![OracleCell::DiskRaw(enum_oid.to_le_bytes().to_vec())],
+    );
+    let hstore = buf(
+        hstore_oid,
+        vec![OracleCell::TextInput(br#""a"=>"one", "b"=>NULL"#.to_vec())],
+    );
+    let columns = [
+        OracleRequestColumn {
+            ordinal: 0,
+            name: "m",
+            target_type: "String",
+            buf: &mood,
+        },
+        OracleRequestColumn {
+            ordinal: 1,
+            name: "h",
+            target_type: "Map(String, Nullable(String))",
+            buf: &hstore,
+        },
+    ];
+    let oracle = bootstrap.oracle();
+    assert!(Arc::ptr_eq(&oracle, &bootstrap.oracle()));
+    let block = oracle
+        .encode_batch(Oracle::ANY_DATABASE, &columns, 1, alloc())
+        .await
+        .unwrap();
+    assert_eq!(
+        block.column(0).unwrap().string().unwrap(),
+        (&[4][..], &b"busy"[..])
+    );
+    let map = block.column(1).unwrap();
+    assert_eq!(map.array_offsets().unwrap(), [2]);
+    let entries = map.array_values().unwrap();
+    assert_eq!(
+        entries.tuple_child(0).unwrap().string().unwrap(),
+        (&[1, 2][..], &b"ab"[..])
+    );
+    let values = entries.tuple_child(1).unwrap();
+    assert_eq!(values.null_map().unwrap(), [0, 1]);
+    assert_eq!(
+        values.nullable_inner().unwrap().string().unwrap(),
+        (&[3, 3][..], &b"one"[..])
+    );
+    drop(bootstrap);
+    assert!(!base.exists());
+    assert!(!shadow.is_running().unwrap());
+    assert!(
+        oracle
+            .encode_batch(Oracle::ANY_DATABASE, &columns, 1, alloc())
+            .await
+            .is_err()
+    );
+    assert_eq!(source.sh.psql_one("SELECT count(*) FROM t").unwrap(), "1");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn bootstrap_oracle_stops_cluster_on_source_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    let Some(source) = start_pg(&tmp, ports::PG_SOURCE_PORT) else {
+        return;
+    };
+    let client = source_client(&source.sh, "postgres", "oracle-seed").await;
+    source
+        .sh
+        .psql_one(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+             WHERE application_name = 'oracle-seed'",
+        )
+        .unwrap();
+    let base = tmp.path().join("oracle");
+    let err = BootstrapOracle::provision(
+        base.clone(),
+        &client,
+        &[],
+        Some(pgext_dir()),
+        1,
+        Duration::from_secs(20),
+    )
+    .await
+    .err()
+    .expect("provision fails");
+    let msg = format!("{err:#}");
+    assert!(msg.contains("seed catalog:"), "{msg}");
+    assert!(!oracle_shadow(&base).is_running().unwrap());
+    assert!(source.sh.is_running().unwrap());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn bootstrap_oracle_keeps_rows_sharing_oids_with_staging_objects() {
+    let tmp = tempfile::tempdir().unwrap();
+    let Some(source) = start_pg(&tmp, ports::PG_SOURCE_PORT) else {
+        return;
+    };
+    let mut ddl = String::new();
+    let mut cols = Vec::new();
+    for i in 0..200 {
+        ddl.push_str(&format!("CREATE DOMAIN d{i} AS int;"));
+        cols.push(format!("c{i} d{i}"));
+    }
+    ddl.push_str(&format!("CREATE TABLE t ({});", cols.join(", ")));
+    source.sh.psql_one(&ddl).unwrap();
+    let copied = "SELECT string_agg(t.oid || ' ' || n.nspname || '.' || t.typname, ',' ORDER BY t.oid) \
+                  FROM pg_type t LEFT JOIN pg_namespace n ON n.oid = t.typnamespace \
+                  WHERE t.oid >= 16384 AND t.typname NOT IN ('t', '_t')";
+    let expected = source.sh.psql_one(copied).unwrap();
+    assert_eq!(
+        source
+            .sh
+            .psql_one("SELECT min(oid) < 16400 AND max(oid) > 16700 FROM pg_type WHERE typname ~ '^_?d[0-9]+$'")
+            .unwrap(),
+        "t",
+        "domains must cover the OIDs the oracle allocates while copying",
+    );
+    let types: Vec<u32> = source
+        .sh
+        .psql_one(
+            "SELECT string_agg(atttypid::text, ',') FROM pg_attribute \
+             WHERE attrelid = 't'::regclass AND attnum > 0",
+        )
+        .unwrap()
+        .split(',')
+        .map(|t| t.parse().unwrap())
+        .collect();
+    let client = source_client(&source.sh, "postgres", "oracle-seed").await;
+    let base = tmp.path().join("oracle");
+    let bootstrap = BootstrapOracle::provision(
+        base.clone(),
+        &client,
+        &types,
+        Some(pgext_dir()),
+        1,
+        Duration::from_secs(20),
+    )
+    .await
+    .unwrap();
+    let got = oracle_shadow(&base).psql_one(copied).unwrap();
+    let have: ahash::HashSet<&str> = got.split(',').collect();
+    let missing: Vec<&str> = expected.split(',').filter(|t| !have.contains(t)).collect();
+    assert!(
+        missing.is_empty(),
+        "source types missing from oracle: {missing:?}"
+    );
+    assert_eq!(got, expected);
+    drop(bootstrap);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn bootstrap_oracle_survives_namespace_name_clashes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let Some(source) = start_pg(&tmp, ports::PG_SOURCE_PORT) else {
+        return;
+    };
+    let mut ddl = String::from("SET allow_system_table_mods = on;");
+    for i in 0..10 {
+        ddl.push_str(&format!(
+            "CREATE SCHEMA pg_temp_{i}; CREATE SCHEMA pg_toast_temp_{i};"
+        ));
+    }
+    ddl.push_str("CREATE TYPE mood AS ENUM ('quiet', 'busy'); CREATE TABLE t (m mood)");
+    source.sh.psql_one(&ddl).unwrap();
+    let namespaces = "SELECT string_agg(oid || ' ' || nspname, ',' ORDER BY nspname) \
+                      FROM pg_namespace WHERE oid >= 12000 AND nspname !~ '^pg_(toast_)?temp_'";
+    let expected = source.sh.psql_one(namespaces).unwrap();
     let oid: u32 = source
         .sh
         .psql_one("SELECT 'mood'::regtype::oid")
@@ -118,176 +397,59 @@ async fn bootstrap_oracle_preserves_types_and_removes_cluster() {
         .unwrap();
     let enum_oid: u32 = source
         .sh
-        .psql_one(
-            "SELECT oid FROM pg_enum WHERE enumtypid = 'mood'::regtype AND enumlabel = 'busy'",
-        )
+        .psql_one("SELECT oid FROM pg_enum WHERE enumlabel = 'busy'")
         .unwrap()
         .parse()
         .unwrap();
-    let hstore_oid: u32 = source
-        .sh
-        .psql_one("SELECT 'hstore'::regtype::oid")
-        .unwrap()
-        .parse()
-        .unwrap();
-    source.sh.stop().unwrap();
-    fs::write(
-        source.sh.config().data_dir.join("pg_hba.conf"),
-        "local all bootstrap scram-sha-256\nlocal all all trust\n",
-    )
-    .unwrap();
-    source.sh.start().unwrap();
 
+    let client = source_client(&source.sh, "postgres", "oracle-seed").await;
     let base = tmp.path().join("oracle");
-    for password in [None, Some("bootstrap-password".to_string())] {
-        fs::create_dir_all(&base).unwrap();
-        fs::write(base.join("stale"), "stale").unwrap();
-        let conninfo = walshadow::pg::socket_conninfo(
-            source.sh.config().socket_dir.to_str().unwrap(),
-            source.sh.config().port,
-            if password.is_some() {
-                "bootstrap"
-            } else {
-                "postgres"
-            },
-            "postgres",
-        );
-        let bootstrap = BootstrapOracle::provision(
-            base.clone(),
-            conninfo,
-            password,
-            Some(pgext_dir()),
-            1,
-            Duration::from_secs(20),
-        )
-        .await
+    let bootstrap = BootstrapOracle::provision(
+        base.clone(),
+        &client,
+        &[oid],
+        Some(pgext_dir()),
+        1,
+        Duration::from_secs(20),
+    )
+    .await
+    .unwrap();
+    let shadow = oracle_shadow(&base);
+    assert_eq!(shadow.psql_one(namespaces).unwrap(), expected);
+    assert_eq!(
+        shadow
+            .psql_one(&format!(
+                "SELECT count(*) FROM pg_namespace WHERE nspname ~ '^pg_(toast_)?temp_' AND oid < {}",
+                oid
+            ))
+            .unwrap(),
+        "0",
+        "source temp schemas stay out of the oracle",
+    );
+    shadow
+        .psql_one("CREATE TEMP TABLE after_seed (a int); SELECT 1")
         .unwrap();
-        assert!(!base.join("stale").exists());
-        let mut cfg = ShadowConfig::new(base.join("pg"), base.clone());
-        cfg.socket_dir = base.join("sock");
-        cfg.port = 55440;
-        let shadow = Shadow::new(cfg);
-        assert!(shadow.is_running().unwrap());
-        assert_eq!(shadow.psql_one("SELECT count(*) FROM t").unwrap(), "0");
-        assert_eq!(
-            shadow.psql_one("SELECT 'mood'::regtype::oid").unwrap(),
-            oid.to_string()
-        );
-        assert_eq!(
-            shadow.psql_one("SELECT 'hstore'::regtype::oid").unwrap(),
-            hstore_oid.to_string()
-        );
-        let mood = buf(
-            oid,
-            vec![OracleCell::DiskRaw(enum_oid.to_le_bytes().to_vec())],
-        );
-        let hstore = buf(
-            hstore_oid,
-            vec![OracleCell::TextInput(br#""a"=>"one", "b"=>NULL"#.to_vec())],
-        );
-        let columns = [
-            OracleRequestColumn {
-                ordinal: 0,
-                name: "m",
-                target_type: "String",
-                buf: &mood,
-            },
-            OracleRequestColumn {
-                ordinal: 1,
-                name: "h",
-                target_type: "Map(String, Nullable(String))",
-                buf: &hstore,
-            },
-        ];
-        let oracle = bootstrap.oracle();
-        assert!(Arc::ptr_eq(&oracle, &bootstrap.oracle()));
-        let block = oracle
-            .encode_batch(Oracle::ANY_DATABASE, &columns, 1, alloc())
-            .await
-            .unwrap();
-        assert_eq!(
-            block.column(0).unwrap().string().unwrap(),
-            (&[4][..], &b"busy"[..])
-        );
-        let map = block.column(1).unwrap();
-        assert_eq!(map.array_offsets().unwrap(), [2]);
-        let entries = map.array_values().unwrap();
-        assert_eq!(
-            entries.tuple_child(0).unwrap().string().unwrap(),
-            (&[1, 2][..], &b"ab"[..])
-        );
-        let values = entries.tuple_child(1).unwrap();
-        assert_eq!(values.null_map().unwrap(), [0, 1]);
-        assert_eq!(
-            values.nullable_inner().unwrap().string().unwrap(),
-            (&[3, 3][..], &b"one"[..])
-        );
-        drop(bootstrap);
-        assert!(!base.exists());
-        assert!(!shadow.is_running().unwrap());
-        assert!(
-            oracle
-                .encode_batch(Oracle::ANY_DATABASE, &columns, 1, alloc())
-                .await
-                .is_err()
-        );
-    }
-    assert_eq!(source.sh.psql_one("SELECT count(*) FROM t").unwrap(), "1");
-}
 
-#[tokio::test(flavor = "current_thread")]
-async fn bootstrap_oracle_reports_source_errors() {
-    let tmp = tempfile::tempdir().unwrap();
-    let Some(source) = start_pg(&tmp, ports::PG_SOURCE_PORT) else {
-        return;
-    };
-    source
-        .sh
-        .psql_one("CREATE ROLE restricted LOGIN; CREATE TABLE private (id int)")
-        .unwrap();
-    for (user, database, stage, expected) in [
-        (
-            "postgres",
-            "missing",
-            "source extensions query failed:",
-            "database \"missing\" does not exist",
-        ),
-        (
-            "restricted",
-            "postgres",
-            "pg_dump failed:",
-            "permission denied for table private",
-        ),
-    ] {
-        let base = tmp.path().join("oracle");
-        let guard = StopOnDrop {
-            sh: Shadow::new(ShadowConfig::new(base.join("pg"), base.clone())),
-        };
-        let conninfo = walshadow::pg::socket_conninfo(
-            source.sh.config().socket_dir.to_str().unwrap(),
-            source.sh.config().port,
-            user,
-            database,
-        );
-        let err = BootstrapOracle::provision(
-            base.clone(),
-            conninfo,
-            None,
-            Some(pgext_dir()),
-            1,
-            Duration::from_secs(20),
-        )
+    let mood = buf(
+        oid,
+        vec![OracleCell::DiskRaw(enum_oid.to_le_bytes().to_vec())],
+    );
+    let columns = [OracleRequestColumn {
+        ordinal: 0,
+        name: "m",
+        target_type: "String",
+        buf: &mood,
+    }];
+    let block = bootstrap
+        .oracle()
+        .encode_batch(Oracle::ANY_DATABASE, &columns, 1, alloc())
         .await
-        .err()
-        .expect("provision fails");
-        let msg = format!("{err:#}");
-        assert!(msg.contains("bootstrap oracle provision:"), "{msg}");
-        assert!(msg.contains(stage), "{msg}");
-        assert!(msg.contains(expected), "{msg}");
-        assert!(!base.join("sock/walshadow-bridge.sock").exists());
-        drop(guard);
-    }
-    assert!(source.sh.is_running().unwrap());
+        .unwrap();
+    assert_eq!(
+        block.column(0).unwrap().string().unwrap(),
+        (&[4][..], &b"busy"[..])
+    );
+    drop(bootstrap);
 }
 
 /// `[1, 2, 3]` int4 array on-disk body.

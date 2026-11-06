@@ -1,9 +1,12 @@
-use std::path::PathBuf;
-use std::process::Command;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use ahash::{HashMap, HashSet};
 use anyhow::{Context, Result};
+use futures::{SinkExt, TryStreamExt};
+use tokio_postgres::types::Oid;
+use tokio_postgres::{Client, NoTls};
 
 use clickhouse_c::Allocator;
 
@@ -13,98 +16,93 @@ use crate::column_rules::ColumnRules;
 use crate::emit::ch_emitter::TablePlan;
 use crate::mapping::{MappingSnapshot, SystemColumns};
 use crate::ops::oracle::Oracle;
+use crate::schema::FIRST_NORMAL_OBJECT_ID;
 
-const ORACLE_PORT: u16 = 55440;
+pub const ORACLE_PORT: u16 = 55440;
+/// Use a distinct bootstrap superuser name to avoid source role conflicts
+pub const ORACLE_USER: &str = "walshadow_oracle";
+/// Match `FirstUnpinnedObjectId` in PostgreSQL's src/include/access/transam.h
+/// Initdb assigns OIDs from here to host locale collations; these vary by host
+const FIRST_UNPINNED_OBJECT_ID: u32 = 12000;
 
 pub struct BootstrapOracle {
-    shadow: Shadow,
+    // Stop PostgreSQL before bridge connections drop
+    _shadow: ShadowGuard,
     oracle: Arc<Oracle>,
+}
+
+/// Stop temporary PostgreSQL and remove its directory on drop, including when
+/// provisioning fails or is cancelled
+struct ShadowGuard {
+    shadow: Shadow,
     base_dir: PathBuf,
 }
 
+impl Drop for ShadowGuard {
+    fn drop(&mut self) {
+        let _ = self.shadow.stop();
+        let _ = std::fs::remove_dir_all(&self.base_dir);
+    }
+}
+
 impl BootstrapOracle {
+    /// Start temporary PostgreSQL with catalog rows needed to convert `types`
+    /// Preserve source OIDs
     pub async fn provision(
         base_dir: PathBuf,
-        source_conninfo: String,
-        source_password: Option<String>,
+        source: &Client,
+        types: &[Oid],
         bridge_lib_dir: Option<PathBuf>,
         workers: usize,
         connect_budget: Duration,
     ) -> Result<Self> {
-        let data_dir = base_dir.join("pg");
         let socket_dir = base_dir.join("sock");
         let bridge_socket = socket_dir.join("walshadow-bridge.sock");
 
-        let (b_data, b_sock, b_bridge, b_base) = (
-            data_dir.clone(),
-            socket_dir.clone(),
-            bridge_socket.clone(),
-            base_dir.clone(),
-        );
-        let shadow = tokio::task::spawn_blocking(move || -> Result<Shadow> {
-            std::fs::remove_dir_all(&b_base).ok();
+        let (b_sock, b_bridge) = (socket_dir.clone(), bridge_socket.clone());
+        let shadow = tokio::task::spawn_blocking(move || -> Result<ShadowGuard> {
+            std::fs::remove_dir_all(&base_dir).ok();
             std::fs::create_dir_all(&b_sock)?;
-
-            let cfg_a = oracle_cfg(&b_data, &b_base, &b_sock, None);
-            let a = Shadow::new(cfg_a);
-            a.initdb().context("initdb")?;
-            a.write_base_conf().context("base conf")?;
-            a.start_binary_upgrade().context("start -b")?;
-
-            let available = a.available_extensions().context("oracle extensions")?;
-            let installed = source_extensions(&source_conninfo, source_password.as_deref())
-                .context("source extensions")?;
-            let unavailable: Vec<String> = installed
-                .into_iter()
-                .filter(|e| !available.contains(e))
-                .collect();
-
-            let major = pg_dump_major().context("pg_dump version")?;
-            let dump = if major >= 17 {
-                run_pg_dump(&source_conninfo, source_password.as_deref(), &unavailable)
-                    .context("pg_dump --binary-upgrade")?
-            } else {
-                let raw = run_pg_dump(&source_conninfo, source_password.as_deref(), &[])
-                    .context("pg_dump --binary-upgrade")?;
-                filter_out_extensions(&raw, &unavailable)
-            };
-            a.apply_schema_dump(&dump).context("apply schema")?;
-            a.stop().context("stop -b")?;
-
             let mut bridge = BridgeConf::in_dir(&b_sock);
             bridge.socket_path = b_bridge;
             bridge.library_dir = bridge_lib_dir;
             bridge.workers = workers;
-            let cfg_b = oracle_cfg(&b_data, &b_base, &b_sock, Some(bridge));
-            let b = Shadow::new(cfg_b);
-            b.write_base_conf().context("serve conf")?;
-            b.start().context("start serve")?;
-            Ok(b)
+            let mut cfg = ShadowConfig::new(base_dir.join("pg"), base_dir.clone());
+            cfg.socket_dir = b_sock;
+            cfg.port = ORACLE_PORT;
+            cfg.user = ORACLE_USER.into();
+            cfg.dbname = "postgres".into();
+            cfg.bridge = Some(bridge);
+            let guard = ShadowGuard {
+                shadow: Shadow::new(cfg),
+                base_dir,
+            };
+            guard.shadow.initdb().context("initdb")?;
+            guard.shadow.write_base_conf().context("base conf")?;
+            guard.shadow.start().context("start")?;
+            Ok(guard)
         })
         .await
-        .context("bootstrap oracle provision task")?
-        .context("bootstrap oracle provision")?;
+        .context("bootstrap oracle provision task")??;
 
-        let connected =
-            crate::ops::bridge::connect_with_budget(&bridge_socket, workers, connect_budget).await;
-        if connected.is_err() {
-            // Nothing else owns this postmaster; left up it outlives the daemon
-            // and the next attempt unlinks its data dir
-            let _ = shadow.stop();
-        }
-        let bridge = connected.with_context(|| {
-            format!(
-                "bootstrap oracle bridge connect ({} of {workers} worker sockets present \
-                 under {}; a bridge pool over max_worker_processes registers fewer \
-                 workers than the daemon dials)",
-                present_sockets(&socket_dir, workers),
-                socket_dir.display(),
-            )
-        })?;
+        seed_catalog(source, &socket_dir, types)
+            .await
+            .context("seed catalog")?;
+        let bridge =
+            crate::ops::bridge::connect_with_budget(&bridge_socket, workers, connect_budget)
+                .await
+                .with_context(|| {
+                    format!(
+                        "bridge connect ({} of {workers} worker sockets present under {}; \
+                     a bridge pool over max_worker_processes registers fewer workers \
+                     than the daemon dials)",
+                        present_sockets(&socket_dir, workers),
+                        socket_dir.display(),
+                    )
+                })?;
         Ok(Self {
-            shadow,
+            _shadow: shadow,
             oracle: Arc::new(Oracle::new(Arc::new(bridge))),
-            base_dir,
         })
     }
 
@@ -119,14 +117,7 @@ impl BootstrapOracle {
     }
 }
 
-impl Drop for BootstrapOracle {
-    fn drop(&mut self) {
-        let _ = self.shadow.stop();
-        let _ = std::fs::remove_dir_all(&self.base_dir);
-    }
-}
-
-fn present_sockets(socket_dir: &std::path::Path, workers: usize) -> usize {
+fn present_sockets(socket_dir: &Path, workers: usize) -> usize {
     (0..workers)
         .filter(|i| {
             let name = if *i == 0 {
@@ -139,161 +130,424 @@ fn present_sockets(socket_dir: &std::path::Path, workers: usize) -> usize {
         .count()
 }
 
-fn oracle_cfg(
-    data_dir: &std::path::Path,
-    filter_out_dir: &std::path::Path,
-    socket_dir: &std::path::Path,
-    bridge: Option<BridgeConf>,
-) -> ShadowConfig {
-    let mut cfg = ShadowConfig::new(data_dir.to_path_buf(), filter_out_dir.to_path_buf());
-    cfg.socket_dir = socket_dir.to_path_buf();
-    cfg.port = ORACLE_PORT;
-    cfg.user = "postgres".into();
-    cfg.dbname = "postgres".into();
-    cfg.bridge = bridge;
-    cfg
+/// Find types needed by `seeds`: array elements, array types, domain base types,
+/// composite fields, range subtypes and multiranges. Include other types from
+/// extensions that own any of these types, or that those extensions require.
+/// 12000 is `FirstUnpinnedObjectId`
+const TYPE_CLOSURE: &str = "\
+WITH RECURSIVE ty(oid) AS (
+    SELECT unnest($1::oid[])
+  UNION
+    SELECT d.oid FROM ty
+    JOIN pg_catalog.pg_type t ON t.oid = ty.oid
+    CROSS JOIN LATERAL (
+        SELECT t.typelem
+        UNION ALL SELECT t.typarray
+        UNION ALL SELECT t.typbasetype
+        UNION ALL SELECT a.atttypid FROM pg_catalog.pg_attribute a
+            WHERE a.attrelid = t.typrelid AND a.attnum > 0
+        UNION ALL SELECT r.rngsubtype FROM pg_catalog.pg_range r WHERE r.rngtypid = t.oid
+        UNION ALL SELECT r.rngmultitypid FROM pg_catalog.pg_range r WHERE r.rngtypid = t.oid
+        UNION ALL SELECT r.rngtypid FROM pg_catalog.pg_range r WHERE r.rngmultitypid = t.oid
+        UNION ALL SELECT m.objid FROM pg_catalog.pg_depend e
+            JOIN pg_catalog.pg_depend m ON m.refclassid = e.refclassid
+                AND m.classid = 'pg_catalog.pg_type'::regclass
+                AND m.deptype = 'e'
+                AND (m.refobjid = e.refobjid OR m.refobjid IN (
+                    SELECT q.refobjid FROM pg_catalog.pg_depend q
+                    WHERE q.classid = e.refclassid AND q.objid = e.refobjid
+                        AND q.refclassid = e.refclassid AND q.deptype = 'n'))
+            WHERE e.classid = 'pg_catalog.pg_type'::regclass AND e.objid = t.oid
+                AND e.refclassid = 'pg_catalog.pg_extension'::regclass AND e.deptype = 'e'
+    ) d(oid)
+    WHERE d.oid >= 12000
+)
+SELECT oid FROM ty";
+
+const TYPE_EXTENSIONS: &str = "\
+SELECT DISTINCT refobjid FROM pg_catalog.pg_depend
+WHERE classid = 'pg_catalog.pg_type'::regclass AND objid = ANY($1)
+    AND refclassid = 'pg_catalog.pg_extension'::regclass AND deptype = 'e'";
+
+/// Find btree operator families of range subtypes. Range type cache looks up
+/// the subtype comparison function through them
+const RANGE_FAMILIES: &str = "\
+SELECT DISTINCT c.opcfamily FROM pg_catalog.pg_range r
+JOIN pg_catalog.pg_opclass c ON c.oid = r.rngsubopc
+WHERE r.rngtypid = ANY($1) AND c.opcfamily >= 12000";
+
+/// Find type support, cast and operator family functions. Include all functions
+/// from extensions in `$2` because they may call each other by name
+const TYPE_FUNCTIONS: &str = "\
+SELECT DISTINCT f FROM (
+    SELECT unnest(ARRAY[typinput, typoutput, typreceive, typsend, typmodin, typmodout,
+                        typanalyze, typsubscript]::oid[])
+        FROM pg_catalog.pg_type WHERE oid = ANY($1)
+    UNION ALL SELECT unnest(ARRAY[rngcanonical, rngsubdiff]::oid[])
+        FROM pg_catalog.pg_range WHERE rngtypid = ANY($1)
+    UNION ALL SELECT castfunc FROM pg_catalog.pg_cast
+        WHERE castsource = ANY($1) OR casttarget = ANY($1)
+    UNION ALL SELECT objid FROM pg_catalog.pg_depend
+        WHERE classid = 'pg_catalog.pg_proc'::regclass AND deptype = 'e'
+            AND refclassid = 'pg_catalog.pg_extension'::regclass AND refobjid = ANY($2)
+    UNION ALL SELECT amproc::oid FROM pg_catalog.pg_amproc WHERE amprocfamily = ANY($3)
+) s(f)
+WHERE f >= 12000";
+
+/// Find languages of copied functions. Initdb creates plpgsql after importing
+/// host locale collations, so its OID varies by host
+const LANGUAGES: &str = "\
+SELECT DISTINCT prolang FROM pg_catalog.pg_proc WHERE oid = ANY($1) AND prolang >= 12000";
+
+const LANGUAGE_HANDLERS: &str = "\
+SELECT f FROM pg_catalog.pg_language
+CROSS JOIN LATERAL unnest(ARRAY[lanplcallfoid, laninline, lanvalidator]::oid[]) f
+WHERE oid = ANY($1) AND f >= 12000";
+
+/// Preserve source OIDs by copying catalog rows directly, requiring matching
+/// PostgreSQL majors. Extension libraries load only when called
+async fn seed_catalog(source: &Client, socket_dir: &Path, seeds: &[Oid]) -> Result<()> {
+    // Fix text output of float4 and timestamptz so oracle parses it back exactly
+    source
+        .batch_execute(
+            "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY;
+             SET LOCAL extra_float_digits = 3;
+             SET LOCAL DateStyle = ISO",
+        )
+        .await
+        .context("open source snapshot")?;
+    let result = seed_catalog_in_snapshot(source, socket_dir, seeds).await;
+    let _ = source.batch_execute("COMMIT").await;
+    result
 }
 
-fn run_pg_dump(conninfo: &str, password: Option<&str>, exclude: &[String]) -> Result<String> {
-    let mut cmd = Command::new("pg_dump");
-    cmd.args([
-        "--binary-upgrade",
-        "--schema-only",
-        "--no-owner",
-        "--no-privileges",
-        "--no-publications",
-        "--no-subscriptions",
-    ]);
-    for ext in exclude {
-        cmd.arg(format!("--exclude-extension={ext}"));
+async fn seed_catalog_in_snapshot(source: &Client, socket_dir: &Path, seeds: &[Oid]) -> Result<()> {
+    let mut cfg = tokio_postgres::Config::new();
+    cfg.host_path(socket_dir)
+        .port(ORACLE_PORT)
+        .user(ORACLE_USER)
+        .dbname("postgres");
+    let (oracle, conn) = cfg.connect(NoTls).await.context("connect oracle")?;
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    oracle.batch_execute("SET extra_float_digits = 3").await?;
+
+    let major = "SELECT current_setting('server_version_num')::int / 10000";
+    let source_major: i32 = source.query_one(major, &[]).await?.get(0);
+    let oracle_major: i32 = oracle.query_one(major, &[]).await?.get(0);
+    anyhow::ensure!(
+        source_major == oracle_major,
+        "oracle PostgreSQL {oracle_major} cannot hold catalog rows of source PostgreSQL {source_major}",
+    );
+    for (catalog, filter) in plan_copy(source, seeds).await? {
+        copy_catalog(source, &oracle, catalog, &filter)
+            .await
+            .with_context(|| format!("copy {catalog}"))?;
     }
-    cmd.args(["-d", conninfo]);
-    if let Some(pw) = password {
-        cmd.env("PGPASSWORD", pw);
-    }
-    let out = cmd.output().context("spawn pg_dump")?;
-    if !out.status.success() {
-        anyhow::bail!("pg_dump failed: {}", String::from_utf8_lossy(&out.stderr));
-    }
-    String::from_utf8(out.stdout).context("pg_dump output not utf8")
+    Ok(())
 }
 
-/// Extensions installed on the source. The binary-upgrade dump recreates each
-/// one's member objects inline, including C functions that load `$libdir/<ext>`.
-fn source_extensions(conninfo: &str, password: Option<&str>) -> Result<Vec<String>> {
-    let mut cmd = Command::new("psql");
-    cmd.args([
-        "-tAXq",
-        "-d",
-        conninfo,
-        "-c",
-        "SELECT extname FROM pg_catalog.pg_extension",
-    ]);
-    if let Some(pw) = password {
-        cmd.env("PGPASSWORD", pw);
-    }
-    let out = cmd.output().context("spawn psql")?;
-    if !out.status.success() {
-        anyhow::bail!(
-            "source extensions query failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
-    Ok(String::from_utf8(out.stdout)
-        .context("psql output not utf8")?
-        .lines()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(String::from)
-        .collect())
+async fn plan_copy(source: &Client, seeds: &[Oid]) -> Result<[(&'static str, String); 16]> {
+    let seeds: Vec<Oid> = seeds
+        .iter()
+        .copied()
+        .filter(|&oid| oid >= FIRST_UNPINNED_OBJECT_ID)
+        .collect();
+    let oids = |rows: Vec<tokio_postgres::Row>| rows.iter().map(|r| r.get(0)).collect::<Vec<Oid>>();
+    let types = oids(source.query(TYPE_CLOSURE, &[&seeds]).await?);
+    let exts = oids(source.query(TYPE_EXTENSIONS, &[&types]).await?);
+    let families = oids(source.query(RANGE_FAMILIES, &[&types]).await?);
+    let mut procs = oids(
+        source
+            .query(TYPE_FUNCTIONS, &[&types, &exts, &families])
+            .await?,
+    );
+    let langs = oids(source.query(LANGUAGES, &[&procs]).await?);
+    procs.extend(oids(source.query(LANGUAGE_HANDLERS, &[&langs]).await?));
+
+    let types = oid_array(&types);
+    let exts = oid_array(&exts);
+    let families = oid_array(&families);
+    let procs = oid_array(&procs);
+    let langs = oid_array(&langs);
+    let rowtypes = format!("SELECT typrelid FROM pg_catalog.pg_type WHERE oid = ANY({types})");
+    Ok([
+        ("pg_authid", format!("oid >= {FIRST_NORMAL_OBJECT_ID}")),
+        (
+            "pg_namespace",
+            "oid >= 12000 AND nspname !~ '^pg_(toast_)?temp_'".into(),
+        ),
+        ("pg_collation", "oid >= 12000".into()),
+        ("pg_language", format!("oid = ANY({langs})")),
+        ("pg_type", format!("oid = ANY({types})")),
+        ("pg_class", format!("oid IN ({rowtypes})")),
+        (
+            "pg_attribute",
+            format!("attnum > 0 AND attrelid IN ({rowtypes})"),
+        ),
+        ("pg_enum", format!("enumtypid = ANY({types})")),
+        ("pg_range", format!("rngtypid = ANY({types})")),
+        ("pg_opfamily", format!("oid = ANY({families})")),
+        ("pg_opclass", format!("opcfamily = ANY({families})")),
+        ("pg_amproc", format!("amprocfamily = ANY({families})")),
+        ("pg_proc", format!("oid = ANY({procs})")),
+        (
+            "pg_cast",
+            format!(
+                "oid >= 12000 \
+                 AND (castsource = ANY({types}) OR casttarget = ANY({types}))"
+            ),
+        ),
+        ("pg_extension", format!("oid = ANY({exts})")),
+        (
+            "pg_depend",
+            format!(
+                "deptype = 'e' AND refclassid = 'pg_catalog.pg_extension'::regclass \
+                 AND refobjid = ANY({exts})"
+            ),
+        ),
+    ])
 }
 
-/// Major version of the `pg_dump` on `PATH`. `--exclude-extension` is 17+.
-fn pg_dump_major() -> Result<u32> {
-    let out = Command::new("pg_dump")
-        .arg("--version")
-        .output()
-        .context("spawn pg_dump --version")?;
-    if !out.status.success() {
-        anyhow::bail!("pg_dump --version failed");
-    }
-    let text = String::from_utf8_lossy(&out.stdout);
-    text.split_whitespace()
-        .find_map(|tok| {
-            let digits: String = tok.chars().take_while(char::is_ascii_digit).collect();
-            digits.parse::<u32>().ok()
+/// Inline OIDs because COPY cannot bind parameters
+fn oid_array(oids: &[Oid]) -> String {
+    let list: Vec<String> = oids.iter().map(Oid::to_string).collect();
+    format!("'{{{}}}'::pg_catalog.oid[]", list.join(","))
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Transfer {
+    Plain,
+    Oid,
+    Null,
+}
+
+/// Copy source rows, replacing oracle rows they conflict with on any unique
+/// index. Conflicts come from objects initdb creates after bootstrap, whose OIDs
+/// vary by host, or from a source that recreated `public`. Use text format
+/// because binary input rejects an empty oidvector
+async fn copy_catalog(source: &Client, oracle: &Client, catalog: &str, filter: &str) -> Result<()> {
+    let rel = format!("pg_catalog.{catalog}");
+    // Use NULL for types without text input; conversion ignores these fields.
+    // Send regproc as OID because its name may resolve only once pg_proc is copied
+    let columns: Vec<(String, Transfer)> = oracle
+        .query(
+            "SELECT a.attname::text,
+                    CASE WHEN a.atttypid = ANY(ARRAY['pg_node_tree', 'anyarray', 'aclitem',
+                                                     'aclitem[]']::pg_catalog.regtype[])
+                         THEN 'null'
+                         WHEN a.atttypid = 'pg_catalog.regproc'::pg_catalog.regtype
+                         THEN 'oid'
+                         ELSE 'plain' END
+             FROM pg_catalog.pg_attribute a
+             WHERE a.attrelid = $1::text::pg_catalog.regclass AND a.attnum > 0
+                 AND NOT a.attisdropped
+             ORDER BY a.attnum",
+            &[&rel],
+        )
+        .await?
+        .iter()
+        .map(|row| {
+            let transfer = match row.get::<_, &str>(1) {
+                "null" => Transfer::Null,
+                "oid" => Transfer::Oid,
+                _ => Transfer::Plain,
+            };
+            (row.get(0), transfer)
         })
-        .with_context(|| format!("parse pg_dump version from {text:?}"))
-}
+        .collect();
+    let keys: Vec<Vec<usize>> = oracle
+        .query(
+            "SELECT array_agg(a.attname::text ORDER BY k.n)
+             FROM pg_catalog.pg_index i
+             CROSS JOIN LATERAL unnest(i.indkey::int2[]) WITH ORDINALITY k(attnum, n)
+             JOIN pg_catalog.pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum
+             WHERE i.indrelid = $1::text::pg_catalog.regclass AND i.indisunique
+             GROUP BY i.indexrelid",
+            &[&rel],
+        )
+        .await?
+        .iter()
+        .map(|row| {
+            row.get::<_, Vec<String>>(0)
+                .iter()
+                .map(|key| {
+                    columns
+                        .iter()
+                        .position(|(name, _)| name == key)
+                        .with_context(|| format!("index column {key}"))
+                })
+                .collect()
+        })
+        .collect::<Result<_>>()?;
 
-/// Drop, from a `--binary-upgrade` dump, every entry belonging to an
-/// `excluded` extension: the extension itself, its `COMMENT`, and each member
-/// object (matched by its in-block `ALTER EXTENSION <ext> ADD`). Used on PG16,
-/// whose `pg_dump` has no `--exclude-extension`. Top-level `SET` directives are
-/// preserved even inside a dropped entry, since they configure the session, not
-/// the extension. An entry runs from its `-- Name: …; Type: …` header comment
-/// to the next such header.
-fn filter_out_extensions(dump: &str, excluded: &[String]) -> String {
-    if excluded.is_empty() {
-        return dump.to_string();
-    }
-    let excluded: ahash::HashSet<&str> = excluded.iter().map(String::as_str).collect();
-    let lines: Vec<&str> = dump.lines().collect();
-    let n = lines.len();
-    let is_header = |i: usize| {
-        i + 2 < n
-            && lines[i] == "--"
-            && lines[i + 1].starts_with("-- Name: ")
-            && lines[i + 2] == "--"
+    // Never replace pinned rows, matching `IsPinnedObject`, where `public` is the
+    // one unpinned bootstrap object. Rows without OIDs are keyed by copied
+    // objects, which are all unpinned
+    let unpinned = if catalog == "pg_namespace" {
+        "(oid >= 12000 OR oid = 2200)"
+    } else if columns.iter().any(|(name, _)| name == "oid") {
+        "oid >= 12000"
+    } else {
+        "true"
     };
-
-    let mut starts = vec![0usize];
-    starts.extend((0..n).filter(|&i| is_header(i)));
-    starts.dedup();
-
-    let mut out: Vec<&str> = Vec::with_capacity(n);
-    for (k, &start) in starts.iter().enumerate() {
-        let end = starts.get(k + 1).copied().unwrap_or(n);
-        let seg = &lines[start..end];
-        if is_header(start) && should_drop_entry(seg, &excluded) {
-            out.extend(
-                seg.iter()
-                    .copied()
-                    .filter(|l| l.trim_start().starts_with("SET ")),
-            );
-        } else {
-            out.extend_from_slice(seg);
+    // Probe through same expressions as source select so text compares equal
+    let exprs: Vec<String> = columns
+        .iter()
+        .map(|(name, how)| match how {
+            Transfer::Plain => name.clone(),
+            Transfer::Oid => format!("{name}::pg_catalog.oid"),
+            Transfer::Null => "NULL".into(),
+        })
+        .collect();
+    let probe = exprs
+        .iter()
+        .enumerate()
+        .map(|(i, expr)| {
+            if keys.iter().flatten().any(|&k| k == i) {
+                expr.as_str()
+            } else {
+                "NULL"
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut existing: Vec<HashMap<Vec<u8>, String>> = vec![HashMap::default(); keys.len()];
+    if !keys.is_empty() {
+        let rows = oracle
+            .copy_out(&format!(
+                "COPY (SELECT ctid, {probe} FROM {rel} WHERE {unpinned}) TO STDOUT"
+            ))
+            .await?;
+        futures::pin_mut!(rows);
+        while let Some(row) = rows.try_next().await? {
+            let fields = copy_fields(&row, columns.len() + 1)?;
+            let ctid = String::from_utf8(fields[0].to_vec())?;
+            for (map, key) in existing.iter_mut().zip(&keys) {
+                map.insert(key_bytes(&fields[1..], key), ctid.clone());
+            }
         }
     }
-    let mut joined = out.join("\n");
-    joined.push('\n');
-    joined
+
+    let select = columns
+        .iter()
+        .zip(&exprs)
+        .map(|((name, _), expr)| column_override(catalog, name).unwrap_or(expr))
+        .collect::<Vec<_>>()
+        .join(", ");
+    // Read role metadata through pg_roles without superuser access; passwords are masked
+    let from = if catalog == "pg_authid" {
+        "pg_roles"
+    } else {
+        catalog
+    };
+    let rows = source
+        .copy_out(&format!(
+            "COPY (SELECT {select} FROM pg_catalog.{from} WHERE {filter}) TO STDOUT"
+        ))
+        .await?;
+    let copy = format!("COPY {rel} FROM STDIN");
+    let sink = oracle.copy_in(&copy).await?;
+    futures::pin_mut!(rows, sink);
+    // Hold back rows replacing oracle rows until those are deleted
+    let mut held = Vec::new();
+    let mut replaced = HashSet::default();
+    while let Some(row) = rows.try_next().await? {
+        let fields = copy_fields(&row, columns.len())?;
+        let mut conflicts = false;
+        for (map, key) in existing.iter().zip(&keys) {
+            if let Some(ctid) = map.get(&key_bytes(&fields, key)) {
+                replaced.insert(ctid.as_str());
+                conflicts = true;
+            }
+        }
+        if conflicts {
+            held.push(row);
+        } else {
+            sink.feed(row).await?;
+        }
+    }
+    sink.finish().await?;
+    if held.is_empty() {
+        return Ok(());
+    }
+    let replaced: Vec<&str> = replaced.into_iter().collect();
+    oracle
+        .execute(
+            &format!("DELETE FROM {rel} WHERE ctid = ANY($1::pg_catalog.text[]::pg_catalog.tid[])"),
+            &[&replaced],
+        )
+        .await?;
+    let sink = oracle.copy_in(&copy).await?;
+    futures::pin_mut!(sink);
+    for row in held {
+        sink.feed(row).await?;
+    }
+    sink.finish().await?;
+    Ok(())
 }
 
-fn should_drop_entry(seg: &[&str], excluded: &ahash::HashSet<&str>) -> bool {
-    let meta = seg
-        .get(1)
-        .and_then(|h| h.strip_prefix("-- Name: "))
-        .unwrap_or("");
-    if let Some((name, rest)) = meta.split_once("; Type: ") {
-        let typ = rest.split(';').next().unwrap_or("").trim();
-        if typ == "EXTENSION" && excluded.contains(name) {
-            return true;
-        }
-        if typ == "COMMENT"
-            && name
-                .strip_prefix("EXTENSION ")
-                .is_some_and(|e| excluded.contains(e.trim()))
-        {
-            return true;
-        }
+/// Split one text COPY row, PostgreSQL sends each row in its own message
+fn copy_fields(row: &[u8], width: usize) -> Result<Vec<&[u8]>> {
+    let line = row.strip_suffix(b"\n").context("unterminated COPY row")?;
+    let fields: Vec<&[u8]> = line.split(|&b| b == b'\t').collect();
+    anyhow::ensure!(
+        fields.len() == width,
+        "COPY row has {} fields, expected {width}",
+        fields.len()
+    );
+    Ok(fields)
+}
+
+/// Compare escaped text, which is equal for equal key values since both sides
+/// use the same output functions. Escaped fields contain no tabs
+fn key_bytes(fields: &[&[u8]], key: &[usize]) -> Vec<u8> {
+    key.iter()
+        .map(|&i| fields[i])
+        .collect::<Vec<_>>()
+        .join(&b'\t')
+}
+
+/// Represent table row types as composites so PostgreSQL does not look for
+/// storage, constraints, defaults or partition keys that were not copied
+fn column_override(catalog: &str, column: &str) -> Option<&'static str> {
+    match (catalog, column) {
+        ("pg_class", "relkind") => Some("'c'"),
+        (
+            "pg_class",
+            "relam" | "relfilenode" | "reltablespace" | "reltoastrelid" | "relchecks"
+            | "relrewrite",
+        ) => Some("0"),
+        (
+            "pg_class",
+            "relhasindex"
+            | "relhasrules"
+            | "relhastriggers"
+            | "relhassubclass"
+            | "relrowsecurity"
+            | "relforcerowsecurity"
+            | "relispartition",
+        )
+        | ("pg_attribute", "atthasdef" | "atthasmissing" | "attnotnull") => Some("false"),
+        ("pg_authid", "rolpassword") => Some("NULL"),
+        _ => None,
     }
-    seg.iter().any(|l| {
-        l.trim_start()
-            .strip_prefix("ALTER EXTENSION ")
-            .and_then(|r| r.split_whitespace().next())
-            .is_some_and(|ext| excluded.contains(ext.trim_matches('"')))
-    })
+}
+
+/// Collect source column types from mapped tables for oracle setup
+pub fn mapped_types(catalog: &CatalogMap, tables: &MappingSnapshot) -> Vec<Oid> {
+    let mut types: Vec<Oid> = catalog
+        .partitioned()
+        .chain(catalog.descriptors())
+        .filter(|desc| tables.contains_key(&desc.rel_name))
+        .flat_map(|desc| desc.attributes.iter())
+        .filter(|attr| !attr.dropped)
+        .map(|attr| attr.type_oid)
+        .collect();
+    types.sort_unstable();
+    types.dedup();
+    types
 }
 
 /// Include every mapped relation, window WAL also emits snapshot opt-outs
@@ -326,7 +580,6 @@ mod tests {
         INT4OID, JSONBOID, JSONOID, RelAttr, RelDescriptor, RelName, ReplIdent, TEXTOID,
     };
     use crate::table_rules::MatchKind;
-    use ahash::HashMap;
 
     fn attr(attnum: i16, name: &str, type_oid: u32, type_name: &str, type_len: i16) -> RelAttr {
         RelAttr {
@@ -468,135 +721,5 @@ mod tests {
             .is_err()
         );
         assert!(needs_oracle(&catalog, &tables, &rules));
-    }
-
-    const DUMP: &str = "\
---
--- PostgreSQL database dump
---
-
-SET statement_timeout = 0;
-
---
--- Name: pg_clickhouse; Type: EXTENSION; Schema: -; Owner: -
---
-
-DROP EXTENSION IF EXISTS pg_clickhouse;
-SELECT pg_catalog.binary_upgrade_create_empty_extension('pg_clickhouse', 'public', true, '1.0', NULL, NULL, ARRAY[]::pg_catalog.text[]);
-
-
---
--- Name: EXTENSION pg_clickhouse; Type: COMMENT; Schema: -; Owner: -
---
-
-COMMENT ON EXTENSION pg_clickhouse IS 'stub clickhouse extension';
-
-
---
--- Name: pg_clickhouse_noop(); Type: FUNCTION; Schema: public; Owner: -
---
-
-CREATE FUNCTION public.pg_clickhouse_noop() RETURNS integer
-    LANGUAGE c
-    AS '$libdir/pg_clickhouse', 'pg_clickhouse_noop';
-
--- For binary upgrade, handle extension membership the hard way
-ALTER EXTENSION pg_clickhouse ADD FUNCTION public.pg_clickhouse_noop();
-
-
-SET default_table_access_method = heap;
-
---
--- Name: app; Type: TABLE; Schema: public; Owner: -
---
-
-CREATE TABLE public.app (
-    id integer NOT NULL,
-    name text
-);
-";
-
-    #[test]
-    fn filter_drops_only_the_excluded_extension() {
-        let out = filter_out_extensions(DUMP, &["pg_clickhouse".to_string()]);
-        assert!(
-            !out.contains("pg_clickhouse"),
-            "all pg_clickhouse refs gone"
-        );
-        assert!(
-            !out.contains("$libdir"),
-            "no missing-library CREATE FUNCTION"
-        );
-        assert!(out.contains("CREATE TABLE public.app"), "mapped table kept");
-        assert!(
-            out.contains("SET default_table_access_method = heap;"),
-            "top-level SET in a dropped entry is preserved"
-        );
-        assert!(out.contains("SET statement_timeout = 0;"), "preamble kept");
-    }
-
-    #[test]
-    fn filter_is_identity_when_nothing_excluded() {
-        assert_eq!(filter_out_extensions(DUMP, &[]), DUMP.to_string());
-    }
-
-    #[test]
-    fn filter_keeps_extensions_not_in_the_excluded_set() {
-        let out = filter_out_extensions(DUMP, &["some_other_ext".to_string()]);
-        assert_eq!(out, DUMP);
-    }
-
-    #[test]
-    fn filter_extension_entries() {
-        for (meta, sql, dropped) in [
-            ("stub; Type: EXTENSION", "CREATE EXTENSION stub;", true),
-            ("keep; Type: EXTENSION", "CREATE EXTENSION keep;", false),
-            (
-                "EXTENSION stub; Type: COMMENT",
-                "COMMENT ON EXTENSION stub IS 'stub';",
-                true,
-            ),
-            (
-                "EXTENSION keep; Type: COMMENT",
-                "COMMENT ON EXTENSION keep IS 'keep';",
-                false,
-            ),
-            (
-                "stub; Type: COMMENT",
-                "COMMENT ON TABLE stub IS 'stub';",
-                false,
-            ),
-            (
-                "f(); Type: FUNCTION",
-                "  ALTER EXTENSION \"stub\" ADD FUNCTION f();",
-                true,
-            ),
-            (
-                "f(); Type: FUNCTION",
-                "ALTER EXTENSION keep ADD FUNCTION f();",
-                false,
-            ),
-            ("stub; Type: TABLE", "CREATE TABLE stub (id int);", false),
-        ] {
-            let entry = format!("--\n-- Name: {meta}; Schema: public; Owner: -\n--\n{sql}\n");
-            let settings = "  SET default_table_access_method = heap;\n";
-            let tail = "--\n-- Name: app; Type: TABLE; Schema: public; Owner: -\n--\nCREATE TABLE app (id int);\n";
-            for prefix in [
-                "",
-                "-- PostgreSQL database dump\nSET statement_timeout = 0;\n",
-            ] {
-                let dump = format!("{prefix}{entry}{settings}{tail}");
-                let expected = if dropped {
-                    format!("{prefix}{settings}{tail}")
-                } else {
-                    dump.clone()
-                };
-                assert_eq!(
-                    filter_out_extensions(&dump, &["stub".into()]),
-                    expected,
-                    "{meta}"
-                );
-            }
-        }
     }
 }
