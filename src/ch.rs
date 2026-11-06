@@ -9,6 +9,7 @@ use backon::BackoffBuilder;
 use clickhouse_c::tls::rustls::pki_types::ServerName;
 use clickhouse_c::{
     AsyncClient, Block, BoxedAsyncClient, ClientOpts, Codec, Compression, ErrorKind, Event,
+    ServerInfo,
 };
 use thiserror::Error;
 use tokio::net::TcpStream;
@@ -160,10 +161,38 @@ pub async fn connect_client(
             .await
             .map(AsyncClient::boxed)
     };
-    client.map_err(|e| match e.kind {
+    let mut client = client.map_err(|e| match e.kind {
         ErrorKind::Io | ErrorKind::Eof => EmitterError::HelloDropped(e),
         _ => e.into(),
-    })
+    })?;
+    if supports_time64(client.server_info().as_ref()) {
+        enable_time64(&mut client).await?;
+    }
+    Ok(client)
+}
+
+/// `time` maps to `Time64`, which ClickHouse 25.6+ creates only under
+/// `enable_time_time64_type`. Earlier servers have no `Time64` and reject the
+/// setting
+fn supports_time64(server: Option<&ServerInfo>) -> bool {
+    server.is_some_and(|i| (i.version_major, i.version_minor) >= (25, 6))
+}
+
+/// Session setting, so it covers every DDL on the connection, `CREATE … AS`
+/// clones included, and is not persisted on the tables it creates
+async fn enable_time64(client: &mut BoxedAsyncClient) -> Result<(), EmitterError> {
+    client
+        .send_query("SET enable_time_time64_type = 1", None)
+        .await?;
+    match drain_to_end_of_stream(client).await {
+        Ok(_) => Ok(()),
+        // A settings constraint can refuse it; only `Time64` DDL needs it
+        Err(EmitterError::ServerException { code, message }) => {
+            tracing::warn!(code, %message, "enable_time_time64_type refused; Time64 DDL will fail");
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// SNI + certificate name for the TLS handshake: `tls_server_name` when
@@ -487,6 +516,24 @@ pub fn quote_ident(name: &str) -> String {
 mod tests {
     use super::*;
     use crate::emit::ch_emitter::InstanceConfig;
+
+    #[test]
+    fn time64_is_enabled_from_25_6() {
+        let server = |version_major, version_minor| ServerInfo {
+            name: "ClickHouse".into(),
+            timezone: "UTC".into(),
+            display_name: String::new(),
+            version_major,
+            version_minor,
+            version_patch: 0,
+            revision: 0,
+        };
+        assert!(supports_time64(Some(&server(25, 6))));
+        assert!(supports_time64(Some(&server(26, 1))));
+        assert!(!supports_time64(Some(&server(25, 5))));
+        assert!(!supports_time64(Some(&server(24, 12))));
+        assert!(!supports_time64(None));
+    }
 
     /// `compression = "none"` still has to decode a compressed response: the
     /// wire flag says what we send, not what the server answers in. A server
