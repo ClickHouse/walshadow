@@ -1262,7 +1262,7 @@ async fn session_body(
         )
         .await?;
     let mirror_resolver = reorder_sink.planning_resolver();
-    let predecode = Arc::new(decoder.predecoder(reorder_sink.planning_resolver()));
+    let prescan = Arc::new(decoder.prescan(reorder_sink.planning_resolver()));
     let decoder_xact = QueueingRecordSink::spawn(
         DecoderXactPair {
             decoder,
@@ -1272,7 +1272,7 @@ async fn session_body(
         decoder_queue_capacity,
         span_registry.clone(),
     )
-    .with_predecode(predecode);
+    .with_prescan(prescan);
     let boundary_gate = CatalogBoundaryGate::new(
         shadow_state.clone(),
         BoundaryGateConfig {

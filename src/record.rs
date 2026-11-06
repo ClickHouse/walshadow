@@ -8,7 +8,6 @@ use thiserror::Error;
 use walrus::pg::wal::segment::SegmentName;
 use walrus::pg::walparser::{RmId, XLogRecord};
 
-use crate::decode::heap_decoder::Predecoded;
 use crate::source::timeline::TimelineHistory;
 
 pub const WAL_SEG_SIZE: u64 = walrus::pg::wal::segment::DEFAULT_WAL_SEG_SIZE;
@@ -254,14 +253,10 @@ pub trait RecordSink: Send {
         true
     }
 
-    /// One boxed future per batch rather than per record; order preserved.
-    /// `pre` holds tuples a dispatcher decoded ahead, off this sink's task,
-    /// by batch index; empty when nothing was decoded ahead, and sinks
-    /// without a decode step drop it
+    /// One boxed future per batch rather than per record; order preserved
     fn on_records<'a>(
         &'a mut self,
         batch: &'a [Record<'a>],
-        _pre: &'a mut [Option<Predecoded>],
     ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
         Box::pin(async move {
             for record in batch {

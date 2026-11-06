@@ -6,9 +6,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use clap::Parser;
-use walrus::pg::walparser::RelFileNode;
-use walshadow::heap_decoder::{ColumnValue, DecodedHeap, DecodedTuple, DescribedHeap, HeapOp};
-use walshadow::schema::{RelDescriptor, RelName, ReplIdent};
+use walrus::pg::walparser::{
+    BlockLocation, RelFileNode, RmId, XLogRecord, XLogRecordBlock, XLogRecordBlockHeader,
+    XLogRecordHeader,
+};
+use walshadow::heap_decoder::ColumnValue;
+use walshadow::schema::{RelAttr, RelDescriptor, RelName, ReplIdent, TEXTOID};
+use walshadow::spill::{DescribedInput, HeapInput};
 use walshadow::xact_buffer::{StashResolved, XactBuffer, XactBufferConfig};
 
 #[path = "common/alloc_meter.rs"]
@@ -61,9 +65,49 @@ async fn run(args: Args) -> anyhow::Result<()> {
         persistence: 'p',
         ancestors: Vec::new(),
         replident: ReplIdent::Default { pk_attnums: None },
-        attributes: Vec::new(),
+        attributes: vec![RelAttr {
+            attnum: 1,
+            name: "v".into(),
+            type_oid: TEXTOID,
+            typmod: -1,
+            not_null: false,
+            dropped: false,
+            type_name: "text".into(),
+            type_byval: false,
+            type_len: -1,
+            type_align: 'i',
+            type_storage: 'x',
+            missing_default: None,
+        }],
     });
     let payload = "x".repeat(args.payload_bytes);
+    // XLOG_HEAP_INSERT block data: xl_heap_header, then one 4-byte-header text
+    let mut tuple = 1u16.to_le_bytes().to_vec();
+    tuple.extend_from_slice(&0u16.to_le_bytes());
+    tuple.push(24);
+    tuple.push(0);
+    tuple.extend_from_slice(&(((4 + payload.len()) as u32) << 2).to_le_bytes());
+    tuple.extend_from_slice(payload.as_bytes());
+    let record = |xid: u32| XLogRecord {
+        header: XLogRecordHeader {
+            xact_id: xid,
+            resource_manager_id: RmId::Heap as u8,
+            ..Default::default()
+        },
+        blocks: vec![XLogRecordBlock {
+            header: XLogRecordBlockHeader {
+                location: BlockLocation {
+                    rel: descriptor.rfn,
+                    block_no: 0,
+                },
+                ..Default::default()
+            },
+            data: std::borrow::Cow::Borrowed(&tuple[..]),
+            ..Default::default()
+        }],
+        main_data: std::borrow::Cow::Borrowed(&[1, 0, 8][..]),
+        ..Default::default()
+    };
     println!("{args:?}");
     for repeat in 0..args.repeats {
         let dir = tempfile::tempdir_in(&args.dir)?;
@@ -78,20 +122,12 @@ async fn run(args: Args) -> anyhow::Result<()> {
         for xid in 1..=args.transactions {
             let base = GLOBAL.reset_peak();
             let start = Instant::now();
+            let record = record(xid);
             for row in 0..args.rows {
+                let source_lsn = u64::from(xid) * (args.rows as u64 + 1) + row as u64;
                 buffer
-                    .on_heap(DescribedHeap {
-                        decoded: DecodedHeap {
-                            rfn: descriptor.rfn,
-                            xid,
-                            source_lsn: u64::from(xid) * (args.rows as u64 + 1) + row as u64,
-                            op: HeapOp::Insert,
-                            new: Some(DecodedTuple {
-                                columns: vec![Some(ColumnValue::Text(payload.clone()))],
-                                partial: false,
-                            }),
-                            old: None,
-                        },
+                    .on_input(DescribedInput {
+                        input: HeapInput::from_parsed(&record, source_lsn, 1),
                         descriptor: descriptor.clone(),
                         descriptor_valid_from: 1,
                     })

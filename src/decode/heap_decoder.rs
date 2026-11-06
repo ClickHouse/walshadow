@@ -65,7 +65,6 @@
 
 use std::borrow::Cow;
 use std::string::FromUtf8Error;
-use std::sync::Arc;
 
 use smallvec::{SmallVec, smallvec};
 
@@ -84,32 +83,6 @@ use crate::schema::{
 /// SmallVec sized at 1: single-row INSERT/UPDATE/DELETE stays stack-allocated,
 /// only MULTI_INSERT with ntuples > 1 spills.
 pub type DecodedHeaps = SmallVec<[DecodedHeap; 1]>;
-
-/// Tuples of one record decoded ahead of the serial worker against the
-/// descriptor resolved then. Decoding is pure in (record, descriptor), so
-/// they stand in for the worker's own decode when its lookup lands on the
-/// same descriptor version
-#[derive(Debug)]
-pub struct Predecoded {
-    rel: Arc<RelDescriptor>,
-    valid_from: u64,
-    set: DecodedHeaps,
-}
-
-impl Predecoded {
-    pub fn new(rel: Arc<RelDescriptor>, valid_from: u64, set: DecodedHeaps) -> Self {
-        Self {
-            rel,
-            valid_from,
-            set,
-        }
-    }
-
-    /// Tuples, if decoded against `rel` valid from `valid_from`
-    pub fn take_if(self, rel: &Arc<RelDescriptor>, valid_from: u64) -> Option<DecodedHeaps> {
-        (Arc::ptr_eq(&self.rel, rel) && self.valid_from == valid_from).then_some(self.set)
-    }
-}
 
 /// PG `SizeOfHeapHeader`.
 pub const SIZE_OF_HEAP_HEADER: usize = 5;
@@ -512,6 +485,24 @@ impl TupleView<'_> {
     }
 }
 
+/// Tuple walked for validity and shape only, building nothing
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TupleShape {
+    pub partial: bool,
+}
+
+impl TupleBuild<'_> for TupleShape {
+    fn with_capacity(_: usize) -> Self {
+        Self::default()
+    }
+
+    fn push(&mut self, _: &RelAttr, _: DatumRef<'_>) {}
+
+    fn set_partial(&mut self) {
+        self.partial = true;
+    }
+}
+
 /// Images of one heap tuple change, before identity and position attach
 #[derive(Clone, Debug, PartialEq)]
 pub struct HeapImages<T> {
@@ -557,6 +548,14 @@ pub fn view_heap_record<'a>(
     record: &'a XLogRecord<'_>,
     rel: &RelDescriptor,
 ) -> Result<SmallVec<[HeapImages<TupleView<'a>>; 1]>, DecodeError> {
+    parse_heap_record(record, rel)
+}
+
+/// Validate `record` as [`decode_heap_record`] would, without building cells
+pub fn scan_heap_record(
+    record: &XLogRecord<'_>,
+    rel: &RelDescriptor,
+) -> Result<SmallVec<[HeapImages<TupleShape>; 1]>, DecodeError> {
     parse_heap_record(record, rel)
 }
 
