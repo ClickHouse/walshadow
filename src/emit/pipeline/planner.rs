@@ -42,7 +42,8 @@ use std::sync::Arc;
 use crate::decode::datum::DatumRef;
 use crate::decode::heap_decoder::view_heap_record;
 use crate::emit::pipeline::plan_spool::{
-    DEFAULT_PLAN_MEM_MAX, PlanPath, PlanSpoolError, PlanWriter, SealedPlan, ViewChange,
+    DEFAULT_PLAN_MEM_MAX, EncoderCache, PlanPath, PlanSpoolError, PlanWriter, SealedPlan,
+    ViewChange,
 };
 use crate::emit::route::RouteSnapshot;
 use crate::schema::RelDescriptor;
@@ -68,6 +69,12 @@ pub trait PlanRouteView {
         &mut self,
         entry: &DrainEntry,
     ) -> impl std::future::Future<Output = Result<(), String>> + Send;
+    /// Encoders an earlier plan compiled against routes this view still
+    /// answers with
+    fn take_encoders(&mut self) -> EncoderCache {
+        EncoderCache::default()
+    }
+    fn keep_encoders(&mut self, _encoders: EncoderCache) {}
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -143,7 +150,8 @@ impl<'a, V: PlanRouteView> Planner<'a, V> {
         Self {
             writer: PlanWriter::create(path, disk_cap, DEFAULT_PLAN_MEM_MAX)
                 .with_segment_limits(segment.0, segment.1)
-                .for_commit(commit_ts),
+                .for_commit(commit_ts)
+                .with_encoders(view.take_encoders()),
             view,
             resolver,
             rows_base: 0,
@@ -280,7 +288,8 @@ impl<'a, V: PlanRouteView> Planner<'a, V> {
 
     /// Freeze the validated plan for the executor
     pub fn seal(self, commit_lsn: u64, commit_ts: i64) -> Result<SealedPlan, PlanError> {
-        let plan = self.writer.seal(commit_lsn, commit_ts)?;
+        let (plan, encoders) = self.writer.seal_keeping(commit_lsn, commit_ts)?;
+        self.view.keep_encoders(encoders);
         for t in &plan.tables {
             if t.route.is_none() {
                 self.view.unmapped(&t.descriptor, t.heaps);

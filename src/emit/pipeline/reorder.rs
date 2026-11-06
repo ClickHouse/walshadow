@@ -49,7 +49,7 @@ use crate::config::ResolvedConfig;
 use crate::emit::pipeline::Fatal;
 use crate::emit::pipeline::ack::{AckHandle, BufferedRowSender, Publish, SeqAlloc};
 use crate::emit::pipeline::batcher::{BatcherMsg, PlacedSegment};
-use crate::emit::pipeline::plan_spool::{PlanItem, PlanPath, SealedPlan, Segment};
+use crate::emit::pipeline::plan_spool::{EncoderCache, PlanItem, PlanPath, SealedPlan, Segment};
 use crate::emit::pipeline::planner::{PlanRouteView, Planner, drain_reason};
 use crate::emit::route::{RouteSnapshot, RowPolicy, route_via};
 use crate::mapping::{MappingSnapshot, TableMapping};
@@ -1383,6 +1383,8 @@ pub struct RouteMaps {
     memo: HashMap<RelName, (Arc<RelDescriptor>, Option<Arc<RouteSnapshot>>)>,
     /// Routes by owning relation
     owned: HashMap<RelName, Option<Arc<RouteSnapshot>>>,
+    /// Compiled against `memo` routes, cleared with them
+    encoders: EncoderCache,
 }
 
 impl RouteMaps {
@@ -1390,6 +1392,7 @@ impl RouteMaps {
         self.overlay.clear();
         self.memo.clear();
         self.owned.clear();
+        self.encoders.clear();
     }
 }
 
@@ -1451,6 +1454,14 @@ impl PlanRouteView for ReorderRouteView<'_> {
                 .insert(rel_name.clone(), (rel.clone(), route.clone()));
             route
         }
+    }
+
+    fn take_encoders(&mut self) -> EncoderCache {
+        std::mem::take(&mut self.maps.encoders)
+    }
+
+    fn keep_encoders(&mut self, encoders: EncoderCache) {
+        self.maps.encoders = encoders;
     }
 
     fn unmapped(&mut self, rel: &RelDescriptor, heaps: u64) {
