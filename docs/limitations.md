@@ -65,9 +65,9 @@ insert batch
   column and row, rather than writing a substituted value
 - a multidimensional array does not fit the default one-layer `Array(...)`
   mapping; map the column to a matching nested `Array(Array(...))` instead
-- greenfield bootstrap runs before the shadow exists, so it starts a throwaway
-  PostgreSQL instance from source schema to convert them, which requires `pg_dump`
-  Schema objects for extensions unavailable on daemon host are omitted
+- greenfield bootstrap runs before shadow exists, so it starts temporary
+  PostgreSQL to convert these values, copying source catalog rows needed for
+  mapped column types
 
 ## Ordering and consistency
 
