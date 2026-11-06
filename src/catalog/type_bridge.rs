@@ -366,6 +366,8 @@ fn pending_text_literal(text: &str, ch_inner: &str) -> Option<String> {
                 .collect();
             Some(format!("[{}]", items.join(", ")))
         }
+        // No text form ClickHouse casts to these
+        Some(Kind::Map | Kind::Object | Kind::QBit) => None,
         // BC and ±infinity have no DateTime64 form
         Some(Kind::DateTime64) if text.ends_with(" BC") || text.ends_with("infinity") => None,
         Some(Kind::DateTime64) => Some(format!(
@@ -932,6 +934,13 @@ mod tests {
             let r = map(&array_attr(type_name, text), false).unwrap();
             assert_eq!(r.default_sql.as_deref(), expected, "{type_name} {text}");
         }
+    }
+
+    #[test]
+    fn map_text_default_is_dropped() {
+        let r = map(&array_attr("hstore", r#""a"=>"1""#), false).unwrap();
+        assert_eq!(r.ch_type, "Map(String, Nullable(String))");
+        assert_eq!(r.default_sql, None);
     }
 
     #[test]
