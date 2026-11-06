@@ -349,8 +349,8 @@ empty containers
 Arrays, maps, and vectors currently use shadow PostgreSQL conversion, including
 when destination uses Native container types
 
-ClickHouse deployments using PostgreSQL `time` columns must enable
-`Time64` support
+PostgreSQL `time` columns need ClickHouse 25.6+ for `Time64`; walshadow sends
+`enable_time_time64_type` with its DDL, which 25.6 through 25.11 require
 
 Use a column rule to override an inferred type; see
 [Select tables](table-selection.md#rename-targets-or-columns). For pgvector

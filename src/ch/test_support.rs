@@ -8,10 +8,12 @@ use crate::ch::CompressionChoice;
 use crate::emit::ch_emitter::{EmitterConfig, InstanceConfig, RetryConfig};
 
 /// Server expecting `sql` then `blocks` one-row Data blocks per attempt.
-/// First attempt drops connection without reply, after `cut` blocks when set
+/// First attempt drops connection without reply, after `cut` blocks when set.
+/// `ddl` expects settings `ch::exec_drain` sends
 pub(crate) async fn retry_server(
     max_attempts: u32,
     sql: &str,
+    ddl: bool,
     blocks: usize,
     idle: bool,
     cut: Option<usize>,
@@ -33,7 +35,7 @@ pub(crate) async fn retry_server(
         ..EmitterConfig::default()
     };
     assert!(sql.len() < 128);
-    // Empty query ID, clickhouse-c ClientInfo, no settings or interserver secret,
+    // Empty query ID, clickhouse-c ClientInfo, settings, no interserver secret,
     // complete stage, no compression
     let mut expected = vec![1, 0, 1, 0, 0, 20];
     expected.extend_from_slice(b"[::ffff:127.0.0.1]:0");
@@ -41,6 +43,11 @@ pub(crate) async fn retry_server(
     expected.extend_from_slice(&[1, 0, 0, 19]);
     expected.extend_from_slice(b"clickhouse-c client");
     expected.extend_from_slice(&[0, 0, 0xc1, 0xa9, 0x03, 0, 0, 0, 0, 0, 0, 0]);
+    if ddl {
+        expected.push(23);
+        expected.extend_from_slice(b"enable_time_time64_type");
+        expected.extend_from_slice(&[0, 1, b'1']);
+    }
     expected.extend_from_slice(&[0, 0, 2, 0, sql.len() as u8]);
     expected.extend_from_slice(sql.as_bytes());
     // Empty params, then empty Data block with BlockInfo

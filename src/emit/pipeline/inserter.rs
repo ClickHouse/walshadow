@@ -184,7 +184,7 @@ mod tests {
             (2, false, 3, Some(2)),
         ] {
             let (mut config, server) =
-                crate::ch::test_support::retry_server(retries, sql, blocks, idle, cut).await;
+                crate::ch::test_support::retry_server(retries, sql, false, blocks, idle, cut).await;
             config.compression = CompressionChoice::Lz4;
             let dest = DestEmitter::new(Arc::new(config), None);
             let mut client = ChConn::deferred(dest);

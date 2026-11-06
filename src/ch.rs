@@ -9,7 +9,7 @@ use backon::BackoffBuilder;
 use clickhouse_c::tls::rustls::pki_types::ServerName;
 use clickhouse_c::{
     Allocator, AsyncClient, Block, BoxedAsyncClient, ClientOpts, Codec, Compression, ErrorKind,
-    Event, Exception, QueryOpts,
+    Event, Exception, QueryOpts, QuerySetting,
 };
 use thiserror::Error;
 use tokio::net::TcpStream;
@@ -223,8 +223,15 @@ pub async fn drain_to_end_of_stream(
     }
 }
 
+/// `time` maps to `Time64`, which ClickHouse 25.6 through 25.11 creates only
+/// under this setting. Sent per query, not as a SQL `SETTINGS` clause, which
+/// `CREATE … AS` would read as table settings. Servers without it skip it
+const DDL_SETTINGS: &[QuerySetting<'static>] = &[QuerySetting::new("enable_time_time64_type", "1")];
+
 pub async fn exec_drain(client: &mut BoxedAsyncClient, sql: &str) -> Result<(), EmitterError> {
-    client.send_query(sql, &QueryOpts::new()).await?;
+    client
+        .send_query(sql, &QueryOpts::new().settings(DDL_SETTINGS))
+        .await?;
     drain_to_end_of_stream(client).await?;
     Ok(())
 }
