@@ -37,15 +37,17 @@ planning committed transactions
 
 ## Commit pipeline
 
-![Commit pipeline: reorder places rows inline, one batcher feeds a conversion pool and ClickHouse inserters, and acknowledgements advance a contiguous watermark](workers.svg)
+![Commit pipeline: reorder plans column chunks, one batcher feeds a conversion and sealing pool, inserters send prepared blocks, and acknowledgements advance a contiguous watermark](workers.svg)
 
 `BufferingDecoderSink` and `ReorderSink` share one record-queue worker
 `ReorderSink` plans each commit, encoding its rows into per-table column
 chunks, and places them onto the batcher in order. Batcher merges chunks of
 many commits into Native blocks and groups blocks into per-table INSERTs. A
 separate conversion pool resolves PostgreSQL types, then serializes each block
-once and keeps it compressed until its INSERT is durable. Conversion concurrency
-matches oracle capacity; `[ch].inserter_pool_size` sizes the inserter pool
+once and keeps prepared bytes until its INSERT is durable. Compression follows
+`[ch] compression`; inserters rebuild blocks only when a connection rejects
+prepared bytes. Conversion concurrency matches oracle capacity;
+`[ch].inserter_pool_size` sizes inserter pool
 Each inserter owns a ClickHouse connection and takes any ready batch
 
 Sequence numbers identify work slices, not necessarily whole transactions
@@ -56,10 +58,11 @@ and plan data can spill to disk
 Queue worker runs on a dedicated thread. A dispatcher scans each batch ahead of
 it to start TOAST store reads for values updated rows keep. Ordinary heap
 records stay WAL bytes under their record-time descriptor until commit;
-planning reads tuples in place and builds cells only for rows whose values must
-be detoasted. Commits drain only their own transaction trees.
-Consecutive small commits can share row chunks while retaining separate
-acknowledgements
+planning reads tuples in place. External TOAST rows and other owned inputs use
+cell adapters; compressed inline values, numeric, JSONB, and fast defaults can
+also need row scratch. Commits drain only their own transaction trees
+Consecutive small commits can share column blocks while retaining separate
+acknowledgements. COPY and backup loads still enter batcher as cell rows
 
 ## Design boundaries
 

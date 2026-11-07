@@ -343,7 +343,12 @@ Common mappings include:
 | `inet`, `cidr`, `interval`, unknown types | `String` |
 
 Nullable source columns become `Nullable(...)` unless used as ClickHouse sort
-keys. ClickHouse deployments using PostgreSQL `time` columns must enable
+keys or mapped to arrays or maps. Default array and map mappings turn NULL into
+empty containers
+Arrays, maps, and vectors currently use shadow PostgreSQL conversion, including
+when destination uses Native container types
+
+ClickHouse deployments using PostgreSQL `time` columns must enable
 `Time64` support
 
 Use a column rule to override an inferred type; see
