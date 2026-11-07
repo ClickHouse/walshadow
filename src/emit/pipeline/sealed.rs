@@ -1,83 +1,66 @@
-//! Resolved Native blocks kept compressed from seal until INSERT
-//! acknowledgement.
+//! Resolved Native blocks kept as prepared Data packet bodies from seal until
+//! INSERT acknowledgement.
 //!
-//! clickhouse-c serializes each block once; the body is compressed with the
-//! configured codec and column slabs drop. An inserter decodes one block at
-//! a time back into a scratch buffer to send it, so resident output costs
-//! compressed bytes plus one block per inserter. Incompressible bodies stay
-//! raw rather than expand
+//! clickhouse-c serializes each block once, compressing wire frames as it
+//! goes, and column slabs drop. Inserters write those bytes on connections
+//! negotiating the same compression; a connection refusing them, such as a
+//! named destination configured otherwise, gets the block decoded and rebuilt
 
 use std::pin::Pin;
 
-use clickhouse_c::{Allocator, Block, BlockBuilder, BlockOpts, BlockReader, Io, SliceIo, sys};
+use clickhouse_c::{
+    Allocator, Block, BlockBuilder, BlockOpts, BlockReader, Codec, PreparedBlock, SliceIo,
+};
 
 use crate::ch::{CompressionChoice, EmitterError};
 
-/// Native file framing: blocks never leave this process in this form
+/// TCP Data packet body framing, which prepared bytes carry
 const OPTS: BlockOpts = BlockOpts {
-    has_block_info: false,
-    has_custom_serialization: false,
+    has_block_info: true,
+    has_custom_serialization: true,
     read_buffer_bytes: 0,
 };
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Stored {
-    Raw,
-    Lz4,
-    Zstd,
-}
+/// CityHash128 checksum, then method byte and two little-endian u32 sizes;
+/// ClickHouse `src/Compression/CompressionInfo.h`
+const CHECKSUM: usize = 16;
+const FRAME_HEADER: usize = 9;
+const METHOD_NONE: u8 = 0x02;
+const METHOD_LZ4: u8 = 0x82;
+const METHOD_ZSTD: u8 = 0x90;
 
-/// One serialized block body, owned until its INSERT is durable
+/// One prepared block body, owned until its INSERT is durable
 pub(crate) struct SealedBlock {
-    stored: Stored,
-    payload: Box<[u8]>,
-    raw_len: usize,
-    n_rows: usize,
+    prepared: PreparedBlock,
+    compression: CompressionChoice,
 }
 
 impl SealedBlock {
-    /// Serialize `bb` and compress its body. `scratch` holds the raw body
-    /// between calls so sealing reuses one buffer
+    /// Serialize `bb` once in `compression`; `codec` must support it
     pub(crate) fn seal(
         bb: &BlockBuilder<'_>,
-        n_rows: usize,
-        codec: CompressionChoice,
-        scratch: &mut Vec<u8>,
+        compression: CompressionChoice,
+        codec: Option<Pin<&Codec>>,
+        alloc: Allocator,
     ) -> Result<Self, EmitterError> {
-        scratch.clear();
-        let mut io = VecIo::new(std::mem::take(scratch));
-        let written = bb.write(io.as_mut(), OPTS);
-        *scratch = io.as_mut().take();
-        written?;
-        let raw_len = scratch.len();
-        let compressed = match codec {
-            CompressionChoice::None => None,
-            CompressionChoice::Lz4 => lz4::block::compress(scratch, None, false)
-                .ok()
-                .map(|c| (Stored::Lz4, c)),
-            CompressionChoice::Zstd => zstd::bulk::compress(scratch, 0)
-                .ok()
-                .map(|c| (Stored::Zstd, c)),
-        };
-        let (stored, payload) = match compressed {
-            Some((stored, c)) if c.len() < raw_len => (stored, c.into_boxed_slice()),
-            _ => (Stored::Raw, scratch.as_slice().into()),
-        };
+        let codec = codec.filter(|_| compression != CompressionChoice::None);
         Ok(Self {
-            stored,
-            payload,
-            raw_len,
-            n_rows,
+            prepared: bb.prepare(compression.to_wire(), codec, alloc)?,
+            compression,
         })
+    }
+
+    pub(crate) fn prepared(&self) -> &PreparedBlock {
+        &self.prepared
     }
 
     /// Serialized body bytes before compression
     pub(crate) fn raw_len(&self) -> usize {
-        self.raw_len
+        self.prepared.raw_len()
     }
 
     pub(crate) fn allocated_bytes(&self) -> usize {
-        self.payload.len()
+        self.prepared.capacity()
     }
 
     /// Decode the block, decompressing into `scratch`; the block owns its
@@ -87,39 +70,64 @@ impl SealedBlock {
         alloc: Allocator,
         scratch: &mut Vec<u8>,
     ) -> Result<Block, EmitterError> {
-        let body: &[u8] = match self.stored {
-            Stored::Raw => &self.payload,
-            Stored::Lz4 => {
-                scratch.resize(self.raw_len, 0);
-                let n = lz4::block::decompress_to_buffer(
-                    &self.payload,
-                    Some(self.raw_len as i32),
-                    scratch,
-                )
-                .map_err(|e| EmitterError::Type(format!("sealed block lz4: {e}")))?;
-                &scratch[..n]
-            }
-            Stored::Zstd => {
-                scratch.resize(self.raw_len, 0);
-                let n = zstd::bulk::decompress_to_buffer(&self.payload, &mut scratch[..])
-                    .map_err(|e| EmitterError::Type(format!("sealed block zstd: {e}")))?;
-                &scratch[..n]
+        let bytes = self.prepared.as_bytes();
+        let body = match self.compression {
+            CompressionChoice::None => bytes,
+            _ => {
+                unframe(bytes, scratch)?;
+                &scratch[..]
             }
         };
-        if body.len() != self.raw_len {
+        if body.len() != self.raw_len() {
             return Err(EmitterError::Type(format!(
                 "sealed block body {} bytes, sealed {}",
                 body.len(),
-                self.raw_len
+                self.raw_len()
             )));
         }
         let mut io = SliceIo::new(body);
         let mut reader = BlockReader::new(io.as_mut(), alloc, OPTS)?;
         reader
             .read()?
-            .filter(|b| b.n_rows() == self.n_rows)
+            .filter(|b| b.n_rows() == self.prepared.n_rows())
             .ok_or_else(|| EmitterError::Type("sealed block decoded short".into()))
     }
+}
+
+/// Concatenate decompressed frames of `bytes` into `out`
+fn unframe(mut bytes: &[u8], out: &mut Vec<u8>) -> Result<(), EmitterError> {
+    let corrupt = |what: &str| EmitterError::Type(format!("sealed block frame {what}"));
+    out.clear();
+    while !bytes.is_empty() {
+        let header = bytes
+            .get(CHECKSUM..CHECKSUM + FRAME_HEADER)
+            .ok_or_else(|| corrupt("header short"))?;
+        let size = |at: usize| u32::from_le_bytes(header[at..at + 4].try_into().unwrap()) as usize;
+        let (stored, raw) = (size(1), size(5));
+        let data = stored
+            .checked_sub(FRAME_HEADER)
+            .and_then(|n| bytes.get(CHECKSUM + FRAME_HEADER..CHECKSUM + FRAME_HEADER + n))
+            .ok_or_else(|| corrupt("body short"))?;
+        let at = out.len();
+        out.resize(at + raw, 0);
+        let dst = &mut out[at..];
+        let n = match header[0] {
+            METHOD_LZ4 => lz4::block::decompress_to_buffer(data, Some(raw as i32), dst)
+                .map_err(|e| corrupt(&format!("lz4: {e}")))?,
+            METHOD_ZSTD => zstd::bulk::decompress_to_buffer(data, dst)
+                .map_err(|e| corrupt(&format!("zstd: {e}")))?,
+            METHOD_NONE if data.len() == raw => {
+                dst.copy_from_slice(data);
+                raw
+            }
+            m => return Err(corrupt(&format!("method {m:#x}"))),
+        };
+        if n != raw {
+            return Err(corrupt("size"));
+        }
+        bytes = &bytes[CHECKSUM + stored..];
+    }
+    Ok(())
 }
 
 /// Rebuild a builder over a decoded block's columns, for `send_data`
@@ -138,76 +146,6 @@ pub(crate) fn builder_of(block: &Block) -> Result<BlockBuilder<'_>, EmitterError
     Ok(bb)
 }
 
-/// Write-only transport appending to an owned buffer
-struct VecIo {
-    io: sys::chc_io,
-    out: Vec<u8>,
-    _pin: std::marker::PhantomPinned,
-}
-
-impl VecIo {
-    fn new(out: Vec<u8>) -> Pin<Box<Self>> {
-        let mut boxed = Box::pin(Self {
-            io: sys::chc_io {
-                ud: std::ptr::null_mut(),
-                read: Some(vec_read),
-                write: Some(vec_write),
-                check_cancel: None,
-            },
-            out,
-            _pin: std::marker::PhantomPinned,
-        });
-        // SAFETY: context set once address is stable; value stays pinned
-        unsafe {
-            let this = boxed.as_mut().get_unchecked_mut();
-            this.io.ud = (this as *mut Self).cast();
-        }
-        boxed
-    }
-
-    fn take(self: Pin<&mut Self>) -> Vec<u8> {
-        // SAFETY: buffer is not structurally pinned; callbacks reach it only
-        // through `ud` during a write call
-        std::mem::take(unsafe { &mut self.get_unchecked_mut().out })
-    }
-}
-
-// SAFETY: `io_ptr` points at the pinned callback table whose `ud` names
-// this value; callbacks follow the chc_io contract
-unsafe impl Io for VecIo {
-    fn io_ptr(self: Pin<&mut Self>) -> *mut sys::chc_io {
-        // SAFETY: table address stays fixed while pinned
-        unsafe { &mut self.get_unchecked_mut().io }
-    }
-}
-
-unsafe extern "C" fn vec_write(
-    ud: *mut std::ffi::c_void,
-    buf: *const std::ffi::c_void,
-    len: usize,
-    _err: *mut sys::chc_err,
-) -> std::ffi::c_int {
-    // SAFETY: `ud` points at the pinned VecIo owning this table; C passes
-    // `len` readable bytes
-    unsafe {
-        let this = &mut *ud.cast::<VecIo>();
-        this.out
-            .extend_from_slice(std::slice::from_raw_parts(buf.cast::<u8>(), len));
-    }
-    sys::CHC_OK
-}
-
-unsafe extern "C" fn vec_read(
-    _ud: *mut std::ffi::c_void,
-    _buf: *mut std::ffi::c_void,
-    _len: usize,
-    _out_n: *mut usize,
-    err: *mut sys::chc_err,
-) -> std::ffi::c_int {
-    let _ = err;
-    sys::CHC_ERR_USAGE
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -218,7 +156,7 @@ mod tests {
     }
 
     /// Block of a UInt64, a Nullable(String) and a UUID column
-    fn seal_rows(strings: &[Option<&[u8]>], codec: CompressionChoice) -> (SealedBlock, Vec<u8>) {
+    fn seal_rows(strings: &[Option<&[u8]>], compression: CompressionChoice) -> SealedBlock {
         let n = strings.len();
         let ids: Vec<u8> = (0..n as u64).flat_map(u64::to_le_bytes).collect();
         let uuids: Vec<u8> = (0..16 * n).map(|i| (i * 7) as u8).collect();
@@ -238,14 +176,18 @@ mod tests {
         bb.append("id", types[0].view(), &id).unwrap();
         bb.append("text", types[1].view(), &text).unwrap();
         bb.append("uuid", types[2].view(), &uuid).unwrap();
-        let mut scratch = Vec::new();
-        let sealed = SealedBlock::seal(&bb, n, codec, &mut scratch).unwrap();
-        (sealed, scratch)
+        let codec = compression.build_codec().unwrap();
+        SealedBlock::seal(
+            &bb,
+            compression,
+            codec.as_ref().map(|c| c.as_ref()),
+            alloc(),
+        )
+        .unwrap()
     }
 
-    fn check(strings: &[Option<&[u8]>], codec: CompressionChoice) -> SealedBlock {
-        let (sealed, raw) = seal_rows(strings, codec);
-        assert_eq!(sealed.raw_len(), raw.len());
+    fn check(strings: &[Option<&[u8]>], compression: CompressionChoice) -> SealedBlock {
+        let sealed = seal_rows(strings, compression);
         let mut scratch = Vec::new();
         let block = sealed.open(alloc(), &mut scratch).unwrap();
         assert_eq!(block.n_rows(), strings.len());
@@ -262,16 +204,16 @@ mod tests {
         let (width, ids) = block.column(0).unwrap().fixed().unwrap();
         assert_eq!(width, 8);
         assert_eq!(ids.len(), 8 * strings.len());
-        // Reserialized for the wire, the block keeps its body
-        let mut again = Vec::new();
-        SealedBlock::seal(
+        // Rebuilt for a refusing connection, the block prepares identically
+        let codec = compression.build_codec().unwrap();
+        let again = SealedBlock::seal(
             &builder_of(&block).unwrap(),
-            strings.len(),
-            CompressionChoice::None,
-            &mut again,
+            compression,
+            codec.as_ref().map(|c| c.as_ref()),
+            alloc(),
         )
         .unwrap();
-        assert_eq!(again, raw);
+        assert_eq!(again.prepared().as_bytes(), sealed.prepared().as_bytes());
         sealed
     }
 
@@ -279,28 +221,27 @@ mod tests {
     fn blocks_round_trip_through_every_codec() {
         let big = vec![b'x'; 1 << 20];
         let rows: Vec<Option<&[u8]>> = vec![Some(b"a"), None, Some(b""), Some(&big), None];
-        for codec in [
+        for compression in [
             CompressionChoice::None,
             CompressionChoice::Lz4,
             CompressionChoice::Zstd,
         ] {
-            let sealed = check(&rows, codec);
-            if codec == CompressionChoice::None {
-                assert_eq!(sealed.stored, Stored::Raw);
+            let sealed = check(&rows, compression);
+            if compression == CompressionChoice::None {
+                assert_eq!(sealed.prepared().as_bytes().len(), sealed.raw_len());
             } else {
                 assert!(
                     sealed.allocated_bytes() * 10 < sealed.raw_len(),
-                    "{codec:?}"
+                    "{compression:?}"
                 );
             }
         }
     }
 
-    /// Bodies that do not shrink stay raw rather than expand
     #[test]
-    fn incompressible_body_stays_raw() {
+    fn incompressible_body_round_trips() {
         let mut x = 0x9E37_79B9_7F4A_7C15u64;
-        let noise: Vec<u8> = (0..64 << 10)
+        let noise: Vec<u8> = (0..200 << 10)
             .map(|_| {
                 x ^= x << 13;
                 x ^= x >> 7;
@@ -308,18 +249,35 @@ mod tests {
                 x as u8
             })
             .collect();
-        for codec in [CompressionChoice::Lz4, CompressionChoice::Zstd] {
-            let sealed = check(&[Some(&noise)], codec);
-            assert_eq!(sealed.stored, Stored::Raw);
-            assert_eq!(sealed.allocated_bytes(), sealed.raw_len());
+        for compression in [CompressionChoice::Lz4, CompressionChoice::Zstd] {
+            check(&[Some(&noise)], compression);
         }
     }
 
     #[test]
-    fn corrupt_body_fails_to_open() {
-        let (mut sealed, _) = seal_rows(&[Some(&b"abc"[..]); 100], CompressionChoice::Lz4);
-        assert_eq!(sealed.stored, Stored::Lz4);
-        sealed.raw_len += 1;
-        assert!(sealed.open(alloc(), &mut Vec::new()).is_err());
+    fn corrupt_frames_fail_to_open() {
+        let sealed = seal_rows(&[Some(&b"abc"[..]); 100], CompressionChoice::Lz4);
+        let bytes = sealed.prepared().as_bytes();
+        let mut out = Vec::new();
+        unframe(bytes, &mut out).unwrap();
+        assert_eq!(out.len(), sealed.raw_len());
+        assert!(unframe(&bytes[..bytes.len() - 1], &mut out).is_err());
+        assert!(unframe(&bytes[..CHECKSUM + 4], &mut out).is_err());
+        let mut method = bytes.to_vec();
+        method[CHECKSUM] = 0x7f;
+        assert!(unframe(&method, &mut out).is_err());
+        let mut sizes = bytes.to_vec();
+        sizes[CHECKSUM + 5] ^= 1;
+        assert!(unframe(&sizes, &mut out).is_err());
+        let none = [
+            &[0u8; CHECKSUM][..],
+            &[METHOD_NONE, 12, 0, 0, 0, 3, 0, 0, 0],
+            b"xyz",
+        ]
+        .concat();
+        unframe(&none, &mut out).unwrap();
+        assert_eq!(out, b"xyz");
+        let short = [&none[..CHECKSUM + 5], &[4, 0, 0, 0], b"xyz"].concat();
+        assert!(unframe(&short, &mut out).is_err());
     }
 }

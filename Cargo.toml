@@ -53,7 +53,7 @@ unused_async = "warn"
 
 [dependencies]
 wal-rus = { version = "0.4.2", default-features = false, features = ["s3", "gcs", "backup"] }
-clickhouse-c-rs = { version = "0.2.2", default-features = false, features = ["tokio", "tls"] }
+clickhouse-c-rs = { version = "0.3.0", default-features = false, features = ["tokio", "tls"] }
 # hash keys are internal (relfilenodes, oids, xids, names), never network
 # input, so SipHash's HashDoS margin buys nothing at 2-4x per probe
 foldhash = "0.2"

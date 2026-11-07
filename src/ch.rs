@@ -8,7 +8,8 @@ use std::time::{Duration, Instant};
 use backon::BackoffBuilder;
 use clickhouse_c::tls::rustls::pki_types::ServerName;
 use clickhouse_c::{
-    AsyncClient, Block, BoxedAsyncClient, ClientOpts, Codec, Compression, ErrorKind, Event,
+    Allocator, AsyncClient, Block, BoxedAsyncClient, ClientOpts, Codec, Compression, ErrorKind,
+    Event, QueryOpts,
 };
 use thiserror::Error;
 use tokio::net::TcpStream;
@@ -76,7 +77,7 @@ impl std::str::FromStr for CompressionChoice {
 }
 
 impl CompressionChoice {
-    fn to_wire(self) -> Compression {
+    pub(crate) fn to_wire(self) -> Compression {
         match self {
             Self::None => Compression::None,
             Self::Lz4 => Compression::Lz4,
@@ -147,6 +148,7 @@ pub async fn connect_client(
     opts.compression = compression.to_wire();
     let sock = TcpStream::connect((config.host(), config.port())).await?;
     sock.set_nodelay(true)?;
+    let alloc = Allocator::global(&mimalloc::MiMalloc);
     let client = if config.secure() {
         let tls = config
             .tls_config()
@@ -156,11 +158,11 @@ pub async fn connect_client(
             .connect(server_name, sock)
             .await
             .map_err(|e| std::io::Error::new(e.kind(), format!("TLS handshake: {e}")))?;
-        AsyncClient::handshake_on(stream, opts, codec)
+        AsyncClient::handshake_on(stream, &opts, alloc, codec)
             .await
             .map(AsyncClient::boxed)
     } else {
-        AsyncClient::handshake_on(sock, opts, codec)
+        AsyncClient::handshake_on(sock, &opts, alloc, codec)
             .await
             .map(AsyncClient::boxed)
     };
@@ -221,7 +223,7 @@ pub async fn exec_drain(
     timeout: Duration,
 ) -> Result<(), EmitterError> {
     with_timeout(timeout, async {
-        client.send_query(sql, None).await?;
+        client.send_query(sql, &QueryOpts::new()).await?;
         drain_to_end_of_stream(client).await?;
         Ok(())
     })
@@ -235,7 +237,7 @@ pub async fn query_strings(
     timeout: Duration,
 ) -> Result<Vec<String>, EmitterError> {
     with_timeout(timeout, async {
-        client.send_query(sql, None).await?;
+        client.send_query(sql, &QueryOpts::new()).await?;
         let mut out = Vec::new();
         loop {
             match client.recv_event().await? {

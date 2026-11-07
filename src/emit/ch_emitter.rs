@@ -1507,8 +1507,7 @@ impl NonFinite {
         if decimal.is_none() && !matches!(inner.kind(), Some(Kind::Date32 | Kind::DateTime64)) {
             return Ok(Self::default());
         }
-        let precision =
-            usize::try_from(inner.decimal_precision()).map_err(|_| "bad Decimal precision")?;
+        let precision = inner.decimal_precision().unwrap_or(0) as usize;
         let scale = usize::from(decimal.map_or(0, |w| w.scale));
         let bound = format!("{}.{}", "9".repeat(precision - scale), "9".repeat(scale));
         let cell = |key: &str, sub: &Option<Substitute>| {
@@ -1720,7 +1719,9 @@ impl TablePlan {
                 name: c.target_name.clone(),
                 type_repr: canonical_type(&ast, &c.target_type),
                 encoding: ColumnEncoding::choose(att, &ast),
-                datetime64_scale: types::strip_nullable(ast.view()).datetime64_scale(),
+                datetime64_scale: types::strip_nullable(ast.view())
+                    .datetime64_scale()
+                    .map_or(0, |s| s as i32),
                 ast,
                 decimal,
                 non_finite: NonFinite::default(),
@@ -1738,7 +1739,8 @@ impl TablePlan {
                                 type_repr: canonical_type(&oast, ty),
                                 encoding: ColumnEncoding::choose(att, &oast),
                                 datetime64_scale: types::strip_nullable(oast.view())
-                                    .datetime64_scale(),
+                                    .datetime64_scale()
+                                    .map_or(0, |s| s as i32),
                                 ast: oast,
                                 decimal,
                                 non_finite: NonFinite::default(),
@@ -2739,7 +2741,7 @@ fn decimal_wire_of(ast: &TypeAst) -> Option<DecimalWire> {
         _ => return None,
     };
     Some(DecimalWire {
-        scale: u8::try_from(inner.decimal_scale()).ok()?,
+        scale: u8::try_from(inner.decimal_scale()?).ok()?,
         width,
     })
 }
@@ -3259,8 +3261,10 @@ crate::atomic_stats! {
         /// `EndOfStream`), retries included. Against `inserter_pool_size ×
         /// elapsed` this is CH-side utilization
         pub inserter_ch_nanos,
-        /// Inserter time rebuilding the Native block over the batch's slabs
-        pub inserter_encode_nanos,
+        /// Blocks decoded and rebuilt for a connection refusing their
+        /// prepared bytes, and inserter time doing so
+        pub inserter_rebuilds,
+        pub inserter_rebuild_nanos,
         /// Resolver time inside the oracle round trip, retries included.
         /// Overlaps the inserters' ClickHouse time, so against
         /// `inserter_ch_nanos` it says which stage is the limiter
