@@ -427,6 +427,14 @@ with archive segments and queue depth to locate remaining serialization.
 `walshadow_pump_queue_wait_seconds_total` measures sends blocked behind decoder.
 These distinguish insufficient fetch concurrency from downstream backpressure.
 
+`walshadow_queue_worker_seconds_total{phase}` stacks the serial queue worker's
+wall time: `busy` (inside decode/plan/emit dispatch), `idle` (waiting on the
+channel) and `predecode_wait` (awaiting the blocking-pool predecode job). The
+phases are disjoint and sum to ~1 s/s. `busy` includes TOAST fetches; subtract
+`rate(walshadow_toast_value_fetch_seconds_total)` for the remainder. A `busy`
+near 1 s/s means the worker is the bottleneck. `walshadow_queue_worker_batch_records`
+is the last dequeued batch size.
+
 ### Object-store backfill restart
 
 `spill/backup_backfill/backup_replay.json` carries an object-store pass across
