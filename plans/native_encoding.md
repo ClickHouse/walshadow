@@ -3,8 +3,13 @@
 Streaming commits plan rows straight from WAL bytes into column chunks, and
 sealed Native blocks stay compressed until acknowledgement; see
 [architecture](../architecture/README.md#commit-pipeline). Remaining work
-removes owned cells from load paths and TOAST rows and proves resource gains end to end. Follow [shared constraints](coordination.md),
+removes owned cells from load paths and TOAST rows and proves resource gains end
+to end. Follow [shared constraints](coordination.md),
 [value coercion](value_coercion.md), and [performance acceptance](performance.md)
+
+Share view encoders and column buffers with [container codecs](tier2.md)
+Container promotion can retain existing raw pending cells in owned adapters;
+complete load and TOAST cell removal is not a prerequisite
 
 ## Encode loads directly
 
@@ -39,7 +44,8 @@ read-ahead transfer, and chunk generation fences. Compressed inline values and
 ## Bound memory across owners
 
 Track allocated capacity, not lengths, for raw inputs, open column builders,
-oracle cells and responses, compression scratch, and transport buffers, and keep them distinct from process RSS. Bound queue bytes as well as
+oracle cells and responses, compression scratch, and transport buffers, and keep
+them distinct from process RSS. Bound queue bytes as well as
 item counts, including spare slab capacity and per-chunk metadata for small
 rows across many tables. Oracle cells own one allocation each; pack them into
 shared buffers if they dominate
@@ -70,9 +76,9 @@ against `more-types` (`69f1700`) using `xact_spill`, `spool_read`, and
 batching limits, and codec settings. Record rows/s, source WAL bytes/s, CPU,
 allocation count, peak/steady RSS, retained bytes by owner, spill volume,
 `walshadow_resident_raw_bytes_total` over `walshadow_resident_stored_bytes_total`
-(stored includes allocation slack), durable lag, blocks per INSERT, and actual ClickHouse part creation, with
-compressible and incompressible payloads and both healthy and stalled
-destinations. Attribute savings separately to compact transaction storage,
-direct encoding, and compression. Choose block size and default compression
+(stored includes allocation slack), durable lag, blocks per INSERT, and actual
+ClickHouse part creation, with compressible and incompressible payloads and
+both healthy and stalled destinations. Attribute savings separately to compact
+transaction storage, direct encoding, and compression. Choose block size and default compression
 from measured CPU/memory/part tradeoffs; do not claim gains from wire
 compression alone

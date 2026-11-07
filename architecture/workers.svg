@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1120" height="1040" viewBox="0 0 1120 1040" role="img" aria-labelledby="title desc">
   <title id="title">Commit pipeline, queues and acknowledgements</title>
-  <desc id="desc">ReorderSink plans commits and places rows inline in commit order. One batcher seals per-table batches. Conversion workers resolve PostgreSQL types before inserters send complete Native blocks to ClickHouse. Bounded queues separate stages. Register, Placed and Acked events track work slices; only contiguous completed work advances emitter_ack_lsn.</desc>
+  <desc id="desc">ReorderSink plans commits into encoded column chunks in commit order. One batcher merges chunks into per-table batches and encodes load rows. Conversion workers resolve PostgreSQL types and seal prepared Native blocks before inserters send them to ClickHouse. Bounded queues separate stages. Register, Placed and Acked events track work slices; only contiguous completed work advances emitter_ack_lsn.</desc>
   <defs>
     <marker id="data" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 1 1 L 9 5 L 1 9" fill="none" stroke="#A3A9CE" stroke-width="1.5"/></marker>
     <marker id="control" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 1 1 L 9 5 L 1 9" fill="none" stroke="#E49B5D" stroke-width="1.5"/></marker>
@@ -15,11 +15,11 @@
   <rect width="1120" height="1040" fill="#292522"/>
   <rect x="48" y="24" width="624" height="112" fill="#292522" stroke="#867462" stroke-width="1.3"/>
   <text x="64" y="53" class="name">ReorderSink · record-queue worker</text>
-  <text x="64" y="79">Plan commits and place rows inline, in commit order</text>
+  <text x="64" y="79">Plan column chunks; dispatch in commit order</text>
   <text x="64" y="105">Assign sequence numbers to work slices</text>
   <path d="M 360 136 V 184" fill="none" stroke="#A3A9CE" stroke-width="1.8" marker-end="url(#data)"/>
   <rect x="48" y="184" width="624" height="44" fill="#403A36" stroke="#867462" stroke-width="1.3"/>
-  <text x="64" y="212" class="name">Rows + FlushAll · bounded FIFO queue</text>
+  <text x="64" y="212" class="name">Chunks / load rows / FlushAll · bounded FIFO</text>
   <path d="M 640 193 V 219" fill="none" stroke="#867462" stroke-width="1.5"/>
   <path d="M 648 193 V 219" fill="none" stroke="#867462" stroke-width="1.5"/>
   <path d="M 656 193 V 219" fill="none" stroke="#867462" stroke-width="1.5"/>
@@ -36,7 +36,7 @@
   <path d="M 360 440 V 480" fill="none" stroke="#A3A9CE" stroke-width="1.8" marker-end="url(#data)"/>
   <rect x="32" y="480" width="656" height="128" fill="#34302C" stroke="#867462" stroke-width="1.3" stroke-dasharray="6 5"/>
   <text x="48" y="507" class="group">Conversion pool · W tasks</text>
-  <text x="48" y="532">Convert PostgreSQL types; pass local columns through</text>
+  <text x="48" y="532">Resolve oracle columns; serialize and compress blocks</text>
   <rect x="48" y="548" width="176" height="44" fill="#292522" stroke="#867462" stroke-width="1.3"/>
   <text x="64" y="576" class="name">resolver[1]</text>
   <rect x="272" y="548" width="176" height="44" fill="#292522" stroke="#867462" stroke-width="1.3"/>
@@ -52,7 +52,7 @@
   <path d="M 360 692 V 732" fill="none" stroke="#A3A9CE" stroke-width="1.8" marker-end="url(#data)"/>
   <rect x="32" y="732" width="656" height="128" fill="#34302C" stroke="#867462" stroke-width="1.3" stroke-dasharray="6 5"/>
   <text x="48" y="759" class="group">Inserter pool · N tasks</text>
-  <text x="48" y="784">Build Native blocks; retain each block across insert retries</text>
+  <text x="48" y="784">Send prepared blocks; retain across INSERT retries</text>
   <rect x="48" y="800" width="176" height="44" fill="#292522" stroke="#867462" stroke-width="1.3"/>
   <text x="64" y="828" class="name">inserter[1]</text>
   <rect x="272" y="800" width="176" height="44" fill="#292522" stroke="#867462" stroke-width="1.3"/>
