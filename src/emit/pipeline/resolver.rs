@@ -54,7 +54,8 @@ pub(crate) struct ResolverOptions {
     pub oracle: Option<Arc<Oracle>>,
     /// Boot budget for oracle transport retries, re-read from `config_rx`
     pub retry: RetryConfig,
-    /// Codec compressing sealed blocks while they wait for acknowledgement
+    /// Compression of prepared blocks, matching connections that negotiate
+    /// it; others rebuild
     pub codec: CompressionChoice,
     pub stats: Arc<EmitterStats>,
     pub fatal: Fatal,
@@ -74,25 +75,25 @@ pub(crate) fn spawn_pool(
         .collect()
 }
 
-/// Per-task resolver state: parsed column types and serialization scratch
+/// Per-task resolver state: parsed column types and compression codec
 pub(crate) struct Sealer {
     alloc: Allocator,
-    codec: CompressionChoice,
+    compression: CompressionChoice,
+    codec: Option<std::pin::Pin<Box<clickhouse_c::Codec>>>,
     /// Parsed column types per table, refreshed when a batch's
     /// `schema_epoch` changes. `TypeAst` is `Send` but not `Sync`, so each
     /// task parses its own
     asts: HashMap<TableKey, (u64, Vec<TypeAst>)>,
-    scratch: Vec<u8>,
 }
 
 impl Sealer {
-    pub(crate) fn new(codec: CompressionChoice) -> Self {
-        Self {
+    pub(crate) fn new(compression: CompressionChoice) -> Result<Self, EmitterError> {
+        Ok(Self {
             alloc: Allocator::global(&mimalloc::MiMalloc),
-            codec,
+            compression,
+            codec: compression.build_codec()?,
             asts: HashMap::default(),
-            scratch: Vec::new(),
-        }
+        })
     }
 
     /// Serialize and compress one block over its slabs and oracle answer
@@ -144,7 +145,12 @@ impl Sealer {
                 }
             }
         }
-        SealedBlock::seal(&bb, n_rows, self.codec, &mut self.scratch)
+        SealedBlock::seal(
+            &bb,
+            self.compression,
+            self.codec.as_ref().map(|c| c.as_ref()),
+            self.alloc,
+        )
     }
 }
 
@@ -162,7 +168,13 @@ async fn run(
         config_rx,
     } = opts;
     let alloc = Allocator::global(&mimalloc::MiMalloc);
-    let mut sealer = Sealer::new(codec);
+    let mut sealer = match Sealer::new(codec) {
+        Ok(sealer) => sealer,
+        Err(e) => {
+            fatal.set(format!("seal codec: {e}"));
+            return;
+        }
+    };
     while let Ok(batch) = rx.recv().await {
         if let Some(rx) = config_rx.as_ref() {
             retry.max_attempts = rx.borrow().retry_max_attempts;

@@ -3,16 +3,16 @@
 //! ClickHouse Cloud INSERT cost is mostly RTT + object-store part commit, so
 //! throughput comes from keeping many INSERTs in flight. Each inserter pulls
 //! `InsertBatch`es off the shared spmc queue (any idle inserter takes any
-//! batch, so a hot table can use more than one connection), rebuilds the
-//! Native block over the batch's owned slabs, and runs one `send_query` +
-//! `send_data` + `send_data_end` + drain-to-`EndOfStream` INSERT.
+//! batch, so a hot table can use more than one connection), and runs one
+//! `send_query`, a prepared Data packet per block, `send_data_end` and
+//! drain-to-`EndOfStream` INSERT.
 //!
 //! Durability invariant: [`AckHandle::acked`] takes the drain's
 //! [`EndOfStream`] proof. Until then a connection drop replays the still-owned batch (CH
 //! dedups by `_lsn`). Retry-exhaustion is fatal: the watermark can't advance
 //! without this batch.
 
-use clickhouse_c::Allocator;
+use clickhouse_c::{Allocator, ErrorKind};
 use tokio::task::JoinHandle;
 
 use crate::ch::{ChConn, EmitterError, EndOfStream, drain_to_end_of_stream, with_timeout};
@@ -29,8 +29,8 @@ use std::sync::atomic::Ordering;
 struct Inserter {
     client: ChConn,
     alloc: Allocator,
-    /// One block's decompressed body, reused across sends; locked only
-    /// while a block opens
+    /// One block's decompressed body for rebuilds, reused across sends;
+    /// locked only while a block opens
     scratch: std::sync::Mutex<Vec<u8>>,
     ack: AckHandle,
     stats: Arc<EmitterStats>,
@@ -38,8 +38,9 @@ struct Inserter {
 
 impl Inserter {
     /// Bounded reconnect+retry around one INSERT. Every attempt resends
-    /// every block in order, so a replay carries unchanged rows; blocks
-    /// open one at a time into `scratch`
+    /// every block in order, so a replay carries unchanged rows. A
+    /// connection refusing prepared bytes gets blocks opened one at a time
+    /// into `scratch` and rebuilt
     async fn send_with_retry(
         &mut self,
         sql: &str,
@@ -58,6 +59,11 @@ impl Inserter {
                         let result = with_timeout(insert_timeout, async {
                             client.send_query(sql, None).await?;
                             for sealed in blocks {
+                                match client.send_prepared(sealed.prepared()).await {
+                                    Ok(()) => continue,
+                                    Err(e) if e.kind != ErrorKind::Usage => return Err(e.into()),
+                                    Err(_) => {}
+                                }
                                 let opened = std::time::Instant::now();
                                 let block = {
                                     let mut scratch =
@@ -65,7 +71,8 @@ impl Inserter {
                                     sealed.open(alloc, &mut scratch)?
                                 };
                                 let bb = builder_of(&block)?;
-                                stats.inserter_encode_nanos.fetch_add(
+                                stats.inserter_rebuilds.fetch_add(1, Ordering::Relaxed);
+                                stats.inserter_rebuild_nanos.fetch_add(
                                     opened.elapsed().as_nanos() as u64,
                                     Ordering::Relaxed,
                                 );
@@ -174,16 +181,19 @@ mod tests {
     use clickhouse_c::{BlockBuilder, ColumnBuilder, TypeAst};
 
     /// One UInt8 column x holding one row 42
-    fn one_row_block(codec: CompressionChoice) -> SealedBlock {
-        let ast = TypeAst::parse("UInt8", Allocator::global(&mimalloc::MiMalloc)).unwrap();
+    fn one_row_block(compression: CompressionChoice) -> SealedBlock {
+        let alloc = Allocator::global(&mimalloc::MiMalloc);
+        let ast = TypeAst::parse("UInt8", alloc).unwrap();
         let column = ColumnBuilder::fixed(&[42], 1, 1).unwrap();
         let mut bb = BlockBuilder::new();
         bb.append("x", ast.view(), &column).unwrap();
-        SealedBlock::seal(&bb, 1, codec, &mut Vec::new()).unwrap()
+        let codec = compression.build_codec().unwrap();
+        SealedBlock::seal(&bb, compression, codec.as_ref().map(|c| c.as_ref()), alloc).unwrap()
     }
 
-    /// Every attempt resends every block of the INSERT, whatever codec held
-    /// them, through failed and idle reconnects
+    /// Every attempt resends every block of the INSERT through failed and
+    /// idle reconnects; blocks prepared for other compression than the
+    /// uncompressed server connection rebuild
     #[tokio::test]
     async fn insert_retry_preserves_payload_through_failed_reconnect() {
         let sql = "INSERT INTO retry_test (x) VALUES";
@@ -219,6 +229,11 @@ mod tests {
             assert_eq!(
                 stats.reconnects.load(Ordering::Relaxed),
                 u64::from(retries == 2 || idle)
+            );
+            assert_eq!(
+                stats.inserter_rebuilds.load(Ordering::Relaxed) > 0,
+                codec != CompressionChoice::None,
+                "{codec:?}"
             );
             server.await.unwrap();
             drop(inserter);

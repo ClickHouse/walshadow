@@ -71,7 +71,8 @@ use ahash::{HashMap, HashMapExt};
 #[derive(Debug, Clone, PartialEq)]
 pub enum SpillEntry {
     Heap(Box<DescribedHeap>),
-    Chunk(ToastChunk),
+    /// Boxed so every slot stays small; heap records outnumber chunks
+    Chunk(Box<ToastChunk>),
     ToastDelete(ToastDelete),
     /// Undecoded record on a filenode invisible at record time (same-xact
     /// CREATE / TRUNCATE / rewrite generation); decoded at commit once
@@ -81,6 +82,9 @@ pub enum SpillEntry {
     /// decoded at commit against that version
     Input(Box<DescribedInput>),
 }
+
+// One slot per buffered record
+const _: () = assert!(std::mem::size_of::<SpillEntry>() <= 32);
 
 /// Heap record bytes decode reads: `main_data` and block 0 registered data.
 /// Block images and other blocks drop; `wal_level=logical` keeps tuple
@@ -920,7 +924,7 @@ impl SpillReader {
                         descriptor_valid_from: valid_from,
                     }))
                 }
-                TAG_CHUNK => SpillEntry::Chunk(decode_chunk(&mut cur)?),
+                TAG_CHUNK => SpillEntry::Chunk(Box::new(decode_chunk(&mut cur)?)),
                 TAG_TOAST_DELETE => SpillEntry::ToastDelete(decode_toast_delete(&mut cur)?),
                 TAG_RAW => SpillEntry::Raw(Box::new(decode_raw(&mut cur)?)),
                 TAG_DESCRIPTOR => {
@@ -1763,12 +1767,12 @@ mod tests {
         for remaining in [1, 3, 5, 31] {
             let mut writer = store.writer(42, remaining).await.unwrap();
             writer
-                .write_batch(vec![SpillEntry::Chunk(sample_chunk(
+                .write_batch(vec![SpillEntry::Chunk(Box::new(sample_chunk(
                     99,
                     0,
                     0x2000,
                     &vec![7; IO_CHUNK + 1],
-                ))])
+                )))])
                 .await
                 .unwrap();
             let mut reader = writer.finish().await.unwrap();
@@ -1796,7 +1800,7 @@ mod tests {
         w.write_batch(vec![SpillEntry::Heap(Box::new(h.clone()))])
             .await
             .unwrap();
-        w.write_batch(vec![SpillEntry::Chunk(c.clone())])
+        w.write_batch(vec![SpillEntry::Chunk(Box::new(c.clone()))])
             .await
             .unwrap();
         let bc = w.byte_count();
@@ -1806,7 +1810,10 @@ mod tests {
             r.next().await.unwrap().unwrap(),
             SpillEntry::Heap(Box::new(h))
         );
-        assert_eq!(r.next().await.unwrap().unwrap(), SpillEntry::Chunk(c));
+        assert_eq!(
+            r.next().await.unwrap().unwrap(),
+            SpillEntry::Chunk(Box::new(c))
+        );
         assert!(r.next().await.unwrap().is_none(), "EOF expected");
         r.unlink().await.unwrap();
     }

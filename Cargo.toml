@@ -129,3 +129,6 @@ toml = { version = "1", default-features = false, features = ["parse", "display"
 # Line tables so `perf annotate` / `--sort=srcline` can attribute samples in
 # the hot pipeline stages. No optimisation change, ~no runtime cost.
 debug = "line-tables-only"
+
+[patch.crates-io]
+clickhouse-c-rs = { path = "../clickhouse-c-rs" }

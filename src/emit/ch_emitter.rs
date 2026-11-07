@@ -3259,8 +3259,10 @@ crate::atomic_stats! {
         /// `EndOfStream`), retries included. Against `inserter_pool_size ×
         /// elapsed` this is CH-side utilization
         pub inserter_ch_nanos,
-        /// Inserter time rebuilding the Native block over the batch's slabs
-        pub inserter_encode_nanos,
+        /// Blocks decoded and rebuilt for a connection refusing their
+        /// prepared bytes, and inserter time doing so
+        pub inserter_rebuilds,
+        pub inserter_rebuild_nanos,
         /// Resolver time inside the oracle round trip, retries included.
         /// Overlaps the inserters' ClickHouse time, so against
         /// `inserter_ch_nanos` it says which stage is the limiter

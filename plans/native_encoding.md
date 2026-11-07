@@ -3,8 +3,7 @@
 Streaming commits plan rows straight from WAL bytes into column chunks, and
 sealed Native blocks stay compressed until acknowledgement; see
 [architecture](../architecture/README.md#commit-pipeline). Remaining work
-removes owned cells from load paths and TOAST rows, sends prepared payloads,
-and proves resource gains end to end. Follow [shared constraints](coordination.md),
+removes owned cells from load paths and TOAST rows and proves resource gains end to end. Follow [shared constraints](coordination.md),
 [value coercion](value_coercion.md), and [performance acceptance](performance.md)
 
 ## Encode loads directly
@@ -37,25 +36,10 @@ scratch, then encode with the view path, preserving size policy, fill modes,
 read-ahead transfer, and chunk generation fences. Compressed inline values and
 `numeric`/`jsonb` already decode through per-row scratch
 
-## Send prepared payloads
-
-clickhouse-c `chc_block_prepare` / `chc_client_send_prepared`, bound in
-clickhouse-c-rs as `BlockBuilder::prepare` and `send_prepared`, write prepared
-Data bytes on connections negotiating the same compression and revision. The
-clickhouse-c-rs walshadow depends on predates them, so
-[sealed blocks](../src/emit/pipeline/sealed.rs) store a Native body compressed
-by walshadow and each inserter decodes it back into a block to send,
-recompressing on the wire. With prepared sends, seal through
-`BlockBuilder::prepare` with the destination's negotiated codec and send
-without decoding; rebuild through the decode path only for a connection that
-rejects the block, such as a named destination configured differently. Count
-rebuilds separately
-
 ## Bound memory across owners
 
 Track allocated capacity, not lengths, for raw inputs, open column builders,
-oracle cells and responses, sealed blocks, compression scratch, and transport
-buffers, and keep them distinct from process RSS. Bound queue bytes as well as
+oracle cells and responses, compression scratch, and transport buffers, and keep them distinct from process RSS. Bound queue bytes as well as
 item counts, including spare slab capacity and per-chunk metadata for small
 rows across many tables. Oracle cells own one allocation each; pack them into
 shared buffers if they dominate
@@ -85,8 +69,8 @@ against `more-types` (`69f1700`) using `xact_spill`, `spool_read`, and
 [benchmark driver](../bench/README.md). Run with unchanged worker counts,
 batching limits, and codec settings. Record rows/s, source WAL bytes/s, CPU,
 allocation count, peak/steady RSS, retained bytes by owner, spill volume,
-`walshadow_resident_raw_bytes_total` over `walshadow_resident_stored_bytes_total`,
-durable lag, blocks per INSERT, and actual ClickHouse part creation, with
+`walshadow_resident_raw_bytes_total` over `walshadow_resident_stored_bytes_total`
+(stored includes allocation slack), durable lag, blocks per INSERT, and actual ClickHouse part creation, with
 compressible and incompressible payloads and both healthy and stalled
 destinations. Attribute savings separately to compact transaction storage,
 direct encoding, and compression. Choose block size and default compression

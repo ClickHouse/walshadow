@@ -383,8 +383,6 @@ checksum = "1c133bc6a41be0d194c306b5506d15e6feeea7b1d6604bd3f8310dfb2ca96486"
 [[package]]
 name = "clickhouse-c-rs"
 version = "0.2.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c8a6e8431f37cec43b8e04539c042335b7132b92995a7bf4fc52a5ed53431bcf"
 dependencies = [
  "cc",
  "pkg-config",
