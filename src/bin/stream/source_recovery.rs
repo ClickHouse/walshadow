@@ -10,6 +10,7 @@ use walrus::pg::replication::conn::PgConfig;
 use walshadow::archive::{Archive, ArchiveFeed};
 use walshadow::config::SourceConn;
 use walshadow::manifest;
+use walshadow::metrics::{SOURCE_MODES, STREAM_ERROR_KINDS};
 use walshadow::pos::{Floor, Monotone, Pos};
 use walshadow::record::WAL_SEG_SIZE;
 use walshadow::source_feed::SourceFeed;
@@ -451,9 +452,57 @@ pub(crate) enum SourcePath {
 }
 
 impl SourcePath {
+    /// Index into [`SOURCE_MODES`]: pause and a pending crossing park the
+    /// pump whatever path it holds, so they name the mode before the path does
+    pub(crate) fn mode(&self, paused: bool, crossing_pending: bool) -> usize {
+        match self {
+            Self::Redial => 2,
+            Self::Archive(_) => 1,
+            Self::AtSwitchpoint => 3,
+            Self::Live if paused => 5,
+            Self::Live if crossing_pending => 4,
+            Self::Live => 0,
+        }
+    }
+
     pub(crate) fn archive(&mut self) -> Option<&mut ArchiveFeed> {
         let Self::Archive(a) = self else { return None };
         Some(a)
+    }
+}
+
+/// `kind` index into [`STREAM_ERROR_KINDS`] for a source stream that ended
+/// with `err`; `None` is a clean walsender exit
+pub(crate) fn stream_error_kind(err: Option<&anyhow::Error>) -> usize {
+    match err {
+        Some(e) if walshadow::source_feed::is_wal_segment_removed(e) => 0,
+        Some(e) if e.chain().any(|c| c.is::<std::io::Error>()) => 1,
+        Some(_) => 2,
+        None => 1,
+    }
+}
+
+/// Pump mode history behind `walshadow_source_mode*` and
+/// `walshadow_source_stream_errors_total`
+#[derive(Default)]
+pub(crate) struct SourceModeStats {
+    mode: usize,
+    pub(crate) transitions: [[u64; SOURCE_MODES.len()]; SOURCE_MODES.len()],
+    pub(crate) stream_errors: [u64; STREAM_ERROR_KINDS.len()],
+}
+
+impl SourceModeStats {
+    /// Record the mode the pump is in now, counting a change from the last
+    pub(crate) fn observe(&mut self, mode: usize) {
+        if mode != self.mode {
+            self.transitions[self.mode][mode] += 1;
+            self.mode = mode;
+        }
+    }
+
+    /// One-hot gauge over [`SOURCE_MODES`]
+    pub(crate) fn gauge(&self) -> [u64; SOURCE_MODES.len()] {
+        std::array::from_fn(|i| u64::from(i == self.mode))
     }
 }
 
@@ -737,6 +786,31 @@ mod tests {
     /// Two standbys of one primary, promoted independently, are both timeline 2
     /// under one system identifier. The chain places either one, so only where
     /// the branch begins refuses the wrong one
+    #[test]
+    fn mode_stats_count_changes_and_classify_errors() {
+        let mut stats = SourceModeStats::default();
+        assert_eq!(stats.gauge(), [1, 0, 0, 0, 0, 0]);
+        stats.observe(0);
+        stats.observe(1);
+        stats.observe(1);
+        stats.observe(2);
+        stats.observe(0);
+        assert_eq!(stats.gauge(), [1, 0, 0, 0, 0, 0]);
+        assert_eq!(stats.transitions[0][1], 1);
+        assert_eq!(stats.transitions[1][2], 1);
+        assert_eq!(stats.transitions[2][0], 1);
+        assert_eq!(stats.transitions[0][0], 0);
+        assert_eq!(stream_error_kind(Some(&removed_wal())), 0);
+        let io: anyhow::Error = std::io::Error::from(std::io::ErrorKind::ConnectionReset).into();
+        assert_eq!(stream_error_kind(Some(&io)), 1);
+        assert_eq!(stream_error_kind(None), 1);
+        assert_eq!(stream_error_kind(Some(&anyhow::anyhow!("boom"))), 2);
+        assert_eq!(SourcePath::Redial.mode(true, true), 2);
+        assert_eq!(SourcePath::Live.mode(true, true), 5);
+        assert_eq!(SourcePath::Live.mode(false, true), 4);
+        assert_eq!(SourcePath::AtSwitchpoint.mode(false, false), 3);
+    }
+
     #[test]
     fn prove_branch_refuses_a_sibling_sharing_the_branch_number() {
         let ours = TimelineHistory::parse(2, b"1\t0/3000000\tno recovery target\n").unwrap();
