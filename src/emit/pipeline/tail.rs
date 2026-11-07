@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use clickhouse_c::Allocator;
 use tokio::sync::{mpsc, oneshot, watch};
+use tokio_util::sync::CancellationToken;
 use tokio_util::task::AbortOnDropHandle;
 
 use crate::ch::EmitterError;
@@ -31,6 +32,7 @@ use ahash::{HashMap, HashMapExt};
 
 /// Spawned tail stages; holding this keeps the tasks owned by the caller.
 pub struct TailParts {
+    stop_retries: CancellationToken,
     collector: AbortOnDropHandle<()>,
     batcher: AbortOnDropHandle<()>,
     resolvers: Vec<AbortOnDropHandle<()>>,
@@ -38,6 +40,10 @@ pub struct TailParts {
 }
 
 impl TailParts {
+    pub(super) fn stop_retries(&self) {
+        self.stop_retries.cancel();
+    }
+
     /// Drop the spawn-returned producer handles, then await the drain
     /// cascade. Hangs while any clone handed to a producer stays alive
     pub async fn close(self, msg_tx: mpsc::Sender<BatcherMsg>, ack: AckHandle) {
@@ -182,9 +188,9 @@ impl OwnedTail {
 
     /// Failed-leg teardown: dropping the last producer handles closes the
     /// batcher, which final-flushes and cascades the inserters + collector
-    /// down. Bounded by the inserters' retry policy (a CH outage trips their
-    /// fatal, not a hang)
+    /// down. Stop oracle retries so shadow outage cannot hold teardown
     pub async fn quiesce(self) {
+        self.parts.stop_retries();
         self.parts.close(self.msg_tx, self.ack).await;
     }
 }
@@ -252,6 +258,7 @@ pub fn spawn_null(
         msg_tx,
         ack,
         TailParts {
+            stop_retries: CancellationToken::new(),
             collector,
             batcher: AbortOnDropHandle::new(batcher),
             resolvers: Vec::new(),
@@ -297,6 +304,7 @@ pub async fn spawn_with_config(
 
     // As wide as the bridge: a narrower pool leaves shadow workers idle, a
     // wider one only queues on their sockets
+    let stop_retries = CancellationToken::new();
     let resolvers = resolver::spawn_pool(
         oracle.as_ref().map_or(1, |o| o.concurrency()),
         batches_rx,
@@ -306,7 +314,7 @@ pub async fn spawn_with_config(
             retry: emitter.retry.clone(),
             stats: stats.clone(),
             fatal: fatal.clone(),
-            config_rx: config_rx.clone(),
+            stop_retries: stop_retries.clone(),
         },
     );
 
@@ -335,6 +343,7 @@ pub async fn spawn_with_config(
         msg_tx,
         ack,
         TailParts {
+            stop_retries,
             collector,
             batcher: AbortOnDropHandle::new(batcher),
             resolvers: resolvers.into_iter().map(AbortOnDropHandle::new).collect(),

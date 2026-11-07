@@ -155,6 +155,11 @@ pub struct PipelineHandle {
 }
 
 impl PipelineHandle {
+    /// Finish healthy batches but stop oracle retries during shutdown
+    pub fn stop_retries(&self) {
+        self.tail.stop_retries();
+    }
+
     /// Await the drain cascade: batcher flushes-all + exits → inserters drain
     /// to `EndOfStream` + exit → ack collector exits. Surfaces any fatal
     /// error.
