@@ -1790,7 +1790,7 @@ mod tests {
         let sql = "CREATE DATABASE IF NOT EXISTS retry_test";
         for (retries, idle) in [(0, false), (1, false), (2, false), (1, true)] {
             let (config, server) =
-                crate::ch::test_support::retry_server(retries, sql, false, idle).await;
+                crate::ch::test_support::retry_server(retries, sql, 0, idle).await;
             let resolved = Arc::new(ResolvedConfig::default());
             let ddl = DdlConfig::from_resolved(
                 &resolved,

@@ -76,7 +76,7 @@ impl std::str::FromStr for CompressionChoice {
 }
 
 impl CompressionChoice {
-    fn to_wire(self) -> Compression {
+    pub(crate) fn to_wire(self) -> Compression {
         match self {
             Self::None => Compression::None,
             Self::Lz4 => Compression::Lz4,

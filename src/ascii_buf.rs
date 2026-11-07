@@ -1,5 +1,4 @@
-//! Fixed-capacity ASCII buffer. `inet`, `interval`, `time`, `timetz` and
-//! `timestamp` text all have a length bound, so their cells render off the
+//! Fixed-capacity ASCII buffers, so length-bounded type text renders off the
 //! stack. Every write funnels through `push`, which takes ASCII only, keeping
 //! the contents valid UTF-8 for [`AsciiBuf::as_str`]. A byte past the bound
 //! drops rather than panics: each renderer's longest output is pinned by a

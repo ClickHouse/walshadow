@@ -27,7 +27,11 @@
 // serializes on that pattern. A bench on a different allocator measures a
 // different program
 #[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+static GLOBAL: alloc_meter::Metered<mimalloc::MiMalloc> =
+    alloc_meter::Metered::new(mimalloc::MiMalloc);
+
+#[path = "common/alloc_meter.rs"]
+mod alloc_meter;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -149,11 +153,12 @@ fn mapping(filenode: u32, columns: usize) -> TableMapping {
 
 /// One 8 KiB heap page carrying `tuples` live int4-only tuples, laid out
 /// as PG writes them: line pointers up from the header, tuple bodies down
-/// from the page end.
-fn heap_page(tuples: usize, columns: usize, seed: i32) -> Vec<u8> {
+/// from the page end. Returns page and wrapping sum of its values
+fn heap_page(tuples: usize, columns: usize, seed: i32) -> (Vec<u8>, i64) {
     let body = TUPLE_HEADER + 4 * columns;
     let mut page = vec![0u8; PAGE_BYTES];
     let mut written = 0usize;
+    let mut digest = 0i64;
     for i in 0..tuples {
         let off = PAGE_BYTES - (i + 1) * body;
         if off < SIZE_OF_PAGE_HEADER + (i + 1) * SIZE_OF_ITEM_ID {
@@ -168,6 +173,7 @@ fn heap_page(tuples: usize, columns: usize, seed: i32) -> Vec<u8> {
             let at = off + TUPLE_HEADER + c * 4;
             let v = seed + (i as i32) * 31 + c as i32;
             page[at..at + 4].copy_from_slice(&v.to_le_bytes());
+            digest = digest.wrapping_add(i64::from(v));
         }
         let slot = SIZE_OF_PAGE_HEADER + i * SIZE_OF_ITEM_ID;
         let raw = ((off as u32) & 0x7FFF) | (LP_NORMAL << 15) | (((body as u32) & 0x7FFF) << 17);
@@ -178,23 +184,23 @@ fn heap_page(tuples: usize, columns: usize, seed: i32) -> Vec<u8> {
     let pd_upper = PAGE_BYTES - written * body;
     page[12..14].copy_from_slice(&(pd_lower as u16).to_le_bytes());
     page[14..16].copy_from_slice(&(pd_upper as u16).to_le_bytes());
-    page
+    (page, digest)
 }
 
-/// One tar part holding `segments_per_part` `base/<db>/<filenode>` entries.
-async fn build_part(shape: Shape, part: usize) -> Vec<u8> {
+/// One tar part holding `segments_per_part` `base/<db>/<filenode>` entries,
+/// with wrapping sum of values written
+async fn build_part(shape: Shape, part: usize) -> (Vec<u8>, i64) {
     use tokio::io::AsyncWriteExt;
 
     let mut builder = tokio_tar::Builder::new(Vec::new());
+    let mut digest = 0i64;
     for s in 0..shape.segments_per_part {
         let filenode = FIRST_FILENODE + (part * shape.segments_per_part + s) as u32;
         let mut body = Vec::with_capacity(shape.pages_per_segment * PAGE_BYTES);
         for p in 0..shape.pages_per_segment {
-            body.extend_from_slice(&heap_page(
-                shape.tuples_per_page,
-                shape.columns,
-                (p * 1_000) as i32,
-            ));
+            let (page, d) = heap_page(shape.tuples_per_page, shape.columns, (p * 1_000) as i32);
+            body.extend_from_slice(&page);
+            digest = digest.wrapping_add(d);
         }
         let mut header = tokio_tar::Header::new_gnu();
         header
@@ -212,7 +218,7 @@ async fn build_part(shape: Shape, part: usize) -> Vec<u8> {
     builder.finish().await.unwrap();
     let mut out = builder.into_inner().await.unwrap();
     out.flush().await.unwrap();
-    out
+    (out, digest)
 }
 
 /// Object-store-shaped source over pre-built tars: one `pump_tar_to_sink`
@@ -288,8 +294,11 @@ impl Report {
 
 async fn bench_pump(shape: Shape) -> Report {
     let mut parts = Vec::with_capacity(shape.parts);
+    let mut expected = 0i64;
     for p in 0..shape.parts {
-        parts.push(build_part(shape, p).await);
+        let (part, digest) = build_part(shape, p).await;
+        parts.push(part);
+        expected = expected.wrapping_add(digest);
     }
 
     let mut catalog = CatalogMap::new();
@@ -305,19 +314,29 @@ async fn bench_pump(shape: Shape) -> Report {
         parallelism: shape.parallelism,
     });
 
+    let base = GLOBAL.reset_peak();
     let started = Instant::now();
     let (mut rx, pump) = spawn_greenfield_bootstrap(cfg, source, catalog, false);
     let drained = tokio::spawn(async move {
-        let mut n = 0u64;
+        let (mut n, mut digest) = (0u64, 0i64);
         while let Some(slab) = rx.recv().await {
-            // Touch the payload so the decode can't be optimised away
-            n += slab.iter().map(|t| t.columns.len() as u64).sum::<u64>();
+            for t in &slab {
+                n += t.columns.len() as u64;
+                for c in &t.columns {
+                    let Some(ColumnValue::Int4(v)) = c else {
+                        panic!("int4 column decoded as {c:?}");
+                    };
+                    digest = digest.wrapping_add(i64::from(*v));
+                }
+            }
         }
-        n
+        (n, digest)
     });
     pump.await.unwrap().unwrap();
-    let touched = drained.await.unwrap();
+    let (touched, digest) = drained.await.unwrap();
     let elapsed = started.elapsed().as_secs_f64();
+    let metered = GLOBAL.snapshot().since(base);
+    assert_eq!(digest, expected, "decoded values differ from written pages");
 
     let ld = |a: &AtomicU64| a.load(Ordering::Relaxed) as f64;
     Report {
@@ -333,6 +352,8 @@ async fn bench_pump(shape: Shape) -> Report {
                 "channel_block_secs",
                 ld(&progress.page_walk.channel_block_nanos) / 1e9,
             ),
+            ("allocs", metered.allocs as f64),
+            ("peak_mib", metered.peak as f64 / (1 << 20) as f64),
         ],
     }
 }
@@ -385,6 +406,7 @@ async fn bench_drain(shape: Shape) -> Report {
     });
 
     let stats = Arc::new(walshadow::ch_emitter::EmitterStats::default());
+    let base = GLOBAL.reset_peak();
     let started = Instant::now();
     let outcome = bootstrap::drain(
         tup_rx,
@@ -403,6 +425,8 @@ async fn bench_drain(shape: Shape) -> Report {
     let elapsed = started.elapsed().as_secs_f64();
     feeder.await.unwrap();
     tail.close(msg_tx, ack).await;
+    let metered = GLOBAL.snapshot().since(base);
+    assert_eq!(outcome.rows_routed, shape.tuples());
 
     Report {
         label: "drain".into(),
@@ -410,7 +434,11 @@ async fn bench_drain(shape: Shape) -> Report {
         tuples: outcome.rows_routed,
         // Int4 payload only; the interesting rate here is rows, not bytes
         bytes: outcome.rows_routed * 4 * shape.columns as u64,
-        detail: vec![("seqs", outcome.next_seq as f64)],
+        detail: vec![
+            ("seqs", outcome.next_seq as f64),
+            ("allocs", metered.allocs as f64),
+            ("peak_mib", metered.peak as f64 / (1 << 20) as f64),
+        ],
     }
 }
 

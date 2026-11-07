@@ -41,9 +41,13 @@ columns for destination insertion. Batch conversion avoids a database round trip
 per row and keeps type semantics in PostgreSQL
 
 Conversion workers run between batcher and inserters, so PostgreSQL conversion
-overlaps ClickHouse insertion. Batches carrying only local columns pass through
-without a PostgreSQL request. Inserters combine local and converted columns into
-complete Native blocks and retain them across insert retries
+overlaps ClickHouse insertion. Blocks carrying only local columns pass through
+without a PostgreSQL request. Conversion workers combine local and converted
+columns into complete Native blocks, serialize and compress each once, and
+release column buffers. Inserters send prepared bytes directly. A connection
+rejecting prepared bytes, such as one using different compression, gets one
+block decoded and rebuilt at a time. Retries resend every block of an INSERT;
+prepared blocks remain owned until every required destination acknowledges
 
 Conversion failure stops batch with column and row context. Module pins output
 settings to make conversion reproducible. Greenfield bootstrap uses a temporary

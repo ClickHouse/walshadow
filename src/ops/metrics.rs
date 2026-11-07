@@ -388,7 +388,7 @@ snapshot! {
         "Sealed transaction-plan bytes by final backing.",
     /// Planning failures `[spool, fail_closed, detoast, partial_update,
     /// view, drain]`, rendered `reason=` labelled
-    counter xact_plan_failures_by_reason: [u64; 11] ["reason" = PLAN_FAILURE_REASONS] =
+    counter xact_plan_failures_by_reason: [u64; 12] ["reason" = PLAN_FAILURE_REASONS] =
         "Planning-stage failures; the whole transaction emits nothing.",
     counter raw_stash_bytes_by_storage: [u64; 2] ["storage" = ["mem", "spill"]] =
         "Cumulative raw-stash payload bytes by first landing.",
@@ -429,8 +429,16 @@ snapshot! {
         "InsertBatches an inserter finished draining to ClickHouse. insertbatch_batches_out - inserter_batches_in is the live backlog; their rates show inserter-pool saturation.",
     counter inserter_ch_seconds_total: f64 =
         "Cumulative inserter time inside the ClickHouse INSERT round trip. Against inserter_pool_size x uptime this is CH-side utilization.",
-    counter inserter_encode_seconds_total: f64 =
-        "Cumulative inserter time rebuilding the Native block over a batch's owned slabs.",
+    counter inserter_rebuilds_total: u64 =
+        "Sealed blocks decoded and rebuilt because a connection negotiated other compression or an older revision than they were prepared for.",
+    counter inserter_rebuild_seconds_total: f64 =
+        "Cumulative inserter time decoding and rebuilding sealed blocks.",
+    counter resident_seal_seconds_total: f64 =
+        "Cumulative resolver time serializing and compressing sealed Native blocks.",
+    counter resident_raw_bytes_total: u64 =
+        "Serialized Native block bytes sealed for insertion, before resident compression.",
+    counter resident_stored_bytes_total: u64 =
+        "Bytes allocated for those sealed blocks while awaiting insertion, including growth slack.",
     counter oracle_resolve_seconds_total: f64 =
         "Cumulative resolver time inside the oracle round trip. Overlaps inserter_ch_seconds_total, so the larger of the two is the tail's limiter.",
     counter process_cpu_seconds_total: f64 =
@@ -753,7 +761,7 @@ impl Default for RateEstimator {
 
 /// `reason=` label order of `MetricsSnapshot::xact_plan_failures_by_reason`,
 /// matching [`crate::emit::pipeline::planner::drain_reason`]
-const PLAN_FAILURE_REASONS: [&str; 11] = [
+const PLAN_FAILURE_REASONS: [&str; 12] = [
     "spool",
     "fail_closed_image_only",
     "fail_closed_malformed",
@@ -764,6 +772,7 @@ const PLAN_FAILURE_REASONS: [&str; 11] = [
     "detoast",
     "partial_update",
     "view",
+    "encode",
     "drain",
 ];
 
@@ -1250,7 +1259,7 @@ mod tests {
         let snap = MetricsSnapshot {
             xact_plan_rows: 9,
             xact_plan_bytes_by_storage: [100, 200],
-            xact_plan_failures_by_reason: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+            xact_plan_failures_by_reason: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
             ..MetricsSnapshot::default()
         };
         let body = render(snap);

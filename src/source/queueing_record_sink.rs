@@ -32,7 +32,6 @@ use tokio::task::JoinHandle;
 
 use tracing::Instrument;
 
-use crate::decode::heap_decoder::Predecoded;
 use crate::ops::trace::TxnSpanRegistry;
 use crate::record::{Done, Record, RecordSink, SinkError};
 
@@ -58,14 +57,14 @@ pub const DEFAULT_QUEUEING_IDLE_INTERVAL: Duration = Duration::from_millis(50);
 /// unstealable LIFO slot
 const YIELD_INTERVAL: Duration = Duration::from_millis(1);
 
-/// Pure per-record decode run ahead of the worker; see
-/// [`QueueingRecordSink::with_predecode`]
-pub type Predecode = Arc<dyn Fn(&Record<'_>) -> Option<Predecoded> + Send + Sync>;
+/// Per-record scan run ahead of the worker; see
+/// [`QueueingRecordSink::with_prescan`]
+pub type Prescan = Arc<dyn Fn(&Record<'_>) + Send + Sync>;
 
-/// Batch records, or the blocking-pool job decoding them ahead
+/// Batch records, or the blocking-pool job scanning them ahead
 enum Records {
     Ready(Vec<Record<'static>>),
-    Decoding(JoinHandle<(Vec<Record<'static>>, Vec<Option<Predecoded>>)>),
+    Scanning(JoinHandle<Vec<Record<'static>>>),
 }
 
 /// One channel message: wanted records plus the position of those the inner
@@ -90,7 +89,7 @@ pub struct QueueingRecordSink {
     skipped_lsn: u64,
     /// Inner sink's [`RecordSink::wants`], evaluated before the owned clone
     wants: fn(&Record<'_>) -> bool,
-    predecode: Option<Predecode>,
+    prescan: Option<Prescan>,
     batch_size: usize,
     err: Arc<StdMutex<Option<SinkError>>>,
     in_flight: Arc<AtomicU64>,
@@ -178,12 +177,12 @@ impl QueueingRecordSink {
                         skipped,
                         skipped_lsn,
                     })) => {
-                        let (batch, mut pre) = match records {
-                            Records::Ready(batch) => (batch, Vec::new()),
-                            Records::Decoding(job) => match job.await {
-                                Ok(decoded) => decoded,
+                        let batch = match records {
+                            Records::Ready(batch) => batch,
+                            Records::Scanning(job) => match job.await {
+                                Ok(batch) => batch,
                                 Err(e) => {
-                                    let e = SinkError::Other(format!("predecode job: {e}"));
+                                    let e = SinkError::Other(format!("prescan job: {e}"));
                                     park_err_and_drain(e, n + skipped, &mut rx).await;
                                     break 'outer;
                                 }
@@ -212,7 +211,7 @@ impl QueueingRecordSink {
                                         reg.note_popped(record.parsed.header.xact_id);
                                     }
                                 }
-                                inner.on_records(&batch, &mut pre).await?;
+                                inner.on_records(&batch).await?;
                                 // Advance idle ack past trailing non-commit WAL
                                 // (`max_lsn` = dispatched high-water).
                                 inner.on_idle_advance(max_lsn).await
@@ -261,7 +260,7 @@ impl QueueingRecordSink {
             skipped: 0,
             skipped_lsn: 0,
             wants: S::wants,
-            predecode: None,
+            prescan: None,
             batch_size,
             err,
             in_flight,
@@ -275,8 +274,8 @@ impl QueueingRecordSink {
     /// Decode each shipped batch on the blocking pool before the worker takes
     /// it, overlapping the worker's serial pass over earlier batches. The
     /// worker hands the results to [`RecordSink::on_records`]
-    pub fn with_predecode(mut self, predecode: Predecode) -> Self {
-        self.predecode = Some(predecode);
+    pub fn with_prescan(mut self, prescan: Prescan) -> Self {
+        self.prescan = Some(prescan);
         self
     }
 
@@ -336,12 +335,12 @@ impl QueueingRecordSink {
             .tx
             .as_ref()
             .ok_or_else(|| SinkError::Other("queueing record sink already closed".into()))?;
-        let records = match &self.predecode {
-            Some(predecode) if !batch.is_empty() => {
-                let predecode = predecode.clone();
-                Records::Decoding(tokio::task::spawn_blocking(move || {
-                    let pre = batch.iter().map(|r| predecode(r)).collect();
-                    (batch, pre)
+        let records = match &self.prescan {
+            Some(prescan) if !batch.is_empty() => {
+                let prescan = prescan.clone();
+                Records::Scanning(tokio::task::spawn_blocking(move || {
+                    batch.iter().for_each(|r| prescan(r));
+                    batch
                 }))
             }
             _ => Records::Ready(batch),
@@ -756,21 +755,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn predecode_panic_surfaces() {
+    async fn prescan_panic_surfaces() {
         let mut q = QueueingRecordSink::spawn(Hooks(|_| Ok(())), 1, 4, None)
-            .with_predecode(Arc::new(|_| panic!("predecode bug")));
+            .with_prescan(Arc::new(|_| panic!("prescan bug")));
         let in_flight = q.in_flight.clone();
         q.on_record(&synth(1)).await.expect("send");
         wait_worker_dead(&q).await;
         assert_eq!(in_flight.load(Ordering::Relaxed), 0);
-        let err = q.close().await.expect_err("predecode error");
-        assert!(matches!(err, SinkError::Other(s) if s.contains("predecode job")));
+        let err = q.close().await.expect_err("prescan error");
+        assert!(matches!(err, SinkError::Other(s) if s.contains("prescan job")));
     }
 
     #[tokio::test]
-    async fn predecode_results_reach_inner_by_index() {
-        struct PreLens(Arc<StdMutex<Vec<(usize, usize)>>>);
-        impl RecordSink for PreLens {
+    async fn prescan_runs_before_inner_batches() {
+        struct Lens(Arc<StdMutex<Vec<(usize, u64)>>>, Arc<AtomicU64>);
+        impl RecordSink for Lens {
             fn on_record<'a>(
                 &'a mut self,
                 _r: &'a Record<'a>,
@@ -781,9 +780,9 @@ mod tests {
             fn on_records<'a>(
                 &'a mut self,
                 batch: &'a [Record<'a>],
-                pre: &'a mut [Option<Predecoded>],
             ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
-                self.0.lock().unwrap().push((batch.len(), pre.len()));
+                let scanned = self.1.load(Ordering::Relaxed);
+                self.0.lock().unwrap().push((batch.len(), scanned));
                 Box::pin(async move {
                     for record in batch {
                         self.on_record(record).await?;
@@ -795,17 +794,18 @@ mod tests {
         let seen = Arc::new(StdMutex::new(Vec::new()));
         let calls = Arc::new(AtomicU64::new(0));
         let calls_p = calls.clone();
-        let mut q = QueueingRecordSink::spawn(PreLens(seen.clone()), 2, 8, None).with_predecode(
-            Arc::new(move |_| {
+        let mut q = QueueingRecordSink::spawn(Lens(seen.clone(), calls.clone()), 2, 8, None)
+            .with_prescan(Arc::new(move |_| {
                 calls_p.fetch_add(1, Ordering::Relaxed);
-                None
-            }),
-        );
+            }));
         for lsn in [1, 2, 3] {
             q.on_record(&synth(lsn)).await.expect("send");
         }
         q.close().await.expect("close");
-        assert_eq!(*seen.lock().unwrap(), [(2, 2), (1, 1)]);
+        // Later batches may scan ahead of earlier ones dispatching
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.iter().map(|(n, _)| *n).collect::<Vec<_>>(), [2, 1]);
+        assert!(seen[0].1 >= 2 && seen[1].1 == 3);
         assert_eq!(calls.load(Ordering::Relaxed), 3);
     }
 

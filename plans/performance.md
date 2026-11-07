@@ -89,10 +89,11 @@ Try these in order:
    insert latency, part count, RSS, and durable completion counts
 2. Profile serial WAL dispatch before splitting it further
    [Queue worker](../src/source/queueing_record_sink.rs) now dispatches batches
-   with heap decode started ahead of dispatch. Measure transaction buffer lock
-   waits, commit draining, shadow replay, and downstream waits before changing
-   execution. Preserve commit/DDL order, byte-before-record reachability, and
-   contiguous durable acknowledgements
+   with TOAST reads started by a prescan ahead of dispatch. Ordinary heaps stay
+   WAL bytes until commit planning. Measure transaction buffer lock waits,
+   commit-time encoding, plan spill, oracle conversion, block sealing, shadow
+   replay, and downstream waits before changing execution. Preserve commit/DDL
+   order, byte-before-record reachability, and contiguous durable acknowledgements
 
 ## Bootstrap worker shape
 

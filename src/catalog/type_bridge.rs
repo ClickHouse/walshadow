@@ -43,13 +43,16 @@
 
 use crate::ascii_buf::{AsciiArray, AsciiBuf};
 use crate::ch::types;
-use crate::decode::codecs::{format_time_us, timetz_to_text};
+use crate::decode::codecs::{
+    format_time_us, macaddr_to_text, macaddr8_to_text, tid_to_text, timetz_to_text,
+};
 use crate::decode::heap_decoder::{self, ColumnValue};
 use crate::emit::ch_emitter::DATE32_PG_EPOCH_DAYS;
 use crate::schema::{
-    BOOLOID, BPCHAROID, BYTEAOID, CHAROID, CIDROID, DATEOID, FLOAT4OID, FLOAT8OID, INETOID,
-    INT2OID, INT4OID, INT8OID, INTERVALOID, JSONBOID, JSONOID, NAMEOID, NUMERICOID, OIDOID,
-    RelAttr, TEXTOID, TIMEOID, TIMESTAMPOID, TIMESTAMPTZOID, TIMETZOID, UUIDOID, VARCHAROID,
+    BOOLOID, BPCHAROID, BYTEAOID, CHAROID, CIDOID, CIDROID, DATEOID, FLOAT4OID, FLOAT8OID, INETOID,
+    INT2OID, INT4OID, INT8OID, INTERVALOID, JSONBOID, JSONOID, MONEYOID, NAMEOID, NUMERICOID,
+    OID8OID, OIDOID, PG_LSNOID, RelAttr, TEXTOID, TIMEOID, TIMESTAMPOID, TIMESTAMPTZOID, TIMETZOID,
+    UUIDOID, VARCHAROID, XID8OID, XIDOID,
 };
 use clickhouse_c::{Allocator, Kind, TypeAst};
 use walrus::time::civil_from_days;
@@ -100,8 +103,9 @@ pub fn base_type_for(att: &RelAttr) -> Result<String, BridgeError> {
         CHAROID => "Int8".into(),
         INT2OID => "Int16".into(),
         INT4OID => "Int32".into(),
-        INT8OID => "Int64".into(),
-        OIDOID => "UInt32".into(),
+        INT8OID | MONEYOID => "Int64".into(),
+        OIDOID | XIDOID | CIDOID => "UInt32".into(),
+        OID8OID | XID8OID | PG_LSNOID => "UInt64".into(),
         FLOAT4OID => "Float32".into(),
         FLOAT8OID => "Float64".into(),
         NUMERICOID => numeric_ch_type(att.typmod),
@@ -215,6 +219,7 @@ pub fn column_value_to_sql_literal(v: &ColumnValue, ch_inner: &str) -> Option<St
         ColumnValue::Int4(i) => Some(i.to_string()),
         ColumnValue::Int8(i) => Some(i.to_string()),
         ColumnValue::Oid(i) => Some(i.to_string()),
+        ColumnValue::Oid8(i) => Some(i.to_string()),
         ColumnValue::Float4(f) => Some(format_float(*f as f64)),
         ColumnValue::Float8(f) => Some(format_float(*f)),
         ColumnValue::Numeric(n) => {
@@ -264,6 +269,11 @@ pub fn column_value_to_sql_literal(v: &ColumnValue, ch_inner: &str) -> Option<St
         }
         ColumnValue::Interval(v) => Some(sql_string_literal(&v.to_text())),
         ColumnValue::Inet(v) => Some(sql_string_literal(&v.to_text())),
+        ColumnValue::MacAddr(b) => Some(sql_string_literal(&macaddr_to_text(b))),
+        ColumnValue::MacAddr8(b) => Some(sql_string_literal(&macaddr8_to_text(b))),
+        ColumnValue::Tid { block, offset } => {
+            Some(sql_string_literal(&tid_to_text(*block, *offset)))
+        }
         ColumnValue::Uuid(b) => Some(format!("toUUID({})", sql_string_literal(&format_uuid(b)))),
         ColumnValue::PgPendingText { text, .. } => Some(sql_bytes_literal(text.as_bytes())),
         ColumnValue::PgPending { .. }
@@ -603,6 +613,24 @@ mod tests {
             base_type_for(&attr(NUMERICOID, tm, true, None)).unwrap(),
             "String"
         );
+    }
+
+    #[test]
+    fn integer_like_system_types_map_native() {
+        for (oid, want) in [
+            (XIDOID, "UInt32"),
+            (CIDOID, "UInt32"),
+            (XID8OID, "UInt64"),
+            (PG_LSNOID, "UInt64"),
+            (OID8OID, "UInt64"),
+            (MONEYOID, "Int64"),
+        ] {
+            assert_eq!(
+                base_type_for(&attr(oid, -1, true, None)).unwrap(),
+                want,
+                "oid {oid}"
+            );
+        }
     }
 
     #[test]

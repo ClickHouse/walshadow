@@ -6,13 +6,22 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use clap::Parser;
-use walrus::pg::walparser::RelFileNode;
-use walshadow::heap_decoder::{ColumnValue, DecodedHeap, DecodedTuple, DescribedHeap, HeapOp};
-use walshadow::schema::{RelDescriptor, RelName, ReplIdent};
-use walshadow::xact_buffer::{StashResolved, XactBuffer, XactBufferConfig};
+use walrus::pg::walparser::{
+    BlockLocation, RelFileNode, RmId, XLogRecord, XLogRecordBlock, XLogRecordBlockHeader,
+    XLogRecordHeader,
+};
+use walshadow::decode::datum::DatumRef;
+use walshadow::heap_decoder::view_heap_record;
+use walshadow::schema::{RelAttr, RelDescriptor, RelName, ReplIdent, TEXTOID};
+use walshadow::spill::{DescribedInput, HeapInput};
+use walshadow::xact_buffer::{DrainHeap, StashResolved, XactBuffer, XactBufferConfig};
+
+#[path = "common/alloc_meter.rs"]
+mod alloc_meter;
 
 #[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+static GLOBAL: alloc_meter::Metered<mimalloc::MiMalloc> =
+    alloc_meter::Metered::new(mimalloc::MiMalloc);
 
 #[derive(Debug, Parser)]
 struct Args {
@@ -57,9 +66,49 @@ async fn run(args: Args) -> anyhow::Result<()> {
         persistence: 'p',
         ancestors: Vec::new(),
         replident: ReplIdent::Default { pk_attnums: None },
-        attributes: Vec::new(),
+        attributes: vec![RelAttr {
+            attnum: 1,
+            name: "v".into(),
+            type_oid: TEXTOID,
+            typmod: -1,
+            not_null: false,
+            dropped: false,
+            type_name: "text".into(),
+            type_byval: false,
+            type_len: -1,
+            type_align: 'i',
+            type_storage: 'x',
+            missing_default: None,
+        }],
     });
     let payload = "x".repeat(args.payload_bytes);
+    // XLOG_HEAP_INSERT block data: xl_heap_header, then one 4-byte-header text
+    let mut tuple = 1u16.to_le_bytes().to_vec();
+    tuple.extend_from_slice(&0u16.to_le_bytes());
+    tuple.push(24);
+    tuple.push(0);
+    tuple.extend_from_slice(&(((4 + payload.len()) as u32) << 2).to_le_bytes());
+    tuple.extend_from_slice(payload.as_bytes());
+    let record = |xid: u32| XLogRecord {
+        header: XLogRecordHeader {
+            xact_id: xid,
+            resource_manager_id: RmId::Heap as u8,
+            ..Default::default()
+        },
+        blocks: vec![XLogRecordBlock {
+            header: XLogRecordBlockHeader {
+                location: BlockLocation {
+                    rel: descriptor.rfn,
+                    block_no: 0,
+                },
+                ..Default::default()
+            },
+            data: std::borrow::Cow::Borrowed(&tuple[..]),
+            ..Default::default()
+        }],
+        main_data: std::borrow::Cow::Borrowed(&[1, 0, 8][..]),
+        ..Default::default()
+    };
     println!("{args:?}");
     for repeat in 0..args.repeats {
         let dir = tempfile::tempdir_in(&args.dir)?;
@@ -70,22 +119,16 @@ async fn run(args: Args) -> anyhow::Result<()> {
         let mut read_time = Duration::ZERO;
         let mut spill_bytes = 0;
         let mut peak_memory = 0;
+        let (mut buffered, mut drained) = (Vec::new(), Vec::new());
         for xid in 1..=args.transactions {
+            let base = GLOBAL.reset_peak();
             let start = Instant::now();
+            let record = record(xid);
             for row in 0..args.rows {
+                let source_lsn = u64::from(xid) * (args.rows as u64 + 1) + row as u64;
                 buffer
-                    .on_heap(DescribedHeap {
-                        decoded: DecodedHeap {
-                            rfn: descriptor.rfn,
-                            xid,
-                            source_lsn: u64::from(xid) * (args.rows as u64 + 1) + row as u64,
-                            op: HeapOp::Insert,
-                            new: Some(DecodedTuple {
-                                columns: vec![Some(ColumnValue::Text(payload.clone()))],
-                                partial: false,
-                            }),
-                            old: None,
-                        },
+                    .on_input(DescribedInput {
+                        input: HeapInput::from_parsed(&record, source_lsn, 1),
                         descriptor: descriptor.clone(),
                         descriptor_valid_from: 1,
                     })
@@ -94,6 +137,8 @@ async fn run(args: Args) -> anyhow::Result<()> {
             }
             write_time += start.elapsed();
             spill_bytes += buffer.stats().spill_bytes_active;
+            buffered.push(GLOBAL.snapshot().since(base));
+            let base = GLOBAL.reset_peak();
             let start = Instant::now();
             let commit_lsn = u64::from(xid + 1) * (args.rows as u64 + 1);
             let mut drain = buffer
@@ -108,17 +153,21 @@ async fn run(args: Args) -> anyhow::Result<()> {
             let mut rows = 0;
             while let Some(batch) = drain.next_batch(1024, 1 << 20, None).await? {
                 for heap in batch.heaps {
-                    assert_eq!(heap.decoded.xid, xid);
+                    let DrainHeap::Input(input) = heap else {
+                        panic!("ordinary rows drain as inputs");
+                    };
+                    assert_eq!(input.input.xid, xid);
                     assert_eq!(
-                        heap.decoded.source_lsn,
+                        input.input.source_lsn,
                         u64::from(xid) * (args.rows as u64 + 1) + rows
                     );
-                    assert_eq!(heap.descriptor.as_ref(), descriptor.as_ref());
-                    assert_eq!(heap.descriptor_valid_from, 1);
-                    let tuple = heap.decoded.new.unwrap();
-                    assert_eq!(tuple.columns.len(), 1);
+                    assert_eq!(input.descriptor.as_ref(), descriptor.as_ref());
+                    assert_eq!(input.descriptor_valid_from, 1);
+                    let record = input.input.to_xlog_record(descriptor.rfn);
+                    let images = view_heap_record(&record, &descriptor)?;
+                    let datums = &images[0].new.as_ref().expect("insert image").datums;
                     assert!(
-                        matches!(&tuple.columns[0], Some(ColumnValue::Text(s)) if s == &payload)
+                        matches!(datums[..], [DatumRef::Varlena(b)] if b == payload.as_bytes())
                     );
                     rows += 1;
                 }
@@ -127,10 +176,18 @@ async fn run(args: Args) -> anyhow::Result<()> {
             drain.finish().await?;
             buffer.resume_safe_lsn(walshadow::pos::Pos::new(commit_lsn));
             read_time += start.elapsed();
+            drained.push(GLOBAL.snapshot().since(base));
         }
+        // Largest transaction footprint, buffered rows still owned by buffer
+        let worst = |d: &[alloc_meter::Delta]| {
+            d.iter()
+                .copied()
+                .max_by_key(|d| d.peak)
+                .expect("one transaction")
+        };
         let rows = args.rows as f64 * f64::from(args.transactions);
         println!(
-            "repeat={} rows={} spill_bytes={} evictions={} peak_buffer_bytes={} write_s={:.6} read_s={:.6} rows_per_s={:.0} spill_write_mib_s={:.2} spill_read_mib_s={:.2}",
+            "repeat={} rows={} spill_bytes={} evictions={} peak_buffer_bytes={} write_s={:.6} read_s={:.6} rows_per_s={:.0} spill_write_mib_s={:.2} spill_read_mib_s={:.2} buffer {} drain {}",
             repeat + 1,
             rows as u64,
             spill_bytes,
@@ -141,6 +198,8 @@ async fn run(args: Args) -> anyhow::Result<()> {
             rows / (write_time + read_time).as_secs_f64(),
             spill_bytes as f64 / (1 << 20) as f64 / write_time.as_secs_f64(),
             spill_bytes as f64 / (1 << 20) as f64 / read_time.as_secs_f64(),
+            worst(&buffered),
+            worst(&drained),
         );
         assert_eq!(buffer.stats().bytes_in_memory, 0);
         assert_eq!(buffer.stats().spill_bytes_active, 0);

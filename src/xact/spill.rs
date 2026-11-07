@@ -20,6 +20,7 @@
 //!   TAG_TOAST_DELETE (body = encoded ToastDelete)
 //!   TAG_RAW          (body = encoded RawRecord)
 //!   TAG_DESCRIPTOR   (body = u64 valid_from + descriptor)
+//!   TAG_INPUT        (body = u32 dict id + encoded HeapInput)
 //! ```
 //!
 //! `TAG_DESCRIPTOR` never surfaces as an entry: each distinct `(rfn, valid_from)`
@@ -70,12 +71,143 @@ use ahash::{HashMap, HashMapExt};
 #[derive(Debug, Clone, PartialEq)]
 pub enum SpillEntry {
     Heap(Box<DescribedHeap>),
-    Chunk(ToastChunk),
+    /// Boxed so every slot stays small; heap records outnumber chunks
+    Chunk(Box<ToastChunk>),
     ToastDelete(ToastDelete),
     /// Undecoded record on a filenode invisible at record time (same-xact
     /// CREATE / TRUNCATE / rewrite generation); decoded at commit once
     /// `relation_at(rfn, commit_lsn)` resolves the survivor
     Raw(Box<RawRecord>),
+    /// Ordinary heap record under a descriptor covering it at record time,
+    /// decoded at commit against that version
+    Input(Box<DescribedInput>),
+}
+
+// One slot per buffered record
+const _: () = assert!(std::mem::size_of::<SpillEntry>() <= 32);
+
+/// Heap record bytes decode reads: `main_data` and block 0 registered data.
+/// Block images and other blocks drop; `wal_level=logical` keeps tuple
+/// data registered (`REGBUF_KEEP_DATA`)
+#[derive(Debug, Clone, PartialEq)]
+pub struct HeapInput {
+    /// Writer xid from record header, a subxact's own under merge
+    pub xid: u32,
+    pub rm: u8,
+    pub info: u8,
+    pub source_lsn: u64,
+    /// Tuples a decode yields, MULTI_INSERT fans out
+    pub tuples: u16,
+    /// `main_data` then block 0 data
+    bytes: Box<[u8]>,
+    main_len: u32,
+    has_block: bool,
+}
+
+impl HeapInput {
+    pub fn from_parsed(
+        parsed: &walrus::pg::walparser::XLogRecord<'_>,
+        source_lsn: u64,
+        tuples: u16,
+    ) -> Self {
+        let block = parsed.blocks.first().map(|b| &b.data[..]);
+        let mut bytes = Vec::with_capacity(parsed.main_data.len() + block.map_or(0, <[u8]>::len));
+        bytes.extend_from_slice(&parsed.main_data);
+        bytes.extend_from_slice(block.unwrap_or_default());
+        Self {
+            xid: parsed.header.xact_id,
+            rm: parsed.header.resource_manager_id,
+            info: parsed.header.info,
+            source_lsn,
+            tuples,
+            bytes: bytes.into_boxed_slice(),
+            main_len: parsed.main_data.len() as u32,
+            has_block: block.is_some(),
+        }
+    }
+
+    pub fn approx_bytes(&self) -> usize {
+        std::mem::size_of::<Self>() + self.bytes.len()
+    }
+
+    /// Fields heap decode reads, borrowed without building a record
+    pub fn record_bytes(&self) -> crate::decode::heap_decoder::HeapRecordBytes<'_> {
+        let (main_data, data) = self.bytes.split_at(self.main_len as usize);
+        crate::decode::heap_decoder::HeapRecordBytes {
+            rm: self.rm,
+            info: self.info,
+            main_data,
+            block: self.has_block.then_some(data),
+        }
+    }
+
+    /// Borrowed record targeting `rfn` for the shared heap decoder
+    pub fn to_xlog_record(&self, rfn: RelFileNode) -> walrus::pg::walparser::XLogRecord<'_> {
+        use walrus::pg::walparser::{
+            BlockLocation, XLogRecord, XLogRecordBlock, XLogRecordBlockHeader, XLogRecordHeader,
+        };
+        let (main_data, data) = self.bytes.split_at(self.main_len as usize);
+        XLogRecord {
+            header: XLogRecordHeader {
+                xact_id: self.xid,
+                info: self.info,
+                resource_manager_id: self.rm,
+                ..Default::default()
+            },
+            main_data_len: self.main_len,
+            origin: 0,
+            toplevel_xid: 0,
+            blocks: self
+                .has_block
+                .then(|| XLogRecordBlock {
+                    header: XLogRecordBlockHeader {
+                        data_length: data.len() as u16,
+                        location: BlockLocation {
+                            rel: rfn,
+                            block_no: 0,
+                        },
+                        ..Default::default()
+                    },
+                    image: std::borrow::Cow::Borrowed(&[]),
+                    data: std::borrow::Cow::Borrowed(data),
+                })
+                .into_iter()
+                .collect(),
+            main_data: std::borrow::Cow::Borrowed(main_data),
+        }
+    }
+}
+
+/// [`HeapInput`] pinned to its record-time descriptor version, as
+/// [`DescribedHeap`] pins decoded cells
+#[derive(Debug, Clone, PartialEq)]
+pub struct DescribedInput {
+    pub input: HeapInput,
+    pub descriptor: Arc<RelDescriptor>,
+    /// Log entry `valid_from` of `descriptor` at attach
+    pub descriptor_valid_from: u64,
+}
+
+impl DescribedInput {
+    /// Owned cells per tuple, through the cell adapter
+    pub fn decode(
+        &self,
+    ) -> std::result::Result<
+        crate::decode::heap_decoder::DecodedHeaps,
+        crate::decode::heap_decoder::DecodeError,
+    > {
+        crate::decode::heap_decoder::decode_heap_record(
+            &self.input.to_xlog_record(self.descriptor.rfn),
+            self.input.source_lsn,
+            &self.descriptor,
+        )
+    }
+
+    pub fn approx_bytes(&self) -> usize {
+        self.input.approx_bytes()
+            + std::mem::size_of::<Arc<RelDescriptor>>()
+            + std::mem::size_of::<u64>()
+    }
 }
 
 /// Raw decode inputs for one WAL record, enough to re-run
@@ -286,10 +418,11 @@ pub const SPILL_MAGIC: [u8; 2] = *b"WS";
 /// the `TAG_DESCRIPTOR` dictionary (Heap bodies reference descriptors by dict
 /// id). v6 added writer xid to heap + raw bodies. v7 added database OID to
 /// chunk and `ToastDelete` bodies. v8 dropped heap rfn, restored from the
-/// dict descriptor. v9 stored inet addr as fixed 16 bytes. `DrainEntry`
+/// dict descriptor. v9 stored inet addr as fixed 16 bytes. v10 added
+/// `TAG_INPUT` undecoded ordinary heap records. `DrainEntry`
 /// events (Catalog, ToastBarrier, Config/Signal) are drain-time, never
 /// spilled, so they don't touch this format
-pub const SPILL_VERSION: u16 = 9;
+pub const SPILL_VERSION: u16 = 10;
 
 /// Wire tags, one block per tag space so encode and decode read off the same
 /// table. Renumbering is a body-encoding change: bump [`SPILL_VERSION`]
@@ -300,6 +433,7 @@ const TAG_CHUNK: u8 = 1;
 const TAG_TOAST_DELETE: u8 = 2;
 const TAG_RAW: u8 = 3;
 const TAG_DESCRIPTOR: u8 = 4;
+const TAG_INPUT: u8 = 5;
 
 /// [`HeapOp`], one byte in every heap body
 const OP_INSERT: u8 = 0;
@@ -336,6 +470,10 @@ const VAL_INTERVAL: u8 = 22;
 const VAL_JSON: u8 = 23;
 const VAL_PG_PENDING: u8 = 24;
 const VAL_PG_PENDING_TEXT: u8 = 25;
+const VAL_OID8: u8 = 26;
+const VAL_MACADDR: u8 = 27;
+const VAL_MACADDR8: u8 = 28;
+const VAL_TID: u8 = 29;
 
 /// [`crate::decode::codecs::NumericKind`], inside a [`VAL_NUMERIC`] body
 const NUM_FINITE: u8 = 0;
@@ -549,24 +687,46 @@ impl SpillWriter {
         self.out.flush().await
     }
 
+    /// Dictionary id for a descriptor version, framing it on first use
+    fn dict_id(&mut self, descriptor: &RelDescriptor, valid_from: u64) -> u32 {
+        let next_id = self.dict.len() as u32;
+        let id = *self
+            .dict
+            .entry((descriptor.rfn, valid_from))
+            .or_insert(next_id);
+        if id == next_id {
+            frame_into(&mut self.out.buf, TAG_DESCRIPTOR, |out| {
+                push_u64(out, valid_from);
+                encode_descriptor_bytes(out, descriptor);
+            });
+        }
+        id
+    }
+
     fn encode(&mut self, entry: &SpillEntry) {
-        let body = &mut self.out.buf;
         match entry {
             SpillEntry::Heap(h) => {
-                let key = (h.descriptor.rfn, h.descriptor_valid_from);
-                let next_id = self.dict.len() as u32;
-                let id = *self.dict.entry(key).or_insert(next_id);
-                if id == next_id {
-                    frame_into(body, TAG_DESCRIPTOR, |out| {
-                        push_u64(out, h.descriptor_valid_from);
-                        encode_descriptor_bytes(out, &h.descriptor);
-                    });
-                }
-                frame_into(body, TAG_HEAP, |out| {
+                let id = self.dict_id(&h.descriptor, h.descriptor_valid_from);
+                frame_into(&mut self.out.buf, TAG_HEAP, |out| {
                     push_u32(out, id);
                     encode_heap_into(out, &h.decoded);
                 });
             }
+            SpillEntry::Input(i) => {
+                let id = self.dict_id(&i.descriptor, i.descriptor_valid_from);
+                frame_into(&mut self.out.buf, TAG_INPUT, |out| {
+                    push_u32(out, id);
+                    encode_input_into(out, &i.input);
+                });
+            }
+            entry => self.encode_payload(entry),
+        }
+    }
+
+    fn encode_payload(&mut self, entry: &SpillEntry) {
+        let body = &mut self.out.buf;
+        match entry {
+            SpillEntry::Heap(_) | SpillEntry::Input(_) => unreachable!("dictionary entries"),
             SpillEntry::Chunk(c) => frame_into(body, TAG_CHUNK, |out| encode_chunk_into(out, c)),
             SpillEntry::ToastDelete(d) => frame_into(body, TAG_TOAST_DELETE, |out| {
                 encode_toast_delete_into(out, d)
@@ -734,25 +894,37 @@ impl SpillReader {
             }
             let body = &self.chunks.consume(5 + len)[5..];
             let mut cur = Cursor::new(body);
+            let described = |cur: &mut Cursor| {
+                let dict_id = cur.u32()? as usize;
+                self.dict
+                    .get(dict_id)
+                    .cloned()
+                    .ok_or_else(|| SpillError::Format {
+                        offset: cur.pos,
+                        detail: format!(
+                            "heap references dict id {dict_id}, only {} defined",
+                            self.dict.len(),
+                        ),
+                    })
+            };
             let entry = match tag {
                 TAG_HEAP => {
-                    let dict_id = cur.u32()? as usize;
-                    let Some((descriptor, valid_from)) = self.dict.get(dict_id).cloned() else {
-                        return Err(SpillError::Format {
-                            offset: cur.pos,
-                            detail: format!(
-                                "heap references dict id {dict_id}, only {} defined",
-                                self.dict.len(),
-                            ),
-                        });
-                    };
+                    let (descriptor, valid_from) = described(&mut cur)?;
                     SpillEntry::Heap(Box::new(DescribedHeap {
                         decoded: decode_heap(&mut cur, descriptor.rfn)?,
                         descriptor,
                         descriptor_valid_from: valid_from,
                     }))
                 }
-                TAG_CHUNK => SpillEntry::Chunk(decode_chunk(&mut cur)?),
+                TAG_INPUT => {
+                    let (descriptor, valid_from) = described(&mut cur)?;
+                    SpillEntry::Input(Box::new(DescribedInput {
+                        input: decode_input(&mut cur)?,
+                        descriptor,
+                        descriptor_valid_from: valid_from,
+                    }))
+                }
+                TAG_CHUNK => SpillEntry::Chunk(Box::new(decode_chunk(&mut cur)?)),
                 TAG_TOAST_DELETE => SpillEntry::ToastDelete(decode_toast_delete(&mut cur)?),
                 TAG_RAW => SpillEntry::Raw(Box::new(decode_raw(&mut cur)?)),
                 TAG_DESCRIPTOR => {
@@ -895,7 +1067,7 @@ pub(crate) fn push_u16(out: &mut Vec<u8>, v: u16) {
 pub(crate) fn push_u32(out: &mut Vec<u8>, v: u32) {
     out.extend_from_slice(&v.to_le_bytes());
 }
-fn push_i32(out: &mut Vec<u8>, v: i32) {
+pub(crate) fn push_i32(out: &mut Vec<u8>, v: i32) {
     out.extend_from_slice(&v.to_le_bytes());
 }
 pub(crate) fn push_u64(out: &mut Vec<u8>, v: u64) {
@@ -904,7 +1076,7 @@ pub(crate) fn push_u64(out: &mut Vec<u8>, v: u64) {
 fn push_i64(out: &mut Vec<u8>, v: i64) {
     out.extend_from_slice(&v.to_le_bytes());
 }
-fn push_bytes(out: &mut Vec<u8>, b: &[u8]) {
+pub(crate) fn push_bytes(out: &mut Vec<u8>, b: &[u8]) {
     push_u32(out, b.len() as u32);
     out.extend_from_slice(b);
 }
@@ -983,6 +1155,23 @@ pub(crate) fn encode_value(out: &mut Vec<u8>, v: &ColumnValue) {
         ColumnValue::Oid(i) => {
             push_u8(out, VAL_OID);
             push_u32(out, *i);
+        }
+        ColumnValue::Oid8(i) => {
+            push_u8(out, VAL_OID8);
+            push_u64(out, *i);
+        }
+        ColumnValue::MacAddr(b) => {
+            push_u8(out, VAL_MACADDR);
+            out.extend_from_slice(b);
+        }
+        ColumnValue::MacAddr8(b) => {
+            push_u8(out, VAL_MACADDR8);
+            out.extend_from_slice(b);
+        }
+        ColumnValue::Tid { block, offset } => {
+            push_u8(out, VAL_TID);
+            push_u32(out, *block);
+            push_u16(out, *offset);
         }
         ColumnValue::Date(i) => {
             push_u8(out, VAL_DATE);
@@ -1122,6 +1311,18 @@ fn encode_raw_into(out: &mut Vec<u8>, r: &RawRecord) {
     }
 }
 
+fn encode_input_into(out: &mut Vec<u8>, i: &HeapInput) {
+    out.reserve(32 + i.bytes.len());
+    push_u32(out, i.xid);
+    push_u8(out, i.rm);
+    push_u8(out, i.info);
+    push_u64(out, i.source_lsn);
+    push_u16(out, i.tuples);
+    push_u32(out, i.main_len);
+    push_u8(out, u8::from(i.has_block));
+    push_bytes(out, &i.bytes);
+}
+
 // ── decoding ────────────────────────────────────────────────────────
 
 pub(crate) struct Cursor<'a> {
@@ -1134,7 +1335,7 @@ impl<'a> Cursor<'a> {
         Self { buf, pos: 0 }
     }
 
-    fn need(&mut self, n: usize) -> Result<&'a [u8]> {
+    pub(crate) fn need(&mut self, n: usize) -> Result<&'a [u8]> {
         if self.pos + n > self.buf.len() {
             return Err(SpillError::Format {
                 offset: self.pos,
@@ -1159,7 +1360,7 @@ impl<'a> Cursor<'a> {
     pub(crate) fn u32(&mut self) -> Result<u32> {
         self.take().map(u32::from_le_bytes)
     }
-    fn i32(&mut self) -> Result<i32> {
+    pub(crate) fn i32(&mut self) -> Result<i32> {
         self.take().map(i32::from_le_bytes)
     }
     pub(crate) fn u64(&mut self) -> Result<u64> {
@@ -1247,6 +1448,14 @@ pub(crate) fn decode_value(c: &mut Cursor) -> Result<ColumnValue> {
         VAL_FLOAT4 => ColumnValue::Float4(c.f32()?),
         VAL_FLOAT8 => ColumnValue::Float8(c.f64()?),
         VAL_OID => ColumnValue::Oid(c.u32()?),
+        VAL_OID8 => ColumnValue::Oid8(c.u64()?),
+        VAL_MACADDR => ColumnValue::MacAddr(c.need(6)?.try_into().unwrap()),
+        VAL_MACADDR8 => ColumnValue::MacAddr8(c.need(8)?.try_into().unwrap()),
+        VAL_TID => {
+            let block = c.u32()?;
+            let offset = c.u16()?;
+            ColumnValue::Tid { block, offset }
+        }
         VAL_DATE => ColumnValue::Date(c.i32()?),
         VAL_TIME => ColumnValue::Time(c.i64()?),
         VAL_TIMESTAMP => ColumnValue::Timestamp(c.i64()?),
@@ -1364,6 +1573,33 @@ fn decode_toast_delete(c: &mut Cursor) -> Result<ToastDelete> {
         blkno: c.u32()?,
         offnum: c.u16()?,
         source_lsn: c.u64()?,
+    })
+}
+
+fn decode_input(c: &mut Cursor) -> Result<HeapInput> {
+    let xid = c.u32()?;
+    let rm = c.u8()?;
+    let info = c.u8()?;
+    let source_lsn = c.u64()?;
+    let tuples = c.u16()?;
+    let main_len = c.u32()?;
+    let has_block = c.u8()? != 0;
+    let bytes = c.bytes()?.into_boxed_slice();
+    if main_len as usize > bytes.len() {
+        return Err(SpillError::Format {
+            offset: c.pos,
+            detail: format!("input main_data {main_len} exceeds {} bytes", bytes.len()),
+        });
+    }
+    Ok(HeapInput {
+        xid,
+        rm,
+        info,
+        source_lsn,
+        tuples,
+        bytes,
+        main_len,
+        has_block,
     })
 }
 
@@ -1531,12 +1767,12 @@ mod tests {
         for remaining in [1, 3, 5, 31] {
             let mut writer = store.writer(42, remaining).await.unwrap();
             writer
-                .write_batch(vec![SpillEntry::Chunk(sample_chunk(
+                .write_batch(vec![SpillEntry::Chunk(Box::new(sample_chunk(
                     99,
                     0,
                     0x2000,
                     &vec![7; IO_CHUNK + 1],
-                ))])
+                )))])
                 .await
                 .unwrap();
             let mut reader = writer.finish().await.unwrap();
@@ -1564,7 +1800,7 @@ mod tests {
         w.write_batch(vec![SpillEntry::Heap(Box::new(h.clone()))])
             .await
             .unwrap();
-        w.write_batch(vec![SpillEntry::Chunk(c.clone())])
+        w.write_batch(vec![SpillEntry::Chunk(Box::new(c.clone()))])
             .await
             .unwrap();
         let bc = w.byte_count();
@@ -1574,7 +1810,10 @@ mod tests {
             r.next().await.unwrap().unwrap(),
             SpillEntry::Heap(Box::new(h))
         );
-        assert_eq!(r.next().await.unwrap().unwrap(), SpillEntry::Chunk(c));
+        assert_eq!(
+            r.next().await.unwrap().unwrap(),
+            SpillEntry::Chunk(Box::new(c))
+        );
         assert!(r.next().await.unwrap().is_none(), "EOF expected");
         r.unlink().await.unwrap();
     }
@@ -1598,6 +1837,47 @@ mod tests {
         assert_eq!(r.next().await.unwrap().unwrap(), SpillEntry::ToastDelete(d));
         assert!(r.next().await.unwrap().is_none());
         r.unlink().await.unwrap();
+    }
+
+    /// Inputs keep only main data and block 0 data, share the descriptor
+    /// dictionary with heaps, and decode identically after spill
+    #[tokio::test(flavor = "current_thread")]
+    async fn round_trip_heap_input() {
+        let tmp = tempdir().unwrap();
+        let store = SpillStore::new(tmp.path().to_path_buf()).unwrap();
+        let mut w = store.writer(1, 0x300).await.unwrap();
+        let descriptor = crate::xact::xact_buffer::raw_fixtures::int4_descriptor(16480);
+        let raw =
+            crate::xact::xact_buffer::raw_fixtures::multi_insert_raw(9, 0x4242, 16480, &[5, 6]);
+        let input = DescribedInput {
+            input: HeapInput::from_parsed(&raw.to_xlog_record(), raw.source_lsn, 2),
+            descriptor: descriptor.clone(),
+            descriptor_valid_from: 0x100,
+        };
+        let heap = DescribedHeap {
+            decoded: input.decode().unwrap().remove(0),
+            descriptor,
+            descriptor_valid_from: 0x100,
+        };
+        let entries = vec![
+            SpillEntry::Input(Box::new(input.clone())),
+            SpillEntry::Heap(Box::new(heap.clone())),
+            SpillEntry::Input(Box::new(input.clone())),
+        ];
+        w.write_batch(entries.clone()).await.unwrap();
+        let mut r = w.finish().await.unwrap();
+        for want in entries {
+            let got = r.next().await.unwrap().unwrap();
+            if let (SpillEntry::Input(a), SpillEntry::Input(b)) = (&got, &want) {
+                assert_eq!(a.decode().unwrap(), b.decode().unwrap());
+            }
+            assert_eq!(got, want);
+        }
+        assert!(r.next().await.unwrap().is_none());
+        assert_eq!(
+            input.input.approx_bytes(),
+            std::mem::size_of::<HeapInput>() + raw.main_data.len() + raw.blocks[0].data.len()
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1828,6 +2108,10 @@ mod tests {
             ColumnValue::Float4(_) => VAL_FLOAT4,
             ColumnValue::Float8(_) => VAL_FLOAT8,
             ColumnValue::Oid(_) => VAL_OID,
+            ColumnValue::Oid8(_) => VAL_OID8,
+            ColumnValue::MacAddr(_) => VAL_MACADDR,
+            ColumnValue::MacAddr8(_) => VAL_MACADDR8,
+            ColumnValue::Tid { .. } => VAL_TID,
             ColumnValue::Date(_) => VAL_DATE,
             ColumnValue::Time(_) => VAL_TIME,
             ColumnValue::Timestamp(_) => VAL_TIMESTAMP,
@@ -1862,6 +2146,13 @@ mod tests {
             ColumnValue::Float4(std::f32::consts::PI),
             ColumnValue::Float8(std::f64::consts::E),
             ColumnValue::Oid(0xDEADBEEF),
+            ColumnValue::Oid8(u64::MAX),
+            ColumnValue::MacAddr([1, 2, 3, 4, 5, 6]),
+            ColumnValue::MacAddr8([1, 2, 3, 4, 5, 6, 7, 8]),
+            ColumnValue::Tid {
+                block: u32::MAX,
+                offset: 7,
+            },
             ColumnValue::Date(-1),
             ColumnValue::Time(86_400_000_000),
             ColumnValue::Timestamp(-1),
