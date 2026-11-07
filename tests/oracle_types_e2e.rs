@@ -134,6 +134,79 @@ async fn run_oracle_stats(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn domains_over_local_types_skip_oracle() {
+    if skip_gate() {
+        return;
+    }
+    let (source, ch, _tmp, oracle) = run_oracle_stats(
+        fx::Ports::alloc(),
+        "walshadow-domains",
+        "CREATE DOMAIN counter AS int;
+         CREATE DOMAIN price AS numeric(10,2);
+         CREATE DOMAIN cents AS price CHECK (VALUE >= 0);
+         CREATE DOMAIN label AS text;
+         CREATE DOMAIN document AS jsonb;
+         CREATE DOMAIN moment AS timestamp(3);
+         CREATE TABLE public.domains (
+             id counter PRIMARY KEY, amount cents, label label, doc document, at moment);
+         ALTER TABLE public.domains ALTER COLUMN label SET STORAGE EXTERNAL;",
+        "CREATE OR REPLACE TABLE walshadow_test.domains (
+             id Int32, amount Nullable(Decimal(10,2)), label Nullable(String),
+             doc Nullable(String), at Nullable(DateTime64(3, 'UTC')),
+             _lsn UInt64, _xid UInt32, _commit_ts DateTime64(6, 'UTC'), _is_deleted Bool
+         ) ENGINE = ReplacingMergeTree(_lsn, _is_deleted) ORDER BY id",
+        vec![fx::TableMappingSpec {
+            source_table: RelName::new("public", "domains"),
+            target_table: TableTarget::new("walshadow_test", "domains"),
+            columns: vec![
+                col(1, "id", "Int32"),
+                col(2, "amount", "Nullable(Decimal(10,2))"),
+                col(3, "label", "Nullable(String)"),
+                col(4, "doc", "Nullable(String)"),
+                col(5, "at", "Nullable(DateTime64(3, 'UTC'))"),
+            ],
+        }],
+        "INSERT INTO public.domains VALUES
+             (1, 12.34, repeat('x', 12000), '{\"k\": 1}', '2024-01-02 03:04:05.678'),
+             (2, NULL, NULL, NULL, NULL),
+             (3, 1.00, 'gone', '{}', NULL);
+         UPDATE public.domains SET amount = 56.78 WHERE id = 1;
+         DELETE FROM public.domains WHERE id = 3;
+         SELECT pg_switch_wal();",
+    )
+    .await;
+    let _src = fx::StopOnDrop { sh: &source };
+    assert_eq!(
+        ch.query(
+            "SELECT id, amount, length(label), doc, toString(at)
+                  FROM walshadow_test.domains FINAL WHERE id = 1 AND _is_deleted = 0"
+        )
+        .unwrap(),
+        "1\t56.78\t12000\t{\"k\": 1}\t2024-01-02 03:04:05.678",
+    );
+    assert_eq!(
+        ch.query(
+            "SELECT isNull(amount), isNull(label), isNull(doc), isNull(at)
+                  FROM walshadow_test.domains FINAL WHERE id = 2 AND _is_deleted = 0"
+        )
+        .unwrap(),
+        "1\t1\t1\t1",
+    );
+    assert_eq!(
+        ch.query("SELECT count() FROM walshadow_test.domains FINAL WHERE _is_deleted = 0")
+            .unwrap(),
+        "2",
+    );
+    assert_eq!(
+        oracle
+            .stats
+            .blocks
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn arrays_resolve_via_oracle() {
     if skip_gate() {
         return;
@@ -141,7 +214,8 @@ async fn arrays_resolve_via_oracle() {
     let (source, ch, _tmp) = run_oracle(
         fx::Ports::alloc(),
         "walshadow-oracle-arrays",
-        "CREATE TABLE public.arr (id int PRIMARY KEY, ints int[], texts text[], nums numeric[]);\n",
+        "CREATE DOMAIN int_array AS int[];\n\
+         CREATE TABLE public.arr (id int PRIMARY KEY, ints int_array, texts text[], nums numeric[]);\n",
         "CREATE OR REPLACE TABLE walshadow_test.arr (\
             id Int32, ints Nullable(String), texts Nullable(String), nums Nullable(String),\
             _lsn UInt64, _xid UInt32, _commit_ts DateTime64(6, 'UTC'), _is_deleted Bool\

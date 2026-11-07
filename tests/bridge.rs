@@ -798,6 +798,149 @@ async fn bridge_drops_bad_frames_per_connection() {
     assert_eq!(bridge.stats.reconnects.load(Ordering::Relaxed), 0);
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn bridge_domains_resolve_across_catalog_paths_and_copy() {
+    if !pg_available() {
+        return;
+    }
+    use walshadow::decode::heap_decoder::{
+        ColumnValue, missing_defaults_equivalent, missing_value_for,
+    };
+    use walshadow::schema::{INT4OID, JSONBOID, TEXTOID, TIMESTAMPOID};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let guard = start_pg(&tmp, ports::PG_SHADOW_PORT);
+    let bridge = Arc::new(dial(&guard.sh).await);
+    let mut cat = open_catalog(&guard.sh, bridge).await;
+    let (_, mut mirror) = open_mirror_catalog(&guard.sh, &tmp.path().join("moving.sock")).await;
+    let setup = connect_sql(&guard.sh).await;
+    setup
+        .batch_execute(
+            "CREATE SCHEMA app;
+         CREATE DOMAIN app.counter AS int;
+         CREATE DOMAIN app.money AS numeric(10,2);
+         CREATE DOMAIN app.cents AS app.money CHECK (VALUE >= 0);
+         CREATE DOMAIN app.moment AS timestamp(3);
+         CREATE DOMAIN app._int4 AS text;
+         CREATE DOMAIN app.document AS jsonb;
+         CREATE DOMAIN app.numbers AS int[];
+         CREATE TABLE app.domains (
+             id app.counter PRIMARY KEY, amount app.cents, at app.moment,
+             label app._int4, doc app.document, nums app.numbers, gone app.counter);
+         INSERT INTO app.domains VALUES
+             (1, 12.34, '2024-01-02 03:04:05.678', 'hello', '{\"k\": 1}', '{1,NULL,3}', 9);
+         ALTER TABLE app.domains DROP COLUMN gone;
+         ALTER TABLE app.domains ADD COLUMN counter app.counter DEFAULT 7;
+         ALTER TABLE app.domains ADD COLUMN counts app.counter[];
+         UPDATE app.domains SET counts = '{4,NULL}';",
+        )
+        .await
+        .unwrap();
+    let oid = oid_of(&setup, "app.domains").await;
+    let (_, committed) = cat.fetch_descriptors_batch(&[oid]).await.unwrap();
+    let (_, stated) = mirror.fetch_descriptors_batch(&[oid]).await.unwrap();
+    let pinned = cat
+        .fetch_overlay_descriptors(&[oid], 0, &ParkedAt::assume_for_test(0))
+        .await
+        .unwrap();
+    assert_eq!(committed, stated);
+    assert_eq!(committed, pinned);
+    let desc = &committed[0];
+    let expected = [
+        (INT4OID, "int4", -1, "Int32"),
+        (
+            NUMERICOID,
+            "numeric",
+            (10 << 16) + 2 + 4,
+            "Nullable(Decimal(10, 2))",
+        ),
+        (
+            TIMESTAMPOID,
+            "timestamp",
+            3,
+            "Nullable(DateTime64(3, 'UTC'))",
+        ),
+        (TEXTOID, "text", -1, "Nullable(String)"),
+        (JSONBOID, "jsonb", -1, "Nullable(String)"),
+        (1007, "_int4", -1, "Array(Nullable(Int32))"),
+    ];
+    for (attr, (oid, name, typmod, ch_type)) in desc.attributes.iter().zip(expected) {
+        assert_eq!(
+            (attr.type_oid, attr.type_name.as_str(), attr.typmod),
+            (oid, name, typmod)
+        );
+        assert_eq!(
+            walshadow::type_bridge::map(attr, attr.attnum == 1)
+                .unwrap()
+                .ch_type,
+            ch_type
+        );
+    }
+    assert!(desc.attributes[6].dropped);
+    let counts = &desc.attributes[8];
+    assert_eq!(
+        (counts.type_oid, counts.type_name.as_str()),
+        (1007, "_int4"),
+        "array of domain"
+    );
+    assert_eq!(
+        walshadow::type_bridge::map(counts, false).unwrap().ch_type,
+        "Array(Nullable(Int32))"
+    );
+    assert_eq!(missing_value_for(&desc.attributes[7]), ColumnValue::Int4(7));
+    assert_eq!(
+        walshadow::type_bridge::map(&desc.attributes[7], false)
+            .unwrap()
+            .default_sql
+            .as_deref(),
+        Some("7")
+    );
+
+    let types = walshadow::pg::type_rows(&setup.query(walshadow::pg::TYPE_SQL, &[]).await.unwrap());
+    let sql_attrs = setup.query(walshadow::pg::ATTR_SQL, &[&oid]).await.unwrap();
+    for (row, attr) in sql_attrs.iter().zip(&desc.attributes) {
+        let mut sql_attr = walshadow::pg::RawAttr::from_row(row).build(&types).unwrap();
+        assert!(missing_defaults_equivalent(&sql_attr, attr));
+        sql_attr.missing_default = attr.missing_default.clone();
+        assert_eq!(&sql_attr, attr);
+    }
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    assert_eq!(
+        walshadow::copy_backfill::copy_rows_into(
+            &setup,
+            desc,
+            42,
+            &tx,
+            &walshadow::ch_emitter::EmitterStats::default(),
+            walshadow::copy_backfill::BlockRange {
+                start: 0,
+                end: None
+            },
+        )
+        .await
+        .unwrap(),
+        1
+    );
+    let rows = rx.recv().await.unwrap();
+    let values = &rows[0].columns;
+    assert_eq!(values[0], Some(ColumnValue::Int4(1)));
+    assert!(matches!(&values[1], Some(ColumnValue::Numeric(_))));
+    assert!(matches!(&values[2], Some(ColumnValue::Timestamp(_))));
+    assert_eq!(values[3], Some(ColumnValue::Text("hello".into())));
+    assert_eq!(values[4], Some(ColumnValue::Json("{\"k\": 1}".into())));
+    assert!(matches!(
+        &values[5],
+        Some(ColumnValue::PgPendingText { type_oid: 1007, .. })
+    ));
+    assert_eq!(values[6], None);
+    assert_eq!(values[7], Some(ColumnValue::Int4(7)));
+    assert!(matches!(
+        &values[8],
+        Some(ColumnValue::PgPendingText { type_oid: 1007, .. })
+    ));
+}
+
 /// Three row sources — the mirroring statement, `SCAN` at top xid 0, and
 /// `SCAN` under a transaction that wrote nothing — must build the same
 /// `RelDescriptor`; overlay then tracks open transaction, and the statement
@@ -891,8 +1034,9 @@ async fn bridge_overlay_descriptors_track_open_ddl() {
         "BEGIN;
          ALTER TABLE app.t ADD COLUMN c int DEFAULT 7;
          CREATE SCHEMA fresh;
-         CREATE DOMAIN fresh.cents AS int;
-         CREATE TABLE fresh.u (id int PRIMARY KEY, amount fresh.cents);",
+         CREATE DOMAIN fresh.money AS numeric(10,2);
+         CREATE DOMAIN fresh.cents AS fresh.money;
+         CREATE TABLE fresh.u (id int PRIMARY KEY, amount fresh.cents, amounts fresh.cents[]);",
     )
     .await
     .expect("open ddl");
@@ -923,9 +1067,16 @@ async fn bridge_overlay_descriptors_track_open_ddl() {
 
     assert_eq!(u.rel_name.to_string(), "fresh.u", "in-xact schema name");
     assert_eq!(
-        u.attributes[1].type_name, "cents",
-        "in-xact domain name: {:#?}",
+        u.attributes[1].type_name, "numeric",
+        "in-xact domain base type: {:#?}",
         u.attributes
+    );
+    assert_eq!(u.attributes[1].type_oid, NUMERICOID);
+    assert_eq!(u.attributes[1].typmod, (10 << 16) + 2 + 4);
+    assert_eq!(
+        (u.attributes[2].type_oid, u.attributes[2].typmod),
+        (1231, (10 << 16) + 2 + 4),
+        "in-xact array of in-xact domain"
     );
     assert_eq!(
         u.replident,

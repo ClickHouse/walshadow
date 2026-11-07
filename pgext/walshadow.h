@@ -10,7 +10,7 @@
  * of an unchanged layout changes */
 #define WS_PROTO_VERSION 7
 /* Bumped when any catalog projection changes shape */
-#define WS_PROJECTION_VERSION 2
+#define WS_PROJECTION_VERSION 3
 
 /* request opcodes */
 #define WS_OP_HELLO 0x01

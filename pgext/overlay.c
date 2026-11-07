@@ -334,6 +334,10 @@ ws_emit_type(StringInfo out, HeapTuple tup, TupleDesc desc) {
 
     ws_put_oid(out, f->oid);
     ws_put_name(out, &f->typname);
+    ws_put_oid(out, f->typbasetype);
+    ws_put_int(out, f->typtypmod);
+    ws_put_oid(out, f->typelem);
+    ws_put_oid(out, f->typarray);
 }
 
 typedef void (*WsEmitRow)(StringInfo out, HeapTuple tup, TupleDesc desc);
@@ -396,7 +400,7 @@ ws_catalog_plan(WsCatalog cat, WsCatalogPlan* plan) {
         plan->indexid    = InvalidOid;
         plan->keyattno   = InvalidAttrNumber;
         plan->min_attnum = 0;
-        plan->ncols      = 2;
+        plan->ncols      = 6;
         plan->emit       = ws_emit_type;
         return true;
     }
