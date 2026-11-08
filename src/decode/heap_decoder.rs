@@ -214,7 +214,7 @@ pub enum DecodeError {
     #[error(
         "xl_heap_header at offset {offset} declares t_hoff={t_hoff} < SIZE_OF_HEAP_TUPLE_HEADER"
     )]
-    BadHoff { offset: usize, t_hoff: usize },
+    BadHoff { offset: usize, t_hoff: u8 },
     #[error("nominal alignment char {0:?} not one of c/s/i/d")]
     BadAlign(char),
     #[error("xl_heap_update prefix/suffix bytes exceed block.data ({need} > {have})")]
@@ -550,9 +550,14 @@ fn decode_multi_insert(
             });
         }
         let datalen = u16::from_le_bytes([data[cursor], data[cursor + 1]]) as usize;
-        let t_infomask2 = u16::from_le_bytes([data[cursor + 2], data[cursor + 3]]);
-        let t_infomask = u16::from_le_bytes([data[cursor + 4], data[cursor + 5]]);
-        let t_hoff = data[cursor + 6];
+        // Multi-insert strips the 5-byte xl_heap_header at write time and
+        // stores (t_infomask2, t_infomask, t_hoff) on xl_multi_insert_tuple
+        let header = TupleHeader {
+            offset: cursor,
+            infomask2: u16::from_le_bytes([data[cursor + 2], data[cursor + 3]]),
+            infomask: u16::from_le_bytes([data[cursor + 4], data[cursor + 5]]),
+            hoff: data[cursor + 6],
+        };
         cursor += SIZE_OF_MULTI_INSERT_TUPLE;
         if data.len() < cursor + datalen {
             return Err(DecodeError::Truncated {
@@ -561,16 +566,8 @@ fn decode_multi_insert(
                 have: data.len().saturating_sub(cursor),
             });
         }
-        // Multi-insert strips the 5-byte xl_heap_header at write time and
-        // stores (t_infomask2, t_infomask, t_hoff) on xl_multi_insert_tuple.
-        // Re-synthesize those 5 bytes + tuple body for decode_tuple_payload
-        let mut synth = Vec::with_capacity(SIZE_OF_HEAP_HEADER + datalen);
-        synth.extend_from_slice(&t_infomask2.to_le_bytes());
-        synth.extend_from_slice(&t_infomask.to_le_bytes());
-        synth.push(t_hoff);
-        synth.extend_from_slice(&data[cursor..cursor + datalen]);
+        let tup = walk_tuple(&data[..cursor + datalen], header, cursor, rel, 0)?;
         cursor += datalen;
-        let tup = decode_tuple_payload(&synth, 0, rel, 0, 0)?;
         out.push(DecodedHeap {
             rfn,
             xid,
@@ -641,12 +638,11 @@ fn decode_update(
         } else {
             0
         };
-        let suffixlen = if has_suffix {
-            read_u16(&b.data, &mut cursor)? as usize
-        } else {
-            0
-        };
-        let mut t = decode_tuple_payload(&b.data, cursor, rel, prefixlen, suffixlen)?;
+        // Suffix bytes lie past WAL slice, so its end already bounds the walk
+        if has_suffix {
+            read_u16(&b.data, &mut cursor)?;
+        }
+        let mut t = decode_tuple_payload(&b.data, cursor, rel, prefixlen)?;
         if has_prefix || has_suffix {
             t.partial = true;
         }
@@ -713,7 +709,7 @@ fn decode_new_tuple_block(
     data_start: usize,
     rel: &RelDescriptor,
 ) -> Result<DecodedTuple, DecodeError> {
-    decode_tuple_payload(data, data_start, rel, 0, 0)
+    decode_tuple_payload(data, data_start, rel, 0)
 }
 
 fn decode_old_tuple_from_main_data(
@@ -728,26 +724,34 @@ fn decode_old_tuple_from_main_data(
             have: main_data.len() - header_off,
         });
     }
-    Ok(Some(decode_tuple_payload(
-        main_data, header_off, rel, 0, 0,
-    )?))
+    Ok(Some(decode_tuple_payload(main_data, header_off, rel, 0)?))
 }
 
 /// Decode a `block.data`-shaped tuple for the bootstrap page-walk sink,
 /// which reshapes on-disk `HeapTupleHeaderData`-prefixed tuples into this
-/// form. `prefixlen=suffixlen=0`: WAL prefix/suffix-from-old compression
+/// form. `prefixlen=0`: WAL prefix/suffix-from-old compression
 /// doesn't apply at backup time.
 pub(crate) fn decode_block_data(
     block_data: &[u8],
     rel: &RelDescriptor,
 ) -> Result<DecodedTuple, DecodeError> {
-    decode_tuple_payload(block_data, 0, rel, 0, 0)
+    decode_tuple_payload(block_data, 0, rel, 0)
+}
+
+/// Fields PG strips into `xl_heap_header` or `xl_multi_insert_tuple`
+#[derive(Clone, Copy)]
+struct TupleHeader {
+    /// Header position, for errors
+    offset: usize,
+    infomask2: u16,
+    infomask: u16,
+    hoff: u8,
 }
 
 /// Walk a tuple payload (`xl_heap_header` at `header_off`, then bitmap,
-/// padding, col data). `prefixlen`/`suffixlen` are PG `XLH_UPDATE_*_FROM_OLD`
-/// byte counts elided from front/back of the logical col-data region; columns
-/// wholly inside those regions surface `None` and caller flips `partial`.
+/// padding, col data). `prefixlen` is PG `XLH_UPDATE_PREFIX_FROM_OLD` byte
+/// count elided from front of logical col-data region; columns wholly inside
+/// it or past end of `buf` surface `None` and caller flips `partial`.
 /// Bitmap + xl_heap_header precede prefix elision so are always present at
 /// `header_off`.
 fn decode_tuple_payload(
@@ -755,7 +759,6 @@ fn decode_tuple_payload(
     header_off: usize,
     rel: &RelDescriptor,
     prefixlen: usize,
-    suffixlen: usize,
 ) -> Result<DecodedTuple, DecodeError> {
     if buf.len() < header_off + SIZE_OF_HEAP_HEADER {
         return Err(DecodeError::Truncated {
@@ -764,22 +767,43 @@ fn decode_tuple_payload(
             have: buf.len().saturating_sub(header_off),
         });
     }
-    let t_infomask2 = u16::from_le_bytes([buf[header_off], buf[header_off + 1]]);
-    let t_infomask = u16::from_le_bytes([buf[header_off + 2], buf[header_off + 3]]);
-    let t_hoff = buf[header_off + 4] as usize;
+    let header = TupleHeader {
+        offset: header_off,
+        infomask2: u16::from_le_bytes([buf[header_off], buf[header_off + 1]]),
+        infomask: u16::from_le_bytes([buf[header_off + 2], buf[header_off + 3]]),
+        hoff: buf[header_off + 4],
+    };
+    walk_tuple(
+        buf,
+        header,
+        header_off + SIZE_OF_HEAP_HEADER,
+        rel,
+        prefixlen,
+    )
+}
+
+/// Walk bitmap, padding and col data starting at `bitmap_off`, one column per
+/// attribute of `rel`. `buf` ends where tuple ends
+fn walk_tuple(
+    buf: &[u8],
+    header: TupleHeader,
+    bitmap_off: usize,
+    rel: &RelDescriptor,
+    prefixlen: usize,
+) -> Result<DecodedTuple, DecodeError> {
+    let t_hoff = usize::from(header.hoff);
     if t_hoff < SIZE_OF_HEAP_TUPLE_HEADER {
         return Err(DecodeError::BadHoff {
-            offset: header_off,
-            t_hoff,
+            offset: header.offset,
+            t_hoff: header.hoff,
         });
     }
-    let natts = (t_infomask2 & HEAP_NATTS_MASK) as usize;
-    let has_null = t_infomask & HEAP_HASNULL != 0;
+    let natts = (header.infomask2 & HEAP_NATTS_MASK) as usize;
+    let has_null = header.infomask & HEAP_HASNULL != 0;
 
     let bitmap_bytes = if has_null { natts.div_ceil(8) } else { 0 };
     // PG tuple: header(23) -> bitmap -> MAXALIGN(8) pad -> col data at t_hoff.
-    // WAL slice elides the 23-byte fixed header, so bitmap is at header_off + 5
-    let bitmap_off = header_off + SIZE_OF_HEAP_HEADER;
+    // WAL slice elides the 23-byte fixed header, so bitmap leads the slice
     if buf.len() < bitmap_off + bitmap_bytes {
         return Err(DecodeError::Truncated {
             offset: bitmap_off,
@@ -791,7 +815,7 @@ fn decode_tuple_payload(
 
     // Bytes between SizeofHeapTupleHeader and t_hoff (bitmap + align pad) are
     // carried verbatim in WAL
-    let col_data_off = header_off + SIZE_OF_HEAP_HEADER + (t_hoff - SIZE_OF_HEAP_TUPLE_HEADER);
+    let col_data_off = bitmap_off + (t_hoff - SIZE_OF_HEAP_TUPLE_HEADER);
 
     let mut columns = Vec::with_capacity(rel.attributes.len());
     // `cur` is offset within the *logical* col-data region (relative to
@@ -801,9 +825,6 @@ fn decode_tuple_payload(
     let mut cur: usize = 0;
     let attrs = effective_attrs(rel, natts);
     let wal_col_data_avail = buf.len().saturating_sub(col_data_off);
-    // suffix bytes are past the WAL slice; buf len already accounts for them so
-    // suffixlen goes unconsulted
-    let _ = suffixlen;
     let logical_end = wal_col_data_avail + prefixlen;
     for (idx, att) in attrs.iter().enumerate() {
         if idx >= natts {
@@ -2187,6 +2208,124 @@ mod tests {
             assert_eq!(new.columns.len(), 1);
             assert_eq!(new.columns[0], Some(ColumnValue::Int4(*expected)));
         }
+    }
+
+    fn multi_insert_main_data(ntuples: u16) -> Vec<u8> {
+        let mut main_data = vec![XLH_INSERT_CONTAINS_NEW_TUPLE, 0];
+        main_data.extend_from_slice(&ntuples.to_le_bytes());
+        main_data
+    }
+
+    fn push_multi_insert_tuple(block_data: &mut Vec<u8>, infomask: u16, body: &[u8]) {
+        block_data.resize(block_data.len().next_multiple_of(2), 0xFF);
+        block_data.extend_from_slice(&(body.len() as u16).to_le_bytes());
+        block_data.extend_from_slice(&2u16.to_le_bytes()); // t_infomask2 = natts
+        block_data.extend_from_slice(&infomask.to_le_bytes());
+        block_data.push(24); // t_hoff
+        block_data.extend_from_slice(body);
+    }
+
+    #[test]
+    fn decode_multi_insert_init_page_nulls_varlena_and_pad() {
+        let rel = descriptor(
+            16413,
+            vec![
+                rel_attr(1, "id", INT4OID, 4, 'i'),
+                rel_attr(2, "msg", TEXTOID, -1, 'i'),
+            ],
+        );
+        let mut block_data = Vec::new();
+        // pad(1) + int4 + short varlena "ab"; odd tuple end forces SHORTALIGN pad
+        let mut body = vec![0];
+        body.extend_from_slice(&7i32.to_le_bytes());
+        body.extend_from_slice(&[0x07, b'a', b'b']);
+        push_multi_insert_tuple(&mut block_data, 0, &body);
+        assert_eq!(block_data.len() % 2, 1);
+        // bitmap 0b01 leaves msg NULL
+        let mut body = vec![0b01];
+        body.extend_from_slice(&8i32.to_le_bytes());
+        push_multi_insert_tuple(&mut block_data, HEAP_HASNULL, &body);
+        let rec = record_with(
+            RmId::Heap2,
+            XLOG_HEAP2_MULTI_INSERT | XLOG_HEAP_INIT_PAGE,
+            multi_insert_main_data(2),
+            block_data,
+        );
+        let out = decode_heap_record(&rec, 0, &rel).unwrap();
+        let cols: Vec<_> = out.iter().map(|h| h.new.clone().unwrap()).collect();
+        assert_eq!(
+            cols[0].columns,
+            vec![
+                Some(ColumnValue::Int4(7)),
+                Some(ColumnValue::Text("ab".into()))
+            ]
+        );
+        assert_eq!(
+            cols[1].columns,
+            vec![Some(ColumnValue::Int4(8)), Some(ColumnValue::Null)]
+        );
+        assert!(!cols[0].partial && !cols[1].partial);
+    }
+
+    #[test]
+    fn decode_multi_insert_varlena_stays_inside_its_tuple() {
+        let rel = descriptor(
+            16414,
+            vec![
+                rel_attr(1, "id", INT4OID, 4, 'i'),
+                rel_attr(2, "msg", TEXTOID, -1, 'i'),
+            ],
+        );
+        let mut block_data = Vec::new();
+        // Varlena header claims 4 data bytes, tuple carries 2
+        let mut body = vec![0];
+        body.extend_from_slice(&7i32.to_le_bytes());
+        body.extend_from_slice(&[0x0B, b'a', b'b']);
+        push_multi_insert_tuple(&mut block_data, 0, &body);
+        let mut body = vec![0];
+        body.extend_from_slice(&8i32.to_le_bytes());
+        body.extend_from_slice(&[0x05, b'z']);
+        push_multi_insert_tuple(&mut block_data, 0, &body);
+        let rec = record_with(
+            RmId::Heap2,
+            XLOG_HEAP2_MULTI_INSERT | XLOG_HEAP_INIT_PAGE,
+            multi_insert_main_data(2),
+            block_data,
+        );
+        let out = decode_heap_record(&rec, 0, &rel).unwrap();
+        let first = out[0].new.as_ref().unwrap();
+        assert!(first.partial);
+        assert_eq!(first.columns, vec![Some(ColumnValue::Int4(7)), None]);
+        let second = out[1].new.as_ref().unwrap();
+        assert_eq!(
+            second.columns,
+            vec![
+                Some(ColumnValue::Int4(8)),
+                Some(ColumnValue::Text("z".into()))
+            ]
+        );
+    }
+
+    #[test]
+    fn decode_multi_insert_truncated_body_errors() {
+        let rel = descriptor(16415, vec![rel_attr(1, "id", INT4OID, 4, 'i')]);
+        let mut block_data = Vec::new();
+        push_multi_insert_tuple(&mut block_data, 0, &[0; 5]);
+        block_data.truncate(block_data.len() - 1);
+        let rec = record_with(
+            RmId::Heap2,
+            XLOG_HEAP2_MULTI_INSERT | XLOG_HEAP_INIT_PAGE,
+            multi_insert_main_data(1),
+            block_data,
+        );
+        assert!(matches!(
+            decode_heap_record(&rec, 0, &rel),
+            Err(DecodeError::Truncated {
+                offset: SIZE_OF_MULTI_INSERT_TUPLE,
+                need: 5,
+                have: 4
+            })
+        ));
     }
 
     #[test]
