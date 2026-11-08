@@ -28,9 +28,10 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 use walrus::pg::walparser::RelFileNode;
 use walshadow::ch_emitter::EmitterStats;
+use walshadow::datum::{Datum, build};
 use walshadow::desc_log::{BatchRecord, DescLogIdentity, DescriptorLog, LogEntry, LogValue};
 use walshadow::heap_decoder::{
-    ColumnValue, CommittedTuple, DecodedHeap, DecodedTuple, DescribedHeap, HeapOp, ToastPointer,
+    CommittedTuple, DecodedHeap, DecodedTuple, DescribedHeap, HeapOp, ToastPointer,
 };
 use walshadow::pg::socket_conninfo;
 use walshadow::pos::Pos;
@@ -140,13 +141,7 @@ fn rfn(spc: u32, db: u32, rel: u32) -> RelFileNode {
     }
 }
 
-fn heap(
-    rfn: RelFileNode,
-    xid: u32,
-    lsn: u64,
-    op: HeapOp,
-    cols: Vec<Option<ColumnValue>>,
-) -> DecodedHeap {
+fn heap(rfn: RelFileNode, xid: u32, lsn: u64, op: HeapOp, cols: Vec<Option<Datum>>) -> DecodedHeap {
     DecodedHeap {
         rfn,
         xid,
@@ -301,12 +296,7 @@ async fn commit_drains_in_arrival_order_and_clears_state() {
     let cat = Arc::new(Mutex::new(cat));
     let spill_dir = tmp.path().join("spill");
     let mut b = XactBuffer::new(cfg(spill_dir, 1024)).unwrap();
-    let one_col = |id: i32| {
-        vec![
-            Some(ColumnValue::Int4(id)),
-            Some(ColumnValue::Text("x".into())),
-        ]
-    };
+    let one_col = |id: i32| vec![Some(build::int4(id)), Some(build::text("x"))];
     let log = log_from_catalog(&cat, tmp.path()).await;
     b.on_heap(described(
         &log,
@@ -481,14 +471,8 @@ async fn commit_drains_spilled_then_in_memory_entries() {
     let cat = Arc::new(Mutex::new(cat));
     let spill_dir = tmp.path().join("spill");
     let mut b = XactBuffer::new(cfg(spill_dir, 1024)).unwrap();
-    let fat_col = vec![
-        Some(ColumnValue::Int4(0)),
-        Some(ColumnValue::Bytea(vec![0u8; 700])),
-    ];
-    let small_col = vec![
-        Some(ColumnValue::Int4(0)),
-        Some(ColumnValue::Text("z".into())),
-    ];
+    let fat_col = vec![Some(build::int4(0)), Some(build::bytes(vec![0u8; 700]))];
+    let small_col = vec![Some(build::int4(0)), Some(build::text("z"))];
     let log = log_from_catalog(&cat, tmp.path()).await;
     // Three big tuples first — spill engages after the second.
     for i in 0..3 {
@@ -547,12 +531,7 @@ async fn commit_merges_top_and_subxact_in_source_lsn_order() {
     let cat = Arc::new(Mutex::new(cat));
     let spill_dir = tmp.path().join("spill");
     let mut b = XactBuffer::new(cfg(spill_dir, 1024)).unwrap();
-    let col = |id: i32| {
-        vec![
-            Some(ColumnValue::Int4(id)),
-            Some(ColumnValue::Text("m".into())),
-        ]
-    };
+    let col = |id: i32| vec![Some(build::int4(id)), Some(build::text("m"))];
     let log = log_from_catalog(&cat, tmp.path()).await;
     b.on_heap(described(&log, heap(rfn, 7, 100, HeapOp::Insert, col(1))))
         .await
@@ -591,8 +570,8 @@ async fn detoast_concatenates_uncompressed_chunks_into_text() {
     let spill_dir = tmp.path().join("spill");
     let mut b = XactBuffer::new(cfg(spill_dir, 1024)).unwrap();
     // wc.things schema: (id int4, body text). Column 0 = id, column 1 = body.
-    let id_col = Some(ColumnValue::Int4(1));
-    let body_ptr = Some(ColumnValue::ExternalToast(ToastPointer {
+    let id_col = Some(build::int4(1));
+    let body_ptr = Some(Datum::External(ToastPointer {
         va_rawsize: (4 + 3 + 3) + 4, // ext_size + VARHDRSZ
         va_extinfo: 4 + 3 + 3,       // ext_size, no compression bits
         va_valueid: 55,
@@ -643,10 +622,7 @@ async fn detoast_concatenates_uncompressed_chunks_into_text() {
     .unwrap();
     assert_eq!(seen.len(), 1);
     let body_col = &seen[0].decoded.new.as_ref().unwrap().columns[1];
-    match body_col {
-        Some(ColumnValue::Text(s)) => assert_eq!(s, "Hello, wor"),
-        other => panic!("expected Text after detoast, got {other:?}"),
-    }
+    assert_eq!(*body_col, Some(build::text("Hello, wor")), "detoasted body");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -660,8 +636,8 @@ async fn detoast_missing_chunk_seq_errors_clearly() {
     let cat = Arc::new(Mutex::new(cat));
     let spill_dir = tmp.path().join("spill");
     let mut b = XactBuffer::new(cfg(spill_dir, 1024)).unwrap();
-    let id_col = Some(ColumnValue::Int4(1));
-    let body_ptr = Some(ColumnValue::ExternalToast(ToastPointer {
+    let id_col = Some(build::int4(1));
+    let body_ptr = Some(Datum::External(ToastPointer {
         va_rawsize: 8,
         va_extinfo: 6,
         va_valueid: 1,
@@ -737,10 +713,7 @@ async fn abort_drops_xact_and_unlinks_spill_against_real_shadow() {
     let log = log_from_catalog(&cat, tmp.path()).await;
     let spill_dir = tmp.path().join("spill");
     let mut b = XactBuffer::new(cfg(spill_dir.clone(), 1024)).unwrap();
-    let fat_col = vec![
-        Some(ColumnValue::Int4(0)),
-        Some(ColumnValue::Bytea(vec![0u8; 256])),
-    ];
+    let fat_col = vec![Some(build::int4(0)), Some(build::bytes(vec![0u8; 256]))];
     for i in 0..10 {
         b.on_heap(described(
             &log,

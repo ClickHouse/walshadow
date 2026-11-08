@@ -30,12 +30,12 @@ use crate::backfill::backup_source::{
 use crate::backfill::copy_backfill::CopyRow;
 use crate::backfill::pg_path::{BaseRelFile, RelFork, parse_base_path};
 use crate::backfill::walk_barrier::WalkBarrier;
-#[cfg(any(test, feature = "test-support"))]
-use crate::decode::heap_decoder::{ColumnValue, decode_block_data};
 use crate::decode::heap_decoder::{DecodeError, TupleView, view_block_data};
 use crate::decode::visibility::{
     PendingXids, PgMultiXactAccum, PgXactAccum, PgXactView, SealedPatch,
 };
+#[cfg(any(test, feature = "test-support"))]
+use crate::decode::{datum::Datum, heap_decoder::decode_block_data};
 use crate::schema::RelDescriptor;
 use foldhash::{HashMap, HashMapExt, HashSet};
 
@@ -121,8 +121,8 @@ impl TupleData {
     /// Heap image of `values`, see
     /// [`form_block_data`](crate::decode::heap_decoder::form_block_data)
     #[cfg(any(test, feature = "test-support"))]
-    pub fn from_cells(values: &[Option<ColumnValue>]) -> Self {
-        Self::Heap(crate::decode::heap_decoder::form_block_data(values).into())
+    pub fn from_cells(values: &[Option<Datum>]) -> Self {
+        Self::Heap(crate::decode::heap_decoder::form_block_data(&[], values).into())
     }
 
     pub fn len(&self) -> usize {
@@ -148,12 +148,12 @@ impl BackfillTuple {
 
     /// Owned cells, attnum-1 indexed
     #[cfg(any(test, feature = "test-support"))]
-    pub fn cells(&self, rel: &RelDescriptor) -> Result<Vec<Option<ColumnValue>>, String> {
+    pub fn cells(&self, rel: &RelDescriptor) -> Result<Vec<Option<Datum>>, String> {
         match &self.data {
             TupleData::Heap(b) => decode_block_data(b, rel)
                 .map(|t| t.columns)
                 .map_err(|e| e.to_string()),
-            TupleData::Copy(row) => crate::backfill::copy_backfill::copy_cells(row, rel),
+            TupleData::Copy(row) => Ok(crate::backfill::copy_backfill::copy_cells(row, rel)),
         }
     }
 }
@@ -1187,6 +1187,7 @@ pub(crate) fn synth_single_tuple_page(value: i32) -> [u8; PAGE_BYTES] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::decode::datum::Datum;
 
     use crate::backfill::backup_source::EndInfo;
     use crate::backfill::backup_source::testing::expect_tap;
@@ -1228,7 +1229,7 @@ mod tests {
     /// Leading int4 of a tuple walked against [`make_rel`]'s layout
     fn int4(t: &BackfillTuple) -> Option<i32> {
         match t.cells(&make_rel()).unwrap().first() {
-            Some(Some(ColumnValue::Int4(v))) => Some(*v),
+            Some(Some(Datum::Fixed(b))) => Some(i32::from_le_bytes(b.as_slice().try_into().ok()?)),
             _ => None,
         }
     }

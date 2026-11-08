@@ -51,8 +51,8 @@ use walshadow::backfill::backup_source::{
 };
 use walshadow::backfill_bootstrap::{BootstrapConfig, spawn_greenfield_bootstrap};
 use walshadow::backup_page_walk::{BackfillTuple, CatalogMap, PAGE_BYTES, TupleData};
+use walshadow::datum::build;
 use walshadow::decode::datum::DatumRef;
-use walshadow::heap_decoder::ColumnValue;
 use walshadow::mapping::{ColumnMapping, TableMapping, TableTarget};
 use walshadow::pipeline::bootstrap;
 use walshadow::pos::{EmitterAck, Monotone};
@@ -443,10 +443,10 @@ async fn bench_drain(shape: Shape) -> Report {
                 let slab: Vec<BackfillTuple> = (slab_start..end)
                     .map(|i| {
                         let mut cells: Vec<_> = (0..shape.columns)
-                            .map(|c| Some(ColumnValue::Int4(i as i32 + c as i32)))
+                            .map(|c| Some(build::int4(i as i32 + c as i32)))
                             .collect();
                         if shape.text > 0 {
-                            cells.push(Some(ColumnValue::Text(text.clone())));
+                            cells.push(Some(build::text(&text)));
                         }
                         BackfillTuple {
                             rfn: r.rfn,

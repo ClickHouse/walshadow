@@ -368,9 +368,8 @@ async fn resolve_oracle(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::decode::heap_decoder::{
-        ColumnValue, CommittedTuple, DecodedHeap, DecodedTuple, HeapOp,
-    };
+    use crate::decode::datum::build;
+    use crate::decode::heap_decoder::{CommittedTuple, DecodedHeap, DecodedTuple, HeapOp};
     use crate::emit::ch_emitter::Wire;
     use crate::emit::pipeline::batcher::{BatcherConfig, BatcherMsg, PlacedSegment, RowTable};
     use crate::emit::route::RouteSnapshot;
@@ -431,7 +430,7 @@ mod tests {
         RowTable { rel, route }
     }
 
-    fn wkt_row(seq: u64, text: Option<&str>) -> (u64, CommittedTuple) {
+    fn wkt_row(seq: u64, point: Option<(f64, f64)>) -> (u64, CommittedTuple) {
         (
             seq,
             CommittedTuple {
@@ -445,7 +444,9 @@ mod tests {
                     source_lsn: 0x1000 + seq,
                     op: HeapOp::Insert,
                     new: Some(DecodedTuple {
-                        columns: vec![text.map(|t| ColumnValue::Text(t.into()))],
+                        columns: vec![
+                            point.map(|(x, y)| build::bytes(crate::ops::oracle::point_body(x, y))),
+                        ],
                         partial: false,
                     }),
                     old: None,
@@ -505,10 +506,9 @@ mod tests {
     #[tokio::test]
     async fn rendered_cells_against_a_string_target_stay_local() {
         let mut batch = seal(vec![
-            wkt_row(0, Some("POINT(1 2)")),
+            wkt_row(0, Some((1.0, 2.0))),
             wkt_row(0, None),
-            wkt_row(0, Some("")),
-            wkt_row(0, Some("POINT(3 4)")),
+            wkt_row(0, Some((3.0, 4.0))),
         ])
         .await;
         assert!(
@@ -527,9 +527,9 @@ mod tests {
         assert_eq!(
             batch.blocks[0].buffers[0].wire(),
             Wire::NullableString {
-                offsets: &[10, 10, 10, 20],
+                offsets: &[10, 10, 20],
                 data: b"POINT(1 2)POINT(3 4)",
-                null_map: &[0, 1, 0, 0],
+                null_map: &[0, 1, 0],
                 absent: b"",
             }
         );
@@ -551,7 +551,7 @@ mod tests {
         let gauge = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let budget = output_pool(4 << 10, 1, false, gauge.clone());
         let queued = budget.admit(budget.admission_max()).await;
-        let batch = seal(vec![wkt_row(0, Some("POINT(1 2)"))]).await;
+        let batch = seal(vec![wkt_row(0, Some((1.0, 2.0)))]).await;
         let (batch_tx, batch_rx) = async_channel::bounded(1);
         let (resolved_tx, resolved_rx) = async_channel::bounded(1);
         let fatal = Fatal::new();
@@ -591,12 +591,9 @@ mod tests {
     /// when its neighbours are rendered
     #[tokio::test]
     async fn one_unrendered_cell_keeps_the_column_remote() {
-        let mut rows = vec![wkt_row(0, Some("POINT(1 2)"))];
+        let mut rows = vec![wkt_row(0, Some((1.0, 2.0)))];
         let mut raw = wkt_row(0, None);
-        raw.1.decoded.new.as_mut().unwrap().columns[0] = Some(ColumnValue::Unsupported {
-            type_oid: GEOM_OID,
-            raw: vec![1, 2, 3],
-        });
+        raw.1.decoded.new.as_mut().unwrap().columns[0] = Some(build::bytes(vec![1, 2, 3]));
         rows.push(raw);
         let mut batch = seal(rows).await;
 

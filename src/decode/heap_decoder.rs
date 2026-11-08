@@ -41,7 +41,7 @@
 //! | `relreplident` | old payload | this module's behaviour |
 //! |---|---|---|
 //! | `Full` (`'f'`) | every non-dropped column | decode every column; `old` populated |
-//! | `UsingIndex` (`'i'`) | indexed columns only, others written as NULL via bitmap | decode all; non-indexed columns surface as `Some(ColumnValue::Null)` |
+//! | `UsingIndex` (`'i'`) | indexed columns only, others written as NULL via bitmap | decode all; non-indexed columns surface as `Some(Datum::Null)` |
 //! | `Default` (`'d'`) with PK | PK columns when `XLH_UPDATE_CONTAINS_OLD_KEY` set | same as `UsingIndex` shape, with PK attnums populated |
 //! | `Default` (`'d'`) no PK | nothing (PG never sets OLD_KEY) | `old = None` |
 //! | `Nothing` (`'n'`) | empty | `old = None`; partial = true noted in stats |
@@ -63,12 +63,9 @@
 //! downstream by design. Every output stamped with `xid` so xact buffer
 //! can key on it.
 
-use std::borrow::Cow;
-use std::string::FromUtf8Error;
-
 use smallvec::{SmallVec, smallvec};
 
-use crate::decode::datum::{DatumRef, ValueRef};
+use crate::decode::datum::{Datum, DatumRef};
 use thiserror::Error;
 use walrus::pg::walparser::{RelFileNode, RmId, XLogRecord};
 
@@ -197,124 +194,6 @@ pub enum DecodeError {
     BadPrefixSuffix { need: usize, have: usize },
 }
 
-/// Tier 1/2 decoded value space. Out-of-matrix types surface as
-/// [`ColumnValue::Unsupported`] or [`ColumnValue::ExternalToast`].
-#[derive(Debug, Clone, PartialEq)]
-pub enum ColumnValue {
-    Null,
-    Bool(bool),
-    /// `char` (typname='char'). PG stores as `int8`; surface `i8` to
-    /// distinguish from `int2`.
-    Char(i8),
-    Int2(i16),
-    Int4(i32),
-    Int8(i64),
-    Float4(f32),
-    Float8(f64),
-    /// `oid`, `xid`, `cid`
-    Oid(u32),
-    /// `oid8`, `xid8`, `pg_lsn`
-    Oid8(u64),
-    MacAddr([u8; 6]),
-    MacAddr8([u8; 8]),
-    Tid {
-        block: u32,
-        offset: u16,
-    },
-    /// `date`, days since PG epoch 2000-01-01, negative for pre-epoch.
-    Date(i32),
-    /// `time`, microseconds since midnight. Legacy float8 storage
-    /// (`--disable-integer-datetimes`) removed in PG 10.
-    Time(i64),
-    /// `timestamp`, microseconds since PG epoch 2000-01-01 00:00:00 UTC.
-    Timestamp(i64),
-    /// `timestamptz`, same storage as `timestamp`; tz is presentation-only
-    /// in PG, bytes identical.
-    TimestampTz(i64),
-    /// `timetz`, `time` storage + 4-byte UTC offset (seconds, negative for
-    /// east of UTC per PG sign convention).
-    TimeTz {
-        micros: i64,
-        tz_seconds: i32,
-    },
-    /// `uuid`, 16 raw bytes network byte order on disk (PG `uuid_send`, memcpy).
-    Uuid([u8; 16]),
-    /// `name`, NUL-padded NAMEDATALEN(64) C string, no varlena header;
-    /// surface trimmed.
-    Name(String),
-    Bytea(Vec<u8>),
-    /// `text`/`varchar`/`bpchar`, varlena + UTF-8 decode. Invalid UTF-8
-    /// surfaces as [`ColumnValue::Bytea`].
-    Text(String),
-    /// `numeric` Tier 2. PG-text form for finite; NaN/Infinity carry their
-    /// flag. Emitter maps to CH `String` (PG precision is per-row, no fixed
-    /// CH `Decimal` fits without operator config).
-    Numeric(crate::decode::codecs::NumericKind),
-    /// `inet`/`cidr` Tier 2. Emit via [`crate::decode::codecs::InetValue::to_text`].
-    Inet(crate::decode::codecs::InetValue),
-    /// `interval` Tier 2, 16-byte fixed-width (months, days, micros).
-    Interval(crate::decode::codecs::IntervalValue),
-    /// JSON document text: `json` is varlena text on disk and passes
-    /// through unchanged, `jsonb` renders through
-    /// [`crate::decode::codecs::decode_jsonb`].
-    Json(String),
-    /// Unhandled on-disk Datum body, varlena header stripped
-    PgPending {
-        type_oid: u32,
-        raw: Vec<u8>,
-    },
-    /// Attribute default text requiring `typinput`, not Datum reconstruction
-    PgPendingText {
-        type_oid: u32,
-        text: String,
-    },
-    /// On-disk TOAST pointer; xact buffer's TOAST reassembly dereferences.
-    ExternalToast(ToastPointer),
-    /// Type OID outside decoder matrix, carries raw bytes.
-    Unsupported {
-        type_oid: u32,
-        raw: Vec<u8>,
-    },
-}
-
-impl ColumnValue {
-    /// Approximate in-memory payload bytes, to bound the decode pool's
-    /// coalescing buffer. Detoast has already run by route time so
-    /// `ExternalToast` pointers are resolved into `Text`/`Bytea`. Exhaustive
-    /// so a new variant forces a width.
-    pub fn approx_bytes(&self) -> usize {
-        use crate::decode::codecs::NumericKind;
-        match self {
-            ColumnValue::Null => 0,
-            ColumnValue::Bool(_) | ColumnValue::Char(_) => 1,
-            ColumnValue::Int2(_) => 2,
-            ColumnValue::MacAddr(_) | ColumnValue::Tid { .. } => 6,
-            ColumnValue::Int4(_)
-            | ColumnValue::Float4(_)
-            | ColumnValue::Oid(_)
-            | ColumnValue::Date(_) => 4,
-            ColumnValue::Int8(_)
-            | ColumnValue::Float8(_)
-            | ColumnValue::Oid8(_)
-            | ColumnValue::MacAddr8(_)
-            | ColumnValue::Time(_)
-            | ColumnValue::Timestamp(_)
-            | ColumnValue::TimestampTz(_) => 8,
-            ColumnValue::TimeTz { .. } => 12,
-            ColumnValue::Uuid(_) => 16,
-            ColumnValue::Interval(_) => 16,
-            ColumnValue::Inet(_) => 19,
-            ColumnValue::Numeric(NumericKind::Finite(s)) => s.len(),
-            ColumnValue::Numeric(_) => 0,
-            ColumnValue::Name(s) | ColumnValue::Text(s) | ColumnValue::Json(s) => s.len(),
-            ColumnValue::Bytea(b) => b.len(),
-            ColumnValue::PgPending { raw, .. } | ColumnValue::Unsupported { raw, .. } => raw.len(),
-            ColumnValue::PgPendingText { text, .. } => text.len(),
-            ColumnValue::ExternalToast(_) => 16,
-        }
-    }
-}
-
 /// On-disk TOAST pointer (PG `varatt.h` `struct varatt_external`), 16 bytes,
 /// unaligned in source tuple.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -346,7 +225,7 @@ impl DecodedHeap {
                 t.columns
                     .iter()
                     .flatten()
-                    .map(ColumnValue::approx_bytes)
+                    .map(Datum::approx_bytes)
                     .sum::<usize>()
             })
         };
@@ -416,15 +295,15 @@ pub struct CommittedTuple {
 pub struct DecodedTuple {
     /// Indexed by attnum-1. `None` = absent from WAL (PG UPDATE prefix/suffix
     /// compression skipped it, or this `relreplident` shape never carries it).
-    /// `Some(ColumnValue::Null)` is explicit NULL (bitmap bit clear).
-    pub columns: Vec<Option<ColumnValue>>,
+    /// `Some(Datum::Null)` is explicit NULL (bitmap bit clear).
+    pub columns: Vec<Option<Datum>>,
     /// True iff a column was elided by PG prefix/suffix compression; xact
     /// buffer backfills from previous tuple image.
     pub partial: bool,
 }
 
-/// Builds one tuple image from walked attributes: owned cells for
-/// [`DecodedTuple`], borrowed datums for [`TupleView`]
+/// Builds one tuple image from walked attributes: owned datums for
+/// [`DecodedTuple`], borrowed for [`TupleView`]
 pub trait TupleBuild<'a>: Sized {
     fn with_capacity(n: usize) -> Self;
     fn push(&mut self, att: &RelAttr, datum: DatumRef<'a>);
@@ -441,7 +320,7 @@ impl<'a> TupleBuild<'a> for DecodedTuple {
 
     #[inline(always)]
     fn push(&mut self, att: &RelAttr, datum: DatumRef<'a>) {
-        self.columns.push(datum_value(att, datum));
+        self.columns.push(resolve(att, datum));
     }
 
     fn set_partial(&mut self) {
@@ -476,14 +355,14 @@ impl<'a> TupleBuild<'a> for TupleView<'a> {
 
 #[cfg(test)]
 impl TupleView<'_> {
-    /// Owned cells, as [`decode_heap_record`] builds them
+    /// Owned datums, as [`decode_heap_record`] builds them
     pub fn to_tuple(&self, rel: &RelDescriptor) -> DecodedTuple {
         DecodedTuple {
             columns: self
                 .datums
                 .iter()
                 .zip(&rel.attributes)
-                .map(|(d, att)| datum_value(att, *d))
+                .map(|(d, att)| resolve(att, *d))
                 .collect(),
             partial: self.partial,
         }
@@ -889,55 +768,43 @@ pub fn scan_block_data(block_data: &[u8], rel: &RelDescriptor) -> Result<TupleSh
     decode_tuple_payload(block_data, 0, rel, 0)
 }
 
-/// `block.data` image of `values` as `heap_fill_tuple` lays them out, each
-/// stored per its variant's PostgreSQL type. Covers fixed-width, text,
-/// bytea, raw varlena and external pointer cells
+/// `block.data` image of `values` as `heap_fill_tuple` lays them out,
+/// aligned per `attrs`. Values past them align by width
 #[cfg(any(test, feature = "test-support"))]
-pub fn form_block_data(values: &[Option<ColumnValue>]) -> Vec<u8> {
+pub fn form_block_data(attrs: &[RelAttr], values: &[Option<Datum>]) -> Vec<u8> {
     let natts = values.len();
-    let has_null = values
-        .iter()
-        .any(|v| matches!(v, None | Some(ColumnValue::Null)));
+    let has_null = values.iter().any(|v| matches!(v, None | Some(Datum::Null)));
     let bitmap_len = if has_null { natts.div_ceil(8) } else { 0 };
     let hoff = (SIZE_OF_HEAP_TUPLE_HEADER + bitmap_len).next_multiple_of(8);
     let mut bitmap = vec![0u8; bitmap_len];
     let mut data = Vec::new();
-    let varlena = |body: &[u8]| {
-        if body.len() < 127 {
-            let mut v = vec![(((body.len() + 1) << 1) | 1) as u8];
-            v.extend_from_slice(body);
-            (v, 1)
-        } else {
-            let mut v = (((body.len() + 4) as u32) << 2).to_le_bytes().to_vec();
-            v.extend_from_slice(body);
-            (v, 4)
-        }
-    };
     for (i, v) in values.iter().enumerate() {
+        let align_of = |len: usize| {
+            attrs
+                .get(i)
+                .map_or(if len.is_power_of_two() { len.min(8) } else { 1 }, |a| {
+                    align_bytes(a.type_align)
+                })
+        };
         let (bytes, align) = match v {
-            None | Some(ColumnValue::Null) => continue,
-            Some(ColumnValue::Bool(b)) => (vec![u8::from(*b)], 1),
-            Some(ColumnValue::Char(c)) => (vec![*c as u8], 1),
-            Some(ColumnValue::Int2(n)) => (n.to_le_bytes().to_vec(), 2),
-            Some(ColumnValue::Int4(n) | ColumnValue::Date(n)) => (n.to_le_bytes().to_vec(), 4),
-            Some(ColumnValue::Oid(n)) => (n.to_le_bytes().to_vec(), 4),
-            Some(ColumnValue::Float4(f)) => (f.to_le_bytes().to_vec(), 4),
-            Some(
-                ColumnValue::Int8(n)
-                | ColumnValue::Time(n)
-                | ColumnValue::Timestamp(n)
-                | ColumnValue::TimestampTz(n),
-            ) => (n.to_le_bytes().to_vec(), 8),
-            Some(ColumnValue::Oid8(n)) => (n.to_le_bytes().to_vec(), 8),
-            Some(ColumnValue::Float8(f)) => (f.to_le_bytes().to_vec(), 8),
-            Some(ColumnValue::Uuid(u)) => (u.to_vec(), 1),
-            Some(ColumnValue::Text(t) | ColumnValue::Json(t)) => varlena(t.as_bytes()),
-            Some(
-                ColumnValue::Bytea(b)
-                | ColumnValue::PgPending { raw: b, .. }
-                | ColumnValue::Unsupported { raw: b, .. },
-            ) => varlena(b),
-            Some(ColumnValue::ExternalToast(p)) => {
+            None | Some(Datum::Null) => continue,
+            Some(Datum::Fixed(b)) => (b.to_vec(), align_of(b.len())),
+            Some(Datum::Varlena(b) | Datum::BadTag(b) | Datum::Text(b)) if b.len() < 127 => {
+                let mut v = vec![(((b.len() + 1) << 1) | 1) as u8];
+                v.extend_from_slice(b);
+                (v, 1)
+            }
+            Some(Datum::Varlena(b) | Datum::BadTag(b) | Datum::Text(b)) => {
+                let mut v = (((b.len() + 4) as u32) << 2).to_le_bytes().to_vec();
+                v.extend_from_slice(b);
+                (v, align_of(4).max(4))
+            }
+            Some(Datum::Cstring(b)) => {
+                let mut v = b.clone();
+                v.push(0);
+                (v, 1)
+            }
+            Some(Datum::External(p)) => {
                 let mut v = vec![0x01, 18];
                 for word in [
                     p.va_rawsize as u32,
@@ -949,7 +816,6 @@ pub fn form_block_data(values: &[Option<ColumnValue>]) -> Vec<u8> {
                 }
                 (v, 1)
             }
-            Some(other) => unimplemented!("form_block_data: {other:?}"),
         };
         if has_null {
             bitmap[i / 8] |= 1 << (i % 8);
@@ -1140,111 +1006,123 @@ fn walk_tuple<'a, T: TupleBuild<'a>>(
     Ok(())
 }
 
-/// Resolve a column's fast default ([`RelAttr::missing_default`]) to a value;
-/// `Null` when there is none. Tier-3 stays a pending value the oracle resolves.
-pub fn missing_value_for(att: &RelAttr) -> ColumnValue {
+/// Column's fast default ([`RelAttr::missing_default`]) as stored or as
+/// `typoutput` text; `Null` when there is none
+pub fn missing_datum(att: &RelAttr) -> DatumRef<'_> {
     match &att.missing_default {
-        Some(MissingDefault::Raw(arr)) => missing_value_from_array(att, arr),
-        Some(MissingDefault::Text(text)) => missing_value_from_text(att.type_oid, text),
-        None => ColumnValue::Null,
+        Some(MissingDefault::Raw(arr)) => missing_array_element(att, arr),
+        Some(MissingDefault::Text(text)) => DatumRef::Text(text.as_bytes()),
+        None => DatumRef::Null,
     }
 }
 
-/// Raw and text spell one default differently but resolve to one value, so
-/// compare by value; tier-3 stays pending, so equal source type counts as equal.
+/// Raw and text spell one default differently, so compare parsed datums.
+/// Text no local parser reads stays pending; equal source type counts as equal
 pub fn missing_defaults_equivalent(a: &RelAttr, b: &RelAttr) -> bool {
-    use ColumnValue::{PgPending, PgPendingText};
-    match (missing_value_for(a), missing_value_for(b)) {
-        (
-            PgPending { type_oid: x, .. } | PgPendingText { type_oid: x, .. },
-            PgPending { type_oid: y, .. } | PgPendingText { type_oid: y, .. },
-        ) => x == y,
-        (l, r) => l == r,
+    #[derive(PartialEq)]
+    enum Image {
+        Value(Option<Datum>),
+        Pending(u32),
     }
+    let image = |att: &RelAttr| match missing_datum(att) {
+        DatumRef::Text(text) => match text_datum(att.type_oid, text) {
+            TextDatum::Datum(d) => Image::Value(Some(d)),
+            TextDatum::Null => Image::Value(Some(Datum::Null)),
+            TextDatum::Opaque if is_text_type(att.type_oid) => {
+                Image::Value(Some(Datum::Varlena(text.to_vec())))
+            }
+            TextDatum::Opaque => Image::Pending(att.type_oid),
+        },
+        // Text-typed defaults compare as their text
+        d if local_matrix_covers(att.type_oid, att.type_len) => {
+            Image::Value(resolve(att, d).map(|d| {
+                match (d, att.type_oid) {
+                    (Datum::Fixed(b), NAMEOID) => {
+                        let end = b.iter().position(|&c| c == 0).unwrap_or(b.len());
+                        Datum::Varlena(b[..end].to_vec())
+                    }
+                    (Datum::Varlena(b), JSONBOID) => crate::decode::codecs::decode_jsonb(&b)
+                        .map_or(Datum::BadTag(b), |text| Datum::Varlena(text.into_bytes())),
+                    (d, _) => d,
+                }
+            }))
+        }
+        DatumRef::Null => Image::Value(Some(Datum::Null)),
+        _ => Image::Pending(att.type_oid),
+    };
+    image(a) == image(b)
 }
 
-fn missing_value_from_array(att: &RelAttr, arr: &[u8]) -> ColumnValue {
+/// `attmissingval[1]`, an `ArrayType` with one non-null element
+fn missing_array_element<'a>(att: &RelAttr, arr: &'a [u8]) -> DatumRef<'a> {
     // ArrayType: vl_len_(4) ndim(4) dataoffset(4) elemtype(4) dims[] lbounds[] [nulls] data
-    let decode = || -> Option<ColumnValue> {
-        if arr.len() < 16 {
-            return None;
-        }
-        let ndim = i32::from_le_bytes(arr[4..8].try_into().ok()?);
-        let dataoffset = i32::from_le_bytes(arr[8..12].try_into().ok()?);
+    let element = || -> Option<DatumRef<'a>> {
+        let ndim = i32::from_le_bytes(arr.get(4..8)?.try_into().ok()?);
+        let dataoffset = i32::from_le_bytes(arr.get(8..12)?.try_into().ok()?);
         if ndim != 1 {
             return None;
         }
         let abs = if dataoffset != 0 {
-            dataoffset as usize
+            usize::try_from(dataoffset).ok()?
         } else {
             // MAXALIGN(16 + 8*ndim), no null bitmap
             (16 + 8 * ndim as usize).next_multiple_of(8)
         };
-        decode_one_value(att, arr, abs).ok().map(|(v, _)| v)
+        read_datum(att, arr, abs).ok().map(|(d, _)| d)
     };
-    decode().unwrap_or(ColumnValue::Null)
+    element().unwrap_or(DatumRef::Null)
 }
 
-/// `attmissingval` element from its `anyarray_out` text form (SQL/mirror path).
-pub(crate) fn missing_value_from_text(type_oid: u32, text: &str) -> ColumnValue {
+fn is_text_type(type_oid: u32) -> bool {
+    matches!(
+        type_oid,
+        TEXTOID | VARCHAROID | BPCHAROID | NAMEOID | JSONOID | JSONBOID
+    )
+}
+
+/// `typoutput` text read back into a stored datum
+#[derive(Debug, PartialEq)]
+pub enum TextDatum {
+    Datum(Datum),
+    /// Text the type's parser rejects
+    Null,
+    /// No local parser; String targets take the text as is
+    Opaque,
+}
+
+/// Parse `typoutput` text of types with a local reader into stored form
+pub fn text_datum(type_oid: u32, text: &[u8]) -> TextDatum {
+    let Ok(text) = simdutf8::basic::from_utf8(text) else {
+        return TextDatum::Opaque;
+    };
+    fn fixed<B: AsRef<[u8]>>(b: Option<B>) -> TextDatum {
+        b.map_or(TextDatum::Null, |b| {
+            TextDatum::Datum(Datum::fixed(b.as_ref()))
+        })
+    }
     match type_oid {
-        BOOLOID => match text {
-            "t" | "true" | "yes" | "on" | "1" => ColumnValue::Bool(true),
-            _ => ColumnValue::Bool(false),
-        },
-        CHAROID => text
-            .as_bytes()
-            .first()
-            .map(|b| ColumnValue::Char(*b as i8))
-            .unwrap_or(ColumnValue::Null),
-        INT2OID => text
-            .parse::<i16>()
-            .map(ColumnValue::Int2)
-            .unwrap_or(ColumnValue::Null),
-        INT4OID => text
-            .parse::<i32>()
-            .map(ColumnValue::Int4)
-            .unwrap_or(ColumnValue::Null),
-        INT8OID => text
-            .parse::<i64>()
-            .map(ColumnValue::Int8)
-            .unwrap_or(ColumnValue::Null),
-        FLOAT4OID => text
-            .parse::<f32>()
-            .map(ColumnValue::Float4)
-            .unwrap_or(ColumnValue::Null),
-        FLOAT8OID => text
-            .parse::<f64>()
-            .map(ColumnValue::Float8)
-            .unwrap_or(ColumnValue::Null),
-        OIDOID | XIDOID | CIDOID => text
-            .parse::<u32>()
-            .map(ColumnValue::Oid)
-            .unwrap_or(ColumnValue::Null),
-        OID8OID | XID8OID => text
-            .parse::<u64>()
-            .map(ColumnValue::Oid8)
-            .unwrap_or(ColumnValue::Null),
-        PG_LSNOID => crate::pg::parse_pg_lsn(text)
-            .map(ColumnValue::Oid8)
-            .unwrap_or(ColumnValue::Null),
-        TEXTOID | VARCHAROID | BPCHAROID | NAMEOID => ColumnValue::Text(text.to_owned()),
-        MACADDROID => crate::decode::codecs::parse_macaddr(text)
-            .map(ColumnValue::MacAddr)
-            .unwrap_or(ColumnValue::Null),
-        MACADDR8OID => crate::decode::codecs::parse_macaddr(text)
-            .map(ColumnValue::MacAddr8)
-            .unwrap_or(ColumnValue::Null),
-        TIDOID => crate::decode::codecs::parse_tid(text)
-            .map(|(block, offset)| ColumnValue::Tid { block, offset })
-            .unwrap_or(ColumnValue::Null),
-        // `jsonb` arrives as `jsonb_out` text, already what the emitter ships
-        JSONOID | JSONBOID => ColumnValue::Json(text.to_owned()),
-        // attmissingval text requires typinput
-        _ => ColumnValue::PgPendingText {
-            type_oid,
-            text: text.to_owned(),
-        },
+        BOOLOID => fixed(Some([u8::from(matches!(
+            text,
+            "t" | "true" | "yes" | "on" | "1"
+        ))])),
+        CHAROID => fixed(text.as_bytes().first().map(|b| [*b])),
+        INT2OID => fixed(text.parse::<i16>().ok().map(i16::to_le_bytes)),
+        INT4OID => fixed(text.parse::<i32>().ok().map(i32::to_le_bytes)),
+        INT8OID => fixed(text.parse::<i64>().ok().map(i64::to_le_bytes)),
+        FLOAT4OID => fixed(text.parse::<f32>().ok().map(f32::to_le_bytes)),
+        FLOAT8OID => fixed(text.parse::<f64>().ok().map(f64::to_le_bytes)),
+        OIDOID | XIDOID | CIDOID => fixed(text.parse::<u32>().ok().map(u32::to_le_bytes)),
+        OID8OID | XID8OID => fixed(text.parse::<u64>().ok().map(u64::to_le_bytes)),
+        PG_LSNOID => fixed(crate::pg::parse_pg_lsn(text).ok().map(u64::to_le_bytes)),
+        MACADDROID => fixed(crate::decode::codecs::parse_macaddr::<6>(text)),
+        MACADDR8OID => fixed(crate::decode::codecs::parse_macaddr::<8>(text)),
+        TIDOID => fixed(
+            crate::decode::codecs::parse_tid(text)
+                .map(|(block, offset)| crate::decode::codecs::encode_tid(block, offset)),
+        ),
+        NUMERICOID => crate::decode::codecs::numeric_from_text(text)
+            .map_or(TextDatum::Null, |b| TextDatum::Datum(Datum::Varlena(b))),
+        _ => TextDatum::Opaque,
     }
 }
 
@@ -1260,6 +1138,16 @@ fn decoded_size_or_skip(att: &RelAttr) -> Option<usize> {
 
 /// MAXALIGN dispatch over `pg_type.typalign`, for in-prefix / past-EOF where
 /// we can't peek to detect a short varlena header (`att_align_pointer`).
+#[cfg(any(test, feature = "test-support"))]
+fn align_bytes(attalign: char) -> usize {
+    match attalign {
+        's' => 2,
+        'i' => 4,
+        'd' => 8,
+        _ => 1,
+    }
+}
+
 fn align_for(cur: usize, attalign: char) -> usize {
     match attalign {
         's' => align_up(cur, 2),
@@ -1349,134 +1237,40 @@ pub(crate) fn read_datum<'a>(
     ))
 }
 
-/// Returns `(value, bytes_consumed)`, see [`read_datum`]
-pub(crate) fn decode_one_value(
-    att: &RelAttr,
-    buf: &[u8],
-    abs: usize,
-) -> Result<(ColumnValue, usize), DecodeError> {
-    let (datum, len) = read_datum(att, buf, abs)?;
-    Ok((datum_value(att, datum).unwrap_or(ColumnValue::Null), len))
-}
-
-/// Owned cell for `datum`, `None` when absent from WAL image
-#[inline(always)]
-pub fn datum_value(att: &RelAttr, datum: DatumRef<'_>) -> Option<ColumnValue> {
+/// Owned copy of `datum`, `None` when absent from WAL image. Fast defaults
+/// resolve, stored where a local reader parses their text, and inline
+/// compressed bodies inflate
+pub fn resolve(att: &RelAttr, datum: DatumRef<'_>) -> Option<Datum> {
     Some(match datum {
         DatumRef::Absent => return None,
-        DatumRef::Null | DatumRef::Dropped => ColumnValue::Null,
-        DatumRef::Missing => missing_value_for(att),
-        DatumRef::Fixed(body) => fixed_value(att, body),
-        DatumRef::Varlena(body) => varlena_to_value(att.type_oid, Cow::Borrowed(body)),
-        DatumRef::Compressed(datum) => {
-            // Reader checked datum spans header and va_tcinfo
-            let tcinfo = u32::from_le_bytes(datum[4..8].try_into().unwrap());
-            let method = (tcinfo >> VARLENA_EXTSIZE_BITS) as u8;
-            let raw_len = (tcinfo & VARLENA_EXTSIZE_MASK) as usize;
-            decompress_varlena(method, &datum[8..], raw_len)
-                .map(|out| varlena_to_value(att.type_oid, Cow::Owned(out)))
-                .unwrap_or_else(|| ColumnValue::Unsupported {
-                    type_oid: att.type_oid,
-                    raw: datum.to_vec(),
-                })
-        }
-        DatumRef::External(p) => ColumnValue::ExternalToast(p),
-        DatumRef::Cstring(body) => simdutf8::basic::from_utf8(body)
-            .map(|s| ColumnValue::Text(s.to_owned()))
-            .unwrap_or_else(|_| ColumnValue::Bytea(body.to_vec())),
-        DatumRef::BadTag(raw) => ColumnValue::Unsupported {
-            type_oid: att.type_oid,
-            raw: raw.to_vec(),
+        DatumRef::Null | DatumRef::Dropped => Datum::Null,
+        DatumRef::Missing => match missing_datum(att) {
+            DatumRef::Text(t) => match text_datum(att.type_oid, t) {
+                TextDatum::Datum(d) => d,
+                TextDatum::Null => Datum::Null,
+                TextDatum::Opaque => Datum::Text(t.to_vec()),
+            },
+            d => return resolve(att, d),
         },
+        DatumRef::Fixed(b) => Datum::fixed(b),
+        DatumRef::Varlena(b) => Datum::Varlena(b.to_vec()),
+        DatumRef::Compressed(datum) => {
+            inflate(datum).map_or_else(|| Datum::BadTag(datum.to_vec()), Datum::Varlena)
+        }
+        DatumRef::External(p) => Datum::External(p),
+        DatumRef::Cstring(b) => Datum::Cstring(b.to_vec()),
+        DatumRef::BadTag(b) => Datum::BadTag(b.to_vec()),
+        DatumRef::Text(b) => Datum::Text(b.to_vec()),
     })
 }
 
-/// Datum whose value only [`datum_value`] builds: fast defaults, compressed
-/// bodies, `numeric` and `jsonb`
-#[derive(Debug)]
-pub struct AllocatingDecode;
-
-/// Borrowed value for `datum`, `Ok(None)` when absent from WAL image
-#[inline]
-pub fn datum_view<'a>(
-    att: &RelAttr,
-    datum: DatumRef<'a>,
-) -> Result<Option<ValueRef<'a>>, AllocatingDecode> {
-    Ok(Some(match datum {
-        DatumRef::Absent => return Ok(None),
-        DatumRef::Null | DatumRef::Dropped => ValueRef::Null,
-        DatumRef::Fixed(body) => fixed_view(att, body),
-        DatumRef::Varlena(body) => varlena_view(att.type_oid, body)?,
-        DatumRef::External(p) => ValueRef::ExternalToast(p),
-        DatumRef::Cstring(body) => match simdutf8::basic::from_utf8(body) {
-            Ok(s) => ValueRef::Text(s),
-            Err(_) => ValueRef::Bytea(body),
-        },
-        DatumRef::BadTag(raw) => ValueRef::Unsupported {
-            type_oid: att.type_oid,
-            raw,
-        },
-        DatumRef::Missing | DatumRef::Compressed(_) => return Err(AllocatingDecode),
-    }))
-}
-
-/// Fixed-width value from its on-disk bytes. Inlined so callers construct
-/// in place: returning a 40-byte enum through memory then reloading it wide
-/// stalls store forwarding, which dominated fixed-width decode
-#[inline(always)]
-fn fixed_value(att: &RelAttr, body: &[u8]) -> ColumnValue {
-    fixed_view(att, body).to_owned_value()
-}
-
-#[inline(always)]
-fn fixed_view<'a>(att: &RelAttr, body: &'a [u8]) -> ValueRef<'a> {
-    let unsupported = || ValueRef::Unsupported {
-        type_oid: att.type_oid,
-        raw: body,
-    };
-    match att.type_oid {
-        BOOLOID => ValueRef::Bool(body[0] != 0),
-        CHAROID => ValueRef::Char(body[0] as i8),
-        INT2OID => ValueRef::Int2(i16::from_le_bytes(body.try_into().unwrap())),
-        INT4OID => ValueRef::Int4(i32::from_le_bytes(body.try_into().unwrap())),
-        // `money` counts minor units, scale set by source `lc_monetary`
-        INT8OID | MONEYOID => ValueRef::Int8(i64::from_le_bytes(body.try_into().unwrap())),
-        FLOAT4OID => ValueRef::Float4(f32::from_le_bytes(body.try_into().unwrap())),
-        FLOAT8OID => ValueRef::Float8(f64::from_le_bytes(body.try_into().unwrap())),
-        OIDOID | XIDOID | CIDOID => ValueRef::Oid(u32::from_le_bytes(body.try_into().unwrap())),
-        OID8OID | XID8OID | PG_LSNOID => {
-            ValueRef::Oid8(u64::from_le_bytes(body.try_into().unwrap()))
-        }
-        // NUL-padded to NAMEDATALEN
-        NAMEOID => {
-            let end = body.iter().position(|&b| b == 0).unwrap_or(body.len());
-            match simdutf8::basic::from_utf8(&body[..end]) {
-                Ok(s) => ValueRef::Name(s),
-                Err(_) => unsupported(),
-            }
-        }
-        MACADDROID => ValueRef::MacAddr(body.try_into().unwrap()),
-        MACADDR8OID => ValueRef::MacAddr8(body.try_into().unwrap()),
-        TIDOID => {
-            let (block, offset) = crate::decode::codecs::decode_tid(body.try_into().unwrap());
-            ValueRef::Tid { block, offset }
-        }
-        DATEOID => ValueRef::Date(i32::from_le_bytes(body.try_into().unwrap())),
-        TIMEOID => ValueRef::Time(i64::from_le_bytes(body.try_into().unwrap())),
-        TIMESTAMPOID => ValueRef::Timestamp(i64::from_le_bytes(body.try_into().unwrap())),
-        TIMESTAMPTZOID => ValueRef::TimestampTz(i64::from_le_bytes(body.try_into().unwrap())),
-        TIMETZOID => {
-            // 12 bytes: 8-byte time + 4-byte tz offset
-            let micros = i64::from_le_bytes(body[..8].try_into().unwrap());
-            let tz_seconds = i32::from_le_bytes(body[8..12].try_into().unwrap());
-            ValueRef::TimeTz { micros, tz_seconds }
-        }
-        UUIDOID => ValueRef::Uuid(body.try_into().unwrap()),
-        INTERVALOID => crate::decode::codecs::decode_interval(body)
-            .map(ValueRef::Interval)
-            .unwrap_or_else(|_| unsupported()),
-        _ => unsupported(),
-    }
+/// Body of an inline compressed varlena, `None` on a corrupt stream
+pub(crate) fn inflate(datum: &[u8]) -> Option<Vec<u8>> {
+    // Reader checked datum spans header and va_tcinfo
+    let tcinfo = u32::from_le_bytes(datum.get(4..8)?.try_into().ok()?);
+    let method = (tcinfo >> VARLENA_EXTSIZE_BITS) as u8;
+    let raw_len = (tcinfo & VARLENA_EXTSIZE_MASK) as usize;
+    decompress_varlena(method, &datum[8..], raw_len)
 }
 
 /// PG `va_tcinfo`/`va_extinfo`: codec method in the top 2 bits, size in the low 30.
@@ -1606,84 +1400,6 @@ fn read_varlena(buf: &[u8], abs: usize) -> Result<(DatumRef<'_>, usize), DecodeE
     Ok((DatumRef::Varlena(&buf[abs + 4..abs + total]), total))
 }
 
-/// Map a varlena body (header stripped, decompressed) to a typed value by the
-/// column's type OID. Shared by the inline decoder (`Cow::Borrowed` into the
-/// WAL buffer) and the TOAST reassembler (`Cow::Owned`, so `detoasted_value`
-/// moves the reassembled buffer into the value instead of copying it). A
-/// detoasted value resolves identically to an inline one — Tier 3 types land
-/// as `PgPending`, resolved at emit by the oracle.
-pub(crate) fn varlena_to_value(type_oid: u32, body: Cow<[u8]>) -> ColumnValue {
-    match type_oid {
-        BYTEAOID => ColumnValue::Bytea(body.into_owned()),
-        TEXTOID | VARCHAROID | BPCHAROID | JSONOID => {
-            // Owned arm keeps detoasted buffer rather than copy it
-            let text = match body {
-                Cow::Borrowed(b) => simdutf8::basic::from_utf8(b)
-                    .map(str::to_owned)
-                    .map_err(|_| b.to_vec()),
-                Cow::Owned(v) => String::from_utf8(v).map_err(FromUtf8Error::into_bytes),
-            };
-            // PG validates UTF-8 on input; surface bytea not crash if ever invalid
-            match text {
-                Ok(s) if type_oid == JSONOID => ColumnValue::Json(s),
-                Ok(s) => ColumnValue::Text(s),
-                Err(b) => ColumnValue::Bytea(b),
-            }
-        }
-        NUMERICOID => match crate::decode::codecs::decode_numeric(&body) {
-            Ok(v) => ColumnValue::Numeric(v),
-            Err(_) => ColumnValue::Unsupported {
-                type_oid,
-                raw: body.into_owned(),
-            },
-        },
-        INETOID | CIDROID => match crate::decode::codecs::decode_inet(&body, type_oid == CIDROID) {
-            Ok(v) => ColumnValue::Inet(v),
-            Err(_) => ColumnValue::Unsupported {
-                type_oid,
-                raw: body.into_owned(),
-            },
-        },
-        JSONBOID => match crate::decode::codecs::decode_jsonb(&body) {
-            Ok(s) => ColumnValue::Json(s),
-            Err(_) => ColumnValue::Unsupported {
-                type_oid,
-                raw: body.into_owned(),
-            },
-        },
-        // Tier 3 deferred: range types, arrays (typcategory='A'),
-        // tsvector etc. Carries full on-disk body so the SQL bridge
-        // reconstructs the varlena Datum; walshadow extension resolves at emit
-        _ => ColumnValue::PgPending {
-            type_oid,
-            raw: body.into_owned(),
-        },
-    }
-}
-
-/// [`varlena_to_value`] borrowing an inline body
-fn varlena_view(type_oid: u32, body: &[u8]) -> Result<ValueRef<'_>, AllocatingDecode> {
-    Ok(match type_oid {
-        BYTEAOID => ValueRef::Bytea(body),
-        TEXTOID | VARCHAROID | BPCHAROID | JSONOID => match simdutf8::basic::from_utf8(body) {
-            Ok(s) if type_oid == JSONOID => ValueRef::Json(s),
-            Ok(s) => ValueRef::Text(s),
-            Err(_) => ValueRef::Bytea(body),
-        },
-        INETOID | CIDROID => crate::decode::codecs::decode_inet(body, type_oid == CIDROID)
-            .map(ValueRef::Inet)
-            .unwrap_or(ValueRef::Unsupported {
-                type_oid,
-                raw: body,
-            }),
-        NUMERICOID | JSONBOID => return Err(AllocatingDecode),
-        _ => ValueRef::PgPending {
-            type_oid,
-            raw: body,
-        },
-    })
-}
-
 /// Match decoder paths producing typed values
 pub(crate) fn local_matrix_covers(type_oid: u32, type_len: i16) -> bool {
     match type_len {
@@ -1807,6 +1523,7 @@ pub(crate) fn short_varlena(content: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::decode::datum::{Datum, build};
     use crate::schema::RelName;
     use walrus::pg::walparser::{
         BlockLocation, XLogRecordBlock, XLogRecordBlockHeader, XLogRecordHeader,
@@ -1860,21 +1577,13 @@ mod tests {
 
     #[test]
     fn approx_bytes_counts_scalars_and_varlena() {
-        assert_eq!(ColumnValue::Null.approx_bytes(), 0);
-        assert_eq!(ColumnValue::Int2(0).approx_bytes(), 2);
-        assert_eq!(ColumnValue::Int4(0).approx_bytes(), 4);
-        assert_eq!(ColumnValue::Int8(0).approx_bytes(), 8);
-        assert_eq!(ColumnValue::Uuid([0; 16]).approx_bytes(), 16);
-        assert_eq!(ColumnValue::Text("héllo".into()).approx_bytes(), 6);
-        assert_eq!(ColumnValue::Bytea(vec![0u8; 100]).approx_bytes(), 100);
-        assert_eq!(
-            ColumnValue::PgPending {
-                type_oid: 1,
-                raw: vec![0u8; 7],
-            }
-            .approx_bytes(),
-            7
-        );
+        assert_eq!(Datum::Null.approx_bytes(), 0);
+        assert_eq!(build::int2(0).approx_bytes(), 2);
+        assert_eq!(build::int4(0).approx_bytes(), 4);
+        assert_eq!(build::int8(0).approx_bytes(), 8);
+        assert_eq!(build::uuid([0; 16]).approx_bytes(), 16);
+        assert_eq!(build::text("héllo").approx_bytes(), 6);
+        assert_eq!(build::bytes(vec![0u8; 100]).approx_bytes(), 100);
 
         let heap = DecodedHeap {
             rfn: RelFileNode {
@@ -1886,14 +1595,11 @@ mod tests {
             source_lsn: 0,
             op: HeapOp::Update,
             new: Some(DecodedTuple {
-                columns: vec![
-                    Some(ColumnValue::Int4(1)),
-                    Some(ColumnValue::Bytea(vec![0u8; 10])),
-                ],
+                columns: vec![Some(build::int4(1)), Some(build::bytes(vec![0u8; 10]))],
                 partial: false,
             }),
             old: Some(DecodedTuple {
-                columns: vec![None, Some(ColumnValue::Text("abc".into()))],
+                columns: vec![None, Some(build::text("abc"))],
                 partial: false,
             }),
         };
@@ -1946,45 +1652,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn varlena_text_preserves_bytes_and_owned_buffers() {
-        let suffixes: &[&[u8]] = &[
-            b"",
-            "é😀".as_bytes(),
-            &[0xff],
-            &[0xc0, 0xaf],
-            &[0xed, 0xa0, 0x80],
-            &[0xf0, 0x9f, 0x98],
-        ];
-        for type_oid in [TEXTOID, VARCHAROID, BPCHAROID, JSONOID] {
-            for prefix in [0, 63, 64, 65, 127, 128, 129] {
-                for suffix in suffixes {
-                    let mut raw = vec![b'a'; prefix];
-                    raw.extend_from_slice(suffix);
-                    let expected = match String::from_utf8(raw.clone()) {
-                        Ok(s) if type_oid == JSONOID => ColumnValue::Json(s),
-                        Ok(s) => ColumnValue::Text(s),
-                        Err(_) => ColumnValue::Bytea(raw.clone()),
-                    };
-                    for body in [Cow::Borrowed(raw.as_slice()), Cow::Owned(raw.clone())] {
-                        let owned = matches!(body, Cow::Owned(_));
-                        let ptr = body.as_ptr();
-                        let value = varlena_to_value(type_oid, body);
-                        assert_eq!(value, expected);
-                        if owned {
-                            let result_ptr = match &value {
-                                ColumnValue::Text(s) | ColumnValue::Json(s) => s.as_ptr(),
-                                ColumnValue::Bytea(b) => b.as_ptr(),
-                                _ => unreachable!(),
-                            };
-                            assert_eq!(result_ptr, ptr);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
     /// Every decode here also checks borrowed views build equal cells
     fn decode_heap_record(
         record: &XLogRecord,
@@ -2010,41 +1677,40 @@ mod tests {
         owned
     }
 
-    fn decode_cstring(buf: &[u8], abs: usize) -> Result<(ColumnValue, usize), DecodeError> {
-        let (datum, n) = read_cstring(buf, abs)?;
-        let att = rel_attr(1, "c", 0, -2, 'c');
-        Ok((datum_value(&att, datum).unwrap(), n))
+    /// Owned datum at `abs` and its stored length
+    fn decode_one_value(
+        att: &RelAttr,
+        buf: &[u8],
+        abs: usize,
+    ) -> Result<(Datum, usize), DecodeError> {
+        let (datum, len) = read_datum(att, buf, abs)?;
+        Ok((resolve(att, datum).unwrap_or(Datum::Null), len))
+    }
+
+    fn missing_value_for(att: &RelAttr) -> Datum {
+        resolve(att, DatumRef::Missing).expect("fast default resolves")
     }
 
     #[test]
-    fn decode_cstring_text_bytea_and_truncated() {
-        let (v, n) = decode_cstring(b"hello\0", 0).unwrap();
-        assert_eq!(v, ColumnValue::Text("hello".into()));
+    fn decode_cstring_bytes_and_truncated() {
+        let att = rel_attr(1, "c", 0, -2, 'c');
+        let cstring = |s: &[u8]| Datum::Cstring(s.to_vec());
+        let (v, n) = decode_one_value(&att, b"hello\0", 0).unwrap();
+        assert_eq!(v, cstring(b"hello"));
         assert_eq!(n, 6);
-        let (v, n) = decode_cstring(&[0xFF, 0xFE, 0x00], 0).unwrap();
-        assert_eq!(v, ColumnValue::Bytea(vec![0xFF, 0xFE]));
+        let (v, n) = decode_one_value(&att, &[0xFF, 0xFE, 0x00], 0).unwrap();
+        assert_eq!(v, cstring(&[0xFF, 0xFE]));
         assert_eq!(n, 3);
         // non-zero offset within multi-string buffer
-        let (v, n) = decode_cstring(b"ab\0cd\0", 3).unwrap();
-        assert_eq!(v, ColumnValue::Text("cd".into()));
+        let (v, n) = decode_one_value(&att, b"ab\0cd\0", 3).unwrap();
+        assert_eq!(v, cstring(b"cd"));
         assert_eq!(n, 3);
         // no terminator before buffer end
-        let err = decode_cstring(b"hello", 0).unwrap_err();
+        let err = decode_one_value(&att, b"hello", 0).unwrap_err();
         assert_eq!(
             format!("{err:?}"),
             "Truncated { offset: 0, need: 1, have: 0 }"
         );
-    }
-
-    #[test]
-    fn decode_one_value_maps_char_to_signed_i8() {
-        let att = rel_attr(1, "c", CHAROID, 1, 'c');
-        let (v, n) = decode_one_value(&att, &[65u8], 0).unwrap();
-        assert_eq!(v, ColumnValue::Char(65));
-        assert_eq!(n, 1);
-        // 0xFF -> i8 -1
-        let (v, _) = decode_one_value(&att, &[0xFFu8], 0).unwrap();
-        assert_eq!(v, ColumnValue::Char(-1));
     }
 
     #[test]
@@ -2070,8 +1736,8 @@ mod tests {
         let new = out.new.unwrap();
         assert!(!new.partial);
         assert_eq!(new.columns.len(), 2);
-        assert_eq!(new.columns[0], Some(ColumnValue::Int4(12345)));
-        assert_eq!(new.columns[1], Some(ColumnValue::Int8(999_999)));
+        assert_eq!(new.columns[0], Some(build::int4(12345)));
+        assert_eq!(new.columns[1], Some(build::int8(999_999)));
     }
 
     #[test]
@@ -2097,8 +1763,8 @@ mod tests {
         let rec = record_with(RmId::Heap, XLOG_HEAP_INSERT, main_data, payload);
         let out = decode_heap_record(&rec, 0, &rel).unwrap().remove(0);
         let new = out.new.unwrap();
-        assert_eq!(new.columns[0], Some(ColumnValue::Bool(true)));
-        assert_eq!(new.columns[1], Some(ColumnValue::Text("hi".into())));
+        assert_eq!(new.columns[0], Some(build::bool_(true)));
+        assert_eq!(new.columns[1], Some(build::text("hi")));
     }
 
     #[test]
@@ -2116,7 +1782,7 @@ mod tests {
         let rec = record_with(RmId::Heap, XLOG_HEAP_INSERT, main_data, payload);
         let out = decode_heap_record(&rec, 0, &rel).unwrap().remove(0);
         let new = out.new.unwrap();
-        assert_eq!(new.columns[0], Some(ColumnValue::Text("hi".into())));
+        assert_eq!(new.columns[0], Some(build::text("hi")));
     }
 
     fn inline_compressed_varlena(method: u8, body: &[u8], raw_len: usize) -> Vec<u8> {
@@ -2138,7 +1804,7 @@ mod tests {
         let att = rel_attr(1, "val", TEXTOID, -1, 'i');
         let (v, consumed) = decode_one_value(&att, &buf, 0).unwrap();
         assert_eq!(consumed, buf.len());
-        assert_eq!(v, ColumnValue::Text(text));
+        assert_eq!(v, build::text(&text));
     }
 
     #[test]
@@ -2149,7 +1815,7 @@ mod tests {
         let att = rel_attr(1, "val", TEXTOID, -1, 'i');
         let (v, consumed) = decode_one_value(&att, &buf, 0).unwrap();
         assert_eq!(consumed, buf.len());
-        assert_eq!(v, ColumnValue::Text(text));
+        assert_eq!(v, build::text(&text));
     }
 
     #[test]
@@ -2158,13 +1824,7 @@ mod tests {
         let att = rel_attr(1, "val", TEXTOID, -1, 'i');
         let (v, consumed) = decode_one_value(&att, &buf, 0).unwrap();
         assert_eq!(consumed, buf.len());
-        assert!(matches!(
-            v,
-            ColumnValue::Unsupported {
-                type_oid: TEXTOID,
-                ..
-            }
-        ));
+        assert!(matches!(v, Datum::BadTag(_)));
     }
 
     #[test]
@@ -2209,9 +1869,9 @@ mod tests {
         let out = decode_heap_record(&rec, 0, &rel).unwrap().remove(0);
         let new = out.new.unwrap();
         assert_eq!(new.columns.len(), 3);
-        assert_eq!(new.columns[0], Some(ColumnValue::Int4(100)));
-        assert_eq!(new.columns[1], Some(ColumnValue::Null));
-        assert_eq!(new.columns[2], Some(ColumnValue::Int4(300)));
+        assert_eq!(new.columns[0], Some(build::int4(100)));
+        assert_eq!(new.columns[1], Some(Datum::Null));
+        assert_eq!(new.columns[2], Some(build::int4(300)));
     }
 
     #[test]
@@ -2229,7 +1889,7 @@ mod tests {
         let out = decode_heap_record(&rec, 0, &rel).unwrap().remove(0);
         assert_eq!(out.op, HeapOp::Delete);
         let old = out.old.unwrap();
-        assert_eq!(old.columns[0], Some(ColumnValue::Int4(7777)));
+        assert_eq!(old.columns[0], Some(build::int4(7777)));
     }
 
     #[test]
@@ -2258,7 +1918,7 @@ mod tests {
         let new = out.new.unwrap();
         assert!(new.partial, "prefix-compressed UPDATE flagged partial");
         assert_eq!(new.columns[0], None);
-        assert_eq!(new.columns[1], Some(ColumnValue::Int4(999)));
+        assert_eq!(new.columns[1], Some(build::int4(999)));
     }
 
     #[test]
@@ -2276,7 +1936,7 @@ mod tests {
         assert_eq!(out.op, HeapOp::HotUpdate);
         assert!(out.old.is_none());
         let new = out.new.unwrap();
-        assert_eq!(new.columns[0], Some(ColumnValue::Int4(55)));
+        assert_eq!(new.columns[0], Some(build::int4(55)));
     }
 
     #[test]
@@ -2292,8 +1952,8 @@ mod tests {
         let rec = record_with(RmId::Heap, XLOG_HEAP_INSERT, main_data, payload);
         let out = decode_heap_record(&rec, 0, &rel).unwrap().remove(0);
         let new = out.new.unwrap();
-        assert_eq!(new.columns[0], Some(ColumnValue::Null));
-        assert_eq!(new.columns[1], Some(ColumnValue::Int4(8888)));
+        assert_eq!(new.columns[0], Some(Datum::Null));
+        assert_eq!(new.columns[1], Some(build::int4(8888)));
     }
 
     #[test]
@@ -2327,7 +1987,7 @@ mod tests {
         let rec = record_with(RmId::Heap, XLOG_HEAP_INSERT, main_data, payload);
         let out = decode_heap_record(&rec, 0, &rel).unwrap().remove(0);
         let new = out.new.unwrap();
-        assert_eq!(new.columns[0], Some(ColumnValue::Uuid(uuid_bytes)));
+        assert_eq!(new.columns[0], Some(build::uuid(uuid_bytes)));
     }
 
     #[test]
@@ -2348,7 +2008,7 @@ mod tests {
         let new = out.new.unwrap();
         assert_eq!(
             new.columns[0],
-            Some(ColumnValue::ExternalToast(ToastPointer {
+            Some(Datum::External(ToastPointer {
                 va_rawsize: 12345,
                 va_extinfo: 678,
                 va_valueid: 12,
@@ -2359,8 +2019,8 @@ mod tests {
 
     #[test]
     fn decode_unsupported_type_emits_pending() {
-        // tsvector is outside the local matrix; varlena fall-through yields
-        // PgPending preserving raw bytes (shadow extension resolves at emit)
+        // tsvector is outside the local matrix; its stored body survives for
+        // the shadow extension to convert at emit
         let rel = descriptor(16397, vec![rel_attr(1, "t", TSVECTOROID, -1, 'i')]);
         let body = b"\x01opaque";
         let total = 4 + body.len();
@@ -2373,13 +2033,7 @@ mod tests {
         let rec = record_with(RmId::Heap, XLOG_HEAP_INSERT, main_data, payload);
         let out = decode_heap_record(&rec, 0, &rel).unwrap().remove(0);
         let new = out.new.unwrap();
-        assert_eq!(
-            new.columns[0],
-            Some(ColumnValue::PgPending {
-                type_oid: TSVECTOROID,
-                raw: body.to_vec(),
-            })
-        );
+        assert_eq!(new.columns[0], Some(build::bytes(body)));
     }
 
     #[test]
@@ -2405,9 +2059,9 @@ mod tests {
         let out = decode_heap_record(&rec, 0, &rel).unwrap().remove(0);
         let new = out.new.unwrap();
         assert_eq!(new.columns.len(), 3);
-        assert_eq!(new.columns[0], Some(ColumnValue::Int4(100)));
-        assert_eq!(new.columns[1], Some(ColumnValue::Int4(200)));
-        assert_eq!(new.columns[2], Some(ColumnValue::Int4(7)));
+        assert_eq!(new.columns[0], Some(build::int4(100)));
+        assert_eq!(new.columns[1], Some(build::int4(200)));
+        assert_eq!(new.columns[2], Some(build::int4(7)));
     }
 
     #[test]
@@ -2429,7 +2083,7 @@ mod tests {
         let rec = record_with(RmId::Heap, XLOG_HEAP_INSERT, main_data, payload);
         let out = decode_heap_record(&rec, 0, &rel).unwrap().remove(0);
         let new = out.new.unwrap();
-        assert_eq!(new.columns[2], Some(ColumnValue::Null));
+        assert_eq!(new.columns[2], Some(Datum::Null));
     }
 
     #[test]
@@ -2450,8 +2104,8 @@ mod tests {
         let rec = record_with(RmId::Heap, XLOG_HEAP_INSERT, main_data, payload);
         let out = decode_heap_record(&rec, 0, &rel).unwrap().remove(0);
         let new = out.new.unwrap();
-        assert_eq!(new.columns[0], Some(ColumnValue::Int4(55)));
-        assert_eq!(new.columns[1], Some(ColumnValue::Null));
+        assert_eq!(new.columns[0], Some(build::int4(55)));
+        assert_eq!(new.columns[1], Some(Datum::Null));
     }
 
     #[test]
@@ -2518,7 +2172,7 @@ mod tests {
             assert_eq!(out[i].source_lsn, 0x2000);
             let new = out[i].new.as_ref().unwrap();
             assert_eq!(new.columns.len(), 1);
-            assert_eq!(new.columns[0], Some(ColumnValue::Int4(*expected)));
+            assert_eq!(new.columns[0], Some(build::int4(*expected)));
         }
     }
 
@@ -2567,14 +2221,11 @@ mod tests {
         let cols: Vec<_> = out.iter().map(|h| h.new.clone().unwrap()).collect();
         assert_eq!(
             cols[0].columns,
-            vec![
-                Some(ColumnValue::Int4(7)),
-                Some(ColumnValue::Text("ab".into()))
-            ]
+            vec![Some(build::int4(7)), Some(build::text("ab"))]
         );
         assert_eq!(
             cols[1].columns,
-            vec![Some(ColumnValue::Int4(8)), Some(ColumnValue::Null)]
+            vec![Some(build::int4(8)), Some(Datum::Null)]
         );
         assert!(!cols[0].partial && !cols[1].partial);
     }
@@ -2607,14 +2258,11 @@ mod tests {
         let out = decode_heap_record(&rec, 0, &rel).unwrap();
         let first = out[0].new.as_ref().unwrap();
         assert!(first.partial);
-        assert_eq!(first.columns, vec![Some(ColumnValue::Int4(7)), None]);
+        assert_eq!(first.columns, vec![Some(build::int4(7)), None]);
         let second = out[1].new.as_ref().unwrap();
         assert_eq!(
             second.columns,
-            vec![
-                Some(ColumnValue::Int4(8)),
-                Some(ColumnValue::Text("z".into()))
-            ]
+            vec![Some(build::int4(8)), Some(build::text("z"))]
         );
     }
 
@@ -2669,24 +2317,19 @@ mod tests {
 
     #[test]
     fn fixed_system_types_decode_values() {
-        let cases: [(u32, Vec<u8>, char, ColumnValue); 7] = [
-            (
-                XIDOID,
-                7u32.to_le_bytes().to_vec(),
-                'i',
-                ColumnValue::Oid(7),
-            ),
+        let cases: [(u32, Vec<u8>, char, Datum); 7] = [
+            (XIDOID, 7u32.to_le_bytes().to_vec(), 'i', build::oid(7)),
             (
                 PG_LSNOID,
                 0x16_B374_D848u64.to_le_bytes().to_vec(),
                 'd',
-                ColumnValue::Oid8(0x16_B374_D848),
+                build::oid8(0x16_B374_D848),
             ),
             (
                 MONEYOID,
                 (-123_456i64).to_le_bytes().to_vec(),
                 'd',
-                ColumnValue::Int8(-123_456),
+                build::int8(-123_456),
             ),
             (
                 NAMEOID,
@@ -2696,28 +2339,25 @@ mod tests {
                     b
                 },
                 'c',
-                ColumnValue::Name("pg_class".into()),
+                build::name("pg_class"),
             ),
             (
                 MACADDROID,
                 vec![0x08, 0x00, 0x2b, 0x01, 0x02, 0xab],
                 'i',
-                ColumnValue::MacAddr([0x08, 0x00, 0x2b, 0x01, 0x02, 0xab]),
+                Datum::fixed(&[0x08, 0x00, 0x2b, 0x01, 0x02, 0xab]),
             ),
             (
                 MACADDR8OID,
                 vec![0x08, 0x00, 0x2b, 0xff, 0xfe, 0x01, 0x02, 0x03],
                 'i',
-                ColumnValue::MacAddr8([0x08, 0x00, 0x2b, 0xff, 0xfe, 0x01, 0x02, 0x03]),
+                Datum::fixed(&[0x08, 0x00, 0x2b, 0xff, 0xfe, 0x01, 0x02, 0x03]),
             ),
             (
                 TIDOID,
                 vec![0, 0, 5, 0, 3, 0],
                 's',
-                ColumnValue::Tid {
-                    block: 5,
-                    offset: 3,
-                },
+                Datum::fixed(&crate::decode::codecs::encode_tid(5, 3)),
             ),
         ];
         for (oid, body, align, want) in cases {
@@ -2731,15 +2371,15 @@ mod tests {
     fn missing_value_text_parses_system_types() {
         let mut lsn = rel_attr(1, "l", PG_LSNOID, 8, 'd');
         lsn.missing_default = Some("16/B374D848".into());
-        assert_eq!(missing_value_for(&lsn), ColumnValue::Oid8(0x16_B374_D848));
+        assert_eq!(missing_value_for(&lsn), build::oid8(0x16_B374_D848));
         let mut x8 = rel_attr(1, "x", XID8OID, 8, 'd');
         x8.missing_default = Some("18446744073709551615".into());
-        assert_eq!(missing_value_for(&x8), ColumnValue::Oid8(u64::MAX));
+        assert_eq!(missing_value_for(&x8), build::oid8(u64::MAX));
         let mut mac = rel_attr(1, "m", MACADDROID, 6, 'i');
         mac.missing_default = Some("08:00:2b:01:02:03".into());
         assert_eq!(
             missing_value_for(&mac),
-            ColumnValue::MacAddr([0x08, 0x00, 0x2b, 0x01, 0x02, 0x03])
+            Datum::fixed(&[0x08, 0x00, 0x2b, 0x01, 0x02, 0x03])
         );
     }
 
@@ -2747,34 +2387,33 @@ mod tests {
     fn missing_value_for_type_matrix() {
         let mut bool_att = rel_attr(1, "b", BOOLOID, 1, 'c');
         bool_att.missing_default = Some("t".into());
-        assert_eq!(missing_value_for(&bool_att), ColumnValue::Bool(true));
+        assert_eq!(missing_value_for(&bool_att), build::bool_(true));
         bool_att.missing_default = Some("false".into());
-        assert_eq!(missing_value_for(&bool_att), ColumnValue::Bool(false));
+        assert_eq!(missing_value_for(&bool_att), build::bool_(false));
 
         let mut i4 = rel_attr(1, "x", INT4OID, 4, 'i');
         i4.missing_default = Some("42".into());
-        assert_eq!(missing_value_for(&i4), ColumnValue::Int4(42));
+        assert_eq!(missing_value_for(&i4), build::int4(42));
 
         let mut i8 = rel_attr(1, "x", INT8OID, 8, 'd');
         i8.missing_default = Some("-9223372036854775808".into());
-        assert_eq!(missing_value_for(&i8), ColumnValue::Int8(i64::MIN));
+        assert_eq!(missing_value_for(&i8), build::int8(i64::MIN));
 
         let mut txt = rel_attr(1, "n", TEXTOID, -1, 'i');
         txt.missing_default = Some("hello".into());
-        assert_eq!(missing_value_for(&txt), ColumnValue::Text("hello".into()));
+        assert_eq!(missing_value_for(&txt), build::out_text("hello"));
 
         let mut num = rel_attr(1, "n", NUMERICOID, -1, 'i');
         num.missing_default = Some("3.14".into());
-        assert_eq!(
-            missing_value_for(&num),
-            ColumnValue::PgPendingText {
-                type_oid: NUMERICOID,
-                text: "3.14".into(),
-            }
-        );
+        assert_eq!(missing_value_for(&num), build::numeric("3.14"));
+        num.missing_default = Some("pi".into());
+        assert_eq!(missing_value_for(&num), Datum::Null);
+        let mut ts = rel_attr(1, "t", TSVECTOROID, -1, 'i');
+        ts.missing_default = Some("'a'".into());
+        assert_eq!(missing_value_for(&ts), build::out_text("'a'"));
 
         let none = rel_attr(1, "x", INT4OID, 4, 'i');
-        assert_eq!(missing_value_for(&none), ColumnValue::Null);
+        assert_eq!(missing_value_for(&none), Datum::Null);
     }
 
     #[test]
@@ -2784,7 +2423,7 @@ mod tests {
             INT4OID,
             &7i32.to_le_bytes(),
         )));
-        assert_eq!(missing_value_for(&a), ColumnValue::Int4(7));
+        assert_eq!(missing_value_for(&a), build::int4(7));
     }
 
     #[test]
@@ -2794,7 +2433,7 @@ mod tests {
             TEXTOID,
             &short_varlena(b"hi"),
         )));
-        assert_eq!(missing_value_for(&a), ColumnValue::Text("hi".into()));
+        assert_eq!(missing_value_for(&a), build::text("hi"));
     }
 
     #[test]
@@ -2807,31 +2446,28 @@ mod tests {
             &short_varlena(&body),
         )));
         // Tier-3 fast default stays pending
-        assert_eq!(
-            missing_value_for(&a),
-            ColumnValue::PgPending {
-                type_oid: TSVECTOROID,
-                raw: body.to_vec(),
-            }
-        );
+        assert_eq!(missing_value_for(&a), build::bytes(body));
     }
 
     #[test]
-    fn fast_default_raw_jsonb_renders_its_document() {
+    fn fast_default_raw_jsonb_stays_stored() {
         // `{}`: bare container header, JB_FOBJECT with no pairs
         let mut a = rel_attr(1, "j", JSONBOID, -1, 'i');
         a.missing_default = Some(MissingDefault::Raw(raw_missing_array(
             JSONBOID,
             &short_varlena(&0x2000_0000u32.to_le_bytes()),
         )));
-        assert_eq!(missing_value_for(&a), ColumnValue::Json("{}".into()));
+        assert_eq!(
+            missing_value_for(&a),
+            build::bytes(0x2000_0000u32.to_le_bytes())
+        );
     }
 
     #[test]
     fn fast_default_malformed_raw_is_null_not_panic() {
         let mut a = rel_attr(1, "x", INT4OID, 4, 'i');
         a.missing_default = Some(MissingDefault::Raw(vec![0, 1, 2]));
-        assert_eq!(missing_value_for(&a), ColumnValue::Null);
+        assert_eq!(missing_value_for(&a), Datum::Null);
     }
 
     #[test]
@@ -2877,7 +2513,8 @@ mod tests {
     }
 
     #[test]
-    fn local_matrix_agrees_with_decoder() {
+    fn local_matrix_agrees_with_codecs() {
+        use crate::emit::ch_emitter::Codec;
         let fixed: [(u32, i16); 26] = [
             (BOOLOID, 1),
             (CHAROID, 1),
@@ -2908,20 +2545,14 @@ mod tests {
         ];
         for (oid, len) in fixed {
             let att = rel_attr(1, "c", oid, len, 'i');
-            let buf = vec![0u8; len as usize];
-            let (v, _) = decode_one_value(&att, &buf, 0).expect("decodes");
-            let raw = matches!(
-                v,
-                ColumnValue::PgPending { .. } | ColumnValue::Unsupported { .. }
-            );
             assert_eq!(
-                !raw,
+                Codec::choose(&att) != Codec::Pending,
                 local_matrix_covers(oid, len),
                 "oid {oid} typlen {len}"
             );
         }
 
-        let bodies: [(u32, Vec<u8>); 9] = [
+        let varlena: [(u32, Vec<u8>); 9] = [
             (BYTEAOID, vec![1, 2]),
             (TEXTOID, b"x".to_vec()),
             (VARCHAROID, b"x".to_vec()),
@@ -2942,13 +2573,13 @@ mod tests {
             (JSONOID, b"{}".to_vec()),
             (3802, vec![0, 0, 0, 0]),
         ];
-        for (oid, body) in bodies {
-            let v = varlena_to_value(oid, Cow::Owned(body));
-            let raw = matches!(
-                v,
-                ColumnValue::PgPending { .. } | ColumnValue::Unsupported { .. }
+        for (oid, _) in varlena {
+            let att = rel_attr(1, "c", oid, -1, 'i');
+            assert_eq!(
+                Codec::choose(&att) != Codec::Pending,
+                local_matrix_covers(oid, -1),
+                "varlena oid {oid}"
             );
-            assert_eq!(!raw, local_matrix_covers(oid, -1), "varlena oid {oid}");
         }
     }
 

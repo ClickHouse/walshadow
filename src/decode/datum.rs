@@ -1,8 +1,8 @@
-//! Borrowed tuple attributes and values, so encoders read source bytes in
-//! place instead of building owned cells per row
+//! Tuple attributes as PostgreSQL stores or sends them. Encoders read source
+//! bytes in place; owned copies hold only bytes that outlive their record
 
-use crate::decode::codecs::{InetValue, IntervalValue, NumericKind};
-use crate::decode::heap_decoder::{ColumnValue, ToastPointer};
+use crate::decode::heap_decoder::ToastPointer;
+use smallvec::SmallVec;
 
 /// One attribute as stored in a tuple image, storage framing stripped
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -25,137 +25,141 @@ pub enum DatumRef<'a> {
     Cstring(&'a [u8]),
     /// Varlena tag PostgreSQL never writes to disk; rest of buffer
     BadTag(&'a [u8]),
+    /// `typoutput` text: fast defaults read over SQL, COPY fields cast to text
+    Text(&'a [u8]),
 }
 
-/// Borrowed counterpart of [`ColumnValue`], one variant per variant
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum ValueRef<'a> {
+/// Owned [`DatumRef`] for values outliving their record: TOAST values,
+/// synthetic columns, COPY and test cells
+#[derive(Clone, Debug, PartialEq)]
+pub enum Datum {
     Null,
-    Bool(bool),
-    Char(i8),
-    Int2(i16),
-    Int4(i32),
-    Int8(i64),
-    Float4(f32),
-    Float8(f64),
-    Oid(u32),
-    Oid8(u64),
-    MacAddr([u8; 6]),
-    MacAddr8([u8; 8]),
-    Tid { block: u32, offset: u16 },
-    Date(i32),
-    Time(i64),
-    Timestamp(i64),
-    TimestampTz(i64),
-    TimeTz { micros: i64, tz_seconds: i32 },
-    Uuid([u8; 16]),
-    Name(&'a str),
-    Bytea(&'a [u8]),
-    Text(&'a str),
-    Numeric(&'a NumericKind),
-    Inet(InetValue),
-    Interval(IntervalValue),
-    Json(&'a str),
-    PgPending { type_oid: u32, raw: &'a [u8] },
-    PgPendingText { type_oid: u32, text: &'a str },
-    ExternalToast(ToastPointer),
-    Unsupported { type_oid: u32, raw: &'a [u8] },
+    Fixed(SmallVec<[u8; 16]>),
+    Varlena(Vec<u8>),
+    External(ToastPointer),
+    Cstring(Vec<u8>),
+    BadTag(Vec<u8>),
+    Text(Vec<u8>),
 }
 
-impl ColumnValue {
-    pub fn view(&self) -> ValueRef<'_> {
+impl Datum {
+    pub fn view(&self) -> DatumRef<'_> {
         match self {
-            Self::Null => ValueRef::Null,
-            Self::Bool(v) => ValueRef::Bool(*v),
-            Self::Char(v) => ValueRef::Char(*v),
-            Self::Int2(v) => ValueRef::Int2(*v),
-            Self::Int4(v) => ValueRef::Int4(*v),
-            Self::Int8(v) => ValueRef::Int8(*v),
-            Self::Float4(v) => ValueRef::Float4(*v),
-            Self::Float8(v) => ValueRef::Float8(*v),
-            Self::Oid(v) => ValueRef::Oid(*v),
-            Self::Oid8(v) => ValueRef::Oid8(*v),
-            Self::MacAddr(v) => ValueRef::MacAddr(*v),
-            Self::MacAddr8(v) => ValueRef::MacAddr8(*v),
-            Self::Tid { block, offset } => ValueRef::Tid {
-                block: *block,
-                offset: *offset,
-            },
-            Self::Date(v) => ValueRef::Date(*v),
-            Self::Time(v) => ValueRef::Time(*v),
-            Self::Timestamp(v) => ValueRef::Timestamp(*v),
-            Self::TimestampTz(v) => ValueRef::TimestampTz(*v),
-            Self::TimeTz { micros, tz_seconds } => ValueRef::TimeTz {
-                micros: *micros,
-                tz_seconds: *tz_seconds,
-            },
-            Self::Uuid(v) => ValueRef::Uuid(*v),
-            Self::Name(s) => ValueRef::Name(s),
-            Self::Bytea(b) => ValueRef::Bytea(b),
-            Self::Text(s) => ValueRef::Text(s),
-            Self::Numeric(n) => ValueRef::Numeric(n),
-            Self::Inet(v) => ValueRef::Inet(*v),
-            Self::Interval(v) => ValueRef::Interval(*v),
-            Self::Json(s) => ValueRef::Json(s),
-            Self::PgPending { type_oid, raw } => ValueRef::PgPending {
-                type_oid: *type_oid,
-                raw,
-            },
-            Self::PgPendingText { type_oid, text } => ValueRef::PgPendingText {
-                type_oid: *type_oid,
-                text,
-            },
-            Self::ExternalToast(p) => ValueRef::ExternalToast(*p),
-            Self::Unsupported { type_oid, raw } => ValueRef::Unsupported {
-                type_oid: *type_oid,
-                raw,
-            },
+            Self::Null => DatumRef::Null,
+            Self::Fixed(b) => DatumRef::Fixed(b),
+            Self::Varlena(b) => DatumRef::Varlena(b),
+            Self::External(p) => DatumRef::External(*p),
+            Self::Cstring(b) => DatumRef::Cstring(b),
+            Self::BadTag(b) => DatumRef::BadTag(b),
+            Self::Text(b) => DatumRef::Text(b),
         }
+    }
+
+    /// Payload bytes held, for resident accounting
+    pub fn approx_bytes(&self) -> usize {
+        match self {
+            Self::Null => 0,
+            Self::Fixed(b) => b.len(),
+            Self::External(_) => std::mem::size_of::<ToastPointer>(),
+            Self::Varlena(b) | Self::Cstring(b) | Self::BadTag(b) | Self::Text(b) => b.len(),
+        }
+    }
+
+    pub fn fixed(le: &[u8]) -> Self {
+        Self::Fixed(SmallVec::from_slice(le))
     }
 }
 
-impl ValueRef<'_> {
-    pub fn to_owned_value(self) -> ColumnValue {
-        match self {
-            Self::Null => ColumnValue::Null,
-            Self::Bool(v) => ColumnValue::Bool(v),
-            Self::Char(v) => ColumnValue::Char(v),
-            Self::Int2(v) => ColumnValue::Int2(v),
-            Self::Int4(v) => ColumnValue::Int4(v),
-            Self::Int8(v) => ColumnValue::Int8(v),
-            Self::Float4(v) => ColumnValue::Float4(v),
-            Self::Float8(v) => ColumnValue::Float8(v),
-            Self::Oid(v) => ColumnValue::Oid(v),
-            Self::Oid8(v) => ColumnValue::Oid8(v),
-            Self::MacAddr(v) => ColumnValue::MacAddr(v),
-            Self::MacAddr8(v) => ColumnValue::MacAddr8(v),
-            Self::Tid { block, offset } => ColumnValue::Tid { block, offset },
-            Self::Date(v) => ColumnValue::Date(v),
-            Self::Time(v) => ColumnValue::Time(v),
-            Self::Timestamp(v) => ColumnValue::Timestamp(v),
-            Self::TimestampTz(v) => ColumnValue::TimestampTz(v),
-            Self::TimeTz { micros, tz_seconds } => ColumnValue::TimeTz { micros, tz_seconds },
-            Self::Uuid(v) => ColumnValue::Uuid(v),
-            Self::Name(s) => ColumnValue::Name(s.to_owned()),
-            Self::Bytea(b) => ColumnValue::Bytea(b.to_vec()),
-            Self::Text(s) => ColumnValue::Text(s.to_owned()),
-            Self::Numeric(n) => ColumnValue::Numeric(n.clone()),
-            Self::Inet(v) => ColumnValue::Inet(v),
-            Self::Interval(v) => ColumnValue::Interval(v),
-            Self::Json(s) => ColumnValue::Json(s.to_owned()),
-            Self::PgPending { type_oid, raw } => ColumnValue::PgPending {
-                type_oid,
-                raw: raw.to_vec(),
-            },
-            Self::PgPendingText { type_oid, text } => ColumnValue::PgPendingText {
-                type_oid,
-                text: text.to_owned(),
-            },
-            Self::ExternalToast(p) => ColumnValue::ExternalToast(p),
-            Self::Unsupported { type_oid, raw } => ColumnValue::Unsupported {
-                type_oid,
-                raw: raw.to_vec(),
-            },
-        }
+/// Cells in their on-disk form, for tests to state tuples
+#[cfg(any(test, feature = "test-support"))]
+pub mod build {
+    use super::Datum;
+    use crate::decode::heap_decoder::ToastPointer;
+
+    pub fn null() -> Datum {
+        Datum::Null
+    }
+
+    pub fn bool_(v: bool) -> Datum {
+        Datum::fixed(&[u8::from(v)])
+    }
+
+    pub fn char_(v: i8) -> Datum {
+        Datum::fixed(&v.to_le_bytes())
+    }
+
+    pub fn int2(v: i16) -> Datum {
+        Datum::fixed(&v.to_le_bytes())
+    }
+
+    pub fn int4(v: i32) -> Datum {
+        Datum::fixed(&v.to_le_bytes())
+    }
+
+    pub fn int8(v: i64) -> Datum {
+        Datum::fixed(&v.to_le_bytes())
+    }
+
+    pub fn float4(v: f32) -> Datum {
+        Datum::fixed(&v.to_le_bytes())
+    }
+
+    pub fn float8(v: f64) -> Datum {
+        Datum::fixed(&v.to_le_bytes())
+    }
+
+    pub fn oid(v: u32) -> Datum {
+        Datum::fixed(&v.to_le_bytes())
+    }
+
+    pub fn oid8(v: u64) -> Datum {
+        Datum::fixed(&v.to_le_bytes())
+    }
+
+    /// Days since 2000-01-01
+    pub fn date(v: i32) -> Datum {
+        Datum::fixed(&v.to_le_bytes())
+    }
+
+    /// `time` or `timestamp[tz]` microseconds
+    pub fn micros(v: i64) -> Datum {
+        Datum::fixed(&v.to_le_bytes())
+    }
+
+    pub fn timetz(micros: i64, tz_seconds: i32) -> Datum {
+        let mut b = micros.to_le_bytes().to_vec();
+        b.extend_from_slice(&tz_seconds.to_le_bytes());
+        Datum::fixed(&b)
+    }
+
+    pub fn uuid(v: [u8; 16]) -> Datum {
+        Datum::fixed(&v)
+    }
+
+    pub fn name(v: impl AsRef<str>) -> Datum {
+        let mut b = v.as_ref().as_bytes().to_vec();
+        b.resize(64, 0);
+        Datum::fixed(&b)
+    }
+
+    pub fn text(v: impl AsRef<str>) -> Datum {
+        Datum::Varlena(v.as_ref().as_bytes().to_vec())
+    }
+
+    pub fn bytes(v: impl AsRef<[u8]>) -> Datum {
+        Datum::Varlena(v.as_ref().to_vec())
+    }
+
+    pub fn numeric(v: impl AsRef<str>) -> Datum {
+        Datum::Varlena(crate::decode::codecs::numeric_from_text(v.as_ref()).expect("numeric text"))
+    }
+
+    pub fn external(p: ToastPointer) -> Datum {
+        Datum::External(p)
+    }
+
+    /// `typoutput` text
+    pub fn out_text(v: impl AsRef<str>) -> Datum {
+        Datum::Text(v.as_ref().as_bytes().to_vec())
     }
 }

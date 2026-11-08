@@ -221,7 +221,9 @@ impl From<crate::decode::heap_decoder::DescribedHeap> for DescribedInput {
     fn from(h: crate::decode::heap_decoder::DescribedHeap) -> Self {
         use crate::decode::heap_decoder::*;
         let d = &h.decoded;
-        let image = |t: &Option<DecodedTuple>| t.as_ref().map(|t| form_block_data(&t.columns));
+        let attrs = &h.descriptor.attributes;
+        let image =
+            |t: &Option<DecodedTuple>| t.as_ref().map(|t| form_block_data(attrs, &t.columns));
         let (old, new) = (image(&d.old), image(&d.new));
         let (info, mut main, flag_at, old_flag) = match d.op {
             HeapOp::Insert => (XLOG_HEAP_INSERT, vec![0; SIZE_OF_HEAP_INSERT], None, 0),
@@ -1309,6 +1311,7 @@ fn decode_raw(c: &mut Cursor) -> Result<RawRecord> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::decode::datum::build;
     use tempfile::tempdir;
 
     fn sample_descriptor(rel_node: u32) -> Arc<RelDescriptor> {
@@ -1355,7 +1358,7 @@ mod tests {
                 source_lsn: lsn,
                 op: HeapOp::Insert,
                 new: Some(DecodedTuple {
-                    columns: vec![Some(ColumnValue::Bytea(vec![7; body]))],
+                    columns: vec![Some(build::bytes(vec![7; body]))],
                     partial: false,
                 }),
                 old: None,

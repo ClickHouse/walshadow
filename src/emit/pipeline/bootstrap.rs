@@ -17,10 +17,9 @@ use crate::backfill::visibility_pending::metadata_patch;
 use crate::backfill::wal_replay::HeapTid;
 use crate::backfill::walk_barrier::{WALK_CHECKPOINT_PERIOD, WalkBarrier};
 use crate::budget::MemoryPermit;
-use crate::ch::EmitterError;
 use crate::config::ResolvedConfig;
-use crate::decode::datum::DatumRef;
-use crate::decode::heap_decoder::{ColumnValue, ToastPointer, TupleView, view_block_data_into};
+use crate::decode::datum::{Datum, DatumRef};
+use crate::decode::heap_decoder::{ToastPointer, TupleView, view_block_data_into};
 use crate::emit::ch_emitter::{EmitterStats, OP_INSERT, RowStamp};
 use crate::emit::pipeline::ack::{AckHandle, OpenSeq, Publish, SeqAlloc};
 use crate::emit::pipeline::batcher::{
@@ -533,7 +532,7 @@ struct LoadRow {
     table: u32,
     tuple: BackfillTuple,
     /// Resolved external values
-    patch: Vec<(usize, ColumnValue)>,
+    patch: Vec<(usize, Datum)>,
 }
 
 impl Slab {
@@ -543,7 +542,7 @@ impl Slab {
         rel: &Arc<RelDescriptor>,
         route: &Arc<RouteSnapshot>,
         tuple: BackfillTuple,
-        patch: Vec<(usize, ColumnValue)>,
+        patch: Vec<(usize, Datum)>,
     ) {
         let table = match self
             .tables
@@ -578,7 +577,7 @@ fn encode_row<'r>(
     tuple: &'r BackfillTuple,
     rel: &Arc<RelDescriptor>,
     route: &Arc<RouteSnapshot>,
-    mut patch: Vec<(usize, ColumnValue)>,
+    mut patch: Vec<(usize, Datum)>,
 ) -> Result<(), String> {
     let key = Arc::as_ptr(rel) as usize;
     let stamp = RowStamp {
@@ -597,10 +596,7 @@ fn encode_row<'r>(
             })
         }
         TupleData::Copy(row) => chunks.append(key, rel, route, |enc| {
-            enc.append_slots(
-                |src| copy_slot(row, rel, src.index).map_err(EmitterError::Type),
-                &stamp,
-            )
+            enc.append_slots(|src| Ok(copy_slot(row, rel, src.index)), &stamp)
         }),
     };
     appended.map_err(|e| format!("bootstrap: encode {}: {e}", rel.rel_name))
@@ -657,7 +653,7 @@ impl LoadOut {
         rel: &Arc<RelDescriptor>,
         route: &Arc<RouteSnapshot>,
         tuple: BackfillTuple,
-        patch: Vec<(usize, ColumnValue)>,
+        patch: Vec<(usize, Datum)>,
     ) -> Result<(), String> {
         self.slab.push(seq, rel, route, tuple, patch);
         if self.slab.due() {
@@ -933,7 +929,7 @@ struct ReplayRow {
     table: u32,
     pointers: Vec<PointerSite>,
     /// Values settled for external attributes
-    patch: Vec<(usize, ColumnValue)>,
+    patch: Vec<(usize, Datum)>,
     replay_covered: bool,
 }
 
@@ -964,13 +960,13 @@ fn mapped_pointers(view: &TupleView<'_>, mapping: &TableMapping) -> Vec<PointerS
 /// Settle oversized values as NULL and remove them from fetch list
 fn fill_oversize(
     sites: &mut Vec<PointerSite>,
-    patch: &mut Vec<(usize, ColumnValue)>,
+    patch: &mut Vec<(usize, Datum)>,
     resolver: &ToastResolver,
 ) {
     sites.retain(|site| {
         let filled = resolver.fills_oversize(&site.p);
         if filled {
-            patch.push((site.idx, ColumnValue::Null));
+            patch.push((site.idx, Datum::Null));
         }
         !filled
     });
@@ -1171,9 +1167,8 @@ async fn resolve_batch(
         }
         let RowTable { rel, route } = &batch.tables[*table as usize];
         for (site, fetched) in pointers.iter().zip(fetched) {
-            let type_oid = rel.attributes.get(site.idx).map_or(0, |a| a.type_oid);
             let target = &route.mapping.columns[site.col].target_name;
-            let (column, bytes) = apply_fetched(fetched, &site.p, type_oid, rel, target, resolver)?;
+            let (column, bytes) = apply_fetched(fetched, &site.p, rel, target, resolver)?;
             retained += bytes;
             patch.push((site.idx, column));
         }
@@ -1269,15 +1264,14 @@ async fn fetch_values_at<'a>(
 fn apply_fetched(
     fetched: Option<FetchedValue>,
     p: &ToastPointer,
-    type_oid: u32,
     rel: &RelDescriptor,
     target: &str,
     resolver: &ToastResolver,
-) -> Result<(ColumnValue, usize), String> {
+) -> Result<(Datum, usize), String> {
     let miss = match StoreMiss::split(fetched) {
         Ok(stored) => {
             let raw = finish_value(p, stored).map_err(|e| e.to_string())?;
-            return Ok(detoasted_sized(raw, type_oid));
+            return Ok(detoasted_sized(raw));
         }
         Err(miss) => miss,
     };
@@ -1302,13 +1296,7 @@ async fn resolve_or_fill_toast(
     rel: &RelDescriptor,
     mapping: &TableMapping,
     resolver: &ToastResolver,
-) -> Result<
-    (
-        Vec<(usize, ColumnValue)>,
-        Option<crate::budget::MemoryPermit>,
-    ),
-    String,
-> {
+) -> Result<(Vec<(usize, Datum)>, Option<crate::budget::MemoryPermit>), String> {
     let need = check_value_caps(
         sites.iter().map(|site| site.p),
         resolver.inline_value_max(),
@@ -1320,7 +1308,6 @@ async fn resolve_or_fill_toast(
     let mut leaf = crate::budget::acquire_opt(resolver.budget(), need).await;
     let mut retained = 0usize;
     for site in &sites {
-        let type_oid = rel.attributes.get(site.idx).map_or(0, |a| a.type_oid);
         let fetched = resolver
             .fetch_value(
                 tuple.rfn.db_node,
@@ -1332,7 +1319,7 @@ async fn resolve_or_fill_toast(
             .await
             .map_err(|e| format!("bootstrap: toast store fetch: {e}"))?;
         let target = &mapping.columns[site.col].target_name;
-        let (column, bytes) = apply_fetched(fetched, &site.p, type_oid, rel, target, resolver)?;
+        let (column, bytes) = apply_fetched(fetched, &site.p, rel, target, resolver)?;
         retained += bytes;
         patch.push((site.idx, column));
     }
@@ -1404,7 +1391,7 @@ mod tests {
     }
 
     /// Flatten the drain's segments back to `(seq, mapped cells)` rows
-    async fn collect_rows(rx: &mut mpsc::Receiver<BatcherMsg>) -> Vec<(u64, Vec<ColumnValue>)> {
+    async fn collect_rows(rx: &mut mpsc::Receiver<BatcherMsg>) -> Vec<(u64, Vec<Datum>)> {
         let mut rows = Vec::new();
         // Any other message ends collection short of the expected rows
         while let Some(BatcherMsg::Segments(segments)) = rx.recv().await {
@@ -1428,6 +1415,7 @@ mod tests {
     }
 
     use super::*;
+    use crate::decode::datum::{Datum, build};
     use crate::emit::pipeline::batcher::segment_rows;
     use crate::toast::ToastRow;
 
@@ -1468,7 +1456,7 @@ mod tests {
             Arc::new(EmitterStats::default()),
         );
         assert!(seeded.stores_chunks());
-        let err = apply_fetched(short.clone(), &ptr, 25, &rel, "body", &seeded)
+        let err = apply_fetched(short.clone(), &ptr, &rel, "body", &seeded)
             .expect_err("a seeded mirror losing its own chunk must stop the load");
         assert!(
             err.contains("chunks sum to 7984 bytes, pointer says 9100"),
@@ -1491,9 +1479,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(fetched, short);
-        let (column, retained) = apply_fetched(fetched, &ptr, 25, &rel, "body", &read_only)
+        let (column, retained) = apply_fetched(fetched, &ptr, &rel, "body", &read_only)
             .expect("a read-only backend fills instead of failing the load");
-        assert_eq!(column, ColumnValue::Null);
+        assert_eq!(column, Datum::Null);
         assert_eq!(retained, 0);
         assert_eq!(
             stats.toast_values_filled_superseded.load(Ordering::Relaxed),
@@ -1515,7 +1503,7 @@ mod tests {
             DEFERRED_SPOOL_MEM_MAX,
         )
     }
-    use crate::decode::heap_decoder::{ColumnValue, ToastPointer};
+    use crate::decode::heap_decoder::ToastPointer;
     use crate::emit::pipeline::batcher::BatcherMsg;
     use crate::emit::pipeline::{Fatal, ack};
     use crate::schema::{RelAttr, RelDescriptor, RelName, ReplIdent};
@@ -1583,7 +1571,7 @@ mod tests {
             page_lsn: 0,
             blkno: 0,
             offnum: 0,
-            data: TupleData::from_cells(&[Some(ColumnValue::Int4(id))]),
+            data: TupleData::from_cells(&[Some(build::int4(id))]),
             pending: None,
         }
     }
@@ -1669,10 +1657,7 @@ mod tests {
 
     /// Main-rel tuple whose columns are on-disk TOAST pointers
     fn referrer_tuple(rel_node: u32, pointers: &[ToastPointer]) -> BackfillTuple {
-        let cells: Vec<_> = pointers
-            .iter()
-            .map(|p| Some(ColumnValue::ExternalToast(*p)))
-            .collect();
+        let cells: Vec<_> = pointers.iter().map(|p| Some(Datum::External(*p))).collect();
         BackfillTuple {
             rfn: RelFileNode {
                 spc_node: 1663,
@@ -1708,9 +1693,9 @@ mod tests {
             blkno: 1,
             offnum: 1,
             data: TupleData::from_cells(&[
-                Some(ColumnValue::Oid(value_id)),
-                Some(ColumnValue::Int4(seq)),
-                Some(ColumnValue::Bytea(body.to_vec())),
+                Some(build::oid(value_id)),
+                Some(build::int4(seq)),
+                Some(build::bytes(body)),
             ]),
             pending: None,
         }
@@ -1898,7 +1883,7 @@ mod tests {
         assert_eq!(outcome.rows_routed, 1);
         assert_eq!(rows.len(), 1);
         let cols = &rows[0].1;
-        assert_eq!(cols[0], ColumnValue::Null, "unresolved toast NULL-filled");
+        assert_eq!(cols[0], Datum::Null, "unresolved toast NULL-filled");
         assert_eq!(stats.toast_values_filled_default.load(Ordering::Relaxed), 1);
         drop(ack);
         collector.await.unwrap();
@@ -1947,7 +1932,7 @@ mod tests {
         assert_eq!(outcome.rows_routed, 1);
         assert_eq!(rows.len(), 1);
         let cols = &rows[0].1;
-        assert_eq!(cols[0], ColumnValue::Null);
+        assert_eq!(cols[0], Datum::Null);
         assert_eq!(
             stats.toast_values_filled_oversize.load(Ordering::Relaxed),
             1
@@ -2014,7 +1999,7 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].0, 2, "deferred row routed under the trailing seq");
         let cols = &rows[0].1;
-        assert_eq!(cols[0], ColumnValue::Bytea(b"hello".to_vec()));
+        assert_eq!(cols[0], build::bytes(b"hello"));
         assert_eq!(stats.toast_chunks_stored.load(Ordering::Relaxed), 1);
         assert_eq!(stats.toast_values_fetched.load(Ordering::Relaxed), 1);
         drop(ack);
@@ -2233,7 +2218,7 @@ mod tests {
         let rows = collect_rows(&mut msg_rx).await;
         assert_eq!(rows.len(), 1);
         let cols = &rows[0].1;
-        assert_eq!(cols[0], ColumnValue::Bytea(b"hello".to_vec()));
+        assert_eq!(cols[0], build::bytes(b"hello"));
         drop(ack);
         collector.await.unwrap();
     }
@@ -2403,10 +2388,7 @@ mod tests {
                     );
                     assert_eq!(
                         chunk.cells(),
-                        [[
-                            ColumnValue::Bytea(b.to_vec()),
-                            ColumnValue::Bytea(c.to_vec())
-                        ]],
+                        [[build::bytes(b), build::bytes(c)]],
                         "{label}"
                     );
                     assert_eq!(covered, 0, "{label}");
@@ -2557,7 +2539,7 @@ mod tests {
         assert_eq!(outcome.rows_routed, 1);
         assert_eq!(rows.len(), 1);
         let cols = &rows[0].1;
-        assert_eq!(cols[0], ColumnValue::Bytea(b"hello".to_vec()));
+        assert_eq!(cols[0], build::bytes(b"hello"));
         drop(ack);
         collector.await.unwrap();
     }
@@ -2619,7 +2601,7 @@ mod tests {
         let outcome = drain_task.await.unwrap().unwrap();
         assert_eq!(outcome.rows_routed as usize, rows);
         let got: Vec<_> = routed.iter().map(|r| r.1[0].clone()).collect();
-        let want: Vec<_> = bodies.into_iter().map(ColumnValue::Bytea).collect();
+        let want: Vec<_> = bodies.into_iter().map(build::bytes).collect();
         assert_eq!(got, want, "replay order kept across the batch boundary");
         assert_eq!(
             stats.toast_value_fetch_batches.load(Ordering::Relaxed),
@@ -2877,7 +2859,7 @@ mod tests {
             .await
             .unwrap();
         for (row, expected) in batch.rows.iter().zip([b"first", b"other"]) {
-            assert_eq!(row.patch, [(0, ColumnValue::Bytea(expected.to_vec()))]);
+            assert_eq!(row.patch, [(0, build::bytes(expected))]);
         }
     }
 
@@ -2959,7 +2941,7 @@ mod tests {
         assert_eq!(
             bodies,
             [b"hello", b"hello", b"world", b"there"]
-                .map(|b| ColumnValue::Bytea(b.to_vec()))
+                .map(build::bytes)
                 .to_vec(),
             "replay order kept, shared value resolved for both referrers",
         );

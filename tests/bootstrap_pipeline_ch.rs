@@ -27,8 +27,8 @@ use walrus::pg::walparser::RelFileNode;
 use walshadow::backup_page_walk::{BackfillTuple, CatalogMap, TupleData};
 use walshadow::ch::CompressionChoice;
 use walshadow::ch_emitter::{EmitterConfig, EmitterStats, InstanceConfig};
+use walshadow::datum::build;
 use walshadow::emit::route::freeze_routes;
-use walshadow::heap_decoder::ColumnValue;
 use walshadow::mapping::{ColumnMapping, TableMapping, TableTarget};
 use walshadow::pipeline::batcher::BatcherMsg;
 use walshadow::pipeline::{Fatal, bootstrap, tail};
@@ -100,7 +100,7 @@ fn tuple(rel_node: u32, id: i32) -> BackfillTuple {
         page_lsn: 0,
         blkno: 0,
         offnum: 0,
-        data: TupleData::from_cells(&[Some(ColumnValue::Int4(id))]),
+        data: TupleData::from_cells(&[Some(build::int4(id))]),
         pending: None,
     }
 }

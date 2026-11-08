@@ -34,13 +34,13 @@ use clickhouse_c::{Allocator, ColumnBuilder, Kind, TypeAst};
 use crate::ch::is_retryable;
 use crate::ch::{CompressionChoice, ConnectionConfig, EmitterError, quote_ident, types};
 use crate::column_rules::{ColumnEntry, ColumnRule, ColumnRules, Substitute};
-use crate::decode::datum::{DatumRef, ValueRef};
+use crate::decode::codecs::{Numeric, parse_numeric};
+use crate::decode::datum::{Datum, DatumRef};
 #[cfg(test)]
 use crate::decode::decoder_sink::DecoderSinkError;
-use crate::decode::heap_decoder::ColumnValue;
 #[cfg(any(test, feature = "test-support"))]
 use crate::decode::heap_decoder::{CommittedTuple, HeapOp};
-use crate::decode::heap_decoder::{datum_value, datum_view};
+use crate::decode::heap_decoder::{TextDatum, inflate, missing_datum, text_datum};
 use crate::mapping::{
     ColumnMapping, DropTableStrategy, NamespaceMapping, SystemColumnNames, SystemColumns,
     TableMapping, TableTarget, named_instance,
@@ -1443,51 +1443,72 @@ pub(crate) struct ColumnPlan {
 pub(crate) struct SourceColumn {
     /// attnum - 1, indexes tuple images
     pub(crate) index: usize,
-    pub(crate) direct: Direct,
+    pub(crate) codec: Codec,
+    /// Zero for values patched past the descriptor's attributes
+    pub(crate) type_oid: u32,
 }
 
+/// Conversion of one source type's stored bytes into its column
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Direct {
-    /// Stored little-endian bytes already match target storage
-    Copy,
-    /// Decode through shared value policy
-    Value,
+pub(crate) enum Codec {
+    /// Little-endian storage copied as the column holds it
+    Le,
+    Date,
+    Time,
+    /// `timestamp` and `timestamptz`
+    Timestamp,
+    TimeTz,
+    Uuid,
+    Name,
+    /// Body bytes as String: text, bytea, json, cstring
+    Bytes,
+    Numeric,
+    Jsonb,
+    Inet,
+    Cidr,
+    MacAddr,
+    MacAddr8,
+    Tid,
+    Interval,
     /// PostGIS point rendered as WKT, typoutput yields HEXEWKB
     Wkt,
+    /// No local decode: typoutput text lands as String, stored bytes fail
+    Pending,
 }
 
-impl Direct {
-    fn choose(att: &RelAttr, plan: &ColumnPlan) -> Self {
+impl Codec {
+    pub(crate) fn choose(att: &RelAttr) -> Self {
         use crate::schema::{
-            CHAROID, CIDOID, FLOAT4OID, FLOAT8OID, INT2OID, INT4OID, INT8OID, MONEYOID, OID8OID,
-            OIDOID, PG_LSNOID, XID8OID, XIDOID,
+            BOOLOID, BPCHAROID, BYTEAOID, CHAROID, CIDOID, CIDROID, DATEOID, FLOAT4OID, FLOAT8OID,
+            INETOID, INT2OID, INT4OID, INT8OID, INTERVALOID, JSONBOID, JSONOID, MACADDR8OID,
+            MACADDROID, MONEYOID, NAMEOID, NUMERICOID, OID8OID, OIDOID, PG_LSNOID, TEXTOID, TIDOID,
+            TIMEOID, TIMESTAMPOID, TIMESTAMPTZOID, TIMETZOID, UUIDOID, VARCHAROID, XID8OID, XIDOID,
         };
         if matches!(att.type_name.as_str(), "geography" | "geometry") {
             return Self::Wkt;
         }
-        if plan.encoding != ColumnEncoding::Local {
-            return Self::Value;
+        if att.type_len == -2 {
+            return Self::Bytes;
         }
-        // Equal width alone is no proof: signedness, float layout, and
-        // epoch all differ between same-sized types
-        let storage = match att.type_oid {
-            CHAROID => Kind::Int8,
-            INT2OID => Kind::Int16,
-            INT4OID => Kind::Int32,
-            INT8OID | MONEYOID => Kind::Int64,
-            FLOAT4OID => Kind::Float32,
-            FLOAT8OID => Kind::Float64,
-            OIDOID | XIDOID | CIDOID => Kind::UInt32,
-            OID8OID | XID8OID | PG_LSNOID => Kind::UInt64,
-            _ => return Self::Value,
-        };
-        let inner = types::strip_nullable(plan.ast.view());
-        if inner.kind() == Some(storage)
-            && usize::try_from(att.type_len).is_ok_and(|n| n == inner.elem_size())
-        {
-            Self::Copy
-        } else {
-            Self::Value
+        match att.type_oid {
+            BOOLOID | CHAROID | INT2OID | INT4OID | INT8OID | MONEYOID | FLOAT4OID | FLOAT8OID
+            | OIDOID | XIDOID | CIDOID | OID8OID | XID8OID | PG_LSNOID => Self::Le,
+            DATEOID => Self::Date,
+            TIMEOID => Self::Time,
+            TIMESTAMPOID | TIMESTAMPTZOID => Self::Timestamp,
+            TIMETZOID => Self::TimeTz,
+            UUIDOID => Self::Uuid,
+            NAMEOID => Self::Name,
+            BYTEAOID | TEXTOID | VARCHAROID | BPCHAROID | JSONOID => Self::Bytes,
+            NUMERICOID => Self::Numeric,
+            JSONBOID => Self::Jsonb,
+            INETOID => Self::Inet,
+            CIDROID => Self::Cidr,
+            MACADDROID => Self::MacAddr,
+            MACADDR8OID => Self::MacAddr8,
+            TIDOID => Self::Tid,
+            INTERVALOID => Self::Interval,
+            _ => Self::Pending,
         }
     }
 }
@@ -1495,15 +1516,21 @@ impl Direct {
 /// Values replacing non-finite numerics or temporal infinities, `None` rejects
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct NonFinite {
-    nan: Option<ColumnValue>,
-    pos_inf: Option<ColumnValue>,
-    neg_inf: Option<ColumnValue>,
+    nan: Option<Fill>,
+    pos_inf: Option<Fill>,
+    neg_inf: Option<Fill>,
+}
+
+/// Substitute cell, encoded for its column
+#[derive(Clone, Debug, PartialEq)]
+enum Fill {
+    Null,
+    Le(SmallVec<[u8; 32]>),
 }
 
 impl NonFinite {
     /// Resolve settings against Decimal or temporal destination once per plan
     fn compile(rule: &ColumnRule, ast: &TypeAst) -> Result<Self, String> {
-        use crate::decode::codecs::NumericKind;
         let nullable = ast.view().kind() == Some(Kind::Nullable);
         let inner = types::strip_nullable(ast.view());
         let decimal = decimal_wire_of(ast);
@@ -1516,18 +1543,18 @@ impl NonFinite {
         let cell = |key: &str, sub: &Option<Substitute>| {
             let text = match sub {
                 None | Some(Substitute::Reject) => return Ok(None),
-                Some(Substitute::Null) if nullable => return Ok(Some(ColumnValue::Null)),
+                Some(Substitute::Null) if nullable => return Ok(Some(Fill::Null)),
                 Some(Substitute::Null) => {
                     return Err(format!("{key} = \"null\" needs a Nullable destination"));
-                }
-                Some(_) if decimal.is_none() => {
-                    return Err(format!(
-                        "{key}: temporal infinity supports only reject or null"
-                    ));
                 }
                 Some(Substitute::Min) => format!("-{bound}"),
                 Some(Substitute::Max) => bound.clone(),
                 Some(Substitute::Literal(lit)) => lit.clone(),
+            };
+            let Some(decimal) = decimal else {
+                return Err(format!(
+                    "{key}: temporal infinity supports only reject or null"
+                ));
             };
             let (int, frac) = crate::column_rules::decimal_parts(&text).unwrap_or_default();
             if frac.len() > scale && frac[scale..].bytes().any(|b| b != b'0') {
@@ -1540,7 +1567,11 @@ impl NonFinite {
                     "{key} = {text:?}: exceeds Decimal({precision}, {scale})"
                 ));
             }
-            Ok(Some(ColumnValue::Numeric(NumericKind::Finite(text))))
+            let scaled = decimal_text_to_scaled_le(&text, i32::from(decimal.scale), decimal.width)
+                .map_err(|e| format!("{key} = {text:?}: {e}"))?;
+            Ok(Some(Fill::Le(SmallVec::from_slice(
+                &scaled[..decimal.width.bytes()],
+            ))))
         };
         Ok(Self {
             // Temporal values have no NaN
@@ -1554,21 +1585,29 @@ impl NonFinite {
         })
     }
 
-    fn substitute<'a>(&'a self, v: ValueRef<'a>) -> ValueRef<'a> {
-        use crate::decode::codecs::NumericKind;
-        let sub = match v {
-            ValueRef::Numeric(NumericKind::NaN) => &self.nan,
-            ValueRef::Numeric(NumericKind::PInf)
-            | ValueRef::Date(i32::MAX)
-            | ValueRef::Timestamp(i64::MAX)
-            | ValueRef::TimestampTz(i64::MAX) => &self.pos_inf,
-            ValueRef::Numeric(NumericKind::NInf)
-            | ValueRef::Date(i32::MIN)
-            | ValueRef::Timestamp(i64::MIN)
-            | ValueRef::TimestampTz(i64::MIN) => &self.neg_inf,
-            _ => return v,
+    /// Substitute for a non-finite `body`, `None` to encode it as is
+    fn fill(&self, codec: Codec, body: &[u8]) -> Option<&Fill> {
+        use crate::decode::codecs::Special;
+        let sub = match codec {
+            Codec::Numeric => match parse_numeric(body) {
+                Ok(Numeric::Special(Special::NaN)) => &self.nan,
+                Ok(Numeric::Special(Special::PInf)) => &self.pos_inf,
+                Ok(Numeric::Special(Special::NInf)) => &self.neg_inf,
+                _ => return None,
+            },
+            Codec::Date => match i32::from_le_bytes(body.try_into().ok()?) {
+                i32::MAX => &self.pos_inf,
+                i32::MIN => &self.neg_inf,
+                _ => return None,
+            },
+            Codec::Timestamp => match i64::from_le_bytes(body.try_into().ok()?) {
+                i64::MAX => &self.pos_inf,
+                i64::MIN => &self.neg_inf,
+                _ => return None,
+            },
+            _ => return None,
         };
-        sub.as_ref().map_or(v, ColumnValue::view)
+        sub.as_ref()
     }
 }
 
@@ -1799,11 +1838,13 @@ impl TablePlan {
                 .and_then(|index| match att {
                     Some(a) => Some(SourceColumn {
                         index,
-                        direct: Direct::choose(a, &plan),
+                        codec: Codec::choose(a),
+                        type_oid: a.type_oid,
                     }),
                     None => (index >= rel.attributes.len()).then_some(SourceColumn {
                         index,
-                        direct: Direct::Value,
+                        codec: Codec::Le,
+                        type_oid: 0,
                     }),
                 });
             columns.push(plan);
@@ -1880,6 +1921,8 @@ pub(crate) struct TableEncoder {
     oracle_cells: Vec<OracleCell>,
     /// Mirrors `plan.columns` plus the synthetic columns the plan carries
     pub(crate) buffers: Vec<ColumnBuf>,
+    /// Rendered text of the cell being encoded
+    text: String,
 }
 
 /// On-the-wire-shape column buffer. [`BlockBuilder`] borrows these
@@ -2317,6 +2360,7 @@ impl TableEncoder {
             oracle_overhead,
             oracle_cells: Vec::new(),
             buffers,
+            text: String::new(),
         })
     }
 
@@ -2401,13 +2445,13 @@ impl TableEncoder {
             HeapOp::Delete => decoded.old.as_ref(),
             _ => decoded.new.as_ref(),
         };
-        let cells: SmallVec<[Cell<'_>; 16]> = mapping
+        let cells: SmallVec<[DatumRef<'_>; 16]> = mapping
             .columns
             .iter()
             .map(|col| {
                 side.and_then(|t| t.columns.get((col.src_attnum - 1) as usize))
                     .and_then(Option::as_ref)
-                    .map_or(Cell::Absent, |v| Cell::Value(v.view()))
+                    .map_or(DatumRef::Absent, Datum::view)
             })
             .collect();
         let stamp = RowStamp {
@@ -2421,81 +2465,60 @@ impl TableEncoder {
     }
 
     /// Append one image of `rel` read in place. Return [`Append::Full`]
-    /// without mutation when oracle threshold is hit. `patch`
-    /// replaces attributes by index: resolved TOAST values, and values past
-    /// `rel`'s attributes. Values whose decode allocates, and PostGIS
-    /// renders, build in row scratch
+    /// without mutation when oracle threshold is hit. `patch` replaces
+    /// attributes by index: resolved TOAST values, and values past `rel`'s
+    /// attributes
     pub(crate) fn append_view(
         &mut self,
         rel: &RelDescriptor,
         datums: &[DatumRef<'_>],
-        patch: &[(usize, ColumnValue)],
+        patch: &[(usize, Datum)],
         stamp: &RowStamp,
     ) -> Result<Append, EmitterError> {
-        let mut row = RowScratch::new(self.plan.columns.len());
-        for c in &self.plan.columns {
-            let Some(src) = c.source else {
-                row.cell(Cell::Absent);
-                continue;
-            };
-            let wkt = src.direct == Direct::Wkt;
-            if let Some((_, v)) = patch.iter().find(|(i, _)| *i == src.index) {
-                if wkt {
-                    let mut v = v.clone();
-                    crate::ops::oracle::render_ext_value(&mut v);
-                    row.own(v);
-                } else {
-                    row.cell(Cell::Value(v.view()));
+        let cells: SmallVec<[DatumRef<'_>; 16]> = self
+            .plan
+            .columns
+            .iter()
+            .map(|c| {
+                let Some(src) = c.source else {
+                    return DatumRef::Absent;
+                };
+                if let Some((_, v)) = patch.iter().find(|(i, _)| *i == src.index) {
+                    return v.view();
                 }
-                continue;
-            }
-            let (Some(&datum), Some(att)) = (datums.get(src.index), rel.attributes.get(src.index))
-            else {
-                row.cell(Cell::Absent);
-                continue;
-            };
-            match (src.direct, datum) {
-                (Direct::Copy, DatumRef::Fixed(le)) => row.cell(Cell::Le(le)),
-                (Direct::Wkt, _) => match datum_value(att, datum) {
-                    None => row.cell(Cell::Absent),
-                    Some(mut v) => {
-                        crate::ops::oracle::render_ext_value(&mut v);
-                        row.own(v);
-                    }
-                },
-                _ => match datum_view(att, datum) {
-                    Ok(v) => row.cell(v.map_or(Cell::Absent, Cell::Value)),
-                    Err(_) => {
-                        row.own(datum_value(att, datum).expect("allocating datum is present"))
-                    }
-                },
-            }
-        }
-        self.append_cells(|i| row.get(i), stamp)
+                match (datums.get(src.index), rel.attributes.get(src.index)) {
+                    (Some(DatumRef::Missing), Some(att)) => missing_datum(att),
+                    (Some(&datum), Some(_)) => datum,
+                    _ => DatumRef::Absent,
+                }
+            })
+            .collect();
+        self.append_cells(|i| cells[i], stamp)
     }
 
     /// Append one row whose mapped sources `slot` yields; columns without a
     /// source attribute stay absent
     pub(crate) fn append_slots<'a>(
         &mut self,
-        mut slot: impl FnMut(SourceColumn) -> Result<Slot<'a>, EmitterError>,
+        mut slot: impl FnMut(SourceColumn) -> Result<DatumRef<'a>, EmitterError>,
         stamp: &RowStamp,
     ) -> Result<Append, EmitterError> {
-        let mut row = RowScratch::new(self.plan.columns.len());
+        let mut cells: SmallVec<[DatumRef<'a>; 16]> = SmallVec::new();
         for c in &self.plan.columns {
-            match c.source.map(&mut slot).transpose()? {
-                None => row.cell(Cell::Absent),
-                Some(Slot::Cell(cell)) => row.cell(cell),
-                Some(Slot::Owned(v)) => row.own(v),
-            }
+            cells.push(
+                c.source
+                    .map(&mut slot)
+                    .transpose()?
+                    .unwrap_or(DatumRef::Absent),
+            );
         }
-        self.append_cells(|i| row.get(i), stamp)
+        self.append_cells(|i| cells[i], stamp)
     }
 
-    /// Append one row, `cell(i)` yielding `plan.columns[i]`'s cell
+    /// Append one row, `cell(i)` yielding `plan.columns[i]`'s datum
     fn append_cells<'c>(
         &mut self,
-        cell: impl Fn(usize) -> Cell<'c>,
+        cell: impl Fn(usize) -> DatumRef<'c>,
         stamp: &RowStamp,
     ) -> Result<Append, EmitterError> {
         let columns = self.plan.columns.len();
@@ -2508,8 +2531,9 @@ impl TableEncoder {
         let mut stranded_bytes = 0usize;
         for i in 0..columns {
             if let ColumnBuf::Oracle(o) = &self.buffers[i] {
-                let cell = oracle_cell(cell(i), o.source_type_oid)
-                    .map_err(|e| name_column(e, &self.plan.columns[i].name))?;
+                let col_plan = &self.plan.columns[i];
+                let cell = oracle_cell(cell(i), col_plan.source, o.source_type_oid)
+                    .map_err(|e| name_column(e, &col_plan.name))?;
                 if !o.resolves_locally(&cell) {
                     row_oracle_bytes += cell.wire_bytes();
                     stranded_bytes += o.stranded_bytes();
@@ -2539,22 +2563,8 @@ impl TableEncoder {
                 o.push(std::mem::replace(cell, OracleCell::Default));
                 continue;
             }
-            match cell(i) {
-                // Absent coerces like NULL, covers key-only delete
-                // tombstones under non-FULL replica identity
-                Cell::Absent => {
-                    buf.append_default();
-                    Ok(())
-                }
-                Cell::Le(le) => buf.append_fixed_bytes(le),
-                Cell::Value(v) => encode_value(
-                    buf,
-                    col_plan.non_finite.substitute(v),
-                    col_plan.decimal,
-                    col_plan.datetime64_scale,
-                ),
-            }
-            .map_err(|e| name_column(e, &col_plan.name))?;
+            encode_datum(buf, col_plan, cell(i), &mut self.text)
+                .map_err(|e| name_column(e, &col_plan.name))?;
         }
         oracle.clear();
         self.oracle_cells = oracle;
@@ -2581,60 +2591,6 @@ impl TableEncoder {
         self.approx_bytes = self.buffers.iter().map(ColumnBuf::approx_size).sum();
         Ok(Append::Done)
     }
-}
-
-/// One row's cells in `plan.columns` order, values whose decode allocates
-/// held aside so cells can borrow them
-struct RowScratch<'a> {
-    marks: SmallVec<[Mark<'a>; 16]>,
-    owned: SmallVec<[ColumnValue; 2]>,
-}
-
-/// Cell, or index into [`RowScratch::owned`]
-enum Mark<'a> {
-    Cell(Cell<'a>),
-    Owned(usize),
-}
-
-impl<'a> RowScratch<'a> {
-    fn new(columns: usize) -> Self {
-        Self {
-            marks: SmallVec::with_capacity(columns),
-            owned: SmallVec::new(),
-        }
-    }
-
-    fn cell(&mut self, cell: Cell<'a>) {
-        self.marks.push(Mark::Cell(cell));
-    }
-
-    fn own(&mut self, v: ColumnValue) {
-        self.owned.push(v);
-        self.marks.push(Mark::Owned(self.owned.len() - 1));
-    }
-
-    fn get(&self, i: usize) -> Cell<'_> {
-        match &self.marks[i] {
-            Mark::Cell(c) => *c,
-            Mark::Owned(j) => Cell::Value(self.owned[*j].view()),
-        }
-    }
-}
-
-/// One mapped source value, borrowed or built in row scratch
-pub(crate) enum Slot<'a> {
-    Cell(Cell<'a>),
-    Owned(ColumnValue),
-}
-
-/// One mapped cell ready to encode
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum Cell<'a> {
-    /// Absent from image, coerces like NULL
-    Absent,
-    Value(ValueRef<'a>),
-    /// Little-endian bytes [`Direct::Copy`] proved match column storage
-    Le(&'a [u8]),
 }
 
 /// Rows of one plan table encoded at planning. Relation and route travel
@@ -2930,6 +2886,12 @@ impl U256 {
         rem as u32
     }
 
+    fn from_le_bytes(b: [u8; 32]) -> Self {
+        Self(std::array::from_fn(|i| {
+            u64::from_le_bytes(b[i * 8..][..8].try_into().expect("8 bytes"))
+        }))
+    }
+
     fn to_le_bytes(self) -> [u8; 32] {
         let mut out = [0u8; 32];
         for (i, limb) in self.0.iter().enumerate() {
@@ -2955,6 +2917,44 @@ impl PartialOrd for U256 {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
     }
+}
+
+/// Decimal text of a CH `Decimal` cell, a two's-complement little-endian
+/// integer scaled by `10^scale`
+pub(crate) fn decimal_le_to_text(le: &[u8], scale: u8) -> String {
+    let neg = le.last().is_some_and(|b| b & 0x80 != 0);
+    let mut wide = [if neg { 0xFF } else { 0 }; 32];
+    wide[..le.len()].copy_from_slice(le);
+    if neg {
+        let mut carry = 1u16;
+        for b in &mut wide {
+            let v = u16::from(!*b) + carry;
+            *b = v as u8;
+            carry = v >> 8;
+        }
+    }
+    let mut mag = U256::from_le_bytes(wide);
+    let mut digits = Vec::new();
+    loop {
+        digits.push(b'0' + mag.div_small(10) as u8);
+        if mag.is_zero() {
+            break;
+        }
+    }
+    let scale = usize::from(scale);
+    digits.resize(digits.len().max(scale + 1), b'0');
+    digits.reverse();
+    let (int, frac) = digits.split_at(digits.len() - scale);
+    let mut out = String::with_capacity(digits.len() + 2);
+    if neg {
+        out.push('-');
+    }
+    out.extend(int.iter().map(|&b| char::from(b)));
+    if scale > 0 {
+        out.push('.');
+        out.extend(frac.iter().map(|&b| char::from(b)));
+    }
+    out
 }
 
 fn decimal_oob() -> EmitterError {
@@ -3024,6 +3024,43 @@ fn decimal_text_to_scaled_le(
         }
     }
 
+    signed_le(mag, neg, width)
+}
+
+/// Stored `numeric` body to the scaled integer a CH `Decimal(_, scale)`
+/// stores, read from its base-10000 digits. Digits past `scale` drop
+fn numeric_to_scaled_le(
+    body: &[u8],
+    scale: i32,
+    width: DecimalWidth,
+) -> Result<[u8; 32], EmitterError> {
+    let scale = u32::try_from(scale)
+        .map_err(|_| decimal_type_error("Decimal column has negative scale"))?;
+    let (neg, weight, digits) = match parse_numeric(body) {
+        Ok(Numeric::Finite {
+            neg,
+            weight,
+            digits,
+            ..
+        }) => (neg, weight, digits),
+        Ok(Numeric::Special(_)) => {
+            return Err(unsupported(
+                "non-finite numeric (NaN/Inf) into Decimal column, set nan/pos_inf/neg_inf or map to String",
+            ));
+        }
+        Err(_) => return Err(unsupported("malformed numeric")),
+    };
+    let mut mag = U256::default();
+    if !crate::decode::codecs::scaled_groups(weight, digits, scale, |m, a| {
+        mag.checked_mul_small(m) && mag.checked_add_small(a)
+    }) {
+        return Err(decimal_oob());
+    }
+    signed_le(mag, neg, width.bytes())
+}
+
+/// Two's-complement little-endian `mag`, bounded by the Decimal wire width
+fn signed_le(mag: U256, neg: bool, width: usize) -> Result<[u8; 32], EmitterError> {
     // Bound by physical wire width (signed Int{32,64,128,256} range),
     // not logical Decimal(p,s) precision 10^p. Backstop turning a
     // too-wide value (eg operator override onto a narrower Decimal) into
@@ -3079,134 +3116,245 @@ fn micros_to_ticks(us: i128, scale: i32) -> Result<i64, EmitterError> {
     i64::try_from(ticks).map_err(|_| unsupported("finite temporal value overflows storage"))
 }
 
-fn encode_value(
+fn fixed<const N: usize>(body: &[u8]) -> Result<[u8; N], EmitterError> {
+    body.try_into()
+        .map_err(|_| unsupported("stored width differs from source type"))
+}
+
+/// Encode one source datum into its column per the plan's codec
+fn encode_datum(
     buf: &mut ColumnBuf,
-    v: ValueRef<'_>,
-    decimal: Option<DecimalWire>,
-    timestamp_scale: i32,
+    plan: &ColumnPlan,
+    datum: DatumRef<'_>,
+    text: &mut String,
 ) -> Result<(), EmitterError> {
-    match v {
-        // Non-Nullable target takes type default
-        ValueRef::Null => {
+    let (codec, type_oid) = plan
+        .source
+        .map_or((Codec::Le, 0), |s| (s.codec, s.type_oid));
+    let body = match datum {
+        // Absent coerces like NULL, covers key-only delete tombstones under
+        // non-FULL replica identity. Non-Nullable target takes type default
+        DatumRef::Absent | DatumRef::Null | DatumRef::Dropped => {
             buf.append_default();
-            Ok(())
+            return Ok(());
         }
-        ValueRef::Bool(b) => buf.append_fixed_bytes(&[b as u8]),
-        ValueRef::Char(c) => buf.append_fixed_bytes(&c.to_le_bytes()),
-        ValueRef::Int2(n) => buf.append_fixed_bytes(&n.to_le_bytes()),
-        ValueRef::Int4(n) => buf.append_fixed_bytes(&n.to_le_bytes()),
-        ValueRef::Int8(n) => buf.append_fixed_bytes(&n.to_le_bytes()),
-        ValueRef::Float4(f) => buf.append_fixed_bytes(&f.to_le_bytes()),
-        ValueRef::Float8(f) => buf.append_fixed_bytes(&f.to_le_bytes()),
-        ValueRef::Oid(n) => buf.append_fixed_bytes(&n.to_le_bytes()),
-        ValueRef::Oid8(n) => buf.append_fixed_bytes(&n.to_le_bytes()),
-        ValueRef::Date(i32::MIN | i32::MAX)
-        | ValueRef::Timestamp(i64::MIN | i64::MAX)
-        | ValueRef::TimestampTz(i64::MIN | i64::MAX) => Err(unsupported(
-            "temporal infinity, set pos_inf/neg_inf to null on a Nullable destination",
-        )),
-        ValueRef::Date(n) => {
-            let days = n
-                .checked_add(DATE32_PG_EPOCH_DAYS)
-                .ok_or_else(|| unsupported("finite date overflows Date32 epoch conversion"))?;
-            buf.append_fixed_bytes(&days.to_le_bytes())
+        DatumRef::Missing => return Err(unsupported("fast default left unresolved")),
+        DatumRef::External(_) => {
+            return Err(unsupported(
+                "unresolved TOAST pointer (xact buffer should have reassembled)",
+            ));
         }
-        // PG time counts microseconds since midnight, without an epoch offset
-        ValueRef::Time(n) => {
-            let ticks = micros_to_ticks(i128::from(n), timestamp_scale)?;
-            buf.append_fixed_bytes(&ticks.to_le_bytes())
+        DatumRef::BadTag(_) => {
+            return Err(unsupported(
+                "unresolved source value routed to a local column",
+            ));
         }
-        ValueRef::Timestamp(n) | ValueRef::TimestampTz(n) => {
-            let ticks = timestamp_ticks(n, timestamp_scale)?;
-            buf.append_fixed_bytes(&ticks.to_le_bytes())
+        DatumRef::Compressed(d) => {
+            let raw = inflate(d).ok_or_else(|| unsupported("corrupt compressed varlena"))?;
+            return encode_datum(buf, plan, DatumRef::Varlena(&raw), text);
         }
-        // `timetz` → text: CH has no zone-aware time type, text keeps
-        // the offset the old fixed encoding dropped
-        ValueRef::TimeTz { micros, tz_seconds } => buf.append_string_bytes(
-            crate::decode::codecs::timetz_to_text(micros, tz_seconds).as_bytes(),
-        ),
-        ValueRef::Uuid(b) => buf.append_fixed_bytes(&crate::decode::codecs::uuid_to_ch_wire(&b)),
-        ValueRef::Name(s) | ValueRef::Text(s) | ValueRef::Json(s) => {
-            buf.append_string_bytes(s.as_bytes())
+        DatumRef::Text(t) => {
+            return match text_datum(type_oid, t) {
+                TextDatum::Datum(d) => encode_datum(buf, plan, d.view(), text),
+                TextDatum::Null => {
+                    buf.append_default();
+                    Ok(())
+                }
+                TextDatum::Opaque => buf.append_string_bytes(t),
+            };
         }
-        ValueRef::Numeric(n) => {
-            use crate::decode::codecs::NumericKind;
-            match decimal {
-                // Decimal column: non-finite (NaN/±Inf) is unrepresentable,
-                // error rather than silently corrupt unless column sets a
-                // substitute or maps to String
-                Some(decimal) => match n {
-                    NumericKind::Finite(s) => {
-                        let scaled =
-                            decimal_text_to_scaled_le(s, i32::from(decimal.scale), decimal.width)?;
-                        buf.append_fixed_bytes(&scaled[..decimal.width.bytes()])
-                    }
-                    NumericKind::NaN | NumericKind::PInf | NumericKind::NInf => Err(unsupported(
-                        "non-finite numeric (NaN/Inf) into Decimal column, set nan/pos_inf/neg_inf or map to String",
-                    )),
-                },
-                // String column: lossless text, including NaN/±Inf
-                None => buf.append_string_bytes(n.as_text().as_bytes()),
+        DatumRef::Fixed(b) | DatumRef::Varlena(b) | DatumRef::Cstring(b) => b,
+    };
+    if let Some(fill) = plan.non_finite.fill(codec, body) {
+        return match fill {
+            Fill::Null => {
+                buf.append_default();
+                Ok(())
             }
+            Fill::Le(le) => buf.append_fixed_bytes(le),
+        };
+    }
+    let rendered = |buf: &mut ColumnBuf, s: &str| buf.append_string_bytes(s.as_bytes());
+    match codec {
+        Codec::Le => buf.append_fixed_bytes(body),
+        Codec::Date => match i32::from_le_bytes(fixed(body)?) {
+            i32::MIN | i32::MAX => Err(temporal_infinity()),
+            n => {
+                let days = n
+                    .checked_add(DATE32_PG_EPOCH_DAYS)
+                    .ok_or_else(|| unsupported("finite date overflows Date32 epoch conversion"))?;
+                buf.append_fixed_bytes(&days.to_le_bytes())
+            }
+        },
+        // PG time counts microseconds since midnight, without an epoch offset
+        Codec::Time => {
+            let us = i64::from_le_bytes(fixed(body)?);
+            let ticks = micros_to_ticks(i128::from(us), plan.datetime64_scale)?;
+            buf.append_fixed_bytes(&ticks.to_le_bytes())
         }
-        ValueRef::Inet(v) => buf.append_string_bytes(v.to_text().as_bytes()),
-        ValueRef::MacAddr(b) => {
-            buf.append_string_bytes(crate::decode::codecs::macaddr_to_text(&b).as_bytes())
+        Codec::Timestamp => match i64::from_le_bytes(fixed(body)?) {
+            i64::MIN | i64::MAX => Err(temporal_infinity()),
+            us => {
+                let ticks = timestamp_ticks(us, plan.datetime64_scale)?;
+                buf.append_fixed_bytes(&ticks.to_le_bytes())
+            }
+        },
+        // CH has no zone-aware time type, text keeps the offset
+        Codec::TimeTz => {
+            let b: [u8; 12] = fixed(body)?;
+            let micros = i64::from_le_bytes(b[..8].try_into().expect("8 bytes"));
+            let tz_seconds = i32::from_le_bytes(b[8..].try_into().expect("4 bytes"));
+            rendered(
+                buf,
+                &crate::decode::codecs::timetz_to_text(micros, tz_seconds),
+            )
         }
-        ValueRef::MacAddr8(b) => {
-            buf.append_string_bytes(crate::decode::codecs::macaddr8_to_text(&b).as_bytes())
+        Codec::Uuid => {
+            buf.append_fixed_bytes(&crate::decode::codecs::uuid_to_ch_wire(&fixed(body)?))
         }
-        ValueRef::Tid { block, offset } => {
-            buf.append_string_bytes(crate::decode::codecs::tid_to_text(block, offset).as_bytes())
+        // NUL-padded to NAMEDATALEN
+        Codec::Name => {
+            let end = body.iter().position(|&b| b == 0).unwrap_or(body.len());
+            simdutf8::basic::from_utf8(&body[..end])
+                .map_err(|_| unsupported("unresolved source value routed to a local column"))?;
+            buf.append_string_bytes(&body[..end])
         }
-        ValueRef::Interval(v) => buf.append_string_bytes(v.to_text().as_bytes()),
-        ValueRef::Bytea(b) => buf.append_string_bytes(b),
-        ValueRef::ExternalToast(_) => Err(unsupported(
-            "unresolved TOAST pointer (xact buffer should have reassembled)",
-        )),
-        ValueRef::PgPendingText { text, .. } => buf.append_string_bytes(text.as_bytes()),
+        // PG validates UTF-8 on input, so bytes pass as they are
+        Codec::Bytes => buf.append_string_bytes(body),
+        Codec::Numeric => match plan.decimal {
+            // Non-finite is unrepresentable in Decimal: error rather than
+            // corrupt unless the column sets a substitute or maps to String
+            Some(decimal) => {
+                let scaled = numeric_to_scaled_le(body, i32::from(decimal.scale), decimal.width)?;
+                buf.append_fixed_bytes(&scaled[..decimal.width.bytes()])
+            }
+            None => {
+                text.clear();
+                crate::decode::codecs::render_numeric_text(body, text)
+                    .map_err(|_| unsupported("malformed numeric"))?;
+                rendered(buf, text)
+            }
+        },
+        Codec::Jsonb => {
+            text.clear();
+            crate::decode::codecs::render_jsonb_text(body, text)
+                .map_err(|_| unsupported("malformed jsonb"))?;
+            rendered(buf, text)
+        }
+        Codec::Inet | Codec::Cidr => {
+            let v = crate::decode::codecs::decode_inet(body, codec == Codec::Cidr)
+                .map_err(|_| unsupported("malformed inet"))?;
+            rendered(buf, &v.to_text())
+        }
+        Codec::MacAddr => rendered(buf, &crate::decode::codecs::macaddr_to_text(&fixed(body)?)),
+        Codec::MacAddr8 => rendered(buf, &crate::decode::codecs::macaddr8_to_text(&fixed(body)?)),
+        Codec::Tid => {
+            let (block, offset) = crate::decode::codecs::decode_tid(&fixed(body)?);
+            rendered(buf, &crate::decode::codecs::tid_to_text(block, offset))
+        }
+        Codec::Interval => {
+            let v = crate::decode::codecs::decode_interval(body)
+                .map_err(|_| unsupported("malformed interval"))?;
+            rendered(buf, &v.to_text())
+        }
+        Codec::Wkt => match crate::ops::oracle::point_wkt(body) {
+            Some(wkt) => rendered(buf, &wkt),
+            None => Err(unsupported(
+                "unresolved source value routed to a local column",
+            )),
+        },
         // Never interpret raw Datum bytes as local String data
-        ValueRef::PgPending { .. } | ValueRef::Unsupported { .. } => Err(unsupported(
+        Codec::Pending => Err(unsupported(
             "unresolved source value routed to a local column",
         )),
     }
 }
 
-/// Map NULL, absent, and unlogged fields to default cells
-fn oracle_cell(cell: Cell<'_>, source_type_oid: u32) -> Result<OracleCell, EmitterError> {
-    let mismatch = |got: u32| EmitterError::UnsupportedValue {
+fn temporal_infinity() -> EmitterError {
+    unsupported("temporal infinity, set pos_inf/neg_inf to null on a Nullable destination")
+}
+
+/// Map NULL, absent, and unlogged fields to default cells. Stored bodies go
+/// to typinput's inverse, text bypasses typoutput
+fn oracle_cell(
+    datum: DatumRef<'_>,
+    source: Option<SourceColumn>,
+    source_type_oid: u32,
+) -> Result<OracleCell, EmitterError> {
+    use crate::schema::{BPCHAROID, TEXTOID, VARCHAROID};
+    let unresolved = |kind| EmitterError::UnsupportedValue {
         target_column: String::new(),
-        kind: if got == 0 {
-            "decoded value on an oracle column"
-        } else {
-            "source type oid differs from the planned one"
-        },
+        kind,
     };
-    let v = match cell {
-        Cell::Absent => return Ok(OracleCell::Default),
-        Cell::Value(v) => v,
-        Cell::Le(_) => return Err(mismatch(0)),
+    let (codec, type_oid) = source.map_or((Codec::Le, 0), |s| (s.codec, s.type_oid));
+    let body = match datum {
+        DatumRef::Absent | DatumRef::Null | DatumRef::Dropped => return Ok(OracleCell::Default),
+        _ if type_oid != source_type_oid || type_oid == 0 => {
+            return Err(unresolved(if type_oid == 0 {
+                "decoded value on an oracle column"
+            } else {
+                "source type oid differs from the planned one"
+            }));
+        }
+        DatumRef::Text(t) => return Ok(OracleCell::TextInput(t.to_vec())),
+        DatumRef::Missing => return Err(unresolved("fast default left unresolved")),
+        DatumRef::External(_) | DatumRef::BadTag(_) => {
+            return Err(unresolved("unresolved source value on an oracle column"));
+        }
+        DatumRef::Compressed(d) => {
+            let raw = inflate(d).ok_or_else(|| unresolved("corrupt compressed varlena"))?;
+            return oracle_cell(DatumRef::Varlena(&raw), source, source_type_oid);
+        }
+        DatumRef::Fixed(b) | DatumRef::Varlena(b) | DatumRef::Cstring(b) => b,
     };
-    Ok(match v {
-        ValueRef::Null => OracleCell::Default,
-        ValueRef::PgPending { type_oid, raw } | ValueRef::Unsupported { type_oid, raw } => {
-            if type_oid != source_type_oid {
-                return Err(mismatch(type_oid));
-            }
-            OracleCell::DiskRaw(raw.to_vec())
-        }
-        ValueRef::PgPendingText { type_oid, text } => {
-            if type_oid != source_type_oid {
-                return Err(mismatch(type_oid));
-            }
-            OracleCell::TextInput(text.as_bytes().to_vec())
-        }
-        // jsonb needs typinput to reconstruct binary storage from document text
-        ValueRef::Json(s) => OracleCell::TextInput(s.as_bytes().to_vec()),
+    Ok(match codec {
         // PostGIS WKT must bypass HEXEWKB typoutput
-        ValueRef::Text(s) | ValueRef::Name(s) => OracleCell::Literal(s.as_bytes().to_vec()),
-        _ => return Err(mismatch(0)),
+        Codec::Wkt => crate::ops::oracle::point_wkt(body).map_or_else(
+            || OracleCell::DiskRaw(body.to_vec()),
+            |wkt| OracleCell::Literal(wkt.into_bytes()),
+        ),
+        Codec::Name => {
+            let end = body.iter().position(|&b| b == 0).unwrap_or(body.len());
+            OracleCell::Literal(body[..end].to_vec())
+        }
+        Codec::Bytes if matches!(datum, DatumRef::Cstring(_)) => OracleCell::Literal(body.to_vec()),
+        Codec::Bytes if matches!(type_oid, TEXTOID | VARCHAROID | BPCHAROID) => {
+            OracleCell::Literal(body.to_vec())
+        }
+        _ => OracleCell::DiskRaw(body.to_vec()),
     })
+}
+
+/// Default of `att` encoded for a one-row `ch_inner` column; `None` without
+/// a fast default or when the column can't hold it locally
+pub(crate) fn encode_default(att: &RelAttr, ch_inner: &str) -> Option<ColumnBuf> {
+    let datum = missing_datum(att);
+    if datum == DatumRef::Null {
+        return None;
+    }
+    let ast = TypeAst::parse(ch_inner, Allocator::global(&mimalloc::MiMalloc)).ok()?;
+    if composite_target(&ast) {
+        return None;
+    }
+    let mut buf = ColumnBuf::new_for_ast(&ast).ok()?;
+    let plan = ColumnPlan {
+        name: att.name.clone(),
+        type_repr: ch_inner.into(),
+        decimal: decimal_wire_of(&ast),
+        datetime64_scale: types::strip_nullable(ast.view())
+            .datetime64_scale()
+            .map_or(0, |s| s as i32),
+        ast,
+        non_finite: NonFinite::default(),
+        encoding: ColumnEncoding::Local,
+        source: Some(SourceColumn {
+            index: 0,
+            codec: Codec::choose(att),
+            type_oid: att.type_oid,
+        }),
+    };
+    encode_datum(&mut buf, &plan, datum, &mut String::new()).ok()?;
+    Some(buf)
 }
 
 crate::atomic_stats! {
@@ -3396,18 +3544,12 @@ pub(crate) enum Wire<'a> {
 #[cfg(test)]
 impl EncodedChunk {
     /// Mapped cells per row read back from wire buffers: fixed widths as
-    /// signed ints, strings as bytes
-    pub(crate) fn cells(&self) -> Vec<Vec<ColumnValue>> {
-        let fixed = |b: &[u8]| match b.len() {
-            1 => ColumnValue::Char(b[0] as i8),
-            2 => ColumnValue::Int2(i16::from_le_bytes(b.try_into().unwrap())),
-            4 => ColumnValue::Int4(i32::from_le_bytes(b.try_into().unwrap())),
-            8 => ColumnValue::Int8(i64::from_le_bytes(b.try_into().unwrap())),
-            _ => ColumnValue::Bytea(b.to_vec()),
-        };
+    /// little-endian bytes, strings as varlena bodies, so builders state both
+    pub(crate) fn cells(&self) -> Vec<Vec<Datum>> {
+        let fixed = Datum::fixed;
         let string = |offsets: &[u64], data: &[u8], r: usize| {
             let start = r.checked_sub(1).map_or(0, |p| offsets[p] as usize);
-            ColumnValue::Bytea(data[start..offsets[r] as usize].to_vec())
+            Datum::Varlena(data[start..offsets[r] as usize].to_vec())
         };
         let mapped = self.route.mapping.columns.len();
         let mut rows = vec![Vec::with_capacity(mapped); self.rows];
@@ -3419,14 +3561,14 @@ impl EncodedChunk {
                     | Wire::NullableString { null_map, .. }
                         if null_map[r] != 0 =>
                     {
-                        ColumnValue::Null
+                        Datum::Null
                     }
                     Wire::NullableFixed { width, inner, .. } => {
                         fixed(&inner[r * width..(r + 1) * width])
                     }
                     Wire::String { offsets, data, .. }
                     | Wire::NullableString { offsets, data, .. } => string(offsets, data, r),
-                    Wire::Oracle(cells) => ColumnValue::Text(format!("{:?}", cells[r])),
+                    Wire::Oracle(cells) => Datum::Text(format!("{:?}", cells[r]).into_bytes()),
                 });
             }
         }
@@ -3614,14 +3756,32 @@ pub async fn load_effective(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::decode::datum::{Datum, build};
 
+    /// Encode `v` alone under `codec`, as a column of `decimal` or
+    /// `timestamp_scale` would
     fn encode_value(
         buf: &mut ColumnBuf,
-        v: &ColumnValue,
+        codec: Codec,
+        v: &Datum,
         decimal: Option<DecimalWire>,
         timestamp_scale: i32,
     ) -> Result<(), EmitterError> {
-        super::encode_value(buf, v.view(), decimal, timestamp_scale)
+        let plan = ColumnPlan {
+            name: String::new(),
+            type_repr: String::new(),
+            ast: TypeAst::parse("String", Allocator::global(&mimalloc::MiMalloc)).unwrap(),
+            decimal,
+            datetime64_scale: timestamp_scale,
+            non_finite: NonFinite::default(),
+            encoding: ColumnEncoding::Local,
+            source: Some(SourceColumn {
+                index: 0,
+                codec,
+                type_oid: 0,
+            }),
+        };
+        encode_datum(buf, &plan, v.view(), &mut String::new())
     }
     use crate::backfill::copy_backfill::COPY_CHUNK_BLOCKS;
     use crate::decode::heap_decoder::{DecodedHeap, DecodedTuple};
@@ -3867,10 +4027,7 @@ mod tests {
     }
 
     fn committed(id: i32, name: Option<&str>) -> CommittedTuple {
-        let name_col = Some(
-            name.map(|s| ColumnValue::Text(s.to_string()))
-                .unwrap_or(ColumnValue::Null),
-        );
+        let name_col = Some(name.map(build::text).unwrap_or(Datum::Null));
         CommittedTuple {
             decoded: DecodedHeap {
                 rfn: RelFileNode {
@@ -3882,7 +4039,7 @@ mod tests {
                 source_lsn: 0xCAFE,
                 op: HeapOp::Insert,
                 new: Some(DecodedTuple {
-                    columns: vec![Some(ColumnValue::Int4(id)), name_col],
+                    columns: vec![Some(build::int4(id)), name_col],
                     partial: false,
                 }),
                 old: None,
@@ -4027,8 +4184,9 @@ mod tests {
         let alloc = Allocator::global(&mimalloc::MiMalloc);
         let mut rel = mk_rel();
         // Source type the local matrix misses, so `name` plans as an oracle
-        // column while its String target still renders literals in-daemon
+        // column while its String target still renders points in-daemon
         rel.attributes[1].type_oid = 17_000;
+        rel.attributes[1].type_name = "geometry".into();
         let m = mk_mapping();
         let plan = TablePlan::build(
             alloc,
@@ -4044,36 +4202,37 @@ mod tests {
         ));
         let mut enc = TableEncoder::new(plan).unwrap();
         let overhead = enc.oracle_bytes;
-        let big = "x".repeat(ORACLE_BATCH_SEAL_BYTES * 3 / 5);
+        let row = |id: i32, body: Vec<u8>| {
+            let mut row = committed(id, None);
+            row.decoded.new.as_mut().expect("insert tuple").columns[1] = Some(build::bytes(body));
+            row
+        };
         for id in 1..=2 {
+            let point = crate::ops::oracle::point_body(f64::from(id), 2.0);
             assert_eq!(
-                enc.append_row(&committed(id, Some(&big)), &m, OP_INSERT)
-                    .unwrap(),
+                enc.append_row(&row(id, point), &m, OP_INSERT).unwrap(),
                 Append::Done,
-                "literal rows do not seal",
             );
         }
         assert_eq!(
             enc.oracle_bytes, overhead,
             "literals owe the request nothing"
         );
-        // A cell needing conversion sends the column whole, so the literals
-        // it strands seal the batch rather than overrun the frame cap
-        let mut json_row = committed(3, None);
-        json_row.decoded.new.as_mut().expect("insert tuple").columns[1] =
-            Some(ColumnValue::Json("{}".into()));
+        let oracle = |enc: &TableEncoder| match &enc.buffers[1] {
+            ColumnBuf::Oracle(o) => literal_column(o, enc.rows).is_some(),
+            _ => unreachable!("oracle column"),
+        };
+        assert!(oracle(&enc));
+        // A cell needing conversion sends the column whole, stranding the
+        // literals onto the request
+        let raw = OracleCell::DiskRaw(vec![1, 2, 3]).wire_bytes();
         assert_eq!(
-            enc.append_row(&json_row, &m, OP_INSERT).unwrap(),
-            Append::Full
+            enc.append_row(&row(3, vec![1, 2, 3]), &m, OP_INSERT)
+                .unwrap(),
+            Append::Done
         );
-        let (buffers, rows) = enc.take_block().unwrap();
-        assert_eq!(rows, 2);
-        assert!(matches!(buffers[1].wire(), Wire::Oracle(cells) if cells.len() == 2));
-        let oracle = buffers.iter().find_map(|b| match b {
-            ColumnBuf::Oracle(o) => Some(o),
-            _ => None,
-        });
-        assert!(literal_column(oracle.expect("oracle column"), rows).is_some());
+        assert!(enc.oracle_bytes > overhead + raw, "literals stranded");
+        assert!(!oracle(&enc));
     }
 
     #[test]
@@ -4150,7 +4309,6 @@ mod tests {
 
     #[test]
     fn encode_numeric_into_decimal_and_string() {
-        use crate::decode::codecs::NumericKind;
         let alloc = Allocator::global(&mimalloc::MiMalloc);
         let ast = TypeAst::parse("Decimal(10, 2)", alloc).unwrap();
         let decimal = decimal_wire_of(&ast);
@@ -4164,7 +4322,8 @@ mod tests {
         let mut buf = ColumnBuf::new_for_ast(&ast).unwrap();
         encode_value(
             &mut buf,
-            &ColumnValue::Numeric(NumericKind::Finite("1.50".into())),
+            Codec::Numeric,
+            &build::numeric("1.50"),
             decimal,
             6,
         )
@@ -4180,7 +4339,8 @@ mod tests {
         assert!(
             encode_value(
                 &mut buf_nan,
-                &ColumnValue::Numeric(NumericKind::NaN),
+                Codec::Numeric,
+                &build::numeric("NaN"),
                 decimal,
                 6,
             )
@@ -4200,7 +4360,8 @@ mod tests {
         let wide_text = "123456789012345678901234567890123456789012345678.12";
         encode_value(
             &mut wide_buf,
-            &ColumnValue::Numeric(NumericKind::Finite(wide_text.into())),
+            Codec::Numeric,
+            &build::numeric(wide_text),
             wide_decimal,
             6,
         )
@@ -4217,7 +4378,7 @@ mod tests {
 
         let sast = TypeAst::parse("String", alloc).unwrap();
         let mut sbuf = ColumnBuf::new_for_ast(&sast).unwrap();
-        encode_value(&mut sbuf, &ColumnValue::Numeric(NumericKind::NaN), None, 6).unwrap();
+        encode_value(&mut sbuf, Codec::Numeric, &build::numeric("NaN"), None, 6).unwrap();
         assert_eq!(
             sbuf.wire(),
             Wire::String {
@@ -4234,7 +4395,7 @@ mod tests {
         let micros = 45_296_000_000i64; // 12:34:56
         let ast = TypeAst::parse("Time64(6)", alloc).unwrap();
         let mut buf = ColumnBuf::new_for_ast(&ast).unwrap();
-        encode_value(&mut buf, &ColumnValue::Time(micros), None, 6).unwrap();
+        encode_value(&mut buf, Codec::Time, &build::micros(micros), None, 6).unwrap();
         assert_eq!(
             buf.wire(),
             Wire::Fixed {
@@ -4244,7 +4405,14 @@ mod tests {
         );
         let ast = TypeAst::parse("Time64(3)", alloc).unwrap();
         let mut buf = ColumnBuf::new_for_ast(&ast).unwrap();
-        encode_value(&mut buf, &ColumnValue::Time(micros + 7_999), None, 3).unwrap();
+        encode_value(
+            &mut buf,
+            Codec::Time,
+            &build::micros(micros + 7_999),
+            None,
+            3,
+        )
+        .unwrap();
         assert_eq!(
             buf.wire(),
             Wire::Fixed {
@@ -4256,10 +4424,8 @@ mod tests {
         let mut sbuf = ColumnBuf::new_for_ast(&sast).unwrap();
         encode_value(
             &mut sbuf,
-            &ColumnValue::TimeTz {
-                micros,
-                tz_seconds: -7200,
-            },
+            Codec::TimeTz,
+            &build::timetz(micros, -7200),
             None,
             6,
         )
@@ -4404,10 +4570,12 @@ mod tests {
         NonFinite::compile(&rule, &ast)
     }
 
-    fn finite(text: &str) -> Option<ColumnValue> {
-        Some(ColumnValue::Numeric(
-            crate::decode::codecs::NumericKind::Finite(text.into()),
-        ))
+    /// Substitute `text` encoded for Decimal type `ty`
+    fn finite(ty: &str, text: &str) -> Option<Fill> {
+        let ast = TypeAst::parse(ty, Allocator::global(&mimalloc::MiMalloc)).unwrap();
+        let wire = decimal_wire_of(&ast).unwrap();
+        let le = decimal_text_to_scaled_le(text, i32::from(wire.scale), wire.width).unwrap();
+        Some(Fill::Le(SmallVec::from_slice(&le[..wire.width.bytes()])))
     }
 
     #[test]
@@ -4432,16 +4600,20 @@ mod tests {
                 &nullable,
             )
             .unwrap();
-            assert_eq!(nf.pos_inf, Some(ColumnValue::Null));
+            assert_eq!(nf.pos_inf, Some(Fill::Null));
             assert_eq!(nf.neg_inf, None);
-            for value in [
-                ColumnValue::Date(i32::MIN + 1),
-                ColumnValue::Date(i32::MAX - 1),
-                ColumnValue::Timestamp(i64::MIN + 1),
-                ColumnValue::TimestampTz(i64::MAX - 1),
+            for (codec, body) in [
+                (Codec::Date, (i32::MIN + 1).to_le_bytes().to_vec()),
+                (Codec::Date, (i32::MAX - 1).to_le_bytes().to_vec()),
+                (Codec::Timestamp, (i64::MIN + 1).to_le_bytes().to_vec()),
+                (Codec::Timestamp, (i64::MAX - 1).to_le_bytes().to_vec()),
             ] {
-                assert_eq!(nf.substitute(value.view()), value.view());
+                assert_eq!(nf.fill(codec, &body), None);
             }
+            assert_eq!(
+                nf.fill(Codec::Date, &i32::MAX.to_le_bytes()),
+                Some(&Fill::Null)
+            );
         }
     }
 
@@ -4481,23 +4653,17 @@ mod tests {
             (
                 "Date32",
                 crate::schema::DATEOID,
-                vec![ColumnValue::Date(i32::MIN), ColumnValue::Date(i32::MAX)],
+                vec![build::date(i32::MIN), build::date(i32::MAX)],
             ),
             (
                 "DateTime64(3, 'UTC')",
                 crate::schema::TIMESTAMPOID,
-                vec![
-                    ColumnValue::Timestamp(i64::MIN),
-                    ColumnValue::Timestamp(i64::MAX),
-                ],
+                vec![build::micros(i64::MIN), build::micros(i64::MAX)],
             ),
             (
                 "DateTime64(6, 'UTC')",
                 crate::schema::TIMESTAMPTZOID,
-                vec![
-                    ColumnValue::TimestampTz(i64::MIN),
-                    ColumnValue::TimestampTz(i64::MAX),
-                ],
+                vec![build::micros(i64::MIN), build::micros(i64::MAX)],
             ),
         ] {
             let mut rel = mk_rel();
@@ -4577,9 +4743,8 @@ mod tests {
             let mut encoder = TableEncoder::new(plan).unwrap();
             for seconds in [-1i64, 0, 946_684_800] {
                 let mut row = committed(1, None);
-                row.decoded.new.as_mut().unwrap().columns[0] = Some(ColumnValue::Timestamp(
-                    seconds * 1_000_000 - DATETIME64_PG_EPOCH_US,
-                ));
+                row.decoded.new.as_mut().unwrap().columns[0] =
+                    Some(build::micros(seconds * 1_000_000 - DATETIME64_PG_EPOCH_US));
                 encoder.append_row(&row, &mapping, OP_INSERT).unwrap();
             }
             let expected: Vec<u8> = [-1i64, 0, 946_684_800]
@@ -4610,12 +4775,12 @@ mod tests {
     #[test]
     fn non_finite_substitutes_resolve_against_destination() {
         let nf = non_finite("Decimal(10, 2)", "0", "1.230", "reject").unwrap();
-        assert_eq!(nf.nan, finite("0"));
-        assert_eq!(nf.pos_inf, finite("1.230"));
+        assert_eq!(nf.nan, finite("Decimal(10, 2)", "0"));
+        assert_eq!(nf.pos_inf, finite("Decimal(10, 2)", "1.230"));
         assert_eq!(nf.neg_inf, None);
 
         let nf = non_finite("Nullable(Decimal(10, 2))", "null", "reject", "reject").unwrap();
-        assert_eq!(nf.nan, Some(ColumnValue::Null));
+        assert_eq!(nf.nan, Some(Fill::Null));
 
         for (ty, nan) in [
             ("Decimal(10, 2)", "null"),
@@ -4641,7 +4806,7 @@ mod tests {
         ] {
             for (action, literal) in [("min", format!("-{bound}")), ("max", bound.into())] {
                 let nf = non_finite(ty, action, action, action).unwrap();
-                let expected = finite(&literal);
+                let expected = finite(ty, &literal);
                 assert_eq!(nf.nan, expected);
                 assert_eq!(nf.pos_inf, expected);
                 assert_eq!(nf.neg_inf, expected);
@@ -4651,14 +4816,14 @@ mod tests {
 
     #[test]
     fn nan_row_lands_as_configured_substitute() {
-        use crate::decode::codecs::NumericKind;
         let alloc = Allocator::global(&mimalloc::MiMalloc);
-        let rel = mk_rel();
+        let mut rel = mk_rel();
+        rel.attributes[0].type_oid = crate::schema::NUMERICOID;
+        rel.attributes[0].type_len = -1;
         let mut m = mk_mapping();
         m.columns[0].target_type = "Decimal(10, 2)".into();
         let mut row = committed(1, None);
-        row.decoded.new.as_mut().expect("insert tuple").columns[0] =
-            Some(ColumnValue::Numeric(NumericKind::NaN));
+        row.decoded.new.as_mut().expect("insert tuple").columns[0] = Some(build::numeric("NaN"));
 
         let plan = TablePlan::build(
             alloc,
@@ -4791,8 +4956,7 @@ mod tests {
             assert_eq!(plan.columns[1].encoding, ColumnEncoding::Local, "{target}");
             let mut enc = TableEncoder::new(plan).unwrap();
             let mut doc = committed(1, None);
-            doc.decoded.new.as_mut().unwrap().columns[1] =
-                Some(ColumnValue::Json(r#"{"a": 1}"#.into()));
+            doc.decoded.new.as_mut().unwrap().columns[1] = Some(build::out_text(r#"{"a": 1}"#));
             enc.append_row(&doc, &m, OP_INSERT).unwrap();
             enc.append_row(&committed(2, None), &m, OP_INSERT).unwrap();
             let (offsets, data, absent) = (&[8, 10][..], &br#"{"a": 1}{}"#[..], &b"{}"[..]);
@@ -4874,7 +5038,7 @@ mod tests {
                 op: HeapOp::Delete,
                 new: None,
                 old: Some(DecodedTuple {
-                    columns: vec![Some(ColumnValue::Int4(id)), None],
+                    columns: vec![Some(build::int4(id)), None],
                     partial: false,
                 }),
             },

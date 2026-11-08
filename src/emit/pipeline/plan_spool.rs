@@ -26,8 +26,8 @@ use clickhouse_c::Allocator;
 use thiserror::Error;
 
 use crate::ch::EmitterError;
-use crate::decode::datum::DatumRef;
-use crate::decode::heap_decoder::{ColumnValue, HeapOp, TupleView, datum_value};
+use crate::decode::datum::{Datum, DatumRef};
+use crate::decode::heap_decoder::{HeapOp, TupleView, inflate, missing_datum};
 use crate::emit::ch_emitter::{
     Append, EncodedChunk, OP_DELETE, OP_INSERT, OP_UPDATE, RowStamp, TableEncoder, TablePlan,
 };
@@ -725,16 +725,16 @@ pub struct ViewChange<'v, 'a> {
     pub source_lsn: u64,
     pub new: Option<&'v TupleView<'a>>,
     pub old: Option<&'v TupleView<'a>>,
-    pub new_patch: &'v [(usize, ColumnValue)],
-    pub old_patch: &'v [(usize, ColumnValue)],
+    pub new_patch: &'v [(usize, Datum)],
+    pub old_patch: &'v [(usize, Datum)],
 }
 
 /// Whether an UPDATE changes primary/index key, or any column under
 /// `REPLICA IDENTITY FULL` without a primary key. PostgreSQL default/index
 /// identity logs old values only when key changes or contains TOASTed values
-fn key_moved(
+fn key_moved<'v>(
     rel: &RelDescriptor,
-    change: &ViewChange<'_, '_>,
+    change: &ViewChange<'v, '_>,
     old: &TupleView<'_>,
     new: &TupleView<'_>,
 ) -> bool {
@@ -743,25 +743,23 @@ fn key_moved(
         HeapOp::HotUpdate => true,
         _ => return false,
     };
-    let patched = |patch: &[(usize, ColumnValue)], a: usize| {
-        patch.iter().find(|(i, _)| *i == a).map(|(_, v)| v.clone())
-    };
     let differs = |a: usize| {
         let (Some(&o), Some(&n), Some(att)) =
             (old.datums.get(a), new.datums.get(a), rel.attributes.get(a))
         else {
             return false;
         };
-        match (patched(change.old_patch, a), patched(change.new_patch, a)) {
-            (None, None) => datums_differ(att, o, n),
-            (po, pn) => values_differ(
-                att,
-                [
-                    po.or_else(|| datum_value(att, o)),
-                    pn.or_else(|| datum_value(att, n)),
-                ],
-            ),
-        }
+        let patched = |patch: &'v [(usize, Datum)], d| {
+            patch
+                .iter()
+                .find(|(i, _)| *i == a)
+                .map_or(d, |(_, v)| v.view())
+        };
+        datums_differ(
+            att,
+            patched(change.old_patch, o),
+            patched(change.new_patch, n),
+        )
     };
     let keys = crate::schema::replident_key_attnums(rel);
     if keys.is_empty() {
@@ -775,34 +773,39 @@ fn key_moved(
     }
 }
 
-/// Cell inequality as owned decode compares it. Equal stored bytes decode
-/// equal except float NaN, which never equals itself
+/// Stored-byte inequality, as PostgreSQL's `datumIsEqual` judges index
+/// keys; absent never differs. Floats compare by value, so NaN differs from
+/// itself and signed zeros match
 fn datums_differ(att: &crate::schema::RelAttr, o: DatumRef<'_>, n: DatumRef<'_>) -> bool {
     use crate::schema::{FLOAT4OID, FLOAT8OID};
     match (o, n) {
         (DatumRef::Absent, _) | (_, DatumRef::Absent) => false,
-        (DatumRef::Fixed(a), DatumRef::Fixed(b))
-            if a == b && !matches!(att.type_oid, FLOAT4OID | FLOAT8OID) =>
-        {
-            false
+        (DatumRef::Missing, d) | (d, DatumRef::Missing) => {
+            datums_differ(att, missing_datum(att), d)
         }
-        (DatumRef::Varlena(a), DatumRef::Varlena(b)) if a == b => false,
+        (DatumRef::Compressed(c), d) | (d, DatumRef::Compressed(c)) => {
+            inflate(c).is_none_or(|raw| datums_differ(att, DatumRef::Varlena(&raw), d))
+        }
         (DatumRef::Null | DatumRef::Dropped, DatumRef::Null | DatumRef::Dropped) => false,
-        _ => values_differ(att, [o, n].map(|d| datum_value(att, d))),
+        (DatumRef::Fixed(a), DatumRef::Fixed(b)) => match att.type_oid {
+            FLOAT4OID => float_bits_differ::<4>(a, b, |w| f64::from(f32::from_le_bytes(w))),
+            FLOAT8OID => float_bits_differ::<8>(a, b, f64::from_le_bytes),
+            _ => a != b,
+        },
+        (
+            DatumRef::Varlena(a) | DatumRef::Cstring(a) | DatumRef::Text(a),
+            DatumRef::Varlena(b) | DatumRef::Cstring(b) | DatumRef::Text(b),
+        ) => a != b,
+        (DatumRef::External(a), DatumRef::External(b)) => a != b,
+        _ => true,
     }
 }
 
-/// Owned cells compared after PostGIS render; absent never differs
-fn values_differ(att: &crate::schema::RelAttr, mut values: [Option<ColumnValue>; 2]) -> bool {
-    if values.iter().any(Option::is_none) {
-        return false;
+fn float_bits_differ<const N: usize>(a: &[u8], b: &[u8], value: fn([u8; N]) -> f64) -> bool {
+    match (a.try_into(), b.try_into()) {
+        (Ok(a), Ok(b)) => value(a) != value(b),
+        _ => a != b,
     }
-    if !att.dropped && matches!(att.type_name.as_str(), "geography" | "geometry") {
-        for v in values.iter_mut().flatten() {
-            crate::ops::oracle::render_ext_value(v);
-        }
-    }
-    values[0] != values[1]
 }
 
 pub(crate) fn op_code(op: HeapOp) -> std::result::Result<i8, EmitterError> {
@@ -1001,7 +1004,8 @@ fn read_frame(f: &mut FileInput, tables: &[PlanTable]) -> Result<EncodedChunk> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::decode::heap_decoder::{ColumnValue, DecodedHeap, DecodedTuple};
+    use crate::decode::datum::{Datum, build};
+    use crate::decode::heap_decoder::{DecodedHeap, DecodedTuple};
     use crate::emit::ch_emitter::Wire;
     use crate::mapping::{ColumnMapping, TableMapping, TableTarget};
     use crate::schema::{INT4OID, RelAttr, RelName, SchemaEvent};
@@ -1050,12 +1054,8 @@ mod tests {
         (v.attnum, v.name, v.type_oid) = (2, "v".into(), crate::schema::TEXTOID);
         (v.type_name, v.type_byval, v.type_len) = ("text".into(), false, -1);
         rel.attributes.push(v);
-        let row = |id: i32, v: &str| {
-            form_block_data(&[
-                Some(ColumnValue::Int4(id)),
-                Some(ColumnValue::Text(v.into())),
-            ])
-        };
+        let row =
+            |id: i32, v: &str| form_block_data(&[], &[Some(build::int4(id)), Some(build::text(v))]);
         let pk = || ReplIdent::Default {
             pk_attnums: Some(vec![1]),
         };
@@ -1107,7 +1107,7 @@ mod tests {
             source_lsn: lsn,
             op: HeapOp::Insert,
             new: Some(DecodedTuple {
-                columns: vec![Some(ColumnValue::Int4(v))],
+                columns: vec![Some(build::int4(v))],
                 partial: false,
             }),
             old: None,
@@ -1282,7 +1282,7 @@ mod tests {
         let d = descriptor(16500);
         let image = |v| {
             Some(DecodedTuple {
-                columns: vec![Some(ColumnValue::Int4(v))],
+                columns: vec![Some(build::int4(v))],
                 partial: false,
             })
         };
@@ -1418,14 +1418,8 @@ mod tests {
             let mut w = PlanWriter::create(path, 1 << 20, mem_max);
             let table = w.table(&d, 0x40, || Some(route_to("String")));
             for (lsn, v) in [
-                (
-                    100,
-                    Some(ColumnValue::PgPending {
-                        type_oid: 3614,
-                        raw: vec![1, 2, 3],
-                    }),
-                ),
-                (110, Some(ColumnValue::Null)),
+                (100, Some(build::bytes(vec![1, 2, 3]))),
+                (110, Some(Datum::Null)),
                 (120, None),
             ] {
                 let mut h = heap(&d, lsn, 0);

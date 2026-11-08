@@ -562,7 +562,7 @@ fn decode_record(buf: &[u8]) -> Result<BackfillTuple> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::decode::heap_decoder::ColumnValue;
+    use crate::decode::datum::build;
     use tempfile::tempdir;
     use tokio::io::AsyncWriteExt;
 
@@ -659,11 +659,7 @@ mod tests {
             page_lsn: lsn + 0x100,
             blkno: 3,
             offnum: 7,
-            data: TupleData::from_cells(&[
-                Some(ColumnValue::Int4(1)),
-                None,
-                Some(ColumnValue::Bytea(payload.to_vec())),
-            ]),
+            data: TupleData::from_cells(&[Some(build::int4(1)), None, Some(build::bytes(payload))]),
             pending: None,
         }
     }

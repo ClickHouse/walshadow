@@ -26,7 +26,7 @@ use crate::backfill::backup_page_walk::{BOOTSTRAP_TUPLE_CHANNEL_CAP, BackfillTup
 use crate::backfill::spool::{DEFERRED_SPOOL_MEM_MAX, DeferredSpool};
 use crate::ch::quote_ident;
 use crate::config::ResolvedConfig;
-use crate::decode::heap_decoder::ColumnValue;
+use crate::decode::datum::Datum;
 use crate::decode::visibility::{PendingXids, PgXactView, XidStatus};
 use crate::emit::ch_emitter::EmitterStats;
 use crate::emit::pipeline::tail::OwnedTail;
@@ -163,16 +163,16 @@ fn pending_table_mapping(
 pub(crate) fn metadata_patch(
     tuple: &BackfillTuple,
     rel: &RelDescriptor,
-    out: &mut Vec<(usize, ColumnValue)>,
+    out: &mut Vec<(usize, Datum)>,
 ) {
     let Some(pending) = tuple.pending else {
         return;
     };
     let base = metadata_base(rel);
     out.extend([
-        (base, ColumnValue::Oid(pending.insert)),
-        (base + 1, ColumnValue::Oid(pending.delete)),
-        (base + 2, ColumnValue::Int2(tuple.infomask as i16)),
+        (base, Datum::fixed(&pending.insert.to_le_bytes())),
+        (base + 1, Datum::fixed(&pending.delete.to_le_bytes())),
+        (base + 2, Datum::fixed(&tuple.infomask.to_le_bytes())),
     ]);
 }
 
@@ -929,6 +929,7 @@ fn xid_list(xids: &[u32]) -> String {
 mod tests {
     use super::*;
     use crate::backfill::backup_page_walk::{TupleData, make_rel_named};
+    use crate::decode::datum::build;
 
     fn manifest(rel: &str, xids: Vec<u32>) -> PendingManifest {
         PendingManifest {
@@ -987,7 +988,7 @@ mod tests {
             page_lsn: 0,
             blkno: 0,
             offnum: 0,
-            data: TupleData::from_cells(&[Some(ColumnValue::Int4(1))]),
+            data: TupleData::from_cells(&[Some(build::int4(1))]),
             pending: Some(PendingXids {
                 insert: 100,
                 delete: 200,
@@ -1015,10 +1016,10 @@ mod tests {
         assert_eq!(
             chunks[0].1.cells(),
             [[
-                ColumnValue::Int4(1),
-                ColumnValue::Int4(100),
-                ColumnValue::Int4(200),
-                ColumnValue::Int2(0x0100),
+                build::int4(1),
+                build::int4(100),
+                build::int4(200),
+                build::int2(0x0100),
             ]],
         );
     }

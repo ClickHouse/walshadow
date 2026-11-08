@@ -16,8 +16,9 @@ use walrus::pg::walparser::{
 };
 use walshadow::backup_page_walk::{BackfillTuple, TupleData};
 use walshadow::ch_emitter::EncodedChunk;
+use walshadow::datum::build;
 use walshadow::emit::route::RouteSnapshot;
-use walshadow::heap_decoder::{ColumnValue, DecodedHeap, DecodedTuple, DescribedHeap, HeapOp};
+use walshadow::heap_decoder::{DecodedHeap, DecodedTuple, DescribedHeap, HeapOp};
 use walshadow::mapping::{ColumnMapping, TableMapping, TableTarget};
 use walshadow::pipeline::plan_spool::{PlanItem, PlanWriter, ViewChange};
 use walshadow::pipeline::planner::{PlanRouteView, Planner};
@@ -103,11 +104,8 @@ async fn deferred(args: &Args, repeat: usize) -> anyhow::Result<()> {
     let base = GLOBAL.reset_peak();
     let start = Instant::now();
     let data = |i: usize| {
-        let cells = [
-            Some(ColumnValue::Int4(i as i32)),
-            Some(ColumnValue::Text(payload.clone())),
-        ];
-        walshadow::heap_decoder::form_block_data(&cells).into_boxed_slice()
+        let cells = [Some(build::int4(i as i32)), Some(build::text(&payload))];
+        walshadow::heap_decoder::form_block_data(&[], &cells).into_boxed_slice()
     };
     let data_len = data(0).len();
     for i in 0..args.rows {
@@ -290,10 +288,7 @@ async fn plan(args: &Args, repeat: usize) -> anyhow::Result<()> {
                 source_lsn: i as u64,
                 op: HeapOp::Insert,
                 new: Some(DecodedTuple {
-                    columns: vec![
-                        Some(ColumnValue::Int4(i as i32)),
-                        Some(ColumnValue::Text(payload.clone())),
-                    ],
+                    columns: vec![Some(build::int4(i as i32)), Some(build::text(&payload))],
                     partial: false,
                 }),
                 old: None,

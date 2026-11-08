@@ -15,9 +15,10 @@ use walrus::pg::walparser::{Oid, RelFileNode, RmId};
 use crate::budget::{MemoryBudget, MemoryPermit, acquire_opt};
 use crate::catalog::desc_log::{DescriptorLog, DescriptorLogs};
 use crate::config::ResolvedConfig;
+use crate::decode::datum::Datum;
 use crate::decode::heap_decoder::{
-    ColumnValue, HeapOp, XLH_DELETE_IS_SUPER, XLOG_HEAP_DELETE, XLOG_HEAP_HOT_UPDATE,
-    XLOG_HEAP_INSERT, XLOG_HEAP_OPMASK, XLOG_HEAP_UPDATE, view_heap_record,
+    HeapOp, XLH_DELETE_IS_SUPER, XLOG_HEAP_DELETE, XLOG_HEAP_HOT_UPDATE, XLOG_HEAP_INSERT,
+    XLOG_HEAP_OPMASK, XLOG_HEAP_UPDATE, view_heap_record,
 };
 use crate::decode::visibility::PgXactPatch;
 use crate::decode::wal_xact::{
@@ -716,7 +717,7 @@ impl WalReplaySink {
                 continue;
             }
             let sites = external_sites([h.new.as_ref(), h.old.as_ref()]);
-            let mut patches: [Vec<(usize, ColumnValue)>; 2] = Default::default();
+            let mut patches: [Vec<(usize, Datum)>; 2] = Default::default();
             let mut permit = None;
             if !sites.is_empty() {
                 // Make earlier commits available before resolving values.
@@ -725,7 +726,7 @@ impl WalReplaySink {
                 self.flush_rows().await?;
                 let db = rel.rfn.db_node;
                 let (values, leaf) =
-                    detoast_sites(&sites, rel, db, lsn, at.spool, at.ref_maps, &self.resolver)
+                    detoast_sites(&sites, db, lsn, at.spool, at.ref_maps, &self.resolver)
                         .await
                         .map_err(SinkError::from)?;
                 for (site, v) in sites.iter().zip(values) {
@@ -948,6 +949,7 @@ pub async fn pump_segments_through(
 mod tests {
     use super::*;
     use crate::catalog::desc_log::DescLogIdentity;
+    use crate::decode::datum::build;
     use crate::decode::heap_decoder::SIZE_OF_HEAP_UPDATE;
     use crate::decode::visibility::{PgXactAccum, PgXactView, SealedPatch, XidStatus};
     use crate::decode::wal_xact::{
@@ -1641,9 +1643,7 @@ mod tests {
 
     #[tokio::test]
     async fn error_between_commits_ships_committed_rows() {
-        use crate::decode::heap_decoder::{
-            ColumnValue, DecodedHeap, DecodedTuple, DescribedHeap, HeapOp,
-        };
+        use crate::decode::heap_decoder::{DecodedHeap, DecodedTuple, DescribedHeap, HeapOp};
         use crate::mapping::{ColumnMapping, TableMapping, TableTarget};
         use crate::schema::{RelName, ReplIdent};
         use walrus::pg::walparser::RelFileNode;
@@ -1696,7 +1696,7 @@ mod tests {
                     source_lsn: 10,
                     op: HeapOp::Insert,
                     new: Some(DecodedTuple {
-                        columns: vec![Some(ColumnValue::Int4(1))],
+                        columns: vec![Some(build::int4(1))],
                         partial: false,
                     }),
                     old: None,

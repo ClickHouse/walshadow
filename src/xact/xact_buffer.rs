@@ -51,14 +51,13 @@ use crate::catalog::desc_log::{
     Ambiguity, DescriptorLog, DescriptorLogs, LogEntry, LogValue, LookupResult,
 };
 use crate::catalog::pending::{PendingCatalog, PendingSlot};
-use crate::decode::datum::DatumRef;
+use crate::decode::datum::{Datum, DatumRef};
 use crate::decode::decoder_sink::{DecoderSinkError, DecoderStats, SkipReason};
-use crate::decode::heap_decoder::{
-    ColumnValue, HeapImages, HeapOp, ToastPointer, TupleView, decode_heap_record, record_shape,
-    view_heap_record,
-};
 #[cfg(any(test, feature = "test-support"))]
 use crate::decode::heap_decoder::{DecodedHeap, DescribedHeap};
+use crate::decode::heap_decoder::{
+    HeapImages, HeapOp, ToastPointer, TupleView, decode_heap_record, record_shape, view_heap_record,
+};
 #[cfg(test)]
 use crate::decode::wal_xact::{
     XACT_XINFO_HAS_DBINFO, XACT_XINFO_HAS_GID, XACT_XINFO_HAS_INVALS, XACT_XINFO_HAS_SUBXACTS,
@@ -2489,22 +2488,13 @@ pub async fn detoast_heap(
     let mut sites = Vec::new();
     for (image, t) in images.iter().enumerate() {
         for (idx, c) in t.iter().flat_map(|t| t.columns.iter().enumerate()) {
-            if let Some(ColumnValue::ExternalToast(p)) = *c {
+            if let Some(Datum::External(p)) = *c {
                 sites.push(ToastSite { image, idx, p });
             }
         }
     }
     let (lsn, db) = (heap.decoded.source_lsn, heap.decoded.rfn.db_node);
-    let (values, permit) = detoast_sites(
-        &sites,
-        &heap.descriptor,
-        db,
-        lsn,
-        spool,
-        chunk_maps,
-        resolver,
-    )
-    .await?;
+    let (values, permit) = detoast_sites(&sites, db, lsn, spool, chunk_maps, resolver).await?;
     for (site, value) in sites.iter().zip(values) {
         if let Some(t) = images[site.image].as_mut() {
             t.columns[site.idx] = Some(value);
@@ -2520,9 +2510,6 @@ pub async fn detoast_heap(
 /// without budget or external values
 pub async fn detoast_sites(
     sites: &[ToastSite],
-    // Attached at decode: same descriptor interpretation from decode to
-    // detoast regardless of captures landing in between
-    rel: &RelDescriptor,
     db: u32,
     lsn: u64,
     // Xact body spool backing `File` refs; None while memory-resident
@@ -2532,17 +2519,12 @@ pub async fn detoast_sites(
     // parallel path)
     chunk_maps: &[&ChunkRefMap],
     resolver: &ToastResolver,
-) -> std::result::Result<(Vec<ColumnValue>, Option<crate::budget::MemoryPermit>), XactBufferError> {
-    let type_oid = |site: &ToastSite| rel.attributes.get(site.idx).map_or(0, |a| a.type_oid);
+) -> std::result::Result<(Vec<Datum>, Option<crate::budget::MemoryPermit>), XactBufferError> {
     // Transfer speculative values before admitting foreground resolution
     let mut ahead = None;
-    let mut values: Vec<Option<ColumnValue>> = Vec::with_capacity(sites.len());
+    let mut values: Vec<Option<Datum>> = Vec::with_capacity(sites.len());
     for site in sites {
-        values.push(
-            resolver
-                .take_ahead(db, &site.p, type_oid(site), lsn, &mut ahead)
-                .await,
-        );
+        values.push(resolver.take_ahead(db, &site.p, lsn, &mut ahead).await);
     }
     let mut pointers: Vec<ToastPointer> = sites
         .iter()
@@ -2582,7 +2564,7 @@ pub async fn detoast_sites(
         .zip(values)
         .map(|(site, v)| match v {
             Some(v) => Ok(v),
-            None => res.resolve(&site.p, type_oid(site)),
+            None => res.resolve(&site.p),
         })
         .collect::<std::result::Result<Vec<_>, _>>()?;
     if let Some(p) = leaf.as_mut() {
@@ -2731,7 +2713,7 @@ pub(crate) fn fill_store_miss(
     p: &ToastPointer,
     resolver: &ToastResolver,
     policy: MissPolicy,
-) -> std::result::Result<ColumnValue, String> {
+) -> std::result::Result<Datum, String> {
     match (miss, policy) {
         (StoreMiss::NoStore, _) => resolver.note_filled_default(),
         (StoreMiss::Generation, _) => resolver.note_filled_generation(),
@@ -2751,7 +2733,7 @@ pub(crate) fn fill_store_miss(
             ));
         }
     }
-    Ok(ColumnValue::Null)
+    Ok(Datum::Null)
 }
 
 /// Per-heap value resolution over prefetched store values, decoded bytes
@@ -2768,13 +2750,9 @@ struct ValueResolution<'a> {
 }
 
 impl ValueResolution<'_> {
-    fn resolve(
-        &mut self,
-        p: &ToastPointer,
-        type_oid: u32,
-    ) -> std::result::Result<ColumnValue, XactBufferError> {
+    fn resolve(&mut self, p: &ToastPointer) -> std::result::Result<Datum, XactBufferError> {
         if self.resolver.fills_oversize(p) {
-            return Ok(ColumnValue::Null);
+            return Ok(Datum::Null);
         }
         let key = (p.va_toastrelid, p.va_valueid);
         let Some(v) = self
@@ -2783,11 +2761,11 @@ impl ValueResolution<'_> {
             .find_map(|m| m.get(&key))
             .filter(|v| !observed_mid_value(v))
         else {
-            return self.resolve_store(p, type_oid);
+            return self.resolve_store(p);
         };
         match reassemble_value_ref(p, self.spool, v)? {
             Reassembled::Bytes(raw) => {
-                let (value, held) = detoasted_sized(raw, type_oid);
+                let (value, held) = detoasted_sized(raw);
                 self.retained += held;
                 Ok(value)
             }
@@ -2796,7 +2774,7 @@ impl ValueResolution<'_> {
             // never an error.
             Reassembled::Missing if self.resolver.fill_on_miss() => {
                 self.resolver.note_filled_default();
-                Ok(ColumnValue::Null)
+                Ok(Datum::Null)
             }
             // In-xact chunks gapped or short: decode bug, surfaced loud
             outcome => {
@@ -2819,11 +2797,7 @@ impl ValueResolution<'_> {
     /// Pre-window / bootstrap value whose chunks aren't in this xact,
     /// assembled by [`prefetch_store_values`] against the pointer's
     /// stored size
-    fn resolve_store(
-        &mut self,
-        p: &ToastPointer,
-        type_oid: u32,
-    ) -> std::result::Result<ColumnValue, XactBufferError> {
+    fn resolve_store(&mut self, p: &ToastPointer) -> std::result::Result<Datum, XactBufferError> {
         let key = (p.va_toastrelid, p.va_valueid);
         let cached = if self.resolver.fill_on_miss() {
             Err(StoreMiss::NoStore)
@@ -2839,7 +2813,7 @@ impl ValueResolution<'_> {
         };
         match cached {
             Ok(raw) => {
-                let (value, held) = detoasted_sized(raw, type_oid);
+                let (value, held) = detoasted_sized(raw);
                 self.retained += held;
                 Ok(value)
             }
@@ -2984,7 +2958,7 @@ fn read_ahead_kept(
             continue;
         }
         for t in [&d.new, &d.old].into_iter().flatten() {
-            for (datum, attr) in t.datums.iter().zip(&rel.attributes) {
+            for datum in &t.datums {
                 if let &DatumRef::External(p) = datum {
                     let recent = born
                         .lock()
@@ -2992,7 +2966,7 @@ fn read_ahead_kept(
                         .counts
                         .contains_key(&(p.va_toastrelid, p.va_valueid));
                     if !recent {
-                        ahead.read_ahead(rel.rfn.db_node, p, attr.type_oid, source_lsn);
+                        ahead.read_ahead(rel.rfn.db_node, p, source_lsn);
                     }
                 }
             }
@@ -3888,6 +3862,7 @@ mod tests {
 
     use super::raw_fixtures::*;
     use super::*;
+    use crate::decode::datum::{Datum, build};
     use crate::decode::heap_decoder::{DecodedTuple, HeapOp, VARLENA_EXTSIZE_BITS};
     use crate::emit::ch_emitter::InlineValueOverflow;
     use tempfile::tempdir;
@@ -3948,7 +3923,7 @@ mod tests {
                 source_lsn: lsn,
                 op: HeapOp::Insert,
                 new: Some(DecodedTuple {
-                    columns: vec![Some(ColumnValue::Bytea(vec![0u8; payload_size]))],
+                    columns: vec![Some(build::bytes(vec![0u8; payload_size]))],
                     partial: false,
                 }),
                 old: None,
@@ -4345,11 +4320,14 @@ mod tests {
             ],
         };
         use crate::decode::heap_decoder::{form_block_data, view_block_data};
-        let full = form_block_data(&[
-            Some(ColumnValue::Oid(55)),
-            Some(ColumnValue::Int4(2)),
-            Some(ColumnValue::Bytea(b"hello".to_vec())),
-        ]);
+        let full = form_block_data(
+            &rel.attributes,
+            &[
+                Some(build::oid(55)),
+                Some(build::int4(2)),
+                Some(build::bytes(b"hello")),
+            ],
+        );
         let view = view_block_data(&full, &rel).unwrap();
         let chunk = toast_chunk(&view, &rel, 0x1234, Some((7, 3))).expect("recognised toast shape");
         assert_eq!(chunk.toast_relid, 99); // pg_class.oid, not rel_node
@@ -4357,94 +4335,30 @@ mod tests {
         assert_eq!(chunk.chunk_seq, 2);
         assert_eq!(&chunk.chunk_data[..], b"hello");
         assert_eq!((chunk.blkno, chunk.offnum), (7, 3));
-        let short = form_block_data(&[Some(ColumnValue::Oid(55)), Some(ColumnValue::Int4(2))]);
+        let short = form_block_data(
+            &rel.attributes,
+            &[Some(build::oid(55)), Some(build::int4(2))],
+        );
         let view = view_block_data(&short, &rel).unwrap();
         assert!(toast_chunk(&view, &rel, 0, None).is_none());
     }
 
+    /// Detoasted bodies stay stored bytes, whatever their type, and hold
+    /// exactly their length
     #[test]
-    fn detoasted_sized_routes_tier3_like_inline() {
-        use crate::schema::{BYTEAOID, TEXTOID};
-        /// Fringe varlena type with no local codec
-        const TSVECTOROID: u32 = 3614;
-        assert!(
-            matches!(detoasted_sized(b"raw".to_vec(), BYTEAOID), (ColumnValue::Bytea(b), 3) if b == b"raw")
-        );
-        assert!(
-            matches!(detoasted_sized(b"hi".to_vec(), TEXTOID), (ColumnValue::Text(s), 2) if s == "hi")
-        );
-        // Tier 3 lands as PgPending carrying the body so the oracle resolves
-        // it like an inline value, not Unsupported
+    fn detoasted_values_stay_stored() {
+        assert_eq!(detoasted_sized(b"raw".to_vec()), (build::bytes(b"raw"), 3));
+        let jsonb = 0x2000_0000u32.to_le_bytes().to_vec();
         assert_eq!(
-            detoasted_sized(b"\x01body".to_vec(), TSVECTOROID),
-            (
-                ColumnValue::PgPending {
-                    type_oid: TSVECTOROID,
-                    raw: b"\x01body".to_vec(),
-                },
-                5
-            )
-        );
-    }
-
-    /// Numeric text outgrows its base-10000 digits, so admission sees text size
-    #[test]
-    fn detoasted_numeric_admits_its_text() {
-        use crate::schema::NUMERICOID;
-        // 10^12: long form, weight 3, one digit group
-        let raw = vec![0, 0, 3, 0, 1, 0];
-        let text = "1000000000000";
-        assert_eq!(
-            crate::toast::detoasted_within(raw.clone(), NUMERICOID, |peak| {
-                assert_eq!(peak, text.len());
+            crate::toast::detoasted_within(jsonb.clone(), |held| {
+                assert_eq!(held, 4);
                 false
             }),
             None
         );
         assert_eq!(
-            detoasted_sized(raw, NUMERICOID),
-            (
-                ColumnValue::Numeric(crate::decode::codecs::NumericKind::Finite(text.into())),
-                text.len()
-            )
-        );
-    }
-
-    /// A detoasted jsonb renders through its codec, same as an inline one,
-    /// holding exactly its text
-    #[test]
-    fn detoasted_jsonb_renders_its_document() {
-        use crate::schema::JSONBOID;
-        let empty = 0x2000_0000u32.to_le_bytes().to_vec();
-        assert_eq!(
-            detoasted_sized(empty, JSONBOID),
-            (ColumnValue::Json("{}".into()), 2)
-        );
-        let mut escaped = 0x5000_0001u32.to_le_bytes().to_vec();
-        escaped.extend_from_slice(&4u32.to_le_bytes());
-        escaped.extend_from_slice(&[1; 4]);
-        let text = r#""\u0001\u0001\u0001\u0001""#;
-        assert_eq!(
-            detoasted_sized(escaped.clone(), JSONBOID),
-            (ColumnValue::Json(text.into()), text.len())
-        );
-        assert_eq!(
-            crate::toast::detoasted_within(escaped, JSONBOID, |peak| {
-                assert_eq!(peak, text.len(), "text outgrows its 12 raw bytes");
-                false
-            }),
-            None
-        );
-        let malformed = vec![0u8; 3];
-        assert_eq!(
-            detoasted_sized(malformed.clone(), JSONBOID),
-            (
-                ColumnValue::Unsupported {
-                    type_oid: JSONBOID,
-                    raw: malformed
-                },
-                3
-            )
+            crate::toast::detoasted_within(jsonb.clone(), |_| true),
+            Some((build::bytes(&jsonb), 4))
         );
     }
 
@@ -4483,7 +4397,7 @@ mod tests {
 
     fn toast_ptr_tuple(value_id: u32) -> DecodedTuple {
         DecodedTuple {
-            columns: vec![Some(ColumnValue::ExternalToast(ToastPointer {
+            columns: vec![Some(Datum::External(ToastPointer {
                 va_rawsize: 8,
                 va_extinfo: 4, // 4 bytes, uncompressed
                 va_valueid: value_id,
@@ -4516,10 +4430,10 @@ mod tests {
             .with_budget(budget.clone())
             .with_read_ahead();
         let tuple = toast_ptr_tuple(55);
-        let Some(ColumnValue::ExternalToast(p)) = tuple.columns[0] else {
+        let Some(Datum::External(p)) = tuple.columns[0] else {
             panic!("pointer")
         };
-        resolver.read_ahead(5, p, crate::schema::BYTEAOID, 0x100);
+        resolver.read_ahead(5, p, 0x100);
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
             while stats.toast_values_fetched.load(Ordering::Relaxed) == 0 {
                 tokio::task::yield_now().await;
@@ -4538,7 +4452,7 @@ mod tests {
         let (heap, permit) = resolve.await.unwrap();
         assert_eq!(
             heap.decoded.new.as_ref().unwrap().columns[0],
-            Some(ColumnValue::Bytea(b"abcd".to_vec()))
+            Some(build::bytes(b"abcd"))
         );
         assert!(budget.resident_bytes() >= 1024 + 4);
         assert_eq!(budget.waits_total(), 0);
@@ -4634,7 +4548,7 @@ mod tests {
             .await
             .expect("fills instead of failing");
         for t in [&heap.decoded.new, &heap.decoded.old] {
-            assert_eq!(t.as_ref().unwrap().columns[0], Some(ColumnValue::Null));
+            assert_eq!(t.as_ref().unwrap().columns[0], Some(Datum::Null));
         }
         assert_eq!(stats.toast_values_filled_oversize.load(Relaxed), 2);
         assert_eq!(stats.toast_values_filled_default.load(Relaxed), 0);
@@ -4682,12 +4596,10 @@ mod tests {
         fn resolve_tuple(
             &mut self,
             t: &mut crate::decode::heap_decoder::DecodedTuple,
-            rel: &RelDescriptor,
         ) -> std::result::Result<(), XactBufferError> {
-            for (idx, col) in t.columns.iter_mut().enumerate() {
-                if let Some(ColumnValue::ExternalToast(p)) = *col {
-                    let type_oid = rel.attributes.get(idx).map_or(0, |a| a.type_oid);
-                    *col = Some(self.resolve(&p, type_oid)?);
+            for col in t.columns.iter_mut() {
+                if let Some(Datum::External(p)) = *col {
+                    *col = Some(self.resolve(&p)?);
                 }
             }
             Ok(())
@@ -4739,7 +4651,7 @@ mod tests {
             let mut errs = Vec::new();
             for miss in misses {
                 match fill_store_miss(miss, &p, &resolver, policy) {
-                    Ok(v) => assert_eq!(v, ColumnValue::Null),
+                    Ok(v) => assert_eq!(v, Datum::Null),
                     Err(detail) => errs.push(detail),
                 }
             }
@@ -4767,7 +4679,6 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn value_observed_mid_write_resolves_from_store() {
-        let rel = bytea_rel();
         let stats = Arc::new(crate::emit::ch_emitter::EmitterStats::default());
         let resolver =
             ToastResolver::with_store(Arc::new(crate::toast::MemChunkStore::new()), stats.clone());
@@ -4778,15 +4689,15 @@ mod tests {
         let mut t = toast_ptr_tuple(55);
         let cache = HashMap::from_iter([(key, Ok(b"abcd".to_vec()))]);
         seeded(&resolver, None, &maps, cache)
-            .resolve_tuple(&mut t, &rel)
+            .resolve_tuple(&mut t)
             .unwrap();
-        assert_eq!(t.columns[0], Some(ColumnValue::Bytea(b"abcd".to_vec())));
+        assert_eq!(t.columns[0], Some(build::bytes(b"abcd")));
 
         let gapped_tail = mem_refs(key, &[(1, b"c"), (3, b"d")]);
         let maps = [&gapped_tail];
         let mut t = toast_ptr_tuple(55);
         let err = seeded(&resolver, None, &maps, HashMap::new())
-            .resolve_tuple(&mut t, &rel)
+            .resolve_tuple(&mut t)
             .expect_err("a gap after the first observed chunk stays loud");
         assert!(
             matches!(err, XactBufferError::MissingToastChunk { .. }),
@@ -4808,7 +4719,6 @@ mod tests {
     /// disabled mode NULL-fills + counts default.
     #[tokio::test(flavor = "current_thread")]
     async fn resolve_tuple_splits_in_xact_gap_from_store_miss() {
-        let rel = bytea_rel();
         let tmp = tempdir().unwrap();
         let stats = Arc::new(crate::emit::ch_emitter::EmitterStats::default());
         let store_resolver =
@@ -4820,8 +4730,8 @@ mod tests {
         let mut t = toast_ptr_tuple(55);
         let cache = HashMap::from_iter([(key, Err(StoreMiss::Missing))]);
         let mut r = seeded(&store_resolver, None, &[], cache);
-        r.resolve_tuple(&mut t, &rel).unwrap();
-        assert_eq!(t.columns[0], Some(ColumnValue::Null));
+        r.resolve_tuple(&mut t).unwrap();
+        assert_eq!(t.columns[0], Some(Datum::Null));
         assert_eq!(r.retained, 0, "fills retain nothing");
         assert_eq!(
             stats
@@ -4835,7 +4745,7 @@ mod tests {
         let maps = [&gapped];
         let mut t = toast_ptr_tuple(55);
         let err = seeded(&store_resolver, None, &maps, HashMap::new())
-            .resolve_tuple(&mut t, &rel)
+            .resolve_tuple(&mut t)
             .expect_err("in-xact gap surfaces");
         assert!(matches!(
             err,
@@ -4853,8 +4763,8 @@ mod tests {
         let maps = [&whole];
         let mut t = toast_ptr_tuple(55);
         let mut r = seeded(&store_resolver, None, &maps, HashMap::new());
-        r.resolve_tuple(&mut t, &rel).unwrap();
-        assert_eq!(t.columns[0], Some(ColumnValue::Bytea(b"abcd".to_vec())));
+        r.resolve_tuple(&mut t).unwrap();
+        assert_eq!(t.columns[0], Some(build::bytes(b"abcd")));
         assert_eq!(r.retained, 4, "decoded bytes tally for the permit shrink");
 
         // In-xact file refs resolve through the spool
@@ -4867,16 +4777,16 @@ mod tests {
             &maps,
             HashMap::new(),
         )
-        .resolve_tuple(&mut t, &rel)
+        .resolve_tuple(&mut t)
         .unwrap();
-        assert_eq!(t.columns[0], Some(ColumnValue::Bytea(b"abcd".to_vec())));
+        assert_eq!(t.columns[0], Some(build::bytes(b"abcd")));
 
         // Store-resolved hit lands assembled bytes
         let mut t = toast_ptr_tuple(55);
         let cache = HashMap::from_iter([(key, Ok(b"abcd".to_vec()))]);
         let mut r = seeded(&store_resolver, None, &[], cache);
-        r.resolve_tuple(&mut t, &rel).unwrap();
-        assert_eq!(t.columns[0], Some(ColumnValue::Bytea(b"abcd".to_vec())));
+        r.resolve_tuple(&mut t).unwrap();
+        assert_eq!(t.columns[0], Some(build::bytes(b"abcd")));
         assert_eq!(r.retained, 4);
         assert!(r.cache.is_empty(), "last use moves the buffer out");
 
@@ -4885,9 +4795,9 @@ mod tests {
         let mut t = toast_ptr_tuple(55);
         let cache = HashMap::from_iter([(key, Err(StoreMiss::Mismatch { got: 3 }))]);
         seeded(&store_resolver, None, &[], cache)
-            .resolve_tuple(&mut t, &rel)
+            .resolve_tuple(&mut t)
             .unwrap();
-        assert_eq!(t.columns[0], Some(ColumnValue::Null));
+        assert_eq!(t.columns[0], Some(Datum::Null));
         assert_eq!(
             stats
                 .toast_values_filled_mismatch
@@ -4908,7 +4818,7 @@ mod tests {
         let maps = [&xact_short];
         let mut t = toast_ptr_tuple(55);
         let err = seeded(&store_resolver, None, &maps, HashMap::new())
-            .resolve_tuple(&mut t, &rel)
+            .resolve_tuple(&mut t)
             .expect_err("in-xact size mismatch surfaces");
         assert!(matches!(err, XactBufferError::Detoast(_)));
 
@@ -4916,9 +4826,9 @@ mod tests {
         let disabled = ToastResolver::disabled();
         let mut t = toast_ptr_tuple(55);
         seeded(&disabled, None, &[], HashMap::new())
-            .resolve_tuple(&mut t, &rel)
+            .resolve_tuple(&mut t)
             .unwrap();
-        assert_eq!(t.columns[0], Some(ColumnValue::Null));
+        assert_eq!(t.columns[0], Some(Datum::Null));
     }
 
     /// Store fetch runs once per key in one round trip: decode once,
@@ -4960,11 +4870,11 @@ mod tests {
             cache,
             retained: 0,
         };
-        let first = r.resolve_store(&p, 17).unwrap();
+        let first = r.resolve_store(&p).unwrap();
         assert!(!r.cache.is_empty(), "pending duplicate use stays cached");
-        let second = r.resolve_store(&p, 17).unwrap();
-        assert_eq!(first, ColumnValue::Bytea(b"abcd".to_vec()));
-        assert_eq!(second, ColumnValue::Bytea(b"abcd".to_vec()));
+        let second = r.resolve_store(&p).unwrap();
+        assert_eq!(first, build::bytes(b"abcd"));
+        assert_eq!(second, build::bytes(b"abcd"));
         assert!(r.cache.is_empty(), "last use moves the buffer out");
         assert_eq!(r.retained, 8, "both uses retain their copy");
         assert_eq!(
@@ -5271,7 +5181,7 @@ mod tests {
             assert_eq!(h.decoded.xid, 8, "writer xid survives subxact merge");
             assert_eq!(h.descriptor_valid_from, 0x50);
             let new = h.decoded.new.as_ref().unwrap();
-            assert_eq!(new.columns[0], Some(ColumnValue::Int4(*expected)));
+            assert_eq!(new.columns[0], Some(build::int4(*expected)));
         }
         assert_eq!(
             batch.cells().unwrap()[3].decoded.source_lsn,
@@ -5815,7 +5725,7 @@ mod tests {
         );
         let cells = batch.cells().unwrap();
         let new = cells[0].decoded.new.as_ref().unwrap();
-        assert_eq!(new.columns[0], Some(ColumnValue::Int4(7)));
+        assert_eq!(new.columns[0], Some(build::int4(7)));
         drain.finish().await.unwrap();
     }
 
@@ -5931,7 +5841,7 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .columns[0],
-            Some(ColumnValue::Int4(9)),
+            Some(build::int4(9)),
         );
         drain.finish().await.unwrap();
     }
@@ -6793,7 +6703,7 @@ mod tests {
             .iter()
             .map(|h| h.decoded.new.as_ref().unwrap().columns[0].clone())
             .collect();
-        let int4 = |v| Some(ColumnValue::Int4(v));
+        let int4 = |v| Some(build::int4(v));
         assert_eq!(
             values,
             [int4(1), int4(10), int4(2), int4(20), int4(3), int4(30)]

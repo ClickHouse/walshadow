@@ -417,6 +417,7 @@ mod tests {
     use super::*;
     use crate::backfill::backup_page_walk::{PAGE_BYTES, make_rel, synth_single_tuple_page};
     use crate::backfill::backup_source::{BackupSink, BackupSource, FileMeta};
+    use crate::decode::datum::build;
     use async_trait::async_trait;
     use walrus::pg::backup::tarball::{Entry, Kind, Reader, Writer};
 
@@ -540,9 +541,6 @@ mod tests {
         assert_eq!(tuple.source_lsn, 0xDEAD_BEEF);
         assert_eq!(tuple.xid, 99);
         let columns = tuple.cells(&make_rel()).unwrap();
-        assert_eq!(
-            columns,
-            [Some(crate::decode::heap_decoder::ColumnValue::Int4(42))]
-        );
+        assert_eq!(columns, [Some(build::int4(42))]);
     }
 }

@@ -211,7 +211,7 @@ pub struct RelAttr {
     pub missing_default: Option<MissingDefault>,
 }
 
-/// Fast default (`attmissingval`), decoded by `missing_value_for`. Shadow
+/// Fast default (`attmissingval`), read by `missing_datum`. Shadow
 /// catalog reads yield `Raw` on-disk bytes; `Text` (element's `anyarray_out`
 /// form) comes from source-PG SQL, which has no way to the bytes, oracle
 /// rendered DDL defaults, and descriptor logs older than raw shadow reads

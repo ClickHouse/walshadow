@@ -37,7 +37,7 @@ use walrus::pg::replication::conn::PgConfig;
 use walrus::pg::replication::tls::{SslMode, TlsParams};
 use walshadow::backfill_bootstrap::{BootstrapConfig, run_greenfield_bootstrap, seed_in_snapshot};
 use walshadow::backup_source_direct::DirectSource;
-use walshadow::heap_decoder::ColumnValue;
+use walshadow::datum::Datum;
 use walshadow::shadow::{Shadow, ShadowConfig};
 
 /// Same row budget as the object-store sibling: one heap page worth so
@@ -259,7 +259,8 @@ async fn direct_source_self_hosted_via_replication_protocol() {
         let rel = catalog_map
             .get(t.rfn.db_node, t.rfn.rel_node)
             .expect("descriptor");
-        if let Some(Some(ColumnValue::Int4(v))) = t.cells(&rel).expect("cells").first() {
+        if let Some(Some(Datum::Fixed(v))) = t.cells(&rel).expect("cells").first() {
+            let v = &i32::from_le_bytes(v.as_slice().try_into().expect("int4"));
             int_ids.insert(*v);
         }
     }

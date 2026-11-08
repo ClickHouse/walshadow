@@ -88,7 +88,7 @@ impl PlacedSegment {
 #[cfg(test)]
 pub(crate) fn segment_rows(
     segments: &[PlacedSegment],
-) -> Vec<(u64, Vec<crate::decode::heap_decoder::ColumnValue>)> {
+) -> Vec<(u64, Vec<crate::decode::datum::Datum>)> {
     segments
         .iter()
         .flat_map(|s| {
@@ -616,9 +616,8 @@ async fn flush_all(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::decode::heap_decoder::{
-        ColumnValue, CommittedTuple, DecodedHeap, DecodedTuple, HeapOp,
-    };
+    use crate::decode::datum::build;
+    use crate::decode::heap_decoder::{CommittedTuple, DecodedHeap, DecodedTuple, HeapOp};
     use crate::mapping::{ColumnMapping, TableMapping, TableTarget};
     use crate::schema::{RelAttr, RelDescriptor, RelName, ReplIdent};
     use tokio::sync::oneshot;
@@ -705,7 +704,7 @@ mod tests {
                     source_lsn: 0x1000 + id as u64,
                     op: HeapOp::Insert,
                     new: Some(DecodedTuple {
-                        columns: vec![Some(ColumnValue::Int4(id))],
+                        columns: vec![Some(build::int4(id))],
                         partial: false,
                     }),
                     old: None,
@@ -1141,7 +1140,7 @@ mod tests {
             let (rel, route) = text_table("String");
             let mut r = tuple(i, 1);
             r.1.decoded.new.as_mut().unwrap().columns =
-                vec![Some(ColumnValue::Text("x".repeat(64 << 10)))];
+                vec![Some(build::text("x".repeat(64 << 10)))];
             tx.send(one(rel, route, r)).await.unwrap();
         }
         let first = rx.recv().await.unwrap();
@@ -1179,7 +1178,7 @@ mod tests {
 
     fn text_row(seq: u64, id: i32, text: &str) -> (u64, CommittedTuple) {
         let mut r = tuple(seq, id);
-        r.1.decoded.new.as_mut().unwrap().columns = vec![Some(ColumnValue::Text(text.into()))];
+        r.1.decoded.new.as_mut().unwrap().columns = vec![Some(build::text(text))];
         r
     }
 

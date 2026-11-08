@@ -39,7 +39,8 @@
 
 use std::sync::Arc;
 
-use crate::decode::heap_decoder::{ColumnValue, view_heap_record};
+use crate::decode::datum::Datum;
+use crate::decode::heap_decoder::view_heap_record;
 use crate::emit::pipeline::plan_spool::{
     DEFAULT_PLAN_MEM_MAX, EncoderCache, PlanPath, PlanSpoolError, PlanWriter, SealedPlan,
     ViewChange,
@@ -241,13 +242,13 @@ impl<'a, V: PlanRouteView> Planner<'a, V> {
             if h.new.as_ref().is_some_and(|t| t.partial) {
                 return Err(PlanError::PartialUpdate { lsn });
             }
-            let mut patches: [Vec<(usize, ColumnValue)>; 2] = Default::default();
+            let mut patches: [Vec<(usize, Datum)>; 2] = Default::default();
             let sites = external_sites([h.new.as_ref(), h.old.as_ref()]);
             if !sites.is_empty() {
                 let db = rel.rfn.db_node;
                 // Value permit drops once bytes land in the plan
                 let (values, _permit) =
-                    detoast_sites(&sites, rel, db, lsn, spool, ref_maps, self.resolver).await?;
+                    detoast_sites(&sites, db, lsn, spool, ref_maps, self.resolver).await?;
                 for (site, v) in sites.iter().zip(values) {
                     patches[site.image].push((site.idx, v));
                 }
@@ -282,8 +283,9 @@ impl<'a, V: PlanRouteView> Planner<'a, V> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::decode::datum::{Datum, build};
     use crate::decode::heap_decoder::{
-        ColumnValue, DecodedHeap, DecodedTuple, DescribedHeap, HeapOp, ToastPointer,
+        DecodedHeap, DecodedTuple, DescribedHeap, HeapOp, ToastPointer,
     };
     use crate::emit::pipeline::plan_spool::PlanItem;
     use crate::mapping::{TableMapping, TableTarget};
@@ -391,7 +393,7 @@ mod tests {
         })
     }
 
-    fn heap(rel: &Arc<RelDescriptor>, lsn: u64, col: ColumnValue) -> DescribedHeap {
+    fn heap(rel: &Arc<RelDescriptor>, lsn: u64, col: Datum) -> DescribedHeap {
         DescribedHeap {
             decoded: DecodedHeap {
                 rfn: rel.rfn,
@@ -508,12 +510,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut b = XactBuffer::new(cfg(tmp.path().to_path_buf())).unwrap();
         let rel = descriptor(16600, INT4OID);
-        b.on_heap(heap(&rel, 100, ColumnValue::Int4(1)))
-            .await
-            .unwrap();
-        b.on_heap(heap(&rel, 120, ColumnValue::Int4(2)))
-            .await
-            .unwrap();
+        b.on_heap(heap(&rel, 100, build::int4(1))).await.unwrap();
+        b.on_heap(heap(&rel, 120, build::int4(2))).await.unwrap();
         b.on_schema_event(
             1,
             150,
@@ -523,9 +521,7 @@ mod tests {
                 partition: None,
             },
         );
-        b.on_heap(heap(&rel, 200, ColumnValue::Int4(3)))
-            .await
-            .unwrap();
+        b.on_heap(heap(&rel, 200, build::int4(3))).await.unwrap();
 
         let mut view = MapView {
             routes: HashMap::from_iter([(rel.rel_name.clone(), route())]),
@@ -594,13 +590,11 @@ mod tests {
         })
         .unwrap();
         let rel = descriptor(16601, TEXTOID);
-        b.on_heap(heap(&rel, 90, ColumnValue::Text("ok".into())))
-            .await
-            .unwrap();
+        b.on_heap(heap(&rel, 90, build::text("ok"))).await.unwrap();
         b.on_heap(heap(
             &rel,
             100,
-            ColumnValue::ExternalToast(ToastPointer {
+            Datum::External(ToastPointer {
                 va_rawsize: 64,
                 va_extinfo: 60,
                 va_valueid: 9999,
@@ -707,7 +701,7 @@ mod tests {
         // Encoded rows of empty mappings cost about 21 bytes each
         const ROWS: usize = 64 * 1024;
         for i in 0..ROWS {
-            b.on_heap(heap(&rel, 100 + i as u64, ColumnValue::Int4(i as i32)))
+            b.on_heap(heap(&rel, 100 + i as u64, build::int4(i as i32)))
                 .await
                 .unwrap();
         }
@@ -785,7 +779,7 @@ mod tests {
             )
             .await
             .unwrap();
-            b.on_heap(heap(&rel, lsn + 1, ColumnValue::Int4(seq as i32)))
+            b.on_heap(heap(&rel, lsn + 1, build::int4(seq as i32)))
                 .await
                 .unwrap();
         }
@@ -798,7 +792,7 @@ mod tests {
                 partition: None,
             },
         );
-        let mut truncate = heap(&rel, 105, ColumnValue::Int4(0));
+        let mut truncate = heap(&rel, 105, build::int4(0));
         truncate.decoded.op = HeapOp::Truncate;
         truncate.decoded.new = None;
         b.on_heap(truncate).await.unwrap();
@@ -858,7 +852,7 @@ mod tests {
             let tmp = tempfile::tempdir().unwrap();
             let mut b = XactBuffer::new(cfg(tmp.path().to_path_buf())).unwrap();
             let rel = descriptor(16607, INT4OID);
-            let mut partial = heap(&rel, 100, ColumnValue::Int4(1));
+            let mut partial = heap(&rel, 100, build::int4(1));
             partial.decoded.op = HeapOp::Update;
             partial.decoded.new.as_mut().unwrap().partial = true;
             b.on_heap(partial).await.unwrap();
@@ -913,7 +907,7 @@ mod tests {
         b.on_heap(heap(
             &rel,
             100,
-            ColumnValue::ExternalToast(ToastPointer {
+            Datum::External(ToastPointer {
                 va_rawsize: 64,
                 va_extinfo: 60,
                 va_valueid: 9999,
@@ -989,7 +983,7 @@ mod tests {
         rel: &Arc<RelDescriptor>,
         resolver: &ToastResolver,
         dir: &std::path::Path,
-    ) -> Vec<ColumnValue> {
+    ) -> Vec<Datum> {
         let mut view = MapView {
             routes: HashMap::from_iter([(rel.rel_name.clone(), text_route())]),
             dropped: HashSet::new(),
@@ -1032,9 +1026,9 @@ mod tests {
                     let body = &data[start..*end as usize];
                     start = *end as usize;
                     out.push(if *null == 1 {
-                        ColumnValue::Null
+                        Datum::Null
                     } else {
-                        ColumnValue::Text(String::from_utf8(body.to_vec()).unwrap())
+                        build::text(String::from_utf8(body.to_vec()).unwrap())
                     });
                 }
             }
@@ -1055,10 +1049,10 @@ mod tests {
         const OIDS: u32 = 5;
         let tmp = tempfile::tempdir().unwrap();
         let rel = descriptor(16699, TEXTOID);
-        let text = |body: &[u8]| ColumnValue::Text(String::from_utf8(body.to_vec()).unwrap());
+        let text = |body: &[u8]| build::text(String::from_utf8(body.to_vec()).unwrap());
         let row = |xid, lsn, op, vid| {
             let t = Some(DecodedTuple {
-                columns: vec![Some(ColumnValue::ExternalToast(ToastPointer {
+                columns: vec![Some(Datum::External(ToastPointer {
                     va_rawsize: 12,
                     va_extinfo: 8,
                     va_valueid: vid,
@@ -1206,9 +1200,9 @@ mod tests {
                     // Prescan reads ahead the values rows keep
                     if born.is_none()
                         && let Some(t) = h.decoded.new.as_ref().or(h.decoded.old.as_ref())
-                        && let Some(ColumnValue::ExternalToast(p)) = t.columns[0]
+                        && let Some(Datum::External(p)) = t.columns[0]
                     {
-                        ahead.read_ahead(rel.rfn.db_node, p, TEXTOID, h.decoded.source_lsn);
+                        ahead.read_ahead(rel.rfn.db_node, p, h.decoded.source_lsn);
                         tokio::task::yield_now().await;
                     }
                     if h.decoded.xid >= 1_000_000 {
@@ -1241,7 +1235,7 @@ mod tests {
                     assert_eq!(served.len(), want.len());
                     for ((w, r), s) in want.iter().zip(&read).zip(&served) {
                         assert!(
-                            s == w || r != w && *s == ColumnValue::Null,
+                            s == w || r != w && *s == Datum::Null,
                             "seed {seed} xid {xid}: {s:?} {r:?} {w:?}"
                         );
                     }

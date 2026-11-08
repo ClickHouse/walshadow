@@ -1203,7 +1203,7 @@ async fn session_body(
     } else {
         // Metrics-only (no CH): the identical pipeline with a null tail —
         // zero CH connections, no DDL applicator, no oracle (nothing ships,
-        // PgPending stays raw). The empty mapping routes nothing, so seqs
+        // out-of-matrix values stay stored bytes). The empty mapping routes nothing, so seqs
         // complete at placement and the watermark + slot advance move as in
         // a CH run. Emitter stats stay unexported (`emitter_stats_handle`
         // None), matching the old serial surface.

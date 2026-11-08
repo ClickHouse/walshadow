@@ -20,14 +20,16 @@ use std::sync::Arc;
 use walrus::pg::walparser::RelFileNode;
 use walshadow::ch::CompressionChoice;
 use walshadow::ch_emitter::{EmitterConfig, EmitterStats, InstanceConfig};
-use walshadow::codecs::NumericKind;
-use walshadow::heap_decoder::{ColumnValue, CommittedTuple, DecodedHeap, DecodedTuple, HeapOp};
+use walshadow::datum::build;
+use walshadow::heap_decoder::{CommittedTuple, DecodedHeap, DecodedTuple, HeapOp};
 use walshadow::mapping::{ColumnMapping, TableMapping, TableTarget};
 use walshadow::pipeline::ack::Publish;
 use walshadow::pipeline::batcher::{BatcherMsg, PlacedSegment};
 use walshadow::pipeline::{Fatal, tail};
 use walshadow::pos::{EmitterAck, Monotone};
-use walshadow::schema::{RelDescriptor, RelName, ReplIdent};
+use walshadow::schema::{
+    INT4OID, NUMERICOID, RelAttr, RelDescriptor, RelName, ReplIdent, TIMEOID, TIMETZOID,
+};
 
 const RFN: RelFileNode = RelFileNode {
     spc_node: 1663,
@@ -38,9 +40,29 @@ const RFN: RelFileNode = RelFileNode {
 // 12:34:56 = 45296 s = 45_296_000_000 µs since midnight.
 const MICROS: i64 = 45_296_000_000;
 
+/// Source attribute of `type_oid` stored `type_len` wide; encoding follows it
+fn attr(attnum: i16, name: &str, type_oid: u32, type_len: i16) -> RelAttr {
+    RelAttr {
+        attnum,
+        name: name.into(),
+        type_oid,
+        typmod: -1,
+        not_null: false,
+        dropped: false,
+        type_name: String::new(),
+        type_byval: type_len > 0 && type_len <= 8,
+        type_len,
+        type_align: if type_len == 8 || type_len == 12 {
+            'd'
+        } else {
+            'i'
+        },
+        type_storage: if type_len < 0 { 'x' } else { 'p' },
+        missing_default: None,
+    }
+}
+
 fn rel_descriptor() -> RelDescriptor {
-    // Encoding reads the mapping's target types, not these attributes,
-    // so a minimal descriptor (qualified_name + rfn) suffices.
     RelDescriptor {
         rfn: RFN,
         oid: 16385,
@@ -51,7 +73,13 @@ fn rel_descriptor() -> RelDescriptor {
         persistence: 'p',
         ancestors: Vec::new(),
         replident: ReplIdent::Default { pk_attnums: None },
-        attributes: vec![],
+        attributes: vec![
+            attr(1, "id", INT4OID, 4),
+            attr(2, "n", NUMERICOID, -1),
+            attr(3, "nw", NUMERICOID, -1),
+            attr(4, "t", TIMEOID, 8),
+            attr(5, "tz", TIMETZOID, 12),
+        ],
     }
 }
 
@@ -151,17 +179,14 @@ async fn native_numeric_time_timetz_round_trip() {
             op: HeapOp::Insert,
             new: Some(DecodedTuple {
                 columns: vec![
-                    Some(ColumnValue::Int4(1)),
-                    Some(ColumnValue::Numeric(NumericKind::Finite("1.50".into()))),
-                    Some(ColumnValue::Numeric(NumericKind::Finite(
-                        "123456789012345678901234567890123456789012345678.12".into(),
-                    ))),
-                    Some(ColumnValue::Time(MICROS)),
+                    Some(build::int4(1)),
+                    Some(build::numeric("1.50")),
+                    Some(build::numeric(
+                        "123456789012345678901234567890123456789012345678.12",
+                    )),
+                    Some(build::micros(MICROS)),
                     // UTC+2 → PG stores tz_seconds west-positive = -7200.
-                    Some(ColumnValue::TimeTz {
-                        micros: MICROS,
-                        tz_seconds: -7200,
-                    }),
+                    Some(build::timetz(MICROS, -7200)),
                 ],
                 partial: false,
             }),

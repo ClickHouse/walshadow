@@ -1,15 +1,16 @@
-//! Direct tuple-view encoding must write the same blocks, and fail with the
-//! same errors, as decoding owned cells first
+//! Borrowed tuple views must encode the same blocks, and fail with the same
+//! errors, as owned datums resolved from them, and COPY rows as heap views
 
 use clickhouse_c::Allocator;
 use walrus::pg::walparser::RelFileNode;
 
 use crate::column_rules::{ColumnRule, ColumnRules, ColumnRulesBuilder, Substitute};
+use crate::decode::datum::{Datum, build};
 use crate::decode::heap_decoder::{
-    ColumnValue, CommittedTuple, DecodedHeap, HeapOp, decode_block_data, view_block_data,
+    CommittedTuple, DecodedHeap, HeapOp, decode_block_data, view_block_data,
 };
 use crate::emit::ch_emitter::{
-    ColumnBuf, Direct, OP_DELETE, OP_INSERT, RowStamp, TableEncoder, TablePlan,
+    Codec, ColumnBuf, OP_DELETE, OP_INSERT, RowStamp, TableEncoder, TablePlan,
 };
 use crate::mapping::{ColumnMapping, SystemColumns, TableMapping, TableTarget};
 use crate::schema::*;
@@ -192,9 +193,7 @@ fn assert_parity(
             op_code: op,
             leaf: None,
         };
-        let mut decoded = decode_block_data(&data, rel).unwrap();
-        // Placement renders PostGIS cells before batching
-        crate::ops::oracle::render_ext_columns(&rel.attributes, &mut decoded.columns);
+        let decoded = decode_block_data(&data, rel).unwrap();
         let committed = CommittedTuple {
             decoded: DecodedHeap {
                 rfn: rel.rfn,
@@ -472,30 +471,29 @@ fn fixed_width_types_match() {
 }
 
 #[test]
-fn copy_requires_matching_storage() {
+fn codec_follows_source_type() {
     let cases = [
-        (INT4OID, 4, 'i', "Int32", Direct::Copy),
-        (INT4OID, 4, 'i', "UInt32", Direct::Value),
-        (INT4OID, 4, 'i', "Float32", Direct::Value),
-        (OIDOID, 4, 'i', "Int32", Direct::Value),
-        (FLOAT8OID, 8, 'd', "Int64", Direct::Value),
-        (INT8OID, 8, 'd', "Nullable(Int64)", Direct::Copy),
-        (MONEYOID, 8, 'd', "Int64", Direct::Copy),
-        (DATEOID, 4, 'i', "Date32", Direct::Value),
-        (BOOLOID, 1, 'c', "Bool", Direct::Value),
+        (INT4OID, 4, 'i', "Int32", Codec::Le),
+        (OIDOID, 4, 'i', "Int32", Codec::Le),
+        (MONEYOID, 8, 'd', "Int64", Codec::Le),
+        (BOOLOID, 1, 'c', "Bool", Codec::Le),
+        (DATEOID, 4, 'i', "Date32", Codec::Date),
+        (NUMERICOID, -1, 'i', "Decimal(10, 2)", Codec::Numeric),
+        (JSONBOID, -1, 'i', "String", Codec::Jsonb),
+        (999_999, -2, 'c', "String", Codec::Bytes),
     ];
     for (oid, len, align, target, want) in cases {
         let rel = rel(vec![attr(1, oid, len, align, "")]);
         let plan = plan(&rel, &[target], &ColumnRules::default());
         assert_eq!(
-            plan.columns[0].source.unwrap().direct,
+            plan.columns[0].source.unwrap().codec,
             want,
             "{oid} {target}"
         );
     }
     let rel = rel(vec![attr(1, 999_999, -1, 'd', "geometry")]);
     let plan = plan(&rel, &["String"], &ColumnRules::default());
-    assert_eq!(plan.columns[0].source.unwrap().direct, Direct::Wkt);
+    assert_eq!(plan.columns[0].source.unwrap().codec, Codec::Wkt);
 }
 
 #[test]
@@ -830,10 +828,7 @@ fn view_matches_owned_decode_for_records() {
     let data = tuple(&rel.attributes, 2, &[Some(&one[..]), Some(&text[..])]);
     let view = view_block_data(&data, &rel).unwrap();
     assert_eq!(view.to_tuple(&rel), decode_block_data(&data, &rel).unwrap());
-    assert_eq!(
-        view.to_tuple(&rel).columns[1],
-        Some(ColumnValue::Text("value".into()))
-    );
+    assert_eq!(view.to_tuple(&rel).columns[1], Some(build::text("value")));
 }
 
 /// Operation with new and old tuple bytes
@@ -841,12 +836,7 @@ type Change = (HeapOp, Option<Vec<u8>>, Option<Vec<u8>>);
 
 /// Plan row changes both ways; segments must carry identical rows.
 /// External values resolve through `values` by value id, as detoast would
-fn plan_both(
-    rel: &RelDescriptor,
-    targets: &[&str],
-    changes: &[Change],
-    values: &[(u32, ColumnValue)],
-) {
+fn plan_both(rel: &RelDescriptor, targets: &[&str], changes: &[Change], values: &[(u32, Datum)]) {
     let resolved = |p: crate::decode::heap_decoder::ToastPointer| {
         values
             .iter()
@@ -873,7 +863,7 @@ fn plan_both(
             if views {
                 let new = new.as_ref().map(|d| view_block_data(d, &rel).unwrap());
                 let old = old.as_ref().map(|d| view_block_data(d, &rel).unwrap());
-                let mut patches: [Vec<(usize, ColumnValue)>; 2] = Default::default();
+                let mut patches: [Vec<(usize, Datum)>; 2] = Default::default();
                 for site in crate::xact::xact_buffer::external_sites([new.as_ref(), old.as_ref()]) {
                     patches[site.image].push((site.idx, resolved(site.p)));
                 }
@@ -891,7 +881,7 @@ fn plan_both(
                 let decode = |d: &Vec<u8>| {
                     let mut t = decode_block_data(d, &rel).unwrap();
                     for c in t.columns.iter_mut() {
-                        if let Some(ColumnValue::ExternalToast(p)) = *c {
+                        if let Some(Datum::External(p)) = *c {
                             *c = Some(resolved(p));
                         }
                     }
@@ -998,7 +988,7 @@ fn plan_views_match_cells_with_resolved_externals() {
         let ext = external_id(value_id);
         tuple(&attrs, 2, &[Some(&id.to_le_bytes()[..]), Some(&ext[..])])
     };
-    let text = |s: &str| ColumnValue::Text(s.into());
+    let text = build::text;
     plan_both(
         &r,
         &["Int32", "String"],
@@ -1044,9 +1034,9 @@ fn plan_views_match_cells_across_value_forms() {
     for target in ["String", "Nullable(String)"] {
         for filled in [false, true] {
             let eight = if filled {
-                ColumnValue::Null
+                Datum::Null
             } else {
-                ColumnValue::Text("eight".into())
+                build::text("eight")
             };
             plan_both(
                 &r,
@@ -1065,7 +1055,7 @@ fn plan_views_match_cells_across_value_forms() {
                     ),
                     (HeapOp::Delete, None, Some(row(packed(), 8))),
                 ],
-                &[(7, ColumnValue::Text("seven".into())), (8, eight)],
+                &[(7, build::text("seven")), (8, eight)],
             );
         }
     }
@@ -1073,6 +1063,16 @@ fn plan_views_match_cells_across_value_forms() {
 
 /// Heap datum and COPY field of one value
 type HeapAndCopy = (Vec<u8>, Vec<u8>);
+
+/// `numeric_send` words of a finite value, big-endian
+fn numeric_send(neg: bool, weight: i16, dscale: u16, digits: &[i16]) -> Vec<u8> {
+    let sign = if neg { 0x4000 } else { 0 };
+    [digits.len() as u16, weight as u16, sign, dscale]
+        .into_iter()
+        .chain(digits.iter().map(|&d| d as u16))
+        .flat_map(u16::to_be_bytes)
+        .collect()
+}
 
 /// COPY binary and text fields encode as page-walk views of same values do
 #[test]
@@ -1109,8 +1109,14 @@ fn copy_fields_match_heap_views() {
             Some((vec![1], vec![1])),
             Some((8000i32.to_le_bytes().into(), 8000i32.to_be_bytes().into())),
             Some((lz4(&b"y".repeat(80)), b"y".repeat(80))),
-            Some((short(&numeric_short(false, 2, &[1, 5000])), b"1.50".into())),
-            Some((short(&numeric_short(true, 0, &[42])), b"-42".into())),
+            Some((
+                short(&numeric_short(false, 2, &[1, 5000])),
+                numeric_send(false, 0, 2, &[1, 5000]),
+            )),
+            Some((
+                short(&numeric_short(true, 0, &[42])),
+                numeric_send(true, 0, 0, &[42]),
+            )),
         ],
         vec![
             Some((0i32.to_le_bytes().into(), 0i32.to_be_bytes().into())),
@@ -1122,8 +1128,17 @@ fn copy_fields_match_heap_views() {
             Some((vec![0], vec![0])),
             Some(((-1i32).to_le_bytes().into(), (-1i32).to_be_bytes().into())),
             None,
-            Some((short(&0xC000u16.to_le_bytes()), b"NaN".into())),
-            Some((short(&numeric_short(false, 0, &[])), b"0".into())),
+            Some((
+                short(&0xC000u16.to_le_bytes()),
+                [0u16, 0, 0xC000, 0]
+                    .iter()
+                    .flat_map(|w| w.to_be_bytes())
+                    .collect(),
+            )),
+            Some((
+                short(&numeric_short(false, 0, &[])),
+                numeric_send(false, 0, 0, &[]),
+            )),
         ],
     ];
     let mut views = TableEncoder::new(plan(&rel, &targets, &ColumnRules::default())).unwrap();
@@ -1147,12 +1162,9 @@ fn copy_fields_match_heap_views() {
             .iter()
             .map(|c| c.as_ref().map(|(_, f)| &f[..]))
             .collect();
-        let fields = CopyRow::new(&fields);
-        copy.append_slots(
-            |src| copy_slot(&fields, &rel, src.index).map_err(crate::ch::EmitterError::Type),
-            &stamp,
-        )
-        .unwrap();
+        let fields = CopyRow::from_send(&rel, &fields).unwrap();
+        copy.append_slots(|src| Ok(copy_slot(&fields, &rel, src.index)), &stamp)
+            .unwrap();
     }
     let wire = |enc: &mut TableEncoder| {
         let (bufs, rows) = enc.take_block().unwrap();

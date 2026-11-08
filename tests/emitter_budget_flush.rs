@@ -24,7 +24,8 @@ use std::sync::atomic::Ordering;
 use walrus::pg::walparser::RelFileNode;
 use walshadow::ch::CompressionChoice;
 use walshadow::ch_emitter::{EmitterConfig, EmitterStats, InstanceConfig};
-use walshadow::heap_decoder::{ColumnValue, CommittedTuple, DecodedHeap, DecodedTuple, HeapOp};
+use walshadow::datum::build;
+use walshadow::heap_decoder::{CommittedTuple, DecodedHeap, DecodedTuple, HeapOp};
 use walshadow::mapping::{ColumnMapping, TableMapping, TableTarget};
 use walshadow::pipeline::ack::Publish;
 use walshadow::pipeline::batcher::{BatcherMsg, PlacedSegment};
@@ -113,8 +114,8 @@ fn tuple(id: i32, source_lsn: u64, commit_lsn: u64) -> CommittedTuple {
             op: HeapOp::Insert,
             new: Some(DecodedTuple {
                 columns: vec![
-                    Some(ColumnValue::Int4(id)),
-                    Some(ColumnValue::Text(format!("row-{id}"))),
+                    Some(build::int4(id)),
+                    Some(build::text(format!("row-{id}"))),
                 ],
                 partial: false,
             }),

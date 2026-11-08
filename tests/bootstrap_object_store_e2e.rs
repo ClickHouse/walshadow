@@ -66,7 +66,7 @@ use walrus::storage::DynStorage;
 use walrus::storage::fs::FsStorage;
 use walshadow::backfill_bootstrap::{BootstrapConfig, run_greenfield_bootstrap, seed_in_snapshot};
 use walshadow::backup_source_object_store::ObjectStoreSource;
-use walshadow::heap_decoder::ColumnValue;
+use walshadow::datum::Datum;
 use walshadow::shadow::{Shadow, ShadowConfig};
 
 /// Row count loaded into the user table before push runs. Must be >0
@@ -360,7 +360,8 @@ async fn object_store_source_self_hosted_via_wal_rs_push() {
         let rel = catalog_map
             .get(t.rfn.db_node, t.rfn.rel_node)
             .expect("descriptor");
-        if let Some(Some(ColumnValue::Int4(v))) = t.cells(&rel).expect("cells").first() {
+        if let Some(Some(Datum::Fixed(v))) = t.cells(&rel).expect("cells").first() {
+            let v = &i32::from_le_bytes(v.as_slice().try_into().expect("int4"));
             int_ids.insert(*v);
         }
     }

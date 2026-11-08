@@ -112,7 +112,7 @@ containers for unsupported elements
 - Verify automatic numeric mappings at precision 76/77/1000, negative scale,
   scale greater than precision, and unconstrained numeric against source text
   Include trailing fractional zeros, SQL NULL, and String fast default `'NaN'`;
-  compare decoded default semantics, not SQL spelling such as `unhex('4e614e')`
+  compare decoded default semantics, not SQL spelling
 - Preserve finite calendar boundaries; reject adjacent out-of-range values
 - Reject Decimal values exceeding declared precision even when wire width fits
 - Accept `1.230` at scale 2; reject `1.234`, including negative equivalents

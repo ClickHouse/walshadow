@@ -6,7 +6,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use clickhouse_c::{Allocator, Block, BlockOpts, BlockReader, Column, Kind, SliceIo, TypeRef};
 
 use crate::ch::types;
-use crate::decode::heap_decoder::ColumnValue;
 use crate::ops::bridge::{Bridge, BridgeError, MAX_REQUEST_BYTES, request_frame};
 use tokio_postgres::types::Oid;
 
@@ -562,38 +561,19 @@ fn decode_block(
     Ok(block)
 }
 
-/// Render PostGIS 2-D points as WKT, typoutput yields HEXEWKB
+/// GSERIALIZED 2-D point, as [`point_wkt`] reads it
 #[cfg(test)]
-pub fn render_ext_columns(attrs: &[crate::schema::RelAttr], columns: &mut [Option<ColumnValue>]) {
-    // Scan cells first: attribute type names sit behind a pointer per column
-    for (idx, cell) in columns.iter_mut().enumerate() {
-        let Some(ColumnValue::PgPending { .. }) = cell.as_ref() else {
-            continue;
-        };
-        let is_geo = attrs.iter().any(|att| {
-            !att.dropped
-                && usize::try_from(att.attnum - 1) == Ok(idx)
-                && matches!(att.type_name.as_str(), "geography" | "geometry")
-        });
-        if is_geo && let Some(v) = cell.as_mut() {
-            render_ext_value(v);
-        }
-    }
-}
-
-/// Render one PostGIS cell as WKT, typoutput yields HEXEWKB
-pub(crate) fn render_ext_value(cell: &mut ColumnValue) {
-    if let ColumnValue::PgPending { raw, .. } = cell
-        && let Some(text) = gserialized_point_to_wkt(raw)
-    {
-        *cell = ColumnValue::Text(text);
-    }
+pub(crate) fn point_body(x: f64, y: f64) -> Vec<u8> {
+    let mut raw = vec![0u8, 0, 0, 0, 1, 0, 0, 0];
+    raw.extend_from_slice(&x.to_le_bytes());
+    raw.extend_from_slice(&y.to_le_bytes());
+    raw
 }
 
 /// PostGIS on-disk GSERIALIZED → `POINT(x y)` for 2-D points. Layout:
 /// `[srid(3) + gflags(1)][geomtype u32-le][…]`; POINT has geomtype 1 and its
 /// two `f64`-LE coordinates are the trailing 16 bytes. `None` for non-points.
-fn gserialized_point_to_wkt(raw: &[u8]) -> Option<String> {
+pub(crate) fn point_wkt(raw: &[u8]) -> Option<String> {
     if raw.len() < 16 {
         return None;
     }
@@ -740,13 +720,10 @@ mod tests {
         let mut raw = vec![0u8, 0, 0, 0, 1, 0, 0, 0];
         raw.extend_from_slice(&30.5_f64.to_le_bytes());
         raw.extend_from_slice(&81.25_f64.to_le_bytes());
-        assert_eq!(
-            gserialized_point_to_wkt(&raw).as_deref(),
-            Some("POINT(30.5 81.25)")
-        );
+        assert_eq!(point_wkt(&raw).as_deref(), Some("POINT(30.5 81.25)"));
         // non-point geomtype → None
         raw[4] = 2;
-        assert_eq!(gserialized_point_to_wkt(&raw), None);
+        assert_eq!(point_wkt(&raw), None);
     }
 
     #[test]

@@ -42,6 +42,15 @@ pub(crate) fn decode_tid(b: &[u8; 6]) -> (u32, u16) {
     )
 }
 
+/// Inverse of [`decode_tid`]
+pub(crate) fn encode_tid(block: u32, offset: u16) -> [u8; 6] {
+    let mut out = [0u8; 6];
+    out[..2].copy_from_slice(&((block >> 16) as u16).to_le_bytes());
+    out[2..4].copy_from_slice(&(block as u16).to_le_bytes());
+    out[4..].copy_from_slice(&offset.to_le_bytes());
+    out
+}
+
 /// `tid` as `tidout` prints it
 pub(crate) fn tid_to_text(block: u32, offset: u16) -> AsciiBuf<18> {
     let mut out = AsciiBuf::new();
@@ -78,6 +87,7 @@ mod tests {
     #[test]
     fn tid_joins_block_halves() {
         assert_eq!(decode_tid(&[1, 0, 2, 0, 3, 0]), (65538, 3));
+        assert_eq!(encode_tid(65538, 3), [1, 0, 2, 0, 3, 0]);
         let (block, offset) = decode_tid(&[0xff; 6]);
         assert_eq!(tid_to_text(block, offset).as_str(), "(4294967295,65535)");
         assert_eq!(parse_tid("(4294967295,65535)"), Some((block, offset)));
