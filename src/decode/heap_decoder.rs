@@ -337,6 +337,7 @@ pub struct DecodedHeap {
     pub old: Option<DecodedTuple>,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl DecodedHeap {
     /// Sum across both images (REPLICA IDENTITY FULL keeps a fat `old` too).
     pub fn approx_bytes(&self) -> usize {
@@ -359,6 +360,7 @@ impl DecodedHeap {
 /// between decode and drain can't reinterpret the row. Spill serializes
 /// `descriptor_valid_from` instead of the `Arc`; rehydrate re-obtains the
 /// descriptor by key and fails closed on span mismatch
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Debug, Clone, PartialEq)]
 pub struct DescribedHeap {
     pub decoded: DecodedHeap,
@@ -367,6 +369,7 @@ pub struct DescribedHeap {
     pub descriptor_valid_from: u64,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl DescribedHeap {
     /// Resident accounting counts the retained `Arc` reference (contents
     /// shared, not per-row) plus the span key
@@ -391,6 +394,7 @@ pub enum HeapOp {
     Truncate,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 /// One drained tuple, fully reassembled. `commit_ts` is the commit-record
 /// `xact_time` carried through
 /// [`crate::xact::xact_buffer::XactBuffer::drain_committed`].
@@ -470,6 +474,7 @@ impl<'a> TupleBuild<'a> for TupleView<'a> {
     }
 }
 
+#[cfg(test)]
 impl TupleView<'_> {
     /// Owned cells, as [`decode_heap_record`] builds them
     pub fn to_tuple(&self, rel: &RelDescriptor) -> DecodedTuple {
@@ -803,10 +808,8 @@ fn decode_old_tuple_from_main_data<'a, T: TupleBuild<'a>>(
     Ok(Some(decode_tuple_payload(main_data, header_off, rel, 0)?))
 }
 
-/// Decode a `block.data`-shaped tuple for the bootstrap page-walk sink,
-/// which reshapes on-disk `HeapTupleHeaderData`-prefixed tuples into this
-/// form. `prefixlen=0`: WAL prefix/suffix-from-old compression
-/// doesn't apply at backup time.
+/// Owned cells of a `block.data`-shaped tuple
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn decode_block_data(
     block_data: &[u8],
     rel: &RelDescriptor,
@@ -840,7 +843,7 @@ pub fn scan_block_data(block_data: &[u8], rel: &RelDescriptor) -> Result<TupleSh
 
 /// `block.data` image of `values` as `heap_fill_tuple` lays them out, each
 /// stored per its variant's PostgreSQL type. Covers fixed-width, text,
-/// bytea and external pointer cells
+/// bytea, raw varlena and external pointer cells
 #[cfg(any(test, feature = "test-support"))]
 pub fn form_block_data(values: &[Option<ColumnValue>]) -> Vec<u8> {
     let natts = values.len();
@@ -881,7 +884,11 @@ pub fn form_block_data(values: &[Option<ColumnValue>]) -> Vec<u8> {
             Some(ColumnValue::Float8(f)) => (f.to_le_bytes().to_vec(), 8),
             Some(ColumnValue::Uuid(u)) => (u.to_vec(), 1),
             Some(ColumnValue::Text(t) | ColumnValue::Json(t)) => varlena(t.as_bytes()),
-            Some(ColumnValue::Bytea(b)) => varlena(b),
+            Some(
+                ColumnValue::Bytea(b)
+                | ColumnValue::PgPending { raw: b, .. }
+                | ColumnValue::Unsupported { raw: b, .. },
+            ) => varlena(b),
             Some(ColumnValue::ExternalToast(p)) => {
                 let mut v = vec![0x01, 18];
                 for word in [
@@ -1711,27 +1718,6 @@ pub(crate) fn toast_chunk_datums<'a>(datums: &[DatumRef<'a>]) -> Option<(u32, u3
     ))
 }
 
-/// Take `(chunk_id, chunk_seq, chunk_data)` out of a `pg_toast_*` tuple's
-/// 3 columns (`chunk_id oid`, `chunk_seq int4`, `chunk_data bytea`);
-/// `None` for shapes that don't fit
-pub(crate) fn take_toast_chunk_columns(
-    cols: &mut [Option<ColumnValue>],
-) -> Option<(u32, u32, Vec<u8>)> {
-    if cols.len() < 3 {
-        return None;
-    }
-    let &ColumnValue::Oid(chunk_id) = cols[0].as_ref()? else {
-        return None;
-    };
-    let &ColumnValue::Int4(chunk_seq) = cols[1].as_ref()? else {
-        return None;
-    };
-    let ColumnValue::Bytea(chunk_data) = cols[2].take()? else {
-        return None;
-    };
-    Some((chunk_id, chunk_seq as u32, chunk_data))
-}
-
 /// True iff `attnum` is part of the relation's replica identity. Emitter gates
 /// delete/update old-key propagation on this, staying agnostic to [`ReplIdent`].
 pub fn is_replica_identity_attr(replident: &ReplIdent, attnum: i16) -> bool {
@@ -1744,39 +1730,6 @@ pub fn is_replica_identity_attr(replident: &ReplIdent, attnum: i16) -> bool {
             .unwrap_or(false),
         ReplIdent::UsingIndex { key_attnums, .. } => key_attnums.contains(&attnum),
     }
-}
-
-/// Build a delete marker when UPDATE changes primary/index key, or any column
-/// under `REPLICA IDENTITY FULL` without a primary key. Use `lsn - 1` so new
-/// row wins if both share a destination key. PostgreSQL default/index identity
-/// logs old values only when key changes or contains TOASTed values
-pub fn take_key_change_tombstone(
-    heap: &mut DecodedHeap,
-    rel: &RelDescriptor,
-) -> Option<DecodedHeap> {
-    let hot = match heap.op {
-        HeapOp::Update => false,
-        HeapOp::HotUpdate => true,
-        _ => return None,
-    };
-    let (old, new) = (heap.old.as_ref()?, heap.new.as_ref()?);
-    let differs = |a: usize| matches!((old.columns.get(a), new.columns.get(a)), (Some(Some(o)), Some(Some(n))) if o != n);
-    let keys = crate::schema::replident_key_attnums(rel);
-    let moved = if keys.is_empty() {
-        matches!(rel.replident, ReplIdent::Full { pk_attnums: None })
-            && (0..new.columns.len()).any(differs)
-    } else {
-        // PostgreSQL HOT updates leave indexed columns unchanged
-        !hot && keys.iter().any(|&a| differs(a as usize - 1))
-    };
-    moved.then(|| DecodedHeap {
-        rfn: heap.rfn,
-        xid: heap.xid,
-        source_lsn: heap.source_lsn - 1,
-        op: HeapOp::Delete,
-        new: None,
-        old: heap.old.take(),
-    })
 }
 
 /// PG `attmissingval`: one-element, no-null `ArrayType`, payload at `MAXALIGN(24)`
@@ -2942,111 +2895,5 @@ mod tests {
         assert!(!is_replica_identity_attr(&default_no_pk, 1));
         assert!(is_replica_identity_attr(&idx, 3));
         assert!(!is_replica_identity_attr(&idx, 1));
-    }
-
-    #[test]
-    fn key_change_tombstone_matrix() {
-        let tuple = |id: i32, v: &str| DecodedTuple {
-            columns: vec![
-                Some(ColumnValue::Int4(id)),
-                Some(ColumnValue::Text(v.into())),
-            ],
-            partial: false,
-        };
-        let heap = |op, old: Option<DecodedTuple>| DecodedHeap {
-            rfn: RelFileNode::default(),
-            xid: 7,
-            source_lsn: 0x100,
-            op,
-            new: Some(tuple(2, "b")),
-            old,
-        };
-        let mut rel = descriptor(1, vec![]);
-        let pk = Some(vec![1]);
-        let cases = [
-            (
-                ReplIdent::Default {
-                    pk_attnums: pk.clone(),
-                },
-                HeapOp::Update,
-                Some(tuple(1, "")),
-                true,
-            ),
-            (
-                ReplIdent::Default {
-                    pk_attnums: pk.clone(),
-                },
-                HeapOp::Update,
-                None,
-                false,
-            ),
-            // PostgreSQL logs TOASTed keys even when unchanged
-            (
-                ReplIdent::Default {
-                    pk_attnums: pk.clone(),
-                },
-                HeapOp::Update,
-                Some(tuple(2, "")),
-                false,
-            ),
-            (
-                ReplIdent::Full {
-                    pk_attnums: pk.clone(),
-                },
-                HeapOp::Update,
-                Some(tuple(2, "a")),
-                false,
-            ),
-            (
-                ReplIdent::Full {
-                    pk_attnums: pk.clone(),
-                },
-                HeapOp::HotUpdate,
-                Some(tuple(1, "a")),
-                false,
-            ),
-            (
-                ReplIdent::Full { pk_attnums: None },
-                HeapOp::HotUpdate,
-                Some(tuple(2, "a")),
-                true,
-            ),
-            (
-                ReplIdent::Full { pk_attnums: None },
-                HeapOp::Update,
-                Some(tuple(2, "b")),
-                false,
-            ),
-            (
-                ReplIdent::Full { pk_attnums: None },
-                HeapOp::Delete,
-                Some(tuple(2, "a")),
-                false,
-            ),
-            (
-                ReplIdent::UsingIndex {
-                    index_oid: 9,
-                    key_attnums: vec![2],
-                },
-                HeapOp::Update,
-                Some(tuple(2, "a")),
-                true,
-            ),
-        ];
-        for (replident, op, old, split) in cases {
-            rel.replident = replident;
-            let mut h = heap(op, old.clone());
-            let tomb = take_key_change_tombstone(&mut h, &rel);
-            assert_eq!(tomb.is_some(), split, "{:?} {op:?} {old:?}", rel.replident);
-            let Some(tomb) = tomb else {
-                assert_eq!(h.old, old);
-                continue;
-            };
-            assert_eq!(
-                (tomb.op, tomb.source_lsn, tomb.xid),
-                (HeapOp::Delete, 0xff, 7)
-            );
-            assert_eq!((tomb.old, tomb.new, h.old), (old, None, None));
-        }
     }
 }

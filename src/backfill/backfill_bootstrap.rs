@@ -39,7 +39,6 @@ use crate::backfill::backup_sink::{
     CatalogFilenodes, DiskLanderSink, DiskLanderStats, MultiplexSink,
 };
 use crate::backfill::backup_source::{BackupSink, BackupSource, EndInfo, PumpStats, StartInfo};
-use crate::decode::decoder_sink::TupleObserver;
 use crate::schema::{RelAttr, RelDescriptor, RelName, ReplIdent};
 
 /// Live counter handles, readable while the pump runs. The pump publishes
@@ -154,10 +153,9 @@ pub fn tap_filenode_set(
 /// `rx.recv() == None` signals channel close.
 ///
 /// ```ignore
-/// let (rx, pump) = spawn_greenfield_bootstrap(cfg, source, catalog_map, store_toast);
-/// let drained = tokio::spawn(drain_backfill(rx, &catalog, observer));
+/// let (mut rx, pump) = spawn_greenfield_bootstrap(cfg, source, catalog_map, store_toast);
+/// while let Some(slab) = rx.recv().await { /* consume */ }
 /// let outcome = pump.await?.context("bootstrap pump")?;
-/// let shipped = drained.await?;
 /// ```
 ///
 /// Channel is bounded ([`BOOTSTRAP_TUPLE_CHANNEL_CAP`]): PageWalkSink::chunk
@@ -223,8 +221,8 @@ pub fn spawn_greenfield_bootstrap(
 }
 
 /// Test/fixture wrapper: run pump to completion, collect every
-/// `BackfillTuple` into a `Vec`. Production callers use
-/// [`spawn_greenfield_bootstrap`] + [`drain_backfill`] to bound memory by
+/// `BackfillTuple` into a `Vec`. Production callers drain
+/// [`spawn_greenfield_bootstrap`] concurrently to bound memory by
 /// the emitter's drain rate, not the source's full tuple count
 pub async fn run_greenfield_bootstrap(
     cfg: BootstrapConfig,
@@ -243,60 +241,6 @@ pub async fn run_greenfield_bootstrap(
     let outcome = pump.await.context("bootstrap pump join")??;
     let tuples = drain.await.context("bootstrap drain join")?;
     Ok((outcome, tuples))
-}
-
-/// Drain backfill tuples into a [`TupleObserver`]. Each `BackfillTuple`
-/// becomes a synthetic
-/// [`CommittedTuple`](crate::decode::heap_decoder::CommittedTuple) with `op = Insert`,
-/// `commit_ts = 0`, `commit_lsn = source_lsn` (BASE_BACKUP `start_lsn`).
-/// Synthesises committed rows from on-disk pages, bypassing the daemon's
-/// xact-buffer + decoder chain.
-///
-/// `PageWalkSink` emits all rows for one rfn contiguously, so drive
-/// `on_xact_end` on every rfn flip: CH Native protocol forbids a new `Query`
-/// while a prior INSERT's data stream is open; without per-table flushes the
-/// second `send_query` races the first INSERT's body bytes and CH silently
-/// drops everything on the connection.
-///
-/// Final `on_xact_end` after channel-close lets the transitional emitter
-/// release CH state before the daemon swaps to the shadow-catalog emitter.
-pub async fn drain_backfill<O: TupleObserver + ?Sized>(
-    mut rx: mpsc::Receiver<Vec<BackfillTuple>>,
-    catalog: &CatalogMap,
-    observer: &mut O,
-) -> Result<u64> {
-    let mut shipped: u64 = 0;
-    let mut last_rfn: Option<RelFileNode> = None;
-    let mut last_lsn: u64 = 0;
-    while let Some(slab) = rx.recv().await {
-        for tuple in slab {
-            if let Some(prev) = last_rfn
-                && prev != tuple.rfn
-            {
-                observer.on_xact_end(last_lsn).await.map_err(|e| {
-                    anyhow::anyhow!("bootstrap drain: emitter rejected mid-table xact end: {e}")
-                })?;
-            }
-            last_rfn = Some(tuple.rfn);
-            last_lsn = tuple.source_lsn;
-            let rel = catalog
-                .get(tuple.rfn.db_node, tuple.rfn.rel_node)
-                .with_context(|| format!("bootstrap drain: no descriptor for {:?}", tuple.rfn))?;
-            let committed = tuple
-                .into_committed_insert(&rel)
-                .map_err(|e| anyhow::anyhow!("bootstrap drain: {e}"))?;
-            observer
-                .on_tuple(&committed)
-                .await
-                .map_err(|e| anyhow::anyhow!("bootstrap drain: emitter rejected tuple: {e}"))?;
-            shipped += 1;
-        }
-    }
-    observer
-        .on_xact_end(last_lsn)
-        .await
-        .map_err(|e| anyhow::anyhow!("bootstrap drain: emitter rejected xact end: {e}"))?;
-    Ok(shipped)
 }
 
 /// Build a [`CatalogMap`] by enumerating every source PG user relation
@@ -471,11 +415,8 @@ fn one_char(s: String, what: &str) -> Result<char> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backfill::backup_page_walk::{
-        PAGE_BYTES, TupleData, make_rel, synth_single_tuple_page,
-    };
+    use crate::backfill::backup_page_walk::{PAGE_BYTES, make_rel, synth_single_tuple_page};
     use crate::backfill::backup_source::{BackupSink, BackupSource, FileMeta};
-    use crate::decode::heap_decoder::HeapOp;
     use async_trait::async_trait;
     use walrus::pg::backup::tarball::{Entry, Kind, Reader, Writer};
 
@@ -603,147 +544,5 @@ mod tests {
             columns,
             [Some(crate::decode::heap_decoder::ColumnValue::Int4(42))]
         );
-    }
-
-    #[tokio::test]
-    async fn drain_backfill_synthesises_inserts_into_observer() {
-        use crate::decode::decoder_sink::CollectingTupleObserver;
-
-        let (tx, rx) = mpsc::channel::<Vec<BackfillTuple>>(64);
-        let rfn = RelFileNode {
-            spc_node: 1663,
-            db_node: 5,
-            rel_node: 16400,
-        };
-        for v in 0..3 {
-            tx.send(vec![BackfillTuple {
-                rfn,
-                xid: 100 + v,
-                xmax: 0,
-                infomask: 0,
-                source_lsn: 0xCAFE,
-                page_lsn: 0,
-                blkno: 0,
-                offnum: 0,
-                data: TupleData::from_cells(&[Some(
-                    crate::decode::heap_decoder::ColumnValue::Int4(v as i32),
-                )]),
-                pending: None,
-            }])
-            .await
-            .unwrap();
-        }
-        drop(tx);
-
-        let mut observer = CollectingTupleObserver::default();
-        let shipped = drain_backfill(rx, &int4_catalog(), &mut observer)
-            .await
-            .unwrap();
-        assert_eq!(shipped, 3);
-        assert_eq!(observer.tuples.len(), 3);
-        for (i, c) in observer.tuples.iter().enumerate() {
-            assert_eq!(c.commit_ts, 0);
-            assert_eq!(c.commit_lsn, 0xCAFE);
-            assert_eq!(c.decoded.op, HeapOp::Insert);
-            assert!(c.decoded.old.is_none());
-            let new = c.decoded.new.as_ref().unwrap();
-            assert!(!new.partial);
-            assert!(matches!(
-                new.columns[0],
-                Some(crate::decode::heap_decoder::ColumnValue::Int4(v)) if v == i as i32
-            ));
-        }
-    }
-
-    fn int4_catalog() -> CatalogMap {
-        let mut catalog = CatalogMap::new();
-        catalog.insert(Arc::new(make_rel()));
-        catalog
-    }
-
-    #[derive(Default)]
-    struct CountingObserver {
-        on_tuple_calls: u32,
-        on_xact_end_calls: u32,
-    }
-
-    impl crate::decode::decoder_sink::TupleObserver for CountingObserver {
-        fn on_tuple<'a>(
-            &'a mut self,
-            _committed: &'a crate::decode::heap_decoder::CommittedTuple,
-        ) -> std::pin::Pin<
-            Box<
-                dyn std::future::Future<
-                        Output = Result<(), crate::decode::decoder_sink::DecoderSinkError>,
-                    > + Send
-                    + 'a,
-            >,
-        > {
-            self.on_tuple_calls += 1;
-            Box::pin(async { Ok(()) })
-        }
-        fn on_xact_end<'a>(
-            &'a mut self,
-            commit_lsn: u64,
-        ) -> std::pin::Pin<
-            Box<
-                dyn std::future::Future<
-                        Output = Result<u64, crate::decode::decoder_sink::DecoderSinkError>,
-                    > + Send
-                    + 'a,
-            >,
-        > {
-            self.on_xact_end_calls += 1;
-            Box::pin(async move { Ok(commit_lsn) })
-        }
-    }
-
-    #[tokio::test]
-    async fn drain_backfill_calls_on_xact_end_after_channel_closes() {
-        let rfn = RelFileNode {
-            spc_node: 1663,
-            db_node: 5,
-            rel_node: 16400,
-        };
-        let (tx, rx) = mpsc::channel::<Vec<BackfillTuple>>(64);
-        for v in 0..4u32 {
-            tx.send(vec![BackfillTuple {
-                rfn,
-                xid: v,
-                xmax: 0,
-                infomask: 0,
-                source_lsn: 1,
-                page_lsn: 0,
-                blkno: 0,
-                offnum: 0,
-                data: TupleData::from_cells(&[Some(
-                    crate::decode::heap_decoder::ColumnValue::Int4(v as i32),
-                )]),
-                pending: None,
-            }])
-            .await
-            .unwrap();
-        }
-        drop(tx);
-
-        let mut obs = CountingObserver::default();
-        let shipped = drain_backfill(rx, &int4_catalog(), &mut obs).await.unwrap();
-        assert_eq!(shipped, 4);
-        assert_eq!(obs.on_tuple_calls, 4);
-        // One synthetic xact closes the backfill
-        assert_eq!(obs.on_xact_end_calls, 1);
-    }
-
-    #[tokio::test]
-    async fn drain_backfill_calls_on_xact_end_even_on_empty_channel() {
-        // Sender dropped without a tuple; `on_xact_end` still fires so the
-        // transitional emitter's INSERT cleanup runs unconditionally
-        let (tx, rx) = mpsc::channel::<Vec<BackfillTuple>>(64);
-        drop(tx);
-        let mut obs = CountingObserver::default();
-        let shipped = drain_backfill(rx, &int4_catalog(), &mut obs).await.unwrap();
-        assert_eq!(shipped, 0);
-        assert_eq!(obs.on_tuple_calls, 0);
-        assert_eq!(obs.on_xact_end_calls, 1);
     }
 }

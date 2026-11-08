@@ -27,7 +27,6 @@ use crate::backfill::visibility_pending::{self, SharedPendingLedger};
 use crate::catalog::pending::PendingCatalog;
 #[cfg(feature = "test-support")]
 use crate::crash_test;
-use crate::decode::heap_decoder::DecodedHeap;
 use crate::decode::visibility::{PgXactView, SealedPatch, read_pg_xact};
 use crate::emit::ch_ddl::{DdlApplicator, Stamp};
 use crate::emit::ch_emitter::EmitterStats;
@@ -839,8 +838,7 @@ impl ReorderSink {
         &mut self,
         _: Fenced,
         rel: &RelDescriptor,
-        heap: &DecodedHeap,
-        commit_ts: i64,
+        at: Stamp,
     ) -> Result<(), SinkError> {
         let Some(scope) = self.scopes.get_mut(&rel.rfn.db_node) else {
             return Ok(());
@@ -851,11 +849,6 @@ impl ReorderSink {
         // Attached at truncate fan-out (record time = pre-capture Present),
         // so the rotation's drain-time Retired answer no longer needs a
         // predecessor walk here
-        let at = Stamp {
-            lsn: heap.source_lsn,
-            xid: heap.xid,
-            commit_ts,
-        };
         applicator
             .truncate(rel, at)
             .await
@@ -978,7 +971,7 @@ impl ReorderSink {
                     })
                     .await?;
                 }
-                PlanItem::Truncate { heap: h, upto } => {
+                PlanItem::Truncate { truncate: t, upto } => {
                     Box::pin(async {
                         self.put_plan_rows(&rd.row_batches, &mut rows_cursor, upto)
                             .await?;
@@ -987,9 +980,13 @@ impl ReorderSink {
                                 .await?;
                         }
                         let fenced = self.barrier_fence().await?;
-                        let rel = &rd.tables[h.table as usize].descriptor;
-                        self.apply_truncate(fenced, rel, &h.decoded, commit_ts)
-                            .await
+                        let rel = &rd.tables[t.table as usize].descriptor;
+                        let at = Stamp {
+                            lsn: t.source_lsn,
+                            xid: t.xid,
+                            commit_ts,
+                        };
+                        self.apply_truncate(fenced, rel, at).await
                     })
                     .await?;
                 }

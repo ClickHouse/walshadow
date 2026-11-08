@@ -17,7 +17,7 @@
 //!   → ObjectStoreSource(settings, FsStorage(temp/storage), name)
 //!   → MultiplexSink(DiskLanderSink + PageWalkSink)
 //!   → mpsc<BackfillTuple>
-//!   → drain_backfill → RecordingObserver (records tuples + on_xact_end)
+//!   → collected tuples
 //! ```
 //!
 //! What this exercises end-to-end (not covered by lib unit tests):
@@ -64,11 +64,9 @@ use walrus::pg::backup::push::{self, PushArgs};
 use walrus::pg::replication::conn::PgConfig;
 use walrus::storage::DynStorage;
 use walrus::storage::fs::FsStorage;
-use walshadow::backfill_bootstrap::{
-    BootstrapConfig, drain_backfill, seed_in_snapshot, spawn_greenfield_bootstrap,
-};
+use walshadow::backfill_bootstrap::{BootstrapConfig, run_greenfield_bootstrap, seed_in_snapshot};
 use walshadow::backup_source_object_store::ObjectStoreSource;
-use walshadow::heap_decoder::{ColumnValue, HeapOp};
+use walshadow::heap_decoder::ColumnValue;
 use walshadow::shadow::{Shadow, ShadowConfig};
 
 /// Row count loaded into the user table before push runs. Must be >0
@@ -229,10 +227,6 @@ async fn object_store_source_self_hosted_via_wal_rs_push() {
         .unwrap()
         .get(0);
 
-    // Run the orchestrator. spawn_greenfield_bootstrap yields the
-    // receiver up front so drain_backfill runs concurrently with the
-    // source pump — bounded by source decode bandwidth, not by total
-    // tuple count.
     let shadow_data = tmp.path().join("shadow-data");
     let cfg = BootstrapConfig::new(shadow_data.clone());
     let object_source = ObjectStoreSource::new(
@@ -242,27 +236,10 @@ async fn object_store_source_self_hosted_via_wal_rs_push() {
         tmp.path().join("part-spool"),
     )
     .with_parallelism(2);
-    let (rx, pump) =
-        spawn_greenfield_bootstrap(cfg, Box::new(object_source), catalog_map.clone(), false);
-
-    // RecordingObserver wraps a CollectingTupleObserver + counts
-    // on_xact_end so the test asserts drain_backfill closes the
-    // synthetic backfill xact exactly once after channel drain. The
-    // production daemon path uses this signal to flush the
-    // transitional emitter's INSERT block before swapping to the
-    // ShadowCatalog-backed emitter.
-    let mut observer = RecordingObserver::default();
-    let (drain_res, pump_res) = tokio::join!(drain_backfill(rx, &catalog_map, &mut observer), pump);
-    let shipped = drain_res.expect("drain task error");
-    let outcome = pump_res
-        .expect("pump task panicked")
-        .expect("pump task returned error");
-    assert_eq!(
-        observer.xact_end_calls, 1,
-        "drain_backfill must call on_xact_end exactly once after channel drain — \
-         got {} calls",
-        observer.xact_end_calls,
-    );
+    let (outcome, tuples) =
+        run_greenfield_bootstrap(cfg, Box::new(object_source), catalog_map.clone(), false)
+            .await
+            .expect("bootstrap");
 
     // --- LSN handoff ---
     assert!(outcome.start.start_lsn > 0, "start_lsn must be non-zero");
@@ -369,32 +346,21 @@ async fn object_store_source_self_hosted_via_wal_rs_push() {
 
     // --- Drain delivered every tuple ---
     assert_eq!(
-        shipped,
+        tuples.len() as u64,
         outcome
             .page_walk
             .tuples_emitted
             .load(std::sync::atomic::Ordering::Relaxed),
-        "drain count != page walk emit count — channel dropped tuples"
+        "collected count != page walk emit count, channel dropped tuples"
     );
 
-    // --- CommittedTuple shape (every captured tuple) ---
     let mut int_ids: HashSet<i32> = HashSet::new();
-    for c in &observer.tuples {
-        assert_eq!(c.commit_ts, 0, "commit_ts must be 0 for backfill rows");
-        assert_eq!(
-            c.commit_lsn, outcome.start.start_lsn,
-            "commit_lsn must equal start_lsn",
-        );
-        assert_eq!(c.decoded.op, HeapOp::Insert);
-        assert_eq!(c.decoded.source_lsn, outcome.start.start_lsn);
-        assert!(c.decoded.old.is_none());
-        let new = c.decoded.new.as_ref().expect("Insert must carry `new`");
-        assert!(!new.partial);
-        // The s12.t.id column is int4 at attnum 1. PG may have given
-        // us catalog rows too if their filenode rotated above 16384,
-        // but ordinary fresh-cluster catalogs stay < 16384 — the
-        // captured stream should be pure s12.t rows here.
-        if let Some(Some(ColumnValue::Int4(v))) = new.columns.first() {
+    for t in &tuples {
+        assert_eq!(t.source_lsn, outcome.start.start_lsn);
+        let rel = catalog_map
+            .get(t.rfn.db_node, t.rfn.rel_node)
+            .expect("descriptor");
+        if let Some(Some(ColumnValue::Int4(v))) = t.cells(&rel).expect("cells").first() {
             int_ids.insert(*v);
         }
     }
@@ -406,43 +372,4 @@ async fn object_store_source_self_hosted_via_wal_rs_push() {
         want.difference(&int_ids).copied().collect::<Vec<_>>(),
         int_ids.len(),
     );
-}
-
-/// Recording observer = `CollectingTupleObserver` + `on_xact_end`
-/// counter. Lets the e2e drill assert both per-tuple shape and the
-/// synthetic xact-close signal that the daemon's transitional emitter
-/// path (Solution 2) relies on to flush its INSERT block.
-#[derive(Default)]
-struct RecordingObserver {
-    tuples: Vec<walshadow::heap_decoder::CommittedTuple>,
-    xact_end_calls: u32,
-}
-
-impl walshadow::decoder_sink::TupleObserver for RecordingObserver {
-    fn on_tuple<'a>(
-        &'a mut self,
-        committed: &'a walshadow::heap_decoder::CommittedTuple,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<Output = Result<(), walshadow::decoder_sink::DecoderSinkError>>
-                + Send
-                + 'a,
-        >,
-    > {
-        self.tuples.push(committed.clone());
-        Box::pin(async { Ok(()) })
-    }
-    fn on_xact_end<'a>(
-        &'a mut self,
-        commit_lsn: u64,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<Output = Result<u64, walshadow::decoder_sink::DecoderSinkError>>
-                + Send
-                + 'a,
-        >,
-    > {
-        self.xact_end_calls += 1;
-        Box::pin(async move { Ok(commit_lsn) })
-    }
 }

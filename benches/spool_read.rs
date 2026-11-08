@@ -2,7 +2,6 @@
 //! `cargo bench --bench spool_read -- --rows 200000`
 //! Add `--plan-only --planner --mapped --relations 8 --control-every 10000`
 //! to include planning, route caching within benchmark, and column encoding.
-//! `--cells` plans decoded rows instead of WAL record bytes.
 //! Excludes WAL drain, TOAST I/O, control execution, and destination insertion.
 
 use std::path::PathBuf;
@@ -52,9 +51,6 @@ struct Args {
     /// Run Planner with cached routes.
     #[arg(long)]
     planner: bool,
-    /// Plan decoded rows rather than WAL record bytes.
-    #[arg(long)]
-    cells: bool,
     #[arg(long)]
     mapped: bool,
     #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u16).range(1..))]
@@ -337,11 +333,7 @@ async fn plan(args: &Args, repeat: usize) -> anyhow::Result<()> {
                             event,
                         });
                     }
-                    heaps.push(if args.cells {
-                        DrainHeap::Cells(make_heap(i))
-                    } else {
-                        DrainHeap::Input(Box::new(make_input(i)))
-                    });
+                    heaps.push(DrainHeap::Input(Box::new(make_input(i))));
                 }
                 DrainedBatch {
                     heaps,
@@ -383,8 +375,6 @@ async fn plan(args: &Args, repeat: usize) -> anyhow::Result<()> {
             let table = writer.table(rel, 1, || view.route_for(rel));
             if !writer.routed(table) {
                 writer.discard(table, 1);
-            } else if args.cells {
-                writer.push_cells(make_heap(i).decoded, table)?;
             } else {
                 let input = make_input(i);
                 let record = input.input.to_xlog_record(rel.rfn);

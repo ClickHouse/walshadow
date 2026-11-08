@@ -59,8 +59,9 @@ Queue worker runs on a dedicated thread. A dispatcher scans each batch ahead of
 it to start TOAST store reads for values updated rows keep. Ordinary heap
 records stay WAL bytes under their record-time descriptor until commit;
 planning reads tuples in place, resolved external values patching them.
-Stash-resolved records use cell adapters; compressed inline values, numeric,
-JSONB, and fast defaults can also need row scratch. Commits drain only their own
+Records resolved from stash at commit carry the same bytes under their resolved
+descriptor. Compressed inline values, numeric, JSONB, and fast defaults can
+need row scratch. Commits drain only their own
 transaction trees. Consecutive small commits can share column blocks while
 retaining separate acknowledgements. COPY and backup loads carry tuple bytes or
 COPY fields and encode their own column chunks

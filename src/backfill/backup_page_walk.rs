@@ -30,10 +30,9 @@ use crate::backfill::backup_source::{
 use crate::backfill::copy_backfill::CopyRow;
 use crate::backfill::pg_path::{BaseRelFile, RelFork, parse_base_path};
 use crate::backfill::walk_barrier::WalkBarrier;
-use crate::decode::heap_decoder::{
-    ColumnValue, CommittedTuple, DecodeError, DecodedHeap, DecodedTuple, HeapOp, TupleView,
-    decode_block_data, view_block_data,
-};
+#[cfg(any(test, feature = "test-support"))]
+use crate::decode::heap_decoder::{ColumnValue, decode_block_data};
+use crate::decode::heap_decoder::{DecodeError, TupleView, view_block_data};
 use crate::decode::visibility::{
     PendingXids, PgMultiXactAccum, PgXactAccum, PgXactView, SealedPatch,
 };
@@ -147,7 +146,8 @@ impl BackfillTuple {
         }
     }
 
-    /// Owned cells, attnum-1 indexed, for observers and tests
+    /// Owned cells, attnum-1 indexed
+    #[cfg(any(test, feature = "test-support"))]
     pub fn cells(&self, rel: &RelDescriptor) -> Result<Vec<Option<ColumnValue>>, String> {
         match &self.data {
             TupleData::Heap(b) => decode_block_data(b, rel)
@@ -155,27 +155,6 @@ impl BackfillTuple {
                 .map_err(|e| e.to_string()),
             TupleData::Copy(row) => crate::backfill::copy_backfill::copy_cells(row, rel),
         }
-    }
-
-    /// start_lsn rides as both source_lsn and commit_lsn so
-    /// ReplacingMergeTree(_lsn) collapses duplicates the WAL decoder
-    /// re-emits for records in [start_lsn, end_lsn]
-    pub fn into_committed_insert(self, rel: &RelDescriptor) -> Result<CommittedTuple, String> {
-        Ok(CommittedTuple {
-            decoded: DecodedHeap {
-                rfn: self.rfn,
-                xid: self.xid,
-                source_lsn: self.source_lsn,
-                op: HeapOp::Insert,
-                new: Some(DecodedTuple {
-                    columns: self.cells(rel)?,
-                    partial: false,
-                }),
-                old: None,
-            },
-            commit_ts: 0,
-            commit_lsn: self.source_lsn,
-        })
     }
 }
 

@@ -39,7 +39,7 @@ use walshadow::shadow_catalog::{ShadowCatalog, ShadowCatalogConfig};
 use walshadow::spill::ToastChunk;
 use walshadow::toast::{ChunkRefMap, MemChunkStore, ToastResolver};
 use walshadow::xact_buffer::{
-    StashResolved, WalkStep, XactBuffer, XactBufferConfig, XactBufferError, detoast_heap,
+    DrainHeap, StashResolved, WalkStep, XactBuffer, XactBufferConfig, XactBufferError, detoast_heap,
 };
 
 fn make_shadow(tmp: &tempfile::TempDir, port: u16) -> Shadow {
@@ -252,7 +252,7 @@ async fn drain_all(
             let WalkStep::Heap(drained) = step else {
                 continue;
             };
-            for mut heap in drained.into_cells()? {
+            for mut heap in DrainHeap::Input(drained).into_cells()? {
                 detoast_heap(&mut heap, spool, &ref_maps, resolver).await?;
                 out.push(CommittedTuple {
                     decoded: heap.decoded,

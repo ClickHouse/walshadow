@@ -27,15 +27,13 @@ use thiserror::Error;
 
 use crate::ch::EmitterError;
 use crate::decode::datum::DatumRef;
-use crate::decode::heap_decoder::{
-    ColumnValue, DecodedHeap, HeapOp, TupleView, datum_value, take_key_change_tombstone,
-};
+use crate::decode::heap_decoder::{ColumnValue, HeapOp, TupleView, datum_value};
 use crate::emit::ch_emitter::{
     Append, EncodedChunk, OP_DELETE, OP_INSERT, OP_UPDATE, RowStamp, TableEncoder, TablePlan,
 };
 use crate::emit::route::RouteSnapshot;
 use crate::schema::RelDescriptor;
-use crate::xact::spill::{self, Cursor, IO_CHUNK, SpillError};
+use crate::xact::spill::{self, Cursor, IO_CHUNK, SpillError, Truncate};
 use crate::xact::xact_buffer::{DrainEntry, ToastRowBatch};
 use foldhash::HashMap;
 
@@ -68,8 +66,9 @@ impl PlanTable {
 
 /// Truncate under its plan table
 #[derive(Debug)]
-pub struct PlannedHeap {
-    pub decoded: DecodedHeap,
+pub struct PlannedTruncate {
+    pub xid: u32,
+    pub source_lsn: u64,
     /// Index into plan's `tables`
     pub table: u32,
 }
@@ -160,7 +159,7 @@ enum Step {
         row_idx: usize,
     },
     Truncate {
-        heap: PlannedHeap,
+        truncate: PlannedTruncate,
         upto: usize,
     },
 }
@@ -297,47 +296,9 @@ impl<K: Copy + PartialEq> ChunkBuilder<K> {
         Ok(())
     }
 
-    /// Encode one owned row change: drop deletes an append-only route has
-    /// nowhere to land, render PostGIS cells, split key changes into a
-    /// delete marker plus the new row. Returns rows appended
-    pub fn push_cells(
-        &mut self,
-        key: K,
-        rel: &Arc<RelDescriptor>,
-        route: &Arc<RouteSnapshot>,
-        mut decoded: DecodedHeap,
-        commit_ts: i64,
-    ) -> std::result::Result<usize, EmitterError> {
-        if route.drops_deletes() && decoded.op == HeapOp::Delete {
-            return Ok(0);
-        }
-        for t in [decoded.new.as_mut(), decoded.old.as_mut()]
-            .into_iter()
-            .flatten()
-        {
-            crate::ops::oracle::render_ext_columns(&rel.attributes, &mut t.columns);
-        }
-        let tomb = (!route.drops_deletes())
-            .then(|| take_key_change_tombstone(&mut decoded, rel))
-            .flatten();
-        let leaf = route.partition.as_ref().map(|p| p.leaf);
-        let mut rows = 0;
-        for decoded in tomb.into_iter().chain([decoded]) {
-            let op = op_code(decoded.op)?;
-            let committed = crate::decode::heap_decoder::CommittedTuple {
-                decoded,
-                commit_ts,
-                commit_lsn: 0,
-            };
-            self.append(key, rel, route, |enc| {
-                enc.append_routed(&committed, &route.mapping, op, leaf)
-            })?;
-            rows += 1;
-        }
-        Ok(rows)
-    }
-
-    /// [`Self::push_cells`] reading tuple images in place
+    /// Encode one row change from tuple images in place: drop deletes an
+    /// append-only route has nowhere to land, split key changes into a delete
+    /// marker plus the new row. Returns rows appended
     pub fn push_views(
         &mut self,
         key: K,
@@ -547,18 +508,40 @@ impl PlanWriter {
         self.tables[table as usize].heaps += rows;
     }
 
-    /// Encode one owned row change, see [`ChunkBuilder::push_cells`]
-    pub fn push_cells(&mut self, decoded: DecodedHeap, table: u32) -> Result<()> {
-        let t = &mut self.tables[table as usize];
-        t.heaps += 1;
-        let route = t.route.as_ref().expect("routed table");
-        let rows = self
-            .chunks
-            .push_cells(table, &t.descriptor, route, decoded, self.commit_ts)?;
-        self.pushed(rows)
+    #[cfg(any(test, feature = "test-support"))]
+    /// [`Self::push_views`] over an owned change's record bytes
+    pub fn push_cells(
+        &mut self,
+        decoded: crate::decode::heap_decoder::DecodedHeap,
+        table: u32,
+    ) -> Result<()> {
+        let input = spill::DescribedInput::from(crate::decode::heap_decoder::DescribedHeap {
+            decoded,
+            descriptor: self.tables[table as usize].descriptor.clone(),
+            descriptor_valid_from: 0,
+        });
+        let images = crate::decode::heap_decoder::view_heap_record(
+            input.input.record_bytes(),
+            &input.descriptor,
+        )
+        .expect("formed record views");
+        for h in &images {
+            let change = ViewChange {
+                op: h.op,
+                xid: input.input.xid,
+                source_lsn: input.input.source_lsn,
+                new: h.new.as_ref(),
+                old: h.old.as_ref(),
+                new_patch: &[],
+                old_patch: &[],
+            };
+            self.push_views(change, table)?;
+        }
+        Ok(())
     }
 
-    /// [`Self::push_cells`] reading tuple images in place
+    /// Encode one change from tuple images in place, see
+    /// [`ChunkBuilder::push_views`]
     pub fn push_views(&mut self, change: ViewChange<'_, '_>, table: u32) -> Result<()> {
         let t = &mut self.tables[table as usize];
         t.heaps += 1;
@@ -663,13 +646,15 @@ impl PlanWriter {
 
     /// Append `HeapOp::Truncate`; executor stores mirror rows with indices
     /// below `upto`, then applies truncate
-    pub fn push_truncate(&mut self, decoded: DecodedHeap, table: u32, upto: usize) -> Result<()> {
+    pub fn push_truncate(&mut self, t: Truncate, table: u32, upto: usize) -> Result<()> {
         self.seal_segment()?;
         self.tables[table as usize].heaps += 1;
-        self.steps.push(Step::Truncate {
-            heap: PlannedHeap { decoded, table },
-            upto,
-        });
+        let truncate = PlannedTruncate {
+            xid: t.xid,
+            source_lsn: t.source_lsn,
+            table,
+        };
+        self.steps.push(Step::Truncate { truncate, upto });
         Ok(())
     }
 
@@ -744,7 +729,9 @@ pub struct ViewChange<'v, 'a> {
     pub old_patch: &'v [(usize, ColumnValue)],
 }
 
-/// [`take_key_change_tombstone`]'s test over tuple images in place
+/// Whether an UPDATE changes primary/index key, or any column under
+/// `REPLICA IDENTITY FULL` without a primary key. PostgreSQL default/index
+/// identity logs old values only when key changes or contains TOASTed values
 fn key_moved(
     rel: &RelDescriptor,
     change: &ViewChange<'_, '_>,
@@ -912,7 +899,7 @@ pub enum PlanItem {
     Segment(Segment),
     /// Mirror rows below `upto` put before the truncate applies
     Truncate {
-        heap: PlannedHeap,
+        truncate: PlannedTruncate,
         upto: usize,
     },
 }
@@ -944,7 +931,7 @@ impl PlanReader {
         };
         Ok(Some(match step {
             Step::Control { event, row_idx } => PlanItem::Control { event, row_idx },
-            Step::Truncate { heap, upto } => PlanItem::Truncate { heap, upto },
+            Step::Truncate { truncate, upto } => PlanItem::Truncate { truncate, upto },
             Step::Segment {
                 count,
                 rows,
@@ -1014,7 +1001,7 @@ fn read_frame(f: &mut FileInput, tables: &[PlanTable]) -> Result<EncodedChunk> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::decode::heap_decoder::{ColumnValue, DecodedTuple};
+    use crate::decode::heap_decoder::{ColumnValue, DecodedHeap, DecodedTuple};
     use crate::emit::ch_emitter::Wire;
     use crate::mapping::{ColumnMapping, TableMapping, TableTarget};
     use crate::schema::{INT4OID, RelAttr, RelName, SchemaEvent};
@@ -1050,6 +1037,67 @@ mod tests {
                 missing_default: None,
             }],
         })
+    }
+
+    /// Delete marker splits off when UPDATE moves a key, or any column under
+    /// `REPLICA IDENTITY FULL` without a primary key
+    #[test]
+    fn key_moved_matrix() {
+        use crate::decode::heap_decoder::{form_block_data, view_block_data};
+        use crate::schema::ReplIdent;
+        let mut rel = (*descriptor(1)).clone();
+        let mut v = rel.attributes[0].clone();
+        (v.attnum, v.name, v.type_oid) = (2, "v".into(), crate::schema::TEXTOID);
+        (v.type_name, v.type_byval, v.type_len) = ("text".into(), false, -1);
+        rel.attributes.push(v);
+        let row = |id: i32, v: &str| {
+            form_block_data(&[
+                Some(ColumnValue::Int4(id)),
+                Some(ColumnValue::Text(v.into())),
+            ])
+        };
+        let pk = || ReplIdent::Default {
+            pk_attnums: Some(vec![1]),
+        };
+        let full_pk = || ReplIdent::Full {
+            pk_attnums: Some(vec![1]),
+        };
+        let full = || ReplIdent::Full { pk_attnums: None };
+        let index = ReplIdent::UsingIndex {
+            index_oid: 9,
+            key_attnums: vec![2],
+        };
+        let cases = [
+            (pk(), HeapOp::Update, (1, ""), true),
+            // PostgreSQL logs TOASTed keys even when unchanged
+            (pk(), HeapOp::Update, (2, ""), false),
+            (full_pk(), HeapOp::Update, (2, "a"), false),
+            (full_pk(), HeapOp::HotUpdate, (1, "a"), false),
+            (full(), HeapOp::HotUpdate, (2, "a"), true),
+            (full(), HeapOp::Update, (2, "b"), false),
+            (full(), HeapOp::Delete, (2, "a"), false),
+            (index, HeapOp::Update, (2, "a"), true),
+        ];
+        let new = row(2, "b");
+        for (replident, op, (id, v), split) in cases {
+            rel.replident = replident;
+            let old = row(id, v);
+            let (old, new) = (
+                view_block_data(&old, &rel).unwrap(),
+                view_block_data(&new, &rel).unwrap(),
+            );
+            let change = ViewChange {
+                op,
+                xid: 7,
+                source_lsn: 0x100,
+                new: Some(&new),
+                old: Some(&old),
+                new_patch: &[],
+                old_patch: &[],
+            };
+            let moved = key_moved(&rel, &change, &old, &new);
+            assert_eq!(moved, split, "{:?} {op:?} ({id}, {v:?})", rel.replident);
+        }
     }
 
     fn heap(rel: &Arc<RelDescriptor>, lsn: u64, v: i32) -> DecodedHeap {
@@ -1163,8 +1211,12 @@ mod tests {
             w.push_control(dropped(1), 0).unwrap();
             push(&mut w, &d1, heap(&d1, 100, 10), Some(r.clone())).unwrap();
             push(&mut w, &d2, heap(&d2, 110, 20), None).unwrap();
-            let mut truncate = heap(&d2, 115, 25);
-            truncate.op = HeapOp::Truncate;
+            let truncate = Truncate {
+                xid: 7,
+                source_lsn: 115,
+                descriptor: d2.clone(),
+                descriptor_valid_from: 0x40,
+            };
             let table = w.table(&d2, 0x40, || unreachable!("table live"));
             w.push_truncate(truncate, table, 0).unwrap();
             w.push_control(dropped(2), 0).unwrap();
@@ -1199,9 +1251,9 @@ mod tests {
                         }
                         format!("{:?}", rows(&s.chunks))
                     }
-                    PlanItem::Truncate { heap: h, .. } => {
-                        assert!(rd.tables[h.table as usize].route.is_none());
-                        format!("t{}", h.decoded.source_lsn)
+                    PlanItem::Truncate { truncate: t, .. } => {
+                        assert!(rd.tables[t.table as usize].route.is_none());
+                        format!("t{}", t.source_lsn)
                     }
                 });
             }

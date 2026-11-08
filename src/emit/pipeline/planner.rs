@@ -39,7 +39,7 @@
 
 use std::sync::Arc;
 
-use crate::decode::heap_decoder::{ColumnValue, view_heap_record};
+use crate::decode::heap_decoder::{ColumnValue, HeapImages, TupleView, view_heap_record};
 use crate::emit::pipeline::plan_spool::{
     DEFAULT_PLAN_MEM_MAX, EncoderCache, PlanPath, PlanSpoolError, PlanWriter, SealedPlan,
     ViewChange,
@@ -49,8 +49,8 @@ use crate::schema::RelDescriptor;
 use crate::toast::{ChunkRefMap, ToastResolver};
 use crate::xact::spill::{BodySpoolFile, DescribedInput};
 use crate::xact::xact_buffer::{
-    DrainEntry, DrainHeap, DrainWalk, DrainedBatch, FailClosedReason, WalkStep, XactBufferError,
-    detoast_heap, detoast_sites, external_sites, heap_reads_toast,
+    DrainEntry, DrainWalk, DrainedBatch, FailClosedReason, WalkStep, XactBufferError,
+    detoast_sites, external_sites,
 };
 
 /// Planner's window onto route state. Implementations resolve from frozen
@@ -188,47 +188,31 @@ impl<'a, V: PlanRouteView> Planner<'a, V> {
                         .map_err(PlanError::View)?;
                     self.writer.push_control(e, self.rows_base + cursor)?;
                 }
-                WalkStep::Truncate { heap, upto } => {
+                WalkStep::Truncate { truncate, upto } => {
                     self.resolver.clear_reads();
-                    let table =
-                        self.writer
-                            .table(&heap.descriptor, heap.descriptor_valid_from, || {
-                                self.view.route_for(&heap.descriptor)
-                            });
+                    let rel = &truncate.descriptor;
+                    let table = self.writer.table(rel, truncate.descriptor_valid_from, || {
+                        self.view.route_for(rel)
+                    });
                     self.writer
-                        .push_truncate(heap.decoded, table, self.rows_base + upto)?;
+                        .push_truncate(*truncate, table, self.rows_base + upto)?;
                 }
-                WalkStep::Heap(drained) => {
+                WalkStep::Heap(input) => {
                     // Route before validation and detoast: unmapped rows
                     // discard without touching the resolver or codec checks
-                    let rel = drained.descriptor().clone();
-                    let table = self
-                        .writer
-                        .table(&rel, drained.descriptor_valid_from(), || {
-                            self.view.route_for(&rel)
-                        });
+                    let rel = &input.descriptor;
+                    let table = self.writer.table(rel, input.descriptor_valid_from, || {
+                        self.view.route_for(rel)
+                    });
                     if !self.writer.routed(table) {
-                        self.writer.discard(table, drained.rows() as u64);
+                        self.writer.discard(table, u64::from(input.input.tuples));
                         continue;
                     }
-                    let mut heap = match drained {
-                        DrainHeap::Input(input) => {
-                            Box::pin(self.plan_views(&input, &rel, table, spool, &ref_maps))
-                                .await?;
-                            continue;
-                        }
-                        DrainHeap::Cells(heap) => heap,
-                    };
-                    if heap.decoded.new.as_ref().is_some_and(|t| t.partial) {
-                        return Err(PlanError::PartialUpdate {
-                            lsn: heap.decoded.source_lsn,
-                        });
+                    if !self.plan_inline(&input, table)? {
+                        // Boxed: external values are rare, and awaiting them
+                        // holds tuple views deep enough to bloat every plan future
+                        Box::pin(self.plan_views(&input, table, spool, &ref_maps)).await?;
                     }
-                    if heap_reads_toast(&heap) {
-                        // Value permit drops once bytes land in the plan
-                        Box::pin(detoast_heap(&mut heap, spool, &ref_maps, self.resolver)).await?;
-                    }
-                    self.writer.push_cells(heap.decoded, table)?;
                 }
             }
         }
@@ -237,16 +221,11 @@ impl<'a, V: PlanRouteView> Planner<'a, V> {
         Ok(())
     }
 
-    /// Encode an input from tuple images in place, external values resolved
-    /// into per-image patches
-    async fn plan_views(
-        &mut self,
-        input: &DescribedInput,
-        rel: &Arc<RelDescriptor>,
-        table: u32,
-        spool: Option<&BodySpoolFile>,
-        ref_maps: &[&ChunkRefMap],
-    ) -> Result<(), PlanError> {
+    /// Tuple images of `input`, rejecting partial new images
+    fn views<'i>(
+        input: &'i DescribedInput,
+    ) -> Result<smallvec::SmallVec<[HeapImages<TupleView<'i>>; 1]>, PlanError> {
+        let rel = &input.descriptor;
         let images = view_heap_record(input.input.record_bytes(), rel).map_err(|e| {
             XactBufferError::OrdinaryFailClosed {
                 relid: rel.oid,
@@ -256,12 +235,63 @@ impl<'a, V: PlanRouteView> Planner<'a, V> {
                 reason: FailClosedReason::Malformed(e.to_string()),
             }
         })?;
+        if images
+            .iter()
+            .any(|h| h.new.as_ref().is_some_and(|t| t.partial))
+        {
+            return Err(PlanError::PartialUpdate {
+                lsn: input.input.source_lsn,
+            });
+        }
+        Ok(images)
+    }
+
+    fn push_images(
+        &mut self,
+        input: &DescribedInput,
+        h: &HeapImages<TupleView<'_>>,
+        patches: &[Vec<(usize, ColumnValue)>; 2],
+        table: u32,
+    ) -> Result<(), PlanError> {
+        let change = ViewChange {
+            op: h.op,
+            xid: input.input.xid,
+            source_lsn: input.input.source_lsn,
+            new: h.new.as_ref(),
+            old: h.old.as_ref(),
+            new_patch: &patches[0],
+            old_patch: &patches[1],
+        };
+        Ok(self.writer.push_views(change, table)?)
+    }
+
+    /// Encode an input without external values; false leaves it to
+    /// [`Self::plan_views`]
+    fn plan_inline(&mut self, input: &DescribedInput, table: u32) -> Result<bool, PlanError> {
+        let images = Self::views(input)?;
+        if images
+            .iter()
+            .any(|h| !external_sites([h.new.as_ref(), h.old.as_ref()]).is_empty())
+        {
+            return Ok(false);
+        }
         for h in &images {
-            if h.new.as_ref().is_some_and(|t| t.partial) {
-                return Err(PlanError::PartialUpdate {
-                    lsn: input.input.source_lsn,
-                });
-            }
+            self.push_images(input, h, &Default::default(), table)?;
+        }
+        Ok(true)
+    }
+
+    /// Encode an input from tuple images in place, external values resolved
+    /// into per-image patches
+    async fn plan_views(
+        &mut self,
+        input: &DescribedInput,
+        table: u32,
+        spool: Option<&BodySpoolFile>,
+        ref_maps: &[&ChunkRefMap],
+    ) -> Result<(), PlanError> {
+        let rel = &input.descriptor;
+        for h in &Self::views(input)? {
             let mut patches: [Vec<(usize, ColumnValue)>; 2] = Default::default();
             let sites = external_sites([h.new.as_ref(), h.old.as_ref()]);
             if !sites.is_empty() {
@@ -274,16 +304,7 @@ impl<'a, V: PlanRouteView> Planner<'a, V> {
                     patches[site.image].push((site.idx, v));
                 }
             }
-            let change = ViewChange {
-                op: h.op,
-                xid: input.input.xid,
-                source_lsn: input.input.source_lsn,
-                new: h.new.as_ref(),
-                old: h.old.as_ref(),
-                new_patch: &patches[0],
-                old_patch: &patches[1],
-            };
-            self.writer.push_views(change, table)?;
+            self.push_images(input, h, &patches, table)?;
         }
         Ok(())
     }
@@ -585,9 +606,9 @@ mod tests {
                         order.extend(lsns(c, 0).iter().map(|lsn| format!("h{lsn}r")));
                     }
                 }
-                PlanItem::Truncate { heap: h, .. } => order.push(format!(
+                PlanItem::Truncate { truncate: h, .. } => order.push(format!(
                     "h{}{}",
-                    h.decoded.source_lsn,
+                    h.source_lsn,
                     if rd.tables[h.table as usize].route.is_some() {
                         "r"
                     } else {

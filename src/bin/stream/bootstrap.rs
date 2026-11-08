@@ -18,7 +18,7 @@ use walshadow::backfill::visibility_gate::{
     DeferredLane, GateStats, GreenfieldSink, PendingGate, resolve_greenfield, stream_phase,
 };
 use walshadow::backfill_bootstrap::{
-    BootstrapConfig, BootstrapOutcome, BootstrapProgress, drain_backfill, seed_in_snapshot,
+    BootstrapConfig, BootstrapOutcome, BootstrapProgress, seed_in_snapshot,
     spawn_greenfield_bootstrap,
 };
 use walshadow::backup_source::BackupSource;
@@ -27,7 +27,6 @@ use walshadow::backup_source_object_store::ObjectStoreSource;
 use walshadow::bootstrap_marker::{self, BootstrapMarker};
 use walshadow::ch_emitter::{BootstrapMode, EmitterConfig, EmitterStats};
 use walshadow::config::{CliOverrides, ConfigResolver, cli_over_toml};
-use walshadow::decoder_sink::MetricsTupleObserver;
 use walshadow::emit::route::routing;
 use walshadow::mapping::MappingHandle;
 use walshadow::metrics::{MetricsRegistry, MetricsSnapshot};
@@ -117,7 +116,7 @@ pub(crate) fn shadow_data_dir_initialized(dir: &std::path::Path) -> bool {
 /// (synthetic INSERT `_lsn = start_lsn`, `_commit_ts = 0`, `_is_deleted = 0`).
 /// `wait_through(K)` proves every bootstrap seq durable on CH before
 /// teardown, so the WAL pump resumes against a fully-shipped baseline.
-/// `None`: rows drain to a metrics-only observer via `drain_backfill`.
+/// `None`: rows drain counted only.
 pub(crate) async fn run_bootstrap(
     src_cfg: &PgConfig,
     feed: &mut SourceFeed,
@@ -978,11 +977,17 @@ pub(crate) async fn run_bootstrap(
         });
         (rows_routed, outcome, window, landing_tracker)
     } else {
-        // Metrics-only skips destination convergence
-        let mut observer = MetricsTupleObserver::default();
-        let (drain_res, pump_res) =
-            tokio::join!(drain_backfill(rx, &drain_catalog, &mut observer), pump);
-        let shipped = drain_res.context("bootstrap drain")?;
+        // Metrics-only skips destination convergence; the walk already
+        // validated every row against its descriptor
+        let count = async move {
+            let mut rx = rx;
+            let mut shipped = 0u64;
+            while let Some(slab) = rx.recv().await {
+                shipped += slab.len() as u64;
+            }
+            shipped
+        };
+        let (shipped, pump_res) = tokio::join!(count, pump);
         let outcome: BootstrapOutcome = pump_res
             .context("bootstrap pump join")?
             .context("bootstrap pump")?;

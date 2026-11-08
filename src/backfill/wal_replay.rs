@@ -16,8 +16,8 @@ use crate::budget::{MemoryBudget, MemoryPermit, acquire_opt};
 use crate::catalog::desc_log::{DescriptorLog, DescriptorLogs};
 use crate::config::ResolvedConfig;
 use crate::decode::heap_decoder::{
-    ColumnValue, DescribedHeap, HeapOp, XLH_DELETE_IS_SUPER, XLOG_HEAP_DELETE,
-    XLOG_HEAP_HOT_UPDATE, XLOG_HEAP_INSERT, XLOG_HEAP_OPMASK, XLOG_HEAP_UPDATE, view_heap_record,
+    ColumnValue, HeapOp, XLH_DELETE_IS_SUPER, XLOG_HEAP_DELETE, XLOG_HEAP_HOT_UPDATE,
+    XLOG_HEAP_INSERT, XLOG_HEAP_OPMASK, XLOG_HEAP_UPDATE, view_heap_record,
 };
 use crate::decode::visibility::PgXactPatch;
 use crate::decode::wal_xact::{
@@ -39,8 +39,8 @@ use crate::source::wal_stream::WalStream;
 use crate::toast::{ChunkRefMap, ToastResolver, ToastRow, ToastRowRef};
 use crate::xact::spill::{BodySpoolFile, DescribedInput};
 use crate::xact::xact_buffer::{
-    BufferingDecoderSink, DrainEntry, DrainHeap, DrainedBatch, SubxactTracker, WalkStep,
-    XactBuffer, detoast_heap, detoast_sites, external_sites, heap_reads_toast, resolve_stash,
+    BufferingDecoderSink, DrainEntry, DrainedBatch, SubxactTracker, WalkStep, XactBuffer,
+    detoast_sites, external_sites, resolve_stash,
 };
 use foldhash::{HashMap, HashSet};
 
@@ -648,13 +648,9 @@ impl WalReplaySink {
                         .await
                         .map_err(|e| SinkError::Other(format!("toast rewrite barrier: {e}")))?;
                 }
-                WalkStep::Heap(drained) => {
-                    let rel = drained.descriptor().clone();
-                    let rfn = match &drained {
-                        DrainHeap::Cells(h) => h.decoded.rfn,
-                        DrainHeap::Input(_) => rel.rfn,
-                    };
-                    let rows = drained.rows() as u64;
+                WalkStep::Heap(input) => {
+                    let rfn = input.descriptor.rfn;
+                    let rows = u64::from(input.input.tuples);
                     // Decode TOAST chunks, route through parent row
                     let Some(target) = targets.get(&(rfn.db_node, rfn.rel_node)) else {
                         continue;
@@ -680,14 +676,7 @@ impl WalReplaySink {
                         spool,
                         ref_maps: &ref_maps,
                     };
-                    match drained {
-                        DrainHeap::Input(input) => {
-                            Box::pin(self.replay_views(&input, &rel, route, &at)).await?;
-                        }
-                        DrainHeap::Cells(heap) => {
-                            Box::pin(self.replay_cells(heap, route, &at)).await?;
-                        }
-                    }
+                    Box::pin(self.replay_views(&input, route, &at)).await?;
                 }
             }
         }
@@ -710,10 +699,10 @@ impl WalReplaySink {
     async fn replay_views(
         &mut self,
         input: &DescribedInput,
-        rel: &Arc<RelDescriptor>,
         route: &Arc<RouteSnapshot>,
         at: &Commit<'_>,
     ) -> std::result::Result<(), SinkError> {
+        let rel = &input.descriptor;
         let lsn = input.input.source_lsn;
         let images = view_heap_record(input.input.record_bytes(), rel)
             .map_err(|e| SinkError::Other(format!("wal_replay: decode at {lsn:#X}: {e}")))?;
@@ -758,36 +747,6 @@ impl WalReplaySink {
             self.encoded(seq, permit).await?;
         }
         Ok(())
-    }
-
-    /// [`Self::replay_views`] for owned cells
-    async fn replay_cells(
-        &mut self,
-        mut heap: DescribedHeap,
-        route: &Arc<RouteSnapshot>,
-        at: &Commit<'_>,
-    ) -> std::result::Result<(), SinkError> {
-        if !self.lands(route, heap.decoded.op) {
-            return Ok(());
-        }
-        // Gate stays as wide as detoast's leaf acquire: narrowing it to
-        // store-bound pointers would hold pending leaf permits across that
-        // acquire, which can wait on them
-        if heap_reads_toast(&heap) {
-            self.flush_rows().await?;
-        }
-        let permit = detoast_heap(&mut heap, at.spool, at.ref_maps, &self.resolver)
-            .await
-            .map_err(SinkError::from)?;
-        let rel = &heap.descriptor;
-        let key = Arc::as_ptr(rel) as usize;
-        let rows = self
-            .chunks
-            .push_cells(key, rel, route, heap.decoded, at.ts)
-            .map_err(encode_err)?;
-        let seq = self.place_rows(at.lsn, rows);
-        self.replay.rows_replayed += 1;
-        self.encoded(seq, permit).await
     }
 
     async fn handle(&mut self, record: &Record<'_>) -> std::result::Result<(), SinkError> {

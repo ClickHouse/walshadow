@@ -3,21 +3,11 @@
 Commits, loads, and gap replay encode rows from tuple bytes or COPY fields into
 column chunks, and sealed Native blocks stay compressed until acknowledgement;
 see [architecture](../architecture/README.md#commit-pipeline). Remaining work
-moves stash-resolved records off owned cells, bounds memory across owners, and
-proves resource gains end to end. Follow [shared constraints](coordination.md),
+bounds memory across owners and proves resource gains end to end. Follow [shared constraints](coordination.md),
 [value coercion](value_coercion.md), and [performance acceptance](performance.md)
 
 Share view encoders and column buffers with [container codecs](tier2.md)
 Container promotion can retain existing raw pending cells in owned adapters
-
-## Stash-resolved records
-
-Records resolved at commit decode into owned cells in
-[transaction buffer](../src/xact/xact_buffer.rs) `fold_raw_ordinary`, then plan
-through the cell adapter. Carry them as raw inputs under their resolved
-descriptor instead, keeping operation policy and ambiguity fences at fold time.
-Resolved TOAST values stay owned cells patching tuple views; read-ahead hands
-them over rendered
 
 ## Bound memory across owners
 

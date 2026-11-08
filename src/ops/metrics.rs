@@ -394,8 +394,6 @@ snapshot! {
         "Cumulative raw-stash payload bytes by first landing.",
     counter raw_decode_rows_by_op: [u64; 7] ["op" = HEAP_OP_LABELS] =
         "Rows fanned out of decoded raw records.",
-    gauge raw_pending_rows: u64 = "Raw-decoded heaps queued for pending-first yield.",
-    gauge raw_pending_bytes: u64 = "Bytes held by the pending raw fanout.",
     counter backfill_backup_rows_total: u64 = "Tuples decoded by table backfill backup walks, including TOAST chunks and rows awaiting visibility checks. Cumulative across passes.",
     counter backfill_backup_bytes_total: u64 = "Backup body bytes handed to table backfill page walks, excluding skipped files. Cumulative across passes.",
     counter backfill_copy_rows_total: u64 = "Rows decoded from source COPY for table backfills.",
@@ -1363,8 +1361,6 @@ mod tests {
             raw_stash_bytes_by_storage: [11, 12],
             raw_decode_rows_by_op: [1, 2, 3, 4, 5, 6, 7],
             decoder_records_by_op: [41, 42, 43, 44, 45],
-            raw_pending_rows: 13,
-            raw_pending_bytes: 14,
             by_database: vec![DbSeries {
                 database: "app".into(),
                 descriptor_ambiguous_total: 21,
@@ -1396,8 +1392,6 @@ mod tests {
         );
         assert!(body.contains("walshadow_raw_decode_rows_total{op=\"multi_insert\"} 6"));
         assert!(body.contains("walshadow_decoder_records_total{op=\"hot_update\"} 43"));
-        assert!(body.contains("walshadow_raw_pending_rows 13"));
-        assert!(body.contains("walshadow_raw_pending_bytes 14"));
         // Published intervals and lookups landing in one stay distinct
         // families
         assert!(body.contains("walshadow_descriptor_ambiguous_total{database=\"app\"} 21"));

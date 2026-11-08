@@ -760,6 +760,7 @@ pub(crate) fn copy_slot<'a>(
 }
 
 /// Owned cells of a COPY row, attnum-1 indexed
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn copy_cells(
     row: &CopyRow,
     rel: &RelDescriptor,
@@ -769,6 +770,7 @@ pub(crate) fn copy_cells(
         .collect()
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn owned(slot: Slot<'_>) -> ColumnValue {
     match slot {
         Slot::Cell(Cell::Value(v)) => v.to_owned_value(),

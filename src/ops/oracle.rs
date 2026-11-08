@@ -8,7 +8,6 @@ use clickhouse_c::{Allocator, Block, BlockOpts, BlockReader, Column, Kind, Slice
 use crate::ch::types;
 use crate::decode::heap_decoder::ColumnValue;
 use crate::ops::bridge::{Bridge, BridgeError, MAX_REQUEST_BYTES, request_frame};
-use crate::schema::RelAttr;
 use tokio_postgres::types::Oid;
 
 /// Cell tags, matching `WS_CELL_*` in `pgext/walshadow.h`
@@ -564,7 +563,8 @@ fn decode_block(
 }
 
 /// Render PostGIS 2-D points as WKT, typoutput yields HEXEWKB
-pub fn render_ext_columns(attrs: &[RelAttr], columns: &mut [Option<ColumnValue>]) {
+#[cfg(test)]
+pub fn render_ext_columns(attrs: &[crate::schema::RelAttr], columns: &mut [Option<ColumnValue>]) {
     // Scan cells first: attribute type names sit behind a pointer per column
     for (idx, cell) in columns.iter_mut().enumerate() {
         let Some(ColumnValue::PgPending { .. }) = cell.as_ref() else {
@@ -581,7 +581,7 @@ pub fn render_ext_columns(attrs: &[RelAttr], columns: &mut [Option<ColumnValue>]
     }
 }
 
-/// Render one PostGIS cell, see [`render_ext_columns`]
+/// Render one PostGIS cell as WKT, typoutput yields HEXEWKB
 pub(crate) fn render_ext_value(cell: &mut ColumnValue) {
     if let ColumnValue::PgPending { raw, .. } = cell
         && let Some(text) = gserialized_point_to_wkt(raw)

@@ -37,7 +37,9 @@ use crate::column_rules::{ColumnEntry, ColumnRule, ColumnRules, Substitute};
 use crate::decode::datum::{DatumRef, ValueRef};
 #[cfg(test)]
 use crate::decode::decoder_sink::DecoderSinkError;
-use crate::decode::heap_decoder::{ColumnValue, CommittedTuple, HeapOp};
+use crate::decode::heap_decoder::ColumnValue;
+#[cfg(any(test, feature = "test-support"))]
+use crate::decode::heap_decoder::{CommittedTuple, HeapOp};
 use crate::decode::heap_decoder::{datum_value, datum_view};
 use crate::mapping::{
     ColumnMapping, DropTableStrategy, NamespaceMapping, SystemColumnNames, SystemColumns,
@@ -2384,8 +2386,9 @@ impl TableEncoder {
         self.append_routed(committed, mapping, op_code, None)
     }
 
-    /// Append one row, stamping `leaf` into the partition column. Return
-    /// [`Append::Full`] without mutation when oracle threshold is hit
+    #[cfg(any(test, feature = "test-support"))]
+    /// Append one owned row, stamping `leaf` into the partition column.
+    /// Return [`Append::Full`] without mutation when oracle threshold is hit
     pub fn append_routed(
         &mut self,
         committed: &CommittedTuple,
@@ -2417,7 +2420,8 @@ impl TableEncoder {
         self.append_cells(|i| cells[i], &stamp)
     }
 
-    /// [`Self::append_routed`] reading one image of `rel` in place. `patch`
+    /// Append one image of `rel` read in place. Return [`Append::Full`]
+    /// without mutation when oracle threshold is hit. `patch`
     /// replaces attributes by index: resolved TOAST values, and values past
     /// `rel`'s attributes. Values whose decode allocates, and PostGIS
     /// renders, build in row scratch

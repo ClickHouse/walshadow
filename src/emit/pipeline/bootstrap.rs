@@ -457,6 +457,7 @@ async fn resolve_spooled(
             total_placed += placed;
             placed = 0;
             if ticker.fire() {
+                out.flush().await?;
                 c.tail.checkpoint(out.seqs.next()).await?;
                 c.state.offset = total_bytes - remaining;
                 c.state.rows += total_placed;
@@ -468,6 +469,7 @@ async fn resolve_spooled(
     }
     let rows_routed = match checkpoint.as_mut() {
         Some(c) => {
+            out.flush().await?;
             c.tail.checkpoint(out.seqs.next()).await?;
             c.state.offset = total_bytes;
             c.state.rows += total_placed;
