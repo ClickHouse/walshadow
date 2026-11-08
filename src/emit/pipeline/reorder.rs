@@ -48,7 +48,10 @@ use crate::config::ResolvedConfig;
 use crate::emit::pipeline::Fatal;
 use crate::emit::pipeline::ack::{AckHandle, BufferedRowSender, Publish, SeqAlloc};
 use crate::emit::pipeline::batcher::{BatcherMsg, PlacedSegment};
-use crate::emit::pipeline::plan_spool::{EncoderCache, PlanItem, PlanPath, SealedPlan, Segment};
+use crate::emit::pipeline::encode::{self, Encoders, PendingSegment};
+use crate::emit::pipeline::plan_spool::{
+    EncoderCache, PlanItem, PlanPath, SealedPlan, Segment, SegmentBody,
+};
 use crate::emit::pipeline::planner::{PlanRouteView, Planner, drain_reason};
 use crate::emit::route::{RouteSnapshot, RowPolicy, route_via};
 use crate::mapping::{MappingSnapshot, TableMapping};
@@ -161,8 +164,15 @@ struct Outbox {
     /// with [`Self::staged`]
     seqs: SeqAlloc,
     /// Placed rows not yet on the batcher channel, shipped per worker batch
-    /// so small commits share one channel hop and wakeup
+    /// so small commits share one channel hop and wakeup. Encoded and
+    /// pending segments never stage together, keeping seq order
     staged: Vec<PlacedSegment>,
+    /// Pending segments, shipped as one encode job
+    pending: Vec<PendingSegment>,
+    /// Admission of `pending`, riding their job
+    pending_permit: Option<crate::budget::MemoryPermit>,
+    encoders: Encoders,
+    stats: Arc<EmitterStats>,
     staged_rows: usize,
     staged_bytes: usize,
     /// Global resident-payload pool; slice and chunk generation admission
@@ -179,6 +189,43 @@ impl Outbox {
         )
     }
 
+    /// Stage `segment` under `seq`, first shipping staged segments of the
+    /// other kind so the batcher sees seqs in order
+    async fn stage(
+        &mut self,
+        seq: u64,
+        segment: Segment,
+        permit: Option<crate::budget::MemoryPermit>,
+    ) -> Result<(), SinkError> {
+        let other = match segment.body {
+            SegmentBody::Pending(_) => !self.staged.is_empty(),
+            SegmentBody::Encoded(_) => !self.pending.is_empty(),
+        };
+        if other {
+            Box::pin(self.flush_pending()).await?;
+        }
+        match segment.body {
+            SegmentBody::Pending(records) => {
+                self.pending.push(PendingSegment {
+                    seq,
+                    rows: segment.rows,
+                    records,
+                });
+                if let Some(p) = permit {
+                    crate::budget::absorb_into(&mut self.pending_permit, p);
+                }
+            }
+            SegmentBody::Encoded(chunks) => self.staged.push(PlacedSegment {
+                seq,
+                chunks,
+                permit: permit.map(Arc::new),
+            }),
+        }
+        self.staged_rows += segment.rows as usize;
+        self.staged_bytes += segment.bytes;
+        Ok(())
+    }
+
     /// Admission permit for `bytes`. Staged rows hold permits only shipping
     /// releases, so ship before waiting on the pool
     async fn admit(
@@ -191,12 +238,16 @@ impl Outbox {
         if let Some(p) = budget.try_admit(bytes) {
             return Ok(Some(p));
         }
-        self.flush_pending().await?;
-        tokio::select! {
-            biased;
-            _ = self.fatal.wait() => Err(self.fatal_err()),
-            p = budget.admit(bytes) => Ok(Some(p)),
-        }
+        // Boxed: waiting is rare, inline it would bloat every commit future
+        Box::pin(async {
+            self.flush_pending().await?;
+            tokio::select! {
+                biased;
+                _ = self.fatal.wait() => Err(self.fatal_err()),
+                p = budget.admit(bytes) => Ok(Some(p)),
+            }
+        })
+        .await
     }
 }
 
@@ -206,16 +257,24 @@ impl BufferedRowSender for Outbox {
     }
 
     async fn send_rows(&mut self) -> Result<(), SinkError> {
-        if self.staged.is_empty() {
+        let msg = if !self.pending.is_empty() {
+            BatcherMsg::Encoded(encode::spawn(
+                std::mem::take(&mut self.pending),
+                self.pending_permit.take(),
+                self.encoders.clone(),
+                self.stats.clone(),
+            ))
+        } else if !self.staged.is_empty() {
+            BatcherMsg::Segments(std::mem::take(&mut self.staged))
+        } else {
             return Ok(());
-        }
-        let chunks = std::mem::take(&mut self.staged);
+        };
         self.staged_rows = 0;
         self.staged_bytes = 0;
         let sent = tokio::select! {
             biased;
             _ = self.fatal.wait() => return Err(self.fatal_err()),
-            r = self.msg_tx.send(BatcherMsg::Segments(chunks)) => r,
+            r = self.msg_tx.send(msg) => r,
         };
         sent.map_err(|_| SinkError::Other("batcher channel closed".into()))
     }
@@ -300,6 +359,10 @@ impl ReorderSink {
                 fatal,
                 seqs,
                 staged: Vec::new(),
+                pending: Vec::new(),
+                pending_permit: None,
+                encoders: Encoders::default(),
+                stats: stats.clone(),
                 staged_rows: 0,
                 staged_bytes: 0,
                 budget,
@@ -709,18 +772,22 @@ impl ReorderSink {
         if !self.resolver.stores_chunks() || self.retires.is_empty() {
             return Ok(());
         }
-        let cut = self.resume_floor.get();
-        for entry in self.retires.due(cut) {
-            self.resolver
-                .retire_mirror(entry.db_oid, entry.toast_relid)
-                .await
-                .map_err(|e| SinkError::Other(format!("toast mirror retire: {e}")))?;
-            self.retires
-                .remove(entry)
-                .await
-                .map_err(|e| SinkError::Other(format!("toast retire ledger: {e}")))?;
-        }
-        Ok(())
+        // Boxed: rare, and deep enough to bloat every commit future
+        Box::pin(async {
+            let cut = self.resume_floor.get();
+            for entry in self.retires.due(cut) {
+                self.resolver
+                    .retire_mirror(entry.db_oid, entry.toast_relid)
+                    .await
+                    .map_err(|e| SinkError::Other(format!("toast mirror retire: {e}")))?;
+                self.retires
+                    .remove(entry)
+                    .await
+                    .map_err(|e| SinkError::Other(format!("toast retire ledger: {e}")))?;
+            }
+            Ok(())
+        })
+        .await
     }
 
     /// Settle pending rows on commit or abort, including subtransactions
@@ -898,27 +965,22 @@ impl ReorderSink {
         commit_lsn: u64,
         publish: Publish,
     ) -> Result<(), SinkError> {
-        let permit = self.out.admit(segment.bytes).await?.map(Arc::new);
+        let permit = self.out.admit(segment.bytes).await?;
         let seq = self.out.seqs.open(commit_lsn, publish);
         self.stats.queue_jobs_out.fetch_add(1, Ordering::Relaxed);
         self.stats.decode_jobs_in.fetch_add(1, Ordering::Relaxed);
         self.stats
             .decode_rows_out
             .fetch_add(segment.rows, Ordering::Relaxed);
-        let chunk_rows = self.dest.current().decode_chunk_rows;
+        let rows = segment.rows;
+        self.out.stage(seq.seq(), segment, permit).await?;
         let out = &mut self.out;
-        out.staged.push(PlacedSegment {
-            seq: seq.seq(),
-            chunks: segment.chunks,
-            permit,
-        });
-        out.seqs.place(seq, segment.rows);
-        out.staged_rows += segment.rows as usize;
-        out.staged_bytes += segment.bytes;
-        if out.staged_rows >= chunk_rows
+        out.seqs.place(seq, rows);
+        if out.staged_rows >= self.dest.current().decode_chunk_rows
             || out.staged_bytes >= crate::emit::pipeline::batcher::DECODE_CHUNK_BYTES
         {
-            out.flush_pending().await?;
+            // Boxed: once per many commits, inline it would bloat each
+            Box::pin(out.flush_pending()).await?;
         }
         Ok(())
     }
@@ -1497,29 +1559,6 @@ impl PlanRouteView for ReorderRouteView<'_> {
     }
 }
 
-impl ReorderSink {
-    async fn handle(&mut self, record: &Record<'_>) -> Result<(), SinkError> {
-        if !Self::wants(record) {
-            return Ok(());
-        }
-        let info = record.parsed.header.info;
-        let op = info & XLOG_XACT_OPMASK;
-        let xid = record.parsed.header.xact_id;
-        match op {
-            XLOG_XACT_COMMIT | XLOG_XACT_COMMIT_PREPARED => self.on_commit(xid, info, record).await,
-            XLOG_XACT_ABORT | XLOG_XACT_ABORT_PREPARED => self.on_abort(xid, info, record).await,
-            XLOG_XACT_ASSIGNMENT => {
-                if let Some((xtop, subs)) = parse_xact_assignment(&record.parsed.main_data) {
-                    self.subxact_tracker.lock().await.assign(xtop, &subs);
-                }
-                Ok(())
-            }
-            // PREPARE allocates no seq; COMMIT_PREPARED drains it later
-            _ => Ok(()),
-        }
-    }
-}
-
 impl RecordSink for ReorderSink {
     fn wants(record: &Record<'_>) -> bool {
         record.parsed.header.resource_manager_id == RmId::Xact as u8
@@ -1541,10 +1580,7 @@ impl RecordSink for ReorderSink {
         &'a mut self,
         record: &'a Record<'a>,
     ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
-        Box::pin(async move {
-            self.handle(record).await?;
-            self.out.flush_pending().await
-        })
+        self.on_records(std::slice::from_ref(record))
     }
 
     fn on_records<'a>(
@@ -1552,8 +1588,27 @@ impl RecordSink for ReorderSink {
         batch: &'a [Record<'a>],
     ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
         Box::pin(async move {
+            // Dispatch inline: a per-record helper future would copy the
+            // commit future once more per commit
             for record in batch.iter().filter(|r| Self::wants(r)) {
-                self.handle(record).await?;
+                let info = record.parsed.header.info;
+                let xid = record.parsed.header.xact_id;
+                match info & XLOG_XACT_OPMASK {
+                    XLOG_XACT_COMMIT | XLOG_XACT_COMMIT_PREPARED => {
+                        self.on_commit(xid, info, record).await?;
+                    }
+                    XLOG_XACT_ABORT | XLOG_XACT_ABORT_PREPARED => {
+                        self.on_abort(xid, info, record).await?;
+                    }
+                    XLOG_XACT_ASSIGNMENT => {
+                        if let Some((xtop, subs)) = parse_xact_assignment(&record.parsed.main_data)
+                        {
+                            self.subxact_tracker.lock().await.assign(xtop, &subs);
+                        }
+                    }
+                    // PREPARE allocates no seq; COMMIT_PREPARED drains it later
+                    _ => {}
+                }
             }
             self.out.flush_pending().await
         })
@@ -1768,11 +1823,70 @@ mod tests {
             fatal: fatal.clone(),
             seqs: ack.seqs(0).buffer_events(),
             staged: Vec::new(),
+            pending: Vec::new(),
+            pending_permit: None,
+            encoders: Encoders::default(),
+            stats: Arc::default(),
             staged_rows: 0,
             staged_bytes: 0,
             budget: Some(budget.clone()),
         };
         (out, tail)
+    }
+
+    /// Encoded and pending segments ship in staging order, each run of one
+    /// kind as one message
+    #[tokio::test]
+    async fn staged_kinds_ship_in_seq_order() {
+        use crate::emit::pipeline::plan_spool::PendingRows;
+        let fatal = Fatal::new();
+        let (ack, _collector) =
+            crate::emit::pipeline::ack::spawn(Arc::new(Monotone::default()), fatal.clone());
+        let (msg_tx, mut msg_rx) = mpsc::channel(8);
+        let mut out = Outbox {
+            msg_tx,
+            fatal,
+            seqs: ack.seqs(0).buffer_events(),
+            staged: Vec::new(),
+            pending: Vec::new(),
+            pending_permit: None,
+            encoders: Encoders::default(),
+            stats: Arc::default(),
+            staged_rows: 0,
+            staged_bytes: 0,
+            budget: None,
+        };
+        let segment = |body| Segment {
+            body,
+            rows: 0,
+            bytes: 0,
+        };
+        let encoded = || segment(SegmentBody::Encoded(Vec::new()));
+        let pending = || segment(SegmentBody::Pending(PendingRows::default()));
+        for (seq, s) in [
+            (1, encoded()),
+            (2, encoded()),
+            (3, pending()),
+            (4, pending()),
+            (5, encoded()),
+        ] {
+            out.stage(seq, s, None).await.unwrap();
+        }
+        out.flush_pending().await.unwrap();
+        let mut shipped = Vec::new();
+        while let Ok(msg) = msg_rx.try_recv() {
+            shipped.push(match msg {
+                BatcherMsg::Segments(s) => {
+                    format!("{:?}", s.iter().map(|s| s.seq).collect::<Vec<_>>())
+                }
+                BatcherMsg::Encoded(job) => {
+                    job.await.unwrap().unwrap();
+                    "job".into()
+                }
+                BatcherMsg::FlushAll(_) => unreachable!(),
+            });
+        }
+        assert_eq!(shipped, ["[1, 2]", "job", "[5]"]);
     }
 
     /// Pool short only by permits riding staged rows: admission ships them

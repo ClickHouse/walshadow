@@ -40,9 +40,11 @@ planning committed transactions
 ![Commit pipeline: reorder plans column chunks, one batcher feeds a conversion and sealing pool, inserters send prepared blocks, and acknowledgements advance a contiguous watermark](workers.svg)
 
 `BufferingDecoderSink` and `ReorderSink` share one record-queue worker
-`ReorderSink` plans each commit, encoding its rows into per-table column
-chunks, and places them onto the batcher in order. Batcher merges chunks of
-many commits into Native blocks and groups blocks into per-table INSERTs. A
+`ReorderSink` plans each commit and places it onto the batcher in order.
+Planning routes, validates and detoasts rows but leaves them WAL bytes; each
+outbox flush hands the rows of many commits to one encode job on the runtime,
+which writes per-table column chunks. Batcher awaits jobs in order, merges
+chunks into Native blocks and groups blocks into per-table INSERTs. A
 separate conversion pool resolves PostgreSQL types, then serializes each block
 once and keeps prepared bytes until its INSERT is durable. Compression follows
 `[ch] compression`; inserters rebuild blocks only when a connection rejects

@@ -56,8 +56,6 @@ pub(crate) struct ResolvedBatch {
     pub blocks: Vec<SealedBlock>,
     pub n_rows: usize,
     pub per_seq: Vec<(u64, u64)>,
-    /// Admission permit shares covering these rows, dropped post-insert-ack
-    _permits: Vec<Arc<crate::budget::MemoryPermit>>,
     _encoded: crate::budget::MemoryPermit,
 }
 
@@ -237,7 +235,6 @@ async fn run(
             blocks,
             n_rows,
             per_seq,
-            permits,
             mut encoded,
         } = batch;
         let mut sealed = Vec::with_capacity(blocks.len());
@@ -287,7 +284,6 @@ async fn run(
             blocks: sealed,
             n_rows,
             per_seq,
-            _permits: permits,
             _encoded: encoded,
         };
         if tx.send(ready).await.is_err() {

@@ -34,6 +34,7 @@ use crate::decode::heap_decoder::CommittedTuple;
 use crate::emit::ch_emitter::{
     Append, ColumnBuf, ColumnEncoding, EmitterStats, EncodedChunk, TableEncoder, TablePlan,
 };
+use crate::emit::pipeline::encode::EncodedRun;
 use crate::emit::pipeline::{DEFAULT_PIPELINE_FLUSH, Fatal};
 use crate::emit::route::RouteSnapshot;
 use crate::schema::{RelDescriptor, TableKey};
@@ -54,7 +55,7 @@ pub struct RowTable {
 pub struct PlacedSegment {
     pub seq: u64,
     pub chunks: Vec<EncodedChunk>,
-    /// Released post-insert-ack, when every covering `InsertBatch` drops
+    /// Released once every table holding these rows emits its batch
     pub permit: Option<Arc<crate::budget::MemoryPermit>>,
 }
 
@@ -78,7 +79,7 @@ impl PlacedSegment {
         }
         Ok(Self {
             seq,
-            chunks: builder.take()?.into_iter().map(|(_, c)| c).collect(),
+            chunks: builder.take().into_iter().map(|(_, c)| c).collect(),
             permit: None,
         })
     }
@@ -183,8 +184,6 @@ pub(crate) struct InsertBatch {
     pub(crate) blocks: Vec<BlockSlabs>,
     pub(crate) n_rows: usize,
     pub(crate) per_seq: Vec<(u64, u64)>,
-    /// Admission permit shares covering these rows, dropped post-insert-ack
-    pub(crate) permits: Vec<Arc<crate::budget::MemoryPermit>>,
     /// Output bytes held, shrunk once blocks compress
     pub(crate) encoded: crate::budget::MemoryPermit,
 }
@@ -197,6 +196,9 @@ pub enum BatcherMsg {
     /// channel send + cross-thread wakeup that dominates coordination
     /// under sustained load
     Segments(Vec<PlacedSegment>),
+    /// Encode job for segments staged across commits, merged once it
+    /// finishes; later messages wait behind it
+    Encoded(JoinHandle<Result<EncodedRun, String>>),
     /// Seal every open table, push to inserters, reply. Barrier (drain before
     /// DDL/TRUNCATE) and shutdown.
     FlushAll(oneshot::Sender<()>),
@@ -222,6 +224,7 @@ struct Table {
     allocated_bytes: usize,
     meta: Arc<BatchMeta>,
     seq_counts: Vec<(u64, u64)>,
+    /// Admission covering open rows, until the output pool takes them
     slice_permits: Vec<Arc<crate::budget::MemoryPermit>>,
     deadline: Option<Instant>,
 }
@@ -237,7 +240,7 @@ impl Table {
         if self.enc.rows == 0 {
             return Ok(());
         }
-        let (buffers, n_rows) = self.enc.take_block().map_err(|e| e.to_string())?;
+        let (buffers, n_rows) = self.enc.take_block();
         self.sealed_rows += n_rows;
         self.sealed_bytes += buffers
             .iter()
@@ -363,6 +366,33 @@ pub(crate) fn spawn(
                             break;
                         }
                     }
+                    Some(BatcherMsg::Encoded(job)) => {
+                        let run = match job.await {
+                            Ok(Ok(run)) => run,
+                            Ok(Err(e)) => {
+                                fatal.set(format!("encode: {e}"));
+                                break;
+                            }
+                            Err(e) => {
+                                fatal.set(format!("encode job: {e}"));
+                                break;
+                            }
+                        };
+                        let live = effective_cfg(&cfg, snapshot(config_rx.as_ref()).as_deref());
+                        let ctx = RowCtx { cfg: live, out: &out, alloc, epoch, stats };
+                        let permit = run.permit.map(Arc::new);
+                        let mut res = Ok(());
+                        for (chunk, seqs) in run.chunks {
+                            res = merge_chunk(&mut tables, &ctx, chunk, &seqs, permit.as_ref()).await;
+                            if res.is_err() {
+                                break;
+                            }
+                        }
+                        if let Err(e) = res {
+                            fatal.set(format!("batcher: {e}"));
+                            break;
+                        }
+                    }
                     Some(BatcherMsg::FlushAll(reply)) => {
                         if let Err(e) = flush_all(&mut tables, &out, &mut epoch, stats).await {
                             fatal.set(format!("batcher barrier flush: {e}"));
@@ -434,58 +464,60 @@ async fn handle_segment(
     ctx: &RowCtx<'_>,
     segment: PlacedSegment,
 ) -> Result<(), String> {
-    for mut chunk in segment.chunks {
-        ctx.stats
-            .insertbatch_rows_in
-            .fetch_add(chunk.rows as u64, Ordering::Relaxed);
-        let rt = RowTable {
-            rel: chunk.rel.clone(),
-            route: chunk.route.clone(),
-        };
-        let slot = tables.slot(ctx, &rt)?;
-        let t = &mut tables.open[slot];
-        if !t.enc.accepts(&chunk.buffers) {
-            // Same destination, other layout: seal what it holds first
-            emit_batch(t, ctx.out, ctx.stats).await?;
-            (t.enc, t.meta) = table_encoder(ctx, t.meta.table_key.clone(), &rt)?;
-        }
-        let rows = chunk.rows;
-        if t.enc
-            .append_block(&mut chunk.buffers, rows)
-            .map_err(|e| e.to_string())?
-            == Append::Full
-        {
-            t.seal_block()?;
-            t.enc
-                .append_block(&mut chunk.buffers, rows)
-                .map_err(|e| e.to_string())?;
-        }
-        appended(
-            tables,
-            ctx,
-            slot,
-            segment.seq,
-            rows as u64,
-            segment.permit.as_ref(),
-        )
-        .await?;
+    for chunk in segment.chunks {
+        let seqs = [(segment.seq, chunk.rows as u64)];
+        merge_chunk(tables, ctx, chunk, &seqs, segment.permit.as_ref()).await?;
     }
     Ok(())
 }
 
-/// Account `rows` of `seq` just appended to `slot`, sealing what limits
+/// Merge one chunk whose rows belong to `seqs` into its destination's batch
+async fn merge_chunk(
+    tables: &mut Tables,
+    ctx: &RowCtx<'_>,
+    mut chunk: EncodedChunk,
+    seqs: &[(u64, u64)],
+    permit: Option<&Arc<crate::budget::MemoryPermit>>,
+) -> Result<(), String> {
+    ctx.stats
+        .insertbatch_rows_in
+        .fetch_add(chunk.rows as u64, Ordering::Relaxed);
+    let rt = RowTable {
+        rel: chunk.rel.clone(),
+        route: chunk.route.clone(),
+    };
+    let slot = tables.slot(ctx, &rt)?;
+    let t = &mut tables.open[slot];
+    if !t.enc.accepts(&chunk.buffers) {
+        // Same destination, other layout: seal what it holds first
+        emit_batch(t, ctx.out, ctx.stats).await?;
+        (t.enc, t.meta) = table_encoder(ctx, t.meta.table_key.clone(), &rt)?;
+    }
+    let rows = chunk.rows;
+    if t.enc
+        .append_block(&mut chunk.buffers, rows)
+        .map_err(|e| e.to_string())?
+        == Append::Full
+    {
+        t.seal_block()?;
+        t.enc
+            .append_block(&mut chunk.buffers, rows)
+            .map_err(|e| e.to_string())?;
+    }
+    appended(tables, ctx, slot, seqs, permit).await
+}
+
+/// Account rows of `seqs` just appended to `slot`, sealing what limits
 /// call for
 async fn appended(
     tables: &mut Tables,
     ctx: &RowCtx<'_>,
     slot: usize,
-    seq: u64,
-    rows: u64,
+    seqs: &[(u64, u64)],
     slice_permit: Option<&Arc<crate::budget::MemoryPermit>>,
 ) -> Result<(), String> {
     let t = &mut tables.open[slot];
-    // Rows sharing a permit arrive consecutively, so check only last entry.
-    // Sealing clears permit lists so each batch retains its own permits
+    // Rows sharing a permit arrive consecutively, so check only last entry
     if let Some(p) = slice_permit
         && t.slice_permits
             .last()
@@ -493,9 +525,11 @@ async fn appended(
     {
         t.slice_permits.push(p.clone());
     }
-    match t.seq_counts.last_mut() {
-        Some((s, c)) if *s == seq => *c += rows,
-        _ => t.seq_counts.push((seq, rows)),
+    for &(seq, rows) in seqs {
+        match t.seq_counts.last_mut() {
+            Some((s, c)) if *s == seq => *c += rows,
+            _ => t.seq_counts.push((seq, rows)),
+        }
     }
     if t.deadline.is_none() {
         t.deadline = Some(Instant::now() + ctx.cfg.flush_timeout);
@@ -552,7 +586,6 @@ async fn emit_batch(t: &mut Table, out: &BatchOutput, stats: &EmitterStats) -> R
         return Ok(());
     }
     let per_seq = std::mem::take(&mut t.seq_counts);
-    let permits = std::mem::take(&mut t.slice_permits);
     // Separate pool avoids waiting on decoded payload held by this batch.
     // Oversized batch waits for whole compartment, then holds rest unmetered
     let mut encoded = out
@@ -560,12 +593,13 @@ async fn emit_batch(t: &mut Table, out: &BatchOutput, stats: &EmitterStats) -> R
         .admit(bytes.min(out.budget.admission_max()))
         .await;
     encoded.settle(bytes as u64);
+    // Output pool covers these rows from here to insert ack
+    t.slice_permits.clear();
     let batch = InsertBatch {
         meta: t.meta.clone(),
         blocks,
         n_rows,
         per_seq,
-        permits,
         encoded,
     };
     out.sender
@@ -1174,6 +1208,111 @@ mod tests {
         let segment = PlacedSegment::of_rows(seq, rel, route, &rows).unwrap();
         assert_eq!(segment.chunks.len(), 1, "one chunk per segment");
         BatcherMsg::Segments(vec![segment])
+    }
+
+    /// Resident admission covers rows until their batch emits; the tail's
+    /// output pool holds them from there to insert ack
+    #[tokio::test]
+    async fn emit_releases_resident_admission() {
+        let resident = crate::budget::MemoryBudget::new(1 << 20);
+        let (tx, rx, fatal, handle) =
+            spawn_deadline_batcher(partial_block_cfg(Duration::from_secs(60)), None);
+        let (rel, route) = text_table("Nullable(String)");
+        let mut seg = PlacedSegment::of_rows(0, &rel, &route, &[text_row(0, 0, "a").1]).unwrap();
+        seg.permit = Some(Arc::new(resident.try_admit(4096).unwrap()));
+        tx.send(BatcherMsg::Segments(vec![seg])).await.unwrap();
+        assert!(resident.resident_bytes() > 0);
+        let (reply_tx, reply_rx) = oneshot::channel();
+        tx.send(BatcherMsg::FlushAll(reply_tx)).await.unwrap();
+        reply_rx.await.unwrap();
+        let batch = rx.recv().await.unwrap();
+        assert_eq!(
+            resident.resident_bytes(),
+            0,
+            "released while batch awaits insert"
+        );
+        drop((batch, tx));
+        handle.await.unwrap();
+        assert!(!fatal.is_set());
+    }
+
+    /// One encode job over several commits' pending segments merges like
+    /// their placed segments, rows counted per seq; a job encoding other
+    /// than the planned rows fails the pipeline
+    #[tokio::test]
+    async fn encode_jobs_merge_like_segments() {
+        use crate::emit::pipeline::encode::{self, Encoders, PendingSegment};
+        use crate::emit::pipeline::plan_spool::{PlanItem, PlanWriter, Segment, SegmentBody};
+        let tmp = tempfile::tempdir().unwrap();
+        let (rel, route) = text_table("Nullable(String)");
+        let pending = |seq: u64, rows: &[(i32, &str)]| {
+            let path = tmp.path().join(format!("{seq}.plan"));
+            let mut w = PlanWriter::create(path, 1 << 20, 1 << 20).deferring();
+            let table = w.table(&rel, 0, || Some(route.clone()));
+            for &(id, text) in rows {
+                w.push_cells(text_row(seq, id, text).1.decoded, table)
+                    .unwrap();
+            }
+            let mut rd = w.seal(0, 0).unwrap().replay().unwrap();
+            let Some(PlanItem::Segment(Segment {
+                body: SegmentBody::Pending(records),
+                rows,
+                ..
+            })) = rd.next_item().unwrap()
+            else {
+                panic!("one pending segment");
+            };
+            PendingSegment { seq, rows, records }
+        };
+        let commits: [(u64, &[(i32, &str)]); 3] = [
+            (0, &[(0, "a"), (1, "")]),
+            (1, &[(2, "ccc")]),
+            (2, &[(3, "dd")]),
+        ];
+        let mut wires = Vec::new();
+        for jobbed in [false, true] {
+            let (tx, rx, fatal, handle) =
+                spawn_deadline_batcher(partial_block_cfg(Duration::from_secs(60)), None);
+            if jobbed {
+                let segments = commits.iter().map(|(seq, rows)| pending(*seq, rows));
+                let job = encode::spawn(
+                    segments.collect(),
+                    None,
+                    Encoders::default(),
+                    Arc::default(),
+                );
+                tx.send(BatcherMsg::Encoded(job)).await.unwrap();
+            } else {
+                for (seq, rows) in commits {
+                    let rows = rows.iter().map(|&(id, t)| text_row(seq, id, t)).collect();
+                    tx.send(segment(seq, &rel, &route, rows)).await.unwrap();
+                }
+            }
+            drop(tx);
+            let b = rx.recv().await.unwrap();
+            assert!(rx.recv().await.is_err(), "one batch");
+            assert_eq!(b.per_seq, [(0, 2), (1, 1), (2, 1)]);
+            wires.push(
+                b.blocks[0]
+                    .buffers
+                    .iter()
+                    .map(|c| format!("{:?}", c.wire()))
+                    .collect::<Vec<_>>(),
+            );
+            handle.await.unwrap();
+            assert!(!fatal.is_set());
+        }
+        assert_eq!(wires[0], wires[1]);
+
+        let (tx, _rx, fatal, handle) =
+            spawn_deadline_batcher(partial_block_cfg(Duration::from_secs(60)), None);
+        let mut short = pending(0, &[(0, "a")]);
+        short.rows = 2;
+        let job = encode::spawn(vec![short], None, Encoders::default(), Arc::default());
+        tx.send(BatcherMsg::Encoded(job)).await.unwrap();
+        handle.await.unwrap();
+        let msg = fatal.message().unwrap();
+        assert!(msg.contains("encoded 1 rows, planned 2"), "{msg}");
     }
 
     fn text_row(seq: u64, id: i32, text: &str) -> (u64, CommittedTuple) {

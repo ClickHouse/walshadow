@@ -1460,16 +1460,16 @@ impl XactBuffer {
             });
         }
         let allowed_xids = xids.iter().copied().collect();
-        let merged = self
-            .open_drain(
-                states,
-                collect_rows,
-                stash,
-                top_xid,
-                commit_lsn,
-                allowed_xids,
-            )
-            .await?;
+        // Boxed: merge setup would bloat every commit future
+        let merged = Box::pin(self.open_drain(
+            states,
+            collect_rows,
+            stash,
+            top_xid,
+            commit_lsn,
+            allowed_xids,
+        ))
+        .await?;
         self.stats.committed_xacts_total += 1;
         Ok(CommittedDrain {
             commit_ts,
@@ -2347,6 +2347,57 @@ pub struct CommittedDrain {
     generations: Vec<Arc<ChunkGeneration>>,
 }
 
+/// Next slice of a merged drain, see [`CommittedDrain::next_batch_admitting`]
+async fn next_merged<E: From<XactBufferError>>(
+    m: &mut MergedDrain,
+    generations: &mut Vec<Arc<ChunkGeneration>>,
+    max_rows: usize,
+    max_bytes: usize,
+    admit: impl AsyncFnOnce(usize) -> std::result::Result<Option<crate::budget::MemoryPermit>, E>,
+) -> std::result::Result<Option<DrainedBatch>, E> {
+    let mut heaps: Vec<DrainHeap> = Vec::new();
+    let mut ordered_events: Vec<OrderedEvent> = Vec::new();
+    let mut truncate_rows: Vec<usize> = Vec::new();
+    let mut bytes = 0usize;
+    while heaps.len() < max_rows.max(1) && bytes < max_bytes.max(1) {
+        match m.next().await? {
+            None => break,
+            Some(MergeItem::Event(event)) => ordered_events.push(OrderedEvent {
+                heap_idx: heaps.len(),
+                row_idx: m.rows.len(),
+                event: *event,
+            }),
+            Some(MergeItem::Truncate(t)) => {
+                truncate_rows.push(m.rows.len());
+                heaps.push(DrainHeap::Truncate(t));
+            }
+            Some(MergeItem::Input(i)) => {
+                bytes += i.approx_bytes();
+                heaps.push(DrainHeap::Input(i));
+            }
+        }
+    }
+    let is_final = m.is_exhausted();
+    let mut sealed = m.take_chunks()?;
+    let sealed_empty = sealed.map.is_empty();
+    let new_rows = m.take_rows();
+    if !sealed_empty {
+        sealed._permit = admit(sealed.resident_bytes()).await?;
+        generations.push(Arc::new(sealed));
+    }
+    if heaps.is_empty() && ordered_events.is_empty() && sealed_empty && new_rows.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(DrainedBatch {
+        heaps,
+        ordered_events,
+        chunks: generations.clone(),
+        new_rows,
+        truncate_rows,
+        is_final,
+    }))
+}
+
 enum Drained {
     /// Boxed so the commit path moves a pointer, not the merge state
     Merged(Box<MergedDrain>),
@@ -2400,47 +2451,15 @@ impl CommittedDrain {
                 }));
             }
         };
-        let mut heaps: Vec<DrainHeap> = Vec::new();
-        let mut ordered_events: Vec<OrderedEvent> = Vec::new();
-        let mut truncate_rows: Vec<usize> = Vec::new();
-        let mut bytes = 0usize;
-        while heaps.len() < max_rows.max(1) && bytes < max_bytes.max(1) {
-            match m.next().await? {
-                None => break,
-                Some(MergeItem::Event(event)) => ordered_events.push(OrderedEvent {
-                    heap_idx: heaps.len(),
-                    row_idx: m.rows.len(),
-                    event: *event,
-                }),
-                Some(MergeItem::Truncate(t)) => {
-                    truncate_rows.push(m.rows.len());
-                    heaps.push(DrainHeap::Truncate(t));
-                }
-                Some(MergeItem::Input(i)) => {
-                    bytes += i.approx_bytes();
-                    heaps.push(DrainHeap::Input(i));
-                }
-            }
-        }
-        let is_final = m.is_exhausted();
-        let mut sealed = m.take_chunks()?;
-        let sealed_empty = sealed.map.is_empty();
-        let new_rows = m.take_rows();
-        if !sealed_empty {
-            sealed._permit = admit(sealed.resident_bytes()).await?;
-            self.generations.push(Arc::new(sealed));
-        }
-        if heaps.is_empty() && ordered_events.is_empty() && sealed_empty && new_rows.is_empty() {
-            return Ok(None);
-        }
-        Ok(Some(DrainedBatch {
-            heaps,
-            ordered_events,
-            chunks: self.generations.clone(),
-            new_rows,
-            truncate_rows,
-            is_final,
-        }))
+        // Boxed: merge state would bloat every commit future
+        Box::pin(next_merged(
+            m,
+            &mut self.generations,
+            max_rows,
+            max_bytes,
+            admit,
+        ))
+        .await
     }
 
     /// Unlink spill files; call after the final slice dispatches. On an

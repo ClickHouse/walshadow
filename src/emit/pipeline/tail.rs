@@ -22,6 +22,7 @@ use crate::config::ResolvedConfig;
 use crate::emit::ch_emitter::EmitterStats;
 use crate::emit::pipeline::ack::{self, AckHandle};
 use crate::emit::pipeline::batcher::{self, BatcherConfig, BatcherMsg, InsertBatch};
+use crate::emit::pipeline::encode::EncodedRun;
 use crate::emit::pipeline::inserter;
 use crate::emit::pipeline::resolver::{self, ResolvedBatch};
 use crate::emit::pipeline::{DEFAULT_PIPELINE_FLUSH, Fatal};
@@ -224,6 +225,15 @@ fn swallow_segments(ack: &AckHandle, segments: Vec<batcher::PlacedSegment>) {
     ack.swallowed(counts.into_iter().collect());
 }
 
+/// Ack every row an encode job produced
+fn swallow_run(ack: &AckHandle, run: EncodedRun) {
+    let mut counts: HashMap<u64, u64> = HashMap::new();
+    for (seq, rows) in run.chunks.into_iter().flat_map(|(_, seqs)| seqs) {
+        *counts.entry(seq).or_insert(0) += rows;
+    }
+    ack.swallowed(counts.into_iter().collect());
+}
+
 /// Metrics-only tail: ack collector + one swallow task, zero CH
 /// connections. Every routed row acks at swallow (permits release on
 /// drop) so nothing can pin the watermark; `FlushAll` replies
@@ -233,7 +243,7 @@ pub fn spawn_null(
     emitter_ack: Arc<Monotone<EmitterAck>>,
     fatal: Fatal,
 ) -> (mpsc::Sender<BatcherMsg>, AckHandle, TailParts) {
-    let (ack, collector) = ack::spawn(emitter_ack, fatal);
+    let (ack, collector) = ack::spawn(emitter_ack, fatal.clone());
     let collector = AbortOnDropHandle::new(collector);
     let (msg_tx, mut msg_rx) = mpsc::channel::<BatcherMsg>(256);
     let swallow_ack = ack.clone();
@@ -241,6 +251,11 @@ pub fn spawn_null(
         while let Some(msg) = msg_rx.recv().await {
             match msg {
                 BatcherMsg::Segments(segments) => swallow_segments(&swallow_ack, segments),
+                BatcherMsg::Encoded(job) => match job.await {
+                    Ok(Ok(run)) => swallow_run(&swallow_ack, run),
+                    Ok(Err(e)) => return fatal.set(format!("encode: {e}")),
+                    Err(e) => return fatal.set(format!("encode job: {e}")),
+                },
                 BatcherMsg::FlushAll(reply) => {
                     let _ = reply.send(());
                 }

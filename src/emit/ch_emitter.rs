@@ -1910,6 +1910,10 @@ pub(crate) enum Append {
     Full,
 }
 
+/// One row's mapped datums, inline up to wide tables so encoding a row
+/// does not allocate
+type RowCells<'a> = SmallVec<[DatumRef<'a>; 64]>;
+
 /// Per-table per-xact accumulator, one block buffer per CH column.
 pub(crate) struct TableEncoder {
     pub(crate) plan: TablePlan,
@@ -1988,6 +1992,33 @@ impl ColumnBuf {
                 inner: Vec::new(),
             },
         })
+    }
+
+    /// Empty buffer of this shape
+    fn empty_like(&self) -> Self {
+        match self {
+            Self::Fixed { width, .. } => Self::Fixed {
+                width: *width,
+                bytes: Vec::new(),
+            },
+            Self::String { absent, .. } => Self::String {
+                offsets: Vec::new(),
+                data: Vec::new(),
+                absent,
+            },
+            Self::NullableFixed { width, .. } => Self::NullableFixed {
+                width: *width,
+                null_map: Vec::new(),
+                inner: Vec::new(),
+            },
+            Self::NullableString { absent, .. } => Self::NullableString {
+                offsets: Vec::new(),
+                data: Vec::new(),
+                null_map: Vec::new(),
+                absent,
+            },
+            Self::Oracle(o) => Self::Oracle(o.empty_like()),
+        }
     }
 
     pub(crate) fn allocated_bytes(&self) -> usize {
@@ -2297,10 +2328,8 @@ impl ColumnBuf {
     }
 }
 
-/// Fresh per-column buffers matching `plan` (mapped + synthetic).
-/// Shared by [`TableEncoder::new`] and [`TableEncoder::take_block`] so
-/// synthetic-column widths live in one place.
-pub(crate) fn fresh_buffers(plan: &TablePlan) -> Result<Vec<ColumnBuf>, EmitterError> {
+/// Fresh per-column buffers matching `plan` (mapped + synthetic)
+fn fresh_buffers(plan: &TablePlan) -> Result<Vec<ColumnBuf>, EmitterError> {
     let mut buffers = Vec::with_capacity(plan.columns.len() + 4);
     for c in &plan.columns {
         buffers.push(match c.encoding {
@@ -2364,16 +2393,17 @@ impl TableEncoder {
         })
     }
 
-    /// Swap accumulated slabs out for fresh empties, returning old slabs
-    /// + row count. Transfers ownership rather than reusing allocations.
-    pub(crate) fn take_block(&mut self) -> Result<(Vec<ColumnBuf>, usize), EmitterError> {
-        let fresh = fresh_buffers(&self.plan)?;
+    /// Swap accumulated slabs out for empties of the same shape, returning
+    /// old slabs + row count. Transfers ownership rather than reusing
+    /// allocations
+    pub(crate) fn take_block(&mut self) -> (Vec<ColumnBuf>, usize) {
+        let fresh = self.buffers.iter().map(ColumnBuf::empty_like).collect();
         let old = std::mem::replace(&mut self.buffers, fresh);
         let rows = self.rows;
         self.rows = 0;
         self.approx_bytes = 0;
         self.oracle_bytes = self.oracle_overhead;
-        Ok((old, rows))
+        (old, rows)
     }
 
     /// Whether `block` lays out the same columns as these buffers
@@ -2445,7 +2475,7 @@ impl TableEncoder {
             HeapOp::Delete => decoded.old.as_ref(),
             _ => decoded.new.as_ref(),
         };
-        let cells: SmallVec<[DatumRef<'_>; 16]> = mapping
+        let cells: RowCells<'_> = mapping
             .columns
             .iter()
             .map(|col| {
@@ -2475,7 +2505,7 @@ impl TableEncoder {
         patch: &[(usize, Datum)],
         stamp: &RowStamp,
     ) -> Result<Append, EmitterError> {
-        let cells: SmallVec<[DatumRef<'_>; 16]> = self
+        let cells: RowCells<'_> = self
             .plan
             .columns
             .iter()
@@ -2503,7 +2533,7 @@ impl TableEncoder {
         mut slot: impl FnMut(SourceColumn) -> Result<DatumRef<'a>, EmitterError>,
         stamp: &RowStamp,
     ) -> Result<Append, EmitterError> {
-        let mut cells: SmallVec<[DatumRef<'a>; 16]> = SmallVec::new();
+        let mut cells = RowCells::new();
         for c in &self.plan.columns {
             cells.push(
                 c.source
@@ -5037,7 +5067,7 @@ mod tests {
             (1, before),
             "row not appended"
         );
-        assert_eq!(enc.take_block().unwrap().1, 1);
+        assert_eq!(enc.take_block().1, 1);
         assert_eq!(
             enc.append_row(&committed(2, Some(&big)), &m, OP_INSERT)
                 .unwrap(),

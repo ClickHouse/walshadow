@@ -223,8 +223,8 @@ fn assert_parity(
             return;
         }
     }
-    let (a, na) = cells.take_block().unwrap();
-    let (b, nb) = direct.take_block().unwrap();
+    let (a, na) = cells.take_block();
+    let (b, nb) = direct.take_block();
     assert_eq!(na, nb);
     let wire = |bufs: &[ColumnBuf]| {
         bufs.iter()
@@ -809,7 +809,7 @@ fn predeclared_columns_match() {
     let view = view_block_data(&data, &rel).unwrap();
     direct.append_view(&rel, &view.datums, &[], &stamp).unwrap();
     let wire = |e: &mut TableEncoder| {
-        let (bufs, _) = e.take_block().unwrap();
+        let (bufs, _) = e.take_block();
         bufs.iter()
             .map(|b| format!("{:?}", b.wire()))
             .collect::<Vec<_>>()
@@ -902,7 +902,7 @@ fn plan_both(rel: &RelDescriptor, targets: &[&str], changes: &[Change], values: 
         let mut bytes = Vec::new();
         while let Some(item) = rd.next_item().unwrap() {
             if let PlanItem::Segment(s) = item {
-                bytes.extend(s.chunks.iter().map(|c| (c.rows(), c.to_bytes())));
+                bytes.extend(s.chunks().iter().map(|c| (c.rows(), c.to_bytes())));
             }
         }
         out.push(bytes);
@@ -1168,7 +1168,7 @@ fn copy_fields_match_heap_views() {
             .unwrap();
     }
     let wire = |enc: &mut TableEncoder| {
-        let (bufs, rows) = enc.take_block().unwrap();
+        let (bufs, rows) = enc.take_block();
         let wire: Vec<_> = bufs.iter().map(|b| format!("{:?}", b.wire())).collect();
         (rows, wire)
     };

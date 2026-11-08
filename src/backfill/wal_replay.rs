@@ -390,27 +390,17 @@ impl WalReplaySink {
             return Ok(());
         }
         let ship = permit.is_some();
-        self.stage(seq, permit.map(Arc::new))?;
+        self.stage(seq, permit.map(Arc::new));
         if ship || self.staged_rows >= STAGED_ROWS {
             self.flush_pending().await?;
         }
         Ok(())
     }
 
-    fn stage(
-        &mut self,
-        seq: u64,
-        permit: Option<Arc<MemoryPermit>>,
-    ) -> std::result::Result<(), SinkError> {
-        let chunks: Vec<_> = self
-            .chunks
-            .take()
-            .map_err(encode_err)?
-            .into_iter()
-            .map(|(_, c)| c)
-            .collect();
+    fn stage(&mut self, seq: u64, permit: Option<Arc<MemoryPermit>>) {
+        let chunks: Vec<_> = self.chunks.take().into_iter().map(|(_, c)| c).collect();
         if chunks.is_empty() {
-            return Ok(());
+            return;
         }
         self.staged_rows += chunks.iter().map(|c| c.rows()).sum::<usize>();
         self.staged.push(PlacedSegment {
@@ -418,7 +408,6 @@ impl WalReplaySink {
             chunks,
             permit,
         });
-        Ok(())
     }
 
     /// Mirror all chunks from restored TOAST page image. Bypass transaction
@@ -602,7 +591,7 @@ impl WalReplaySink {
         }
         drain.finish().await.map_err(SinkError::from)?;
         if let Some((seq, rows)) = self.open.take() {
-            self.stage(seq.seq(), None)?;
+            self.stage(seq.seq(), None);
             self.seqs.place(seq, rows);
             if self.staged_rows >= STAGED_ROWS {
                 self.flush_pending().await?;

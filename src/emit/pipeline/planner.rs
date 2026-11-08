@@ -29,8 +29,9 @@
 //!   reconstruction path exists and PG only elides below
 //!   `wal_level=logical`, so a routed partial fails the plan
 //! - needed toast values resolve deterministically → detoast at planning
-//! - mapped output columns have deterministic codecs → plan-time codec
-//!   policy layers onto this stage (deterministic-codec phase)
+//! - mapped output columns encode → not checked here: memory-resident plans
+//!   carry records to dispatch, where an encode job runs the codec and a
+//!   failure is pipeline fatal; spilled plans encode at planning
 //! - route snapshot complete → `RouteSnapshot::freeze` populates every
 //!   field by construction; `None` is the counted unmapped discard, which
 //!   skips detoast and codec validation entirely
@@ -40,7 +41,7 @@
 use std::sync::Arc;
 
 use crate::decode::datum::Datum;
-use crate::decode::heap_decoder::view_heap_record;
+use crate::decode::heap_decoder::{HeapImages, TupleView, view_heap_record};
 use crate::emit::pipeline::plan_spool::{
     DEFAULT_PLAN_MEM_MAX, EncoderCache, PlanPath, PlanSpoolError, PlanWriter, SealedPlan,
     ViewChange,
@@ -149,6 +150,7 @@ impl<'a, V: PlanRouteView> Planner<'a, V> {
     ) -> Self {
         Self {
             writer: PlanWriter::create(path, disk_cap, DEFAULT_PLAN_MEM_MAX)
+                .deferring()
                 .with_segment_limits(segment.0, segment.1)
                 .for_commit(commit_ts)
                 .with_encoders(view.take_encoders()),
@@ -209,7 +211,7 @@ impl<'a, V: PlanRouteView> Planner<'a, V> {
                         self.writer.discard(table, u64::from(input.input.tuples));
                         continue;
                     }
-                    self.plan_views(&input, table, spool, &ref_maps).await?;
+                    self.plan_views(input, table, spool, &ref_maps).await?;
                 }
             }
         }
@@ -218,51 +220,113 @@ impl<'a, V: PlanRouteView> Planner<'a, V> {
         Ok(())
     }
 
-    /// Encode an input from tuple images in place, external values resolved
-    /// into per-image patches
+    /// Plan an input from tuple images in place. Records without external
+    /// values plan synchronously; the rest detoast into per-image patches
     async fn plan_views(
         &mut self,
-        input: &DescribedInput,
+        input: Box<DescribedInput>,
         table: u32,
         spool: Option<&BodySpoolFile>,
         ref_maps: &[&ChunkRefMap],
     ) -> Result<(), PlanError> {
-        let rel = &input.descriptor;
-        let lsn = input.input.source_lsn;
-        let images = view_heap_record(input.input.record_bytes(), rel).map_err(|e| {
-            XactBufferError::OrdinaryFailClosed {
-                relid: rel.oid,
-                lsn,
-                rm: input.input.rm,
-                info: input.input.info,
-                reason: FailClosedReason::Malformed(e.to_string()),
-            }
-        })?;
+        let Some(input) = self.plan_inline(input, table)? else {
+            return Ok(());
+        };
+        // Boxed: detoast state would bloat every commit future
+        Box::pin(self.plan_detoasted(input, table, spool, ref_maps)).await
+    }
+
+    /// Plan `input` unless an image holds an external value, handing it back
+    fn plan_inline(
+        &mut self,
+        input: Box<DescribedInput>,
+        table: u32,
+    ) -> Result<Option<Box<DescribedInput>>, PlanError> {
+        let images = images(&input)?;
+        if images
+            .iter()
+            .any(|h| !external_sites([h.new.as_ref(), h.old.as_ref()]).is_empty())
+        {
+            drop(images);
+            return Ok(Some(input));
+        }
+        let rows = self.push_changes(&input, table, &images, &[])?;
+        drop(images);
+        self.carry(input, table, Vec::new(), rows)?;
+        Ok(None)
+    }
+
+    async fn plan_detoasted(
+        &mut self,
+        input: Box<DescribedInput>,
+        table: u32,
+        spool: Option<&BodySpoolFile>,
+        ref_maps: &[&ChunkRefMap],
+    ) -> Result<(), PlanError> {
+        let images = images(&input)?;
+        let (db, lsn) = (input.descriptor.rfn.db_node, input.input.source_lsn);
+        let mut patches = Vec::with_capacity(images.len());
         for h in &images {
-            if h.new.as_ref().is_some_and(|t| t.partial) {
-                return Err(PlanError::PartialUpdate { lsn });
-            }
-            let mut patches: [Vec<(usize, Datum)>; 2] = Default::default();
+            let mut patch: [Vec<(usize, Datum)>; 2] = Default::default();
             let sites = external_sites([h.new.as_ref(), h.old.as_ref()]);
             if !sites.is_empty() {
-                let db = rel.rfn.db_node;
                 // Value permit drops once bytes land in the plan
                 let (values, _permit) =
                     detoast_sites(&sites, db, lsn, spool, ref_maps, self.resolver).await?;
                 for (site, v) in sites.iter().zip(values) {
-                    patches[site.image].push((site.idx, v));
+                    patch[site.image].push((site.idx, v));
                 }
             }
+            patches.push(patch);
+        }
+        let rows = self.push_changes(&input, table, &images, &patches)?;
+        drop(images);
+        self.carry(input, table, patches, rows)
+    }
+
+    /// Plan each image as one change with its patches. A deferring writer
+    /// only counts them, returning rows the record encodes to
+    fn push_changes(
+        &mut self,
+        input: &DescribedInput,
+        table: u32,
+        images: &[HeapImages<TupleView<'_>>],
+        patches: &[[Vec<(usize, Datum)>; 2]],
+    ) -> Result<Option<usize>, PlanError> {
+        let defer = self.writer.defers();
+        let mut rows = 0;
+        for (i, h) in images.iter().enumerate() {
+            let (new_patch, old_patch) = patches
+                .get(i)
+                .map_or((&[][..], &[][..]), |[n, o]| (&n[..], &o[..]));
             let change = ViewChange {
                 op: h.op,
                 xid: input.input.xid,
-                source_lsn: lsn,
+                source_lsn: input.input.source_lsn,
                 new: h.new.as_ref(),
                 old: h.old.as_ref(),
-                new_patch: &patches[0],
-                old_patch: &patches[1],
+                new_patch,
+                old_patch,
             };
-            self.writer.push_views(change, table)?;
+            if defer {
+                rows += self.writer.count_change(&change, table)?;
+            } else {
+                self.writer.push_views(change, table)?;
+            }
+        }
+        Ok(defer.then_some(rows))
+    }
+
+    /// Carry a record [`Self::push_changes`] counted for deferred encoding
+    fn carry(
+        &mut self,
+        input: Box<DescribedInput>,
+        table: u32,
+        patches: Vec<[Vec<(usize, Datum)>; 2]>,
+        rows: Option<usize>,
+    ) -> Result<(), PlanError> {
+        if let Some(rows) = rows {
+            self.writer.push_pending(table, input, patches, rows)?;
         }
         Ok(())
     }
@@ -279,6 +343,31 @@ impl<'a, V: PlanRouteView> Planner<'a, V> {
         Ok(plan)
     }
 }
+
+/// Tuple images of `input`, failing closed on a malformed record or an
+/// update whose new image elides a predecessor prefix or suffix
+fn images(input: &DescribedInput) -> Result<ImageViews<'_>, PlanError> {
+    let rel = &input.descriptor;
+    let lsn = input.input.source_lsn;
+    let images = view_heap_record(input.input.record_bytes(), rel).map_err(|e| {
+        XactBufferError::OrdinaryFailClosed {
+            relid: rel.oid,
+            lsn,
+            rm: input.input.rm,
+            info: input.input.info,
+            reason: FailClosedReason::Malformed(e.to_string()),
+        }
+    })?;
+    if images
+        .iter()
+        .any(|h| h.new.as_ref().is_some_and(|t| t.partial))
+    {
+        return Err(PlanError::PartialUpdate { lsn });
+    }
+    Ok(images)
+}
+
+type ImageViews<'a> = smallvec::SmallVec<[HeapImages<TupleView<'a>>; 1]>;
 
 #[cfg(test)]
 mod tests {
@@ -555,7 +644,7 @@ mod tests {
             match item {
                 PlanItem::Control { .. } => order.push("e".to_string()),
                 PlanItem::Segment(s) => {
-                    for c in &s.chunks {
+                    for c in &s.chunks() {
                         order.extend(lsns(c, 0).iter().map(|lsn| format!("h{lsn}r")));
                     }
                 }
@@ -744,11 +833,10 @@ mod tests {
             let PlanItem::Segment(s) = item else {
                 panic!("segments only");
             };
-            assert_eq!(
-                s.rows,
-                s.chunks.iter().map(|c| c.rows() as u64).sum::<u64>()
-            );
             rows += s.rows;
+            let want = s.rows;
+            let encoded = s.chunks().iter().map(|c| c.rows() as u64).sum::<u64>();
+            assert_eq!(want, encoded);
         }
         drop(rd);
         assert_eq!(rows, ROWS as u64);
@@ -1011,7 +1099,7 @@ mod tests {
         let mut out = Vec::new();
         while let Some(item) = rd.next_item().unwrap() {
             let PlanItem::Segment(s) = item else { continue };
-            for c in &s.chunks {
+            for c in &s.chunks() {
                 let crate::emit::ch_emitter::Wire::NullableString {
                     offsets,
                     data,

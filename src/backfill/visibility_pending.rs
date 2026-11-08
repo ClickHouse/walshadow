@@ -1011,7 +1011,7 @@ mod tests {
                 enc.append_view(&desc, &view.datums, &patch, &stamp)
             })
             .unwrap();
-        let chunks = chunks.take().unwrap();
+        let chunks = chunks.take();
         // UInt32 xids and UInt16 infomask read back as same-width ints
         assert_eq!(
             chunks[0].1.cells(),

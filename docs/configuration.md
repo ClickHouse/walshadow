@@ -305,7 +305,8 @@ Both settings apply to initial load and WAL processing in every value mode
 ### Memory budget
 
 `[memory] resident_payload_max` controls backpressure for payload bytes held
-while decoding and inserting rows. New work waits when budget is full. Default
+while decoding, planning and batching rows; a ClickHouse tail's own budget
+covers them once sealed into an INSERT. New work waits when budget is full. Default
 is one half of cgroup memory limit, or host memory without a cgroup limit, with
 a 512 MiB minimum. This default assumes a dedicated host or container. Set an
 explicit limit in shared environments

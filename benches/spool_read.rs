@@ -401,8 +401,9 @@ async fn plan(args: &Args, repeat: usize) -> anyhow::Result<()> {
     while let Some(item) = rd.next_item()? {
         match item {
             PlanItem::Segment(s) => {
-                n += s.chunks.iter().map(|c| c.rows()).sum::<usize>();
-                segments.push(s.chunks);
+                let chunks = s.into_chunks()?;
+                n += chunks.iter().map(|c| c.rows()).sum::<usize>();
+                segments.push(chunks);
             }
             PlanItem::Control { .. } => controls += 1,
             PlanItem::Truncate { .. } => unreachable!(),
@@ -446,7 +447,7 @@ async fn plan(args: &Args, repeat: usize) -> anyhow::Result<()> {
         let mut rrd = reference.seal(u64::MAX, 0)?.replay()?;
         let mut want = Vec::new();
         while let Some(PlanItem::Segment(s)) = rrd.next_item()? {
-            want.extend(s.chunks);
+            want.extend(s.into_chunks()?);
         }
         assert!(
             merged(want) == merged(segments.into_iter().flatten().collect()),

@@ -742,31 +742,25 @@ impl EncodeState {
         let mut view = TupleView::default();
         for row in &mut slab.rows {
             if row.seq != self.seq {
-                self.seal()?;
+                self.seal();
                 self.seq = row.seq;
             }
             let patch = std::mem::take(&mut row.patch);
             let (rel, route) = &slab.tables[row.table as usize];
             encode_row(&mut self.chunks, &mut view, &row.tuple, rel, route, patch)?;
             if self.chunks.due() {
-                self.seal()?;
+                self.seal();
             }
         }
         Ok(())
     }
 
-    fn seal(&mut self) -> Result<(), String> {
+    fn seal(&mut self) {
         let rows = self.chunks.rows();
         if rows == 0 {
-            return Ok(());
+            return;
         }
-        let chunks = self
-            .chunks
-            .take()
-            .map_err(|e| format!("bootstrap: encode: {e}"))?
-            .into_iter()
-            .map(|(_, c)| c)
-            .collect();
+        let chunks = self.chunks.take().into_iter().map(|(_, c)| c).collect();
         self.chunks.clear();
         self.ready.push(PlacedSegment {
             seq: self.seq,
@@ -774,7 +768,6 @@ impl EncodeState {
             permit: None,
         });
         self.ready_rows += rows;
-        Ok(())
     }
 }
 
@@ -826,7 +819,7 @@ impl Encoder {
     /// seqs whose rows all shipped
     async fn ship(&mut self) -> Result<(), String> {
         let state = self.state.as_mut().expect("encode state home");
-        state.seal()?;
+        state.seal();
         // Every row it covered ships now; holding it longer stalls next acquire
         let permit = self.permit.take();
         if !state.ready.is_empty() {

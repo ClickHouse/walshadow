@@ -134,6 +134,16 @@ impl OracleColumnBuf {
         }
     }
 
+    /// Empty buffer for the same column
+    pub fn empty_like(&self) -> Self {
+        Self::with_target(
+            self.source_type_oid,
+            self.source_typmod,
+            self.string_target,
+            self.nullable_target,
+        )
+    }
+
     pub fn push(&mut self, cell: OracleCell) {
         self.payload_capacity += match &cell {
             OracleCell::Default => 0,

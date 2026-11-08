@@ -1,9 +1,11 @@
 //! Plan one committed transaction before executing it.
 //!
-//! Encode routed rows into per-table column chunks while planning. Seal open
-//! chunks into a segment at row and byte limits and before every control or
-//! truncate; each segment dispatches as one seq. Keep chunks in memory until
-//! their size exceeds memory limit, then write them to a spool file. Keep
+//! Seal routed rows into a segment at row and byte limits and before every
+//! control or truncate; each segment dispatches as one seq. A deferring
+//! writer keeps validated records as WAL bytes so encoding runs once
+//! dispatched, off the commit path; others encode per-table column chunks
+//! while planning. Keep segments in memory until their size exceeds memory
+//! limit, then encode and write them to a spool file. Keep
 //! table metadata, controls, and truncates in memory, assuming control state
 //! stays small as in live transaction buffer. Count and discard rows without
 //! mappings, but keep their truncates. On planning failure, delete spool file
@@ -27,13 +29,13 @@ use thiserror::Error;
 
 use crate::ch::EmitterError;
 use crate::decode::datum::{Datum, DatumRef};
-use crate::decode::heap_decoder::{HeapOp, TupleView, inflate, missing_datum};
+use crate::decode::heap_decoder::{HeapOp, TupleView, inflate, missing_datum, view_heap_record};
 use crate::emit::ch_emitter::{
     Append, EncodedChunk, OP_DELETE, OP_INSERT, OP_UPDATE, RowStamp, TableEncoder, TablePlan,
 };
 use crate::emit::route::RouteSnapshot;
 use crate::schema::RelDescriptor;
-use crate::xact::spill::{self, Cursor, IO_CHUNK, SpillError, Truncate};
+use crate::xact::spill::{self, Cursor, DescribedInput, IO_CHUNK, SpillError, Truncate};
 use crate::xact::xact_buffer::{DrainEntry, ToastRowBatch};
 use foldhash::HashMap;
 
@@ -75,11 +77,107 @@ pub struct PlannedTruncate {
 
 /// Rows sealed together; executor dispatches one seq per segment
 pub struct Segment {
-    pub chunks: Vec<EncodedChunk>,
+    pub body: SegmentBody,
     /// Destination rows, delete markers for key changes included
     pub rows: u64,
-    /// Allocated column bytes, the admission a dispatched segment holds
+    /// Allocated column bytes or held record bytes, the admission a
+    /// dispatched segment holds
     pub bytes: usize,
+}
+
+pub enum SegmentBody {
+    Encoded(Vec<EncodedChunk>),
+    /// Validated records still WAL bytes, encoded once dispatched
+    Pending(PendingRows),
+}
+
+impl Segment {
+    #[cfg(any(test, feature = "test-support"))]
+    /// [`Self::into_chunks`], panicking on a codec failure
+    pub fn chunks(self) -> Vec<EncodedChunk> {
+        self.into_chunks().expect("segment encodes")
+    }
+
+    /// Column chunks, encoding pending records here
+    pub fn into_chunks(self) -> std::result::Result<Vec<EncodedChunk>, EmitterError> {
+        match self.body {
+            SegmentBody::Encoded(chunks) => Ok(chunks),
+            SegmentBody::Pending(rows) => {
+                let mut b = ChunkBuilder::new(usize::MAX, usize::MAX);
+                rows.encode_into(&mut b)?;
+                Ok(b.take().into_iter().map(|(_, c)| c).collect())
+            }
+        }
+    }
+}
+
+/// Routed heap record planned without encoding: routed, validated and
+/// detoasted, so encoding can only fail on the value codec
+pub struct PendingHeap {
+    table: u32,
+    route: Arc<RouteSnapshot>,
+    input: Box<DescribedInput>,
+    /// Resolved external values per image as `[new, old]`, empty when no
+    /// image has any
+    patches: Vec<[Vec<(usize, Datum)>; 2]>,
+}
+
+impl PendingHeap {
+    /// Encode every image into `b` under `key`, returning rows appended
+    fn encode_into<K: Copy + PartialEq>(
+        &self,
+        b: &mut ChunkBuilder<K>,
+        key: K,
+        commit_ts: i64,
+    ) -> std::result::Result<usize, EmitterError> {
+        let rel = &self.input.descriptor;
+        let lsn = self.input.input.source_lsn;
+        let images = view_heap_record(self.input.input.record_bytes(), rel)
+            .map_err(|e| EmitterError::Type(format!("record at {lsn:#X}: {e}")))?;
+        let mut rows = 0;
+        for (i, h) in images.iter().enumerate() {
+            let (new_patch, old_patch) = self
+                .patches
+                .get(i)
+                .map_or((&[][..], &[][..]), |[n, o]| (&n[..], &o[..]));
+            let change = ViewChange {
+                op: h.op,
+                xid: self.input.input.xid,
+                source_lsn: lsn,
+                new: h.new.as_ref(),
+                old: h.old.as_ref(),
+                new_patch,
+                old_patch,
+            };
+            rows += b.push_views(key, rel, &self.route, change, commit_ts)?;
+        }
+        Ok(rows)
+    }
+}
+
+/// One segment's pending records
+#[derive(Default)]
+pub struct PendingRows {
+    commit_ts: i64,
+    heaps: Vec<PendingHeap>,
+}
+
+impl PendingRows {
+    /// Encode into `b`, keying tables by relation and route identity so
+    /// several segments' rows of one table share a chunk. Returns rows
+    /// appended
+    pub fn encode_into(
+        &self,
+        b: &mut ChunkBuilder<(usize, usize)>,
+    ) -> std::result::Result<usize, EmitterError> {
+        self.heaps.iter().try_fold(0, |rows, h| {
+            let key = (
+                Arc::as_ptr(&h.input.descriptor) as usize,
+                Arc::as_ptr(&h.route) as usize,
+            );
+            Ok(rows + h.encode_into(b, key, self.commit_ts)?)
+        })
+    }
 }
 
 #[derive(Debug, Error)]
@@ -147,12 +245,10 @@ impl Drop for PlanFile {
 
 /// One plan step in drain order
 enum Step {
-    /// `chunks` stay `None` once written to the spool file
     Segment {
-        count: usize,
         rows: u64,
         bytes: usize,
-        chunks: Option<Vec<(u32, EncodedChunk)>>,
+        body: StepBody,
     },
     Control {
         event: DrainEntry,
@@ -164,13 +260,30 @@ enum Step {
     },
 }
 
+enum StepBody {
+    Pending(PendingRows),
+    Encoded(Vec<(u32, EncodedChunk)>),
+    /// `frames` chunks written to the spool file
+    Spooled {
+        frames: usize,
+    },
+}
+
 /// Per-table encoder of the open segment
 struct OpenTable<K> {
     key: K,
     rel: Arc<RelDescriptor>,
     route: Arc<RouteSnapshot>,
     enc: TableEncoder,
+    /// `(seq, rows)` of the open chunk, in append order, when tagging
+    seqs: SeqRows,
 }
+
+/// `(seq, rows)` runs one chunk carries, in append order
+pub type SeqRows = Vec<(u64, u64)>;
+
+/// Chunk sealed out of a [`ChunkBuilder`], with the seqs its rows belong to
+type Taken<K> = (K, EncodedChunk, SeqRows);
 
 /// Empty encoders kept across plans, so a route compiles its table plan
 /// once rather than per transaction. One per relation name: a new
@@ -217,7 +330,9 @@ pub struct ChunkBuilder<K> {
     open: Vec<OpenTable<K>>,
     encoders: EncoderCache,
     /// Chunks of the open segment sealed early at an oracle frame limit
-    sealed: Vec<(K, EncodedChunk)>,
+    sealed: Vec<Taken<K>>,
+    /// Seq rows append under, see [`Self::tag`]
+    seq: Option<u64>,
     rows: usize,
     segment_rows: usize,
     segment_bytes: usize,
@@ -231,6 +346,7 @@ impl<K: Copy + PartialEq> ChunkBuilder<K> {
             open: Vec::new(),
             encoders: EncoderCache::default(),
             sealed: Vec::new(),
+            seq: None,
             rows: 0,
             segment_rows: segment_rows.max(1),
             segment_bytes: segment_bytes.max(1),
@@ -241,6 +357,12 @@ impl<K: Copy + PartialEq> ChunkBuilder<K> {
     pub fn with_encoders(mut self, encoders: EncoderCache) -> Self {
         self.encoders = encoders;
         self
+    }
+
+    /// Tag rows appended from here on with `seq`, so one chunk can carry
+    /// rows of several seqs; see [`Self::take_runs`]
+    pub fn tag(&mut self, seq: u64) {
+        self.seq = Some(seq);
     }
 
     /// Rows in the open segment
@@ -258,7 +380,7 @@ impl<K: Copy + PartialEq> ChunkBuilder<K> {
             + self
                 .sealed
                 .iter()
-                .map(|(_, c)| c.allocated_bytes())
+                .map(|(_, c, _)| c.allocated_bytes())
                 .sum::<usize>()
     }
 
@@ -283,14 +405,22 @@ impl<K: Copy + PartialEq> ChunkBuilder<K> {
                     rel: rel.clone(),
                     route: route.clone(),
                     enc,
+                    seqs: SeqRows::new(),
                 });
                 self.open.len() - 1
             }
         };
         if row(&mut self.open[i].enc)? == Append::Full {
-            let chunk = self.take_chunk(i)?;
+            let chunk = self.take_chunk(i);
             self.sealed.push(chunk);
             row(&mut self.open[i].enc)?;
+        }
+        if let Some(seq) = self.seq {
+            let seqs = &mut self.open[i].seqs;
+            match seqs.last_mut() {
+                Some((s, n)) if *s == seq => *n += 1,
+                _ => seqs.push((seq, 1)),
+            }
         }
         self.rows += 1;
         Ok(())
@@ -319,10 +449,7 @@ impl<K: Copy + PartialEq> ChunkBuilder<K> {
             leaf,
         };
         let mut rows = 0;
-        if !route.drops_deletes()
-            && let (Some(old), Some(new)) = (change.old, change.new)
-            && key_moved(rel, &change, old, new)
-        {
+        if let Some(old) = moved_key(rel, route, &change) {
             let stamp = stamp(change.source_lsn - 1, OP_DELETE);
             self.append(key, rel, route, |enc| {
                 enc.append_view(rel, &old.datums, change.old_patch, &stamp)
@@ -341,28 +468,44 @@ impl<K: Copy + PartialEq> ChunkBuilder<K> {
         Ok(rows + 1)
     }
 
-    fn take_chunk(&mut self, i: usize) -> std::result::Result<(K, EncodedChunk), EmitterError> {
+    fn take_chunk(&mut self, i: usize) -> Taken<K> {
         let o = &mut self.open[i];
-        let (buffers, rows) = o.enc.take_block()?;
+        let (buffers, rows) = o.enc.take_block();
         let chunk = EncodedChunk {
             rel: o.rel.clone(),
             route: o.route.clone(),
             buffers,
             rows,
         };
-        Ok((o.key, chunk))
+        (o.key, chunk, std::mem::take(&mut o.seqs))
     }
 
     /// Seal the open segment's chunks, early-sealed ones first
-    pub fn take(&mut self) -> std::result::Result<Vec<(K, EncodedChunk)>, EmitterError> {
+    fn take_tagged(&mut self) -> Vec<Taken<K>> {
         let mut chunks = std::mem::take(&mut self.sealed);
         for i in 0..self.open.len() {
             if self.open[i].enc.rows > 0 {
-                chunks.push(self.take_chunk(i)?);
+                chunks.push(self.take_chunk(i));
             }
         }
         self.rows = 0;
-        Ok(chunks)
+        chunks
+    }
+
+    /// Seal the open segment's chunks, early-sealed ones first
+    pub fn take(&mut self) -> Vec<(K, EncodedChunk)> {
+        self.take_tagged()
+            .into_iter()
+            .map(|(k, c, _)| (k, c))
+            .collect()
+    }
+
+    /// [`Self::take`] with each chunk's rows per [`Self::tag`]ged seq
+    pub fn take_runs(&mut self) -> Vec<(EncodedChunk, SeqRows)> {
+        self.take_tagged()
+            .into_iter()
+            .map(|(_, c, seqs)| (c, seqs))
+            .collect()
     }
 
     /// Park open encoders, emptied by [`Self::take`], so later keys start
@@ -402,6 +545,12 @@ pub struct PlanWriter {
     /// second live table appears, so single-relation plans never hash
     table_ids: Option<HashMap<(usize, u64), u32>>,
     chunks: ChunkBuilder<u32>,
+    /// Keep routed records as WAL bytes until dispatch, see [`Self::defers`]
+    defer: bool,
+    /// Open segment's records when deferring
+    pending: Vec<PendingHeap>,
+    pending_rows: usize,
+    pending_bytes: usize,
     commit_ts: i64,
     steps: Vec<Step>,
     row_batches: Vec<ToastRowBatch>,
@@ -425,6 +574,10 @@ impl PlanWriter {
             last_table: 0,
             table_ids: None,
             chunks: ChunkBuilder::new(usize::MAX, usize::MAX),
+            defer: false,
+            pending: Vec::new(),
+            pending_rows: 0,
+            pending_bytes: 0,
             commit_ts: 0,
             steps: Vec::new(),
             row_batches: Vec::new(),
@@ -445,6 +598,19 @@ impl PlanWriter {
     pub fn for_commit(mut self, commit_ts: i64) -> Self {
         self.commit_ts = commit_ts;
         self
+    }
+
+    /// Plan routed records without encoding them, so encoding runs once
+    /// dispatched instead of on the commit path
+    pub fn deferring(mut self) -> Self {
+        self.defer = true;
+        self
+    }
+
+    /// Whether the next record should go through [`Self::push_pending`]:
+    /// only memory-resident plans defer, a spilled one writes chunks
+    pub fn defers(&self) -> bool {
+        self.defer && self.file.is_none()
     }
 
     /// Reuse encoders an earlier plan returned through [`Self::seal_keeping`]
@@ -525,6 +691,8 @@ impl PlanWriter {
             &input.descriptor,
         )
         .expect("formed record views");
+        let defer = self.defers();
+        let mut rows = 0;
         for h in &images {
             let change = ViewChange {
                 op: h.op,
@@ -535,7 +703,15 @@ impl PlanWriter {
                 new_patch: &[],
                 old_patch: &[],
             };
-            self.push_views(change, table)?;
+            if defer {
+                rows += self.count_change(&change, table)?;
+            } else {
+                self.push_views(change, table)?;
+            }
+        }
+        drop(images);
+        if defer {
+            self.push_pending(table, Box::new(input), Vec::new(), rows)?;
         }
         Ok(())
     }
@@ -552,13 +728,68 @@ impl PlanWriter {
         self.pushed(rows)
     }
 
-    /// Count `rows` just encoded, none for a dropped delete, and seal a due
-    /// segment
-    fn pushed(&mut self, rows: usize) -> Result<()> {
+    /// Count one change [`Self::push_pending`] will carry, validating its
+    /// operation. Returns the rows it encodes to
+    pub fn count_change(&mut self, change: &ViewChange<'_, '_>, table: u32) -> Result<usize> {
+        let t = &mut self.tables[table as usize];
+        t.heaps += 1;
+        let route = t.route.as_ref().expect("routed table");
+        let rows = if route.drops_deletes() && change.op == HeapOp::Delete {
+            0
+        } else {
+            op_code(change.op)?;
+            1 + usize::from(moved_key(&t.descriptor, route, change).is_some())
+        };
+        self.count(rows);
+        Ok(rows)
+    }
+
+    /// Carry a record whose images [`Self::count_change`] counted as `rows`
+    pub fn push_pending(
+        &mut self,
+        table: u32,
+        input: Box<DescribedInput>,
+        patches: Vec<[Vec<(usize, Datum)>; 2]>,
+        rows: usize,
+    ) -> Result<()> {
+        if rows == 0 {
+            return Ok(());
+        }
+        let route = self.tables[table as usize].route.clone();
+        self.pending_bytes += size_of::<PendingHeap>()
+            + input.approx_bytes()
+            + patches
+                .iter()
+                .flatten()
+                .flatten()
+                .map(|(_, d)| size_of::<(usize, Datum)>() + d.approx_bytes())
+                .sum::<usize>();
+        self.pending_rows += rows;
+        self.pending.push(PendingHeap {
+            table,
+            route: route.expect("routed table"),
+            input,
+            patches,
+        });
+        if self.pending_rows >= self.chunks.segment_rows
+            || self.pending_bytes >= self.chunks.segment_bytes
+        {
+            self.seal_segment()?;
+        }
+        Ok(())
+    }
+
+    /// Count `rows` of one change, none for a dropped delete
+    fn count(&mut self, rows: usize) {
         if rows == 0 {
             self.deletes_discarded += 1;
         }
         self.routed_rows += rows as u64;
+    }
+
+    /// Count `rows` just encoded and seal a due segment
+    fn pushed(&mut self, rows: usize) -> Result<()> {
+        self.count(rows);
         if self.chunks.due() {
             self.seal_segment()?;
         }
@@ -567,33 +798,61 @@ impl PlanWriter {
 
     /// Close the open segment into a step, spilling once memory runs out
     fn seal_segment(&mut self) -> Result<()> {
-        let chunks = self.chunks.take()?;
-        if chunks.is_empty() {
-            return Ok(());
-        }
-        let rows = chunks.iter().map(|(_, c)| c.rows as u64).sum();
-        let bytes = chunks
-            .iter()
-            .map(|(_, c)| c.allocated_bytes())
-            .sum::<usize>();
-        let count = chunks.len();
-        let chunks =
-            if self.file.is_none() && self.bytes + bytes as u64 <= self.mem_max.min(self.cap) {
-                self.bytes += bytes as u64;
-                Some(chunks)
-            } else {
-                self.spill()?;
-                for (table, c) in &chunks {
-                    self.write_chunk(*table, c)?;
-                }
-                None
+        let (rows, bytes, body) = if self.pending.is_empty() {
+            let chunks = self.chunks.take();
+            if chunks.is_empty() {
+                return Ok(());
+            }
+            let rows = chunks.iter().map(|(_, c)| c.rows as u64).sum();
+            let bytes = chunks.iter().map(|(_, c)| c.allocated_bytes()).sum();
+            (rows, bytes, StepBody::Encoded(chunks))
+        } else {
+            let rows = std::mem::take(&mut self.pending_rows) as u64;
+            let bytes = std::mem::take(&mut self.pending_bytes);
+            let records = PendingRows {
+                commit_ts: self.commit_ts,
+                heaps: std::mem::take(&mut self.pending),
             };
-        self.steps.push(Step::Segment {
-            count,
-            rows,
-            bytes,
-            chunks,
-        });
+            (rows, bytes, StepBody::Pending(records))
+        };
+        let mut step = Step::Segment { rows, bytes, body };
+        if self.file.is_none() && self.bytes + bytes as u64 <= self.mem_max.min(self.cap) {
+            self.bytes += bytes as u64;
+        } else {
+            self.spill()?;
+            self.spool_step(&mut step)?;
+        }
+        self.steps.push(step);
+        Ok(())
+    }
+
+    /// Write a resident segment's chunks to the spool file, encoding
+    /// pending records first
+    fn spool_step(&mut self, step: &mut Step) -> Result<()> {
+        let Step::Segment { bytes, body, .. } = step else {
+            return Ok(());
+        };
+        let chunks = match std::mem::replace(body, StepBody::Spooled { frames: 0 }) {
+            StepBody::Encoded(chunks) => chunks,
+            StepBody::Pending(records) => {
+                for h in &records.heaps {
+                    h.encode_into(&mut self.chunks, h.table, records.commit_ts)?;
+                }
+                let chunks = self.chunks.take();
+                *bytes = chunks.iter().map(|(_, c)| c.allocated_bytes()).sum();
+                chunks
+            }
+            spooled @ StepBody::Spooled { .. } => {
+                *body = spooled;
+                return Ok(());
+            }
+        };
+        for (table, c) in &chunks {
+            self.write_chunk(*table, c)?;
+        }
+        *body = StepBody::Spooled {
+            frames: chunks.len(),
+        };
         Ok(())
     }
 
@@ -609,16 +868,7 @@ impl PlanWriter {
         self.file = Some((out, PlanFile(path)));
         self.bytes = 4;
         let mut steps = std::mem::take(&mut self.steps);
-        let written = steps.iter_mut().try_for_each(|step| {
-            if let Step::Segment { chunks, .. } = step
-                && let Some(chunks) = chunks.take()
-            {
-                chunks
-                    .iter()
-                    .try_for_each(|(table, c)| self.write_chunk(*table, c))?;
-            }
-            Ok::<_, PlanSpoolError>(())
-        });
+        let written = steps.iter_mut().try_for_each(|step| self.spool_step(step));
         self.steps = steps;
         written
     }
@@ -771,6 +1021,19 @@ fn key_moved<'v>(
         // PostgreSQL HOT updates leave indexed columns unchanged
         !hot && keys.iter().any(|&a| differs(a as usize - 1))
     }
+}
+
+/// Old image when `change` moves its key and the route keeps deletes: the
+/// change encodes as a delete marker plus the new row
+fn moved_key<'v, 'a>(
+    rel: &RelDescriptor,
+    route: &RouteSnapshot,
+    change: &ViewChange<'v, 'a>,
+) -> Option<&'v TupleView<'a>> {
+    let (Some(old), Some(new)) = (change.old, change.new) else {
+        return None;
+    };
+    (!route.drops_deletes() && key_moved(rel, change, old, new)).then_some(old)
 }
 
 /// Stored-byte inequality, as PostgreSQL's `datumIsEqual` judges index
@@ -935,30 +1198,26 @@ impl PlanReader {
         Ok(Some(match step {
             Step::Control { event, row_idx } => PlanItem::Control { event, row_idx },
             Step::Truncate { truncate, upto } => PlanItem::Truncate { truncate, upto },
-            Step::Segment {
-                count,
-                rows,
-                bytes,
-                chunks,
-            } => {
-                let chunks = match chunks {
-                    Some(chunks) => chunks.into_iter().map(|(_, c)| c).collect(),
-                    None => {
+            Step::Segment { rows, bytes, body } => {
+                let body = match body {
+                    StepBody::Pending(records) => SegmentBody::Pending(records),
+                    StepBody::Encoded(chunks) => {
+                        SegmentBody::Encoded(chunks.into_iter().map(|(_, c)| c).collect())
+                    }
+                    StepBody::Spooled { frames } => {
                         let Some(f) = self.input.as_mut() else {
                             return Err(PlanSpoolError::Format {
                                 detail: "spilled segment without spool file".into(),
                             });
                         };
-                        (0..count)
-                            .map(|_| read_frame(f, &self.tables))
-                            .collect::<Result<_>>()?
+                        SegmentBody::Encoded(
+                            (0..frames)
+                                .map(|_| read_frame(f, &self.tables))
+                                .collect::<Result<_>>()?,
+                        )
                     }
                 };
-                PlanItem::Segment(Segment {
-                    chunks,
-                    rows,
-                    bytes,
-                })
+                PlanItem::Segment(Segment { body, rows, bytes })
             }
         }))
     }
@@ -1005,7 +1264,7 @@ fn read_frame(f: &mut FileInput, tables: &[PlanTable]) -> Result<EncodedChunk> {
 mod tests {
     use super::*;
     use crate::decode::datum::{Datum, build};
-    use crate::decode::heap_decoder::{DecodedHeap, DecodedTuple};
+    use crate::decode::heap_decoder::{CommittedTuple, DecodedHeap, DecodedTuple};
     use crate::emit::ch_emitter::Wire;
     use crate::mapping::{ColumnMapping, TableMapping, TableTarget};
     use crate::schema::{INT4OID, RelAttr, RelName, SchemaEvent};
@@ -1245,11 +1504,12 @@ mod tests {
                 order.push(match item {
                     PlanItem::Control { event, .. } => format!("{event:?}"),
                     PlanItem::Segment(s) => {
-                        for c in &s.chunks {
+                        let chunks = s.chunks();
+                        for c in &chunks {
                             assert!(Arc::ptr_eq(&c.rel, &d1), "descriptor survives plan");
                             assert!(Arc::ptr_eq(&c.route, &r));
                         }
-                        format!("{:?}", rows(&s.chunks))
+                        format!("{:?}", rows(&chunks))
                     }
                     PlanItem::Truncate { truncate: t, .. } => {
                         assert!(rd.tables[t.table as usize].route.is_none());
@@ -1344,8 +1604,8 @@ mod tests {
             let Some(PlanItem::Segment(s)) = rd.next_item().unwrap() else {
                 panic!("one segment");
             };
-            assert_eq!(rows(&s.chunks), want);
             assert_eq!(s.rows, want.len() as u64);
+            assert_eq!(rows(&s.chunks()), want);
             assert_eq!(rd.deletes_discarded, discarded);
         }
     }
@@ -1369,9 +1629,76 @@ mod tests {
         let mut seen = Vec::new();
         while let Some(PlanItem::Segment(s)) = rd.next_item().unwrap() {
             assert_eq!(s.rows, 2);
-            seen.extend(rows(&s.chunks).into_iter().map(|r| r.0.unwrap()));
+            seen.extend(rows(&s.chunks()).into_iter().map(|r| r.0.unwrap()));
         }
         assert_eq!(seen, (0..64).collect::<Vec<_>>());
+    }
+
+    /// Deferred records replay pending and encode to the rows inline
+    /// planning writes; a spill encodes them into frames
+    #[test]
+    fn deferred_records_encode_like_inline() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = descriptor(16500);
+        let r = route();
+        let plan = |name: &str, defer: bool, mem_max: u64| {
+            let mut w = PlanWriter::create(tmp.path().join(name), 1 << 20, mem_max)
+                .with_segment_limits(2, usize::MAX)
+                .for_commit(42);
+            if defer {
+                w = w.deferring();
+            }
+            for v in 0..5 {
+                push(&mut w, &d, heap(&d, 100 + v as u64, v), Some(r.clone())).unwrap();
+            }
+            let mut rd = w.seal(0x2000, 42).unwrap().replay().unwrap();
+            let (mut out, mut pending) = (Vec::new(), 0);
+            while let Some(PlanItem::Segment(s)) = rd.next_item().unwrap() {
+                pending += usize::from(matches!(s.body, SegmentBody::Pending(_)));
+                let want = s.rows;
+                let got = rows(&s.chunks());
+                assert_eq!(got.len() as u64, want);
+                out.push(got);
+            }
+            (out, pending)
+        };
+        let (inline, none) = plan("inline", false, 1 << 20);
+        assert_eq!((inline.len(), none), (3, 0));
+        assert_eq!(plan("deferred", true, 1 << 20), (inline.clone(), 3));
+        assert_eq!(plan("spilled", true, 0), (inline, 0));
+    }
+
+    /// Rows tagged with seqs share one chunk per table, each run counted
+    #[test]
+    fn tagged_rows_share_chunk_per_table() {
+        let (d1, d2, r) = (descriptor(1), descriptor(2), route());
+        let mut b = ChunkBuilder::new(usize::MAX, usize::MAX);
+        for (seq, rel) in [(5, &d1), (5, &d2), (6, &d1), (6, &d1), (7, &d2)] {
+            b.tag(seq);
+            let h = heap(rel, 100 + seq, seq as i32);
+            b.append(Arc::as_ptr(rel) as usize, rel, &r, |enc| {
+                enc.append_routed(
+                    &CommittedTuple {
+                        decoded: h.clone(),
+                        commit_ts: 42,
+                        commit_lsn: 0,
+                    },
+                    &r.mapping,
+                    OP_INSERT,
+                    None,
+                )
+            })
+            .unwrap();
+        }
+        let runs: Vec<_> = b
+            .take_runs()
+            .into_iter()
+            .map(|(c, seqs)| (c.rel.oid, c.rows, seqs))
+            .collect();
+        assert_eq!(
+            runs,
+            [(1, 3, vec![(5, 1), (6, 2)]), (2, 2, vec![(5, 1), (7, 1)])]
+        );
     }
 
     /// Sealing returns emptied encoders that serve the next plan under the
@@ -1403,7 +1730,7 @@ mod tests {
             let Some(PlanItem::Segment(s)) = rd.next_item().unwrap() else {
                 panic!("one segment");
             };
-            assert_eq!(rows(&s.chunks), [(Some(i as i32), 100 + i as u64, 7, 0)]);
+            assert_eq!(rows(&s.chunks()), [(Some(i as i32), 100 + i as u64, 7, 0)]);
         }
     }
 
@@ -1430,7 +1757,7 @@ mod tests {
             let Some(PlanItem::Segment(s)) = rd.next_item().unwrap() else {
                 panic!("one segment");
             };
-            s.chunks
+            s.chunks()
                 .iter()
                 .flat_map(|c| c.buffers.iter().map(|b| format!("{:?}", b.wire())))
                 .collect::<Vec<_>>()
