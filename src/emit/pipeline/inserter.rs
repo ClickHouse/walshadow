@@ -68,7 +68,13 @@ impl Inserter {
                                 let block = {
                                     let mut scratch =
                                         scratch.lock().expect("inserter scratch poisoned");
-                                    sealed.open(alloc, &mut scratch)?
+                                    let held = scratch.capacity();
+                                    let block = sealed.open(alloc, &mut scratch);
+                                    stats.inserter_scratch_bytes.fetch_add(
+                                        (scratch.capacity() - held) as u64,
+                                        Ordering::Relaxed,
+                                    );
+                                    block?
                                 };
                                 let bb = builder_of(&block)?;
                                 stats.inserter_rebuilds.fetch_add(1, Ordering::Relaxed);
@@ -112,6 +118,8 @@ impl Inserter {
         for query in &meta.inserts {
             self.client.select(query.instance.as_deref())?;
             durable = Some(self.send_with_retry(&query.sql, blocks).await?);
+            #[cfg(feature = "test-support")]
+            crate::crash_test::hit(crate::crash_test::Point::AfterInsert, u64::MAX);
         }
         durable.ok_or_else(|| EmitterError::Config("batch has no INSERT target".into()))
     }
@@ -145,6 +153,15 @@ impl Inserter {
                 }
             }
         }
+    }
+}
+
+impl Drop for Inserter {
+    fn drop(&mut self) {
+        let held = self.scratch.get_mut().map_or(0, |s| s.capacity());
+        self.stats
+            .inserter_scratch_bytes
+            .fetch_sub(held as u64, Ordering::Relaxed);
     }
 }
 
@@ -192,20 +209,23 @@ mod tests {
     }
 
     /// Every attempt resends every block of the INSERT through failed and
-    /// idle reconnects; blocks prepared for other compression than the
-    /// uncompressed server connection rebuild
+    /// idle reconnects, and after a drop between Data blocks; blocks
+    /// prepared for other compression than the uncompressed server
+    /// connection rebuild
     #[tokio::test]
     async fn insert_retry_preserves_payload_through_failed_reconnect() {
         let sql = "INSERT INTO retry_test (x) VALUES";
-        for (retries, idle, blocks, codec) in [
-            (0, false, 1, CompressionChoice::Lz4),
-            (1, false, 1, CompressionChoice::None),
-            (2, false, 1, CompressionChoice::Zstd),
-            (2, false, 3, CompressionChoice::Lz4),
-            (1, true, 2, CompressionChoice::Zstd),
+        for (retries, idle, blocks, codec, cut) in [
+            (0, false, 1, CompressionChoice::Lz4, None),
+            (1, false, 1, CompressionChoice::None, None),
+            (2, false, 1, CompressionChoice::Zstd, None),
+            (2, false, 3, CompressionChoice::Lz4, None),
+            (1, true, 2, CompressionChoice::Zstd, None),
+            (2, false, 3, CompressionChoice::None, Some(1)),
+            (2, false, 3, CompressionChoice::Zstd, Some(2)),
         ] {
             let (config, server) =
-                crate::ch::test_support::retry_server(retries, sql, blocks, idle).await;
+                crate::ch::test_support::retry_server(retries, sql, blocks, idle, cut).await;
             let dest = DestEmitter::new(Arc::new(config), None);
             let client = ChConn::connect(dest).await.unwrap();
             let (ack, collector) = ack::spawn(Arc::default(), Fatal::new());
@@ -235,8 +255,13 @@ mod tests {
                 codec != CompressionChoice::None,
                 "{codec:?}"
             );
+            assert_eq!(
+                stats.inserter_scratch_bytes.load(Ordering::Relaxed),
+                inserter.scratch.lock().unwrap().capacity() as u64
+            );
             server.await.unwrap();
             drop(inserter);
+            assert_eq!(stats.inserter_scratch_bytes.load(Ordering::Relaxed), 0);
             collector.await.unwrap();
         }
     }

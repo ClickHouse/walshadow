@@ -47,6 +47,27 @@ replay can temporarily duplicate rows
 Use existing stage metrics to locate missing attribution before adding counters
 Check process uptime and cumulative series remain valid across phase changes
 
+## Encoding and memory baseline
+
+Measure narrow fixed rows, short strings, wide JSONB/text, TOAST-heavy updates,
+mixed oracle tables, many small transactions, and a spilling large transaction
+against `more-types` (`69f1700`), before direct encoding, using `xact_spill`,
+`spool_read`, and `bootstrap_pump` allocation reports, and source-to-destination
+with [benchmark driver](../bench/README.md). Keep worker counts, batching
+limits, and codec settings unchanged. Use compressible and incompressible
+payloads, healthy and stalled destinations
+
+Record rows/s, source WAL bytes/s, CPU, allocation count, peak/steady RSS, spill
+volume, durable lag, blocks per INSERT, and ClickHouse part creation. Record
+retained bytes by owner from `walshadow_` metrics `xact_bytes_in_memory`,
+`resident_payload_bytes`, `output_resident_bytes`, `batcher_open_bytes`,
+`inserter_scratch_bytes`, and `resident_raw_bytes_total` over
+`resident_stored_bytes_total`, then compare their
+sum against RSS to size allocator and client overhead. Attribute savings
+separately to compact transaction storage, direct encoding, and compression
+Choose block size, seal workspace reserve, and default compression from measured
+CPU, memory, and part tradeoffs; do not claim gains from wire compression alone
+
 ## Candidate changes
 
 | Measured limit | Candidate |
@@ -59,6 +80,9 @@ Check process uptime and cumulative series remain valid across phase changes
 | Per-record allocation dominates | Evaluate inline storage for small block-reference lists |
 | Catalog refresh work dominates | Narrow invalidation only after measuring recapture and cache cost |
 | TOAST fetch or materialization dominates | Compare ClickHouse and [shadow modes](../architecture/shadow-toast.md) |
+| Oracle cells dominate output memory | Pack one column's cells into a shared buffer instead of one allocation each |
+| Open transaction inputs dominate RSS | Compress raw transaction segments in memory; keep spill regardless of ratio |
+| Commit-time encoding dominates latency | Encode before commit, after defining unresolved-value and rollback state |
 
 Bootstrap workers change ordering: assign acknowledgement sequence before
 parallel decode and account for concurrent deferred-TOAST writers. Preserve

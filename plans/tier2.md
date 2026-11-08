@@ -30,8 +30,7 @@ Commit planning already reads ordinary WAL tuples through borrowed datums and
 writes encoded column chunks. Large plans spill those chunks; conversion workers
 combine local and oracle columns, then seal prepared Native blocks. Extend this
 path with container buffers and a borrowed element walk. Nested owned values
-are not a prerequisite. See [direct encoding](native_encoding.md) for remaining
-load and TOAST work
+are not a prerequisite
 
 ## Dependencies need no change
 

@@ -62,6 +62,9 @@ enum Strategy {
 
 const RUNS_PER_STRATEGY: u32 = 5;
 
+/// Below one large xact, so it spills while open
+const XACT_BUFFER_MAX: usize = 1 << 20;
+
 /// Splitmix-style LCG; deterministic, no dep cost.
 fn next_seeded(state: &mut u64) -> u64 {
     *state = state
@@ -178,6 +181,8 @@ impl DaemonFlags {
             "0".into(),
             "--ch-config".into(),
             self.ch_config.to_string_lossy().into_owned(),
+            "--xact-buffer-max".into(),
+            XACT_BUFFER_MAX.to_string(),
             "--bootstrap-shadow-data-dir".into(),
             self.shadow_data.to_string_lossy().into_owned(),
             "--keep-shadow-running".into(),
@@ -249,13 +254,14 @@ async fn small_insert_loop(
     }
 }
 
-/// Run one large `BEGIN; INSERT × 10000; COMMIT` xact. Sized to spill
-/// to disk via `XactBuffer`'s largest-first eviction (each row carries
-/// a 200-byte payload; 10k rows × ~250 bytes ≈ 2.5 MiB).
+/// Run one large `BEGIN; INSERT × 10000; COMMIT` xact, open two seconds
+/// after its rows. 10k rows × ~250 bytes ≈ 2.5 MiB spills past
+/// [`XACT_BUFFER_MAX`] via `XactBuffer`'s largest-first eviction
 async fn large_xact(source_sock: PathBuf, start_id: i64) {
     let sql = format!(
         "BEGIN; \
          INSERT INTO kr.t SELECT g::int4, repeat('x', 200) FROM generate_series({}, {}) g; \
+         SELECT pg_sleep(2); \
          COMMIT",
         start_id,
         start_id + 9999,
@@ -299,22 +305,19 @@ async fn wait_for_source_rows(source: &Shadow, target: i64, deadline: Duration) 
     bail!("source never reached {target} rows in {deadline:?}");
 }
 
-/// Poll the metrics endpoint until `walshadow_xacts_committed_total`
-/// crosses zero. Used by the `PostCommit` strategy to fire immediately
-/// after the first commit drain returns (simpler shape per plan
-/// §"Risks").
-async fn wait_for_first_commit(metrics_addr: SocketAddr, deadline: Duration) -> Result<()> {
+/// Poll the metrics endpoint until counter `name` crosses zero
+async fn wait_for_metric(metrics_addr: SocketAddr, name: &str, deadline: Duration) -> Result<()> {
     let start = Instant::now();
     while start.elapsed() < deadline {
         if let Ok(body) = fx::http_get(metrics_addr, "/metrics")
-            && let Some(v) = fx::parse_metric(&body, "walshadow_xacts_committed_total")
+            && let Some(v) = fx::parse_metric(&body, name)
             && v > 0
         {
             return Ok(());
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    bail!("walshadow_xacts_committed_total never crossed 0 in {deadline:?}");
+    bail!("{name} never crossed 0 in {deadline:?}");
 }
 
 /// Poll source's `pg_current_wal_lsn` + daemon's
@@ -522,9 +525,8 @@ async fn run_cycle(
         stop.clone(),
         next_id.clone(),
     ));
-    // Strategy 2's parallel large xact runs alongside the small loop;
-    // its window overlaps the kill_delay naturally since the xact takes
-    // ~hundreds of ms to commit.
+    // Strategy 2's parallel large xact runs alongside the small loop and
+    // stays open past the kill
     let large_handle = if matches!(strategy, Strategy::MidXact) {
         let large_start = next_id.fetch_add(10_000, Ordering::Relaxed);
         Some(tokio::spawn(large_xact(source_sock.clone(), large_start)))
@@ -537,15 +539,30 @@ async fn run_cycle(
         .await
         .context("source never reached 100 rows")?;
 
-    // 4. Strategy-specific kill trigger.
+    // 4. Strategy-specific kill trigger. MidXact kills while large xact
+    //    sits spilled and uncommitted
     match strategy {
-        Strategy::MidSegment | Strategy::MidXact => {
+        Strategy::MidSegment => {
             tokio::time::sleep(Duration::from_millis(kill_delay_ms)).await;
         }
+        Strategy::MidXact => {
+            wait_for_metric(
+                flags.metrics_addr,
+                "walshadow_spill_evictions_total",
+                Duration::from_secs(30),
+            )
+            .await
+            .context("large xact never spilled")?;
+            tokio::time::sleep(Duration::from_millis(kill_delay_ms / 10)).await;
+        }
         Strategy::PostCommit => {
-            wait_for_first_commit(flags.metrics_addr, Duration::from_secs(30))
-                .await
-                .context("first commit drain never happened")?;
+            wait_for_metric(
+                flags.metrics_addr,
+                "walshadow_xacts_committed_total",
+                Duration::from_secs(30),
+            )
+            .await
+            .context("first commit drain never happened")?;
         }
     }
 
@@ -589,6 +606,17 @@ async fn run_cycle(
     wait_for_received_catchup(source, flags.metrics_addr, Duration::from_secs(90))
         .await
         .context("restart pump catchup")?;
+
+    // Large xact was open at kill, so restart reads and spills it again
+    if matches!(strategy, Strategy::MidXact) {
+        wait_for_metric(
+            flags.metrics_addr,
+            "walshadow_spill_evictions_total",
+            Duration::from_secs(5),
+        )
+        .await
+        .context("restart never spilled reopened large xact")?;
+    }
 
     // 10. Wait for source/CH parity
     fx::wait_ch_matches_source(ch, source, "kr.t", "default.kr_t", Duration::from_secs(60))

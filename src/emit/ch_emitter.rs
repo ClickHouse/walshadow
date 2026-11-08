@@ -2651,8 +2651,16 @@ impl EncodedChunk {
         self.rows
     }
 
+    /// Slab capacity plus chunk header and buffer slots, which dominate
+    /// for small rows spread across many tables
     pub fn allocated_bytes(&self) -> usize {
-        self.buffers.iter().map(ColumnBuf::allocated_bytes).sum()
+        std::mem::size_of::<Self>()
+            + self.buffers.capacity() * std::mem::size_of::<ColumnBuf>()
+            + self
+                .buffers
+                .iter()
+                .map(ColumnBuf::allocated_bytes)
+                .sum::<usize>()
     }
 
     pub fn rel_oid(&self) -> u32 {
@@ -3350,6 +3358,11 @@ crate::atomic_stats! {
         pub resident_stored_bytes,
         /// Resolver time serializing and compressing sealed blocks
         pub resident_seal_nanos,
+        /// Gauges: every tail's output pool (queued slabs, sealed blocks,
+        /// seal workspace), open batch slabs, inserter rebuild scratch
+        pub output_resident_bytes: Arc<std::sync::atomic::AtomicU64>,
+        pub batcher_open_bytes,
+        pub inserter_scratch_bytes,
     }
 }
 

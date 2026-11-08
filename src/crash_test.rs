@@ -14,6 +14,8 @@ pub enum Point {
     BeforeDdl,
     AfterAlter,
     AfterDdl,
+    /// One destination accepted rows, later destinations and ack pending
+    AfterInsert,
     AfterAck,
     AfterManifest,
 }

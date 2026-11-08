@@ -1,6 +1,8 @@
 //! Tee end-to-end: one source table feeds a `ReplacingMergeTree` primary, a
 //! `MergeTree` audit log, and a replica in another database. Rows, deletes
-//! and `ADD COLUMN` must reach all three.
+//! and `ADD COLUMN` must reach all three. Named instances differ in
+//! compression, so one INSERT sends prepared blocks to one and rebuilds
+//! them for other
 
 #![cfg(target_os = "linux")]
 
@@ -103,6 +105,7 @@ async fn run(named: bool) {
                         host: "127.0.0.1".into(),
                         port: remote_ports.ch_tcp,
                         database: "walshadow_test".into(),
+                        compression: walshadow::ch::CompressionChoice::None,
                         ..Default::default()
                     },
                 );
@@ -174,6 +177,11 @@ async fn run(named: bool) {
         .wait_for_replay(target, Duration::from_secs(30))
         .expect("shadow replay");
     assert!(observed >= target);
+    let rebuilds = pipeline
+        .stats
+        .inserter_rebuilds
+        .load(std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(rebuilds > 0, named, "rebuilds {rebuilds}");
     pipeline.shutdown().await.expect("pipeline drains clean");
 
     let live = "SELECT arrayStringConcat(groupArray(concat(toString(id), ':', body, ':', \

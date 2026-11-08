@@ -238,7 +238,7 @@ snapshot! {
     lsn emitter_ack_lsn: Pos<EmitterAck> = "Contiguous-done watermark from the insert pipeline.",
     lsn floor_lsn: Pos<Floor> = "Durable resume floor: restart resumes here and pruners cut to it.",
     gauge xact_active: u64 = "Active transactions buffered in memory or on spill.",
-    gauge xact_bytes_in_memory: u64 = "Bytes held in memory across all buffered xacts.",
+    gauge xact_bytes_in_memory: u64 = "Allocated bytes held in memory across all buffered xacts.",
     gauge spill_xacts_active: u64 = "Xacts with at least one entry currently in their spill file.",
     gauge spill_bytes_active: u64 = "Bytes currently held across all active xact spill files.",
     gauge drain_resident_bytes: u64 =
@@ -437,6 +437,12 @@ snapshot! {
         "Serialized Native block bytes sealed for insertion, before resident compression.",
     counter resident_stored_bytes_total: u64 =
         "Bytes allocated for those sealed blocks while awaiting insertion, including growth slack.",
+    gauge output_resident_bytes: u64 =
+        "Bytes held in insert tail output pools: queued column slabs, sealed blocks awaiting acknowledgement, and seal workspace.",
+    gauge batcher_open_bytes: u64 =
+        "Allocated column slab bytes in batches still open for more rows.",
+    gauge inserter_scratch_bytes: u64 =
+        "Allocated inserter buffers for decoding sealed blocks a connection cannot send as prepared.",
     counter oracle_resolve_seconds_total: f64 =
         "Cumulative resolver time inside the oracle round trip. Overlaps inserter_ch_seconds_total, so the larger of the two is the tail's limiter.",
     counter process_cpu_seconds_total: f64 =

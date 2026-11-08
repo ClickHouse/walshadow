@@ -38,6 +38,12 @@ Extend existing TOAST and type suites with:
   and MD5s after WAL replay. Test incompressible bodies, cap boundaries, explicit
   native JSON mapping, and restart. Do not infer native JSON semantics from
   automatic String mapping or row count
+- Compressed external, unchanged, and same-transaction values under shadow and
+  disabled modes, matching ClickHouse-mode cases in
+  [TOAST harness](../tests/toast_e2e.rs)
+- One fixture loaded by COPY, direct bootstrap, base backup, and object store,
+  with pending transactions, deferred TOAST, and restart; compare destination
+  rows across modes as well as against source
 
 For a fixture containing 8 KiB, 32 MiB, and 128 MiB TEXT rows, assert total
 length of `167780352` bytes after all inserts succeed. Compare every expected
@@ -89,6 +95,8 @@ retry exhaustion, supervisor restart, and recovery after connectivity returns
 Cover a transaction spanning WAL segments, partial batch success, and later
 inserts completing before an earlier insert. Compare final rows and durable
 progress with uninterrupted execution. Verify missing retained WAL fails clearly
+Add crash points while a spilled plan is written and while it replays, then
+assert restart clears scratch and converges
 
 Prepared COMMIT and ABORT already dispatch through ordinary drain/discard logic,
 and open transactions constrain restart floor. Verify full daemon restart after

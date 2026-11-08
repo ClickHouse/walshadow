@@ -53,7 +53,9 @@ Each inserter owns a ClickHouse connection and takes any ready batch
 Sequence numbers identify work slices, not necessarily whole transactions
 Only a commit's final slice publishes its LSN, after all earlier work finishes
 Bounded queues and a shared payload budget limit work in flight; transaction
-and plan data can spill to disk
+and plan data can spill to disk. Each tail's output pool holds batches from
+batcher to acknowledgement and reserves seal workspace apart from them, so
+conversion finishes however much output waits on inserters
 
 Queue worker runs on a dedicated thread. A dispatcher scans each batch ahead of
 it to start TOAST store reads for values updated rows keep. Ordinary heap

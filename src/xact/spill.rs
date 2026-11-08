@@ -429,11 +429,12 @@ impl RawRecord {
 
     pub fn approx_bytes(&self) -> usize {
         std::mem::size_of::<Self>()
-            + self.main_data.len()
+            + self.main_data.capacity()
+            + self.blocks.capacity() * std::mem::size_of::<RawBlock>()
             + self
                 .blocks
                 .iter()
-                .map(|b| std::mem::size_of::<RawBlock>() + b.image.len() + b.data.len())
+                .map(|b| b.image.capacity() + b.data.capacity())
                 .sum::<usize>()
     }
 }

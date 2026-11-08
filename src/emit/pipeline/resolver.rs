@@ -12,6 +12,18 @@
 //!
 //! A batch with no oracle column crosses unchanged, without touching the
 //! bridge.
+//!
+//! ## Output pool
+//!
+//! Each tail owns one pool, separate from the global admission pool its
+//! batches already hold. Batcher admits slab bytes per batch; permit rides
+//! batch through sealing until insert ack. Resolvers draw seal workspace
+//! from leaf reserve, which queued batches never hold, so sealing finishes
+//! however full the queue is. Order per block: take workspace, resolve,
+//! seal, drop slabs and workspace. Output past admitted slab bytes, such as
+//! frame overhead on incompressible data, settles as unmetered overshoot
+//! instead of waiting. Blocks whose workspace exceeds reserve seal one at a
+//! time. Inserters take nothing from pool, so acks always release it
 
 use std::collections::hash_map::Entry;
 use std::sync::Arc;
@@ -22,15 +34,18 @@ use clickhouse_c::{Allocator, BlockBuilder, ColumnBuilder, TypeAst};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
+use crate::budget::MemoryBudget;
 use crate::ch::{CompressionChoice, EmitterError};
 use crate::config::ResolvedConfig;
 use crate::emit::ch_emitter::{
     ColumnBuf, EmitterStats, RetryConfig, build_leaf, build_root, literal_column,
 };
 use crate::emit::pipeline::Fatal;
-use crate::emit::pipeline::batcher::{BatchMeta, BlockSlabs, InsertBatch};
+use crate::emit::pipeline::batcher::{BatchMeta, BlockSlabs, InsertBatch, NATIVE_BLOCK_BYTES};
 use crate::emit::pipeline::sealed::SealedBlock;
-use crate::ops::oracle::{Oracle, OracleBlock, OracleError, OracleRequestColumn};
+use crate::ops::oracle::{
+    ORACLE_BATCH_SEAL_BYTES, Oracle, OracleBlock, OracleError, OracleRequestColumn,
+};
 use crate::schema::TableKey;
 use foldhash::HashMap;
 
@@ -60,6 +75,43 @@ pub(crate) struct ResolverOptions {
     pub stats: Arc<EmitterStats>,
     pub fatal: Fatal,
     pub config_rx: Option<watch::Receiver<Arc<ResolvedConfig>>>,
+    /// Tail's output pool, see [`output_pool`]
+    pub budget: MemoryBudget,
+}
+
+/// clickhouse-c frame stage plus one compressed frame,
+/// `CHC_COMPRESS_MAX_CHUNK` in `clickhouse-compression.h`
+const SEAL_SCRATCH: usize = 160 << 10;
+
+/// Pool admitting `queued` bytes of batches, plus seal workspace for each
+/// of `resolvers`: largest block's output, and with `oracle` its request
+/// copy and decoded response
+pub(crate) fn output_pool(
+    queued: usize,
+    resolvers: usize,
+    oracle: bool,
+    gauge: Arc<std::sync::atomic::AtomicU64>,
+) -> MemoryBudget {
+    let oracle = if oracle {
+        2 * ORACLE_BATCH_SEAL_BYTES
+    } else {
+        0
+    };
+    let reserve = resolvers.max(1) * (SEAL_SCRATCH + NATIVE_BLOCK_BYTES + oracle);
+    MemoryBudget::gauged(queued.max(1) + reserve, reserve, gauge)
+}
+
+/// Bytes sealing `block` holds beside its slabs: compressed output before
+/// slabs drop, frame scratch, oracle request and response
+fn workspace_bytes(block: &BlockSlabs) -> usize {
+    let slabs: usize = block.buffers.iter().map(ColumnBuf::allocated_bytes).sum();
+    let oracle: usize = block
+        .buffers
+        .iter()
+        .filter(|b| matches!(b, ColumnBuf::Oracle(_)))
+        .map(ColumnBuf::allocated_bytes)
+        .sum();
+    slabs + slabs / 128 + SEAL_SCRATCH + 2 * oracle
 }
 
 /// Spawn `n` resolvers over the shared batch queue. Drops the sender it was
@@ -166,6 +218,7 @@ async fn run(
         stats,
         fatal,
         config_rx,
+        budget,
     } = opts;
     let alloc = Allocator::global(&mimalloc::MiMalloc);
     let mut sealer = match Sealer::new(codec) {
@@ -190,6 +243,7 @@ async fn run(
         let mut sealed = Vec::with_capacity(blocks.len());
         for mut block in blocks {
             resolve_local_columns(&mut block, &stats);
+            let _workspace = budget.acquire(workspace_bytes(&block)).await;
             let started = std::time::Instant::now();
             let resolved = match resolve_oracle_with_retry(
                 &oracle, alloc, &meta, &block, &retry, &stats,
@@ -227,7 +281,7 @@ async fn run(
                 .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
         }
         // Slabs and oracle output already dropped
-        encoded.shrink(sealed.iter().map(|b| b.allocated_bytes() as u64).sum());
+        encoded.settle(sealed.iter().map(|b| b.allocated_bytes() as u64).sum());
         let ready = ResolvedBatch {
             meta,
             blocks: sealed,
@@ -418,7 +472,7 @@ mod tests {
                 inserters: 1,
                 flush_timeout: Duration::from_secs(3600),
             },
-            Allocator::global(&mimalloc::MiMalloc),
+            crate::budget::MemoryBudget::new(1 << 30),
             fatal.clone(),
             Arc::new(EmitterStats::default()),
             None,
@@ -488,6 +542,49 @@ mod tests {
         );
         resolve_local_columns(&mut batch.blocks[0], &stats);
         assert_eq!(stats.oracle_local_columns.load(Ordering::Relaxed), 1);
+    }
+
+    /// Queued batches holding all admitted bytes leave sealing its
+    /// workspace, so a stalled inserter cannot block its own queue
+    #[tokio::test]
+    async fn sealing_finishes_while_queued_output_fills_admission() {
+        let gauge = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let budget = output_pool(4 << 10, 1, false, gauge.clone());
+        let queued = budget.admit(budget.admission_max()).await;
+        let batch = seal(vec![wkt_row(0, Some("POINT(1 2)"))]).await;
+        let (batch_tx, batch_rx) = async_channel::bounded(1);
+        let (resolved_tx, resolved_rx) = async_channel::bounded(1);
+        let fatal = Fatal::new();
+        let task = tokio::spawn(run(
+            batch_rx,
+            resolved_tx,
+            ResolverOptions {
+                oracle: None,
+                retry: RetryConfig::default(),
+                codec: CompressionChoice::Lz4,
+                stats: Arc::default(),
+                fatal: fatal.clone(),
+                config_rx: None,
+                budget: budget.clone(),
+            },
+        ));
+        batch_tx.send(batch).await.unwrap();
+        let resolved = tokio::time::timeout(Duration::from_secs(5), resolved_rx.recv())
+            .await
+            .expect("sealed under full admission")
+            .unwrap();
+        assert_eq!(resolved.blocks.len(), 1);
+        assert!(budget.peak_bytes() > queued.bytes(), "workspace taken");
+        assert_eq!(
+            budget.resident_bytes(),
+            queued.bytes(),
+            "workspace returned"
+        );
+        drop(batch_tx);
+        task.await.unwrap();
+        assert!(fatal.message().is_none());
+        drop(queued);
+        assert_eq!(gauge.load(Ordering::Relaxed), 0);
     }
 
     /// A cell PG must convert keeps the whole column in the request, even

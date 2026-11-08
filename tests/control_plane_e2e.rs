@@ -3176,6 +3176,99 @@ async fn check_ddl_crash(point: Point, applied_columns: u64) {
     }
 }
 
+/// Crash after main destination accepted an INSERT, before its tee did or
+/// its ack: restart replays rows to both, and `_lsn` dedup keeps each exact
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn insert_crash_between_destinations_before_ack() {
+    use std::os::unix::process::ExitStatusExt;
+    use walshadow::manifest::Manifest;
+
+    if !gated() {
+        return;
+    }
+    let mut h = Harness::up(&fx::Ports::alloc())
+        .await
+        .expect("bring up harness");
+    let result = async {
+        h.wait_ready(Duration::from_secs(60)).await?;
+        h.ctl_body(
+            &["apply"],
+            "[table.demo.crash_t]\nreplicate = true\ntee = [{ table = \"crash_copy\" }]",
+        )?;
+        h.ctl(&["reload"])?;
+        h.psql(
+            "CREATE TABLE demo.crash_t (id bigint PRIMARY KEY, v text); \
+             INSERT INTO demo.crash_t VALUES (1, 'before')",
+        )?;
+        let rows =
+            |table: &str| format!("SELECT id, v FROM demo.{table} FINAL ORDER BY id FORMAT TSV");
+        for table in ["demo_crash_t", "crash_copy"] {
+            h.wait_ch(&rows(table), "1\tbefore", Duration::from_secs(60))
+                .await?;
+        }
+        let arm = h.stderr_path.with_extension("arm");
+        fs::write(&arm, format!("{:?}", Point::AfterInsert))?;
+        // Catalog change arms capture; next INSERT after it crashes
+        h.psql("ALTER TABLE demo.crash_t ADD COLUMN a bigint")?;
+        h.psql("INSERT INTO demo.crash_t VALUES (2, 'after', 8)")?;
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while h.alive() {
+            ensure!(Instant::now() < deadline, "crash point never fired");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let status = h.child.take().context("daemon missing")?.wait()?;
+        ensure!(
+            status.signal() == Some(libc::SIGKILL),
+            "unexpected exit: {status}"
+        );
+        let landed = |h: &Harness, table: &str| -> Result<String> {
+            h.ch_get(&format!("SELECT count() FROM demo.{table} WHERE id = 2"))
+        };
+        ensure!(
+            landed(&h, "demo_crash_t")? == "1",
+            "main INSERT did not land"
+        );
+        ensure!(
+            landed(&h, "crash_copy")? == "0",
+            "tee INSERT ran before crash"
+        );
+        let spill = h.tmp.path().join("spill");
+        let manifest: Manifest = toml::from_str(&fs::read_to_string(spill.join("manifest.toml"))?)?;
+        let landed_lsn: u64 = h
+            .ch_get("SELECT max(_lsn) FROM demo.demo_crash_t WHERE id = 2")?
+            .parse()?;
+        ensure!(
+            manifest.lsn.emitter_ack.get() < landed_lsn,
+            "ack reached manifest before crash"
+        );
+        // Merges would collapse replayed duplicate
+        for table in ["demo_crash_t", "crash_copy"] {
+            h.ch_get(&format!("SYSTEM STOP MERGES demo.{table}"))?;
+        }
+        fs::remove_file(arm)?;
+        h.start_daemon(Duration::from_secs(120)).await?;
+        h.psql("INSERT INTO demo.crash_t VALUES (3, 'live', 9)")?;
+        for table in ["demo_crash_t", "crash_copy"] {
+            h.wait_ch(
+                &format!("SELECT id, v, a FROM demo.{table} FINAL ORDER BY id FORMAT TSV"),
+                "1\tbefore\t\\N\n2\tafter\t8\n3\tlive\t9",
+                Duration::from_secs(60),
+            )
+            .await?;
+        }
+        ensure!(
+            (landed(&h, "demo_crash_t")?, landed(&h, "crash_copy")?) == ("2".into(), "1".into()),
+            "restart did not replay unacknowledged INSERT to every destination"
+        );
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    let stderr = h.teardown();
+    if let Err(e) = result {
+        panic!("{e:#}\n--- daemon stderr ---\n{stderr}");
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ddl_crash_before_descriptor_append() {
     check_ddl_crash(Point::BeforeDescriptor, 0).await;

@@ -13,7 +13,6 @@
 
 use std::sync::Arc;
 
-use clickhouse_c::Allocator;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::task::AbortOnDropHandle;
 
@@ -271,15 +270,13 @@ pub fn spawn_discard(
     let (ack, collector) = ack::spawn(Arc::new(Monotone::default()), fatal.clone());
     let (msg_tx, msg_rx) = mpsc::channel::<BatcherMsg>(256);
     let (batches_tx, batches_rx) = async_channel::bounded::<InsertBatch>(4);
-    let batcher = batcher::spawn(
-        msg_rx,
-        batches_tx,
-        cfg,
-        Allocator::global(&mimalloc::MiMalloc),
-        fatal,
-        stats,
-        None,
+    let budget = resolver::output_pool(
+        cfg.byte_budget,
+        1,
+        false,
+        stats.output_resident_bytes.clone(),
     );
+    let batcher = batcher::spawn(msg_rx, batches_tx, cfg, budget, fatal, stats, None);
     let discard_ack = ack.clone();
     let discard = tokio::spawn(async move {
         while let Ok(batch) = batches_rx.recv().await {
@@ -335,8 +332,15 @@ pub async fn spawn_with_config(
 
     // As wide as the bridge: a narrower pool leaves shadow workers idle, a
     // wider one only queues on their sockets
+    let width = oracle.as_ref().map_or(1, |o| o.concurrency());
+    let budget = resolver::output_pool(
+        emitter.byte_budget,
+        width,
+        oracle.is_some(),
+        stats.output_resident_bytes.clone(),
+    );
     let resolvers = resolver::spawn_pool(
-        oracle.as_ref().map_or(1, |o| o.concurrency()),
+        width,
         batches_rx,
         resolved_tx,
         resolver::ResolverOptions {
@@ -346,6 +350,7 @@ pub async fn spawn_with_config(
             stats: stats.clone(),
             fatal: fatal.clone(),
             config_rx: config_rx.clone(),
+            budget: budget.clone(),
         },
     );
 
@@ -364,7 +369,7 @@ pub async fn spawn_with_config(
             inserters: n,
             flush_timeout,
         },
-        Allocator::global(&mimalloc::MiMalloc),
+        budget,
         fatal,
         stats.clone(),
         config_rx,

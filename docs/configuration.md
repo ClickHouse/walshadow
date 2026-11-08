@@ -335,20 +335,29 @@ ClickHouse tails bound sealed encoder buffers by startup `[ch] byte_budget`,
 including spare vector capacity. Each batch targets that budget divided by
 inserter count, keeping concurrent inserts within a byte limit. Partial batches
 across tables share another `byte_budget`; a producer waiting to hand off a
-sealed batch can hold one additional batch. A single oversized row may exceed
-these limits. Oracle responses and native client buffers remain additional costs
+sealed batch can hold one additional batch. A batch above `byte_budget` waits
+until no other batch holds budget
 
 Sealed-buffer permits stay held through resolution, retries and insert completion.
 After resolution each Native block is serialized once, compressed with
-`[ch] compression`, and kept in that form until acknowledged; its permit shrinks
-to memory those bytes occupy, which can exceed their length. Inserters send
-those bytes unchanged. A connection unable to accept them, such as a
-destination configured with other compression, gets each block decoded and
-rebuilt, so one block of scratch per inserter adds to these limits. An INSERT
-carries several blocks, sealed at 1,048,576 rows or 16 MiB of column bytes and
-when oracle request size fills, while batch limits still bound each INSERT.
-`walshadow_resident_raw_bytes_total` over `walshadow_resident_stored_bytes_total`
-reports how far sealing shrinks resident blocks
+`[ch] compression`, and kept in that form until acknowledged; its permit settles
+to memory those bytes occupy, which can exceed their length. Output beyond
+what a batch reserved, such as frame overhead on incompressible data, is held
+without waiting. Each resolver also
+reserves workspace on top of `byte_budget` for one block's compressed output
+and frame scratch, plus 64 MiB for oracle request and response when the tail
+has an oracle; resolvers count oracle bridge concurrency, or one without an
+oracle. Blocks needing more workspace than that reserve seal one at a time
+Inserters send prepared bytes unchanged. A connection unable to accept them,
+such as a destination configured with other compression, gets each block
+decoded and rebuilt into one block of scratch per inserter, outside the pool.
+An INSERT carries several blocks, sealed at 1,048,576 rows or 16 MiB of column
+bytes and when oracle request size fills, while batch limits still bound each
+INSERT. `walshadow_resident_raw_bytes_total` over
+`walshadow_resident_stored_bytes_total` reports how far sealing shrinks
+resident blocks. `walshadow_output_resident_bytes`,
+`walshadow_batcher_open_bytes`, and `walshadow_inserter_scratch_bytes` report
+allocated bytes held by output pools, open batches, and rebuild scratch
 This pool is separate from decoded-payload admission to avoid circular waits.
 Live byte-budget reductions lower flush thresholds; increasing sealed-buffer
 capacity requires restarting walshadow

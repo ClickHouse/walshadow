@@ -548,16 +548,17 @@ impl StashMark {
     }
 }
 
-/// Approximate byte cost for in-memory accounting; estimate, not exact
-/// heap allocation. Good enough for the eviction threshold
+/// Allocated bytes of an entry and its buffer slot, excluding allocator
+/// overhead and spare slot capacity
 fn approximate_size(entry: &SpillEntry) -> usize {
-    match entry {
-        SpillEntry::Truncate(_) => std::mem::size_of::<Truncate>(),
-        SpillEntry::Chunk(c) => std::mem::size_of::<ToastChunk>() + c.chunk_data.len(),
-        SpillEntry::ToastDelete(_) => std::mem::size_of::<crate::xact::spill::ToastDelete>(),
-        SpillEntry::Raw(r) => r.approx_bytes(),
-        SpillEntry::Input(i) => i.approx_bytes(),
-    }
+    std::mem::size_of::<SpillEntry>()
+        + match entry {
+            SpillEntry::Truncate(_) => std::mem::size_of::<Truncate>(),
+            SpillEntry::Chunk(c) => std::mem::size_of::<ToastChunk>() + c.chunk_data.len(),
+            SpillEntry::ToastDelete(_) => 0,
+            SpillEntry::Raw(r) => r.approx_bytes(),
+            SpillEntry::Input(i) => i.approx_bytes(),
+        }
 }
 
 #[derive(Debug, Eq, Ord, PartialEq, PartialOrd)]

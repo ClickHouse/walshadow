@@ -316,17 +316,18 @@ pub(crate) fn spawn(
     mut msg_rx: mpsc::Receiver<BatcherMsg>,
     out: async_channel::Sender<InsertBatch>,
     cfg: BatcherConfig,
-    alloc: Allocator,
+    budget: crate::budget::MemoryBudget,
     fatal: Fatal,
     stats: Arc<EmitterStats>,
     mut config_rx: Option<watch::Receiver<Arc<ResolvedConfig>>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
+        let alloc = Allocator::global(&mimalloc::MiMalloc);
         let out = BatchOutput {
             sender: out,
-            budget: crate::budget::MemoryBudget::new(cfg.byte_budget.max(1)),
+            batch_limit: (budget.admission_max() / cfg.inserters.max(1)).max(1),
+            budget,
             partial_bytes: AtomicUsize::new(0),
-            batch_limit: (cfg.byte_budget / cfg.inserters.max(1)).max(1),
         };
         let mut tables = Tables::default();
         let mut epoch: u64 = 0;
@@ -508,16 +509,18 @@ async fn appended(
             .iter()
             .map(ColumnBuf::allocated_bytes)
             .sum::<usize>();
-    ctx.out
-        .partial_bytes
-        .fetch_add(bytes - t.allocated_bytes, Ordering::Relaxed);
+    let grown = bytes - t.allocated_bytes;
+    ctx.out.partial_bytes.fetch_add(grown, Ordering::Relaxed);
+    ctx.stats
+        .batcher_open_bytes
+        .fetch_add(grown as u64, Ordering::Relaxed);
     t.allocated_bytes = bytes;
     let batch_limit = ctx.cfg.byte_budget.min(ctx.out.batch_limit);
     if t.rows() >= ctx.cfg.row_budget || bytes >= batch_limit {
         emit_batch(t, ctx.out, ctx.stats).await?;
     }
     if ctx.out.partial_bytes.load(Ordering::Relaxed)
-        >= ctx.cfg.byte_budget.min(ctx.out.budget.total())
+        >= ctx.cfg.byte_budget.min(ctx.out.budget.admission_max())
     {
         for table in &mut tables.open {
             emit_batch(table, ctx.out, ctx.stats).await?;
@@ -531,8 +534,11 @@ async fn appended(
 /// is on the inserter channel (the inserter bumps `inserter_batches_in` once it
 /// drains).
 async fn emit_batch(t: &mut Table, out: &BatchOutput, stats: &EmitterStats) -> Result<(), String> {
-    out.partial_bytes
-        .fetch_sub(std::mem::take(&mut t.allocated_bytes), Ordering::Relaxed);
+    let open = std::mem::take(&mut t.allocated_bytes);
+    out.partial_bytes.fetch_sub(open, Ordering::Relaxed);
+    stats
+        .batcher_open_bytes
+        .fetch_sub(open as u64, Ordering::Relaxed);
     t.seal_block()?;
     t.deadline = None;
     let blocks = std::mem::take(&mut t.sealed);
@@ -547,8 +553,13 @@ async fn emit_batch(t: &mut Table, out: &BatchOutput, stats: &EmitterStats) -> R
     }
     let per_seq = std::mem::take(&mut t.seq_counts);
     let permits = std::mem::take(&mut t.slice_permits);
-    // Separate pool avoids waiting on decoded payload held by this batch
-    let encoded = out.budget.acquire(bytes).await;
+    // Separate pool avoids waiting on decoded payload held by this batch.
+    // Oversized batch waits for whole compartment, then holds rest unmetered
+    let mut encoded = out
+        .budget
+        .admit(bytes.min(out.budget.admission_max()))
+        .await;
+    encoded.settle(bytes as u64);
     let batch = InsertBatch {
         meta: t.meta.clone(),
         blocks,
@@ -745,7 +756,7 @@ mod tests {
                 byte_budget: 1 << 30,
                 flush_timeout: Duration::from_secs(3600),
             },
-            Allocator::global(&mimalloc::MiMalloc),
+            crate::budget::MemoryBudget::new(1 << 30),
             fatal.clone(),
             Arc::new(EmitterStats::default()),
             None,
@@ -790,7 +801,7 @@ mod tests {
                 byte_budget: 1 << 30,
                 flush_timeout: Duration::from_secs(3600),
             },
-            Allocator::global(&mimalloc::MiMalloc),
+            crate::budget::MemoryBudget::new(1 << 30),
             fatal.clone(),
             Arc::new(EmitterStats::default()),
             None,
@@ -854,7 +865,7 @@ mod tests {
                 byte_budget: 1 << 30,
                 flush_timeout: Duration::from_secs(3600),
             },
-            Allocator::global(&mimalloc::MiMalloc),
+            crate::budget::MemoryBudget::new(1 << 30),
             fatal.clone(),
             Arc::new(EmitterStats::default()),
             None,
@@ -920,7 +931,7 @@ mod tests {
                 // Huge deadline: only FlushAll, not the timer, can seal
                 flush_timeout: Duration::from_secs(3600),
             },
-            Allocator::global(&mimalloc::MiMalloc),
+            crate::budget::MemoryBudget::new(1 << 30),
             fatal.clone(),
             Arc::new(EmitterStats::default()),
             None,
@@ -958,7 +969,7 @@ mod tests {
             msg_rx,
             batches_tx,
             cfg,
-            Allocator::global(&mimalloc::MiMalloc),
+            crate::budget::MemoryBudget::new(cfg.byte_budget.max(1)),
             fatal.clone(),
             Arc::new(EmitterStats::default()),
             config_rx,

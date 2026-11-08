@@ -1013,3 +1013,151 @@ fn plan_views_match_cells_with_resolved_externals() {
         &[(7, text("same")), (8, text("same")), (9, text("other"))],
     );
 }
+
+/// Inline short, long and compressed values beside an external value that
+/// resolves, stays unchanged under its old pointer, or fills NULL as
+/// disabled mode and null overflow do. Store, shadow and same-transaction
+/// reads all arrive as resolved values, so patches must plan as inlined
+/// values would for either target nullability
+#[test]
+fn plan_views_match_cells_across_value_forms() {
+    let mut r = rel(vec![
+        attr(1, INT4OID, 4, 'i', "int4"),
+        attr(2, TEXTOID, -1, 'i', "text"),
+        attr(3, TEXTOID, -1, 'i', "text"),
+    ]);
+    r.replident = ReplIdent::Full { pk_attnums: None };
+    let attrs = r.attributes.clone();
+    let row = |inline: Vec<u8>, value_id: u32| {
+        let ext = external_id(value_id);
+        tuple(
+            &attrs,
+            3,
+            &[
+                Some(&1i32.to_le_bytes()[..]),
+                Some(&inline[..]),
+                Some(&ext[..]),
+            ],
+        )
+    };
+    let packed = || lz4(&b"x".repeat(64));
+    for target in ["String", "Nullable(String)"] {
+        for filled in [false, true] {
+            let eight = if filled {
+                ColumnValue::Null
+            } else {
+                ColumnValue::Text("eight".into())
+            };
+            plan_both(
+                &r,
+                &["Int32", target, target],
+                &[
+                    (HeapOp::Insert, Some(row(short(b"a"), 7)), None),
+                    (
+                        HeapOp::Update,
+                        Some(row(long(b"bb"), 7)),
+                        Some(row(short(b"a"), 7)),
+                    ),
+                    (
+                        HeapOp::Update,
+                        Some(row(packed(), 8)),
+                        Some(row(long(b"bb"), 7)),
+                    ),
+                    (HeapOp::Delete, None, Some(row(packed(), 8))),
+                ],
+                &[(7, ColumnValue::Text("seven".into())), (8, eight)],
+            );
+        }
+    }
+}
+
+/// Heap datum and COPY field of one value
+type HeapAndCopy = (Vec<u8>, Vec<u8>);
+
+/// COPY binary and text fields encode as page-walk views of same values do
+#[test]
+fn copy_fields_match_heap_views() {
+    use crate::backfill::copy_backfill::{CopyRow, copy_slot};
+    let rel = rel(vec![
+        attr(1, INT4OID, 4, 'i', "int4"),
+        attr(2, INT8OID, 8, 'd', "int8"),
+        attr(3, FLOAT8OID, 8, 'd', "float8"),
+        attr(4, BOOLOID, 1, 'c', "bool"),
+        attr(5, DATEOID, 4, 'i', "date"),
+        attr(6, TEXTOID, -1, 'i', "text"),
+        attr(7, NUMERICOID, -1, 'i', "numeric"),
+        attr(8, NUMERICOID, -1, 'i', "numeric"),
+    ]);
+    let targets = [
+        "Int32",
+        "Nullable(Int64)",
+        "Float64",
+        "Bool",
+        "Date32",
+        "Nullable(String)",
+        "String",
+        "Decimal(10, 2)",
+    ];
+    let rows: Vec<Vec<Option<HeapAndCopy>>> = vec![
+        vec![
+            Some((7i32.to_le_bytes().into(), 7i32.to_be_bytes().into())),
+            Some((i64::MIN.to_le_bytes().into(), i64::MIN.to_be_bytes().into())),
+            Some((
+                (-0.5f64).to_le_bytes().into(),
+                (-0.5f64).to_be_bytes().into(),
+            )),
+            Some((vec![1], vec![1])),
+            Some((8000i32.to_le_bytes().into(), 8000i32.to_be_bytes().into())),
+            Some((lz4(&b"y".repeat(80)), b"y".repeat(80))),
+            Some((short(&numeric_short(false, 2, &[1, 5000])), b"1.50".into())),
+            Some((short(&numeric_short(true, 0, &[42])), b"-42".into())),
+        ],
+        vec![
+            Some((0i32.to_le_bytes().into(), 0i32.to_be_bytes().into())),
+            None,
+            Some((
+                f64::INFINITY.to_le_bytes().into(),
+                f64::INFINITY.to_be_bytes().into(),
+            )),
+            Some((vec![0], vec![0])),
+            Some(((-1i32).to_le_bytes().into(), (-1i32).to_be_bytes().into())),
+            None,
+            Some((short(&0xC000u16.to_le_bytes()), b"NaN".into())),
+            Some((short(&numeric_short(false, 0, &[])), b"0".into())),
+        ],
+    ];
+    let mut views = TableEncoder::new(plan(&rel, &targets, &ColumnRules::default())).unwrap();
+    let mut copy = TableEncoder::new(plan(&rel, &targets, &ColumnRules::default())).unwrap();
+    for (i, row) in rows.iter().enumerate() {
+        let stamp = RowStamp {
+            source_lsn: 0x1000 + i as u64,
+            xid: 700,
+            commit_ts: 0,
+            op_code: OP_INSERT,
+            leaf: None,
+        };
+        let heap: Vec<_> = row
+            .iter()
+            .map(|c| c.as_ref().map(|(h, _)| &h[..]))
+            .collect();
+        let data = tuple(&rel.attributes, rel.attributes.len(), &heap);
+        let view = view_block_data(&data, &rel).unwrap();
+        views.append_view(&rel, &view.datums, &[], &stamp).unwrap();
+        let fields: Vec<_> = row
+            .iter()
+            .map(|c| c.as_ref().map(|(_, f)| &f[..]))
+            .collect();
+        let fields = CopyRow::new(&fields);
+        copy.append_slots(
+            |src| copy_slot(&fields, &rel, src.index).map_err(crate::ch::EmitterError::Type),
+            &stamp,
+        )
+        .unwrap();
+    }
+    let wire = |enc: &mut TableEncoder| {
+        let (bufs, rows) = enc.take_block().unwrap();
+        let wire: Vec<_> = bufs.iter().map(|b| format!("{:?}", b.wire())).collect();
+        (rows, wire)
+    };
+    assert_eq!(wire(&mut views), wire(&mut copy));
+}
