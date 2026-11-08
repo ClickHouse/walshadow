@@ -70,13 +70,15 @@ use ahash::{HashMap, HashMapExt};
 #[derive(Debug, Clone, PartialEq)]
 pub enum SpillEntry {
     Heap(Box<DescribedHeap>),
-    Chunk(ToastChunk),
-    ToastDelete(ToastDelete),
+    Chunk(Box<ToastChunk>),
+    ToastDelete(Box<ToastDelete>),
     /// Undecoded record on a filenode invisible at record time (same-xact
     /// CREATE / TRUNCATE / rewrite generation); decoded at commit once
     /// `relation_at(rfn, commit_lsn)` resolves the survivor
     Raw(Box<RawRecord>),
 }
+
+const _: () = assert!(std::mem::size_of::<SpillEntry>() <= 16);
 
 /// Raw decode inputs for one WAL record, enough to re-run
 /// [`crate::decode::heap_decoder::decode_heap_record`] after commit-time
@@ -752,8 +754,10 @@ impl SpillReader {
                         descriptor_valid_from: valid_from,
                     }))
                 }
-                TAG_CHUNK => SpillEntry::Chunk(decode_chunk(&mut cur)?),
-                TAG_TOAST_DELETE => SpillEntry::ToastDelete(decode_toast_delete(&mut cur)?),
+                TAG_CHUNK => SpillEntry::Chunk(Box::new(decode_chunk(&mut cur)?)),
+                TAG_TOAST_DELETE => {
+                    SpillEntry::ToastDelete(Box::new(decode_toast_delete(&mut cur)?))
+                }
                 TAG_RAW => SpillEntry::Raw(Box::new(decode_raw(&mut cur)?)),
                 TAG_DESCRIPTOR => {
                     let valid_from = cur.u64()?;
@@ -1531,12 +1535,12 @@ mod tests {
         for remaining in [1, 3, 5, 31] {
             let mut writer = store.writer(42, remaining).await.unwrap();
             writer
-                .write_batch(vec![SpillEntry::Chunk(sample_chunk(
+                .write_batch(vec![SpillEntry::Chunk(Box::new(sample_chunk(
                     99,
                     0,
                     0x2000,
                     &vec![7; IO_CHUNK + 1],
-                ))])
+                )))])
                 .await
                 .unwrap();
             let mut reader = writer.finish().await.unwrap();
@@ -1564,7 +1568,7 @@ mod tests {
         w.write_batch(vec![SpillEntry::Heap(Box::new(h.clone()))])
             .await
             .unwrap();
-        w.write_batch(vec![SpillEntry::Chunk(c.clone())])
+        w.write_batch(vec![SpillEntry::Chunk(Box::new(c.clone()))])
             .await
             .unwrap();
         let bc = w.byte_count();
@@ -1574,7 +1578,10 @@ mod tests {
             r.next().await.unwrap().unwrap(),
             SpillEntry::Heap(Box::new(h))
         );
-        assert_eq!(r.next().await.unwrap().unwrap(), SpillEntry::Chunk(c));
+        assert_eq!(
+            r.next().await.unwrap().unwrap(),
+            SpillEntry::Chunk(Box::new(c))
+        );
         assert!(r.next().await.unwrap().is_none(), "EOF expected");
         r.unlink().await.unwrap();
     }
@@ -1591,11 +1598,14 @@ mod tests {
             offnum: 9,
             source_lsn: 0x2200,
         };
-        w.write_batch(vec![SpillEntry::ToastDelete(d)])
+        w.write_batch(vec![SpillEntry::ToastDelete(Box::new(d))])
             .await
             .unwrap();
         let mut r = w.finish().await.unwrap();
-        assert_eq!(r.next().await.unwrap().unwrap(), SpillEntry::ToastDelete(d));
+        assert_eq!(
+            r.next().await.unwrap().unwrap(),
+            SpillEntry::ToastDelete(Box::new(d))
+        );
         assert!(r.next().await.unwrap().is_none());
         r.unlink().await.unwrap();
     }

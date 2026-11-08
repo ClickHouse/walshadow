@@ -318,7 +318,7 @@ pub struct ChConn {
     instance: Option<String>,
     selected: Option<Arc<EmitterConfig>>,
     active: Connection,
-    parked: std::collections::HashMap<Option<String>, Connection>,
+    parked: ahash::HashMap<Option<String>, Connection>,
     dest: Arc<DestEmitter>,
     dials: u64,
 }
