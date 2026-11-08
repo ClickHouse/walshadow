@@ -37,9 +37,11 @@
 //! the on-disk datum form the WAL heap decoder reads. Each row converts to
 //! on-disk form as it arrives: fixed-width fields byte-swap, `name` pads to
 //! `NAMEDATALEN`, `numeric_send` rebuilds the stored `numeric` body, and
-//! byte/text strings pass unchanged. `jsonb` and every out-of-matrix type
-//! select as `::text` and stay `typoutput` text, which the oracle converts
-//! through `typinput` exactly as it does a WAL-path default
+//! byte/text strings pass unchanged. Types only the oracle converts keep
+//! their `typsend` bytes, which the oracle reads through `typreceive`.
+//! `jsonb`, other types the local matrix renders, and types lacking binary
+//! I/O select as `::text` and stay `typoutput` text, which the oracle
+//! converts through `typinput` exactly as it does a WAL-path default
 //! (architecture/values.md).
 //!
 //! ## Resume ledger
@@ -94,8 +96,9 @@ use crate::pos::{Pos, Snapshot};
 use crate::runtime_config::InitialLoadMode;
 use crate::schema::{
     BOOLOID, BPCHAROID, BYTEAOID, CHAROID, CIDOID, DATEOID, FLOAT4OID, FLOAT8OID, INT2OID, INT4OID,
-    INT8OID, JSONOID, MONEYOID, NAMEOID, NUMERICOID, OID8OID, OIDOID, PG_LSNOID, RelDescriptor,
-    RelName, TEXTOID, TIMEOID, TIMESTAMPOID, TIMESTAMPTZOID, UUIDOID, VARCHAROID, XID8OID, XIDOID,
+    INT8OID, JSONOID, MONEYOID, NAMEOID, NUMERICOID, OID8OID, OIDOID, PG_LSNOID, RelAttr,
+    RelDescriptor, RelName, TEXTOID, TIMEOID, TIMESTAMPOID, TIMESTAMPTZOID, UUIDOID, VARCHAROID,
+    XID8OID, XIDOID,
 };
 use crate::source::source_feed::open_sql_client;
 use crate::toast::{ToastResolver, ToastRow};
@@ -395,9 +398,10 @@ impl Ledger {
 // ---------------------------------------------------------------------------
 
 /// How one selected column decodes from the wire. Native kinds read `typsend`
-/// output; `Cast` columns were cast to `text` in the SELECT
+/// output; `Cast` columns were cast to `text` in the SELECT; `Send` columns
+/// keep `typsend` bytes for the oracle's `typreceive`
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WireKind {
+pub(crate) enum WireKind {
     Bool,
     Char,
     Int2,
@@ -418,6 +422,7 @@ enum WireKind {
     Json,
     Numeric,
     Cast,
+    Send,
 }
 
 struct ColPlan {
@@ -427,7 +432,8 @@ struct ColPlan {
 struct CopyPlan {
     select: String,
     cols: Vec<ColPlan>,
-    natts: usize,
+    /// Indexed by attnum - 1
+    kinds: Vec<WireKind>,
 }
 
 fn wire_kind(type_oid: u32) -> Option<WireKind> {
@@ -455,26 +461,73 @@ fn wire_kind(type_oid: u32) -> Option<WireKind> {
     })
 }
 
-/// Wire form a column selects as; out-of-matrix types cast to `text`.
-/// jsonb's send form is its text behind a version byte, so cast it too
-fn copy_kind(type_oid: u32) -> WireKind {
-    wire_kind(type_oid).unwrap_or(WireKind::Cast)
+/// Types no local reader converts, so their values always reach the oracle
+fn oracle_only(att: &RelAttr) -> bool {
+    wire_kind(att.type_oid).is_none()
+        && !crate::decode::heap_decoder::local_matrix_covers(att.type_oid, att.type_len)
 }
 
-fn column_plan(desc: &RelDescriptor) -> CopyPlan {
+/// Oracle-only types of `desc` with binary I/O. Shadow replays source's
+/// catalog, so one source `pg_type` read covers `typsend` and the oracle's
+/// `typreceive`
+async fn binary_io_types(
+    client: &tokio_postgres::Client,
+    desc: &RelDescriptor,
+) -> anyhow::Result<HashSet<u32>> {
+    let oids: Vec<u32> = desc
+        .attributes
+        .iter()
+        .filter(|a| !a.dropped && oracle_only(a))
+        .map(|a| a.type_oid)
+        .collect();
+    if oids.is_empty() {
+        return Ok(HashSet::new());
+    }
+    let rows = client
+        .query(
+            "SELECT oid FROM pg_type WHERE oid = ANY($1) \
+             AND typsend::oid <> 0 AND typreceive::oid <> 0",
+            &[&oids],
+        )
+        .await
+        .context("backfill: binary I/O types")?;
+    Ok(rows.iter().map(|r| r.get(0)).collect())
+}
+
+/// Wire form each attribute selects as, attnum - 1 indexed. Oracle-only
+/// types in `binary` keep `typsend` bytes, the rest cast to `text`. jsonb's
+/// send form is its text behind a version byte, so cast it too
+pub(crate) fn wire_kinds(desc: &RelDescriptor, binary: &HashSet<u32>) -> Vec<WireKind> {
+    let natts = desc
+        .attributes
+        .iter()
+        .map(|a| a.attnum.max(0) as usize)
+        .max()
+        .unwrap_or(0);
+    let mut kinds = vec![WireKind::Cast; natts];
+    for a in desc.attributes.iter().filter(|a| a.attnum >= 1) {
+        kinds[a.attnum as usize - 1] = match wire_kind(a.type_oid) {
+            Some(kind) => kind,
+            None if oracle_only(a) && binary.contains(&a.type_oid) => WireKind::Send,
+            None => WireKind::Cast,
+        };
+    }
+    kinds
+}
+
+fn column_plan(desc: &RelDescriptor, binary: &HashSet<u32>) -> CopyPlan {
+    let kinds = wire_kinds(desc, binary);
     let mut select = String::new();
     let mut cols = Vec::with_capacity(desc.attributes.len());
-    let mut natts = 0usize;
     for a in &desc.attributes {
-        natts = natts.max(a.attnum.max(0) as usize);
         if a.dropped {
             continue;
         }
         let ident = quote_ident(&a.name);
-        let expr = if wire_kind(a.type_oid).is_some() {
-            ident
-        } else {
+        let expr = if kinds[(a.attnum - 1).max(0) as usize] == WireKind::Cast {
             format!("{ident}::text")
+        } else {
+            ident
         };
         if !select.is_empty() {
             select.push_str(", ");
@@ -485,7 +538,7 @@ fn column_plan(desc: &RelDescriptor) -> CopyPlan {
     CopyPlan {
         select,
         cols,
-        natts,
+        kinds,
     }
 }
 
@@ -529,7 +582,7 @@ pub async fn copy_rows_into(
     stats: &EmitterStats,
     range: BlockRange,
 ) -> anyhow::Result<u64> {
-    let plan = column_plan(desc);
+    let plan = column_plan(desc, &binary_io_types(client, desc).await?);
     let sql = format!(
         "COPY (SELECT {} FROM ONLY {}.{}{}) TO STDOUT (FORMAT binary)",
         plan.select,
@@ -546,14 +599,14 @@ pub async fn copy_rows_into(
     let mut slab_bytes = 0usize;
     while let Some(row) = stream.next().await {
         let row = row.context("backfill: COPY stream")?;
-        let mut fields: Vec<Option<&[u8]>> = vec![None; plan.natts];
+        let mut fields: Vec<Option<&[u8]>> = vec![None; plan.kinds.len()];
         for (i, cp) in plan.cols.iter().enumerate() {
             fields[(cp.attnum - 1).max(0) as usize] =
                 row.try_get(i).context("backfill: COPY field")?;
         }
         let payload_bytes = fields.iter().flatten().map(|f| f.len() as u64).sum::<u64>();
-        let data =
-            CopyRow::from_send(desc, &fields).map_err(|e| anyhow::anyhow!("backfill: {e}"))?;
+        let data = CopyRow::from_send(&plan.kinds, &fields)
+            .map_err(|e| anyhow::anyhow!("backfill: {e}"))?;
         slab_bytes += data.bytes().len();
         slab.push(BackfillTuple {
             rfn: desc.rfn,
@@ -670,11 +723,14 @@ fn fixed<const N: usize>(raw: &[u8], what: &str) -> Result<[u8; N], String> {
 
 /// One binary COPY row: per attribute, `typsend` bytes or NULL. Laid out
 /// `[natts: u16][end: u32 per attribute][field bytes]`, an end's high bit
-/// marking NULL
+/// marking NULL and the next marking a field kept in `typsend` form
 #[derive(Clone, Debug, PartialEq)]
 pub struct CopyRow(Box<[u8]>);
 
 const COPY_NULL: u32 = 1 << 31;
+const COPY_SEND: u32 = 1 << 30;
+/// PostgreSQL builds each COPY row in one palloc, so 1 GiB bounds it
+const COPY_END: u32 = COPY_SEND - 1;
 
 impl CopyRow {
     /// `fields` indexed by attnum - 1
@@ -696,20 +752,27 @@ impl CopyRow {
     }
 
     /// Row of `typsend` fields indexed by attnum - 1, each converted to its
-    /// on-disk form per `rel`'s attribute types
-    pub fn from_send(rel: &RelDescriptor, fields: &[Option<&[u8]>]) -> Result<Self, String> {
+    /// on-disk form per `kinds`
+    pub(crate) fn from_send(kinds: &[WireKind], fields: &[Option<&[u8]>]) -> Result<Self, String> {
         let head = 2 + 4 * fields.len();
         let body = fields.iter().flatten().map(|f| f.len()).sum::<usize>();
         let mut out = Vec::with_capacity(head + body);
         out.extend_from_slice(&(fields.len() as u16).to_le_bytes());
         out.resize(head, 0);
         for (i, f) in fields.iter().enumerate() {
+            let kind = kinds.get(i).copied().unwrap_or(WireKind::Cast);
             if let Some(raw) = f {
-                let type_oid = rel.attributes.get(i).map_or(0, |a| a.type_oid);
-                store_field(copy_kind(type_oid), raw, &mut out)?;
+                store_field(kind, raw, &mut out)?;
             }
-            let end = u32::try_from(out.len() - head).map_err(|_| "COPY row past 4 GiB")?;
-            let mark = if f.is_none() { COPY_NULL } else { 0 };
+            let end = u32::try_from(out.len() - head)
+                .ok()
+                .filter(|&end| end <= COPY_END)
+                .ok_or("COPY row past 1 GiB")?;
+            let mark = match (f, kind) {
+                (None, _) => COPY_NULL,
+                (Some(_), WireKind::Send) => COPY_SEND,
+                _ => 0,
+            };
             out[2 + 4 * i..][..4].copy_from_slice(&(end | mark).to_le_bytes());
         }
         Ok(Self(out.into()))
@@ -735,11 +798,16 @@ impl CopyRow {
     fn end(&self, i: usize) -> Option<u32> {
         let at = 2 + 4 * i;
         let word = u32::from_le_bytes(self.0.get(at..at + 4)?.try_into().ok()?);
-        Some(word & !COPY_NULL)
+        Some(word & COPY_END)
     }
 
     /// Field of attribute index `i`; `None` past the row or NULL
     pub fn field(&self, i: usize) -> Option<&[u8]> {
+        self.slot(i).map(|(raw, _)| raw)
+    }
+
+    /// Field of attribute index `i` and whether it kept `typsend` form
+    fn slot(&self, i: usize) -> Option<(&[u8], bool)> {
         let natts = self.natts()?;
         if i >= natts {
             return None;
@@ -751,22 +819,27 @@ impl CopyRow {
         }
         let start = if i == 0 { 0 } else { self.end(i - 1)? };
         let base = 2 + 4 * natts;
-        self.0
-            .get(base + start as usize..base + (word & !COPY_NULL) as usize)
+        let raw = self
+            .0
+            .get(base + start as usize..base + (word & COPY_END) as usize)?;
+        Some((raw, word & COPY_SEND != 0))
     }
 }
 
 /// Attribute index `i` of a row [`CopyRow::from_send`] stored; NULL past the row
 pub(crate) fn copy_slot<'a>(row: &'a CopyRow, rel: &RelDescriptor, i: usize) -> DatumRef<'a> {
-    let (Some(att), Some(raw)) = (rel.attributes.get(i), row.field(i)) else {
+    let (Some(att), Some((raw, send))) = (rel.attributes.get(i), row.slot(i)) else {
         return DatumRef::Null;
     };
-    match copy_kind(att.type_oid) {
-        WireKind::Bytea | WireKind::Text | WireKind::Json | WireKind::Numeric => {
+    if send {
+        return DatumRef::Send(raw);
+    }
+    match wire_kind(att.type_oid) {
+        Some(WireKind::Bytea | WireKind::Text | WireKind::Json | WireKind::Numeric) => {
             DatumRef::Varlena(raw)
         }
-        WireKind::Cast => DatumRef::Text(raw),
-        _ => DatumRef::Fixed(raw),
+        Some(_) => DatumRef::Fixed(raw),
+        None => DatumRef::Text(raw),
     }
 }
 
@@ -820,11 +893,44 @@ fn store_field(kind: WireKind, raw: &[u8], out: &mut Vec<u8>) -> Result<(), Stri
             out.extend_from_slice(&numeric_from_send(raw)?);
             Ok(())
         }
-        WireKind::Bytea | WireKind::Text | WireKind::Json | WireKind::Cast => {
+        WireKind::Bytea | WireKind::Text | WireKind::Json | WireKind::Cast | WireKind::Send => {
             out.extend_from_slice(raw);
             Ok(())
         }
     }
+}
+
+/// On-disk `attmissingval` from its `anyarray_send` form, `None` for types
+/// outside the wire matrix or an array other than one non-null element
+pub(crate) fn missing_from_send(type_oid: u32, send: &[u8]) -> Option<Vec<u8>> {
+    let kind = wire_kind(type_oid)?;
+    // array_send: ndim, hasnull, elemtype, (dim, lbound) per dim, (len, bytes) per element
+    let word = |i: usize| {
+        Some(i32::from_be_bytes(
+            send.get(4 * i..4 * i + 4)?.try_into().ok()?,
+        ))
+    };
+    if word(0)? != 1 || word(3)? != 1 {
+        return None;
+    }
+    let len = usize::try_from(word(5)?).ok()?;
+    let raw = send.get(24..)?;
+    if raw.len() != len {
+        return None;
+    }
+    let mut elem = Vec::new();
+    store_field(kind, raw, &mut elem).ok()?;
+    if matches!(
+        kind,
+        WireKind::Bytea | WireKind::Text | WireKind::Json | WireKind::Numeric
+    ) {
+        // 4-byte uncompressed varlena header, VARSIZE in upper 30 bits
+        let size = u32::try_from(elem.len() + 4).ok()?;
+        elem.splice(0..0, (size << 2).to_le_bytes());
+    }
+    Some(crate::decode::heap_decoder::raw_missing_array(
+        type_oid, &elem,
+    ))
 }
 
 /// PostgreSQL `NAMEDATALEN`, `name`'s stored width
@@ -2226,28 +2332,163 @@ mod tests {
         }
     }
 
-    #[test]
-    fn plan_casts_out_of_matrix_and_skips_dropped() {
-        let d = desc(vec![
+    fn varlena(attnum: i16, name: &str, type_oid: u32) -> RelAttr {
+        RelAttr {
+            type_len: -1,
+            type_byval: false,
+            type_align: 'i',
+            type_storage: 'x',
+            ..attr(attnum, name, type_oid, false)
+        }
+    }
+
+    /// text[], aclitem, and a user enum: none has a local reader
+    const TEXTARRAYOID: u32 = 1009;
+    const ACLITEMOID: u32 = 1033;
+    const ENUM_OID: u32 = 16_500;
+
+    fn mixed_desc() -> RelDescriptor {
+        desc(vec![
             attr(1, "id", INT8OID, false),
             attr(2, "gone", TEXTOID, true),
-            attr(3, "price", NUMERICOID, false),
-            attr(4, "tags", 1009, false), // text[] — out of matrix
-            attr(5, "doc", JSONBOID, false),
-        ]);
-        let plan = column_plan(&d);
+            varlena(3, "price", NUMERICOID),
+            varlena(4, "tags", TEXTARRAYOID),
+            varlena(5, "doc", JSONBOID),
+            RelAttr {
+                type_len: 12,
+                ..attr(6, "acl", ACLITEMOID, false)
+            },
+            RelAttr {
+                type_len: 4,
+                ..attr(7, "mood", ENUM_OID, false)
+            },
+        ])
+    }
+
+    #[test]
+    fn plan_casts_out_of_matrix_and_skips_dropped() {
+        let plan = column_plan(&mixed_desc(), &HashSet::new());
         assert_eq!(
             plan.select,
-            "\"id\", \"price\", \"tags\"::text, \"doc\"::text"
+            "\"id\", \"price\", \"tags\"::text, \"doc\"::text, \"acl\"::text, \"mood\"::text"
         );
-        assert_eq!(plan.natts, 5);
-        assert_eq!(plan.cols.len(), 4, "dropped column not selected");
+        assert_eq!(plan.kinds.len(), 7);
+        assert_eq!(plan.cols.len(), 6, "dropped column not selected");
         assert_eq!(plan.cols[2].attnum, 4);
-        assert_eq!(copy_kind(INT8OID), WireKind::Int8);
-        assert_eq!(copy_kind(NUMERICOID), WireKind::Numeric);
-        assert_eq!(copy_kind(1009), WireKind::Cast);
+        assert_eq!(plan.kinds[0], WireKind::Int8);
+        assert_eq!(plan.kinds[2], WireKind::Numeric);
+        assert_eq!(plan.kinds[3], WireKind::Cast);
         // jsonb_out text, the document shape the WAL path yields
-        assert_eq!(copy_kind(JSONBOID), WireKind::Cast);
+        assert_eq!(plan.kinds[4], WireKind::Cast);
+    }
+
+    /// Oracle-only types with binary I/O select bare; local-matrix types and
+    /// types lacking `typsend`/`typreceive` keep their text cast
+    #[test]
+    fn plan_keeps_send_form_of_binary_io_types() {
+        // jsonb has binary I/O but a local reader, aclitem lacks it
+        let binary = HashSet::from_iter([TEXTARRAYOID, ENUM_OID, JSONBOID]);
+        let plan = column_plan(&mixed_desc(), &binary);
+        assert_eq!(
+            plan.select,
+            "\"id\", \"price\", \"tags\", \"doc\"::text, \"acl\"::text, \"mood\""
+        );
+        assert_eq!(
+            plan.kinds[3..],
+            [
+                WireKind::Send,
+                WireKind::Cast,
+                WireKind::Cast,
+                WireKind::Send
+            ]
+        );
+    }
+
+    /// Send fields keep their bytes and mark, NULLs stay NULL, and the row
+    /// reads back the same from its spooled bytes
+    #[test]
+    fn send_fields_round_trip_as_send_datums() {
+        let d = mixed_desc();
+        let plan = column_plan(&d, &HashSet::from_iter([TEXTARRAYOID, ENUM_OID]));
+        let tags = b"\x00\x00\x00\x01array-send";
+        let fields: [Option<&[u8]>; 7] = [
+            Some(&7i64.to_be_bytes()),
+            None,
+            None,
+            Some(tags),
+            Some(br#"{"a": 1}"#),
+            Some(b"=r/postgres"),
+            None,
+        ];
+        let row = CopyRow::from_send(&plan.kinds, &fields).unwrap();
+        let row = CopyRow::from_bytes(row.bytes().into()).expect("spooled bytes parse");
+        let slots: Vec<_> = (0..7).map(|i| copy_slot(&row, &d, i)).collect();
+        assert_eq!(
+            slots,
+            [
+                DatumRef::Fixed(&7i64.to_le_bytes()),
+                DatumRef::Null,
+                DatumRef::Null,
+                DatumRef::Send(tags),
+                DatumRef::Text(br#"{"a": 1}"#),
+                DatumRef::Text(b"=r/postgres"),
+                DatumRef::Null,
+            ]
+        );
+        assert_eq!(row.field(3), Some(&tags[..]), "mark stays off the bytes");
+    }
+
+    #[test]
+    fn missing_from_send_matches_stored_default() {
+        use crate::decode::datum::{Datum, build};
+        use crate::decode::heap_decoder::resolve;
+        use crate::schema::MissingDefault;
+        let hex = |s: &str| {
+            (0..s.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+                .collect::<Vec<u8>>()
+        };
+        // anyarray_send(attmissingval) from PG 17 after ALTER TABLE ADD ... DEFAULT
+        let cases = [
+            (
+                NUMERICOID,
+                -1,
+                "0000000100000000000006a400000001000000010000000c0002000000000002000c1388",
+                build::numeric("12.50"),
+            ),
+            (
+                TEXTOID,
+                -1,
+                "0000000100000000000000190000000100000001000000026869",
+                Datum::Varlena(b"hi".to_vec()),
+            ),
+            (
+                NAMEOID,
+                64,
+                "0000000100000000000000130000000100000001000000026e6d",
+                build::name("nm"),
+            ),
+            (
+                INT8OID,
+                8,
+                "000000010000000000000014000000010000000100000008fffffffffffffffd",
+                Datum::fixed(&(-3i64).to_le_bytes()),
+            ),
+        ];
+        for (type_oid, type_len, send, want) in cases {
+            let mut att = attr(1, "c", type_oid, false);
+            att.type_len = type_len;
+            att.missing_default = missing_from_send(type_oid, &hex(send)).map(MissingDefault::Raw);
+            assert_eq!(
+                resolve(&att, DatumRef::Missing),
+                Some(want),
+                "type {type_oid}"
+            );
+        }
+        const TSVECTOROID: u32 = 3614;
+        let tsvector = hex("000000010000000000000e1e0000000100000001000000080000000178000000");
+        assert_eq!(missing_from_send(TSVECTOROID, &tsvector), None);
     }
 
     #[test]

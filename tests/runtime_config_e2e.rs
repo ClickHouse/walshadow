@@ -82,6 +82,11 @@
 //!    * `ALTER DATABASE … SET intervalstyle = iso_8601` before a COPY load.
 //!    * Expect: COPY and WAL rows render the same interval identically.
 //!
+//! 13. `copy_load_matches_wal_for_oracle_types`
+//!    * COPY loads rows of types only the oracle converts, binary I/O ones
+//!      by `typsend`/`typreceive`, aclitem by text; WAL inserts the same.
+//!    * Expect: COPY and WAL rows, NULL rows included, read identically.
+//!
 //! Source-side `config_*` install runs the real `sql/runtime_config_install.sql`
 
 //! inside the bootstrap schema dump, so the drills double as install-script
@@ -1308,18 +1313,29 @@ async fn copy_load_converges(
     ch.query("CREATE DATABASE IF NOT EXISTS walshadow_test")
         .expect("create db");
 
-    let mut pipeline = fx::build_pipeline(fx::BuildPipelineArgs {
-        tmp: &tmp,
-        source: &source,
-        shadow: &shadow,
-        shadow_filter_dir: &shadow_filter_dir,
-        shadow_stream_state,
-        ch_database: "walshadow_test",
-        ch_tcp_port: slot.ch_tcp,
-        mappings: vec![],
-        app_name,
-        ddl: Some(overlay_ddl_args()),
-    })
+    // Worker binds only once recovery reaches consistency, so budget the dial
+    let socket = shadow.bridge_socket().expect("bridge configured");
+    let bridge = walshadow::bridge::connect_with_budget(socket, 1, Duration::from_secs(30))
+        .await
+        .expect("bridge connect");
+    let mut pipeline = fx::build_pipeline_tuned(
+        fx::BuildPipelineArgs {
+            tmp: &tmp,
+            source: &source,
+            shadow: &shadow,
+            shadow_filter_dir: &shadow_filter_dir,
+            shadow_stream_state,
+            ch_database: "walshadow_test",
+            ch_tcp_port: slot.ch_tcp,
+            mappings: vec![],
+            app_name,
+            ddl: Some(overlay_ddl_args()),
+        },
+        |_| {},
+        Some(std::sync::Arc::new(walshadow::oracle::Oracle::new(
+            std::sync::Arc::new(bridge),
+        ))),
+    )
     .await;
 
     let driver = fx::spawn_workload(&source, workload);
@@ -1427,4 +1443,58 @@ async fn copy_load_pins_output_settings() {
         got, "['1 day 02:03:04','1 day 02:03:04']",
         "COPY row renders like the WAL row"
     );
+}
+
+/// Types only the oracle converts: binary I/O ones travel as `typsend`
+/// bytes, aclitem (no `typsend`) as text. Each COPY row must read like the
+/// WAL row holding the same values
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn copy_load_matches_wal_for_oracle_types() {
+    if !fx::tools::requirements_available() {
+        return;
+    }
+    let values = "'{1,NULL,3}', '{a,\"b c\"}', 'happy', '(7,\"x y\")', 42, \
+                  'k=>v, n=>NULL', 'fat:2 rat:1', '[3,9)', 'postgres=r/postgres'";
+    let nulls = "NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL";
+    let schema_sql = format!(
+        "{INSTALL_SQL}\n\
+         CREATE EXTENSION hstore;\n\
+         CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy');\n\
+         CREATE TYPE pair AS (a int, b text);\n\
+         CREATE DOMAIN posint AS int CHECK (VALUE > 0);\n\
+         CREATE SCHEMA app;\n\
+         CREATE TABLE app.wide (id bigint PRIMARY KEY, ints int4[], texts text[], m mood, \
+            p pair, d posint, h hstore, tv tsvector, r int8range, acl aclitem);\n\
+         INSERT INTO app.wide VALUES (1, {values}), (3, {nulls});\n"
+    );
+    let (ch, got) = copy_load_converges(
+        &schema_sql,
+        vec![
+            "INSERT INTO walshadow.config_table (namespace, relname, replicate, initial_load) \
+             VALUES ('app', 'wide', true, 'copy')"
+                .into(),
+            format!("INSERT INTO app.wide VALUES (2, {values}), (4, {nulls})"),
+            "SELECT pg_switch_wal()".into(),
+        ],
+        "walshadow-copy-binary",
+        "SELECT count() FROM walshadow_test.app_wide FINAL WHERE _is_deleted = 0",
+        "4",
+    )
+    .await;
+    assert_eq!(got, "4", "COPY and WAL rows reach CH");
+    let row = |id: u32| {
+        ch.query(&format!(
+            "SELECT ints, texts, m, p, d, h, tv, r, acl FROM walshadow_test.app_wide FINAL \
+             WHERE _is_deleted = 0 AND id = {id}"
+        ))
+        .expect("ch row")
+    };
+    let (copy, wal) = (row(1), row(2));
+    assert_eq!(copy, wal, "COPY row reads like the WAL row");
+    assert_eq!(
+        copy,
+        "[1,NULL,3]\t['a','b c']\thappy\t(7,\"x y\")\t42\t{'k':'v','n':NULL}\t\
+         \\'fat\\':2 \\'rat\\':1\t[3,9)\tpostgres=r/postgres"
+    );
+    assert_eq!(row(3), row(4), "NULL COPY row reads like the NULL WAL row");
 }

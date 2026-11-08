@@ -14,6 +14,7 @@ const CELL_DEFAULT: u8 = 0x00;
 const CELL_DISK_RAW: u8 = 0x01;
 const CELL_TEXT: u8 = 0x02;
 const CELL_LITERAL: u8 = 0x03;
+const CELL_BINARY: u8 = 0x04;
 
 crate::atomic_stats! {
     pub struct OracleStats {
@@ -53,14 +54,29 @@ pub enum OracleCell {
     TextInput(Vec<u8>),
     /// Pre-rendered text bypassing source type
     Literal(Vec<u8>),
+    /// `typsend` bytes for `typreceive`
+    BinaryInput(Vec<u8>),
 }
 
 impl OracleCell {
     /// Tag plus optional length-prefixed body
     pub fn wire_bytes(&self) -> usize {
+        let (tag, body) = self.tagged();
+        if tag == CELL_DEFAULT {
+            1
+        } else {
+            5 + body.len()
+        }
+    }
+
+    /// Wire tag and body, empty for `Default`
+    fn tagged(&self) -> (u8, &[u8]) {
         match self {
-            Self::Default => 1,
-            Self::DiskRaw(b) | Self::TextInput(b) | Self::Literal(b) => 5 + b.len(),
+            Self::Default => (CELL_DEFAULT, &[]),
+            Self::DiskRaw(b) => (CELL_DISK_RAW, b),
+            Self::TextInput(b) => (CELL_TEXT, b),
+            Self::Literal(b) => (CELL_LITERAL, b),
+            Self::BinaryInput(b) => (CELL_BINARY, b),
         }
     }
 }
@@ -121,9 +137,10 @@ impl OracleColumnBuf {
     pub fn push(&mut self, cell: OracleCell) {
         self.payload_capacity += match &cell {
             OracleCell::Default => 0,
-            OracleCell::DiskRaw(v) | OracleCell::TextInput(v) | OracleCell::Literal(v) => {
-                v.capacity()
-            }
+            OracleCell::DiskRaw(v)
+            | OracleCell::TextInput(v)
+            | OracleCell::Literal(v)
+            | OracleCell::BinaryInput(v) => v.capacity(),
         };
         let bytes = cell.wire_bytes();
         self.wire_bytes += bytes;
@@ -223,14 +240,9 @@ impl OracleColumnBuf {
         push_u8(out, u8::from(self.nullable_target));
         push_u32(out, self.cells.len() as u32);
         for cell in &self.cells {
-            let (tag, body) = match cell {
-                OracleCell::Default => (0, &[][..]),
-                OracleCell::DiskRaw(b) => (1, &b[..]),
-                OracleCell::TextInput(b) => (2, &b[..]),
-                OracleCell::Literal(b) => (3, &b[..]),
-            };
+            let (tag, body) = cell.tagged();
             push_u8(out, tag);
-            if tag != 0 {
+            if tag != CELL_DEFAULT {
                 push_bytes(out, body);
             }
         }
@@ -244,10 +256,11 @@ impl OracleColumnBuf {
         buf.cells.reserve(n.min(1 << 20));
         for _ in 0..n {
             buf.push(match c.u8()? {
-                0 => OracleCell::Default,
-                1 => OracleCell::DiskRaw(c.bytes()?),
-                2 => OracleCell::TextInput(c.bytes()?),
-                3 => OracleCell::Literal(c.bytes()?),
+                CELL_DEFAULT => OracleCell::Default,
+                CELL_DISK_RAW => OracleCell::DiskRaw(c.bytes()?),
+                CELL_TEXT => OracleCell::TextInput(c.bytes()?),
+                CELL_LITERAL => OracleCell::Literal(c.bytes()?),
+                CELL_BINARY => OracleCell::BinaryInput(c.bytes()?),
                 tag => {
                     return Err(crate::xact::spill::SpillError::Format {
                         offset: 0,
@@ -478,21 +491,10 @@ fn encode_request(columns: &[OracleRequestColumn<'_>], n_rows: usize) -> Vec<u8>
     }
     for row in 0..n_rows {
         for c in columns {
-            let cell = &c.buf.cells()[row];
-            match cell {
-                OracleCell::Default => out.push(CELL_DEFAULT),
-                OracleCell::DiskRaw(b) => {
-                    out.push(CELL_DISK_RAW);
-                    put_lenstr(&mut out, b);
-                }
-                OracleCell::TextInput(b) => {
-                    out.push(CELL_TEXT);
-                    put_lenstr(&mut out, b);
-                }
-                OracleCell::Literal(b) => {
-                    out.push(CELL_LITERAL);
-                    put_lenstr(&mut out, b);
-                }
+            let (tag, body) = c.buf.cells()[row].tagged();
+            out.push(tag);
+            if tag != CELL_DEFAULT {
+                put_lenstr(&mut out, body);
             }
         }
     }
@@ -649,7 +651,14 @@ mod tests {
         );
         b.push(OracleCell::Literal(b"x".to_vec()));
         b.push(OracleCell::TextInput(b"{}".to_vec()));
-        let cols = [col(0, "t", "Array(Int32)", &a), col(3, "j", "JSON", &b)];
+        let mut e = OracleColumnBuf::string(16_400, -1);
+        e.push(OracleCell::BinaryInput(b"ok".to_vec()));
+        e.push(OracleCell::Default);
+        let cols = [
+            col(0, "t", "Array(Int32)", &a),
+            col(3, "j", "JSON", &b),
+            col(4, "e", "String", &e),
+        ];
 
         let out = encode_request(&cols, 2);
         let mut c = FRAME_PREFIX_BYTES;
@@ -659,13 +668,15 @@ mod tests {
             v
         };
         assert_eq!(u32_at(&mut c), 2, "n_rows");
-        assert_eq!(u32_at(&mut c), 2, "n_columns");
+        assert_eq!(u32_at(&mut c), 3, "n_columns");
         // First column's metadata, then the second's, before any cell
         assert_eq!(u32_at(&mut c), 1007, "source oid");
         assert_eq!(u32_at(&mut c) as i32, -1, "typmod");
         c += 4 + 1 + 4 + "Array(Int32)".len();
         assert_eq!(u32_at(&mut c), 3802, "second source oid");
         c += 4 + 4 + 1 + 4 + "JSON".len();
+        assert_eq!(u32_at(&mut c), 16_400, "third source oid");
+        c += 4 + 4 + 1 + 4 + "String".len();
         assert_eq!(
             &out[c..],
             &[
@@ -682,6 +693,13 @@ mod tests {
                 0,
                 1,
                 b'x',
+                CELL_BINARY,
+                0,
+                0,
+                0,
+                2,
+                b'o',
+                b'k',
                 CELL_DEFAULT,
                 CELL_TEXT,
                 0,
@@ -690,8 +708,31 @@ mod tests {
                 2,
                 b'{',
                 b'}',
+                CELL_DEFAULT,
             ]
         );
+    }
+
+    /// Every cell kind survives the spill encoding
+    #[test]
+    fn column_cells_round_trip_through_spill() {
+        let mut buf = OracleColumnBuf::string(16_400, 7);
+        for cell in [
+            OracleCell::Default,
+            OracleCell::DiskRaw(vec![1, 2]),
+            OracleCell::TextInput(b"{}".to_vec()),
+            OracleCell::Literal(b"x".to_vec()),
+            OracleCell::BinaryInput(vec![0, 0, 0, 1]),
+            OracleCell::BinaryInput(Vec::new()),
+        ] {
+            buf.push(cell);
+        }
+        let mut out = Vec::new();
+        buf.encode_into(&mut out);
+        let back = OracleColumnBuf::decode(&mut crate::xact::spill::Cursor::new(&out)).unwrap();
+        assert_eq!(back.cells(), buf.cells());
+        assert_eq!(back.approx_size(), buf.approx_size());
+        assert!(back.same_column(&buf));
     }
 
     #[test]

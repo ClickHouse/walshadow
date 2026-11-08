@@ -38,8 +38,10 @@ unconditionally wiping history needed by earlier reads
 Values stay in forms PostgreSQL produced until they become ClickHouse Native
 column bytes: stored datums read in place from WAL, page images and TOAST
 chunks, or `typoutput` text from SQL-read fast defaults and COPY casts. COPY's
-binary send forms convert to stored datums on arrival. Each destination column
-compiles one conversion from its source type, so there is no decoded
+binary send forms convert to stored datums on arrival where a local codec reads
+the type; types only PostgreSQL converts keep their send bytes for its
+`typreceive`, falling back to text casts without binary I/O. Each destination
+column compiles one conversion from its source type, so there is no decoded
 intermediate value. Detoasted values hold their stored bytes, so resident
 accounting counts what was fetched rather than a rendering
 

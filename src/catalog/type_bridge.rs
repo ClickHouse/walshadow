@@ -37,8 +37,9 @@
 //!
 //! ## Default expression
 //!
-//! `attmissingval` arrives as on-disk PG bytes (pinned worker) or element
-//! text (SQL path). Tier-3 bytes resolve to text through shadow PG first.
+//! `attmissingval` arrives as on-disk PG bytes (pinned worker, SQL path for
+//! types with a wire codec) or element text (other SQL-path types). Tier-3
+//! bytes resolve to text through shadow PG first.
 //! The default encodes into its column as a row would, and
 //! `column_literal` renders that cell as the `ADD COLUMN` default
 

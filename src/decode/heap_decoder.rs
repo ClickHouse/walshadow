@@ -789,12 +789,14 @@ pub fn form_block_data(attrs: &[RelAttr], values: &[Option<Datum>]) -> Vec<u8> {
         let (bytes, align) = match v {
             None | Some(Datum::Null) => continue,
             Some(Datum::Fixed(b)) => (b.to_vec(), align_of(b.len())),
-            Some(Datum::Varlena(b) | Datum::BadTag(b) | Datum::Text(b)) if b.len() < 127 => {
+            Some(Datum::Varlena(b) | Datum::BadTag(b) | Datum::Text(b) | Datum::Send(b))
+                if b.len() < 127 =>
+            {
                 let mut v = vec![(((b.len() + 1) << 1) | 1) as u8];
                 v.extend_from_slice(b);
                 (v, 1)
             }
-            Some(Datum::Varlena(b) | Datum::BadTag(b) | Datum::Text(b)) => {
+            Some(Datum::Varlena(b) | Datum::BadTag(b) | Datum::Text(b) | Datum::Send(b)) => {
                 let mut v = (((b.len() + 4) as u32) << 2).to_le_bytes().to_vec();
                 v.extend_from_slice(b);
                 (v, align_of(4).max(4))
@@ -1120,6 +1122,7 @@ pub fn text_datum(type_oid: u32, text: &[u8]) -> TextDatum {
             crate::decode::codecs::parse_tid(text)
                 .map(|(block, offset)| crate::decode::codecs::encode_tid(block, offset)),
         ),
+        // TODO(0.2.0): remove once 0.1.x descriptor logs migrate
         NUMERICOID => crate::decode::codecs::numeric_from_text(text)
             .map_or(TextDatum::Null, |b| TextDatum::Datum(Datum::Varlena(b))),
         _ => TextDatum::Opaque,
@@ -1261,6 +1264,7 @@ pub fn resolve(att: &RelAttr, datum: DatumRef<'_>) -> Option<Datum> {
         DatumRef::Cstring(b) => Datum::Cstring(b.to_vec()),
         DatumRef::BadTag(b) => Datum::BadTag(b.to_vec()),
         DatumRef::Text(b) => Datum::Text(b.to_vec()),
+        DatumRef::Send(b) => Datum::Send(b.to_vec()),
     })
 }
 
@@ -1497,7 +1501,6 @@ pub fn is_replica_identity_attr(replident: &ReplIdent, attnum: i16) -> bool {
 }
 
 /// PG `attmissingval`: one-element, no-null `ArrayType`, payload at `MAXALIGN(24)`
-#[cfg(test)]
 pub(crate) fn raw_missing_array(elemtype: u32, elem: &[u8]) -> Vec<u8> {
     let mut v = Vec::with_capacity(24 + elem.len());
     v.extend_from_slice(&0u32.to_le_bytes()); // vl_len_ (ignored)

@@ -1077,7 +1077,7 @@ fn numeric_send(neg: bool, weight: i16, dscale: u16, digits: &[i16]) -> Vec<u8> 
 /// COPY binary and text fields encode as page-walk views of same values do
 #[test]
 fn copy_fields_match_heap_views() {
-    use crate::backfill::copy_backfill::{CopyRow, copy_slot};
+    use crate::backfill::copy_backfill::{CopyRow, copy_slot, wire_kinds};
     let rel = rel(vec![
         attr(1, INT4OID, 4, 'i', "int4"),
         attr(2, INT8OID, 8, 'd', "int8"),
@@ -1141,6 +1141,7 @@ fn copy_fields_match_heap_views() {
             )),
         ],
     ];
+    let kinds = wire_kinds(&rel, &foldhash::HashSet::default());
     let mut views = TableEncoder::new(plan(&rel, &targets, &ColumnRules::default())).unwrap();
     let mut copy = TableEncoder::new(plan(&rel, &targets, &ColumnRules::default())).unwrap();
     for (i, row) in rows.iter().enumerate() {
@@ -1162,7 +1163,7 @@ fn copy_fields_match_heap_views() {
             .iter()
             .map(|c| c.as_ref().map(|(_, f)| &f[..]))
             .collect();
-        let fields = CopyRow::from_send(&rel, &fields).unwrap();
+        let fields = CopyRow::from_send(&kinds, &fields).unwrap();
         copy.append_slots(|src| Ok(copy_slot(&fields, &rel, src.index)), &stamp)
             .unwrap();
     }

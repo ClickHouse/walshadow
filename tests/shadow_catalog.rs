@@ -366,6 +366,81 @@ async fn dropped_column_keeps_physical_slot() {
     assert_eq!(b.attributes, desc.attributes);
 }
 
+/// Source SQL reads fast defaults through `anyarray_send`, landing the stored
+/// datums shadow reads do; types without a wire codec stay element text
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn source_sql_fast_defaults_match_shadow_reads() {
+    use walshadow::datum::DatumRef;
+    use walshadow::heap_decoder::resolve;
+    use walshadow::schema::MissingDefault;
+    if !pg_available() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let shadow = make_shadow(&tmp, ports::PG_SHADOW_PORT);
+    shadow.initdb().expect("initdb");
+    shadow.write_base_conf().expect("conf");
+    shadow.start().expect("start");
+    let _stop = stop_on_drop(&shadow);
+
+    shadow
+        .apply_schema_dump(
+            "CREATE SCHEMA fd;\n\
+             CREATE TABLE fd.t (id int);\n\
+             INSERT INTO fd.t VALUES (1);\n\
+             ALTER TABLE fd.t ADD n numeric DEFAULT 12.50, ADD s text DEFAULT 'hi', \
+             ADD nm name DEFAULT 'nm', ADD b int8 DEFAULT -3, \
+             ADD ts timestamp DEFAULT '2024-01-02 03:04:05', ADD v tsvector DEFAULT 'x';\n",
+        )
+        .expect("schema dump");
+
+    let db = current_db_oid(&shadow);
+    let filenode = user_relation_filenode(&shadow, "fd.t");
+    let mut cat = open_catalog(&shadow, Duration::from_secs(5)).await;
+    let stored = cat
+        .descriptor_by_name(&RelName::new("fd", "t"))
+        .await
+        .expect("descriptor_by_name")
+        .expect("fd.t exists");
+
+    let cfg = shadow.config();
+    let conninfo = socket_conninfo(
+        cfg.socket_dir.to_str().unwrap(),
+        cfg.port,
+        "postgres",
+        "postgres",
+    );
+    let (client, conn) = tokio_postgres::connect(&conninfo, tokio_postgres::NoTls)
+        .await
+        .expect("sql connect");
+    tokio::spawn(conn);
+    let seeded = walshadow::backfill_bootstrap::seed_catalog_from_source(&client)
+        .await
+        .expect("seed catalog")
+        .get(db, filenode)
+        .expect("fd.t seeded");
+
+    assert_eq!(seeded.attributes.len(), stored.attributes.len());
+    for (sql, disk) in seeded.attributes.iter().zip(&stored.attributes).skip(1) {
+        let resolved = resolve(sql, DatumRef::Missing);
+        assert!(resolved.is_some(), "{} default missing", sql.name);
+        if sql.name == "v" {
+            assert_eq!(
+                sql.missing_default,
+                Some(MissingDefault::Text("'x'".into()))
+            );
+            continue;
+        }
+        assert!(
+            matches!(sql.missing_default, Some(MissingDefault::Raw(_))),
+            "{}: {:?}",
+            sql.name,
+            sql.missing_default
+        );
+        assert_eq!(resolved, resolve(disk, DatumRef::Missing), "{}", sql.name);
+    }
+}
+
 /// Replica-identity carriage: `RelDescriptor::replident` carries the resolved
 /// `pg_class.relreplident` and, for `USING INDEX`, the index oid plus
 /// `pg_index.indkey` attnum list. Heap decoder reads both off the

@@ -3144,7 +3144,7 @@ fn encode_datum(
                 "unresolved TOAST pointer (xact buffer should have reassembled)",
             ));
         }
-        DatumRef::BadTag(_) => {
+        DatumRef::BadTag(_) | DatumRef::Send(_) => {
             return Err(unsupported(
                 "unresolved source value routed to a local column",
             ));
@@ -3297,6 +3297,7 @@ fn oracle_cell(
             }));
         }
         DatumRef::Text(t) => return Ok(OracleCell::TextInput(t.to_vec())),
+        DatumRef::Send(b) => return Ok(OracleCell::BinaryInput(b.to_vec())),
         DatumRef::Missing => return Err(unresolved("fast default left unresolved")),
         DatumRef::External(_) | DatumRef::BadTag(_) => {
             return Err(unresolved("unresolved source value on an oracle column"));
@@ -4177,6 +4178,26 @@ mod tests {
                 assert!(literal_column(&buf, 2).is_none());
             }
         }
+    }
+
+    /// COPY `typsend` bytes take the oracle's binary input under the planned
+    /// source type only; NULL stays a default cell
+    #[test]
+    fn send_datums_become_binary_input_cells() {
+        let source = Some(SourceColumn {
+            index: 0,
+            codec: Codec::Pending,
+            type_oid: 16_500,
+        });
+        assert_eq!(
+            oracle_cell(DatumRef::Send(&[0, 1]), source, 16_500).unwrap(),
+            OracleCell::BinaryInput(vec![0, 1])
+        );
+        assert_eq!(
+            oracle_cell(DatumRef::Null, source, 16_500).unwrap(),
+            OracleCell::Default
+        );
+        assert!(oracle_cell(DatumRef::Send(b"x"), source, 16_501).is_err());
     }
 
     #[test]

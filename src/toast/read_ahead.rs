@@ -58,7 +58,7 @@ pub struct PendingReads {
     entries: HashMap<Key, Entry>,
 }
 
-/// Fetch and decompress transients; rendered values top up once their size is known
+/// Fetch and decompress transients; held values top up once their size is known
 fn read_cost(p: &ToastPointer) -> usize {
     pointer_extsize(p)
         .saturating_mul(2)
@@ -66,9 +66,9 @@ fn read_cost(p: &ToastPointer) -> usize {
         .saturating_add(ENTRY_OVERHEAD)
 }
 
-/// Bytes a value rendered to `rendered` bytes holds until planning consumes it
-pub fn retained_bytes(rendered: usize, p: &ToastPointer) -> u64 {
-    rendered.max(pointer_footprint(p)).saturating_mul(2) as u64
+/// Bytes a value of `held` raw bytes retains until planning consumes it
+pub fn retained_bytes(held: usize, p: &ToastPointer) -> u64 {
+    held.max(pointer_footprint(p)).saturating_mul(2) as u64
 }
 
 impl PendingReads {
