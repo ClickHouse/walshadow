@@ -82,6 +82,11 @@
 //!    * `ALTER DATABASE … SET intervalstyle = iso_8601` before a COPY load.
 //!    * Expect: COPY and WAL rows render the same interval identically.
 //!
+//! 13. `copy_load_matches_wal_for_postgis`
+//!    * COPY and WAL rows of each PostGIS subtype, plus a NULL row of each.
+//!    * Expect: 2-D subtypes land in CH geo columns, the rest as `ST_AsText`
+//!      WKT, and COPY rows read like WAL rows.
+//!
 //! Source-side `config_*` install runs the real `sql/runtime_config_install.sql`
 
 //! inside the bootstrap schema dump, so the drills double as install-script
@@ -1308,18 +1313,29 @@ async fn copy_load_converges(
     ch.query("CREATE DATABASE IF NOT EXISTS walshadow_test")
         .expect("create db");
 
-    let mut pipeline = fx::build_pipeline(fx::BuildPipelineArgs {
-        tmp: &tmp,
-        source: &source,
-        shadow: &shadow,
-        shadow_filter_dir: &shadow_filter_dir,
-        shadow_stream_state,
-        ch_database: "walshadow_test",
-        ch_tcp_port: slot.ch_tcp,
-        mappings: vec![],
-        app_name,
-        ddl: Some(overlay_ddl_args()),
-    })
+    // Worker binds only once recovery reaches consistency, so budget the dial
+    let socket = shadow.bridge_socket().expect("bridge configured");
+    let bridge = walshadow::bridge::connect_with_budget(socket, 1, Duration::from_secs(30))
+        .await
+        .expect("bridge connect");
+    let mut pipeline = fx::build_pipeline_tuned(
+        fx::BuildPipelineArgs {
+            tmp: &tmp,
+            source: &source,
+            shadow: &shadow,
+            shadow_filter_dir: &shadow_filter_dir,
+            shadow_stream_state,
+            ch_database: "walshadow_test",
+            ch_tcp_port: slot.ch_tcp,
+            mappings: vec![],
+            app_name,
+            ddl: Some(overlay_ddl_args()),
+        },
+        |_| {},
+        Some(std::sync::Arc::new(walshadow::oracle::Oracle::new(
+            std::sync::Arc::new(bridge),
+        ))),
+    )
     .await;
 
     let driver = fx::spawn_workload(&source, workload);
@@ -1427,4 +1443,79 @@ async fn copy_load_pins_output_settings() {
         got, "['1 day 02:03:04','1 day 02:03:04']",
         "COPY row renders like the WAL row"
     );
+}
+
+/// PostGIS subtypes with a 2-D CH geo type land there, the rest as WKT; COPY
+/// rows must read like WAL rows holding the same values
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn copy_load_matches_wal_for_postgis() {
+    if !fx::tools::requirements_available() || !fx::tools::extension("postgis") {
+        return;
+    }
+    let values = "'SRID=4326;POINT(0.1 0.30000000000000004)', 'LINESTRING(0 0,1 1,2 0)', \
+        'POLYGON((0 0,4 0,4 4,0 4,0 0),(1 1,2 1,2 2,1 1))', \
+        'MULTILINESTRING((0 0,1 1),(2 2,3 3,4 4))', \
+        'MULTIPOLYGON(((0 0,1 0,1 1,0 0)),((5 5,9 5,9 9,5 5),(6 6,7 6,7 7,6 6)))', \
+        'GEOMETRYCOLLECTION(POINT(1 2),LINESTRING(0 0,1 1))', 'POINT Z (1 2 3)', \
+        'SRID=4326;POINT(30.5 50.25)', 'POINT(0.1 0.30000000000000004)'";
+    let nulls = "NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL";
+    let schema_sql = format!(
+        "{INSTALL_SQL}\n\
+         CREATE EXTENSION postgis;\n\
+         CREATE SCHEMA app;\n\
+         CREATE TABLE app.geo (id bigint PRIMARY KEY, pt geometry(Point,4326), \
+            ln geometry(LineString), pg geometry(Polygon), mls geometry(MultiLineString), \
+            mpg geometry(MultiPolygon), anyg geometry, ptz geometry(PointZ), \
+            gpt geography(Point,4326), wkt geometry);\n\
+         INSERT INTO app.geo VALUES (1, {values}), (3, {nulls});\n"
+    );
+    let (ch, got) = copy_load_converges(
+        &schema_sql,
+        vec![
+            "INSERT INTO walshadow.config_table (namespace, relname, replicate, initial_load) \
+             VALUES ('app', 'geo', true, 'copy')"
+                .into(),
+            format!("INSERT INTO app.geo VALUES (2, {values}), (4, {nulls})"),
+            "SELECT pg_switch_wal()".into(),
+        ],
+        "walshadow-copy-postgis",
+        "SELECT count() FROM walshadow_test.app_geo FINAL WHERE _is_deleted = 0",
+        "4",
+    )
+    .await;
+    assert_eq!(got, "4", "COPY and WAL rows reach CH");
+    let types = ch
+        .query(
+            "SELECT groupArray(type) FROM (SELECT type FROM system.columns \
+             WHERE database = 'walshadow_test' AND table = 'app_geo' \
+             AND name IN ('pt', 'ln', 'pg', 'mls', 'mpg', 'anyg', 'ptz', 'gpt', 'wkt') \
+             ORDER BY position)",
+        )
+        .expect("ch column types");
+    assert_eq!(
+        types,
+        "['Nullable(Point)','LineString','Polygon','MultiLineString','MultiPolygon',\
+         'Nullable(String)','Nullable(String)','Nullable(Point)','Nullable(String)']"
+    );
+    let row = |id: u32| {
+        ch.query(&format!(
+            "SELECT pt, ln, pg, mls, mpg, anyg, ptz, gpt, wkt FROM walshadow_test.app_geo \
+             FINAL WHERE _is_deleted = 0 AND id = {id}"
+        ))
+        .expect("ch row")
+    };
+    let (copy, wal) = (row(1), row(2));
+    assert_eq!(copy, wal, "COPY row reads like the WAL row");
+    assert_eq!(
+        copy,
+        "(0.1,0.30000000000000004)\t[(0,0),(1,1),(2,0)]\t\
+         [[(0,0),(4,0),(4,4),(0,4),(0,0)],[(1,1),(2,1),(2,2),(1,1)]]\t\
+         [[(0,0),(1,1)],[(2,2),(3,3),(4,4)]]\t\
+         [[[(0,0),(1,0),(1,1),(0,0)]],[[(5,5),(9,5),(9,9),(5,5)],[(6,6),(7,6),(7,7),(6,6)]]]\t\
+         GEOMETRYCOLLECTION(POINT(1 2),LINESTRING(0 0,1 1))\tPOINT Z (1 2 3)\t(30.5,50.25)\t\
+         POINT(0.1 0.3)"
+    );
+    let (copy, wal) = (row(3), row(4));
+    assert_eq!(copy, wal, "NULL COPY row reads like the NULL WAL row");
+    assert_eq!(copy, "\\N\t[]\t[]\t[]\t[]\t\\N\t\\N\t\\N\t\\N");
 }

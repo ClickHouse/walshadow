@@ -77,13 +77,6 @@ pub fn place_rows(
             commit_ts,
             commit_lsn,
         };
-        // PostGIS WKT differs from typoutput HEXEWKB
-        if let Some(t) = committed.decoded.new.as_mut() {
-            crate::ops::oracle::render_ext_columns(&rel.attributes, &mut t.columns);
-        }
-        if let Some(t) = committed.decoded.old.as_mut() {
-            crate::ops::oracle::render_ext_columns(&rel.attributes, &mut t.columns);
-        }
         if !route.drops_deletes()
             && let Some(tomb) = take_key_change_tombstone(&mut committed.decoded, rel)
         {

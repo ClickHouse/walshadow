@@ -21,7 +21,6 @@ use crate::emit::pipeline::ack::{AckHandle, OpenSeq, Publish, SeqAlloc};
 use crate::emit::pipeline::batcher::{BatcherClosed, BatcherMsg, RowBuffer, RowTable};
 use crate::emit::route::{FrozenRoutes, RouteSnapshot, RowPolicy, freeze_routes};
 use crate::mapping::{MappingSnapshot, TableMapping};
-use crate::ops::oracle::render_ext_columns;
 use crate::schema::{RelDescriptor, RelName};
 use crate::ticker::Ticker;
 use crate::toast::{
@@ -259,7 +258,6 @@ pub async fn drain(
                     .await?
                     .map(Arc::new);
             }
-            render_ext_columns(&rel.attributes, &mut tuple.columns);
             let committed = tuple.into_committed_insert();
             row_buffer
                 .push(&msg_tx, run.seq.seq(), (rel, route), committed, permit)
@@ -629,12 +627,11 @@ async fn route_batch(
         if row.replay_covered {
             continue;
         }
-        let mut tuple = row.tuple;
+        let tuple = row.tuple;
         let at = seq
             .get_or_insert_with(|| seqs.open(tuple.source_lsn, Publish::Commit))
             .seq();
         let RowTable { rel, route } = &tables[row.table as usize];
-        render_ext_columns(&rel.attributes, &mut tuple.columns);
         row_buffer
             .push(
                 msg_tx,

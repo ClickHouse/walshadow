@@ -6,9 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use clickhouse_c::{Allocator, Block, BlockOpts, BlockReader, Column, Kind, SliceIo, TypeRef};
 
 use crate::ch::types;
-use crate::decode::heap_decoder::ColumnValue;
 use crate::ops::bridge::{Bridge, BridgeError, MAX_REQUEST_BYTES, request_frame};
-use crate::schema::RelAttr;
 use tokio_postgres::types::Oid;
 
 /// Cell tags, matching `WS_CELL_*` in `pgext/walshadow.h`
@@ -477,41 +475,6 @@ fn decode_block(
     Ok(block)
 }
 
-/// Render PostGIS 2-D points as WKT, typoutput yields HEXEWKB
-pub fn render_ext_columns(attrs: &[RelAttr], columns: &mut [Option<ColumnValue>]) {
-    // Scan cells first: attribute type names sit behind a pointer per column
-    for (idx, cell) in columns.iter_mut().enumerate() {
-        let Some(ColumnValue::PgPending { raw, .. }) = cell.as_ref() else {
-            continue;
-        };
-        let is_geo = attrs.iter().any(|att| {
-            !att.dropped
-                && usize::try_from(att.attnum - 1) == Ok(idx)
-                && matches!(att.type_name.as_str(), "geography" | "geometry")
-        });
-        if is_geo && let Some(text) = gserialized_point_to_wkt(raw) {
-            *cell = Some(ColumnValue::Text(text));
-        }
-    }
-}
-
-/// PostGIS on-disk GSERIALIZED → `POINT(x y)` for 2-D points. Layout:
-/// `[srid(3) + gflags(1)][geomtype u32-le][…]`; POINT has geomtype 1 and its
-/// two `f64`-LE coordinates are the trailing 16 bytes. `None` for non-points.
-fn gserialized_point_to_wkt(raw: &[u8]) -> Option<String> {
-    if raw.len() < 16 {
-        return None;
-    }
-    let geomtype = u32::from_le_bytes(raw[4..8].try_into().ok()?);
-    if geomtype != 1 {
-        return None;
-    }
-    let n = raw.len();
-    let x = f64::from_le_bytes(raw[n - 16..n - 8].try_into().ok()?);
-    let y = f64::from_le_bytes(raw[n - 8..n].try_into().ok()?);
-    Some(format!("POINT({x} {y})"))
-}
-
 impl OracleStats {
     pub fn summary(&self) -> String {
         use std::fmt::Write as _;
@@ -637,21 +600,6 @@ mod tests {
                 + request_column_bytes("payload", "Nullable(JSON)")
                 + buf.approx_size()
         );
-    }
-
-    #[test]
-    fn gserialized_2d_point_renders_wkt() {
-        // [srid+gflags:4][geomtype=1:4][X f64le][Y f64le]
-        let mut raw = vec![0u8, 0, 0, 0, 1, 0, 0, 0];
-        raw.extend_from_slice(&30.5_f64.to_le_bytes());
-        raw.extend_from_slice(&81.25_f64.to_le_bytes());
-        assert_eq!(
-            gserialized_point_to_wkt(&raw).as_deref(),
-            Some("POINT(30.5 81.25)")
-        );
-        // non-point geomtype → None
-        raw[4] = 2;
-        assert_eq!(gserialized_point_to_wkt(&raw), None);
     }
 
     #[test]
