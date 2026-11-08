@@ -155,7 +155,7 @@ pub fn tap_filenode_set(
 ///
 /// ```ignore
 /// let (rx, pump) = spawn_greenfield_bootstrap(cfg, source, catalog_map, store_toast);
-/// let drained = tokio::spawn(drain_backfill(rx, observer));
+/// let drained = tokio::spawn(drain_backfill(rx, &catalog, observer));
 /// let outcome = pump.await?.context("bootstrap pump")?;
 /// let shipped = drained.await?;
 /// ```
@@ -262,6 +262,7 @@ pub async fn run_greenfield_bootstrap(
 /// release CH state before the daemon swaps to the shadow-catalog emitter.
 pub async fn drain_backfill<O: TupleObserver + ?Sized>(
     mut rx: mpsc::Receiver<Vec<BackfillTuple>>,
+    catalog: &CatalogMap,
     observer: &mut O,
 ) -> Result<u64> {
     let mut shipped: u64 = 0;
@@ -278,7 +279,12 @@ pub async fn drain_backfill<O: TupleObserver + ?Sized>(
             }
             last_rfn = Some(tuple.rfn);
             last_lsn = tuple.source_lsn;
-            let committed = tuple.into_committed_insert();
+            let rel = catalog
+                .get(tuple.rfn.db_node, tuple.rfn.rel_node)
+                .with_context(|| format!("bootstrap drain: no descriptor for {:?}", tuple.rfn))?;
+            let committed = tuple
+                .into_committed_insert(&rel)
+                .map_err(|e| anyhow::anyhow!("bootstrap drain: {e}"))?;
             observer
                 .on_tuple(&committed)
                 .await
@@ -465,7 +471,9 @@ fn one_char(s: String, what: &str) -> Result<char> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backfill::backup_page_walk::{PAGE_BYTES, make_rel, synth_single_tuple_page};
+    use crate::backfill::backup_page_walk::{
+        PAGE_BYTES, TupleData, make_rel, synth_single_tuple_page,
+    };
     use crate::backfill::backup_source::{BackupSink, BackupSource, FileMeta};
     use crate::decode::heap_decoder::HeapOp;
     use async_trait::async_trait;
@@ -590,11 +598,11 @@ mod tests {
         let tuple = &tuples[0];
         assert_eq!(tuple.source_lsn, 0xDEAD_BEEF);
         assert_eq!(tuple.xid, 99);
-        assert_eq!(tuple.columns.len(), 1);
-        assert!(matches!(
-            tuple.columns[0],
-            Some(crate::decode::heap_decoder::ColumnValue::Int4(42))
-        ));
+        let columns = tuple.cells(&make_rel()).unwrap();
+        assert_eq!(
+            columns,
+            [Some(crate::decode::heap_decoder::ColumnValue::Int4(42))]
+        );
     }
 
     #[tokio::test]
@@ -617,9 +625,10 @@ mod tests {
                 page_lsn: 0,
                 blkno: 0,
                 offnum: 0,
-                columns: vec![Some(crate::decode::heap_decoder::ColumnValue::Int4(
-                    v as i32,
-                ))],
+                data: TupleData::from_cells(&[Some(
+                    crate::decode::heap_decoder::ColumnValue::Int4(v as i32),
+                )]),
+                pending: None,
             }])
             .await
             .unwrap();
@@ -627,7 +636,9 @@ mod tests {
         drop(tx);
 
         let mut observer = CollectingTupleObserver::default();
-        let shipped = drain_backfill(rx, &mut observer).await.unwrap();
+        let shipped = drain_backfill(rx, &int4_catalog(), &mut observer)
+            .await
+            .unwrap();
         assert_eq!(shipped, 3);
         assert_eq!(observer.tuples.len(), 3);
         for (i, c) in observer.tuples.iter().enumerate() {
@@ -642,6 +653,12 @@ mod tests {
                 Some(crate::decode::heap_decoder::ColumnValue::Int4(v)) if v == i as i32
             ));
         }
+    }
+
+    fn int4_catalog() -> CatalogMap {
+        let mut catalog = CatalogMap::new();
+        catalog.insert(Arc::new(make_rel()));
+        catalog
     }
 
     #[derive(Default)]
@@ -699,9 +716,10 @@ mod tests {
                 page_lsn: 0,
                 blkno: 0,
                 offnum: 0,
-                columns: vec![Some(crate::decode::heap_decoder::ColumnValue::Int4(
-                    v as i32,
-                ))],
+                data: TupleData::from_cells(&[Some(
+                    crate::decode::heap_decoder::ColumnValue::Int4(v as i32),
+                )]),
+                pending: None,
             }])
             .await
             .unwrap();
@@ -709,7 +727,7 @@ mod tests {
         drop(tx);
 
         let mut obs = CountingObserver::default();
-        let shipped = drain_backfill(rx, &mut obs).await.unwrap();
+        let shipped = drain_backfill(rx, &int4_catalog(), &mut obs).await.unwrap();
         assert_eq!(shipped, 4);
         assert_eq!(obs.on_tuple_calls, 4);
         // One synthetic xact closes the backfill
@@ -723,7 +741,7 @@ mod tests {
         let (tx, rx) = mpsc::channel::<Vec<BackfillTuple>>(64);
         drop(tx);
         let mut obs = CountingObserver::default();
-        let shipped = drain_backfill(rx, &mut obs).await.unwrap();
+        let shipped = drain_backfill(rx, &int4_catalog(), &mut obs).await.unwrap();
         assert_eq!(shipped, 0);
         assert_eq!(obs.on_tuple_calls, 0);
         assert_eq!(obs.on_xact_end_calls, 1);

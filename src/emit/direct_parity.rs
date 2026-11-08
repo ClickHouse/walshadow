@@ -97,8 +97,12 @@ fn lz4(content: &[u8]) -> Vec<u8> {
 }
 
 fn external() -> Vec<u8> {
+    external_id(7)
+}
+
+fn external_id(value_id: u32) -> Vec<u8> {
     let mut v = vec![0x01, 18];
-    for word in [100i32 as u32, 96, 7, 16400] {
+    for word in [100i32 as u32, 96, value_id, 16400] {
         v.extend_from_slice(&word.to_le_bytes());
     }
     v
@@ -213,7 +217,7 @@ fn assert_parity(
             .append_routed(&committed, &mapping, op, None)
             .map_err(|e| e.to_string());
         let b = direct
-            .append_view(rel, &view.datums, &stamp)
+            .append_view(rel, &view.datums, &[], &stamp)
             .map_err(|e| e.to_string());
         assert_eq!(a, b, "row {i}: {values:?}");
         if a.is_err() {
@@ -805,7 +809,7 @@ fn predeclared_columns_match() {
         .append_routed(&committed, &mapping, OP_INSERT, None)
         .unwrap();
     let view = view_block_data(&data, &rel).unwrap();
-    direct.append_view(&rel, &view.datums, &stamp).unwrap();
+    direct.append_view(&rel, &view.datums, &[], &stamp).unwrap();
     let wire = |e: &mut TableEncoder| {
         let (bufs, _) = e.take_block().unwrap();
         bufs.iter()
@@ -835,8 +839,21 @@ fn view_matches_owned_decode_for_records() {
 /// Operation with new and old tuple bytes
 type Change = (HeapOp, Option<Vec<u8>>, Option<Vec<u8>>);
 
-/// Plan row changes both ways; segments must carry identical rows
-fn plan_both(rel: &RelDescriptor, targets: &[&str], changes: &[Change]) {
+/// Plan row changes both ways; segments must carry identical rows.
+/// External values resolve through `values` by value id, as detoast would
+fn plan_both(
+    rel: &RelDescriptor,
+    targets: &[&str],
+    changes: &[Change],
+    values: &[(u32, ColumnValue)],
+) {
+    let resolved = |p: crate::decode::heap_decoder::ToastPointer| {
+        values
+            .iter()
+            .find(|(id, _)| *id == p.va_valueid)
+            .map(|(_, v)| v.clone())
+            .expect("value for every pointer")
+    };
     use crate::emit::pipeline::plan_spool::{PlanItem, PlanWriter, ViewChange};
     use crate::emit::route::RouteSnapshot;
     let rel = std::sync::Arc::new(rel.clone());
@@ -856,22 +873,37 @@ fn plan_both(rel: &RelDescriptor, targets: &[&str], changes: &[Change]) {
             if views {
                 let new = new.as_ref().map(|d| view_block_data(d, &rel).unwrap());
                 let old = old.as_ref().map(|d| view_block_data(d, &rel).unwrap());
+                let mut patches: [Vec<(usize, ColumnValue)>; 2] = Default::default();
+                for site in crate::xact::xact_buffer::external_sites([new.as_ref(), old.as_ref()]) {
+                    patches[site.image].push((site.idx, resolved(site.p)));
+                }
                 let change = ViewChange {
                     op: *op,
                     xid: 5,
                     source_lsn: lsn,
                     new: new.as_ref(),
                     old: old.as_ref(),
+                    new_patch: &patches[0],
+                    old_patch: &patches[1],
                 };
                 w.push_views(change, table).unwrap();
             } else {
+                let decode = |d: &Vec<u8>| {
+                    let mut t = decode_block_data(d, &rel).unwrap();
+                    for c in t.columns.iter_mut() {
+                        if let Some(ColumnValue::ExternalToast(p)) = *c {
+                            *c = Some(resolved(p));
+                        }
+                    }
+                    t
+                };
                 let decoded = DecodedHeap {
                     rfn: rel.rfn,
                     xid: 5,
                     source_lsn: lsn,
                     op: *op,
-                    new: new.as_ref().map(|d| decode_block_data(d, &rel).unwrap()),
-                    old: old.as_ref().map(|d| decode_block_data(d, &rel).unwrap()),
+                    new: new.as_ref().map(decode),
+                    old: old.as_ref().map(decode),
                 };
                 w.push_cells(decoded, table).unwrap();
             }
@@ -947,6 +979,37 @@ fn plan_views_match_cells_for_row_changes() {
                 (HeapOp::Delete, None, Some(row(3, 3.0, "c"))),
                 (HeapOp::Delete, None, None),
             ],
+            &[],
         );
     }
+}
+
+/// Resolved external values patch tuple views as detoast patches cells;
+/// key changes compare resolved values, not pointers
+#[test]
+fn plan_views_match_cells_with_resolved_externals() {
+    let mut r = rel(vec![
+        attr(1, INT4OID, 4, 'i', "int4"),
+        attr(2, TEXTOID, -1, 'i', "text"),
+    ]);
+    r.replident = ReplIdent::Full { pk_attnums: None };
+    let attrs = r.attributes.clone();
+    let row = |id: i32, value_id: u32| {
+        let ext = external_id(value_id);
+        tuple(&attrs, 2, &[Some(&id.to_le_bytes()[..]), Some(&ext[..])])
+    };
+    let text = |s: &str| ColumnValue::Text(s.into());
+    plan_both(
+        &r,
+        &["Int32", "String"],
+        &[
+            (HeapOp::Insert, Some(row(1, 7)), None),
+            // Other pointer, same value: no key change
+            (HeapOp::Update, Some(row(1, 8)), Some(row(1, 7))),
+            // Other value: delete marker plus new row
+            (HeapOp::Update, Some(row(1, 9)), Some(row(1, 8))),
+            (HeapOp::Delete, None, Some(row(1, 9))),
+        ],
+        &[(7, text("same")), (8, text("same")), (9, text("other"))],
+    );
 }

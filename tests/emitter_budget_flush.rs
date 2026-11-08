@@ -27,7 +27,7 @@ use walshadow::ch_emitter::{EmitterConfig, EmitterStats, InstanceConfig};
 use walshadow::heap_decoder::{ColumnValue, CommittedTuple, DecodedHeap, DecodedTuple, HeapOp};
 use walshadow::mapping::{ColumnMapping, TableMapping, TableTarget};
 use walshadow::pipeline::ack::Publish;
-use walshadow::pipeline::batcher::{BatcherMsg, RoutedRow, RowChunk, RowTable};
+use walshadow::pipeline::batcher::{BatcherMsg, PlacedSegment};
 use walshadow::pipeline::{Fatal, tail};
 use walshadow::pos::Pos;
 use walshadow::pos::{EmitterAck, Monotone};
@@ -183,23 +183,15 @@ async fn budget_trips_seal_complete_inserts() {
     let commit_lsn = 0xC0FFEE;
     let mut seqs = ack.seqs(0);
     let seq = seqs.open(commit_lsn, Publish::Commit);
-    let rows = (0..N)
-        .map(|i| RoutedRow {
-            seq: seq.seq(),
-            table: 0,
-            committed: tuple(i, 0x1000 + i as u64, commit_lsn),
-            value_permit: None,
+    let rel = rel_descriptor();
+    let segments = (0..N)
+        .map(|i| {
+            let row = tuple(i, 0x1000 + i as u64, commit_lsn);
+            PlacedSegment::of_rows(seq.seq(), &rel, &route, &[row]).expect("encode row")
         })
         .collect();
     msg_tx
-        .send(BatcherMsg::Rows(RowChunk {
-            tables: vec![RowTable {
-                rel: rel_descriptor(),
-                route,
-            }],
-            rows,
-            permit: None,
-        }))
+        .send(BatcherMsg::Segments(segments))
         .await
         .expect("route rows");
     seqs.place(seq, N as u64);

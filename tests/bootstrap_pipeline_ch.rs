@@ -24,7 +24,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use walrus::pg::walparser::RelFileNode;
-use walshadow::backup_page_walk::{BackfillTuple, CatalogMap};
+use walshadow::backup_page_walk::{BackfillTuple, CatalogMap, TupleData};
 use walshadow::ch::CompressionChoice;
 use walshadow::ch_emitter::{EmitterConfig, EmitterStats, InstanceConfig};
 use walshadow::emit::route::freeze_routes;
@@ -100,7 +100,8 @@ fn tuple(rel_node: u32, id: i32) -> BackfillTuple {
         page_lsn: 0,
         blkno: 0,
         offnum: 0,
-        columns: vec![Some(ColumnValue::Int4(id))],
+        data: TupleData::from_cells(&[Some(ColumnValue::Int4(id))]),
+        pending: None,
     }
 }
 

@@ -28,7 +28,7 @@ use thiserror::Error;
 use crate::ch::EmitterError;
 use crate::decode::datum::DatumRef;
 use crate::decode::heap_decoder::{
-    DecodedHeap, HeapOp, TupleView, datum_value, take_key_change_tombstone,
+    ColumnValue, DecodedHeap, HeapOp, TupleView, datum_value, take_key_change_tombstone,
 };
 use crate::emit::ch_emitter::{
     Append, EncodedChunk, OP_DELETE, OP_INSERT, OP_UPDATE, RowStamp, TableEncoder, TablePlan,
@@ -165,9 +165,11 @@ enum Step {
     },
 }
 
-/// Per-table encoder of the open segment, keyed by plan table
-struct OpenTable {
-    table: u32,
+/// Per-table encoder of the open segment
+struct OpenTable<K> {
+    key: K,
+    rel: Arc<RelDescriptor>,
+    route: Arc<RouteSnapshot>,
     enc: TableEncoder,
 }
 
@@ -208,6 +210,217 @@ impl EncoderCache {
     }
 }
 
+/// Encodes row changes into per-table column chunks of one open segment,
+/// sealing a table's chunk early when an oracle frame fills. `K` names the
+/// caller's table
+pub struct ChunkBuilder<K> {
+    alloc: Allocator,
+    open: Vec<OpenTable<K>>,
+    encoders: EncoderCache,
+    /// Chunks of the open segment sealed early at an oracle frame limit
+    sealed: Vec<(K, EncodedChunk)>,
+    rows: usize,
+    segment_rows: usize,
+    segment_bytes: usize,
+}
+
+impl<K: Copy + PartialEq> ChunkBuilder<K> {
+    /// Segment is due once its rows or allocated bytes reach these
+    pub fn new(segment_rows: usize, segment_bytes: usize) -> Self {
+        Self {
+            alloc: Allocator::global(&mimalloc::MiMalloc),
+            open: Vec::new(),
+            encoders: EncoderCache::default(),
+            sealed: Vec::new(),
+            rows: 0,
+            segment_rows: segment_rows.max(1),
+            segment_bytes: segment_bytes.max(1),
+        }
+    }
+
+    /// Reuse encoders an earlier builder returned
+    pub fn with_encoders(mut self, encoders: EncoderCache) -> Self {
+        self.encoders = encoders;
+        self
+    }
+
+    /// Rows in the open segment
+    pub fn rows(&self) -> usize {
+        self.rows
+    }
+
+    /// Whether the open segment reached its row or byte limit
+    pub fn due(&self) -> bool {
+        self.rows >= self.segment_rows || self.open_bytes() >= self.segment_bytes
+    }
+
+    fn open_bytes(&self) -> usize {
+        self.open.iter().map(|o| o.enc.approx_bytes).sum::<usize>()
+            + self
+                .sealed
+                .iter()
+                .map(|(_, c)| c.allocated_bytes())
+                .sum::<usize>()
+    }
+
+    /// Encode one row into `key`'s open chunk, sealing it first when an
+    /// oracle frame fills
+    pub(crate) fn append(
+        &mut self,
+        key: K,
+        rel: &Arc<RelDescriptor>,
+        route: &Arc<RouteSnapshot>,
+        mut row: impl FnMut(&mut TableEncoder) -> std::result::Result<Append, EmitterError>,
+    ) -> std::result::Result<(), EmitterError> {
+        let i = match self.open.iter().position(|o| o.key == key) {
+            Some(i) => i,
+            None => {
+                let enc = match self.encoders.take(rel, route) {
+                    Some(enc) => enc,
+                    None => TableEncoder::new(TablePlan::for_route(self.alloc, rel, route)?)?,
+                };
+                self.open.push(OpenTable {
+                    key,
+                    rel: rel.clone(),
+                    route: route.clone(),
+                    enc,
+                });
+                self.open.len() - 1
+            }
+        };
+        if row(&mut self.open[i].enc)? == Append::Full {
+            let chunk = self.take_chunk(i)?;
+            self.sealed.push(chunk);
+            row(&mut self.open[i].enc)?;
+        }
+        self.rows += 1;
+        Ok(())
+    }
+
+    /// Encode one owned row change: drop deletes an append-only route has
+    /// nowhere to land, render PostGIS cells, split key changes into a
+    /// delete marker plus the new row. Returns rows appended
+    pub fn push_cells(
+        &mut self,
+        key: K,
+        rel: &Arc<RelDescriptor>,
+        route: &Arc<RouteSnapshot>,
+        mut decoded: DecodedHeap,
+        commit_ts: i64,
+    ) -> std::result::Result<usize, EmitterError> {
+        if route.drops_deletes() && decoded.op == HeapOp::Delete {
+            return Ok(0);
+        }
+        for t in [decoded.new.as_mut(), decoded.old.as_mut()]
+            .into_iter()
+            .flatten()
+        {
+            crate::ops::oracle::render_ext_columns(&rel.attributes, &mut t.columns);
+        }
+        let tomb = (!route.drops_deletes())
+            .then(|| take_key_change_tombstone(&mut decoded, rel))
+            .flatten();
+        let leaf = route.partition.as_ref().map(|p| p.leaf);
+        let mut rows = 0;
+        for decoded in tomb.into_iter().chain([decoded]) {
+            let op = op_code(decoded.op)?;
+            let committed = crate::decode::heap_decoder::CommittedTuple {
+                decoded,
+                commit_ts,
+                commit_lsn: 0,
+            };
+            self.append(key, rel, route, |enc| {
+                enc.append_routed(&committed, &route.mapping, op, leaf)
+            })?;
+            rows += 1;
+        }
+        Ok(rows)
+    }
+
+    /// [`Self::push_cells`] reading tuple images in place
+    pub fn push_views(
+        &mut self,
+        key: K,
+        rel: &Arc<RelDescriptor>,
+        route: &Arc<RouteSnapshot>,
+        change: ViewChange<'_, '_>,
+        commit_ts: i64,
+    ) -> std::result::Result<usize, EmitterError> {
+        if route.drops_deletes() && change.op == HeapOp::Delete {
+            return Ok(0);
+        }
+        let leaf = route.partition.as_ref().map(|p| p.leaf);
+        let stamp = |source_lsn, op_code| RowStamp {
+            source_lsn,
+            xid: change.xid,
+            commit_ts,
+            op_code,
+            leaf,
+        };
+        let mut rows = 0;
+        if !route.drops_deletes()
+            && let (Some(old), Some(new)) = (change.old, change.new)
+            && key_moved(rel, &change, old, new)
+        {
+            let stamp = stamp(change.source_lsn - 1, OP_DELETE);
+            self.append(key, rel, route, |enc| {
+                enc.append_view(rel, &old.datums, change.old_patch, &stamp)
+            })?;
+            rows += 1;
+        }
+        let (side, patch) = match change.op {
+            HeapOp::Delete => (change.old, change.old_patch),
+            _ => (change.new, change.new_patch),
+        };
+        let stamp = stamp(change.source_lsn, op_code(change.op)?);
+        let datums = side.map_or(&[][..], |t| &t.datums);
+        self.append(key, rel, route, |enc| {
+            enc.append_view(rel, datums, patch, &stamp)
+        })?;
+        Ok(rows + 1)
+    }
+
+    fn take_chunk(&mut self, i: usize) -> std::result::Result<(K, EncodedChunk), EmitterError> {
+        let o = &mut self.open[i];
+        let (buffers, rows) = o.enc.take_block()?;
+        let chunk = EncodedChunk {
+            rel: o.rel.clone(),
+            route: o.route.clone(),
+            buffers,
+            rows,
+        };
+        Ok((o.key, chunk))
+    }
+
+    /// Seal the open segment's chunks, early-sealed ones first
+    pub fn take(&mut self) -> std::result::Result<Vec<(K, EncodedChunk)>, EmitterError> {
+        let mut chunks = std::mem::take(&mut self.sealed);
+        for i in 0..self.open.len() {
+            if self.open[i].enc.rows > 0 {
+                chunks.push(self.take_chunk(i)?);
+            }
+        }
+        self.rows = 0;
+        Ok(chunks)
+    }
+
+    /// Park open encoders, emptied by [`Self::take`], so later keys start
+    /// fresh. A control entry may change routes, and the cache matches
+    /// route identity
+    pub fn clear(&mut self) {
+        debug_assert_eq!(self.rows, 0, "clear after take");
+        for o in self.open.drain(..) {
+            self.encoders.put(o.rel, o.route, o.enc);
+        }
+    }
+
+    /// Emptied encoders for the next builder
+    pub fn into_encoders(mut self) -> EncoderCache {
+        self.clear();
+        self.encoders
+    }
+}
+
 /// Streams one transaction's validated rows into column chunks, in memory
 /// or on disk, while accumulating the bounded plan header. Dropped unsealed
 /// (any planning error), the file unlinks and nothing replays
@@ -218,7 +431,6 @@ pub struct PlanWriter {
     cap: u64,
     /// Resident chunk bytes while in memory, file bytes once spilled
     bytes: u64,
-    alloc: Allocator,
     tables: Vec<PlanTable>,
     /// Tables since the last control entry, which may change routes
     live_from: usize,
@@ -228,14 +440,8 @@ pub struct PlanWriter {
     /// Arc in `tables` keeps each pointer live and unique. Built once a
     /// second live table appears, so single-relation plans never hash
     table_ids: Option<HashMap<(usize, u64), u32>>,
-    open: Vec<OpenTable>,
-    encoders: EncoderCache,
-    /// Chunks of the open segment sealed early at an oracle frame limit
-    sealed: Vec<(u32, EncodedChunk)>,
+    chunks: ChunkBuilder<u32>,
     commit_ts: i64,
-    open_rows: usize,
-    segment_rows: usize,
-    segment_bytes: usize,
     steps: Vec<Step>,
     row_batches: Vec<ToastRowBatch>,
     routed_rows: u64,
@@ -253,18 +459,12 @@ impl PlanWriter {
             mem_max,
             cap,
             bytes: 4,
-            alloc: Allocator::global(&mimalloc::MiMalloc),
             tables: Vec::new(),
             live_from: 0,
             last_table: 0,
             table_ids: None,
-            open: Vec::new(),
-            encoders: EncoderCache::default(),
-            sealed: Vec::new(),
+            chunks: ChunkBuilder::new(usize::MAX, usize::MAX),
             commit_ts: 0,
-            open_rows: 0,
-            segment_rows: usize::MAX,
-            segment_bytes: usize::MAX,
             steps: Vec::new(),
             row_batches: Vec::new(),
             routed_rows: 0,
@@ -275,8 +475,8 @@ impl PlanWriter {
 
     /// Seal a segment once its open rows or bytes reach these
     pub fn with_segment_limits(mut self, rows: usize, bytes: usize) -> Self {
-        self.segment_rows = rows.max(1);
-        self.segment_bytes = bytes.max(1);
+        self.chunks.segment_rows = rows.max(1);
+        self.chunks.segment_bytes = bytes.max(1);
         self
     }
 
@@ -288,7 +488,7 @@ impl PlanWriter {
 
     /// Reuse encoders an earlier plan returned through [`Self::seal_keeping`]
     pub fn with_encoders(mut self, encoders: EncoderCache) -> Self {
-        self.encoders = encoders;
+        self.chunks.encoders = encoders;
         self
     }
 
@@ -347,138 +547,44 @@ impl PlanWriter {
         self.tables[table as usize].heaps += rows;
     }
 
-    /// Encode one owned row change: drop deletes an append-only route has
-    /// nowhere to land, render PostGIS cells, split key changes into a
-    /// delete marker plus the new row
-    pub fn push_cells(&mut self, mut decoded: DecodedHeap, table: u32) -> Result<()> {
+    /// Encode one owned row change, see [`ChunkBuilder::push_cells`]
+    pub fn push_cells(&mut self, decoded: DecodedHeap, table: u32) -> Result<()> {
         let t = &mut self.tables[table as usize];
         t.heaps += 1;
-        let (rel, route) = (t.descriptor.clone(), t.route.clone().expect("routed table"));
-        if route.drops_deletes() && decoded.op == HeapOp::Delete {
-            self.deletes_discarded += 1;
-            return Ok(());
-        }
-        for t in [decoded.new.as_mut(), decoded.old.as_mut()]
-            .into_iter()
-            .flatten()
-        {
-            crate::ops::oracle::render_ext_columns(&rel.attributes, &mut t.columns);
-        }
-        let tomb = (!route.drops_deletes())
-            .then(|| take_key_change_tombstone(&mut decoded, &rel))
-            .flatten();
-        let leaf = route.partition.as_ref().map(|p| p.leaf);
-        for decoded in tomb.into_iter().chain([decoded]) {
-            let op = op_code(decoded.op)?;
-            let committed = crate::decode::heap_decoder::CommittedTuple {
-                decoded,
-                commit_ts: self.commit_ts,
-                commit_lsn: 0,
-            };
-            self.append(table, |enc| {
-                enc.append_routed(&committed, &route.mapping, op, leaf)
-            })?;
-        }
-        Ok(())
+        let route = t.route.as_ref().expect("routed table");
+        let rows = self
+            .chunks
+            .push_cells(table, &t.descriptor, route, decoded, self.commit_ts)?;
+        self.pushed(rows)
     }
 
     /// [`Self::push_cells`] reading tuple images in place
     pub fn push_views(&mut self, change: ViewChange<'_, '_>, table: u32) -> Result<()> {
         let t = &mut self.tables[table as usize];
         t.heaps += 1;
-        let (rel, route) = (t.descriptor.clone(), t.route.clone().expect("routed table"));
-        if route.drops_deletes() && change.op == HeapOp::Delete {
-            self.deletes_discarded += 1;
-            return Ok(());
-        }
-        let leaf = route.partition.as_ref().map(|p| p.leaf);
-        let commit_ts = self.commit_ts;
-        let stamp = |source_lsn, op_code| RowStamp {
-            source_lsn,
-            xid: change.xid,
-            commit_ts,
-            op_code,
-            leaf,
-        };
-        if !route.drops_deletes()
-            && let (Some(old), Some(new)) = (change.old, change.new)
-            && key_moved(&rel, change.op, old, new)
-        {
-            let stamp = stamp(change.source_lsn - 1, OP_DELETE);
-            self.append(table, |enc| enc.append_view(&rel, &old.datums, &stamp))?;
-        }
-        let side = match change.op {
-            HeapOp::Delete => change.old,
-            _ => change.new,
-        };
-        let stamp = stamp(change.source_lsn, op_code(change.op)?);
-        let datums = side.map_or(&[][..], |t| &t.datums);
-        self.append(table, |enc| enc.append_view(&rel, datums, &stamp))
+        let route = t.route.as_ref().expect("routed table");
+        let rows = self
+            .chunks
+            .push_views(table, &t.descriptor, route, change, self.commit_ts)?;
+        self.pushed(rows)
     }
 
-    /// Encode into `table`'s open chunk, sealing it first when an oracle
-    /// frame fills
-    fn append(
-        &mut self,
-        table: u32,
-        mut row: impl FnMut(&mut TableEncoder) -> std::result::Result<Append, EmitterError>,
-    ) -> Result<()> {
-        let i = match self.open.iter().position(|o| o.table == table) {
-            Some(i) => i,
-            None => {
-                let t = &self.tables[table as usize];
-                let route = t.route.as_ref().expect("routed table");
-                let enc = match self.encoders.take(&t.descriptor, route) {
-                    Some(enc) => enc,
-                    None => {
-                        TableEncoder::new(TablePlan::for_route(self.alloc, &t.descriptor, route)?)?
-                    }
-                };
-                self.open.push(OpenTable { table, enc });
-                self.open.len() - 1
-            }
-        };
-        if row(&mut self.open[i].enc)? == Append::Full {
-            let chunk = self.take_chunk(i)?;
-            self.sealed.push(chunk);
-            row(&mut self.open[i].enc)?;
+    /// Count `rows` just encoded, none for a dropped delete, and seal a due
+    /// segment
+    fn pushed(&mut self, rows: usize) -> Result<()> {
+        if rows == 0 {
+            self.deletes_discarded += 1;
         }
-        self.open_rows += 1;
-        self.routed_rows += 1;
-        let open_bytes = self.open.iter().map(|o| o.enc.approx_bytes).sum::<usize>()
-            + self
-                .sealed
-                .iter()
-                .map(|(_, c)| c.allocated_bytes())
-                .sum::<usize>();
-        if self.open_rows >= self.segment_rows || open_bytes >= self.segment_bytes {
+        self.routed_rows += rows as u64;
+        if self.chunks.due() {
             self.seal_segment()?;
         }
         Ok(())
     }
 
-    fn take_chunk(&mut self, i: usize) -> Result<(u32, EncodedChunk)> {
-        let o = &mut self.open[i];
-        let t = &self.tables[o.table as usize];
-        let (buffers, rows) = o.enc.take_block()?;
-        let chunk = EncodedChunk {
-            rel: t.descriptor.clone(),
-            route: t.route.clone().expect("routed table"),
-            buffers,
-            rows,
-        };
-        Ok((o.table, chunk))
-    }
-
     /// Close the open segment into a step, spilling once memory runs out
     fn seal_segment(&mut self) -> Result<()> {
-        let mut chunks = std::mem::take(&mut self.sealed);
-        for i in 0..self.open.len() {
-            if self.open[i].enc.rows > 0 {
-                chunks.push(self.take_chunk(i)?);
-            }
-        }
-        self.open_rows = 0;
+        let chunks = self.chunks.take()?;
         if chunks.is_empty() {
             return Ok(());
         }
@@ -572,7 +678,7 @@ impl PlanWriter {
     /// mirror-row position it fences
     pub fn push_control(&mut self, event: DrainEntry, row_idx: usize) -> Result<()> {
         self.seal_segment()?;
-        self.open.clear();
+        self.chunks.clear();
         self.live_from = self.tables.len();
         self.table_ids = None;
         self.steps.push(Step::Control { event, row_idx });
@@ -601,12 +707,7 @@ impl PlanWriter {
         commit_ts: i64,
     ) -> Result<(SealedPlan, EncoderCache)> {
         self.seal_segment()?;
-        let mut encoders = std::mem::take(&mut self.encoders);
-        for o in self.open.drain(..) {
-            let t = &self.tables[o.table as usize];
-            let route = t.route.clone().expect("routed table");
-            encoders.put(t.descriptor.clone(), route, o.enc);
-        }
+        let encoders = self.chunks.into_encoders();
         let file = match self.file.take() {
             None => None,
             Some((mut out, file)) => {
@@ -629,7 +730,9 @@ impl PlanWriter {
     }
 }
 
-/// One row change read from tuple images in place
+/// One row change read from tuple images in place. Patches replace image
+/// attributes by index: resolved TOAST values, and values past the
+/// descriptor's attributes
 #[derive(Clone, Copy)]
 pub struct ViewChange<'v, 'a> {
     pub op: HeapOp,
@@ -637,18 +740,41 @@ pub struct ViewChange<'v, 'a> {
     pub source_lsn: u64,
     pub new: Option<&'v TupleView<'a>>,
     pub old: Option<&'v TupleView<'a>>,
+    pub new_patch: &'v [(usize, ColumnValue)],
+    pub old_patch: &'v [(usize, ColumnValue)],
 }
 
 /// [`take_key_change_tombstone`]'s test over tuple images in place
-fn key_moved(rel: &RelDescriptor, op: HeapOp, old: &TupleView<'_>, new: &TupleView<'_>) -> bool {
-    let hot = match op {
+fn key_moved(
+    rel: &RelDescriptor,
+    change: &ViewChange<'_, '_>,
+    old: &TupleView<'_>,
+    new: &TupleView<'_>,
+) -> bool {
+    let hot = match change.op {
         HeapOp::Update => false,
         HeapOp::HotUpdate => true,
         _ => return false,
     };
-    let differs = |a: usize| match (old.datums.get(a), new.datums.get(a), rel.attributes.get(a)) {
-        (Some(&o), Some(&n), Some(att)) => datums_differ(att, o, n),
-        _ => false,
+    let patched = |patch: &[(usize, ColumnValue)], a: usize| {
+        patch.iter().find(|(i, _)| *i == a).map(|(_, v)| v.clone())
+    };
+    let differs = |a: usize| {
+        let (Some(&o), Some(&n), Some(att)) =
+            (old.datums.get(a), new.datums.get(a), rel.attributes.get(a))
+        else {
+            return false;
+        };
+        match (patched(change.old_patch, a), patched(change.new_patch, a)) {
+            (None, None) => datums_differ(att, o, n),
+            (po, pn) => values_differ(
+                att,
+                [
+                    po.or_else(|| datum_value(att, o)),
+                    pn.or_else(|| datum_value(att, n)),
+                ],
+            ),
+        }
     };
     let keys = crate::schema::replident_key_attnums(rel);
     if keys.is_empty() {
@@ -675,19 +801,24 @@ fn datums_differ(att: &crate::schema::RelAttr, o: DatumRef<'_>, n: DatumRef<'_>)
         }
         (DatumRef::Varlena(a), DatumRef::Varlena(b)) if a == b => false,
         (DatumRef::Null | DatumRef::Dropped, DatumRef::Null | DatumRef::Dropped) => false,
-        _ => {
-            let mut values = [o, n].map(|d| datum_value(att, d));
-            if !att.dropped && matches!(att.type_name.as_str(), "geography" | "geometry") {
-                for v in values.iter_mut().flatten() {
-                    crate::ops::oracle::render_ext_value(v);
-                }
-            }
-            values[0] != values[1]
-        }
+        _ => values_differ(att, [o, n].map(|d| datum_value(att, d))),
     }
 }
 
-fn op_code(op: HeapOp) -> std::result::Result<i8, EmitterError> {
+/// Owned cells compared after PostGIS render; absent never differs
+fn values_differ(att: &crate::schema::RelAttr, mut values: [Option<ColumnValue>; 2]) -> bool {
+    if values.iter().any(Option::is_none) {
+        return false;
+    }
+    if !att.dropped && matches!(att.type_name.as_str(), "geography" | "geometry") {
+        for v in values.iter_mut().flatten() {
+            crate::ops::oracle::render_ext_value(v);
+        }
+    }
+    values[0] != values[1]
+}
+
+pub(crate) fn op_code(op: HeapOp) -> std::result::Result<i8, EmitterError> {
     Ok(match op {
         HeapOp::Insert => OP_INSERT,
         HeapOp::Update | HeapOp::HotUpdate => OP_UPDATE,
@@ -1202,7 +1333,7 @@ mod tests {
         for (i, route) in routes.into_iter().enumerate() {
             let mut w = PlanWriter::create(tmp.path().join(format!("{i}.plan")), 1 << 20, 1 << 20)
                 .with_encoders(encoders);
-            let cached = w.encoders.entries.len();
+            let cached = w.chunks.encoders.entries.len();
             push(
                 &mut w,
                 &d,
@@ -1210,7 +1341,7 @@ mod tests {
                 Some(route.clone()),
             )
             .unwrap();
-            let reused = cached - w.encoders.entries.len();
+            let reused = cached - w.chunks.encoders.entries.len();
             assert_eq!((cached, reused), [(0, 0), (1, 1), (1, 0)][i]);
             let plan;
             (plan, encoders) = w.seal_keeping(0x2000, 42).unwrap();

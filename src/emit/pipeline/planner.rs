@@ -39,8 +39,7 @@
 
 use std::sync::Arc;
 
-use crate::decode::datum::DatumRef;
-use crate::decode::heap_decoder::view_heap_record;
+use crate::decode::heap_decoder::{ColumnValue, view_heap_record};
 use crate::emit::pipeline::plan_spool::{
     DEFAULT_PLAN_MEM_MAX, EncoderCache, PlanPath, PlanSpoolError, PlanWriter, SealedPlan,
     ViewChange,
@@ -48,10 +47,10 @@ use crate::emit::pipeline::plan_spool::{
 use crate::emit::route::RouteSnapshot;
 use crate::schema::RelDescriptor;
 use crate::toast::{ChunkRefMap, ToastResolver};
-use crate::xact::spill::DescribedInput;
+use crate::xact::spill::{BodySpoolFile, DescribedInput};
 use crate::xact::xact_buffer::{
     DrainEntry, DrainHeap, DrainWalk, DrainedBatch, FailClosedReason, WalkStep, XactBufferError,
-    detoast_heap, heap_reads_toast,
+    detoast_heap, detoast_sites, external_sites, heap_reads_toast,
 };
 
 /// Planner's window onto route state. Implementations resolve from frozen
@@ -212,28 +211,24 @@ impl<'a, V: PlanRouteView> Planner<'a, V> {
                         self.writer.discard(table, drained.rows() as u64);
                         continue;
                     }
-                    let drained = match drained {
+                    let mut heap = match drained {
                         DrainHeap::Input(input) => {
-                            if self.plan_views(&input, &rel, table)? {
-                                continue;
-                            }
-                            DrainHeap::Input(input)
-                        }
-                        cells => cells,
-                    };
-                    for mut heap in drained.into_cells()? {
-                        if heap.decoded.new.as_ref().is_some_and(|t| t.partial) {
-                            return Err(PlanError::PartialUpdate {
-                                lsn: heap.decoded.source_lsn,
-                            });
-                        }
-                        if heap_reads_toast(&heap) {
-                            // Value permit drops once bytes land in the plan
-                            Box::pin(detoast_heap(&mut heap, spool, &ref_maps, self.resolver))
+                            Box::pin(self.plan_views(&input, &rel, table, spool, &ref_maps))
                                 .await?;
+                            continue;
                         }
-                        self.writer.push_cells(heap.decoded, table)?;
+                        DrainHeap::Cells(heap) => heap,
+                    };
+                    if heap.decoded.new.as_ref().is_some_and(|t| t.partial) {
+                        return Err(PlanError::PartialUpdate {
+                            lsn: heap.decoded.source_lsn,
+                        });
                     }
+                    if heap_reads_toast(&heap) {
+                        // Value permit drops once bytes land in the plan
+                        Box::pin(detoast_heap(&mut heap, spool, &ref_maps, self.resolver)).await?;
+                    }
+                    self.writer.push_cells(heap.decoded, table)?;
                 }
             }
         }
@@ -242,14 +237,16 @@ impl<'a, V: PlanRouteView> Planner<'a, V> {
         Ok(())
     }
 
-    /// Encode an input from tuple images in place; `false` when an image
-    /// holds external values, which only owned cells detoast
-    fn plan_views(
+    /// Encode an input from tuple images in place, external values resolved
+    /// into per-image patches
+    async fn plan_views(
         &mut self,
         input: &DescribedInput,
         rel: &Arc<RelDescriptor>,
         table: u32,
-    ) -> Result<bool, PlanError> {
+        spool: Option<&BodySpoolFile>,
+        ref_maps: &[&ChunkRefMap],
+    ) -> Result<(), PlanError> {
         let images = view_heap_record(input.input.record_bytes(), rel).map_err(|e| {
             XactBufferError::OrdinaryFailClosed {
                 relid: rel.oid,
@@ -259,20 +256,23 @@ impl<'a, V: PlanRouteView> Planner<'a, V> {
                 reason: FailClosedReason::Malformed(e.to_string()),
             }
         })?;
-        let external = images.iter().any(|h| {
-            [&h.new, &h.old]
-                .into_iter()
-                .flatten()
-                .any(|t| t.datums.iter().any(|d| matches!(d, DatumRef::External(_))))
-        });
-        if external {
-            return Ok(false);
-        }
         for h in &images {
             if h.new.as_ref().is_some_and(|t| t.partial) {
                 return Err(PlanError::PartialUpdate {
                     lsn: input.input.source_lsn,
                 });
+            }
+            let mut patches: [Vec<(usize, ColumnValue)>; 2] = Default::default();
+            let sites = external_sites([h.new.as_ref(), h.old.as_ref()]);
+            if !sites.is_empty() {
+                let db = rel.rfn.db_node;
+                let lsn = input.input.source_lsn;
+                // Value permit drops once bytes land in the plan
+                let (values, _permit) =
+                    detoast_sites(&sites, rel, db, lsn, spool, ref_maps, self.resolver).await?;
+                for (site, v) in sites.iter().zip(values) {
+                    patches[site.image].push((site.idx, v));
+                }
             }
             let change = ViewChange {
                 op: h.op,
@@ -280,10 +280,12 @@ impl<'a, V: PlanRouteView> Planner<'a, V> {
                 source_lsn: input.input.source_lsn,
                 new: h.new.as_ref(),
                 old: h.old.as_ref(),
+                new_patch: &patches[0],
+                old_patch: &patches[1],
             };
             self.writer.push_views(change, table)?;
         }
-        Ok(true)
+        Ok(())
     }
 
     /// Freeze the validated plan for the executor

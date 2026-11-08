@@ -77,6 +77,7 @@ use crate::xact::spill::{
     SpillReader, SpillStore, SpillWriter, ToastChunk, ToastDelete,
 };
 use foldhash::{HashMap, HashMapExt};
+#[cfg(any(test, feature = "test-support"))]
 use smallvec::SmallVec;
 
 use std::pin::Pin;
@@ -208,6 +209,7 @@ impl DrainHeap {
         }
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     /// Owned cells per tuple, through the cell adapter
     pub fn into_cells(self) -> std::result::Result<SmallVec<[DescribedHeap; 1]>, XactBufferError> {
         match self {
@@ -225,6 +227,7 @@ fn entry_rows(e: &SpillEntry) -> usize {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 /// Cells for every tuple of a buffered input, under its pinned descriptor.
 /// Record-time scan validated the bytes, so failure means corrupt storage
 fn input_heaps(
@@ -2351,6 +2354,7 @@ pub struct DrainedBatch {
 }
 
 impl DrainedBatch {
+    #[cfg(any(test, feature = "test-support"))]
     /// Owned cells of every row change, inputs decoded through the cell
     /// adapter
     pub fn cells(&self) -> std::result::Result<Vec<DescribedHeap>, XactBufferError> {
@@ -2570,13 +2574,74 @@ impl CommittedDrain {
     }
 }
 
-/// Returns the leaf permit shrunk to the decoded bytes retained in the
-/// heap's tuples; the caller rides it with the routed row to insert ack
-/// so decoded values (and their encoder slab copy) stay covered past
-/// this call. `None` without budget or external values.
-/// Pub for the planner, gap replay, and tests.
+/// External value of one tuple image attribute
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ToastSite {
+    /// Caller's image index
+    pub image: usize,
+    /// Attribute index, attnum - 1
+    pub idx: usize,
+    pub p: ToastPointer,
+}
+
+/// Resolve owned cells' external values in place, see [`detoast_sites`].
+/// Pub for the planner, gap replay, and tests
 pub async fn detoast_heap(
     heap: &mut DescribedHeap,
+    spool: Option<&BodySpoolFile>,
+    chunk_maps: &[&ChunkRefMap],
+    resolver: &ToastResolver,
+) -> std::result::Result<Option<crate::budget::MemoryPermit>, XactBufferError> {
+    let mut images = [heap.decoded.new.as_mut(), heap.decoded.old.as_mut()];
+    let sites: Vec<ToastSite> = images
+        .iter()
+        .enumerate()
+        .flat_map(|(image, t)| {
+            t.iter().flat_map(move |t| {
+                t.columns
+                    .iter()
+                    .enumerate()
+                    .filter_map(move |(idx, c)| match c {
+                        Some(ColumnValue::ExternalToast(p)) => {
+                            Some(ToastSite { image, idx, p: *p })
+                        }
+                        _ => None,
+                    })
+            })
+        })
+        .collect();
+    let lsn = heap.decoded.source_lsn;
+    let db = heap.decoded.rfn.db_node;
+    let (values, permit) = detoast_sites(
+        &sites,
+        &heap.descriptor,
+        db,
+        lsn,
+        spool,
+        chunk_maps,
+        resolver,
+    )
+    .await?;
+    for (site, value) in sites.iter().zip(values) {
+        if let Some(t) = images[site.image].as_mut() {
+            t.columns[site.idx] = Some(value);
+        }
+    }
+    Ok(permit)
+}
+
+/// Resolve every site of one heap change's images, values aligned with
+/// `sites`. Returns the leaf permit shrunk to the decoded bytes retained;
+/// the caller rides it with the routed row to insert ack so decoded values
+/// (and their encoder slab copy) stay covered past this call. `None`
+/// without budget or external values
+pub async fn detoast_sites(
+    sites: &[ToastSite],
+    // Attached at decode: same descriptor interpretation from decode to
+    // detoast regardless of captures landing in between
+    rel: &RelDescriptor,
+    db: u32,
+    lsn: u64,
     // Xact body spool backing `File` refs; None while memory-resident
     spool: Option<&BodySpoolFile>,
     // Ref-map generations, oldest first; a value lives in exactly one
@@ -2584,25 +2649,26 @@ pub async fn detoast_heap(
     // parallel path)
     chunk_maps: &[&ChunkRefMap],
     resolver: &ToastResolver,
-) -> std::result::Result<Option<crate::budget::MemoryPermit>, XactBufferError> {
-    // Attached at decode: same descriptor interpretation from decode to
-    // detoast regardless of captures landing in between
-    let rel = heap.descriptor.clone();
-    let db = heap.decoded.rfn.db_node;
+) -> std::result::Result<(Vec<ColumnValue>, Option<crate::budget::MemoryPermit>), XactBufferError> {
+    let type_oid = |site: &ToastSite| rel.attributes.get(site.idx).map_or(0, |a| a.type_oid);
     // Transfer speculative values before admitting foreground resolution
-    let lsn = heap.decoded.source_lsn;
     let mut ahead = None;
-    for t in [heap.decoded.new.as_mut(), heap.decoded.old.as_mut()]
-        .into_iter()
-        .flatten()
-    {
-        resolver.fill_ahead(db, t, &rel, lsn, &mut ahead).await;
+    let mut values: Vec<Option<ColumnValue>> = Vec::with_capacity(sites.len());
+    for site in sites {
+        values.push(
+            resolver
+                .take_ahead(db, &site.p, type_oid(site), lsn, &mut ahead)
+                .await,
+        );
     }
-    let mut pointers: Vec<ToastPointer> = Vec::new();
-    collect_toast_pointers(heap.decoded.new.as_ref(), &mut pointers);
-    collect_toast_pointers(heap.decoded.old.as_ref(), &mut pointers);
+    let mut pointers: Vec<ToastPointer> = sites
+        .iter()
+        .zip(&values)
+        .filter(|(_, v)| v.is_none())
+        .map(|(site, _)| site.p)
+        .collect();
     if pointers.is_empty() {
-        return Ok(ahead);
+        return Ok((values.into_iter().flatten().collect(), ahead));
     }
     let leaf_need = check_value_caps(
         pointers.iter().copied(),
@@ -2628,19 +2694,36 @@ pub async fn detoast_heap(
         cache,
         retained: 0,
     };
-    if let Some(t) = heap.decoded.new.as_mut() {
-        res.resolve_tuple(t, &rel)?;
-    }
-    if let Some(t) = heap.decoded.old.as_mut() {
-        res.resolve_tuple(t, &rel)?;
-    }
+    let values = sites
+        .iter()
+        .zip(values)
+        .map(|(site, v)| match v {
+            Some(v) => Ok(v),
+            None => res.resolve(&site.p, type_oid(site)),
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()?;
     if let Some(p) = leaf.as_mut() {
         p.shrink(res.retained as u64);
     }
     if let Some(ahead) = ahead {
         crate::budget::absorb_into(&mut leaf, ahead);
     }
-    Ok(leaf)
+    Ok((values, leaf))
+}
+
+/// External datums of tuple images, image index by position in `images`
+pub fn external_sites<'v, 'a: 'v>(
+    images: impl IntoIterator<Item = Option<&'v TupleView<'a>>>,
+) -> Vec<ToastSite> {
+    let mut sites = Vec::new();
+    for (image, t) in images.into_iter().enumerate() {
+        for (idx, d) in t.iter().flat_map(|t| t.datums.iter().enumerate()) {
+            if let DatumRef::External(p) = *d {
+                sites.push(ToastSite { image, idx, p });
+            }
+        }
+    }
+    sites
 }
 
 /// Whether [`detoast_heap`] resolves anything, ie whether it reads the
@@ -2652,22 +2735,6 @@ pub fn heap_reads_toast(heap: &DescribedHeap) -> bool {
         .flatten()
         .flat_map(|t| t.columns.iter())
         .any(|c| matches!(c, Some(ColumnValue::ExternalToast(_))))
-}
-
-/// Append every on-disk toast pointer; carries `va_extinfo`/`va_rawsize`
-/// so store fetch can cap allocation
-fn collect_toast_pointers(
-    t: Option<&crate::decode::heap_decoder::DecodedTuple>,
-    out: &mut Vec<ToastPointer>,
-) {
-    let Some(t) = t else {
-        return;
-    };
-    for c in &t.columns {
-        if let Some(ColumnValue::ExternalToast(p)) = c {
-            out.push(*p);
-        }
-    }
 }
 
 /// Fetch every pointer the xact's chunk maps can't cover in one round
@@ -2829,61 +2896,52 @@ struct ValueResolution<'a> {
 }
 
 impl ValueResolution<'_> {
-    fn resolve_tuple(
+    fn resolve(
         &mut self,
-        t: &mut crate::decode::heap_decoder::DecodedTuple,
-        rel: &RelDescriptor,
-    ) -> std::result::Result<(), XactBufferError> {
-        for (idx, col) in t.columns.iter_mut().enumerate() {
-            let Some(ColumnValue::ExternalToast(p)) = col else {
-                continue;
-            };
-            // `ToastPointer: Copy` frees the borrow on `col` before reassign
-            let p: ToastPointer = *p;
-            if self.resolver.fill_oversize(col, &p) {
-                continue;
-            }
-            let type_oid = rel.attributes.get(idx).map(|a| a.type_oid).unwrap_or(0);
-            let key = (p.va_toastrelid, p.va_valueid);
-            if let Some(v) = self.xact_maps.iter().find_map(|m| m.get(&key))
-                && !observed_mid_value(v)
-            {
-                match reassemble_value_ref(&p, self.spool, v)? {
-                    Reassembled::Bytes(raw) => {
-                        let (value, held) = detoasted_sized(raw, type_oid);
-                        self.retained += held;
-                        *col = Some(value);
-                    }
-                    // Disabled mode: surface the unresolvable value as
-                    // NULL/default downstream (`append_default`), counted,
-                    // never an error.
-                    Reassembled::Missing if self.resolver.fill_on_miss() => {
-                        self.resolver.note_filled_default();
-                        *col = Some(ColumnValue::Null);
-                    }
-                    // In-xact chunks gapped or short: decode bug, surfaced loud
-                    outcome => {
-                        self.resolver.note_fetch_miss();
-                        return Err(match outcome {
-                            Reassembled::SizeMismatch { got, want } => {
-                                XactBufferError::Detoast(format!(
-                                    "toast value {}/{}: chunks sum to {got} bytes, pointer says {want}",
-                                    p.va_toastrelid, p.va_valueid
-                                ))
-                            }
-                            _ => XactBufferError::MissingToastChunk {
-                                toast_relid: p.va_toastrelid,
-                                value_id: p.va_valueid,
-                                missing: first_missing_seq_ref(v),
-                            },
-                        });
-                    }
-                }
-                continue;
-            }
-            *col = Some(self.resolve_store(&p, type_oid)?);
+        p: &ToastPointer,
+        type_oid: u32,
+    ) -> std::result::Result<ColumnValue, XactBufferError> {
+        if self.resolver.fills_oversize(p) {
+            return Ok(ColumnValue::Null);
         }
-        Ok(())
+        let key = (p.va_toastrelid, p.va_valueid);
+        let Some(v) = self
+            .xact_maps
+            .iter()
+            .find_map(|m| m.get(&key))
+            .filter(|v| !observed_mid_value(v))
+        else {
+            return self.resolve_store(p, type_oid);
+        };
+        match reassemble_value_ref(p, self.spool, v)? {
+            Reassembled::Bytes(raw) => {
+                let (value, held) = detoasted_sized(raw, type_oid);
+                self.retained += held;
+                Ok(value)
+            }
+            // Disabled mode: surface the unresolvable value as
+            // NULL/default downstream (`append_default`), counted,
+            // never an error.
+            Reassembled::Missing if self.resolver.fill_on_miss() => {
+                self.resolver.note_filled_default();
+                Ok(ColumnValue::Null)
+            }
+            // In-xact chunks gapped or short: decode bug, surfaced loud
+            outcome => {
+                self.resolver.note_fetch_miss();
+                Err(match outcome {
+                    Reassembled::SizeMismatch { got, want } => XactBufferError::Detoast(format!(
+                        "toast value {}/{}: chunks sum to {got} bytes, pointer says {want}",
+                        p.va_toastrelid, p.va_valueid
+                    )),
+                    _ => XactBufferError::MissingToastChunk {
+                        toast_relid: p.va_toastrelid,
+                        value_id: p.va_valueid,
+                        missing: first_missing_seq_ref(v),
+                    },
+                })
+            }
+        }
     }
 
     /// Pre-window / bootstrap value whose chunks aren't in this xact,
@@ -3738,15 +3796,15 @@ fn decode_image_insert(
             "stashed image insert: no LP_NORMAL tuple at ({blkno},{offnum})"
         )));
     };
-    let Some((_, _, _, mut columns)) =
-        crate::backfill::backup_page_walk::decode_on_page_tuple(tuple, rel)
-    else {
+    let Some((_, data)) = crate::backfill::backup_page_walk::on_page_tuple(tuple, rel) else {
         return Err(XactBufferError::Detoast(format!(
             "stashed image insert: malformed tuple at ({blkno},{offnum})"
         )));
     };
+    let view = crate::decode::heap_decoder::view_block_data(data, rel)
+        .map_err(|e| XactBufferError::Detoast(format!("stashed image insert: {e}")))?;
     let Some((value_id, chunk_seq, chunk_data)) =
-        crate::decode::heap_decoder::take_toast_chunk_columns(&mut columns)
+        crate::decode::heap_decoder::toast_chunk_datums(&view.datums)
     else {
         tracing::warn!(
             target: "walshadow::xact_buffer",
@@ -3765,7 +3823,7 @@ fn decode_image_insert(
         source_lsn: raw.source_lsn,
         blkno,
         offnum,
-        chunk_data: bytes::Bytes::from(chunk_data),
+        chunk_data: bytes::Bytes::copy_from_slice(chunk_data),
     })])
 }
 
@@ -4786,6 +4844,23 @@ mod tests {
     }
 
     /// One-key resolution scope with cache pre-seeded to a store outcome
+    impl ValueResolution<'_> {
+        /// Resolve every external cell of `t` in place
+        fn resolve_tuple(
+            &mut self,
+            t: &mut crate::decode::heap_decoder::DecodedTuple,
+            rel: &RelDescriptor,
+        ) -> std::result::Result<(), XactBufferError> {
+            for (idx, col) in t.columns.iter_mut().enumerate() {
+                if let Some(ColumnValue::ExternalToast(p)) = *col {
+                    let type_oid = rel.attributes.get(idx).map_or(0, |a| a.type_oid);
+                    *col = Some(self.resolve(&p, type_oid)?);
+                }
+            }
+            Ok(())
+        }
+    }
+
     fn seeded<'a>(
         resolver: &'a ToastResolver,
         spool: Option<&'a BodySpoolFile>,

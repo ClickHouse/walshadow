@@ -318,9 +318,7 @@ mod tests {
         ColumnValue, CommittedTuple, DecodedHeap, DecodedTuple, HeapOp,
     };
     use crate::emit::ch_emitter::Wire;
-    use crate::emit::pipeline::batcher::{
-        BatcherConfig, BatcherMsg, RoutedRow, RowChunk, RowTable,
-    };
+    use crate::emit::pipeline::batcher::{BatcherConfig, BatcherMsg, PlacedSegment, RowTable};
     use crate::emit::route::RouteSnapshot;
     use crate::mapping::{ColumnMapping, TableMapping, TableTarget};
     use crate::schema::{RelAttr, RelDescriptor, RelName, ReplIdent};
@@ -379,11 +377,10 @@ mod tests {
         RowTable { rel, route }
     }
 
-    fn wkt_row(seq: u64, text: Option<&str>) -> RoutedRow {
-        RoutedRow {
+    fn wkt_row(seq: u64, text: Option<&str>) -> (u64, CommittedTuple) {
+        (
             seq,
-            table: 0,
-            committed: CommittedTuple {
+            CommittedTuple {
                 decoded: DecodedHeap {
                     rfn: RelFileNode {
                         spc_node: 1663,
@@ -402,14 +399,13 @@ mod tests {
                 commit_ts: 0,
                 commit_lsn: (seq + 1) * 100,
             },
-            value_permit: None,
-        }
+        )
     }
 
     /// One batch of the rows, sealed through the real batcher: `InsertBatch`
     /// is only reachable that way, and its cell tags are what the encoder
     /// chose rather than what a test asserted
-    async fn seal(rows: Vec<RoutedRow>) -> InsertBatch {
+    async fn seal(rows: Vec<(u64, CommittedTuple)>) -> InsertBatch {
         let (msg_tx, msg_rx) = mpsc::channel(64);
         let (batches_tx, batches_rx) = async_channel::bounded(64);
         let fatal = Fatal::new();
@@ -427,13 +423,13 @@ mod tests {
             Arc::new(EmitterStats::default()),
             None,
         );
-        let chunk = RowChunk {
-            tables: vec![wkt_table()],
-            rows,
-            permit: None,
-        };
+        let RowTable { rel, route } = wkt_table();
+        let segments = rows
+            .into_iter()
+            .map(|(seq, row)| PlacedSegment::of_rows(seq, &rel, &route, &[row]).unwrap())
+            .collect();
         msg_tx
-            .send(BatcherMsg::Rows(chunk))
+            .send(BatcherMsg::Segments(segments))
             .await
             .expect("send rows");
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -500,7 +496,7 @@ mod tests {
     async fn one_unrendered_cell_keeps_the_column_remote() {
         let mut rows = vec![wkt_row(0, Some("POINT(1 2)"))];
         let mut raw = wkt_row(0, None);
-        raw.committed.decoded.new.as_mut().unwrap().columns[0] = Some(ColumnValue::Unsupported {
+        raw.1.decoded.new.as_mut().unwrap().columns[0] = Some(ColumnValue::Unsupported {
             type_oid: GEOM_OID,
             raw: vec![1, 2, 3],
         });

@@ -61,8 +61,6 @@ checking lifetimes. Treat this as builder organization, not a throughput claim
 
 Keep raw transaction spill unchanged when existing pending-value forms suffice
 Version transaction or deferred-load formats only if their representation changes
-Container encoding need not wait for complete removal of cells from load and
-TOAST paths
 
 Give the walk its own `CodecError` variants for a rejected array header and an
 uncovered element type, so a malformed body is distinguishable from a type the
@@ -74,9 +72,9 @@ Choose encoding from source type, element codec, and target shape together
 Admitting an array OID must not enable local encoding for a `String` override,
 unsupported nested target, or `QBit`. Keep those pairs on oracle until covered
 
-Column-wide admission also affects owned load and TOAST rows. Heap values can
-retain raw bodies in existing pending cells; COPY currently casts containers to
-text. Support that text form or introduce an explicit oracle fallback before
+Column-wide admission also affects resolved TOAST values and COPY rows.
+Resolved values retain raw bodies in existing pending cells; COPY casts
+containers to text. Support that text form or introduce an explicit oracle fallback before
 opening gates. Fast defaults need equivalent handling. An unsupported input
 must not enter a local-only buffer merely because WAL encoding works
 

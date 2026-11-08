@@ -540,7 +540,7 @@ pub async fn resolve_greenfield(
 mod tests {
     use super::*;
     use crate::backfill::backup_page_walk::{
-        PAGE_BYTES, PageWalkSink, make_rel, make_rel_named, synth_single_tuple_page,
+        PAGE_BYTES, PageWalkSink, TupleData, make_rel, make_rel_named, synth_single_tuple_page,
     };
     use crate::backfill::backup_source::testing::expect_tap;
     use crate::backfill::backup_source::{BackupSink, FileMeta, StartInfo};
@@ -573,7 +573,8 @@ mod tests {
             page_lsn: 0,
             blkno: 0,
             offnum: 0,
-            columns: Vec::new(),
+            data: TupleData::Heap(Box::default()),
+            pending: None,
         }
     }
 
@@ -813,7 +814,7 @@ mod tests {
         };
 
         let row = |id| BackfillTuple {
-            columns: vec![Some(ColumnValue::Int4(id))],
+            data: TupleData::from_cells(&[Some(ColumnValue::Int4(id))]),
             ..tuple(100, 0, HEAP_XMIN_COMMITTED)
         };
         let mut tails = Vec::new();
@@ -844,8 +845,11 @@ mod tests {
         for (want_seq, (ack, ack_task, mut msg_rx)) in [3u64, 7].into_iter().zip(tails) {
             let mut seqs = Vec::new();
             while let Some(msg) = msg_rx.recv().await {
-                let BatcherMsg::Rows(c) = msg else { panic!() };
-                seqs.extend(c.rows.iter().map(|r| r.seq));
+                let BatcherMsg::Segments(segments) = msg else {
+                    panic!()
+                };
+                let rows = crate::emit::pipeline::batcher::segment_rows(&segments);
+                seqs.extend(rows.iter().map(|r| r.0));
             }
             assert_eq!(seqs, vec![want_seq; 2], "rows rode their own lane's tail");
             drop(ack);
@@ -962,8 +966,17 @@ mod tests {
                 tees: Vec::new(),
             };
             let row = |value, infomask| BackfillTuple {
-                columns: vec![Some(ColumnValue::Int4(1)), Some(value)],
+                data: TupleData::from_cells(&[Some(ColumnValue::Int4(1)), Some(value)]),
                 ..tuple(100, 0, infomask)
+            };
+            let has_mapped_external = |t: &BackfillTuple| {
+                let cells = t.cells(&desc).unwrap();
+                mapping.columns.iter().any(|c| {
+                    matches!(
+                        cells[c.src_attnum as usize - 1],
+                        Some(ColumnValue::ExternalToast(_))
+                    )
+                })
             };
             let (stats, passed) = run_stream_phase(
                 &catalog,
@@ -976,8 +989,8 @@ mod tests {
             .await;
             assert_eq!(stats.gated, 1);
             assert_eq!(passed.len(), 2);
-            assert!(!passed[0].has_mapped_external(&mapping));
-            assert_eq!(passed[1].has_mapped_external(&mapping), body_mapped);
+            assert!(!has_mapped_external(&passed[0]));
+            assert_eq!(has_mapped_external(&passed[1]), body_mapped);
         }
     }
 

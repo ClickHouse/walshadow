@@ -1431,7 +1431,8 @@ pub(crate) struct ColumnPlan {
     pub(crate) datetime64_scale: i32,
     pub(crate) non_finite: NonFinite,
     pub(crate) encoding: ColumnEncoding,
-    /// Source attribute feeding this column, `None` when descriptor lacks it
+    /// Source attribute feeding this column, `None` when descriptor holds
+    /// it dropped
     pub(crate) source: Option<SourceColumn>,
 }
 
@@ -1790,12 +1791,19 @@ impl TablePlan {
             if plan.encoding != ColumnEncoding::Local && plan.non_finite != NonFinite::default() {
                 return Err(config_err("substitution needs local encoding"));
             }
-            plan.source = att.and_then(|a| {
-                Some(SourceColumn {
-                    index: usize::try_from(c.src_attnum - 1).ok()?,
-                    direct: Direct::choose(a, &plan),
-                })
-            });
+            // Attnums past the descriptor still source patched values
+            plan.source = usize::try_from(c.src_attnum - 1)
+                .ok()
+                .and_then(|index| match att {
+                    Some(a) => Some(SourceColumn {
+                        index,
+                        direct: Direct::choose(a, &plan),
+                    }),
+                    None => (index >= rel.attributes.len()).then_some(SourceColumn {
+                        index,
+                        direct: Direct::Value,
+                    }),
+                });
             columns.push(plan);
             col_sql.push(quote_ident(&c.target_name));
         }
@@ -2406,71 +2414,87 @@ impl TableEncoder {
             op_code,
             leaf,
         };
-        self.append_cells(&cells, &stamp)
+        self.append_cells(|i| cells[i], &stamp)
     }
 
-    /// [`Self::append_routed`] reading one image of `rel` in place. Values
-    /// whose decode allocates, and PostGIS renders, build in row scratch
+    /// [`Self::append_routed`] reading one image of `rel` in place. `patch`
+    /// replaces attributes by index: resolved TOAST values, and values past
+    /// `rel`'s attributes. Values whose decode allocates, and PostGIS
+    /// renders, build in row scratch
     pub(crate) fn append_view(
         &mut self,
         rel: &RelDescriptor,
         datums: &[DatumRef<'_>],
+        patch: &[(usize, ColumnValue)],
         stamp: &RowStamp,
     ) -> Result<Append, EmitterError> {
-        enum Slot<'a> {
-            Cell(Cell<'a>),
-            Owned(usize),
-        }
-        let mut owned: SmallVec<[ColumnValue; 2]> = SmallVec::new();
-        let mut own = |v: ColumnValue| {
-            owned.push(v);
-            Slot::Owned(owned.len() - 1)
-        };
-        let slots: SmallVec<[Slot<'_>; 16]> = self
-            .plan
-            .columns
-            .iter()
-            .map(|c| {
-                let Some((src, &datum)) =
-                    c.source.and_then(|src| Some((src, datums.get(src.index)?)))
-                else {
-                    return Slot::Cell(Cell::Absent);
-                };
-                let att = &rel.attributes[src.index];
-                match (src.direct, datum) {
-                    (Direct::Copy, DatumRef::Fixed(le)) => Slot::Cell(Cell::Le(le)),
-                    (Direct::Wkt, _) => match datum_value(att, datum) {
-                        None => Slot::Cell(Cell::Absent),
-                        Some(mut v) => {
-                            crate::ops::oracle::render_ext_value(&mut v);
-                            own(v)
-                        }
-                    },
-                    _ => match datum_view(att, datum) {
-                        Ok(v) => Slot::Cell(v.map_or(Cell::Absent, Cell::Value)),
-                        Err(_) => {
-                            own(datum_value(att, datum).expect("allocating datum is present"))
-                        }
-                    },
+        let mut row = RowScratch::new(self.plan.columns.len());
+        for c in &self.plan.columns {
+            let Some(src) = c.source else {
+                row.cell(Cell::Absent);
+                continue;
+            };
+            let wkt = src.direct == Direct::Wkt;
+            if let Some((_, v)) = patch.iter().find(|(i, _)| *i == src.index) {
+                if wkt {
+                    let mut v = v.clone();
+                    crate::ops::oracle::render_ext_value(&mut v);
+                    row.own(v);
+                } else {
+                    row.cell(Cell::Value(v.view()));
                 }
-            })
-            .collect();
-        let cells: SmallVec<[Cell<'_>; 16]> = slots
-            .iter()
-            .map(|s| match s {
-                Slot::Cell(c) => *c,
-                Slot::Owned(i) => Cell::Value(owned[*i].view()),
-            })
-            .collect();
-        self.append_cells(&cells, stamp)
+                continue;
+            }
+            let (Some(&datum), Some(att)) = (datums.get(src.index), rel.attributes.get(src.index))
+            else {
+                row.cell(Cell::Absent);
+                continue;
+            };
+            match (src.direct, datum) {
+                (Direct::Copy, DatumRef::Fixed(le)) => row.cell(Cell::Le(le)),
+                (Direct::Wkt, _) => match datum_value(att, datum) {
+                    None => row.cell(Cell::Absent),
+                    Some(mut v) => {
+                        crate::ops::oracle::render_ext_value(&mut v);
+                        row.own(v);
+                    }
+                },
+                _ => match datum_view(att, datum) {
+                    Ok(v) => row.cell(v.map_or(Cell::Absent, Cell::Value)),
+                    Err(_) => {
+                        row.own(datum_value(att, datum).expect("allocating datum is present"))
+                    }
+                },
+            }
+        }
+        self.append_cells(|i| row.get(i), stamp)
     }
 
-    /// Append one row of cells in `plan.columns` order
-    fn append_cells(
+    /// Append one row whose mapped sources `slot` yields; columns without a
+    /// source attribute stay absent
+    pub(crate) fn append_slots<'a>(
         &mut self,
-        cells: &[Cell<'_>],
+        mut slot: impl FnMut(SourceColumn) -> Result<Slot<'a>, EmitterError>,
         stamp: &RowStamp,
     ) -> Result<Append, EmitterError> {
+        let mut row = RowScratch::new(self.plan.columns.len());
+        for c in &self.plan.columns {
+            match c.source.map(&mut slot).transpose()? {
+                None => row.cell(Cell::Absent),
+                Some(Slot::Cell(cell)) => row.cell(cell),
+                Some(Slot::Owned(v)) => row.own(v),
+            }
+        }
+        self.append_cells(|i| row.get(i), stamp)
+    }
+
+    /// Append one row, `cell(i)` yielding `plan.columns[i]`'s cell
+    fn append_cells<'c>(
+        &mut self,
+        cell: impl Fn(usize) -> Cell<'c>,
+        stamp: &RowStamp,
+    ) -> Result<Append, EmitterError> {
+        let columns = self.plan.columns.len();
         // Size oracle cells before mutating column buffers
         let mut oracle = std::mem::take(&mut self.oracle_cells);
         oracle.clear();
@@ -2478,9 +2502,9 @@ impl TableEncoder {
         // Literals bound for a String target never reach the request, so they
         // owe it nothing until a cell needing conversion strands them
         let mut stranded_bytes = 0usize;
-        for (i, cell) in cells.iter().enumerate() {
+        for i in 0..columns {
             if let ColumnBuf::Oracle(o) = &self.buffers[i] {
-                let cell = oracle_cell(*cell, o.source_type_oid)
+                let cell = oracle_cell(cell(i), o.source_type_oid)
                     .map_err(|e| name_column(e, &self.plan.columns[i].name))?;
                 if !o.resolves_locally(&cell) {
                     row_oracle_bytes += cell.wire_bytes();
@@ -2503,7 +2527,7 @@ impl TableEncoder {
             )));
         }
         let mut oracle_iter = oracle.iter_mut();
-        for (i, cell) in cells.iter().enumerate() {
+        for i in 0..columns {
             let col_plan = &self.plan.columns[i];
             let buf = &mut self.buffers[i];
             if let ColumnBuf::Oracle(o) = buf {
@@ -2511,7 +2535,7 @@ impl TableEncoder {
                 o.push(std::mem::replace(cell, OracleCell::Default));
                 continue;
             }
-            match *cell {
+            match cell(i) {
                 // Absent coerces like NULL, covers key-only delete
                 // tombstones under non-FULL replica identity
                 Cell::Absent => {
@@ -2532,7 +2556,7 @@ impl TableEncoder {
         self.oracle_cells = oracle;
         self.oracle_bytes += row_oracle_bytes + stranded_bytes;
         // Synthetic columns: lsn, xid, commit_ts (unix micros), delete marker
-        let off = cells.len();
+        let off = columns;
         push_fixed(&mut self.buffers[off], &stamp.source_lsn.to_le_bytes())?;
         push_fixed(&mut self.buffers[off + 1], &stamp.xid.to_le_bytes())?;
         let unix_us = stamp.commit_ts.saturating_add(DATETIME64_PG_EPOCH_US);
@@ -2553,6 +2577,50 @@ impl TableEncoder {
         self.approx_bytes = self.buffers.iter().map(ColumnBuf::approx_size).sum();
         Ok(Append::Done)
     }
+}
+
+/// One row's cells in `plan.columns` order, values whose decode allocates
+/// held aside so cells can borrow them
+struct RowScratch<'a> {
+    marks: SmallVec<[Mark<'a>; 16]>,
+    owned: SmallVec<[ColumnValue; 2]>,
+}
+
+/// Cell, or index into [`RowScratch::owned`]
+enum Mark<'a> {
+    Cell(Cell<'a>),
+    Owned(usize),
+}
+
+impl<'a> RowScratch<'a> {
+    fn new(columns: usize) -> Self {
+        Self {
+            marks: SmallVec::with_capacity(columns),
+            owned: SmallVec::new(),
+        }
+    }
+
+    fn cell(&mut self, cell: Cell<'a>) {
+        self.marks.push(Mark::Cell(cell));
+    }
+
+    fn own(&mut self, v: ColumnValue) {
+        self.owned.push(v);
+        self.marks.push(Mark::Owned(self.owned.len() - 1));
+    }
+
+    fn get(&self, i: usize) -> Cell<'_> {
+        match &self.marks[i] {
+            Mark::Cell(c) => *c,
+            Mark::Owned(j) => Cell::Value(self.owned[*j].view()),
+        }
+    }
+}
+
+/// One mapped source value, borrowed or built in row scratch
+pub(crate) enum Slot<'a> {
+    Cell(Cell<'a>),
+    Owned(ColumnValue),
 }
 
 /// One mapped cell ready to encode
@@ -3306,6 +3374,47 @@ pub(crate) enum Wire<'a> {
         absent: &'a [u8],
     },
     Oracle(&'a [OracleCell]),
+}
+
+#[cfg(test)]
+impl EncodedChunk {
+    /// Mapped cells per row read back from wire buffers: fixed widths as
+    /// signed ints, strings as bytes
+    pub(crate) fn cells(&self) -> Vec<Vec<ColumnValue>> {
+        let fixed = |b: &[u8]| match b.len() {
+            1 => ColumnValue::Char(b[0] as i8),
+            2 => ColumnValue::Int2(i16::from_le_bytes(b.try_into().unwrap())),
+            4 => ColumnValue::Int4(i32::from_le_bytes(b.try_into().unwrap())),
+            8 => ColumnValue::Int8(i64::from_le_bytes(b.try_into().unwrap())),
+            _ => ColumnValue::Bytea(b.to_vec()),
+        };
+        let string = |offsets: &[u64], data: &[u8], r: usize| {
+            let start = r.checked_sub(1).map_or(0, |p| offsets[p] as usize);
+            ColumnValue::Bytea(data[start..offsets[r] as usize].to_vec())
+        };
+        let mapped = self.route.mapping.columns.len();
+        let mut rows = vec![Vec::with_capacity(mapped); self.rows];
+        for buf in &self.buffers[..mapped] {
+            for (r, row) in rows.iter_mut().enumerate() {
+                row.push(match buf.wire() {
+                    Wire::Fixed { width, bytes } => fixed(&bytes[r * width..(r + 1) * width]),
+                    Wire::NullableFixed { null_map, .. }
+                    | Wire::NullableString { null_map, .. }
+                        if null_map[r] != 0 =>
+                    {
+                        ColumnValue::Null
+                    }
+                    Wire::NullableFixed { width, inner, .. } => {
+                        fixed(&inner[r * width..(r + 1) * width])
+                    }
+                    Wire::String { offsets, data, .. }
+                    | Wire::NullableString { offsets, data, .. } => string(offsets, data, r),
+                    Wire::Oracle(cells) => ColumnValue::Text(format!("{:?}", cells[r])),
+                });
+            }
+        }
+        rows
+    }
 }
 
 #[cfg(test)]

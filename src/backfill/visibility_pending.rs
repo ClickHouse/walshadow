@@ -158,17 +158,22 @@ fn pending_table_mapping(
     }
 }
 
-fn inject_metadata(tuple: &mut BackfillTuple, rel: &RelDescriptor, pending: PendingXids) {
+/// Values a pending row adds past `rel`'s attributes, see
+/// [`pending_table_mapping`]
+pub(crate) fn metadata_patch(
+    tuple: &BackfillTuple,
+    rel: &RelDescriptor,
+    out: &mut Vec<(usize, ColumnValue)>,
+) {
+    let Some(pending) = tuple.pending else {
+        return;
+    };
     let base = metadata_base(rel);
-    let infomask = tuple.infomask as i16;
-    debug_assert!(
-        tuple.columns.len() <= base,
-        "walk indexes columns by attnum-1 against this descriptor",
-    );
-    tuple.columns.resize(base, None);
-    tuple.columns.push(Some(ColumnValue::Oid(pending.insert)));
-    tuple.columns.push(Some(ColumnValue::Oid(pending.delete)));
-    tuple.columns.push(Some(ColumnValue::Int2(infomask)));
+    out.extend([
+        (base, ColumnValue::Oid(pending.insert)),
+        (base + 1, ColumnValue::Oid(pending.delete)),
+        (base + 2, ColumnValue::Int2(tuple.infomask as i16)),
+    ]);
 }
 
 #[derive(Debug)]
@@ -222,7 +227,7 @@ impl PendingSpool {
         }
         tally.start_lsn = tally.start_lsn.min(tuple.source_lsn);
         tally.rows += 1;
-        inject_metadata(&mut tuple, &rel, pending);
+        tuple.pending = Some(pending);
         self.spool
             .push(tuple)
             .await
@@ -923,7 +928,7 @@ fn xid_list(xids: &[u32]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backfill::backup_page_walk::make_rel_named;
+    use crate::backfill::backup_page_walk::{TupleData, make_rel_named};
 
     fn manifest(rel: &str, xids: Vec<u32>) -> PendingManifest {
         PendingManifest {
@@ -973,7 +978,7 @@ mod tests {
         let pending = pending_table_mapping(&m, &desc, &rel);
         assert_eq!(pending.target.table, "t__wspending");
 
-        let mut tuple = BackfillTuple {
+        let tuple = BackfillTuple {
             rfn: desc.rfn,
             xid: 100,
             xmax: 200,
@@ -982,26 +987,40 @@ mod tests {
             page_lsn: 0,
             blkno: 0,
             offnum: 0,
-            columns: vec![Some(ColumnValue::Int4(1))],
-        };
-        inject_metadata(
-            &mut tuple,
-            &desc,
-            PendingXids {
+            data: TupleData::from_cells(&[Some(ColumnValue::Int4(1))]),
+            pending: Some(PendingXids {
                 insert: 100,
                 delete: 200,
-            },
+            }),
+        };
+        let mut patch = Vec::new();
+        metadata_patch(&tuple, &desc, &mut patch);
+        let route = RouteSnapshot::freeze(Arc::new(pending), Arc::default(), Default::default());
+        let view = tuple.view(&desc).unwrap().unwrap();
+        let stamp = crate::emit::ch_emitter::RowStamp {
+            source_lsn: tuple.source_lsn,
+            xid: tuple.xid,
+            commit_ts: 0,
+            op_code: crate::emit::ch_emitter::OP_INSERT,
+            leaf: None,
+        };
+        let mut chunks = crate::emit::pipeline::plan_spool::ChunkBuilder::new(1, usize::MAX);
+        chunks
+            .append((), &desc, &route, |enc| {
+                enc.append_view(&desc, &view.datums, &patch, &stamp)
+            })
+            .unwrap();
+        let chunks = chunks.take().unwrap();
+        // UInt32 xids and UInt16 infomask read back as same-width ints
+        assert_eq!(
+            chunks[0].1.cells(),
+            [[
+                ColumnValue::Int4(1),
+                ColumnValue::Int4(100),
+                ColumnValue::Int4(200),
+                ColumnValue::Int2(0x0100),
+            ]],
         );
-        for c in &pending.columns[1..] {
-            let idx = (c.src_attnum - 1) as usize;
-            let got = tuple.columns[idx].as_ref().expect("metadata value");
-            let want = match c.target_name.as_str() {
-                XMIN_COLUMN => ColumnValue::Oid(100),
-                XMAX_COLUMN => ColumnValue::Oid(200),
-                _ => ColumnValue::Int2(0x0100),
-            };
-            assert_eq!(got, &want, "{}", c.target_name);
-        }
     }
 
     #[tokio::test]

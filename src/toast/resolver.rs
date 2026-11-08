@@ -1421,38 +1421,30 @@ impl ToastResolver {
         finish_value(&p, stored).ok()
     }
 
-    pub async fn fill_ahead(
+    /// Speculative read of `p` started ahead of planning, its permit
+    /// absorbed into `permit`
+    pub async fn take_ahead(
         &self,
         db_oid: u32,
-        t: &mut crate::decode::heap_decoder::DecodedTuple,
-        rel: &crate::schema::RelDescriptor,
+        p: &ToastPointer,
+        type_oid: u32,
         lsn: u64,
         permit: &mut Option<crate::budget::MemoryPermit>,
-    ) {
-        for (col, attr) in t.columns.iter_mut().zip(&rel.attributes) {
-            let Some(ColumnValue::ExternalToast(p)) = col else {
-                continue;
-            };
-            let Some(slot) = self
-                .pending()
-                .and_then(|mut c| c.take(db_oid, p, attr.type_oid, lsn))
-            else {
-                continue;
-            };
-            let started = std::time::Instant::now();
-            let value = slot.take().await;
-            self.stats
-                .toast_value_wait_nanos
-                .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
-            if let Some(ReadValue {
-                value,
-                permit: read,
-            }) = value
-            {
-                crate::budget::absorb_into(permit, read);
-                *col = Some(value);
-            }
-        }
+    ) -> Option<ColumnValue> {
+        let slot = self
+            .pending()
+            .and_then(|mut c| c.take(db_oid, p, type_oid, lsn))?;
+        let started = std::time::Instant::now();
+        let value = slot.take().await;
+        self.stats
+            .toast_value_wait_nanos
+            .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        let ReadValue {
+            value,
+            permit: read,
+        } = value?;
+        crate::budget::absorb_into(permit, read);
+        Some(value)
     }
 
     pub fn forget_reads<'a>(&self, keys: impl IntoIterator<Item = &'a (u32, u32)>) {
@@ -1497,14 +1489,13 @@ impl ToastResolver {
         pointer_footprint(p) > self.inline_value_max
     }
 
-    /// Replace an oversized value in place, counting the fill. True when the
-    /// pointer is settled and needs no fetch
-    pub fn fill_oversize(&self, col: &mut Option<ColumnValue>, p: &ToastPointer) -> bool {
+    /// Whether an oversized value fills NULL, counting the fill. True when
+    /// the pointer is settled and needs no fetch
+    pub fn fills_oversize(&self, p: &ToastPointer) -> bool {
         if !self.value_oversize(p) {
             return false;
         }
         self.note_filled_oversize();
-        *col = Some(ColumnValue::Null);
         true
     }
 

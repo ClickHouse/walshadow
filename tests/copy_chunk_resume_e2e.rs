@@ -54,12 +54,13 @@ async fn ids(
 ) -> Vec<i64> {
     let (tx, mut rx) = mpsc::channel::<Vec<BackfillTuple>>(4);
     let stats = Arc::new(EmitterStats::default());
+    let rel = desc.clone();
     let collect = tokio::spawn(async move {
         let mut out = Vec::new();
         while let Some(slab) = rx.recv().await {
             for t in slab {
-                match t.columns.first().and_then(|c| c.as_ref()) {
-                    Some(ColumnValue::Int8(v)) => out.push(*v),
+                match t.cells(&rel).unwrap().first() {
+                    Some(Some(ColumnValue::Int8(v))) => out.push(*v),
                     other => panic!("unexpected id column {other:?}"),
                 }
             }

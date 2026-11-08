@@ -213,18 +213,7 @@ pub async fn spawn(
     .await
 }
 
-/// Ack every row of `chunks` as done, one count per seq
-fn swallow(ack: &AckHandle, chunks: impl IntoIterator<Item = batcher::RowChunk>) {
-    let mut counts: HashMap<u64, u64> = HashMap::new();
-    for chunk in chunks {
-        for r in &chunk.rows {
-            *counts.entry(r.seq).or_insert(0) += 1;
-        }
-    }
-    ack.swallowed(counts.into_iter().collect());
-}
-
-/// [`swallow`] for planned segments
+/// Ack every row of `segments` as done, one count per seq
 fn swallow_segments(ack: &AckHandle, segments: Vec<batcher::PlacedSegment>) {
     let mut counts: HashMap<u64, u64> = HashMap::new();
     for s in segments {
@@ -252,7 +241,6 @@ pub fn spawn_null(
     let batcher = tokio::spawn(async move {
         while let Some(msg) = msg_rx.recv().await {
             match msg {
-                BatcherMsg::Rows(chunk) => swallow(&swallow_ack, [chunk]),
                 BatcherMsg::Segments(segments) => swallow_segments(&swallow_ack, segments),
                 BatcherMsg::FlushAll(reply) => {
                     let _ = reply.send(());
@@ -268,6 +256,44 @@ pub fn spawn_null(
             batcher: AbortOnDropHandle::new(batcher),
             resolvers: Vec::new(),
             inserters: Vec::new(),
+        },
+    )
+}
+
+/// Batcher whose sealed batches drop on arrival, acked as inserted.
+/// Measures producers and batching without ClickHouse
+#[cfg(any(test, feature = "test-support"))]
+pub fn spawn_discard(
+    cfg: BatcherConfig,
+    stats: Arc<EmitterStats>,
+    fatal: Fatal,
+) -> (mpsc::Sender<BatcherMsg>, AckHandle, TailParts) {
+    let (ack, collector) = ack::spawn(Arc::new(Monotone::default()), fatal.clone());
+    let (msg_tx, msg_rx) = mpsc::channel::<BatcherMsg>(256);
+    let (batches_tx, batches_rx) = async_channel::bounded::<InsertBatch>(4);
+    let batcher = batcher::spawn(
+        msg_rx,
+        batches_tx,
+        cfg,
+        Allocator::global(&mimalloc::MiMalloc),
+        fatal,
+        stats,
+        None,
+    );
+    let discard_ack = ack.clone();
+    let discard = tokio::spawn(async move {
+        while let Ok(batch) = batches_rx.recv().await {
+            discard_ack.swallowed(batch.per_seq.clone());
+        }
+    });
+    (
+        msg_tx,
+        ack,
+        TailParts {
+            collector: AbortOnDropHandle::new(collector),
+            batcher: AbortOnDropHandle::new(batcher),
+            resolvers: Vec::new(),
+            inserters: vec![AbortOnDropHandle::new(discard)],
         },
     )
 }

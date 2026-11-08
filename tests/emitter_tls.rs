@@ -40,7 +40,7 @@ use walshadow::ch_emitter::{EmitterConfig, EmitterStats, InstanceConfig};
 use walshadow::heap_decoder::{ColumnValue, CommittedTuple, DecodedHeap, DecodedTuple, HeapOp};
 use walshadow::mapping::{ColumnMapping, TableMapping, TableTarget};
 use walshadow::pipeline::ack::Publish;
-use walshadow::pipeline::batcher::{BatcherMsg, RoutedRow, RowChunk, RowTable};
+use walshadow::pipeline::batcher::{BatcherMsg, PlacedSegment};
 use walshadow::pipeline::{Fatal, tail};
 use walshadow::pos::{EmitterAck, Monotone};
 use walshadow::schema::{RelDescriptor, RelName, ReplIdent};
@@ -377,23 +377,19 @@ async fn emitter_tls_round_trip() {
     let mut seqs = ack.seqs(0);
     let seq = seqs.open(tuple.commit_lsn, Publish::Commit);
     msg_tx
-        .send(BatcherMsg::Rows(RowChunk {
-            tables: vec![RowTable {
-                rel,
-                route: walshadow::emit::route::RouteSnapshot::freeze(
+        .send(BatcherMsg::Segments(vec![
+            PlacedSegment::of_rows(
+                seq.seq(),
+                &rel,
+                &walshadow::emit::route::RouteSnapshot::freeze(
                     mapping,
                     Arc::default(),
                     Default::default(),
                 ),
-            }],
-            rows: vec![RoutedRow {
-                seq: seq.seq(),
-                table: 0,
-                committed: tuple,
-                value_permit: None,
-            }],
-            permit: None,
-        }))
+                &[tuple],
+            )
+            .expect("encode row"),
+        ]))
         .await
         .expect("route row");
     seqs.place(seq, 1);

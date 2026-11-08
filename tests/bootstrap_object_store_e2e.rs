@@ -242,7 +242,8 @@ async fn object_store_source_self_hosted_via_wal_rs_push() {
         tmp.path().join("part-spool"),
     )
     .with_parallelism(2);
-    let (rx, pump) = spawn_greenfield_bootstrap(cfg, Box::new(object_source), catalog_map, false);
+    let (rx, pump) =
+        spawn_greenfield_bootstrap(cfg, Box::new(object_source), catalog_map.clone(), false);
 
     // RecordingObserver wraps a CollectingTupleObserver + counts
     // on_xact_end so the test asserts drain_backfill closes the
@@ -251,7 +252,7 @@ async fn object_store_source_self_hosted_via_wal_rs_push() {
     // transitional emitter's INSERT block before swapping to the
     // ShadowCatalog-backed emitter.
     let mut observer = RecordingObserver::default();
-    let (drain_res, pump_res) = tokio::join!(drain_backfill(rx, &mut observer), pump);
+    let (drain_res, pump_res) = tokio::join!(drain_backfill(rx, &catalog_map, &mut observer), pump);
     let shipped = drain_res.expect("drain task error");
     let outcome = pump_res
         .expect("pump task panicked")

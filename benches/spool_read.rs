@@ -15,7 +15,7 @@ use walrus::pg::walparser::RelFileNode;
 use walrus::pg::walparser::{
     BlockLocation, RmId, XLogRecord, XLogRecordBlock, XLogRecordBlockHeader, XLogRecordHeader,
 };
-use walshadow::backup_page_walk::BackfillTuple;
+use walshadow::backup_page_walk::{BackfillTuple, TupleData};
 use walshadow::ch_emitter::EncodedChunk;
 use walshadow::emit::route::RouteSnapshot;
 use walshadow::heap_decoder::{ColumnValue, DecodedHeap, DecodedTuple, DescribedHeap, HeapOp};
@@ -106,6 +106,14 @@ async fn deferred(args: &Args, repeat: usize) -> anyhow::Result<()> {
     let mut spool = DeferredSpool::new(dir.path().join("deferred.spool"), 1 << 20);
     let base = GLOBAL.reset_peak();
     let start = Instant::now();
+    let data = |i: usize| {
+        let cells = [
+            Some(ColumnValue::Int4(i as i32)),
+            Some(ColumnValue::Text(payload.clone())),
+        ];
+        walshadow::heap_decoder::form_block_data(&cells).into_boxed_slice()
+    };
+    let data_len = data(0).len();
     for i in 0..args.rows {
         spool
             .push(BackfillTuple {
@@ -117,10 +125,8 @@ async fn deferred(args: &Args, repeat: usize) -> anyhow::Result<()> {
                 page_lsn: 0,
                 blkno: i as u32,
                 offnum: 1,
-                columns: vec![
-                    Some(ColumnValue::Int4(i as i32)),
-                    Some(ColumnValue::Text(payload.clone())),
-                ],
+                data: TupleData::Heap(data(i)),
+                pending: None,
             })
             .await?;
     }
@@ -133,11 +139,7 @@ async fn deferred(args: &Args, repeat: usize) -> anyhow::Result<()> {
     let mut n = 0;
     while let Some(t) = reader.next().await? {
         assert_eq!(t.xid, n as u32);
-        assert!(matches!(
-            t.columns.as_slice(),
-            [Some(ColumnValue::Int4(v)), Some(ColumnValue::Text(s))]
-                if *v == n as i32 && *s == payload
-        ));
+        assert!(matches!(&t.data, TupleData::Heap(b) if b.len() == data_len));
         n += 1;
     }
     reader.finish().await?;
@@ -393,6 +395,8 @@ async fn plan(args: &Args, repeat: usize) -> anyhow::Result<()> {
                     source_lsn: input.input.source_lsn,
                     new: images[0].new.as_ref(),
                     old: None,
+                    new_patch: &[],
+                    old_patch: &[],
                 };
                 writer.push_views(change, table)?;
             }

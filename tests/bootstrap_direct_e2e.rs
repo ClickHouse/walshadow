@@ -153,10 +153,10 @@ async fn direct_source_self_hosted_via_replication_protocol() {
 
     let shadow_data = tmp.path().join("shadow-data");
     let cfg = BootstrapConfig::new(shadow_data.clone());
-    let (rx, pump) = spawn_greenfield_bootstrap(cfg, Box::new(direct), catalog_map, false);
+    let (rx, pump) = spawn_greenfield_bootstrap(cfg, Box::new(direct), catalog_map.clone(), false);
 
     let mut observer = RecordingObserver::default();
-    let (drain_res, pump_res) = tokio::join!(drain_backfill(rx, &mut observer), pump);
+    let (drain_res, pump_res) = tokio::join!(drain_backfill(rx, &catalog_map, &mut observer), pump);
     let shipped = drain_res.expect("drain task error");
     let outcome = pump_res
         .expect("pump task panicked")

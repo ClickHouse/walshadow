@@ -8,6 +8,11 @@
 //!   concurrent tar parts so shared-sink contention shows up.
 //! - `drain`: synthetic `BackfillTuple`s → `pipeline::bootstrap::drain` →
 //!   metrics-only tail. Covers routing plus the `BatcherMsg` hop.
+//! - `load`: `pump` feeding `drain` feeding the real batcher, sealed batches
+//!   dropped instead of inserted. Ends at the same `InsertBatch` blocks
+//!   whichever stage encodes rows, so it compares across encoder designs.
+//!
+//! `--text N` appends a text column of N bytes to every tuple.
 //!
 //! ```text
 //! cargo bench --bench bootstrap_pump -- \
@@ -45,12 +50,13 @@ use walshadow::backfill::backup_source::{
     BackupSink, BackupSource, EndInfo, PumpStats, PumpTarget, StartInfo, pump_tar_to_sink,
 };
 use walshadow::backfill_bootstrap::{BootstrapConfig, spawn_greenfield_bootstrap};
-use walshadow::backup_page_walk::{BackfillTuple, CatalogMap, PAGE_BYTES};
+use walshadow::backup_page_walk::{BackfillTuple, CatalogMap, PAGE_BYTES, TupleData};
+use walshadow::decode::datum::DatumRef;
 use walshadow::heap_decoder::ColumnValue;
 use walshadow::mapping::{ColumnMapping, TableMapping, TableTarget};
 use walshadow::pipeline::bootstrap;
 use walshadow::pos::{EmitterAck, Monotone};
-use walshadow::schema::{INT4OID, RelAttr, RelDescriptor, RelName, ReplIdent};
+use walshadow::schema::{INT4OID, RelAttr, RelDescriptor, RelName, ReplIdent, TEXTOID};
 use walshadow::toast::ToastResolver;
 
 const DB_NODE: u32 = 5;
@@ -72,6 +78,8 @@ struct Shape {
     tuples_per_page: usize,
     /// int4 columns per tuple
     columns: usize,
+    /// Trailing text column bytes, none at 0
+    text: usize,
     parallelism: usize,
 }
 
@@ -83,6 +91,7 @@ impl Default for Shape {
             pages_per_segment: 256,
             tuples_per_page: 100,
             columns: 8,
+            text: 0,
             parallelism: 4,
         }
     }
@@ -102,7 +111,35 @@ impl Shape {
     }
 }
 
-fn descriptor(filenode: u32, columns: usize) -> Arc<RelDescriptor> {
+fn descriptor(filenode: u32, shape: Shape) -> Arc<RelDescriptor> {
+    let mut attributes: Vec<RelAttr> = (0..shape.columns)
+        .map(|i| RelAttr {
+            attnum: i as i16 + 1,
+            name: format!("c{i}"),
+            type_oid: INT4OID,
+            typmod: -1,
+            not_null: false,
+            dropped: false,
+            type_name: "int4".into(),
+            type_byval: true,
+            type_len: 4,
+            type_align: 'i',
+            type_storage: 'p',
+            missing_default: None,
+        })
+        .collect();
+    if shape.text > 0 {
+        attributes.push(RelAttr {
+            attnum: shape.columns as i16 + 1,
+            name: "body".into(),
+            type_oid: TEXTOID,
+            type_name: "text".into(),
+            type_byval: false,
+            type_len: -1,
+            type_storage: 'x',
+            ..attributes[0].clone()
+        });
+    }
     RelDescriptor {
         rfn: RelFileNode {
             spc_node: 1663,
@@ -117,57 +154,69 @@ fn descriptor(filenode: u32, columns: usize) -> Arc<RelDescriptor> {
         persistence: 'p',
         ancestors: Vec::new(),
         replident: ReplIdent::Default { pk_attnums: None },
-        attributes: (0..columns)
-            .map(|i| RelAttr {
-                attnum: i as i16 + 1,
-                name: format!("c{i}"),
-                type_oid: INT4OID,
-                typmod: -1,
-                not_null: false,
-                dropped: false,
-                type_name: "int4".into(),
-                type_byval: true,
-                type_len: 4,
-                type_align: 'i',
-                type_storage: 'p',
-                missing_default: None,
-            })
-            .collect(),
+        attributes,
     }
     .into()
 }
 
-fn mapping(filenode: u32, columns: usize) -> TableMapping {
+fn mapping(filenode: u32, shape: Shape) -> TableMapping {
+    let mut columns: Vec<ColumnMapping> = (0..shape.columns)
+        .map(|i| ColumnMapping {
+            src_attnum: i as i16 + 1,
+            target_name: format!("c{i}"),
+            target_type: "Int32".into(),
+            type_pinned: false,
+        })
+        .collect();
+    if shape.text > 0 {
+        columns.push(ColumnMapping {
+            src_attnum: shape.columns as i16 + 1,
+            target_name: "body".into(),
+            target_type: "String".into(),
+            type_pinned: false,
+        });
+    }
     TableMapping {
         target: TableTarget::new("bench", &format!("t{filenode}")),
-        columns: (0..columns)
-            .map(|i| ColumnMapping {
-                src_attnum: i as i16 + 1,
-                target_name: format!("c{i}"),
-                target_type: "Int32".into(),
-                type_pinned: false,
-            })
-            .collect(),
+        columns,
         tees: Vec::new(),
     }
 }
 
-/// One 8 KiB heap page carrying `tuples` live int4-only tuples, laid out
-/// as PG writes them: line pointers up from the header, tuple bodies down
-/// from the page end. Returns page and wrapping sum of its values
-fn heap_page(tuples: usize, columns: usize, seed: i32) -> (Vec<u8>, i64) {
-    let body = TUPLE_HEADER + 4 * columns;
+/// Stored text datum: 1-byte header below 127 bytes, else 4-byte
+fn text_datum(len: usize) -> Vec<u8> {
+    let mut v = if len < 127 {
+        vec![(((len + 1) << 1) | 1) as u8]
+    } else {
+        (((len + 4) as u32) << 2).to_le_bytes().to_vec()
+    };
+    v.resize(v.len() + len, b'x');
+    v
+}
+
+/// One 8 KiB heap page carrying `tuples` live tuples, laid out as PG writes
+/// them: line pointers up from the header, MAXALIGNed tuple bodies down
+/// from the page end. Returns page, tuples written, and wrapping sum of
+/// int4 values
+fn heap_page(tuples: usize, shape: Shape, seed: i32) -> (Vec<u8>, usize, i64) {
+    let columns = shape.columns;
+    let text = (shape.text > 0).then(|| text_datum(shape.text));
+    let natts = columns + usize::from(text.is_some());
+    let body = TUPLE_HEADER + 4 * columns + text.as_ref().map_or(0, Vec::len);
+    let stride = body.next_multiple_of(8);
     let mut page = vec![0u8; PAGE_BYTES];
     let mut written = 0usize;
     let mut digest = 0i64;
     for i in 0..tuples {
-        let off = PAGE_BYTES - (i + 1) * body;
+        let Some(off) = PAGE_BYTES.checked_sub((i + 1) * stride) else {
+            break;
+        };
         if off < SIZE_OF_PAGE_HEADER + (i + 1) * SIZE_OF_ITEM_ID {
             break;
         }
         let xmin = 100u32 + i as u32;
         page[off..off + 4].copy_from_slice(&xmin.to_le_bytes());
-        page[off + 18..off + 20].copy_from_slice(&(columns as u16).to_le_bytes());
+        page[off + 18..off + 20].copy_from_slice(&(natts as u16).to_le_bytes());
         page[off + 20..off + 22].copy_from_slice(&0u16.to_le_bytes());
         page[off + 22] = TUPLE_HEADER as u8;
         for c in 0..columns {
@@ -176,36 +225,42 @@ fn heap_page(tuples: usize, columns: usize, seed: i32) -> (Vec<u8>, i64) {
             page[at..at + 4].copy_from_slice(&v.to_le_bytes());
             digest = digest.wrapping_add(i64::from(v));
         }
+        if let Some(t) = &text {
+            let at = off + TUPLE_HEADER + columns * 4;
+            page[at..at + t.len()].copy_from_slice(t);
+        }
         let slot = SIZE_OF_PAGE_HEADER + i * SIZE_OF_ITEM_ID;
         let raw = ((off as u32) & 0x7FFF) | (LP_NORMAL << 15) | (((body as u32) & 0x7FFF) << 17);
         page[slot..slot + SIZE_OF_ITEM_ID].copy_from_slice(&raw.to_le_bytes());
         written = i + 1;
     }
     let pd_lower = SIZE_OF_PAGE_HEADER + written * SIZE_OF_ITEM_ID;
-    let pd_upper = PAGE_BYTES - written * body;
+    let pd_upper = PAGE_BYTES - written * stride;
     page[12..14].copy_from_slice(&(pd_lower as u16).to_le_bytes());
     page[14..16].copy_from_slice(&(pd_upper as u16).to_le_bytes());
-    (page, digest)
+    (page, written, digest)
 }
 
 /// One tar part holding `segments_per_part` `base/<db>/<filenode>` entries,
-/// with wrapping sum of values written
-async fn build_part(shape: Shape, part: usize) -> (Vec<u8>, i64) {
+/// with tuples and wrapping sum of int4 values written
+async fn build_part(shape: Shape, part: usize) -> (Vec<u8>, u64, i64) {
     let mut writer = Writer::new(Vec::new());
     let mut digest = 0i64;
+    let mut tuples = 0u64;
     for s in 0..shape.segments_per_part {
         let filenode = FIRST_FILENODE + (part * shape.segments_per_part + s) as u32;
         let mut body = Vec::with_capacity(shape.pages_per_segment * PAGE_BYTES);
         for p in 0..shape.pages_per_segment {
-            let (page, d) = heap_page(shape.tuples_per_page, shape.columns, (p * 1_000) as i32);
+            let (page, n, d) = heap_page(shape.tuples_per_page, shape, (p * 1_000) as i32);
             body.extend_from_slice(&page);
+            tuples += n as u64;
             digest = digest.wrapping_add(d);
         }
         let path = format!("base/{DB_NODE}/{filenode}");
         let entry = Entry::new(path, Kind::Regular, body.len() as u64, 0o600, 0);
         writer.append(&entry, body.as_slice()).await.unwrap();
     }
-    (writer.finish().await.unwrap(), digest)
+    (writer.finish().await.unwrap(), tuples, digest)
 }
 
 /// Object-store-shaped source over pre-built tars: one `pump_tar_to_sink`
@@ -279,20 +334,40 @@ impl Report {
     }
 }
 
-async fn bench_pump(shape: Shape) -> Report {
+/// Tars, their tuple count and int4 digest, and the catalog naming them
+async fn backup(shape: Shape) -> (Vec<Vec<u8>>, u64, i64, CatalogMap) {
     let mut parts = Vec::with_capacity(shape.parts);
-    let mut expected = 0i64;
+    let (mut tuples, mut digest) = (0u64, 0i64);
     for p in 0..shape.parts {
-        let (part, digest) = build_part(shape, p).await;
+        let (part, n, d) = build_part(shape, p).await;
         parts.push(part);
-        expected = expected.wrapping_add(digest);
+        tuples += n;
+        digest = digest.wrapping_add(d);
     }
-
     let mut catalog = CatalogMap::new();
     for i in 0..shape.segments() {
-        catalog.insert(descriptor(FIRST_FILENODE + i as u32, shape.columns));
+        catalog.insert(descriptor(FIRST_FILENODE + i as u32, shape));
     }
+    (parts, tuples, digest, catalog)
+}
 
+fn pump_detail(
+    progress: &walshadow::backfill_bootstrap::BootstrapProgress,
+) -> Vec<(&'static str, f64)> {
+    let ld = |a: &AtomicU64| a.load(Ordering::Relaxed) as f64;
+    vec![
+        ("pages_walked", ld(&progress.page_walk.pages_walked)),
+        ("decode_secs", ld(&progress.page_walk.decode_nanos) / 1e9),
+        ("tap_secs", ld(&progress.pump.sink_chunk_nanos) / 1e9),
+        (
+            "channel_block_secs",
+            ld(&progress.page_walk.channel_block_nanos) / 1e9,
+        ),
+    ]
+}
+
+async fn bench_pump(shape: Shape) -> Report {
+    let (parts, tuples, expected, catalog) = backup(shape).await;
     let tmp = tempfile::tempdir().unwrap();
     let cfg = BootstrapConfig::new(tmp.path().join("data"));
     let progress = cfg.progress.clone();
@@ -303,57 +378,52 @@ async fn bench_pump(shape: Shape) -> Report {
 
     let base = GLOBAL.reset_peak();
     let started = Instant::now();
-    let (mut rx, pump) = spawn_greenfield_bootstrap(cfg, source, catalog, false);
+    let (mut rx, pump) = spawn_greenfield_bootstrap(cfg, source, catalog.clone(), false);
     let drained = tokio::spawn(async move {
         let (mut n, mut digest) = (0u64, 0i64);
         while let Some(slab) = rx.recv().await {
             for t in &slab {
-                n += t.columns.len() as u64;
-                for c in &t.columns {
-                    let Some(ColumnValue::Int4(v)) = c else {
-                        panic!("int4 column decoded as {c:?}");
-                    };
-                    digest = digest.wrapping_add(i64::from(*v));
+                let rel = catalog.get(t.rfn.db_node, t.rfn.rel_node).unwrap();
+                let view = t.view(&rel).unwrap().unwrap();
+                n += 1;
+                for d in &view.datums {
+                    if let DatumRef::Fixed(b) = d {
+                        let v = i32::from_le_bytes((*b).try_into().unwrap());
+                        digest = digest.wrapping_add(i64::from(v));
+                    }
                 }
             }
         }
         (n, digest)
     });
     pump.await.unwrap().unwrap();
-    let (touched, digest) = drained.await.unwrap();
+    let (walked, digest) = drained.await.unwrap();
     let elapsed = started.elapsed().as_secs_f64();
     let metered = GLOBAL.snapshot().since(base);
-    assert_eq!(digest, expected, "decoded values differ from written pages");
+    assert_eq!(digest, expected, "walked values differ from written pages");
+    assert_eq!(walked, tuples);
 
-    let ld = |a: &AtomicU64| a.load(Ordering::Relaxed) as f64;
+    let mut detail = pump_detail(&progress);
+    detail.push(("allocs", metered.allocs as f64));
+    detail.push(("peak_mib", metered.peak as f64 / (1 << 20) as f64));
     Report {
         label: "pump".into(),
         elapsed_secs: elapsed,
-        tuples: touched / shape.columns as u64,
-        bytes: ld(&progress.pump.bytes_tapped) as u64,
-        detail: vec![
-            ("pages_walked", ld(&progress.page_walk.pages_walked)),
-            ("decode_secs", ld(&progress.page_walk.decode_nanos) / 1e9),
-            ("tap_secs", ld(&progress.pump.sink_chunk_nanos) / 1e9),
-            (
-                "channel_block_secs",
-                ld(&progress.page_walk.channel_block_nanos) / 1e9,
-            ),
-            ("allocs", metered.allocs as f64),
-            ("peak_mib", metered.peak as f64 / (1 << 20) as f64),
-        ],
+        tuples,
+        bytes: progress.pump.bytes_tapped.load(Ordering::Relaxed),
+        detail,
     }
 }
 
 async fn bench_drain(shape: Shape) -> Report {
     let rels: Vec<Arc<RelDescriptor>> = (0..shape.segments())
-        .map(|i| descriptor(FIRST_FILENODE + i as u32, shape.columns))
+        .map(|i| descriptor(FIRST_FILENODE + i as u32, shape))
         .collect();
     let mut catalog = CatalogMap::new();
     let mut tables = foldhash::HashMap::default();
     for r in &rels {
         catalog.insert(r.clone());
-        tables.insert(r.rel_name.clone(), mapping(r.oid, shape.columns));
+        tables.insert(r.rel_name.clone(), mapping(r.oid, shape));
     }
     let routes = Arc::new(walshadow::mapping::shared(tables));
 
@@ -364,25 +434,32 @@ async fn bench_drain(shape: Shape) -> Report {
     let (tup_tx, tup_rx) = tokio::sync::mpsc::channel::<Vec<BackfillTuple>>(16);
 
     let per_rel = shape.pages_per_segment as u64 * shape.tuples_per_page as u64;
-    let columns = shape.columns;
+    let text = "x".repeat(shape.text);
     let feeder = tokio::spawn(async move {
         for r in rels {
             // Slab at the walk's grain so the drain sees production shape
             for slab_start in (0..per_rel).step_by(shape.tuples_per_page * 16) {
                 let end = (slab_start + (shape.tuples_per_page * 16) as u64).min(per_rel);
                 let slab: Vec<BackfillTuple> = (slab_start..end)
-                    .map(|i| BackfillTuple {
-                        rfn: r.rfn,
-                        xid: 100 + i as u32,
-                        xmax: 0,
-                        infomask: 0,
-                        source_lsn: START_LSN,
-                        page_lsn: 0,
-                        blkno: (i / 100) as u32,
-                        offnum: (i % 100) as u16 + 1,
-                        columns: (0..columns)
+                    .map(|i| {
+                        let mut cells: Vec<_> = (0..shape.columns)
                             .map(|c| Some(ColumnValue::Int4(i as i32 + c as i32)))
-                            .collect(),
+                            .collect();
+                        if shape.text > 0 {
+                            cells.push(Some(ColumnValue::Text(text.clone())));
+                        }
+                        BackfillTuple {
+                            rfn: r.rfn,
+                            xid: 100 + i as u32,
+                            xmax: 0,
+                            infomask: 0,
+                            source_lsn: START_LSN,
+                            page_lsn: 0,
+                            blkno: (i / 100) as u32,
+                            offnum: (i % 100) as u16 + 1,
+                            data: TupleData::from_cells(&cells),
+                            pending: None,
+                        }
                     })
                     .collect();
                 if tup_tx.send(slab).await.is_err() {
@@ -419,8 +496,8 @@ async fn bench_drain(shape: Shape) -> Report {
         label: "drain".into(),
         elapsed_secs: elapsed,
         tuples: outcome.rows_routed,
-        // Int4 payload only; the interesting rate here is rows, not bytes
-        bytes: outcome.rows_routed * 4 * shape.columns as u64,
+        // Row payload only; the interesting rate here is rows, not bytes
+        bytes: outcome.rows_routed * (4 * shape.columns + shape.text) as u64,
         detail: vec![
             ("seqs", outcome.next_seq as f64),
             ("allocs", metered.allocs as f64),
@@ -429,11 +506,85 @@ async fn bench_drain(shape: Shape) -> Report {
     }
 }
 
+/// Backup pages through walk, drain, and batcher to sealed `InsertBatch`es,
+/// which drop instead of inserting
+async fn bench_load(shape: Shape) -> Report {
+    let (parts, tuples, _, catalog) = backup(shape).await;
+    let tables = catalog
+        .descriptors()
+        .map(|d| (d.rel_name.clone(), mapping(d.oid, shape)))
+        .collect();
+    let routes = Arc::new(walshadow::mapping::shared(tables));
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = BootstrapConfig::new(tmp.path().join("data"));
+    let progress = cfg.progress.clone();
+    let source = Box::new(MemSource {
+        parts,
+        parallelism: shape.parallelism,
+    });
+    let emitter = walshadow::ch_emitter::EmitterConfig::default();
+    let stats = Arc::new(walshadow::ch_emitter::EmitterStats::default());
+    let fatal = walshadow::pipeline::Fatal::new();
+    let batcher = walshadow::pipeline::batcher::BatcherConfig {
+        row_budget: emitter.row_budget,
+        byte_budget: emitter.byte_budget,
+        inserters: 1,
+        flush_timeout: std::time::Duration::from_secs(1),
+    };
+
+    let base = GLOBAL.reset_peak();
+    let started = Instant::now();
+    let (msg_tx, ack, tail) =
+        walshadow::pipeline::tail::spawn_discard(batcher, stats.clone(), fatal.clone());
+    let (rx, pump) = spawn_greenfield_bootstrap(cfg, source, catalog.clone(), false);
+    let drain = bootstrap::drain(
+        rx,
+        catalog,
+        walshadow::emit::route::freeze_routes(&routes, None, &Default::default()),
+        msg_tx.clone(),
+        ack.clone(),
+        stats.clone(),
+        ToastResolver::disabled(),
+        bootstrap::Deferral::Rejected,
+        foldhash::HashSet::default(),
+        None,
+    );
+    let (outcome, pumped) = tokio::join!(drain, pump);
+    pumped.unwrap().unwrap();
+    let outcome = outcome.unwrap();
+    tail.finish(msg_tx, ack, outcome.next_seq, &fatal)
+        .await
+        .unwrap();
+    let elapsed = started.elapsed().as_secs_f64();
+    let metered = GLOBAL.snapshot().since(base);
+    assert_eq!(outcome.rows_routed, tuples);
+    assert_eq!(
+        stats.insertbatch_rows_in.load(Ordering::Relaxed),
+        tuples,
+        "every row reached the batcher"
+    );
+
+    let mut detail = pump_detail(&progress);
+    detail.push((
+        "batches",
+        stats.insertbatch_batches_out.load(Ordering::Relaxed) as f64,
+    ));
+    detail.push(("allocs", metered.allocs as f64));
+    detail.push(("peak_mib", metered.peak as f64 / (1 << 20) as f64));
+    Report {
+        label: "load".into(),
+        elapsed_secs: elapsed,
+        tuples,
+        bytes: progress.pump.bytes_tapped.load(Ordering::Relaxed),
+        detail,
+    }
+}
+
 fn usage() -> ! {
     eprintln!(
-        "usage: bootstrap_pump [--list] [--stage pump|drain|all] [--parts N] \
+        "usage: bootstrap_pump [--list] [--stage pump|drain|load|all] [--parts N] \
          [--segments-per-part N] [--pages N] [--tuples-per-page N] [--columns N] \
-         [--parallelism N]"
+         [--text N] [--parallelism N]"
     );
     std::process::exit(2)
 }
@@ -460,6 +611,7 @@ fn main() {
             "--pages" => shape.pages_per_segment = val(&next).max(1),
             "--tuples-per-page" => shape.tuples_per_page = val(&next).max(1),
             "--columns" => shape.columns = val(&next).max(1),
+            "--text" => shape.text = val(&next),
             "--parallelism" => shape.parallelism = val(&next).max(1),
             // cargo bench passes --bench through
             "--bench" => {
@@ -473,11 +625,13 @@ fn main() {
 
     let rt = tokio::runtime::Runtime::new().unwrap();
     println!(
-        "shape: {} segments x {} pages x {} tuples x {} int4 cols, {} parts, parallelism {}",
+        "shape: {} segments x {} pages x {} tuples x {} int4 cols + {} text bytes, {} parts, \
+         parallelism {}",
         shape.segments(),
         shape.pages_per_segment,
         shape.tuples_per_page,
         shape.columns,
+        shape.text,
         shape.parts,
         shape.parallelism,
     );
@@ -491,5 +645,8 @@ fn main() {
     }
     if stage == "drain" || stage == "all" {
         rt.block_on(bench_drain(shape)).print();
+    }
+    if stage == "load" || stage == "all" {
+        rt.block_on(bench_load(shape)).print();
     }
 }

@@ -980,7 +980,8 @@ pub(crate) async fn run_bootstrap(
     } else {
         // Metrics-only skips destination convergence
         let mut observer = MetricsTupleObserver::default();
-        let (drain_res, pump_res) = tokio::join!(drain_backfill(rx, &mut observer), pump);
+        let (drain_res, pump_res) =
+            tokio::join!(drain_backfill(rx, &drain_catalog, &mut observer), pump);
         let shipped = drain_res.context("bootstrap drain")?;
         let outcome: BootstrapOutcome = pump_res
             .context("bootstrap pump join")?

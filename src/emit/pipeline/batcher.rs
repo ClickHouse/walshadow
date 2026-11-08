@@ -1,10 +1,9 @@
 //! Insert batcher — per-table accumulation stage.
 //!
-//! Coalesces decoded rows ([`RoutedRow`]) per destination table into
-//! budget-sized ClickHouse Native blocks (`InsertBatch`). Encoding happens
-//! here, not in decoders, so rows from all M decoders and all xacts merge
-//! into one part per flush window per table instead of one part per decoder
-//! per xact.
+//! Merges encoded column chunks ([`PlacedSegment`]) per destination table
+//! into budget-sized ClickHouse Native blocks (`InsertBatch`), so rows from
+//! every producer and xact share one part per flush window per table
+//! instead of one part per producer per xact.
 //!
 //! Single hub task owns one `TableEncoder` per table; per-table task
 //! sharding / hash(pk) splitting is the plan's later optimization.
@@ -30,10 +29,10 @@ use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
 use crate::config::ResolvedConfig;
-use crate::decode::heap_decoder::{CommittedTuple, HeapOp};
+#[cfg(any(test, feature = "test-support"))]
+use crate::decode::heap_decoder::CommittedTuple;
 use crate::emit::ch_emitter::{
-    Append, ColumnBuf, ColumnEncoding, EmitterStats, EncodedChunk, OP_DELETE, OP_INSERT, OP_UPDATE,
-    TableEncoder, TablePlan,
+    Append, ColumnBuf, ColumnEncoding, EmitterStats, EncodedChunk, TableEncoder, TablePlan,
 };
 use crate::emit::pipeline::{DEFAULT_PIPELINE_FLUSH, Fatal};
 use crate::emit::route::RouteSnapshot;
@@ -51,126 +50,54 @@ pub struct RowTable {
     pub route: Arc<RouteSnapshot>,
 }
 
-/// One decoded row routed to its destination
-pub struct RoutedRow {
-    pub seq: u64,
-    /// Index into containing chunk's `tables`
-    pub table: u32,
-    pub committed: CommittedTuple,
-    /// Detoast leaf permit shrunk to this row's decoded TOAST bytes, so
-    /// decoded values and their encoder slab copy stay covered to insert
-    /// ack. Per row, unlike the slice permit on [`RowChunk`]
-    pub value_permit: Option<Arc<crate::budget::MemoryPermit>>,
-}
-
-/// Share table metadata and a memory permit across decoded rows
-#[derive(Default)]
-pub struct RowChunk {
-    pub tables: Vec<RowTable>,
-    pub rows: Vec<RoutedRow>,
-    /// Released post-insert-ack, when every covering `InsertBatch` drops
-    pub permit: Option<Arc<crate::budget::MemoryPermit>>,
-}
-
-impl RowChunk {
-    fn table(&mut self, rel: &Arc<RelDescriptor>, route: &Arc<RouteSnapshot>) -> u32 {
-        if !self
-            .tables
-            .last()
-            .is_some_and(|t| Arc::ptr_eq(&t.rel, rel) && Arc::ptr_eq(&t.route, route))
-        {
-            self.tables.push(RowTable {
-                rel: rel.clone(),
-                route: route.clone(),
-            });
-        }
-        (self.tables.len() - 1) as u32
-    }
-}
-
-/// Rows per chunk a [`RowBuffer`] ships. Fixed rather than config-driven:
-/// backfill rows are uniform, and the byte trigger covers the fat-row case
-const ROW_BUFFER_MAX_ROWS: usize = 1024;
-
-/// Coalesces routed rows into one `BatcherMsg::Rows` per `ROW_BUFFER_MAX_ROWS`
-/// rows or [`DECODE_CHUNK_BYTES`], the same amortization streaming placement
-/// gets. Rows of different seqs may share a chunk; the batcher routes each
-/// independently
-#[derive(Default)]
-pub struct RowBuffer {
-    chunk: RowChunk,
-    bytes: usize,
-}
-
-impl RowBuffer {
-    /// Share `permit` across all buffered and sent chunks
-    pub fn new(permit: Option<Arc<crate::budget::MemoryPermit>>) -> Self {
-        Self {
-            chunk: RowChunk {
-                permit,
-                ..Default::default()
-            },
-            bytes: 0,
-        }
-    }
-
-    pub async fn push(
-        &mut self,
-        msg_tx: &mpsc::Sender<BatcherMsg>,
-        seq: u64,
-        table: (&Arc<RelDescriptor>, &Arc<RouteSnapshot>),
-        committed: CommittedTuple,
-        value_permit: Option<Arc<crate::budget::MemoryPermit>>,
-    ) -> Result<(), BatcherClosed> {
-        if self.stage(seq, table, committed, value_permit) {
-            self.flush(msg_tx).await?;
-        }
-        Ok(())
-    }
-
-    /// Buffer a row, true once buffer is due to flush
-    pub fn stage(
-        &mut self,
-        seq: u64,
-        table: (&Arc<RelDescriptor>, &Arc<RouteSnapshot>),
-        committed: CommittedTuple,
-        value_permit: Option<Arc<crate::budget::MemoryPermit>>,
-    ) -> bool {
-        // Flush leaf permits before another acquisition can wait on them.
-        let has_value_permit = value_permit.is_some();
-        self.bytes += committed.decoded.approx_bytes();
-        let table = self.chunk.table(table.0, table.1);
-        self.chunk.rows.push(RoutedRow {
-            seq,
-            table,
-            committed,
-            value_permit,
-        });
-        has_value_permit
-            || self.chunk.rows.len() >= ROW_BUFFER_MAX_ROWS
-            || self.bytes >= DECODE_CHUNK_BYTES
-    }
-
-    pub async fn flush(&mut self, msg_tx: &mpsc::Sender<BatcherMsg>) -> Result<(), BatcherClosed> {
-        if self.chunk.rows.is_empty() {
-            return Ok(());
-        }
-        self.bytes = 0;
-        let next = Self::new(self.chunk.permit.clone()).chunk;
-        let chunk = std::mem::replace(&mut self.chunk, next);
-        msg_tx
-            .send(BatcherMsg::Rows(chunk))
-            .await
-            .map_err(|_| BatcherClosed)
-    }
-}
-
 /// Planned segment placed under its seq
 pub struct PlacedSegment {
     pub seq: u64,
     pub chunks: Vec<EncodedChunk>,
     /// Released post-insert-ack, when every covering `InsertBatch` drops
     pub permit: Option<Arc<crate::budget::MemoryPermit>>,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl PlacedSegment {
+    /// Segment of owned rows under one table, each encoded as its own op
+    pub fn of_rows(
+        seq: u64,
+        rel: &Arc<RelDescriptor>,
+        route: &Arc<RouteSnapshot>,
+        rows: &[CommittedTuple],
+    ) -> Result<Self, crate::ch::EmitterError> {
+        use crate::emit::pipeline::plan_spool::{ChunkBuilder, op_code};
+        let mut builder = ChunkBuilder::new(usize::MAX, usize::MAX);
+        let leaf = route.partition.as_ref().map(|p| p.leaf);
+        for r in rows {
+            let op = op_code(r.decoded.op)?;
+            builder.append((), rel, route, |enc| {
+                enc.append_routed(r, &route.mapping, op, leaf)
+            })?;
+        }
+        Ok(Self {
+            seq,
+            chunks: builder.take()?.into_iter().map(|(_, c)| c).collect(),
+            permit: None,
+        })
+    }
+}
+
+/// `(seq, mapped cells)` per row of `segments`, see [`EncodedChunk::cells`]
+#[cfg(test)]
+pub(crate) fn segment_rows(
+    segments: &[PlacedSegment],
+) -> Vec<(u64, Vec<crate::decode::heap_decoder::ColumnValue>)> {
+    segments
+        .iter()
+        .flat_map(|s| {
+            s.chunks
+                .iter()
+                .flat_map(|c| c.cells())
+                .map(move |cells| (s.seq, cells))
+        })
+        .collect()
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -266,12 +193,9 @@ pub(crate) struct InsertBatch {
 /// process ahead of rows enqueued before it — else flush seals a partial set
 /// and falsely signals "earlier data sealed", pinning the durability wait.
 pub enum BatcherMsg {
-    /// Chunk of rows from one placement (see [`DECODE_CHUNK_BYTES`]),
-    /// amortizing the per-row channel-send + cross-thread wakeup — the
-    /// dominant coordination cost under sustained load. Rows may carry
-    /// different `seq`s; batcher routes each independently.
-    Rows(RowChunk),
-    /// Planned segments staged across commits, one hop for the lot
+    /// Segments staged across commits, one hop for the lot, amortizing the
+    /// channel send + cross-thread wakeup that dominates coordination
+    /// under sustained load
     Segments(Vec<PlacedSegment>),
     /// Seal every open table, push to inserters, reply. Barrier (drain before
     /// DDL/TRUNCATE) and shutdown.
@@ -299,7 +223,6 @@ struct Table {
     meta: Arc<BatchMeta>,
     seq_counts: Vec<(u64, u64)>,
     slice_permits: Vec<Arc<crate::budget::MemoryPermit>>,
-    value_permits: Vec<Arc<crate::budget::MemoryPermit>>,
     deadline: Option<Instant>,
 }
 
@@ -352,7 +275,6 @@ impl Tables {
             meta,
             seq_counts: Vec::new(),
             slice_permits: Vec::new(),
-            value_permits: Vec::new(),
             deadline: None,
         });
         Ok(*e.insert(self.open.len() - 1))
@@ -425,14 +347,6 @@ pub(crate) fn spawn(
             }
             tokio::select! {
                 msg = msg_rx.recv() => match msg {
-                    Some(BatcherMsg::Rows(chunk)) => {
-                        let live = effective_cfg(&cfg, snapshot(config_rx.as_ref()).as_deref());
-                        let ctx = RowCtx { cfg: live, out: &out, alloc, epoch, stats };
-                        if let Err(e) = handle_rows(&mut tables, &ctx, chunk).await {
-                            fatal.set(format!("batcher: {e}"));
-                            break;
-                        }
-                    }
                     Some(BatcherMsg::Segments(segments)) => {
                         let live = effective_cfg(&cfg, snapshot(config_rx.as_ref()).as_deref());
                         let ctx = RowCtx { cfg: live, out: &out, alloc, epoch, stats };
@@ -511,63 +425,6 @@ async fn config_changed(rx: &mut Option<watch::Receiver<Arc<ResolvedConfig>>>) {
     } else {
         std::future::pending::<()>().await
     }
-}
-
-/// Process a decoder's row chunk in order. Chunk only amortizes the channel
-/// hop, not the coalescing; budget/deadline trips behave per-row.
-async fn handle_rows(tables: &mut Tables, ctx: &RowCtx<'_>, chunk: RowChunk) -> Result<(), String> {
-    ctx.stats
-        .insertbatch_rows_in
-        .fetch_add(chunk.rows.len() as u64, Ordering::Relaxed);
-    let slots = chunk
-        .tables
-        .iter()
-        .map(|t| tables.slot(ctx, t))
-        .collect::<Result<Vec<_>, _>>()?;
-    for row in chunk.rows {
-        let i = row.table as usize;
-        let route = &chunk.tables[i].route;
-        handle_row(tables, ctx, slots[i], route, row, chunk.permit.as_ref()).await?;
-    }
-    Ok(())
-}
-
-async fn handle_row(
-    tables: &mut Tables,
-    ctx: &RowCtx<'_>,
-    slot: usize,
-    route: &RouteSnapshot,
-    row: RoutedRow,
-    slice_permit: Option<&Arc<crate::budget::MemoryPermit>>,
-) -> Result<(), String> {
-    let t = &mut tables.open[slot];
-    let op = match row.committed.decoded.op {
-        HeapOp::Insert => OP_INSERT,
-        HeapOp::Update | HeapOp::HotUpdate => OP_UPDATE,
-        HeapOp::Delete => OP_DELETE,
-        // TRUNCATE is a reorder barrier; must never route here
-        HeapOp::Truncate => return Err("TRUNCATE routed to batcher".into()),
-    };
-    // Seal before appending row that exceeds oracle frame threshold
-    let leaf = route.partition.as_ref().map(|p| p.leaf);
-    let append = t
-        .enc
-        .append_routed(&row.committed, &route.mapping, op, leaf)
-        .map_err(|e| e.to_string())?;
-    if append == Append::Full {
-        t.seal_block()?;
-        t.enc
-            .append_routed(&row.committed, &route.mapping, op, leaf)
-            .map_err(|e| e.to_string())?;
-    }
-    if let Some(p) = row.value_permit
-        && t.value_permits
-            .last()
-            .is_none_or(|held| !Arc::ptr_eq(held, &p))
-    {
-        t.value_permits.push(p);
-    }
-    appended(tables, ctx, slot, row.seq, 1, slice_permit).await
 }
 
 /// Merge each chunk of a planned segment into its destination's batch
@@ -686,12 +543,10 @@ async fn emit_batch(t: &mut Table, out: &BatchOutput, stats: &EmitterStats) -> R
     if n_rows == 0 {
         t.seq_counts.clear();
         t.slice_permits.clear();
-        t.value_permits.clear();
         return Ok(());
     }
     let per_seq = std::mem::take(&mut t.seq_counts);
-    let mut permits = std::mem::take(&mut t.slice_permits);
-    permits.append(&mut t.value_permits);
+    let permits = std::mem::take(&mut t.slice_permits);
     // Separate pool avoids waiting on decoded payload held by this batch
     let encoded = out.budget.acquire(bytes).await;
     let batch = InsertBatch {
@@ -750,7 +605,9 @@ async fn flush_all(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::decode::heap_decoder::{ColumnValue, DecodedHeap, DecodedTuple, HeapOp};
+    use crate::decode::heap_decoder::{
+        ColumnValue, CommittedTuple, DecodedHeap, DecodedTuple, HeapOp,
+    };
     use crate::mapping::{ColumnMapping, TableMapping, TableTarget};
     use crate::schema::{RelAttr, RelDescriptor, RelName, ReplIdent};
     use tokio::sync::oneshot;
@@ -813,48 +670,20 @@ mod tests {
         one(rel_named(table), route_named(table), tuple(seq, id))
     }
 
-    fn one(rel: Arc<RelDescriptor>, route: Arc<RouteSnapshot>, row: RoutedRow) -> BatcherMsg {
-        BatcherMsg::Rows(RowChunk {
-            tables: vec![RowTable { rel, route }],
-            rows: vec![row],
-            permit: None,
-        })
+    fn one(
+        rel: Arc<RelDescriptor>,
+        route: Arc<RouteSnapshot>,
+        (seq, row): (u64, CommittedTuple),
+    ) -> BatcherMsg {
+        BatcherMsg::Segments(vec![
+            PlacedSegment::of_rows(seq, &rel, &route, &[row]).unwrap(),
+        ])
     }
 
-    #[tokio::test]
-    async fn row_buffer_flushes_leaf_permit_with_buffered_rows() {
-        let (tx, mut rx) = mpsc::channel(1);
-        let budget = crate::budget::MemoryBudget::new(256);
-        let mut row_buffer = RowBuffer::default();
-        let (rel, route) = (rel_named("t"), route_named("t"));
-        for id in 0..2 {
-            let row = tuple(0, id);
-            let permit = if id == 1 {
-                Some(Arc::new(budget.acquire(256).await))
-            } else {
-                None
-            };
-            row_buffer
-                .push(&tx, row.seq, (&rel, &route), row.committed, permit)
-                .await
-                .unwrap();
-        }
-        let BatcherMsg::Rows(chunk) = rx.try_recv().expect("flush pinned row") else {
-            panic!("expected rows");
-        };
-        assert_eq!(chunk.rows.len(), 2);
-        assert_eq!(budget.resident_bytes(), 256);
-        drop(chunk);
-        assert_eq!(budget.resident_bytes(), 0);
-        row_buffer.flush(&tx).await.unwrap();
-        assert!(rx.try_recv().is_err());
-    }
-
-    fn tuple(seq: u64, id: i32) -> RoutedRow {
-        RoutedRow {
+    fn tuple(seq: u64, id: i32) -> (u64, CommittedTuple) {
+        (
             seq,
-            table: 0,
-            committed: CommittedTuple {
+            CommittedTuple {
                 decoded: DecodedHeap {
                     rfn: RelFileNode {
                         spc_node: 1663,
@@ -873,8 +702,7 @@ mod tests {
                 commit_ts: 0,
                 commit_lsn: (seq + 1) * 100,
             },
-            value_permit: None,
-        }
+        )
     }
 
     fn text_table(target_type: &str) -> (Arc<RelDescriptor>, Arc<RouteSnapshot>) {
@@ -929,62 +757,6 @@ mod tests {
             msg_tx.send(row(1, id)).await.expect("send seq1");
         }
         // Drop sender → final flush + graceful exit
-        drop(msg_tx);
-
-        let mut total = 0u64;
-        let mut per_seq = std::collections::BTreeMap::new();
-        while let Ok(b) = batches_rx.recv().await {
-            total += b.n_rows as u64;
-            for (seq, n) in b.per_seq {
-                *per_seq.entry(seq).or_insert(0) += n;
-            }
-        }
-        handle.await.expect("batcher task");
-        assert_eq!(total, 5, "all rows sealed exactly once");
-        assert_eq!(per_seq, [(0, 3), (1, 2)].into(), "rows per seq");
-        assert!(fatal.message().is_none(), "no fatal: {:?}", fatal.message());
-    }
-
-    /// A mixed-seq `Rows` chunk trips the budget mid-chunk yet reconciles
-    /// per-seq same as the per-row path — chunk boundary is purely a
-    /// channel-hop amortization (point of `DECODE_CHUNK_ROWS`).
-    #[tokio::test]
-    async fn rows_chunk_trips_budget_and_tracks_per_seq() {
-        let (msg_tx, msg_rx) = mpsc::channel(64);
-        let (batches_tx, batches_rx) = async_channel::bounded(64);
-        let fatal = Fatal::new();
-        let handle = spawn(
-            msg_rx,
-            batches_tx,
-            BatcherConfig {
-                row_budget: 2,
-                inserters: 1,
-                byte_budget: 1 << 30,
-                flush_timeout: Duration::from_secs(3600),
-            },
-            Allocator::global(&mimalloc::MiMalloc),
-            fatal.clone(),
-            Arc::new(EmitterStats::default()),
-            None,
-        );
-        let chunk = RowChunk {
-            tables: vec![RowTable {
-                rel: rel_named("t"),
-                route: route_named("t"),
-            }],
-            rows: vec![
-                tuple(0, 0),
-                tuple(0, 1),
-                tuple(0, 2),
-                tuple(1, 0),
-                tuple(1, 1),
-            ],
-            permit: None,
-        };
-        msg_tx
-            .send(BatcherMsg::Rows(chunk))
-            .await
-            .expect("send chunk");
         drop(msg_tx);
 
         let mut total = 0u64;
@@ -1357,7 +1129,7 @@ mod tests {
         for i in 0..2 {
             let (rel, route) = text_table("String");
             let mut r = tuple(i, 1);
-            r.committed.decoded.new.as_mut().unwrap().columns =
+            r.1.decoded.new.as_mut().unwrap().columns =
                 vec![Some(ColumnValue::Text("x".repeat(64 << 10)))];
             tx.send(one(rel, route, r)).await.unwrap();
         }
@@ -1386,40 +1158,22 @@ mod tests {
         seq: u64,
         rel: &Arc<RelDescriptor>,
         route: &Arc<RouteSnapshot>,
-        rows: Vec<RoutedRow>,
+        rows: Vec<(u64, CommittedTuple)>,
     ) -> BatcherMsg {
-        let plan =
-            TablePlan::for_route(Allocator::global(&mimalloc::MiMalloc), rel, route).unwrap();
-        let mut enc = TableEncoder::new(plan).unwrap();
-        for r in &rows {
-            assert_eq!(
-                enc.append_routed(&r.committed, &route.mapping, OP_INSERT, None)
-                    .unwrap(),
-                Append::Done
-            );
-        }
-        let (buffers, rows) = enc.take_block().unwrap();
-        BatcherMsg::Segments(vec![PlacedSegment {
-            seq,
-            chunks: vec![EncodedChunk {
-                rel: rel.clone(),
-                route: route.clone(),
-                buffers,
-                rows,
-            }],
-            permit: None,
-        }])
+        let rows: Vec<_> = rows.into_iter().map(|(_, r)| r).collect();
+        let segment = PlacedSegment::of_rows(seq, rel, route, &rows).unwrap();
+        assert_eq!(segment.chunks.len(), 1, "one chunk per segment");
+        BatcherMsg::Segments(vec![segment])
     }
 
-    fn text_row(seq: u64, id: i32, text: &str) -> RoutedRow {
+    fn text_row(seq: u64, id: i32, text: &str) -> (u64, CommittedTuple) {
         let mut r = tuple(seq, id);
-        r.committed.decoded.new.as_mut().unwrap().columns =
-            vec![Some(ColumnValue::Text(text.into()))];
+        r.1.decoded.new.as_mut().unwrap().columns = vec![Some(ColumnValue::Text(text.into()))];
         r
     }
 
     /// Chunks of several transactions merge into one batch with string
-    /// offsets rebased, matching rows batched one at a time
+    /// offsets rebased, matching one-row chunks
     #[tokio::test]
     async fn segments_merge_like_rows() {
         let (rel, route) = text_table("Nullable(String)");
@@ -1475,32 +1229,6 @@ mod tests {
             tx.send(segment(seq, &rel, &route, vec![text_row(seq, 1, &big)]))
                 .await
                 .unwrap();
-        }
-        drop(tx);
-        let b = rx.recv().await.unwrap();
-        assert!(rx.recv().await.is_err(), "one INSERT");
-        assert_eq!(b.per_seq, [(0, 1), (1, 1)]);
-        assert_eq!(
-            b.blocks.iter().map(|b| b.n_rows).collect::<Vec<_>>(),
-            [1, 1]
-        );
-        handle.await.unwrap();
-        assert!(!fatal.is_set());
-    }
-
-    /// Row that would push oracle cells past the seal threshold opens the
-    /// next block of the same INSERT
-    #[tokio::test]
-    async fn oracle_seal_moves_row_to_next_block() {
-        let (tx, rx, fatal, handle) =
-            spawn_deadline_batcher(partial_block_cfg(Duration::from_secs(60)), None);
-        let big = "x".repeat(crate::ops::oracle::ORACLE_BATCH_SEAL_BYTES * 3 / 5);
-        for i in 0..2 {
-            let (rel, route) = text_table("Array(Nullable(String))");
-            let mut r = tuple(i, 1);
-            r.committed.decoded.new.as_mut().unwrap().columns =
-                vec![Some(ColumnValue::Text(big.clone()))];
-            tx.send(one(rel, route, r)).await.unwrap();
         }
         drop(tx);
         let b = rx.recv().await.unwrap();

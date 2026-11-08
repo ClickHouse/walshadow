@@ -185,6 +185,7 @@ pub struct DescribedInput {
 }
 
 impl DescribedInput {
+    #[cfg(any(test, feature = "test-support"))]
     /// Owned cells per tuple, through the cell adapter
     pub fn decode(
         &self,

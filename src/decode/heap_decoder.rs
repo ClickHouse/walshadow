@@ -447,7 +447,7 @@ impl<'a> TupleBuild<'a> for DecodedTuple {
 
 /// Tuple image borrowing its record. Indexed by attnum-1 like
 /// [`DecodedTuple::columns`]; inline up to 32 attributes
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct TupleView<'a> {
     pub datums: SmallVec<[DatumRef<'a>; 32]>,
     pub partial: bool,
@@ -689,7 +689,8 @@ fn decode_multi_insert<'a, T: TupleBuild<'a>>(
                 have: data.len().saturating_sub(cursor),
             });
         }
-        let tup = walk_tuple(&data[..cursor + datalen], header, cursor, rel, 0)?;
+        let mut tup = TupleBuild::with_capacity(rel.attributes.len());
+        walk_tuple(&data[..cursor + datalen], header, cursor, rel, 0, &mut tup)?;
         cursor += datalen;
         out.push(HeapImages {
             op: HeapOp::Insert,
@@ -821,6 +822,95 @@ pub fn view_block_data<'a>(
     decode_tuple_payload(block_data, 0, rel, 0)
 }
 
+/// [`view_block_data`] refilling `out`, sparing a bulk loop the return copy
+pub fn view_block_data_into<'a>(
+    block_data: &'a [u8],
+    rel: &RelDescriptor,
+    out: &mut TupleView<'a>,
+) -> Result<(), DecodeError> {
+    out.datums.clear();
+    out.partial = false;
+    decode_tuple_payload_into(block_data, 0, rel, 0, out)
+}
+
+/// Validate a `block.data`-shaped buffer without building attributes
+pub fn scan_block_data(block_data: &[u8], rel: &RelDescriptor) -> Result<TupleShape, DecodeError> {
+    decode_tuple_payload(block_data, 0, rel, 0)
+}
+
+/// `block.data` image of `values` as `heap_fill_tuple` lays them out, each
+/// stored per its variant's PostgreSQL type. Covers fixed-width, text,
+/// bytea and external pointer cells
+#[cfg(any(test, feature = "test-support"))]
+pub fn form_block_data(values: &[Option<ColumnValue>]) -> Vec<u8> {
+    let natts = values.len();
+    let has_null = values
+        .iter()
+        .any(|v| matches!(v, None | Some(ColumnValue::Null)));
+    let bitmap_len = if has_null { natts.div_ceil(8) } else { 0 };
+    let hoff = (SIZE_OF_HEAP_TUPLE_HEADER + bitmap_len).next_multiple_of(8);
+    let mut bitmap = vec![0u8; bitmap_len];
+    let mut data = Vec::new();
+    let varlena = |body: &[u8]| {
+        if body.len() < 127 {
+            let mut v = vec![(((body.len() + 1) << 1) | 1) as u8];
+            v.extend_from_slice(body);
+            (v, 1)
+        } else {
+            let mut v = (((body.len() + 4) as u32) << 2).to_le_bytes().to_vec();
+            v.extend_from_slice(body);
+            (v, 4)
+        }
+    };
+    for (i, v) in values.iter().enumerate() {
+        let (bytes, align) = match v {
+            None | Some(ColumnValue::Null) => continue,
+            Some(ColumnValue::Bool(b)) => (vec![u8::from(*b)], 1),
+            Some(ColumnValue::Char(c)) => (vec![*c as u8], 1),
+            Some(ColumnValue::Int2(n)) => (n.to_le_bytes().to_vec(), 2),
+            Some(ColumnValue::Int4(n) | ColumnValue::Date(n)) => (n.to_le_bytes().to_vec(), 4),
+            Some(ColumnValue::Oid(n)) => (n.to_le_bytes().to_vec(), 4),
+            Some(ColumnValue::Float4(f)) => (f.to_le_bytes().to_vec(), 4),
+            Some(
+                ColumnValue::Int8(n)
+                | ColumnValue::Time(n)
+                | ColumnValue::Timestamp(n)
+                | ColumnValue::TimestampTz(n),
+            ) => (n.to_le_bytes().to_vec(), 8),
+            Some(ColumnValue::Oid8(n)) => (n.to_le_bytes().to_vec(), 8),
+            Some(ColumnValue::Float8(f)) => (f.to_le_bytes().to_vec(), 8),
+            Some(ColumnValue::Uuid(u)) => (u.to_vec(), 1),
+            Some(ColumnValue::Text(t) | ColumnValue::Json(t)) => varlena(t.as_bytes()),
+            Some(ColumnValue::Bytea(b)) => varlena(b),
+            Some(ColumnValue::ExternalToast(p)) => {
+                let mut v = vec![0x01, 18];
+                for word in [
+                    p.va_rawsize as u32,
+                    p.va_extinfo,
+                    p.va_valueid,
+                    p.va_toastrelid,
+                ] {
+                    v.extend_from_slice(&word.to_le_bytes());
+                }
+                (v, 1)
+            }
+            Some(other) => unimplemented!("form_block_data: {other:?}"),
+        };
+        if has_null {
+            bitmap[i / 8] |= 1 << (i % 8);
+        }
+        data.resize(data.len().next_multiple_of(align), 0);
+        data.extend_from_slice(&bytes);
+    }
+    let mut out = (natts as u16).to_le_bytes().to_vec();
+    out.extend_from_slice(&if has_null { HEAP_HASNULL } else { 0 }.to_le_bytes());
+    out.push(hoff as u8);
+    out.extend_from_slice(&bitmap);
+    out.resize(SIZE_OF_HEAP_HEADER + hoff - SIZE_OF_HEAP_TUPLE_HEADER, 0);
+    out.extend_from_slice(&data);
+    out
+}
+
 /// Fields PG strips into `xl_heap_header` or `xl_multi_insert_tuple`
 #[derive(Clone, Copy)]
 struct TupleHeader {
@@ -837,12 +927,25 @@ struct TupleHeader {
 /// it or past end of `buf` surface absent and caller flips `partial`.
 /// Bitmap + xl_heap_header precede prefix elision so are always present at
 /// `header_off`.
+#[inline]
 fn decode_tuple_payload<'a, T: TupleBuild<'a>>(
     buf: &'a [u8],
     header_off: usize,
     rel: &RelDescriptor,
     prefixlen: usize,
 ) -> Result<T, DecodeError> {
+    let mut out = T::with_capacity(rel.attributes.len());
+    decode_tuple_payload_into(buf, header_off, rel, prefixlen, &mut out)?;
+    Ok(out)
+}
+
+fn decode_tuple_payload_into<'a, T: TupleBuild<'a>>(
+    buf: &'a [u8],
+    header_off: usize,
+    rel: &RelDescriptor,
+    prefixlen: usize,
+    out: &mut T,
+) -> Result<(), DecodeError> {
     if buf.len() < header_off + SIZE_OF_HEAP_HEADER {
         return Err(DecodeError::Truncated {
             offset: header_off,
@@ -862,6 +965,7 @@ fn decode_tuple_payload<'a, T: TupleBuild<'a>>(
         header_off + SIZE_OF_HEAP_HEADER,
         rel,
         prefixlen,
+        out,
     )
 }
 
@@ -873,7 +977,8 @@ fn walk_tuple<'a, T: TupleBuild<'a>>(
     bitmap_off: usize,
     rel: &RelDescriptor,
     prefixlen: usize,
-) -> Result<T, DecodeError> {
+    out: &mut T,
+) -> Result<(), DecodeError> {
     let t_hoff = usize::from(header.hoff);
     if t_hoff < SIZE_OF_HEAP_TUPLE_HEADER {
         return Err(DecodeError::BadHoff {
@@ -901,7 +1006,6 @@ fn walk_tuple<'a, T: TupleBuild<'a>>(
     let col_data_off = bitmap_off + (t_hoff - SIZE_OF_HEAP_TUPLE_HEADER);
 
     let attrs = &rel.attributes;
-    let mut out = T::with_capacity(attrs.len());
     // Mark this + every later col absent
     let absent_from = |out: &mut T, idx: usize| {
         for att in &attrs[idx..] {
@@ -950,8 +1054,8 @@ fn walk_tuple<'a, T: TupleBuild<'a>>(
             // accounting only; varlena width needs its bytes so later cols
             // stay absent too
             let Some(n) = decoded_size_or_skip(att) else {
-                absent_from(&mut out, idx);
-                return Ok(out);
+                absent_from(out, idx);
+                return Ok(());
             };
             out.push(att, DatumRef::Absent);
             cur += n;
@@ -970,15 +1074,15 @@ fn walk_tuple<'a, T: TupleBuild<'a>>(
         let (datum, consumed) = match read_datum(att, buf, abs) {
             Ok(v) => v,
             Err(DecodeError::Truncated { .. }) => {
-                absent_from(&mut out, idx);
-                return Ok(out);
+                absent_from(out, idx);
+                return Ok(());
             }
             Err(e) => return Err(e),
         };
         out.push(att, datum);
         cur += consumed;
     }
-    Ok(out)
+    Ok(())
 }
 
 /// Resolve a column's fast default ([`RelAttr::missing_default`]) to a value;
@@ -1586,6 +1690,25 @@ fn read_cstring(buf: &[u8], abs: usize) -> Result<(DatumRef<'_>, usize), DecodeE
         })?;
     // include trailing NUL
     Ok((DatumRef::Cstring(&buf[abs..abs + end]), end + 1))
+}
+
+/// `(chunk_id, chunk_seq, chunk_data)` of a `pg_toast_*` tuple's 3 datums;
+/// `None` for shapes that don't fit
+pub(crate) fn toast_chunk_datums<'a>(datums: &[DatumRef<'a>]) -> Option<(u32, u32, &'a [u8])> {
+    let [
+        DatumRef::Fixed(id),
+        DatumRef::Fixed(seq),
+        DatumRef::Varlena(data),
+        ..,
+    ] = *datums
+    else {
+        return None;
+    };
+    Some((
+        u32::from_le_bytes(id.try_into().ok()?),
+        u32::from_le_bytes(seq.try_into().ok()?),
+        data,
+    ))
 }
 
 /// Take `(chunk_id, chunk_seq, chunk_data)` out of a `pg_toast_*` tuple's

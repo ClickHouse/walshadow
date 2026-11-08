@@ -1,45 +1,23 @@
 # Encode PostgreSQL values directly into ClickHouse blocks
 
-Streaming commits plan rows straight from WAL bytes into column chunks, and
-sealed Native blocks stay compressed until acknowledgement; see
-[architecture](../architecture/README.md#commit-pipeline). Remaining work
-removes owned cells from load paths and TOAST rows and proves resource gains end
-to end. Follow [shared constraints](coordination.md),
+Commits, loads, and gap replay encode rows from tuple bytes or COPY fields into
+column chunks, and sealed Native blocks stay compressed until acknowledgement;
+see [architecture](../architecture/README.md#commit-pipeline). Remaining work
+moves stash-resolved records off owned cells, bounds memory across owners, and
+proves resource gains end to end. Follow [shared constraints](coordination.md),
 [value coercion](value_coercion.md), and [performance acceptance](performance.md)
 
 Share view encoders and column buffers with [container codecs](tier2.md)
-Container promotion can retain existing raw pending cells in owned adapters;
-complete load and TOAST cell removal is not a prerequisite
+Container promotion can retain existing raw pending cells in owned adapters
 
-## Encode loads directly
+## Stash-resolved records
 
-COPY and heap-page/bootstrap loads still decode every tuple into `ColumnValue`
-cells: [page walk](../src/backfill/backup_page_walk.rs) and
-[COPY](../src/backfill/copy_backfill.rs) fill `BackfillTuple` slabs, and
-[bootstrap drain](../src/emit/pipeline/bootstrap.rs) and
-[gap replay](../src/backfill/wal_replay.rs) stage cell rows through
-`RowBuffer`, the batcher's second input next to planned segments
-
-Carry tuple bytes or COPY fields through load queues instead of cells. Read
-visibility from tuple headers, which needs no columns. Encode visible rows into
-chunks with the shared view encoder; decode cells only where pending rows,
-deferred TOAST, and replacement evidence need them, keeping those mechanisms
-and staging publication unchanged. Binary COPY fields are big-endian `typsend`
-representations: add a field-view decoder beside the heap one, never reuse the
-heap byte-copy rule. Then ship load rows as planned segments and delete
-`RowChunk`/`RoutedRow` from the batcher
-
-Version the deferred TOAST spool if its tuple format changes. Rewrite bootstrap
-tests that inspect routed cells to read chunk columns
-
-## Detoast without cells
-
-Inputs whose images hold external pointers, stash-resolved records, and
-directly buffered heaps plan through the owned-cell adapter, since
-`detoast_heap` resolves cells. Resolve pointers from tuple views into bounded
-scratch, then encode with the view path, preserving size policy, fill modes,
-read-ahead transfer, and chunk generation fences. Compressed inline values and
-`numeric`/`jsonb` already decode through per-row scratch
+Records resolved at commit decode into owned cells in
+[transaction buffer](../src/xact/xact_buffer.rs) `fold_raw_ordinary`, then plan
+through the cell adapter. Carry them as raw inputs under their resolved
+descriptor instead, keeping operation policy and ambiguity fences at fold time.
+Resolved TOAST values stay owned cells patching tuple views; read-ahead hands
+them over rendered
 
 ## Bound memory across owners
 

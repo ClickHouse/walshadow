@@ -76,14 +76,17 @@ use walrus::pg::replication::conn::PgConfig;
 use crate::backfill::backfill_staging::{self, StagingPlan, StagingRel, StagingSession};
 use crate::backfill::backfill_types::{BackupRequest, PassContext, PassOutcome};
 use crate::backfill::backup_checkpoint::BackupCheckpoint;
-use crate::backfill::backup_page_walk::{BOOTSTRAP_TUPLE_CHANNEL_CAP, BackfillTuple, CatalogMap};
+use crate::backfill::backup_page_walk::{
+    BOOTSTRAP_TUPLE_CHANNEL_CAP, BackfillTuple, CatalogMap, TupleData,
+};
 use crate::backfill::opt_in::Backfiller;
 use crate::backfill::visibility_pending::{self, SharedPendingLedger};
 use crate::catalog::shadow_catalog::ShadowCatalog;
 use crate::config::{DestEmitter, ResolvedConfig};
 use crate::decode::codecs::NumericKind;
+use crate::decode::datum::ValueRef;
 use crate::decode::heap_decoder::ColumnValue;
-use crate::emit::ch_emitter::{EmitterStats, ToastMode};
+use crate::emit::ch_emitter::{Cell, EmitterStats, Slot, ToastMode};
 use crate::emit::pipeline::tail::OwnedTail;
 use crate::emit::pipeline::{Fatal, bootstrap};
 use crate::emit::route::{Routing, freeze_routes, routing};
@@ -423,8 +426,6 @@ enum WireKind {
 
 struct ColPlan {
     attnum: i16,
-    kind: WireKind,
-    type_oid: u32,
 }
 
 struct CopyPlan {
@@ -457,6 +458,17 @@ fn wire_kind(type_oid: u32) -> Option<WireKind> {
     })
 }
 
+/// Wire form a column selects as; out-of-matrix types cast to `text`.
+/// jsonb's send form prefixes a version byte; its text is the document the
+/// WAL path renders, so take that instead
+fn copy_kind(type_oid: u32) -> WireKind {
+    wire_kind(type_oid).unwrap_or(match type_oid {
+        JSONBOID => WireKind::Json,
+        NUMERICOID => WireKind::NumericText,
+        _ => WireKind::CastText,
+    })
+}
+
 fn column_plan(desc: &RelDescriptor) -> CopyPlan {
     let mut select = String::new();
     let mut cols = Vec::with_capacity(desc.attributes.len());
@@ -467,23 +479,16 @@ fn column_plan(desc: &RelDescriptor) -> CopyPlan {
             continue;
         }
         let ident = quote_ident(&a.name);
-        let (expr, kind) = match wire_kind(a.type_oid) {
-            Some(k) => (ident, k),
-            // jsonb's send form prefixes a version byte; its text is the
-            // document the WAL path renders, so take that instead
-            None if a.type_oid == JSONBOID => (format!("{ident}::text"), WireKind::Json),
-            None if a.type_oid == NUMERICOID => (format!("{ident}::text"), WireKind::NumericText),
-            None => (format!("{ident}::text"), WireKind::CastText),
+        let expr = if wire_kind(a.type_oid).is_some() {
+            ident
+        } else {
+            format!("{ident}::text")
         };
         if !select.is_empty() {
             select.push_str(", ");
         }
         select.push_str(&expr);
-        cols.push(ColPlan {
-            attnum: a.attnum,
-            kind,
-            type_oid: a.type_oid,
-        });
+        cols.push(ColPlan { attnum: a.attnum });
     }
     CopyPlan {
         select,
@@ -549,23 +554,14 @@ pub async fn copy_rows_into(
     let mut slab_bytes = 0usize;
     while let Some(row) = stream.next().await {
         let row = row.context("backfill: COPY stream")?;
-        let mut payload_bytes = 0u64;
-        let mut columns: Vec<Option<ColumnValue>> = vec![None; plan.natts];
+        let mut fields: Vec<Option<&[u8]>> = vec![None; plan.natts];
         for (i, cp) in plan.cols.iter().enumerate() {
-            let raw: Option<&[u8]> = row.try_get(i).context("backfill: COPY field")?;
-            payload_bytes += raw.map_or(0, |bytes| bytes.len() as u64);
-            let v = raw
-                .map(|raw| decode_field(cp.kind, cp.type_oid, raw))
-                .transpose()
-                .map_err(anyhow::Error::msg)?
-                .unwrap_or(ColumnValue::Null);
-            columns[(cp.attnum - 1).max(0) as usize] = Some(v);
+            fields[(cp.attnum - 1).max(0) as usize] =
+                row.try_get(i).context("backfill: COPY field")?;
         }
-        slab_bytes += columns
-            .iter()
-            .flatten()
-            .map(ColumnValue::approx_bytes)
-            .sum::<usize>();
+        let payload_bytes = fields.iter().flatten().map(|f| f.len() as u64).sum::<u64>();
+        let data = CopyRow::new(&fields);
+        slab_bytes += data.bytes().len();
         slab.push(BackfillTuple {
             rfn: desc.rfn,
             xid: 0,
@@ -576,7 +572,8 @@ pub async fn copy_rows_into(
             // COPY rows have no on-page TID
             blkno: 0,
             offnum: 0,
-            columns,
+            data: TupleData::Copy(data),
+            pending: None,
         });
         rows += 1;
         stats.backfill_copy_rows.fetch_add(1, Ordering::Relaxed);
@@ -678,54 +675,149 @@ fn fixed<const N: usize>(raw: &[u8], what: &str) -> Result<[u8; N], String> {
         .map_err(|_| format!("{what}: expected {N} bytes, got {}", raw.len()))
 }
 
-fn text_or_bytea(raw: &[u8], wrap: fn(String) -> ColumnValue) -> ColumnValue {
-    simdutf8::basic::from_utf8(raw)
-        .map_or_else(|_| ColumnValue::Bytea(raw.to_vec()), |s| wrap(s.into()))
+/// One binary COPY row: per attribute, `typsend` bytes or NULL. Laid out
+/// `[natts: u16][end: u32 per attribute][field bytes]`, an end's high bit
+/// marking NULL
+#[derive(Clone, Debug, PartialEq)]
+pub struct CopyRow(Box<[u8]>);
+
+const COPY_NULL: u32 = 1 << 31;
+
+impl CopyRow {
+    /// `fields` indexed by attnum - 1
+    pub fn new(fields: &[Option<&[u8]>]) -> Self {
+        let head = 2 + 4 * fields.len();
+        let body = fields.iter().flatten().map(|f| f.len()).sum::<usize>();
+        let mut out = Vec::with_capacity(head + body);
+        out.extend_from_slice(&(fields.len() as u16).to_le_bytes());
+        let mut end = 0u32;
+        for f in fields {
+            end += f.map_or(0, |f| f.len() as u32);
+            let mark = if f.is_none() { COPY_NULL } else { 0 };
+            out.extend_from_slice(&(end | mark).to_le_bytes());
+        }
+        for f in fields.iter().flatten() {
+            out.extend_from_slice(f);
+        }
+        Self(out.into())
+    }
+
+    /// Spooled bytes, see [`Self::from_bytes`]
+    pub fn bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    /// Row [`Self::bytes`] wrote; `None` when the header overruns them
+    pub fn from_bytes(bytes: Box<[u8]>) -> Option<Self> {
+        let row = Self(bytes);
+        let natts = row.natts()?;
+        let last = natts.checked_sub(1).map_or(Some(0), |i| row.end(i))?;
+        (row.0.len() == 2 + 4 * natts + last as usize).then_some(row)
+    }
+
+    fn natts(&self) -> Option<usize> {
+        Some(u16::from_le_bytes(self.0.get(..2)?.try_into().ok()?) as usize)
+    }
+
+    fn end(&self, i: usize) -> Option<u32> {
+        let at = 2 + 4 * i;
+        let word = u32::from_le_bytes(self.0.get(at..at + 4)?.try_into().ok()?);
+        Some(word & !COPY_NULL)
+    }
+
+    /// Field of attribute index `i`; `None` past the row or NULL
+    pub fn field(&self, i: usize) -> Option<&[u8]> {
+        let natts = self.natts()?;
+        if i >= natts {
+            return None;
+        }
+        let at = 2 + 4 * i;
+        let word = u32::from_le_bytes(self.0[at..at + 4].try_into().ok()?);
+        if word & COPY_NULL != 0 {
+            return None;
+        }
+        let start = if i == 0 { 0 } else { self.end(i - 1)? };
+        let base = 2 + 4 * natts;
+        self.0
+            .get(base + start as usize..base + (word & !COPY_NULL) as usize)
+    }
+}
+
+fn text_or_bytea<'a>(raw: &'a [u8], wrap: fn(&'a str) -> ValueRef<'a>) -> ValueRef<'a> {
+    simdutf8::basic::from_utf8(raw).map_or(ValueRef::Bytea(raw), wrap)
+}
+
+/// Value of attribute index `i` in heap-decoder shape; NULL past the row
+pub(crate) fn copy_slot<'a>(
+    row: &'a CopyRow,
+    rel: &RelDescriptor,
+    i: usize,
+) -> Result<Slot<'a>, String> {
+    let (Some(att), Some(raw)) = (rel.attributes.get(i), row.field(i)) else {
+        return Ok(Slot::Cell(Cell::Value(ValueRef::Null)));
+    };
+    decode_field(copy_kind(att.type_oid), att.type_oid, raw)
+}
+
+/// Owned cells of a COPY row, attnum-1 indexed
+pub(crate) fn copy_cells(
+    row: &CopyRow,
+    rel: &RelDescriptor,
+) -> Result<Vec<Option<ColumnValue>>, String> {
+    (0..rel.attributes.len())
+        .map(|i| copy_slot(row, rel, i).map(|v| Some(owned(v))))
+        .collect()
+}
+
+fn owned(slot: Slot<'_>) -> ColumnValue {
+    match slot {
+        Slot::Cell(Cell::Value(v)) => v.to_owned_value(),
+        Slot::Owned(v) => v,
+        Slot::Cell(_) => unreachable!("COPY fields decode to values"),
+    }
 }
 
 /// Decode non-NULL wire field into heap-decoder value shape
-fn decode_field(kind: WireKind, type_oid: u32, raw: &[u8]) -> Result<ColumnValue, String> {
-    Ok(match kind {
-        WireKind::Bool => ColumnValue::Bool(fixed::<1>(raw, "bool")?[0] != 0),
-        WireKind::Char => ColumnValue::Char(fixed::<1>(raw, "char")?[0] as i8),
-        WireKind::Int2 => ColumnValue::Int2(i16::from_be_bytes(fixed(raw, "int2")?)),
-        WireKind::Int4 => ColumnValue::Int4(i32::from_be_bytes(fixed(raw, "int4")?)),
-        WireKind::Int8 => ColumnValue::Int8(i64::from_be_bytes(fixed(raw, "int8")?)),
-        WireKind::Oid => ColumnValue::Oid(u32::from_be_bytes(fixed(raw, "oid")?)),
-        WireKind::Oid8 => ColumnValue::Oid8(u64::from_be_bytes(fixed(raw, "oid8")?)),
-        WireKind::Float4 => ColumnValue::Float4(f32::from_be_bytes(fixed(raw, "float4")?)),
-        WireKind::Float8 => ColumnValue::Float8(f64::from_be_bytes(fixed(raw, "float8")?)),
-        WireKind::Date => ColumnValue::Date(i32::from_be_bytes(fixed(raw, "date")?)),
-        WireKind::Time => ColumnValue::Time(i64::from_be_bytes(fixed(raw, "time")?)),
-        WireKind::Timestamp => ColumnValue::Timestamp(i64::from_be_bytes(fixed(raw, "timestamp")?)),
+fn decode_field(kind: WireKind, type_oid: u32, raw: &[u8]) -> Result<Slot<'_>, String> {
+    let v = match kind {
+        WireKind::Bool => ValueRef::Bool(fixed::<1>(raw, "bool")?[0] != 0),
+        WireKind::Char => ValueRef::Char(fixed::<1>(raw, "char")?[0] as i8),
+        WireKind::Int2 => ValueRef::Int2(i16::from_be_bytes(fixed(raw, "int2")?)),
+        WireKind::Int4 => ValueRef::Int4(i32::from_be_bytes(fixed(raw, "int4")?)),
+        WireKind::Int8 => ValueRef::Int8(i64::from_be_bytes(fixed(raw, "int8")?)),
+        WireKind::Oid => ValueRef::Oid(u32::from_be_bytes(fixed(raw, "oid")?)),
+        WireKind::Oid8 => ValueRef::Oid8(u64::from_be_bytes(fixed(raw, "oid8")?)),
+        WireKind::Float4 => ValueRef::Float4(f32::from_be_bytes(fixed(raw, "float4")?)),
+        WireKind::Float8 => ValueRef::Float8(f64::from_be_bytes(fixed(raw, "float8")?)),
+        WireKind::Date => ValueRef::Date(i32::from_be_bytes(fixed(raw, "date")?)),
+        WireKind::Time => ValueRef::Time(i64::from_be_bytes(fixed(raw, "time")?)),
+        WireKind::Timestamp => ValueRef::Timestamp(i64::from_be_bytes(fixed(raw, "timestamp")?)),
         WireKind::TimestampTz => {
-            ColumnValue::TimestampTz(i64::from_be_bytes(fixed(raw, "timestamptz")?))
+            ValueRef::TimestampTz(i64::from_be_bytes(fixed(raw, "timestamptz")?))
         }
-        WireKind::Uuid => ColumnValue::Uuid(fixed(raw, "uuid")?),
-        WireKind::Bytea => ColumnValue::Bytea(raw.to_vec()),
-        WireKind::Text => text_or_bytea(raw, ColumnValue::Text),
+        WireKind::Uuid => ValueRef::Uuid(fixed(raw, "uuid")?),
+        WireKind::Bytea => ValueRef::Bytea(raw),
+        WireKind::Text => text_or_bytea(raw, ValueRef::Text),
         // Preserve source type for typinput
         WireKind::CastText => match simdutf8::basic::from_utf8(raw) {
-            Ok(s) => ColumnValue::PgPendingText {
-                type_oid,
-                text: s.to_owned(),
-            },
-            Err(_) => ColumnValue::Bytea(raw.to_vec()),
+            Ok(text) => ValueRef::PgPendingText { type_oid, text },
+            Err(_) => ValueRef::Bytea(raw),
         },
-        WireKind::Name => text_or_bytea(raw, ColumnValue::Name),
-        WireKind::Json => text_or_bytea(raw, ColumnValue::Json),
+        WireKind::Name => text_or_bytea(raw, ValueRef::Name),
+        WireKind::Json => text_or_bytea(raw, ValueRef::Json),
         // numeric_out text form; specials carry their flag
         WireKind::NumericText => {
             let s = simdutf8::basic::from_utf8(raw)
                 .map_err(|_| "numeric::text not utf8".to_string())?;
-            ColumnValue::Numeric(match s {
+            return Ok(Slot::Owned(ColumnValue::Numeric(match s {
                 "NaN" => NumericKind::NaN,
                 "Infinity" => NumericKind::PInf,
                 "-Infinity" => NumericKind::NInf,
                 _ => NumericKind::Finite(s.into()),
-            })
+            })));
         }
-    })
+    };
+    Ok(Slot::Cell(Cell::Value(v)))
 }
 
 // ---------------------------------------------------------------------------
@@ -2104,58 +2196,58 @@ mod tests {
         );
         assert_eq!(plan.natts, 5);
         assert_eq!(plan.cols.len(), 4, "dropped column not selected");
-        assert_eq!(plan.cols[0].kind, WireKind::Int8);
-        assert_eq!(plan.cols[1].kind, WireKind::NumericText);
-        assert_eq!(plan.cols[2].kind, WireKind::CastText);
         assert_eq!(plan.cols[2].attnum, 4);
+        assert_eq!(copy_kind(INT8OID), WireKind::Int8);
+        assert_eq!(copy_kind(NUMERICOID), WireKind::NumericText);
+        assert_eq!(copy_kind(1009), WireKind::CastText);
         // jsonb_out text, the document shape the WAL path yields
-        assert_eq!(plan.cols[3].kind, WireKind::Json);
+        assert_eq!(copy_kind(JSONBOID), WireKind::Json);
     }
 
     #[test]
     fn decode_matches_wal_variants() {
         assert_eq!(
-            decode_field(WireKind::Int8, 0, &7i64.to_be_bytes()).unwrap(),
+            owned(decode_field(WireKind::Int8, 0, &7i64.to_be_bytes()).unwrap()),
             ColumnValue::Int8(7),
         );
         assert_eq!(
-            decode_field(WireKind::Bool, 0, &[1]).unwrap(),
+            owned(decode_field(WireKind::Bool, 0, &[1]).unwrap()),
             ColumnValue::Bool(true),
         );
         assert_eq!(
-            decode_field(WireKind::Date, 0, &8000i32.to_be_bytes()).unwrap(),
+            owned(decode_field(WireKind::Date, 0, &8000i32.to_be_bytes()).unwrap()),
             ColumnValue::Date(8000),
         );
         assert_eq!(
-            decode_field(WireKind::Text, 0, b"abc").unwrap(),
+            owned(decode_field(WireKind::Text, 0, b"abc").unwrap()),
             ColumnValue::Text("abc".into()),
         );
         assert_eq!(
-            decode_field(WireKind::Name, 0, b"orders").unwrap(),
+            owned(decode_field(WireKind::Name, 0, b"orders").unwrap()),
             ColumnValue::Name("orders".into()),
         );
         assert_eq!(
-            decode_field(WireKind::Json, 0, b"{\"a\": 1}").unwrap(),
+            owned(decode_field(WireKind::Json, 0, b"{\"a\": 1}").unwrap()),
             ColumnValue::Json("{\"a\": 1}".into()),
         );
         assert_eq!(
-            decode_field(WireKind::NumericText, 0, b"12.50").unwrap(),
+            owned(decode_field(WireKind::NumericText, 0, b"12.50").unwrap()),
             ColumnValue::Numeric(NumericKind::Finite("12.50".into())),
         );
         assert_eq!(
-            decode_field(WireKind::NumericText, 0, b"NaN").unwrap(),
+            owned(decode_field(WireKind::NumericText, 0, b"NaN").unwrap()),
             ColumnValue::Numeric(NumericKind::NaN),
         );
         assert_eq!(
-            decode_field(WireKind::NumericText, 0, b"Infinity").unwrap(),
+            owned(decode_field(WireKind::NumericText, 0, b"Infinity").unwrap()),
             ColumnValue::Numeric(NumericKind::PInf),
         );
         assert_eq!(
-            decode_field(WireKind::NumericText, 0, b"-Infinity").unwrap(),
+            owned(decode_field(WireKind::NumericText, 0, b"-Infinity").unwrap()),
             ColumnValue::Numeric(NumericKind::NInf),
         );
         assert_eq!(
-            decode_field(WireKind::CastText, 1007, b"{1,2}").unwrap(),
+            owned(decode_field(WireKind::CastText, 1007, b"{1,2}").unwrap()),
             ColumnValue::PgPendingText {
                 type_oid: 1007,
                 text: "{1,2}".into(),
@@ -2165,7 +2257,7 @@ mod tests {
         assert!(decode_field(WireKind::Int4, 0, &[0, 1]).is_err());
         // Invalid UTF-8 degrades to Bytea like the heap decoder
         assert_eq!(
-            decode_field(WireKind::Text, 0, &[0xFF, 0xFE]).unwrap(),
+            owned(decode_field(WireKind::Text, 0, &[0xFF, 0xFE]).unwrap()),
             ColumnValue::Bytea(vec![0xFF, 0xFE]),
         );
     }
