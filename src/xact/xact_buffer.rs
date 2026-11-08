@@ -966,7 +966,7 @@ impl XactBuffer {
         xid: u32,
     ) -> std::result::Result<(), XactBufferError> {
         let first_lsn = chunk.source_lsn;
-        let entry = SpillEntry::Chunk(chunk);
+        let entry = SpillEntry::Chunk(Box::new(chunk));
         self.absorb(xid, first_lsn, entry).await
     }
 
@@ -979,7 +979,7 @@ impl XactBuffer {
         xid: u32,
     ) -> std::result::Result<(), XactBufferError> {
         let first_lsn = delete.source_lsn;
-        self.absorb(xid, first_lsn, SpillEntry::ToastDelete(delete))
+        self.absorb(xid, first_lsn, SpillEntry::ToastDelete(Box::new(delete)))
             .await
     }
 
@@ -1795,8 +1795,8 @@ impl MergedDrain {
                             self.check_owned(h.decoded.xid)?;
                             return Ok(Some(MergeItem::Heap(h)));
                         }
-                        SpillEntry::Chunk(c) => self.fold_chunk(c)?,
-                        SpillEntry::ToastDelete(d) => self.fold_delete(d)?,
+                        SpillEntry::Chunk(c) => self.fold_chunk(*c)?,
+                        SpillEntry::ToastDelete(d) => self.fold_delete(*d)?,
                         SpillEntry::Raw(raw) => self.fold_raw(&raw)?,
                     }
                 }
