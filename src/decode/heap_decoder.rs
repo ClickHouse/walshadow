@@ -450,17 +450,17 @@ impl<'a> TupleBuild<'a> for DecodedTuple {
 }
 
 /// Tuple image borrowing its record. Indexed by attnum-1 like
-/// [`DecodedTuple::columns`]; inline up to 32 attributes
+/// [`DecodedTuple::columns`]
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct TupleView<'a> {
-    pub datums: SmallVec<[DatumRef<'a>; 32]>,
+    pub datums: Vec<DatumRef<'a>>,
     pub partial: bool,
 }
 
 impl<'a> TupleBuild<'a> for TupleView<'a> {
     fn with_capacity(n: usize) -> Self {
         Self {
-            datums: SmallVec::with_capacity(n),
+            datums: Vec::with_capacity(n),
             partial: false,
         }
     }
@@ -577,12 +577,60 @@ impl<'a> From<&'a XLogRecord<'_>> for HeapRecordBytes<'a> {
     }
 }
 
-/// Validate `record` as [`decode_heap_record`] would, without building cells
-pub fn scan_heap_record(
-    record: &XLogRecord<'_>,
-    rel: &RelDescriptor,
-) -> Result<SmallVec<[HeapImages<TupleShape>; 1]>, DecodeError> {
-    parse_heap_record(record.into(), rel)
+/// Heap record summary read from its headers, tuple bytes unchecked
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RecordShape {
+    pub op: HeapOp,
+    pub tuples: u16,
+    /// PG elided an update's prefix or suffix
+    pub partial: bool,
+}
+
+/// Shape of a record [`view_heap_record`] yields images for, `None` when it
+/// yields none
+pub fn record_shape<'a>(
+    record: impl Into<HeapRecordBytes<'a>>,
+) -> Result<Option<RecordShape>, DecodeError> {
+    let record = record.into();
+    let md = record.main_data;
+    let heap2 = record.rm == RmId::Heap2 as u8;
+    let (op, need) = match record.info & XLOG_HEAP_OPMASK {
+        XLOG_HEAP2_MULTI_INSERT if heap2 => (HeapOp::Insert, SIZE_OF_HEAP_MULTI_INSERT),
+        _ if heap2 || record.rm != RmId::Heap as u8 => return Ok(None),
+        XLOG_HEAP_INSERT => (HeapOp::Insert, 0),
+        XLOG_HEAP_UPDATE => (HeapOp::Update, SIZE_OF_HEAP_UPDATE),
+        XLOG_HEAP_HOT_UPDATE => (HeapOp::HotUpdate, SIZE_OF_HEAP_UPDATE),
+        XLOG_HEAP_DELETE => (HeapOp::Delete, SIZE_OF_HEAP_DELETE),
+        _ => return Ok(None),
+    };
+    if md.len() < need {
+        return Err(DecodeError::Truncated {
+            offset: 0,
+            need,
+            have: md.len(),
+        });
+    }
+    let mut shape = RecordShape {
+        op,
+        tuples: 1,
+        partial: false,
+    };
+    if heap2 {
+        shape.tuples = u16::from_le_bytes([md[2], md[3]]);
+        if shape.tuples == 0 {
+            return Err(DecodeError::Truncated {
+                offset: 0,
+                need: 1,
+                have: 0,
+            });
+        }
+        if md[0] & XLH_INSERT_CONTAINS_NEW_TUPLE == 0 {
+            return Ok(None);
+        }
+    } else if matches!(op, HeapOp::Update | HeapOp::HotUpdate) {
+        shape.partial = md[7] & (XLH_UPDATE_PREFIX_FROM_OLD | XLH_UPDATE_SUFFIX_FROM_OLD) != 0;
+    }
+    Ok(Some(shape))
 }
 
 fn parse_heap_record<'a, T: TupleBuild<'a>>(
@@ -2404,6 +2452,36 @@ mod tests {
         let new = out.new.unwrap();
         assert_eq!(new.columns[0], Some(ColumnValue::Int4(55)));
         assert_eq!(new.columns[1], Some(ColumnValue::Null));
+    }
+
+    #[test]
+    fn record_shape_reads_headers() {
+        let shape = |rm: RmId, info, main_data: &[u8]| {
+            record_shape(HeapRecordBytes {
+                rm: rm as u8,
+                info,
+                main_data,
+                block: None,
+            })
+        };
+        let mut update = [0u8; SIZE_OF_HEAP_UPDATE];
+        update[7] = XLH_UPDATE_SUFFIX_FROM_OLD;
+        let s = shape(RmId::Heap, XLOG_HEAP_HOT_UPDATE, &update)
+            .unwrap()
+            .unwrap();
+        assert_eq!((s.op, s.tuples, s.partial), (HeapOp::HotUpdate, 1, true));
+        let multi = [XLH_INSERT_CONTAINS_NEW_TUPLE, 0, 3, 0];
+        let s = shape(RmId::Heap2, XLOG_HEAP2_MULTI_INSERT, &multi)
+            .unwrap()
+            .unwrap();
+        assert_eq!((s.op, s.tuples, s.partial), (HeapOp::Insert, 3, false));
+        assert!(matches!(
+            shape(RmId::Heap2, XLOG_HEAP2_MULTI_INSERT, &[0, 0, 3, 0]),
+            Ok(None)
+        ));
+        assert!(matches!(shape(RmId::Heap, XLOG_HEAP_LOCK, &[]), Ok(None)));
+        assert!(shape(RmId::Heap2, XLOG_HEAP2_MULTI_INSERT, &[0, 0, 0, 0]).is_err());
+        assert!(shape(RmId::Heap, XLOG_HEAP_DELETE, &[0; 4]).is_err());
     }
 
     #[test]

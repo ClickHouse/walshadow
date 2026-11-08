@@ -676,7 +676,7 @@ impl WalReplaySink {
                         spool,
                         ref_maps: &ref_maps,
                     };
-                    Box::pin(self.replay_views(&input, route, &at)).await?;
+                    self.replay_views(&input, route, &at).await?;
                 }
             }
         }
@@ -707,6 +707,11 @@ impl WalReplaySink {
         let images = view_heap_record(input.input.record_bytes(), rel)
             .map_err(|e| SinkError::Other(format!("wal_replay: decode at {lsn:#X}: {e}")))?;
         for h in &images {
+            if h.new.as_ref().is_some_and(|t| t.partial) {
+                return Err(SinkError::Other(format!(
+                    "wal_replay: partial update at {lsn:#X}"
+                )));
+            }
             if !self.lands(route, h.op) {
                 continue;
             }

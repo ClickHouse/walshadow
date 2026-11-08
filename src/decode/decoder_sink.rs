@@ -148,15 +148,16 @@ pub struct SkipKey {
 pub type SkipCounts = crate::emit::pipeline::row_ledger::KeyedCounts<SkipKey>;
 
 impl DecoderStats {
-    pub fn record_op(&self, op: crate::decode::heap_decoder::HeapOp, partial: bool) {
+    pub fn record_op(&self, op: crate::decode::heap_decoder::HeapOp, rows: u16, partial: bool) {
         use crate::decode::heap_decoder::HeapOp;
-        self.decoded.fetch_add(1, Ordering::Relaxed);
+        let rows = u64::from(rows);
+        self.decoded.fetch_add(rows, Ordering::Relaxed);
         match op {
-            HeapOp::Insert => self.inserts.fetch_add(1, Ordering::Relaxed),
-            HeapOp::Update => self.updates.fetch_add(1, Ordering::Relaxed),
-            HeapOp::HotUpdate => self.hot_updates.fetch_add(1, Ordering::Relaxed),
-            HeapOp::Delete => self.deletes.fetch_add(1, Ordering::Relaxed),
-            HeapOp::Truncate => self.truncates.fetch_add(1, Ordering::Relaxed),
+            HeapOp::Insert => self.inserts.fetch_add(rows, Ordering::Relaxed),
+            HeapOp::Update => self.updates.fetch_add(rows, Ordering::Relaxed),
+            HeapOp::HotUpdate => self.hot_updates.fetch_add(rows, Ordering::Relaxed),
+            HeapOp::Delete => self.deletes.fetch_add(rows, Ordering::Relaxed),
+            HeapOp::Truncate => self.truncates.fetch_add(rows, Ordering::Relaxed),
         };
         if partial {
             self.partial.fetch_add(1, Ordering::Relaxed);
@@ -289,9 +290,9 @@ mod tests {
             HeapOp::HotUpdate,
             HeapOp::Delete,
         ] {
-            s.record_op(op, false);
+            s.record_op(op, 1, false);
         }
-        s.record_op(HeapOp::Update, true);
+        s.record_op(HeapOp::Update, 1, true);
         let ld = |a: &AtomicU64| a.load(Ordering::Relaxed);
         assert_eq!(ld(&s.decoded), 6);
         assert_eq!(ld(&s.inserts), 2);

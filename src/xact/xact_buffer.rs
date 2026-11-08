@@ -54,7 +54,7 @@ use crate::catalog::pending::{PendingCatalog, PendingSlot};
 use crate::decode::datum::DatumRef;
 use crate::decode::decoder_sink::{DecoderSinkError, DecoderStats, SkipReason};
 use crate::decode::heap_decoder::{
-    ColumnValue, HeapImages, HeapOp, ToastPointer, TupleView, decode_heap_record, scan_heap_record,
+    ColumnValue, HeapImages, HeapOp, ToastPointer, TupleView, decode_heap_record, record_shape,
     view_heap_record,
 };
 #[cfg(any(test, feature = "test-support"))]
@@ -2066,27 +2066,23 @@ impl MergedDrain {
             // Sink stashes heap/heap2 only; anything else broke that invariant
             return Err(fail(FailClosedReason::UnsupportedOperation));
         }
-        let shapes = scan_heap_record(&rec, &rel)
-            .map_err(|e| fail(FailClosedReason::Malformed(e.to_string())))?;
+        let Some(shape) =
+            record_shape(&rec).map_err(|e| fail(FailClosedReason::Malformed(e.to_string())))?
+        else {
+            return Ok(None);
+        };
         if let Some(s) = &self.stash.stats {
             s.raw_decode_ordinary_ops.bump(raw.rm, raw.info);
             s.raw_decode_rows_ops
-                .add(raw.rm, raw.info, shapes.len() as u64);
+                .add(raw.rm, raw.info, u64::from(shape.tuples));
         }
         // New-tuple prefix/suffix elision references a same-page predecessor
-        // image this path cannot reconstruct. Replident-shaped old keys keep
-        // live-path semantics
-        if shapes
-            .iter()
-            .any(|t| t.new.as_ref().is_some_and(|n| n.partial))
-        {
+        // image this path cannot reconstruct
+        if shape.partial {
             return Err(fail(FailClosedReason::PartialUpdate));
         }
-        if shapes.is_empty() {
-            return Ok(None);
-        }
         Ok(Some(Box::new(DescribedInput {
-            input: HeapInput::from_parsed(&rec, raw.source_lsn, shapes.len() as u16),
+            input: HeapInput::from_parsed(&rec, raw.source_lsn, shape.tuples),
             descriptor: rel,
             descriptor_valid_from: valid_from,
         })))
@@ -3218,7 +3214,7 @@ impl BufferingDecoderSink {
             if rel.kind != 'r' && rel.kind != 'p' {
                 continue;
             }
-            self.stats.record_op(HeapOp::Truncate, false);
+            self.stats.record_op(HeapOp::Truncate, 1, false);
             let mut buf = self.lock_buffer().await;
             buf.on_truncate(Truncate {
                 xid,
@@ -3381,30 +3377,19 @@ impl BufferingDecoderSink {
             .filter(|schema| &*rel.rel_name.namespace == *schema)
             .and_then(|_| ConfigTableKind::from_relname(&rel.rel_name.name));
         if rel.kind != 't' && config_kind.is_none() {
-            // Ordinary rows stay as WAL bytes until commit; scanning now
-            // keeps malformed-record errors and per-op counts at record time
-            let shapes = {
-                let _decode = decode_span();
-                scan_heap_record(&record.parsed, &rel).map_err(DecoderSinkError::from)?
-            };
-            if shapes.is_empty() {
+            // Ordinary rows stay as WAL bytes until commit, tuple bytes
+            // validate where planning reads them
+            let Some(shape) = record_shape(&record.parsed).map_err(DecoderSinkError::from)? else {
                 self.skip(SkipReason::NoTuple, record, rfn);
                 return Ok(());
-            }
-            for t in &shapes {
-                let partial = [&t.new, &t.old].into_iter().flatten().any(|s| s.partial);
-                self.stats.record_op(t.op, partial);
-            }
+            };
+            self.stats.record_op(shape.op, shape.tuples, shape.partial);
             let input = DescribedInput {
-                input: HeapInput::from_parsed(
-                    &record.parsed,
-                    record.source_lsn,
-                    shapes.len() as u16,
-                ),
+                input: HeapInput::from_parsed(&record.parsed, record.source_lsn, shape.tuples),
                 descriptor: rel,
                 descriptor_valid_from: rel_valid_from,
             };
-            let buffer_span = trace_span!(sampled, "buffer", rows = shapes.len());
+            let buffer_span = trace_span!(sampled, "buffer", rows = shape.tuples);
             return async { self.lock_buffer().await.on_input(input).await }
                 .instrument(buffer_span)
                 .await
@@ -3453,7 +3438,7 @@ impl BufferingDecoderSink {
                     .into_iter()
                     .flatten()
                     .any(|t| t.partial);
-                self.stats.record_op(img.op, partial);
+                self.stats.record_op(img.op, 1, partial);
                 if img.op == HeapOp::Delete
                     && let Some((blkno, offnum)) = tid
                 {

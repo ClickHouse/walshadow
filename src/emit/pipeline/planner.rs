@@ -39,7 +39,7 @@
 
 use std::sync::Arc;
 
-use crate::decode::heap_decoder::{ColumnValue, HeapImages, TupleView, view_heap_record};
+use crate::decode::heap_decoder::{ColumnValue, view_heap_record};
 use crate::emit::pipeline::plan_spool::{
     DEFAULT_PLAN_MEM_MAX, EncoderCache, PlanPath, PlanSpoolError, PlanWriter, SealedPlan,
     ViewChange,
@@ -208,77 +208,13 @@ impl<'a, V: PlanRouteView> Planner<'a, V> {
                         self.writer.discard(table, u64::from(input.input.tuples));
                         continue;
                     }
-                    if !self.plan_inline(&input, table)? {
-                        // Boxed: external values are rare, and awaiting them
-                        // holds tuple views deep enough to bloat every plan future
-                        Box::pin(self.plan_views(&input, table, spool, &ref_maps)).await?;
-                    }
+                    self.plan_views(&input, table, spool, &ref_maps).await?;
                 }
             }
         }
         self.rows_base += new_rows.len();
         self.writer.push_rows(new_rows);
         Ok(())
-    }
-
-    /// Tuple images of `input`, rejecting partial new images
-    fn views<'i>(
-        input: &'i DescribedInput,
-    ) -> Result<smallvec::SmallVec<[HeapImages<TupleView<'i>>; 1]>, PlanError> {
-        let rel = &input.descriptor;
-        let images = view_heap_record(input.input.record_bytes(), rel).map_err(|e| {
-            XactBufferError::OrdinaryFailClosed {
-                relid: rel.oid,
-                lsn: input.input.source_lsn,
-                rm: input.input.rm,
-                info: input.input.info,
-                reason: FailClosedReason::Malformed(e.to_string()),
-            }
-        })?;
-        if images
-            .iter()
-            .any(|h| h.new.as_ref().is_some_and(|t| t.partial))
-        {
-            return Err(PlanError::PartialUpdate {
-                lsn: input.input.source_lsn,
-            });
-        }
-        Ok(images)
-    }
-
-    fn push_images(
-        &mut self,
-        input: &DescribedInput,
-        h: &HeapImages<TupleView<'_>>,
-        patches: &[Vec<(usize, ColumnValue)>; 2],
-        table: u32,
-    ) -> Result<(), PlanError> {
-        let change = ViewChange {
-            op: h.op,
-            xid: input.input.xid,
-            source_lsn: input.input.source_lsn,
-            new: h.new.as_ref(),
-            old: h.old.as_ref(),
-            new_patch: &patches[0],
-            old_patch: &patches[1],
-        };
-        Ok(self.writer.push_views(change, table)?)
-    }
-
-    /// Encode an input without external values; false leaves it to
-    /// [`Self::plan_views`]
-    fn plan_inline(&mut self, input: &DescribedInput, table: u32) -> Result<bool, PlanError> {
-        let images = Self::views(input)?;
-        if images
-            .iter()
-            .any(|h| !external_sites([h.new.as_ref(), h.old.as_ref()]).is_empty())
-        {
-            return Ok(false);
-        }
-        for h in &images {
-            self.push_images(input, h, &Default::default(), table)?;
-        }
-        Ok(true)
     }
 
     /// Encode an input from tuple images in place, external values resolved
@@ -291,12 +227,24 @@ impl<'a, V: PlanRouteView> Planner<'a, V> {
         ref_maps: &[&ChunkRefMap],
     ) -> Result<(), PlanError> {
         let rel = &input.descriptor;
-        for h in &Self::views(input)? {
+        let lsn = input.input.source_lsn;
+        let images = view_heap_record(input.input.record_bytes(), rel).map_err(|e| {
+            XactBufferError::OrdinaryFailClosed {
+                relid: rel.oid,
+                lsn,
+                rm: input.input.rm,
+                info: input.input.info,
+                reason: FailClosedReason::Malformed(e.to_string()),
+            }
+        })?;
+        for h in &images {
+            if h.new.as_ref().is_some_and(|t| t.partial) {
+                return Err(PlanError::PartialUpdate { lsn });
+            }
             let mut patches: [Vec<(usize, ColumnValue)>; 2] = Default::default();
             let sites = external_sites([h.new.as_ref(), h.old.as_ref()]);
             if !sites.is_empty() {
                 let db = rel.rfn.db_node;
-                let lsn = input.input.source_lsn;
                 // Value permit drops once bytes land in the plan
                 let (values, _permit) =
                     detoast_sites(&sites, rel, db, lsn, spool, ref_maps, self.resolver).await?;
@@ -304,7 +252,16 @@ impl<'a, V: PlanRouteView> Planner<'a, V> {
                     patches[site.image].push((site.idx, v));
                 }
             }
-            self.push_images(input, h, &patches, table)?;
+            let change = ViewChange {
+                op: h.op,
+                xid: input.input.xid,
+                source_lsn: lsn,
+                new: h.new.as_ref(),
+                old: h.old.as_ref(),
+                new_patch: &patches[0],
+                old_patch: &patches[1],
+            };
+            self.writer.push_views(change, table)?;
         }
         Ok(())
     }
