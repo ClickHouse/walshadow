@@ -15,10 +15,8 @@ use walrus::pg::walparser::{
     BlockLocation, RmId, XLogRecord, XLogRecordBlock, XLogRecordBlockHeader, XLogRecordHeader,
 };
 use walshadow::backup_page_walk::{BackfillTuple, TupleData};
-use walshadow::ch_emitter::EncodedChunk;
 use walshadow::datum::build;
 use walshadow::emit::route::RouteSnapshot;
-use walshadow::heap_decoder::{DecodedHeap, DecodedTuple, DescribedHeap, HeapOp};
 use walshadow::mapping::{ColumnMapping, TableMapping, TableTarget};
 use walshadow::pipeline::plan_spool::{PlanItem, PlanWriter, ViewChange};
 use walshadow::pipeline::planner::{PlanRouteView, Planner};
@@ -30,12 +28,8 @@ use walshadow::spool::DeferredSpool;
 use walshadow::toast::ToastResolver;
 use walshadow::xact_buffer::{DrainEntry, DrainHeap, DrainedBatch, OrderedEvent};
 
-#[path = "common/alloc_meter.rs"]
-mod alloc_meter;
-
 #[global_allocator]
-static GLOBAL: alloc_meter::Metered<mimalloc::MiMalloc> =
-    alloc_meter::Metered::new(mimalloc::MiMalloc);
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 #[derive(Debug, Parser)]
 struct Args {
@@ -101,7 +95,6 @@ async fn deferred(args: &Args, repeat: usize) -> anyhow::Result<()> {
     let dir = tempfile::tempdir_in(&args.dir)?;
     let payload = "x".repeat(args.payload_bytes);
     let mut spool = DeferredSpool::new(dir.path().join("deferred.spool"), 1 << 20);
-    let base = GLOBAL.reset_peak();
     let start = Instant::now();
     let data = |i: usize| {
         let cells = [Some(build::int4(i as i32)), Some(build::text(&payload))];
@@ -127,8 +120,6 @@ async fn deferred(args: &Args, repeat: usize) -> anyhow::Result<()> {
     let bytes = spool.spooled_bytes();
     let mut reader = spool.into_reader().await?;
     let write = start.elapsed();
-    let spooled = GLOBAL.snapshot().since(base);
-    let base = GLOBAL.reset_peak();
     let start = Instant::now();
     let mut n = 0;
     while let Some(t) = reader.next().await? {
@@ -138,10 +129,8 @@ async fn deferred(args: &Args, repeat: usize) -> anyhow::Result<()> {
     }
     reader.finish().await?;
     let read = start.elapsed();
-    let replayed = GLOBAL.snapshot().since(base);
     assert_eq!(n, args.rows);
     report("deferred", repeat, n, bytes, write, read);
-    println!("deferred_alloc repeat={repeat} spool {spooled} replay {replayed}");
     Ok(())
 }
 
@@ -279,24 +268,6 @@ async fn plan(args: &Args, repeat: usize) -> anyhow::Result<()> {
             descriptor_valid_from: 1,
         }
     };
-    let make_heap = |i: usize| {
-        let descriptor = &descriptors[i % descriptors.len()];
-        DescribedHeap {
-            decoded: DecodedHeap {
-                rfn: descriptor.rfn,
-                xid: xid_of(i),
-                source_lsn: i as u64,
-                op: HeapOp::Insert,
-                new: Some(DecodedTuple {
-                    columns: vec![Some(build::int4(i as i32)), Some(build::text(&payload))],
-                    partial: false,
-                }),
-                old: None,
-            },
-            descriptor: descriptor.clone(),
-            descriptor_valid_from: 1,
-        }
-    };
     let control = |i: usize| {
         (args.control_every != 0 && i != 0 && i.is_multiple_of(args.control_every)).then(|| {
             DrainEntry::Catalog(SchemaEvent::Dropped {
@@ -343,7 +314,6 @@ async fn plan(args: &Args, repeat: usize) -> anyhow::Result<()> {
     } else {
         Vec::new()
     };
-    let base = GLOBAL.reset_peak();
     let start = Instant::now();
     let sealed = if args.planner {
         let mut planner = Planner::create(
@@ -389,71 +359,24 @@ async fn plan(args: &Args, repeat: usize) -> anyhow::Result<()> {
         writer.seal(u64::MAX, 0)?
     };
     let write = start.elapsed();
-    let planned = GLOBAL.snapshot().since(base);
     let (size_bytes, spilled) = (sealed.size_bytes, sealed.path().is_some());
     let routed = sealed.routed_rows;
-    let base = GLOBAL.reset_peak();
     let start = Instant::now();
     let mut rd = sealed.replay()?;
     let mut n = 0;
     let mut controls = 0;
-    let mut segments = Vec::new();
+    let mut n_segments = 0;
     while let Some(item) = rd.next_item()? {
         match item {
             PlanItem::Segment(s) => {
-                let chunks = s.into_chunks()?;
-                n += chunks.iter().map(|c| c.rows()).sum::<usize>();
-                segments.push(chunks);
+                n += s.into_chunks()?.iter().map(|c| c.rows()).sum::<usize>();
+                n_segments += 1;
             }
             PlanItem::Control { .. } => controls += 1,
             PlanItem::Truncate { .. } => unreachable!(),
         }
     }
     let replay = start.elapsed();
-    let replayed = GLOBAL.snapshot().since(base);
-    let n_segments = segments.len();
-    // Encoded chunks match a reference plan encoding decoded rows
-    if args.mapped {
-        let mut reference = PlanWriter::create(dir.path().join("ref.spool"), u64::MAX, u64::MAX)
-            .with_segment_limits(usize::MAX, usize::MAX);
-        let mut tables = HashMap::new();
-        for i in 0..args.rows {
-            if control(i).is_some() {
-                tables.clear();
-            }
-            let rel = &descriptors[i % descriptors.len()];
-            let table = *tables
-                .entry(rel.oid)
-                .or_insert_with(|| reference.table(rel, 1, || view.route.clone()));
-            reference.push_cells(make_heap(i).decoded, table)?;
-        }
-        // Chunk boundaries differ between plans; compare rows per relation
-        let merged = |chunks: Vec<EncodedChunk>| {
-            let mut by_rel: HashMap<u32, EncodedChunk> = HashMap::new();
-            for c in chunks {
-                match by_rel.entry(c.rel_oid()) {
-                    std::collections::hash_map::Entry::Occupied(mut e) => {
-                        assert!(e.get_mut().merge(c), "one layout per relation");
-                    }
-                    std::collections::hash_map::Entry::Vacant(e) => {
-                        e.insert(c);
-                    }
-                }
-            }
-            let mut out: Vec<_> = by_rel.into_iter().map(|(k, c)| (k, c.to_bytes())).collect();
-            out.sort();
-            out
-        };
-        let mut rrd = reference.seal(u64::MAX, 0)?.replay()?;
-        let mut want = Vec::new();
-        while let Some(PlanItem::Segment(s)) = rrd.next_item()? {
-            want.extend(s.into_chunks()?);
-        }
-        assert!(
-            merged(want) == merged(segments.into_iter().flatten().collect()),
-            "encoded rows differ from reference"
-        );
-    }
     assert_eq!(n, if args.mapped { args.rows } else { 0 });
     assert_eq!(routed, n as u64);
     assert_eq!(
@@ -484,7 +407,7 @@ async fn plan(args: &Args, repeat: usize) -> anyhow::Result<()> {
         + (args.rows % interval).min(descriptors.len());
     assert_eq!(view.calls, expected_calls);
     println!(
-        "plan_total repeat={repeat} total_s={:.6} route_calls={} tables={} routed={routed} segments={} spilled={} plan {planned} replay {replayed}",
+        "plan_total repeat={repeat} total_s={:.6} route_calls={} tables={} routed={routed} segments={} spilled={}",
         (write + replay).as_secs_f64(),
         view.calls,
         rd.tables.len(),

@@ -16,8 +16,6 @@ xid, LSN order, descriptor, and file cleanup. Write timing includes allocation
 and admission; read timing includes reader setup, verified drain, and unlink.
 Report spill bytes alongside throughput: final memory tails can avoid disk.
 Compare equal spill bytes when isolating I/O improvements.
-`buffer` and `drain` report allocation count, bytes still live, and peak live
-bytes for largest transaction, counted by a wrapping global allocator
 
 Files follow disposable-spill semantics: no fsync, immediate replay, then unlink.
 Results include page cache and codec costs; they do not measure sustained device
@@ -48,9 +46,7 @@ Read `plan_total` for combined write and replay time per sample. For plans in
 memory, byte counts report allocated chunk bytes; for spilled plans, encoded
 file size. Route caching measures descriptor identity checks and reuse of cached
 references. Measurements exclude mapping resolution, WAL draining, TOAST I/O,
-control execution, and PostgreSQL/ClickHouse I/O. `plan` reports allocations and
-bytes retained by sealed plan; `replay` reports peak bytes while replaying it.
-With `--mapped`, replayed rows must match a reference plan encoded from cells
+control execution, and PostgreSQL/ClickHouse I/O.
 
 ## pgbench workload
 

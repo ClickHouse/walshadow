@@ -32,11 +32,7 @@
 // serializes on that pattern. A bench on a different allocator measures a
 // different program
 #[global_allocator]
-static GLOBAL: alloc_meter::Metered<mimalloc::MiMalloc> =
-    alloc_meter::Metered::new(mimalloc::MiMalloc);
-
-#[path = "common/alloc_meter.rs"]
-mod alloc_meter;
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -376,7 +372,6 @@ async fn bench_pump(shape: Shape) -> Report {
         parallelism: shape.parallelism,
     });
 
-    let base = GLOBAL.reset_peak();
     let started = Instant::now();
     let (mut rx, pump) = spawn_greenfield_bootstrap(cfg, source, catalog.clone(), false);
     let drained = tokio::spawn(async move {
@@ -399,19 +394,15 @@ async fn bench_pump(shape: Shape) -> Report {
     pump.await.unwrap().unwrap();
     let (walked, digest) = drained.await.unwrap();
     let elapsed = started.elapsed().as_secs_f64();
-    let metered = GLOBAL.snapshot().since(base);
     assert_eq!(digest, expected, "walked values differ from written pages");
     assert_eq!(walked, tuples);
 
-    let mut detail = pump_detail(&progress);
-    detail.push(("allocs", metered.allocs as f64));
-    detail.push(("peak_mib", metered.peak as f64 / (1 << 20) as f64));
     Report {
         label: "pump".into(),
         elapsed_secs: elapsed,
         tuples,
         bytes: progress.pump.bytes_tapped.load(Ordering::Relaxed),
-        detail,
+        detail: pump_detail(&progress),
     }
 }
 
@@ -470,7 +461,6 @@ async fn bench_drain(shape: Shape) -> Report {
     });
 
     let stats = Arc::new(walshadow::ch_emitter::EmitterStats::default());
-    let base = GLOBAL.reset_peak();
     let started = Instant::now();
     let outcome = bootstrap::drain(
         tup_rx,
@@ -489,7 +479,6 @@ async fn bench_drain(shape: Shape) -> Report {
     let elapsed = started.elapsed().as_secs_f64();
     feeder.await.unwrap();
     tail.close(msg_tx, ack).await;
-    let metered = GLOBAL.snapshot().since(base);
     assert_eq!(outcome.rows_routed, shape.tuples());
 
     Report {
@@ -498,11 +487,7 @@ async fn bench_drain(shape: Shape) -> Report {
         tuples: outcome.rows_routed,
         // Row payload only; the interesting rate here is rows, not bytes
         bytes: outcome.rows_routed * (4 * shape.columns + shape.text) as u64,
-        detail: vec![
-            ("seqs", outcome.next_seq as f64),
-            ("allocs", metered.allocs as f64),
-            ("peak_mib", metered.peak as f64 / (1 << 20) as f64),
-        ],
+        detail: vec![("seqs", outcome.next_seq as f64)],
     }
 }
 
@@ -532,7 +517,6 @@ async fn bench_load(shape: Shape) -> Report {
         flush_timeout: std::time::Duration::from_secs(1),
     };
 
-    let base = GLOBAL.reset_peak();
     let started = Instant::now();
     let (msg_tx, ack, tail) =
         walshadow::pipeline::tail::spawn_discard(batcher, stats.clone(), fatal.clone());
@@ -556,7 +540,6 @@ async fn bench_load(shape: Shape) -> Report {
         .await
         .unwrap();
     let elapsed = started.elapsed().as_secs_f64();
-    let metered = GLOBAL.snapshot().since(base);
     assert_eq!(outcome.rows_routed, tuples);
     assert_eq!(
         stats.insertbatch_rows_in.load(Ordering::Relaxed),
@@ -569,8 +552,6 @@ async fn bench_load(shape: Shape) -> Report {
         "batches",
         stats.insertbatch_batches_out.load(Ordering::Relaxed) as f64,
     ));
-    detail.push(("allocs", metered.allocs as f64));
-    detail.push(("peak_mib", metered.peak as f64 / (1 << 20) as f64));
     Report {
         label: "load".into(),
         elapsed_secs: elapsed,

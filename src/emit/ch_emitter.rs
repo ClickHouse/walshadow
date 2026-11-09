@@ -2647,27 +2647,6 @@ impl EncodedChunk {
                 .sum::<usize>()
     }
 
-    pub fn rel_oid(&self) -> u32 {
-        self.rel.oid
-    }
-
-    /// Append `other`'s rows; `false` leaves both untouched when layouts differ
-    pub fn merge(&mut self, other: Self) -> bool {
-        let same = self.buffers.len() == other.buffers.len()
-            && self
-                .buffers
-                .iter()
-                .zip(&other.buffers)
-                .all(|(a, b)| a.same_shape(b));
-        if same {
-            for (buf, more) in self.buffers.iter_mut().zip(other.buffers) {
-                buf.extend(more);
-            }
-            self.rows += other.rows;
-        }
-        same
-    }
-
     /// Wire content as a plan spool frame body
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::new();

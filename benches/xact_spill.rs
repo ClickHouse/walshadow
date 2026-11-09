@@ -22,12 +22,8 @@ use walshadow::spill::{DescribedInput, HeapInput, RawRecord};
 use walshadow::toast::ToastResolver;
 use walshadow::xact_buffer::{DrainEntry, DrainHeap, StashResolved, XactBuffer, XactBufferConfig};
 
-#[path = "common/alloc_meter.rs"]
-mod alloc_meter;
-
 #[global_allocator]
-static GLOBAL: alloc_meter::Metered<mimalloc::MiMalloc> =
-    alloc_meter::Metered::new(mimalloc::MiMalloc);
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 #[derive(Debug, Parser)]
 struct Args {
@@ -158,9 +154,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
         let mut read_time = Duration::ZERO;
         let mut spill_bytes = 0;
         let mut peak_memory = 0;
-        let (mut buffered, mut drained) = (Vec::new(), Vec::new());
         for xid in 1..=args.transactions {
-            let base = GLOBAL.reset_peak();
             let start = Instant::now();
             let record = record(xid);
             for row in 0..args.rows {
@@ -181,8 +175,6 @@ async fn run(args: Args) -> anyhow::Result<()> {
             }
             write_time += start.elapsed();
             spill_bytes += buffer.stats().spill_bytes_active;
-            buffered.push(GLOBAL.snapshot().since(base));
-            let base = GLOBAL.reset_peak();
             let start = Instant::now();
             let commit_lsn = u64::from(xid + 1) * (args.rows as u64 + 1);
             let resolved = if args.stashed {
@@ -237,18 +229,10 @@ async fn run(args: Args) -> anyhow::Result<()> {
             drain.finish().await?;
             buffer.resume_safe_lsn(walshadow::pos::Pos::new(commit_lsn));
             read_time += start.elapsed();
-            drained.push(GLOBAL.snapshot().since(base));
         }
-        // Largest transaction footprint, buffered rows still owned by buffer
-        let worst = |d: &[alloc_meter::Delta]| {
-            d.iter()
-                .copied()
-                .max_by_key(|d| d.peak)
-                .expect("one transaction")
-        };
         let rows = args.rows as f64 * f64::from(args.transactions);
         println!(
-            "repeat={} rows={} spill_bytes={} evictions={} peak_buffer_bytes={} write_s={:.6} read_s={:.6} rows_per_s={:.0} spill_write_mib_s={:.2} spill_read_mib_s={:.2} buffer {} drain {}",
+            "repeat={} rows={} spill_bytes={} evictions={} peak_buffer_bytes={} write_s={:.6} read_s={:.6} rows_per_s={:.0} spill_write_mib_s={:.2} spill_read_mib_s={:.2}",
             repeat + 1,
             rows as u64,
             spill_bytes,
@@ -259,8 +243,6 @@ async fn run(args: Args) -> anyhow::Result<()> {
             rows / (write_time + read_time).as_secs_f64(),
             spill_bytes as f64 / (1 << 20) as f64 / write_time.as_secs_f64(),
             spill_bytes as f64 / (1 << 20) as f64 / read_time.as_secs_f64(),
-            worst(&buffered),
-            worst(&drained),
         );
         assert_eq!(buffer.stats().bytes_in_memory, 0);
         assert_eq!(buffer.stats().spill_bytes_active, 0);

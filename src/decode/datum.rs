@@ -82,18 +82,9 @@ impl Datum {
 #[cfg(any(test, feature = "test-support"))]
 pub mod build {
     use super::Datum;
-    use crate::decode::heap_decoder::ToastPointer;
-
-    pub fn null() -> Datum {
-        Datum::Null
-    }
 
     pub fn bool_(v: bool) -> Datum {
         Datum::fixed(&[u8::from(v)])
-    }
-
-    pub fn char_(v: i8) -> Datum {
-        Datum::fixed(&v.to_le_bytes())
     }
 
     pub fn int2(v: i16) -> Datum {
@@ -105,14 +96,6 @@ pub mod build {
     }
 
     pub fn int8(v: i64) -> Datum {
-        Datum::fixed(&v.to_le_bytes())
-    }
-
-    pub fn float4(v: f32) -> Datum {
-        Datum::fixed(&v.to_le_bytes())
-    }
-
-    pub fn float8(v: f64) -> Datum {
         Datum::fixed(&v.to_le_bytes())
     }
 
@@ -160,10 +143,6 @@ pub mod build {
 
     pub fn numeric(v: impl AsRef<str>) -> Datum {
         Datum::Varlena(crate::decode::codecs::numeric_from_text(v.as_ref()).expect("numeric text"))
-    }
-
-    pub fn external(p: ToastPointer) -> Datum {
-        Datum::External(p)
     }
 
     /// `typoutput` text
