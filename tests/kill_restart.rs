@@ -332,7 +332,8 @@ async fn wait_for_received_catchup(
     let target = parse_pg_lsn(&target_text).context("parse source LSN")?;
     while start.elapsed() < deadline {
         if let Ok(body) = fx::http_get(metrics_addr, "/metrics")
-            && let Some(received) = fx::parse_metric(&body, "walshadow_position_lsn{at=\"received\"}")
+            && let Some(received) =
+                fx::parse_metric(&body, "walshadow_position_lsn{at=\"received\"}")
             && received >= target
         {
             return Ok(received);

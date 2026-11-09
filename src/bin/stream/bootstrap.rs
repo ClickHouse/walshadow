@@ -31,7 +31,7 @@ use walshadow::config::{CliOverrides, ConfigResolver, cli_over_toml};
 use walshadow::decoder_sink::MetricsTupleObserver;
 use walshadow::emit::route::routing;
 use walshadow::mapping::MappingHandle;
-use walshadow::metrics::{MetricsRegistry, MetricsSnapshot};
+use walshadow::metrics::{MetricsRegistry, MetricsSnapshot, SourceMode};
 use walshadow::pipeline::Fatal;
 use walshadow::pipeline::tail::OwnedTail;
 use walshadow::runtime_config::InitialLoadMode;
@@ -419,7 +419,7 @@ pub(crate) async fn run_bootstrap(
         resolver: None,
         backfiller: None,
     };
-    let ticker = tokio_util::task::AbortOnDropHandle::new(tokio::spawn({
+    let _ticker = tokio_util::task::AbortOnDropHandle::new(tokio::spawn({
         let metrics = metrics.clone();
         let progress = progress.clone();
         let stats = bootstrap_stats.clone();
@@ -432,6 +432,7 @@ pub(crate) async fn run_bootstrap(
                 metrics
                     .set(MetricsSnapshot {
                         by_database: vec![boot_db.series()],
+                        source_mode: SourceMode::InitialLoad.one_hot(),
                         ..stage_gauges(&StageCounters {
                             emitter: Some(&stats),
                             db_name: &|_| boot_db.database.clone(),
@@ -445,6 +446,7 @@ pub(crate) async fn run_bootstrap(
             }
         }
     }));
+    let walk_timing = walshadow::ops::stages::BOOTSTRAP_WALK.start();
     let (rx, pump) = match &resume {
         Some(done) => {
             let (_tx, rx) = tokio::sync::mpsc::channel(1);
@@ -889,23 +891,24 @@ pub(crate) async fn run_bootstrap(
         // Replay backup WAL before resolving deferred value references
         if let Some(mut cfg) = window_cfg {
             cfg.timeline = outcome.start.timeline;
-            let replayed = async {
-                let segments = walshadow::backfill::bootstrap_window::segments_in_dir(
-                    &window_wal,
-                    outcome.start.timeline,
-                    outcome.start.start_lsn,
-                    outcome.end.end_lsn,
-                )
-                .await?;
-                walshadow::backfill::bootstrap_window::replay_segments(
-                    cfg,
-                    &segments,
-                    outcome.start.start_lsn,
-                    outcome.end.end_lsn,
-                )
-                .await
-            }
-            .await;
+            let replayed = walshadow::ops::stages::BOOTSTRAP_WINDOW
+                .measure(async {
+                    let segments = walshadow::backfill::bootstrap_window::segments_in_dir(
+                        &window_wal,
+                        outcome.start.timeline,
+                        outcome.start.start_lsn,
+                        outcome.end.end_lsn,
+                    )
+                    .await?;
+                    walshadow::backfill::bootstrap_window::replay_segments(
+                        cfg,
+                        &segments,
+                        outcome.start.start_lsn,
+                        outcome.end.end_lsn,
+                    )
+                    .await
+                })
+                .await;
             match replayed {
                 Ok(w) => window = Some(w),
                 Err(e) => {
@@ -948,7 +951,10 @@ pub(crate) async fn run_bootstrap(
         }
         let mut deferred_rows = 0;
         if !handback.is_empty() {
-            match sink.resolve_deferred(handback, coverage.clone()).await {
+            match walshadow::ops::stages::BOOTSTRAP_DEFERRED
+                .measure(sink.resolve_deferred(handback, coverage.clone()))
+                .await
+            {
                 Ok(resolved) => {
                     for (i, lane) in handback_at.into_iter().zip(resolved) {
                         drain_outcome[i].next_seq = lane.next_seq;
@@ -1041,6 +1047,7 @@ pub(crate) async fn run_bootstrap(
         drained = shipped,
         "bootstrap landed",
     );
+    walk_timing.finish();
     // Stage attribution: which of tap, decode or emitter drain owned the
     // wall clock. Sum exceeds elapsed under source parallelism
     tracing::info!(
@@ -1054,7 +1061,6 @@ pub(crate) async fn run_bootstrap(
         files_skipped_unmapped = outcome.page_walk.files_skipped_unmapped.load(Ordering::Relaxed),
         "bootstrap stage timings",
     );
-    ticker.abort();
 
     if let Some((settings, storage)) = wal_hydrate {
         fetch_wal_into_pg_wal(
@@ -1109,10 +1115,15 @@ pub(crate) async fn run_bootstrap(
     // Resolve deferred tuples after window transaction overlay is complete
     let recorded = if let Some(pending) = pending_gate {
         let patch = std::mem::take(&mut *window_patch.lock().expect("window patch lock")).seal();
-        let (gate, pending_tables) =
-            resolve_greenfield(pending, &shadow_data_dir, &patch, source_major)
-                .await
-                .context("bootstrap: visibility gate")?;
+        let (gate, pending_tables) = walshadow::ops::stages::BOOTSTRAP_GATE
+            .measure(resolve_greenfield(
+                pending,
+                &shadow_data_dir,
+                &patch,
+                source_major,
+            ))
+            .await
+            .context("bootstrap: visibility gate")?;
         // Persist the ledger before clearing the marker so pending rows
         // already in ClickHouse can be published after restart
         let mut ledger = PendingLedger::load(&args.spill_dir, source_ident.system_id)

@@ -404,7 +404,8 @@ async fn bin_stream_replicates_segments_and_serves_metrics() {
             let body = http_get(metrics_addr, "/metrics").context("ack poll scrape")?;
             // LSN gauges stay absent while their position is unknown
             let ack = metric_u64(&body, "walshadow_position_lsn{at=\"ack\"}").unwrap_or(0);
-            let replay = metric_u64(&body, "walshadow_position_lsn{at=\"shadow_replay\"}").unwrap_or(0);
+            let replay =
+                metric_u64(&body, "walshadow_position_lsn{at=\"shadow_replay\"}").unwrap_or(0);
             if ack > ack_at_boot && replay > 0 {
                 break;
             }
