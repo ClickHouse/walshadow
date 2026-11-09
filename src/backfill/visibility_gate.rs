@@ -160,6 +160,7 @@ pub async fn resolve_phase(
     tx: &mpsc::Sender<Vec<BackfillTuple>>,
     mut pending_spool: Option<&mut PendingSpool>,
     stats: &mut GateStats,
+    counters: &EmitterStats,
 ) -> Result<(), String> {
     let mut out = SlabTx::new(tx);
     let mut replay = deferred
@@ -172,17 +173,25 @@ pub async fn resolve_phase(
         .await
         .map_err(|e| format!("visibility gate: deferred spool replay: {e}"))?
     {
+        counters.gate_rechecked.fetch_add(1, Ordering::Relaxed);
         match tuple_visibility(t.xid, t.xmax, t.infomask, Some(view)) {
             Visibility::Emit => {
                 if t.infomask & HEAP_XMAX_IS_MULTI != 0 {
                     stats.multixact_emitted += 1;
+                    counters
+                        .gate_multixact_emitted
+                        .fetch_add(1, Ordering::Relaxed);
                 }
                 stats.emitted += 1;
+                counters.gate_emitted.fetch_add(1, Ordering::Relaxed);
                 if !out.push(t).await {
                     break;
                 }
             }
-            Visibility::Skip => stats.gated += 1,
+            Visibility::Skip => {
+                stats.gated += 1;
+                counters.gate_gated.fetch_add(1, Ordering::Relaxed);
+            }
             Visibility::Defer => {
                 let pending = deferred_xids(t.xid, t.xmax, t.infomask, view);
                 let retained = match pending_spool.as_mut() {
@@ -191,8 +200,10 @@ pub async fn resolve_phase(
                 };
                 if retained {
                     stats.pending += 1;
+                    counters.gate_pending.fetch_add(1, Ordering::Relaxed);
                 } else {
                     stats.gated += 1;
+                    counters.gate_gated.fetch_add(1, Ordering::Relaxed);
                 }
             }
             Visibility::Unresolvable => {
@@ -441,7 +452,11 @@ pub async fn resolve_greenfield(
         coverage,
     } = gate;
     let scratch_dir = sink.scratch_dir.clone();
-    if deferred.iter().map(DeferredSpool::records).sum::<u64>() == 0 {
+    let to_recheck = deferred.iter().map(DeferredSpool::records).sum::<u64>();
+    sink.stats
+        .gate_recheck_total
+        .store(to_recheck, Ordering::Relaxed);
+    if to_recheck == 0 {
         return Ok((gate_stats, Vec::new()));
     }
     let accum = read_pg_xact(data_dir).await?;
@@ -482,6 +497,7 @@ pub async fn resolve_greenfield(
             &txs[0],
             Some(&mut pending_spool),
             &mut gate_stats,
+            &sink.stats,
         )
         .await;
         if resolved.is_err() {
@@ -1086,9 +1102,16 @@ mod tests {
             if spool.records() == 0 {
                 continue;
             }
-            resolve_phase(spool, &view, &tx, None, &mut stats)
-                .await
-                .unwrap();
+            resolve_phase(
+                spool,
+                &view,
+                &tx,
+                None,
+                &mut stats,
+                &EmitterStats::default(),
+            )
+            .await
+            .unwrap();
         }
         drop(tx);
 
@@ -1136,9 +1159,16 @@ mod tests {
             tuple(100, 0, HEAP_XMIN_COMMITTED | HEAP_XMAX_INVALID),
         ])
         .await;
-        resolve_phase(spool, &view, &tx, Some(&mut pending_spool), &mut stats)
-            .await
-            .unwrap();
+        resolve_phase(
+            spool,
+            &view,
+            &tx,
+            Some(&mut pending_spool),
+            &mut stats,
+            &EmitterStats::default(),
+        )
+        .await
+        .unwrap();
         drop(tx);
 
         let visible = rx.recv().await.expect("visible rows");
@@ -1161,9 +1191,16 @@ mod tests {
         let (tx, _rx) = mpsc::channel(8);
         let mut stats = GateStats::default();
         let spool = spool_at("no-pending", vec![tuple(100, 0, 0)]).await;
-        resolve_phase(spool, &view, &tx, None, &mut stats)
-            .await
-            .unwrap();
+        resolve_phase(
+            spool,
+            &view,
+            &tx,
+            None,
+            &mut stats,
+            &EmitterStats::default(),
+        )
+        .await
+        .unwrap();
         assert_eq!(stats.pending, 0);
         assert_eq!(stats.gated, 1);
     }
@@ -1191,11 +1228,17 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(4);
         let mut stats = GateStats::default();
         let spool = spool_at("lock-only", vec![locked()]).await;
-        resolve_phase(spool, &view, &tx, None, &mut stats)
+        let counters = EmitterStats::default();
+        resolve_phase(spool, &view, &tx, None, &mut stats, &counters)
             .await
             .unwrap();
         drop(tx);
         assert_eq!((stats.emitted, stats.multixact_emitted), (1, 1));
+        let ld = |a: &std::sync::atomic::AtomicU64| a.load(Ordering::Relaxed);
+        assert_eq!(
+            (ld(&counters.gate_rechecked), ld(&counters.gate_emitted)),
+            (1, 1)
+        );
         assert_eq!(rx.recv().await.map(|slab| slab.len()), Some(1));
     }
 
@@ -1214,9 +1257,16 @@ mod tests {
         )])
         .await;
 
-        let err = resolve_phase(spool, &view, &tx, None, &mut stats)
-            .await
-            .unwrap_err();
+        let err = resolve_phase(
+            spool,
+            &view,
+            &tx,
+            None,
+            &mut stats,
+            &EmitterStats::default(),
+        )
+        .await
+        .unwrap_err();
         assert!(err.contains("pg_multixact"), "{err}");
         assert_eq!(stats.emitted, 0);
     }
@@ -1332,9 +1382,16 @@ mod tests {
         let patch = SealedPatch::default();
         let view = PgXactView::new(&accum, &patch);
         let (tx, _rx) = mpsc::channel(1);
-        resolve_phase(spool, &view, &tx, None, &mut GateStats::default())
-            .await
-            .unwrap_err()
+        resolve_phase(
+            spool,
+            &view,
+            &tx,
+            None,
+            &mut GateStats::default(),
+            &EmitterStats::default(),
+        )
+        .await
+        .unwrap_err()
     }
 
     /// File-backed spool of one visible tuple
@@ -1402,9 +1459,16 @@ mod tests {
         let (tx, rx) = mpsc::channel(1);
         drop(rx);
         let mut stats = GateStats::default();
-        resolve_phase(spool, &view, &tx, None, &mut stats)
-            .await
-            .unwrap();
+        resolve_phase(
+            spool,
+            &view,
+            &tx,
+            None,
+            &mut stats,
+            &EmitterStats::default(),
+        )
+        .await
+        .unwrap();
         assert_eq!(stats.emitted, GATE_SLAB_ROWS as u64);
     }
 

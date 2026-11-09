@@ -132,6 +132,9 @@ impl<'a> DeferredReplayProgress<'a> {
         stats
             .bootstrap_deferred_replay_bytes
             .fetch_add(total, Ordering::Relaxed);
+        stats
+            .bootstrap_fill_bytes
+            .fetch_add(total, Ordering::Relaxed);
         Self {
             stats,
             total,
@@ -140,6 +143,10 @@ impl<'a> DeferredReplayProgress<'a> {
     }
 
     fn advance(&mut self, remaining: u64) {
+        let done = self.total - remaining;
+        self.stats
+            .bootstrap_filled_bytes
+            .fetch_add(done.saturating_sub(self.processed), Ordering::Relaxed);
         shift(
             &self.stats.bootstrap_deferred_replayed_bytes,
             &mut self.processed,

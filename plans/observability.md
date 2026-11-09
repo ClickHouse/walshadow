@@ -45,7 +45,7 @@ expected siblings is too narrow.
 | `commit_timestamp_seconds` | `at` | source, ack | shadow_replay once the pump keeps an LSN→commit-time ring |
 | `source_mode` | `mode` | the six one-hot states, `initial_load` included | complete |
 | `stage_active`, `stage_seconds_total`, `stage_completed_total`, `stage_interrupted_total` | `stage`, `title`, `order` | ten stages | copy and publish phases as the table backfill grows |
-| `stage_count` | `stage`, `title`, `order`, `measure` | work_total, work_done, rows | complete |
+| `stage_progress` | `stage`, `title`, `order`, `measure` | work_total, work_done, rows | complete |
 | `worker_seconds_total` | `worker`, `state` | pump, queue, batcher, inserter, backup_tap, backup_walk × busy, idle, blocked_in, blocked_out | reorder if it ever leaves the queue worker |
 | `errors_total` | `component`, `kind` | source: wal_removed, disconnect, walsender_exit, other | ClickHouse insert retries and reconnects, DDL retries, bridge errors, oracle errors, timeline switch failures, endpoint swap failures |
 | `request_duration_seconds` | `database`, `target`, `op` | bridge × op | clickhouse insert, archive fetch |
@@ -71,8 +71,8 @@ family they read.
 | `bootstrap_bytes_tapped`, `backfill_backup_bytes_total`, `backfill_copy_bytes_total`, `timeline_prefix_bytes_verified_total` | `wal_bytes_total{flow}` |
 | `archive_wal_segments_total` | `wal_bytes_total{flow="archive_fetched"}` in bytes |
 | `xact_bytes_in_memory`, `spill_bytes_active`, `drain_resident_bytes`, `drain_chunk_resident_bytes`, `drain_row_resident_bytes`, `toast_xact_spool_bytes`, `resident_payload_bytes`, `resident_payload_peak_bytes`, `raw_pending_bytes`, `desc_log_tail_bytes` | `buffer_bytes{buffer}` |
-| `bootstrap_deferred_bytes`, `bootstrap_deferred_spool_bytes`, `bootstrap_deferred_replay_bytes`, `bootstrap_deferred_replayed_bytes` | derive: `stage_count` for bootstrap_deferred already carries the replay ratio; the spool byte gauges also wrap below zero (u64 underflow in the deferred footprint), fix or drop |
-| `bootstrap_parts_total`, `bootstrap_parts_done`, `bootstrap_tuples_emitted`, `bootstrap_pages_walked`, `bootstrap_files_walked`, `bootstrap_files_skipped_unmapped`, `bootstrap_replay_covered_rows_total` | derive from `stage_count`; pages and files walked to debug |
+| `bootstrap_deferred_bytes`, `bootstrap_deferred_spool_bytes`, `bootstrap_deferred_replay_bytes`, `bootstrap_deferred_replayed_bytes` | derive: `stage_progress` for bootstrap_deferred already carries the replay ratio; the spool byte gauges also wrap below zero (u64 underflow in the deferred footprint), fix or drop |
+| `bootstrap_parts_total`, `bootstrap_parts_done`, `bootstrap_tuples_emitted`, `bootstrap_pages_walked`, `bootstrap_files_walked`, `bootstrap_files_skipped_unmapped`, `bootstrap_replay_covered_rows_total` | derive from `stage_progress`; pages and files walked to debug |
 | `bootstrap_gate_chunks_gated_total`, `bootstrap_gate_multixact_emitted_total` | debug |
 | `emitter_retries_attempted_total`, `emitter_reconnects_total`, `bridge_errors_by_op`, `bridge_reconnects_total`, `oracle_errors_total`, `oracle_conversion_errors_total`, `timeline_switch_failures_by_reason`, `source_endpoint_swap_failures_total`, `catalog_boundary_hold_failures_total`, `toast_fetch_miss_total` | `errors_total{component,kind}` |
 | `inserter_ch_seconds_total`, `archive_fetch_seconds_total` | `request_duration_seconds{target}` histograms; the counters go once the histograms exist |

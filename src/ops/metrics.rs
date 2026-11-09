@@ -136,6 +136,15 @@ label_class! {
 }
 
 label_class! {
+    pub enum GateVerdict {
+        Emitted => "emitted",
+        Gated => "gated",
+        Deferred => "deferred",
+        Pending => "pending",
+    }
+}
+
+label_class! {
     pub enum WorkerState {
         Busy => "busy",
         Idle => "idle",
@@ -421,8 +430,9 @@ snapshot! {
     counter bootstrap_files_skipped_unmapped: u64 =
         "User-heap segments declined at begin because no mapped relation owns them; their bytes drain unread.",
     counter spill_evictions_total: u64 = "Total evictions in→spill since daemon start.",
-    counter xacts_committed_total: u64 = "Total xacts drained as commits since daemon start.",
-    counter xacts_aborted_total: u64 = "Total xacts dropped as aborts since daemon start.",
+    counter xacts_committed_total: u64 =
+        "Commits drained that carried buffered rows for mapped tables; walshadow_emitter_xacts_total counts every drained commit.",
+    counter xacts_aborted_total: u64 = "Aborts that discarded buffered rows for mapped tables.",
     counter decoder_decoded_total: u64 = "Heap records decoded since daemon start.",
     counter decoder_records_by_op: [u64; 5]
         ["op" = ["insert", "update", "hot_update", "delete", "truncate"]] =
@@ -480,12 +490,9 @@ snapshot! {
         "TOAST resolution failures caused by missing chunks or size mismatches.",
     counter bootstrap_replay_covered_rows_total: u64 =
         "Backup rows dropped during deferred TOAST resolution because values were unreadable and window replay emitted a tombstone or newer version for each tuple's slot.",
-    counter bootstrap_gate_emitted_total: u64 =
-        "Heap tuples forwarded by bootstrap visibility gate using hint bits.",
-    counter bootstrap_gate_gated_total: u64 =
-        "Heap tuples dropped by bootstrap visibility gate using hint bits.",
-    counter bootstrap_gate_deferred_total: u64 =
-        "Heap tuples with undecided hint-bit visibility, spooled for transaction-status checks.",
+    counter bootstrap_gate_tuples_by_verdict: [u64; GateVerdict::COUNT]
+        ["verdict" = GateVerdict::LABELS] =
+        "Heap tuples by the bootstrap visibility gate's verdict: emitted (forwarded, from hint bits during the walk or the pg_xact pass after it), gated (dropped as dead), deferred (undecided by hint bits, spooled for the pg_xact pass), pending (writer or deleter still open at backup end, parked for the live stream to settle). A deferred tuple is counted again under the verdict the pg_xact pass gives it, so the verdicts do not sum to tuples seen. Gate pass progress is walshadow_stage_progress{measure=\"work_done\"} over {measure=\"work_total\"} for stage bootstrap_gate.",
     counter bootstrap_gate_chunks_gated_total: u64 =
         "TOAST chunk tuples excluded from mirror writes because hint bits proved them dead.",
     counter bootstrap_gate_multixact_emitted_total: u64 =
@@ -894,7 +901,7 @@ const BACKFILL_MODES: [&str; 3] = ["copy", "base_backup", "object_store"];
 /// Family declaration off a snapshot field name: a `_by_<label>` tail names
 /// the label rather than the family, and OpenMetrics appends `_total` to
 /// counter samples itself, so a counter family declares the name without it
-fn declare<'s>(
+pub(crate) fn declare<'s>(
     enc: &'s mut DescriptorEncoder<'_>,
     name: &'s str,
     help: &str,
@@ -1514,8 +1521,9 @@ mod tests {
         }
     }
 
-    /// Stage and log families fit in one encoder buffer, so a leading pad of
-    /// swept length lands the first flush, refused, in each of them
+    /// Stage and log families span more than one encoder buffer, so a leading
+    /// pad of swept length lands the first and the second flush, refused, in
+    /// each of them
     #[test]
     fn stage_and_log_families_propagate_a_refused_flush() {
         #[derive(Debug)]
@@ -1525,29 +1533,39 @@ mod tests {
                 gauge(&mut enc, "walshadow_pad", &self.0, 0u64)
             }
         }
-        /// Refuses every write, keeping the refused chunk's length
-        struct Refuse(usize);
+        /// Refuses the write after `allow` accepted ones, keeping the bytes
+        /// offered up to and including the refused chunk
+        struct Refuse {
+            allow: usize,
+            offered: usize,
+        }
         impl fmt::Write for Refuse {
             fn write_str(&mut self, s: &str) -> fmt::Result {
-                self.0 = s.len();
-                Err(fmt::Error)
+                self.offered += s.len();
+                if self.allow == 0 {
+                    return Err(fmt::Error);
+                }
+                self.allow -= 1;
+                Ok(())
             }
         }
         let name_at = |text: &str| text.split(' ').next().unwrap().to_owned();
         let mut families = std::collections::BTreeSet::new();
         let mut refused_in = std::collections::BTreeSet::new();
-        for pad in (0..4096).step_by(8) {
-            let mut registry = Registry::default();
-            registry.register_collector(Box::new(Pad("p".repeat(pad))));
-            registry.register_collector(Box::new(crate::ops::stages::StageCollector));
-            registry.register_collector(Box::new(crate::ops::log_events::LogEventCollector));
-            let mut whole = String::new();
-            text::encode(&mut whole, &registry).unwrap();
-            let mut refuse = Refuse(0);
-            text::encode(&mut refuse, &registry).unwrap_err();
-            let (head, _) = whole[..refuse.0].rsplit_once("# HELP ").unwrap();
-            refused_in.insert(name_at(&whole[head.len() + "# HELP ".len()..]));
-            families.extend(whole.split("# HELP ").skip(1).map(name_at));
+        for allow in 0..2 {
+            for pad in (0..4096).step_by(8) {
+                let mut registry = Registry::default();
+                registry.register_collector(Box::new(Pad("p".repeat(pad))));
+                registry.register_collector(Box::new(crate::ops::stages::StageCollector));
+                registry.register_collector(Box::new(crate::ops::log_events::LogEventCollector));
+                let mut whole = String::new();
+                text::encode(&mut whole, &registry).unwrap();
+                let mut refuse = Refuse { allow, offered: 0 };
+                text::encode(&mut refuse, &registry).unwrap_err();
+                let (head, _) = whole[..refuse.offered].rsplit_once("# HELP ").unwrap();
+                refused_in.insert(name_at(&whole[head.len() + "# HELP ".len()..]));
+                families.extend(whole.split("# HELP ").skip(1).map(name_at));
+            }
         }
         refused_in.remove("walshadow_pad");
         families.remove("walshadow_pad");
@@ -2130,7 +2148,9 @@ mod tests {
 
         let (families, tail) = body.split_once("# EOF\n").expect("EOF marker");
         assert!(tail.is_empty(), "bytes after EOF: {tail:?}");
-        assert!(families.contains("walshadow_stage_completed_total{stage=\"copy\"} 0"));
+        assert!(families.contains(
+            "walshadow_stage_completed_total{stage=\"copy\",title=\"Table COPY\",order=\"070\"} 0"
+        ));
 
         let mut declared: Option<(&str, &str)> = None;
         let mut helped = "";
