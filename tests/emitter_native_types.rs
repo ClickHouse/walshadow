@@ -113,9 +113,9 @@ async fn native_numeric_time_timetz_round_trip() {
             host: "127.0.0.1".into(),
             port: slot.ch_tcp,
             database: "walshadow_test".into(),
-            compression: CompressionChoice::Lz4,
             ..Default::default()
         },
+        compression: CompressionChoice::Lz4,
         ..Default::default()
     };
 

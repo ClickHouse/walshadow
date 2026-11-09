@@ -1149,7 +1149,7 @@ async fn session_body(
                 emitter_cfg.row_budget = rc.row_budget;
                 emitter_cfg.byte_budget = rc.byte_budget;
                 emitter_cfg.flush_timeout = rc.flush_timeout;
-                emitter_cfg.conn.compression = rc.conn.compression;
+                emitter_cfg.compression = rc.compression;
                 emitter_cfg.retry.max_attempts = rc.retry_max_attempts;
             }
             if let Some(applicator) = built.applicator {

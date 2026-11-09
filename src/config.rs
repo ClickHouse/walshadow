@@ -158,9 +158,10 @@ pub struct ResolvedConfig {
     pub flush_timeout: Duration,
     /// CH client retry budget (live: inserter reads per attempt loop)
     pub retry_max_attempts: u32,
-    /// CH connection (live: inserter + DDL applicator reconnect on change,
-    /// inserter rebuilds its codec on compression change)
+    /// CH connection (live: inserter + DDL applicator reconnect on change)
     pub conn: InstanceConfig,
+    /// Wire compression (live: resolvers seal later batches in it)
+    pub compression: CompressionChoice,
     /// Source PostgreSQL connection and slot, live via config reload
     pub source: SourceConn,
     /// Columns-less `[table.*]` opt-in intents (live: reorder coordinator
@@ -183,6 +184,7 @@ impl ResolvedConfig {
     pub fn dest_conn_eq(&self, cfg: &EmitterConfig) -> bool {
         cfg.instances == self.instances
             && cfg.conn == self.conn
+            && cfg.compression == self.compression
             && cfg.retry.max_attempts == self.retry_max_attempts
     }
 
@@ -190,6 +192,7 @@ impl ResolvedConfig {
         let mut out = EmitterConfig {
             instances: self.instances.clone(),
             conn: self.conn.clone(),
+            compression: self.compression,
             ..base.clone()
         };
         out.retry.max_attempts = self.retry_max_attempts;
@@ -786,6 +789,7 @@ impl ConfigResolver {
             flush_timeout: base.flush_timeout,
             retry_max_attempts: base.retry.max_attempts,
             conn: base.conn.clone(),
+            compression: base.compression,
             source: base.source.clone(),
             table_opt_ins: base.table_opt_ins.clone(),
             paused: base.paused,
@@ -863,7 +867,7 @@ impl ConfigResolver {
                 // codec (e.g. zstd with the feature off) is rejected here, never
                 // surfaced as a fatal when the inserter reconnects.
                 match v.parse().map(|c: CompressionChoice| (c, c.build_codec())) {
-                    Ok((c, Ok(_))) => rc.conn.compression = c,
+                    Ok((c, Ok(_))) => rc.compression = c,
                     _ => {
                         rejections += 1;
                         tracing::warn!(target: "walshadow::config", value = %v, "config_global.compression rejected");
@@ -1160,7 +1164,7 @@ mod tests {
         assert_eq!(r.row_budget, 1000);
         assert_eq!(r.byte_budget, 4096);
         assert_eq!(r.flush_timeout, Duration::from_millis(250));
-        assert_eq!(r.conn.compression, CompressionChoice::None);
+        assert_eq!(r.compression, CompressionChoice::None);
         assert_eq!(r.retry_max_attempts, 9);
     }
 
@@ -1206,7 +1210,7 @@ mod tests {
         // Prior (TOML/base) values survive each rejection.
         assert_eq!(r.drop_table_strategy, DropTableStrategy::Retain);
         assert_eq!(r.detach_strategy, DropTableStrategy::Retain);
-        assert_eq!(r.conn.compression, base.conn.compression);
+        assert_eq!(r.compression, base.compression);
         assert_eq!(r.row_budget, base.row_budget);
         assert_eq!(r.byte_budget, base.byte_budget);
         assert_eq!(r.flush_timeout, base.flush_timeout);

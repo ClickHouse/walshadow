@@ -21,9 +21,9 @@ pub(crate) async fn retry_server(
         conn: InstanceConfig {
             host: "127.0.0.1".into(),
             port: listener.local_addr().unwrap().port(),
-            compression: CompressionChoice::None,
             ..Default::default()
         },
+        compression: CompressionChoice::None,
         retry: RetryConfig {
             max_attempts,
             initial_backoff: Duration::from_millis(1),

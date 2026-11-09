@@ -35,9 +35,9 @@ fn emitter(port: u16) -> EmitterConfig {
             host: "127.0.0.1".into(),
             port,
             database: "walshadow_test".into(),
-            compression: CompressionChoice::None,
             ..Default::default()
         },
+        compression: CompressionChoice::None,
         flush_timeout: Duration::from_millis(50),
         ..Default::default()
     };

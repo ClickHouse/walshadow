@@ -285,7 +285,7 @@ pub struct CommittedTuple {
     /// (decoder unbuffered path).
     pub commit_ts: i64,
     /// Source LSN of matching `XLOG_XACT_COMMIT`. CH emitter snapshots onto
-    /// its ack-LSN gauge once the xact's `send_data(None)` finishes; daemon
+    /// its ack-LSN gauge once the xact's `send_data_end()` finishes; daemon
     /// status loop writes it to cursor file `emitter_ack_lsn`. 0 for
     /// decoder unbuffered path.
     pub commit_lsn: u64,

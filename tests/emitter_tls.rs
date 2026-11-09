@@ -337,9 +337,9 @@ async fn emitter_tls_round_trip() {
             port: ch.secure_port,
             database: "walshadow_test".into(),
             secure: true,
-            compression: CompressionChoice::Lz4,
             ..Default::default()
         },
+        compression: CompressionChoice::Lz4,
         tls_config: Some(ch.pinned_config()),
         ..Default::default()
     };

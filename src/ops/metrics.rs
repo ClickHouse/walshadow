@@ -427,10 +427,6 @@ snapshot! {
         "InsertBatches an inserter finished draining to ClickHouse. insertbatch_batches_out - inserter_batches_in is the live backlog; their rates show inserter-pool saturation.",
     counter inserter_ch_seconds_total: f64 =
         "Cumulative inserter time inside the ClickHouse INSERT round trip. Against inserter_pool_size x uptime this is CH-side utilization.",
-    counter inserter_rebuilds_total: u64 =
-        "Sealed blocks decoded and rebuilt because a connection negotiated other compression or an older revision than they were prepared for.",
-    counter inserter_rebuild_seconds_total: f64 =
-        "Cumulative inserter time decoding and rebuilding sealed blocks.",
     counter resident_seal_seconds_total: f64 =
         "Cumulative resolver time serializing and compressing sealed Native blocks.",
     counter resident_raw_bytes_total: u64 =
@@ -441,8 +437,6 @@ snapshot! {
         "Bytes held in insert tail output pools: queued column slabs, sealed blocks awaiting acknowledgement, and seal workspace.",
     gauge batcher_open_bytes: u64 =
         "Allocated column slab bytes in batches still open for more rows.",
-    gauge inserter_scratch_bytes: u64 =
-        "Allocated inserter buffers for decoding sealed blocks a connection cannot send as prepared.",
     counter oracle_resolve_seconds_total: f64 =
         "Cumulative resolver time inside the oracle round trip. Overlaps inserter_ch_seconds_total, so the larger of the two is the tail's limiter.",
     counter process_cpu_seconds_total: f64 =

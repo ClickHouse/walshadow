@@ -12,7 +12,7 @@
 //! dedups by `_lsn`). Retry-exhaustion is fatal: the watermark can't advance
 //! without this batch.
 
-use clickhouse_c::{Allocator, ErrorKind, QueryOpts};
+use clickhouse_c::QueryOpts;
 use tokio::task::JoinHandle;
 
 use crate::ch::{ChConn, EmitterError, EndOfStream, drain_to_end_of_stream, with_timeout};
@@ -22,25 +22,19 @@ use crate::emit::pipeline::Fatal;
 use crate::emit::pipeline::ack::AckHandle;
 use crate::emit::pipeline::batcher::BatchMeta;
 use crate::emit::pipeline::resolver::ResolvedBatch;
-use crate::emit::pipeline::sealed::{SealedBlock, builder_of};
+use crate::emit::pipeline::sealed::SealedBlock;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 struct Inserter {
     client: ChConn,
-    alloc: Allocator,
-    /// One block's decompressed body for rebuilds, reused across sends;
-    /// locked only while a block opens
-    scratch: std::sync::Mutex<Vec<u8>>,
     ack: AckHandle,
     stats: Arc<EmitterStats>,
 }
 
 impl Inserter {
     /// Bounded reconnect+retry around one INSERT. Every attempt resends
-    /// every block in order, so a replay carries unchanged rows. A
-    /// connection refusing prepared bytes gets blocks opened one at a time
-    /// into `scratch` and rebuilt
+    /// every block in order, so a replay carries unchanged rows
     async fn send_with_retry(
         &mut self,
         sql: &str,
@@ -48,48 +42,21 @@ impl Inserter {
     ) -> Result<EndOfStream, EmitterError> {
         let insert_timeout = self.client.config().insert_timeout;
         let started = std::time::Instant::now();
-        let (alloc, stats) = (self.alloc, self.stats.clone());
-        let scratch = &self.scratch;
+        let stats = &self.stats;
         let result = self
             .client
             .retry(
-                |mut client| {
-                    let stats = &stats;
-                    async move {
-                        let result = with_timeout(insert_timeout, async {
-                            client.send_query(sql, &QueryOpts::new()).await?;
-                            for sealed in blocks {
-                                match client.send_prepared(sealed.prepared()).await {
-                                    Ok(()) => continue,
-                                    Err(e) if e.kind != ErrorKind::Usage => return Err(e.into()),
-                                    Err(_) => {}
-                                }
-                                let opened = std::time::Instant::now();
-                                let block = {
-                                    let mut scratch =
-                                        scratch.lock().expect("inserter scratch poisoned");
-                                    let held = scratch.capacity();
-                                    let block = sealed.open(alloc, &mut scratch);
-                                    stats.inserter_scratch_bytes.fetch_add(
-                                        (scratch.capacity() - held) as u64,
-                                        Ordering::Relaxed,
-                                    );
-                                    block?
-                                };
-                                let bb = builder_of(&block)?;
-                                stats.inserter_rebuilds.fetch_add(1, Ordering::Relaxed);
-                                stats.inserter_rebuild_nanos.fetch_add(
-                                    opened.elapsed().as_nanos() as u64,
-                                    Ordering::Relaxed,
-                                );
-                                client.send_data(&bb).await?;
-                            }
-                            client.send_data_end().await?;
-                            drain_to_end_of_stream(&mut client).await
-                        })
-                        .await;
-                        (client, result)
-                    }
+                |mut client| async move {
+                    let result = with_timeout(insert_timeout, async {
+                        client.send_query(sql, &QueryOpts::new()).await?;
+                        for sealed in blocks {
+                            client.send_prepared(sealed.prepared()).await?;
+                        }
+                        client.send_data_end().await?;
+                        drain_to_end_of_stream(&mut client).await
+                    })
+                    .await;
+                    (client, result)
                 },
                 |_, _| {
                     stats.retries_attempted.fetch_add(1, Ordering::Relaxed);
@@ -126,6 +93,7 @@ impl Inserter {
 
     async fn run(mut self, rx: async_channel::Receiver<ResolvedBatch>, fatal: Fatal) {
         while let Ok(batch) = rx.recv().await {
+            self.client.force_compression(batch.compression);
             match self.send_all(&batch.meta, &batch.blocks).await {
                 Ok(durable) => {
                     self.stats
@@ -156,15 +124,6 @@ impl Inserter {
     }
 }
 
-impl Drop for Inserter {
-    fn drop(&mut self) {
-        let held = self.scratch.get_mut().map_or(0, |s| s.capacity());
-        self.stats
-            .inserter_scratch_bytes
-            .fetch_sub(held as u64, Ordering::Relaxed);
-    }
-}
-
 /// Connect `n` inserters and spawn drain loops
 pub(crate) async fn spawn_pool(
     n: usize,
@@ -178,8 +137,6 @@ pub(crate) async fn spawn_pool(
     for _ in 0..n.max(1) {
         let inserter = Inserter {
             client: ChConn::connect(dest.clone()).await?,
-            alloc: Allocator::global(&mimalloc::MiMalloc),
-            scratch: Default::default(),
             ack: ack.clone(),
             stats: stats.clone(),
         };
@@ -195,49 +152,49 @@ mod tests {
     use super::*;
     use crate::ch::CompressionChoice;
     use crate::emit::pipeline::ack;
-    use clickhouse_c::{BlockBuilder, ColumnBuilder, TypeAst};
+    use clickhouse_c::{Allocator, BlockBuilder, ColumnBuilder, TypeAst};
 
-    /// One UInt8 column x holding one row 42
-    fn one_row_block(compression: CompressionChoice) -> SealedBlock {
+    /// One uncompressed UInt8 column x holding one row 42
+    fn one_row_block() -> SealedBlock {
         let alloc = Allocator::global(&mimalloc::MiMalloc);
         let ast = TypeAst::parse("UInt8", alloc).unwrap();
         let column = ColumnBuilder::fixed(&[42], 1, 1).unwrap();
         let mut bb = BlockBuilder::new();
         bb.append("x", ast.view(), &column).unwrap();
-        let codec = compression.build_codec().unwrap();
-        SealedBlock::seal(&bb, compression, codec.as_ref().map(|c| c.as_ref()), alloc).unwrap()
+        SealedBlock::seal(&bb, CompressionChoice::None, None, alloc).unwrap()
     }
 
     /// Every attempt resends every block of the INSERT through failed and
-    /// idle reconnects, and after a drop between Data blocks; blocks
-    /// prepared for other compression than the uncompressed server
-    /// connection rebuild
+    /// idle reconnects, and after a drop between Data blocks, dialing
+    /// uncompressed blocks' compression over configured lz4
     #[tokio::test]
     async fn insert_retry_preserves_payload_through_failed_reconnect() {
         let sql = "INSERT INTO retry_test (x) VALUES";
-        for (retries, idle, blocks, codec, cut) in [
-            (0, false, 1, CompressionChoice::Lz4, None),
-            (1, false, 1, CompressionChoice::None, None),
-            (2, false, 1, CompressionChoice::Zstd, None),
-            (2, false, 3, CompressionChoice::Lz4, None),
-            (1, true, 2, CompressionChoice::Zstd, None),
-            (2, false, 3, CompressionChoice::None, Some(1)),
-            (2, false, 3, CompressionChoice::Zstd, Some(2)),
+        for (retries, idle, blocks, cut) in [
+            (0, false, 1, None),
+            (1, false, 1, None),
+            (2, false, 1, None),
+            (2, false, 3, None),
+            (1, true, 2, None),
+            (2, false, 3, Some(1)),
+            (2, false, 3, Some(2)),
         ] {
-            let (config, server) =
+            let (mut config, server) =
                 crate::ch::test_support::retry_server(retries, sql, blocks, idle, cut).await;
+            config.compression = CompressionChoice::Lz4;
             let dest = DestEmitter::new(Arc::new(config), None);
-            let client = ChConn::connect(dest).await.unwrap();
+            let mut client = ChConn::deferred(dest);
+            client.force_compression(CompressionChoice::None);
+            client.dial().await.unwrap();
+            client.take_dials();
             let (ack, collector) = ack::spawn(Arc::default(), Fatal::new());
             let stats = Arc::new(EmitterStats::default());
             let mut inserter = Inserter {
                 client,
-                alloc: Allocator::global(&mimalloc::MiMalloc),
-                scratch: Default::default(),
                 ack,
                 stats: stats.clone(),
             };
-            let sealed: Vec<_> = (0..blocks).map(|_| one_row_block(codec)).collect();
+            let sealed: Vec<_> = (0..blocks).map(|_| one_row_block()).collect();
             assert_eq!(
                 inserter.send_with_retry(sql, &sealed).await.is_ok(),
                 retries == 2 || idle
@@ -250,18 +207,8 @@ mod tests {
                 stats.reconnects.load(Ordering::Relaxed),
                 u64::from(retries == 2 || idle)
             );
-            assert_eq!(
-                stats.inserter_rebuilds.load(Ordering::Relaxed) > 0,
-                codec != CompressionChoice::None,
-                "{codec:?}"
-            );
-            assert_eq!(
-                stats.inserter_scratch_bytes.load(Ordering::Relaxed),
-                inserter.scratch.lock().unwrap().capacity() as u64
-            );
             server.await.unwrap();
             drop(inserter);
-            assert_eq!(stats.inserter_scratch_bytes.load(Ordering::Relaxed), 0);
             collector.await.unwrap();
         }
     }

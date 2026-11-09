@@ -128,6 +128,8 @@ pub fn default_database<'a>(
 pub struct EmitterConfig {
     pub instances: BTreeMap<String, InstanceConfig>,
     pub conn: InstanceConfig,
+    /// Wire compression for every destination, so blocks seal once
+    pub compression: CompressionChoice,
     /// Custom rustls roots/config for `secure` path: private CA, pinned
     /// self-signed cert, or mTLS. `None` uses public webpki roots via
     /// [`clickhouse_c::tls::default_config`]. Not parsed from TOML;
@@ -620,7 +622,7 @@ impl ConnectionConfig for EmitterConfig {
     }
 
     fn compression(&self) -> CompressionChoice {
-        self.conn.compression
+        self.compression
     }
 
     fn idle_reconnect(&self) -> Duration {
@@ -791,8 +793,6 @@ pub struct InstanceConfig {
     /// handshake still names what the certificate was issued for. Empty
     /// uses `host`.
     pub tls_server_name: String,
-    #[serde(deserialize_with = "crate::toml_de::de_parse")]
-    pub compression: CompressionChoice,
 }
 
 impl Default for InstanceConfig {
@@ -806,7 +806,6 @@ impl Default for InstanceConfig {
             password: ch.password,
             secure: ch.secure,
             tls_server_name: ch.tls_server_name,
-            compression: ch.compression,
         }
     }
 }
@@ -1018,8 +1017,8 @@ impl EmitterConfig {
                 password: ch.password,
                 secure: ch.secure,
                 tls_server_name: ch.tls_server_name,
-                compression: ch.compression,
             },
+            compression: ch.compression,
             tls_config: None,
             row_budget: ch.row_budget,
             byte_budget: ch.byte_budget,
@@ -1146,7 +1145,6 @@ impl EmitterConfig {
                     "ch.instances.{name}: host and port must be nonempty"
                 )));
             }
-            instance.compression.build_codec()?;
         }
         out.auto_create_name_all = prefix_all
             .as_deref()
@@ -1430,7 +1428,7 @@ pub(crate) struct ColumnPlan {
     pub(crate) type_repr: String,
     pub(crate) ast: TypeAst,
     pub(crate) decimal: Option<DecimalWire>,
-    pub(crate) datetime64_scale: i32,
+    pub(crate) datetime64_scale: u32,
     pub(crate) non_finite: NonFinite,
     pub(crate) encoding: ColumnEncoding,
     /// Source attribute feeding this column, `None` when descriptor holds
@@ -1763,7 +1761,7 @@ impl TablePlan {
                 encoding: ColumnEncoding::choose(att, &ast),
                 datetime64_scale: types::strip_nullable(ast.view())
                     .datetime64_scale()
-                    .map_or(0, |s| s as i32),
+                    .unwrap_or(0),
                 ast,
                 decimal,
                 non_finite: NonFinite::default(),
@@ -1782,7 +1780,7 @@ impl TablePlan {
                                 encoding: ColumnEncoding::choose(att, &oast),
                                 datetime64_scale: types::strip_nullable(oast.view())
                                     .datetime64_scale()
-                                    .map_or(0, |s| s as i32),
+                                    .unwrap_or(0),
                                 ast: oast,
                                 decimal,
                                 non_finite: NonFinite::default(),
@@ -3125,7 +3123,7 @@ fn unsupported(kind: &'static str) -> EmitterError {
     }
 }
 
-fn timestamp_ticks(pg_us: i64, scale: i32) -> Result<i64, EmitterError> {
+fn timestamp_ticks(pg_us: i64, scale: u32) -> Result<i64, EmitterError> {
     micros_to_ticks(
         i128::from(pg_us) + i128::from(DATETIME64_PG_EPOCH_US),
         scale,
@@ -3133,15 +3131,14 @@ fn timestamp_ticks(pg_us: i64, scale: i32) -> Result<i64, EmitterError> {
 }
 
 /// Convert microseconds to `DateTime64(scale)` or `Time64(scale)` ticks
-fn micros_to_ticks(us: i128, scale: i32) -> Result<i64, EmitterError> {
-    if !(0..=9).contains(&scale) {
+fn micros_to_ticks(us: i128, scale: u32) -> Result<i64, EmitterError> {
+    if scale > 9 {
         return Err(EmitterError::Type("invalid temporal precision".into()));
     }
     let ticks = if scale < 6 {
-        let divisor = 10i128.pow((6 - scale) as u32);
-        us / divisor
+        us / 10i128.pow(6 - scale)
     } else {
-        us * 10i128.pow((scale - 6) as u32)
+        us * 10i128.pow(scale - 6)
     };
     i64::try_from(ticks).map_err(|_| unsupported("finite temporal value overflows storage"))
 }
@@ -3374,7 +3371,7 @@ pub(crate) fn encode_default(att: &RelAttr, ch_inner: &str) -> Option<ColumnBuf>
         decimal: decimal_wire_of(&ast),
         datetime64_scale: types::strip_nullable(ast.view())
             .datetime64_scale()
-            .map_or(0, |s| s as i32),
+            .unwrap_or(0),
         ast,
         non_finite: NonFinite::default(),
         encoding: ColumnEncoding::Local,
@@ -3520,10 +3517,6 @@ crate::atomic_stats! {
         /// `EndOfStream`), retries included. Against `inserter_pool_size ×
         /// elapsed` this is CH-side utilization
         pub inserter_ch_nanos,
-        /// Blocks decoded and rebuilt for a connection refusing their
-        /// prepared bytes, and inserter time doing so
-        pub inserter_rebuilds,
-        pub inserter_rebuild_nanos,
         /// Resolver time inside the oracle round trip, retries included.
         /// Overlaps the inserters' ClickHouse time, so against
         /// `inserter_ch_nanos` it says which stage is the limiter
@@ -3538,10 +3531,9 @@ crate::atomic_stats! {
         /// Resolver time serializing and compressing sealed blocks
         pub resident_seal_nanos,
         /// Gauges: every tail's output pool (queued slabs, sealed blocks,
-        /// seal workspace), open batch slabs, inserter rebuild scratch
+        /// seal workspace), open batch slabs
         pub output_resident_bytes: Arc<std::sync::atomic::AtomicU64>,
         pub batcher_open_bytes,
-        pub inserter_scratch_bytes,
     }
 }
 
@@ -3796,7 +3788,7 @@ mod tests {
         codec: Codec,
         v: &Datum,
         decimal: Option<DecimalWire>,
-        timestamp_scale: i32,
+        timestamp_scale: u32,
     ) -> Result<(), EmitterError> {
         let plan = ColumnPlan {
             name: String::new(),
@@ -5262,7 +5254,7 @@ mod tests {
         assert_eq!(c.conn.password, "secret");
         assert!(c.conn.secure);
         assert_eq!(c.conn.tls_server_name, "svc.clickhouse.cloud");
-        assert_eq!(c.conn.compression, CompressionChoice::Lz4);
+        assert_eq!(c.compression, CompressionChoice::Lz4);
         // Omitting `secure` defaults to plaintext, and SNI falls back to `host`
         let plain = EmitterConfig::from_toml_str("[ch]\nhost = \"h\"\n").unwrap();
         assert!(!plain.conn.secure);

@@ -18,9 +18,9 @@ fn emitter(port: u16) -> EmitterConfig {
             host: "127.0.0.1".into(),
             port,
             database: "walshadow_test".into(),
-            compression: CompressionChoice::Lz4,
             ..Default::default()
         },
+        compression: CompressionChoice::Lz4,
         ..Default::default()
     }
 }

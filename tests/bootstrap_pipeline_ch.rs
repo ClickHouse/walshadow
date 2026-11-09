@@ -135,9 +135,9 @@ async fn bootstrap_tail_fans_out_n2() {
             host: "127.0.0.1".into(),
             port: slot.ch_tcp,
             database: "walshadow_test".into(),
-            compression: CompressionChoice::None,
             ..Default::default()
         },
+        compression: CompressionChoice::None,
         row_budget: 4,
         flush_timeout: Duration::from_millis(50),
         ..Default::default()

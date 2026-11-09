@@ -8,7 +8,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use async_trait::async_trait;
-use clickhouse_c::{Allocator, Block, BlockBuilder, ColumnBuilder, Event, QueryOpts, TypeAst};
+use clickhouse_c::{
+    Allocator, Block, BlockBuilder, ColumnBuilder, Event, QueryOpts, QuerySetting, TypeAst,
+};
 use futures::stream::StreamExt;
 use thiserror::Error;
 use tokio::sync::Mutex;
@@ -40,7 +42,7 @@ pub const CHUNK_PUT_BATCH: usize = 65_536;
 pub const CHUNK_PUT_BYTES: usize = 64 << 20;
 /// Fetch result rows per block: bounds one block's buffer to ~2 MiB at
 /// `TOAST_MAX_CHUNK_SIZE`, ordering validated across block boundaries
-const FETCH_BLOCK_ROWS: usize = 1024;
+const FETCH_BLOCK_ROWS: QuerySetting = QuerySetting::new("max_block_size", "1024");
 const FETCH_QUERY_IDS: usize = 1024;
 
 const CHUNK_ID_INDEX_FP: f64 = 0.000001;
@@ -767,8 +769,7 @@ impl ClickHouseChunkStore {
              SELECT `blkno`, `offnum`, 0, 0, '', {commit_lsn}, 1\n\
              FROM {table}\n\
              GROUP BY `blkno`, `offnum`\n\
-             HAVING max(`_lsn`) <= {marker_lsn} AND argMax(`_is_deleted`, `_lsn`) = 0\n\
-             SETTINGS optimize_aggregation_in_order = 1"
+             HAVING max(`_lsn`) <= {marker_lsn} AND argMax(`_is_deleted`, `_lsn`) = 0"
         )
     }
 
@@ -801,8 +802,7 @@ impl ClickHouseChunkStore {
              )\n\
              WHERE `chunk_id` IN ({ids}) AND `dead` = 0\n\
              GROUP BY `chunk_id`, `chunk_seq`\n\
-             ORDER BY `chunk_id`, `chunk_seq`\n\
-             SETTINGS max_block_size = {FETCH_BLOCK_ROWS}"
+             ORDER BY `chunk_id`, `chunk_seq`"
         )
     }
 
@@ -810,6 +810,7 @@ impl ClickHouseChunkStore {
         &self,
         state: &mut ChState,
         sql: &str,
+        opts: &QueryOpts<'_>,
         bb: Option<&BlockBuilder<'_>>,
     ) -> Result<(), EmitterError> {
         let insert_timeout = self.dest.current().insert_timeout;
@@ -819,7 +820,7 @@ impl ClickHouseChunkStore {
                 |e| is_retryable(e) && !is_missing_mirror(e),
                 |mut client| async move {
                     let result = with_timeout(insert_timeout, async {
-                        client.send_query(sql, &QueryOpts::new()).await?;
+                        client.send_query(sql, opts).await?;
                         if let Some(bb) = bb {
                             client.send_data(bb).await?;
                             client.send_data_end().await?;
@@ -846,7 +847,8 @@ impl ClickHouseChunkStore {
         for ((db_oid, relid), group) in by_mirror {
             if !state.created.contains(&(db_oid, relid)) {
                 let create = self.create_sql(db_oid, relid);
-                self.exec_write(state, &create, None).await?;
+                self.exec_write(state, &create, &QueryOpts::new(), None)
+                    .await?;
                 state.created.insert((db_oid, relid));
             }
             let n = group.len();
@@ -894,7 +896,8 @@ impl ClickHouseChunkStore {
             bb.append("_lsn", u64_ast.view(), &lsn_col)?;
             bb.append("_is_deleted", u8_ast.view(), &is_deleted_col)?;
             let insert = self.insert_sql(db_oid, relid);
-            self.exec_write(state, &insert, Some(&bb)).await?;
+            self.exec_write(state, &insert, &QueryOpts::new(), Some(&bb))
+                .await?;
         }
         Ok(())
     }
@@ -903,6 +906,7 @@ impl ClickHouseChunkStore {
         &self,
         state: &mut ChState,
         sql: &str,
+        opts: &QueryOpts<'_>,
         parse: impl Fn(&Block, &mut A) -> Result<(), EmitterError>,
     ) -> Result<A, EmitterError> {
         let insert_timeout = self.dest.current().insert_timeout;
@@ -912,7 +916,7 @@ impl ClickHouseChunkStore {
                 |e| is_retryable(e) && !is_missing_mirror(e),
                 |mut client| async {
                     let result = with_timeout(insert_timeout, async {
-                        client.send_query(sql, &QueryOpts::new()).await?;
+                        client.send_query(sql, opts).await?;
                         let mut out = A::default();
                         loop {
                             match client.recv_event().await? {
@@ -950,7 +954,8 @@ impl ClickHouseChunkStore {
     ) -> Result<HashMap<u32, ChunkAssembler>, ChunkStoreError> {
         let sql = self.fetch_sql(db_oid, toast_relid, ids, max_lsn);
         let mut state = self.slot().await;
-        self.query_locked(&mut state, &sql, |block, out| {
+        let opts = QueryOpts::new().settings(&[FETCH_BLOCK_ROWS]);
+        self.query_locked(&mut state, &sql, &opts, |block, out| {
             read_value_block(block, expected, out)
         })
         .await
@@ -1083,7 +1088,7 @@ impl ChunkStore for ClickHouseChunkStore {
     async fn truncate_mirror(&self, db_oid: u32, toast_relid: u32) -> Result<(), ChunkStoreError> {
         let sql = self.truncate_sql(db_oid, toast_relid);
         let mut state = self.slot_for(toast_relid).await;
-        self.exec_write(&mut state, &sql, None)
+        self.exec_write(&mut state, &sql, &QueryOpts::new(), None)
             .await
             .map_err(|e| ChunkStoreError::Clickhouse(e.to_string()))
     }
@@ -1097,7 +1102,9 @@ impl ChunkStore for ClickHouseChunkStore {
     ) -> Result<(), ChunkStoreError> {
         let sql = self.rewrite_barrier_sql(db_oid, toast_relid, marker_lsn, commit_lsn);
         let mut state = self.slot_for(toast_relid).await;
-        match self.exec_write(&mut state, &sql, None).await {
+        let in_order = [QuerySetting::new("optimize_aggregation_in_order", "1")];
+        let opts = QueryOpts::new().settings(&in_order);
+        match self.exec_write(&mut state, &sql, &opts, None).await {
             Ok(()) => Ok(()),
             // Never-populated mirror: no table, nothing lived, nothing to
             // tombstone
@@ -2920,8 +2927,7 @@ mod tests {
              SELECT `blkno`, `offnum`, 0, 0, '', 16384, 1\n\
              FROM `wh`.`pg_toast_5_16500`\n\
              GROUP BY `blkno`, `offnum`\n\
-             HAVING max(`_lsn`) <= 8192 AND argMax(`_is_deleted`, `_lsn`) = 0\n\
-             SETTINGS optimize_aggregation_in_order = 1"
+             HAVING max(`_lsn`) <= 8192 AND argMax(`_is_deleted`, `_lsn`) = 0"
         );
 
         assert_eq!(
@@ -2944,8 +2950,7 @@ mod tests {
              )\n\
              WHERE `chunk_id` IN (7, 9) AND `dead` = 0\n\
              GROUP BY `chunk_id`, `chunk_seq`\n\
-             ORDER BY `chunk_id`, `chunk_seq`\n\
-             SETTINGS max_block_size = 1024"
+             ORDER BY `chunk_id`, `chunk_seq`"
         );
     }
 

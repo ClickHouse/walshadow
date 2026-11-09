@@ -231,9 +231,9 @@ pub(crate) fn column_literal(buf: &ColumnBuf, ch_inner: &str) -> Option<String> 
     };
     let unsigned = |n: usize| le(n).map(|w| u128::from_le_bytes(w) as i128);
     // Ticks at `scale` digits to microseconds
-    let micros = |ticks: i64, scale: i32| match 6 - scale {
-        up @ 0.. => ticks.saturating_mul(10i64.pow(up as u32)),
-        down => ticks / 10i64.pow(down.unsigned_abs()),
+    let micros = |ticks: i64, scale: u32| match scale.checked_sub(6) {
+        Some(down) => ticks / 10i64.pow(down),
+        None => ticks.saturating_mul(10i64.pow(6 - scale)),
     };
     match view.kind()? {
         Kind::Bool => Some(if bytes[0] != 0 { "true" } else { "false" }.into()),
@@ -259,11 +259,11 @@ pub(crate) fn column_literal(buf: &ColumnBuf, ch_inner: &str) -> Option<String> 
         )),
         Kind::Time64 => {
             let ticks = i64::from_le_bytes(bytes.try_into().ok()?);
-            let txt = format_time_us(micros(ticks, view.datetime64_scale()? as i32));
+            let txt = format_time_us(micros(ticks, view.datetime64_scale()?));
             Some(sql_string_literal(&txt))
         }
         Kind::DateTime64 => {
-            let prec = view.datetime64_scale()? as i32;
+            let prec = view.datetime64_scale()?;
             let unix = micros(i64::from_le_bytes(bytes.try_into().ok()?), prec);
             let txt = render_pg_timestamp(unix - walrus::pg::replication::PG_EPOCH_USEC);
             Some(format!(
@@ -327,13 +327,13 @@ fn render_pg_timestamp(pg_micros: i64) -> AsciiBuf<32> {
     out
 }
 
-fn datetime64_scale(ch_inner: &str) -> Option<i32> {
+fn datetime64_scale(ch_inner: &str) -> Option<u32> {
     let ast = TypeAst::parse(ch_inner, Allocator::global(&mimalloc::MiMalloc)).ok()?;
     let view = ast.view();
     if view.kind() != Some(Kind::DateTime64) {
         return None;
     }
-    view.datetime64_scale().map(|s| s as i32)
+    view.datetime64_scale()
 }
 
 fn format_uuid(b: &[u8; 16]) -> AsciiArray<36> {
@@ -978,11 +978,7 @@ mod tests {
         for type_name in ["vector", "halfvec"] {
             let r = map(&array_attr(type_name, "[1,2,3]"), false).unwrap();
             assert_eq!(r.ch_type, "Array(Float32)");
-            assert_eq!(
-                r.default_sql.as_deref(),
-                Some("unhex('5b312c322c335d')"),
-                "{type_name}"
-            );
+            assert_eq!(r.default_sql.as_deref(), Some("'[1,2,3]'"), "{type_name}");
         }
     }
 
@@ -996,6 +992,6 @@ mod tests {
     #[test]
     fn other_pending_text_defaults_cast_from_their_text() {
         let r = map(&attr(NUMERICOID, -1, true, Some("3.14")), false).unwrap();
-        assert_eq!(r.default_sql.as_deref(), Some("unhex('332e3134')"));
+        assert_eq!(r.default_sql.as_deref(), Some("'3.14'"));
     }
 }

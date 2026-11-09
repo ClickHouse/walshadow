@@ -155,9 +155,9 @@ async fn budget_trips_seal_complete_inserts() {
             host: "127.0.0.1".into(),
             port: slot.ch_tcp,
             database: "walshadow_test".into(),
-            compression: CompressionChoice::Lz4,
             ..Default::default()
         },
+        compression: CompressionChoice::Lz4,
         row_budget: 2,
         ..Default::default()
     };
@@ -295,9 +295,9 @@ async fn stalled_inserters_backpressure_many_tables_then_drain() {
             host: "127.0.0.1".into(),
             port,
             database: "walshadow_test".into(),
-            compression: CompressionChoice::Lz4,
             ..Default::default()
         },
+        compression: CompressionChoice::Lz4,
         row_budget: 16,
         byte_budget: 16 << 10,
         ..Default::default()

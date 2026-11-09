@@ -763,9 +763,9 @@ async fn build_pipeline_inner(
             host: "127.0.0.1".into(),
             port: ch_tcp_port,
             database: ch_database.into(),
-            compression: CompressionChoice::Lz4,
             ..Default::default()
         },
+        compression: CompressionChoice::Lz4,
         ..Default::default()
     };
     for spec in mappings {

@@ -60,8 +60,8 @@ payloads, healthy and stalled destinations
 Record rows/s, source WAL bytes/s, CPU, allocation count, peak/steady RSS, spill
 volume, durable lag, blocks per INSERT, and ClickHouse part creation. Record
 retained bytes by owner from `walshadow_` metrics `xact_bytes_in_memory`,
-`resident_payload_bytes`, `output_resident_bytes`, `batcher_open_bytes`,
-`inserter_scratch_bytes`, and `resident_raw_bytes_total` over
+`resident_payload_bytes`, `output_resident_bytes`, `batcher_open_bytes`, and
+`resident_raw_bytes_total` over
 `resident_stored_bytes_total`, then compare their
 sum against RSS to size allocator and client overhead. Attribute savings
 separately to compact transaction storage, direct encoding, and compression

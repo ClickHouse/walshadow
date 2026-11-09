@@ -306,6 +306,7 @@ pub async fn connect_creating_database(
 struct Connection {
     client: Option<BoxedAsyncClient>,
     dialed: Option<Arc<EmitterConfig>>,
+    compression: CompressionChoice,
     last_used: Instant,
 }
 
@@ -314,6 +315,7 @@ impl Default for Connection {
         Self {
             client: None,
             dialed: None,
+            compression: CompressionChoice::None,
             last_used: Instant::now(),
         }
     }
@@ -323,6 +325,8 @@ impl Default for Connection {
 pub struct ChConn {
     instance: Option<String>,
     selected: Option<Arc<EmitterConfig>>,
+    /// Dial with this instead of configured compression
+    compression: Option<CompressionChoice>,
     active: Connection,
     parked: foldhash::HashMap<Option<String>, Connection>,
     dest: Arc<DestEmitter>,
@@ -336,6 +340,7 @@ impl ChConn {
             dest,
             instance: None,
             selected: None,
+            compression: None,
             active: Connection::default(),
             parked: Default::default(),
             dials: 0,
@@ -368,6 +373,12 @@ impl ChConn {
         }
         self.selected = config;
         Ok(())
+    }
+
+    /// Dial every destination with `compression`, so prepared blocks sealed
+    /// in it send as is
+    pub fn force_compression(&mut self, compression: CompressionChoice) {
+        self.compression = Some(compression);
     }
 
     /// Redial now, for settings fixed at connect (codec, host, credentials)
@@ -450,23 +461,32 @@ impl ChConn {
             self.selected = Some(self.dest.instance(name)?);
         }
         let config = self.config();
+        let compression = self.compression.unwrap_or(config.compression);
         let moved = self
             .active
             .dialed
             .as_ref()
             .is_none_or(|dialed| !Arc::ptr_eq(dialed, &config));
-        if moved || self.active.last_used.elapsed() >= config.idle_reconnect() {
+        if moved
+            || compression != self.active.compression
+            || self.active.last_used.elapsed() >= config.idle_reconnect()
+        {
             self.active.client = None;
         }
         if let Some(client) = self.active.client.take() {
             return Ok(client);
         }
+        let mut dial = config.clone();
+        if compression != config.compression {
+            Arc::make_mut(&mut dial).compression = compression;
+        }
         let client = if self.instance.is_some() {
-            connect_creating_database(&config).await?.0
+            connect_creating_database(&dial).await?.0
         } else {
-            connect_client(&*config).await?
+            connect_client(&*dial).await?
         };
         self.active.dialed = Some(config);
+        self.active.compression = compression;
         self.active.last_used = Instant::now();
         self.dials += 1;
         Ok(client)

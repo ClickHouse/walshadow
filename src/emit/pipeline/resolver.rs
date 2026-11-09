@@ -54,6 +54,8 @@ use foldhash::HashMap;
 pub(crate) struct ResolvedBatch {
     pub meta: Arc<BatchMeta>,
     pub blocks: Vec<SealedBlock>,
+    /// Compression every block was sealed in
+    pub compression: CompressionChoice,
     pub n_rows: usize,
     pub per_seq: Vec<(u64, u64)>,
     _encoded: crate::budget::MemoryPermit,
@@ -67,8 +69,7 @@ pub(crate) struct ResolverOptions {
     pub oracle: Option<Arc<Oracle>>,
     /// Boot budget for oracle transport retries, re-read from `config_rx`
     pub retry: RetryConfig,
-    /// Compression of prepared blocks, matching connections that negotiate
-    /// it; others rebuild
+    /// Boot compression of prepared blocks, re-read from `config_rx`
     pub codec: CompressionChoice,
     pub stats: Arc<EmitterStats>,
     pub fatal: Fatal,
@@ -144,6 +145,14 @@ impl Sealer {
             codec: compression.build_codec()?,
             asts: HashMap::default(),
         })
+    }
+
+    fn set_compression(&mut self, compression: CompressionChoice) -> Result<(), EmitterError> {
+        if compression != self.compression {
+            self.codec = compression.build_codec()?;
+            self.compression = compression;
+        }
+        Ok(())
     }
 
     /// Serialize and compress one block over its slabs and oracle answer
@@ -228,7 +237,12 @@ async fn run(
     };
     while let Ok(batch) = rx.recv().await {
         if let Some(rx) = config_rx.as_ref() {
-            retry.max_attempts = rx.borrow().retry_max_attempts;
+            let rc = rx.borrow().clone();
+            retry.max_attempts = rc.retry_max_attempts;
+            if let Err(e) = sealer.set_compression(rc.compression) {
+                fatal.set(format!("seal codec: {e}"));
+                return;
+            }
         }
         let InsertBatch {
             meta,
@@ -282,6 +296,7 @@ async fn run(
         let ready = ResolvedBatch {
             meta,
             blocks: sealed,
+            compression: sealer.compression,
             n_rows,
             per_seq,
             _encoded: encoded,
