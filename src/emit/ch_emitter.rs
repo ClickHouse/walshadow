@@ -2716,6 +2716,9 @@ crate::atomic_stats! {
         pub gate_deferred,
         pub gate_chunks_gated,
         pub gate_multixact_emitted,
+        pub gate_pending,
+        pub gate_spools,
+        pub gate_spools_replayed,
         /// Chunk rows mirrored from a restored TOAST page image, repairing
         /// backup page copies read mid-write
         pub toast_image_rows_mirrored,

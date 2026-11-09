@@ -142,10 +142,12 @@ fn lifecycle_complete(
     after: &BTreeMap<String, f64>,
 ) -> bool {
     let finished = |stage| {
-        let key = format!("walshadow_stage_completed_total{{stage=\"{stage}\"}}");
-        after
-            .get(&key)
-            .is_some_and(|value| *value > *before.get(&key).unwrap_or(&0.0))
+        let prefix = format!("walshadow_stage_completed_total{{stage=\"{stage}\"");
+        after.iter().any(|(key, value)| {
+            key.strip_prefix(&prefix)
+                .is_some_and(|rest| rest.starts_with(',') || rest.starts_with('}'))
+                && *value > *before.get(key).unwrap_or(&0.0)
+        })
     };
     if bootstrap {
         finished("bootstrap") && finished("shadow_replay")
@@ -557,7 +559,7 @@ mod tests {
     #[test]
     fn completion_requires_new_stage_work_and_settlement() {
         let before = metrics_values(
-            "walshadow_stage_completed_total{stage=\"publish\"} 2\nwalshadow_stage_completed_total{stage=\"settle\"} 2\nwalshadow_config_backfills_pending 0\n",
+            "walshadow_stage_completed_total{stage=\"publish\",title=\"Publish\",order=\"08\"} 2\nwalshadow_stage_completed_total{stage=\"settle\",title=\"Settle\",order=\"09\"} 2\nwalshadow_config_backfills_pending 0\n",
         );
         assert!(!lifecycle_complete(
             false,
@@ -567,7 +569,8 @@ mod tests {
         ));
         let mut after = before.clone();
         after.insert(
-            "walshadow_stage_completed_total{stage=\"publish\"}".into(),
+            "walshadow_stage_completed_total{stage=\"publish\",title=\"Publish\",order=\"08\"}"
+                .into(),
             3.0,
         );
         assert!(!lifecycle_complete(
@@ -577,7 +580,8 @@ mod tests {
             &after
         ));
         after.insert(
-            "walshadow_stage_completed_total{stage=\"settle\"}".into(),
+            "walshadow_stage_completed_total{stage=\"settle\",title=\"Settle\",order=\"09\"}"
+                .into(),
             3.0,
         );
         assert!(lifecycle_complete(
@@ -599,7 +603,7 @@ mod tests {
     fn bootstrap_requires_snapshot_and_shadow_replay() {
         let empty = BTreeMap::new();
         let mut after = metrics_values(
-            "walshadow_stage_completed_total{stage=\"copy\"} 1\nwalshadow_config_backfills_pending 0\n",
+            "walshadow_stage_completed_total{stage=\"copy\",title=\"Table COPY\",order=\"07\"} 1\nwalshadow_config_backfills_pending 0\n",
         );
         assert!(!lifecycle_complete(
             true,
@@ -608,7 +612,8 @@ mod tests {
             &after
         ));
         after.insert(
-            "walshadow_stage_completed_total{stage=\"bootstrap\"}".into(),
+            "walshadow_stage_completed_total{stage=\"bootstrap\",title=\"Bootstrap\",order=\"01\"}"
+                .into(),
             1.0,
         );
         assert!(!lifecycle_complete(
@@ -618,7 +623,7 @@ mod tests {
             &after
         ));
         after.insert(
-            "walshadow_stage_completed_total{stage=\"shadow_replay\"}".into(),
+            "walshadow_stage_completed_total{stage=\"shadow_replay\",title=\"Shadow replay\",order=\"02\"}".into(),
             1.0,
         );
         assert!(lifecycle_complete(

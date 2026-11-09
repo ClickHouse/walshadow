@@ -97,6 +97,26 @@ If decoder queue stays deep, check `walshadow_queue_records_out_total` for
 progress. Use rate of `walshadow_decoder_buffer_lock_wait_seconds_total` to
 measure time spent waiting for transaction buffer lock
 
+An initial load reports its phase through `walshadow_stage_active{stage}`:
+`bootstrap` spans the whole load, and inside it `bootstrap_walk` (page walk
+off the backup), `bootstrap_window` (replay of the WAL the backup landed),
+`bootstrap_deferred` (TOAST referrers resolved against the chunk store) and
+`bootstrap_gate` (undecided tuples resolved against pg_xact) light up in
+turn. `walshadow_stage_seconds_total` and `_completed_total` carry the same
+labels. Every bootstrap gauge keeps updating until the load hands off to
+streaming, so a frozen `bootstrap_pages_walked_total` under an active
+`bootstrap_gate` is expected: the walk is over, the gate pass is running.
+Gate pass progress is `walshadow_stage_count{measure="work_done"}` against
+`{measure="work_total"}` for `stage="bootstrap_gate"`, and its decisions
+accrue live in `walshadow_bootstrap_gate_tuples_total{verdict}`.
+
+The daemon also logs its replication scope once at start and every hour
+after, on target `walshadow::config`: one `event="shadow config"` line with
+the source endpoint, version, system id and table count, then one
+`event="table config"` line per replicated table with its destination. Log
+pipelines can render the current table list from the newest of these lines
+without a per-table metric series.
+
 Metrics for work a source database owns carry a `database=` label: bridge
 requests, descriptor log and capture counters, and config overlay counters.
 Sum them when a panel wants one number for the daemon. Cluster WAL positions,
