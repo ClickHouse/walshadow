@@ -12,7 +12,6 @@
 //! cadence, HTTP server reads a snapshot per request. Endpoint is read-only by
 //! design (no `/quit`, no admin verbs); operator actions stay on the CLI.
 
-use std::borrow::Cow;
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::io;
@@ -74,32 +73,26 @@ macro_rules! encode_metric {
 /// [`encode_metric`] for a family every database carries: the `database=`
 /// label comes first, a declared label array second
 macro_rules! encode_db_metric {
-    ($enc:expr, $dbs:expr, $names:expr, counter, $name:expr, $help:expr, $field:ident) => {
+    ($enc:expr, $dbs:expr, counter, $name:expr, $help:expr, $field:ident) => {
         counter_series(
             $enc,
             $name,
             $help,
             "database",
-            $names
-                .iter()
-                .zip($dbs)
-                .map(|(db, s)| (db.as_ref(), s.$field)),
+            $dbs.iter().map(|s| (s.database.as_str(), s.$field)),
         )?
     };
-    ($enc:expr, $dbs:expr, $names:expr, gauge, $name:expr, $help:expr, $field:ident) => {
+    ($enc:expr, $dbs:expr, gauge, $name:expr, $help:expr, $field:ident) => {
         gauge_series(
             $enc,
             $name,
             $help,
             "database",
-            $names
-                .iter()
-                .zip($dbs)
-                .map(|(db, s)| (db.as_ref(), s.$field)),
+            $dbs.iter().map(|s| (s.database.as_str(), s.$field)),
         )?
     };
     (
-        $enc:expr, $dbs:expr, $names:expr, counter, $name:expr, $help:expr, $field:ident,
+        $enc:expr, $dbs:expr, counter, $name:expr, $help:expr, $field:ident,
         $key:literal, $labels:expr
     ) => {
         counter_grid(
@@ -107,14 +100,12 @@ macro_rules! encode_db_metric {
             $name,
             $help,
             $key,
-            $names
-                .iter()
-                .zip($dbs)
-                .map(|(db, s)| (db.as_ref(), $labels.into_iter().zip(s.$field))),
+            $dbs.iter()
+                .map(|s| (s.database.as_str(), $labels.into_iter().zip(s.$field))),
         )?
     };
     (
-        $enc:expr, $dbs:expr, $names:expr, gauge, $name:expr, $help:expr, $field:ident,
+        $enc:expr, $dbs:expr, gauge, $name:expr, $help:expr, $field:ident,
         $key:literal, $labels:expr
     ) => {
         gauge_grid(
@@ -122,10 +113,8 @@ macro_rules! encode_db_metric {
             $name,
             $help,
             $key,
-            $names
-                .iter()
-                .zip($dbs)
-                .map(|(db, s)| (db.as_ref(), $labels.into_iter().zip(s.$field))),
+            $dbs.iter()
+                .map(|s| (s.database.as_str(), $labels.into_iter().zip(s.$field))),
         )?
     };
 }
@@ -561,12 +550,9 @@ macro_rules! db_snapshot {
         }
 
         fn encode_db_fields(dbs: &[DbSeries], enc: &mut DescriptorEncoder<'_>) -> fmt::Result {
-            let names: Vec<Cow<'_, str>> =
-                dbs.iter().map(|db| escape_label(&db.database)).collect();
             $(encode_db_metric!(
                 enc,
                 dbs,
-                names,
                 $kind,
                 concat!("walshadow_", stringify!($field)),
                 $help,
@@ -928,24 +914,6 @@ where
     Ok(())
 }
 
-/// The encoder writes label values through, and a database name is whatever
-/// `CREATE DATABASE` took, so escape what OpenMetrics reserves inside quotes
-fn escape_label(value: &str) -> Cow<'_, str> {
-    if !value.contains(['\\', '"', '\n']) {
-        return Cow::Borrowed(value);
-    }
-    let mut out = String::with_capacity(value.len() + 8);
-    for c in value.chars() {
-        match c {
-            '\\' => out.push_str("\\\\"),
-            '"' => out.push_str("\\\""),
-            '\n' => out.push_str("\\n"),
-            _ => out.push(c),
-        }
-    }
-    Cow::Owned(out)
-}
-
 /// LSN gauges carry their raw `u64`
 impl<K> EncodeGaugeValue for Pos<K> {
     fn encode(&self, encoder: &mut GaugeValueEncoder) -> fmt::Result {
@@ -1008,8 +976,6 @@ fn encode_snapshot(snap: &MetricsSnapshot, enc: &mut DescriptorEncoder<'_>) -> f
         u64::from(!snap.crossing_blocked_on.is_empty()),
     )?;
 
-    // rmgr names come out of the fixed resource-manager table, so label values
-    // need no escaping the encoder does not do
     let mut records = declare(
         enc,
         "walshadow_filter_records_total",

@@ -94,7 +94,7 @@ opentelemetry_sdk = { version = "0.33", features = ["rt-tokio"] }
 opentelemetry-otlp = { version = "0.33", default-features = false, features = ["grpc-tonic", "trace"] }
 tracing-opentelemetry = { version = "0.34", default-features = false }
 mimalloc = "0.1.52"
-prometheus-client = "0.25.1"
+prometheus-client = "0.25.2"
 
 # `harness = false` throughout: these take shape flags rather than libtest
 # filters. Bootstrap pump + drain needs no PG and no CH; oracle batch needs
