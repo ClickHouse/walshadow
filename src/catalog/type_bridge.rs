@@ -356,6 +356,9 @@ fn sql_string_literal(s: &str) -> String {
 /// the UTC offset `timestamptz_out` appends (`+00`)
 fn pending_text_literal(text: &str, ch_inner: &str) -> Option<String> {
     match types::kind(ch_inner) {
+        Some(Kind::Array) if text.starts_with('[') && text.ends_with(']') => {
+            Some(sql_bytes_literal(text.as_bytes()))
+        }
         Some(Kind::Array) => {
             let items: Vec<String> = pg_array_items(text)?
                 .iter()
@@ -933,6 +936,19 @@ mod tests {
         ] {
             let r = map(&array_attr(type_name, text), false).unwrap();
             assert_eq!(r.default_sql.as_deref(), expected, "{type_name} {text}");
+        }
+    }
+
+    #[test]
+    fn vector_text_default_casts_from_its_bracketed_text() {
+        for type_name in ["vector", "halfvec"] {
+            let r = map(&array_attr(type_name, "[1,2,3]"), false).unwrap();
+            assert_eq!(r.ch_type, "Array(Float32)");
+            assert_eq!(
+                r.default_sql.as_deref(),
+                Some("unhex('5b312c322c335d')"),
+                "{type_name}"
+            );
         }
     }
 
