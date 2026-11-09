@@ -77,6 +77,8 @@ use crate::source_recovery::{
     stream_error_kind, swap_reason,
 };
 
+const CONFIG_LOG_INTERVAL: Duration = Duration::from_secs(3600);
+
 /// Wait out an unreachable ClickHouse at boot rather than exit, which leaves
 /// a supervisor restart-looping the daemon until the destination returns
 async fn ensure_boot_database_waiting(cfg: &EmitterConfig) -> Result<()> {
@@ -1517,6 +1519,7 @@ async fn session_body(
     }
 
     let mut segments_shipped = 0u64;
+    let mut config_logged: Option<Instant> = None;
     let mut prev_dispatched = stream.dispatched_lsn();
     let mut rate_estimator = RateEstimator::default();
     // Manifest write cadence. Slot safety doesn't ride on it: advertised
@@ -2319,6 +2322,17 @@ async fn session_body(
         let streaming =
             path.mode(paused, crossing.pending()) == walshadow::metrics::SourceMode::Streaming;
         let source_wal_end = streaming.then(|| feed.last_server_wal_end());
+        if config_logged.is_none_or(|t| t.elapsed() >= CONFIG_LOG_INTERVAL) {
+            config_logged = Some(Instant::now());
+            for resolver in &config_resolvers {
+                log_replication_config(
+                    &resolver.subscribe().borrow(),
+                    &source_conn.endpoint(),
+                    feed.server_version_num(),
+                    &ident.system_id,
+                );
+            }
+        }
         populate_metrics(
             &metrics,
             received,
@@ -2585,6 +2599,41 @@ impl SessionTasks {
             }
         }
         Ok(())
+    }
+}
+
+fn log_replication_config(
+    cfg: &walshadow::config::ResolvedConfig,
+    source_endpoint: &str,
+    source_version_num: i32,
+    system_id: &dyn std::fmt::Display,
+) {
+    tracing::info!(
+        target: "walshadow::config",
+        event = "shadow config",
+        source_endpoint,
+        source_version_num,
+        system_id = %system_id,
+        source_dbname = %cfg.source.dbname,
+        tables = cfg.tables.len(),
+        namespaces = cfg.namespaces.len(),
+        paused = cfg.paused,
+        row_budget = cfg.row_budget,
+        byte_budget = cfg.byte_budget,
+    );
+    let mut tables: Vec<_> = cfg.tables.iter().collect();
+    tables.sort_by(|a, b| a.0.cmp(b.0));
+    for (rel, mapping) in tables {
+        tracing::info!(
+            target: "walshadow::config",
+            event = "table config",
+            source_table = %rel,
+            target_database = %mapping.target.database,
+            target_table = %mapping.target.table,
+            target_instance = mapping.target.instance.as_deref().unwrap_or(""),
+            columns = mapping.columns.len(),
+            tees = mapping.tees.len(),
+        );
     }
 }
 

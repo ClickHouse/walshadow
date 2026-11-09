@@ -437,7 +437,7 @@ pub(crate) async fn run_bootstrap(
         resolver: None,
         backfiller: None,
     };
-    let ticker = tokio_util::task::AbortOnDropHandle::new(tokio::spawn({
+    let _ticker = tokio_util::task::AbortOnDropHandle::new(tokio::spawn({
         let metrics = metrics.clone();
         let progress = progress.clone();
         let stats = bootstrap_stats.clone();
@@ -464,6 +464,9 @@ pub(crate) async fn run_bootstrap(
             }
         }
     }));
+    let walk_timing = resume
+        .is_none()
+        .then(|| walshadow::ops::stages::BOOTSTRAP_WALK.start());
     let (rx, pump) = match &resume {
         Some(done) => {
             let (_tx, rx) = tokio::sync::mpsc::channel(1);
@@ -692,19 +695,28 @@ pub(crate) async fn run_bootstrap(
         };
         let leg_fut = async {
             match live_cfg {
-                Some(cfg) => walshadow::backfill::bootstrap_window::stream_window(
-                    cfg,
-                    feed,
-                    source_ident.xlogpos,
-                    stop_rx,
-                )
-                .await
-                .map(Some),
+                Some(cfg) => walshadow::ops::stages::BOOTSTRAP_WINDOW
+                    .measure(walshadow::backfill::bootstrap_window::stream_window(
+                        cfg,
+                        feed,
+                        source_ident.xlogpos,
+                        stop_rx,
+                    ))
+                    .await
+                    .map(Some),
                 None => Ok(None),
             }
         };
-        let (gate_res, stage_res, pump_res, leg_res) =
-            tokio::join!(gate, stages.join(), pump_then_stop, leg_fut);
+        let walk = async {
+            let (gate_res, stage_res, pump_res) = tokio::join!(gate, stages.join(), pump_then_stop);
+            let walked = gate_res.is_ok() && stage_res.is_ok() && matches!(pump_res, Ok(Ok(_)));
+            walk_timing
+                .into_iter()
+                .filter(|_| walked)
+                .for_each(|timing| timing.finish());
+            (gate_res, stage_res, pump_res)
+        };
+        let ((gate_res, stage_res, pump_res), leg_res) = tokio::join!(walk, leg_fut);
         let prepared = (|| -> Result<_> {
             let drain_outcome = stage_res.map_err(|e| anyhow::anyhow!(e))?;
             let (gate_stats, gate_spool) =
@@ -900,23 +912,24 @@ pub(crate) async fn run_bootstrap(
         // Replay backup WAL before resolving deferred value references
         if let Some(mut cfg) = window_cfg {
             cfg.timeline = outcome.start.timeline;
-            let replayed = async {
-                let segments = walshadow::backfill::bootstrap_window::segments_in_dir(
-                    &window_wal,
-                    outcome.start.timeline,
-                    outcome.start.start_lsn,
-                    outcome.end.end_lsn,
-                )
-                .await?;
-                walshadow::backfill::bootstrap_window::replay_segments(
-                    cfg,
-                    &segments,
-                    outcome.start.start_lsn,
-                    outcome.end.end_lsn,
-                )
-                .await
-            }
-            .await;
+            let replayed = walshadow::ops::stages::BOOTSTRAP_WINDOW
+                .measure(async {
+                    let segments = walshadow::backfill::bootstrap_window::segments_in_dir(
+                        &window_wal,
+                        outcome.start.timeline,
+                        outcome.start.start_lsn,
+                        outcome.end.end_lsn,
+                    )
+                    .await?;
+                    walshadow::backfill::bootstrap_window::replay_segments(
+                        cfg,
+                        &segments,
+                        outcome.start.start_lsn,
+                        outcome.end.end_lsn,
+                    )
+                    .await
+                })
+                .await;
             match replayed {
                 Ok(w) => window = Some(w),
                 Err(e) => {
@@ -956,7 +969,14 @@ pub(crate) async fn run_bootstrap(
         }
         let mut deferred_rows = 0;
         if !handback.is_empty() {
-            match sink.resolve_deferred(handback, coverage.clone()).await {
+            match walshadow::ops::stages::BOOTSTRAP_DEFERRED
+                .measure(async {
+                    let resolved = sink.resolve_deferred(handback, coverage.clone()).await;
+                    crate::metrics_publish::mirror_emitter_work(&bootstrap_stats);
+                    resolved
+                })
+                .await
+            {
                 Ok(resolved) => {
                     for (i, lane) in handback_at.into_iter().zip(resolved) {
                         drain_outcome[i].next_seq = lane.next_seq;
@@ -1000,6 +1020,7 @@ pub(crate) async fn run_bootstrap(
         let outcome: BootstrapOutcome = pump_res
             .context("bootstrap pump join")?
             .context("bootstrap pump")?;
+        walk_timing.into_iter().for_each(|timing| timing.finish());
         (shipped, outcome, None, Some(landing_tracker))
     };
 
@@ -1043,7 +1064,6 @@ pub(crate) async fn run_bootstrap(
         files_skipped_unmapped = outcome.page_walk.files_skipped_unmapped.load(Ordering::Relaxed),
         "bootstrap stage timings",
     );
-    ticker.abort();
 
     let open_floor = window.as_ref().and_then(|w| w.open_floor);
     if let Some(w) = &window {
@@ -1085,10 +1105,15 @@ pub(crate) async fn run_bootstrap(
     // Resolve deferred tuples after window transaction overlay is complete
     let recorded = if let Some(pending) = pending_gate {
         let patch = std::mem::take(&mut *window_patch.lock().expect("window patch lock")).seal();
-        let (gate, pending_tables) =
-            resolve_greenfield(pending, &shadow_data_dir, &patch, source_major)
-                .await
-                .context("bootstrap: visibility gate")?;
+        let (gate, pending_tables) = walshadow::ops::stages::BOOTSTRAP_GATE
+            .measure(async {
+                let resolved =
+                    resolve_greenfield(pending, &shadow_data_dir, &patch, source_major).await;
+                crate::metrics_publish::mirror_emitter_work(&bootstrap_stats);
+                resolved
+            })
+            .await
+            .context("bootstrap: visibility gate")?;
         // Persist the ledger before clearing the marker so pending rows
         // already in ClickHouse can be published after restart
         let mut ledger = PendingLedger::load(&args.spill_dir, source_ident.system_id)
