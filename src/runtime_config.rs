@@ -985,4 +985,34 @@ mod tests {
             assert_eq!(mode.as_str().parse(), Ok(mode));
         }
     }
+
+    /// Typed and `typoutput` text cells read alike
+    #[test]
+    fn field_readers_take_text_and_stored_forms() {
+        use crate::schema::{BOOLOID, INT2OID, INT4OID, INT8OID, NAMEOID};
+        let r = rel(
+            "t",
+            vec![
+                attr(1, "n", INT8OID),
+                attr(2, "i2", INT2OID),
+                attr(3, "on", BOOLOID),
+                attr(4, "nm", NAMEOID),
+                attr(5, "i4", INT4OID),
+            ],
+        );
+        let text = |s: &str| Some(build::out_text(s));
+        let cols = [
+            text("42"),
+            Some(build::int2(-2)),
+            text("on"),
+            Some(build::name("ab")),
+            Some(build::int4(7)),
+        ];
+        assert_eq!(field_i64(&r, &cols, "n"), Some(42));
+        assert_eq!(field_i64(&r, &cols, "i2"), Some(-2));
+        assert_eq!(field_i64(&r, &cols, "nm"), None);
+        assert_eq!(field_bool(&r, &cols, "on"), Some(true));
+        assert_eq!(field_bool(&r, &cols, "i4"), None);
+        assert_eq!(field_string(&r, &cols, "nm").as_deref(), Some("ab"));
+    }
 }

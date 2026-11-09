@@ -994,4 +994,32 @@ mod tests {
         let r = map(&attr(NUMERICOID, -1, true, Some("3.14")), false).unwrap();
         assert_eq!(r.default_sql.as_deref(), Some("'3.14'"));
     }
+
+    #[test]
+    fn fixed_cells_render_by_target_width() {
+        let fixed = |bytes: &[u8]| ColumnBuf::Fixed {
+            width: bytes.len(),
+            bytes: bytes.to_vec(),
+        };
+        let cases: [(&[u8], &str, &str); 10] = [
+            (&[0xFE], "Int8", "-2"),
+            (&(-3i16).to_le_bytes(), "Int16", "-3"),
+            (&(-5i64).to_le_bytes(), "Int64", "-5"),
+            (&[0xFE], "UInt8", "254"),
+            (&u16::MAX.to_le_bytes(), "UInt16", "65535"),
+            (&u32::MAX.to_le_bytes(), "UInt32", "4294967295"),
+            (&u64::MAX.to_le_bytes(), "UInt64", "18446744073709551615"),
+            (&1.5f32.to_le_bytes(), "Float32", "1.5"),
+            (&(-0.25f64).to_le_bytes(), "Float64", "-0.25"),
+            (&7i64.to_le_bytes(), "Time64(3)", "'00:00:00.007'"),
+        ];
+        for (bytes, ch, want) in cases {
+            assert_eq!(
+                column_literal(&fixed(bytes), ch).as_deref(),
+                Some(want),
+                "{ch}"
+            );
+        }
+        assert_eq!(column_literal(&fixed(&[1]), "IPv4"), None);
+    }
 }

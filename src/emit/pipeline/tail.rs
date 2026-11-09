@@ -415,4 +415,48 @@ mod tests {
             .unwrap();
         drop(ack);
     }
+
+    #[tokio::test]
+    async fn null_tail_swallows_encoded_runs() {
+        let fatal = Fatal::new();
+        let (tx, ack, parts) = spawn_null(Arc::new(Monotone::default()), fatal.clone());
+        let run = tokio::spawn(async {
+            Ok(EncodedRun {
+                chunks: Vec::new(),
+                permit: None,
+            })
+        });
+        tx.send(BatcherMsg::Encoded(run)).await.unwrap();
+        parts.finish(tx, ack, 0, &fatal).await.unwrap();
+    }
+
+    /// A failed encode job stops the null tail, so a later flush reports the
+    /// job's error rather than a closed channel
+    #[tokio::test]
+    async fn null_tail_fails_on_encode_errors() {
+        let failed = || tokio::spawn(async { Err("boom".to_string()) });
+        let panicked = || tokio::spawn(async { panic!("encoder panicked") });
+        for (job, want) in [(failed(), "encode: boom"), (panicked(), "encode job: ")] {
+            let fatal = Fatal::new();
+            let (tx, ack, parts) = spawn_null(Arc::new(Monotone::default()), fatal.clone());
+            tx.send(BatcherMsg::Encoded(job)).await.unwrap();
+            tx.closed().await;
+            let err = parts.finish(tx, ack, 0, &fatal).await.unwrap_err();
+            assert!(err.starts_with(want), "{err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn discard_tail_finishes_without_clickhouse() {
+        let fatal = Fatal::new();
+        let cfg = BatcherConfig {
+            row_budget: 1024,
+            byte_budget: 1 << 20,
+            inserters: 1,
+            flush_timeout: std::time::Duration::from_secs(1),
+        };
+        let (tx, ack, parts) = spawn_discard(cfg, Arc::default(), fatal.clone());
+        parts.finish(tx, ack, 0, &fatal).await.unwrap();
+        assert!(!fatal.is_set());
+    }
 }

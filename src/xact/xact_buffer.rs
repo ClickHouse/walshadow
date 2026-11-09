@@ -3788,15 +3788,6 @@ pub(crate) mod raw_fixtures {
         }
     }
 
-    /// `Ordinary` verdict for top xid 1, injected directly (no descriptor
-    /// log in these fixtures)
-    pub(crate) fn inject_ordinary(
-        rfn: RelFileNode,
-        rel: Arc<crate::schema::RelDescriptor>,
-    ) -> StashResolved {
-        inject_ordinary_with_stats(rfn, rel, None)
-    }
-
     pub(crate) fn inject_ordinary_with_stats(
         rfn: RelFileNode,
         rel: Arc<crate::schema::RelDescriptor>,
@@ -5166,13 +5157,12 @@ mod tests {
         let tmp = tempdir().unwrap();
         let mut b = XactBuffer::new(cfg(tmp.path().to_path_buf())).unwrap();
         let rel = int4_descriptor(16410);
-        let rfn = rel.rfn;
         b.stash_raw(8, multi_insert_raw(8, 100, 16410, &[100, 200, 300]))
             .await
             .unwrap();
         b.on_heap(heap_with_value(1, 200, 16)).await.unwrap();
         b.on_schema_event(1, 100, dropped_event(7));
-        let stash = inject_ordinary(rfn, rel);
+        let stash = StashResolved::ordinary(1, rel, 0x50);
 
         let mut drain = b
             .drain_committed(stash, 42, 0x2000, &[8], false)
@@ -5247,11 +5237,10 @@ mod tests {
         let tmp = tempdir().unwrap();
         let mut b = XactBuffer::new(cfg(tmp.path().to_path_buf())).unwrap();
         let rel = int4_descriptor(16411);
-        let rfn = rel.rfn;
         let mut raw = multi_insert_raw(1, 100, 16411, &[1]);
         raw.main_data[0] = 0;
         b.stash_raw(1, raw).await.unwrap();
-        let stash = inject_ordinary(rfn, rel);
+        let stash = StashResolved::ordinary(1, rel, 0x50);
         let mut drain = b
             .drain_committed(stash, 42, 0x2000, &[], false)
             .await
@@ -5653,12 +5642,11 @@ mod tests {
         let tmp = tempdir().unwrap();
         let mut b = XactBuffer::new(cfg(tmp.path().to_path_buf())).unwrap();
         let rel = int4_descriptor(16412);
-        let rfn = rel.rfn;
         let mut raw = multi_insert_raw(1, 100, 16412, &[1]);
         raw.rm = RmId::Heap as u8;
         raw.info = crate::decode::heap_decoder::XLOG_HEAP_INPLACE;
         b.stash_raw(1, raw).await.unwrap();
-        let stash = inject_ordinary(rfn, rel);
+        let stash = StashResolved::ordinary(1, rel, 0x50);
         let mut drain = b
             .drain_committed(stash, 42, 0x2000, &[], false)
             .await
@@ -5688,11 +5676,10 @@ mod tests {
         let tmp = tempdir().unwrap();
         let mut b = XactBuffer::new(cfg(tmp.path().to_path_buf())).unwrap();
         let rel = int4_descriptor(16417);
-        let rfn = rel.rfn;
         b.stash_raw(1, multi_insert_raw(99, 100, 16417, &[5]))
             .await
             .unwrap();
-        let stash = inject_ordinary(rfn, rel);
+        let stash = StashResolved::ordinary(1, rel, 0x50);
         let mut drain = b
             .drain_committed(stash, 42, 0x2000, &[], false)
             .await
@@ -5715,7 +5702,6 @@ mod tests {
         let tmp = tempdir().unwrap();
         let mut b = XactBuffer::new(cfg(tmp.path().to_path_buf())).unwrap();
         let rel = int4_descriptor(16413);
-        let rfn = rel.rfn;
         let mut prune = multi_insert_raw(1, 90, 16413, &[1]);
         prune.info = 0x10; // XLOG_HEAP2_PRUNE*
         let mut lock = multi_insert_raw(1, 95, 16413, &[1]);
@@ -5726,7 +5712,7 @@ mod tests {
         b.stash_raw(1, multi_insert_raw(1, 100, 16413, &[7]))
             .await
             .unwrap();
-        let stash = inject_ordinary(rfn, rel);
+        let stash = StashResolved::ordinary(1, rel, 0x50);
         let mut drain = b
             .drain_committed(stash, 42, 0x2000, &[], false)
             .await
@@ -5759,7 +5745,6 @@ mod tests {
         let tmp = tempdir().unwrap();
         let mut b = XactBuffer::new(cfg(tmp.path().to_path_buf())).unwrap();
         let rel = int4_descriptor(16414);
-        let rfn = rel.rfn;
         let mut main_data = vec![0u8; SIZE_OF_HEAP_UPDATE];
         main_data[7] = XLH_UPDATE_PREFIX_FROM_OLD;
         // block 0: [prefixlen=4 covers the whole int4][xl_heap_header][pad]
@@ -5793,7 +5778,7 @@ mod tests {
             }],
         };
         b.stash_raw(1, raw).await.unwrap();
-        let stash = inject_ordinary(rfn, rel);
+        let stash = StashResolved::ordinary(1, rel, 0x50);
         let mut drain = b
             .drain_committed(stash, 42, 0x2000, &[], false)
             .await
@@ -5822,12 +5807,11 @@ mod tests {
         let tmp = tempdir().unwrap();
         let mut b = XactBuffer::new(cfg(tmp.path().to_path_buf())).unwrap();
         let rel = int4_descriptor(16415);
-        let rfn = rel.rfn;
         b.stash_raw(1, multi_insert_raw(1, 100, 16415, &[1, 2, 3]))
             .await
             .unwrap();
         b.stash_raw(1, update_raw(1, 150, 16415, 9)).await.unwrap();
-        let stash = inject_ordinary(rfn, rel);
+        let stash = StashResolved::ordinary(1, rel, 0x50);
         let mut drain = b
             .drain_committed(stash, 42, 0x2000, &[], false)
             .await
@@ -5973,7 +5957,6 @@ mod tests {
         let tmp = tempdir().unwrap();
         let mut b = XactBuffer::new(cfg(tmp.path().to_path_buf())).unwrap();
         let rel = int4_descriptor(16416);
-        let rfn = rel.rfn;
         // ~3.6 KiB of tuple data blows the 1 KiB budget: subxact 8 spills
         let big: Vec<i32> = (0..300).collect();
         b.stash_raw(8, multi_insert_raw(8, 100, 16416, &big))
@@ -5989,7 +5972,7 @@ mod tests {
             .collect();
         assert!(spilled.contains(&(8, true)), "{spilled:?}");
         assert!(spilled.contains(&(9, false)), "{spilled:?}");
-        let stash = inject_ordinary(rfn, rel);
+        let stash = StashResolved::ordinary(1, rel, 0x50);
         let mut drain = b
             .drain_committed(stash, 42, 0x2000, &[8, 9], false)
             .await
@@ -6623,7 +6606,7 @@ mod tests {
         assert_eq!(live.load(Ordering::Relaxed), 3, "top abort");
 
         let mut drain = b
-            .drain_committed(inject_ordinary(rel_rfn, rel), 0, 0x300, &[], false)
+            .drain_committed(StashResolved::ordinary(1, rel, 0x50), 0, 0x300, &[], false)
             .await
             .unwrap();
         let batch = drain

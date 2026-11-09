@@ -2489,6 +2489,12 @@ mod tests {
         const TSVECTOROID: u32 = 3614;
         let tsvector = hex("000000010000000000000e1e0000000100000001000000080000000178000000");
         assert_eq!(missing_from_send(TSVECTOROID, &tsvector), None);
+        // Two elements, then a length word disagreeing with the bytes
+        let text = hex("0000000100000000000000190000000100000001000000026869");
+        let mut two = text.clone();
+        two[15] = 2;
+        assert_eq!(missing_from_send(TEXTOID, &two), None);
+        assert_eq!(missing_from_send(TEXTOID, &text[..text.len() - 1]), None);
     }
 
     #[test]
@@ -2538,6 +2544,26 @@ mod tests {
         // Wrong width is an error, not a silent misread
         assert!(store(WireKind::Int4, &[0, 1]).is_err());
         assert!(store(WireKind::Numeric, &[0, 1, 0]).is_err());
+        assert!(store(WireKind::Numeric, &[0, 1, 0, 0, 0, 0, 0, 0]).is_err());
+        assert!(store(WireKind::Numeric, &[0, 0, 0, 0, 0x12, 0x34, 0, 0]).is_err());
+        use WireKind::*;
+        for (kind, width) in [
+            (Char, 1),
+            (Int2, 2),
+            (Oid, 4),
+            (Float4, 4),
+            (Oid8, 8),
+            (Time, 8),
+        ] {
+            let raw: Vec<u8> = (1..=width).collect();
+            let want: Vec<u8> = raw.iter().rev().copied().collect();
+            assert_eq!(store(kind, &raw).unwrap(), want, "{kind:?}");
+            assert!(store(kind, &raw[1..]).is_err(), "{kind:?}");
+        }
+        let uuid: Vec<u8> = (0..16).collect();
+        assert_eq!(store(Uuid, &uuid).unwrap(), uuid);
+        assert!(store(Uuid, &uuid[1..]).is_err());
+        assert!(store(Name, &[b'n'; NAMEDATALEN]).is_err());
     }
 
     #[tokio::test]

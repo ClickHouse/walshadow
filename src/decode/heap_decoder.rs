@@ -2498,6 +2498,80 @@ mod tests {
         assert!(missing_defaults_equivalent(&raw_ts, &text_ts));
     }
 
+    #[test]
+    fn fast_default_equivalent_across_raw_and_text_name() {
+        let mut raw = rel_attr(1, "n", NAMEOID, 64, 'c');
+        let name = build::name("nm");
+        let Datum::Fixed(stored) = &name else {
+            panic!("name is fixed width");
+        };
+        raw.missing_default = Some(MissingDefault::Raw(raw_missing_array(NAMEOID, stored)));
+        let mut text = rel_attr(1, "n", NAMEOID, 64, 'c');
+        text.missing_default = Some("nm".into());
+        assert!(missing_defaults_equivalent(&raw, &text));
+
+        // Text the parser rejects reads as NULL on both sides
+        let mut bad = rel_attr(1, "x", INT4OID, 4, 'i');
+        bad.missing_default = Some("x".into());
+        assert!(missing_defaults_equivalent(&bad, &bad.clone()));
+    }
+
+    /// Owned datums view and resolve back to themselves, holding their bytes
+    #[test]
+    fn owned_datums_round_trip_through_views() {
+        let att = rel_attr(1, "x", INT4OID, 4, 'i');
+        let pointer = ToastPointer {
+            va_rawsize: 8,
+            va_extinfo: 4,
+            va_valueid: 1,
+            va_toastrelid: 9,
+        };
+        let cases = [
+            (Datum::Null, 0),
+            (build::int4(3), 4),
+            (build::text("ab"), 2),
+            (
+                Datum::External(pointer),
+                std::mem::size_of::<ToastPointer>(),
+            ),
+            (Datum::Cstring(b"c".to_vec()), 1),
+            (Datum::BadTag(b"de".to_vec()), 2),
+            (Datum::Text(b"f".to_vec()), 1),
+            (Datum::Send(b"gh".to_vec()), 2),
+        ];
+        for (d, bytes) in cases {
+            assert_eq!(resolve(&att, d.view()).as_ref(), Some(&d));
+            assert_eq!(d.approx_bytes(), bytes, "{d:?}");
+        }
+    }
+
+    #[test]
+    fn text_datum_parses_local_types() {
+        let fixed = |b: &[u8]| TextDatum::Datum(Datum::fixed(b));
+        let cases: [(u32, &str, TextDatum); 8] = [
+            (CHAROID, "q", fixed(b"q")),
+            (INT2OID, "-2", fixed(&(-2i16).to_le_bytes())),
+            (FLOAT4OID, "1.5", fixed(&1.5f32.to_le_bytes())),
+            (FLOAT8OID, "-0.25", fixed(&(-0.25f64).to_le_bytes())),
+            (OIDOID, "16384", fixed(&16384u32.to_le_bytes())),
+            (
+                MACADDR8OID,
+                "08:00:2b:01:02:03:04:05",
+                fixed(&[8, 0, 0x2b, 1, 2, 3, 4, 5]),
+            ),
+            (
+                TIDOID,
+                "(1,2)",
+                fixed(&crate::decode::codecs::encode_tid(1, 2)),
+            ),
+            (INT2OID, "70000", TextDatum::Null),
+        ];
+        for (oid, text, want) in cases {
+            assert_eq!(text_datum(oid, text.as_bytes()), want, "{oid} {text}");
+        }
+        assert_eq!(text_datum(INT4OID, &[0xFF]), TextDatum::Opaque);
+    }
+
     /// Raw and text both render, so jsonb equivalence is by document
     #[test]
     fn fast_default_equivalent_across_raw_and_text_jsonb() {

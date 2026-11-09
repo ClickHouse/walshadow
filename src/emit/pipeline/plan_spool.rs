@@ -1302,6 +1302,63 @@ mod tests {
         })
     }
 
+    /// Index-key equality as `datumIsEqual` judges stored bytes
+    #[test]
+    fn datums_differ_matrix() {
+        use crate::decode::heap_decoder::ToastPointer;
+        use crate::schema::FLOAT4OID;
+        let mut att = descriptor(1).attributes[0].clone();
+        let one = 1i32.to_le_bytes();
+        let two = 2i32.to_le_bytes();
+        let toast = |va_valueid| ToastPointer {
+            va_rawsize: 8,
+            va_extinfo: 4,
+            va_valueid,
+            va_toastrelid: 9,
+        };
+        let cases = [
+            (DatumRef::Absent, DatumRef::Fixed(&one), false),
+            (DatumRef::Missing, DatumRef::Null, false),
+            (DatumRef::Fixed(&one), DatumRef::Missing, true),
+            (DatumRef::Null, DatumRef::Dropped, false),
+            (DatumRef::Fixed(&one), DatumRef::Fixed(&two), true),
+            (DatumRef::Text(b"a"), DatumRef::Varlena(b"a"), false),
+            (DatumRef::Cstring(b"a"), DatumRef::Varlena(b"b"), true),
+            (
+                DatumRef::External(toast(1)),
+                DatumRef::External(toast(1)),
+                false,
+            ),
+            (
+                DatumRef::External(toast(1)),
+                DatumRef::External(toast(2)),
+                true,
+            ),
+            (DatumRef::Null, DatumRef::Fixed(&one), true),
+        ];
+        for (o, n, want) in cases {
+            assert_eq!(datums_differ(&att, o, n), want, "{o:?} vs {n:?}");
+        }
+        att.type_oid = FLOAT4OID;
+        let f = |v: f32| v.to_le_bytes();
+        let (zero, neg_zero, nan) = (f(0.0), f(-0.0), f(f32::NAN));
+        assert!(!datums_differ(
+            &att,
+            DatumRef::Fixed(&zero),
+            DatumRef::Fixed(&neg_zero)
+        ));
+        assert!(datums_differ(
+            &att,
+            DatumRef::Fixed(&nan),
+            DatumRef::Fixed(&nan)
+        ));
+        assert!(datums_differ(
+            &att,
+            DatumRef::Fixed(&zero),
+            DatumRef::Fixed(&[0])
+        ));
+    }
+
     /// Delete marker splits off when UPDATE moves a key, or any column under
     /// `REPLICA IDENTITY FULL` without a primary key
     #[test]

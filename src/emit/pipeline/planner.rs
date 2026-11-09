@@ -379,9 +379,7 @@ mod tests {
     use crate::emit::pipeline::plan_spool::PlanItem;
     use crate::mapping::{TableMapping, TableTarget};
     use crate::schema::{INT4OID, RelAttr, RelDescriptor, RelName, SchemaEvent, TEXTOID};
-    use crate::xact::xact_buffer::raw_fixtures::{
-        inject_ordinary, int4_descriptor, multi_insert_raw,
-    };
+    use crate::xact::xact_buffer::raw_fixtures::{int4_descriptor, multi_insert_raw};
     use crate::xact::xact_buffer::{FailClosedReason, StashResolved, XactBuffer, XactBufferConfig};
     use foldhash::{HashMap, HashMapExt, HashSet, HashSetExt};
     use walrus::pg::walparser::RelFileNode;
@@ -736,14 +734,13 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut b = XactBuffer::new(cfg(tmp.path().to_path_buf())).unwrap();
         let rel = int4_descriptor(16610);
-        let rfn = rel.rfn;
         b.stash_raw(1, multi_insert_raw(1, 100, 16610, &[1, 2]))
             .await
             .unwrap();
         let mut bad = multi_insert_raw(1, 120, 16610, &[3]);
         bad.main_data[0] = 0; // strip CONTAINS_NEW_TUPLE: ImageOnly on fold
         b.stash_raw(1, bad).await.unwrap();
-        let stash = inject_ordinary(rfn, rel.clone());
+        let stash = StashResolved::ordinary(1, rel.clone(), 0x50);
 
         let mut view = MapView {
             routes: HashMap::from_iter([(rel.rel_name.clone(), route())]),

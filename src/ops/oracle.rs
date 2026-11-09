@@ -200,16 +200,6 @@ impl OracleColumnBuf {
         self.wire_bytes
     }
 
-    /// Request bytes this column adds: none while it resolves locally,
-    /// every cell once one needs conversion
-    pub fn request_bytes(&self) -> usize {
-        if self.remote_cells == 0 {
-            0
-        } else {
-            self.wire_bytes
-        }
-    }
-
     /// Request bytes once `other`'s cells follow these
     pub fn request_bytes_with(&self, other: &Self) -> usize {
         if self.remote_cells + other.remote_cells == 0 {
