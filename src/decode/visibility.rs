@@ -15,8 +15,8 @@
 
 use std::path::{Path, PathBuf};
 
-use ahash::HashMap;
 use anyhow::{Context, Result};
+use foldhash::HashMap;
 use roaring::RoaringBitmap;
 
 // t_infomask bits, PG src/include/access/htup_details.h

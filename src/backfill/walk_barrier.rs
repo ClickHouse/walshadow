@@ -16,7 +16,7 @@
 
 use std::collections::VecDeque;
 
-use ahash::HashSet;
+use foldhash::HashSet;
 use std::time::Duration;
 
 use tokio::sync::Mutex;

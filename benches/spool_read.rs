@@ -8,8 +8,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use ahash::{HashMap, HashMapExt};
 use clap::Parser;
+use foldhash::{HashMap, HashMapExt};
 use walrus::pg::walparser::RelFileNode;
 use walshadow::backup_page_walk::BackfillTuple;
 use walshadow::ch_emitter::EmitterStats;

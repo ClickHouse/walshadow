@@ -62,7 +62,7 @@ pub struct BootstrapConfig {
     pub catalog_filenodes: CatalogFilenodes,
     /// Filenodes worth decoding: mapped relations plus their TOAST heaps.
     /// `None` taps every seeded relation
-    pub tap_filenodes: Option<Arc<ahash::HashSet<(Oid, Oid)>>>,
+    pub tap_filenodes: Option<Arc<foldhash::HashSet<(Oid, Oid)>>>,
     pub progress: BootstrapProgress,
 }
 
@@ -83,7 +83,7 @@ impl BootstrapConfig {
 
     /// Decline every filenode outside `set` at `begin`, so unmapped
     /// relations drain off the wire without a page decode
-    pub fn with_tap_filenodes(mut self, set: Arc<ahash::HashSet<(Oid, Oid)>>) -> Self {
+    pub fn with_tap_filenodes(mut self, set: Arc<foldhash::HashSet<(Oid, Oid)>>) -> Self {
         self.tap_filenodes = Some(set);
         self
     }
@@ -114,13 +114,13 @@ pub fn tap_filenode_set(
     catalog: &CatalogMap,
     routed: impl Fn(&RelDescriptor) -> bool,
     walked: impl Fn(&RelDescriptor) -> bool,
-) -> Option<ahash::HashSet<(Oid, Oid)>> {
-    use ahash::HashSetExt;
-    let by_oid: ahash::HashMap<Oid, (Oid, Oid)> = catalog
+) -> Option<foldhash::HashSet<(Oid, Oid)>> {
+    use foldhash::HashSetExt;
+    let by_oid: foldhash::HashMap<Oid, (Oid, Oid)> = catalog
         .descriptors()
         .map(|d| (d.oid, (d.rfn.db_node, d.rfn.rel_node)))
         .collect();
-    let mut set = ahash::HashSet::new();
+    let mut set = foldhash::HashSet::new();
     for d in catalog.descriptors() {
         if !routed(d) {
             continue;
@@ -326,8 +326,8 @@ pub async fn seed_catalog_from_source(client: &Client) -> Result<CatalogMap> {
         .await
         .context("bootstrap: enumerate user relations on source")?;
 
-    let mut by_oid: ahash::HashMap<Oid, (Arc<RelDescriptor>, Option<Oid>)> =
-        ahash::HashMap::default();
+    let mut by_oid: foldhash::HashMap<Oid, (Arc<RelDescriptor>, Option<Oid>)> =
+        foldhash::HashMap::default();
     for row in rows {
         let oid: Oid = row.get(0);
         let namespace_oid: Oid = row.get(1);

@@ -27,7 +27,7 @@ use crate::emit::pipeline::inserter;
 use crate::emit::pipeline::resolver::{self, ResolvedBatch};
 use crate::emit::pipeline::{DEFAULT_PIPELINE_FLUSH, Fatal};
 use crate::pos::{EmitterAck, Monotone};
-use ahash::{HashMap, HashMapExt};
+use foldhash::{HashMap, HashMapExt};
 
 /// Spawned tail stages; holding this keeps the tasks owned by the caller.
 pub struct TailParts {

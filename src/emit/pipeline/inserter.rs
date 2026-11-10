@@ -23,7 +23,7 @@ use crate::emit::pipeline::ack::AckHandle;
 use crate::emit::pipeline::batcher::BatchMeta;
 use crate::emit::pipeline::resolver::ResolvedBatch;
 use crate::schema::TableKey;
-use ahash::{HashMap, HashMapExt};
+use foldhash::{HashMap, HashMapExt};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 

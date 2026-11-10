@@ -74,7 +74,7 @@ use crate::xact::spill::{
     BodySpoolFile, BodySpoolWriter, RawRecord, SpillEntry, SpillError, SpillReader, SpillStore,
     SpillWriter, ToastChunk, ToastDelete,
 };
-use ahash::{HashMap, HashMapExt};
+use foldhash::{HashMap, HashMapExt};
 
 use std::pin::Pin;
 
@@ -439,7 +439,7 @@ struct XactState {
 }
 
 impl XactState {
-    fn new(first_lsn: u64, span: tracing::Span, hasher: ahash::RandomState) -> Self {
+    fn new(first_lsn: u64, span: tracing::Span, hasher: foldhash::fast::RandomState) -> Self {
         let wait_span = trace_span!(
             !span.is_none(),
             parent: &span,
@@ -1238,7 +1238,7 @@ impl XactBuffer {
         // created once memory-held chunk bytes cross `toast_body_mem_max`
         top_xid: u32,
         commit_lsn: u64,
-        allowed_xids: ahash::HashSet<u32>,
+        allowed_xids: foldhash::HashSet<u32>,
     ) -> std::result::Result<MergedDrain, XactBufferError> {
         let mut gauge = self.drain_gauge(&self.drain_head_resident);
         let mut sources = Vec::with_capacity(states.len());
@@ -1719,7 +1719,7 @@ struct MergedDrain {
     /// Owning xact + subxacts: every yielded heap's writer xid must be a
     /// member (spec validation "decoded xid matches owning xact/subxact");
     /// a stranger means spill corruption or buffer-key drift, fail closed
-    allowed_xids: ahash::HashSet<u32>,
+    allowed_xids: foldhash::HashSet<u32>,
     /// Merge heads + in-mem tail
     gauge: ResidentGauge,
     /// Unsealed chunk map (memory bodies + ref metadata, never file
@@ -2863,7 +2863,7 @@ pub(crate) fn reassemble_value_ref(
 #[derive(Default)]
 struct RecentToastBirths {
     order: VecDeque<(u32, u32)>,
-    counts: ahash::HashMap<(u32, u32), usize>,
+    counts: foldhash::HashMap<(u32, u32), usize>,
 }
 
 impl RecentToastBirths {

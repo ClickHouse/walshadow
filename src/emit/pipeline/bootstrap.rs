@@ -29,7 +29,7 @@ use crate::toast::{
     finish_value, pointer_extsize,
 };
 use crate::xact::xact_buffer::{MissPolicy, StoreMiss, fill_store_miss};
-use ahash::{HashMap, HashMapExt, HashSet};
+use foldhash::{HashMap, HashMapExt, HashSet};
 
 /// Window replay coverage for deferred TOAST reads. Row versions and sequence
 /// positions remain at `start_lsn`
@@ -1122,7 +1122,7 @@ mod tests {
     use crate::emit::pipeline::{Fatal, ack};
     use crate::schema::{RelAttr, RelDescriptor, RelName, ReplIdent};
     use crate::toast::{GatedStore, MemChunkStore};
-    use ahash::{HashMap, HashMapExt, HashSetExt};
+    use foldhash::{HashMap, HashMapExt, HashSetExt};
     use walrus::pg::walparser::RelFileNode;
 
     fn rel(rel_node: u32) -> Arc<RelDescriptor> {

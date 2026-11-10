@@ -230,7 +230,7 @@ mod tests {
         inject_ordinary, int4_descriptor, multi_insert_raw,
     };
     use crate::xact::xact_buffer::{FailClosedReason, StashResolved, XactBuffer, XactBufferConfig};
-    use ahash::{HashMap, HashMapExt, HashSet, HashSetExt};
+    use foldhash::{HashMap, HashMapExt, HashSet, HashSetExt};
     use walrus::pg::walparser::RelFileNode;
 
     /// Pins the `reason=` vocabulary `bump_plan_failure` and the metrics

@@ -39,7 +39,7 @@ use crate::emit::pipeline::decode::DECODE_CHUNK_BYTES;
 use crate::emit::pipeline::{DEFAULT_PIPELINE_FLUSH, Fatal};
 use crate::emit::route::RouteSnapshot;
 use crate::schema::{RelDescriptor, TableKey};
-use ahash::HashMap;
+use foldhash::HashMap;
 
 /// Source relation and route captured during planning
 pub struct RowTable {

@@ -448,3 +448,13 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --no-deps --lib --bins
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+
+      # Advisories, licenses, bans, sources over the Linux graph (deny.toml)
+      - name: cargo deny
+        working-directory: walshadow
+        run: cargo deny --locked check

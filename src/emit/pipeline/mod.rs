@@ -35,7 +35,7 @@ use crate::ops::trace::TxnSpanRegistry;
 use crate::pos::{EmitterAck, Floor, Monotone};
 use crate::source_db::SourceDbs;
 use crate::xact::xact_buffer::{SubxactTracker, XactBuffer};
-use ahash::HashMap;
+use foldhash::HashMap;
 use tokio_postgres::types::Oid;
 
 /// One-shot fatal-error signal shared across pipeline stages. Pump polls

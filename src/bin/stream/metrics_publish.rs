@@ -486,7 +486,7 @@ fn skipped_by_rel(
     stats: &walshadow::decoder_sink::DecoderStats,
     db_name: &(dyn Fn(u32) -> String + Sync),
 ) -> Vec<walshadow::metrics::SkippedRel> {
-    let mut per_reason = ahash::HashMap::<_, usize>::default();
+    let mut per_reason = foldhash::HashMap::<_, usize>::default();
     stats
         .skipped_by_rel
         .snapshot()

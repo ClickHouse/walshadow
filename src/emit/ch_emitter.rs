@@ -51,7 +51,7 @@ use crate::source::queueing_record_sink::{
     DEFAULT_QUEUEING_BATCH_SIZE, DEFAULT_QUEUEING_RECORD_SINK_CAPACITY,
 };
 use crate::table_rules::{MatchKind, PartitionRoute, TableRule};
-use ahash::{HashMap, HashMapExt};
+use foldhash::{HashMap, HashMapExt};
 
 /// Microseconds between PG `TimestampTz` epoch (2000-01-01 UTC) and Unix
 /// epoch. CH `DateTime64(6)` is Unix microseconds; PG commit-record

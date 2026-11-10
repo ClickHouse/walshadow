@@ -329,7 +329,7 @@ async fn bench_drain(shape: Shape) -> Report {
         .map(|i| descriptor(FIRST_FILENODE + i as u32, shape.columns))
         .collect();
     let mut catalog = CatalogMap::new();
-    let mut tables = ahash::HashMap::default();
+    let mut tables = foldhash::HashMap::default();
     for r in &rels {
         catalog.insert(r.clone());
         tables.insert(r.rel_name.clone(), mapping(r.oid, shape.columns));
@@ -382,7 +382,7 @@ async fn bench_drain(shape: Shape) -> Report {
         stats.clone(),
         ToastResolver::disabled(),
         bootstrap::Deferral::Rejected,
-        ahash::HashSet::default(),
+        foldhash::HashSet::default(),
         None,
     )
     .await

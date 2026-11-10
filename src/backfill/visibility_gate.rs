@@ -36,7 +36,7 @@ use crate::mapping::MappingSnapshot;
 use crate::schema::RelName;
 use crate::ticker::Ticker;
 use crate::toast::ToastResolver;
-use ahash::HashSet;
+use foldhash::HashSet;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct GateStats {
@@ -551,7 +551,7 @@ mod tests {
         HEAP_XMIN_INVALID,
     };
     use crate::decode::visibility::{PgMultiXactAccum, PgXactAccum};
-    use ahash::HashSetExt;
+    use foldhash::HashSetExt;
     use std::path::PathBuf;
     use walrus::pg::walparser::RelFileNode;
 
@@ -786,7 +786,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut catalog = CatalogMap::new();
         catalog.insert(make_rel_named(16400, 16400, 0, RelName::new("public", "t")));
-        let mut tables = ahash::HashMap::default();
+        let mut tables = foldhash::HashMap::default();
         tables.insert(
             RelName::new("public", "t"),
             TableMapping {

@@ -1,7 +1,7 @@
 use std::io;
 use std::path::Path;
 
-use ahash::HashSet;
+use foldhash::HashSet;
 
 use crate::schema::FIRST_NORMAL_OBJECT_ID;
 

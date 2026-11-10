@@ -6,8 +6,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use ahash::{HashMap, HashSet};
 use anyhow::{Context, Result, ensure};
+use foldhash::{HashMap, HashSet};
 use serde::{Deserialize, Serialize};
 
 const FILE: &str = "walshadow_relations.toml";

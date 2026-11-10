@@ -25,7 +25,7 @@ use crate::decode::heap_decoder::{
 use crate::emit::ch_emitter::{EmitterConfig, EmitterStats, InlineValueOverflow, ToastMode};
 use crate::toast::read_ahead::{PendingReads, ReadValue, retained_bytes};
 use crate::xact::spill::{BodyRef, BodySpoolFile, ToastChunk, ToastDelete};
-use ahash::{HashMap, HashMapExt, HashSet, HashSetExt};
+use foldhash::{HashMap, HashMapExt, HashSet, HashSetExt};
 
 /// `(toast_relid, value_id) -> chunk_seq -> bytes`; bodies shared with
 /// mirror rows via `Bytes`

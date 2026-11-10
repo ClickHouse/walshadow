@@ -2,7 +2,7 @@ use std::hash::Hash;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
-use ahash::HashMap;
+use foldhash::HashMap;
 
 use crate::schema::TableKey;
 

@@ -90,7 +90,7 @@ use crate::source::timeline::TimelineHistory;
 use crate::ticker::Ticker;
 use crate::toast::ToastResolver;
 use crate::xact::xact_buffer::{XactBuffer, XactBufferConfig};
-use ahash::{HashMap, HashSet, HashSetExt};
+use foldhash::{HashMap, HashSet, HashSetExt};
 
 /// Run one coalesced backup pass for `reqs` (all sharing `mode`).
 pub async fn run_pass(

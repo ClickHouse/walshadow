@@ -5,7 +5,7 @@ use std::sync::Arc;
 use tokio_postgres::types::Oid;
 use walrus::pg::walparser::RelFileNode;
 
-use ahash::HashMap;
+use foldhash::HashMap;
 
 /// `FirstNormalObjectId`, PG src/include/access/transam.h
 pub const FIRST_NORMAL_OBJECT_ID: u32 = 16384;

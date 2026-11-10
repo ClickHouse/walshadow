@@ -242,7 +242,7 @@ fn shadow_major_mismatch(source_version_num: i32) -> Option<String> {
 /// Explicit list, then `--all-tables`, then the interactive picker
 fn select_tables(listed: &[SourceTable], opts: &InitOpts) -> Result<Vec<RelName>> {
     if !opts.tables.is_empty() {
-        let known: ahash::HashSet<&RelName> = listed.iter().map(|t| &t.rel).collect();
+        let known: foldhash::HashSet<&RelName> = listed.iter().map(|t| &t.rel).collect();
         for rel in &opts.tables {
             if !known.contains(rel) {
                 bail!("{}.{} not found on source", rel.namespace, rel.name);

@@ -8,7 +8,7 @@ use crate::column_rules::{ColumnRule, ColumnRules};
 use crate::runtime_config::InitialLoadMode;
 use crate::schema::{RelAttr, RelDescriptor, RelName, SchemaDiff, replident_key_attnums};
 use crate::table_rules::set_if;
-use ahash::HashMap;
+use foldhash::HashMap;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct TableMapping {

@@ -4,8 +4,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use ahash::HashSet;
 use anyhow::Context;
+use foldhash::HashSet;
 use tokio::sync::Mutex;
 use walrus::pg::backup::format_pg_lsn;
 use walshadow::ch_emitter::{EmitterConfig, EmitterStats};
@@ -434,7 +434,7 @@ pub(crate) const ATTACH_MARKER: &str = "attach-pending";
 
 pub(crate) async fn list_databases(
     client: &tokio_postgres::Client,
-) -> anyhow::Result<ahash::HashMap<String, u32>> {
+) -> anyhow::Result<foldhash::HashMap<String, u32>> {
     let rows = client
         .query("SELECT datname::text, oid::int8 FROM pg_database", &[])
         .await?;

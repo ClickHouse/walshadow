@@ -7,8 +7,8 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use ahash::HashSet;
 use anyhow::{Context, Result};
+use foldhash::HashSet;
 use std::fs;
 use walrus::pg::backup::format_pg_lsn;
 use walrus::pg::replication::base_backup::BaseBackupOpts;
@@ -331,7 +331,7 @@ pub(crate) async fn run_bootstrap(
         None => (None, false, Default::default()),
     };
 
-    let shadow_toast_rels: ahash::HashSet<(u32, u32)> = if shadow_toast {
+    let shadow_toast_rels: foldhash::HashSet<(u32, u32)> = if shadow_toast {
         walshadow::toast::shadow_landing::toast_relations(
             sql_client,
             drain_catalog.descriptors().map(Arc::as_ref),
@@ -339,7 +339,7 @@ pub(crate) async fn run_bootstrap(
         )
         .await?
     } else {
-        ahash::HashSet::default()
+        foldhash::HashSet::default()
     };
 
     // Set up oracle before opening BASE_BACKUP to avoid holding backup open

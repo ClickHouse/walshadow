@@ -66,7 +66,7 @@ use crate::ops::bridge::BridgeError;
 use crate::record::{BoundaryInfo, BoundaryKind, SinkError};
 use crate::schema::{DroppedPartition, RelDescriptor, SchemaEvent, compute_schema_diff};
 use crate::xact::xact_buffer::XactBuffer;
-use ahash::{HashMap, HashMapExt, HashSet};
+use foldhash::{HashMap, HashMapExt, HashSet};
 
 crate::atomic_stats! {
     pub struct CaptureStats {
