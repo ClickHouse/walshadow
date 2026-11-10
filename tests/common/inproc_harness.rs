@@ -174,25 +174,32 @@ impl ChServer {
         fs::create_dir_all(&data_dir)?;
         let log_dir = tmp.path().join("ch-logs");
         fs::create_dir_all(&log_dir)?;
-        // Default-profile users config that also enables CH `Time64`
-        // (the bridge maps PG `time` to it; gated behind this
-        // experimental setting in CH 25.x — production must enable it
-        // server-side too). Replaces the built-in users config, so the
-        // passwordless default user is restated here.
+        // Default-profile users config that also enables CH `Time64` for
+        // tests creating tables through `ChServer::query`; walshadow's own
+        // connections set it per session, which user `no_time64` checks.
+        // Replaces the built-in users config, so the passwordless default
+        // user is restated here.
         let users_xml = tmp.path().join("users.xml");
         fs::write(
             &users_xml,
             "<clickhouse>\
                 <profiles><default>\
                     <enable_time_time64_type>1</enable_time_time64_type>\
-                </default></profiles>\
+                </default><no_time64>\
+                    <enable_time_time64_type>0</enable_time_time64_type>\
+                </no_time64></profiles>\
                 <users><default>\
                     <password></password>\
                     <networks><ip>::/0</ip></networks>\
                     <profile>default</profile>\
                     <quota>default</quota>\
                     <access_management>1</access_management>\
-                </default></users>\
+                </default><no_time64>\
+                    <password></password>\
+                    <networks><ip>::/0</ip></networks>\
+                    <profile>no_time64</profile>\
+                    <quota>default</quota>\
+                </no_time64></users>\
                 <quotas><default/></quotas>\
             </clickhouse>",
         )?;
