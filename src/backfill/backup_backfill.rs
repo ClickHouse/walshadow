@@ -1117,6 +1117,7 @@ impl RecordSink for PrescanSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backfill::backup_page_walk::TupleData;
     use crate::decode::visibility::{
         HEAP_XMAX_INVALID, HEAP_XMAX_IS_MULTI, HEAP_XMIN_COMMITTED, HEAP_XMIN_INVALID,
         PgMultiXactAccum, PgXactAccum, PgXactView,
@@ -1550,7 +1551,8 @@ mod tests {
             page_lsn: 0,
             blkno: 0,
             offnum: 0,
-            columns: Vec::new(),
+            data: TupleData::Heap(Box::default()),
+            pending: None,
         }
     }
 

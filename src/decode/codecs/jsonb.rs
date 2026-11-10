@@ -36,14 +36,14 @@ const JSONB_MAX_DEPTH: usize = 1000;
 
 /// Decode `jsonb` varlena body to PG `jsonb_out` text (`JsonbToCString`)
 pub fn decode_jsonb(body: &[u8]) -> Result<String, CodecError> {
-    decode_jsonb_with_capacity(body, body.len())
+    let mut out = String::with_capacity(body.len());
+    render_jsonb_text(body, &mut out)?;
+    Ok(out)
 }
 
-/// [`decode_jsonb`] into a buffer sized by [`jsonb_text_len`]
-pub fn decode_jsonb_with_capacity(body: &[u8], capacity: usize) -> Result<String, CodecError> {
-    let mut out = String::with_capacity(capacity);
-    render_jsonb_container(body, 0, &mut out)?;
-    Ok(out)
+/// `jsonb_out` text appended to `out`
+pub fn render_jsonb_text(body: &[u8], out: &mut String) -> Result<(), CodecError> {
+    render_jsonb_container(body, 0, out)
 }
 
 /// [`decode_jsonb`] length without rendering. Text may outgrow its body,
@@ -453,7 +453,8 @@ mod tests {
         for (hex, want) in JSONB_VECTORS {
             let body = varlena_body(hex);
             let len = jsonb_text_len(&body).expect(hex);
-            let text = decode_jsonb_with_capacity(&body, len).expect(hex);
+            let mut text = String::with_capacity(len);
+            render_jsonb_text(&body, &mut text).expect(hex);
             assert_eq!(
                 (text.as_str(), text.capacity()),
                 (*want, want.len()),

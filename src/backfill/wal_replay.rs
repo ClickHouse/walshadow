@@ -15,9 +15,10 @@ use walrus::pg::walparser::{Oid, RelFileNode, RmId};
 use crate::budget::{MemoryBudget, MemoryPermit, acquire_opt};
 use crate::catalog::desc_log::{DescriptorLog, DescriptorLogs};
 use crate::config::ResolvedConfig;
+use crate::decode::datum::Datum;
 use crate::decode::heap_decoder::{
-    CommittedTuple, XLH_DELETE_IS_SUPER, XLOG_HEAP_DELETE, XLOG_HEAP_HOT_UPDATE, XLOG_HEAP_INSERT,
-    XLOG_HEAP_OPMASK, XLOG_HEAP_UPDATE, take_key_change_tombstone,
+    HeapOp, XLH_DELETE_IS_SUPER, XLOG_HEAP_DELETE, XLOG_HEAP_HOT_UPDATE, XLOG_HEAP_INSERT,
+    XLOG_HEAP_OPMASK, XLOG_HEAP_UPDATE, view_heap_record,
 };
 use crate::decode::visibility::PgXactPatch;
 use crate::decode::wal_xact::{
@@ -26,7 +27,10 @@ use crate::decode::wal_xact::{
 };
 use crate::emit::ch_emitter::EmitterStats;
 use crate::emit::pipeline::ack::{AckHandle, BufferedRowSender, OpenSeq, Publish, SeqAlloc};
-use crate::emit::pipeline::batcher::{BatcherClosed, BatcherMsg, RowBuffer};
+use crate::emit::pipeline::batcher::{
+    BatcherClosed, BatcherMsg, DECODE_CHUNK_BYTES, PlacedSegment,
+};
+use crate::emit::pipeline::plan_spool::{ChunkBuilder, ViewChange};
 use crate::emit::route::{RouteSnapshot, freeze_routes};
 use crate::mapping::MappingSnapshot;
 use crate::pos::Pos;
@@ -34,10 +38,10 @@ use crate::record::{Record, RecordSink, SegmentSink, SinkError, WAL_SEG_SIZE};
 use crate::schema::{FIRST_NORMAL_OBJECT_ID, RelDescriptor};
 use crate::source::wal_stream::WalStream;
 use crate::toast::{ChunkRefMap, ToastResolver, ToastRow, ToastRowRef};
-use crate::xact::spill::BodySpoolFile;
+use crate::xact::spill::{BodySpoolFile, DescribedInput};
 use crate::xact::xact_buffer::{
     BufferingDecoderSink, DrainEntry, DrainedBatch, SubxactTracker, WalkStep, XactBuffer,
-    detoast_heap, heap_reads_toast, resolve_stash,
+    detoast_sites, external_sites, resolve_stash,
 };
 use foldhash::{HashMap, HashSet};
 
@@ -182,8 +186,11 @@ pub struct WalReplaySink {
     batch_rows: usize,
     batch_bytes: usize,
     msg_tx: mpsc::Sender<BatcherMsg>,
-    /// Rows not yet on the batcher channel, shipped with held seq events
-    row_buffer: RowBuffer,
+    /// Open commit's encoded rows, keyed by descriptor identity
+    chunks: ChunkBuilder<usize>,
+    /// Segments not yet on the batcher channel, shipped with held seq events
+    staged: Vec<PlacedSegment>,
+    staged_rows: usize,
     patch: Option<Arc<std::sync::Mutex<PgXactPatch>>>,
     seqs: SeqAlloc,
     /// Current seq and its routed rows, registered on first row
@@ -210,6 +217,21 @@ struct ReplayTarget {
 
 fn tail_closed(_: BatcherClosed) -> SinkError {
     SinkError::Other("wal_replay: tail closed".into())
+}
+
+fn encode_err(e: crate::ch::EmitterError) -> SinkError {
+    SinkError::Other(format!("wal_replay: encode: {e}"))
+}
+
+/// Rows staged before a channel hop
+const STAGED_ROWS: usize = 65536;
+
+/// Commit a drained batch belongs to, with its TOAST sources
+struct Commit<'a> {
+    ts: i64,
+    lsn: u64,
+    spool: Option<&'a BodySpoolFile>,
+    ref_maps: &'a [&'a ChunkRefMap],
 }
 
 impl WalReplaySink {
@@ -257,7 +279,9 @@ impl WalReplaySink {
             batch_rows: inputs.batch_rows,
             batch_bytes: inputs.batch_bytes,
             msg_tx: inputs.msg_tx,
-            row_buffer: RowBuffer::default(),
+            chunks: ChunkBuilder::new(STAGED_ROWS, DECODE_CHUNK_BYTES),
+            staged: Vec::new(),
+            staged_rows: 0,
             patch: inputs.patch,
             seqs: inputs.ack.seqs(inputs.next_seq).buffer_events(),
             open: None,
@@ -299,7 +323,7 @@ impl WalReplaySink {
     }
 
     /// Transactions needing replay below `lsn` to rebuild buffered prefix
-    pub async fn xacts_opened_below(&self, lsn: u64) -> Vec<(u32, u64)> {
+    pub async fn xacts_opened_below(&mut self, lsn: u64) -> Vec<(u32, u64)> {
         self.buffer
             .lock()
             .await
@@ -327,7 +351,7 @@ impl WalReplaySink {
 
     /// Lowest first-record LSN still buffered. A resume above it would drop
     /// the prefix of a transaction that commits later
-    pub async fn oldest_inflight(&self) -> Option<u64> {
+    pub async fn oldest_inflight(&mut self) -> Option<u64> {
         self.buffer
             .lock()
             .await
@@ -344,17 +368,46 @@ impl WalReplaySink {
         Ok(self.stats())
     }
 
-    async fn emit(
+    /// Seq of the open commit, registered on its first routed row; counts
+    /// `rows` against it
+    fn place_rows(&mut self, commit_lsn: u64, rows: usize) -> u64 {
+        let (open, placed) = self
+            .open
+            .get_or_insert_with(|| (self.seqs.open(commit_lsn, Publish::Commit), 0));
+        *placed += rows as u64;
+        open.seq()
+    }
+
+    /// Stage encoded rows as a segment of `seq` once due, or at once when a
+    /// leaf permit rides them: ship it before another acquisition can
+    /// wait on it
+    async fn encoded(
         &mut self,
         seq: u64,
-        table: (&Arc<RelDescriptor>, &Arc<RouteSnapshot>),
-        committed: CommittedTuple,
-        value_permit: Option<Arc<MemoryPermit>>,
+        permit: Option<MemoryPermit>,
     ) -> std::result::Result<(), SinkError> {
-        if self.row_buffer.stage(seq, table, committed, value_permit) {
+        if permit.is_none() && !self.chunks.due() {
+            return Ok(());
+        }
+        let ship = permit.is_some();
+        self.stage(seq, permit.map(Arc::new));
+        if ship || self.staged_rows >= STAGED_ROWS {
             self.flush_pending().await?;
         }
         Ok(())
+    }
+
+    fn stage(&mut self, seq: u64, permit: Option<Arc<MemoryPermit>>) {
+        let chunks: Vec<_> = self.chunks.take().into_iter().map(|(_, c)| c).collect();
+        if chunks.is_empty() {
+            return;
+        }
+        self.staged_rows += chunks.iter().map(|c| c.rows()).sum::<usize>();
+        self.staged.push(PlacedSegment {
+            seq,
+            chunks,
+            permit,
+        });
     }
 
     /// Mirror all chunks from restored TOAST page image. Bypass transaction
@@ -538,7 +591,11 @@ impl WalReplaySink {
         }
         drain.finish().await.map_err(SinkError::from)?;
         if let Some((seq, rows)) = self.open.take() {
+            self.stage(seq.seq(), None);
             self.seqs.place(seq, rows);
+            if self.staged_rows >= STAGED_ROWS {
+                self.flush_pending().await?;
+            }
         }
         self.subxact_tracker.forget_tree(xid);
         Ok(())
@@ -581,75 +638,108 @@ impl WalReplaySink {
                         .await
                         .map_err(|e| SinkError::Other(format!("toast rewrite barrier: {e}")))?;
                 }
-                WalkStep::Heap(mut heap) => {
-                    let rfn = heap.decoded.rfn;
+                WalkStep::Heap(input) => {
+                    let rfn = input.descriptor.rfn;
+                    let rows = u64::from(input.input.tuples);
                     // Decode TOAST chunks, route through parent row
                     let Some(target) = targets.get(&(rfn.db_node, rfn.rel_node)) else {
                         continue;
                     };
                     if commit_lsn <= self.from_lsn {
                         // Walked pages cover commits through from_lsn
-                        self.replay.commits_below_from += 1;
+                        self.replay.commits_below_from += rows;
                         continue;
                     }
                     if commit_lsn > target.through {
-                        self.replay.commits_past_through += 1;
+                        self.replay.commits_past_through += rows;
                         continue;
                     }
                     let Some(route) = &target.route else {
                         self.stats
                             .unsupported_relations
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            .fetch_add(rows, std::sync::atomic::Ordering::Relaxed);
                         continue;
                     };
-                    // Skip deletes for append-only destinations
-                    if route.drops_deletes()
-                        && matches!(heap.decoded.op, crate::decode::heap_decoder::HeapOp::Delete)
-                    {
-                        self.stats
-                            .deletes_discarded
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        continue;
-                    }
-                    let rel = &target.rel;
-                    // Make earlier commits available before resolving values.
-                    // Inline-only heaps read nothing: flushing for them
-                    // shreds the batch on a row-heavy segment. Gate stays
-                    // as wide as detoast's leaf acquire: narrowing it to
-                    // store-bound pointers would hold pending leaf permits
-                    // across that acquire, which can wait on them
-                    if heap_reads_toast(&heap) {
-                        self.flush_rows().await?;
-                    }
-                    let value_permit = detoast_heap(&mut heap, spool, &ref_maps, &self.resolver)
-                        .await
-                        .map_err(SinkError::from)?;
-                    let (open, rows) = self
-                        .open
-                        .get_or_insert_with(|| (self.seqs.open(commit_lsn, Publish::Commit), 0));
-                    *rows += 1;
-                    let seq = open.seq();
-                    if !route.drops_deletes()
-                        && let Some(tomb) = take_key_change_tombstone(&mut heap.decoded, rel)
-                    {
-                        *rows += 1;
-                        let tomb = CommittedTuple {
-                            decoded: tomb,
-                            commit_ts,
-                            commit_lsn,
-                        };
-                        self.emit(seq, (rel, route), tomb, None).await?;
-                    }
-                    let committed = CommittedTuple {
-                        decoded: heap.decoded,
-                        commit_ts,
-                        commit_lsn,
+                    let at = Commit {
+                        ts: commit_ts,
+                        lsn: commit_lsn,
+                        spool,
+                        ref_maps: &ref_maps,
                     };
-                    self.emit(seq, (rel, route), committed, value_permit.map(Arc::new))
-                        .await?;
-                    self.replay.rows_replayed += 1;
+                    self.replay_views(&input, route, &at).await?;
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// Whether `op` lands; append-only destinations drop deletes
+    fn lands(&self, route: &RouteSnapshot, op: HeapOp) -> bool {
+        let dropped = route.drops_deletes() && op == HeapOp::Delete;
+        if dropped {
+            self.stats
+                .deletes_discarded
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        !dropped
+    }
+
+    /// Encode an input's tuple images in place, external values resolved
+    /// into per-image patches
+    async fn replay_views(
+        &mut self,
+        input: &DescribedInput,
+        route: &Arc<RouteSnapshot>,
+        at: &Commit<'_>,
+    ) -> std::result::Result<(), SinkError> {
+        let rel = &input.descriptor;
+        let lsn = input.input.source_lsn;
+        let images = view_heap_record(input.input.record_bytes(), rel)
+            .map_err(|e| SinkError::Other(format!("wal_replay: decode at {lsn:#X}: {e}")))?;
+        for h in &images {
+            if h.new.as_ref().is_some_and(|t| t.partial) {
+                return Err(SinkError::Other(format!(
+                    "wal_replay: partial update at {lsn:#X}"
+                )));
+            }
+            if !self.lands(route, h.op) {
+                continue;
+            }
+            let sites = external_sites([h.new.as_ref(), h.old.as_ref()]);
+            let mut patches: [Vec<(usize, Datum)>; 2] = Default::default();
+            let mut permit = None;
+            if !sites.is_empty() {
+                // Make earlier commits available before resolving values.
+                // Inline-only heaps read nothing: flushing for them shreds
+                // the batch on a row-heavy segment
+                self.flush_rows().await?;
+                let db = rel.rfn.db_node;
+                let (values, leaf) =
+                    detoast_sites(&sites, db, lsn, at.spool, at.ref_maps, &self.resolver)
+                        .await
+                        .map_err(SinkError::from)?;
+                for (site, v) in sites.iter().zip(values) {
+                    patches[site.image].push((site.idx, v));
+                }
+                permit = leaf;
+            }
+            let change = ViewChange {
+                op: h.op,
+                xid: input.input.xid,
+                source_lsn: lsn,
+                new: h.new.as_ref(),
+                old: h.old.as_ref(),
+                new_patch: &patches[0],
+                old_patch: &patches[1],
+            };
+            let key = Arc::as_ptr(rel) as usize;
+            let rows = self
+                .chunks
+                .push_views(key, rel, route, change, at.ts)
+                .map_err(encode_err)?;
+            let seq = self.place_rows(at.lsn, rows);
+            self.replay.rows_replayed += 1;
+            self.encoded(seq, permit).await?;
         }
         Ok(())
     }
@@ -727,10 +817,15 @@ impl BufferedRowSender for WalReplaySink {
     }
 
     async fn send_rows(&mut self) -> std::result::Result<(), SinkError> {
-        self.row_buffer
-            .flush(&self.msg_tx)
+        if self.staged.is_empty() {
+            return Ok(());
+        }
+        self.staged_rows = 0;
+        let staged = std::mem::take(&mut self.staged);
+        self.msg_tx
+            .send(BatcherMsg::Segments(staged))
             .await
-            .map_err(tail_closed)
+            .map_err(|_| tail_closed(BatcherClosed))
     }
 }
 
@@ -744,6 +839,7 @@ impl RecordSink for WalReplaySink {
                 return Ok(());
             };
             // Failed commit's seq stays unplaced, pinning ack below it
+            let _ = self.chunks.take();
             self.flush_pending().await?;
             Err(e)
         })
@@ -842,6 +938,7 @@ pub async fn pump_segments_through(
 mod tests {
     use super::*;
     use crate::catalog::desc_log::DescLogIdentity;
+    use crate::decode::datum::build;
     use crate::decode::heap_decoder::SIZE_OF_HEAP_UPDATE;
     use crate::decode::visibility::{PgXactAccum, PgXactView, SealedPatch, XidStatus};
     use crate::decode::wal_xact::{
@@ -1535,9 +1632,7 @@ mod tests {
 
     #[tokio::test]
     async fn error_between_commits_ships_committed_rows() {
-        use crate::decode::heap_decoder::{
-            ColumnValue, DecodedHeap, DecodedTuple, DescribedHeap, HeapOp,
-        };
+        use crate::decode::heap_decoder::{DecodedHeap, DecodedTuple, DescribedHeap, HeapOp};
         use crate::mapping::{ColumnMapping, TableMapping, TableTarget};
         use crate::schema::{RelName, ReplIdent};
         use walrus::pg::walparser::RelFileNode;
@@ -1590,7 +1685,7 @@ mod tests {
                     source_lsn: 10,
                     op: HeapOp::Insert,
                     new: Some(DecodedTuple {
-                        columns: vec![Some(ColumnValue::Int4(1))],
+                        columns: vec![Some(build::int4(1))],
                         partial: false,
                     }),
                     old: None,
@@ -1608,9 +1703,12 @@ mod tests {
         let mut abort = xact_record(XLOG_XACT_ABORT, 901, &[902], None);
         abort.parsed.main_data = std::borrow::Cow::Owned(vec![0u8; 10]);
         assert!(sink.on_record(&abort).await.is_err());
-        let Ok(BatcherMsg::Rows(chunk)) = msg_rx.try_recv() else {
+        let Ok(BatcherMsg::Segments(segments)) = msg_rx.try_recv() else {
             panic!("committed row not shipped");
         };
-        assert_eq!(chunk.rows.len(), 1);
+        assert_eq!(
+            crate::emit::pipeline::batcher::segment_rows(&segments).len(),
+            1
+        );
     }
 }

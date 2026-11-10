@@ -1,6 +1,6 @@
 //! Tee end-to-end: one source table feeds a `ReplacingMergeTree` primary, a
 //! `MergeTree` audit log, and a replica in another database. Rows, deletes
-//! and `ADD COLUMN` must reach all three.
+//! and `ADD COLUMN` must reach all three
 
 #![cfg(target_os = "linux")]
 

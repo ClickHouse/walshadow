@@ -40,31 +40,37 @@ const NUMERIC_SHORT_WEIGHT_MASK: u16 = 0x003F;
 
 const NUMERIC_DSCALE_MASK: u16 = 0x3FFF;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum NumericKind {
+/// Non-finite `numeric`, a header with no digits
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Special {
     NaN,
     /// `+Infinity` (PG 14+)
     PInf,
     /// `-Infinity` (PG 14+)
     NInf,
-    /// PG-text form
-    Finite(String),
 }
 
-impl NumericKind {
-    pub(crate) fn as_text(&self) -> &str {
+impl Special {
+    pub(crate) fn as_text(self) -> &'static str {
         match self {
-            Self::Finite(s) => s,
             Self::NaN => "NaN",
             Self::PInf => "Infinity",
             Self::NInf => "-Infinity",
         }
     }
+
+    fn header(self) -> u16 {
+        match self {
+            Self::NaN => NUMERIC_NAN,
+            Self::PInf => NUMERIC_PINF,
+            Self::NInf => NUMERIC_NINF,
+        }
+    }
 }
 
 /// `numeric` header fields plus its base-10000 digits, still in the datum
-enum Numeric<'a> {
-    Special(NumericKind),
+pub(crate) enum Numeric<'a> {
+    Special(Special),
     Finite {
         neg: bool,
         weight: i32,
@@ -74,7 +80,7 @@ enum Numeric<'a> {
     },
 }
 
-fn parse_numeric(body: &[u8]) -> Result<Numeric<'_>, CodecError> {
+pub(crate) fn parse_numeric(body: &[u8]) -> Result<Numeric<'_>, CodecError> {
     if body.len() < 2 {
         return Err(CodecError::Truncated {
             offset: 0,
@@ -89,10 +95,10 @@ fn parse_numeric(body: &[u8]) -> Result<Numeric<'_>, CodecError> {
 
     if is_special {
         return Ok(Numeric::Special(match n_header {
-            NUMERIC_NAN => NumericKind::NaN,
-            NUMERIC_PINF => NumericKind::PInf,
-            NUMERIC_NINF => NumericKind::NInf,
-            _ => NumericKind::NaN, // unknown special, treat as NaN (lossy-safe)
+            NUMERIC_PINF => Special::PInf,
+            NUMERIC_NINF => Special::NInf,
+            // Unknown special reads as NaN, lossy but safe
+            _ => Special::NaN,
         }));
     }
 
@@ -141,26 +147,8 @@ fn parse_numeric(body: &[u8]) -> Result<Numeric<'_>, CodecError> {
     })
 }
 
-/// Decode `numeric` varlena body to PG `numeric_out` text or special value
-pub fn decode_numeric(body: &[u8]) -> Result<NumericKind, CodecError> {
-    match parse_numeric(body)? {
-        Numeric::Special(kind) => Ok(kind),
-        Numeric::Finite {
-            neg,
-            weight,
-            dscale,
-            digits,
-        } => {
-            let mut out = String::with_capacity(finite_text_len(neg, weight, dscale, digits));
-            render_numeric(neg, weight, dscale, digits, &mut out);
-            Ok(NumericKind::Finite(out))
-        }
-    }
-}
-
-/// `numeric_out` text into a caller's buffer, for callers holding one already:
-/// `jsonb`'s numeric children render straight into the enclosing document
-pub(crate) fn render_numeric_text(body: &[u8], out: &mut String) -> Result<(), CodecError> {
+/// `numeric_out` text appended to `out`
+pub fn render_numeric_text(body: &[u8], out: &mut String) -> Result<(), CodecError> {
     match parse_numeric(body)? {
         Numeric::Special(kind) => out.push_str(kind.as_text()),
         Numeric::Finite {
@@ -173,7 +161,7 @@ pub(crate) fn render_numeric_text(body: &[u8], out: &mut String) -> Result<(), C
     Ok(())
 }
 
-/// [`decode_numeric`] text length without rendering
+/// [`render_numeric_text`] length without rendering
 pub fn numeric_text_len(body: &[u8]) -> Result<usize, CodecError> {
     Ok(match parse_numeric(body)? {
         Numeric::Special(kind) => kind.as_text().len(),
@@ -262,6 +250,121 @@ fn render_numeric(neg: bool, weight: i32, dscale: i32, digits: &[[u8; 2]], out: 
     }
 }
 
+const NUMERIC_SHORT_DSCALE_MAX: i32 = 0x3F;
+const NUMERIC_SHORT_WEIGHT_MAX: i32 = 63;
+const NUMERIC_SHORT_WEIGHT_MIN: i32 = -64;
+const NBASE: u32 = 10_000;
+
+/// Body PostgreSQL stores for a non-finite value
+pub fn numeric_special_body(special: Special) -> Vec<u8> {
+    special.header().to_le_bytes().to_vec()
+}
+
+/// Body `make_result` stores: zero groups trimmed from both ends, short
+/// header when weight and dscale fit
+pub fn numeric_body(neg: bool, weight: i32, dscale: u16, digits: &[i16]) -> Vec<u8> {
+    let lead = digits.iter().take_while(|&&d| d == 0).count();
+    let digits = &digits[lead..];
+    let digits = &digits[..digits.len() - digits.iter().rev().take_while(|&&d| d == 0).count()];
+    let (neg, weight) = if digits.is_empty() {
+        (false, 0)
+    } else {
+        (neg, weight - lead as i32)
+    };
+    let dscale = i32::from(dscale & NUMERIC_DSCALE_MASK);
+    let mut out = Vec::with_capacity(4 + 2 * digits.len());
+    if dscale <= NUMERIC_SHORT_DSCALE_MAX
+        && (NUMERIC_SHORT_WEIGHT_MIN..=NUMERIC_SHORT_WEIGHT_MAX).contains(&weight)
+    {
+        let sign = if neg { NUMERIC_SHORT_SIGN_MASK } else { 0 };
+        let weight_sign = if weight < 0 {
+            NUMERIC_SHORT_WEIGHT_SIGN_MASK
+        } else {
+            0
+        };
+        let header = NUMERIC_SHORT
+            | sign
+            | ((dscale as u16) << NUMERIC_SHORT_DSCALE_SHIFT)
+            | weight_sign
+            | (weight as u16 & NUMERIC_SHORT_WEIGHT_MASK);
+        out.extend_from_slice(&header.to_le_bytes());
+    } else {
+        let sign = if neg { NUMERIC_NEG } else { NUMERIC_POS };
+        out.extend_from_slice(&(sign | dscale as u16).to_le_bytes());
+        out.extend_from_slice(&(weight as i16).to_le_bytes());
+    }
+    for d in digits {
+        out.extend_from_slice(&d.to_le_bytes());
+    }
+    out
+}
+
+/// `numeric_in` for plain decimal text and the special spellings
+pub fn numeric_from_text(text: &str) -> Option<Vec<u8>> {
+    let text = text.trim();
+    match text.to_ascii_lowercase().as_str() {
+        "nan" => return Some(numeric_special_body(Special::NaN)),
+        "infinity" | "+infinity" | "inf" | "+inf" => {
+            return Some(numeric_special_body(Special::PInf));
+        }
+        "-infinity" | "-inf" => return Some(numeric_special_body(Special::NInf)),
+        _ => {}
+    }
+    let (neg, body) = match text.as_bytes().first()? {
+        b'-' => (true, &text[1..]),
+        b'+' => (false, &text[1..]),
+        _ => (false, text),
+    };
+    let (int, frac) = body.split_once('.').unwrap_or((body, ""));
+    let all_digits = |s: &str| s.bytes().all(|b| b.is_ascii_digit());
+    if (int.is_empty() && frac.is_empty()) || !all_digits(int) || !all_digits(frac) {
+        return None;
+    }
+    let dscale = u16::try_from(frac.len()).ok()?;
+    let int_pad = (4 - int.len() % 4) % 4;
+    let frac_pad = (4 - frac.len() % 4) % 4;
+    let decimal: Vec<u8> = std::iter::repeat_n(b'0', int_pad)
+        .chain(int.bytes())
+        .chain(frac.bytes())
+        .chain(std::iter::repeat_n(b'0', frac_pad))
+        .collect();
+    let digits: Vec<i16> = decimal
+        .chunks(4)
+        .map(|g| g.iter().fold(0i16, |acc, b| acc * 10 + i16::from(b - b'0')))
+        .collect();
+    let weight = i32::try_from((int_pad + int.len()) / 4).ok()? - 1;
+    Some(numeric_body(neg, weight, dscale, &digits))
+}
+
+/// Finite value times `10^scale`, fractional digits past `scale` dropped.
+/// `step(m, a)` sets the caller's accumulator to `acc * m + a`, `false` on
+/// overflow
+pub(crate) fn scaled_groups(
+    weight: i32,
+    digits: &[[u8; 2]],
+    scale: u32,
+    mut step: impl FnMut(u32, u32) -> bool,
+) -> bool {
+    let digit = |g: i32| {
+        usize::try_from(g)
+            .ok()
+            .and_then(|i| digits.get(i))
+            .map_or(0, |raw| i16::from_le_bytes(*raw).max(0) as u32)
+    };
+    let whole = (scale / 4) as i32;
+    let rem = scale % 4;
+    for e in (-whole..=weight.max(0)).rev() {
+        if !step(NBASE, digit(weight - e)) {
+            return false;
+        }
+    }
+    if rem == 0 {
+        return true;
+    }
+    let tail = digit(weight + whole + 1) / 10u32.pow(4 - rem);
+    step(10u32.pow(rem), tail)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -294,86 +397,71 @@ mod tests {
         out
     }
 
+    fn text(body: &[u8]) -> Result<String, CodecError> {
+        let mut out = String::new();
+        render_numeric_text(body, &mut out)?;
+        Ok(out)
+    }
+
     #[test]
     fn numeric_short_one_digit() {
         let body = short_numeric(false, 0, 0, &[42]);
-        assert_eq!(
-            decode_numeric(&body).unwrap(),
-            NumericKind::Finite("42".into())
-        );
+        assert_eq!(text(&body).unwrap(), "42");
     }
 
     #[test]
     fn numeric_short_negative() {
         let body = short_numeric(true, 0, 0, &[7]);
-        assert_eq!(
-            decode_numeric(&body).unwrap(),
-            NumericKind::Finite("-7".into())
-        );
+        assert_eq!(text(&body).unwrap(), "-7");
     }
 
     #[test]
     fn numeric_short_with_scale() {
         // 1.5: digits base-10000 → [1, 5000]
         let body = short_numeric(false, 0, 1, &[1, 5000]);
-        assert_eq!(
-            decode_numeric(&body).unwrap(),
-            NumericKind::Finite("1.5".into())
-        );
+        assert_eq!(text(&body).unwrap(), "1.5");
     }
 
     #[test]
     fn numeric_zero() {
         let body = short_numeric(false, 0, 0, &[]);
-        assert_eq!(
-            decode_numeric(&body).unwrap(),
-            NumericKind::Finite("0".into())
-        );
+        assert_eq!(text(&body).unwrap(), "0");
     }
 
     #[test]
     fn numeric_long_form_large() {
         // 12345: base-10000 blocks [1, 2345], weight 1
         let body = long_numeric(false, 1, 0, &[1, 2345]);
-        assert_eq!(
-            decode_numeric(&body).unwrap(),
-            NumericKind::Finite("12345".into())
-        );
+        assert_eq!(text(&body).unwrap(), "12345");
     }
 
     #[test]
     fn numeric_specials() {
         let nan = NUMERIC_NAN.to_le_bytes();
-        assert_eq!(decode_numeric(&nan).unwrap(), NumericKind::NaN);
+        assert_eq!(text(&nan).unwrap(), "NaN");
         let pinf = NUMERIC_PINF.to_le_bytes();
-        assert_eq!(decode_numeric(&pinf).unwrap(), NumericKind::PInf);
+        assert_eq!(text(&pinf).unwrap(), "Infinity");
         let ninf = NUMERIC_NINF.to_le_bytes();
-        assert_eq!(decode_numeric(&ninf).unwrap(), NumericKind::NInf);
+        assert_eq!(text(&ninf).unwrap(), "-Infinity");
     }
 
     #[test]
     fn numeric_truncated_returns_error() {
         let one_byte = [0u8];
-        assert!(matches!(
-            decode_numeric(&one_byte),
-            Err(CodecError::Truncated { .. })
-        ));
+        assert!(matches!(text(&one_byte), Err(CodecError::Truncated { .. })));
     }
 
     #[test]
     fn numeric_short_negative_weight_renders_leading_zero() {
         let body = short_numeric(false, -1, 1, &[5000]);
-        assert_eq!(
-            decode_numeric(&body).unwrap(),
-            NumericKind::Finite("0.5".into())
-        );
+        assert_eq!(text(&body).unwrap(), "0.5");
     }
 
     #[test]
     fn numeric_long_form_truncated_body() {
         let body = NUMERIC_POS.to_le_bytes().to_vec();
         assert_eq!(
-            decode_numeric(&body),
+            text(&body),
             Err(CodecError::Truncated {
                 offset: 2,
                 need: 4,
@@ -386,16 +474,13 @@ mod tests {
     fn numeric_unknown_special_falls_back_to_nan() {
         let header: u16 = NUMERIC_SPECIAL | 0x0001;
         let body = header.to_le_bytes();
-        assert_eq!(decode_numeric(&body).unwrap(), NumericKind::NaN);
+        assert_eq!(text(&body).unwrap(), "NaN");
     }
 
     #[test]
     fn numeric_dscale_trailing_zero_pad() {
         let body = short_numeric(false, 0, 4, &[5]);
-        assert_eq!(
-            decode_numeric(&body).unwrap(),
-            NumericKind::Finite("5.0000".into())
-        );
+        assert_eq!(text(&body).unwrap(), "5.0000");
     }
 
     #[test]
@@ -415,13 +500,69 @@ mod tests {
             NUMERIC_NINF.to_le_bytes().to_vec(),
         ];
         for body in bodies {
-            let text = decode_numeric(&body).unwrap();
-            assert_eq!(
-                numeric_text_len(&body),
-                Ok(text.as_text().len()),
-                "{text:?}"
-            );
+            let rendered = text(&body).unwrap();
+            assert_eq!(numeric_text_len(&body), Ok(rendered.len()), "{rendered:?}");
         }
+    }
+
+    #[test]
+    fn numeric_from_text_round_trips_canonically() {
+        for (input, want) in [
+            ("0", "0"),
+            ("-0.00", "0.00"),
+            ("12345", "12345"),
+            ("-12.340", "-12.340"),
+            ("0.0005", "0.0005"),
+            ("100000000", "100000000"),
+            (".5", "0.5"),
+            ("NaN", "NaN"),
+            ("-Infinity", "-Infinity"),
+        ] {
+            let body = numeric_from_text(input).unwrap();
+            assert_eq!(text(&body).unwrap(), want, "{input}");
+        }
+        assert_eq!(
+            numeric_from_text("12345").unwrap(),
+            short_numeric(false, 1, 0, &[1, 2345])
+        );
+        assert_eq!(
+            numeric_from_text("1.5").unwrap(),
+            short_numeric(false, 0, 1, &[1, 5000])
+        );
+        assert_eq!(
+            numeric_from_text("0").unwrap(),
+            short_numeric(false, 0, 0, &[])
+        );
+        let wide = format!("1.{}", "0".repeat(70));
+        assert_eq!(
+            numeric_from_text(&wide).unwrap(),
+            long_numeric(false, 0, 70, &[1])
+        );
+        for bad in ["", "-", ".", "1e5", "1.2.3", "abc"] {
+            assert_eq!(numeric_from_text(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn scaled_groups_truncates_past_scale() {
+        let scaled = |input: &str, scale: u32| {
+            let body = numeric_from_text(input).unwrap();
+            let Numeric::Finite { weight, digits, .. } = parse_numeric(&body).unwrap() else {
+                panic!("finite");
+            };
+            let mut acc = 0u128;
+            assert!(scaled_groups(weight, digits, scale, |m, a| {
+                acc = acc * u128::from(m) + u128::from(a);
+                true
+            }));
+            acc
+        };
+        assert_eq!(scaled("12.34", 2), 1234);
+        assert_eq!(scaled("12.3456789", 3), 12345);
+        assert_eq!(scaled("12", 5), 1_200_000);
+        assert_eq!(scaled("0.0005", 4), 5);
+        assert_eq!(scaled("0.0005", 3), 0);
+        assert_eq!(scaled("123456789.5", 0), 123_456_789);
     }
 
     #[test]
@@ -432,9 +573,6 @@ mod tests {
             0u8,
             ((NUMERIC_DSCALE_MASK as usize) + 5) * 2,
         ));
-        assert!(matches!(
-            decode_numeric(&body),
-            Err(CodecError::BadNumeric { .. })
-        ));
+        assert!(matches!(text(&body), Err(CodecError::BadNumeric { .. })));
     }
 }

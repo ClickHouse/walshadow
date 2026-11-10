@@ -37,22 +37,21 @@
 //!
 //! ## Default expression
 //!
-//! `attmissingval` arrives as on-disk PG bytes (pinned worker) or element
-//! text (SQL path). Resolve tier-3 bytes through shadow PG before rendering
-//! `ADD COLUMN` defaults with [`column_value_to_sql_literal`]
+//! `attmissingval` arrives as on-disk PG bytes (pinned worker, SQL path for
+//! types with a wire codec) or element text (other SQL-path types). Tier-3
+//! bytes resolve to text through shadow PG first.
+//! The default encodes into its column as a row would, and
+//! `column_literal` renders that cell as the `ADD COLUMN` default
 
 use crate::ascii_buf::{AsciiArray, AsciiBuf};
 use crate::ch::types;
-use crate::decode::codecs::{
-    format_time_us, macaddr_to_text, macaddr8_to_text, tid_to_text, timetz_to_text,
-};
-use crate::decode::heap_decoder::{self, ColumnValue};
-use crate::emit::ch_emitter::DATE32_PG_EPOCH_DAYS;
+use crate::decode::codecs::format_time_us;
+use crate::emit::ch_emitter::{ColumnBuf, decimal_le_to_text, encode_default};
 use crate::schema::{
     BOOLOID, BPCHAROID, BYTEAOID, CHAROID, CIDOID, CIDROID, DATEOID, FLOAT4OID, FLOAT8OID, INETOID,
-    INT2OID, INT4OID, INT8OID, INTERVALOID, JSONBOID, JSONOID, MONEYOID, NAMEOID, NUMERICOID,
-    OID8OID, OIDOID, PG_LSNOID, RelAttr, TEXTOID, TIMEOID, TIMESTAMPOID, TIMESTAMPTZOID, TIMETZOID,
-    UUIDOID, VARCHAROID, XID8OID, XIDOID,
+    INT2OID, INT4OID, INT8OID, INTERVALOID, JSONBOID, JSONOID, MONEYOID, MissingDefault, NAMEOID,
+    NUMERICOID, OID8OID, OIDOID, PG_LSNOID, RelAttr, TEXTOID, TIMEOID, TIMESTAMPOID,
+    TIMESTAMPTZOID, TIMETZOID, UUIDOID, VARCHAROID, XID8OID, XIDOID,
 };
 use clickhouse_c::{Allocator, Kind, TypeAst};
 use walrus::time::civil_from_days;
@@ -161,12 +160,13 @@ fn array_ch_type(type_name: &str) -> Option<String> {
 /// `ALTER TABLE ... ADD COLUMN ... DEFAULT k`). `None` when no fast-path
 /// default or value not cleanly expressible as CH literal
 fn render_default(att: &RelAttr, ch_inner: &str) -> Option<String> {
-    let _ = att.missing_default.as_ref()?;
-    let value = heap_decoder::missing_value_for(att);
-    if matches!(value, ColumnValue::Null) {
-        return None;
+    if let Some(buf) = encode_default(att, ch_inner) {
+        return column_literal(&buf, ch_inner);
     }
-    column_value_to_sql_literal(&value, ch_inner)
+    let Some(MissingDefault::Text(text)) = &att.missing_default else {
+        return None;
+    };
+    pending_text_literal(text, ch_inner)
 }
 
 /// Decode `pg_attribute.atttypmod` for `numeric(p, s)`. Falls back to
@@ -206,79 +206,78 @@ fn temporal_precision(typmod: i32) -> i32 {
     }
 }
 
-/// Render PG-decoded value as CH SQL literal for after `DEFAULT `. `None`
-/// for shapes not cleanly expressible (e.g. `Unsupported.raw` needing
-/// typmod-aware reconstruction). `ch_inner` (non-nullable, from
-/// [`base_type_for`]) drives timestamp formatting + cast shape
-pub fn column_value_to_sql_literal(v: &ColumnValue, ch_inner: &str) -> Option<String> {
-    match v {
-        ColumnValue::Null => Some("NULL".into()),
-        ColumnValue::Bool(b) => Some(if *b { "true".into() } else { "false".into() }),
-        ColumnValue::Char(i) => Some(i.to_string()),
-        ColumnValue::Int2(i) => Some(i.to_string()),
-        ColumnValue::Int4(i) => Some(i.to_string()),
-        ColumnValue::Int8(i) => Some(i.to_string()),
-        ColumnValue::Oid(i) => Some(i.to_string()),
-        ColumnValue::Oid8(i) => Some(i.to_string()),
-        ColumnValue::Float4(f) => Some(format_float(*f as f64)),
-        ColumnValue::Float8(f) => Some(format_float(*f)),
-        ColumnValue::Numeric(n) => {
-            use crate::decode::codecs::NumericKind;
-            match n {
-                NumericKind::Finite(s) => {
-                    if matches!(
-                        types::kind(ch_inner),
-                        Some(
-                            Kind::Decimal32 | Kind::Decimal64 | Kind::Decimal128 | Kind::Decimal256
-                        )
-                    ) {
-                        Some(s.clone())
-                    } else {
-                        Some(sql_string_literal(s))
-                    }
-                }
-                NumericKind::NaN => Some("nan".into()),
-                NumericKind::PInf => Some("inf".into()),
-                NumericKind::NInf => Some("-inf".into()),
-            }
+/// First cell of `buf`, a non-nullable `ch_inner` column, as a CH SQL
+/// literal for after `DEFAULT `. `None` for shapes a literal can't spell
+pub(crate) fn column_literal(buf: &ColumnBuf, ch_inner: &str) -> Option<String> {
+    let bytes = match buf {
+        ColumnBuf::String { offsets, data, .. } => {
+            let cell = &data[..usize::try_from(*offsets.first()?).ok()?];
+            return Some(sql_bytes_literal(cell));
         }
-        ColumnValue::Text(s) | ColumnValue::Name(s) | ColumnValue::Json(s) => {
-            Some(sql_string_literal(s))
-        }
-        ColumnValue::Bytea(b) => Some(sql_bytes_literal(b)),
-        // PG counts days from 2000-01-01, `toDate32` from 1970-01-01
-        ColumnValue::Date(days) => Some(format!(
+        ColumnBuf::Fixed { width, bytes } => bytes.get(..*width)?,
+        _ => return None,
+    };
+    let ast = TypeAst::parse(ch_inner, Allocator::global(&mimalloc::MiMalloc)).ok()?;
+    let view = ast.view();
+    let int = |n: i128| Some(n.to_string());
+    let le = |n: usize| -> Option<[u8; 16]> {
+        let mut wide = [0u8; 16];
+        wide[..n].copy_from_slice(bytes.get(..n)?);
+        Some(wide)
+    };
+    let signed = |n: usize| {
+        let shift = 128 - 8 * n as u32;
+        le(n).map(|w| (i128::from_le_bytes(w) << shift) >> shift)
+    };
+    let unsigned = |n: usize| le(n).map(|w| u128::from_le_bytes(w) as i128);
+    // Ticks at `scale` digits to microseconds
+    let micros = |ticks: i64, scale: u32| match scale.checked_sub(6) {
+        Some(down) => ticks / 10i64.pow(down),
+        None => ticks.saturating_mul(10i64.pow(6 - scale)),
+    };
+    match view.kind()? {
+        Kind::Bool => Some(if bytes[0] != 0 { "true" } else { "false" }.into()),
+        Kind::Int8 => int(signed(1)?),
+        Kind::Int16 => int(signed(2)?),
+        Kind::Int32 => int(signed(4)?),
+        Kind::Int64 => int(signed(8)?),
+        Kind::UInt8 => int(unsigned(1)?),
+        Kind::UInt16 => int(unsigned(2)?),
+        Kind::UInt32 => int(unsigned(4)?),
+        Kind::UInt64 => int(unsigned(8)?),
+        Kind::Float32 => Some(format_float(f64::from(f32::from_le_bytes(
+            bytes.try_into().ok()?,
+        )))),
+        Kind::Float64 => Some(format_float(f64::from_le_bytes(bytes.try_into().ok()?))),
+        Kind::Decimal32 | Kind::Decimal64 | Kind::Decimal128 | Kind::Decimal256 => Some(
+            decimal_le_to_text(bytes, u8::try_from(view.decimal_scale()?).ok()?),
+        ),
+        // `toDate32` counts days from 1970-01-01
+        Kind::Date32 => Some(format!(
             "toDate32({})",
-            i64::from(*days) + i64::from(DATE32_PG_EPOCH_DAYS)
+            i32::from_le_bytes(bytes.try_into().ok()?)
         )),
-        ColumnValue::Time(micros) => {
-            let txt = format_time_us(*micros);
+        Kind::Time64 => {
+            let ticks = i64::from_le_bytes(bytes.try_into().ok()?);
+            let txt = format_time_us(micros(ticks, view.datetime64_scale()?));
             Some(sql_string_literal(&txt))
         }
-        ColumnValue::TimeTz { micros, tz_seconds } => {
-            let txt = timetz_to_text(*micros, *tz_seconds);
-            Some(sql_string_literal(&txt))
-        }
-        ColumnValue::Timestamp(micros) | ColumnValue::TimestampTz(micros) => {
-            let txt = render_pg_timestamp(*micros);
-            let prec = datetime64_scale(ch_inner).unwrap_or(6);
+        Kind::DateTime64 => {
+            let prec = view.datetime64_scale()?;
+            let unix = micros(i64::from_le_bytes(bytes.try_into().ok()?), prec);
+            let txt = render_pg_timestamp(unix - walrus::pg::replication::PG_EPOCH_USEC);
             Some(format!(
                 "toDateTime64({}, {prec}, 'UTC')",
                 sql_string_literal(&txt)
             ))
         }
-        ColumnValue::Interval(v) => Some(sql_string_literal(&v.to_text())),
-        ColumnValue::Inet(v) => Some(sql_string_literal(&v.to_text())),
-        ColumnValue::MacAddr(b) => Some(sql_string_literal(&macaddr_to_text(b))),
-        ColumnValue::MacAddr8(b) => Some(sql_string_literal(&macaddr8_to_text(b))),
-        ColumnValue::Tid { block, offset } => {
-            Some(sql_string_literal(&tid_to_text(*block, *offset)))
+        Kind::Uuid => {
+            let mut pg: [u8; 16] = bytes.try_into().ok()?;
+            pg[..8].reverse();
+            pg[8..].reverse();
+            Some(format!("toUUID({})", sql_string_literal(&format_uuid(&pg))))
         }
-        ColumnValue::Uuid(b) => Some(format!("toUUID({})", sql_string_literal(&format_uuid(b)))),
-        ColumnValue::PgPendingText { text, .. } => pending_text_literal(text, ch_inner),
-        ColumnValue::PgPending { .. }
-        | ColumnValue::ExternalToast(_)
-        | ColumnValue::Unsupported { .. } => None,
+        _ => None,
     }
 }
 
@@ -328,10 +327,13 @@ fn render_pg_timestamp(pg_micros: i64) -> AsciiBuf<32> {
     out
 }
 
-fn datetime64_scale(ch_inner: &str) -> Option<i32> {
+fn datetime64_scale(ch_inner: &str) -> Option<u32> {
     let ast = TypeAst::parse(ch_inner, Allocator::global(&mimalloc::MiMalloc)).ok()?;
     let view = ast.view();
-    (view.kind() == Some(Kind::DateTime64)).then(|| view.datetime64_scale())
+    if view.kind() != Some(Kind::DateTime64) {
+        return None;
+    }
+    view.datetime64_scale()
 }
 
 fn format_uuid(b: &[u8; 16]) -> AsciiArray<36> {
@@ -345,16 +347,28 @@ fn format_uuid(b: &[u8; 16]) -> AsciiArray<36> {
     AsciiArray::new(out)
 }
 
-/// CH SQL string-literal escaping. Double backslash + single-quote; other
-/// control chars stay literal, CH parser accepts raw UTF-8 inside `'…'`
+/// CH SQL string literal. Doubles single quotes and backslashes; raw UTF-8
+/// stays literal inside `'…'`
 fn sql_string_literal(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
+    sql_bytes_literal(s.as_bytes())
+}
+
+/// [`sql_string_literal`] of arbitrary bytes, those outside UTF-8 spelled
+/// `\xHH`, which CH string literals decode to the raw byte
+fn sql_bytes_literal(b: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(b.len() + 2);
     out.push('\'');
-    for ch in s.chars() {
-        match ch {
-            '\'' => out.push_str("''"),
-            '\\' => out.push_str("\\\\"),
-            other => out.push(other),
+    for chunk in b.utf8_chunks() {
+        for ch in chunk.valid().chars() {
+            match ch {
+                '\'' => out.push_str("''"),
+                '\\' => out.push_str("\\\\"),
+                other => out.push(other),
+            }
+        }
+        for byte in chunk.invalid() {
+            write!(out, "\\x{byte:02x}").expect("String write");
         }
     }
     out.push('\'');
@@ -431,21 +445,27 @@ fn pg_array_items(text: &str) -> Option<Vec<Option<String>>> {
     }
 }
 
-/// Raw bytes as CH binary literal via `unhex('…')`; round-trip safe for
-/// non-UTF-8 payloads into CH `String` columns
-fn sql_bytes_literal(b: &[u8]) -> String {
-    let mut hex = String::with_capacity(b.len() * 2);
-    for byte in b {
-        hex.push_str(&format!("{byte:02x}"));
-    }
-    format!("unhex('{hex}')")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::decode::codecs::{IntervalValue, NumericKind};
+    use crate::decode::datum::{Datum, build};
+    use crate::decode::heap_decoder::{raw_missing_array, short_varlena};
     use crate::schema::RelAttr;
+
+    /// Literal of `v` stored as a `type_oid` fast default, for `ch_inner`
+    fn literal(type_oid: u32, type_len: i16, v: &Datum, ch_inner: &str) -> Option<String> {
+        let elem = match v {
+            Datum::Fixed(b) => b.to_vec(),
+            Datum::Varlena(b) => short_varlena(b),
+            other => panic!("no stored default for {other:?}"),
+        };
+        let mut att = attr(type_oid, -1, true, None);
+        att.type_len = type_len;
+        att.missing_default = Some(crate::schema::MissingDefault::Raw(raw_missing_array(
+            type_oid, &elem,
+        )));
+        render_default(&att, ch_inner)
+    }
 
     fn attr(oid: u32, typmod: i32, not_null: bool, missing: Option<&str>) -> RelAttr {
         RelAttr {
@@ -476,7 +496,7 @@ mod tests {
         ];
         for (micros, expected) in cases {
             assert_eq!(
-                column_value_to_sql_literal(&ColumnValue::Time(micros), "Time64(6)"),
+                literal(TIMEOID, 8, &build::micros(micros), "Time64(6)"),
                 Some(sql_string_literal(expected)),
                 "micros={micros}"
             );
@@ -496,13 +516,7 @@ mod tests {
         ];
         for (micros, tz, expected) in cases {
             assert_eq!(
-                column_value_to_sql_literal(
-                    &ColumnValue::TimeTz {
-                        micros,
-                        tz_seconds: tz,
-                    },
-                    "String"
-                ),
+                literal(TIMETZOID, 12, &build::timetz(micros, tz), "String"),
                 Some(sql_string_literal(expected)),
                 "micros={micros} tz={tz}"
             );
@@ -776,12 +790,9 @@ mod tests {
 
     #[test]
     fn unresolved_disk_default_never_renders_as_string() {
-        let value = ColumnValue::PgPending {
-            type_oid: TSVECTOROID,
-            raw: vec![0, 0, 0, 0x20],
-        };
+        let value = build::bytes([0, 0, 0, 0x20]);
         for ch_type in ["JSON", "String", "Array(Nullable(Int32))"] {
-            assert_eq!(column_value_to_sql_literal(&value, ch_type), None);
+            assert_eq!(literal(TSVECTOROID, -1, &value, ch_type), None);
         }
     }
 
@@ -794,40 +805,45 @@ mod tests {
 
     #[test]
     fn column_value_text_escapes_singles() {
-        let lit = column_value_to_sql_literal(&ColumnValue::Text("a'b".into()), "String").unwrap();
+        let lit = literal(TEXTOID, -1, &build::text("a'b"), "String").unwrap();
         assert_eq!(lit, "'a''b'");
     }
 
     #[test]
     fn column_value_int_round_trips() {
-        let lit = column_value_to_sql_literal(&ColumnValue::Int4(-42), "Int32").unwrap();
+        let lit = literal(INT4OID, 4, &build::int4(-42), "Int32").unwrap();
         assert_eq!(lit, "-42");
     }
 
     #[test]
     fn column_value_numeric_to_decimal_drops_quotes() {
-        let lit = column_value_to_sql_literal(
-            &ColumnValue::Numeric(NumericKind::Finite("3.14".into())),
-            "Decimal(10, 2)",
-        )
-        .unwrap();
-        assert_eq!(lit, "3.14");
-        let lit = column_value_to_sql_literal(
-            &ColumnValue::Numeric(NumericKind::Finite("3.14".into())),
-            "String",
-        )
-        .unwrap();
-        assert_eq!(lit, "'3.14'");
+        let pi = build::numeric("3.14");
+        assert_eq!(
+            literal(NUMERICOID, -1, &pi, "Decimal(10, 2)").unwrap(),
+            "3.14"
+        );
+        assert_eq!(
+            literal(NUMERICOID, -1, &pi, "Decimal(10, 4)").unwrap(),
+            "3.1400"
+        );
+        assert_eq!(
+            literal(NUMERICOID, -1, &build::numeric("-0.05"), "Decimal(10, 2)").unwrap(),
+            "-0.05"
+        );
+        assert_eq!(literal(NUMERICOID, -1, &pi, "String").unwrap(), "'3.14'");
+        assert_eq!(
+            literal(NUMERICOID, -1, &build::numeric("NaN"), "Decimal(10, 2)"),
+            None
+        );
     }
 
     #[test]
     fn column_value_interval_renders_pg_text() {
-        let v = ColumnValue::Interval(IntervalValue {
-            months: 0,
-            days: 1,
-            micros: 0,
-        });
-        let lit = column_value_to_sql_literal(&v, "String").unwrap();
+        // micros, days, months
+        let mut v = 0i64.to_le_bytes().to_vec();
+        v.extend_from_slice(&1i32.to_le_bytes());
+        v.extend_from_slice(&0i32.to_le_bytes());
+        let lit = literal(INTERVALOID, 16, &Datum::fixed(&v), "String").unwrap();
         assert!(lit.starts_with('\''), "{lit}");
         assert!(lit.contains("day"), "{lit}");
     }
@@ -838,7 +854,7 @@ mod tests {
             0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54,
             0x32, 0x10,
         ];
-        let lit = column_value_to_sql_literal(&ColumnValue::Uuid(uuid), "UUID").unwrap();
+        let lit = literal(UUIDOID, 16, &build::uuid(uuid), "UUID").unwrap();
         assert_eq!(
             lit, "toUUID('01234567-89ab-cdef-fedc-ba9876543210')",
             "uuid format mismatch: {lit}"
@@ -847,8 +863,7 @@ mod tests {
 
     #[test]
     fn column_value_timestamp_routes_through_to_datetime64() {
-        let lit = column_value_to_sql_literal(&ColumnValue::TimestampTz(0), "DateTime64(6, 'UTC')")
-            .unwrap();
+        let lit = literal(TIMESTAMPTZOID, 8, &build::micros(0), "DateTime64(6, 'UTC')").unwrap();
         assert!(
             lit.starts_with("toDateTime64('2000-01-01"),
             "PG epoch should render as 2000-01-01: {lit}"
@@ -859,35 +874,26 @@ mod tests {
     #[test]
     fn column_value_date_shifts_to_unix_epoch() {
         // 2024-01-01 is day 8766 after 2000-01-01, day 19723 after 1970-01-01
-        let lit = column_value_to_sql_literal(&ColumnValue::Date(8766), "Date32").unwrap();
+        let lit = literal(DATEOID, 4, &build::date(8766), "Date32").unwrap();
         assert_eq!(lit, "toDate32(19723)");
-        let lit = column_value_to_sql_literal(&ColumnValue::Date(0), "Date32").unwrap();
+        let lit = literal(DATEOID, 4, &build::date(0), "Date32").unwrap();
         assert_eq!(lit, "toDate32(10957)");
     }
 
     #[test]
-    fn column_value_bytea_renders_unhex_literal() {
-        let lit =
-            column_value_to_sql_literal(&ColumnValue::Bytea(vec![0xDE, 0xAD]), "String").unwrap();
-        assert_eq!(lit, "unhex('dead')");
+    fn bytea_default_escapes_invalid_utf8() {
+        let lit = literal(BYTEAOID, -1, &build::bytes([0xFF, b'\'', 0xFE]), "String").unwrap();
+        assert_eq!(lit, r"'\xff''\xfe'");
+        let lit = literal(BYTEAOID, -1, &build::bytes(b"ok"), "String").unwrap();
+        assert_eq!(lit, "'ok'");
     }
 
     #[test]
-    fn column_value_null_is_explicit_null() {
-        let lit = column_value_to_sql_literal(&ColumnValue::Null, "Int32").unwrap();
-        assert_eq!(lit, "NULL");
-    }
-
-    #[test]
-    fn external_toast_does_not_render() {
-        use crate::decode::heap_decoder::ToastPointer;
-        let v = ColumnValue::ExternalToast(ToastPointer {
-            va_rawsize: 1,
-            va_extinfo: 0,
-            va_valueid: 0,
-            va_toastrelid: 0,
-        });
-        assert!(column_value_to_sql_literal(&v, "String").is_none());
+    fn absent_default_renders_nothing() {
+        assert_eq!(
+            render_default(&attr(INT4OID, -1, true, None), "Int32"),
+            None
+        );
     }
 
     #[test]
@@ -972,11 +978,7 @@ mod tests {
         for type_name in ["vector", "halfvec"] {
             let r = map(&array_attr(type_name, "[1,2,3]"), false).unwrap();
             assert_eq!(r.ch_type, "Array(Float32)");
-            assert_eq!(
-                r.default_sql.as_deref(),
-                Some("unhex('5b312c322c335d')"),
-                "{type_name}"
-            );
+            assert_eq!(r.default_sql.as_deref(), Some("'[1,2,3]'"), "{type_name}");
         }
     }
 
@@ -990,6 +992,34 @@ mod tests {
     #[test]
     fn other_pending_text_defaults_cast_from_their_text() {
         let r = map(&attr(NUMERICOID, -1, true, Some("3.14")), false).unwrap();
-        assert_eq!(r.default_sql.as_deref(), Some("unhex('332e3134')"));
+        assert_eq!(r.default_sql.as_deref(), Some("'3.14'"));
+    }
+
+    #[test]
+    fn fixed_cells_render_by_target_width() {
+        let fixed = |bytes: &[u8]| ColumnBuf::Fixed {
+            width: bytes.len(),
+            bytes: bytes.to_vec(),
+        };
+        let cases: [(&[u8], &str, &str); 10] = [
+            (&[0xFE], "Int8", "-2"),
+            (&(-3i16).to_le_bytes(), "Int16", "-3"),
+            (&(-5i64).to_le_bytes(), "Int64", "-5"),
+            (&[0xFE], "UInt8", "254"),
+            (&u16::MAX.to_le_bytes(), "UInt16", "65535"),
+            (&u32::MAX.to_le_bytes(), "UInt32", "4294967295"),
+            (&u64::MAX.to_le_bytes(), "UInt64", "18446744073709551615"),
+            (&1.5f32.to_le_bytes(), "Float32", "1.5"),
+            (&(-0.25f64).to_le_bytes(), "Float64", "-0.25"),
+            (&7i64.to_le_bytes(), "Time64(3)", "'00:00:00.007'"),
+        ];
+        for (bytes, ch, want) in cases {
+            assert_eq!(
+                column_literal(&fixed(bytes), ch).as_deref(),
+                Some(want),
+                "{ch}"
+            );
+        }
+        assert_eq!(column_literal(&fixed(&[1]), "IPv4"), None);
     }
 }

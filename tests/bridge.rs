@@ -22,6 +22,7 @@ use walshadow::bridge::{
     AttributeRow, Bridge, BridgeError, Catalog, ClassRow, IndexRow, NamespaceRow,
     PROJECTION_VERSION, PROTO_VERSION,
 };
+use walshadow::datum::{DatumRef, build};
 use walshadow::oracle::{Oracle, OracleCell, OracleColumnBuf, OracleRequestColumn};
 use walshadow::pg::socket_conninfo;
 use walshadow::schema::{NUMERICOID, ReplIdent};
@@ -510,8 +511,8 @@ async fn bridge_scans_uncommitted_ddl() {
         missing_default: Some(walshadow::schema::MissingDefault::Raw(bytes)),
     };
     assert_eq!(
-        walshadow::heap_decoder::missing_value_for(&c_attr),
-        walshadow::heap_decoder::ColumnValue::Int4(7)
+        walshadow::heap_decoder::resolve(&c_attr, DatumRef::Missing),
+        Some(build::int4(7))
     );
     assert_eq!(added.atttypid, 23);
     assert!(attrs[0].attmissingval.is_none());
@@ -912,8 +913,8 @@ async fn bridge_overlay_descriptors_track_open_ddl() {
     let cols: Vec<&str> = t.attributes.iter().map(|a| a.name.as_str()).collect();
     assert_eq!(cols, ["id", "a", "c"]);
     assert_eq!(
-        walshadow::heap_decoder::missing_value_for(&t.attributes[2]),
-        walshadow::heap_decoder::ColumnValue::Int4(7)
+        walshadow::heap_decoder::resolve(&t.attributes[2], DatumRef::Missing),
+        Some(build::int4(7))
     );
     assert_eq!(t.attributes[2].type_name, "int4");
     // Unchanged by the ALTER, so still the committed values

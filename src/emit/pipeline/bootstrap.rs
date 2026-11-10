@@ -7,26 +7,32 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use walrus::pg::walparser::RelFileNode;
 
-use crate::backfill::backup_page_walk::{BackfillTuple, CatalogMap};
+use crate::backfill::backup_page_walk::{BackfillTuple, CatalogMap, TupleData, toast_row};
+use crate::backfill::copy_backfill::copy_slot;
 use crate::backfill::spool::{DeferredReader, DeferredSpool, Replayable, SpoolMark};
+use crate::backfill::visibility_pending::metadata_patch;
 use crate::backfill::wal_replay::HeapTid;
 use crate::backfill::walk_barrier::{WALK_CHECKPOINT_PERIOD, WalkBarrier};
+use crate::budget::MemoryPermit;
 use crate::config::ResolvedConfig;
-use crate::decode::heap_decoder::{ColumnValue, ToastPointer};
-use crate::emit::ch_emitter::EmitterStats;
+use crate::decode::datum::{Datum, DatumRef};
+use crate::decode::heap_decoder::{ToastPointer, TupleView, view_block_data_into};
+use crate::emit::ch_emitter::{EmitterStats, OP_INSERT, RowStamp};
 use crate::emit::pipeline::ack::{AckHandle, OpenSeq, Publish, SeqAlloc};
-use crate::emit::pipeline::batcher::{BatcherClosed, BatcherMsg, RowBuffer, RowTable};
+use crate::emit::pipeline::batcher::{
+    BatcherClosed, BatcherMsg, DECODE_CHUNK_BYTES, PlacedSegment, RowTable,
+};
+use crate::emit::pipeline::plan_spool::ChunkBuilder;
 use crate::emit::route::{FrozenRoutes, RouteSnapshot, RowPolicy, freeze_routes};
 use crate::mapping::{MappingSnapshot, TableMapping};
-use crate::ops::oracle::render_ext_columns;
 use crate::schema::{RelDescriptor, RelName};
 use crate::ticker::Ticker;
 use crate::toast::{
-    ChunkStoreError, FetchedValue, ToastResolver, ToastRow, check_value_caps, detoasted_sized,
-    finish_value, pointer_extsize,
+    ChunkStoreError, FetchedValue, ToastResolver, check_value_caps, detoasted_sized, finish_value,
+    pointer_extsize,
 };
 use crate::xact::xact_buffer::{MissPolicy, StoreMiss, fill_store_miss};
 use foldhash::{HashMap, HashMapExt, HashSet};
@@ -199,50 +205,71 @@ pub async fn drain(
         Deferral::Handback(spool) => (Some(spool), true),
     };
     let mut footprint = DeferredFootprint::new(&stats);
-    let mut seqs = ack.seqs(0);
     let mut rows_routed = 0;
     let mut open: Option<Run> = None;
     let mut puts = resolver.chunk_puts();
-    let mut row_buffer = RowBuffer::default();
+    let mut out = LoadOut::new(&msg_tx, &ack, 0);
     let mut consumed = 0u64;
     let mut ticker = Ticker::new(WALK_CHECKPOINT_PERIOD);
-    while let Some(batch) = rx.recv().await {
+    loop {
+        if rx.is_empty() {
+            out.send().await?;
+        }
+        let Some(batch) = rx.recv().await else {
+            break;
+        };
         consumed += batch.len() as u64;
-        for mut tuple in batch {
+        for tuple in batch {
             let rfn = tuple.rfn;
             let run = match &mut open {
                 Some(run) if run.rfn == rfn => run,
                 slot => {
                     if let Some(prev) = slot.take() {
-                        // Send all rows before publishing their expected count
-                        row_buffer.flush(&msg_tx).await.map_err(closed)?;
-                        seqs.place(prev.seq, prev.rows);
+                        out.place(prev.seq, prev.rows);
                     }
                     slot.insert(Run {
                         rfn,
-                        seq: seqs.open(tuple.source_lsn, Publish::Commit),
+                        seq: out.seqs.open(tuple.source_lsn, Publish::Commit),
                         rows: 0,
                         target: Target::resolve(&catalog, &routes, &skip_initial, rfn),
                     })
                 }
             };
-            let (rel, route) = match &run.target {
-                Target::Routed(rel, route) => (rel, route),
+            let (rel, route, varlena) = match &run.target {
+                Target::Routed {
+                    rel,
+                    route,
+                    varlena,
+                } => (rel, route, *varlena),
                 Target::Unsupported => {
                     stats.unsupported_relations.fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
                 Target::Skipped => continue,
-                Target::Toast(toast_relid) => {
-                    if let Some(row) = row_from_columns(tuple, rfn.db_node, *toast_relid) {
-                        puts.push(row).await.map_err(put_err)?;
+                Target::Toast(toast) => {
+                    if let TupleData::Heap(data) = &tuple.data {
+                        debug_assert_ne!(tuple.offnum, 0, "walked toast tuple without TID");
+                        // Weakest evidence for a TID: a backup copy can be
+                        // torn, so any WAL-sourced row for the same TID outranks it
+                        if let Some(row) = toast_row(data, toast, tuple.blkno, tuple.offnum, 0) {
+                            out.send().await?;
+                            puts.push(row).await.map_err(put_err)?;
+                        }
                     }
                     continue;
                 }
             };
 
+            let sites = if varlena {
+                let view = tuple.view(rel).map_err(|e| decode_err(rel, e))?;
+                view.as_ref()
+                    .map_or_else(Vec::new, |v| mapped_pointers(v, &route.mapping))
+            } else {
+                Vec::new()
+            };
             let mut permit = None;
-            if tuple.has_mapped_external(&route.mapping) {
+            let mut patch = Vec::new();
+            if !sites.is_empty() {
                 // Defer until page walk has populated or started backing store
                 if !resolver.fill_on_miss() {
                     let spool = deferred.as_mut().ok_or_else(|| {
@@ -255,18 +282,22 @@ pub async fn drain(
                     footprint.publish(spool);
                     continue;
                 }
-                permit = resolve_or_fill_toast(&mut tuple, rel, &route.mapping, &resolver)
-                    .await?
-                    .map(Arc::new);
+                // Earlier rows ship while values fetch
+                out.send().await?;
+                let resolved = resolve_or_fill_toast(&tuple, sites, rel, &route.mapping, &resolver);
+                let leaf;
+                (patch, leaf) = Box::pin(resolved).await?;
+                permit = leaf.map(Arc::new);
             }
-            render_ext_columns(&rel.attributes, &mut tuple.columns);
-            let committed = tuple.into_committed_insert();
-            row_buffer
-                .push(&msg_tx, run.seq.seq(), (rel, route), committed, permit)
-                .await
-                .map_err(closed)?;
+            out.push(run.seq.seq(), rel, route, tuple, patch).await?;
             run.rows += 1;
             rows_routed += 1;
+            if permit.is_some() {
+                // Ship leaf permits before another acquisition can wait on them
+                out.hold(permit);
+                out.flush().await?;
+                out.hold(None);
+            }
         }
         // Resumable walk: close the seq space and fsync the spool so the
         // checkpointer can name every tuple consumed so far durable
@@ -275,10 +306,10 @@ pub async fn drain(
         {
             // Durable files must include their chunks
             puts.flush().await.map_err(put_err)?;
-            row_buffer.flush(&msg_tx).await.map_err(closed)?;
             if let Some(run) = open.take() {
-                seqs.place(run.seq, run.rows);
+                out.place(run.seq, run.rows);
             }
+            out.flush().await?;
             let mut mark = SpoolMark::default();
             if let Some(spool) = deferred.as_mut() {
                 mark = spool
@@ -287,14 +318,14 @@ pub async fn drain(
                     .map_err(|e| format!("bootstrap: deferred spool checkpoint: {e}"))?;
                 footprint.publish(spool);
             }
-            b.publish_drain(consumed, seqs.next(), mark).await;
+            b.publish_drain(consumed, out.seqs.next(), mark).await;
         }
     }
-    row_buffer.flush(&msg_tx).await.map_err(closed)?;
     if let Some(run) = open.take() {
-        seqs.place(run.seq, run.rows);
+        out.place(run.seq, run.rows);
     }
-    let next_seq = seqs.next();
+    let next_seq = out.seqs.next();
+    out.finish().await?;
 
     puts.flush().await.map_err(put_err)?;
 
@@ -398,7 +429,6 @@ async fn resolve_spooled(
     let mut seq = None;
     let mut placed = 0u64;
     let total_bytes = spool.spooled_bytes();
-    let mut seqs = ack.seqs(first_seq);
     let mut total_placed = 0;
     let mut ticker = Ticker::new(WALK_CHECKPOINT_PERIOD);
     let mut replay = spool
@@ -407,6 +437,7 @@ async fn resolve_spooled(
         .map_err(|e| format!("bootstrap: deferred spool seal: {e}"))?;
     let mut progress = DeferredReplayProgress::new(stats, total_bytes);
     progress.advance(replay.remaining_file_bytes());
+    let mut out = LoadOut::new(msg_tx, ack, first_seq);
     // Read and fetch the next batch while this one routes: spool reads and
     // inserts otherwise leave the store pool idle
     let mut ready = prepare_batch(&mut replay, routes, catalog, stats, resolver, coverage).await?;
@@ -414,18 +445,19 @@ async fn resolve_spooled(
         let remaining = replay.remaining_file_bytes();
         let (next, routed) = tokio::join!(
             prepare_batch(&mut replay, routes, catalog, stats, resolver, coverage),
-            route_batch(batch, msg_tx, &mut seqs, &mut seq, &mut placed),
+            route_batch(batch, &mut out, &mut seq, &mut placed),
         );
         routed?;
         progress.advance(remaining);
         if let Some(c) = checkpoint.as_mut() {
             if let Some(s) = seq.take() {
-                seqs.place(s, placed);
+                out.place(s, placed);
             }
             total_placed += placed;
             placed = 0;
             if ticker.fire() {
-                c.tail.checkpoint(seqs.next()).await?;
+                out.flush().await?;
+                c.tail.checkpoint(out.seqs.next()).await?;
                 c.state.offset = total_bytes - remaining;
                 c.state.rows += total_placed;
                 total_placed = 0;
@@ -436,7 +468,8 @@ async fn resolve_spooled(
     }
     let rows_routed = match checkpoint.as_mut() {
         Some(c) => {
-            c.tail.checkpoint(seqs.next()).await?;
+            out.flush().await?;
+            c.tail.checkpoint(out.seqs.next()).await?;
             c.state.offset = total_bytes;
             c.state.rows += total_placed;
             c.state.save(c.dir).await.map_err(|e| e.to_string())?;
@@ -452,8 +485,10 @@ async fn resolve_spooled(
         }
     };
     if let Some(s) = seq {
-        seqs.place(s, placed);
+        out.place(s, placed);
     }
+    let next_seq = out.seqs.next();
+    out.finish().await?;
     let covered = stats.bootstrap_replay_covered_rows.load(Ordering::Relaxed) - covered_before;
     if covered > 0 {
         tracing::info!(
@@ -464,7 +499,7 @@ async fn resolve_spooled(
         );
     }
     Ok(BootstrapDrainOutcome {
-        next_seq: seqs.next(),
+        next_seq,
         rows_routed,
         deferred: None,
     })
@@ -472,6 +507,337 @@ async fn resolve_spooled(
 
 fn closed(e: BatcherClosed) -> String {
     format!("bootstrap: {e}")
+}
+
+fn decode_err(rel: &RelDescriptor, e: impl std::fmt::Display) -> String {
+    format!("bootstrap: {} tuple decode: {e}", rel.rel_name)
+}
+
+/// Rows per load segment; the byte limit bounds wide rows
+const LOAD_SEGMENT_ROWS: usize = 65536;
+
+/// Slabs queued for a lane's encoder
+const LOAD_QUEUE: usize = 1;
+
+/// Routed load rows on their way to the encoder
+#[derive(Default)]
+struct Slab {
+    tables: Vec<(Arc<RelDescriptor>, Arc<RouteSnapshot>)>,
+    rows: Vec<LoadRow>,
+    bytes: usize,
+}
+
+struct LoadRow {
+    seq: u64,
+    table: u32,
+    tuple: BackfillTuple,
+    /// Resolved external values
+    patch: Vec<(usize, Datum)>,
+}
+
+impl Slab {
+    fn push(
+        &mut self,
+        seq: u64,
+        rel: &Arc<RelDescriptor>,
+        route: &Arc<RouteSnapshot>,
+        tuple: BackfillTuple,
+        patch: Vec<(usize, Datum)>,
+    ) {
+        let table = match self
+            .tables
+            .iter()
+            .rposition(|(r, t)| Arc::ptr_eq(r, rel) && Arc::ptr_eq(t, route))
+        {
+            Some(i) => i,
+            None => {
+                self.tables.push((rel.clone(), route.clone()));
+                self.tables.len() - 1
+            }
+        };
+        self.bytes += crate::backfill::spool::approx_bytes(&tuple)
+            + patch.iter().map(|(_, v)| v.approx_bytes()).sum::<usize>();
+        self.rows.push(LoadRow {
+            seq,
+            table: table as u32,
+            tuple,
+            patch,
+        });
+    }
+
+    fn due(&self) -> bool {
+        self.rows.len() >= LOAD_SEGMENT_ROWS || self.bytes >= DECODE_CHUNK_BYTES
+    }
+}
+
+/// `view` is scratch, refilled per heap row
+fn encode_row<'r>(
+    chunks: &mut ChunkBuilder<usize>,
+    view: &mut TupleView<'r>,
+    tuple: &'r BackfillTuple,
+    rel: &Arc<RelDescriptor>,
+    route: &Arc<RouteSnapshot>,
+    mut patch: Vec<(usize, Datum)>,
+) -> Result<(), String> {
+    let key = Arc::as_ptr(rel) as usize;
+    let stamp = RowStamp {
+        source_lsn: tuple.source_lsn,
+        xid: tuple.xid,
+        commit_ts: 0,
+        op_code: OP_INSERT,
+        leaf: route.partition.as_ref().map(|p| p.leaf),
+    };
+    let appended = match &tuple.data {
+        TupleData::Heap(data) => {
+            view_block_data_into(data, rel, view).map_err(|e| decode_err(rel, e))?;
+            metadata_patch(tuple, rel, &mut patch);
+            chunks.append(key, rel, route, |enc| {
+                enc.append_view(rel, &view.datums, &patch, &stamp)
+            })
+        }
+        TupleData::Copy(row) => chunks.append(key, rel, route, |enc| {
+            enc.append_slots(|src| Ok(copy_slot(row, rel, src.index)), &stamp)
+        }),
+    };
+    appended.map_err(|e| format!("bootstrap: encode {}: {e}", rel.rel_name))
+}
+
+enum LoadMsg {
+    /// Rows, then placements whose rows all precede them
+    Rows(Slab, Option<Arc<MemoryPermit>>, Vec<(OpenSeq, u64)>),
+    /// Ship everything received, then reply
+    Flush(oneshot::Sender<()>),
+}
+
+/// Routed load rows go to a lane encoder task, which ships them whatever
+/// the router is waiting on and places each seq after its rows. Router
+/// sends its slab before waiting on anything but the encoder
+struct LoadOut {
+    tx: mpsc::Sender<LoadMsg>,
+    encoder: tokio::task::JoinHandle<Result<(), String>>,
+    seqs: SeqAlloc,
+    slab: Slab,
+    places: Vec<(OpenSeq, u64)>,
+    /// Leaf permit riding rows sent while held
+    permit: Option<Arc<MemoryPermit>>,
+}
+
+impl LoadOut {
+    fn new(msg_tx: &mpsc::Sender<BatcherMsg>, ack: &AckHandle, first_seq: u64) -> Self {
+        let (tx, rx) = mpsc::channel(LOAD_QUEUE);
+        let encoder = Encoder {
+            msg_tx: msg_tx.clone(),
+            ack: ack.clone(),
+            state: Some(EncodeState::default()),
+            places: Vec::new(),
+            permit: None,
+        };
+        Self {
+            tx,
+            encoder: tokio::spawn(encoder.run(rx)),
+            seqs: ack.seqs(first_seq),
+            slab: Slab::default(),
+            places: Vec::new(),
+            permit: None,
+        }
+    }
+
+    fn hold(&mut self, permit: Option<Arc<MemoryPermit>>) {
+        self.permit = permit;
+    }
+
+    /// Queue `tuple` as an insert under `seq`
+    async fn push(
+        &mut self,
+        seq: u64,
+        rel: &Arc<RelDescriptor>,
+        route: &Arc<RouteSnapshot>,
+        tuple: BackfillTuple,
+        patch: Vec<(usize, Datum)>,
+    ) -> Result<(), String> {
+        self.slab.push(seq, rel, route, tuple, patch);
+        if self.slab.due() {
+            self.send().await?;
+        }
+        Ok(())
+    }
+
+    /// Hand queued rows and placements to the encoder
+    async fn send(&mut self) -> Result<(), String> {
+        if self.slab.rows.is_empty() && self.places.is_empty() {
+            return Ok(());
+        }
+        let slab = std::mem::take(&mut self.slab);
+        let places = std::mem::take(&mut self.places);
+        let permit = self.permit.clone();
+        self.post(LoadMsg::Rows(slab, permit, places)).await
+    }
+
+    /// Report `rows` for `seq`, every one already pushed
+    fn place(&mut self, seq: OpenSeq, rows: u64) {
+        self.places.push((seq, rows));
+    }
+
+    /// Wait until every pushed row reached the batcher and every seq placed
+    async fn flush(&mut self) -> Result<(), String> {
+        self.send().await?;
+        let (reply, done) = oneshot::channel();
+        self.post(LoadMsg::Flush(reply)).await?;
+        match done.await {
+            Ok(()) => Ok(()),
+            Err(_) => Err(self.failure().await),
+        }
+    }
+
+    /// [`Self::flush`], then stop the encoder
+    async fn finish(mut self) -> Result<(), String> {
+        self.send().await?;
+        drop(self.tx);
+        self.encoder
+            .await
+            .map_err(|e| format!("bootstrap: encoder: {e}"))?
+    }
+
+    async fn post(&mut self, msg: LoadMsg) -> Result<(), String> {
+        match self.tx.send(msg).await {
+            Ok(()) => Ok(()),
+            Err(_) => Err(self.failure().await),
+        }
+    }
+
+    async fn failure(&mut self) -> String {
+        match (&mut self.encoder).await {
+            Ok(Err(e)) => e,
+            Ok(Ok(())) => "bootstrap: encoder stopped early".into(),
+            Err(e) => format!("bootstrap: encoder: {e}"),
+        }
+    }
+}
+
+/// Builder state crossing to blocking encode jobs and back
+struct EncodeState {
+    chunks: ChunkBuilder<usize>,
+    /// Seq of rows open in `chunks`
+    seq: u64,
+    /// Sealed segments awaiting shipment
+    ready: Vec<PlacedSegment>,
+    ready_rows: usize,
+}
+
+impl Default for EncodeState {
+    fn default() -> Self {
+        Self {
+            chunks: ChunkBuilder::new(LOAD_SEGMENT_ROWS, DECODE_CHUNK_BYTES),
+            seq: 0,
+            ready: Vec::new(),
+            ready_rows: 0,
+        }
+    }
+}
+
+impl EncodeState {
+    /// Encode rows as inserts at their load version, sealing a segment at
+    /// each seq change and at `chunks`' limits
+    fn encode(&mut self, mut slab: Slab) -> Result<(), String> {
+        let mut view = TupleView::default();
+        for row in &mut slab.rows {
+            if row.seq != self.seq {
+                self.seal();
+                self.seq = row.seq;
+            }
+            let patch = std::mem::take(&mut row.patch);
+            let (rel, route) = &slab.tables[row.table as usize];
+            encode_row(&mut self.chunks, &mut view, &row.tuple, rel, route, patch)?;
+            if self.chunks.due() {
+                self.seal();
+            }
+        }
+        Ok(())
+    }
+
+    fn seal(&mut self) {
+        let rows = self.chunks.rows();
+        if rows == 0 {
+            return;
+        }
+        let chunks = self.chunks.take().into_iter().map(|(_, c)| c).collect();
+        self.chunks.clear();
+        self.ready.push(PlacedSegment {
+            seq: self.seq,
+            chunks,
+            permit: None,
+        });
+        self.ready_rows += rows;
+    }
+}
+
+struct Encoder {
+    msg_tx: mpsc::Sender<BatcherMsg>,
+    ack: AckHandle,
+    /// `None` while a blocking job holds it
+    state: Option<EncodeState>,
+    places: Vec<(OpenSeq, u64)>,
+    permit: Option<Arc<MemoryPermit>>,
+}
+
+impl Encoder {
+    async fn run(mut self, mut rx: mpsc::Receiver<LoadMsg>) -> Result<(), String> {
+        while let Some(msg) = rx.recv().await {
+            match msg {
+                LoadMsg::Rows(slab, permit, places) => {
+                    // A flush separates rows holding one permit from the next
+                    self.permit = permit;
+                    let mut state = self.state.take().expect("encode state home");
+                    let (state, encoded) = tokio::task::spawn_blocking(move || {
+                        let encoded = state.encode(slab);
+                        (state, encoded)
+                    })
+                    .await
+                    .map_err(|e| format!("bootstrap: encode job: {e}"))?;
+                    encoded?;
+                    self.places.extend(places);
+                    let due = state.ready_rows >= LOAD_SEGMENT_ROWS;
+                    self.state = Some(state);
+                    if due {
+                        self.ship().await?;
+                    }
+                }
+                LoadMsg::Flush(reply) => {
+                    self.ship().await?;
+                    let _ = reply.send(());
+                }
+            }
+            // Caught up: router may be waiting on something besides us
+            if rx.is_empty() {
+                self.ship().await?;
+            }
+        }
+        self.ship().await
+    }
+
+    /// Send sealed and open rows, `permit` riding to insert ack, then place
+    /// seqs whose rows all shipped
+    async fn ship(&mut self) -> Result<(), String> {
+        let state = self.state.as_mut().expect("encode state home");
+        state.seal();
+        // Every row it covered ships now; holding it longer stalls next acquire
+        let permit = self.permit.take();
+        if !state.ready.is_empty() {
+            let mut segments = std::mem::take(&mut state.ready);
+            state.ready_rows = 0;
+            for s in &mut segments {
+                s.permit = permit.clone();
+            }
+            self.msg_tx
+                .send(BatcherMsg::Segments(segments))
+                .await
+                .map_err(|_| closed(BatcherClosed))?;
+        }
+        for (seq, rows) in self.places.drain(..) {
+            self.ack.place(seq, rows);
+        }
+        Ok(())
+    }
 }
 
 struct Run {
@@ -486,9 +852,14 @@ enum Target {
     Unsupported,
     /// Already loaded by caller
     Skipped,
-    /// Store TOAST chunks under this relation OID
-    Toast(u32),
-    Routed(Arc<RelDescriptor>, Arc<RouteSnapshot>),
+    /// Store TOAST chunks of this relation
+    Toast(Arc<RelDescriptor>),
+    Routed {
+        rel: Arc<RelDescriptor>,
+        route: Arc<RouteSnapshot>,
+        /// Some mapped column is varlena, so a tuple may hold external values
+        varlena: bool,
+    },
 }
 
 impl Target {
@@ -505,11 +876,22 @@ impl Target {
             return Self::Skipped;
         }
         if catalog.is_toast(rfn.db_node, rfn.rel_node) {
-            return Self::Toast(rel.oid);
+            return Self::Toast(rel);
         }
-        routes
-            .route(&rel)
-            .map_or(Self::Unsupported, |route| Self::Routed(rel, route))
+        let Some(route) = routes.route(&rel) else {
+            return Self::Unsupported;
+        };
+        let varlena = route.mapping.columns.iter().any(|c| {
+            usize::try_from(c.src_attnum as i32 - 1)
+                .ok()
+                .and_then(|i| rel.attributes.get(i))
+                .is_some_and(|a| a.type_len == -1)
+        });
+        Self::Routed {
+            rel,
+            route,
+            varlena,
+        }
     }
 }
 
@@ -539,6 +921,8 @@ struct ReplayRow {
     /// Index into containing batch's `tables`
     table: u32,
     pointers: Vec<PointerSite>,
+    /// Values settled for external attributes
+    patch: Vec<(usize, Datum)>,
     replay_covered: bool,
 }
 
@@ -551,28 +935,34 @@ struct PointerSite {
 }
 
 /// Check only columns routed to ClickHouse
-fn mapped_pointers(tuple: &BackfillTuple, mapping: &TableMapping) -> Vec<PointerSite> {
+fn mapped_pointers(view: &TupleView<'_>, mapping: &TableMapping) -> Vec<PointerSite> {
     mapping
         .columns
         .iter()
         .enumerate()
         .filter_map(|(col, c)| {
             let idx = usize::try_from(c.src_attnum as i32 - 1).ok()?;
-            let Some(ColumnValue::ExternalToast(p)) = tuple.columns.get(idx)? else {
+            let DatumRef::External(p) = *view.datums.get(idx)? else {
                 return None;
             };
-            Some(PointerSite { idx, col, p: *p })
+            Some(PointerSite { idx, col, p })
         })
         .collect()
 }
 
-/// Replace oversized values with NULL and remove them from fetch list
+/// Settle oversized values as NULL and remove them from fetch list
 fn fill_oversize(
-    tuple: &mut BackfillTuple,
     sites: &mut Vec<PointerSite>,
+    patch: &mut Vec<(usize, Datum)>,
     resolver: &ToastResolver,
 ) {
-    sites.retain(|site| !resolver.fill_oversize(&mut tuple.columns[site.idx], &site.p));
+    sites.retain(|site| {
+        let filled = resolver.fills_oversize(&site.p);
+        if filled {
+            patch.push((site.idx, Datum::Null));
+        }
+        !filled
+    });
 }
 
 /// Batch whose values are resolved, holding the leaf permit its rows ride
@@ -614,8 +1004,7 @@ async fn prepare_batch(
 /// batch's leaf permit, which the next batch's acquire may wait on
 async fn route_batch(
     batch: ResolvedReplayBatch,
-    msg_tx: &mpsc::Sender<BatcherMsg>,
-    seqs: &mut SeqAlloc,
+    out: &mut LoadOut,
     seq: &mut Option<OpenSeq>,
     placed: &mut u64,
 ) -> Result<(), String> {
@@ -624,30 +1013,21 @@ async fn route_batch(
         rows,
         permit,
     } = batch;
-    let mut row_buffer = RowBuffer::new(permit);
+    out.hold(permit);
     for row in rows {
         if row.replay_covered {
             continue;
         }
-        let mut tuple = row.tuple;
-        let at = seq
-            .get_or_insert_with(|| seqs.open(tuple.source_lsn, Publish::Commit))
+        let s = seq
+            .get_or_insert_with(|| out.seqs.open(row.tuple.source_lsn, Publish::Commit))
             .seq();
         let RowTable { rel, route } = &tables[row.table as usize];
-        render_ext_columns(&rel.attributes, &mut tuple.columns);
-        row_buffer
-            .push(
-                msg_tx,
-                at,
-                (rel, route),
-                tuple.into_committed_insert(),
-                None,
-            )
-            .await
-            .map_err(closed)?;
+        out.push(s, rel, route, row.tuple, row.patch).await?;
         *placed += 1;
     }
-    row_buffer.flush(msg_tx).await.map_err(closed)
+    out.flush().await?;
+    out.hold(None);
+    Ok(())
 }
 
 /// Read referrers until the batch seals or the spool ends, dropping rows no
@@ -667,7 +1047,7 @@ async fn next_batch(
     };
     let mut run: Option<(RelFileNode, Option<u32>)> = None;
     while batch.rows.len() < REPLAY_BATCH_ROWS && batch.need + batch.resident < REPLAY_FETCH_BYTES {
-        let Some(mut tuple) = replay
+        let Some(tuple) = replay
             .next()
             .await
             .map_err(|e| format!("bootstrap: deferred spool replay: {e}"))?
@@ -693,20 +1073,25 @@ async fn next_batch(
             stats.unsupported_relations.fetch_add(1, Ordering::Relaxed);
             continue;
         };
-        let route = &batch.tables[table as usize].route;
-        let mut pointers = mapped_pointers(&tuple, &route.mapping);
+        let RowTable { rel, route } = &batch.tables[table as usize];
+        let mut pointers = tuple
+            .view(rel)
+            .map_err(|e| decode_err(rel, e))?
+            .map_or_else(Vec::new, |v| mapped_pointers(&v, &route.mapping));
         batch.need += check_value_caps(
             pointers.iter().map(|site| site.p),
             resolver.inline_value_max(),
             resolver.overflow(),
         )
         .map_err(|e| format!("bootstrap: {e}"))?;
-        fill_oversize(&mut tuple, &mut pointers, resolver);
+        let mut patch = Vec::new();
+        fill_oversize(&mut pointers, &mut patch, resolver);
         batch.resident += crate::backfill::spool::approx_bytes(&tuple);
         batch.rows.push(ReplayRow {
             tuple,
             table,
             pointers,
+            patch,
             replay_covered: false,
         });
     }
@@ -760,6 +1145,7 @@ async fn resolve_batch(
             tuple,
             table,
             pointers,
+            patch,
             replay_covered,
         },
         fetched,
@@ -774,11 +1160,10 @@ async fn resolve_batch(
         }
         let RowTable { rel, route } = &batch.tables[*table as usize];
         for (site, fetched) in pointers.iter().zip(fetched) {
-            let type_oid = rel.attributes.get(site.idx).map_or(0, |a| a.type_oid);
             let target = &route.mapping.columns[site.col].target_name;
-            let (column, bytes) = apply_fetched(fetched, &site.p, type_oid, rel, target, resolver)?;
+            let (column, bytes) = apply_fetched(fetched, &site.p, rel, target, resolver)?;
             retained += bytes;
-            tuple.columns[site.idx] = Some(column);
+            patch.push((site.idx, column));
         }
     }
     Ok(retained)
@@ -872,15 +1257,14 @@ async fn fetch_values_at<'a>(
 fn apply_fetched(
     fetched: Option<FetchedValue>,
     p: &ToastPointer,
-    type_oid: u32,
     rel: &RelDescriptor,
     target: &str,
     resolver: &ToastResolver,
-) -> Result<(ColumnValue, usize), String> {
+) -> Result<(Datum, usize), String> {
     let miss = match StoreMiss::split(fetched) {
         Ok(stored) => {
             let raw = finish_value(p, stored).map_err(|e| e.to_string())?;
-            return Ok(detoasted_sized(raw, type_oid));
+            return Ok(detoasted_sized(raw));
         }
         Err(miss) => miss,
     };
@@ -895,30 +1279,28 @@ fn apply_fetched(
     Ok((column, 0))
 }
 
-/// Resolve mapped TOAST pointers or fill in disabled mode. Value cap
-/// checked before any fetch; the returned leaf permit is shrunk to the
-/// retained decoded bytes and rides the routed row to insert ack
+/// Resolve mapped TOAST pointers or fill in disabled mode, as a patch of
+/// settled values. Value cap checked before any fetch; the returned leaf
+/// permit is shrunk to the retained decoded bytes and rides the routed row
+/// to insert ack
 async fn resolve_or_fill_toast(
-    tuple: &mut BackfillTuple,
+    tuple: &BackfillTuple,
+    mut sites: Vec<PointerSite>,
     rel: &RelDescriptor,
     mapping: &TableMapping,
     resolver: &ToastResolver,
-) -> Result<Option<crate::budget::MemoryPermit>, String> {
-    let mut sites = mapped_pointers(tuple, mapping);
-    if sites.is_empty() {
-        return Ok(None);
-    }
+) -> Result<(Vec<(usize, Datum)>, Option<crate::budget::MemoryPermit>), String> {
     let need = check_value_caps(
         sites.iter().map(|site| site.p),
         resolver.inline_value_max(),
         resolver.overflow(),
     )
     .map_err(|e| format!("bootstrap: {e}"))?;
-    fill_oversize(tuple, &mut sites, resolver);
+    let mut patch = Vec::with_capacity(sites.len());
+    fill_oversize(&mut sites, &mut patch, resolver);
     let mut leaf = crate::budget::acquire_opt(resolver.budget(), need).await;
     let mut retained = 0usize;
     for site in &sites {
-        let type_oid = rel.attributes.get(site.idx).map_or(0, |a| a.type_oid);
         let fetched = resolver
             .fetch_value(
                 tuple.rfn.db_node,
@@ -930,37 +1312,18 @@ async fn resolve_or_fill_toast(
             .await
             .map_err(|e| format!("bootstrap: toast store fetch: {e}"))?;
         let target = &mapping.columns[site.col].target_name;
-        let (column, bytes) = apply_fetched(fetched, &site.p, type_oid, rel, target, resolver)?;
+        let (column, bytes) = apply_fetched(fetched, &site.p, rel, target, resolver)?;
         retained += bytes;
-        tuple.columns[site.idx] = Some(column);
+        patch.push((site.idx, column));
     }
     if let Some(p) = leaf.as_mut() {
         p.shrink(retained as u64);
     }
-    Ok(leaf)
+    Ok((patch, leaf))
 }
 
 fn put_err(e: ChunkStoreError) -> String {
     format!("bootstrap: toast store put: {e}")
-}
-
-/// Convert PostgreSQL TOAST tuple shape into mirror row
-fn row_from_columns(mut tuple: BackfillTuple, db_oid: u32, toast_relid: u32) -> Option<ToastRow> {
-    let (chunk_id, chunk_seq, chunk_data) =
-        crate::decode::heap_decoder::take_toast_chunk_columns(&mut tuple.columns)?;
-    debug_assert_ne!(tuple.offnum, 0, "walked toast tuple without TID");
-    Some(ToastRow {
-        db_oid,
-        toast_relid,
-        blkno: tuple.blkno,
-        offnum: tuple.offnum,
-        chunk_id,
-        chunk_seq,
-        chunk_data: bytes::Bytes::from(chunk_data),
-        // Weakest evidence for a TID: a backup copy can be torn, so any
-        // WAL-sourced row for the same TID outranks it
-        lsn: 0,
-    })
 }
 
 #[cfg(test)]
@@ -1020,18 +1383,34 @@ mod tests {
         );
     }
 
-    /// Flatten the drain's coalesced `Rows` chunks back to a row list
-    async fn collect_rows(rx: &mut mpsc::Receiver<BatcherMsg>) -> Vec<RoutedRow> {
+    /// Flatten the drain's segments back to `(seq, mapped cells)` rows
+    async fn collect_rows(rx: &mut mpsc::Receiver<BatcherMsg>) -> Vec<(u64, Vec<Datum>)> {
         let mut rows = Vec::new();
         // Any other message ends collection short of the expected rows
-        while let Some(BatcherMsg::Rows(chunk)) = rx.recv().await {
-            rows.extend(chunk.rows);
+        while let Some(BatcherMsg::Segments(segments)) = rx.recv().await {
+            rows.extend(segment_rows(&segments));
         }
         rows
     }
 
+    /// `_lsn` per row of `chunk`
+    fn lsn_column(chunk: &crate::emit::ch_emitter::EncodedChunk) -> Vec<u64> {
+        let lsn = &chunk.buffers[chunk.route.mapping.columns.len()];
+        let crate::emit::ch_emitter::Wire::Fixed { bytes, .. } = lsn.wire() else {
+            panic!("UInt64 _lsn");
+        };
+        bytes
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|b| u64::from_le_bytes(*b))
+            .collect()
+    }
+
     use super::*;
-    use crate::emit::pipeline::batcher::RoutedRow;
+    use crate::decode::datum::{Datum, build};
+    use crate::emit::pipeline::batcher::segment_rows;
+    use crate::toast::ToastRow;
 
     /// Distinguish missing data in walk-seeded store from superseded value in
     /// read-only end-of-backup store
@@ -1070,7 +1449,7 @@ mod tests {
             Arc::new(EmitterStats::default()),
         );
         assert!(seeded.stores_chunks());
-        let err = apply_fetched(short.clone(), &ptr, 25, &rel, "body", &seeded)
+        let err = apply_fetched(short.clone(), &ptr, &rel, "body", &seeded)
             .expect_err("a seeded mirror losing its own chunk must stop the load");
         assert!(
             err.contains("chunks sum to 7984 bytes, pointer says 9100"),
@@ -1093,9 +1472,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(fetched, short);
-        let (column, retained) = apply_fetched(fetched, &ptr, 25, &rel, "body", &read_only)
+        let (column, retained) = apply_fetched(fetched, &ptr, &rel, "body", &read_only)
             .expect("a read-only backend fills instead of failing the load");
-        assert_eq!(column, ColumnValue::Null);
+        assert_eq!(column, Datum::Null);
         assert_eq!(retained, 0);
         assert_eq!(
             stats.toast_values_filled_superseded.load(Ordering::Relaxed),
@@ -1117,7 +1496,7 @@ mod tests {
             DEFERRED_SPOOL_MEM_MAX,
         )
     }
-    use crate::decode::heap_decoder::{ColumnValue, ToastPointer};
+    use crate::decode::heap_decoder::ToastPointer;
     use crate::emit::pipeline::batcher::BatcherMsg;
     use crate::emit::pipeline::{Fatal, ack};
     use crate::schema::{RelAttr, RelDescriptor, RelName, ReplIdent};
@@ -1185,7 +1564,8 @@ mod tests {
             page_lsn: 0,
             blkno: 0,
             offnum: 0,
-            columns: vec![Some(ColumnValue::Int4(id))],
+            data: TupleData::from_cells(&[Some(build::int4(id))]),
+            pending: None,
         }
     }
 
@@ -1229,7 +1609,7 @@ mod tests {
             columns: vec![ColumnMapping {
                 src_attnum: 1,
                 target_name: "b".into(),
-                target_type: "String".into(),
+                target_type: "Nullable(String)".into(),
                 type_pinned: false,
             }],
             tees: Vec::new(),
@@ -1237,10 +1617,9 @@ mod tests {
     }
 
     /// `pg_toast` rel so [`CatalogMap::is_toast`] fires; `oid` matches the
-    /// referring pointer's `va_toastrelid`. Attributes unread — the drain
-    /// reinterprets a toast tuple's columns positionally (`chunk_from_columns`).
+    /// referring pointer's `va_toastrelid`
     fn toast_rel(rel_node: u32) -> Arc<RelDescriptor> {
-        let name = format!("pg_toast_{rel_node}");
+        let base = crate::backfill::backup_page_walk::toast_chunk_rel();
         Arc::new(RelDescriptor {
             rfn: RelFileNode {
                 spc_node: 1663,
@@ -1248,14 +1627,8 @@ mod tests {
                 rel_node,
             },
             oid: rel_node,
-            toast_oid: 0,
-            namespace_oid: 99,
-            rel_name: RelName::new("pg_toast", &name),
-            kind: 't',
-            persistence: 'p',
-            ancestors: Vec::new(),
-            replident: ReplIdent::Default { pk_attnums: None },
-            attributes: vec![],
+            rel_name: RelName::new("pg_toast", &format!("pg_toast_{rel_node}")),
+            ..base
         })
     }
 
@@ -1263,6 +1636,21 @@ mod tests {
     /// into `toast_relid`/`value_id`, uncompressed (`va_extinfo` high bits
     /// clear so reassembly returns the concatenated chunks verbatim).
     fn bytea_toast_tuple(rel_node: u32, toast_relid: u32, value_id: u32) -> BackfillTuple {
+        referrer_tuple(rel_node, &[pointer(toast_relid, value_id)])
+    }
+
+    fn pointer(toast_relid: u32, value_id: u32) -> ToastPointer {
+        ToastPointer {
+            va_rawsize: 9,
+            va_extinfo: 5,
+            va_valueid: value_id,
+            va_toastrelid: toast_relid,
+        }
+    }
+
+    /// Main-rel tuple whose columns are on-disk TOAST pointers
+    fn referrer_tuple(rel_node: u32, pointers: &[ToastPointer]) -> BackfillTuple {
+        let cells: Vec<_> = pointers.iter().map(|p| Some(Datum::External(*p))).collect();
         BackfillTuple {
             rfn: RelFileNode {
                 spc_node: 1663,
@@ -1276,12 +1664,8 @@ mod tests {
             page_lsn: 0,
             blkno: 0,
             offnum: 0,
-            columns: vec![Some(ColumnValue::ExternalToast(ToastPointer {
-                va_rawsize: 9,
-                va_extinfo: 5,
-                va_valueid: value_id,
-                va_toastrelid: toast_relid,
-            }))],
+            data: TupleData::from_cells(&cells),
+            pending: None,
         }
     }
 
@@ -1301,20 +1685,21 @@ mod tests {
             page_lsn: 0,
             blkno: 1,
             offnum: 1,
-            columns: vec![
-                Some(ColumnValue::Oid(value_id)),
-                Some(ColumnValue::Int4(seq)),
-                Some(ColumnValue::Bytea(body.to_vec())),
-            ],
+            data: TupleData::from_cells(&[
+                Some(build::oid(value_id)),
+                Some(build::int4(seq)),
+                Some(build::bytes(body)),
+            ]),
+            pending: None,
         }
     }
 
     #[tokio::test]
     async fn detoasted_input_rejects_external_pointers() {
         let mut catalog = CatalogMap::new();
-        catalog.insert(rel(16400));
+        catalog.insert(bytea_rel(16400));
         let mapping = Arc::new(
-            [(RelName::new("public", "t16400"), mapping_for(16400))]
+            [(RelName::new("public", "t16400"), bytea_mapping_for(16400))]
                 .into_iter()
                 .collect(),
         );
@@ -1385,7 +1770,7 @@ mod tests {
 
         let mut by_seq: HashMap<u64, u64> = HashMap::new();
         for r in collect_rows(&mut msg_rx).await {
-            *by_seq.entry(r.seq).or_default() += 1;
+            *by_seq.entry(r.0).or_default() += 1;
         }
         let outcome = drain_task.await.unwrap().unwrap();
         assert_eq!(outcome.next_seq, 2, "one seq per rfn");
@@ -1438,7 +1823,7 @@ mod tests {
         let seqs: Vec<u64> = collect_rows(&mut msg_rx)
             .await
             .iter()
-            .map(|r| r.seq)
+            .map(|r| r.0)
             .collect();
         let outcome = drain_task.await.unwrap().unwrap();
         assert_eq!(outcome.next_seq, 3, "three distinct rfn runs");
@@ -1490,12 +1875,8 @@ mod tests {
         assert_eq!(outcome.next_seq, 1);
         assert_eq!(outcome.rows_routed, 1);
         assert_eq!(rows.len(), 1);
-        let cols = &rows[0].committed.decoded.new.as_ref().unwrap().columns;
-        assert_eq!(
-            cols[0],
-            Some(ColumnValue::Null),
-            "unresolved toast NULL-filled"
-        );
+        let cols = &rows[0].1;
+        assert_eq!(cols[0], Datum::Null, "unresolved toast NULL-filled");
         assert_eq!(stats.toast_values_filled_default.load(Ordering::Relaxed), 1);
         drop(ack);
         collector.await.unwrap();
@@ -1543,8 +1924,8 @@ mod tests {
         let outcome = drain_task.await.unwrap().unwrap();
         assert_eq!(outcome.rows_routed, 1);
         assert_eq!(rows.len(), 1);
-        let cols = &rows[0].committed.decoded.new.as_ref().unwrap().columns;
-        assert_eq!(cols[0], Some(ColumnValue::Null));
+        let cols = &rows[0].1;
+        assert_eq!(cols[0], Datum::Null);
         assert_eq!(
             stats.toast_values_filled_oversize.load(Ordering::Relaxed),
             1
@@ -1609,9 +1990,9 @@ mod tests {
         assert_eq!(outcome.next_seq, 3, "toast seq, main seq, deferred seq");
         assert_eq!(outcome.rows_routed, 1);
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].seq, 2, "deferred row routed under the trailing seq");
-        let cols = &rows[0].committed.decoded.new.as_ref().unwrap().columns;
-        assert_eq!(cols[0], Some(ColumnValue::Bytea(b"hello".to_vec())));
+        assert_eq!(rows[0].0, 2, "deferred row routed under the trailing seq");
+        let cols = &rows[0].1;
+        assert_eq!(cols[0], build::bytes(b"hello"));
         assert_eq!(stats.toast_chunks_stored.load(Ordering::Relaxed), 1);
         assert_eq!(stats.toast_values_fetched.load(Ordering::Relaxed), 1);
         drop(ack);
@@ -1673,10 +2054,10 @@ mod tests {
         let msg = tokio::time::timeout(std::time::Duration::from_secs(5), msg_rx.recv())
             .await
             .expect("heap rows stuck behind gated put");
-        let Some(BatcherMsg::Rows(chunk)) = msg else {
+        let Some(BatcherMsg::Segments(segments)) = msg else {
             panic!("expected heap rows");
         };
-        assert_eq!(chunk.rows.len(), 2);
+        assert_eq!(segment_rows(&segments).len(), 2);
         assert_eq!(store.permits.available_permits(), 0, "no put landed yet");
 
         store.permits.add_permits(2);
@@ -1829,8 +2210,8 @@ mod tests {
 
         let rows = collect_rows(&mut msg_rx).await;
         assert_eq!(rows.len(), 1);
-        let cols = &rows[0].committed.decoded.new.as_ref().unwrap().columns;
-        assert_eq!(cols[0], Some(ColumnValue::Bytea(b"hello".to_vec())));
+        let cols = &rows[0].1;
+        assert_eq!(cols[0], build::bytes(b"hello"));
         drop(ack);
         collector.await.unwrap();
     }
@@ -1959,12 +2340,7 @@ mod tests {
             let (ack, collector) =
                 ack::spawn(Arc::new(crate::pos::Monotone::default()), Fatal::new());
             let (msg_tx, mut msg_rx) = mpsc::channel::<BatcherMsg>(64);
-            let mut referrer = bytea_toast_tuple(16400, 16500, b);
-            referrer.columns.push(referrer.columns[0].clone());
-            let Some(Some(ColumnValue::ExternalToast(p))) = referrer.columns.get_mut(1) else {
-                unreachable!()
-            };
-            p.va_valueid = c;
+            let mut referrer = referrer_tuple(16400, &[pointer(16500, b), pointer(16500, c)]);
             (referrer.blkno, referrer.offnum) = (slot.1, slot.2);
             referrer.page_lsn = page_lsn;
             let mut spool = mem_spool();
@@ -1985,25 +2361,27 @@ mod tests {
             )
             .await;
             drop(msg_tx);
-            let routed = collect_rows(&mut msg_rx).await;
+            let mut routed = Vec::new();
+            while let Some(msg) = msg_rx.recv().await {
+                routed.push(msg);
+            }
             let covered = stats.bootstrap_replay_covered_rows.load(Ordering::Relaxed);
             match want {
                 Want::Routed(b, c) => {
                     let resolved = result.unwrap_or_else(|e| panic!("{label}: {e}"));
                     assert_eq!(resolved.rows_routed, 1, "{label}");
-                    let row = &routed[0].committed;
+                    let BatcherMsg::Segments(segments) = &routed[0] else {
+                        panic!("{label}: expected segments");
+                    };
+                    let chunk = &segments[0].chunks[0];
                     assert_eq!(
-                        (row.decoded.source_lsn, row.commit_lsn),
-                        (0x1000, 0x1000),
+                        lsn_column(chunk),
+                        [0x1000],
                         "{label}: load version moved with lookup bound"
                     );
-                    let cols = &row.decoded.new.as_ref().unwrap().columns;
                     assert_eq!(
-                        cols[..],
-                        [
-                            Some(ColumnValue::Bytea(b.to_vec())),
-                            Some(ColumnValue::Bytea(c.to_vec()))
-                        ],
+                        chunk.cells(),
+                        [[build::bytes(b), build::bytes(c)]],
                         "{label}"
                     );
                     assert_eq!(covered, 0, "{label}");
@@ -2153,8 +2531,8 @@ mod tests {
         let outcome = drain_task.await.unwrap().unwrap();
         assert_eq!(outcome.rows_routed, 1);
         assert_eq!(rows.len(), 1);
-        let cols = &rows[0].committed.decoded.new.as_ref().unwrap().columns;
-        assert_eq!(cols[0], Some(ColumnValue::Bytea(b"hello".to_vec())));
+        let cols = &rows[0].1;
+        assert_eq!(cols[0], build::bytes(b"hello"));
         drop(ack);
         collector.await.unwrap();
     }
@@ -2215,14 +2593,8 @@ mod tests {
         let routed = collect_rows(&mut msg_rx).await;
         let outcome = drain_task.await.unwrap().unwrap();
         assert_eq!(outcome.rows_routed as usize, rows);
-        let got: Vec<_> = routed
-            .iter()
-            .map(|r| r.committed.decoded.new.as_ref().unwrap().columns[0].clone())
-            .collect();
-        let want: Vec<_> = bodies
-            .into_iter()
-            .map(|b| Some(ColumnValue::Bytea(b)))
-            .collect();
+        let got: Vec<_> = routed.iter().map(|r| r.1[0].clone()).collect();
+        let want: Vec<_> = bodies.into_iter().map(build::bytes).collect();
         assert_eq!(got, want, "replay order kept across the batch boundary");
         assert_eq!(
             stats.toast_value_fetch_batches.load(Ordering::Relaxed),
@@ -2261,12 +2633,12 @@ mod tests {
         tup_tx.send(chunks).await.unwrap();
         let referrers = (0..rows)
             .map(|i| {
-                let mut t = bytea_toast_tuple(16400, 16500, i + 1);
-                if let Some(ColumnValue::ExternalToast(p)) = &mut t.columns[0] {
-                    p.va_rawsize = VALUE as i32 + 4;
-                    p.va_extinfo = VALUE as u32;
-                }
-                t
+                let p = ToastPointer {
+                    va_rawsize: VALUE as i32 + 4,
+                    va_extinfo: VALUE as u32,
+                    ..pointer(16500, i + 1)
+                };
+                referrer_tuple(16400, &[p])
             })
             .collect();
         tup_tx.send(referrers).await.unwrap();
@@ -2293,8 +2665,8 @@ mod tests {
         // Drop rows on receipt, as insert ack would
         let mut routed = 0;
         let count = async {
-            while let Some(BatcherMsg::Rows(chunk)) = msg_rx.recv().await {
-                routed += chunk.rows.len();
+            while let Some(BatcherMsg::Segments(segments)) = msg_rx.recv().await {
+                routed += segment_rows(&segments).len();
             }
         };
         tokio::time::timeout(std::time::Duration::from_secs(5), count)
@@ -2446,10 +2818,13 @@ mod tests {
         for (db_oid, body) in [(1, b"first"), (2, b"other")] {
             let store = Arc::new(MemChunkStore::new());
             let chunk = toast_chunk_tuple(16500, 1, 0, body);
-            store
-                .put(&[row_from_columns(chunk, db_oid, 16500).unwrap()])
-                .await
-                .unwrap();
+            let TupleData::Heap(data) = &chunk.data else {
+                unreachable!()
+            };
+            let mut toast = (*toast_rel(16500)).clone();
+            toast.rfn.db_node = db_oid;
+            let row = toast_row(data, &toast, chunk.blkno, chunk.offnum, 0).unwrap();
+            store.put(&[row]).await.unwrap();
             stores.push((db_oid, store as Arc<dyn ChunkStore>));
             let mut tuple = bytea_toast_tuple(16400, 16500, 1);
             tuple.rfn.db_node = db_oid;
@@ -2458,15 +2833,16 @@ mod tests {
                 Arc::default(),
                 RowPolicy::default(),
             );
-            let pointers = mapped_pointers(&tuple, &route.mapping);
-            batch.tables.push(RowTable {
-                rel: bytea_rel(16400),
-                route,
-            });
+            let rel = bytea_rel(16400);
+            let view = tuple.view(&rel).unwrap().unwrap();
+            let pointers = mapped_pointers(&view, &route.mapping);
+            drop(view);
+            batch.tables.push(RowTable { rel, route });
             batch.rows.push(ReplayRow {
                 tuple,
                 table: batch.tables.len() as u32 - 1,
                 pointers,
+                patch: Vec::new(),
                 replay_covered: false,
             });
         }
@@ -2476,10 +2852,7 @@ mod tests {
             .await
             .unwrap();
         for (row, expected) in batch.rows.iter().zip([b"first", b"other"]) {
-            assert_eq!(
-                row.tuple.columns[0],
-                Some(ColumnValue::Bytea(expected.to_vec()))
-            );
+            assert_eq!(row.patch, [(0, build::bytes(expected))]);
         }
     }
 
@@ -2557,19 +2930,16 @@ mod tests {
         let rows = collect_rows(&mut msg_rx).await;
         let outcome = drain_task.await.unwrap().unwrap();
         assert_eq!(outcome.rows_routed, 4);
-        let bodies: Vec<_> = rows
-            .iter()
-            .map(|r| r.committed.decoded.new.as_ref().unwrap().columns[0].clone())
-            .collect();
+        let bodies: Vec<_> = rows.iter().map(|r| r.1[0].clone()).collect();
         assert_eq!(
             bodies,
             [b"hello", b"hello", b"world", b"there"]
-                .map(|b| Some(ColumnValue::Bytea(b.to_vec())))
+                .map(build::bytes)
                 .to_vec(),
             "replay order kept, shared value resolved for both referrers",
         );
         assert!(
-            rows.iter().all(|r| r.seq == rows[0].seq),
+            rows.iter().all(|r| r.0 == rows[0].0),
             "one trailing seq for the replay",
         );
         assert_eq!(

@@ -40,7 +40,8 @@ use crate::column_rules::ColumnRules;
 use crate::config::{ConfigResolver, DestEmitter, ResolvedConfig};
 #[cfg(feature = "test-support")]
 use crate::crash_test;
-use crate::decode::heap_decoder::{self, ColumnValue};
+use crate::decode::datum::DatumRef;
+use crate::decode::heap_decoder;
 use crate::emit::ch_emitter::{DATETIME64_PG_EPOCH_US, EmitterConfig};
 use crate::emit::route::{Routing, routing};
 use crate::mapping::{
@@ -1499,14 +1500,24 @@ async fn resolve_disk_default<'a>(
     db: Oid,
     att: &'a RelAttr,
 ) -> Cow<'a, RelAttr> {
-    let ColumnValue::PgPending { raw, .. } = heap_decoder::missing_value_for(att) else {
+    if heap_decoder::local_matrix_covers(att.type_oid, att.type_len) {
+        return Cow::Borrowed(att);
+    }
+    let (DatumRef::Fixed(raw) | DatumRef::Varlena(raw) | DatumRef::Cstring(raw)) =
+        heap_decoder::missing_datum(att)
+    else {
         return Cow::Borrowed(att);
     };
     let Some(oracle) = oracle else {
         return Cow::Borrowed(att);
     };
     match oracle
-        .text_value(db, att.type_oid, att.typmod, OracleCell::DiskRaw(raw))
+        .text_value(
+            db,
+            att.type_oid,
+            att.typmod,
+            OracleCell::DiskRaw(raw.to_vec()),
+        )
         .await
     {
         Ok(text) => {
@@ -1790,7 +1801,7 @@ mod tests {
         let sql = "CREATE DATABASE IF NOT EXISTS retry_test";
         for (retries, idle) in [(0, false), (1, false), (2, false), (1, true)] {
             let (config, server) =
-                crate::ch::test_support::retry_server(retries, sql, false, idle).await;
+                crate::ch::test_support::retry_server(retries, sql, 0, idle, None).await;
             let resolved = Arc::new(ResolvedConfig::default());
             let ddl = DdlConfig::from_resolved(
                 &resolved,

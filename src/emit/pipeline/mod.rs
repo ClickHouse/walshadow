@@ -13,13 +13,14 @@
 pub mod ack;
 pub mod batcher;
 pub mod bootstrap;
-pub mod decode;
+pub mod encode;
 pub mod inserter;
 pub mod plan_spool;
 pub mod planner;
 pub mod reorder;
 pub mod resolver;
 pub mod row_ledger;
+pub(crate) mod sealed;
 pub mod tail;
 
 use std::sync::Arc;

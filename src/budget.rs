@@ -156,6 +156,8 @@ struct Inner {
     /// (mixed pool), the whole pool otherwise (leaf-only pool)
     leaf_max: usize,
     cur: AtomicU64,
+    /// Process-wide sum over pools of one kind, eg every tail's output pool
+    gauge: Option<Arc<AtomicU64>>,
     peak: AtomicU64,
     waits: AtomicU64,
     overshoots: AtomicU64,
@@ -178,6 +180,15 @@ impl MemoryBudget {
     /// `leaf_reserve` bytes stay out of admission's reach so per-value
     /// leaf acquires under held admission permits always complete
     pub fn with_leaf_reserve(total: usize, leaf_reserve: usize) -> Self {
+        Self::build(total, leaf_reserve, None)
+    }
+
+    /// [`Self::with_leaf_reserve`] also mirroring held bytes into `gauge`
+    pub fn gauged(total: usize, leaf_reserve: usize, gauge: Arc<AtomicU64>) -> Self {
+        Self::build(total, leaf_reserve, Some(gauge))
+    }
+
+    fn build(total: usize, leaf_reserve: usize, gauge: Option<Arc<AtomicU64>>) -> Self {
         let total = total.min(MAX_BYTES);
         let admission_max = total.saturating_sub(leaf_reserve);
         Self {
@@ -194,6 +205,7 @@ impl MemoryBudget {
                     leaf_reserve.min(total)
                 },
                 cur: AtomicU64::new(0),
+                gauge,
                 peak: AtomicU64::new(0),
                 waits: AtomicU64::new(0),
                 overshoots: AtomicU64::new(0),
@@ -206,6 +218,11 @@ impl MemoryBudget {
 
     pub fn total(&self) -> usize {
         self.inner.total
+    }
+
+    /// Bytes admission can hold, `total` minus leaf reserve
+    pub fn admission_max(&self) -> usize {
+        self.inner.admission_max
     }
 
     /// Share a single leaf acquire waits on: the reserve on a mixed pool,
@@ -369,6 +386,16 @@ impl Inner {
     fn meter(&self, bytes: u64) {
         let now = self.cur.fetch_add(bytes, Ordering::Relaxed) + bytes;
         self.peak.fetch_max(now, Ordering::Relaxed);
+        if let Some(g) = &self.gauge {
+            g.fetch_add(bytes, Ordering::Relaxed);
+        }
+    }
+
+    fn unmeter(&self, bytes: u64) {
+        self.cur.fetch_sub(bytes, Ordering::Relaxed);
+        if let Some(g) = &self.gauge {
+            g.fetch_sub(bytes, Ordering::Relaxed);
+        }
     }
 
     /// Atomically reserve `want` if capacity is available and queues in
@@ -571,16 +598,27 @@ impl MemoryPermit {
             freed |= BIG_FREE;
         }
         self.inner.release(freed);
-        self.inner
-            .cur
-            .fetch_sub(self.bytes - bytes, Ordering::Relaxed);
+        self.inner.unmeter(self.bytes - bytes);
+        self.bytes = bytes;
+    }
+
+    /// Set held bytes to `bytes` once known: shrink, or account growth past
+    /// what was reserved as overshoot. Growth never waits, so an owner can
+    /// always finish output it already started
+    pub fn settle(&mut self, bytes: u64) {
+        if bytes <= self.bytes {
+            self.shrink(bytes);
+            return;
+        }
+        self.inner.overshoots.fetch_add(1, Ordering::Relaxed);
+        self.inner.meter(bytes - self.bytes);
         self.bytes = bytes;
     }
 }
 
 impl Drop for MemoryPermit {
     fn drop(&mut self) {
-        self.inner.cur.fetch_sub(self.bytes, Ordering::Relaxed);
+        self.inner.unmeter(self.bytes);
         let big = if self.big_leaf { BIG_FREE } else { 0 };
         self.inner
             .release(word(self.units, self.admission_units) | big);
@@ -893,6 +931,26 @@ mod tests {
         drop(q);
         drop(p);
         assert_eq!(b.resident_bytes(), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn settle_grows_unmetered_and_gauge_sums_pools() {
+        let gauge = Arc::new(AtomicU64::new(0));
+        let a = MemoryBudget::gauged(64 << 10, 16 << 10, gauge.clone());
+        let b = MemoryBudget::gauged(64 << 10, 0, gauge.clone());
+        let mut p = a.admit(32 << 10).await;
+        let q = b.acquire(8 << 10).await;
+        assert_eq!(gauge.load(Ordering::Relaxed), 40 << 10);
+        // Growth past admission keeps admission units free for others
+        p.settle(48 << 10);
+        assert_eq!(a.overshoots_total(), 1);
+        assert_eq!(a.resident_bytes(), 48 << 10);
+        assert!(a.try_admit(16 << 10).is_some());
+        p.settle(4 << 10);
+        assert_eq!(a.resident_bytes(), 4 << 10);
+        assert!(a.try_admit(44 << 10).is_some());
+        drop((p, q));
+        assert_eq!(gauge.load(Ordering::Relaxed), 0);
     }
 
     /// Allow only one large value above reserve at a time

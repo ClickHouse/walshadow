@@ -367,6 +367,11 @@ impl AckHandle {
             buffered_events: None,
         }
     }
+
+    /// [`SeqAlloc::place`] from a task other than the allocator's
+    pub fn place(&self, OpenSeq(seq): OpenSeq, rows: u64) {
+        let _ = self.tx.send(AckEvent::Placed { seq, rows });
+    }
 }
 
 /// Whether a done seq advances `emitter_ack` to its `commit_lsn`

@@ -67,7 +67,7 @@ pub use backfill::{
 #[doc(hidden)]
 pub use catalog::{desc_log, pending, shadow, shadow_catalog, type_bridge};
 #[doc(hidden)]
-pub use decode::{codecs, decoder_sink, fpi, heap_decoder, visibility, wal_xact};
+pub use decode::{codecs, datum, decoder_sink, fpi, heap_decoder, visibility, wal_xact};
 #[doc(hidden)]
 pub use emit::{ch_ddl, ch_emitter, pipeline};
 #[doc(hidden)]

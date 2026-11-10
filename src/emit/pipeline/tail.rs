@@ -13,7 +13,6 @@
 
 use std::sync::Arc;
 
-use clickhouse_c::Allocator;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::task::AbortOnDropHandle;
 
@@ -23,6 +22,7 @@ use crate::config::ResolvedConfig;
 use crate::emit::ch_emitter::EmitterStats;
 use crate::emit::pipeline::ack::{self, AckHandle};
 use crate::emit::pipeline::batcher::{self, BatcherConfig, BatcherMsg, InsertBatch};
+use crate::emit::pipeline::encode::EncodedRun;
 use crate::emit::pipeline::inserter;
 use crate::emit::pipeline::resolver::{self, ResolvedBatch};
 use crate::emit::pipeline::{DEFAULT_PIPELINE_FLUSH, Fatal};
@@ -213,13 +213,23 @@ pub async fn spawn(
     .await
 }
 
-/// Ack every row of `chunks` as done, one count per seq
-fn swallow(ack: &AckHandle, chunks: impl IntoIterator<Item = batcher::RowChunk>) {
+/// Ack every row of `segments` as done, one count per seq
+fn swallow_segments(ack: &AckHandle, segments: Vec<batcher::PlacedSegment>) {
     let mut counts: HashMap<u64, u64> = HashMap::new();
-    for chunk in chunks {
-        for r in &chunk.rows {
-            *counts.entry(r.seq).or_insert(0) += 1;
+    for s in segments {
+        let rows = s.chunks.iter().map(|c| c.rows() as u64).sum::<u64>();
+        if rows > 0 {
+            *counts.entry(s.seq).or_insert(0) += rows;
         }
+    }
+    ack.swallowed(counts.into_iter().collect());
+}
+
+/// Ack every row an encode job produced
+fn swallow_run(ack: &AckHandle, run: EncodedRun) {
+    let mut counts: HashMap<u64, u64> = HashMap::new();
+    for (seq, rows) in run.chunks.into_iter().flat_map(|(_, seqs)| seqs) {
+        *counts.entry(seq).or_insert(0) += rows;
     }
     ack.swallowed(counts.into_iter().collect());
 }
@@ -233,15 +243,19 @@ pub fn spawn_null(
     emitter_ack: Arc<Monotone<EmitterAck>>,
     fatal: Fatal,
 ) -> (mpsc::Sender<BatcherMsg>, AckHandle, TailParts) {
-    let (ack, collector) = ack::spawn(emitter_ack, fatal);
+    let (ack, collector) = ack::spawn(emitter_ack, fatal.clone());
     let collector = AbortOnDropHandle::new(collector);
     let (msg_tx, mut msg_rx) = mpsc::channel::<BatcherMsg>(256);
     let swallow_ack = ack.clone();
     let batcher = tokio::spawn(async move {
         while let Some(msg) = msg_rx.recv().await {
             match msg {
-                BatcherMsg::Rows(chunk) => swallow(&swallow_ack, [chunk]),
-                BatcherMsg::Chunks(chunks) => swallow(&swallow_ack, chunks),
+                BatcherMsg::Segments(segments) => swallow_segments(&swallow_ack, segments),
+                BatcherMsg::Encoded(job) => match job.await {
+                    Ok(Ok(run)) => swallow_run(&swallow_ack, run),
+                    Ok(Err(e)) => return fatal.set(format!("encode: {e}")),
+                    Err(e) => return fatal.set(format!("encode job: {e}")),
+                },
                 BatcherMsg::FlushAll(reply) => {
                     let _ = reply.send(());
                 }
@@ -256,6 +270,42 @@ pub fn spawn_null(
             batcher: AbortOnDropHandle::new(batcher),
             resolvers: Vec::new(),
             inserters: Vec::new(),
+        },
+    )
+}
+
+/// Batcher whose sealed batches drop on arrival, acked as inserted.
+/// Measures producers and batching without ClickHouse
+#[cfg(any(test, feature = "test-support"))]
+pub fn spawn_discard(
+    cfg: BatcherConfig,
+    stats: Arc<EmitterStats>,
+    fatal: Fatal,
+) -> (mpsc::Sender<BatcherMsg>, AckHandle, TailParts) {
+    let (ack, collector) = ack::spawn(Arc::new(Monotone::default()), fatal.clone());
+    let (msg_tx, msg_rx) = mpsc::channel::<BatcherMsg>(256);
+    let (batches_tx, batches_rx) = async_channel::bounded::<InsertBatch>(4);
+    let budget = resolver::output_pool(
+        cfg.byte_budget,
+        1,
+        false,
+        stats.output_resident_bytes.clone(),
+    );
+    let batcher = batcher::spawn(msg_rx, batches_tx, cfg, budget, fatal, stats, None);
+    let discard_ack = ack.clone();
+    let discard = tokio::spawn(async move {
+        while let Ok(batch) = batches_rx.recv().await {
+            discard_ack.swallowed(batch.per_seq.clone());
+        }
+    });
+    (
+        msg_tx,
+        ack,
+        TailParts {
+            collector: AbortOnDropHandle::new(collector),
+            batcher: AbortOnDropHandle::new(batcher),
+            resolvers: Vec::new(),
+            inserters: vec![AbortOnDropHandle::new(discard)],
         },
     )
 }
@@ -297,16 +347,25 @@ pub async fn spawn_with_config(
 
     // As wide as the bridge: a narrower pool leaves shadow workers idle, a
     // wider one only queues on their sockets
+    let width = oracle.as_ref().map_or(1, |o| o.concurrency());
+    let budget = resolver::output_pool(
+        emitter.byte_budget,
+        width,
+        oracle.is_some(),
+        stats.output_resident_bytes.clone(),
+    );
     let resolvers = resolver::spawn_pool(
-        oracle.as_ref().map_or(1, |o| o.concurrency()),
+        width,
         batches_rx,
         resolved_tx,
         resolver::ResolverOptions {
             oracle,
             retry: emitter.retry.clone(),
+            codec: emitter.compression,
             stats: stats.clone(),
             fatal: fatal.clone(),
             config_rx: config_rx.clone(),
+            budget: budget.clone(),
         },
     );
 
@@ -325,7 +384,7 @@ pub async fn spawn_with_config(
             inserters: n,
             flush_timeout,
         },
-        Allocator::global(&mimalloc::MiMalloc),
+        budget,
         fatal,
         stats.clone(),
         config_rx,
@@ -355,5 +414,49 @@ mod tests {
             .await
             .unwrap();
         drop(ack);
+    }
+
+    #[tokio::test]
+    async fn null_tail_swallows_encoded_runs() {
+        let fatal = Fatal::new();
+        let (tx, ack, parts) = spawn_null(Arc::new(Monotone::default()), fatal.clone());
+        let run = tokio::spawn(async {
+            Ok(EncodedRun {
+                chunks: Vec::new(),
+                permit: None,
+            })
+        });
+        tx.send(BatcherMsg::Encoded(run)).await.unwrap();
+        parts.finish(tx, ack, 0, &fatal).await.unwrap();
+    }
+
+    /// A failed encode job stops the null tail, so a later flush reports the
+    /// job's error rather than a closed channel
+    #[tokio::test]
+    async fn null_tail_fails_on_encode_errors() {
+        let failed = || tokio::spawn(async { Err("boom".to_string()) });
+        let panicked = || tokio::spawn(async { panic!("encoder panicked") });
+        for (job, want) in [(failed(), "encode: boom"), (panicked(), "encode job: ")] {
+            let fatal = Fatal::new();
+            let (tx, ack, parts) = spawn_null(Arc::new(Monotone::default()), fatal.clone());
+            tx.send(BatcherMsg::Encoded(job)).await.unwrap();
+            tx.closed().await;
+            let err = parts.finish(tx, ack, 0, &fatal).await.unwrap_err();
+            assert!(err.starts_with(want), "{err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn discard_tail_finishes_without_clickhouse() {
+        let fatal = Fatal::new();
+        let cfg = BatcherConfig {
+            row_budget: 1024,
+            byte_budget: 1 << 20,
+            inserters: 1,
+            flush_timeout: std::time::Duration::from_secs(1),
+        };
+        let (tx, ack, parts) = spawn_discard(cfg, Arc::default(), fatal.clone());
+        parts.finish(tx, ack, 0, &fatal).await.unwrap();
+        assert!(!fatal.is_set());
     }
 }

@@ -8,7 +8,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use async_trait::async_trait;
-use clickhouse_c::{Allocator, Block, BlockBuilder, ColumnBuilder, Event, TypeAst};
+use clickhouse_c::{
+    Allocator, Block, BlockBuilder, ColumnBuilder, Event, QueryOpts, QuerySetting, TypeAst,
+};
 use futures::stream::StreamExt;
 use thiserror::Error;
 use tokio::sync::Mutex;
@@ -19,8 +21,9 @@ use bytes::Bytes;
 use crate::ch::{
     ChConn, EmitterError, drain_to_end_of_stream, is_retryable, quote_ident, with_timeout,
 };
+use crate::decode::datum::Datum;
 use crate::decode::heap_decoder::{
-    ColumnValue, ToastPointer, VARLENA_EXTSIZE_BITS, VARLENA_EXTSIZE_MASK, decompress_varlena,
+    ToastPointer, VARLENA_EXTSIZE_BITS, VARLENA_EXTSIZE_MASK, decompress_varlena,
 };
 use crate::emit::ch_emitter::{EmitterConfig, EmitterStats, InlineValueOverflow, ToastMode};
 use crate::toast::read_ahead::{PendingReads, ReadValue, retained_bytes};
@@ -39,7 +42,7 @@ pub const CHUNK_PUT_BATCH: usize = 65_536;
 pub const CHUNK_PUT_BYTES: usize = 64 << 20;
 /// Fetch result rows per block: bounds one block's buffer to ~2 MiB at
 /// `TOAST_MAX_CHUNK_SIZE`, ordering validated across block boundaries
-const FETCH_BLOCK_ROWS: usize = 1024;
+const FETCH_BLOCK_ROWS: QuerySetting = QuerySetting::new("max_block_size", "1024");
 const FETCH_QUERY_IDS: usize = 1024;
 
 const CHUNK_ID_INDEX_FP: f64 = 0.000001;
@@ -123,43 +126,20 @@ pub(crate) fn check_value_caps(
     Ok(retained + transient)
 }
 
-/// Convert raw TOAST bytes through inline varlena decoder
-pub(crate) fn detoasted_value(raw: Vec<u8>, type_oid: u32) -> ColumnValue {
-    crate::decode::heap_decoder::varlena_to_value(type_oid, std::borrow::Cow::Owned(raw))
-}
-
-/// [`detoasted_value`] and bytes it holds, `None` unless `fits` admits decode
-/// peak. JSONB and numeric text may outgrow raw, so measure before rendering
+/// Detoasted body as the datum it stands for and bytes it holds, `None`
+/// unless `fits` admits them
 pub(crate) fn detoasted_within(
     raw: Vec<u8>,
-    type_oid: u32,
     fits: impl FnOnce(usize) -> bool,
-) -> Option<(ColumnValue, usize)> {
-    use crate::decode::codecs::{decode_jsonb_with_capacity, jsonb_text_len, numeric_text_len};
-    use crate::schema::{JSONBOID, NUMERICOID};
-    let text_len = match type_oid {
-        JSONBOID => jsonb_text_len(&raw).ok(),
-        NUMERICOID => numeric_text_len(&raw).ok(),
-        _ => None,
-    };
-    if !fits(raw.len().max(text_len.unwrap_or(0))) {
-        return None;
-    }
-    let value = if type_oid == JSONBOID
-        && let Some(len) = text_len
-        && let Ok(text) = decode_jsonb_with_capacity(&raw, len)
-    {
-        ColumnValue::Json(text)
-    } else {
-        detoasted_value(raw, type_oid)
-    };
-    let held = value.approx_bytes();
-    Some((value, held))
+) -> Option<(Datum, usize)> {
+    let held = raw.len();
+    fits(held).then_some((Datum::Varlena(raw), held))
 }
 
 /// [`detoasted_within`] for leaf holders, whose retained bytes settle after
-pub(crate) fn detoasted_sized(raw: Vec<u8>, type_oid: u32) -> (ColumnValue, usize) {
-    detoasted_within(raw, type_oid, |_| true).expect("admits every size")
+pub(crate) fn detoasted_sized(raw: Vec<u8>) -> (Datum, usize) {
+    let held = raw.len();
+    (Datum::Varlena(raw), held)
 }
 
 /// Convert stored bytes to raw bytes using pointer compression method
@@ -789,8 +769,7 @@ impl ClickHouseChunkStore {
              SELECT `blkno`, `offnum`, 0, 0, '', {commit_lsn}, 1\n\
              FROM {table}\n\
              GROUP BY `blkno`, `offnum`\n\
-             HAVING max(`_lsn`) <= {marker_lsn} AND argMax(`_is_deleted`, `_lsn`) = 0\n\
-             SETTINGS optimize_aggregation_in_order = 1"
+             HAVING max(`_lsn`) <= {marker_lsn} AND argMax(`_is_deleted`, `_lsn`) = 0"
         )
     }
 
@@ -823,8 +802,7 @@ impl ClickHouseChunkStore {
              )\n\
              WHERE `chunk_id` IN ({ids}) AND `dead` = 0\n\
              GROUP BY `chunk_id`, `chunk_seq`\n\
-             ORDER BY `chunk_id`, `chunk_seq`\n\
-             SETTINGS max_block_size = {FETCH_BLOCK_ROWS}"
+             ORDER BY `chunk_id`, `chunk_seq`"
         )
     }
 
@@ -832,6 +810,7 @@ impl ClickHouseChunkStore {
         &self,
         state: &mut ChState,
         sql: &str,
+        opts: &QueryOpts<'_>,
         bb: Option<&BlockBuilder<'_>>,
     ) -> Result<(), EmitterError> {
         let insert_timeout = self.dest.current().insert_timeout;
@@ -841,9 +820,9 @@ impl ClickHouseChunkStore {
                 |e| is_retryable(e) && !is_missing_mirror(e),
                 |mut client| async move {
                     let result = with_timeout(insert_timeout, async {
-                        client.send_query(sql, None).await?;
+                        client.send_query(sql, opts).await?;
                         if let Some(bb) = bb {
-                            client.send_data(Some(bb)).await?;
+                            client.send_data(bb).await?;
                             client.send_data_end().await?;
                         }
                         drain_to_end_of_stream(&mut client).await?;
@@ -868,7 +847,8 @@ impl ClickHouseChunkStore {
         for ((db_oid, relid), group) in by_mirror {
             if !state.created.contains(&(db_oid, relid)) {
                 let create = self.create_sql(db_oid, relid);
-                self.exec_write(state, &create, None).await?;
+                self.exec_write(state, &create, &QueryOpts::new(), None)
+                    .await?;
                 state.created.insert((db_oid, relid));
             }
             let n = group.len();
@@ -916,7 +896,8 @@ impl ClickHouseChunkStore {
             bb.append("_lsn", u64_ast.view(), &lsn_col)?;
             bb.append("_is_deleted", u8_ast.view(), &is_deleted_col)?;
             let insert = self.insert_sql(db_oid, relid);
-            self.exec_write(state, &insert, Some(&bb)).await?;
+            self.exec_write(state, &insert, &QueryOpts::new(), Some(&bb))
+                .await?;
         }
         Ok(())
     }
@@ -925,6 +906,7 @@ impl ClickHouseChunkStore {
         &self,
         state: &mut ChState,
         sql: &str,
+        opts: &QueryOpts<'_>,
         parse: impl Fn(&Block, &mut A) -> Result<(), EmitterError>,
     ) -> Result<A, EmitterError> {
         let insert_timeout = self.dest.current().insert_timeout;
@@ -934,7 +916,7 @@ impl ClickHouseChunkStore {
                 |e| is_retryable(e) && !is_missing_mirror(e),
                 |mut client| async {
                     let result = with_timeout(insert_timeout, async {
-                        client.send_query(sql, None).await?;
+                        client.send_query(sql, opts).await?;
                         let mut out = A::default();
                         loop {
                             match client.recv_event().await? {
@@ -972,7 +954,8 @@ impl ClickHouseChunkStore {
     ) -> Result<HashMap<u32, ChunkAssembler>, ChunkStoreError> {
         let sql = self.fetch_sql(db_oid, toast_relid, ids, max_lsn);
         let mut state = self.slot().await;
-        self.query_locked(&mut state, &sql, |block, out| {
+        let opts = QueryOpts::new().settings(&[FETCH_BLOCK_ROWS]);
+        self.query_locked(&mut state, &sql, &opts, |block, out| {
             read_value_block(block, expected, out)
         })
         .await
@@ -1105,7 +1088,7 @@ impl ChunkStore for ClickHouseChunkStore {
     async fn truncate_mirror(&self, db_oid: u32, toast_relid: u32) -> Result<(), ChunkStoreError> {
         let sql = self.truncate_sql(db_oid, toast_relid);
         let mut state = self.slot_for(toast_relid).await;
-        self.exec_write(&mut state, &sql, None)
+        self.exec_write(&mut state, &sql, &QueryOpts::new(), None)
             .await
             .map_err(|e| ChunkStoreError::Clickhouse(e.to_string()))
     }
@@ -1119,7 +1102,9 @@ impl ChunkStore for ClickHouseChunkStore {
     ) -> Result<(), ChunkStoreError> {
         let sql = self.rewrite_barrier_sql(db_oid, toast_relid, marker_lsn, commit_lsn);
         let mut state = self.slot_for(toast_relid).await;
-        match self.exec_write(&mut state, &sql, None).await {
+        let in_order = [QuerySetting::new("optimize_aggregation_in_order", "1")];
+        let opts = QueryOpts::new().settings(&in_order);
+        match self.exec_write(&mut state, &sql, &opts, None).await {
             Ok(()) => Ok(()),
             // Never-populated mirror: no table, nothing lived, nothing to
             // tombstone
@@ -1369,7 +1354,7 @@ impl ToastResolver {
         Some(self.ahead.as_ref()?.lock().expect("pending reads"))
     }
 
-    pub fn read_ahead(&self, db_oid: u32, p: ToastPointer, type_oid: u32, lsn: u64) {
+    pub fn read_ahead(&self, db_oid: u32, p: ToastPointer, lsn: u64) {
         if self.value_oversize(&p) {
             return;
         }
@@ -1382,14 +1367,13 @@ impl ToastResolver {
             ahead: None,
             ..self.clone()
         };
-        pending.reserve(db_oid, &p, type_oid, lsn, |mut permit| async move {
+        pending.reserve(db_oid, &p, lsn, |mut permit| async move {
             this.stats
                 .toast_values_read_ahead
                 .fetch_add(1, Ordering::Relaxed);
             let raw = this.read_raw(db_oid, p, lsn).await?;
-            // Rendering may expand past fetch transients
-            let fits = |rendered: usize| {
-                let need = retained_bytes(rendered, &p);
+            let fits = |held: usize| {
+                let need = retained_bytes(held, &p);
                 if need > permit.bytes() {
                     let Some(more) = budget.try_speculate((need - permit.bytes()) as usize) else {
                         return false;
@@ -1398,7 +1382,7 @@ impl ToastResolver {
                 }
                 true
             };
-            let (value, held) = detoasted_within(raw, type_oid, fits)?;
+            let (value, held) = detoasted_within(raw, fits)?;
             permit.shrink(retained_bytes(held, &p));
             Some(ReadValue { value, permit })
         });
@@ -1421,38 +1405,27 @@ impl ToastResolver {
         finish_value(&p, stored).ok()
     }
 
-    pub async fn fill_ahead(
+    /// Speculative read of `p` started ahead of planning, its permit
+    /// absorbed into `permit`
+    pub async fn take_ahead(
         &self,
         db_oid: u32,
-        t: &mut crate::decode::heap_decoder::DecodedTuple,
-        rel: &crate::schema::RelDescriptor,
+        p: &ToastPointer,
         lsn: u64,
         permit: &mut Option<crate::budget::MemoryPermit>,
-    ) {
-        for (col, attr) in t.columns.iter_mut().zip(&rel.attributes) {
-            let Some(ColumnValue::ExternalToast(p)) = col else {
-                continue;
-            };
-            let Some(slot) = self
-                .pending()
-                .and_then(|mut c| c.take(db_oid, p, attr.type_oid, lsn))
-            else {
-                continue;
-            };
-            let started = std::time::Instant::now();
-            let value = slot.take().await;
-            self.stats
-                .toast_value_wait_nanos
-                .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
-            if let Some(ReadValue {
-                value,
-                permit: read,
-            }) = value
-            {
-                crate::budget::absorb_into(permit, read);
-                *col = Some(value);
-            }
-        }
+    ) -> Option<Datum> {
+        let slot = self.pending().and_then(|mut c| c.take(db_oid, p, lsn))?;
+        let started = std::time::Instant::now();
+        let value = slot.take().await;
+        self.stats
+            .toast_value_wait_nanos
+            .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        let ReadValue {
+            value,
+            permit: read,
+        } = value?;
+        crate::budget::absorb_into(permit, read);
+        Some(value)
     }
 
     pub fn forget_reads<'a>(&self, keys: impl IntoIterator<Item = &'a (u32, u32)>) {
@@ -1497,14 +1470,13 @@ impl ToastResolver {
         pointer_footprint(p) > self.inline_value_max
     }
 
-    /// Replace an oversized value in place, counting the fill. True when the
-    /// pointer is settled and needs no fetch
-    pub fn fill_oversize(&self, col: &mut Option<ColumnValue>, p: &ToastPointer) -> bool {
+    /// Whether an oversized value fills NULL, counting the fill. True when
+    /// the pointer is settled and needs no fetch
+    pub fn fills_oversize(&self, p: &ToastPointer) -> bool {
         if !self.value_oversize(p) {
             return false;
         }
         self.note_filled_oversize();
-        *col = Some(ColumnValue::Null);
         true
     }
 
@@ -1922,6 +1894,7 @@ mod tests {
     }
 
     use super::*;
+    use crate::decode::datum::build;
     use crate::emit::ch_emitter::InstanceConfig;
     use std::time::Duration;
 
@@ -2749,7 +2722,6 @@ mod tests {
                 va_valueid: 7,
                 va_toastrelid: 16500,
             },
-            crate::schema::TEXTOID,
             0x2000,
         );
         // Store read misses within same poll on current_thread runtime
@@ -2955,8 +2927,7 @@ mod tests {
              SELECT `blkno`, `offnum`, 0, 0, '', 16384, 1\n\
              FROM `wh`.`pg_toast_5_16500`\n\
              GROUP BY `blkno`, `offnum`\n\
-             HAVING max(`_lsn`) <= 8192 AND argMax(`_is_deleted`, `_lsn`) = 0\n\
-             SETTINGS optimize_aggregation_in_order = 1"
+             HAVING max(`_lsn`) <= 8192 AND argMax(`_is_deleted`, `_lsn`) = 0"
         );
 
         assert_eq!(
@@ -2979,8 +2950,7 @@ mod tests {
              )\n\
              WHERE `chunk_id` IN (7, 9) AND `dead` = 0\n\
              GROUP BY `chunk_id`, `chunk_seq`\n\
-             ORDER BY `chunk_id`, `chunk_seq`\n\
-             SETTINGS max_block_size = 1024"
+             ORDER BY `chunk_id`, `chunk_seq`"
         );
     }
 
@@ -3010,7 +2980,6 @@ mod tests {
                     va_valueid: id,
                     va_toastrelid: 16500,
                 },
-                crate::schema::TEXTOID,
                 0x100,
             );
             tokio::task::yield_now().await;
@@ -3065,7 +3034,7 @@ mod tests {
                 .with_budget(budget.clone())
                 .with_read_ahead();
             for id in 1..=2 {
-                resolver.read_ahead(0, pointer(id), crate::schema::TEXTOID, 1);
+                resolver.read_ahead(0, pointer(id), 1);
             }
             tokio::time::timeout(std::time::Duration::from_secs(1), async {
                 while stats.toast_values_read_ahead.load(Ordering::Relaxed) != 2
@@ -3078,13 +3047,9 @@ mod tests {
             .unwrap();
             assert!(budget.resident_bytes() > 0);
             let next = pointer(3);
-            resolver.read_ahead(0, next, crate::schema::TEXTOID, 2);
+            resolver.read_ahead(0, next, 2);
             assert!(
-                resolver
-                    .pending()
-                    .unwrap()
-                    .take(0, &next, crate::schema::TEXTOID, 2)
-                    .is_none(),
+                resolver.pending().unwrap().take(0, &next, 2).is_none(),
                 "unconsumed slots exhaust admission"
             );
             let leaf = budget.acquire(2048).await;
@@ -3098,7 +3063,7 @@ mod tests {
             drop(leaf);
             assert_eq!(budget.resident_bytes(), 0);
             assert!(budget.peak_bytes() <= budget.total() as u64);
-            resolver.read_ahead(0, next, crate::schema::TEXTOID, 2);
+            resolver.read_ahead(0, next, 2);
             tokio::time::timeout(std::time::Duration::from_secs(1), async {
                 while stats.toast_values_read_ahead.load(Ordering::Relaxed) != 3 {
                     tokio::task::yield_now().await;
@@ -3106,20 +3071,13 @@ mod tests {
             })
             .await
             .expect("read ahead resumes after foreground reclaim");
-            assert!(
-                resolver
-                    .pending()
-                    .unwrap()
-                    .take(0, &next, crate::schema::TEXTOID, 2)
-                    .is_some()
-            );
+            assert!(resolver.pending().unwrap().take(0, &next, 2).is_some());
         }
     }
 
-    /// Escaped JSON renders to six bytes per control byte, past fetch transients,
-    /// into exactly the capacity admitted ahead of rendering
+    /// Values read ahead hold their stored bytes, whatever their type renders to
     #[tokio::test(flavor = "current_thread")]
-    async fn rendered_growth_tops_up_or_discards_read() {
+    async fn read_ahead_holds_stored_bytes() {
         struct Store(Vec<u8>);
         #[async_trait]
         impl ChunkStore for Store {
@@ -3142,30 +3100,23 @@ mod tests {
             va_valueid: 1,
             va_toastrelid: 16500,
         };
-        for (total, fits) in [(1 << 20, true), (64 << 10, false)] {
-            let budget = crate::budget::MemoryBudget::with_leaf_reserve(total, 32 << 10);
-            let r = ToastResolver::with_store(
-                Arc::new(Store(body.clone())),
-                Arc::new(EmitterStats::default()),
-            )
-            .with_budget(budget.clone())
-            .with_read_ahead();
-            r.read_ahead(0, p, crate::schema::JSONBOID, 1);
-            for _ in 0..8 {
-                tokio::task::yield_now().await;
-            }
-            let slot = r.pending().unwrap().take(0, &p, crate::schema::JSONBOID, 1);
-            let read = slot.unwrap().take().await;
-            assert_eq!(read.is_some(), fits);
-            if let Some(ReadValue { value, permit }) = read {
-                let ColumnValue::Json(s) = value else {
-                    panic!("jsonb renders as Json, got {value:?}");
-                };
-                assert_eq!((s.len(), s.capacity()), (24578, 24578));
-                assert!(permit.bytes() >= 2 * 24578);
-            }
-            assert_eq!(budget.resident_bytes(), 0);
+        let budget = crate::budget::MemoryBudget::with_leaf_reserve(1 << 20, 32 << 10);
+        let r = ToastResolver::with_store(
+            Arc::new(Store(body.clone())),
+            Arc::new(EmitterStats::default()),
+        )
+        .with_budget(budget.clone())
+        .with_read_ahead();
+        r.read_ahead(0, p, 1);
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
         }
+        let slot = r.pending().unwrap().take(0, &p, 1);
+        let ReadValue { value, permit } = slot.unwrap().take().await.expect("read fits");
+        assert_eq!(value, build::bytes(&body));
+        assert!(permit.bytes() >= body.len() as u64);
+        drop(permit);
+        assert_eq!(budget.resident_bytes(), 0);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -3185,7 +3136,6 @@ mod tests {
                 va_valueid: 1,
                 va_toastrelid: 16500,
             },
-            crate::schema::TEXTOID,
             1,
         );
         while stats.toast_values_read_ahead.load(Ordering::Relaxed) == 0 {

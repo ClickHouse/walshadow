@@ -21,15 +21,17 @@ use std::path::PathBuf;
 use tokio::fs::OpenOptions;
 use tokio::io::AsyncSeekExt;
 
-use crate::backfill::backup_page_walk::BackfillTuple;
+use crate::backfill::backup_page_walk::{BackfillTuple, TupleData};
+use crate::backfill::copy_backfill::CopyRow;
+use crate::decode::visibility::PendingXids;
 use crate::xact::spill::{
-    ChunkReader, ChunkWriter, Cursor, IO_CHUNK, SpillError, decode_value, encode_value, push_u8,
-    push_u16, push_u32, push_u64,
+    ChunkReader, ChunkWriter, Cursor, IO_CHUNK, SpillError, push_u8, push_u16, push_u32, push_u64,
 };
 use walrus::pg::walparser::RelFileNode;
 
 const SPOOL_MAGIC: [u8; 2] = *b"WD";
-const SPOOL_VERSION: u16 = 2;
+/// v3 carries tuple bytes instead of decoded cells
+const SPOOL_VERSION: u16 = 3;
 /// Default in-memory prefix budget before records spill to file
 pub const DEFERRED_SPOOL_MEM_MAX: usize = 8 << 20;
 
@@ -468,14 +470,11 @@ fn truncated() -> SpillError {
 }
 
 pub(crate) fn approx_bytes(value: &BackfillTuple) -> usize {
-    std::mem::size_of::<BackfillTuple>()
-        + value
-            .columns
-            .iter()
-            .flatten()
-            .map(crate::decode::heap_decoder::ColumnValue::approx_bytes)
-            .sum::<usize>()
+    std::mem::size_of::<BackfillTuple>() + value.data.len()
 }
+
+const DATA_HEAP: u8 = 0;
+const DATA_COPY: u8 = 1;
 
 fn encode_record(value: &BackfillTuple, out: &mut Vec<u8>) {
     push_u32(out, value.rfn.spc_node);
@@ -488,16 +487,21 @@ fn encode_record(value: &BackfillTuple, out: &mut Vec<u8>) {
     push_u64(out, value.page_lsn);
     push_u32(out, value.blkno);
     push_u16(out, value.offnum);
-    push_u32(out, value.columns.len() as u32);
-    for col in &value.columns {
-        match col {
-            None => push_u8(out, 0),
-            Some(v) => {
-                push_u8(out, 1);
-                encode_value(out, v);
-            }
+    match value.pending {
+        None => push_u8(out, 0),
+        Some(p) => {
+            push_u8(out, 1);
+            push_u32(out, p.insert);
+            push_u32(out, p.delete);
         }
     }
+    let (tag, bytes) = match &value.data {
+        TupleData::Heap(b) => (DATA_HEAP, &b[..]),
+        TupleData::Copy(r) => (DATA_COPY, r.bytes()),
+    };
+    push_u8(out, tag);
+    push_u32(out, bytes.len() as u32);
+    out.extend_from_slice(bytes);
 }
 
 fn decode_record(buf: &[u8]) -> Result<BackfillTuple> {
@@ -514,14 +518,33 @@ fn decode_record(buf: &[u8]) -> Result<BackfillTuple> {
     let page_lsn = c.u64()?;
     let blkno = c.u32()?;
     let offnum = c.u16()?;
-    let ncols = c.u32()? as usize;
-    let mut columns = Vec::with_capacity(ncols);
-    for _ in 0..ncols {
-        columns.push(match c.u8()? {
-            0 => None,
-            _ => Some(decode_value(c)?),
-        });
-    }
+    let pending = match c.u8()? {
+        0 => None,
+        _ => Some(PendingXids {
+            insert: c.u32()?,
+            delete: c.u32()?,
+        }),
+    };
+    let tag = c.u8()?;
+    let len = c.u32()? as usize;
+    let bytes: Box<[u8]> = c.need(len)?.into();
+    let data = match tag {
+        DATA_HEAP => TupleData::Heap(bytes),
+        DATA_COPY => {
+            TupleData::Copy(
+                CopyRow::from_bytes(bytes).ok_or_else(|| SpillError::Format {
+                    offset: 0,
+                    detail: "malformed COPY row".into(),
+                })?,
+            )
+        }
+        tag => {
+            return Err(SpillError::Format {
+                offset: 0,
+                detail: format!("unknown tuple data tag {tag}"),
+            });
+        }
+    };
     Ok(BackfillTuple {
         rfn,
         xid,
@@ -531,14 +554,15 @@ fn decode_record(buf: &[u8]) -> Result<BackfillTuple> {
         page_lsn,
         blkno,
         offnum,
-        columns,
+        data,
+        pending,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::decode::heap_decoder::ColumnValue;
+    use crate::decode::datum::build;
     use tempfile::tempdir;
     use tokio::io::AsyncWriteExt;
 
@@ -635,12 +659,60 @@ mod tests {
             page_lsn: lsn + 0x100,
             blkno: 3,
             offnum: 7,
-            columns: vec![
-                Some(ColumnValue::Int4(1)),
-                None,
-                Some(ColumnValue::Bytea(payload.to_vec())),
-            ],
+            data: TupleData::from_cells(&[Some(build::int4(1)), None, Some(build::bytes(payload))]),
+            pending: None,
         }
+    }
+
+    /// COPY rows and pending xids survive the file round trip
+    #[tokio::test]
+    async fn file_records_keep_copy_rows_and_pending_xids() {
+        let dir = tempdir().unwrap();
+        let mut spool = DeferredSpool::new(dir.path().join("copy.bin"), 0);
+        let row = CopyRow::new(&[Some(&7i32.to_be_bytes()[..]), None, Some(b"abc")]);
+        let mut copy = tuple(1, b"");
+        copy.data = TupleData::Copy(row.clone());
+        let mut pending = tuple(2, b"xyz");
+        pending.pending = Some(PendingXids {
+            insert: 11,
+            delete: 12,
+        });
+        spool.push(copy).await.unwrap();
+        spool.push(pending.clone()).await.unwrap();
+        assert_eq!(spool.resident_bytes(), 0);
+        let out = drain_all(spool).await;
+        assert_eq!(out[0].data, TupleData::Copy(row.clone()));
+        assert_eq!(out[0].pending, None);
+        assert_eq!(out[1].data, pending.data);
+        assert_eq!(out[1].pending, pending.pending);
+        assert_eq!(row.field(0), Some(&7i32.to_be_bytes()[..]));
+        assert_eq!(
+            (row.field(1), row.field(2), row.field(3)),
+            (None, Some(&b"abc"[..]), None)
+        );
+    }
+
+    /// `typsend` fields keep their mark across the file, so they still read
+    /// as oracle binary input
+    #[tokio::test]
+    async fn file_records_keep_send_fields() {
+        use crate::backfill::copy_backfill::{WireKind, copy_slot};
+        use crate::decode::datum::DatumRef;
+        let dir = tempdir().unwrap();
+        let mut spool = DeferredSpool::new(dir.path().join("send.bin"), 0);
+        let kinds = [WireKind::Int4, WireKind::Send, WireKind::Send];
+        let fields: [Option<&[u8]>; 3] = [Some(&7i32.to_be_bytes()), Some(b"\x01send"), None];
+        let mut copy = tuple(1, b"");
+        copy.data = TupleData::Copy(CopyRow::from_send(&kinds, &fields).unwrap());
+        spool.push(copy.clone()).await.unwrap();
+        let out = drain_all(spool).await;
+        assert_eq!(out[0].data, copy.data);
+        let TupleData::Copy(row) = &out[0].data else {
+            unreachable!("COPY row")
+        };
+        let rel = crate::schema::int4_rel(16400, "t", 'r', &[(1, "id"), (2, "e"), (3, "f")]);
+        assert_eq!(copy_slot(row, &rel, 1), DatumRef::Send(b"\x01send"));
+        assert_eq!(copy_slot(row, &rel, 2), DatumRef::Null);
     }
 
     #[tokio::test]
@@ -776,7 +848,7 @@ mod tests {
         let out = drain_all(spool).await;
         assert_eq!(out.len(), 10);
         assert_eq!(out[3].source_lsn, 0x1003);
-        assert_eq!(out[3].columns[2], Some(ColumnValue::Bytea(b"abc".to_vec())));
+        assert_eq!(out[3].data, tuple(0, b"abc").data);
     }
 
     #[tokio::test(flavor = "current_thread")]

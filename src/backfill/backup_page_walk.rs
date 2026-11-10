@@ -1,5 +1,5 @@
 //! Page-walk Tap sink. Decodes user-heap tar entries through the same
-//! heap decoder the WAL hot path uses (`decode_block_data`).
+//! heap decoder the WAL hot path uses (`view_block_data`).
 //! See [architecture/bootstrap.md](../../architecture/bootstrap.md).
 //!
 //! ## V1 limits
@@ -27,12 +27,15 @@ use walrus::pg::walparser::{Oid, RelFileNode};
 use crate::backfill::backup_source::{
     BackupSink, EntrySink, FileAction, FileKind, FileMeta, StartInfo,
 };
+use crate::backfill::copy_backfill::CopyRow;
 use crate::backfill::pg_path::{BaseRelFile, RelFork, parse_base_path};
 use crate::backfill::walk_barrier::WalkBarrier;
-use crate::decode::heap_decoder::{
-    ColumnValue, CommittedTuple, DecodeError, DecodedHeap, DecodedTuple, HeapOp, decode_block_data,
+use crate::decode::heap_decoder::{DecodeError, TupleView, view_block_data};
+use crate::decode::visibility::{
+    PendingXids, PgMultiXactAccum, PgXactAccum, PgXactView, SealedPatch,
 };
-use crate::decode::visibility::{PgMultiXactAccum, PgXactAccum, PgXactView, SealedPatch};
+#[cfg(any(test, feature = "test-support"))]
+use crate::decode::{datum::Datum, heap_decoder::decode_block_data};
 use crate::schema::RelDescriptor;
 use foldhash::{HashMap, HashMapExt, HashSet};
 
@@ -80,8 +83,8 @@ pub enum PageWalkError {
     },
 }
 
-/// One decoded tuple from a backup page; a synthetic INSERT at
-/// `_lsn = start_lsn`.
+/// One tuple from a backup page or COPY; a synthetic INSERT at
+/// `_lsn = start_lsn`. Carries row bytes, decoded only at encode
 #[derive(Debug, Clone)]
 pub struct BackfillTuple {
     pub rfn: RelFileNode,
@@ -100,38 +103,57 @@ pub struct BackfillTuple {
     /// ([`crate::toast::ToastRow`])
     pub blkno: u32,
     pub offnum: u16,
-    /// Attnum-1 indexed, matching `RelDescriptor.attributes`
-    pub columns: Vec<Option<ColumnValue>>,
+    pub data: TupleData,
+    /// Xids an undecided row waits on, set once it enters a pending table
+    pub pending: Option<PendingXids>,
+}
+
+/// Row bytes of a [`BackfillTuple`]
+#[derive(Debug, Clone, PartialEq)]
+pub enum TupleData {
+    /// On-page tuple from `t_infomask2` on: the `block.data` shape heap
+    /// decode reads
+    Heap(Box<[u8]>),
+    Copy(CopyRow),
+}
+
+impl TupleData {
+    /// Heap image of `values`, see
+    /// [`form_block_data`](crate::decode::heap_decoder::form_block_data)
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn from_cells(values: &[Option<Datum>]) -> Self {
+        Self::Heap(crate::decode::heap_decoder::form_block_data(&[], values).into())
+    }
+
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Heap(b) => b.len(),
+            Self::Copy(r) => r.bytes().len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 impl BackfillTuple {
-    pub fn has_mapped_external(&self, mapping: &crate::mapping::TableMapping) -> bool {
-        mapping.columns.iter().any(|c| {
-            usize::try_from(i32::from(c.src_attnum) - 1)
-                .ok()
-                .and_then(|i| self.columns.get(i))
-                .is_some_and(|v| matches!(v, Some(ColumnValue::ExternalToast(_))))
-        })
+    /// Tuple image in place; `None` for COPY rows
+    pub fn view<'a>(&'a self, rel: &RelDescriptor) -> Result<Option<TupleView<'a>>, DecodeError> {
+        match &self.data {
+            TupleData::Heap(b) => view_block_data(b, rel).map(Some),
+            TupleData::Copy(_) => Ok(None),
+        }
     }
 
-    /// start_lsn rides as both source_lsn and commit_lsn so
-    /// ReplacingMergeTree(_lsn) collapses duplicates the WAL decoder
-    /// re-emits for records in [start_lsn, end_lsn]
-    pub fn into_committed_insert(self) -> CommittedTuple {
-        CommittedTuple {
-            decoded: DecodedHeap {
-                rfn: self.rfn,
-                xid: self.xid,
-                source_lsn: self.source_lsn,
-                op: HeapOp::Insert,
-                new: Some(DecodedTuple {
-                    columns: self.columns,
-                    partial: false,
-                }),
-                old: None,
-            },
-            commit_ts: 0,
-            commit_lsn: self.source_lsn,
+    /// Owned cells, attnum-1 indexed
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn cells(&self, rel: &RelDescriptor) -> Result<Vec<Option<Datum>>, String> {
+        match &self.data {
+            TupleData::Heap(b) => decode_block_data(b, rel)
+                .map(|t| t.columns)
+                .map_err(|e| e.to_string()),
+            TupleData::Copy(row) => Ok(crate::backfill::copy_backfill::copy_cells(row, rel)),
         }
     }
 }
@@ -321,19 +343,20 @@ impl<'a> PageWalker<'a> {
                 continue;
             }
             let tuple_bytes = &page[lp_off..lp_off + lp_len];
-            match decode_on_page_tuple(tuple_bytes, self.rel) {
-                Some((xid, xmax, infomask, columns)) => {
+            match on_page_tuple(tuple_bytes, self.rel) {
+                Some((header, data)) => {
                     out.push(BackfillTuple {
                         rfn: self.rel.rfn,
-                        xid,
-                        xmax,
-                        infomask,
+                        xid: header.xmin,
+                        xmax: header.xmax,
+                        infomask: header.infomask,
                         source_lsn: self.source_lsn,
                         page_lsn,
                         blkno: block_no,
                         // OffsetNumber is 1-based (PG off/itemid.h)
                         offnum: (i + 1) as u16,
-                        columns,
+                        data: TupleData::Heap(data.into()),
+                        pending: None,
                     });
                     tally.tuples_emitted += 1;
                 }
@@ -396,42 +419,60 @@ pub(crate) fn toast_rows_from_page(
 ) -> Vec<crate::toast::ToastRow> {
     let mut rows = Vec::new();
     for offnum in 1..=page_max_offnum(page) {
-        let Some(tuple) = page_tuple_bytes(page, offnum) else {
-            continue;
-        };
-        let Some((_, _, _, mut columns)) = decode_on_page_tuple(tuple, rel) else {
-            continue;
-        };
-        let Some((chunk_id, chunk_seq, chunk_data)) =
-            crate::decode::heap_decoder::take_toast_chunk_columns(&mut columns)
+        let Some((_, data)) = page_tuple_bytes(page, offnum).and_then(|t| on_page_tuple(t, rel))
         else {
             continue;
         };
-        rows.push(crate::toast::ToastRow {
-            db_oid: rel.rfn.db_node,
-            toast_relid: rel.oid,
-            blkno,
-            offnum,
-            chunk_id,
-            chunk_seq,
-            chunk_data: bytes::Bytes::from(chunk_data),
-            lsn,
-        });
+        let Some(row) = toast_row(data, rel, blkno, offnum, lsn) else {
+            continue;
+        };
+        rows.push(row);
     }
     rows
 }
 
-/// Decode one on-page tuple into `(xmin, xmax, infomask, columns)`.
+/// Chunk row of one `pg_toast_*` tuple's `block.data` image
+pub(crate) fn toast_row(
+    data: &[u8],
+    rel: &RelDescriptor,
+    blkno: u32,
+    offnum: u16,
+    lsn: u64,
+) -> Option<crate::toast::ToastRow> {
+    let view = view_block_data(data, rel).ok()?;
+    let (chunk_id, chunk_seq, chunk_data) =
+        crate::decode::heap_decoder::toast_chunk_datums(&view.datums)?;
+    Some(crate::toast::ToastRow {
+        db_oid: rel.rfn.db_node,
+        toast_relid: rel.oid,
+        blkno,
+        offnum,
+        chunk_id,
+        chunk_seq,
+        chunk_data: bytes::Bytes::copy_from_slice(chunk_data),
+        lsn,
+    })
+}
+
+/// `HeapTupleHeaderData` fields the gate reads
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct OnPageHeader {
+    pub xmin: u32,
+    pub xmax: u32,
+    pub infomask: u16,
+}
+
+/// Split one on-page tuple into its header fields and `block.data` image.
 /// On-disk shape carries a full `HeapTupleHeaderData` (23 bytes); from
 /// `t_infomask2` on it matches the `xl_heap_header` (5 bytes) shape PG
 /// strips into WAL via
 /// `XLogRegisterBufData(0, tup->t_data + SizeofHeapTupleHeader, ...)`,
 /// so the shared heap decoder reads it in place. `None` on truncated /
-/// malformed header.
-pub(crate) fn decode_on_page_tuple(
-    tuple: &[u8],
+/// malformed header or attributes.
+pub(crate) fn on_page_tuple<'a>(
+    tuple: &'a [u8],
     rel: &RelDescriptor,
-) -> Option<(u32, u32, u16, Vec<Option<ColumnValue>>)> {
+) -> Option<(OnPageHeader, &'a [u8])> {
     use crate::decode::heap_decoder::SIZE_OF_HEAP_TUPLE_HEADER;
     const T_INFOMASK2_OFF: usize = 18;
 
@@ -443,17 +484,18 @@ pub(crate) fn decode_on_page_tuple(
     //   t_infomask2 18..20  t_infomask 20..22
     //   t_hoff 22 (offset to user data, 8-byte aligned)
     //   t_bits[] 23.. (NULL bitmap, only if HEAP_HASNULL)
-    let xmin = u32::from_le_bytes(tuple[0..4].try_into().unwrap());
-    let xmax = u32::from_le_bytes(tuple[4..8].try_into().unwrap());
-    let t_infomask = u16::from_le_bytes(tuple[20..22].try_into().unwrap());
+    let header = OnPageHeader {
+        xmin: u32::from_le_bytes(tuple[0..4].try_into().unwrap()),
+        xmax: u32::from_le_bytes(tuple[4..8].try_into().unwrap()),
+        infomask: u16::from_le_bytes(tuple[20..22].try_into().unwrap()),
+    };
     let t_hoff = tuple[22] as usize;
     if t_hoff < SIZE_OF_HEAP_TUPLE_HEADER || t_hoff > tuple.len() {
         return None;
     }
-    match decode_block_data(&tuple[T_INFOMASK2_OFF..], rel) {
-        Ok(d) => Some((xmin, xmax, t_infomask, d.columns)),
-        Err(_) => None,
-    }
+    let data = &tuple[T_INFOMASK2_OFF..];
+    crate::decode::heap_decoder::scan_block_data(data, rel).ok()?;
+    Some((header, data))
 }
 
 /// Tap router: resolves a segment's descriptor at `begin` and hands back a
@@ -1145,6 +1187,7 @@ pub(crate) fn synth_single_tuple_page(value: i32) -> [u8; PAGE_BYTES] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::decode::datum::Datum;
 
     use crate::backfill::backup_source::EndInfo;
     use crate::backfill::backup_source::testing::expect_tap;
@@ -1183,6 +1226,14 @@ mod tests {
         assert_eq!(sink.source_lsn(), 0xABCD_1234);
     }
 
+    /// Leading int4 of a tuple walked against [`make_rel`]'s layout
+    fn int4(t: &BackfillTuple) -> Option<i32> {
+        match t.cells(&make_rel()).unwrap().first() {
+            Some(Some(Datum::Fixed(b))) => Some(i32::from_le_bytes(b.as_slice().try_into().ok()?)),
+            _ => None,
+        }
+    }
+
     #[test]
     fn page_walker_emits_single_tuple() {
         let rel = make_rel();
@@ -1194,8 +1245,7 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].source_lsn, 0xABCD);
         assert_eq!(out[0].xid, 99);
-        assert_eq!(out[0].columns.len(), 1);
-        assert!(matches!(out[0].columns[0], Some(ColumnValue::Int4(42))));
+        assert_eq!(int4(&out[0]), Some(42));
         assert_eq!(tally.pages_walked, 1);
         assert_eq!(tally.tuples_emitted, 1);
     }
@@ -1366,10 +1416,7 @@ mod tests {
         assert_eq!(captured.len(), 1);
         assert_eq!(captured[0].source_lsn, 0x1234_5678);
         assert_eq!(captured[0].xid, 99);
-        assert!(matches!(
-            captured[0].columns[0],
-            Some(ColumnValue::Int4(99))
-        ));
+        assert!(matches!(int4(&captured[0]), Some(99)));
         assert_eq!(ld(&sink.stats.files_seen), 1);
         assert_eq!(ld(&sink.stats.files_walked), 1);
         assert_eq!(ld(&sink.stats.pages_walked), 1);
@@ -1586,7 +1633,7 @@ mod tests {
         assert_eq!(ld(&sink.stats.tail_bytes_dropped), 0);
         for (i, t) in captured.iter().enumerate() {
             assert_eq!(t.blkno, i as u32, "page {i} kept its block number");
-            assert!(matches!(t.columns[0], Some(ColumnValue::Int4(v)) if v == i as i32));
+            assert_eq!(int4(t), Some(i as i32));
         }
     }
 
@@ -1718,8 +1765,8 @@ mod tests {
         let captured = sink.captured();
         let mut by_rel: HashMap<Oid, i32> = HashMap::new();
         for t in &captured {
-            if let Some(Some(ColumnValue::Int4(v))) = t.columns.first() {
-                by_rel.insert(t.rfn.rel_node, *v);
+            if let Some(v) = int4(t) {
+                by_rel.insert(t.rfn.rel_node, v);
             }
         }
         assert_eq!(captured.len(), 2);

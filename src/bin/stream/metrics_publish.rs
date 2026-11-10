@@ -235,8 +235,6 @@ pub(crate) struct DrainResident {
     pub(crate) chunks: u64,
     pub(crate) rows: u64,
     pub(crate) spool: u64,
-    pub(crate) raw_pending_rows: u64,
-    pub(crate) raw_pending_bytes: u64,
 }
 
 impl DrainResident {
@@ -246,8 +244,6 @@ impl DrainResident {
             chunks: b.drain_chunk_resident_bytes(),
             rows: b.drain_row_resident_bytes(),
             spool: b.toast_spool_bytes(),
-            raw_pending_rows: b.raw_pending_rows(),
-            raw_pending_bytes: b.raw_pending_bytes(),
         }
     }
 }
@@ -431,8 +427,6 @@ pub(crate) async fn populate_pipeline_metrics(
             xact_stats.raw_stash_bytes_mem,
             xact_stats.raw_stash_bytes_spill,
         ],
-        raw_pending_rows: drain_resident.raw_pending_rows,
-        raw_pending_bytes: drain_resident.raw_pending_bytes,
         pump_queue_depth,
         queue_records_out_total,
         catalog_boundary_holds_total: boundary_hold.holds.load(Ordering::Relaxed),
@@ -592,6 +586,7 @@ pub(crate) fn stage_gauges_on(v: &StageCounters<'_>, base: MetricsSnapshot) -> M
                 |s| &s.plan_failures_detoast,
                 |s| &s.plan_failures_partial_update,
                 |s| &s.plan_failures_view,
+                |s| &s.plan_failures_encode,
                 |s| &s.plan_failures_drain,
             ],
         ),
@@ -613,7 +608,11 @@ pub(crate) fn stage_gauges_on(v: &StageCounters<'_>, base: MetricsSnapshot) -> M
         insertbatch_batches_out_total: emitter(|s| &s.insertbatch_batches_out),
         inserter_batches_in_total: emitter(|s| &s.inserter_batches_in),
         inserter_ch_seconds_total: emitter_seconds(|s| &s.inserter_ch_nanos),
-        inserter_encode_seconds_total: emitter_seconds(|s| &s.inserter_encode_nanos),
+        resident_seal_seconds_total: emitter_seconds(|s| &s.resident_seal_nanos),
+        resident_raw_bytes_total: emitter(|s| &s.resident_raw_bytes),
+        resident_stored_bytes_total: emitter(|s| &s.resident_stored_bytes),
+        output_resident_bytes: emitter(|s| &s.output_resident_bytes),
+        batcher_open_bytes: emitter(|s| &s.batcher_open_bytes),
         oracle_resolve_seconds_total: emitter_seconds(|s| &s.oracle_resolve_nanos),
         process_cpu_seconds_total: proc_cpu,
         process_resident_memory_bytes: proc_rss,
@@ -752,8 +751,6 @@ mod tests {
                         chunks: 0,
                         rows: n * 10,
                         spool: 0,
-                        raw_pending_rows: n,
-                        raw_pending_bytes: n * 10,
                     },
                     budget: None,
                     decoder_stats: &decoder,
@@ -777,7 +774,6 @@ mod tests {
             assert_eq!(snap.pump_queue_depth, n);
             assert_eq!(snap.queue_records_out_total, n * 3);
             assert_eq!(snap.drain_resident_bytes, n * 10);
-            assert_eq!(snap.raw_pending_rows, n);
             assert_eq!(snap.uptime_seconds, n);
             assert_eq!(snap.archive_restore_active, 1);
             assert_eq!(snap.archive_wal_segments_total, 42);

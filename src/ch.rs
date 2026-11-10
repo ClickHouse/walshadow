@@ -8,7 +8,8 @@ use std::time::{Duration, Instant};
 use backon::BackoffBuilder;
 use clickhouse_c::tls::rustls::pki_types::ServerName;
 use clickhouse_c::{
-    AsyncClient, Block, BoxedAsyncClient, ClientOpts, Codec, Compression, ErrorKind, Event,
+    Allocator, AsyncClient, Block, BoxedAsyncClient, ClientOpts, Codec, Compression, ErrorKind,
+    Event, QueryOpts,
 };
 use thiserror::Error;
 use tokio::net::TcpStream;
@@ -76,7 +77,7 @@ impl std::str::FromStr for CompressionChoice {
 }
 
 impl CompressionChoice {
-    fn to_wire(self) -> Compression {
+    pub(crate) fn to_wire(self) -> Compression {
         match self {
             Self::None => Compression::None,
             Self::Lz4 => Compression::Lz4,
@@ -147,6 +148,7 @@ pub async fn connect_client(
     opts.compression = compression.to_wire();
     let sock = TcpStream::connect((config.host(), config.port())).await?;
     sock.set_nodelay(true)?;
+    let alloc = Allocator::global(&mimalloc::MiMalloc);
     let client = if config.secure() {
         let tls = config
             .tls_config()
@@ -156,11 +158,11 @@ pub async fn connect_client(
             .connect(server_name, sock)
             .await
             .map_err(|e| std::io::Error::new(e.kind(), format!("TLS handshake: {e}")))?;
-        AsyncClient::handshake_on(stream, opts, codec)
+        AsyncClient::handshake_on(stream, &opts, alloc, codec)
             .await
             .map(AsyncClient::boxed)
     } else {
-        AsyncClient::handshake_on(sock, opts, codec)
+        AsyncClient::handshake_on(sock, &opts, alloc, codec)
             .await
             .map(AsyncClient::boxed)
     };
@@ -221,7 +223,7 @@ pub async fn exec_drain(
     timeout: Duration,
 ) -> Result<(), EmitterError> {
     with_timeout(timeout, async {
-        client.send_query(sql, None).await?;
+        client.send_query(sql, &QueryOpts::new()).await?;
         drain_to_end_of_stream(client).await?;
         Ok(())
     })
@@ -235,7 +237,7 @@ pub async fn query_strings(
     timeout: Duration,
 ) -> Result<Vec<String>, EmitterError> {
     with_timeout(timeout, async {
-        client.send_query(sql, None).await?;
+        client.send_query(sql, &QueryOpts::new()).await?;
         let mut out = Vec::new();
         loop {
             match client.recv_event().await? {
@@ -304,6 +306,7 @@ pub async fn connect_creating_database(
 struct Connection {
     client: Option<BoxedAsyncClient>,
     dialed: Option<Arc<EmitterConfig>>,
+    compression: CompressionChoice,
     last_used: Instant,
 }
 
@@ -312,6 +315,7 @@ impl Default for Connection {
         Self {
             client: None,
             dialed: None,
+            compression: CompressionChoice::None,
             last_used: Instant::now(),
         }
     }
@@ -321,6 +325,8 @@ impl Default for Connection {
 pub struct ChConn {
     instance: Option<String>,
     selected: Option<Arc<EmitterConfig>>,
+    /// Dial with this instead of configured compression
+    compression: Option<CompressionChoice>,
     active: Connection,
     parked: foldhash::HashMap<Option<String>, Connection>,
     dest: Arc<DestEmitter>,
@@ -334,6 +340,7 @@ impl ChConn {
             dest,
             instance: None,
             selected: None,
+            compression: None,
             active: Connection::default(),
             parked: Default::default(),
             dials: 0,
@@ -366,6 +373,12 @@ impl ChConn {
         }
         self.selected = config;
         Ok(())
+    }
+
+    /// Dial every destination with `compression`, so prepared blocks sealed
+    /// in it send as is
+    pub fn force_compression(&mut self, compression: CompressionChoice) {
+        self.compression = Some(compression);
     }
 
     /// Redial now, for settings fixed at connect (codec, host, credentials)
@@ -448,23 +461,32 @@ impl ChConn {
             self.selected = Some(self.dest.instance(name)?);
         }
         let config = self.config();
+        let compression = self.compression.unwrap_or(config.compression);
         let moved = self
             .active
             .dialed
             .as_ref()
             .is_none_or(|dialed| !Arc::ptr_eq(dialed, &config));
-        if moved || self.active.last_used.elapsed() >= config.idle_reconnect() {
+        if moved
+            || compression != self.active.compression
+            || self.active.last_used.elapsed() >= config.idle_reconnect()
+        {
             self.active.client = None;
         }
         if let Some(client) = self.active.client.take() {
             return Ok(client);
         }
+        let mut dial = config.clone();
+        if compression != config.compression {
+            Arc::make_mut(&mut dial).compression = compression;
+        }
         let client = if self.instance.is_some() {
-            connect_creating_database(&config).await?.0
+            connect_creating_database(&dial).await?.0
         } else {
-            connect_client(&*config).await?
+            connect_client(&*dial).await?
         };
         self.active.dialed = Some(config);
+        self.active.compression = compression;
         self.active.last_used = Instant::now();
         self.dials += 1;
         Ok(client)

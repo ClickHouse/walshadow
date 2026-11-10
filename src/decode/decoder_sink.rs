@@ -1,20 +1,15 @@
-//! Shared types for the heap-tuple decoder fan-out: [`TupleObserver`],
-//! [`DecoderStats`], [`DecoderSinkError`].
-//!
-//! WAL commits drain through the parallel [`pipeline`](crate::emit::pipeline);
-//! [`TupleObserver`] is the greenfield-bootstrap page-walk drain destination
-//! (`drain_backfill`). Catalog gate timeouts poison the stream, so no
+//! Shared types for the heap-tuple decoder fan-out: [`DecoderStats`],
+//! [`DecoderSinkError`]. WAL commits drain through the parallel
+//! [`pipeline`](crate::emit::pipeline). Catalog gate timeouts poison the stream, so no
 //! `replay_timeout` counter: silent loss is impossible by construction.
 
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use thiserror::Error;
 
 use crate::catalog::shadow_catalog::CatalogError;
 use crate::ch::EmitterError;
-use crate::decode::heap_decoder::{CommittedTuple, DecodeError};
+use crate::decode::heap_decoder::DecodeError;
 use crate::record::SinkError;
 use walrus::pg::walparser::{RmId, XLogRecordHeader};
 
@@ -37,28 +32,6 @@ impl From<DecoderSinkError> for SinkError {
 impl From<EmitterError> for DecoderSinkError {
     fn from(error: EmitterError) -> Self {
         Self::Observer(error.to_string())
-    }
-}
-
-/// Destination of decoded + committed heap events. Wire type is
-/// [`CommittedTuple`] not [`DecodedHeap`](crate::decode::heap_decoder::DecodedHeap):
-/// CH emitter needs `commit_ts` for its `_commit_ts` synthetic column.
-///
-/// `on_xact_end` fires after every tuple in a committed xact is delivered.
-/// Returns highest commit_lsn now durable on the observer. Callers advance
-/// their ack ceiling from the return value, NOT `commit_lsn`. Default
-/// returns `commit_lsn` (instant ack).
-pub trait TupleObserver: Send {
-    fn on_tuple<'a>(
-        &'a mut self,
-        committed: &'a CommittedTuple,
-    ) -> Pin<Box<dyn Future<Output = Result<(), DecoderSinkError>> + Send + 'a>>;
-
-    fn on_xact_end<'a>(
-        &'a mut self,
-        commit_lsn: u64,
-    ) -> Pin<Box<dyn Future<Output = Result<u64, DecoderSinkError>> + Send + 'a>> {
-        Box::pin(async move { Ok(commit_lsn) })
     }
 }
 
@@ -174,56 +147,18 @@ pub struct SkipKey {
 
 pub type SkipCounts = crate::emit::pipeline::row_ledger::KeyedCounts<SkipKey>;
 
-#[derive(Debug, Default)]
-pub struct MetricsTupleObserver {
-    pub stats: DecoderStats,
-}
-
-impl TupleObserver for MetricsTupleObserver {
-    fn on_tuple<'a>(
-        &'a mut self,
-        committed: &'a CommittedTuple,
-    ) -> Pin<Box<dyn Future<Output = Result<(), DecoderSinkError>> + Send + 'a>> {
-        Box::pin(async move {
-            self.stats.record(&committed.decoded);
-            Ok(())
-        })
-    }
-}
-
-/// In-memory test observer; retains full committed tuples for assertions.
-#[derive(Debug, Default)]
-pub struct CollectingTupleObserver {
-    pub tuples: Vec<CommittedTuple>,
-}
-
-impl TupleObserver for CollectingTupleObserver {
-    fn on_tuple<'a>(
-        &'a mut self,
-        committed: &'a CommittedTuple,
-    ) -> Pin<Box<dyn Future<Output = Result<(), DecoderSinkError>> + Send + 'a>> {
-        Box::pin(async move {
-            self.tuples.push(committed.clone());
-            Ok(())
-        })
-    }
-}
-
 impl DecoderStats {
-    /// Single source of truth for the `HeapOp → counter` mapping; all decoder
-    /// dispatch sites route through here.
-    pub fn record(&self, decoded: &crate::decode::heap_decoder::DecodedHeap) {
+    pub fn record_op(&self, op: crate::decode::heap_decoder::HeapOp, rows: u16, partial: bool) {
         use crate::decode::heap_decoder::HeapOp;
-        self.decoded.fetch_add(1, Ordering::Relaxed);
-        match decoded.op {
-            HeapOp::Insert => self.inserts.fetch_add(1, Ordering::Relaxed),
-            HeapOp::Update => self.updates.fetch_add(1, Ordering::Relaxed),
-            HeapOp::HotUpdate => self.hot_updates.fetch_add(1, Ordering::Relaxed),
-            HeapOp::Delete => self.deletes.fetch_add(1, Ordering::Relaxed),
-            HeapOp::Truncate => self.truncates.fetch_add(1, Ordering::Relaxed),
+        let rows = u64::from(rows);
+        self.decoded.fetch_add(rows, Ordering::Relaxed);
+        match op {
+            HeapOp::Insert => self.inserts.fetch_add(rows, Ordering::Relaxed),
+            HeapOp::Update => self.updates.fetch_add(rows, Ordering::Relaxed),
+            HeapOp::HotUpdate => self.hot_updates.fetch_add(rows, Ordering::Relaxed),
+            HeapOp::Delete => self.deletes.fetch_add(rows, Ordering::Relaxed),
+            HeapOp::Truncate => self.truncates.fetch_add(rows, Ordering::Relaxed),
         };
-        let partial = decoded.new.as_ref().is_some_and(|t| t.partial)
-            || decoded.old.as_ref().is_some_and(|t| t.partial);
         if partial {
             self.partial.fetch_add(1, Ordering::Relaxed);
         }
@@ -343,31 +278,11 @@ impl DecoderStats {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::decode::heap_decoder::{ColumnValue, DecodedHeap, HeapOp};
-    use walrus::pg::walparser::RelFileNode;
+    use crate::decode::heap_decoder::HeapOp;
 
-    fn wrap(decoded: DecodedHeap) -> CommittedTuple {
-        CommittedTuple {
-            decoded,
-            commit_ts: 0,
-            commit_lsn: 0,
-        }
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn metrics_observer_buckets_by_op() {
-        let mut obs = MetricsTupleObserver::default();
-        let mk = |op: HeapOp, partial: bool| DecodedHeap {
-            rfn: RelFileNode::default(),
-            xid: 0,
-            source_lsn: 0,
-            op,
-            new: Some(crate::decode::heap_decoder::DecodedTuple {
-                columns: vec![Some(ColumnValue::Null)],
-                partial,
-            }),
-            old: None,
-        };
+    #[test]
+    fn record_op_buckets_by_op() {
+        let s = DecoderStats::default();
         for op in [
             HeapOp::Insert,
             HeapOp::Insert,
@@ -375,10 +290,9 @@ mod tests {
             HeapOp::HotUpdate,
             HeapOp::Delete,
         ] {
-            obs.on_tuple(&wrap(mk(op, false))).await.unwrap();
+            s.record_op(op, 1, false);
         }
-        obs.on_tuple(&wrap(mk(HeapOp::Update, true))).await.unwrap();
-        let s = &obs.stats;
+        s.record_op(HeapOp::Update, 1, true);
         let ld = |a: &AtomicU64| a.load(Ordering::Relaxed);
         assert_eq!(ld(&s.decoded), 6);
         assert_eq!(ld(&s.inserts), 2);
@@ -386,36 +300,6 @@ mod tests {
         assert_eq!(ld(&s.hot_updates), 1);
         assert_eq!(ld(&s.deletes), 1);
         assert_eq!(ld(&s.partial), 1);
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn collecting_observer_keeps_full_clone() {
-        let mut obs = CollectingTupleObserver::default();
-        let d = DecodedHeap {
-            rfn: RelFileNode {
-                spc_node: 1663,
-                db_node: 5,
-                rel_node: 16385,
-            },
-            xid: 42,
-            source_lsn: 0x1234,
-            op: HeapOp::Insert,
-            new: Some(crate::decode::heap_decoder::DecodedTuple {
-                columns: vec![Some(ColumnValue::Int4(7))],
-                partial: false,
-            }),
-            old: None,
-        };
-        let c = CommittedTuple {
-            decoded: d,
-            commit_ts: 9_876,
-            commit_lsn: 0,
-        };
-        obs.on_tuple(&c).await.unwrap();
-        assert_eq!(obs.tuples.len(), 1);
-        assert_eq!(obs.tuples[0].decoded.xid, 42);
-        assert_eq!(obs.tuples[0].decoded.source_lsn, 0x1234);
-        assert_eq!(obs.tuples[0].commit_ts, 9_876);
     }
 
     #[test]

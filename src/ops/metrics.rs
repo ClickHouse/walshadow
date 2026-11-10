@@ -12,7 +12,6 @@
 //! cadence, HTTP server reads a snapshot per request. Endpoint is read-only by
 //! design (no `/quit`, no admin verbs); operator actions stay on the CLI.
 
-use std::borrow::Cow;
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::io;
@@ -74,32 +73,26 @@ macro_rules! encode_metric {
 /// [`encode_metric`] for a family every database carries: the `database=`
 /// label comes first, a declared label array second
 macro_rules! encode_db_metric {
-    ($enc:expr, $dbs:expr, $names:expr, counter, $name:expr, $help:expr, $field:ident) => {
+    ($enc:expr, $dbs:expr, counter, $name:expr, $help:expr, $field:ident) => {
         counter_series(
             $enc,
             $name,
             $help,
             "database",
-            $names
-                .iter()
-                .zip($dbs)
-                .map(|(db, s)| (db.as_ref(), s.$field)),
+            $dbs.iter().map(|s| (s.database.as_str(), s.$field)),
         )?
     };
-    ($enc:expr, $dbs:expr, $names:expr, gauge, $name:expr, $help:expr, $field:ident) => {
+    ($enc:expr, $dbs:expr, gauge, $name:expr, $help:expr, $field:ident) => {
         gauge_series(
             $enc,
             $name,
             $help,
             "database",
-            $names
-                .iter()
-                .zip($dbs)
-                .map(|(db, s)| (db.as_ref(), s.$field)),
+            $dbs.iter().map(|s| (s.database.as_str(), s.$field)),
         )?
     };
     (
-        $enc:expr, $dbs:expr, $names:expr, counter, $name:expr, $help:expr, $field:ident,
+        $enc:expr, $dbs:expr, counter, $name:expr, $help:expr, $field:ident,
         $key:literal, $labels:expr
     ) => {
         counter_grid(
@@ -107,14 +100,12 @@ macro_rules! encode_db_metric {
             $name,
             $help,
             $key,
-            $names
-                .iter()
-                .zip($dbs)
-                .map(|(db, s)| (db.as_ref(), $labels.into_iter().zip(s.$field))),
+            $dbs.iter()
+                .map(|s| (s.database.as_str(), $labels.into_iter().zip(s.$field))),
         )?
     };
     (
-        $enc:expr, $dbs:expr, $names:expr, gauge, $name:expr, $help:expr, $field:ident,
+        $enc:expr, $dbs:expr, gauge, $name:expr, $help:expr, $field:ident,
         $key:literal, $labels:expr
     ) => {
         gauge_grid(
@@ -122,10 +113,8 @@ macro_rules! encode_db_metric {
             $name,
             $help,
             $key,
-            $names
-                .iter()
-                .zip($dbs)
-                .map(|(db, s)| (db.as_ref(), $labels.into_iter().zip(s.$field))),
+            $dbs.iter()
+                .map(|s| (s.database.as_str(), $labels.into_iter().zip(s.$field))),
         )?
     };
 }
@@ -238,7 +227,7 @@ snapshot! {
     lsn emitter_ack_lsn: Pos<EmitterAck> = "Contiguous-done watermark from the insert pipeline.",
     lsn floor_lsn: Pos<Floor> = "Durable resume floor: restart resumes here and pruners cut to it.",
     gauge xact_active: u64 = "Active transactions buffered in memory or on spill.",
-    gauge xact_bytes_in_memory: u64 = "Bytes held in memory across all buffered xacts.",
+    gauge xact_bytes_in_memory: u64 = "Allocated bytes held in memory across all buffered xacts.",
     gauge spill_xacts_active: u64 = "Xacts with at least one entry currently in their spill file.",
     gauge spill_bytes_active: u64 = "Bytes currently held across all active xact spill files.",
     gauge drain_resident_bytes: u64 =
@@ -388,14 +377,12 @@ snapshot! {
         "Sealed transaction-plan bytes by final backing.",
     /// Planning failures `[spool, fail_closed, detoast, partial_update,
     /// view, drain]`, rendered `reason=` labelled
-    counter xact_plan_failures_by_reason: [u64; 11] ["reason" = PLAN_FAILURE_REASONS] =
+    counter xact_plan_failures_by_reason: [u64; 12] ["reason" = PLAN_FAILURE_REASONS] =
         "Planning-stage failures; the whole transaction emits nothing.",
     counter raw_stash_bytes_by_storage: [u64; 2] ["storage" = ["mem", "spill"]] =
         "Cumulative raw-stash payload bytes by first landing.",
     counter raw_decode_rows_by_op: [u64; 7] ["op" = HEAP_OP_LABELS] =
         "Rows fanned out of decoded raw records.",
-    gauge raw_pending_rows: u64 = "Raw-decoded heaps queued for pending-first yield.",
-    gauge raw_pending_bytes: u64 = "Bytes held by the pending raw fanout.",
     counter backfill_backup_rows_total: u64 = "Tuples decoded by table backfill backup walks, including TOAST chunks and rows awaiting visibility checks. Cumulative across passes.",
     counter backfill_backup_bytes_total: u64 = "Backup body bytes handed to table backfill page walks, excluding skipped files. Cumulative across passes.",
     counter backfill_copy_rows_total: u64 = "Rows decoded from source COPY for table backfills.",
@@ -429,8 +416,16 @@ snapshot! {
         "InsertBatches an inserter finished draining to ClickHouse. insertbatch_batches_out - inserter_batches_in is the live backlog; their rates show inserter-pool saturation.",
     counter inserter_ch_seconds_total: f64 =
         "Cumulative inserter time inside the ClickHouse INSERT round trip. Against inserter_pool_size x uptime this is CH-side utilization.",
-    counter inserter_encode_seconds_total: f64 =
-        "Cumulative inserter time rebuilding the Native block over a batch's owned slabs.",
+    counter resident_seal_seconds_total: f64 =
+        "Cumulative resolver time serializing and compressing sealed Native blocks.",
+    counter resident_raw_bytes_total: u64 =
+        "Serialized Native block bytes sealed for insertion, before resident compression.",
+    counter resident_stored_bytes_total: u64 =
+        "Bytes allocated for those sealed blocks while awaiting insertion, including growth slack.",
+    gauge output_resident_bytes: u64 =
+        "Bytes held in insert tail output pools: queued column slabs, sealed blocks awaiting acknowledgement, and seal workspace.",
+    gauge batcher_open_bytes: u64 =
+        "Allocated column slab bytes in batches still open for more rows.",
     counter oracle_resolve_seconds_total: f64 =
         "Cumulative resolver time inside the oracle round trip. Overlaps inserter_ch_seconds_total, so the larger of the two is the tail's limiter.",
     counter process_cpu_seconds_total: f64 =
@@ -555,12 +550,9 @@ macro_rules! db_snapshot {
         }
 
         fn encode_db_fields(dbs: &[DbSeries], enc: &mut DescriptorEncoder<'_>) -> fmt::Result {
-            let names: Vec<Cow<'_, str>> =
-                dbs.iter().map(|db| escape_label(&db.database)).collect();
             $(encode_db_metric!(
                 enc,
                 dbs,
-                names,
                 $kind,
                 concat!("walshadow_", stringify!($field)),
                 $help,
@@ -753,7 +745,7 @@ impl Default for RateEstimator {
 
 /// `reason=` label order of `MetricsSnapshot::xact_plan_failures_by_reason`,
 /// matching [`crate::emit::pipeline::planner::drain_reason`]
-const PLAN_FAILURE_REASONS: [&str; 11] = [
+const PLAN_FAILURE_REASONS: [&str; 12] = [
     "spool",
     "fail_closed_image_only",
     "fail_closed_malformed",
@@ -764,6 +756,7 @@ const PLAN_FAILURE_REASONS: [&str; 11] = [
     "detoast",
     "partial_update",
     "view",
+    "encode",
     "drain",
 ];
 
@@ -921,24 +914,6 @@ where
     Ok(())
 }
 
-/// The encoder writes label values through, and a database name is whatever
-/// `CREATE DATABASE` took, so escape what OpenMetrics reserves inside quotes
-fn escape_label(value: &str) -> Cow<'_, str> {
-    if !value.contains(['\\', '"', '\n']) {
-        return Cow::Borrowed(value);
-    }
-    let mut out = String::with_capacity(value.len() + 8);
-    for c in value.chars() {
-        match c {
-            '\\' => out.push_str("\\\\"),
-            '"' => out.push_str("\\\""),
-            '\n' => out.push_str("\\n"),
-            _ => out.push(c),
-        }
-    }
-    Cow::Owned(out)
-}
-
 /// LSN gauges carry their raw `u64`
 impl<K> EncodeGaugeValue for Pos<K> {
     fn encode(&self, encoder: &mut GaugeValueEncoder) -> fmt::Result {
@@ -1001,8 +976,6 @@ fn encode_snapshot(snap: &MetricsSnapshot, enc: &mut DescriptorEncoder<'_>) -> f
         u64::from(!snap.crossing_blocked_on.is_empty()),
     )?;
 
-    // rmgr names come out of the fixed resource-manager table, so label values
-    // need no escaping the encoder does not do
     let mut records = declare(
         enc,
         "walshadow_filter_records_total",
@@ -1250,7 +1223,7 @@ mod tests {
         let snap = MetricsSnapshot {
             xact_plan_rows: 9,
             xact_plan_bytes_by_storage: [100, 200],
-            xact_plan_failures_by_reason: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+            xact_plan_failures_by_reason: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
             ..MetricsSnapshot::default()
         };
         let body = render(snap);
@@ -1354,8 +1327,6 @@ mod tests {
             raw_stash_bytes_by_storage: [11, 12],
             raw_decode_rows_by_op: [1, 2, 3, 4, 5, 6, 7],
             decoder_records_by_op: [41, 42, 43, 44, 45],
-            raw_pending_rows: 13,
-            raw_pending_bytes: 14,
             by_database: vec![DbSeries {
                 database: "app".into(),
                 descriptor_ambiguous_total: 21,
@@ -1387,8 +1358,6 @@ mod tests {
         );
         assert!(body.contains("walshadow_raw_decode_rows_total{op=\"multi_insert\"} 6"));
         assert!(body.contains("walshadow_decoder_records_total{op=\"hot_update\"} 43"));
-        assert!(body.contains("walshadow_raw_pending_rows 13"));
-        assert!(body.contains("walshadow_raw_pending_bytes 14"));
         // Published intervals and lookups landing in one stay distinct
         // families
         assert!(body.contains("walshadow_descriptor_ambiguous_total{database=\"app\"} 21"));

@@ -37,25 +37,38 @@ planning committed transactions
 
 ## Commit pipeline
 
-![Commit pipeline: reorder places rows inline, one batcher feeds a conversion pool and ClickHouse inserters, and acknowledgements advance a contiguous watermark](workers.svg)
+![Commit pipeline: reorder plans column chunks, one batcher feeds a conversion and sealing pool, inserters send prepared blocks, and acknowledgements advance a contiguous watermark](workers.svg)
 
 `BufferingDecoderSink` and `ReorderSink` share one record-queue worker
-`ReorderSink` plans each commit and places its rows onto the batcher in order
-Batcher seals per-table batches. A separate conversion pool resolves PostgreSQL
-types before inserters send complete Native blocks. Conversion concurrency
-matches oracle capacity; `[ch].inserter_pool_size` sizes the inserter pool
+`ReorderSink` plans each commit and places it onto the batcher in order.
+Planning routes, validates and detoasts rows but leaves them WAL bytes; each
+outbox flush hands the rows of many commits to one encode job on the runtime,
+which writes per-table column chunks. Batcher awaits jobs in order, merges
+chunks into Native blocks and groups blocks into per-table INSERTs. A
+separate conversion pool resolves PostgreSQL types, then serializes each block
+once and keeps prepared bytes until its INSERT is durable. Compression follows
+`[ch] compression`; inserters rebuild blocks only when a connection rejects
+prepared bytes. Conversion concurrency matches oracle capacity;
+`[ch].inserter_pool_size` sizes inserter pool
 Each inserter owns a ClickHouse connection and takes any ready batch
 
 Sequence numbers identify work slices, not necessarily whole transactions
 Only a commit's final slice publishes its LSN, after all earlier work finishes
 Bounded queues and a shared payload budget limit work in flight; transaction
-and plan data can spill to disk
+and plan data can spill to disk. Each tail's output pool holds batches from
+batcher to acknowledgement and reserves seal workspace apart from them, so
+conversion finishes however much output waits on inserters
 
-Queue worker runs on a dedicated thread and receives batches with heap decode
-started ahead of dispatch. It checks decoded results against descriptor history
-and decodes again if needed. Commits drain only their own transaction trees.
-Consecutive small commits can share row chunks while retaining separate
-acknowledgements
+Queue worker runs on a dedicated thread. A dispatcher scans each batch ahead of
+it to start TOAST store reads for values updated rows keep. Ordinary heap
+records stay WAL bytes under their record-time descriptor until commit;
+planning reads tuples in place, resolved external values patching them.
+Records resolved from stash at commit carry the same bytes under their resolved
+descriptor. Compressed inline values, numeric, JSONB, and fast defaults can
+need row scratch. Commits drain only their own
+transaction trees. Consecutive small commits can share column blocks while
+retaining separate acknowledgements. COPY and backup loads carry tuple bytes or
+COPY fields and encode their own column chunks
 
 ## Design boundaries
 

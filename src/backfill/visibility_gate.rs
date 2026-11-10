@@ -540,12 +540,13 @@ pub async fn resolve_greenfield(
 mod tests {
     use super::*;
     use crate::backfill::backup_page_walk::{
-        PAGE_BYTES, PageWalkSink, make_rel, make_rel_named, synth_single_tuple_page,
+        PAGE_BYTES, PageWalkSink, TupleData, make_rel, make_rel_named, synth_single_tuple_page,
     };
     use crate::backfill::backup_source::testing::expect_tap;
     use crate::backfill::backup_source::{BackupSink, FileMeta, StartInfo};
     use crate::backfill::spool::DEFERRED_SPOOL_MEM_MAX;
     use crate::backfill::spool::SpoolMark;
+    use crate::decode::datum::{Datum, build};
     use crate::decode::visibility::{
         HEAP_XMAX_COMMITTED, HEAP_XMAX_INVALID, HEAP_XMAX_IS_MULTI, HEAP_XMIN_COMMITTED,
         HEAP_XMIN_INVALID,
@@ -573,7 +574,8 @@ mod tests {
             page_lsn: 0,
             blkno: 0,
             offnum: 0,
-            columns: Vec::new(),
+            data: TupleData::Heap(Box::default()),
+            pending: None,
         }
     }
 
@@ -780,7 +782,6 @@ mod tests {
     /// route to two tails at once, each resuming its own seq space
     #[tokio::test]
     async fn deferred_lanes_replay_on_their_own_tails() {
-        use crate::decode::heap_decoder::ColumnValue;
         use crate::mapping::{ColumnMapping, TableMapping, TableTarget};
 
         let tmp = tempfile::tempdir().unwrap();
@@ -813,7 +814,7 @@ mod tests {
         };
 
         let row = |id| BackfillTuple {
-            columns: vec![Some(ColumnValue::Int4(id))],
+            data: TupleData::from_cells(&[Some(build::int4(id))]),
             ..tuple(100, 0, HEAP_XMIN_COMMITTED)
         };
         let mut tails = Vec::new();
@@ -844,8 +845,11 @@ mod tests {
         for (want_seq, (ack, ack_task, mut msg_rx)) in [3u64, 7].into_iter().zip(tails) {
             let mut seqs = Vec::new();
             while let Some(msg) = msg_rx.recv().await {
-                let BatcherMsg::Rows(c) = msg else { panic!() };
-                seqs.extend(c.rows.iter().map(|r| r.seq));
+                let BatcherMsg::Segments(segments) = msg else {
+                    panic!()
+                };
+                let rows = crate::emit::pipeline::batcher::segment_rows(&segments);
+                seqs.extend(rows.iter().map(|r| r.0));
             }
             assert_eq!(seqs, vec![want_seq; 2], "rows rode their own lane's tail");
             drop(ack);
@@ -919,7 +923,7 @@ mod tests {
     /// them for chunk-store resolution
     #[tokio::test]
     async fn mapped_external_values_stream_untouched() {
-        use crate::decode::heap_decoder::{ColumnValue, ToastPointer};
+        use crate::decode::heap_decoder::ToastPointer;
         use crate::mapping::{ColumnMapping, TableMapping, TableTarget};
         use crate::schema::RelName;
 
@@ -935,7 +939,7 @@ mod tests {
         d.attributes.push(body);
         let mut catalog = CatalogMap::new();
         catalog.insert(desc.clone());
-        let external = ColumnValue::ExternalToast(ToastPointer {
+        let external = Datum::External(ToastPointer {
             va_rawsize: 8004,
             va_extinfo: 8000,
             va_valueid: 100,
@@ -962,13 +966,20 @@ mod tests {
                 tees: Vec::new(),
             };
             let row = |value, infomask| BackfillTuple {
-                columns: vec![Some(ColumnValue::Int4(1)), Some(value)],
+                data: TupleData::from_cells(&[Some(build::int4(1)), Some(value)]),
                 ..tuple(100, 0, infomask)
+            };
+            let has_mapped_external = |t: &BackfillTuple| {
+                let cells = t.cells(&desc).unwrap();
+                mapping
+                    .columns
+                    .iter()
+                    .any(|c| matches!(cells[c.src_attnum as usize - 1], Some(Datum::External(_))))
             };
             let (stats, passed) = run_stream_phase(
                 &catalog,
                 vec![
-                    row(ColumnValue::Text("inline".into()), HEAP_XMIN_COMMITTED),
+                    row(build::text("inline"), HEAP_XMIN_COMMITTED),
                     row(external.clone(), HEAP_XMIN_INVALID),
                     row(external.clone(), HEAP_XMIN_COMMITTED),
                 ],
@@ -976,8 +987,8 @@ mod tests {
             .await;
             assert_eq!(stats.gated, 1);
             assert_eq!(passed.len(), 2);
-            assert!(!passed[0].has_mapped_external(&mapping));
-            assert_eq!(passed[1].has_mapped_external(&mapping), body_mapped);
+            assert!(!has_mapped_external(&passed[0]));
+            assert_eq!(has_mapped_external(&passed[1]), body_mapped);
         }
     }
 

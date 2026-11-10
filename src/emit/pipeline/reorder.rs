@@ -27,7 +27,6 @@ use crate::backfill::visibility_pending::{self, SharedPendingLedger};
 use crate::catalog::pending::PendingCatalog;
 #[cfg(feature = "test-support")]
 use crate::crash_test;
-use crate::decode::heap_decoder::{DecodedHeap, DescribedHeap, Predecoded};
 use crate::decode::visibility::{PgXactView, SealedPatch, read_pg_xact};
 use crate::emit::ch_ddl::{DdlApplicator, Stamp};
 use crate::emit::ch_emitter::EmitterStats;
@@ -48,9 +47,11 @@ use crate::xact::xact_buffer::{
 use crate::config::ResolvedConfig;
 use crate::emit::pipeline::Fatal;
 use crate::emit::pipeline::ack::{AckHandle, BufferedRowSender, Publish, SeqAlloc};
-use crate::emit::pipeline::batcher::{BatcherMsg, RowChunk};
-use crate::emit::pipeline::decode;
-use crate::emit::pipeline::plan_spool::{PlanItem, PlanPath, PlanTable, PlannedHeap, SealedPlan};
+use crate::emit::pipeline::batcher::{BatcherMsg, PlacedSegment};
+use crate::emit::pipeline::encode::{self, Encoders, PendingSegment};
+use crate::emit::pipeline::plan_spool::{
+    EncoderCache, PlanItem, PlanPath, SealedPlan, Segment, SegmentBody,
+};
 use crate::emit::pipeline::planner::{PlanRouteView, Planner, drain_reason};
 use crate::emit::route::{RouteSnapshot, RowPolicy, route_via};
 use crate::mapping::{MappingSnapshot, TableMapping};
@@ -163,8 +164,15 @@ struct Outbox {
     /// with [`Self::staged`]
     seqs: SeqAlloc,
     /// Placed rows not yet on the batcher channel, shipped per worker batch
-    /// so small commits share one channel hop and wakeup
-    staged: Vec<RowChunk>,
+    /// so small commits share one channel hop and wakeup. Encoded and
+    /// pending segments never stage together, keeping seq order
+    staged: Vec<PlacedSegment>,
+    /// Pending segments, shipped as one encode job
+    pending: Vec<PendingSegment>,
+    /// Admission of `pending`, riding their job
+    pending_permit: Option<crate::budget::MemoryPermit>,
+    encoders: Encoders,
+    stats: Arc<EmitterStats>,
     staged_rows: usize,
     staged_bytes: usize,
     /// Global resident-payload pool; slice and chunk generation admission
@@ -181,6 +189,43 @@ impl Outbox {
         )
     }
 
+    /// Stage `segment` under `seq`, first shipping staged segments of the
+    /// other kind so the batcher sees seqs in order
+    async fn stage(
+        &mut self,
+        seq: u64,
+        segment: Segment,
+        permit: Option<crate::budget::MemoryPermit>,
+    ) -> Result<(), SinkError> {
+        let other = match segment.body {
+            SegmentBody::Pending(_) => !self.staged.is_empty(),
+            SegmentBody::Encoded(_) => !self.pending.is_empty(),
+        };
+        if other {
+            Box::pin(self.flush_pending()).await?;
+        }
+        match segment.body {
+            SegmentBody::Pending(records) => {
+                self.pending.push(PendingSegment {
+                    seq,
+                    rows: segment.rows,
+                    records,
+                });
+                if let Some(p) = permit {
+                    crate::budget::absorb_into(&mut self.pending_permit, p);
+                }
+            }
+            SegmentBody::Encoded(chunks) => self.staged.push(PlacedSegment {
+                seq,
+                chunks,
+                permit: permit.map(Arc::new),
+            }),
+        }
+        self.staged_rows += segment.rows as usize;
+        self.staged_bytes += segment.bytes;
+        Ok(())
+    }
+
     /// Admission permit for `bytes`. Staged rows hold permits only shipping
     /// releases, so ship before waiting on the pool
     async fn admit(
@@ -193,12 +238,16 @@ impl Outbox {
         if let Some(p) = budget.try_admit(bytes) {
             return Ok(Some(p));
         }
-        self.flush_pending().await?;
-        tokio::select! {
-            biased;
-            _ = self.fatal.wait() => Err(self.fatal_err()),
-            p = budget.admit(bytes) => Ok(Some(p)),
-        }
+        // Boxed: waiting is rare, inline it would bloat every commit future
+        Box::pin(async {
+            self.flush_pending().await?;
+            tokio::select! {
+                biased;
+                _ = self.fatal.wait() => Err(self.fatal_err()),
+                p = budget.admit(bytes) => Ok(Some(p)),
+            }
+        })
+        .await
     }
 }
 
@@ -208,16 +257,24 @@ impl BufferedRowSender for Outbox {
     }
 
     async fn send_rows(&mut self) -> Result<(), SinkError> {
-        if self.staged.is_empty() {
+        let msg = if !self.pending.is_empty() {
+            BatcherMsg::Encoded(encode::spawn(
+                std::mem::take(&mut self.pending),
+                self.pending_permit.take(),
+                self.encoders.clone(),
+                self.stats.clone(),
+            ))
+        } else if !self.staged.is_empty() {
+            BatcherMsg::Segments(std::mem::take(&mut self.staged))
+        } else {
             return Ok(());
-        }
-        let chunks = std::mem::take(&mut self.staged);
+        };
         self.staged_rows = 0;
         self.staged_bytes = 0;
         let sent = tokio::select! {
             biased;
             _ = self.fatal.wait() => return Err(self.fatal_err()),
-            r = self.msg_tx.send(BatcherMsg::Chunks(chunks)) => r,
+            r = self.msg_tx.send(msg) => r,
         };
         sent.map_err(|_| SinkError::Other("batcher channel closed".into()))
     }
@@ -302,6 +359,10 @@ impl ReorderSink {
                 fatal,
                 seqs,
                 staged: Vec::new(),
+                pending: Vec::new(),
+                pending_permit: None,
+                encoders: Encoders::default(),
+                stats: stats.clone(),
                 staged_rows: 0,
                 staged_bytes: 0,
                 budget,
@@ -324,7 +385,7 @@ impl ReorderSink {
         })
     }
 
-    /// Resolver shared with predecode for TOAST read-ahead
+    /// Resolver shared with prescan for TOAST read-ahead
     pub fn planning_resolver(&self) -> ToastResolver {
         self.resolver.clone()
     }
@@ -711,18 +772,22 @@ impl ReorderSink {
         if !self.resolver.stores_chunks() || self.retires.is_empty() {
             return Ok(());
         }
-        let cut = self.resume_floor.get();
-        for entry in self.retires.due(cut) {
-            self.resolver
-                .retire_mirror(entry.db_oid, entry.toast_relid)
-                .await
-                .map_err(|e| SinkError::Other(format!("toast mirror retire: {e}")))?;
-            self.retires
-                .remove(entry)
-                .await
-                .map_err(|e| SinkError::Other(format!("toast retire ledger: {e}")))?;
-        }
-        Ok(())
+        // Boxed: rare, and deep enough to bloat every commit future
+        Box::pin(async {
+            let cut = self.resume_floor.get();
+            for entry in self.retires.due(cut) {
+                self.resolver
+                    .retire_mirror(entry.db_oid, entry.toast_relid)
+                    .await
+                    .map_err(|e| SinkError::Other(format!("toast mirror retire: {e}")))?;
+                self.retires
+                    .remove(entry)
+                    .await
+                    .map_err(|e| SinkError::Other(format!("toast retire ledger: {e}")))?;
+            }
+            Ok(())
+        })
+        .await
     }
 
     /// Settle pending rows on commit or abort, including subtransactions
@@ -840,8 +905,7 @@ impl ReorderSink {
         &mut self,
         _: Fenced,
         rel: &RelDescriptor,
-        heap: &DecodedHeap,
-        commit_ts: i64,
+        at: Stamp,
     ) -> Result<(), SinkError> {
         let Some(scope) = self.scopes.get_mut(&rel.rfn.db_node) else {
             return Ok(());
@@ -852,11 +916,6 @@ impl ReorderSink {
         // Attached at truncate fan-out (record time = pre-capture Present),
         // so the rotation's drain-time Retired answer no longer needs a
         // predecessor walk here
-        let at = Stamp {
-            lsn: heap.source_lsn,
-            xid: heap.xid,
-            commit_ts,
-        };
         applicator
             .truncate(rel, at)
             .await
@@ -896,48 +955,32 @@ impl ReorderSink {
         Ok(())
     }
 
-    /// Place accumulated planned heaps as one seq under a fresh admission
-    /// permit; values detoasted at planning. `publish` marks the commit's
-    /// final data segment so its seq carries the LSN publication (no
-    /// trailing marker needed)
-    ///
-    /// Takes `&mut self` so the borrow across awaits is `&mut Self` (Send):
-    /// owned `DdlApplicator` is Send but not Sync
-    async fn dispatch_planned(
+    /// Place one planned segment as one seq under a fresh admission permit;
+    /// values detoasted and encoded at planning. `publish` marks the
+    /// commit's final data segment so its seq carries the LSN publication
+    /// (no trailing marker needed)
+    async fn dispatch_segment(
         &mut self,
-        tables: &[PlanTable],
-        pending: &mut Vec<PlannedHeap>,
-        pending_bytes: &mut usize,
-        commit_ts: i64,
+        segment: Segment,
         commit_lsn: u64,
         publish: Publish,
     ) -> Result<(), SinkError> {
-        if pending.is_empty() {
-            return Ok(());
-        }
-        let heaps = std::mem::take(pending);
-        let bytes = std::mem::take(pending_bytes);
-        let permit = self.out.admit(bytes).await?.map(Arc::new);
+        let permit = self.out.admit(segment.bytes).await?;
         let seq = self.out.seqs.open(commit_lsn, publish);
         self.stats.queue_jobs_out.fetch_add(1, Ordering::Relaxed);
-        let chunk_rows = self.dest.current().decode_chunk_rows;
-        let rows = decode::place_rows(
-            &mut self.out.staged,
-            &self.stats,
-            chunk_rows,
-            seq.seq(),
-            commit_ts,
-            commit_lsn,
-            tables,
-            heaps,
-            permit,
-        );
+        self.stats.decode_jobs_in.fetch_add(1, Ordering::Relaxed);
+        self.stats
+            .decode_rows_out
+            .fetch_add(segment.rows, Ordering::Relaxed);
+        let rows = segment.rows;
+        self.out.stage(seq.seq(), segment, permit).await?;
         let out = &mut self.out;
         out.seqs.place(seq, rows);
-        out.staged_rows += rows as usize;
-        out.staged_bytes += bytes;
-        if out.staged_rows >= chunk_rows || out.staged_bytes >= decode::DECODE_CHUNK_BYTES {
-            out.flush_pending().await?;
+        if out.staged_rows >= self.dest.current().decode_chunk_rows
+            || out.staged_bytes >= crate::emit::pipeline::batcher::DECODE_CHUNK_BYTES
+        {
+            // Boxed: once per many commits, inline it would bloat each
+            Box::pin(out.flush_pending()).await?;
         }
         Ok(())
     }
@@ -964,8 +1007,11 @@ impl ReorderSink {
         let mut rd = plan
             .replay()
             .map_err(|e| SinkError::Other(format!("plan replay: {e}")))?;
-        let mut pending: Vec<PlannedHeap> = Vec::new();
-        let mut pending_bytes = 0usize;
+        self.stats
+            .deletes_discarded
+            .fetch_add(rd.deletes_discarded, Ordering::Relaxed);
+        // Segment held until the next step shows whether it is final
+        let mut pending: Option<Segment> = None;
         let mut rows_cursor = 0usize;
         let total_rows: usize = rd.row_batches.iter().map(|rb| rb.len()).sum();
         let mut rows_total = 0u64;
@@ -974,58 +1020,43 @@ impl ReorderSink {
             .map_err(|e| SinkError::Other(format!("plan replay: {e}")))?
         {
             match item {
-                PlanItem::Control(c) => {
+                PlanItem::Control { event, row_idx } => {
                     Box::pin(async {
-                        self.put_plan_rows(&rd.row_batches, &mut rows_cursor, c.row_idx)
+                        self.put_plan_rows(&rd.row_batches, &mut rows_cursor, row_idx)
                             .await?;
-                        self.dispatch_planned(
-                            &rd.tables,
-                            &mut pending,
-                            &mut pending_bytes,
-                            commit_ts,
-                            commit_lsn,
-                            Publish::Partial,
-                        )
-                        .await?;
+                        if let Some(segment) = pending.take() {
+                            self.dispatch_segment(segment, commit_lsn, Publish::Partial)
+                                .await?;
+                        }
                         let fenced = self.barrier_fence().await?;
-                        self.apply_drain_entry(fenced, db, &c.event, at).await
+                        self.apply_drain_entry(fenced, db, &event, at).await
                     })
                     .await?;
                 }
-                PlanItem::Truncate { heap: h, upto } => {
+                PlanItem::Truncate { truncate: t, upto } => {
                     Box::pin(async {
                         self.put_plan_rows(&rd.row_batches, &mut rows_cursor, upto)
                             .await?;
-                        self.dispatch_planned(
-                            &rd.tables,
-                            &mut pending,
-                            &mut pending_bytes,
-                            commit_ts,
-                            commit_lsn,
-                            Publish::Partial,
-                        )
-                        .await?;
+                        if let Some(segment) = pending.take() {
+                            self.dispatch_segment(segment, commit_lsn, Publish::Partial)
+                                .await?;
+                        }
                         let fenced = self.barrier_fence().await?;
-                        let rel = &rd.tables[h.table as usize].descriptor;
-                        self.apply_truncate(fenced, rel, &h.decoded, commit_ts)
-                            .await
+                        let rel = &rd.tables[t.table as usize].descriptor;
+                        let at = Stamp {
+                            lsn: t.source_lsn,
+                            xid: t.xid,
+                            commit_ts,
+                        };
+                        self.apply_truncate(fenced, rel, at).await
                     })
                     .await?;
                 }
-                PlanItem::Heap(h) => {
-                    rows_total += 1;
-                    pending_bytes += h.bytes;
-                    pending.push(h);
-                    if pending.len() >= self.batch_rows || pending_bytes >= self.batch_bytes {
-                        self.dispatch_planned(
-                            &rd.tables,
-                            &mut pending,
-                            &mut pending_bytes,
-                            commit_ts,
-                            commit_lsn,
-                            Publish::Partial,
-                        )
-                        .await?;
+                PlanItem::Segment(segment) => {
+                    rows_total += segment.rows;
+                    if let Some(prev) = pending.replace(segment) {
+                        self.dispatch_segment(prev, commit_lsn, Publish::Partial)
+                            .await?;
                     }
                 }
             }
@@ -1033,16 +1064,11 @@ impl ReorderSink {
         if rows_cursor < total_rows {
             Box::pin(self.put_plan_rows(&rd.row_batches, &mut rows_cursor, total_rows)).await?;
         }
-        let published = !pending.is_empty();
-        self.dispatch_planned(
-            &rd.tables,
-            &mut pending,
-            &mut pending_bytes,
-            commit_ts,
-            commit_lsn,
-            Publish::Commit,
-        )
-        .await?;
+        let published = pending.is_some();
+        if let Some(segment) = pending {
+            self.dispatch_segment(segment, commit_lsn, Publish::Commit)
+                .await?;
+        }
         Ok((rows_total, published))
     }
 
@@ -1181,8 +1207,14 @@ impl ReorderSink {
                 let (batch_rows, batch_bytes) = (self.batch_rows, self.batch_bytes);
                 let out = &mut self.out;
                 let stats = self.stats.clone();
-                let mut planner =
-                    Planner::create(plan_path, self.plan_disk_max, &mut view, &resolver);
+                let mut planner = Planner::create(
+                    plan_path,
+                    self.plan_disk_max,
+                    (batch_rows, batch_bytes),
+                    commit_ts,
+                    &mut view,
+                    &resolver,
+                );
                 loop {
                     let Some(batch) = drain
                         .next_batch_admitting(batch_rows, batch_bytes, async |bytes| {
@@ -1343,6 +1375,7 @@ fn bump_plan_failure(stats: &EmitterStats, reason: &'static str) {
         "detoast" => &stats.plan_failures_detoast,
         "partial_update" => &stats.plan_failures_partial_update,
         "view" => &stats.plan_failures_view,
+        "encode" => &stats.plan_failures_encode,
         _ => &stats.plan_failures_drain,
     };
     counter.fetch_add(1, Ordering::Relaxed);
@@ -1409,6 +1442,8 @@ pub struct RouteMaps {
     memo: HashMap<RelName, (Arc<RelDescriptor>, Option<Arc<RouteSnapshot>>)>,
     /// Routes by owning relation
     owned: HashMap<RelName, Option<Arc<RouteSnapshot>>>,
+    /// Compiled against `memo` routes, cleared with them
+    encoders: EncoderCache,
 }
 
 impl RouteMaps {
@@ -1416,6 +1451,7 @@ impl RouteMaps {
         self.overlay.clear();
         self.memo.clear();
         self.owned.clear();
+        self.encoders.clear();
     }
 }
 
@@ -1463,22 +1499,28 @@ impl ReorderRouteView<'_> {
 }
 
 impl PlanRouteView for ReorderRouteView<'_> {
-    fn route_for(&mut self, heap: &DescribedHeap) -> Option<Arc<RouteSnapshot>> {
-        let rel_name = &heap.descriptor.rel_name;
+    fn route_for(&mut self, rel: &Arc<RelDescriptor>) -> Option<Arc<RouteSnapshot>> {
+        let rel_name = &rel.rel_name;
         if let Some((desc, r)) = self.maps.memo.get(rel_name)
-            && Arc::ptr_eq(desc, &heap.descriptor)
+            && Arc::ptr_eq(desc, rel)
         {
             r.clone()
         } else {
             let rules = self.config.as_ref().map(|rc| rc.rules.clone());
-            let route = route_via(&heap.descriptor, rules.as_deref(), |owner| {
-                self.owned_route(owner)
-            });
+            let route = route_via(rel, rules.as_deref(), |owner| self.owned_route(owner));
             self.maps
                 .memo
-                .insert(rel_name.clone(), (heap.descriptor.clone(), route.clone()));
+                .insert(rel_name.clone(), (rel.clone(), route.clone()));
             route
         }
+    }
+
+    fn take_encoders(&mut self) -> EncoderCache {
+        std::mem::take(&mut self.maps.encoders)
+    }
+
+    fn keep_encoders(&mut self, encoders: EncoderCache) {
+        self.maps.encoders = encoders;
     }
 
     fn unmapped(&mut self, rel: &RelDescriptor, heaps: u64) {
@@ -1517,29 +1559,6 @@ impl PlanRouteView for ReorderRouteView<'_> {
     }
 }
 
-impl ReorderSink {
-    async fn handle(&mut self, record: &Record<'_>) -> Result<(), SinkError> {
-        if !Self::wants(record) {
-            return Ok(());
-        }
-        let info = record.parsed.header.info;
-        let op = info & XLOG_XACT_OPMASK;
-        let xid = record.parsed.header.xact_id;
-        match op {
-            XLOG_XACT_COMMIT | XLOG_XACT_COMMIT_PREPARED => self.on_commit(xid, info, record).await,
-            XLOG_XACT_ABORT | XLOG_XACT_ABORT_PREPARED => self.on_abort(xid, info, record).await,
-            XLOG_XACT_ASSIGNMENT => {
-                if let Some((xtop, subs)) = parse_xact_assignment(&record.parsed.main_data) {
-                    self.subxact_tracker.lock().await.assign(xtop, &subs);
-                }
-                Ok(())
-            }
-            // PREPARE allocates no seq; COMMIT_PREPARED drains it later
-            _ => Ok(()),
-        }
-    }
-}
-
 impl RecordSink for ReorderSink {
     fn wants(record: &Record<'_>) -> bool {
         record.parsed.header.resource_manager_id == RmId::Xact as u8
@@ -1561,20 +1580,35 @@ impl RecordSink for ReorderSink {
         &'a mut self,
         record: &'a Record<'a>,
     ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
-        Box::pin(async move {
-            self.handle(record).await?;
-            self.out.flush_pending().await
-        })
+        self.on_records(std::slice::from_ref(record))
     }
 
     fn on_records<'a>(
         &'a mut self,
         batch: &'a [Record<'a>],
-        _pre: &'a mut [Option<Predecoded>],
     ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
         Box::pin(async move {
+            // Dispatch inline: a per-record helper future would copy the
+            // commit future once more per commit
             for record in batch.iter().filter(|r| Self::wants(r)) {
-                self.handle(record).await?;
+                let info = record.parsed.header.info;
+                let xid = record.parsed.header.xact_id;
+                match info & XLOG_XACT_OPMASK {
+                    XLOG_XACT_COMMIT | XLOG_XACT_COMMIT_PREPARED => {
+                        self.on_commit(xid, info, record).await?;
+                    }
+                    XLOG_XACT_ABORT | XLOG_XACT_ABORT_PREPARED => {
+                        self.on_abort(xid, info, record).await?;
+                    }
+                    XLOG_XACT_ASSIGNMENT => {
+                        if let Some((xtop, subs)) = parse_xact_assignment(&record.parsed.main_data)
+                        {
+                            self.subxact_tracker.lock().await.assign(xtop, &subs);
+                        }
+                    }
+                    // PREPARE allocates no seq; COMMIT_PREPARED drains it later
+                    _ => {}
+                }
             }
             self.out.flush_pending().await
         })
@@ -1605,7 +1639,6 @@ impl RecordSink for ReorderSink {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::decode::heap_decoder::{DecodedHeap, HeapOp};
     use crate::emit::pipeline::tail::{self, TailParts};
     use crate::mapping::TableTarget;
     use crate::xact::xact_buffer::raw_fixtures::int4_descriptor;
@@ -1619,21 +1652,10 @@ mod tests {
         }
     }
 
-    fn heap_of(rel: &RelName) -> DescribedHeap {
+    fn rel_of(rel: &RelName) -> Arc<RelDescriptor> {
         let mut desc = (*int4_descriptor(16400)).clone();
         desc.rel_name = rel.clone();
-        DescribedHeap {
-            decoded: DecodedHeap {
-                rfn: desc.rfn,
-                xid: 1,
-                source_lsn: 0x100,
-                op: HeapOp::Insert,
-                new: None,
-                old: None,
-            },
-            descriptor: Arc::new(desc),
-            descriptor_valid_from: 0x40,
-        }
+        Arc::new(desc)
     }
 
     #[tokio::test]
@@ -1654,8 +1676,8 @@ mod tests {
             stats,
             RouteMaps::default(),
         );
-        assert!(view.route_for(&heap_of(&planned)).is_some());
-        assert!(view.route_for(&heap_of(&added)).is_none());
+        assert!(view.route_for(&rel_of(&planned)).is_some());
+        assert!(view.route_for(&rel_of(&added)).is_none());
 
         handle.publish(Arc::new(HashMap::from_iter([(
             added.clone(),
@@ -1663,11 +1685,11 @@ mod tests {
         )])));
 
         assert!(
-            view.route_for(&heap_of(&planned)).is_some(),
+            view.route_for(&rel_of(&planned)).is_some(),
             "republish can't unroute rows already planned"
         );
         assert!(
-            view.route_for(&heap_of(&added)).is_none(),
+            view.route_for(&rel_of(&added)).is_none(),
             "republish can't route rows this transaction planned unmapped"
         );
     }
@@ -1733,7 +1755,7 @@ mod tests {
             crate::mapping::mapping_handle(HashMap::from_iter([(rel.clone(), mapping_for(&rel))]));
         let snapshot = handle.snapshot();
         let stats = Arc::new(EmitterStats::default());
-        let heap = heap_of(&rel);
+        let heap = rel_of(&rel);
         let memoized = |view: &ReorderRouteView, desc: &Arc<RelDescriptor>| {
             view.maps
                 .memo
@@ -1765,20 +1787,16 @@ mod tests {
             Arc::ptr_eq(&first, &view.route_for(&heap).unwrap()),
             "next commit reuses the carried route"
         );
-        assert!(memoized(&view, &heap.descriptor));
+        assert!(memoized(&view, &heap));
 
-        let mut altered = heap.clone();
-        altered.descriptor = Arc::new((*heap.descriptor).clone());
+        let altered = Arc::new((*heap).clone());
         view.route_for(&altered).expect("mapped");
-        assert!(
-            memoized(&view, &altered.descriptor),
-            "new descriptor version rebuilds"
-        );
+        assert!(memoized(&view, &altered), "new descriptor version rebuilds");
 
         // Catalog event folded mid-plan drops the memo even without an
         // applicator to predict its mapping
         view.apply(&DrainEntry::Catalog(SchemaEvent::Dropped {
-            oid: altered.descriptor.oid,
+            oid: altered.oid,
             rel_name: rel.clone(),
             partition: None,
         }))
@@ -1793,7 +1811,7 @@ mod tests {
         .await
         .unwrap();
         assert!(
-            memoized(&view, &altered.descriptor),
+            memoized(&view, &altered),
             "non-catalog entries keep the memo"
         );
     }
@@ -1805,11 +1823,70 @@ mod tests {
             fatal: fatal.clone(),
             seqs: ack.seqs(0).buffer_events(),
             staged: Vec::new(),
+            pending: Vec::new(),
+            pending_permit: None,
+            encoders: Encoders::default(),
+            stats: Arc::default(),
             staged_rows: 0,
             staged_bytes: 0,
             budget: Some(budget.clone()),
         };
         (out, tail)
+    }
+
+    /// Encoded and pending segments ship in staging order, each run of one
+    /// kind as one message
+    #[tokio::test]
+    async fn staged_kinds_ship_in_seq_order() {
+        use crate::emit::pipeline::plan_spool::PendingRows;
+        let fatal = Fatal::new();
+        let (ack, _collector) =
+            crate::emit::pipeline::ack::spawn(Arc::new(Monotone::default()), fatal.clone());
+        let (msg_tx, mut msg_rx) = mpsc::channel(8);
+        let mut out = Outbox {
+            msg_tx,
+            fatal,
+            seqs: ack.seqs(0).buffer_events(),
+            staged: Vec::new(),
+            pending: Vec::new(),
+            pending_permit: None,
+            encoders: Encoders::default(),
+            stats: Arc::default(),
+            staged_rows: 0,
+            staged_bytes: 0,
+            budget: None,
+        };
+        let segment = |body| Segment {
+            body,
+            rows: 0,
+            bytes: 0,
+        };
+        let encoded = || segment(SegmentBody::Encoded(Vec::new()));
+        let pending = || segment(SegmentBody::Pending(PendingRows::default()));
+        for (seq, s) in [
+            (1, encoded()),
+            (2, encoded()),
+            (3, pending()),
+            (4, pending()),
+            (5, encoded()),
+        ] {
+            out.stage(seq, s, None).await.unwrap();
+        }
+        out.flush_pending().await.unwrap();
+        let mut shipped = Vec::new();
+        while let Ok(msg) = msg_rx.try_recv() {
+            shipped.push(match msg {
+                BatcherMsg::Segments(s) => {
+                    format!("{:?}", s.iter().map(|s| s.seq).collect::<Vec<_>>())
+                }
+                BatcherMsg::Encoded(job) => {
+                    job.await.unwrap().unwrap();
+                    "job".into()
+                }
+                BatcherMsg::FlushAll(_) => unreachable!(),
+            });
+        }
+        assert_eq!(shipped, ["[1, 2]", "job", "[5]"]);
     }
 
     /// Pool short only by permits riding staged rows: admission ships them
@@ -1820,9 +1897,10 @@ mod tests {
         let fatal = Fatal::new();
         let (mut out, _tail) = outbox(&budget, &fatal);
         let staged = budget.try_admit(768 << 10).unwrap();
-        out.staged.push(RowChunk {
+        out.staged.push(PlacedSegment {
+            seq: 0,
+            chunks: Vec::new(),
             permit: Some(Arc::new(staged)),
-            ..Default::default()
         });
         let permit = tokio::time::timeout(Duration::from_secs(5), out.admit(512 << 10))
             .await

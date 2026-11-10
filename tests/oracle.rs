@@ -567,6 +567,118 @@ async fn oracle_encodes_tier3_disk_bytes() {
     assert_eq!(oracle.stats.errors.load(Ordering::Relaxed), 0);
 }
 
+/// `array_send` of one-dimensional int4 `values`, big-endian throughout
+fn array_int4_send(values: &[i32]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for v in [1i32, 0, 23, values.len() as i32, 1] {
+        out.extend_from_slice(&v.to_be_bytes());
+    }
+    for v in values {
+        out.extend_from_slice(&4i32.to_be_bytes());
+        out.extend_from_slice(&v.to_be_bytes());
+    }
+    out
+}
+
+/// COPY `typsend` bytes decode through `typreceive`; NULL takes the
+/// column default; leftover or short bytes and types without a receive
+/// function fail the request, which the worker survives
+#[tokio::test(flavor = "current_thread")]
+async fn oracle_receives_binary_cells() {
+    let tmp = tempfile::tempdir().unwrap();
+    let Some(guard) = start_pg(&tmp, ports::PG_SHADOW_PORT) else {
+        return;
+    };
+    let oracle = oracle_on(&guard.sh).await;
+    let encode = async |oid, ty, cells: Vec<OracleCell>| {
+        let n = cells.len();
+        let b = buf(oid, cells);
+        let columns = [OracleRequestColumn {
+            ordinal: 0,
+            name: "value",
+            target_type: ty,
+            buf: &b,
+        }];
+        oracle
+            .encode_batch(Oracle::ANY_DATABASE, &columns, n, alloc())
+            .await
+    };
+
+    let block = encode(
+        INT4ARRAYOID,
+        "Array(Int32)",
+        vec![
+            OracleCell::BinaryInput(array_int4_send(&[1, 2, 3])),
+            OracleCell::Default,
+            OracleCell::BinaryInput(array_int4_send(&[])),
+        ],
+    )
+    .await
+    .expect("binary cells decode");
+    let tags = block.column(0).unwrap();
+    assert_eq!(tags.array_offsets().unwrap(), [3, 3, 3]);
+    assert_eq!(
+        tags.array_values().unwrap().fixed().unwrap().1,
+        [1i32, 2, 3]
+            .into_iter()
+            .flat_map(i32::to_le_bytes)
+            .collect::<Vec<_>>()
+    );
+    // int4_send is four big-endian bytes, rendered through typoutput
+    let block = encode(
+        23,
+        "Nullable(String)",
+        vec![
+            OracleCell::BinaryInput((-7i32).to_be_bytes().to_vec()),
+            OracleCell::Default,
+        ],
+    )
+    .await
+    .expect("scalar binary cell decodes");
+    let value = block.column(0).unwrap();
+    assert_eq!(value.null_map().unwrap(), [0, 1]);
+    assert_eq!(
+        value.nullable_inner().unwrap().string().unwrap(),
+        (&[2, 2][..], &b"-7"[..])
+    );
+
+    let mut trailing = array_int4_send(&[1]);
+    trailing.push(0);
+    let mut short = array_int4_send(&[1]);
+    short.pop();
+    let cases = [
+        (
+            INT4ARRAYOID,
+            "Array(Int32)",
+            trailing,
+            "incorrect binary data format",
+        ),
+        (
+            INT4ARRAYOID,
+            "Array(Int32)",
+            short,
+            "insufficient data left in message",
+        ),
+        // aclitem has typinput but no typreceive
+        (1033, "String", b"x".to_vec(), "no binary input function"),
+    ];
+    for (oid, ty, bad, expected) in cases {
+        let err = encode(oid, ty, vec![OracleCell::BinaryInput(bad)])
+            .await
+            .expect_err("malformed binary cell fails");
+        let msg = err.to_string();
+        assert!(msg.contains(expected), "{msg}");
+        assert!(!err.retryable());
+    }
+    encode(
+        INT4ARRAYOID,
+        "Array(Int32)",
+        vec![OracleCell::BinaryInput(array_int4_send(&[4]))],
+    )
+    .await
+    .expect("worker still serves");
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn oracle_defaults_fill_absent_cells() {
     let tmp = tempfile::tempdir().unwrap();

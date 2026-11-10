@@ -1149,7 +1149,7 @@ async fn session_body(
                 emitter_cfg.row_budget = rc.row_budget;
                 emitter_cfg.byte_budget = rc.byte_budget;
                 emitter_cfg.flush_timeout = rc.flush_timeout;
-                emitter_cfg.conn.compression = rc.conn.compression;
+                emitter_cfg.compression = rc.compression;
                 emitter_cfg.retry.max_attempts = rc.retry_max_attempts;
             }
             if let Some(applicator) = built.applicator {
@@ -1203,7 +1203,7 @@ async fn session_body(
     } else {
         // Metrics-only (no CH): the identical pipeline with a null tail —
         // zero CH connections, no DDL applicator, no oracle (nothing ships,
-        // PgPending stays raw). The empty mapping routes nothing, so seqs
+        // out-of-matrix values stay stored bytes). The empty mapping routes nothing, so seqs
         // complete at placement and the watermark + slot advance move as in
         // a CH run. Emitter stats stay unexported (`emitter_stats_handle`
         // None), matching the old serial surface.
@@ -1262,7 +1262,7 @@ async fn session_body(
         )
         .await?;
     let mirror_resolver = reorder_sink.planning_resolver();
-    let predecode = Arc::new(decoder.predecoder(reorder_sink.planning_resolver()));
+    let prescan = Arc::new(decoder.prescan(reorder_sink.planning_resolver()));
     let decoder_xact = QueueingRecordSink::spawn(
         DecoderXactPair {
             decoder,
@@ -1272,7 +1272,7 @@ async fn session_body(
         decoder_queue_capacity,
         span_registry.clone(),
     )
-    .with_predecode(predecode);
+    .with_prescan(prescan);
     let boundary_gate = CatalogBoundaryGate::new(
         shadow_state.clone(),
         BoundaryGateConfig {

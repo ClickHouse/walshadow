@@ -37,13 +37,14 @@ use clickhouse_c::tls::{self, rustls};
 use walrus::pg::walparser::RelFileNode;
 use walshadow::ch::CompressionChoice;
 use walshadow::ch_emitter::{EmitterConfig, EmitterStats, InstanceConfig};
-use walshadow::heap_decoder::{ColumnValue, CommittedTuple, DecodedHeap, DecodedTuple, HeapOp};
+use walshadow::datum::build;
+use walshadow::heap_decoder::{CommittedTuple, DecodedHeap, DecodedTuple, HeapOp};
 use walshadow::mapping::{ColumnMapping, TableMapping, TableTarget};
 use walshadow::pipeline::ack::Publish;
-use walshadow::pipeline::batcher::{BatcherMsg, RoutedRow, RowChunk, RowTable};
+use walshadow::pipeline::batcher::{BatcherMsg, PlacedSegment};
 use walshadow::pipeline::{Fatal, tail};
 use walshadow::pos::{EmitterAck, Monotone};
-use walshadow::schema::{RelDescriptor, RelName, ReplIdent};
+use walshadow::schema::{INT4OID, RelAttr, RelDescriptor, RelName, ReplIdent, TEXTOID};
 
 const RFN: RelFileNode = RelFileNode {
     spc_node: 1663,
@@ -269,6 +270,28 @@ impl Drop for TlsChServer {
     }
 }
 
+/// Source attribute of `type_oid` stored `type_len` wide; encoding follows it
+fn attr(attnum: i16, name: &str, type_oid: u32, type_len: i16) -> RelAttr {
+    RelAttr {
+        attnum,
+        name: name.into(),
+        type_oid,
+        typmod: -1,
+        not_null: false,
+        dropped: false,
+        type_name: String::new(),
+        type_byval: type_len > 0 && type_len <= 8,
+        type_len,
+        type_align: if type_len == 8 || type_len == 12 {
+            'd'
+        } else {
+            'i'
+        },
+        type_storage: if type_len < 0 { 'x' } else { 'p' },
+        missing_default: None,
+    }
+}
+
 fn rel_descriptor() -> RelDescriptor {
     RelDescriptor {
         rfn: RFN,
@@ -280,7 +303,7 @@ fn rel_descriptor() -> RelDescriptor {
         persistence: 'p',
         ancestors: Vec::new(),
         replident: ReplIdent::Default { pk_attnums: None },
-        attributes: vec![],
+        attributes: vec![attr(1, "id", INT4OID, 4), attr(2, "name", TEXTOID, -1)],
     }
 }
 
@@ -314,9 +337,9 @@ async fn emitter_tls_round_trip() {
             port: ch.secure_port,
             database: "walshadow_test".into(),
             secure: true,
-            compression: CompressionChoice::Lz4,
             ..Default::default()
         },
+        compression: CompressionChoice::Lz4,
         tls_config: Some(ch.pinned_config()),
         ..Default::default()
     };
@@ -363,10 +386,7 @@ async fn emitter_tls_round_trip() {
             source_lsn: 0x2000,
             op: HeapOp::Insert,
             new: Some(DecodedTuple {
-                columns: vec![
-                    Some(ColumnValue::Int4(1)),
-                    Some(ColumnValue::Text("over-tls".into())),
-                ],
+                columns: vec![Some(build::int4(1)), Some(build::text("over-tls"))],
                 partial: false,
             }),
             old: None,
@@ -377,23 +397,19 @@ async fn emitter_tls_round_trip() {
     let mut seqs = ack.seqs(0);
     let seq = seqs.open(tuple.commit_lsn, Publish::Commit);
     msg_tx
-        .send(BatcherMsg::Rows(RowChunk {
-            tables: vec![RowTable {
-                rel,
-                route: walshadow::emit::route::RouteSnapshot::freeze(
+        .send(BatcherMsg::Segments(vec![
+            PlacedSegment::of_rows(
+                seq.seq(),
+                &rel,
+                &walshadow::emit::route::RouteSnapshot::freeze(
                     mapping,
                     Arc::default(),
                     Default::default(),
                 ),
-            }],
-            rows: vec![RoutedRow {
-                seq: seq.seq(),
-                table: 0,
-                committed: tuple,
-                value_permit: None,
-            }],
-            permit: None,
-        }))
+                &[tuple],
+            )
+            .expect("encode row"),
+        ]))
         .await
         .expect("route row");
     seqs.place(seq, 1);

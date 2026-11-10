@@ -10,7 +10,8 @@ use tokio::sync::Semaphore;
 use tokio_util::task::AbortOnDropHandle;
 
 use crate::budget::{MemoryBudget, MemoryPermit};
-use crate::decode::heap_decoder::{ColumnValue, ToastPointer};
+use crate::decode::datum::Datum;
+use crate::decode::heap_decoder::ToastPointer;
 use crate::toast::{pointer_extsize, pointer_footprint};
 
 pub const AHEAD_READS: usize = crate::ops::bridge::MAX_BRIDGE_WORKERS;
@@ -21,7 +22,7 @@ const ENTRY_OVERHEAD: usize = 512;
 type Key = (u32, u32);
 
 pub struct ReadValue {
-    pub value: ColumnValue,
+    pub value: Datum,
     pub permit: MemoryPermit,
 }
 
@@ -45,7 +46,6 @@ impl Pending {
 struct Entry {
     db: u32,
     p: ToastPointer,
-    type_oid: u32,
     read: Pending,
 }
 
@@ -58,7 +58,7 @@ pub struct PendingReads {
     entries: HashMap<Key, Entry>,
 }
 
-/// Fetch and decompress transients; rendered values top up once their size is known
+/// Fetch and decompress transients; held values top up once their size is known
 fn read_cost(p: &ToastPointer) -> usize {
     pointer_extsize(p)
         .saturating_mul(2)
@@ -66,9 +66,9 @@ fn read_cost(p: &ToastPointer) -> usize {
         .saturating_add(ENTRY_OVERHEAD)
 }
 
-/// Bytes a value rendered to `rendered` bytes holds until planning consumes it
-pub fn retained_bytes(rendered: usize, p: &ToastPointer) -> u64 {
-    rendered.max(pointer_footprint(p)).saturating_mul(2) as u64
+/// Bytes a value of `held` raw bytes retains until planning consumes it
+pub fn retained_bytes(held: usize, p: &ToastPointer) -> u64 {
+    held.max(pointer_footprint(p)).saturating_mul(2) as u64
 }
 
 impl PendingReads {
@@ -87,7 +87,6 @@ impl PendingReads {
         &mut self,
         db: u32,
         p: &ToastPointer,
-        type_oid: u32,
         lsn: u64,
         read: impl FnOnce(MemoryPermit) -> F,
     ) where
@@ -122,7 +121,6 @@ impl PendingReads {
             Entry {
                 db,
                 p: *p,
-                type_oid,
                 read: Pending {
                     lsn,
                     started,
@@ -132,10 +130,10 @@ impl PendingReads {
         );
     }
 
-    pub fn take(&mut self, db: u32, p: &ToastPointer, type_oid: u32, lsn: u64) -> Option<Pending> {
+    pub fn take(&mut self, db: u32, p: &ToastPointer, lsn: u64) -> Option<Pending> {
         let key = (p.va_toastrelid, p.va_valueid);
         let e = self.entries.get(&key)?;
-        if (e.db, e.p, e.type_oid) != (db, *p, type_oid) || e.read.lsn > lsn {
+        if (e.db, e.p) != (db, *p) || e.read.lsn > lsn {
             return None;
         }
         Some(self.entries.remove(&key)?.read)
@@ -163,7 +161,7 @@ impl crate::budget::Reclaim for std::sync::Mutex<PendingReads> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{JSONBOID, TEXTOID};
+    use crate::decode::datum::build;
 
     fn pointer(id: u32, size: u32) -> ToastPointer {
         ToastPointer {
@@ -175,7 +173,7 @@ mod tests {
     }
 
     fn ready(value: &str) -> impl FnOnce(MemoryPermit) -> std::future::Ready<Option<ReadValue>> {
-        let value = ColumnValue::Text(value.into());
+        let value = build::text(value);
         |permit| std::future::ready(Some(ReadValue { value, permit }))
     }
 
@@ -190,19 +188,13 @@ mod tests {
         let p = pointer(1, 4104);
         let mut pending = PendingReads::new(MemoryBudget::new(128 << 10));
         let budget = pending.budget().clone();
-        pending.reserve(1, &p, JSONBOID, 100, ready("v"));
+        pending.reserve(1, &p, 100, ready("v"));
         settle().await;
-        assert!(pending.take(2, &p, JSONBOID, 100).is_none());
-        assert!(pending.take(1, &p, TEXTOID, 100).is_none());
-        assert!(pending.take(1, &p, JSONBOID, 99).is_none());
-        let value = pending
-            .take(1, &p, JSONBOID, 100)
-            .unwrap()
-            .take()
-            .await
-            .unwrap();
-        assert_eq!(value.value, ColumnValue::Text("v".into()));
-        assert!(pending.take(1, &p, JSONBOID, 100).is_none());
+        assert!(pending.take(2, &p, 100).is_none());
+        assert!(pending.take(1, &p, 99).is_none());
+        let value = pending.take(1, &p, 100).unwrap().take().await.unwrap();
+        assert_eq!(value.value, build::text("v"));
+        assert!(pending.take(1, &p, 100).is_none());
         assert!(budget.resident_bytes() > 0);
         drop(value);
         assert_eq!(budget.resident_bytes(), 0);
@@ -213,26 +205,26 @@ mod tests {
         let mut pending = PendingReads::new(MemoryBudget::new(1024));
         let budget = pending.budget().clone();
         let p = pointer(1, 1);
-        pending.reserve(1, &p, TEXTOID, 100, |permit| async move {
+        pending.reserve(1, &p, 100, |permit| async move {
             let _permit = permit;
             std::future::pending().await
         });
         settle().await;
-        pending.reserve(1, &pointer(2, 1), TEXTOID, 100, ready("v"));
-        assert!(pending.take(1, &pointer(2, 1), TEXTOID, 100).is_none());
+        pending.reserve(1, &pointer(2, 1), 100, ready("v"));
+        assert!(pending.take(1, &pointer(2, 1), 100).is_none());
         pending.forget((p.va_toastrelid, p.va_valueid));
         settle().await;
         assert_eq!(budget.resident_bytes(), 0);
-        pending.reserve(1, &pointer(2, 1), TEXTOID, 100, ready("v"));
-        assert!(pending.take(1, &pointer(2, 1), TEXTOID, 100).is_some());
+        pending.reserve(1, &pointer(2, 1), 100, ready("v"));
+        assert!(pending.take(1, &pointer(2, 1), 100).is_some());
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn planning_does_not_wait_for_queued_reads() {
         let mut pending = PendingReads::new(MemoryBudget::new(4096));
         let p = pointer(1, 1);
-        pending.reserve(1, &p, TEXTOID, 100, ready("v"));
-        let slot = pending.take(1, &p, TEXTOID, 100).unwrap();
+        pending.reserve(1, &p, 100, ready("v"));
+        let slot = pending.take(1, &p, 100).unwrap();
         assert!(slot.take().await.is_none());
     }
 }

@@ -5,7 +5,16 @@ use std::hint::black_box;
 use std::time::{Duration, Instant};
 
 use clap::Parser;
-use walshadow::codecs::{decode_jsonb_with_capacity, jsonb_text_len};
+use walshadow::codecs::{jsonb_text_len, render_jsonb_text};
+
+fn decode_jsonb_with_capacity(
+    body: &[u8],
+    len: usize,
+) -> Result<String, walshadow::codecs::CodecError> {
+    let mut out = String::with_capacity(len);
+    render_jsonb_text(body, &mut out)?;
+    Ok(out)
+}
 
 #[derive(Debug, Parser)]
 struct Args {

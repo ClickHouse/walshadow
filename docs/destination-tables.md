@@ -198,9 +198,10 @@ By default, a tee uses its main destination's instance and database. Set
 use `archive`, and another copy of orders goes to `[ch]`
 
 Named connections accept `host`, `port`, `database`, `user`, `password`, `secure`,
-`tls_server_name`, and `compression`, with the same defaults as `[ch]`.
+and `tls_server_name`, with the same defaults as `[ch]`.
 Credentials from `[ch]` are not reused for named connections. All destinations
-share pipeline limits, pool sizes, retry settings, and column layout. Reload
+share pipeline limits, pool sizes, retry settings, `[ch] compression`, and column
+layout. Reload
 TOML to update connection names and table mappings. `config_table` has no instance
 column. `default` is reserved, and unknown names cause configuration errors
 
@@ -343,7 +344,12 @@ Common mappings include:
 | `inet`, `cidr`, `interval`, unknown types | `String` |
 
 Nullable source columns become `Nullable(...)` unless used as ClickHouse sort
-keys. ClickHouse deployments using PostgreSQL `time` columns must enable
+keys or mapped to arrays or maps. Default array and map mappings turn NULL into
+empty containers
+Arrays, maps, and vectors currently use shadow PostgreSQL conversion, including
+when destination uses Native container types
+
+ClickHouse deployments using PostgreSQL `time` columns must enable
 `Time64` support
 
 Use a column rule to override an inferred type; see
