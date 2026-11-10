@@ -156,13 +156,12 @@ count. Each scenario asserts CH end state against source, not just execution
 
 ### Backfill
 
-- Object-store opt-in pass: every `backfill_staging_e2e` opt-in
-  lacks a `[backup]` section and falls back to COPY. Give fixture an FsStorage
-  backup root, push a backup and WAL past it, opt in above redo LSN with a
-  TOAST-external row. Covers `run_object_store_pass`, `walk_and_ship` gap leg,
-  `prescan_gap`, `replay_gap`, `drain_deferred`. Then crash after walk and rerun
-  for `reopen_walk_spools` and ready-checkpoint resume, or hand-seed checkpoints
-  as `backup_checkpoint_e2e` does
+- Object-store opt-in pass: `backfill_staging_e2e` pushes a backup into an
+  FsStorage root and covers the gap leg, a pre-flight failure that retries and
+  a walk failure that falls back. Still open: opt in above redo LSN with a
+  TOAST-external row for `drain_deferred`, then crash after walk and rerun for
+  `reopen_walk_spools` and ready-checkpoint resume, or hand-seed checkpoints as
+  `backup_checkpoint_e2e` does
 - `copy_backfill` pending tables: hold an open xact on target table across a
   base-backup opt-in, commit or abort after walk, for `hold_pending`,
   `release_pending` and `settle_ended_pending`. `copy_chunk_blocks = 1` on a

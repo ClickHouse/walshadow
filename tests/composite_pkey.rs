@@ -125,10 +125,7 @@ fn live_pairs(ch: &fx::ChServer) -> String {
 }
 
 fn skip_gate() -> bool {
-    if !fx::tools::requirements_available() {
-        return true;
-    }
-    false
+    !fx::tools::requirements_available()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

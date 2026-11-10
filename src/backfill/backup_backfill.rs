@@ -44,14 +44,14 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use walrus::pg::backup::BACKUP_NAME_PREFIX;
 use walrus::pg::replication::base_backup::BaseBackupOpts;
 use walrus::pg::wal::segment::SegmentName;
 use walrus::pg::walparser::{Oid, RmId};
 
-use crate::backfill::backfill_types::{BackupRequest, PassContext, PassOutcome};
+use crate::backfill::backfill_types::{BackupRequest, PassContext, PassError, PassOutcome};
 use crate::backfill::backup_checkpoint::{self, BackupCheckpoint, WalkState};
 use crate::backfill::backup_page_walk::{
     BOOTSTRAP_TUPLE_CHANNEL_CAP, BackfillTuple, CatalogMap, CompleteAccums, GateAccums,
@@ -97,12 +97,14 @@ pub async fn run_pass(
     ctx: &PassContext,
     mode: InitialLoadMode,
     reqs: &[BackupRequest],
-) -> Result<PassOutcome> {
+) -> Result<PassOutcome, PassError> {
     match mode {
-        InitialLoadMode::None | InitialLoadMode::Copy => {
-            bail!("backup_backfill: mode {mode:?} routes via the copy backfiller")
-        }
-        InitialLoadMode::BaseBackup => run_base_backup_pass(ctx, reqs).await,
+        InitialLoadMode::None | InitialLoadMode::Copy => Err(PassError::Preflight(anyhow!(
+            "backup_backfill: mode {mode:?} routes via the copy backfiller"
+        ))),
+        InitialLoadMode::BaseBackup => run_base_backup_pass(ctx, reqs)
+            .await
+            .map_err(PassError::Load),
         InitialLoadMode::ObjectStore => run_object_store_pass(ctx, reqs).await,
     }
 }
@@ -156,7 +158,51 @@ fn target_db_oid(reqs: &[BackupRequest]) -> Result<Oid> {
     Ok(db_oid)
 }
 
-async fn run_object_store_pass(ctx: &PassContext, reqs: &[BackupRequest]) -> Result<PassOutcome> {
+struct ObjectStorePass {
+    source: Box<dyn BackupSource>,
+    tags: HashMap<(Oid, Oid), u64>,
+    patch: SealedPatch,
+    replay: Option<ReplayLeg>,
+    outcome: PassOutcome,
+    resolved: String,
+    seg_dir: PathBuf,
+}
+
+async fn run_object_store_pass(
+    ctx: &PassContext,
+    reqs: &[BackupRequest],
+) -> Result<PassOutcome, PassError> {
+    let ObjectStorePass {
+        source,
+        tags,
+        patch,
+        replay,
+        mut outcome,
+        resolved,
+        seg_dir,
+    } = prepare_object_store_pass(ctx, reqs)
+        .await
+        .map_err(PassError::Preflight)?;
+    walk_and_ship(
+        ctx,
+        source,
+        reqs,
+        &tags,
+        patch,
+        replay,
+        &mut outcome,
+        Some(resolved),
+    )
+    .await
+    .map_err(PassError::Load)?;
+    tokio::fs::remove_dir_all(&seg_dir).await.ok();
+    Ok(outcome)
+}
+
+async fn prepare_object_store_pass(
+    ctx: &PassContext,
+    reqs: &[BackupRequest],
+) -> Result<ObjectStorePass> {
     let target_db = target_db_oid(reqs)?;
     // Archive from the `[backup]` config, never the source-PG overlay:
     // credentials in a source table is the wrong trust direction
@@ -252,20 +298,15 @@ async fn run_object_store_pass(ctx: &PassContext, reqs: &[BackupRequest]) -> Res
         .map(|r| (rfn_key(&r.desc), r.s_lsn.min(b_redo)))
         .collect();
     let had_gap = !gap_segments.is_empty();
-    walk_and_ship(
-        ctx,
+    Ok(ObjectStorePass {
         source,
-        reqs,
-        &tags,
+        tags,
         patch,
-        had_gap.then_some((gap_segments, b_redo)),
-        &mut outcome,
-        Some(resolved),
-    )
-    .await?;
-    // Fetched segments only help a *failed* pass resume; reclaim on success
-    tokio::fs::remove_dir_all(&seg_dir).await.ok();
-    Ok(outcome)
+        replay: had_gap.then_some((gap_segments, b_redo)),
+        outcome,
+        resolved,
+        seg_dir,
+    })
 }
 
 fn rfn_key(desc: &RelDescriptor) -> (Oid, Oid) {
