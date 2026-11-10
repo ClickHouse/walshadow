@@ -244,16 +244,16 @@ pub fn freeze_routes(
 /// root's route once
 #[derive(Debug)]
 pub struct FrozenRoutes {
-    owned: ahash::HashMap<RelName, Arc<RouteSnapshot>>,
+    owned: foldhash::HashMap<RelName, Arc<RouteSnapshot>>,
     rules: Option<Arc<TableRules>>,
     /// Routes by row relation, bypassing partition routing
-    pinned: ahash::HashMap<RelName, Arc<RouteSnapshot>>,
-    partitions: std::sync::Mutex<ahash::HashMap<Oid, Option<Arc<RouteSnapshot>>>>,
+    pinned: foldhash::HashMap<RelName, Arc<RouteSnapshot>>,
+    partitions: std::sync::Mutex<foldhash::HashMap<Oid, Option<Arc<RouteSnapshot>>>>,
 }
 
 impl FrozenRoutes {
     /// Routes keyed by the relation rows come from, partitions included
-    pub fn pinned(pinned: ahash::HashMap<RelName, Arc<RouteSnapshot>>) -> Self {
+    pub fn pinned(pinned: foldhash::HashMap<RelName, Arc<RouteSnapshot>>) -> Self {
         Self {
             owned: Default::default(),
             rules: None,

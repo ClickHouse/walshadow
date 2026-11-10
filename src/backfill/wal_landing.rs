@@ -46,7 +46,7 @@ pub async fn filter_landed_wal(
     tracker: CatalogTracker,
     // Start with staged relations, then add relations created during recovery
     // `None` keeps only catalog WAL
-    shadow_rels: Option<(ahash::HashSet<(u32, u32)>, u64)>,
+    shadow_rels: Option<(foldhash::HashSet<(u32, u32)>, u64)>,
 ) -> Result<LandedWalStats> {
     let segments = segments_on_disk(pg_wal, timeline).await?;
     let in_window = segments

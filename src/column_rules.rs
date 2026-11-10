@@ -1,6 +1,6 @@
 //! Resolves column settings from TOML and runtime config
 
-use ahash::HashMap;
+use foldhash::HashMap;
 
 use crate::schema::RelName;
 use crate::table_rules::{MatchKind, NamePattern, RelMatcher, set_if};

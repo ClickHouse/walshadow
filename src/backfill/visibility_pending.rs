@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use ahash::{HashMap, HashMapExt, HashSet, HashSetExt};
+use foldhash::{HashMap, HashMapExt, HashSet, HashSetExt};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::mpsc;
@@ -271,8 +271,8 @@ pub async fn ship(
     let column_rules = config
         .as_ref()
         .map_or_else(Arc::default, |rc| rc.column_rules.clone());
-    let mut routes: ahash::HashMap<RelName, Arc<RouteSnapshot>> =
-        ahash::HashMap::with_capacity(tally.len());
+    let mut routes: foldhash::HashMap<RelName, Arc<RouteSnapshot>> =
+        foldhash::HashMap::with_capacity(tally.len());
     let mut manifests = Vec::with_capacity(tally.len());
     let mut sess = StagingSession::connect(dest.clone())
         .await

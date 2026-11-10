@@ -1330,7 +1330,7 @@ mod tests {
     #[test]
     fn render_declares_each_family_once() {
         let body = render(MetricsSnapshot::default());
-        let mut seen: ahash::HashMap<&str, usize> = ahash::HashMap::default();
+        let mut seen: foldhash::HashMap<&str, usize> = foldhash::HashMap::default();
         for line in body.lines() {
             if let Some(rest) = line.strip_prefix("# TYPE ")
                 && let Some(name) = rest.split_whitespace().next()

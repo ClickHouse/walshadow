@@ -30,10 +30,11 @@ path = "src/lib.rs"
 [features]
 # Compression codecs for CH-Native emitter & wal-rus archives. Forwarded to
 # clickhouse-c-rs so its `chc_*_codec_init` symbols & C TU link only what the
-# top crate offers. Flip `default-features = false` for an uncompressed-only
-# build with neither codec lib linked — which then cannot decode a compressed
-# server response. Both by default: the wire flag only says what we send, and
-# a server answers in whatever method it is configured for.
+# top crate offers. Flip `default-features = false` for a build with no
+# CH-Native wire compression or lz4/zstd archive reads — which then cannot
+# decode a compressed server response. WAL FPI/TOAST decoding links lz4/zstd
+# regardless. Both by default: the wire flag only says what we send, and a
+# server answers in whatever method it is configured for.
 default = ["lz4", "zstd"]
 lz4 = ["clickhouse-c-rs/lz4", "wal-rus/lz4"]
 zstd = ["clickhouse-c-rs/zstd", "wal-rus/zstd"]
@@ -55,7 +56,7 @@ wal-rus = { version = "0.4.2", default-features = false, features = ["s3", "gcs"
 clickhouse-c-rs = { version = "0.2.2", default-features = false, features = ["tokio", "tls"] }
 # hash keys are internal (relfilenodes, oids, xids, names), never network
 # input, so SipHash's HashDoS margin buys nothing at 2-4x per probe
-ahash = "0.8"
+foldhash = "0.2"
 anyhow = "1"
 async-channel = "2.5"
 async-trait = "0.1"
@@ -63,7 +64,6 @@ backon = { version = "1", features = ["tokio-sleep"] }
 bytes = "1"
 clap = { version = "4", features = ["derive", "env"] }
 crc32c = "0.6"
-fallible-iterator = "0.2"
 fearless_simd = "1.2"
 fearless_simd_macros = "0.1"
 futures = "0.3"

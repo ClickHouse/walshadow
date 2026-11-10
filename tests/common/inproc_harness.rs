@@ -520,7 +520,7 @@ pub struct BuildPipelineArgs<'a> {
 
 #[derive(Default)]
 pub struct DdlPipelineArgs {
-    pub namespaces: ahash::HashMap<String, NamespaceMapping>,
+    pub namespaces: foldhash::HashMap<String, NamespaceMapping>,
     pub drop_table_strategy: Option<DropTableStrategy>,
     /// Source-PG schema holding the `config_*` runtime-config overlay tables
     /// (TOML `[runtime_config] schema`). `Some` diverts their heap writes into

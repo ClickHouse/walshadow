@@ -34,7 +34,7 @@ use crate::ops::bridge::{
 #[cfg(test)]
 use crate::pg::socket_conninfo;
 use crate::schema::{FIRST_NORMAL_OBJECT_ID, RelDescriptor, RelName, ReplIdent};
-use ahash::{HashMap, HashMapExt};
+use foldhash::{HashMap, HashMapExt};
 
 #[derive(Debug, Error)]
 pub enum CatalogError {

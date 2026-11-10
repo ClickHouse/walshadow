@@ -5,9 +5,9 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use ahash::{HashMap, HashMapExt};
 use anyhow::{Context, Result};
 use backon::{ExponentialBuilder, Retryable};
+use foldhash::{HashMap, HashMapExt};
 use tokio::sync::{Mutex, watch};
 use tokio_postgres::types::Oid;
 use tokio_util::sync::CancellationToken;
@@ -2447,7 +2447,7 @@ async fn session_body(
 #[derive(Default)]
 pub(crate) struct SessionTasks {
     set: tokio::task::JoinSet<()>,
-    names: ahash::HashMap<tokio::task::Id, &'static str>,
+    names: foldhash::HashMap<tokio::task::Id, &'static str>,
 }
 
 impl SessionTasks {

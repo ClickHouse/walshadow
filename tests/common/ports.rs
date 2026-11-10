@@ -28,7 +28,7 @@ use std::net::TcpListener;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-use ahash::{HashSet, HashSetExt};
+use foldhash::{HashSet, HashSetExt};
 use walrus::pg::replication::conn::PgConfig;
 use walrus::pg::replication::tls::{SslMode, TlsParams};
 use walshadow::shadow::Shadow;

@@ -22,7 +22,7 @@
 use crate::decode::heap_decoder::{ColumnValue, DecodedHeap, HeapOp};
 use crate::schema::{RelDescriptor, RelName};
 use crate::table_rules::MatchKind;
-use ahash::HashMap;
+use foldhash::HashMap;
 
 pub const CONFIG_GLOBAL: &str = "config_global";
 pub const CONFIG_NAMESPACE: &str = "config_namespace";

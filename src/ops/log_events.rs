@@ -2,7 +2,7 @@ use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, PoisonError, RwLock};
 
-use ahash::{HashMap, HashMapExt};
+use foldhash::{HashMap, HashMapExt};
 use prometheus_client::collector::Collector;
 use prometheus_client::encoding::DescriptorEncoder;
 

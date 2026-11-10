@@ -3,8 +3,8 @@
 
 use std::sync::Arc;
 
-use ahash::HashSet;
 use anyhow::Context;
+use foldhash::HashSet;
 use tokio::sync::{Mutex, watch};
 use tokio_util::sync::CancellationToken;
 use walshadow::config::ResolvedConfig;
@@ -218,7 +218,7 @@ pub(crate) async fn load_runtime_config(
 pub(crate) async fn apply_toml_initial_loads(
     catalog: &Arc<Mutex<ShadowCatalog>>,
     backfiller: Option<&Arc<walshadow::copy_backfill::CopyBackfiller>>,
-    table_initial_loads: &ahash::HashMap<RelName, String>,
+    table_initial_loads: &foldhash::HashMap<RelName, String>,
     active_tables: &HashSet<RelName>,
     sql_scoped_tables: &HashSet<RelName>,
     raw_start: u64,

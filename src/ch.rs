@@ -322,7 +322,7 @@ pub struct ChConn {
     instance: Option<String>,
     selected: Option<Arc<EmitterConfig>>,
     active: Connection,
-    parked: ahash::HashMap<Option<String>, Connection>,
+    parked: foldhash::HashMap<Option<String>, Connection>,
     dest: Arc<DestEmitter>,
     dials: u64,
 }

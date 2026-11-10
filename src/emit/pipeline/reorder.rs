@@ -33,7 +33,7 @@ use crate::emit::ch_ddl::{DdlApplicator, Stamp};
 use crate::emit::ch_emitter::EmitterStats;
 use crate::record::{Record, RecordSink, SinkError};
 use crate::schema::{RelDescriptor, RelName, SchemaEvent, TableKey};
-use ahash::{HashMap, HashMapExt, HashSet, HashSetExt};
+use foldhash::{HashMap, HashMapExt, HashSet, HashSetExt};
 use tracing::Instrument;
 
 use crate::decode::wal_xact::{

@@ -23,7 +23,7 @@ use tokio_postgres::types::Oid;
 use walrus::pg::walparser::RelFileNode;
 
 use crate::schema::RelDescriptor;
-use ahash::HashMap;
+use foldhash::HashMap;
 
 /// Why one transaction's pending coverage stopped being trustworthy. Every
 /// reason falls back to commit-time capture, which is sound

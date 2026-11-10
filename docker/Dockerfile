@@ -15,9 +15,9 @@
 ARG PG_MAJOR=18
 
 FROM rust:1-alpine AS rust-builder
-# build-base: gcc 15 + musl-dev + make. lz4/zstd dev+headers for the
-# clickhouse-c-rs codecs. Dynamic musl link (crt-static off) so the binary
-# resolves liblz4.so.1/libzstd.so.1 shipped in postgres:*-alpine at runtime.
+# build-base: gcc 15 + musl-dev + make. lz4/zstd headers for clickhouse-c-rs;
+# the codecs themselves link statically from lz4-sys/zstd-sys. Dynamic musl
+# link (crt-static off).
 RUN apk add --no-cache \
         build-base \
         lz4-dev \
@@ -61,7 +61,7 @@ RUN make -C pgext clean \
 FROM postgres:${PG_MAJOR}-alpine AS runtime
 # ca-certificates: TLS to clickhouse.
 # postgis: so the daemon-owned shadow PG can render the schema's geography
-# column via typoutput. liblz4/libzstd already present as PG deps.
+# column via typoutput.
 RUN apk add --no-cache ca-certificates postgis
 
 COPY --from=rust-builder /usr/local/bin/walshadow-stream /usr/local/bin/walshadow-stream

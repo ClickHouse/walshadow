@@ -36,7 +36,7 @@ use crate::filter::shadow_relations::ShadowRelations;
 use crate::record::{AffectedOid, BoundaryInfo, BoundaryKind, Route, rmgr_label};
 use crate::schema::FIRST_NORMAL_OBJECT_ID;
 use crate::toast::xid_ceiling::{XidCeiling, follows};
-use ahash::{HashMap, HashSet, HashSetExt};
+use foldhash::{HashMap, HashSet, HashSetExt};
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct FilterStats {

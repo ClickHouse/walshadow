@@ -33,7 +33,7 @@ use crate::source::source_feed::{SourceEvent, SourceFeed, StandbyStatus};
 use crate::source::wal_stream::WalStream;
 use crate::toast::ToastResolver;
 use crate::xact::xact_buffer::{XactBuffer, XactBufferConfig};
-use ahash::HashSet;
+use foldhash::HashSet;
 
 /// Wind-down poll while source sends no WAL
 const STOP_POLL: Duration = Duration::from_millis(100);

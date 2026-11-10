@@ -26,7 +26,7 @@ use crate::ch::{ChConn, EmitterError, exec_drain, query_strings, quote_ident};
 use crate::config::DestEmitter;
 use crate::mapping::{MappingHandle, TableMapping, TableTarget};
 use crate::schema::RelName;
-use ahash::{HashMap, HashMapExt, HashSet};
+use foldhash::{HashMap, HashMapExt, HashSet};
 
 /// `orders` loads into `orders__wsstg`; deterministic so a retry or boot
 /// recovery finds the prior attempt's table

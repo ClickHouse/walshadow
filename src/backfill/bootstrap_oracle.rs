@@ -2,8 +2,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use ahash::{HashMap, HashSet};
 use anyhow::{Context, Result};
+use foldhash::{HashMap, HashSet};
 use futures::{SinkExt, TryStreamExt};
 use tokio_postgres::types::Oid;
 use tokio_postgres::{Client, NoTls};

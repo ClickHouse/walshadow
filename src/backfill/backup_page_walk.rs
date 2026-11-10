@@ -34,7 +34,7 @@ use crate::decode::heap_decoder::{
 };
 use crate::decode::visibility::{PgMultiXactAccum, PgXactAccum, PgXactView, SealedPatch};
 use crate::schema::RelDescriptor;
-use ahash::{HashMap, HashMapExt, HashSet};
+use foldhash::{HashMap, HashMapExt, HashSet};
 
 /// Heap page size, PG compile-time, identical to wal-rus `BLOCK_SIZE`
 pub const PAGE_BYTES: usize = 8192;

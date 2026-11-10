@@ -38,7 +38,7 @@ use crate::pos::{
     SourceReceived,
 };
 use crate::record::{RecordBytesSink, SinkError};
-use ahash::{HashMap, HashMapExt};
+use foldhash::{HashMap, HashMapExt};
 
 /// libpq environment for shadow's walreceiver. This walsender speaks protocol
 /// 3.0 and sends no `NegotiateProtocolVersion`; PG 19 beta libpq greases every

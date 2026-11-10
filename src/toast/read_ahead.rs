@@ -5,7 +5,7 @@ use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use ahash::{HashMap, HashMapExt};
+use foldhash::{HashMap, HashMapExt};
 use tokio::sync::Semaphore;
 use tokio_util::task::AbortOnDropHandle;
 

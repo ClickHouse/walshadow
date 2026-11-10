@@ -21,7 +21,7 @@ use crate::backfill::backup_source::{
 };
 use crate::backfill::pg_path::{is_system_dir, parse_base_path};
 use crate::schema::FIRST_NORMAL_OBJECT_ID;
-use ahash::HashSet;
+use foldhash::HashSet;
 
 /// `relfilenode < 16384` is always bootstrap catalog. Rotated-catalog
 /// filenodes (`VACUUM FULL` / `REINDEX` on a catalog) land in `whitelist`.

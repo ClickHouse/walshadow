@@ -305,7 +305,7 @@ async fn tables_list<'a>(ctx: &SharedCtx, req: &Request<'a>) -> Result<String> {
     let listed = introspect::tables(&client, ns)
         .await
         .context("list tables")?;
-    let selected: ahash::HashSet<(String, String)> =
+    let selected: foldhash::HashSet<(String, String)> =
         selected_tables(&root, db).into_iter().collect();
     let arr = listed
         .into_iter()

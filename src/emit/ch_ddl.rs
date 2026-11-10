@@ -55,7 +55,7 @@ use crate::schema::{
     ReplIdent, SchemaDiff, SchemaEvent, replident_key_attnums,
 };
 use crate::table_rules::{PartitionRoute, TableRule, TableRules};
-use ahash::{HashMap, HashSet};
+use foldhash::{HashMap, HashSet};
 use tokio_postgres::types::Oid;
 
 /// Knobs that don't ride the INSERT pump. [`DdlApplicator`] rebuilds them
@@ -1780,7 +1780,7 @@ async fn ensure_instance_database(cfg: &EmitterConfig) -> Result<bool, EmitterEr
 mod tests {
     use super::*;
     use crate::mapping::{ColumnMapping, TableMapping, derive_columns_for_mapping};
-    use ahash::HashSetExt;
+    use foldhash::HashSetExt;
     use std::sync::LazyLock;
 
     static SYS: LazyLock<Arc<SystemColumns>> = LazyLock::new(Arc::default);
@@ -1888,7 +1888,7 @@ mod tests {
     #[test]
     fn auto_create_name_names_derived_destinations_only() {
         use crate::mapping::NamespaceMapping;
-        use ahash::{HashMap, HashMapExt};
+        use foldhash::{HashMap, HashMapExt};
         let mut namespaces = HashMap::new();
         namespaces.insert(
             "public".to_string(),
@@ -1993,7 +1993,7 @@ mod tests {
     #[test]
     fn per_namespace_target_and_drop_override_global() {
         use crate::mapping::NamespaceMapping;
-        use ahash::{HashMap, HashMapExt};
+        use foldhash::{HashMap, HashMapExt};
         let mut namespaces = HashMap::new();
         namespaces.insert(
             "analytics".to_string(),
@@ -2046,7 +2046,7 @@ mod tests {
 
     #[test]
     fn with_drop_strategy_overrides_global_default() {
-        use ahash::{HashMap, HashMapExt};
+        use foldhash::{HashMap, HashMapExt};
         let cfg = DdlConfig {
             instances: Default::default(),
             drop_table_strategy: DropTableStrategy::Retain,
@@ -2155,7 +2155,7 @@ mod tests {
             runtime_config_schema: Some("walshadow".into()),
             target_database: "default".into(),
             source_database: "app".into(),
-            namespaces: ahash::HashMap::default(),
+            namespaces: foldhash::HashMap::default(),
             soft_delete: false,
             system: Arc::default(),
             rules: Arc::new(rules),
@@ -3015,7 +3015,7 @@ mod tests {
         );
     }
 
-    fn orders_mapping() -> (RelName, ahash::HashMap<RelName, TableMapping>) {
+    fn orders_mapping() -> (RelName, foldhash::HashMap<RelName, TableMapping>) {
         let rel = RelName::new("public", "orders");
         let map = [(
             rel.clone(),
@@ -3049,7 +3049,7 @@ mod tests {
         let handle = crate::mapping::mapping_handle(map);
         let at = handle.snapshot();
         ensure_unmoved(&handle, &rel, &at).unwrap();
-        handle.publish(Arc::new(ahash::HashMap::default()));
+        handle.publish(Arc::new(foldhash::HashMap::default()));
         let err = ensure_unmoved(&handle, &rel, &at)
             .expect_err("republish invalidates the resolved target");
         assert!(matches!(err, EmitterError::Config(_)), "{err}");
@@ -3060,7 +3060,7 @@ mod tests {
         let (rel, map) = orders_mapping();
         let handle = crate::mapping::mapping_handle(map);
         let frozen = handle.snapshot();
-        handle.publish(Arc::new(ahash::HashMap::default()));
+        handle.publish(Arc::new(foldhash::HashMap::default()));
         let cfg = DdlConfig {
             instances: Default::default(),
             drop_table_strategy: DropTableStrategy::Drop,
@@ -3071,7 +3071,7 @@ mod tests {
             runtime_config_schema: None,
             target_database: "default".into(),
             source_database: "app".into(),
-            namespaces: ahash::HashMap::default(),
+            namespaces: foldhash::HashMap::default(),
             soft_delete: false,
             system: Arc::default(),
             rules: Arc::default(),
@@ -3110,7 +3110,7 @@ mod tests {
             runtime_config_schema: None,
             target_database: "default".into(),
             source_database: "app".into(),
-            namespaces: ahash::HashMap::default(),
+            namespaces: foldhash::HashMap::default(),
             soft_delete: false,
             system: Arc::default(),
             rules: Arc::default(),
@@ -3376,7 +3376,7 @@ mod tests {
             runtime_config_schema: None,
             target_database: "default".into(),
             source_database: "app".into(),
-            namespaces: ahash::HashMap::default(),
+            namespaces: foldhash::HashMap::default(),
             soft_delete: false,
             system: Arc::default(),
             rules: Arc::default(),

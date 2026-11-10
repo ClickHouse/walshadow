@@ -39,7 +39,7 @@ use crate::xact::xact_buffer::{
     BufferingDecoderSink, DrainEntry, DrainedBatch, SubxactTracker, WalkStep, XactBuffer,
     detoast_heap, heap_reads_toast, resolve_stash,
 };
-use ahash::{HashMap, HashSet};
+use foldhash::{HashMap, HashSet};
 
 /// Per-filenode descriptor and exclusive replay ceiling
 pub type ReplayTargets = HashMap<(Oid, Oid), (Arc<RelDescriptor>, u64)>;

@@ -27,7 +27,7 @@ use crate::emit::route::RouteSnapshot;
 use crate::schema::RelDescriptor;
 use crate::xact::spill::{self, Cursor, IO_CHUNK, SpillError};
 use crate::xact::xact_buffer::{DrainEntry, OrderedEvent, ToastRowBatch};
-use ahash::HashMap;
+use foldhash::HashMap;
 
 /// ASCII for `xxd`-friendly debug
 pub const PLAN_MAGIC: [u8; 2] = *b"WP";

@@ -79,7 +79,7 @@ use walrus::pg::walparser::RelFileNode;
 
 use crate::pos::{Floor, Pos};
 use crate::schema::{MissingDefault, RelAttr, RelDescriptor, RelName, ReplIdent};
-use ahash::{HashMap, HashSet, HashSetExt};
+use foldhash::{HashMap, HashSet, HashSetExt};
 
 pub const CKPT_FILE: &str = "desc_log.ckpt";
 pub const TAIL_FILE: &str = "desc_log.tail";

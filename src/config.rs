@@ -42,7 +42,7 @@ use crate::mapping::{
 use crate::runtime_config::{ConfigEvent, ConfigOverlay, TableRow};
 use crate::schema::{RelDescriptor, RelName, SchemaDiff};
 use crate::table_rules::{MatchKind, TableRule, TableRules, TableRulesBuilder};
-use ahash::{HashMap, HashSet};
+use foldhash::{HashMap, HashSet};
 
 #[derive(Clone, PartialEq, Eq, serde::Deserialize)]
 #[serde(default)]
@@ -991,7 +991,7 @@ impl ConfigResolver {
 mod tests {
     use super::*;
     use crate::runtime_config::{ColumnRow, GlobalRow, NamespaceRow, TableRow};
-    use ahash::HashMapExt;
+    use foldhash::HashMapExt;
 
     fn base_with(drop_strategy: &str) -> EmitterConfig {
         EmitterConfig::from_toml_str(&format!(
@@ -1561,7 +1561,7 @@ mod tests {
         );
     }
 
-    fn auto_create_set(base: &EmitterConfig, overlay: &ConfigOverlay) -> ahash::HashSet<String> {
+    fn auto_create_set(base: &EmitterConfig, overlay: &ConfigOverlay) -> foldhash::HashSet<String> {
         use crate::emit::ch_ddl::DdlConfig;
         let (r, _) = ConfigResolver::resolve(
             base,

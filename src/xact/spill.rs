@@ -63,7 +63,7 @@ use crate::decode::heap_decoder::{
     ColumnValue, DecodedHeap, DecodedTuple, DescribedHeap, HeapOp, ToastPointer,
 };
 use crate::schema::RelDescriptor;
-use ahash::{HashMap, HashMapExt};
+use foldhash::{HashMap, HashMapExt};
 
 /// Heap tuples + TOAST chunks share the file: both flush at commit drain,
 /// WAL-aligned ordering keeps the drain a single linear read

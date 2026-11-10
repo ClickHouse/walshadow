@@ -14,7 +14,7 @@
 
 use std::collections::hash_map::Entry;
 
-use ahash::{HashMap, HashMapExt};
+use foldhash::{HashMap, HashMapExt};
 
 /// One catalog-dirty xid's accumulated capture inputs
 #[derive(Debug)]

@@ -4,8 +4,8 @@
 //! landed in place by the backup, then replayed. Index filenodes are absent
 //! from the catalog seed, so the source answers for them.
 
-use ahash::{HashMap, HashSet, HashSetExt};
 use anyhow::{Context, Result, bail, ensure};
+use foldhash::{HashMap, HashSet, HashSetExt};
 use tokio::sync::Mutex;
 
 use crate::catalog::shadow_catalog::ShadowCatalog;

@@ -362,7 +362,7 @@ async fn bootstrap_oracle_keeps_rows_sharing_oids_with_staging_objects() {
     .await
     .unwrap();
     let got = oracle_shadow(&base).psql_one(copied).unwrap();
-    let have: ahash::HashSet<&str> = got.split(',').collect();
+    let have: foldhash::HashSet<&str> = got.split(',').collect();
     let missing: Vec<&str> = expected.split(',').filter(|t| !have.contains(t)).collect();
     assert!(
         missing.is_empty(),

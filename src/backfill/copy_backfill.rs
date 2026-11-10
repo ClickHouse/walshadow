@@ -107,7 +107,7 @@ const COPY_SLAB_ROWS: usize = 1024;
 /// Decoded value bytes per hop. With
 /// [`BOOTSTRAP_TUPLE_CHANNEL_CAP`] this is the resident payload ceiling
 pub const COPY_SLAB_BYTES: usize = 1 << 20;
-use ahash::{HashMap, HashMapExt, HashSet, HashSetExt};
+use foldhash::{HashMap, HashMapExt, HashSet, HashSetExt};
 
 const LEDGER_FILENAME: &str = "backfills.toml";
 const LEDGER_VERSION: u32 = 1;

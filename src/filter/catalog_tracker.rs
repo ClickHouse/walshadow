@@ -40,7 +40,7 @@ use crate::filter::pg_class_decoder::{
     info_carries_new_tuple_heap2, info_is_inplace, page_rows, tuple_slots,
 };
 use crate::schema::FIRST_NORMAL_OBJECT_ID;
-use ahash::{HashMap, HashSet};
+use foldhash::{HashMap, HashSet};
 
 /// XLOG_RELMAP_UPDATE info byte (`xl_info & XLR_RMGR_INFO_MASK`).
 const XLOG_RELMAP_UPDATE: u8 = 0x00;
