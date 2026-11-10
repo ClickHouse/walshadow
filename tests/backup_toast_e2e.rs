@@ -11,7 +11,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use tokio::sync::{Mutex, watch};
-use walshadow::backfill_types::{BackupRequest, PassContext, PassOutcome};
+use walshadow::backfill_types::{BackupRequest, PassContext, PassError, PassOutcome};
 use walshadow::backup_checkpoint::BackupCheckpoint;
 use walshadow::ch_emitter::{EmitterConfig, EmitterStats, InstanceConfig};
 use walshadow::copy_backfill::CopyBackfiller;
@@ -325,7 +325,7 @@ impl Passes {
             .unwrap()
     }
 
-    async fn run(&self, checkpoint: BackupCheckpoint) -> anyhow::Result<PassOutcome> {
+    async fn run(&self, checkpoint: BackupCheckpoint) -> Result<PassOutcome, PassError> {
         let ctx = self.ctx(self.emitter.clone(), checkpoint);
         walshadow::backup_backfill::run_pass(&ctx, InitialLoadMode::ObjectStore, &self.reqs).await
     }
@@ -614,6 +614,7 @@ async fn object_store_pass_resumes_from_its_checkpoint() {
     let err = passes.run(fresh.clone()).await.unwrap_err();
     std::fs::remove_dir(&blocker).unwrap();
     let kind = err
+        .inner()
         .downcast_ref::<std::io::Error>()
         .map(std::io::Error::kind);
     assert_eq!(kind, Some(std::io::ErrorKind::IsADirectory), "{err:#}");

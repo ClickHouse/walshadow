@@ -32,6 +32,8 @@ struct Fixture {
     log: Arc<DescriptorLog>,
     desc: Arc<RelDescriptor>,
     stats: Arc<EmitterStats>,
+    config: Option<Arc<walshadow::config::ResolvedConfig>>,
+    budget: Option<walshadow::budget::MemoryBudget>,
     _tmp: tempfile::TempDir,
 }
 
@@ -123,6 +125,8 @@ impl Fixture {
             log,
             desc,
             stats: Arc::new(EmitterStats::default()),
+            config: None,
+            budget: None,
             _tmp: tmp,
         }
     }
@@ -148,9 +152,9 @@ impl Fixture {
                 self.catalog.clone(),
                 self.log.clone(),
                 dir,
-                None,
+                self.config.clone().map(|c| watch::channel(c).1),
                 watch::channel(Arc::new(TimelineHistory::root(1))).1,
-                None,
+                self.budget.clone(),
                 None,
                 source_major,
                 self.system_id(),
@@ -666,7 +670,10 @@ async fn dropped_table_backfill_finishes() {
         return;
     }
     for mode in [InitialLoadMode::Copy, InitialLoadMode::ObjectStore] {
-        let fx = Fixture::new().await;
+        let mut fx = Fixture::new().await;
+        let archive = archive_root();
+        push_backup(&fx, &archive).await;
+        fx.emitter.backup = Some(archive.settings.clone());
         let dir = tempfile::tempdir().unwrap();
         let backfiller = fx.backfiller(dir.path()).await;
         fx.source.psql_one("DROP TABLE public.t").unwrap();
@@ -681,7 +688,8 @@ async fn failed_backup_defaults_to_copy_at_original_boundary() {
     if !fx::tools::requirements_available() {
         return;
     }
-    let fx = Fixture::new().await;
+    let mut fx = Fixture::new().await;
+    let _archive = broken_backup(&mut fx).await;
     let dir = tempfile::tempdir().unwrap();
     fx.ch
         .query("INSERT INTO default.t (id, name, _lsn) VALUES (2, 'live', 200)")
@@ -763,13 +771,14 @@ async fn failed_backup_copy_fallback_seeds_chunk_mirror() {
     if !fx::tools::requirements_available() {
         return;
     }
-    let fx = Fixture::new().await;
+    let mut fx = Fixture::new().await;
     fx.source
         .psql_one(
             "ALTER TABLE public.t ALTER COLUMN name SET STORAGE EXTERNAL; \
              UPDATE public.t SET name = repeat('external', 1000) WHERE id = 1",
         )
         .unwrap();
+    let _archive = broken_backup(&mut fx).await;
     let dir = tempfile::tempdir().unwrap();
     let backfiller = fx.backfiller(dir.path()).await;
     backfiller
@@ -798,6 +807,7 @@ async fn failed_backup_can_disable_copy_fallback() {
         return;
     }
     let mut fx = Fixture::new().await;
+    let _archive = broken_backup(&mut fx).await;
     fx.emitter.bootstrap.copy_fallback = Some(false);
     let dir = tempfile::tempdir().unwrap();
     let backfiller = fx.backfiller(dir.path()).await;
@@ -820,6 +830,105 @@ async fn failed_backup_can_disable_copy_fallback() {
     assert_eq!(fx.rows(), "");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn preflight_failure_keeps_tables_pending_until_a_retry_succeeds() {
+    if !fx::tools::requirements_available() {
+        return;
+    }
+    let mut fx = Fixture::new().await;
+    let archive = archive_root();
+    fx.emitter.backup = Some(archive.settings.clone());
+    let dir = tempfile::tempdir().unwrap();
+    let backfiller = fx.backfiller(dir.path()).await;
+    backfiller
+        .set_preflight_retry(Duration::from_millis(300), Duration::from_millis(300))
+        .await;
+    backfiller
+        .note_opt_in(&fx.desc, InitialLoadMode::ObjectStore, 100)
+        .await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    backfiller
+        .note_opt_in(&fx.desc, InitialLoadMode::ObjectStore, 100)
+        .await;
+    assert_eq!(backfiller.pending_by_mode(), [0, 0, 1]);
+    assert_eq!(
+        read_ledger(dir.path())["backfill"][0]["mode"].as_str(),
+        Some("object_store")
+    );
+    assert_eq!(fx.rows(), "");
+    assert_eq!(fx.stats.backfill_copy_rows.load(Ordering::Relaxed), 0);
+    push_backup(&fx, &archive).await;
+    wait_done(&backfiller, dir.path()).await;
+    assert_eq!(fx.rows(), "1\tone\n2\ttwo\n3\tthree");
+    assert_eq!(fx.stats.backfill_copy_rows.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        read_ledger(dir.path())["backfill"][0]["mode"].as_str(),
+        Some("object_store")
+    );
+}
+
+struct ArchiveRoot {
+    settings: walrus::config::Settings,
+    storage: walrus::storage::DynStorage,
+    root: tempfile::TempDir,
+}
+
+fn archive_root() -> ArchiveRoot {
+    let root = tempfile::tempdir().unwrap();
+    let storage: walrus::storage::DynStorage =
+        Arc::new(walrus::storage::fs::FsStorage::new(root.path()).unwrap());
+    let settings = walrus::config::Settings {
+        storage: walrus::config::StorageSettings::Fs {
+            path: root.path().to_string_lossy().into_owned(),
+        },
+        compression: walrus::compression::Method::None,
+        compression_level: 0,
+        ..Default::default()
+    };
+    ArchiveRoot {
+        settings,
+        storage,
+        root,
+    }
+}
+
+async fn push_backup(fx: &Fixture, archive: &ArchiveRoot) {
+    walrus::pg::backup::push::handle(
+        &archive.settings,
+        archive.storage.clone(),
+        walrus::pg::backup::push::PushArgs::default(),
+        fx::pg_cfg(&fx.source, "backfill-push"),
+    )
+    .await
+    .unwrap();
+}
+
+fn corrupt_data_parts(archive: &ArchiveRoot) {
+    let mut broken = 0;
+    for backup in std::fs::read_dir(archive.root.path().join("basebackups_005")).unwrap() {
+        let parts = backup.unwrap().path().join("tar_partitions");
+        if !parts.is_dir() {
+            continue;
+        }
+        for part in std::fs::read_dir(parts).unwrap() {
+            let path = part.unwrap().path();
+            if !path.to_string_lossy().contains("pg_control") {
+                std::fs::write(&path, [0xFFu8; 1024]).unwrap();
+                broken += 1;
+            }
+        }
+    }
+    assert!(broken > 0, "backup has data parts");
+}
+
+async fn broken_backup(fx: &mut Fixture) -> ArchiveRoot {
+    let archive = archive_root();
+    push_backup(fx, &archive).await;
+    corrupt_data_parts(&archive);
+    fx.emitter.backup = Some(archive.settings.clone());
+    archive
+}
+
 /// Archive every WAL file in source's `pg_wal`, current segment included, so
 /// the gap through the opt-in boundary is fetchable
 async fn archive_wal(
@@ -840,15 +949,8 @@ async fn archive_wal(
 }
 
 /// Archived backup of public.t, then changes past it. Returns the archive
-/// root, its settings and storage, and the opt-in boundary after the changes
-async fn pushed_backup(
-    fx: &Fixture,
-) -> (
-    tempfile::TempDir,
-    walrus::config::Settings,
-    walrus::storage::DynStorage,
-    u64,
-) {
+/// and the opt-in boundary after the changes
+async fn pushed_backup(fx: &Fixture) -> (ArchiveRoot, u64) {
     // Live capture fills the log in production; replay decodes through it
     fx.log
         .seed(
@@ -868,25 +970,8 @@ async fn pushed_backup(
         )
         .await
         .unwrap();
-    let root = tempfile::tempdir().unwrap();
-    let storage: walrus::storage::DynStorage =
-        Arc::new(walrus::storage::fs::FsStorage::new(root.path()).unwrap());
-    let settings = walrus::config::Settings {
-        storage: walrus::config::StorageSettings::Fs {
-            path: root.path().to_string_lossy().into_owned(),
-        },
-        compression: walrus::compression::Method::None,
-        compression_level: 0,
-        ..Default::default()
-    };
-    walrus::pg::backup::push::handle(
-        &settings,
-        storage.clone(),
-        walrus::pg::backup::push::PushArgs::default(),
-        fx::pg_cfg(&fx.source, "backfill-push"),
-    )
-    .await
-    .unwrap();
+    let archive = archive_root();
+    push_backup(fx, &archive).await;
     fx.source
         .psql_one(
             "UPDATE public.t SET name = 'updated' WHERE id = 1; \
@@ -897,7 +982,7 @@ async fn pushed_backup(
     let s_lsn = fx.source.psql_one("SELECT pg_current_wal_lsn()").unwrap();
     let s_lsn = walrus::pg::backup::parse_pg_lsn(&s_lsn).unwrap();
     fx.source.psql_one("SELECT pg_switch_wal()").unwrap();
-    (root, settings, storage, s_lsn)
+    (archive, s_lsn)
 }
 
 /// [`pushed_backup`] rows as of the opt-in boundary
@@ -912,9 +997,11 @@ async fn object_store_opt_in_replays_archive_gap() {
     }
     let mut fx = Fixture::new().await;
     let u = fx.toastless_rel().await;
-    let (_root, settings, storage, s_lsn) = pushed_backup(&fx).await;
-    archive_wal(&fx.source, &settings, &storage).await;
-    fx.emitter.backup = Some(settings);
+    let (archive, s_lsn) = pushed_backup(&fx).await;
+    archive_wal(&fx.source, &archive.settings, &archive.storage).await;
+    fx.emitter.backup = Some(archive.settings.clone());
+    fx.config = Some(Arc::default());
+    fx.budget = Some(walshadow::budget::MemoryBudget::new(256 << 20));
 
     let dir = tempfile::tempdir().unwrap();
     let backfiller = fx.backfiller(dir.path()).await;
@@ -936,34 +1023,41 @@ async fn object_store_opt_in_replays_archive_gap() {
     );
 }
 
-/// Backups a page walk cannot serve fall back to COPY at the boundary
 #[tokio::test(flavor = "current_thread")]
-async fn unservable_object_store_backups_fall_back_to_copy() {
+async fn unservable_object_store_backups_stay_pending_without_copy() {
     if !fx::tools::requirements_available() {
         return;
     }
     let (logs, _guard) = Logs::capture();
     let mut fx = Fixture::new().await;
-    let (root, settings, _storage, s_lsn) = pushed_backup(&fx).await;
-    fx.emitter.backup = Some(settings);
-    let load = async |fx: &Fixture, why: &str| {
-        let dir = tempfile::tempdir().unwrap();
-        let backfiller = fx.backfiller(dir.path()).await;
+    let (archive, s_lsn) = pushed_backup(&fx).await;
+    let root = &archive.root;
+    fx.emitter.backup = Some(archive.settings.clone());
+    let stalled = async |fx: &Fixture, dir: &Path, why: &str| {
+        let backfiller = fx.backfiller(dir).await;
+        backfiller
+            .set_preflight_retry(Duration::from_millis(300), Duration::from_millis(300))
+            .await;
         backfiller
             .note_opt_in(&fx.desc, InitialLoadMode::ObjectStore, s_lsn)
             .await;
-        wait_done(&backfiller, dir.path()).await;
-        assert!(logs.text().contains(why), "{}", logs.text());
-        assert_eq!(fx.rows(), PAST_BACKUP_ROWS);
+        logs.wait_for(why).await;
+        logs.wait_for("failed before reading the backup").await;
+        assert_eq!(backfiller.pending_by_mode(), [0, 0, 1]);
+        assert_eq!(fx.rows(), "");
         assert_eq!(
-            read_ledger(dir.path())["backfill"][0]["mode"].as_str(),
-            Some("copy")
+            read_ledger(dir)["backfill"][0]["mode"].as_str(),
+            Some("object_store")
         );
-        fx.ch.query("TRUNCATE TABLE default.t").unwrap();
+        backfiller
     };
 
-    // Gap WAL never archived
-    load(&fx, "fetch archive WAL for the gap").await;
+    let dir = tempfile::tempdir().unwrap();
+    let backfiller = stalled(&fx, dir.path(), "fetch archive WAL for the gap").await;
+    archive_wal(&fx.source, &archive.settings, &archive.storage).await;
+    wait_done(&backfiller, dir.path()).await;
+    assert_eq!(fx.rows(), PAST_BACKUP_ROWS);
+    fx.ch.query("TRUNCATE TABLE default.t").unwrap();
 
     let sentinels = root.path().join("basebackups_005");
     let sentinel = std::fs::read_dir(&sentinels)
@@ -975,7 +1069,9 @@ async fn unservable_object_store_backups_fall_back_to_copy() {
         serde_json::from_slice(&std::fs::read(&sentinel).unwrap()).unwrap();
     json["DeltaFrom"] = "base_000000010000000000000001".into();
     std::fs::write(&sentinel, serde_json::to_vec(&json).unwrap()).unwrap();
-    load(&fx, "is a delta backup").await;
+    let dir = tempfile::tempdir().unwrap();
+    stalled(&fx, dir.path(), "is a delta backup").await;
+    assert_eq!(fx.stats.backfill_copy_rows.load(Ordering::Relaxed), 0);
 }
 
 /// Walked load survives a failed gap replay: restart resumes into the same
@@ -988,9 +1084,9 @@ async fn object_store_pass_resumes_walked_load() {
     let (logs, _guard) = Logs::capture();
     let mut fx = Fixture::new().await;
     fx.emitter.bootstrap.copy_fallback = Some(false);
-    let (_root, settings, storage, s_lsn) = pushed_backup(&fx).await;
-    archive_wal(&fx.source, &settings, &storage).await;
-    fx.emitter.backup = Some(settings);
+    let (archive, s_lsn) = pushed_backup(&fx).await;
+    archive_wal(&fx.source, &archive.settings, &archive.storage).await;
+    fx.emitter.backup = Some(archive.settings.clone());
     let dir = tempfile::tempdir().unwrap();
     let replay_spill = dir.path().join("backup_backfill/replay_spill");
     std::fs::create_dir_all(replay_spill.parent().unwrap()).unwrap();
@@ -1302,7 +1398,8 @@ async fn unrecorded_copy_fallback_keeps_backup_mode_pending() {
         return;
     }
     let (logs, _guard) = Logs::capture();
-    let fx = Fixture::new().await;
+    let mut fx = Fixture::new().await;
+    let _archive = broken_backup(&mut fx).await;
     let dir = tempfile::tempdir().unwrap();
     block_ledger(dir.path());
     let backfiller = fx.backfiller(dir.path()).await;
