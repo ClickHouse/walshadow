@@ -391,6 +391,38 @@ impl Ledger {
     }
 }
 
+pub async fn record_bootstrap_loads(
+    spill_dir: &Path,
+    system_id: u64,
+    mode: InitialLoadMode,
+    end_lsn: u64,
+    rels: impl IntoIterator<Item = RelName>,
+) -> std::io::Result<usize> {
+    let mut ledger = Ledger::load(spill_dir, system_id).await?;
+    let mut recorded = 0;
+    for rel in rels {
+        if let Some(rec) = ledger.entries.get(&rel)
+            && matches!(rec.phase, Phase::Swapped { .. })
+        {
+            continue;
+        }
+        ledger.entries.insert(
+            rel,
+            LedgerRec {
+                s_lsn: Pos::new(end_lsn),
+                mode,
+                phase: Phase::Done,
+                toast_seeded: false,
+            },
+        );
+        recorded += 1;
+    }
+    if recorded > 0 {
+        ledger.persist().await?;
+    }
+    Ok(recorded)
+}
+
 // ---------------------------------------------------------------------------
 // Per-column decode plan
 // ---------------------------------------------------------------------------
@@ -2225,6 +2257,63 @@ mod tests {
         assert_eq!(resumed.entries[&rel].mode, InitialLoadMode::Copy);
         assert_eq!(resumed.entries[&rel].s_lsn.get(), 100);
         assert!(!resumed.entries[&rel].done());
+    }
+
+    #[tokio::test]
+    async fn bootstrap_loads_record_done_entries_and_keep_swaps() {
+        let tmp = tempfile::tempdir().unwrap();
+        let orders = RelName::new("app", "orders");
+        let users = RelName::new("app", "users");
+        let swapped = RelName::new("app", "swapped");
+        let mut ledger = Ledger::load(tmp.path(), 7).await.unwrap();
+        ledger.entries.insert(
+            orders.clone(),
+            LedgerRec {
+                s_lsn: 50.into(),
+                mode: InitialLoadMode::Copy,
+                phase: Phase::Pending { copy: None },
+                toast_seeded: false,
+            },
+        );
+        ledger.entries.insert(
+            swapped.clone(),
+            LedgerRec {
+                s_lsn: 50.into(),
+                mode: InitialLoadMode::ObjectStore,
+                phase: Phase::Swapped {
+                    staging_target: None,
+                    staging_uuid: "uuid".into(),
+                },
+                toast_seeded: false,
+            },
+        );
+        ledger.persist().await.unwrap();
+        let recorded = record_bootstrap_loads(
+            tmp.path(),
+            7,
+            InitialLoadMode::ObjectStore,
+            100,
+            [orders.clone(), users.clone(), swapped.clone()],
+        )
+        .await
+        .unwrap();
+        assert_eq!(recorded, 2);
+        let again = Ledger::load(tmp.path(), 7).await.unwrap();
+        for rel in [&orders, &users] {
+            assert!(again.entries[rel].done());
+            assert_eq!(again.entries[rel].s_lsn.get(), 100);
+            assert_eq!(again.entries[rel].mode, InitialLoadMode::ObjectStore);
+        }
+        assert!(matches!(
+            again.entries[&swapped].phase,
+            Phase::Swapped { .. }
+        ));
+        assert_eq!(
+            record_bootstrap_loads(tmp.path(), 7, InitialLoadMode::ObjectStore, 100, [])
+                .await
+                .unwrap(),
+            0
+        );
     }
 
     #[test]
