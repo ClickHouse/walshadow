@@ -9,7 +9,7 @@
 # Override with WALSHADOW_PG_IMAGE=postgres:17 / 18 / etc. Set
 # WALSHADOW_USE_LOCAL=1 to bypass docker; local `postgres` must be 15+.
 #
-# Output: segments/000000010000000000000001.gz
+# Output: segments/000000010000000000000001.zst
 set -eu
 
 here="$(cd "$(dirname "$0")" && pwd)"
@@ -108,5 +108,5 @@ with open(dst, 'wb') as f:
 print(f"kept {keep // PAGE} pages ({keep} bytes) of {n_pages} ({len(data)} bytes)", file=sys.stderr)
 PY
 
-gzip -f -9 "$out/000000010000000000000001"
-echo "wrote $out/000000010000000000000001.gz"
+zstd -f -q -19 --rm "$out/000000010000000000000001"
+echo "wrote $out/000000010000000000000001.zst"

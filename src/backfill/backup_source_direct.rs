@@ -14,6 +14,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use tokio::sync::mpsc;
+use walrus::pg::backup::tarball;
 use walrus::pg::replication::base_backup::{
     BackupEvent, BaseBackupOpts, ChannelReader, run_base_backup,
 };
@@ -103,14 +104,14 @@ impl BackupSource for DirectSource {
 }
 
 /// Drain one archive body through `pump_tar_to_sink`. wal-rus's
-/// `ChannelReader` is `AsyncRead`, so tokio_tar takes it directly, no
+/// `ChannelReader` is `AsyncRead`, so the tar reader takes it directly, no
 /// SyncIoBridge / spawn_blocking.
 async fn drive_archive(
     body: mpsc::Receiver<std::io::Result<bytes::Bytes>>,
     target: &PumpTarget,
 ) -> Result<()> {
     let reader = ChannelReader::new(body);
-    let mut archive = tokio_tar::Archive::new(reader);
+    let mut archive = tarball::Reader::new(reader);
     pump_tar_to_sink(&mut archive, target)
         .await
         .context("DirectSource: tar unpack")?;

@@ -28,15 +28,19 @@ name = "walshadow"
 path = "src/lib.rs"
 
 [features]
-# Compression codecs walshadow's CH-Native emitter links. Forwarded to
+# Compression codecs for CH-Native emitter & wal-rus archives. Forwarded to
 # clickhouse-c-rs so its `chc_*_codec_init` symbols & C TU link only what the
 # top crate offers. Flip `default-features = false` for an uncompressed-only
 # build with neither codec lib linked — which then cannot decode a compressed
 # server response. Both by default: the wire flag only says what we send, and
 # a server answers in whatever method it is configured for.
 default = ["lz4", "zstd"]
-lz4 = ["clickhouse-c-rs/lz4"]
-zstd = ["clickhouse-c-rs/zstd"]
+lz4 = ["clickhouse-c-rs/lz4", "wal-rus/lz4"]
+zstd = ["clickhouse-c-rs/zstd", "wal-rus/zstd"]
+# Read backups & WAL archives other tools compressed with these
+brotli = ["wal-rus/brotli"]
+lzma = ["wal-rus/lzma"]
+gzip = ["wal-rus/gzip"]
 test-support = []
 
 [lints.rust]
@@ -47,13 +51,12 @@ unexpected_cfgs = { level = "warn", check-cfg = ["cfg(coverage)"] }
 unused_async = "warn"
 
 [dependencies]
-wal-rus = "0.4.1"
+wal-rus = { version = "0.4.2", default-features = false, features = ["s3", "gcs", "backup"] }
 clickhouse-c-rs = { version = "0.2.2", default-features = false, features = ["tokio", "tls"] }
 # hash keys are internal (relfilenodes, oids, xids, names), never network
 # input, so SipHash's HashDoS margin buys nothing at 2-4x per probe
 ahash = "0.8"
 anyhow = "1"
-astral-tokio-tar = { version = "0.7", default-features = false }
 async-channel = "2.5"
 async-trait = "0.1"
 backon = { version = "1", features = ["tokio-sleep"] }

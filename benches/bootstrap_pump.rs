@@ -33,6 +33,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
+use walrus::pg::backup::tarball::{Entry, Kind, Reader, Writer};
 use walrus::pg::replication::base_backup::Tablespace;
 use walrus::pg::walparser::RelFileNode;
 
@@ -183,9 +184,7 @@ fn heap_page(tuples: usize, columns: usize, seed: i32) -> Vec<u8> {
 
 /// One tar part holding `segments_per_part` `base/<db>/<filenode>` entries.
 async fn build_part(shape: Shape, part: usize) -> Vec<u8> {
-    use tokio::io::AsyncWriteExt;
-
-    let mut builder = tokio_tar::Builder::new(Vec::new());
+    let mut writer = Writer::new(Vec::new());
     for s in 0..shape.segments_per_part {
         let filenode = FIRST_FILENODE + (part * shape.segments_per_part + s) as u32;
         let mut body = Vec::with_capacity(shape.pages_per_segment * PAGE_BYTES);
@@ -196,23 +195,11 @@ async fn build_part(shape: Shape, part: usize) -> Vec<u8> {
                 (p * 1_000) as i32,
             ));
         }
-        let mut header = tokio_tar::Header::new_gnu();
-        header
-            .set_path(format!("base/{DB_NODE}/{filenode}"))
-            .unwrap();
-        header.set_size(body.len() as u64);
-        header.set_mode(0o600);
-        header.set_entry_type(tokio_tar::EntryType::Regular);
-        header.set_cksum();
-        builder
-            .append(&header, std::io::Cursor::new(body))
-            .await
-            .unwrap();
+        let path = format!("base/{DB_NODE}/{filenode}");
+        let entry = Entry::new(path, Kind::Regular, body.len() as u64, 0o600, 0);
+        writer.append(&entry, body.as_slice()).await.unwrap();
     }
-    builder.finish().await.unwrap();
-    let mut out = builder.into_inner().await.unwrap();
-    out.flush().await.unwrap();
-    out
+    writer.finish().await.unwrap()
 }
 
 /// Object-store-shaped source over pre-built tars: one `pump_tar_to_sink`
@@ -249,7 +236,7 @@ impl BackupSource for MemSource {
             .map(|blob| {
                 let target = target.clone();
                 async move {
-                    let mut archive = tokio_tar::Archive::new(std::io::Cursor::new(blob));
+                    let mut archive = Reader::new(blob.as_slice());
                     pump_tar_to_sink(&mut archive, &target).await
                 }
             })

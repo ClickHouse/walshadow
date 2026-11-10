@@ -22,15 +22,14 @@ use crate::source::wal_stream::WalStream;
 use crate::toast::xid_ceiling::XidCeiling;
 use crate::xact::xact_buffer::BufferingDecoderSink;
 
-/// Generated fixtures are absent until `capture.sh` runs
-const FIXTURES: [(&str, bool); 4] = [
-    ("classify/segments/000000010000000000000001.gz", false),
-    ("filter/segments/000000010000000000000002.gz", false),
-    (
-        "vacuum_full_pg_depend/segments/000000010000000000000002.gz",
-        true,
-    ),
-    ("xlog_switch/segments/000000010000000000000002.gz", true),
+#[path = "../../tests/common/tools.rs"]
+mod tools;
+
+const FIXTURES: [&str; 4] = [
+    "classify/segments/000000010000000000000001.zst",
+    "filter/segments/000000010000000000000002.zst",
+    "vacuum_full_pg_depend/segments/000000010000000000000002.zst",
+    "xlog_switch/segments/000000010000000000000002.zst",
 ];
 
 /// Daemon's skip rule: neither the decoder nor the reorder stage wants it
@@ -87,21 +86,16 @@ async fn pump(name: SegmentName, seg: &[u8], header_only: bool) -> Pumped {
 
 #[tokio::test]
 async fn header_only_path_matches_full_parse() {
-    let (mut header_only, mut toplevel) = (0, 0);
-    let mut classify = false;
-    for (path, committed) in FIXTURES {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    let fixtures = FIXTURES.map(|path| {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("fixtures/wal")
-            .join(path);
-        if !path.exists() {
-            assert!(
-                !committed && std::env::var_os("WALSHADOW_REQUIRE_TOOLS").is_none(),
-                "no fixture at {}",
-                path.display()
-            );
-            continue;
-        }
-        classify |= path.ends_with("classify/segments/000000010000000000000001.gz");
+            .join(path)
+    });
+    if !fixtures.iter().all(|path| tools::fixture(path)) {
+        return;
+    }
+    let (mut header_only, mut toplevel) = (0, 0);
+    for path in fixtures {
         let (name, mut r) = open_segment_file(&path).await.unwrap();
         let mut seg = Vec::new();
         tokio::io::AsyncReadExt::read_to_end(&mut r, &mut seg)
@@ -168,8 +162,5 @@ async fn header_only_path_matches_full_parse() {
         "no fixture record took the header-only path"
     );
     // Classify workload's subtransaction logs its toplevel xid
-    assert!(
-        !classify || toplevel > 0,
-        "no record carried a toplevel xid"
-    );
+    assert!(toplevel > 0, "no record carried a toplevel xid");
 }

@@ -2,7 +2,7 @@
 //! segments, writing filtered segments under their own names.
 //!
 //! ```text
-//! walshadow-filter --in seg1.wal[.zst|.gz|.lz4|.lzma|.br] [--in seg2 …] \
+//! walshadow-filter --in seg1.wal[.zst|.lz4] [--in seg2 …] \
 //!     --out-dir filtered/
 //! ```
 //!
@@ -26,6 +26,10 @@ use walshadow::record::CountingRecordSink;
 use walshadow::segment_sink::DirSegmentSink;
 use walshadow::wal_stream::WalStream;
 
+#[cfg(test)]
+#[path = "../../tests/common/tools.rs"]
+mod tools;
+
 #[derive(Debug, Parser)]
 #[command(
     name = "walshadow-filter",
@@ -33,8 +37,8 @@ use walshadow::wal_stream::WalStream;
     about = "Filter consecutive WAL segments to catalog-only."
 )]
 struct Args {
-    /// Input segment files in LSN order. Compression suffix (.zst .gz .lz4
-    /// .lzma .br) is auto-detected.
+    /// Input segment files in LSN order. Compression suffix (.zst .lz4 .gz
+    /// .lzma .br) is auto-detected, each needs its cargo feature
     #[arg(long = "in", value_name = "SEGMENT", required = true)]
     input: Vec<PathBuf>,
     /// Output directory for filtered segments.
@@ -147,8 +151,10 @@ mod tests {
     #[tokio::test]
     async fn run_filters_fixture_and_writes_segment() {
         let seg = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("fixtures/wal/xlog_switch/segments/000000010000000000000002.gz");
-        assert!(seg.exists(), "committed fixture {seg:?}");
+            .join("fixtures/wal/xlog_switch/segments/000000010000000000000002.zst");
+        if !tools::fixture(&seg) {
+            return;
+        }
         let tmp = tempfile::tempdir().unwrap();
         let out_dir = tmp.path().join("out");
         run(Args {

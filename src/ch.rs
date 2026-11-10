@@ -98,20 +98,24 @@ impl CompressionChoice {
             }
             _ => {}
         }
-        if !cfg!(any(feature = "lz4", feature = "zstd")) {
-            return Ok(None);
+        #[cfg(any(feature = "lz4", feature = "zstd"))]
+        {
+            let mut codec = Codec::empty();
+            // Slots are per method and each init fills only its own, so one codec
+            // decodes both
+            unsafe {
+                let raw = codec.as_mut().raw_mut();
+                #[cfg(feature = "lz4")]
+                clickhouse_c::sys::chc_lz4_codec_init(raw);
+                #[cfg(feature = "zstd")]
+                clickhouse_c::sys::chc_zstd_codec_init(raw);
+            }
+            Ok(Some(codec))
         }
-        let mut codec = Codec::empty();
-        // Slots are per method and each init fills only its own, so one codec
-        // decodes both
-        unsafe {
-            let raw = codec.as_mut().raw_mut();
-            #[cfg(feature = "lz4")]
-            clickhouse_c::sys::chc_lz4_codec_init(raw);
-            #[cfg(feature = "zstd")]
-            clickhouse_c::sys::chc_zstd_codec_init(raw);
+        #[cfg(not(any(feature = "lz4", feature = "zstd")))]
+        {
+            Ok(None)
         }
-        Ok(Some(codec))
     }
 }
 

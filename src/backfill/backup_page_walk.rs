@@ -725,7 +725,7 @@ impl BackupSink for PageWalkSink {
         }
         Ok(FileAction::Tap(Box::new(PageWalkEntry {
             block_no: f.segno.saturating_mul(RELSEG_BLOCKS),
-            slab: Vec::with_capacity(SLAB_BYTES + PAGE_BYTES),
+            slab: Vec::new(),
             spare: None,
             walk: (!is_toast || self.store_toast).then_some(WalkTarget { desc, lsn }),
             out: match &self.out_tx {
@@ -760,10 +760,10 @@ pub struct PageWalkEntry {
     /// `(blkno, offnum)`, and all walk rows share one LSN, so per-file
     /// numbering would collide segment TIDs at equal version
     block_no: u32,
-    /// Accumulates body bytes; complete pages walk in place out of it and
-    /// only a sub-page remainder carries into the next slab
+    /// Body bytes awaiting the walk. A slab-sized chunk becomes the slab
+    /// as is; only a sub-page remainder carries into the next one
     slab: Vec<u8>,
-    /// The slab last handed to the walk, back for reuse. Two buffers
+    /// The slab last walked, back for the source to refill. Two buffers
     /// ping-pong, so a segment allocates twice however long it is
     spare: Option<Vec<u8>>,
     walk: Option<WalkTarget>,
@@ -797,30 +797,22 @@ impl PageWalkEntry {
         if full == 0 {
             return Ok(());
         }
-        let take = full * PAGE_BYTES;
         let first_block = self.block_no;
         self.block_no = self.block_no.saturating_add(full as u32);
 
+        // At most one walk in flight, so a segment holds two slabs, never more
+        self.join_pending().await?;
+        let rest = self.slab.split_off(full * PAGE_BYTES);
+        let walked = std::mem::replace(&mut self.slab, rest);
         let Some(target) = self.walk.as_ref() else {
             self.stats
                 .pages_walked
                 .fetch_add(full as u64, Ordering::Relaxed);
-            self.slab.drain(..take);
+            self.spare = Some(walked);
             return Ok(());
         };
         let desc = target.desc.clone();
         let lsn = target.lsn;
-
-        // At most one walk in flight, so a segment holds two slabs, never more
-        self.join_pending().await?;
-        let mut next = self
-            .spare
-            .take()
-            .unwrap_or_else(|| Vec::with_capacity(SLAB_BYTES + PAGE_BYTES));
-        next.clear();
-        next.extend_from_slice(&self.slab[take..]);
-        let mut walked = std::mem::replace(&mut self.slab, next);
-        walked.truncate(take);
 
         let stats = self.stats.clone();
         // Pure CPU over a byte slice; off the async runtime so the drain
@@ -878,12 +870,20 @@ impl PageWalkEntry {
 
 #[async_trait]
 impl EntrySink for PageWalkEntry {
-    async fn chunk(&mut self, bytes: &[u8]) -> io::Result<()> {
-        self.slab.extend_from_slice(bytes);
+    fn chunk_len(&self) -> usize {
+        SLAB_BYTES
+    }
+
+    async fn chunk(&mut self, mut bytes: Vec<u8>) -> io::Result<Vec<u8>> {
+        if self.slab.is_empty() {
+            std::mem::swap(&mut self.slab, &mut bytes);
+        } else {
+            self.slab.extend_from_slice(&bytes);
+        }
         if self.slab.len() >= SLAB_BYTES {
             self.drain_slab().await?;
         }
-        Ok(())
+        Ok(self.spare.take().unwrap_or(bytes))
     }
 
     async fn end(mut self: Box<Self>) -> io::Result<()> {
@@ -972,9 +972,13 @@ impl CompleteAccums {
 
 #[async_trait]
 impl EntrySink for SlruEntry {
-    async fn chunk(&mut self, bytes: &[u8]) -> io::Result<()> {
-        self.buf.extend_from_slice(bytes);
-        Ok(())
+    async fn chunk(&mut self, mut bytes: Vec<u8>) -> io::Result<Vec<u8>> {
+        if self.buf.is_empty() {
+            std::mem::swap(&mut self.buf, &mut bytes);
+        } else {
+            self.buf.extend_from_slice(&bytes);
+        }
+        Ok(bytes)
     }
 
     async fn end(self: Box<Self>) -> io::Result<()> {
@@ -1348,8 +1352,8 @@ mod tests {
         let mut entry = tap(&sink, &heap_meta("base/5/16400")).await;
         let page = synth_single_tuple_page(99);
         // Two chunks exercise the buffer-across-chunk path
-        entry.chunk(&page[..4096]).await.unwrap();
-        entry.chunk(&page[4096..]).await.unwrap();
+        entry.chunk(page[..4096].to_vec()).await.unwrap();
+        entry.chunk(page[4096..].to_vec()).await.unwrap();
         entry.end().await.unwrap();
         sink.finish(&EndInfo {
             end_lsn: 0,
@@ -1389,7 +1393,10 @@ mod tests {
         .unwrap();
         for path in ["base/5/16400", "base/5/16400.1"] {
             let mut entry = tap(&sink, &heap_meta(path)).await;
-            entry.chunk(&synth_single_tuple_page(7)).await.unwrap();
+            entry
+                .chunk(synth_single_tuple_page(7).to_vec())
+                .await
+                .unwrap();
             entry.end().await.unwrap();
         }
         let captured = sink.captured();
@@ -1528,7 +1535,10 @@ mod tests {
         .unwrap();
 
         let mut entry = tap(&sink, &heap_meta("base/5/16400")).await;
-        entry.chunk(&synth_single_tuple_page(1)).await.unwrap();
+        entry
+            .chunk(synth_single_tuple_page(1).to_vec())
+            .await
+            .unwrap();
         entry.end().await.unwrap();
         assert!(matches!(
             sink.begin(&heap_meta("base/5/16401")).await.unwrap(),
@@ -1566,7 +1576,7 @@ mod tests {
         }
         let mut entry = tap(&sink, &heap_meta("base/5/16400")).await;
         for chunk in body.chunks(6000) {
-            entry.chunk(chunk).await.unwrap();
+            entry.chunk(chunk.to_vec()).await.unwrap();
         }
         entry.end().await.unwrap();
 
@@ -1694,8 +1704,12 @@ mod tests {
         // interleave: worst case for a shared slot
         let mut a = tap(&sink, &heap_meta("base/5/16400")).await;
         let mut b = tap(&sink, &heap_meta("base/5/16401")).await;
-        b.chunk(&synth_single_tuple_page(200)).await.unwrap();
-        a.chunk(&synth_single_tuple_page(100)).await.unwrap();
+        b.chunk(synth_single_tuple_page(200).to_vec())
+            .await
+            .unwrap();
+        a.chunk(synth_single_tuple_page(100).to_vec())
+            .await
+            .unwrap();
         a.end().await.unwrap();
         b.end().await.unwrap();
 

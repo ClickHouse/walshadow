@@ -6,7 +6,7 @@
 # fixtures/wal/filter/capture.sh. Default: postgres:16 in docker.
 # walshadow rejects PG <= 14 captures (FPI bit layout).
 #
-# Output: segments/000000010000000000000002.gz
+# Output: segments/000000010000000000000002.zst
 set -eu
 
 here="$(cd "$(dirname "$0")" && pwd)"
@@ -96,5 +96,5 @@ with open(dst, 'wb') as f:
 print(f"kept {keep // PAGE} pages ({keep} bytes) of {n_pages} ({len(data)} bytes)", file=sys.stderr)
 PY
 
-gzip -f -9 "$out/000000010000000000000002"
-echo "wrote $out/000000010000000000000002.gz"
+zstd -f -q -19 --rm "$out/000000010000000000000002"
+echo "wrote $out/000000010000000000000002.zst"
