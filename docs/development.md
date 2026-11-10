@@ -25,7 +25,9 @@ concurrency to limit memory and disk use
 
 ## WAL fixtures and coverage
 
-Regenerate fixtures using PostgreSQL major being tested:
+Generate WAL fixtures from SQL workloads using PostgreSQL major being tested.
+Keep captures out of Git. Encode regressions needing specific WAL bytes as
+generators or text patches applied after capture. CI generates fixtures before tests:
 
 ```bash
 WALSHADOW_USE_LOCAL=1 fixtures/wal/classify/capture.sh

@@ -29,22 +29,22 @@ use segment::load_segment;
 
 fn fixture_segment() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("fixtures/wal/classify/segments/000000010000000000000001.gz")
+        .join("fixtures/wal/classify/segments/000000010000000000000001.zst")
 }
 
 fn oltp_segment() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("fixtures/wal/filter/segments/000000010000000000000002.gz")
+        .join("fixtures/wal/filter/segments/000000010000000000000002.zst")
 }
 
 fn vacuum_full_pg_depend_segment() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("fixtures/wal/vacuum_full_pg_depend/segments/000000010000000000000002.gz")
+        .join("fixtures/wal/vacuum_full_pg_depend/segments/000000010000000000000002.zst")
 }
 
 fn xlog_switch_segment() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("fixtures/wal/xlog_switch/segments/000000010000000000000002.gz")
+        .join("fixtures/wal/xlog_switch/segments/000000010000000000000002.zst")
 }
 
 /// One segment through the streaming filter
@@ -212,6 +212,9 @@ async fn xlog_switch_fixture_keeps_switch_record_bytes_intact() {
     use walrus::pg::walparser::RmId;
     const XLOG_SWITCH: u8 = 0x40;
     let seg = xlog_switch_segment();
+    if !tools::fixture(&seg) {
+        return;
+    }
     let f = filter(&seg).await;
 
     let switch = f
@@ -242,7 +245,11 @@ async fn xlog_switch_fixture_keeps_switch_record_bytes_intact() {
 /// byte written into a rebuilt catalog's storage reaches shadow.
 #[tokio::test]
 async fn vacuum_full_pg_depend_keeps_every_rebuilt_catalog_write() {
-    let f = filter(&vacuum_full_pg_depend_segment()).await;
+    let seg = vacuum_full_pg_depend_segment();
+    if !tools::fixture(&seg) {
+        return;
+    }
+    let f = filter(&seg).await;
     let tracker = f.stream.filter().tracker().stats();
     eprintln!(
         "VACUUM FULL pg_depend fixture: {} records, dropped={}, oid_in_prefix={}, undecoded={}, decoded={}",
@@ -284,6 +291,9 @@ async fn vacuum_full_pg_depend_keeps_every_rebuilt_catalog_write() {
 #[tokio::test]
 async fn writes_filtered_segment_via_cli() {
     let seg = xlog_switch_segment();
+    if !tools::fixture(&seg) {
+        return;
+    }
     let out_dir = tempfile::tempdir().unwrap();
     let exe = std::env::var("CARGO_BIN_EXE_walshadow-filter").unwrap();
     let out = Command::new(exe)
@@ -313,6 +323,9 @@ async fn writes_filtered_segment_via_cli() {
 #[tokio::test]
 async fn cli_prints_stats_line_without_quiet() {
     let seg = xlog_switch_segment();
+    if !tools::fixture(&seg) {
+        return;
+    }
     let out_dir = tempfile::tempdir().unwrap();
     let exe = std::env::var("CARGO_BIN_EXE_walshadow-filter").unwrap();
     let out = Command::new(exe)

@@ -23,7 +23,7 @@ use segment::load_segment;
 
 fn fixture_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("fixtures/wal/classify/segments/000000010000000000000001.gz")
+        .join("fixtures/wal/classify/segments/000000010000000000000001.zst")
 }
 
 /// Fixture with trimmed zero pages restored up to a power-of-two segment size

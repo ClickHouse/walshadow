@@ -7,8 +7,7 @@
 //! [`crate::backfill::backup_source_object_store::ObjectStoreSource`] (wal-g
 //! layout via `DynStorage`).
 //!
-//! All I/O is async on `tokio_tar` (astral-sh fork of sync `tar`); no
-//! `spawn_blocking`.
+//! All I/O is async on wal-rus's `tarball`; no `spawn_blocking`.
 //!
 //! ## Contracts every source guarantees
 //!
@@ -29,8 +28,9 @@ use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use async_trait::async_trait;
-use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::io::AsyncRead;
 
+use walrus::pg::backup::tarball::{self, Kind};
 use walrus::pg::replication::base_backup::Tablespace;
 
 crate::atomic_stats! {
@@ -119,9 +119,15 @@ impl std::fmt::Debug for FileAction {
 /// already `Sync`.
 #[async_trait]
 pub trait EntrySink: Send {
-    /// Body bytes in file order, arbitrary chunk sizes. Awaiting here
-    /// backpressures the source
-    async fn chunk(&mut self, bytes: &[u8]) -> io::Result<()>;
+    /// Bytes per `chunk` the source reads straight into the sink's buffer
+    fn chunk_len(&self) -> usize {
+        256 * 1024
+    }
+
+    /// Body bytes in file order, `chunk_len` long apart from the last.
+    /// Returns a buffer for the source to refill, its length kept so the
+    /// refill skips zeroing. Awaiting here backpressures the source
+    async fn chunk(&mut self, bytes: Vec<u8>) -> io::Result<Vec<u8>>;
 
     /// Fires once, after the last `chunk`
     async fn end(self: Box<Self>) -> io::Result<()>;
@@ -216,18 +222,15 @@ pub trait BackupSource: Send {
 
 // Shared helpers: tar->file translation, async disk-land writer
 
-/// Translate one tokio_tar entry into a `FileMeta`. `None` for entries
+/// Translate one tar entry into a `FileMeta`. `None` for entries
 /// the source ignores (absolute paths, `..` traversal, hard links; PG
 /// basebackup emits none). Path rebuilt component-by-component skipping
 /// `..` / `/` so callers can't escape `data_dir` on write.
-pub(crate) fn tar_entry_meta<R: AsyncRead + Unpin>(
-    entry: &tokio_tar::Entry<R>,
-) -> io::Result<Option<FileMeta>> {
+pub(crate) fn tar_entry_meta(entry: &tarball::Entry) -> io::Result<Option<FileMeta>> {
     use std::path::Component;
 
-    let path = entry.path()?.into_owned();
     let mut rel = PathBuf::new();
-    for c in path.components() {
+    for c in Path::new(&entry.path).components() {
         match c {
             Component::Prefix(..) | Component::RootDir | Component::CurDir => continue,
             Component::ParentDir => return Ok(None),
@@ -237,102 +240,83 @@ pub(crate) fn tar_entry_meta<R: AsyncRead + Unpin>(
     if rel.as_os_str().is_empty() {
         return Ok(None);
     }
-    let header = entry.header();
-    let size = entry.effective_size();
-    let mode = header.mode().unwrap_or(0o644);
-    let etype = header.entry_type();
-    let kind = if etype.is_dir() {
-        FileKind::Dir
-    } else if etype.is_symlink() {
-        let target = header
-            .link_name()?
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "symlink without target"))?
-            .into_owned();
-        FileKind::Symlink { target }
-    } else if etype.is_file() || etype.is_hard_link() {
-        FileKind::File
-    } else {
-        return Ok(None);
+    let kind = match entry.kind {
+        Kind::Directory => FileKind::Dir,
+        Kind::SymbolicLink if entry.link.is_empty() => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "symlink without target",
+            ));
+        }
+        Kind::SymbolicLink => FileKind::Symlink {
+            target: PathBuf::from(&entry.link),
+        },
+        Kind::Regular | Kind::HardLink => FileKind::File,
+        _ => return Ok(None),
     };
     Ok(Some(FileMeta {
         path: rel,
-        size,
-        mode,
+        size: entry.size,
+        mode: entry.mode,
         kind,
         part: None,
     }))
 }
 
-/// Drain one tokio_tar archive against a sink, emitting per-entry
+/// Drain one tar archive against a sink, emitting per-entry
 /// callbacks. Called by `DirectSource` (per `BackupEvent::Archive.body`)
 /// and `ObjectStoreSource` (per fetched tar part).
 pub async fn pump_tar_to_sink<R>(
-    archive: &mut tokio_tar::Archive<R>,
+    archive: &mut tarball::Reader<R>,
     target: &PumpTarget,
 ) -> io::Result<()>
 where
     R: AsyncRead + Unpin + Send,
 {
-    use futures::StreamExt;
-
-    let mut entries = archive.entries()?;
-    while let Some(entry_res) = entries.next().await {
-        let mut entry = entry_res?;
+    while let Some((entry, mut body)) = archive.next().await? {
         let Some(mut meta) = tar_entry_meta(&entry)? else {
             continue;
         };
         meta.part = target.part.clone();
-        pump_entry(&mut entry, &meta, target).await?;
+        pump_entry(&mut body, &meta, target).await?;
     }
     Ok(())
 }
 
-/// One tar entry through the sink. Factored so callers can drive
-/// non-tar-shaped FileMeta sequences
-pub async fn pump_entry<R>(body: &mut R, meta: &FileMeta, target: &PumpTarget) -> io::Result<()>
+/// One tar entry through the sink. Skipped bodies go unread, the reader
+/// drains them on its next entry
+async fn pump_entry<R>(
+    body: &mut tarball::Body<'_, R>,
+    meta: &FileMeta,
+    target: &PumpTarget,
+) -> io::Result<()>
 where
-    R: AsyncRead + Unpin + ?Sized,
+    R: AsyncRead + Unpin + Send,
 {
     match target.sink.begin(meta).await? {
         FileAction::Keep => write_kept(body, meta, &target.data_dir).await,
-        FileAction::Skip => drain_to_void(body).await,
+        FileAction::Skip => Ok(()),
         FileAction::Tap(entry) => stream_to_entry(body, entry, &target.stats).await,
     }
 }
 
-async fn drain_to_void<R>(body: &mut R) -> io::Result<()>
-where
-    R: AsyncRead + Unpin + ?Sized,
-{
-    let mut buf = [0u8; 16 * 1024];
-    loop {
-        let n = body.read(&mut buf).await?;
-        if n == 0 {
-            break;
-        }
-    }
-    Ok(())
-}
-
 async fn stream_to_entry<R>(
-    body: &mut R,
+    body: &mut tarball::Body<'_, R>,
     mut entry: Box<dyn EntrySink>,
     stats: &PumpStats,
 ) -> io::Result<()>
 where
-    R: AsyncRead + Unpin + ?Sized,
+    R: AsyncRead + Unpin + Send,
 {
-    let mut buf = [0u8; 64 * 1024];
-    loop {
-        let n = body.read(&mut buf).await?;
-        if n == 0 {
-            break;
-        }
-        stats.bytes_tapped.fetch_add(n as u64, Ordering::Relaxed);
+    let mut buf = Vec::new();
+    while body.next_chunk(&mut buf, entry.chunk_len()).await? {
+        stats
+            .bytes_tapped
+            .fetch_add(buf.len() as u64, Ordering::Relaxed);
         // Awaiting here parks only this entry's read, and through it this
         // part's fetch. Other parts keep draining
         let entered = Instant::now();
-        entry.chunk(&buf[..n]).await?;
+        buf = entry.chunk(buf).await?;
         stats
             .sink_chunk_nanos
             .fetch_add(entered.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -340,9 +324,13 @@ where
     entry.end().await
 }
 
-async fn write_kept<R>(body: &mut R, meta: &FileMeta, data_dir: &Path) -> io::Result<()>
+async fn write_kept<R>(
+    body: &mut tarball::Body<'_, R>,
+    meta: &FileMeta,
+    data_dir: &Path,
+) -> io::Result<()>
 where
-    R: AsyncRead + Unpin + ?Sized,
+    R: AsyncRead + Unpin + Send,
 {
     let target = data_dir.join(&meta.path);
     if let Some(parent) = target.parent() {
@@ -355,7 +343,6 @@ where
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(()),
                 Err(e) => Err(e),
             }?;
-            drain_to_void(body).await?;
         }
         FileKind::Symlink {
             target: link_target,
@@ -370,7 +357,6 @@ where
                 let _ = link_target;
                 return Err(io::Error::other("symlink restore requires unix"));
             }
-            drain_to_void(body).await?;
         }
         FileKind::File => {
             let mut f = tokio::fs::OpenOptions::new()
@@ -379,7 +365,7 @@ where
                 .truncate(true)
                 .open(&target)
                 .await?;
-            tokio::io::copy(body, &mut f).await?;
+            tokio::io::copy_buf(body, &mut f).await?;
             f.sync_data().await?;
             #[cfg(unix)]
             {
@@ -397,7 +383,7 @@ where
 pub(crate) mod testing {
     //! Helpers reused across crate tests.
 
-    use tokio::io::AsyncWriteExt;
+    use walrus::pg::backup::tarball::{Entry, Kind, Writer};
 
     use super::{EntrySink, FileAction};
 
@@ -412,47 +398,20 @@ pub(crate) mod testing {
     /// pg_replslot dir + denylist file inside, global/ catalog,
     /// base/<db>/<catalog>, base/<db>/<heap>, pg_control last.
     pub async fn build_synthetic_tar() -> Vec<u8> {
-        let buf: Vec<u8> = Vec::new();
-        let mut b = tokio_tar::Builder::new(buf);
-        append_dir(&mut b, "pg_replslot", 0o700).await;
-        append_file(&mut b, "pg_replslot/0/state", b"REPLSLOT", 0o600).await;
-        append_file(&mut b, "global/1213", b"global-catalog-bytes", 0o600).await;
-        append_file(&mut b, "base/5/1259", b"pg_class-bytes", 0o600).await;
-        append_file(&mut b, "base/5/16400", &[0xAB; 8192], 0o600).await;
-        append_file(&mut b, "pg_control", b"pg-control-bytes", 0o600).await;
-        b.finish().await.unwrap();
-        let mut out = b.into_inner().await.unwrap();
-        out.flush().await.unwrap();
-        out
-    }
-
-    async fn append_dir<W: tokio::io::AsyncWrite + Unpin + Send + 'static>(
-        b: &mut tokio_tar::Builder<W>,
-        name: &str,
-        mode: u32,
-    ) {
-        let mut h = tokio_tar::Header::new_gnu();
-        h.set_path(name).unwrap();
-        h.set_size(0);
-        h.set_mode(mode);
-        h.set_entry_type(tokio_tar::EntryType::Directory);
-        h.set_cksum();
-        b.append(&h, tokio::io::empty()).await.unwrap();
-    }
-
-    async fn append_file<W: tokio::io::AsyncWrite + Unpin + Send + 'static>(
-        b: &mut tokio_tar::Builder<W>,
-        name: &str,
-        body: &[u8],
-        mode: u32,
-    ) {
-        let mut h = tokio_tar::Header::new_gnu();
-        h.set_path(name).unwrap();
-        h.set_size(body.len() as u64);
-        h.set_mode(mode);
-        h.set_entry_type(tokio_tar::EntryType::Regular);
-        h.set_cksum();
-        b.append(&h, body).await.unwrap();
+        let mut w = Writer::new(Vec::new());
+        let dir = Entry::new("pg_replslot", Kind::Directory, 0, 0o700, 0);
+        w.append(&dir, tokio::io::empty()).await.unwrap();
+        for (name, body) in [
+            ("pg_replslot/0/state", &b"REPLSLOT"[..]),
+            ("global/1213", b"global-catalog-bytes"),
+            ("base/5/1259", b"pg_class-bytes"),
+            ("base/5/16400", &[0xAB; 8192]),
+            ("pg_control", b"pg-control-bytes"),
+        ] {
+            let e = Entry::new(name, Kind::Regular, body.len() as u64, 0o600, 0);
+            w.append(&e, body).await.unwrap();
+        }
+        w.finish().await.unwrap()
     }
 }
 
@@ -485,14 +444,14 @@ mod tests {
 
     #[async_trait]
     impl EntrySink for RecordingEntry {
-        async fn chunk(&mut self, bytes: &[u8]) -> io::Result<()> {
+        async fn chunk(&mut self, bytes: Vec<u8>) -> io::Result<Vec<u8>> {
             self.sink
                 .events
                 .lock()
                 .unwrap()
                 .push(Event::Chunk { len: bytes.len() });
-            self.body.extend_from_slice(bytes);
-            Ok(())
+            self.body.extend_from_slice(&bytes);
+            Ok(bytes)
         }
         async fn end(self: Box<Self>) -> io::Result<()> {
             let RecordingEntry { sink, path, body } = *self;
@@ -538,84 +497,56 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn tar_entry_meta_translates_file_and_dir_and_symlink() {
-        let buf: Vec<u8> = Vec::new();
-        let mut b = tokio_tar::Builder::new(buf);
-
-        let mut h = tokio_tar::Header::new_gnu();
-        h.set_path("base/5/16400").unwrap();
-        h.set_size(8);
-        h.set_mode(0o600);
-        h.set_entry_type(tokio_tar::EntryType::Regular);
-        h.set_cksum();
-        b.append(&h, &b"AAAAAAAA"[..]).await.unwrap();
-
-        let mut h = tokio_tar::Header::new_gnu();
-        h.set_path("pg_replslot").unwrap();
-        h.set_size(0);
-        h.set_mode(0o700);
-        h.set_entry_type(tokio_tar::EntryType::Directory);
-        h.set_cksum();
-        b.append(&h, tokio::io::empty()).await.unwrap();
-
-        let mut h = tokio_tar::Header::new_gnu();
-        h.set_path("pg_tblspc/16384").unwrap();
-        h.set_link_name("/srv/ts/a").unwrap();
-        h.set_size(0);
-        h.set_mode(0o755);
-        h.set_entry_type(tokio_tar::EntryType::Symlink);
-        h.set_cksum();
-        b.append(&h, tokio::io::empty()).await.unwrap();
-
-        b.finish().await.unwrap();
-        let bytes = b.into_inner().await.unwrap();
-
-        use futures::StreamExt;
-        let mut archive = tokio_tar::Archive::new(std::io::Cursor::new(bytes));
-        let mut entries = archive.entries().unwrap();
-        let mut kinds = Vec::new();
-        while let Some(entry_res) = entries.next().await {
-            let entry = entry_res.unwrap();
-            let meta = tar_entry_meta(&entry).unwrap().unwrap();
-            kinds.push((meta.path, meta.kind));
+    async fn tar_metas(entries: &[(tarball::Entry, &[u8])]) -> Vec<Option<FileMeta>> {
+        let mut w = tarball::Writer::new(Vec::new());
+        for (e, body) in entries {
+            w.append(e, *body).await.unwrap();
         }
-        assert_eq!(kinds.len(), 3);
-        assert_eq!(kinds[0].0, PathBuf::from("base/5/16400"));
-        assert!(matches!(kinds[0].1, FileKind::File));
-        assert_eq!(kinds[1].0, PathBuf::from("pg_replslot"));
-        assert!(matches!(kinds[1].1, FileKind::Dir));
-        assert_eq!(kinds[2].0, PathBuf::from("pg_tblspc/16384"));
-        match &kinds[2].1 {
-            FileKind::Symlink { target } => {
-                assert_eq!(target, &PathBuf::from("/srv/ts/a"))
-            }
-            other => panic!("expected Symlink, got {other:?}"),
+        let bytes = w.finish().await.unwrap();
+        let mut r = tarball::Reader::new(bytes.as_slice());
+        let mut metas = Vec::new();
+        while let Some((e, _)) = r.next().await.unwrap() {
+            metas.push(tar_entry_meta(&e).unwrap());
         }
+        metas
     }
 
     #[tokio::test]
+    async fn tar_entry_meta_translates_file_and_dir_and_symlink() {
+        let mut link = tarball::Entry::new("pg_tblspc/16384", Kind::SymbolicLink, 0, 0o755, 0);
+        link.link = "/srv/ts/a".into();
+        let metas = tar_metas(&[
+            (
+                tarball::Entry::new("base/5/16400", Kind::Regular, 8, 0o600, 0),
+                b"AAAAAAAA",
+            ),
+            (
+                tarball::Entry::new("pg_replslot", Kind::Directory, 0, 0o700, 0),
+                b"",
+            ),
+            (link, b""),
+        ])
+        .await;
+        let kinds: Vec<_> = metas.into_iter().map(|m| m.unwrap()).collect();
+        assert_eq!(kinds.len(), 3);
+        assert_eq!(kinds[0].path, PathBuf::from("base/5/16400"));
+        assert_eq!((kinds[0].size, kinds[0].mode), (8, 0o600));
+        assert!(matches!(kinds[0].kind, FileKind::File));
+        assert_eq!(kinds[1].path, PathBuf::from("pg_replslot"));
+        assert!(matches!(kinds[1].kind, FileKind::Dir));
+        assert_eq!(kinds[2].path, PathBuf::from("pg_tblspc/16384"));
+        let FileKind::Symlink { target } = &kinds[2].kind else {
+            panic!("expected Symlink, got {:?}", kinds[2].kind);
+        };
+        assert_eq!(target, &PathBuf::from("/srv/ts/a"));
+    }
+
+    /// PG never emits `..` but a hostile / corrupt tar must not escape data_dir
+    #[tokio::test]
     async fn tar_entry_meta_rejects_parent_dir_traversal() {
-        let mut bytes = Vec::new();
-        {
-            let mut h = tokio_tar::Header::new_gnu();
-            // set_path refuses `..`, so write header bytes directly. PG
-            // never emits `..` but a hostile / corrupt tar must not
-            // escape data_dir.
-            let name = b"../../etc/passwd";
-            h.as_old_mut().name[..name.len()].copy_from_slice(name);
-            h.set_size(0);
-            h.set_mode(0o600);
-            h.set_entry_type(tokio_tar::EntryType::Regular);
-            h.set_cksum();
-            bytes.extend_from_slice(h.as_bytes());
-            bytes.extend_from_slice(&[0u8; 1024]);
-        }
-        use futures::StreamExt;
-        let mut archive = tokio_tar::Archive::new(std::io::Cursor::new(bytes));
-        let mut entries = archive.entries().unwrap();
-        let entry = entries.next().await.unwrap().unwrap();
-        assert!(tar_entry_meta(&entry).unwrap().is_none());
+        let e = tarball::Entry::new("../../etc/passwd", Kind::Regular, 0, 0o600, 0);
+        let metas = tar_metas(&[(e, b"")]).await;
+        assert!(metas[0].is_none());
     }
 
     #[tokio::test]
@@ -625,7 +556,7 @@ mod tests {
         let tar_bytes = testing::build_synthetic_tar().await;
         let recording = Arc::new(RecordingSink::default());
         let sink: Arc<dyn BackupSink> = Arc::new(recording.clone());
-        let mut archive = tokio_tar::Archive::new(std::io::Cursor::new(tar_bytes));
+        let mut archive = tarball::Reader::new(tar_bytes.as_slice());
         let target = PumpTarget::new(data_dir.to_path_buf(), sink, Arc::new(PumpStats::default()));
         pump_tar_to_sink(&mut archive, &target).await.unwrap();
 

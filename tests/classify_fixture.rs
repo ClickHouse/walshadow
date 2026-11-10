@@ -46,7 +46,7 @@ fn walk(bytes: &[u8]) -> anyhow::Result<Summary> {
 #[tokio::test]
 async fn catalog_fraction_under_workload_is_bounded() {
     let dir = fixture_dir();
-    let seg = dir.join("000000010000000000000001.gz");
+    let seg = dir.join("000000010000000000000001.zst");
     if !tools::fixture(&seg) {
         return;
     }
@@ -95,7 +95,7 @@ async fn catalog_fraction_under_workload_is_bounded() {
 #[test]
 fn cli_produces_json_for_fixture() {
     let dir = fixture_dir();
-    let seg = dir.join("000000010000000000000001.gz");
+    let seg = dir.join("000000010000000000000001.zst");
     if !tools::fixture(&seg) {
         return;
     }
@@ -114,7 +114,7 @@ fn cli_produces_json_for_fixture() {
 #[test]
 fn cli_produces_human_summary_for_fixture() {
     let dir = fixture_dir();
-    let seg = dir.join("000000010000000000000001.gz");
+    let seg = dir.join("000000010000000000000001.zst");
     if !tools::fixture(&seg) {
         return;
     }

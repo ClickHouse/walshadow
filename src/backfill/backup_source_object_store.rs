@@ -36,7 +36,7 @@ use futures::{StreamExt, TryStreamExt};
 use walrus::compression;
 use walrus::config::Settings;
 use walrus::pg::backup::fetch::{fetch_sentinel, list_tar_parts};
-use walrus::pg::backup::tar_partitions_prefix;
+use walrus::pg::backup::{tar_partitions_prefix, tarball};
 use walrus::storage::DynStorage;
 
 use crate::backfill::backup_sentinel::build_lsn_pair;
@@ -185,7 +185,7 @@ impl BackupSource for ObjectStoreSource {
 }
 
 /// Fetch one tar part, throttle, decrypt, decompress, pump through
-/// `pump_tar_to_sink`. Decompressed reader is `AsyncRead`, tokio_tar
+/// `pump_tar_to_sink`. Decompressed reader is `AsyncRead`, tar reader
 /// drives it directly, no spawn_blocking.
 async fn unpack_one_part(
     settings: &Settings,
@@ -205,7 +205,7 @@ async fn unpack_one_part(
     let spooled = spool_backup_part(part_spool_dir, key, decrypted).await?;
     let decoded = compression::decode(method, Box::pin(spooled));
 
-    let mut archive = tokio_tar::Archive::new(decoded);
+    let mut archive = tarball::Reader::new(decoded);
     pump_tar_to_sink(&mut archive, target)
         .await
         .with_context(|| format!("ObjectStoreSource: tar unpack {key}"))?;

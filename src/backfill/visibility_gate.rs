@@ -618,7 +618,10 @@ mod tests {
             };
             let mut entry = expect_tap(sink.begin(&meta).await.unwrap());
             for page in 0..pages {
-                entry.chunk(&visible_page(page as i32)).await.unwrap();
+                entry
+                    .chunk(visible_page(page as i32).to_vec())
+                    .await
+                    .unwrap();
             }
             entry.end().await.unwrap();
         }

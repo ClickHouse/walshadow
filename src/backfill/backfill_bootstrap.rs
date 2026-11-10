@@ -469,6 +469,7 @@ mod tests {
     use crate::backfill::backup_source::{BackupSink, BackupSource, FileMeta};
     use crate::decode::heap_decoder::HeapOp;
     use async_trait::async_trait;
+    use walrus::pg::backup::tarball::{Entry, Kind, Reader, Writer};
 
     #[test]
     fn with_catalog_filenodes_seeds_whitelist() {
@@ -498,10 +499,15 @@ mod tests {
             sink.start(&self.start).await?;
             let target =
                 crate::backfill::backup_source::PumpTarget::new(data_dir, sink.clone(), stats);
-            for (meta, body) in self.files.iter() {
-                let mut cur: &[u8] = body;
-                crate::backfill::backup_source::pump_entry(&mut cur, meta, &target).await?;
+            let mut tar = Writer::new(Vec::new());
+            for (meta, body) in &self.files {
+                let path = meta.path.to_string_lossy();
+                let e = Entry::new(path, Kind::Regular, body.len() as u64, meta.mode, 0);
+                tar.append(&e, body.as_slice()).await?;
             }
+            let tar = tar.finish().await?;
+            let mut archive = Reader::new(tar.as_slice());
+            crate::backfill::backup_source::pump_tar_to_sink(&mut archive, &target).await?;
             sink.finish(&self.end).await?;
             Ok((self.start.clone(), self.end.clone()))
         }

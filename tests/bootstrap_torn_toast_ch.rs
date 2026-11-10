@@ -19,11 +19,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
-use futures::StreamExt;
-use tokio_tar::{Archive, Builder};
 use walrus::compression;
 use walrus::config::{Settings, StorageSettings, Vars};
 use walrus::pg::backup::push::{self, PushArgs};
+use walrus::pg::backup::tarball::{Reader, Writer};
 use walrus::pg::backup::{list, parse_pg_lsn, sentinel_key, tar_partitions_prefix};
 use walrus::pg::replication::conn::PgConfig;
 use walrus::pg::wal;
@@ -207,24 +206,20 @@ async fn rewrite_tar_entry(tar_path: &Path, rel: &str, body: &[u8]) -> Result<bo
     let file = tokio::fs::File::open(tar_path)
         .await
         .with_context(|| format!("open {}", tar_path.display()))?;
-    let mut archive = Archive::new(file);
-    let mut entries = archive.entries()?;
-    let mut out = Builder::new(Vec::new());
+    let mut archive = Reader::new(file);
+    let mut out = Writer::new(Vec::new());
     let mut replaced = false;
-    while let Some(entry) = entries.next().await {
-        let mut entry = entry?;
-        let path = entry.path()?.into_owned();
-        let mut header = entry.header().clone();
-        let bare = path.strip_prefix(".").unwrap_or(&path);
-        if bare == Path::new(rel) {
-            header.set_size(body.len() as u64);
-            out.append_data(&mut header, &path, body).await?;
+    while let Some((mut entry, entry_body)) = archive.next().await? {
+        let path = Path::new(&entry.path);
+        if path.strip_prefix(".").unwrap_or(path) == Path::new(rel) {
+            entry.size = body.len() as u64;
+            out.append(&entry, body).await?;
             replaced = true;
         } else {
-            out.append_data(&mut header, &path, &mut entry).await?;
+            out.append(&entry, entry_body).await?;
         }
     }
-    let bytes = out.into_inner().await?;
+    let bytes = out.finish().await?;
     tokio::fs::write(tar_path, bytes)
         .await
         .with_context(|| format!("rewrite {}", tar_path.display()))?;

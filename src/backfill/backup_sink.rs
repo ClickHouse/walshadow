@@ -413,12 +413,12 @@ mod tests {
 
     #[async_trait]
     impl crate::backfill::backup_source::EntrySink for CountingEntry {
-        async fn chunk(&mut self, bytes: &[u8]) -> io::Result<()> {
+        async fn chunk(&mut self, bytes: Vec<u8>) -> io::Result<Vec<u8>> {
             self.0.chunks.fetch_add(1, Ordering::Relaxed);
             self.0
                 .bytes
                 .fetch_add(bytes.len() as u64, Ordering::Relaxed);
-            Ok(())
+            Ok(bytes)
         }
         async fn end(self: Box<Self>) -> io::Result<()> {
             self.0.ends.fetch_add(1, Ordering::Relaxed);
@@ -444,8 +444,8 @@ mod tests {
         ));
 
         let mut entry = expect_tap(mux.begin(&file("base/5/16400")).await.unwrap());
-        entry.chunk(&[0u8; 1024]).await.unwrap();
-        entry.chunk(&[1u8; 512]).await.unwrap();
+        entry.chunk(vec![0u8; 1024]).await.unwrap();
+        entry.chunk(vec![1u8; 512]).await.unwrap();
         entry.end().await.unwrap();
 
         assert!(matches!(

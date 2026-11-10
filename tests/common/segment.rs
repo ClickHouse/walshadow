@@ -1,6 +1,6 @@
 //! Shared test helper: read a captured WAL segment fixture into bytes.
 //!
-//! Fixtures are gzipped under `fixtures/wal/**/segments/`;
+//! Fixtures are zstd-compressed under `fixtures/wal/**/segments/`;
 //! `open_segment_file` transparently decompresses. Several round-trip
 //! and classifier drills need the raw segment bytes, so the loader
 //! lives here rather than being copied per test file.

@@ -5,6 +5,7 @@ preprocessed_configs/
 /results
 /access
 /bench/results/
+/fixtures/wal/*/segments/
 pgext/out/
 pgext/log/
 pgext/.pg_version
