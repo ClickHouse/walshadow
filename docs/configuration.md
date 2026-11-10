@@ -409,14 +409,21 @@ Object-store table backfills honor `[bootstrap] object_store_parallelism`,
 defaulting to 8 when absent. This controls concurrent parts, not ClickHouse
 inserter count.
 
-`[bootstrap] copy_fallback` defaults to `true`. Failed `base_backup` and
-`object_store` table loads retry through source COPY, one table at a time per
-failed pass. Set `copy_fallback = false` to leave failures pending until restart.
-Fallback preserves original load LSN and persists COPY mode before reading source;
-restarts resume recorded mode even if fallback is subsequently disabled. COPY
-adds source database read load. Completed or publishing staging tables never
-fall back. This option does not apply to greenfield bootstrap or publication
-failures. Failed COPY remains pending until restart.
+A backup pass that fails before reading any backup data, such as a backup it
+cannot resolve, a delta backup, a lineage mismatch or an archive gap, keeps its
+tables pending and retries the pass: first after 30 seconds, then at doubling
+intervals up to 10 minutes, logging an error each time. The source database is
+not read.
+
+`[bootstrap] copy_fallback` defaults to `true`. A `base_backup` or
+`object_store` pass that fails after it started reading backup data retries its
+tables through source COPY, one table at a time. Set `copy_fallback = false` to
+leave such failures pending until restart. Fallback preserves original load LSN
+and persists COPY mode before reading source; restarts resume recorded mode even
+if fallback is subsequently disabled. COPY adds source database read load.
+Completed or publishing staging tables never fall back. This option does not
+apply to greenfield bootstrap or publication failures. Failed COPY remains
+pending until restart.
 
 `walshadow_archive_fetch_seconds_total` sums fetch durations across concurrent
 requests, including decrypt and decompression. `walshadow_archive_replay_seconds_total`
@@ -502,3 +509,5 @@ Spill-dir state files `backfills.toml`, `toast_retires.toml` and
 files another source wrote. A file without the field loads
 once and is rewritten with it. An unreadable `backfills.toml` stops boot:
 removing it re-runs every load and can orphan `__wsstg` staging tables.
+Greenfield bootstrap records every table it loaded as done there, so the first
+live boot streams those tables instead of loading them again.
