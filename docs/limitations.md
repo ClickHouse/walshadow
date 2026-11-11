@@ -15,7 +15,9 @@ Review these limits before production use
 - prepared transactions are not supported for production use; commit and abort
   records are handled, but full restart and bootstrap cases are unvalidated
 - sequence state is not replicated, values already stored in table rows still replicate
-- non-default tablespaces are unsafe for bootstrap and managed-shadow lifecycle
+- non-default tablespaces: bootstrap moves their files under shadow's
+  `walshadow_tblspc/` but loads no rows from tables stored in them. Creating
+  or moving tablespaces after bootstrap is unsafe for managed shadow
 - partitions replicate through their root only; see
   [partitioned tables](table-selection.md#replicate-partitioned-tables). Root
   renames, root replica identity changes, and attaching a partitioned table as
