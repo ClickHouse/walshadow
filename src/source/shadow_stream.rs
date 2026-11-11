@@ -143,19 +143,25 @@ pub struct AggregateLsn {
     pub min_apply_lsn: Option<Pos<ShadowReplay>>,
     /// Connections past `START_REPLICATION`, the only ones carrying LSNs.
     pub active_connections: usize,
-    /// Monotonic count of sockets that entered the handshake. Above
-    /// `active_connections` means a client is connected but stalled before
-    /// `START_REPLICATION`, which reads as "nothing attached" otherwise.
-    pub accepted_total: u64,
-    /// Monotonic count of connections dropped by `slow_threshold`
-    /// overflow since process start.
-    pub dropped_total: u64,
+    pub socket_events: [u64; SocketEvent::COUNT],
+    /// Monotonic count of `START_REPLICATION` bytes replayed from the retained
+    /// wire buffer to reconnecting clients
+    pub backfill_bytes_total: u64,
+    /// Largest unsent send queue across connections, to read against
+    /// `slow_threshold`
+    pub send_queue_bytes: u64,
     /// Oldest branch an attached client is still reading: a historic
     /// connection is pinned to the branch its `ends_at` names, the rest to the
     /// served one. `None` with nothing attached. Beside the apply LSN it is
     /// what separates a shadow that followed a crossing from one that only
     /// survived it.
     pub replay_timeline: Option<u32>,
+}
+
+impl AggregateLsn {
+    pub fn accepted(&self) -> u64 {
+        self.socket_events[SocketEvent::Accepted.index()]
+    }
 }
 
 /// Why a `START_REPLICATION` gets an `ErrorResponse` instead of a stream
@@ -183,6 +189,15 @@ impl Refused {
             Self::Timeline(_) => "XX000",
             Self::Archived { .. } => crate::source_feed::SQLSTATE_UNDEFINED_FILE,
         }
+    }
+}
+
+crate::label_class! {
+    pub enum SocketEvent {
+        Accepted => "accepted",
+        ClosedSlowClient => "closed_slow_client",
+        ClosedByClient => "closed_by_client",
+        ClosedError => "closed_error",
     }
 }
 
@@ -219,10 +234,8 @@ pub struct ShadowStreamState {
     pub slow_threshold: usize,
     /// Populates `'w'`/`'k'` frame headers.
     pub server_wal_end: Pos<SourceReceived>,
-    /// Surfaced via [`AggregateLsn::dropped_total`] for the
-    /// `walshadow_shadow_stream_dropped_connections_total` gauge.
-    dropped_total: u64,
-    accepted_total: u64,
+    socket_events: [u64; SocketEvent::COUNT],
+    backfill_bytes_total: u64,
     /// Wire bytes `[wire_buf_start, server_wal_end]` not yet on disk, used to
     /// backfill a reconnect behind the live head (else it gets an unappliable
     /// gap and strands at segment boundaries). Spans up to two segments while
@@ -257,8 +270,8 @@ impl ShadowStreamState {
             send_queues: HashMap::new(),
             slow_threshold,
             server_wal_end: Pos::new(current_lsn),
-            dropped_total: 0,
-            accepted_total: 0,
+            socket_events: [0; SocketEvent::COUNT],
+            backfill_bytes_total: 0,
             wire_buf: Vec::new(),
             wire_buf_start: current_lsn,
             queued: Monotone::default(),
@@ -303,8 +316,9 @@ impl ShadowStreamState {
             min_flush_lsn: (active > 0).then_some(min_flush),
             min_apply_lsn: (active > 0).then_some(min_apply),
             active_connections: active,
-            accepted_total: self.accepted_total,
-            dropped_total: self.dropped_total,
+            socket_events: self.socket_events,
+            backfill_bytes_total: self.backfill_bytes_total,
+            send_queue_bytes: self.send_queues.values().map(Vec::len).max().unwrap_or(0) as u64,
             replay_timeline: (active > 0).then_some(branch),
         }
     }
@@ -313,8 +327,8 @@ impl ShadowStreamState {
     /// `register_connection`: per-connection state needs the `START_REPLICATION`
     /// LSN, and a placeholder would feed boundary holds a fabricated apply
     /// point.
-    pub fn note_accepted(&mut self) {
-        self.accepted_total += 1;
+    pub fn note_socket(&mut self, event: SocketEvent) {
+        self.socket_events[event.index()] += 1;
     }
 
     /// Refuse a `START_REPLICATION` this walsender cannot serve gap-free
@@ -332,6 +346,12 @@ impl ShadowStreamState {
             return Err(Refused::Timeline(timeline));
         }
         if start_lsn < self.wire_buf_start {
+            tracing::warn!(
+                target: "walshadow::shadow_stream",
+                start_lsn = %format_pg_lsn(start_lsn),
+                retained_from = %format_pg_lsn(self.wire_buf_start),
+                "START_REPLICATION below the retained wire buffer; the walreceiver takes that range from restore_command",
+            );
             return Err(Refused::Archived {
                 start: start_lsn,
                 retained: self.wire_buf_start,
@@ -551,6 +571,7 @@ impl ShadowStreamState {
         if let Some(c) = self.connections.get_mut(&id) {
             c.backfill_queued = self.send_queues.get(&id).map_or(0, Vec::len);
         }
+        self.backfill_bytes_total += backfill.len() as u64;
         self.advance_dispatched(id, Pos::new(server_wal_end));
     }
 
@@ -615,10 +636,8 @@ impl ShadowStreamState {
     pub fn enqueue(&mut self, id: u64, framed: Vec<u8>) -> bool {
         let q = self.send_queues.entry(id).or_default();
         if q.len() + framed.len() > self.slow_threshold {
-            if let Some(c) = self.connections.get_mut(&id)
-                && c.phase.close()
-            {
-                self.dropped_total += 1;
+            if let Some(c) = self.connections.get_mut(&id) {
+                c.phase.close();
             }
             self.send_queues.remove(&id);
             return false;
@@ -650,10 +669,8 @@ impl ShadowStreamState {
             && envelope_start.saturating_sub(backfill) + 1 + payload_len > cap
         {
             q.truncate(envelope_start);
-            if let Some(c) = self.connections.get_mut(&id)
-                && c.phase.close()
-            {
-                self.dropped_total += 1;
+            if let Some(c) = self.connections.get_mut(&id) {
+                c.phase.close();
             }
             self.send_queues.remove(&id);
             return false;
@@ -852,16 +869,32 @@ async fn handle_tcp_connection(
 
 /// Generic over the socket transport so unix + TCP share the logic.
 async fn drive_connection<S>(
-    mut sock: S,
+    sock: S,
     state: Arc<Mutex<ShadowStreamState>>,
     flush_interval: Duration,
 ) -> Result<(), ShadowStreamError>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
 {
+    let ended = serve_connection(sock, state.clone(), flush_interval).await;
+    state.lock().await.note_socket(match &ended {
+        Ok(event) => *event,
+        Err(_) => SocketEvent::ClosedError,
+    });
+    ended.map(|_| ())
+}
+
+async fn serve_connection<S>(
+    mut sock: S,
+    state: Arc<Mutex<ShadowStreamState>>,
+    flush_interval: Duration,
+) -> Result<SocketEvent, ShadowStreamError>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
+{
     let identity = {
         let mut s = state.lock().await;
-        s.note_accepted();
+        s.note_socket(SocketEvent::Accepted);
         s.identity()
     };
 
@@ -889,7 +922,7 @@ where
                 let mut err = bytes::BytesMut::new();
                 server::encode_error_response(&mut err, refused.sqlstate(), &refused.to_string());
                 conn.write_framed(&err).await?;
-                return Ok(());
+                return Ok(SocketEvent::ClosedError);
             }
         };
         tracing::info!(
@@ -903,7 +936,8 @@ where
         let outcome = run_connection_loop(&mut conn, state.clone(), id, flush_interval).await;
         state.lock().await.drop_connection(id);
         match outcome? {
-            StreamOutcome::Closed => return Ok(()),
+            StreamOutcome::Closed => return Ok(SocketEvent::ClosedByClient),
+            StreamOutcome::Slow => return Ok(SocketEvent::ClosedSlowClient),
             StreamOutcome::TimelineEnded(switch) => {
                 conn.end_timeline(switch).await?;
                 let identity = state.lock().await.identity();
@@ -915,8 +949,10 @@ where
 
 /// How one stream on a walsender connection finished.
 enum StreamOutcome {
-    /// Client gone, or the connection dropped for slowness
+    /// Client gone
     Closed,
+    /// Dropped for overflowing `slow_threshold`
+    Slow,
     /// Served through a historic branch's switchpoint; the client is owed the
     /// next-timeline result
     TimelineEnded(TimelineSwitch),
@@ -1009,7 +1045,7 @@ where
             return Ok(StreamOutcome::TimelineEnded(switch));
         }
         if closing {
-            return Ok(StreamOutcome::Closed);
+            return Ok(StreamOutcome::Slow);
         }
     }
 }
@@ -1210,15 +1246,15 @@ mod tests {
     #[test]
     fn accepted_counts_sockets_short_of_start_replication() {
         let mut s = fresh_state();
-        s.note_accepted();
+        s.note_socket(SocketEvent::Accepted);
         let agg = s.aggregate();
-        assert_eq!(agg.accepted_total, 1);
+        assert_eq!(agg.accepted(), 1);
         assert_eq!(agg.active_connections, 0, "handshake carries no LSN");
         assert_eq!(agg.min_apply_lsn, None, "holds must not see a fake apply");
         s.register_connection(0x1000, 1, None)
             .expect("current timeline");
         let agg = s.aggregate();
-        assert_eq!(agg.accepted_total, 1, "monotonic, not decremented");
+        assert_eq!(agg.accepted(), 1, "monotonic, not decremented");
         assert_eq!(agg.active_connections, 1);
     }
 
@@ -1275,7 +1311,6 @@ mod tests {
         assert!(!s.enqueue(id, vec![0u8; 64]));
         assert!(s.connections[&id].phase.is_closing());
         assert!(!s.send_queues.contains_key(&id));
-        assert_eq!(s.aggregate().dropped_total, 1);
     }
 
     #[test]
@@ -1293,16 +1328,6 @@ mod tests {
         assert!(!s.enqueue(id, vec![0u8; 128]));
         assert!(s.connections[&id].phase.is_closing());
         assert_eq!(s.timeline_ended_for(id), Some(switch));
-    }
-
-    #[test]
-    fn dropped_total_increments_once_per_connection() {
-        let mut s = ShadowStreamState::new(1, "x".into(), 0, 64);
-        let id = s.register_connection(0, 1, None).expect("current timeline");
-        assert!(!s.enqueue(id, vec![0u8; 128]));
-        // second overflow on the closing slot must not double-count
-        assert!(!s.enqueue(id, vec![0u8; 128]));
-        assert_eq!(s.aggregate().dropped_total, 1);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1405,6 +1430,50 @@ mod tests {
         }
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn backfill_is_counted_and_starts_below_the_buffer_are_refused() {
+        let state = Arc::new(Mutex::new(fresh_state()));
+        let mut sink = ShadowStreamSink::new(state.clone());
+        sink.on_wire_chunk(0x1000, b"AAAA").await.unwrap();
+        sink.on_segment_retired(0x1004).await.unwrap();
+        sink.on_wire_chunk(0x1004, b"CCCC").await.unwrap();
+        let mut s = state.lock().await;
+        s.register_connection(0x1008, 1, None).unwrap();
+        assert_eq!(s.aggregate().backfill_bytes_total, 0);
+        s.register_connection(0x1004, 1, None).unwrap();
+        assert_eq!(s.aggregate().backfill_bytes_total, 4);
+        assert!(matches!(
+            s.register_connection(0x1000, 1, None),
+            Err(Refused::Archived { .. })
+        ));
+        assert_eq!(s.aggregate().backfill_bytes_total, 4);
+    }
+
+    /// A rebuilt `WalStream` replays its segment over retained bytes, which
+    /// keeps `wire_buf_start` and the backfill gap-free
+    #[test]
+    fn send_queue_bytes_is_the_largest_queue() {
+        let mut s = ShadowStreamState::new(1, "x".into(), 0, 64);
+        let a = s.register_connection(0, 1, None).unwrap();
+        let b = s.register_connection(0, 1, None).unwrap();
+        assert!(s.enqueue(a, vec![0u8; 10]));
+        assert!(s.enqueue(b, vec![0u8; 30]));
+        assert_eq!(s.aggregate().send_queue_bytes, 30);
+        s.drain_send_queue(b);
+        assert_eq!(s.aggregate().send_queue_bytes, 10);
+    }
+
+    #[test]
+    fn socket_events_count_per_kind() {
+        let mut s = fresh_state();
+        s.note_socket(SocketEvent::ClosedSlowClient);
+        s.note_socket(SocketEvent::ClosedByClient);
+        s.note_socket(SocketEvent::ClosedByClient);
+        s.note_socket(SocketEvent::ClosedError);
+        assert_eq!(s.aggregate().socket_events, [0, 1, 2, 1]);
+        assert_eq!(SocketEvent::ClosedByClient.label(), "closed_by_client");
+    }
+
     /// A rebuilt `WalStream` replays its segment over retained bytes, which
     /// keeps `wire_buf_start` and the backfill gap-free
     #[tokio::test(flavor = "current_thread")]
@@ -1428,9 +1497,9 @@ mod tests {
         s.dispatch_wire(16, b"EEEEEEEE");
         s.swap_send_queue(id, &mut Vec::new());
         s.dispatch_wire(24, b"FFFFFFFF");
-        assert_eq!(s.aggregate().dropped_total, 0);
+        assert!(!s.connections[&id].phase.is_closing());
         s.dispatch_wire(32, b"GGGGGGGG");
-        assert_eq!(s.aggregate().dropped_total, 1);
+        assert!(s.connections[&id].phase.is_closing());
     }
 
     #[tokio::test(flavor = "current_thread")]
