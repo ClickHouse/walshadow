@@ -115,8 +115,9 @@ jobs:
 
       # `-p walshadow --bins`: the bench workspace member has bins too, keep
       # them out of the release. build.rs picks up the git sha for --version.
+      # Archive codecs match docker/Dockerfile's CARGO_FEATURES.
       - name: Build
-        run: cargo build --release --locked -p walshadow --bins --target ${{ matrix.image.target }}
+        run: cargo build --release --locked -p walshadow --bins --features brotli,lzma,gzip --target ${{ matrix.image.target }}
 
       - name: Smoke test
         run: |

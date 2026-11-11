@@ -30,6 +30,9 @@ ENV CFLAGS="-Dunreachable()=__builtin_unreachable()"
 # Commit shown by `walshadow-stream --version`; no .git in the build context
 ARG WALSHADOW_GIT_SHA=unknown
 ENV WALSHADOW_GIT_SHA=$WALSHADOW_GIT_SHA
+# Archive codecs past the default lz4/zstd, so the image reads base backups
+# and WAL other tools compressed with them (wal-g's brotli, lzma, gzip)
+ARG CARGO_FEATURES="brotli lzma gzip"
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY bench ./bench
@@ -42,7 +45,7 @@ COPY src ./src
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/src/target \
-    cargo build --release --bin walshadow-stream \
+    cargo build --release --features "$CARGO_FEATURES" --bin walshadow-stream \
     && cp /src/target/release/walshadow-stream /usr/local/bin/walshadow-stream
 
 FROM postgres:${PG_MAJOR}-alpine AS ext-builder
