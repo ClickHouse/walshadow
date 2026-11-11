@@ -392,8 +392,15 @@ pub async fn seed_catalog_from_source(client: &Client) -> Result<CatalogMap> {
 /// prevents a torn read against concurrent DDL during the seed. The
 /// sub-second window before `source.run` relies on operator quiesce.
 pub async fn seed_in_snapshot(client: &Client) -> Result<CatalogMap> {
+    // Fast defaults (`attmissingval::text`) render under these, and the
+    // decoder parses that text as the bridge worker renders it
     client
-        .batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        .batch_execute(
+            "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; \
+             SET LOCAL TimeZone = 'UTC'; SET LOCAL DateStyle = 'ISO,MDY'; \
+             SET LOCAL IntervalStyle = 'postgres'; SET LOCAL extra_float_digits = 1; \
+             SET LOCAL bytea_output = 'hex'",
+        )
         .await
         .context("bootstrap: open seed snapshot xact")?;
     let result = seed_catalog_from_source(client).await;

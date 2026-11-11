@@ -259,6 +259,12 @@ pub fn column_value_to_sql_literal(v: &ColumnValue, ch_inner: &str) -> Option<St
             let txt = timetz_to_text(*micros, *tz_seconds);
             Some(sql_string_literal(&txt))
         }
+        // ±infinity (the i64 bounds) and BC have no DateTime64 form
+        ColumnValue::Timestamp(micros) | ColumnValue::TimestampTz(micros)
+            if *micros == i64::MAX || *micros < PG_AD_1_MICROS =>
+        {
+            None
+        }
         ColumnValue::Timestamp(micros) | ColumnValue::TimestampTz(micros) => {
             let txt = render_pg_timestamp(*micros);
             let prec = datetime64_scale(ch_inner).unwrap_or(6);
@@ -300,6 +306,9 @@ fn format_float(f: f64) -> String {
 
 /// PG `timestamp` / `timestamptz` (PG-epoch microseconds) → CH-parseable ISO
 /// string, up to 6 fractional digits
+/// 0001-01-01 00:00:00 in PG timestamp micros (since 2000-01-01)
+const PG_AD_1_MICROS: i64 = -730_119 * 86_400 * 1_000_000;
+
 fn render_pg_timestamp(pg_micros: i64) -> AsciiBuf<32> {
     const DAY_US: i64 = 86_400 * 1_000_000;
     let unix_micros = pg_micros.saturating_add(walrus::pg::replication::PG_EPOCH_USEC);
@@ -930,7 +939,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             r.default_sql.as_deref(),
-            Some("parseDateTime64BestEffort('2026-08-27 12:47:00.842306+00', 6, 'UTC')")
+            Some("toDateTime64('2026-08-27 12:47:00.842306', 6, 'UTC')")
         );
         let r = map(
             &attr(TIMESTAMPOID, 3, true, Some("2024-01-01 00:00:00")),
@@ -939,9 +948,14 @@ mod tests {
         .unwrap();
         assert_eq!(
             r.default_sql.as_deref(),
-            Some("parseDateTime64BestEffort('2024-01-01 00:00:00', 3, 'UTC')")
+            Some("toDateTime64('2024-01-01 00:00:00', 3, 'UTC')")
         );
-        for text in ["infinity", "-infinity", "0044-03-15 12:00:00+00 BC"] {
+        for text in [
+            "infinity",
+            "-infinity",
+            "0044-03-15 12:00:00+00 BC",
+            "0001-12-31 23:59:59+00 BC",
+        ] {
             let r = map(&attr(TIMESTAMPTZOID, -1, true, Some(text)), false).unwrap();
             assert_eq!(r.default_sql, None, "{text}");
         }
@@ -989,7 +1003,19 @@ mod tests {
 
     #[test]
     fn other_pending_text_defaults_cast_from_their_text() {
+        let r = map(&attr(INTERVALOID, -1, true, Some("1 day")), false).unwrap();
+        assert_eq!(r.default_sql.as_deref(), Some("unhex('3120646179')"));
+    }
+
+    #[test]
+    fn numeric_text_default_renders_its_digits() {
         let r = map(&attr(NUMERICOID, -1, true, Some("3.14")), false).unwrap();
-        assert_eq!(r.default_sql.as_deref(), Some("unhex('332e3134')"));
+        assert_eq!(r.default_sql.as_deref(), Some("'3.14'"));
+        let r = map(
+            &attr(NUMERICOID, (12 << 16 | 2) + 4, true, Some("0.00")),
+            false,
+        )
+        .unwrap();
+        assert_eq!(r.default_sql.as_deref(), Some("0.00"));
     }
 }
