@@ -107,6 +107,29 @@ label_class! {
     }
 }
 
+label_class! {
+    #[derive(Default)]
+    pub enum SourceMode {
+        #[default]
+        Streaming => "Streaming from source",
+        Archive => "Catching up from archive",
+        Reconnecting => "Reconnecting to source",
+        Switchpoint => "Waiting at timeline switch",
+        Crossing => "Crossing timelines",
+        Paused => "Paused by operator",
+        InitialLoad => "Initial load",
+    }
+}
+
+label_class! {
+    pub enum ErrorKind {
+        SourceWalRemoved => ("source", "wal_removed"),
+        SourceDisconnect => ("source", "disconnect"),
+        SourceWalsenderExit => ("source", "walsender_exit"),
+        SourceOther => ("source", "other"),
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum MetricsError {
     #[error("io: {0}")]
@@ -267,6 +290,9 @@ snapshot! {
         /// `(worker, state, seconds)` for every serial worker, rendered
         /// `walshadow_worker_seconds_total{worker,state}`
         worker_seconds: Vec<(&'static str, WorkerState, f64)>,
+        /// Failures by [`ErrorKind`], rendered
+        /// `walshadow_errors_total{component,kind}`
+        errors: [u64; ErrorKind::COUNT],
         /// Refusal a crossing parked on, rendered as `crossing_wedged`. The
         /// pump keeps publishing rather than exiting into a restart that
         /// re-crosses and re-fails, so this is how the daemon says it is
@@ -524,6 +550,8 @@ snapshot! {
         "Time filtering and dispatching archived WAL, including downstream backpressure.",
     gauge archive_restore_active: u64 =
         "1 while consuming prefetched archive WAL through the normal pump.",
+    gauge source_mode: [u64; SourceMode::COUNT] ["mode" = SourceMode::LABELS] =
+        "1 for what the daemon is doing, 0 for the rest. Initial load while the bootstrap builds ClickHouse from a backup; afterwards the pump's source: streaming, catching up from the archive, reconnecting, waiting at a timeline switch, crossing timelines, or paused by an operator.",
     counter source_endpoint_swaps_total: u64 =
         "Source feeds swapped onto a reloaded `[source]` endpoint or slot.",
     counter source_endpoint_swap_failures_total: u64 =
@@ -1066,6 +1094,16 @@ fn encode_snapshot(snap: &MetricsSnapshot, enc: &mut DescriptorEncoder<'_>) -> f
 
     counter_pairs(
         enc,
+        "walshadow_errors_total",
+        "Failures by component and kind. source: the live stream ended under the pump, wal_removed is SQLSTATE 58P01 (the source recycled WAL walshadow still needed), disconnect an I/O failure, walsender_exit a clean end of stream, other anything else.",
+        ["component", "kind"],
+        ErrorKind::ALL
+            .into_iter()
+            .map(|e| (e.pair(), snap.errors[e.index()])),
+    )?;
+
+    counter_pairs(
+        enc,
         "walshadow_worker_seconds_total",
         "Wall time of each serial worker by state: busy is doing its own work, idle is waiting for input, blocked_in is waiting on a result it already requested, blocked_out is waiting to hand work downstream. States are disjoint, so one worker sums to about 1 s/s; busy near 1 s/s names the bottleneck. Workers: pump, queue, batcher, inserter (summed over the pool), backup_tap, backup_walk.",
         ["worker", "state"],
@@ -1430,6 +1468,27 @@ mod tests {
         assert!(dupes.is_empty(), "families declared twice: {dupes:?}");
         let helps = body.lines().filter(|l| l.starts_with("# HELP ")).count();
         assert_eq!(helps, seen.len(), "one HELP per TYPE");
+    }
+
+    #[test]
+    fn render_emits_source_mode_families() {
+        let snap = MetricsSnapshot {
+            source_mode: SourceMode::Archive.one_hot(),
+            errors: [2, 3, 6, 4],
+            ..MetricsSnapshot::default()
+        };
+        let body = render(snap);
+        assert!(body.contains("walshadow_source_mode{mode=\"Catching up from archive\"} 1"));
+        assert!(body.contains("walshadow_source_mode{mode=\"Streaming from source\"} 0"));
+        assert!(body.contains("walshadow_source_mode{mode=\"Initial load\"} 0"));
+        assert!(body.contains("# TYPE walshadow_errors counter"));
+        assert!(
+            body.contains("walshadow_errors_total{component=\"source\",kind=\"wal_removed\"} 2")
+        );
+        assert!(
+            body.contains("walshadow_errors_total{component=\"source\",kind=\"walsender_exit\"} 6")
+        );
+        assert!(body.contains("walshadow_errors_total{component=\"source\",kind=\"other\"} 4"));
     }
 
     #[test]
