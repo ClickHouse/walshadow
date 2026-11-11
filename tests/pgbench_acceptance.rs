@@ -423,7 +423,7 @@ fn run_ddl_intermix(ports: fx::Ports, decoder_pool: usize, inserter_pool: usize,
         )?)?;
         wait_for_metric_lsn(
             metrics_addr,
-            "walshadow_source_received_lsn",
+            "walshadow_position_lsn{at=\"received\"}",
             bootstrap_lsn,
             Duration::from_secs(120),
         )
@@ -492,7 +492,7 @@ fn run_ddl_intermix(ports: fx::Ports, decoder_pool: usize, inserter_pool: usize,
 
         // 14. Force a segment seal so the daemon's pump definitely
         //     reaches every committed row in WAL, then poll the daemon's
-        //     `walshadow_emitter_ack_lsn` until it crosses source's
+        //     `walshadow_position_lsn{at="ack"}` until it crosses source's
         //     pre-switch insert position. The switch record starts there,
         //     so it carries the ack over the target. A post-switch target
         //     waits on bgwriter's next standby snapshot instead, up to
@@ -505,7 +505,7 @@ fn run_ddl_intermix(ports: fx::Ports, decoder_pool: usize, inserter_pool: usize,
             walshadow::pg::parse_pg_lsn(&target_lsn_text).context("parse source LSN")?;
         wait_for_metric_lsn(
             metrics_addr,
-            "walshadow_emitter_ack_lsn",
+            "walshadow_position_lsn{at=\"ack\"}",
             target_lsn,
             Duration::from_secs(60),
         )
@@ -668,12 +668,12 @@ fn wait_child_with_timeout(
 /// Stands in for `--max-segments`, which races with bootstrap-triggered
 /// segment seals.
 ///
-/// `walshadow_emitter_ack_lsn` carries record *start* LSNs (a commit's seq
+/// `walshadow_position_lsn{at="ack"}` carries record *start* LSNs (a commit's seq
 /// publishes its commit record's start, idle advance publishes the last
 /// record's start), so it reaches `target` only once a record starting at or
 /// past `target` is flushed to CH. `pg_current_wal_lsn` reports the *end* of
 /// the last record, so a source that never writes again pins the ack one
-/// record short of its own head; gate on `walshadow_source_received_lsn`
+/// record short of its own head; gate on `walshadow_position_lsn{at="received"}`
 /// instead, which the pump takes from the walsender's WAL end
 fn wait_for_metric_lsn(
     metrics_addr: SocketAddr,

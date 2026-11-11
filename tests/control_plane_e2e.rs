@@ -1470,12 +1470,12 @@ async fn pause_publishes_frozen_frontier_lsns() {
             "consumed {consumed:X} above received {received:X}",
         );
         assert_eq!(
-            h.metric("walshadow_pause_consumed_lsn")?,
+            h.metric("walshadow_position_lsn{at=\"pause_consumed\"}")?,
             consumed,
             "metric disagrees with ctl status",
         );
         assert_eq!(
-            h.metric("walshadow_pause_received_lsn")?,
+            h.metric("walshadow_position_lsn{at=\"pause_received\"}")?,
             received,
             "metric disagrees with ctl status",
         );
@@ -2150,7 +2150,7 @@ async fn restart_after_switchover_resumes_on_both_sides_of_the_fork() {
         .await
         .context("pump never crossed the fork")?;
         // Captured now: the counters are per-process, so a restart zeroes them
-        let switch_lsn = h.metric("walshadow_timeline_switch_lsn")?;
+        let switch_lsn = h.metric("walshadow_position_lsn{at=\"timeline_switch\"}")?;
         assert!(switch_lsn > 0, "crossing reported no fork LSN");
         // The shadow must be past the fork too, else the first restart is not
         // exercising the window
@@ -2195,7 +2195,7 @@ async fn restart_after_switchover_resumes_on_both_sides_of_the_fork() {
         // Survives the restart because it comes off the source's history chain,
         // not off a per-process counter
         assert_eq!(
-            h.metric("walshadow_timeline_switch_lsn")?,
+            h.metric("walshadow_position_lsn{at=\"timeline_switch\"}")?,
             switch_lsn,
             "fork LSN did not come back from the timeline history",
         );

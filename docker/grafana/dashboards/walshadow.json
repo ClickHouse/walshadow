@@ -210,7 +210,7 @@
       },
       "targets": [
         {
-          "expr": "clamp_min(walshadow_source_received_lsn - walshadow_emitter_ack_lsn, 0)",
+          "expr": "clamp_min(walshadow_position_lsn{at=\"source_head\"} - ignoring(at) walshadow_position_lsn{at=\"ack\"}, 0)",
           "instant": true,
           "legendFormat": "backlog",
           "refId": "A"
@@ -633,12 +633,12 @@
           "refId": "A"
         },
         {
-          "expr": "clamp_min(walshadow_source_received_lsn - walshadow_decoder_commit_lsn, 0)",
+          "expr": "clamp_min(walshadow_position_lsn{at=\"received\"} - ignoring(at) walshadow_position_lsn{at=\"decoder_commit\"}, 0)",
           "legendFormat": "source to decoder",
           "refId": "B"
         },
         {
-          "expr": "clamp_min(walshadow_source_received_lsn - walshadow_emitter_ack_lsn, 0)",
+          "expr": "clamp_min(walshadow_position_lsn{at=\"source_head\"} - ignoring(at) walshadow_position_lsn{at=\"ack\"}, 0)",
           "legendFormat": "source to ClickHouse ack",
           "refId": "C"
         }

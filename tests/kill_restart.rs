@@ -14,7 +14,7 @@
 //!   6. snapshot source's pg_current_wal_lsn + row state
 //!   7. restart the daemon with identical flags — same spill dir, same
 //!      walsender bind (SO_REUSEADDR), no `--ignore-cursor`
-//!   8. poll source + daemon's `walshadow_source_received_lsn` until the
+//!   8. poll source + daemon's `walshadow_position_lsn{at="received"}` until the
 //!      restarted pump catches up to the snapshotted LSN
 //!   9. poll CH count + sum(id) + md5(string_agg(name, ',' ORDER BY
 //!      id)) until it matches source's
@@ -318,7 +318,7 @@ async fn wait_for_first_commit(metrics_addr: SocketAddr, deadline: Duration) -> 
 }
 
 /// Poll source's `pg_current_wal_lsn` + daemon's
-/// `walshadow_source_received_lsn` until the restarted pump catches up
+/// `walshadow_position_lsn{at="received"}` until the restarted pump catches up
 ///
 /// `emitter_ack` carries record start LSNs while `pg_current_wal_lsn` reports
 /// the last record's end, so an idle source never lifts it to the target
@@ -332,7 +332,8 @@ async fn wait_for_received_catchup(
     let target = parse_pg_lsn(&target_text).context("parse source LSN")?;
     while start.elapsed() < deadline {
         if let Ok(body) = fx::http_get(metrics_addr, "/metrics")
-            && let Some(received) = fx::parse_metric(&body, "walshadow_source_received_lsn")
+            && let Some(received) =
+                fx::parse_metric(&body, "walshadow_position_lsn{at=\"received\"}")
             && received >= target
         {
             return Ok(received);

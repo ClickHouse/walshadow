@@ -112,6 +112,23 @@ label_class! {
 }
 
 label_class! {
+    pub enum Position {
+        SourceHead => "source_head",
+        Received => "received",
+        Filter => "filter",
+        DecoderCommit => "decoder_commit",
+        Ack => "ack",
+        ShadowReplay => "shadow_replay",
+        Floor => "floor",
+        PauseConsumed => "pause_consumed",
+        PauseReceived => "pause_received",
+        PromotionTargetReplay => "promotion_target_replay",
+        PromotionTargetReceive => "promotion_target_receive",
+        TimelineSwitch => "timeline_switch",
+    }
+}
+
+label_class! {
     pub enum WorkerState {
         Busy => "busy",
         Idle => "idle",
@@ -167,11 +184,21 @@ macro_rules! encode_metric {
             gauge($enc, $name, $help, $value)?
         }
     };
+    ($enc:expr, opt, $name:expr, $help:expr, $value:expr) => {
+        if let Some(v) = $value {
+            gauge($enc, $name, $help, v)?
+        }
+    };
     ($enc:expr, counter, $name:expr, $help:expr, $value:expr, $key:literal, $labels:expr) => {
         counter_series($enc, $name, $help, $key, $labels.into_iter().zip($value))?
     };
     ($enc:expr, gauge, $name:expr, $help:expr, $value:expr, $key:literal, $labels:expr) => {
         gauge_series($enc, $name, $help, $key, $labels.into_iter().zip($value))?
+    };
+    ($enc:expr, opt, $name:expr, $help:expr, $value:expr, $key:literal, $labels:expr) => {
+        if let Some(v) = $value {
+            gauge_series($enc, $name, $help, $key, $labels.into_iter().zip(v))?
+        }
     };
 }
 
@@ -338,20 +365,21 @@ snapshot! {
         promotion_target_replay_lsn: u64,
         /// Target's `pg_last_wal_receive_lsn()`, read while paused
         promotion_target_receive_lsn: u64,
+        /// WAL positions rendered as `walshadow_position_lsn{at}`, each only
+        /// while known (0 is InvalidXLogRecPtr); all read in one status tick
+        /// so differences between them carry no scrape skew
+        source_received_lsn: Pos<SourceReceived>,
+        source_server_wal_end_lsn: Option<u64>,
+        filter_lsn: Pos<FilterDispatched>,
+        shadow_replay_lsn: Pos<ShadowReplay>,
+        decoder_commit_lsn: Pos<Drain>,
+        emitter_ack_lsn: Pos<EmitterAck>,
+        floor_lsn: Pos<Floor>,
+        timeline_switch_lsn: u64,
+        pause_consumed_lsn: u64,
+        pause_received_lsn: u64,
     }
 
-    lsn source_received_lsn: Pos<SourceReceived> =
-        "Source PG's most recent server_wal_end seen on the replication socket.",
-    /// Last segment-boundary LSN dispatched downstream; becomes durable once
-    /// segment fsync lands
-    lsn filter_lsn: Pos<FilterDispatched> =
-        "LSN of the last filtered WAL byte the daemon has dispatched.",
-    lsn shadow_replay_lsn: Pos<ShadowReplay> =
-        "Shadow PG's pg_last_wal_replay_lsn(), polled at status cadence.",
-    lsn decoder_commit_lsn: Pos<Drain> = "Highest commit LSN drained out of the xact buffer.",
-    /// Live insert watermark, unlike manifest's resume-safe `emitter_ack`
-    lsn emitter_ack_lsn: Pos<EmitterAck> = "Contiguous-done watermark from the insert pipeline.",
-    lsn floor_lsn: Pos<Floor> = "Durable resume floor: restart resumes here and pruners cut to it.",
     gauge xact_active: u64 = "Active transactions buffered in memory or on spill.",
     gauge xact_bytes_in_memory: u64 = "Bytes held in memory across all buffered xacts.",
     gauge spill_xacts_active: u64 = "Xacts with at least one entry currently in their spill file.",
@@ -584,21 +612,9 @@ snapshot! {
     counter timeline_switch_failures_by_reason: [u64; SWITCH_FAILURE_REASONS.len()]
         ["reason" = SWITCH_FAILURE_REASONS] =
         "Crossings refused; the stream stays on the ancestor.",
-    /// Most recent fork point, diagnostic
-    gauge timeline_switch_lsn: u64 = "Fork LSN of the most recent timeline crossing.",
     counter timeline_prefix_bytes_verified_total: u64 =
         "Descendant bytes compared against the retained ancestor fork prefix.",
     counter timeline_transition_seconds_total: f64 = "Seconds spent inside timeline crossings.",
-    /// `WalStream::next_lsn` frozen when the pump observed `[stream] paused`,
-    /// which resume asks the source to serve. `0` while not paused: a value
-    /// left from an earlier pause cannot be compared against a promotion
-    /// decision either
-    gauge pause_consumed_lsn: u64 =
-        "Consumed frontier frozen when the pump observed the pause; 0 while running.",
-    /// Source head last heard about, frozen at the same instant. The promotion
-    /// target must reach it before it is promoted
-    gauge pause_received_lsn: u64 =
-        "Source head frozen when the pump observed the pause; 0 while running.",
     gauge shadow_served_timeline: u32 = "Timeline the shadow-facing walsender advertises.",
     /// Branch the shadow is replaying, which is how a shadow that followed the
     /// chain reads differently from one that merely survived
@@ -876,6 +892,10 @@ const PLAN_FAILURE_REASONS: [&str; 11] = [
     "drain",
 ];
 
+pub fn source_server_wal_end(wal_end: Option<u64>) -> Option<u64> {
+    wal_end.filter(|&end| end != 0)
+}
+
 /// `mode=` label order of [`DbSeries::config_backfills_pending_by_mode`]
 const BACKFILL_MODES: [&str; 3] = ["copy", "base_backup", "object_store"];
 
@@ -1150,6 +1170,40 @@ fn encode_snapshot(snap: &MetricsSnapshot, enc: &mut DescriptorEncoder<'_>) -> f
             .map(|(worker, state, secs)| ([*worker, state.label()], *secs)),
     )?;
 
+    let positions = [
+        (
+            Position::SourceHead,
+            snap.source_server_wal_end_lsn.unwrap_or(0),
+        ),
+        (Position::Received, snap.source_received_lsn.get()),
+        (Position::Filter, snap.filter_lsn.get()),
+        (Position::DecoderCommit, snap.decoder_commit_lsn.get()),
+        (Position::Ack, snap.emitter_ack_lsn.get()),
+        (Position::ShadowReplay, snap.shadow_replay_lsn.get()),
+        (Position::Floor, snap.floor_lsn.get()),
+        (Position::PauseConsumed, snap.pause_consumed_lsn),
+        (Position::PauseReceived, snap.pause_received_lsn),
+        (
+            Position::PromotionTargetReplay,
+            snap.promotion_target_replay_lsn,
+        ),
+        (
+            Position::PromotionTargetReceive,
+            snap.promotion_target_receive_lsn,
+        ),
+        (Position::TimelineSwitch, snap.timeline_switch_lsn),
+    ];
+    gauge_series(
+        enc,
+        "walshadow_position_lsn",
+        "WAL byte positions, all read in one status tick so any two subtract without scrape skew. source_head is the newest server_wal_end heard on the source socket (absent while the archive feeds the pump); received the pump's intake frontier; filter the last dispatched filtered byte; decoder_commit the highest commit drained; ack the ClickHouse watermark; shadow_replay the shadow Postgres replay position; floor the durable resume floor. pause_consumed and pause_received are the frontiers frozen by a pause, promotion_target_replay and promotion_target_receive the target's positions read while paused, timeline_switch the fork of the last crossing. A member is absent while its position is unknown (0).",
+        "at",
+        positions
+            .into_iter()
+            .filter(|(_, lsn)| *lsn != 0)
+            .map(|(at, lsn)| (at.label(), lsn)),
+    )?;
+
     // rmgr names come out of the fixed resource-manager table, so label values
     // need no escaping the encoder does not do
     let mut records = declare(
@@ -1324,21 +1378,50 @@ mod tests {
     }
 
     #[test]
-    fn render_omits_unknown_lsn_gauges() {
+    fn render_omits_unknown_positions() {
         let body = render(MetricsSnapshot {
             emitter_ack_lsn: 0x47FD_FB00_0000.into(),
+            pause_received_lsn: 77,
             ..MetricsSnapshot::default()
         });
-        assert!(body.contains("walshadow_emitter_ack_lsn 79156163379200"));
-        for name in [
-            "walshadow_source_received_lsn",
-            "walshadow_filter_lsn",
-            "walshadow_shadow_replay_lsn",
-            "walshadow_decoder_commit_lsn",
-            "walshadow_floor_lsn",
+        assert!(body.contains("# TYPE walshadow_position_lsn gauge"));
+        assert!(body.contains("walshadow_position_lsn{at=\"ack\"} 79156163379200"));
+        assert!(body.contains("walshadow_position_lsn{at=\"pause_received\"} 77"));
+        for at in [
+            "source_head",
+            "received",
+            "filter",
+            "shadow_replay",
+            "decoder_commit",
+            "floor",
+            "pause_consumed",
+            "promotion_target_replay",
+            "promotion_target_receive",
+            "timeline_switch",
         ] {
-            assert!(!body.contains(name), "{name} rendered at LSN 0: {body}");
+            let line = format!("walshadow_position_lsn{{at=\"{at}\"}}");
+            assert!(!body.contains(&line), "{at} rendered at LSN 0: {body}");
         }
+    }
+
+    #[test]
+    fn source_server_wal_end_is_absent_until_heard() {
+        for unknown in [None, Some(0)] {
+            assert_eq!(source_server_wal_end(unknown), None);
+            let body = render(MetricsSnapshot {
+                source_server_wal_end_lsn: source_server_wal_end(unknown),
+                ..MetricsSnapshot::default()
+            });
+            assert!(
+                !body.contains("walshadow_position_lsn{at=\"source_head\"}"),
+                "{body}"
+            );
+        }
+        let body = render(MetricsSnapshot {
+            source_server_wal_end_lsn: source_server_wal_end(Some(1_000)),
+            ..MetricsSnapshot::default()
+        });
+        assert!(body.contains("walshadow_position_lsn{at=\"source_head\"} 1000"));
     }
 
     #[test]
@@ -1354,10 +1437,10 @@ mod tests {
             .insert(("Heap".into(), "to_decoder"), 17);
 
         let body = render(snap);
-        assert!(body.contains("# HELP walshadow_source_received_lsn"));
-        assert!(body.contains("# TYPE walshadow_source_received_lsn gauge"));
-        assert!(body.contains("walshadow_source_received_lsn 3405691582"));
-        assert!(body.contains("walshadow_filter_lsn 12648430"));
+        assert!(body.contains("# HELP walshadow_position_lsn"));
+        assert!(body.contains("# TYPE walshadow_position_lsn gauge"));
+        assert!(body.contains("walshadow_position_lsn{at=\"received\"} 3405691582"));
+        assert!(body.contains("walshadow_position_lsn{at=\"filter\"} 12648430"));
         assert!(
             body.contains("walshadow_filter_records_total{rmgr=\"Heap\",route=\"to_decoder\"} 17")
         );
@@ -1838,6 +1921,9 @@ mod tests {
         let resp = String::from_utf8(buf).unwrap();
         assert!(resp.starts_with("HTTP/1.0 200 OK\r\n"), "{resp}");
         assert!(resp.contains("Content-Type: application/openmetrics-text"));
-        assert!(resp.contains("walshadow_filter_lsn 57005"), "{resp}");
+        assert!(
+            resp.contains("walshadow_position_lsn{at=\"filter\"} 57005"),
+            "{resp}"
+        );
     }
 }
