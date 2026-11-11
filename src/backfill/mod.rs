@@ -15,6 +15,7 @@ pub mod bootstrap_window;
 pub mod copy_backfill;
 pub mod opt_in;
 pub mod pg_path;
+pub mod shadow_tablespaces;
 pub mod spool;
 pub mod visibility_gate;
 pub mod visibility_pending;

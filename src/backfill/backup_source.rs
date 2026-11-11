@@ -13,8 +13,9 @@
 //!
 //! 1. `start()` fires before any `begin()`, carrying start_lsn,
 //!    timeline, user tablespace list.
-//! 2. Tablespace symlinks (`pg_tblspc/<oid>`) emit as `FileKind::Symlink`
-//!    before any file under their subtree.
+//! 2. Tablespace contents emit under `pg_tblspc/<oid>/`; a tablespace
+//!    symlink, where one is sent, emits as `FileKind::Symlink` before any
+//!    file under its subtree.
 //! 3. `pg_control` emits last; PG's BASE_BACKUP protocol and wal-rus's
 //!    `list_tar_parts` both honour this, future impls must too.
 //! 4. `finish()` fires after the last `end()`, carrying end_lsn.
@@ -187,6 +188,9 @@ pub struct PumpTarget {
     pub sink: Arc<dyn BackupSink>,
     pub stats: Arc<PumpStats>,
     pub part: Option<Arc<str>>,
+    /// Cluster-relative directory an archive's entries sit under. A
+    /// replication-protocol tablespace archive is rooted at the tablespace
+    pub root: Option<PathBuf>,
 }
 
 impl PumpTarget {
@@ -196,6 +200,7 @@ impl PumpTarget {
             sink,
             stats,
             part: None,
+            root: None,
         }
     }
 
@@ -206,6 +211,19 @@ impl PumpTarget {
             sink: self.sink.clone(),
             stats: self.stats.clone(),
             part: Some(Arc::from(key)),
+            root: self.root.clone(),
+        }
+    }
+
+    /// Land one tablespace's archive where an object-store backup carries
+    /// it, `pg_tblspc/<oid>/`, rather than over the data dir root
+    pub fn for_tablespace(&self, oid: u32) -> Self {
+        Self {
+            data_dir: self.data_dir.clone(),
+            sink: self.sink.clone(),
+            stats: self.stats.clone(),
+            part: self.part.clone(),
+            root: Some(crate::backfill::shadow_tablespaces::landing_root(oid)),
         }
     }
 }
@@ -278,6 +296,9 @@ where
             continue;
         };
         meta.part = target.part.clone();
+        if let Some(root) = &target.root {
+            meta.path = root.join(&meta.path);
+        }
         pump_entry(&mut body, &meta, target).await?;
     }
     Ok(())
@@ -586,5 +607,49 @@ mod tests {
             })
             .sum();
         assert_eq!(tapped_bytes, 8192);
+    }
+
+    /// A replication-protocol tablespace archive is rooted at the
+    /// tablespace; its entries must not land over the data dir root
+    #[tokio::test]
+    async fn tablespace_archive_lands_under_pg_tblspc() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path();
+        let mut w = tarball::Writer::new(Vec::new());
+        let dir = tarball::Entry::new("PG_18_202506291", Kind::Directory, 0, 0o700, 0);
+        w.append(&dir, tokio::io::empty()).await.unwrap();
+        let file = tarball::Entry::new("PG_18_202506291/5/16400", Kind::Regular, 4, 0o600, 0);
+        w.append(&file, &b"page"[..]).await.unwrap();
+        let tar_bytes = w.finish().await.unwrap();
+
+        let recording = Arc::new(RecordingSink::default());
+        let sink: Arc<dyn BackupSink> = Arc::new(recording.clone());
+        let target = PumpTarget::new(data_dir.to_path_buf(), sink, Arc::new(PumpStats::default()))
+            .for_tablespace(16385);
+        let mut archive = tarball::Reader::new(tar_bytes.as_slice());
+        pump_tar_to_sink(&mut archive, &target).await.unwrap();
+
+        assert_eq!(
+            std::fs::read(data_dir.join("pg_tblspc/16385/PG_18_202506291/5/16400")).unwrap(),
+            b"page",
+        );
+        assert!(!data_dir.join("PG_18_202506291").exists());
+        let begun: Vec<_> = recording
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match e {
+                Event::Begin { path, .. } => Some(path.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            begun,
+            [
+                PathBuf::from("pg_tblspc/16385/PG_18_202506291"),
+                PathBuf::from("pg_tblspc/16385/PG_18_202506291/5/16400"),
+            ],
+        );
     }
 }

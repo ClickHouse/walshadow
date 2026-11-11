@@ -1,7 +1,8 @@
 //! Direct base-backup source. Wraps wal-rus's
 //! `pg::replication::base_backup::run_base_backup` to drive walshadow's
-//! [`BackupSource`] trait. Tablespace symlinks ride inside the data-dir
-//! archive in PG protocol order, surfacing as `FileKind::Symlink`.
+//! [`BackupSource`] trait. `TABLESPACE_MAP` keeps tablespace symlinks out of
+//! the data-dir archive; each tablespace archive lands under
+//! `pg_tblspc/<oid>/`, matching the object-store layout.
 //!
 //! Single-pass: seed the page-walk
 //! [`CatalogMap`](crate::backfill::backup_page_walk::CatalogMap) from source PG
@@ -80,7 +81,11 @@ impl BackupSource for DirectSource {
                         oid = meta.oid,
                         "archive open",
                     );
-                    drive_archive(body, &target).await?;
+                    if meta.is_data_dir() {
+                        drive_archive(body, &target).await?;
+                    } else {
+                        drive_archive(body, &target.for_tablespace(meta.oid)).await?;
+                    }
                 }
                 BackupEvent::Finish(e) => {
                     let e = EndInfo {
