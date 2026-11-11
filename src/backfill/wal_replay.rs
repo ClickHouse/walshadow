@@ -17,7 +17,7 @@ use crate::catalog::desc_log::{DescriptorLog, DescriptorLogs};
 use crate::config::ResolvedConfig;
 use crate::decode::heap_decoder::{
     CommittedTuple, XLH_DELETE_IS_SUPER, XLOG_HEAP_DELETE, XLOG_HEAP_HOT_UPDATE, XLOG_HEAP_INSERT,
-    XLOG_HEAP_OPMASK, XLOG_HEAP_UPDATE, take_key_change_tombstone,
+    XLOG_HEAP_OPMASK, XLOG_HEAP_UPDATE, XLOG_HEAP2_MULTI_INSERT, take_key_change_tombstone,
 };
 use crate::decode::visibility::PgXactPatch;
 use crate::decode::wal_xact::{
@@ -198,6 +198,8 @@ pub struct WalReplaySink {
     pending_cap: usize,
     replay: ReplayStats,
     replaced: Option<ReplacedTids>,
+    /// Xids of replayed records that filled slots of filtered TOAST relations
+    toast_writers: HashSet<u32>,
 }
 
 /// Relation and route captured at replay start
@@ -267,6 +269,7 @@ impl WalReplaySink {
             pending_cap,
             replay: ReplayStats::default(),
             replaced: inputs.track_replaced.then(ReplacedTids::default),
+            toast_writers: HashSet::default(),
         }
     }
 
@@ -277,6 +280,31 @@ impl WalReplaySink {
             .as_mut()
             .map(|r| std::mem::take(&mut r.committed))
             .unwrap_or_default()
+    }
+
+    /// TOAST tuples carry their inserting record's xid as `t_xmin`, so an
+    /// image tuple whose xmin is absent here was written before replay began
+    fn note_toast_writer(&mut self, record: &Record<'_>) {
+        if !self.resolver.stores_chunks() {
+            return;
+        }
+        let header = &record.parsed.header;
+        let op = header.info & XLOG_HEAP_OPMASK;
+        let fills = if header.resource_manager_id == RmId::Heap as u8 {
+            matches!(
+                op,
+                XLOG_HEAP_INSERT | XLOG_HEAP_UPDATE | XLOG_HEAP_HOT_UPDATE
+            )
+        } else {
+            header.resource_manager_id == RmId::Heap2 as u8 && op == XLOG_HEAP2_MULTI_INSERT
+        };
+        let Some(rfn) = record.parsed.blocks.first().map(|b| b.header.location.rel) else {
+            return;
+        };
+        let key = (rfn.db_node, rfn.rel_node);
+        if fills && self.filter_rfns.contains(&key) && !self.targets.contains_key(&key) {
+            self.toast_writers.insert(header.xact_id);
+        }
     }
 
     fn note_ended(&mut self, record: &Record<'_>) {
@@ -386,11 +414,27 @@ impl WalReplaySink {
             }
             let page = crate::decode::fpi::restore_block_image(block, record.page_magic)
                 .map_err(|e| SinkError::Other(format!("wal_replay: toast image restore: {e}")))?;
+            let page_lsn = crate::backfill::backup_page_walk::page_pd_lsn(&page);
+            // A tuple no replayed record wrote held its slot from before
+            // `from_lsn` through `page_lsn`. Dating it at `page_lsn` alone
+            // lets a mirror merge collapse the walked copy into a version
+            // above older referrers' bounds
+            let predates = if self.filter_rfns.contains(&(rfn.db_node, rfn.rel_node)) {
+                page_lsn.min(self.from_lsn)
+            } else {
+                page_lsn
+            };
             let mut harvested = crate::backfill::backup_page_walk::toast_rows_from_page(
                 &page,
                 &rel,
                 block.header.location.block_no,
-                crate::backfill::backup_page_walk::page_pd_lsn(&page),
+                |xmin| {
+                    if self.toast_writers.contains(&xmin) {
+                        page_lsn
+                    } else {
+                        predates
+                    }
+                },
             );
             // Insert reaches mirror at its own LSN on commit
             if block.header.block_id == 0
@@ -663,6 +707,7 @@ impl WalReplaySink {
         if rm == RmId::Heap as u8 || rm == RmId::Heap2 as u8 {
             if let Some(rel) = record.parsed.blocks.first().map(|b| b.header.location.rel) {
                 if self.filter_rfns.contains(&(rel.db_node, rel.rel_node)) {
+                    self.note_toast_writer(record);
                     self.harvest_toast_images(record).await?;
                     self.decoder.on_record(record).await?;
                     self.note_ended(record);
@@ -1223,6 +1268,99 @@ mod tests {
         );
     }
 
+    /// Chunk walked from the backup copy, and dated below every bootstrap read
+    fn walked_chunk(rel: &RelDescriptor, tid: (u32, u16), body: &'static [u8]) -> ToastRow {
+        ToastRow {
+            db_oid: rel.rfn.db_node,
+            toast_relid: rel.oid,
+            blkno: tid.0,
+            offnum: tid.1,
+            chunk_id: 7,
+            chunk_seq: 0,
+            chunk_data: bytes::Bytes::from_static(body),
+            lsn: 0,
+        }
+    }
+
+    /// Unchanged pre-backup chunk on a page an image re-logs inside the
+    /// window. A merge keeps only the image's row for the slot, which must
+    /// stay readable at backup start for a referrer on an older heap page
+    #[tokio::test]
+    async fn image_of_pre_window_chunk_survives_mirror_merge() {
+        use crate::backfill::backup_page_walk::{synth_toast_chunk_page, toast_chunk_rel};
+        use crate::toast::{ChunkStore, FetchedValue, MemChunkStore};
+
+        let dir = tempfile::tempdir().unwrap();
+        let rel = Arc::new(toast_chunk_rel());
+        let mut catalog = crate::backfill::backup_page_walk::CatalogMap::new();
+        catalog.insert(rel.clone());
+        let log = seed_test_log(dir.path(), &catalog).await;
+        let store = Arc::new(MemChunkStore::new());
+        let resolver = ToastResolver::with_store(store.clone(), Arc::new(EmitterStats::default()));
+        let mut sink = walked_image_sink(dir.path(), log, resolver, &rel, 0x6800).await;
+
+        store
+            .put(&[walked_chunk(&rel, (3, 1), b"kept")])
+            .await
+            .unwrap();
+        let page = synth_toast_chunk_page(&[(7, 0, b"kept".as_slice())], 0x7000);
+        sink.harvest_toast_images(&image_record(&page, rel.rfn.rel_node, 3))
+            .await
+            .unwrap();
+        sink.finish().await.unwrap();
+        store.merge();
+
+        assert_eq!(
+            store
+                .fetch(rel.rfn.db_node, rel.oid, 7, 0x6800, 4)
+                .await
+                .unwrap(),
+            FetchedValue::Assembled(b"kept".to_vec())
+        );
+    }
+
+    /// Value ID reused inside window: an image holds the new generation,
+    /// written by a replayed insert. It stays at page LSN, so reads at
+    /// backup start still see the walked old generation
+    #[tokio::test]
+    async fn image_of_window_birth_stays_at_page_lsn() {
+        use crate::backfill::backup_page_walk::{synth_toast_chunk_page, toast_chunk_rel};
+        use crate::toast::{ChunkStore, FetchedValue, MemChunkStore};
+
+        let dir = tempfile::tempdir().unwrap();
+        let rel = Arc::new(toast_chunk_rel());
+        let mut catalog = crate::backfill::backup_page_walk::CatalogMap::new();
+        catalog.insert(rel.clone());
+        let log = seed_test_log(dir.path(), &catalog).await;
+        let store = Arc::new(MemChunkStore::new());
+        let resolver = ToastResolver::with_store(store.clone(), Arc::new(EmitterStats::default()));
+        let mut sink = walked_image_sink(dir.path(), log, resolver, &rel, 0x6800).await;
+
+        store
+            .put(&[walked_chunk(&rel, (2, 1), b"old!")])
+            .await
+            .unwrap();
+        let page = synth_toast_chunk_page(&[(7, 0, b"new!".as_slice())], 0x7000);
+        // Synthetic tuples carry xmin 99
+        let mut insert = image_record(&page, rel.rfn.rel_node, 3);
+        insert.parsed.header.xact_id = 99;
+        sink.note_toast_writer(&insert);
+        sink.harvest_toast_images(&image_record(&page, rel.rfn.rel_node, 3))
+            .await
+            .unwrap();
+        sink.finish().await.unwrap();
+
+        let fetch = |bound| store.fetch(rel.rfn.db_node, rel.oid, 7, bound, 4);
+        assert_eq!(
+            fetch(0x6800).await.unwrap(),
+            FetchedValue::Assembled(b"old!".to_vec())
+        );
+        assert_eq!(
+            fetch(0x7000).await.unwrap(),
+            FetchedValue::Assembled(b"new!".to_vec())
+        );
+    }
+
     async fn seed_test_log(
         dir: &Path,
         catalog: &crate::backfill::backup_page_walk::CatalogMap,
@@ -1303,6 +1441,20 @@ mod tests {
             patch: None,
             track_replaced: false,
         })
+    }
+
+    /// Image sink replaying from `from_lsn` with walked TOAST relation `rel`
+    async fn walked_image_sink(
+        dir: &Path,
+        log: Arc<DescriptorLog>,
+        resolver: ToastResolver,
+        rel: &RelDescriptor,
+        from_lsn: u64,
+    ) -> WalReplaySink {
+        let mut sink = image_sink(dir, log, resolver).await;
+        sink.filter_rfns.insert((rel.rfn.db_node, rel.rfn.rel_node));
+        sink.from_lsn = from_lsn;
+        sink
     }
 
     /// Sink with no targets: the xact records under test carry no rows, so

@@ -30,8 +30,11 @@ none, so unreadable values there remain fatal. Keep evidence in memory during
 window replay and deferred resolution; rebuild it on resume by replaying window
 WAL. Memory grows with window deletes and updates on relations with TOAST
 
-Window page images mirror every tuple at page LSN regardless of `xmax`. Images
-taken after a delete commits restore dead chunks above their tombstones.
+Window page images mirror every tuple regardless of `xmax`, at page LSN when
+replay saw its xmin write the relation, else at backup start or page LSN,
+whichever is earlier. Replay keeps those xids in memory for the whole window.
+Images taken after a delete commits restore dead window-born chunks above
+their tombstones.
 Replayed replacements outrank affected rows, but after OID wrap a reused value
 ID can pick up restored chunks and report a size mismatch. Decide whether to
 tombstone or skip image tuples whose deleting transaction committed

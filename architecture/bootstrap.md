@@ -24,7 +24,10 @@ that need PostgreSQL's type conversion
 Rows with external values wait until page walk and window replay finish writing
 chunk mirrors. Window page images restore missing chunks from every tuple on
 each image, including tuples outside that WAL record's operation, except slot an
-insert fills, which mirrors at insert LSN. Committed window inserts hide walked
+insert fills, which mirrors at insert LSN. An image tuple whose xmin wrote no
+replayed record predates the window and mirrors at backup start or page LSN,
+whichever is earlier, so a merge collapsing its walked copy cannot lift it
+above older referrers' bounds. Committed window inserts hide walked
 copies of their slots below insert LSN, so a copy taken after value-ID reuse
 cannot splice into reads of older value. Read mirrors at heap page LSN or backup
 start, whichever is later: late page copies can reference chunks recovered only
