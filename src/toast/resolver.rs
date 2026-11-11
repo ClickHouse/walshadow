@@ -488,6 +488,24 @@ impl MemChunkStore {
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// Keep each TID's newest row, as a `ReplacingMergeTree` merge does;
+    /// equal versions keep the later insert
+    #[cfg(test)]
+    pub(crate) fn merge(&self) {
+        for rows in self.mirrors.lock().unwrap().values_mut() {
+            let mut newest: HashMap<(u32, u16), ToastRow> = HashMap::new();
+            for r in rows.drain(..) {
+                match newest.get(&(r.blkno, r.offnum)) {
+                    Some(kept) if kept.lsn > r.lsn => {}
+                    _ => {
+                        newest.insert((r.blkno, r.offnum), r);
+                    }
+                }
+            }
+            rows.extend(newest.into_values());
+        }
+    }
 }
 
 #[async_trait]
