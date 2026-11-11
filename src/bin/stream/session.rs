@@ -49,8 +49,8 @@ use walshadow::xact_buffer::{BufferingDecoderSink, SubxactTracker, XactBuffer, X
 
 use crate::args::{Args, cli_base, finish_ch_config, positive_usize};
 use crate::bootstrap::{
-    BootstrapHandoff, BootstrapMetrics, BootstrapObservers, ShadowStart, resolve_bootstrap,
-    resolve_shadow_start, run_bootstrap,
+    BootstrapHandoff, BootstrapMetrics, BootstrapObservers, ShadowStart, owed_handoff,
+    resolve_bootstrap, resolve_shadow_start, run_bootstrap,
 };
 use crate::housekeeping::{
     SEGMENT_FSYNC_QUEUE, spawn_desc_log_gc, spawn_segment_fsync, trim_retention,
@@ -312,7 +312,7 @@ async fn session_body(
         bootstrap_metrics = Some(stage);
         Some(handoff)
     } else {
-        None
+        owed_handoff(&shadow_start)?
     };
     let bootstrap_end_lsn: Option<u64> = bootstrap_handoff.as_ref().map(|h| h.end_lsn);
     let bootstrap_resume_lsn: Option<u64> =
@@ -959,6 +959,9 @@ async fn session_body(
         manifest::write(&args.spill_dir, &initial)
             .await
             .context("write initial resume manifest after bootstrap")?;
+        walshadow::bootstrap_marker::HandoffPoint::clear(shadow_start.data_dir())
+            .await
+            .context("clear bootstrap handoff behind initial manifest")?;
     }
 
     // Descriptor log: durable shape history captured at catalog boundaries,
@@ -1033,7 +1036,8 @@ async fn session_body(
                     wal_seg_size: WAL_SEG_SIZE as u32,
                 },
                 lineage: &lineage,
-                manifest_present: manifest_at_boot.is_some(),
+                // A bootstrap handoff pins the start, whatever a manifest said
+                manifest_present: manifest_at_boot.is_some() && bootstrap_end_lsn.is_none(),
                 start_lsn_override,
                 raw_start,
                 aligned,

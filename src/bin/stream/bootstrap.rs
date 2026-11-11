@@ -24,7 +24,7 @@ use walshadow::backfill_bootstrap::{
 use walshadow::backup_source::BackupSource;
 use walshadow::backup_source_direct::DirectSource;
 use walshadow::backup_source_object_store::ObjectStoreSource;
-use walshadow::bootstrap_marker::{self, BootstrapMarker};
+use walshadow::bootstrap_marker::{self, BootstrapMarker, HandoffPoint};
 use walshadow::ch_emitter::{BootstrapMode, EmitterConfig, EmitterStats};
 use walshadow::config::{CliOverrides, ConfigResolver, cli_over_toml};
 use walshadow::decoder_sink::MetricsTupleObserver;
@@ -1136,7 +1136,12 @@ pub(crate) async fn run_bootstrap(
             .with_context(|| format!("bootstrap: chmod 0700 {}", shadow_data_dir.display()))?;
     }
 
-    BootstrapMarker::complete(&shadow_data_dir, recorded).await?;
+    let handoff = HandoffPoint {
+        end_lsn: outcome.end.end_lsn,
+        timeline: outcome.start.timeline,
+        open_floor,
+    };
+    BootstrapMarker::complete(&shadow_data_dir, &handoff, recorded).await?;
 
     timing.finish();
     Ok((
@@ -1188,6 +1193,39 @@ impl BootstrapHandoff {
     pub(crate) fn resume_lsn(&self) -> u64 {
         self.open_floor.unwrap_or(self.end_lsn).min(self.end_lsn)
     }
+}
+
+impl From<HandoffPoint> for BootstrapHandoff {
+    fn from(p: HandoffPoint) -> Self {
+        Self {
+            end_lsn: p.end_lsn,
+            timeline: p.timeline,
+            open_floor: p.open_floor,
+            shadow: None,
+        }
+    }
+}
+
+/// Handoff a landed bootstrap still owes: it completed, but the daemon
+/// stopped before clearing the marker behind the first resume manifest.
+/// Any manifest present is either that initial one or older, so the marker
+/// wins
+pub(crate) fn owed_handoff(start: &ShadowStart) -> Result<Option<BootstrapHandoff>> {
+    let ShadowStart::Resume(dir) = start else {
+        return Ok(None);
+    };
+    let Some(point) = HandoffPoint::read(dir)? else {
+        return Ok(None);
+    };
+    tracing::warn!(
+        target: "walshadow::bootstrap",
+        data_dir = %dir.display(),
+        end_lsn = format_pg_lsn(point.end_lsn).to_string(),
+        timeline = point.timeline,
+        open_floor = point.open_floor.map(|l| format_pg_lsn(l).to_string()),
+        "bootstrap landed but its handoff never reached a manifest; resuming at backup end",
+    );
+    Ok(Some(point.into()))
 }
 
 /// Routing map for the bootstrap drain: explicit `[table.*]` seeded up front,
@@ -1612,5 +1650,48 @@ mod tests {
             .resume_lsn(),
             0x3000
         );
+    }
+
+    /// Restart after the bootstrap marker cleared but before the first
+    /// manifest: resume at the backup, not at the source head
+    #[tokio::test]
+    async fn owed_handoff_resumes_a_landed_bootstrap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("data");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("PG_VERSION"), b"18\n").unwrap();
+        let args = args_from(&[
+            "--bootstrap-mode",
+            "object_store",
+            "--bootstrap-shadow-data-dir",
+            dir.to_str().unwrap(),
+            "--walsender-bind",
+            "127.0.0.1:5555",
+        ]);
+        let start = shadow_start(&args).unwrap();
+        assert!(matches!(start, ShadowStart::Resume(_)));
+        assert!(owed_handoff(&start).unwrap().is_none());
+
+        let point = HandoffPoint {
+            end_lsn: 0x5AA_FFDF_FFF8,
+            timeline: 64,
+            open_floor: Some(0x5AA_F000_0000),
+        };
+        point.write(&dir).await.unwrap();
+        // The marker alone never routes the dir back into bootstrap
+        let start = shadow_start(&args).unwrap();
+        assert!(matches!(start, ShadowStart::Resume(_)));
+        let owed = owed_handoff(&start).unwrap().expect("handoff owed");
+        assert_eq!(
+            (owed.end_lsn, owed.timeline, owed.resume_lsn()),
+            (0x5AA_FFDF_FFF8, 64, 0x5AA_F000_0000),
+        );
+        assert!(owed.shadow.is_none());
+
+        HandoffPoint::clear(&dir).await.unwrap();
+        assert!(owed_handoff(&start).unwrap().is_none());
+
+        std::fs::write(dir.join(bootstrap_marker::HANDOFF_FILENAME), b"garbage").unwrap();
+        assert!(owed_handoff(&start).is_err());
     }
 }

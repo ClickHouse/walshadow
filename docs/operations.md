@@ -130,7 +130,9 @@ Do not reuse state against unrelated PostgreSQL cluster. Source system-ID
 mismatch fails startup
 
 `--ignore-cursor` and `--start-lsn` intentionally discard normal resume
-position. Reserve them for recovery drills or operator-directed rebuilds
+position. Reserve them for recovery drills or operator-directed rebuilds.
+`--start-lsn` below descriptor history fails once a manifest exists; add
+`--ignore-cursor` to re-seed history at that position
 
 ## Retain source WAL
 
