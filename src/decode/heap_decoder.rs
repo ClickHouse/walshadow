@@ -990,6 +990,10 @@ fn missing_value_from_array(att: &RelAttr, arr: &[u8]) -> ColumnValue {
 
 /// `attmissingval` element from its `anyarray_out` text form (SQL/mirror path).
 pub(crate) fn missing_value_from_text(type_oid: u32, text: &str) -> ColumnValue {
+    let pending = || ColumnValue::PgPendingText {
+        type_oid,
+        text: text.to_owned(),
+    };
     match type_oid {
         BOOLOID => match text {
             "t" | "true" | "yes" | "on" | "1" => ColumnValue::Bool(true),
@@ -1043,11 +1047,30 @@ pub(crate) fn missing_value_from_text(type_oid: u32, text: &str) -> ColumnValue 
             .unwrap_or(ColumnValue::Null),
         // `jsonb` arrives as `jsonb_out` text, already what the emitter ships
         JSONOID | JSONBOID => ColumnValue::Json(text.to_owned()),
+        NUMERICOID => {
+            use crate::decode::codecs::NumericKind;
+            ColumnValue::Numeric(match text {
+                "NaN" => NumericKind::NaN,
+                "Infinity" => NumericKind::PInf,
+                "-Infinity" => NumericKind::NInf,
+                _ => NumericKind::Finite(text.to_owned()),
+            })
+        }
+        // Encoded into fixed-width ClickHouse columns, where pending text has
+        // no place; unparseable text stays pending and fails loudly there
+        DATEOID => crate::decode::codecs::parse_date(text).map_or_else(pending, ColumnValue::Date),
+        TIMEOID => crate::decode::codecs::parse_time(text).map_or_else(pending, ColumnValue::Time),
+        TIMESTAMPOID => crate::decode::codecs::parse_timestamp(text)
+            .map_or_else(pending, ColumnValue::Timestamp),
+        TIMESTAMPTZOID => crate::decode::codecs::parse_timestamptz(text)
+            .map_or_else(pending, ColumnValue::TimestampTz),
+        UUIDOID => crate::decode::codecs::parse_uuid(text).map_or_else(pending, ColumnValue::Uuid),
+        // Pending text would land in the String column as `\x..` text
+        BYTEAOID => {
+            crate::decode::codecs::parse_bytea_hex(text).map_or_else(pending, ColumnValue::Bytea)
+        }
         // attmissingval text requires typinput
-        _ => ColumnValue::PgPendingText {
-            type_oid,
-            text: text.to_owned(),
-        },
+        _ => pending(),
     }
 }
 
@@ -2515,11 +2538,50 @@ mod tests {
         num.missing_default = Some("3.14".into());
         assert_eq!(
             missing_value_for(&num),
+            ColumnValue::Numeric(crate::decode::codecs::NumericKind::Finite("3.14".into()))
+        );
+        num.missing_default = Some("NaN".into());
+        assert_eq!(
+            missing_value_for(&num),
+            ColumnValue::Numeric(crate::decode::codecs::NumericKind::NaN)
+        );
+
+        let mut tstz = rel_attr(1, "t", TIMESTAMPTZOID, 8, 'd');
+        tstz.missing_default = Some("2026-08-27 12:47:00.842306+00".into());
+        assert_eq!(
+            missing_value_for(&tstz),
+            ColumnValue::TimestampTz(841_150_020_842_306)
+        );
+        tstz.missing_default = Some("Thu Aug 27 12:47:00 2026 UTC".into());
+        assert_eq!(
+            missing_value_for(&tstz),
             ColumnValue::PgPendingText {
-                type_oid: NUMERICOID,
-                text: "3.14".into(),
+                type_oid: TIMESTAMPTZOID,
+                text: "Thu Aug 27 12:47:00 2026 UTC".into(),
             }
         );
+
+        let mut ts = rel_attr(1, "t", TIMESTAMPOID, 8, 'd');
+        ts.missing_default = Some("2000-01-01 00:00:01".into());
+        assert_eq!(missing_value_for(&ts), ColumnValue::Timestamp(1_000_000));
+
+        let mut date = rel_attr(1, "d", DATEOID, 4, 'i');
+        date.missing_default = Some("1999-12-31".into());
+        assert_eq!(missing_value_for(&date), ColumnValue::Date(-1));
+
+        let mut time = rel_attr(1, "t", TIMEOID, 8, 'd');
+        time.missing_default = Some("00:00:01.5".into());
+        assert_eq!(missing_value_for(&time), ColumnValue::Time(1_500_000));
+
+        let mut uuid = rel_attr(1, "u", UUIDOID, 16, 'c');
+        uuid.missing_default = Some("00000000-0000-0000-0000-0000000000ff".into());
+        let mut want = [0u8; 16];
+        want[15] = 0xff;
+        assert_eq!(missing_value_for(&uuid), ColumnValue::Uuid(want));
+
+        let mut bytes = rel_attr(1, "b", BYTEAOID, -1, 'i');
+        bytes.missing_default = Some("\\x01ff".into());
+        assert_eq!(missing_value_for(&bytes), ColumnValue::Bytea(vec![1, 0xff]));
 
         let none = rel_attr(1, "x", INT4OID, 4, 'i');
         assert_eq!(missing_value_for(&none), ColumnValue::Null);

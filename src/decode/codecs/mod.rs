@@ -7,6 +7,7 @@ mod interval;
 mod jsonb;
 mod numeric;
 mod text_array;
+mod text_input;
 mod time;
 mod uuid;
 
@@ -18,6 +19,9 @@ pub use interval::{IntervalValue, decode_interval};
 pub use jsonb::{decode_jsonb, decode_jsonb_with_capacity, jsonb_text_len};
 pub use numeric::{NumericKind, decode_numeric, numeric_text_len};
 pub use text_array::decode_text_array;
+pub(crate) use text_input::{
+    parse_bytea_hex, parse_date, parse_time, parse_timestamp, parse_timestamptz, parse_uuid,
+};
 pub(crate) use time::{format_time_us, timetz_to_text};
 pub(crate) use uuid::uuid_to_ch_wire;
 
