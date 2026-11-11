@@ -30,9 +30,9 @@ none, so unreadable values there remain fatal. Keep evidence in memory during
 window replay and deferred resolution; rebuild it on resume by replaying window
 WAL. Memory grows with window deletes and updates on relations with TOAST
 
-Window page images mirror every tuple regardless of `xmax`, at page LSN when
-replay saw its xmin write the relation, else at backup start or page LSN,
-whichever is earlier. Replay keeps those xids in memory for the whole window.
+Window page images mirror every tuple regardless of `xmax`, at its slot's last
+replayed insert, else backup start, capped by page LSN. Replay keeps one
+insert LSN per TOAST slot filled during the window in memory.
 Images taken after a delete commits restore dead window-born chunks above
 their tombstones.
 Replayed replacements outrank affected rows, but after OID wrap a reused value

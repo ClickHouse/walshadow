@@ -388,12 +388,12 @@ pub(crate) fn page_pd_lsn(page: &[u8]) -> u64 {
 }
 
 /// Chunk rows a TOAST page holds, TID-keyed and dated by `lsn` of each
-/// tuple's `t_xmin`
+/// tuple's offnum and `t_xmin`
 pub(crate) fn toast_rows_from_page(
     page: &[u8],
     rel: &RelDescriptor,
     blkno: u32,
-    lsn: impl Fn(u32) -> u64,
+    lsn: impl Fn(u16, u32) -> u64,
 ) -> Vec<crate::toast::ToastRow> {
     let mut rows = Vec::new();
     for offnum in 1..=page_max_offnum(page) {
@@ -416,7 +416,7 @@ pub(crate) fn toast_rows_from_page(
             chunk_id,
             chunk_seq,
             chunk_data: bytes::Bytes::from(chunk_data),
-            lsn: lsn(xmin),
+            lsn: lsn(offnum, xmin),
         });
     }
     rows
@@ -1272,7 +1272,7 @@ mod tests {
             &[(7, 0, b"first"), (8, 0, b"second"), (7, 1, b"third")],
             0x9000,
         );
-        let rows = toast_rows_from_page(&page, &rel, 3, |_| page_pd_lsn(&page));
+        let rows = toast_rows_from_page(&page, &rel, 3, |_, _| page_pd_lsn(&page));
         assert_eq!(rows.len(), 3);
         assert!(rows.iter().all(|r| r.toast_relid == 16401 && r.blkno == 3));
         assert!(rows.iter().all(|r| r.lsn == 0x9000));
@@ -1301,7 +1301,7 @@ mod tests {
         );
         let dead = (raw & !(0x3 << 15)) | (3u32 << 15);
         page[SIZE_OF_PAGE_HEADER..SIZE_OF_PAGE_HEADER + 4].copy_from_slice(&dead.to_le_bytes());
-        let rows = toast_rows_from_page(&page, &rel, 0, |_| 0x9000);
+        let rows = toast_rows_from_page(&page, &rel, 0, |_, _| 0x9000);
         assert_eq!(rows.len(), 1);
         assert_eq!((rows[0].chunk_id, rows[0].offnum), (8, 2));
     }
