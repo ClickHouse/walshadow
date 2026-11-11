@@ -12,6 +12,8 @@ pub const MAX_ATTEMPTS: u32 = 3;
 
 pub const EXTRACTED_FILENAME: &str = "walshadow_bootstrap.extracted";
 
+pub const HANDOFF_FILENAME: &str = "walshadow_bootstrap.handoff";
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BootstrapMarker {
     pub attempts: u32,
@@ -40,6 +42,53 @@ pub struct SpooledRecords {
 impl SpooledRecords {
     pub fn expected(spools: &[Self], path: &Path) -> Option<u64> {
         spools.iter().find(|s| s.path == path).map(|s| s.records)
+    }
+}
+
+/// Where streaming takes over from a landed bootstrap. Lands before the
+/// attempt marker clears and stays until the first resume manifest does, so
+/// a restart in between resumes at the backup rather than the source head
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct HandoffPoint {
+    pub end_lsn: u64,
+    pub timeline: u32,
+    /// Earliest record among transactions open at window seal
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open_floor: Option<u64>,
+}
+
+impl HandoffPoint {
+    /// An unreadable file still says a handoff is owed, so it stops startup
+    /// rather than reading as a cluster with nothing to resume
+    pub fn read(dir: &Path) -> Result<Option<Self>> {
+        let path = dir.join(HANDOFF_FILENAME);
+        let raw = match std::fs::read_to_string(&path) {
+            Ok(raw) => raw,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
+        };
+        toml::from_str(&raw)
+            .map(Some)
+            .with_context(|| format!("parse {}; bootstrap handoff owed", path.display()))
+    }
+
+    pub async fn write(&self, dir: &Path) -> Result<()> {
+        let body = toml::to_string(self).context("render bootstrap handoff")?;
+        crate::fs::write_atomic(dir, HANDOFF_FILENAME, body.as_bytes())
+            .await
+            .context("persist bootstrap handoff")
+    }
+
+    /// Only once a resume manifest carries the handoff forward
+    pub async fn clear(dir: &Path) -> Result<()> {
+        match tokio::fs::remove_file(dir.join(HANDOFF_FILENAME)).await {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e).context("clear bootstrap handoff"),
+        }
+        crate::fs::fsync_dir(dir)
+            .await
+            .context("persist bootstrap handoff removal")
     }
 }
 
@@ -110,8 +159,11 @@ impl BootstrapMarker {
     }
 
     /// End the attempt. Pending rows already in ClickHouse must be recorded
-    /// first, so a restart can still publish them
-    pub async fn complete(dir: &Path, _: PendingRecorded) -> Result<()> {
+    /// first, so a restart can still publish them. The handoff lands first:
+    /// with neither file, a restart reads the dir as resumed and starts at
+    /// the source head, silently skipping everything since the backup
+    pub async fn complete(dir: &Path, handoff: &HandoffPoint, _: PendingRecorded) -> Result<()> {
+        handoff.write(dir).await?;
         ExtractedCheckpoint::clear(dir).await?;
         Self::clear(dir).await
     }
@@ -310,6 +362,43 @@ mod tests {
             attempts,
             backup_name: Some("base_original".into()),
         }
+    }
+
+    /// The handoff must be on disk before the attempt marker goes, or a
+    /// crash between them reads as a resumed cluster with no start position
+    #[tokio::test]
+    async fn complete_leaves_the_handoff_owed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        pinned(1).write(dir).await.unwrap();
+        std::fs::write(dir.join(EXTRACTED_FILENAME), b"").unwrap();
+        let point = HandoffPoint {
+            end_lsn: 0x200,
+            timeline: 1,
+            open_floor: None,
+        };
+        BootstrapMarker::complete(dir, &point, PendingRecorded::nothing_pending())
+            .await
+            .unwrap();
+        assert_eq!(BootstrapMarker::read(dir).unwrap(), None);
+        assert!(!dir.join(EXTRACTED_FILENAME).exists());
+        assert_eq!(HandoffPoint::read(dir).unwrap(), Some(point));
+
+        HandoffPoint::clear(dir).await.unwrap();
+        assert_eq!(HandoffPoint::read(dir).unwrap(), None);
+        HandoffPoint::clear(dir).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn handoff_round_trips_open_floor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let point = HandoffPoint {
+            end_lsn: 0x5AA_FFDF_FFF8,
+            timeline: 64,
+            open_floor: Some(0x5AA_F000_0000),
+        };
+        point.write(tmp.path()).await.unwrap();
+        assert_eq!(HandoffPoint::read(tmp.path()).unwrap(), Some(point));
     }
 
     #[tokio::test]

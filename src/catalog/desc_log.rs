@@ -477,6 +477,18 @@ impl DescriptorLog {
         self.index.read().unwrap().floor_at_write
     }
 
+    /// Lowest LSN the boot seed describes. A seeded relation's record below
+    /// it reads as `NotCovered` and skips. `None` for an empty seed, or once
+    /// GC dropped every seeded entry and `floor_at_write` bounds history
+    pub fn seed_valid_from(&self) -> Option<u64> {
+        let idx = self.index.read().unwrap();
+        idx.batches
+            .range(..=idx.covered_through)
+            .flat_map(|(_, b)| &b.entries)
+            .map(|e| e.valid_from)
+            .min()
+    }
+
     /// Highest `captured_at`, 0 when empty
     pub fn head(&self) -> u64 {
         self.index
@@ -1919,6 +1931,39 @@ mod tests {
         assert_eq!(log.descriptor_at(rfn(6001), 89), LookupResult::NotCovered);
         assert!(log.batch_at(300).unwrap().entries.is_empty());
         assert!(log.batch_at(150).is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn seed_valid_from_tracks_surviving_seed_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d1 = desc(101, 6001, false);
+        let d2 = desc(101, 6001, true);
+        let d3 = desc(102, 6002, false);
+        {
+            let log = open(tmp.path()).await;
+            assert_eq!(log.seed_valid_from(), None);
+            log.seed(batch(100, vec![present(90, &d1), present(90, &d3)]), 100)
+                .await
+                .unwrap();
+            log.append_batch(batch(200, vec![present(180, &d2)]))
+                .await
+                .unwrap();
+            assert_eq!(log.seed_valid_from(), Some(90));
+            assert_eq!(log.descriptor_at(rfn(6002), 89), LookupResult::NotCovered);
+        }
+        let log = open(tmp.path()).await;
+        assert_eq!(log.seed_valid_from(), Some(90));
+        // 6001's seed entry goes, 6002's is still the state at the floor
+        log.force_gc(Pos::new(250)).await.unwrap();
+        assert_eq!(log.seed_valid_from(), Some(90));
+        log.append_batch(batch(
+            300,
+            vec![tombstone(290, 102, 6002, LogValue::Dropped)],
+        ))
+        .await
+        .unwrap();
+        log.force_gc(Pos::new(350)).await.unwrap();
+        assert_eq!(log.seed_valid_from(), None);
     }
 
     #[tokio::test(flavor = "current_thread")]
