@@ -220,7 +220,7 @@ pub async fn drain(
                     }
                     slot.insert(Run {
                         rfn,
-                        seq: seqs.open(tuple.source_lsn, Publish::Commit),
+                        seq: seqs.open(tuple.source_lsn, None, Publish::Commit),
                         rows: 0,
                         target: Target::resolve(&catalog, &routes, &skip_initial, rfn),
                     })
@@ -631,7 +631,7 @@ async fn route_batch(
         }
         let mut tuple = row.tuple;
         let at = seq
-            .get_or_insert_with(|| seqs.open(tuple.source_lsn, Publish::Commit))
+            .get_or_insert_with(|| seqs.open(tuple.source_lsn, None, Publish::Commit))
             .seq();
         let RowTable { rel, route } = &tables[row.table as usize];
         render_ext_columns(&rel.attributes, &mut tuple.columns);
