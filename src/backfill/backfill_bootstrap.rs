@@ -14,6 +14,7 @@
 //! 4. source.run(shadow_data_dir, mux) → (StartInfo, EndInfo)
 //!    - During run: catalog files Keep'd onto shadow_data_dir;
 //!      user heap pages decoded → BackfillTuple → mpsc → emitter task
+//!    - After run: user tablespaces relocate inside shadow_data_dir
 //! 5. Return EndInfo; daemon writes standby.signal w/
 //!    recovery_target_lsn = end_lsn, starts shadow, waits replay,
 //!    then rebinds WAL pump at end_lsn.
@@ -208,6 +209,9 @@ pub fn spawn_greenfield_bootstrap(
             .run(data_dir, sink, cfg.progress.pump.clone())
             .await
             .context("bootstrap: source.run")?;
+        crate::backfill::shadow_tablespaces::relocate(&cfg.shadow_data_dir)
+            .await
+            .context("bootstrap: relocate tablespaces")?;
 
         // Dropping the last sink Arc closes the channel sender in `out_tx`,
         // so a concurrent drain observes channel-close on next recv
