@@ -530,7 +530,28 @@ fn skipped_by_rel(
         .collect()
 }
 
+fn mirror_stage_work(v: &StageCounters<'_>) {
+    use walshadow::ops::stages::{
+        BOOTSTRAP_DEFERRED, BOOTSTRAP_GATE, BOOTSTRAP_WALK, BOOTSTRAP_WINDOW,
+    };
+    let ld = |a: &AtomicU64| a.load(Ordering::Relaxed);
+    if let Some(p) = v.bootstrap {
+        BOOTSTRAP_WALK.set_work(ld(&p.pump.parts_done), ld(&p.pump.parts_total));
+        BOOTSTRAP_WALK.set_rows(ld(&p.page_walk.tuples_emitted));
+    }
+    if let Some(s) = v.emitter {
+        BOOTSTRAP_WINDOW.set_rows(ld(&s.bootstrap_replay_covered_rows));
+        BOOTSTRAP_DEFERRED.set_work(
+            ld(&s.bootstrap_deferred_replayed_bytes),
+            ld(&s.bootstrap_deferred_replay_bytes),
+        );
+        BOOTSTRAP_GATE.set_work(ld(&s.gate_spools_replayed), ld(&s.gate_spools));
+        BOOTSTRAP_GATE.set_rows(ld(&s.gate_deferred));
+    }
+}
+
 pub(crate) fn stage_gauges_on(v: &StageCounters<'_>, base: MetricsSnapshot) -> MetricsSnapshot {
+    mirror_stage_work(v);
     let (proc_cpu, proc_rss, proc_threads) = read_process_stats();
     let by_table = |pick: fn(&EmitterStats) -> &TableRowCounts| {
         v.emitter.map_or_else(Vec::new, |s| {
@@ -590,9 +611,15 @@ pub(crate) fn stage_gauges_on(v: &StageCounters<'_>, base: MetricsSnapshot) -> M
         toast_values_filled_oversize_total: emitter(|s| &s.toast_values_filled_oversize),
         toast_fetch_miss_total: emitter(|s| &s.toast_fetch_miss),
         bootstrap_replay_covered_rows_total: emitter(|s| &s.bootstrap_replay_covered_rows),
-        bootstrap_gate_emitted_total: emitter(|s| &s.gate_emitted),
-        bootstrap_gate_gated_total: emitter(|s| &s.gate_gated),
-        bootstrap_gate_deferred_total: emitter(|s| &s.gate_deferred),
+        bootstrap_gate_tuples_by_verdict: emitter_counts(
+            v.emitter,
+            [
+                |s| &s.gate_emitted,
+                |s| &s.gate_gated,
+                |s| &s.gate_deferred,
+                |s| &s.gate_pending,
+            ],
+        ),
         bootstrap_gate_chunks_gated_total: emitter(|s| &s.gate_chunks_gated),
         bootstrap_gate_multixact_emitted_total: emitter(|s| &s.gate_multixact_emitted),
         toast_mirror_truncates_total: emitter(|s| &s.toast_mirror_truncates),

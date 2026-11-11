@@ -718,7 +718,15 @@ async fn gate_task(
     };
     let segments = accums.segment_count();
     let view = accums.view(&patch);
-    resolve_phase(deferred, &view, &tx, Some(&mut pending), &mut stats).await?;
+    resolve_phase(
+        deferred,
+        &view,
+        &tx,
+        Some(&mut pending),
+        &mut stats,
+        &counters,
+    )
+    .await?;
     Ok((stats, segments, pending))
 }
 
