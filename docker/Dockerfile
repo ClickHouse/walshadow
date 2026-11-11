@@ -59,10 +59,19 @@ RUN make -C pgext clean \
 
 
 FROM postgres:${PG_MAJOR}-alpine AS runtime
+ARG PG_MAJOR
 # ca-certificates: TLS to clickhouse.
 # postgis: so the daemon-owned shadow PG can render the schema's geography
-# column via typoutput.
-RUN apk add --no-cache ca-certificates postgis
+# column via typoutput. Alpine's package installs under its own
+# /usr/lib/postgresql<major>, not this image's $libdir, and only for Alpine's
+# default major, so link it in where the majors match.
+RUN apk add --no-cache ca-certificates postgis \
+    && src=/usr/lib/postgresql${PG_MAJOR} \
+    && if [ -e "$src/postgis-3.so" ]; then \
+           ln -s "$src"/postgis*-3.so "$(pg_config --pkglibdir)/"; \
+       else \
+           echo "postgis: Alpine has no build for PG ${PG_MAJOR}" >&2; \
+       fi
 
 COPY --from=rust-builder /usr/local/bin/walshadow-stream /usr/local/bin/walshadow-stream
 COPY --from=ext-builder /src/pgext/walshadow.so \
