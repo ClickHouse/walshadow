@@ -161,6 +161,34 @@ fn restore_command_filename_is_segment_relative() {
     assert!(tmp.path().join("data/standby.signal").exists());
 }
 
+/// Custom files can change defaults but cannot override required settings
+#[test]
+fn conf_dir_overrides_defaults_only() {
+    if !pg_available() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let conf_dir = tmp.path().join("conf.d");
+    std::fs::create_dir_all(&conf_dir).unwrap();
+    std::fs::write(
+        conf_dir.join("tune.conf"),
+        "shared_buffers = '64MB'\nfsync = off\n",
+    )
+    .unwrap();
+    let mut cfg = make_shadow(&tmp, ports::PG_SHADOW_PORT).config().clone();
+    cfg.conf_dir = Some(conf_dir);
+    let shadow = Shadow::new(cfg);
+    shadow.initdb().expect("initdb");
+    shadow
+        .materialize_conf(&SourceGucFloor::default(), None)
+        .expect("conf");
+    shadow.start().expect("start");
+    let started = scopeguard_stop(&shadow);
+    assert_eq!(shadow.psql_one("SHOW shared_buffers").unwrap(), "64MB");
+    assert_eq!(shadow.psql_one("SHOW fsync").unwrap(), "on");
+    drop(started);
+}
+
 /// PG pauses hot standby when a replayed `XLOG_PARAMETER_CHANGE` names a value
 /// above the running one, and shuts down once that pause is lifted. Producing
 /// the record needs a cluster that raises the value and a copy of that cluster
