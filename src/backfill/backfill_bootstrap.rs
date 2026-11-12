@@ -325,6 +325,12 @@ pub async fn seed_catalog_from_source(client: &Client) -> Result<CatalogMap> {
         )
         .await
         .context("bootstrap: enumerate user relations on source")?;
+    let types = crate::pg::type_rows(
+        &client
+            .query(crate::pg::TYPE_SQL, &[])
+            .await
+            .context("bootstrap: read pg_type on source")?,
+    );
 
     let mut by_oid: foldhash::HashMap<Oid, (Arc<RelDescriptor>, Option<Oid>)> =
         foldhash::HashMap::default();
@@ -349,7 +355,7 @@ pub async fn seed_catalog_from_source(client: &Client) -> Result<CatalogMap> {
             rel_node,
         };
         let replident = fetch_replident(client, replident_char, oid).await?;
-        let attributes = fetch_attributes(client, oid).await?;
+        let attributes = fetch_attributes(client, oid, &types).await?;
         let desc = RelDescriptor {
             rfn,
             oid,
@@ -432,12 +438,16 @@ async fn fetch_replident(client: &Client, c: char, rel_oid: Oid) -> Result<ReplI
         .map_err(|e| anyhow::anyhow!("bootstrap: {e} for relation {rel_oid}"))
 }
 
-async fn fetch_attributes(client: &Client, rel_oid: Oid) -> Result<Vec<RelAttr>> {
+async fn fetch_attributes(
+    client: &Client,
+    rel_oid: Oid,
+    types: &ahash::HashMap<Oid, crate::ops::bridge::TypeRow>,
+) -> Result<Vec<RelAttr>> {
     let rows = client.query(crate::pg::ATTR_SQL, &[&rel_oid]).await?;
     rows.iter()
         .map(|row| {
             crate::pg::RawAttr::from_row(row)
-                .build()
+                .build(types)
                 .map_err(|e| anyhow::anyhow!("bootstrap: {e}"))
         })
         .collect()

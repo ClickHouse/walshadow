@@ -507,19 +507,14 @@ impl ShadowCatalog {
                 },
             )
             .await?;
-        // DROP COLUMN zeroes atttypid, and no pg_type row for it is what leaves
-        // the slot's type_name empty
         let types = self
-            .resolve_names(
+            .resolve_types(
                 bridge,
-                "SELECT oid::oid, typname::text FROM pg_type \
-                 WHERE oid = ANY($1::oid[])",
                 &attrs
                     .iter()
                     .map(|a| a.atttypid)
                     .filter(|oid| *oid != 0)
                     .collect(),
-                |r: TypeRow| (r.oid, r.typname),
                 top_xid,
                 NamePin {
                     lsn: pinned,
@@ -600,6 +595,34 @@ impl ShadowCatalog {
             }
         }
         Ok(names)
+    }
+
+    /// Type rows for `wanted` and their domain bases, read in
+    /// [`Self::resolve_names`] order
+    async fn resolve_types(
+        &mut self,
+        bridge: &Bridge,
+        wanted: &BTreeSet<Oid>,
+        top_xid: u32,
+        pin: NamePin,
+    ) -> Result<HashMap<Oid, TypeRow>> {
+        if wanted.is_empty() {
+            return Ok(HashMap::new());
+        }
+        if !pin.by_caller {
+            let list: Vec<Oid> = wanted.iter().copied().collect();
+            let rows = self.query_retry(&TYPE_CLOSURE_SQL, &[&list]).await?;
+            let types = crate::pg::type_rows(&rows);
+            if wanted.iter().all(|oid| types.contains_key(oid)) {
+                return Ok(types);
+            }
+        }
+        let scan = bridge.scan_at(Catalog::Type, top_xid, &[], pin.lsn).await?;
+        Ok(scan
+            .parse::<TypeRow>()?
+            .into_iter()
+            .map(|row| (row.oid, row))
+            .collect())
     }
 
     pub async fn current_database_oid(&mut self) -> Result<Oid> {
@@ -724,7 +747,7 @@ fn mirror_sql(scope_pred: &str) -> String {
          ), att AS MATERIALIZED (\
              SELECT a.* FROM pg_attribute a JOIN scoped s ON s.oid = a.attrelid \
              WHERE a.attnum >= 1\
-         ) \
+         ), {types} \
          SELECT {position}, ARRAY[coalesce(pg_last_wal_replay_lsn()::text, '{no_replay}')] \
          UNION ALL SELECT {class}, ARRAY[\
              format('%s', c.oid), format('%s', c.relnamespace), format('%s', c.relname), \
@@ -750,8 +773,9 @@ fn mirror_sql(scope_pred: &str) -> String {
            FROM pg_inherits i JOIN scoped s ON s.oid = i.inhrelid AND s.relispartition \
          UNION ALL SELECT {namespace}, ARRAY[format('%s', n.oid), format('%s', n.nspname)] \
            FROM pg_namespace n WHERE n.oid IN (SELECT relnamespace FROM scoped) \
-         UNION ALL SELECT {typ}, ARRAY[format('%s', t.oid), format('%s', t.typname)] \
-           FROM pg_type t WHERE t.oid IN (SELECT atttypid FROM att)",
+         UNION ALL SELECT {typ}, ARRAY[format('%s', t.oid), format('%s', t.typname), \
+             format('%s', t.typbasetype), format('%s', t.typtypmod), \
+             format('%s', t.typelem), format('%s', t.typarray)] FROM types t",
         position = MIRROR_POSITION,
         no_replay = NO_REPLAY,
         class = Catalog::Class as u8,
@@ -760,8 +784,31 @@ fn mirror_sql(scope_pred: &str) -> String {
         inherits = Catalog::Inherits as u8,
         namespace = Catalog::Namespace as u8,
         typ = Catalog::Type as u8,
+        types = type_closure("SELECT atttypid FROM att"),
     )
 }
+
+/// `types` CTE over `seed` oids plus their domain bases, array elements and
+/// array types, enough for [`crate::pg::RawAttr::build`]
+fn type_closure(seed: &str) -> String {
+    format!(
+        "types AS (\
+             SELECT oid, typname, typbasetype, typtypmod, typelem, typarray \
+             FROM pg_type WHERE oid IN ({seed}) \
+             UNION \
+             SELECT t.oid, t.typname, t.typbasetype, t.typtypmod, t.typelem, t.typarray \
+             FROM types d JOIN pg_type t ON t.oid IN (d.typbasetype, d.typelem, d.typarray)\
+         )"
+    )
+}
+
+static TYPE_CLOSURE_SQL: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "WITH RECURSIVE {} \
+         SELECT oid, typname::text, typbasetype, typtypmod, typelem, typarray FROM types",
+        type_closure("SELECT unnest($1::oid[])")
+    )
+});
 
 static MIRROR_BATCH_SQL: LazyLock<String> = LazyLock::new(|| mirror_sql("c.oid = ANY($1::oid[])"));
 
@@ -901,7 +948,7 @@ struct DescriptorRows {
     indexes: Vec<IndexRow>,
     inherits: Vec<InheritsRow>,
     namespaces: HashMap<Oid, String>,
-    types: HashMap<Oid, String>,
+    types: HashMap<Oid, TypeRow>,
     /// Requested relations. Other `class` rows supply ancestor information.
     /// Use `None` to keep every row
     requested: Option<BTreeSet<Oid>>,
@@ -940,7 +987,7 @@ impl DescriptorRows {
                 }
                 Catalog::Type => {
                     let row = TypeRow::parse(&cols)?;
-                    out.types.insert(row.oid, row.typname);
+                    out.types.insert(row.oid, row);
                 }
             }
         }
@@ -1037,7 +1084,7 @@ fn descriptor_from_rows(
     attrs: &[AttributeRow],
     indexes: &[IndexRow],
     namespaces: &HashMap<Oid, String>,
-    types: &HashMap<Oid, String>,
+    types: &HashMap<Oid, TypeRow>,
     db_node: Oid,
     default_tablespace: Oid,
 ) -> Result<RelDescriptor> {
@@ -1080,14 +1127,13 @@ fn descriptor_from_rows(
             typmod: attr.atttypmod,
             not_null: attr.attnotnull,
             dropped: attr.attisdropped,
-            type_name: types.get(&attr.atttypid).cloned(),
             type_byval: attr.attbyval,
             type_len: attr.attlen,
             type_align: attr.attalign.to_string(),
             type_storage: attr.attstorage.to_string(),
             missing: None,
         };
-        let mut rel_attr = raw.build().map_err(CatalogError::Parse)?;
+        let mut rel_attr = raw.build(types).map_err(CatalogError::Parse)?;
         if let Some(hex) = attr.attmissingval.as_deref()
             && let Some(bytes) = decode_hex(hex)
         {
@@ -1203,6 +1249,25 @@ mod tests {
         pairs.iter().map(|(o, n)| (*o, (*n).to_owned())).collect()
     }
 
+    fn types(pairs: &[(Oid, &str)]) -> HashMap<Oid, TypeRow> {
+        pairs
+            .iter()
+            .map(|(oid, name)| {
+                (
+                    *oid,
+                    TypeRow {
+                        oid: *oid,
+                        typname: (*name).into(),
+                        typbasetype: 0,
+                        typtypmod: -1,
+                        typelem: 0,
+                        typarray: 0,
+                    },
+                )
+            })
+            .collect()
+    }
+
     fn overlay(
         class: &ClassRow,
         attrs: &[AttributeRow],
@@ -1214,7 +1279,7 @@ mod tests {
             attrs,
             indexes,
             namespaces,
-            &names(&[(23, "int4"), (25, "text")]),
+            &types(&[(23, "int4"), (25, "text")]),
             5,
             DEFAULT_TABLESPACE,
         )
@@ -1346,7 +1411,7 @@ mod tests {
                 },
             ],
             namespaces: names(&[(2200, "public")]),
-            types: names(&[(23, "int4")]),
+            types: types(&[(23, "int4")]),
             requested: Some([16500, 16510].into_iter().collect()),
             ..DescriptorRows::default()
         };
