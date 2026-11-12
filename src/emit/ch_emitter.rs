@@ -2641,7 +2641,7 @@ fn oracle_cell(v: Option<&ColumnValue>, source_type_oid: u32) -> Result<OracleCe
         }
         // jsonb needs typinput to reconstruct binary storage from document text
         Some(ColumnValue::Json(s)) => OracleCell::TextInput(s.as_bytes().to_vec()),
-        // PostGIS WKT must bypass HEXEWKB typoutput
+        // Decoded text is already its own rendering
         Some(ColumnValue::Text(s)) | Some(ColumnValue::Name(s)) => {
             OracleCell::Literal(s.as_bytes().to_vec())
         }

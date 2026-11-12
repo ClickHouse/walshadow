@@ -10,6 +10,7 @@
 #include "libpq/pqformat.h"
 #include "utils/builtins.h"
 #include "utils/catcache.h"
+#include "utils/geo_decls.h"
 #include "utils/json.h"
 #include "utils/lsyscache.h"
 #include "utils/syscache.h"
@@ -23,6 +24,16 @@
 
 /* hstore_to_matrix returns Nx2 text arrays accepted as Map entries */
 #define WS_HSTORE_EXPANDER "hstore_to_matrix"
+/* PostGIS renders WKT for String targets, ISO WKB for ClickHouse geo types */
+#define WS_WKT_EXPANDER "st_astext"
+#define WS_WKB_EXPANDER "st_asbinary"
+
+/* ISO WKB type codes, 2-D only */
+#define WS_WKB_POINT 1
+#define WS_WKB_LINESTRING 2
+#define WS_WKB_POLYGON 3
+#define WS_WKB_MULTILINESTRING 5
+#define WS_WKB_MULTIPOLYGON 6
 
 /* Minimum per column: source OID, typmod, two length prefixes */
 #define WS_COL_META_BYTES 16
@@ -41,6 +52,9 @@ typedef struct WsNativeCol {
     bool infn_ready;
 
     FmgrInfo expander;
+    Oid expander_type;
+    /* ISO WKB type a geo target takes, zero for other targets */
+    uint32 wkb_type;
 
     Oid native_oid;
 } WsNativeCol;
@@ -168,7 +182,7 @@ ws_input_datum(WsNativeCol* col, const char* body, uint32 len) {
 
 /* Require one expander owned by source type's extension */
 static bool
-ws_find_hstore_expander(Oid source_oid, Oid* out) {
+ws_find_expander(Oid source_oid, const char* name, Oid* out) {
     Oid ext = getExtensionOfObject(TypeRelationId, source_oid);
     CatCList* list;
     Oid found  = InvalidOid;
@@ -177,7 +191,7 @@ ws_find_hstore_expander(Oid source_oid, Oid* out) {
     if (!OidIsValid(ext)) {
         return false;
     }
-    list = SearchSysCacheList1(PROCNAMEARGSNSP, CStringGetDatum(WS_HSTORE_EXPANDER));
+    list = SearchSysCacheList1(PROCNAMEARGSNSP, CStringGetDatum(name));
     for (int i = 0; i < list->n_members; i++) {
         HeapTuple tup     = &list->members[i]->tuple;
         Form_pg_proc form = (Form_pg_proc)GETSTRUCT(tup);
@@ -203,15 +217,45 @@ static void
 ws_resolve_expander(WsNativeCol* col) {
     const chc_type* root = col->type;
     chc_kind kind;
+    const char* name = WS_WKB_EXPANDER;
+    Oid result       = BYTEAOID;
     Oid funcid;
 
     while ((kind = chc_type_kind(root)) == CHC_NULLABLE ||
            kind == CHC_LOW_CARDINALITY) {
         root = chc_type_child(root, 0);
     }
-
-    if (kind == CHC_MAP && ws_find_hstore_expander(col->source_oid, &funcid)) {
+    switch (kind) {
+    case CHC_MAP:
+        name   = WS_HSTORE_EXPANDER;
+        result = TEXTARRAYOID;
+        break;
+    case CHC_STRING:
+        name   = WS_WKT_EXPANDER;
+        result = TEXTOID;
+        break;
+    case CHC_POINT:
+        col->wkb_type = WS_WKB_POINT;
+        break;
+    case CHC_RING:
+    case CHC_LINE_STRING:
+        col->wkb_type = WS_WKB_LINESTRING;
+        break;
+    case CHC_POLYGON:
+        col->wkb_type = WS_WKB_POLYGON;
+        break;
+    case CHC_MULTI_LINE_STRING:
+        col->wkb_type = WS_WKB_MULTILINESTRING;
+        break;
+    case CHC_MULTI_POLYGON:
+        col->wkb_type = WS_WKB_MULTIPOLYGON;
+        break;
+    default:
+        return;
+    }
+    if (ws_find_expander(col->source_oid, name, &funcid)) {
         fmgr_info_cxt(funcid, &col->expander, CurrentMemoryContext);
+        col->expander_type = result;
     }
 }
 
@@ -220,8 +264,126 @@ ws_expand(WsNativeCol* col, Datum val, Oid* valtype) {
     if (!OidIsValid(col->expander.fn_oid)) {
         return val;
     }
-    *valtype = TEXTARRAYOID;
+    *valtype = col->expander_type;
     return FunctionCall1(&col->expander, val);
+}
+
+/* PostGIS writes the WKB, so its bounds and byte order hold */
+typedef struct WsWkb {
+    const uint8* p;
+    const uint8* end;
+    bool little;
+} WsWkb;
+
+static uint64
+ws_wkb_word(WsWkb* r, int n) {
+    uint64 v = 0;
+
+    Assert(r->end - r->p >= n);
+    for (int i = 0; i < n; i++) {
+        v |= (uint64)r->p[r->little ? i : n - 1 - i] << (8 * i);
+    }
+    r->p += n;
+    return v;
+}
+
+/* Byte order then type, which must be `want` */
+static void
+ws_wkb_header(WsWkb* r, uint32 want) {
+    uint32 type;
+
+    Assert(r->p < r->end && *r->p <= 1);
+    r->little = *r->p++ == 1;
+    type      = (uint32)ws_wkb_word(r, 4);
+    if (type != want) {
+        ereport(
+            ERROR,
+            (errcode(ERRCODE_DATATYPE_MISMATCH),
+             errmsg("WKB geometry type %u, target column takes type %u", type, want),
+             errhint("ClickHouse geo types hold one 2-D geometry type each"))
+        );
+    }
+}
+
+static void
+ws_wkb_point(pgch_writer* w, size_t col, WsWkb* r) {
+    Point pt;
+    uint64 x = ws_wkb_word(r, 8);
+    uint64 y = ws_wkb_word(r, 8);
+
+    memcpy(&pt.x, &x, sizeof pt.x);
+    memcpy(&pt.y, &y, sizeof pt.y);
+    pgch_append_datum(w, col, PointPGetDatum(&pt), POINTOID, false);
+}
+
+static void
+ws_wkb_points(pgch_writer* w, size_t col, WsWkb* r) {
+    uint32 n = (uint32)ws_wkb_word(r, 4);
+
+    pgch_array_begin(w, col);
+    for (uint32 i = 0; i < n; i++) {
+        ws_wkb_point(w, 0, r);
+    }
+    pgch_array_end(w);
+}
+
+static void
+ws_wkb_rings(pgch_writer* w, size_t col, WsWkb* r) {
+    uint32 n = (uint32)ws_wkb_word(r, 4);
+
+    pgch_array_begin(w, col);
+    for (uint32 i = 0; i < n; i++) {
+        ws_wkb_points(w, 0, r);
+    }
+    pgch_array_end(w);
+}
+
+/* Multi-geometry of `part` geometries, each with its own header */
+static void
+ws_wkb_parts(pgch_writer* w, size_t col, WsWkb* r, uint32 part) {
+    uint32 n = (uint32)ws_wkb_word(r, 4);
+
+    pgch_array_begin(w, col);
+    for (uint32 i = 0; i < n; i++) {
+        ws_wkb_header(r, part);
+        if (part == WS_WKB_LINESTRING) {
+            ws_wkb_points(w, 0, r);
+        } else {
+            ws_wkb_rings(w, 0, r);
+        }
+    }
+    pgch_array_end(w);
+}
+
+/* ISO WKB into a geo column of WKB `type` */
+static void
+ws_append_wkb(pgch_writer* w, size_t col, uint32 type, const bytea* wkb) {
+    WsWkb r = {
+        .p   = (const uint8*)VARDATA_ANY(wkb),
+        .end = (const uint8*)VARDATA_ANY(wkb) + VARSIZE_ANY_EXHDR(wkb),
+    };
+
+    ws_wkb_header(&r, type);
+    switch (type) {
+    case WS_WKB_POINT:
+        ws_wkb_point(w, col, &r);
+        break;
+    case WS_WKB_LINESTRING:
+        ws_wkb_points(w, col, &r);
+        break;
+    case WS_WKB_POLYGON:
+        ws_wkb_rings(w, col, &r);
+        break;
+    default:
+        ws_wkb_parts(
+            w,
+            col,
+            &r,
+            type == WS_WKB_MULTILINESTRING ? WS_WKB_LINESTRING : WS_WKB_POLYGON
+        );
+        break;
+    }
+    Assert(r.p == r.end);
 }
 
 /* Default absent values to NULL or empty non-nullable shapes */
@@ -249,6 +411,21 @@ ws_append_default(pgch_writer* w, size_t col, const WsNativeCol* c) {
         pgch_append_datum(
             w, col, DirectFunctionCall1(json_in, CStringGetDatum("{}")), JSONOID, false
         );
+        return;
+    case CHC_POINT: {
+        Point origin = { 0 };
+
+        pgch_append_datum(w, col, PointPGetDatum(&origin), POINTOID, false);
+        return;
+    }
+    /* Only Point nests in Nullable, so other geo shapes default empty */
+    case CHC_RING:
+    case CHC_LINE_STRING:
+    case CHC_POLYGON:
+    case CHC_MULTI_LINE_STRING:
+    case CHC_MULTI_POLYGON:
+        pgch_array_begin(w, col);
+        pgch_array_end(w);
         return;
     default:
         ereport(
@@ -309,6 +486,10 @@ ws_append_cell(pgch_writer* w, size_t col, WsNativeCol* c, StringInfo req) {
     val = tag == WS_CELL_DISK_RAW ? ws_reconstruct_datum(c, body, len)
                                   : ws_input_datum(c, body, len);
     val = ws_expand(c, val, &valtype);
+    if (c->expander_type == BYTEAOID) {
+        ws_append_wkb(w, col, c->wkb_type, DatumGetByteaPP(val));
+        return;
+    }
     pgch_append_datum(w, col, val, valtype, false);
 }
 

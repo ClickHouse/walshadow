@@ -27,13 +27,14 @@
 //! | `json` / `jsonb` | `String` | document text |
 //! | `hstore` | `Map(String, Nullable(String))` | by type name |
 //! | `vector` / `halfvec` | `Array(Float32)` | pgvector, by type name |
-//! | `geography` / `geometry` | `String` | WKT `POINT(x y)`, rendered at decode |
+//! | `geography` / `geometry` | `Point`, `LineString`, `Polygon`, `MultiLineString`, `MultiPolygon` | 2-D typmod subtype; else `String` WKT |
 //! | `<elem>[]` | `Array(Nullable(<elem>))` | 1-D supported elems, else String |
 //! | unknown | `String` | oracle converts, never raw bytes |
 //!
 //! Nullability: `not_null = false` wraps inner in `Nullable(_)` unless
 //! column is in CH `ORDER BY` (PK columns must stay non-nullable; caller
-//! enforces).
+//! enforces). CH nests only scalars and `Point` in `Nullable`, so arrays,
+//! maps and other geo types store NULL as empty.
 //!
 //! ## Default expression
 //!
@@ -83,7 +84,18 @@ pub fn map(att: &RelAttr, pk_member: bool) -> Result<ResolvedColumn, BridgeError
     let inner = base_type_for(att)?;
     let nullable = !pk_member
         && !att.not_null
-        && !matches!(types::kind(&inner), Some(Kind::Array | Kind::Map));
+        && !matches!(
+            types::kind(&inner),
+            Some(
+                Kind::Array
+                    | Kind::Map
+                    | Kind::Ring
+                    | Kind::LineString
+                    | Kind::Polygon
+                    | Kind::MultiLineString
+                    | Kind::MultiPolygon
+            )
+        );
     let ch_type = if nullable {
         format!("Nullable({inner})")
     } else {
@@ -121,10 +133,12 @@ pub fn base_type_for(att: &RelAttr) -> Result<String, BridgeError> {
         JSONOID | JSONBOID => "String".into(),
         // Extension / array types carry dynamic OIDs, so match on the type
         // name: `hstore` → Map, `vector` (pgvector) → Array(Float32),
-        // `_<elem>` (PG array convention) → Array of a supported element, else
-        // the String fallback (geography stays String, rendered WKT at decode).
+        // PostGIS → its typmod's geo type, `_<elem>` (PG array convention) →
+        // Array of a supported element, else the String fallback.
         _ => {
-            if att.type_name == "hstore" {
+            if matches!(att.type_name.as_str(), "geometry" | "geography") {
+                postgis_ch_type(att.typmod).into()
+            } else if att.type_name == "hstore" {
                 "Map(String, Nullable(String))".into()
             } else if att.type_name == "vector" || att.type_name == "halfvec" {
                 "Array(Float32)".into()
@@ -135,6 +149,23 @@ pub fn base_type_for(att: &RelAttr) -> Result<String, BridgeError> {
             }
         }
     })
+}
+
+/// CH geo type of a PostGIS typmod: subtype in bits 2..8, Z and M in bits 1
+/// and 0. CH geo types are 2-D and have no MultiPoint or collection, so the
+/// rest render WKT
+fn postgis_ch_type(typmod: i32) -> &'static str {
+    if typmod < 0 || typmod & 0b11 != 0 {
+        return "String";
+    }
+    match (typmod >> 2) & 0x3f {
+        1 => "Point",
+        2 => "LineString",
+        3 => "Polygon",
+        5 => "MultiLineString",
+        6 => "MultiPolygon",
+        _ => "String",
+    }
 }
 
 /// PG array type name (`_int4`, `_text`, …) → `Array(Nullable(<elem>))` for
@@ -572,6 +603,34 @@ mod tests {
                 map(&attr(oid, -1, false, None), false).unwrap().ch_type,
                 "Nullable(String)"
             );
+        }
+    }
+
+    /// Typmods as PostGIS 3.7 stores them; only Point stays Nullable
+    #[test]
+    fn postgis_typmods_pick_geo_types() {
+        let cases = [
+            (-1, "Nullable(String)"),
+            (4, "Nullable(Point)"),
+            (1_107_460, "Nullable(Point)"),
+            (1_107_462, "Nullable(String)"),
+            (5, "Nullable(String)"),
+            (7, "Nullable(String)"),
+            (8, "LineString"),
+            (1_107_468, "Polygon"),
+            (16, "Nullable(String)"),
+            (20, "MultiLineString"),
+            (24, "MultiPolygon"),
+            (28, "Nullable(String)"),
+        ];
+        for name in ["geometry", "geography"] {
+            for (typmod, want) in cases {
+                let att = RelAttr {
+                    typmod,
+                    ..named_attr(99_997, name, false)
+                };
+                assert_eq!(map(&att, false).unwrap().ch_type, want, "{name} {typmod}");
+            }
         }
     }
 

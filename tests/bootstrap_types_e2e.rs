@@ -211,8 +211,8 @@ async fn direct_bootstrap_all_types_end_to_end() {
             ("round(c_vector[1], 2)", "0.1".into()),
         ];
         if has_postgis {
-            checks.push(("c_geog", "POINT(30.5 50.25)".into()));
-            checks.push(("c_geom", "POINT(1 2)".into()));
+            checks.push(("c_geog", "(30.5,50.25)".into()));
+            checks.push(("c_geom", "(1,2)".into()));
         }
 
         let mut fails = Vec::new();
