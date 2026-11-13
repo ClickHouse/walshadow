@@ -23,10 +23,7 @@ fn col(attnum: i16, name: &str, ty: &str) -> ColumnMapping {
 }
 
 fn skip_gate() -> bool {
-    if !fx::tools::requirements_available() {
-        return true;
-    }
-    false
+    !fx::tools::requirements_available()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

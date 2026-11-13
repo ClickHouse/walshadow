@@ -42,21 +42,13 @@ pub(crate) async fn fetch_wal_into_pg_wal(
     // walshadow serves it from `seed_shadow_branches` — so warn, don't fail.
     let history = walshadow::timeline::history_filename(timeline);
     if timeline > 1 {
-        let dst = pg_wal_dir.join(&history);
-        match walrus::pg::wal::fetch::handle(
-            settings,
-            storage.clone(),
-            &history,
-            &dst,
-            walrus::pg::wal::fetch::Prefetch::Off,
-        )
-        .await
-        {
-            Ok(()) => {}
-            Err(e) => tracing::warn!(
+        match walshadow::archive::fetch_history(settings, &storage, timeline).await? {
+            Some(raw) => tokio::fs::write(pg_wal_dir.join(&history), raw)
+                .await
+                .with_context(|| format!("write {history}"))?,
+            None => tracing::warn!(
                 target: "walshadow::bootstrap",
                 timeline,
-                error = %e,
                 "archive holds no {history}; the shadow will ask the walsender for it",
             ),
         }

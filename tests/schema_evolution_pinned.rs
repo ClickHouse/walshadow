@@ -33,10 +33,7 @@ use walshadow::mapping::TableTarget;
 use walshadow::schema::RelName;
 
 fn skip_if_missing() -> bool {
-    if !fx::tools::requirements_available() {
-        return true;
-    }
-    false
+    !fx::tools::requirements_available()
 }
 
 /// Synthetic-column tail every CH dest carries.

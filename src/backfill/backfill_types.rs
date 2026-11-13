@@ -56,6 +56,32 @@ pub struct WalkCounts {
     pub pg_xact_segments: usize,
 }
 
+#[derive(Debug)]
+pub enum PassError {
+    Preflight(anyhow::Error),
+    Load(anyhow::Error),
+}
+
+impl PassError {
+    pub fn inner(&self) -> &anyhow::Error {
+        match self {
+            Self::Preflight(e) | Self::Load(e) => e,
+        }
+    }
+}
+
+impl std::fmt::Display for PassError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if f.alternate() {
+            write!(f, "{:#}", self.inner())
+        } else {
+            write!(f, "{}", self.inner())
+        }
+    }
+}
+
+impl std::error::Error for PassError {}
+
 #[derive(Debug, Default, Clone)]
 pub struct PassOutcome {
     pub counts: WalkCounts,

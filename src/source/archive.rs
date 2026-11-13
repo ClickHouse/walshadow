@@ -181,6 +181,24 @@ fn extends(known: &TimelineHistory, next: &TimelineHistory) -> bool {
     })
 }
 
+pub async fn fetch_history(
+    settings: &Settings,
+    storage: &DynStorage,
+    timeline: u32,
+) -> Result<Option<Vec<u8>>> {
+    let name = history_filename(timeline);
+    match walrus::pg::wal::fetch::read_segment(settings, storage, &name).await {
+        Ok(raw) => Ok(Some(raw)),
+        Err(e)
+            if e.downcast_ref::<walrus::pg::wal::fetch::ArchiveNotFound>()
+                .is_some() =>
+        {
+            Ok(None)
+        }
+        Err(e) => Err(e.context(format!("fetch {name}"))),
+    }
+}
+
 /// Check that archive and source have matching timeline histories, since replay
 /// uses source history to choose archived segment names. PG writes no history
 /// file for timeline 1, so a never-promoted source has nothing to compare
@@ -193,9 +211,14 @@ pub async fn verify_history(
         return Ok(());
     }
     let name = history_filename(source.target());
-    let raw = walrus::pg::wal::fetch::read_segment(settings, storage, &name)
-        .await
-        .with_context(|| format!("fetch {name}"))?;
+    let Some(raw) = fetch_history(settings, storage, source.target()).await? else {
+        tracing::warn!(
+            target: "walshadow::archive",
+            timeline = source.target(),
+            "archive holds no {name}; skipping the timeline history cross-check",
+        );
+        return Ok(());
+    };
     let archived =
         TimelineHistory::parse(source.target(), &raw).with_context(|| format!("parse {name}"))?;
     anyhow::ensure!(
@@ -273,15 +296,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reject_an_archive_missing_the_sources_own_history() {
+    async fn tolerate_an_archive_missing_the_sources_own_history() {
         let tmp = tempfile::tempdir().unwrap();
         let (settings, storage) = fs_archive(&tmp.path().join("archive"));
         archive_history_file(&settings, &storage, 2, "1\t0/3000000\tpromotion\n").await;
         let source = TimelineHistory::parse(3, b"1\t0/3000000\tpromotion\n").unwrap();
+        verify_history(&settings, &storage, &source).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reject_an_archived_history_that_disagrees_with_the_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (settings, storage) = fs_archive(&tmp.path().join("archive"));
+        archive_history_file(&settings, &storage, 3, "1\t0/4000000\tpromotion\n").await;
+        let source = TimelineHistory::parse(3, b"1\t0/3000000\tpromotion\n").unwrap();
         let err = verify_history(&settings, &storage, &source)
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("00000003.history"), "{err:#}");
+        assert!(err.to_string().contains("disagrees"), "{err:#}");
     }
 
     #[tokio::test]

@@ -308,7 +308,7 @@ pub(crate) async fn run_bootstrap(
 
     // Decline unmapped relations at `begin` so their pages never decode.
     // Metrics-only (no CH) has no mapping to filter against, so it walks all
-    let (tap_filenodes, needs_oracle, routes) = match &ch_target {
+    let (tap_filenodes, needs_oracle, routes, loaded_rels) = match &ch_target {
         Some((_, mapping, resolved, skip_initial)) => {
             let routed = mapping.snapshot();
             let is_routed = |d: &RelDescriptor| {
@@ -317,6 +317,11 @@ pub(crate) async fn run_bootstrap(
                     .is_some_and(|o| routed.contains_key(&o.rel_name))
             };
             let walked = |d: &RelDescriptor| is_routed(d) && !skip_initial.contains(&d.rel_name);
+            let loaded: Vec<_> = drain_catalog
+                .descriptors()
+                .filter(|d| walked(d))
+                .map(|d| d.rel_name.clone())
+                .collect();
             (
                 walshadow::backfill_bootstrap::tap_filenode_set(&drain_catalog, is_routed, walked)
                     .map(Arc::new),
@@ -326,9 +331,10 @@ pub(crate) async fn run_bootstrap(
                     &resolved.column_rules,
                 ),
                 routed,
+                loaded,
             )
         }
-        None => (None, false, Default::default()),
+        None => (None, false, Default::default(), Vec::new()),
     };
 
     let shadow_toast_rels: foldhash::HashSet<(u32, u32)> = if shadow_toast {
@@ -1135,6 +1141,27 @@ pub(crate) async fn run_bootstrap(
             .await
             .with_context(|| format!("bootstrap: chmod 0700 {}", shadow_data_dir.display()))?;
     }
+
+    let ledger_mode = if plan.mode == BootstrapMode::ObjectStore {
+        InitialLoadMode::ObjectStore
+    } else {
+        InitialLoadMode::BaseBackup
+    };
+    let recorded_loads = walshadow::copy_backfill::record_bootstrap_loads(
+        &args.spill_dir,
+        source_ident.system_id,
+        ledger_mode,
+        outcome.end.end_lsn,
+        loaded_rels,
+    )
+    .await
+    .context("bootstrap: record loaded tables in the backfill ledger")?;
+    tracing::info!(
+        target: "walshadow::bootstrap",
+        tables = recorded_loads,
+        end_lsn = format_pg_lsn(outcome.end.end_lsn).to_string(),
+        "bootstrap loads recorded in the backfill ledger",
+    );
 
     BootstrapMarker::complete(&shadow_data_dir, recorded).await?;
 

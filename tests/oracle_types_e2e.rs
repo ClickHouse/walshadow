@@ -17,10 +17,7 @@ use walshadow::oracle::Oracle;
 use walshadow::schema::RelName;
 
 fn skip_gate() -> bool {
-    if !fx::tools::requirements_available() {
-        return true;
-    }
-    false
+    !fx::tools::requirements_available()
 }
 
 fn col(attnum: i16, name: &str, ty: &str) -> ColumnMapping {

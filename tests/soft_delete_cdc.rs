@@ -128,10 +128,7 @@ fn winning_flag(ch: &fx::ChServer, id: i32) -> String {
 }
 
 fn skip_gate() -> bool {
-    if !fx::tools::requirements_available() {
-        return true;
-    }
-    false
+    !fx::tools::requirements_available()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
