@@ -32,13 +32,6 @@ use walshadow::mapping::ColumnMapping;
 use walshadow::mapping::TableTarget;
 use walshadow::schema::RelName;
 
-fn skip_if_missing() -> bool {
-    if !fx::tools::requirements_available() {
-        return true;
-    }
-    false
-}
-
 /// Synthetic-column tail every CH dest carries.
 const SYNTHETIC_TAIL: &str = "_lsn UInt64,\
      _xid UInt32,\
@@ -70,7 +63,7 @@ fn base_columns() -> Vec<ColumnMapping> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pinned_alter_add_column_replicates_without_priming_dml() {
-    if skip_if_missing() {
+    if !fx::tools::requirements_available() {
         return;
     }
 
@@ -189,7 +182,7 @@ async fn pinned_alter_add_column_replicates_without_priming_dml() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pinned_subset_alter_adds_only_new_column() {
-    if skip_if_missing() {
+    if !fx::tools::requirements_available() {
         return;
     }
 

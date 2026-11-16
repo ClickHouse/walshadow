@@ -105,6 +105,17 @@ pub(crate) fn shadow_data_dir_initialized(dir: &std::path::Path) -> bool {
     dir.join("PG_VERSION").exists()
 }
 
+/// Preserve existing cluster data when no bootstrap attempt owns it
+fn refuse_unowned_cluster(previous: Option<&BootstrapMarker>, dir: &Path) -> Result<()> {
+    anyhow::ensure!(
+        previous.is_some() || !shadow_data_dir_initialized(dir),
+        "bootstrap: {} already holds a cluster (PG_VERSION present) but no bootstrap attempt \
+         marker; provide an empty data dir to bootstrap",
+        dir.display(),
+    );
+    Ok(())
+}
+
 /// Run BASE_BACKUP into new shadow data dir and return backup `end_lsn`
 /// Caller starts WAL pump from returned LSN, then starts and supervises
 /// shadow in [`crate::run`]
@@ -136,14 +147,7 @@ pub(crate) async fn run_bootstrap(
     let bridge_workers = bridge_pool_size(ch_config.as_ref());
     let shadow_data_dir = args.bootstrap_shadow_data_dir.clone();
 
-    // Preserve existing cluster data when no bootstrap attempt owns it
-    if previous.is_none() && shadow_data_dir_initialized(&shadow_data_dir) {
-        anyhow::bail!(
-            "bootstrap: {} already holds a cluster (PG_VERSION present) but no bootstrap attempt \
-             marker; provide an empty data dir to bootstrap",
-            shadow_data_dir.display(),
-        );
-    }
+    refuse_unowned_cluster(previous.as_ref(), &shadow_data_dir)?;
 
     // Seed catalog map inside a REPEATABLE READ snapshot. DDL between the
     // seed COMMIT and BASE_BACKUP's checkpoint window is operator-quiesced
@@ -287,7 +291,7 @@ pub(crate) async fn run_bootstrap(
                         .table_opt_ins
                         .get(rn)
                         .and_then(|r| r.initial_load.as_deref())
-                        .or_else(|| emitter_cfg.table_initial_loads.get(rn).map(String::as_str));
+                        .or_else(|| emitter_cfg.table_initial_loads.get(rn).map(|m| m.as_str()));
                     let none = match table_mode {
                         Some(s) => s.parse::<InitialLoadMode>() == Ok(InitialLoadMode::None),
                         None => {
@@ -826,11 +830,10 @@ pub(crate) async fn run_bootstrap(
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
+                let dir = shadow_data_dir.display();
                 tokio::fs::set_permissions(&shadow_data_dir, fs::Permissions::from_mode(0o700))
                     .await
-                    .with_context(|| {
-                        format!("bootstrap: chmod 0700 {}", shadow_data_dir.display())
-                    })?;
+                    .context(format!("bootstrap: chmod 0700 {dir}"))?;
             }
             // Guard before start, so a failed bootstrap stops what it started
             let started = running_shadow.insert(OwnedShadow::new(
@@ -990,14 +993,11 @@ pub(crate) async fn run_bootstrap(
 
     // Replace live-leg COPY connection and recheck source identity
     if live_leg_ran || window_leg_error.is_some() {
+        let (host, port) = (&src_cfg.host, src_cfg.port);
+        let reconnect = format!("bootstrap: reconnect source {host}:{port} after the window leg");
         *feed = SourceFeed::connect(src_cfg)
             .await
-            .with_context(|| {
-                format!(
-                    "bootstrap: reconnect source {}:{} after the window leg",
-                    src_cfg.host, src_cfg.port
-                )
-            })?
+            .context(reconnect)?
             .with_status_interval(Duration::from_secs(args.status_interval));
         let now = feed
             .identify_system()
@@ -1131,9 +1131,10 @@ pub(crate) async fn run_bootstrap(
     {
         use std::os::unix::fs::PermissionsExt;
         let perms = fs::Permissions::from_mode(0o700);
+        let dir = shadow_data_dir.display();
         tokio::fs::set_permissions(&shadow_data_dir, perms)
             .await
-            .with_context(|| format!("bootstrap: chmod 0700 {}", shadow_data_dir.display()))?;
+            .context(format!("bootstrap: chmod 0700 {dir}"))?;
     }
 
     BootstrapMarker::complete(&shadow_data_dir, recorded).await?;
@@ -1244,7 +1245,7 @@ pub(crate) async fn bootstrap_build_mapping(
         applicator
             .add(desc)
             .await
-            .with_context(|| format!("bootstrap: ensure CH table {}", desc.rel_name))?;
+            .context(format!("bootstrap: ensure CH table {}", desc.rel_name))?;
     }
     Ok((mapping, resolved))
 }
@@ -1365,6 +1366,33 @@ mod tests {
 
     fn shadow_start(args: &Args) -> Result<ShadowStart> {
         resolve_shadow_start(args, resolve_bootstrap(args, None)?.mode)
+    }
+
+    #[test]
+    fn bootstrap_refuses_cluster_no_attempt_owns() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(refuse_unowned_cluster(None, tmp.path()).is_ok());
+        std::fs::write(tmp.path().join("PG_VERSION"), "17").unwrap();
+        let err = refuse_unowned_cluster(None, tmp.path()).unwrap_err();
+        assert!(err.to_string().contains("already holds a cluster"), "{err}");
+    }
+
+    #[test]
+    fn shadow_data_dir_refuses_overlap_with_daemon_dirs() {
+        let err = shadow_start(&args_from(&[
+            "--bootstrap-shadow-data-dir",
+            "/tmp/out/shadow",
+        ]))
+        .err()
+        .unwrap();
+        assert!(
+            err.to_string().contains("overlaps --out-dir /tmp/out"),
+            "{err}"
+        );
+        assert!(
+            paths_overlap(Path::new(""), Path::new("/tmp")),
+            "unresolvable path overlaps"
+        );
     }
 
     #[test]

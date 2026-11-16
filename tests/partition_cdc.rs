@@ -136,10 +136,6 @@ async fn start_in(
     })
 }
 
-fn skip_gate() -> bool {
-    !fx::tools::requirements_available()
-}
-
 fn rule(cfg: &mut EmitterConfig, ns: &str, rel: &str, rule: TableRule) {
     cfg.table_entries
         .push((RelName::new(ns, rel), MatchKind::Exact, rule));
@@ -187,7 +183,7 @@ const LIVE_IDS: &str = "SELECT groupArray(id) FROM \
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn partition_rows_land_in_root_destination() {
-    if skip_gate() {
+    if !fx::tools::requirements_available() {
         return;
     }
     let ns = "pt_route";
@@ -246,7 +242,7 @@ async fn partition_rows_land_in_root_destination() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn partition_truncate_tombstones_only_its_rows() {
-    if skip_gate() {
+    if !fx::tools::requirements_available() {
         return;
     }
     let ns = "pt_trunc";
@@ -280,7 +276,7 @@ async fn partition_truncate_tombstones_only_its_rows() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn detach_and_drop_follow_their_policies() {
-    if skip_gate() {
+    if !fx::tools::requirements_available() {
         return;
     }
     let ns = "pt_leave";
@@ -344,7 +340,7 @@ async fn detach_and_drop_follow_their_policies() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn attached_partition_maps_columns_by_name() {
-    if skip_gate() {
+    if !fx::tools::requirements_available() {
         return;
     }
     let ns = "pt_attach";
@@ -374,7 +370,7 @@ async fn attached_partition_maps_columns_by_name() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn route_self_keeps_partition_destination() {
-    if skip_gate() {
+    if !fx::tools::requirements_available() {
         return;
     }
     let ns = "pt_self";
@@ -420,7 +416,7 @@ async fn route_self_keeps_partition_destination() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn unlogged_partition_stops_replication() {
-    if skip_gate() {
+    if !fx::tools::requirements_available() {
         return;
     }
     let ns = "pt_unlogged";
@@ -440,7 +436,7 @@ async fn unlogged_partition_stops_replication() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn attach_loads_existing_rows_into_root() {
-    if skip_gate() {
+    if !fx::tools::requirements_available() {
         return;
     }
     let ns = "pt_load";
@@ -500,7 +496,7 @@ async fn attach_loads_existing_rows_into_root() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn partitioned_opt_in_loads_each_partition() {
-    if skip_gate() {
+    if !fx::tools::requirements_available() {
         return;
     }
     let ns = "pt_optin";
@@ -553,7 +549,7 @@ async fn partitioned_opt_in_loads_each_partition() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn partition_removal_needs_partition_column() {
-    if skip_gate() {
+    if !fx::tools::requirements_available() {
         return;
     }
     let ns = "pt_noleaf";

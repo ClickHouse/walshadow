@@ -280,6 +280,15 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
+      # cargo-llvm-cov skips build/*/*/out dirs lacking a sibling fingerprint
+      # dir as build script output, and nextest archives omit fingerprints,
+      # dropping every test binary under cargo's v2 build-dir layout
+      # https://github.com/taiki-e/cargo-llvm-cov/issues/520
+      - name: Mark extracted test binaries as v2 layout
+        if: ${{ !cancelled() }}
+        working-directory: walshadow/target/llvm-cov-target/target/debug/build
+        run: find . -mindepth 3 -maxdepth 3 -type d -name out -execdir mkdir -p fingerprint \;
+
       # Preserve coverage from failed test runs. Build failures may have none.
       - name: Coverage summary (job log)
         if: ${{ !cancelled() }}
@@ -348,7 +357,7 @@ jobs:
       - name: Coverage summary
         working-directory: walshadow
         env:
-          MAX_MISSED_LINES: 2470
+          MAX_MISSED_LINES: 500
         run: |
           awk -F'[:,]' -v max="$MAX_MISSED_LINES" '
             /^DA:/ { f++; if ($3 > 0) h++ }

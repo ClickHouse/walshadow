@@ -62,7 +62,7 @@ pub async fn filter_landed_wal(
         WAL_SEG_SIZE,
         Pos::new(first.start_lsn(WAL_SEG_SIZE)),
     )
-    .map_err(|e| anyhow::anyhow!("wal_landing: WalStream: {e}"))?;
+    .context("wal_landing: WalStream")?;
     *stream.filter_mut().tracker_mut() = tracker;
     if let Some((rels, redo_lsn)) = shadow_rels {
         stream.filter_mut().keep_user_rels(rels, redo_lsn);
@@ -147,11 +147,9 @@ async fn segments_on_disk(pg_wal: &Path, timeline: u32) -> Result<Vec<SegmentNam
                 .with_context(|| format!("wal_landing: remove {}", path.display()))?;
             continue;
         }
-        if !is_wal_filename(name) {
+        let Ok(seg) = SegmentName::parse(name) else {
             continue;
-        }
-        let seg = SegmentName::parse(name)
-            .map_err(|e| anyhow::anyhow!("wal_landing: segment name {name}: {e}"))?;
+        };
         if seg.timeline != timeline {
             bail!(
                 "wal_landing: {name} sits on timeline {} but bootstrap ran on {timeline}",
@@ -342,6 +340,44 @@ mod tests {
         .await;
         let err = segments_on_disk(tmp.path(), 1).await.unwrap_err();
         assert!(err.to_string().contains("timeline"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn scan_reports_a_pg_wal_that_is_no_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("pg_wal");
+        touch(tmp.path(), "pg_wal").await;
+        let err = segments_on_disk(&file, 1).await.unwrap_err();
+        assert!(err.to_string().contains("wal_landing: read"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn filter_refuses_a_short_segment() {
+        let tmp = tempfile::tempdir().unwrap();
+        touch(tmp.path(), &seg(1).format()).await;
+        let err = filter_landed_wal(tmp.path(), 1, u64::MAX, CatalogTracker::new(), None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("is 0 bytes"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn copy_takes_only_segments_inside_the_window() {
+        let tmp = tempfile::tempdir().unwrap();
+        for n in 1..=3 {
+            touch(tmp.path(), &seg(n).format()).await;
+        }
+        let out = tmp.path().join("window");
+        let from = seg(2).start_lsn(WAL_SEG_SIZE);
+        let copied = copy_window_segments(tmp.path(), &out, 1, from, from + 1)
+            .await
+            .unwrap();
+        assert_eq!(copied, 1);
+        assert!(out.join(seg(2).format()).exists());
+        let err = copy_window_segments(tmp.path(), &out.join(seg(2).format()), 1, from, from + 1)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().starts_with("create "), "{err}");
     }
 
     #[tokio::test]

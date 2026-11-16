@@ -221,9 +221,9 @@ impl TimelineHistory {
     }
 
     /// Timeline that took over from `tli`.
-    pub fn successor_of(&self, tli: u32) -> Option<u32> {
+    pub fn successor_of(&self, tli: u32) -> Option<&HistoryEntry> {
         let at = self.entries.iter().position(|e| e.tli == tli)?;
-        self.entries.get(at + 1).map(|e| e.tli)
+        self.entries.get(at + 1)
     }
 
     /// `tli` owns `lsn`: both that the branch is an ancestor and that the
@@ -398,9 +398,18 @@ mod tests {
     #[test]
     fn successor_and_switchpoint_walk_the_chain() {
         let h = TimelineHistory::parse(4, SAMPLE.as_bytes()).unwrap();
-        assert_eq!(h.successor_of(1), Some(2));
-        assert_eq!(h.successor_of(2), Some(4), "non-consecutive IDs are fine");
-        assert_eq!(h.successor_of(4), None);
+        let successor = |tli| h.successor_of(tli).map(|e| e.tli);
+        assert_eq!(successor(1), Some(2));
+        assert_eq!(successor(2), Some(4), "non-consecutive IDs are fine");
+        assert_eq!(successor(4), None);
+        assert_eq!(
+            format!("{h:?}"),
+            format!(
+                "TimelineHistory {{ target: 4, entries: {:?} }}",
+                h.entries()
+            ),
+            "raw bytes stay out of logs",
+        );
         assert_eq!(h.switchpoint_of(2), Some(0x500_0000));
         assert_eq!(h.switchpoint_of(4), None);
         assert_eq!(h.switchpoint_of(9), None);

@@ -389,6 +389,9 @@ async fn forward_decl_materializes_on_create_table() {
         vec![
             "CREATE TABLE app.later (id bigint PRIMARY KEY, body text)".into(),
             "INSERT INTO app.later (id, body) VALUES (1, 'declared-first')".into(),
+            "DELETE FROM walshadow.config_table WHERE namespace = 'app' AND relname = 'later'"
+                .into(),
+            "INSERT INTO app.later (id, body) VALUES (2, 'opted-out')".into(),
             "SELECT pg_switch_wal()".into(),
         ],
     );
@@ -420,6 +423,10 @@ async fn forward_decl_materializes_on_create_table() {
         )
         .expect("ch body");
     assert_eq!(body, "declared-first");
+    let n = ch
+        .query("SELECT count() FROM walshadow_test.app_later FINAL WHERE _is_deleted = 0")
+        .expect("ch count");
+    assert_eq!(n, "1", "insert after config row removal must not land");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

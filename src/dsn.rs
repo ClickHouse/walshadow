@@ -293,15 +293,10 @@ mod tests {
     use super::*;
 
     fn s(t: &Table, k: &str) -> String {
-        t.get(k)
-            .and_then(Value::as_str)
-            .unwrap_or_else(|| panic!("{k} missing"))
-            .into()
+        t.get(k).and_then(Value::as_str).expect(k).into()
     }
     fn i(t: &Table, k: &str) -> i64 {
-        t.get(k)
-            .and_then(Value::as_integer)
-            .unwrap_or_else(|| panic!("{k} missing"))
+        t.get(k).and_then(Value::as_integer).expect(k)
     }
 
     #[test]
@@ -514,6 +509,30 @@ mod tests {
         assert!(matches!(
             ch_table("not a url").unwrap_err(),
             DsnError::Invalid { .. }
+        ));
+    }
+
+    #[test]
+    fn source_url_without_dbname_omits_it() {
+        let t = source_table("postgres://h").unwrap();
+        assert_eq!(s(&t, "host"), "h");
+        assert!(!t.contains_key("dbname"));
+    }
+
+    #[test]
+    fn source_url_rejects_non_utf8_socket_dir() {
+        let e = source_table("postgres:///d?host=%2Ftmp%FF").unwrap_err();
+        assert!(e.to_string().contains("host is not UTF-8"), "{e}");
+    }
+
+    #[test]
+    fn ch_url_secure_false_and_missing_host() {
+        let t = ch_table("clickhouses://ch/db?secure=off").unwrap();
+        assert_eq!(t.get("secure").and_then(Value::as_bool), Some(false));
+        assert_eq!(i(&t, "port"), 9000);
+        assert!(matches!(
+            ch_table("clickhouse:/db").unwrap_err(),
+            DsnError::NoHost(_)
         ));
     }
 }

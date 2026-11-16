@@ -938,7 +938,14 @@ impl ClickHouseChunkStore {
                         let mut out = A::default();
                         loop {
                             match client.recv_event().await? {
-                                Event::Data(block) => parse(&block, &mut out)?,
+                                Event::Data(block) => {
+                                    if let Err(e) = parse(&block, &mut out) {
+                                        // Next query on this connection must
+                                        // start at its own answer
+                                        drain_to_end_of_stream(&mut client).await?;
+                                        return Err(e);
+                                    }
+                                }
                                 Event::EndOfStream => break,
                                 Event::Exception(exc) => {
                                     return Err(EmitterError::ServerException {
@@ -1072,8 +1079,8 @@ impl ChunkStore for ClickHouseChunkStore {
         for &(id, size) in values {
             let prev = expected.insert(id, size);
             debug_assert!(
-                prev.is_none_or(|prev| prev == size),
-                "batch contains value {id} from {} with two different stored sizes",
+                prev.is_none(),
+                "batch repeats value {id} from {}",
                 mirror_table_name(db_oid, toast_relid),
             );
         }
@@ -1887,10 +1894,6 @@ impl GatedStore {
 #[cfg(test)]
 #[async_trait]
 impl ChunkStore for GatedStore {
-    fn accepts_writes(&self) -> bool {
-        true
-    }
-
     async fn put(&self, rows: &[ToastRow]) -> Result<(), ChunkStoreError> {
         self.puts_started.fetch_add(1, Ordering::Relaxed);
         self.permits.acquire().await.unwrap().forget();
@@ -1996,6 +1999,80 @@ mod tests {
         puts.push(row(7, 0, (1, 1), 1, b"a")).await.unwrap();
         let err = puts.flush().await.unwrap_err();
         assert!(err.to_string().contains("gated failure"), "{err}");
+    }
+
+    /// Put task panic resurfaces on the joining caller
+    #[tokio::test]
+    async fn flush_resumes_put_panic() {
+        let (store, mut puts) = gated_puts(GatedStore::new());
+        store.permits.close();
+        puts.push(row(7, 0, (1, 1), 1, b"a")).await.unwrap();
+        let joined = tokio::spawn(async move { puts.flush().await }).await;
+        assert!(joined.unwrap_err().is_panic());
+    }
+
+    /// Put cancelled by its runtime shutting down surfaces as an error
+    #[test]
+    fn flush_surfaces_put_cancelled_by_shutdown() {
+        let rt = || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+        };
+        let (_store, mut puts) = gated_puts(GatedStore::new());
+        let doomed = rt();
+        doomed
+            .block_on(puts.push(row(7, 0, (1, 1), 1, b"a")))
+            .unwrap();
+        doomed.shutdown_background();
+        let err = rt().block_on(puts.flush()).unwrap_err();
+        assert!(err.to_string().contains("cancelled"), "{err}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn storeless_and_empty_calls_are_noops() {
+        let r = ToastResolver::disabled();
+        r.put_batched(&[row(7, 0, (1, 1), 1, b"a")]).await.unwrap();
+        r.put_row_refs(None, &[]).await.unwrap();
+        let stored = ToastResolver::with_store(Arc::new(MemChunkStore::new()), Arc::default());
+        let got = stored.fetch_stored(0, 16500, &[], 1).await.unwrap();
+        assert_eq!(got, Some(Vec::new()));
+    }
+
+    /// Older row of a TID arriving after a newer one keeps the newer as
+    /// latest; only a live latest below the marker earns a residual tombstone
+    #[tokio::test(flavor = "current_thread")]
+    async fn mem_rewrite_barrier_keys_latest_row_per_tid() {
+        let store = MemChunkStore::new();
+        let tomb = ToastRow::tombstone(&ToastDelete {
+            db_oid: 0,
+            toast_relid: 16500,
+            blkno: 1,
+            offnum: 1,
+            source_lsn: 20,
+        });
+        store
+            .put(&[
+                tomb,
+                row(7, 0, (1, 1), 10, b"a"),
+                row(8, 0, (1, 2), 10, b"b"),
+            ])
+            .await
+            .unwrap();
+        store.rewrite_barrier(0, 16500, 30, 40).await.unwrap();
+        assert_eq!(
+            store.fetch(0, 16500, 7, u64::MAX, 1).await.unwrap(),
+            FetchedValue::Missing
+        );
+        assert_eq!(
+            store.fetch(0, 16500, 8, 39, 1).await.unwrap(),
+            assembled(b"b")
+        );
+        assert_eq!(
+            store.fetch(0, 16500, 8, u64::MAX, 1).await.unwrap(),
+            FetchedValue::Missing
+        );
     }
 
     const PG_LZ4_CHUNKS: &[u8] = include_bytes!("testdata/compressed_external_lz4.bin");
@@ -2785,28 +2862,11 @@ mod tests {
 
     #[tokio::test]
     async fn failed_mirror_flush_stays_failed_and_keeps_rows() {
-        #[derive(Default)]
-        struct Failing(AtomicUsize);
-        #[async_trait]
-        impl ChunkStore for Failing {
-            fn accepts_writes(&self) -> bool {
-                true
-            }
-            async fn put(&self, _rows: &[ToastRow]) -> Result<(), ChunkStoreError> {
-                self.0.fetch_add(1, Ordering::Relaxed);
-                Err(ChunkStoreError::Clickhouse("down".into()))
-            }
-            async fn fetch_many(
-                &self,
-                _db_oid: u32,
-                _toast_relid: u32,
-                _values: &[(u32, usize)],
-                _max_lsn: u64,
-            ) -> Result<Vec<FetchedValue>, ChunkStoreError> {
-                unreachable!()
-            }
-        }
-        let store = Arc::new(Failing::default());
+        let store = Arc::new(GatedStore {
+            fail: true,
+            ..GatedStore::new()
+        });
+        store.permits.add_permits(8);
         let budget = crate::budget::MemoryBudget::new(1 << 20);
         let r =
             ToastResolver::with_store(store.clone(), Arc::default()).with_budget(budget.clone());
@@ -2815,7 +2875,8 @@ mod tests {
         assert!(held > 0);
         assert!(r.flush_mirror().await.is_err());
         assert!(r.flush_mirror().await.is_err());
-        assert_eq!(store.0.load(Ordering::Relaxed), 1, "no retry after failure");
+        let puts = store.puts_started.load(Ordering::Relaxed);
+        assert_eq!(puts, 1, "no retry after failure");
         assert_eq!(budget.resident_bytes(), held, "rows outlive failed INSERT");
     }
 

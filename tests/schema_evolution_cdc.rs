@@ -9,13 +9,6 @@ use std::time::Duration;
 
 use walshadow::mapping::NamespaceMapping;
 
-fn skip_gate() -> bool {
-    if !fx::tools::requirements_available() {
-        return true;
-    }
-    false
-}
-
 async fn run(
     slot: fx::Ports,
     ns: &str,
@@ -100,7 +93,7 @@ fn has_column(ch: &fx::ChServer, table: &str, col: &str) -> bool {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn added_column_without_dml_visible_next_batch() {
-    if skip_gate() {
+    if !fx::tools::requirements_available() {
         return;
     }
     let (source, shadow, ch, _tmp) = run(
@@ -133,7 +126,7 @@ async fn added_column_without_dml_visible_next_batch() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn schema_change_on_one_table_spares_sibling() {
-    if skip_gate() {
+    if !fx::tools::requirements_available() {
         return;
     }
     let (source, shadow, ch, _tmp) = run(
@@ -174,7 +167,7 @@ async fn schema_change_on_one_table_spares_sibling() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn nullable_add_column_under_replident_full() {
-    if skip_gate() {
+    if !fx::tools::requirements_available() {
         return;
     }
     let (source, shadow, ch, _tmp) = run(
@@ -226,7 +219,7 @@ async fn nullable_add_column_under_replident_full() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn nullable_add_column_under_replident_index() {
-    if skip_gate() {
+    if !fx::tools::requirements_available() {
         return;
     }
     let (source, shadow, ch, _tmp) = run(
@@ -279,7 +272,7 @@ fn column_type(ch: &fx::ChServer, table: &str, col: &str) -> String {
 /// PostgreSQL rewrite rows carry USING results for every live row
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn alter_column_type_converges_through_rewrite() {
-    if skip_gate() {
+    if !fx::tools::requirements_available() {
         return;
     }
     let (source, shadow, ch, _tmp) = run(
@@ -325,7 +318,7 @@ async fn alter_column_type_converges_through_rewrite() {
 /// Remove old row after key changes, including changes back to original key
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn key_update_retires_old_key() {
-    if skip_gate() {
+    if !fx::tools::requirements_available() {
         return;
     }
     let (source, shadow, ch, _tmp) = run(
@@ -359,7 +352,7 @@ async fn key_update_retires_old_key() {
 /// updates and deletes remove old versions
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn keyless_full_identity_converges() {
-    if skip_gate() {
+    if !fx::tools::requirements_available() {
         return;
     }
     let (source, shadow, ch, _tmp) = run(

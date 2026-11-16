@@ -127,16 +127,9 @@ fn winning_flag(ch: &fx::ChServer, id: i32) -> String {
     .expect("ch winning _is_deleted")
 }
 
-fn skip_gate() -> bool {
-    if !fx::tools::requirements_available() {
-        return true;
-    }
-    false
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn iud_same_batch_collapses_to_tombstone() {
-    if skip_gate() {
+    if !fx::tools::requirements_available() {
         return;
     }
     let workload = "BEGIN;\n\
@@ -155,7 +148,7 @@ async fn iud_same_batch_collapses_to_tombstone() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ud_same_batch_collapses_to_tombstone() {
-    if skip_gate() {
+    if !fx::tools::requirements_available() {
         return;
     }
     let workload = "INSERT INTO sd.t VALUES (1, 'a');\n\
@@ -175,7 +168,7 @@ async fn ud_same_batch_collapses_to_tombstone() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn insert_after_delete_resurrects_key() {
-    if skip_gate() {
+    if !fx::tools::requirements_available() {
         return;
     }
     let workload = "INSERT INTO sd.t VALUES (1, 'a');\n\
@@ -202,7 +195,7 @@ async fn insert_after_delete_resurrects_key() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn basic_insert_update_delete_ends_as_tombstone() {
-    if skip_gate() {
+    if !fx::tools::requirements_available() {
         return;
     }
     let workload = "INSERT INTO sd.t VALUES (1, 'a');\n\
@@ -225,7 +218,7 @@ async fn basic_insert_update_delete_ends_as_tombstone() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn large_single_xact_triggers_mid_loop_chunk_flush() {
-    if skip_gate() {
+    if !fx::tools::requirements_available() {
         return;
     }
     let workload = "BEGIN;\n\
@@ -253,7 +246,7 @@ async fn large_single_xact_triggers_mid_loop_chunk_flush() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn metadata_columns_are_populated() {
-    if skip_gate() {
+    if !fx::tools::requirements_available() {
         return;
     }
     let workload = "INSERT INTO sd.t VALUES (1, 'a');\n\

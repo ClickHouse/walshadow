@@ -1881,7 +1881,7 @@ mod tests {
             snap.tables
                 .get(&RelName::new(ns, rel))
                 .map(|t| t.target.table.clone())
-                .unwrap_or_else(|| panic!("{ns}.{rel} unmapped"))
+                .expect("table mapped")
         };
         assert_eq!(table_of("audit", "events"), "events", "$table$ is bare");
         assert_eq!(table_of("shop", "items"), "wh_items");
@@ -1890,6 +1890,38 @@ mod tests {
             "app_logs",
             "a namespace with no entry derives from its own name",
         );
+    }
+
+    #[tokio::test]
+    async fn opt_in_routing_takes_overlay_namespace_template() {
+        let base = EmitterConfig::from_toml_str("[ch]\n").unwrap();
+        let (resolver, rx) = ConfigResolver::new(
+            &base,
+            CliOverrides::default(),
+            None,
+            toml::Table::new(),
+            dummy_handles(),
+            ResolverBoot::default(),
+        );
+        for (namespace, name) in [("ops", "ovl_$table$"), ("bad", "$bogus$")] {
+            let row = NamespaceRow {
+                auto_create_name: Some(name.into()),
+                ..NamespaceRow::default()
+            };
+            let namespace = namespace.into();
+            let event = ConfigEvent::NamespaceUpserted { namespace, row };
+            resolver.apply_config_event(event).await;
+        }
+        for ns in ["ops", "bad"] {
+            resolver
+                .materialize_opt_in(&rel_desc(ns, "t"), None, None)
+                .await;
+        }
+        let snap = rx.borrow();
+        let table_of = |ns: &str| snap.tables[&RelName::new(ns, "t")].target.table.clone();
+        assert_eq!(table_of("ops"), "ovl_t");
+        assert_eq!(table_of("bad"), "bad_t", "rejected template keeps default");
+        assert!(snap.namespaces["bad"].auto_create_name.is_none());
     }
 
     #[tokio::test]

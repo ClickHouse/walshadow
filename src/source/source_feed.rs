@@ -593,23 +593,23 @@ mod tests {
         socket.write_all(&frame).await.unwrap();
     }
 
-    async fn mock_feed() -> (SourceFeed, TcpStream) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let cfg = PgConfig {
+    fn mock_cfg(port: u16) -> PgConfig {
+        PgConfig {
             host: "127.0.0.1".into(),
-            port: listener.local_addr().unwrap().port(),
+            port,
             user: "test".into(),
             password: None,
             database: "test".into(),
             application_name: "source-timeout-test".into(),
             sslmode: SslMode::Disable,
             tls: Default::default(),
-        };
-        let client = async {
-            let mut feed = SourceFeed::connect(&cfg).await.unwrap();
-            feed.start_physical_replication(None, 0, 1).await.unwrap();
-            feed
-        };
+        }
+    }
+
+    /// Feed past startup, and the backend socket it talks to
+    async fn mock_session() -> (SourceFeed, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let cfg = mock_cfg(listener.local_addr().unwrap().port());
         let server = async {
             let (mut socket, _) = listener.accept().await.unwrap();
             socket.set_nodelay(true).unwrap();
@@ -618,13 +618,34 @@ mod tests {
             backend(&mut socket, b'R', &0u32.to_be_bytes()).await;
             backend(&mut socket, b'S', b"server_version\x0016.3\0").await;
             backend(&mut socket, b'Z', b"I").await;
-            assert_eq!(socket.read_u8().await.unwrap(), b'Q');
-            let len = socket.read_u32().await.unwrap() as usize;
-            socket.read_exact(&mut vec![0; len - 4]).await.unwrap();
-            backend(&mut socket, b'W', &[0, 0, 0]).await;
             socket
         };
-        tokio::join!(client, server)
+        let (feed, socket) = tokio::join!(SourceFeed::connect(&cfg), server);
+        (feed.unwrap(), socket)
+    }
+
+    /// Read one simple query off the backend socket
+    async fn query(socket: &mut TcpStream) -> String {
+        assert_eq!(socket.read_u8().await.unwrap(), b'Q');
+        let len = socket.read_u32().await.unwrap() as usize;
+        let mut body = vec![0; len - 4];
+        socket.read_exact(&mut body).await.unwrap();
+        String::from_utf8(body).unwrap()
+    }
+
+    fn error_response(code: &str) -> Vec<u8> {
+        format!("SERROR\0C{code}\0Mrefused\0\0").into_bytes()
+    }
+
+    async fn mock_feed() -> (SourceFeed, TcpStream) {
+        let (mut feed, mut socket) = mock_session().await;
+        let server = async {
+            query(&mut socket).await;
+            backend(&mut socket, b'W', &[0, 0, 0]).await;
+        };
+        let (started, ()) = tokio::join!(feed.start_physical_replication(None, 0, 1), server);
+        started.unwrap();
+        (feed, socket)
     }
 
     #[tokio::test]
@@ -757,6 +778,90 @@ mod tests {
         assert_eq!(
             no_slot, "START_REPLICATION B/4C000000 TIMELINE 1",
             "high word must be hex (B), not decimal (11)"
+        );
+    }
+
+    /// A refusal before COPY opens is typed as a removed segment only on PG's
+    /// `undefined_file` SQLSTATE
+    #[tokio::test]
+    async fn start_refusal_reads_its_sqlstate() {
+        for (code, removed) in [(SQLSTATE_UNDEFINED_FILE, true), ("XX000", false)] {
+            let (mut feed, mut socket) = mock_session().await;
+            let server = async {
+                query(&mut socket).await;
+                backend(&mut socket, b'E', &error_response(code)).await;
+            };
+            let (started, ()) = tokio::join!(feed.start_physical_replication(None, 0, 1), server);
+            let e = started.unwrap_err();
+            assert_eq!(is_wal_segment_removed(&e), removed, "{e:#}");
+            assert!(format!("{e:#}").contains(code), "{e:#}");
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_skips_unexpected_backend_messages() {
+        let (mut feed, mut socket) = mock_feed().await;
+        backend(&mut socket, b'A', b"\0\0\0\x01chan\0note\0").await;
+        let mut frame = vec![b'w'];
+        frame.extend_from_slice(&0x100u64.to_be_bytes());
+        frame.extend_from_slice(&0x104u64.to_be_bytes());
+        frame.extend_from_slice(&0u64.to_be_bytes());
+        frame.extend_from_slice(b"WAL!");
+        backend(&mut socket, b'd', &frame).await;
+        let mut buf = Vec::new();
+        let event = feed.next_event(StandbyStatus::default(), &mut buf).await;
+        assert!(
+            matches!(event, Ok(SourceEvent::Wal(c)) if c.start_lsn == 0x100 && c.data == b"WAL!")
+        );
+        assert_eq!(feed.last_server_wal_end(), 0x104);
+    }
+
+    #[tokio::test]
+    async fn timeline_history_failure_names_the_timeline() {
+        let (mut feed, mut socket) = mock_session().await;
+        let server = async {
+            assert!(query(&mut socket).await.starts_with("TIMELINE_HISTORY 2"));
+            backend(&mut socket, b'E', &error_response("XX000")).await;
+        };
+        let (history, ()) = tokio::join!(feed.timeline_history(2), server);
+        let e = history.unwrap_err();
+        assert_eq!(e.to_string(), "TIMELINE_HISTORY 2");
+    }
+
+    /// Sidecar SQL rides the replication connection's transport settings
+    #[tokio::test]
+    async fn sql_client_dial_failures_name_the_endpoint() {
+        let closed = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut cfg = mock_cfg(closed.local_addr().unwrap().port());
+        cfg.password = Some("pw".into());
+        drop(closed);
+        let e = open_sql_client(&cfg).await.err().unwrap();
+        assert!(e.to_string().starts_with("connect to 127.0.0.1:"), "{e:#}");
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        cfg.port = listener.local_addr().unwrap().port();
+        let refuse_tls = async {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            socket.read_exact(&mut [0; 8]).await.unwrap();
+            socket.write_all(b"N").await.unwrap();
+            let (mut plain, _) = listener.accept().await.unwrap();
+            plain.read_u32().await.unwrap();
+        };
+        let dial = async {
+            cfg.sslmode = SslMode::Require;
+            let tls = open_sql_client(&cfg).await.err().unwrap();
+            cfg.sslmode = SslMode::Disable;
+            let plain = open_sql_client(&cfg).await.err().unwrap();
+            (tls, plain)
+        };
+        let ((tls, plain), ()) = tokio::join!(dial, refuse_tls);
+        assert!(
+            tls.to_string().starts_with("tls negotiation against"),
+            "{tls:#}"
+        );
+        assert!(
+            !plain.to_string().starts_with("tls negotiation"),
+            "{plain:#}"
         );
     }
 }

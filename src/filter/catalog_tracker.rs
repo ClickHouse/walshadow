@@ -735,6 +735,17 @@ mod tests {
             t.is_opaque_catalog(6, 2619),
             "filenode tracking is per database",
         );
+        let again = heap_block_record_with_main(
+            RmId::Heap,
+            0x20,
+            5,
+            1259,
+            pg_class_block_data(2619, 41000),
+            xl_heap_update_no_compression(),
+        );
+        t.observe(&again, MAGIC);
+        assert!(t.is_opaque_catalog(5, 41000));
+        assert!(!t.is_opaque_catalog(5, 40000), "second move retires first");
     }
 
     #[test]
@@ -1134,6 +1145,27 @@ mod tests {
         t.observe(&with_xid(delete, 900), MAGIC);
         t.observe(&smgr_create(5, 50005, 900), MAGIC);
         assert!(!t.is_catalog(5, 50005), "transient drop closes the rebuild");
+    }
+
+    #[test]
+    fn pg_class_rebuild_outside_an_xact_teaches_its_transient_pages() {
+        let mut t = CatalogTracker::new();
+        let insert = heap_block_record_with_main(
+            RmId::Heap,
+            0x00,
+            5,
+            1259,
+            named_block_data(50010, "pg_temp_1259", 11, 50010),
+            1u16.to_le_bytes().to_vec(),
+        );
+        t.observe(&insert, MAGIC);
+        assert!(t.is_catalog(5, 50010));
+        assert!(
+            t.reads_image(5, 50010),
+            "transient pg_class pages teach slots"
+        );
+        t.observe(&smgr_create(5, 50011, 0), MAGIC);
+        assert!(!t.is_catalog(5, 50011), "no xact claims later storage");
     }
 
     #[test]

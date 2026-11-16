@@ -474,9 +474,12 @@ impl Future for Waiter<'_> {
             inner.next_head(waiters, this.queue);
             return Poll::Ready(());
         }
-        if let Some(slot) = waiters.iter_mut().find(|s| s.id == id) {
-            slot.waker.clone_from(cx.waker());
-        }
+        waiters
+            .iter_mut()
+            .find(|s| s.id == id)
+            .expect("queued waiter has a slot")
+            .waker
+            .clone_from(cx.waker());
         Poll::Pending
     }
 }
@@ -626,9 +629,7 @@ pub fn proc_field(text: &str, key: &str) -> Option<u64> {
 
 fn read_mem_total(path: &str) -> Option<usize> {
     let text = std::fs::read_to_string(path).ok()?;
-    usize::try_from(proc_field(&text, "MemTotal:")?)
-        .ok()?
-        .checked_mul(1024)
+    usize::try_from(proc_field(&text, "MemTotal:")?.checked_mul(1024)?).ok()
 }
 
 fn units_for(bytes: usize) -> u32 {
@@ -724,8 +725,8 @@ mod tests {
         assert_eq!(b.resident_bytes(), 0);
     }
 
-    #[test]
-    fn try_admit_keeps_speculation() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn try_admit_keeps_speculation() {
         struct Count(AtomicU64);
         impl Reclaim for Count {
             fn reclaim(&self) {
@@ -740,6 +741,58 @@ mod tests {
         assert_eq!(count.0.load(Ordering::Relaxed), 0);
         drop(speculative);
         assert!(b.try_admit(1).is_some());
+        let held = b.try_admit(2048).unwrap();
+        let waiting = tokio::time::timeout(std::time::Duration::ZERO, b.admit(1)).await;
+        assert!(waiting.is_err());
+        assert_eq!(
+            count.0.load(Ordering::Relaxed),
+            1,
+            "a waiting admit reclaims"
+        );
+        drop(held);
+    }
+
+    #[test]
+    fn oversized_try_admit_overshoots_and_blocks_zero_speculation() {
+        let b = MemoryBudget::with_leaf_reserve(4096, 2048);
+        let oversized = b.try_admit(128 << 10).unwrap();
+        assert_eq!((oversized.bytes(), b.overshoots_total()), (128 << 10, 1));
+        assert!(b.try_speculate(0).is_none(), "resident already past total");
+        let mut into = None;
+        absorb_into(&mut into, oversized);
+        absorb_into(&mut into, b.try_admit(1024).unwrap());
+        assert_eq!(into.map(|p| p.bytes()), Some((128 << 10) + 1024));
+        assert_eq!(b.resident_bytes(), 0);
+    }
+
+    /// Release wakes the queue head, the head's grant wakes the next one, and
+    /// cancelling a waiter further back disturbs neither
+    #[tokio::test(flavor = "current_thread")]
+    async fn admission_queue_hands_off_in_order_past_a_cancelled_waiter() {
+        let b = MemoryBudget::with_leaf_reserve(4096, 2048);
+        let held = b.admit(2048).await;
+        let mut queued = Vec::new();
+        for (n, bytes) in [2048, 1024, 1024].into_iter().enumerate() {
+            let budget = b.clone();
+            queued.push(tokio::spawn(async move { budget.admit(bytes).await }));
+            while b.inner.admission_waiters.load(Ordering::SeqCst) == n {
+                tokio::task::yield_now().await;
+            }
+        }
+        let [head, next, cancelled] = <[_; 3]>::try_from(queued).ok().unwrap();
+        cancelled.abort();
+        assert!(matches!(cancelled.await, Err(e) if e.is_cancelled()));
+        drop(held);
+        let head = head.await.unwrap();
+        assert_eq!(head.bytes(), 2048);
+        drop(head);
+        assert_eq!(next.await.unwrap().bytes(), 1024);
+    }
+
+    #[test]
+    fn proc_field_needs_a_number_after_the_key() {
+        assert_eq!(proc_field("MemTotal:\n", "MemTotal:"), None);
+        assert_eq!(proc_field("MemTotal: 12 kB\n", "MemTotal:"), Some(12));
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -34,7 +34,7 @@ use walshadow::queueing_record_sink::{
     DEFAULT_QUEUEING_BATCH_SIZE, DEFAULT_QUEUEING_RECORD_SINK_CAPACITY, QueueingRecordSink,
 };
 use walshadow::record::{MetricsRecordSink, WAL_SEG_SIZE};
-use walshadow::retention::max_segment_end;
+use walshadow::retention::{DEFAULT_TRIM_INTERVAL, max_segment_end};
 use walshadow::segment_sink::{DirSegmentSink, SegFsync};
 use walshadow::source_db::{DbLink, DbLinkConfig, SourceDb, SourceDbs};
 use walshadow::source_feed::{SourceEvent, SourceFeed, StandbyStatus};
@@ -100,6 +100,157 @@ async fn ensure_boot_database_waiting(cfg: &EmitterConfig) -> Result<()> {
     Ok(())
 }
 
+/// Poll until a walreceiver streams from the walsender, or `timeout` passes
+async fn await_walreceiver(
+    shadow_state: &Mutex<walshadow::shadow_stream::ShadowStreamState>,
+    walsender_addr: std::net::SocketAddr,
+    timeout: Duration,
+    shutdown: &CancellationToken,
+) -> Result<()> {
+    let start = Instant::now();
+    loop {
+        let agg = shadow_state.lock().await.aggregate();
+        if agg.active_connections > 0 {
+            break;
+        }
+        // `accepted` separates "shadow never dialed" from "shadow dialed
+        // and stalled in the handshake" — the latter reads as the former
+        // without it, since only START_REPLICATION registers a connection
+        let (secs, accepted) = (timeout.as_secs(), agg.accepted_total);
+        anyhow::ensure!(
+            start.elapsed() < timeout,
+            "no walreceiver streaming from walsender {walsender_addr} within \
+             {secs}s (accepted {accepted}, none sent START_REPLICATION); catalog-boundary \
+             holds require a live wire — point shadow's primary_conninfo here \
+             or raise --walsender-connect-timeout",
+        );
+        or_signal(shutdown, async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            Ok(())
+        })
+        .await?;
+    }
+    tracing::info!(
+        target: "walshadow",
+        wait = ?start.elapsed(),
+        "walsender connected — starting pump",
+    );
+    Ok(())
+}
+
+/// Followed databases in bridge socket order: `[source] dbname` plus every
+/// database-prefixed config key
+fn followed_databases(ch_config: Option<&EmitterConfig>, dbname: &str) -> Result<Vec<String>> {
+    let databases = match ch_config {
+        Some(cfg) if !cfg.databases.is_empty() => cfg.databases.clone(),
+        _ => vec![dbname.to_owned()],
+    };
+    let seats = walshadow::bridge::MAX_BRIDGE_DATABASES;
+    let named = databases.len();
+    anyhow::ensure!(
+        named <= seats,
+        "config names {named} source databases, the shadow bridge seats {seats}"
+    );
+    Ok(databases)
+}
+
+/// Manifest boot resumes from. Unreadable is fatal unless an operator override
+/// discards it, another cluster's is fatal regardless
+fn boot_manifest(
+    loaded: Result<Option<manifest::Manifest>, manifest::ManifestError>,
+    overridden: bool,
+    spill_dir: &std::path::Path,
+) -> Result<Option<manifest::Manifest>> {
+    match loaded {
+        Ok(m) => Ok(m),
+        Err(e @ manifest::ManifestError::ForeignSource { .. }) => Err(e.into()),
+        Err(e) if overridden => {
+            tracing::warn!(
+                target: "walshadow::manifest",
+                error = %e,
+                spill_dir = %spill_dir.display(),
+                "manifest unreadable; operator override discards it",
+            );
+            Ok(None)
+        }
+        Err(e) => anyhow::bail!(
+            "manifest at {} unreadable: {e}; restore it, or authorize \
+             recovery with --ignore-cursor / --start-lsn",
+            manifest::manifest_path(spill_dir).display(),
+        ),
+    }
+}
+
+/// Branch serving `aligned` on the source's history. `--ignore-cursor`
+/// adopts the live timeline when the stored one has no lineage there
+fn start_branch(
+    history: &mut TimelineHistory,
+    stored_timeline: u32,
+    aligned: Pos<Floor>,
+    live_timeline: u32,
+    ignore_cursor: bool,
+) -> Result<u32> {
+    if let Some(tli) = history.resume_branch(stored_timeline, aligned.get(), WAL_SEG_SIZE) {
+        return Ok(tli);
+    }
+    let serves = history.tli_of_segment(aligned.get(), WAL_SEG_SIZE);
+    anyhow::ensure!(
+        ignore_cursor,
+        "timeline_not_descendant: stored timeline {stored_timeline} does not reach \
+         {aligned} on live timeline {live_timeline}'s history (it serves {serves:?}); \
+         --ignore-cursor re-baselines onto the live branch",
+    );
+    tracing::warn!(
+        target: "walshadow",
+        stored_timeline,
+        live_timeline,
+        serves_start = serves,
+        "--ignore-cursor adopts the live timeline without a lineage proof",
+    );
+    *history = TimelineHistory::root(live_timeline);
+    Ok(live_timeline)
+}
+
+/// Same number, different branch: only the switchpoint tells a sibling from
+/// the branch artifacts came off. `stored_begin` 0 is a manifest that never
+/// recorded one
+fn check_branch_begin(
+    stored_timeline: u32,
+    stored_begin: u64,
+    live_begin: u64,
+    ignore_cursor: bool,
+) -> Result<()> {
+    match stored_begin {
+        0 if stored_timeline > 1 => tracing::warn!(
+            target: "walshadow",
+            stored_timeline,
+            live_begin = %format_pg_lsn(live_begin),
+            "manifest records no switchpoint for its branch, so a sibling sharing \
+             that number cannot be refused until the next manifest write",
+        ),
+        0 => {}
+        begin if begin != live_begin => {
+            anyhow::ensure!(
+                ignore_cursor,
+                "sibling_branch: source places timeline {stored_timeline} at {}, \
+                 walshadow's artifacts came off it from {}; the branch behind them is \
+                 absent from this source's history",
+                format_pg_lsn(live_begin),
+                format_pg_lsn(begin),
+            );
+            tracing::warn!(
+                target: "walshadow",
+                stored_timeline,
+                stored_begin = %format_pg_lsn(begin),
+                live_begin = %format_pg_lsn(live_begin),
+                "--ignore-cursor adopts a branch that begins somewhere else",
+            );
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 /// Wait out tracked I/O on every exit, attach restart reopens same files
 /// in-process
 pub(crate) async fn run_session(
@@ -134,7 +285,7 @@ async fn session_body(
     let merged: toml::Table = match args.ch_config.as_deref() {
         Some(p) => walshadow::ch_emitter::load_effective(p, cli_base(args))
             .await
-            .with_context(|| format!("load config {}", p.display()))?,
+            .context(format!("load config {}", p.display()))?,
         None => cli_base(args),
     };
     // Applied source endpoint. Boot resolves it file-over-CLI; a later reload
@@ -147,7 +298,7 @@ async fn session_body(
     let mut cfg = source_conn.to_pg_config();
     let mut feed = or_signal(
         shutdown,
-        connect_source_waiting(args, &mut source_conn, &mut cfg),
+        connect_source_waiting(args, &mut source_conn, &mut cfg, SOURCE_SWAP_RETRY),
     )
     .await?;
 
@@ -203,18 +354,7 @@ async fn session_body(
                 c.decoder_queue_capacity
             }),
     );
-    // Followed databases, in bridge socket order: `[source] dbname` plus
-    // every database-prefixed config key
-    let source_databases: Vec<String> = match ch_config.as_ref() {
-        Some(cfg) if !cfg.databases.is_empty() => cfg.databases.clone(),
-        _ => vec![source_conn.dbname.clone()],
-    };
-    anyhow::ensure!(
-        source_databases.len() <= walshadow::bridge::MAX_BRIDGE_DATABASES,
-        "config names {} source databases, the shadow bridge seats {}",
-        source_databases.len(),
-        walshadow::bridge::MAX_BRIDGE_DATABASES,
-    );
+    let source_databases = followed_databases(ch_config.as_ref(), &source_conn.dbname)?;
     // Assign older TOAST mirrors and retire entries to sole followed database
     // TODO(0.2.0): remove with adopt_legacy_mirrors and legacy ledger load
     let legacy_owner: Option<u32> = if source_databases.len() == 1 {
@@ -258,7 +398,7 @@ async fn session_body(
     if let Some(slot) = source_conn.slot.as_deref() {
         feed.ensure_physical_slot(slot)
             .await
-            .with_context(|| format!("ensure physical replication slot {slot}"))?;
+            .context(format!("ensure physical replication slot {slot}"))?;
         tracing::info!(target: "walshadow", slot, "physical replication slot ready");
     }
     // Uptime anchors here, ahead of bootstrap: an initial load is part of the
@@ -403,13 +543,9 @@ async fn session_body(
         .as_ref()
         .and_then(|c| c.backup.clone())
         .map(Archive::open)
-        .transpose()?;
-    let start_lsn_override: Option<Pos<RawStart>> = args
-        .start_lsn
-        .as_deref()
-        .map(|s| walshadow::pg::parse_pg_lsn(s).context("--start-lsn"))
-        .transpose()?
-        .map(Pos::new);
+        .transpose()
+        .context("open backup archive")?;
+    let start_lsn_override: Option<Pos<RawStart>> = args.start_lsn.map(Pos::new);
 
     let live_identity = manifest::SourceIdentity {
         system_id: ident.system_id,
@@ -420,29 +556,9 @@ async fn session_body(
     // LSNs, not artifact ownership. Foreign system_id is fatal regardless
     // (retire/backfill ledgers would act on another cluster's state). A newer
     // live timeline is a promotion, proved against the source's history below.
-    let manifest_at_boot: Option<manifest::Manifest> =
-        match manifest::load(&args.spill_dir, &live_identity).await {
-            Ok(m) => m,
-            Err(e @ manifest::ManifestError::ForeignSource { .. }) => {
-                anyhow::bail!("{e}");
-            }
-            Err(e) if args.ignore_cursor || start_lsn_override.is_some() => {
-                tracing::warn!(
-                    target: "walshadow::manifest",
-                    error = %e,
-                    spill_dir = %args.spill_dir.display(),
-                    "manifest unreadable; operator override discards it",
-                );
-                None
-            }
-            Err(e) => {
-                anyhow::bail!(
-                    "manifest at {} unreadable: {e}; restore it, or authorize \
-                     recovery with --ignore-cursor / --start-lsn",
-                    manifest::manifest_path(&args.spill_dir).display(),
-                );
-            }
-        };
+    let loaded = manifest::load(&args.spill_dir, &live_identity).await;
+    let overridden = args.ignore_cursor || start_lsn_override.is_some();
+    let manifest_at_boot = boot_manifest(loaded, overridden, &args.spill_dir)?;
     // Precedence: explicit > bootstrap > manifest > greenfield head
     let manifest_at_boot = if args.ignore_cursor {
         None
@@ -507,29 +623,13 @@ async fn session_body(
         .or_else(|| manifest_at_boot.as_ref().map(|m| m.source.timeline))
         .unwrap_or(ident.timeline);
     let mut history = load_boot_history(&mut feed, ident.timeline, stored_timeline).await?;
-    let start_timeline = match history.resume_branch(stored_timeline, aligned.get(), WAL_SEG_SIZE) {
-        Some(tli) => tli,
-        None if args.ignore_cursor => {
-            let found = history.tli_of_segment(aligned.get(), WAL_SEG_SIZE);
-            tracing::warn!(
-                target: "walshadow",
-                stored_timeline,
-                live_timeline = ident.timeline,
-                serves_start = found,
-                "--ignore-cursor adopts the live timeline without a lineage proof",
-            );
-            history = TimelineHistory::root(ident.timeline);
-            ident.timeline
-        }
-        None => anyhow::bail!(
-            "timeline_not_descendant: stored timeline {stored_timeline} does not reach \
-             {} on live timeline {}'s history (it serves {:?}); \
-             --ignore-cursor re-baselines onto the live branch",
-            aligned,
-            ident.timeline,
-            history.tli_of_segment(aligned.get(), WAL_SEG_SIZE),
-        ),
-    };
+    let start_timeline = start_branch(
+        &mut history,
+        stored_timeline,
+        aligned,
+        ident.timeline,
+        args.ignore_cursor,
+    )?;
     // Backup passes replay archived WAL off the same branch, and outlive a
     // crossing, so they read the chain here rather than re-deriving it
     let (history_tx, history_rx) = watch::channel(Arc::new(history.clone()));
@@ -546,31 +646,12 @@ async fn session_body(
             .map(|m| m.source.timeline_begin.get())
             .unwrap_or(0)
     };
-    match stored_begin {
-        0 if stored_timeline > 1 => tracing::warn!(
-            target: "walshadow",
-            stored_timeline,
-            live_begin = %format_pg_lsn(live_begin),
-            "manifest records no switchpoint for its branch, so a sibling sharing \
-             that number cannot be refused until the next manifest write",
-        ),
-        0 => {}
-        begin if begin != live_begin && !args.ignore_cursor => anyhow::bail!(
-            "sibling_branch: source places timeline {stored_timeline} at {}, \
-             walshadow's artifacts came off it from {}; the branch behind them is \
-             absent from this source's history",
-            format_pg_lsn(live_begin),
-            format_pg_lsn(begin),
-        ),
-        begin if begin != live_begin => tracing::warn!(
-            target: "walshadow",
-            stored_timeline,
-            stored_begin = %format_pg_lsn(begin),
-            live_begin = %format_pg_lsn(live_begin),
-            "--ignore-cursor adopts a branch that begins somewhere else",
-        ),
-        _ => {}
-    }
+    check_branch_begin(
+        stored_timeline,
+        stored_begin,
+        live_begin,
+        args.ignore_cursor,
+    )?;
     if start_timeline != ident.timeline {
         tracing::info!(
             target: "walshadow",
@@ -611,7 +692,7 @@ async fn session_body(
         Duration::from_millis(50),
     )
     .await
-    .with_context(|| format!("bind walsender at {walsender_addr}"))?;
+    .context(format!("bind walsender at {walsender_addr}"))?;
     tasks.adopt("walsender listener", walsender_task);
     tracing::info!(target: "walshadow", addr = %walsender_addr, "walsender listening");
     stream.set_bytes_sink(Box::new(walshadow::shadow_stream::ShadowStreamSink::new(
@@ -678,7 +759,7 @@ async fn session_body(
         let emitter = match ch_config.as_ref() {
             Some(_) => Some(finish_ch_config(
                 EmitterConfig::for_database(&merged, name)
-                    .with_context(|| format!("parse ch config for database {name}"))?,
+                    .context(format!("parse ch config for database {name}"))?,
                 args,
             )),
             None => None,
@@ -706,7 +787,7 @@ async fn session_body(
     if stand_in.is_some() {
         tokio::fs::write(args.spill_dir.join(ATTACH_MARKER), b"")
             .await
-            .with_context(|| format!("mark {} as attaching", args.spill_dir.display()))?;
+            .context(format!("mark {} as attaching", args.spill_dir.display()))?;
         let source_sql = feed
             .sql_client()
             .await
@@ -717,16 +798,13 @@ async fn session_body(
             .context("source WAL position for the absent database")?;
         let visible_at = walshadow::pg::parse_pg_lsn(visible_at.get::<_, &str>(0))
             .context("parse source WAL position")?;
+        let dbname = &source_conn.dbname;
+        let absent = format!("database {dbname} is configured but not on the source");
         let oid = *list_databases(source_sql)
             .await
             .context("list source databases")?
-            .get(source_conn.dbname.as_str())
-            .with_context(|| {
-                format!(
-                    "database {} is configured but not on the source",
-                    source_conn.dbname
-                )
-            })?;
+            .get(dbname.as_str())
+            .context(absent)?;
         pending_dbs.push(PendingDatabase {
             oid,
             name: source_conn.dbname.clone(),
@@ -767,9 +845,8 @@ async fn session_body(
                 continue;
             }
             let (name, emitter, conninfo) = link_for(index)?;
-            let source_oid = *source_dbs
-                .get(name.as_str())
-                .with_context(|| format!("database {name} is configured but not on the source"))?;
+            let absent = format!("database {name} is configured but not on the source");
+            let source_oid = *source_dbs.get(name.as_str()).context(absent)?;
             match shadow_dbs.get(name.as_str()) {
                 Some(&oid) if oid == source_oid => {
                     *link = Some(
@@ -793,10 +870,10 @@ async fn session_body(
                     let dir = args.spill_dir.join(format!("db-{source_oid}"));
                     tokio::fs::create_dir_all(&dir)
                         .await
-                        .with_context(|| format!("create {}", dir.display()))?;
+                        .context(format!("create {}", dir.display()))?;
                     tokio::fs::write(dir.join(ATTACH_MARKER), b"")
                         .await
-                        .with_context(|| format!("mark {} as attaching", dir.display()))?;
+                        .context(format!("mark {} as attaching", dir.display()))?;
                     tracing::warn!(
                         target: "walshadow",
                         database = %name,
@@ -867,11 +944,11 @@ async fn session_body(
             };
             let client = open_source_sql_client(&source_conn, &conn.name)
                 .await
-                .with_context(|| format!("source sql for database {}", conn.name))?;
+                .context(format!("source sql for database {}", conn.name))?;
             report.errors.extend(
                 walshadow::preflight::mapped_relations(&client, cfg)
                     .await
-                    .with_context(|| format!("pre-flight probe for database {}", conn.name))?,
+                    .context(format!("pre-flight probe for database {}", conn.name))?,
             );
         }
         report
@@ -1013,7 +1090,7 @@ async fn session_body(
             let dir = args.spill_dir.join(format!("db-{}", conn.oid));
             tokio::fs::create_dir_all(&dir)
                 .await
-                .with_context(|| format!("create descriptor log dir {}", dir.display()))?;
+                .context(format!("create descriptor log dir {}", dir.display()))?;
             dir
         };
         desc_logs.push(
@@ -1111,7 +1188,8 @@ async fn session_body(
         // concurrent backup pass
         let pipeline_budget =
             walshadow::pipeline::build_budget(&emitter_cfg, emitter_cfg.decoder_pool_size)
-                .map_err(|e| anyhow::anyhow!("memory budget: {e}"))?;
+                .map_err(anyhow::Error::msg)
+                .context("memory budget")?;
         let mut dbs: Vec<Arc<SourceDb>> = Vec::with_capacity(db_conns.len());
         let mut applicators: HashMap<Oid, walshadow::ch_ddl::DdlApplicator> = HashMap::new();
         let mut backfillers: HashMap<Oid, Arc<dyn walshadow::opt_in::Backfiller>> = HashMap::new();
@@ -1120,6 +1198,7 @@ async fn session_body(
             let built = build_source_db(SourceDbInputs {
                 args,
                 conn,
+                cfg: conn.emitter.clone().expect("[ch] present"),
                 primary: i == primary_index,
                 desc_log: &desc_logs[i],
                 spill_dir: if conn.name == source_conn.dbname {
@@ -1140,7 +1219,7 @@ async fn session_body(
                 tasks: &mut tasks,
             })
             .await
-            .with_context(|| format!("wire source database {}", conn.name))?;
+            .context(format!("wire source database {}", conn.name))?;
             if i == primary_index {
                 // Seeded + CLI values the initial batcher/inserter run with;
                 // they track the watch channel live thereafter
@@ -1152,17 +1231,11 @@ async fn session_body(
                 emitter_cfg.conn.compression = rc.conn.compression;
                 emitter_cfg.retry.max_attempts = rc.retry_max_attempts;
             }
-            if let Some(applicator) = built.applicator {
-                applicators.insert(conn.oid, applicator);
-            }
-            if let Some(backfiller) = built.backfiller.clone() {
-                backfillers.insert(conn.oid, backfiller as _);
-                copy_backfillers.insert(conn.oid, built.backfiller.expect("just cloned"));
-            }
-            if let Some(resolver) = &built.db.resolver {
-                resolvers.push(resolver.clone());
-                resolvers_by_db.insert(conn.oid, resolver.clone());
-            }
+            applicators.insert(conn.oid, built.applicator);
+            backfillers.insert(conn.oid, built.backfiller.clone() as _);
+            copy_backfillers.insert(conn.oid, built.backfiller);
+            resolvers.push(built.resolver.clone());
+            resolvers_by_db.insert(conn.oid, built.resolver);
             dbs.push(built.db);
         }
         // SIGHUP and `ctl reload` republish every database's scope
@@ -1384,6 +1457,7 @@ async fn session_body(
                 args.retention_bytes,
                 shadow_conninfo.clone(),
                 shadow_replay_lsn.clone(),
+                DEFAULT_TRIM_INTERVAL,
             ),
         );
     }
@@ -1397,38 +1471,13 @@ async fn session_body(
     // attachment fails startup: catalog-boundary holds require a live wire,
     // and archive-only operation can't stop publication at a mid-segment
     // commit (restore_command must never observe unreleased bytes).
-    {
-        let timeout = Duration::from_secs(args.walsender_connect_timeout);
-        let start = Instant::now();
-        loop {
-            let agg = shadow_state.lock().await.aggregate();
-            if agg.active_connections > 0 {
-                break;
-            }
-            // `accepted` separates "shadow never dialed" from "shadow dialed
-            // and stalled in the handshake" — the latter reads as the former
-            // without it, since only START_REPLICATION registers a connection
-            anyhow::ensure!(
-                start.elapsed() < timeout,
-                "no walreceiver streaming from walsender {walsender_addr} within \
-                 {}s (accepted {}, none sent START_REPLICATION); catalog-boundary \
-                 holds require a live wire — point shadow's primary_conninfo here \
-                 or raise --walsender-connect-timeout",
-                args.walsender_connect_timeout,
-                agg.accepted_total,
-            );
-            or_signal(shutdown, async {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                Ok(())
-            })
-            .await?;
-        }
-        tracing::info!(
-            target: "walshadow",
-            wait = ?start.elapsed(),
-            "walsender connected — starting pump",
-        );
-    }
+    await_walreceiver(
+        &shadow_state,
+        walsender_addr,
+        Duration::from_secs(args.walsender_connect_timeout),
+        shutdown,
+    )
+    .await?;
 
     let mut source_recovery = SourceRecovery {
         system_id: live_identity.system_id,
@@ -1816,7 +1865,7 @@ async fn session_body(
             res = &mut fsync_task => return Err(task_stopped("segment fsync", res, &fsync_fatal)),
             res = &mut gc_task => return Err(task_stopped("descriptor log gc", res, &gc_fatal)),
             // Surfaced by the check after the crossing step
-            () = pipeline_handle.fatal.wait() => None,
+            _ = pipeline_handle.fatal.wait() => None,
             // Idle tick so metrics/cursor keep tracking, and so a `paused` flip
             // is picked up promptly.
             _ = tokio::time::sleep(metrics_tick) => None,
@@ -2569,5 +2618,111 @@ mod tests {
             "{err}"
         );
         tasks.shutdown().await.expect("idle task aborts cleanly");
+    }
+
+    #[tokio::test]
+    async fn task_stopped_prefers_fatal_over_join_result() {
+        let fatal = walshadow::pipeline::Fatal::new();
+        let exited = task_stopped("gc", Ok(()), &fatal).to_string();
+        assert_eq!(exited, "gc task exited");
+        let panicked = tokio::spawn(async { panic!("boom") }).await;
+        let failed = task_stopped("gc", panicked, &fatal).to_string();
+        assert!(failed.starts_with("gc task failed") && failed.contains("boom"));
+        fatal.set("disk gone".into());
+        let panicked = tokio::spawn(async { panic!("boom") }).await;
+        assert_eq!(
+            task_stopped("gc", panicked, &fatal).to_string(),
+            "gc failed: disk gone"
+        );
+    }
+
+    #[tokio::test]
+    async fn walreceiver_wait_names_the_walsender_when_none_attaches() {
+        let state = Mutex::new(walshadow::shadow_stream::ShadowStreamState::new(
+            1,
+            "1".into(),
+            0,
+            1,
+        ));
+        let addr = "127.0.0.1:5555".parse().unwrap();
+        let shutdown = CancellationToken::new();
+        let err = await_walreceiver(&state, addr, Duration::ZERO, &shutdown)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("walsender 127.0.0.1:5555 within 0s (accepted 0"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn followed_databases_fit_bridge_seats() {
+        assert_eq!(followed_databases(None, "app").unwrap(), ["app"]);
+        let seats = walshadow::bridge::MAX_BRIDGE_DATABASES;
+        let mut cfg = EmitterConfig {
+            databases: (0..seats).map(|i| format!("db{i}")).collect(),
+            ..EmitterConfig::default()
+        };
+        assert_eq!(
+            followed_databases(Some(&cfg), "app").unwrap(),
+            cfg.databases
+        );
+        cfg.databases.push("one-more".into());
+        assert!(followed_databases(Some(&cfg), "app").is_err());
+    }
+
+    #[test]
+    fn boot_manifest_refuses_foreign_and_unreadable_unless_overridden() {
+        let spill = std::path::Path::new("/spill");
+        let identity = |system_id| manifest::SourceIdentity {
+            system_id,
+            timeline: 1,
+            timeline_begin: Pos::ZERO,
+        };
+        let foreign = || manifest::ManifestError::ForeignSource {
+            stored: identity(1),
+            live: identity(2),
+        };
+        assert!(boot_manifest(Ok(None), false, spill).unwrap().is_none());
+        let err = boot_manifest(Err(foreign()), true, spill).unwrap_err();
+        assert!(err.to_string().contains("another source"), "{err}");
+        let unreadable = || Err(manifest::ManifestError::Version(99));
+        let err = boot_manifest(unreadable(), false, spill).unwrap_err();
+        assert!(
+            err.to_string().contains("--ignore-cursor / --start-lsn"),
+            "{err}"
+        );
+        assert!(boot_manifest(unreadable(), true, spill).unwrap().is_none());
+    }
+
+    #[test]
+    fn start_branch_needs_lineage_unless_cursor_ignored() {
+        let promoted = || TimelineHistory::parse(2, b"1\t0/3000000\tpromoted\n").unwrap();
+        let aligned = Pos::new(0x400_0000);
+        let mut history = promoted();
+        assert_eq!(start_branch(&mut history, 2, aligned, 2, false).unwrap(), 2);
+        assert_eq!(history.entries().len(), 2);
+        let err = start_branch(&mut history, 3, aligned, 2, false).unwrap_err();
+        assert!(
+            err.to_string().starts_with("timeline_not_descendant"),
+            "{err}"
+        );
+        assert_eq!(start_branch(&mut history, 3, aligned, 2, true).unwrap(), 2);
+        assert_eq!(
+            history.entries().len(),
+            1,
+            "re-baselined onto a root history"
+        );
+    }
+
+    #[test]
+    fn branch_begin_refuses_sibling_unless_cursor_ignored() {
+        assert!(check_branch_begin(2, 0, 0x300_0000, false).is_ok());
+        assert!(check_branch_begin(1, 0, 0, false).is_ok());
+        assert!(check_branch_begin(2, 0x300_0000, 0x300_0000, false).is_ok());
+        let err = check_branch_begin(2, 0x300_0000, 0x500_0000, false).unwrap_err();
+        assert!(err.to_string().starts_with("sibling_branch"), "{err}");
+        assert!(check_branch_begin(2, 0x300_0000, 0x500_0000, true).is_ok());
     }
 }

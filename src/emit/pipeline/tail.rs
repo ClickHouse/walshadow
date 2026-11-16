@@ -71,10 +71,7 @@ impl TailParts {
     ) -> Result<(), String> {
         flush_and_prove(&msg_tx, &ack, through, fatal).await?;
         self.close(msg_tx, ack).await;
-        if let Some(msg) = fatal.message() {
-            return Err(msg);
-        }
-        Ok(())
+        fatal.message().map_or(Ok(()), Err)
     }
 }
 
@@ -93,16 +90,12 @@ async fn flush_and_prove(
     // Prefer concurrent fatal over successful completion
     tokio::select! {
         biased;
-        _ = fatal.wait() => {
-            return Err(fatal.message().unwrap_or_else(|| "tail fatal during flush".into()));
-        }
+        msg = fatal.wait() => return Err(msg),
         r = reply_rx => r.map_err(|_| "batcher dropped flush ack".to_string())?,
     }
     tokio::select! {
         biased;
-        _ = fatal.wait() => {
-            return Err(fatal.message().unwrap_or_else(|| "tail fatal during drain".into()));
-        }
+        msg = fatal.wait() => return Err(msg),
         r = ack.wait_through(through) => r.map_err(|e| format!("tail drain: {e}"))?,
     }
     Ok(())
@@ -355,5 +348,44 @@ mod tests {
             .await
             .unwrap();
         drop(ack);
+    }
+
+    #[tokio::test]
+    async fn closed_batcher_fails_flush_with_fallback_reason() {
+        let tail = OwnedTail::null();
+        let (msg_tx, msg_rx) = mpsc::channel(1);
+        drop(msg_rx);
+        let e = flush_and_prove(&msg_tx, &tail.ack, 0, &tail.fatal).await;
+        assert_eq!(e, Err("tail closed before flush".into()));
+        tail.quiesce().await;
+    }
+
+    #[tokio::test]
+    async fn fatal_fails_checkpoint_and_finish_under_leg_context() {
+        let tail = OwnedTail::null();
+        tail.fatal.set("ch down".into());
+        assert_eq!(tail.checkpoint(0).await, Err("test: ch down".into()));
+        assert_eq!(tail.finish(0).await, Err("test: ch down".into()));
+    }
+
+    #[tokio::test]
+    async fn unreachable_destination_fails_spawn_under_leg_context() {
+        let cfg = crate::emit::ch_emitter::EmitterConfig {
+            conn: crate::emit::ch_emitter::InstanceConfig {
+                host: "127.0.0.1".into(),
+                port: 1,
+                ..Default::default()
+            },
+            retry: crate::emit::ch_emitter::RetryConfig {
+                max_attempts: 0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let dest = DestEmitter::new(Arc::new(cfg), None);
+        let spawned =
+            OwnedTail::spawn(dest, 1, Arc::default(), Fatal::new(), None, None, "leg").await;
+        let e = spawned.err().expect("dead port fails spawn");
+        assert!(e.starts_with("leg: spawn insert tail: "), "{e}");
     }
 }

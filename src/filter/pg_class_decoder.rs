@@ -143,10 +143,7 @@ impl PgClassRow {
             |off: usize| Some(u32::from_le_bytes(cols.get(off..off + 4)?.try_into().ok()?));
         Some(Self {
             oid: u32_at(PG_CLASS_OID_OFFSET)?,
-            relname: cols
-                .get(PG_CLASS_RELNAME_OFFSET..PG_CLASS_RELNAME_OFFSET + NAME_LEN)?
-                .try_into()
-                .ok()?,
+            relname: *cols.get(PG_CLASS_RELNAME_OFFSET..)?.first_chunk()?,
             relnamespace: u32_at(PG_CLASS_RELNAMESPACE_OFFSET)?,
             relfilenode: u32_at(PG_CLASS_RELFILENODE_OFFSET)?,
         })
@@ -770,5 +767,34 @@ mod tests {
         };
         block.image = std::borrow::Cow::Owned(page_with(&[(2608, 40000), (2615, 41000)]));
         assert_eq!(decode_pg_class_tuple(&rec, 0, MAGIC), decoded(2615, 41000));
+        // Image without a new-tuple offnum
+        rec.main_data = std::borrow::Cow::Owned(Vec::new());
+        assert_eq!(
+            decode_pg_class_tuple(&rec, 0, MAGIC),
+            DecodeOutcome::Undecoded
+        );
+    }
+
+    #[test]
+    fn ops_without_new_tuple_stay_undecoded() {
+        let data = pg_class_insert_block(2615, 30000);
+        let delete = record(RmId::Heap, HEAP_DELETE_OP, vec![0; 8], data.clone());
+        assert_eq!(
+            decode_pg_class_tuple(&delete, 0, MAGIC),
+            DecodeOutcome::Undecoded
+        );
+        let lock = record(RmId::Heap, 0x60, vec![0; 8], data);
+        assert_eq!(tuple_slots(&lock), TupleSlots::default());
+    }
+
+    #[test]
+    fn t_hoff_past_block_data_stays_undecoded() {
+        let mut v = pg_class_insert_block(2615, 30000);
+        v[4] = 255;
+        let rec = record(RmId::Heap, HEAP_INSERT_OP, Vec::new(), v);
+        assert_eq!(
+            decode_pg_class_tuple(&rec, 0, MAGIC),
+            DecodeOutcome::Undecoded
+        );
     }
 }

@@ -236,6 +236,21 @@ mod tests {
         assert!(v.to_text().as_str().starts_with('?'));
     }
 
+    /// RFC 5952 as PG applies it: a lone zero group stays, the first
+    /// longest run collapses
+    #[test]
+    fn inet_ipv6_collapses_only_the_first_longest_zero_run() {
+        let v6 = |groups: [u16; 8]| {
+            let mut body = vec![PGSQL_AF_INET6, 128];
+            groups
+                .iter()
+                .for_each(|g| body.extend_from_slice(&g.to_be_bytes()));
+            decode_inet(&body, false).unwrap().to_text()
+        };
+        assert_eq!(v6([1, 0, 1, 0, 0, 1, 1, 1]).as_str(), "1:0:1::1:1:1");
+        assert_eq!(v6([1, 0, 0, 1, 0, 0, 1, 1]).as_str(), "1::1:0:0:1:1");
+    }
+
     #[test]
     fn inet_ipv6_full_expansion_no_collapse() {
         let mut body = vec![PGSQL_AF_INET6, 128];

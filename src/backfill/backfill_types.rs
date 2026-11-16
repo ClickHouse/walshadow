@@ -43,6 +43,8 @@ pub struct PassContext {
     /// Source PG major: picks the backup's pg_multixact offsets width
     pub source_major: u32,
     pub checkpoint: crate::backfill::backup_checkpoint::BackupCheckpoint,
+    /// Interval between walk and gap replay checkpoints
+    pub checkpoint_period: std::time::Duration,
 }
 
 /// Walk-phase counters a resumed pass reports rather than re-deriving from

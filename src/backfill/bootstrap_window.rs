@@ -194,7 +194,7 @@ impl Leg {
                 drain_batch_bytes: cfg.dest.current().drain_batch_bytes,
                 ..XactBufferConfig::new(spill)
             })
-            .map_err(|e| anyhow::anyhow!("bootstrap window leg: xact buffer: {e}"))?,
+            .context("bootstrap window leg: xact buffer")?,
         ));
         buffer.lock().await.clear_scratch_dir().ok();
 
@@ -339,7 +339,7 @@ async fn run_live(
         .await
         .context("bootstrap window leg: START_REPLICATION")?;
     let mut stream = WalStream::builder(timeline, WAL_SEG_SIZE, Pos::new(begin))
-        .map_err(|e| anyhow::anyhow!("bootstrap window leg: WalStream: {e}"))?;
+        .context("bootstrap window leg: WalStream")?;
     stream.filter_mut().set_target_db(leg.db_oid);
     let mut stream = stream.start();
     let mut seg_sink = DropSegments;
@@ -474,6 +474,17 @@ mod tests {
             log.descriptor_at(d.rfn, read_start(from) - 1),
             LookupResult::NotCovered
         ));
+    }
+
+    #[tokio::test]
+    async fn scratch_log_below_a_file_fails_with_its_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("file");
+        tokio::fs::write(&file, b"").await.unwrap();
+        let err = seed_scratch_log(&file.join("log"), ident(), &CatalogMap::new(), 0)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().starts_with("create "), "{err}");
     }
 
     /// TOAST records decode but do not route directly

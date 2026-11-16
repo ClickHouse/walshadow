@@ -32,13 +32,6 @@ use std::time::Duration;
 
 use walshadow::mapping::NamespaceMapping;
 
-fn skip_gate() -> bool {
-    if !fx::tools::requirements_available() {
-        return true;
-    }
-    false
-}
-
 struct Drill {
     source: fx::ClusterGuard,
     shadow: fx::ClusterGuard,
@@ -137,7 +130,7 @@ fn load(c: &std::sync::atomic::AtomicU64) -> u64 {
 /// cover it and stop the stream.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pending_timeline_decodes_the_post_ddl_row() {
-    if skip_gate() {
+    if !fx::tools::requirements_available() {
         return;
     }
     let mut drill = build_drill(
@@ -204,7 +197,7 @@ async fn pending_timeline_decodes_the_post_ddl_row() {
 /// so both land in the batch instead of collapsing onto one position.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn relation_born_in_xact_keeps_a_slot_per_boundary() {
-    if skip_gate() {
+    if !fx::tools::requirements_available() {
         return;
     }
     let mut drill = build_drill(
@@ -260,7 +253,7 @@ async fn relation_born_in_xact_keeps_a_slot_per_boundary() {
 /// nor CH.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn savepoint_rollback_drops_its_pending_slots() {
-    if skip_gate() {
+    if !fx::tools::requirements_available() {
         return;
     }
     let mut drill = build_drill(

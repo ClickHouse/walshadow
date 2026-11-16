@@ -97,8 +97,8 @@ impl BackupSource for DirectSource {
             bail!("DirectSource: BASE_BACKUP pump task panicked: {e:#}");
         }
 
-        let start = start.ok_or_else(|| anyhow::anyhow!("DirectSource: no StartInfo emitted"))?;
-        let end = end.ok_or_else(|| anyhow::anyhow!("DirectSource: no EndInfo emitted"))?;
+        let start = start.context("DirectSource: no StartInfo emitted")?;
+        let end = end.context("DirectSource: no EndInfo emitted")?;
         Ok((start, end))
     }
 }

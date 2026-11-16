@@ -429,7 +429,7 @@ mod tests {
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub(crate) enum Event {
-        Begin { path: PathBuf, action: &'static str },
+        Begin { path: PathBuf, action: String },
         Chunk { len: usize },
         End { path: PathBuf },
     }
@@ -482,11 +482,7 @@ mod tests {
             };
             self.events.lock().unwrap().push(Event::Begin {
                 path: meta.path.clone(),
-                action: match action {
-                    FileAction::Keep => "Keep",
-                    FileAction::Skip => "Skip",
-                    FileAction::Tap(_) => "Tap",
-                },
+                action: format!("{action:?}"),
             });
             if !action.is_tap() {
                 self.events.lock().unwrap().push(Event::End {
@@ -535,10 +531,63 @@ mod tests {
         assert_eq!(kinds[1].path, PathBuf::from("pg_replslot"));
         assert!(matches!(kinds[1].kind, FileKind::Dir));
         assert_eq!(kinds[2].path, PathBuf::from("pg_tblspc/16384"));
-        let FileKind::Symlink { target } = &kinds[2].kind else {
-            panic!("expected Symlink, got {:?}", kinds[2].kind);
-        };
-        assert_eq!(target, &PathBuf::from("/srv/ts/a"));
+        assert_eq!(
+            kinds[2].kind,
+            FileKind::Symlink {
+                target: PathBuf::from("/srv/ts/a")
+            }
+        );
+    }
+
+    #[test]
+    fn tar_entry_meta_ignores_root_and_special_entries_and_rejects_bare_symlinks() {
+        let entry = |path, kind| tarball::Entry::new(path, kind, 0, 0o700, 0);
+        assert!(
+            tar_entry_meta(&entry("/", Kind::Directory))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            tar_entry_meta(&entry("dev/null", Kind::Other))
+                .unwrap()
+                .is_none()
+        );
+        let err = tar_entry_meta(&entry("pg_tblspc/1", Kind::SymbolicLink)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    /// Kept symlinks replace whatever the path held; a repeated dir is no error
+    #[tokio::test]
+    async fn pump_tar_lands_kept_symlinks_over_repeated_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut link = tarball::Entry::new("pg_tblspc/16384", Kind::SymbolicLink, 0, 0o777, 0);
+        link.link = "/srv/ts/a".into();
+        let mut w = tarball::Writer::new(Vec::new());
+        for e in [
+            tarball::Entry::new("./", Kind::Directory, 0, 0o700, 0),
+            tarball::Entry::new("pg_tblspc", Kind::Directory, 0, 0o700, 0),
+            tarball::Entry::new("pg_tblspc", Kind::Directory, 0, 0o700, 0),
+            link.clone(),
+            link,
+        ] {
+            w.append(&e, tokio::io::empty()).await.unwrap();
+        }
+        let bytes = w.finish().await.unwrap();
+        let recording = Arc::new(RecordingSink::default());
+        let target = PumpTarget::new(
+            tmp.path().to_path_buf(),
+            Arc::new(recording.clone()),
+            Arc::new(PumpStats::default()),
+        );
+        pump_tar_to_sink(&mut tarball::Reader::new(bytes.as_slice()), &target)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_link(tmp.path().join("pg_tblspc/16384")).unwrap(),
+            PathBuf::from("/srv/ts/a")
+        );
+        assert_eq!(recording.tapped.lock().unwrap().len(), 0);
+        assert_eq!(recording.events.lock().unwrap().len(), 8);
     }
 
     /// PG never emits `..` but a hostile / corrupt tar must not escape data_dir

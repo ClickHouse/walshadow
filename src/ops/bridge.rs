@@ -1519,6 +1519,100 @@ pub(crate) mod tests {
         assert!(bridge.is_up());
     }
 
+    /// Worker answers the daemon cannot frame: each a protocol error
+    #[tokio::test(flavor = "current_thread")]
+    async fn malformed_answers_are_protocol_errors() {
+        let ok = |parts: &[&[u8]]| [&[0u8][..], &parts.concat()].concat();
+        let scan_head = |nrows: u32, ncols: u16| {
+            ok(&[
+                &0u64.to_be_bytes(),
+                &0u64.to_be_bytes(),
+                &0u32.to_be_bytes(),
+                &0u32.to_be_bytes(),
+                &nrows.to_be_bytes(),
+                &ncols.to_be_bytes(),
+            ])
+        };
+        let one_value = |tag: u8| ok(&[&1u32.to_be_bytes(), &[tag], &[0; 8]]);
+        let (_tmp, path) = spawn_worker(vec![
+            Some(hello_body(PROTO_VERSION, PROJECTION_VERSION)),
+            Some(ok(&[&2u32.to_be_bytes()])),
+            Some(one_value(9)),
+            Some(scan_head(0, 3)),
+            Some(scan_head(1000, 10)),
+        ]);
+        let bridge = Bridge::connect(&path).await.unwrap();
+        fn protocol<T>(r: Result<T, BridgeError>) -> String {
+            r.err().unwrap().to_string()
+        }
+        let fetch = || bridge.fetch_toast(1, &[(7, 1)], 0);
+        assert!(protocol(fetch().await).contains("answered 2 values for 1 asked"));
+        assert!(protocol(fetch().await).contains("result tag 9"));
+        let scan = || bridge.scan(Catalog::Class, 0, &[]);
+        assert!(protocol(scan().await).contains("projected 3 columns, client expects 10"));
+        assert!(protocol(scan().await).contains("1000 rows do not fit"));
+        assert_eq!(bridge.stats.reconnects.load(Ordering::Relaxed), 0);
+    }
+
+    /// Bad frames drop the socket; the one replay after reconnect fails too
+    #[tokio::test(flavor = "current_thread")]
+    async fn bad_frame_then_bad_status_after_reconnect() {
+        let (_tmp, path) = spawn_worker(vec![
+            Some(hello_body(PROTO_VERSION, PROJECTION_VERSION)),
+            Some(Vec::new()),
+            Some(hello_body(PROTO_VERSION, PROJECTION_VERSION)),
+            Some(vec![7]),
+        ]);
+        let bridge = Bridge::connect(&path).await.unwrap();
+        let err = bridge.replay_lsn().await.unwrap_err();
+        assert!(
+            matches!(&err, BridgeError::Protocol(m) if m == "response status 7"),
+            "{err:?}"
+        );
+        assert_eq!(bridge.stats.reconnects.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reconnect_refuses_changed_worker_identity() {
+        let mut other_db = hello_body(PROTO_VERSION, PROJECTION_VERSION);
+        let n = other_db.len();
+        other_db[n - 4..].copy_from_slice(&16385u32.to_be_bytes());
+        let (_tmp, path) = spawn_worker(vec![
+            Some(hello_body(PROTO_VERSION, PROJECTION_VERSION)),
+            None,
+            Some(other_db),
+        ]);
+        let bridge = Bridge::connect(&path).await.unwrap();
+        let err = bridge.replay_lsn().await.unwrap_err();
+        assert!(err.to_string().contains("worker identity changed"), "{err}");
+    }
+
+    #[test]
+    fn row_parsers_name_the_bad_column() {
+        let row = |cols: &[Option<&str>]| -> Vec<Option<String>> {
+            cols.iter().map(|c| c.map(str::to_owned)).collect()
+        };
+        let class = |cols: &[Option<&str>]| ClassRow::parse(&row(cols)).unwrap_err().to_string();
+        let good = ["1", "2", "t", "r", "p", "d", "0", "0", "1", "f"].map(Some);
+        let with = |i: usize, v: Option<&'static str>| {
+            let mut r = good;
+            r[i] = v;
+            r
+        };
+        assert!(class(&good[..3]).contains("column 3 missing"));
+        assert!(class(&with(0, None)).contains("column 0 is null"));
+        assert!(class(&with(0, Some("x"))).contains(r#"column 0 unparsable: "x""#));
+        assert!(class(&with(3, Some("rr"))).contains("column 3 unparsable"));
+        assert!(class(&with(9, Some("y"))).contains("column 9 unparsable"));
+        let index = row(&["1", "2", "t", "f", "1 x"].map(Some));
+        let err = IndexRow::parse(&index).unwrap_err().to_string();
+        assert!(err.contains(r#"column 4 unparsable: "1 x""#), "{err}");
+        let mut buf = 2u32.to_be_bytes().to_vec();
+        buf.extend_from_slice(&[0xff, 0xfe]);
+        let err = Cursor::at(&buf, 0).opt_str().unwrap_err();
+        assert!(err.to_string().contains("non-UTF8"), "{err}");
+    }
+
     /// One poll sends the request, then the call drops before its answer
     #[tokio::test(flavor = "current_thread")]
     async fn cancelled_call_leaves_no_answer_for_the_next() {

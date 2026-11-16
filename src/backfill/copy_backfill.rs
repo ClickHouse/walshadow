@@ -379,6 +379,13 @@ impl Ledger {
         self.persist().await
     }
 
+    fn copy_cursor(&self, rel: &RelName) -> Option<CopyCursor> {
+        let Phase::Pending { copy } = self.entries.get(rel)?.phase else {
+            return None;
+        };
+        copy
+    }
+
     fn pending_count(&self) -> u64 {
         self.entries.values().filter(|r| !r.done()).count() as u64
     }
@@ -587,13 +594,13 @@ pub async fn copy_rows_into(
             slab_bytes = 0;
             tx.send(std::mem::take(&mut slab))
                 .await
-                .map_err(|_| anyhow::anyhow!("backfill: drain closed early"))?;
+                .context("backfill: drain closed early")?;
         }
     }
     if !slab.is_empty() {
         tx.send(slab)
             .await
-            .map_err(|_| anyhow::anyhow!("backfill: drain closed early"))?;
+            .context("backfill: drain closed early")?;
     }
     Ok(rows)
 }
@@ -630,18 +637,17 @@ pub async fn copy_toast_into(
         quote_ident(&nsp),
         quote_ident(&rel),
     );
-    let copy = client.copy_out(&sql).await.map_err(|e| {
-        if e.code() == Some(&tokio_postgres::error::SqlState::INSUFFICIENT_PRIVILEGE) {
-            anyhow::anyhow!(
+    let copy = match client.copy_out(&sql).await {
+        Err(e) if e.code() == Some(&tokio_postgres::error::SqlState::INSUFFICIENT_PRIVILEGE) => {
+            anyhow::bail!(
                 "backfill: source role cannot read {nsp}.{rel} of {}: seeding the chunk mirror \
                  needs USAGE on schema pg_toast and SELECT on its TOAST heaps; grant \
                  pg_read_all_data to the source role: {e}",
                 desc.rel_name,
             )
-        } else {
-            anyhow::Error::new(e).context("backfill: TOAST COPY out")
         }
-    })?;
+        copy => copy.context("backfill: TOAST COPY out")?,
+    };
     let stream = BinaryCopyOutStream::new(copy, &[Type::BYTEA; 4]);
     futures::pin_mut!(stream);
     let mut chunks = 0u64;
@@ -1021,32 +1027,26 @@ impl CopyBackfiller {
             });
             return;
         }
-        match mode {
-            InitialLoadMode::None => {}
-            InitialLoadMode::Copy => {
-                // Caller releases live apply past `S` once this returns
-                if let Err(e) = self.seed_toast(desc, s_lsn).await {
-                    tracing::error!(
-                        target: "walshadow::backfill",
-                        qname = %rel,
-                        error = %format!("{e:#}"),
-                        "backfill failed; entry stays pending (re-COPY on next boot)",
-                    );
-                    let mut inner = self.inner.lock().await;
-                    inner.active.remove(&rel);
-                    self.refresh_gauges(&inner.ledger);
-                    return;
-                }
-                let this = self.clone();
-                let desc = desc.clone();
-                tokio::spawn(async move { this.run(desc, s_lsn).await });
+        if spawn_pass {
+            let this = self.clone();
+            tokio::spawn(async move { this.run_backup_pass(mode).await });
+        } else if mode == InitialLoadMode::Copy {
+            // Caller releases live apply past `S` once this returns
+            if let Err(e) = self.seed_toast(desc, s_lsn).await {
+                tracing::error!(
+                    target: "walshadow::backfill",
+                    qname = %rel,
+                    error = %format!("{e:#}"),
+                    "backfill failed; entry stays pending (re-COPY on next boot)",
+                );
+                let mut inner = self.inner.lock().await;
+                inner.active.remove(&rel);
+                self.refresh_gauges(&inner.ledger);
+                return;
             }
-            InitialLoadMode::BaseBackup | InitialLoadMode::ObjectStore => {
-                if spawn_pass {
-                    let this = self.clone();
-                    tokio::spawn(async move { this.run_backup_pass(mode).await });
-                }
-            }
+            let this = self.clone();
+            let desc = desc.clone();
+            tokio::spawn(async move { this.run(desc, s_lsn).await });
         }
     }
 
@@ -1237,6 +1237,7 @@ impl CopyBackfiller {
             oracle: self.oracle.clone(),
             source_major: self.source_major,
             checkpoint,
+            checkpoint_period: crate::backfill::walk_barrier::WALK_CHECKPOINT_PERIOD,
         };
         let outcome = crate::backfill::backup_backfill::run_pass(&ctx, mode, reqs).await?;
         self.hold_pending(&outcome).await;
@@ -1565,11 +1566,15 @@ impl CopyBackfiller {
                     .schema_fingerprint(&rel.target.database, &rel.staging_table())
                     .await?;
                 if real_fp != staging_fp {
+                    // Swapped entry over missing staging reads as published
+                    anyhow::ensure!(
+                        self.clear_swapped(name).await,
+                        "swap clear unrecorded; staging kept for next boot"
+                    );
                     sess.drop_staging(&rel).await?;
                     if self.pending_rows.lock().await.discard_held(name) {
                         self.persist_pending().await;
                     }
-                    self.clear_swapped(name).await;
                     anyhow::bail!(
                         "destination schema changed before exchange; load discarded, entry re-pends"
                     );
@@ -1635,20 +1640,29 @@ impl CopyBackfiller {
         self.refresh_gauges(&inner.ledger);
     }
 
-    async fn clear_swapped(&self, name: &RelName) {
+    /// `false` when persist failed; entry stays swapped
+    async fn clear_swapped(&self, name: &RelName) -> bool {
         let mut inner = self.inner.lock().await;
-        if let Some(rec) = inner.ledger.entries.get_mut(name) {
-            rec.phase = Phase::Pending { copy: None };
-            if let Err(e) = inner.ledger.persist().await {
-                tracing::warn!(
-                    target: "walshadow::backfill",
-                    qname = %name,
-                    error = %e,
-                    "backfill ledger persist failed on swap clear",
-                );
-            }
+        let Some(rec) = inner.ledger.entries.get_mut(name) else {
+            return true;
+        };
+        let prior = std::mem::replace(&mut rec.phase, Phase::Pending { copy: None });
+        let persisted = inner.ledger.persist().await;
+        if let Err(e) = &persisted {
+            tracing::warn!(
+                target: "walshadow::backfill",
+                qname = %name,
+                error = %e,
+                "backfill ledger persist failed on swap clear",
+            );
+            inner
+                .ledger
+                .entries
+                .get_mut(name)
+                .expect("just present")
+                .phase = prior;
         }
-        self.refresh_gauges(&inner.ledger);
+        persisted.is_ok()
     }
 
     async fn run(self: Arc<Self>, desc: Arc<RelDescriptor>, s_lsn: Pos<Snapshot>) {
@@ -1947,11 +1961,7 @@ impl CopyBackfiller {
     }
 
     async fn copy_cursor(&self, rel: &RelName) -> Option<CopyCursor> {
-        let inner = self.inner.lock().await;
-        let Phase::Pending { copy } = inner.ledger.entries.get(rel)?.phase else {
-            return None;
-        };
-        copy
+        self.inner.lock().await.ledger.copy_cursor(rel)
     }
 
     /// Cursor loss only costs a repeated chunk, so a failed persist logs
@@ -2168,6 +2178,141 @@ mod tests {
             decode_field(WireKind::Text, 0, &[0xFF, 0xFE]).unwrap(),
             ColumnValue::Bytea(vec![0xFF, 0xFE]),
         );
+        assert_eq!(
+            decode_field(WireKind::CastText, 1007, &[0xFF]).unwrap(),
+            ColumnValue::Bytea(vec![0xFF]),
+        );
+        assert!(decode_field(WireKind::NumericText, 0, &[0xFF]).is_err());
+    }
+
+    /// PostgreSQL binary COPY uses each type's `typsend` format
+    #[test]
+    fn every_native_kind_decodes_its_send_bytes() {
+        let uuid = *b"0123456789abcdef";
+        for (oid, kind, raw, want) in [
+            (BOOLOID, WireKind::Bool, vec![0], ColumnValue::Bool(false)),
+            (
+                CHAROID,
+                WireKind::Char,
+                vec![b'x'],
+                ColumnValue::Char(b'x' as i8),
+            ),
+            (
+                INT2OID,
+                WireKind::Int2,
+                (-2i16).to_be_bytes().to_vec(),
+                ColumnValue::Int2(-2),
+            ),
+            (
+                INT4OID,
+                WireKind::Int4,
+                5i32.to_be_bytes().to_vec(),
+                ColumnValue::Int4(5),
+            ),
+            (
+                MONEYOID,
+                WireKind::Int8,
+                1234i64.to_be_bytes().to_vec(),
+                ColumnValue::Int8(1234),
+            ),
+            (
+                XIDOID,
+                WireKind::Oid,
+                77u32.to_be_bytes().to_vec(),
+                ColumnValue::Oid(77),
+            ),
+            (
+                PG_LSNOID,
+                WireKind::Oid8,
+                (1u64 << 40).to_be_bytes().to_vec(),
+                ColumnValue::Oid8(1 << 40),
+            ),
+            (
+                FLOAT4OID,
+                WireKind::Float4,
+                1.5f32.to_be_bytes().to_vec(),
+                ColumnValue::Float4(1.5),
+            ),
+            (
+                FLOAT8OID,
+                WireKind::Float8,
+                (-0.25f64).to_be_bytes().to_vec(),
+                ColumnValue::Float8(-0.25),
+            ),
+            (
+                DATEOID,
+                WireKind::Date,
+                (-1i32).to_be_bytes().to_vec(),
+                ColumnValue::Date(-1),
+            ),
+            (
+                TIMEOID,
+                WireKind::Time,
+                3_600_000_000i64.to_be_bytes().to_vec(),
+                ColumnValue::Time(3_600_000_000),
+            ),
+            (
+                TIMESTAMPOID,
+                WireKind::Timestamp,
+                9i64.to_be_bytes().to_vec(),
+                ColumnValue::Timestamp(9),
+            ),
+            (
+                TIMESTAMPTZOID,
+                WireKind::TimestampTz,
+                10i64.to_be_bytes().to_vec(),
+                ColumnValue::TimestampTz(10),
+            ),
+            (
+                UUIDOID,
+                WireKind::Uuid,
+                uuid.to_vec(),
+                ColumnValue::Uuid(uuid),
+            ),
+            (
+                BYTEAOID,
+                WireKind::Bytea,
+                vec![0, 0xFF],
+                ColumnValue::Bytea(vec![0, 0xFF]),
+            ),
+            (
+                BPCHAROID,
+                WireKind::Text,
+                b"ab ".to_vec(),
+                ColumnValue::Text("ab ".into()),
+            ),
+            (
+                NAMEOID,
+                WireKind::Name,
+                b"rel".to_vec(),
+                ColumnValue::Name("rel".into()),
+            ),
+            (
+                JSONOID,
+                WireKind::Json,
+                b"[]".to_vec(),
+                ColumnValue::Json("[]".into()),
+            ),
+        ] {
+            assert_eq!(wire_kind(oid), Some(kind), "oid {oid}");
+            assert_eq!(decode_field(kind, oid, &raw).unwrap(), want, "oid {oid}");
+            let variable = matches!(
+                kind,
+                WireKind::Bytea | WireKind::Text | WireKind::Name | WireKind::Json
+            );
+            assert_eq!(
+                decode_field(kind, oid, &[0; 17]).is_ok(),
+                variable,
+                "oid {oid}: only fixed-width kinds reject a wrong width"
+            );
+        }
+        for oid in [OIDOID, CIDOID] {
+            assert_eq!(wire_kind(oid), Some(WireKind::Oid));
+        }
+        for oid in [OID8OID, XID8OID] {
+            assert_eq!(wire_kind(oid), Some(WireKind::Oid8));
+        }
+        assert_eq!(wire_kind(NUMERICOID), None);
     }
 
     #[tokio::test]
@@ -2348,6 +2493,67 @@ mod tests {
             corrupt.to_string().contains("orphan `__wsstg`"),
             "corrupt ledger stops boot rather than orphaning staging: {corrupt}"
         );
+
+        tokio::fs::write(
+            tmp.path().join(LEDGER_FILENAME),
+            "version = 99\nsystem_id = 7\n",
+        )
+        .await
+        .unwrap();
+        let future = Ledger::load(tmp.path(), 7).await.err().unwrap();
+        assert!(
+            future.to_string().contains("unsupported version 99"),
+            "{future}"
+        );
+
+        let unreadable = tempfile::tempdir().unwrap();
+        std::fs::create_dir(unreadable.path().join(LEDGER_FILENAME)).unwrap();
+        let unreadable = Ledger::load(unreadable.path(), 7).await.err().unwrap();
+        assert_eq!(unreadable.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn copy_cursor_advances_only_pending_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ledger = Ledger::load(tmp.path(), 7).await.unwrap();
+        let cursor = CopyCursor {
+            relfilenode: 16400,
+            next_block: 8,
+        };
+        let pending = RelName::new("app", "orders");
+        let done = RelName::new("app", "done");
+        ledger
+            .note_copy(&RelName::new("app", "absent"), cursor)
+            .await
+            .unwrap();
+        assert!(
+            !tmp.path().join(LEDGER_FILENAME).exists(),
+            "absent entry writes nothing"
+        );
+        for (rel, phase) in [
+            (&pending, Phase::Pending { copy: None }),
+            (&done, Phase::Done),
+        ] {
+            ledger.entries.insert(
+                rel.clone(),
+                LedgerRec {
+                    s_lsn: 100.into(),
+                    mode: InitialLoadMode::Copy,
+                    phase,
+                    toast_seeded: false,
+                },
+            );
+        }
+        ledger.note_copy(&pending, cursor).await.unwrap();
+        ledger.note_copy(&done, cursor).await.unwrap();
+        assert_eq!(ledger.copy_cursor(&pending), Some(cursor));
+        assert_eq!(ledger.copy_cursor(&done), None);
+        let again = Ledger::load(tmp.path(), 7).await.unwrap();
+        assert_eq!(
+            again.entries[&pending].phase,
+            Phase::Pending { copy: Some(cursor) }
+        );
+        assert_eq!(again.entries[&done].phase, Phase::Done);
     }
 
     #[tokio::test]

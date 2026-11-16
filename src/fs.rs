@@ -70,11 +70,9 @@ pub async fn sync_filesystem(dir: &Path) -> io::Result<()> {
 pub fn syncfs(f: &std::fs::File) -> io::Result<()> {
     use std::os::fd::AsRawFd;
     // SAFETY: `f` owns the fd for the whole call
-    if unsafe { libc::syncfs(f.as_raw_fd()) } == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
+    (unsafe { libc::syncfs(f.as_raw_fd()) } == 0)
+        .then_some(())
+        .ok_or_else(io::Error::last_os_error)
 }
 
 #[cfg(not(target_os = "linux"))]

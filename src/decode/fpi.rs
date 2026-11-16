@@ -11,8 +11,6 @@ pub const PAGE_BYTES: usize = BLOCK_SIZE as usize;
 pub enum FpiError {
     #[error("block carries no image")]
     NoImage,
-    #[error("unrecognised compression bits {0:#04x}")]
-    UnknownCodec(u8),
     #[error("hole offset {offset} + length {length} > BLCKSZ")]
     BadHole { offset: u16, length: u16 },
     #[error("pglz: corrupt stream")]
@@ -48,14 +46,9 @@ pub fn restore_block_image(
     let body = &mut scratch[..body_len];
 
     match ih.compression_method(page_magic) {
+        // Complete check fills `body` exactly or fails
         Some(FpiCompressionMethod::Pglz) => {
-            let written = pglz::decompress_into(&block.image, body, true).ok_or(FpiError::Pglz)?;
-            if written != body_len {
-                return Err(FpiError::SizeMismatch {
-                    got: written,
-                    expected: body_len,
-                });
-            }
+            pglz::decompress_into(&block.image, body, true).ok_or(FpiError::Pglz)?;
         }
         Some(FpiCompressionMethod::Lz4) => {
             let written =
@@ -80,10 +73,7 @@ pub fn restore_block_image(
         }
         None => {
             // uncompressed: image already BLCKSZ - hole_length (parse.rs
-            // enforces); reject codec-bit corruption
-            if ih.is_compressed(page_magic) {
-                return Err(FpiError::UnknownCodec(ih.info));
-            }
+            // enforces)
             if block.image.len() != body_len {
                 return Err(FpiError::SizeMismatch {
                     got: block.image.len(),
@@ -300,6 +290,20 @@ mod tests {
         assert!(matches!(
             restore_block_image(&block, XLP_PAGE_MAGIC_PG15),
             Err(FpiError::Pglz),
+        ));
+    }
+
+    #[test]
+    fn corrupt_lz4_and_zstd_images_error() {
+        let lz4 = build_block(vec![0xFF; 16], BKP_IMAGE_COMPRESS_LZ4, 0, 0);
+        assert!(matches!(
+            restore_block_image(&lz4, XLP_PAGE_MAGIC_PG15),
+            Err(FpiError::Lz4(_)),
+        ));
+        let zstd = build_block(vec![0xFF; 16], BKP_IMAGE_COMPRESS_ZSTD, 0, 0);
+        assert!(matches!(
+            restore_block_image(&zstd, XLP_PAGE_MAGIC_PG15),
+            Err(FpiError::Zstd(_)),
         ));
     }
 }

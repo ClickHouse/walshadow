@@ -486,5 +486,19 @@ mod tests {
     fn unknown_payload_passes_through() {
         assert_eq!(render("status", "paused = false\n"), "paused = false\n");
         assert_eq!(render("tables", "not toml ["), "not toml [");
+        assert_eq!(render("schemas", "schemas = 3\n"), "schemas = 3\n");
+        assert_eq!(render("schemas", "schemas = [\"a\", \"b\"]\n"), "a\nb");
+    }
+
+    #[test]
+    fn initial_load_names_match_config_spelling() {
+        let names = [
+            InitialLoad::None,
+            InitialLoad::Copy,
+            InitialLoad::BaseBackup,
+            InitialLoad::ObjectStore,
+        ]
+        .map(InitialLoad::as_str);
+        assert_eq!(names, ["none", "copy", "base_backup", "object_store"]);
     }
 }

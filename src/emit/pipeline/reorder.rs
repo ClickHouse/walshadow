@@ -81,15 +81,13 @@ struct DbScope {
 }
 
 impl DbScope {
-    /// Republished config to diff or opt-ins to retry; mirrors the early
-    /// returns of [`ReorderSink::apply_reload_for`]
+    /// Republished config to diff or opt-ins to retry
     fn reload_due(&self) -> bool {
-        self.db.resolver.is_some()
-            && (!self.pending_opt_ins.is_empty()
-                || self
-                    .reload_rx
-                    .as_ref()
-                    .is_some_and(|rx| rx.has_changed().unwrap_or(false)))
+        !self.pending_opt_ins.is_empty()
+            || self
+                .reload_rx
+                .as_ref()
+                .is_some_and(|rx| rx.has_changed().unwrap_or(false))
     }
 }
 
@@ -173,14 +171,6 @@ struct Outbox {
 }
 
 impl Outbox {
-    fn fatal_err(&self) -> SinkError {
-        SinkError::Other(
-            self.fatal
-                .message()
-                .unwrap_or_else(|| "pipeline fatal".into()),
-        )
-    }
-
     /// Admission permit for `bytes`. Staged rows hold permits only shipping
     /// releases, so ship before waiting on the pool
     async fn admit(
@@ -196,7 +186,7 @@ impl Outbox {
         self.flush_pending().await?;
         tokio::select! {
             biased;
-            _ = self.fatal.wait() => Err(self.fatal_err()),
+            msg = self.fatal.wait() => Err(SinkError::Other(msg)),
             p = budget.admit(bytes) => Ok(Some(p)),
         }
     }
@@ -216,7 +206,7 @@ impl BufferedRowSender for Outbox {
         self.staged_bytes = 0;
         let sent = tokio::select! {
             biased;
-            _ = self.fatal.wait() => return Err(self.fatal_err()),
+            msg = self.fatal.wait() => return Err(SinkError::Other(msg)),
             r = self.msg_tx.send(BatcherMsg::Chunks(chunks)) => r,
         };
         sent.map_err(|_| SinkError::Other("batcher channel closed".into()))
@@ -351,24 +341,22 @@ impl ReorderSink {
     async fn maybe_apply_reload(&mut self, commit_lsn: u64) -> Result<(), SinkError> {
         // A reload republishes every database's config, so the diff is not
         // scoped to whichever database is committing
-        let dbs: Vec<Oid> = self
-            .dbs
-            .oids()
-            .filter(|db| self.scopes.get(db).is_some_and(DbScope::reload_due))
-            .collect();
-        for db in dbs {
-            Box::pin(self.apply_reload_for(db, commit_lsn)).await?;
+        for db in self.dbs.oids() {
+            if let Some(scope) = self.scopes.get_mut(&db)
+                && scope.reload_due()
+                && let Some(resolver) = scope.db.resolver.clone()
+            {
+                Box::pin(Self::apply_reload_for(scope, &resolver, commit_lsn)).await?;
+            }
         }
         Ok(())
     }
 
-    async fn apply_reload_for(&mut self, db: Oid, commit_lsn: u64) -> Result<(), SinkError> {
-        let Some(scope) = self.scopes.get_mut(&db) else {
-            return Ok(());
-        };
-        let Some(resolver) = scope.db.resolver.clone() else {
-            return Ok(());
-        };
+    async fn apply_reload_for(
+        scope: &mut DbScope,
+        resolver: &crate::config::ConfigResolver,
+        commit_lsn: u64,
+    ) -> Result<(), SinkError> {
         // On a republish, re-diff `table_opt_ins`: opt-outs drain now, new
         // opt-ins queue as pending, dropped intents leave the queue.
         let changed = scope
@@ -453,7 +441,7 @@ impl ReorderSink {
                 .await
                 .descriptor_by_name(&rel)
                 .await
-                .map_err(|e| SinkError::Other(format!("opt-in descriptor lookup: {e}")))?
+                .map_err(SinkError::ctx("opt-in descriptor lookup"))?
                 .is_some();
             if !known {
                 tracing::debug!(
@@ -464,7 +452,7 @@ impl ReorderSink {
                 continue;
             }
             crate::backfill::opt_in::apply_table_opt_in(
-                &resolver,
+                resolver,
                 applicator,
                 &scope.db.catalog,
                 scope.backfiller.as_ref(),
@@ -473,7 +461,7 @@ impl ReorderSink {
                 commit_lsn,
             )
             .await
-            .map_err(|e| SinkError::Other(format!("reload opt-in: {e}")))?;
+            .map_err(SinkError::ctx("reload opt-in"))?;
             scope.pending_opt_ins.remove(&rel);
             scope.applied_opt_ins.insert(rel);
         }
@@ -521,7 +509,7 @@ impl ReorderSink {
                         commit_lsn,
                     )
                     .await
-                    .map_err(|e| SinkError::Other(format!("opt-in: {e}")))?;
+                    .map_err(SinkError::ctx("opt-in"))?;
                 }
             }
             ConfigEvent::TableRemoved {
@@ -554,7 +542,7 @@ impl ReorderSink {
         }
         tokio::select! {
             biased;
-            _ = self.out.fatal.wait() => Err(self.out.fatal_err()),
+            msg = self.out.fatal.wait() => Err(SinkError::Other(msg)),
             r = rx => r.map_err(|_| SinkError::Other("batcher dropped flush ack".into())),
         }
     }
@@ -567,7 +555,7 @@ impl ReorderSink {
         let through = self.out.seqs.next();
         tokio::select! {
             biased;
-            _ = self.out.fatal.wait() => Err(self.out.fatal_err()),
+            msg = self.out.fatal.wait() => Err(SinkError::Other(msg)),
             r = self.ack.wait_through(through) => r.map_err(|e| {
                 SinkError::Other(format!("durability barrier through {through}: {e}"))
             }),
@@ -608,7 +596,7 @@ impl ReorderSink {
             applicator
                 .predict_route_mapping(event, &before, frozen)
                 .await
-                .map_err(|e| SinkError::Other(format!("ddl predict: {e}")))?
+                .map_err(SinkError::ctx("ddl predict"))?
         } else {
             None
         };
@@ -617,7 +605,7 @@ impl ReorderSink {
         applicator
             .apply_at(event, frozen, at)
             .await
-            .map_err(|e| SinkError::Other(format!("ddl apply: {e}")))?;
+            .map_err(SinkError::ctx("ddl apply"))?;
         #[cfg(feature = "test-support")]
         crash_test::hit(crash_test::Point::AfterDdl, commit_lsn);
         if let Some((rel, m)) = predicted {
@@ -644,7 +632,7 @@ impl ReorderSink {
         {
             crate::backfill::opt_in::materialize_pending_on_added(&resolver, applicator, desc)
                 .await
-                .map_err(|e| SinkError::Other(format!("opt-in materialize: {e}")))?;
+                .map_err(SinkError::ctx("opt-in materialize"))?;
         }
         // Immediate DROP wipe corrupts same-LSN replay fills. Ledger fsync
         // here precedes this commit's ack publication, so any persisted
@@ -660,7 +648,7 @@ impl ReorderSink {
                     commit_lsn: Pos::new(commit_lsn),
                 })
                 .await
-                .map_err(|e| SinkError::Other(format!("toast retire ledger: {e}")))?;
+                .map_err(SinkError::ctx("toast retire ledger"))?;
         }
         Ok(())
     }
@@ -716,11 +704,11 @@ impl ReorderSink {
             self.resolver
                 .retire_mirror(entry.db_oid, entry.toast_relid)
                 .await
-                .map_err(|e| SinkError::Other(format!("toast mirror retire: {e}")))?;
+                .map_err(SinkError::ctx("toast mirror retire"))?;
             self.retires
                 .remove(entry)
                 .await
-                .map_err(|e| SinkError::Other(format!("toast retire ledger: {e}")))?;
+                .map_err(SinkError::ctx("toast retire ledger"))?;
         }
         Ok(())
     }
@@ -757,7 +745,7 @@ impl ReorderSink {
             None => self.pending_session.insert(
                 StagingSession::connect(self.dest.clone())
                     .await
-                    .map_err(|e| SinkError::Other(format!("pending visibility: connect: {e}")))?,
+                    .map_err(SinkError::ctx("pending visibility: connect"))?,
             ),
         };
         visibility_pending::settle(&mut ledger, sess, &self.stats)
@@ -812,7 +800,7 @@ impl ReorderSink {
         self.resolver
             .rewrite_barrier(db, toast_relid, marker_lsn, commit_lsn)
             .await
-            .map_err(|e| SinkError::Other(format!("toast rewrite barrier: {e}")))
+            .map_err(SinkError::ctx("toast rewrite barrier"))
     }
 
     async fn apply_drain_entry(
@@ -860,7 +848,7 @@ impl ReorderSink {
         applicator
             .truncate(rel, at)
             .await
-            .map_err(|e| SinkError::Other(format!("ch truncate: {e}")))?;
+            .map_err(SinkError::ctx("ch truncate"))?;
         self.stats.truncates_emitted.fetch_add(1, Ordering::Relaxed);
         // PG swaps TOAST relfilenode without listing it in `xl_heap_truncate`;
         // the descriptor carries the owner's toast oid
@@ -868,7 +856,7 @@ impl ReorderSink {
             self.resolver
                 .truncate_mirror(rel.rfn.db_node, rel.toast_oid)
                 .await
-                .map_err(|e| SinkError::Other(format!("toast mirror truncate: {e}")))?;
+                .map_err(SinkError::ctx("toast mirror truncate"))?;
         }
         Ok(())
     }
@@ -888,7 +876,7 @@ impl ReorderSink {
                 self.resolver
                     .put_row_refs(rb.spool(), &rb[lo - base..hi - base])
                     .await
-                    .map_err(|e| SinkError::Other(format!("toast store put: {e}")))?;
+                    .map_err(SinkError::ctx("toast store put"))?;
             }
             base += rb.len();
         }
@@ -961,18 +949,13 @@ impl ReorderSink {
             xid,
             commit_ts,
         };
-        let mut rd = plan
-            .replay()
-            .map_err(|e| SinkError::Other(format!("plan replay: {e}")))?;
+        let mut rd = plan.replay().map_err(SinkError::ctx("plan replay"))?;
         let mut pending: Vec<PlannedHeap> = Vec::new();
         let mut pending_bytes = 0usize;
         let mut rows_cursor = 0usize;
         let total_rows: usize = rd.row_batches.iter().map(|rb| rb.len()).sum();
         let mut rows_total = 0u64;
-        while let Some(item) = rd
-            .next_item()
-            .map_err(|e| SinkError::Other(format!("plan replay: {e}")))?
-        {
+        while let Some(item) = rd.next_item().map_err(SinkError::ctx("plan replay"))? {
             match item {
                 PlanItem::Control(c) => {
                     Box::pin(async {
@@ -1303,19 +1286,15 @@ impl BootingReorder {
         let mut sink = self.0;
         sink.flush_due_retires()
             .await
-            .map_err(|e| boot_step("flush of due toast-mirror retires", e))?;
+            .map_err(SinkError::ctx("boot flush of due toast-mirror retires"))?;
         sink.settle_pending_boot(shadow_data_dir)
             .await
-            .map_err(|e| boot_step("settle of pending backup rows", e))?;
+            .map_err(SinkError::ctx("boot settle of pending backup rows"))?;
         sink.apply_boot_events(present, resume_lsn)
             .await
-            .map_err(|e| boot_step("Added pass over descriptor log", e))?;
+            .map_err(SinkError::ctx("boot Added pass over descriptor log"))?;
         Ok(sink)
     }
-}
-
-fn boot_step(step: &str, e: SinkError) -> SinkError {
-    SinkError::Other(format!("boot {step}: {e}"))
 }
 
 /// Drain errors count as plan failures, admission errors are pipeline fatal
@@ -1552,7 +1531,7 @@ impl RecordSink for ReorderSink {
             self.resolver
                 .flush_mirror()
                 .await
-                .map_err(|e| SinkError::Other(format!("toast store flush: {e}")))?;
+                .map_err(SinkError::ctx("toast store flush"))?;
             self.out.flush_pending().await
         })
     }
@@ -1834,6 +1813,14 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unmetered_outbox_admits_without_a_permit() {
+        let budget = crate::budget::MemoryBudget::new(1);
+        let (mut out, _tail) = outbox(&budget, &Fatal::new());
+        out.budget = None;
+        assert!(out.admit(1 << 30).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
     async fn admit_returns_on_fatal_while_pool_held() {
         let budget = crate::budget::MemoryBudget::new(1 << 20);
         let fatal = Fatal::new();
@@ -1847,9 +1834,44 @@ mod tests {
             tokio::time::timeout(Duration::from_secs(5), out.admit(512 << 10)),
             trip,
         );
-        let Err(err) = admitted.expect("admit ignored fatal") else {
-            panic!("admit passed a held pool");
-        };
+        let err = admitted
+            .expect("admit ignored fatal")
+            .map(drop)
+            .expect_err("admit passed a held pool");
         assert!(err.to_string().contains("inserter down"), "{err}");
+    }
+
+    #[test]
+    fn plan_failure_reasons_bump_their_counters() {
+        let stats = EmitterStats::default();
+        let counters = [
+            ("spool", &stats.plan_failures_spool),
+            (
+                "fail_closed_image_only",
+                &stats.plan_failures_fail_closed_image_only,
+            ),
+            (
+                "fail_closed_malformed",
+                &stats.plan_failures_fail_closed_malformed,
+            ),
+            (
+                "fail_closed_unsupported_op",
+                &stats.plan_failures_fail_closed_unsupported_op,
+            ),
+            ("stash_ambiguous", &stats.plan_failures_stash_ambiguous),
+            ("incomplete_toast", &stats.plan_failures_incomplete_toast),
+            (
+                "missing_stash_resolution",
+                &stats.plan_failures_missing_stash_resolution,
+            ),
+            ("detoast", &stats.plan_failures_detoast),
+            ("partial_update", &stats.plan_failures_partial_update),
+            ("view", &stats.plan_failures_view),
+            ("unknown", &stats.plan_failures_drain),
+        ];
+        for (reason, counter) in counters {
+            bump_plan_failure(&stats, reason);
+            assert_eq!(counter.load(Ordering::Relaxed), 1, "{reason}");
+        }
     }
 }

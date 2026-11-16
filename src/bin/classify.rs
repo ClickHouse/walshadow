@@ -69,14 +69,9 @@ async fn walk_segment<R: AsyncRead + Unpin>(
             return Ok(());
         }
         let buf = &page[..n];
-        let (_, records) = parser
-            .parse_records_from_page(buf)
-            .map_err(|e| anyhow::anyhow!("parse page: {e}"))?;
+        let (_, records) = parser.parse_records_from_page(buf).context("parse page")?;
         for rec in &records {
             summary.observe(rec);
-        }
-        if n < page.len() {
-            return Ok(());
         }
     }
 }

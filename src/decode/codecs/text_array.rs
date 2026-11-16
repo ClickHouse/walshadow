@@ -67,5 +67,11 @@ mod tests {
         let mut with_null = text_array_body(&["tenant"]);
         with_null[4..8].copy_from_slice(&32i32.to_le_bytes());
         assert_eq!(decode_text_array(&with_null), None);
+
+        // 1-byte varlena header: length byte counts itself, `(len << 1) | 1`
+        let mut short = text_array_body(&[]);
+        short[12..16].copy_from_slice(&1i32.to_le_bytes());
+        short.extend_from_slice(&[7, b'a', b'b']);
+        assert_eq!(decode_text_array(&short).unwrap(), ["ab".to_owned()]);
     }
 }

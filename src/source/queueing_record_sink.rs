@@ -335,7 +335,7 @@ impl QueueingRecordSink {
         let tx = self
             .tx
             .as_ref()
-            .ok_or_else(|| SinkError::Other("queueing record sink already closed".into()))?;
+            .expect("close drops the sender only after its final flush");
         let records = match &self.predecode {
             Some(predecode) if !batch.is_empty() => {
                 let predecode = predecode.clone();
@@ -378,7 +378,7 @@ impl QueueingRecordSink {
         let worker = self.worker.take().expect("only close and drop take worker");
         worker
             .await
-            .map_err(|e| SinkError::Other(format!("queueing sink worker: {e}")))?;
+            .map_err(SinkError::ctx("queueing sink worker"))?;
         self.take_pending_error().map_or(Ok(()), Err)
     }
 

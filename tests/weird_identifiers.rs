@@ -96,16 +96,9 @@ fn create_ch_dests(ch: &fx::ChServer) {
     .expect("create w_cols dest");
 }
 
-fn skip_gate() -> bool {
-    if !fx::tools::requirements_available() {
-        return true;
-    }
-    false
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn weird_table_and_column_names_replicate() {
-    if skip_gate() {
+    if !fx::tools::requirements_available() {
         return;
     }
     let slot = fx::Ports::alloc();

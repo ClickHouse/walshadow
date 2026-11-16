@@ -385,7 +385,7 @@ impl WalReplaySink {
                 continue;
             }
             let page = crate::decode::fpi::restore_block_image(block, record.page_magic)
-                .map_err(|e| SinkError::Other(format!("wal_replay: toast image restore: {e}")))?;
+                .map_err(SinkError::ctx("wal_replay: toast image restore"))?;
             let mut harvested = crate::backfill::backup_page_walk::toast_rows_from_page(
                 &page,
                 &rel,
@@ -458,7 +458,7 @@ impl WalReplaySink {
             let permit = self.reserve_pending(r.chunk_data.len()).await?;
             let row = r
                 .materialize(spool)
-                .map_err(|e| SinkError::Other(format!("wal_replay: toast body load: {e}")))?;
+                .map_err(SinkError::ctx("wal_replay: toast body load"))?;
             let floor = (!row.is_tombstone()).then(|| slot_floor(&row));
             self.push_pending(row, permit);
             self.pending_rows.extend(floor);
@@ -478,7 +478,7 @@ impl WalReplaySink {
         self.resolver
             .put_batched(&rows)
             .await
-            .map_err(|e| SinkError::Other(format!("wal_replay: write toast rows: {e}")))
+            .map_err(SinkError::ctx("wal_replay: write toast rows"))
     }
 
     async fn on_commit(
@@ -489,7 +489,7 @@ impl WalReplaySink {
     ) -> std::result::Result<(), SinkError> {
         // Require subxact list to preserve buffered rows
         let payload = parse_xact_payload(info, &record.parsed.main_data, record.page_magic)
-            .map_err(|e| SinkError::Other(format!("wal_replay: commit payload: {e}")))?;
+            .map_err(SinkError::ctx("wal_replay: commit payload"))?;
         // Prepared xid owns buffered work and visibility verdict
         let xid = payload.twophase_xid.unwrap_or(xid);
         if let Some(patch) = &self.patch {
@@ -579,7 +579,7 @@ impl WalReplaySink {
                     self.resolver
                         .rewrite_barrier(self.log.db_oid(), toast_relid, marker_lsn, commit_lsn)
                         .await
-                        .map_err(|e| SinkError::Other(format!("toast rewrite barrier: {e}")))?;
+                        .map_err(SinkError::ctx("toast rewrite barrier"))?;
                 }
                 WalkStep::Heap(mut heap) => {
                     let rfn = heap.decoded.rfn;
@@ -785,7 +785,7 @@ impl SegmentPump {
             WAL_SEG_SIZE,
             Pos::new(first.start_lsn(WAL_SEG_SIZE)),
         )
-        .map_err(|e| anyhow::anyhow!("wal_replay: WalStream: {e}"))?;
+        .context("wal_replay: WalStream")?;
         stream.filter_mut().set_target_db(target_db_oid);
         Ok(Self {
             stream: stream.start(),
@@ -1580,26 +1580,22 @@ mod tests {
             None,
         )
         .await;
-        buffer
-            .lock()
-            .await
-            .on_heap(DescribedHeap {
-                decoded: DecodedHeap {
-                    rfn: rel.rfn,
-                    xid: 900,
-                    source_lsn: 10,
-                    op: HeapOp::Insert,
-                    new: Some(DecodedTuple {
-                        columns: vec![Some(ColumnValue::Int4(1))],
-                        partial: false,
-                    }),
-                    old: None,
-                },
-                descriptor: rel,
-                descriptor_valid_from: 1,
-            })
-            .await
-            .unwrap();
+        let insert = |xid, source_lsn| DescribedHeap {
+            decoded: DecodedHeap {
+                rfn: rel.rfn,
+                xid,
+                source_lsn,
+                op: HeapOp::Insert,
+                new: Some(DecodedTuple {
+                    columns: vec![Some(ColumnValue::Int4(1))],
+                    partial: false,
+                }),
+                old: None,
+            },
+            descriptor: rel.clone(),
+            descriptor_valid_from: 1,
+        };
+        buffer.lock().await.on_heap(insert(900, 10)).await.unwrap();
         let mut commit = xact_record(XLOG_XACT_COMMIT, 900, &[], None);
         commit.source_lsn = 20;
         sink.on_record(&commit).await.unwrap();
@@ -1608,9 +1604,16 @@ mod tests {
         let mut abort = xact_record(XLOG_XACT_ABORT, 901, &[902], None);
         abort.parsed.main_data = std::borrow::Cow::Owned(vec![0u8; 10]);
         assert!(sink.on_record(&abort).await.is_err());
-        let Ok(BatcherMsg::Rows(chunk)) = msg_rx.try_recv() else {
-            panic!("committed row not shipped");
-        };
-        assert_eq!(chunk.rows.len(), 1);
+        let shipped = msg_rx.try_recv();
+        assert!(matches!(&shipped, Ok(BatcherMsg::Rows(chunk)) if chunk.rows.len() == 1));
+
+        // Rows staged past a closed tail fail the replay
+        buffer.lock().await.on_heap(insert(903, 30)).await.unwrap();
+        let mut commit = xact_record(XLOG_XACT_COMMIT, 903, &[], None);
+        commit.source_lsn = 40;
+        sink.on_record(&commit).await.unwrap();
+        drop(msg_rx);
+        let err = sink.finish().await.unwrap_err();
+        assert!(err.to_string().contains("tail closed"), "{err}");
     }
 }

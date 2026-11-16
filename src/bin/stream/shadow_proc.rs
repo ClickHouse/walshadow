@@ -23,13 +23,11 @@ pub(crate) async fn open_shadow_sql_client(
     user: &str,
     dbname: &str,
 ) -> Result<tokio_postgres::Client> {
-    let socket = socket_dir
-        .to_str()
-        .ok_or_else(|| anyhow::anyhow!("shadow-socket-dir not UTF-8"))?;
+    let socket = socket_dir.to_str().context("shadow-socket-dir not UTF-8")?;
     let conninfo = socket_conninfo(socket, port, user, dbname);
     let (client, conn) = tokio_postgres::connect(&conninfo, tokio_postgres::NoTls)
         .await
-        .with_context(|| format!("preflight: open shadow sql client ({conninfo})"))?;
+        .context(format!("preflight: open shadow sql client ({conninfo})"))?;
     tokio::spawn(async move {
         let _ = conn.await;
     });
@@ -125,8 +123,20 @@ pub(crate) async fn start_owned_shadow(
     .context("shadow start task")?
 }
 
-pub(crate) const SHADOW_PROBE_INTERVAL: Duration = Duration::from_secs(2);
-pub(crate) const SHADOW_RESTART_BACKOFF_MAX: Duration = Duration::from_secs(60);
+/// Supervisor pacing: liveness probe period, and restart backoff doubling
+/// from `restart` up to `restart_max`
+#[derive(Clone, Copy)]
+pub(crate) struct SupervisePace {
+    pub(crate) probe: Duration,
+    pub(crate) restart: Duration,
+    pub(crate) restart_max: Duration,
+}
+
+pub(crate) const SUPERVISE_PACE: SupervisePace = SupervisePace {
+    probe: Duration::from_secs(2),
+    restart: Duration::from_secs(1),
+    restart_max: Duration::from_secs(60),
+};
 
 /// Daemon-owned postmaster, stopped on drop unless `keep_running`. Wraps a
 /// shadow before its start, so every exit path after it stops what started
@@ -189,6 +199,7 @@ impl ShadowLifecycle {
             guard.shadow.clone(),
             conninfo,
             cancel.clone(),
+            SUPERVISE_PACE,
         ));
         Self {
             guard,
@@ -201,19 +212,20 @@ impl ShadowLifecycle {
         shadow: Arc<Shadow>,
         conninfo: String,
         cancel: CancellationToken,
+        pace: SupervisePace,
     ) {
-        let mut backoff = Duration::from_secs(1);
+        let mut backoff = pace.restart;
         // Edge-trigger the foreign-pause log so a held operator pause does
         // not spam once per tick
         let mut foreign_logged = false;
         loop {
             tokio::select! {
                 () = cancel.cancelled() => return,
-                () = tokio::time::sleep(SHADOW_PROBE_INTERVAL) => {}
+                () = tokio::time::sleep(pace.probe) => {}
             }
             match probe_blocking(&shadow, |s| s.is_running()).await {
                 Some(true) => {
-                    backoff = Duration::from_secs(1);
+                    backoff = pace.restart;
                     // Higher GUC requirement pauses active hot standby
                     // Resume forces shutdown, then restart uses new values
                     // Ignore probe errors while psql waits for consistency
@@ -256,13 +268,13 @@ impl ShadowLifecycle {
                     .await;
                     if restarted.is_some() {
                         tracing::info!(target: "walshadow::shadow", "shadow restarted");
-                        backoff = Duration::from_secs(1);
+                        backoff = pace.restart;
                     } else {
                         tokio::select! {
                             () = cancel.cancelled() => return,
                             () = tokio::time::sleep(backoff) => {}
                         }
-                        backoff = (backoff * 2).min(SHADOW_RESTART_BACKOFF_MAX);
+                        backoff = (backoff * 2).min(pace.restart_max);
                     }
                 }
                 None => {}
@@ -380,5 +392,187 @@ mod tests {
         let ci = walsender_primary_conninfo("127.0.0.1:5441".parse().unwrap());
         assert!(ci.contains("host=127.0.0.1"), "{ci}");
         assert!(ci.contains("port=5441"), "{ci}");
+    }
+
+    /// Shadow whose `pg_ctl` / `pg_controldata` / `psql` are scripts answering
+    /// from files under `state`, each call appended to `state/calls`
+    struct FakePg {
+        _tmp: tempfile::TempDir,
+        state: PathBuf,
+        bin: PathBuf,
+        shadow: Arc<Shadow>,
+    }
+
+    impl FakePg {
+        fn new() -> Self {
+            use std::os::unix::fs::PermissionsExt;
+            let tmp = tempfile::tempdir().unwrap();
+            let (state, bin) = (tmp.path().join("state"), tmp.path().join("bin"));
+            for dir in [&state, &bin, &tmp.path().join("data")] {
+                std::fs::create_dir(dir).unwrap();
+            }
+            let st = state.display();
+            let scripts = [
+                (
+                    "pg_ctl",
+                    format!("echo \"pg_ctl $*\" >> {st}/calls\nfor a; do last=$a; done\nexit $(cat {st}/$last)\n"),
+                ),
+                (
+                    "pg_controldata",
+                    "for k in max_connections max_worker_processes max_wal_senders max_prepared_xacts max_locks_per_xact; do echo \"$k setting: 20\"; done\n".to_owned(),
+                ),
+                (
+                    "psql",
+                    format!(
+                        "echo \"psql $*\" >> {st}/calls\ncase \"$*\" in\n*pause_state*) cat {st}/pause ;;\n*current_setting*) cat {st}/running ;;\nesac\nexit $(cat {st}/psql)\n"
+                    ),
+                ),
+            ];
+            for (name, body) in scripts {
+                let path = bin.join(name);
+                std::fs::write(&path, format!("#!/bin/sh\n{body}")).unwrap();
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            let mut cfg = ShadowConfig::new(tmp.path().join("data"), tmp.path().join("out"));
+            cfg.pg_bin_dir = Some(bin.clone());
+            cfg.socket_dir = tmp.path().to_path_buf();
+            let fake = Self {
+                state,
+                bin,
+                shadow: Arc::new(Shadow::new(cfg)),
+                _tmp: tmp,
+            };
+            for (file, value) in [
+                ("status", "0"),
+                ("stop", "0"),
+                ("start", "0"),
+                ("psql", "0"),
+                ("pause", "not paused"),
+                ("running", "20|20|20|20|20"),
+            ] {
+                fake.set(file, value);
+            }
+            fake
+        }
+
+        fn set(&self, file: &str, value: &str) {
+            std::fs::write(self.state.join(file), value).unwrap();
+        }
+
+        fn calls(&self, needle: &str) -> usize {
+            let calls = std::fs::read_to_string(self.state.join("calls")).unwrap_or_default();
+            calls.lines().filter(|l| l.contains(needle)).count()
+        }
+
+        /// Block until `needle` has been called `n` times
+        async fn called(&self, needle: &str, n: usize) {
+            let poll = async {
+                while self.calls(needle) < n {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            };
+            tokio::time::timeout(Duration::from_secs(10), poll)
+                .await
+                .expect(needle);
+        }
+    }
+
+    #[tokio::test]
+    async fn owned_shadow_drop_survives_failed_stop_and_probe() {
+        let fake = FakePg::new();
+        fake.set("stop", "1");
+        drop(OwnedShadow {
+            shadow: fake.shadow.clone(),
+            keep_running: false,
+        });
+        assert_eq!(fake.calls("stop"), 1);
+        std::fs::remove_file(fake.bin.join("pg_ctl")).unwrap();
+        assert!(fake.shadow.is_running().is_err());
+        drop(OwnedShadow {
+            shadow: fake.shadow.clone(),
+            keep_running: false,
+        });
+    }
+
+    #[tokio::test]
+    async fn probe_blocking_reports_panicked_op_as_none() {
+        let fake = FakePg::new();
+        let none: Option<()> = probe_blocking(&fake.shadow, |_| panic!("op")).await;
+        assert!(none.is_none());
+    }
+
+    #[tokio::test]
+    async fn supervisor_resumes_floor_pause_and_restarts_stopped_shadow() {
+        let fake = FakePg::new();
+        let pace = SupervisePace {
+            probe: Duration::from_millis(1),
+            restart: Duration::from_millis(1),
+            restart_max: Duration::from_millis(2),
+        };
+        use tracing::instrument::WithSubscriber;
+        use tracing_subscriber::layer::SubscriberExt;
+        let messages = crate::housekeeping::tests::Messages::default();
+        let cancel = CancellationToken::new();
+        let supervise =
+            ShadowLifecycle::supervise(fake.shadow.clone(), "host=x".into(), cancel.clone(), pace);
+        let task = tokio::spawn(
+            supervise.with_subscriber(tracing_subscriber::registry().with(messages.clone())),
+        );
+        // Floor above running settings is a GUC-floor pause, resumed
+        fake.set("pause", "paused");
+        fake.set("running", "10|10|10|10|10");
+        fake.called("pg_wal_replay_resume", 1).await;
+        // Floor equal to running is someone else's pause, left alone
+        fake.set("running", "20|20|20|20|20");
+        fake.called("pause_state", fake.calls("pause_state") + 1)
+            .await;
+        let resumed = fake.calls("pg_wal_replay_resume");
+        fake.called("pause_state", fake.calls("pause_state") + 2)
+            .await;
+        assert_eq!(fake.calls("pg_wal_replay_resume"), resumed);
+        // Failed probe ignored
+        fake.set("psql", "1");
+        fake.called("pause_state", fake.calls("pause_state") + 1)
+            .await;
+        // Stopped postmaster restarts, a failed start backs off and retries
+        fake.set("start", "1");
+        fake.set("status", "3");
+        fake.called(" start", 2).await;
+        fake.set("start", "0");
+        messages.wait("shadow restarted", 1).await;
+        // Status probe that cannot run is skipped
+        std::fs::remove_file(fake.bin.join("pg_ctl")).unwrap();
+        messages
+            .wait("shadow op failed", messages.count("shadow op failed") + 1)
+            .await;
+        cancel.cancel();
+        task.await.unwrap();
+        let conf = std::fs::read_to_string(fake.shadow.config().data_dir.join("postgresql.conf"));
+        assert!(conf.unwrap().contains("max_connections = 20\n"));
+    }
+
+    #[tokio::test]
+    async fn lifecycle_shutdown_survives_failed_stop() {
+        let fake = FakePg::new();
+        fake.set("stop", "1");
+        let lifecycle = ShadowLifecycle {
+            guard: OwnedShadow {
+                shadow: fake.shadow.clone(),
+                keep_running: true,
+            },
+            supervisor: Some(tokio::spawn(async { panic!("supervisor") })),
+            cancel: CancellationToken::new(),
+        };
+        lifecycle.shutdown().await;
+        assert_eq!(fake.calls("stop"), 0, "keep_running leaves shadow up");
+        let lifecycle = ShadowLifecycle::spawn(
+            OwnedShadow {
+                shadow: fake.shadow.clone(),
+                keep_running: false,
+            },
+            "host=x".into(),
+        );
+        lifecycle.shutdown().await;
+        assert_eq!(fake.calls("stop"), 2, "shutdown stop, then drop's retry");
     }
 }

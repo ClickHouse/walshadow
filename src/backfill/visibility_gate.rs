@@ -65,7 +65,7 @@ pub async fn stream_phase(
 ) -> Result<(), String> {
     let mut forwarded = 0u64;
     let mut popped: Vec<(String, u64)> = Vec::new();
-    let mut ticker = Ticker::new(WALK_CHECKPOINT_PERIOD);
+    let mut ticker = Ticker::new(barrier.map_or(WALK_CHECKPOINT_PERIOD, |b| b.period()));
     while let Some(slab) = rx.recv().await {
         // Empty slab means one walked file's tuples are all behind us
         if slab.is_empty() {
@@ -547,8 +547,8 @@ mod tests {
     use crate::backfill::spool::DEFERRED_SPOOL_MEM_MAX;
     use crate::backfill::spool::SpoolMark;
     use crate::decode::visibility::{
-        HEAP_XMAX_COMMITTED, HEAP_XMAX_INVALID, HEAP_XMAX_IS_MULTI, HEAP_XMIN_COMMITTED,
-        HEAP_XMIN_INVALID,
+        HEAP_XMAX_COMMITTED, HEAP_XMAX_INVALID, HEAP_XMAX_IS_MULTI, HEAP_XMAX_LOCK_ONLY,
+        HEAP_XMIN_COMMITTED, HEAP_XMIN_INVALID,
     };
     use crate::decode::visibility::{PgMultiXactAccum, PgXactAccum};
     use foldhash::HashSetExt;
@@ -709,6 +709,45 @@ mod tests {
             "a file waits for the drain to read past it"
         );
         barrier.publish_drain(2, 4, SpoolMark::default()).await;
+        assert_eq!(
+            barrier.collect().await.unwrap().files(),
+            vec!["base/5/16400".to_string()]
+        );
+    }
+
+    /// Zero period hands every slab's files over at once; an end-of-file
+    /// slab with no finished file pairs nothing
+    #[tokio::test]
+    async fn zero_period_barrier_publishes_per_slab() {
+        let mut catalog = CatalogMap::new();
+        catalog.insert(make_rel_named(16400, 16400, 0, RelName::new("public", "t")));
+        let barrier = Arc::new(WalkBarrier::new(std::time::Duration::ZERO));
+        let (walk_tx, mut walk_rx) = mpsc::channel::<Vec<BackfillTuple>>(8);
+        let (tx, mut rx) = mpsc::channel::<Vec<BackfillTuple>>(8);
+        let dir = tempfile::tempdir().unwrap();
+        let mut spool = DeferredSpool::new(dir.path().join("gate.bin"), DEFERRED_SPOOL_MEM_MAX);
+        let visible = HEAP_XMIN_COMMITTED | HEAP_XMAX_INVALID;
+        walk_tx.send(Vec::new()).await.unwrap();
+        walk_tx.send(vec![tuple(10, 0, visible)]).await.unwrap();
+        barrier.finished_file("base/5/16400".into()).await;
+        walk_tx.send(Vec::new()).await.unwrap();
+        walk_tx.send(vec![tuple(11, 0, visible)]).await.unwrap();
+        drop(walk_tx);
+
+        stream_phase(
+            &mut walk_rx,
+            &tx,
+            &catalog,
+            &mut spool,
+            &mut GateStats::default(),
+            &EmitterStats::default(),
+            Some(&barrier),
+        )
+        .await
+        .unwrap();
+        drop(tx);
+        assert_eq!(rx.recv().await.map(|s| s.len()), Some(1));
+        barrier.publish_drain(1, 3, SpoolMark::default()).await;
         assert_eq!(
             barrier.collect().await.unwrap().files(),
             vec!["base/5/16400".to_string()]
@@ -1127,6 +1166,37 @@ mod tests {
             .unwrap();
         assert_eq!(stats.pending, 0);
         assert_eq!(stats.gated, 1);
+    }
+
+    /// Lock-only multixact xmax leaves the row live in either phase
+    #[tokio::test]
+    async fn lock_only_multixact_rows_emit_and_count() {
+        let mut catalog = CatalogMap::new();
+        catalog.insert(make_rel_named(16400, 16400, 0, RelName::new("public", "t")));
+        let locked = || {
+            tuple(
+                100,
+                10,
+                HEAP_XMIN_COMMITTED | HEAP_XMAX_IS_MULTI | HEAP_XMAX_LOCK_ONLY,
+            )
+        };
+        let (stats, passed) = run_stream_phase(&catalog, vec![locked()]).await;
+        assert_eq!((stats.emitted, stats.multixact_emitted), (1, 1));
+        assert_eq!(passed.len(), 1);
+
+        let accum = PgXactAccum::new();
+        let patch = SealedPatch::default();
+        let multi = PgMultiXactAccum::new(17);
+        let view = PgXactView::new(&accum, &patch).with_multixact(&multi);
+        let (tx, mut rx) = mpsc::channel(4);
+        let mut stats = GateStats::default();
+        let spool = spool_at("lock-only", vec![locked()]).await;
+        resolve_phase(spool, &view, &tx, None, &mut stats)
+            .await
+            .unwrap();
+        drop(tx);
+        assert_eq!((stats.emitted, stats.multixact_emitted), (1, 1));
+        assert_eq!(rx.recv().await.map(|slab| slab.len()), Some(1));
     }
 
     #[tokio::test]

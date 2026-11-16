@@ -824,6 +824,34 @@ mod tests {
     }
 
     #[test]
+    fn skipped_rows_cap_per_reason() {
+        use walrus::pg::walparser::{RmId, XLogRecordHeader};
+        use walshadow::decoder_sink::{DecoderStats, SkipReason};
+        let stats = DecoderStats::default();
+        let header = XLogRecordHeader {
+            resource_manager_id: RmId::Heap as u8,
+            info: walshadow::heap_decoder::XLOG_HEAP_INSERT,
+            ..Default::default()
+        };
+        let skip = |reason, rel_node| stats.skip(reason, &header, 0x1000, 5, rel_node);
+        for rel_node in 1..=25 {
+            skip(SkipReason::NotCovered, rel_node);
+        }
+        skip(SkipReason::NotCovered, 25);
+        skip(SkipReason::Unresolvable, 30);
+        let rows = skipped_by_rel(&stats, &db_label);
+        let not_covered: Vec<_> = rows.iter().filter(|r| r.reason == "not_covered").collect();
+        assert_eq!(not_covered.len(), UNMAPPED_STATUS_ROWS);
+        let top = not_covered[0];
+        assert_eq!((top.rel_node.as_str(), top.records), ("25", 2));
+        assert!(rows.iter().all(|r| r.database == "db5" && r.op == "insert"));
+        assert!(
+            rows.iter()
+                .any(|r| r.reason == "unresolvable" && r.rel_node == "30")
+        );
+    }
+
+    #[test]
     fn archive_stage_metrics_refresh_without_resetting_recovery_state() {
         use walshadow::record::WAL_SEG_SIZE;
         let emitter = EmitterStats::default();

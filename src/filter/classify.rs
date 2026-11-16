@@ -259,11 +259,14 @@ mod tests {
     fn heap_no_blocks_classifies_empty() {
         let r = record_with(RmId::Heap, &[]);
         assert_eq!(classify(&r), Class::Empty);
+        // Blocks naming only InvalidOid relfilenodes
+        assert_eq!(classify(&record_with(RmId::Heap, &[0])), Class::Empty);
     }
 
     #[test]
     fn summary_tracks_counts_and_fraction() {
         let mut s = Summary::default();
+        assert_eq!(s.catalog_fraction(), 0.0);
         s.observe(&record_with(RmId::Heap, &[1259]));
         s.observe(&record_with(RmId::Heap, &[16500]));
         s.observe(&record_with(RmId::Heap, &[16501]));

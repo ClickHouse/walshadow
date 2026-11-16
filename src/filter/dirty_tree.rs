@@ -262,6 +262,24 @@ mod tests {
     }
 
     #[test]
+    fn absorb_keeps_first_database_and_notes_another() {
+        let with_db = |db| DirtyState {
+            db,
+            ..DirtyState::new(10)
+        };
+        let mut m = with_db(Some(5));
+        m.absorb(with_db(None));
+        assert_eq!((m.db, m.db_other), (Some(5), None));
+        m.absorb(with_db(Some(5)));
+        assert_eq!((m.db, m.db_other), (Some(5), None));
+        m.absorb(with_db(Some(6)));
+        assert_eq!((m.db, m.db_other), (Some(5), Some(6)));
+        let mut m = with_db(None);
+        m.absorb(with_db(Some(6)));
+        assert_eq!((m.db, m.db_other), (Some(6), None));
+    }
+
+    #[test]
     fn drain_sweeps_unlisted_linked_members() {
         let mut t = DirtyTree::default();
         t.link(101, 100);

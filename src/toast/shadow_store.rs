@@ -352,6 +352,41 @@ mod tests {
         }
     }
 
+    /// Replay wait rides out a worker restart, and fails on any other
+    /// replay-position error
+    #[tokio::test(flavor = "current_thread")]
+    async fn replay_wait_survives_restart_and_fails_on_remote_error() {
+        use crate::ops::bridge::tests::{
+            fetch_body, hello_body, lsn_body, remote_body, spawn_worker,
+        };
+        use crate::ops::bridge::{PROJECTION_VERSION, PROTO_VERSION};
+        let hello = || Some(hello_body(PROTO_VERSION, PROJECTION_VERSION));
+        let refusal = || Some(remote_body("replay below the requested floor"));
+        let (_tmp, path) = spawn_worker(vec![
+            hello(),
+            refusal(),
+            None,
+            hello(),
+            None,
+            hello(),
+            Some(lsn_body(0x1000)),
+            Some(lsn_body(0x2000)),
+            Some(fetch_body(&[b"v"])),
+        ]);
+        let bridge = Arc::new(Bridge::connect(&path).await.unwrap());
+        let store = ShadowToastStore::new(bridge).with_replay_wait_max(Duration::from_secs(5));
+        let got = store.fetch(0, 1, 7, 0x2000, 1).await.unwrap();
+        assert_eq!(got, FetchedValue::Assembled(b"v".to_vec()));
+
+        let (_tmp, path) = spawn_worker(vec![hello(), refusal(), Some(remote_body("boom"))]);
+        let bridge = Arc::new(Bridge::connect(&path).await.unwrap());
+        let err = ShadowToastStore::new(bridge)
+            .fetch(0, 1, 7, 0x2000, 1)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("replay position: "), "{err}");
+    }
+
     #[test]
     fn slices_respect_both_caps_and_never_drop_a_value() {
         let many: Vec<(u32, usize)> = (0..MAX_FETCH_VALUES as u32 * 2 + 7)

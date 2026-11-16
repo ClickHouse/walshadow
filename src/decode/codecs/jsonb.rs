@@ -547,15 +547,9 @@ mod tests {
         dispatch!(level, simd => check_simd(simd));
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         {
-            if let Some(simd) = level.as_sse4_2() {
-                check_simd(simd);
-            }
-            if let Some(simd) = level.as_avx2() {
-                check_simd(simd);
-            }
-            if let Some(simd) = level.as_avx512() {
-                check_simd(simd);
-            }
+            level.as_sse4_2().into_iter().for_each(check_simd);
+            level.as_avx2().into_iter().for_each(check_simd);
+            level.as_avx512().into_iter().for_each(check_simd);
         }
     }
 
@@ -579,5 +573,39 @@ mod tests {
             decode_jsonb(&[0u8; 3]),
             Err(CodecError::BadJsonbContainer("header past end"))
         );
+    }
+
+    /// Container of `entries` (type and length each) over `data`
+    fn container(header: u32, entries: &[u32], data: &[u8]) -> Vec<u8> {
+        let mut out = header.to_le_bytes().to_vec();
+        entries
+            .iter()
+            .for_each(|e| out.extend_from_slice(&e.to_le_bytes()));
+        out.extend_from_slice(data);
+        out
+    }
+
+    #[test]
+    fn jsonb_structural_contradictions_error() {
+        let bad = |body: &[u8]| decode_jsonb(body).unwrap_err();
+        let err = CodecError::BadJsonbContainer;
+        assert_eq!(
+            bad(&container(JB_FSCALAR, &[], b"")),
+            err("scalar without a child")
+        );
+        let null_key = container(JB_FOBJECT | 1, &[JENTRY_ISNULL, JENTRY_ISNULL], b"");
+        assert_eq!(bad(&null_key), err("object key is not a string"));
+        assert_eq!(
+            bad(&container(1, &[0x6000_0000], b"")),
+            err("unknown child type")
+        );
+        let mut nested = container(0, &[], b"");
+        for _ in 0..=JSONB_MAX_DEPTH {
+            nested = container(1, &[JENTRY_ISCONTAINER | nested.len() as u32], &nested);
+        }
+        // Unoptimised frames outgrow a default 2 MiB test stack before the bound
+        let deep = std::thread::Builder::new().stack_size(64 << 20);
+        let deep = deep.spawn(move || decode_jsonb(&nested)).unwrap();
+        assert_eq!(deep.join().unwrap(), Err(err("nesting past depth bound")));
     }
 }

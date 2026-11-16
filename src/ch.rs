@@ -9,6 +9,7 @@ use backon::BackoffBuilder;
 use clickhouse_c::tls::rustls::pki_types::ServerName;
 use clickhouse_c::{
     AsyncClient, Block, BoxedAsyncClient, ClientOpts, Codec, Compression, ErrorKind, Event,
+    Exception,
 };
 use thiserror::Error;
 use tokio::net::TcpStream;
@@ -89,14 +90,13 @@ impl CompressionChoice {
     /// is configured for, so a client that installed one codec — or none —
     /// fails on the first frame it cannot decode
     pub fn build_codec(self) -> Result<Option<Pin<Box<Codec>>>, EmitterError> {
-        match self {
-            Self::Lz4 if !cfg!(feature = "lz4") => {
-                return Err(EmitterError::CompressionUnsupported("lz4"));
-            }
-            Self::Zstd if !cfg!(feature = "zstd") => {
-                return Err(EmitterError::CompressionUnsupported("zstd"));
-            }
-            _ => {}
+        #[cfg(not(feature = "lz4"))]
+        if self == Self::Lz4 {
+            return Err(EmitterError::CompressionUnsupported("lz4"));
+        }
+        #[cfg(not(feature = "zstd"))]
+        if self == Self::Zstd {
+            return Err(EmitterError::CompressionUnsupported("zstd"));
         }
         #[cfg(any(feature = "lz4", feature = "zstd"))]
         {
@@ -182,6 +182,15 @@ fn tls_server_name(config: &impl ConnectionConfig) -> Result<ServerName<'static>
         .map_err(|e| EmitterError::Config(format!("TLS server name `{name}`: {e}")))
 }
 
+impl From<Exception> for EmitterError {
+    fn from(exc: Exception) -> Self {
+        Self::ServerException {
+            code: exc.code(),
+            message: String::from_utf8_lossy(exc.display_text()).into_owned(),
+        }
+    }
+}
+
 /// Server finished the query; an INSERT's rows are durable
 pub struct EndOfStream(());
 
@@ -191,12 +200,7 @@ pub async fn drain_to_end_of_stream(
     loop {
         match client.recv_event().await? {
             Event::EndOfStream => return Ok(EndOfStream(())),
-            Event::Exception(exc) => {
-                return Err(EmitterError::ServerException {
-                    code: exc.code(),
-                    message: String::from_utf8_lossy(exc.display_text()).into_owned(),
-                });
-            }
+            Event::Exception(exc) => return Err(exc.into()),
             _ => {}
         }
     }
@@ -241,12 +245,7 @@ pub async fn query_strings(
             match client.recv_event().await? {
                 Event::Data(block) => read_string_column(&block, &mut out)?,
                 Event::EndOfStream => return Ok(out),
-                Event::Exception(exc) => {
-                    return Err(EmitterError::ServerException {
-                        code: exc.code(),
-                        message: String::from_utf8_lossy(exc.display_text()).into_owned(),
-                    });
-                }
+                Event::Exception(exc) => return Err(exc.into()),
                 _ => {}
             }
         }
@@ -261,12 +260,10 @@ fn read_string_column(block: &Block, out: &mut Vec<String>) -> Result<(), Emitte
     if n == 0 {
         return Ok(());
     }
-    let col = block
-        .column(0)
-        .ok_or_else(|| EmitterError::Type("missing result column".into()))?;
-    let (offsets, data) = col
-        .string()
-        .ok_or_else(|| EmitterError::Type("result column not String".into()))?;
+    let col = block.column(0);
+    let Some((offsets, data)) = col.as_ref().and_then(|c| c.string()) else {
+        return Err(EmitterError::Type("result is not one String column".into()));
+    };
     for i in 0..n {
         let start = if i == 0 { 0 } else { offsets[i - 1] as usize };
         let end = offsets[i] as usize;
@@ -492,6 +489,16 @@ mod tests {
     use super::*;
     use crate::emit::ch_emitter::InstanceConfig;
 
+    #[tokio::test(start_paused = true)]
+    async fn with_timeout_names_the_budget() {
+        let r = with_timeout(
+            Duration::from_secs(3),
+            std::future::pending::<Result<(), _>>(),
+        )
+        .await;
+        assert!(matches!(r, Err(EmitterError::Timeout { secs: 3 })), "{r:?}");
+    }
+
     /// `compression = "none"` still has to decode a compressed response: the
     /// wire flag says what we send, not what the server answers in. A server
     /// set to ZSTD against a codec-less client fails on the first frame
@@ -535,9 +542,10 @@ mod tests {
             ..EmitterConfig::default()
         };
         let server = tokio::spawn(async move { drop(listener.accept().await.unwrap()) });
-        let Err(e) = connect_client(&config).await else {
-            panic!("handshake succeeded against a dropped connection");
-        };
+        let e = connect_client(&config)
+            .await
+            .err()
+            .expect("handshake fails");
         server.await.unwrap();
         assert!(matches!(e, EmitterError::HelloDropped(_)), "{e:?}");
         assert!(is_retryable(&e));

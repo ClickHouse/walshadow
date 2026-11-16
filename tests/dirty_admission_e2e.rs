@@ -19,13 +19,6 @@ use std::time::Duration;
 
 use walshadow::mapping::NamespaceMapping;
 
-fn skip_gate() -> bool {
-    if !fx::tools::requirements_available() {
-        return true;
-    }
-    false
-}
-
 struct Drill {
     source: fx::ClusterGuard,
     shadow: fx::ClusterGuard,
@@ -118,7 +111,7 @@ async fn pump_and_drain(drill: &mut Drill) {
 /// rows deliver, dirty post-touch row fences.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn interleaved_clean_xact_unaffected_by_dirty_tree() {
-    if skip_gate() {
+    if !fx::tools::requirements_available() {
         return;
     }
     let mut drill = build_drill(
@@ -199,7 +192,7 @@ async fn interleaved_clean_xact_unaffected_by_dirty_tree() {
 /// commit's capture boundary.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn subxact_catalog_touch_defers_top_and_child_rows() {
-    if skip_gate() {
+    if !fx::tools::requirements_available() {
         return;
     }
     let mut drill = build_drill(
@@ -269,7 +262,7 @@ async fn subxact_catalog_touch_defers_top_and_child_rows() {
 /// reflects all of them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn phase_gate_every_post_touch_record_defers_and_fences() {
-    if skip_gate() {
+    if !fx::tools::requirements_available() {
         return;
     }
     let mut drill = build_drill(
@@ -360,7 +353,7 @@ async fn phase_gate_every_post_touch_record_defers_and_fences() {
 /// route snapshot, and the plan routes the fanned-out rows.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn create_table_and_copy_same_xact_delivers() {
-    if skip_gate() {
+    if !fx::tools::requirements_available() {
         return;
     }
     let drill = build_drill(
@@ -377,7 +370,7 @@ async fn create_table_and_copy_same_xact_delivers() {
 /// prediction must map the table like the executor's create does
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn create_table_and_copy_same_xact_delivers_under_replicate_all() {
-    if skip_gate() {
+    if !fx::tools::requirements_available() {
         return;
     }
     let drill = build_drill_with(
@@ -448,7 +441,7 @@ async fn create_and_copy_same_xact_delivers(mut drill: Drill, ns: &str) {
 /// `BEGIN; ALTER COLUMN TYPE varchar(n); INSERT; COMMIT;` permanently fatal.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn benign_in_place_alter_then_dml_delivers() {
-    if skip_gate() {
+    if !fx::tools::requirements_available() {
         return;
     }
     let mut drill = build_drill(
@@ -522,7 +515,7 @@ async fn benign_in_place_alter_then_dml_delivers() {
 /// the first boundary and the row lands
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn physical_in_place_alter_fences_deferred_rows() {
-    if skip_gate() {
+    if !fx::tools::requirements_available() {
         return;
     }
     let mut drill = build_drill_with(
@@ -563,7 +556,7 @@ async fn physical_in_place_alter_fences_deferred_rows() {
 /// the same connection inherits no dirty state.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn top_abort_with_ddl_appends_no_metadata_and_emits_no_rows() {
-    if skip_gate() {
+    if !fx::tools::requirements_available() {
         return;
     }
     let mut drill = build_drill(
@@ -658,7 +651,7 @@ const BODY_DIRTY_LEN: &str = "9216";
 /// is silent data loss rather than a stopped stream.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ddl_then_toasted_insert_keeps_existing_toast_generation() {
-    if skip_gate() {
+    if !fx::tools::requirements_available() {
         return;
     }
     let mut drill = build_drill_with(
@@ -756,7 +749,7 @@ async fn ddl_then_toasted_insert_keeps_existing_toast_generation() {
 /// Restart needs this batch because evidence that only statistics changed is lost
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn analyze_covers_its_commit_without_reading_shadow() {
-    if skip_gate() {
+    if !fx::tools::requirements_available() {
         return;
     }
     let mut drill = build_drill(

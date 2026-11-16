@@ -124,16 +124,9 @@ fn live_pairs(ch: &fx::ChServer) -> String {
     .expect("ch live pairs")
 }
 
-fn skip_gate() -> bool {
-    if !fx::tools::requirements_available() {
-        return true;
-    }
-    false
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn composite_pk_dedup_keys_on_full_tuple() {
-    if skip_gate() {
+    if !fx::tools::requirements_available() {
         return;
     }
     let workload = "BEGIN;\n\
@@ -167,7 +160,7 @@ async fn composite_pk_dedup_keys_on_full_tuple() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn composite_pk_with_toast_value() {
-    if skip_gate() {
+    if !fx::tools::requirements_available() {
         return;
     }
     // >8KB values force out-of-line TOAST under the composite key.

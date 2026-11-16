@@ -454,6 +454,16 @@ mod tests {
     }
 
     #[test]
+    fn consolidate_moves_a_tree_only_its_child_captured() {
+        let p = PendingCatalog::default();
+        let rfn = desc(16400, 7000, "t").rfn;
+        p.record(101, vec![slot(200, 101, desc(16400, 7000, "child"))]);
+        p.consolidate(100, &[100, 101]);
+        assert_eq!(p.tracked_xacts(), 1);
+        assert_eq!(&*p.chain(100, rfn)[0].desc.rel_name.name, "child");
+    }
+
+    #[test]
     fn admit_caps_boundaries_then_degrades() {
         let p = PendingCatalog::default();
         assert_eq!(p.admit(100, 2, u64::MAX), Ok(()));

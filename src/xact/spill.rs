@@ -489,10 +489,7 @@ impl BodySpoolWriter {
     }
 
     pub fn append(&mut self, body: &[u8]) -> Result<BodyRef> {
-        let len = u32::try_from(body.len()).map_err(|_| SpillError::Format {
-            offset: self.len as usize,
-            detail: "toast body over u32".into(),
-        })?;
+        let len = u32::try_from(body.len()).map_err(io::Error::other)?;
         self.shared.charge(u64::from(len));
         let r = BodyRef {
             offset: self.len,
@@ -1772,6 +1769,41 @@ mod tests {
         assert!(!path.exists(), "writer.unlink() must remove file");
     }
 
+    /// Already-gone files unlink clean, anything else surfaces
+    #[tokio::test(flavor = "current_thread")]
+    async fn unlink_tolerates_only_missing_files() {
+        let tmp = tempdir().unwrap();
+        let store = SpillStore::new(tmp.path().to_path_buf()).unwrap();
+        let w = store.writer(7, 0).await.unwrap();
+        std::fs::remove_file(w.path()).unwrap();
+        w.unlink().await.unwrap();
+        let w = store.writer(8, 0).await.unwrap();
+        std::fs::remove_file(w.path()).unwrap();
+        std::fs::create_dir(w.path()).unwrap();
+        assert!(matches!(w.unlink().await, Err(SpillError::Io(_))));
+
+        let w = BodySpoolWriter::create(tmp.path(), 9, 0x10, None).unwrap();
+        std::fs::remove_file(w.shared().path()).unwrap();
+        w.unlink().unwrap();
+        let w = BodySpoolWriter::create(tmp.path(), 10, 0x10, None).unwrap();
+        std::fs::remove_file(w.shared().path()).unwrap();
+        std::fs::create_dir(w.shared().path()).unwrap();
+        assert!(matches!(w.unlink(), Err(SpillError::Io(_))));
+    }
+
+    #[test]
+    fn body_spool_flushes_at_io_chunk() {
+        let tmp = tempdir().unwrap();
+        let mut w = BodySpoolWriter::create(tmp.path(), 7, 0x1000, None).unwrap();
+        let body = vec![3u8; IO_CHUNK];
+        let r = w.append(&body).unwrap();
+        let on_disk = |w: &BodySpoolWriter| std::fs::metadata(w.shared().path()).unwrap().len();
+        assert_eq!(on_disk(&w), IO_CHUNK as u64);
+        w.flush().unwrap();
+        assert_eq!(on_disk(&w), IO_CHUNK as u64);
+        assert_eq!(w.shared().read(r).unwrap(), body);
+    }
+
     #[test]
     fn body_spool_appends_reads_and_survives_unlink() {
         let tmp = tempdir().unwrap();
@@ -1852,6 +1884,55 @@ mod tests {
             }
             other => panic!("expected Format, got {other:?}"),
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn corrupt_dict_frames_surface_format_error() {
+        let frame = |tag: u8, body: &[u8]| {
+            let mut v = vec![tag];
+            v.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            v.extend_from_slice(body);
+            v
+        };
+        let mut descriptor = 0x40u64.to_le_bytes().to_vec();
+        encode_descriptor_bytes(&mut descriptor, &sample_descriptor(16385));
+        let mut trailing = descriptor.clone();
+        trailing.push(0);
+        let mut garbled = 0x40u64.to_le_bytes().to_vec();
+        garbled.push(0xFF);
+        let cases = [
+            (
+                frame(TAG_HEAP, &0u32.to_le_bytes()),
+                "dict id 0, only 0 defined",
+            ),
+            (frame(TAG_DESCRIPTOR, &garbled), "short read"),
+            (
+                frame(TAG_DESCRIPTOR, &trailing),
+                "descriptor body length mismatch",
+            ),
+        ];
+        let tmp = tempdir().unwrap();
+        for (i, (body, want)) in cases.into_iter().enumerate() {
+            let path = tmp.path().join(format!("xid-{i:010}-0000000000000000.bin"));
+            let mut bytes = SPILL_MAGIC.to_vec();
+            bytes.extend_from_slice(&SPILL_VERSION.to_le_bytes());
+            bytes.extend_from_slice(&body);
+            tokio::fs::write(&path, &bytes).await.unwrap();
+            let mut r = SpillReader::open(path, IO_CHUNK).await.unwrap();
+            let err = r.next().await.expect_err(want);
+            assert!(
+                matches!(&err, SpillError::Format { detail, .. } if detail.contains(want)),
+                "{want}: {err:?}"
+            );
+        }
+        let path = tmp.path().join("xid-0000000009-0000000000000000.bin");
+        let mut bytes = SPILL_MAGIC.to_vec();
+        bytes.extend_from_slice(&SPILL_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&frame(TAG_DESCRIPTOR, &descriptor));
+        tokio::fs::write(&path, &bytes).await.unwrap();
+        let mut r = SpillReader::open(path, IO_CHUNK).await.unwrap();
+        assert!(r.next().await.unwrap().is_none());
+        assert_eq!(r.dict.len(), 1);
     }
 
     /// Exhaustive: a new [`ColumnValue`] variant fails to compile here until
@@ -2023,9 +2104,8 @@ mod tests {
         assert!(r.path().to_str().unwrap().contains("xid-"));
         let mut ops = Vec::new();
         while let Some(e) = r.next().await.unwrap() {
-            if let SpillEntry::Heap(b) = e {
-                ops.push(b.decoded.op);
-            }
+            let SpillEntry::Heap(b) = e else { panic!() };
+            ops.push(b.decoded.op);
         }
         assert_eq!(
             ops,

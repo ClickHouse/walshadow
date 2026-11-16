@@ -352,7 +352,7 @@ mod tests {
     #[test]
     fn truncated_dbinfo_poisons() {
         let full = commit_payload(Some(5), &[], &[], &[], 12);
-        for cut in [4, 8, 12, 15] {
+        for cut in [4, 8, 12, 15, 18] {
             let mut md = full.clone();
             md.truncate(cut);
             assert!(
@@ -379,5 +379,59 @@ mod tests {
             assert_eq!(p.invals.relcache.len(), 1, "magic {magic:#X}");
             assert_eq!(p.invals.relcache[0].rel_id, 16500);
         }
+    }
+
+    #[test]
+    fn truncated_tail_sections_poison() {
+        let one: &[u8] = &1i32.to_le_bytes();
+        let cases: [(u32, &[u8], &str); 5] = [
+            (XACT_XINFO_HAS_RELFILELOCATORS, one, "relfilelocators"),
+            (XACT_XINFO_HAS_DROPPED_STATS, one, "dropped stats"),
+            (XACT_XINFO_HAS_TWOPHASE, &[], "twophase xid"),
+            (
+                XACT_XINFO_HAS_TWOPHASE | XACT_XINFO_HAS_GID,
+                b"\x09\0\0\0gid",
+                "gid terminator",
+            ),
+            (XACT_XINFO_HAS_ORIGIN, &[0; 15], "origin"),
+        ];
+        for (xinfo, tail, what) in cases {
+            let mut md = 0i64.to_le_bytes().to_vec();
+            md.extend_from_slice(&xinfo.to_le_bytes());
+            md.extend_from_slice(tail);
+            let e = parse_xact_payload(XLOG_XACT_HAS_INFO, &md, PG17_MAGIC).unwrap_err();
+            assert!(
+                matches!(&e, XactPayloadError::Malformed(w) if w == what),
+                "{e}"
+            );
+        }
+        let mut md = 0i64.to_le_bytes().to_vec();
+        let xinfo = XACT_XINFO_HAS_TWOPHASE | XACT_XINFO_HAS_GID | XACT_XINFO_HAS_ORIGIN;
+        md.extend_from_slice(&xinfo.to_le_bytes());
+        md.extend_from_slice(b"\x09\0\0\0gid\0");
+        md.extend_from_slice(&[0; 16]);
+        let p = parse_xact_payload(XLOG_XACT_HAS_INFO, &md, PG17_MAGIC).unwrap();
+        assert_eq!(p.twophase_xid, Some(9));
+    }
+
+    #[test]
+    fn namespace_scope_widens_to_shared_plus_one_db() {
+        let marked = |dbs: &[u32]| {
+            let mut n = NamespaceInval::default();
+            for &db in dbs {
+                n.mark(db);
+            }
+            n
+        };
+        assert_eq!(marked(&[0, 5]), NamespaceInval::Both(5));
+        assert_eq!(marked(&[5, 0, 5]), NamespaceInval::Both(5));
+        assert_eq!(
+            marked(&[5, 6]),
+            NamespaceInval::Shared,
+            "one backend, one db"
+        );
+        let both = marked(&[0, 5]);
+        assert!(both.hits(|db| db == 0) && both.hits(|db| db == 5));
+        assert!(!both.hits(|db| db == 6));
     }
 }

@@ -239,6 +239,24 @@ mod tests {
         );
     }
 
+    /// Unreadable ledger surfaces; removing an absent entry is a no-op
+    #[tokio::test(flavor = "current_thread")]
+    async fn unreadable_ledger_errors_and_absent_remove_noops() {
+        let tmp = tempdir().unwrap();
+        std::fs::create_dir(ledger_path(tmp.path())).unwrap();
+        let err = RetireLedger::load(tmp.path(), SYSID, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RetireLedgerError::Io(_)), "{err:?}");
+        std::fs::remove_dir(ledger_path(tmp.path())).unwrap();
+        let mut ledger = RetireLedger::load(tmp.path(), SYSID, None).await.unwrap();
+        ledger.remove(entry(1, 0x10)).await.unwrap();
+        assert!(
+            !ledger_path(tmp.path()).exists(),
+            "no-op remove writes nothing"
+        );
+    }
+
     /// Require one followed database to migrate nonempty version 1 ledgers
     #[tokio::test(flavor = "current_thread")]
     async fn legacy_entries_take_the_sole_database() {

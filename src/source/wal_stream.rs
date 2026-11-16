@@ -1832,4 +1832,94 @@ mod tests {
             }
         }
     }
+
+    /// One-page segment, long header at `addr`, then `body`
+    fn one_page_segment(addr: u64, remaining: u32, body: &[u8]) -> Vec<u8> {
+        use walrus::pg::walparser::{WAL_PAGE_SIZE, XLP_LONG_HEADER, XLP_PAGE_MAGIC_PG15};
+        let mut page = XLP_PAGE_MAGIC_PG15.to_le_bytes().to_vec();
+        page.extend_from_slice(&XLP_LONG_HEADER.to_le_bytes());
+        page.extend_from_slice(&1u32.to_le_bytes());
+        page.extend_from_slice(&addr.to_le_bytes());
+        page.extend_from_slice(&remaining.to_le_bytes());
+        page.extend_from_slice(&[0; 4]);
+        page.extend_from_slice(&12345u64.to_le_bytes());
+        page.extend_from_slice(&(WAL_PAGE_SIZE as u32).to_le_bytes());
+        page.extend_from_slice(&(WAL_PAGE_SIZE as u32).to_le_bytes());
+        page.extend_from_slice(body);
+        page.resize(WAL_PAGE_SIZE as usize, 0);
+        page
+    }
+
+    /// `XLogRecord` header for `rmid`/`info`, then `body`
+    fn record(rmid: RmId, info: u8, body: &[u8]) -> Vec<u8> {
+        let mut r = ((24 + body.len()) as u32).to_le_bytes().to_vec();
+        r.extend_from_slice(&[0; 12]);
+        r.extend_from_slice(&[info, rmid as u8, 0, 0, 0, 0, 0, 0]);
+        r.extend_from_slice(body);
+        r
+    }
+
+    /// A fork inside a record straddling the segment boundary drops it, which
+    /// releases the segment it held back
+    #[tokio::test(flavor = "current_thread")]
+    async fn fork_inside_a_straddling_record_seals_the_segment_it_held() {
+        const SEG: u64 = 8192;
+        let mut straddle = 9000u32.to_le_bytes().to_vec();
+        straddle.resize(9000, 0xAA);
+        let mut bytes = one_page_segment(0, 0, &straddle[..SEG as usize - 40]);
+        let held = 9000 - (SEG as u32 - 40);
+        bytes
+            .extend_from_slice(&one_page_segment(SEG, held, &straddle[SEG as usize - 40..])[..140]);
+        let mut rec = CollectingRecordSink::default();
+        let fresh = async |rec: &mut CollectingRecordSink| {
+            let mut ws = WalStream::new(1, SEG, Pos::ZERO).unwrap();
+            let mut seg = CollectingSegmentSink::default();
+            ws.push(0, &bytes, rec, &mut seg).await.unwrap();
+            assert!(seg.segments.is_empty(), "straddle holds the segment");
+            ws
+        };
+        let mut ws = fresh(&mut rec).await;
+        let mut seg = CollectingSegmentSink::default();
+        assert_eq!(
+            ws.transition_timeline(2, SEG + 40, &mut seg).await.unwrap(),
+            SEG
+        );
+        assert_eq!(seg.segments.len(), 1);
+        assert_eq!(seg.segments[0].0.format(), "000000010000000000000000");
+        assert_eq!(ws.timeline(), 2);
+
+        let mut ws = fresh(&mut rec).await;
+        let err = ws
+            .transition_timeline(2, SEG + 40, &mut ErrSegmentSink)
+            .await;
+        assert!(matches!(err, Err(WalStreamError::Sink(_))));
+        let again = ws.transition_timeline(2, SEG + 40, &mut seg).await;
+        assert!(matches!(again, Err(WalStreamError::Poisoned)));
+        assert!(rec.records.is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn unparseable_records_poison_with_their_offset() {
+        const SEG: u64 = 8192;
+        let mut commit_body = vec![255, 12];
+        commit_body.extend_from_slice(&[0; 8]);
+        commit_body.extend_from_slice(&1u32.to_le_bytes());
+        let cases = [
+            record(RmId::Heap, 0, &[0x7F, 0]),
+            record(RmId::Xact, 0x80, &commit_body),
+        ];
+        for (body, parse) in cases.into_iter().zip([true, false]) {
+            let mut ws = WalStream::new(1, SEG, Pos::ZERO).unwrap();
+            let (mut rec, mut seg) = (
+                CollectingRecordSink::default(),
+                CollectingSegmentSink::default(),
+            );
+            let err = ws
+                .push(0, &one_page_segment(0, 0, &body), &mut rec, &mut seg)
+                .await;
+            let parse_failed = matches!(err, Err(WalStreamError::Parse { offset: 40, .. }));
+            let payload_failed = matches!(err, Err(WalStreamError::Payload { offset: 40, .. }));
+            assert_eq!((parse_failed, payload_failed), (parse, !parse), "{err:?}");
+        }
+    }
 }

@@ -2272,4 +2272,74 @@ mod tests {
             .expect("boundary");
         assert_eq!(b.oids[0].oid, 16400);
     }
+
+    #[test]
+    fn one_xact_writing_two_followed_databases_poisons() {
+        let mut f = Filter::new();
+        f.set_target_dbs([TARGET_DB, FOREIGN_DB]);
+        f.decide_record(&pg_class_write(TARGET_DB, 7, 16400), 100, 0xD116)
+            .unwrap();
+        f.decide_record(&pg_class_write(FOREIGN_DB, 7, 16401), 150, 0xD116)
+            .unwrap();
+        let err = f
+            .decide_record(&xact_end(XLOG_XACT_COMMIT, 7, &[], None), 200, 0xD116)
+            .unwrap_err();
+        let want = XactPayloadError::MixedScope {
+            first: TARGET_DB,
+            second: FOREIGN_DB,
+        };
+        assert_eq!(err.to_string(), want.to_string());
+    }
+
+    #[test]
+    fn smgr_markers_evict_oldest_unless_superseded() {
+        let rfn = |rel_node| RelFileNode {
+            spc_node: 1663,
+            db_node: TARGET_DB,
+            rel_node,
+        };
+        let cap = SMGR_MARKER_CAP as u32;
+        let mut m = SmgrMarkers::default();
+        m.insert(rfn(1), 10);
+        m.insert(rfn(1), 20);
+        m.insert(rfn(1), 20);
+        for rel in 2..=cap {
+            m.insert(rfn(rel), 30);
+        }
+        assert_eq!(m.get(rfn(1)), Some(20), "stale order entry leaves map");
+        m.insert(rfn(cap + 1), 30);
+        assert_eq!(m.get(rfn(1)), None);
+        assert_eq!(m.get(rfn(2)), Some(30));
+    }
+
+    #[tokio::test]
+    async fn persisting_without_shadow_rels_writes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        target_filter()
+            .persist_shadow_rels(tmp.path())
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn skip_attribution_takes_the_full_parse() {
+        let mut bytes = vec![0; walrus::pg::walparser::X_LOG_RECORD_HEADER_SIZE];
+        bytes[17] = RmId::Btree as u8;
+        bytes.extend_from_slice(&[0, 0, 0, 0]);
+        for v in [1663u32, TARGET_DB, 20001, 0] {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        let len = bytes.len() as u32;
+        bytes[..4].copy_from_slice(&len.to_le_bytes());
+        let mut f = target_filter();
+        f.enable_header_routing();
+        assert!(f.route_from_header(&bytes, 0xD116, 0).is_some());
+        let stats = Arc::new(DecoderStats::default());
+        stats
+            .attribute_skips
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        f.set_skip_stats(stats);
+        assert!(f.route_from_header(&bytes, 0xD116, 0).is_none());
+    }
 }

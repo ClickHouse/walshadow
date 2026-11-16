@@ -130,9 +130,7 @@ impl DirSegmentSink {
 }
 
 async fn join_write(write: JoinHandle<Result<Vec<u8>, SinkError>>) -> Result<Vec<u8>, SinkError> {
-    write
-        .await
-        .map_err(|e| SinkError::Other(format!("segment write task: {e}")))?
+    write.await.map_err(SinkError::ctx("segment write task"))?
 }
 
 impl SegmentSink for DirSegmentSink {
@@ -193,5 +191,20 @@ mod tests {
         assert_eq!(rx.recv().await.unwrap().seg_path(), seg_path);
         assert_eq!(std::fs::read(&seg_path).unwrap(), bytes);
         assert!(!tmp.path().join(format!("{}.tmp", seg.format())).exists());
+    }
+
+    #[tokio::test]
+    async fn closed_fsync_queue_fails_the_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+        let io = TaskTracker::new();
+        let mut sink =
+            DirSegmentSink::with_durability(tmp.path().to_path_buf(), WAL_SEG_SIZE, tx, io.clone())
+                .unwrap();
+        let seg = SegmentName::parse("000000010000000000000003").unwrap();
+        sink.on_segment(seg, &[0xAA; 64]).await.unwrap();
+        let e = sink.close().await.unwrap_err();
+        assert!(e.to_string().contains("segment fsync queue closed"), "{e}");
     }
 }

@@ -129,16 +129,7 @@ pub(crate) async fn promotion_gate(feed: &mut SourceFeed, pause_received: u64) -
     let in_recovery: bool = row.get(0);
     let replay_lsn = row.get::<_, Option<PgLsn>>(1).map(u64::from).unwrap_or(0);
     let receive_lsn = row.get::<_, Option<PgLsn>>(2).map(u64::from).unwrap_or(0);
-    // Order names the first term to fix, not every one that fails
-    let blocked_on = if !in_recovery {
-        "not_a_standby"
-    } else if replay_lsn < pause_received {
-        "replay_below_pause_received"
-    } else if receive_lsn > replay_lsn {
-        "received_not_replayed"
-    } else {
-        ""
-    };
+    let blocked_on = promotion_blocked_on(in_recovery, replay_lsn, receive_lsn, pause_received);
     PromotionGate {
         blocked_on,
         in_recovery,
@@ -252,10 +243,29 @@ pub(crate) async fn commit_fork_resume(
 /// (architecture/recovery.md): every restart there dials a server
 /// that is down. `ctl` and `/metrics` are bound before this, so the repoint
 /// that ends the wait can be applied to the daemon doing the waiting.
+/// Order names the first term to fix, not every one that fails
+fn promotion_blocked_on(
+    in_recovery: bool,
+    replay_lsn: u64,
+    receive_lsn: u64,
+    pause_received: u64,
+) -> &'static str {
+    if !in_recovery {
+        "not_a_standby"
+    } else if replay_lsn < pause_received {
+        "replay_below_pause_received"
+    } else if receive_lsn > replay_lsn {
+        "received_not_replayed"
+    } else {
+        ""
+    }
+}
+
 pub(crate) async fn connect_source_waiting(
     args: &Args,
     source_conn: &mut SourceConn,
     cfg: &mut PgConfig,
+    retry: Duration,
 ) -> Result<SourceFeed> {
     loop {
         match SourceFeed::connect(cfg).await {
@@ -269,7 +279,7 @@ pub(crate) async fn connect_source_waiting(
                 "source unreachable — waiting for it, or for a repoint",
             ),
         }
-        tokio::time::sleep(SOURCE_SWAP_RETRY).await;
+        tokio::time::sleep(retry).await;
         let Some(path) = args.ch_config.as_deref() else {
             continue;
         };
@@ -379,7 +389,7 @@ pub(crate) async fn resume_source_feed(
     }
     feed.start_physical_replication(slot, resume_lsn.get(), branch.timeline)
         .await
-        .with_context(|| format!("START_REPLICATION at {resume_lsn}"))?;
+        .context(format!("START_REPLICATION at {resume_lsn}"))?;
     Ok((feed, point))
 }
 
@@ -834,5 +844,78 @@ mod tests {
             swap_reason(&anyhow::anyhow!("connection refused")),
             "source"
         );
+    }
+
+    #[test]
+    fn promotion_names_first_blocker() {
+        assert_eq!(promotion_blocked_on(false, 0, 0, 0), "not_a_standby");
+        assert_eq!(
+            promotion_blocked_on(true, 5, 5, 9),
+            "replay_below_pause_received"
+        );
+        assert_eq!(
+            promotion_blocked_on(true, 9, 12, 9),
+            "received_not_replayed"
+        );
+        assert_eq!(promotion_blocked_on(true, 9, 9, 9), "");
+    }
+
+    /// `connect_source_waiting` logging into `messages` until `stop` fires
+    fn spawn_wait(
+        args: Args,
+        messages: &crate::housekeeping::tests::Messages,
+        stop: &tokio_util::sync::CancellationToken,
+    ) -> tokio::task::JoinHandle<()> {
+        use tracing::instrument::WithSubscriber;
+        use tracing_subscriber::layer::SubscriberExt;
+        let stop = stop.clone();
+        let wait = async move {
+            let mut conn = SourceConn::from_table(&cli_base(&args)).unwrap();
+            let mut cfg = conn.to_pg_config();
+            let retry = Duration::from_millis(1);
+            let connect = connect_source_waiting(&args, &mut conn, &mut cfg, retry);
+            let _ = futures::future::select(Box::pin(connect), Box::pin(stop.cancelled())).await;
+        };
+        tokio::spawn(wait.with_subscriber(tracing_subscriber::registry().with(messages.clone())))
+    }
+
+    #[tokio::test]
+    async fn unreachable_source_waits_and_follows_config_repoints() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("config.toml");
+        let source = |host: &str| {
+            format!(
+                "[source]\nhost = \"{}/{host}\"\nport = 1\n",
+                tmp.path().display()
+            )
+        };
+        std::fs::write(&config, source("a")).unwrap();
+        let unreachable = ["--host", "/nonexistent", "--port", "1"];
+        let stop = tokio_util::sync::CancellationToken::new();
+        let messages = crate::housekeeping::tests::Messages::default();
+        let task = spawn_wait(crate::args::args_from(&unreachable), &messages, &stop);
+        messages
+            .wait("source unreachable — waiting for it, or for a repoint", 2)
+            .await;
+        stop.cancel();
+        task.await.unwrap();
+
+        let reloads = [
+            &unreachable[..],
+            &["--ch-config", config.to_str().unwrap(), "--slot", "s"],
+        ]
+        .concat();
+        let stop = tokio_util::sync::CancellationToken::new();
+        let messages = crate::housekeeping::tests::Messages::default();
+        let task = spawn_wait(crate::args::args_from(&reloads), &messages, &stop);
+        messages.wait("source moved while waiting", 1).await;
+        std::fs::write(&config, source("b")).unwrap();
+        messages.wait("source moved while waiting", 2).await;
+        std::fs::write(&config, "[source]\nport = \"one\"\n").unwrap();
+        messages.wait("[source] reload", 1).await;
+        std::fs::write(&config, "[[[").unwrap();
+        messages.wait("config reload", 1).await;
+        stop.cancel();
+        task.await.unwrap();
     }
 }

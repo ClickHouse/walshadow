@@ -82,8 +82,16 @@ impl DurableWalk {
     }
 }
 
-#[derive(Default)]
-pub struct WalkBarrier(Mutex<WalkProgress>);
+pub struct WalkBarrier {
+    progress: Mutex<WalkProgress>,
+    period: Duration,
+}
+
+impl Default for WalkBarrier {
+    fn default() -> Self {
+        Self::new(WALK_CHECKPOINT_PERIOD)
+    }
+}
 
 #[derive(Default)]
 struct WalkProgress {
@@ -99,28 +107,40 @@ struct WalkProgress {
 }
 
 impl WalkBarrier {
+    /// Stages publish and the checkpointer writes once per `period`
+    pub fn new(period: Duration) -> Self {
+        Self {
+            progress: Mutex::default(),
+            period,
+        }
+    }
+
+    pub fn period(&self) -> Duration {
+        self.period
+    }
+
     /// Sink: called after the file's last slab is on the channel, before its
     /// end-of-file slab
     pub async fn finished_file(&self, path: String) {
-        self.0.lock().await.finished.push_back(path);
+        self.progress.lock().await.finished.push_back(path);
     }
 
     /// Gate: an empty slab stands for one finished file. Which name it pops
     /// does not matter, only that every registered file's tuples precede the
     /// slab that pops it
     pub async fn pop_finished(&self) -> Option<String> {
-        self.0.lock().await.finished.pop_front()
+        self.progress.lock().await.finished.pop_front()
     }
 
     pub async fn publish_gate(&self, files: Vec<(String, u64)>, deferred: SpoolMark) {
-        let mut progress = self.0.lock().await;
+        let mut progress = self.progress.lock().await;
         progress.gate = deferred;
         progress.consumed.extend(files);
     }
 
     /// Sink: one archive part fully dispatched
     pub async fn part_drained(&self, key: String, files: Vec<String>, slru: bool) {
-        self.0
+        self.progress
             .lock()
             .await
             .parts
@@ -128,7 +148,7 @@ impl WalkBarrier {
     }
 
     pub async fn publish_drain(&self, consumed: u64, next_seq: u64, spool: SpoolMark) {
-        self.0.lock().await.drain = DrainReport {
+        self.progress.lock().await.drain = DrainReport {
             consumed,
             next_seq,
             spool,
@@ -136,7 +156,7 @@ impl WalkBarrier {
     }
 
     pub async fn collect(&self) -> Option<WalkProof> {
-        let mut progress = self.0.lock().await;
+        let mut progress = self.progress.lock().await;
         let drain = progress.drain;
         let mut files = Vec::new();
         progress.consumed.retain(|(path, forwarded)| {
@@ -161,7 +181,7 @@ impl WalkBarrier {
     /// recorded set, so a part waits however many ticks its files take
     pub async fn settled_parts(&self, recorded: &HashSet<String>) -> Vec<String> {
         let mut out = Vec::new();
-        self.0.lock().await.parts.retain(|p| {
+        self.progress.lock().await.parts.retain(|p| {
             let settled = !p.slru && p.files.iter().all(|f| recorded.contains(f));
             if settled {
                 out.push(p.key.clone());

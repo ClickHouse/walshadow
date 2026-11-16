@@ -421,6 +421,9 @@ mod tests {
                 Ok(text.as_text().len()),
                 "{text:?}"
             );
+            let mut rendered = String::new();
+            render_numeric_text(&body, &mut rendered).unwrap();
+            assert_eq!(rendered, text.as_text());
         }
     }
 
