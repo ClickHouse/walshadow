@@ -520,17 +520,12 @@ impl CatalogTracker {
             let db_node: Oid = row.get(0);
             let catalog_oid: Oid = row.get(1);
             let filenode: Oid = row.get(2);
-            if filenode == 0 {
-                continue;
-            }
             if db_node != 0
                 && let Some(slot) = parse_ctid(row.get(3))
             {
                 slots.push((db_node, slot, catalog_oid, filenode));
             }
-            if self.nodes.insert((db_node, filenode)) {
-                added += 1;
-            }
+            added += usize::from(self.nodes.insert((db_node, filenode)));
             if catalog_oid == PG_CLASS_OID {
                 self.pg_class_filenode.insert(db_node, filenode);
             }
@@ -1220,6 +1215,27 @@ mod tests {
         );
         t.observe(&again, MAGIC);
         assert!(t.is_catalog(5, 40100));
+    }
+
+    /// Unrestorable pg_class image teaches nothing and forgets its page
+    #[test]
+    fn unrestorable_image_forgets_its_page_slots() {
+        use walrus::pg::walparser::{BKP_BLOCK_HAS_IMAGE, XLogRecordBlockImageHeader};
+        let mut t = CatalogTracker::new();
+        t.catalog_slots.insert((5, 1259, 0, 7), (2674, 2674));
+        t.catalog_slots.insert((5, 1259, 1, 7), (2675, 2675));
+        let mut lock = heap_block_record(RmId::Heap, 0x60, 5, 1259, Vec::new());
+        let block = &mut lock.blocks[0];
+        block.header.fork_flags = BKP_BLOCK_HAS_IMAGE;
+        block.header.image_header = XLogRecordBlockImageHeader {
+            image_length: 0,
+            hole_offset: 8192,
+            hole_length: 1,
+            info: 0,
+        };
+        t.observe(&lock, MAGIC);
+        let left: Vec<_> = t.catalog_slots.into_iter().collect();
+        assert_eq!(left, [((5, 1259, 1, 7), (2675, 2675))]);
     }
 
     #[test]

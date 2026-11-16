@@ -1449,8 +1449,7 @@ impl NonFinite {
         if decimal.is_none() && !matches!(inner.kind(), Some(Kind::Date32 | Kind::DateTime64)) {
             return Ok(Self::default());
         }
-        let precision = usize::try_from(inner.decimal_precision().unwrap_or(0))
-            .map_err(|_| "bad Decimal precision")?;
+        let precision = inner.decimal_precision().unwrap_or(0) as usize;
         let scale = usize::from(decimal.map_or(0, |w| w.scale));
         let bound = format!("{}.{}", "9".repeat(precision - scale), "9".repeat(scale));
         let cell = |key: &str, sub: &Option<Substitute>| {
@@ -3803,6 +3802,20 @@ mod tests {
         .unwrap();
         let m = &c.tables[&RelName::new("app", "events")];
         assert_eq!(m.target.table, "app_events");
+    }
+
+    #[test]
+    fn pinned_columns_follow_namespace_template_and_opt_out() {
+        let c = EmitterConfig::from_toml_str(
+            "[ch]\n[namespace.app]\nauto_create_name = \"wh_\"\n\
+             [table.app.events]\ncolumns = [{ attnum = 1, target = \"id\", type = \"UInt64\" }]\n\
+             [table.app.skipped]\nreplicate = false\n\
+             columns = [{ attnum = 1, target = \"id\", type = \"UInt64\" }]\n",
+        )
+        .unwrap();
+        let m = &c.tables[&RelName::new("app", "events")];
+        assert_eq!(m.target.table, "wh_events");
+        assert!(!c.tables.contains_key(&RelName::new("app", "skipped")));
     }
 
     #[tokio::test]

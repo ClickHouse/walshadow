@@ -92,10 +92,12 @@ impl DirtyTree {
         if sub == 0 || top == 0 || sub == top {
             return;
         }
-        // Until its top is known a dirty child credits itself; first link
-        // moves that credit, re-links find it already at the root
-        if self.top_by_xid.insert(sub, top).is_none() && self.state_by_xid.contains_key(&sub) {
-            decrement(&mut self.dirty_members, sub);
+        // Until its top is known a dirty child credits itself. Link moves
+        // that credit, re-links find it already at the root. Crash-orphaned
+        // link reused after xid wraparound names another top
+        let old = self.top_by_xid.insert(sub, top).unwrap_or(sub);
+        if old != top && self.state_by_xid.contains_key(&sub) {
+            decrement(&mut self.dirty_members, old);
             *self.dirty_members.entry(top).or_default() += 1;
         }
     }
@@ -174,11 +176,12 @@ impl DirtyTree {
 }
 
 fn decrement(counts: &mut HashMap<u32, u32>, key: u32) {
-    if let Some(n) = counts.get_mut(&key) {
-        *n -= 1;
-        if *n == 0 {
-            counts.remove(&key);
-        }
+    let n = counts
+        .get_mut(&key)
+        .expect("dirty member counted under its root");
+    *n -= 1;
+    if *n == 0 {
+        counts.remove(&key);
     }
 }
 
@@ -222,6 +225,18 @@ mod tests {
         t.drain_tree(100, None, &[101]);
         assert!(!t.is_dirty(100));
         assert!(!t.is_dirty(101));
+    }
+
+    #[test]
+    fn relink_to_another_top_moves_credit() {
+        let mut t = DirtyTree::default();
+        t.link(101, 100);
+        t.touch(101, 100);
+        t.link(101, 200);
+        assert!(!t.is_dirty(100), "old top keeps no stale credit");
+        assert!(t.is_dirty(200));
+        t.drain_tree(200, None, &[101]);
+        assert!(!t.is_dirty(200));
     }
 
     #[test]

@@ -353,7 +353,8 @@ impl ShadowCatalog {
     }
 
     /// [`fetch_descriptors_batch`](Self::fetch_descriptors_batch) pinned at
-    /// a [`ParkedAt`] position.
+    /// a [`ParkedAt`] position. Worker answers for that position or fails
+    /// with `ReplayMismatch`, so no replay position comes back.
     ///
     /// Parking is what keeps the read out of the deadlock: the worker checks
     /// the position on both sides and may then read a catalog whose lock replay
@@ -363,18 +364,20 @@ impl ShadowCatalog {
         &mut self,
         oids: &[Oid],
         at: &ParkedAt,
-    ) -> Result<(u64, Vec<RelDescriptor>)> {
-        self.fetch_committed(Scope::Oids(oids), Some(at.lsn()))
-            .await
+    ) -> Result<Vec<RelDescriptor>> {
+        let (_, descs) = self
+            .fetch_committed(Scope::Oids(oids), Some(at.lsn()))
+            .await?;
+        Ok(descs)
     }
 
     /// [`fetch_all_descriptors`](Self::fetch_all_descriptors), pinned as in
     /// [`fetch_descriptors_batch_at`](Self::fetch_descriptors_batch_at).
-    pub async fn fetch_all_descriptors_at(
-        &mut self,
-        at: &ParkedAt,
-    ) -> Result<(u64, Vec<RelDescriptor>)> {
-        self.fetch_committed(Scope::Eligible, Some(at.lsn())).await
+    pub async fn fetch_all_descriptors_at(&mut self, at: &ParkedAt) -> Result<Vec<RelDescriptor>> {
+        let (_, descs) = self
+            .fetch_committed(Scope::Eligible, Some(at.lsn()))
+            .await?;
+        Ok(descs)
     }
 
     /// Committed catalog at one replay position.
@@ -588,18 +591,8 @@ impl ShadowCatalog {
             let list: Vec<Oid> = wanted.iter().copied().collect();
             let rows = self.query_retry(sql, &[&list]).await?;
             names.extend(rows.iter().map(|r| (r.get(0), r.get(1))));
-            if names.len() == wanted.len() {
-                return Ok(names);
-            }
         }
-        let scan = bridge.scan_at(R::CATALOG, top_xid, &[], pin.lsn).await?;
-        for row in scan.parse::<R>()? {
-            let (oid, name) = name_of(row);
-            if wanted.contains(&oid) {
-                names.insert(oid, name);
-            }
-        }
-        Ok(names)
+        complete_names(bridge, wanted, names, name_of, top_xid, pin.lsn).await
     }
 
     pub async fn current_database_oid(&mut self) -> Result<Oid> {
@@ -773,6 +766,28 @@ static MIRROR_ALL_SQL: LazyLock<String> = LazyLock::new(|| {
         "c.oid >= {FIRST_NORMAL_OBJECT_ID} AND c.relkind IN ('r', 'p', 'm', 't')"
     ))
 });
+
+/// Fill names the committed read lacks from one worker scan at `lsn`
+async fn complete_names<R: ScanRow>(
+    bridge: &Bridge,
+    wanted: &BTreeSet<Oid>,
+    mut names: HashMap<Oid, String>,
+    name_of: fn(R) -> (Oid, String),
+    top_xid: u32,
+    lsn: u64,
+) -> Result<HashMap<Oid, String>> {
+    if names.len() == wanted.len() {
+        return Ok(names);
+    }
+    let scan = bridge.scan_at(R::CATALOG, top_xid, &[], lsn).await?;
+    for row in scan.parse::<R>()? {
+        let (oid, name) = name_of(row);
+        if wanted.contains(&oid) {
+            names.insert(oid, name);
+        }
+    }
+    Ok(names)
+}
 
 /// Swap each fast default the statement marked present for its on-disk bytes
 /// off the worker, the one encoding decode reads. The bytes hold still while
@@ -1484,5 +1499,103 @@ mod tests {
     fn odd_length_hex_rejects() {
         assert_eq!(decode_hex("0a1"), None);
         assert_eq!(decode_hex("0a1b"), Some(vec![0x0a, 0x1b]));
+    }
+
+    #[test]
+    fn descriptor_rejects_unknown_replica_identity() {
+        let class = ClassRow {
+            relreplident: 'x',
+            ..class_row()
+        };
+        let err = overlay(&class, &[], &[], &names(&[(2200, "public")])).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "parse: unknown relreplident 'x' (expected one of d/n/f/i) for relation 16384"
+        );
+    }
+
+    /// Worker `SCAN` answer pinned at `lsn`; `None` is SQL null
+    fn scan_answer(lsn: u64, ncols: u16, rows: &[&[Option<&str>]]) -> Vec<u8> {
+        let mut b = vec![0u8];
+        b.extend_from_slice(&lsn.to_be_bytes());
+        b.extend_from_slice(&lsn.to_be_bytes());
+        b.extend_from_slice(&0u32.to_be_bytes());
+        b.extend_from_slice(&0u32.to_be_bytes());
+        b.extend_from_slice(&(rows.len() as u32).to_be_bytes());
+        b.extend_from_slice(&ncols.to_be_bytes());
+        for value in rows.iter().flat_map(|r| r.iter()) {
+            match value {
+                Some(v) => {
+                    b.extend_from_slice(&(v.len() as u32).to_be_bytes());
+                    b.extend_from_slice(v.as_bytes());
+                }
+                None => b.extend_from_slice(&(-1i32).to_be_bytes()),
+            }
+        }
+        b
+    }
+
+    async fn scripted_bridge(answers: Vec<Vec<u8>>) -> (tempfile::TempDir, Bridge) {
+        use crate::ops::bridge::{PROJECTION_VERSION, PROTO_VERSION, tests};
+        let script = std::iter::once(tests::hello_body(PROTO_VERSION, PROJECTION_VERSION))
+            .chain(answers)
+            .map(Some)
+            .collect();
+        let (tmp, path) = tests::spawn_worker(script);
+        (tmp, Bridge::connect(&path).await.unwrap())
+    }
+
+    /// Committed read short a name (dropped since the class scan, or never
+    /// committed) takes the rest from the worker at the pinned position
+    #[tokio::test(flavor = "current_thread")]
+    async fn names_committed_read_lacks_come_from_worker() {
+        let rows: [&[Option<&str>]; 3] = [
+            &[Some("2200"), Some("public")],
+            &[Some("16500"), Some("s")],
+            &[Some("16600"), Some("unwanted")],
+        ];
+        let (_tmp, bridge) = scripted_bridge(vec![scan_answer(0x5000, 2, &rows)]).await;
+        let wanted = BTreeSet::from([2200, 16500]);
+        let got = complete_names(
+            &bridge,
+            &wanted,
+            names(&[(2200, "public")]),
+            |r: NamespaceRow| (r.oid, r.nspname),
+            0,
+            0x5000,
+        )
+        .await
+        .unwrap();
+        assert_eq!(got, names(&[(2200, "public"), (16500, "s")]));
+    }
+
+    /// `ALTER TABLE` rewrite between statement and worker scan clears
+    /// `atthasmissing`, so the bytes decode needs are gone
+    #[tokio::test(flavor = "current_thread")]
+    async fn fast_default_lost_by_worker_fails_the_read() {
+        let row: [Option<&str>; 12] = [
+            Some("16384"),
+            Some("2"),
+            Some("v"),
+            Some("23"),
+            Some("-1"),
+            Some("f"),
+            Some("f"),
+            Some("t"),
+            Some("4"),
+            Some("i"),
+            Some("p"),
+            None,
+        ];
+        let (_tmp, bridge) = scripted_bridge(vec![scan_answer(0x5000, 12, &[&row])]).await;
+        let mut attrs = [AttributeRow {
+            attmissingval: Some("{7}".into()),
+            ..attr_row(2, "v", 23)
+        }];
+        let err = raw_missing_values(&bridge, &mut attrs).await.unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "parse: worker lost fast default of relation 16384 attnum 2 since the statement read it"
+        );
     }
 }

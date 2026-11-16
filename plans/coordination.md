@@ -12,7 +12,7 @@ plans; these contracts identify changes that cannot be designed independently
 | Schema planning and route snapshots | [Schema](schema.md), [runtime config](runtime_config.md), [fuzzing](fuzzing.md), [destinations](extensions.md#multiple-clickhouse-destinations) | Validate transaction before effects, retain source baseline separately from destination projection, publish mapping after successful application |
 | Bootstrap jobs and deferred storage | [Performance](performance.md), [bootstrap](bootstrap.md), [shadow TOAST](shadow_toast.md) | Assign completion identity before parallel decode, retain original load version, make deferral safe for concurrent writers and restart |
 | Timeline crossing | [Failover](failover.md), [runtime config](runtime_config.md), [verification](verification.md) | Fence abandoned ordinary state, retain prepared state when supported, compare positions through lineage |
-| Recovery evidence | [Coverage](coverage100.md), [fuzzing](fuzzing.md), all storage changes | Test crashes around persistence and publication, assert rows and durable progress, retain minimized regressions |
+| Recovery evidence | [Bootstrap](bootstrap.md), [fuzzing](fuzzing.md), all storage changes | Test crashes around persistence and publication, assert rows and durable progress, retain minimized regressions |
 
 ## Resolve before composing publication gates
 

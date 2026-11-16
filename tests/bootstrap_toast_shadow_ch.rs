@@ -19,6 +19,7 @@
 mod fx;
 
 use std::fs;
+use std::io::Write;
 use std::path::Path;
 use std::time::Duration;
 
@@ -99,6 +100,9 @@ fn write_shadow_toast_config(path: &Path, ch_port: u16, schema: &str) -> Result<
          database = \"default\"\n\
          compression = \"lz4\"\n\
          \n\
+         [stream]\n\
+         replicate_all = false\n\
+         \n\
          [toast]\n\
          mode = \"shadow\"\n\
          \n\
@@ -128,7 +132,6 @@ async fn bootstrap_renders_external_values_out_of_shadow() {
     // Same knob `fpi_user_pages.rs` needs: without it a page whose only
     // change is a hint bit logs no image
     {
-        use std::io::Write;
         let mut f = fs::OpenOptions::new()
             .append(true)
             .open(source.config().data_dir.join("postgresql.conf"))
@@ -141,6 +144,12 @@ async fn bootstrap_renders_external_values_out_of_shadow() {
     }
     let _src_stop = fx::StopOnDrop { sh: &source };
     load_toast_workload(&source, schema).expect("load toast workload");
+    // Unfollowed at bootstrap, so its TOAST heap never lands on shadow
+    source
+        .psql_one(&format!(
+            "CREATE TABLE {schema}.late (id int4 PRIMARY KEY, body text)"
+        ))
+        .expect("create late table");
 
     let ch_tmp = tempfile::tempdir().unwrap();
     let ch = fx::ChServer::spawn(ch_tmp, slot.ch_tcp, slot.ch_http).expect("spawn ch");
@@ -164,7 +173,7 @@ async fn bootstrap_renders_external_values_out_of_shadow() {
     let child = daemon
         .spawn(&source, &ch_config_path, slot.walsender, &[])
         .expect("spawn walshadow-stream");
-    let guard = fx::ChildGuard::new(child);
+    let mut guard = fx::ChildGuard::new(child);
 
     let result = (|| -> Result<()> {
         // In-window churn, timed off the backup's own progress view
@@ -303,6 +312,47 @@ async fn bootstrap_renders_external_values_out_of_shadow() {
                 .lines()
                 .any(|l| l.contains("caught up to bootstrap end_lsn")),
             "shadow never replayed to end_lsn, so in-window values cannot resolve",
+        );
+
+        source.psql_one(&format!(
+            "INSERT INTO {schema}.t VALUES (5, 'before-restart')"
+        ))?;
+        fx::wait_for_ch_value(
+            &ch,
+            "SELECT count() FROM default.t FINAL WHERE _is_deleted = 0 AND id = 5",
+            "1",
+            Duration::from_secs(30),
+        )?;
+
+        // Resume with the late table configured: boot refuses it, keeps the rest
+        if let Some(mut first) = guard.child.take() {
+            fx::tools::stop_gracefully(&mut first);
+        }
+        let late = format!(
+            "\n[table.\"{schema}\".\"late\"]\n\
+             target_database = \"default\"\n\
+             target_table = \"late\"\n\
+             columns = [{{ attnum = 1, target = \"id\", type = \"Int32\" }}]\n"
+        );
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&ch_config_path)?
+            .write_all(late.as_bytes())?;
+        guard.child = Some(daemon.spawn(&source, &ch_config_path, slot.walsender, &[])?);
+        source.psql_one(&format!(
+            "INSERT INTO {schema}.t VALUES (6, 'after-restart')"
+        ))?;
+        fx::wait_for_ch_value(
+            &ch,
+            "SELECT count() FROM default.t FINAL WHERE _is_deleted = 0 AND id = 6",
+            "1",
+            Duration::from_secs(60),
+        )?;
+        ensure!(
+            daemon
+                .stderr()
+                .contains("[toast] mode = shadow cannot replicate this table"),
+            "late table's missing TOAST heap not refused"
         );
         Ok(())
     })();

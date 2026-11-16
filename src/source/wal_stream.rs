@@ -40,7 +40,7 @@ use walrus::pg::walparser::{
 
 use crate::filter::Filter;
 use crate::filter::header_walk;
-use crate::filter::rewrite::{RewriteError, noop_replace};
+use crate::filter::rewrite::noop_replace;
 use crate::pos::{Floor, Pos};
 #[cfg(test)]
 use crate::record::{
@@ -61,6 +61,10 @@ use crate::source::streaming_walker::{CompletedRecord, StreamingWalker, WalkErro
 const STAGED_MAX_BYTES: usize = 128 * 1024;
 const STAGED_MAX_RECORDS: usize = 4096;
 
+/// Decoder routing needs a block or relation-naming main data, and the walker
+/// hands over whole records, so a NOOP always fits
+const NOOP_FITS: &str = "decoder-routed record too small for NOOP";
+
 #[derive(Debug, Error)]
 pub enum WalStreamError {
     #[error("walk segment {seg}: {source}")]
@@ -80,12 +84,6 @@ pub enum WalStreamError {
         offset: usize,
         #[source]
         source: crate::decode::wal_xact::XactPayloadError,
-    },
-    #[error("rewrite record at offset {offset}: {source}")]
-    Rewrite {
-        offset: usize,
-        #[source]
-        source: RewriteError,
     },
     #[error("misaligned push: expected lsn {expected:#X}, got {got:#X}")]
     Misaligned { expected: u64, got: u64 },
@@ -383,10 +381,7 @@ impl WalStream {
                     // Cross-page: stitch → NOOP → scatter back across
                     // `byte_ranges`.
                     Some(mut bytes) => {
-                        noop_replace(&mut bytes).map_err(|source| WalStreamError::Rewrite {
-                            offset: start_offset,
-                            source,
-                        })?;
+                        noop_replace(&mut bytes).expect(NOOP_FITS);
                         self.walker.rewrite_record(&byte_ranges, &bytes);
                     }
                     // Single-page: contiguous, NOOP in place.
@@ -394,10 +389,7 @@ impl WalStream {
                         let (off, len) = byte_ranges[0];
                         self.walker
                             .rewrite_record_in_place(off, len, noop_replace)
-                            .map_err(|source| WalStreamError::Rewrite {
-                                offset: start_offset,
-                                source,
-                            })?;
+                            .expect(NOOP_FITS);
                     }
                 }
             }

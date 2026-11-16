@@ -234,17 +234,22 @@ async fn seed_catalog_in_snapshot(source: &Client, socket_dir: &Path, seeds: &[O
     oracle.batch_execute("SET extra_float_digits = 3").await?;
 
     let major = "SELECT current_setting('server_version_num')::int / 10000";
-    let source_major: i32 = source.query_one(major, &[]).await?.get(0);
-    let oracle_major: i32 = oracle.query_one(major, &[]).await?.get(0);
-    anyhow::ensure!(
-        source_major == oracle_major,
-        "oracle PostgreSQL {oracle_major} cannot hold catalog rows of source PostgreSQL {source_major}",
-    );
+    let source_major = source.query_one(major, &[]).await?.get(0);
+    let oracle_major = oracle.query_one(major, &[]).await?.get(0);
+    check_majors(source_major, oracle_major)?;
     for (catalog, filter) in plan_copy(source, seeds).await? {
         copy_catalog(source, &oracle, catalog, &filter)
             .await
             .with_context(|| format!("copy {catalog}"))?;
     }
+    Ok(())
+}
+
+fn check_majors(source: i32, oracle: i32) -> Result<()> {
+    anyhow::ensure!(
+        source == oracle,
+        "oracle PostgreSQL {oracle} cannot hold catalog rows of source PostgreSQL {source}",
+    );
     Ok(())
 }
 
@@ -357,12 +362,16 @@ async fn copy_catalog(source: &Client, oracle: &Client, catalog: &str, filter: &
             (row.get(0), transfer)
         })
         .collect();
+    // Key columns as positions in `columns`
     let keys: Vec<Vec<usize>> = oracle
         .query(
-            "SELECT array_agg(a.attname::text ORDER BY k.n)
+            "SELECT array_agg(a.pos ORDER BY k.n)
              FROM pg_catalog.pg_index i
              CROSS JOIN LATERAL unnest(i.indkey::int2[]) WITH ORDINALITY k(attnum, n)
-             JOIN pg_catalog.pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum
+             JOIN (SELECT attnum, (row_number() OVER (ORDER BY attnum) - 1)::int4 pos
+                   FROM pg_catalog.pg_attribute
+                   WHERE attrelid = $1::text::pg_catalog.regclass AND attnum > 0
+                       AND NOT attisdropped) a ON a.attnum = k.attnum
              WHERE i.indrelid = $1::text::pg_catalog.regclass AND i.indisunique
              GROUP BY i.indexrelid",
             &[&rel],
@@ -370,17 +379,12 @@ async fn copy_catalog(source: &Client, oracle: &Client, catalog: &str, filter: &
         .await?
         .iter()
         .map(|row| {
-            row.get::<_, Vec<String>>(0)
-                .iter()
-                .map(|key| {
-                    columns
-                        .iter()
-                        .position(|(name, _)| name == key)
-                        .with_context(|| format!("index column {key}"))
-                })
+            row.get::<_, Vec<i32>>(0)
+                .into_iter()
+                .map(|pos| pos as usize)
                 .collect()
         })
-        .collect::<Result<_>>()?;
+        .collect();
 
     // Never replace pinned rows, matching `IsPinnedObject`, where `public` is the
     // one unpinned bootstrap object. Rows without OIDs are keyed by copied
@@ -589,6 +593,15 @@ mod tests {
         }
         assert_eq!(present_sockets(tmp.path(), 3), 2);
         assert_eq!(present_sockets(tmp.path(), 1), 1);
+    }
+
+    #[test]
+    fn catalog_copy_needs_matching_majors() {
+        check_majors(18, 18).unwrap();
+        assert_eq!(
+            check_majors(17, 19).unwrap_err().to_string(),
+            "oracle PostgreSQL 19 cannot hold catalog rows of source PostgreSQL 17"
+        );
     }
 
     #[test]

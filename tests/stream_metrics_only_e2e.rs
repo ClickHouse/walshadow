@@ -74,6 +74,26 @@ async fn metrics_only_bootstrap_streams_and_reports_open_xact() {
         stdin.write_all(b"COMMIT;\n")?;
         drop(stdin);
         ensure!(open.wait()?.success(), "open xact session failed");
+        // No `[ch]` to apply TRUNCATE or DDL against; ack still passes both
+        source.psql_one("TRUNCATE public.t")?;
+        source.psql_one("ALTER TABLE public.t ADD COLUMN w int")?;
+        let applied: u64 = source
+            .psql_one("SELECT pg_current_wal_lsn() - '0/0'")?
+            .parse()?;
+        source.psql_one("SELECT pg_switch_wal()")?;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let body = fx::http_get(daemon.metrics_addr, "/metrics")?;
+            let ack = fx::parse_metric(&body, "walshadow_emitter_ack_lsn");
+            if ack.is_some_and(|a| a >= applied) {
+                break;
+            }
+            ensure!(
+                Instant::now() < deadline,
+                "ack {ack:?} stuck below {applied}"
+            );
+            std::thread::sleep(Duration::from_millis(200));
+        }
         Ok(())
     }
     .await;

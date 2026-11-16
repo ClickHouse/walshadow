@@ -370,11 +370,28 @@ pub(crate) mod tests {
     }
 
     async fn run_one(batch: InsertBatch, output_open: bool) -> Fatal {
+        run_with(
+            batch,
+            output_open,
+            None,
+            RetryConfig::default(),
+            Arc::default(),
+        )
+        .await
+    }
+
+    async fn run_with(
+        batch: InsertBatch,
+        output_open: bool,
+        oracle: Option<Arc<Oracle>>,
+        retry: RetryConfig,
+        stats: Arc<EmitterStats>,
+    ) -> Fatal {
         let fatal = Fatal::new();
         let opts = ResolverOptions {
-            oracle: None,
-            retry: RetryConfig::default(),
-            stats: Arc::default(),
+            oracle,
+            retry,
+            stats,
             fatal: fatal.clone(),
             config_rx: None,
         };
@@ -401,5 +418,41 @@ pub(crate) mod tests {
         assert!(msg.starts_with("oracle resolve: "), "{msg}");
         let fatal = run_one(seal(vec![wkt_row(0, Some("POINT(1 2)"))]).await, false).await;
         assert!(fatal.message().is_none());
+    }
+
+    /// Dead bridge socket is a transport failure, so the resolver retries it
+    #[tokio::test]
+    async fn transport_failure_counts_a_retry() {
+        use crate::ops::bridge::{self, Bridge};
+        let (_tmp, path) = bridge::tests::spawn_worker(vec![
+            Some(bridge::tests::hello_body(
+                bridge::PROTO_VERSION,
+                bridge::PROJECTION_VERSION,
+            )),
+            None,
+        ]);
+        let oracle = Arc::new(Oracle::new(Arc::new(Bridge::connect(&path).await.unwrap())));
+        let mut raw = wkt_row(0, None);
+        raw.committed.decoded.new.as_mut().unwrap().columns[0] = Some(ColumnValue::Unsupported {
+            type_oid: GEOM_OID,
+            raw: vec![1],
+        });
+        let retry = RetryConfig {
+            max_attempts: 1,
+            initial_backoff: Duration::from_millis(1),
+            max_backoff: Duration::from_millis(1),
+        };
+        let stats = Arc::new(EmitterStats::default());
+        let fatal = run_with(
+            seal(vec![raw]).await,
+            true,
+            Some(oracle),
+            retry,
+            stats.clone(),
+        )
+        .await;
+        let msg = fatal.message().expect("dead bridge trips fatal");
+        assert!(msg.starts_with("oracle resolve: "), "{msg}");
+        assert_eq!(stats.retries_attempted.load(Ordering::Relaxed), 1);
     }
 }

@@ -1569,13 +1569,11 @@ mod tests {
                 )))])
                 .await
                 .unwrap();
-            let mut reader = writer.finish().await.unwrap();
-            let file = OpenOptions::new()
-                .write(true)
-                .open(reader.path())
-                .await
-                .unwrap();
+            let path = writer.finish().await.unwrap().path().to_path_buf();
+            let file = OpenOptions::new().write(true).open(&path).await.unwrap();
             file.set_len(4 + remaining).await.unwrap();
+            // Open after truncation so first chunk read sees short file
+            let mut reader = SpillReader::open(path, IO_CHUNK).await.unwrap();
             assert!(matches!(
                 reader.next().await,
                 Err(SpillError::Io(e)) if e.kind() == io::ErrorKind::UnexpectedEof

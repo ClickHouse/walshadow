@@ -91,8 +91,8 @@ impl Reloader {
 #[derive(Clone)]
 pub struct SharedCtx {
     pub ch_config: PathBuf,
-    /// Fragment control mutations write, see [`fragment_path`]
-    pub fragment: PathBuf,
+    /// Fragment control mutations write
+    pub fragment: Fragment,
     /// CLI-arg `[source]` / `[ch]` defaults; the config file overrides them,
     /// matching the daemon's connection resolution
     /// (see `ch_emitter::load_effective`).
@@ -192,7 +192,10 @@ pub fn serve(path: PathBuf, ctx: SharedCtx) -> Result<tokio::task::JoinHandle<()
                         }
                     });
                 }
-                Err(e) => tracing::warn!(target: "walshadow::control", error = %e, "accept failed"),
+                Err(e) => {
+                    tracing::warn!(target: "walshadow::control", error = %e, "accept failed");
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
             }
         }
     }))
@@ -236,7 +239,7 @@ async fn apply(ctx: &SharedCtx, req: &Request<'_>) -> Result<String> {
         bail!("empty apply (send a TOML fragment as the body)");
     }
     let _guard = ctx.frag_lock.lock().await;
-    let mut root = load(&ctx.fragment).await?;
+    let mut root = load(&ctx.fragment.path()).await?;
     crate::ch_emitter::merge_tables(&mut root, req.config.clone());
     commit(ctx, &ctx.fragment, &root).await
 }
@@ -244,7 +247,7 @@ async fn apply(ctx: &SharedCtx, req: &Request<'_>) -> Result<String> {
 /// Removes named keys without touching operator-owned base config
 async fn unset(ctx: &SharedCtx, req: &Request<'_>) -> Result<String> {
     let _guard = ctx.frag_lock.lock().await;
-    let mut root = load(&ctx.fragment).await?;
+    let mut root = load(&ctx.fragment.path()).await?;
     apply_mask(&mut root, &req.config);
     commit(ctx, &ctx.fragment, &root).await
 }
@@ -263,8 +266,8 @@ fn apply_mask(root: &mut Table, mask: &Table) {
 
 /// Persist `root` as fragment `frag` only once merged config accepts it, so
 /// file never holds a rejected fragment, not even briefly
-async fn commit(ctx: &SharedCtx, frag: &Path, root: &Table) -> Result<String> {
-    validate(ctx, frag, root)
+async fn commit(ctx: &SharedCtx, frag: &Fragment, root: &Table) -> Result<String> {
+    validate(ctx, &frag.path(), root)
         .await
         .context("rejected: merged config invalid")?;
     save(frag, root).await?;
@@ -288,12 +291,27 @@ pub const DEFAULT_FRAGMENT: &str = "50-api.toml";
 
 /// Plain `.toml` name, so reload picks the fragment up in its lexical slot of
 /// the `ch-config.d` directory
-pub fn fragment_path(ch_config: &Path, name: &str) -> Result<PathBuf> {
+#[derive(Clone, Debug)]
+pub struct Fragment {
+    dir: PathBuf,
+    name: String,
+}
+
+impl Fragment {
+    pub fn path(&self) -> PathBuf {
+        self.dir.join(&self.name)
+    }
+}
+
+pub fn fragment_path(ch_config: &Path, name: &str) -> Result<Fragment> {
     let plain = Path::new(name).file_name().is_some_and(|n| n == name);
     if !plain || Path::new(name).extension().is_none_or(|e| e != "toml") {
         bail!("control fragment {name:?} must be a .toml file name without directories");
     }
-    Ok(ch_config.with_extension("d").join(name))
+    Ok(Fragment {
+        dir: ch_config.with_extension("d"),
+        name: name.to_owned(),
+    })
 }
 
 async fn get_config(ctx: &SharedCtx) -> Result<Table> {
@@ -735,18 +753,15 @@ async fn load(path: &Path) -> Result<Table> {
     }
 }
 
-async fn save(path: &Path, root: &Table) -> Result<()> {
-    let dir = path.parent().context("fragment path has no directory")?;
-    let name = path.file_name().and_then(|n| n.to_str());
-    let name = name.context("fragment path has no UTF-8 file name")?;
-    tokio::fs::create_dir_all(dir).await.ok();
+async fn save(frag: &Fragment, root: &Table) -> Result<()> {
+    tokio::fs::create_dir_all(&frag.dir).await.ok();
     crate::fs::write_atomic(
-        dir,
-        name,
+        &frag.dir,
+        &frag.name,
         toml::to_string(root).context("serialize toml")?.as_bytes(),
     )
     .await
-    .with_context(|| format!("write {}", path.display()))
+    .with_context(|| format!("write {}", frag.path().display()))
 }
 
 // TODO: use daemon catalog rather than a second connection per request
@@ -898,6 +913,66 @@ mod tests {
         assert!(format!("{err:#}").contains("unlink stale"), "{err:#}");
     }
 
+    struct Warns(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Warns {
+        fn on_event(&self, e: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+            let warn = *e.metadata().level() == tracing::Level::WARN;
+            self.0
+                .fetch_add(usize::from(warn), std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Accept failing on fd exhaustion is retried after a backoff, peer gone
+    /// before reply drops only its own connection
+    #[tokio::test]
+    async fn serve_outlives_fd_exhaustion_and_vanished_peers() {
+        use std::os::fd::AsRawFd;
+        use tracing_subscriber::layer::SubscriberExt;
+        let warns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        // Current-thread runtime, so spawned accept loop logs on this thread
+        let _log = tracing::subscriber::set_default(
+            tracing_subscriber::registry().with(Warns(warns.clone())),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("c.sock");
+        let _h = serve(sock.clone(), ctx_at(dir.path())).unwrap();
+
+        let mut gone = UnixStream::connect(&sock).await.unwrap();
+        gone.write_all(b"\xff").await.unwrap();
+        drop(gone);
+
+        let pending = tokio::net::UnixSocket::new_stream().unwrap();
+        let lowest_free = std::fs::File::open("/dev/null").unwrap().as_raw_fd();
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        let exhausted = |limit: libc::rlimit| libc::rlimit {
+            rlim_cur: libc::rlim_t::try_from(lowest_free).unwrap(),
+            ..limit
+        };
+        // SAFETY: rlimit structs outlive each call
+        unsafe {
+            assert_eq!(libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit), 0);
+            assert_eq!(libc::setrlimit(libc::RLIMIT_NOFILE, &exhausted(limit)), 0);
+        }
+        let mut s = pending.connect(&sock).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // SAFETY: as above
+        unsafe { assert_eq!(libc::setrlimit(libc::RLIMIT_NOFILE, &limit), 0) };
+        s.write_all(b"\xff").await.unwrap();
+        s.shutdown().await.unwrap();
+        let mut resp = String::new();
+        s.read_to_string(&mut resp).await.unwrap();
+        assert!(resp.starts_with("ERR"), "{resp}");
+        let warned = warns.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            (1..=3).contains(&warned),
+            "{warned} accept warnings in 50ms"
+        );
+    }
+
     /// Fragment I/O and source connect failures answer ERR naming the cause
     #[tokio::test]
     async fn requests_surface_fragment_and_source_failures() {
@@ -905,7 +980,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("c.sock");
         let ctx = ctx_at(dir.path());
-        let frag = ctx.fragment.clone();
+        let frag = ctx.fragment.path();
         let _h = serve(sock.clone(), ctx).unwrap();
 
         let mut raw = UnixStream::connect(&sock).await.unwrap();
@@ -981,7 +1056,11 @@ mod tests {
                    [namespace.public]\nauto_create = true\ninitial_load = \"object_store\"\n\
                    [table.public.orders]\nreplicate = true\ninitial_load = \"copy\"\n";
         std::fs::write(&ctx.ch_config, doc).unwrap();
-        let base = crate::ch_emitter::EmitterConfig::from_table(&doc.parse().unwrap()).unwrap();
+        // Live config still opts in a table the file since dropped
+        let live_doc =
+            format!("{doc}[table.public.items]\nreplicate = true\ninitial_load = \"copy\"\n");
+        let base =
+            crate::ch_emitter::EmitterConfig::from_table(&live_doc.parse().unwrap()).unwrap();
         let (resolver, _rx) = crate::config::ConfigResolver::new(
             &base,
             crate::config::CliOverrides::default(),
@@ -1019,16 +1098,27 @@ mod tests {
                 missing_default: None,
             }],
         };
-        resolver
-            .register_derived_mapping(
-                &desc,
-                TableMapping {
-                    target: TableTarget::new("cdc", "public_events"),
-                    columns: Vec::new(),
-                    tees: Vec::new(),
-                },
-            )
-            .await;
+        for (namespace, name) in [
+            ("public", "events"),
+            ("public", "items"),
+            ("audit", "trail"),
+        ] {
+            let desc = RelDescriptor {
+                rel_name: RelName::new(namespace, name),
+                ..desc.clone()
+            };
+            let target = TableTarget::new("cdc", &format!("{namespace}_{name}"));
+            resolver
+                .register_derived_mapping(
+                    &desc,
+                    TableMapping {
+                        target,
+                        columns: Vec::new(),
+                        tees: Vec::new(),
+                    },
+                )
+                .await;
+        }
         ctx.reloader.set_resolvers(vec![resolver]).await;
         let _h = serve(sock.clone(), ctx).unwrap();
 
@@ -1041,7 +1131,7 @@ mod tests {
                 .filter_map(Value::as_table)
                 .find(|t| t.get("source_table").and_then(Value::as_str) == Some(source))
                 .cloned()
-                .unwrap_or_else(|| panic!("{source} missing: {status}"))
+                .unwrap()
         };
         let events = entry("app.public.events");
         assert_eq!(
@@ -1053,7 +1143,15 @@ mod tests {
             entry("app.public.orders")["initial_load"].as_str(),
             Some("copy")
         );
-        assert_eq!(tables.len(), 2, "{status}");
+        assert_eq!(
+            entry("app.public.items")["initial_load"].as_str(),
+            Some("copy")
+        );
+        assert_eq!(
+            entry("app.audit.trail")["initial_load"].as_str(),
+            Some("none")
+        );
+        assert_eq!(tables.len(), 4, "{status}");
     }
 
     fn ctx_at(dir: &Path) -> SharedCtx {
@@ -1284,7 +1382,7 @@ mod tests {
     fn fragment_path_takes_plain_toml_names_only() {
         let base = Path::new("/etc/walshadow/ch-config.toml");
         assert_eq!(
-            fragment_path(base, "90-ctl.toml").unwrap(),
+            fragment_path(base, "90-ctl.toml").unwrap().path(),
             Path::new("/etc/walshadow/ch-config.d/90-ctl.toml")
         );
         for bad in [

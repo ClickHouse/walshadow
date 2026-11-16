@@ -701,6 +701,12 @@ mod tests {
     }
 
     #[test]
+    fn unparseable_default_renders_no_default() {
+        let r = map(&attr(INT4OID, -1, true, Some("seven")), false);
+        assert_eq!(r.default_sql, None);
+    }
+
+    #[test]
     fn default_for_text_quotes_and_escapes() {
         let r = map(&attr(TEXTOID, -1, true, Some("o'rly")), false);
         assert_eq!(r.default_sql.as_deref(), Some("'o''rly'"));

@@ -554,6 +554,21 @@ mod tests {
     }
 
     #[test]
+    fn non_string_result_column_is_refused() {
+        use clickhouse_c::{Allocator, BlockOpts, BlockReader, SliceIo};
+        // One UInt8 column x, one row 42
+        let native = b"\x01\x01\x01x\x05UInt8\x2a";
+        let mut io = SliceIo::new(native);
+        let mut reader =
+            BlockReader::new(io.as_mut(), Allocator::default(), BlockOpts::default()).unwrap();
+        let block = reader.read().unwrap().unwrap();
+        let mut out = Vec::new();
+        let e = read_string_column(&block, &mut out).unwrap_err();
+        assert_eq!(e.to_string(), "type: result is not one String column");
+        assert_eq!(out, Vec::<String>::new());
+    }
+
+    #[test]
     fn client_error_prefix_appears_once() {
         let e = EmitterError::from(clickhouse_c::Error::from(std::io::Error::other("reset")));
         assert_eq!(e.to_string(), "clickhouse-c: Io: reset");

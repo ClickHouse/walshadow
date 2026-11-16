@@ -347,6 +347,15 @@ impl StreamingWalker {
                     self.page_cursor += take_now;
                     p.try_resolve_total_len(&self.buf);
                 }
+                if p.total_len
+                    .is_some_and(|t| (t as usize) < X_LOG_RECORD_HEADER_SIZE)
+                {
+                    self.done_in_segment = true;
+                    return Some(Err(WalkError::ShortRecord {
+                        offset: p.start_offset,
+                        min: X_LOG_RECORD_HEADER_SIZE,
+                    }));
+                }
                 if p.fully_loaded() {
                     let p = self.pending.take().unwrap();
                     let stitched = p.materialise(&self.buf);
@@ -413,9 +422,6 @@ impl StreamingWalker {
             let page_end = self.page_start + PAGE_SIZE;
             let skip = remaining_data_len.min(page_end - data_start);
             self.page_cursor = align_up(data_start + skip, X_LOG_RECORD_ALIGNMENT);
-            if remaining_data_len >= page_end - data_start {
-                self.page_cursor = page_end;
-            }
         }
         Ok(true)
     }
@@ -632,15 +638,11 @@ mod tests {
         let p1_remainder_bytes = &record[p1_data_area..]; // 48
         let page1 = build_single_page(p1_record_bytes, XLP_PAGE_MAGIC_PG15, 0);
 
-        let mut page2 = Vec::with_capacity(PAGE_SIZE);
-        page2.extend_from_slice(&XLP_PAGE_MAGIC_PG15.to_le_bytes());
-        page2.extend_from_slice(&0u16.to_le_bytes());
-        page2.extend_from_slice(&1u32.to_le_bytes());
-        page2.extend_from_slice(&(PAGE_SIZE as u64).to_le_bytes());
-        page2.extend_from_slice(&(p1_remainder_bytes.len() as u32).to_le_bytes());
-        page2.extend_from_slice(&[0u8; 4]); // pad to 24 (short header)
-        page2.extend_from_slice(p1_remainder_bytes);
-        page2.resize(PAGE_SIZE, 0);
+        let page2 = build_short_header_page(
+            p1_remainder_bytes,
+            p1_remainder_bytes.len() as u32,
+            PAGE_SIZE as u64,
+        );
 
         let mut walker = StreamingWalker::new(PAGE_SIZE * 2);
         walker.extend(&page1);
@@ -863,17 +865,89 @@ mod tests {
         assert!(walker.try_next().is_none(), "nothing past the end");
     }
 
+    fn build_short_header_page(body: &[u8], remaining_data_len: u32, page_address: u64) -> Vec<u8> {
+        let mut page =
+            build_long_header_page(body, XLP_PAGE_MAGIC_PG15, remaining_data_len, page_address);
+        page[2..4].copy_from_slice(&0u16.to_le_bytes());
+        page.drain(24..40);
+        page.resize(PAGE_SIZE, 0);
+        page
+    }
+
+    /// Page holding a full record, then first 16 bytes of `next` header
+    fn page_ending_in_header(next: &[u8]) -> Vec<u8> {
+        let first = PAGE_SIZE - 40 - 16;
+        let mut body = header_le(first as u32);
+        body.resize(first, 0);
+        body.extend_from_slice(&next[..16]);
+        build_single_page(&body, XLP_PAGE_MAGIC_PG15, 0)
+    }
+
+    /// Header-only record (eg XLOG_SWITCH) whose header straddles a page
+    #[test]
+    fn stitches_header_only_record_straddling_pages() {
+        let switch = header_le(X_LOG_RECORD_HEADER_SIZE as u32);
+        let mut walker = StreamingWalker::new(2 * PAGE_SIZE);
+        walker.extend(&page_ending_in_header(&switch));
+        assert_eq!(walker.try_next().unwrap().unwrap().start_offset, 40);
+        assert!(walker.try_next().is_none());
+        walker.extend(&build_short_header_page(&switch[16..], 8, PAGE_SIZE as u64));
+        let r = walker.try_next().unwrap().unwrap();
+        assert_eq!(
+            r.byte_ranges.as_slice(),
+            [(PAGE_SIZE - 16, 16), (PAGE_SIZE + 24, 8)]
+        );
+        assert_eq!(r.stitched_bytes, Some(switch));
+        assert!(walker.try_next().is_none());
+    }
+
+    /// Straddling header claiming less than a header ends the segment
+    #[test]
+    fn straddling_short_record_ends_the_segment() {
+        let short = header_le(10);
+        let mut walker = StreamingWalker::new(2 * PAGE_SIZE);
+        walker.extend(&page_ending_in_header(&short));
+        assert!(walker.try_next().unwrap().is_ok());
+        walker.extend(&build_short_header_page(&short[16..], 8, PAGE_SIZE as u64));
+        let e = walker.try_next().unwrap().unwrap_err();
+        let expected = WalkError::ShortRecord {
+            offset: PAGE_SIZE - 16,
+            min: X_LOG_RECORD_HEADER_SIZE,
+        };
+        assert_eq!(e.to_string(), expected.to_string());
+        assert!(walker.try_next().is_none());
+    }
+
+    /// Segment starting mid-record whose continuation covers its first page
+    #[test]
+    fn skips_unseen_continuation_spanning_a_whole_page() {
+        let tail = 100;
+        let page1 = build_single_page(
+            &vec![0xAA; PAGE_SIZE - 40],
+            XLP_PAGE_MAGIC_PG15,
+            (PAGE_SIZE - 40 + tail) as u32,
+        );
+        let mut body = vec![0xAA; tail];
+        body.resize(tail.next_multiple_of(X_LOG_RECORD_ALIGNMENT), 0);
+        body.extend_from_slice(&header_le(40));
+        body.resize(body.len() + 16, 0);
+        let page2 = build_short_header_page(&body, tail as u32, PAGE_SIZE as u64);
+        let mut walker = StreamingWalker::new(2 * PAGE_SIZE);
+        walker.extend(&page1);
+        assert!(walker.try_next().is_none());
+        walker.extend(&page2);
+        let r = walker.try_next().unwrap().unwrap();
+        assert_eq!((r.start_offset, r.total_len()), (PAGE_SIZE + 24 + 104, 40));
+        assert!(walker.try_next().is_none());
+    }
+
     /// Truncating below the page being parsed restarts from the first page
     #[test]
     fn truncate_below_the_current_page_rereads_from_its_header() {
         let mut record = header_le(8200);
         record.resize(8200, 0xAA);
         let page1 = build_single_page(&record[..PAGE_SIZE - 40], XLP_PAGE_MAGIC_PG15, 0);
-        let mut page2 =
-            build_long_header_page(&record[PAGE_SIZE - 40..], XLP_PAGE_MAGIC_PG15, 48, 0);
-        page2[2..4].copy_from_slice(&0u16.to_le_bytes());
-        page2.drain(24..40);
-        page2.resize(PAGE_SIZE, 0);
+        let page2 = build_short_header_page(&record[PAGE_SIZE - 40..], 48, PAGE_SIZE as u64);
         let mut walker = StreamingWalker::new(2 * PAGE_SIZE);
         walker.extend(&page1);
         walker.extend(&page2);

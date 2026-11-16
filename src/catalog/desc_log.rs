@@ -148,6 +148,16 @@ pub enum LogValue {
     Retired,
 }
 
+impl LogValue {
+    pub fn present(&self) -> Option<&Arc<RelDescriptor>> {
+        if let Self::Present(d) = self {
+            Some(d)
+        } else {
+            None
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct LogEntry {
     pub valid_from: u64,
@@ -246,14 +256,14 @@ pub enum LookupResult {
     ForeignDb,
 }
 
-/// [`LookupResult`] minus `Present`, error side of spanned lookups
+/// [`LookupResult`] minus `Present` and `ForeignDb`, error side of spanned
+/// lookups. Foreign locators return `NotCovered`, counted separately
 #[derive(Debug, Clone, PartialEq)]
 pub enum LookupMiss {
     Dropped,
     Retired,
     Ambiguous(Arc<Ambiguity>),
     NotCovered,
-    ForeignDb,
 }
 
 impl From<LookupMiss> for LookupResult {
@@ -263,7 +273,6 @@ impl From<LookupMiss> for LookupResult {
             LookupMiss::Retired => Self::Retired,
             LookupMiss::Ambiguous(a) => Self::Ambiguous(a),
             LookupMiss::NotCovered => Self::NotCovered,
-            LookupMiss::ForeignDb => Self::ForeignDb,
         }
     }
 }
@@ -517,6 +526,9 @@ impl DescriptorLog {
     }
 
     pub fn descriptor_at(&self, rfn: RelFileNode, lsn: u64) -> LookupResult {
+        if self.refuses_db(rfn.db_node) {
+            return LookupResult::ForeignDb;
+        }
         match self.descriptor_at_spanned(rfn, lsn) {
             Ok((rel, _)) => LookupResult::Present(rel),
             Err(miss) => miss.into(),
@@ -532,6 +544,9 @@ impl DescriptorLog {
         rfn: RelFileNode,
         lsn: u64,
     ) -> std::result::Result<(Arc<RelDescriptor>, u64), LookupMiss> {
+        if self.refuses_db(rfn.db_node) {
+            return Err(LookupMiss::NotCovered);
+        }
         let result = self.peek_spanned(rfn, lsn);
         self.count_spanned(&result);
         result
@@ -544,9 +559,6 @@ impl DescriptorLog {
         rfn: RelFileNode,
         lsn: u64,
     ) -> std::result::Result<(Arc<RelDescriptor>, u64), LookupMiss> {
-        if rfn.db_node != 0 && rfn.db_node != self.identity.db_oid {
-            return Err(LookupMiss::ForeignDb);
-        }
         let idx = self.index.read().unwrap();
         // Ambiguity precedes the chain: a chain entry inside an ambiguous
         // interval is not proven safe for rows there. The db scope keys on
@@ -587,7 +599,7 @@ impl DescriptorLog {
             self.stats
                 .lookups_foreign_db
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            return Err(LookupMiss::ForeignDb);
+            return Err(LookupMiss::NotCovered);
         }
         self.descriptor_by_oid_at_spanned(oid, lsn)
     }
@@ -625,8 +637,19 @@ impl DescriptorLog {
             LookupMiss::Retired => self.stats.lookups_retired.fetch_add(1, Relaxed),
             LookupMiss::Ambiguous(_) => self.stats.lookups_ambiguous.fetch_add(1, Relaxed),
             LookupMiss::NotCovered => self.stats.lookups_not_covered.fetch_add(1, Relaxed),
-            LookupMiss::ForeignDb => self.stats.lookups_foreign_db.fetch_add(1, Relaxed),
         };
+    }
+
+    /// Neither this log's database nor shared catalogs (`db_node` 0),
+    /// counted as a foreign-database lookup
+    pub fn refuses_db(&self, db_node: Oid) -> bool {
+        let foreign = db_node != 0 && db_node != self.identity.db_oid;
+        if foreign {
+            self.stats
+                .lookups_foreign_db
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        foreign
     }
 
     /// Intervals overlapping `[from, through)` for a relation, under every
@@ -681,10 +704,7 @@ impl DescriptorLog {
         chain[..upto]
             .iter()
             .rev()
-            .find_map(|s| match &s.entry.value {
-                LogValue::Present(d) => Some(d.clone()),
-                _ => None,
-            })
+            .find_map(|s| s.entry.value.present().cloned())
     }
 
     /// Replay-from-log hit test for a boundary at `captured_at`
@@ -1879,6 +1899,20 @@ mod tests {
         DescriptorLog::open(dir, ident()).await.unwrap()
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn open_surfaces_an_unreadable_tail() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join(TAIL_FILE)).unwrap();
+        let err = DescriptorLog::open(tmp.path(), ident())
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            matches!(&err, DescLogError::Io(io) if io.kind() == std::io::ErrorKind::IsADirectory),
+            "{err}"
+        );
+    }
+
     #[test]
     fn partition_ancestors_round_trip_and_nest_one_deep() {
         let root = desc(90, 0, false);
@@ -2007,6 +2041,23 @@ mod tests {
             rel_node: 8000,
         };
         assert_eq!(log.descriptor_at(foreign, 150), LookupResult::ForeignDb);
+        assert_eq!(
+            log.descriptor_at_spanned(foreign, 150),
+            Err(LookupMiss::NotCovered)
+        );
+        let stats = log.stats_handle();
+        assert_eq!(
+            stats
+                .lookups_foreign_db
+                .load(std::sync::atomic::Ordering::Relaxed),
+            2
+        );
+        assert_eq!(
+            stats
+                .lookups_not_covered
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
         // Shared-catalog db_node 0 is local, not foreign
         let shared = RelFileNode {
             spc_node: 1664,
@@ -2035,7 +2086,7 @@ mod tests {
         assert_eq!(stats.lookups_foreign_db.load(Relaxed), 0);
         assert_eq!(
             log.descriptor_by_oid_in_db_at_spanned(6, 101, 200),
-            Err(LookupMiss::ForeignDb)
+            Err(LookupMiss::NotCovered)
         );
         assert_eq!(stats.lookups_foreign_db.load(Relaxed), 1);
         assert_eq!(
@@ -2046,7 +2097,7 @@ mod tests {
         // Shared-catalog dbid 0 names no per-database relation either
         assert_eq!(
             log.descriptor_by_oid_in_db_at_spanned(0, 101, 200),
-            Err(LookupMiss::ForeignDb)
+            Err(LookupMiss::NotCovered)
         );
         assert_eq!(stats.lookups_foreign_db.load(Relaxed), 2);
     }
@@ -3008,7 +3059,9 @@ mod tests {
             smgr_create_lsn: None,
             kind: ObservationKind::FullScan,
         }];
-        let observed = encode_batch(&observed);
+        let observed_body = encode_batch(&observed);
+        assert_eq!(decode_body(&observed_body).unwrap(), observed);
+        let observed = observed_body;
         let present = encode_batch(&batch(4, vec![present(1, &desc(16400, 16400, false))]));
         // Wire order: rfn, oids, names, kind, persistence, replident
         let replident = 46 + 24 + (4 + 6) + (4 + 6) + 2;
@@ -3035,6 +3088,10 @@ mod tests {
             corrupt_detail(decode_body(&retired[..retired.len() - 1])),
             "short read: need 4, have 3"
         );
+        let mut bad = present.clone();
+        let name = bad.windows(4).position(|w| w == b"int8").unwrap();
+        bad[name] = 0xff;
+        assert!(corrupt_detail(decode_body(&bad)).starts_with("utf8: "));
     }
 
     #[test]

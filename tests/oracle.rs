@@ -314,6 +314,71 @@ async fn bootstrap_oracle_stops_cluster_on_source_error() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn bootstrap_oracle_names_catalog_it_cannot_read() {
+    let tmp = tempfile::tempdir().unwrap();
+    let Some(source) = start_pg(&tmp, ports::PG_SOURCE_PORT) else {
+        return;
+    };
+    source
+        .sh
+        .psql_one(
+            "CREATE ROLE restricted LOGIN;
+             REVOKE SELECT ON pg_catalog.pg_enum FROM PUBLIC",
+        )
+        .unwrap();
+    let client = source_client(&source.sh, "restricted", "oracle-seed").await;
+    let base = tmp.path().join("oracle");
+    let err = BootstrapOracle::provision(
+        base.clone(),
+        &client,
+        &[],
+        Some(pgext_dir()),
+        1,
+        Duration::from_secs(20),
+    )
+    .await
+    .err()
+    .expect("provision fails");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.starts_with("seed catalog: copy pg_enum: ") && msg.contains("permission denied"),
+        "{msg}"
+    );
+    assert!(!oracle_shadow(&base).is_running().unwrap());
+}
+
+/// Bridge socket name outgrows `sun_path` where PG's own socket still fits
+#[tokio::test(flavor = "current_thread")]
+async fn bootstrap_oracle_reports_bridge_sockets_it_cannot_dial() {
+    let tmp = tempfile::tempdir().unwrap();
+    let Some(source) = start_pg(&tmp, ports::PG_SOURCE_PORT) else {
+        return;
+    };
+    let client = source_client(&source.sh, "postgres", "oracle-seed").await;
+    let socket_dir_len = 90;
+    let pad = socket_dir_len - tmp.path().as_os_str().len() - "/sock".len() - 1;
+    let base = tmp.path().join("o".repeat(pad));
+    let err = BootstrapOracle::provision(
+        base.clone(),
+        &client,
+        &[],
+        Some(pgext_dir()),
+        1,
+        Duration::from_millis(300),
+    )
+    .await
+    .err()
+    .expect("provision fails");
+    let msg = format!("{err:#}");
+    let want = format!(
+        "bridge connect (0 of 1 worker sockets present under {}/sock; ",
+        base.display()
+    );
+    assert!(msg.starts_with(&want), "{msg}");
+    assert!(!oracle_shadow(&base).is_running().unwrap());
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn bootstrap_oracle_keeps_rows_sharing_oids_with_staging_objects() {
     let tmp = tempfile::tempdir().unwrap();
     let Some(source) = start_pg(&tmp, ports::PG_SOURCE_PORT) else {

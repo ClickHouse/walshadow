@@ -174,8 +174,7 @@ pub(crate) async fn build_source_db(input: SourceDbInputs<'_>) -> anyhow::Result
         .context("load backfill ledger")?
         .with_backup_loads(input.primary),
     );
-    let backfiller_effects: Option<Arc<dyn walshadow::opt_in::Backfiller>> =
-        Some(backfiller.clone() as _);
+    let backfiller_effects: Arc<dyn walshadow::opt_in::Backfiller> = backfiller.clone();
     // Re-materialise per-table opt-in scope from the seeded config_table
     // rows. Live edits arrive off WAL via the reorder coordinator, but a
     // restart replays WAL from past these rows' commit LSN, so the seed
@@ -189,7 +188,7 @@ pub(crate) async fn build_source_db(input: SourceDbInputs<'_>) -> anyhow::Result
                 &resolver,
                 &mut applicator,
                 &conn.catalog,
-                backfiller_effects.as_ref(),
+                &backfiller_effects,
                 rel,
                 row,
                 raw_start.get(),
@@ -204,7 +203,7 @@ pub(crate) async fn build_source_db(input: SourceDbInputs<'_>) -> anyhow::Result
                 &resolver,
                 &mut applicator,
                 &conn.catalog,
-                backfiller_effects.as_ref(),
+                &backfiller_effects,
                 rel,
                 row,
                 raw_start.get(),
@@ -226,7 +225,7 @@ pub(crate) async fn build_source_db(input: SourceDbInputs<'_>) -> anyhow::Result
             &resolver,
             &mut applicator,
             &conn.catalog,
-            backfiller_effects.as_ref(),
+            &backfiller_effects,
             rel,
             row,
             raw_start.get(),

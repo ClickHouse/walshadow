@@ -70,10 +70,9 @@ use crate::source_db::{
     open_db_desc_log, open_source_sql_client,
 };
 use crate::source_recovery::{
-    BARRIER_LOG_INTERVAL, FORK_FENCE_DRAIN, PROMOTION_POLL, PauseState, PromotionGate,
-    ReconnectBackoff, ResumePoint, SOURCE_SWAP_RETRY, SourcePath, SourceRecovery,
-    commit_fork_resume, connect_source_waiting, promotion_gate, resume_manifest,
-    resume_source_feed, stream_branch, swap_reason,
+    BARRIER_LOG_INTERVAL, PROMOTION_POLL, PauseState, PromotionGate, ReconnectBackoff, ResumePoint,
+    SOURCE_SWAP_RETRY, SourcePath, SourceRecovery, commit_fork_resume, connect_source_waiting,
+    promotion_gate, resume_manifest, resume_source_feed, stream_branch, swap_reason,
 };
 
 /// Wait out an unreachable ClickHouse at boot rather than exit, which leaves
@@ -272,7 +271,7 @@ async fn session_body(
     args: &Args,
     metrics: &MetricsRegistry,
     reloader: &Arc<walshadow::control::Reloader>,
-    sighup: tokio::signal::unix::Signal,
+    mut sighup: tokio::signal::unix::Signal,
     shutdown: &CancellationToken,
     attach: &AttachSlot,
     io: &TaskTracker,
@@ -280,6 +279,7 @@ async fn session_body(
     // Clone the Arc-backed registry so the body's `&metrics` uses are unchanged.
     let metrics = metrics.clone();
     let mut tasks = SessionTasks::default();
+    let sighup = futures::stream::poll_fn(move |cx| sighup.poll_recv(cx));
     tasks.spawn("sighup reload", sighup_reload(sighup, reloader.clone()));
 
     let merged: toml::Table = match args.ch_config.as_deref() {
@@ -410,7 +410,7 @@ async fn session_body(
     // keeps inserter and TOAST totals from resetting at handoff
     let emitter_stats = Arc::new(EmitterStats::default());
     let mut bootstrap_metrics: Option<BootstrapMetrics> = None;
-    let mut bootstrap_handoff: Option<BootstrapHandoff> = if shadow_start.bootstraps() {
+    let mut bootstrap_handoff = if let ShadowStart::Bootstrap(_, attempt) = &shadow_start {
         if !args.skip_preflight {
             let source_sql = feed
                 .sql_client()
@@ -426,11 +426,6 @@ async fn session_body(
             .into_result()
             .context("pre-flight rejected bootstrap")?;
         }
-        let previous = if let ShadowStart::Rebootstrap(_, marker) = &shadow_start {
-            Some(marker.clone())
-        } else {
-            None
-        };
         let (handoff, stage) = or_signal(
             shutdown,
             run_bootstrap(
@@ -438,7 +433,7 @@ async fn session_body(
                 &mut feed,
                 args,
                 &bootstrap_plan,
-                previous,
+                attempt.clone(),
                 ch_config.clone(),
                 BootstrapObservers {
                     metrics: &metrics,
@@ -493,16 +488,7 @@ async fn session_body(
     };
     let stand_in = stand_in_primary(&owned.shadow, &source_conn.dbname).await;
     let (owned, source_databases) = if let Some(name) = &stand_in {
-        let substituted: Vec<String> = source_databases
-            .iter()
-            .map(|db| {
-                if *db == source_conn.dbname {
-                    name.clone()
-                } else {
-                    db.clone()
-                }
-            })
-            .collect();
+        let substituted = substitute_database(&source_databases, &source_conn.dbname, name);
         tracing::warn!(
             target: "walshadow",
             absent = source_conn.dbname.as_str(),
@@ -899,8 +885,8 @@ async fn session_body(
     let db_conns: Vec<DbLink> = links.into_iter().flatten().collect();
     let primary_index = db_conns
         .iter()
-        .position(|db| db.name == source_conn.dbname)
-        .unwrap_or(0);
+        .position(|db| db.name == primary_dbname)
+        .expect("primary database linked");
     let shadow_conninfo = socket_conninfo(
         args.shadow_socket_dir
             .to_str()
@@ -937,13 +923,8 @@ async fn session_body(
         .await
         .context("pre-flight probe")?;
         // Relations of another database resolve over a connection to it
-        for conn in &db_conns {
-            if conn.name == source_conn.dbname {
-                continue;
-            }
-            let Some(cfg) = &conn.emitter else {
-                continue;
-            };
+        let others = db_conns.iter().filter(|c| c.name != source_conn.dbname);
+        for (conn, cfg) in others.filter_map(|c| Some((c, c.emitter.as_ref()?))) {
             let client = open_source_sql_client(&source_conn, &conn.name)
                 .await
                 .context(format!("source sql for database {}", conn.name))?;
@@ -1042,11 +1023,7 @@ async fn session_body(
 
     // Descriptor log: durable shape history captured at catalog boundaries,
     // bound to this source + shadow pairing. Sole schema-event source.
-    let source_major = (feed.server_version_num() / 10000) as u32;
-    anyhow::ensure!(
-        (16..=19).contains(&source_major),
-        "source PG major {source_major} unsupported (commit-record sinval layout audited for 16-19)",
-    );
+    let source_major = supported_major(feed.server_version_num())?;
     stream
         .filter_mut()
         .set_target_dbs(db_conns.iter().map(|conn| conn.oid));
@@ -1198,8 +1175,7 @@ async fn session_body(
                 .map_err(anyhow::Error::msg)
                 .context("memory budget")?;
         let mut dbs: Vec<Arc<SourceDb>> = Vec::with_capacity(db_conns.len());
-        let mut applicators: HashMap<Oid, walshadow::ch_ddl::DdlApplicator> = HashMap::new();
-        let mut backfillers: HashMap<Oid, Arc<dyn walshadow::opt_in::Backfiller>> = HashMap::new();
+        let mut ddl: HashMap<Oid, walshadow::pipeline::DbDdl> = HashMap::new();
         let mut resolvers: Vec<Arc<ConfigResolver>> = Vec::with_capacity(db_conns.len());
         for (i, conn) in db_conns.iter().enumerate() {
             let built = build_source_db(SourceDbInputs {
@@ -1238,8 +1214,12 @@ async fn session_body(
                 emitter_cfg.conn.compression = rc.conn.compression;
                 emitter_cfg.retry.max_attempts = rc.retry_max_attempts;
             }
-            applicators.insert(conn.oid, built.applicator);
-            backfillers.insert(conn.oid, built.backfiller.clone() as _);
+            let db_ddl = walshadow::pipeline::DbDdl {
+                applicator: built.applicator,
+                backfiller: built.backfiller.clone(),
+                resolver: built.resolver.clone(),
+            };
+            ddl.insert(conn.oid, db_ddl);
             copy_backfillers.insert(conn.oid, built.backfiller);
             resolvers.push(built.resolver.clone());
             resolvers_by_db.insert(conn.oid, built.resolver);
@@ -1265,16 +1245,15 @@ async fn session_body(
             emitter: emitter_cfg,
             decoder_pool_size: decoders,
             inserter_pool_size: inserters,
-            dbs: Arc::new(SourceDbs::new(dbs, primary_db_oid)),
+            dbs: Arc::new(SourceDbs::new(dbs, primary_index)),
             oracle: oracle.clone(),
-            applicators,
+            ddl,
             tail: TailKind::ClickHouse,
             buffer: xact_buffer.clone(),
             subxact_tracker: Arc::new(Mutex::new(SubxactTracker::new())),
             pending: pending_catalog.clone(),
             stats: stats.clone(),
             span_registry: span_registry.clone(),
-            backfillers,
             retires,
             pending_rows,
             resume_floor: resume_floor.clone(),
@@ -1312,16 +1291,15 @@ async fn session_body(
             emitter: EmitterConfig::default(),
             decoder_pool_size: decoders,
             inserter_pool_size: inserters,
-            dbs: Arc::new(SourceDbs::new(dbs, primary_db_oid)),
+            dbs: Arc::new(SourceDbs::new(dbs, primary_index)),
             oracle: None,
-            applicators: HashMap::new(),
+            ddl: HashMap::new(),
             tail: TailKind::Null,
             buffer: xact_buffer.clone(),
             subxact_tracker: Arc::new(Mutex::new(SubxactTracker::new())),
             pending: pending_catalog.clone(),
             stats: Arc::new(EmitterStats::default()),
             span_registry: span_registry.clone(),
-            backfillers: HashMap::new(),
             retires,
             pending_rows: walshadow::visibility_pending::PendingLedger::empty().shared(),
             resume_floor: resume_floor.clone(),
@@ -1336,7 +1314,7 @@ async fn session_body(
     let ack_probe = pipeline_handle.ack_probe.clone();
     let reorder_sink = booting_reorder
         .boot(
-            Some(&args.bootstrap_shadow_data_dir),
+            &args.bootstrap_shadow_data_dir,
             desc_log.active_present_at(raw_start.get()),
             raw_start.get(),
         )
@@ -1421,15 +1399,12 @@ async fn session_body(
     )));
     let fsync_fatal = walshadow::pipeline::Fatal::new();
     let (fsync_tx, fsync_rx) = tokio::sync::mpsc::channel::<SegFsync>(SEGMENT_FSYNC_QUEUE);
-    let mut fsync_task = spawn_segment_fsync(
-        args.out_dir.clone(),
-        fsync_rx,
-        durable_lsn.clone(),
-        fsync_fatal.clone(),
-    );
     let mut segment_sink =
         DirSegmentSink::with_durability(args.out_dir.clone(), WAL_SEG_SIZE, fsync_tx, io.clone())
             .context("open out-dir")?;
+    let out_dir = std::fs::File::open(&args.out_dir).context("open out-dir for syncfs")?;
+    let mut fsync_task =
+        spawn_segment_fsync(out_dir, fsync_rx, durable_lsn.clone(), fsync_fatal.clone());
     // Descriptor-log GC off the pump task: the pump publishes each persisted
     // floor, the task compacts. Coalesces by construction — a watch holds
     // only the latest floor.
@@ -1549,8 +1524,8 @@ async fn session_body(
     // anything down, and a moved `[source]` swaps the feed in place.
     // Pause and the source endpoint are cluster-wide, so the primary's
     // resolver is the one the pump watches
-    let pump_config_rx = config_resolvers.first().map(|r| r.subscribe());
-    if let Some(mut rx) = config_resolvers.first().map(|r| r.subscribe()) {
+    let pump_config_rx = config_resolvers.get(primary_index).map(|r| r.subscribe());
+    if let Some(mut rx) = config_resolvers.get(primary_index).map(|r| r.subscribe()) {
         tokio::spawn(async move {
             loop {
                 let on = rx.borrow_and_update().skip_attribution;
@@ -1584,7 +1559,7 @@ async fn session_body(
     // ancestor's switchpoint an ordinary reconnect has nothing to ask for
     let mut crossing = CrossingState::default();
     let mut barrier_logged: Option<Instant> = None;
-    let shutdown_reason = 'pump: loop {
+    let shutdown_reason = loop {
         // Switch timelines at a switchpoint. Reconnecting may find a switchpoint
         // missing from `history`; use that connection to fetch updated history.
         if matches!(path, SourcePath::AtSwitchpoint) {
@@ -1776,18 +1751,7 @@ async fn session_body(
         {
             if polled_at.is_none_or(|t| t.elapsed() >= PROMOTION_POLL) {
                 *polled_at = Some(Instant::now());
-                promotion = match tokio::time::timeout(
-                    PROMOTION_POLL,
-                    promotion_gate(&mut feed, *pause_received),
-                )
-                .await
-                {
-                    Ok(gate) => gate,
-                    Err(_) => {
-                        feed.drop_sql_client();
-                        PromotionGate::unreachable()
-                    }
-                };
+                promotion = promotion_gate(&mut feed, *pause_received).await;
             }
         } else {
             promotion = PromotionGate::blocked("not_paused");
@@ -2085,35 +2049,14 @@ async fn session_body(
             && !crossing.awaiting_connection()
             && let Some(probed) = crossing.fork().cloned()
         {
-            // Both fork proofs read the decoder's view, so the pump-side queue
-            // drains first: a record still in flight answers for a frontier the
-            // decoder has not reached, which would read as a transaction left
-            // open at the fork
+            // Read before the guards: with the source arms parked, an empty
+            // queue stays empty, so the decoder's view they read is final
             record_sink
                 .decoder_xact
                 .flush()
                 .await
                 .context("flush queueing decoder sink at the fork")?;
-            let fence = Instant::now();
-            let in_flight = loop {
-                let n = record_sink.decoder_xact.in_flight();
-                if n == 0 || fence.elapsed() >= FORK_FENCE_DRAIN {
-                    break n;
-                }
-                tokio::select! {
-                    () = shutdown.cancelled() => break 'pump "signal",
-                    () = tokio::time::sleep(Duration::from_millis(10)) => {}
-                }
-            };
-            // Timeout stops queue drain only, fork guards remain authoritative
-            if in_flight != 0 {
-                tracing::warn!(
-                    target: "walshadow",
-                    in_flight,
-                    waited = ?fence.elapsed(),
-                    "fork fence gave up draining the pump queue — guards decide",
-                );
-            }
+            let pump_in_flight = record_sink.decoder_xact.in_flight();
             let (guards, resume_safe) = {
                 let mut b = xact_buffer.lock().await;
                 let ea = emitter_ack.get();
@@ -2132,6 +2075,7 @@ async fn session_body(
             // meanwhile, so a wait reads as a wait rather than a stall, and the
             // source has stopped producing so nothing queues up behind it
             let open = match (walshadow::transition::ForkBarrier {
+                pump_in_flight,
                 resume_safe_lsn: resume_safe,
                 shadow_apply_lsn: (shadow_replay.get() != 0).then_some(shadow_replay),
                 filter_durable: durable,
@@ -2442,17 +2386,11 @@ async fn session_body(
         .close()
         .await
         .context("write final filtered segment")?;
-    let res = fsync_task.await;
-    if res.is_err() || fsync_fatal.is_set() {
-        return Err(task_stopped("segment fsync", res, &fsync_fatal));
-    }
+    task_finished("segment fsync", fsync_task.await, &fsync_fatal)?;
     // Close the floor channel and join: nothing else may own desc_log.ckpt
     // after the session returns
     drop(gc_floor);
-    let res = gc_task.await;
-    if res.is_err() || gc_fatal.is_set() {
-        return Err(task_stopped("descriptor log gc", res, &gc_fatal));
-    }
+    task_finished("descriptor log gc", gc_task.await, &gc_fatal)?;
     // Drain queueing worker so enqueued-but-undispatched records run
     // through decoder + xact_drain before exit; surfaces worker-parked errors.
     let DaemonSinks { decoder_xact, .. } = record_sink;
@@ -2497,6 +2435,16 @@ async fn session_body(
     .context("write shutdown resume manifest")?;
     shadow_lifecycle.shutdown().await;
     tasks.shutdown().await
+}
+
+/// Source PG major, refusing any whose commit-record sinval layout is unaudited
+fn supported_major(server_version_num: i32) -> Result<u32> {
+    let major = (server_version_num / 10000) as u32;
+    anyhow::ensure!(
+        (16..=19).contains(&major),
+        "source PG major {major} unsupported (commit-record sinval layout audited for 16-19)",
+    );
+    Ok(major)
 }
 
 /// Session tasks meant to run until shutdown; any exit before it is fatal
@@ -2569,6 +2517,28 @@ pub(crate) fn task_stopped(
     }
 }
 
+/// Join of a task told to finish, failing on a panic or a fatal it set
+fn task_finished(
+    name: &str,
+    res: Result<(), tokio::task::JoinError>,
+    fatal: &walshadow::pipeline::Fatal,
+) -> Result<()> {
+    if res.is_err() || fatal.is_set() {
+        return Err(task_stopped(name, res, fatal));
+    }
+    Ok(())
+}
+
+fn substitute_database(databases: &[String], absent: &str, replacement: &str) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    databases
+        .iter()
+        .map(|db| if db == absent { replacement } else { db })
+        .filter(|db| seen.insert(*db))
+        .map(str::to_owned)
+        .collect()
+}
+
 async fn stand_in_primary(shadow: &Arc<walshadow::shadow::Shadow>, absent: &str) -> Option<String> {
     if probe_blocking(shadow, |s| s.has_database()).await != Some(false) {
         return None;
@@ -2588,6 +2558,20 @@ async fn stand_in_primary(shadow: &Arc<walshadow::shadow::Shadow>, absent: &str)
 mod tests {
     use super::*;
     use walshadow::ch_emitter::InstanceConfig;
+
+    #[test]
+    fn stand_in_reuses_an_already_followed_database() {
+        for databases in [["late", "postgres", "early"], ["postgres", "late", "early"]] {
+            assert_eq!(
+                substitute_database(&databases.map(String::from), "late", "postgres"),
+                ["postgres", "early"]
+            );
+        }
+        assert_eq!(
+            substitute_database(&["early".into(), "late".into()], "late", "postgres"),
+            ["early", "postgres"]
+        );
+    }
 
     #[tokio::test]
     async fn boot_redials_clickhouse_that_drops_connections() {
@@ -2627,6 +2611,39 @@ mod tests {
         tasks.shutdown().await.expect("idle task aborts cleanly");
     }
 
+    #[test]
+    fn supported_major_spans_audited_sinval_layouts() {
+        assert_eq!(supported_major(160_004).unwrap(), 16);
+        assert_eq!(supported_major(190_000).unwrap(), 19);
+        let err = supported_major(150_008).unwrap_err().to_string();
+        assert_eq!(
+            err,
+            "source PG major 15 unsupported (commit-record sinval layout audited for 16-19)"
+        );
+    }
+
+    #[tokio::test]
+    async fn adopted_task_panic_propagates_and_fails_shutdown() {
+        let mut tasks = SessionTasks::default();
+        tasks.adopt("quits", tokio::spawn(async {}));
+        let err = tasks.exited().await.unwrap().to_string();
+        assert_eq!(err, "quits task exited");
+        tasks.adopt("panics", tokio::spawn(async { panic!("boom") }));
+        let err = tasks.exited().await.unwrap().to_string();
+        assert!(
+            err.starts_with("panics task failed") && err.ends_with("\"boom\""),
+            "{err}"
+        );
+        tasks.spawn("idle", std::future::pending());
+        tasks.spawn("panics", async { panic!("boom") });
+        tokio::task::yield_now().await;
+        let err = tasks.shutdown().await.unwrap_err().to_string();
+        assert!(
+            err.starts_with("panics task failed") && err.ends_with("\"boom\""),
+            "{err}"
+        );
+    }
+
     #[tokio::test]
     async fn task_stopped_prefers_fatal_over_join_result() {
         let fatal = walshadow::pipeline::Fatal::new();
@@ -2641,6 +2658,18 @@ mod tests {
             task_stopped("gc", panicked, &fatal).to_string(),
             "gc failed: disk gone"
         );
+    }
+
+    #[tokio::test]
+    async fn finished_task_fails_on_panic_or_fatal() {
+        let fatal = walshadow::pipeline::Fatal::new();
+        task_finished("fsync", Ok(()), &fatal).unwrap();
+        let panicked = tokio::spawn(async { panic!("boom") }).await;
+        let err = task_finished("fsync", panicked, &fatal).unwrap_err();
+        assert!(err.to_string().starts_with("fsync task failed"), "{err}");
+        fatal.set("syncfs out-dir: EIO".into());
+        let err = task_finished("fsync", Ok(()), &fatal).unwrap_err();
+        assert_eq!(err.to_string(), "fsync failed: syncfs out-dir: EIO");
     }
 
     #[tokio::test]

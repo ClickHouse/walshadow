@@ -17,6 +17,7 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use walshadow::mapping::{ColumnMapping, TableTarget};
+use walshadow::pending::DegradeReason;
 use walshadow::schema::RelName;
 use walshadow::shadow::Shadow;
 
@@ -67,14 +68,16 @@ impl TxnSession {
     }
 }
 
-/// Poll until the held session's statements executed (session parked idle
-/// in transaction) so its WAL precedes the upcoming segment switch
-fn wait_idle_in_txn(source: &Shadow) {
+/// Poll until the held session ran its statement ending in `last` (session
+/// parked idle in transaction) so its WAL precedes the upcoming segment switch
+fn wait_idle_in_txn(source: &Shadow, last: &str) {
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let probe = format!(
+        "SELECT count(*) FROM pg_stat_activity \
+         WHERE state = 'idle in transaction' AND query LIKE '%{last}'"
+    );
     loop {
-        let n = source
-            .psql_one("SELECT count(*) FROM pg_stat_activity WHERE state = 'idle in transaction'")
-            .expect("poll pg_stat_activity");
+        let n = source.psql_one(&probe).expect("poll pg_stat_activity");
         if n.trim() == "1" {
             return;
         }
@@ -171,7 +174,7 @@ async fn rename_commit_after_restart_reroutes() {
 
     let mut txn = TxnSession::open(&source);
     txn.send("BEGIN;\nALTER SCHEMA rs1 RENAME TO rs2;\n");
-    wait_idle_in_txn(&source);
+    wait_idle_in_txn(&source, "RENAME TO rs2;");
     source.psql_one("SELECT pg_switch_wal()").expect("rotate");
     let shipped = fx::pump_segments(&mut pipeline, 1, Duration::from_secs(60)).await;
     assert!(shipped >= 1, "expected ≥1 shipped segment, got {shipped}");
@@ -317,4 +320,102 @@ async fn prepared_rename_commit_after_restart_reroutes() {
         "COMMIT PREPARED after restart recaptures namespace, rows route under ps2",
     )
     .await;
+}
+
+/// Command boundaries the boot re-reads below `covered_through` sit where
+/// shadow already replayed past, so none can be read at its own position.
+/// Transaction degrades once however many such boundaries it holds, and its
+/// commit still captures above the seed
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn command_boundaries_below_covered_through_degrade_once() {
+    if !fx::tools::requirements_available() {
+        return;
+    }
+    let slot = fx::Ports::alloc();
+    let tmp = tempfile::tempdir().unwrap();
+    let (
+        fx::BootstrappedClusters {
+            source,
+            shadow,
+            shadow_filter_dir,
+        },
+        shadow_stream_state,
+    ) = fx::bootstrap_clusters(
+        &tmp,
+        "CREATE SCHEMA cb;\n\
+         CREATE TABLE cb.t (id bigint PRIMARY KEY, v text);\n",
+        slot.source,
+        slot.shadow,
+        slot.walsender,
+    )
+    .await;
+
+    let ch_tmp = tempfile::tempdir().unwrap();
+    let ch = fx::ChServer::spawn(ch_tmp, slot.ch_tcp, slot.ch_http).expect("spawn ch");
+    create_dest_table(&ch, "covered_t");
+
+    // Both boundaries land in the segment the pipeline boots in, below the
+    // head its seed covers
+    let mut txn = TxnSession::open(&source);
+    txn.send(
+        "BEGIN;\n\
+         ALTER TABLE cb.t ADD COLUMN a text;\n\
+         ALTER TABLE cb.t ADD COLUMN b text;\n",
+    );
+    wait_idle_in_txn(&source, "ADD COLUMN b text;");
+    // Boot seeds `covered_through` at the flushed head, and an open
+    // transaction's WAL waits in buffers until something flushes it
+    source.psql_one("CHECKPOINT").expect("flush WAL");
+    let mut pipeline = fx::build_pipeline(fx::BuildPipelineArgs {
+        tmp: &tmp,
+        source: &source,
+        shadow: &shadow,
+        shadow_filter_dir: &shadow_filter_dir,
+        shadow_stream_state,
+        ch_database: "walshadow_test",
+        ch_tcp_port: slot.ch_tcp,
+        mappings: mappings_for("cb", "covered_t"),
+        app_name: "walshadow-desc-covered",
+        ddl: Some(fx::DdlPipelineArgs::default()),
+    })
+    .await;
+    let capture = pipeline
+        .sinks
+        .capture
+        .stats_handles()
+        .next()
+        .expect("one capture")
+        .1;
+
+    txn.send(
+        "INSERT INTO cb.t (id, v, a, b) VALUES (1, 'post', 'x', 'y');\n\
+         COMMIT;\n\
+         SELECT pg_switch_wal();\n",
+    );
+    txn.finish();
+    let shipped = fx::pump_segments(&mut pipeline, 1, Duration::from_secs(60)).await;
+    assert!(shipped >= 1, "expected ≥1 shipped segment, got {shipped}");
+    let target = pipeline.stream.dispatched_lsn();
+    let observed = shadow
+        .wait_for_replay(target, Duration::from_secs(30))
+        .expect("shadow replay");
+    assert!(observed >= target);
+    pipeline.shutdown().await.expect("pipeline drains clean");
+    let _ = shadow.stop();
+    let _ = source.stop();
+
+    fx::wait_query(
+        &ch,
+        "SELECT count() FROM walshadow_test.covered_t WHERE v = 'post'",
+        "1",
+        "commit past the seed still captures, its row lands",
+    )
+    .await;
+    let degraded: Vec<(DegradeReason, u64)> = DegradeReason::ALL
+        .iter()
+        .zip(&capture.pending_degraded)
+        .map(|(reason, n)| (*reason, n.load(std::sync::atomic::Ordering::Relaxed)))
+        .filter(|(_, n)| *n > 0)
+        .collect();
+    assert_eq!(degraded, [(DegradeReason::ReplayMismatch, 1)]);
 }

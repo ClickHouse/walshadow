@@ -66,7 +66,8 @@ async fn boot_seeds_sql_scope_and_toml_initial_loads() {
         format!(
             "[ch]\nhost = \"127.0.0.1\"\nport = {}\ndatabase = \"default\"\n\n\
              [stream]\nreplicate_all = false\n\n\
-             [runtime_config]\nschema = \"walshadow\"\n\n{}\n{}",
+             [runtime_config]\nschema = \"walshadow\"\n\n{}\n{}\n\
+             [table.public.q]\ntarget_table = \"q_renamed\"\n",
             slot.ch_tcp,
             pinned("b", "copy"),
             pinned("ghost", "copy"),
@@ -164,8 +165,11 @@ async fn boot_seeds_sql_scope_and_toml_initial_loads() {
             amount == "Decimal(38, 2)\t1",
             "column override lost: {amount}"
         );
-        let q = ch.query("EXISTS TABLE default.public_q")?;
-        ensure!(q == "0", "out-of-scope table replicated");
+        let q = ch.query(
+            "SELECT count() FROM system.tables WHERE database = 'default' \
+             AND name IN ('public_q', 'q_renamed')",
+        )?;
+        ensure!(q == "0", "target-only row brought table into scope");
         Ok(())
     }
     .await;

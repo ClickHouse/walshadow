@@ -10,6 +10,8 @@
 
 #[path = "common/bootstrap_ch_fixture.rs"]
 mod fx;
+#[path = "common/source_proxy.rs"]
+mod source_proxy;
 
 use std::fs;
 use std::net::SocketAddr;
@@ -24,6 +26,8 @@ use walshadow::crash_test::Point;
 use walshadow::pg::parse_pg_lsn;
 use walshadow::record::WAL_SEG_SIZE;
 use walshadow::shadow::{Shadow, ShadowConfig};
+
+use source_proxy::{Faults, SourceProxy};
 
 /// Running daemon + its source PG + CH, with the paths the tests poke.
 struct Harness {
@@ -762,6 +766,62 @@ async fn pause_resume_via_ctl_and_sighup_no_restart() {
             .await
             .context("SIGHUP resume did not catch up")?;
 
+        // Unparsable fragment: reload refuses, live config stays
+        let refused = || h.daemon_log().matches("reload failed").count();
+        let refused_before = refused();
+        fs::write(&h.frag_path, "[stream\npaused = true\n").context("write frag")?;
+        h.sighup()?;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while refused() == refused_before && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        ensure!(
+            refused() > refused_before,
+            "broken fragment reload not refused"
+        );
+        h.psql("UPDATE demo.users SET email = 'post-broken@x' WHERE id = 1")?;
+        h.wait_ch(USER_EMAIL, "post-broken@x", Duration::from_secs(15))
+            .await
+            .context("broken fragment changed live config")?;
+
+        // Second signal skips the drain. A frozen shadow postmaster holds the
+        // drain at shadow stop, so the second one lands mid-drain
+        let postmaster = fs::read_to_string(h.shadow_data.join("postmaster.pid"))?
+            .lines()
+            .next()
+            .context("postmaster.pid empty")?
+            .to_owned();
+        let kill = |sig: &str, pid: &str| Command::new("kill").args([sig, pid]).status();
+        let daemon = h.child.as_ref().context("daemon gone")?.id().to_string();
+        let draining = || h.daemon_log().matches("signal, shutting down").count();
+        let draining_before = draining();
+        kill("-STOP", &postmaster)?;
+        kill("-INT", &daemon)?;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while draining() == draining_before && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        kill("-INT", &daemon)?;
+        let child = h.child.as_mut().context("daemon gone")?;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let status = loop {
+            if let Some(status) = child.try_wait()? {
+                break Some(status);
+            }
+            if Instant::now() >= deadline {
+                break None;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        kill("-CONT", &postmaster)?;
+        let code = status.and_then(|s| s.code());
+        ensure!(code == Some(1), "second signal exit {code:?}");
+        ensure!(
+            h.daemon_log()
+                .contains("second signal, exiting without drain"),
+            "forced exit not logged"
+        );
+
         Ok::<(), anyhow::Error>(())
     }
     .await;
@@ -1053,6 +1113,7 @@ async fn ctl_introspects_source_catalog() {
             Duration::from_secs(30),
         )
         .await?;
+        ensure_lines("tables live", &h.ctl(&["tables", "demo"])?, &demo_tables)?;
         let added = h.ctl(&[
             "add",
             "app",
@@ -1121,9 +1182,9 @@ async fn ctl_introspects_source_catalog() {
     }
 }
 
-/// OTLP export never blocks the pipeline: an unreachable collector still
-/// opens a span per sampled txn, and an endpoint the exporter rejects boots
-/// without traces
+/// OTLP export never blocks the pipeline: a collector that never answers
+/// still opens a span per sampled txn and only delays exit by the tracer's
+/// shutdown timeout, and an endpoint the exporter rejects boots without traces
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn otlp_export_failures_keep_streaming() {
     if !gated() {
@@ -1134,16 +1195,11 @@ async fn otlp_export_failures_keep_streaming() {
         .expect("bring up harness");
 
     let result = async {
-        // Nothing listens on port 1, so every export is refused
-        h.args.extend(
-            [
-                "--otlp-endpoint",
-                "http://127.0.0.1:1",
-                "--trace-sample-ratio",
-                "1",
-            ]
-            .map(String::from),
-        );
+        // Kernel completes handshakes into the backlog, nothing ever answers
+        let collector = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let endpoint = format!("http://{}", collector.local_addr()?);
+        h.args
+            .extend(["--otlp-endpoint", &endpoint, "--trace-sample-ratio", "1"].map(String::from));
         h.restart(Duration::from_secs(60)).await?;
         h.psql("UPDATE demo.users SET email = 'traced@x' WHERE id = 1")?;
         h.psql("BEGIN; UPDATE demo.users SET email = 'aborted@x' WHERE id = 1; ROLLBACK")?;
@@ -1158,6 +1214,10 @@ async fn otlp_export_failures_keep_streaming() {
             .context("otlp flag")?;
         h.args[endpoint + 1] = "::not a uri::".into();
         h.restart(Duration::from_secs(60)).await?;
+        ensure!(
+            h.daemon_log().contains("otlp tracer shutdown"),
+            "stuck export did not time out tracer shutdown"
+        );
         h.wait_log(
             "OTLP exporter init failed for ::not a uri::",
             Duration::from_secs(10),
@@ -1165,6 +1225,252 @@ async fn otlp_export_failures_keep_streaming() {
         .await?;
         h.psql("UPDATE demo.users SET email = 'untraced@x' WHERE id = 1")?;
         h.wait_ch(USER_EMAIL, "untraced@x", Duration::from_secs(15))
+            .await?;
+        ensure!(h.alive(), "daemon exited");
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+
+    let stderr = h.teardown();
+    if let Err(e) = result {
+        panic!("{e:#}\n--- daemon stderr ---\n{stderr}");
+    }
+}
+
+/// Lost descriptor log refuses a manifest resume, `--ignore-cursor`
+/// re-baselines it, and `--start-lsn` at the seeded head resumes there
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn resume_overrides_rebaseline_a_lost_descriptor_log() {
+    if !gated() {
+        return;
+    }
+    let mut h = Harness::up(&fx::Ports::alloc())
+        .await
+        .expect("bring up harness");
+
+    let result = async {
+        h.psql("UPDATE demo.users SET email = 'before-loss@x' WHERE id = 1")?;
+        h.wait_ch(USER_EMAIL, "before-loss@x", Duration::from_secs(15))
+            .await?;
+        h.stop_daemon();
+        let spill = h.tmp.path().join("spill");
+        for f in [
+            walshadow::desc_log::CKPT_FILE,
+            walshadow::desc_log::TAIL_FILE,
+        ] {
+            let _ = fs::remove_file(spill.join(f));
+        }
+        h.child = Some(spawn_daemon(&h.bin, &h.args, &h.stderr_path)?);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while h.alive() && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        ensure!(
+            h.daemon_log()
+                .contains("manifest present but descriptor log missing"),
+            "lost descriptor log not refused"
+        );
+
+        // Pre-oid mirror name, which boot renames under the followed database
+        h.ch_get("CREATE TABLE demo.pg_toast_99999 (x UInt8) ENGINE = Memory")?;
+        h.args.push("--ignore-cursor".into());
+        h.restart(Duration::from_secs(60)).await?;
+        let renamed = h.ch_get(
+            "SELECT groupArray(name) FROM system.tables \
+             WHERE database = 'demo' AND name LIKE 'pg\\_toast\\_%'",
+        )?;
+        ensure!(
+            renamed == "['pg_toast_5_99999']",
+            "legacy mirror not renamed: {renamed}"
+        );
+        h.psql("UPDATE demo.users SET email = 'after-rebaseline@x' WHERE id = 1")?;
+        h.wait_ch(USER_EMAIL, "after-rebaseline@x", Duration::from_secs(15))
+            .await?;
+
+        let log = h.daemon_log();
+        let seeded = log
+            .lines()
+            .rfind(|l| l.contains("descriptor log seeded"))
+            .and_then(|l| l.split("covered_through=").nth(1))
+            .and_then(|v| v.split_whitespace().next())
+            .context("no descriptor log seed logged")?
+            .trim_matches('"')
+            .to_owned();
+        h.args.pop();
+        h.args.extend(["--start-lsn".into(), seeded]);
+        h.restart(Duration::from_secs(60)).await?;
+        h.psql("UPDATE demo.users SET email = 'after-start-lsn@x' WHERE id = 1")?;
+        h.wait_ch(USER_EMAIL, "after-start-lsn@x", Duration::from_secs(15))
+            .await?;
+        ensure!(h.alive(), "daemon exited");
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+
+    let stderr = h.teardown();
+    if let Err(e) = result {
+        panic!("{e:#}\n--- daemon stderr ---\n{stderr}");
+    }
+}
+
+/// Walsender dies while a pause is leaving the stream: the pause holds and
+/// resume redials instead of reusing the dead connection
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pause_survives_a_walsender_lost_while_leaving_the_stream() {
+    if !gated() {
+        return;
+    }
+    let mut h = Harness::up(&fx::Ports::alloc())
+        .await
+        .expect("bring up harness");
+    let source_port = h.source.config().port;
+    let proxy = SourceProxy::spawn(
+        &h.tmp.path().join("source-proxy"),
+        source_port,
+        &h.source.config().socket_dir,
+    );
+
+    let result = async {
+        h.wait_ready(Duration::from_secs(30)).await?;
+        point_source_at(&h, &proxy.dir, source_port)?;
+        h.wait_metric(
+            "walshadow_source_endpoint_swaps_total",
+            1,
+            Duration::from_secs(30),
+        )
+        .await?;
+        proxy.arm(|f| f.drop_client_copy_done = 1);
+        h.ctl_body(&["apply"], "[stream]\npaused = true")?;
+        h.wait_log(
+            "leaving the source stream for a pause failed; resume redials",
+            Duration::from_secs(10),
+        )
+        .await?;
+        ensure!(
+            proxy.pending() == Faults::default(),
+            "pause fault never fired"
+        );
+        h.ctl_body(&["apply"], "[stream]\npaused = false")?;
+        h.psql("UPDATE demo.users SET email = 'after-lost-pause@x' WHERE id = 1")?;
+        h.wait_ch(USER_EMAIL, "after-lost-pause@x", Duration::from_secs(30))
+            .await?;
+        ensure!(h.alive(), "daemon exited");
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+
+    let stderr = h.teardown();
+    if let Err(e) = result {
+        panic!("{e:#}\n--- daemon stderr ---\n{stderr}");
+    }
+}
+
+/// ClickHouse dies with a buffered row and shutdown follows: final drain
+/// exhausts its retries, so exit fails instead of advertising the row shipped
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shutdown_fails_when_the_final_drain_cannot_ship() {
+    if !gated() {
+        return;
+    }
+    let mut h = Harness::up(&fx::Ports::alloc())
+        .await
+        .expect("bring up harness");
+
+    let result = async {
+        h.psql("UPDATE demo.users SET email = 'shipped@x' WHERE id = 1")?;
+        h.wait_ch(USER_EMAIL, "shipped@x", Duration::from_secs(15))
+            .await?;
+        h.ctl_body(
+            &["apply"],
+            "[ch]\nretry_max_attempts = 0\nflush_timeout_ms = 3600000\nrow_budget = 1000000",
+        )?;
+        h.ctl(&["reload"])?;
+        let buffered = h.metric("walshadow_insertbatch_rows_in_total")?;
+        let sealed = h.metric("walshadow_insertbatch_batches_out_total")?;
+        h.psql("UPDATE demo.users SET email = 'unshipped@x' WHERE id = 1")?;
+        h.wait_metric(
+            "walshadow_insertbatch_rows_in_total",
+            buffered + 1,
+            Duration::from_secs(15),
+        )
+        .await?;
+        ensure!(
+            h.metric("walshadow_insertbatch_batches_out_total")? == sealed,
+            "row shipped before final drain"
+        );
+        let ch = format!("--tcp_port={}", h.ch.port);
+        let killed = Command::new("pkill")
+            .args(["-KILL", "-f", "--", &ch])
+            .status()?;
+        ensure!(killed.success(), "no clickhouse to kill");
+        let mut child = h.child.take().context("daemon gone")?;
+        Command::new("kill")
+            .args(["-INT", &child.id().to_string()])
+            .status()?;
+        let deadline = Instant::now() + Duration::from_secs(14);
+        let status = loop {
+            if let Some(status) = child.try_wait()? {
+                break Some(status);
+            }
+            if Instant::now() >= deadline {
+                fx::tools::stop_gracefully(&mut child);
+                break None;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        ensure!(
+            status.is_some_and(|s| !s.success())
+                && h.daemon_log()
+                    .contains("decode+insert pipeline drain failed"),
+            "drain failure not surfaced at exit ({status:?})"
+        );
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+
+    let stderr = h.teardown();
+    if let Err(e) = result {
+        panic!("{e:#}\n--- daemon stderr ---\n{stderr}");
+    }
+}
+
+/// Another consumer holds the configured slot at boot: START_REPLICATION is
+/// refused, the daemon redials, and streams once the slot frees
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn boot_redials_while_another_consumer_holds_the_slot() {
+    if !gated() {
+        return;
+    }
+    let mut h = Harness::up(&fx::Ports::alloc())
+        .await
+        .expect("bring up harness");
+
+    let result = async {
+        h.stop_daemon();
+        h.psql("SELECT pg_create_physical_replication_slot('held')")?;
+        let head = parse_pg_lsn(&h.psql("SELECT pg_current_wal_lsn()")?)?;
+        let src = h.source.config();
+        let cfg = walrus::pg::replication::conn::PgConfig {
+            host: src.socket_dir.display().to_string(),
+            port: src.port,
+            user: "postgres".into(),
+            password: None,
+            database: "postgres".into(),
+            application_name: "slot-holder".into(),
+            sslmode: walrus::pg::replication::tls::SslMode::Disable,
+            tls: Default::default(),
+        };
+        let mut holder = walshadow::source_feed::SourceFeed::connect(&cfg).await?;
+        holder
+            .start_physical_replication(Some("held"), head, 1)
+            .await?;
+        h.args.extend(["--slot".into(), "held".into()]);
+        h.start_daemon(Duration::from_secs(60)).await?;
+        h.wait_log("is active for PID", Duration::from_secs(30))
+            .await?;
+        drop(holder);
+        h.psql("UPDATE demo.users SET email = 'slot-freed@x' WHERE id = 1")?;
+        h.wait_ch(USER_EMAIL, "slot-freed@x", Duration::from_secs(30))
             .await?;
         ensure!(h.alive(), "daemon exited");
         Ok::<(), anyhow::Error>(())
@@ -1617,10 +1923,14 @@ async fn repoint(h: &Harness, target: &Shadow, swaps: u64) -> Result<()> {
 /// Step 4 without waiting for the pump to reach it: a daemon still waiting for
 /// its source at boot adopts the moved endpoint there instead of swapping.
 fn apply_repoint(h: &Harness, target: &Shadow) -> Result<()> {
-    let target_sock = target.config().socket_dir.display().to_string();
+    point_source_at(h, &target.config().socket_dir, TARGET_PORT)
+}
+
+fn point_source_at(h: &Harness, socket_dir: &Path, port: u16) -> Result<()> {
+    let host = socket_dir.display();
     h.ctl_body(
         &["apply"],
-        &format!("[source]\nhost = \"{target_sock}\"\nport = {TARGET_PORT}"),
+        &format!("[source]\nhost = \"{host}\"\nport = {port}"),
     )?;
     Ok(())
 }
@@ -2940,6 +3250,267 @@ async fn promotion_under_a_stable_endpoint_crosses_without_a_repoint() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn reconnect_at_the_switchpoint_crosses_without_a_restart() {
     check_unpaused_switchover(SwitchoverMode::SameAddress).await;
+}
+
+/// Every crossing step a source can drop is retried against the untouched
+/// ancestor: the walsender closing at the switchpoint instead of ending the
+/// timeline, the redial refused, the fork proof's history read cut, the
+/// descendant's `START_REPLICATION` cut. The restart makes boot read the
+/// descendant's history, so the ancestor is a branch already known to end where
+/// its stream closes
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn crossing_retries_each_step_the_source_drops() {
+    if !gated() {
+        return;
+    }
+    let mut h = Harness::up(&fx::Ports::alloc())
+        .await
+        .expect("bring up harness");
+    let target = h.promotion_target().expect("build promotion target");
+    let proxy = SourceProxy::spawn(
+        &h.tmp.path().join("target-proxy"),
+        TARGET_PORT,
+        &target.config().socket_dir,
+    );
+
+    let result = async {
+        pause_and_stop_writes(&h, &target).await?;
+        point_source_at(&h, &proxy.dir, TARGET_PORT)?;
+        h.wait_metric(
+            "walshadow_source_endpoint_swaps_total",
+            1,
+            Duration::from_secs(30),
+        )
+        .await
+        .context("pump never swapped onto the proxied target")?;
+        promote(&target)?;
+        h.restart(Duration::from_secs(90))
+            .await
+            .context("restart after the promotion")?;
+        // Armed once the restarted pump left the stream for the pause, the
+        // client CopyDone this drill does not break
+        let left = "pause left the source stream so the source can shut down";
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while h.daemon_log().matches(left).count() < 2 {
+            ensure!(
+                Instant::now() < deadline,
+                "restarted pump never left the stream"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        proxy.arm(|f| {
+            f.drop_server_copy_done = 1;
+            f.refuse = 1;
+            f.drop_query = vec!["TIMELINE_HISTORY", "TIMELINE 2"];
+        });
+        h.ctl_body(&["apply"], "[stream]\npaused = false")?;
+        h.wait_metric(
+            "walshadow_timeline_switches_total",
+            1,
+            Duration::from_secs(60),
+        )
+        .await
+        .context("crossing never got past the dropped steps")?;
+        ensure!(
+            proxy.pending() == Faults::default(),
+            "{:?} never fired",
+            proxy.pending()
+        );
+        let log = h.daemon_log();
+        let retried = [
+            "source stream ended where the branch does — crossing",
+            "cannot reach the source to cross the fork — retrying",
+            "proving the source fork failed — retrying",
+            "timeline crossing failed — retrying",
+        ];
+        let missing: Vec<_> = retried.iter().filter(|l| !log.contains(*l)).collect();
+        ensure!(missing.is_empty(), "never logged {missing:?}");
+        ensure!(
+            h.metric_series("walshadow_timeline_switch_failures_total{reason=\"source\"}")? == 2,
+            "probe and cross failures uncounted",
+        );
+        h.wait_ch(SECOND_EMAIL, "below-fork@x", Duration::from_secs(60))
+            .await
+            .context("row committed below the fork never reached CH")?;
+        target.psql_one("UPDATE demo.users SET email = 'after-promote@x' WHERE id = 1")?;
+        h.wait_ch(USER_EMAIL, "after-promote@x", Duration::from_secs(60))
+            .await
+            .context("write on the descendant timeline never reached CH")?;
+        ensure!(h.alive(), "daemon exited crossing the fork");
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+
+    let stderr = h.teardown();
+    let _ = target.stop();
+    if let Err(e) = result {
+        panic!("{e:#}\n--- daemon stderr ---\n{stderr}");
+    }
+}
+
+/// The walsender ends the historic timeline, but the connection dies answering
+/// it: the crossing reads history off a fresh connection instead. That one
+/// lands on a standby still on the ancestor, which parks the crossing until a
+/// pause re-proves it against the promoted target
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn crossing_redials_when_ending_the_historic_stream_fails() {
+    if !gated() {
+        return;
+    }
+    let h = Harness::up(&fx::Ports::alloc())
+        .await
+        .expect("bring up harness");
+    let target = h.promotion_target().expect("build promotion target");
+    let standby = h
+        .promotion_target_named("sibling", SIBLING_PORT)
+        .expect("build a standby left unpromoted");
+    let proxy = SourceProxy::spawn(
+        &h.tmp.path().join("target-proxy"),
+        TARGET_PORT,
+        &target.config().socket_dir,
+    );
+
+    let result = async {
+        pause_and_stop_writes(&h, &target).await?;
+        point_source_at(&h, &proxy.dir, TARGET_PORT)?;
+        h.wait_metric(
+            "walshadow_source_endpoint_swaps_total",
+            1,
+            Duration::from_secs(30),
+        )
+        .await
+        .context("pump never swapped onto the proxied target")?;
+        promote(&target)?;
+        proxy.arm(|f| f.drop_client_copy_done = 1);
+        proxy.reroute(&standby.config().socket_dir, SIBLING_PORT);
+        h.ctl_body(&["apply"], "[stream]\npaused = false")?;
+        h.wait_metric("walshadow_crossing_wedged", 1, Duration::from_secs(60))
+            .await
+            .context("probe against the unpromoted standby never parked")?;
+        ensure!(
+            proxy.pending() == Faults::default(),
+            "{:?} never fired",
+            proxy.pending()
+        );
+        ensure!(
+            h.daemon_log()
+                .contains("ending the historic stream failed — reconnecting to cross"),
+            "crossing never saw the CopyDone answer fail",
+        );
+        let blocked = h.status_field("crossing_blocked_on")?;
+        ensure!(
+            blocked == "timeline_not_descendant",
+            "parked crossing read as {blocked:?}"
+        );
+        proxy.reroute(&target.config().socket_dir, TARGET_PORT);
+        h.ctl_body(&["apply"], "[stream]\npaused = true")?;
+        h.wait_log("pause clears the parked crossing", Duration::from_secs(30))
+            .await?;
+        h.ctl_body(&["apply"], "[stream]\npaused = false")?;
+        h.wait_metric(
+            "walshadow_timeline_switches_total",
+            1,
+            Duration::from_secs(60),
+        )
+        .await
+        .context("re-proved crossing never ran")?;
+        h.wait_ch(SECOND_EMAIL, "below-fork@x", Duration::from_secs(60))
+            .await
+            .context("row committed below the fork never reached CH")?;
+        target.psql_one("UPDATE demo.users SET email = 'after-promote@x' WHERE id = 1")?;
+        h.wait_ch(USER_EMAIL, "after-promote@x", Duration::from_secs(60))
+            .await
+            .context("write on the descendant timeline never reached CH")?;
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+
+    let stderr = h.teardown();
+    let _ = target.stop();
+    let _ = standby.stop();
+    if let Err(e) = result {
+        panic!("{e:#}\n--- daemon stderr ---\n{stderr}");
+    }
+}
+
+/// A primary gone without the pump noticing leaves the stream consumed through
+/// the shutdown checkpoint, which is where the promoted target's branch begins.
+/// A repoint then lands exactly on the switchpoint and crosses from the swap,
+/// no redial in between
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn repoint_at_the_switchpoint_crosses_from_the_swap() {
+    if !gated() {
+        return;
+    }
+    let mut h = Harness::up(&fx::Ports::alloc())
+        .await
+        .expect("bring up harness");
+    let target = h.promotion_target().expect("build promotion target");
+    let source_port = h.source.config().port;
+    let proxy = SourceProxy::spawn(
+        &h.tmp.path().join("source-proxy"),
+        source_port,
+        &h.source.config().socket_dir,
+    );
+
+    let result = async {
+        h.wait_ready(Duration::from_secs(60)).await?;
+        point_source_at(&h, &proxy.dir, source_port)?;
+        h.wait_metric(
+            "walshadow_source_endpoint_swaps_total",
+            1,
+            Duration::from_secs(30),
+        )
+        .await
+        .context("pump never swapped onto the proxied primary")?;
+        proxy.arm(|f| f.hold_shutdown = 1);
+        h.psql("INSERT INTO demo.users VALUES (2, 'bob', 'below-fork@x')")?;
+        h.wait_ch(SECOND_EMAIL, "below-fork@x", Duration::from_secs(60))
+            .await
+            .context("row sent through WAL never reached ClickHouse")?;
+        h.source.stop().context("stop source primary")?;
+        ensure!(
+            proxy.pending() == Faults::default(),
+            "walsender never shut down"
+        );
+        let checkpoint = controldata_checkpoint_lsn(&h.source.config().data_dir)?;
+        target
+            .wait_for_replay(checkpoint + 1, Duration::from_secs(30))
+            .context("target never replayed the shutdown checkpoint")?;
+        promote(&target)?;
+        apply_repoint(&h, &target)?;
+        h.wait_metric(
+            "walshadow_timeline_switches_total",
+            1,
+            Duration::from_secs(60),
+        )
+        .await
+        .context("swap at the switchpoint never crossed")?;
+        let log = h.daemon_log();
+        ensure!(
+            log.lines()
+                .any(|l| l.contains("source feed swapped")
+                    && l.contains("resume_point=AtSwitchpoint")),
+            "swap did not land on the switchpoint",
+        );
+        ensure!(
+            !log.contains("source reconnected"),
+            "pump noticed the primary go and redialed",
+        );
+        target.psql_one("UPDATE demo.users SET email = 'after-promote@x' WHERE id = 1")?;
+        h.wait_ch(USER_EMAIL, "after-promote@x", Duration::from_secs(60))
+            .await
+            .context("write on the descendant timeline never reached CH")?;
+        ensure!(h.alive(), "daemon exited crossing from the swap");
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+
+    let stderr = h.teardown();
+    let _ = target.stop();
+    if let Err(e) = result {
+        panic!("{e:#}\n--- daemon stderr ---\n{stderr}");
+    }
 }
 
 /// Restart the promotion target on the stopped primary's socket path and port,

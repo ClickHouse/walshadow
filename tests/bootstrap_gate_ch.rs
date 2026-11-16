@@ -155,3 +155,83 @@ async fn dead_and_aborted_tuples_stay_out_of_ch() {
 
     fx::finish_daemon(guard, &daemon, result);
 }
+
+/// Multixact xmax the backup's `pg_multixact` cannot resolve aborts the
+/// deferred pass, winds the tail down and keeps no pending rows
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unresolvable_multixact_fails_greenfield_resolution() {
+    use std::sync::Arc;
+    use walshadow::backfill::spool::{DEFERRED_SPOOL_MEM_MAX, DeferredSpool};
+    use walshadow::backfill::visibility_gate::{GreenfieldSink, PendingGate, resolve_greenfield};
+    use walshadow::visibility::{HEAP_XMAX_IS_MULTI, HEAP_XMIN_COMMITTED};
+
+    if !fx::tools::requirements_available() {
+        return;
+    }
+    let slot = fx::Ports::alloc();
+    let ch = fx::ChServer::spawn(tempfile::tempdir().unwrap(), slot.ch_tcp, slot.ch_http)
+        .expect("spawn ch");
+    let tmp = tempfile::tempdir().unwrap();
+    let mut deferred = DeferredSpool::new(tmp.path().join("gate.bin"), DEFERRED_SPOOL_MEM_MAX);
+    deferred
+        .push(walshadow::backup_page_walk::BackfillTuple {
+            rfn: walrus::pg::walparser::RelFileNode {
+                spc_node: 1663,
+                db_node: 5,
+                rel_node: 16400,
+            },
+            xid: 100,
+            xmax: 10,
+            infomask: HEAP_XMIN_COMMITTED | HEAP_XMAX_IS_MULTI,
+            source_lsn: 0x1000,
+            page_lsn: 0,
+            blkno: 0,
+            offnum: 1,
+            columns: Vec::new(),
+        })
+        .await
+        .unwrap();
+    let emitter = walshadow::ch_emitter::EmitterConfig {
+        conn: walshadow::ch_emitter::InstanceConfig {
+            host: "127.0.0.1".into(),
+            port: slot.ch_tcp,
+            compression: walshadow::ch::CompressionChoice::None,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let stats = Arc::new(walshadow::ch_emitter::EmitterStats::default());
+    let gate = PendingGate {
+        deferred: vec![deferred],
+        sink: GreenfieldSink {
+            catalog: Default::default(),
+            mapping: Default::default(),
+            config: Arc::default(),
+            dest: walshadow::config::DestEmitter::new(Arc::new(emitter), None),
+            stats,
+            resolver: walshadow::toast::ToastResolver::disabled(),
+            skip_initial: Default::default(),
+            scratch_dir: tmp.path().to_path_buf(),
+            inherit_spools: Vec::new(),
+        },
+        oracle: None,
+        stream_stats: Default::default(),
+        coverage: None,
+    };
+    // Empty data dir: no pg_xact, no pg_multixact segments landed
+    let data_dir = tmp.path().join("data");
+    let err = tokio::time::timeout(
+        Duration::from_secs(30),
+        resolve_greenfield(gate, &data_dir, &Default::default(), 17),
+    )
+    .await
+    .expect("failed resolution hung")
+    .unwrap_err()
+    .to_string();
+    assert!(
+        err.starts_with("visibility gate: multixact xmax 10 (rfn 5/16400) unresolvable"),
+        "{err}"
+    );
+    assert!(!tmp.path().join("bootstrap_gate_pending.bin").exists());
+    drop(ch);
+}

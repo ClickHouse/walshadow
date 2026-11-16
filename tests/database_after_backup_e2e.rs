@@ -28,6 +28,7 @@ use walshadow::schema::RelName;
 use walshadow::shadow::Shadow;
 
 const LATE_DB: &str = "latecomer";
+const EARLY_DB: &str = "early";
 
 fn test_settings(storage_root: PathBuf) -> Settings {
     Settings {
@@ -79,6 +80,20 @@ async fn a_database_created_after_the_backup_is_followed_once_replay_creates_it(
 
     let source = fx::start_source(&tmp);
     let _src_stop = fx::StopOnDrop { sh: &source };
+    // Followed beside the late one, so the stand-in keeps its name
+    source
+        .psql_one(&format!("CREATE DATABASE {EARLY_DB}"))
+        .expect("create the database the backup holds");
+    let early = in_database(&source, EARLY_DB);
+    early
+        .psql_one(
+            "CREATE SCHEMA s1; \
+             CREATE TABLE s1.t (id int4 PRIMARY KEY, name text NOT NULL); \
+             ALTER TABLE s1.t REPLICA IDENTITY FULL",
+        )
+        .expect("populate the early database");
+    // Else the backup's spread checkpoint writes out the copied template
+    source.psql_one("CHECKPOINT").expect("checkpoint");
 
     // 1. Back the cluster up before the database exists
     let storage_root = tmp.path().join("wal-g");
@@ -130,6 +145,7 @@ async fn a_database_created_after_the_backup_is_followed_once_replay_creates_it(
     let ch_tmp = tempfile::tempdir().unwrap();
     let ch = fx::ChServer::spawn(ch_tmp, slot.ch_tcp, slot.ch_http).expect("spawn ch");
     fx::create_ch_dest_table(&ch, "default", "t").expect("create ch table");
+    fx::create_ch_dest_table(&ch, "default", "early_t").expect("create early ch table");
 
     let ch_config_path = tmp.path().join("ch-config.toml");
     fx::write_ch_config_toml(
@@ -145,7 +161,15 @@ async fn a_database_created_after_the_backup_is_followed_once_replay_creates_it(
     // The file wins over the CLI, so this is what selects the database the
     // backup does not hold
     body.push_str(&format!(
-        "\n[source]\ndbname = \"{LATE_DB}\"\n\n[backup]\narchive = \"file://{}\"\n",
+        "\n[source]\ndbname = \"{LATE_DB}\"\n\n[backup]\narchive = \"file://{}\"\n\n\
+         [database.postgres]\n\n\
+         [database.{EARLY_DB}.table.\"s1\".\"t\"]\n\
+         target_database = \"default\"\n\
+         target_table = \"early_t\"\n\
+         columns = [\n  \
+           {{ attnum = 1, target = \"id\",   type = \"Int32\"  }},\n  \
+           {{ attnum = 2, target = \"name\", type = \"String\" }},\n\
+         ]\n",
         storage_root.display()
     ));
     fs::write(&ch_config_path, body).expect("append [source] + [backup]");
@@ -189,6 +213,16 @@ async fn a_database_created_after_the_backup_is_followed_once_replay_creates_it(
             Duration::from_secs(90),
         )
         .context("live CDC on the post-backup database never reached CH")?;
+        early
+            .psql_one("INSERT INTO s1.t VALUES (1, 'beside-stand-in')")
+            .context("insert into the early database")?;
+        fx::wait_for_ch_value(
+            &ch,
+            "SELECT name FROM default.early_t FINAL WHERE id = 1",
+            "beside-stand-in",
+            Duration::from_secs(90),
+        )
+        .context("database followed beside the stand-in never reached CH")?;
         Ok(())
     })();
 

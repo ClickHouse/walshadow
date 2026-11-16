@@ -608,6 +608,16 @@ async fn object_store_pass_resumes_from_its_checkpoint() {
     assert_eq!(walk_only.gap_segments, 0);
     assert_ch();
 
+    // Walk that cannot record its progress fails the pass
+    let blocker = passes.scratch.join("backup_replay.json.tmp");
+    std::fs::create_dir(&blocker).unwrap();
+    let err = passes.run(fresh.clone()).await.unwrap_err();
+    std::fs::remove_dir(&blocker).unwrap();
+    let kind = err
+        .downcast_ref::<std::io::Error>()
+        .map(std::io::Error::kind);
+    assert_eq!(kind, Some(std::io::ErrorKind::IsADirectory), "{err:#}");
+
     // Finished walk that deferred no TOAST referrer still resumes
     std::fs::remove_file(passes.scratch.join("bootstrap_deferred.bin")).ok();
     passes.reqs.retain(|r| r.desc.oid == u.oid);

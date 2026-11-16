@@ -203,7 +203,6 @@ impl DbMetricSources {
             pending_hold_seconds_total: cap_seconds(|s| &s.pending_hold_nanos),
             pending_entries_promoted_total: cap(|s| &s.pending_entries_promoted),
             pending_entries_dropped_abort_total: cap(|s| &s.pending_entries_dropped_abort),
-            pending_ambiguities_suppressed_total: cap(|s| &s.ambiguities_suppressed),
             pending_degraded_by_reason: std::array::from_fn(|i| {
                 self.capture
                     .as_ref()

@@ -618,8 +618,6 @@ db_snapshot! {
         "Pending slots folded into a commit's descriptor-log batch.",
     counter pending_entries_dropped_abort_total: u64 =
         "Pending slots dropped with an aborted transaction tree.",
-    counter pending_ambiguities_suppressed_total: u64 =
-        "Ambiguity intervals the pending timeline covered end to end.",
     counter pending_degraded_by_reason: [u64; 5]
         ["reason" = DegradeReason::ALL.map(|reason| reason.label())] =
         "Transactions degraded to commit-time capture, by reason.",
@@ -1033,7 +1031,12 @@ pub async fn serve(
             source: e,
         })?;
     let local = listener.local_addr()?;
-    let handle = tokio::spawn(async move {
+    Ok((local, accept_loop(listener, registry)))
+}
+
+/// Serve every accepted client until `accept` errors
+fn accept_loop(listener: TcpListener, registry: MetricsRegistry) -> JoinHandle<()> {
+    tokio::spawn(async move {
         loop {
             let (mut socket, _peer) = match listener.accept().await {
                 Ok(p) => p,
@@ -1058,8 +1061,7 @@ pub async fn serve(
                 let _ = socket.shutdown().await;
             });
         }
-    });
-    Ok((local, handle))
+    })
 }
 
 async fn handle_client(
@@ -1109,13 +1111,23 @@ mod tests {
             }
         }
 
+        // Encoder buffers small writes; a label past its buffer reaches the
+        // writer inside its own family
+        let huge = "x".repeat(1 << 16);
         let mut snap = MetricsSnapshot {
             crossing_blocked_on: "slot_missing",
             source_endpoint_swap_blocked_on: "slot_missing",
             promotion_blocked_on: "not_paused",
             unmapped_rows_by_table: vec![("app".into(), "public.noise".into(), 5)],
-            rows_inserted_by_table: vec![("app".into(), "public.orders".into(), 9)],
-            cells_inserted_by_type: vec![("String".into(), "local", 9)],
+            rows_inserted_by_table: vec![("app".into(), huge.clone(), 9)],
+            cells_inserted_by_type: vec![(huge.clone(), "local", 9)],
+            skipped_records_by_rel: vec![SkippedRel {
+                database: "app".into(),
+                rel_node: huge,
+                op: "update",
+                reason: "not_covered",
+                records: 3,
+            }],
             by_database: vec![DbSeries {
                 database: "app".into(),
                 ..DbSeries::default()
@@ -1147,6 +1159,46 @@ mod tests {
                 "a failed encode cannot be complete"
             );
         }
+    }
+
+    /// Stage and log families fit in one encoder buffer, so a leading pad of
+    /// swept length lands the first flush, refused, in each of them
+    #[test]
+    fn stage_and_log_families_propagate_a_refused_flush() {
+        #[derive(Debug)]
+        struct Pad(String);
+        impl Collector for Pad {
+            fn encode(&self, mut enc: DescriptorEncoder) -> fmt::Result {
+                gauge(&mut enc, "walshadow_pad", &self.0, 0u64)
+            }
+        }
+        /// Refuses every write, keeping the refused chunk's length
+        struct Refuse(usize);
+        impl fmt::Write for Refuse {
+            fn write_str(&mut self, s: &str) -> fmt::Result {
+                self.0 = s.len();
+                Err(fmt::Error)
+            }
+        }
+        let name_at = |text: &str| text.split(' ').next().unwrap().to_owned();
+        let mut families = std::collections::BTreeSet::new();
+        let mut refused_in = std::collections::BTreeSet::new();
+        for pad in (0..4096).step_by(8) {
+            let mut registry = Registry::default();
+            registry.register_collector(Box::new(Pad("p".repeat(pad))));
+            registry.register_collector(Box::new(crate::ops::stages::StageCollector));
+            registry.register_collector(Box::new(crate::ops::log_events::LogEventCollector));
+            let mut whole = String::new();
+            text::encode(&mut whole, &registry).unwrap();
+            let mut refuse = Refuse(0);
+            text::encode(&mut refuse, &registry).unwrap_err();
+            let (head, _) = whole[..refuse.0].rsplit_once("# HELP ").unwrap();
+            refused_in.insert(name_at(&whole[head.len() + "# HELP ".len()..]));
+            families.extend(whole.split("# HELP ").skip(1).map(name_at));
+        }
+        refused_in.remove("walshadow_pad");
+        families.remove("walshadow_pad");
+        assert_eq!(refused_in, families);
     }
 
     #[test]
@@ -1631,5 +1683,34 @@ mod tests {
         assert!(resp.contains("walshadow_filter_lsn 57005"), "{resp}");
         let taken = serve(addr, MetricsRegistry::new()).await.unwrap_err();
         assert!(matches!(taken, MetricsError::Bind { .. }), "{taken}");
+    }
+
+    /// Reset client errors only its own connection, dead listener ends server
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn accept_loop_outlives_reset_client_and_exits_on_dead_listener() {
+        use std::os::fd::AsFd;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let fd = listener.as_fd().try_clone_to_owned().unwrap();
+        let handle = accept_loop(listener, MetricsRegistry::new());
+
+        let reset = tokio::net::TcpStream::connect(addr).await.unwrap();
+        reset.set_zero_linger().unwrap();
+        drop(reset);
+        let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+        sock.write_all(b"GET / HTTP/1.0\r\n\r\n").await.unwrap();
+        let mut buf = Vec::new();
+        sock.read_to_end(&mut buf).await.unwrap();
+        assert!(buf.starts_with(b"HTTP/1.0 200 OK\r\n"));
+
+        // Shutting down a listening socket fails its pending accept with EINVAL
+        std::net::TcpStream::from(fd)
+            .shutdown(std::net::Shutdown::Read)
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .unwrap()
+            .unwrap();
     }
 }

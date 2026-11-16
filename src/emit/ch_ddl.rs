@@ -974,7 +974,7 @@ impl DdlApplicator {
         event: &SchemaEvent,
         mapping: &MappingSnapshot,
         config: Option<&ResolvedConfig>,
-    ) -> Result<Option<(RelName, Option<TableMapping>)>, EmitterError> {
+    ) -> Option<(RelName, Option<TableMapping>)> {
         // Resolver owns opt-outs, frozen routing state does not include them
         let excluded = match event {
             SchemaEvent::Added { desc } | SchemaEvent::Changed { new: desc, .. }
@@ -1090,35 +1090,32 @@ fn predict_route_effect(
     mapping: &MappingSnapshot,
     event: &SchemaEvent,
     excluded: bool,
-) -> Result<Option<(RelName, Option<TableMapping>)>, EmitterError> {
+) -> Option<(RelName, Option<TableMapping>)> {
     match event {
         SchemaEvent::Added { desc } => {
             if mapping.contains_key(&desc.rel_name) || excluded {
-                return Ok(None);
+                return None;
             }
-            Ok(derive_added(cfg, desc).map(|(_, m)| (desc.rel_name.clone(), Some(m))))
+            derive_added(cfg, desc).map(|(_, m)| (desc.rel_name.clone(), Some(m)))
         }
         SchemaEvent::Changed { old, new, diff } => {
             if old.is_partition() || new.is_partition() {
                 match routing(new, Some(&cfg.rules)) {
-                    Routing::Ancestor(_) | Routing::Excluded => return Ok(None),
+                    Routing::Ancestor(_) | Routing::Excluded => return None,
                     Routing::Own if !matches!(routing(old, Some(&cfg.rules)), Routing::Own) => {
                         if mapping.contains_key(&new.rel_name) || excluded {
-                            return Ok(None);
+                            return None;
                         }
-                        return Ok(
-                            derive_added(cfg, new).map(|(_, m)| (new.rel_name.clone(), Some(m)))
-                        );
+                        return derive_added(cfg, new)
+                            .map(|(_, m)| (new.rel_name.clone(), Some(m)));
                     }
                     Routing::Own => {}
                 }
             }
-            let Some(mut m) = mapping.get(&new.rel_name).map(|m| m.as_ref().clone()) else {
-                return Ok(None);
-            };
+            let mut m = mapping.get(&new.rel_name).map(|m| m.as_ref().clone())?;
             let retypes = plan_retypes(old, new, diff, &m.columns, &cfg.column_rules);
             fold_diff_into_mapping(&mut m, new, diff, &retypes, &cfg.column_rules);
-            Ok(Some((new.rel_name.clone(), Some(m))))
+            Some((new.rel_name.clone(), Some(m)))
         }
         SchemaEvent::Dropped { rel_name, .. } => {
             if !mapping.contains_key(rel_name)
@@ -1127,9 +1124,9 @@ fn predict_route_effect(
                     DropTableStrategy::Drop
                 )
             {
-                return Ok(None);
+                return None;
             }
-            Ok(Some((rel_name.clone(), None)))
+            Some((rel_name.clone(), None))
         }
     }
 }
@@ -2343,6 +2340,47 @@ mod tests {
         );
     }
 
+    /// Tier-3 fast default renders through shadow; no oracle or a failed
+    /// render leaves raw default in place
+    #[tokio::test(flavor = "current_thread")]
+    async fn disk_default_resolves_through_oracle() {
+        use crate::decode::heap_decoder::{raw_missing_array, short_varlena};
+        use crate::ops::bridge::{self, Bridge};
+        const TSVECTOROID: u32 = 3614;
+        let mut native = vec![0, 1, 1, 5];
+        native.extend_from_slice(b"value");
+        native.push(6);
+        native.extend_from_slice(b"String");
+        native.push(3);
+        native.extend_from_slice(b"'a'");
+        let (_tmp, path) = bridge::tests::spawn_worker(vec![
+            Some(bridge::tests::hello_body(
+                bridge::PROTO_VERSION,
+                bridge::PROJECTION_VERSION,
+            )),
+            Some(native),
+            Some(bridge::tests::remote_body("no typoutput")),
+        ]);
+        let oracle = Oracle::new(Arc::new(Bridge::connect(&path).await.unwrap()));
+        let mut tsv = att(2, "tsv", TSVECTOROID, false, None);
+        tsv.type_byval = false;
+        tsv.type_len = -1;
+        tsv.type_storage = 'x';
+        tsv.missing_default = Some(MissingDefault::Raw(raw_missing_array(
+            TSVECTOROID,
+            &short_varlena(b"\x01\x00\x00\x00"),
+        )));
+        let unresolved = resolve_disk_default(None, 5, &tsv).await;
+        assert!(matches!(unresolved, Cow::Borrowed(_)));
+        let rendered = resolve_disk_default(Some(&oracle), 5, &tsv).await;
+        assert_eq!(
+            rendered.missing_default,
+            Some(MissingDefault::Text("'a'".into()))
+        );
+        let refused = resolve_disk_default(Some(&oracle), 5, &tsv).await;
+        assert!(matches!(refused, Cow::Borrowed(_)));
+    }
+
     #[test]
     fn render_create_table_uses_pk_for_order_by() {
         let d = desc(
@@ -3040,16 +3078,14 @@ mod tests {
             rel_name: rel.clone(),
             partition: None,
         };
-        let predicted = predict_route_effect(&cfg, &frozen, &dropped, false).unwrap();
+        let predicted = predict_route_effect(&cfg, &frozen, &dropped, false);
         assert!(
             matches!(predicted, Some((r, None)) if r == rel),
             "frozen version still maps the rel"
         );
         let live = handle.snapshot();
         assert!(
-            predict_route_effect(&cfg, &live, &dropped, false)
-                .unwrap()
-                .is_none(),
+            predict_route_effect(&cfg, &live, &dropped, false).is_none(),
             "live handle moved on"
         );
     }
@@ -3082,23 +3118,17 @@ mod tests {
             )),
         };
         let empty = MappingSnapshot::default();
-        let predicted = predict_route_effect(&cfg, &empty, &added, false).unwrap();
+        let predicted = predict_route_effect(&cfg, &empty, &added, false);
         assert!(
             matches!(&predicted, Some((r, Some(m))) if &*r.name == "fresh" && m.target.table == "public_fresh"),
             "{predicted:?}"
         );
         assert!(
-            predict_route_effect(&cfg, &empty, &added, true)
-                .unwrap()
-                .is_none(),
+            predict_route_effect(&cfg, &empty, &added, true).is_none(),
             "operator opt-out wins"
         );
         cfg.replicate_all = false;
-        assert!(
-            predict_route_effect(&cfg, &empty, &added, false)
-                .unwrap()
-                .is_none()
-        );
+        assert!(predict_route_effect(&cfg, &empty, &added, false).is_none());
     }
 
     #[tokio::test]
@@ -3346,29 +3376,17 @@ mod tests {
         let added = SchemaEvent::Added {
             desc: Arc::new(leaf.clone()),
         };
-        assert!(
-            predict_route_effect(&cfg, &empty, &added, false)
-                .unwrap()
-                .is_none()
-        );
+        assert!(predict_route_effect(&cfg, &empty, &added, false).is_none());
         let root = SchemaEvent::Added {
             desc: Arc::new(m.clone()),
         };
-        assert!(
-            predict_route_effect(&cfg, &empty, &root, false)
-                .unwrap()
-                .is_some()
-        );
+        assert!(predict_route_effect(&cfg, &empty, &root, false).is_some());
         let attach = SchemaEvent::Changed {
             old: standalone.clone(),
             new: Arc::new(leaf.clone()),
             diff: SchemaDiff::default(),
         };
-        assert!(
-            predict_route_effect(&cfg, &empty, &attach, false)
-                .unwrap()
-                .is_none()
-        );
+        assert!(predict_route_effect(&cfg, &empty, &attach, false).is_none());
         let own = DdlConfig {
             rules: Arc::new(rules_with(
                 "m_eu",
@@ -3385,9 +3403,7 @@ mod tests {
             diff: SchemaDiff::default(),
         };
         assert!(
-            predict_route_effect(&own, &empty, &altered, false)
-                .unwrap()
-                .is_none(),
+            predict_route_effect(&own, &empty, &altered, false).is_none(),
             "unmapped partition with its own destination"
         );
         let detach = SchemaEvent::Changed {
@@ -3395,16 +3411,12 @@ mod tests {
             new: standalone,
             diff: SchemaDiff::default(),
         };
-        let predicted = predict_route_effect(&cfg, &empty, &detach, false).unwrap();
+        let predicted = predict_route_effect(&cfg, &empty, &detach, false);
         assert!(
             matches!(&predicted, Some((r, Some(_))) if &*r.name == "m_eu"),
             "{predicted:?}"
         );
-        assert!(
-            predict_route_effect(&cfg, &empty, &detach, true)
-                .unwrap()
-                .is_none()
-        );
+        assert!(predict_route_effect(&cfg, &empty, &detach, true).is_none());
     }
 
     fn base_cfg() -> DdlConfig {

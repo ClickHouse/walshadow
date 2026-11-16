@@ -107,12 +107,6 @@ Add explicit walsender keepalive timeout and transport regressions where current
 round trips cover behavior only indirectly. Cover source TCP/TLS and shadow
 connection loss separately
 
-Reach [100% line coverage](coverage100.md), raising floor from a freshly measured
-baseline after meaningful behavioral tests land. Keep product code, binaries,
-and defensive paths in scope
-Do not exclude code or disable coverage to reach a percentage without human
-approval. Existing zero-coverage-file gate and lints remain required
-
 ## Recovery implementation decisions
 
 Retained-WAL replay remains first recovery strategy for ClickHouse retry

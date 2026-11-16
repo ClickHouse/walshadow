@@ -353,42 +353,17 @@ jobs:
           printf 'merging %s\n' "${inputs[@]}"
           awk -f ci/lcov_merge.awk "${inputs[@]}" >merged.lcov
 
-      # Lower ceiling as tests land, zero means every DA line hit
-      - name: Coverage summary
+      - name: Require 100% line coverage
         working-directory: walshadow
-        env:
-          MAX_MISSED_LINES: 500
         run: |
-          awk -F'[:,]' -v max="$MAX_MISSED_LINES" '
+          awk -F'[:,]' '
             /^DA:/ { f++; if ($3 > 0) h++ }
             END {
+              if (!f) { print "::error::no line coverage data"; exit 1 }
               printf "merged line coverage: %d/%d = %.2f%%, %d missed\n", h, f, 100 * h / f, f - h
-              if (f - h > max) { printf "::error::%d missed lines exceeds ceiling %d\n", f - h, max; exit 1 }
+              if (h != f) { print "::error::100% line coverage required"; exit 1 }
             }
           ' merged.lcov
-
-      - name: Fail on any 0%-coverage file (merged)
-        working-directory: walshadow
-        run: |
-          set -euo pipefail
-          zero=$(awk '
-            /^SF:/ { f = substr($0, 4) }
-            /^LF:/ { lf = substr($0, 4) + 0 }
-            /^LH:/ {
-              if (substr($0, 4) + 0 == 0 && lf > 0) {
-                i = index(f, "/src/"); if (i) f = substr(f, i + 1)
-                print f
-              }
-            }
-          ' merged.lcov)
-          if [ -n "$zero" ]; then
-            count=$(printf '%s\n' "$zero" | grep -c .)
-            echo "Files with 0% line coverage (every source file must be exercised by a test):"
-            printf '%s\n' "$zero" | sed 's/^/  /'
-            echo "::error::${count} file(s) have 0% line coverage"
-            exit 1
-          fi
-          echo "OK: all merged files have >0% line coverage."
 
       - name: Install genhtml
         run: sudo apt-get update && sudo apt-get install -y lcov

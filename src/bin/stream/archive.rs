@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use walrus::pg::backup::format_pg_lsn;
 use walshadow::record::segments_covering;
 
-/// Fetch WAL `[start_lsn, end_lsn]` from archive storage into shadow's `pg_wal/`.
+/// Fetch WAL `[start_lsn, end_lsn)` from archive storage into shadow's `pg_wal/`.
 pub(crate) async fn fetch_wal_into_pg_wal(
     settings: &walrus::config::Settings,
     storage: walrus::storage::DynStorage,
@@ -19,7 +19,7 @@ pub(crate) async fn fetch_wal_into_pg_wal(
     tokio::fs::create_dir_all(&pg_wal_dir)
         .await
         .context(format!("create {}", pg_wal_dir.display()))?;
-    let segments = segments_covering(timeline, start_lsn..end_lsn.saturating_add(1));
+    let segments = segments_covering(timeline, start_lsn..end_lsn);
     for seg in &segments {
         let name = seg.format();
         let dst = pg_wal_dir.join(&name);
@@ -119,9 +119,8 @@ mod tests {
         )
         .await
         .unwrap();
-        for seg in &segments {
-            assert!(shadow.join("pg_wal").join(seg.format()).exists());
-        }
+        assert!(shadow.join("pg_wal").join(segments[0].format()).exists());
+        assert!(!shadow.join("pg_wal").join(segments[1].format()).exists());
         assert!(!shadow.join("pg_wal").join(&history).exists());
 
         archive(
@@ -136,14 +135,17 @@ mod tests {
             storage.clone(),
             &shadow,
             WAL_SEG_SIZE,
-            WAL_SEG_SIZE,
+            2 * WAL_SEG_SIZE + 42,
             2,
         )
         .await
         .unwrap();
+        for seg in &segments {
+            assert!(shadow.join("pg_wal").join(seg.format()).exists());
+        }
         assert!(shadow.join("pg_wal").join(&history).exists());
 
-        let err = fetch_wal_into_pg_wal(&settings, storage, &shadow, 0, 0, 2)
+        let err = fetch_wal_into_pg_wal(&settings, storage, &shadow, 0, WAL_SEG_SIZE, 2)
             .await
             .unwrap_err();
         assert!(format!("{err:#}").contains("fetch WAL"), "{err:#}");

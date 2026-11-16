@@ -342,6 +342,25 @@ impl Ledger {
         crate::fs::write_atomic(&self.dir, LEDGER_FILENAME, text.as_bytes()).await
     }
 
+    /// `false` when persist failed; entry stays swapped
+    async fn clear_swapped(&mut self, name: &RelName) -> bool {
+        let Some(rec) = self.entries.get_mut(name) else {
+            return true;
+        };
+        let prior = std::mem::replace(&mut rec.phase, Phase::Pending { copy: None });
+        let persisted = self.persist().await;
+        if let Err(e) = &persisted {
+            tracing::warn!(
+                target: "walshadow::backfill",
+                qname = %name,
+                error = %e,
+                "backfill ledger persist failed on swap clear",
+            );
+            self.entries.get_mut(name).expect("just present").phase = prior;
+        }
+        persisted.is_ok()
+    }
+
     async fn fallback_to_copy(
         &mut self,
         rel: &RelName,
@@ -1568,7 +1587,7 @@ impl CopyBackfiller {
                 if real_fp != staging_fp {
                     // Swapped entry over missing staging reads as published
                     anyhow::ensure!(
-                        self.clear_swapped(name).await,
+                        self.inner.lock().await.ledger.clear_swapped(name).await,
                         "swap clear unrecorded; staging kept for next boot"
                     );
                     sess.drop_staging(&rel).await?;
@@ -1625,44 +1644,28 @@ impl CopyBackfiller {
     }
 
     async fn mark_done_entry(&self, name: &RelName) {
+        self.update_entry(name, "next boot resumes (idempotent)", |rec| {
+            rec.phase = Phase::Done;
+        })
+        .await;
+    }
+
+    /// Persist `update` of an entry opt-out has not removed; `lost` names
+    /// what a failed persist costs
+    async fn update_entry(&self, name: &RelName, lost: &str, update: impl FnOnce(&mut LedgerRec)) {
         let mut inner = self.inner.lock().await;
         if let Some(rec) = inner.ledger.entries.get_mut(name) {
-            rec.phase = Phase::Done;
+            update(rec);
             if let Err(e) = inner.ledger.persist().await {
                 tracing::warn!(
                     target: "walshadow::backfill",
                     qname = %name,
                     error = %e,
-                    "backfill ledger persist failed; next boot resumes (idempotent)",
+                    "backfill ledger persist failed; {lost}",
                 );
             }
         }
         self.refresh_gauges(&inner.ledger);
-    }
-
-    /// `false` when persist failed; entry stays swapped
-    async fn clear_swapped(&self, name: &RelName) -> bool {
-        let mut inner = self.inner.lock().await;
-        let Some(rec) = inner.ledger.entries.get_mut(name) else {
-            return true;
-        };
-        let prior = std::mem::replace(&mut rec.phase, Phase::Pending { copy: None });
-        let persisted = inner.ledger.persist().await;
-        if let Err(e) = &persisted {
-            tracing::warn!(
-                target: "walshadow::backfill",
-                qname = %name,
-                error = %e,
-                "backfill ledger persist failed on swap clear",
-            );
-            inner
-                .ledger
-                .entries
-                .get_mut(name)
-                .expect("just present")
-                .phase = prior;
-        }
-        persisted.is_ok()
     }
 
     async fn run(self: Arc<Self>, desc: Arc<RelDescriptor>, s_lsn: Pos<Snapshot>) {
@@ -1944,19 +1947,11 @@ impl CopyBackfiller {
             chunks,
             "chunk mirror seeded from source TOAST heap",
         );
-        let mut inner = self.inner.lock().await;
-        if let Some(rec) = inner.ledger.entries.get_mut(&desc.rel_name) {
+        // Loss only repeats the seed, idempotent at equal TID and version
+        self.update_entry(&desc.rel_name, "restart re-seeds the chunk mirror", |rec| {
             rec.toast_seeded = true;
-            // Loss only repeats the seed, idempotent at equal TID and version
-            if let Err(e) = inner.ledger.persist().await {
-                tracing::warn!(
-                    target: "walshadow::backfill",
-                    qname = %desc.rel_name,
-                    error = %e,
-                    "backfill ledger persist failed; restart re-seeds the chunk mirror",
-                );
-            }
-        }
+        })
+        .await;
         Ok(())
     }
 
@@ -2370,6 +2365,35 @@ mod tests {
         assert_eq!(resumed.entries[&rel].mode, InitialLoadMode::Copy);
         assert_eq!(resumed.entries[&rel].s_lsn.get(), 100);
         assert!(!resumed.entries[&rel].done());
+    }
+
+    #[tokio::test]
+    async fn clear_swap_after_opt_out_leaves_ledger_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ledger = Ledger::load(tmp.path(), 7).await.unwrap();
+        let name = RelName::new("app", "orders");
+        ledger.entries.insert(
+            name.clone(),
+            LedgerRec {
+                s_lsn: 100.into(),
+                mode: InitialLoadMode::BaseBackup,
+                phase: Phase::Swapped {
+                    staging_uuid: "uuid".into(),
+                    staging_target: None,
+                },
+                toast_seeded: false,
+            },
+        );
+        ledger.entries.remove(&name);
+        ledger.persist().await.unwrap();
+        assert!(ledger.clear_swapped(&name).await);
+        assert!(
+            Ledger::load(tmp.path(), 7)
+                .await
+                .unwrap()
+                .entries
+                .is_empty()
+        );
     }
 
     #[test]

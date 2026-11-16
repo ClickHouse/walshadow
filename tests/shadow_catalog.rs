@@ -127,7 +127,9 @@ async fn user_relation_lookup_by_name() {
                 id   bigint PRIMARY KEY,\n\
                 name text NOT NULL,\n\
                 payload jsonb\n\
-             );\n",
+             );\n\
+             CREATE TABLE wc.narrow (id bigint);\n\
+             CREATE TABLE wc.bare ();\n",
         )
         .expect("apply schema dump");
 
@@ -157,6 +159,31 @@ async fn user_relation_lookup_by_name() {
             .is_none(),
         "unknown rel resolves None (forward-declaration parking)",
     );
+
+    let toast = cat
+        .toast_descriptor_for(desc.oid)
+        .await
+        .expect("toast lookup")
+        .expect("jsonb column needs toast");
+    assert_eq!((toast.oid, toast.kind), (desc.toast_oid, 't'));
+    let narrow = relation_oid(&shadow, "wc.narrow");
+    assert!(
+        cat.toast_descriptor_for(narrow)
+            .await
+            .expect("toast lookup")
+            .is_none(),
+        "fixed-width table has no toast",
+    );
+    let (_, none) = cat.fetch_descriptors_batch(&[]).await.expect("empty batch");
+    assert!(none.is_empty(), "empty oid list reads no relation");
+    let (_, bare) = cat
+        .fetch_descriptors_batch(&[relation_oid(&shadow, "wc.bare")])
+        .await
+        .expect("zero-column fetch");
+    let [bare] = &bare[..] else {
+        panic!("{bare:?}")
+    };
+    assert!(bare.attributes.is_empty(), "{bare:?}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

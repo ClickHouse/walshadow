@@ -540,7 +540,10 @@ mod tests {
         fake.called(" start", 2).await;
         fake.set("start", "0");
         messages.wait("shadow restarted", 1).await;
-        // Status probe that cannot run is skipped
+        // Status probe that cannot run is skipped, once no restart is in flight
+        fake.set("status", "0");
+        fake.called("pause_state", fake.calls("pause_state") + 1)
+            .await;
         std::fs::remove_file(fake.bin.join("pg_ctl")).unwrap();
         messages
             .wait("shadow op failed", messages.count("shadow op failed") + 1)
