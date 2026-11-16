@@ -76,10 +76,12 @@ impl Fatal {
         self.0.borrow().clone()
     }
 
-    /// Resolve once the flag is set (now or later). Holding the sender keeps
-    /// the channel open, so this never resolves unset.
-    pub async fn wait(&self) {
-        let _ = self.0.subscribe().wait_for(Option::is_some).await;
+    /// Root cause, once set (now or later). Holding the sender keeps the
+    /// channel open, so this never resolves unset.
+    pub async fn wait(&self) -> String {
+        let mut rx = self.0.subscribe();
+        let set = rx.wait_for(Option::is_some).await;
+        set.ok().and_then(|m| m.clone()).unwrap_or_default()
     }
 }
 
@@ -160,10 +162,7 @@ impl PipelineHandle {
     /// error.
     pub async fn join(self) -> Result<(), String> {
         self.tail.join().await;
-        match self.fatal.message() {
-            Some(msg) => Err(msg),
-            None => Ok(()),
-        }
+        self.fatal.message().map_or(Ok(()), Err)
     }
 }
 
@@ -363,6 +362,14 @@ pub fn leaf_reserve_for(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fatal_keeps_first_message() {
+        let fatal = Fatal::new();
+        fatal.set("root".into());
+        fatal.set("echo".into());
+        assert_eq!(fatal.message().as_deref(), Some("root"));
+    }
 
     /// Default byte values with a wide decode pool must fail startup, not
     /// zero out the admission compartment

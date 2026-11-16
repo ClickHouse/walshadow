@@ -246,6 +246,28 @@ pub enum LookupResult {
     ForeignDb,
 }
 
+/// [`LookupResult`] minus `Present`, error side of spanned lookups
+#[derive(Debug, Clone, PartialEq)]
+pub enum LookupMiss {
+    Dropped,
+    Retired,
+    Ambiguous(Arc<Ambiguity>),
+    NotCovered,
+    ForeignDb,
+}
+
+impl From<LookupMiss> for LookupResult {
+    fn from(miss: LookupMiss) -> Self {
+        match miss {
+            LookupMiss::Dropped => Self::Dropped,
+            LookupMiss::Retired => Self::Retired,
+            LookupMiss::Ambiguous(a) => Self::Ambiguous(a),
+            LookupMiss::NotCovered => Self::NotCovered,
+            LookupMiss::ForeignDb => Self::ForeignDb,
+        }
+    }
+}
+
 /// One key's version chain slot; `captured_at` denormalized for
 /// [`DescriptorLog::predecessor_before`]
 #[derive(Debug, Clone)]
@@ -497,7 +519,7 @@ impl DescriptorLog {
     pub fn descriptor_at(&self, rfn: RelFileNode, lsn: u64) -> LookupResult {
         match self.descriptor_at_spanned(rfn, lsn) {
             Ok((rel, _)) => LookupResult::Present(rel),
-            Err(other) => other,
+            Err(miss) => miss.into(),
         }
     }
 
@@ -509,7 +531,7 @@ impl DescriptorLog {
         &self,
         rfn: RelFileNode,
         lsn: u64,
-    ) -> std::result::Result<(Arc<RelDescriptor>, u64), LookupResult> {
+    ) -> std::result::Result<(Arc<RelDescriptor>, u64), LookupMiss> {
         let result = self.peek_spanned(rfn, lsn);
         self.count_spanned(&result);
         result
@@ -521,9 +543,9 @@ impl DescriptorLog {
         &self,
         rfn: RelFileNode,
         lsn: u64,
-    ) -> std::result::Result<(Arc<RelDescriptor>, u64), LookupResult> {
+    ) -> std::result::Result<(Arc<RelDescriptor>, u64), LookupMiss> {
         if rfn.db_node != 0 && rfn.db_node != self.identity.db_oid {
-            return Err(LookupResult::ForeignDb);
+            return Err(LookupMiss::ForeignDb);
         }
         let idx = self.index.read().unwrap();
         // Ambiguity precedes the chain: a chain entry inside an ambiguous
@@ -535,7 +557,7 @@ impl DescriptorLog {
             .or_else(|| ambiguity_covering(idx.amb_db.get(&rfn.db_node), lsn))
             .map_or_else(
                 || lookup_spanned(idx.by_rfn.get(&rfn), lsn),
-                |a| Err(LookupResult::Ambiguous(a)),
+                |a| Err(LookupMiss::Ambiguous(a)),
             )
     }
 
@@ -546,7 +568,7 @@ impl DescriptorLog {
     pub fn descriptor_by_oid_at(&self, oid: Oid, lsn: u64) -> LookupResult {
         match self.descriptor_by_oid_at_spanned(oid, lsn) {
             Ok((rel, _)) => LookupResult::Present(rel),
-            Err(other) => other,
+            Err(miss) => miss.into(),
         }
     }
 
@@ -560,12 +582,12 @@ impl DescriptorLog {
         db_oid: Oid,
         oid: Oid,
         lsn: u64,
-    ) -> std::result::Result<(Arc<RelDescriptor>, u64), LookupResult> {
+    ) -> std::result::Result<(Arc<RelDescriptor>, u64), LookupMiss> {
         if db_oid != self.identity.db_oid {
             self.stats
                 .lookups_foreign_db
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            return Err(LookupResult::ForeignDb);
+            return Err(LookupMiss::ForeignDb);
         }
         self.descriptor_by_oid_at_spanned(oid, lsn)
     }
@@ -574,37 +596,36 @@ impl DescriptorLog {
         &self,
         oid: Oid,
         lsn: u64,
-    ) -> std::result::Result<(Arc<RelDescriptor>, u64), LookupResult> {
+    ) -> std::result::Result<(Arc<RelDescriptor>, u64), LookupMiss> {
         let idx = self.index.read().unwrap();
         let result = ambiguity_covering(idx.amb_oid.get(&oid), lsn)
             .or_else(|| ambiguity_covering(idx.amb_db.get(&self.identity.db_oid), lsn))
             .map_or_else(
                 || lookup_spanned(idx.by_oid.get(&oid), lsn),
-                |a| Err(LookupResult::Ambiguous(a)),
+                |a| Err(LookupMiss::Ambiguous(a)),
             );
         self.count_spanned(&result);
         result
     }
 
-    fn count_spanned(&self, result: &std::result::Result<(Arc<RelDescriptor>, u64), LookupResult>) {
+    fn count_spanned(&self, result: &std::result::Result<(Arc<RelDescriptor>, u64), LookupMiss>) {
         use std::sync::atomic::Ordering::Relaxed;
         match result {
             Ok(_) => {
                 self.stats.lookups_present.fetch_add(1, Relaxed);
             }
-            Err(other) => self.count(other),
+            Err(miss) => self.count(miss),
         }
     }
 
-    fn count(&self, result: &LookupResult) {
+    fn count(&self, miss: &LookupMiss) {
         use std::sync::atomic::Ordering::Relaxed;
-        match result {
-            LookupResult::Present(_) => self.stats.lookups_present.fetch_add(1, Relaxed),
-            LookupResult::Dropped => self.stats.lookups_dropped.fetch_add(1, Relaxed),
-            LookupResult::Retired => self.stats.lookups_retired.fetch_add(1, Relaxed),
-            LookupResult::Ambiguous(_) => self.stats.lookups_ambiguous.fetch_add(1, Relaxed),
-            LookupResult::NotCovered => self.stats.lookups_not_covered.fetch_add(1, Relaxed),
-            LookupResult::ForeignDb => self.stats.lookups_foreign_db.fetch_add(1, Relaxed),
+        match miss {
+            LookupMiss::Dropped => self.stats.lookups_dropped.fetch_add(1, Relaxed),
+            LookupMiss::Retired => self.stats.lookups_retired.fetch_add(1, Relaxed),
+            LookupMiss::Ambiguous(_) => self.stats.lookups_ambiguous.fetch_add(1, Relaxed),
+            LookupMiss::NotCovered => self.stats.lookups_not_covered.fetch_add(1, Relaxed),
+            LookupMiss::ForeignDb => self.stats.lookups_foreign_db.fetch_add(1, Relaxed),
         };
     }
 
@@ -915,18 +936,18 @@ fn ambiguity_covering(list: Option<&Vec<Arc<Ambiguity>>>, lsn: u64) -> Option<Ar
 fn lookup_spanned(
     chain: Option<&Vec<Slot>>,
     lsn: u64,
-) -> std::result::Result<(Arc<RelDescriptor>, u64), LookupResult> {
+) -> std::result::Result<(Arc<RelDescriptor>, u64), LookupMiss> {
     let Some(chain) = chain else {
-        return Err(LookupResult::NotCovered);
+        return Err(LookupMiss::NotCovered);
     };
     let pos = chain.partition_point(|s| s.valid_from <= lsn);
     let Some(slot) = pos.checked_sub(1).map(|i| &chain[i]) else {
-        return Err(LookupResult::NotCovered);
+        return Err(LookupMiss::NotCovered);
     };
     match &slot.entry.value {
         LogValue::Present(d) => Ok((d.clone(), slot.valid_from)),
-        LogValue::Dropped => Err(LookupResult::Dropped),
-        LogValue::Retired => Err(LookupResult::Retired),
+        LogValue::Dropped => Err(LookupMiss::Dropped),
+        LogValue::Retired => Err(LookupMiss::Retired),
     }
 }
 
@@ -1956,6 +1977,8 @@ mod tests {
             log.descriptor_by_oid_at(42, 300),
             LookupResult::Present(_)
         ));
+        // Truncate apply reaches past the retirement
+        assert_eq!(log.present_before(rfn(7000), 300).unwrap().oid, 42);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2012,7 +2035,7 @@ mod tests {
         assert_eq!(stats.lookups_foreign_db.load(Relaxed), 0);
         assert_eq!(
             log.descriptor_by_oid_in_db_at_spanned(6, 101, 200),
-            Err(LookupResult::ForeignDb)
+            Err(LookupMiss::ForeignDb)
         );
         assert_eq!(stats.lookups_foreign_db.load(Relaxed), 1);
         assert_eq!(
@@ -2023,7 +2046,7 @@ mod tests {
         // Shared-catalog dbid 0 names no per-database relation either
         assert_eq!(
             log.descriptor_by_oid_in_db_at_spanned(0, 101, 200),
-            Err(LookupResult::ForeignDb)
+            Err(LookupMiss::ForeignDb)
         );
         assert_eq!(stats.lookups_foreign_db.load(Relaxed), 2);
     }
@@ -2892,5 +2915,140 @@ mod tests {
         divergent.commit_lsn = 181;
         let err = log.append_batch(divergent).await.unwrap_err();
         assert!(matches!(err, DescLogError::Corrupt { .. }));
+    }
+
+    fn load(bytes: &[u8], repairable: bool) -> Result<(u64, u16)> {
+        load_frames(
+            bytes,
+            TAIL_FILE,
+            &ident(),
+            &[],
+            &mut Index::default(),
+            repairable,
+        )
+    }
+
+    fn corrupt_detail(r: Result<impl std::fmt::Debug>) -> String {
+        let msg = r.unwrap_err().to_string();
+        let (head, detail) = msg.split_once(": ").unwrap();
+        assert!(head.starts_with("descriptor log corrupt at "), "{msg}");
+        detail.to_owned()
+    }
+
+    #[test]
+    fn foreign_headers_name_the_mismatched_field() {
+        let cases = [
+            (
+                "pg_major",
+                DescLogIdentity {
+                    pg_major: 16,
+                    ..ident()
+                },
+            ),
+            (
+                "system_id",
+                DescLogIdentity {
+                    system_id: "1".into(),
+                    ..ident()
+                },
+            ),
+            (
+                "wal_seg_size",
+                DescLogIdentity {
+                    wal_seg_size: 1 << 30,
+                    ..ident()
+                },
+            ),
+        ];
+        for (want, id) in cases {
+            let err = load(&encode_header(&id), false).unwrap_err().to_string();
+            let prefix = format!("foreign descriptor log: {want} mismatch");
+            assert!(err.starts_with(&prefix), "{err}");
+        }
+        let mut bytes = encode_header(&ident());
+        bytes[0] = b'X';
+        assert!(corrupt_detail(load(&bytes, true)).starts_with("bad magic"));
+    }
+
+    #[test]
+    fn torn_frames_repair_only_in_tail() {
+        let header = encode_header(&ident());
+        let mut torn = header.clone();
+        torn.extend_from_slice(&[1, 0, 0]);
+        assert_eq!(load(&torn, true).unwrap(), (header.len() as u64, VERSION));
+        assert_eq!(corrupt_detail(load(&torn, false)), "torn frame header");
+
+        let mut bad_crc = header.clone();
+        push_frame(&mut bad_crc, &encode_meta(1, 2));
+        let last = bad_crc.len() - 1;
+        bad_crc[last] ^= 0xff;
+        assert_eq!(load(&bad_crc, true).unwrap().0, header.len() as u64);
+
+        let mut unknown = header;
+        push_frame(&mut unknown, &[9]);
+        assert_eq!(corrupt_detail(load(&unknown, true)), "unknown frame tag 9");
+    }
+
+    fn decode_body(body: &[u8]) -> Result<BatchRecord> {
+        assert_eq!(body[0], TAG_BATCH);
+        decode_batch(&mut Cur::new(&body[1..], TAIL_FILE, 1), VERSION)
+    }
+
+    #[test]
+    fn batch_decode_rejects_unknown_tags() {
+        let retired = encode_batch(&batch(1, vec![tombstone(1, 7, 7, LogValue::Retired)]));
+        let mut scoped = batch(2, Vec::new());
+        scoped.ambiguities = vec![amb(AmbiguityScope::Database(5), 1, 2)];
+        let scoped = encode_batch(&scoped);
+        let mut observed = batch(3, Vec::new());
+        observed.observations = vec![RelationObservation {
+            oid: None,
+            rfn: None,
+            first_touch_lsn: 1,
+            smgr_create_lsn: None,
+            kind: ObservationKind::FullScan,
+        }];
+        let observed = encode_batch(&observed);
+        let present = encode_batch(&batch(4, vec![present(1, &desc(16400, 16400, false))]));
+        // Wire order: rfn, oids, names, kind, persistence, replident
+        let replident = 46 + 24 + (4 + 6) + (4 + 6) + 2;
+        assert_eq!(present[replident], 0);
+        let cases = [
+            (&retired, retired.len() - 9, 2, "unknown entry kind 9"),
+            (&scoped, scoped.len() - 26, 2, "unknown ambiguity scope 9"),
+            (&scoped, scoped.len() - 5, 1, "unknown ambiguity reason 9"),
+            (
+                &observed,
+                observed.len() - 1,
+                2,
+                "unknown observation kind 9",
+            ),
+            (&present, replident, 0, "unknown replident tag 9"),
+        ];
+        for (body, at, was, want) in cases {
+            assert_eq!(body[at], was, "{want}");
+            let mut bad = body.clone();
+            bad[at] = 9;
+            assert_eq!(corrupt_detail(decode_body(&bad)), want);
+        }
+        assert_eq!(
+            corrupt_detail(decode_body(&retired[..retired.len() - 1])),
+            "short read: need 4, have 3"
+        );
+    }
+
+    #[test]
+    fn raw_missing_default_round_trips() {
+        let mut d = (*desc(16401, 16401, true)).clone();
+        let raw = vec![0xab, 0xcd, 0xef, 0x12];
+        d.attributes[2].missing_default = Some(MissingDefault::Raw(raw.clone()));
+        let rec = batch(5, vec![present(1, &Arc::new(d))]);
+        let body = encode_batch(&rec);
+        assert_eq!(decode_body(&body).unwrap(), rec);
+        let at = body.windows(4).position(|w| w == raw).unwrap() - 5;
+        assert_eq!(body[at], 2);
+        let mut bad = body.clone();
+        bad[at] = 7;
+        assert_eq!(corrupt_detail(decode_body(&bad)), "missing_default tag 7");
     }
 }

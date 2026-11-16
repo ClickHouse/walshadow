@@ -659,6 +659,43 @@ async fn oracle_defaults_fill_absent_cells() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn oracle_text_value_routes_by_database() {
+    let tmp = tempfile::tempdir().unwrap();
+    let Some(guard) = start_pg(&tmp, ports::PG_SHADOW_PORT) else {
+        return;
+    };
+    let bridge = Arc::new(bridge_on(&guard.sh).await);
+    let oracle = Oracle::per_database(vec![(5, bridge.clone()), (6, bridge)]);
+    let text = oracle
+        .text_value(6, NUMERICOID, -1, OracleCell::TextInput(b"042.50".to_vec()))
+        .await
+        .unwrap();
+    assert_eq!(text, "42.50");
+    let absent = oracle
+        .text_value(7, NUMERICOID, -1, OracleCell::TextInput(b"1".to_vec()))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&absent, walshadow::oracle::OracleError::Absent(m) if m.contains("database 7")),
+        "{absent}"
+    );
+    let short = buf(NUMERICOID, Vec::new());
+    let columns = [OracleRequestColumn {
+        ordinal: 0,
+        name: "v",
+        target_type: "String",
+        buf: &short,
+    }];
+    let err = oracle
+        .encode_batch(5, &columns, 1, alloc())
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("holds 0 cells"), "{err}");
+    assert_eq!(oracle.stats.blocks.load(Ordering::Relaxed), 1);
+    assert_eq!(oracle.stats.errors.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn oracle_fails_whole_request_on_bad_cell() {
     let tmp = tempfile::tempdir().unwrap();
     let Some(guard) = start_pg(&tmp, ports::PG_SHADOW_PORT) else {

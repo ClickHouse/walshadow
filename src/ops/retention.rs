@@ -272,6 +272,8 @@ mod tests {
         touch(dir, &format!("{}.tmp", seg_name(1, 0, 8)), b"t");
         touch(dir, &format!("{}.manifest.json", seg_name(1, 0, 7)), b"{}");
         touch(dir, "README", b"hi");
+        use std::os::unix::ffi::OsStrExt;
+        std::fs::write(dir.join(std::ffi::OsStr::from_bytes(b"\xff")), b"x").unwrap();
         let want = SegmentName {
             timeline: 1,
             log_id: 0,

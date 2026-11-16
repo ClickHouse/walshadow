@@ -72,15 +72,9 @@ pub struct ResolvedColumn {
     pub default_sql: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum BridgeError {
-    #[error("unsupported PG type oid {type_oid} (name {type_name:?})")]
-    UnsupportedType { type_oid: u32, type_name: String },
-}
-
 /// `pk_member = true` forces non-nullable: CH refuses `Nullable` in `ORDER BY`
-pub fn map(att: &RelAttr, pk_member: bool) -> Result<ResolvedColumn, BridgeError> {
-    let inner = base_type_for(att)?;
+pub fn map(att: &RelAttr, pk_member: bool) -> ResolvedColumn {
+    let inner = base_type_for(att);
     let nullable = !pk_member
         && !att.not_null
         && !matches!(types::kind(&inner), Some(Kind::Array | Kind::Map));
@@ -90,15 +84,15 @@ pub fn map(att: &RelAttr, pk_member: bool) -> Result<ResolvedColumn, BridgeError
         inner.clone()
     };
     let default_sql = render_default(att, &inner);
-    Ok(ResolvedColumn {
+    ResolvedColumn {
         ch_type,
         default_sql,
-    })
+    }
 }
 
 /// Inner CH type without `Nullable(_)`; [`map`] adds wrap
-pub fn base_type_for(att: &RelAttr) -> Result<String, BridgeError> {
-    Ok(match att.type_oid {
+pub fn base_type_for(att: &RelAttr) -> String {
+    match att.type_oid {
         BOOLOID => "Bool".into(),
         CHAROID => "Int8".into(),
         INT2OID => "Int16".into(),
@@ -134,7 +128,7 @@ pub fn base_type_for(att: &RelAttr) -> Result<String, BridgeError> {
                 "String".into()
             }
         }
-    })
+    }
 }
 
 /// PG array type name (`_int4`, `_text`, …) → `Array(Nullable(<elem>))` for
@@ -534,20 +528,20 @@ mod tests {
     #[test]
     fn arrays_map_to_native_ch_array() {
         assert_eq!(
-            base_type_for(&named_attr(1007, "_int4", true)).unwrap(),
+            base_type_for(&named_attr(1007, "_int4", true)),
             "Array(Nullable(Int32))"
         );
         assert_eq!(
-            base_type_for(&named_attr(1016, "_int8", true)).unwrap(),
+            base_type_for(&named_attr(1016, "_int8", true)),
             "Array(Nullable(Int64))"
         );
         assert_eq!(
-            base_type_for(&named_attr(1009, "_text", true)).unwrap(),
+            base_type_for(&named_attr(1009, "_text", true)),
             "Array(Nullable(String))"
         );
         // Unsupported element type keeps array shape with String elements.
         assert_eq!(
-            base_type_for(&named_attr(1231, "_numeric", true)).unwrap(),
+            base_type_for(&named_attr(1231, "_numeric", true)),
             "Array(Nullable(String))"
         );
     }
@@ -555,7 +549,7 @@ mod tests {
     #[test]
     fn hstore_maps_to_ch_map() {
         assert_eq!(
-            base_type_for(&named_attr(99999, "hstore", true)).unwrap(),
+            base_type_for(&named_attr(99999, "hstore", true)),
             "Map(String, Nullable(String))"
         );
     }
@@ -563,13 +557,10 @@ mod tests {
     #[test]
     fn json_maps_to_ch_string() {
         for oid in [JSONOID, JSONBOID] {
-            assert_eq!(base_type_for(&attr(oid, -1, true, None)).unwrap(), "String");
+            assert_eq!(base_type_for(&attr(oid, -1, true, None)), "String");
+            assert_eq!(map(&attr(oid, -1, true, None), false).ch_type, "String");
             assert_eq!(
-                map(&attr(oid, -1, true, None), false).unwrap().ch_type,
-                "String"
-            );
-            assert_eq!(
-                map(&attr(oid, -1, false, None), false).unwrap().ch_type,
+                map(&attr(oid, -1, false, None), false).ch_type,
                 "Nullable(String)"
             );
         }
@@ -578,7 +569,7 @@ mod tests {
     #[test]
     fn vector_maps_to_array_float32() {
         assert_eq!(
-            base_type_for(&named_attr(99998, "vector", false)).unwrap(),
+            base_type_for(&named_attr(99998, "vector", false)),
             "Array(Float32)"
         );
     }
@@ -587,46 +578,30 @@ mod tests {
     fn composite_types_never_wrapped_in_nullable() {
         // nullable source array/hstore → bare Array/Map (CH forbids Nullable)
         assert_eq!(
-            map(&named_attr(1007, "_int4", false), false)
-                .unwrap()
-                .ch_type,
+            map(&named_attr(1007, "_int4", false), false).ch_type,
             "Array(Nullable(Int32))"
         );
         assert_eq!(
-            map(&named_attr(99999, "hstore", false), false)
-                .unwrap()
-                .ch_type,
+            map(&named_attr(99999, "hstore", false), false).ch_type,
             "Map(String, Nullable(String))"
         );
     }
 
     #[test]
     fn int_types_map_to_signed_ch() {
-        assert_eq!(
-            base_type_for(&attr(INT2OID, -1, true, None)).unwrap(),
-            "Int16"
-        );
-        assert_eq!(
-            base_type_for(&attr(INT4OID, -1, true, None)).unwrap(),
-            "Int32"
-        );
-        assert_eq!(
-            base_type_for(&attr(INT8OID, -1, true, None)).unwrap(),
-            "Int64"
-        );
-        assert_eq!(
-            base_type_for(&attr(OIDOID, -1, true, None)).unwrap(),
-            "UInt32"
-        );
+        assert_eq!(base_type_for(&attr(INT2OID, -1, true, None)), "Int16");
+        assert_eq!(base_type_for(&attr(INT4OID, -1, true, None)), "Int32");
+        assert_eq!(base_type_for(&attr(INT8OID, -1, true, None)), "Int64");
+        assert_eq!(base_type_for(&attr(OIDOID, -1, true, None)), "UInt32");
     }
 
     #[test]
     fn nullable_wraps_when_not_pk_and_not_not_null() {
-        let r = map(&attr(INT4OID, -1, false, None), false).unwrap();
+        let r = map(&attr(INT4OID, -1, false, None), false);
         assert_eq!(r.ch_type, "Nullable(Int32)");
-        let r = map(&attr(INT4OID, -1, true, None), false).unwrap();
+        let r = map(&attr(INT4OID, -1, true, None), false);
         assert_eq!(r.ch_type, "Int32");
-        let r = map(&attr(INT4OID, -1, false, None), true).unwrap();
+        let r = map(&attr(INT4OID, -1, false, None), true);
         assert_eq!(r.ch_type, "Int32", "pk_member forces non-nullable");
     }
 
@@ -635,54 +610,42 @@ mod tests {
         // typmod = ((precision << 16) | scale) + VARHDRSZ
         let tm = ((10i32 << 16) | 2) + VARHDRSZ;
         assert_eq!(
-            base_type_for(&attr(NUMERICOID, tm, true, None)).unwrap(),
+            base_type_for(&attr(NUMERICOID, tm, true, None)),
             "Decimal(10, 2)"
         );
         // numeric (no typmod) → String
-        assert_eq!(
-            base_type_for(&attr(NUMERICOID, -1, true, None)).unwrap(),
-            "String"
-        );
+        assert_eq!(base_type_for(&attr(NUMERICOID, -1, true, None)), "String");
         // p=38 Decimal128 boundary
         let tm = ((38i32 << 16) | 4) + VARHDRSZ;
         assert_eq!(
-            base_type_for(&attr(NUMERICOID, tm, true, None)).unwrap(),
+            base_type_for(&attr(NUMERICOID, tm, true, None)),
             "Decimal(38, 4)"
         );
         let tm = ((39i32 << 16) | 4) + VARHDRSZ;
         assert_eq!(
-            base_type_for(&attr(NUMERICOID, tm, true, None)).unwrap(),
+            base_type_for(&attr(NUMERICOID, tm, true, None)),
             "Decimal(39, 4)"
         );
         // p=76 Decimal256 ceiling
         let tm = ((76i32 << 16) | 10) + VARHDRSZ;
         assert_eq!(
-            base_type_for(&attr(NUMERICOID, tm, true, None)).unwrap(),
+            base_type_for(&attr(NUMERICOID, tm, true, None)),
             "Decimal(76, 10)"
         );
         // p=77 beyond Decimal256 → String
         let tm = ((77i32 << 16) | 10) + VARHDRSZ;
-        assert_eq!(
-            base_type_for(&attr(NUMERICOID, tm, true, None)).unwrap(),
-            "String"
-        );
+        assert_eq!(base_type_for(&attr(NUMERICOID, tm, true, None)), "String");
         // negative scale → String
         let tm = ((10i32 << 16) | 0xFFFF) + VARHDRSZ;
-        assert_eq!(
-            base_type_for(&attr(NUMERICOID, tm, true, None)).unwrap(),
-            "String"
-        );
+        assert_eq!(base_type_for(&attr(NUMERICOID, tm, true, None)), "String");
         let tm = ((50i32 << 16) | 2) + VARHDRSZ;
         assert_eq!(
-            base_type_for(&attr(NUMERICOID, tm, true, None)).unwrap(),
+            base_type_for(&attr(NUMERICOID, tm, true, None)),
             "Decimal(50, 2)"
         );
         // scale > precision → String
         let tm = ((50i32 << 16) | 60) + VARHDRSZ;
-        assert_eq!(
-            base_type_for(&attr(NUMERICOID, tm, true, None)).unwrap(),
-            "String"
-        );
+        assert_eq!(base_type_for(&attr(NUMERICOID, tm, true, None)), "String");
     }
 
     #[test]
@@ -695,42 +658,26 @@ mod tests {
             (OID8OID, "UInt64"),
             (MONEYOID, "Int64"),
         ] {
-            assert_eq!(
-                base_type_for(&attr(oid, -1, true, None)).unwrap(),
-                want,
-                "oid {oid}"
-            );
+            assert_eq!(base_type_for(&attr(oid, -1, true, None)), want, "oid {oid}");
         }
     }
 
     #[test]
     fn time_maps_native_timetz_and_interval_text() {
-        assert_eq!(
-            base_type_for(&attr(TIMEOID, -1, true, None)).unwrap(),
-            "Time64(6)"
-        );
-        assert_eq!(
-            base_type_for(&attr(TIMEOID, 0, true, None)).unwrap(),
-            "Time64(0)"
-        );
-        assert_eq!(
-            base_type_for(&attr(TIMETZOID, -1, true, None)).unwrap(),
-            "String"
-        );
-        assert_eq!(
-            base_type_for(&attr(INTERVALOID, -1, true, None)).unwrap(),
-            "String"
-        );
+        assert_eq!(base_type_for(&attr(TIMEOID, -1, true, None)), "Time64(6)");
+        assert_eq!(base_type_for(&attr(TIMEOID, 0, true, None)), "Time64(0)");
+        assert_eq!(base_type_for(&attr(TIMETZOID, -1, true, None)), "String");
+        assert_eq!(base_type_for(&attr(INTERVALOID, -1, true, None)), "String");
     }
 
     #[test]
     fn timestamp_typmod_drives_precision() {
         assert_eq!(
-            base_type_for(&attr(TIMESTAMPOID, 3, true, None)).unwrap(),
+            base_type_for(&attr(TIMESTAMPOID, 3, true, None)),
             "DateTime64(3, 'UTC')"
         );
         assert_eq!(
-            base_type_for(&attr(TIMESTAMPTZOID, -1, true, None)).unwrap(),
+            base_type_for(&attr(TIMESTAMPTZOID, -1, true, None)),
             "DateTime64(6, 'UTC')"
         );
     }
@@ -738,36 +685,33 @@ mod tests {
     #[test]
     fn text_family_collapses_to_string() {
         for oid in [TEXTOID, VARCHAROID, BPCHAROID, NAMEOID, BYTEAOID] {
-            assert_eq!(base_type_for(&attr(oid, -1, true, None)).unwrap(), "String");
+            assert_eq!(base_type_for(&attr(oid, -1, true, None)), "String");
         }
     }
 
     #[test]
     fn unknown_oid_falls_through_to_string() {
-        assert_eq!(
-            base_type_for(&attr(99999, -1, true, None)).unwrap(),
-            "String"
-        );
+        assert_eq!(base_type_for(&attr(99999, -1, true, None)), "String");
     }
 
     #[test]
     fn default_for_int_renders_literal_number() {
-        let r = map(&attr(INT4OID, -1, true, Some("7")), false).unwrap();
+        let r = map(&attr(INT4OID, -1, true, Some("7")), false);
         assert_eq!(r.ch_type, "Int32");
         assert_eq!(r.default_sql.as_deref(), Some("7"));
     }
 
     #[test]
     fn default_for_text_quotes_and_escapes() {
-        let r = map(&attr(TEXTOID, -1, true, Some("o'rly")), false).unwrap();
+        let r = map(&attr(TEXTOID, -1, true, Some("o'rly")), false);
         assert_eq!(r.default_sql.as_deref(), Some("'o''rly'"));
     }
 
     #[test]
     fn default_for_bool_renders_true_false() {
-        let r = map(&attr(BOOLOID, -1, true, Some("t")), false).unwrap();
+        let r = map(&attr(BOOLOID, -1, true, Some("t")), false);
         assert_eq!(r.default_sql.as_deref(), Some("true"));
-        let r = map(&attr(BOOLOID, -1, true, Some("f")), false).unwrap();
+        let r = map(&attr(BOOLOID, -1, true, Some("f")), false);
         assert_eq!(r.default_sql.as_deref(), Some("false"));
     }
 
@@ -788,7 +732,7 @@ mod tests {
     /// Preserve PostgreSQL `jsonb_out` text
     #[test]
     fn default_for_jsonb_text_renders_the_document() {
-        let r = map(&attr(JSONBOID, -1, true, Some(r#"{"a": 1}"#)), false).unwrap();
+        let r = map(&attr(JSONBOID, -1, true, Some(r#"{"a": 1}"#)), false);
         assert_eq!(r.default_sql.as_deref(), Some(r#"'{"a": 1}'"#));
     }
 
@@ -926,8 +870,7 @@ mod tests {
                 Some("2026-08-27 12:47:00.842306+00"),
             ),
             false,
-        )
-        .unwrap();
+        );
         assert_eq!(
             r.default_sql.as_deref(),
             Some("parseDateTime64BestEffort('2026-08-27 12:47:00.842306+00', 6, 'UTC')")
@@ -935,14 +878,13 @@ mod tests {
         let r = map(
             &attr(TIMESTAMPOID, 3, true, Some("2024-01-01 00:00:00")),
             false,
-        )
-        .unwrap();
+        );
         assert_eq!(
             r.default_sql.as_deref(),
             Some("parseDateTime64BestEffort('2024-01-01 00:00:00', 3, 'UTC')")
         );
         for text in ["infinity", "-infinity", "0044-03-15 12:00:00+00 BC"] {
-            let r = map(&attr(TIMESTAMPTZOID, -1, true, Some(text)), false).unwrap();
+            let r = map(&attr(TIMESTAMPTZOID, -1, true, Some(text)), false);
             assert_eq!(r.default_sql, None, "{text}");
         }
     }
@@ -962,7 +904,7 @@ mod tests {
             ("_int4", "[0:1]={1,2}", None),
             ("_text", r#"{"unterminated}"#, None),
         ] {
-            let r = map(&array_attr(type_name, text), false).unwrap();
+            let r = map(&array_attr(type_name, text), false);
             assert_eq!(r.default_sql.as_deref(), expected, "{type_name} {text}");
         }
     }
@@ -970,7 +912,7 @@ mod tests {
     #[test]
     fn vector_text_default_casts_from_its_bracketed_text() {
         for type_name in ["vector", "halfvec"] {
-            let r = map(&array_attr(type_name, "[1,2,3]"), false).unwrap();
+            let r = map(&array_attr(type_name, "[1,2,3]"), false);
             assert_eq!(r.ch_type, "Array(Float32)");
             assert_eq!(
                 r.default_sql.as_deref(),
@@ -982,14 +924,88 @@ mod tests {
 
     #[test]
     fn map_text_default_is_dropped() {
-        let r = map(&array_attr("hstore", r#""a"=>"1""#), false).unwrap();
+        let r = map(&array_attr("hstore", r#""a"=>"1""#), false);
         assert_eq!(r.ch_type, "Map(String, Nullable(String))");
         assert_eq!(r.default_sql, None);
     }
 
     #[test]
     fn other_pending_text_defaults_cast_from_their_text() {
-        let r = map(&attr(NUMERICOID, -1, true, Some("3.14")), false).unwrap();
+        let r = map(&attr(NUMERICOID, -1, true, Some("3.14")), false);
         assert_eq!(r.default_sql.as_deref(), Some("unhex('332e3134')"));
+    }
+
+    #[test]
+    fn array_elements_map_per_type() {
+        for (name, inner) in [
+            ("_int2", "Int16"),
+            ("_oid", "UInt32"),
+            ("_float4", "Float32"),
+            ("_float8", "Float64"),
+            ("_bool", "Bool"),
+            ("_uuid", "UUID"),
+        ] {
+            assert_eq!(
+                base_type_for(&named_attr(0, name, true)),
+                format!("Array(Nullable({inner}))")
+            );
+        }
+        assert_eq!(base_type_for(&attr(CHAROID, -1, true, None)), "Int8");
+    }
+
+    #[test]
+    fn scalar_values_render_as_ch_literals() {
+        use crate::decode::codecs::InetValue;
+        let mut addr = [0u8; 16];
+        addr[..4].copy_from_slice(&[10, 0, 0, 1]);
+        let cases = [
+            (ColumnValue::Char(-3), "-3"),
+            (ColumnValue::Int2(7), "7"),
+            (ColumnValue::Int8(-1 << 40), "-1099511627776"),
+            (ColumnValue::Oid(4_000_000_000), "4000000000"),
+            (ColumnValue::Oid8(u64::MAX), "18446744073709551615"),
+            (ColumnValue::Float4(2.0), "2.0"),
+            (ColumnValue::Float8(f64::NEG_INFINITY), "-inf"),
+            (ColumnValue::Numeric(NumericKind::NaN), "nan"),
+            (ColumnValue::Numeric(NumericKind::PInf), "inf"),
+            (ColumnValue::Numeric(NumericKind::NInf), "-inf"),
+            (
+                ColumnValue::Inet(InetValue {
+                    family: 2,
+                    bits: 32,
+                    is_cidr: false,
+                    addr,
+                }),
+                "'10.0.0.1'",
+            ),
+            (
+                ColumnValue::MacAddr([0x08, 0, 0x2b, 1, 2, 3]),
+                "'08:00:2b:01:02:03'",
+            ),
+            (
+                ColumnValue::MacAddr8([0x08, 0, 0x2b, 1, 2, 3, 4, 5]),
+                "'08:00:2b:01:02:03:04:05'",
+            ),
+            (
+                ColumnValue::Tid {
+                    block: 12,
+                    offset: 3,
+                },
+                "'(12,3)'",
+            ),
+        ];
+        for (value, want) in cases {
+            assert_eq!(
+                column_value_to_sql_literal(&value, "String").as_deref(),
+                Some(want),
+                "{value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_array_text_has_no_default() {
+        assert_eq!(pg_array_items(r#"{"a"x}"#), None);
+        assert_eq!(pending_text_literal(r#"{"a"x}"#, "Array(String)"), None);
     }
 }

@@ -285,6 +285,31 @@ mod tests {
     use super::*;
     use walrus::pg::backup::{BackupSentinelDto, BackupSentinelDtoV2, TablespaceSpec};
 
+    #[tokio::test]
+    async fn run_names_the_spool_dir_and_backup_it_could_not_use() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage: DynStorage =
+            Arc::new(walrus::storage::fs::FsStorage::new(tmp.path()).unwrap());
+        let file = tmp.path().join("file");
+        tokio::fs::write(&file, b"").await.unwrap();
+        let run = |spool: PathBuf| {
+            let source = ObjectStoreSource::new(
+                Settings::default(),
+                storage.clone(),
+                "LATEST".into(),
+                spool,
+            );
+            let sink = crate::backfill::backup_page_walk::PageWalkSink::new_capturing(
+                crate::backfill::backup_page_walk::CatalogMap::new(),
+            );
+            Box::new(source).run(tmp.path().join("void"), Arc::new(sink), Arc::default())
+        };
+        let err = run(file.join("spool")).await.unwrap_err();
+        assert!(err.to_string().starts_with("part spool dir "), "{err}");
+        let err = run(tmp.path().join("spool")).await.unwrap_err();
+        assert!(err.to_string().contains("resolve LATEST"), "{err}");
+    }
+
     #[test]
     fn timeline_parses_from_backup_name() {
         let n = walrus::pg::backup::format_backup_name(0x42, 0x0300_0000, 16 * 1024 * 1024);
@@ -316,6 +341,8 @@ mod tests {
         assert_eq!(end.end_lsn, 0x0300_1000);
         assert_eq!(start.timeline, 1);
 
+        s.sentinel.backup_finish_lsn = None;
+        assert!(build_lsn_pair(&resolved, &s).is_err());
         s.sentinel.backup_start_lsn = None;
         assert!(build_lsn_pair(&resolved, &s).is_err());
     }

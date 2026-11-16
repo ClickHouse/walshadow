@@ -8,7 +8,6 @@ edition = "2024"
 description = "Schema-only Postgres + WAL replay catalog mirror for CDC to ClickHouse"
 license = "AGPL-3.0-only"
 repository = "https://github.com/ClickHouse/walshadow"
-homepage = "https://github.com/ClickHouse/walshadow"
 documentation = "https://github.com/ClickHouse/walshadow/tree/main/docs"
 
 [[bin]]

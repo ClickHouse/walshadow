@@ -204,6 +204,14 @@ pub const XLH_INSERT_CONTAINS_NEW_TUPLE: u8 = 1 << 3;
 pub const HEAP_HASNULL: u16 = 0x0001;
 pub const HEAP_NATTS_MASK: u16 = 0x07FF;
 
+/// Value runs past tuple end; caller marks rest of tuple absent
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Truncated {
+    pub offset: usize,
+    pub need: usize,
+    pub have: usize,
+}
+
 #[derive(Debug, Error)]
 pub enum DecodeError {
     #[error("truncated tuple at offset {offset}: need {need} bytes, have {have}")]
@@ -472,19 +480,14 @@ pub fn decode_heap_record(
     if rm != RmId::Heap as u8 {
         return Ok(SmallVec::new());
     }
-    match info_op {
-        XLOG_HEAP_INSERT => Ok(smallvec![decode_insert(record, source_lsn, rfn, xid, rel)?]),
-        XLOG_HEAP_UPDATE => Ok(smallvec![decode_update(
-            record, source_lsn, rfn, xid, rel, false,
-        )?]),
-        XLOG_HEAP_HOT_UPDATE => Ok(smallvec![decode_update(
-            record, source_lsn, rfn, xid, rel, true,
-        )?]),
-        XLOG_HEAP_DELETE => Ok(smallvec![
-            decode_delete(record, source_lsn, rfn, xid, rel,)?
-        ]),
-        _ => Ok(SmallVec::new()),
-    }
+    let op = match info_op {
+        XLOG_HEAP_INSERT => decode_insert(record, source_lsn, rfn, xid, rel)?,
+        XLOG_HEAP_UPDATE => decode_update(record, source_lsn, rfn, xid, rel, false)?,
+        XLOG_HEAP_HOT_UPDATE => decode_update(record, source_lsn, rfn, xid, rel, true)?,
+        XLOG_HEAP_DELETE => decode_delete(record, source_lsn, rfn, xid, rel)?,
+        _ => return Ok(SmallVec::new()),
+    };
+    Ok(smallvec![op])
 }
 
 /// PG `SizeOfHeapMultiInsert = offsetof(xl_heap_multi_insert, offsets)`:
@@ -920,19 +923,15 @@ fn walk_tuple(
                 continue;
             }
         }
-        let (value, consumed) = match decode_one_value(att, buf, abs) {
-            Ok(v) => v,
-            Err(DecodeError::Truncated { .. }) => {
+        let Ok((value, consumed)) = decode_one_value(att, buf, abs) else {
+            columns.push(None);
+            for _ in (idx + 1)..attrs.len() {
                 columns.push(None);
-                for _ in (idx + 1)..attrs.len() {
-                    columns.push(None);
-                }
-                return Ok(DecodedTuple {
-                    columns,
-                    partial: true,
-                });
             }
-            Err(e) => return Err(e),
+            return Ok(DecodedTuple {
+                columns,
+                partial: true,
+            });
         };
         columns.push(Some(value));
         cur += consumed;
@@ -1134,7 +1133,7 @@ pub(crate) fn decode_one_value(
     att: &RelAttr,
     buf: &[u8],
     abs: usize,
-) -> Result<(ColumnValue, usize), DecodeError> {
+) -> Result<(ColumnValue, usize), Truncated> {
     if att.dropped {
         // Dropped cols retain attlen/attalign/typbyval per catalog
         // convention; still read varlena header to advance cursor
@@ -1150,7 +1149,7 @@ pub(crate) fn decode_one_value(
     }
     let len = att.type_len as usize;
     if buf.len() < abs + len {
-        return Err(DecodeError::Truncated {
+        return Err(Truncated {
             offset: abs,
             need: len,
             have: buf.len().saturating_sub(abs),
@@ -1220,7 +1219,7 @@ fn fixed_value(att: &RelAttr, body: &[u8]) -> ColumnValue {
 }
 
 /// Skip a dropped column; still read varlena header to advance correctly.
-fn consume_dropped(att: &RelAttr, buf: &[u8], abs: usize) -> Result<usize, DecodeError> {
+fn consume_dropped(att: &RelAttr, buf: &[u8], abs: usize) -> Result<usize, Truncated> {
     if att.type_len == -1 {
         let (_, consumed) = decode_varlena(att, buf, abs)?;
         Ok(consumed)
@@ -1230,7 +1229,7 @@ fn consume_dropped(att: &RelAttr, buf: &[u8], abs: usize) -> Result<usize, Decod
     } else {
         let len = att.type_len as usize;
         if buf.len() < abs + len {
-            return Err(DecodeError::Truncated {
+            return Err(Truncated {
                 offset: abs,
                 need: len,
                 have: buf.len().saturating_sub(abs),
@@ -1273,9 +1272,9 @@ fn decode_varlena(
     att: &RelAttr,
     buf: &[u8],
     abs: usize,
-) -> Result<(ColumnValue, usize), DecodeError> {
+) -> Result<(ColumnValue, usize), Truncated> {
     if buf.len() <= abs {
-        return Err(DecodeError::Truncated {
+        return Err(Truncated {
             offset: abs,
             need: 1,
             have: 0,
@@ -1285,7 +1284,7 @@ fn decode_varlena(
     if first == 0x01 {
         // varattrib_1b_e: va_tag follows the 0x01 byte
         if buf.len() < abs + 2 {
-            return Err(DecodeError::Truncated {
+            return Err(Truncated {
                 offset: abs,
                 need: 2,
                 have: buf.len() - abs,
@@ -1295,7 +1294,7 @@ fn decode_varlena(
         // VARTAG_ONDISK = 18: tag byte + 16-byte struct varatt_external
         if tag == 18 {
             if buf.len() < abs + 2 + 16 {
-                return Err(DecodeError::Truncated {
+                return Err(Truncated {
                     offset: abs,
                     need: 18,
                     have: buf.len() - abs,
@@ -1327,17 +1326,11 @@ fn decode_varlena(
         ));
     }
     if first & 0x01 != 0 {
-        // Short header: low bit set, total length (incl header byte) in upper 7
+        // Short header: low bit set, total length (incl header byte) in upper 7;
+        // first != 0x01 above, so total >= 1
         let total = (first >> 1) as usize;
-        if total < 1 {
-            return Err(DecodeError::Truncated {
-                offset: abs,
-                need: 1,
-                have: 0,
-            });
-        }
         if buf.len() < abs + total {
-            return Err(DecodeError::Truncated {
+            return Err(Truncated {
                 offset: abs,
                 need: total,
                 have: buf.len() - abs,
@@ -1349,7 +1342,7 @@ fn decode_varlena(
     }
     // 4-byte length: bits [1:0] = 00 uncompressed, 10 compressed
     if buf.len() < abs + 4 {
-        return Err(DecodeError::Truncated {
+        return Err(Truncated {
             offset: abs,
             need: 4,
             have: buf.len() - abs,
@@ -1359,14 +1352,14 @@ fn decode_varlena(
     let compressed = header & 0b10 != 0;
     let total = (header >> 2) as usize;
     if total < 4 {
-        return Err(DecodeError::Truncated {
+        return Err(Truncated {
             offset: abs,
             need: 4,
             have: 0,
         });
     }
     if buf.len() < abs + total {
-        return Err(DecodeError::Truncated {
+        return Err(Truncated {
             offset: abs,
             need: total,
             have: buf.len() - abs,
@@ -1375,7 +1368,7 @@ fn decode_varlena(
     if compressed {
         // inline-compressed varlena: 4-byte header, va_tcinfo (size + method), body
         if total < 8 {
-            return Err(DecodeError::Truncated {
+            return Err(Truncated {
                 offset: abs,
                 need: 8,
                 have: total,
@@ -1502,13 +1495,13 @@ pub(crate) fn local_matrix_covers(type_oid: u32, type_len: i16) -> bool {
 /// Handle `typlen=-2` `\0`-terminated cstring (regtype/regclass typoutput
 /// intermediates). Not in the type matrix, but tracking it lets dropped
 /// cstring columns walk correctly. (`name`, typlen=64, goes the fixed path.)
-fn decode_cstring(buf: &[u8], abs: usize) -> Result<(ColumnValue, usize), DecodeError> {
+fn decode_cstring(buf: &[u8], abs: usize) -> Result<(ColumnValue, usize), Truncated> {
     let mut end = abs;
     while end < buf.len() && buf[end] != 0 {
         end += 1;
     }
     if end >= buf.len() {
-        return Err(DecodeError::Truncated {
+        return Err(Truncated {
             offset: abs,
             need: 1,
             have: 0,
@@ -1781,12 +1774,11 @@ mod tests {
                         let value = varlena_to_value(type_oid, body);
                         assert_eq!(value, expected);
                         if owned {
-                            let result_ptr = match &value {
-                                ColumnValue::Text(s) | ColumnValue::Json(s) => s.as_ptr(),
-                                ColumnValue::Bytea(b) => b.as_ptr(),
-                                _ => unreachable!(),
-                            };
-                            assert_eq!(result_ptr, ptr);
+                            assert!(
+                                matches!(&value, ColumnValue::Text(s) | ColumnValue::Json(s) if s.as_ptr() == ptr)
+                                    || matches!(&value, ColumnValue::Bytea(b) if b.as_ptr() == ptr),
+                                "owned body reused in place"
+                            );
                         }
                     }
                 }
@@ -2826,6 +2818,448 @@ mod tests {
                 (HeapOp::Delete, 0xff, 7)
             );
             assert_eq!((tomb.old, tomb.new, h.old), (old, None, None));
+        }
+    }
+
+    #[test]
+    fn heap_op_index_maps_every_op() {
+        let (heap, heap2) = (RmId::Heap as u8, RmId::Heap2 as u8);
+        let cases = [
+            (heap, XLOG_HEAP_INSERT, "insert"),
+            (heap, XLOG_HEAP_DELETE, "delete"),
+            (heap, XLOG_HEAP_UPDATE | XLOG_HEAP_INIT_PAGE, "update"),
+            (heap, XLOG_HEAP_TRUNCATE, "truncate"),
+            (heap, XLOG_HEAP_HOT_UPDATE, "hot_update"),
+            (heap, XLOG_HEAP_LOCK, "other"),
+            (heap2, XLOG_HEAP2_MULTI_INSERT, "multi_insert"),
+            (heap2, 0x60, "other"),
+            (RmId::Xact as u8, XLOG_HEAP_INSERT, "other"),
+        ];
+        for (rm, info, label) in cases {
+            assert_eq!(HEAP_OP_LABELS[heap_op_index(rm, info)], label);
+        }
+    }
+
+    fn truncated(r: &Result<DecodedHeaps, DecodeError>) -> bool {
+        matches!(r, Err(DecodeError::Truncated { .. }))
+    }
+
+    #[test]
+    fn decode_rejects_short_main_data_per_op() {
+        let rel = descriptor(16400, vec![rel_attr(1, "id", INT4OID, 4, 'i')]);
+        let mut old_tuple_update = vec![0u8; SIZE_OF_HEAP_UPDATE];
+        old_tuple_update[7] = XLH_UPDATE_CONTAINS_OLD_TUPLE;
+        let mut old_key_delete = vec![0u8; SIZE_OF_HEAP_DELETE];
+        old_key_delete[7] = XLH_DELETE_CONTAINS_OLD_KEY;
+        let cases = [
+            (
+                RmId::Heap,
+                XLOG_HEAP_UPDATE,
+                vec![0; SIZE_OF_HEAP_UPDATE - 1],
+            ),
+            (
+                RmId::Heap,
+                XLOG_HEAP_HOT_UPDATE,
+                vec![0; SIZE_OF_HEAP_UPDATE - 1],
+            ),
+            (
+                RmId::Heap,
+                XLOG_HEAP_DELETE,
+                vec![0; SIZE_OF_HEAP_DELETE - 1],
+            ),
+            // Flag old tuple without including its bytes
+            (RmId::Heap, XLOG_HEAP_HOT_UPDATE, old_tuple_update),
+            (RmId::Heap, XLOG_HEAP_DELETE, old_key_delete),
+            (
+                RmId::Heap2,
+                XLOG_HEAP2_MULTI_INSERT,
+                vec![0; SIZE_OF_HEAP_MULTI_INSERT - 1],
+            ),
+            // Omit offsets required without INIT_PAGE
+            (
+                RmId::Heap2,
+                XLOG_HEAP2_MULTI_INSERT,
+                multi_insert_main_data(2),
+            ),
+        ];
+        for (rm, info, main_data) in cases {
+            let rec = record_with(rm, info, main_data, Vec::new());
+            let r = decode_heap_record(&rec, 0, &rel);
+            assert!(truncated(&r), "{rm:?} {info:#x}: {r:?}");
+        }
+    }
+
+    #[test]
+    fn decode_without_block_yields_tupleless_ops() {
+        let rel = descriptor(16401, vec![rel_attr(1, "id", INT4OID, 4, 'i')]);
+        let blockless = |rm, info, main_data| {
+            let mut rec = record_with(rm, info, main_data, Vec::new());
+            rec.blocks.clear();
+            decode_heap_record(&rec, 7, &rel).unwrap()
+        };
+        let ins = blockless(RmId::Heap, XLOG_HEAP_INSERT, vec![0; SIZE_OF_HEAP_INSERT]);
+        assert_eq!((ins[0].op, ins[0].new.is_none()), (HeapOp::Insert, true));
+        assert_eq!(ins[0].rfn, RelFileNode::default());
+        let upd = blockless(RmId::Heap, XLOG_HEAP_UPDATE, vec![0; SIZE_OF_HEAP_UPDATE]);
+        assert_eq!(
+            (upd[0].op, upd[0].new.is_none(), upd[0].old.is_none()),
+            (HeapOp::Update, true, true)
+        );
+        let multi = blockless(
+            RmId::Heap2,
+            XLOG_HEAP2_MULTI_INSERT | XLOG_HEAP_INIT_PAGE,
+            multi_insert_main_data(1),
+        );
+        assert!(multi.is_empty());
+    }
+
+    #[test]
+    fn decode_multi_insert_short_tuple_header_errors() {
+        let rel = descriptor(16402, vec![rel_attr(1, "id", INT4OID, 4, 'i')]);
+        let rec = record_with(
+            RmId::Heap2,
+            XLOG_HEAP2_MULTI_INSERT | XLOG_HEAP_INIT_PAGE,
+            multi_insert_main_data(1),
+            vec![4, 0, 1, 0],
+        );
+        let r = decode_heap_record(&rec, 0, &rel);
+        assert!(
+            matches!(
+                r,
+                Err(DecodeError::Truncated {
+                    offset: 0,
+                    need: SIZE_OF_MULTI_INSERT_TUPLE,
+                    have: 4
+                })
+            ),
+            "{r:?}"
+        );
+    }
+
+    #[test]
+    fn decode_insert_bad_header_errors() {
+        let rel = descriptor(16403, vec![rel_attr(1, "id", INT4OID, 4, 'i')]);
+        let insert = |block| record_with(RmId::Heap, XLOG_HEAP_INSERT, vec![0; 3], block);
+        // t_hoff below fixed header size
+        let mut bad_hoff = build_tuple_payload(1, false, 24, &1i32.to_le_bytes());
+        bad_hoff[4] = 20;
+        let r = decode_heap_record(&insert(bad_hoff), 0, &rel);
+        assert!(
+            matches!(
+                r,
+                Err(DecodeError::BadHoff {
+                    offset: 0,
+                    t_hoff: 20
+                })
+            ),
+            "{r:?}"
+        );
+        // Omit null bitmap for 16 attributes
+        let mut no_bitmap = Vec::new();
+        no_bitmap.extend_from_slice(&16u16.to_le_bytes());
+        no_bitmap.extend_from_slice(&HEAP_HASNULL.to_le_bytes());
+        no_bitmap.push(32);
+        let r = decode_heap_record(&insert(no_bitmap), 0, &rel);
+        assert!(truncated(&r), "{r:?}");
+        // Truncate xl_heap_header
+        let r = decode_heap_record(&insert(vec![1, 0, 0]), 0, &rel);
+        assert!(truncated(&r), "{r:?}");
+    }
+
+    #[test]
+    fn decode_update_suffix_marks_tail_absent() {
+        let rel = descriptor(
+            16404,
+            vec![
+                rel_attr(1, "a", INT4OID, 4, 'i'),
+                rel_attr(2, "b", INT4OID, 4, 'i'),
+                rel_attr(3, "c", TEXTOID, -1, 'i'),
+                rel_attr(4, "d", INT4OID, 4, 'i'),
+            ],
+        );
+        let mut main_data = vec![0u8; SIZE_OF_HEAP_UPDATE];
+        main_data[7] = XLH_UPDATE_SUFFIX_FROM_OLD;
+        // Wire layout: suffixlen:u16, xl_heap_header, padding, column a
+        let mut block = 12u16.to_le_bytes().to_vec();
+        block.extend_from_slice(&build_tuple_payload(4, false, 24, &5i32.to_le_bytes()));
+        let rec = record_with(RmId::Heap, XLOG_HEAP_UPDATE, main_data.clone(), block);
+        let new = decode_heap_record(&rec, 0, &rel)
+            .unwrap()
+            .remove(0)
+            .new
+            .unwrap();
+        assert!(new.partial);
+        assert_eq!(
+            new.columns,
+            vec![Some(ColumnValue::Int4(5)), None, None, None]
+        );
+        // Truncate suffixlen
+        let rec = record_with(RmId::Heap, XLOG_HEAP_UPDATE, main_data, vec![12]);
+        let r = decode_heap_record(&rec, 0, &rel);
+        assert!(truncated(&r), "{r:?}");
+    }
+
+    #[test]
+    fn decode_update_varlena_in_prefix_marks_rest_absent() {
+        let rel = descriptor(
+            16405,
+            vec![
+                rel_attr(1, "a", TEXTOID, -1, 'i'),
+                rel_attr(2, "b", INT4OID, 4, 'i'),
+            ],
+        );
+        let mut main_data = vec![0u8; SIZE_OF_HEAP_UPDATE];
+        main_data[7] = XLH_UPDATE_PREFIX_FROM_OLD;
+        let mut block = 3u16.to_le_bytes().to_vec();
+        block.extend_from_slice(&build_tuple_payload(2, false, 24, &[b'c', 0, 0, 0, 0]));
+        let rec = record_with(RmId::Heap, XLOG_HEAP_HOT_UPDATE, main_data, block);
+        let out = decode_heap_record(&rec, 0, &rel).unwrap().remove(0);
+        assert_eq!(out.op, HeapOp::HotUpdate);
+        let new = out.new.unwrap();
+        assert!(new.partial);
+        assert_eq!(new.columns, vec![None, None]);
+    }
+
+    #[test]
+    fn decode_insert_truncated_fixed_column_marks_rest_absent() {
+        let rel = descriptor(
+            16406,
+            vec![
+                rel_attr(1, "a", INT4OID, 4, 'i'),
+                rel_attr(2, "b", INT8OID, 8, 'd'),
+                rel_attr(3, "c", INT4OID, 4, 'i'),
+            ],
+        );
+        let mut col_data = 9i32.to_le_bytes().to_vec();
+        col_data.extend_from_slice(&[0; 4 + 3]); // padding + 3 of column b's 8 bytes
+        let payload = build_tuple_payload(3, false, 24, &col_data);
+        let rec = record_with(RmId::Heap, XLOG_HEAP_INSERT, vec![0; 3], payload);
+        let new = decode_heap_record(&rec, 0, &rel)
+            .unwrap()
+            .remove(0)
+            .new
+            .unwrap();
+        assert!(new.partial);
+        assert_eq!(new.columns, vec![Some(ColumnValue::Int4(9)), None, None]);
+    }
+
+    #[test]
+    fn varlena_alignment_skips_zero_pad_per_typalign() {
+        let mut long_body = ((64u32) << 2).to_le_bytes().to_vec();
+        long_body.extend_from_slice(&[b'x'; 60]);
+        let cases: [(char, Vec<u8>, ColumnValue); 3] = [
+            ('s', short_varlena(b"hi"), ColumnValue::Text("hi".into())),
+            ('d', short_varlena(b"hi"), ColumnValue::Text("hi".into())),
+            // Character alignment needs no padding; leading zero belongs to header
+            ('c', long_body, ColumnValue::Text("x".repeat(60))),
+        ];
+        for (align, value, expect) in cases {
+            let rel = descriptor(
+                16407,
+                vec![
+                    rel_attr(1, "f", BOOLOID, 1, 'c'),
+                    rel_attr(2, "v", TEXTOID, -1, align),
+                ],
+            );
+            let pad = match align {
+                's' => 1,
+                'd' => 7,
+                _ => 0,
+            };
+            let mut col_data = vec![1u8];
+            col_data.extend(std::iter::repeat_n(0u8, pad));
+            col_data.extend_from_slice(&value);
+            let payload = build_tuple_payload(2, false, 24, &col_data);
+            let rec = record_with(RmId::Heap, XLOG_HEAP_INSERT, vec![0; 3], payload);
+            let new = decode_heap_record(&rec, 0, &rel)
+                .unwrap()
+                .remove(0)
+                .new
+                .unwrap();
+            assert!(!new.partial, "align {align}");
+            assert_eq!(
+                new.columns,
+                vec![Some(ColumnValue::Bool(true)), Some(expect)],
+                "align {align}"
+            );
+        }
+    }
+
+    #[test]
+    fn decode_one_value_malformed_varlena_headers() {
+        let text = rel_attr(1, "t", TEXTOID, -1, 'i');
+        let compressed_short = ((6u32 << 2) | 0b10).to_le_bytes();
+        let truncated_cases: [(&str, Vec<u8>); 7] = [
+            ("empty", Vec::new()),
+            ("external without tag", vec![0x01]),
+            ("ondisk pointer cut short", vec![0x01, 18, 0, 0, 0, 0]),
+            ("4B header cut short", vec![0x00, 0x01]),
+            ("4B total below header", vec![0; 4]),
+            (
+                "4B body cut short",
+                [(10u32 << 2).to_le_bytes().as_slice(), &[1, 2]].concat(),
+            ),
+            (
+                "compressed without tcinfo",
+                [compressed_short.as_slice(), &[0, 0]].concat(),
+            ),
+        ];
+        for (what, buf) in truncated_cases {
+            let r = decode_one_value(&text, &buf, 0);
+            assert!(matches!(r, Err(Truncated { .. })), "{what}: {r:?}");
+        }
+        // VARTAG_INDIRECT appears only in memory
+        let indirect = vec![0x01, 1, 0xAA, 0xBB];
+        assert_eq!(
+            decode_one_value(&text, &indirect, 0).unwrap(),
+            (
+                ColumnValue::Unsupported {
+                    type_oid: TEXTOID,
+                    raw: indirect.clone(),
+                },
+                4
+            )
+        );
+    }
+
+    #[test]
+    fn decode_one_value_cstring_dropped_and_bad_bodies() {
+        let cstring = rel_attr(1, "c", 2275, -2, 'c');
+        assert_eq!(
+            decode_one_value(&cstring, b"ab\0", 0).unwrap(),
+            (ColumnValue::Text("ab".into()), 3)
+        );
+        let dropped = |type_len, align| {
+            let mut att = rel_attr(1, "gone", TEXTOID, type_len, align);
+            att.dropped = true;
+            att
+        };
+        let null3 = (ColumnValue::Null, 3);
+        assert_eq!(
+            decode_one_value(&dropped(-1, 'i'), &short_varlena(b"zz"), 0).unwrap(),
+            null3
+        );
+        assert_eq!(
+            decode_one_value(&dropped(-2, 'c'), b"zz\0", 0).unwrap(),
+            null3
+        );
+        let r = decode_one_value(&dropped(4, 'i'), &[0, 0], 0);
+        assert!(
+            matches!(
+                r,
+                Err(Truncated {
+                    need: 4,
+                    have: 2,
+                    ..
+                })
+            ),
+            "{r:?}"
+        );
+        let r = decode_one_value(&rel_attr(1, "i", INT4OID, 4, 'i'), &[0, 0], 0);
+        assert!(
+            matches!(
+                r,
+                Err(Truncated {
+                    need: 4,
+                    have: 2,
+                    ..
+                })
+            ),
+            "{r:?}"
+        );
+
+        let unsupported = |att: &RelAttr, buf: &[u8]| {
+            let (v, _) = decode_one_value(att, buf, 0).unwrap();
+            assert!(
+                matches!(v, ColumnValue::Unsupported { type_oid, .. } if type_oid == att.type_oid),
+                "{}: {v:?}",
+                att.type_oid
+            );
+        };
+        unsupported(&rel_attr(1, "n", NAMEOID, 64, 'c'), &[0xFF; 64]);
+        // PostgreSQL intervals require 16 bytes
+        unsupported(&rel_attr(1, "iv", INTERVALOID, 8, 'd'), &[0; 8]);
+        unsupported(
+            &rel_attr(1, "num", NUMERICOID, -1, 'i'),
+            &short_varlena(&[1]),
+        );
+        unsupported(&rel_attr(1, "ip", INETOID, -1, 'i'), &short_varlena(&[9]));
+        unsupported(
+            &rel_attr(1, "j", JSONBOID, -1, 'i'),
+            &short_varlena(&[0xFF; 4]),
+        );
+    }
+
+    #[test]
+    fn local_matrix_covers_cstring() {
+        assert!(local_matrix_covers(2275, -2));
+    }
+
+    #[test]
+    fn take_toast_chunk_columns_rejects_misshapen_rows() {
+        let good = || {
+            vec![
+                Some(ColumnValue::Oid(7)),
+                Some(ColumnValue::Int4(2)),
+                Some(ColumnValue::Bytea(vec![1])),
+            ]
+        };
+        assert_eq!(take_toast_chunk_columns(&mut good()), Some((7, 2, vec![1])));
+        assert_eq!(take_toast_chunk_columns(&mut good()[..2].to_vec()), None);
+        for slot in 0..3 {
+            let mut cols = good();
+            cols[slot] = Some(ColumnValue::Text("x".into()));
+            assert_eq!(take_toast_chunk_columns(&mut cols), None, "slot {slot}");
+        }
+    }
+
+    #[test]
+    fn fast_default_raw_honours_dataoffset_and_rejects_multidim() {
+        let mut att = rel_attr(1, "x", INT4OID, 4, 'i');
+        let mut arr = raw_missing_array(INT4OID, &77i32.to_le_bytes());
+        arr[8..12].copy_from_slice(&24i32.to_le_bytes());
+        att.missing_default = Some(MissingDefault::Raw(arr.clone()));
+        assert_eq!(missing_value_for(&att), ColumnValue::Int4(77));
+        arr[4..8].copy_from_slice(&2i32.to_le_bytes());
+        att.missing_default = Some(MissingDefault::Raw(arr));
+        assert_eq!(missing_value_for(&att), ColumnValue::Null);
+    }
+
+    #[test]
+    fn missing_value_text_scalar_matrix() {
+        let cases = [
+            (CHAROID, "a", ColumnValue::Char(b'a' as i8)),
+            (CHAROID, "", ColumnValue::Null),
+            (INT2OID, "-7", ColumnValue::Int2(-7)),
+            (INT2OID, "70000", ColumnValue::Null),
+            (FLOAT4OID, "1.5", ColumnValue::Float4(1.5)),
+            (FLOAT4OID, "x", ColumnValue::Null),
+            (FLOAT8OID, "-2.25", ColumnValue::Float8(-2.25)),
+            (FLOAT8OID, "x", ColumnValue::Null),
+            (OIDOID, "4294967295", ColumnValue::Oid(u32::MAX)),
+            (OIDOID, "-1", ColumnValue::Null),
+            (
+                MACADDR8OID,
+                "08:00:2b:ff:fe:01:02:03",
+                ColumnValue::MacAddr8([0x08, 0x00, 0x2b, 0xff, 0xfe, 0x01, 0x02, 0x03]),
+            ),
+            (MACADDR8OID, "08:00:2b:01:02:03", ColumnValue::Null),
+            (
+                TIDOID,
+                "(3,4)",
+                ColumnValue::Tid {
+                    block: 3,
+                    offset: 4,
+                },
+            ),
+            (TIDOID, "3,4", ColumnValue::Null),
+        ];
+        for (type_oid, text, expect) in cases {
+            assert_eq!(
+                missing_value_from_text(type_oid, text),
+                expect,
+                "{type_oid} {text:?}"
+            );
         }
     }
 }

@@ -49,12 +49,10 @@ pub fn place_rows(
     while let Some(heap) = heaps.next() {
         let PlanTable {
             descriptor: rel,
-            route: Some(route),
+            route,
             ..
-        } = &tables[heap.table as usize]
-        else {
-            unreachable!("unmapped heaps must be discarded during planning");
-        };
+        } = &tables[heap.table as usize];
+        let route = route.as_ref().expect("planning discards unmapped heaps");
         // No delete-marker column: a DELETE would land as a phantom insert of
         // the old image, so drop it (append-only destination)
         if route.drops_deletes() && matches!(heap.decoded.op, HeapOp::Delete) {

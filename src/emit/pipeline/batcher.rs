@@ -716,12 +716,10 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let BatcherMsg::Rows(chunk) = rx.try_recv().expect("flush pinned row") else {
-            panic!("expected rows");
-        };
-        assert_eq!(chunk.rows.len(), 2);
+        let msg = rx.try_recv().expect("flush pinned row");
+        assert!(matches!(&msg, BatcherMsg::Rows(c) if c.rows.len() == 2));
         assert_eq!(budget.resident_bytes(), 256);
-        drop(chunk);
+        drop(msg);
         assert_eq!(budget.resident_bytes(), 0);
         row_buffer.flush(&tx).await.unwrap();
         assert!(rx.try_recv().is_err());
@@ -1220,6 +1218,34 @@ mod tests {
         assert!(!fatal.is_set());
     }
 
+    /// Shared byte trip seals every open table, skipping ones a row trip
+    /// already emptied
+    #[tokio::test]
+    async fn shared_byte_trip_skips_emptied_tables() {
+        let (tx, rx, fatal, handle) = spawn_deadline_batcher(
+            BatcherConfig {
+                row_budget: 2,
+                byte_budget: 1024,
+                inserters: 1,
+                flush_timeout: Duration::from_secs(60),
+            },
+            None,
+        );
+        tx.send(row_for("t0", 0, 1)).await.unwrap();
+        tx.send(row_for("t0", 1, 2)).await.unwrap();
+        for i in 1..60 {
+            tx.send(row_for(&format!("t{i}"), i + 1, 1)).await.unwrap();
+        }
+        drop(tx);
+        let mut rows = 0;
+        while let Ok(batch) = rx.recv().await {
+            rows += batch.n_rows;
+        }
+        assert_eq!(rows, 61);
+        handle.await.unwrap();
+        assert!(!fatal.is_set());
+    }
+
     #[tokio::test]
     async fn oversized_string_batches_make_progress_without_losing_rows() {
         let (tx, rx, fatal, handle) = spawn_deadline_batcher(
@@ -1377,5 +1403,76 @@ mod tests {
             DEFAULT_PIPELINE_FLUSH
         );
         assert_eq!(effective_cfg(&boot, None).flush_timeout, boot.flush_timeout);
+    }
+
+    /// Feed `msgs`, hold input open until the batcher exits when `hold`,
+    /// else close it; return the fatal the batcher recorded
+    async fn batcher_fatal(msgs: Vec<BatcherMsg>, output_open: bool, hold: bool) -> String {
+        let cfg = partial_block_cfg(Duration::from_secs(1));
+        let (msg_tx, batches_rx, fatal, handle) = spawn_deadline_batcher(cfg, None);
+        let _output = output_open.then_some(batches_rx);
+        for msg in msgs {
+            msg_tx.send(msg).await.unwrap();
+        }
+        let _input = hold.then_some(msg_tx);
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("batcher exits on fault")
+            .unwrap();
+        fatal.message().expect("batcher trips fatal")
+    }
+
+    fn with_op(op: HeapOp) -> RoutedRow {
+        let mut row = tuple(0, 1);
+        row.committed.decoded.op = op;
+        row
+    }
+
+    fn date_table(target_type: &str) -> (Arc<RelDescriptor>, Arc<RouteSnapshot>) {
+        let mut rel = rel_named("t");
+        Arc::make_mut(&mut rel).attributes[0].type_oid = crate::schema::DATEOID;
+        let mut mapping = (*route_named("t").mapping).clone();
+        mapping.columns[0].target_type = target_type.into();
+        let route = RouteSnapshot::freeze(Arc::new(mapping), Arc::default(), Default::default());
+        (rel, route)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn row_faults_trip_fatal_and_stop_the_batcher() {
+        let chunk = |row| RowChunk {
+            tables: vec![RowTable {
+                rel: rel_named("t"),
+                route: route_named("t"),
+            }],
+            rows: vec![row],
+            permit: None,
+        };
+        let truncate = chunk(with_op(HeapOp::Truncate));
+        let msg = batcher_fatal(vec![BatcherMsg::Rows(truncate)], true, false).await;
+        assert_eq!(msg, "batcher: TRUNCATE routed to batcher");
+        let chunks = vec![chunk(tuple(0, 1)), chunk(with_op(HeapOp::Truncate))];
+        let msg = batcher_fatal(vec![BatcherMsg::Chunks(chunks)], true, false).await;
+        assert_eq!(msg, "batcher: TRUNCATE routed to batcher");
+
+        let (rel, route) = date_table("Date32");
+        let mut overflow = tuple(0, 1);
+        overflow.committed.decoded.new.as_mut().unwrap().columns[0] =
+            Some(ColumnValue::Date(i32::MAX - 1));
+        let msg = batcher_fatal(vec![one(rel, route, overflow)], true, false).await;
+        assert!(msg.contains("Date32 epoch"), "{msg}");
+        let (rel, route) = date_table("Int32");
+        let msg = batcher_fatal(vec![one(rel, route, tuple(0, 1))], true, false).await;
+        assert!(msg.contains("local temporal encoding"), "{msg}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn closed_inserter_queue_trips_every_flush_path() {
+        let (reply, _reply_rx) = oneshot::channel();
+        let msg = batcher_fatal(vec![row(0, 1), BatcherMsg::FlushAll(reply)], false, true).await;
+        assert_eq!(msg, "batcher barrier flush: inserter queue closed");
+        let msg = batcher_fatal(vec![row(0, 1)], false, false).await;
+        assert_eq!(msg, "batcher final flush: inserter queue closed");
+        let msg = batcher_fatal(vec![row(0, 1)], false, true).await;
+        assert_eq!(msg, "batcher deadline flush: inserter queue closed");
     }
 }

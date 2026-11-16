@@ -348,6 +348,20 @@ mod tests {
     use super::*;
     use tokio_postgres::types::Oid;
 
+    #[test]
+    fn replident_rejects_missing_index_and_unknown_code() {
+        assert!(
+            ReplIdent::from_parts('i', None, None)
+                .unwrap_err()
+                .contains("indisreplident")
+        );
+        assert!(
+            ReplIdent::from_parts('x', None, None)
+                .unwrap_err()
+                .contains("'x'")
+        );
+    }
+
     fn mk_attr(attnum: i16, name: &str, oid: Oid, not_null: bool) -> RelAttr {
         RelAttr {
             attnum,

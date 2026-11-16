@@ -622,30 +622,23 @@ pub async fn read_pg_multixact(data_dir: &Path, source_major: u32) -> Result<PgM
 /// A directory the cluster never made reads as empty
 async fn read_slru_dir(data_dir: &Path, rel_dir: &Path) -> Result<Vec<(PathBuf, Vec<u8>)>> {
     let dir = data_dir.join(rel_dir);
-    let mut entries = match tokio::fs::read_dir(&dir).await {
+    read_files(&dir, rel_dir)
+        .await
+        .with_context(|| format!("slru: read {}", dir.display()))
+}
+
+async fn read_files(dir: &Path, rel_dir: &Path) -> std::io::Result<Vec<(PathBuf, Vec<u8>)>> {
+    let mut entries = match tokio::fs::read_dir(dir).await {
         Ok(e) => e,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(e).with_context(|| format!("slru: read {}", dir.display())),
+        Err(e) => return Err(e),
     };
     let mut out = Vec::new();
-    while let Some(entry) = entries
-        .next_entry()
-        .await
-        .with_context(|| format!("slru: scan {}", dir.display()))?
-    {
-        let path = entry.path();
-        if !entry
-            .file_type()
-            .await
-            .with_context(|| format!("slru: stat {}", path.display()))?
-            .is_file()
-        {
-            continue;
+    while let Some(entry) = entries.next_entry().await? {
+        if entry.file_type().await?.is_file() {
+            let bytes = tokio::fs::read(entry.path()).await?;
+            out.push((rel_dir.join(entry.file_name()), bytes));
         }
-        let bytes = tokio::fs::read(&path)
-            .await
-            .with_context(|| format!("slru: read {}", path.display()))?;
-        out.push((rel_dir.join(entry.file_name()), bytes));
     }
     Ok(out)
 }
@@ -1057,5 +1050,104 @@ mod tests {
             XidStatus::Committed,
         );
         assert_eq!(view.xid_status(701), XidStatus::InProgress);
+    }
+
+    #[test]
+    fn multixact_updater_wrap_and_short_reads() {
+        let per_segment = PgMultiXactAccum::new(17).offsets_per_segment();
+        // Wrap successor past zero to FirstMultiXactId
+        let mut m = mx_accum(&[(1, 101)], &[(100, 900, 4)]);
+        let mut last = vec![0u8; 8192 * SLRU_PAGES_PER_SEGMENT as usize];
+        let byte = ((u32::MAX % per_segment) * 4) as usize;
+        last[byte..byte + 4].copy_from_slice(&100u32.to_le_bytes());
+        m.insert_offsets_segment(u32::MAX / per_segment, last.clone());
+        assert_eq!(m.updater(u32::MAX), MultiXactUpdater::Updater(900));
+        // Omit successor's segment and all earlier segments
+        let mut m = PgMultiXactAccum::new(17);
+        m.insert_offsets_segment(u32::MAX / per_segment, last);
+        assert_eq!(m.updater(u32::MAX), MultiXactUpdater::Unresolvable);
+
+        // Offsets segment shorter than its entry
+        let mut m = PgMultiXactAccum::new(17);
+        m.insert_offsets_segment(0, vec![0u8; 8]);
+        assert_eq!(m.updater(10), MultiXactUpdater::Covered);
+        // Place member beyond copied segments
+        let next_seg = MULTIXACT_MEMBERS_PER_PAGE * SLRU_PAGES_PER_SEGMENT;
+        let m = mx_accum(&[(10, next_seg), (11, next_seg + 1)], &[]);
+        assert_eq!(m.updater(10), MultiXactUpdater::Covered);
+        // Truncate members segment before required slot
+        let mut m = mx_accum(&[(10, 100), (11, 101)], &[]);
+        m.insert_members_segment(0, vec![0u8; 4]);
+        assert_eq!(m.updater(10), MultiXactUpdater::Covered);
+        assert_eq!(m.segment_count(), 2);
+    }
+
+    /// PG 19's 64-bit member offsets can require segment numbers beyond u32
+    #[test]
+    fn pg19_member_offset_beyond_segment_space_is_unresolvable() {
+        let mut m = PgMultiXactAccum::new(19);
+        let start = 1u64 << 50;
+        let mut off = vec![0u8; 8192];
+        off[80..88].copy_from_slice(&start.to_le_bytes());
+        off[88..96].copy_from_slice(&(start + 1).to_le_bytes());
+        m.insert_offsets_segment(0, off);
+        m.insert_members_segment(0, vec![0u8; 8192]);
+        assert_eq!(m.updater(10), MultiXactUpdater::Unresolvable);
+    }
+
+    #[test]
+    fn sealed_patch_reports_emptiness() {
+        assert!(PgXactPatch::new().seal().is_empty());
+        let mut p = PgXactPatch::new();
+        p.abort(5, &[6]);
+        let sealed = p.seal();
+        assert!(!sealed.is_empty());
+        assert_eq!(sealed.len(), 2);
+    }
+
+    #[test]
+    fn pg_multixact_segno_rejects_odd_paths() {
+        assert_eq!(
+            pg_multixact_segno_from_path(Path::new("pg_multixact/offsets/0000/x")),
+            None
+        );
+        assert_eq!(
+            pg_multixact_segno_from_path(Path::new("pg_multixact/other/0000")),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn slru_reads_skip_strays_and_fail_on_non_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let offsets = dir.join("pg_multixact").join("offsets");
+        tokio::fs::create_dir_all(dir.join("pg_xact").join("nested"))
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(&offsets).await.unwrap();
+        tokio::fs::write(dir.join("pg_xact").join("0000"), pg_xact_segment(9))
+            .await
+            .unwrap();
+        tokio::fs::write(dir.join("pg_xact").join("stray.tmp"), b"x")
+            .await
+            .unwrap();
+        tokio::fs::write(offsets.join("stray.tmp"), b"x")
+            .await
+            .unwrap();
+
+        let accum = read_pg_xact(dir).await.unwrap();
+        let multi = read_pg_multixact(dir, 17).await.unwrap();
+        assert_eq!(multi.segment_count(), 0);
+        let patch = PgXactPatch::new().seal();
+        let view = PgXactView::new(&accum, &patch);
+        assert_eq!(view.xid_status(9), XidStatus::Committed);
+
+        let flat = tempfile::tempdir().unwrap();
+        tokio::fs::write(flat.path().join("pg_xact"), b"x")
+            .await
+            .unwrap();
+        let err = read_pg_xact(flat.path()).await.unwrap_err();
+        assert!(format!("{err:#}").contains("slru: read"), "{err:#}");
     }
 }

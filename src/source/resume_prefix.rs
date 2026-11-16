@@ -420,4 +420,63 @@ mod tests {
         let error = prefix.apply(start_lsn - 32, &mut head).unwrap_err();
         assert!(error.to_string().contains("header differs"), "{error}");
     }
+
+    /// Continuation that cannot be followed into the next segment fails
+    /// loudly rather than preserving a partial record
+    #[tokio::test]
+    async fn resume_refuses_a_continuation_it_cannot_follow() {
+        let seg_size = PAGE_SIZE as u64;
+        let start = seg_size;
+        let next = start + seg_size;
+        let first = page(start, (PAGE_SIZE - LONG_HDR + 100) as u32, seg_size);
+        let mut unflagged = page(next, 100, seg_size);
+        unflagged[2..4].copy_from_slice(&XLP_LONG_HEADER.to_le_bytes());
+        let cases: [(Vec<u8>, &str); 5] = [
+            (vec![0; PAGE_SIZE], "incomplete retained WAL page"),
+            (page(next + seg_size, 100, seg_size), "address mismatch"),
+            (page(next, 99, seg_size), "continuation length mismatch"),
+            (unflagged, "continuation flag missing"),
+            (vec![0; 8], "has 8 bytes"),
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        let dirs = [dir.path().to_path_buf()];
+        std::fs::write(segment_path(dir.path(), 1, seg_size, start), &first).unwrap();
+        let second = segment_path(dir.path(), 1, seg_size, next);
+        for (bytes, error) in cases {
+            std::fs::write(&second, &bytes).unwrap();
+            let e = ResumePrefix::load(&dirs, 1, seg_size, start).await.err();
+            assert!(
+                e.is_some_and(|e| format!("{e:#}").contains(error)),
+                "{error}"
+            );
+        }
+        std::fs::remove_file(&second).unwrap();
+        std::fs::create_dir(&second).unwrap();
+        let e = ResumePrefix::load(&dirs, 1, seg_size, start).await.err();
+        assert!(e.is_some_and(|e| e.to_string().starts_with("read ")));
+    }
+
+    #[tokio::test]
+    async fn resume_follows_a_continuation_across_pages_of_one_segment() {
+        let seg_size = 2 * PAGE_SIZE as u64;
+        let start = seg_size;
+        let dir = tempfile::tempdir().unwrap();
+        let dirs = [dir.path().to_path_buf()];
+        let path = segment_path(dir.path(), 1, seg_size, start);
+        std::fs::write(&path, vec![0; seg_size as usize]).unwrap();
+        assert!(
+            ResumePrefix::load(&dirs, 1, seg_size, start)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let mut segment = page(start, (PAGE_SIZE - LONG_HDR + 100) as u32, seg_size);
+        segment.extend_from_slice(&page(start + PAGE_SIZE as u64, 100, seg_size));
+        std::fs::write(&path, &segment).unwrap();
+        let prefix = ResumePrefix::load(&dirs, 1, seg_size, start).await.unwrap();
+        assert_eq!(
+            prefix.map(|p| p.end_lsn()),
+            Some(start + PAGE_SIZE as u64 + 140)
+        );
+    }
 }

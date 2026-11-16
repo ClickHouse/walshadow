@@ -210,6 +210,14 @@ mod tests {
         assert!(relation_for_empty(&r).is_none());
     }
 
+    #[test]
+    fn running_xacts_next_xid_needs_full_header() {
+        let mut md = vec![0; MIN_SIZE_OF_XACT_RUNNING_XACTS];
+        md[RUNNING_XACTS_NEXT_XID_OFFSET..][..4].copy_from_slice(&742u32.to_le_bytes());
+        assert_eq!(parse_running_xacts_next_xid(&md), Some(742));
+        assert_eq!(parse_running_xacts_next_xid(&md[..23]), None);
+    }
+
     fn btree_reuse_record(spc: u32, db: u32, rel: u32) -> XLogRecord<'static> {
         let mut md = Vec::with_capacity(BTREE_REUSE_PAGE_MIN_SIZE);
         md.extend_from_slice(&spc.to_le_bytes());

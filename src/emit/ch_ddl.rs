@@ -542,23 +542,14 @@ impl DdlApplicator {
     /// `auto_create` or an existing mapping. Unlike `apply_added`, does
     /// not gate on the namespace opt-in set and does not write the routing map
     /// — the [`crate::config::ConfigResolver`] owns the opt-in mapping so it
-    /// survives the republish full-swap. Returns `false` when the descriptor
-    /// has no bridgeable shape (nothing created; caller should not map it).
-    /// Idempotent: `IF NOT EXISTS` no-ops a re-create.
-    pub async fn ensure_ch_table(&mut self, desc: &RelDescriptor) -> Result<bool, EmitterError> {
+    /// survives the republish full-swap. Idempotent: `IF NOT EXISTS` no-ops
+    /// a re-create.
+    pub async fn ensure_ch_table(&mut self, desc: &RelDescriptor) -> Result<(), EmitterError> {
         self.refresh_config();
         let settings = self.config.rule_for(desc);
         let target = self.config.create_target(&settings, &desc.rel_name);
         let shape = self.config.create_shape(&settings);
-        let Some(cols) = descriptor_columns(desc, &self.config.column_rules) else {
-            tracing::warn!(
-                target: "walshadow::ch_ddl",
-                qname = %desc.rel_name,
-                "opt-in skipped: no bridgeable CH shape",
-            );
-            self.stats.skipped += 1;
-            return Ok(false);
-        };
+        let cols = descriptor_columns(desc, &self.config.column_rules);
         self.ensure_database(&target).await?;
         self.execute(&target, &render_create_table(desc, &cols, &target, &shape))
             .await?;
@@ -568,8 +559,7 @@ impl DdlApplicator {
             columns: cols.iter().map(DestColumn::mapping).collect(),
             tees: settings.tee.clone().unwrap_or_default(),
         };
-        self.create_tees(desc, &mapping, &cols, &shape).await?;
-        Ok(true)
+        self.create_tees(desc, &mapping, &cols, &shape).await
     }
 
     async fn apply_changed(
@@ -657,11 +647,7 @@ impl DdlApplicator {
         for att in &diff.added_columns {
             let pk_member = replident_key_attnums(new).contains(&att.attnum);
             let att = resolve_disk_default(oracle.as_deref(), new.rfn.db_node, att).await;
-            let Ok(resolved) = type_bridge::map(&att, pk_member) else {
-                // Unbridged type; operator TOML override is the recovery path
-                self.stats.skipped += 1;
-                continue;
-            };
+            let resolved = type_bridge::map(&att, pk_member);
             let (name, resolved) = apply_column_rule(
                 &att.name,
                 resolved,
@@ -1150,13 +1136,13 @@ fn predict_route_effect(
 
 /// `CREATE TABLE` plus row-routing mapping `Added` derives for an unmapped,
 /// unexcluded rel, so rows and DDL land in same place. `None` when out of
-/// scope or without a bridgeable shape
+/// scope
 fn derive_added(cfg: &DdlConfig, desc: &RelDescriptor) -> Option<(Vec<DestColumn>, TableMapping)> {
     if !cfg.auto_creates(desc) {
         return None;
     }
     let settings = cfg.rule_for(desc);
-    let cols = descriptor_columns(desc, &cfg.column_rules)?;
+    let cols = descriptor_columns(desc, &cfg.column_rules);
     let mapping = TableMapping {
         target: cfg.create_target(&settings, &desc.rel_name),
         columns: cols.iter().map(DestColumn::mapping).collect(),
@@ -1436,15 +1422,13 @@ impl DestColumn {
     }
 }
 
-/// Bridged descriptor columns, `None` when a type can't be bridged
-fn descriptor_columns(desc: &RelDescriptor, rules: &ColumnRules) -> Option<Vec<DestColumn>> {
+/// Bridged descriptor columns
+fn descriptor_columns(desc: &RelDescriptor, rules: &ColumnRules) -> Vec<DestColumn> {
     let pk_attnums = replident_key_attnums(desc);
     let mut cols = Vec::with_capacity(desc.attributes.len());
     for att in desc.attributes.iter().filter(|a| !a.dropped) {
         let pk_member = pk_attnums.contains(&att.attnum);
-        // Skip the half-renderable CREATE; operator installs a
-        // TOML override and re-triggers via Added on next refetch
-        let resolved = type_bridge::map(att, pk_member).ok()?;
+        let resolved = type_bridge::map(att, pk_member);
         let (name, resolved) = apply_column_rule(
             &att.name,
             resolved,
@@ -1456,7 +1440,7 @@ fn descriptor_columns(desc: &RelDescriptor, rules: &ColumnRules) -> Option<Vec<D
             resolved,
         });
     }
-    Some(cols)
+    cols
 }
 
 /// Mapped columns, the emitter's INSERT contract. Mapping keeps no defaults
@@ -1828,8 +1812,8 @@ mod tests {
         target: &TableTarget,
         shape: &CreateShape<'_>,
         rules: &ColumnRules,
-    ) -> Option<String> {
-        descriptor_columns(desc, rules).map(|cols| render_create_table(desc, &cols, target, shape))
+    ) -> String {
+        render_create_table(desc, &descriptor_columns(desc, rules), target, shape)
     }
 
     fn render_from_mapping(
@@ -2283,8 +2267,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let sql = render_from_desc(&d, &dest("db", &d), &shape(false), &b.finish().0)
-            .expect("renderable");
+        let sql = render_from_desc(&d, &dest("db", &d), &shape(false), &b.finish().0);
         assert!(sql.contains("`order_id` Int32"), "{sql}");
         assert!(sql.contains("`net_amount` Decimal(38, 9)"), "{sql}");
         assert!(sql.ends_with("ORDER BY (`order_id`)"), "{sql}");
@@ -2304,8 +2287,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let sql = render_from_desc(&d, &dest("db", &d), &shape(false), &b.finish().0)
-            .expect("renderable");
+        let sql = render_from_desc(&d, &dest("db", &d), &shape(false), &b.finish().0);
         assert!(sql.ends_with("ORDER BY (`_lsn`)"), "{sql}");
     }
 
@@ -2326,7 +2308,7 @@ mod tests {
             TSVECTOROID,
             &short_varlena(&[0x01, 0x20, 0x00]),
         )));
-        let resolved = type_bridge::map(&labels, false).unwrap();
+        let resolved = type_bridge::map(&labels, false);
         assert_eq!(
             add_column_clause("labels", &resolved),
             "ADD COLUMN IF NOT EXISTS `labels` String"
@@ -2341,8 +2323,7 @@ mod tests {
             &dest("default", &d),
             &shape(false),
             &ColumnRules::default(),
-        )
-        .unwrap();
+        );
         assert!(sql.contains("`labels` String,"), "{sql}");
         assert!(!sql.contains("DEFAULT"), "{sql}");
     }
@@ -2355,7 +2336,7 @@ mod tests {
         labels.type_byval = false;
         labels.type_len = -1;
         labels.type_storage = 'x';
-        let resolved = type_bridge::map(&labels, false).unwrap();
+        let resolved = type_bridge::map(&labels, false);
         assert_eq!(
             add_column_clause("labels", &resolved),
             r#"ADD COLUMN IF NOT EXISTS `labels` String DEFAULT '{"a": 1}'"#
@@ -2377,8 +2358,7 @@ mod tests {
             &dest("default", &d),
             &shape(false),
             &ColumnRules::default(),
-        )
-        .unwrap();
+        );
         assert!(sql.contains("CREATE TABLE IF NOT EXISTS `default`.`orders`"));
         assert!(sql.contains("`id` Int32"));
         assert!(sql.contains("`body` Nullable(String)"));
@@ -2409,8 +2389,7 @@ mod tests {
             &dest("default", &d),
             &shape(false),
             &ColumnRules::default(),
-        )
-        .unwrap();
+        );
         assert!(sql.ends_with("ORDER BY (`id`)"), "{sql}");
         assert!(!sql.contains("ORDER BY _lsn"), "{sql}");
     }
@@ -2431,8 +2410,7 @@ mod tests {
             &dest("default", &d),
             &shape(false),
             &ColumnRules::default(),
-        )
-        .unwrap();
+        );
         assert!(sql.contains("`v` Nullable(String)"), "{sql}");
         assert!(
             sql.ends_with(
@@ -2490,8 +2468,7 @@ mod tests {
             &dest("default", &d),
             &shape(false),
             &ColumnRules::default(),
-        )
-        .unwrap();
+        );
         assert!(sql.contains("`a` Int32"), "{sql}");
         assert!(sql.contains("`b` Int32"), "{sql}");
         assert!(!sql.contains("`a` Nullable"), "{sql}");
@@ -2515,8 +2492,7 @@ mod tests {
             &dest("default", &d),
             &shape(true),
             &ColumnRules::default(),
-        )
-        .unwrap();
+        );
         // Column always present; soft_delete only drops it from the engine
         assert!(sql.contains("`_is_deleted` Bool"));
         assert!(sql.contains("ENGINE = ReplacingMergeTree(`_lsn`)"));
@@ -2539,7 +2515,7 @@ mod tests {
                 engine: Some(engine),
                 ..shape(false)
             };
-            render_from_desc(&d, &dest("default", &d), &shape, &ColumnRules::default()).unwrap()
+            render_from_desc(&d, &dest("default", &d), &shape, &ColumnRules::default())
         };
         let sql = render("CoalescingMergeTree");
         assert!(
@@ -2568,8 +2544,7 @@ mod tests {
             &dest("default", &d),
             &shape(false),
             &ColumnRules::default(),
-        )
-        .unwrap();
+        );
         assert!(sql.ends_with("ORDER BY (`_lsn`)"));
     }
 
@@ -2594,8 +2569,7 @@ mod tests {
             &dest("default", &d),
             &shape(false),
             &ColumnRules::default(),
-        )
-        .unwrap();
+        );
         assert!(!sql.contains("`key` Nullable"), "{sql}");
         assert!(!sql.contains("`tenant` Nullable"), "{sql}");
         assert!(sql.contains("`body` Nullable(String)"), "{sql}");
@@ -2615,8 +2589,7 @@ mod tests {
             &dest("default", &d),
             &shape(false),
             &ColumnRules::default(),
-        )
-        .unwrap();
+        );
         assert!(sql.ends_with("ORDER BY (`_lsn`)"), "{sql}");
     }
 
@@ -2625,8 +2598,7 @@ mod tests {
         let mut a = att(1, "ship_at", TIMESTAMPTZOID, false, None);
         a.typmod = 3;
         let d = desc("t", vec![a], None);
-        let sql =
-            render_from_desc(&d, &dest("db", &d), &shape(false), &ColumnRules::default()).unwrap();
+        let sql = render_from_desc(&d, &dest("db", &d), &shape(false), &ColumnRules::default());
         assert!(
             sql.contains("`ship_at` Nullable(DateTime64(3, 'UTC'))"),
             "{sql}"
@@ -2712,8 +2684,7 @@ mod tests {
                 partition_by: None,
             },
             &ColumnRules::default(),
-        )
-        .unwrap();
+        );
         assert!(sql.contains("`_peerdb_version` UInt64"), "{sql}");
         assert!(
             sql.contains("`_peerdb_synced_at` DateTime64(6, 'UTC')"),
@@ -2748,8 +2719,7 @@ mod tests {
                 partition_by: None,
             },
             &ColumnRules::default(),
-        )
-        .unwrap();
+        );
         assert!(!sql.contains("_is_deleted"), "{sql}");
         assert!(sql.contains("ENGINE = ReplacingMergeTree(`_lsn`)"), "{sql}");
         assert!(sql.ends_with("ORDER BY (`_lsn`)"), "{sql}");
@@ -2778,8 +2748,7 @@ mod tests {
                 partition_by: None,
             },
             &ColumnRules::default(),
-        )
-        .unwrap();
+        );
         assert!(sql.ends_with("ORDER BY (`tenant`, `id`)"), "{sql}");
     }
 
@@ -2806,8 +2775,7 @@ mod tests {
                     partition_by: None,
                 },
                 &ColumnRules::default(),
-            )
-            .unwrap();
+            );
             assert!(sql.ends_with("ORDER BY (`id`)"), "{keys:?}: {sql}");
         }
     }
@@ -2837,7 +2805,6 @@ mod tests {
                 },
                 &ColumnRules::default(),
             )
-            .unwrap()
         };
         let sql = mk(&["tenant".to_string()]);
         assert!(
@@ -2904,15 +2871,6 @@ mod tests {
             DropTableStrategy::Warn
         );
         assert!("bogus".parse::<DropTableStrategy>().is_err());
-    }
-
-    #[test]
-    fn render_create_table_skips_when_type_unbridged() {
-        // type_bridge falls back to String for unknown OIDs today, so
-        // this never hits None; revisit if the bridge grows strictness
-        let d = desc("t", vec![att(1, "id", 99999, true, None)], None);
-        let sql = render_from_desc(&d, &dest("db", &d), &shape(false), &ColumnRules::default());
-        assert!(sql.is_some(), "fallback path keeps the CREATE renderable");
     }
 
     #[test]
@@ -3310,8 +3268,7 @@ mod tests {
             partition_by: Some("intDiv(id, 1000)"),
             ..shape(false)
         };
-        let sql =
-            render_from_desc(&m, &dest("db", &m), &partitioned, &ColumnRules::default()).unwrap();
+        let sql = render_from_desc(&m, &dest("db", &m), &partitioned, &ColumnRules::default());
         assert!(sql.contains("`_leaf_oid` UInt32"), "{sql}");
         assert!(
             sql.contains("\nPARTITION BY intDiv(id, 1000)\nORDER BY (`id`, `region`)"),
@@ -3324,7 +3281,7 @@ mod tests {
             }),
             ..partitioned
         };
-        let sql = render_from_desc(&m, &dest("db", &m), &off, &ColumnRules::default()).unwrap();
+        let sql = render_from_desc(&m, &dest("db", &m), &off, &ColumnRules::default());
         assert!(!sql.contains("_leaf_oid"), "{sql}");
         let plain = desc("t", vec![att(1, "id", INT4OID, true, None)], Some(vec![1]));
         let sql = render_from_desc(
@@ -3332,8 +3289,7 @@ mod tests {
             &dest("db", &plain),
             &shape(false),
             &ColumnRules::default(),
-        )
-        .unwrap();
+        );
         assert!(
             !sql.contains("_leaf_oid"),
             "only partitioned tables carry it: {sql}"
@@ -3348,7 +3304,7 @@ mod tests {
                 order_by,
                 ..shape(false)
             };
-            render_from_desc(&m, &dest("db", &m), &shape, &ColumnRules::default()).unwrap()
+            render_from_desc(&m, &dest("db", &m), &shape, &ColumnRules::default())
         };
         let sql = render(&["_leaf_oid".to_owned(), "id".to_owned(), "region".to_owned()]);
         assert!(
@@ -3449,5 +3405,199 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    fn base_cfg() -> DdlConfig {
+        DdlConfig {
+            instances: Default::default(),
+            drop_table_strategy: DropTableStrategy::Warn,
+            detach_strategy: DropTableStrategy::Retain,
+            auto_create_namespaces: HashSet::new(),
+            replicate_all: false,
+            auto_create_name_all: None,
+            runtime_config_schema: None,
+            target_database: "default".into(),
+            source_database: "app".into(),
+            namespaces: foldhash::HashMap::default(),
+            soft_delete: false,
+            system: Arc::default(),
+            rules: Arc::default(),
+            column_rules: Arc::default(),
+        }
+    }
+
+    /// Applicator whose connection refuses every dial, so a path that
+    /// reaches ClickHouse fails the test
+    fn offline(cfg: DdlConfig, map: foldhash::HashMap<RelName, TableMapping>) -> DdlApplicator {
+        let emitter = EmitterConfig {
+            conn: crate::emit::ch_emitter::InstanceConfig {
+                host: "127.0.0.1".into(),
+                port: 1,
+                ..Default::default()
+            },
+            retry: crate::emit::ch_emitter::RetryConfig {
+                max_attempts: 0,
+                ..Default::default()
+            },
+            ..EmitterConfig::default()
+        };
+        DdlApplicator {
+            client: ChConn::deferred(DestEmitter::new(Arc::new(emitter), None)),
+            config: cfg,
+            config_rx: watch::channel(Arc::new(ResolvedConfig::default())).1,
+            mapping: crate::mapping::mapping_handle(map),
+            resolver: None,
+            oracle: None,
+            ensured_databases: HashMap::default(),
+            truncated: None,
+            stats: DdlStats::default(),
+        }
+    }
+
+    const STAMP: Stamp = Stamp {
+        lsn: 0x500,
+        xid: 7,
+        commit_ts: 0,
+    };
+
+    #[tokio::test]
+    async fn warn_strategy_retains_destination_on_drop() {
+        let (rel, map) = orders_mapping();
+        let mut app = offline(base_cfg(), map);
+        let dropped = SchemaEvent::Dropped {
+            oid: 16400,
+            rel_name: rel.clone(),
+            partition: None,
+        };
+        app.apply_at(&dropped, None, STAMP).await.unwrap();
+        assert_eq!((app.stats.skipped, app.stats.drops_applied), (1, 0));
+        assert!(app.mapping_for(&rel).is_some(), "mapping kept");
+    }
+
+    /// Pre-declared renames and unmapped retypes leave ClickHouse alone and
+    /// fold into the mapping
+    #[tokio::test]
+    async fn noop_alters_fold_without_touching_clickhouse() {
+        let (rel, mut map) = orders_mapping();
+        map.get_mut(&rel).unwrap().columns.push(ColumnMapping {
+            src_attnum: 2,
+            target_name: "label".into(),
+            target_type: "Nullable(String)".into(),
+            type_pinned: false,
+        });
+        let mut app = offline(base_cfg(), map);
+        let attrs = |name: &str, unmapped_oid| {
+            vec![
+                att(1, "id", INT4OID, true, None),
+                att(2, name, TEXTOID, false, None),
+                att(3, "extra", unmapped_oid, false, None),
+            ]
+        };
+        let old = desc("orders", attrs("title", INT4OID), Some(vec![1]));
+        let new = desc("orders", attrs("label", TEXTOID), Some(vec![1]));
+        let diff = SchemaDiff {
+            added_columns: vec![],
+            dropped_columns: vec![],
+            renamed_columns: vec![(2, "title".into(), "label".into())],
+            type_changes: vec![(old.attributes[2].clone(), new.attributes[2].clone())],
+        };
+        let changed = SchemaEvent::Changed {
+            old: Arc::new(old),
+            new: Arc::new(new),
+            diff,
+        };
+        app.apply_at(&changed, None, STAMP).await.unwrap();
+        assert_eq!(app.stats.alters_applied, 0);
+        let names: Vec<String> = app
+            .mapping_for(&rel)
+            .unwrap()
+            .columns
+            .iter()
+            .map(|c| c.target_name.clone())
+            .collect();
+        assert_eq!(names, ["id", "label"]);
+    }
+
+    #[tokio::test]
+    async fn excluded_partition_changes_skip_and_unmapped_root_loads_nothing() {
+        let (_, leaf) = partition_pair();
+        let excluded = rules_with(
+            "m_eu",
+            TableRule {
+                replicate: Some(false),
+                ..TableRule::default()
+            },
+        );
+        let cfg = DdlConfig {
+            rules: Arc::new(excluded),
+            ..base_cfg()
+        };
+        let mut app = offline(cfg, foldhash::HashMap::default());
+        let leaf = Arc::new(leaf);
+        let altered = SchemaEvent::Changed {
+            old: leaf.clone(),
+            new: leaf.clone(),
+            diff: SchemaDiff::default(),
+        };
+        app.apply_at(&altered, None, STAMP).await.unwrap();
+        assert_eq!(app.stats.skipped, 1);
+        let mut app = offline(base_cfg(), foldhash::HashMap::default());
+        assert_eq!(app.partition_load(&leaf), InitialLoadMode::None);
+        let ghost = Arc::new(desc("ghost", vec![att(1, "id", INT4OID, true, None)], None));
+        let unmapped = SchemaEvent::Changed {
+            old: ghost.clone(),
+            new: ghost.clone(),
+            diff: SchemaDiff::default(),
+        };
+        app.apply_at(&unmapped, None, STAMP).await.unwrap();
+        assert_eq!(
+            app.stats.skipped, 1,
+            "unmapped relation has nothing to alter"
+        );
+        app.truncate(&ghost, STAMP).await.unwrap();
+    }
+
+    /// Detach drops the stale leaf mapping before re-deriving the leaf as
+    /// its own relation
+    #[tokio::test]
+    async fn detached_partition_forgets_its_stale_mapping() {
+        let (_, leaf) = partition_pair();
+        let stale = TableMapping {
+            target: TableTarget::new("default", "m_eu"),
+            columns: Vec::new(),
+            tees: Vec::new(),
+        };
+        let map = [(leaf.rel_name.clone(), stale)].into_iter().collect();
+        let mut app = offline(base_cfg(), map);
+        let standalone = RelDescriptor {
+            ancestors: Vec::new(),
+            ..leaf.clone()
+        };
+        let detach = SchemaEvent::Changed {
+            old: Arc::new(leaf.clone()),
+            new: Arc::new(standalone),
+            diff: SchemaDiff::default(),
+        };
+        app.apply_at(&detach, None, STAMP).await.unwrap();
+        assert!(app.mapping_for(&leaf.rel_name).is_none());
+        assert_eq!(app.stats.creates_applied, 0);
+    }
+
+    /// A partition sharing the record of its root's full truncate adds no
+    /// delete markers
+    #[tokio::test]
+    async fn partition_truncate_folds_into_root_truncate() {
+        let (m, leaf) = partition_pair();
+        let target = TableTarget::new("default", "m");
+        let mapping = TableMapping {
+            target: target.clone(),
+            columns: Vec::new(),
+            tees: Vec::new(),
+        };
+        let map = [(m.rel_name.clone(), mapping)].into_iter().collect();
+        let mut app = offline(base_cfg(), map);
+        app.truncated = Some((STAMP.lsn, target));
+        app.truncate(&leaf, STAMP).await.unwrap();
+        assert_eq!(app.stats.alters_applied, 0);
     }
 }

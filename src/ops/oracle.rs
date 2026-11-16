@@ -356,7 +356,7 @@ impl Oracle {
         let (_, data) = block
             .column(0)
             .and_then(|c| c.string())
-            .ok_or_else(|| OracleError::Response("text value came back untyped".into()))?;
+            .expect("decode_block pinned column 0 to String");
         Ok(String::from_utf8_lossy(data).into_owned())
     }
 }
@@ -691,6 +691,143 @@ mod tests {
         for (err, want) in cases {
             assert_eq!(err.retryable(), want, "{err}");
         }
+    }
+
+    fn uvarint(out: &mut Vec<u8>, mut v: usize) {
+        while v >= 0x80 {
+            out.push(v as u8 | 0x80);
+            v >>= 7;
+        }
+        out.push(v as u8);
+    }
+
+    /// Build an uncompressed Native block with String columns
+    fn native(columns: &[(&str, &str)], rows: &[&str]) -> Vec<u8> {
+        let mut out = Vec::new();
+        uvarint(&mut out, columns.len());
+        uvarint(&mut out, rows.len());
+        for (name, ty) in columns {
+            for s in [name, ty] {
+                uvarint(&mut out, s.len());
+                out.extend_from_slice(s.as_bytes());
+            }
+            for row in rows {
+                uvarint(&mut out, row.len());
+                out.extend_from_slice(row.as_bytes());
+            }
+        }
+        out
+    }
+
+    fn decode_err(native: &[u8], columns: &[OracleRequestColumn<'_>], n_rows: usize) -> String {
+        let alloc = Allocator::global(&mimalloc::MiMalloc);
+        let err = decode_block(native, columns, n_rows, alloc).err();
+        err.expect("decode accepted a mismatched response")
+            .to_string()
+    }
+
+    #[test]
+    fn decode_block_checks_response_shape() {
+        let buf = OracleColumnBuf::string(25, -1);
+        let want = [col(3, "v", "String", &buf)];
+        let one = native(&[("v", "String")], &["x"]);
+        let block = decode_block(&one, &want, 1, Allocator::global(&mimalloc::MiMalloc)).unwrap();
+        let block = OracleBlock {
+            block,
+            ordinals: vec![3],
+        };
+        assert_eq!(
+            format!("{block:?}"),
+            "OracleBlock { rows: 1, ordinals: [3] }"
+        );
+        assert_eq!(block.column(3).and_then(|c| c.string()).unwrap().1, b"x");
+        assert!(block.column(0).is_none());
+
+        let long = "x".repeat(200);
+        let wide = native(&[("v", "String")], &[&long]);
+        let block = decode_block(&wide, &want, 1, Allocator::global(&mimalloc::MiMalloc)).unwrap();
+        let (_, data) = block.column(0).and_then(|c| c.string()).unwrap();
+        assert_eq!(data, long.as_bytes(), "multi-byte varint length");
+
+        let cases: [(Vec<u8>, usize, &str); 7] = [
+            (Vec::new(), 1, "empty Native response"),
+            (vec![1, 1, 1], 1, "block read"),
+            ([one.clone(), one.clone()].concat(), 1, "more than one"),
+            ([one.clone(), vec![1, 1, 1]].concat(), 1, "trailing read"),
+            (one.clone(), 2, "block is 1x1, requested 1x2"),
+            (native(&[("w", "String")], &["x"]), 1, "column 0 is"),
+            (
+                native(&[("v", "Nullable(String)")], &[]),
+                0,
+                "requested \"String\"",
+            ),
+        ];
+        for (bytes, n_rows, want_err) in cases {
+            let err = decode_err(&bytes, &want, n_rows);
+            assert!(err.contains(want_err), "{want_err}: {err}");
+        }
+    }
+
+    #[test]
+    fn ext_columns_render_only_geo_points() {
+        let attr = |attnum: i16, type_name: &str, dropped: bool| RelAttr {
+            attnum,
+            name: format!("c{attnum}"),
+            type_oid: 0,
+            typmod: -1,
+            not_null: false,
+            dropped,
+            type_name: type_name.into(),
+            type_byval: false,
+            type_len: -1,
+            type_align: 'd',
+            type_storage: 'm',
+            missing_default: None,
+        };
+        let mut point = vec![0u8, 0, 0, 0, 1, 0, 0, 0];
+        point.extend_from_slice(&1.5_f64.to_le_bytes());
+        point.extend_from_slice(&(-2.0_f64).to_le_bytes());
+        let pending = |raw: &[u8]| {
+            Some(ColumnValue::PgPending {
+                type_oid: 0,
+                raw: raw.to_vec(),
+            })
+        };
+        let attrs = [
+            attr(1, "geometry", false),
+            attr(2, "geography", false),
+            attr(3, "bytea", false),
+            attr(4, "geometry", true),
+        ];
+        let mut columns = vec![
+            pending(&point),
+            pending(&point[..8]),
+            pending(&point),
+            pending(&point),
+            None,
+        ];
+        render_ext_columns(&attrs, &mut columns);
+        assert!(matches!(&columns[0], Some(ColumnValue::Text(t)) if t == "POINT(1.5 -2)"));
+        for (i, c) in columns.iter().enumerate().take(4).skip(1) {
+            assert!(matches!(c, Some(ColumnValue::PgPending { .. })), "{i}");
+        }
+        assert!(columns[4].is_none());
+    }
+
+    /// Answer that fails to decode counts as an oracle error
+    #[tokio::test(flavor = "current_thread")]
+    async fn undecodable_native_answer_counts_an_error() {
+        use crate::ops::bridge::tests::{hello_body, spawn_worker};
+        use crate::ops::bridge::{PROJECTION_VERSION, PROTO_VERSION};
+        let (_tmp, path) = spawn_worker(vec![
+            Some(hello_body(PROTO_VERSION, PROJECTION_VERSION)),
+            Some(vec![0]),
+        ]);
+        let oracle = Oracle::new(Arc::new(Bridge::connect(&path).await.unwrap()));
+        let cell = OracleCell::DiskRaw(7i32.to_le_bytes().to_vec());
+        let err = oracle.text_value(0, 23, -1, cell).await.unwrap_err();
+        assert!(err.to_string().contains("empty Native response"), "{err}");
+        assert_eq!(oracle.stats.errors.load(Ordering::Relaxed), 1);
     }
 
     #[test]

@@ -741,6 +741,11 @@ mod tests {
         let mut spool = DeferredSpool::new(path.clone(), DEFERRED_SPOOL_MEM_MAX);
         spool.checkpoint().await.unwrap();
         assert!(!path.exists());
+        let shown = format!("{spool:?}");
+        assert!(
+            shown.starts_with("DeferredSpool { records: 0, spooled_bytes: 0"),
+            "{shown}"
+        );
     }
 
     async fn drain_all(spool: DeferredSpool) -> Vec<BackfillTuple> {

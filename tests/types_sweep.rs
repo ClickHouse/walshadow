@@ -22,16 +22,9 @@ fn col(attnum: i16, name: &str, ty: &str) -> ColumnMapping {
     }
 }
 
-fn skip_gate() -> bool {
-    if !fx::tools::requirements_available() {
-        return true;
-    }
-    false
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn broad_type_fidelity() {
-    if skip_gate() {
+    if !fx::tools::requirements_available() {
         return;
     }
     let schema = "CREATE TABLE public.types_t (\
@@ -232,7 +225,7 @@ async fn broad_type_fidelity() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn nan_and_infinity() {
-    if skip_gate() {
+    if !fx::tools::requirements_available() {
         return;
     }
     let schema = "CREATE TABLE public.ni (\
@@ -326,7 +319,7 @@ async fn nan_and_infinity() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn time_precision() {
-    if skip_gate() {
+    if !fx::tools::requirements_available() {
         return;
     }
     let schema = "CREATE TABLE public.tp (id int PRIMARY KEY, t time, tz timetz);\n";
@@ -425,7 +418,7 @@ async fn time_precision() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn large_numeric() {
-    if skip_gate() {
+    if !fx::tools::requirements_available() {
         return;
     }
     let schema = "CREATE TABLE public.ln (id int PRIMARY KEY, d numeric(38,4), huge numeric, neg numeric);\n";
@@ -527,7 +520,7 @@ async fn large_numeric() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn json_null_vs_sql_null() {
-    if skip_gate() {
+    if !fx::tools::requirements_available() {
         return;
     }
     let schema = "CREATE TABLE public.jn (id int PRIMARY KEY, j json);\n";

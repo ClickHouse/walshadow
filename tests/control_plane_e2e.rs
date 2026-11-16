@@ -835,6 +835,21 @@ async fn live_table_opt_in_auto_creates_on_reload() {
         .await
         .context("post-opt-in insert did not reach CH")?;
 
+        // Reload without the opt-in row drops it; a later commit elsewhere
+        // lands after the gizmos insert would have
+        h.ctl_body(&["unset"], "[table.demo]\ngizmos = \"\"")?;
+        h.ctl(&["reload"])?;
+        h.psql("INSERT INTO demo.gizmos VALUES (3, 'gamma')")?;
+        h.psql("UPDATE demo.users SET email = 'after-opt-out@x' WHERE id = 1")?;
+        h.wait_ch(USER_EMAIL, "after-opt-out@x", Duration::from_secs(15))
+            .await
+            .context("commit after the opt-out reload did not reach CH")?;
+        assert_eq!(
+            h.ch_get("SELECT count() FROM demo.demo_gizmos FINAL WHERE id = 3")?,
+            "0",
+            "insert after the opt-out reload reached CH",
+        );
+
         assert!(h.alive(), "daemon exited during opt-in");
         Ok::<(), anyhow::Error>(())
     }

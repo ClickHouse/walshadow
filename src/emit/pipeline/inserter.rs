@@ -230,7 +230,54 @@ pub(crate) async fn spawn_pool(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::decode::heap_decoder::ColumnValue;
     use crate::emit::pipeline::ack;
+    use crate::emit::pipeline::batcher::InsertBatch;
+    use crate::emit::pipeline::resolver::tests::{GEOM_OID, seal, wkt_row};
+
+    async fn run_one(batch: InsertBatch) -> String {
+        let (ack, collector) = ack::spawn(Arc::default(), Fatal::new());
+        let dest = DestEmitter::new(Arc::default(), None);
+        let inserter = Inserter {
+            client: ChConn::deferred(dest),
+            alloc: Allocator::global(&mimalloc::MiMalloc),
+            asts: HashMap::new(),
+            ack,
+            stats: Arc::default(),
+        };
+        let (tx, rx) = async_channel::bounded(1);
+        let resolved = None;
+        tx.send(ResolvedBatch { batch, resolved }).await.unwrap();
+        let fatal = Fatal::new();
+        inserter.run(rx, fatal.clone()).await;
+        collector.await.unwrap();
+        fatal.message().expect("inserter trips fatal")
+    }
+
+    /// Batch shape faults fail before any connection dials
+    #[tokio::test]
+    async fn unanswered_oracle_column_and_bad_type_trip_fatal() {
+        let mut raw = wkt_row(0, None);
+        raw.committed.decoded.new.as_mut().unwrap().columns[0] = Some(ColumnValue::Unsupported {
+            type_oid: GEOM_OID,
+            raw: vec![1],
+        });
+        let msg = run_one(seal(vec![raw]).await).await;
+        assert!(msg.contains("oracle answered no column"), "{msg}");
+
+        let mut batch = seal(vec![wkt_row(0, Some("POINT(1 2)"))]).await;
+        let mut columns = batch.meta.columns.clone();
+        columns[0].type_repr = "Nope(((".into();
+        batch.meta = Arc::new(BatchMeta {
+            table_key: batch.meta.table_key.clone(),
+            inserts: batch.meta.inserts.clone(),
+            columns,
+            schema_epoch: batch.meta.schema_epoch,
+            rows_inserted: Arc::default(),
+        });
+        let msg = run_one(batch).await;
+        assert!(msg.starts_with("inserter type parse: "), "{msg}");
+    }
 
     #[tokio::test]
     async fn insert_retry_preserves_payload_through_failed_reconnect() {

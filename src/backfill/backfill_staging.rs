@@ -135,7 +135,7 @@ impl StagingSession {
     pub async fn connect(dest: Arc<DestEmitter>) -> Result<Self> {
         let client = ChConn::connect(dest)
             .await
-            .map_err(|e| anyhow::anyhow!("backfill_staging: connect: {e}"))?;
+            .context("backfill_staging: connect")?;
         Ok(Self {
             client,
             rules: None,

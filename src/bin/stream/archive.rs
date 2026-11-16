@@ -18,7 +18,7 @@ pub(crate) async fn fetch_wal_into_pg_wal(
     let pg_wal_dir = shadow_data_dir.join("pg_wal");
     tokio::fs::create_dir_all(&pg_wal_dir)
         .await
-        .with_context(|| format!("create {}", pg_wal_dir.display()))?;
+        .context(format!("create {}", pg_wal_dir.display()))?;
     let segments = segments_covering(timeline, start_lsn..end_lsn.saturating_add(1));
     for seg in &segments {
         let name = seg.format();

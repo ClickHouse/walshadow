@@ -166,7 +166,7 @@ fn assert_ch_rows(ch: &fx::ChServer, expected: &[(i64, &str)]) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn savepoint_rollback_discards_subxact_writes() {
-    if skip_gate() {
+    if !fx::tools::requirements_available() {
         return;
     }
     let driver = |source: &Shadow| {
@@ -195,7 +195,7 @@ async fn savepoint_rollback_discards_subxact_writes() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn savepoint_release_commits_subxact_writes() {
-    if skip_gate() {
+    if !fx::tools::requirements_available() {
         return;
     }
     let driver = |source: &Shadow| {
@@ -223,7 +223,7 @@ async fn savepoint_release_commits_subxact_writes() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn orm_nested_savepoints_only_post_savepoint_writes_survive() {
-    if skip_gate() {
+    if !fx::tools::requirements_available() {
         return;
     }
     let driver = |source: &Shadow| {
@@ -255,7 +255,7 @@ async fn orm_nested_savepoints_only_post_savepoint_writes_survive() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn top_abort_with_subxacts_discards_everything() {
-    if skip_gate() {
+    if !fx::tools::requirements_available() {
         return;
     }
     // Top ROLLBACK on its own doesn't drain a commit; pair it with an
@@ -292,7 +292,7 @@ async fn top_abort_with_subxacts_discards_everything() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn toast_value_in_rolled_back_subxact_is_discarded() {
-    if skip_gate() {
+    if !fx::tools::requirements_available() {
         return;
     }
     let driver = |source: &Shadow| {
@@ -343,7 +343,7 @@ async fn toast_value_in_rolled_back_subxact_is_discarded() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn iud_in_aborted_top_xact_leaves_rows_untouched() {
-    if skip_gate() {
+    if !fx::tools::requirements_available() {
         return;
     }
     let driver = |source: &Shadow| {
@@ -378,7 +378,7 @@ async fn iud_in_aborted_top_xact_leaves_rows_untouched() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn savepoint_after_ddl_rollback_discards_column_and_rows() {
-    if skip_gate() {
+    if !fx::tools::requirements_available() {
         return;
     }
     let slot = fx::Ports::alloc();
@@ -484,7 +484,7 @@ async fn savepoint_after_ddl_rollback_discards_column_and_rows() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn many_subxacts_emit_assignment_record() {
-    if skip_gate() {
+    if !fx::tools::requirements_available() {
         return;
     }
     let mut sql = String::from("BEGIN;\nINSERT INTO s14.sub_t (id, payload) VALUES (0, 'r0');\n");
@@ -509,8 +509,4 @@ async fn many_subxacts_emit_assignment_record() {
             .unwrap(),
         "71",
     );
-}
-
-fn skip_gate() -> bool {
-    !fx::tools::requirements_available()
 }

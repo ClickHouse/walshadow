@@ -166,17 +166,7 @@ impl SourceDb {
     }
 }
 
-impl std::fmt::Debug for SourceDb {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SourceDb")
-            .field("name", &self.name)
-            .field("oid", &self.oid)
-            .finish_non_exhaustive()
-    }
-}
-
 /// Databases this daemon follows
-#[derive(Debug)]
 pub struct SourceDbs {
     /// Config order, which is also bridge socket order
     order: Vec<Arc<SourceDb>>,
@@ -215,5 +205,30 @@ impl SourceDbs {
 
     pub fn oids(&self) -> impl Iterator<Item = Oid> + '_ {
         self.order.iter().map(|db| db.oid)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn absent_bridge_socket_names_the_database() {
+        let tmp = tempfile::tempdir().unwrap();
+        let link = DbLink::connect(DbLinkConfig {
+            name: "app",
+            index: 0,
+            workers: 1,
+            bridge_path: &tmp.path().join("absent"),
+            shadow_conninfo: "host=/nonexistent",
+            budget: Duration::ZERO,
+            emitter: None,
+        })
+        .await;
+        let e = link.err().expect("no bridge to dial");
+        assert!(
+            e.to_string().starts_with("connect bridge for database app"),
+            "{e:#}"
+        );
     }
 }

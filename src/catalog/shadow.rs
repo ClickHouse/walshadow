@@ -959,6 +959,18 @@ mod tests {
     fn parse_controldata_floor_rejects_missing_key() {
         let err = parse_controldata_floor("max_connections setting: 100\n").unwrap_err();
         assert!(matches!(err, ShadowError::ControlDataParse(_)), "{err}");
+        let err = parse_controldata_floor("max_connections setting: many\n").unwrap_err();
+        assert!(
+            err.to_string()
+                .ends_with("max_connections setting: \"many\""),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn root_data_dir_puts_socket_under_tmp() {
+        let cfg = ShadowConfig::new("/".into(), "/filtered".into());
+        assert_eq!(cfg.socket_dir, Path::new("/tmp/shadow_sock"));
     }
 
     #[test]
@@ -1167,6 +1179,8 @@ mod tests {
         assert!(!data_dir.join("postmaster.pid").exists());
         fs::write(data_dir.join("PG_VERSION"), b"17\n").unwrap();
         assert!(shadow.data_dir_initialized());
+        fs::create_dir(data_dir.join("postmaster.pid")).unwrap();
+        assert!(matches!(shadow.clear_stale_pid(), Err(ShadowError::Io(_))));
     }
 
     fn stub_bin(path: &Path, body: &str) {
@@ -1225,5 +1239,221 @@ mod tests {
         cfg.pg_bin_dir = Some(bin);
         let err = Shadow::new(cfg).try_pg_wal_replay_resume().unwrap_err();
         assert!(matches!(err, ShadowError::Process { .. }), "{err}");
+    }
+
+    /// Read probe responses from `answers/<key>`; reject databases with `no_db_<name>`
+    fn psql_stub(tmp: &Path) -> (ShadowConfig, PathBuf) {
+        let bin = tmp.join("bin");
+        let answers = bin.join("answers");
+        fs::create_dir_all(&answers).unwrap();
+        fs::create_dir_all(tmp.join("data")).unwrap();
+        stub_bin(
+            &bin.join("psql"),
+            r#"dir=$(dirname "$0")
+while [ $# -gt 0 ]; do
+  case "$1" in -d) db=$2; shift;; -c) sql=$2; shift;; esac
+  shift
+done
+[ -e "$dir/no_db_$db" ] && { echo "database \"$db\" does not exist" >&2; exit 2; }
+case "$sql" in
+  *pg_is_in_recovery*) key=recovery;;
+  *pg_last_wal_replay_lsn*) key=replay;;
+  *data_directory*) key=data_directory;;
+  *restore_command*) key=restore_command;;
+  *socket_path*) key=socket_path;;
+  *bridge_workers*) key=bridge_workers;;
+  *"count(*)"*) key=count;;
+  *current_setting*) key=settings;;
+  *pause_state*) key=pause;;
+  *) key=other;;
+esac
+printf '%s\n' "$db" >> "$dir/dbs"
+cat "$dir/answers/$key""#,
+        );
+        let mut cfg = ShadowConfig::new(tmp.join("data"), tmp.join("filtered"));
+        cfg.pg_bin_dir = Some(bin);
+        cfg.dbname = "app".into();
+        cfg.wait_poll = Duration::from_millis(1);
+        (cfg, answers)
+    }
+
+    fn answer(answers: &Path, key: &str, value: &str) {
+        fs::write(answers.join(key), format!("{value}\n")).unwrap();
+    }
+
+    #[test]
+    fn validate_running_names_each_mismatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut cfg, answers) = psql_stub(tmp.path());
+        let mut bridge = BridgeConf::in_dir(&cfg.socket_dir);
+        bridge.workers = 2;
+        cfg.bridge = Some(bridge.clone());
+        let shadow = Shadow::new(cfg.clone());
+        let incompatible = |want: &str| {
+            assert_eq!(
+                shadow.validate_running().unwrap_err().to_string(),
+                ShadowError::Incompatible(want.into()).to_string()
+            );
+        };
+
+        answer(&answers, "recovery", "f");
+        assert!(matches!(
+            shadow.validate_running(),
+            Err(ShadowError::NotInRecovery)
+        ));
+        answer(&answers, "recovery", "t");
+        answer(&answers, "data_directory", tmp.path().to_str().unwrap());
+        incompatible("data_directory differs");
+        answer(&answers, "data_directory", cfg.data_str());
+        answer(&answers, "restore_command", "cp /elsewhere/%f %p");
+        incompatible("restore_command differs");
+        let restore = format!("cp {}/%f %p", cfg.filter_out_dir.display());
+        answer(&answers, "restore_command", &restore);
+        answer(&answers, "socket_path", "/elsewhere.sock");
+        incompatible("bridge socket differs");
+        answer(
+            &answers,
+            "socket_path",
+            bridge.socket_path.to_str().unwrap(),
+        );
+        answer(&answers, "bridge_workers", "1");
+        incompatible("bridge worker increase requires shadow restart");
+        answer(&answers, "bridge_workers", "2");
+        shadow.validate_running().unwrap();
+    }
+
+    #[test]
+    fn probes_parse_and_fall_back_to_configured_database() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (cfg, answers) = psql_stub(tmp.path());
+        fs::write(answers.parent().unwrap().join("no_db_postgres"), b"").unwrap();
+        let shadow = Shadow::new(cfg);
+
+        answer(&answers, "recovery", "maybe");
+        let err = shadow.is_in_recovery().unwrap_err();
+        assert!(err.to_string().contains("got \"maybe\""), "{err}");
+        let dbs = fs::read_to_string(answers.parent().unwrap().join("dbs")).unwrap();
+        assert_eq!(dbs, "app\n", "probe must use configured database");
+
+        answer(&answers, "replay", "not-an-lsn");
+        assert!(matches!(
+            shadow.last_replay_lsn(),
+            Err(ShadowError::PsqlParse(_))
+        ));
+
+        answer(&answers, "recovery", "t");
+        answer(&answers, "replay", "0/10");
+        answer(&answers, "count", "many");
+        let err = shadow.health().unwrap_err();
+        assert!(err.to_string().contains("count(*) FROM pg_class"), "{err}");
+
+        answer(&answers, "pause", "paused");
+        let controldata = answers.parent().unwrap().join("pg_controldata");
+        stub_bin(
+            &controldata,
+            "echo 'max_connections setting: 500'\n\
+             echo 'max_worker_processes setting: 16'\n\
+             echo 'max_wal_senders setting: 12'\n\
+             echo 'max_prepared_xacts setting: 2'\n\
+             echo 'max_locks_per_xact setting: 128'",
+        );
+        for (row, want) in [
+            ("100|8", "missing max_wal_senders"),
+            ("100|8|x|0|64", "max_wal_senders \"x\""),
+        ] {
+            answer(&answers, "settings", row);
+            let err = shadow.try_pg_wal_replay_resume().unwrap_err();
+            assert!(err.to_string().contains(want), "{want}: {err}");
+        }
+    }
+
+    #[test]
+    fn wait_for_replay_stops_on_promotion_or_timeout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (cfg, answers) = psql_stub(tmp.path());
+        let shadow = Shadow::new(cfg);
+        answer(&answers, "recovery", "t");
+        answer(&answers, "replay", "0/10");
+        assert_eq!(shadow.wait_for_replay(0x10, Duration::ZERO).unwrap(), 0x10);
+        let err = shadow
+            .wait_for_replay(0x11, Duration::from_millis(5))
+            .unwrap_err()
+            .to_string();
+        let want = "timeout waiting for pg_last_wal_replay_lsn >= 0x11 after";
+        assert!(err.starts_with(want), "{err}");
+        answer(&answers, "recovery", "f");
+        assert!(matches!(
+            shadow.wait_for_replay(0x11, Duration::ZERO),
+            Err(ShadowError::NotInRecovery)
+        ));
+    }
+
+    /// WAL replay can raise recovery GUC minimums in `pg_control`
+    #[test]
+    fn floor_retry_restarts_until_floor_settles() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("bin");
+        let data = tmp.path().join("data");
+        fs::create_dir_all(&bin).unwrap();
+        fs::create_dir_all(&data).unwrap();
+        fs::write(bin.join("max_connections"), "100\n").unwrap();
+        stub_bin(
+            &bin.join("pg_controldata"),
+            "dir=$(dirname \"$0\")\n\
+             echo \"max_connections setting: $(cat \"$dir/max_connections\")\"\n\
+             echo 'max_worker_processes setting: 8'\n\
+             echo 'max_wal_senders setting: 10'\n\
+             echo 'max_prepared_xacts setting: 0'\n\
+             echo 'max_locks_per_xact setting: 64'",
+        );
+        stub_bin(
+            &bin.join("pg_ctl"),
+            "dir=$(dirname \"$0\")\n\
+             echo >> \"$dir/starts\"\n\
+             n=$(wc -l < \"$dir/starts\")\n\
+             echo \"attempt $n\" >> \"$4\"\n\
+             echo 200 > \"$dir/max_connections\"\n\
+             echo 'pg_ctl: could not start server' >&2\n\
+             exit 1",
+        );
+        // Exclude old output from startup log tail
+        fs::write(data.join("startup.log"), format!("{}\n", "x".repeat(5000))).unwrap();
+        fs::write(data.join("postmaster.pid"), b"1\n").unwrap();
+        let mut cfg = ShadowConfig::new(data.clone(), tmp.path().join("filtered"));
+        cfg.pg_bin_dir = Some(bin.clone());
+        let shadow = Shadow::new(cfg);
+
+        let Err(ShadowError::Process { cmd, stderr, .. }) = shadow.start_with_floor_retry(None)
+        else {
+            panic!("start must fail");
+        };
+        assert_eq!(cmd, "pg_ctl");
+        let (head, tail) = stderr.split_once("\nstartup.log tail:\n").unwrap();
+        assert_eq!(head, "pg_ctl: could not start server\n");
+        assert!(tail.ends_with("attempt 1\nattempt 2\n"), "{tail}");
+        assert_eq!(tail.len(), 4096);
+        assert_eq!(fs::read_to_string(bin.join("starts")).unwrap(), "\n\n");
+        assert!(!data.join("postmaster.pid").exists());
+        let conf = fs::read_to_string(data.join("postgresql.conf")).unwrap();
+        assert!(conf.contains("max_connections = 200"), "{conf}");
+    }
+
+    #[test]
+    fn missing_binaries_name_the_binary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let mut cfg = ShadowConfig::new(tmp.path().join("data"), tmp.path().join("filtered"));
+        cfg.pg_bin_dir = Some(bin);
+        let shadow = Shadow::new(cfg);
+        let missing = |r: Result<()>, want: &str| {
+            assert_eq!(
+                r.unwrap_err().to_string(),
+                ShadowError::MissingBinary(want.into()).to_string()
+            );
+        };
+        missing(shadow.control_guc_floor().map(drop), "pg_controldata");
+        missing(shadow.stop(), "pg_ctl");
+        assert_eq!(log_tail(&tmp.path().join("absent.log")), "<unreadable>");
     }
 }

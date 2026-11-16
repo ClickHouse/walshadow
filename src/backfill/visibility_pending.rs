@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
+use anyhow::Context as _;
 use foldhash::{HashMap, HashMapExt, HashSet, HashSetExt};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -256,6 +257,31 @@ pub async fn ship(
     oracle: Option<Arc<Oracle>>,
     scratch_dir: &Path,
 ) -> Result<Vec<PendingManifest>, String> {
+    ship_rows(
+        pending,
+        live,
+        dest,
+        stats,
+        resolver,
+        config,
+        oracle,
+        scratch_dir,
+    )
+    .await
+    .map_err(|e| format!("pending visibility: {e:#}"))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn ship_rows(
+    pending: PendingSpool,
+    live: &MappingSnapshot,
+    dest: Arc<crate::config::DestEmitter>,
+    stats: Arc<EmitterStats>,
+    resolver: ToastResolver,
+    config: Option<Arc<ResolvedConfig>>,
+    oracle: Option<Arc<Oracle>>,
+    scratch_dir: &Path,
+) -> anyhow::Result<Vec<PendingManifest>> {
     let PendingSpool {
         spool,
         catalog,
@@ -276,7 +302,7 @@ pub async fn ship(
     let mut manifests = Vec::with_capacity(tally.len());
     let mut sess = StagingSession::connect(dest.clone())
         .await
-        .map_err(|e| format!("pending visibility: connect: {e}"))?;
+        .context("connect")?;
     for desc in catalog.descriptors() {
         // Excluded partitions have no owner and no tapped rows
         let (Some(counted), Some(owner)) = (
@@ -346,7 +372,8 @@ pub async fn ship(
         oracle,
         "pending visibility",
     )
-    .await?;
+    .await
+    .map_err(anyhow::Error::msg)?;
     // Stale file from a crashed pass blocks create_new
     let deferred = scratch_dir.join("pending_deferred.bin");
     tokio::fs::remove_file(&deferred).await.ok();
@@ -368,9 +395,13 @@ pub async fn ship(
     drop(tx);
     let drained = drain
         .await
-        .map_err(|e| format!("pending visibility: drain join: {e}"))?;
+        .context("drain join")?
+        .map_err(anyhow::Error::msg);
     match (replayed, drained) {
-        (Ok(()), Ok(outcome)) => tail.finish(outcome.next_seq).await?,
+        (Ok(()), Ok(outcome)) => tail
+            .finish(outcome.next_seq)
+            .await
+            .map_err(anyhow::Error::msg)?,
         (Err(e), _) | (_, Err(e)) => {
             tail.quiesce().await;
             return Err(e);
@@ -385,17 +416,10 @@ pub async fn ship(
     Ok(manifests)
 }
 
-async fn replay(spool: DeferredSpool, tx: &mpsc::Sender<Vec<BackfillTuple>>) -> Result<(), String> {
-    let mut reader = spool
-        .into_reader()
-        .await
-        .map_err(|e| format!("pending visibility: spool seal: {e}"))?;
+async fn replay(spool: DeferredSpool, tx: &mpsc::Sender<Vec<BackfillTuple>>) -> anyhow::Result<()> {
+    let mut reader = spool.into_reader().await.context("spool seal")?;
     let mut slab = Vec::with_capacity(PENDING_SLAB_ROWS);
-    while let Some(t) = reader
-        .next()
-        .await
-        .map_err(|e| format!("pending visibility: spool replay: {e}"))?
-    {
+    while let Some(t) = reader.next().await.context("spool replay")? {
         slab.push(t);
         if slab.len() >= PENDING_SLAB_ROWS {
             let full = std::mem::replace(&mut slab, Vec::with_capacity(PENDING_SLAB_ROWS));
@@ -407,11 +431,7 @@ async fn replay(spool: DeferredSpool, tx: &mpsc::Sender<Vec<BackfillTuple>>) -> 
     if !slab.is_empty() {
         let _ = tx.send(slab).await;
     }
-    reader
-        .finish()
-        .await
-        .map_err(|e| format!("pending visibility: spool cleanup: {e}"))?;
-    Ok(())
+    reader.finish().await.context("spool cleanup")
 }
 
 /// Use plain MergeTree to retain competing UPDATE versions
@@ -426,16 +446,12 @@ fn pending_create_sql(rel: &PendingRel) -> String {
     )
 }
 
-async fn rebuild_pending(sess: &mut StagingSession, rel: &PendingRel) -> Result<(), String> {
-    sess.select(rel.target.instance.as_deref())
-        .map_err(|e| e.to_string())?;
+async fn rebuild_pending(sess: &mut StagingSession, rel: &PendingRel) -> anyhow::Result<()> {
+    sess.select(rel.target.instance.as_deref())?;
     let pending = rel.pending_sql();
     sess.exec_retry(&format!("DROP TABLE IF EXISTS {pending}"))
-        .await
-        .map_err(|e| e.to_string())?;
-    sess.exec_retry(&pending_create_sql(rel))
-        .await
-        .map_err(|e| e.to_string())?;
+        .await?;
+    sess.exec_retry(&pending_create_sql(rel)).await?;
     for (name, ty) in [
         (XMIN_COLUMN, "UInt32"),
         (XMAX_COLUMN, "UInt32"),
@@ -445,8 +461,7 @@ async fn rebuild_pending(sess: &mut StagingSession, rel: &PendingRel) -> Result<
             "ALTER TABLE {pending} ADD COLUMN IF NOT EXISTS {} {ty}",
             quote_ident(name)
         ))
-        .await
-        .map_err(|e| e.to_string())?;
+        .await?;
     }
     Ok(())
 }
@@ -766,19 +781,27 @@ pub async fn settle(
     sess: &mut StagingSession,
     stats: &EmitterStats,
 ) -> Result<(), String> {
+    settle_round(ledger, sess, stats)
+        .await
+        .map_err(|e| format!("pending visibility: {e:#}"))
+}
+
+async fn settle_round(
+    ledger: &mut PendingLedger,
+    sess: &mut StagingSession,
+    stats: &EmitterStats,
+) -> anyhow::Result<()> {
     let mut done = Vec::new();
     for (i, e) in ledger.entries.iter_mut().enumerate() {
         if e.held {
             continue;
         }
         let rel = e.rel();
-        sess.select(rel.target.instance.as_deref())
-            .map_err(|err| err.to_string())?;
+        sess.select(rel.target.instance.as_deref())?;
         // Crash may follow DROP but precede ledger persist
         if sess
             .table_uuid(&e.target.database, &rel.pending_table())
-            .await
-            .map_err(|err| format!("pending visibility: {}: {err}", rel.pending_sql()))?
+            .await?
             .is_none()
         {
             done.push(i);
@@ -793,11 +816,9 @@ pub async fn settle(
             continue;
         }
         for copy in rel.remote_copies().chain(std::iter::once(rel.clone())) {
-            sess.select(copy.target.instance.as_deref())
-                .map_err(|err| err.to_string())?;
+            sess.select(copy.target.instance.as_deref())?;
             sess.exec_retry(&format!("DROP TABLE IF EXISTS {}", copy.pending_sql()))
-                .await
-                .map_err(|err| err.to_string())?;
+                .await?;
         }
         stats.pending_tables_dropped.fetch_add(1, Ordering::Relaxed);
         done.push(i);
@@ -808,10 +829,7 @@ pub async fn settle(
     stats
         .pending_outstanding_xids
         .store(ledger.outstanding().len() as u64, Ordering::Relaxed);
-    ledger
-        .persist()
-        .await
-        .map_err(|e| format!("pending visibility: ledger persist: {e}"))
+    ledger.persist().await.context("ledger persist")
 }
 
 /// Intersect destination and pending columns to exclude metadata and later DDL
@@ -819,26 +837,24 @@ async fn promote(
     sess: &mut StagingSession,
     rel: &PendingRel,
     entry: &PendingEntry,
-) -> Result<(), String> {
+) -> anyhow::Result<()> {
     for target in rel.targets() {
         let copy = if target.instance == rel.target.instance {
             rel.clone()
         } else {
             rel.for_target(&target)
         };
-        sess.select(copy.target.instance.as_deref())
-            .map_err(|e| e.to_string())?;
+        sess.select(copy.target.instance.as_deref())?;
         if sess
             .table_uuid(&copy.target.database, &copy.pending_table())
-            .await
-            .map_err(|e| e.to_string())?
+            .await?
             .is_none()
         {
             continue;
         }
         let list = shared_columns(sess, &copy).await?;
         let sql = promote_sql(&target.sql(), &copy, entry, &list);
-        sess.exec_retry(&sql).await.map_err(|e| e.to_string())?;
+        sess.exec_retry(&sql).await?;
     }
     Ok(())
 }
@@ -853,7 +869,7 @@ fn promote_sql(target: &str, rel: &PendingRel, entry: &PendingEntry, list: &str)
     )
 }
 
-async fn shared_columns(sess: &mut StagingSession, rel: &PendingRel) -> Result<String, String> {
+async fn shared_columns(sess: &mut StagingSession, rel: &PendingRel) -> anyhow::Result<String> {
     let target_columns = sess
         .query_strings(&format!(
             "SELECT name FROM system.columns WHERE database = {} AND table = {} \
@@ -861,8 +877,7 @@ async fn shared_columns(sess: &mut StagingSession, rel: &PendingRel) -> Result<S
             sql_str(&rel.target.database),
             sql_str(&rel.target.table)
         ))
-        .await
-        .map_err(|e| e.to_string())?;
+        .await?;
     let pending_columns: HashSet<String> = sess
         .query_strings(&format!(
             "SELECT name FROM system.columns WHERE database = {} AND table = {} \
@@ -870,8 +885,7 @@ async fn shared_columns(sess: &mut StagingSession, rel: &PendingRel) -> Result<S
             sql_str(&rel.target.database),
             sql_str(&rel.pending_table())
         ))
-        .await
-        .map_err(|e| e.to_string())?
+        .await?
         .into_iter()
         .collect();
     let cols: Vec<String> = target_columns
@@ -879,13 +893,12 @@ async fn shared_columns(sess: &mut StagingSession, rel: &PendingRel) -> Result<S
         .filter(|c| pending_columns.contains(*c))
         .map(|c| quote_ident(c))
         .collect();
-    if cols.is_empty() {
-        return Err(format!(
-            "pending visibility: no shared columns between {} and {}",
-            rel.target_sql(),
-            rel.pending_sql()
-        ));
-    }
+    anyhow::ensure!(
+        !cols.is_empty(),
+        "no shared columns between {} and {}",
+        rel.target_sql(),
+        rel.pending_sql()
+    );
     Ok(cols.join(", "))
 }
 
@@ -1178,6 +1191,31 @@ mod tests {
         assert_eq!(fold.settled, 0);
         assert_eq!(fold.undecidable, 1, "an aged-out xid is visible as such");
         assert_eq!(ledger.entries()[0].outstanding, [101]);
+    }
+
+    #[tokio::test]
+    async fn note_view_settles_decided_xids() {
+        use crate::decode::visibility::{PgXactAccum, PgXactPatch};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ledger = PendingLedger::load(tmp.path(), 7).await.unwrap();
+        ledger
+            .push(&manifest("orders", vec![101, 102]))
+            .await
+            .unwrap();
+        let accum = PgXactAccum::new();
+        let mut patch = PgXactPatch::new();
+        patch.commit(101, &[]);
+        patch.abort(102, &[]);
+        let patch = patch.seal();
+        let fold = ledger.note_view(&PgXactView::new(&accum, &patch));
+        assert_eq!((fold.settled, fold.undecidable), (2, 0));
+        let entry = &ledger.entries()[0];
+        assert!(entry.outstanding.is_empty());
+        assert_eq!(
+            (&entry.committed[..], &entry.aborted[..]),
+            (&[101][..], &[102][..])
+        );
     }
 
     #[tokio::test]

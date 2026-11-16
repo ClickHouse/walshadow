@@ -320,7 +320,6 @@ impl AckState {
 #[derive(Clone)]
 pub struct AckHandle {
     tx: mpsc::UnboundedSender<AckEvent>,
-    emitter_ack: Arc<Monotone<EmitterAck>>,
     frontier: Gate<AckFrontier>,
     probe: watch::Receiver<AckSnapshot>,
 }
@@ -344,10 +343,6 @@ impl AckHandle {
 
     pub fn trailing(&self, lsn: u64) {
         let _ = self.tx.send(AckEvent::Trailing { lsn });
-    }
-
-    pub fn emitter_ack(&self) -> Pos<EmitterAck> {
-        self.emitter_ack.get()
     }
 
     pub fn probe(&self) -> watch::Receiver<AckSnapshot> {
@@ -495,7 +490,7 @@ pub fn spawn(emitter_ack: Arc<Monotone<EmitterAck>>, fatal: Fatal) -> (AckHandle
     let frontier_cell = Monotone::default();
     let frontier = frontier_cell.watch();
     let (probe_tx, probe) = watch::channel(AckSnapshot::default());
-    let mut state = AckState::new(emitter_ack.clone(), frontier_cell, probe_tx, fatal);
+    let mut state = AckState::new(emitter_ack, frontier_cell, probe_tx, fatal);
     let handle = tokio::spawn(async move {
         while let Some(ev) = rx.recv().await {
             state.apply(ev);
@@ -504,7 +499,6 @@ pub fn spawn(emitter_ack: Arc<Monotone<EmitterAck>>, fatal: Fatal) -> (AckHandle
     (
         AckHandle {
             tx,
-            emitter_ack,
             frontier,
             probe,
         },
@@ -624,6 +618,18 @@ mod tests {
         s.placed(7, 3);
         assert_eq!(s.snapshot().wedged, 4, "seq past the registration frontier");
         assert_eq!(s.fatal.message(), Some(first), "root cause kept");
+    }
+
+    #[test]
+    fn acks_ahead_of_placement_past_row_count_wedge() {
+        let (mut s, ack) = state();
+        s.register(0, 100, true);
+        s.acked(0, 3);
+        s.placed(0, 2);
+        let msg = s.fatal.message().expect("over-ack trips fatal");
+        assert!(msg.contains("seq acked past its row count"), "{msg}");
+        assert_eq!(s.snapshot().wedged, 1);
+        assert_eq!(ack.get(), 0);
     }
 }
 

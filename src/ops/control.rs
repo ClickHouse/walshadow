@@ -161,11 +161,9 @@ fn ok_toml(t: &Table) -> String {
 /// Bind the control socket (unlinking any stale one, 0600) and serve one
 /// request per connection until the runtime tears down.
 pub fn serve(path: PathBuf, ctx: SharedCtx) -> Result<tokio::task::JoinHandle<()>> {
-    if let Some(dir) = path.parent()
-        && !dir.as_os_str().is_empty()
-    {
-        std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
-    }
+    // Bare file name: parent is "", which create_dir_all accepts
+    let dir = path.parent().unwrap_or(Path::new(""));
+    std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
     if let Err(e) = std::fs::remove_file(&path)
         && e.kind() != std::io::ErrorKind::NotFound
     {
@@ -654,9 +652,9 @@ async fn load(path: &Path) -> Result<Table> {
 }
 
 async fn save(path: &Path, root: &Table) -> Result<()> {
-    let (Some(dir), Some(name)) = (path.parent(), path.file_name().and_then(|n| n.to_str())) else {
-        bail!("bad fragment path {}", path.display());
-    };
+    let dir = path.parent().context("fragment path has no directory")?;
+    let name = path.file_name().and_then(|n| n.to_str());
+    let name = name.context("fragment path has no UTF-8 file name")?;
     tokio::fs::create_dir_all(dir).await.ok();
     crate::fs::write_atomic(
         dir,
@@ -687,7 +685,7 @@ async fn pg_connect(root: &Table, dbname: Option<&str>) -> Result<Client> {
 fn set_mode_600(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-        .with_context(|| format!("chmod 600 {}", path.display()))
+        .context(format!("chmod 600 {}", path.display()))
 }
 
 #[cfg(test)]
@@ -777,6 +775,114 @@ mod tests {
         assert!(demo.get("a").is_none() && demo.get("b").is_some());
         apply_mask(&mut root, &cfg("table = \"\""));
         assert!(root.get("table").is_none());
+        apply_mask(&mut root, &cfg("[stream]\npaused = \"\""));
+        assert!(root.get("stream").is_none(), "absent section stays absent");
+    }
+
+    #[test]
+    fn ok_with_frames_body_on_its_own_lines() {
+        assert_eq!(ok_with(""), ok());
+        assert_eq!(ok_with("a\n"), "OK\na\n");
+        assert_eq!(ok_with("a"), "OK\na\n");
+    }
+
+    /// Resolver wiring sweeps config once; a broken file only warns
+    #[tokio::test]
+    async fn wiring_sweep_survives_unreadable_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ch-config.toml");
+        let doc: Table = "[ch]\nhost = \"ch\"\n".parse().unwrap();
+        let base = crate::ch_emitter::EmitterConfig::from_table(&doc).unwrap();
+        let (resolver, _rx) = crate::config::ConfigResolver::new(
+            &base,
+            crate::config::CliOverrides::default(),
+            Some(path.clone()),
+            Table::new(),
+            crate::mapping::mapping_handle(Default::default()),
+            crate::config::ResolverBoot::default(),
+        );
+        tokio::fs::write(&path, "[ch\n").await.unwrap();
+        let reloader = Reloader::default();
+        reloader.set_resolvers(vec![resolver]).await;
+        assert!(reloader.reload().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn serve_refuses_a_directory_in_socket_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = serve(dir.path().to_path_buf(), ctx_at(dir.path())).unwrap_err();
+        assert!(format!("{err:#}").contains("unlink stale"), "{err:#}");
+    }
+
+    /// Fragment I/O and source connect failures answer ERR naming the cause
+    #[tokio::test]
+    async fn requests_surface_fragment_and_source_failures() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("c.sock");
+        let ctx = ctx_at(dir.path());
+        let frag = ctx.fragment.clone();
+        let _h = serve(sock.clone(), ctx).unwrap();
+
+        let mut raw = UnixStream::connect(&sock).await.unwrap();
+        raw.write_all(b"\xff").await.unwrap();
+        raw.shutdown().await.unwrap();
+        let mut resp = String::new();
+        raw.read_to_string(&mut resp).await.unwrap();
+        assert!(resp.starts_with("ERR"), "{resp}");
+
+        let confd = frag.parent().unwrap();
+        std::fs::create_dir_all(&frag).unwrap();
+        let resp = call(&sock, "unset", "[ch]\nport = \"\"").await;
+        assert!(resp.starts_with("ERR read"), "{resp}");
+        std::fs::remove_dir(&frag).unwrap();
+        std::fs::write(&frag, "[ch\n").unwrap();
+        let resp = call(&sock, "unset", "[ch]\nport = \"\"").await;
+        assert!(resp.starts_with("ERR parse"), "{resp}");
+        std::fs::remove_file(&frag).unwrap();
+        std::fs::set_permissions(confd, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let resp = call(&sock, "apply", "[ch]\nhost = \"ch\"").await;
+        std::fs::set_permissions(confd, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(resp.starts_with("ERR write"), "{resp}");
+
+        let resp = call(&sock, "columns", "").await;
+        assert!(resp.starts_with("ERR usage: columns list"), "{resp}");
+        let resp = call(&sock, "apply", "[source]\nhost = \"\"").await;
+        assert!(resp.starts_with("OK"), "{resp}");
+        let resp = call(&sock, "schemas", "").await;
+        assert!(resp.starts_with("ERR source host not set"), "{resp}");
+        let resp = call(&sock, "apply", "[source]\nhost = \"127.0.0.1\"\nport = 1").await;
+        assert!(resp.starts_with("OK"), "{resp}");
+        let resp = call(&sock, "schemas", "").await;
+        assert!(resp.starts_with("ERR connect source 127.0.0.1:1"), "{resp}");
+    }
+
+    /// `status` resolves instance-routed tables and lists decoder skips
+    #[tokio::test]
+    async fn status_lists_instances_and_skipped_relations() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("c.sock");
+        let ctx = ctx_at(dir.path());
+        ctx.metrics
+            .update(|snap| {
+                snap.skipped_records_by_rel = vec![crate::metrics::SkippedRel {
+                    database: "app".into(),
+                    rel_node: "16400".into(),
+                    op: "update",
+                    reason: "not_covered",
+                    records: 3,
+                }];
+            })
+            .await;
+        let _h = serve(sock.clone(), ctx).unwrap();
+        let resp = call(&sock, "apply", "[ch.instances.west]\nhost = \"w\"").await;
+        assert!(resp.starts_with("OK"), "{resp}");
+        let status = call(&sock, "status", "").await;
+        let parsed: Table = status.strip_prefix("OK\n").unwrap().parse().unwrap();
+        let skipped = parsed["skipped_relations"].as_array().unwrap();
+        let [skip] = &skipped[..] else { panic!() };
+        assert_eq!(skip["rel_node"].as_str(), Some("16400"));
+        assert_eq!(skip["records"].as_integer(), Some(3));
     }
 
     fn ctx_at(dir: &Path) -> SharedCtx {
@@ -910,7 +1016,7 @@ mod tests {
                 .filter_map(Value::as_table)
                 .find(|t| t.get("source_table").and_then(Value::as_str) == Some(source))
                 .cloned()
-                .unwrap_or_else(|| panic!("{source} missing from {status}"))
+                .expect(source)
         };
         assert_eq!(tables.len(), 4, "{status}");
 

@@ -314,3 +314,65 @@ async fn preflight_passes_once_source_is_logical_and_relations_keyed() {
     .expect("preflight probe runs");
     assert!(report.is_ok(), "unexpected findings: {:?}", report.errors);
 }
+
+/// Reserve WAL senders for backup window; require archiving for archive restore
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bootstrap_preflight_checks_senders_and_archiving() {
+    if !pg_available() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let source = make_pg(&tmp, "src-arch", ports::PG_SOURCE_PORT);
+    source.initdb().expect("initdb source");
+    source.write_base_conf().expect("source base conf");
+    let conf = source.config().data_dir.join("postgresql.conf");
+    let mut f = fs::OpenOptions::new().append(true).open(&conf).unwrap();
+    writeln!(f, "\nmax_wal_senders = 1\narchive_mode = off").unwrap();
+    drop(f);
+    source.start().expect("start source");
+    let _stop = StopOnDrop { sh: &source };
+    let socket = source.config().socket_dir.as_path();
+    let probe = |window_leg, wal_from_archive| async move {
+        let sql = connect_sql(socket, ports::PG_SOURCE_PORT).await.unwrap();
+        walshadow::preflight::bootstrap(walshadow::preflight::BootstrapInputs {
+            source_sql: &sql,
+            window_leg,
+            wal_from_archive,
+        })
+        .await
+        .expect("bootstrap probe runs")
+        .errors
+    };
+
+    assert!(probe(false, false).await.is_empty());
+    let errors = probe(true, true).await;
+    assert!(
+        matches!(
+            errors[..],
+            [
+                PreflightError::WalSendersTooLow { got: 1, need: 2 },
+                PreflightError::ArchiveModeOff { ref got },
+            ] if got == "off"
+        ),
+        "{errors:?}"
+    );
+
+    source
+        .psql_one("ALTER SYSTEM SET archive_mode = 'always'")
+        .unwrap();
+    source.stop().unwrap();
+    source.start().unwrap();
+    let errors = probe(false, true).await;
+    assert!(
+        matches!(errors[..], [PreflightError::ArchiveTargetEmpty]),
+        "{errors:?}"
+    );
+    source
+        .psql_one("ALTER SYSTEM SET archive_command = '/bin/true'")
+        .unwrap();
+    source.psql_one("SELECT pg_reload_conf()").unwrap();
+    while source.psql_one("SHOW archive_command").unwrap() != "/bin/true" {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(probe(false, true).await.is_empty());
+}

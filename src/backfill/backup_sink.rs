@@ -217,6 +217,23 @@ mod tests {
     use crate::backfill::pg_path::{BaseRelFile, RelFork, is_system_dir, parse_base_path};
     use std::path::{Path, PathBuf};
 
+    #[tokio::test]
+    async fn lander_keeps_and_counts_tablespace_symlinks() {
+        let lander = DiskLanderSink::new(CatalogFilenodes::new());
+        let meta = FileMeta {
+            path: PathBuf::from("pg_tblspc/16384"),
+            kind: FileKind::Symlink {
+                target: PathBuf::from("/srv/ts"),
+            },
+            ..Default::default()
+        };
+        assert!(matches!(
+            lander.begin(&meta).await.unwrap(),
+            FileAction::Keep
+        ));
+        assert_eq!(lander.stats.kept_symlinks.load(Ordering::Relaxed), 1);
+    }
+
     #[test]
     fn is_system_dir_matches_denylist() {
         assert!(is_system_dir(Path::new("pg_replslot")));

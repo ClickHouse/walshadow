@@ -31,12 +31,9 @@ compile_error!(
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-/// Enable every callsite so coverage runs evaluate tracing field expressions
 #[cfg(test)]
-#[ctor::ctor(unsafe)]
-fn enable_tracing() {
-    let _ = tracing::subscriber::set_global_default(tracing_subscriber::registry());
-}
+#[path = "../../../tests/common/tools.rs"]
+mod tools;
 
 mod archive;
 mod args;
@@ -131,7 +128,7 @@ async fn run_ctl(socket: &Path, cmd: walshadow::ctl::Command) -> Result<()> {
     let doc = walshadow::control::encode_request(&cmd.verb, body)?;
     let mut stream = tokio::net::UnixStream::connect(socket)
         .await
-        .with_context(|| format!("connect control socket {}", socket.display()))?;
+        .context(format!("connect control socket {}", socket.display()))?;
     stream.write_all(doc.as_bytes()).await?;
     stream.flush().await?;
     stream.shutdown().await.ok();
@@ -162,13 +159,7 @@ async fn run(mut args: Args) -> Result<()> {
     validate_transport_args(&args)?;
     validate_scratch_dir(&args)?;
     let sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
-        .inspect_err(|e| {
-            tracing::warn!(
-                target: "walshadow::sighup",
-                error = %e,
-                "SIGHUP install failed",
-            );
-        })?;
+        .context("install SIGHUP")?;
     let shutdown = spawn_shutdown_signals()?;
 
     let metrics = MetricsRegistry::new();

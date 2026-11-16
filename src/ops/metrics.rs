@@ -1159,18 +1159,27 @@ mod tests {
         snap.records_by_rm_route
             .insert(("Heap".into(), "to_decoder"), 3);
 
-        let full = render(snap.clone()).len();
-        for writes in 0..64 {
+        let mut registry = Registry::default();
+        registry.register_collector(Box::new(SnapshotCollector(snap)));
+        registry.register_collector(Box::new(crate::ops::log_events::LogEventCollector));
+        registry.register_collector(Box::new(crate::ops::stages::StageCollector));
+        let mut whole = FailAfter {
+            writes: usize::MAX,
+            out: String::new(),
+        };
+        text::encode(&mut whole, &registry).unwrap();
+        let total = usize::MAX - whole.writes;
+        for writes in 0..total {
             let mut w = FailAfter {
                 writes,
                 out: String::new(),
             };
-            let mut registry = Registry::default();
-            registry.register_collector(Box::new(SnapshotCollector(snap.clone())));
-            registry.register_collector(Box::new(crate::ops::log_events::LogEventCollector));
             let failed = text::encode(&mut w, &registry).is_err();
             assert!(failed, "prefix length {writes} must surface the failure");
-            assert!(w.out.len() < full, "a failed encode cannot be complete");
+            assert!(
+                w.out.len() < whole.out.len(),
+                "a failed encode cannot be complete"
+            );
         }
     }
 
@@ -1646,5 +1655,13 @@ mod tests {
         assert!(resp.starts_with("HTTP/1.0 200 OK\r\n"), "{resp}");
         assert!(resp.contains("Content-Type: application/openmetrics-text"));
         assert!(resp.contains("walshadow_filter_lsn 57005"), "{resp}");
+        let taken = serve(addr, MetricsRegistry::new()).await.unwrap_err();
+        assert!(matches!(taken, MetricsError::Bind { .. }), "{taken}");
+    }
+
+    #[test]
+    fn escape_label_quotes_openmetrics_reserved_chars() {
+        assert!(matches!(escape_label("plain"), Cow::Borrowed("plain")));
+        assert_eq!(escape_label("a\\b\"c\nd"), r#"a\\b\"c\nd"#);
     }
 }

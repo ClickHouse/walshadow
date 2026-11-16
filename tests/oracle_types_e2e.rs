@@ -16,13 +16,6 @@ use walshadow::mapping::TableTarget;
 use walshadow::oracle::Oracle;
 use walshadow::schema::RelName;
 
-fn skip_gate() -> bool {
-    if !fx::tools::requirements_available() {
-        return true;
-    }
-    false
-}
-
 fn col(attnum: i16, name: &str, ty: &str) -> ColumnMapping {
     ColumnMapping {
         src_attnum: attnum,
@@ -135,7 +128,7 @@ async fn run_oracle_stats(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn arrays_resolve_via_oracle() {
-    if skip_gate() {
+    if !fx::tools::requirements_available() {
         return;
     }
     let (source, ch, _tmp) = run_oracle(
@@ -186,7 +179,7 @@ async fn arrays_resolve_via_oracle() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn native_array_targets_carry_elements_and_nulls() {
-    if skip_gate() {
+    if !fx::tools::requirements_available() {
         return;
     }
     let (source, ch, _tmp) = run_oracle(
@@ -239,7 +232,7 @@ async fn native_array_targets_carry_elements_and_nulls() {
 /// `ADD COLUMN` defaults supply values for rows already stored in ClickHouse
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn jsonb_fast_default_renders_on_add_column() {
-    if skip_gate() {
+    if !fx::tools::requirements_available() {
         return;
     }
     let (source, ch, _tmp) = run_oracle(
@@ -285,7 +278,7 @@ async fn jsonb_fast_default_renders_on_add_column() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn hstore_maps_through_the_extension_expander() {
-    if skip_gate() || !fx::tools::extension("hstore") {
+    if !fx::tools::requirements_available() || !fx::tools::extension("hstore") {
         return;
     }
     let (source, ch, _tmp) = run_oracle(
@@ -337,7 +330,7 @@ async fn hstore_maps_through_the_extension_expander() {
 /// codecs render reach CH without a conversion request
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn json_targets_take_every_json_shape() {
-    if skip_gate() {
+    if !fx::tools::requirements_available() {
         return;
     }
     let (source, ch, _tmp, oracle) = run_oracle_stats(
@@ -391,7 +384,7 @@ async fn json_targets_take_every_json_shape() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn one_request_covers_a_whole_sealed_batch() {
-    if skip_gate() {
+    if !fx::tools::requirements_available() {
         return;
     }
     const ROWS: u64 = 200;
@@ -435,7 +428,7 @@ async fn one_request_covers_a_whole_sealed_batch() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn enums_resolve_via_oracle() {
-    if skip_gate() {
+    if !fx::tools::requirements_available() {
         return;
     }
     let (source, ch, _tmp) = run_oracle(
@@ -480,7 +473,7 @@ async fn enums_resolve_via_oracle() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn geometric_types_resolve_via_oracle() {
-    if skip_gate() {
+    if !fx::tools::requirements_available() {
         return;
     }
     let (source, ch, _tmp) = run_oracle(
@@ -530,7 +523,7 @@ async fn geometric_types_resolve_via_oracle() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pgvector_resolves_via_oracle() {
-    if skip_gate() || !fx::tools::extension("vector") {
+    if !fx::tools::requirements_available() || !fx::tools::extension("vector") {
         return;
     }
     let (source, ch, _tmp) = run_oracle(
@@ -568,7 +561,7 @@ async fn pgvector_resolves_via_oracle() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pgvector_fills_float_arrays_and_qbit() {
-    if skip_gate() || !fx::tools::extension("vector") {
+    if !fx::tools::requirements_available() || !fx::tools::extension("vector") {
         return;
     }
     let (source, ch, _tmp) = run_oracle(
@@ -609,7 +602,7 @@ async fn pgvector_fills_float_arrays_and_qbit() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn array_update_under_rif_resolves_old_tuple() {
-    if skip_gate() {
+    if !fx::tools::requirements_available() {
         return;
     }
     let (source, ch, _tmp) = run_oracle(

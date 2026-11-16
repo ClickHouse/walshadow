@@ -148,8 +148,7 @@ pub async fn materialize_pending_on_added(
     Ok(())
 }
 
-/// Create the CH table (idempotent) then register the opt-in mapping. Skips the
-/// mapping if the shape can't be bridged so no rows route to a missing table.
+/// Create the CH table (idempotent) then register the opt-in mapping
 async fn opt_in_known(
     resolver: &ConfigResolver,
     applicator: &mut DdlApplicator,
@@ -170,9 +169,10 @@ async fn opt_in_known(
         );
         return Ok(());
     }
-    if !applicator.owns_destination(desc)? || !applicator.ensure_ch_table(desc).await? {
+    if !applicator.owns_destination(desc)? {
         return Ok(());
     }
+    applicator.ensure_ch_table(desc).await?;
     resolver
         .materialize_opt_in(desc, row.target_database.clone(), row.target_table.clone())
         .await;

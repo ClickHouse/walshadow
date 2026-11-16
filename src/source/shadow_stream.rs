@@ -25,7 +25,7 @@ use std::time::Duration;
 
 use smallvec::SmallVec;
 use thiserror::Error;
-use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
+use tokio::net::{TcpListener, UnixListener};
 use tokio::sync::Mutex;
 use walrus::pg::backup::format_pg_lsn;
 use walrus::pg::replication::server::{
@@ -83,16 +83,14 @@ impl Phase {
         }
     }
 
-    fn end(&mut self, switch: TimelineSwitch) -> bool {
-        if self.ended().is_some() {
-            return false;
-        }
+    /// Only a streaming connection reaches its switchpoint, though an overflow
+    /// on that same dispatch may already have marked it closing
+    fn end(&mut self, switch: TimelineSwitch) {
         *self = if self.is_closing() {
             Self::Closing(Some(switch))
         } else {
             Self::Ended(switch)
         };
-        true
     }
 
     fn close(&mut self) -> bool {
@@ -493,18 +491,19 @@ impl ShadowStreamState {
     /// Mark a historic connection served through its switchpoint. The listener
     /// picks this up and ends the timeline on the wire.
     fn end_timeline_for(&mut self, id: u64, switch: TimelineSwitch) {
-        if let Some(c) = self.connections.get_mut(&id)
-            && c.phase.end(switch)
-        {
-            tracing::info!(
-                target: "walshadow::shadow_stream",
-                conn_id = id,
-                timeline = switch.timeline,
-                next_timeline = switch.next_timeline,
-                switch_lsn = format!("{:#X}", switch.ends_at),
-                "historic timeline served to its switchpoint",
-            );
-        }
+        self.connections
+            .get_mut(&id)
+            .expect("switchpoint reached by a registered connection")
+            .phase
+            .end(switch);
+        tracing::info!(
+            target: "walshadow::shadow_stream",
+            conn_id = id,
+            timeline = switch.timeline,
+            next_timeline = switch.next_timeline,
+            switch_lsn = format!("{:#X}", switch.ends_at),
+            "historic timeline served to its switchpoint",
+        );
         self.wake_listener();
     }
 
@@ -548,9 +547,10 @@ impl ShadowStreamState {
             });
             pos = end;
         }
-        if let Some(c) = self.connections.get_mut(&id) {
-            c.backfill_queued = self.send_queues.get(&id).map_or(0, Vec::len);
-        }
+        self.connections
+            .get_mut(&id)
+            .expect("backfill follows registration")
+            .backfill_queued = self.send_queues.get(&id).map_or(0, Vec::len);
         self.advance_dispatched(id, Pos::new(server_wal_end));
     }
 
@@ -615,16 +615,20 @@ impl ShadowStreamState {
     pub fn enqueue(&mut self, id: u64, framed: Vec<u8>) -> bool {
         let q = self.send_queues.entry(id).or_default();
         if q.len() + framed.len() > self.slow_threshold {
-            if let Some(c) = self.connections.get_mut(&id)
-                && c.phase.close()
-            {
-                self.dropped_total += 1;
-            }
-            self.send_queues.remove(&id);
+            self.overflow(id);
             return false;
         }
         q.extend_from_slice(&framed);
         true
+    }
+
+    fn overflow(&mut self, id: u64) {
+        if let Some(c) = self.connections.get_mut(&id)
+            && c.phase.close()
+        {
+            self.dropped_total += 1;
+        }
+        self.send_queues.remove(&id);
     }
 
     /// Append a CopyData envelope wrapping a `'w'`/`'k'` frame, built in-place.
@@ -649,13 +653,7 @@ impl ShadowStreamState {
         if let Some(cap) = cap
             && envelope_start.saturating_sub(backfill) + 1 + payload_len > cap
         {
-            q.truncate(envelope_start);
-            if let Some(c) = self.connections.get_mut(&id)
-                && c.phase.close()
-            {
-                self.dropped_total += 1;
-            }
-            self.send_queues.remove(&id);
+            self.overflow(id);
             return false;
         }
         q[envelope_start + 1..envelope_start + 5]
@@ -764,24 +762,12 @@ pub async fn spawn_listener(
             )))
         }
         WalSenderAddr::Tcp(addr) => {
-            // SO_REUSEADDR: a prior bind in TIME_WAIT must not block
-            // restart with the same `--walsender-bind`.
-            let sock = match addr {
-                std::net::SocketAddr::V4(_) => tokio::net::TcpSocket::new_v4().map_err(|e| {
-                    io::Error::new(e.kind(), format!("TcpSocket::new_v4 {addr}: {e}"))
-                })?,
-                std::net::SocketAddr::V6(_) => tokio::net::TcpSocket::new_v6().map_err(|e| {
-                    io::Error::new(e.kind(), format!("TcpSocket::new_v6 {addr}: {e}"))
-                })?,
-            };
-            sock.set_reuseaddr(true)
-                .map_err(|e| io::Error::new(e.kind(), format!("set_reuseaddr {addr}: {e}")))?;
+            // SO_REUSEADDR (tokio sets it on unix): a prior bind in TIME_WAIT
+            // must not block restart with the same `--walsender-bind`
             tracing::info!(target: "walshadow::shadow_stream", %addr, "binding walsender");
-            sock.bind(addr)
+            let listener = TcpListener::bind(addr)
+                .await
                 .map_err(|e| io::Error::new(e.kind(), format!("bind {addr}: {e}")))?;
-            let listener = sock
-                .listen(1024)
-                .map_err(|e| io::Error::new(e.kind(), format!("listen {addr}: {e}")))?;
             Ok(tokio::spawn(run_tcp_listener(
                 listener,
                 state,
@@ -800,7 +786,7 @@ async fn run_unix_listener(
         match listener.accept().await {
             Ok((sock, _)) => {
                 let state = state.clone();
-                tokio::spawn(handle_unix_connection(sock, state, flush_interval));
+                tokio::spawn(handle_connection(sock, state, flush_interval));
             }
             Err(e) => {
                 tracing::warn!(target: "walshadow", error = %e, "walsender listener accept failed");
@@ -820,7 +806,7 @@ async fn run_tcp_listener(
             Ok((sock, _)) => {
                 let _ = sock.set_nodelay(true);
                 let state = state.clone();
-                tokio::spawn(handle_tcp_connection(sock, state, flush_interval));
+                tokio::spawn(handle_connection(sock, state, flush_interval));
             }
             Err(e) => {
                 tracing::warn!(target: "walshadow", error = %e, "walsender listener accept failed");
@@ -830,21 +816,13 @@ async fn run_tcp_listener(
     }
 }
 
-async fn handle_unix_connection(
-    sock: UnixStream,
+async fn handle_connection<S>(
+    sock: S,
     state: Arc<Mutex<ShadowStreamState>>,
     flush_interval: Duration,
-) {
-    if let Err(e) = drive_connection(sock, state, flush_interval).await {
-        tracing::warn!(target: "walshadow", error = %e, "walsender connection ended");
-    }
-}
-
-async fn handle_tcp_connection(
-    sock: TcpStream,
-    state: Arc<Mutex<ShadowStreamState>>,
-    flush_interval: Duration,
-) {
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
+{
     if let Err(e) = drive_connection(sock, state, flush_interval).await {
         tracing::warn!(target: "walshadow", error = %e, "walsender connection ended");
     }
@@ -1010,6 +988,44 @@ where
         }
         if closing {
             return Ok(StreamOutcome::Closed);
+        }
+    }
+}
+
+/// This walsender on a unix socket, standing in for a source PG
+#[cfg(test)]
+pub(crate) mod fake_source {
+    use super::*;
+    use walrus::pg::replication::conn::PgConfig;
+    use walrus::pg::replication::tls::SslMode;
+
+    pub(crate) struct FakeSource {
+        pub(crate) state: Arc<Mutex<ShadowStreamState>>,
+        pub(crate) cfg: PgConfig,
+        _dir: tempfile::TempDir,
+    }
+
+    pub(crate) async fn serve(state: ShadowStreamState) -> FakeSource {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(Mutex::new(state));
+        let socket = WalSenderAddr::Unix(dir.path().join("sock/.s.PGSQL.5432"));
+        spawn_listener(socket, state.clone(), Duration::from_millis(5))
+            .await
+            .unwrap();
+        let cfg = PgConfig {
+            host: dir.path().join("sock").display().to_string(),
+            port: 5432,
+            user: "test".into(),
+            password: None,
+            database: "test".into(),
+            application_name: "fake-source".into(),
+            sslmode: SslMode::Disable,
+            tls: Default::default(),
+        };
+        FakeSource {
+            state,
+            cfg,
+            _dir: dir,
         }
     }
 }
@@ -1340,10 +1356,9 @@ mod tests {
         let mut out = Vec::new();
         while !q.is_empty() {
             let len = 1 + u32::from_be_bytes(q[1..5].try_into().unwrap()) as usize;
-            if q[5] == b'w' {
-                let lsn = u64::from_be_bytes(q[6..14].try_into().unwrap());
-                out.push((lsn, len - WIRE_HDR));
-            }
+            assert_eq!(q[5], b'w');
+            let lsn = u64::from_be_bytes(q[6..14].try_into().unwrap());
+            out.push((lsn, len - WIRE_HDR));
             q = &q[len..];
         }
         out
@@ -1453,5 +1468,166 @@ mod tests {
             .expect("current timeline");
         let q = s.drain_send_queue(cur).expect("in-progress backfill kept");
         assert_eq!(&q[WIRE_HDR..], b"BBBB", "no gap after trim");
+    }
+
+    #[test]
+    fn overflow_on_the_chunk_reaching_the_switchpoint_still_owes_the_end() {
+        let mut s = ShadowStreamState::new(1, "x".into(), 0, WIRE_HDR + 2);
+        let switch = TimelineSwitch {
+            timeline: 1,
+            ends_at: 4,
+            next_timeline: 2,
+        };
+        let id = s.register_connection(0, 1, Some(switch)).unwrap();
+        s.dispatch_wire(0, b"AAAABBBB");
+        assert!(s.connections[&id].phase.is_closing());
+        assert_eq!(s.aggregate().dropped_total, 1);
+        assert_eq!(s.timeline_ended_for(id), Some(switch));
+    }
+
+    #[test]
+    fn advertising_at_the_head_ends_an_idle_stream_once() {
+        let mut s = fresh_state();
+        let id = s.register_connection(0x1000, 1, None).unwrap();
+        s.advertise_timeline(2, 0x1000, HISTORY.to_vec());
+        let first = TimelineSwitch {
+            timeline: 1,
+            ends_at: 0x1000,
+            next_timeline: 2,
+        };
+        assert_eq!(s.timeline_ended_for(id), Some(first));
+        s.advertise_timeline(3, 0x1000, HISTORY.to_vec());
+        assert_eq!(
+            s.timeline_ended_for(id),
+            Some(first),
+            "an ended stream keeps the branch it was reading",
+        );
+    }
+
+    #[test]
+    fn seeding_a_known_history_keeps_the_first_bytes() {
+        let mut s = fresh_state();
+        s.seed_history(1, b"first".to_vec());
+        s.seed_history(1, b"second".to_vec());
+        assert_eq!(s.identity().histories, [(1, b"first".to_vec())]);
+    }
+
+    #[test]
+    fn an_empty_chunk_keeps_retained_bytes() {
+        let mut s = fresh_state();
+        s.dispatch_wire(0x1000, b"AAAA");
+        s.dispatch_wire(0x1000, b"");
+        let id = s.register_connection(0x1000, 1, None).unwrap();
+        assert_eq!(&s.drain_send_queue(id).unwrap()[WIRE_HDR..], b"AAAA");
+    }
+
+    /// A rebuilt `WalStream` replaying less than the head retains less; a
+    /// reconnect past the replay waits for it rather than reading a hole
+    #[test]
+    fn reconnect_past_a_short_replay_streams_once_replay_reaches_it() {
+        let mut s = fresh_state();
+        s.dispatch_wire(0x1000, b"AAAABBBB");
+        s.dispatch_wire(0x1000, b"AA");
+        let id = s.register_connection(0x1004, 1, None).unwrap();
+        assert!(s.drain_send_queue(id).is_none());
+        s.dispatch_wire(0x1002, b"AABBBBCC");
+        assert_eq!(
+            frames(&s.drain_send_queue(id).unwrap()),
+            [(0x1004, 6)],
+            "served from its own start",
+        );
+    }
+
+    #[test]
+    fn a_dropped_connection_ignores_late_traffic() {
+        let mut s = fresh_state();
+        let id = s.register_connection(0x1000, 1, None).unwrap();
+        s.drop_connection(id);
+        let applied = s.applied();
+        let quiet = applied.current();
+        s.observe_status(id, 0x2000, Pos::new(0x2000), Pos::new(0x2000));
+        s.advance_dispatched(id, Pos::new(0x2000));
+        assert_eq!(applied.current(), quiet);
+        assert!(s.drain_send_queue(id).is_none());
+        assert_eq!(s.aggregate().active_connections, 0);
+    }
+
+    /// Wait past `seen` registrations and drops, each of which bumps `applied`
+    async fn applied_past(state: &Mutex<ShadowStreamState>, seen: Pos<AppliedWake>) {
+        let applied = state.lock().await.applied();
+        applied.advance(seen).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn unix_walsender_streams_and_notices_a_client_leave() {
+        use crate::source_feed::{SourceEvent, SourceFeed, StandbyStatus};
+        let mut state = fresh_state();
+        state.dispatch_wire(0x1000, b"AAAA");
+        let source = fake_source::serve(state).await;
+        let mut feed = SourceFeed::connect(&source.cfg).await.unwrap();
+        let ident = feed.identify_system().await.unwrap();
+        assert_eq!((ident.system_id, ident.timeline), (12345, 1));
+        assert_eq!(feed.timeline_history(1).await.unwrap(), None);
+        feed.start_physical_replication(None, 0x1000, 1)
+            .await
+            .unwrap();
+        let mut buf = Vec::new();
+        let event = feed.next_event(StandbyStatus::default(), &mut buf).await;
+        assert!(
+            matches!(event, Ok(SourceEvent::Wal(c)) if c.start_lsn == 0x1000 && c.data == b"AAAA")
+        );
+        let seen = source.state.lock().await.applied().current();
+        drop(feed);
+        applied_past(&source.state, seen).await;
+        assert_eq!(source.state.lock().await.aggregate().active_connections, 0);
+    }
+
+    #[tokio::test]
+    async fn unix_walsender_drops_a_slow_client() {
+        use crate::source_feed::{SourceFeed, StandbyStatus};
+        let source = fake_source::serve(ShadowStreamState::new(1, "1".into(), 0, 64)).await;
+        let mut feed = SourceFeed::connect(&source.cfg).await.unwrap();
+        feed.start_physical_replication(None, 0, 1).await.unwrap();
+        applied_past(&source.state, Pos::ZERO).await;
+        source.state.lock().await.dispatch_wire(0, &[0; 128]);
+        applied_past(&source.state, Pos::new(1)).await;
+        assert_eq!(source.state.lock().await.aggregate().dropped_total, 1);
+        let mut buf = Vec::new();
+        assert!(
+            feed.next_event(StandbyStatus::default(), &mut buf)
+                .await
+                .is_err()
+        );
+    }
+
+    /// Refusals arrive inside CopyBoth with the SQLSTATE a PG walsender uses,
+    /// and only the archived one reads as a removed segment
+    #[tokio::test]
+    async fn unix_walsender_refusals_carry_pg_sqlstates() {
+        use crate::source_feed::{SourceFeed, StandbyStatus, is_wal_segment_removed};
+        let source = fake_source::serve(fresh_state()).await;
+        for (start, tli, removed) in [(0x1000, 7, false), (0, 1, true)] {
+            let mut feed = SourceFeed::connect(&source.cfg).await.unwrap();
+            feed.start_physical_replication(None, start, tli)
+                .await
+                .unwrap();
+            let mut buf = Vec::new();
+            let err = feed
+                .next_event(StandbyStatus::default(), &mut buf)
+                .await
+                .unwrap_err();
+            assert_eq!(is_wal_segment_removed(&err), removed, "{err:#}");
+        }
+    }
+
+    #[tokio::test]
+    async fn tcp_walsender_names_an_address_it_cannot_bind() {
+        let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = taken.local_addr().unwrap();
+        let state = Arc::new(Mutex::new(fresh_state()));
+        let e = spawn_listener(WalSenderAddr::Tcp(addr), state, Duration::from_millis(5))
+            .await
+            .err();
+        assert!(e.is_some_and(|e| e.to_string().contains(&format!("bind {addr}"))));
     }
 }

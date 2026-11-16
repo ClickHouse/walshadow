@@ -160,7 +160,8 @@ impl ShadowRelations {
             system_id: control_system_id(dir).await?,
             creates_from: self.creates_from,
             relations,
-        })?;
+        })
+        .expect("shadow relations serialize");
         crate::fs::write_atomic(dir, FILE, raw.as_bytes())
             .await
             .context("persist shadow replay eligibility before WAL publication")?;
@@ -191,7 +192,9 @@ mod tests {
     #[tokio::test]
     async fn held_tracks_seed_admissions_and_reload() {
         let tmp = tempfile::tempdir().unwrap();
+        assert!(ShadowRelations::new(HashSet::default(), 100).is_empty());
         let mut rels = ShadowRelations::new(HashSet::from_iter([(5, 17000)]), 100);
+        assert!(!rels.is_empty());
         let held = rels.held();
         assert!(held.contains((5, 17000)));
         assert!(!held.contains((5, 17001)));
@@ -237,6 +240,19 @@ mod tests {
             .unwrap();
         let err = ShadowRelations::load(tmp.path()).await.err().unwrap();
         assert!(err.to_string().contains("belongs to system 42"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn unreadable_or_short_control_file_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let control = tmp.path().join("global/pg_control");
+        tokio::fs::create_dir_all(&control).await.unwrap();
+        let err = control_system_id(tmp.path()).await.unwrap_err();
+        assert!(err.to_string().starts_with("read "), "{err}");
+        tokio::fs::remove_dir(&control).await.unwrap();
+        tokio::fs::write(&control, [1, 2, 3]).await.unwrap();
+        let err = control_system_id(tmp.path()).await.unwrap_err();
+        assert!(err.to_string().ends_with("too short"), "{err}");
     }
 
     #[tokio::test]

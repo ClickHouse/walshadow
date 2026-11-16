@@ -825,4 +825,63 @@ mod tests {
         let r2 = walker.try_next().unwrap().unwrap();
         assert_eq!(r2.start_offset, 40);
     }
+
+    #[test]
+    fn malformed_record_header_ends_the_segment() {
+        let mut zero_len = vec![0u8; 8];
+        zero_len[4] = 1;
+        let cases = [
+            (zero_len, WalkError::ZeroRecord { offset: 40 }),
+            (
+                header_le(10),
+                WalkError::ShortRecord {
+                    offset: 40,
+                    min: X_LOG_RECORD_HEADER_SIZE,
+                },
+            ),
+        ];
+        for (body, expected) in cases {
+            let mut walker = StreamingWalker::new(PAGE_SIZE);
+            walker.extend(&build_single_page(&body, XLP_PAGE_MAGIC_PG15, 0));
+            let e = walker.try_next().unwrap().unwrap_err();
+            assert_eq!(e.to_string(), expected.to_string());
+            assert!(walker.try_next().is_none());
+        }
+    }
+
+    /// A page tail too short for a record header, all zero, is the end of WAL
+    #[test]
+    fn zero_tail_shorter_than_a_header_terminates_segment() {
+        let len = PAGE_SIZE - 40 - 16;
+        let mut body = header_le(len as u32);
+        body.resize(len, 0);
+        let mut walker = StreamingWalker::new(2 * PAGE_SIZE);
+        walker.extend(&build_single_page(&body, XLP_PAGE_MAGIC_PG15, 0));
+        assert_eq!(walker.try_next().unwrap().unwrap().total_len(), len);
+        assert!(walker.try_next().is_none());
+        walker.extend(&build_single_page(&header_le(40), XLP_PAGE_MAGIC_PG15, 0));
+        assert!(walker.try_next().is_none(), "nothing past the end");
+    }
+
+    /// Truncating below the page being parsed restarts from the first page
+    #[test]
+    fn truncate_below_the_current_page_rereads_from_its_header() {
+        let mut record = header_le(8200);
+        record.resize(8200, 0xAA);
+        let page1 = build_single_page(&record[..PAGE_SIZE - 40], XLP_PAGE_MAGIC_PG15, 0);
+        let mut page2 =
+            build_long_header_page(&record[PAGE_SIZE - 40..], XLP_PAGE_MAGIC_PG15, 48, 0);
+        page2[2..4].copy_from_slice(&0u16.to_le_bytes());
+        page2.drain(24..40);
+        page2.resize(PAGE_SIZE, 0);
+        let mut walker = StreamingWalker::new(2 * PAGE_SIZE);
+        walker.extend(&page1);
+        walker.extend(&page2);
+        assert_eq!(walker.try_next().unwrap().unwrap().total_len(), 8200);
+        walker.truncate_to(40);
+        walker.extend(&page1[40..]);
+        walker.extend(&page2);
+        let again = walker.try_next().unwrap().unwrap();
+        assert_eq!((again.start_offset, again.total_len()), (40, 8200));
+    }
 }

@@ -10,7 +10,7 @@
 //! see [`crate::opt_in::apply_table_opt_in`], which boot and reload share
 
 use std::collections::BTreeSet;
-use std::io::{IsTerminal, Write};
+use std::io::{BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -56,10 +56,12 @@ pub async fn run(opts: InitOpts) -> Result<()> {
         PG_URL_ENV,
         "Source Postgres URL",
         "postgres://user:password@host:5432/dbname",
+        terminal(),
     )?;
     let source = crate::dsn::source_table(&source_url)?;
     let conn = SourceConn::from_table(&wrap("source", source.clone()))
-        .map_err(|e| anyhow::anyhow!("[source] {e}"))?;
+        .map_err(anyhow::Error::msg)
+        .context("[source]")?;
 
     println!("\nsource {}", conn.endpoint());
     let client = open_sql_client(&conn.to_pg_config())
@@ -77,10 +79,10 @@ pub async fn run(opts: InitOpts) -> Result<()> {
         CH_URL_ENV,
         "ClickHouse URL",
         "clickhouse://user:password@host:9000/database",
+        terminal(),
     )?;
     let ch = crate::dsn::ch_table(&ch_url)?;
-    let ch_cfg = EmitterConfig::from_table(&wrap("ch", ch.clone()))
-        .map_err(|e| anyhow::anyhow!("[ch] {e}"))?;
+    let ch_cfg = EmitterConfig::from_table(&wrap("ch", ch.clone())).context("[ch]")?;
     println!("\ndestination {}:{}", ch_cfg.conn.host, ch_cfg.conn.port);
     let created_db = crate::ch_ddl::ensure_boot_database(&ch_cfg)
         .await
@@ -89,12 +91,11 @@ pub async fn run(opts: InitOpts) -> Result<()> {
         .await
         .context("connect ClickHouse")?;
     // chc-rs returns None only before handshake
-    if let Some(i) = ch_client.server_info() {
-        println!(
-            "  ✓ reachable, ClickHouse {}.{}.{}",
-            i.version_major, i.version_minor, i.version_patch
-        );
-    }
+    let i = ch_client.server_info().context("ClickHouse handshake")?;
+    println!(
+        "  ✓ reachable, ClickHouse {}.{}.{}",
+        i.version_major, i.version_minor, i.version_patch
+    );
     if created_db {
         println!("  ✓ created database {}", ch_cfg.conn.database);
     }
@@ -102,7 +103,7 @@ pub async fn run(opts: InitOpts) -> Result<()> {
     let listed = introspect::tables(&client, opts.namespace.as_deref())
         .await
         .context("list source tables")?;
-    let picked = select_tables(&listed, &opts)?;
+    let picked = select_tables(&listed, &opts, terminal())?;
     if picked.is_empty() {
         println!(
             "\nno tables selected — add them later with `walshadow-stream ctl add <schema> <table>`"
@@ -150,9 +151,7 @@ async fn probe_source(
     }
     for e in &report.errors {
         out.push(format!("  ✗ {e}"));
-        if let Some(fix) = remedy(e) {
-            out.push(format!("      {fix}"));
-        }
+        out.extend(remedy(e).map(|fix| format!("      {fix}")));
     }
 
     let row = client
@@ -198,10 +197,6 @@ fn remedy(e: &PreflightError) -> Option<String> {
         PreflightError::SlotMissing { slot } => {
             Some(format!("SELECT pg_create_physical_replication_slot('{slot}');"))
         }
-        PreflightError::BadReplicaIdentity { rel, .. } => Some(format!(
-            "ALTER TABLE {}.{} REPLICA IDENTITY FULL;  -- or add a PRIMARY KEY",
-            rel.namespace, rel.name
-        )),
         _ => None,
     }
 }
@@ -240,7 +235,11 @@ fn shadow_major_mismatch(source_version_num: i32) -> Option<String> {
 }
 
 /// Explicit list, then `--all-tables`, then the interactive picker
-fn select_tables(listed: &[SourceTable], opts: &InitOpts) -> Result<Vec<RelName>> {
+fn select_tables(
+    listed: &[SourceTable],
+    opts: &InitOpts,
+    tty: Option<impl BufRead>,
+) -> Result<Vec<RelName>> {
     if !opts.tables.is_empty() {
         let known: foldhash::HashSet<&RelName> = listed.iter().map(|t| &t.rel).collect();
         for rel in &opts.tables {
@@ -262,13 +261,16 @@ fn select_tables(listed: &[SourceTable], opts: &InitOpts) -> Result<Vec<RelName>
         }
         return Ok(replicable.iter().map(|t| t.rel.clone()).collect());
     }
-    if !std::io::stdin().is_terminal() {
+    let Some(mut tty) = tty else {
         bail!("no terminal for the table picker — pass --all-tables or --table <schema> <table>");
-    }
+    };
     print_table_menu(listed);
     // Re-prompt rather than discard the probing work already done
     loop {
-        let answer = prompt("\nTables (numbers, ranges, `all`, or empty for none): ")?;
+        let answer = prompt(
+            "\nTables (numbers, ranges, `all`, or empty for none): ",
+            &mut tty,
+        )?;
         match resolve_picked(listed, &answer) {
             Ok(picked) => return Ok(picked),
             Err(e) => println!("  {e}"),
@@ -360,29 +362,29 @@ fn build_config(source: Table, ch: Table, picked: &[RelName], initial_load: &str
     if picked.is_empty() {
         return root;
     }
-    let mut tables = Table::new();
+    let mut by_ns: std::collections::BTreeMap<&str, Table> = Default::default();
     for rel in picked {
         let mut block = Table::new();
         block.insert("replicate".into(), true.into());
         block.insert("initial_load".into(), initial_load.into());
-        let ns = tables
-            .entry(rel.namespace.to_string())
-            .or_insert_with(|| Value::Table(Table::new()));
-        if let Value::Table(ns) = ns {
-            ns.insert(rel.name.to_string(), Value::Table(block));
-        }
+        by_ns
+            .entry(&rel.namespace)
+            .or_default()
+            .insert(rel.name.to_string(), Value::Table(block));
     }
+    let tables = by_ns
+        .into_iter()
+        .map(|(ns, t)| (ns.to_owned(), Value::Table(t)))
+        .collect();
     root.insert("table".into(), Value::Table(tables));
     root
 }
 
 /// 0600: the file carries both passwords
 fn write_config(path: &Path, doc: &Table) -> Result<()> {
-    if let Some(dir) = path.parent()
-        && !dir.as_os_str().is_empty()
-    {
-        std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
-    }
+    // Bare file name: parent is "", which create_dir_all accepts
+    let dir = path.parent().unwrap_or(Path::new(""));
+    std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
     let body = format!(
         "# Written by `walshadow-stream init`. Edit freely, or drive it live\n\
          # over the control socket (`walshadow-stream ctl …`), which writes\n\
@@ -394,7 +396,7 @@ fn write_config(path: &Path, doc: &Table) -> Result<()> {
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("chmod 0600 {}", path.display()))?;
+            .context(format!("chmod 0600 {}", path.display()))?;
     }
     Ok(())
 }
@@ -407,7 +409,13 @@ fn wrap(section: &str, body: Table) -> Table {
 
 /// Flag, then env, then prompt. Env keeps credentials out of `ps` and
 /// shell history
-fn resolve_url(flag: Option<String>, env: &str, label: &str, example: &str) -> Result<String> {
+fn resolve_url(
+    flag: Option<String>,
+    env: &str,
+    label: &str,
+    example: &str,
+    tty: Option<impl BufRead>,
+) -> Result<String> {
     if let Some(url) = flag.filter(|s| !s.trim().is_empty()) {
         return Ok(url);
     }
@@ -416,21 +424,27 @@ fn resolve_url(flag: Option<String>, env: &str, label: &str, example: &str) -> R
     {
         return Ok(url);
     }
-    if !std::io::stdin().is_terminal() {
+    let Some(mut tty) = tty else {
         bail!("no {label}: pass the flag or set {env} (eg {example})");
-    }
-    let answer = prompt(&format!("{label} [{example}]: "))?;
+    };
+    let answer = prompt(&format!("{label} [{example}]: "), &mut tty)?;
     if answer.trim().is_empty() {
         bail!("no {label} given");
     }
     Ok(answer.trim().into())
 }
 
-fn prompt(text: &str) -> Result<String> {
+/// Prompt answers: stdin, when it is a terminal
+fn terminal() -> Option<std::io::StdinLock<'static>> {
+    let stdin = std::io::stdin();
+    stdin.is_terminal().then_some(stdin.lock())
+}
+
+fn prompt(text: &str, tty: &mut impl BufRead) -> Result<String> {
     print!("{text}");
     std::io::stdout().flush()?;
     let mut line = String::new();
-    std::io::stdin().read_line(&mut line)?;
+    tty.read_line(&mut line)?;
     Ok(line)
 }
 
@@ -465,6 +479,85 @@ mod tests {
         ]
     }
 
+    const NO_TTY: Option<std::io::Empty> = None;
+
+    fn tty(answers: &str) -> Option<std::io::Cursor<&str>> {
+        Some(std::io::Cursor::new(answers))
+    }
+
+    #[test]
+    fn picker_reprompts_until_an_answer_resolves() {
+        let picked = select_tables(&listed(), &opts(), tty("2\n9\n1\n")).unwrap();
+        assert_eq!(picked, vec![RelName::new("public", "users")]);
+        let e = select_tables(&listed(), &opts(), NO_TTY).unwrap_err();
+        assert!(e.to_string().contains("no terminal"), "{e}");
+    }
+
+    #[test]
+    fn url_resolves_flag_env_then_prompt() {
+        let url = |flag: Option<&str>, env: &str, tty: Option<std::io::Cursor<&str>>| {
+            resolve_url(flag.map(Into::into), env, "URL", "eg", tty).map_err(|e| e.to_string())
+        };
+        let unset = "WALSHADOW_INIT_TEST_UNSET";
+        assert_eq!(url(Some("pg://flag"), unset, None), Ok("pg://flag".into()));
+        let path = std::env::var("PATH").unwrap();
+        assert_eq!(url(Some(" "), "PATH", None), Ok(path));
+        assert_eq!(
+            url(None, unset, tty(" pg://typed \n")),
+            Ok("pg://typed".into())
+        );
+        assert_eq!(url(None, unset, tty("\n")), Err("no URL given".into()));
+        let e = url(None, unset, None).unwrap_err();
+        assert!(
+            e.contains("pass the flag or set WALSHADOW_INIT_TEST_UNSET"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn remedies_only_for_fixable_findings() {
+        let wal = PreflightError::WalLevel {
+            got: "replica".into(),
+            expected: "logical",
+        };
+        assert!(remedy(&wal).unwrap().contains("wal_level = logical"));
+        let slot = PreflightError::SlotMissing { slot: "s".into() };
+        assert!(
+            remedy(&slot)
+                .unwrap()
+                .contains("pg_create_physical_replication_slot('s')")
+        );
+        let old = PreflightError::SourceVersionTooOld { got: 1, min: 2 };
+        assert_eq!(remedy(&old), None);
+    }
+
+    #[test]
+    fn config_writes_into_missing_dirs_owner_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("nested/ch-config.toml");
+        let doc = build_config(Table::new(), Table::new(), &[], "none");
+        write_config(&path, &doc).unwrap();
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(body.starts_with("# Written by `walshadow-stream init`"));
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
+    /// Unreachable source fails naming its endpoint
+    #[tokio::test(flavor = "current_thread")]
+    async fn unreachable_source_names_endpoint() {
+        let tmp = tempfile::tempdir().unwrap();
+        let e = run(InitOpts {
+            config: tmp.path().join("ch-config.toml"),
+            source_url: Some("postgres://u@127.0.0.1:1/db".into()),
+            ..opts()
+        })
+        .await
+        .unwrap_err();
+        assert!(format!("{e:#}").contains("connect source"), "{e:#}");
+    }
+
     fn opts() -> InitOpts {
         InitOpts {
             config: "/tmp/walshadow-init-test.toml".into(),
@@ -486,6 +579,7 @@ mod tests {
                 all_tables: true,
                 ..opts()
             },
+            NO_TTY,
         )
         .unwrap();
         assert_eq!(picked, vec![RelName::new("public", "users")]);
@@ -499,6 +593,7 @@ mod tests {
                 tables: vec![RelName::new("public", "ghost")],
                 ..opts()
             },
+            NO_TTY,
         )
         .unwrap_err();
         assert!(e.to_string().contains("not found on source"), "{e}");

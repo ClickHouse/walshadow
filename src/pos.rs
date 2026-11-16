@@ -431,5 +431,17 @@ mod tests {
         drop(m);
         assert_eq!(gate.wait(Pos::new(10u64)).await.expect("covered"), 10);
         assert_eq!(gate.wait(Pos::new(11u64)).await, Err(GateClosed));
+        assert_eq!(
+            GateClosed.to_string(),
+            "gate closed before target was covered"
+        );
+    }
+
+    #[test]
+    fn cells_and_proofs_copy_and_render_as_their_position() {
+        let m = Monotone::<Floor>::new(Pos::new(0x6A000000));
+        assert_eq!(format!("{m:?}"), "floor=1778384896");
+        let proof = Durable::new(m.get());
+        assert_eq!(Some(&proof).cloned().map(|p| m.publish(p)), Some(m.get()));
     }
 }

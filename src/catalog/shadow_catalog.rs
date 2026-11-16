@@ -548,7 +548,7 @@ impl ShadowCatalog {
             Scope::Oids(oids) => self.query_retry(&MIRROR_BATCH_SQL, &[&oids]).await?,
             Scope::Eligible => self.query_retry(&MIRROR_ALL_SQL, &[]).await?,
         };
-        let mut out = DescriptorRows::from_mirror(&rows)?;
+        let mut out = DescriptorRows::from_mirror(rows.iter().map(|r| (r.get(0), r.get(1))))?;
         if let Scope::Oids(oids) = scope {
             out.requested = Some(oids.iter().copied().collect());
         }
@@ -911,12 +911,10 @@ struct DescriptorRows {
 impl DescriptorRows {
     /// Rows off [`mirror_sql`], keyed by the catalog ids `SCAN` requests carry
     /// in their own header.
-    fn from_mirror(rows: &[Row]) -> Result<Self> {
+    fn from_mirror(rows: impl IntoIterator<Item = (i32, Vec<Option<String>>)>) -> Result<Self> {
         let mut out = Self::default();
         let mut position = None;
-        for row in rows {
-            let id: i32 = row.get(0);
-            let cols: Vec<Option<String>> = row.get(1);
+        for (id, cols) in rows {
             if id == MIRROR_POSITION {
                 let text = cols.first().and_then(Option::as_deref).unwrap_or(NO_REPLAY);
                 let lsn: PgLsn = text
@@ -1437,5 +1435,54 @@ mod tests {
             1,
             "non-transient must not retry",
         );
+    }
+
+    #[test]
+    fn mirror_rows_need_one_valid_position() {
+        let position = |text: &str| (MIRROR_POSITION, vec![Some(text.to_owned())]);
+        let rows = DescriptorRows::from_mirror([position("0/10")]).unwrap();
+        assert_eq!(rows.replay_lsn, 0x10);
+        for (rows, want) in [
+            (vec![position("bogus")], "mirror replay position"),
+            (
+                vec![position("0/10"), (99, Vec::new())],
+                "mirror catalog id 99",
+            ),
+            (Vec::new(), "carried no position"),
+        ] {
+            let err = DescriptorRows::from_mirror(rows).err().unwrap();
+            assert!(err.to_string().contains(want), "{err}");
+        }
+    }
+
+    #[test]
+    fn assemble_resolves_tablespace_and_rejects_duplicate_class_rows() {
+        let spaced = ClassRow {
+            reltablespace: 1700,
+            ..class_row()
+        };
+        let rows = |class| DescriptorRows {
+            class,
+            namespaces: names(&[(2200, "public")]),
+            ..DescriptorRows::default()
+        };
+        let descs = rows(vec![spaced.clone()])
+            .assemble(5, DEFAULT_TABLESPACE)
+            .unwrap();
+        assert_eq!(descs[0].rfn.spc_node, 1700);
+        let err = rows(vec![spaced.clone(), spaced])
+            .assemble(5, DEFAULT_TABLESPACE)
+            .err()
+            .unwrap();
+        assert!(
+            err.to_string().contains("two pg_class rows for oid 16384"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn odd_length_hex_rejects() {
+        assert_eq!(decode_hex("0a1"), None);
+        assert_eq!(decode_hex("0a1b"), Some(vec![0x0a, 0x1b]));
     }
 }

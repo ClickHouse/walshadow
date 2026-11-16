@@ -76,14 +76,22 @@ impl WalkState {
         self.toast_deferred
     }
 
-    /// Record a proven walk tick, then the parts it settled
-    pub async fn record(&mut self, walk: DurableWalk, barrier: &WalkBarrier) {
-        let (files, gate_deferred, toast_deferred) = walk.into_parts();
-        self.files.extend(files);
-        self.gate_deferred = gate_deferred;
-        self.toast_deferred = toast_deferred;
+    /// Record a proven walk tick, then the parts settled so far: a part can
+    /// finish draining after its last file was recorded. False when neither
+    /// changed
+    pub async fn record(&mut self, walk: Option<DurableWalk>, barrier: &WalkBarrier) -> bool {
+        let proven = walk.is_some();
+        if let Some(walk) = walk {
+            let (files, gate_deferred, toast_deferred) = walk.into_parts();
+            self.files.extend(files);
+            self.gate_deferred = gate_deferred;
+            self.toast_deferred = toast_deferred;
+        }
         let recorded = self.files.iter().cloned().collect();
-        self.parts.extend(barrier.settled_parts(&recorded).await);
+        let settled = barrier.settled_parts(&recorded).await;
+        let changed = proven || !settled.is_empty();
+        self.parts.extend(settled);
+        changed
     }
 }
 
@@ -289,5 +297,26 @@ mod tests {
         );
         BackupCheckpoint::discard(dir.path()).await.unwrap();
         assert!(BackupCheckpoint::load(dir.path()).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn checkpoint_restarts_on_garbage_and_fails_on_unreadable_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::write(dir.path().join(FILENAME), b"{")
+            .await
+            .unwrap();
+        assert!(BackupCheckpoint::load(dir.path()).await.unwrap().is_none());
+        assert!(
+            BackupCheckpoint::load(&dir.path().join(FILENAME))
+                .await
+                .is_err()
+        );
+        tokio::fs::remove_file(dir.path().join(FILENAME))
+            .await
+            .unwrap();
+        tokio::fs::create_dir(dir.path().join(FILENAME))
+            .await
+            .unwrap();
+        assert!(BackupCheckpoint::discard(dir.path()).await.is_err());
     }
 }

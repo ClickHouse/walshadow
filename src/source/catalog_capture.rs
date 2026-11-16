@@ -363,11 +363,7 @@ impl CatalogCapture {
             if last_for_oid.get(&entry.oid) != Some(&at) {
                 continue;
             }
-            let pred = self.log.predecessor_before(entry.oid, batch.captured_at);
-            let pred_desc = pred.as_ref().and_then(|p| match &p.value {
-                LogValue::Present(d) => Some(d.clone()),
-                _ => None,
-            });
+            let pred_desc = self.present_before(entry.oid, batch.captured_at);
             match &entry.value {
                 LogValue::Present(desc) => {
                     if let Some(event) = diff_event(pred_desc.as_deref(), desc) {
@@ -450,11 +446,7 @@ impl CatalogCapture {
                 // only then hits its CCI. Only the first shape seen on that
                 // generation may claim the marker; a later boundary
                 // answering from it would bury the earlier one
-                let pred = self.log.predecessor_before(desc.oid, next_lsn);
-                let pred_rfn = pred.as_ref().and_then(|p| match &p.value {
-                    LogValue::Present(d) => Some(d.rfn),
-                    _ => None,
-                });
+                let pred_rfn = self.present_before(desc.oid, next_lsn).map(|d| d.rfn);
                 let first_seen =
                     pred_rfn != Some(desc.rfn) && !self.pending.has_slots(top_xid, desc.rfn);
                 let valid_from = first_seen
@@ -488,7 +480,7 @@ impl CatalogCapture {
                 entries: Vec::new(),
             })
             .await
-            .map_err(|e| SinkError::Other(format!("descriptor log append: {e}")))
+            .map_err(SinkError::ctx("descriptor log append"))
     }
 
     async fn sql_capture(
@@ -586,11 +578,7 @@ impl CatalogCapture {
         let mut entries: Vec<Arc<LogEntry>> = Vec::new();
         let mut ambiguities: Vec<Arc<Ambiguity>> = Vec::new();
         for oid in expected {
-            let pred = self.log.predecessor_before(oid, next_lsn);
-            let pred_desc = pred.as_ref().and_then(|p| match &p.value {
-                LogValue::Present(d) => Some(d.clone()),
-                _ => None,
-            });
+            let pred_desc = self.present_before(oid, next_lsn);
             match fetched.get(&oid) {
                 Some(desc) => {
                     // Full physical identity: SET TABLESPACE changes spc
@@ -751,7 +739,7 @@ impl CatalogCapture {
         self.log
             .append_batch(batch.clone())
             .await
-            .map_err(|e| SinkError::Other(format!("descriptor log append: {e}")))?;
+            .map_err(SinkError::ctx("descriptor log append"))?;
         #[cfg(feature = "test-support")]
         crash_test::hit(crash_test::Point::AfterDescriptor, commit_lsn);
         // Events off the appended batch, the same derivation a restart runs:
@@ -763,6 +751,14 @@ impl CatalogCapture {
 
     /// Markers key physical WAL locators; descriptor rfns are resolved to
     /// physical at capture — match on full identity
+    /// Descriptor `oid` held just before `lsn`, `None` once dropped or retired
+    fn present_before(&self, oid: Oid, lsn: u64) -> Option<Arc<RelDescriptor>> {
+        match &self.log.predecessor_before(oid, lsn)?.value {
+            LogValue::Present(d) => Some(d.clone()),
+            LogValue::Dropped | LogValue::Retired => None,
+        }
+    }
+
     fn marker_for(&self, rfn: RelFileNode) -> Option<u64> {
         self.markers.lock().expect("smgr markers poisoned").get(rfn)
     }

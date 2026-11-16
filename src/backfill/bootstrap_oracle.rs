@@ -581,6 +581,24 @@ mod tests {
     };
     use crate::table_rules::MatchKind;
 
+    #[test]
+    fn present_sockets_counts_each_worker_socket() {
+        let tmp = tempfile::tempdir().unwrap();
+        for name in ["walshadow-bridge.sock", "walshadow-bridge.sock.2"] {
+            std::fs::write(tmp.path().join(name), b"").unwrap();
+        }
+        assert_eq!(present_sockets(tmp.path(), 3), 2);
+        assert_eq!(present_sockets(tmp.path(), 1), 1);
+    }
+
+    #[test]
+    fn copy_fields_splits_one_row_and_checks_its_width() {
+        assert_eq!(copy_fields(b"a\tb\n", 2).unwrap(), [b"a".as_slice(), b"b"]);
+        let err = copy_fields(b"a\n", 2).unwrap_err();
+        assert_eq!(err.to_string(), "COPY row has 1 fields, expected 2");
+        assert!(copy_fields(b"a", 1).is_err());
+    }
+
     fn attr(attnum: i16, name: &str, type_oid: u32, type_name: &str, type_len: i16) -> RelAttr {
         RelAttr {
             attnum,

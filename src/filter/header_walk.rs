@@ -112,3 +112,59 @@ fn image_header(c: &mut &[u8], page_magic: u16) -> Option<u16> {
     };
     (hole_ok && length_ok).then_some(h.image_length)
 }
+
+#[cfg(test)]
+mod tests {
+    use walrus::pg::walparser::{XLP_PAGE_MAGIC_PG15, XLogRecordHeader};
+
+    use super::*;
+
+    const BKP_IMAGE_HAS_HOLE: u8 = 0x01;
+    const BKP_IMAGE_COMPRESS_PGLZ: u8 = 0x04;
+
+    fn walk_body(body: &[u8]) -> Option<XLogRecord<'static>> {
+        let mut bytes = vec![0; X_LOG_RECORD_HEADER_SIZE];
+        bytes.extend_from_slice(body);
+        let header = XLogRecordHeader {
+            total_record_length: bytes.len() as u32,
+            ..Default::default()
+        };
+        walk(header, &bytes, XLP_PAGE_MAGIC_PG15, |_| true)
+    }
+
+    /// Block 0 carrying only a 4-byte image whose header ends in `image`
+    fn image_block(image: &[u8]) -> Vec<u8> {
+        let mut body = vec![0, BKP_BLOCK_HAS_IMAGE, 0, 0, 4, 0];
+        body.extend_from_slice(image);
+        body.extend_from_slice(&[0; 16]);
+        body.extend_from_slice(&[0xAA; 4]);
+        body
+    }
+
+    #[test]
+    fn origin_rides_the_header() {
+        assert_eq!(walk_body(&[253, 0x34, 0x12]).unwrap().origin, 0x1234);
+    }
+
+    #[test]
+    fn malformed_block_references_reject() {
+        // Data flag without length, unknown id, out-of-order ids
+        assert!(walk_body(&[0, BKPBLOCK_HAS_DATA, 0, 0]).is_none());
+        assert!(walk_body(&[200]).is_none());
+        let once = image_block(&[0, 0, BKP_IMAGE_COMPRESS_PGLZ]);
+        assert!(walk_body(&once).is_some());
+        let header = &once[..once.len() - 4];
+        let twice = [header, header, &[0xAA; 8]].concat();
+        assert!(walk_body(&twice).is_none());
+    }
+
+    #[test]
+    fn compressed_images_take_hole_length_only_with_a_hole() {
+        let holed = [8, 0, BKP_IMAGE_HAS_HOLE | BKP_IMAGE_COMPRESS_PGLZ, 16, 0];
+        assert!(walk_body(&image_block(&holed)).is_some());
+        assert!(walk_body(&image_block(&[0, 0, BKP_IMAGE_COMPRESS_PGLZ])).is_some());
+        // Hole flag with zero hole length
+        let empty_hole = [8, 0, BKP_IMAGE_HAS_HOLE | BKP_IMAGE_COMPRESS_PGLZ, 0, 0];
+        assert!(walk_body(&image_block(&empty_hole)).is_none());
+    }
+}

@@ -1317,6 +1317,65 @@ mod tests {
         let mut tally = PageWalkTally::default();
         let err = walker.walk_page(&page, 0, &mut out, &mut tally);
         assert!(matches!(err, Err(PageWalkError::BadPageHeader { .. })));
+        let err = walker.walk_page(&page[..8], 0, &mut out, &mut tally);
+        assert!(matches!(
+            err,
+            Err(PageWalkError::BadPageHeader {
+                lower: 0,
+                upper: 0,
+                ..
+            })
+        ));
+    }
+
+    fn set_slot(page: &mut [u8], slot: usize, lp_off: usize, lp_len: usize) {
+        let raw = (lp_off as u32 & 0x7FFF) | ((LP_NORMAL as u32) << 15) | ((lp_len as u32) << 17);
+        let at = SIZE_OF_PAGE_HEADER + slot * SIZE_OF_ITEM_ID;
+        page[at..at + SIZE_OF_ITEM_ID].copy_from_slice(&raw.to_le_bytes());
+    }
+
+    #[test]
+    fn page_walker_counts_unreadable_slots_as_truncated() {
+        let rel = make_rel();
+        let walker = PageWalker::new(&rel, 0);
+        let mut page = synth_single_tuple_page(7);
+        let tuple_off = PAGE_BYTES - 32;
+        // Past page end, shorter than a tuple header, then zeroed t_hoff
+        set_slot(&mut page, 1, tuple_off, 64);
+        set_slot(&mut page, 2, tuple_off, 10);
+        set_slot(&mut page, 3, 512, 32);
+        page[12..14]
+            .copy_from_slice(&((SIZE_OF_PAGE_HEADER + 4 * SIZE_OF_ITEM_ID) as u16).to_le_bytes());
+        let mut out = Vec::new();
+        let mut tally = PageWalkTally::default();
+        walker.walk_page(&page, 0, &mut out, &mut tally).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(tally.tuples_skipped_truncated, 3);
+    }
+
+    #[test]
+    fn page_helpers_read_nothing_from_a_short_page() {
+        let short = [0u8; 8];
+        assert_eq!(page_tuple_bytes(&short, 1), None);
+        assert_eq!(page_max_offnum(&short), 0);
+        assert_eq!(page_pd_lsn(&short), 0);
+    }
+
+    #[test]
+    fn toast_rows_from_page_skips_undecodable_and_non_chunk_tuples() {
+        let rel = toast_chunk_rel();
+        let mut page = synth_toast_chunk_page(&[(7, 0, b"first"), (8, 0, b"second")], 0x9000);
+        // t_hoff below the tuple header
+        let raw = u32::from_le_bytes(
+            page[SIZE_OF_PAGE_HEADER..SIZE_OF_PAGE_HEADER + 4]
+                .try_into()
+                .unwrap(),
+        );
+        page[(raw & 0x7FFF) as usize + 22] = 0;
+        let rows = toast_rows_from_page(&page, &rel, 0, 0x9000);
+        assert_eq!(rows.iter().map(|r| r.chunk_id).collect::<Vec<_>>(), [8]);
+        let heap = synth_single_tuple_page(7);
+        assert!(toast_rows_from_page(&heap, &make_rel(), 0, 0x9000).is_empty());
     }
 
     #[test]
@@ -1374,6 +1433,53 @@ mod tests {
         assert_eq!(ld(&sink.stats.files_walked), 1);
         assert_eq!(ld(&sink.stats.pages_walked), 1);
         assert_eq!(ld(&sink.stats.tuples_emitted), 1);
+    }
+
+    #[tokio::test]
+    async fn pagewalk_sink_fails_once_the_walk_channel_closes() {
+        let mut catalog = CatalogMap::new();
+        catalog.insert(Arc::new(make_rel()));
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+        let barrier = Arc::new(WalkBarrier::default());
+        let sink = PageWalkSink::new(catalog, tx, false).with_resume(
+            barrier,
+            HashSet::default(),
+            HashSet::default(),
+        );
+        // Empty page ships nothing, so only the end-of-file marker fails
+        let mut entry = tap(&sink, &heap_meta("base/5/16400")).await;
+        entry.chunk(vec![0u8; PAGE_BYTES]).await.unwrap();
+        assert!(entry.end().await.is_err());
+        let mut entry = tap(&sink, &heap_meta("base/5/16400.1")).await;
+        entry
+            .chunk(synth_single_tuple_page(1).to_vec())
+            .await
+            .unwrap();
+        let err = entry.end().await.unwrap_err();
+        assert!(err.to_string().contains("emitter channel closed"), "{err}");
+    }
+
+    /// A TOAST heap the store does not consume is counted, never decoded;
+    /// a misframed heap page is skipped, not fatal
+    #[tokio::test]
+    async fn pagewalk_sink_counts_unstored_toast_and_skips_misframed_pages() {
+        let mut catalog = CatalogMap::new();
+        catalog.insert(Arc::new(make_rel()));
+        catalog.insert(Arc::new(toast_chunk_rel()));
+        let sink = PageWalkSink::new_capturing(catalog);
+        let mut entry = tap(&sink, &heap_meta("base/5/16401")).await;
+        let page = synth_toast_chunk_page(&[(7, 0, b"first")], 0x9000);
+        entry.chunk(page.to_vec()).await.unwrap();
+        entry.end().await.unwrap();
+        let mut misframed = [0u8; PAGE_BYTES];
+        misframed[12..14].copy_from_slice(&(PAGE_BYTES as u16).to_le_bytes());
+        let mut entry = tap(&sink, &heap_meta("base/5/16400")).await;
+        entry.chunk(misframed.to_vec()).await.unwrap();
+        entry.end().await.unwrap();
+        assert!(sink.captured().is_empty());
+        assert_eq!(ld(&sink.stats.toast_files_observed), 1);
+        assert_eq!(ld(&sink.stats.pages_walked), 1);
     }
 
     /// `.N` segment tuples get global block numbers: same local page +
@@ -1715,15 +1821,18 @@ mod tests {
 
         // Each tuple carries its own file's rfn + value; a shared slot
         // would attribute both to rel B
-        let captured = sink.captured();
-        let mut by_rel: HashMap<Oid, i32> = HashMap::new();
-        for t in &captured {
-            if let Some(Some(ColumnValue::Int4(v))) = t.columns.first() {
-                by_rel.insert(t.rfn.rel_node, *v);
-            }
-        }
-        assert_eq!(captured.len(), 2);
-        assert_eq!(by_rel.get(&16400), Some(&100), "entry A decoded vs rel A");
-        assert_eq!(by_rel.get(&16401), Some(&200), "entry B decoded vs rel B");
+        let mut by_rel: Vec<_> = sink
+            .captured()
+            .into_iter()
+            .map(|t| (t.rfn.rel_node, t.columns))
+            .collect();
+        by_rel.sort_by_key(|(rel_node, _)| *rel_node);
+        assert_eq!(
+            by_rel,
+            [
+                (16400, vec![Some(ColumnValue::Int4(100))]),
+                (16401, vec![Some(ColumnValue::Int4(200))]),
+            ]
+        );
     }
 }

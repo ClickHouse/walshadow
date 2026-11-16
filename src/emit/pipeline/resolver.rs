@@ -164,7 +164,7 @@ async fn resolve_oracle(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::decode::heap_decoder::{
         ColumnValue, CommittedTuple, DecodedHeap, DecodedTuple, HeapOp,
@@ -182,7 +182,7 @@ mod tests {
 
     /// An oracle-routed column the local matrix does not cover, rendered by
     /// the daemon: the shape a PostGIS 2-D point takes
-    const GEOM_OID: u32 = 999_999;
+    pub(crate) const GEOM_OID: u32 = 999_999;
 
     fn wkt_table() -> RowTable {
         let rel = Arc::new(RelDescriptor {
@@ -231,7 +231,7 @@ mod tests {
         RowTable { rel, route }
     }
 
-    fn wkt_row(seq: u64, text: Option<&str>) -> RoutedRow {
+    pub(crate) fn wkt_row(seq: u64, text: Option<&str>) -> RoutedRow {
         RoutedRow {
             seq,
             table: 0,
@@ -261,7 +261,7 @@ mod tests {
     /// One batch of the rows, sealed through the real batcher: `InsertBatch`
     /// is only reachable that way, and its cell tags are what the encoder
     /// chose rather than what a test asserted
-    async fn seal(rows: Vec<RoutedRow>) -> InsertBatch {
+    pub(crate) async fn seal(rows: Vec<RoutedRow>) -> InsertBatch {
         let (msg_tx, msg_rx) = mpsc::channel(64);
         let (batches_tx, batches_rx) = async_channel::bounded(64);
         let fatal = Fatal::new();
@@ -367,5 +367,39 @@ mod tests {
             resolve_oracle(&None, Allocator::global(&mimalloc::MiMalloc), &batch).await,
             Err(OracleError::Absent(_)),
         ));
+    }
+
+    async fn run_one(batch: InsertBatch, output_open: bool) -> Fatal {
+        let fatal = Fatal::new();
+        let opts = ResolverOptions {
+            oracle: None,
+            retry: RetryConfig::default(),
+            stats: Arc::default(),
+            fatal: fatal.clone(),
+            config_rx: None,
+        };
+        let (in_tx, in_rx) = async_channel::bounded(1);
+        let (out_tx, out_rx) = async_channel::bounded(1);
+        if !output_open {
+            drop(out_rx);
+        }
+        in_tx.send(batch).await.unwrap();
+        run(in_rx, out_tx, opts).await;
+        fatal
+    }
+
+    /// Resolver exits on a missing oracle (fatal) or a closed output (quiet)
+    #[tokio::test]
+    async fn resolver_exits_on_oracle_failure_or_closed_output() {
+        let mut raw = wkt_row(0, None);
+        raw.committed.decoded.new.as_mut().unwrap().columns[0] = Some(ColumnValue::Unsupported {
+            type_oid: GEOM_OID,
+            raw: vec![1],
+        });
+        let fatal = run_one(seal(vec![raw]).await, true).await;
+        let msg = fatal.message().expect("missing oracle trips fatal");
+        assert!(msg.starts_with("oracle resolve: "), "{msg}");
+        let fatal = run_one(seal(vec![wkt_row(0, Some("POINT(1 2)"))]).await, false).await;
+        assert!(fatal.message().is_none());
     }
 }

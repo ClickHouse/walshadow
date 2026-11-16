@@ -148,26 +148,126 @@ mod tests {
         assert!(format!("{err:#}").contains("open input"), "{err:#}");
     }
 
+    async fn run_err(input: Vec<PathBuf>, out_dir: PathBuf) -> String {
+        let args = Args {
+            input,
+            out_dir,
+            quiet: true,
+        };
+        format!("{:#}", run(args).await.unwrap_err())
+    }
+
+    #[tokio::test]
+    async fn run_rejects_unusable_inputs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("out");
+        let file = tmp.path().join("file");
+        std::fs::write(&file, b"").unwrap();
+        let err = run_err(vec![file.clone()], file.join("out")).await;
+        assert!(err.contains("create out-dir"), "{err}");
+
+        let dir = tmp.path().join("000000010000000000000002");
+        std::fs::create_dir(&dir).unwrap();
+        let err = run_err(vec![dir], out.clone()).await;
+        assert!(err.contains("read input"), "{err}");
+
+        let short = tmp.path().join("short/000000010000000000000002");
+        std::fs::create_dir(short.parent().unwrap()).unwrap();
+        std::fs::write(&short, [0u8; 8]).unwrap();
+        let err = run_err(vec![short.clone()], out.clone()).await;
+        assert!(err.contains("no long page header"), "{err}");
+
+        let mut oversized = vec![0u8; 64];
+        oversized[32..36].copy_from_slice(&16u32.to_le_bytes());
+        std::fs::write(&short, oversized).unwrap();
+        let err = run_err(vec![short], out).await;
+        assert!(err.contains("64 bytes against segment size 16"), "{err}");
+    }
+
+    /// Decompressed fixture bytes written under `name` in `dir`
+    async fn raw_copy(fixture: &std::path::Path, dir: &std::path::Path, name: &str) -> PathBuf {
+        let (_, mut r) = open_segment_file(fixture).await.unwrap();
+        let mut bytes = Vec::new();
+        r.read_to_end(&mut bytes).await.unwrap();
+        let path = dir.join(name);
+        std::fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    fn fixture_path(name: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!("fixtures/wal/{name}.zst"))
+    }
+
     #[tokio::test]
     async fn run_filters_fixture_and_writes_segment() {
-        let seg = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("fixtures/wal/xlog_switch/segments/000000010000000000000002.zst");
-        if !tools::fixture(&seg) {
-            return;
+        let seg = fixture_path("xlog_switch/segments/000000010000000000000002");
+        if tools::fixture(&seg) {
+            let tmp = tempfile::tempdir().unwrap();
+            let out_dir = tmp.path().join("out");
+            run(Args {
+                input: vec![seg],
+                out_dir: out_dir.clone(),
+                quiet: false,
+            })
+            .await
+            .expect("run");
+            let names: Vec<_> = std::fs::read_dir(&out_dir)
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .collect();
+            assert_eq!(names, ["000000010000000000000002"]);
         }
+    }
+
+    #[tokio::test]
+    async fn run_rejects_inputs_that_do_not_continue_first() {
+        let seg = fixture_path("xlog_switch/segments/000000010000000000000002");
+        if tools::fixture(&seg) {
+            let tmp = tempfile::tempdir().unwrap();
+            let out = tmp.path().join("out");
+            let other_tli = raw_copy(&seg, tmp.path(), "000000020000000000000003").await;
+            let err = run_err(vec![seg.clone(), other_tli], out.clone()).await;
+            assert!(err.contains("timeline or segment size differs"), "{err}");
+            let gap = raw_copy(&seg, tmp.path(), "000000010000000000000004").await;
+            let err = run_err(vec![seg, gap], out).await;
+            assert!(
+                err.contains("filter ") && err.contains("000000010000000000000004"),
+                "{err}"
+            );
+        }
+    }
+
+    /// One-page segment whose only record claims more bytes than the page holds
+    fn spanning_segment() -> Vec<u8> {
+        use walrus::pg::walparser::{RmId, WAL_PAGE_SIZE, XLP_LONG_HEADER, XLP_PAGE_MAGIC_PG15};
+        let mut page = Vec::new();
+        page.extend_from_slice(&XLP_PAGE_MAGIC_PG15.to_le_bytes());
+        page.extend_from_slice(&XLP_LONG_HEADER.to_le_bytes());
+        page.extend_from_slice(&1u32.to_le_bytes());
+        page.extend_from_slice(&[0; 16]);
+        page.extend_from_slice(&12345u64.to_le_bytes());
+        page.extend_from_slice(&u32::from(WAL_PAGE_SIZE).to_le_bytes());
+        page.extend_from_slice(&u32::from(WAL_PAGE_SIZE).to_le_bytes());
+        page.extend_from_slice(&(2 * u32::from(WAL_PAGE_SIZE)).to_le_bytes());
+        page.extend_from_slice(&[0; 12]);
+        page.extend_from_slice(&[0, RmId::Xact as u8, 0, 0]);
+        page.resize(WAL_PAGE_SIZE as usize, 0xAA);
+        page
+    }
+
+    #[tokio::test]
+    async fn run_holds_back_segment_whose_last_record_continues() {
         let tmp = tempfile::tempdir().unwrap();
+        let seg = tmp.path().join("000000010000000000000000");
+        std::fs::write(&seg, spanning_segment()).unwrap();
         let out_dir = tmp.path().join("out");
         run(Args {
             input: vec![seg],
             out_dir: out_dir.clone(),
-            quiet: false,
+            quiet: true,
         })
         .await
         .expect("run");
-        let names: Vec<_> = std::fs::read_dir(&out_dir)
-            .unwrap()
-            .map(|e| e.unwrap().file_name())
-            .collect();
-        assert_eq!(names, ["000000010000000000000002"]);
+        assert_eq!(std::fs::read_dir(&out_dir).unwrap().count(), 0);
     }
 }

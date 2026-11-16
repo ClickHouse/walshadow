@@ -44,7 +44,7 @@ use crate::record::{RecordSink, SegmentSink};
 use crate::source::archive::Archive;
 use crate::source::shadow_stream::ShadowStreamState;
 use crate::source::source_feed::{SlotError, SourceEvent, SourceFeed, StandbyStatus};
-use crate::source::timeline::{HistoryError, TimelineHistory, history_filename};
+use crate::source::timeline::{HistoryEntry, HistoryError, TimelineHistory, history_filename};
 use crate::source::wal_stream::{ForkPrefix, WalStream, WalStreamError};
 
 /// `reason=` label order of [`TimelineStats::failures_by_reason`].
@@ -494,7 +494,8 @@ impl Switchover<'_> {
             .ok_or_else(not_descendant)?;
         let next_tli = live_history
             .successor_of(finished_tli)
-            .ok_or_else(not_descendant)?;
+            .ok_or_else(not_descendant)?
+            .tli;
         // The walsender stops exactly at the switchpoint, so a frontier above
         // it means bytes were read that the descendant branch never had
         if stream.next_lsn().get() > switch_lsn {
@@ -1045,12 +1046,13 @@ pub async fn seed_shadow_branches(
     }
     while state.timeline < through {
         let finished = state.timeline;
-        let next = history
+        let &HistoryEntry {
+            tli: next,
+            begin: switch_lsn,
+            ..
+        } = history
             .successor_of(finished)
             .with_context(|| format!("timeline {finished} has no successor in the chain"))?;
-        let switch_lsn = history
-            .begin_of(next)
-            .with_context(|| format!("timeline {next} has no switchpoint in the chain"))?;
         let raw = branch_history(history, next)?;
         persist_history(out_dir, next, &raw).await?;
         state.advertise_timeline(next, switch_lsn, raw);
@@ -1068,6 +1070,10 @@ pub async fn seed_shadow_branches(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::record::{CollectingRecordSink, CollectingSegmentSink, RecordBytesSink};
+    use crate::source::shadow_stream::ShadowStreamSink;
+    use crate::source::shadow_stream::fake_source::{self, FakeSource};
+    use crate::source::source_feed::is_wal_segment_removed;
 
     #[tokio::test]
     async fn seed_ancestor_histories_without_source_files() {
@@ -1415,5 +1421,462 @@ mod tests {
         assert!(c.due(now + std::time::Duration::from_secs(3)));
         c.connected();
         assert!(!c.awaiting_connection());
+    }
+
+    const SID: u64 = 7;
+    const H2: &[u8] = b"1\t0/100\tpromoted\n";
+    const H3: &[u8] = b"1\t0/1000000\tfirst\n2\t0/3000000\tsecond\n";
+
+    /// Source on `tli`, with `chunk` at 0 and then a fork to `fork` if given
+    async fn source(tli: u32, chunk: &[u8], fork: Option<(u32, u64, &[u8])>) -> FakeSource {
+        let source =
+            fake_source::serve(ShadowStreamState::new(tli, SID.to_string(), 0, 1 << 20)).await;
+        let mut sink = ShadowStreamSink::new(source.state.clone());
+        sink.on_wire_chunk(0, chunk).await.unwrap();
+        if let Some((next, at, raw)) = fork {
+            source
+                .state
+                .lock()
+                .await
+                .advertise_timeline(next, at, raw.to_vec());
+        }
+        source
+    }
+
+    struct Rig {
+        out: tempfile::TempDir,
+        shadow: Arc<Mutex<ShadowStreamState>>,
+        stats: TimelineStats,
+    }
+
+    impl Rig {
+        fn new() -> Self {
+            Self {
+                out: tempfile::tempdir().unwrap(),
+                shadow: Arc::new(Mutex::new(ShadowStreamState::new(
+                    1,
+                    SID.to_string(),
+                    0,
+                    1 << 20,
+                ))),
+                stats: TimelineStats::default(),
+            }
+        }
+
+        async fn probe(
+            &mut self,
+            source: &FakeSource,
+            system_id: u64,
+            stream: &WalStream,
+            branch_begin: u64,
+        ) -> Result<ForkPoint, TransitionError> {
+            let mut feed = SourceFeed::connect(&source.cfg).await.unwrap();
+            let sw = Switchover {
+                system_id,
+                out_dir: self.out.path(),
+                shadow_state: &self.shadow,
+                backup: None,
+            };
+            sw.probe(&mut feed, stream, branch_begin, &mut self.stats)
+                .await
+        }
+
+        fn failures(&self, reason: &str) -> u64 {
+            let at = SWITCH_FAILURE_REASONS.iter().position(|r| *r == reason);
+            self.stats.failures_by_reason[at.unwrap()]
+        }
+    }
+
+    fn stream_at(tli: u32, lsn: u64) -> WalStream {
+        WalStream::new(tli, SEG, Pos::new(lsn)).unwrap()
+    }
+
+    #[tokio::test]
+    async fn probe_proves_lineage_against_the_source() {
+        let mut rig = Rig::new();
+        let flat = source(1, b"", None).await;
+        let e = rig.probe(&flat, SID + 1, &stream_at(1, 0), 0).await;
+        assert!(matches!(
+            e,
+            Err(TransitionError::ForeignSystem { stored: 8, live: 7 })
+        ));
+        let e = rig.probe(&flat, SID, &stream_at(1, 0), 0).await;
+        assert!(matches!(
+            e,
+            Err(TransitionError::NotDescendant {
+                finished: 1,
+                live: 1
+            })
+        ));
+
+        let forked = source(2, b"", Some((3, 0x300_0000, H3))).await;
+        let e = rig.probe(&forked, SID, &stream_at(1, 0), 0).await;
+        assert!(matches!(e, Err(TransitionError::HistoryMissing { tli: 2 })));
+        let e = rig.probe(&forked, SID, &stream_at(2, 0), 0x500_0000).await;
+        assert!(matches!(
+            e,
+            Err(TransitionError::SiblingBranch { tli: 2, .. })
+        ));
+        let e = rig.probe(&forked, SID, &stream_at(2, 0x400_0000), 0).await;
+        assert!(matches!(
+            e,
+            Err(TransitionError::ResumePastFork {
+                switch_lsn: 0x300_0000,
+                ..
+            })
+        ));
+        let fork = rig
+            .probe(&forked, SID, &stream_at(2, 0x300_0000), 0x100_0000)
+            .await
+            .unwrap();
+        assert_eq!(
+            (fork.next_tli, fork.live_tli, fork.switch_lsn),
+            (3, 3, 0x300_0000)
+        );
+
+        let skipped = source(2, b"", Some((3, 0x300_0000, b"1\t0/1000000\tfirst\n"))).await;
+        let e = rig.probe(&skipped, SID, &stream_at(2, 0), 0).await;
+        assert!(
+            matches!(
+                e,
+                Err(TransitionError::NotDescendant {
+                    finished: 2,
+                    live: 3
+                })
+            ),
+            "timeline 3 forked off 1, not off 2",
+        );
+        let garbled = source(2, b"", Some((3, 0x300_0000, b"two\t0/1\n"))).await;
+        let e = rig.probe(&garbled, SID, &stream_at(2, 0), 0).await;
+        assert!(matches!(
+            e,
+            Err(TransitionError::HistoryMalformed { tli: 3, .. })
+        ));
+
+        assert_eq!(rig.failures("timeline_not_descendant"), 2);
+        assert_eq!(rig.failures("foreign_system_id"), 1);
+        assert_eq!(rig.failures("history_missing"), 1);
+        assert_eq!(rig.failures("history_malformed"), 1);
+    }
+
+    fn fork_to_2(switch_lsn: u64) -> ForkPoint {
+        ForkPoint {
+            finished_tli: 1,
+            next_tli: 2,
+            live_tli: 2,
+            switch_lsn,
+            histories: vec![TimelineHistory::parse(2, H2).unwrap()],
+        }
+    }
+
+    const CLEAN: ForkGuards = ForkGuards {
+        drain_lsn: Pos::ZERO,
+        open_xacts: 0,
+    };
+
+    /// Ancestor read through `through` zero bytes, ending where `fork` does
+    async fn ancestor(through: usize) -> WalStream {
+        let mut stream = stream_at(1, 0);
+        let (mut rec, mut seg) = (
+            CollectingRecordSink::default(),
+            CollectingSegmentSink::default(),
+        );
+        stream
+            .push(0, &vec![0; through], &mut rec, &mut seg)
+            .await
+            .unwrap();
+        stream
+    }
+
+    impl Rig {
+        async fn cross(
+            &mut self,
+            source: &FakeSource,
+            slot: Option<&str>,
+            stream: &mut WalStream,
+            guards: ForkGuards,
+            fork: &ForkPoint,
+        ) -> (Result<Crossing, TransitionError>, Option<ForkResume>) {
+            let mut feed = SourceFeed::connect(&source.cfg).await.unwrap();
+            let (mut rec, mut seg) = (
+                CollectingRecordSink::default(),
+                CollectingSegmentSink::default(),
+            );
+            let mut committed = None;
+            let open = BarrierOpen {
+                switch_lsn: Pos::new(fork.switch_lsn),
+            };
+            let sw = Switchover {
+                system_id: SID,
+                out_dir: self.out.path(),
+                shadow_state: &self.shadow,
+                backup: None,
+            };
+            let out = sw
+                .cross(
+                    &mut feed,
+                    slot,
+                    stream,
+                    &mut rec,
+                    &mut seg,
+                    StandbyStatus::default(),
+                    guards,
+                    fork,
+                    open,
+                    async |resume| {
+                        committed = Some(resume);
+                        Ok(())
+                    },
+                    &mut self.stats,
+                )
+                .await;
+            (out, committed)
+        }
+    }
+
+    #[tokio::test]
+    async fn cross_verifies_the_repeated_prefix_before_committing() {
+        let mut rig = Rig::new();
+        let live = source(1, &[0; 0x180], Some((2, 0x100, H2))).await;
+        let mut stream = ancestor(0x100).await;
+        let fork = fork_to_2(0x100);
+
+        let guards = ForkGuards {
+            drain_lsn: Pos::new(0x101),
+            ..CLEAN
+        };
+        let (e, _) = rig.cross(&live, None, &mut stream, guards, &fork).await;
+        assert!(matches!(
+            e,
+            Err(TransitionError::PublishedPastFork {
+                drain_lsn: 0x101,
+                ..
+            })
+        ));
+        let guards = ForkGuards {
+            open_xacts: 1,
+            ..CLEAN
+        };
+        let (e, _) = rig.cross(&live, None, &mut stream, guards, &fork).await;
+        assert!(matches!(
+            e,
+            Err(TransitionError::OpenXactAtFork { open_xacts: 1, .. })
+        ));
+        let (e, _) = rig
+            .cross(&live, None, &mut ancestor(0x80).await, CLEAN, &fork)
+            .await;
+        assert!(matches!(
+            e,
+            Err(TransitionError::PrefixNotRetained { from: 0, to: 0x100 })
+        ));
+        let (e, committed) = rig.cross(&live, Some("s"), &mut stream, CLEAN, &fork).await;
+        assert!(matches!(&e, Err(e @ TransitionError::Slot(SlotError::Query(_))) if e.retryable()));
+        assert!(committed.is_none());
+
+        let (crossing, committed) = rig.cross(&live, None, &mut stream, CLEAN, &fork).await;
+        let crossing = crossing.unwrap();
+        assert_eq!(
+            (crossing.prefix_bytes, crossing.prefix_origin),
+            (0x100, PrefixOrigin::Live)
+        );
+        let resume = committed.unwrap();
+        assert_eq!(
+            (resume.timeline(), resume.floor(), resume.switch_lsn().get()),
+            (2, Pos::ZERO, 0x100)
+        );
+        assert_eq!((stream.timeline(), stream.next_lsn().get()), (2, 0x180));
+        assert_eq!(rig.shadow.lock().await.timeline, 2);
+        let written = tokio::fs::read(rig.out.path().join(history_filename(2))).await;
+        assert_eq!(written.unwrap(), H2);
+        assert_eq!(rig.stats.switches, 1);
+
+        let exact = source(1, &[0; 0x100], Some((2, 0x100, H2))).await;
+        let mut stream = ancestor(0x100).await;
+        let (crossing, _) = rig.cross(&exact, None, &mut stream, CLEAN, &fork).await;
+        assert_eq!(crossing.map(|c| c.prefix_bytes).ok(), Some(0x100));
+        assert_eq!(
+            stream.next_lsn().get(),
+            0x100,
+            "nothing past the fork to adopt"
+        );
+    }
+
+    /// Walsender answering `START_REPLICATION` with one WAL frame at `lsn`
+    fn misplaced_source(lsn: u64) -> (tempfile::TempDir, walrus::pg::replication::conn::PgConfig) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let dir = tempfile::tempdir().unwrap();
+        let listener = tokio::net::UnixListener::bind(dir.path().join(".s.PGSQL.5432")).unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let len = sock.read_u32().await.unwrap() as usize;
+            sock.read_exact(&mut vec![0; len - 4]).await.unwrap();
+            let startup = b"R\0\0\0\x08\0\0\0\0S\0\0\0\x18server_version\x0016.3\0Z\0\0\0\x05I";
+            sock.write_all(startup).await.unwrap();
+            assert_eq!(sock.read_u8().await.unwrap(), b'Q');
+            let len = sock.read_u32().await.unwrap() as usize;
+            sock.read_exact(&mut vec![0; len - 4]).await.unwrap();
+            let mut frame = b"W\0\0\0\x07\0\0\0d\0\0\0\x2dw".to_vec();
+            frame.extend_from_slice(&lsn.to_be_bytes());
+            frame.extend_from_slice(&[0; 16]);
+            frame.extend_from_slice(&[0; 0x10]);
+            sock.write_all(&frame).await.unwrap();
+        });
+        let cfg = walrus::pg::replication::conn::PgConfig {
+            host: dir.path().display().to_string(),
+            port: 5432,
+            user: "test".into(),
+            password: None,
+            database: "test".into(),
+            application_name: "misplaced".into(),
+            sslmode: walrus::pg::replication::tls::SslMode::Disable,
+            tls: Default::default(),
+        };
+        (dir, cfg)
+    }
+
+    #[tokio::test]
+    async fn cross_refuses_a_descendant_that_cannot_repeat_the_prefix() {
+        let mut rig = Rig::new();
+        let fork = fork_to_2(0x100);
+        let short = source(2, &[0; 0x80], Some((3, 0x80, H3))).await;
+        let (e, committed) = rig
+            .cross(&short, None, &mut ancestor(0x100).await, CLEAN, &fork)
+            .await;
+        assert!(matches!(
+            e,
+            Err(TransitionError::PrefixTruncated { lsn: 0x80 })
+        ));
+        assert!(committed.is_none());
+
+        let recycled =
+            fake_source::serve(ShadowStreamState::new(2, SID.to_string(), SEG, 1 << 20)).await;
+        let (e, _) = rig
+            .cross(&recycled, None, &mut ancestor(0x100).await, CLEAN, &fork)
+            .await;
+        assert!(
+            matches!(&e, Err(TransitionError::Source(inner)) if is_wal_segment_removed(inner)),
+            "{e:?}",
+        );
+        assert_eq!(rig.failures("fork_prefix_mismatch"), 1);
+
+        let (_dir, cfg) = misplaced_source(0x40);
+        let mut feed = SourceFeed::connect(&cfg).await.unwrap();
+        let sw = Switchover {
+            system_id: SID,
+            out_dir: rig.out.path(),
+            shadow_state: &rig.shadow,
+            backup: None,
+        };
+        let ancestor = ancestor(0x100).await.fork_prefix();
+        feed.start_physical_replication(None, 0, 2).await.unwrap();
+        let e = sw.verify_prefix(&mut feed, 0x100, StandbyStatus::default(), ancestor);
+        assert!(matches!(
+            e.await,
+            Err(TransitionError::PrefixNotRetained { from: 0, to: 0x40 })
+        ));
+    }
+
+    #[tokio::test]
+    async fn boot_history_needs_proof_only_for_a_changed_branch() {
+        let unproved = source(2, b"", None).await;
+        let mut feed = SourceFeed::connect(&unproved.cfg).await.unwrap();
+        assert!(source_history(&mut feed, 1).await.unwrap().is_none());
+        let root = load_boot_history(&mut feed, 2, 2).await.unwrap();
+        assert_eq!(root, TimelineHistory::root(2));
+        let e = load_boot_history(&mut feed, 2, 1).await.unwrap_err();
+        assert!(e.to_string().starts_with("history_missing"), "{e:#}");
+    }
+
+    #[tokio::test]
+    async fn seeding_refuses_a_chain_short_of_the_floor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = ShadowStreamState::new(2, "123".into(), 0, 1024);
+        let unproved = TimelineHistory::root(2);
+        seed_shadow_branches(&mut state, &unproved, tmp.path(), 2)
+            .await
+            .unwrap();
+        assert!(state.identity().histories.is_empty(), "nothing to serve");
+        let e = seed_shadow_branches(&mut state, &unproved, tmp.path(), 3)
+            .await
+            .unwrap_err();
+        assert_eq!(e.to_string(), "timeline 2 has no successor in the chain");
+
+        let history = TimelineHistory::parse(4, b"2\t0/1000000\tx\n3\t0/2000000\tx\n").unwrap();
+        let mut boot = ShadowStreamState::new(2, "123".into(), 0, 1024);
+        let e = seed_shadow_branches(&mut boot, &history, tmp.path(), 2)
+            .await
+            .unwrap_err();
+        assert_eq!(e.to_string(), "history_missing: timeline 2");
+    }
+
+    #[tokio::test]
+    async fn seeding_surfaces_where_history_could_not_land() {
+        let tmp = tempfile::tempdir().unwrap();
+        let history = TimelineHistory::parse(3, H3).unwrap();
+        let file = tmp.path().join("file");
+        std::fs::write(&file, b"").unwrap();
+        let mut state = ShadowStreamState::new(2, "123".into(), 0, 1024);
+        let e = seed_shadow_branches(&mut state, &history, &file, 3)
+            .await
+            .unwrap_err();
+        assert!(e.to_string().starts_with("create filtered dir"), "{e:#}");
+        std::fs::create_dir_all(tmp.path().join(history_filename(2)).join("taken")).unwrap();
+        let e = seed_shadow_branches(&mut state, &history, tmp.path(), 3)
+            .await
+            .unwrap_err();
+        assert_eq!(e.to_string(), "persist history for timeline 2");
+    }
+
+    #[test]
+    fn waits_render_what_they_wait_on() {
+        let fork_segment: Pos<Floor> = SEG.into();
+        let rendered = [
+            ForkWait::EmitterAck {
+                acked: 1.into(),
+                fork_segment,
+            },
+            ForkWait::ShadowApply {
+                applied: None,
+                fork: SEG.into(),
+            },
+            ForkWait::ArchiveSeal {
+                durable: Pos::ZERO,
+                fork_segment,
+            },
+        ]
+        .map(|w| format!("{}: {w}", w.label()));
+        assert_eq!(
+            rendered,
+            [
+                "emitter_ack: emitter acked 0x1, need 0x1000000",
+                "shadow_apply: shadow replay unknown, fork at 0x1000000",
+                "archive_seal: archive fsynced 0x0, need 0x1000000",
+            ],
+        );
+    }
+
+    #[test]
+    fn an_unknown_reason_counts_nowhere() {
+        let mut stats = TimelineStats::default();
+        stats.record_reason("not_a_reason");
+        assert_eq!(stats.failures_by_reason, [0; SWITCH_FAILURE_REASONS.len()]);
+    }
+
+    #[test]
+    fn pacing_touches_only_a_live_attempt() {
+        let now = Instant::now();
+        let later = now + std::time::Duration::from_secs(2);
+        let mut c = CrossingState::default();
+        c.connected();
+        c.retry_at(later);
+        c.retry_from_source(later);
+        assert!(!c.pending() && !c.awaiting_connection());
+        c.ancestor_ended(false);
+        c.retry_at(later);
+        assert!(!c.due(now) && c.due(later));
+        c.park(TransitionError::HistoryMissing { tli: 2 }, 0, Some(0x100));
+        c.ancestor_ended(true);
+        assert_eq!(c.wedge().map(|w| w.reason), Some("history_missing"));
+        assert!(!c.due(later), "a repeated end leaves the park in place");
     }
 }

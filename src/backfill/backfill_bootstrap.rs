@@ -282,14 +282,14 @@ pub async fn drain_backfill<O: TupleObserver + ?Sized>(
             observer
                 .on_tuple(&committed)
                 .await
-                .map_err(|e| anyhow::anyhow!("bootstrap drain: emitter rejected tuple: {e}"))?;
+                .context("bootstrap drain: emitter rejected tuple")?;
             shipped += 1;
         }
     }
     observer
         .on_xact_end(last_lsn)
         .await
-        .map_err(|e| anyhow::anyhow!("bootstrap drain: emitter rejected xact end: {e}"))?;
+        .context("bootstrap drain: emitter rejected xact end")?;
     Ok(shipped)
 }
 
@@ -472,6 +472,23 @@ mod tests {
     use walrus::pg::backup::tarball::{Entry, Kind, Reader, Writer};
 
     #[test]
+    fn tap_set_walks_everything_when_a_toast_heap_is_unseeded() {
+        let mut rel = make_rel();
+        rel.toast_oid = 16401;
+        let mut catalog = CatalogMap::new();
+        catalog.insert(Arc::new(rel));
+        assert!(tap_filenode_set(&catalog, |_| true, |_| true).is_none());
+    }
+
+    #[test]
+    fn one_char_rejects_empty_and_long_values() {
+        assert_eq!(one_char("r".into(), "relkind").unwrap(), 'r');
+        for s in ["", "rp"] {
+            assert!(one_char(s.into(), "relkind").is_err());
+        }
+    }
+
+    #[test]
     fn with_catalog_filenodes_seeds_whitelist() {
         let tmp = tempfile::tempdir().unwrap();
         let cfg = BootstrapConfig::new(tmp.path().to_path_buf());
@@ -511,6 +528,34 @@ mod tests {
             sink.finish(&self.end).await?;
             Ok((self.start.clone(), self.end.clone()))
         }
+    }
+
+    #[tokio::test]
+    async fn orchestrator_names_a_data_dir_it_cannot_create() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("file");
+        std::fs::write(&file, b"").unwrap();
+        let source = MockSource {
+            files: Vec::new(),
+            start: StartInfo {
+                start_lsn: 0,
+                timeline: 1,
+                tablespaces: Vec::new(),
+            },
+            end: EndInfo {
+                end_lsn: 0,
+                timeline: 1,
+            },
+        };
+        let cfg = BootstrapConfig::new(file.join("shadow"));
+        let err = run_greenfield_bootstrap(cfg, Box::new(source), CatalogMap::new(), false)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .starts_with("bootstrap: create shadow data_dir"),
+            "{err}"
+        );
     }
 
     #[tokio::test]
@@ -648,6 +693,7 @@ mod tests {
     struct CountingObserver {
         on_tuple_calls: u32,
         on_xact_end_calls: u32,
+        reject_xact_end: bool,
     }
 
     impl crate::decode::decoder_sink::TupleObserver for CountingObserver {
@@ -677,7 +723,13 @@ mod tests {
             >,
         > {
             self.on_xact_end_calls += 1;
-            Box::pin(async move { Ok(commit_lsn) })
+            let reject = self.reject_xact_end;
+            Box::pin(async move {
+                use crate::decode::decoder_sink::DecoderSinkError;
+                (!reject)
+                    .then_some(commit_lsn)
+                    .ok_or(DecoderSinkError::Observer("full".into()))
+            })
         }
     }
 
@@ -714,6 +766,35 @@ mod tests {
         assert_eq!(obs.on_tuple_calls, 4);
         // One synthetic xact closes the backfill
         assert_eq!(obs.on_xact_end_calls, 1);
+    }
+
+    #[tokio::test]
+    async fn drain_backfill_surfaces_a_rejected_table_flip() {
+        let tuple = |rel_node| BackfillTuple {
+            rfn: RelFileNode {
+                spc_node: 1663,
+                db_node: 5,
+                rel_node,
+            },
+            xid: 1,
+            xmax: 0,
+            infomask: 0,
+            source_lsn: 1,
+            page_lsn: 0,
+            blkno: 0,
+            offnum: 0,
+            columns: Vec::new(),
+        };
+        let (tx, rx) = mpsc::channel::<Vec<BackfillTuple>>(1);
+        tx.send(vec![tuple(16400), tuple(16401)]).await.unwrap();
+        drop(tx);
+        let mut obs = CountingObserver {
+            reject_xact_end: true,
+            ..Default::default()
+        };
+        let err = drain_backfill(rx, &mut obs).await.unwrap_err();
+        assert!(err.to_string().contains("mid-table xact end"), "{err}");
+        assert_eq!(obs.on_tuple_calls, 1);
     }
 
     #[tokio::test]

@@ -502,6 +502,12 @@ shadow_flush = \"1234563/0\"
         let tmp = tempdir().unwrap();
         let got = load(tmp.path(), &ident()).await.unwrap();
         assert!(got.is_none(), "greenfield boot must surface as None");
+        std::fs::create_dir(manifest_path(tmp.path())).unwrap();
+        let unreadable = load(tmp.path(), &ident()).await;
+        assert!(
+            matches!(unreadable, Err(ManifestError::Io(_))),
+            "{unreadable:?}"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

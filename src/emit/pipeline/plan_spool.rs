@@ -114,13 +114,11 @@ pub enum PlanSpoolError {
     DiskBudget { needed: u64, cap: u64 },
 }
 
+/// Frames decode from memory, so a decode error is always malformed bytes
 impl From<SpillError> for PlanSpoolError {
     fn from(e: SpillError) -> Self {
-        match e {
-            SpillError::Io(e) => Self::Io(e),
-            e => Self::Format {
-                detail: e.to_string(),
-            },
+        Self::Format {
+            detail: e.to_string(),
         }
     }
 }
@@ -196,6 +194,29 @@ pub struct PlanWriter {
     frame: Vec<u8>,
 }
 
+/// Append one length-prefixed heap frame, charging `bytes` against `cap`
+fn encode_frame(
+    frame: &mut Vec<u8>,
+    bytes: &mut u64,
+    cap: u64,
+    out: &mut BufWriter<File>,
+    heap: &PlannedHeap,
+) -> Result<()> {
+    frame.clear();
+    frame.extend_from_slice(&[0; 4]);
+    spill::push_u32(frame, heap.table);
+    spill::encode_heap_into(frame, &heap.decoded);
+    let needed = *bytes + frame.len() as u64;
+    if needed > cap {
+        return Err(PlanSpoolError::DiskBudget { needed, cap });
+    }
+    let len = (frame.len() - 4) as u32;
+    frame[..4].copy_from_slice(&len.to_le_bytes());
+    out.write_all(frame)?;
+    *bytes = needed;
+    Ok(())
+}
+
 impl PlanWriter {
     /// Starts memory-resident; the file at `path` is only created if the
     /// plan outgrows `mem_max`
@@ -216,11 +237,6 @@ impl PlanWriter {
             truncate_rows: Vec::new(),
             frame: Vec::new(),
         }
-    }
-
-    /// Disk bytes written so far, header included
-    pub fn bytes(&self) -> u64 {
-        self.bytes
     }
 
     /// Table `heap` plans under. `route` resolves only for a descriptor
@@ -289,55 +305,35 @@ impl PlanWriter {
         self.heap_count += 1;
         // Resident estimate overstates encoded size, so enforce disk cap
         // only against encoded frames
-        if let PlanSink::Mem(heaps) = &mut self.sink {
-            let cost = mem_cost(&heap);
-            if self.bytes + cost <= self.mem_max.min(self.cap) {
-                self.bytes += cost;
+        match &mut self.sink {
+            PlanSink::Mem(heaps) => {
+                let cost = mem_cost(&heap);
+                if self.bytes + cost <= self.mem_max.min(self.cap) {
+                    self.bytes += cost;
+                    heaps.push(heap);
+                    return Ok(());
+                }
+                let mut heaps = std::mem::take(heaps);
                 heaps.push(heap);
-                return Ok(());
+                self.spill(&heaps)
             }
-            self.spill()?;
+            PlanSink::File(out, _) => {
+                encode_frame(&mut self.frame, &mut self.bytes, self.cap, out, &heap)
+            }
         }
-        self.encode_heap(&heap)
     }
 
     /// Move resident heaps into a fresh spool file; later heaps append there
-    fn spill(&mut self) -> Result<()> {
-        let path = self.path.resolve();
-        let mut out = BufWriter::with_capacity(IO_CHUNK, File::create(&path)?);
+    fn spill(&mut self, heaps: &[PlannedHeap]) -> Result<()> {
+        let file = PlanFile(self.path.resolve());
+        let mut out = BufWriter::with_capacity(IO_CHUNK, File::create(&file.0)?);
         out.write_all(&PLAN_MAGIC)?;
         out.write_all(&PLAN_VERSION.to_le_bytes())?;
-        let sink = PlanSink::File(out, PlanFile(path));
-        let PlanSink::Mem(heaps) = std::mem::replace(&mut self.sink, sink) else {
-            unreachable!("spill runs once, from memory");
-        };
         self.bytes = 4;
-        for h in &heaps {
-            self.encode_heap(h)?;
+        for h in heaps {
+            encode_frame(&mut self.frame, &mut self.bytes, self.cap, &mut out, h)?;
         }
-        Ok(())
-    }
-
-    fn encode_heap(&mut self, heap: &PlannedHeap) -> Result<()> {
-        let frame = &mut self.frame;
-        frame.clear();
-        frame.extend_from_slice(&[0; 4]);
-        spill::push_u32(frame, heap.table);
-        spill::encode_heap_into(frame, &heap.decoded);
-        let needed = self.bytes + frame.len() as u64;
-        if needed > self.cap {
-            return Err(PlanSpoolError::DiskBudget {
-                needed,
-                cap: self.cap,
-            });
-        }
-        let len = (frame.len() - 4) as u32;
-        frame[..4].copy_from_slice(&len.to_le_bytes());
-        let PlanSink::File(out, _) = &mut self.sink else {
-            unreachable!("frames require a spool file");
-        };
-        out.write_all(frame)?;
-        self.bytes = needed;
+        self.sink = PlanSink::File(out, file);
         Ok(())
     }
 
@@ -793,11 +789,10 @@ mod tests {
             }
             let mut rd = plan.replay().unwrap();
             for decoded in expected {
-                let h = match rd.next_item().unwrap().unwrap() {
-                    PlanItem::Heap(h) | PlanItem::Truncate { heap: h, .. } => h,
-                    PlanItem::Control(_) => panic!(),
-                };
-                assert_eq!(h.decoded, decoded);
+                let item = rd.next_item().unwrap().unwrap();
+                assert!(
+                    matches!(item, PlanItem::Heap(h) | PlanItem::Truncate { heap: h, .. } if h.decoded == decoded)
+                );
             }
             assert!(rd.next_item().unwrap().is_none());
         }
@@ -941,8 +936,7 @@ mod tests {
         };
         loop {
             match rd.next_item() {
-                Ok(Some(_)) => {}
-                Ok(None) => panic!("tampered plan replayed clean"),
+                Ok(item) => assert!(item.is_some(), "tampered plan replayed clean"),
                 Err(e) => return e,
             }
         }

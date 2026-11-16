@@ -9,7 +9,7 @@ mod fx;
 use tokio::sync::Mutex;
 use walshadow::filter::shadow_relations::ShadowHeld;
 use walshadow::schema::RelName;
-use walshadow::toast::shadow_landing::{unheld_toast, unserved_rels};
+use walshadow::toast::shadow_landing::{serves_toast, unheld_toast, unserved_rels};
 
 #[tokio::test]
 async fn unheld_toast_names_only_rels_shadow_cannot_serve() {
@@ -67,6 +67,9 @@ async fn unheld_toast_names_only_rels_shadow_cannot_serve() {
         unheld_toast(&catalog, &held, &big).await.unwrap().is_none(),
         "a landed TOAST heap serves its rel",
     );
+    assert!(serves_toast(&catalog, &empty, &plain).await.unwrap());
+    assert!(!serves_toast(&catalog, &empty, &big).await.unwrap());
+    assert!(serves_toast(&catalog, &held, &big).await.unwrap());
 
     // Startup checks all configured relations in one batch
     let names = [
