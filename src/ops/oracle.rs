@@ -766,6 +766,44 @@ mod tests {
             let err = decode_err(&bytes, &want, n_rows);
             assert!(err.contains(want_err), "{want_err}: {err}");
         }
+
+        // Array offsets running backwards parse, then fail validation
+        let mut backwards = native(&[("v", "Array(String)")], &[]);
+        backwards[1] = 2;
+        backwards.extend([1u64, 0].map(u64::to_le_bytes).concat());
+        let err = decode_err(&backwards, &want, 2);
+        assert!(err.contains("block validate: "), "{err}");
+    }
+
+    /// Reader struct allocates, its read buffer does not
+    #[test]
+    fn decode_block_surfaces_reader_allocation_failure() {
+        use std::alloc::{GlobalAlloc, Layout, System};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct FirstOnly(AtomicBool);
+        // SAFETY: forwards to System or refuses with null
+        unsafe impl GlobalAlloc for FirstOnly {
+            unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+                let refused = self.0.swap(true, Ordering::Relaxed);
+                // SAFETY: caller upholds GlobalAlloc contract
+                if refused {
+                    std::ptr::null_mut()
+                } else {
+                    unsafe { System.alloc(layout) }
+                }
+            }
+            unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+                // SAFETY: ptr came from System.alloc with this layout
+                unsafe { System.dealloc(ptr, layout) }
+            }
+        }
+        static FIRST_ONLY: FirstOnly = FirstOnly(AtomicBool::new(false));
+        let buf = OracleColumnBuf::string(25, -1);
+        let want = [col(3, "v", "String", &buf)];
+        let one = native(&[("v", "String")], &["x"]);
+        let err = decode_block(&one, &want, 1, Allocator::global(&FIRST_ONLY)).err();
+        let err = err.unwrap().to_string();
+        assert!(err.contains("reader: "), "{err}");
     }
 
     #[test]

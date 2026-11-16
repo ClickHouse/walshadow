@@ -1106,18 +1106,21 @@ mod tests {
         assert_eq!(f.decide(&rec(RmId::Btree, &[(5, 20001)])), Route::ToDecoder);
         assert_eq!(f.decide(&rec(RmId::Heap, &[(5, 20000)])), Route::ToDecoder);
         assert_eq!(f.decide(&rec(RmId::Btree, &[(5, 1259)])), Route::ToShadow);
-        assert_eq!(
-            stats.skipped_by_rel.snapshot(),
-            vec![(
-                SkipKey {
-                    db_oid: 5,
-                    rel_node: 20001,
-                    op: "btree",
-                    reason: SkipReason::IndexDropped,
-                },
-                2,
-            )],
-        );
+        // Blockless REUSE_PAGE names its index in main data
+        let mut reuse = rec(RmId::Btree, &[]);
+        reuse.header.info = main_data::XLOG_BTREE_REUSE_PAGE;
+        let locator = [1663u32, 5, 20002].map(u32::to_le_bytes).concat();
+        reuse.main_data = std::borrow::Cow::Owned([&locator[..], &[0; 13]].concat());
+        assert_eq!(f.decide(&reuse), Route::ToDecoder);
+        let key = |rel_node| SkipKey {
+            db_oid: 5,
+            rel_node,
+            op: "btree",
+            reason: SkipReason::IndexDropped,
+        };
+        let mut skipped = stats.skipped_by_rel.snapshot();
+        skipped.sort_by_key(|(k, _)| k.rel_node);
+        assert_eq!(skipped, vec![(key(20001), 2), (key(20002), 1)]);
     }
 
     #[test]
@@ -2207,6 +2210,18 @@ mod tests {
         r
     }
 
+    /// `XLOG_DBASE_DROP` names a database too, but creates none
+    #[test]
+    fn only_create_records_name_a_created_database() {
+        assert_eq!(
+            created_database(&dbase_create(TARGET_DB, 7)),
+            Some(TARGET_DB)
+        );
+        let mut dropped = dbase_create(TARGET_DB, 7);
+        dropped.header.info = 0x20;
+        assert_eq!(created_database(&dropped), None);
+    }
+
     #[test]
     fn creating_the_target_database_is_not_a_foreign_scope() {
         let mut f = target_filter();
@@ -2334,7 +2349,9 @@ mod tests {
         bytes[..4].copy_from_slice(&len.to_le_bytes());
         let mut f = target_filter();
         f.enable_header_routing();
-        assert!(f.route_from_header(&bytes, 0xD116, 0).is_some());
+        let routed = f.route_from_header(&bytes, 0xD116, 0).unwrap();
+        // No toast xid ceiling to feed, clean xid defers nothing
+        assert!(!f.decide_from_header(&routed, 0));
         let stats = Arc::new(DecoderStats::default());
         stats
             .attribute_skips

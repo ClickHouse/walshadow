@@ -193,6 +193,38 @@ impl Fixture {
         rel
     }
 
+    /// Mapped `public.u` holding row (7, 'seven'). Its `name` column is
+    /// fixed width, so the relation has no TOAST heap
+    async fn toastless_rel(&self) -> Arc<RelDescriptor> {
+        self.source
+            .psql_one(
+                "CREATE TABLE public.u (id int PRIMARY KEY, name name NOT NULL); \
+                 INSERT INTO public.u VALUES (7, 'seven'); CHECKPOINT",
+            )
+            .unwrap();
+        let (_, descs) = self
+            .catalog
+            .lock()
+            .await
+            .fetch_all_descriptors()
+            .await
+            .unwrap();
+        let u = Arc::new(
+            descs
+                .into_iter()
+                .find(|d| d.rel_name == RelName::new("public", "u"))
+                .unwrap(),
+        );
+        assert_eq!(u.toast_oid, 0);
+        fx::create_ch_dest_table(&self.ch, "default", "u").unwrap();
+        let mut mapping = (*self.mapping.snapshot()[&self.desc.rel_name]).clone();
+        mapping.target = TableTarget::new("default", "u");
+        self.mapping.mutate(|map| {
+            Arc::make_mut(map).insert(u.rel_name.clone(), Arc::new(mapping));
+        });
+        u
+    }
+
     fn rows(&self) -> String {
         self.ch
             .query("SELECT id, name FROM default.t FINAL WHERE NOT _is_deleted ORDER BY id")
@@ -807,14 +839,16 @@ async fn archive_wal(
     }
 }
 
-/// Backup predates the opt-in: walk loads the backup image, gap replay
-/// carries changes between backup redo and the boundary
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn object_store_opt_in_replays_archive_gap() {
-    if !fx::tools::requirements_available() {
-        return;
-    }
-    let mut fx = Fixture::new().await;
+/// Archived backup of public.t, then changes past it. Returns the archive
+/// root, its settings and storage, and the opt-in boundary after the changes
+async fn pushed_backup(
+    fx: &Fixture,
+) -> (
+    tempfile::TempDir,
+    walrus::config::Settings,
+    walrus::storage::DynStorage,
+    u64,
+) {
     // Live capture fills the log in production; replay decodes through it
     fx.log
         .seed(
@@ -863,21 +897,124 @@ async fn object_store_opt_in_replays_archive_gap() {
     let s_lsn = fx.source.psql_one("SELECT pg_current_wal_lsn()").unwrap();
     let s_lsn = walrus::pg::backup::parse_pg_lsn(&s_lsn).unwrap();
     fx.source.psql_one("SELECT pg_switch_wal()").unwrap();
+    (root, settings, storage, s_lsn)
+}
+
+/// [`pushed_backup`] rows as of the opt-in boundary
+const PAST_BACKUP_ROWS: &str = "1\tupdated\n3\tthree\n4\tfour";
+
+/// Backup predates the opt-in: walk loads the backup image, gap replay
+/// carries changes between backup redo and the boundary
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn object_store_opt_in_replays_archive_gap() {
+    if !fx::tools::requirements_available() {
+        return;
+    }
+    let mut fx = Fixture::new().await;
+    let u = fx.toastless_rel().await;
+    let (_root, settings, storage, s_lsn) = pushed_backup(&fx).await;
     archive_wal(&fx.source, &settings, &storage).await;
     fx.emitter.backup = Some(settings);
 
     let dir = tempfile::tempdir().unwrap();
     let backfiller = fx.backfiller(dir.path()).await;
-    backfiller
-        .note_opt_in(&fx.desc, InitialLoadMode::ObjectStore, s_lsn)
-        .await;
+    for desc in [&fx.desc, &u] {
+        backfiller
+            .note_opt_in(desc, InitialLoadMode::ObjectStore, s_lsn)
+            .await;
+    }
     wait_done(&backfiller, dir.path()).await;
-    assert_eq!(fx.rows(), "1\tupdated\n3\tthree\n4\tfour");
+    assert_eq!(fx.rows(), PAST_BACKUP_ROWS);
+    assert_eq!(
+        fx.ch.query("SELECT id, name FROM default.u FINAL").unwrap(),
+        "7\tseven"
+    );
     assert_eq!(fx.stats.backfill_copy_rows.load(Ordering::Relaxed), 0);
     assert_eq!(
         read_ledger(dir.path())["backfill"][0]["mode"].as_str(),
         Some("object_store")
     );
+}
+
+/// Backups a page walk cannot serve fall back to COPY at the boundary
+#[tokio::test(flavor = "current_thread")]
+async fn unservable_object_store_backups_fall_back_to_copy() {
+    if !fx::tools::requirements_available() {
+        return;
+    }
+    let (logs, _guard) = Logs::capture();
+    let mut fx = Fixture::new().await;
+    let (root, settings, _storage, s_lsn) = pushed_backup(&fx).await;
+    fx.emitter.backup = Some(settings);
+    let load = async |fx: &Fixture, why: &str| {
+        let dir = tempfile::tempdir().unwrap();
+        let backfiller = fx.backfiller(dir.path()).await;
+        backfiller
+            .note_opt_in(&fx.desc, InitialLoadMode::ObjectStore, s_lsn)
+            .await;
+        wait_done(&backfiller, dir.path()).await;
+        assert!(logs.text().contains(why), "{}", logs.text());
+        assert_eq!(fx.rows(), PAST_BACKUP_ROWS);
+        assert_eq!(
+            read_ledger(dir.path())["backfill"][0]["mode"].as_str(),
+            Some("copy")
+        );
+        fx.ch.query("TRUNCATE TABLE default.t").unwrap();
+    };
+
+    // Gap WAL never archived
+    load(&fx, "fetch archive WAL for the gap").await;
+
+    let sentinels = root.path().join("basebackups_005");
+    let sentinel = std::fs::read_dir(&sentinels)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.to_string_lossy().ends_with("_backup_stop_sentinel.json"))
+        .unwrap();
+    let mut json: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&sentinel).unwrap()).unwrap();
+    json["DeltaFrom"] = "base_000000010000000000000001".into();
+    std::fs::write(&sentinel, serde_json::to_vec(&json).unwrap()).unwrap();
+    load(&fx, "is a delta backup").await;
+}
+
+/// Walked load survives a failed gap replay: restart resumes into the same
+/// staging table from the checkpoint rather than walking the backup again
+#[tokio::test(flavor = "current_thread")]
+async fn object_store_pass_resumes_walked_load() {
+    if !fx::tools::requirements_available() {
+        return;
+    }
+    let (logs, _guard) = Logs::capture();
+    let mut fx = Fixture::new().await;
+    fx.emitter.bootstrap.copy_fallback = Some(false);
+    let (_root, settings, storage, s_lsn) = pushed_backup(&fx).await;
+    archive_wal(&fx.source, &settings, &storage).await;
+    fx.emitter.backup = Some(settings);
+    let dir = tempfile::tempdir().unwrap();
+    let replay_spill = dir.path().join("backup_backfill/replay_spill");
+    std::fs::create_dir_all(replay_spill.parent().unwrap()).unwrap();
+    std::fs::write(&replay_spill, b"").unwrap();
+
+    let backfiller = fx.backfiller(dir.path()).await;
+    backfiller
+        .note_opt_in(&fx.desc, InitialLoadMode::ObjectStore, s_lsn)
+        .await;
+    logs.wait_for("backup backfill pass failed").await;
+    assert!(logs.text().contains("replay xact buffer"));
+    assert_eq!(fx.rows(), "");
+    let mut sess = staging_session(&fx).await;
+    let staging = sess.table_uuid("default", "t__wsstg").await.unwrap();
+    assert!(staging.is_some());
+
+    std::fs::remove_file(&replay_spill).unwrap();
+    let restarted = fx.backfiller(dir.path()).await;
+    restarted
+        .note_opt_in(&fx.desc, InitialLoadMode::ObjectStore, s_lsn)
+        .await;
+    wait_done(&restarted, dir.path()).await;
+    assert!(logs.text().contains("resuming deferred backup replay"));
+    assert_eq!(fx.rows(), PAST_BACKUP_ROWS);
 }
 
 /// Use `current_thread` runtimes to capture logs from spawned tasks too
@@ -1459,31 +1596,7 @@ async fn backup_opt_ins_coalesce_into_one_pass() {
     }
     let (logs, _guard) = Logs::capture();
     let fx = Fixture::new().await;
-    fx.source
-        .psql_one(
-            "CREATE TABLE public.u (id int PRIMARY KEY, name text NOT NULL); \
-             INSERT INTO public.u VALUES (7, 'seven'); CHECKPOINT",
-        )
-        .unwrap();
-    let (_, descs) = fx
-        .catalog
-        .lock()
-        .await
-        .fetch_all_descriptors()
-        .await
-        .unwrap();
-    let u = Arc::new(
-        descs
-            .into_iter()
-            .find(|d| d.rel_name == RelName::new("public", "u"))
-            .unwrap(),
-    );
-    fx::create_ch_dest_table(&fx.ch, "default", "u").unwrap();
-    let mut mapping = (*fx.mapping.snapshot()[&fx.desc.rel_name]).clone();
-    mapping.target = TableTarget::new("default", "u");
-    fx.mapping.mutate(|map| {
-        Arc::make_mut(map).insert(u.rel_name.clone(), Arc::new(mapping));
-    });
+    let u = fx.toastless_rel().await;
     let dir = tempfile::tempdir().unwrap();
     let backfiller = fx.backfiller(dir.path()).await;
     let mut sess = staging_session(&fx).await;
@@ -1630,6 +1743,47 @@ async fn unrecorded_swap_clear_keeps_staging() {
     assert_eq!(restarted.pending_by_mode(), [0, 1, 0]);
 }
 
+/// Concurrent opt-out and swap resume leave no entry or staging
+#[tokio::test(flavor = "current_thread")]
+async fn opt_out_during_swap_resume_leaves_no_entry() {
+    if !fx::tools::requirements_available() {
+        return;
+    }
+    let fx = Fixture::new().await;
+    let dir = tempfile::tempdir().unwrap();
+    fx.prepare_staging().await;
+    let mut sess = staging_session(&fx).await;
+    let uuid = sess.table_uuid("default", "t__wsstg").await.unwrap();
+    fx.ch
+        .query("ALTER TABLE default.t ADD COLUMN extra String DEFAULT 'new'")
+        .unwrap();
+    // Changed destination, then staging already gone
+    for uuid in [uuid.as_deref().unwrap(), "gone"] {
+        write_swapped_ledger(dir.path(), uuid);
+        let backfiller = fx.backfiller(dir.path()).await;
+        backfiller
+            .note_opt_in(&fx.desc, InitialLoadMode::BaseBackup, 999)
+            .await;
+        backfiller.note_opt_out(&fx.desc.rel_name).await;
+        // Resume task holds the other handle until it ends
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while Arc::strong_count(&backfiller) > 1 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("swap resume ends");
+        assert_eq!(sess.table_uuid("default", "t__wsstg").await.unwrap(), None);
+        assert!(
+            read_ledger(dir.path())
+                .get("backfill")
+                .and_then(toml::Value::as_array)
+                .is_none_or(Vec::is_empty)
+        );
+        assert_eq!(backfiller.pending_by_mode(), [0, 0, 0]);
+    }
+}
+
 /// Opt-out mid-COPY lets the load drain without recording it done
 #[tokio::test(flavor = "current_thread")]
 async fn opt_out_mid_copy_leaves_no_entry() {
@@ -1666,4 +1820,76 @@ fn widen_many(fx: &Fixture) {
              CHECKPOINT",
         )
         .unwrap();
+}
+
+/// Open source xact so a backup pass records pending tables, hence stalls
+/// at [`stall_at_pending_hold`]
+async fn open_pending_xact(fx: &Fixture) -> tokio_postgres::Client {
+    let open = walshadow::source_feed::open_sql_client(&fx::pg_cfg(&fx.source, "pending-open"))
+        .await
+        .unwrap();
+    open.batch_execute(
+        "BEGIN; INSERT INTO public.t SELECT g, 'kept' FROM generate_series(101, 110) g",
+    )
+    .await
+    .unwrap();
+    open
+}
+
+/// Destination gone at publish: nothing swaps, entry stays pending
+#[tokio::test(flavor = "current_thread")]
+async fn publish_without_destination_keeps_entry_pending() {
+    if !fx::tools::requirements_available() {
+        return;
+    }
+    let (logs, _guard) = Logs::capture();
+    let fx = Fixture::new().await;
+    let open = open_pending_xact(&fx).await;
+    let dir = tempfile::tempdir().unwrap();
+    let backfiller = fx.backfiller(dir.path()).await;
+    let blocker = stall_at_pending_hold(&fx, &backfiller, dir.path(), &logs).await;
+    let _ = fx.ch.query("SYSTEM SHUTDOWN");
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while std::net::TcpStream::connect(("127.0.0.1", fx.ch.port)).is_ok() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("clickhouse stops");
+    std::fs::remove_dir(&blocker).unwrap();
+    logs.wait_for("staging publish connect failed; entries stay pending")
+        .await;
+    logs.wait_for(PASS_DONE).await;
+    assert_eq!(backfiller.pending_by_mode(), [0, 1, 0]);
+    assert_eq!(
+        read_ledger(dir.path())["backfill"][0]["swapped"].as_bool(),
+        Some(false)
+    );
+    open.batch_execute("ROLLBACK").await.unwrap();
+}
+
+/// Cleanup failing after publish fails the pass, yet its COPY fallback
+/// declines an entry the pass already published
+#[tokio::test(flavor = "current_thread")]
+async fn published_load_survives_failed_scratch_cleanup() {
+    if !fx::tools::requirements_available() {
+        return;
+    }
+    let (logs, _guard) = Logs::capture();
+    let fx = Fixture::new().await;
+    let open = open_pending_xact(&fx).await;
+    let dir = tempfile::tempdir().unwrap();
+    let backfiller = fx.backfiller(dir.path()).await;
+    let blocker = stall_at_pending_hold(&fx, &backfiller, dir.path(), &logs).await;
+    std::fs::create_dir(dir.path().join("backup_backfill/backup_replay.json")).unwrap();
+    std::fs::remove_dir(&blocker).unwrap();
+    logs.wait_for("backup backfill pass failed").await;
+    assert_eq!(fx.rows(), "1\tone\n2\ttwo\n3\tthree");
+    assert_eq!(
+        read_ledger(dir.path())["backfill"][0]["done"].as_bool(),
+        Some(true)
+    );
+    assert_eq!(backfiller.pending_by_mode(), [0, 0, 0]);
+    assert_eq!(fx.stats.backfill_copy_rows.load(Ordering::Relaxed), 0);
+    open.batch_execute("ROLLBACK").await.unwrap();
 }

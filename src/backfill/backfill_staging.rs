@@ -358,6 +358,58 @@ mod tests {
         assert!(server.await.unwrap_err().is_cancelled());
     }
 
+    #[tokio::test]
+    async fn prepare_names_the_rel_whose_staging_rebuild_failed() {
+        let sql = "DROP TABLE IF EXISTS `db`.`t__wsstg`";
+        let (config, server) = crate::ch::test_support::retry_server(0, sql, false, false).await;
+        let desc = crate::backfill::backup_page_walk::make_rel_named(
+            16400,
+            16400,
+            0,
+            RelName::new("public", "t"),
+        );
+        let table = TableMapping {
+            target: TableTarget::new("db", "t"),
+            columns: Vec::new(),
+            tees: Vec::new(),
+        };
+        let live =
+            crate::mapping::mapping_handle([(desc.rel_name.clone(), table)].into_iter().collect());
+        let reqs = [BackupRequest {
+            desc,
+            s_lsn: 0x5000,
+        }];
+        let err = prepare(
+            DestEmitter::new(Arc::new(config), None),
+            &live,
+            &reqs,
+            false,
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(
+            err.to_string(),
+            "backfill_staging: rebuild staging for public.t"
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_query_names_its_sql() {
+        let sql = "SELECT name FROM system.tables";
+        let (config, server) = crate::ch::test_support::retry_server(0, sql, false, false).await;
+        let mut session = StagingSession::connect(DestEmitter::new(Arc::new(config), None))
+            .await
+            .unwrap();
+        let err = session.query_strings(sql).await.unwrap_err();
+        assert!(
+            err.to_string()
+                .starts_with(&format!("backfill_staging: {sql}: "))
+        );
+        server.await.unwrap();
+    }
+
     #[test]
     fn staging_rel_renders_sql_names() {
         let rel = StagingRel {

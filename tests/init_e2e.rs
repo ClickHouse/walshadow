@@ -216,9 +216,18 @@ async fn init_subcommand_reports_fixes_without_a_terminal() {
         "#!/bin/sh\necho 'initdb (PostgreSQL) 9.6.24'\n",
     )
     .unwrap();
+    // `initdb` whose banner names no major
+    let odd_bins = tmp.path().join("odd-bins");
+    fs::create_dir_all(&odd_bins).unwrap();
+    fs::write(
+        odd_bins.join("initdb"),
+        "#!/bin/sh\necho 'initdb (PostgreSQL) devel'\n",
+    )
+    .unwrap();
     {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&fake_initdb, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(odd_bins.join("initdb"), fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     let config = tmp.path().join("etc/walshadow/ch-config.toml");
@@ -283,11 +292,15 @@ async fn init_subcommand_reports_fixes_without_a_terminal() {
     assert!(out.contains("no `initdb` on PATH"), "{out}");
     assert!(out.contains("no tables selected"), "{out}");
 
-    let (ok, _, err) = init_bin(
+    let (ok, out, err) = init_bin(
         &[&base[..], &["--force"][..]].concat(),
         Some(&app_url),
-        &no_bins,
+        &odd_bins,
     );
     assert!(!ok);
     assert!(err.contains("no terminal for the table picker"), "{err}");
+    assert!(
+        out.contains("could not read `initdb --version` (initdb (PostgreSQL) devel)"),
+        "{out}"
+    );
 }

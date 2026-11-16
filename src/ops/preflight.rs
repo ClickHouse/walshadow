@@ -100,8 +100,6 @@ pub enum PreflightError {
     SourceDatabaseMissing { db: String },
     #[error("pg query: {0}")]
     Pg(#[from] tokio_postgres::Error),
-    #[error("shadow_version_num could not be parsed: {0:?}")]
-    BadShadowVersion(String),
 }
 
 /// All validator findings surfaced at once so operators don't fix one
@@ -281,11 +279,11 @@ pub async fn mapped_relations(
 pub async fn shadow(input: ShadowInputs<'_>) -> Result<PreflightReport, PreflightError> {
     let mut report = PreflightReport { errors: Vec::new() };
 
-    let shadow_num_str = scalar_text(input.shadow_sql, "SHOW server_version_num").await?;
-    let shadow_num = shadow_num_str
-        .trim()
-        .parse::<i32>()
-        .map_err(|_| PreflightError::BadShadowVersion(shadow_num_str))?;
+    let shadow_num: i32 = input
+        .shadow_sql
+        .query_one("SELECT current_setting('server_version_num')::int", &[])
+        .await?
+        .get(0);
     let source_major = input.source_version_num / 10_000;
     let shadow_major = shadow_num / 10_000;
     if source_major != shadow_major {

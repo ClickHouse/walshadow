@@ -82,20 +82,22 @@ impl DbLink {
             "bridge connected",
         );
         let cat_cfg = ShadowCatalogConfig::default();
-        let mut catalog = with_transient_retry(
-            cfg.budget,
-            cat_cfg.reconnect_backoff_initial,
-            cat_cfg.reconnect_backoff_max,
-            async || {
-                ShadowCatalog::connect(cfg.shadow_conninfo, cat_cfg.clone(), bridge.clone()).await
-            },
-        )
+        let (catalog, oid) = async {
+            let mut catalog = with_transient_retry(
+                cfg.budget,
+                cat_cfg.reconnect_backoff_initial,
+                cat_cfg.reconnect_backoff_max,
+                async || {
+                    ShadowCatalog::connect(cfg.shadow_conninfo, cat_cfg.clone(), bridge.clone())
+                        .await
+                },
+            )
+            .await?;
+            let oid = catalog.current_database_oid().await?;
+            anyhow::Ok((catalog, oid))
+        }
         .await
         .with_context(|| format!("connect to shadow PG database {}", cfg.name))?;
-        let oid = catalog
-            .current_database_oid()
-            .await
-            .with_context(|| format!("shadow database oid for {}", cfg.name))?;
         anyhow::ensure!(
             info.datid == oid,
             "bridge socket {} serves database oid {}, but {} is oid {oid}; \
@@ -176,23 +178,16 @@ pub struct SourceDbs {
 }
 
 impl SourceDbs {
-    /// Use config order, fall back to first database if primary OID is missing
-    pub fn new(dbs: Vec<Arc<SourceDb>>, primary: Oid) -> Self {
-        let primary = dbs
-            .iter()
-            .find(|db| db.oid == primary)
-            .or_else(|| dbs.first())
-            .cloned()
-            .expect("a daemon follows at least one database");
+    /// Databases in config order, `primary` indexing `[source] dbname`
+    pub fn new(dbs: Vec<Arc<SourceDb>>, primary: usize) -> Self {
         Self {
+            primary: dbs[primary].clone(),
             order: dbs,
-            primary,
         }
     }
 
     pub fn single(db: Arc<SourceDb>) -> Self {
-        let primary = db.oid;
-        Self::new(vec![db], primary)
+        Self::new(vec![db], 0)
     }
 
     pub fn primary(&self) -> &Arc<SourceDb> {

@@ -32,6 +32,14 @@ bootstrap. Add transactions begun during backup. Repeat for object-store
 bootstrap and per-table backup loads, stating which WAL history must remain
 available
 
+Hold one row under two concurrent lockers across backup and resolution, so its
+xmax is a lock-only multixact, and assert row reaches ClickHouse. Add
+counter-boundary drills for multixact wraparound, truncated or unwritten
+multixact members, and pending xids crossing an epoch. Derive segment geometry
+from PostgreSQL major and isolate each reset in a fresh stopped cluster.
+[Truncated pg_xact](../tests/pending_wraparound_ch.rs) covers pending xids whose
+status segment shadow removed
+
 Restart before settlement and after promotion but before ledger persistence.
 Interrupt pending-table cleanup and staged publication. Cover outcomes arriving
 between replay cut and ledger registration, including failure of source status

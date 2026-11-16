@@ -529,6 +529,8 @@ pub struct DdlPipelineArgs {
     /// Install the tables on source via `sql/runtime_config_install.sql`
     /// inside the bootstrap `schema_sql`.
     pub config_schema: Option<String>,
+    /// Database a cluster backup does not cover, so backup loads refuse
+    pub non_primary: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -543,6 +545,27 @@ pub struct DdlPipelineArgs {
 // channel — so `ddl: Some(..)` wires that subscription + the pg_class delete
 // epoch + baseline seeding. `ddl: None` leaves the DML-only path untouched.
 // ---------------------------------------------------------------------------
+
+/// Stands in for the COPY backfiller when no runtime config schema is set:
+/// opt-ins stream from their opt-in LSN only
+struct NoBackfill;
+
+#[async_trait::async_trait]
+impl walshadow::opt_in::Backfiller for NoBackfill {
+    async fn note_opt_in(
+        self: Arc<Self>,
+        _: Arc<walshadow::schema::RelDescriptor>,
+        _: walshadow::runtime_config::InitialLoadMode,
+        _: u64,
+    ) {
+    }
+
+    async fn note_opt_out(&self, _: &walshadow::schema::RelName) {}
+
+    fn refuses(&self, _: walshadow::runtime_config::InitialLoadMode) -> Option<&'static str> {
+        None
+    }
+}
 
 /// Record-sink chain feeding the parallel pipeline: `metrics → decoder
 /// (heaps → xact buffer) → reorder (commit → dispatch to decode pool)`.
@@ -942,7 +965,8 @@ async fn build_pipeline_inner(
                     pending_rows.clone(),
                 )
                 .await
-                .expect("load backfill ledger"),
+                .expect("load backfill ledger")
+                .with_backup_loads(!ddl.as_ref().is_some_and(|d| d.non_primary)),
             ))
         } else {
             None
@@ -965,14 +989,22 @@ async fn build_pipeline_inner(
         inserter_pool_size: 2,
         dbs: Arc::new(walshadow::source_db::SourceDbs::single(source_db)),
         oracle,
-        applicators: [(shadow_db_oid, applicator)].into_iter().collect(),
+        ddl: [(
+            shadow_db_oid,
+            walshadow::pipeline::DbDdl {
+                applicator,
+                backfiller: backfiller.unwrap_or_else(|| Arc::new(NoBackfill)),
+                resolver: config_resolver.clone(),
+            },
+        )]
+        .into_iter()
+        .collect(),
         tail: TailKind::ClickHouse,
         buffer: xact_buffer.clone(),
         subxact_tracker: Arc::new(Mutex::new(SubxactTracker::new())),
         pending: pending_catalog.clone(),
         stats: stats.clone(),
         span_registry: None,
-        backfillers: backfiller.map(|b| (shadow_db_oid, b)).into_iter().collect(),
         retires,
         pending_rows,
         resume_floor: resume_floor.clone(),
@@ -984,7 +1016,7 @@ async fn build_pipeline_inner(
         .expect("spawn decode+insert pipeline");
     let reorder = booting
         .boot(
-            None,
+            &shadow.config().data_dir,
             desc_log.active_present_at(ident.xlogpos),
             ident.xlogpos,
         )

@@ -450,9 +450,6 @@ impl WalReplaySink {
         spool: Option<&BodySpoolFile>,
         rows: &[ToastRowRef],
     ) -> std::result::Result<(), SinkError> {
-        if !self.resolver.stores_chunks() {
-            return Ok(());
-        }
         for r in rows {
             // Permit before the read: the body is resident from here
             let permit = self.reserve_pending(r.chunk_data.len()).await?;
@@ -1313,6 +1310,7 @@ mod tests {
             ReplayTargets::default(),
             Arc::default(),
             Some(patch.clone()),
+            |_| {},
         )
         .await
         .0
@@ -1323,6 +1321,7 @@ mod tests {
         targets: ReplayTargets,
         mapping: MappingSnapshot,
         patch: Option<Arc<std::sync::Mutex<PgXactPatch>>>,
+        tune: impl FnOnce(&mut WalReplayInputs),
     ) -> (
         WalReplaySink,
         Arc<Mutex<XactBuffer>>,
@@ -1352,7 +1351,7 @@ mod tests {
             Arc::new(Monotone::<EmitterAck>::default()),
             crate::emit::pipeline::Fatal::new(),
         );
-        let sink = WalReplaySink::new(WalReplayInputs {
+        let mut inputs = WalReplayInputs {
             log: Arc::new(log),
             buffer: buffer.clone(),
             resolver: ToastResolver::disabled(),
@@ -1372,8 +1371,9 @@ mod tests {
             next_seq: 0,
             patch,
             track_replaced: true,
-        });
-        (sink, buffer, msg_rx)
+        };
+        tune(&mut inputs);
+        (WalReplaySink::new(inputs), buffer, msg_rx)
     }
 
     fn status(patch: &SealedPatch, xid: u32) -> XidStatus {
@@ -1578,6 +1578,7 @@ mod tests {
                 [(rel.rel_name.clone(), table)].into_iter().collect(),
             )),
             None,
+            |_| {},
         )
         .await;
         let insert = |xid, source_lsn| DescribedHeap {
@@ -1615,5 +1616,259 @@ mod tests {
         drop(msg_rx);
         let err = sink.finish().await.unwrap_err();
         assert!(err.to_string().contains("tail closed"), "{err}");
+    }
+
+    fn int_rel(rel_node: Oid, name: &str) -> Arc<RelDescriptor> {
+        crate::backfill::backup_page_walk::make_rel_named(
+            rel_node,
+            rel_node,
+            0,
+            crate::schema::RelName::new("public", name),
+        )
+    }
+
+    fn mapping_of(rel: &RelDescriptor) -> MappingSnapshot {
+        use crate::mapping::{ColumnMapping, TableMapping, TableTarget};
+        let table = TableMapping {
+            target: TableTarget::new("db", &rel.rel_name.name),
+            columns: vec![ColumnMapping {
+                src_attnum: 1,
+                target_name: "id".into(),
+                target_type: "Int32".into(),
+                type_pinned: false,
+            }],
+            tees: Vec::new(),
+        };
+        Arc::new(crate::mapping::shared(
+            [(rel.rel_name.clone(), table)].into_iter().collect(),
+        ))
+    }
+
+    fn targets_of(rels: &[&Arc<RelDescriptor>]) -> ReplayTargets {
+        rels.iter()
+            .map(|r| ((DB, r.rfn.rel_node), ((*r).clone(), u64::MAX)))
+            .collect()
+    }
+
+    fn described(
+        rel: &Arc<RelDescriptor>,
+        xid: u32,
+        source_lsn: u64,
+        op: crate::decode::heap_decoder::HeapOp,
+    ) -> crate::decode::heap_decoder::DescribedHeap {
+        use crate::decode::heap_decoder::{ColumnValue, DecodedHeap, DecodedTuple, HeapOp};
+        let tuple = Some(DecodedTuple {
+            columns: vec![Some(ColumnValue::Int4(1))],
+            partial: false,
+        });
+        let deletes = matches!(op, HeapOp::Delete);
+        crate::decode::heap_decoder::DescribedHeap {
+            decoded: DecodedHeap {
+                rfn: rel.rfn,
+                xid,
+                source_lsn,
+                op,
+                new: tuple.clone().filter(|_| !deletes),
+                old: tuple.filter(|_| deletes),
+            },
+            descriptor: rel.clone(),
+            descriptor_valid_from: 1,
+        }
+    }
+
+    async fn commit(sink: &mut WalReplaySink, xid: u32, source_lsn: u64) {
+        let mut record = xact_record(XLOG_XACT_COMMIT, xid, &[], None);
+        record.source_lsn = source_lsn;
+        sink.on_record(&record).await.unwrap();
+    }
+
+    fn assert_one_row_shipped(msg_rx: &mut mpsc::Receiver<BatcherMsg>) {
+        let shipped = msg_rx.try_recv();
+        assert!(matches!(&shipped, Ok(BatcherMsg::Rows(chunk)) if chunk.rows.len() == 1));
+        assert!(msg_rx.try_recv().is_err(), "nothing else ships");
+    }
+
+    /// Rows of unrouted relations never reach the batcher; catalog events
+    /// and rewrite barriers ride the drain without emitting
+    #[tokio::test]
+    async fn replay_emits_only_routed_rows() {
+        use crate::decode::heap_decoder::HeapOp;
+        use std::sync::atomic::Ordering;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let routed = int_rel(16385, "routed");
+        let unmapped = int_rel(16386, "unmapped");
+        let untargeted = int_rel(16387, "untargeted");
+        let (mut sink, buffer, mut msg_rx) = replay_sink(
+            tmp.path(),
+            targets_of(&[&routed, &unmapped]),
+            mapping_of(&routed),
+            None,
+            |_| {},
+        )
+        .await;
+        {
+            let mut buffer = buffer.lock().await;
+            for (lsn, rel) in [(10, &untargeted), (11, &unmapped), (12, &routed)] {
+                buffer
+                    .on_heap(described(rel, 900, lsn, HeapOp::Insert))
+                    .await
+                    .unwrap();
+            }
+            buffer.on_schema_event(
+                900,
+                13,
+                crate::schema::SchemaEvent::Dropped {
+                    oid: 16399,
+                    rel_name: crate::schema::RelName::new("public", "gone"),
+                    partition: None,
+                },
+            );
+            buffer.on_toast_barrier(900, 20, 16390, 5);
+        }
+        commit(&mut sink, 900, 20).await;
+        let emitter = sink.stats.clone();
+        assert_eq!(sink.finish().await.unwrap().rows_replayed, 1);
+        assert_one_row_shipped(&mut msg_rx);
+        assert_eq!(emitter.unsupported_relations.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn append_only_replay_discards_deletes() {
+        use crate::decode::heap_decoder::HeapOp;
+        use std::sync::atomic::Ordering;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let rel = int_rel(16385, "log");
+        let (mut sink, buffer, mut msg_rx) = replay_sink(
+            tmp.path(),
+            targets_of(&[&rel]),
+            mapping_of(&rel),
+            None,
+            |inputs| {
+                inputs.row_policy.system = Arc::new(crate::mapping::SystemColumns {
+                    is_deleted: None,
+                    ..Default::default()
+                });
+            },
+        )
+        .await;
+        for (lsn, op) in [(10, HeapOp::Insert), (11, HeapOp::Delete)] {
+            buffer
+                .lock()
+                .await
+                .on_heap(described(&rel, 900, lsn, op))
+                .await
+                .unwrap();
+        }
+        commit(&mut sink, 900, 20).await;
+        let emitter = sink.stats.clone();
+        assert_eq!(sink.finish().await.unwrap().rows_replayed, 1);
+        assert_one_row_shipped(&mut msg_rx);
+        assert_eq!(emitter.deletes_discarded.load(Ordering::Relaxed), 1);
+    }
+
+    /// Whole-database filter counts user filenodes it does not follow;
+    /// untracked aborts and malformed assignments leave no state behind
+    #[tokio::test]
+    async fn whole_db_replay_counts_unknown_filenodes() {
+        use crate::decode::heap_decoder::{HeapOp, XLOG_HEAP_INSERT};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut sink, buffer, _msg_rx) = replay_sink(
+            tmp.path(),
+            ReplayTargets::default(),
+            Arc::default(),
+            None,
+            |inputs| {
+                inputs.whole_db_filter = true;
+                inputs.track_replaced = false;
+            },
+        )
+        .await;
+        sink.on_record(&heap_record(XLOG_HEAP_INSERT, 0, 1, &[(0, 0)]))
+            .await
+            .unwrap();
+        assert_eq!(sink.stats().unknown_rfns, 1);
+
+        let rel = int_rel(16385, "t");
+        buffer
+            .lock()
+            .await
+            .on_heap(described(&rel, 901, 30, HeapOp::Insert))
+            .await
+            .unwrap();
+        assert_eq!(sink.oldest_inflight().await, Some(30));
+        sink.on_record(&xact_record(XLOG_XACT_ABORT, 901, &[], None))
+            .await
+            .unwrap();
+        assert_eq!(sink.oldest_inflight().await, None);
+
+        let mut assignment = xact_record(XLOG_XACT_ASSIGNMENT, 902, &[], None);
+        assignment.parsed.main_data = std::borrow::Cow::Owned(vec![0u8; 2]);
+        sink.on_record(&assignment).await.unwrap();
+        assert_eq!(sink.subxact_tracker.top_for(903), 903);
+    }
+
+    /// A full put batch writes before the next row queues
+    #[tokio::test]
+    async fn image_harvest_writes_once_put_batch_fills() {
+        use crate::backfill::backup_page_walk::{synth_toast_chunk_page, toast_chunk_rel};
+        use crate::toast::MemChunkStore;
+        use std::sync::atomic::Ordering;
+
+        let dir = tempfile::tempdir().unwrap();
+        let rel = Arc::new(toast_chunk_rel());
+        let mut catalog = crate::backfill::backup_page_walk::CatalogMap::new();
+        catalog.insert(rel.clone());
+        let log = seed_test_log(dir.path(), &catalog).await;
+        let stats = Arc::new(EmitterStats::default());
+        let resolver = ToastResolver::with_store(Arc::new(MemChunkStore::new()), stats.clone())
+            .with_put_batch_rows(1);
+        let mut sink = image_sink(dir.path(), log, resolver).await;
+
+        for (block_no, value_id) in [(3u32, 7u32), (4, 8)] {
+            let page = synth_toast_chunk_page(&[(value_id, 0, b"body".as_slice())], 0x6000);
+            let record = image_record(&page, rel.rfn.rel_node, block_no);
+            sink.harvest_toast_images(&record).await.unwrap();
+        }
+        assert_eq!(stats.toast_chunk_puts.load(Ordering::Relaxed), 1);
+        sink.finish().await.unwrap();
+        assert_eq!(stats.toast_chunk_puts.load(Ordering::Relaxed), 2);
+    }
+
+    struct IdleFails;
+
+    impl RecordSink for IdleFails {
+        fn on_record<'a>(
+            &'a mut self,
+            _record: &'a Record<'a>,
+        ) -> Pin<Box<dyn Future<Output = std::result::Result<(), SinkError>> + Send + 'a>> {
+            Box::pin(std::future::ready(Ok(())))
+        }
+
+        fn on_idle<'a>(
+            &'a mut self,
+        ) -> Pin<Box<dyn Future<Output = std::result::Result<(), SinkError>> + Send + 'a>> {
+            Box::pin(std::future::ready(Err(SinkError::Other("idle".into()))))
+        }
+    }
+
+    #[tokio::test]
+    async fn pump_names_the_segment_whose_idle_flush_failed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let seg = SegmentName {
+            timeline: 1,
+            log_id: 0,
+            seg_no: 1,
+        };
+        let path = write_segment(tmp.path(), seg).await;
+        let err = pump_segments_through(&[(seg, path)], DB, &mut IdleFails)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "wal_replay: 000000010000000000000001: idle"
+        );
     }
 }

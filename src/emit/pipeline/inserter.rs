@@ -231,6 +231,7 @@ pub(crate) async fn spawn_pool(
 mod tests {
     use super::*;
     use crate::decode::heap_decoder::ColumnValue;
+    use crate::emit::ch_emitter::ColumnBuf;
     use crate::emit::pipeline::ack;
     use crate::emit::pipeline::batcher::InsertBatch;
     use crate::emit::pipeline::resolver::tests::{GEOM_OID, seal, wkt_row};
@@ -277,6 +278,33 @@ mod tests {
         });
         let msg = run_one(batch).await;
         assert!(msg.starts_with("inserter type parse: "), "{msg}");
+    }
+
+    /// Slab shorter than its row count fails leaf or root build, before any dial
+    #[tokio::test]
+    async fn short_slab_trips_fatal() {
+        let mut batch = seal(vec![wkt_row(0, Some("POINT(1 2)"))]).await;
+        batch.buffers[0] = ColumnBuf::NullableFixed {
+            width: 4,
+            null_map: vec![0],
+            inner: Vec::new(),
+        };
+        let leaf = run_one(batch).await;
+        let mut batch = seal(vec![wkt_row(0, Some("POINT(1 2)"))]).await;
+        let lsn = batch
+            .buffers
+            .iter()
+            .position(|b| matches!(b, ColumnBuf::Fixed { width: 8, .. }))
+            .unwrap();
+        batch.buffers[lsn] = ColumnBuf::Fixed {
+            width: 8,
+            bytes: Vec::new(),
+        };
+        let root = run_one(batch).await;
+        for msg in [leaf, root] {
+            assert!(msg.starts_with("inserter: "), "{msg}");
+            assert!(msg.contains("fixed data"), "{msg}");
+        }
     }
 
     #[tokio::test]

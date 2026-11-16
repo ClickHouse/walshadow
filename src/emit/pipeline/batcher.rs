@@ -260,8 +260,7 @@ pub struct BatcherConfig {
     pub row_budget: usize,
     pub byte_budget: usize,
     pub inserters: usize,
-    /// Partial-batch deadline; caller passes positive (0 defaulted upstream)
-    /// so cold tables can't pin the watermark.
+    /// Partial-batch deadline, 0 takes pipeline default
     pub flush_timeout: Duration,
 }
 
@@ -427,22 +426,22 @@ fn snapshot(rx: Option<&watch::Receiver<Arc<ResolvedConfig>>>) -> Option<Arc<Res
 }
 
 /// Effective batch knobs: the live resolved snapshot when the overlay is wired,
-/// else the boot config. A zero live `flush_timeout` falls back to the pipeline
+/// else the boot config. A zero `flush_timeout` falls back to the pipeline
 /// default so a cold table can't pin the watermark.
 fn effective_cfg(boot: &BatcherConfig, resolved: Option<&ResolvedConfig>) -> BatcherConfig {
-    let Some(r) = resolved else {
-        return *boot;
-    };
-    let flush_timeout = if r.flush_timeout.is_zero() {
-        DEFAULT_PIPELINE_FLUSH
-    } else {
-        r.flush_timeout
-    };
-    BatcherConfig {
+    let cfg = resolved.map_or(*boot, |r| BatcherConfig {
         row_budget: r.row_budget,
         byte_budget: r.byte_budget,
         inserters: boot.inserters,
-        flush_timeout,
+        flush_timeout: r.flush_timeout,
+    });
+    if cfg.flush_timeout.is_zero() {
+        BatcherConfig {
+            flush_timeout: DEFAULT_PIPELINE_FLUSH,
+            ..cfg
+        }
+    } else {
+        cfg
     }
 }
 
@@ -1389,8 +1388,8 @@ mod tests {
         assert!(fatal.message().is_none());
     }
 
-    /// Zero live `flush_timeout` takes the documented pipeline fallback, so a
-    /// cold table can never pin the watermark.
+    /// Zero live or boot `flush_timeout` takes the documented pipeline
+    /// fallback, so a cold table can never pin the watermark.
     #[test]
     fn zero_live_timeout_takes_pipeline_fallback() {
         let boot = partial_block_cfg(Duration::from_secs(5));
@@ -1403,6 +1402,11 @@ mod tests {
             DEFAULT_PIPELINE_FLUSH
         );
         assert_eq!(effective_cfg(&boot, None).flush_timeout, boot.flush_timeout);
+        let zero_boot = partial_block_cfg(Duration::ZERO);
+        assert_eq!(
+            effective_cfg(&zero_boot, None).flush_timeout,
+            DEFAULT_PIPELINE_FLUSH
+        );
     }
 
     /// Feed `msgs`, hold input open until the batcher exits when `hold`,
@@ -1463,6 +1467,32 @@ mod tests {
         let (rel, route) = date_table("Int32");
         let msg = batcher_fatal(vec![one(rel, route, tuple(0, 1))], true, false).await;
         assert!(msg.contains("local temporal encoding"), "{msg}");
+    }
+
+    /// Row past the bridge frame cap seals the open batch, then fails alone
+    #[tokio::test]
+    async fn oversized_oracle_row_trips_fatal_after_seal() {
+        use crate::ops::bridge::MAX_REQUEST_BYTES;
+        let text_row = |seq, text: String| {
+            let mut r = tuple(seq, 1);
+            r.committed.decoded.new.as_mut().unwrap().columns = vec![Some(ColumnValue::Text(text))];
+            r
+        };
+        let (rel, route) = text_table("Array(Nullable(String))");
+        // Zeroed allocation stays untouched until the oracle cell copies it
+        let huge = String::from_utf8(vec![0; MAX_REQUEST_BYTES]).unwrap();
+        let msgs = vec![
+            one(rel.clone(), route.clone(), text_row(0, "x".into())),
+            one(rel, route, text_row(1, huge)),
+        ];
+        let msg = batcher_fatal(msgs, true, false).await;
+        let want = MAX_REQUEST_BYTES + 5;
+        assert_eq!(
+            msg,
+            format!(
+                "batcher: type: row needs {want} oracle bytes, one request carries {MAX_REQUEST_BYTES}"
+            )
+        );
     }
 
     #[tokio::test(start_paused = true)]

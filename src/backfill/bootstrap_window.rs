@@ -563,4 +563,39 @@ mod tests {
             names,
         );
     }
+
+    #[tokio::test]
+    async fn leg_reports_spill_dir_it_cannot_create() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("xact_spill"), b"").unwrap();
+        let mut catalog = CatalogMap::new();
+        catalog.insert(desc(16400, 16400, "public", "t"));
+        let stats = Arc::new(EmitterStats::default());
+        let cfg = WindowLegConfig {
+            dest: crate::config::DestEmitter::new(Arc::default(), None),
+            mapping: crate::mapping::mapping_handle(Default::default()),
+            config: Arc::new(ResolvedConfig::default()),
+            stats,
+            resolver: ToastResolver::disabled(),
+            oracle: None,
+            fatal: Fatal::new(),
+            scratch_dir: tmp.path().to_path_buf(),
+            patch: Arc::default(),
+            catalog,
+            pg_major: 17,
+            system_id: "7300000000000000001".into(),
+            timeline: 1,
+            wind_down: Duration::ZERO,
+        };
+        let err = replay_segments(cfg, &[], WAL_SEG_SIZE, WAL_SEG_SIZE)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            format!("{err:#}"),
+            format!(
+                "bootstrap window leg: open: create {}: File exists (os error 17)",
+                tmp.path().join("xact_spill").display()
+            )
+        );
+    }
 }

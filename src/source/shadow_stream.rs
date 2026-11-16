@@ -18,7 +18,7 @@
 use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -751,15 +751,10 @@ pub async fn spawn_listener(
     match addr {
         WalSenderAddr::Unix(path) => {
             let _ = tokio::fs::remove_file(&path).await;
-            if let Some(parent) = path.parent() {
-                tokio::fs::create_dir_all(parent).await?;
-            }
+            // Root and empty paths have no parent, `""` is a no-op create
+            tokio::fs::create_dir_all(path.parent().unwrap_or(Path::new(""))).await?;
             let listener = UnixListener::bind(&path)?;
-            Ok(tokio::spawn(run_unix_listener(
-                listener,
-                state,
-                flush_interval,
-            )))
+            Ok(tokio::spawn(run_listener(listener, state, flush_interval)))
         }
         WalSenderAddr::Tcp(addr) => {
             // SO_REUSEADDR (tokio sets it on unix): a prior bind in TIME_WAIT
@@ -768,45 +763,43 @@ pub async fn spawn_listener(
             let listener = TcpListener::bind(addr)
                 .await
                 .map_err(|e| io::Error::new(e.kind(), format!("bind {addr}: {e}")))?;
-            Ok(tokio::spawn(run_tcp_listener(
-                listener,
-                state,
-                flush_interval,
-            )))
+            Ok(tokio::spawn(run_listener(listener, state, flush_interval)))
         }
     }
 }
 
-async fn run_unix_listener(
-    listener: UnixListener,
-    state: Arc<Mutex<ShadowStreamState>>,
-    flush_interval: Duration,
-) {
-    loop {
-        match listener.accept().await {
-            Ok((sock, _)) => {
-                let state = state.clone();
-                tokio::spawn(handle_connection(sock, state, flush_interval));
-            }
-            Err(e) => {
-                tracing::warn!(target: "walshadow", error = %e, "walsender listener accept failed");
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-        }
+/// Walsender socket source, so the accept loop is shared across transports
+trait Listen: Send + 'static {
+    type Conn: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static;
+    fn accept_conn(&self) -> impl Future<Output = io::Result<Self::Conn>> + Send;
+}
+
+impl Listen for UnixListener {
+    type Conn = tokio::net::UnixStream;
+    async fn accept_conn(&self) -> io::Result<Self::Conn> {
+        Ok(self.accept().await?.0)
     }
 }
 
-async fn run_tcp_listener(
-    listener: TcpListener,
+impl Listen for TcpListener {
+    type Conn = tokio::net::TcpStream;
+    async fn accept_conn(&self) -> io::Result<Self::Conn> {
+        let (sock, _) = self.accept().await?;
+        let _ = sock.set_nodelay(true);
+        Ok(sock)
+    }
+}
+
+/// Accept clients forever, backing off after a failed accept (eg EMFILE)
+async fn run_listener(
+    listener: impl Listen,
     state: Arc<Mutex<ShadowStreamState>>,
     flush_interval: Duration,
 ) {
     loop {
-        match listener.accept().await {
-            Ok((sock, _)) => {
-                let _ = sock.set_nodelay(true);
-                let state = state.clone();
-                tokio::spawn(handle_connection(sock, state, flush_interval));
+        match listener.accept_conn().await {
+            Ok(sock) => {
+                tokio::spawn(handle_connection(sock, state.clone(), flush_interval));
             }
             Err(e) => {
                 tracing::warn!(target: "walshadow", error = %e, "walsender listener accept failed");
@@ -993,27 +986,20 @@ where
 }
 
 /// This walsender on a unix socket, standing in for a source PG
-#[cfg(test)]
-pub(crate) mod fake_source {
+#[cfg(any(test, feature = "test-support"))]
+pub mod fake_source {
     use super::*;
     use walrus::pg::replication::conn::PgConfig;
     use walrus::pg::replication::tls::SslMode;
 
-    pub(crate) struct FakeSource {
-        pub(crate) state: Arc<Mutex<ShadowStreamState>>,
-        pub(crate) cfg: PgConfig,
-        _dir: tempfile::TempDir,
-    }
-
-    pub(crate) async fn serve(state: ShadowStreamState) -> FakeSource {
-        let dir = tempfile::tempdir().unwrap();
-        let state = Arc::new(Mutex::new(state));
-        let socket = WalSenderAddr::Unix(dir.path().join("sock/.s.PGSQL.5432"));
-        spawn_listener(socket, state.clone(), Duration::from_millis(5))
+    /// Serve `state` under `dir`, returning the source config that dials it
+    pub async fn listen_in(dir: &Path, state: Arc<Mutex<ShadowStreamState>>) -> PgConfig {
+        let socket = WalSenderAddr::Unix(dir.join("sock/.s.PGSQL.5432"));
+        spawn_listener(socket, state, Duration::from_millis(5))
             .await
             .unwrap();
-        let cfg = PgConfig {
-            host: dir.path().join("sock").display().to_string(),
+        PgConfig {
+            host: dir.join("sock").display().to_string(),
             port: 5432,
             user: "test".into(),
             password: None,
@@ -1021,7 +1007,21 @@ pub(crate) mod fake_source {
             application_name: "fake-source".into(),
             sslmode: SslMode::Disable,
             tls: Default::default(),
-        };
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) struct FakeSource {
+        pub(crate) state: Arc<Mutex<ShadowStreamState>>,
+        pub(crate) cfg: PgConfig,
+        _dir: tempfile::TempDir,
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn serve(state: ShadowStreamState) -> FakeSource {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(Mutex::new(state));
+        let cfg = listen_in(dir.path(), state.clone()).await;
         FakeSource {
             state,
             cfg,
@@ -1175,6 +1175,40 @@ mod tests {
             "nothing left on that branch"
         );
         assert_eq!(s.timeline_ended_for(id), Some(switch));
+        assert_eq!(
+            s.aggregate().replay_timeline,
+            Some(1),
+            "client owed the next-timeline result still reads the ancestor",
+        );
+    }
+
+    /// First accept fails, the loop backs off and accepts again
+    struct FailsOnce(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl Listen for FailsOnce {
+        type Conn = tokio::io::DuplexStream;
+        async fn accept_conn(&self) -> io::Result<Self::Conn> {
+            if self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
+                return Err(io::Error::from_raw_os_error(libc::EMFILE));
+            }
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn failed_accept_backs_off_and_retries() {
+        let accepts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let state = Arc::new(Mutex::new(fresh_state()));
+        let task = tokio::spawn(run_listener(
+            FailsOnce(accepts.clone()),
+            state,
+            Duration::from_millis(10),
+        ));
+        tokio::time::sleep(Duration::from_millis(49)).await;
+        assert_eq!(accepts.load(std::sync::atomic::Ordering::Relaxed), 1);
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        assert_eq!(accepts.load(std::sync::atomic::Ordering::Relaxed), 2);
+        task.abort();
     }
 
     #[test]

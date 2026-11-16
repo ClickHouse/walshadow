@@ -163,15 +163,15 @@ impl ReplIdent {
             'd' => Ok(ReplIdent::Default { pk_attnums }),
             'n' => Ok(ReplIdent::Nothing),
             'f' => Ok(ReplIdent::Full { pk_attnums }),
-            'i' => {
-                let (index_oid, key_attnums) = using_index.ok_or_else(|| {
-                    "relreplident='i' but no pg_index row with indisreplident=true".to_owned()
-                })?;
-                Ok(ReplIdent::UsingIndex {
-                    index_oid,
-                    key_attnums,
-                })
-            }
+            // PG treats a dropped identity index as NOTHING, relreplident stays 'i'
+            'i' => Ok(
+                using_index.map_or(ReplIdent::Nothing, |(index_oid, key_attnums)| {
+                    ReplIdent::UsingIndex {
+                        index_oid,
+                        key_attnums,
+                    }
+                }),
+            ),
             other => Err(format!(
                 "unknown relreplident {other:?} (expected one of d/n/f/i)"
             )),
@@ -349,11 +349,10 @@ mod tests {
     use tokio_postgres::types::Oid;
 
     #[test]
-    fn replident_rejects_missing_index_and_unknown_code() {
-        assert!(
-            ReplIdent::from_parts('i', None, None)
-                .unwrap_err()
-                .contains("indisreplident")
+    fn replident_missing_index_is_nothing_and_unknown_code_errors() {
+        assert_eq!(
+            ReplIdent::from_parts('i', None, None).unwrap(),
+            ReplIdent::Nothing
         );
         assert!(
             ReplIdent::from_parts('x', None, None)

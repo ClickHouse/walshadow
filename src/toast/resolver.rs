@@ -535,27 +535,24 @@ impl ChunkStore for MemChunkStore {
                 })
                 .or_insert(r);
         }
-        let mut newest: HashMap<u32, BTreeMap<u32, (u64, &[u8])>> = HashMap::new();
-        for r in latest.into_values() {
-            if r.is_tombstone() || !wanted.contains(&r.chunk_id) {
-                continue;
-            }
+        let mut live: Vec<&ToastRow> = latest
+            .into_values()
+            .filter(|r| !r.is_tombstone() && wanted.contains(&r.chunk_id))
+            .collect();
+        // Newest copy of a chunk wins, as across TIDs after a rewrite
+        live.sort_by_key(|r| r.lsn);
+        let mut newest: HashMap<u32, BTreeMap<u32, &[u8]>> = HashMap::new();
+        for r in live {
             newest
                 .entry(r.chunk_id)
                 .or_default()
-                .entry(r.chunk_seq)
-                .and_modify(|e| {
-                    if r.lsn >= e.0 {
-                        *e = (r.lsn, &r.chunk_data);
-                    }
-                })
-                .or_insert((r.lsn, &r.chunk_data));
+                .insert(r.chunk_seq, &r.chunk_data);
         }
         values
             .iter()
             .map(|&(value_id, expected_size)| {
                 let mut asm = ChunkAssembler::new(expected_size);
-                for (&seq, (_, body)) in newest.get(&value_id).into_iter().flatten() {
+                for (&seq, body) in newest.get(&value_id).into_iter().flatten() {
                     asm.push(seq, body).map_err(ChunkStoreError::Clickhouse)?;
                 }
                 Ok(asm.finish())
@@ -1932,6 +1929,28 @@ mod tests {
     use super::*;
     use crate::emit::ch_emitter::InstanceConfig;
     use std::time::Duration;
+
+    /// Query orders by value id, so a smaller id after a larger one fails
+    #[test]
+    fn value_ids_out_of_order_are_refused() {
+        use clickhouse_c::{BlockOpts, BlockReader, SliceIo};
+        // chunk_id [8, 7], chunk_seq [0, 0], chunk_data ['a', 'b']
+        let native = b"\x03\x02\x08chunk_id\x06UInt32\x08\0\0\0\x07\0\0\0\
+            \x09chunk_seq\x06UInt32\0\0\0\0\0\0\0\0\
+            \x0achunk_data\x06String\x01a\x01b";
+        let mut io = SliceIo::new(native);
+        let mut reader =
+            BlockReader::new(io.as_mut(), Allocator::default(), BlockOpts::default()).unwrap();
+        let block = reader.read().unwrap().unwrap();
+        let expected = [(8, (0, 1)), (7, (1, 1))].into_iter().collect();
+        let mut out = Vec::new();
+        let e = read_value_block(&block, &expected, &mut out).unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "type: toast fetch: chunk_id 7: fetch order contract broken"
+        );
+        assert_eq!(out.iter().map(|(id, _)| *id).collect::<Vec<_>>(), [8]);
+    }
 
     fn row(value_id: u32, seq: u32, tid: (u32, u16), lsn: u64, body: &[u8]) -> ToastRow {
         ToastRow {

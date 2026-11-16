@@ -98,5 +98,4 @@ mismatch, policy divergence, and generator rejection in artifacts
 
 Supervisor must bound target processes, memory, disk, and input duration, preserve
 corpus on restart, and surface crashes. Promote found cases into deterministic
-regressions for [100% coverage work](coverage100.md) without treating percentage
-as substitute for semantic matrix
+regressions without treating line coverage as substitute for semantic matrix

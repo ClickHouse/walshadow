@@ -8,6 +8,8 @@ mod fx;
 
 use std::num::NonZeroUsize;
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use walshadow::mapping::{NameTemplate, NamespaceMapping};
@@ -27,11 +29,23 @@ const SCHEMA: &str = "CREATE SCHEMA app;\n\
 struct Env<'a> {
     ch: &'a fx::ChServer,
     source: &'a fx::ClusterGuard,
+    shadow: &'a fx::ClusterGuard,
     spill_dir: &'a Path,
 }
 
 /// Boot, `sabotage`, stream `stmts`, return the error they raise
 async fn fail_after(app_name: &str, sabotage: impl FnOnce(&Env), stmts: &[&str]) -> String {
+    fail_after_tuned(app_name, |_| {}, sabotage, stmts).await.0
+}
+
+/// [`fail_after`] with final say over the emitter config, also returning
+/// the pipeline's counters
+async fn fail_after_tuned(
+    app_name: &str,
+    tune: impl FnOnce(&mut walshadow::ch_emitter::EmitterConfig),
+    sabotage: impl FnOnce(&Env),
+    stmts: &[&str],
+) -> (String, Arc<walshadow::ch_emitter::EmitterStats>) {
     let slot = fx::Ports::alloc();
     let tmp = tempfile::tempdir().unwrap();
     let (
@@ -86,12 +100,15 @@ async fn fail_after(app_name: &str, sabotage: impl FnOnce(&Env), stmts: &[&str])
             cfg.retry.max_attempts = 0;
             // Mirror puts write through instead of waiting for a barrier
             cfg.toast.put_batch_rows = NonZeroUsize::new(1);
+            tune(cfg);
         },
     )
     .await;
+    let stats = pipeline.stats.clone();
     sabotage(&Env {
         ch: &ch,
         source: &source,
+        shadow: &shadow,
         spill_dir: &tmp.path().join("spill"),
     });
 
@@ -100,13 +117,14 @@ async fn fail_after(app_name: &str, sabotage: impl FnOnce(&Env), stmts: &[&str])
     let driver = fx::spawn_workload(&source, stmts);
     let pumped = fx::pump_segments_res(&mut pipeline, 1, Duration::from_secs(45)).await;
     let _ = driver.join();
-    match pumped {
+    let err = match pumped {
         Err(e) => e,
         Ok(_) => pipeline
             .shutdown()
             .await
             .expect_err("barrier against sabotaged CH succeeded"),
-    }
+    };
+    (err, stats)
 }
 
 fn drop_dest(env: &Env) {
@@ -237,4 +255,43 @@ async fn config_opt_in_without_ch_database_fails() {
     )
     .await;
     assert!(err.contains("opt-in: "), "{err}");
+}
+
+/// Plan past its in-memory cap spills to a file the disk budget refuses
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn plan_over_disk_budget_fails() {
+    if !fx::tools::requirements_available() {
+        return;
+    }
+    let (err, stats) = fail_after_tuned(
+        "walshadow-fault-plan-spool",
+        |cfg| cfg.plan_disk_max = 4096,
+        |_| {},
+        &[
+            "CREATE TABLE app.w (id int PRIMARY KEY, body text STORAGE PLAIN)",
+            "INSERT INTO app.w SELECT g, repeat('x', 8000) FROM generate_series(1, 150) g",
+        ],
+    )
+    .await;
+    assert!(err.contains("plan: plan spool"), "{err}");
+    assert!(err.contains("exceeds disk budget 4096"), "{err}");
+    assert_eq!(stats.plan_failures_spool.load(Ordering::Relaxed), 1);
+}
+
+/// Opt-in resolves its descriptor through the shadow catalog
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn config_opt_in_without_shadow_fails() {
+    if !fx::tools::requirements_available() {
+        return;
+    }
+    let err = fail_after(
+        "walshadow-fault-opt-in-shadow",
+        |env| env.shadow.stop().expect("stop shadow"),
+        &[
+            "INSERT INTO walshadow.config_table (namespace, relname, replicate, initial_load) \
+             VALUES ('other', 'u', true, 'none')",
+        ],
+    )
+    .await;
+    assert!(err.contains("opt-in: catalog: "), "{err}");
 }

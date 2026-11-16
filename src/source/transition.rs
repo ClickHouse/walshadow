@@ -211,6 +211,9 @@ pub struct ForkGuards {
 /// transaction in flight there is re-read rather than lost.
 #[derive(Debug, Clone, Copy)]
 pub struct ForkBarrier {
+    /// Records queued ahead of the decoder. Fork guards read the decoder's
+    /// view, where a queued record would read as a transaction open at the fork
+    pub pump_in_flight: u64,
     /// Highest commit acknowledged by the pipeline, floored at the oldest
     /// unresolved transaction ([`XactBuffer::resume_safe_lsn`]).
     ///
@@ -231,6 +234,8 @@ pub struct ForkBarrier {
 /// crossing anyway would resurrect the mixed state the barrier exists to delete.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ForkWait {
+    /// Pump-side queue still holds records the decoder has not seen
+    PumpQueue { in_flight: u64 },
     /// A transaction below the fork segment's start is not durable in
     /// ClickHouse, so resuming from that boundary would skip it.
     EmitterAck {
@@ -256,6 +261,7 @@ pub enum ForkWait {
 impl std::fmt::Display for ForkWait {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::PumpQueue { in_flight } => write!(f, "pump queue holds {in_flight} records"),
             Self::EmitterAck {
                 acked,
                 fork_segment,
@@ -283,9 +289,10 @@ impl std::fmt::Display for ForkWait {
 }
 
 impl ForkWait {
-    /// `waiting_on=` label, stable across the three reasons.
+    /// `waiting_on=` label, stable across reasons
     pub fn label(&self) -> &'static str {
         match self {
+            Self::PumpQueue { .. } => "pump_queue",
             Self::EmitterAck { .. } => "emitter_ack",
             Self::ShadowApply { .. } => "shadow_apply",
             Self::ArchiveSeal { .. } => "archive_seal",
@@ -310,6 +317,11 @@ impl ForkBarrier {
     ) -> Result<BarrierOpen, ForkWait> {
         // One barrier, three roles: retag each term onto barrier's role
         let fork_segment: Pos<Floor> = Pos::new(WalStream::align_down(switch_lsn.get(), seg_size));
+        if self.pump_in_flight != 0 {
+            return Err(ForkWait::PumpQueue {
+                in_flight: self.pump_in_flight,
+            });
+        }
         if self.resume_safe_lsn.retag() < fork_segment {
             return Err(ForkWait::EmitterAck {
                 acked: self.resume_safe_lsn,
@@ -1238,6 +1250,7 @@ mod tests {
     /// Everything caught up to a fork one segment in, at offset 0x1000
     fn caught_up() -> ForkBarrier {
         ForkBarrier {
+            pump_in_flight: 0,
             resume_safe_lsn: (SEG + 0x800).into(),
             shadow_apply_lsn: Some((SEG + 0x1000).into()),
             filter_durable: SEG.into(),
@@ -1276,6 +1289,18 @@ mod tests {
                 acked: (SEG - 1).into(),
                 fork_segment: SEG.into(),
             }),
+        );
+    }
+
+    #[test]
+    fn barrier_holds_while_the_pump_queue_drains() {
+        let b = ForkBarrier {
+            pump_in_flight: 3,
+            ..caught_up()
+        };
+        assert_eq!(
+            b.open(Pos::new(SEG + 0x1000), SEG).err(),
+            Some(ForkWait::PumpQueue { in_flight: 3 }),
         );
     }
 
@@ -1831,6 +1856,7 @@ mod tests {
     fn waits_render_what_they_wait_on() {
         let fork_segment: Pos<Floor> = SEG.into();
         let rendered = [
+            ForkWait::PumpQueue { in_flight: 2 },
             ForkWait::EmitterAck {
                 acked: 1.into(),
                 fork_segment,
@@ -1848,6 +1874,7 @@ mod tests {
         assert_eq!(
             rendered,
             [
+                "pump_queue: pump queue holds 2 records",
                 "emitter_ack: emitter acked 0x1, need 0x1000000",
                 "shadow_apply: shadow replay unknown, fork at 0x1000000",
                 "archive_seal: archive fsynced 0x0, need 0x1000000",

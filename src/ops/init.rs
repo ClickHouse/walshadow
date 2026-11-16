@@ -215,10 +215,11 @@ fn shadow_major_mismatch(source_version_num: i32) -> Option<String> {
         ));
     };
     let text = String::from_utf8_lossy(&out.stdout);
+    // `initdb (PostgreSQL) 19rc2 (Debian 19~rc2-1.pgdg13+1)`, packagers append a suffix
     let local = text
         .split_whitespace()
-        .last()
-        .and_then(|v| v.split(['.', 'd', 'r', 'b']).next())
+        .nth(2)
+        .and_then(|v| v.split(|c: char| !c.is_ascii_digit()).next())
         .and_then(|v| v.parse::<i32>().ok());
     match local {
         Some(major) if major == source_major => None,

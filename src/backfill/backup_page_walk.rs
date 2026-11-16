@@ -1835,4 +1835,15 @@ mod tests {
             ]
         );
     }
+
+    /// Null bitmap claiming more attributes than the tuple holds
+    #[test]
+    fn on_page_tuple_with_overlong_null_bitmap_decodes_nothing() {
+        use crate::decode::heap_decoder::HEAP_HASNULL;
+        let mut tuple = [0u8; 24];
+        tuple[18..20].copy_from_slice(&0x07FFu16.to_le_bytes());
+        tuple[20..22].copy_from_slice(&HEAP_HASNULL.to_le_bytes());
+        tuple[22] = 24;
+        assert!(decode_on_page_tuple(&tuple, &make_rel()).is_none());
+    }
 }

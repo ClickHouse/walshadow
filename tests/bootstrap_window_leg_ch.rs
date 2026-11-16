@@ -22,7 +22,7 @@ use walshadow::pipeline::Fatal;
 use walshadow::record::WAL_SEG_SIZE;
 use walshadow::schema::RelName;
 use walshadow::source_feed::{SourceFeed, open_sql_client};
-use walshadow::toast::{MemChunkStore, ToastResolver};
+use walshadow::toast::{ChunkStore, ChunkStoreError, FetchedValue, MemChunkStore, ToastResolver};
 use walshadow::visibility::PgXactPatch;
 use walshadow::wal_stream::WalStream;
 
@@ -288,4 +288,300 @@ async fn leg_reads_through_end_lsn_inside_its_first_segment() {
     if let Err(e) = result {
         panic!("{e:#}");
     }
+}
+
+fn leg_cfg(
+    port: u16,
+    dir: &std::path::Path,
+    catalog: walshadow::backfill::backup_page_walk::CatalogMap,
+    feed: &SourceFeed,
+    system_id: u64,
+    timeline: u32,
+) -> WindowLegConfig {
+    WindowLegConfig {
+        wind_down: Duration::from_secs(5),
+        dest: walshadow::config::DestEmitter::new(Arc::new(emitter(port)), None),
+        mapping: walshadow::mapping::mapping_handle(emitter(port).tables),
+        config: Arc::new(ResolvedConfig::default()),
+        stats: Arc::new(EmitterStats::default()),
+        resolver: ToastResolver::disabled(),
+        oracle: None,
+        fatal: Fatal::new(),
+        scratch_dir: dir.to_path_buf(),
+        patch: Arc::new(std::sync::Mutex::new(PgXactPatch::new())),
+        catalog,
+        pg_major: (feed.server_version_num() / 10000) as u32,
+        system_id: system_id.to_string(),
+        timeline,
+    }
+}
+
+/// Every way a live leg stops short of a clean seal: waiting out an xact
+/// open across the handoff, a caller unwinding, the source promoting, and
+/// the source shutting down
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn leg_waits_out_open_xacts_and_reports_how_the_stream_ended() {
+    if !fx::tools::requirements_available() {
+        return;
+    }
+    let slot = fx::Ports::alloc();
+    let tmp = tempfile::tempdir().unwrap();
+    let source = fx::make_pg(&tmp, "source", slot.source);
+    source.initdb().unwrap();
+    source.write_base_conf().unwrap();
+    fx::append_source_conf(&source);
+    source.start().unwrap();
+    let _stop = fx::StopOnDrop { sh: &source };
+    // Frequent reply requests: walsender notices promotion, and its shutdown
+    // sees the leg's ack, within a second instead of a minute
+    source
+        .psql_one("ALTER SYSTEM SET wal_sender_timeout = '2s'")
+        .unwrap();
+    source.psql_one("SELECT pg_reload_conf()").unwrap();
+    source
+        .apply_schema_dump(&format!(
+            "CREATE SCHEMA {SCHEMA};
+             CREATE TABLE {SCHEMA}.t (id int PRIMARY KEY, name text NOT NULL);
+             ALTER TABLE {SCHEMA}.t REPLICA IDENTITY FULL;
+             SELECT pg_switch_wal();"
+        ))
+        .unwrap();
+    let ch = fx::ChServer::spawn(tempfile::tempdir().unwrap(), slot.ch_tcp, slot.ch_http).unwrap();
+    ch.query("CREATE DATABASE walshadow_test").unwrap();
+    ch.query(
+        "CREATE TABLE walshadow_test.t (id Int32, name String, _lsn UInt64, _xid UInt32,
+         _commit_ts DateTime64(6, 'UTC'), _is_deleted Bool)
+         ENGINE = ReplacingMergeTree(_lsn, _is_deleted) ORDER BY id",
+    )
+    .unwrap();
+    let pg = fx::pg_cfg(&source, "window-end-test");
+    let sql = open_sql_client(&pg).await.unwrap();
+    let catalog = seed_catalog_from_source(&sql).await.unwrap();
+    let scratch = tmp.path().join("leg");
+
+    // Xact open across the handoff: the leg waits until it commits
+    let mut feed = SourceFeed::connect(&pg).await.unwrap();
+    let ident = feed.identify_system().await.unwrap();
+    let cfg = leg_cfg(
+        slot.ch_tcp,
+        &scratch,
+        catalog.clone(),
+        &feed,
+        ident.system_id,
+        1,
+    );
+    let holder = open_sql_client(&pg).await.unwrap();
+    holder
+        .batch_execute(&format!(
+            "BEGIN; INSERT INTO {SCHEMA}.t VALUES (500, 'spanning')"
+        ))
+        .await
+        .unwrap();
+    let handoff: String = sql
+        .query_one("SELECT pg_current_wal_insert_lsn()::text", &[])
+        .await
+        .unwrap()
+        .get(0);
+    let handoff = parse_pg_lsn(&handoff).unwrap();
+    // Committed xact flushes the open one's insert out to the leg
+    sql.batch_execute("SELECT txid_current()").await.unwrap();
+    let (_stop_tx, stop_rx) = tokio::sync::watch::channel(Some(handoff));
+    let (leg, ()) = tokio::join!(
+        stream_window(cfg.clone(), &mut feed, ident.xlogpos, stop_rx),
+        async {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            holder.batch_execute("COMMIT").await.unwrap();
+        }
+    );
+    let leg = leg.unwrap();
+    assert_eq!(leg.open_floor, None, "leg sealed before the commit landed");
+    assert_eq!(
+        ch.query("SELECT name FROM walshadow_test.t FINAL WHERE id = 500")
+            .unwrap(),
+        "spanning"
+    );
+
+    // Caller unwinding: closed stop watch seals where the leg stands
+    let mut feed = SourceFeed::connect(&pg).await.unwrap();
+    let ident = feed.identify_system().await.unwrap();
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(None);
+    drop(stop_tx);
+    let leg = stream_window(cfg.clone(), &mut feed, ident.xlogpos, stop_rx)
+        .await
+        .unwrap();
+    assert_eq!(
+        leg.through_lsn,
+        WalStream::align_down(ident.xlogpos, WAL_SEG_SIZE)
+    );
+
+    // Promotion ends the timeline the leg reads
+    source.stop().unwrap();
+    source.write_standby_signal().unwrap();
+    source.start().unwrap();
+    let mut feed = SourceFeed::connect(&pg).await.unwrap();
+    let ident = feed.identify_system().await.unwrap();
+    let promoter = open_sql_client(&pg).await.unwrap();
+    let far = tokio::sync::watch::channel(Some(u64::MAX));
+    let (leg, ()) = tokio::join!(
+        stream_window(cfg.clone(), &mut feed, ident.xlogpos, far.1.clone()),
+        async {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            promoter
+                .batch_execute("SELECT pg_promote(true, 60)")
+                .await
+                .unwrap();
+        }
+    );
+    let err = format!("{:#}", leg.unwrap_err());
+    assert!(
+        err.contains("source ended timeline 1 inside the backup window"),
+        "{err}"
+    );
+
+    // Shutdown closes the stream of the promoted timeline
+    let mut feed = SourceFeed::connect(&pg).await.unwrap();
+    let ident = feed.identify_system().await.unwrap();
+    let cfg = leg_cfg(slot.ch_tcp, &scratch, catalog, &feed, ident.system_id, 2);
+    let data_dir = source.config().data_dir.clone();
+    let (leg, ()) = tokio::join!(stream_window(cfg, &mut feed, ident.xlogpos, far.1), async {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        // Off this task, so the leg keeps acking while the walsender drains
+        let status = tokio::task::spawn_blocking(move || {
+            std::process::Command::new("pg_ctl")
+                .arg("-D")
+                .arg(data_dir)
+                .args(["-m", "fast", "-w", "stop"])
+                .status()
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(status.success());
+    });
+    let err = format!("{:#}", leg.unwrap_err());
+    assert!(
+        err.contains("source closed the stream inside the backup window"),
+        "{err}"
+    );
+}
+
+/// Takes chunk rows, refuses to write them
+struct RefusesPuts;
+
+#[async_trait::async_trait]
+impl ChunkStore for RefusesPuts {
+    fn accepts_writes(&self) -> bool {
+        true
+    }
+    async fn fetch_many(
+        &self,
+        _: u32,
+        _: u32,
+        values: &[(u32, usize)],
+        _: u64,
+    ) -> Result<Vec<FetchedValue>, ChunkStoreError> {
+        Ok(values.iter().map(|_| FetchedValue::Missing).collect())
+    }
+}
+
+/// Tail closing mid-leg fails next flush, a refused mirror write fails seal
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn leg_reports_tail_failures_at_flush_and_finish() {
+    if !fx::tools::requirements_available() {
+        return;
+    }
+    let slot = fx::Ports::alloc();
+    let tmp = tempfile::tempdir().unwrap();
+    let source = fx::make_pg(&tmp, "source", slot.source);
+    source.initdb().unwrap();
+    source.write_base_conf().unwrap();
+    fx::append_source_conf(&source);
+    source.start().unwrap();
+    let _stop = fx::StopOnDrop { sh: &source };
+    source
+        .apply_schema_dump(&format!(
+            "CREATE SCHEMA {SCHEMA};
+             CREATE TABLE {SCHEMA}.t (id int PRIMARY KEY, name text NOT NULL);
+             ALTER TABLE {SCHEMA}.t ALTER COLUMN name SET STORAGE EXTERNAL;
+             INSERT INTO {SCHEMA}.t VALUES (2, repeat('external', 1000));"
+        ))
+        .unwrap();
+    let ch = fx::ChServer::spawn(tempfile::tempdir().unwrap(), slot.ch_tcp, slot.ch_http).unwrap();
+    ch.query("CREATE DATABASE walshadow_test").unwrap();
+    ch.query(
+        "CREATE TABLE walshadow_test.t (id Int32, name String, _lsn UInt64, _xid UInt32,
+         _commit_ts DateTime64(6, 'UTC'), _is_deleted Bool)
+         ENGINE = ReplacingMergeTree(_lsn, _is_deleted) ORDER BY id",
+    )
+    .unwrap();
+    let pg = fx::pg_cfg(&source, "window-tail-test");
+    let sql = open_sql_client(&pg).await.unwrap();
+    let catalog = seed_catalog_from_source(&sql).await.unwrap();
+    let scratch = tmp.path().join("leg");
+
+    // Batcher refuses a destination type it cannot plan and exits
+    let mut feed = SourceFeed::connect(&pg).await.unwrap();
+    let ident = feed.identify_system().await.unwrap();
+    let mut cfg = leg_cfg(
+        slot.ch_tcp,
+        &scratch,
+        catalog.clone(),
+        &feed,
+        ident.system_id,
+        ident.timeline,
+    );
+    let mut bad_type = emitter(slot.ch_tcp);
+    for m in bad_type.tables.values_mut() {
+        m.columns[1].target_type = "NoSuchType".into();
+    }
+    cfg.mapping = walshadow::mapping::mapping_handle(bad_type.tables.clone());
+    cfg.dest = walshadow::config::DestEmitter::new(Arc::new(bad_type), None);
+    let writer = open_sql_client(&pg).await.unwrap();
+    let inserts = tokio::spawn(async move {
+        for id in 100..10_000 {
+            writer
+                .batch_execute(&format!("INSERT INTO {SCHEMA}.t VALUES ({id}, 'x')"))
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    });
+    let (_stop_tx, stop_rx) = tokio::sync::watch::channel(None);
+    let err = tokio::time::timeout(
+        Duration::from_secs(10),
+        stream_window(cfg, &mut feed, ident.xlogpos, stop_rx),
+    )
+    .await
+    .expect("leg outlived its tail")
+    .unwrap_err();
+    inserts.abort();
+    assert_eq!(
+        format!("{err:#}"),
+        "bootstrap window leg: flush: wal_replay: tail closed"
+    );
+
+    // Delete of a toasted row queues chunk tombstones the store refuses
+    sql.batch_execute("SELECT pg_switch_wal()").await.unwrap();
+    let mut feed = SourceFeed::connect(&pg).await.unwrap();
+    let ident = feed.identify_system().await.unwrap();
+    let mut cfg = leg_cfg(
+        slot.ch_tcp,
+        &scratch,
+        catalog,
+        &feed,
+        ident.system_id,
+        ident.timeline,
+    );
+    cfg.resolver = ToastResolver::with_store(Arc::new(RefusesPuts), cfg.stats.clone());
+    sql.batch_execute(&format!("DELETE FROM {SCHEMA}.t WHERE id = 2"))
+        .await
+        .unwrap();
+    let end = walshadow::pg::current_wal_lsn(&sql).await.unwrap();
+    sql.batch_execute("SELECT txid_current()").await.unwrap();
+    let (_stop_tx, stop_rx) = tokio::sync::watch::channel(Some(end));
+    let err = stream_window(cfg, &mut feed, ident.xlogpos, stop_rx)
+        .await
+        .unwrap_err();
+    let err = format!("{err:#}");
+    assert!(err.starts_with("bootstrap window leg: finish: "), "{err}");
 }

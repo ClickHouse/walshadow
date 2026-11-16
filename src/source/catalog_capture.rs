@@ -10,9 +10,9 @@
 //! its events from the stored entries against each oid's historical
 //! predecessor — no SQL, deterministic across restarts. Boundaries at or
 //! below the seed's `covered_through` are baked into the seed snapshot and
-//! skip entirely. A miss queries shadow; the returned replay position must
-//! equal `next_lsn` (nothing past the commit has published during the hold),
-//! anything else means the log lost coverage — fatal.
+//! skip entirely. A miss queries shadow pinned at `next_lsn` (nothing past
+//! the commit has published during the hold); replay anywhere else means the
+//! log lost coverage, fatal.
 //!
 //! Statistics-only commits leave relation definitions unchanged, so skip
 //! replay waits and save an empty batch. Restart loses evidence that only
@@ -86,9 +86,6 @@ crate::atomic_stats! {
         pub events_dropped,
         /// Ambiguity intervals published for unproven in-place changes
         pub ambiguities_published,
-        /// Unproven in-place changes whose whole interval the pending
-        /// timeline answered for, so the commit published no fence
-        pub ambiguities_suppressed,
         /// Command boundaries captured into the pending timeline
         pub pending_captures,
         /// Descriptors read across those captures
@@ -198,27 +195,15 @@ impl CatalogCapture {
         // rather than skips silently — an xact straddling the horizon would
         // otherwise claim coverage over boundaries nothing read
         if next_lsn <= self.log.covered_through() {
-            if self
-                .pending
-                .degrade(info.drain_xid, DegradeReason::ReplayMismatch)
-            {
-                self.stats.count_degrade(DegradeReason::ReplayMismatch);
-            }
+            self.degrade(info.drain_xid, DegradeReason::ReplayMismatch);
             return false;
         }
         // Whole-relcache flush or a namespace catcache hit names no
         // relations, and a full catalog scan per command is the one shape
-        // that makes holds expensive
+        // that makes holds expensive. Filter emits a command boundary only
+        // when it names relations or is one of those
         if info.capture_all {
-            if self
-                .pending
-                .degrade(info.drain_xid, DegradeReason::CaptureAll)
-            {
-                self.stats.count_degrade(DegradeReason::CaptureAll);
-            }
-            return false;
-        }
-        if info.oids.is_empty() {
+            self.degrade(info.drain_xid, DegradeReason::CaptureAll);
             return false;
         }
         match self.pending.admit(
@@ -233,6 +218,13 @@ impl CatalogCapture {
                 }
                 false
             }
+        }
+    }
+
+    /// Count a degrade only for the boundary that caused it
+    fn degrade(&self, xid: u32, reason: DegradeReason) {
+        if self.pending.degrade(xid, reason) {
+            self.stats.count_degrade(reason);
         }
     }
 
@@ -254,11 +246,9 @@ impl CatalogCapture {
     pub fn forget_aborted(&self, members: &[u32]) {
         use std::sync::atomic::Ordering::Relaxed;
         let dropped = self.pending.forget_members(members);
-        if dropped > 0 {
-            self.stats
-                .pending_entries_dropped_abort
-                .fetch_add(dropped as u64, Relaxed);
-        }
+        self.stats
+            .pending_entries_dropped_abort
+            .fetch_add(dropped as u64, Relaxed);
     }
 
     pub async fn capture_boundary(
@@ -267,22 +257,31 @@ impl CatalogCapture {
         commit_lsn: u64,
         parked: &ParkedAt,
     ) -> Result<(), SinkError> {
-        self.capture(info, commit_lsn, parked.lsn(), Some(parked))
+        use std::sync::atomic::Ordering::Relaxed;
+        if let BoundaryKind::Command { writer_xid } = info.kind {
+            let start = std::time::Instant::now();
+            let out = self.capture_command(info, writer_xid, parked).await;
+            self.stats
+                .capture_nanos
+                .fetch_add(start.elapsed().as_nanos() as u64, Relaxed);
+            return out;
+        }
+        self.capture_commit(info, commit_lsn, parked.lsn(), Some(parked))
             .await
     }
 
-    /// Commit boundary capture declined to park for: answered from the log or
-    /// an empty batch, never a shadow read
+    /// Statistics-only commit capture declined to park for: answered from the
+    /// log or an empty batch, never a shadow read
     pub async fn cover_unparked(
         &self,
         info: &BoundaryInfo,
         commit_lsn: u64,
         next_lsn: u64,
     ) -> Result<(), SinkError> {
-        self.capture(info, commit_lsn, next_lsn, None).await
+        self.capture_commit(info, commit_lsn, next_lsn, None).await
     }
 
-    async fn capture(
+    async fn capture_commit(
         &self,
         info: &BoundaryInfo,
         commit_lsn: u64,
@@ -291,14 +290,6 @@ impl CatalogCapture {
     ) -> Result<(), SinkError> {
         use std::sync::atomic::Ordering::Relaxed;
         let start = std::time::Instant::now();
-        if let BoundaryKind::Command { writer_xid } = info.kind {
-            let parked = parked.ok_or_else(|| unparked_read(next_lsn))?;
-            let out = self.capture_command(info, writer_xid, parked).await;
-            self.stats
-                .capture_nanos
-                .fetch_add(start.elapsed().as_nanos() as u64, Relaxed);
-            return out;
-        }
         // Late `XLOG_XACT_ASSIGNMENT` leaves a subxact's slots under its own
         // key; the commit's member list is the first place the whole tree is
         // named, so fold before anything reads the timeline — including the
@@ -311,12 +302,13 @@ impl CatalogCapture {
         let events = if let Some(batch) = self.log.batch_at(next_lsn) {
             self.stats.log_replays.fetch_add(1, Relaxed);
             self.replay_events(&batch)
-        } else if info.stats_only {
+        } else if let Some(parked) = parked
+            && !info.stats_only
+        {
+            self.sql_capture(info, commit_lsn, parked).await?
+        } else {
             self.cover_stub(commit_lsn, next_lsn).await?;
             Vec::new()
-        } else {
-            let parked = parked.ok_or_else(|| unparked_read(next_lsn))?;
-            self.sql_capture(info, commit_lsn, parked).await?
         };
         if !events.is_empty() {
             let mut buf = self.buffer.lock().await;
@@ -364,37 +356,28 @@ impl CatalogCapture {
                 continue;
             }
             let pred_desc = self.present_before(entry.oid, batch.captured_at);
-            match &entry.value {
-                LogValue::Present(desc) => {
-                    if let Some(event) = diff_event(pred_desc.as_deref(), desc) {
-                        out.push(PendingEvent {
-                            lsn: entry.valid_from,
-                            event,
-                        });
-                    }
-                }
-                LogValue::Dropped => {
-                    if let Some(old) = pred_desc {
-                        out.push(PendingEvent {
-                            lsn: entry.valid_from,
-                            event: SchemaEvent::Dropped {
-                                oid: entry.oid,
-                                rel_name: old.rel_name.clone(),
-                                partition: old.is_partition().then(|| DroppedPartition {
-                                    desc: old.clone(),
-                                    dropped: old
-                                        .ancestors
-                                        .iter()
-                                        .map(|a| a.oid)
-                                        .filter(|oid| dropped_here.contains(oid))
-                                        .collect(),
-                                }),
-                            },
-                        });
-                    }
-                }
-                LogValue::Retired => {}
-            }
+            // Not Present means Dropped, last_for_oid skips Retired
+            let event = if let LogValue::Present(desc) = &entry.value {
+                diff_event(pred_desc.as_deref(), desc)
+            } else {
+                pred_desc.map(|old| SchemaEvent::Dropped {
+                    oid: entry.oid,
+                    rel_name: old.rel_name.clone(),
+                    partition: old.is_partition().then(|| DroppedPartition {
+                        desc: old.clone(),
+                        dropped: old
+                            .ancestors
+                            .iter()
+                            .map(|a| a.oid)
+                            .filter(|oid| dropped_here.contains(oid))
+                            .collect(),
+                    }),
+                })
+            };
+            out.extend(event.map(|event| PendingEvent {
+                lsn: entry.valid_from,
+                event,
+            }));
         }
         out
     }
@@ -421,9 +404,9 @@ impl CatalogCapture {
             Ok(descs) => descs,
             Err(e) => {
                 let reason = degrade_reason(&e);
-                if self.pending.degrade(top_xid, reason) {
-                    self.stats.count_degrade(reason);
-                }
+                // Admitted, so not degraded before this read
+                self.pending.degrade(top_xid, reason);
+                self.stats.count_degrade(reason);
                 tracing::warn!(
                     target: "walshadow::desc_log",
                     xid = top_xid,
@@ -492,7 +475,10 @@ impl CatalogCapture {
         use std::sync::atomic::Ordering::Relaxed;
         let next_lsn = parked.lsn();
         self.stats.sql_captures.fetch_add(1, Relaxed);
-        let (replay_lsn, descs) = {
+        // Pinned read fails `ReplayMismatch` once shadow replayed past this
+        // boundary without a stored batch: log lost coverage (wiped or foreign
+        // spill dir), decode would misread
+        let descs = {
             let mut cat = self.catalog.lock().await;
             if info.capture_all {
                 self.stats.capture_all_runs.fetch_add(1, Relaxed);
@@ -502,17 +488,9 @@ impl CatalogCapture {
                 cat.fetch_descriptors_batch_at(&oids, parked).await
             }
         }
-        .map_err(|e| SinkError::Other(format!("descriptor capture at {commit_lsn:#X}: {e}")))?;
-        // Hold guarantees apply >= next_lsn; nothing past the commit has
-        // published, so equality is the only sane reading. Ahead = this
-        // boundary replayed into shadow without a stored batch: the log
-        // lost coverage (wiped/foreign spill dir), decode would misread
-        if replay_lsn != next_lsn {
-            return Err(SinkError::Other(format!(
-                "shadow replay {replay_lsn:#X} != boundary next_lsn {next_lsn:#X}: \
-                 descriptor log lost coverage; re-bootstrap or --ignore-cursor",
-            )));
-        }
+        .map_err(SinkError::ctx(format_args!(
+            "descriptor capture at {commit_lsn:#X}"
+        )))?;
         self.stats
             .rels_captured
             .fetch_add(descs.len() as u64, Relaxed);
@@ -657,12 +635,7 @@ impl CatalogCapture {
                                     "in-place change reads identically, bias-early kept",
                                 );
                             }
-                            if published.is_empty()
-                                && covered_from.is_some()
-                                && incompat.is_some_and(|i| i.is_physical())
-                            {
-                                self.stats.ambiguities_suppressed.fetch_add(1, Relaxed);
-                            } else if !published.is_empty() {
+                            if !published.is_empty() {
                                 tracing::warn!(
                                     target: "walshadow::desc_log",
                                     oid,
@@ -753,21 +726,16 @@ impl CatalogCapture {
     /// physical at capture — match on full identity
     /// Descriptor `oid` held just before `lsn`, `None` once dropped or retired
     fn present_before(&self, oid: Oid, lsn: u64) -> Option<Arc<RelDescriptor>> {
-        match &self.log.predecessor_before(oid, lsn)?.value {
-            LogValue::Present(d) => Some(d.clone()),
-            LogValue::Dropped | LogValue::Retired => None,
-        }
+        self.log
+            .predecessor_before(oid, lsn)?
+            .value
+            .present()
+            .cloned()
     }
 
     fn marker_for(&self, rfn: RelFileNode) -> Option<u64> {
         self.markers.lock().expect("smgr markers poisoned").get(rfn)
     }
-}
-
-fn unparked_read(next_lsn: u64) -> SinkError {
-    SinkError::Other(format!(
-        "catalog boundary at {next_lsn:#X} needs a shadow read but replay was not parked"
-    ))
 }
 
 /// Why an overlay read failed, as the transaction's degrade reason. A

@@ -111,7 +111,7 @@ pub struct PipelineConfig {
     /// One per database that applies CH DDL. A database with no entry has
     /// its schema events and truncates observed only (pairs with
     /// [`TailKind::Null`])
-    pub applicators: HashMap<Oid, DdlApplicator>,
+    pub ddl: HashMap<Oid, DbDdl>,
     pub tail: TailKind,
     pub buffer: Arc<Mutex<XactBuffer>>,
     pub subxact_tracker: Arc<Mutex<SubxactTracker>>,
@@ -122,9 +122,6 @@ pub struct PipelineConfig {
     /// Per-txn span map shared with the pump + buffer; `Some` only when OTLP
     /// tracing is on. Reorder parents `commit.drain`/`dispatch` under `txn`.
     pub span_registry: Option<TxnSpanRegistry>,
-    /// COPY backfillers for `initial_load='copy'` opt-ins, one per database.
-    /// A database with no entry streams from the opt-in LSN only
-    pub backfillers: HashMap<Oid, Arc<dyn crate::backfill::opt_in::Backfiller>>,
     /// Durable queue of deferred toast-mirror retires, loaded from the
     /// spill dir; entries due at resume retire in
     /// [`reorder::BootingReorder::boot`]
@@ -138,6 +135,15 @@ pub struct PipelineConfig {
     /// concurrently with the pipeline and must draw from the same pool.
     /// `None` builds one at spawn
     pub budget: Option<crate::budget::MemoryBudget>,
+}
+
+/// CH-side wiring of one database applying DDL
+pub struct DbDdl {
+    pub applicator: DdlApplicator,
+    /// COPY or backup-sourced backfill of `initial_load` opt-ins
+    pub backfiller: Arc<dyn crate::backfill::opt_in::Backfiller>,
+    /// Live config the opt-in diff and route freeze read
+    pub resolver: Arc<crate::config::ConfigResolver>,
 }
 
 /// Spawned-stage join handles + shared signals. The daemon drives the
@@ -180,14 +186,13 @@ impl PipelineConfig {
             inserter_pool_size,
             dbs,
             oracle,
-            applicators,
+            ddl,
             tail,
             buffer,
             subxact_tracker,
             pending,
             stats,
             span_registry,
-            backfillers,
             retires,
             pending_rows,
             resume_floor,
@@ -273,12 +278,11 @@ impl PipelineConfig {
             dbs,
             pending,
             subxact_tracker,
-            applicators,
+            ddl,
             ack,
             msg_tx,
             stats,
             planning,
-            backfillers,
             fatal.clone(),
             span_registry,
             emitter.drain_batch_rows,

@@ -646,6 +646,14 @@ pub async fn resolve_stash(
     let mut barriers: Vec<(u32, u64)> = Vec::with_capacity(rfns.len());
     for (rfn, mark) in &rfns {
         let (rfn, mark) = (*rfn, *mark);
+        // Foreign db never stashes rows worth keeping; counted
+        // cluster-level, once per filenode
+        if log.refuses_db(rfn.db_node) {
+            stats
+                .stash_foreign_db_skipped
+                .fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
         match log.descriptor_at_spanned(rfn, next_lsn) {
             Ok((rel, _)) if rel.kind == 't' => {
                 // Chunk layout is fixed, so an interval on a toast heap is an
@@ -715,13 +723,6 @@ pub async fn resolve_stash(
             // this xact's family (capture tombstones only predecessors, a
             // commit-time survivor would be Present), so no surviving rows
             Err(LookupMiss::Dropped | LookupMiss::Retired | LookupMiss::NotCovered) => {}
-            // Foreign db never stashes rows worth keeping; counted
-            // cluster-level, once per filenode
-            Err(LookupMiss::ForeignDb) => {
-                stats
-                    .stash_foreign_db_skipped
-                    .fetch_add(1, Ordering::Relaxed);
-            }
         }
     }
     let mut buf = buffer.lock().await;
@@ -1332,7 +1333,7 @@ impl XactBuffer {
             }
         }
         self.stats.drain_lsn = self.stats.drain_lsn.max(Pos::new(commit_lsn));
-        if states.is_empty() {
+        let Some(first) = states.iter().map(|st| st.first_lsn).min() else {
             // Read-only / filter-dropped: reorder coordinator still
             // registers a seq so the contiguous watermark passes commit_lsn
             self.stats.commits_unknown_xid += 1;
@@ -1342,11 +1343,9 @@ impl XactBuffer {
                 merged: None,
                 generations: Vec::new(),
             });
-        }
+        };
         // Preserve floor while decoded slices remain undurable
-        if let Some(first) = states.iter().map(|st| st.first_lsn).min() {
-            self.pending_durable.push(first, Pos::new(commit_lsn));
-        }
+        self.pending_durable.push(first, Pos::new(commit_lsn));
         for st in &states {
             self.stats.xacts_active = self.stats.xacts_active.saturating_sub(1);
             self.bytes_in_memory = self.bytes_in_memory.saturating_sub(st.in_mem_bytes);
@@ -1581,7 +1580,7 @@ impl Drop for PendingGauge {
 /// Lazy merge source for one xid: spill-reader head (older in WAL order)
 /// chained with the in-mem tail, one decoded entry resident. `pop` refills
 /// from the reader until EOF, then drains `in_mem`. The EOF reader parks as
-/// `Spent` so the file unlinks only at [`MergedDrain::finish`],
+/// `spent` so the file unlinks only at [`MergedDrain::finish`],
 /// post-dispatch.
 struct MergeSource {
     head: Option<SpillEntry>,
@@ -1591,8 +1590,7 @@ struct MergeSource {
 
 enum SpillSide {
     Unspilled,
-    Reading(SpillReader),
-    Spent(SpillReader),
+    Spilled { reader: SpillReader, spent: bool },
 }
 
 impl MergeSource {
@@ -1622,7 +1620,10 @@ impl MergeSource {
         gauge.add(reader.buffered_bytes());
         let mut src = Self {
             head: None,
-            spill: SpillSide::Reading(reader),
+            spill: SpillSide::Spilled {
+                reader,
+                spent: false,
+            },
             in_mem: in_mem.into(),
         };
         src.head = src.next_entry(gauge).await?;
@@ -1633,15 +1634,14 @@ impl MergeSource {
         &mut self,
         gauge: &mut ResidentGauge,
     ) -> std::result::Result<Option<SpillEntry>, SpillError> {
-        if let SpillSide::Reading(r) = &mut self.spill {
-            if let Some(entry) = r.next().await? {
+        if let SpillSide::Spilled { reader, spent } = &mut self.spill
+            && !*spent
+        {
+            if let Some(entry) = reader.next().await? {
                 gauge.add(approximate_size(&entry));
                 return Ok(Some(entry));
             }
-            if let SpillSide::Reading(r) = std::mem::replace(&mut self.spill, SpillSide::Unspilled)
-            {
-                self.spill = SpillSide::Spent(r);
-            }
+            *spent = true;
         }
         // Already counted at `open`; moving to head keeps it resident
         Ok(self.in_mem.pop_front())
@@ -2106,8 +2106,8 @@ impl MergedDrain {
             s.unlink()?;
         }
         for s in self.sources {
-            if let SpillSide::Reading(r) | SpillSide::Spent(r) = s.spill {
-                r.unlink().await?;
+            if let SpillSide::Spilled { reader, .. } = s.spill {
+                reader.unlink().await?;
             }
         }
         Ok(())
@@ -2699,25 +2699,24 @@ impl ValueResolution<'_> {
                     // Disabled mode: surface the unresolvable value as
                     // NULL/default downstream (`append_default`), counted,
                     // never an error.
-                    Reassembled::Missing if self.resolver.fill_on_miss() => {
+                    Reassembled::Missing { .. } if self.resolver.fill_on_miss() => {
                         self.resolver.note_filled_default();
                         *col = Some(ColumnValue::Null);
                     }
                     // In-xact chunks gapped or short: decode bug, surfaced loud
-                    outcome => {
+                    Reassembled::SizeMismatch { got, want } => {
                         self.resolver.note_fetch_miss();
-                        return Err(match outcome {
-                            Reassembled::SizeMismatch { got, want } => {
-                                XactBufferError::Detoast(format!(
-                                    "toast value {}/{}: chunks sum to {got} bytes, pointer says {want}",
-                                    p.va_toastrelid, p.va_valueid
-                                ))
-                            }
-                            _ => XactBufferError::MissingToastChunk {
-                                toast_relid: p.va_toastrelid,
-                                value_id: p.va_valueid,
-                                missing: first_missing_seq_ref(v),
-                            },
+                        return Err(XactBufferError::Detoast(format!(
+                            "toast value {}/{}: chunks sum to {got} bytes, pointer says {want}",
+                            p.va_toastrelid, p.va_valueid
+                        )));
+                    }
+                    Reassembled::Missing { seq } => {
+                        self.resolver.note_fetch_miss();
+                        return Err(XactBufferError::MissingToastChunk {
+                            toast_relid: p.va_toastrelid,
+                            value_id: p.va_valueid,
+                            missing: seq,
                         });
                     }
                 }
@@ -2771,24 +2770,14 @@ fn observed_mid_value(v: &ValueRef) -> bool {
         .is_some_and(|first| first > 0 && seqs.zip(first + 1..).all(|(seq, want)| seq == want))
 }
 
-/// First seq missing from a ref value's dense coverage, for the error
-/// message. Only walked on the error path.
-fn first_missing_seq_ref(v: &ValueRef) -> u32 {
-    let mut next = v.run_chunks;
-    for (&seq, _) in v.tail.range(v.run_chunks..) {
-        if seq != next {
-            return next;
-        }
-        next += 1;
-    }
-    next
-}
-
 /// Chunk coverage outcome, decompression failures remain errors
 #[cfg_attr(test, derive(Debug, PartialEq))]
 pub(crate) enum Reassembled {
     Bytes(Vec<u8>),
-    Missing,
+    /// First chunk seq absent from dense coverage
+    Missing {
+        seq: u32,
+    },
     /// Dense run failing PostgreSQL stored-size check
     SizeMismatch {
         got: usize,
@@ -2810,7 +2799,7 @@ pub(crate) fn reassemble_value_ref(
     let mut total = v.run.len as usize;
     for (next, (&seq, b)) in (v.run_chunks..).zip(v.tail.range(v.run_chunks..)) {
         if seq != next {
-            return Ok(Reassembled::Missing);
+            return Ok(Reassembled::Missing { seq: next });
         }
         total += b.len();
     }
@@ -3220,7 +3209,6 @@ impl BufferingDecoderSink {
         // hold, before successor bytes publish)
         let (rel, rel_valid_from) = match log.descriptor_at_spanned(rfn, record.source_lsn) {
             Ok(pair) => pair,
-            Err(LookupMiss::ForeignDb) => unreachable!("log picked by rfn.db_node"),
             // Rel that died before coverage horizon: counted row skip, never
             // a stash or a fatal
             Err(LookupMiss::NotCovered)
@@ -4528,6 +4516,59 @@ mod tests {
         assert_eq!(budget.resident_bytes(), 0);
     }
 
+    /// Foreground fetch of a value read-ahead missed keeps the read-ahead
+    /// permit in the one it returns
+    #[tokio::test(flavor = "current_thread")]
+    async fn read_ahead_permit_joins_foreground_fetch() {
+        use crate::toast::{ChunkStore, MemChunkStore, ToastRow};
+        let store = Arc::new(MemChunkStore::new());
+        let row = |chunk_id, data| ToastRow {
+            db_oid: 5,
+            toast_relid: 16500,
+            blkno: 1,
+            offnum: chunk_id as u16,
+            chunk_id,
+            chunk_seq: 0,
+            chunk_data: bytes::Bytes::from_static(data),
+            lsn: 1,
+        };
+        store
+            .put(&[row(55, b"abcd"), row(56, b"efgh")])
+            .await
+            .unwrap();
+        let stats = Arc::new(crate::emit::ch_emitter::EmitterStats::default());
+        let budget = crate::budget::MemoryBudget::with_leaf_reserve(2048, 1024);
+        let resolver = ToastResolver::with_store(store, stats.clone())
+            .with_budget(budget.clone())
+            .with_read_ahead();
+        resolver.read_ahead(5, toast_ptr(55), crate::schema::BYTEAOID, 0x100);
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while stats.toast_values_fetched.load(Ordering::Relaxed) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let mut heap = heap_with_value(1, 0x100, 0);
+        heap.descriptor = Arc::new(bytea_rel());
+        heap.decoded.new = Some(toast_ptr_tuple(55));
+        heap.decoded.old = Some(toast_ptr_tuple(56));
+        let permit = detoast_heap(&mut heap, None, &[], &resolver).await.unwrap();
+        let value = |t: &Option<DecodedTuple>| t.as_ref().unwrap().columns[0].clone();
+        assert_eq!(
+            [value(&heap.decoded.new), value(&heap.decoded.old)],
+            [
+                Some(ColumnValue::Bytea(b"abcd".to_vec())),
+                Some(ColumnValue::Bytea(b"efgh".to_vec()))
+            ]
+        );
+        assert_eq!(stats.toast_values_fetched.load(Ordering::Relaxed), 2);
+        assert!(budget.resident_bytes() >= 8);
+        drop(heap);
+        drop(permit);
+        assert_eq!(budget.resident_bytes(), 0);
+    }
+
     /// Read-ahead declines without a store, a budget, or an inline-sized
     /// pointer; a stored miss yields no value, leaving the pointer for
     /// foreground resolution
@@ -4746,6 +4787,11 @@ mod tests {
 
     /// One miss matrix for streaming and both bootstrap store owners: each
     /// cell's fill counter, or fail-closed detail plus fetch-miss count
+    #[test]
+    fn store_less_fetch_splits_as_no_store() {
+        assert_eq!(StoreMiss::split(None), Err(StoreMiss::NoStore));
+    }
+
     #[test]
     fn fill_store_miss_policy_matrix() {
         use std::sync::atomic::Ordering::Relaxed;
@@ -4986,6 +5032,29 @@ mod tests {
         assert_eq!(filled.load(std::sync::atomic::Ordering::Relaxed), 2);
     }
 
+    /// Store-bound pointer resolved without prefetch breaks caller contract
+    #[test]
+    #[should_panic(expected = "prefetched with the heap")]
+    fn resolve_store_without_prefetch_panics() {
+        let stats = Arc::new(crate::emit::ch_emitter::EmitterStats::default());
+        let resolver =
+            ToastResolver::with_store(Arc::new(crate::toast::MemChunkStore::new()), stats);
+        let mut r = ValueResolution {
+            spool: None,
+            xact_maps: &[],
+            resolver: &resolver,
+            cache: HashMap::new(),
+            retained: 0,
+        };
+        let p = ToastPointer {
+            va_rawsize: 8,
+            va_extinfo: 4,
+            va_valueid: 55,
+            va_toastrelid: 16500,
+        };
+        let _ = r.resolve_store(&p, 17);
+    }
+
     /// Store fetch runs once per key in one round trip: decode once,
     /// clone for earlier duplicate uses (old/new tuple reuse), move the
     /// buffer on the last
@@ -5030,11 +5099,8 @@ mod tests {
         let second = r.resolve_store(&p, 17).unwrap();
         assert_eq!(first, ColumnValue::Bytea(b"abcd".to_vec()));
         assert_eq!(second, ColumnValue::Bytea(b"abcd".to_vec()));
-        let (ColumnValue::Bytea(first), ColumnValue::Bytea(second)) = (&first, &second) else {
-            unreachable!();
-        };
-        assert_ne!(first.as_ptr(), stored);
-        assert_eq!(second.as_ptr(), stored);
+        assert!(matches!(&first, ColumnValue::Bytea(b) if b.as_ptr() != stored));
+        assert!(matches!(&second, ColumnValue::Bytea(b) if b.as_ptr() == stored));
         assert!(r.cache.is_empty(), "last use moves the buffer out");
         assert_eq!(r.retained, 8, "both uses retain their copy");
         assert_eq!(
@@ -6474,15 +6540,16 @@ mod tests {
             .drain_committed(StashResolved::nothing_stashed(4), 0, 0x9000, &[], false)
             .await
             .unwrap();
-        use SpillSide::Reading;
+        use SpillSide::Spilled;
         let merged = drain.merged.as_ref().unwrap();
         let Drained::Merged(m) = merged else { panic!() };
         let read_buffers = m
             .sources
             .iter()
             .map(|src| {
-                let Reading(r) = &src.spill else { panic!() };
-                r.buffered_bytes() as u64
+                let s = &src.spill;
+                let Spilled { reader, .. } = s else { panic!() };
+                reader.buffered_bytes() as u64
             })
             .sum::<u64>();
         let mut rows = 0usize;
@@ -6682,6 +6749,10 @@ mod tests {
             reassemble_value_ref(&p(50 + n - 1), spool, file_v).unwrap(),
             whole
         );
+        let mut past_end = file_v.clone();
+        past_end.run.offset += 1 << 20;
+        let e = reassemble_value_ref(&p(50 + n - 1), spool, &past_end).unwrap_err();
+        assert!(e.to_string().contains("body spool read: "), "{e}");
         // Mirror row refs materialize from the same spool
         let rows = &held.last().unwrap().new_rows;
         for r in rows.iter() {
@@ -6874,6 +6945,17 @@ mod tests {
             ..Default::default()
         };
         assert!(predecode(&truncate).is_none(), "truncate never predecodes");
+        let uncovered_raw = multi_insert_raw(1, 0x201, 16999, &[1]);
+        let uncovered = Record {
+            parsed: uncovered_raw.to_xlog_record(),
+            source_lsn: uncovered_raw.source_lsn,
+            route: Route::ToDecoder,
+            ..Default::default()
+        };
+        assert!(
+            predecode(&uncovered).is_none(),
+            "uncovered rel never predecodes"
+        );
         let decoy_raw = multi_insert_raw(1, 0x200, 16480, &[99]);
         let decoy = |rel: &Arc<RelDescriptor>, valid_from| {
             let set = decode_heap_record(&decoy_raw.to_xlog_record(), 0x200, rel).unwrap();

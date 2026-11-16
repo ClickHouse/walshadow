@@ -109,9 +109,6 @@ pub async fn filter_landed_wal(
             .await
             .with_context(|| format!("wal_landing: blank {}", seg.format()))?;
     }
-    crate::fs::fsync_dir(pg_wal)
-        .await
-        .with_context(|| format!("wal_landing: fsync {}", pg_wal.display()))?;
 
     let stats = stream.filter().stats();
     Ok(LandedWalStats {
@@ -130,13 +127,13 @@ async fn segments_on_disk(pg_wal: &Path, timeline: u32) -> Result<Vec<SegmentNam
     let mut dir = match tokio::fs::read_dir(pg_wal).await {
         Ok(d) => d,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(e).with_context(|| format!("wal_landing: read {}", pg_wal.display())),
+        Err(e) => return Err(e).context(format!("wal_landing: read {}", pg_wal.display())),
     };
     let mut found = Vec::new();
     while let Some(entry) = dir
         .next_entry()
         .await
-        .with_context(|| format!("wal_landing: scan {}", pg_wal.display()))?
+        .context(format!("wal_landing: scan {}", pg_wal.display()))?
     {
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
@@ -378,6 +375,136 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().starts_with("create "), "{err}");
+    }
+
+    /// Long page header of `seg`, then `body` at first record position
+    async fn write_wal(dir: &Path, seg: SegmentName, body: &[u8]) {
+        use walrus::pg::walparser::{WAL_PAGE_SIZE, XLP_LONG_HEADER, XLP_PAGE_MAGIC_PG15};
+        let mut bytes = Vec::with_capacity(WAL_SEG_SIZE as usize);
+        bytes.extend_from_slice(&XLP_PAGE_MAGIC_PG15.to_le_bytes());
+        bytes.extend_from_slice(&XLP_LONG_HEADER.to_le_bytes());
+        bytes.extend_from_slice(&seg.timeline.to_le_bytes());
+        bytes.extend_from_slice(&seg.start_lsn(WAL_SEG_SIZE).to_le_bytes());
+        bytes.extend_from_slice(&[0; 8]);
+        bytes.extend_from_slice(&12345u64.to_le_bytes());
+        bytes.extend_from_slice(&(WAL_SEG_SIZE as u32).to_le_bytes());
+        bytes.extend_from_slice(&u32::from(WAL_PAGE_SIZE).to_le_bytes());
+        bytes.extend_from_slice(body);
+        bytes.resize(WAL_SEG_SIZE as usize, 0);
+        tokio::fs::write(dir.join(seg.format()), bytes)
+            .await
+            .unwrap();
+    }
+
+    async fn filter_err(dir: &Path, end_lsn: u64) -> String {
+        filter_landed_wal(dir, 1, end_lsn, CatalogTracker::new(), None)
+            .await
+            .unwrap_err()
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn filter_rewrites_window_and_blanks_above_end() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_wal(tmp.path(), seg(1), &[]).await;
+        tokio::fs::write(tmp.path().join(seg(2).format()), [0xAA; 8])
+            .await
+            .unwrap();
+        let stats = filter_landed_wal(
+            tmp.path(),
+            1,
+            seg(2).start_lsn(WAL_SEG_SIZE),
+            CatalogTracker::new(),
+            None,
+        )
+        .await
+        .unwrap();
+        let blank = tokio::fs::read(tmp.path().join(seg(2).format()))
+            .await
+            .unwrap();
+        assert_eq!(
+            (stats.segments, stats.segments_blanked, blank.len() as u64),
+            (1, 1, WAL_SEG_SIZE)
+        );
+        assert!(blank.iter().all(|&b| b == 0));
+    }
+
+    #[tokio::test]
+    async fn filter_reports_unparsable_segment() {
+        let tmp = tempfile::tempdir().unwrap();
+        tokio::fs::write(tmp.path().join(seg(1).format()), {
+            let mut bytes = vec![0u8; WAL_SEG_SIZE as usize];
+            bytes[..3].copy_from_slice(&[0xFF, 0xFF, 1]);
+            bytes
+        })
+        .await
+        .unwrap();
+        let err = filter_err(tmp.path(), u64::MAX).await;
+        assert!(
+            err.starts_with(&format!("wal_landing: {}: ", seg(1).format())),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn filter_refuses_segment_walk_holds_back() {
+        use walrus::pg::walparser::{RmId, WAL_PAGE_SIZE};
+        let tmp = tempfile::tempdir().unwrap();
+        let mut rec = (2 * WAL_SEG_SIZE as u32).to_le_bytes().to_vec();
+        rec.extend_from_slice(&[0; 12]);
+        rec.extend_from_slice(&[0, RmId::Xact as u8, 0, 0]);
+        rec.resize(usize::from(WAL_PAGE_SIZE) - 40, 0xAA);
+        write_wal(tmp.path(), seg(1), &rec).await;
+        let end = seg(1).start_lsn(WAL_SEG_SIZE) + u64::from(WAL_PAGE_SIZE);
+        let err = filter_err(tmp.path(), end).await;
+        assert_eq!(err, "wal_landing: rewrote 0 of 1 in-window segments");
+    }
+
+    #[tokio::test]
+    async fn filter_reports_segment_it_cannot_read_or_blank() {
+        let tmp = tempfile::tempdir().unwrap();
+        tokio::fs::create_dir(tmp.path().join(seg(1).format()))
+            .await
+            .unwrap();
+        let err = filter_err(tmp.path(), u64::MAX).await;
+        assert!(err.starts_with("wal_landing: read "), "{err}");
+
+        tokio::fs::remove_dir(tmp.path().join(seg(1).format()))
+            .await
+            .unwrap();
+        write_wal(tmp.path(), seg(1), &[]).await;
+        tokio::fs::create_dir(tmp.path().join(seg(2).format()))
+            .await
+            .unwrap();
+        let err = filter_err(tmp.path(), seg(2).start_lsn(WAL_SEG_SIZE)).await;
+        assert_eq!(err, format!("wal_landing: blank {}", seg(2).format()));
+    }
+
+    #[tokio::test]
+    async fn scan_reports_leftover_it_cannot_remove() {
+        let tmp = tempfile::tempdir().unwrap();
+        let leftover = tmp.path().join(format!("{}.tmp", seg(1).format()));
+        tokio::fs::create_dir(&leftover).await.unwrap();
+        let err = segments_on_disk(tmp.path(), 1).await.unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!("wal_landing: remove {}", leftover.display())
+        );
+    }
+
+    #[tokio::test]
+    async fn copy_reports_segment_it_cannot_copy() {
+        let tmp = tempfile::tempdir().unwrap();
+        tokio::fs::create_dir(tmp.path().join(seg(1).format()))
+            .await
+            .unwrap();
+        let err = copy_window_segments(tmp.path(), &tmp.path().join("out"), 1, 0, u64::MAX)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!("copy WAL segment {}", seg(1).format())
+        );
     }
 
     #[tokio::test]

@@ -343,9 +343,11 @@ impl Shadow {
     // ----- lifecycle steps -------------------------------------------
 
     pub fn initdb(&self) -> Result<()> {
-        if let Some(parent) = self.config.data_dir.parent() {
-            fs::create_dir_all(parent)?;
-        }
+        self.config
+            .data_dir
+            .parent()
+            .map(fs::create_dir_all)
+            .transpose()?;
         fs::create_dir_all(&self.config.socket_dir)?;
         self.run(
             "initdb",
@@ -548,13 +550,7 @@ impl Shadow {
             // Keep labels stable for parser
             .env("LC_ALL", "C")
             .output()
-            .map_err(|e| {
-                if e.kind() == std::io::ErrorKind::NotFound {
-                    ShadowError::MissingBinary("pg_controldata".into())
-                } else {
-                    ShadowError::Io(e)
-                }
-            })?;
+            .map_err(|e| spawn_failed("pg_controldata", e))?;
         let out = self.check("pg_controldata", out)?;
         parse_controldata_floor(&String::from_utf8_lossy(&out.stdout))
     }
@@ -726,7 +722,6 @@ impl Shadow {
             .map_err(|e| ShadowError::PsqlParse(e.to_string()))
     }
 
-    /// Block until in recovery and replay LSN ≥ `target`, or `timeout`.
     pub fn has_database(&self) -> Result<bool> {
         // `standard_conforming_strings` is on by default, so doubling the
         // quote is the whole escape
@@ -737,6 +732,7 @@ impl Shadow {
         Ok(present == "t")
     }
 
+    /// Block until in recovery and replay LSN ≥ `target`, or `timeout`.
     pub fn wait_for_replay(&self, target: u64, timeout: Duration) -> Result<u64> {
         let start = Instant::now();
         loop {
@@ -847,13 +843,7 @@ impl Shadow {
             .args(args)
             .envs(env.iter().copied())
             .output()
-            .map_err(|e| {
-                if e.kind() == std::io::ErrorKind::NotFound {
-                    ShadowError::MissingBinary(cmd.into())
-                } else {
-                    ShadowError::Io(e)
-                }
-            })?;
+            .map_err(|e| spawn_failed(cmd, e))?;
         self.check(cmd, out)
     }
 
@@ -866,6 +856,15 @@ impl Shadow {
             status: out.status.code().unwrap_or(-1),
             stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
         })
+    }
+}
+
+/// Missing binary names the command, any other spawn failure stays io
+fn spawn_failed(cmd: &str, e: std::io::Error) -> ShadowError {
+    if e.kind() == std::io::ErrorKind::NotFound {
+        ShadowError::MissingBinary(cmd.into())
+    } else {
+        ShadowError::Io(e)
     }
 }
 
@@ -1320,6 +1319,10 @@ cat "$dir/answers/$key""#,
         incompatible("bridge worker increase requires shadow restart");
         answer(&answers, "bridge_workers", "2");
         shadow.validate_running().unwrap();
+        // No bridge configured, so worker count goes unchecked
+        answer(&answers, "bridge_workers", "1");
+        cfg.bridge = None;
+        Shadow::new(cfg).validate_running().unwrap();
     }
 
     #[test]
@@ -1381,6 +1384,20 @@ cat "$dir/answers/$key""#,
             .to_string();
         let want = "timeout waiting for pg_last_wal_replay_lsn >= 0x11 after";
         assert!(err.starts_with(want), "{err}");
+        // Replay reaches target only once a poll has slept
+        let dbs = answers.with_file_name("dbs");
+        let probes = move || fs::read_to_string(&dbs).unwrap().lines().count();
+        let polled = probes() + 3;
+        let catch_up = std::thread::spawn(move || {
+            while probes() < polled {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            answer(&answers, "replay", "0/11");
+            answers
+        });
+        let reached = shadow.wait_for_replay(0x11, Duration::from_secs(10));
+        let answers = catch_up.join().unwrap();
+        assert_eq!(reached.unwrap(), 0x11);
         answer(&answers, "recovery", "f");
         assert!(matches!(
             shadow.wait_for_replay(0x11, Duration::ZERO),
@@ -1423,11 +1440,8 @@ cat "$dir/answers/$key""#,
         cfg.pg_bin_dir = Some(bin.clone());
         let shadow = Shadow::new(cfg);
 
-        let Err(ShadowError::Process { cmd, stderr, .. }) = shadow.start_with_floor_retry(None)
-        else {
-            panic!("start must fail");
-        };
-        assert_eq!(cmd, "pg_ctl");
+        let err = shadow.start_with_floor_retry(None).unwrap_err().to_string();
+        let stderr = err.strip_prefix("pg_ctl failed (exit 1): ").unwrap();
         let (head, tail) = stderr.split_once("\nstartup.log tail:\n").unwrap();
         assert_eq!(head, "pg_ctl: could not start server\n");
         assert!(tail.ends_with("attempt 1\nattempt 2\n"), "{tail}");
@@ -1436,6 +1450,50 @@ cat "$dir/answers/$key""#,
         assert!(!data.join("postmaster.pid").exists());
         let conf = fs::read_to_string(data.join("postgresql.conf")).unwrap();
         assert!(conf.contains("max_connections = 200"), "{conf}");
+    }
+
+    /// Running postmaster without a pidfile has exited, unreadable one fails
+    #[test]
+    fn wait_started_reads_pidfile_absence_and_faults() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("bin");
+        let data = tmp.path().join("data");
+        fs::create_dir_all(&bin).unwrap();
+        fs::create_dir_all(&data).unwrap();
+        stub_bin(&bin.join("pg_ctl"), "exit 0");
+        let mut cfg = ShadowConfig::new(data.clone(), tmp.path().join("filtered"));
+        cfg.pg_bin_dir = Some(bin);
+        let shadow = Shadow::new(cfg);
+        assert!(!shadow.wait_started().unwrap());
+        fs::create_dir(data.join("postmaster.pid")).unwrap();
+        let err = shadow.wait_started().unwrap_err();
+        assert!(
+            matches!(&err, ShadowError::Io(e) if e.kind() == std::io::ErrorKind::IsADirectory),
+            "{err}"
+        );
+    }
+
+    /// Binary present but not executable is an io fault, not a missing one
+    #[test]
+    fn unexecutable_binaries_surface_io() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        for name in ["pg_controldata", "pg_ctl"] {
+            fs::write(bin.join(name), "").unwrap();
+        }
+        let mut cfg = ShadowConfig::new(tmp.path().join("data"), tmp.path().join("filtered"));
+        cfg.pg_bin_dir = Some(bin);
+        let shadow = Shadow::new(cfg);
+        let denied = |r: Result<()>| {
+            let err = r.unwrap_err();
+            assert!(
+                matches!(&err, ShadowError::Io(e) if e.kind() == std::io::ErrorKind::PermissionDenied),
+                "{err}"
+            );
+        };
+        denied(shadow.control_guc_floor().map(drop));
+        denied(shadow.stop());
     }
 
     #[test]

@@ -21,11 +21,11 @@ use crate::ch::EmitterError;
 use crate::config::DestEmitter;
 use crate::config::ResolvedConfig;
 use crate::emit::ch_emitter::EmitterStats;
+use crate::emit::pipeline::Fatal;
 use crate::emit::pipeline::ack::{self, AckHandle};
 use crate::emit::pipeline::batcher::{self, BatcherConfig, BatcherMsg, InsertBatch};
 use crate::emit::pipeline::inserter;
 use crate::emit::pipeline::resolver::{self, ResolvedBatch};
-use crate::emit::pipeline::{DEFAULT_PIPELINE_FLUSH, Fatal};
 use crate::pos::{EmitterAck, Monotone};
 use foldhash::{HashMap, HashMapExt};
 
@@ -303,12 +303,6 @@ pub async fn spawn_with_config(
         },
     );
 
-    // Boot fallback for the batcher; the live path re-reads from `config_rx`.
-    let flush_timeout = if emitter.flush_timeout.is_zero() {
-        DEFAULT_PIPELINE_FLUSH
-    } else {
-        emitter.flush_timeout
-    };
     let batcher = batcher::spawn(
         msg_rx,
         batches_tx,
@@ -316,7 +310,7 @@ pub async fn spawn_with_config(
             row_budget: emitter.row_budget,
             byte_budget: emitter.byte_budget,
             inserters: n,
-            flush_timeout,
+            flush_timeout: emitter.flush_timeout,
         },
         Allocator::global(&mimalloc::MiMalloc),
         fatal,

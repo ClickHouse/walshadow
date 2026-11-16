@@ -14,11 +14,13 @@ use walshadow::runtime_config::InitialLoadMode;
 use walshadow::schema::RelName;
 use walshadow::shadow_catalog::ShadowCatalog;
 
+/// Reload on each `sig` item, returning once signals end
 pub(crate) async fn sighup_reload(
-    mut sig: tokio::signal::unix::Signal,
+    mut sig: impl futures::Stream<Item = ()> + Unpin,
     reloader: Arc<walshadow::control::Reloader>,
 ) {
-    while sig.recv().await.is_some() {
+    use futures::StreamExt;
+    while sig.next().await.is_some() {
         tracing::info!(target: "walshadow", "SIGHUP — live reload");
         match reloader.reload().await {
             Err(e) => {
@@ -263,6 +265,18 @@ pub(crate) async fn refresh_mapping(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn sighup_reload_runs_per_signal_and_returns_once_they_end() {
+        use tracing::instrument::WithSubscriber;
+        use tracing_subscriber::layer::SubscriberExt;
+        let messages = crate::housekeeping::tests::Messages::default();
+        let reloader = Arc::new(walshadow::control::Reloader::default());
+        sighup_reload(futures::stream::iter([(), ()]), reloader)
+            .with_subscriber(tracing_subscriber::registry().with(messages.clone()))
+            .await;
+        assert_eq!(messages.count("SIGHUP — live reload"), 2);
+    }
 
     #[tokio::test]
     async fn refresh_mapping_republishes_until_sender_drops() {

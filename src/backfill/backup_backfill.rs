@@ -1912,4 +1912,30 @@ mod tests {
             assert!(validate_backup_lineage(&TimelineHistory::root(1), &start, &end).is_err());
         }
     }
+
+    /// Walk proof the tail cannot back stops checkpoint recording
+    #[tokio::test]
+    async fn record_walked_fails_once_tail_cannot_prove_walk() {
+        let tail = OwnedTail::null();
+        // Second registration of seq 0 wedges the ack collector
+        for _ in 0..2 {
+            tail.ack.seqs(0).mark(0);
+        }
+        let barrier = WalkBarrier::new(std::time::Duration::from_millis(1));
+        barrier
+            .publish_gate(vec![("base/5/16400".into(), 0)], SpoolMark::default())
+            .await;
+        barrier.publish_drain(0, 1, SpoolMark::default()).await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = BackupCheckpoint::new(
+            InitialLoadMode::ObjectStore,
+            &[],
+            &Arc::default(),
+            &crate::emit::ch_emitter::EmitterConfig::default(),
+            None,
+        );
+        let err = record_walked(Some(&barrier), &tail, &mut state, dir.path()).await;
+        assert!(err.to_string().contains("seq registered twice"), "{err}");
+        assert!(BackupCheckpoint::load(dir.path()).await.unwrap().is_none());
+    }
 }

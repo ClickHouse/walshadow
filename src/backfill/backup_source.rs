@@ -333,9 +333,7 @@ where
     R: AsyncRead + Unpin + Send,
 {
     let target = data_dir.join(&meta.path);
-    if let Some(parent) = target.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
+    tokio::fs::create_dir_all(target.parent().unwrap_or(data_dir)).await?;
     match &meta.kind {
         FileKind::Dir => {
             match tokio::fs::create_dir(&target).await {
@@ -588,6 +586,29 @@ mod tests {
         );
         assert_eq!(recording.tapped.lock().unwrap().len(), 0);
         assert_eq!(recording.events.lock().unwrap().len(), 8);
+    }
+
+    /// Kept dir the data dir cannot hold fails the pump
+    #[tokio::test]
+    async fn pump_tar_surfaces_kept_dir_it_cannot_create() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir(&data_dir).unwrap();
+        std::fs::set_permissions(&data_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let mut w = tarball::Writer::new(Vec::new());
+        let dir = tarball::Entry::new("pg_tblspc", Kind::Directory, 0, 0o700, 0);
+        w.append(&dir, tokio::io::empty()).await.unwrap();
+        let bytes = w.finish().await.unwrap();
+        let target = PumpTarget::new(
+            data_dir,
+            Arc::new(Arc::new(RecordingSink::default())),
+            Arc::new(PumpStats::default()),
+        );
+        let err = pump_tar_to_sink(&mut tarball::Reader::new(bytes.as_slice()), &target)
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
     }
 
     /// PG never emits `..` but a hostile / corrupt tar must not escape data_dir

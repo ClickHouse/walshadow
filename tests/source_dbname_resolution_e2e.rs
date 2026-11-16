@@ -147,56 +147,60 @@ async fn shadow_catalog_follows_applied_source_dbname() {
     let stderr_path = tmp.path().join("daemon.stderr.log");
     let stderr_file = fs::File::create(&stderr_path).expect("open daemon stderr log");
     let metrics_addr: SocketAddr = format!("127.0.0.1:{}", slot.metrics).parse().unwrap();
-    let child = Command::new(bin)
-        .args([
-            "--host",
-            source.config().socket_dir.to_str().unwrap(),
-            "--port",
-            &fx::PG_SOURCE_PORT.to_string(),
-            "--user",
-            "postgres",
-            "--dbname",
-            "postgres",
-            "--sslmode",
-            "disable",
-            "--out-dir",
-            shadow_filter_dir.to_str().unwrap(),
-            "--shadow-socket-dir",
-            shadow_sock.to_str().unwrap(),
-            "--shadow-port",
-            &fx::PG_SHADOW_PORT.to_string(),
-            "--shadow-user",
-            "postgres",
-            "--shadow-dbname",
-            "postgres",
-            "--bridge-lib-dir",
-            fx::pgext_dir().to_str().unwrap(),
-            "--spill-dir",
-            spill_dir.to_str().unwrap(),
-            "--status-interval",
-            "1",
-            "--metrics-bind",
-            &metrics_addr.to_string(),
-            "--walsender-bind",
-            &format!("127.0.0.1:{}", slot.walsender),
-            "--retention-bytes",
-            "0",
-            "--ch-config",
-            ch_config_path.to_str().unwrap(),
-            "--bootstrap-mode",
-            "direct",
-            "--bootstrap-shadow-data-dir",
-            bootstrap_shadow_data_dir.to_str().unwrap(),
-            "--bootstrap-shadow-replay-timeout",
-            "120",
-        ])
-        .env("RUST_LOG", "warn,walshadow=info")
-        .stdout(Stdio::null())
-        .stderr(Stdio::from(stderr_file))
-        .process_group(0)
-        .spawn()
-        .expect("spawn walshadow-stream");
-    let _guard = fx::ChildGuard::new(child);
+    let args = [
+        "--host",
+        source.config().socket_dir.to_str().unwrap(),
+        "--port",
+        &fx::PG_SOURCE_PORT.to_string(),
+        "--user",
+        "postgres",
+        "--dbname",
+        "postgres",
+        "--sslmode",
+        "disable",
+        "--out-dir",
+        shadow_filter_dir.to_str().unwrap(),
+        "--shadow-socket-dir",
+        shadow_sock.to_str().unwrap(),
+        "--shadow-port",
+        &fx::PG_SHADOW_PORT.to_string(),
+        "--shadow-user",
+        "postgres",
+        "--shadow-dbname",
+        "postgres",
+        "--bridge-lib-dir",
+        fx::pgext_dir().to_str().unwrap(),
+        "--spill-dir",
+        spill_dir.to_str().unwrap(),
+        "--status-interval",
+        "1",
+        "--metrics-bind",
+        &metrics_addr.to_string(),
+        "--walsender-bind",
+        &format!("127.0.0.1:{}", slot.walsender),
+        "--retention-bytes",
+        "0",
+        "--ch-config",
+        ch_config_path.to_str().unwrap(),
+        "--bootstrap-mode",
+        "direct",
+        "--bootstrap-shadow-data-dir",
+        bootstrap_shadow_data_dir.to_str().unwrap(),
+        "--bootstrap-shadow-replay-timeout",
+        "120",
+    ]
+    .map(String::from);
+    let spawn = |stderr: fs::File| {
+        Command::new(&bin)
+            .args(&args)
+            .env("RUST_LOG", "warn,walshadow=info")
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(stderr))
+            .process_group(0)
+            .spawn()
+    };
+    let child = spawn(stderr_file).expect("spawn walshadow-stream");
+    let mut guard = fx::ChildGuard::new(child);
 
     let result = (|| -> Result<()> {
         fx::wait_for_listen(metrics_addr, Duration::from_secs(90))
@@ -281,6 +285,20 @@ async fn shadow_catalog_follows_applied_source_dbname() {
                 == "2",
             "duptest's destination holds its own two rows and no others"
         );
+
+        // Second database recreated while down: shadow still holds the old oid
+        if let Some(mut first) = guard.child.take() {
+            fx::tools::stop_gracefully(&mut first);
+        }
+        psql_db(&source, "duptest", "DROP DATABASE postgres")?;
+        psql_db(&source, "duptest", "CREATE DATABASE postgres")?;
+        let stderr = fs::OpenOptions::new().append(true).open(&stderr_path)?;
+        let status = spawn(stderr)?.wait()?;
+        let log = fs::read_to_string(&stderr_path)?;
+        anyhow::ensure!(
+            !status.success() && log.contains("recreated after the shadow's backup, re-bootstrap"),
+            "boot accepted a recreated database ({status})"
+        );
         Ok(())
     })();
 
@@ -298,4 +316,54 @@ async fn shadow_catalog_follows_applied_source_dbname() {
         let stderr = fs::read_to_string(&stderr_path).unwrap_or_default();
         panic!("{e:#}\n--- daemon stderr ---\n{stderr}");
     }
+}
+
+/// HELLO names the worker's database, so a link whose catalog dials another
+/// database is refused, and an unreachable catalog names its database
+#[tokio::test]
+async fn db_link_refuses_a_catalog_of_another_database() {
+    use walshadow::source_db::{DbLink, DbLinkConfig};
+    if !fx::tools::pg_available() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let source = fx::start_bridged_source(&tmp);
+    let _stop = fx::StopOnDrop { sh: &source };
+    let cfg = source.config();
+    let bridge_path = cfg.socket_dir.join("walshadow-bridge.sock");
+    // Worker registers its socket after postmaster accepts connections
+    walshadow::bridge::connect_with_budget(&bridge_path, 1, Duration::from_secs(20))
+        .await
+        .expect("dial bridge worker");
+    let link = async |name: &str| {
+        let conninfo = walshadow::pg::socket_conninfo(
+            cfg.socket_dir.to_str().unwrap(),
+            cfg.port,
+            "postgres",
+            name,
+        );
+        DbLink::connect(DbLinkConfig {
+            name,
+            index: 0,
+            workers: 1,
+            bridge_path: &bridge_path,
+            shadow_conninfo: &conninfo,
+            budget: Duration::ZERO,
+            emitter: None,
+        })
+        .await
+        .err()
+        .map(|e| e.to_string())
+    };
+    let wrong = link("template1").await.unwrap();
+    let want = format!(
+        "bridge socket {} serves database oid 5, but template1 is oid 1; \
+         shadow's walshadow.databases disagrees with this config",
+        bridge_path.display()
+    );
+    assert_eq!(wrong, want);
+    assert_eq!(
+        link("absent").await.as_deref(),
+        Some("connect to shadow PG database absent")
+    );
 }

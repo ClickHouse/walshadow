@@ -17,9 +17,8 @@
 //! `'object_store'` coalesce into a backup-sourced page-walk pass
 //! ([`crate::backfill::backup_backfill`], architecture/bootstrap.md). All
 //! converge with the WAL stream via `ReplacingMergeTree(_lsn)` dedup, and the
-//! backfiller's ledger dedups restarts. `None` (backfiller not wired) streams
-//! from the opt-in LSN only; so do unknown mode strings (validate-late, never
-//! crash).
+//! backfiller's ledger dedups restarts. Unknown mode strings stream from the
+//! opt-in LSN only (validate-late, never crash).
 
 use std::sync::Arc;
 
@@ -66,24 +65,34 @@ pub async fn apply_table_opt_in(
     resolver: &ConfigResolver,
     applicator: &mut DdlApplicator,
     catalog: &Arc<Mutex<ShadowCatalog>>,
-    backfiller: Option<&Arc<dyn Backfiller>>,
+    backfiller: &Arc<dyn Backfiller>,
     rel: &RelName,
     row: &TableRow,
     opt_in_lsn: u64,
 ) -> Result<(), EmitterError> {
     match row.replicate {
         Some(true) => {
-            let desc = catalog
-                .lock()
-                .await
-                .descriptor_by_name(rel)
-                .await
-                .map_err(|error| EmitterError::Catalog(error.to_string()))?;
-            match desc {
-                Some(desc) => {
-                    if shadow_serves_toast(resolver, catalog, &desc).await? {
-                        opt_in_known(resolver, applicator, backfiller, &desc, row, opt_in_lsn)
-                            .await?;
+            let resolved = async {
+                let Some(desc) = catalog.lock().await.descriptor_by_name(rel).await? else {
+                    return anyhow::Ok(None);
+                };
+                let served = shadow_serves_toast(resolver, catalog, &desc).await?;
+                anyhow::Ok(Some((desc, served)))
+            }
+            .await
+            .map_err(|error| EmitterError::Catalog(error.to_string()))?;
+            match resolved {
+                Some((desc, served)) => {
+                    if served {
+                        opt_in_known(
+                            resolver,
+                            applicator,
+                            Some(backfiller),
+                            &desc,
+                            row,
+                            opt_in_lsn,
+                        )
+                        .await?;
                     }
                 }
                 None => {
@@ -98,9 +107,7 @@ pub async fn apply_table_opt_in(
         }
         Some(false) => {
             resolver.exclude_table(rel).await;
-            if let Some(b) = backfiller {
-                b.note_opt_out(rel).await;
-            }
+            backfiller.note_opt_out(rel).await;
         }
         None => {}
     }
@@ -113,13 +120,11 @@ async fn shadow_serves_toast(
     resolver: &ConfigResolver,
     catalog: &Arc<Mutex<ShadowCatalog>>,
     desc: &RelDescriptor,
-) -> Result<bool, EmitterError> {
+) -> anyhow::Result<bool> {
     let Some(held) = resolver.shadow_toast() else {
         return Ok(true);
     };
-    crate::toast::shadow_landing::serves_toast(catalog, held, desc)
-        .await
-        .map_err(|error| EmitterError::Catalog(error.to_string()))
+    crate::toast::shadow_landing::serves_toast(catalog, held, desc).await
 }
 
 /// When a `CREATE TABLE` lands, materialise a parked forward-declaration for

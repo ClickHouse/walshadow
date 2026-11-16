@@ -189,7 +189,7 @@ pub enum SinkError {
 
 impl SinkError {
     /// `map_err` adapter prefixing failure with step that failed
-    pub fn ctx<E: std::fmt::Display>(step: &'static str) -> impl FnOnce(E) -> Self {
+    pub fn ctx<E: std::fmt::Display>(step: impl std::fmt::Display) -> impl FnOnce(E) -> Self {
         move |e| Self::Other(format!("{step}: {e}"))
     }
 }

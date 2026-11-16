@@ -241,3 +241,93 @@ async fn seed_skips_user_tables() {
     // PG_CLASS_OID exposure — touch it so it doesn't drift unused.
     let _ = PG_CLASS_OID;
 }
+
+fn started_cluster(tmp: &tempfile::TempDir) -> Shadow {
+    let sh = make_cluster(tmp, ports::PG_SOURCE_PORT);
+    sh.initdb().expect("initdb");
+    sh.write_base_conf().expect("conf");
+    sh.start().expect("start");
+    sh
+}
+
+/// Dropping replica identity index leaves `relreplident = 'i'` with no
+/// index, which PG treats as NOTHING
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn relation_seed_reads_dropped_identity_index_as_nothing() {
+    if !pg_available() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let sh = started_cluster(&tmp);
+    let _stop = StopOnDrop { sh: &sh };
+    sh.apply_schema_dump(
+        "CREATE TABLE r (id int NOT NULL);\n\
+         CREATE UNIQUE INDEX r_id ON r (id);\n\
+         ALTER TABLE r REPLICA IDENTITY USING INDEX r_id;\n\
+         DROP INDEX r_id;\n",
+    )
+    .expect("orphan replica identity");
+
+    let client = connect(&sh).await;
+    let catalog = walshadow::backfill_bootstrap::seed_catalog_from_source(&client)
+        .await
+        .unwrap();
+    let replident: Vec<_> = catalog
+        .descriptors()
+        .filter(|d| d.rel_name.name.as_ref() == "r")
+        .map(|d| d.replident.clone())
+        .collect();
+    assert_eq!(replident, [walshadow::schema::ReplIdent::Nothing]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shadow_toast_refuses_toast_index_outside_default_tablespace() {
+    if !pg_available() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let sh = started_cluster(&tmp);
+    let _stop = StopOnDrop { sh: &sh };
+    let location = tmp.path().join("ts");
+    std::fs::create_dir(&location).unwrap();
+    sh.apply_schema_dump(&format!(
+        "CREATE TABLESPACE ts LOCATION '{}';\n\
+         CREATE TABLE t (body text);\n",
+        location.display()
+    ))
+    .expect("create table");
+    let index = sh
+        .psql_one(
+            "SELECT ic.relname FROM pg_class t \
+             JOIN pg_index i ON i.indrelid = t.reltoastrelid \
+             JOIN pg_class ic ON ic.oid = i.indexrelid WHERE t.oid = 't'::regclass",
+        )
+        .unwrap();
+    sh.apply_schema_dump(&format!(
+        "SET allow_system_table_mods = on;\n\
+         ALTER INDEX pg_toast.{index} SET TABLESPACE ts;\n"
+    ))
+    .expect("move toast index");
+    let spc = sh
+        .psql_one("SELECT oid FROM pg_tablespace WHERE spcname = 'ts'")
+        .unwrap();
+
+    let client = connect(&sh).await;
+    let catalog = walshadow::backfill_bootstrap::seed_catalog_from_source(&client)
+        .await
+        .unwrap();
+    let err = walshadow::toast::shadow_landing::toast_relations(
+        &client,
+        catalog.descriptors().map(std::sync::Arc::as_ref),
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "bootstrap: TOAST index {index} is in tablespace {spc}; \
+             [toast] mode = shadow keeps files from default tablespace only"
+        )
+    );
+}

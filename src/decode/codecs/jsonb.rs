@@ -57,10 +57,7 @@ pub fn jsonb_text_len(body: &[u8]) -> Result<usize, CodecError> {
 trait Out: Sized {
     fn push_str(&mut self, s: &str) -> Result<(), CodecError>;
     fn numeric(&mut self, body: &[u8]) -> Result<(), CodecError>;
-
-    fn string(&mut self, raw: &[u8]) -> Result<(), CodecError> {
-        render_jsonb_string(raw, self)
-    }
+    fn string(&mut self, raw: &[u8]) -> Result<(), CodecError>;
 }
 
 impl Out for String {
@@ -71,6 +68,10 @@ impl Out for String {
 
     fn numeric(&mut self, body: &[u8]) -> Result<(), CodecError> {
         render_numeric_text(body, self)
+    }
+
+    fn string(&mut self, raw: &[u8]) -> Result<(), CodecError> {
+        render_jsonb_string(raw, self)
     }
 }
 
@@ -93,27 +94,20 @@ impl Out for TextLen {
         self.0 += 2 + raw.len();
         for_each_escape_block(raw, |_, escaped, wide| {
             self.0 += (escaped.count_ones() + 4 * wide.count_ones()) as usize;
-            Ok(())
-        })
+        });
+        Ok(())
     }
 }
 
 /// Visits `raw` a vector at a time as (offset, escaped, wide), bit per byte:
 /// `escaped` marks bytes `escape_json_char` rewrites, `wide` those taking
 /// `\u00XX`
-fn for_each_escape_block(
-    raw: &[u8],
-    visit: impl FnMut(usize, u64, u64) -> Result<(), CodecError>,
-) -> Result<(), CodecError> {
+fn for_each_escape_block(raw: &[u8], visit: impl FnMut(usize, u64, u64)) {
     dispatch!(Level::new(), simd => escape_blocks(simd, raw, visit))
 }
 
 #[simd]
-fn escape_blocks<S: Simd>(
-    simd: S,
-    raw: &[u8],
-    mut visit: impl FnMut(usize, u64, u64) -> Result<(), CodecError>,
-) -> Result<(), CodecError> {
+fn escape_blocks<S: Simd>(simd: S, raw: &[u8], mut visit: impl FnMut(usize, u64, u64)) {
     let len = S::u8s::LEN;
     let Some(last) = raw.len().checked_sub(len) else {
         let (mut escaped, mut wide) = (0, 0);
@@ -126,7 +120,7 @@ fn escape_blocks<S: Simd>(
     let mut blocks = raw.chunks_exact(len);
     for (index, block) in blocks.by_ref().enumerate() {
         let (escaped, wide) = escape_masks(simd, block);
-        visit(index * len, escaped, wide)?;
+        visit(index * len, escaped, wide);
     }
     let rest = blocks.remainder().len();
     if rest > 0 {
@@ -136,9 +130,8 @@ fn escape_blocks<S: Simd>(
             raw.len() - rest,
             escaped >> (len - rest),
             wide >> (len - rest),
-        )?;
+        );
     }
-    Ok(())
 }
 
 #[inline(always)]
@@ -324,10 +317,10 @@ fn render_jsonb_value(
 /// PG `escape_json_char`: two-character escapes for backspace, form feed,
 /// newline, carriage return, tab, quote and backslash, `\uXXXX` for the rest
 /// below `0x20`, every other byte verbatim
-fn render_jsonb_string(raw: &[u8], out: &mut impl Out) -> Result<(), CodecError> {
+fn render_jsonb_string(raw: &[u8], out: &mut String) -> Result<(), CodecError> {
     let s = simdutf8::basic::from_utf8(raw)
         .map_err(|_| CodecError::BadJsonbContainer("string not utf8"))?;
-    out.push_str("\"")?;
+    out.push('"');
     // escapes are ASCII, so each run between them is a char-boundary slice
     let mut run = 0;
     for_each_escape_block(
@@ -337,29 +330,29 @@ fn render_jsonb_string(raw: &[u8], out: &mut impl Out) -> Result<(), CodecError>
             while escaped != 0 {
                 let i = offset + escaped.trailing_zeros() as usize;
                 escaped &= escaped - 1;
-                out.push_str(&s[run..i])?;
+                out.push_str(&s[run..i]);
                 run = i + 1;
                 match raw[i] {
-                    0x8 => out.push_str("\\b")?,
-                    0xc => out.push_str("\\f")?,
-                    b'\n' => out.push_str("\\n")?,
-                    b'\r' => out.push_str("\\r")?,
-                    b'\t' => out.push_str("\\t")?,
-                    b'"' => out.push_str("\\\"")?,
-                    b'\\' => out.push_str("\\\\")?,
+                    0x8 => out.push_str("\\b"),
+                    0xc => out.push_str("\\f"),
+                    b'\n' => out.push_str("\\n"),
+                    b'\r' => out.push_str("\\r"),
+                    b'\t' => out.push_str("\\t"),
+                    b'"' => out.push_str("\\\""),
+                    b'\\' => out.push_str("\\\\"),
                     // control byte below 0x20, so one nibble of it is already known
                     b => {
                         let hex = (b & 0xf) as usize;
-                        out.push_str(if b < 0x10 { "\\u000" } else { "\\u001" })?;
-                        out.push_str(&"0123456789abcdef"[hex..=hex])?;
+                        out.push_str(if b < 0x10 { "\\u000" } else { "\\u001" });
+                        out.push_str(&"0123456789abcdef"[hex..=hex]);
                     }
                 }
             }
-            Ok(())
         },
-    )?;
-    out.push_str(&s[run..])?;
-    out.push_str("\"")
+    );
+    out.push_str(&s[run..]);
+    out.push('"');
+    Ok(())
 }
 
 #[cfg(test)]
@@ -523,21 +516,10 @@ mod tests {
                     for lane in (0..64).filter(|lane| escaped >> lane & 1 != 0) {
                         found.push((offset + lane, wide >> lane & 1 != 0));
                     }
-                    Ok(())
-                })
-                .unwrap();
+                });
                 assert_eq!(found, expected, "offset={offset} len={len}");
             }
         }
-        let mut calls = 0;
-        assert_eq!(
-            escape_blocks(simd, &[b'"'; 256], |_, _, _| {
-                calls += 1;
-                Err(CodecError::BadJsonbContainer("stop"))
-            }),
-            Err(CodecError::BadJsonbContainer("stop"))
-        );
-        assert_eq!(calls, 1);
     }
 
     #[test]

@@ -320,7 +320,8 @@ pub async fn seed_catalog_from_source(client: &Client) -> Result<CatalogMap> {
                  WHERE i.inhrelid = c.oid AND c.relispartition)::oid \
              FROM pg_class c \
              JOIN pg_namespace n ON n.oid = c.relnamespace \
-             WHERE c.oid >= 16384 AND c.relkind IN ('r', 't', 'm', 'p')",
+             WHERE c.oid >= 16384 AND c.relkind IN ('r', 't', 'm', 'p') \
+             AND (c.relkind = 'p' OR pg_relation_filenode(c.oid) IS NOT NULL)",
             &[],
         )
         .await
@@ -340,9 +341,6 @@ pub async fn seed_catalog_from_source(client: &Client) -> Result<CatalogMap> {
         let spc_node: Oid = row.get(8);
         let rel_node: Oid = row.get(9);
         let parent: Option<Oid> = row.get(10);
-        if rel_node == 0 && kind != 'p' {
-            continue;
-        }
         let rfn = RelFileNode {
             spc_node,
             db_node: db_oid,
@@ -428,8 +426,7 @@ async fn fetch_replident(client: &Client, c: char, rel_oid: Oid) -> Result<ReplI
     } else {
         None
     };
-    ReplIdent::from_parts(c, pk_attnums, using_index)
-        .map_err(|e| anyhow::anyhow!("bootstrap: {e} for relation {rel_oid}"))
+    ReplIdent::from_parts(c, pk_attnums, using_index).map_err(anyhow::Error::msg)
 }
 
 async fn fetch_attributes(client: &Client, rel_oid: Oid) -> Result<Vec<RelAttr>> {
@@ -438,7 +435,7 @@ async fn fetch_attributes(client: &Client, rel_oid: Oid) -> Result<Vec<RelAttr>>
         .map(|row| {
             crate::pg::RawAttr::from_row(row)
                 .build()
-                .map_err(|e| anyhow::anyhow!("bootstrap: {e}"))
+                .map_err(anyhow::Error::msg)
         })
         .collect()
 }

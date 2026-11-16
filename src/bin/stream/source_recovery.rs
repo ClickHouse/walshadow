@@ -19,12 +19,6 @@ use walshadow::wal_stream::WalStream;
 
 use crate::args::{Args, cli_base};
 
-/// How long the fork proofs wait for the pump-side queue to drain. Past it the
-/// buffer's own view answers, which reads a still-queued record as a
-/// transaction open at the fork and refuses the crossing — the fail-closed
-/// direction.
-pub(crate) const FORK_FENCE_DRAIN: Duration = Duration::from_secs(30);
-
 /// Branch the stream is reading, as a reconnect has to name it: number plus the
 /// switchpoint the proved chain places it at.
 pub(crate) fn stream_branch(
@@ -105,26 +99,20 @@ pub(crate) const PROMOTION_POLL: Duration = Duration::from_secs(1);
 /// paused: `pause_received` is the frozen head the target has to reach, and an
 /// unfrozen one moves under the decision.
 pub(crate) async fn promotion_gate(feed: &mut SourceFeed, pause_received: u64) -> PromotionGate {
-    let client = match feed.sql_client().await {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::debug!(target: "walshadow", error = %format!("{e:#}"), "promotion gate");
-            return PromotionGate::unreachable();
-        }
-    };
-    let row = client
-        .query_one(
-            "SELECT pg_is_in_recovery(), pg_last_wal_replay_lsn(), pg_last_wal_receive_lsn()",
-            &[],
-        )
-        .await;
-    let row = match row {
-        Ok(row) => row,
-        Err(e) => {
-            tracing::debug!(target: "walshadow", error = %e, "promotion gate");
-            feed.drop_sql_client();
-            return PromotionGate::unreachable();
-        }
+    let row = tokio::time::timeout(PROMOTION_POLL, async {
+        let client = feed.sql_client().await?;
+        let sql = "SELECT pg_is_in_recovery(), pg_last_wal_replay_lsn(), pg_last_wal_receive_lsn()";
+        anyhow::Ok(client.query_one(sql, &[]).await?)
+    })
+    .await
+    .map_err(anyhow::Error::from)
+    .flatten()
+    .inspect_err(
+        |e| tracing::debug!(target: "walshadow", error = %format!("{e:#}"), "promotion gate"),
+    );
+    let Ok(row) = row else {
+        feed.drop_sql_client();
+        return PromotionGate::unreachable();
     };
     let in_recovery: bool = row.get(0);
     let replay_lsn = row.get::<_, Option<PgLsn>>(1).map(u64::from).unwrap_or(0);
@@ -717,6 +705,70 @@ mod tests {
         assert!(bytes.iter().all(|b| *b == 0x5a));
         let error = path.archive().unwrap().next().await.unwrap().unwrap_err();
         assert!(format!("{error:#}").contains("000000010000000000000063"));
+    }
+
+    #[tokio::test]
+    async fn unparsable_archive_history_falls_back_to_the_proved_chain() {
+        let tmp = tempfile::tempdir().unwrap();
+        let settings = walrus::config::Settings {
+            storage: walrus::config::StorageSettings::Fs {
+                path: tmp.path().join("archive").display().to_string(),
+            },
+            ..Default::default()
+        };
+        let history_file = tmp.path().join("00000002.history");
+        std::fs::write(&history_file, "not a history\n").unwrap();
+        walrus::pg::wal::push::handle(&settings, settings.build_storage().unwrap(), &history_file)
+            .await
+            .unwrap();
+        let floor = Monotone::new(Pos::new(0x6200_0000));
+        let archive = Archive::open(settings).unwrap();
+        let mut recovery = recovery(Some(&archive), &floor);
+        let mut path = recovery
+            .fall_back(slot_too_new(), &TimelineHistory::root(1), 1, floor.get())
+            .await
+            .unwrap();
+        let error = path.archive().unwrap().next().await.unwrap().unwrap_err();
+        assert!(format!("{error:#}").contains("000000010000000000000062"));
+    }
+
+    /// Identity, timeline and history gates refuse a source before streaming
+    #[tokio::test]
+    async fn resume_refuses_a_source_that_cannot_serve_the_branch() {
+        use walshadow::shadow_stream::{ShadowStreamState, fake_source};
+        let tmp = tempfile::tempdir().unwrap();
+        let state = ShadowStreamState::new(2, "7".into(), 0, 1 << 20);
+        let state = std::sync::Arc::new(tokio::sync::Mutex::new(state));
+        let cfg = fake_source::listen_in(tmp.path(), state).await;
+        let resume = async |system_id, timeline| {
+            let branch = SourceBranch {
+                system_id,
+                timeline,
+                begin: 0,
+            };
+            let res = resume_source_feed(
+                &cfg,
+                None,
+                Pos::new(0x100),
+                branch,
+                Pos::ZERO,
+                Duration::from_secs(10),
+            )
+            .await;
+            res.err().unwrap().to_string()
+        };
+        assert_eq!(
+            resume(8, 2).await,
+            "source is system 7, artifacts belong to 8"
+        );
+        assert_eq!(
+            resume(7, 3).await,
+            "source is on timeline 2, below the stream's 3; an older branch cannot \
+             serve what has already been read",
+        );
+        let missing = resume(7, 1).await;
+        let want = TransitionError::HistoryMissing { tli: 2 }.to_string();
+        assert_eq!(missing, want);
     }
 
     #[tokio::test]

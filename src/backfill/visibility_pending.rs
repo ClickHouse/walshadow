@@ -1249,4 +1249,96 @@ mod tests {
             "{err}"
         );
     }
+
+    fn tuple(rel_node: u32, columns: Vec<Option<ColumnValue>>) -> BackfillTuple {
+        BackfillTuple {
+            rfn: walrus::pg::walparser::RelFileNode {
+                spc_node: 1663,
+                db_node: 5,
+                rel_node,
+            },
+            xid: 101,
+            xmax: 0,
+            infomask: 0,
+            source_lsn: 0x5000,
+            page_lsn: 0,
+            blkno: 0,
+            offnum: 1,
+            columns,
+        }
+    }
+
+    #[tokio::test]
+    async fn spool_skips_rows_without_descriptor_and_surfaces_spool_faults() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut catalog = CatalogMap::new();
+        catalog.insert(make_rel_named(16400, 16400, 0, RelName::new("public", "t")));
+        let blocker = tmp.path().join("file");
+        std::fs::write(&blocker, b"").unwrap();
+        let mut spool = PendingSpool::new(blocker.join("spool"), catalog);
+        let xids = PendingXids {
+            insert: 101,
+            delete: 0,
+        };
+        assert_eq!(spool.push(tuple(16401, Vec::new()), xids).await, Ok(false));
+        assert_eq!(spool.rows(), 0);
+        let wide = Some(ColumnValue::Text("x".repeat(DEFERRED_SPOOL_MEM_MAX)));
+        let err = spool
+            .push(tuple(16400, vec![wide]), xids)
+            .await
+            .unwrap_err();
+        assert!(err.starts_with("pending visibility: spool: "), "{err}");
+    }
+
+    async fn replay_slabs(rows: usize, open: bool) -> Vec<usize> {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut spool = DeferredSpool::new(tmp.path().join("spool"), DEFERRED_SPOOL_MEM_MAX);
+        for _ in 0..rows {
+            spool.push(tuple(16400, Vec::new())).await.unwrap();
+        }
+        let (tx, mut rx) = mpsc::channel(4);
+        if !open {
+            rx.close();
+        }
+        replay(spool, &tx).await.unwrap();
+        drop(tx);
+        let mut slabs = Vec::new();
+        while let Some(slab) = rx.recv().await {
+            slabs.push(slab.len());
+        }
+        slabs
+    }
+
+    #[tokio::test]
+    async fn replay_ships_full_slabs_and_stops_at_closed_drain() {
+        assert_eq!(
+            replay_slabs(PENDING_SLAB_ROWS, true).await,
+            [PENDING_SLAB_ROWS]
+        );
+        assert_eq!(
+            replay_slabs(PENDING_SLAB_ROWS + 1, true).await,
+            [PENDING_SLAB_ROWS, 1]
+        );
+        assert!(replay_slabs(PENDING_SLAB_ROWS + 1, false).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn ledger_load_surfaces_unreadable_file_and_empty_ledger_skips_disk() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(ledger_path(tmp.path())).unwrap();
+        assert!(matches!(
+            PendingLedger::load(tmp.path(), 7).await,
+            Err(PendingLedgerError::Io(_))
+        ));
+        let mut ledger = PendingLedger::empty();
+        ledger.push(&manifest("orders", vec![101])).await.unwrap();
+        assert_eq!(ledger.outstanding().len(), 1);
+    }
+
+    #[test]
+    fn fresh_side_without_new_outcomes_selects_nothing() {
+        let mut ledger = PendingLedger::empty();
+        ledger.stage(&manifest("orders", vec![101]));
+        assert_eq!(fresh_side(&ledger.entries()[0]), "0");
+    }
 }

@@ -16,7 +16,7 @@ use tokio::sync::watch;
 use walrus::pg::walparser::RelFileNode;
 use walshadow::ch::{CompressionChoice, EmitterError, connect_client, query_strings};
 use walshadow::ch_ddl::{DdlApplicator, DdlBoot, DdlConfig, Stamp};
-use walshadow::ch_emitter::{EmitterConfig, InstanceConfig};
+use walshadow::ch_emitter::{EmitterConfig, InstanceConfig, RetryConfig};
 use walshadow::config::{DestEmitter, ResolvedConfig};
 use walshadow::mapping::{ColumnMapping, DropTableStrategy, TableMapping, TableTarget};
 use walshadow::schema::{
@@ -81,6 +81,12 @@ async fn ddl_applies_and_refuses_against_clickhouse() {
             compression: CompressionChoice::None,
             ..Default::default()
         },
+        // Refusals retry like any server exception, keep them quick
+        retry: RetryConfig {
+            max_attempts: 1,
+            initial_backoff: Duration::from_millis(1),
+            max_backoff: Duration::from_millis(1),
+        },
         ..Default::default()
     };
     let resolved = Arc::new(ResolvedConfig::default());
@@ -122,6 +128,57 @@ async fn ddl_applies_and_refuses_against_clickhouse() {
     assert_eq!(
         (app.stats.creates_applied, app.stats.alters_applied),
         (1, 1)
+    );
+
+    // Zero-column relation: re-learn creates from its mapping with nothing to add
+    let bare = SchemaEvent::Added {
+        desc: Arc::new(rel(16395, "bare", Vec::new())),
+    };
+    app.apply_at(&bare, None, at).await.unwrap();
+    app.apply_at(&bare, None, at).await.unwrap();
+    assert_eq!(
+        (app.stats.creates_applied, app.stats.alters_applied),
+        (3, 1)
+    );
+
+    // Refusal other than a key retype passes through unchanged
+    let gone_v1 = rel(
+        16396,
+        "gone",
+        vec![attr(1, "id", INT4OID, true), attr(2, "n", INT4OID, false)],
+    );
+    app.apply_at(
+        &SchemaEvent::Added {
+            desc: Arc::new(gone_v1.clone()),
+        },
+        None,
+        at,
+    )
+    .await
+    .unwrap();
+    let gone = mapping
+        .snapshot()
+        .get(&gone_v1.rel_name)
+        .map(|m| m.target.clone())
+        .expect("derived mapping");
+    ch.query(&format!("DROP TABLE {}", gone.sql()))
+        .expect("drop behind applicator");
+    let mut gone_v2 = gone_v1.clone();
+    gone_v2.attributes[1].type_oid = INT8OID;
+    gone_v2.attributes[1].type_len = 8;
+    let diff = SchemaDiff {
+        type_changes: vec![(gone_v1.attributes[1].clone(), gone_v2.attributes[1].clone())],
+        ..SchemaDiff::default()
+    };
+    let retyped = SchemaEvent::Changed {
+        old: Arc::new(gone_v1),
+        new: Arc::new(gone_v2),
+        diff,
+    };
+    let e = app.apply_at(&retyped, None, at).await.unwrap_err();
+    assert!(
+        matches!(&e, EmitterError::ServerException { code: 60, .. }),
+        "{e}"
     );
 
     // Replicate-all derives the destination for a fresh relation

@@ -28,33 +28,23 @@ pub(crate) const SEGMENT_FSYNC_QUEUE: usize = 64;
 /// the *whole* filesystem, `out_dir` should live on a volume walshadow owns —
 /// on a shared disk it may block on unrelated writeback.
 pub(crate) fn spawn_segment_fsync(
-    out_dir: PathBuf,
+    out_dir: std::fs::File,
     mut rx: tokio::sync::mpsc::Receiver<SegFsync>,
     durable_lsn: Arc<Monotone<FilterDurable>>,
     fatal: walshadow::pipeline::Fatal,
 ) -> tokio::task::JoinHandle<()> {
+    let dir = Arc::new(out_dir);
     tokio::spawn(async move {
-        let dir = match std::fs::File::open(&out_dir) {
-            Ok(f) => Arc::new(f),
-            Err(e) => {
-                fatal.set(format!("open {} for syncfs: {e}", out_dir.display()));
-                return;
-            }
-        };
         while let Some(mut last) = rx.recv().await {
             while let Ok(next) = rx.try_recv() {
                 last = std::cmp::max_by_key(last, next, SegFsync::end_lsn);
             }
             let dir = Arc::clone(&dir);
             let synced = tokio::task::spawn_blocking(move || last.syncfs(&dir)).await;
-            match synced {
-                Ok(Ok(durable)) => durable_lsn.publish(durable),
-                Ok(Err(e)) => {
-                    fatal.set(format!("syncfs {}: {e}", out_dir.display()));
-                    return;
-                }
+            match synced.map_err(std::io::Error::from).flatten() {
+                Ok(durable) => durable_lsn.publish(durable),
                 Err(e) => {
-                    fatal.set(format!("syncfs join {}: {e}", out_dir.display()));
+                    fatal.set(format!("syncfs out-dir: {e}"));
                     return;
                 }
             };
@@ -190,24 +180,42 @@ pub(crate) mod tests {
         sink.close().await.unwrap();
         let durable = Arc::new(Monotone::new(Pos::new(0)));
         let fatal = walshadow::pipeline::Fatal::new();
-        spawn_segment_fsync(tmp.path().to_path_buf(), rx, durable.clone(), fatal.clone())
+        let dir = std::fs::File::open(tmp.path()).unwrap();
+        spawn_segment_fsync(dir, rx, durable.clone(), fatal.clone())
             .await
             .unwrap();
         assert_eq!(fatal.message(), None);
         assert_eq!(durable.get().get(), segs[2].start_lsn(WAL_SEG_SIZE) + 64);
     }
 
+    /// Path-only fd makes syncfs fail EBADF, standing in for a writeback error
     #[tokio::test]
-    async fn fsync_fails_fatal_when_out_dir_unopenable() {
+    async fn fsync_failure_sets_fatal_without_publishing() {
+        use std::os::unix::fs::OpenOptionsExt;
         let tmp = tempfile::tempdir().unwrap();
-        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        let dir = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_PATH)
+            .open(tmp.path())
+            .unwrap();
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let io = tokio_util::task::TaskTracker::new();
+        let mut sink =
+            DirSegmentSink::with_durability(tmp.path().to_path_buf(), WAL_SEG_SIZE, tx, io)
+                .unwrap();
+        let seg = segments_covering(1, 0..WAL_SEG_SIZE)[0];
+        sink.on_segment(seg, &[0u8; 64]).await.unwrap();
+        sink.close().await.unwrap();
         let durable = Arc::new(Monotone::new(Pos::new(0)));
         let fatal = walshadow::pipeline::Fatal::new();
-        let missing = tmp.path().join("missing");
-        spawn_segment_fsync(missing, rx, durable, fatal.clone())
+        spawn_segment_fsync(dir, rx, durable.clone(), fatal.clone())
             .await
             .unwrap();
-        assert!(fatal.message().unwrap().contains("for syncfs"));
+        assert_eq!(
+            fatal.message().as_deref(),
+            Some("syncfs out-dir: Bad file descriptor (os error 9)")
+        );
+        assert_eq!(durable.get().get(), 0);
     }
 
     /// Session wrapper's wait covers gc until its floor cell drops
@@ -234,6 +242,57 @@ pub(crate) mod tests {
         io.wait().await;
         assert!(gc.is_finished());
         assert_eq!(fatal.message(), None);
+    }
+
+    /// Read-only log dir fails the ckpt rewrite once dead tombstones trip compaction
+    #[tokio::test]
+    async fn desc_log_gc_failure_sets_fatal() {
+        use std::os::unix::fs::PermissionsExt;
+        use walshadow::desc_log::{BatchRecord, LogEntry, LogValue};
+        let tmp = tempfile::tempdir().unwrap();
+        let identity = walshadow::desc_log::DescLogIdentity {
+            pg_major: 17,
+            system_id: "7300000000000000001".into(),
+            timeline: 1,
+            db_oid: 5,
+            wal_seg_size: WAL_SEG_SIZE as u32,
+        };
+        let log = walshadow::desc_log::DescriptorLog::open(tmp.path(), identity)
+            .await
+            .unwrap();
+        let entries = (0..1024)
+            .map(|oid| {
+                Arc::new(LogEntry {
+                    valid_from: 10,
+                    oid,
+                    rfn: walrus::pg::walparser::RelFileNode {
+                        spc_node: 1663,
+                        db_node: 5,
+                        rel_node: oid,
+                    },
+                    value: LogValue::Dropped,
+                })
+            })
+            .collect();
+        log.append_batch(BatchRecord {
+            captured_at: 20,
+            commit_lsn: 0,
+            observations: Vec::new(),
+            ambiguities: Vec::new(),
+            entries,
+        })
+        .await
+        .unwrap();
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+        let floor = Monotone::<Floor>::new(Pos::new(100));
+        let fatal = walshadow::pipeline::Fatal::new();
+        let io = tokio_util::task::TaskTracker::new();
+        spawn_desc_log_gc(Arc::new(log), floor.watch(), fatal.clone(), &io)
+            .await
+            .unwrap();
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let msg = fatal.message().unwrap();
+        assert!(msg.starts_with("descriptor log gc at 0/64: "), "{msg}");
     }
 
     /// Every event's message, for asserting what a task logged
@@ -323,19 +382,23 @@ pub(crate) mod tests {
         std::fs::write(out_dir.join("unrelated"), b"keep").unwrap();
 
         let messages = Messages::default();
-        let replay = Arc::new(Monotone::<ShadowReplay>::new(Pos::new(64 * WAL_SEG_SIZE)));
+        let replay = Arc::new(Monotone::<ShadowReplay>::default());
         let task = tokio::spawn(
             trim_retention(
                 out_dir.clone(),
                 1,
                 conninfo,
-                replay,
+                replay.clone(),
                 Duration::from_millis(10),
             )
             .with_subscriber(tracing_subscriber::registry().with(messages.clone())),
         );
 
         let refused = "shadow connect failed; retrying next cycle";
+        // No replay yet, so no cycle dials shadow
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(messages.count(refused), 0);
+        replay.join(Pos::new(64 * WAL_SEG_SIZE));
         messages.wait(refused, 1).await;
         assert!(seg(0).exists(), "trimmed without a REDO bound");
         shadow.start().unwrap();

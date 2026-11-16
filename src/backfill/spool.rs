@@ -39,19 +39,14 @@ type Result<T> = std::result::Result<T, SpillError>;
 /// Insertion order preserved; once the file exists every record (prefix
 /// included) lives there.
 pub struct DeferredSpool {
-    store: Store,
+    /// Prefix held until `file` opens, empty after
+    mem: Vec<BackfillTuple>,
+    mem_bytes: usize,
+    file: Option<ChunkWriter>,
     mem_max: usize,
     path: PathBuf,
     records: u64,
     spooled_bytes: u64,
-}
-
-enum Store {
-    Mem {
-        tuples: Vec<BackfillTuple>,
-        bytes: usize,
-    },
-    File(ChunkWriter),
 }
 
 /// Checkpointed spool reopened read-only at an acknowledged record boundary
@@ -95,10 +90,9 @@ impl DeferredSpool {
     /// be creatable
     pub fn new(path: PathBuf, mem_max: usize) -> Self {
         Self {
-            store: Store::Mem {
-                tuples: Vec::new(),
-                bytes: 0,
-            },
+            mem: Vec::new(),
+            mem_bytes: 0,
+            file: None,
             mem_max,
             path,
             records: 0,
@@ -108,7 +102,9 @@ impl DeferredSpool {
 
     fn at_file(path: PathBuf, mem_max: usize, out: ChunkWriter, mark: SpoolMark) -> Self {
         Self {
-            store: Store::File(out),
+            mem: Vec::new(),
+            mem_bytes: 0,
+            file: Some(out),
             mem_max,
             path,
             records: mark.records,
@@ -126,10 +122,7 @@ impl DeferredSpool {
 
     /// Bytes retained in the in-memory prefix
     pub fn resident_bytes(&self) -> usize {
-        match &self.store {
-            Store::Mem { bytes, .. } => *bytes,
-            Store::File(_) => 0,
-        }
+        self.mem_bytes
     }
 
     /// Encoded bytes written to the spool file
@@ -139,11 +132,11 @@ impl DeferredSpool {
 
     pub async fn push(&mut self, value: BackfillTuple) -> Result<()> {
         self.records += 1;
-        if let Store::Mem { tuples, bytes } = &mut self.store {
+        if self.file.is_none() {
             let value_bytes = approx_bytes(&value);
-            if *bytes + value_bytes <= self.mem_max {
-                *bytes += value_bytes;
-                tuples.push(value);
+            if self.mem_bytes + value_bytes <= self.mem_max {
+                self.mem_bytes += value_bytes;
+                self.mem.push(value);
                 return Ok(());
             }
         }
@@ -154,30 +147,35 @@ impl DeferredSpool {
 
     /// Writer, creating the file and moving the prefix into it on first use
     async fn file(&mut self) -> Result<&mut ChunkWriter> {
-        if let Store::Mem { tuples, .. } = &mut self.store {
-            let tuples = std::mem::take(tuples);
-            let parent = self.path.parent().filter(|p| !p.as_os_str().is_empty());
-            if let Some(parent) = parent {
-                tokio::fs::create_dir_all(parent).await?;
-            }
-            let file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&self.path)
-                .await?;
-            // Checkpoint names this file, so its directory entry must survive
-            crate::fs::fsync_dir(parent.unwrap_or(std::path::Path::new("."))).await?;
-            let mut out = ChunkWriter::new(file.into_std().await, 0);
-            out.buf.extend_from_slice(&SPOOL_MAGIC);
-            push_u16(&mut out.buf, SPOOL_VERSION);
-            for v in &tuples {
-                self.spooled_bytes += append(&mut out, v).await?;
-            }
-            self.store = Store::File(out);
-        }
-        let Store::File(out) = &mut self.store else {
-            unreachable!("file store installed above");
+        let out = match self.file.take() {
+            Some(out) => out,
+            None => self.create_file().await?,
         };
+        Ok(self.file.insert(out))
+    }
+
+    async fn create_file(&mut self) -> Result<ChunkWriter> {
+        let tuples = std::mem::take(&mut self.mem);
+        self.mem_bytes = 0;
+        let parent = self
+            .path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(std::path::Path::new("."));
+        tokio::fs::create_dir_all(parent).await?;
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&self.path)
+            .await?;
+        // Checkpoint names this file, so its directory entry must survive
+        crate::fs::fsync_dir(parent).await?;
+        let mut out = ChunkWriter::new(file.into_std().await, 0);
+        out.buf.extend_from_slice(&SPOOL_MAGIC);
+        push_u16(&mut out.buf, SPOOL_VERSION);
+        for v in &tuples {
+            self.spooled_bytes += append(&mut out, v).await?;
+        }
         Ok(out)
     }
 
@@ -185,7 +183,7 @@ impl DeferredSpool {
     /// outlives a crash: the tuples in it came from backup pages nothing can
     /// re-read, so a resumed load replays them instead of the whole backup
     pub async fn checkpoint(&mut self) -> Result<SpoolMark> {
-        if matches!(&self.store, Store::Mem { tuples, .. } if tuples.is_empty()) {
+        if self.file.is_none() && self.mem.is_empty() {
             return Ok(SpoolMark::default());
         }
         self.file().await?.sync_data().await?;
@@ -272,13 +270,10 @@ impl DeferredSpool {
 
     /// Seal writes, hand back a sequential reader
     pub async fn into_reader(self) -> Result<DeferredReader> {
-        let mut out = match self.store {
-            Store::Mem { tuples, .. } => {
-                return Ok(DeferredReader {
-                    src: ReadSrc::Mem(tuples.into_iter()),
-                });
-            }
-            Store::File(out) => out,
+        let Some(mut out) = self.file else {
+            return Ok(DeferredReader {
+                src: ReadSrc::Mem(self.mem.into_iter()),
+            });
         };
         out.flush().await?;
         Ok(DeferredReader {
@@ -292,7 +287,7 @@ impl DeferredSpool {
 
     /// Drop without replay (walk failure); unlink any file
     pub async fn discard(self) {
-        if let Store::File(_) = self.store {
+        if self.file.is_some() {
             let _ = tokio::fs::remove_file(&self.path).await;
         }
     }
