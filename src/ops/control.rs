@@ -71,6 +71,15 @@ impl Reloader {
         unfollowed.retain(|db| !resolvers.iter().any(|r| r.dbname() == db));
         Ok(unfollowed)
     }
+
+    pub async fn live_configs(&self) -> BTreeMap<String, Arc<crate::config::ResolvedConfig>> {
+        self.resolvers
+            .lock()
+            .await
+            .iter()
+            .map(|r| (r.dbname().to_owned(), r.subscribe().borrow().clone()))
+            .collect()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -303,8 +312,15 @@ async fn tables_list<'a>(ctx: &SharedCtx, req: &Request<'a>) -> Result<String> {
     let listed = introspect::tables(&client, ns)
         .await
         .context("list tables")?;
-    let selected: foldhash::HashSet<(String, String)> =
+    let mut selected: foldhash::HashSet<(String, String)> =
         selected_tables(&root, db).into_iter().collect();
+    if let Some(live) = ctx.reloader.live_configs().await.get(db) {
+        selected.extend(
+            live.tables
+                .keys()
+                .map(|rel| (rel.namespace.to_string(), rel.name.to_string())),
+        );
+    }
     let arr = listed
         .into_iter()
         .map(|t| {
@@ -429,7 +445,62 @@ fn status_tables(
     db: &str,
     ch_database: &str,
     instances: &BTreeMap<String, InstanceConfig>,
+    live: Option<&crate::config::ResolvedConfig>,
 ) -> Vec<Value> {
+    let mut rows: BTreeMap<String, Table> =
+        configured_status_tables(root, db, ch_database, instances)
+            .into_iter()
+            .filter_map(|row| {
+                let source = row.get("source_table")?.as_str()?.to_owned();
+                Some((source, row))
+            })
+            .collect();
+    if let Some(live) = live {
+        for (rel, mapping) in &live.tables {
+            let source = format!("{db}.{}.{}", rel.namespace, rel.name);
+            let initial_load = rows
+                .get(&source)
+                .and_then(|row| row.get("initial_load"))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .or_else(|| {
+                    live.table_opt_ins
+                        .get(rel)
+                        .and_then(|row| row.initial_load.clone())
+                })
+                .or_else(|| {
+                    live.namespaces
+                        .get(&*rel.namespace)
+                        .and_then(|ns| ns.initial_load)
+                        .map(|mode| mode.as_str().to_owned())
+                })
+                .unwrap_or_else(|| "none".into());
+            let target = &mapping.target;
+            let mut entry = Table::new();
+            entry.insert("source_table".into(), source.clone().into());
+            entry.insert("destination_table".into(), target.to_string().into());
+            entry.insert(
+                "destination_instance".into(),
+                target
+                    .instance
+                    .clone()
+                    .unwrap_or_else(|| "default".into())
+                    .into(),
+            );
+            entry.insert("initial_load".into(), initial_load.into());
+            entry.insert("cdc".into(), true.into());
+            rows.insert(source, entry);
+        }
+    }
+    rows.into_values().map(Value::Table).collect()
+}
+
+fn configured_status_tables(
+    root: &Table,
+    db: &str,
+    ch_database: &str,
+    instances: &BTreeMap<String, InstanceConfig>,
+) -> Vec<Table> {
     replicated_entries(root, db)
         .into_iter()
         .map(|(ns, rel, block)| {
@@ -467,7 +538,7 @@ fn status_tables(
             entry.insert("destination_instance".into(), instance.into());
             entry.insert("initial_load".into(), initial_load.into());
             entry.insert("cdc".into(), true.into());
-            Value::Table(entry)
+            entry
         })
         .collect()
 }
@@ -500,6 +571,7 @@ async fn stream_status(ctx: &SharedCtx) -> Result<String> {
         .cloned()
         .and_then(|v| v.try_into().ok())
         .unwrap_or_default();
+    let live = ctx.reloader.live_configs().await;
     // One entry per database, each holding that database's selected tables
     let per_db: Vec<Value> = databases(&root)
         .iter()
@@ -508,14 +580,26 @@ async fn stream_status(ctx: &SharedCtx) -> Result<String> {
             row.insert("dbname".into(), db.clone().into());
             row.insert(
                 "tables".into(),
-                Value::Array(status_tables(&root, db, &ch_database, &instances)),
+                Value::Array(status_tables(
+                    &root,
+                    db,
+                    &ch_database,
+                    &instances,
+                    live.get(db).map(Arc::as_ref),
+                )),
             );
             Value::Table(row)
         })
         .collect();
     // Flat list stays the primary database's, which is what a single-database
     // deployment reports
-    let tables = status_tables(&root, dbname(&root), &ch_database, &instances);
+    let tables = status_tables(
+        &root,
+        dbname(&root),
+        &ch_database,
+        &instances,
+        live.get(dbname(&root)).map(Arc::as_ref),
+    );
     let snap = ctx.metrics.snapshot().await;
     let mut out = Table::new();
     out.insert("paused".into(), paused.into());
@@ -883,6 +967,93 @@ mod tests {
         let [skip] = &skipped[..] else { panic!() };
         assert_eq!(skip["rel_node"].as_str(), Some("16400"));
         assert_eq!(skip["records"].as_integer(), Some(3));
+    }
+
+    #[tokio::test]
+    async fn status_tables_include_auto_created_mappings() {
+        use crate::mapping::{TableMapping, TableTarget};
+        use crate::schema::{RelAttr, RelDescriptor, ReplIdent};
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("c.sock");
+        let ctx = ctx_at(dir.path());
+        let doc = "[source]\ndbname = \"app\"\n\
+                   [ch]\ndatabase = \"cdc\"\n\
+                   [namespace.public]\nauto_create = true\ninitial_load = \"object_store\"\n\
+                   [table.public.orders]\nreplicate = true\ninitial_load = \"copy\"\n";
+        std::fs::write(&ctx.ch_config, doc).unwrap();
+        let base = crate::ch_emitter::EmitterConfig::from_table(&doc.parse().unwrap()).unwrap();
+        let (resolver, _rx) = crate::config::ConfigResolver::new(
+            &base,
+            crate::config::CliOverrides::default(),
+            None,
+            Table::new(),
+            crate::mapping::mapping_handle(Default::default()),
+            crate::config::ResolverBoot::default(),
+        );
+        let desc = RelDescriptor {
+            rfn: walrus::pg::walparser::RelFileNode {
+                spc_node: 1663,
+                db_node: 5,
+                rel_node: 30000,
+            },
+            oid: 30000,
+            toast_oid: 0,
+            namespace_oid: 2200,
+            rel_name: RelName::new("public", "events"),
+            kind: 'r',
+            persistence: 'p',
+            ancestors: Vec::new(),
+            replident: ReplIdent::Default { pk_attnums: None },
+            attributes: vec![RelAttr {
+                attnum: 1,
+                name: "id".into(),
+                type_oid: 23,
+                typmod: -1,
+                not_null: true,
+                dropped: false,
+                type_name: "int4".into(),
+                type_byval: true,
+                type_len: 4,
+                type_align: 'i',
+                type_storage: 'p',
+                missing_default: None,
+            }],
+        };
+        resolver
+            .register_derived_mapping(
+                &desc,
+                TableMapping {
+                    target: TableTarget::new("cdc", "public_events"),
+                    columns: Vec::new(),
+                    tees: Vec::new(),
+                },
+            )
+            .await;
+        ctx.reloader.set_resolvers(vec![resolver]).await;
+        let _h = serve(sock.clone(), ctx).unwrap();
+
+        let status = call(&sock, "status", "").await;
+        let parsed: Table = status.strip_prefix("OK\n").unwrap().parse().unwrap();
+        let tables = parsed["tables"].as_array().unwrap();
+        let entry = |source: &str| -> Table {
+            tables
+                .iter()
+                .filter_map(Value::as_table)
+                .find(|t| t.get("source_table").and_then(Value::as_str) == Some(source))
+                .cloned()
+                .unwrap_or_else(|| panic!("{source} missing: {status}"))
+        };
+        let events = entry("app.public.events");
+        assert_eq!(
+            events["destination_table"].as_str(),
+            Some("cdc.public_events")
+        );
+        assert_eq!(events["initial_load"].as_str(), Some("object_store"));
+        assert_eq!(
+            entry("app.public.orders")["initial_load"].as_str(),
+            Some("copy")
+        );
+        assert_eq!(tables.len(), 2, "{status}");
     }
 
     fn ctx_at(dir: &Path) -> SharedCtx {
