@@ -332,12 +332,7 @@ pub(crate) async fn open_db_desc_log(
         dir.display(),
     );
     if args.ignore_cursor {
-        for f in [
-            walshadow::desc_log::CKPT_FILE,
-            walshadow::desc_log::TAIL_FILE,
-        ] {
-            let _ = tokio::fs::remove_file(dir.join(f)).await;
-        }
+        discard_desc_log(dir).await?;
     }
     if walshadow::desc_log::DescriptorLog::predates_partitions(dir).await?
         && let Some(d) = (input.catalog.lock().await.fetch_all_descriptors().await?.1)
@@ -351,13 +346,37 @@ pub(crate) async fn open_db_desc_log(
             d.rel_name,
         );
     }
-    let desc_log = Arc::new(
-        walshadow::desc_log::DescriptorLog::open_on_branch(dir, input.identity, input.lineage)
-            .await
-            .context(format!("open descriptor log for database {}", input.dbname))?,
-    );
+    let open = || async {
+        walshadow::desc_log::DescriptorLog::open_on_branch(
+            dir,
+            input.identity.clone(),
+            input.lineage,
+        )
+        .await
+        .map(Arc::new)
+        .with_context(|| format!("open descriptor log for database {}", input.dbname))
+    };
+    let mut desc_log = open().await?;
     if let Some(lsn) = input.start_lsn_override {
         check_start_lsn(lsn, desc_log.floor_at_write(), desc_log.head())?;
+    }
+    if let Some(seeded) = reseed_below_start(
+        desc_log.seed_valid_from(),
+        input.aligned,
+        input.manifest_present,
+    )
+    .with_context(|| format!("descriptor log in {}", dir.display()))?
+    {
+        tracing::warn!(
+            target: "walshadow::desc_log",
+            dbname = %input.dbname,
+            start = %input.aligned,
+            seeded_from = format_pg_lsn(seeded).to_string(),
+            "descriptor log seeded above start with no manifest behind it; re-seeding",
+        );
+        drop(desc_log);
+        discard_desc_log(dir).await?;
+        desc_log = open().await?;
     }
     if desc_log.is_empty() {
         // Baseline snapshot: every eligible rel as of shadow's position,
@@ -427,6 +446,42 @@ fn check_start_lsn(lsn: Pos<RawStart>, floor: Pos<Floor>, head: u64) -> anyhow::
     Ok(())
 }
 
+/// Below the seed every seeded relation's record reads as not covered and
+/// skips undecoded. With a manifest behind the log that is lost history, so
+/// refuse; without one no run behind it made progress durable, so `Some`
+/// asks for a re-seed at start
+fn reseed_below_start(
+    seeded: Option<u64>,
+    start: Pos<Floor>,
+    manifest_present: bool,
+) -> anyhow::Result<Option<u64>> {
+    let Some(seeded) = seeded.filter(|&s| start.get() < s) else {
+        return Ok(None);
+    };
+    anyhow::ensure!(
+        !manifest_present,
+        "start {start} below descriptor log coverage from {}; records in between would \
+         skip undecoded — --ignore-cursor re-seeds the log at the start, or re-bootstrap",
+        format_pg_lsn(seeded),
+    );
+    Ok(Some(seeded))
+}
+
+async fn discard_desc_log(dir: &Path) -> anyhow::Result<()> {
+    for f in [
+        walshadow::desc_log::CKPT_FILE,
+        walshadow::desc_log::TAIL_FILE,
+    ] {
+        let path = dir.join(f);
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e).with_context(|| format!("discard {}", path.display())),
+        }
+    }
+    Ok(())
+}
+
 pub(crate) const ATTACH_MARKER: &str = "attach-pending";
 
 pub(crate) async fn list_databases(
@@ -478,5 +533,43 @@ mod tests {
                 .contains("beyond descriptor log head 0/300"),
             "{beyond}"
         );
+    }
+
+    const SEED: u64 = 0x5FA_6B00_0000;
+
+    #[test]
+    fn start_at_or_above_seed_keeps_the_log() {
+        for manifest in [false, true] {
+            assert_eq!(
+                reseed_below_start(Some(SEED), Pos::new(SEED), manifest).unwrap(),
+                None
+            );
+            assert_eq!(
+                reseed_below_start(Some(SEED), Pos::new(SEED + 1), manifest).unwrap(),
+                None
+            );
+            assert_eq!(
+                reseed_below_start(None, Pos::new(1), manifest).unwrap(),
+                None
+            );
+        }
+    }
+
+    /// A restart that never wrote a manifest seeded at the source head; the
+    /// operator's earlier `--start-lsn` must not decode against it
+    #[test]
+    fn start_below_seed_without_manifest_reseeds() {
+        assert_eq!(
+            reseed_below_start(Some(SEED), Pos::new(0x5AA_FF00_0000), false).unwrap(),
+            Some(SEED)
+        );
+    }
+
+    #[test]
+    fn start_below_seed_with_manifest_is_refused() {
+        let err = reseed_below_start(Some(SEED), Pos::new(0x5AA_FF00_0000), true).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("5FA/6B000000"), "{msg}");
+        assert!(msg.contains("--ignore-cursor"), "{msg}");
     }
 }
