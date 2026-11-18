@@ -246,7 +246,7 @@ impl Harness {
         .collect();
         let child = spawn_daemon(&bin, &args, &stderr_path).context("spawn walshadow-stream")?;
 
-        let h = Harness {
+        let mut h = Harness {
             tmp,
             source,
             ch,
@@ -274,6 +274,9 @@ impl Harness {
         )
         .await
         .context("seed row never reached CH")?;
+        h.wait_ready(Duration::from_secs(60))
+            .await
+            .context("bootstrap never handed off to the pump")?;
         Ok(h)
     }
 
@@ -358,6 +361,18 @@ impl Harness {
             }
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
+    }
+
+    async fn settled_metric(&self, name: &str) -> Result<u64> {
+        let mut seen = self.metric(name)?;
+        let mut steady = 0;
+        while steady < 2 {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let now = self.metric(name)?;
+            steady = if now == seen { steady + 1 } else { 0 };
+            seen = now;
+        }
+        Ok(seen)
     }
 
     /// One labelled series off `/metrics`, by its full `name{labels}` head.
@@ -1385,8 +1400,10 @@ async fn shutdown_fails_when_the_final_drain_cannot_ship() {
             "[ch]\nretry_max_attempts = 0\nflush_timeout_ms = 3600000\nrow_budget = 1000000",
         )?;
         h.ctl(&["reload"])?;
+        let sealed = h
+            .settled_metric("walshadow_insertbatch_batches_out_total")
+            .await?;
         let buffered = h.metric("walshadow_insertbatch_rows_in_total")?;
-        let sealed = h.metric("walshadow_insertbatch_batches_out_total")?;
         h.psql("UPDATE demo.users SET email = 'unshipped@x' WHERE id = 1")?;
         h.wait_metric(
             "walshadow_insertbatch_rows_in_total",
