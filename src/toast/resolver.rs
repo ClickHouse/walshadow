@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use async_trait::async_trait;
-use clickhouse_c::{Allocator, Block, BlockBuilder, ColumnBuilder, Event, TypeAst};
+use clickhouse_c::{Allocator, Block, BlockBuilder, ColumnBuilder, Event, QueryOpts, TypeAst};
 use futures::stream::StreamExt;
 use thiserror::Error;
 use tokio::sync::Mutex;
@@ -841,9 +841,9 @@ impl ClickHouseChunkStore {
                 |e| is_retryable(e) && !is_missing_mirror(e),
                 |mut client| async move {
                     let result = with_timeout(insert_timeout, async {
-                        client.send_query(sql, None).await?;
+                        client.send_query(sql, &QueryOpts::new()).await?;
                         if let Some(bb) = bb {
-                            client.send_data(Some(bb)).await?;
+                            client.send_data(bb).await?;
                             client.send_data_end().await?;
                         }
                         drain_to_end_of_stream(&mut client).await?;
@@ -934,7 +934,7 @@ impl ClickHouseChunkStore {
                 |e| is_retryable(e) && !is_missing_mirror(e),
                 |mut client| async {
                     let result = with_timeout(insert_timeout, async {
-                        client.send_query(sql, None).await?;
+                        client.send_query(sql, &QueryOpts::new()).await?;
                         let mut out = A::default();
                         loop {
                             match client.recv_event().await? {

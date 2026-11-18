@@ -12,7 +12,7 @@
 //! dedups by `_lsn`). Retry-exhaustion is fatal: the watermark can't advance
 //! without this batch.
 
-use clickhouse_c::{Allocator, BlockBuilder, ColumnBuilder, TypeAst};
+use clickhouse_c::{Allocator, BlockBuilder, ColumnBuilder, QueryOpts, TypeAst};
 use tokio::task::JoinHandle;
 
 use crate::ch::{ChConn, EmitterError, EndOfStream, drain_to_end_of_stream, with_timeout};
@@ -70,8 +70,8 @@ impl Inserter {
             .retry(
                 |mut client| async move {
                     let result = with_timeout(insert_timeout, async {
-                        client.send_query(sql, None).await?;
-                        client.send_data(Some(bb)).await?;
+                        client.send_query(sql, &QueryOpts::new()).await?;
+                        client.send_data(bb).await?;
                         client.send_data_end().await?;
                         drain_to_end_of_stream(&mut client).await
                     })

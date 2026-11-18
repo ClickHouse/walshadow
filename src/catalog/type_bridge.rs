@@ -322,10 +322,9 @@ fn render_pg_timestamp(pg_micros: i64) -> AsciiBuf<32> {
     out
 }
 
-fn datetime64_scale(ch_inner: &str) -> Option<i32> {
+fn datetime64_scale(ch_inner: &str) -> Option<u32> {
     let ast = TypeAst::parse(ch_inner, Allocator::global(&mimalloc::MiMalloc)).ok()?;
-    let view = ast.view();
-    (view.kind() == Some(Kind::DateTime64)).then(|| view.datetime64_scale())
+    ast.view().datetime64_scale()
 }
 
 fn format_uuid(b: &[u8; 16]) -> AsciiArray<36> {

@@ -12,7 +12,6 @@
 //! cadence, HTTP server reads a snapshot per request. Endpoint is read-only by
 //! design (no `/quit`, no admin verbs); operator actions stay on the CLI.
 
-use std::borrow::Cow;
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::io;
@@ -74,32 +73,26 @@ macro_rules! encode_metric {
 /// [`encode_metric`] for a family every database carries: the `database=`
 /// label comes first, a declared label array second
 macro_rules! encode_db_metric {
-    ($enc:expr, $dbs:expr, $names:expr, counter, $name:expr, $help:expr, $field:ident) => {
+    ($enc:expr, $dbs:expr, counter, $name:expr, $help:expr, $field:ident) => {
         counter_series(
             $enc,
             $name,
             $help,
             "database",
-            $names
-                .iter()
-                .zip($dbs)
-                .map(|(db, s)| (db.as_ref(), s.$field)),
+            $dbs.iter().map(|db| (db.database.as_str(), db.$field)),
         )?
     };
-    ($enc:expr, $dbs:expr, $names:expr, gauge, $name:expr, $help:expr, $field:ident) => {
+    ($enc:expr, $dbs:expr, gauge, $name:expr, $help:expr, $field:ident) => {
         gauge_series(
             $enc,
             $name,
             $help,
             "database",
-            $names
-                .iter()
-                .zip($dbs)
-                .map(|(db, s)| (db.as_ref(), s.$field)),
+            $dbs.iter().map(|db| (db.database.as_str(), db.$field)),
         )?
     };
     (
-        $enc:expr, $dbs:expr, $names:expr, counter, $name:expr, $help:expr, $field:ident,
+        $enc:expr, $dbs:expr, counter, $name:expr, $help:expr, $field:ident,
         $key:literal, $labels:expr
     ) => {
         counter_grid(
@@ -107,14 +100,12 @@ macro_rules! encode_db_metric {
             $name,
             $help,
             $key,
-            $names
-                .iter()
-                .zip($dbs)
-                .map(|(db, s)| (db.as_ref(), $labels.into_iter().zip(s.$field))),
+            $dbs.iter()
+                .map(|db| (db.database.as_str(), $labels.into_iter().zip(db.$field))),
         )?
     };
     (
-        $enc:expr, $dbs:expr, $names:expr, gauge, $name:expr, $help:expr, $field:ident,
+        $enc:expr, $dbs:expr, gauge, $name:expr, $help:expr, $field:ident,
         $key:literal, $labels:expr
     ) => {
         gauge_grid(
@@ -122,10 +113,8 @@ macro_rules! encode_db_metric {
             $name,
             $help,
             $key,
-            $names
-                .iter()
-                .zip($dbs)
-                .map(|(db, s)| (db.as_ref(), $labels.into_iter().zip(s.$field))),
+            $dbs.iter()
+                .map(|db| (db.database.as_str(), $labels.into_iter().zip(db.$field))),
         )?
     };
 }
@@ -555,12 +544,9 @@ macro_rules! db_snapshot {
         }
 
         fn encode_db_fields(dbs: &[DbSeries], enc: &mut DescriptorEncoder<'_>) -> fmt::Result {
-            let names: Vec<Cow<'_, str>> =
-                dbs.iter().map(|db| escape_label(&db.database)).collect();
             $(encode_db_metric!(
                 enc,
                 dbs,
-                names,
                 $kind,
                 concat!("walshadow_", stringify!($field)),
                 $help,
@@ -921,24 +907,6 @@ where
     Ok(())
 }
 
-/// The encoder writes label values through, and a database name is whatever
-/// `CREATE DATABASE` took, so escape what OpenMetrics reserves inside quotes
-fn escape_label(value: &str) -> Cow<'_, str> {
-    if !value.contains(['\\', '"', '\n']) {
-        return Cow::Borrowed(value);
-    }
-    let mut out = String::with_capacity(value.len() + 8);
-    for c in value.chars() {
-        match c {
-            '\\' => out.push_str("\\\\"),
-            '"' => out.push_str("\\\""),
-            '\n' => out.push_str("\\n"),
-            _ => out.push(c),
-        }
-    }
-    Cow::Owned(out)
-}
-
 /// LSN gauges carry their raw `u64`
 impl<K> EncodeGaugeValue for Pos<K> {
     fn encode(&self, encoder: &mut GaugeValueEncoder) -> fmt::Result {
@@ -1001,8 +969,6 @@ fn encode_snapshot(snap: &MetricsSnapshot, enc: &mut DescriptorEncoder<'_>) -> f
         u64::from(!snap.crossing_blocked_on.is_empty()),
     )?;
 
-    // rmgr names come out of the fixed resource-manager table, so label values
-    // need no escaping the encoder does not do
     let mut records = declare(
         enc,
         "walshadow_filter_records_total",
@@ -1450,22 +1416,30 @@ mod tests {
         assert!(body.contains("walshadow_pump_queue_depth 0"), "{body}");
     }
 
-    /// A database name is a PG identifier, so a quote in it must not end the
-    /// label and truncate the scrape
     #[test]
     fn render_escapes_a_database_label() {
         let body = render(MetricsSnapshot {
             by_database: vec![DbSeries {
-                database: "we\"ird\\name".into(),
+                database: "we\"ird\\name\n".into(),
+                bridge_up: 1,
+                bridge_requests_by_op: [3, 0, 0, 0, 0],
                 desc_log_entries: 4,
+                config_backfills_pending_by_mode: [2, 0, 0],
                 ..DbSeries::default()
             }],
             ..MetricsSnapshot::default()
         });
-        assert!(
-            body.contains(r#"walshadow_desc_log_entries{database="we\"ird\\name"} 4"#),
-            "{body}"
-        );
+        for want in [
+            r#"walshadow_bridge_up{database="we\"ird\\name\n"} 1"#,
+            r#"walshadow_desc_log_entries{database="we\"ird\\name\n"} 4"#,
+            &format!(
+                r#"walshadow_bridge_requests_total{{database="we\"ird\\name\n",op="{}"}} 3"#,
+                OP_LABELS[0]
+            ),
+            r#"walshadow_config_backfills_pending{database="we\"ird\\name\n",mode="copy"} 2"#,
+        ] {
+            assert!(body.contains(want), "missing {want}\n{body}");
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1657,11 +1631,5 @@ mod tests {
         assert!(resp.contains("walshadow_filter_lsn 57005"), "{resp}");
         let taken = serve(addr, MetricsRegistry::new()).await.unwrap_err();
         assert!(matches!(taken, MetricsError::Bind { .. }), "{taken}");
-    }
-
-    #[test]
-    fn escape_label_quotes_openmetrics_reserved_chars() {
-        assert!(matches!(escape_label("plain"), Cow::Borrowed("plain")));
-        assert_eq!(escape_label("a\\b\"c\nd"), r#"a\\b\"c\nd"#);
     }
 }

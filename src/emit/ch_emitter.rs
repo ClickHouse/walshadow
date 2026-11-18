@@ -1426,7 +1426,7 @@ pub(crate) struct ColumnPlan {
     pub(crate) type_repr: String,
     pub(crate) ast: TypeAst,
     pub(crate) decimal: Option<DecimalWire>,
-    pub(crate) datetime64_scale: i32,
+    pub(crate) datetime64_scale: u32,
     pub(crate) non_finite: NonFinite,
     pub(crate) encoding: ColumnEncoding,
 }
@@ -1449,8 +1449,8 @@ impl NonFinite {
         if decimal.is_none() && !matches!(inner.kind(), Some(Kind::Date32 | Kind::DateTime64)) {
             return Ok(Self::default());
         }
-        let precision =
-            usize::try_from(inner.decimal_precision()).map_err(|_| "bad Decimal precision")?;
+        let precision = usize::try_from(inner.decimal_precision().unwrap_or(0))
+            .map_err(|_| "bad Decimal precision")?;
         let scale = usize::from(decimal.map_or(0, |w| w.scale));
         let bound = format!("{}.{}", "9".repeat(precision - scale), "9".repeat(scale));
         let cell = |key: &str, sub: &Option<Substitute>| {
@@ -1662,7 +1662,9 @@ impl TablePlan {
                 name: c.target_name.clone(),
                 type_repr: canonical_type(&ast, &c.target_type),
                 encoding: ColumnEncoding::choose(att, &ast),
-                datetime64_scale: types::strip_nullable(ast.view()).datetime64_scale(),
+                datetime64_scale: types::strip_nullable(ast.view())
+                    .datetime64_scale()
+                    .unwrap_or(0),
                 ast,
                 decimal,
                 non_finite: NonFinite::default(),
@@ -1679,7 +1681,8 @@ impl TablePlan {
                                 type_repr: canonical_type(&oast, ty),
                                 encoding: ColumnEncoding::choose(att, &oast),
                                 datetime64_scale: types::strip_nullable(oast.view())
-                                    .datetime64_scale(),
+                                    .datetime64_scale()
+                                    .unwrap_or(0),
                                 ast: oast,
                                 decimal,
                                 non_finite: NonFinite::default(),
@@ -2257,7 +2260,7 @@ fn decimal_wire_of(ast: &TypeAst) -> Option<DecimalWire> {
         _ => return None,
     };
     Some(DecimalWire {
-        scale: u8::try_from(inner.decimal_scale()).ok()?,
+        scale: u8::try_from(inner.decimal_scale()?).ok()?,
         width,
     })
 }
@@ -2488,7 +2491,7 @@ fn unsupported(kind: &'static str) -> EmitterError {
     }
 }
 
-fn timestamp_ticks(pg_us: i64, scale: i32) -> Result<i64, EmitterError> {
+fn timestamp_ticks(pg_us: i64, scale: u32) -> Result<i64, EmitterError> {
     micros_to_ticks(
         i128::from(pg_us) + i128::from(DATETIME64_PG_EPOCH_US),
         scale,
@@ -2496,15 +2499,15 @@ fn timestamp_ticks(pg_us: i64, scale: i32) -> Result<i64, EmitterError> {
 }
 
 /// Convert microseconds to `DateTime64(scale)` or `Time64(scale)` ticks
-fn micros_to_ticks(us: i128, scale: i32) -> Result<i64, EmitterError> {
-    if !(0..=9).contains(&scale) {
+fn micros_to_ticks(us: i128, scale: u32) -> Result<i64, EmitterError> {
+    if scale > 9 {
         return Err(EmitterError::Type("invalid temporal precision".into()));
     }
     let ticks = if scale < 6 {
-        let divisor = 10i128.pow((6 - scale) as u32);
+        let divisor = 10i128.pow(6 - scale);
         us / divisor
     } else {
-        us * 10i128.pow((scale - 6) as u32)
+        us * 10i128.pow(scale - 6)
     };
     i64::try_from(ticks).map_err(|_| unsupported("finite temporal value overflows storage"))
 }
@@ -2513,7 +2516,7 @@ fn encode_value(
     buf: &mut ColumnBuf,
     v: &ColumnValue,
     decimal: Option<DecimalWire>,
-    timestamp_scale: i32,
+    timestamp_scale: u32,
 ) -> Result<(), EmitterError> {
     match v {
         // Non-Nullable target takes type default
