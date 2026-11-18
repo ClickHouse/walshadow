@@ -2925,7 +2925,7 @@ dependencies = [
 
 [[package]]
 name = "walshadow"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -2975,7 +2975,7 @@ dependencies = [
 
 [[package]]
 name = "walshadow-bench"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "ab_glyph",
  "anyhow",
