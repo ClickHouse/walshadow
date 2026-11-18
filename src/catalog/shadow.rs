@@ -258,6 +258,13 @@ impl SourceGucFloor {
     }
 }
 
+fn killed_by_shutdown(err: &ShadowError) -> bool {
+    matches!(
+        err,
+        ShadowError::Process { stderr, .. } if stderr.contains("crash of another server process")
+    )
+}
+
 /// Outcome of [`try_pg_wal_replay_resume`](Shadow::try_pg_wal_replay_resume)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResumeOutcome {
@@ -773,7 +780,11 @@ impl Shadow {
         {
             return Ok(ResumeOutcome::PausedForeign);
         }
-        self.probe_one("SELECT pg_wal_replay_resume()")?;
+        if let Err(e) = self.probe_one("SELECT pg_wal_replay_resume()")
+            && !killed_by_shutdown(&e)
+        {
+            return Err(e);
+        }
         Ok(ResumeOutcome::ResumedForFloor)
     }
 
@@ -1267,6 +1278,7 @@ case "$sql" in
   *) key=other;;
 esac
 printf '%s\n' "$db" >> "$dir/dbs"
+[ -e "$dir/fail_$key" ] && { cat "$dir/fail_$key" >&2; exit 2; }
 cat "$dir/answers/$key""#,
         );
         let mut cfg = ShadowConfig::new(tmp.join("data"), tmp.join("filtered"));
@@ -1368,6 +1380,25 @@ cat "$dir/answers/$key""#,
             let err = shadow.try_pg_wal_replay_resume().unwrap_err();
             assert!(err.to_string().contains(want), "{want}: {err}");
         }
+
+        answer(&answers, "settings", "100|8|10|0|64");
+        let refused = answers.parent().unwrap().join("fail_other");
+        fs::write(
+            &refused,
+            "permission denied for function pg_wal_replay_resume",
+        )
+        .unwrap();
+        let err = shadow.try_pg_wal_replay_resume().unwrap_err();
+        assert!(err.to_string().contains("permission denied"), "{err}");
+        fs::write(
+            &refused,
+            "WARNING:  terminating connection because of crash of another server process",
+        )
+        .unwrap();
+        assert_eq!(
+            shadow.try_pg_wal_replay_resume().unwrap(),
+            ResumeOutcome::ResumedForFloor
+        );
     }
 
     #[test]
