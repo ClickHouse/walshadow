@@ -502,7 +502,9 @@ snapshot! {
     counter catalog_boundary_holds_total: u64 =
         "Publication holds released at catalog-mutating commit boundaries.",
     counter catalog_boundary_hold_failures_total: u64 =
-        "Catalog-boundary holds woken with an error (worker death, walreceiver loss, timeout).",
+        "Catalog-boundary holds interrupted by decoder worker failure.",
+    gauge catalog_boundary_stalled_lsn: u64 =
+        "Target replay LSN of a stalled catalog boundary, or zero when none is stalled.",
     counter catalog_boundary_hold_seconds_total: f64 =
         "Cumulative seconds the pump parked in released catalog-boundary holds.",
 }

@@ -18,32 +18,32 @@
 //! observe apply advancing at poll cadence rather than
 //! `wal_receiver_status_interval`.
 //!
-//! Waiter is result-bearing: worker death (channel closed / panic),
-//! walreceiver loss past the hold timeout, and replay timeout all wake it
-//! with `Err`, which poisons the stream and terminates the pump with the
-//! root cause. The hold never waits on ClickHouse, committed drains, or
-//! queued barrier work — only shadow replay of already-shipped bytes.
+//! During archive recovery, read replay progress directly from the shadow
+//! through the bridge. Report stalls and keep waiting for replay.
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, watch};
+use tokio::time::Instant;
 
 use crate::catalog::shadow_catalog::ParkedAt;
+use crate::ops::bridge::Bridge;
+use crate::ops::metrics::MetricsRegistry;
 use crate::pos::{Pos, ShadowReplay};
 use crate::record::{BoundaryKind, Record, RecordSink, Route, SinkError};
 use crate::source::catalog_capture::CaptureSet;
 use crate::source::queueing_record_sink::QueueingRecordSink;
 use crate::source::shadow_stream::ShadowStreamState;
 
-/// Bounds one publication hold. Must stay well under source PG's
-/// `wal_sender_timeout` (default 60s): the pump answers no source
-/// keepalives while parked.
-pub const DEFAULT_HOLD_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_STALL_WARNING: Duration = Duration::from_secs(30);
+const REPLAY_PROBE_INTERVAL: Duration = Duration::from_millis(250);
+// Dropping a probe mid round trip closes its bridge socket
+const REPLAY_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Apply-LSN poll cadence. Listener flushes queued frames every ~50ms, so
 /// finer polling only spins the lock.
@@ -53,10 +53,14 @@ pub const DEFAULT_HOLD_POLL: Duration = Duration::from_millis(20);
 pub struct BoundaryHoldStats {
     /// Holds released by shadow replay reaching the commit's `next_lsn`.
     pub holds: AtomicU64,
-    /// Holds woken with `Err` (worker death, walreceiver loss, timeout).
+    /// Holds interrupted by decoder worker failure.
     pub failures: AtomicU64,
     /// Cumulative released-hold duration.
     pub hold_nanos: AtomicU64,
+    /// Target replay LSN of a stalled hold, zero otherwise
+    pub stalled_lsn: AtomicU64,
+    /// True while a hold parks the pump
+    pub parked: watch::Sender<bool>,
 }
 
 impl BoundaryHoldStats {
@@ -67,14 +71,14 @@ impl BoundaryHoldStats {
 
 #[derive(Debug, Clone, Copy)]
 pub struct BoundaryGateConfig {
-    pub hold_timeout: Duration,
+    pub warn_after: Duration,
     pub poll_interval: Duration,
 }
 
 impl Default for BoundaryGateConfig {
     fn default() -> Self {
         Self {
-            hold_timeout: DEFAULT_HOLD_TIMEOUT,
+            warn_after: DEFAULT_STALL_WARNING,
             poll_interval: DEFAULT_HOLD_POLL,
         }
     }
@@ -84,6 +88,7 @@ impl Default for BoundaryGateConfig {
 pub struct CatalogBoundaryGate {
     state: Arc<Mutex<ShadowStreamState>>,
     config: BoundaryGateConfig,
+    probe: Option<(Arc<Bridge>, MetricsRegistry)>,
     pub stats: Arc<BoundaryHoldStats>,
 }
 
@@ -92,48 +97,89 @@ impl CatalogBoundaryGate {
         Self {
             state,
             config,
+            probe: None,
             stats: Arc::new(BoundaryHoldStats::default()),
         }
     }
 
-    /// Park until shadow's aggregate apply LSN reaches `next_lsn`.
-    /// `worker_alive` is polled each tick; a dead decoder worker wakes the
-    /// waiter with `Err` instead of letting the daemon hang out the
-    /// timeout. Walreceiver loss mid-hold is tolerated until the deadline —
-    /// a reconnect backfills the in-progress segment and replay resumes —
-    /// then fails the boundary.
+    pub fn with_local_shadow(mut self, bridge: Arc<Bridge>, metrics: MetricsRegistry) -> Self {
+        self.probe = Some((bridge, metrics));
+        self
+    }
+
+    /// Publish directly since the pump, which publishes metrics, is parked
+    async fn set_stalled(&self, lsn: u64) {
+        if self.stats.stalled_lsn.swap(lsn, Ordering::Relaxed) != lsn
+            && let Some((_, metrics)) = &self.probe
+        {
+            metrics
+                .update(|snap| snap.catalog_boundary_stalled_lsn = lsn)
+                .await;
+        }
+    }
+
+    /// Hold successor WAL until shadow applies through `next_lsn`.
     pub async fn hold(
         &self,
         commit_lsn: u64,
         next_lsn: Pos<ShadowReplay>,
         worker_alive: impl Fn() -> bool,
     ) -> Result<ParkedAt, SinkError> {
+        self.stats.parked.send_replace(true);
+        let _parked = ParkedGuard(&self.stats);
         let applied = self.state.lock().await.applied();
         let start = Instant::now();
+        let mut next_probe = start;
+        let mut quiet_since = start;
+        let mut last_apply = Pos::ZERO;
         let held = loop {
-            // Read the wake count before the probe, so a status landing
-            // between them is not parked through
             let seen = applied.current();
             let agg = self.state.lock().await.aggregate();
-            if agg.min_apply_lsn.is_some_and(|apply| apply >= next_lsn) {
-                break start.elapsed();
-            }
             if !worker_alive() {
+                self.set_stalled(0).await;
                 return self.fail(format!(
                     "decoder worker terminated during catalog boundary hold at {commit_lsn:#X}"
                 ));
             }
-            let waited = start.elapsed();
-            if waited >= self.config.hold_timeout {
-                return self.fail(format!(
-                    "catalog boundary hold at {commit_lsn:#X} timed out after {waited:?}: \
-                     shadow apply {:?} < {next_lsn} ({} walreceiver connection(s))",
-                    agg.min_apply_lsn, agg.active_connections,
-                ));
+            let mut apply = agg.min_apply_lsn.unwrap_or(Pos::ZERO);
+            if agg.active_connections == 0
+                && Instant::now() >= next_probe
+                && let Some((bridge, _)) = &self.probe
+            {
+                // Archive replay has no receiver. Probe shared memory since SQL can
+                // wait on a catalog lock that replay releases after this record.
+                if let Ok(Ok(lsn)) =
+                    tokio::time::timeout(REPLAY_PROBE_TIMEOUT, bridge.replay_lsn()).await
+                {
+                    apply = Pos::new(lsn);
+                }
+                next_probe = Instant::now() + REPLAY_PROBE_INTERVAL;
             }
-            // Poll cadence also covers aggregate moves with no per-connection
-            // progress, such as a walreceiver attaching or dropping
-            self.state.lock().await.request_status();
+            if apply >= next_lsn {
+                self.set_stalled(0).await;
+                break start.elapsed();
+            }
+            let now = Instant::now();
+            if apply > last_apply {
+                last_apply = apply;
+                quiet_since = now;
+                self.set_stalled(0).await;
+            } else if now.duration_since(quiet_since) >= self.config.warn_after {
+                tracing::warn!(
+                    target: "walshadow::boundary_hold",
+                    commit_lsn = format_args!("{commit_lsn:#X}"),
+                    next_lsn = %next_lsn,
+                    shadow_apply = %last_apply,
+                    walreceivers = agg.active_connections,
+                    held = ?start.elapsed(),
+                    "catalog boundary stalled waiting for shadow replay",
+                );
+                self.set_stalled(next_lsn.get()).await;
+                quiet_since = now;
+            }
+            if agg.active_connections != 0 {
+                self.state.lock().await.request_status();
+            }
             let _ = tokio::time::timeout(self.config.poll_interval, applied.advance(seen)).await;
         };
         self.stats.holds.fetch_add(1, Ordering::Relaxed);
@@ -153,6 +199,16 @@ impl CatalogBoundaryGate {
     fn fail<T>(&self, msg: String) -> Result<T, SinkError> {
         self.stats.failures.fetch_add(1, Ordering::Relaxed);
         Err(SinkError::Other(msg))
+    }
+}
+
+/// Clear hold state when a hold is cancelled. Next metrics publish clears gauge
+struct ParkedGuard<'a>(&'a BoundaryHoldStats);
+
+impl Drop for ParkedGuard<'_> {
+    fn drop(&mut self) {
+        self.0.stalled_lsn.store(0, Ordering::Relaxed);
+        self.0.parked.send_replace(false);
     }
 }
 
@@ -265,12 +321,8 @@ impl BoundaryHoldSink {
         self
     }
 
-    async fn attach_pending(
-        &mut self,
-        db: PendingDatabase,
-        record: &Record<'_>,
-    ) -> Result<(), SinkError> {
-        self.inner.flush().await?;
+    /// Hold fails only once the worker dies, so flush to surface its root cause
+    async fn hold(&mut self, record: &Record<'_>) -> Result<ParkedAt, SinkError> {
         let inner = &self.inner;
         let held = self
             .gate
@@ -279,9 +331,18 @@ impl BoundaryHoldSink {
             })
             .await;
         if let Err(hold_err) = held {
-            self.inner.flush().await?;
-            return Err(hold_err);
+            return self.inner.flush().await.and(Err(hold_err));
         }
+        held
+    }
+
+    async fn attach_pending(
+        &mut self,
+        db: PendingDatabase,
+        record: &Record<'_>,
+    ) -> Result<(), SinkError> {
+        self.inner.flush().await?;
+        self.hold(record).await?;
         if !bridge_listening(&db.bridge_socket, self.pending.attach_timeout).await {
             return Err(SinkError::Other(format!(
                 "database {} (oid {}) is on the source, but the shadow replayed through \
@@ -378,23 +439,8 @@ impl RecordSink for BoundaryHoldSink {
             // commit itself forwards only after capture so the worker's
             // drain finds events already attached
             self.inner.flush().await?;
-            let inner = &self.inner;
             let parked = Instant::now();
-            let held = self
-                .gate
-                .hold(record.source_lsn, Pos::new(record.next_lsn), || {
-                    inner.worker_alive()
-                })
-                .await;
-            let held = match held {
-                Ok(held) => held,
-                Err(hold_err) => {
-                    // Dead worker fails flush with its own error, so hold error
-                    // only surfaces on timeout
-                    self.inner.flush().await?;
-                    return Err(hold_err);
-                }
-            };
+            let held = self.hold(record).await?;
             self.capture.charge_hold(info, parked.elapsed());
             self.capture
                 .capture_boundary(info, record.source_lsn, &held)
@@ -425,12 +471,12 @@ mod tests {
 
     fn gate_with(
         state: Arc<Mutex<ShadowStreamState>>,
-        hold_timeout: Duration,
+        warn_after: Duration,
     ) -> CatalogBoundaryGate {
         CatalogBoundaryGate::new(
             state,
             BoundaryGateConfig {
-                hold_timeout,
+                warn_after,
                 poll_interval: Duration::from_millis(1),
             },
         )
@@ -486,7 +532,7 @@ mod tests {
         let gate = CatalogBoundaryGate::new(
             s.clone(),
             BoundaryGateConfig {
-                hold_timeout: Duration::from_secs(5),
+                warn_after: Duration::from_secs(5),
                 poll_interval: Duration::from_secs(4),
             },
         );
@@ -543,36 +589,51 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hold_times_out_without_apply_progress() {
-        let s = state();
-        let _ = s.lock().await.register_connection(0x1000, 1, None);
-        let gate = gate_with(s.clone(), Duration::from_millis(20));
-        let err = gate
-            .hold(0x1F00, Pos::new(0x2000), || true)
-            .await
-            .expect_err("must time out");
-        assert!(err.to_string().contains("timed out"), "{err}");
-        assert_eq!(gate.stats.failures.load(Ordering::Relaxed), 1);
-    }
+    async fn hold_releases_from_archive_replay_without_a_receiver() {
+        use crate::ops::bridge::{
+            PROJECTION_VERSION, PROTO_VERSION,
+            tests::{hello_body, lsn_body, remote_body, spawn_worker},
+        };
 
-    #[tokio::test]
-    async fn hold_times_out_with_no_walreceiver() {
-        // No connection at all: min_apply_lsn stays None; reconnect never
-        // comes, deadline fails the boundary
-        let gate = gate_with(state(), Duration::from_millis(20));
-        let err = gate
-            .hold(0x1F00, Pos::new(0x2000), || true)
+        let (_dir, path) = spawn_worker(vec![
+            Some(hello_body(PROTO_VERSION, PROJECTION_VERSION)),
+            Some(remote_body("replay position unavailable")),
+            Some(lsn_body(0x1000)),
+            Some(lsn_body(0x2000)),
+        ]);
+        let bridge = Arc::new(Bridge::connect(path).await.unwrap());
+        let metrics = MetricsRegistry::new();
+        let gate = gate_with(state(), Duration::from_millis(10))
+            .with_local_shadow(bridge, metrics.clone());
+        let hold = gate.hold(0x1F00, Pos::new(0x2000), || true);
+        tokio::pin!(hold);
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut hold)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            metrics.snapshot().await.catalog_boundary_stalled_lsn,
+            0x2000
+        );
+        assert!(*gate.stats.parked.borrow());
+        let parked = tokio::time::timeout(Duration::from_secs(2), hold)
             .await
-            .expect_err("must time out");
-        assert!(err.to_string().contains("0 walreceiver"), "{err}");
+            .expect("probe should observe archive replay")
+            .expect("released");
+        assert_eq!(parked.lsn(), 0x2000);
+        assert_eq!(metrics.snapshot().await.catalog_boundary_stalled_lsn, 0);
+        assert!(!*gate.stats.parked.borrow());
+        assert_eq!(gate.stats.failures.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]
     async fn hold_releases_after_mid_hold_reconnect() {
         // Walreceiver absent when the hold starts; a late attach + status
-        // must still release within the deadline
+        // releases even after a stall warning
         let s = state();
-        let gate = gate_with(s.clone(), Duration::from_secs(5));
+        let gate = gate_with(s.clone(), Duration::from_millis(10));
         let attach = tokio::spawn({
             let s = s.clone();
             async move {
@@ -733,7 +794,10 @@ mod tests {
                 &'a mut self,
                 _r: &'a Record<'a>,
             ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
-                Box::pin(async { Err(SinkError::Other("worker boom".into())) })
+                Box::pin(async {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    Err(SinkError::Other("worker boom".into()))
+                })
             }
         }
         let s = state();
@@ -741,9 +805,9 @@ mod tests {
         let q = QueueingRecordSink::spawn(Fail, 1, 4, None);
         let gate = gate_with(s, Duration::from_secs(30));
         let mut sink = BoundaryHoldSink::new(q, gate);
-        // Predecessor record ships (batch_size 1) and kills the worker;
-        // the boundary's pre-hold flush (or the hold's worker_alive wake)
-        // must surface that root cause, never the generic hold error
+        // Predecessor record ships (batch_size 1) and kills the worker
+        // mid-hold; the hold's worker_alive wake must surface that root
+        // cause, never the generic hold error
         let dml = Record {
             source_lsn: 0x1E00,
             next_lsn: 0x1F00,
@@ -758,6 +822,7 @@ mod tests {
         };
         let err = sink.on_record(&rec).await.expect_err("must fail");
         assert!(err.to_string().contains("boom"), "{err}");
+        assert_eq!(sink.gate.stats.failures.load(Ordering::Relaxed), 1);
     }
 
     fn boundary() -> Record<'static> {
@@ -783,24 +848,6 @@ mod tests {
             Duration::ZERO,
             AttachSlot::default(),
         ))
-    }
-
-    #[tokio::test]
-    async fn sink_boundary_timeout_surfaces_hold_error() {
-        // No walreceiver, worker alive: hold's own error is the cause
-        let q = QueueingRecordSink::spawn(CountingRecordSink::default(), 4, 16, None);
-        let mut sink = BoundaryHoldSink::new(q, gate_with(state(), Duration::from_millis(10)));
-        let err = sink.on_record(&boundary()).await.expect_err("timeout");
-        assert!(err.to_string().contains("timed out"), "{err}");
-        sink.close().await.expect("close");
-    }
-
-    #[tokio::test]
-    async fn pending_attach_timeout_surfaces_hold_error() {
-        let mut sink = pending_sink(gate_with(state(), Duration::from_millis(10)));
-        let err = sink.on_record(&boundary()).await.expect_err("timeout");
-        assert!(err.to_string().contains("timed out"), "{err}");
-        sink.close().await.expect("close");
     }
 
     #[tokio::test]

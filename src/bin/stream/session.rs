@@ -1334,10 +1334,11 @@ async fn session_body(
     let boundary_gate = CatalogBoundaryGate::new(
         shadow_state.clone(),
         BoundaryGateConfig {
-            hold_timeout: Duration::from_secs(args.catalog_hold_timeout),
+            warn_after: Duration::from_secs(args.catalog_hold_timeout),
             ..BoundaryGateConfig::default()
         },
-    );
+    )
+    .with_local_shadow(db_conns[primary_index].bridge.clone(), metrics.clone());
     let boundary_hold_stats = boundary_gate.stats.clone();
     // One capture per database: a boundary's catalog reads answer over the
     // connection to the database that wrote them
@@ -1936,14 +1937,40 @@ async fn session_body(
             .unwrap_or(received.get());
         if let Some(chunk) = chunk {
             let replay_started = Instant::now();
-            stream
-                .push(
-                    chunk.start_lsn,
-                    chunk.data,
-                    &mut record_sink,
-                    &mut segment_sink,
-                )
-                .await?;
+            let push = stream.push(
+                chunk.start_lsn,
+                chunk.data,
+                &mut record_sink,
+                &mut segment_sink,
+            );
+            tokio::pin!(push);
+            loop {
+                let status_due = feed.parked_status_due();
+                tokio::select! {
+                    biased;
+                    result = &mut push => {
+                        result?;
+                        break;
+                    }
+                    () = async {
+                        shutdown.cancelled().await;
+                        let _ = boundary_hold_stats.parked.subscribe().wait_for(|&parked| parked).await;
+                    } => {
+                        // Shadow may never replay the boundary, and a partial push
+                        // cannot publish a new resume cursor
+                        tracing::info!(target: "walshadow", "stopping during catalog boundary hold");
+                        return Ok(());
+                    }
+                    Some(err) = tasks.exited() => return Err(err),
+                    res = &mut fsync_task => return Err(task_stopped("segment fsync", res, &fsync_fatal)),
+                    res = &mut gc_task => return Err(task_stopped("descriptor log gc", res, &gc_fatal)),
+                    msg = pipeline_handle.fatal.wait() => anyhow::bail!("decode+insert pipeline failed: {msg}"),
+                    () = async { tokio::time::sleep_until(status_due.unwrap()).await },
+                        if matches!(path, SourcePath::Live) && status_due.is_some() => {
+                        feed.send_parked_status(status).await;
+                    }
+                }
+            }
             if archived_segment {
                 metrics
                     .update(|snap| {

@@ -27,7 +27,7 @@ use std::process::{Child, Command, Stdio};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use walshadow::shadow::{BridgeConf, Shadow, ShadowConfig};
 
 /// Build tree holding `walshadow.so`, fed to PG as `dynamic_library_path`.
@@ -264,6 +264,10 @@ async fn bin_stream_replicates_segments_and_serves_metrics() {
     append_source_conf(&source);
     source.start().expect("start source");
     let _src_stop = StopOnDrop { sh: &source };
+    source
+        .psql_one("ALTER SYSTEM SET wal_sender_timeout = '3s'")
+        .expect("set source sender timeout");
+    source.psql_one("SELECT pg_reload_conf()").expect("reload");
 
     source
         .apply_schema_dump(
@@ -323,6 +327,8 @@ async fn bin_stream_replicates_segments_and_serves_metrics() {
             "--max-segments",
             "1",
             "--status-interval",
+            "1",
+            "--catalog-hold-timeout",
             "1",
             "--metrics-bind",
             &metrics_addr.to_string(),
@@ -384,6 +390,20 @@ async fn bin_stream_replicates_segments_and_serves_metrics() {
         //    destination is the CH emitter, exercised by pipeline_e2e).
         //    Autocommit per `-c` keeps each commit in the same segment
         //    as its records.
+        let sender_sql = "SELECT coalesce((SELECT pid::text FROM pg_stat_replication \
+                          WHERE application_name = 'walshadow' AND state = 'streaming' LIMIT 1), '')";
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let sender_pid = loop {
+            let pid = source.psql_one(sender_sql)?;
+            if !pid.is_empty() {
+                break pid;
+            }
+            if Instant::now() >= deadline {
+                bail!("source walsender never started streaming");
+            }
+            sleep(Duration::from_millis(100));
+        };
+        shadow.psql_one("SELECT pg_wal_replay_pause()")?;
         let driver_sock = source.config().socket_dir.clone();
         psql_exec(
             &driver_sock,
@@ -392,6 +412,22 @@ async fn bin_stream_replicates_segments_and_serves_metrics() {
                 "INSERT INTO bs.t SELECT g, repeat('x', g)::text FROM generate_series(1, 5) g",
             ],
         )?;
+
+        let stalled_lsn = "walshadow_catalog_boundary_stalled_lsn";
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while metric_u64(&http_get(metrics_addr, "/metrics")?, stalled_lsn).unwrap_or(0) == 0 {
+            if Instant::now() >= deadline {
+                bail!("catalog boundary never reported a stall");
+            }
+            sleep(Duration::from_millis(100));
+        }
+        // Hold past the source's sender timeout to verify heartbeats keep COPY open.
+        sleep(Duration::from_secs(4));
+        ensure!(
+            source.psql_one(sender_sql)? == sender_pid,
+            "source walsender restarted during catalog boundary hold"
+        );
+        shadow.psql_one("SELECT pg_wal_replay_resume()")?;
 
         // 6b. Null-tail watermark: the metrics-only pipeline's contiguous
         //     ack must advance past the workload's commits — routed-nothing
@@ -403,7 +439,7 @@ async fn bin_stream_replicates_segments_and_serves_metrics() {
             // LSN gauges stay absent while their position is unknown
             let ack = metric_u64(&body, "walshadow_emitter_ack_lsn").unwrap_or(0);
             let replay = metric_u64(&body, "walshadow_shadow_replay_lsn").unwrap_or(0);
-            if ack > ack_at_boot && replay > 0 {
+            if ack > ack_at_boot && replay > 0 && metric_u64(&body, stalled_lsn).unwrap_or(0) == 0 {
                 break;
             }
             if std::time::Instant::now() > deadline {
@@ -861,6 +897,8 @@ async fn process_restart_preserves_shadow_postmaster() {
                 &metrics_addr.to_string(),
                 "--status-interval",
                 "1",
+                "--catalog-hold-timeout",
+                "1",
                 "--retention-bytes",
                 "0",
             ])
@@ -889,6 +927,26 @@ async fn process_restart_preserves_shadow_postmaster() {
             }
             source.psql_one("SELECT pg_switch_wal()")?;
             tokio::time::sleep(Duration::from_secs(2)).await;
+            if round == 2 {
+                // Stop while a catalog boundary holds for a paused shadow
+                shadow.psql_one("SELECT pg_wal_replay_pause()")?;
+                source.psql_one("CREATE TABLE restart_hold (id int)")?;
+                let started = Instant::now();
+                while http_get(metrics_addr, "/metrics")
+                    .ok()
+                    .and_then(|body| {
+                        metric_u64(&body, "walshadow_catalog_boundary_stalled_lsn").ok()
+                    })
+                    .unwrap_or(0)
+                    == 0
+                {
+                    anyhow::ensure!(
+                        started.elapsed() < Duration::from_secs(15),
+                        "catalog boundary never stalled"
+                    );
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
             let signal = if round == 1 { "-KILL" } else { "-TERM" };
             let status = Command::new("kill")
                 .args([signal, &child.id().to_string()])
@@ -905,11 +963,15 @@ async fn process_restart_preserves_shadow_postmaster() {
         if result.is_err() {
             tools::stop_gracefully(&mut child);
         }
-        assert!(
-            result.is_ok(),
-            "{result:?}\n{}",
-            fs::read_to_string(&log).unwrap()
-        );
+        let log = fs::read_to_string(&log).unwrap();
+        assert!(result.is_ok(), "{result:?}\n{log}");
+        if round == 2 {
+            shadow.psql_one("SELECT pg_wal_replay_resume()").unwrap();
+            assert!(
+                log.contains("stopping during catalog boundary hold"),
+                "{log}"
+            );
+        }
         assert!(shadow.is_running().unwrap());
         assert_eq!(
             fs::read_to_string(data.join("postmaster.pid"))
