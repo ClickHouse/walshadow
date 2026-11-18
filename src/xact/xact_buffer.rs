@@ -2453,16 +2453,11 @@ pub async fn detoast_heap(
     // resolution peak (every retained decoded value + the largest
     // single-value transient), shrunk to retained bytes before return
     let mut leaf = crate::budget::acquire_opt(resolver.budget(), leaf_need).await;
-    let mut uses: HashMap<(u32, u32), u32> = HashMap::with_capacity(pointers.len());
-    for p in &pointers {
-        *uses.entry((p.va_toastrelid, p.va_valueid)).or_default() += 1;
-    }
     let cache = prefetch_store_values(&pointers, chunk_maps, resolver, db, lsn).await?;
     let mut res = ValueResolution {
         spool,
         xact_maps: chunk_maps,
         resolver,
-        uses,
         cache,
         retained: 0,
     };
@@ -2526,7 +2521,7 @@ async fn prefetch_store_values(
     if resolver.fill_on_miss() {
         return Ok(cache);
     }
-    let mut wanted: HashMap<u32, HashMap<u32, ToastPointer>> = HashMap::new();
+    let mut wanted: HashMap<u32, HashMap<u32, (ToastPointer, u32)>> = HashMap::new();
     for p in pointers {
         let key = (p.va_toastrelid, p.va_valueid);
         if let Some(v) = chunk_maps.iter().find_map(|m| m.get(&key)) {
@@ -2541,28 +2536,37 @@ async fn prefetch_store_values(
                 "toast value's leading chunks precede the stream start; resolving it from the store",
             );
         }
-        wanted
+        let (pointer, uses) = wanted
             .entry(p.va_toastrelid)
             .or_default()
-            .insert(p.va_valueid, *p);
+            .entry(p.va_valueid)
+            .or_insert((*p, 0));
+        *pointer = *p;
+        *uses += 1;
     }
     for (toast_relid, ptrs) in wanted {
-        let ptrs: Vec<ToastPointer> = ptrs.into_values().collect();
+        let ptrs: Vec<_> = ptrs.into_values().collect();
         let batch: Vec<(u32, usize)> = ptrs
             .iter()
-            .map(|p| (p.va_valueid, pointer_extsize(p)))
+            .map(|(p, _)| (p.va_valueid, pointer_extsize(p)))
             .collect();
         let got = resolver
             .fetch_values(db_oid, toast_relid, &batch, bound)
             .await
             .map_err(|e| XactBufferError::Detoast(format!("toast store fetch: {e}")))?
             .expect("store checked via fill_on_miss");
-        for (p, fetched) in ptrs.iter().zip(got) {
+        for ((p, uses), fetched) in ptrs.iter().zip(got) {
             let cached = match StoreMiss::split(Some(fetched)) {
                 Ok(stored) => Ok(finish_value(p, stored)?),
                 Err(miss) => Err(miss),
             };
-            cache.insert((p.va_toastrelid, p.va_valueid), cached);
+            cache.insert(
+                (p.va_toastrelid, p.va_valueid),
+                CachedValue {
+                    remaining: *uses,
+                    value: cached,
+                },
+            );
         }
     }
     Ok(cache)
@@ -2570,7 +2574,10 @@ async fn prefetch_store_values(
 
 /// Store-fetched value decoded once per key; cloned for all but the last
 /// use, which moves the buffer
-type CachedValue = std::result::Result<Vec<u8>, StoreMiss>;
+struct CachedValue {
+    remaining: u32,
+    value: std::result::Result<Vec<u8>, StoreMiss>,
+}
 
 /// Who owns chunk store contents, deciding what an unresolved value means
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2659,9 +2666,6 @@ struct ValueResolution<'a> {
     spool: Option<&'a BodySpoolFile>,
     xact_maps: &'a [&'a ChunkRefMap],
     resolver: &'a ToastResolver,
-    /// Pointer occurrences per key across both tuples, sizing cache
-    /// retention (last use moves instead of cloning)
-    uses: HashMap<(u32, u32), u32>,
     cache: HashMap<(u32, u32), CachedValue>,
     retained: usize,
 }
@@ -2736,14 +2740,15 @@ impl ValueResolution<'_> {
         let cached = if self.resolver.fill_on_miss() {
             Err(StoreMiss::NoStore)
         } else {
-            let uses = self.uses.get_mut(&key).expect("counted in detoast_heap");
-            *uses -= 1;
-            if *uses > 0 {
-                self.cache.get(&key).cloned()
+            let Entry::Occupied(mut entry) = self.cache.entry(key) else {
+                panic!("prefetched with the heap");
+            };
+            entry.get_mut().remaining -= 1;
+            if entry.get().remaining > 0 {
+                entry.get().value.clone()
             } else {
-                self.cache.remove(&key)
+                entry.remove().value
             }
-            .expect("prefetched with the heap")
         };
         match cached {
             Ok(raw) => {
@@ -4717,14 +4722,24 @@ mod tests {
         resolver: &'a ToastResolver,
         spool: Option<&'a BodySpoolFile>,
         xact_maps: &'a [&'a ChunkRefMap],
-        cache: HashMap<(u32, u32), CachedValue>,
+        cache: HashMap<(u32, u32), std::result::Result<Vec<u8>, StoreMiss>>,
     ) -> ValueResolution<'a> {
         ValueResolution {
             spool,
             xact_maps,
             resolver,
-            uses: HashMap::from_iter([((16500u32, 55u32), 1)]),
-            cache,
+            cache: cache
+                .into_iter()
+                .map(|(key, value)| {
+                    (
+                        key,
+                        CachedValue {
+                            remaining: 1,
+                            value,
+                        },
+                    )
+                })
+                .collect(),
             retained: 0,
         }
     }
@@ -5002,11 +5017,11 @@ mod tests {
         let cache = prefetch_store_values(&[p, p], &[], &resolver, 0, 10)
             .await
             .unwrap();
+        let stored = cache[&(16500, 55)].value.as_ref().unwrap().as_ptr();
         let mut r = ValueResolution {
             spool: None,
             xact_maps: &[],
             resolver: &resolver,
-            uses: HashMap::from_iter([((16500u32, 55u32), 2)]),
             cache,
             retained: 0,
         };
@@ -5015,6 +5030,11 @@ mod tests {
         let second = r.resolve_store(&p, 17).unwrap();
         assert_eq!(first, ColumnValue::Bytea(b"abcd".to_vec()));
         assert_eq!(second, ColumnValue::Bytea(b"abcd".to_vec()));
+        let (ColumnValue::Bytea(first), ColumnValue::Bytea(second)) = (&first, &second) else {
+            unreachable!();
+        };
+        assert_ne!(first.as_ptr(), stored);
+        assert_eq!(second.as_ptr(), stored);
         assert!(r.cache.is_empty(), "last use moves the buffer out");
         assert_eq!(r.retained, 8, "both uses retain their copy");
         assert_eq!(

@@ -975,8 +975,8 @@ impl ClickHouseChunkStore {
         toast_relid: u32,
         ids: &[u32],
         max_lsn: u64,
-        expected: &HashMap<u32, usize>,
-    ) -> Result<HashMap<u32, ChunkAssembler>, ChunkStoreError> {
+        expected: &HashMap<u32, (usize, usize)>,
+    ) -> Result<Vec<(u32, ChunkAssembler)>, ChunkStoreError> {
         let sql = self.fetch_sql(db_oid, toast_relid, ids, max_lsn);
         let mut state = self.slot().await;
         self.query_locked(&mut state, &sql, |block, out| {
@@ -1005,13 +1005,11 @@ fn is_missing_mirror(error: &EmitterError) -> bool {
     )
 }
 
-/// Feed one result block into per-value assemblers, sized off `expected` at
-/// a value's first chunk. Seq order is validated per value across block
-/// boundaries (final `ORDER BY chunk_id, chunk_seq` is the contract)
+/// SQL orders chunks by value id and sequence across result blocks
 fn read_value_block(
     block: &Block,
-    expected: &HashMap<u32, usize>,
-    out: &mut HashMap<u32, ChunkAssembler>,
+    expected: &HashMap<u32, (usize, usize)>,
+    out: &mut Vec<(u32, ChunkAssembler)>,
 ) -> Result<(), EmitterError> {
     let n = block.n_rows();
     if n == 0 {
@@ -1039,8 +1037,18 @@ fn read_value_block(
         let seq = u32::from_le_bytes(seq_bytes[i * 4..i * 4 + 4].try_into().unwrap());
         let start = if i == 0 { 0 } else { offsets[i - 1] as usize };
         let end = offsets[i] as usize;
-        out.entry(id)
-            .or_insert_with(|| ChunkAssembler::new(expected.get(&id).copied().unwrap_or_default()))
+        if out.last().is_none_or(|(last, _)| *last != id) {
+            if out.last().is_some_and(|(last, _)| *last > id) {
+                return Err(EmitterError::Type(format!(
+                    "toast fetch: chunk_id {id}: fetch order contract broken"
+                )));
+            }
+            let size = expected.get(&id).map_or(0, |(_, size)| *size);
+            out.push((id, ChunkAssembler::new(size)));
+        }
+        out.last_mut()
+            .expect("assembler for current value")
+            .1
             .push(seq, &data[start..end])
             .map_err(|e| EmitterError::Type(format!("toast fetch: {e}")))?;
     }
@@ -1075,9 +1083,9 @@ impl ChunkStore for ClickHouseChunkStore {
         if values.is_empty() {
             return Ok(Vec::new());
         }
-        let mut expected: HashMap<u32, usize> = HashMap::with_capacity(values.len());
-        for &(id, size) in values {
-            let prev = expected.insert(id, size);
+        let mut expected = HashMap::with_capacity(values.len());
+        for (index, &(id, size)) in values.iter().enumerate() {
+            let prev = expected.insert(id, (index, size));
             debug_assert!(
                 prev.is_none(),
                 "batch repeats value {id} from {}",
@@ -1087,7 +1095,7 @@ impl ChunkStore for ClickHouseChunkStore {
         let mut ids: Vec<u32> = expected.keys().copied().collect();
         // Ascending: a split's ids stay adjacent in the mirror's granules
         ids.sort_unstable();
-        let mut assembled: HashMap<u32, ChunkAssembler> = HashMap::with_capacity(ids.len());
+        let mut assembled = vec![FetchedValue::Missing; values.len()];
         let queries = ids.len().div_ceil(FETCH_QUERY_IDS).max(1);
         let width = ids.len().div_ceil(queries);
         let concurrency = queries.min(self.states.len());
@@ -1097,16 +1105,13 @@ impl ChunkStore for ClickHouseChunkStore {
             .collect();
         let mut batches = futures::stream::iter(split).buffer_unordered(concurrency);
         while let Some(batch) = batches.next().await {
-            assembled.extend(batch?);
+            for (id, chunks) in batch? {
+                if let Some(&(index, _)) = expected.get(&id) {
+                    assembled[index] = chunks.finish();
+                }
+            }
         }
-        Ok(values
-            .iter()
-            .map(|(id, _)| {
-                assembled
-                    .remove(id)
-                    .map_or(FetchedValue::Missing, ChunkAssembler::finish)
-            })
-            .collect())
+        Ok(assembled)
     }
 
     async fn truncate_mirror(&self, db_oid: u32, toast_relid: u32) -> Result<(), ChunkStoreError> {
