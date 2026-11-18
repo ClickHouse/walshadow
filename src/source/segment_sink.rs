@@ -54,7 +54,7 @@ pub struct DirSegmentSink {
 
 impl DirSegmentSink {
     pub fn new(out_dir: PathBuf) -> Result<Self, SinkError> {
-        std::fs::create_dir_all(&out_dir)?;
+        std::fs::create_dir_all(&out_dir).map_err(io_op("create dir", &out_dir))?;
         Ok(Self {
             out_dir,
             durability: Durability::Inline,
@@ -67,7 +67,7 @@ impl DirSegmentSink {
         tx: mpsc::Sender<SegFsync>,
         io: TaskTracker,
     ) -> Result<Self, SinkError> {
-        std::fs::create_dir_all(&out_dir)?;
+        std::fs::create_dir_all(&out_dir).map_err(io_op("create dir", &out_dir))?;
         Ok(Self {
             out_dir,
             durability: Durability::Background {
@@ -92,7 +92,7 @@ impl DirSegmentSink {
     async fn write(&mut self, seg: &SegmentName, bytes: &[u8]) -> Result<(), SinkError> {
         let name = seg.format();
         let seg_path = self.out_dir.join(&name);
-        // Retention sweeps a temp a crash leaves behind
+        // Startup sweeps a temp a crash leaves behind
         let seg_tmp = self.out_dir.join(format!("{name}.tmp"));
         let Durability::Background {
             seg_size,
@@ -102,7 +102,9 @@ impl DirSegmentSink {
         } = &mut self.durability
         else {
             write_sync_rename(&seg_tmp, &seg_path, bytes).await?;
-            return Ok(crate::fs::fsync_dir(&self.out_dir).await?);
+            return crate::fs::fsync_dir(&self.out_dir)
+                .await
+                .map_err(io_op("fsync dir", &self.out_dir));
         };
         // Copy out so pump keeps streaming while a blocking thread writes.
         // One write in flight: returning here proves every earlier segment
@@ -119,14 +121,19 @@ impl DirSegmentSink {
         };
         let tx = tx.clone();
         *in_flight = Some(io.spawn_blocking(move || {
-            std::fs::write(&seg_tmp, &buf)?;
-            std::fs::rename(&seg_tmp, &fsync.seg_path)?;
+            std::fs::write(&seg_tmp, &buf).map_err(io_op("write", &seg_tmp))?;
+            std::fs::rename(&seg_tmp, &fsync.seg_path).map_err(io_op("rename", &seg_tmp))?;
             tx.blocking_send(fsync)
                 .map_err(|_| SinkError::Other("segment fsync queue closed".into()))?;
             Ok(buf)
         }));
         Ok(())
     }
+}
+
+/// Name failed operation and file, `io::Error` alone carries neither
+fn io_op(op: &'static str, path: &Path) -> impl FnOnce(std::io::Error) -> SinkError {
+    move |e| std::io::Error::new(e.kind(), format!("{op} {}: {e}", path.display())).into()
 }
 
 async fn join_write(write: JoinHandle<Result<Vec<u8>, SinkError>>) -> Result<Vec<u8>, SinkError> {
@@ -150,13 +157,15 @@ async fn write_sync_rename(tmp: &Path, final_path: &Path, bytes: &[u8]) -> Resul
         .create(true)
         .truncate(true)
         .open(tmp)
-        .await?;
-    file.write_all(bytes).await?;
-    file.flush().await?;
-    file.sync_all().await?;
+        .await
+        .map_err(io_op("create", tmp))?;
+    file.write_all(bytes).await.map_err(io_op("write", tmp))?;
+    file.flush().await.map_err(io_op("write", tmp))?;
+    file.sync_all().await.map_err(io_op("fsync", tmp))?;
     drop(file);
-    tokio::fs::rename(tmp, final_path).await?;
-    Ok(())
+    tokio::fs::rename(tmp, final_path)
+        .await
+        .map_err(io_op("rename", tmp))
 }
 
 #[cfg(test)]
@@ -191,6 +200,27 @@ mod tests {
         assert_eq!(rx.recv().await.unwrap().seg_path(), seg_path);
         assert_eq!(std::fs::read(&seg_path).unwrap(), bytes);
         assert!(!tmp.path().join(format!("{}.tmp", seg.format())).exists());
+    }
+
+    #[tokio::test]
+    async fn write_error_names_operation_and_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out_dir = tmp.path().join("out");
+        let (tx, _rx) = mpsc::channel(1);
+        let mut sink =
+            DirSegmentSink::with_durability(out_dir.clone(), WAL_SEG_SIZE, tx, TaskTracker::new())
+                .unwrap();
+        std::fs::remove_dir(&out_dir).unwrap();
+        let seg = SegmentName::parse("000000010000000000000003").unwrap();
+        sink.on_segment(seg, &[0xAA; 64]).await.unwrap();
+        let e = sink.close().await.unwrap_err();
+        let temp = out_dir.join(format!("{}.tmp", seg.format()));
+        let want = format!("write {}: ", temp.display());
+        assert!(e.to_string().contains(&want), "{e}");
+        assert!(
+            matches!(&e, SinkError::Io(io) if io.kind() == std::io::ErrorKind::NotFound),
+            "{e:?}"
+        );
     }
 
     #[tokio::test]

@@ -862,7 +862,11 @@ async fn process_restart_preserves_shadow_postmaster() {
         .unwrap()
         .to_string();
     let spill = tmp.path().join("spill");
+    let stale_temp = filtered.join("0000000100000000000000FF.tmp");
     for round in 0..3 {
+        if round == 2 {
+            fs::write(&stale_temp, b"crash residue").unwrap();
+        }
         let metrics_port = ports::reserve_port();
         let metrics_addr: SocketAddr = format!("127.0.0.1:{metrics_port}").parse().unwrap();
         let log = tmp.path().join(format!("daemon-{round}.log"));
@@ -946,6 +950,7 @@ async fn process_restart_preserves_shadow_postmaster() {
                     );
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
+                anyhow::ensure!(!stale_temp.exists(), "stale write temp survived startup");
             }
             let signal = if round == 1 { "-KILL" } else { "-TERM" };
             let status = Command::new("kill")
