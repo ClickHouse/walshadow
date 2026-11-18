@@ -437,6 +437,7 @@ pub(crate) async fn populate_pipeline_metrics(
         catalog_boundary_holds_total: boundary_hold.holds.load(Ordering::Relaxed),
         catalog_boundary_hold_failures_total: boundary_hold.failures.load(Ordering::Relaxed),
         catalog_boundary_hold_seconds_total: boundary_hold.hold_seconds_total(),
+        catalog_boundary_stalled_lsn: boundary_hold.stalled_lsn.load(Ordering::Relaxed),
         // `ctl status` reports one number for the daemon; the scrape
         // splits it by database
         config_backfills_pending: by_database

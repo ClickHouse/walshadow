@@ -203,10 +203,8 @@ pub(crate) struct Args {
     /// leaves an apply LSN that never advances.
     #[arg(long, default_value_t = 60)]
     pub(crate) walsender_connect_timeout: u64,
-    /// Seconds a catalog-boundary publication hold may wait for shadow to
-    /// replay through a catalog-mutating commit before failing the daemon.
-    /// Keep well under source's `wal_sender_timeout` (default 60s): the
-    /// pump answers no source keepalives while parked.
+    /// Seconds without shadow replay progress before reporting a stalled
+    /// catalog boundary. Replay continues waiting for the boundary.
     #[arg(long, default_value_t = 30)]
     pub(crate) catalog_hold_timeout: u64,
     /// Soft cap on in-flight records for the `QueueingRecordSink` feeding

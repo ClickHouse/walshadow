@@ -1583,7 +1583,7 @@ mod tests {
         let gate = CatalogBoundaryGate::new(
             state.clone(),
             BoundaryGateConfig {
-                hold_timeout: Duration::from_secs(10),
+                warn_after: Duration::from_secs(10),
                 poll_interval: Duration::from_millis(1),
             },
         );
