@@ -150,7 +150,8 @@ jobs:
             postgresql-${{ matrix.pg-major }} \
             postgresql-client-${{ matrix.pg-major }} \
             postgresql-server-dev-${{ matrix.pg-major }} \
-            postgresql-${{ matrix.pg-major }}-pgvector
+            postgresql-${{ matrix.pg-major }}-pgvector \
+            postgresql-${{ matrix.pg-major }}-postgis-3
           sudo systemctl stop postgresql 2>/dev/null || true
           PG_BIN=/usr/lib/postgresql/${{ matrix.pg-major }}/bin
           "$PG_BIN/postgres" -V

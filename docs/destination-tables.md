@@ -338,7 +338,7 @@ Common mappings include:
 | `json`, `jsonb` | `String` |
 | `hstore` | `Map(String, Nullable(String))` |
 | `vector`, `halfvec` (pgvector) | `Array(Float32)` |
-| `geography`, `geometry` (PostGIS) | `String`, WKT for 2-D points, PostgreSQL's own hex form otherwise |
+| `geography`, `geometry` (PostGIS) | 2-D `Point`, `LineString`, `Polygon`, `MultiLineString`, `MultiPolygon` subtypes map to the same CH type, SRID dropped; NULL is empty except for `Point`. Other subtypes, Z/M and unconstrained columns map to `String` holding `ST_AsText` WKT |
 | `<elem>[]` arrays | `Array(Nullable(<elem>))`; unknown elem → `Array(Nullable(String))`. One layer, so a multidimensional value needs an explicit nested override |
 | `inet`, `cidr`, `interval`, unknown types | `String` |
 

@@ -23,7 +23,7 @@ use tokio::sync::Mutex;
 use crate::toast::FetchedValue;
 
 /// Frame and op layouts. Must equal `WS_PROTO_VERSION` in `pgext/walshadow.h`
-pub const PROTO_VERSION: u32 = 7;
+pub const PROTO_VERSION: u32 = 8;
 /// Catalog column plans. Must equal `WS_PROJECTION_VERSION`
 pub const PROJECTION_VERSION: u32 = 2;
 

@@ -567,6 +567,92 @@ async fn oracle_encodes_tier3_disk_bytes() {
     assert_eq!(oracle.stats.errors.load(Ordering::Relaxed), 0);
 }
 
+/// PostGIS values walk WKB into CH geo columns: `POINT EMPTY` keeps its NaN
+/// axes, absent cells take the origin or an empty shape, and a subtype the
+/// column cannot hold fails the request
+#[tokio::test(flavor = "current_thread")]
+async fn oracle_maps_postgis_into_geo_types() {
+    if !tools::extension("postgis") {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let Some(guard) = start_pg(&tmp, ports::PG_SHADOW_PORT) else {
+        return;
+    };
+    guard.sh.psql_one("CREATE EXTENSION postgis").unwrap();
+    let geometry: u32 = guard
+        .sh
+        .psql_one("SELECT 'geometry'::regtype::oid")
+        .unwrap()
+        .parse()
+        .unwrap();
+    let oracle = oracle_on(&guard.sh).await;
+    let wkt = |s: &str| OracleCell::TextInput(s.as_bytes().to_vec());
+    let encode = async |ty, cells: Vec<OracleCell>| {
+        let n = cells.len();
+        let b = buf(geometry, cells);
+        let columns = [OracleRequestColumn {
+            ordinal: 0,
+            name: "geom",
+            target_type: ty,
+            buf: &b,
+        }];
+        oracle
+            .encode_batch(Oracle::ANY_DATABASE, &columns, n, alloc())
+            .await
+    };
+
+    let block = encode(
+        "Point",
+        vec![wkt("POINT EMPTY"), OracleCell::Default, wkt("POINT(1 2)")],
+    )
+    .await
+    .expect("points encode");
+    let axis = |i| {
+        let (_, bytes) = block
+            .column(0)
+            .and_then(|c| c.tuple_child(i))
+            .and_then(|c| c.fixed())
+            .expect("Float64 axis");
+        bytes
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|b| f64::from_le_bytes(*b))
+            .collect::<Vec<_>>()
+    };
+    let (x, y) = (axis(0), axis(1));
+    assert!(x[0].is_nan() && y[0].is_nan(), "{x:?} {y:?}");
+    assert_eq!((&x[1..], &y[1..]), (&[0.0, 1.0][..], &[0.0, 2.0][..]));
+
+    let block = encode(
+        "Polygon",
+        vec![OracleCell::Default, wkt("POLYGON((0 0,1 0,1 1,0 0))")],
+    )
+    .await
+    .expect("polygons encode");
+    let polygon = block.column(0).unwrap();
+    assert_eq!(polygon.array_offsets().unwrap(), [0, 1]);
+    assert_eq!(
+        polygon.array_values().unwrap().array_offsets().unwrap(),
+        [4]
+    );
+
+    let cases = [
+        ("Point", "POLYGON((0 0,1 0,1 1,0 0))", "WKB geometry type 3"),
+        ("Point", "POINT Z (1 2 3)", "WKB geometry type 1001"),
+        ("MultiPolygon", "MULTIPOINT(1 2)", "WKB geometry type 4"),
+    ];
+    for (ty, value, expected) in cases {
+        let err = encode(ty, vec![wkt(value)])
+            .await
+            .expect_err("subtype mismatch fails");
+        let msg = err.to_string();
+        assert!(msg.contains(expected), "{msg}");
+        assert!(!err.retryable());
+    }
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn oracle_defaults_fill_absent_cells() {
     let tmp = tempfile::tempdir().unwrap();
