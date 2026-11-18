@@ -25,7 +25,7 @@ use crate::toast::FetchedValue;
 /// Frame and op layouts. Must equal `WS_PROTO_VERSION` in `pgext/walshadow.h`
 pub const PROTO_VERSION: u32 = 7;
 /// Catalog column plans. Must equal `WS_PROJECTION_VERSION`
-pub const PROJECTION_VERSION: u32 = 2;
+pub const PROJECTION_VERSION: u32 = 3;
 
 /// Match `WS_MAX_REQUEST_BYTES`
 pub const MAX_REQUEST_BYTES: usize = 256 * 1024 * 1024;
@@ -112,7 +112,8 @@ impl Catalog {
             Catalog::Class => 10,
             Catalog::Attribute => 12,
             Catalog::Index => 5,
-            Catalog::Namespace | Catalog::Type | Catalog::Inherits => 2,
+            Catalog::Namespace | Catalog::Inherits => 2,
+            Catalog::Type => 6,
         }
     }
 }
@@ -1049,6 +1050,10 @@ impl ScanRow for NamespaceRow {
 pub struct TypeRow {
     pub oid: u32,
     pub typname: String,
+    pub typbasetype: u32,
+    pub typtypmod: i32,
+    pub typelem: u32,
+    pub typarray: u32,
 }
 
 impl ScanRow for TypeRow {
@@ -1058,6 +1063,10 @@ impl ScanRow for TypeRow {
         Ok(Self {
             oid: field(row, 0)?.parse().map_err(|_| bad(row, 0))?,
             typname: field(row, 1)?.to_owned(),
+            typbasetype: field(row, 2)?.parse().map_err(|_| bad(row, 2))?,
+            typtypmod: field(row, 3)?.parse().map_err(|_| bad(row, 3))?,
+            typelem: field(row, 4)?.parse().map_err(|_| bad(row, 4))?,
+            typarray: field(row, 5)?.parse().map_err(|_| bad(row, 5))?,
         })
     }
 }

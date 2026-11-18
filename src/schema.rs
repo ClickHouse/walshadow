@@ -199,6 +199,7 @@ pub fn replident_key_attnums(desc: &RelDescriptor) -> &[i16] {
 pub struct RelAttr {
     pub attnum: i16,
     pub name: String,
+    /// Domain base type and typmod, as PG `getBaseTypeAndTypmod`
     pub type_oid: Oid,
     pub typmod: i32,
     pub not_null: bool,
