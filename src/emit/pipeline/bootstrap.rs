@@ -4,6 +4,7 @@
 //! before resolving deferred values, which may read past `start_lsn`. Wait for
 //! synthetic sequences to become durable before advancing resume LSN to backup end
 
+use std::collections::hash_map::Entry;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -794,21 +795,26 @@ fn unreadable(fetched: &[Option<FetchedValue>]) -> bool {
 
 /// A batch's values, with how many referrers each one still owes
 struct FetchedValues {
-    /// `None` without store: nothing to consult, every referrer fills
-    values: Option<HashMap<ValueKey, FetchedValue>>,
-    uses: HashMap<ValueKey, u32>,
+    values: HashMap<ValueKey, FetchedEntry>,
+}
+
+#[derive(Default)]
+struct FetchedEntry {
+    remaining: u32,
+    value: Option<FetchedValue>,
 }
 
 impl FetchedValues {
     /// Last referrer of a value takes its bytes, earlier ones copy
     fn take(&mut self, key: ValueKey) -> Option<FetchedValue> {
-        let left = self.uses.get_mut(&key)?;
-        *left -= 1;
-        let values = self.values.as_mut()?;
-        if *left == 0 {
-            values.remove(&key)
+        let Entry::Occupied(mut entry) = self.values.entry(key) else {
+            return None;
+        };
+        entry.get_mut().remaining -= 1;
+        if entry.get().remaining == 0 {
+            entry.remove().value
         } else {
-            values.get(&key).cloned()
+            entry.get().value.clone()
         }
     }
 
@@ -834,14 +840,14 @@ async fn fetch_values_at<'a>(
     rows: impl Iterator<Item = (&'a ReplayRow, u64)>,
     resolver: &ToastResolver,
 ) -> Result<FetchedValues, String> {
-    let mut uses: HashMap<ValueKey, u32> = HashMap::new();
+    let mut values: HashMap<ValueKey, FetchedEntry> = HashMap::new();
     let mut wanted: HashMap<(u32, u32, u64), Vec<(u32, usize)>> = HashMap::new();
     for (row, bound) in rows {
         for site in &row.pointers {
             let key = value_key(row, site, bound);
-            let seen = uses.entry(key).or_default();
-            *seen += 1;
-            if *seen == 1 {
+            let entry = values.entry(key).or_default();
+            entry.remaining += 1;
+            if entry.remaining == 1 {
                 wanted
                     .entry((key.0, key.1, bound))
                     .or_default()
@@ -849,23 +855,24 @@ async fn fetch_values_at<'a>(
             }
         }
     }
-    let mut values = HashMap::with_capacity(uses.len());
     for ((db_oid, toast_relid, bound), batch) in wanted {
         let Some(got) = resolver
             .fetch_values(db_oid, toast_relid, &batch, bound)
             .await
             .map_err(|e| format!("bootstrap: toast store fetch: {e}"))?
         else {
-            return Ok(FetchedValues { values: None, uses });
+            return Ok(FetchedValues {
+                values: HashMap::new(),
+            });
         };
         for ((value_id, _), value) in batch.iter().zip(got) {
-            values.insert((db_oid, toast_relid, *value_id, bound), value);
+            values
+                .get_mut(&(db_oid, toast_relid, *value_id, bound))
+                .expect("counted in fetch_values_at")
+                .value = Some(value);
         }
     }
-    Ok(FetchedValues {
-        values: Some(values),
-        uses,
-    })
+    Ok(FetchedValues { values })
 }
 
 /// Turn one fetch outcome into the column its row routes, counting fills.

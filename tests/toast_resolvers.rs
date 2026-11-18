@@ -442,10 +442,9 @@ async fn ch_chunk_store_fetch_many_aligns_and_splits() {
         None,
     ));
 
-    // 200 single-chunk values: past one query's id width, so a fetch has to
-    // split across the pool and merge its splits back
+    // Exceed 1024 ids per query to exercise concurrent splits
     let body = |id: u32| format!("v{id}").into_bytes();
-    let rows: Vec<ToastRow> = (1..=200)
+    let rows: Vec<ToastRow> = (1..=2050)
         .map(|id| {
             row(
                 16900,
@@ -464,7 +463,7 @@ async fn ch_chunk_store_fetch_many_aligns_and_splits() {
         .expect("stop merges");
     store.put(&[tomb(16900, (0, 6), 0x2000)]).await.unwrap();
     store
-        .put(&[row(16900, 301, 0, (0, 6), 0x3000, b"reborn")])
+        .put(&[row(16900, 3001, 0, (0, 6), 0x3000, b"reborn")])
         .await
         .unwrap();
 
@@ -474,8 +473,8 @@ async fn ch_chunk_store_fetch_many_aligns_and_splits() {
         (200, 4),
         (1, 2),
         (5, 2),
-        (301, 6),
-        (999, 3),
+        (3001, 6),
+        (9999, 3),
         (42, 3),
         (7, 9),
     ];
@@ -498,7 +497,7 @@ async fn ch_chunk_store_fetch_many_aligns_and_splits() {
     // not yet born
     assert_eq!(
         store
-            .fetch_many(SRC_DB, 16900, &[(5, 2), (301, 6)], 0x1fff)
+            .fetch_many(SRC_DB, 16900, &[(5, 2), (3001, 6)], 0x1fff)
             .await
             .unwrap(),
         vec![assembled(b"v5"), FetchedValue::Missing],
@@ -512,7 +511,7 @@ async fn ch_chunk_store_fetch_many_aligns_and_splits() {
         })
     ));
 
-    let all: Vec<(u32, usize)> = (1..=200).map(|id| (id, body(id).len())).collect();
+    let all: Vec<(u32, usize)> = (1..=2050).rev().map(|id| (id, body(id).len())).collect();
     let got = store
         .fetch_many(SRC_DB, 16900, &all, u64::MAX)
         .await
