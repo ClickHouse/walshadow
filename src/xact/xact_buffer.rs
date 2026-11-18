@@ -158,12 +158,6 @@ fn entry_lsn(e: &SpillEntry) -> u64 {
 /// past it spool to disk (`toastbody-*`), refs stay resident
 pub const TOAST_BODY_SPOOL_MEM_MAX: usize = 16 << 20;
 
-/// Cap on resident chunk-index + mirror-row-ref metadata per commit
-/// drain; breach fails the drain with a typed non-retryable error before
-/// further allocation. ~`CHUNK_REF_META`/chunk ⇒ default admits ~500k
-/// chunks ≈ 1 GB TOAST payload per xact
-pub const TOAST_INDEX_MEM_MAX: usize = 64 << 20;
-
 /// Resident approximation per indexed chunk: one `ValueRef`/tail entry or
 /// one row ref, container overhead included
 const CHUNK_REF_META: usize = 64;
@@ -176,8 +170,6 @@ pub struct XactBufferConfig {
     pub scratch_dir: PathBuf,
     /// Per-drain memory-held chunk body budget before body spooling
     pub toast_body_mem_max: usize,
-    /// Per-drain chunk/row-ref metadata cap
-    pub toast_index_mem_max: usize,
     /// Caller's commit-drain slice budget. A lone in-memory xact within it
     /// skips the merge, larger ones slice through it
     pub drain_batch_rows: usize,
@@ -190,7 +182,6 @@ impl XactBufferConfig {
             xact_buffer_max: DEFAULT_XACT_BUFFER_MAX,
             scratch_dir,
             toast_body_mem_max: TOAST_BODY_SPOOL_MEM_MAX,
-            toast_index_mem_max: TOAST_INDEX_MEM_MAX,
             drain_batch_rows: crate::emit::ch_emitter::DEFAULT_DRAIN_BATCH_ROWS,
             drain_batch_bytes: crate::emit::ch_emitter::DEFAULT_DRAIN_BATCH_BYTES,
         }
@@ -219,10 +210,6 @@ pub enum XactBufferError {
     },
     #[error("toast decompression: {0}")]
     Detoast(String),
-    /// Non-retryable: replay hits the same cardinality. Raise
-    /// `toast_index_mem_max` or reduce per-xact TOAST chunk count
-    #[error("toast index metadata {bytes} bytes exceeds cap {max}")]
-    ToastIndexOverflow { bytes: usize, max: usize },
     /// Value exceeded `inline_value_max` under error policy. Replay fails again,
     /// so raise limit or remove error policy
     #[error("toast value of {rawsize} bytes exceeds inline_value_max {max}")]
@@ -1292,8 +1279,6 @@ impl XactBuffer {
             spool_gauge: self.toast_spool_bytes.clone(),
             mem_body_bytes: 0,
             body_mem_max: self.config.toast_body_mem_max,
-            index_meta_bytes: 0,
-            index_mem_max: self.config.toast_index_mem_max,
         })
     }
 
@@ -1735,9 +1720,6 @@ struct MergedDrain {
     /// Cumulative memory-held body bytes, monotone (spooling never reverts)
     mem_body_bytes: usize,
     body_mem_max: usize,
-    /// Cumulative ref metadata, checked against `index_mem_max`
-    index_meta_bytes: usize,
-    index_mem_max: usize,
 }
 
 impl MergedDrain {
@@ -1787,7 +1769,7 @@ impl MergedDrain {
                             return Ok(Some(MergeItem::Heap(h)));
                         }
                         SpillEntry::Chunk(c) => self.fold_chunk(*c)?,
-                        SpillEntry::ToastDelete(d) => self.fold_delete(*d)?,
+                        SpillEntry::ToastDelete(d) => self.fold_delete(*d),
                         SpillEntry::Raw(raw) => self.fold_raw(&raw)?,
                     }
                 }
@@ -1803,19 +1785,6 @@ impl MergedDrain {
             xid,
             top: self.spool_xid,
         })
-    }
-
-    /// Cap resident ref metadata before allocating more; typed
-    /// non-retryable error fails the drain loud, replay-safe
-    fn reserve_meta(&mut self, n: usize) -> std::result::Result<(), XactBufferError> {
-        if self.index_meta_bytes + n > self.index_mem_max {
-            return Err(XactBufferError::ToastIndexOverflow {
-                bytes: self.index_meta_bytes + n,
-                max: self.index_mem_max,
-            });
-        }
-        self.index_meta_bytes += n;
-        Ok(())
     }
 
     /// Body kept memory-resident below `body_mem_max` cumulative bytes,
@@ -1842,7 +1811,6 @@ impl MergedDrain {
     fn fold_chunk(&mut self, c: ToastChunk) -> std::result::Result<(), XactBufferError> {
         // InvalidOffsetNumber cannot key mirror rows
         let collect_row = self.collect_rows && c.offnum != 0;
-        self.reserve_meta(CHUNK_REF_META * (1 + usize::from(collect_row)))?;
         let body = self.fold_body(&c.chunk_data)?;
         // File bodies live on disk, outside resident shares (M7)
         let mem_len = match &body {
@@ -1869,15 +1837,13 @@ impl MergedDrain {
         Ok(())
     }
 
-    fn fold_delete(&mut self, d: ToastDelete) -> std::result::Result<(), XactBufferError> {
+    fn fold_delete(&mut self, d: ToastDelete) {
         if !self.collect_rows {
-            return Ok(());
+            return;
         }
-        self.reserve_meta(CHUNK_REF_META)?;
         self.row_bytes += CHUNK_REF_META;
         self.row_gauge.add(CHUNK_REF_META);
         self.rows.push(ToastRowRef::tombstone(&d));
-        Ok(())
     }
 
     /// Decode a stashed record against its commit-time verdict: toast heaps
@@ -1936,7 +1902,7 @@ impl MergedDrain {
         for op in ops {
             match op {
                 StashedToastOp::Chunk(c) => self.fold_chunk(c)?,
-                StashedToastOp::Delete(d) => self.fold_delete(d)?,
+                StashedToastOp::Delete(d) => self.fold_delete(d),
             }
         }
         Ok(())
@@ -6780,32 +6746,6 @@ mod tests {
         assert_eq!(b.drain_row_resident_bytes(), 0);
         assert_eq!(b.drain_resident_bytes(), 0);
         assert_eq!(b.toast_spool_bytes(), 0, "gauge drops with the last reader");
-    }
-
-    /// Metadata cap: typed non-retryable error before further allocation
-    #[tokio::test(flavor = "current_thread")]
-    async fn drain_fails_loud_past_index_meta_cap() {
-        let tmp = tempdir().unwrap();
-        let mut c = cfg(tmp.path().to_path_buf());
-        // Chunk + row ref cost 2×CHUNK_REF_META per fold; second fold trips
-        c.toast_index_mem_max = 3 * CHUNK_REF_META;
-        let mut b = XactBuffer::new(c).unwrap();
-        b.on_toast_chunk(chunk(50, 0, 100, b"aa"), 9).await.unwrap();
-        b.on_toast_chunk(chunk(51, 0, 102, b"bb"), 9).await.unwrap();
-        b.on_heap(heap_with_value(9, 110, 16)).await.unwrap();
-        let mut drain = b
-            .drain_committed(StashResolved::nothing_stashed(9), 0, 0x1000, &[], true)
-            .await
-            .unwrap();
-        let err = drain
-            .next_batch(usize::MAX, usize::MAX, None)
-            .await
-            .err()
-            .expect("cap breach surfaces");
-        assert!(matches!(
-            err,
-            XactBufferError::ToastIndexOverflow { max, .. } if max == 3 * CHUNK_REF_META
-        ));
     }
 
     #[tokio::test(flavor = "current_thread")]

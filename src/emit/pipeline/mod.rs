@@ -322,17 +322,16 @@ pub fn build_budget(
         decoders,
     )?;
     // Progress invariant: a drain admits slices while holding its sealed
-    // generations (bounded by the body-spool + index caps), so the
-    // compartment must fit both plus slice headroom or a mid-drain admit
-    // could wait on units the drain itself holds
+    // generations (bounded by the body-spool cap), so the compartment must
+    // fit it plus slice headroom or a mid-drain admit could wait on units
+    // the drain itself holds
     let admission_max = emitter.resident_payload_max - reserve;
-    let drain_floor = crate::xact::xact_buffer::TOAST_BODY_SPOOL_MEM_MAX
-        + crate::xact::xact_buffer::TOAST_INDEX_MEM_MAX
-        + 2 * emitter.drain_batch_bytes;
+    let drain_floor =
+        crate::xact::xact_buffer::TOAST_BODY_SPOOL_MEM_MAX + 2 * emitter.drain_batch_bytes;
     if admission_max < drain_floor {
         return Err(format!(
             "admission compartment {admission_max} below drain floor {drain_floor} \
-             (body spool cap + index cap + 2x drain_batch_bytes); raise \
+             (body spool cap + 2x drain_batch_bytes); raise \
              resident_payload_max or lower drain_batch_bytes",
         ));
     }
