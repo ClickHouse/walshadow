@@ -34,7 +34,7 @@ use walshadow::queueing_record_sink::{
     DEFAULT_QUEUEING_BATCH_SIZE, DEFAULT_QUEUEING_RECORD_SINK_CAPACITY, QueueingRecordSink,
 };
 use walshadow::record::{MetricsRecordSink, WAL_SEG_SIZE};
-use walshadow::retention::{DEFAULT_TRIM_INTERVAL, max_segment_end};
+use walshadow::retention::{DEFAULT_TRIM_INTERVAL, max_segment_end, remove_stale_temps};
 use walshadow::segment_sink::{DirSegmentSink, SegFsync};
 use walshadow::source_db::{DbLink, DbLinkConfig, SourceDb, SourceDbs};
 use walshadow::source_feed::{SourceEvent, SourceFeed, StandbyStatus};
@@ -1400,6 +1400,13 @@ async fn session_body(
     )));
     let fsync_fatal = walshadow::pipeline::Fatal::new();
     let (fsync_tx, fsync_rx) = tokio::sync::mpsc::channel::<SegFsync>(SEGMENT_FSYNC_QUEUE);
+    // Prior session's writes joined in `run_session`, so no temp is live
+    let stale_temps = remove_stale_temps(&args.out_dir)
+        .await
+        .context("remove stale out-dir write temps")?;
+    if stale_temps > 0 {
+        tracing::info!(target: "walshadow::retention", count = stale_temps, "removed stale write temps");
+    }
     let mut segment_sink =
         DirSegmentSink::with_durability(args.out_dir.clone(), WAL_SEG_SIZE, fsync_tx, io.clone())
             .context("open out-dir")?;

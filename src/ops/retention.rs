@@ -9,10 +9,11 @@
 //! Trim in LSN bytes not wall-clock: retention is "how far behind can
 //! shadow be" which is exactly LSN, keeping the trimmer clock-free.
 //!
-//! `.tmp` write temps (crash residue), plus `.partial` files and
-//! `*.manifest.json` sidecars older releases wrote, are removed with their
-//! segment. Unknown files left alone, so a sibling system sharing the dir
-//! doesn't lose unrelated files.
+//! `.partial` files and `*.manifest.json` sidecars older releases wrote are
+//! removed with their segment. `.tmp` write temps are never trimmed live,
+//! `DirSegmentSink` may still be writing one; [`remove_stale_temps`] clears
+//! crash residue at startup before writes begin. Unknown files left alone,
+//! so a sibling system sharing the dir doesn't lose unrelated files.
 
 use std::io;
 use std::path::Path;
@@ -69,6 +70,12 @@ pub async fn trim_below_lsn(
         let Some(seg) = seg_str.and_then(|s| SegmentName::parse(s).ok()) else {
             continue;
         };
+        let removed = match kind {
+            FileKind::Segment => &mut report.segments_removed,
+            FileKind::Manifest => &mut report.manifests_removed,
+            FileKind::Partial => &mut report.partials_removed,
+            FileKind::Temp => continue,
+        };
         let end_lsn = seg.start_lsn(WAL_SEG_SIZE).saturating_add(WAL_SEG_SIZE);
         if end_lsn > cutoff_lsn.get() {
             continue;
@@ -76,11 +83,7 @@ pub async fn trim_below_lsn(
         let size = entry.metadata().await.map(|m| m.len()).unwrap_or(0);
         tokio::fs::remove_file(&path).await?;
         report.bytes_freed = report.bytes_freed.saturating_add(size);
-        match kind {
-            FileKind::Segment => report.segments_removed += 1,
-            FileKind::Manifest => report.manifests_removed += 1,
-            FileKind::Partial => report.partials_removed += 1,
-        }
+        *removed += 1;
         tracing::debug!(
             target: "walshadow::retention",
             file = %name,
@@ -90,6 +93,25 @@ pub async fn trim_below_lsn(
         );
     }
     Ok(report)
+}
+
+/// Remove every segment write temp in `dir`, returning count removed.
+/// Call only while no `DirSegmentSink` writes into `dir`
+pub async fn remove_stale_temps(dir: &Path) -> Result<u64, RetentionError> {
+    let mut removed = 0;
+    if !dir.exists() {
+        return Ok(removed);
+    }
+    let mut rd = tokio::fs::read_dir(dir).await?;
+    while let Some(entry) = rd.next_entry().await? {
+        if let Some(name) = entry.file_name().to_str()
+            && let (Some(_), FileKind::Temp) = classify(name)
+        {
+            tokio::fs::remove_file(entry.path()).await?;
+            removed += 1;
+        }
+    }
+    Ok(removed)
 }
 
 /// Return highest end LSN among sealed segments in `dir`
@@ -122,8 +144,10 @@ pub async fn max_segment_end(dir: &Path) -> Result<Option<Pos<FilterDurable>>, R
 enum FileKind {
     Segment,
     Manifest,
-    /// Crash-interrupted write temp or older release's shutdown partial
+    /// Older release's shutdown partial
     Partial,
+    /// Segment write in progress, or crash residue
+    Temp,
 }
 
 /// Pluck the 24-hex segment prefix, tag the suffix kind. `(None, _)` for
@@ -144,13 +168,17 @@ fn classify(name: &str) -> (Option<&str>, FileKind) {
     {
         return (Some(stem), FileKind::Manifest);
     }
-    if let Some(stem) = name
-        .strip_suffix(".partial")
-        .or_else(|| name.strip_suffix(".tmp"))
+    if let Some(stem) = name.strip_suffix(".partial")
         && stem.len() == SEGMENT_NAME_LEN
         && all_hex(stem)
     {
         return (Some(stem), FileKind::Partial);
+    }
+    if let Some(stem) = name.strip_suffix(".tmp")
+        && stem.len() == SEGMENT_NAME_LEN
+        && all_hex(stem)
+    {
+        return (Some(stem), FileKind::Temp);
     }
     (None, FileKind::Segment)
 }
@@ -210,7 +238,6 @@ mod tests {
         touch(dir, &format!("{seg}.manifest.json"), b"{}");
         touch(dir, &format!("{seg}.partial"), b"partial-body");
         touch(dir, &format!("{seg}.partial.manifest.json"), b"{}");
-        touch(dir, &format!("{seg}.tmp"), b"tmp-body");
         let cutoff = SegmentName {
             timeline: 1,
             log_id: 0,
@@ -222,8 +249,54 @@ mod tests {
         let report = trim_below_lsn(dir, Pos::new(cutoff)).await.unwrap();
         assert_eq!(report.segments_removed, 1, "{report:?}");
         assert_eq!(report.manifests_removed, 2, "{report:?}");
-        assert_eq!(report.partials_removed, 2, "{report:?}");
+        assert_eq!(report.partials_removed, 1, "{report:?}");
         assert!(dir.read_dir().unwrap().next().is_none(), "dir not empty");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sweep_spares_writer_temp_below_cutoff() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let sealed = seg_name(1, 0, 1);
+        let writing = seg_name(1, 0, 2);
+        let temp = dir.join(format!("{writing}.tmp"));
+        touch(dir, &sealed, b"sealed");
+        touch(dir, &format!("{writing}.tmp"), b"writing");
+        let cutoff = Pos::new(u64::MAX);
+        let report = trim_below_lsn(dir, cutoff).await.unwrap();
+        assert_eq!(report.segments_removed, 1, "{report:?}");
+        assert_eq!(report.partials_removed, 0, "{report:?}");
+        assert!(!dir.join(&sealed).exists());
+        std::fs::rename(&temp, dir.join(&writing)).unwrap();
+        assert_eq!(std::fs::read(dir.join(&writing)).unwrap(), b"writing");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn startup_removes_only_segment_temps() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let seg = seg_name(1, 0, 3);
+        touch(dir, &seg, b"seg");
+        touch(dir, &format!("{seg}.tmp"), b"t");
+        touch(dir, &format!("{}.tmp", seg_name(1, 0, 9)), b"t");
+        touch(dir, &format!("{seg}.partial"), b"p");
+        touch(dir, "config.toml.tmp", b"keep");
+        assert_eq!(remove_stale_temps(dir).await.unwrap(), 2);
+        let mut left: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            [
+                seg.clone(),
+                format!("{seg}.partial"),
+                "config.toml.tmp".into()
+            ]
+        );
+        let missing = Path::new("/this/path/does/not/exist/walshadow-retention-test");
+        assert_eq!(remove_stale_temps(missing).await.unwrap(), 0);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -257,6 +330,7 @@ mod tests {
         std::fs::write(dir.join(raw), b"x").unwrap();
         let report = trim_below_lsn(dir, Pos::new(u64::MAX)).await.unwrap();
         assert_eq!(report.segments_removed, 0);
+        assert_eq!(remove_stale_temps(dir).await.unwrap(), 0);
         assert!(dir.join(raw).exists());
     }
 
@@ -302,10 +376,14 @@ mod tests {
         assert_eq!(stem, Some(s.as_str()));
         assert!(matches!(kind, FileKind::Manifest));
 
-        for p in [format!("{s}.partial"), format!("{s}.tmp")] {
-            let (stem, kind) = classify(&p);
-            assert_eq!(stem, Some(s.as_str()));
-            assert!(matches!(kind, FileKind::Partial));
-        }
+        let p = format!("{s}.partial");
+        let (stem, kind) = classify(&p);
+        assert_eq!(stem, Some(s.as_str()));
+        assert!(matches!(kind, FileKind::Partial));
+
+        let t = format!("{s}.tmp");
+        let (stem, kind) = classify(&t);
+        assert_eq!(stem, Some(s.as_str()));
+        assert!(matches!(kind, FileKind::Temp));
     }
 }
