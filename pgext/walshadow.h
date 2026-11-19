@@ -8,7 +8,7 @@
 
 /* Bumped when a request or response layout changes, or when an op's reading
  * of an unchanged layout changes */
-#define WS_PROTO_VERSION 7
+#define WS_PROTO_VERSION 8
 /* Bumped when any catalog projection changes shape */
 #define WS_PROJECTION_VERSION 2
 
@@ -38,6 +38,7 @@
 #define WS_CELL_DISK_RAW 0x01
 #define WS_CELL_TEXT 0x02
 #define WS_CELL_LITERAL 0x03
+#define WS_CELL_BINARY 0x04
 
 /* Match daemon MAX_REQUEST_BYTES, exceed maximum inline TOAST value */
 #define WS_MAX_REQUEST_BYTES (256 * 1024 * 1024)

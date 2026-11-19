@@ -14,6 +14,7 @@ const CELL_DEFAULT: u8 = 0x00;
 const CELL_DISK_RAW: u8 = 0x01;
 const CELL_TEXT: u8 = 0x02;
 const CELL_LITERAL: u8 = 0x03;
+const CELL_BINARY: u8 = 0x04;
 
 crate::atomic_stats! {
     pub struct OracleStats {
@@ -53,6 +54,8 @@ pub enum OracleCell {
     TextInput(Vec<u8>),
     /// Pre-rendered text bypassing source type
     Literal(Vec<u8>),
+    /// `typsend` bytes for `typreceive`
+    BinaryInput(Vec<u8>),
 }
 
 impl OracleCell {
@@ -73,6 +76,7 @@ impl OracleCell {
             Self::DiskRaw(b) => (CELL_DISK_RAW, b),
             Self::TextInput(b) => (CELL_TEXT, b),
             Self::Literal(b) => (CELL_LITERAL, b),
+            Self::BinaryInput(b) => (CELL_BINARY, b),
         }
     }
 }
@@ -143,9 +147,10 @@ impl OracleColumnBuf {
     pub fn push(&mut self, cell: OracleCell) {
         self.payload_capacity += match &cell {
             OracleCell::Default => 0,
-            OracleCell::DiskRaw(v) | OracleCell::TextInput(v) | OracleCell::Literal(v) => {
-                v.capacity()
-            }
+            OracleCell::DiskRaw(v)
+            | OracleCell::TextInput(v)
+            | OracleCell::Literal(v)
+            | OracleCell::BinaryInput(v) => v.capacity(),
         };
         let bytes = cell.wire_bytes();
         self.wire_bytes += bytes;
@@ -255,6 +260,7 @@ impl OracleColumnBuf {
                 CELL_DISK_RAW => OracleCell::DiskRaw(c.bytes()?),
                 CELL_TEXT => OracleCell::TextInput(c.bytes()?),
                 CELL_LITERAL => OracleCell::Literal(c.bytes()?),
+                CELL_BINARY => OracleCell::BinaryInput(c.bytes()?),
                 tag => {
                     return Err(crate::xact::spill::SpillError::Format {
                         offset: 0,
@@ -646,7 +652,14 @@ mod tests {
         );
         b.push(OracleCell::Literal(b"x".to_vec()));
         b.push(OracleCell::TextInput(b"{}".to_vec()));
-        let cols = [col(0, "t", "Array(Int32)", &a), col(3, "j", "JSON", &b)];
+        let mut e = OracleColumnBuf::string(16_400, -1);
+        e.push(OracleCell::BinaryInput(b"ok".to_vec()));
+        e.push(OracleCell::Default);
+        let cols = [
+            col(0, "t", "Array(Int32)", &a),
+            col(3, "j", "JSON", &b),
+            col(4, "e", "String", &e),
+        ];
 
         let out = encode_request(&cols, 2);
         let mut c = FRAME_PREFIX_BYTES;
@@ -656,13 +669,15 @@ mod tests {
             v
         };
         assert_eq!(u32_at(&mut c), 2, "n_rows");
-        assert_eq!(u32_at(&mut c), 2, "n_columns");
+        assert_eq!(u32_at(&mut c), 3, "n_columns");
         // First column's metadata, then the second's, before any cell
         assert_eq!(u32_at(&mut c), 1007, "source oid");
         assert_eq!(u32_at(&mut c) as i32, -1, "typmod");
         c += 4 + 1 + 4 + "Array(Int32)".len();
         assert_eq!(u32_at(&mut c), 3802, "second source oid");
         c += 4 + 4 + 1 + 4 + "JSON".len();
+        assert_eq!(u32_at(&mut c), 16_400, "third source oid");
+        c += 4 + 4 + 1 + 4 + "String".len();
         assert_eq!(
             &out[c..],
             &[
@@ -679,6 +694,13 @@ mod tests {
                 0,
                 1,
                 b'x',
+                CELL_BINARY,
+                0,
+                0,
+                0,
+                2,
+                b'o',
+                b'k',
                 CELL_DEFAULT,
                 CELL_TEXT,
                 0,
@@ -687,6 +709,7 @@ mod tests {
                 2,
                 b'{',
                 b'}',
+                CELL_DEFAULT,
             ]
         );
     }
@@ -700,6 +723,8 @@ mod tests {
             OracleCell::DiskRaw(vec![1, 2]),
             OracleCell::TextInput(b"{}".to_vec()),
             OracleCell::Literal(b"x".to_vec()),
+            OracleCell::BinaryInput(vec![0, 0, 0, 1]),
+            OracleCell::BinaryInput(Vec::new()),
         ] {
             buf.push(cell);
         }

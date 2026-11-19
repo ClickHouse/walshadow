@@ -39,6 +39,9 @@ typedef struct WsNativeCol {
     FmgrInfo infn;
     Oid ioparam;
     bool infn_ready;
+    FmgrInfo recvfn;
+    Oid recv_ioparam;
+    bool recvfn_ready;
 
     FmgrInfo expander;
 
@@ -166,6 +169,43 @@ ws_input_datum(WsNativeCol* col, const char* body, uint32 len) {
     return val;
 }
 
+/* COPY fields carry typsend bytes, typreceive must consume all of them */
+static Datum
+ws_receive_datum(WsNativeCol* col, const char* body, uint32 len) {
+    StringInfoData buf;
+    Datum val;
+
+    if (!col->recvfn_ready) {
+        Oid recvfunc;
+
+        getTypeBinaryInputInfo(col->source_oid, &recvfunc, &col->recv_ioparam);
+        fmgr_info_cxt(recvfunc, &col->recvfn, CurrentMemoryContext);
+        col->recvfn_ready = true;
+    }
+    /* Receive functions expect a writable, NUL-terminated buffer */
+    buf.data = (char*)palloc(len + 1);
+    memcpy(buf.data, body, len);
+    buf.data[len] = '\0';
+    buf.len       = (int)len;
+    buf.maxlen    = (int)len + 1;
+    buf.cursor    = 0;
+    val =
+        ReceiveFunctionCall(&col->recvfn, &buf, col->recv_ioparam, col->source_typmod);
+    if (buf.cursor != buf.len) {
+        ereport(
+            ERROR,
+            (errcode(ERRCODE_INVALID_BINARY_REPRESENTATION),
+             errmsg(
+                 "incorrect binary data format for type %u: %d of %u bytes consumed",
+                 col->source_oid,
+                 buf.cursor,
+                 len
+             ))
+        );
+    }
+    return val;
+}
+
 /* Require one expander owned by source type's extension */
 static bool
 ws_find_hstore_expander(Oid source_oid, Oid* out) {
@@ -274,7 +314,8 @@ ws_append_cell(pgch_writer* w, size_t col, WsNativeCol* c, StringInfo req) {
         ws_append_default(w, col, c);
         return;
     }
-    if (tag != WS_CELL_DISK_RAW && tag != WS_CELL_TEXT && tag != WS_CELL_LITERAL) {
+    if (tag != WS_CELL_DISK_RAW && tag != WS_CELL_TEXT && tag != WS_CELL_LITERAL &&
+        tag != WS_CELL_BINARY) {
         ereport(
             ERROR,
             (errcode(ERRCODE_PROTOCOL_VIOLATION),
@@ -306,8 +347,17 @@ ws_append_cell(pgch_writer* w, size_t col, WsNativeCol* c, StringInfo req) {
         );
         return;
     }
-    val = tag == WS_CELL_DISK_RAW ? ws_reconstruct_datum(c, body, len)
-                                  : ws_input_datum(c, body, len);
+    switch (tag) {
+    case WS_CELL_DISK_RAW:
+        val = ws_reconstruct_datum(c, body, len);
+        break;
+    case WS_CELL_BINARY:
+        val = ws_receive_datum(c, body, len);
+        break;
+    default:
+        val = ws_input_datum(c, body, len);
+        break;
+    }
     val = ws_expand(c, val, &valtype);
     pgch_append_datum(w, col, val, valtype, false);
 }
