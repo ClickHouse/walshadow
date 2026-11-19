@@ -87,7 +87,6 @@ impl Fixture {
             inserter_pool_size: 4,
             byte_budget: 1 << 20,
             row_budget: 1,
-            insert_timeout: Duration::from_secs(2),
             ..Default::default()
         };
         let mapping = mapping_handle(

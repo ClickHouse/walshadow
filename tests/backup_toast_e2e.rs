@@ -221,7 +221,6 @@ async fn object_store_pass_resolves_deferred_toast_referrers() {
         inserter_pool_size: 4,
         byte_budget: 1 << 20,
         row_budget: 1,
-        insert_timeout: Duration::from_secs(2),
         backup: Some(settings),
         ..Default::default()
     };
@@ -445,7 +444,6 @@ async fn object_store_pass_resumes_from_its_checkpoint() {
             ..Default::default()
         },
         inserter_pool_size: 4,
-        insert_timeout: Duration::from_secs(2),
         backup: Some(settings.clone()),
         bootstrap: walshadow::ch_emitter::BootstrapSettings {
             object_store_parallelism: std::num::NonZeroUsize::new(1),

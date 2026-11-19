@@ -1537,10 +1537,9 @@ impl CopyBackfiller {
         if swapped.is_empty() {
             return;
         }
-        // In-flight live INSERTs that resolved the pre-swap storage finish
-        // within one attempt cap (later attempts re-resolve the name to the
-        // swapped-in table); copy-back may start only once they've landed
-        tokio::time::sleep(self.dest.current().insert_timeout).await;
+        // Copy-back may start only once live INSERTs that resolved the
+        // pre-swap storage have landed; later attempts resolve the swapped-in table
+        crate::ch::INSERT_GATE.settle().await;
         for rel in swapped {
             if let Err(e) = self.finish_swapped(&mut sess, rel).await {
                 tracing::error!(
@@ -1702,7 +1701,7 @@ impl CopyBackfiller {
             Some(_) => {}
         }
         self.activate_pending(name).await;
-        tokio::time::sleep(self.dest.current().insert_timeout).await;
+        crate::ch::INSERT_GATE.settle().await;
         sess.copy_back(&rel).await?;
         sess.drop_staging(&rel).await?;
         self.mark_done_entry(name).await;

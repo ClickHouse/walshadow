@@ -16,9 +16,7 @@ use tokio_util::task::AbortOnDropHandle;
 
 use bytes::Bytes;
 
-use crate::ch::{
-    ChConn, EmitterError, drain_to_end_of_stream, is_retryable, quote_ident, with_timeout,
-};
+use crate::ch::{ChConn, EmitterError, drain_to_end_of_stream, is_retryable, quote_ident};
 use crate::decode::heap_decoder::{
     ColumnValue, ToastPointer, VARLENA_EXTSIZE_BITS, VARLENA_EXTSIZE_MASK, decompress_varlena,
 };
@@ -639,7 +637,6 @@ pub async fn adopt_legacy_mirrors(
         &mut client,
         "SELECT name FROM system.tables \
          WHERE database = currentDatabase() AND match(name, '^pg_toast_[1-9][0-9]*$')",
-        cfg.insert_timeout,
     )
     .await?
     .iter()
@@ -675,7 +672,6 @@ pub async fn adopt_legacy_mirrors(
                 quote_ident(&format!("pg_toast_{relid}")),
                 quote_ident(&mirror_table_name(owner, relid))
             ),
-            cfg.insert_timeout,
         )
         .await?;
     }
@@ -831,13 +827,12 @@ impl ClickHouseChunkStore {
         sql: &str,
         bb: Option<&BlockBuilder<'_>>,
     ) -> Result<(), EmitterError> {
-        let insert_timeout = self.dest.current().insert_timeout;
         state
             .client
             .retry_when(
                 |e| is_retryable(e) && !is_missing_mirror(e),
                 |mut client| async move {
-                    let result = with_timeout(insert_timeout, async {
+                    let result = async {
                         client.send_query(sql, &QueryOpts::new()).await?;
                         if let Some(bb) = bb {
                             client.send_data(bb).await?;
@@ -845,7 +840,7 @@ impl ClickHouseChunkStore {
                         }
                         drain_to_end_of_stream(&mut client).await?;
                         Ok(())
-                    })
+                    }
                     .await;
                     (client, result)
                 },
@@ -924,13 +919,12 @@ impl ClickHouseChunkStore {
         sql: &str,
         parse: impl Fn(&Block, &mut A) -> Result<(), EmitterError>,
     ) -> Result<A, EmitterError> {
-        let insert_timeout = self.dest.current().insert_timeout;
         state
             .client
             .retry_when(
                 |e| is_retryable(e) && !is_missing_mirror(e),
                 |mut client| async {
-                    let result = with_timeout(insert_timeout, async {
+                    let result = async {
                         client.send_query(sql, &QueryOpts::new()).await?;
                         let mut out = A::default();
                         loop {
@@ -955,7 +949,7 @@ impl ClickHouseChunkStore {
                             }
                         }
                         Ok(out)
-                    })
+                    }
                     .await;
                     (client, result)
                 },

@@ -165,19 +165,17 @@ impl StagingSession {
     }
 
     async fn attempt_write(&mut self, sql: &str) -> Result<(), EmitterError> {
-        let timeout = self.client.config().insert_timeout;
         let client = self.client.ready().await?;
-        exec_drain(client, sql, timeout).await
+        exec_drain(client, sql).await
     }
 
     /// Statement safe to re-apply (DROP/CREATE IF NOT EXISTS, dedup-absorbed
     /// INSERT..SELECT): reconnect + resend on retryable failure.
     pub(crate) async fn exec_retry(&mut self, sql: &str) -> Result<()> {
-        let timeout = self.client.config().insert_timeout;
         self.client
             .retry(
                 |mut client| async move {
-                    let result = exec_drain(&mut client, sql, timeout).await;
+                    let result = exec_drain(&mut client, sql).await;
                     (client, result)
                 },
                 |e, attempt| {
@@ -192,7 +190,7 @@ impl StagingSession {
             .map_err(|e| anyhow::anyhow!("backfill_staging: {sql}: {e}"))
     }
 
-    /// Single attempt, no resend: an ambiguous timeout may have applied
+    /// Single attempt, no resend: a dropped connection may have applied
     /// server-side. Callers resolve through the ledger's staging uuid.
     async fn exec_once(&mut self, sql: &str) -> Result<()> {
         self.attempt_write(sql)
@@ -200,10 +198,9 @@ impl StagingSession {
             .map_err(|e| anyhow::anyhow!("backfill_staging: {sql}: {e}"))
     }
 
-    /// Single-column String SELECT, one attempt under the timeout.
+    /// Single-column String SELECT, one attempt.
     pub(crate) async fn query_strings(&mut self, sql: &str) -> Result<Vec<String>> {
-        let timeout = self.client.config().insert_timeout;
-        async { query_strings(self.client.ready().await?, sql, timeout).await }
+        async { query_strings(self.client.ready().await?, sql).await }
             .await
             .map_err(|e| anyhow::anyhow!("backfill_staging: {sql}: {e}"))
     }

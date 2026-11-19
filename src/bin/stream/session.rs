@@ -2564,7 +2564,7 @@ fn task_finished(
 }
 
 fn substitute_database(databases: &[String], absent: &str, replacement: &str) -> Vec<String> {
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = foldhash::HashSet::default();
     databases
         .iter()
         .map(|db| if db == absent { replacement } else { db })
