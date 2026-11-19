@@ -78,9 +78,9 @@ async fn ddl_applies_and_refuses_against_clickhouse() {
             host: "127.0.0.1".into(),
             port: slot.ch_tcp,
             database: DB.into(),
-            compression: CompressionChoice::None,
             ..Default::default()
         },
+        compression: CompressionChoice::None,
         // Refusals retry like any server exception, keep them quick
         retry: RetryConfig {
             max_attempts: 1,

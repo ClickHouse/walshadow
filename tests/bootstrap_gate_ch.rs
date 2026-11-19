@@ -195,9 +195,9 @@ async fn unresolvable_multixact_fails_greenfield_resolution() {
         conn: walshadow::ch_emitter::InstanceConfig {
             host: "127.0.0.1".into(),
             port: slot.ch_tcp,
-            compression: walshadow::ch::CompressionChoice::None,
             ..Default::default()
         },
+        compression: walshadow::ch::CompressionChoice::None,
         ..Default::default()
     };
     let stats = Arc::new(walshadow::ch_emitter::EmitterStats::default());

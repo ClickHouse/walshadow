@@ -41,15 +41,19 @@ planning committed transactions
 
 `BufferingDecoderSink` and `ReorderSink` share one record-queue worker
 `ReorderSink` plans each commit and places its rows onto the batcher in order
-Batcher seals per-table batches. A separate conversion pool resolves PostgreSQL
-types before inserters send complete Native blocks. Conversion concurrency
-matches oracle capacity; `[ch].inserter_pool_size` sizes the inserter pool
+Batcher seals per-table batches of Native blocks. A separate conversion pool
+resolves PostgreSQL types, then serializes and compresses each block once with
+`[ch] compression`, keeping prepared bytes until its INSERT is durable.
+Inserters send those bytes unchanged. Conversion concurrency matches oracle
+capacity; `[ch].inserter_pool_size` sizes the inserter pool
 Each inserter owns a ClickHouse connection and takes any ready batch
 
 Sequence numbers identify work slices, not necessarily whole transactions
 Only a commit's final slice publishes its LSN, after all earlier work finishes
 Bounded queues and a shared payload budget limit work in flight; transaction
-and plan data can spill to disk
+and plan data can spill to disk. Each tail's output pool holds batches from
+batcher to acknowledgement and reserves seal workspace apart from them, so
+conversion finishes however much output waits on inserters
 
 Queue worker runs on a dedicated thread and receives batches with heap decode
 started ahead of dispatch. It checks decoded results against descriptor history

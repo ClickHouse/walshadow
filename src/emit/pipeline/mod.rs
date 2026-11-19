@@ -20,6 +20,7 @@ pub mod planner;
 pub mod reorder;
 pub mod resolver;
 pub mod row_ledger;
+pub(crate) mod sealed;
 pub mod tail;
 
 use std::sync::Arc;

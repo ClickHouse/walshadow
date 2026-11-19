@@ -9,7 +9,7 @@ use walshadow::backfill_bootstrap::BootstrapProgress;
 use walshadow::boundary_hold::BoundaryHoldStats;
 use walshadow::ch_emitter::EmitterStats;
 use walshadow::config::ConfigResolver;
-use walshadow::metrics::WorkerState;
+use walshadow::metrics::{Buffer, WorkerState};
 use walshadow::metrics::{
     DbSeries, HistogramSnapshot, MetricsRegistry, MetricsSnapshot, RateEstimator,
     source_server_wal_end,
@@ -335,7 +335,7 @@ pub(crate) async fn populate_metrics(
         shadow_stream_active_connections: shadow_view.active_connections,
         shadow_stream_sockets_by_event: shadow_view.socket_events,
         wal_bytes: [shadow_view.backfill_bytes_total],
-        buffer_bytes: [shadow_view.send_queue_bytes],
+        buffer_bytes: [shadow_view.send_queue_bytes, 0, 0],
         ..registry.snapshot().await
     };
     populate_pipeline_metrics(
@@ -585,7 +585,11 @@ pub(crate) fn stage_gauges_on(v: &StageCounters<'_>, base: MetricsSnapshot) -> M
             .map(|s| pick(s).load(Ordering::Relaxed))
             .sum()
     };
+    let mut buffer_bytes = base.buffer_bytes;
+    buffer_bytes[Buffer::InsertOutput.index()] = emitter(|s| &s.output_resident_bytes);
+    buffer_bytes[Buffer::BatcherOpen.index()] = emitter(|s| &s.batcher_open_bytes);
     MetricsSnapshot {
+        buffer_bytes,
         bootstrap_deferred_bytes: emitter(|s| &s.bootstrap_deferred_bytes),
         bootstrap_deferred_spool_bytes: emitter(|s| &s.bootstrap_deferred_spool_bytes),
         bootstrap_deferred_replay_bytes: emitter(|s| &s.bootstrap_deferred_replay_bytes),
@@ -672,7 +676,9 @@ pub(crate) fn stage_gauges_on(v: &StageCounters<'_>, base: MetricsSnapshot) -> M
         insertbatch_batches_out_total: emitter(|s| &s.insertbatch_batches_out),
         inserter_batches_in_total: emitter(|s| &s.inserter_batches_in),
         inserter_ch_seconds_total: emitter_seconds(|s| &s.inserter_ch_nanos),
-        inserter_encode_seconds_total: emitter_seconds(|s| &s.inserter_encode_nanos),
+        resident_seal_seconds_total: emitter_seconds(|s| &s.resident_seal_nanos),
+        resident_raw_bytes_total: emitter(|s| &s.resident_raw_bytes),
+        resident_stored_bytes_total: emitter(|s| &s.resident_stored_bytes),
         oracle_resolve_seconds_total: emitter_seconds(|s| &s.oracle_resolve_nanos),
         process_cpu_seconds_total: proc_cpu,
         process_resident_memory_bytes: proc_rss,
@@ -819,11 +825,7 @@ fn emitter_worker_seconds(s: &EmitterStats) -> [(&'static str, WorkerState, f64)
         ("batcher", Busy, secs(&s.batcher_busy_nanos)),
         ("batcher", Idle, secs(&s.batcher_idle_nanos)),
         ("batcher", BlockedOut, secs(&s.batcher_send_nanos)),
-        (
-            "inserter",
-            Busy,
-            secs(&s.inserter_encode_nanos) + secs(&s.inserter_ch_nanos),
-        ),
+        ("inserter", Busy, secs(&s.inserter_ch_nanos)),
         ("inserter", Idle, secs(&s.inserter_idle_nanos)),
     ]
 }
