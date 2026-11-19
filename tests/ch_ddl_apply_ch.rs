@@ -234,12 +234,8 @@ async fn ddl_applies_and_refuses_against_clickhouse() {
     assert_eq!(exists.trim(), "0");
 
     let mut client = connect_client(&emitter).await.expect("connect");
-    let e = query_strings(
-        &mut client,
-        "SELECT nope FROM nowhere",
-        Duration::from_secs(5),
-    )
-    .await
-    .unwrap_err();
+    let e = query_strings(&mut client, "SELECT nope FROM nowhere")
+        .await
+        .unwrap_err();
     assert!(matches!(e, EmitterError::ServerException { .. }), "{e}");
 }

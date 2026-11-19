@@ -15,7 +15,7 @@
 use clickhouse_c::{Allocator, BlockBuilder, ColumnBuilder, QueryOpts, TypeAst};
 use tokio::task::JoinHandle;
 
-use crate::ch::{ChConn, EmitterError, EndOfStream, drain_to_end_of_stream, with_timeout};
+use crate::ch::{ChConn, EmitterError, EndOfStream, INSERT_GATE, drain_to_end_of_stream};
 use crate::config::DestEmitter;
 use crate::emit::ch_emitter::{EmitterStats, build_leaf, build_root};
 use crate::emit::pipeline::Fatal;
@@ -63,18 +63,18 @@ impl Inserter {
         sql: &str,
         bb: &BlockBuilder<'_>,
     ) -> Result<EndOfStream, EmitterError> {
-        let insert_timeout = self.client.config().insert_timeout;
         let started = std::time::Instant::now();
         let result = self
             .client
             .retry(
                 |mut client| async move {
-                    let result = with_timeout(insert_timeout, async {
+                    let _pass = INSERT_GATE.enter();
+                    let result = async {
                         client.send_query(sql, &QueryOpts::new()).await?;
                         client.send_data(bb).await?;
                         client.send_data_end().await?;
                         drain_to_end_of_stream(&mut client).await
-                    })
+                    }
                     .await;
                     (client, result)
                 },

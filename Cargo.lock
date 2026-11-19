@@ -2957,6 +2957,7 @@ dependencies = [
  "serde_json",
  "simdutf8",
  "smallvec",
+ "socket2",
  "tempfile",
  "thiserror",
  "tokio",

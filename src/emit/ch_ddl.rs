@@ -1015,12 +1015,6 @@ impl DdlApplicator {
         }
     }
 
-    /// Run one DDL statement with the same bounded timeout +
-    /// reconnect/retry as the INSERT pump. DDL applies inside the
-    /// reorder barrier, so a half-open socket would otherwise park the
-    /// barrier and ack frontier indefinitely. Every emitted statement is
-    /// idempotent (`IF [NOT] EXISTS`, `RENAME COLUMN IF EXISTS`,
-    /// `TRUNCATE`), so a reconnect resends and CH no-ops the second apply.
     async fn ensure_database(&mut self, target: &TableTarget) -> Result<(), EmitterError> {
         self.client.select(target.instance.as_deref())?;
         let config = self.client.config();
@@ -1046,9 +1040,12 @@ impl DdlApplicator {
         self.execute_selected(sql).await
     }
 
+    /// Run one DDL statement with the same reconnect/retry as the INSERT pump.
+    /// Every emitted statement is idempotent (`IF [NOT] EXISTS`, `RENAME
+    /// COLUMN IF EXISTS`, `TRUNCATE`), so a reconnect resends and CH no-ops
+    /// the second apply
     async fn execute_selected(&mut self, sql: &str) -> Result<(), EmitterError> {
         tracing::debug!(target: "walshadow::ch_ddl", sql = %sql, "applying");
-        let query_timeout = self.client.config().insert_timeout;
         self.client
             .retry_when(
                 |e| {
@@ -1062,7 +1059,7 @@ impl DdlApplicator {
                         )
                 },
                 |mut client| async move {
-                    let result = exec_drain(&mut client, sql, query_timeout).await;
+                    let result = exec_drain(&mut client, sql).await;
                     (client, result)
                 },
                 |e, attempt| {

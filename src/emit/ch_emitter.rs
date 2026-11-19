@@ -177,15 +177,10 @@ pub struct EmitterConfig {
     /// destination, overridable per namespace
     pub detach_strategy: DropTableStrategy,
     pub retry: RetryConfig,
-    /// Wall-clock limit for one INSERT attempt. If connection stalls
-    /// mid-INSERT, return retryable [`EmitterError::Timeout`] so inserter
-    /// reconnects and resends without blocking durable watermark
-    /// Set well above healthy round-trip time
-    pub insert_timeout: Duration,
     /// A CH connection idle longer than this may be half-open (NAT/LB/CH
-    /// idle-reap); reconnect before the next op instead of blocking the
-    /// full `insert_timeout` on a dead socket. Guards the start of a run,
-    /// when connections sat idle since the previous one.
+    /// idle-reap); reconnect before the next op instead of waiting for TCP
+    /// keepalive to fail it. Guards the start of a run, when connections sat
+    /// idle since the previous one.
     pub idle_reconnect: Duration,
     /// Keep the delete marker out of `ReplacingMergeTree`'s args so delete
     /// tombstones stay queryable instead of collapsing on FINAL. Column
@@ -393,7 +388,6 @@ fn vcpus() -> usize {
         .unwrap_or(DEFAULT_POOL_FLOOR)
 }
 
-pub(crate) const DEFAULT_INSERT_TIMEOUT_SECS: u64 = 30;
 pub(crate) const DEFAULT_IDLE_RECONNECT_SECS: u64 = 30;
 
 /// Bounded-retry knobs. Retryable error (IO, clickhouse-c protocol,
@@ -1034,7 +1028,6 @@ impl EmitterConfig {
             drop_table_strategy: ch.drop_table_strategy,
             detach_strategy: ch.detach_strategy,
             retry: ch.retry,
-            insert_timeout: Duration::from_secs(DEFAULT_INSERT_TIMEOUT_SECS),
             idle_reconnect: Duration::from_secs(DEFAULT_IDLE_RECONNECT_SECS),
             soft_delete: ch.soft_delete,
             system_columns: Arc::default(),
