@@ -37,6 +37,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use tokio::sync::Mutex;
 
+use walshadow::bridge::Bridge;
 use walshadow::ch::CompressionChoice;
 use walshadow::ch_ddl::{DdlApplicator, DdlConfig};
 use walshadow::ch_emitter::{EmitterConfig, EmitterStats, InstanceConfig};
@@ -53,7 +54,7 @@ use walshadow::record::{
 use walshadow::schema::RelName;
 use walshadow::segment_sink::DirSegmentSink;
 use walshadow::shadow::{Shadow, ShadowConfig};
-use walshadow::shadow_catalog::{ParkedAt, ShadowCatalog, ShadowCatalogConfig};
+use walshadow::shadow_catalog::{ParkedAt, ShadowCatalog};
 use walshadow::source_feed::{SourceEvent, SourceFeed, StandbyStatus};
 use walshadow::wal_stream::WalStream;
 use walshadow::xact_buffer::{BufferingDecoderSink, SubxactTracker, XactBuffer, XactBufferConfig};
@@ -577,10 +578,27 @@ pub struct PipelineSinks {
     pub reorder: ReorderSink,
     /// Descriptor capture at catalog boundaries. The daemon runs it inside
     /// the boundary hold; the synchronous harness has no gate, so
-    /// `wait_for_replay` stands in before capturing (nothing past the
+    /// [`wait_for_replay`] stands in before capturing (nothing past the
     /// commit has been pumped yet — serial record cadence)
     pub capture: walshadow::catalog_capture::CaptureSet,
-    pub catalog: Arc<Mutex<ShadowCatalog>>,
+    pub bridge: Arc<Bridge>,
+}
+
+/// Poll bridge worker until shadow replay reaches `target`. Worker reads
+/// replay position from shared memory, so polling never blocks behind a
+/// catalog AccessExclusiveLock replay holds
+async fn wait_for_replay(bridge: &Bridge, target: u64) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let lsn = bridge.replay_lsn().await?;
+        if lsn != 0 && lsn >= target {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            bail!("timed out waiting for shadow replay ≥ {target:#X}, last {lsn:#X}");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 impl RecordSink for PipelineSinks {
@@ -596,10 +614,7 @@ impl RecordSink for PipelineSinks {
             }
             if let Some(info) = &record.boundary_info {
                 if self.capture.admits(info, record.next_lsn) {
-                    self.catalog
-                        .lock()
-                        .await
-                        .wait_for_replay(record.next_lsn)
+                    wait_for_replay(&self.bridge, record.next_lsn)
                         .await
                         .map_err(|e| SinkError::Other(format!("harness boundary wait: {e}")))?;
                     self.capture.charge_hold(info, std::time::Duration::ZERO);
@@ -752,18 +767,13 @@ async fn build_pipeline_inner(
         "postgres",
         "postgres",
     );
-    let cat_cfg = ShadowCatalogConfig {
-        replay_timeout: Duration::from_secs(60),
-        replay_poll: Duration::from_millis(50),
-        ..Default::default()
-    };
     let bridge_path = shadow.bridge_socket().expect("bridge configured");
     let bridge = Arc::new(
         walshadow::bridge::connect_with_budget(bridge_path, 1, Duration::from_secs(60))
             .await
             .unwrap_or_else(|e| panic!("bridge connect on {}: {e}", bridge_path.display())),
     );
-    let catalog = ShadowCatalog::connect(&shadow_conninfo, cat_cfg, bridge.clone())
+    let catalog = ShadowCatalog::connect(&shadow_conninfo, bridge.clone())
         .await
         .expect("connect shadow catalog");
     let catalog = Arc::new(Mutex::new(catalog));
@@ -1047,7 +1057,7 @@ async fn build_pipeline_inner(
         decoder,
         reorder,
         capture,
-        catalog,
+        bridge,
     };
     let segment_sink =
         DirSegmentSink::new(shadow_filter_dir.to_path_buf()).expect("open shadow filter dir");

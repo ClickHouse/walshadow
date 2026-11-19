@@ -186,8 +186,6 @@ async fn shadow_catalog_follows_applied_source_dbname() {
         "direct",
         "--bootstrap-shadow-data-dir",
         bootstrap_shadow_data_dir.to_str().unwrap(),
-        "--bootstrap-shadow-replay-timeout",
-        "120",
     ]
     .map(String::from);
     let spawn = |stderr: fs::File| {

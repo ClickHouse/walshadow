@@ -17,7 +17,6 @@
 //! Single-database model: instance bound to one DB.
 
 use std::collections::BTreeSet;
-use std::num::NonZeroU64;
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
@@ -50,12 +49,6 @@ pub enum CatalogError {
     ForeignDatabase(RelFileNode),
     #[error("relation not found by oid {0}")]
     NotFoundByOid(Oid),
-    #[error("timeout after {elapsed:?} waiting for replay ≥ {target:#X} (last observed: {last:?})")]
-    ReplayTimeout {
-        target: u64,
-        last: Option<u64>,
-        elapsed: Duration,
-    },
     #[error("parse: {0}")]
     Parse(String),
 }
@@ -83,46 +76,17 @@ impl ParkedAt {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct ShadowCatalogConfig {
-    /// `pg_last_wal_replay_lsn()` poll interval
-    pub replay_poll: Duration,
-    /// [`ShadowCatalog::wait_for_replay`] gives up after this; also bounds
-    /// [`with_transient_retry`]'s window
-    pub replay_timeout: Duration,
-    pub reconnect_backoff_initial: Duration,
-    pub reconnect_backoff_max: Duration,
-}
-
-impl Default for ShadowCatalogConfig {
-    fn default() -> Self {
-        Self {
-            // 1 ms, not 50 ms: at 50 ms the fixed tick dominated worker
-            // throughput in `pgbench_acceptance` when shadow apply lagged
-            // pump dispatch by O(records); 1 ms keeps each wait_for_replay
-            // miss bounded by SQL round-trip cost instead
-            replay_poll: Duration::from_millis(1),
-            replay_timeout: Duration::from_secs(30),
-            reconnect_backoff_initial: Duration::from_millis(100),
-            reconnect_backoff_max: Duration::from_secs(1),
-        }
-    }
-}
-
 #[derive(Debug, Default, Clone)]
 pub struct ShadowCatalogStats {
     pub fetches: u64,
     /// Committed reads answered off the mirroring statement, not the worker
     pub mirror_fetches: u64,
-    pub replay_waits: u64,
     pub reconnects: u64,
 }
 
 pub struct ShadowCatalog {
     client: Client,
     conninfo: String,
-    config: ShadowCatalogConfig,
-    last_replay_lsn: Option<u64>,
     /// DB oid this client is connected to; survives `reconnect` since
     /// `conninfo` pins the DB
     current_db_oid: Option<Oid>,
@@ -164,11 +128,7 @@ impl ShadowCatalog {
     /// Connect over a libpq key=value conninfo. One-shot; wrap in
     /// [`with_transient_retry`] for retry-on-PG-coming-up. `conninfo` is stashed
     /// so the client can be rebuilt when shadow PG bounces.
-    pub async fn connect(
-        conninfo: &str,
-        config: ShadowCatalogConfig,
-        bridge: Arc<Bridge>,
-    ) -> Result<Self> {
+    pub async fn connect(conninfo: &str, bridge: Arc<Bridge>) -> Result<Self> {
         let (client, conn) = tokio_postgres::connect(conninfo, NoTls).await?;
         tokio::spawn(async move {
             let _ = conn.await;
@@ -176,8 +136,6 @@ impl ShadowCatalog {
         Ok(Self {
             client,
             conninfo: conninfo.to_string(),
-            config,
-            last_replay_lsn: None,
             current_db_oid: None,
             default_tablespace: None,
             bridge,
@@ -261,8 +219,7 @@ impl ShadowCatalog {
     }
 
     /// Rebuild the client from stashed `conninfo`. One-shot; retry via
-    /// [`with_transient_retry`]. Resets `last_replay_lsn` since a restarted
-    /// instance's replay LSN starts fresh.
+    /// [`with_transient_retry`].
     async fn reconnect(&mut self) -> Result<()> {
         let (client, conn) = tokio_postgres::connect(&self.conninfo, NoTls).await?;
         tokio::spawn(async move {
@@ -270,7 +227,6 @@ impl ShadowCatalog {
         });
         self.client = client;
         self.stats.reconnects += 1;
-        self.last_replay_lsn = None;
         Ok(())
     }
 
@@ -295,46 +251,6 @@ impl ShadowCatalog {
         params: &[&(dyn ToSql + Sync)],
     ) -> Result<Vec<Row>> {
         query_with_reconnect!(self, query, statement, params)
-    }
-
-    /// Wait until shadow's replay LSN ≥ `target`, returning the deciding poll's
-    /// LSN. `target = 0` returns on the first non-zero LSN.
-    ///
-    /// Polls the bridge worker, not SQL. `SELECT pg_last_wal_replay_lsn()`
-    /// needs no lock of its own but its *parse* opens `pg_type`, so it blocks
-    /// whenever replay is holding an AccessExclusiveLock on a catalog — and the
-    /// release for such a lock can be in WAL this very wait is what unblocks.
-    /// The worker reads the position out of shared memory instead, and it is
-    /// long-lived, so it parses nothing here.
-    pub async fn wait_for_replay(&mut self, target: u64) -> Result<u64> {
-        if let Some(seen) = self.last_replay_lsn
-            && seen >= target
-            && target != 0
-        {
-            return Ok(seen);
-        }
-        self.stats.replay_waits += 1;
-        let start = Instant::now();
-        let bridge = self.bridge.clone();
-        loop {
-            // Worker reports 0 off a standby, same as the SQL function's NULL
-            let lsn = NonZeroU64::new(bridge.replay_lsn().await?).map(NonZeroU64::get);
-            if let Some(lsn) = lsn {
-                self.last_replay_lsn = Some(self.last_replay_lsn.map_or(lsn, |old| old.max(lsn)));
-                if lsn >= target {
-                    return Ok(lsn);
-                }
-            }
-            let elapsed = start.elapsed();
-            if elapsed >= self.config.replay_timeout {
-                return Err(CatalogError::ReplayTimeout {
-                    target,
-                    last: self.last_replay_lsn,
-                    elapsed,
-                });
-            }
-            tokio::time::sleep(self.config.replay_poll).await;
-        }
     }
 
     /// Batched descriptor fetch: N oids plus the shadow's replay position.
@@ -635,12 +551,8 @@ impl ShadowCatalog {
 }
 
 /// Exponential-backoff retry on transient PG errors (closed connection, "system
-/// is starting up", connect refused). Non-PG errors (parse, not-found, replay
-/// timeout) surface immediately.
-///
-/// Outside `ShadowCatalog` on purpose: the catalog's invalidation and
-/// replay-LSN bookkeeping stay unaware of in-flight retries, seeing only the
-/// final outcome.
+/// is starting up", connect refused). Non-PG errors (parse, not-found) surface
+/// immediately.
 pub async fn with_transient_retry<R, F>(
     timeout: Duration,
     initial_backoff: Duration,
@@ -1150,13 +1062,6 @@ mod tests {
     }
 
     #[test]
-    fn config_default_is_sane() {
-        let c = ShadowCatalogConfig::default();
-        assert!(c.replay_poll < c.replay_timeout);
-        assert!(c.reconnect_backoff_initial < c.reconnect_backoff_max);
-    }
-
-    #[test]
     fn eligible_takes_user_oids_of_heap_bearing_kinds() {
         let user = |kind| ClassRow {
             relkind: kind,
@@ -1405,11 +1310,6 @@ mod tests {
     fn is_transient_classifies_known_variants() {
         assert!(!is_transient(&CatalogError::Parse("x".into())));
         assert!(!is_transient(&CatalogError::NotFoundByOid(42)));
-        assert!(!is_transient(&CatalogError::ReplayTimeout {
-            target: 0,
-            last: None,
-            elapsed: Duration::from_secs(0),
-        }));
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -35,7 +35,7 @@ use walshadow::heap_decoder::{
 use walshadow::pg::socket_conninfo;
 use walshadow::pos::Pos;
 use walshadow::shadow::{BridgeConf, Shadow, ShadowConfig};
-use walshadow::shadow_catalog::{ShadowCatalog, ShadowCatalogConfig};
+use walshadow::shadow_catalog::ShadowCatalog;
 use walshadow::spill::ToastChunk;
 use walshadow::toast::{ChunkRefMap, MemChunkStore, ToastResolver};
 use walshadow::xact_buffer::{
@@ -82,11 +82,6 @@ async fn open_catalog(shadow: &Shadow) -> ShadowCatalog {
         "postgres",
         "postgres",
     );
-    let cat_cfg = ShadowCatalogConfig {
-        replay_timeout: Duration::from_secs(5),
-        replay_poll: Duration::from_millis(20),
-        ..Default::default()
-    };
     let bridge = Arc::new(
         walshadow::bridge::connect_with_budget(
             shadow.bridge_socket().expect("bridge configured"),
@@ -96,7 +91,7 @@ async fn open_catalog(shadow: &Shadow) -> ShadowCatalog {
         .await
         .expect("bridge connect"),
     );
-    ShadowCatalog::connect(&conninfo, cat_cfg, bridge)
+    ShadowCatalog::connect(&conninfo, bridge)
         .await
         .expect("catalog connect")
 }

@@ -70,18 +70,22 @@ pub(crate) fn walsender_primary_conninfo(bind: SocketAddr) -> String {
     )
 }
 
+const REPLAY_REPORT: Duration = Duration::from_secs(10);
+
 /// Start daemon-owned shadow using archived WAL
 /// After fresh bootstrap, wait for backup `end_lsn`; direct mode includes
 /// required WAL in `base.tar`
 /// Restart a postmaster left alive by an unclean prior exit so it binds
 /// this daemon's port and socket
+/// Dropping returned future stops replay wait on blocking pool
 pub(crate) async fn start_owned_shadow(
     shadow: &Arc<Shadow>,
     replay_target: Option<u64>,
-    replay_timeout: Duration,
     keep_running: bool,
 ) -> Result<()> {
     let s = shadow.clone();
+    let cancel = CancellationToken::new();
+    let _cancel_on_drop = cancel.clone().drop_guard();
     tokio::task::spawn_blocking(move || -> Result<()> {
         // Prior daemon may have died mid `pg_ctl start -w`
         if keep_running
@@ -108,7 +112,7 @@ pub(crate) async fn start_owned_shadow(
         s.start_with_floor_retry(None).context("shadow start")?;
         if let Some(target) = replay_target {
             let lsn = s
-                .wait_for_replay(target, replay_timeout)
+                .wait_for_replay_reporting(target, REPLAY_REPORT, &cancel)
                 .context("wait for shadow replay of bootstrap end_lsn")?;
             tracing::info!(
                 target: "walshadow::shadow",

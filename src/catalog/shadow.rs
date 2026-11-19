@@ -8,7 +8,7 @@
 //! [`point_at_walsender`](Shadow::point_at_walsender),
 //! [`clear_stale_pid`](Shadow::clear_stale_pid),
 //! [`start_with_floor_retry`](Shadow::start_with_floor_retry),
-//! [`wait_for_replay`](Shadow::wait_for_replay),
+//! [`wait_for_replay_reporting`](Shadow::wait_for_replay_reporting),
 //! [`is_running`](Shadow::is_running),
 //! [`try_pg_wal_replay_resume`](Shadow::try_pg_wal_replay_resume),
 //! [`health`](Shadow::health),
@@ -28,6 +28,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use thiserror::Error;
+use tokio_util::sync::CancellationToken;
+use walrus::pg::backup::format_pg_lsn;
 
 use crate::source::shadow_stream::WALRECEIVER_PROTOCOL_PIN;
 
@@ -53,6 +55,8 @@ pub enum ShadowError {
     NotInRecovery,
     #[error("missing required PG binary: {0}")]
     MissingBinary(String),
+    #[error("cancelled")]
+    Cancelled,
 }
 
 pub type Result<T> = std::result::Result<T, ShadowError>;
@@ -741,6 +745,15 @@ impl Shadow {
 
     /// Block until in recovery and replay LSN ≥ `target`, or `timeout`.
     pub fn wait_for_replay(&self, target: u64, timeout: Duration) -> Result<u64> {
+        self.wait_for_replay_until(target, timeout, &CancellationToken::new())
+    }
+
+    fn wait_for_replay_until(
+        &self,
+        target: u64,
+        timeout: Duration,
+        cancel: &CancellationToken,
+    ) -> Result<u64> {
         let start = Instant::now();
         loop {
             if !self.is_in_recovery()? {
@@ -758,7 +771,67 @@ impl Shadow {
                     elapsed,
                 });
             }
+            if cancel.is_cancelled() {
+                return Err(ShadowError::Cancelled);
+            }
             thread::sleep(self.config.wait_poll);
+        }
+    }
+
+    /// [`wait_for_replay`](Self::wait_for_replay) without deadline, since
+    /// a large backup WAL window replays for as long as it needs. Log
+    /// progress each `report`, restart after a GUC floor pause. Postmaster
+    /// exit or recovery end fails through probe errors, `cancel` through
+    /// [`ShadowError::Cancelled`]
+    pub fn wait_for_replay_reporting(
+        &self,
+        target: u64,
+        report: Duration,
+        cancel: &CancellationToken,
+    ) -> Result<u64> {
+        let target_lsn = format_pg_lsn(target).to_string();
+        let mut prior = None;
+        loop {
+            match self.wait_for_replay_until(target, report, cancel) {
+                Err(ShadowError::Timeout { .. }) => {}
+                reached => return reached,
+            }
+            match self.try_pg_wal_replay_resume()? {
+                ResumeOutcome::ResumedForFloor => {
+                    tracing::warn!(
+                        target: "walshadow::shadow",
+                        target_lsn,
+                        "shadow replay paused because GUC value is below primary; \
+                         restarting with required value",
+                    );
+                    while self.is_running()? {
+                        if cancel.is_cancelled() {
+                            return Err(ShadowError::Cancelled);
+                        }
+                        thread::sleep(self.config.wait_poll);
+                    }
+                    self.clear_stale_pid()?;
+                    self.start_with_floor_retry(None)?;
+                    continue;
+                }
+                ResumeOutcome::PausedForeign => tracing::warn!(
+                    target: "walshadow::shadow",
+                    target_lsn,
+                    "shadow replay paused for a reason other than GUC floor \
+                     (eg operator pg_wal_replay_pause); waiting for resume",
+                ),
+                ResumeOutcome::NotPaused => {}
+            }
+            let lsn = self.last_replay_lsn()?;
+            tracing::info!(
+                target: "walshadow::shadow",
+                replay_lsn = lsn.map(|l| format_pg_lsn(l).to_string()),
+                target_lsn,
+                remaining_bytes = target.saturating_sub(lsn.unwrap_or(0)),
+                advanced = lsn > prior,
+                "shadow replaying toward bootstrap end_lsn",
+            );
+            prior = lsn;
         }
     }
 
@@ -1278,6 +1351,7 @@ case "$sql" in
   *) key=other;;
 esac
 printf '%s\n' "$db" >> "$dir/dbs"
+printf '%s\n' "$key" >> "$dir/keys"
 [ -e "$dir/fail_$key" ] && { cat "$dir/fail_$key" >&2; exit 2; }
 cat "$dir/answers/$key""#,
         );
@@ -1399,6 +1473,91 @@ cat "$dir/answers/$key""#,
             shadow.try_pg_wal_replay_resume().unwrap(),
             ResumeOutcome::ResumedForFloor
         );
+    }
+
+    /// Stalled replay keeps waiting past each report, ends once it reaches target
+    #[test]
+    fn wait_for_replay_reporting_outlasts_stall() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (cfg, answers) = psql_stub(tmp.path());
+        let shadow = Shadow::new(cfg);
+        answer(&answers, "recovery", "t");
+        answer(&answers, "replay", "0/10");
+        answer(&answers, "pause", "not paused");
+        let keys = answers.with_file_name("keys");
+        let reports = move || {
+            fs::read_to_string(&keys).map_or(0, |s| s.lines().filter(|k| *k == "pause").count())
+        };
+        let catch_up = std::thread::spawn(move || {
+            while reports() < 2 {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            answer(&answers, "replay", "0/11");
+        });
+        let reached = shadow.wait_for_replay_reporting(
+            0x11,
+            Duration::from_millis(5),
+            &CancellationToken::new(),
+        );
+        catch_up.join().unwrap();
+        assert_eq!(reached.unwrap(), 0x11);
+        // Cancel lands between polls, not at next report
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        assert!(matches!(
+            shadow.wait_for_replay_reporting(0x12, Duration::from_secs(60), &cancel),
+            Err(ShadowError::Cancelled)
+        ));
+    }
+
+    /// Foreign pause holds, floor pause restarts shadow and replay resumes
+    #[test]
+    fn wait_for_replay_reporting_restarts_on_floor_pause() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (cfg, answers) = psql_stub(tmp.path());
+        let bin = answers.parent().unwrap().to_path_buf();
+        // Floor matches running settings once, then replay raises it
+        stub_bin(
+            &bin.join("pg_controldata"),
+            "dir=$(dirname \"$0\")\n\
+             echo >> \"$dir/controldata_calls\"\n\
+             n=100; [ \"$(wc -l < \"$dir/controldata_calls\")\" -gt 1 ] && n=200\n\
+             echo \"max_connections setting: $n\"\n\
+             echo 'max_worker_processes setting: 8'\n\
+             echo 'max_wal_senders setting: 10'\n\
+             echo 'max_prepared_xacts setting: 0'\n\
+             echo 'max_locks_per_xact setting: 64'",
+        );
+        // Report running once per `running` marker, start lets replay reach 0/11
+        stub_bin(
+            &bin.join("pg_ctl"),
+            "dir=$(dirname \"$0\")\n\
+             case \"$*\" in\n\
+               *status) rm \"$dir/running\" 2>/dev/null || exit 3;;\n\
+               *start) echo 0/11 > \"$dir/answers/replay\";;\n\
+             esac",
+        );
+        fs::write(bin.join("running"), b"").unwrap();
+        let shadow = Shadow::new(cfg);
+        answer(&answers, "recovery", "t");
+        answer(&answers, "replay", "0/10");
+        answer(&answers, "pause", "paused");
+        answer(&answers, "settings", "100|8|10|0|64");
+        answer(&answers, "other", "");
+        let reached =
+            shadow.wait_for_replay_reporting(0x11, Duration::ZERO, &CancellationToken::new());
+        assert_eq!(reached.unwrap(), 0x11);
+        let keys = fs::read_to_string(bin.join("keys")).unwrap();
+        assert_eq!(keys.matches("pause").count(), 2, "{keys}");
+        assert!(!bin.join("running").exists());
+        // Cancel also ends wait for floor-paused postmaster to exit
+        fs::write(bin.join("running"), b"").unwrap();
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        assert!(matches!(
+            shadow.wait_for_replay_reporting(0x12, Duration::ZERO, &cancel),
+            Err(ShadowError::Cancelled)
+        ));
     }
 
     #[test]

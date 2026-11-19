@@ -36,7 +36,7 @@ use walshadow::bridge::Bridge;
 use walshadow::mapping::TableTarget;
 use walshadow::schema::RelName;
 use walshadow::shadow::{BridgeConf, Shadow, ShadowConfig};
-use walshadow::shadow_catalog::{ShadowCatalog, ShadowCatalogConfig};
+use walshadow::shadow_catalog::ShadowCatalog;
 
 /// ClickHouse server subprocess wrapper shared by the pipeline DDL
 /// drill, both bootstrap-to-CH drills, and the
@@ -301,8 +301,6 @@ impl DaemonRun {
                 mode,
                 "--bootstrap-shadow-data-dir",
                 self.shadow_data_dir.to_str().unwrap(),
-                "--bootstrap-shadow-replay-timeout",
-                "120",
             ])
             .args(extra)
             .envs(env.iter().map(|(k, v)| (*k, v)))
@@ -391,7 +389,6 @@ pub async fn connect_catalog(source: &Shadow, app_name: &str) -> (Arc<Bridge>, S
     let pg = pg_cfg(source, app_name);
     let catalog = ShadowCatalog::connect(
         &walshadow::pg::socket_conninfo(&pg.host, pg.port, &pg.user, &pg.database),
-        ShadowCatalogConfig::default(),
         bridge.clone(),
     )
     .await

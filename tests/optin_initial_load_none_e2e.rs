@@ -126,8 +126,6 @@ async fn optin_initial_load_none_skips_snapshot_but_streams_cdc() {
             "32768",
             "--bootstrap-shadow-data-dir",
             bootstrap_shadow_data_dir.to_str().unwrap(),
-            "--bootstrap-shadow-replay-timeout",
-            "120",
         ])
         .env("RUST_LOG", "warn,walshadow=info")
         .stdout(Stdio::null())

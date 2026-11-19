@@ -1696,6 +1696,8 @@ async fn backup_opt_ins_coalesce_into_one_pass() {
     let dir = tempfile::tempdir().unwrap();
     let backfiller = fx.backfiller(dir.path()).await;
     let mut sess = staging_session(&fx).await;
+    // Stand-in live INSERT holds copy-back until opt-out lands
+    let live_insert = walshadow::ch::INSERT_GATE.enter();
     for desc in [&fx.desc, &u] {
         backfiller
             .note_opt_in(desc, InitialLoadMode::BaseBackup, 100)
@@ -1705,6 +1707,7 @@ async fn backup_opt_ins_coalesce_into_one_pass() {
     // Opt-out between exchange and copy-back finishes the publish unrecorded
     wait_exchanged(&mut sess, "default", "u").await;
     backfiller.note_opt_out(&u.rel_name).await;
+    drop(live_insert);
     logs.wait_for(PASS_DONE).await;
     tokio::time::timeout(Duration::from_secs(30), async {
         while backfiller.pending_count() != 0 {
@@ -1752,9 +1755,12 @@ async fn pending_rows_outlast_unreachable_source_and_failed_copy_back() {
     let mut sess = staging_session(&fx).await;
     let blocker = stall_at_pending_hold(&fx, &backfiller, dir.path(), &logs).await;
     fx.source.psql_one("ALTER ROLE ws_pass NOLOGIN").unwrap();
+    // Stand-in live INSERT holds copy-back until staging is gone
+    let live_insert = walshadow::ch::INSERT_GATE.enter();
     std::fs::remove_dir(&blocker).unwrap();
     wait_exchanged(&mut sess, "default", "t").await;
     fx.ch.query("DROP TABLE default.t__wsstg").unwrap();
+    drop(live_insert);
     logs.wait_for("staging copy-back failed; entry stays swapped")
         .await;
     logs.wait_for("pending visibility source check failed")

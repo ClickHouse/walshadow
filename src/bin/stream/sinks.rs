@@ -74,9 +74,7 @@ impl<D: RecordSink + Send> RecordSink for DecoderXactPair<D> {
 ///
 /// `metrics` stays synchronous on the pump task (counter bumps, never
 /// await). The decoder/xact-drain pair runs behind a [`QueueingRecordSink`](walshadow::queueing_record_sink::QueueingRecordSink)
-/// so its `wait_for_replay` waits don't park the pump task: each gate
-/// would freeze wire delivery for a full shadow apply round-trip and
-/// couple wire pacing to decode.
+/// so decode and drain cost doesn't pace wire delivery.
 pub(crate) struct DaemonSinks {
     pub(crate) metrics: MetricsRecordSink,
     /// Queueing sink wrapped with the catalog-boundary publication hold:

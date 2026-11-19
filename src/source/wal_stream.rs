@@ -328,9 +328,9 @@ impl WalStream {
     }
 
     /// Drain every now-completable record. Fires `bytes_sink` (shadow
-    /// wire) before `record_sink` so the catalog gate
-    /// `wait_for_replay(record.lsn)` clears against shadow's wire-driven
-    /// apply LSN, not against `restore_command` segment landing.
+    /// wire) before `record_sink` so the catalog gate clears against
+    /// shadow's wire-driven apply LSN, not against `restore_command`
+    /// segment landing.
     ///
     /// Records stage until one may park on shadow replay
     /// ([`RecordSink::may_park`]), staging crosses a bound, or the walker
