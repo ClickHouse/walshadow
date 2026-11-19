@@ -209,14 +209,12 @@ pub(crate) struct Args {
     pub(crate) catalog_hold_timeout: u64,
     /// Soft cap on in-flight records for the `QueueingRecordSink` feeding
     /// the decoder / xact-drain worker. Past this watermark the pump
-    /// yields to let the worker drain; a stuck worker still surfaces via
-    /// the catalog `wait_for_replay` timeout on the err slot.
+    /// yields to let the worker drain.
     /// Overrides `[ch] decoder_queue_capacity`.
     #[arg(long)]
     pub(crate) decoder_queue_capacity: Option<usize>,
     /// Pump-side batch size for the `QueueingRecordSink`. Bigger
-    /// amortises per-send overhead but adds pump→worker latency (worker's
-    /// `wait_for_replay` lags one batch behind).
+    /// amortises per-send overhead but adds pump→worker latency.
     /// Overrides `[ch] decoder_batch_size`.
     #[arg(long)]
     pub(crate) decoder_batch_size: Option<usize>,
@@ -351,10 +349,6 @@ pub(crate) struct Args {
     /// archiving to that same bucket.
     #[arg(long, default_value_t = false)]
     pub(crate) bootstrap_wal_from_archive: bool,
-    /// Maximum seconds to wait for shadow replay after bootstrap
-    /// Abort daemon when timeout expires
-    #[arg(long, default_value_t = 300)]
-    pub(crate) bootstrap_shadow_replay_timeout: u64,
 }
 
 impl Args {

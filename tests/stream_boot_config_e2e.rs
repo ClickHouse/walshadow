@@ -114,8 +114,6 @@ async fn boot_seeds_sql_scope_and_toml_initial_loads() {
             "direct",
             "--bootstrap-shadow-data-dir",
             daemon.shadow_data_dir.to_str().unwrap(),
-            "--bootstrap-shadow-replay-timeout",
-            "120",
             "--bootstrap-wind-down-secs",
             "0",
             // Skip preflight to test boot handling of missing relations

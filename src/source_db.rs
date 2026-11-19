@@ -16,7 +16,7 @@ use tokio::sync::{Mutex, watch};
 use tokio_postgres::types::Oid;
 
 use crate::catalog::desc_log::DescriptorLog;
-use crate::catalog::shadow_catalog::{ShadowCatalog, ShadowCatalogConfig, with_transient_retry};
+use crate::catalog::shadow_catalog::{ShadowCatalog, with_transient_retry};
 use crate::config::{ConfigResolver, ResolvedConfig};
 use crate::emit::ch_emitter::EmitterConfig;
 use crate::emit::route::RowPolicy;
@@ -81,16 +81,12 @@ impl DbLink {
             in_recovery = info.in_recovery,
             "bridge connected",
         );
-        let cat_cfg = ShadowCatalogConfig::default();
         let (catalog, oid) = async {
             let mut catalog = with_transient_retry(
                 cfg.budget,
-                cat_cfg.reconnect_backoff_initial,
-                cat_cfg.reconnect_backoff_max,
-                async || {
-                    ShadowCatalog::connect(cfg.shadow_conninfo, cat_cfg.clone(), bridge.clone())
-                        .await
-                },
+                Duration::from_millis(100),
+                Duration::from_secs(1),
+                async || ShadowCatalog::connect(cfg.shadow_conninfo, bridge.clone()).await,
             )
             .await?;
             let oid = catalog.current_database_oid().await?;

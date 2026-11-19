@@ -3,8 +3,7 @@
 //!
 //! WAL commits drain through the parallel [`pipeline`](crate::emit::pipeline);
 //! [`TupleObserver`] is the greenfield-bootstrap page-walk drain destination
-//! (`drain_backfill`). Catalog gate timeouts poison the stream, so no
-//! `replay_timeout` counter: silent loss is impossible by construction.
+//! (`drain_backfill`).
 
 use std::future::Future;
 use std::pin::Pin;

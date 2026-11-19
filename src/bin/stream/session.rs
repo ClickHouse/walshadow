@@ -475,14 +475,15 @@ async fn session_body(
                 .shadow
                 .write_standby_signal()
                 .context("write standby.signal")?;
-            walshadow::ops::stages::SHADOW_REPLAY
-                .measure(start_owned_shadow(
+            or_signal(
+                shutdown,
+                walshadow::ops::stages::SHADOW_REPLAY.measure(start_owned_shadow(
                     &owned.shadow,
                     bootstrap_end_lsn,
-                    Duration::from_secs(args.bootstrap_shadow_replay_timeout),
                     args.keep_shadow_running,
-                ))
-                .await?;
+                )),
+            )
+            .await?;
             owned
         }
     };
@@ -514,11 +515,9 @@ async fn session_body(
             .shadow
             .write_standby_signal()
             .context("write standby.signal")?;
-        start_owned_shadow(
-            &owned.shadow,
-            None,
-            Duration::from_secs(args.bootstrap_shadow_replay_timeout),
-            args.keep_shadow_running,
+        or_signal(
+            shutdown,
+            start_owned_shadow(&owned.shadow, None, args.keep_shadow_running),
         )
         .await?;
         (owned, substituted)

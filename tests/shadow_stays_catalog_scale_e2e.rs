@@ -204,8 +204,6 @@ async fn user_relation_never_materialises_on_the_shadow() {
             "direct",
             "--bootstrap-shadow-data-dir",
             bootstrap_shadow_data_dir.to_str().unwrap(),
-            "--bootstrap-shadow-replay-timeout",
-            "120",
         ])
         .env("RUST_LOG", "warn,walshadow=info")
         .stdout(Stdio::null())

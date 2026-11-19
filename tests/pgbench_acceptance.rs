@@ -338,8 +338,6 @@ fn run_ddl_intermix(ports: fx::Ports, decoder_pool: usize, inserter_pool: usize,
             "direct",
             "--bootstrap-shadow-data-dir",
             bootstrap_shadow_data_dir.to_str().unwrap(),
-            "--bootstrap-shadow-replay-timeout",
-            "180",
             // N>1 here drives concurrent BoxedAsyncClients for bootstrap +
             // WAL; the end-state parity oracle proves out-of-order
             // INSERTs across connections stay _lsn-correct.

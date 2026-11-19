@@ -158,8 +158,6 @@ async fn direct_bootstrap_all_types_end_to_end() {
             "direct",
             "--bootstrap-shadow-data-dir",
             bootstrap_shadow_data_dir.to_str().unwrap(),
-            "--bootstrap-shadow-replay-timeout",
-            "120",
         ])
         .env("RUST_LOG", "warn,walshadow=info")
         .stdout(Stdio::null())

@@ -4,18 +4,16 @@
 //! ## Why
 //!
 //! Pump awaits `on_wire_chunk` (shadow-wire bytes) then `on_record`
-//! (decoder/xact buffer/emitter) per record. Decoder's
-//! `ShadowCatalog::wait_for_replay` targets bytes the wire already
-//! pushed but clears only once shadow *applies* them: send queue →
-//! walreceiver flush → startup replay → poll. Under DDL-mixed workload
-//! the gate exceeds one record latency; awaited inline it parks the
-//! pump for that whole round-trip and couples wire pacing to decode,
-//! turning any delivery path that needs fresh pump bytes into a
-//! deadlock.
+//! (decoder/xact buffer/emitter) per record. Awaited inline, decode,
+//! xact spill and drain backpressure would pace wire delivery, and so
+//! shadow replay.
 //!
 //! Break the lockstep: `on_record` owns the record `'static`, pushes
 //! onto an mpsc channel, returns. Worker drains through the inner sink
 //! at its own pace while pump keeps streaming bytes so shadow applies.
+//! Catalog-boundary waits stay on the pump:
+//! [`BoundaryHoldSink`](crate::source::boundary_hold::BoundaryHoldSink)
+//! flushes this queue, then parks the pump to withhold successor bytes.
 //!
 //! Worker errors surface back to the pump on the next `on_record` via
 //! a shared error slot, so the daemon exits with the root cause rather
@@ -44,7 +42,7 @@ pub const DEFAULT_QUEUEING_BATCH_SIZE: usize = 512;
 /// at `max_records / batch_size`, so past it the pump's `send` blocks — real
 /// backpressure to the source instead of unbounded RAM growth. Deadlock-safe:
 /// shadow is fed by an independent walsender task (+keepalive), so a parked
-/// pump can't starve `wait_for_replay`.
+/// pump can't starve shadow replay.
 pub const DEFAULT_QUEUEING_RECORD_SINK_CAPACITY: usize = 131_072;
 
 /// Worker `on_idle` cadence. Lets CH emitter's hold-INSERT-open
@@ -347,7 +345,7 @@ impl QueueingRecordSink {
             _ => Records::Ready(batch),
         };
         // Blocking the pump here is deadlock-safe: shadow is fed by an independent
-        // walsender task (+keepalive), so a parked pump can't starve wait_for_replay.
+        // walsender task (+keepalive), so a parked pump can't starve shadow replay.
         let started = Instant::now();
         let sent = tx
             .send(Batch {

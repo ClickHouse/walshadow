@@ -878,7 +878,6 @@ pub(crate) async fn run_bootstrap(
                 .measure(start_owned_shadow(
                     &started.shadow,
                     Some(outcome.end.end_lsn),
-                    Duration::from_secs(args.bootstrap_shadow_replay_timeout),
                     false,
                 ))
                 .await

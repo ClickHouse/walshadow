@@ -26,7 +26,7 @@ use walshadow::oracle::{Oracle, OracleCell, OracleColumnBuf, OracleRequestColumn
 use walshadow::pg::socket_conninfo;
 use walshadow::schema::{NUMERICOID, ReplIdent};
 use walshadow::shadow::{BridgeConf, Shadow, ShadowConfig};
-use walshadow::shadow_catalog::{CatalogError, ParkedAt, ShadowCatalog, ShadowCatalogConfig};
+use walshadow::shadow_catalog::{CatalogError, ParkedAt, ShadowCatalog};
 
 /// Build tree holding `walshadow.so`, fed to shadow as `dynamic_library_path`.
 /// Module is not optional, so an unbuilt tree fails rather than skips
@@ -103,7 +103,7 @@ async fn open_catalog(sh: &Shadow, bridge: Arc<Bridge>) -> ShadowCatalog {
         &sh.config().user,
         &sh.config().dbname,
     );
-    ShadowCatalog::connect(&conninfo, ShadowCatalogConfig::default(), bridge)
+    ShadowCatalog::connect(&conninfo, bridge)
         .await
         .expect("catalog connect")
 }

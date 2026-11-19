@@ -312,8 +312,6 @@ async fn queueing_worker_throughput_under_tiny_transactions() {
             "direct",
             "--bootstrap-shadow-data-dir",
             bootstrap_shadow_data_dir.to_str().unwrap(),
-            "--bootstrap-shadow-replay-timeout",
-            "180",
             "--bridge-lib-dir",
             pgext_dir.to_str().unwrap(),
         ])
