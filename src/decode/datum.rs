@@ -27,6 +27,8 @@ pub enum DatumRef<'a> {
     BadTag(&'a [u8]),
     /// `typoutput` text: fast defaults read over SQL, COPY fields cast to text
     Text(&'a [u8]),
+    /// `typsend` bytes of a COPY field, read back through `typreceive`
+    Send(&'a [u8]),
 }
 
 /// Owned [`DatumRef`] for values outliving their record: TOAST values,
@@ -40,6 +42,7 @@ pub enum Datum {
     Cstring(Vec<u8>),
     BadTag(Vec<u8>),
     Text(Vec<u8>),
+    Send(Vec<u8>),
 }
 
 impl Datum {
@@ -52,6 +55,7 @@ impl Datum {
             Self::Cstring(b) => DatumRef::Cstring(b),
             Self::BadTag(b) => DatumRef::BadTag(b),
             Self::Text(b) => DatumRef::Text(b),
+            Self::Send(b) => DatumRef::Send(b),
         }
     }
 
@@ -61,7 +65,11 @@ impl Datum {
             Self::Null => 0,
             Self::Fixed(b) => b.len(),
             Self::External(_) => std::mem::size_of::<ToastPointer>(),
-            Self::Varlena(b) | Self::Cstring(b) | Self::BadTag(b) | Self::Text(b) => b.len(),
+            Self::Varlena(b)
+            | Self::Cstring(b)
+            | Self::BadTag(b)
+            | Self::Text(b)
+            | Self::Send(b) => b.len(),
         }
     }
 

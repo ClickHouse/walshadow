@@ -1139,7 +1139,7 @@ fn copy_fields_match_heap_views() {
             )),
         ],
     ];
-    let kinds = wire_kinds(&rel);
+    let kinds = wire_kinds(&rel, &foldhash::HashSet::default());
     let mut views = TableEncoder::new(plan(&rel, &targets, &ColumnRules::default())).unwrap();
     let mut copy = TableEncoder::new(plan(&rel, &targets, &ColumnRules::default())).unwrap();
     for (i, row) in rows.iter().enumerate() {

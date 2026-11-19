@@ -687,6 +687,27 @@ mod tests {
         );
     }
 
+    /// `typsend` fields keep their mark across the file, so they still read
+    /// as oracle binary input
+    #[tokio::test]
+    async fn file_records_keep_send_fields() {
+        use crate::backfill::copy_backfill::{WireKind, copy_slot};
+        use crate::decode::datum::DatumRef;
+        let dir = tempdir().unwrap();
+        let mut spool = DeferredSpool::new(dir.path().join("send.bin"), 0);
+        let kinds = [WireKind::Int4, WireKind::Send, WireKind::Send];
+        let fields: [Option<&[u8]>; 3] = [Some(&7i32.to_be_bytes()), Some(b"\x01send"), None];
+        let row = CopyRow::from_send(&kinds, &fields).unwrap();
+        let mut copy = tuple(1, b"");
+        copy.data = TupleData::Copy(row.clone());
+        spool.push(copy).await.unwrap();
+        let out = drain_all(spool).await;
+        assert_eq!(out[0].data, TupleData::Copy(row.clone()));
+        let rel = crate::schema::int4_rel(16400, "t", 'r', &[(1, "id"), (2, "e"), (3, "f")]);
+        assert_eq!(copy_slot(&row, &rel, 1), DatumRef::Send(b"\x01send"));
+        assert_eq!(copy_slot(&row, &rel, 2), DatumRef::Null);
+    }
+
     /// Record with tuple data tag `tag` over `data`'s bytes
     fn retagged(data: TupleData, tag: u8) -> Vec<u8> {
         let mut t = tuple(1, b"");

@@ -1562,25 +1562,28 @@ async fn boot_opt_in_waits_for_its_table() {
 }
 
 /// Types only the oracle converts: binary I/O ones travel as `typsend`
-/// bytes, aclitem (no `typsend`) as text. Each COPY row must read like the
-/// WAL row holding the same values
+/// bytes, aclitem (no `typsend`) and types built on it as text. Each COPY row
+/// must read like the WAL row holding the same values
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn copy_load_matches_wal_for_oracle_types() {
     if !fx::tools::requirements_available() {
         return;
     }
     let values = "'{1,NULL,3}', '{a,\"b c\"}', 'happy', '(7,\"x y\")', 42, \
-                  'k=>v, n=>NULL', 'fat:2 rat:1', '[3,9)', 'postgres=r/postgres'";
-    let nulls = "NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL";
+                  'k=>v, n=>NULL', 'fat:2 rat:1', '[3,9)', 'postgres=r/postgres', \
+                  '{postgres=r/postgres}', '(x,postgres=r/postgres)'";
+    let nulls = "NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL";
     let schema_sql = format!(
         "{INSTALL_SQL}\n\
          CREATE EXTENSION hstore;\n\
          CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy');\n\
          CREATE TYPE pair AS (a int, b text);\n\
          CREATE DOMAIN posint AS int CHECK (VALUE > 0);\n\
+         CREATE TYPE grant_of AS (who text, acl aclitem);\n\
          CREATE SCHEMA app;\n\
          CREATE TABLE app.wide (id bigint PRIMARY KEY, ints int4[], texts text[], m mood, \
-            p pair, d posint, h hstore, tv tsvector, r int8range, acl aclitem);\n\
+            p pair, d posint, h hstore, tv tsvector, r int8range, acl aclitem, \
+            acls aclitem[], g grant_of);\n\
          INSERT INTO app.wide VALUES (1, {values}), (3, {nulls});\n"
     );
     let (ch, got) = copy_load_converges(
@@ -1600,7 +1603,7 @@ async fn copy_load_matches_wal_for_oracle_types() {
     assert_eq!(got, "4", "COPY and WAL rows reach CH");
     let row = |id: u32| {
         ch.query(&format!(
-            "SELECT ints, texts, m, p, d, h, tv, r, acl FROM walshadow_test.app_wide FINAL \
+            "SELECT ints, texts, m, p, d, h, tv, r, acl, acls, g FROM walshadow_test.app_wide FINAL \
              WHERE _is_deleted = 0 AND id = {id}"
         ))
         .expect("ch row")
@@ -1610,7 +1613,8 @@ async fn copy_load_matches_wal_for_oracle_types() {
     assert_eq!(
         copy,
         "[1,NULL,3]\t['a','b c']\thappy\t(7,\"x y\")\t42\t{'k':'v','n':NULL}\t\
-         \\'fat\\':2 \\'rat\\':1\t[3,9)\tpostgres=r/postgres"
+         \\'fat\\':2 \\'rat\\':1\t[3,9)\tpostgres=r/postgres\t['postgres=r/postgres']\t\
+         (x,postgres=r/postgres)"
     );
     assert_eq!(row(3), row(4), "NULL COPY row reads like the NULL WAL row");
 }

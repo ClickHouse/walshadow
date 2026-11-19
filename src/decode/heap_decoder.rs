@@ -788,12 +788,14 @@ pub fn form_block_data(attrs: &[RelAttr], values: &[Option<Datum>]) -> Vec<u8> {
         let (bytes, align) = match v {
             None | Some(Datum::Null) => continue,
             Some(Datum::Fixed(b)) => (b.to_vec(), align_of(b.len())),
-            Some(Datum::Varlena(b) | Datum::BadTag(b) | Datum::Text(b)) if b.len() < 127 => {
+            Some(Datum::Varlena(b) | Datum::BadTag(b) | Datum::Text(b) | Datum::Send(b))
+                if b.len() < 127 =>
+            {
                 let mut v = vec![(((b.len() + 1) << 1) | 1) as u8];
                 v.extend_from_slice(b);
                 (v, 1)
             }
-            Some(Datum::Varlena(b) | Datum::BadTag(b) | Datum::Text(b)) => {
+            Some(Datum::Varlena(b) | Datum::BadTag(b) | Datum::Text(b) | Datum::Send(b)) => {
                 let mut v = (((b.len() + 4) as u32) << 2).to_le_bytes().to_vec();
                 v.extend_from_slice(b);
                 (v, align_of(4).max(4))
@@ -1261,6 +1263,7 @@ pub fn resolve(att: &RelAttr, datum: DatumRef<'_>) -> Option<Datum> {
         DatumRef::Cstring(b) => Datum::Cstring(b.to_vec()),
         DatumRef::BadTag(b) => Datum::BadTag(b.to_vec()),
         DatumRef::Text(b) => Datum::Text(b.to_vec()),
+        DatumRef::Send(b) => Datum::Send(b.to_vec()),
     })
 }
 
@@ -2580,6 +2583,7 @@ mod tests {
             (Datum::Cstring(b"c".to_vec()), 1),
             (Datum::BadTag(b"de".to_vec()), 2),
             (Datum::Text(b"f".to_vec()), 1),
+            (Datum::Send(b"gh".to_vec()), 2),
         ];
         for (d, bytes) in cases {
             assert_eq!(resolve(&att, d.view()).as_ref(), Some(&d));
