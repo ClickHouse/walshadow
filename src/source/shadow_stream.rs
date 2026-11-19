@@ -1743,6 +1743,49 @@ mod tests {
         assert_eq!(source.state.lock().await.aggregate().active_connections, 0);
     }
 
+    /// Bytes queued while a write is stuck on a full socket, by the same dispatch
+    /// that reaches the switchpoint, still go out ahead of the timeline end
+    #[tokio::test(flavor = "current_thread")]
+    async fn timeline_end_flushes_bytes_queued_during_a_write() {
+        use tokio::io::AsyncReadExt;
+        let state = Arc::new(Mutex::new(fresh_state()));
+        let id = {
+            let mut s = state.lock().await;
+            let id = s.register_connection(0x1000, 1, None).unwrap();
+            s.dispatch_wire(0x1000, &[0; 4096]);
+            id
+        };
+        let (mut client, server) = tokio::io::duplex(64);
+        let looped = tokio::spawn({
+            let state = state.clone();
+            async move {
+                let mut conn = WalSenderConn::new(server);
+                run_connection_loop(&mut conn, state, id, Duration::from_secs(3600)).await
+            }
+        });
+        let mut first = [0; 1];
+        client.read_exact(&mut first).await.unwrap();
+        {
+            let mut s = state.lock().await;
+            s.advertise_timeline(2, 0x2004, HISTORY.to_vec());
+            s.dispatch_wire(0x2000, b"AAAABBBB");
+        }
+        let mut rest = Vec::new();
+        client.read_to_end(&mut rest).await.unwrap();
+        let switch = TimelineSwitch {
+            timeline: 1,
+            ends_at: 0x2004,
+            next_timeline: 2,
+        };
+        assert!(matches!(
+            looped.await.unwrap(),
+            Ok(StreamOutcome::TimelineEnded(s)) if s == switch
+        ));
+        let wire = [&first[..], &rest].concat();
+        assert_eq!(frames(&wire), [(0x1000, 4096), (0x2000, 4)]);
+        assert!(wire.ends_with(b"AAAA"));
+    }
+
     #[tokio::test]
     async fn unix_walsender_drops_a_slow_client() {
         use crate::source_feed::{SourceFeed, StandbyStatus};
