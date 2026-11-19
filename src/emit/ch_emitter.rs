@@ -123,6 +123,8 @@ pub fn default_database<'a>(
 pub struct EmitterConfig {
     pub instances: BTreeMap<String, InstanceConfig>,
     pub conn: InstanceConfig,
+    /// Wire compression for every destination, so blocks seal once
+    pub compression: CompressionChoice,
     /// Custom rustls roots/config for `secure` path: private CA, pinned
     /// self-signed cert, or mTLS. `None` uses public webpki roots via
     /// [`clickhouse_c::tls::default_config`]. Not parsed from TOML;
@@ -609,7 +611,7 @@ impl ConnectionConfig for EmitterConfig {
     }
 
     fn compression(&self) -> CompressionChoice {
-        self.conn.compression
+        self.compression
     }
 
     fn idle_reconnect(&self) -> Duration {
@@ -780,8 +782,6 @@ pub struct InstanceConfig {
     /// handshake still names what the certificate was issued for. Empty
     /// uses `host`.
     pub tls_server_name: String,
-    #[serde(deserialize_with = "crate::toml_de::de_parse")]
-    pub compression: CompressionChoice,
 }
 
 impl Default for InstanceConfig {
@@ -795,7 +795,6 @@ impl Default for InstanceConfig {
             password: ch.password,
             secure: ch.secure,
             tls_server_name: ch.tls_server_name,
-            compression: ch.compression,
         }
     }
 }
@@ -1007,8 +1006,8 @@ impl EmitterConfig {
                 password: ch.password,
                 secure: ch.secure,
                 tls_server_name: ch.tls_server_name,
-                compression: ch.compression,
             },
+            compression: ch.compression,
             tls_config: None,
             row_budget: ch.row_budget,
             byte_budget: ch.byte_budget,
@@ -1134,7 +1133,6 @@ impl EmitterConfig {
                     "ch.instances.{name}: host and port must be nonempty"
                 )));
             }
-            instance.compression.build_codec()?;
         }
         out.auto_create_name_all = prefix_all
             .as_deref()
@@ -2777,8 +2775,6 @@ crate::atomic_stats! {
         /// `EndOfStream`), retries included. Against `inserter_pool_size ×
         /// elapsed` this is CH-side utilization
         pub inserter_ch_nanos,
-        /// Inserter time rebuilding the Native block over the batch's slabs
-        pub inserter_encode_nanos,
         /// Resolver time inside the oracle round trip, retries included.
         /// Overlaps the inserters' ClickHouse time, so against
         /// `inserter_ch_nanos` it says which stage is the limiter
@@ -2786,6 +2782,16 @@ crate::atomic_stats! {
         /// Oracle-routed columns the daemon built itself: rendered cells
         /// against a `String` target, which PG would hand straight back
         pub oracle_local_columns,
+        /// Serialized Native block bytes before and after resident
+        /// compression; their ratio is what retained output saves
+        pub resident_raw_bytes,
+        pub resident_stored_bytes,
+        /// Resolver time serializing and compressing sealed blocks
+        pub resident_seal_nanos,
+        /// Gauges: every tail's output pool (queued slabs, sealed blocks,
+        /// seal workspace), open batch slabs
+        pub output_resident_bytes: Arc<std::sync::atomic::AtomicU64>,
+        pub batcher_open_bytes,
     }
 }
 
@@ -4660,7 +4666,7 @@ mod tests {
         assert_eq!(c.conn.password, "secret");
         assert!(c.conn.secure);
         assert_eq!(c.conn.tls_server_name, "svc.clickhouse.cloud");
-        assert_eq!(c.conn.compression, CompressionChoice::Lz4);
+        assert_eq!(c.compression, CompressionChoice::Lz4);
         // Omitting `secure` defaults to plaintext, and SNI falls back to `host`
         let plain = EmitterConfig::from_toml_str("[ch]\nhost = \"h\"\n").unwrap();
         assert!(!plain.conn.secure);

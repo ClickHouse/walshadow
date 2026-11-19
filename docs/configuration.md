@@ -335,10 +335,26 @@ ClickHouse tails bound sealed encoder buffers by startup `[ch] byte_budget`,
 including spare vector capacity. Each batch targets that budget divided by
 inserter count, keeping concurrent inserts within a byte limit. Partial batches
 across tables share another `byte_budget`; a producer waiting to hand off a
-sealed batch can hold one additional batch. A single oversized row may exceed
-these limits. Oracle responses and native client buffers remain additional costs
+sealed batch can hold one additional batch. A batch above `byte_budget` waits
+until no other batch holds budget. Native client buffers remain additional costs
 
 Sealed-buffer permits stay held through resolution, retries and insert completion.
+After resolution each Native block is serialized once, compressed with
+`[ch] compression`, and kept in that form until every destination acknowledges
+its INSERT. Its permit then settles to memory those bytes occupy, which can
+exceed their length. Output beyond what a batch reserved, such as frame overhead
+on incompressible data, is held without waiting. Each resolver also reserves
+workspace on top of `byte_budget` for one block's compressed output and frame
+scratch, plus 64 MiB for oracle request and response when the tail has an
+oracle. Resolver count follows oracle bridge concurrency, or one without an
+oracle. Blocks needing more workspace than that reserve seal one at a time.
+An INSERT carries several blocks, sealed at 1,048,576 rows, 16 MiB of column
+bytes, or once oracle request size fills, while batch limits still bound each
+INSERT. `walshadow_resident_raw_bytes_total` over
+`walshadow_resident_stored_bytes_total` reports how far sealing shrinks held
+blocks. `walshadow_buffer_bytes{buffer="insert_output"}` and
+`walshadow_buffer_bytes{buffer="batcher_open"}` report bytes held by output
+pools and open batches
 This pool is separate from decoded-payload admission to avoid circular waits.
 Live byte-budget reductions lower flush thresholds; increasing sealed-buffer
 capacity requires restarting walshadow
@@ -471,7 +487,8 @@ and `blocked_out` (waiting to hand work downstream or for its memory budget). Fo
 `busy` is near 1 s/s is the bottleneck. `batcher` is summed over every running
 tail: one live, more during a bootstrap or backfill. Time is credited when a
 span ends, so a stall longer than the scrape interval reads 0 and then one
-burst. The oracle resolver pool between batcher and inserter has no row:
+burst. The resolver pool between batcher and inserter, which calls the oracle
+and compresses blocks, has no row:
 `batcher` `blocked_out` with idle inserters points at it. `inserter` busy includes
 the ClickHouse round trip, failed attempts included. `backup_tap` and
 `backup_walk` run once per backup part in parallel, and `backup_tap` busy

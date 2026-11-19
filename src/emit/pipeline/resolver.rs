@@ -12,25 +12,55 @@
 //!
 //! A batch with no oracle column crosses unchanged, without touching the
 //! bridge.
+//!
+//! ## Output pool
+//!
+//! Each tail owns one pool, separate from the global admission pool its
+//! batches already hold. Batcher admits slab bytes per batch; permit rides
+//! batch through sealing until insert ack. Resolvers draw seal workspace
+//! from leaf reserve, which queued batches never hold, so sealing finishes
+//! however full the queue is. Order per block: take workspace, resolve,
+//! seal, drop slabs and workspace. Output past admitted slab bytes, such as
+//! frame overhead on incompressible data, settles as unmetered overshoot
+//! instead of waiting. Blocks whose workspace exceeds reserve seal one at a
+//! time. Inserters take nothing from pool, so acks always release it
 
+use std::collections::hash_map::Entry;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use backon::Retryable;
-use clickhouse_c::Allocator;
+use clickhouse_c::{Allocator, BlockBuilder, ColumnBuilder, TypeAst};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
-use crate::ch::EmitterError;
+use crate::budget::MemoryBudget;
+use crate::ch::{CompressionChoice, EmitterError};
 use crate::config::ResolvedConfig;
-use crate::emit::ch_emitter::{ColumnBuf, EmitterStats, RetryConfig, literal_column};
+use crate::emit::ch_emitter::{
+    ColumnBuf, EmitterStats, RetryConfig, build_leaf, build_root, literal_column,
+};
 use crate::emit::pipeline::Fatal;
-use crate::emit::pipeline::batcher::InsertBatch;
-use crate::ops::oracle::{Oracle, OracleBlock, OracleError, OracleRequestColumn};
+use crate::emit::pipeline::batcher::{BatchMeta, BlockSlabs, InsertBatch, NATIVE_BLOCK_BYTES};
+use crate::emit::pipeline::sealed::SealedBlock;
+use crate::ops::oracle::{
+    ORACLE_BATCH_SEAL_BYTES, Oracle, OracleBlock, OracleError, OracleRequestColumn,
+};
+use crate::schema::TableKey;
+use foldhash::HashMap;
 
+/// Resolved INSERT: every block serialized and compressed, slabs and
+/// oracle output released
 pub(crate) struct ResolvedBatch {
-    pub batch: InsertBatch,
-    pub resolved: Option<OracleBlock>,
+    pub meta: Arc<BatchMeta>,
+    pub blocks: Vec<SealedBlock>,
+    /// Compression every block was sealed in
+    pub compression: CompressionChoice,
+    pub n_rows: usize,
+    pub per_seq: Vec<(u64, u64)>,
+    /// Admission permit shares covering these rows, dropped post-insert-ack
+    _permits: Vec<Arc<crate::budget::MemoryPermit>>,
+    _encoded: crate::budget::MemoryPermit,
 }
 
 /// `None` oracle resolves nothing, which a pipeline with no oracle column
@@ -41,9 +71,48 @@ pub(crate) struct ResolverOptions {
     pub oracle: Option<Arc<Oracle>>,
     /// Boot budget for oracle transport retries, re-read from `config_rx`
     pub retry: RetryConfig,
+    /// Boot compression of prepared blocks, re-read from `config_rx`
+    pub codec: CompressionChoice,
     pub stats: Arc<EmitterStats>,
     pub fatal: Fatal,
     pub config_rx: Option<watch::Receiver<Arc<ResolvedConfig>>>,
+    /// Tail's output pool, see [`output_pool`]
+    pub budget: MemoryBudget,
+}
+
+/// clickhouse-c frame stage plus one compressed frame,
+/// `CHC_COMPRESS_MAX_CHUNK` in `clickhouse-compression.h`
+const SEAL_SCRATCH: usize = 160 << 10;
+
+/// Pool admitting `queued` bytes of batches, plus seal workspace for each
+/// of `resolvers`: largest block's output, and with `oracle` its request
+/// copy and decoded response
+pub(crate) fn output_pool(
+    queued: usize,
+    resolvers: usize,
+    oracle: bool,
+    gauge: Arc<std::sync::atomic::AtomicU64>,
+) -> MemoryBudget {
+    let oracle = if oracle {
+        2 * ORACLE_BATCH_SEAL_BYTES
+    } else {
+        0
+    };
+    let reserve = resolvers.max(1) * (SEAL_SCRATCH + NATIVE_BLOCK_BYTES + oracle);
+    MemoryBudget::gauged(queued.max(1) + reserve, reserve, gauge)
+}
+
+/// Bytes sealing `block` holds beside its slabs: compressed output before
+/// slabs drop, frame scratch, oracle request and response
+fn workspace_bytes(block: &BlockSlabs) -> usize {
+    let slabs: usize = block.buffers.iter().map(ColumnBuf::allocated_bytes).sum();
+    let oracle: usize = block
+        .buffers
+        .iter()
+        .filter(|b| matches!(b, ColumnBuf::Oracle(_)))
+        .map(ColumnBuf::allocated_bytes)
+        .sum();
+    slabs + slabs / 128 + SEAL_SCRATCH + 2 * oracle
 }
 
 /// Spawn `n` resolvers over the shared batch queue. Drops the sender it was
@@ -59,48 +128,185 @@ pub(crate) fn spawn_pool(
         .collect()
 }
 
+/// Per-task resolver state: parsed column types and compression codec
+pub(crate) struct Sealer {
+    alloc: Allocator,
+    compression: CompressionChoice,
+    codec: Option<std::pin::Pin<Box<clickhouse_c::Codec>>>,
+    /// Parsed column types per table, refreshed when a batch's
+    /// `schema_epoch` changes. `TypeAst` is `Send` but not `Sync`, so each
+    /// task parses its own
+    asts: HashMap<TableKey, (u64, Vec<TypeAst>)>,
+}
+
+impl Sealer {
+    pub(crate) fn new(compression: CompressionChoice) -> Result<Self, EmitterError> {
+        Ok(Self {
+            alloc: Allocator::global(&mimalloc::MiMalloc),
+            compression,
+            codec: compression.build_codec()?,
+            asts: HashMap::default(),
+        })
+    }
+
+    /// Config resolution rejects a codec this build cannot construct
+    fn set_compression(&mut self, compression: CompressionChoice) {
+        if compression != self.compression {
+            self.codec = compression.build_codec().expect("config validated codec");
+            self.compression = compression;
+        }
+    }
+
+    /// Serialize and compress one block over its slabs and oracle answer
+    pub(crate) fn seal(
+        &mut self,
+        meta: &BatchMeta,
+        block: &BlockSlabs,
+        resolved: Option<&OracleBlock>,
+    ) -> Result<SealedBlock, EmitterError> {
+        let asts = match self.asts.entry(meta.table_key.clone()) {
+            Entry::Occupied(e) if e.get().0 == meta.schema_epoch => e.into_mut(),
+            e => {
+                let parsed = meta
+                    .columns
+                    .iter()
+                    .map(|c| TypeAst::parse(&c.type_repr, self.alloc))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let fresh = (meta.schema_epoch, parsed);
+                match e {
+                    Entry::Occupied(mut e) => {
+                        e.insert(fresh);
+                        e.into_mut()
+                    }
+                    Entry::Vacant(e) => e.insert(fresh),
+                }
+            }
+        };
+        let n_rows = block.n_rows;
+        let leaves: Vec<Option<ColumnBuilder<'_>>> = block
+            .buffers
+            .iter()
+            .map(|buf| build_leaf(buf, n_rows))
+            .collect::<Result<_, _>>()?;
+        let roots: Vec<Option<ColumnBuilder<'_>>> = block
+            .buffers
+            .iter()
+            .zip(&leaves)
+            .map(|(buf, leaf)| build_root(buf, leaf.as_ref(), n_rows))
+            .collect::<Result<_, _>>()?;
+        let mut bb = BlockBuilder::new();
+        for (i, col) in meta.columns.iter().enumerate() {
+            match &roots[i] {
+                Some(node) => bb.append(&col.name, asts.1[i].view(), node)?,
+                None => {
+                    let decoded = resolved.and_then(|r| r.column(i as u32)).ok_or_else(|| {
+                        EmitterError::Type(format!("oracle answered no column for {}", col.name))
+                    })?;
+                    bb.append_column(&col.name, asts.1[i].view(), decoded)?;
+                }
+            }
+        }
+        SealedBlock::seal(
+            &bb,
+            self.compression,
+            self.codec.as_ref().map(|c| c.as_ref()),
+            self.alloc,
+        )
+    }
+}
+
 async fn run(
     rx: async_channel::Receiver<InsertBatch>,
     tx: async_channel::Sender<ResolvedBatch>,
     opts: ResolverOptions,
 ) {
-    let ResolverOptions {
-        oracle,
-        mut retry,
-        stats,
-        fatal,
-        config_rx,
-    } = opts;
-    let alloc = Allocator::global(&mimalloc::MiMalloc);
-    while let Ok(mut batch) = rx.recv().await {
-        if let Some(rx) = config_rx.as_ref() {
-            retry.max_attempts = rx.borrow().retry_max_attempts;
-        }
-        resolve_local_columns(&mut batch, &stats);
-        let started = std::time::Instant::now();
-        let resolved = match resolve_oracle_with_retry(&oracle, alloc, &batch, &retry, &stats).await
-        {
-            Ok(v) => v,
-            Err(e) => {
-                // Seq stays unacknowledged, so a restart replays it
-                fatal.set(format!("oracle resolve: {e}"));
-                return;
-            }
-        };
-        stats
-            .oracle_resolve_nanos
-            .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
-        if tx.send(ResolvedBatch { batch, resolved }).await.is_err() {
-            return;
-        }
+    let fatal = opts.fatal.clone();
+    if let Err(e) = resolve_batches(rx, tx, opts).await {
+        fatal.set(e);
     }
 }
 
-fn resolve_local_columns(batch: &mut InsertBatch, stats: &EmitterStats) {
+/// Resolve and seal until either channel closes; Err is fatal. A failed
+/// seq stays unacknowledged, so a restart replays it
+async fn resolve_batches(
+    rx: async_channel::Receiver<InsertBatch>,
+    tx: async_channel::Sender<ResolvedBatch>,
+    opts: ResolverOptions,
+) -> Result<(), String> {
+    let ResolverOptions {
+        oracle,
+        mut retry,
+        codec,
+        stats,
+        config_rx,
+        budget,
+        ..
+    } = opts;
+    let alloc = Allocator::global(&mimalloc::MiMalloc);
+    let mut sealer = Sealer::new(codec).map_err(|e| format!("seal codec: {e}"))?;
+    while let Ok(batch) = rx.recv().await {
+        if let Some(rx) = config_rx.as_ref() {
+            let rc = rx.borrow().clone();
+            retry.max_attempts = rc.retry_max_attempts;
+            sealer.set_compression(rc.compression);
+        }
+        let InsertBatch {
+            meta,
+            blocks,
+            n_rows,
+            per_seq,
+            permits,
+            mut encoded,
+        } = batch;
+        let mut sealed = Vec::with_capacity(blocks.len());
+        for mut block in blocks {
+            resolve_local_columns(&mut block, &stats);
+            let _workspace = budget.acquire(workspace_bytes(&block)).await;
+            let started = std::time::Instant::now();
+            let resolved = resolve_oracle_with_retry(&oracle, alloc, &meta, &block, &retry, &stats)
+                .await
+                .map_err(|e| format!("oracle resolve: {e}"))?;
+            stats
+                .oracle_resolve_nanos
+                .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            let started = std::time::Instant::now();
+            let b = sealer
+                .seal(&meta, &block, resolved.as_ref())
+                .map_err(|e| format!("seal block: {e}"))?;
+            stats
+                .resident_raw_bytes
+                .fetch_add(b.raw_len() as u64, Ordering::Relaxed);
+            stats
+                .resident_stored_bytes
+                .fetch_add(b.allocated_bytes() as u64, Ordering::Relaxed);
+            sealed.push(b);
+            stats
+                .resident_seal_nanos
+                .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
+        // Slabs and oracle output already dropped
+        encoded.settle(sealed.iter().map(|b| b.allocated_bytes() as u64).sum());
+        let ready = ResolvedBatch {
+            meta,
+            blocks: sealed,
+            compression: sealer.compression,
+            n_rows,
+            per_seq,
+            _permits: permits,
+            _encoded: encoded,
+        };
+        if tx.send(ready).await.is_err() {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn resolve_local_columns(block: &mut BlockSlabs, stats: &EmitterStats) {
     let mut n = 0;
-    for buf in &mut batch.buffers {
+    for buf in &mut block.buffers {
         if let ColumnBuf::Oracle(o) = buf
-            && let Some(local) = literal_column(o, batch.n_rows)
+            && let Some(local) = literal_column(o, block.n_rows)
         {
             *buf = local;
             n += 1;
@@ -115,11 +321,12 @@ fn resolve_local_columns(batch: &mut InsertBatch, stats: &EmitterStats) {
 async fn resolve_oracle_with_retry(
     oracle: &Option<Arc<Oracle>>,
     alloc: Allocator,
-    batch: &InsertBatch,
+    meta: &BatchMeta,
+    block: &BlockSlabs,
     retry: &RetryConfig,
     stats: &EmitterStats,
 ) -> Result<Option<OracleBlock>, EmitterError> {
-    (|| resolve_oracle(oracle, alloc, batch))
+    (|| resolve_oracle(oracle, alloc, meta, block))
         .retry(retry.backoff())
         .when(OracleError::retryable)
         .notify(|_, _| {
@@ -132,17 +339,18 @@ async fn resolve_oracle_with_retry(
 async fn resolve_oracle(
     oracle: &Option<Arc<Oracle>>,
     alloc: Allocator,
-    batch: &InsertBatch,
+    meta: &BatchMeta,
+    block: &BlockSlabs,
 ) -> Result<Option<OracleBlock>, OracleError> {
-    let columns: Vec<OracleRequestColumn<'_>> = batch
+    let columns: Vec<OracleRequestColumn<'_>> = block
         .buffers
         .iter()
         .enumerate()
         .filter_map(|(i, buf)| match buf {
             ColumnBuf::Oracle(o) => Some(OracleRequestColumn {
                 ordinal: i as u32,
-                name: &batch.meta.columns[i].name,
-                target_type: &batch.meta.columns[i].type_repr,
+                name: &meta.columns[i].name,
+                target_type: &meta.columns[i].type_repr,
                 buf: o,
             }),
             _ => None,
@@ -154,11 +362,11 @@ async fn resolve_oracle(
     let oracle = oracle.as_ref().ok_or_else(|| {
         OracleError::Absent(format!(
             "{} needs the shadow oracle, which this pipeline has none of",
-            batch.meta.table_key
+            meta.table_key
         ))
     })?;
     oracle
-        .encode_batch(batch.meta.table_key.db_oid, &columns, batch.n_rows, alloc)
+        .encode_batch(meta.table_key.db_oid, &columns, block.n_rows, alloc)
         .await
         .map(Some)
 }
@@ -274,7 +482,7 @@ pub(crate) mod tests {
                 inserters: 1,
                 flush_timeout: Duration::from_secs(3600),
             },
-            Allocator::global(&mimalloc::MiMalloc),
+            crate::budget::MemoryBudget::new(1 << 30),
             fatal.clone(),
             Arc::new(EmitterStats::default()),
             None,
@@ -314,20 +522,20 @@ pub(crate) mod tests {
         ])
         .await;
         assert!(
-            matches!(batch.buffers[0], ColumnBuf::Oracle(_)),
+            matches!(batch.blocks[0].buffers[0], ColumnBuf::Oracle(_)),
             "premise: an uncovered source type routes to the oracle",
         );
 
         let alloc = Allocator::global(&mimalloc::MiMalloc);
         assert!(matches!(
-            resolve_oracle(&None, alloc, &batch).await,
+            resolve_oracle(&None, alloc, &batch.meta, &batch.blocks[0]).await,
             Err(OracleError::Absent(_)),
         ));
         let stats = EmitterStats::default();
-        resolve_local_columns(&mut batch, &stats);
+        resolve_local_columns(&mut batch.blocks[0], &stats);
         assert_eq!(stats.oracle_local_columns.load(Ordering::Relaxed), 1);
         assert_eq!(
-            batch.buffers[0].wire(),
+            batch.blocks[0].buffers[0].wire(),
             Wire::NullableString {
                 offsets: &[10, 10, 10, 20],
                 data: b"POINT(1 2)POINT(3 4)",
@@ -337,12 +545,12 @@ pub(crate) mod tests {
         );
 
         assert!(
-            resolve_oracle(&None, alloc, &batch)
+            resolve_oracle(&None, alloc, &batch.meta, &batch.blocks[0])
                 .await
                 .expect("no request to make")
                 .is_none(),
         );
-        resolve_local_columns(&mut batch, &stats);
+        resolve_local_columns(&mut batch.blocks[0], &stats);
         assert_eq!(stats.oracle_local_columns.load(Ordering::Relaxed), 1);
     }
 
@@ -360,11 +568,17 @@ pub(crate) mod tests {
         let mut batch = seal(rows).await;
 
         let stats = EmitterStats::default();
-        resolve_local_columns(&mut batch, &stats);
-        assert!(matches!(batch.buffers[0], ColumnBuf::Oracle(_)));
+        resolve_local_columns(&mut batch.blocks[0], &stats);
+        assert!(matches!(batch.blocks[0].buffers[0], ColumnBuf::Oracle(_)));
         assert_eq!(stats.oracle_local_columns.load(Ordering::Relaxed), 0);
         assert!(matches!(
-            resolve_oracle(&None, Allocator::global(&mimalloc::MiMalloc), &batch).await,
+            resolve_oracle(
+                &None,
+                Allocator::global(&mimalloc::MiMalloc),
+                &batch.meta,
+                &batch.blocks[0],
+            )
+            .await,
             Err(OracleError::Absent(_)),
         ));
     }
@@ -391,9 +605,11 @@ pub(crate) mod tests {
         let opts = ResolverOptions {
             oracle,
             retry,
+            codec: CompressionChoice::None,
             stats,
             fatal: fatal.clone(),
             config_rx: None,
+            budget: MemoryBudget::new(1 << 30),
         };
         let (in_tx, in_rx) = async_channel::bounded(1);
         let (out_tx, out_rx) = async_channel::bounded(1);
@@ -454,5 +670,165 @@ pub(crate) mod tests {
         let msg = fatal.message().expect("dead bridge trips fatal");
         assert!(msg.starts_with("oracle resolve: "), "{msg}");
         assert_eq!(stats.retries_attempted.load(Ordering::Relaxed), 1);
+    }
+
+    /// Queued batches holding all admitted bytes leave sealing its
+    /// workspace, so a stalled inserter cannot block its own queue
+    #[tokio::test]
+    async fn sealing_finishes_while_queued_output_fills_admission() {
+        let gauge = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let budget = output_pool(4 << 10, 1, false, gauge.clone());
+        let queued = budget.admit(budget.admission_max()).await;
+        let batch = seal(vec![wkt_row(0, Some("POINT(1 2)"))]).await;
+        let (batch_tx, batch_rx) = async_channel::bounded(1);
+        let (resolved_tx, resolved_rx) = async_channel::bounded(1);
+        let fatal = Fatal::new();
+        let task = tokio::spawn(run(
+            batch_rx,
+            resolved_tx,
+            ResolverOptions {
+                oracle: None,
+                retry: RetryConfig::default(),
+                codec: CompressionChoice::Lz4,
+                stats: Arc::default(),
+                fatal: fatal.clone(),
+                config_rx: None,
+                budget: budget.clone(),
+            },
+        ));
+        batch_tx.send(batch).await.unwrap();
+        let resolved = tokio::time::timeout(Duration::from_secs(5), resolved_rx.recv())
+            .await
+            .expect("sealed under full admission")
+            .unwrap();
+        assert_eq!(resolved.blocks.len(), 1);
+        assert!(budget.peak_bytes() > queued.bytes(), "workspace taken");
+        assert_eq!(
+            budget.resident_bytes(),
+            queued.bytes(),
+            "workspace returned"
+        );
+        drop(batch_tx);
+        task.await.unwrap();
+        assert!(fatal.message().is_none());
+        drop(queued);
+        assert_eq!(gauge.load(Ordering::Relaxed), 0);
+    }
+
+    /// Republished compression seals later batches in it, and the batch
+    /// names it so inserters dial to match
+    #[tokio::test]
+    async fn live_compression_reseals_later_batches() {
+        let (cfg_tx, config_rx) = watch::channel(Arc::new(ResolvedConfig {
+            compression: CompressionChoice::Lz4,
+            ..ResolvedConfig::default()
+        }));
+        let (batch_tx, batch_rx) = async_channel::bounded(1);
+        let (resolved_tx, resolved_rx) = async_channel::bounded(1);
+        let fatal = Fatal::new();
+        let task = tokio::spawn(run(
+            batch_rx,
+            resolved_tx,
+            ResolverOptions {
+                oracle: None,
+                retry: RetryConfig::default(),
+                codec: CompressionChoice::None,
+                stats: Arc::default(),
+                fatal: fatal.clone(),
+                config_rx: Some(config_rx),
+                budget: MemoryBudget::new(1 << 30),
+            },
+        ));
+        for _ in 0..2 {
+            batch_tx
+                .send(seal(vec![wkt_row(0, Some("POINT(1 2)"))]).await)
+                .await
+                .unwrap();
+        }
+        for _ in 0..2 {
+            let resolved = resolved_rx.recv().await.unwrap();
+            assert_eq!(resolved.compression, CompressionChoice::Lz4);
+        }
+        drop((batch_tx, cfg_tx));
+        task.await.unwrap();
+        assert!(fatal.message().is_none());
+    }
+
+    #[tokio::test]
+    async fn short_slab_fails_seal() {
+        let mut sealer = Sealer::new(CompressionChoice::None).unwrap();
+        let mut batch = seal(vec![wkt_row(0, Some("POINT(1 2)"))]).await;
+        let block = &mut batch.blocks[0];
+        block.buffers[0] = ColumnBuf::NullableFixed {
+            width: 4,
+            null_map: vec![0],
+            inner: Vec::new(),
+        };
+        let leaf = sealer
+            .seal(&batch.meta, block, None)
+            .err()
+            .expect("short nullable slab fails");
+        let mut batch = seal(vec![wkt_row(0, Some("POINT(1 2)"))]).await;
+        let block = &mut batch.blocks[0];
+        let fixed = block
+            .buffers
+            .iter_mut()
+            .find(|b| matches!(b, ColumnBuf::Fixed { width: 8, .. }))
+            .unwrap();
+        *fixed = ColumnBuf::Fixed {
+            width: 8,
+            bytes: Vec::new(),
+        };
+        let root = sealer
+            .seal(&batch.meta, block, None)
+            .err()
+            .expect("short fixed slab fails");
+        for e in [leaf, root] {
+            assert!(e.to_string().contains("fixed data"), "{e}");
+        }
+    }
+
+    /// Block shape faults fail sealing
+    #[tokio::test]
+    async fn unanswered_oracle_column_and_bad_type_fail_seal() {
+        let mut sealer = Sealer::new(CompressionChoice::None).unwrap();
+        let mut raw = wkt_row(0, None);
+        raw.committed.decoded.new.as_mut().unwrap().columns[0] = Some(ColumnValue::Unsupported {
+            type_oid: GEOM_OID,
+            raw: vec![1],
+        });
+        let batch = seal(vec![raw]).await;
+        let e = sealer
+            .seal(&batch.meta, &batch.blocks[0], None)
+            .err()
+            .expect("unanswered oracle column fails");
+        assert!(e.to_string().contains("oracle answered no column"), "{e}");
+
+        let mut batch = seal(vec![wkt_row(0, Some("POINT(1 2)"))]).await;
+        let mut columns = batch.meta.columns.clone();
+        columns[0].type_repr = "Nope(((".into();
+        batch.meta = Arc::new(BatchMeta {
+            table_key: batch.meta.table_key.clone(),
+            inserts: batch.meta.inserts.clone(),
+            columns,
+            schema_epoch: batch.meta.schema_epoch + 1,
+            rows_inserted: Arc::default(),
+        });
+        assert!(sealer.seal(&batch.meta, &batch.blocks[0], None).is_err());
+        let mut fresh = seal(vec![wkt_row(0, Some("POINT(1 2)"))]).await;
+        fresh.meta = Arc::new(BatchMeta {
+            table_key: fresh.meta.table_key.clone(),
+            inserts: fresh.meta.inserts.clone(),
+            columns: fresh.meta.columns.clone(),
+            schema_epoch: batch.meta.schema_epoch + 1,
+            rows_inserted: Arc::default(),
+        });
+        resolve_local_columns(&mut fresh.blocks[0], &EmitterStats::default());
+        sealer
+            .seal(&fresh.meta, &fresh.blocks[0], None)
+            .expect("next epoch reparses its types");
+        let fatal = run_one(batch, true).await;
+        let msg = fatal.message().expect("bad type trips fatal");
+        assert!(msg.starts_with("seal block: "), "{msg}");
     }
 }

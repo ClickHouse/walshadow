@@ -107,6 +107,8 @@ label_class! {
 label_class! {
     pub enum Buffer {
         WalsenderSendQueue => "walsender_send_queue",
+        InsertOutput => "insert_output",
+        BatcherOpen => "batcher_open",
     }
 }
 
@@ -562,8 +564,12 @@ snapshot! {
         "InsertBatches an inserter finished draining to ClickHouse. insertbatch_batches_out - inserter_batches_in is the live backlog; their rates show inserter-pool saturation.",
     counter inserter_ch_seconds_total: f64 =
         "Cumulative inserter time inside the ClickHouse INSERT round trip. Against inserter_pool_size x uptime this is CH-side utilization.",
-    counter inserter_encode_seconds_total: f64 =
-        "Cumulative inserter time rebuilding the Native block over a batch's owned slabs.",
+    counter resident_seal_seconds_total: f64 =
+        "Cumulative resolver time serializing and compressing sealed Native blocks.",
+    counter resident_raw_bytes_total: u64 =
+        "Serialized Native block bytes sealed for insertion, before resident compression.",
+    counter resident_stored_bytes_total: u64 =
+        "Bytes allocated for those sealed blocks while awaiting insertion, including growth slack.",
     counter oracle_resolve_seconds_total: f64 =
         "Cumulative resolver time inside the oracle round trip. Overlaps inserter_ch_seconds_total, so the larger of the two is the tail's limiter.",
     counter process_cpu_seconds_total: f64 =
@@ -1240,7 +1246,7 @@ fn encode_snapshot(snap: &MetricsSnapshot, enc: &mut DescriptorEncoder<'_>) -> f
     gauge_series(
         enc,
         "walshadow_buffer_bytes",
-        "Data held right now, by buffer. walsender_send_queue is the largest unsent walsender queue across connections with the reconnect backfill left out, read against the slow-client cap.",
+        "Data held right now, by buffer. walsender_send_queue is the largest unsent walsender queue across connections with the reconnect backfill left out, read against the slow-client cap. insert_output is every insert tail's output pool: queued column slabs, sealed blocks awaiting acknowledgement, and seal workspace. batcher_open is allocated column slab bytes in batches still open for more rows.",
         "buffer",
         buffers,
     )?;
@@ -2011,7 +2017,7 @@ mod tests {
             shadow_stream_active_connections: 2,
             shadow_stream_sockets_by_event: [9, 5, 3, 1],
             wal_bytes: [4096],
-            buffer_bytes: [777],
+            buffer_bytes: [777, 5, 6],
             ..MetricsSnapshot::default()
         };
         let body = render(snap);
@@ -2037,6 +2043,8 @@ mod tests {
         assert!(body.contains("walshadow_wal_bytes_total{flow=\"walsender_backfill\"} 4096"));
         assert!(body.contains("# TYPE walshadow_buffer_bytes gauge"));
         assert!(body.contains("walshadow_buffer_bytes{buffer=\"walsender_send_queue\"} 777"));
+        assert!(body.contains("walshadow_buffer_bytes{buffer=\"insert_output\"} 5"));
+        assert!(body.contains("walshadow_buffer_bytes{buffer=\"batcher_open\"} 6"));
     }
 
     /// Unknown rate stays infinite on the wire. prometheus-client spells it

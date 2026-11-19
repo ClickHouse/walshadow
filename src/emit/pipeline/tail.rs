@@ -13,7 +13,6 @@
 
 use std::sync::Arc;
 
-use clickhouse_c::Allocator;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::task::AbortOnDropHandle;
 
@@ -254,8 +253,8 @@ pub fn spawn_null(
 }
 
 /// [`spawn`] plus a live config receiver: the batcher re-reads
-/// budgets/flush and the inserter pool re-reads compression/retry from it on
-/// each republish. `None` == boot values only (bootstrap + tests use [`spawn`]).
+/// budgets/flush, resolvers compression/retry, and inserters retry from it
+/// on each republish. `None` == boot values only (bootstrap + tests use [`spawn`]).
 pub async fn spawn_with_config(
     dest: Arc<DestEmitter>,
     inserter_pool_size: usize,
@@ -290,16 +289,25 @@ pub async fn spawn_with_config(
 
     // As wide as the bridge: a narrower pool leaves shadow workers idle, a
     // wider one only queues on their sockets
+    let width = oracle.as_ref().map_or(1, |o| o.concurrency());
+    let budget = resolver::output_pool(
+        emitter.byte_budget,
+        width,
+        oracle.is_some(),
+        stats.output_resident_bytes.clone(),
+    );
     let resolvers = resolver::spawn_pool(
-        oracle.as_ref().map_or(1, |o| o.concurrency()),
+        width,
         batches_rx,
         resolved_tx,
         resolver::ResolverOptions {
             oracle,
             retry: emitter.retry.clone(),
+            codec: emitter.compression,
             stats: stats.clone(),
             fatal: fatal.clone(),
             config_rx: config_rx.clone(),
+            budget: budget.clone(),
         },
     );
 
@@ -312,7 +320,7 @@ pub async fn spawn_with_config(
             inserters: n,
             flush_timeout: emitter.flush_timeout,
         },
-        Allocator::global(&mimalloc::MiMalloc),
+        budget,
         fatal,
         stats.clone(),
         config_rx,
