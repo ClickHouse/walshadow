@@ -29,8 +29,9 @@
 //!   reconstruction path exists and PG only elides below
 //!   `wal_level=logical`, so a routed partial fails the plan
 //! - needed toast values resolve deterministically → detoast at planning
-//! - mapped output columns have deterministic codecs → plan-time codec
-//!   policy layers onto this stage (deterministic-codec phase)
+//! - mapped output columns encode → not checked here: memory-resident plans
+//!   carry records to dispatch, where an encode job runs the codec and a
+//!   failure is pipeline fatal; spilled plans encode at planning
 //! - route snapshot complete → `RouteSnapshot::freeze` populates every
 //!   field by construction; `None` is the counted unmapped discard, which
 //!   skips detoast and codec validation entirely
@@ -39,16 +40,19 @@
 
 use std::sync::Arc;
 
-use crate::decode::heap_decoder::DescribedHeap;
+use crate::decode::datum::Datum;
+use crate::decode::heap_decoder::{HeapImages, TupleView, view_heap_record};
 use crate::emit::pipeline::plan_spool::{
-    DEFAULT_PLAN_MEM_MAX, PlanPath, PlanSpoolError, PlanWriter, SealedPlan,
+    DEFAULT_PLAN_MEM_MAX, EncoderCache, PlanPath, PlanSpoolError, PlanWriter, SealedPlan,
+    ViewChange,
 };
 use crate::emit::route::RouteSnapshot;
 use crate::schema::RelDescriptor;
 use crate::toast::{ChunkRefMap, ToastResolver};
+use crate::xact::spill::{BodySpoolFile, DescribedInput};
 use crate::xact::xact_buffer::{
-    DrainEntry, DrainWalk, DrainedBatch, FailClosedReason, WalkStep, XactBufferError, detoast_heap,
-    heap_reads_toast,
+    DrainEntry, DrainWalk, DrainedBatch, FailClosedReason, WalkStep, XactBufferError,
+    detoast_sites, external_sites,
 };
 
 /// Planner's window onto route state. Implementations resolve from frozen
@@ -58,7 +62,7 @@ use crate::xact::xact_buffer::{
 /// discard. A plan asks once per descriptor version between control
 /// entries, and reports what it discarded through `unmapped` once sealed
 pub trait PlanRouteView {
-    fn route_for(&mut self, heap: &DescribedHeap) -> Option<Arc<RouteSnapshot>>;
+    fn route_for(&mut self, rel: &Arc<RelDescriptor>) -> Option<Arc<RouteSnapshot>>;
     /// `heaps` rows of `rel` a sealed plan discards as unmapped
     fn unmapped(&mut self, rel: &RelDescriptor, heaps: u64);
     /// Fold control entry into local view without mutating shared route state
@@ -66,6 +70,12 @@ pub trait PlanRouteView {
         &mut self,
         entry: &DrainEntry,
     ) -> impl std::future::Future<Output = Result<(), String>> + Send;
+    /// Encoders an earlier plan compiled against routes this view still
+    /// answers with
+    fn take_encoders(&mut self) -> EncoderCache {
+        EncoderCache::default()
+    }
+    fn keep_encoders(&mut self, _encoders: EncoderCache) {}
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -86,6 +96,7 @@ impl PlanError {
     /// `reason=` label for `xact_plan_failures_total`
     pub fn reason(&self) -> &'static str {
         match self {
+            Self::Spool(PlanSpoolError::Encode(_)) => "encode",
             Self::Spool(_) => "spool",
             Self::Detoast(e) => drain_reason(e),
             Self::PartialUpdate { .. } => "partial_update",
@@ -128,14 +139,21 @@ pub struct Planner<'a, V> {
 }
 
 impl<'a, V: PlanRouteView> Planner<'a, V> {
+    /// `segment` bounds rows and bytes dispatched as one seq
     pub fn create(
         path: impl Into<PlanPath>,
         disk_cap: u64,
+        segment: (usize, usize),
+        commit_ts: i64,
         view: &'a mut V,
         resolver: &'a ToastResolver,
     ) -> Self {
         Self {
-            writer: PlanWriter::create(path, disk_cap, DEFAULT_PLAN_MEM_MAX),
+            writer: PlanWriter::create(path, disk_cap, DEFAULT_PLAN_MEM_MAX)
+                .deferring()
+                .with_segment_limits(segment.0, segment.1)
+                .for_commit(commit_ts)
+                .with_encoders(view.take_encoders()),
             view,
             resolver,
             rows_base: 0,
@@ -171,32 +189,29 @@ impl<'a, V: PlanRouteView> Planner<'a, V> {
                     Box::pin(self.view.apply(&e))
                         .await
                         .map_err(PlanError::View)?;
-                    self.writer.push_control(e, self.rows_base + cursor);
+                    self.writer.push_control(e, self.rows_base + cursor)?;
                 }
-                WalkStep::Truncate { heap, upto } => {
+                WalkStep::Truncate { truncate, upto } => {
                     self.resolver.clear_reads();
-                    let table = self.writer.table(&heap, || self.view.route_for(&heap));
+                    let rel = &truncate.descriptor;
+                    let table = self.writer.table(rel, truncate.descriptor_valid_from, || {
+                        self.view.route_for(rel)
+                    });
                     self.writer
-                        .push_truncate(heap.decoded, table, self.rows_base + upto)?;
+                        .push_truncate(*truncate, table, self.rows_base + upto)?;
                 }
-                WalkStep::Heap(mut heap) => {
+                WalkStep::Heap(input) => {
                     // Route before validation and detoast: unmapped rows
-                    // discard without touching
-                    // the resolver or codec checks. The value permit drops
-                    // once bytes land in the plan file
-                    let table = self.writer.table(&heap, || self.view.route_for(&heap));
-                    if self.writer.routed(table) {
-                        if heap.decoded.new.as_ref().is_some_and(|t| t.partial) {
-                            return Err(PlanError::PartialUpdate {
-                                lsn: heap.decoded.source_lsn,
-                            });
-                        }
-                        if heap_reads_toast(&heap) {
-                            Box::pin(detoast_heap(&mut heap, spool, &ref_maps, self.resolver))
-                                .await?;
-                        }
+                    // discard without touching the resolver or codec checks
+                    let rel = &input.descriptor;
+                    let table = self.writer.table(rel, input.descriptor_valid_from, || {
+                        self.view.route_for(rel)
+                    });
+                    if !self.writer.routed(table) {
+                        self.writer.discard(table, u64::from(input.input.tuples));
+                        continue;
                     }
-                    self.writer.push_heap(heap.decoded, table)?;
+                    self.plan_views(input, table, spool, &ref_maps).await?;
                 }
             }
         }
@@ -205,9 +220,119 @@ impl<'a, V: PlanRouteView> Planner<'a, V> {
         Ok(())
     }
 
+    /// Plan an input from tuple images in place. Records without external
+    /// values plan synchronously; the rest detoast into per-image patches
+    async fn plan_views(
+        &mut self,
+        input: Box<DescribedInput>,
+        table: u32,
+        spool: Option<&BodySpoolFile>,
+        ref_maps: &[&ChunkRefMap],
+    ) -> Result<(), PlanError> {
+        let Some(input) = self.plan_inline(input, table)? else {
+            return Ok(());
+        };
+        // Boxed: detoast state would bloat every commit future
+        Box::pin(self.plan_detoasted(input, table, spool, ref_maps)).await
+    }
+
+    /// Plan `input` unless an image holds an external value, handing it back
+    fn plan_inline(
+        &mut self,
+        input: Box<DescribedInput>,
+        table: u32,
+    ) -> Result<Option<Box<DescribedInput>>, PlanError> {
+        let images = images(&input)?;
+        if images
+            .iter()
+            .any(|h| !external_sites([h.new.as_ref(), h.old.as_ref()]).is_empty())
+        {
+            drop(images);
+            return Ok(Some(input));
+        }
+        let rows = self.push_changes(&input, table, &images, &[])?;
+        drop(images);
+        self.carry(input, table, Vec::new(), rows)?;
+        Ok(None)
+    }
+
+    async fn plan_detoasted(
+        &mut self,
+        input: Box<DescribedInput>,
+        table: u32,
+        spool: Option<&BodySpoolFile>,
+        ref_maps: &[&ChunkRefMap],
+    ) -> Result<(), PlanError> {
+        let images = images(&input)?;
+        let (db, lsn) = (input.descriptor.rfn.db_node, input.input.source_lsn);
+        let mut patches = Vec::with_capacity(images.len());
+        for h in &images {
+            let mut patch: [Vec<(usize, Datum)>; 2] = Default::default();
+            let sites = external_sites([h.new.as_ref(), h.old.as_ref()]);
+            // Value permit drops once bytes land in the plan
+            let (values, _permit) =
+                detoast_sites(&sites, db, lsn, spool, ref_maps, self.resolver).await?;
+            for (site, v) in sites.iter().zip(values) {
+                patch[site.image].push((site.idx, v));
+            }
+            patches.push(patch);
+        }
+        let rows = self.push_changes(&input, table, &images, &patches)?;
+        drop(images);
+        self.carry(input, table, patches, rows)
+    }
+
+    /// Plan each image as one change with its patches. A deferring writer
+    /// only counts them, returning rows the record encodes to
+    fn push_changes(
+        &mut self,
+        input: &DescribedInput,
+        table: u32,
+        images: &[HeapImages<TupleView<'_>>],
+        patches: &[[Vec<(usize, Datum)>; 2]],
+    ) -> Result<Option<usize>, PlanError> {
+        let defer = self.writer.defers();
+        let mut rows = 0;
+        for (i, h) in images.iter().enumerate() {
+            let (new_patch, old_patch) = patches
+                .get(i)
+                .map_or((&[][..], &[][..]), |[n, o]| (&n[..], &o[..]));
+            let change = ViewChange {
+                op: h.op,
+                xid: input.input.xid,
+                source_lsn: input.input.source_lsn,
+                new: h.new.as_ref(),
+                old: h.old.as_ref(),
+                new_patch,
+                old_patch,
+            };
+            if defer {
+                rows += self.writer.count_change(&change, table)?;
+            } else {
+                self.writer.push_views(change, table)?;
+            }
+        }
+        Ok(defer.then_some(rows))
+    }
+
+    /// Carry a record [`Self::push_changes`] counted for deferred encoding
+    fn carry(
+        &mut self,
+        input: Box<DescribedInput>,
+        table: u32,
+        patches: Vec<[Vec<(usize, Datum)>; 2]>,
+        rows: Option<usize>,
+    ) -> Result<(), PlanError> {
+        if let Some(rows) = rows {
+            self.writer.push_pending(table, input, patches, rows)?;
+        }
+        Ok(())
+    }
+
     /// Freeze the validated plan for the executor
     pub fn seal(self, commit_lsn: u64, commit_ts: i64) -> Result<SealedPlan, PlanError> {
-        let plan = self.writer.seal(commit_lsn, commit_ts)?;
+        let (plan, encoders) = self.writer.seal_keeping(commit_lsn, commit_ts)?;
+        self.view.keep_encoders(encoders);
         for t in &plan.tables {
             if t.route.is_none() {
                 self.view.unmapped(&t.descriptor, t.heaps);
@@ -217,18 +342,43 @@ impl<'a, V: PlanRouteView> Planner<'a, V> {
     }
 }
 
+/// Tuple images of `input`, failing closed on a malformed record or an
+/// update whose new image elides a predecessor prefix or suffix
+fn images(input: &DescribedInput) -> Result<ImageViews<'_>, PlanError> {
+    let rel = &input.descriptor;
+    let lsn = input.input.source_lsn;
+    let images = view_heap_record(input.input.record_bytes(), rel).map_err(|e| {
+        XactBufferError::OrdinaryFailClosed {
+            relid: rel.oid,
+            lsn,
+            rm: input.input.rm,
+            info: input.input.info,
+            reason: FailClosedReason::Malformed(e.to_string()),
+        }
+    })?;
+    if images
+        .iter()
+        .any(|h| h.new.as_ref().is_some_and(|t| t.partial))
+    {
+        return Err(PlanError::PartialUpdate { lsn });
+    }
+    Ok(images)
+}
+
+type ImageViews<'a> = smallvec::SmallVec<[HeapImages<TupleView<'a>>; 1]>;
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::decode::datum::{Datum, build};
     use crate::decode::heap_decoder::{
-        ColumnValue, DecodedHeap, DecodedTuple, HeapOp, ToastPointer,
+        DecodedHeap, DecodedTuple, DescribedHeap, HeapOp, ToastPointer,
     };
+    use crate::emit::ch_emitter::Wire;
     use crate::emit::pipeline::plan_spool::PlanItem;
     use crate::mapping::{TableMapping, TableTarget};
     use crate::schema::{INT4OID, RelAttr, RelDescriptor, RelName, SchemaEvent, TEXTOID};
-    use crate::xact::xact_buffer::raw_fixtures::{
-        inject_ordinary, int4_descriptor, multi_insert_raw,
-    };
+    use crate::xact::xact_buffer::raw_fixtures::{int4_descriptor, multi_insert_raw};
     use crate::xact::xact_buffer::{FailClosedReason, StashResolved, XactBuffer, XactBufferConfig};
     use foldhash::{HashMap, HashMapExt, HashSet, HashSetExt};
     use walrus::pg::walparser::RelFileNode;
@@ -244,6 +394,8 @@ mod tests {
         assert_eq!(PlanError::View("x".into()).reason(), "view");
         let spool = PlanSpoolError::DiskBudget { needed: 2, cap: 1 };
         assert_eq!(PlanError::Spool(spool).reason(), "spool");
+        let encode = PlanSpoolError::Encode(crate::ch::EmitterError::Type("x".into()));
+        assert_eq!(PlanError::Spool(encode).reason(), "encode");
         let fail_closed = |reason| XactBufferError::OrdinaryFailClosed {
             relid: 1,
             lsn: 2,
@@ -331,7 +483,18 @@ mod tests {
         })
     }
 
-    fn heap(rel: &Arc<RelDescriptor>, lsn: u64, col: ColumnValue) -> DescribedHeap {
+    /// Record cut short of its tuple fails closed before planning
+    #[test]
+    fn torn_record_fails_closed_malformed() {
+        let d = descriptor(16600, INT4OID);
+        let mut torn = DescribedInput::try_from(heap(&d, 0x100, build::int4(1))).expect("insert");
+        // Insert body read as an update falls short of its main data
+        torn.input.info = crate::decode::heap_decoder::XLOG_HEAP_UPDATE;
+        let err = images(&torn).unwrap_err();
+        assert_eq!(err.reason(), "fail_closed_malformed", "{err}");
+    }
+
+    fn heap(rel: &Arc<RelDescriptor>, lsn: u64, col: Datum) -> DescribedHeap {
         DescribedHeap {
             decoded: DecodedHeap {
                 rfn: rel.rfn,
@@ -361,6 +524,34 @@ mod tests {
         )
     }
 
+    /// Route carrying source column 1 as `Nullable(String)`
+    fn text_route() -> Arc<RouteSnapshot> {
+        RouteSnapshot::freeze(
+            Arc::new(TableMapping {
+                target: TableTarget::new("db", "t"),
+                columns: vec![crate::mapping::ColumnMapping {
+                    src_attnum: 1,
+                    target_name: "v".into(),
+                    target_type: "Nullable(String)".into(),
+                    type_pinned: false,
+                }],
+                tees: Vec::new(),
+            }),
+            Arc::default(),
+            Default::default(),
+        )
+    }
+
+    fn planner<'a>(
+        path: impl Into<PlanPath>,
+        cap: u64,
+        segment_rows: usize,
+        view: &'a mut MapView,
+        resolver: &'a ToastResolver,
+    ) -> Planner<'a, MapView> {
+        Planner::create(path, cap, (segment_rows, usize::MAX), 42, view, resolver)
+    }
+
     /// Fixed-map view: routes by rel name until a Dropped event for the oid
     /// folds in, then unmapped. Records applied entries
     struct MapView {
@@ -371,11 +562,11 @@ mod tests {
     }
 
     impl PlanRouteView for MapView {
-        fn route_for(&mut self, heap: &DescribedHeap) -> Option<Arc<RouteSnapshot>> {
-            if self.dropped.contains(&heap.descriptor.oid) {
+        fn route_for(&mut self, rel: &Arc<RelDescriptor>) -> Option<Arc<RouteSnapshot>> {
+            if self.dropped.contains(&rel.oid) {
                 return None;
             }
-            self.routes.get(&heap.descriptor.rel_name).cloned()
+            self.routes.get(&rel.rel_name).cloned()
         }
 
         fn unmapped(&mut self, rel: &RelDescriptor, heaps: u64) {
@@ -406,12 +597,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut b = XactBuffer::new(cfg(tmp.path().to_path_buf())).unwrap();
         let rel = descriptor(16600, INT4OID);
-        b.on_heap(heap(&rel, 100, ColumnValue::Int4(1)))
-            .await
-            .unwrap();
-        b.on_heap(heap(&rel, 120, ColumnValue::Int4(2)))
-            .await
-            .unwrap();
+        b.on_heap(heap(&rel, 100, build::int4(1))).await.unwrap();
+        b.on_heap(heap(&rel, 120, build::int4(2))).await.unwrap();
         b.on_schema_event(
             1,
             150,
@@ -421,9 +608,7 @@ mod tests {
                 partition: None,
             },
         );
-        b.on_heap(heap(&rel, 200, ColumnValue::Int4(3)))
-            .await
-            .unwrap();
+        b.on_heap(heap(&rel, 200, build::int4(3))).await.unwrap();
 
         let mut view = MapView {
             routes: HashMap::from_iter([(rel.rel_name.clone(), route())]),
@@ -432,7 +617,7 @@ mod tests {
             unmapped: Vec::new(),
         };
         let resolver = ToastResolver::disabled();
-        let mut planner = Planner::create(tmp.path().join("1.plan"), 1 << 20, &mut view, &resolver);
+        let mut planner = planner(tmp.path().join("1.plan"), 1 << 20, 1, &mut view, &resolver);
         let mut drain = b
             .drain_committed(StashResolved::nothing_stashed(1), 42, 0x2000, &[], false)
             .await
@@ -454,22 +639,31 @@ mod tests {
         let mut rd = plan.replay().unwrap();
         let mut order = Vec::new();
         while let Some(item) = rd.next_item().unwrap() {
-            order.push(match item {
-                PlanItem::Control(_) => "e".to_string(),
-                PlanItem::Heap(h) | PlanItem::Truncate { heap: h, .. } => format!(
-                    "h{}{}",
-                    h.decoded.source_lsn,
-                    if rd.tables[h.table as usize].route.is_some() {
-                        "r"
-                    } else {
-                        "-"
-                    }
-                ),
-            });
+            if let PlanItem::Segment(s) = item {
+                // Unmapped route: `_lsn` leads
+                let chunks = s.chunks();
+                order.extend(chunks.iter().map(|c| format!("{:?}", c.buffers[0].wire())));
+            } else {
+                assert!(
+                    matches!(item, PlanItem::Control { .. }),
+                    "no truncate planned"
+                );
+                order.push("e".to_string());
+            }
         }
+        let lsn = |v: u64| {
+            let bytes = v.to_le_bytes();
+            format!(
+                "{:?}",
+                Wire::Fixed {
+                    width: 8,
+                    bytes: &bytes
+                }
+            )
+        };
         assert_eq!(
             order,
-            ["h100r", "h120r", "e"],
+            [lsn(100), lsn(120), "e".into()],
             "heap after schema event has no mapping and is discarded"
         );
     }
@@ -487,13 +681,11 @@ mod tests {
         })
         .unwrap();
         let rel = descriptor(16601, TEXTOID);
-        b.on_heap(heap(&rel, 90, ColumnValue::Text("ok".into())))
-            .await
-            .unwrap();
+        b.on_heap(heap(&rel, 90, build::text("ok"))).await.unwrap();
         b.on_heap(heap(
             &rel,
             100,
-            ColumnValue::ExternalToast(ToastPointer {
+            Datum::External(ToastPointer {
                 va_rawsize: 64,
                 va_extinfo: 60,
                 va_valueid: 9999,
@@ -514,7 +706,7 @@ mod tests {
             Arc::new(crate::emit::ch_emitter::EmitterStats::default()),
         );
         let path = tmp.path().join("1.plan");
-        let mut planner = Planner::create(path.clone(), 1 << 20, &mut view, &resolver);
+        let mut planner = planner(path.clone(), 1 << 20, usize::MAX, &mut view, &resolver);
         let mut drain = b
             .drain_committed(StashResolved::nothing_stashed(1), 42, 0x2000, &[], false)
             .await
@@ -546,14 +738,13 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut b = XactBuffer::new(cfg(tmp.path().to_path_buf())).unwrap();
         let rel = int4_descriptor(16610);
-        let rfn = rel.rfn;
         b.stash_raw(1, multi_insert_raw(1, 100, 16610, &[1, 2]))
             .await
             .unwrap();
         let mut bad = multi_insert_raw(1, 120, 16610, &[3]);
         bad.main_data[0] = 0; // strip CONTAINS_NEW_TUPLE: ImageOnly on fold
         b.stash_raw(1, bad).await.unwrap();
-        let stash = inject_ordinary(rfn, rel.clone());
+        let stash = StashResolved::ordinary(1, rel.clone(), 0x50);
 
         let mut view = MapView {
             routes: HashMap::from_iter([(rel.rel_name.clone(), route())]),
@@ -563,7 +754,7 @@ mod tests {
         };
         let resolver = ToastResolver::disabled();
         let path = tmp.path().join("1.plan");
-        let mut planner = Planner::create(path.clone(), 1 << 20, &mut view, &resolver);
+        let mut planner = planner(path.clone(), 1 << 20, usize::MAX, &mut view, &resolver);
         let mut drain = b
             .drain_committed(stash, 42, 0x2000, &[], false)
             .await
@@ -597,9 +788,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut b = XactBuffer::new(cfg(tmp.path().to_path_buf())).unwrap();
         let rel = descriptor(16612, INT4OID);
-        const ROWS: usize = 32 * 1024;
+        // Encoded rows of empty mappings cost about 21 bytes each
+        const ROWS: usize = 64 * 1024;
         for i in 0..ROWS {
-            b.on_heap(heap(&rel, 100 + i as u64, ColumnValue::Int4(i as i32)))
+            b.on_heap(heap(&rel, 100 + i as u64, build::int4(i as i32)))
                 .await
                 .unwrap();
         }
@@ -611,7 +803,13 @@ mod tests {
             unmapped: Vec::new(),
         };
         let resolver = ToastResolver::disabled();
-        let mut planner = Planner::create(tmp.path().join("1.plan"), 1 << 30, &mut view, &resolver);
+        let mut planner = planner(
+            tmp.path().join("1.plan"),
+            1 << 30,
+            4096,
+            &mut view,
+            &resolver,
+        );
         let mut drain = b
             .drain_committed(StashResolved::nothing_stashed(1), 42, 0x2000, &[], false)
             .await
@@ -630,16 +828,17 @@ mod tests {
             "plan crossed mem threshold into file spool"
         );
         let mut rd = plan.replay().unwrap();
-        let mut rows = 0usize;
-        while let Some(item) = rd.next_item().unwrap() {
-            // No controls planned, every heap routed
-            assert!(
-                matches!(item, PlanItem::Heap(h) if rd.tables[h.table as usize].route.is_some())
-            );
-            rows += 1;
+        let mut rows = 0u64;
+        // No controls planned, every row routed
+        while let Some(PlanItem::Segment(s)) = rd.next_item().unwrap() {
+            rows += s.rows;
+            let want = s.rows;
+            let encoded = s.chunks().iter().map(|c| c.rows() as u64).sum::<u64>();
+            assert_eq!(want, encoded);
         }
+        assert!(rd.next_item().unwrap().is_none(), "segments only");
         drop(rd);
-        assert_eq!(rows, ROWS);
+        assert_eq!(rows, ROWS as u64);
     }
 
     /// Mirror-row refs and fences survive multi-batch planning re-based to
@@ -667,7 +866,7 @@ mod tests {
             )
             .await
             .unwrap();
-            b.on_heap(heap(&rel, lsn + 1, ColumnValue::Int4(seq as i32)))
+            b.on_heap(heap(&rel, lsn + 1, build::int4(seq as i32)))
                 .await
                 .unwrap();
         }
@@ -680,7 +879,7 @@ mod tests {
                 partition: None,
             },
         );
-        let mut truncate = heap(&rel, 105, ColumnValue::Int4(0));
+        let mut truncate = heap(&rel, 105, build::int4(0));
         truncate.decoded.op = HeapOp::Truncate;
         truncate.decoded.new = None;
         b.on_heap(truncate).await.unwrap();
@@ -692,7 +891,13 @@ mod tests {
             unmapped: Vec::new(),
         };
         let resolver = ToastResolver::disabled();
-        let mut planner = Planner::create(tmp.path().join("1.plan"), 1 << 20, &mut view, &resolver);
+        let mut planner = planner(
+            tmp.path().join("1.plan"),
+            1 << 20,
+            usize::MAX,
+            &mut view,
+            &resolver,
+        );
         let mut drain = b
             .drain_committed(StashResolved::nothing_stashed(1), 42, 0x2000, &[], true)
             .await
@@ -708,16 +913,20 @@ mod tests {
         let plan = planner.seal(0x2000, 42).unwrap();
         let total_rows: usize = plan.row_batches.iter().map(|rb| rb.len()).sum();
         assert_eq!(total_rows, 2, "both chunk births carried");
-        assert_eq!(plan.heap_count, 3, "2 inserts + truncate");
-        assert_eq!(plan.controls.len(), 1);
+        assert_eq!(plan.routed_count(), 3, "2 inserts + truncate");
+        let mut rd = plan.replay().unwrap();
+        let mut fences = Vec::new();
+        while let Some(item) = rd.next_item().unwrap() {
+            match item {
+                PlanItem::Control { row_idx, .. } => fences.push(("event", row_idx)),
+                PlanItem::Truncate { upto, .. } => fences.push(("truncate", upto)),
+                PlanItem::Segment(_) => {}
+            }
+        }
         assert_eq!(
-            plan.controls[0].row_idx, 2,
-            "event fence re-based to plan-global rows"
-        );
-        assert_eq!(
-            plan.truncate_rows,
-            vec![2],
-            "truncate fence re-based to plan-global rows"
+            fences,
+            [("event", 2), ("truncate", 2)],
+            "fences re-based to plan-global rows"
         );
     }
 
@@ -730,7 +939,7 @@ mod tests {
             let tmp = tempfile::tempdir().unwrap();
             let mut b = XactBuffer::new(cfg(tmp.path().to_path_buf())).unwrap();
             let rel = descriptor(16607, INT4OID);
-            let mut partial = heap(&rel, 100, ColumnValue::Int4(1));
+            let mut partial = heap(&rel, 100, build::int4(1));
             partial.decoded.op = HeapOp::Update;
             partial.decoded.new.as_mut().unwrap().partial = true;
             b.on_heap(partial).await.unwrap();
@@ -747,7 +956,7 @@ mod tests {
             };
             let resolver = ToastResolver::disabled();
             let path = tmp.path().join("1.plan");
-            let mut planner = Planner::create(path.clone(), 1 << 20, &mut view, &resolver);
+            let mut planner = planner(path.clone(), 1 << 20, usize::MAX, &mut view, &resolver);
             let mut drain = b
                 .drain_committed(StashResolved::nothing_stashed(1), 42, 0x2000, &[], false)
                 .await
@@ -769,7 +978,7 @@ mod tests {
             } else {
                 res.unwrap();
                 let plan = planner.seal(0x2000, 42).unwrap();
-                assert_eq!(plan.heap_count, 0, "unmapped partial heap is discarded");
+                assert_eq!(plan.routed_rows, 0, "unmapped partial heap is discarded");
                 assert_eq!(plan.tables[0].heaps, 1);
             }
         }
@@ -785,7 +994,7 @@ mod tests {
         b.on_heap(heap(
             &rel,
             100,
-            ColumnValue::ExternalToast(ToastPointer {
+            Datum::External(ToastPointer {
                 va_rawsize: 64,
                 va_extinfo: 60,
                 va_valueid: 9999,
@@ -802,7 +1011,13 @@ mod tests {
             unmapped: Vec::new(),
         };
         let resolver = ToastResolver::disabled();
-        let mut planner = Planner::create(tmp.path().join("1.plan"), 1 << 20, &mut view, &resolver);
+        let mut planner = planner(
+            tmp.path().join("1.plan"),
+            1 << 20,
+            usize::MAX,
+            &mut view,
+            &resolver,
+        );
         let mut drain = b
             .drain_committed(StashResolved::nothing_stashed(1), 42, 0x2000, &[], false)
             .await
@@ -813,7 +1028,7 @@ mod tests {
         drain.finish().await.unwrap();
         let plan = planner.seal(0x2000, 42).unwrap();
         assert_eq!(
-            plan.heap_count, 0,
+            plan.routed_rows, 0,
             "unmapped heap is counted without being stored"
         );
         assert_eq!(plan.tables[0].heaps, 1);
@@ -855,15 +1070,15 @@ mod tests {
         rel: &Arc<RelDescriptor>,
         resolver: &ToastResolver,
         dir: &std::path::Path,
-    ) -> Vec<ColumnValue> {
+    ) -> Vec<Datum> {
         let mut view = MapView {
-            routes: HashMap::from_iter([(rel.rel_name.clone(), route())]),
+            routes: HashMap::from_iter([(rel.rel_name.clone(), text_route())]),
             dropped: HashSet::new(),
             applied: Vec::new(),
             unmapped: Vec::new(),
         };
         let path = dir.join(format!("{xid}.plan"));
-        let mut planner = Planner::create(path, 1 << 20, &mut view, resolver);
+        let mut planner = planner(path, 1 << 20, usize::MAX, &mut view, resolver);
         let commit = u64::from(xid) << 12 | 0x100;
         let stash = StashResolved::nothing_stashed(xid);
         let mut drain = b
@@ -880,10 +1095,9 @@ mod tests {
         let mut rd = plan.replay().unwrap();
         let mut out = Vec::new();
         while let Some(item) = rd.next_item().unwrap() {
-            if let PlanItem::Heap(h) = item {
-                let d = h.decoded;
-                let t = d.new.or(d.old).expect("row image");
-                out.push(t.columns[0].clone().expect("column"));
+            let PlanItem::Segment(s) = item else { continue };
+            for c in &s.chunks() {
+                out.extend(c.cells().into_iter().flatten());
             }
         }
         out
@@ -892,7 +1106,7 @@ mod tests {
     /// Value ids come from a tiny wrapping OID space, as in PostgreSQL only
     /// once every chunk of the previous value is vacuumed, truncated or
     /// rewritten away; rewrites assign ids no WAL birth shows. Shadow and
-    /// predecode run up to a few commits ahead of planning. Whatever the
+    /// prescan run up to a few commits ahead of planning. Whatever the
     /// sequence, lead and budget, a row using read-ahead carries the value
     /// its pointer names at that commit whenever a store read at planning
     /// does, and NULL at worst
@@ -902,10 +1116,10 @@ mod tests {
         const OIDS: u32 = 5;
         let tmp = tempfile::tempdir().unwrap();
         let rel = descriptor(16699, TEXTOID);
-        let text = |body: &[u8]| ColumnValue::Text(String::from_utf8(body.to_vec()).unwrap());
+        let text = |body: &[u8]| build::text(String::from_utf8(body.to_vec()).unwrap());
         let row = |xid, lsn, op, vid| {
             let t = Some(DecodedTuple {
-                columns: vec![Some(ColumnValue::ExternalToast(ToastPointer {
+                columns: vec![Some(Datum::External(ToastPointer {
                     va_rawsize: 12,
                     va_extinfo: 8,
                     va_valueid: vid,
@@ -1050,12 +1264,12 @@ mod tests {
                     events.push((None, h));
                 }
                 for (born, h) in &events {
-                    // Predecode reads ahead the values rows keep
+                    // Prescan reads ahead the values rows keep
                     if born.is_none()
                         && let Some(t) = h.decoded.new.as_ref().or(h.decoded.old.as_ref())
-                        && let Some(ColumnValue::ExternalToast(p)) = t.columns[0]
+                        && let Some(Datum::External(p)) = t.columns[0]
                     {
-                        ahead.read_ahead(rel.rfn.db_node, p, TEXTOID, h.decoded.source_lsn);
+                        ahead.read_ahead(rel.rfn.db_node, p, h.decoded.source_lsn);
                         tokio::task::yield_now().await;
                     }
                     if h.decoded.xid >= 1_000_000 {
@@ -1088,7 +1302,7 @@ mod tests {
                     assert_eq!(served.len(), want.len());
                     for ((w, r), s) in want.iter().zip(&read).zip(&served) {
                         assert!(
-                            s == w || r != w && *s == ColumnValue::Null,
+                            s == w || r != w && *s == Datum::Null,
                             "seed {seed} xid {xid}: {s:?} {r:?} {w:?}"
                         );
                     }

@@ -26,7 +26,8 @@ use walrus::storage::fs::FsStorage;
 use walshadow::archive;
 use walshadow::backfill_bootstrap::seed_catalog_from_source;
 use walshadow::backup_backfill::fetch_segments;
-use walshadow::heap_decoder::{ColumnValue, decode_heap_record};
+use walshadow::datum::Datum;
+use walshadow::heap_decoder::decode_heap_record;
 use walshadow::record::{
     Record, RecordSink, SinkError, WAL_SEG_SIZE, segments_covering, segments_covering_lineage,
 };
@@ -140,12 +141,13 @@ impl RecordSink for BranchTally {
                 .expect("decode replayed heap")
             {
                 let tuple = heap.new.expect("insert tuple");
-                let [Some(ColumnValue::Int4(id)), Some(ColumnValue::Text(name))] =
-                    tuple.columns.as_slice()
+                let [Some(Datum::Fixed(id)), Some(Datum::Varlena(name))] = tuple.columns.as_slice()
                 else {
                     panic!("unexpected tuple: {tuple:?}");
                 };
-                self.rows.push((*id, name.clone()));
+                let id = i32::from_le_bytes(id.as_slice().try_into().expect("int4"));
+                self.rows
+                    .push((id, String::from_utf8(name.clone()).expect("utf8")));
             }
         }
         Box::pin(std::future::ready(Ok(())))

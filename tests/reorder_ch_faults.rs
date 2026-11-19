@@ -273,7 +273,7 @@ async fn plan_over_disk_budget_fails() {
         ],
     )
     .await;
-    assert!(err.contains("plan: plan spool"), "{err}");
+    assert!(err.contains("plan seal: plan spool"), "{err}");
     assert!(err.contains("exceeds disk budget 4096"), "{err}");
     assert_eq!(stats.plan_failures_spool.load(Ordering::Relaxed), 1);
 }

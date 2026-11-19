@@ -21,7 +21,7 @@ use walrus::pg::walparser::RelFileNode;
 use walshadow::backup_page_walk::BackfillTuple;
 use walshadow::ch_emitter::EmitterStats;
 use walshadow::copy_backfill::{BlockRange, copy_rows_into};
-use walshadow::decode::heap_decoder::ColumnValue;
+use walshadow::datum::Datum;
 use walshadow::schema::{INT8OID, RelAttr, RelDescriptor, RelName, ReplIdent, TEXTOID};
 use walshadow::source_feed::open_sql_client;
 
@@ -54,12 +54,15 @@ async fn ids(
 ) -> Vec<i64> {
     let (tx, mut rx) = mpsc::channel::<Vec<BackfillTuple>>(4);
     let stats = Arc::new(EmitterStats::default());
+    let rel = desc.clone();
     let collect = tokio::spawn(async move {
         let mut out = Vec::new();
         while let Some(slab) = rx.recv().await {
             for t in slab {
-                match t.columns.first().and_then(|c| c.as_ref()) {
-                    Some(ColumnValue::Int8(v)) => out.push(*v),
+                match t.cells(&rel).unwrap().first() {
+                    Some(Some(Datum::Fixed(v))) => {
+                        out.push(i64::from_le_bytes(v.as_slice().try_into().expect("int8")))
+                    }
                     other => panic!("unexpected id column {other:?}"),
                 }
             }

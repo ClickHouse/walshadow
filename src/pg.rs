@@ -3,7 +3,7 @@
 use tokio_postgres::types::{Oid, PgLsn};
 use tokio_postgres::{Client, Row};
 
-use crate::schema::RelAttr;
+use crate::schema::{MissingDefault, RelAttr};
 
 pub use walrus::pg::backup::parse_pg_lsn;
 
@@ -43,7 +43,8 @@ pub const ATTR_SQL: &str = "SELECT \
         a.attlen::int2, \
         a.attalign::text, \
         a.attstorage::text, \
-        CASE WHEN a.atthasmissing THEN a.attmissingval::text END \
+        CASE WHEN a.atthasmissing THEN a.attmissingval::text END, \
+        CASE WHEN a.atthasmissing AND t.typsend::oid <> 0 THEN anyarray_send(a.attmissingval) END \
      FROM pg_attribute a \
      LEFT JOIN pg_type t ON t.oid = a.atttypid \
      WHERE a.attrelid = $1 AND a.attnum >= 1 \
@@ -65,6 +66,9 @@ pub struct RawAttr {
     pub type_storage: String,
     /// `attmissingval::text` array literal
     pub missing: Option<String>,
+    /// `anyarray_send(attmissingval)`, preferred over `missing` where the
+    /// type's send form converts to on-disk bytes
+    pub missing_send: Option<Vec<u8>>,
 }
 
 impl RawAttr {
@@ -82,10 +86,22 @@ impl RawAttr {
             type_align: row.get(9),
             type_storage: row.get(10),
             missing: row.get(11),
+            missing_send: row.get(12),
         }
     }
 
     pub fn build(self) -> Result<RelAttr, String> {
+        let missing_default = self
+            .missing_send
+            .as_deref()
+            .and_then(|send| crate::backfill::copy_backfill::missing_from_send(self.type_oid, send))
+            .map(MissingDefault::Raw)
+            .or_else(|| {
+                self.missing
+                    .as_deref()
+                    .and_then(parse_array_one_element)
+                    .map(MissingDefault::Text)
+            });
         Ok(RelAttr {
             attnum: self.attnum,
             name: self.name,
@@ -98,11 +114,7 @@ impl RawAttr {
             type_len: self.type_len,
             type_align: single_char(&self.type_align, "attalign")?,
             type_storage: single_char(&self.type_storage, "attstorage")?,
-            missing_default: self
-                .missing
-                .as_deref()
-                .and_then(parse_array_one_element)
-                .map(crate::schema::MissingDefault::Text),
+            missing_default,
         })
     }
 }
@@ -190,6 +202,7 @@ mod tests {
             type_align: "i".into(),
             type_storage: "x".into(),
             missing: None,
+            missing_send: None,
         };
         let attr = raw.build().unwrap();
         assert!(attr.dropped);
@@ -214,6 +227,7 @@ mod tests {
             type_align: "ii".into(),
             type_storage: "p".into(),
             missing: None,
+            missing_send: None,
         };
         assert!(raw.build().is_err());
     }

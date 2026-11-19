@@ -1011,6 +1011,7 @@ fn descriptor_from_rows(
             type_align: attr.attalign.to_string(),
             type_storage: attr.attstorage.to_string(),
             missing: None,
+            missing_send: None,
         };
         let mut rel_attr = raw.build().map_err(CatalogError::Parse)?;
         if let Some(hex) = attr.attmissingval.as_deref()

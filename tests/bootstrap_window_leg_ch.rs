@@ -508,18 +508,12 @@ async fn leg_reports_tail_failures_at_flush_and_finish() {
         .unwrap();
     let ch = fx::ChServer::spawn(tempfile::tempdir().unwrap(), slot.ch_tcp, slot.ch_http).unwrap();
     ch.query("CREATE DATABASE walshadow_test").unwrap();
-    ch.query(
-        "CREATE TABLE walshadow_test.t (id Int32, name String, _lsn UInt64, _xid UInt32,
-         _commit_ts DateTime64(6, 'UTC'), _is_deleted Bool)
-         ENGINE = ReplacingMergeTree(_lsn, _is_deleted) ORDER BY id",
-    )
-    .unwrap();
     let pg = fx::pg_cfg(&source, "window-tail-test");
     let sql = open_sql_client(&pg).await.unwrap();
     let catalog = seed_catalog_from_source(&sql).await.unwrap();
     let scratch = tmp.path().join("leg");
 
-    // Batcher refuses a destination type it cannot plan and exits
+    // INSERT into a missing destination table stops inserters, closing the tail
     let mut feed = SourceFeed::connect(&pg).await.unwrap();
     let ident = feed.identify_system().await.unwrap();
     let mut cfg = leg_cfg(
@@ -530,12 +524,9 @@ async fn leg_reports_tail_failures_at_flush_and_finish() {
         ident.system_id,
         ident.timeline,
     );
-    let mut bad_type = emitter(slot.ch_tcp);
-    for m in bad_type.tables.values_mut() {
-        m.columns[1].target_type = "NoSuchType".into();
-    }
-    cfg.mapping = walshadow::mapping::mapping_handle(bad_type.tables.clone());
-    cfg.dest = walshadow::config::DestEmitter::new(Arc::new(bad_type), None);
+    let mut no_retry = emitter(slot.ch_tcp);
+    no_retry.retry.max_attempts = 0;
+    cfg.dest = walshadow::config::DestEmitter::new(Arc::new(no_retry), None);
     let writer = open_sql_client(&pg).await.unwrap();
     let inserts = tokio::spawn(async move {
         for id in 100..10_000 {
@@ -561,6 +552,12 @@ async fn leg_reports_tail_failures_at_flush_and_finish() {
     );
 
     // Delete of a toasted row queues chunk tombstones the store refuses
+    ch.query(
+        "CREATE TABLE walshadow_test.t (id Int32, name String, _lsn UInt64, _xid UInt32,
+         _commit_ts DateTime64(6, 'UTC'), _is_deleted Bool)
+         ENGINE = ReplacingMergeTree(_lsn, _is_deleted) ORDER BY id",
+    )
+    .unwrap();
     sql.batch_execute("SELECT pg_switch_wal()").await.unwrap();
     let mut feed = SourceFeed::connect(&pg).await.unwrap();
     let ident = feed.identify_system().await.unwrap();

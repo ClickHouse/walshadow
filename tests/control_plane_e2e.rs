@@ -989,10 +989,15 @@ async fn ch_password_rotation_via_ctl_keeps_streaming() {
             &["apply"],
             "[ch]\npassword = \"wrong\"\ncompression = \"lz4\"\nretry_max_attempts = 0\n",
         )?;
-        h.psql("UPDATE demo.users SET email = 'wrong@x' WHERE id = 1")?;
+        // A fresh row, since id 1's TOASTed name would fail the mirror fetch
+        // in the decoder before the inserter dials
+        h.psql("INSERT INTO demo.users VALUES (2, 'bob', 'wrong@x')")?;
         h.wait_log("Authentication failed", Duration::from_secs(30))
             .await
             .context("a rejected password never reached a re-dial")?;
+        h.wait_log("decode+insert pipeline failed", Duration::from_secs(30))
+            .await
+            .context("exhausted dial retries never stopped the daemon")?;
 
         Ok::<(), anyhow::Error>(())
     }

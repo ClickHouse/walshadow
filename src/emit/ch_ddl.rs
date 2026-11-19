@@ -40,7 +40,8 @@ use crate::column_rules::ColumnRules;
 use crate::config::{ConfigResolver, DestEmitter, ResolvedConfig};
 #[cfg(feature = "test-support")]
 use crate::crash_test;
-use crate::decode::heap_decoder::{self, ColumnValue};
+use crate::decode::datum::DatumRef;
+use crate::decode::heap_decoder;
 use crate::emit::ch_emitter::{DATETIME64_PG_EPOCH_US, EmitterConfig};
 use crate::emit::route::{Routing, routing};
 use crate::mapping::{
@@ -1477,14 +1478,24 @@ async fn resolve_disk_default<'a>(
     db: Oid,
     att: &'a RelAttr,
 ) -> Cow<'a, RelAttr> {
-    let ColumnValue::PgPending { raw, .. } = heap_decoder::missing_value_for(att) else {
+    if heap_decoder::local_matrix_covers(att.type_oid, att.type_len) {
+        return Cow::Borrowed(att);
+    }
+    let (DatumRef::Fixed(raw) | DatumRef::Varlena(raw) | DatumRef::Cstring(raw)) =
+        heap_decoder::missing_datum(att)
+    else {
         return Cow::Borrowed(att);
     };
     let Some(oracle) = oracle else {
         return Cow::Borrowed(att);
     };
     match oracle
-        .text_value(db, att.type_oid, att.typmod, OracleCell::DiskRaw(raw))
+        .text_value(
+            db,
+            att.type_oid,
+            att.typmod,
+            OracleCell::DiskRaw(raw.to_vec()),
+        )
         .await
     {
         Ok(text) => {
@@ -2367,6 +2378,12 @@ mod tests {
             TSVECTOROID,
             &short_varlena(b"\x01\x00\x00\x00"),
         )));
+        let bare = RelAttr {
+            missing_default: None,
+            ..tsv.clone()
+        };
+        let no_default = resolve_disk_default(Some(&oracle), 5, &bare).await;
+        assert!(matches!(no_default, Cow::Borrowed(_)));
         let unresolved = resolve_disk_default(None, 5, &tsv).await;
         assert!(matches!(unresolved, Cow::Borrowed(_)));
         let rendered = resolve_disk_default(Some(&oracle), 5, &tsv).await;

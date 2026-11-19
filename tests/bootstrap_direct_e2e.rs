@@ -15,7 +15,7 @@
 //!   → DirectSource(PgConfig→source, BaseBackupOpts{fast_checkpoint})
 //!   → MultiplexSink(DiskLanderSink + PageWalkSink)
 //!   → mpsc<BackfillTuple>
-//!   → drain_backfill → RecordingObserver
+//!   → collected tuples
 //! ```
 //!
 //! Skipped silently when `initdb` is not on `$PATH`.
@@ -35,11 +35,9 @@ use foldhash::{HashSet, HashSetExt};
 use walrus::pg::replication::base_backup::BaseBackupOpts;
 use walrus::pg::replication::conn::PgConfig;
 use walrus::pg::replication::tls::{SslMode, TlsParams};
-use walshadow::backfill_bootstrap::{
-    BootstrapConfig, drain_backfill, seed_in_snapshot, spawn_greenfield_bootstrap,
-};
+use walshadow::backfill_bootstrap::{BootstrapConfig, run_greenfield_bootstrap, seed_in_snapshot};
 use walshadow::backup_source_direct::DirectSource;
-use walshadow::heap_decoder::{ColumnValue, HeapOp};
+use walshadow::datum::Datum;
 use walshadow::shadow::{Shadow, ShadowConfig};
 
 /// Same row budget as the object-store sibling: one heap page worth so
@@ -153,15 +151,10 @@ async fn direct_source_self_hosted_via_replication_protocol() {
 
     let shadow_data = tmp.path().join("shadow-data");
     let cfg = BootstrapConfig::new(shadow_data.clone());
-    let (rx, pump) = spawn_greenfield_bootstrap(cfg, Box::new(direct), catalog_map, false);
-
-    let mut observer = RecordingObserver::default();
-    let (drain_res, pump_res) = tokio::join!(drain_backfill(rx, &mut observer), pump);
-    let shipped = drain_res.expect("drain task error");
-    let outcome = pump_res
-        .expect("pump task panicked")
-        .expect("pump task returned error");
-    assert_eq!(observer.xact_end_calls, 1);
+    let (outcome, tuples) =
+        run_greenfield_bootstrap(cfg, Box::new(direct), catalog_map.clone(), false)
+            .await
+            .expect("bootstrap");
 
     // LSN handoff
     assert!(outcome.start.start_lsn > 0, "start_lsn must be non-zero");
@@ -253,24 +246,21 @@ async fn direct_source_self_hosted_via_replication_protocol() {
             .load(std::sync::atomic::Ordering::Relaxed),
     );
     assert_eq!(
-        shipped,
+        tuples.len() as u64,
         outcome
             .page_walk
             .tuples_emitted
             .load(std::sync::atomic::Ordering::Relaxed)
     );
 
-    // CommittedTuple shape
     let mut int_ids: HashSet<i32> = HashSet::new();
-    for c in &observer.tuples {
-        assert_eq!(c.commit_ts, 0);
-        assert_eq!(c.commit_lsn, outcome.start.start_lsn);
-        assert_eq!(c.decoded.op, HeapOp::Insert);
-        assert_eq!(c.decoded.source_lsn, outcome.start.start_lsn);
-        assert!(c.decoded.old.is_none());
-        let new = c.decoded.new.as_ref().expect("Insert must carry `new`");
-        assert!(!new.partial);
-        if let Some(Some(ColumnValue::Int4(v))) = new.columns.first() {
+    for t in &tuples {
+        assert_eq!(t.source_lsn, outcome.start.start_lsn);
+        let rel = catalog_map
+            .get(t.rfn.db_node, t.rfn.rel_node)
+            .expect("descriptor");
+        if let Some(Some(Datum::Fixed(v))) = t.cells(&rel).expect("cells").first() {
+            let v = &i32::from_le_bytes(v.as_slice().try_into().expect("int4"));
             int_ids.insert(*v);
         }
     }
@@ -282,39 +272,4 @@ async fn direct_source_self_hosted_via_replication_protocol() {
         want.difference(&int_ids).copied().collect::<Vec<_>>(),
         int_ids.len(),
     );
-}
-
-#[derive(Default)]
-struct RecordingObserver {
-    tuples: Vec<walshadow::heap_decoder::CommittedTuple>,
-    xact_end_calls: u32,
-}
-
-impl walshadow::decoder_sink::TupleObserver for RecordingObserver {
-    fn on_tuple<'a>(
-        &'a mut self,
-        committed: &'a walshadow::heap_decoder::CommittedTuple,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<Output = Result<(), walshadow::decoder_sink::DecoderSinkError>>
-                + Send
-                + 'a,
-        >,
-    > {
-        self.tuples.push(committed.clone());
-        Box::pin(async { Ok(()) })
-    }
-    fn on_xact_end<'a>(
-        &'a mut self,
-        commit_lsn: u64,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<Output = Result<u64, walshadow::decoder_sink::DecoderSinkError>>
-                + Send
-                + 'a,
-        >,
-    > {
-        self.xact_end_calls += 1;
-        Box::pin(async move { Ok(commit_lsn) })
-    }
 }
