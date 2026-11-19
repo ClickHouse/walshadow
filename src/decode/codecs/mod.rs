@@ -11,12 +11,17 @@ mod time;
 mod uuid;
 
 pub(crate) use fixed::{
-    decode_tid, macaddr_to_text, macaddr8_to_text, parse_macaddr, parse_tid, tid_to_text,
+    decode_tid, encode_tid, macaddr_to_text, macaddr8_to_text, parse_macaddr, parse_tid,
+    tid_to_text,
 };
 pub use inet::{InetValue, PGSQL_AF_INET, PGSQL_AF_INET6, decode_inet};
 pub use interval::{IntervalValue, decode_interval};
-pub use jsonb::{decode_jsonb, decode_jsonb_with_capacity, jsonb_text_len};
-pub use numeric::{NumericKind, decode_numeric, numeric_text_len};
+pub use jsonb::{decode_jsonb, jsonb_text_len, render_jsonb_text};
+pub(crate) use numeric::{Numeric, parse_numeric, scaled_groups};
+pub use numeric::{
+    Special, numeric_body, numeric_from_text, numeric_special_body, numeric_text_len,
+    render_numeric_text,
+};
 pub use text_array::decode_text_array;
 pub(crate) use time::{format_time_us, timetz_to_text};
 pub(crate) use uuid::uuid_to_ch_wire;

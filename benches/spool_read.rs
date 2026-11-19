@@ -1,7 +1,7 @@
 //! Deferred spool and plan spool write and replay, without servers.
 //! `cargo bench --bench spool_read -- --rows 200000`
 //! Add `--plan-only --planner --mapped --relations 8 --control-every 10000`
-//! to include planning, route caching within benchmark, and row placement.
+//! to include planning, route caching within benchmark, and column encoding.
 //! Excludes WAL drain, TOAST I/O, control execution, and destination insertion.
 
 use std::path::PathBuf;
@@ -11,18 +11,22 @@ use std::time::{Duration, Instant};
 use clap::Parser;
 use foldhash::{HashMap, HashMapExt};
 use walrus::pg::walparser::RelFileNode;
-use walshadow::backup_page_walk::BackfillTuple;
-use walshadow::ch_emitter::EmitterStats;
+use walrus::pg::walparser::{
+    BlockLocation, RmId, XLogRecord, XLogRecordBlock, XLogRecordBlockHeader, XLogRecordHeader,
+};
+use walshadow::backup_page_walk::{BackfillTuple, TupleData};
+use walshadow::datum::build;
 use walshadow::emit::route::RouteSnapshot;
-use walshadow::heap_decoder::{ColumnValue, DecodedHeap, DecodedTuple, DescribedHeap, HeapOp};
-use walshadow::mapping::{TableMapping, TableTarget};
-use walshadow::pipeline::decode::place_rows;
-use walshadow::pipeline::plan_spool::{PlanItem, PlanWriter};
+use walshadow::mapping::{ColumnMapping, TableMapping, TableTarget};
+use walshadow::pipeline::plan_spool::{PlanItem, PlanWriter, ViewChange};
 use walshadow::pipeline::planner::{PlanRouteView, Planner};
-use walshadow::schema::{RelDescriptor, RelName, ReplIdent, SchemaEvent};
+use walshadow::schema::{
+    INT4OID, RelAttr, RelDescriptor, RelName, ReplIdent, SchemaEvent, TEXTOID,
+};
+use walshadow::spill::{DescribedInput, HeapInput};
 use walshadow::spool::DeferredSpool;
 use walshadow::toast::ToastResolver;
-use walshadow::xact_buffer::{DrainEntry, DrainedBatch, OrderedEvent};
+use walshadow::xact_buffer::{DrainEntry, DrainHeap, DrainedBatch, OrderedEvent};
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -39,7 +43,7 @@ struct Args {
     dir: PathBuf,
     #[arg(long)]
     plan_only: bool,
-    /// Run Planner and row placement with cached routes.
+    /// Run Planner with cached routes.
     #[arg(long)]
     planner: bool,
     #[arg(long)]
@@ -92,6 +96,11 @@ async fn deferred(args: &Args, repeat: usize) -> anyhow::Result<()> {
     let payload = "x".repeat(args.payload_bytes);
     let mut spool = DeferredSpool::new(dir.path().join("deferred.spool"), 1 << 20);
     let start = Instant::now();
+    let data = |i: usize| {
+        let cells = [Some(build::int4(i as i32)), Some(build::text(&payload))];
+        walshadow::heap_decoder::form_block_data(&[], &cells).into_boxed_slice()
+    };
+    let data_len = data(0).len();
     for i in 0..args.rows {
         spool
             .push(BackfillTuple {
@@ -103,10 +112,8 @@ async fn deferred(args: &Args, repeat: usize) -> anyhow::Result<()> {
                 page_lsn: 0,
                 blkno: i as u32,
                 offnum: 1,
-                columns: vec![
-                    Some(ColumnValue::Int4(i as i32)),
-                    Some(ColumnValue::Text(payload.clone())),
-                ],
+                data: TupleData::Heap(data(i)),
+                pending: None,
             })
             .await?;
     }
@@ -117,7 +124,7 @@ async fn deferred(args: &Args, repeat: usize) -> anyhow::Result<()> {
     let mut n = 0;
     while let Some(t) = reader.next().await? {
         assert_eq!(t.xid, n as u32);
-        assert!(matches!(&t.columns[1], Some(ColumnValue::Text(s)) if s.len() == payload.len()));
+        assert!(matches!(&t.data, TupleData::Heap(b) if b.len() == data_len));
         n += 1;
     }
     reader.finish().await?;
@@ -134,18 +141,16 @@ struct BenchRoutes {
 }
 
 impl PlanRouteView for BenchRoutes {
-    fn route_for(&mut self, heap: &DescribedHeap) -> Option<Arc<RouteSnapshot>> {
+    fn route_for(&mut self, rel: &Arc<RelDescriptor>) -> Option<Arc<RouteSnapshot>> {
         self.calls += 1;
-        if let Some((desc, route)) = self.memo.get(&heap.descriptor.rel_name)
-            && Arc::ptr_eq(desc, &heap.descriptor)
+        if let Some((desc, route)) = self.memo.get(&rel.rel_name)
+            && Arc::ptr_eq(desc, rel)
         {
             return route.clone();
         }
         let route = self.route.clone();
-        self.memo.insert(
-            heap.descriptor.rel_name.clone(),
-            (heap.descriptor.clone(), route.clone()),
-        );
+        self.memo
+            .insert(rel.rel_name.clone(), (rel.clone(), route.clone()));
         route
     }
 
@@ -154,6 +159,59 @@ impl PlanRouteView for BenchRoutes {
     async fn apply(&mut self, _: &DrainEntry) -> Result<(), String> {
         self.memo.clear();
         Ok(())
+    }
+}
+
+fn attr(attnum: i16, type_oid: u32, type_len: i16) -> RelAttr {
+    RelAttr {
+        attnum,
+        name: format!("c{attnum}"),
+        type_oid,
+        typmod: -1,
+        not_null: false,
+        dropped: false,
+        type_name: String::new(),
+        type_byval: type_len > 0,
+        type_len,
+        type_align: 'i',
+        type_storage: if type_len > 0 { 'p' } else { 'x' },
+        missing_default: None,
+    }
+}
+
+/// XLOG_HEAP_INSERT block data: xl_heap_header, int4, 4-byte-header text
+fn insert_tuple(id: i32, payload: &[u8]) -> Vec<u8> {
+    let mut t = Vec::with_capacity(14 + payload.len());
+    t.extend_from_slice(&2u16.to_le_bytes());
+    t.extend_from_slice(&0u16.to_le_bytes());
+    t.push(24);
+    t.push(0);
+    t.extend_from_slice(&id.to_le_bytes());
+    t.extend_from_slice(&(((4 + payload.len()) as u32) << 2).to_le_bytes());
+    t.extend_from_slice(payload);
+    t
+}
+
+fn insert_record<'a>(xid: u32, rel: &RelDescriptor, tuple: &'a [u8]) -> XLogRecord<'a> {
+    XLogRecord {
+        header: XLogRecordHeader {
+            xact_id: xid,
+            resource_manager_id: RmId::Heap as u8,
+            ..Default::default()
+        },
+        blocks: vec![XLogRecordBlock {
+            header: XLogRecordBlockHeader {
+                location: BlockLocation {
+                    rel: rel.rfn,
+                    block_no: 0,
+                },
+                ..Default::default()
+            },
+            data: std::borrow::Cow::Borrowed(tuple),
+            ..Default::default()
+        }],
+        main_data: std::borrow::Cow::Borrowed(&[1, 0, 8][..]),
+        ..Default::default()
     }
 }
 
@@ -174,15 +232,21 @@ async fn plan(args: &Args, repeat: usize) -> anyhow::Result<()> {
                 persistence: 'p',
                 ancestors: Vec::new(),
                 replident: ReplIdent::Default { pk_attnums: None },
-                attributes: Vec::new(),
+                attributes: vec![attr(1, INT4OID, 4), attr(2, TEXTOID, -1)],
             })
         })
         .collect();
     let route = args.mapped.then(|| {
+        let column = |attnum: i16, ty: &str| ColumnMapping {
+            src_attnum: attnum,
+            target_name: format!("c{attnum}"),
+            target_type: ty.into(),
+            type_pinned: false,
+        };
         RouteSnapshot::freeze(
             Arc::new(TableMapping {
                 target: TableTarget::new("db", "spool_bench"),
-                columns: Vec::new(),
+                columns: vec![column(1, "Int32"), column(2, "String")],
                 tees: Vec::new(),
             }),
             Arc::default(),
@@ -190,23 +254,16 @@ async fn plan(args: &Args, repeat: usize) -> anyhow::Result<()> {
         )
     });
     let payload = "x".repeat(args.payload_bytes);
-    let make_heap = |i: usize| {
+    let xid_of = |i: usize| 7 + (i % 4) as u32;
+    let make_input = |i: usize| {
         let descriptor = &descriptors[i % descriptors.len()];
-        DescribedHeap {
-            decoded: DecodedHeap {
-                rfn: descriptor.rfn,
-                xid: 7 + (i % 4) as u32,
-                source_lsn: i as u64,
-                op: HeapOp::Insert,
-                new: Some(DecodedTuple {
-                    columns: vec![
-                        Some(ColumnValue::Int4(i as i32)),
-                        Some(ColumnValue::Text(payload.clone())),
-                    ],
-                    partial: false,
-                }),
-                old: None,
-            },
+        let tuple = insert_tuple(i as i32, payload.as_bytes());
+        DescribedInput {
+            input: HeapInput::from_parsed(
+                &insert_record(xid_of(i), descriptor, &tuple),
+                i as u64,
+                1,
+            ),
             descriptor: descriptor.clone(),
             descriptor_valid_from: 1,
         }
@@ -226,113 +283,102 @@ async fn plan(args: &Args, repeat: usize) -> anyhow::Result<()> {
         calls: 0,
     };
     let resolver = ToastResolver::disabled();
-    let start = Instant::now();
-    let sealed = if args.planner {
-        let mut planner = Planner::create(
-            dir.path().join("plan.spool"),
-            u64::MAX,
-            &mut view,
-            &resolver,
-        );
-        for first in (0..args.rows).step_by(4096) {
-            let end = (first + 4096).min(args.rows);
-            let mut heaps = Vec::with_capacity(end - first);
-            let mut ordered_events = Vec::new();
-            for i in first..end {
-                if let Some(event) = control(i) {
-                    ordered_events.push(OrderedEvent {
-                        heap_idx: heaps.len(),
-                        row_idx: 0,
-                        event,
-                    });
+    // Drained slices built ahead so timing covers planning alone
+    let batches: Vec<DrainedBatch> = if args.planner {
+        (0..args.rows)
+            .step_by(4096)
+            .map(|first| {
+                let end = (first + 4096).min(args.rows);
+                let mut heaps = Vec::with_capacity(end - first);
+                let mut ordered_events = Vec::new();
+                for i in first..end {
+                    if let Some(event) = control(i) {
+                        ordered_events.push(OrderedEvent {
+                            heap_idx: heaps.len(),
+                            row_idx: 0,
+                            event,
+                        });
+                    }
+                    heaps.push(DrainHeap::Input(Box::new(make_input(i))));
                 }
-                heaps.push(make_heap(i));
-            }
-            planner
-                .plan_batch(DrainedBatch {
+                DrainedBatch {
                     heaps,
                     ordered_events,
                     chunks: Vec::new(),
                     new_rows: Default::default(),
                     truncate_rows: Vec::new(),
                     is_final: end == args.rows,
-                })
-                .await?;
+                }
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let start = Instant::now();
+    let sealed = if args.planner {
+        let mut planner = Planner::create(
+            dir.path().join("plan.spool"),
+            u64::MAX,
+            (4096, 1 << 20),
+            0,
+            &mut view,
+            &resolver,
+        );
+        for batch in batches {
+            planner.plan_batch(batch).await?;
         }
         planner.seal(u64::MAX, 0)?
     } else {
-        let mut writer = PlanWriter::create(dir.path().join("plan.spool"), u64::MAX, 1 << 20);
+        let mut writer = PlanWriter::create(dir.path().join("plan.spool"), u64::MAX, 1 << 20)
+            .with_segment_limits(4096, 1 << 20);
         for i in 0..args.rows {
             if let Some(event) = control(i) {
                 view.apply(&event).await.map_err(anyhow::Error::msg)?;
-                writer.push_control(event, 0);
+                writer.push_control(event, 0)?;
             }
-            let heap = make_heap(i);
-            let table = writer.table(&heap, || view.route_for(&heap));
-            writer.push_heap(heap.decoded, table)?;
+            let rel = &descriptors[i % descriptors.len()];
+            let table = writer.table(rel, 1, || view.route_for(rel));
+            if !writer.routed(table) {
+                writer.discard(table, 1);
+            } else {
+                let input = make_input(i);
+                let record = input.input.to_xlog_record(rel.rfn);
+                let images = walshadow::heap_decoder::view_heap_record(&record, rel)?;
+                let change = ViewChange {
+                    op: images[0].op,
+                    xid: input.input.xid,
+                    source_lsn: input.input.source_lsn,
+                    new: images[0].new.as_ref(),
+                    old: None,
+                    new_patch: &[],
+                    old_patch: &[],
+                };
+                writer.push_views(change, table)?;
+            }
         }
         writer.seal(u64::MAX, 0)?
     };
     let write = start.elapsed();
     let (size_bytes, spilled) = (sealed.size_bytes, sealed.path().is_some());
-    let stats = EmitterStats::default();
-    let mut staged = Vec::new();
-    let mut pending = Vec::with_capacity(4096);
-    let mut routed = 0;
-    let mut controls = 0;
+    let routed = sealed.routed_rows;
     let start = Instant::now();
     let mut rd = sealed.replay()?;
     let mut n = 0;
+    let mut controls = 0;
+    let mut n_segments = 0;
     while let Some(item) = rd.next_item()? {
-        let control = matches!(item, PlanItem::Control(_));
         match item {
-            PlanItem::Heap(h) => {
-                assert_eq!(h.decoded.source_lsn, n as u64);
-                assert_eq!(h.decoded.rfn, descriptors[n % descriptors.len()].rfn);
-                assert_eq!(h.decoded.xid, 7 + (n % 4) as u32);
-                n += 1;
-                if args.planner {
-                    pending.push(h);
-                }
+            PlanItem::Segment(s) => {
+                n += s.into_chunks()?.iter().map(|c| c.rows()).sum::<usize>();
+                n_segments += 1;
             }
-            PlanItem::Control(c) => {
-                assert_eq!(c.heap_idx, n);
-                controls += 1;
-            }
+            PlanItem::Control { .. } => controls += 1,
             PlanItem::Truncate { .. } => unreachable!(),
         }
-        if pending.len() == 4096 || (control && !pending.is_empty()) {
-            routed += place_rows(
-                &mut staged,
-                &stats,
-                4096,
-                0,
-                0,
-                u64::MAX,
-                &rd.tables,
-                std::mem::take(&mut pending),
-                None,
-            );
-            staged.clear();
-        }
-    }
-    if args.planner {
-        routed += place_rows(
-            &mut staged,
-            &stats,
-            4096,
-            0,
-            0,
-            u64::MAX,
-            &rd.tables,
-            pending,
-            None,
-        );
-        staged.clear();
-        assert_eq!(routed, if args.mapped { args.rows as u64 } else { 0 });
     }
     let replay = start.elapsed();
     assert_eq!(n, if args.mapped { args.rows } else { 0 });
+    assert_eq!(routed, n as u64);
     assert_eq!(
         controls,
         args.rows
@@ -342,7 +388,7 @@ async fn plan(args: &Args, repeat: usize) -> anyhow::Result<()> {
     );
     report(
         if args.planner {
-            "plan_replay_place"
+            "plan_replay_encode"
         } else {
             "plan_replay"
         },
@@ -361,10 +407,11 @@ async fn plan(args: &Args, repeat: usize) -> anyhow::Result<()> {
         + (args.rows % interval).min(descriptors.len());
     assert_eq!(view.calls, expected_calls);
     println!(
-        "plan_total repeat={repeat} total_s={:.6} route_calls={} tables={} routed={routed} spilled={}",
+        "plan_total repeat={repeat} total_s={:.6} route_calls={} tables={} routed={routed} segments={} spilled={}",
         (write + replay).as_secs_f64(),
         view.calls,
         rd.tables.len(),
+        n_segments,
         spilled
     );
     Ok(())

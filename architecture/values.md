@@ -33,6 +33,17 @@ acknowledgement alone is insufficient because restart could still reread a
 pre-drop row. Rewrite barriers handle changed physical generations without
 unconditionally wiping history needed by earlier reads
 
+## Value forms
+
+Values stay in forms PostgreSQL produced until they become ClickHouse Native
+column bytes: stored datums read in place from WAL, page images and TOAST
+chunks, or `typoutput` text from SQL-read fast defaults and COPY casts. COPY's
+binary send forms convert to stored datums on arrival when a local codec
+supports the conversion. Other types use text casts. Each destination column
+compiles one conversion from its source type, so there is no decoded
+intermediate value. Detoasted values hold their stored bytes, so resident
+accounting counts what was fetched rather than a rendering
+
 ## Convert unfamiliar types
 
 After decompression, values outside local codec set are sent to PostgreSQL
@@ -41,9 +52,12 @@ columns for destination insertion. Batch conversion avoids a database round trip
 per row and keeps type semantics in PostgreSQL
 
 Conversion workers run between batcher and inserters, so PostgreSQL conversion
-overlaps ClickHouse insertion. Batches carrying only local columns pass through
-without a PostgreSQL request. Inserters combine local and converted columns into
-complete Native blocks and retain them across insert retries
+overlaps ClickHouse insertion. Blocks carrying only local columns pass through
+without a PostgreSQL request. Conversion workers combine local and converted
+columns into complete Native blocks, serialize and compress each once, and
+release column buffers. Inserters dial with the batch's compression and send
+prepared bytes directly. Retries resend every block of an INSERT. Prepared
+blocks stay resident until every required destination acknowledges
 
 Conversion failure stops batch with column and row context. Module pins output
 settings to make conversion reproducible. Greenfield bootstrap uses a temporary

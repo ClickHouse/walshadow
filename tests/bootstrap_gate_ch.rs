@@ -187,7 +187,8 @@ async fn unresolvable_multixact_fails_greenfield_resolution() {
             page_lsn: 0,
             blkno: 0,
             offnum: 1,
-            columns: Vec::new(),
+            data: walshadow::backup_page_walk::TupleData::Heap(Box::default()),
+            pending: None,
         })
         .await
         .unwrap();

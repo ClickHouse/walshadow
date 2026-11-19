@@ -10,10 +10,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use walshadow::backfill_staging::StagingSession;
-use walshadow::backup_page_walk::{BackfillTuple, CatalogMap};
+use walshadow::backup_page_walk::{BackfillTuple, CatalogMap, TupleData};
 use walshadow::ch_emitter::{EmitterConfig, EmitterStats, InstanceConfig, RetryConfig};
 use walshadow::config::DestEmitter;
-use walshadow::heap_decoder::ColumnValue;
+use walshadow::datum::{Datum, build};
 use walshadow::mapping::{ColumnMapping, TableMapping, TableTarget};
 use walshadow::schema::{RelAttr, RelDescriptor, RelName, ReplIdent};
 use walshadow::toast::ToastResolver;
@@ -183,7 +183,7 @@ fn int_rel(name: &str) -> Arc<RelDescriptor> {
 async fn one_row_spool(
     dir: &std::path::Path,
     rel: &Arc<RelDescriptor>,
-    value: ColumnValue,
+    value: Datum,
 ) -> PendingSpool {
     let mut catalog = CatalogMap::new();
     catalog.insert(rel.clone());
@@ -197,7 +197,8 @@ async fn one_row_spool(
         page_lsn: 0,
         blkno: 0,
         offnum: 1,
-        columns: vec![Some(value)],
+        data: TupleData::from_cells(&[Some(value)]),
+        pending: None,
     };
     let xids = PendingXids {
         insert: 101,
@@ -249,7 +250,7 @@ async fn ship_discards_unmapped_rows_and_names_failed_rebuild() {
         }
     };
 
-    let spool = one_row_spool(scratch.path(), &rel, ColumnValue::Int4(7)).await;
+    let spool = one_row_spool(scratch.path(), &rel, build::int4(7)).await;
     let manifests = ship_to(Arc::default(), spool).await.expect("unmapped ship");
     assert!(manifests.is_empty());
     let tables = ch.server.query("SHOW TABLES FROM db").expect("list tables");
@@ -259,7 +260,7 @@ async fn ship_discards_unmapped_rows_and_names_failed_rebuild() {
         "no pending table for an unmapped relation"
     );
 
-    let spool = one_row_spool(scratch.path(), &rel, ColumnValue::Int4(7)).await;
+    let spool = one_row_spool(scratch.path(), &rel, build::int4(7)).await;
     let err = ship_to(mapping_of(&rel, "missing"), spool)
         .await
         .expect_err("pending table cloned from a missing target");
@@ -269,7 +270,7 @@ async fn ship_discards_unmapped_rows_and_names_failed_rebuild() {
     ch.server
         .query("CREATE TABLE db.t (a Int32) ENGINE = MergeTree ORDER BY a")
         .expect("target");
-    let wide = ColumnValue::Text("x".repeat(walshadow::spool::DEFERRED_SPOOL_MEM_MAX));
+    let wide = Datum::Varlena(vec![b'x'; walshadow::spool::DEFERRED_SPOOL_MEM_MAX]);
     let spool = one_row_spool(scratch.path(), &rel, wide).await;
     std::fs::remove_file(scratch.path().join("pending.bin")).unwrap();
     let err = ship_to(mapping_of(&rel, "t"), spool)

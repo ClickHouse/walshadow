@@ -1,4 +1,5 @@
 pub mod codecs;
+pub mod datum;
 pub mod decoder_sink;
 pub mod fpi;
 pub mod heap_decoder;

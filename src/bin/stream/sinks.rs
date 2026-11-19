@@ -6,7 +6,6 @@ use anyhow::Result;
 use std::future::Future;
 use std::pin::Pin;
 use walshadow::boundary_hold::BoundaryHoldSink;
-use walshadow::heap_decoder::Predecoded;
 use walshadow::record::{MetricsRecordSink, Record, RecordSink, SinkError};
 use walshadow::xact_buffer::BufferingDecoderSink;
 
@@ -30,7 +29,7 @@ impl<D: RecordSink + Send> RecordSink for DecoderXactPair<D> {
         &'a mut self,
         record: &'a Record<'a>,
     ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
-        self.on_records(std::slice::from_ref(record), &mut [])
+        self.on_records(std::slice::from_ref(record))
     }
 
     /// Absorbs every heap record before draining any commit in the batch:
@@ -38,11 +37,10 @@ impl<D: RecordSink + Send> RecordSink for DecoderXactPair<D> {
     fn on_records<'a>(
         &'a mut self,
         batch: &'a [Record<'a>],
-        pre: &'a mut [Option<Predecoded>],
     ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
         Box::pin(async move {
-            self.decoder.on_records(batch, pre).await?;
-            self.xact_drain.on_records(batch, &mut []).await?;
+            self.decoder.on_records(batch).await?;
+            self.xact_drain.on_records(batch).await?;
             Ok(())
         })
     }

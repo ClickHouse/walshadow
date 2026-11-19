@@ -379,7 +379,7 @@ snapshot! {
     }
 
     gauge xact_active: u64 = "Active transactions buffered in memory or on spill.",
-    gauge xact_bytes_in_memory: u64 = "Bytes held in memory across all buffered xacts.",
+    gauge xact_bytes_in_memory: u64 = "Allocated bytes held in memory across all buffered xacts.",
     gauge spill_xacts_active: u64 = "Xacts with at least one entry currently in their spill file.",
     gauge spill_bytes_active: u64 = "Bytes currently held across all active xact spill files.",
     gauge drain_resident_bytes: u64 =
@@ -521,16 +521,12 @@ snapshot! {
     /// Sealed plan bytes `[mem, file]`, rendered `storage=` labelled
     counter xact_plan_bytes_by_storage: [u64; 2] ["storage" = ["mem", "file"]] =
         "Sealed transaction-plan bytes by final backing.",
-    /// Planning failures `[spool, fail_closed, detoast, partial_update,
-    /// view, drain]`, rendered `reason=` labelled
-    counter xact_plan_failures_by_reason: [u64; 11] ["reason" = PLAN_FAILURE_REASONS] =
-        "Planning-stage failures; the whole transaction emits nothing.",
+    counter xact_plan_failures_by_reason: [u64; 12] ["reason" = PLAN_FAILURE_REASONS] =
+        "Failures during commit planning or deferred encoding.",
     counter raw_stash_bytes_by_storage: [u64; 2] ["storage" = ["mem", "spill"]] =
         "Cumulative raw-stash payload bytes by first landing.",
     counter raw_decode_rows_by_op: [u64; 7] ["op" = HEAP_OP_LABELS] =
         "Rows fanned out of decoded raw records.",
-    gauge raw_pending_rows: u64 = "Raw-decoded heaps queued for pending-first yield.",
-    gauge raw_pending_bytes: u64 = "Bytes held by the pending raw fanout.",
     counter backfill_backup_rows_total: u64 = "Tuples decoded by table backfill backup walks, including TOAST chunks and rows awaiting visibility checks. Cumulative across passes.",
     counter backfill_backup_bytes_total: u64 = "Backup body bytes handed to table backfill page walks, excluding skipped files. Cumulative across passes.",
     counter backfill_copy_rows_total: u64 = "Rows decoded from source COPY for table backfills.",
@@ -883,7 +879,7 @@ impl Default for RateEstimator {
 
 /// `reason=` label order of `MetricsSnapshot::xact_plan_failures_by_reason`,
 /// matching [`crate::emit::pipeline::planner::drain_reason`]
-const PLAN_FAILURE_REASONS: [&str; 11] = [
+const PLAN_FAILURE_REASONS: [&str; 12] = [
     "spool",
     "fail_closed_image_only",
     "fail_closed_malformed",
@@ -894,6 +890,7 @@ const PLAN_FAILURE_REASONS: [&str; 11] = [
     "detoast",
     "partial_update",
     "view",
+    "encode",
     "drain",
 ];
 
@@ -1683,7 +1680,7 @@ mod tests {
         let snap = MetricsSnapshot {
             xact_plan_rows: 9,
             xact_plan_bytes_by_storage: [100, 200],
-            xact_plan_failures_by_reason: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+            xact_plan_failures_by_reason: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
             worker_seconds: vec![
                 ("queue", WorkerState::Busy, 1.5),
                 ("queue", WorkerState::Idle, 2.5),
@@ -1819,8 +1816,6 @@ mod tests {
             raw_stash_bytes_by_storage: [11, 12],
             raw_decode_rows_by_op: [1, 2, 3, 4, 5, 6, 7],
             decoder_records_by_op: [41, 42, 43, 44, 45],
-            raw_pending_rows: 13,
-            raw_pending_bytes: 14,
             by_database: vec![DbSeries {
                 database: "app".into(),
                 descriptor_ambiguous_total: 21,
@@ -1852,8 +1847,6 @@ mod tests {
         );
         assert!(body.contains("walshadow_raw_decode_rows_total{op=\"multi_insert\"} 6"));
         assert!(body.contains("walshadow_decoder_records_total{op=\"hot_update\"} 43"));
-        assert!(body.contains("walshadow_raw_pending_rows 13"));
-        assert!(body.contains("walshadow_raw_pending_bytes 14"));
         // Published intervals and lookups landing in one stay distinct
         // families
         assert!(body.contains("walshadow_descriptor_ambiguous_total{database=\"app\"} 21"));

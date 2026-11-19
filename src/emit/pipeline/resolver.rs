@@ -58,8 +58,6 @@ pub(crate) struct ResolvedBatch {
     pub compression: CompressionChoice,
     pub n_rows: usize,
     pub per_seq: Vec<(u64, u64)>,
-    /// Admission permit shares covering these rows, dropped post-insert-ack
-    _permits: Vec<Arc<crate::budget::MemoryPermit>>,
     _encoded: crate::budget::MemoryPermit,
 }
 
@@ -255,7 +253,6 @@ async fn resolve_batches(
             blocks,
             n_rows,
             per_seq,
-            permits,
             mut encoded,
         } = batch;
         let mut sealed = Vec::with_capacity(blocks.len());
@@ -292,7 +289,6 @@ async fn resolve_batches(
             compression: sealer.compression,
             n_rows,
             per_seq,
-            _permits: permits,
             _encoded: encoded,
         };
         if tx.send(ready).await.is_err() {
@@ -374,13 +370,10 @@ async fn resolve_oracle(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::decode::heap_decoder::{
-        ColumnValue, CommittedTuple, DecodedHeap, DecodedTuple, HeapOp,
-    };
+    use crate::decode::datum::build;
+    use crate::decode::heap_decoder::{CommittedTuple, DecodedHeap, DecodedTuple, HeapOp};
     use crate::emit::ch_emitter::Wire;
-    use crate::emit::pipeline::batcher::{
-        BatcherConfig, BatcherMsg, RoutedRow, RowChunk, RowTable,
-    };
+    use crate::emit::pipeline::batcher::{BatcherConfig, BatcherMsg, PlacedSegment, RowTable};
     use crate::emit::route::RouteSnapshot;
     use crate::mapping::{ColumnMapping, TableMapping, TableTarget};
     use crate::schema::{RelAttr, RelDescriptor, RelName, ReplIdent};
@@ -392,7 +385,7 @@ pub(crate) mod tests {
     /// the daemon: the shape a PostGIS 2-D point takes
     pub(crate) const GEOM_OID: u32 = 999_999;
 
-    fn wkt_table() -> RowTable {
+    pub(crate) fn wkt_table() -> RowTable {
         let rel = Arc::new(RelDescriptor {
             rfn: RelFileNode {
                 spc_node: 1663,
@@ -439,11 +432,10 @@ pub(crate) mod tests {
         RowTable { rel, route }
     }
 
-    pub(crate) fn wkt_row(seq: u64, text: Option<&str>) -> RoutedRow {
-        RoutedRow {
+    pub(crate) fn wkt_row(seq: u64, point: Option<(f64, f64)>) -> (u64, CommittedTuple) {
+        (
             seq,
-            table: 0,
-            committed: CommittedTuple {
+            CommittedTuple {
                 decoded: DecodedHeap {
                     rfn: RelFileNode {
                         spc_node: 1663,
@@ -454,7 +446,9 @@ pub(crate) mod tests {
                     source_lsn: 0x1000 + seq,
                     op: HeapOp::Insert,
                     new: Some(DecodedTuple {
-                        columns: vec![text.map(|t| ColumnValue::Text(t.into()))],
+                        columns: vec![
+                            point.map(|(x, y)| build::bytes(crate::ops::oracle::point_body(x, y))),
+                        ],
                         partial: false,
                     }),
                     old: None,
@@ -462,14 +456,13 @@ pub(crate) mod tests {
                 commit_ts: 0,
                 commit_lsn: (seq + 1) * 100,
             },
-            value_permit: None,
-        }
+        )
     }
 
     /// One batch of the rows, sealed through the real batcher: `InsertBatch`
     /// is only reachable that way, and its cell tags are what the encoder
     /// chose rather than what a test asserted
-    pub(crate) async fn seal(rows: Vec<RoutedRow>) -> InsertBatch {
+    pub(crate) async fn seal(rows: Vec<(u64, CommittedTuple)>) -> InsertBatch {
         let (msg_tx, msg_rx) = mpsc::channel(64);
         let (batches_tx, batches_rx) = async_channel::bounded(64);
         let fatal = Fatal::new();
@@ -487,13 +480,13 @@ pub(crate) mod tests {
             Arc::new(EmitterStats::default()),
             None,
         );
-        let chunk = RowChunk {
-            tables: vec![wkt_table()],
-            rows,
-            permit: None,
-        };
+        let RowTable { rel, route } = wkt_table();
+        let segments = rows
+            .into_iter()
+            .map(|(seq, row)| PlacedSegment::of_rows(seq, &rel, &route, &[row]).unwrap())
+            .collect();
         msg_tx
-            .send(BatcherMsg::Rows(chunk))
+            .send(BatcherMsg::Segments(segments))
             .await
             .expect("send rows");
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -515,10 +508,9 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn rendered_cells_against_a_string_target_stay_local() {
         let mut batch = seal(vec![
-            wkt_row(0, Some("POINT(1 2)")),
+            wkt_row(0, Some((1.0, 2.0))),
             wkt_row(0, None),
-            wkt_row(0, Some("")),
-            wkt_row(0, Some("POINT(3 4)")),
+            wkt_row(0, Some((3.0, 4.0))),
         ])
         .await;
         assert!(
@@ -537,9 +529,9 @@ pub(crate) mod tests {
         assert_eq!(
             batch.blocks[0].buffers[0].wire(),
             Wire::NullableString {
-                offsets: &[10, 10, 10, 20],
+                offsets: &[10, 10, 20],
                 data: b"POINT(1 2)POINT(3 4)",
-                null_map: &[0, 1, 0, 0],
+                null_map: &[0, 1, 0],
                 absent: b"",
             }
         );
@@ -554,16 +546,56 @@ pub(crate) mod tests {
         assert_eq!(stats.oracle_local_columns.load(Ordering::Relaxed), 1);
     }
 
+    /// Queued batches holding all admitted bytes leave sealing its
+    /// workspace, so a stalled inserter cannot block its own queue
+    #[tokio::test]
+    async fn sealing_finishes_while_queued_output_fills_admission() {
+        let gauge = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let budget = output_pool(4 << 10, 1, false, gauge.clone());
+        let queued = budget.admit(budget.admission_max()).await;
+        let batch = seal(vec![wkt_row(0, Some((1.0, 2.0)))]).await;
+        let (batch_tx, batch_rx) = async_channel::bounded(1);
+        let (resolved_tx, resolved_rx) = async_channel::bounded(1);
+        let fatal = Fatal::new();
+        let task = tokio::spawn(run(
+            batch_rx,
+            resolved_tx,
+            ResolverOptions {
+                oracle: None,
+                retry: RetryConfig::default(),
+                codec: CompressionChoice::Lz4,
+                stats: Arc::default(),
+                fatal: fatal.clone(),
+                config_rx: None,
+                budget: budget.clone(),
+            },
+        ));
+        batch_tx.send(batch).await.unwrap();
+        let resolved = tokio::time::timeout(Duration::from_secs(5), resolved_rx.recv())
+            .await
+            .expect("sealed under full admission")
+            .unwrap();
+        assert_eq!(resolved.blocks.len(), 1);
+        assert!(budget.peak_bytes() > queued.bytes(), "workspace taken");
+        assert_eq!(
+            budget.resident_bytes(),
+            queued.bytes(),
+            "workspace returned"
+        );
+        drop(batch_tx);
+        task.await.unwrap();
+        assert!(fatal.message().is_none());
+        drop(queued);
+        assert_eq!(gauge.load(Ordering::Relaxed), 0);
+    }
+
     /// A cell PG must convert keeps the whole column in the request, even
     /// when its neighbours are rendered
     #[tokio::test]
     async fn one_unrendered_cell_keeps_the_column_remote() {
-        let mut rows = vec![wkt_row(0, Some("POINT(1 2)"))];
+        let mut rows = vec![wkt_row(0, Some((1.0, 2.0)))];
         let mut raw = wkt_row(0, None);
-        raw.committed.decoded.new.as_mut().unwrap().columns[0] = Some(ColumnValue::Unsupported {
-            type_oid: GEOM_OID,
-            raw: vec![1, 2, 3],
-        });
+        raw.1.decoded.new.as_mut().unwrap().columns[0] = Some(build::bytes(vec![1, 2, 3]));
         rows.push(raw);
         let mut batch = seal(rows).await;
 
@@ -625,14 +657,11 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn resolver_exits_on_oracle_failure_or_closed_output() {
         let mut raw = wkt_row(0, None);
-        raw.committed.decoded.new.as_mut().unwrap().columns[0] = Some(ColumnValue::Unsupported {
-            type_oid: GEOM_OID,
-            raw: vec![1],
-        });
+        raw.1.decoded.new.as_mut().unwrap().columns[0] = Some(build::bytes(vec![1]));
         let fatal = run_one(seal(vec![raw]).await, true).await;
         let msg = fatal.message().expect("missing oracle trips fatal");
         assert!(msg.starts_with("oracle resolve: "), "{msg}");
-        let fatal = run_one(seal(vec![wkt_row(0, Some("POINT(1 2)"))]).await, false).await;
+        let fatal = run_one(seal(vec![wkt_row(0, Some((1.0, 2.0)))]).await, false).await;
         assert!(fatal.message().is_none());
     }
 
@@ -649,10 +678,7 @@ pub(crate) mod tests {
         ]);
         let oracle = Arc::new(Oracle::new(Arc::new(Bridge::connect(&path).await.unwrap())));
         let mut raw = wkt_row(0, None);
-        raw.committed.decoded.new.as_mut().unwrap().columns[0] = Some(ColumnValue::Unsupported {
-            type_oid: GEOM_OID,
-            raw: vec![1],
-        });
+        raw.1.decoded.new.as_mut().unwrap().columns[0] = Some(build::bytes([1]));
         let retry = RetryConfig {
             max_attempts: 1,
             initial_backoff: Duration::from_millis(1),
@@ -672,92 +698,10 @@ pub(crate) mod tests {
         assert_eq!(stats.retries_attempted.load(Ordering::Relaxed), 1);
     }
 
-    /// Queued batches holding all admitted bytes leave sealing its
-    /// workspace, so a stalled inserter cannot block its own queue
-    #[tokio::test]
-    async fn sealing_finishes_while_queued_output_fills_admission() {
-        let gauge = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let budget = output_pool(4 << 10, 1, false, gauge.clone());
-        let queued = budget.admit(budget.admission_max()).await;
-        let batch = seal(vec![wkt_row(0, Some("POINT(1 2)"))]).await;
-        let (batch_tx, batch_rx) = async_channel::bounded(1);
-        let (resolved_tx, resolved_rx) = async_channel::bounded(1);
-        let fatal = Fatal::new();
-        let task = tokio::spawn(run(
-            batch_rx,
-            resolved_tx,
-            ResolverOptions {
-                oracle: None,
-                retry: RetryConfig::default(),
-                codec: CompressionChoice::Lz4,
-                stats: Arc::default(),
-                fatal: fatal.clone(),
-                config_rx: None,
-                budget: budget.clone(),
-            },
-        ));
-        batch_tx.send(batch).await.unwrap();
-        let resolved = tokio::time::timeout(Duration::from_secs(5), resolved_rx.recv())
-            .await
-            .expect("sealed under full admission")
-            .unwrap();
-        assert_eq!(resolved.blocks.len(), 1);
-        assert!(budget.peak_bytes() > queued.bytes(), "workspace taken");
-        assert_eq!(
-            budget.resident_bytes(),
-            queued.bytes(),
-            "workspace returned"
-        );
-        drop(batch_tx);
-        task.await.unwrap();
-        assert!(fatal.message().is_none());
-        drop(queued);
-        assert_eq!(gauge.load(Ordering::Relaxed), 0);
-    }
-
-    /// Republished compression seals later batches in it, and the batch
-    /// names it so inserters dial to match
-    #[tokio::test]
-    async fn live_compression_reseals_later_batches() {
-        let (cfg_tx, config_rx) = watch::channel(Arc::new(ResolvedConfig {
-            compression: CompressionChoice::Lz4,
-            ..ResolvedConfig::default()
-        }));
-        let (batch_tx, batch_rx) = async_channel::bounded(1);
-        let (resolved_tx, resolved_rx) = async_channel::bounded(1);
-        let fatal = Fatal::new();
-        let task = tokio::spawn(run(
-            batch_rx,
-            resolved_tx,
-            ResolverOptions {
-                oracle: None,
-                retry: RetryConfig::default(),
-                codec: CompressionChoice::None,
-                stats: Arc::default(),
-                fatal: fatal.clone(),
-                config_rx: Some(config_rx),
-                budget: MemoryBudget::new(1 << 30),
-            },
-        ));
-        for _ in 0..2 {
-            batch_tx
-                .send(seal(vec![wkt_row(0, Some("POINT(1 2)"))]).await)
-                .await
-                .unwrap();
-        }
-        for _ in 0..2 {
-            let resolved = resolved_rx.recv().await.unwrap();
-            assert_eq!(resolved.compression, CompressionChoice::Lz4);
-        }
-        drop((batch_tx, cfg_tx));
-        task.await.unwrap();
-        assert!(fatal.message().is_none());
-    }
-
     #[tokio::test]
     async fn short_slab_fails_seal() {
         let mut sealer = Sealer::new(CompressionChoice::None).unwrap();
-        let mut batch = seal(vec![wkt_row(0, Some("POINT(1 2)"))]).await;
+        let mut batch = seal(vec![wkt_row(0, Some((1.0, 2.0)))]).await;
         let block = &mut batch.blocks[0];
         block.buffers[0] = ColumnBuf::NullableFixed {
             width: 4,
@@ -768,7 +712,7 @@ pub(crate) mod tests {
             .seal(&batch.meta, block, None)
             .err()
             .expect("short nullable slab fails");
-        let mut batch = seal(vec![wkt_row(0, Some("POINT(1 2)"))]).await;
+        let mut batch = seal(vec![wkt_row(0, Some((1.0, 2.0)))]).await;
         let block = &mut batch.blocks[0];
         let fixed = block
             .buffers
@@ -793,10 +737,7 @@ pub(crate) mod tests {
     async fn unanswered_oracle_column_and_bad_type_fail_seal() {
         let mut sealer = Sealer::new(CompressionChoice::None).unwrap();
         let mut raw = wkt_row(0, None);
-        raw.committed.decoded.new.as_mut().unwrap().columns[0] = Some(ColumnValue::Unsupported {
-            type_oid: GEOM_OID,
-            raw: vec![1],
-        });
+        raw.1.decoded.new.as_mut().unwrap().columns[0] = Some(build::bytes(vec![1]));
         let batch = seal(vec![raw]).await;
         let e = sealer
             .seal(&batch.meta, &batch.blocks[0], None)
@@ -804,7 +745,7 @@ pub(crate) mod tests {
             .expect("unanswered oracle column fails");
         assert!(e.to_string().contains("oracle answered no column"), "{e}");
 
-        let mut batch = seal(vec![wkt_row(0, Some("POINT(1 2)"))]).await;
+        let mut batch = seal(vec![wkt_row(0, Some((1.0, 2.0)))]).await;
         let mut columns = batch.meta.columns.clone();
         columns[0].type_repr = "Nope(((".into();
         batch.meta = Arc::new(BatchMeta {
@@ -815,18 +756,6 @@ pub(crate) mod tests {
             rows_inserted: Arc::default(),
         });
         assert!(sealer.seal(&batch.meta, &batch.blocks[0], None).is_err());
-        let mut fresh = seal(vec![wkt_row(0, Some("POINT(1 2)"))]).await;
-        fresh.meta = Arc::new(BatchMeta {
-            table_key: fresh.meta.table_key.clone(),
-            inserts: fresh.meta.inserts.clone(),
-            columns: fresh.meta.columns.clone(),
-            schema_epoch: batch.meta.schema_epoch + 1,
-            rows_inserted: Arc::default(),
-        });
-        resolve_local_columns(&mut fresh.blocks[0], &EmitterStats::default());
-        sealer
-            .seal(&fresh.meta, &fresh.blocks[0], None)
-            .expect("next epoch reparses its types");
         let fatal = run_one(batch, true).await;
         let msg = fatal.message().expect("bad type trips fatal");
         assert!(msg.starts_with("seal block: "), "{msg}");

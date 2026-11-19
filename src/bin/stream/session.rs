@@ -1268,7 +1268,7 @@ async fn session_body(
     } else {
         // Metrics-only (no CH): the identical pipeline with a null tail —
         // zero CH connections, no DDL applicator, no oracle (nothing ships,
-        // PgPending stays raw). The empty mapping routes nothing, so seqs
+        // out-of-matrix values stay stored bytes). The empty mapping routes nothing, so seqs
         // complete at placement and the watermark + slot advance move as in
         // a CH run. Emitter stats stay unexported (`emitter_stats_handle`
         // None), matching the old serial surface.
@@ -1326,7 +1326,7 @@ async fn session_body(
         )
         .await?;
     let mirror_resolver = reorder_sink.planning_resolver();
-    let predecode = Arc::new(decoder.predecoder(reorder_sink.planning_resolver()));
+    let prescan = Arc::new(decoder.prescan(reorder_sink.planning_resolver()));
     let decoder_xact = QueueingRecordSink::spawn(
         DecoderXactPair {
             decoder,
@@ -1336,7 +1336,7 @@ async fn session_body(
         decoder_queue_capacity,
         span_registry.clone(),
     )
-    .with_predecode(predecode);
+    .with_prescan(prescan);
     decoder_xact
         .worker_clock()
         .watch_blocked(emitter_stats.queue_blocked_out_nanos.clone());

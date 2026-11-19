@@ -6,9 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use clickhouse_c::{Allocator, Block, BlockOpts, BlockReader, Column, Kind, SliceIo, TypeRef};
 
 use crate::ch::types;
-use crate::decode::heap_decoder::ColumnValue;
 use crate::ops::bridge::{Bridge, BridgeError, MAX_REQUEST_BYTES, request_frame};
-use crate::schema::RelAttr;
 use tokio_postgres::types::Oid;
 
 /// Cell tags, matching `WS_CELL_*` in `pgext/walshadow.h`
@@ -60,9 +58,21 @@ pub enum OracleCell {
 impl OracleCell {
     /// Tag plus optional length-prefixed body
     pub fn wire_bytes(&self) -> usize {
+        let (tag, body) = self.tagged();
+        if tag == CELL_DEFAULT {
+            1
+        } else {
+            5 + body.len()
+        }
+    }
+
+    /// Wire tag and body, empty for `Default`
+    fn tagged(&self) -> (u8, &[u8]) {
         match self {
-            Self::Default => 1,
-            Self::DiskRaw(b) | Self::TextInput(b) | Self::Literal(b) => 5 + b.len(),
+            Self::Default => (CELL_DEFAULT, &[]),
+            Self::DiskRaw(b) => (CELL_DISK_RAW, b),
+            Self::TextInput(b) => (CELL_TEXT, b),
+            Self::Literal(b) => (CELL_LITERAL, b),
         }
     }
 }
@@ -120,6 +130,16 @@ impl OracleColumnBuf {
         }
     }
 
+    /// Empty buffer for the same column
+    pub fn empty_like(&self) -> Self {
+        Self::with_target(
+            self.source_type_oid,
+            self.source_typmod,
+            self.string_target,
+            self.nullable_target,
+        )
+    }
+
     pub fn push(&mut self, cell: OracleCell) {
         self.payload_capacity += match &cell {
             OracleCell::Default => 0,
@@ -173,6 +193,77 @@ impl OracleColumnBuf {
 
     pub fn approx_size(&self) -> usize {
         self.wire_bytes
+    }
+
+    /// Request bytes once `other`'s cells follow these
+    pub fn request_bytes_with(&self, other: &Self) -> usize {
+        if self.remote_cells + other.remote_cells == 0 {
+            0
+        } else {
+            self.wire_bytes + other.wire_bytes
+        }
+    }
+
+    /// Same source type and target, so cells of both share one request column
+    pub fn same_column(&self, other: &Self) -> bool {
+        (
+            self.source_type_oid,
+            self.source_typmod,
+            self.string_target,
+            self.nullable_target,
+        ) == (
+            other.source_type_oid,
+            other.source_typmod,
+            other.string_target,
+            other.nullable_target,
+        )
+    }
+
+    /// Append `other`'s cells, which must target the same column
+    pub fn append(&mut self, other: Self) {
+        self.cells.reserve(other.cells.len());
+        for cell in other.cells {
+            self.push(cell);
+        }
+    }
+
+    pub(crate) fn encode_into(&self, out: &mut Vec<u8>) {
+        use crate::xact::spill::{push_bytes, push_i32, push_u8, push_u32};
+        push_u32(out, self.source_type_oid);
+        push_i32(out, self.source_typmod);
+        push_u8(out, u8::from(self.string_target));
+        push_u8(out, u8::from(self.nullable_target));
+        push_u32(out, self.cells.len() as u32);
+        for cell in &self.cells {
+            let (tag, body) = cell.tagged();
+            push_u8(out, tag);
+            if tag != CELL_DEFAULT {
+                push_bytes(out, body);
+            }
+        }
+    }
+
+    pub(crate) fn decode(
+        c: &mut crate::xact::spill::Cursor<'_>,
+    ) -> Result<Self, crate::xact::spill::SpillError> {
+        let mut buf = Self::with_target(c.u32()?, c.i32()?, c.u8()? != 0, c.u8()? != 0);
+        let n = c.u32()? as usize;
+        buf.cells.reserve(n.min(1 << 20));
+        for _ in 0..n {
+            buf.push(match c.u8()? {
+                CELL_DEFAULT => OracleCell::Default,
+                CELL_DISK_RAW => OracleCell::DiskRaw(c.bytes()?),
+                CELL_TEXT => OracleCell::TextInput(c.bytes()?),
+                CELL_LITERAL => OracleCell::Literal(c.bytes()?),
+                tag => {
+                    return Err(crate::xact::spill::SpillError::Format {
+                        offset: 0,
+                        detail: format!("unknown oracle cell tag {tag}"),
+                    });
+                }
+            });
+        }
+        Ok(buf)
     }
 }
 
@@ -394,21 +485,10 @@ fn encode_request(columns: &[OracleRequestColumn<'_>], n_rows: usize) -> Vec<u8>
     }
     for row in 0..n_rows {
         for c in columns {
-            let cell = &c.buf.cells()[row];
-            match cell {
-                OracleCell::Default => out.push(CELL_DEFAULT),
-                OracleCell::DiskRaw(b) => {
-                    out.push(CELL_DISK_RAW);
-                    put_lenstr(&mut out, b);
-                }
-                OracleCell::TextInput(b) => {
-                    out.push(CELL_TEXT);
-                    put_lenstr(&mut out, b);
-                }
-                OracleCell::Literal(b) => {
-                    out.push(CELL_LITERAL);
-                    put_lenstr(&mut out, b);
-                }
+            let (tag, body) = c.buf.cells()[row].tagged();
+            out.push(tag);
+            if tag != CELL_DEFAULT {
+                put_lenstr(&mut out, body);
             }
         }
     }
@@ -477,28 +557,19 @@ fn decode_block(
     Ok(block)
 }
 
-/// Render PostGIS 2-D points as WKT, typoutput yields HEXEWKB
-pub fn render_ext_columns(attrs: &[RelAttr], columns: &mut [Option<ColumnValue>]) {
-    // Scan cells first: attribute type names sit behind a pointer per column
-    for (idx, cell) in columns.iter_mut().enumerate() {
-        let Some(ColumnValue::PgPending { raw, .. }) = cell.as_ref() else {
-            continue;
-        };
-        let is_geo = attrs.iter().any(|att| {
-            !att.dropped
-                && usize::try_from(att.attnum - 1) == Ok(idx)
-                && matches!(att.type_name.as_str(), "geography" | "geometry")
-        });
-        if is_geo && let Some(text) = gserialized_point_to_wkt(raw) {
-            *cell = Some(ColumnValue::Text(text));
-        }
-    }
+/// GSERIALIZED 2-D point, as [`point_wkt`] reads it
+#[cfg(test)]
+pub(crate) fn point_body(x: f64, y: f64) -> Vec<u8> {
+    let mut raw = vec![0u8, 0, 0, 0, 1, 0, 0, 0];
+    raw.extend_from_slice(&x.to_le_bytes());
+    raw.extend_from_slice(&y.to_le_bytes());
+    raw
 }
 
 /// PostGIS on-disk GSERIALIZED → `POINT(x y)` for 2-D points. Layout:
 /// `[srid(3) + gflags(1)][geomtype u32-le][…]`; POINT has geomtype 1 and its
 /// two `f64`-LE coordinates are the trailing 16 bytes. `None` for non-points.
-fn gserialized_point_to_wkt(raw: &[u8]) -> Option<String> {
+pub(crate) fn point_wkt(raw: &[u8]) -> Option<String> {
     if raw.len() < 16 {
         return None;
     }
@@ -538,6 +609,7 @@ impl OracleStats {
 mod tests {
     use super::*;
     use crate::ops::bridge::FRAME_PREFIX_BYTES;
+    use crate::schema::RelAttr;
     use clickhouse_c::TypeAst;
 
     fn col<'a>(
@@ -619,6 +691,37 @@ mod tests {
         );
     }
 
+    /// Every cell kind survives the spill encoding
+    #[test]
+    fn column_cells_round_trip_through_spill() {
+        let mut buf = OracleColumnBuf::string(16_400, 7);
+        for cell in [
+            OracleCell::Default,
+            OracleCell::DiskRaw(vec![1, 2]),
+            OracleCell::TextInput(b"{}".to_vec()),
+            OracleCell::Literal(b"x".to_vec()),
+        ] {
+            buf.push(cell);
+        }
+        let mut out = Vec::new();
+        buf.encode_into(&mut out);
+        let back = OracleColumnBuf::decode(&mut crate::xact::spill::Cursor::new(&out)).unwrap();
+        assert_eq!(back.cells(), buf.cells());
+        assert_eq!(back.approx_size(), buf.approx_size());
+        assert!(back.same_column(&buf));
+        let mut lone = OracleColumnBuf::string(16_400, 7);
+        lone.push(OracleCell::Default);
+        out.clear();
+        lone.encode_into(&mut out);
+        // Default cell is its bare tag, last byte of frame
+        *out.last_mut().unwrap() = u8::MAX;
+        let err = OracleColumnBuf::decode(&mut crate::xact::spill::Cursor::new(&out)).unwrap_err();
+        assert!(
+            err.to_string().contains("unknown oracle cell tag 255"),
+            "{err}"
+        );
+    }
+
     #[test]
     fn request_column_bytes_matches_framed_size() {
         let mut buf = OracleColumnBuf::new(
@@ -645,13 +748,10 @@ mod tests {
         let mut raw = vec![0u8, 0, 0, 0, 1, 0, 0, 0];
         raw.extend_from_slice(&30.5_f64.to_le_bytes());
         raw.extend_from_slice(&81.25_f64.to_le_bytes());
-        assert_eq!(
-            gserialized_point_to_wkt(&raw).as_deref(),
-            Some("POINT(30.5 81.25)")
-        );
+        assert_eq!(point_wkt(&raw).as_deref(), Some("POINT(30.5 81.25)"));
         // non-point geomtype → None
         raw[4] = 2;
-        assert_eq!(gserialized_point_to_wkt(&raw), None);
+        assert_eq!(point_wkt(&raw), None);
     }
 
     #[test]
@@ -822,34 +922,14 @@ mod tests {
             type_storage: 'm',
             missing_default: None,
         };
-        let mut point = vec![0u8, 0, 0, 0, 1, 0, 0, 0];
-        point.extend_from_slice(&1.5_f64.to_le_bytes());
-        point.extend_from_slice(&(-2.0_f64).to_le_bytes());
-        let pending = |raw: &[u8]| {
-            Some(ColumnValue::PgPending {
-                type_oid: 0,
-                raw: raw.to_vec(),
-            })
-        };
-        let attrs = [
-            attr(1, "geometry", false),
-            attr(2, "geography", false),
-            attr(3, "bytea", false),
-            attr(4, "geometry", true),
-        ];
-        let mut columns = vec![
-            pending(&point),
-            pending(&point[..8]),
-            pending(&point),
-            pending(&point),
-            None,
-        ];
-        render_ext_columns(&attrs, &mut columns);
-        assert!(matches!(&columns[0], Some(ColumnValue::Text(t)) if t == "POINT(1.5 -2)"));
-        for (i, c) in columns.iter().enumerate().take(4).skip(1) {
-            assert!(matches!(c, Some(ColumnValue::PgPending { .. })), "{i}");
+        use crate::emit::ch_emitter::Codec;
+        for (type_name, wkt) in [("geometry", true), ("geography", true), ("bytea", false)] {
+            let codec = Codec::choose(&attr(1, type_name, false));
+            assert_eq!(matches!(codec, Codec::Wkt), wkt, "{type_name}");
         }
-        assert!(columns[4].is_none());
+        let point = point_body(1.5, -2.0);
+        assert_eq!(point_wkt(&point).as_deref(), Some("POINT(1.5 -2)"));
+        assert_eq!(point_wkt(&point[..8]), None);
     }
 
     /// Answer that fails to decode counts as an oracle error

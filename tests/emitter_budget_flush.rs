@@ -24,10 +24,11 @@ use std::sync::atomic::Ordering;
 use walrus::pg::walparser::RelFileNode;
 use walshadow::ch::CompressionChoice;
 use walshadow::ch_emitter::{EmitterConfig, EmitterStats, InstanceConfig};
-use walshadow::heap_decoder::{ColumnValue, CommittedTuple, DecodedHeap, DecodedTuple, HeapOp};
+use walshadow::datum::build;
+use walshadow::heap_decoder::{CommittedTuple, DecodedHeap, DecodedTuple, HeapOp};
 use walshadow::mapping::{ColumnMapping, TableMapping, TableTarget};
 use walshadow::pipeline::ack::Publish;
-use walshadow::pipeline::batcher::{BatcherMsg, RoutedRow, RowChunk, RowTable};
+use walshadow::pipeline::batcher::{BatcherMsg, PlacedSegment};
 use walshadow::pipeline::{Fatal, tail};
 use walshadow::pos::Pos;
 use walshadow::pos::{EmitterAck, Monotone};
@@ -113,8 +114,8 @@ fn tuple(id: i32, source_lsn: u64, commit_lsn: u64) -> CommittedTuple {
             op: HeapOp::Insert,
             new: Some(DecodedTuple {
                 columns: vec![
-                    Some(ColumnValue::Int4(id)),
-                    Some(ColumnValue::Text(format!("row-{id}"))),
+                    Some(build::int4(id)),
+                    Some(build::text(format!("row-{id}"))),
                 ],
                 partial: false,
             }),
@@ -183,23 +184,15 @@ async fn budget_trips_seal_complete_inserts() {
     let commit_lsn = 0xC0FFEE;
     let mut seqs = ack.seqs(0);
     let seq = seqs.open(commit_lsn, None, Publish::Commit);
-    let rows = (0..N)
-        .map(|i| RoutedRow {
-            seq: seq.seq(),
-            table: 0,
-            committed: tuple(i, 0x1000 + i as u64, commit_lsn),
-            value_permit: None,
+    let rel = rel_descriptor();
+    let segments = (0..N)
+        .map(|i| {
+            let row = tuple(i, 0x1000 + i as u64, commit_lsn);
+            PlacedSegment::of_rows(seq.seq(), &rel, &route, &[row]).expect("encode row")
         })
         .collect();
     msg_tx
-        .send(BatcherMsg::Rows(RowChunk {
-            tables: vec![RowTable {
-                rel: rel_descriptor(),
-                route,
-            }],
-            rows,
-            permit: None,
-        }))
+        .send(BatcherMsg::Segments(segments))
         .await
         .expect("route rows");
     seqs.place(seq, N as u64);
@@ -347,23 +340,12 @@ async fn stalled_inserters_backpressure_many_tables_then_drain() {
             for i in 0..ROWS {
                 let (rel, route) = &tables[i % TABLES];
                 let seq = seqs.open(commit(i), None, Publish::Commit);
-                let mut committed = tuple(i as i32, commit(i) - 1, commit(i));
-                committed.decoded.rfn = rel.rfn;
-                let chunk = RowChunk {
-                    tables: vec![RowTable {
-                        rel: rel.clone(),
-                        route: route.clone(),
-                    }],
-                    rows: vec![RoutedRow {
-                        seq: seq.seq(),
-                        table: 0,
-                        committed,
-                        value_permit: None,
-                    }],
-                    permit: None,
-                };
+                let mut row = tuple(i as i32, commit(i) - 1, commit(i));
+                row.decoded.rfn = rel.rfn;
+                let segment =
+                    PlacedSegment::of_rows(seq.seq(), rel, route, &[row]).expect("encode row");
                 msg_tx
-                    .send(BatcherMsg::Rows(chunk))
+                    .send(BatcherMsg::Segments(vec![segment]))
                     .await
                     .expect("route row");
                 seqs.place(seq, 1);

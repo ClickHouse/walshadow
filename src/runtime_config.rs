@@ -19,7 +19,9 @@
 //! typed rows and [`ConfigOverlay::apply`] just replaces the entry. Values are
 //! validated late, at resolver merge time, not here.
 
-use crate::decode::heap_decoder::{ColumnValue, DecodedHeap, HeapOp};
+use crate::decode::datum::Datum;
+use crate::decode::heap_decoder::{DecodedHeap, HeapOp};
+use crate::schema::RelAttr;
 use crate::schema::{RelDescriptor, RelName};
 use crate::table_rules::MatchKind;
 use foldhash::HashMap;
@@ -249,7 +251,7 @@ impl ConfigOverlay {
 /// the old image, for the row key (`REPLICA IDENTITY FULL` keeps it complete).
 /// `None` for ops with no usable image (TRUNCATE, or an UPDATE lacking a new
 /// image).
-fn full_image(decoded: &DecodedHeap) -> Option<Vec<Option<ColumnValue>>> {
+fn full_image(decoded: &DecodedHeap) -> Option<Vec<Option<Datum>>> {
     match decoded.op {
         HeapOp::Insert => decoded.new.as_ref().map(|t| t.columns.clone()),
         HeapOp::Update | HeapOp::HotUpdate => {
@@ -271,50 +273,60 @@ fn full_image(decoded: &DecodedHeap) -> Option<Vec<Option<ColumnValue>>> {
     }
 }
 
-/// `Some(&value)` when the named column is present in the image (including an
-/// explicit SQL NULL as `ColumnValue::Null`); `None` when absent.
+/// Attribute and datum when the named column is present in the image
+/// (including an explicit SQL NULL); `None` when absent
 fn column<'a>(
-    rel: &RelDescriptor,
-    cols: &'a [Option<ColumnValue>],
+    rel: &'a RelDescriptor,
+    cols: &'a [Option<Datum>],
     name: &str,
-) -> Option<&'a ColumnValue> {
+) -> Option<(&'a RelAttr, &'a Datum)> {
     let att = rel
         .attributes
         .iter()
         .find(|a| a.name == name && !a.dropped)?;
-    cols.get((att.attnum - 1).max(0) as usize)?.as_ref()
+    Some((att, cols.get((att.attnum - 1).max(0) as usize)?.as_ref()?))
 }
 
-fn field_i64(rel: &RelDescriptor, cols: &[Option<ColumnValue>], name: &str) -> Option<i64> {
+fn field_i64(rel: &RelDescriptor, cols: &[Option<Datum>], name: &str) -> Option<i64> {
+    use crate::schema::{INT2OID, INT4OID, INT8OID};
     match column(rel, cols, name)? {
-        ColumnValue::Int8(v) => Some(*v),
-        ColumnValue::Int4(v) => Some(*v as i64),
-        ColumnValue::Int2(v) => Some(*v as i64),
+        (_, Datum::Text(t)) => std::str::from_utf8(t).ok()?.parse().ok(),
+        (att, Datum::Fixed(b)) => match att.type_oid {
+            INT8OID => Some(i64::from_le_bytes(b.as_slice().try_into().ok()?)),
+            INT4OID => Some(i32::from_le_bytes(b.as_slice().try_into().ok()?).into()),
+            INT2OID => Some(i16::from_le_bytes(b.as_slice().try_into().ok()?).into()),
+            _ => None,
+        },
         _ => None,
     }
 }
 
-fn field_bool(rel: &RelDescriptor, cols: &[Option<ColumnValue>], name: &str) -> Option<bool> {
+fn field_bool(rel: &RelDescriptor, cols: &[Option<Datum>], name: &str) -> Option<bool> {
     match column(rel, cols, name)? {
-        ColumnValue::Bool(v) => Some(*v),
+        (att, Datum::Fixed(b)) if att.type_oid == crate::schema::BOOLOID => Some(*b.first()? != 0),
+        (_, Datum::Text(t)) => Some(matches!(&t[..], b"t" | b"true" | b"yes" | b"on" | b"1")),
         _ => None,
     }
 }
 
-fn field_string(rel: &RelDescriptor, cols: &[Option<ColumnValue>], name: &str) -> Option<String> {
-    match column(rel, cols, name)? {
-        ColumnValue::Text(v) | ColumnValue::Name(v) | ColumnValue::Json(v) => Some(v.clone()),
-        _ => None,
-    }
+fn field_string(rel: &RelDescriptor, cols: &[Option<Datum>], name: &str) -> Option<String> {
+    let bytes = match column(rel, cols, name)? {
+        (att, Datum::Fixed(b)) if att.type_oid == crate::schema::NAMEOID => {
+            &b[..b.iter().position(|&c| c == 0).unwrap_or(b.len())]
+        }
+        (_, Datum::Varlena(b) | Datum::Text(b)) => b.as_slice(),
+        _ => return None,
+    };
+    String::from_utf8(bytes.to_vec()).ok()
 }
 
 fn field_string_array(
     rel: &RelDescriptor,
-    cols: &[Option<ColumnValue>],
+    cols: &[Option<Datum>],
     name: &str,
 ) -> Option<Vec<String>> {
     match column(rel, cols, name)? {
-        ColumnValue::PgPending { type_oid, raw } if *type_oid == crate::schema::TEXTARRAYOID => {
+        (att, Datum::Varlena(raw)) if att.type_oid == crate::schema::TEXTARRAYOID => {
             crate::decode::codecs::decode_text_array(raw)
         }
         _ => None,
@@ -426,7 +438,8 @@ pub fn interpret(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::decode::heap_decoder::{ColumnValue, DecodedHeap, DecodedTuple, HeapOp};
+    use crate::decode::datum::{Datum, build};
+    use crate::decode::heap_decoder::{DecodedHeap, DecodedTuple, HeapOp};
     use crate::schema::{RelAttr, RelDescriptor, ReplIdent};
     use walrus::pg::walparser::RelFileNode;
 
@@ -466,17 +479,14 @@ mod tests {
         }
     }
 
-    fn text_array(values: &[&str]) -> ColumnValue {
-        ColumnValue::PgPending {
-            type_oid: crate::schema::TEXTARRAYOID,
-            raw: crate::decode::codecs::text_array_body(values),
-        }
+    fn text_array(values: &[&str]) -> Datum {
+        build::bytes(crate::decode::codecs::text_array_body(values))
     }
 
     fn heap(
         op: HeapOp,
-        new: Option<Vec<Option<ColumnValue>>>,
-        old: Option<Vec<Option<ColumnValue>>>,
+        new: Option<Vec<Option<Datum>>>,
+        old: Option<Vec<Option<Datum>>>,
     ) -> DecodedHeap {
         DecodedHeap {
             rfn: RelFileNode {
@@ -518,13 +528,13 @@ mod tests {
         let d = heap(
             HeapOp::Insert,
             Some(vec![
-                Some(ColumnValue::Int2(1)),
-                Some(ColumnValue::Int8(1000)),
-                Some(ColumnValue::Null), // byte_budget NULL → daemon default
-                Some(ColumnValue::Int8(250)),
-                Some(ColumnValue::Text("zstd".into())),
-                Some(ColumnValue::Int4(9)),
-                Some(ColumnValue::Text("drop".into())),
+                Some(build::int2(1)),
+                Some(build::int8(1000)),
+                Some(Datum::Null), // byte_budget NULL → daemon default
+                Some(build::int8(250)),
+                Some(build::text("zstd")),
+                Some(build::int4(9)),
+                Some(build::text("drop")),
             ]),
             None,
         );
@@ -547,23 +557,15 @@ mod tests {
     /// image is whole for these tables, so this exercises it with synthetic gaps.
     #[test]
     fn global_update_backfills_absent_columns_from_old() {
-        let new = vec![
-            None,
-            None,
-            Some(ColumnValue::Int8(2048)),
-            None,
-            None,
-            None,
-            None,
-        ];
+        let new = vec![None, None, Some(build::int8(2048)), None, None, None, None];
         let old = vec![
-            Some(ColumnValue::Int2(1)),
-            Some(ColumnValue::Int8(1000)),
-            Some(ColumnValue::Int8(999)),
-            Some(ColumnValue::Int8(250)),
-            Some(ColumnValue::Text("lz4".into())),
-            Some(ColumnValue::Int4(5)),
-            Some(ColumnValue::Text("retain".into())),
+            Some(build::int2(1)),
+            Some(build::int8(1000)),
+            Some(build::int8(999)),
+            Some(build::int8(250)),
+            Some(build::text("lz4")),
+            Some(build::int4(5)),
+            Some(build::text("retain")),
         ];
         // byte_budget changed in new image, rest filled from old
         assert_eq!(
@@ -587,13 +589,13 @@ mod tests {
     #[test]
     fn global_delete_clears() {
         let old = vec![
-            Some(ColumnValue::Int2(1)),
-            Some(ColumnValue::Int8(1)),
-            Some(ColumnValue::Int8(1)),
-            Some(ColumnValue::Int8(1)),
-            Some(ColumnValue::Text("lz4".into())),
-            Some(ColumnValue::Int4(1)),
-            Some(ColumnValue::Text("retain".into())),
+            Some(build::int2(1)),
+            Some(build::int8(1)),
+            Some(build::int8(1)),
+            Some(build::int8(1)),
+            Some(build::text("lz4")),
+            Some(build::int4(1)),
+            Some(build::text("retain")),
         ];
         assert_eq!(
             interpret(
@@ -617,10 +619,10 @@ mod tests {
             ],
         );
         let old = vec![
-            Some(ColumnValue::Text("public".into())),
-            Some(ColumnValue::Null),
-            Some(ColumnValue::Bool(true)),
-            Some(ColumnValue::Null),
+            Some(build::text("public")),
+            Some(Datum::Null),
+            Some(build::bool_(true)),
+            Some(Datum::Null),
         ];
         assert_eq!(
             interpret(
@@ -650,12 +652,12 @@ mod tests {
             ],
         );
         let new = vec![
-            Some(ColumnValue::Text("public".into())),
-            Some(ColumnValue::Text("events".into())),
-            Some(ColumnValue::Text("default".into())),
-            Some(ColumnValue::Text("events".into())),
-            Some(ColumnValue::Bool(true)),
-            Some(ColumnValue::Text("copy".into())),
+            Some(build::text("public")),
+            Some(build::text("events")),
+            Some(build::text("default")),
+            Some(build::text("events")),
+            Some(build::bool_(true)),
+            Some(build::text("copy")),
             Some(text_array(&["tenant", "id"])),
             Some(text_array(&["tenant"])),
         ];
@@ -693,9 +695,9 @@ mod tests {
             ],
         );
         let new = vec![
-            Some(ColumnValue::Text("public".into())),
-            Some(ColumnValue::Text("events".into())),
-            Some(ColumnValue::Text("events".into())),
+            Some(build::text("public")),
+            Some(build::text("events")),
+            Some(build::text("events")),
         ];
         assert_eq!(
             interpret(
@@ -727,12 +729,12 @@ mod tests {
             ],
         );
         let new = vec![
-            Some(ColumnValue::Text("app".into())),
-            Some(ColumnValue::Text("events_.*".into())),
-            Some(ColumnValue::Text("regex".into())),
-            Some(ColumnValue::Bool(true)),
-            Some(ColumnValue::Text("_peerdb_version".into())),
-            Some(ColumnValue::Text(String::new())),
+            Some(build::text("app")),
+            Some(build::text("events_.*")),
+            Some(build::text("regex")),
+            Some(build::bool_(true)),
+            Some(build::text("_peerdb_version")),
+            Some(build::text(String::new())),
         ];
         // Absent system columns (xid, commit_ts) inherit
         assert_eq!(
@@ -781,11 +783,11 @@ mod tests {
             ],
         );
         let new = vec![
-            Some(ColumnValue::Text("app".into())),
-            Some(ColumnValue::Text("m".into())),
-            Some(ColumnValue::Text("self".into())),
-            Some(ColumnValue::Text("toYYYYMM(ts)".into())),
-            Some(ColumnValue::Text("_part".into())),
+            Some(build::text("app")),
+            Some(build::text("m")),
+            Some(build::text("self")),
+            Some(build::text("toYYYYMM(ts)")),
+            Some(build::text("_part")),
         ];
         assert_eq!(
             interpret(
@@ -810,10 +812,7 @@ mod tests {
             CONFIG_NAMESPACE,
             vec![attr(1, "namespace", 25), attr(2, "detach_strategy", 25)],
         );
-        let new = vec![
-            Some(ColumnValue::Text("app".into())),
-            Some(ColumnValue::Text("drop".into())),
-        ];
+        let new = vec![Some(build::text("app")), Some(build::text("drop"))];
         assert_eq!(
             interpret(
                 ConfigTableKind::Namespace,
@@ -846,14 +845,14 @@ mod tests {
             ],
         );
         let new = vec![
-            Some(ColumnValue::Text("app".into())),
-            Some(ColumnValue::Text("*".into())),
-            Some(ColumnValue::Text("*_amount".into())),
-            Some(ColumnValue::Text("glob".into())),
-            Some(ColumnValue::Text("Decimal(38, 9)".into())),
-            Some(ColumnValue::Text("0".into())),
-            Some(ColumnValue::Text("max".into())),
-            Some(ColumnValue::Null),
+            Some(build::text("app")),
+            Some(build::text("*")),
+            Some(build::text("*_amount")),
+            Some(build::text("glob")),
+            Some(build::text("Decimal(38, 9)")),
+            Some(build::text("0")),
+            Some(build::text("max")),
+            Some(Datum::Null),
         ];
         // NULL neg_inf inherits
         assert_eq!(
@@ -891,7 +890,7 @@ mod tests {
     #[test]
     fn global_smallint_budget_widens() {
         let r = rel(CONFIG_GLOBAL, vec![attr(1, "row_budget", 21)]);
-        let d = heap(HeapOp::Insert, Some(vec![Some(ColumnValue::Int2(5))]), None);
+        let d = heap(HeapOp::Insert, Some(vec![Some(build::int2(5))]), None);
         assert_eq!(
             interpret(ConfigTableKind::Global, &d, &r),
             Some(ConfigEvent::GlobalUpserted(GlobalRow {
@@ -985,5 +984,35 @@ mod tests {
         ] {
             assert_eq!(mode.as_str().parse(), Ok(mode));
         }
+    }
+
+    /// Typed and `typoutput` text cells read alike
+    #[test]
+    fn field_readers_take_text_and_stored_forms() {
+        use crate::schema::{BOOLOID, INT2OID, INT4OID, INT8OID, NAMEOID};
+        let r = rel(
+            "t",
+            vec![
+                attr(1, "n", INT8OID),
+                attr(2, "i2", INT2OID),
+                attr(3, "on", BOOLOID),
+                attr(4, "nm", NAMEOID),
+                attr(5, "i4", INT4OID),
+            ],
+        );
+        let text = |s: &str| Some(build::out_text(s));
+        let cols = [
+            text("42"),
+            Some(build::int2(-2)),
+            text("on"),
+            Some(build::name("ab")),
+            Some(build::int4(7)),
+        ];
+        assert_eq!(field_i64(&r, &cols, "n"), Some(42));
+        assert_eq!(field_i64(&r, &cols, "i2"), Some(-2));
+        assert_eq!(field_i64(&r, &cols, "nm"), None);
+        assert_eq!(field_bool(&r, &cols, "on"), Some(true));
+        assert_eq!(field_bool(&r, &cols, "i4"), None);
+        assert_eq!(field_string(&r, &cols, "nm").as_deref(), Some("ab"));
     }
 }
