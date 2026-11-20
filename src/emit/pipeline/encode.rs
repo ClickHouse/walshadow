@@ -69,7 +69,9 @@ pub fn spawn(
     encoders: Encoders,
     stats: Arc<EmitterStats>,
 ) -> JoinHandle<Result<EncodedRun, String>> {
-    tokio::spawn(async move {
+    // Blocking pool: a whole run encodes in one call, which would hold a
+    // runtime worker the serial planner needs back after each yield
+    tokio::task::spawn_blocking(move || {
         let run = encode(&segments, permit, &encoders);
         if run.is_err() {
             stats.plan_failures_encode.fetch_add(1, Ordering::Relaxed);

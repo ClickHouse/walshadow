@@ -267,9 +267,16 @@ async fn resolve_batches(
                 .oracle_resolve_nanos
                 .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
             let started = std::time::Instant::now();
-            let b = sealer
-                .seal(&meta, &block, resolved.as_ref())
-                .map_err(|e| format!("seal block: {e}"))?;
+            // Blocking pool: compression holds a thread for the whole block
+            let at = meta.clone();
+            let (back, b) = tokio::task::spawn_blocking(move || {
+                let b = sealer.seal(&at, &block, resolved.as_ref());
+                (sealer, b)
+            })
+            .await
+            .expect("seal does not panic");
+            sealer = back;
+            let b = b.map_err(|e| format!("seal block: {e}"))?;
             stats
                 .resident_raw_bytes
                 .fetch_add(b.raw_len() as u64, Ordering::Relaxed);
