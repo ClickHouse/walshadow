@@ -49,7 +49,9 @@ SELECT 1 FROM ceramic_runs WHERE id = :parent_id::bigint FOR UPDATE;
 SELECT 1 FROM ceramic_items WHERE id = :target::bigint FOR UPDATE;
 UPDATE ceramic_items SET status = CASE status WHEN 'pending' THEN 'running' ELSE 'succeeded' END,
   attempt = attempt + 1, completed_at = now(), duration_ms = :dur::int, updated_at = now(),
-  payload_b = (SELECT doc FROM ceramic_pool WHERE kind = 'b' AND id = :q::int)
+  payload_b = CASE WHEN :rewrite_payload_b::int = 1
+    THEN (SELECT doc FROM ceramic_pool WHERE kind = 'b' AND id = :q::int)
+    ELSE payload_b END
   WHERE id = :target::bigint;
 COMMIT;
 \elif :r2 < :inline_end_pm

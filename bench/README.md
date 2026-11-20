@@ -229,6 +229,21 @@ and `CHECKPOINT_S=0.05 WAL_COMPRESSION=off` for larger WAL volume. Tune
 checkpoint frequency and seed size against `WAL-KiB/row` and
 `TOAST-batches/1k-rows`, then reuse each snapshot across builds and feeds.
 
+To stress retained TOAST reads with little WAL per row, run `prepare.sh`
+with the following settings, then run `run.sh` with `WAL_FEED=archive`
+against the same snapshot.
+
+```bash
+SEED_ROWS=30000 PAYLOAD_A_ITEMS=112 REWRITE_PAYLOAD_B=1 \
+UPD_PM=1000 UPD_REPEAT=2000 UPD_RECENT_FRAC=0 \
+GEN_SECS=30 TPS=4500 CHECKPOINT_S=0 WAL_COMPRESSION=lz4 \
+bench/ceramic/prepare.sh
+```
+
+Updates retain wide `payload_a` and replace `payload_b`. Set
+`REWRITE_PAYLOAD_B=0` to retain both values and reduce WAL per update.
+`PAYLOAD_A_ITEMS` controls retained document width independently of updates.
+
 `drain` measures from daemon launch to ClickHouse acknowledgment of the fixed
 end LSN. Whole-run metrics include source WAL MiB/s, emitted rows/s, TOAST
 fetch batches/s, WAL KiB per emitted row and TOAST fetch batches per 1,000

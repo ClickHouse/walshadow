@@ -7,8 +7,8 @@ INSERT INTO ceramic_pool SELECT g, 'a', jsonb_build_object('version', g, 'kind',
      'tags', jsonb_build_array(substr(md5(g || 't' || i), 1, 8), substr(md5(g || 'u' || i), 1, 8)),
      'attrs', jsonb_build_object('color', (ARRAY['red', 'green', 'blue'])[1 + i % 3],
        'weight', i * 1.5, 'note', md5(g || 'a' || i))))
-   FROM generate_series(1, 28) i),
-  'summary', jsonb_build_object('count', 28, 'owner', md5(g::text), 'ok', true))
+   FROM generate_series(1, :payload_a_items) i),
+  'summary', jsonb_build_object('count', :payload_a_items, 'owner', md5(g::text), 'ok', true))
 FROM generate_series(0, 63) g;
 INSERT INTO ceramic_pool SELECT g, 'b', jsonb_build_object('result', g, 'status', 'ok',
   'outputs', (SELECT jsonb_agg(jsonb_build_object('key', 'out-' || i, 'value', md5(g || 'o' || i),

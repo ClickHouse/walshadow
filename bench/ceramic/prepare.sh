@@ -18,6 +18,8 @@
 #   RECENT_IDS=N       recency window in hot-table ids (default 20000)
 #   GEN_SECS=N         backlog seconds (default 40)
 #   TPS=N              script runs/s while generating (default 8000)
+#   PAYLOAD_A_ITEMS=N  nested entries in retained payload (default 28)
+#   REWRITE_PAYLOAD_B=0 retain both TOAST values during updates
 #   CLIENTS=N          pgbench clients (default 32)
 #   CHECKPOINT_S=N     forced checkpoint interval, 0 disables (default 2)
 #   WAL_COMPRESSION=lz4  compression of full-page images
@@ -75,7 +77,7 @@ max_connections = 300
 EOF
 src_start
 psrc -f "$SCHEMA" >/dev/null
-psrc -f "$HERE/pool.sql" >/dev/null
+psrc -v payload_a_items="${PAYLOAD_A_ITEMS:-28}" -f "$HERE/pool.sql" >/dev/null
 psrc -v rows="$SEED_ROWS" -f "$SEED"
 psrc -c "VACUUM ANALYZE" -c CHECKPOINT
 HOT=ceramic_items
@@ -110,7 +112,7 @@ if [[ $CHECKPOINT_S != 0 ]]; then
 fi
 pgbench -h "$SRUN/sock" -p $SRC_PORT -U postgres -d postgres -n -M prepared -f "$WORKLOAD" \
   -D seed_rows="$SEED_ROWS" -D recent_ids="$RECENT_IDS" -D upd_pm="$UPD_PM" \
-  -D inline_end_pm="$INLINE_END_PM" -D ins_pm="$(bc <<<"$UPD_PM / $UPD_REPEAT")" \
+  -D rewrite_payload_b="${REWRITE_PAYLOAD_B:-1}" -D inline_end_pm="$INLINE_END_PM" -D ins_pm="$(bc <<<"$UPD_PM / $UPD_REPEAT")" \
   -D recent_pm="$(bc <<<"1000 * $UPD_RECENT_FRAC / 1")" \
   -R "$TPS" -c "$CLIENTS" -j 16 -T "$GEN_SECS" >"$DRUN/pgbench.log" 2>&1 || {
   [[ -z $CKPT ]] || kill "$CKPT"

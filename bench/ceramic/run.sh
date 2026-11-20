@@ -89,7 +89,7 @@ while :; do
     $1 == "walshadow_spill_bytes_active" {s = $2} END {print r == "" ? "-" : r, s + 0}' "$DRUN/m.txt")
   [[ $R != - && $R != "$ROUT" ]] && { ROUT=$R; TOUT=$(date +%s.%N); cp "$DRUN/m.txt" "$DRUN/m1.txt"; threadcpu "$DAEMON" >"$DRUN/cpu1.txt"; }
   (( S > SPILL_PEAK )) && SPILL_PEAK=$S
-  if awk -v end="$END_BYTES" '$1 == "walshadow_emitter_ack_lsn" && $2 + 0 >= end { ok = 1 } END { exit !ok }' "$DRUN/m.txt"; then
+  if awk -v end="$END_BYTES" '($1 == "walshadow_emitter_ack_lsn" || $1 == "walshadow_position_lsn{at=\"ack\"}") && $2 + 0 >= end { ok = 1 } END { exit !ok }' "$DRUN/m.txt"; then
     break
   fi
   check_drain
