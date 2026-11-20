@@ -180,3 +180,91 @@ Keep stdout logs and adjacent `provenance.txt` for revision attribution
 
 Stage metrics cover bootstrap, shadow replay, COPY, insert flush, publication,
 and settlement, include waits and overlap, so do not sum into wall-time percentages
+
+## Production-shaped drain (ceramic)
+
+`bench/ceramic/` generates a fixed WAL backlog with synthetic data. A status
+update leaves an out-of-line JSONB value unchanged, so Walshadow fetches it
+from shadow PostgreSQL and may have to wait for replay. The workload also
+generates row locks, index changes and full-page images.
+
+```sh
+bench/ceramic/prepare.sh <oldest-tree>       # golden snapshot, once
+DAEMON_CPUS=0-7 SRC_CPUS=8-15 CH_CPUS=16-23 bench/ceramic/run.sh <tree>
+WAL_FEED=archive bench/ceramic/run.sh <tree> # same WAL through a local archive
+bench/ceramic/ab.sh <treeA> <treeB> 4         # interleaved, mean ± stdev, B/A
+```
+
+Needs PostgreSQL 18 (source and shadow share the major; `PG=17` works),
+its server dev package for the pgext build, pgbench, `bc` and a `clickhouse`
+binary. `prepare.sh` seeds the source (24 tables, the hot one with six
+btree indexes including two partial on status, lz4 nested jsonb two and
+one TOAST chunks wide), bootstraps a shadow in `[toast] mode = "shadow"`,
+stops the daemon and generates about 5.6M records of WAL behind it. It
+keeps the result as a golden snapshot: shadow, out, spill and source WAL on
+`DISK` (a real disk), and the source data files, sockets and its own
+ClickHouse on `SHM` (tmpfs). `run.sh` restores the snapshot (WAL segments
+are hard-linked), starts the daemon pinned and resumes it from the persisted
+floor. It then drains to the fixed end LSN and appends one line to
+`$DISK/results.tsv`. Archive runs expose completed segments through a local
+`file://` archive and require evidence of archive replay.
+Ports default to 62432-62441 and 62484.
+
+Bootstrap the golden with the oldest tree under comparison: newer trees
+resume its state. Swap `SCHEMA`, `SEED` or `WORKLOAD` for other shapes.
+`UPD_RECENT_FRAC` (default 0.5) aims that share of transitions at
+recently inserted rows instead of random seeded ones. `UPD_REPEAT`
+(default 3.5) sets transitions per insert. `CHECKPOINT_S` sets the FPI
+share. Set it to `0` to skip forced checkpoints. Change `WAL_COMPRESSION`
+from `lz4` to `off` to increase WAL bytes per row without adding updates.
+`UPD_PM` (default 910) and `INLINE_UPD_PM` (default 0) set TOAST-bearing and
+narrow updates per 1,000 script runs. Use separate short `DISK` and `SHM` paths
+for each snapshot so PostgreSQL's Unix socket paths fit. Pass `BIN` and
+`BRIDGE_LIB_DIR` for prebuilt artifacts
+(`BIN_A`/`BIN_B` and `BRIDGE_LIB_DIR_A`/`BRIDGE_LIB_DIR_B` for `ab.sh`).
+
+For a two-shape comparison, start with `UPD_PM=90 INLINE_UPD_PM=820` in both
+snapshots. Use `CHECKPOINT_S=1 WAL_COMPRESSION=lz4` for smaller WAL volume
+and `CHECKPOINT_S=0.05 WAL_COMPRESSION=off` for larger WAL volume. Tune
+checkpoint frequency and seed size against `WAL-KiB/row` and
+`TOAST-batches/1k-rows`, then reuse each snapshot across builds and feeds.
+
+To stress retained TOAST reads with little WAL per row, run `prepare.sh`
+with the following settings, then run `run.sh` with `WAL_FEED=archive`
+against the same snapshot.
+
+```bash
+SEED_ROWS=30000 PAYLOAD_A_ITEMS=112 REWRITE_PAYLOAD_B=1 \
+UPD_PM=1000 UPD_REPEAT=2000 UPD_RECENT_FRAC=0 \
+GEN_SECS=30 TPS=4500 CHECKPOINT_S=0 WAL_COMPRESSION=lz4 \
+bench/ceramic/prepare.sh
+```
+
+Updates retain wide `payload_a` and replace `payload_b`. Set
+`REWRITE_PAYLOAD_B=0` to retain both values and reduce WAL per update.
+`PAYLOAD_A_ITEMS` controls retained document width independently of updates.
+
+`drain` measures from daemon launch to ClickHouse acknowledgment of the fixed
+end LSN. Whole-run metrics include source WAL MiB/s, emitted rows/s, TOAST
+fetch batches/s, WAL KiB per emitted row and TOAST fetch batches per 1,000
+emitted rows. `TOAST-ms/batch` includes time waiting for replay and can include
+overlapping read-ahead. Use `TOAST_READ_AHEAD=false` on builds that support
+it to measure read-ahead's effect on the same snapshot. `ab.sh` accepts
+`TOAST_READ_AHEAD_A` and `TOAST_READ_AHEAD_B` for interleaved comparisons.
+Compare these metrics before interpreting a higher WAL rate.
+
+Worker metrics cover the window from the first to the last record out:
+
+- `rec/s`, `B/rec`: worker throughput and backlog bytes per record
+- `<thread>=%core/ns-per-record`: `tokio` sums the runtime workers, and
+  `cores` is the whole daemon
+- `wait`: pump seconds per second blocked on the full worker queue
+- `f`: TOAST values fetched per record. `c_fetch` is the time per fetch,
+  and `fetch s/s` is the share of wall time spent fetching. Bridge
+  `fetch_toast` and `replay_lsn` are per-call latencies
+- `ack_tail`: time from the last record out to ClickHouse acknowledgment
+
+The worker model is `rec/s = 1 / (c_rec + f * c_fetch)`. `c_rec` is the
+per-record cost without fetching, so `1/rec_s - f * c_fetch` estimates it.
+A fix that batches or overlaps fetches shows up as a drop in `fetch s/s`
+and `c_fetch`. One that cheapens discarded records shows up in `c_rec`.
