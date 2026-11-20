@@ -8,8 +8,9 @@
 -- out-of-line values. Transition targets are the last recent_ids items with
 -- probability recent_pm/1000, else random seeded items.
 -- Insert and transition commit separately, as production commits once per
--- update. Variables from prepare.sh: seed_rows, upd_pm, ins_pm, recent_pm,
--- recent_ids
+-- update. Narrow parent updates dilute TOAST fetches without adding payload
+-- writes. Variables from prepare.sh: seed_rows, upd_pm, inline_end_pm,
+-- ins_pm, recent_pm, recent_ids
 \set r1 random(0, 999)
 \set r2 random(0, 999)
 \set r3 random(0, 999)
@@ -51,4 +52,7 @@ UPDATE ceramic_items SET status = CASE status WHEN 'pending' THEN 'running' ELSE
   payload_b = (SELECT doc FROM ceramic_pool WHERE kind = 'b' AND id = :q::int)
   WHERE id = :target::bigint;
 COMMIT;
+\elif :r2 < :inline_end_pm
+UPDATE ceramic_runs SET item_count = item_count + 1, updated_at = now()
+  WHERE id = :parent_id::bigint;
 \endif

@@ -70,8 +70,13 @@ src_stop() { pg_ctl -D "$SRUN/src" -m "${1:-fast}" stop >/dev/null 2>&1 || true;
 #   XACT_BUFFER_MAX=64M  --xact-buffer-max (v0.1.4 default 64M, main 512M)
 #   INSERTERS=16 DECODERS=16  [ch] inserter_pool_size, decoder_pool_size
 #   TOAST_MODE=shadow    [toast] mode, fixed at bootstrap
+#   TOAST_READ_AHEAD=false  disable read-ahead on builds that support it
 start_daemon() {
   local bin=$1 bridge=$2 pin=${3:-}
+  local -a bootstrap_timeout=()
+  if [[ $("$bin" --help) == *--bootstrap-shadow-replay-timeout* ]]; then
+    bootstrap_timeout=(--bootstrap-shadow-replay-timeout 600)
+  fi
   cat >"$DRUN/ch-config.toml" <<EOF
 [ch]
 host = "127.0.0.1"
@@ -84,6 +89,18 @@ decoder_pool_size = ${DECODERS:-16}
 [toast]
 mode = "${TOAST_MODE:-shadow}"
 EOF
+  case ${TOAST_READ_AHEAD:-} in
+    true|false) printf 'read_ahead = %s\n' "$TOAST_READ_AHEAD" >>"$DRUN/ch-config.toml" ;;
+    '') ;;
+    *) echo "TOAST_READ_AHEAD must be true or false" >&2; return 1 ;;
+  esac
+  if [[ ${WAL_FEED:-stream} == archive ]]; then
+    cat >>"$DRUN/ch-config.toml" <<EOF
+
+[backup]
+archive = "file://$DRUN/archive"
+EOF
+  fi
   setsid ${pin:+taskset -c "$pin"} "$bin" \
     --host "$SRUN/sock" --port $SRC_PORT --user postgres --dbname postgres --sslmode disable \
     --out-dir "$DRUN/out" --spill-dir "$DRUN/spill" \
@@ -93,7 +110,7 @@ EOF
     --walsender-bind 127.0.0.1:$WALSENDER_PORT --retention-bytes 0 \
     --ch-config "$DRUN/ch-config.toml" \
     --bootstrap-mode direct --bootstrap-shadow-data-dir "$DRUN/shadow-data" \
-    --bootstrap-shadow-replay-timeout 600 \
+    "${bootstrap_timeout[@]}" \
     --bridge-lib-dir "$bridge" \
     ${XACT_BUFFER_MAX:+--xact-buffer-max "$(numfmt --from=iec "$XACT_BUFFER_MAX")"} \
     >>"$DRUN/daemon.log" 2>&1 9>&- &
