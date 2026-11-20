@@ -15,11 +15,13 @@
 #   KEEP=1        leave the run dirs and servers up for inspection
 #   TAG=text      free-form label in the results line
 set -euo pipefail
+# shellcheck source-path=SCRIPTDIR source=common.sh
 . "$(dirname "$0")/common.sh"
 TREE=$(cd "${1:-$HERE/../..}" && pwd)
 BIN=${BIN:-$TREE/target/release/walshadow-stream}
 [[ -x $BIN ]] || BIN=$TREE/target/fast/release/walshadow-stream
 [[ -f $DGOLD/meta.env ]] || { echo "no golden snapshot, run prepare.sh" >&2; exit 1; }
+# shellcheck source=/dev/null
 . "$DGOLD/meta.env"
 [[ $GOLD_PG == "$PG" ]] || { echo "golden is PG $GOLD_PG, run with PG=$GOLD_PG" >&2; exit 1; }
 [[ -n ${END_LSN:-} ]] || { echo "no fixed end LSN, rerun prepare.sh" >&2; exit 1; }
@@ -107,7 +109,7 @@ FETCH_SECONDS=$(final_metric walshadow_toast_value_fetch_seconds_total)
 ARCHIVE_WAIT=$(final_metric walshadow_archive_wait_seconds_total)
 # Live shadow processes only; exited backends are not counted
 PM=$(head -1 "$DRUN/shadow-data/postmaster.pid")
-SHADOW_TICKS=$(for p in $PM $(pgrep -P "$PM"); do awk '{print $14+$15}' /proc/$p/stat 2>/dev/null; done | awk '{s+=$1} END{print s+0}')
+SHADOW_TICKS=$(for p in $PM $(pgrep -P "$PM"); do awk '{print $14+$15}' /proc/"$p"/stat 2>/dev/null; done | awk '{s+=$1} END{print s+0}')
 
 N=$((ROUT - R0))
 DT=$(bc -l <<<"$T1 - $TD"); DTR=$(bc -l <<<"$TOUT - $T0")

@@ -26,6 +26,7 @@
 #   BIN, BRIDGE_LIB_DIR  prebuilt daemon and PostgreSQL module directory
 #   PG=18|17           source and shadow major (default 18)
 set -euo pipefail
+# shellcheck source-path=SCRIPTDIR source=common.sh
 . "$(dirname "$0")/common.sh"
 TREE=$(cd "${1:-$HERE/../..}" && pwd)
 SCHEMA=${SCHEMA:-$HERE/schema.sql}
@@ -110,7 +111,7 @@ CKPT=
 if [[ $CHECKPOINT_S != 0 ]]; then
   ( while sleep "$CHECKPOINT_S"; do psrc -c CHECKPOINT 2>/dev/null; done ) & CKPT=$!
 fi
-pgbench -h "$SRUN/sock" -p $SRC_PORT -U postgres -d postgres -n -M prepared -f "$WORKLOAD" \
+pgbench -h "$SRUN/sock" -p "$SRC_PORT" -U postgres -d postgres -n -M prepared -f "$WORKLOAD" \
   -D seed_rows="$SEED_ROWS" -D recent_ids="$RECENT_IDS" -D upd_pm="$UPD_PM" \
   -D rewrite_payload_b="${REWRITE_PAYLOAD_B:-1}" -D inline_end_pm="$INLINE_END_PM" -D ins_pm="$(bc <<<"$UPD_PM / $UPD_REPEAT")" \
   -D recent_pm="$(bc <<<"1000 * $UPD_RECENT_FRAC / 1")" \

@@ -1,3 +1,4 @@
+# shellcheck shell=bash disable=SC2034  # globals are read by sourcing scripts
 # Shared paths, ports and helpers for prepare.sh and run.sh. Sourced, not run.
 # Defaults keep ports above the Linux ephemeral range (32768-60999), so a
 # client socket in TIME-WAIT cannot hold them
@@ -27,8 +28,8 @@ DAEMON_CPUS=${DAEMON_CPUS:-}
 SRC_CPUS=${SRC_CPUS:-}
 CH_CPUS=${CH_CPUS:-}
 
-psrc() { PGOPTIONS="-c client_min_messages=warning" psql -h "$SRUN/sock" -p $SRC_PORT -U postgres -d postgres -tAXq -v ON_ERROR_STOP=1 "$@"; }
-chq() { clickhouse client --port $CH_TCP -q "$@"; }
+psrc() { PGOPTIONS="-c client_min_messages=warning" psql -h "$SRUN/sock" -p "$SRC_PORT" -U postgres -d postgres -tAXq -v ON_ERROR_STOP=1 "$@"; }
+chq() { clickhouse client --port "$CH_TCP" -q "$@"; }
 # awk exits at the match, so curl may die of SIGPIPE
 metric() { { curl -s -m 2 "http://$METRICS/metrics" || true; } | awk -v n="$1" '$1==n {print $2; exit}'; }
 # CPU ticks per thread name, summed over threads sharing a name
@@ -49,7 +50,7 @@ ch_start() {
   mkdir -p "$SRUN/ch/data" "$SRUN/ch/logs"
   # Embedded default config, so cwd must hold no config.xml
   (cd "$SRUN/ch" && exec setsid ${CH_CPUS:+taskset -c "$CH_CPUS"} clickhouse server -- \
-    --tcp_port=$CH_TCP --http_port=$CH_HTTP --interserver_http_port=$((CH_HTTP + 1)) \
+    --tcp_port="$CH_TCP" --http_port="$CH_HTTP" --interserver_http_port=$((CH_HTTP + 1)) \
     --mysql_port= --postgresql_port= --grpc_port= --prometheus.port= --listen_host=127.0.0.1 \
     --path="$SRUN/ch/data/" --access_control_path="$SRUN/ch/data/access/" \
     --logger.log="$SRUN/ch/logs/server.log" --logger.errorlog="$SRUN/ch/logs/error.log" \
@@ -102,12 +103,12 @@ archive = "file://$DRUN/archive"
 EOF
   fi
   setsid ${pin:+taskset -c "$pin"} "$bin" \
-    --host "$SRUN/sock" --port $SRC_PORT --user postgres --dbname postgres --sslmode disable \
+    --host "$SRUN/sock" --port "$SRC_PORT" --user postgres --dbname postgres --sslmode disable \
     --out-dir "$DRUN/out" --spill-dir "$DRUN/spill" \
-    --shadow-socket-dir "$SRUN/shadow-sock" --shadow-port $SHADOW_PORT \
+    --shadow-socket-dir "$SRUN/shadow-sock" --shadow-port "$SHADOW_PORT" \
     --shadow-user postgres --shadow-dbname postgres \
-    --status-interval 1 --metrics-bind $METRICS \
-    --walsender-bind 127.0.0.1:$WALSENDER_PORT --retention-bytes 0 \
+    --status-interval 1 --metrics-bind "$METRICS" \
+    --walsender-bind "127.0.0.1:$WALSENDER_PORT" --retention-bytes 0 \
     --ch-config "$DRUN/ch-config.toml" \
     --bootstrap-mode direct --bootstrap-shadow-data-dir "$DRUN/shadow-data" \
     "${bootstrap_timeout[@]}" \
