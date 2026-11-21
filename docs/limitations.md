@@ -57,11 +57,12 @@ and workload limits before attaching
 
 ## Types shadow PostgreSQL converts
 
-Values outside walshadow's own codec set (arrays, `hstore`, enums, ranges,
-domains, extension types) are converted by shadow PostgreSQL in batches, one
-request per Native block needing conversion. Native array or map destination
-types still require this conversion; prepared sending and compression do not
-remove shadow requests
+Values outside walshadow's own codec set (arrays beyond
+[built-in elements in one layer](destination-tables.md#default-type-mapping), `hstore`, enums,
+ranges, domains, extension types) are converted by shadow PostgreSQL in
+batches, one request per Native block needing conversion. Native map
+destination types still require this conversion; prepared sending and
+compression do not remove shadow requests
 
 - a value shadow PostgreSQL cannot convert stops the batch and names the
   column and row, rather than writing a substituted value

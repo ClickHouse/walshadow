@@ -1129,3 +1129,237 @@ async fn oracle_recovers_after_cluster_restart() {
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
 }
+
+/// Source column and its type, oid, and alignment
+const COPIED: [(&str, &str, u32, char); 16] = [
+    ("i4", "int4[]", 1007, 'i'),
+    ("i8", "int8[]", 1016, 'd'),
+    ("b", "bool[]", 1000, 'i'),
+    ("f8", "float8[]", 1022, 'd'),
+    ("u", "uuid[]", 2951, 'i'),
+    ("t", "text[]", 1009, 'i'),
+    ("bp", "char(3)[]", 1014, 'i'),
+    ("n", "name[]", 1003, 'i'),
+    ("j", "jsonb[]", 3807, 'i'),
+    ("ip", "inet[]", 1041, 'i'),
+    ("net", "cidr[]", 651, 'i'),
+    ("iv", "interval[]", 1187, 'd'),
+    ("tz", "timetz[]", 1270, 'd'),
+    ("mac", "macaddr[]", 1040, 'i'),
+    ("mac8", "macaddr8[]", 775, 'i'),
+    ("ct", "tid[]", 1010, 'i'),
+];
+
+/// COPY's `array_send` fields convert to the stored form PostgreSQL reads
+/// back as its own `array_recv` does, dimensions and bounds included
+#[tokio::test(flavor = "current_thread")]
+async fn copied_arrays_store_as_postgres_reads_them() {
+    use tokio::sync::mpsc;
+    use walrus::pg::walparser::RelFileNode;
+    use walshadow::backup_page_walk::BackfillTuple;
+    use walshadow::ch_emitter::EmitterStats;
+    use walshadow::copy_backfill::{BlockRange, copy_rows_into};
+    use walshadow::datum::Datum;
+    use walshadow::schema::{RelAttr, RelDescriptor, RelName, ReplIdent};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let Some(guard) = start_pg(&tmp, ports::PG_SHADOW_PORT) else {
+        return;
+    };
+    let oracle = oracle_on(&guard.sh).await;
+    let client = source_client(&guard.sh, "postgres", "copy-arrays").await;
+    let cols: Vec<String> = COPIED
+        .iter()
+        .map(|(c, ty, ..)| format!("{c} {ty}"))
+        .collect();
+    client
+        .batch_execute(&format!(
+            "CREATE TABLE arrs (id int, {});\n\
+             INSERT INTO arrs VALUES \
+                (1, '{{1,NULL,-3}}', '{{9000000000}}', '{{t,NULL}}', '{{1.5,NULL}}', \
+                    '{{00112233-4455-6677-8899-aabbccddeeff}}', '{{a,\"b,c\",NULL,\"\"}}', \
+                    '{{ab,\"  \",NULL}}', '{{nm,NULL}}', \
+                    '{{\"{{\\\"a\\\": [1, null, \\\"x,y\\\"]}}\",NULL,\"\\\"s\\\"\",7}}', \
+                    '{{10.0.0.1/24,NULL,::1,fe80::1/64}}', '{{10.0.0.0/8,2001:db8::/32}}', \
+                    '{{\"1 year 2 mons 3 days 04:05:06.7\",NULL,-00:00:01}}', \
+                    '{{01:02:03+05:30,NULL,23:59:59.5-08}}', '{{08:00:2b:01:02:03,NULL}}', \
+                    '{{08:00:2b:01:02:03:04:05}}', '{{\"(1,2)\",NULL,\"(4294967295,65535)\"}}'),\
+                (2, '{{}}', '{{}}', '{{}}', '{{}}', '{{}}', '{{}}', '{{}}', '{{}}', \
+                    '{{}}', '{{}}', '{{}}', '{{}}', '{{}}', '{{}}', '{{}}', '{{}}'),\
+                (3, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, \
+                    NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL),\
+                (4, '[5:6]={{1,2}}', '{{{{1,2}},{{3,NULL}}}}', '[0:0]={{f}}', NULL, NULL, \
+                    '[2:3][1:1]={{{{p}},{{q}}}}', NULL, NULL, '[0:0]={{\"null\"}}', \
+                    '{{{{1.2.3.4}},{{5.6.7.8}}}}', NULL, NULL, NULL, NULL, NULL, NULL);\n\
+             INSERT INTO arrs (id, i4, t) SELECT 5, \
+                ARRAY(SELECT g FROM generate_series(1, 3000) g), \
+                ARRAY(SELECT md5(g::text) FROM generate_series(1, 400) g);\n",
+            cols.join(", ")
+        ))
+        .await
+        .unwrap();
+    let oid: u32 = client
+        .query_one("SELECT 'arrs'::regclass::oid", &[])
+        .await
+        .unwrap()
+        .get(0);
+    let attr = |attnum: i16, type_oid: u32, align: char| RelAttr {
+        attnum,
+        name: format!("c{attnum}"),
+        type_oid,
+        typmod: -1,
+        not_null: false,
+        dropped: false,
+        type_name: String::new(),
+        type_byval: false,
+        type_len: -1,
+        type_align: align,
+        type_storage: 'x',
+        missing_default: None,
+    };
+    let mut attributes = vec![RelAttr {
+        type_byval: true,
+        type_len: 4,
+        type_storage: 'p',
+        ..attr(1, 23, 'i')
+    }];
+    for (i, (name, _, type_oid, align)) in COPIED.iter().enumerate() {
+        attributes.push(RelAttr {
+            name: (*name).into(),
+            ..attr(i as i16 + 2, *type_oid, *align)
+        });
+    }
+    attributes[0].name = "id".into();
+    let desc = RelDescriptor {
+        rfn: RelFileNode {
+            spc_node: 0,
+            db_node: 5,
+            rel_node: oid,
+        },
+        oid,
+        toast_oid: 0,
+        namespace_oid: 0,
+        rel_name: RelName::new("public", "arrs"),
+        kind: 'r',
+        persistence: 'p',
+        ancestors: Vec::new(),
+        replident: ReplIdent::Nothing,
+        attributes,
+    };
+    let (tx, mut rx) = mpsc::channel::<Vec<BackfillTuple>>(4);
+    let stats = EmitterStats::default();
+    let range = BlockRange {
+        start: 0,
+        end: None,
+    };
+    copy_rows_into(&client, &desc, 1, &tx, &stats, range)
+        .await
+        .unwrap();
+    drop(tx);
+    let mut copied = Vec::new();
+    while let Some(slab) = rx.recv().await {
+        copied.extend(slab.iter().map(|t| t.cells(&desc).unwrap()));
+    }
+    assert_eq!(copied.len(), 5);
+    let sends: Vec<String> = COPIED
+        .iter()
+        .map(|(c, ..)| format!("array_send({c})"))
+        .collect();
+    let rows = client
+        .query(
+            &format!("SELECT {} FROM arrs ORDER BY id", sends.join(", ")),
+            &[],
+        )
+        .await
+        .unwrap();
+
+    let text = async |type_oid: u32, cells: Vec<OracleCell>| {
+        let b = buf(type_oid, cells);
+        let columns = [OracleRequestColumn {
+            ordinal: 0,
+            name: "value",
+            target_type: "Nullable(String)",
+            buf: &b,
+        }];
+        let block = oracle
+            .encode_batch(Oracle::ANY_DATABASE, &columns, 5, alloc())
+            .await
+            .unwrap();
+        let col = block.column(0).unwrap();
+        let (offsets, data) = col.nullable_inner().unwrap().string().unwrap();
+        (
+            col.null_map().unwrap().to_vec(),
+            offsets.to_vec(),
+            String::from_utf8(data.to_vec()).unwrap(),
+        )
+    };
+    for (i, (name, _, type_oid, _)) in COPIED.iter().enumerate() {
+        let elem = walshadow::codecs::array_elem(*type_oid).unwrap();
+        // jsonb[] keeps send form, which rebuilds as text[] of jsonb_out text
+        let mut held = *type_oid;
+        let stored = copied
+            .iter()
+            .map(|row| match &row[i + 1] {
+                Some(Datum::Varlena(b)) => OracleCell::DiskRaw(b.clone()),
+                Some(Datum::Send(b)) if *type_oid == 3807 => {
+                    let mut body = Vec::new();
+                    held = walshadow::codecs::array_from_send(b, elem, &mut body)
+                        .unwrap()
+                        .array_oid;
+                    OracleCell::DiskRaw(body)
+                }
+                None | Some(Datum::Null) => OracleCell::Default,
+                other => panic!("{name}: {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        let received = rows
+            .iter()
+            .map(|r| {
+                r.get::<_, Option<Vec<u8>>>(i)
+                    .map_or(OracleCell::Default, OracleCell::BinaryInput)
+            })
+            .collect();
+        let want = text(*type_oid, received).await;
+        assert_eq!(text(held, stored).await, want, "{name}");
+        assert!(want.2.contains('{'), "{name}: {want:?}");
+    }
+}
+
+/// Array walks take element storage from a static table, which must agree
+/// with the catalog: wrong alignment misreads silently
+#[tokio::test(flavor = "current_thread")]
+async fn array_element_layouts_match_pg_type() {
+    let tmp = tempfile::tempdir().unwrap();
+    let Some(guard) = start_pg(&tmp, ports::PG_SHADOW_PORT) else {
+        return;
+    };
+    let client = source_client(&guard.sh, "postgres", "array-layouts").await;
+    for e in &walshadow::codecs::ARRAY_ELEMS {
+        let row = client
+            .query_one(
+                "SELECT el.oid, el.typlen, el.typbyval, el.typalign \
+                 FROM pg_catalog.pg_type arr JOIN pg_catalog.pg_type el ON el.oid = arr.typelem \
+                 WHERE arr.oid = $1",
+                &[&e.array_oid],
+            )
+            .await
+            .unwrap();
+        let align = match row.get::<_, i8>(3) as u8 {
+            b'c' => 1,
+            b's' => 2,
+            b'i' => 4,
+            _ => 8,
+        };
+        assert_eq!(
+            (
+                row.get::<_, u32>(0),
+                row.get::<_, i16>(1),
+                row.get::<_, bool>(2),
+                align
+            ),
+            (e.elem_oid, e.len, e.byval, e.align),
+            "array {}",
+            e.array_oid
+        );
+    }
+}

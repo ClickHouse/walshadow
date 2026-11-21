@@ -30,16 +30,14 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use backon::Retryable;
-use clickhouse_c::{Allocator, BlockBuilder, ColumnBuilder, TypeAst};
+use clickhouse_c::{Allocator, BlockBuilder, TypeAst};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use crate::budget::MemoryBudget;
 use crate::ch::{CompressionChoice, EmitterError};
 use crate::config::ResolvedConfig;
-use crate::emit::ch_emitter::{
-    ColumnBuf, EmitterStats, RetryConfig, build_leaf, build_root, literal_column,
-};
+use crate::emit::ch_emitter::{ColumnBuf, EmitterStats, RetryConfig, literal_column, with_roots};
 use crate::emit::pipeline::Fatal;
 use crate::emit::pipeline::batcher::{BatchMeta, BlockSlabs, InsertBatch, NATIVE_BLOCK_BYTES};
 use crate::emit::pipeline::sealed::SealedBlock;
@@ -180,36 +178,27 @@ impl Sealer {
                 }
             }
         };
-        let n_rows = block.n_rows;
-        let leaves: Vec<Option<ColumnBuilder<'_>>> = block
-            .buffers
-            .iter()
-            .map(|buf| build_leaf(buf, n_rows))
-            .collect::<Result<_, _>>()?;
-        let roots: Vec<Option<ColumnBuilder<'_>>> = block
-            .buffers
-            .iter()
-            .zip(&leaves)
-            .map(|(buf, leaf)| build_root(buf, leaf.as_ref(), n_rows))
-            .collect::<Result<_, _>>()?;
-        let mut bb = BlockBuilder::new();
-        for (i, col) in meta.columns.iter().enumerate() {
-            match &roots[i] {
-                Some(node) => bb.append(&col.name, asts.1[i].view(), node)?,
-                None => {
-                    let decoded = resolved.and_then(|r| r.column(i as u32)).ok_or_else(|| {
-                        EmitterError::Type(format!("oracle answered no column for {}", col.name))
-                    })?;
-                    bb.append_column(&col.name, asts.1[i].view(), decoded)?;
+        let (alloc, compression) = (self.alloc, self.compression);
+        let codec = self.codec.as_ref().map(|c| c.as_ref());
+        with_roots(&block.buffers, block.n_rows, |roots| {
+            let mut bb = BlockBuilder::new();
+            for (i, col) in meta.columns.iter().enumerate() {
+                match roots[i] {
+                    Some(node) => bb.append(&col.name, asts.1[i].view(), node)?,
+                    None => {
+                        let decoded =
+                            resolved.and_then(|r| r.column(i as u32)).ok_or_else(|| {
+                                EmitterError::Type(format!(
+                                    "oracle answered no column for {}",
+                                    col.name
+                                ))
+                            })?;
+                        bb.append_column(&col.name, asts.1[i].view(), decoded)?;
+                    }
                 }
             }
-        }
-        SealedBlock::seal(
-            &bb,
-            self.compression,
-            self.codec.as_ref().map(|c| c.as_ref()),
-            self.alloc,
-        )
+            SealedBlock::seal(&bb, compression, codec, alloc)
+        })
     }
 }
 
