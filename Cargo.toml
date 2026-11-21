@@ -119,6 +119,10 @@ harness = false
 name = "jsonb"
 harness = false
 
+[[bench]]
+name = "array_encode"
+harness = false
+
 [dev-dependencies]
 walshadow = { path = ".", features = ["test-support"] }
 # Pre-main tracing subscriber for tests

@@ -10,7 +10,7 @@ use crate::decode::heap_decoder::{
     CommittedTuple, DecodedHeap, HeapOp, decode_block_data, view_block_data,
 };
 use crate::emit::ch_emitter::{
-    Codec, ColumnBuf, OP_DELETE, OP_INSERT, RowStamp, TableEncoder, TablePlan,
+    Codec, ColumnBuf, ColumnEncoding, OP_DELETE, OP_INSERT, RowStamp, TableEncoder, TablePlan,
 };
 use crate::mapping::{ColumnMapping, SystemColumns, TableMapping, TableTarget};
 use crate::schema::*;
@@ -481,6 +481,14 @@ fn codec_follows_source_type() {
         (NUMERICOID, -1, 'i', "Decimal(10, 2)", Codec::Numeric),
         (JSONBOID, -1, 'i', "String", Codec::Jsonb),
         (999_999, -2, 'c', "String", Codec::Bytes),
+        (
+            1007,
+            -1,
+            'i',
+            "Array(Int32)",
+            Codec::Array(crate::decode::codecs::array_elem(1007).unwrap()),
+        ),
+        (1231, -1, 'i', "Array(Nullable(String))", Codec::Pending),
     ];
     for (oid, len, align, target, want) in cases {
         let rel = rel(vec![attr(1, oid, len, align, "")]);
@@ -577,6 +585,252 @@ fn varlena_types_match() {
     for c in &cases {
         run(c, &ColumnRules::default());
     }
+}
+
+/// Stored array body of `items` over `dims`, without varlena header
+fn stored(array_oid: u32, dims: &[(i32, i32)], items: &[Option<&[u8]>]) -> Vec<u8> {
+    crate::decode::codecs::stored_array(array_oid, dims, items)
+}
+
+/// One-dimensional array of `items` under a 4-byte varlena header
+fn array(array_oid: u32, items: &[Option<&[u8]>]) -> Vec<u8> {
+    long(&stored(array_oid, &[(items.len() as i32, 1)], items))
+}
+
+#[test]
+fn array_types_match() {
+    let i4 = |v: i32| v.to_be_bytes();
+    let (one, two) = (i4(1), i4(-2));
+    let many: Vec<_> = (0..200).map(|_| Some(&one[..])).collect();
+    let uuid: Vec<u8> = (0..16).collect();
+    let long_text = vec![b'y'; 200];
+    let elems = |array_oid: u32, items: &[&[u8]]| {
+        let items: Vec<_> = items.iter().map(|i| Some(*i)).collect();
+        vec![
+            array(array_oid, &items),
+            array(array_oid, &[None, items[0]]),
+        ]
+    };
+    let cases = [
+        case(
+            1007,
+            -1,
+            'i',
+            "Array(Nullable(Int32))",
+            vec![
+                array(1007, &[Some(&one), None, Some(&two)]),
+                array(1007, &[]),
+                // Lower bound drops, elements keep stored order
+                long(&stored(1007, &[(2, -5)], &[Some(&two), Some(&one)])),
+                short(&stored(1007, &[(1, 1)], &[Some(&one)])),
+                lz4(&stored(1007, &[(200, 1)], &many)),
+            ],
+        ),
+        case(
+            1007,
+            -1,
+            'i',
+            "Array(Int32)",
+            vec![array(1007, &[Some(&one)])],
+        ),
+        case(
+            1000,
+            -1,
+            'i',
+            "Array(Nullable(Bool))",
+            elems(1000, &[&[1], &[0]]),
+        ),
+        case(
+            1005,
+            -1,
+            'i',
+            "Array(Nullable(Int16))",
+            elems(1005, &[&7i16.to_be_bytes()]),
+        ),
+        case(
+            1016,
+            -1,
+            'd',
+            "Array(Nullable(Int64))",
+            elems(1016, &[&i64::MIN.to_be_bytes(), &3i64.to_be_bytes()]),
+        ),
+        case(
+            1021,
+            -1,
+            'i',
+            "Array(Nullable(Float32))",
+            elems(1021, &[&(-0.5f32).to_be_bytes()]),
+        ),
+        case(
+            1022,
+            -1,
+            'd',
+            "Array(Nullable(Float64))",
+            elems(1022, &[&f64::NAN.to_be_bytes(), &1.5f64.to_be_bytes()]),
+        ),
+        case(
+            1028,
+            -1,
+            'i',
+            "Array(Nullable(UInt32))",
+            elems(1028, &[&u32::MAX.to_be_bytes()]),
+        ),
+        case(
+            2951,
+            -1,
+            'i',
+            "Array(Nullable(UUID))",
+            elems(2951, &[&uuid]),
+        ),
+        case(
+            1009,
+            -1,
+            'i',
+            "Array(Nullable(String))",
+            elems(1009, &[b"a", b"", &long_text]),
+        ),
+        case(
+            1014,
+            -1,
+            'i',
+            "Array(Nullable(String))",
+            elems(1014, &[b"ab  "]),
+        ),
+        case(
+            1015,
+            -1,
+            'i',
+            "Array(String)",
+            vec![array(1015, &[Some(b"v")])],
+        ),
+        case(
+            1003,
+            -1,
+            'i',
+            "Array(Nullable(String))",
+            elems(1003, &[b"nm"]),
+        ),
+    ];
+    for c in &cases {
+        run(c, &ColumnRules::default());
+    }
+}
+
+/// Shapes a one-layer target can't hold fail alike, as do element types
+/// other than the column's
+#[test]
+fn array_errors_match() {
+    let one = 1i32.to_be_bytes();
+    let grid = long(&stored(1007, &[(1, 1), (2, 1)], &[Some(&one), Some(&one)]));
+    let cases = [
+        case(1007, -1, 'i', "Array(Nullable(Int32))", vec![grid]),
+        case(1007, -1, 'i', "Array(Int32)", vec![array(1007, &[None])]),
+        case(
+            1007,
+            -1,
+            'i',
+            "Array(Int32)",
+            vec![array(1016, &[Some(&1i64.to_be_bytes())])],
+        ),
+        case(1007, -1, 'i', "Array(Int32)", vec![long(&[0; 8])]),
+    ];
+    for c in &cases {
+        run(c, &ColumnRules::default());
+    }
+}
+
+/// Local encoding needs a covered source array and one `Array` layer of its
+/// element's own kind; every other pair stays with the oracle
+#[test]
+fn array_gates_pair_source_with_target() {
+    let encoding = |att: RelAttr, target: &str, rules: &ColumnRules| {
+        plan(&rel(vec![att]), &[target], rules).columns[0].encoding
+    };
+    let array_attr = |oid: u32| attr(1, oid, -1, 'i', "");
+    let local = |oid: u32, target: &str| {
+        encoding(array_attr(oid), target, &ColumnRules::default()) == ColumnEncoding::Local
+    };
+    for e in &crate::decode::codecs::ARRAY_ELEMS {
+        let elem_name = match e.elem_oid {
+            BOOLOID => "bool",
+            NAMEOID => "name",
+            INT2OID => "int2",
+            INT4OID => "int4",
+            TEXTOID => "text",
+            BPCHAROID => "bpchar",
+            VARCHAROID => "varchar",
+            INT8OID => "int8",
+            FLOAT4OID => "float4",
+            FLOAT8OID => "float8",
+            OIDOID => "oid",
+            _ => "uuid",
+        };
+        let att = attr(1, e.array_oid, -1, 'i', &format!("_{elem_name}"));
+        let target = crate::catalog::type_bridge::map(&att, false).ch_type;
+        assert!(local(e.array_oid, &target), "{elem_name}: {target}");
+    }
+    assert!(local(1007, "Array(Int32)"));
+    for (oid, target) in [
+        (1007, "Array(Nullable(Int64))"),
+        (1007, "Array(Array(Int32))"),
+        (1007, "String"),
+        (1009, "Array(LowCardinality(String))"),
+        (1231, "Array(Nullable(String))"),
+    ] {
+        assert!(!local(oid, target), "{oid} {target}");
+    }
+    let mut text_default = array_attr(1007);
+    text_default.missing_default = Some(MissingDefault::Text("{1}".into()));
+    let mut raw_default = array_attr(1007);
+    raw_default.missing_default = Some(MissingDefault::Raw(
+        crate::decode::heap_decoder::raw_missing_array(1007, &array(1007, &[])),
+    ));
+    let defaults = ColumnRules::default();
+    assert!(matches!(
+        encoding(text_default, "Array(Int32)", &defaults),
+        ColumnEncoding::Oracle { .. }
+    ));
+    assert_eq!(
+        encoding(raw_default, "Array(Int32)", &defaults),
+        ColumnEncoding::Local
+    );
+    let to_string = rules(&[(
+        "c1",
+        ColumnRule {
+            target_type: Some("String".into()),
+            ..ColumnRule::default()
+        },
+    )]);
+    assert!(matches!(
+        encoding(array_attr(1007), "Array(Int32)", &to_string),
+        ColumnEncoding::Oracle { .. }
+    ));
+}
+
+/// Fast defaults stored raw encode as stored arrays do
+#[test]
+fn array_fast_defaults_match() {
+    let one = 1i32.to_be_bytes();
+    let mut attrs = vec![
+        attr(1, INT4OID, 4, 'i', "int4"),
+        attr(2, 1007, -1, 'i', "_int4"),
+        attr(3, 1016, -1, 'd', "_int8"),
+    ];
+    attrs[1].missing_default = Some(MissingDefault::Raw(
+        crate::decode::heap_decoder::raw_missing_array(1007, &array(1007, &[Some(&one), None])),
+    ));
+    attrs[2].missing_default = Some(MissingDefault::Raw(
+        crate::decode::heap_decoder::raw_missing_array(1016, &array(1016, &[])),
+    ));
+    let rel = rel(attrs);
+    let id = 1i32.to_le_bytes();
+    let stored = array(1007, &[Some(&one)]);
+    let rows = vec![
+        (1, vec![Some(&id[..]), None, None]),
+        (2, vec![Some(&id[..]), Some(&stored[..]), None]),
+    ];
+    let targets = ["Int32", "Array(Nullable(Int32))", "Array(Int64)"];
+    assert_parity(&rel, &targets, &ColumnRules::default(), &rows);
 }
 
 #[test]
@@ -1002,6 +1256,36 @@ fn plan_views_match_cells_with_resolved_externals() {
     );
 }
 
+/// Resolved array values plan as inline arrays do
+#[test]
+fn plan_views_match_cells_with_resolved_array_externals() {
+    let mut r = rel(vec![
+        attr(1, INT4OID, 4, 'i', "int4"),
+        attr(2, 1007, -1, 'i', "_int4"),
+    ]);
+    r.replident = ReplIdent::Full { pk_attnums: None };
+    let attrs = r.attributes.clone();
+    let row = |id: i32, value_id: u32| {
+        let ext = external_id(value_id);
+        tuple(&attrs, 2, &[Some(&id.to_le_bytes()[..]), Some(&ext[..])])
+    };
+    let ints = |vals: &[i32]| {
+        let be: Vec<_> = vals.iter().map(|v| v.to_be_bytes()).collect();
+        let items: Vec<_> = be.iter().map(|b| Some(&b[..])).collect();
+        Datum::Varlena(stored(1007, &[(items.len() as i32, 1)], &items))
+    };
+    plan_both(
+        &r,
+        &["Int32", "Array(Nullable(Int32))"],
+        &[
+            (HeapOp::Insert, Some(row(1, 7)), None),
+            (HeapOp::Update, Some(row(1, 8)), Some(row(1, 7))),
+            (HeapOp::Delete, None, Some(row(1, 8))),
+        ],
+        &[(7, ints(&[1, 2])), (8, ints(&[]))],
+    );
+}
+
 /// Inline short, long and compressed values beside an external value that
 /// resolves, stays unchanged under its old pointer, or fills NULL as
 /// disabled mode and null overflow do. Store, shadow and same-transaction
@@ -1085,6 +1369,8 @@ fn copy_fields_match_heap_views() {
         attr(6, TEXTOID, -1, 'i', "text"),
         attr(7, NUMERICOID, -1, 'i', "numeric"),
         attr(8, NUMERICOID, -1, 'i', "numeric"),
+        attr(9, 1007, -1, 'i', "_int4"),
+        attr(10, 1009, -1, 'i', "_text"),
     ]);
     let targets = [
         "Int32",
@@ -1095,7 +1381,17 @@ fn copy_fields_match_heap_views() {
         "Nullable(String)",
         "String",
         "Decimal(10, 2)",
+        "Array(Nullable(Int32))",
+        "Array(String)",
     ];
+    let send = crate::decode::codecs::array_send;
+    let arrays = |array_oid: u32, elem_oid: u32, dims: &[(i32, i32)], items: &[Option<&[u8]>]| {
+        Some((
+            long(&stored(array_oid, dims, items)),
+            send(elem_oid, dims, items),
+        ))
+    };
+    let one = 1i32.to_be_bytes();
     let rows: Vec<Vec<Option<HeapAndCopy>>> = vec![
         vec![
             Some((7i32.to_le_bytes().into(), 7i32.to_be_bytes().into())),
@@ -1115,6 +1411,8 @@ fn copy_fields_match_heap_views() {
                 short(&numeric_short(true, 0, &[42])),
                 numeric_send(true, 0, 0, &[42]),
             )),
+            arrays(1007, INT4OID, &[(3, 0)], &[Some(&one), None, Some(&one)]),
+            arrays(1009, TEXTOID, &[(2, 1)], &[Some(b"a"), Some(b"bc")]),
         ],
         vec![
             Some((0i32.to_le_bytes().into(), 0i32.to_be_bytes().into())),
@@ -1137,6 +1435,8 @@ fn copy_fields_match_heap_views() {
                 short(&numeric_short(false, 0, &[])),
                 numeric_send(false, 0, 0, &[]),
             )),
+            None,
+            arrays(1009, TEXTOID, &[], &[]),
         ],
     ];
     let kinds = wire_kinds(&rel, &foldhash::HashSet::default());

@@ -50,7 +50,7 @@ use crate::ops::oracle::{
     ORACLE_BATCH_SEAL_BYTES, OracleCell, OracleColumnBuf, REQUEST_FRAME_BYTES, request_column_bytes,
 };
 use crate::runtime_config::{InitialLoadMode, TableRow};
-use crate::schema::{RelAttr, RelDescriptor, RelName};
+use crate::schema::{MissingDefault, RelAttr, RelDescriptor, RelName};
 use crate::source::queueing_record_sink::{
     DEFAULT_QUEUEING_BATCH_SIZE, DEFAULT_QUEUEING_RECORD_SINK_CAPACITY,
 };
@@ -1464,6 +1464,8 @@ pub(crate) enum Codec {
     Interval,
     /// PostGIS point rendered as WKT, typoutput yields HEXEWKB
     Wkt,
+    /// Built-in array, elements in stored order
+    Array(&'static crate::decode::codecs::ArrayElem),
     /// No local decode: typoutput text lands as String, stored bytes fail
     Pending,
 }
@@ -1500,7 +1502,7 @@ impl Codec {
             MACADDR8OID => Self::MacAddr8,
             TIDOID => Self::Tid,
             INTERVALOID => Self::Interval,
-            _ => Self::Pending,
+            oid => crate::decode::codecs::array_elem(oid).map_or(Self::Pending, Self::Array),
         }
     }
 }
@@ -1633,6 +1635,9 @@ impl ColumnEncoding {
                 Self::Local
             };
         };
+        if local_array(att, ast) {
+            return Self::Local;
+        }
         if composite_target(ast)
             || !crate::decode::heap_decoder::local_matrix_covers(att.type_oid, att.type_len)
         {
@@ -1653,6 +1658,39 @@ fn canonical_type(ast: &TypeAst, configured: &str) -> String {
         .and_then(|b| std::str::from_utf8(b).ok())
         .unwrap_or(configured)
         .to_owned()
+}
+
+/// Built-in array into one `Array` layer of its element's own kind. Text
+/// fast defaults stay with PostgreSQL, which parses them
+fn local_array(att: &RelAttr, ast: &TypeAst) -> bool {
+    let view = ast.view();
+    let (Some(elem), Some(Kind::Array), Some(inner)) = (
+        crate::decode::codecs::array_elem(att.type_oid),
+        view.kind(),
+        view.child(0),
+    ) else {
+        return false;
+    };
+    !matches!(att.missing_default, Some(MissingDefault::Text(_)))
+        && types::strip_nullable(inner).kind() == Some(array_elem_kind(elem.elem_oid))
+}
+
+/// ClickHouse kind each local array element encodes into
+fn array_elem_kind(elem_oid: u32) -> Kind {
+    use crate::schema::{
+        BOOLOID, FLOAT4OID, FLOAT8OID, INT2OID, INT4OID, INT8OID, OIDOID, UUIDOID,
+    };
+    match elem_oid {
+        BOOLOID => Kind::Bool,
+        INT2OID => Kind::Int16,
+        INT4OID => Kind::Int32,
+        INT8OID => Kind::Int64,
+        OIDOID => Kind::UInt32,
+        FLOAT4OID => Kind::Float32,
+        FLOAT8OID => Kind::Float64,
+        UUIDOID => Kind::Uuid,
+        _ => Kind::String,
+    }
 }
 
 /// CH JSON serialization v1 accepts strings, legacy Object needs a kind prefix
@@ -1941,12 +1979,26 @@ pub(crate) enum ColumnBuf {
         null_map: Vec<u8>,
         absent: &'static [u8],
     },
+    /// `offsets[i]` is the cumulative exclusive end of row `i` in `values`
+    Array {
+        offsets: Vec<u64>,
+        values: Box<ColumnBuf>,
+    },
     Oracle(OracleColumnBuf),
 }
 
 impl ColumnBuf {
     fn new_for_ast(ast: &TypeAst) -> Result<Self, EmitterError> {
-        let view = ast.view();
+        Self::new_for_type(ast.view())
+    }
+
+    fn new_for_type(view: clickhouse_c::TypeRef<'_>) -> Result<Self, EmitterError> {
+        if let (Some(Kind::Array), Some(inner)) = (view.kind(), view.child(0)) {
+            return Ok(Self::Array {
+                offsets: Vec::new(),
+                values: Box::new(Self::new_for_type(inner)?),
+            });
+        }
         let nullable = view.kind() == Some(Kind::Nullable);
         let inner = types::strip_nullable(view);
         // CH parses JSON cells even when null_map marks them NULL
@@ -2002,6 +2054,10 @@ impl ColumnBuf {
                 null_map: Vec::new(),
                 absent,
             },
+            Self::Array { values, .. } => Self::Array {
+                offsets: Vec::new(),
+                values: Box::new(values.empty_like()),
+            },
             Self::Oracle(o) => Self::Oracle(o.empty_like()),
         }
     }
@@ -2019,6 +2075,9 @@ impl ColumnBuf {
                 null_map,
                 ..
             } => offsets.capacity() * 8 + data.capacity() + null_map.capacity(),
+            Self::Array { offsets, values } => {
+                offsets.capacity() * 8 + std::mem::size_of::<Self>() + values.allocated_bytes()
+            }
             Self::Oracle(o) => o.allocated_bytes(),
         }
     }
@@ -2036,6 +2095,7 @@ impl ColumnBuf {
                 null_map,
                 ..
             } => offsets.len() * 8 + data.len() + null_map.len(),
+            Self::Array { offsets, values } => offsets.len() * 8 + values.approx_size(),
             Self::Oracle(o) => o.approx_size(),
         }
     }
@@ -2070,8 +2130,27 @@ impl ColumnBuf {
                 data.extend_from_slice(absent);
                 offsets.push(data.len() as u64);
             }
+            // CH forbids Nullable(Array), so NULL lands as an empty array
+            Self::Array { offsets, .. } => offsets.push(offsets.last().copied().unwrap_or(0)),
             Self::Oracle(o) => o.push(OracleCell::Default),
         }
+    }
+
+    /// Append packed `width`-byte values `le` when buffer holds that width
+    fn append_fixed_run(&mut self, le: &[u8], width: usize) -> bool {
+        match self {
+            Self::Fixed { width: w, bytes } if *w == width => bytes.extend_from_slice(le),
+            Self::NullableFixed {
+                width: w,
+                null_map,
+                inner,
+            } if *w == width => {
+                null_map.resize(null_map.len() + le.len() / width, 0);
+                inner.extend_from_slice(le);
+            }
+            _ => return false,
+        }
+        true
     }
 
     fn append_fixed_bytes(&mut self, le: &[u8]) -> Result<(), EmitterError> {
@@ -2118,6 +2197,7 @@ impl ColumnBuf {
             | (Self::NullableString { absent: a, .. }, Self::NullableString { absent: b, .. }) => {
                 a == b
             }
+            (Self::Array { values: a, .. }, Self::Array { values: b, .. }) => a.same_shape(b),
             (Self::Oracle(a), Self::Oracle(b)) => a.same_column(b),
             _ => false,
         }
@@ -2174,6 +2254,17 @@ impl ColumnBuf {
                 data.extend_from_slice(&more_data);
                 null_map.extend_from_slice(&more_nulls);
             }
+            (
+                Self::Array { offsets, values },
+                Self::Array {
+                    offsets: more,
+                    values: more_values,
+                },
+            ) => {
+                let base = offsets.last().map_or(0, |&n| n as usize);
+                rebase(offsets, base, more);
+                values.extend(*more_values);
+            }
             (Self::Oracle(a), Self::Oracle(b)) => a.append(b),
             _ => unreachable!("chunk shape checked before merge"),
         }
@@ -2229,6 +2320,11 @@ impl ColumnBuf {
                 push_u8(out, 4);
                 o.encode_into(out);
             }
+            Self::Array { offsets: o, values } => {
+                push_u8(out, 5);
+                offsets(out, o);
+                values.encode_into(out);
+            }
         }
     }
 
@@ -2281,11 +2377,59 @@ impl ColumnBuf {
                 }
             }
             4 => Self::Oracle(OracleColumnBuf::decode(c)?),
+            5 => Self::Array {
+                offsets: offsets(c)?,
+                values: Box::new(Self::decode(c)?),
+            },
             tag => {
                 return Err(crate::xact::spill::SpillError::Format {
                     offset: 0,
                     detail: format!("unknown column buffer tag {tag}"),
                 });
+            }
+        })
+    }
+
+    /// Builder levels from leaf to root, zero for oracle columns
+    fn height(&self) -> usize {
+        match self {
+            Self::Oracle(_) => 0,
+            Self::Fixed { .. } | Self::String { .. } => 1,
+            Self::NullableFixed { .. } | Self::NullableString { .. } => 2,
+            Self::Array { values, .. } => values.height() + 1,
+        }
+    }
+
+    /// Builder at `level` counted from leaf, `below` built at `level - 1`
+    fn build_level<'b>(
+        &'b self,
+        level: usize,
+        below: Option<&'b ColumnBuilder<'b>>,
+        n_rows: usize,
+    ) -> Result<ColumnBuilder<'b>, EmitterError> {
+        let child =
+            || below.ok_or_else(|| EmitterError::Type("wrapper column without child".into()));
+        Ok(match self {
+            Self::Fixed { width, bytes } => ColumnBuilder::fixed(bytes, *width, n_rows)?,
+            Self::String { offsets, data, .. } => ColumnBuilder::string(offsets, data, n_rows)?,
+            Self::NullableFixed { width, inner, .. } if level == 0 => {
+                ColumnBuilder::fixed(inner, *width, n_rows)?
+            }
+            Self::NullableString { offsets, data, .. } if level == 0 => {
+                ColumnBuilder::string(offsets, data, n_rows)?
+            }
+            Self::NullableFixed { null_map, .. } | Self::NullableString { null_map, .. } => {
+                child()?.nullable(null_map)?
+            }
+            Self::Array { offsets, values } if level + 1 < self.height() => {
+                let elements = offsets.last().map_or(0, |&n| n as usize);
+                values.build_level(level, below, elements)?
+            }
+            Self::Array { offsets, .. } => child()?.array(offsets, n_rows)?,
+            Self::Oracle(_) => {
+                return Err(EmitterError::Type(
+                    "oracle column has no local wire shape".into(),
+                ));
             }
         })
     }
@@ -2719,40 +2863,64 @@ pub(crate) fn literal_column(buf: &OracleColumnBuf, n_rows: usize) -> Option<Col
     Some(local)
 }
 
-pub(crate) fn build_leaf(
-    buf: &ColumnBuf,
+/// Call `f` with each column's root builder, `None` for oracle columns.
+/// Wrappers borrow builders below them, so each level lives in its own frame
+pub(crate) fn with_roots<R>(
+    bufs: &[ColumnBuf],
     n_rows: usize,
-) -> Result<Option<ColumnBuilder<'_>>, EmitterError> {
-    Ok(match buf {
-        ColumnBuf::NullableFixed { width, inner, .. } => {
-            Some(ColumnBuilder::fixed(inner, *width, n_rows)?)
+    f: impl FnOnce(&[Option<&ColumnBuilder<'_>>]) -> Result<R, EmitterError>,
+) -> Result<R, EmitterError> {
+    let height = bufs.iter().map(ColumnBuf::height).max().unwrap_or(0);
+    build_levels(bufs, n_rows, 0, height, &vec![None; bufs.len()], f)
+}
+
+/// Encode stored `elem` array bodies, `None` for NULL, into a `target` column
+/// and build it as planning and sealing would. Returns built row count
+#[cfg(any(test, feature = "test-support"))]
+pub fn build_array_column(
+    elem: &'static crate::decode::codecs::ArrayElem,
+    target: &TypeAst,
+    bodies: &[Option<&[u8]>],
+) -> Result<usize, EmitterError> {
+    let mut buf = ColumnBuf::new_for_ast(target)?;
+    for body in bodies {
+        if let Some(body) = body {
+            encode_array(&mut buf, elem, body)?;
+        } else {
+            buf.append_default();
         }
-        ColumnBuf::NullableString { offsets, data, .. } => {
-            Some(ColumnBuilder::string(offsets, data, n_rows)?)
-        }
-        _ => None,
+    }
+    with_roots(std::slice::from_ref(&buf), bodies.len(), |roots| {
+        Ok(roots[0].expect("array columns encode locally").n_rows())
     })
 }
 
-/// Borrow leaf from storage that outlives returned root, `None` for oracle
-/// columns which carry no local wire shape
-pub(crate) fn build_root<'b>(
-    buf: &'b ColumnBuf,
-    leaf: Option<&'b ColumnBuilder<'b>>,
+fn build_levels<'p, R>(
+    bufs: &'p [ColumnBuf],
     n_rows: usize,
-) -> Result<Option<ColumnBuilder<'b>>, EmitterError> {
-    let wrap = |null_map: &'b [u8]| -> Result<ColumnBuilder<'b>, EmitterError> {
-        let leaf = leaf.ok_or_else(|| EmitterError::Type("nullable column without leaf".into()))?;
-        Ok(leaf.nullable(null_map)?)
-    };
-    Ok(Some(match buf {
-        ColumnBuf::Fixed { width, bytes } => ColumnBuilder::fixed(bytes, *width, n_rows)?,
-        ColumnBuf::String { offsets, data, .. } => ColumnBuilder::string(offsets, data, n_rows)?,
-        ColumnBuf::NullableFixed { null_map, .. } | ColumnBuf::NullableString { null_map, .. } => {
-            wrap(null_map)?
-        }
-        ColumnBuf::Oracle(_) => return Ok(None),
-    }))
+    level: usize,
+    height: usize,
+    below: &[Option<&'p ColumnBuilder<'p>>],
+    f: impl FnOnce(&[Option<&ColumnBuilder<'_>>]) -> Result<R, EmitterError>,
+) -> Result<R, EmitterError> {
+    if level == height {
+        return f(below);
+    }
+    let here = bufs
+        .iter()
+        .zip(below)
+        .map(|(buf, &child)| {
+            (level < buf.height())
+                .then(|| buf.build_level(level, child, n_rows))
+                .transpose()
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let next: Vec<_> = here
+        .iter()
+        .zip(below)
+        .map(|(built, &child)| built.as_ref().or(child))
+        .collect();
+    build_levels(bufs, n_rows, level + 1, height, &next, f)
 }
 
 fn push_fixed(buf: &mut ColumnBuf, le: &[u8]) -> Result<(), EmitterError> {
@@ -3117,6 +3285,13 @@ fn encode_datum(
     let (codec, type_oid) = plan
         .source
         .map_or((Codec::Le, 0), |s| (s.codec, s.type_oid));
+    // Deferred spools written before arrays encoded locally keep `array_send`
+    if let (DatumRef::Send(send), Codec::Array(elem)) = (datum, codec) {
+        let mut stored = Vec::new();
+        crate::decode::codecs::array_from_send(send, elem, &mut stored)
+            .map_err(|_| unsupported("malformed array"))?;
+        return encode_datum(buf, plan, DatumRef::Varlena(&stored), text);
+    }
     let body = match datum {
         // Absent coerces like NULL, covers key-only delete tombstones under
         // non-FULL replica identity. Non-Nullable target takes type default
@@ -3138,6 +3313,9 @@ fn encode_datum(
         DatumRef::Compressed(d) => {
             let raw = inflate(d).ok_or_else(|| unsupported("corrupt compressed varlena"))?;
             return encode_datum(buf, plan, DatumRef::Varlena(&raw), text);
+        }
+        DatumRef::Text(_) if matches!(codec, Codec::Array(_)) => {
+            return Err(unsupported("array text routed to a local column"));
         }
         DatumRef::Text(t) => {
             return match text_datum(type_oid, t) {
@@ -3249,11 +3427,71 @@ fn encode_datum(
                 "unresolved source value routed to a local column",
             )),
         },
+        Codec::Array(elem) => encode_array(buf, elem, body),
         // Never interpret raw Datum bytes as local String data
         Codec::Pending => Err(unsupported(
             "unresolved source value routed to a local column",
         )),
     }
+}
+
+/// Append one-dimensional stored array, checking shape before any element
+fn encode_array(
+    buf: &mut ColumnBuf,
+    elem: &'static crate::decode::codecs::ArrayElem,
+    body: &[u8],
+) -> Result<(), EmitterError> {
+    use crate::decode::codecs::{ArrayBody, CodecError};
+    use crate::schema::{BPCHAROID, NAMEOID, TEXTOID, UUIDOID, VARCHAROID};
+    let ColumnBuf::Array { offsets, values } = buf else {
+        return Err(unsupported("array value into a scalar column"));
+    };
+    let malformed = |e| match e {
+        CodecError::ArrayElemType { .. } => unsupported("array element type differs from column"),
+        _ => unsupported("malformed array"),
+    };
+    let arr = ArrayBody::parse(body, elem).map_err(malformed)?;
+    if arr.ndim() > 1 {
+        return Err(unsupported(
+            "multidimensional array into one-dimensional Array column",
+        ));
+    }
+    let nullable = matches!(
+        **values,
+        ColumnBuf::NullableFixed { .. } | ColumnBuf::NullableString { .. }
+    );
+    if arr.has_nulls() && !nullable {
+        return Err(unsupported("NULL array element into non-Nullable element"));
+    }
+    let packed = arr.packed().map_err(malformed)?;
+    let run = packed.is_some_and(|p| values.append_fixed_run(p, elem.len as usize));
+    if !run {
+        for e in arr.elements() {
+            let Some(raw) = e.map_err(malformed)? else {
+                values.append_default();
+                continue;
+            };
+            match elem.elem_oid {
+                TEXTOID | VARCHAROID => values.append_string_bytes(raw)?,
+                // bpchar to text casts strip trailing spaces
+                BPCHAROID => {
+                    let end = raw.iter().rposition(|&b| b != b' ').map_or(0, |i| i + 1);
+                    values.append_string_bytes(&raw[..end])?
+                }
+                NAMEOID => {
+                    let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+                    values.append_string_bytes(&raw[..end])?
+                }
+                UUIDOID => values.append_fixed_bytes(&crate::decode::codecs::uuid_to_ch_wire(
+                    raw.try_into().expect("uuid elements are 16 bytes"),
+                ))?,
+                _ => values.append_fixed_bytes(raw)?,
+            }
+        }
+    }
+    let end = offsets.last().copied().unwrap_or(0) + arr.len() as u64;
+    offsets.push(end);
+    Ok(())
 }
 
 fn temporal_infinity() -> EmitterError {
@@ -3536,6 +3774,10 @@ pub(crate) enum Wire<'a> {
         null_map: &'a [u8],
         absent: &'a [u8],
     },
+    Array {
+        offsets: &'a [u64],
+        values: Box<Wire<'a>>,
+    },
     Oracle(&'a [OracleCell]),
 }
 
@@ -3567,6 +3809,7 @@ impl EncodedChunk {
                     Wire::String { offsets, data, .. }
                     | Wire::NullableString { offsets, data, .. } => string(offsets, data, r),
                     Wire::Oracle(cells) => Datum::Text(format!("{:?}", cells[r]).into_bytes()),
+                    Wire::Array { .. } => Datum::Text(format!("{buf:?}").into_bytes()),
                 });
             }
         }
@@ -3611,6 +3854,10 @@ impl ColumnBuf {
                 null_map,
                 absent,
             },
+            Self::Array { offsets, values } => Wire::Array {
+                offsets,
+                values: Box::new(values.wire()),
+            },
             Self::Oracle(o) => Wire::Oracle(o.cells()),
         }
     }
@@ -3649,6 +3896,11 @@ impl std::fmt::Debug for ColumnBuf {
                 .field("rows", &null_map.len())
                 .field("offsets_len", &offsets.len())
                 .field("data_len", &data.len())
+                .finish(),
+            Self::Array { offsets, values } => f
+                .debug_struct("Array")
+                .field("rows", &offsets.len())
+                .field("values", values)
                 .finish(),
             Self::Oracle(o) => f
                 .debug_struct("Oracle")
@@ -4609,6 +4861,324 @@ mod tests {
         );
     }
 
+    fn array_codec(array_oid: u32) -> Codec {
+        Codec::Array(crate::decode::codecs::array_elem(array_oid).unwrap())
+    }
+
+    /// Stored one-dimensional array of `items`
+    fn stored(array_oid: u32, items: &[Option<&[u8]>]) -> Datum {
+        let dims = [(items.len() as i32, 1)];
+        Datum::Varlena(crate::decode::codecs::stored_array(array_oid, &dims, items))
+    }
+
+    #[test]
+    fn array_cells_encode_elements_in_stored_order() {
+        let (one, three) = (1i32.to_be_bytes(), 3i32.to_be_bytes());
+        let mut ints = buf("Array(Nullable(Int32))");
+        let int4 = array_codec(1007);
+        for v in [
+            stored(1007, &[Some(&one), None, Some(&three)]),
+            Datum::Null,
+            stored(1007, &[]),
+            // NULL-free by-value elements copy as one run
+            stored(1007, &[Some(&three)]),
+        ] {
+            encode_value(&mut ints, int4, &v, None, 0).unwrap();
+        }
+        assert_eq!(
+            ints.wire(),
+            Wire::Array {
+                offsets: &[3, 3, 3, 4],
+                values: Box::new(Wire::NullableFixed {
+                    width: 4,
+                    null_map: &[0, 1, 0, 0],
+                    inner: &[1, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 3, 0, 0, 0],
+                }),
+            }
+        );
+
+        let mut longs = buf("Array(Int64)");
+        let (a, b) = (5i64.to_be_bytes(), (-6i64).to_be_bytes());
+        let v = stored(1016, &[Some(&a), Some(&b)]);
+        encode_value(&mut longs, array_codec(1016), &v, None, 0).unwrap();
+        let bytes: Vec<u8> = [5i64, -6].iter().flat_map(|w| w.to_le_bytes()).collect();
+        assert_eq!(
+            longs.wire(),
+            Wire::Array {
+                offsets: &[2],
+                values: Box::new(Wire::Fixed {
+                    width: 8,
+                    bytes: &bytes,
+                }),
+            }
+        );
+        // Width the gate would refuse falls back to per-element checks
+        let narrow = encode_value(&mut longs, int4, &stored(1007, &[Some(&one)]), None, 0);
+        assert!(matches!(narrow, Err(EmitterError::Type(e)) if e.contains("fixed-width")));
+
+        let mut strings = buf("Array(String)");
+        for (array_oid, items) in [
+            (1009, [Some(&b"a"[..]), Some(b"")]),
+            (1015, [Some(b"v"), Some(b" v ")]),
+            // bpchar casts to text without trailing spaces
+            (1014, [Some(b"ab  "), Some(b" ")]),
+            (1003, [Some(b"nm"), Some(b"")]),
+        ] {
+            let v = stored(array_oid, &items);
+            encode_value(&mut strings, array_codec(array_oid), &v, None, 0).unwrap();
+        }
+        assert_eq!(
+            strings.wire(),
+            Wire::Array {
+                offsets: &[2, 4, 6, 8],
+                values: Box::new(Wire::String {
+                    offsets: &[1, 1, 2, 5, 7, 7, 9, 9],
+                    data: b"av v abnm",
+                    absent: b"",
+                }),
+            }
+        );
+
+        let uuid: Vec<u8> = (0..16).collect();
+        let mut ids = buf("Array(UUID)");
+        encode_value(
+            &mut ids,
+            array_codec(2951),
+            &stored(2951, &[Some(&uuid)]),
+            None,
+            0,
+        )
+        .unwrap();
+        let wire = crate::decode::codecs::uuid_to_ch_wire(&uuid.try_into().unwrap());
+        assert_eq!(
+            ids.wire(),
+            Wire::Array {
+                offsets: &[1],
+                values: Box::new(Wire::Fixed {
+                    width: 16,
+                    bytes: &wire,
+                }),
+            }
+        );
+    }
+
+    #[test]
+    fn array_columns_build_from_stored_bodies() {
+        let elem = crate::decode::codecs::array_elem(1007).unwrap();
+        let ast = TypeAst::parse("Array(Int32)", Allocator::global(&mimalloc::MiMalloc)).unwrap();
+        let body =
+            crate::decode::codecs::stored_array(1007, &[(1, 1)], &[Some(&1i32.to_be_bytes())]);
+        assert_eq!(
+            build_array_column(elem, &ast, &[Some(&body), None]).unwrap(),
+            2
+        );
+        let grid = crate::decode::codecs::stored_array(1007, &[(1, 1), (1, 1)], &[Some(&[0; 4])]);
+        assert!(build_array_column(elem, &ast, &[Some(&grid)]).is_err());
+    }
+
+    #[test]
+    fn array_cells_reject_shapes_before_appending() {
+        let int4 = array_codec(1007);
+        let one = 1i32.to_be_bytes();
+        let grid = Datum::Varlena(crate::decode::codecs::stored_array(
+            1007,
+            &[(1, 1), (1, 1)],
+            &[Some(&one)],
+        ));
+        let words = |ws: &[i32]| Datum::Varlena(ws.iter().flat_map(|w| w.to_le_bytes()).collect());
+        let cases = [
+            ("Array(Int32)", grid, "multidimensional"),
+            (
+                "Array(Int32)",
+                stored(1007, &[None]),
+                "non-Nullable element",
+            ),
+            (
+                "Array(Nullable(Int32))",
+                stored(1016, &[Some(&1i64.to_be_bytes())]),
+                "element type differs",
+            ),
+            ("Array(Int32)", words(&[1, 0]), "malformed array"),
+            // Second of two elements is missing
+            (
+                "Array(Int32)",
+                words(&[1, 0, 23, 2, 1, 5]),
+                "malformed array",
+            ),
+            ("Int32", stored(1007, &[Some(&one)]), "scalar column"),
+        ];
+        for (ty, v, want) in cases {
+            let mut b = buf(ty);
+            assert!(
+                rejects(encode_value(&mut b, int4, &v, None, 0), want),
+                "{want}"
+            );
+            if let ColumnBuf::Array { offsets, .. } = &b {
+                assert!(offsets.is_empty(), "{want}: no partial row");
+            }
+        }
+        let source = SourceColumn {
+            index: 0,
+            codec: int4,
+            type_oid: 1007,
+        };
+        let text = encode_ref(
+            &mut buf("Array(Int32)"),
+            source,
+            DatumRef::Text(b"{1}"),
+            None,
+            0,
+        );
+        assert!(rejects(text, "array text routed"));
+
+        let mut ints = buf("Array(Int32)");
+        let send = crate::decode::codecs::array_send(23, &[(1, 1)], &[Some(&one)]);
+        encode_ref(&mut ints, source, DatumRef::Send(&send), None, 0).unwrap();
+        let bad = encode_ref(&mut ints, source, DatumRef::Send(&send[1..]), None, 0);
+        assert!(rejects(bad, "malformed array"));
+        assert_eq!(
+            ints.wire(),
+            Wire::Array {
+                offsets: &[1],
+                values: Box::new(Wire::Fixed {
+                    width: 4,
+                    bytes: &1i32.to_le_bytes(),
+                }),
+            }
+        );
+    }
+
+    #[test]
+    fn array_buffers_merge_spill_and_account() {
+        let text = array_codec(1009);
+        let mut a = buf("Array(Nullable(String))");
+        assert_eq!(
+            format!("{a:?}"),
+            "Array { rows: 0, values: NullableString { rows: 0, offsets_len: 0, data_len: 0 } }"
+        );
+        encode_value(&mut a, text, &stored(1009, &[Some(b"x"), None]), None, 0).unwrap();
+        a.append_default();
+        let mut b = a.empty_like();
+        encode_value(&mut b, text, &stored(1009, &[Some(b"yz")]), None, 0).unwrap();
+        assert!(a.same_shape(&b));
+        assert!(!a.same_shape(&buf("Array(String)")));
+        assert!(!a.same_shape(&buf("String")));
+        assert_eq!(b.approx_size(), 8 + 8 + 2 + 1);
+        assert!(b.allocated_bytes() >= b.approx_size() + std::mem::size_of::<ColumnBuf>());
+        a.extend(b);
+        let merged = Wire::Array {
+            offsets: &[2, 2, 3],
+            values: Box::new(Wire::NullableString {
+                offsets: &[1, 1, 3],
+                data: b"xyz",
+                null_map: &[0, 1, 0],
+                absent: b"",
+            }),
+        };
+        assert_eq!(a.wire(), merged);
+        let mut out = Vec::new();
+        a.encode_into(&mut out);
+        let back = ColumnBuf::decode(&mut crate::xact::spill::Cursor::new(&out)).unwrap();
+        assert_eq!(back.wire(), merged);
+        let mut empty = buf("Array(Int64)").empty_like();
+        empty.extend(buf("Array(Int64)"));
+        assert_eq!(empty.approx_size(), 0);
+    }
+
+    #[test]
+    fn roots_wrap_each_column_level_by_level() {
+        use clickhouse_c::{BlockBuilder, BlockOpts, BlockReader, SliceIo};
+        let alloc = Allocator::global(&mimalloc::MiMalloc);
+        let text = array_codec(1009);
+        let mut tags = buf("Array(Nullable(String))");
+        for v in [stored(1009, &[Some(b"a"), None]), stored(1009, &[])] {
+            encode_value(&mut tags, text, &v, None, 0).unwrap();
+        }
+        let mut ints = buf("Array(Int64)");
+        for v in [
+            stored(1016, &[]),
+            stored(1016, &[Some(&9i64.to_be_bytes())]),
+        ] {
+            encode_value(&mut ints, array_codec(1016), &v, None, 0).unwrap();
+        }
+        let ids = ColumnBuf::Fixed {
+            width: 4,
+            bytes: [1i32, 2].iter().flat_map(|v| v.to_le_bytes()).collect(),
+        };
+        let oracle = ColumnBuf::Oracle(OracleColumnBuf::string(0, -1));
+        let bufs = [ids, tags, ints, oracle];
+        let rows = with_roots(&bufs, 2, |roots| {
+            Ok(roots
+                .iter()
+                .map(|r| r.map(|b| b.n_rows()))
+                .collect::<Vec<_>>())
+        })
+        .unwrap();
+        assert_eq!(rows, [Some(2), Some(2), Some(2), None]);
+
+        let types = ["Int32", "Array(Nullable(String))", "Array(Int64)"]
+            .map(|t| TypeAst::parse(t, alloc).unwrap());
+        let seal = |compression: CompressionChoice| {
+            let codec = compression.build_codec().unwrap();
+            with_roots(&bufs[..3], 2, |roots| {
+                let mut bb = BlockBuilder::new();
+                for ((name, ty), root) in ["id", "tags", "ints"].iter().zip(&types).zip(roots) {
+                    bb.append(name, ty.view(), root.unwrap())?;
+                }
+                crate::emit::pipeline::sealed::SealedBlock::seal(
+                    &bb,
+                    compression,
+                    codec.as_ref().map(|c| c.as_ref()),
+                    alloc,
+                )
+            })
+            .unwrap()
+        };
+        let sealed = seal(CompressionChoice::None);
+        for compression in [CompressionChoice::Lz4, CompressionChoice::Zstd] {
+            assert_eq!(
+                seal(compression).raw_len(),
+                sealed.raw_len(),
+                "{compression:?}"
+            );
+        }
+        let mut io = SliceIo::new(sealed.prepared().as_bytes());
+        let opts = BlockOpts {
+            has_block_info: true,
+            has_custom_serialization: true,
+            ..BlockOpts::default()
+        };
+        let mut reader = BlockReader::new(io.as_mut(), alloc, opts).unwrap();
+        let block = reader.read().unwrap().unwrap();
+        let tags = block.column(1).unwrap();
+        assert_eq!(tags.array_offsets().unwrap(), [2, 2]);
+        let values = tags.array_values().unwrap();
+        assert_eq!(values.null_map().unwrap(), [0, 1]);
+        assert_eq!(
+            values.nullable_inner().unwrap().string().unwrap(),
+            (&[1, 1][..], &b"a"[..])
+        );
+        let ints = block.column(2).unwrap();
+        assert_eq!(ints.array_offsets().unwrap(), [0, 1]);
+        assert_eq!(
+            ints.array_values().unwrap().fixed().unwrap(),
+            (8, &9i64.to_le_bytes()[..])
+        );
+    }
+
+    #[test]
+    fn wrapper_levels_need_their_child() {
+        let nullable = buf("Nullable(Int32)");
+        let array = buf("Array(Int32)");
+        let oracle = ColumnBuf::Oracle(OracleColumnBuf::string(0, -1));
+        for (b, level) in [(&nullable, 1), (&array, 1), (&oracle, 0)] {
+            assert!(matches!(
+                b.build_level(level, None, 0),
+                Err(EmitterError::Type(_))
+            ));
+        }
+    }
+
     #[test]
     fn json_buffers_keep_absent_cell_through_spill() {
         for ty in ["JSON", "Nullable(JSON)"] {
@@ -4762,6 +5332,18 @@ mod tests {
                 [Datum::Null, text("Default")],
                 [build::int4(7), text("Literal([97])")],
             ]
+        );
+        let (mut tags, mut name) = (buf("Array(Int32)"), buf("String"));
+        tags.append_default();
+        name.append_default();
+        let chunk = EncodedChunk {
+            buffers: vec![tags, name],
+            rows: 1,
+            ..chunk
+        };
+        assert_eq!(
+            chunk.cells()[0][0],
+            text("Array { rows: 1, values: Fixed { width: 4, bytes_len: 0 } }")
         );
     }
 

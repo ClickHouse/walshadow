@@ -483,6 +483,8 @@ pub(crate) enum WireKind {
     Name,
     Json,
     Numeric,
+    /// `array_send` of a built-in array, stored as `array_recv` would
+    Array(&'static crate::decode::codecs::ArrayElem),
     Cast,
     Send,
 }
@@ -519,7 +521,7 @@ fn wire_kind(type_oid: u32) -> Option<WireKind> {
         NAMEOID => WireKind::Name,
         JSONOID => WireKind::Json,
         NUMERICOID => WireKind::Numeric,
-        _ => return None,
+        oid => WireKind::Array(crate::decode::codecs::array_elem(oid)?),
     })
 }
 
@@ -915,9 +917,13 @@ pub(crate) fn copy_slot<'a>(row: &'a CopyRow, rel: &RelDescriptor, i: usize) -> 
         return DatumRef::Send(raw);
     }
     match wire_kind(att.type_oid) {
-        Some(WireKind::Bytea | WireKind::Text | WireKind::Json | WireKind::Numeric) => {
-            DatumRef::Varlena(raw)
-        }
+        Some(
+            WireKind::Bytea
+            | WireKind::Text
+            | WireKind::Json
+            | WireKind::Numeric
+            | WireKind::Array(_),
+        ) => DatumRef::Varlena(raw),
         Some(_) => DatumRef::Fixed(raw),
         None => DatumRef::Text(raw),
     }
@@ -973,6 +979,8 @@ fn store_field(kind: WireKind, raw: &[u8], out: &mut Vec<u8>) -> Result<(), Stri
             out.extend_from_slice(&numeric_from_send(raw)?);
             Ok(())
         }
+        WireKind::Array(elem) => crate::decode::codecs::array_from_send(raw, elem, out)
+            .map_err(|e| format!("array: {e}")),
         WireKind::Bytea | WireKind::Text | WireKind::Json | WireKind::Cast | WireKind::Send => {
             out.extend_from_slice(raw);
             Ok(())
@@ -1002,7 +1010,7 @@ pub(crate) fn missing_from_send(type_oid: u32, send: &[u8]) -> Option<Vec<u8>> {
     store_field(kind, raw, &mut elem).ok()?;
     if matches!(
         kind,
-        WireKind::Bytea | WireKind::Text | WireKind::Json | WireKind::Numeric
+        WireKind::Bytea | WireKind::Text | WireKind::Json | WireKind::Numeric | WireKind::Array(_)
     ) {
         // 4-byte uncompressed varlena header, VARSIZE in upper 30 bits
         let size = u32::try_from(elem.len() + 4).ok()?;
@@ -2466,8 +2474,8 @@ mod tests {
         }
     }
 
-    /// text[], aclitem, and a user enum: none has a local reader
-    const TEXTARRAYOID: u32 = 1009;
+    /// numeric[], aclitem, and a user enum: none has a local reader
+    const NUMERICARRAYOID: u32 = 1231;
     const ACLITEMOID: u32 = 1033;
     const ENUM_OID: u32 = 16_500;
 
@@ -2476,7 +2484,7 @@ mod tests {
             attr(1, "id", INT8OID, false),
             attr(2, "gone", TEXTOID, true),
             varlena(3, "price", NUMERICOID),
-            varlena(4, "tags", TEXTARRAYOID),
+            varlena(4, "tags", NUMERICARRAYOID),
             varlena(5, "doc", JSONBOID),
             RelAttr {
                 type_len: 12,
@@ -2511,7 +2519,7 @@ mod tests {
     #[test]
     fn plan_keeps_send_form_of_binary_io_types() {
         // jsonb has binary I/O but a local reader, aclitem lacks it
-        let binary = HashSet::from_iter([TEXTARRAYOID, ENUM_OID, JSONBOID]);
+        let binary = HashSet::from_iter([NUMERICARRAYOID, ENUM_OID, JSONBOID]);
         let plan = column_plan(&mixed_desc(), &binary);
         assert_eq!(
             plan.select,
@@ -2533,7 +2541,7 @@ mod tests {
     #[test]
     fn send_fields_round_trip_as_send_datums() {
         let d = mixed_desc();
-        let plan = column_plan(&d, &HashSet::from_iter([TEXTARRAYOID, ENUM_OID]));
+        let plan = column_plan(&d, &HashSet::from_iter([NUMERICARRAYOID, ENUM_OID]));
         let tags = b"\x00\x00\x00\x01array-send";
         let fields: [Option<&[u8]>; 7] = [
             Some(&7i64.to_be_bytes()),
@@ -2598,6 +2606,20 @@ mod tests {
                 8,
                 "000000010000000000000014000000010000000100000008fffffffffffffffd",
                 Datum::fixed(&(-3i64).to_le_bytes()),
+            ),
+            // int4[] default '{1,2}', its element itself an array_send
+            (
+                1007,
+                -1,
+                "0000000100000000000003ef000000010000000100000024\
+                 000000010000000000000017000000020000000100000004\
+                 000000010000000400000002",
+                Datum::Varlena(
+                    [1i32, 0, 23, 2, 1, 1, 2]
+                        .iter()
+                        .flat_map(|w| w.to_le_bytes())
+                        .collect(),
+                ),
             ),
         ];
         for (type_oid, type_len, send, want) in cases {
@@ -2691,6 +2713,18 @@ mod tests {
         assert_eq!(store(Uuid, &uuid).unwrap(), uuid);
         assert!(store(Uuid, &uuid[1..]).is_err());
         assert!(store(Name, &[b'n'; NAMEDATALEN]).is_err());
+        let int4s = Array(crate::decode::codecs::array_elem(1007).unwrap());
+        let words = |ws: &[i32], be: bool| -> Vec<u8> {
+            ws.iter()
+                .flat_map(|w| if be { w.to_be_bytes() } else { w.to_le_bytes() })
+                .collect()
+        };
+        let send = words(&[1, 0, 23, 1, 1, 4, 9], true);
+        assert_eq!(
+            store(int4s, &send).unwrap(),
+            words(&[1, 0, 23, 1, 1, 9], false)
+        );
+        assert!(store(int4s, &send[..8]).unwrap_err().starts_with("array: "));
         assert_eq!(
             fixed::<6>(&[0; 4], "ctid"),
             Err("ctid: expected 6 bytes, got 4".into())
