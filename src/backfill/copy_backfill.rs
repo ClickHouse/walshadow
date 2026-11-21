@@ -98,7 +98,7 @@ use crate::pos::{Pos, Snapshot};
 use crate::runtime_config::InitialLoadMode;
 use crate::schema::{
     BOOLOID, BPCHAROID, BYTEAOID, CHAROID, CIDOID, DATEOID, FLOAT4OID, FLOAT8OID, INT2OID, INT4OID,
-    INT8OID, JSONOID, MONEYOID, NAMEOID, NUMERICOID, OID8OID, OIDOID, PG_LSNOID, RelAttr,
+    INT8OID, JSONBOID, JSONOID, MONEYOID, NAMEOID, NUMERICOID, OID8OID, OIDOID, PG_LSNOID, RelAttr,
     RelDescriptor, RelName, TEXTOID, TIMEOID, TIMESTAMPOID, TIMESTAMPTZOID, UUIDOID, VARCHAROID,
     XID8OID, XIDOID,
 };
@@ -521,7 +521,11 @@ fn wire_kind(type_oid: u32) -> Option<WireKind> {
         NAMEOID => WireKind::Name,
         JSONOID => WireKind::Json,
         NUMERICOID => WireKind::Numeric,
-        oid => WireKind::Array(crate::decode::codecs::array_elem(oid)?),
+        oid => match crate::decode::codecs::array_elem(oid)? {
+            // Stored jsonb[] can't be rebuilt from send form, so keep that form
+            e if e.elem_oid == JSONBOID => return None,
+            e => WireKind::Array(e),
+        },
     })
 }
 
@@ -980,6 +984,7 @@ fn store_field(kind: WireKind, raw: &[u8], out: &mut Vec<u8>) -> Result<(), Stri
             Ok(())
         }
         WireKind::Array(elem) => crate::decode::codecs::array_from_send(raw, elem, out)
+            .map(drop)
             .map_err(|e| format!("array: {e}")),
         WireKind::Bytea | WireKind::Text | WireKind::Json | WireKind::Cast | WireKind::Send => {
             out.extend_from_slice(raw);
@@ -2423,7 +2428,6 @@ struct CopyOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::JSONBOID;
 
     use crate::schema::{RelAttr, RelName, ReplIdent};
     use walrus::pg::walparser::RelFileNode;

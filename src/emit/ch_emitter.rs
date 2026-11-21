@@ -2883,9 +2883,10 @@ pub fn build_array_column(
     bodies: &[Option<&[u8]>],
 ) -> Result<usize, EmitterError> {
     let mut buf = ColumnBuf::new_for_ast(target)?;
+    let mut text = String::new();
     for body in bodies {
         if let Some(body) = body {
-            encode_array(&mut buf, elem, body)?;
+            encode_array(&mut buf, elem, body, &mut text)?;
         } else {
             buf.append_default();
         }
@@ -3285,12 +3286,13 @@ fn encode_datum(
     let (codec, type_oid) = plan
         .source
         .map_or((Codec::Le, 0), |s| (s.codec, s.type_oid));
-    // Deferred spools written before arrays encoded locally keep `array_send`
+    // COPY's jsonb arrays, and deferred spools written before arrays encoded
+    // locally, keep `array_send`
     if let (DatumRef::Send(send), Codec::Array(elem)) = (datum, codec) {
         let mut stored = Vec::new();
-        crate::decode::codecs::array_from_send(send, elem, &mut stored)
+        let held = crate::decode::codecs::array_from_send(send, elem, &mut stored)
             .map_err(|_| unsupported("malformed array"))?;
-        return encode_datum(buf, plan, DatumRef::Varlena(&stored), text);
+        return encode_array(buf, held, &stored, text);
     }
     let body = match datum {
         // Absent coerces like NULL, covers key-only delete tombstones under
@@ -3363,16 +3365,6 @@ fn encode_datum(
                 buf.append_fixed_bytes(&ticks.to_le_bytes())
             }
         },
-        // CH has no zone-aware time type, text keeps the offset
-        Codec::TimeTz => {
-            let b: [u8; 12] = fixed(body)?;
-            let micros = i64::from_le_bytes(b[..8].try_into().expect("8 bytes"));
-            let tz_seconds = i32::from_le_bytes(b[8..].try_into().expect("4 bytes"));
-            rendered(
-                buf,
-                &crate::decode::codecs::timetz_to_text(micros, tz_seconds),
-            )
-        }
         Codec::Uuid => {
             buf.append_fixed_bytes(&crate::decode::codecs::uuid_to_ch_wire(&fixed(body)?))
         }
@@ -3399,6 +3391,44 @@ fn encode_datum(
                 rendered(buf, text)
             }
         },
+        Codec::TimeTz
+        | Codec::Jsonb
+        | Codec::Inet
+        | Codec::Cidr
+        | Codec::MacAddr
+        | Codec::MacAddr8
+        | Codec::Tid
+        | Codec::Interval
+        | Codec::Pending => append_typoutput(buf, codec, body, text),
+        Codec::Wkt => match crate::ops::oracle::point_wkt(body) {
+            Some(wkt) => rendered(buf, &wkt),
+            None => Err(unsupported(
+                "unresolved source value routed to a local column",
+            )),
+        },
+        Codec::Array(elem) => encode_array(buf, elem, body, text),
+    }
+}
+
+/// Append typoutput text of codecs ClickHouse holds as String
+fn append_typoutput(
+    buf: &mut ColumnBuf,
+    codec: Codec,
+    body: &[u8],
+    text: &mut String,
+) -> Result<(), EmitterError> {
+    let rendered = |buf: &mut ColumnBuf, s: &str| buf.append_string_bytes(s.as_bytes());
+    match codec {
+        // CH has no zone-aware time type, text keeps the offset
+        Codec::TimeTz => {
+            let b: [u8; 12] = fixed(body)?;
+            let micros = i64::from_le_bytes(b[..8].try_into().expect("8 bytes"));
+            let tz_seconds = i32::from_le_bytes(b[8..].try_into().expect("4 bytes"));
+            rendered(
+                buf,
+                &crate::decode::codecs::timetz_to_text(micros, tz_seconds),
+            )
+        }
         Codec::Jsonb => {
             text.clear();
             crate::decode::codecs::render_jsonb_text(body, text)
@@ -3421,18 +3451,30 @@ fn encode_datum(
                 .map_err(|_| unsupported("malformed interval"))?;
             rendered(buf, &v.to_text())
         }
-        Codec::Wkt => match crate::ops::oracle::point_wkt(body) {
-            Some(wkt) => rendered(buf, &wkt),
-            None => Err(unsupported(
-                "unresolved source value routed to a local column",
-            )),
-        },
-        Codec::Array(elem) => encode_array(buf, elem, body),
-        // Never interpret raw Datum bytes as local String data
-        Codec::Pending => Err(unsupported(
+        // Never interpret raw Datum bytes of Pending as local String data
+        _ => Err(unsupported(
             "unresolved source value routed to a local column",
         )),
     }
+}
+
+/// Codec rendering array element type `elem_oid` as its typoutput text
+fn typoutput_elem(elem_oid: u32) -> Option<Codec> {
+    use crate::schema::{
+        CIDROID, INETOID, INTERVALOID, JSONBOID, MACADDR8OID, MACADDROID, TIDOID, TIMETZOID,
+    };
+    Some(match elem_oid {
+        JSONBOID => Codec::Jsonb,
+        // Shadow conversion casts inet to text, whose network_show keeps the
+        // /32 or /128 that inet_out drops
+        INETOID | CIDROID => Codec::Cidr,
+        INTERVALOID => Codec::Interval,
+        TIMETZOID => Codec::TimeTz,
+        MACADDROID => Codec::MacAddr,
+        MACADDR8OID => Codec::MacAddr8,
+        TIDOID => Codec::Tid,
+        _ => return None,
+    })
 }
 
 /// Append one-dimensional stored array, checking shape before any element
@@ -3440,6 +3482,7 @@ fn encode_array(
     buf: &mut ColumnBuf,
     elem: &'static crate::decode::codecs::ArrayElem,
     body: &[u8],
+    text: &mut String,
 ) -> Result<(), EmitterError> {
     use crate::decode::codecs::{ArrayBody, CodecError};
     use crate::schema::{BPCHAROID, NAMEOID, TEXTOID, UUIDOID, VARCHAROID};
@@ -3465,12 +3508,17 @@ fn encode_array(
     }
     let packed = arr.packed().map_err(malformed)?;
     let run = packed.is_some_and(|p| values.append_fixed_run(p, elem.len as usize));
+    let rendered = typoutput_elem(elem.elem_oid);
     if !run {
         for e in arr.elements() {
             let Some(raw) = e.map_err(malformed)? else {
                 values.append_default();
                 continue;
             };
+            if let Some(codec) = rendered {
+                append_typoutput(values, codec, raw, text)?;
+                continue;
+            }
             match elem.elem_oid {
                 TEXTOID | VARCHAROID => values.append_string_bytes(raw)?,
                 // bpchar to text casts strip trailing spaces
@@ -4960,6 +5008,109 @@ mod tests {
                 }),
             }
         );
+    }
+
+    /// Elements PostgreSQL prints as text land as their typoutput, from stored
+    /// and send forms alike
+    #[test]
+    fn array_cells_render_typoutput_elements() {
+        // Binary jsonb holding one string scalar
+        let jsonb = |s: &[u8]| {
+            let mut v = 0x5000_0001u32.to_le_bytes().to_vec();
+            v.extend_from_slice(&(s.len() as u32).to_le_bytes());
+            v.extend_from_slice(s);
+            v
+        };
+        let interval = [
+            &3_600_000_000i64.to_be_bytes()[..],
+            &2i32.to_be_bytes(),
+            &14i32.to_be_bytes(),
+        ]
+        .concat();
+        let timetz = [
+            &3_723_000_000i64.to_be_bytes()[..],
+            &(-3600i32).to_be_bytes(),
+        ]
+        .concat();
+        let tid = [&1u32.to_be_bytes()[..], &2u16.to_be_bytes()].concat();
+        let cells: [(u32, Datum); 8] = [
+            (
+                3807,
+                Datum::Varlena(crate::decode::codecs::stored_jsonb(
+                    &[(2, 1)],
+                    &[Some(&jsonb(b"a\"b")), Some(&jsonb(b""))],
+                )),
+            ),
+            (
+                1041,
+                stored(
+                    1041,
+                    &[
+                        Some(&[2, 24, 0, 4, 10, 0, 0, 1]),
+                        Some(&[2, 32, 0, 4, 10, 0, 0, 2]),
+                    ],
+                ),
+            ),
+            (651, stored(651, &[Some(&[2, 8, 1, 4, 10, 0, 0, 0])])),
+            (1187, stored(1187, &[Some(&interval)])),
+            (1270, stored(1270, &[Some(&timetz)])),
+            (1040, stored(1040, &[Some(&[8, 0, 0x2b, 1, 2, 3])])),
+            (775, stored(775, &[Some(&[8, 0, 0x2b, 1, 2, 3, 4, 5])])),
+            (1010, stored(1010, &[Some(&tid)])),
+        ];
+        let mut strings = buf("Array(String)");
+        for (array_oid, v) in &cells {
+            encode_value(&mut strings, array_codec(*array_oid), v, None, 0).unwrap();
+        }
+        // COPY keeps jsonb arrays in send form, text behind a version byte
+        let source = SourceColumn {
+            index: 0,
+            codec: array_codec(3807),
+            type_oid: 3807,
+        };
+        let send = crate::decode::codecs::array_send(
+            crate::schema::JSONBOID,
+            &[(1, 1)],
+            &[Some(b"\x01{\"k\": 1}")],
+        );
+        encode_ref(&mut strings, source, DatumRef::Send(&send), None, 0).unwrap();
+        let want = [
+            "\"a\\\"b\"",
+            "\"\"",
+            "10.0.0.1/24",
+            "10.0.0.2/32",
+            "10.0.0.0/8",
+            "1 year 2 mons 2 days 01:00:00",
+            "01:02:03+01",
+            "08:00:2b:01:02:03",
+            "08:00:2b:01:02:03:04:05",
+            "(1,2)",
+            "{\"k\": 1}",
+        ];
+        let offsets: Vec<u64> = want
+            .iter()
+            .scan(0, |end, w| {
+                *end += w.len() as u64;
+                Some(*end)
+            })
+            .collect();
+        assert_eq!(
+            strings.wire(),
+            Wire::Array {
+                offsets: &[2, 4, 5, 6, 7, 8, 9, 10, 11],
+                values: Box::new(Wire::String {
+                    offsets: &offsets,
+                    data: want.concat().as_bytes(),
+                    absent: b"",
+                }),
+            }
+        );
+        let bad = Datum::Varlena(crate::decode::codecs::stored_jsonb(
+            &[(1, 1)],
+            &[Some(&[0xff; 4])],
+        ));
+        let r = encode_value(&mut buf("Array(String)"), array_codec(3807), &bad, None, 0);
+        assert!(rejects(r, "malformed jsonb"));
     }
 
     #[test]

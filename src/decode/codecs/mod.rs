@@ -29,7 +29,7 @@ pub(crate) use time::{format_time_us, timetz_to_text};
 pub(crate) use uuid::uuid_to_ch_wire;
 
 #[cfg(test)]
-pub(crate) use array::tests::{send as array_send, stored as stored_array};
+pub(crate) use array::tests::{send as array_send, stored as stored_array, stored_jsonb};
 #[cfg(test)]
 pub(crate) use text_array::text_array_body;
 

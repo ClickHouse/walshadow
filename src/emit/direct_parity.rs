@@ -592,6 +592,10 @@ fn stored(array_oid: u32, dims: &[(i32, i32)], items: &[Option<&[u8]>]) -> Vec<u
     crate::decode::codecs::stored_array(array_oid, dims, items)
 }
 
+fn stored_jsonb(dims: &[(i32, i32)], items: &[Option<&[u8]>]) -> Vec<u8> {
+    crate::decode::codecs::stored_jsonb(dims, items)
+}
+
 /// One-dimensional array of `items` under a 4-byte varlena header
 fn array(array_oid: u32, items: &[Option<&[u8]>]) -> Vec<u8> {
     long(&stored(array_oid, &[(items.len() as i32, 1)], items))
@@ -604,6 +608,13 @@ fn array_types_match() {
     let many: Vec<_> = (0..200).map(|_| Some(&one[..])).collect();
     let uuid: Vec<u8> = (0..16).collect();
     let long_text = vec![b'y'; 200];
+    let interval = [
+        &1i64.to_be_bytes()[..],
+        &2i32.to_be_bytes(),
+        &3i32.to_be_bytes(),
+    ]
+    .concat();
+    let timetz = [&4i64.to_be_bytes()[..], &(-3600i32).to_be_bytes()].concat();
     let elems = |array_oid: u32, items: &[&[u8]]| {
         let items: Vec<_> = items.iter().map(|i| Some(*i)).collect();
         vec![
@@ -710,6 +721,68 @@ fn array_types_match() {
             "Array(Nullable(String))",
             elems(1003, &[b"nm"]),
         ),
+        case(
+            3807,
+            -1,
+            'i',
+            "Array(Nullable(String))",
+            vec![
+                long(&stored_jsonb(
+                    &[(2, 1)],
+                    &[Some(&jsonb_scalar(b"abc")), None],
+                )),
+                long(&stored_jsonb(&[], &[])),
+            ],
+        ),
+        case(
+            1041,
+            -1,
+            'i',
+            "Array(Nullable(String))",
+            elems(1041, &[&[2, 32, 0, 4, 10, 0, 0, 1]]),
+        ),
+        case(
+            651,
+            -1,
+            'i',
+            "Array(String)",
+            vec![array(651, &[Some(&[2, 8, 1, 4, 10, 0, 0, 0])])],
+        ),
+        case(
+            1187,
+            -1,
+            'd',
+            "Array(Nullable(String))",
+            elems(1187, &[&interval]),
+        ),
+        case(
+            1270,
+            -1,
+            'd',
+            "Array(Nullable(String))",
+            elems(1270, &[&timetz]),
+        ),
+        case(
+            1040,
+            -1,
+            'i',
+            "Array(Nullable(String))",
+            elems(1040, &[&[8, 0, 0x2b, 1, 2, 3]]),
+        ),
+        case(
+            775,
+            -1,
+            'i',
+            "Array(Nullable(String))",
+            elems(775, &[&[8, 0, 0x2b, 1, 2, 3, 4, 5]]),
+        ),
+        case(
+            1010,
+            -1,
+            'i',
+            "Array(Nullable(String))",
+            elems(1010, &[&[0, 0, 0, 1, 0, 2]]),
+        ),
     ];
     for c in &cases {
         run(c, &ColumnRules::default());
@@ -750,21 +823,33 @@ fn array_gates_pair_source_with_target() {
     let local = |oid: u32, target: &str| {
         encoding(array_attr(oid), target, &ColumnRules::default()) == ColumnEncoding::Local
     };
+    let names = [
+        (BOOLOID, "bool"),
+        (NAMEOID, "name"),
+        (INT2OID, "int2"),
+        (INT4OID, "int4"),
+        (TEXTOID, "text"),
+        (BPCHAROID, "bpchar"),
+        (VARCHAROID, "varchar"),
+        (INT8OID, "int8"),
+        (FLOAT4OID, "float4"),
+        (FLOAT8OID, "float8"),
+        (OIDOID, "oid"),
+        (UUIDOID, "uuid"),
+        (JSONBOID, "jsonb"),
+        (INETOID, "inet"),
+        (CIDROID, "cidr"),
+        (INTERVALOID, "interval"),
+        (TIMETZOID, "timetz"),
+        (MACADDROID, "macaddr"),
+        (MACADDR8OID, "macaddr8"),
+        (TIDOID, "tid"),
+    ];
     for e in &crate::decode::codecs::ARRAY_ELEMS {
-        let elem_name = match e.elem_oid {
-            BOOLOID => "bool",
-            NAMEOID => "name",
-            INT2OID => "int2",
-            INT4OID => "int4",
-            TEXTOID => "text",
-            BPCHAROID => "bpchar",
-            VARCHAROID => "varchar",
-            INT8OID => "int8",
-            FLOAT4OID => "float4",
-            FLOAT8OID => "float8",
-            OIDOID => "oid",
-            _ => "uuid",
-        };
+        let (_, elem_name) = names
+            .iter()
+            .find(|(oid, _)| *oid == e.elem_oid)
+            .expect("element needs a name");
         let att = attr(1, e.array_oid, -1, 'i', &format!("_{elem_name}"));
         let target = crate::catalog::type_bridge::map(&att, false).ch_type;
         assert!(local(e.array_oid, &target), "{elem_name}: {target}");
@@ -1371,6 +1456,8 @@ fn copy_fields_match_heap_views() {
         attr(8, NUMERICOID, -1, 'i', "numeric"),
         attr(9, 1007, -1, 'i', "_int4"),
         attr(10, 1009, -1, 'i', "_text"),
+        attr(11, 3807, -1, 'i', "_jsonb"),
+        attr(12, 1041, -1, 'i', "_inet"),
     ]);
     let targets = [
         "Int32",
@@ -1382,6 +1469,8 @@ fn copy_fields_match_heap_views() {
         "String",
         "Decimal(10, 2)",
         "Array(Nullable(Int32))",
+        "Array(String)",
+        "Array(Nullable(String))",
         "Array(String)",
     ];
     let send = crate::decode::codecs::array_send;
@@ -1413,6 +1502,17 @@ fn copy_fields_match_heap_views() {
             )),
             arrays(1007, INT4OID, &[(3, 0)], &[Some(&one), None, Some(&one)]),
             arrays(1009, TEXTOID, &[(2, 1)], &[Some(b"a"), Some(b"bc")]),
+            // COPY keeps jsonb[] in send form
+            Some((
+                long(&stored_jsonb(&[(2, 1)], &[Some(&jsonb_scalar(b"x")), None])),
+                send(JSONBOID, &[(2, 1)], &[Some(b"\x01\"x\""), None]),
+            )),
+            arrays(
+                1041,
+                INETOID,
+                &[(1, 1)],
+                &[Some(&[2, 32, 0, 4, 10, 0, 0, 1])],
+            ),
         ],
         vec![
             Some((0i32.to_le_bytes().into(), 0i32.to_be_bytes().into())),
@@ -1437,9 +1537,11 @@ fn copy_fields_match_heap_views() {
             )),
             None,
             arrays(1009, TEXTOID, &[], &[]),
+            None,
+            arrays(1041, INETOID, &[], &[]),
         ],
     ];
-    let kinds = wire_kinds(&rel, &foldhash::HashSet::default());
+    let kinds = wire_kinds(&rel, &foldhash::HashSet::from_iter([3807]));
     let mut views = TableEncoder::new(plan(&rel, &targets, &ColumnRules::default())).unwrap();
     let mut copy = TableEncoder::new(plan(&rel, &targets, &ColumnRules::default())).unwrap();
     for (i, row) in rows.iter().enumerate() {

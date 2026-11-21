@@ -1131,7 +1131,7 @@ async fn oracle_recovers_after_cluster_restart() {
 }
 
 /// Source column and its type, oid, and alignment
-const COPIED: [(&str, &str, u32, char); 8] = [
+const COPIED: [(&str, &str, u32, char); 16] = [
     ("i4", "int4[]", 1007, 'i'),
     ("i8", "int8[]", 1016, 'd'),
     ("b", "bool[]", 1000, 'i'),
@@ -1140,6 +1140,14 @@ const COPIED: [(&str, &str, u32, char); 8] = [
     ("t", "text[]", 1009, 'i'),
     ("bp", "char(3)[]", 1014, 'i'),
     ("n", "name[]", 1003, 'i'),
+    ("j", "jsonb[]", 3807, 'i'),
+    ("ip", "inet[]", 1041, 'i'),
+    ("net", "cidr[]", 651, 'i'),
+    ("iv", "interval[]", 1187, 'd'),
+    ("tz", "timetz[]", 1270, 'd'),
+    ("mac", "macaddr[]", 1040, 'i'),
+    ("mac8", "macaddr8[]", 775, 'i'),
+    ("ct", "tid[]", 1010, 'i'),
 ];
 
 /// COPY's `array_send` fields convert to the stored form PostgreSQL reads
@@ -1170,11 +1178,19 @@ async fn copied_arrays_store_as_postgres_reads_them() {
              INSERT INTO arrs VALUES \
                 (1, '{{1,NULL,-3}}', '{{9000000000}}', '{{t,NULL}}', '{{1.5,NULL}}', \
                     '{{00112233-4455-6677-8899-aabbccddeeff}}', '{{a,\"b,c\",NULL,\"\"}}', \
-                    '{{ab,\"  \",NULL}}', '{{nm,NULL}}'),\
-                (2, '{{}}', '{{}}', '{{}}', '{{}}', '{{}}', '{{}}', '{{}}', '{{}}'),\
-                (3, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL),\
+                    '{{ab,\"  \",NULL}}', '{{nm,NULL}}', \
+                    '{{\"{{\\\"a\\\": [1, null, \\\"x,y\\\"]}}\",NULL,\"\\\"s\\\"\",7}}', \
+                    '{{10.0.0.1/24,NULL,::1,fe80::1/64}}', '{{10.0.0.0/8,2001:db8::/32}}', \
+                    '{{\"1 year 2 mons 3 days 04:05:06.7\",NULL,-00:00:01}}', \
+                    '{{01:02:03+05:30,NULL,23:59:59.5-08}}', '{{08:00:2b:01:02:03,NULL}}', \
+                    '{{08:00:2b:01:02:03:04:05}}', '{{\"(1,2)\",NULL,\"(4294967295,65535)\"}}'),\
+                (2, '{{}}', '{{}}', '{{}}', '{{}}', '{{}}', '{{}}', '{{}}', '{{}}', \
+                    '{{}}', '{{}}', '{{}}', '{{}}', '{{}}', '{{}}', '{{}}', '{{}}'),\
+                (3, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, \
+                    NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL),\
                 (4, '[5:6]={{1,2}}', '{{{{1,2}},{{3,NULL}}}}', '[0:0]={{f}}', NULL, NULL, \
-                    '[2:3][1:1]={{{{p}},{{q}}}}', NULL, NULL);\n\
+                    '[2:3][1:1]={{{{p}},{{q}}}}', NULL, NULL, '[0:0]={{\"null\"}}', \
+                    '{{{{1.2.3.4}},{{5.6.7.8}}}}', NULL, NULL, NULL, NULL, NULL, NULL);\n\
              INSERT INTO arrs (id, i4, t) SELECT 5, \
                 ARRAY(SELECT g FROM generate_series(1, 3000) g), \
                 ARRAY(SELECT md5(g::text) FROM generate_series(1, 400) g);\n",
@@ -1278,14 +1294,24 @@ async fn copied_arrays_store_as_postgres_reads_them() {
         )
     };
     for (i, (name, _, type_oid, _)) in COPIED.iter().enumerate() {
+        let elem = walshadow::codecs::array_elem(*type_oid).unwrap();
+        // jsonb[] keeps send form, which rebuilds as text[] of jsonb_out text
+        let mut held = *type_oid;
         let stored = copied
             .iter()
             .map(|row| match &row[i + 1] {
                 Some(Datum::Varlena(b)) => OracleCell::DiskRaw(b.clone()),
+                Some(Datum::Send(b)) if *type_oid == 3807 => {
+                    let mut body = Vec::new();
+                    held = walshadow::codecs::array_from_send(b, elem, &mut body)
+                        .unwrap()
+                        .array_oid;
+                    OracleCell::DiskRaw(body)
+                }
                 None | Some(Datum::Null) => OracleCell::Default,
                 other => panic!("{name}: {other:?}"),
             })
-            .collect();
+            .collect::<Vec<_>>();
         let received = rows
             .iter()
             .map(|r| {
@@ -1294,7 +1320,7 @@ async fn copied_arrays_store_as_postgres_reads_them() {
             })
             .collect();
         let want = text(*type_oid, received).await;
-        assert_eq!(text(*type_oid, stored).await, want, "{name}");
+        assert_eq!(text(held, stored).await, want, "{name}");
         assert!(want.2.contains('{'), "{name}: {want:?}");
     }
 }

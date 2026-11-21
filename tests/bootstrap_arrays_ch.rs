@@ -1,5 +1,5 @@
-//! BASE_BACKUP initial loads encode built-in arrays in process, landing as
-//! oracle-converted twin columns of the same source do
+//! BASE_BACKUP and COPY initial loads encode built-in arrays in process,
+//! landing as oracle-converted twin columns of the same source do
 
 #![cfg(target_os = "linux")]
 
@@ -12,7 +12,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, ensure};
 
 /// Source column, local target, and twin target the oracle converts
-const TWINS: [(&str, &str, &str, &str); 7] = [
+const TWINS: [(&str, &str, &str, &str); 15] = [
     (
         "i4",
         "int4[]",
@@ -50,6 +50,54 @@ const TWINS: [(&str, &str, &str, &str); 7] = [
         "Array(Nullable(String))",
         "Array(LowCardinality(Nullable(String)))",
     ),
+    (
+        "j",
+        "jsonb[]",
+        "Array(Nullable(String))",
+        "Array(LowCardinality(Nullable(String)))",
+    ),
+    (
+        "ip",
+        "inet[]",
+        "Array(Nullable(String))",
+        "Array(LowCardinality(Nullable(String)))",
+    ),
+    (
+        "net",
+        "cidr[]",
+        "Array(Nullable(String))",
+        "Array(LowCardinality(Nullable(String)))",
+    ),
+    (
+        "iv",
+        "interval[]",
+        "Array(Nullable(String))",
+        "Array(LowCardinality(Nullable(String)))",
+    ),
+    (
+        "tz",
+        "timetz[]",
+        "Array(Nullable(String))",
+        "Array(LowCardinality(Nullable(String)))",
+    ),
+    (
+        "mac",
+        "macaddr[]",
+        "Array(Nullable(String))",
+        "Array(LowCardinality(Nullable(String)))",
+    ),
+    (
+        "mac8",
+        "macaddr8[]",
+        "Array(Nullable(String))",
+        "Array(LowCardinality(Nullable(String)))",
+    ),
+    (
+        "ct",
+        "tid[]",
+        "Array(Nullable(String))",
+        "Array(LowCardinality(Nullable(String)))",
+    ),
 ];
 
 fn source_sql() -> String {
@@ -62,23 +110,33 @@ fn source_sql() -> String {
              INSERT INTO public.ab VALUES \
                 (1, '{{1,NULL,-3}}', '{{9000000000}}', '{{t,NULL}}', \
                     '{{00112233-4455-6677-8899-aabbccddeeff,NULL}}', '{{a,\"b,c\",NULL,\"\"}}', \
-                    '{{ab,\"  \",NULL}}', '{{nm,NULL}}'),\
-                (2, '{{}}', '{{}}', '{{}}', '{{}}', '{{}}', '{{}}', '{{}}'),\
-                (3, NULL, NULL, NULL, NULL, NULL, NULL, NULL),\
-                (4, '[5:6]={{1,2}}', '[0:0]={{3}}', NULL, NULL, '[2:3]={{p,q}}', NULL, NULL);\n\
-             INSERT INTO public.ab (id, i4, t) SELECT 5, \
+                    '{{ab,\"  \",NULL}}', '{{nm,NULL}}', \
+                    '{{\"{{\\\"a\\\": [1, null, \\\"x,y\\\"]}}\",NULL,\"\\\"s\\\"\",7}}', \
+                    '{{10.0.0.1/24,NULL,::1,1.2.3.4}}', '{{10.0.0.0/8,2001:db8::/32}}', \
+                    '{{\"1 year 2 mons 3 days 04:05:06.7\",NULL,-00:00:01}}', \
+                    '{{01:02:03+05:30,NULL,23:59:59.5-08}}', '{{08:00:2b:01:02:03,NULL}}', \
+                    '{{08:00:2b:01:02:03:04:05}}', '{{\"(1,2)\",NULL,\"(4294967295,65535)\"}}'),\
+                (2, '{{}}', '{{}}', '{{}}', '{{}}', '{{}}', '{{}}', '{{}}', \
+                    '{{}}', '{{}}', '{{}}', '{{}}', '{{}}', '{{}}', '{{}}', '{{}}'),\
+                (3, NULL, NULL, NULL, NULL, NULL, NULL, NULL, \
+                    NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL),\
+                (4, '[5:6]={{1,2}}', '[0:0]={{3}}', NULL, NULL, '[2:3]={{p,q}}', NULL, NULL, \
+                    '[0:0]={{\"[]\"}}', '[3:3]={{1.2.3.4}}', NULL, NULL, NULL, NULL, NULL, NULL);\n\
+             INSERT INTO public.ab (id, i4, t, j) SELECT 5, \
                 ARRAY(SELECT g FROM generate_series(1, 3000) g), \
-                ARRAY(SELECT md5(g::text) FROM generate_series(1, 400) g);\n\
+                ARRAY(SELECT md5(g::text) FROM generate_series(1, 400) g), \
+                ARRAY(SELECT jsonb_build_object('k', g, 'v', md5(g::text)) \
+                    FROM generate_series(1, 400) g);\n\
              CHECKPOINT;\nSELECT pg_switch_wal();\n",
         cols.join(", ")
     )
 }
 
-fn write_config(path: &std::path::Path, ch_port: u16) -> Result<()> {
+fn write_config(path: &std::path::Path, ch_port: u16, mode: &str) -> Result<()> {
     let mut body = format!(
         "[ch]\nhost = \"127.0.0.1\"\nport = {ch_port}\ndatabase = \"default\"\n\
          compression = \"lz4\"\n\n[stream]\nreplicate_all = false\n\n\
-         [table.\"public\".\"ab\"]\nreplicate = true\ninitial_load = \"base_backup\"\n\
+         [table.\"public\".\"ab\"]\nreplicate = true\ninitial_load = \"{mode}\"\n\
          target_database = \"default\"\ntarget_table = \"ab\"\ncolumns = [\n  \
          {{ attnum = 1, target = \"id\", type = \"Int32\" }},\n"
     );
@@ -109,6 +167,16 @@ fn create_ch_tables(ch: &fx::ChServer) -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn backup_loads_encode_arrays_as_oracle_twins() {
+    loads_encode_arrays_as_oracle_twins("base_backup");
+}
+
+/// COPY keeps jsonb[] in send form, other arrays rebuild stored bodies
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn copy_loads_encode_arrays_as_oracle_twins() {
+    loads_encode_arrays_as_oracle_twins("copy");
+}
+
+fn loads_encode_arrays_as_oracle_twins(mode: &str) {
     if !fx::tools::requirements_available() {
         return;
     }
@@ -124,7 +192,7 @@ async fn backup_loads_encode_arrays_as_oracle_twins() {
     let ch = fx::ChServer::spawn(ch_tmp, slot.ch_tcp, slot.ch_http).expect("spawn ch");
     create_ch_tables(&ch).expect("create ch tables");
     let ch_config_path = tmp.path().join("ch-config.toml");
-    write_config(&ch_config_path, slot.ch_tcp).expect("write ch-config");
+    write_config(&ch_config_path, slot.ch_tcp, mode).expect("write ch-config");
 
     let daemon = fx::DaemonRun::prepare(tmp.path(), slot.metrics).expect("daemon layout");
     let child = daemon
@@ -160,8 +228,12 @@ async fn backup_loads_encode_arrays_as_oracle_twins() {
             (row(3, "i4, t"), "[]\t[]".to_owned()),
             (row(4, "i4, i8, t"), "[1,2]\t[3]\t['p','q']".to_owned()),
             (
-                row(5, "length(i4), i4[3000], t[400]"),
-                format!("3000\t3000\t{md5}"),
+                row(5, "length(i4), i4[3000], t[400], length(j), j[400]"),
+                format!("3000\t3000\t{md5}\t400\t{{\"k\": 400, \"v\": \"{md5}\"}}"),
+            ),
+            (
+                row(1, "ip"),
+                "['10.0.0.1/24',NULL,'::1/128','1.2.3.4/32']".to_owned(),
             ),
         ];
         for (got, want) in checks {

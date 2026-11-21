@@ -636,7 +636,7 @@ async fn array_update_under_rif_resolves_old_tuple() {
 
 /// Source column, local target, and an oracle-bound twin target of equal
 /// text: widened or LowCardinality elements keep the twin on the oracle
-const TWINS: [(&str, &str, &str, &str); 13] = [
+const TWINS: [(&str, &str, &str, &str); 21] = [
     (
         "i4",
         "int4[]",
@@ -709,6 +709,54 @@ const TWINS: [(&str, &str, &str, &str); 13] = [
         "Array(Nullable(String))",
         "Array(LowCardinality(Nullable(String)))",
     ),
+    (
+        "j",
+        "jsonb[]",
+        "Array(Nullable(String))",
+        "Array(LowCardinality(Nullable(String)))",
+    ),
+    (
+        "ip",
+        "inet[]",
+        "Array(Nullable(String))",
+        "Array(LowCardinality(Nullable(String)))",
+    ),
+    (
+        "net",
+        "cidr[]",
+        "Array(Nullable(String))",
+        "Array(LowCardinality(Nullable(String)))",
+    ),
+    (
+        "iv",
+        "interval[]",
+        "Array(Nullable(String))",
+        "Array(LowCardinality(Nullable(String)))",
+    ),
+    (
+        "tz",
+        "timetz[]",
+        "Array(Nullable(String))",
+        "Array(LowCardinality(Nullable(String)))",
+    ),
+    (
+        "mac",
+        "macaddr[]",
+        "Array(Nullable(String))",
+        "Array(LowCardinality(Nullable(String)))",
+    ),
+    (
+        "mac8",
+        "macaddr8[]",
+        "Array(Nullable(String))",
+        "Array(LowCardinality(Nullable(String)))",
+    ),
+    (
+        "ct",
+        "tid[]",
+        "Array(Nullable(String))",
+        "Array(LowCardinality(Nullable(String)))",
+    ),
     // Added below with a fast default, read back by delete markers
     (
         "extra",
@@ -726,7 +774,7 @@ async fn local_arrays_match_oracle_twins() {
     if !fx::tools::requirements_available() {
         return;
     }
-    let source_cols: Vec<String> = TWINS[..12]
+    let source_cols: Vec<String> = TWINS[..20]
         .iter()
         .map(|(c, pg, _, _)| format!("{c} {pg}"))
         .collect();
@@ -760,18 +808,29 @@ async fn local_arrays_match_oracle_twins() {
         "INSERT INTO public.tw VALUES \
             (1, '{1,NULL,-3}', '{7}', '{9000000000,NULL}', '{t,f,NULL}', '{1.5,-0.25}', \
                 '{2.5,NULL}', '{4294967295,0}', '{00112233-4455-6677-8899-aabbccddeeff,NULL}', \
-                '{a,\"b,c\",NULL,\"\"}', '{x}', '{ab,\"  \",NULL}', '{nm,NULL}'),\
-            (2, '{}', '{}', '{}', '{}', '{}', '{}', '{}', '{}', '{}', '{}', '{}', '{}'),\
-            (3, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL),\
+                '{a,\"b,c\",NULL,\"\"}', '{x}', '{ab,\"  \",NULL}', '{nm,NULL}', \
+                '{\"{\\\"a\\\": [1, null, \\\"x,y\\\"]}\",NULL,\"\\\"s\\\"\",7,\"null\"}', \
+                '{10.0.0.1/24,NULL,::1,fe80::1/64}', '{10.0.0.0/8,2001:db8::/32}', \
+                '{\"1 year 2 mons 3 days 04:05:06.7\",NULL,-00:00:01}', \
+                '{01:02:03+05:30,NULL,23:59:59.5-08}', '{08:00:2b:01:02:03,NULL}', \
+                '{08:00:2b:01:02:03:04:05}', '{\"(1,2)\",NULL,\"(4294967295,65535)\"}'),\
+            (2, '{}', '{}', '{}', '{}', '{}', '{}', '{}', '{}', '{}', '{}', '{}', '{}', \
+                '{}', '{}', '{}', '{}', '{}', '{}', '{}', '{}'),\
+            (3, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, \
+                NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL),\
             (4, '[5:6]={1,2}', '[0:0]={3}', '[-2:-2]={4}', NULL, NULL, NULL, NULL, NULL, \
-                '[2:3]={p,q}', NULL, NULL, NULL);\n\
-         INSERT INTO public.tw (id, i4, t) SELECT 5, \
+                '[2:3]={p,q}', NULL, NULL, NULL, '[0:0]={\"[]\"}', '[3:3]={1.2.3.4}', NULL, \
+                NULL, NULL, NULL, NULL, NULL);\n\
+         INSERT INTO public.tw (id, i4, t, j) SELECT 5, \
             ARRAY(SELECT g FROM generate_series(1, 3000) g), \
-            ARRAY(SELECT md5(g::text) FROM generate_series(1, 400) g);\n\
+            ARRAY(SELECT md5(g::text) FROM generate_series(1, 400) g), \
+            ARRAY(SELECT jsonb_build_object('k', g, 'v', md5(g::text)) \
+                FROM generate_series(1, 400) g);\n\
          INSERT INTO public.tw (id, i4) VALUES (6, '{6}');\n\
          ALTER TABLE public.tw ADD COLUMN extra int4[] DEFAULT '{1,NULL}';\n\
          UPDATE public.tw SET i4 = '{10,11}', t = '{updated}' WHERE id = 1;\n\
          UPDATE public.tw SET b = '{t}' WHERE id = 5;\n\
+         UPDATE public.tw SET j = '{\"{\\\"u\\\": true}\"}', ip = '{192.168.0.1}' WHERE id = 1;\n\
          DELETE FROM public.tw WHERE id IN (2, 6);\n\
          SELECT pg_switch_wal();\n",
     )
@@ -792,12 +851,16 @@ async fn local_arrays_match_oracle_twins() {
         ))
     };
     assert_eq!(live(1, "i4, t, bp"), "[10,11]\t['updated']\t['ab','',NULL]");
+    assert_eq!(live(1, "j, ip"), "['{\"u\": true}']\t['192.168.0.1/32']");
     assert_eq!(live(3, "i4, t, v"), "[]\t[]\t[]", "NULL arrays land empty");
     assert_eq!(live(4, "i4, i2, i8, t"), "[1,2]\t[3]\t[4]\t['p','q']");
     let md5 = source.psql_one("SELECT md5('400')").unwrap();
     assert_eq!(
-        live(5, "length(i4), i4[3000], length(t), t[400], b"),
-        format!("3000\t3000\t400\t{md5}\t[true]"),
+        live(
+            5,
+            "length(i4), i4[3000], length(t), t[400], b, length(j), j[400]"
+        ),
+        format!("3000\t3000\t400\t{md5}\t[true]\t400\t{{\"k\": 400, \"v\": \"{md5}\"}}"),
         "TOASTed arrays resolve, unchanged under an update",
     );
     assert_eq!(

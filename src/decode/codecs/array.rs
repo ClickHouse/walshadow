@@ -3,8 +3,9 @@
 
 use super::CodecError;
 use crate::schema::{
-    BOOLOID, BPCHAROID, FLOAT4OID, FLOAT8OID, INT2OID, INT4OID, INT8OID, NAMEOID, OIDOID,
-    TEXTARRAYOID, TEXTOID, UUIDOID, VARCHAROID,
+    BOOLOID, BPCHAROID, CIDROID, FLOAT4OID, FLOAT8OID, INETOID, INT2OID, INT4OID, INT8OID,
+    INTERVALOID, JSONBOID, MACADDR8OID, MACADDROID, NAMEOID, OIDOID, TEXTARRAYOID, TEXTOID, TIDOID,
+    TIMETZOID, UUIDOID, VARCHAROID,
 };
 
 /// PostgreSQL `MAXDIM`
@@ -40,7 +41,7 @@ const fn elem(array_oid: u32, elem_oid: u32, len: i16, byval: bool, align: usize
 }
 
 /// Arrays whose elements decode without PostgreSQL
-pub static ARRAY_ELEMS: [ArrayElem; 12] = [
+pub static ARRAY_ELEMS: [ArrayElem; 20] = [
     elem(1000, BOOLOID, 1, true, 1),
     elem(1003, NAMEOID, 64, false, 1),
     elem(1005, INT2OID, 2, true, 2),
@@ -53,6 +54,14 @@ pub static ARRAY_ELEMS: [ArrayElem; 12] = [
     elem(1022, FLOAT8OID, 8, true, 8),
     elem(1028, OIDOID, 4, true, 4),
     elem(2951, UUIDOID, 16, false, 1),
+    elem(3807, JSONBOID, -1, false, 4),
+    elem(1041, INETOID, -1, false, 4),
+    elem(651, CIDROID, -1, false, 4),
+    elem(1187, INTERVALOID, 16, false, 8),
+    elem(1270, TIMETZOID, 12, false, 8),
+    elem(1040, MACADDROID, 6, false, 4),
+    elem(775, MACADDR8OID, 8, false, 4),
+    elem(1010, TIDOID, 6, false, 2),
 ];
 
 /// Element of array type `array_oid` when local decoding covers it
@@ -282,12 +291,19 @@ impl<'a> SendCursor<'a> {
 }
 
 /// Append stored body of `array_send` bytes `send`, without length word, laid
-/// out as `array_recv` stores it
+/// out as `array_recv` stores it. Returns element type body holds: jsonb
+/// arrays store as text[] of `jsonb_out` text, as no local encoder rebuilds
+/// binary jsonb
 pub fn array_from_send(
     send: &[u8],
     elem: &'static ArrayElem,
     out: &mut Vec<u8>,
-) -> Result<(), CodecError> {
+) -> Result<&'static ArrayElem, CodecError> {
+    let stored = if elem.elem_oid == JSONBOID {
+        array_elem(TEXTARRAYOID).expect("text[] in table")
+    } else {
+        elem
+    };
     let mut c = SendCursor { send, at: 0 };
     let ndim = usize::try_from(c.word()?)
         .ok()
@@ -327,7 +343,7 @@ pub fn array_from_send(
     let base = out.len();
     out.extend_from_slice(&(ndim as i32).to_le_bytes());
     out.extend_from_slice(&(if has_null { data as i32 } else { 0 }).to_le_bytes());
-    out.extend_from_slice(&elemtype.to_le_bytes());
+    out.extend_from_slice(&stored.elem_oid.to_le_bytes());
     for (dim, _) in &dims[..ndim] {
         out.extend_from_slice(&dim.to_le_bytes());
     }
@@ -342,17 +358,37 @@ pub fn array_from_send(
         if has_null {
             out[bitmap + i / 8] |= 1 << (i % 8);
         }
-        out.resize(base + align_body(out.len() - base, elem.align), 0);
+        out.resize(base + align_body(out.len() - base, stored.align), 0);
         store_elem(elem, raw, out)?;
     }
-    Ok(())
+    Ok(stored)
 }
 
 /// Element `typsend` bytes in stored form
 fn store_elem(elem: &ArrayElem, raw: &[u8], out: &mut Vec<u8>) -> Result<(), CodecError> {
+    let varlena = |out: &mut Vec<u8>, parts: &[&[u8]]| {
+        let len: usize = parts.iter().map(|p| p.len()).sum();
+        out.extend_from_slice(&(((len + VARHDRSZ) as u32) << 2).to_le_bytes());
+        for p in parts {
+            out.extend_from_slice(p);
+        }
+    };
     let Ok(len) = usize::try_from(elem.len) else {
-        out.extend_from_slice(&(((raw.len() + VARHDRSZ) as u32) << 2).to_le_bytes());
-        out.extend_from_slice(raw);
+        match elem.elem_oid {
+            // jsonb_send prefixes jsonb_out text with format version 1
+            JSONBOID => match raw.split_first() {
+                Some((1, text)) => varlena(out, &[text]),
+                _ => return Err(CodecError::BadArray("jsonb element version")),
+            },
+            // inet_send adds is_cidr and address length, which storage omits
+            INETOID | CIDROID => match *raw {
+                [family, bits, _, nb, ref addr @ ..] if addr.len() == usize::from(nb) => {
+                    varlena(out, &[&[family, bits], addr]);
+                }
+                _ => return Err(CodecError::BadArray("inet element")),
+            },
+            _ => varlena(out, &[raw]),
+        }
         return Ok(());
     };
     // name_send omits the NUL padding out to NAMEDATALEN
@@ -364,11 +400,25 @@ fn store_elem(elem: &ArrayElem, raw: &[u8], out: &mut Vec<u8>) -> Result<(), Cod
     if !fits {
         return Err(CodecError::BadArray("element width"));
     }
-    if elem.byval {
-        out.extend(raw.iter().rev());
-    } else {
-        out.extend_from_slice(raw);
-        out.resize(out.len() + len - raw.len(), 0);
+    match elem.elem_oid {
+        // int64 time then int32 fields, each big-endian on the wire
+        INTERVALOID | TIMETZOID => {
+            let (time, words) = raw.split_at(8);
+            out.extend(time.iter().rev());
+            for w in words.as_chunks::<4>().0 {
+                out.extend(w.iter().rev());
+            }
+        }
+        TIDOID => {
+            let block = u32::from_be_bytes(raw[..4].try_into().expect("4 bytes"));
+            let offset = u16::from_be_bytes([raw[4], raw[5]]);
+            out.extend_from_slice(&super::fixed::encode_tid(block, offset));
+        }
+        _ if elem.byval => out.extend(raw.iter().rev()),
+        _ => {
+            out.extend_from_slice(raw);
+            out.resize(out.len() + len - raw.len(), 0);
+        }
     }
     Ok(())
 }
@@ -412,6 +462,13 @@ pub(crate) mod tests {
         out
     }
 
+    /// Stored jsonb[] body over binary jsonb `items`, laid out as text[] is
+    pub(crate) fn stored_jsonb(dims: &[(i32, i32)], items: &[Option<&[u8]>]) -> Vec<u8> {
+        let mut body = stored(TEXTARRAYOID, dims, items);
+        body[8..12].copy_from_slice(&JSONBOID.to_le_bytes());
+        body
+    }
+
     fn collect(body: &[u8], elem: &'static ArrayElem) -> Result<Vec<Option<Vec<u8>>>, CodecError> {
         ArrayBody::parse(body, elem)?
             .elements()
@@ -438,6 +495,14 @@ pub(crate) mod tests {
             (1022, FLOAT8OID, 8, true, 8),
             (1028, OIDOID, 4, true, 4),
             (2951, UUIDOID, 16, false, 1),
+            (3807, JSONBOID, -1, false, 4),
+            (1041, INETOID, -1, false, 4),
+            (651, CIDROID, -1, false, 4),
+            (1187, INTERVALOID, 16, false, 8),
+            (1270, TIMETZOID, 12, false, 8),
+            (1040, MACADDROID, 6, false, 4),
+            (775, MACADDR8OID, 8, false, 4),
+            (1010, TIDOID, 6, false, 2),
         ];
         for (array, elem_oid, len, byval, align) in want {
             assert_eq!(el(array), &elem(array, elem_oid, len, byval, align));
@@ -481,6 +546,66 @@ pub(crate) mod tests {
         assert_eq!(stored(1003, &[(1, 1)], &[Some(b"nm")]), name);
         let uuid: Vec<u8> = (0..16).collect();
         assert_eq!(stored(2951, &[(1, 1)], &[Some(&uuid)])[20..], uuid[..]);
+    }
+
+    #[test]
+    fn send_rebuilds_rendered_elements() {
+        let one = |array_oid: u32, raw: &[u8]| {
+            let elem = el(array_oid);
+            let mut out = Vec::new();
+            let held = array_from_send(
+                &send(elem.elem_oid, &[(1, 1)], &[Some(raw)]),
+                elem,
+                &mut out,
+            )
+            .unwrap();
+            (held.array_oid, out)
+        };
+        let head = |elem_oid: u32| words(&[1, 0, elem_oid as i32, 1, 1]);
+        let with = |mut v: Vec<u8>, tail: &[u8]| {
+            v.extend_from_slice(tail);
+            v
+        };
+        // jsonb stores as text[] of its text, version byte dropped
+        assert_eq!(
+            one(3807, b"\x01{}"),
+            (1009, with(head(TEXTOID), &[24, 0, 0, 0, b'{', b'}']))
+        );
+        // Family, bits, address; is_cidr and length drop
+        assert_eq!(
+            one(1041, &[2, 24, 0, 4, 10, 0, 0, 1]),
+            (
+                1041,
+                with(head(INETOID), &[40, 0, 0, 0, 2, 24, 10, 0, 0, 1])
+            )
+        );
+        let v6 = [
+            3, 128, 1, 16, 0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+        ];
+        assert_eq!(
+            one(651, &v6).1[20..],
+            [&[88, 0, 0, 0, 3, 128][..], &v6[4..]].concat()
+        );
+        // Data at 24 already 8-aligned
+        let mut interval = 5i64.to_be_bytes().to_vec();
+        interval.extend((-2i32).to_be_bytes());
+        interval.extend(3i32.to_be_bytes());
+        let mut want = 5i64.to_le_bytes().to_vec();
+        want.extend((-2i32).to_le_bytes());
+        want.extend(3i32.to_le_bytes());
+        assert_eq!(one(1187, &interval), (1187, with(head(INTERVALOID), &want)));
+        let timetz = [&7i64.to_be_bytes()[..], &(-3600i32).to_be_bytes()].concat();
+        let want = [&7i64.to_le_bytes()[..], &(-3600i32).to_le_bytes()].concat();
+        assert_eq!(one(1270, &timetz), (1270, with(head(TIMETZOID), &want)));
+        let tid = [&0x0001_0002u32.to_be_bytes()[..], &3u16.to_be_bytes()].concat();
+        assert_eq!(
+            one(1010, &tid),
+            (1010, with(head(TIDOID), &[1, 0, 2, 0, 3, 0]))
+        );
+        let mac = [8, 0, 0x2b, 1, 2, 3];
+        assert_eq!(one(1040, &mac), (1040, with(head(MACADDROID), &mac)));
+        let mac8 = [8, 0, 0x2b, 1, 2, 3, 4, 5];
+        assert_eq!(one(775, &mac8), (775, with(head(MACADDR8OID), &mac8)));
     }
 
     #[test]
@@ -698,6 +823,25 @@ pub(crate) mod tests {
         );
         assert_eq!(
             bad(2951, send(2950, &[(1, 1)], &[Some(&[0; 15])])),
+            CodecError::BadArray("element width")
+        );
+        assert_eq!(
+            bad(3807, send(JSONBOID, &[(1, 1)], &[Some(b"\x02{}")])),
+            CodecError::BadArray("jsonb element version")
+        );
+        assert_eq!(
+            bad(3807, send(JSONBOID, &[(1, 1)], &[Some(b"")])),
+            CodecError::BadArray("jsonb element version")
+        );
+        assert_eq!(
+            bad(
+                1041,
+                send(INETOID, &[(1, 1)], &[Some(&[2, 32, 0, 4, 1, 2, 3])])
+            ),
+            CodecError::BadArray("inet element")
+        );
+        assert_eq!(
+            bad(1187, send(INTERVALOID, &[(1, 1)], &[Some(&[0; 12])])),
             CodecError::BadArray("element width")
         );
     }

@@ -30,7 +30,7 @@ use std::time::{Duration, Instant};
 use clap::Parser;
 use clickhouse_c::{Allocator, TypeAst};
 use walshadow::ch_emitter::build_array_column;
-use walshadow::codecs::{array_elem, array_from_send};
+use walshadow::codecs::{array_elem, array_from_send, decode_jsonb};
 use walshadow::oracle::{Oracle, OracleCell, OracleColumnBuf, OracleRequestColumn};
 use walshadow::shadow::{BridgeConf, Shadow, ShadowConfig};
 
@@ -55,8 +55,34 @@ struct Shape {
     array_oid: u32,
     elem_oid: u32,
     target: &'static str,
-    /// `typsend` element bodies, `None` for NULL
+    /// `typsend` element bodies, `None` for NULL. jsonb elements are stored
+    /// binary instead, as no local encoder rebuilds it from text
     elems: Vec<Option<Vec<u8>>>,
+}
+
+/// Binary jsonb object of string pairs, keys in storage order
+fn jsonb_object(pairs: &[(&str, &str)]) -> Vec<u8> {
+    let mut out = (0x2000_0000u32 | pairs.len() as u32).to_le_bytes().to_vec();
+    let strings: Vec<&str> = pairs
+        .iter()
+        .map(|p| p.0)
+        .chain(pairs.iter().map(|p| p.1))
+        .collect();
+    let mut end = 0;
+    for (i, s) in strings.iter().enumerate() {
+        end += s.len() as u32;
+        // First entry holds its end offset, later ones their length
+        let entry = if i == 0 {
+            0x8000_0000 | end
+        } else {
+            s.len() as u32
+        };
+        out.extend_from_slice(&entry.to_le_bytes());
+    }
+    for s in strings {
+        out.extend_from_slice(s.as_bytes());
+    }
+    out
 }
 
 fn shapes() -> Vec<Shape> {
@@ -111,14 +137,59 @@ fn shapes() -> Vec<Shape> {
             target: "Array(UUID)",
             elems: (0..4u8).map(|i| Some(vec![i; 16])).collect(),
         },
+        Shape {
+            name: "jsonb[8] obj",
+            array_oid: 3807,
+            elem_oid: 3802,
+            target: "Array(Nullable(String))",
+            elems: (0..8)
+                .map(|i| {
+                    let (id, name) = (format!("{i:06}"), format!("{i:016}"));
+                    let body = jsonb_object(&[("id", &id), ("name", &name)]);
+                    let want = format!("{{\"id\": \"{id}\", \"name\": \"{name}\"}}");
+                    assert_eq!(decode_jsonb(&body).unwrap(), want);
+                    Some(body)
+                })
+                .collect(),
+        },
+        Shape {
+            name: "inet[16]",
+            array_oid: 1041,
+            elem_oid: 869,
+            target: "Array(String)",
+            elems: (0..16u8)
+                .map(|i| Some(vec![2, 32, 0, 4, 10, 0, i, 1]))
+                .collect(),
+        },
+        Shape {
+            name: "interval[8]",
+            array_oid: 1187,
+            elem_oid: 1186,
+            target: "Array(String)",
+            elems: (0..8i64)
+                .map(|i| {
+                    let mut v = (i * 3_600_000_000).to_be_bytes().to_vec();
+                    v.extend((i as i32).to_be_bytes());
+                    v.extend(14i32.to_be_bytes());
+                    Some(v)
+                })
+                .collect(),
+        },
     ]
 }
 
-/// `array_send` of a one-dimensional array, then its stored body
+/// `array_send` of a one-dimensional array, then its stored body. jsonb
+/// elements lay out as text[] varlenas do, under jsonb's element type
 fn stored_body(shape: &Shape) -> Vec<u8> {
+    let jsonb = shape.elem_oid == 3802;
+    let (array_oid, elem_oid) = if jsonb {
+        (1009, 25)
+    } else {
+        (shape.array_oid, shape.elem_oid)
+    };
     let has_null = shape.elems.iter().any(Option::is_none);
     let mut send = Vec::new();
-    for w in [1, i32::from(has_null), shape.elem_oid as i32] {
+    for w in [1, i32::from(has_null), elem_oid as i32] {
         send.extend_from_slice(&w.to_be_bytes());
     }
     send.extend_from_slice(&(shape.elems.len() as i32).to_be_bytes());
@@ -132,7 +203,10 @@ fn stored_body(shape: &Shape) -> Vec<u8> {
         }
     }
     let mut body = Vec::new();
-    array_from_send(&send, array_elem(shape.array_oid).unwrap(), &mut body).unwrap();
+    array_from_send(&send, array_elem(array_oid).unwrap(), &mut body).unwrap();
+    if jsonb {
+        body[8..12].copy_from_slice(&shape.elem_oid.to_le_bytes());
+    }
     body
 }
 
