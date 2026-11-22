@@ -19,6 +19,7 @@ use clickhouse_c::Allocator;
 use tokio_postgres::{Client, NoTls};
 use walshadow::backfill::bootstrap_oracle::{BootstrapOracle, ORACLE_PORT, ORACLE_USER};
 use walshadow::bridge::{Bridge, BridgeError, FRAME_PREFIX_BYTES, request_frame};
+use walshadow::mimalloc;
 use walshadow::oracle::{Oracle, OracleCell, OracleColumnBuf, OracleRequestColumn};
 use walshadow::schema::NUMERICOID;
 use walshadow::shadow::{BridgeConf, Shadow, ShadowConfig};

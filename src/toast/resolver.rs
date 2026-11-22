@@ -24,6 +24,7 @@ use crate::decode::heap_decoder::{
     ToastPointer, VARLENA_EXTSIZE_BITS, VARLENA_EXTSIZE_MASK, decompress_varlena,
 };
 use crate::emit::ch_emitter::{EmitterConfig, EmitterStats, InlineValueOverflow, ToastMode};
+use crate::mimalloc;
 use crate::toast::read_ahead::{PendingReads, ReadValue, retained_bytes};
 use crate::xact::spill::{BodyRef, BodySpoolFile, ToastChunk, ToastDelete};
 use foldhash::{HashMap, HashMapExt, HashSet, HashSetExt};

@@ -156,6 +156,7 @@ mod tests {
     use super::*;
     use crate::ch::CompressionChoice;
     use crate::emit::pipeline::ack;
+    use crate::mimalloc;
     use clickhouse_c::{Allocator, BlockBuilder, ColumnBuilder, TypeAst};
 
     /// One uncompressed UInt8 column x holding one row 42

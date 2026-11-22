@@ -13,7 +13,7 @@ FROM rust:1-alpine AS builder
 RUN apk add --no-cache build-base
 ENV RUSTFLAGS="-C target-feature=-crt-static"
 WORKDIR /src
-COPY Cargo.toml Cargo.lock ./
+COPY Cargo.toml Cargo.lock build.rs ./
 COPY src ./src
 COPY bench/Cargo.toml ./bench/Cargo.toml
 COPY bench/src ./bench/src

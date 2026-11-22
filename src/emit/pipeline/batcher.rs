@@ -39,6 +39,7 @@ use crate::emit::pipeline::bootstrap::Slab;
 use crate::emit::pipeline::encode::EncodedRun;
 use crate::emit::pipeline::{DEFAULT_PIPELINE_FLUSH, Fatal};
 use crate::emit::route::RouteSnapshot;
+use crate::mimalloc;
 use crate::schema::{RelDescriptor, TableKey};
 use foldhash::HashMap;
 

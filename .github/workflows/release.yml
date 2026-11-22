@@ -33,6 +33,7 @@ on:
     paths:
       - .github/workflows/release.yml
       - build.rs
+      - vendor/mimalloc
   workflow_dispatch:
 
 env:
@@ -68,9 +69,10 @@ jobs:
     timeout-minutes: 45
 
     steps:
-      # The Rust build does not touch pgext, so no submodules.
       - name: Checkout walshadow
         uses: actions/checkout@v7
+        with:
+          submodules: true
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -133,6 +135,7 @@ jobs:
           mkdir -p "dist/$ARCHIVE"
           cp target/${{ matrix.image.target }}/release/walshadow-{stream,classify,filter} \
              LICENSE README.md "dist/$ARCHIVE/"
+          cp vendor/mimalloc/LICENSE "dist/$ARCHIVE/LICENSE-mimalloc"
           tar -czf "dist/$ARCHIVE.tar.gz" -C dist "$ARCHIVE"
           ls -l dist/*.tar.gz
 

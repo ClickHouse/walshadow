@@ -43,6 +43,7 @@ use crate::emit::ch_emitter::{
 use crate::emit::pipeline::Fatal;
 use crate::emit::pipeline::batcher::{BatchMeta, BlockSlabs, InsertBatch, NATIVE_BLOCK_BYTES};
 use crate::emit::pipeline::sealed::SealedBlock;
+use crate::mimalloc;
 use crate::ops::oracle::{
     ORACLE_BATCH_SEAL_BYTES, Oracle, OracleBlock, OracleError, OracleRequestColumn,
 };

@@ -27,7 +27,9 @@ on:
       - .gitmodules
       - Cargo.toml
       - Cargo.lock
+      - build.rs
       - pgext/**
+      - vendor/mimalloc
       - .github/workflows/docker.yml
   workflow_dispatch:
 

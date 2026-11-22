@@ -47,6 +47,7 @@ impl SealedBlock {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mimalloc;
     use clickhouse_c::{ColumnBuilder, TypeAst};
 
     fn alloc() -> Allocator {

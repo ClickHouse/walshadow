@@ -23,6 +23,7 @@ use walshadow::bridge::{
     PROJECTION_VERSION, PROTO_VERSION,
 };
 use walshadow::datum::{DatumRef, build};
+use walshadow::mimalloc;
 use walshadow::oracle::{Oracle, OracleCell, OracleColumnBuf, OracleRequestColumn};
 use walshadow::pg::socket_conninfo;
 use walshadow::schema::{NUMERICOID, ReplIdent};

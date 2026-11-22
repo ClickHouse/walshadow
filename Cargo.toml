@@ -7,6 +7,7 @@ version = "0.1.9"
 edition = "2024"
 description = "Schema-only Postgres + WAL replay catalog mirror for CDC to ClickHouse"
 license = "AGPL-3.0-only"
+links = "mimalloc"
 repository = "https://github.com/ClickHouse/walshadow"
 documentation = "https://github.com/ClickHouse/walshadow/tree/main/docs"
 
@@ -93,8 +94,10 @@ opentelemetry = "0.33"
 opentelemetry_sdk = { version = "0.33", features = ["rt-tokio"] }
 opentelemetry-otlp = { version = "0.33", default-features = false, features = ["grpc-tonic", "trace"] }
 tracing-opentelemetry = { version = "0.34", default-features = false }
-mimalloc = "0.1.52"
 prometheus-client = "0.26"
+
+[build-dependencies]
+cc = "1.2"
 
 # `harness = false` throughout: these take shape flags rather than libtest
 # filters. Bootstrap pump + drain needs no PG and no CH; oracle batch needs

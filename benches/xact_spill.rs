@@ -16,6 +16,7 @@ use walshadow::decode::datum::DatumRef;
 use walshadow::emit::route::RouteSnapshot;
 use walshadow::heap_decoder::view_heap_record;
 use walshadow::mapping::{ColumnMapping, TableMapping, TableTarget};
+use walshadow::mimalloc;
 use walshadow::pipeline::planner::{PlanRouteView, Planner};
 use walshadow::schema::{RelAttr, RelDescriptor, RelName, ReplIdent, TEXTOID};
 use walshadow::spill::{DescribedInput, HeapInput, RawRecord};

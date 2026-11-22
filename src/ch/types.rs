@@ -2,6 +2,8 @@
 
 use clickhouse_c::{Allocator, Kind, TypeAst, TypeRef};
 
+use crate::mimalloc;
+
 /// Outer kind, `None` when `ty` does not parse
 pub fn kind(ty: &str) -> Option<Kind> {
     TypeAst::parse(ty, Allocator::global(&mimalloc::MiMalloc))

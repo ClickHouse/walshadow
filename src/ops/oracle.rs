@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use clickhouse_c::{Allocator, Block, BlockOpts, BlockReader, Column, Kind, SliceIo, TypeRef};
 
 use crate::ch::types;
+use crate::mimalloc;
 use crate::ops::bridge::{Bridge, BridgeError, MAX_REQUEST_BYTES, request_frame};
 use tokio_postgres::types::Oid;
 

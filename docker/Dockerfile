@@ -31,10 +31,11 @@ ENV CFLAGS="-Dunreachable()=__builtin_unreachable()"
 ARG WALSHADOW_GIT_SHA=unknown
 ENV WALSHADOW_GIT_SHA=$WALSHADOW_GIT_SHA
 WORKDIR /src
-COPY Cargo.toml Cargo.lock ./
+COPY Cargo.toml Cargo.lock build.rs ./
 COPY bench ./bench
 COPY benches ./benches
 COPY src ./src
+COPY vendor/mimalloc ./vendor/mimalloc
 # Cache mounts persist cargo's registry/git and the target dir across builds,
 # so a source change recompiles only the changed crates, not all deps. The
 # target dir lives in the cache mount (not the image layer), so the binary is
@@ -65,6 +66,7 @@ FROM postgres:${PG_MAJOR}-alpine AS runtime
 RUN apk add --no-cache ca-certificates postgis
 
 COPY --from=rust-builder /usr/local/bin/walshadow-stream /usr/local/bin/walshadow-stream
+COPY vendor/mimalloc/LICENSE /usr/local/share/licenses/walshadow/mimalloc/LICENSE
 COPY --from=ext-builder /src/pgext/walshadow.so \
         /usr/local/lib/postgresql/walshadow.so
 

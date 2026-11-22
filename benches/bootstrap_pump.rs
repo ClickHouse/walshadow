@@ -50,6 +50,7 @@ use walshadow::backup_page_walk::{BackfillTuple, CatalogMap, PAGE_BYTES, TupleDa
 use walshadow::datum::build;
 use walshadow::decode::datum::DatumRef;
 use walshadow::mapping::{ColumnMapping, TableMapping, TableTarget};
+use walshadow::mimalloc;
 use walshadow::pipeline::bootstrap;
 use walshadow::pos::{EmitterAck, Monotone};
 use walshadow::schema::{INT4OID, RelAttr, RelDescriptor, RelName, ReplIdent, TEXTOID};
