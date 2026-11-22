@@ -43,6 +43,8 @@ pub mod emit;
 pub mod filter;
 pub mod fs;
 pub mod mapping;
+#[doc(hidden)]
+pub mod mimalloc;
 pub mod ops;
 pub mod pg;
 pub mod pos;

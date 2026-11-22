@@ -15,6 +15,7 @@ use crate::catalog::shadow::{BridgeConf, Shadow, ShadowConfig};
 use crate::column_rules::ColumnRules;
 use crate::emit::ch_emitter::TablePlan;
 use crate::mapping::{MappingSnapshot, SystemColumns};
+use crate::mimalloc;
 use crate::ops::oracle::Oracle;
 use crate::schema::FIRST_NORMAL_OBJECT_ID;
 

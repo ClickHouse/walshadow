@@ -45,6 +45,7 @@ use crate::mapping::{
     ColumnMapping, DropTableStrategy, NamespaceMapping, SystemColumnNames, SystemColumns,
     TableMapping, TableTarget, named_instance,
 };
+use crate::mimalloc;
 use crate::ops::bridge::MAX_REQUEST_BYTES;
 use crate::ops::oracle::{
     ORACLE_BATCH_SEAL_BYTES, OracleCell, OracleColumnBuf, REQUEST_FRAME_BYTES, request_column_bytes,

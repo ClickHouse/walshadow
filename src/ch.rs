@@ -18,6 +18,7 @@ use tokio_rustls::TlsConnector;
 
 use crate::config::DestEmitter;
 use crate::emit::ch_emitter::EmitterConfig;
+use crate::mimalloc;
 
 #[cfg(test)]
 pub(crate) mod test_support;

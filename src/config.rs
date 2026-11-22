@@ -39,6 +39,7 @@ use crate::mapping::{
     DropTableStrategy, MappingHandle, NameTemplate, NamespaceMapping, Retype, TableMapping,
     TableTarget, derive_columns_for_mapping, fold_diff_into_mapping, named_instance,
 };
+use crate::mimalloc;
 use crate::runtime_config::{ConfigEvent, ConfigOverlay, TableRow};
 use crate::schema::{RelDescriptor, RelName, SchemaDiff};
 use crate::table_rules::{MatchKind, TableRule, TableRules, TableRulesBuilder};

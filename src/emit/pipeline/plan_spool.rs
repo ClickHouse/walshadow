@@ -34,6 +34,7 @@ use crate::emit::ch_emitter::{
     Append, EncodedChunk, OP_DELETE, OP_INSERT, OP_UPDATE, RowStamp, TableEncoder, TablePlan,
 };
 use crate::emit::route::RouteSnapshot;
+use crate::mimalloc;
 use crate::schema::RelDescriptor;
 use crate::xact::spill::{self, Cursor, DescribedInput, IO_CHUNK, SpillError, Truncate};
 use crate::xact::xact_buffer::{DrainEntry, ToastRowBatch};

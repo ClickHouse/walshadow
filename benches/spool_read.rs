@@ -18,6 +18,7 @@ use walshadow::backup_page_walk::{BackfillTuple, TupleData};
 use walshadow::datum::build;
 use walshadow::emit::route::RouteSnapshot;
 use walshadow::mapping::{ColumnMapping, TableMapping, TableTarget};
+use walshadow::mimalloc;
 use walshadow::pipeline::plan_spool::{PlanItem, PlanWriter, ViewChange};
 use walshadow::pipeline::planner::{PlanRouteView, Planner};
 use walshadow::schema::{

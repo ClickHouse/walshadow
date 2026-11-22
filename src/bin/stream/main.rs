@@ -57,6 +57,7 @@ use clap::Parser;
 use tokio::sync::Mutex;
 use walshadow::boundary_hold::AttachSlot;
 use walshadow::metrics::MetricsRegistry;
+use walshadow::mimalloc;
 
 use crate::args::{
     Args, InitArgs, cli_base, url_base, validate_scratch_dir, validate_transport_args,

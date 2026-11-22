@@ -34,6 +34,7 @@ use std::time::{Duration, Instant};
 
 use clickhouse_c::{Allocator, ColumnBuilder};
 use walshadow::bridge::Bridge;
+use walshadow::mimalloc;
 use walshadow::oracle::{Oracle, OracleCell, OracleColumnBuf, OracleRequestColumn};
 use walshadow::schema::NUMERICOID;
 use walshadow::shadow::{BridgeConf, Shadow, ShadowConfig};

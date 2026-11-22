@@ -13,6 +13,7 @@ use crate::emit::ch_emitter::{
     Codec, ColumnBuf, OP_DELETE, OP_INSERT, RowStamp, TableEncoder, TablePlan,
 };
 use crate::mapping::{ColumnMapping, SystemColumns, TableMapping, TableTarget};
+use crate::mimalloc;
 use crate::schema::*;
 use crate::table_rules::MatchKind;
 
