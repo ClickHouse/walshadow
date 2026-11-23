@@ -659,15 +659,11 @@ impl DdlApplicator {
             self.alter(&targets, &add_column_clause(&name, &resolved))
                 .await?;
         }
-        // diff lists attnums only; resolve CH column name from old descriptor
-        let dropped = old
-            .attributes
+        let dropped = columns
             .iter()
-            .filter(|a| diff.dropped_columns.contains(&a.attnum));
-        for att in dropped {
-            // Surface the drop on CH even if TOML still references the
-            // column; emitter then encodes NULL for the vanished attnum
-            let clause = format!("DROP COLUMN IF EXISTS {}", quote_ident(&att.name));
+            .filter(|c| diff.dropped_columns.contains(&c.src_attnum));
+        for column in dropped {
+            let clause = format!("DROP COLUMN IF EXISTS {}", quote_ident(&column.target_name));
             self.alter(&targets, &clause).await?;
         }
         // Auto-extend the TableMapping so the emitter ships post-DDL

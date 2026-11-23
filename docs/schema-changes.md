@@ -11,7 +11,7 @@ changes after earlier rows and before later rows
 | `ADD COLUMN` | adds mapped column automatically |
 | `ADD COLUMN ... DEFAULT ...` | adds column and carries supported default |
 | `RENAME COLUMN` | renames destination column unless config pins another target name |
-| `DROP COLUMN` | drops automatically mapped destination column, custom target mappings can need cleanup |
+| `DROP COLUMN` | drops mapped destination column, including one with a configured target name |
 | `ALTER COLUMN ... TYPE` | updates destination type unless config states one; `USING` is eventually consistent |
 | `DROP NOT NULL` | makes automatically derived destination type `Nullable` |
 | `SET NOT NULL` | preserves existing destination `Nullable` type |

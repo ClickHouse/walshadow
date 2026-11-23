@@ -132,9 +132,8 @@ warning followed by incomplete routing is not rejection
 | Drop with CASCADE or a refused RESTRICT | Apply chosen dependent-object policy and preserve unaffected mappings |
 
 Column DDL must address destination columns by mapped name. `DROP COLUMN`
-names old source column, so a column with a configured destination name stays
-in ClickHouse. `RENAME COLUMN` renames to new source name while mapping takes
-column rule's target name
+resolves destination name by attribute number. `RENAME COLUMN` renames to new
+source name while mapping takes column rule's target name
 
 Cover configured target names through column rename/drop, including restart
 Compare schema-change tests against canonical source rows, not literals
