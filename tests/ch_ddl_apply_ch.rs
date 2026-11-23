@@ -103,12 +103,20 @@ async fn ddl_applies_and_refuses_against_clickhouse() {
     let pinned = RelName::new("public", "pinned");
     let pinned_mapping = TableMapping {
         target: TableTarget::new(DB, "pinned"),
-        columns: vec![ColumnMapping {
-            src_attnum: 1,
-            target_name: "id".into(),
-            target_type: "Int32".into(),
-            type_pinned: false,
-        }],
+        columns: vec![
+            ColumnMapping {
+                src_attnum: 1,
+                target_name: "id".into(),
+                target_type: "Int32".into(),
+                type_pinned: false,
+            },
+            ColumnMapping {
+                src_attnum: 2,
+                target_name: "label".into(),
+                target_type: "Nullable(String)".into(),
+                type_pinned: false,
+            },
+        ],
         tees: Vec::new(),
     };
     let mapping =
@@ -120,14 +128,50 @@ async fn ddl_applies_and_refuses_against_clickhouse() {
     let at = Stamp::default();
 
     // Mapped relation: create from the mapping, then add its columns
-    let pinned_desc = rel(16390, "pinned", vec![attr(1, "id", INT4OID, true)]);
+    let pinned_desc = rel(
+        16390,
+        "pinned",
+        vec![
+            attr(1, "id", INT4OID, true),
+            attr(2, "title", TEXTOID, false),
+        ],
+    );
     let added = SchemaEvent::Added {
-        desc: Arc::new(pinned_desc),
+        desc: Arc::new(pinned_desc.clone()),
     };
     app.apply_at(&added, None, at).await.unwrap();
     assert_eq!(
         (app.stats.creates_applied, app.stats.alters_applied),
         (1, 1)
+    );
+
+    // Aliased column drops under its ClickHouse name
+    let mut pinned_v2 = pinned_desc.clone();
+    pinned_v2.attributes.truncate(1);
+    let dropped = SchemaEvent::Changed {
+        old: Arc::new(pinned_desc),
+        new: Arc::new(pinned_v2),
+        diff: SchemaDiff {
+            dropped_columns: vec![2],
+            ..SchemaDiff::default()
+        },
+    };
+    app.apply_at(&dropped, None, at).await.unwrap();
+    assert_eq!(app.stats.alters_applied, 2);
+    let names = ch
+        .query(&format!(
+            "SELECT name FROM system.columns WHERE database = '{DB}' AND table = 'pinned' AND name IN ('title', 'label')"
+        ))
+        .expect("pinned columns");
+    assert_eq!(names.trim(), "");
+    assert!(
+        mapping
+            .snapshot()
+            .get(&pinned)
+            .unwrap()
+            .columns
+            .iter()
+            .all(|c| c.src_attnum != 2)
     );
 
     // Zero-column relation: re-learn creates from its mapping with nothing to add
@@ -138,7 +182,7 @@ async fn ddl_applies_and_refuses_against_clickhouse() {
     app.apply_at(&bare, None, at).await.unwrap();
     assert_eq!(
         (app.stats.creates_applied, app.stats.alters_applied),
-        (3, 1)
+        (3, 2)
     );
 
     // Refusal other than a key retype passes through unchanged
