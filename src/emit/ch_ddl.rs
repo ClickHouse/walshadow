@@ -68,6 +68,7 @@ pub struct DdlConfig {
     pub instances: std::collections::BTreeMap<String, crate::emit::ch_emitter::InstanceConfig>,
     pub drop_table_strategy: DropTableStrategy,
     pub detach_strategy: DropTableStrategy,
+    pub truncate_strategy: DropTableStrategy,
     /// Namespaces whose `Added` events run `CREATE TABLE IF NOT EXISTS`
     /// automatically (`auto_create = true`)
     pub auto_create_namespaces: HashSet<String>,
@@ -146,6 +147,7 @@ impl DdlConfig {
             instances: resolved.instances.clone(),
             drop_table_strategy: resolved.drop_table_strategy,
             detach_strategy: resolved.detach_strategy,
+            truncate_strategy: resolved.truncate_strategy,
             auto_create_namespaces,
             replicate_all,
             auto_create_name_all,
@@ -777,6 +779,7 @@ impl DdlApplicator {
                     .truncated
                     .as_ref()
                     .is_some_and(|(lsn, t)| *lsn == at.lsn && *t == mapping.target)
+                    || !self.truncates(&cfg, desc, &mapping.target)
                 {
                     return Ok(());
                 }
@@ -788,12 +791,36 @@ impl DdlApplicator {
         let Some((_, mapping)) = self.mapping_snapshot(&desc.rel_name) else {
             return Ok(());
         };
+        if !self.truncates(&cfg, desc, &mapping.target) {
+            return Ok(());
+        }
         for target in mapping.targets() {
             self.execute(&target, &format!("TRUNCATE TABLE {}", target.sql()))
                 .await?;
         }
         self.truncated = Some((at.lsn, mapping.target));
         Ok(())
+    }
+
+    fn truncates(&mut self, cfg: &DdlConfig, desc: &RelDescriptor, dest: &TableTarget) -> bool {
+        let source = &desc.rel_name;
+        match cfg.truncate_strategy {
+            DropTableStrategy::Drop => return true,
+            DropTableStrategy::Retain => tracing::info!(
+                target: "walshadow::ch_ddl",
+                source = %source,
+                dest = %dest,
+                "Kept ClickHouse rows after source TRUNCATE (truncate_strategy=retain)",
+            ),
+            DropTableStrategy::Warn => tracing::warn!(
+                target: "walshadow::ch_ddl",
+                source = %source,
+                dest = %dest,
+                "Kept ClickHouse rows after source TRUNCATE (truncate_strategy=warn)",
+            ),
+        }
+        self.stats.skipped += 1;
+        false
     }
 
     /// Check routing requirements. Return `false` for excluded partitions
@@ -1894,6 +1921,7 @@ mod tests {
             instances: Default::default(),
             drop_table_strategy: DropTableStrategy::Retain,
             detach_strategy: DropTableStrategy::Retain,
+            truncate_strategy: DropTableStrategy::Drop,
             auto_create_namespaces: HashSet::new(),
             replicate_all: false,
             auto_create_name_all: None,
@@ -1944,6 +1972,7 @@ mod tests {
             instances: Default::default(),
             drop_table_strategy: DropTableStrategy::Retain,
             detach_strategy: DropTableStrategy::Retain,
+            truncate_strategy: DropTableStrategy::Drop,
             auto_create_namespaces: HashSet::new(),
             replicate_all: true,
             auto_create_name_all: Some(NameTemplate::parse("$database$_$schema$_$table$").unwrap()),
@@ -2010,6 +2039,7 @@ mod tests {
             instances: Default::default(),
             drop_table_strategy: DropTableStrategy::Retain,
             detach_strategy: DropTableStrategy::Retain,
+            truncate_strategy: DropTableStrategy::Drop,
             auto_create_namespaces: HashSet::new(),
             replicate_all: false,
             auto_create_name_all: None,
@@ -2040,6 +2070,7 @@ mod tests {
             instances: Default::default(),
             drop_table_strategy: DropTableStrategy::Retain,
             detach_strategy: DropTableStrategy::Retain,
+            truncate_strategy: DropTableStrategy::Drop,
             auto_create_namespaces: HashSet::new(),
             replicate_all: false,
             auto_create_name_all: None,
@@ -2138,6 +2169,7 @@ mod tests {
             instances: Default::default(),
             drop_table_strategy: DropTableStrategy::Retain,
             detach_strategy: DropTableStrategy::Retain,
+            truncate_strategy: DropTableStrategy::Drop,
             auto_create_namespaces: HashSet::new(),
             replicate_all: false,
             auto_create_name_all: None,
@@ -3075,6 +3107,7 @@ mod tests {
             instances: Default::default(),
             drop_table_strategy: DropTableStrategy::Drop,
             detach_strategy: DropTableStrategy::Retain,
+            truncate_strategy: DropTableStrategy::Drop,
             auto_create_namespaces: HashSet::new(),
             replicate_all: false,
             auto_create_name_all: None,
@@ -3112,6 +3145,7 @@ mod tests {
             instances: Default::default(),
             drop_table_strategy: DropTableStrategy::Retain,
             detach_strategy: DropTableStrategy::Retain,
+            truncate_strategy: DropTableStrategy::Drop,
             auto_create_namespaces: HashSet::new(),
             replicate_all: true,
             auto_create_name_all: None,
@@ -3370,6 +3404,7 @@ mod tests {
             instances: Default::default(),
             drop_table_strategy: DropTableStrategy::Retain,
             detach_strategy: DropTableStrategy::Retain,
+            truncate_strategy: DropTableStrategy::Drop,
             auto_create_namespaces: HashSet::new(),
             replicate_all: true,
             auto_create_name_all: None,
@@ -3438,6 +3473,7 @@ mod tests {
             instances: Default::default(),
             drop_table_strategy: DropTableStrategy::Warn,
             detach_strategy: DropTableStrategy::Retain,
+            truncate_strategy: DropTableStrategy::Drop,
             auto_create_namespaces: HashSet::new(),
             replicate_all: false,
             auto_create_name_all: None,
@@ -3625,5 +3661,47 @@ mod tests {
         app.truncated = Some((STAMP.lsn, target));
         app.truncate(&leaf, STAMP).await.unwrap();
         assert_eq!(app.stats.alters_applied, 0);
+    }
+
+    #[tokio::test]
+    async fn truncate_strategy_retains_rows_unless_drop() {
+        let orders = desc(
+            "orders",
+            vec![att(1, "id", INT4OID, true, None)],
+            Some(vec![1]),
+        );
+        let (_, map) = orders_mapping();
+        let mut app = offline(base_cfg(), map);
+        // Any ClickHouse query fails in this test
+        assert!(
+            app.truncate(&orders, STAMP).await.is_err(),
+            "drop should send a query to ClickHouse"
+        );
+
+        for truncate_strategy in [DropTableStrategy::Retain, DropTableStrategy::Warn] {
+            let cfg = DdlConfig {
+                truncate_strategy,
+                ..base_cfg()
+            };
+            let (_, map) = orders_mapping();
+            let mut app = offline(cfg, map);
+            app.truncate(&orders, STAMP).await.unwrap();
+            assert_eq!(app.stats.skipped, 1);
+            assert!(app.truncated.is_none());
+        }
+
+        let (m, leaf) = partition_pair();
+        let mapping = TableMapping {
+            target: TableTarget::new("default", "m"),
+            columns: Vec::new(),
+            tees: Vec::new(),
+        };
+        let cfg = DdlConfig {
+            truncate_strategy: DropTableStrategy::Retain,
+            ..base_cfg()
+        };
+        let mut app = offline(cfg, [(m.rel_name.clone(), mapping)].into_iter().collect());
+        app.truncate(&leaf, STAMP).await.unwrap();
+        assert_eq!((app.stats.skipped, app.stats.alters_applied), (1, 0));
     }
 }

@@ -15,8 +15,8 @@ changes after earlier rows and before later rows
 | `ALTER COLUMN ... TYPE` | updates destination type unless config states one; `USING` is eventually consistent |
 | `DROP NOT NULL` | makes automatically derived destination type `Nullable` |
 | `SET NOT NULL` | preserves existing destination `Nullable` type |
-| `TRUNCATE` | truncates destination table in source order |
-| `TRUNCATE` of a partition | removes that partition's rows from root's destination |
+| `TRUNCATE` | clears destination rows in source order unless `truncate_strategy` keeps them |
+| `TRUNCATE` of a partition | removes that partition's rows from root's destination unless `truncate_strategy` keeps them |
 | `DROP TABLE` | retains, warns, or drops destination based on policy |
 | `DROP TABLE` of a partition | retains or removes that partition's rows based on `drop_table_strategy` |
 | `ATTACH PARTITION` | loads attached table's rows into root's destination |
@@ -66,6 +66,19 @@ drop_table_strategy = "drop"
 Choose `drop` only when source owns destination lifecycle. ClickHouse
 dependencies and downstream consumers remain operator responsibility
 
+## Keep ClickHouse rows after `TRUNCATE`
+
+By default, a source `TRUNCATE` clears rows from its destination and any tee tables
+
+```toml
+[ch]
+truncate_strategy = "drop"
+```
+
+Set `truncate_strategy` to `retain` to keep existing rows, or `warn` to keep
+them and log a warning. This also applies to partition truncates. With
+`ReplacingMergeTree`, new rows with matching keys still replace rows you keep
+
 ## Configure partition changes
 
 A partition routed to its root has no separate destination. Its schema
@@ -75,8 +88,8 @@ destination once
 walshadow uses `_leaf_oid` to find a partition's rows and source position to
 limit removal to earlier rows. With default `ReplacingMergeTree`, it inserts
 delete markers at removal position. Other MergeTree engines and tees use a
-lightweight `DELETE`. If `leaf` column is disabled, replication stops on
-partition `TRUNCATE` or on a detach or drop with policy set to `drop`
+lightweight `DELETE`. If `leaf` is disabled, replication stops when a
+partition `TRUNCATE`, detach, or drop needs to remove rows
 
 By default, `DETACH PARTITION` keeps existing rows in root's destination:
 

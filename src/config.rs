@@ -151,6 +151,8 @@ pub struct ResolvedConfig {
     pub drop_table_strategy: DropTableStrategy,
     /// Global `DETACH PARTITION` fallback, overridden per namespace
     pub detach_strategy: DropTableStrategy,
+    /// Whether a source `TRUNCATE` clears ClickHouse rows
+    pub truncate_strategy: DropTableStrategy,
     /// Emitter batch-seal row trigger (live: batcher reads per seal decision)
     pub row_budget: usize,
     /// Emitter batch-seal byte trigger (live)
@@ -785,6 +787,7 @@ impl ConfigResolver {
             rules: rules.clone(),
             drop_table_strategy: base.drop_table_strategy,
             detach_strategy: base.detach_strategy,
+            truncate_strategy: base.truncate_strategy,
             row_budget: base.row_budget,
             byte_budget: base.byte_budget,
             flush_timeout: base.flush_timeout,
