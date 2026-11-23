@@ -1372,6 +1372,7 @@ impl EmitterConfig {
             self.namespaces
                 .get(ns)
                 .and_then(|n| n.auto_create_name.clone())
+                .or_else(|| self.auto_create_name_all.clone())
                 .unwrap_or_default()
                 .render(&self.source.dbname, ns, &name)
         });
@@ -4893,14 +4894,18 @@ mod tests {
     #[test]
     fn pinned_columns_follow_namespace_template_and_opt_out() {
         let c = EmitterConfig::from_toml_str(
-            "[ch]\n[namespace.app]\nauto_create_name = \"wh_\"\n\
+            "[ch]\n[stream]\nauto_create_name_all = \"all_\"\n\
+             [namespace.app]\nauto_create_name = \"wh_\"\n\
              [table.app.events]\ncolumns = [{ attnum = 1, target = \"id\", type = \"UInt64\" }]\n\
+             [table.audit.log]\ncolumns = [{ attnum = 1, target = \"id\", type = \"UInt64\" }]\n\
              [table.app.skipped]\nreplicate = false\n\
              columns = [{ attnum = 1, target = \"id\", type = \"UInt64\" }]\n",
         )
         .unwrap();
         let m = &c.tables[&RelName::new("app", "events")];
         assert_eq!(m.target.table, "wh_events");
+        let m = &c.tables[&RelName::new("audit", "log")];
+        assert_eq!(m.target.table, "all_log");
         assert!(!c.tables.contains_key(&RelName::new("app", "skipped")));
     }
 
