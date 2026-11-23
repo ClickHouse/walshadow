@@ -184,6 +184,9 @@ pub struct EmitterConfig {
     /// `[ch] detach_strategy`: rows a detached partition leaves in its root's
     /// destination, overridable per namespace
     pub detach_strategy: DropTableStrategy,
+    /// `[ch] truncate_strategy` defaults to `drop`, which clears ClickHouse
+    /// rows after a source `TRUNCATE`
+    pub truncate_strategy: DropTableStrategy,
     pub retry: RetryConfig,
     /// A CH connection idle longer than this may be half-open (NAT/LB/CH
     /// idle-reap); reconnect before the next op instead of waiting for TCP
@@ -848,6 +851,8 @@ struct ChSection {
     drop_table_strategy: DropTableStrategy,
     #[serde(deserialize_with = "crate::toml_de::de_parse")]
     detach_strategy: DropTableStrategy,
+    #[serde(deserialize_with = "crate::toml_de::de_parse")]
+    truncate_strategy: DropTableStrategy,
     soft_delete: bool,
 }
 
@@ -876,6 +881,7 @@ impl Default for ChSection {
             retry: RetryConfig::default(),
             drop_table_strategy: DropTableStrategy::default(),
             detach_strategy: DropTableStrategy::default(),
+            truncate_strategy: DropTableStrategy::Drop,
             soft_delete: false,
         }
     }
@@ -1032,6 +1038,7 @@ impl EmitterConfig {
             databases: Vec::new(),
             drop_table_strategy: ch.drop_table_strategy,
             detach_strategy: ch.detach_strategy,
+            truncate_strategy: ch.truncate_strategy,
             retry: ch.retry,
             idle_reconnect: Duration::from_secs(DEFAULT_IDLE_RECONNECT_SECS),
             soft_delete: ch.soft_delete,
@@ -6767,7 +6774,7 @@ mod tests {
     fn config_parses_partition_settings() {
         EmitterConfig::from_toml_str("[table.public.m]\nleaf = 7\n").expect_err("leaf = 7");
         let c = EmitterConfig::from_toml_str(
-            "[ch]\ndetach_strategy = \"drop\"\n\
+            "[ch]\ndetach_strategy = \"drop\"\ntruncate_strategy = \"retain\"\n\
              [namespace.sales]\ndetach_strategy = \"warn\"\n\
              [system_columns]\nleaf = \"_part\"\n\
              [table.public.m]\npartition_by = \"toYYYYMM(ts)\"\nleaf = false\n\
@@ -6775,6 +6782,11 @@ mod tests {
         )
         .expect("parses");
         assert_eq!(c.detach_strategy, DropTableStrategy::Drop);
+        assert_eq!(c.truncate_strategy, DropTableStrategy::Retain);
+        assert_eq!(
+            EmitterConfig::default().truncate_strategy,
+            DropTableStrategy::Drop
+        );
         assert_eq!(
             c.namespaces["sales"].detach_strategy,
             Some(DropTableStrategy::Warn)

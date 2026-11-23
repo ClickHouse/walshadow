@@ -127,6 +127,7 @@ Apply live:
   `partition_by`, applied when walshadow creates a table, see
   [Query destination data](destination-tables.md)
 - namespace destinations, drop policy, and detach policy
+- whether a source `TRUNCATE` clears ClickHouse rows
 - pause state
 - batch sizes, flush timeout, compression, and retry count
 - source and ClickHouse endpoints
