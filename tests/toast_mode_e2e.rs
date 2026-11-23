@@ -180,7 +180,11 @@ async fn unchanged_toast_pointer_resolves_out_of_shadow() {
             .stream
             .filter()
             .shadow_rels()
-            .is_some_and(|rels| rels.contains(&(db_oid, toast_filenode))),
+            .is_some_and(|rels| rels.contains(&walrus::pg::walparser::RelFileNode {
+                spc_node: 1663,
+                db_node: db_oid,
+                rel_node: toast_filenode,
+            })),
         "shadow mode must route the TOAST relation's records to shadow",
     );
 

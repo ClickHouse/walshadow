@@ -46,7 +46,7 @@ use crate::xact::xact_buffer::{
 use foldhash::{HashMap, HashSet};
 
 /// Per-filenode descriptor and exclusive replay ceiling
-pub type ReplayTargets = HashMap<(Oid, Oid), (Arc<RelDescriptor>, u64)>;
+pub type ReplayTargets = HashMap<RelFileNode, (Arc<RelDescriptor>, u64)>;
 
 /// Replay inputs shared across records
 pub struct WalReplayInputs {
@@ -54,7 +54,7 @@ pub struct WalReplayInputs {
     pub buffer: Arc<Mutex<XactBuffer>>,
     pub resolver: ToastResolver,
     /// Rfns whose heap records reach the decoder: targets plus their toast rels
-    pub filter_rfns: HashSet<(Oid, Oid)>,
+    pub filter_rfns: HashSet<RelFileNode>,
     pub targets: ReplayTargets,
     /// Walk-coverage floor; commits at or below it drop
     pub from_lsn: u64,
@@ -175,8 +175,8 @@ pub struct WalReplaySink {
     pending: crate::catalog::pending::PendingCatalog,
     subxact_tracker: SubxactTracker,
     resolver: ToastResolver,
-    filter_rfns: HashSet<(Oid, Oid)>,
-    targets: Arc<HashMap<(Oid, Oid), ReplayTarget>>,
+    filter_rfns: HashSet<RelFileNode>,
+    targets: Arc<HashMap<RelFileNode, ReplayTarget>>,
     from_lsn: u64,
     /// See [`WalReplayInputs::whole_db_filter`]
     whole_db_filter: bool,
@@ -310,7 +310,7 @@ impl WalReplaySink {
         let Some(tid @ (rfn, _, _)) = ended_tid(record) else {
             return;
         };
-        let Some(target) = self.targets.get(&(rfn.db_node, rfn.rel_node)) else {
+        let Some(target) = self.targets.get(&rfn) else {
             return;
         };
         if target.rel.toast_oid != 0 && target.route.as_ref().is_some_and(|r| !r.drops_deletes()) {
@@ -642,7 +642,7 @@ impl WalReplaySink {
                     let rfn = input.descriptor.rfn;
                     let rows = u64::from(input.input.tuples);
                     // Decode TOAST chunks, route through parent row
-                    let Some(target) = targets.get(&(rfn.db_node, rfn.rel_node)) else {
+                    let Some(target) = targets.get(&rfn) else {
                         continue;
                     };
                     if commit_lsn <= self.from_lsn {
@@ -752,7 +752,7 @@ impl WalReplaySink {
         }
         if rm == RmId::Heap as u8 || rm == RmId::Heap2 as u8 {
             if let Some(rel) = record.parsed.blocks.first().map(|b| b.header.location.rel) {
-                if self.filter_rfns.contains(&(rel.db_node, rel.rel_node)) {
+                if self.filter_rfns.contains(&rel) {
                     self.harvest_toast_images(record).await?;
                     self.decoder.on_record(record).await?;
                     self.note_ended(record);
@@ -1669,9 +1669,7 @@ mod tests {
         };
         let (mut sink, buffer, mut msg_rx) = replay_sink(
             tmp.path(),
-            [((DB, 16385), (rel.clone(), u64::MAX))]
-                .into_iter()
-                .collect(),
+            [(rel.rfn, (rel.clone(), u64::MAX))].into_iter().collect(),
             Arc::new(crate::mapping::shared(
                 [(rel.rel_name.clone(), table)].into_iter().collect(),
             )),
@@ -1752,7 +1750,7 @@ mod tests {
 
     fn targets_of(rels: &[&Arc<RelDescriptor>]) -> ReplayTargets {
         rels.iter()
-            .map(|r| ((DB, r.rfn.rel_node), ((*r).clone(), u64::MAX)))
+            .map(|r| (r.rfn, ((*r).clone(), u64::MAX)))
             .collect()
     }
 

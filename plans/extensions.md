@@ -44,8 +44,9 @@ rules through [runtime config](runtime_config.md)
 Fan-in needs source identity in destination key when source key domains overlap
 `_lsn` and `_xid` do not by themselves prevent equal primary keys from collapsing
 Validate sorting key, projection, and DDL ownership before activating route
-Tablespace predicates depend on [resolved physical OIDs](tablespaces.md), other
-predicates can land independently
+Tablespace predicates match each descriptor's resolved tablespace OID. Cache
+OID/name mapping and compare database default explicitly instead of querying
+names for each row
 
 ## Schema export
 

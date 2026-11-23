@@ -152,6 +152,12 @@ pub struct Filter {
     /// Continue routing WAL and tracking catalog files for all databases
     targets: Vec<u32>,
     creating_dbs: HashMap<u32, u32>,
+    /// Followed databases copied to another tablespace, awaiting the commit
+    /// that publishes the move. Default-placed relations change tablespace
+    /// with no pg_class write naming them
+    moving_dbs: Vec<u32>,
+    /// Xids writing shared catalogs while a move is pending, by moved database
+    move_xids: HashMap<u32, u32>,
     shadow_rels: Option<ShadowRelations>,
     /// Xid ceilings the shadow TOAST store reads. Absent for offline
     /// filters, which serve no reads
@@ -171,6 +177,8 @@ impl Filter {
             smgr_markers: Arc::new(Mutex::new(SmgrMarkers::default())),
             targets: Vec::new(),
             creating_dbs: HashMap::default(),
+            moving_dbs: Vec::new(),
+            move_xids: HashMap::default(),
             shadow_rels: None,
             xid_ceiling: None,
             skip_stats: None,
@@ -235,7 +243,7 @@ impl Filter {
     /// Route `rels` and relations created at or after `from_lsn` to both paths
     ///
     /// `rels` lists files shadow already holds at `from_lsn`
-    pub fn keep_user_rels(&mut self, rels: HashSet<(u32, u32)>, from_lsn: u64) {
+    pub fn keep_user_rels(&mut self, rels: HashSet<RelFileNode>, from_lsn: u64) {
         self.shadow_rels = Some(ShadowRelations::new(rels, from_lsn));
     }
 
@@ -244,17 +252,15 @@ impl Filter {
         self.shadow_rels.as_ref()
     }
 
-    fn keeps_user_rel(&self, db: u32, rel: u32, lsn: u64) -> bool {
-        self.shadow_rels
-            .as_ref()
-            .is_some_and(|s| s.keeps((db, rel), lsn))
+    fn keeps_user_rel(&self, rel: RelFileNode, lsn: u64) -> bool {
+        self.shadow_rels.as_ref().is_some_and(|s| s.keeps(rel, lsn))
     }
 
     fn user_rel_to_shadow(&self, record: &XLogRecord, lsn: u64) -> bool {
-        record.blocks.iter().any(|b| {
-            let r = b.header.location.rel;
-            self.keeps_user_rel(r.db_node, r.rel_node, lsn)
-        })
+        record
+            .blocks
+            .iter()
+            .any(|b| self.keeps_user_rel(b.header.location.rel, lsn))
     }
 
     pub async fn persist_shadow_rels(&mut self, dir: &Path) -> anyhow::Result<()> {
@@ -348,10 +354,10 @@ impl Filter {
             }
             Class::Empty => match main_data::relation_for_empty(record) {
                 Some(rel) => {
-                    if self.tracker.is_catalog(rel.db_node, rel.rel_node) {
-                        let opaque = self.tracker.is_opaque_catalog(rel.db_node, rel.rel_node);
+                    if self.tracker.is_catalog(rel) {
+                        let opaque = self.tracker.is_opaque_catalog(rel);
                         (Route::ToShadow, (!opaque).then_some(rel.db_node))
-                    } else if self.keeps_user_rel(rel.db_node, rel.rel_node, source_lsn) {
+                    } else if self.keeps_user_rel(rel, source_lsn) {
                         (Route::ToBoth, None)
                     } else {
                         (Route::ToDecoder, None)
@@ -373,7 +379,7 @@ impl Filter {
             if let Some(rels) = &mut self.shadow_rels
                 && (self.targets.is_empty() || self.targets.contains(&rfn.db_node))
             {
-                rels.admit((rfn.db_node, rfn.rel_node), source_lsn);
+                rels.admit(rfn, source_lsn);
             }
         }
         // Running-xacts records provide observation points during streaming
@@ -389,6 +395,11 @@ impl Filter {
         {
             self.creating_dbs.insert(xid, db);
         }
+        if let Some(db) = moved_database(record).filter(|db| self.is_target_db(*db))
+            && !self.moving_dbs.contains(&db)
+        {
+            self.moving_dbs.push(db);
+        }
         if let Some(ceiling) = &self.xid_ceiling {
             ceiling.observe(source_lsn, xid);
         }
@@ -402,6 +413,17 @@ impl Filter {
         // Foreign and shared catalog writes route to shadow and update the
         // cluster-wide tracker above, but feed no descriptor of the
         // followed database, so they must not dirty its capture tree
+        // Move publishes through its pg_database row, a shared catalog write
+        // from a session in another database
+        if let Some(&moved) = self.moving_dbs.first()
+            && xid != 0
+            && catalog_touch_db == Some(0)
+        {
+            let dirty = self.dirty.touch(xid, source_lsn);
+            dirty.unenumerated = true;
+            dirty.db.get_or_insert(moved);
+            self.move_xids.insert(xid, moved);
+        }
         if let Some(db) = catalog_touch_db.filter(|db| {
             xid != 0 && self.is_target_db(*db) && self.creating_dbs.get(&xid) != Some(db)
         }) {
@@ -419,7 +441,7 @@ impl Filter {
             }
             if record.blocks.iter().any(|b| {
                 let r = b.header.location.rel;
-                self.tracker.is_capture_all_catalog(r.db_node, r.rel_node)
+                self.tracker.is_capture_all_catalog(r)
             }) {
                 dirty.unenumerated = true;
             }
@@ -471,13 +493,10 @@ impl Filter {
         }
         let mut blocks = 0;
         let record = header_walk::walk(header, bytes, page_magic, |rel| {
-            let (db, rel) = (rel.db_node, rel.rel_node);
             blocks += 1;
-            rel != 0
-                && !self.tracker.is_catalog(db, rel)
-                && !self.tracker.is_opaque_catalog(db, rel)
-                && !self.tracker.reads_image(db, rel)
-                && !self.keeps_user_rel(db, rel, source_lsn)
+            rel.rel_node != 0
+                && !self.tracker.is_catalog(rel)
+                && !self.keeps_user_rel(rel, source_lsn)
         })?;
         (blocks > 0).then_some(record)
     }
@@ -546,6 +565,11 @@ impl Filter {
         }
         let header_xid = record.header.xact_id;
         self.creating_dbs.remove(&header_xid);
+        if let Some(db) = self.move_xids.remove(&header_xid)
+            && is_commit
+        {
+            self.moving_dbs.retain(|d| *d != db);
+        }
         let (merged, members) =
             self.dirty
                 .drain_tree(header_xid, payload.twophase_xid, &payload.subxacts);
@@ -748,12 +772,12 @@ impl Filter {
         if !self.is_target_db(rel.db_node) {
             return false;
         }
-        if self.tracker.is_opaque_catalog(rel.db_node, rel.rel_node) {
+        if self.tracker.is_opaque_catalog(rel) {
             return true;
         }
         record.header.resource_manager_id == RmId::Heap as u8
             && record.header.info & XLOG_HEAP_OPMASK == XLOG_HEAP_INPLACE
-            && self.tracker.is_catalog(rel.db_node, rel.rel_node)
+            && self.tracker.is_catalog(rel)
     }
 
     /// Return true when transaction history is fully observed
@@ -780,7 +804,7 @@ impl Filter {
     fn descriptor_touch_db(&self, record: &XLogRecord) -> Option<u32> {
         let db = catalog_write_db(record)?;
         let rel = record.blocks.first()?.header.location.rel;
-        (!self.tracker.is_opaque_catalog(rel.db_node, rel.rel_node)).then_some(db)
+        (!self.tracker.is_opaque_catalog(rel)).then_some(db)
     }
 
     /// Check whether record belongs to a configured database
@@ -813,15 +837,23 @@ fn created_database(record: &XLogRecord) -> Option<u32> {
         return None;
     }
     let op = record.header.info & 0xF0;
-    if op != XLOG_DBASE_CREATE_FILE_COPY && op != XLOG_DBASE_CREATE_WAL_LOG {
+    if op != main_data::XLOG_DBASE_CREATE_FILE_COPY && op != main_data::XLOG_DBASE_CREATE_WAL_LOG {
         return None;
     }
     let db = record.main_data.get(..4)?;
     Some(u32::from_le_bytes(db.try_into().ok()?))
 }
 
-const XLOG_DBASE_CREATE_FILE_COPY: u8 = 0x00;
-const XLOG_DBASE_CREATE_WAL_LOG: u8 = 0x10;
+/// Database `ALTER DATABASE SET TABLESPACE` copies, its own copy source
+fn moved_database(record: &XLogRecord) -> Option<u32> {
+    if record.header.resource_manager_id != RmId::Dbase as u8
+        || record.header.info & 0xF0 != main_data::XLOG_DBASE_CREATE_FILE_COPY
+    {
+        return None;
+    }
+    let copy = main_data::parse_xl_dbase_create_file_copy(&record.main_data)?;
+    (copy.src_db_id == copy.db_id).then_some(copy.db_id)
+}
 
 fn is_index_rmgr(rm: u8) -> bool {
     [
@@ -838,10 +870,9 @@ fn is_index_rmgr(rm: u8) -> bool {
 }
 
 fn any_block_is_catalog(tracker: &CatalogTracker, blocks: &[XLogRecordBlock]) -> bool {
-    blocks.iter().any(|b| {
-        let r = b.header.location.rel;
-        tracker.is_catalog(r.db_node, r.rel_node)
-    })
+    blocks
+        .iter()
+        .any(|b| tracker.is_catalog(b.header.location.rel))
 }
 
 /// Catalog pages take physical writes from any backend — opportunistic
@@ -882,6 +913,7 @@ fn catalog_mutation(record: &XLogRecord) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::filter::catalog_tracker::test_rfn;
     use walrus::pg::walparser::{
         BlockLocation, RelFileNode, RmId, XLogRecordBlockHeader, XLogRecordHeader,
     };
@@ -910,7 +942,7 @@ mod tests {
         assert_eq!(f.decide(&user), Route::ToDecoder, "off by default");
         assert!(f.shadow_rels().is_none());
 
-        f.keep_user_rels([(TARGET_DB, 16500)].into_iter().collect(), 0);
+        f.keep_user_rels([test_rfn(TARGET_DB, 16500)].into_iter().collect(), 0);
         assert_eq!(f.decide(&user), Route::ToBoth);
         // Listed relations only, keyed by database
         assert_eq!(
@@ -984,7 +1016,7 @@ mod tests {
     async fn resume_uses_durable_routes_and_creation_lsn() {
         let tmp = tempfile::tempdir().unwrap();
         let mut bootstrap = target_filter();
-        bootstrap.keep_user_rels([(TARGET_DB, 17000)].into_iter().collect(), 100);
+        bootstrap.keep_user_rels([test_rfn(TARGET_DB, 17000)].into_iter().collect(), 100);
         bootstrap.persist_shadow_rels(tmp.path()).await.unwrap();
         bootstrap
             .decide_record(&smgr_create(TARGET_DB, 24000, 0), 120, 0xD116)
@@ -1012,14 +1044,24 @@ mod tests {
         resumed
             .decide_record(&smgr_create(TARGET_DB, 16456, 0), 99, 0xD116)
             .unwrap();
-        assert!(!resumed.shadow_rels().unwrap().contains(&(TARGET_DB, 16456)));
+        assert!(
+            !resumed
+                .shadow_rels()
+                .unwrap()
+                .contains(&test_rfn(TARGET_DB, 16456))
+        );
         resumed
             .decide_record(&smgr_create(TARGET_DB, 25000, 0), 130, 0xD116)
             .unwrap();
         resumed.flush_shadow_rels().await.unwrap();
         let mut again = target_filter();
         again.load_shadow_rels(tmp.path()).await.unwrap();
-        assert!(again.shadow_rels().unwrap().contains(&(TARGET_DB, 25000)));
+        assert!(
+            again
+                .shadow_rels()
+                .unwrap()
+                .contains(&test_rfn(TARGET_DB, 25000))
+        );
     }
 
     /// Keep `ToBoth` records unchanged so shadow receives original bytes
@@ -1052,7 +1094,7 @@ mod tests {
         md.push(0);
         r.main_data = md.into();
         assert_eq!(f.decide(&r), Route::ToDecoder);
-        f.keep_user_rels([(TARGET_DB, 16500)].into_iter().collect(), 0);
+        f.keep_user_rels([test_rfn(TARGET_DB, 16500)].into_iter().collect(), 0);
         assert_eq!(f.decide(&r), Route::ToBoth);
     }
 
@@ -1068,11 +1110,7 @@ mod tests {
                 .map(|&(db, rel)| XLogRecordBlock {
                     header: XLogRecordBlockHeader {
                         location: BlockLocation {
-                            rel: RelFileNode {
-                                spc_node: 1663,
-                                db_node: db,
-                                rel_node: rel,
-                            },
+                            rel: test_rfn(db, rel),
                             block_no: 0,
                         },
                         ..Default::default()
@@ -1146,7 +1184,7 @@ mod tests {
     fn tracker_promotes_user_to_catalog_post_relmap() {
         let mut f = target_filter();
         // Learned mapping: catalog on db 5 rewritten to filenode 50000.
-        f.tracker.add(5, 50000);
+        f.tracker.add(test_rfn(5, 50000));
         let r = rec(RmId::Heap, &[(5, 50000)]);
         assert_eq!(f.decide(&r), Route::ToShadow);
     }
@@ -1523,7 +1561,7 @@ mod tests {
     #[test]
     fn tracker_promoted_user_record_dirties() {
         let mut f = target_filter();
-        f.tracker.add(5, 50000); // rotated mapped catalog above 16384
+        f.tracker.add(test_rfn(5, 50000)); // rotated mapped catalog above 16384
         f.decide_record(&rec_with_xid(RmId::Heap, &[(5, 50000)], 7), 0, 0xD116)
             .unwrap();
         let v = f
@@ -2188,7 +2226,7 @@ mod tests {
             let v = f.decide_record(&r, 100, 0xD116).unwrap();
             assert_eq!(v.route, Route::ToShadow, "shadow replays every relmap");
             assert!(
-                f.tracker().is_catalog(db, filenode),
+                f.tracker().is_catalog(test_rfn(db, filenode)),
                 "filenode tracking stays cluster-wide"
             );
             let v = f
@@ -2228,11 +2266,75 @@ mod tests {
 
     fn dbase_create(db: u32, xid: u32) -> XLogRecord<'static> {
         let mut r = rec_with_xid(RmId::Dbase, &[], xid);
-        r.header.info = XLOG_DBASE_CREATE_WAL_LOG;
+        r.header.info = main_data::XLOG_DBASE_CREATE_WAL_LOG;
         let mut md = db.to_le_bytes().to_vec();
         md.extend_from_slice(&1663u32.to_le_bytes());
         r.main_data = std::borrow::Cow::Owned(md);
         r
+    }
+
+    /// `XLOG_DBASE_CREATE_FILE_COPY` of `db` onto itself, xid-less as
+    /// `movedb` logs it before its pg_database write
+    fn dbase_move(db: u32, from: u32, to: u32) -> XLogRecord<'static> {
+        let mut r = rec_with_xid(RmId::Dbase, &[], 0);
+        r.header.info = main_data::XLOG_DBASE_CREATE_FILE_COPY;
+        let md = [db, to, db, from]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        r.main_data = std::borrow::Cow::Owned(md);
+        r
+    }
+
+    /// Session in another database moves the followed one, publishing
+    /// through a shared pg_database write. An abort leaves it pending
+    #[test]
+    fn database_move_recaptures_moved_database_at_commit() {
+        let mut f = target_filter();
+        let pg_database = |xid| rec_with_xid(RmId::Heap, &[(0, 1262)], xid);
+        f.decide_record(&dbase_move(TARGET_DB, 1663, 16385), 100, 0xD116)
+            .unwrap();
+        f.decide_record(&pg_database(8), 110, 0xD116).unwrap();
+        let v = f
+            .decide_record(&xact_end(XLOG_XACT_ABORT, 8, &[], None), 120, 0xD116)
+            .unwrap();
+        assert!(v.boundary.is_none());
+
+        f.decide_record(&pg_database(9), 130, 0xD116).unwrap();
+        let v = f
+            .decide_record(
+                &xact_end_dbinfo(XLOG_XACT_COMMIT, 9, FOREIGN_DB),
+                140,
+                0xD116,
+            )
+            .unwrap();
+        let b = v.boundary.expect("move boundary");
+        assert!(b.capture_all, "moved relations carry no pg_class write");
+        assert_eq!(b.db_oid, TARGET_DB);
+        assert_eq!(b.tree_first_touch, 130);
+
+        // Published: later shared writes are no target dirt
+        f.decide_record(&pg_database(10), 150, 0xD116).unwrap();
+        let v = f
+            .decide_record(&xact_end(XLOG_XACT_COMMIT, 10, &[], None), 160, 0xD116)
+            .unwrap();
+        assert!(v.boundary.is_none());
+    }
+
+    #[test]
+    fn foreign_database_move_or_create_is_no_target_dirt() {
+        let mut f = target_filter();
+        let mut create = dbase_move(FOREIGN_DB, 1663, 1663);
+        create.main_data.to_mut()[8..12].copy_from_slice(&1u32.to_le_bytes());
+        for r in [dbase_move(FOREIGN_DB, 1663, 16385), create] {
+            f.decide_record(&r, 100, 0xD116).unwrap();
+        }
+        f.decide_record(&rec_with_xid(RmId::Heap, &[(0, 1262)], 9), 110, 0xD116)
+            .unwrap();
+        let v = f
+            .decide_record(&xact_end(XLOG_XACT_COMMIT, 9, &[], None), 120, 0xD116)
+            .unwrap();
+        assert!(v.boundary.is_none());
     }
 
     /// `XLOG_DBASE_DROP` names a database too, but creates none

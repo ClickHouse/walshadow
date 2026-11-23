@@ -49,7 +49,7 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 use walrus::pg::backup::BACKUP_NAME_PREFIX;
 use walrus::pg::replication::base_backup::BaseBackupOpts;
 use walrus::pg::wal::segment::SegmentName;
-use walrus::pg::walparser::{Oid, RmId};
+use walrus::pg::walparser::{Oid, RelFileNode, RmId};
 
 use crate::backfill::backfill_types::{BackupRequest, PassContext, PassError, PassOutcome};
 use crate::backfill::backup_checkpoint::{self, BackupCheckpoint, WalkState};
@@ -84,7 +84,6 @@ use crate::filter::pg_class_decoder::{
 };
 use crate::record::{Record, RecordSink, SinkError, WAL_SEG_SIZE, segments_covering_lineage};
 use crate::runtime_config::InitialLoadMode;
-use crate::schema::RelDescriptor;
 use crate::source::archive;
 use crate::source::timeline::TimelineHistory;
 use crate::ticker::Ticker;
@@ -120,7 +119,7 @@ async fn run_base_backup_pass(ctx: &PassContext, reqs: &[BackupRequest]) -> Resu
     };
     let source = Box::new(DirectSource::new(ctx.pg.clone(), opts));
     // Tag S per rel: backup B ≥ S, live stream covers (S, ∞)
-    let tags: HashMap<(Oid, Oid), u64> = reqs.iter().map(|r| (rfn_key(&r.desc), r.s_lsn)).collect();
+    let tags: HashMap<RelFileNode, u64> = reqs.iter().map(|r| (r.desc.rfn, r.s_lsn)).collect();
     let mut outcome = PassOutcome::default();
     walk_and_ship(
         ctx,
@@ -160,7 +159,7 @@ fn target_db_oid(reqs: &[BackupRequest]) -> Result<Oid> {
 
 struct ObjectStorePass {
     source: Box<dyn BackupSource>,
-    tags: HashMap<(Oid, Oid), u64>,
+    tags: HashMap<RelFileNode, u64>,
     patch: SealedPatch,
     replay: Option<ReplayLeg>,
     outcome: PassOutcome,
@@ -293,9 +292,9 @@ async fn prepare_object_store_pass(
     // Tag min(B_redo, S) per rel: gap replay covers (B_redo, S], so walked
     // rows must lose to replayed commits; a backup newer than the opt-in
     // has no replay leg for that rel and tags S
-    let tags: HashMap<(Oid, Oid), u64> = reqs
+    let tags: HashMap<RelFileNode, u64> = reqs
         .iter()
-        .map(|r| (rfn_key(&r.desc), r.s_lsn.min(b_redo)))
+        .map(|r| (r.desc.rfn, r.s_lsn.min(b_redo)))
         .collect();
     let had_gap = !gap_segments.is_empty();
     Ok(ObjectStorePass {
@@ -309,10 +308,6 @@ async fn prepare_object_store_pass(
     })
 }
 
-fn rfn_key(desc: &RelDescriptor) -> (Oid, Oid) {
-    (desc.rfn.db_node, desc.rfn.rel_node)
-}
-
 /// Gap replay inputs: fetched segments, `B_redo`
 type ReplayLeg = (Vec<(SegmentName, PathBuf)>, u64);
 
@@ -323,7 +318,7 @@ async fn walk_and_ship(
     ctx: &PassContext,
     source: Box<dyn BackupSource>,
     reqs: &[BackupRequest],
-    tags: &HashMap<(Oid, Oid), u64>,
+    tags: &HashMap<RelFileNode, u64>,
     patch: SealedPatch,
     replay: Option<ReplayLeg>,
     outcome: &mut PassOutcome,
@@ -333,7 +328,7 @@ async fn walk_and_ship(
     // filtered walk carries external chunks. Toast rows tag their parent's
     // boundary.
     let mut filter = CatalogMap::new();
-    let mut lsn_overrides: HashMap<(Oid, Oid), u64> = tags.clone();
+    let mut lsn_overrides: HashMap<RelFileNode, u64> = tags.clone();
     for r in reqs {
         filter.insert(r.desc.clone());
         let toast = ctx
@@ -344,7 +339,7 @@ async fn walk_and_ship(
             .await
             .context("backup_backfill: toast descriptor")?;
         if let Some(td) = toast {
-            lsn_overrides.insert(rfn_key(&td), tags[&rfn_key(&r.desc)]);
+            lsn_overrides.insert(td.rfn, tags[&r.desc.rfn]);
             filter.insert(td);
         }
     }
@@ -492,7 +487,7 @@ async fn walk_and_ship(
         if let Some((segments, b_redo)) = replay {
             let s_by_rfn: ReplayTargets = reqs
                 .iter()
-                .map(|r| (rfn_key(&r.desc), (r.desc.clone(), r.s_lsn)))
+                .map(|r| (r.desc.rfn, (r.desc.clone(), r.s_lsn)))
                 .collect();
             // Segments wholly below the resume point replayed already; commits at
             // or below it are filtered, so only a transaction the boundary caught
@@ -557,7 +552,7 @@ async fn run_walk(
     ctx: &PassContext,
     source: Box<dyn BackupSource>,
     filter: &CatalogMap,
-    lsn_overrides: HashMap<(Oid, Oid), u64>,
+    lsn_overrides: HashMap<RelFileNode, u64>,
     patch: SealedPatch,
     resolver: &ToastResolver,
     tail: &OwnedTail,
@@ -919,7 +914,7 @@ async fn replay_gap(
     buffer.lock().await.clear_scratch_dir().ok();
 
     // Include opted-in main and TOAST filenodes
-    let mut filter_rfns: HashSet<(Oid, Oid)> = targets.keys().copied().collect();
+    let mut filter_rfns: HashSet<RelFileNode> = targets.keys().copied().collect();
     for (desc, _) in targets.values() {
         if let Some(td) = ctx
             .catalog
@@ -929,7 +924,7 @@ async fn replay_gap(
             .await
             .context("backup_backfill: toast descriptor")?
         {
-            filter_rfns.insert(rfn_key(&td));
+            filter_rfns.insert(td.rfn);
         }
     }
 

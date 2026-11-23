@@ -279,9 +279,6 @@ ClickHouse. Choose it only when limits below are acceptable
   becomes NULL, or column default when destination column is not Nullable
 - Buffering settings above have no effect because this mode writes no chunks
 - Changing mode requires a fresh bootstrap
-- Only default tablespace is supported. Bootstrap refuses a mapped table whose
-  large-value storage uses another tablespace. Moving or creating such a table
-  after bootstrap is not supported
 
 See [limitations](limitations.md#shadow-value-mode) before enabling
 this mode

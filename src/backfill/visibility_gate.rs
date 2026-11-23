@@ -78,7 +78,7 @@ pub async fn stream_phase(
         }
         let mut pass = Vec::with_capacity(slab.len());
         for t in slab {
-            if catalog.is_toast(t.rfn.db_node, t.rfn.rel_node) {
+            if catalog.is_toast(t.rfn) {
                 if tuple_visibility(t.xid, t.xmax, t.infomask, None) == Visibility::Skip {
                     stats.chunks_gated += 1;
                     counters.gate_chunks_gated.fetch_add(1, Ordering::Relaxed);

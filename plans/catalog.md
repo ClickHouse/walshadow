@@ -71,6 +71,6 @@ in one transaction before it can establish completeness
 
 Coordinate relation/schema rename detection with [schema planner](schema.md),
 fresh descriptors alone do not establish destination rename policy. Use full
-physical locators from [tablespace plan](tablespaces.md) in new reverse maps
-and generation cleanup. Keep committed history separate from speculative
+physical locators (tablespace, database, filenode) in new reverse maps and
+generation cleanup. Keep committed history separate from speculative
 [shadow TOAST routing](shadow_toast.md) needed before catalog rows are queryable

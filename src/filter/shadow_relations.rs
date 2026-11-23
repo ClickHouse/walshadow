@@ -9,28 +9,32 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result, ensure};
 use foldhash::{HashMap, HashSet};
 use serde::{Deserialize, Serialize};
+use walrus::pg::walparser::RelFileNode;
+
+use crate::schema::DEFAULT_TABLESPACE_OID;
 
 const FILE: &str = "walshadow_relations.toml";
+const VERSION: u32 = 2;
 
 /// Share relation membership outside routing task
 ///
 /// Keep per-record routing reads in [`ShadowRelations`] free of locks
 /// Less frequent opt-in checks can take a lock
 #[derive(Clone, Default)]
-pub struct ShadowHeld(Arc<Mutex<HashSet<(u32, u32)>>>);
+pub struct ShadowHeld(Arc<Mutex<HashSet<RelFileNode>>>);
 
 impl ShadowHeld {
-    pub fn contains(&self, rel: (u32, u32)) -> bool {
+    pub fn contains(&self, rel: RelFileNode) -> bool {
         self.0.lock().expect("shadow held poisoned").contains(&rel)
     }
 
-    fn insert(&self, rel: (u32, u32)) {
+    fn insert(&self, rel: RelFileNode) {
         self.0.lock().expect("shadow held poisoned").insert(rel);
     }
 }
 
-impl FromIterator<(u32, u32)> for ShadowHeld {
-    fn from_iter<I: IntoIterator<Item = (u32, u32)>>(rels: I) -> Self {
+impl FromIterator<RelFileNode> for ShadowHeld {
+    fn from_iter<I: IntoIterator<Item = RelFileNode>>(rels: I) -> Self {
         Self(Arc::new(Mutex::new(rels.into_iter().collect())))
     }
 }
@@ -41,11 +45,20 @@ struct Stored {
     #[serde(default)]
     system_id: Option<u64>,
     creates_from: u64,
-    relations: Vec<(u32, u32, u64)>,
+    relations: Vec<StoredRel>,
+}
+
+/// `(tablespace, database, filenode, created at)`. Version 1 omitted the
+/// tablespace, written while shadow held default tablespace files only
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+enum StoredRel {
+    V2(u32, u32, u32, u64),
+    V1(u32, u32, u64),
 }
 
 pub struct ShadowRelations {
-    rels: HashMap<(u32, u32), u64>,
+    rels: HashMap<RelFileNode, u64>,
     held: ShadowHeld,
     creates_from: u64,
     dir: Option<PathBuf>,
@@ -53,7 +66,7 @@ pub struct ShadowRelations {
 }
 
 impl ShadowRelations {
-    pub fn new(rels: HashSet<(u32, u32)>, creates_from: u64) -> Self {
+    pub fn new(rels: HashSet<RelFileNode>, creates_from: u64) -> Self {
         Self {
             held: rels.iter().copied().collect(),
             rels: rels.into_iter().map(|r| (r, 0)).collect(),
@@ -63,7 +76,7 @@ impl ShadowRelations {
         }
     }
 
-    pub fn contains(&self, rel: &(u32, u32)) -> bool {
+    pub fn contains(&self, rel: &RelFileNode) -> bool {
         self.rels.contains_key(rel)
     }
 
@@ -80,11 +93,11 @@ impl ShadowRelations {
         self.rels.is_empty()
     }
 
-    pub(super) fn keeps(&self, rel: (u32, u32), lsn: u64) -> bool {
+    pub(super) fn keeps(&self, rel: RelFileNode, lsn: u64) -> bool {
         self.rels.get(&rel).is_some_and(|from| lsn >= *from)
     }
 
-    pub(super) fn admit(&mut self, rel: (u32, u32), lsn: u64) {
+    pub(super) fn admit(&mut self, rel: RelFileNode, lsn: u64) {
         if lsn < self.creates_from || self.rels.contains_key(&rel) {
             return;
         }
@@ -92,8 +105,9 @@ impl ShadowRelations {
         self.held.insert(rel);
         self.dirty = true;
         tracing::info!(
-            db = rel.0,
-            filenode = rel.1,
+            tablespace = rel.spc_node,
+            db = rel.db_node,
+            filenode = rel.rel_node,
             lsn,
             "admitted shadow relation from WAL create"
         );
@@ -106,7 +120,7 @@ impl ShadowRelations {
         })?;
         let stored: Stored = toml::from_str(&raw).context("parse shadow replay eligibility")?;
         ensure!(
-            stored.version == 1,
+            stored.version == 1 || stored.version == VERSION,
             "unsupported shadow replay eligibility version"
         );
         let control = control_system_id(dir).await?;
@@ -119,23 +133,39 @@ impl ShadowRelations {
             );
         }
         let mut rels = HashMap::default();
-        for (db, rel, lsn) in stored.relations {
+        for entry in stored.relations {
+            let (rfn, lsn) = match entry {
+                StoredRel::V2(spc_node, db_node, rel_node, lsn) if stored.version == VERSION => (
+                    RelFileNode {
+                        spc_node,
+                        db_node,
+                        rel_node,
+                    },
+                    lsn,
+                ),
+                StoredRel::V1(db_node, rel_node, lsn) if stored.version == 1 => (
+                    RelFileNode {
+                        spc_node: DEFAULT_TABLESPACE_OID,
+                        db_node,
+                        rel_node,
+                    },
+                    lsn,
+                ),
+                _ => anyhow::bail!("shadow relation entry does not match version"),
+            };
             ensure!(
                 lsn == 0 || lsn >= stored.creates_from,
                 "invalid shadow relation creation LSN"
             );
-            ensure!(
-                rels.insert((db, rel), lsn).is_none(),
-                "duplicate shadow relation"
-            );
+            ensure!(rels.insert(rfn, lsn).is_none(), "duplicate shadow relation");
         }
         Ok(Self {
             held: rels.keys().copied().collect(),
             rels,
             creates_from: stored.creates_from,
             dir: Some(dir.to_path_buf()),
-            // Stamp a file predating the identifier at next flush
-            dirty: stored.system_id.is_none() && control.is_some(),
+            // Restamp a file predating identifier or tablespaces at next flush
+            dirty: (stored.system_id.is_none() && control.is_some()) || stored.version != VERSION,
         })
     }
 
@@ -149,17 +179,16 @@ impl ShadowRelations {
         let Some(dir) = self.dir.as_ref().filter(|_| self.dirty) else {
             return Ok(());
         };
-        let mut relations: Vec<_> = self
-            .rels
-            .iter()
-            .map(|(&(db, rel), &lsn)| (db, rel, lsn))
-            .collect();
+        let mut relations: Vec<_> = self.rels.iter().map(|(&rfn, &lsn)| (rfn, lsn)).collect();
         relations.sort_unstable();
         let raw = toml::to_string(&Stored {
-            version: 1,
+            version: VERSION,
+            relations: relations
+                .into_iter()
+                .map(|(r, lsn)| StoredRel::V2(r.spc_node, r.db_node, r.rel_node, lsn))
+                .collect(),
             system_id: control_system_id(dir).await?,
             creates_from: self.creates_from,
-            relations,
         })
         .expect("shadow relations serialize");
         crate::fs::write_atomic(dir, FILE, raw.as_bytes())
@@ -189,26 +218,55 @@ async fn control_system_id(dir: &Path) -> Result<Option<u64>> {
 mod tests {
     use super::*;
 
+    fn rfn(spc_node: u32, rel_node: u32) -> RelFileNode {
+        RelFileNode {
+            spc_node,
+            db_node: 5,
+            rel_node,
+        }
+    }
+
     #[tokio::test]
     async fn held_tracks_seed_admissions_and_reload() {
         let tmp = tempfile::tempdir().unwrap();
         assert!(ShadowRelations::new(HashSet::default(), 100).is_empty());
-        let mut rels = ShadowRelations::new(HashSet::from_iter([(5, 17000)]), 100);
+        let mut rels = ShadowRelations::new(HashSet::from_iter([rfn(1663, 17000)]), 100);
         assert!(!rels.is_empty());
         let held = rels.held();
-        assert!(held.contains((5, 17000)));
-        assert!(!held.contains((5, 17001)));
+        assert!(held.contains(rfn(1663, 17000)));
+        assert!(!held.contains(rfn(1663, 17001)));
+        assert!(!held.contains(rfn(16385, 17000)));
 
         // Below `creates_from` stays out of both views
-        rels.admit((5, 17001), 99);
-        assert!(!held.contains((5, 17001)));
-        rels.admit((5, 17001), 120);
-        assert!(held.contains((5, 17001)));
+        rels.admit(rfn(16385, 17001), 99);
+        assert!(!held.contains(rfn(16385, 17001)));
+        rels.admit(rfn(16385, 17001), 120);
+        assert!(held.contains(rfn(16385, 17001)));
 
         rels.persist(tmp.path()).await.unwrap();
         let reloaded = ShadowRelations::load(tmp.path()).await.unwrap();
         let held = reloaded.held();
-        assert!(held.contains((5, 17000)) && held.contains((5, 17001)));
+        assert!(held.contains(rfn(1663, 17000)) && held.contains(rfn(16385, 17001)));
+    }
+
+    /// Version 1 predates tablespaces, when shadow held `base/` files only
+    #[tokio::test]
+    async fn version_one_reads_as_default_tablespace_and_upgrades() {
+        let tmp = tempfile::tempdir().unwrap();
+        tokio::fs::write(
+            tmp.path().join(FILE),
+            "version = 1\ncreates_from = 100\nrelations = [[5, 17000, 0]]\n",
+        )
+        .await
+        .unwrap();
+        let mut rels = ShadowRelations::load(tmp.path()).await.unwrap();
+        assert!(rels.contains(&rfn(DEFAULT_TABLESPACE_OID, 17000)));
+        rels.flush().await.unwrap();
+        let raw = tokio::fs::read_to_string(tmp.path().join(FILE))
+            .await
+            .unwrap();
+        assert!(raw.contains("version = 2"), "{raw}");
+        assert!(raw.contains("1663, 5, 17000, 0"), "{raw}");
     }
 
     #[tokio::test]
@@ -260,7 +318,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         assert!(ShadowRelations::load(tmp.path()).await.is_err());
         for raw in [
-            "version = 2\ncreates_from = 100\nrelations = []\n",
+            "version = 3\ncreates_from = 100\nrelations = []\n",
+            "version = 2\ncreates_from = 100\nrelations = [[5, 17000, 0]]\n",
+            "version = 1\ncreates_from = 100\nrelations = [[1663, 5, 17000, 0]]\n",
             "version = 1\ncreates_from = 100\nrelations = [[5, 17000, 99]]\n",
             "version = 1\ncreates_from = 100\nrelations = [[5, 17000, 0], [5, 17000, 120]]\n",
             "version = 1\n",

@@ -404,6 +404,7 @@ impl Shadow {
              unix_socket_directories = '{sock}'\n\
              port = {port}\n\
              shared_buffers = 32MB\n\
+             allow_in_place_tablespaces = on\n\
              max_worker_processes = {max_worker_processes}\n",
             sock = self.config.socket_str(),
             port = self.config.port,
@@ -460,6 +461,7 @@ impl Shadow {
              max_locks_per_transaction = {max_locks_per_transaction}\n\
              restore_command = 'cp {filter_dir}/%f %p'\n\
              recovery_target_timeline = 'latest'\n\
+             allow_in_place_tablespaces = on\n\
              wal_retrieve_retry_interval = '100ms'\n",
             sock = self.config.socket_str(),
             port = self.config.port,

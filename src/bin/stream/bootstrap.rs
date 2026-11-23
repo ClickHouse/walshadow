@@ -359,7 +359,7 @@ pub(crate) async fn run_bootstrap(
         None => (None, false, Default::default(), Vec::new()),
     };
 
-    let shadow_toast_rels: foldhash::HashSet<(u32, u32)> = if shadow_toast {
+    let shadow_toast_rels: foldhash::HashSet<walrus::pg::walparser::RelFileNode> = if shadow_toast {
         walshadow::toast::shadow_landing::toast_relations(
             sql_client,
             drain_catalog.descriptors().map(Arc::as_ref),

@@ -123,6 +123,29 @@ pub fn parse_xl_relmap_update(mut md: &[u8]) -> Option<RelmapUpdate> {
     })
 }
 
+/// Database rmgr info bytes, PG `src/include/commands/dbcommands_xlog.h`
+pub const XLOG_DBASE_CREATE_FILE_COPY: u8 = 0x00;
+pub const XLOG_DBASE_CREATE_WAL_LOG: u8 = 0x10;
+
+/// `xl_dbase_create_file_copy_rec`: one directory copy. A source database
+/// equal to the target is `ALTER DATABASE SET TABLESPACE`
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DbaseFileCopy {
+    pub db_id: u32,
+    pub tablespace_id: u32,
+    pub src_db_id: u32,
+    pub src_tablespace_id: u32,
+}
+
+pub fn parse_xl_dbase_create_file_copy(mut md: &[u8]) -> Option<DbaseFileCopy> {
+    Some(DbaseFileCopy {
+        db_id: md.u32()?,
+        tablespace_id: md.u32()?,
+        src_db_id: md.u32()?,
+        src_tablespace_id: md.u32()?,
+    })
+}
+
 /// `XLOG_SMGR_CREATE` info byte (PG `catalog/storage_xlog.h`)
 pub const XLOG_SMGR_CREATE: u8 = 0x10;
 /// PG `MAIN_FORKNUM`

@@ -22,13 +22,13 @@ use std::time::Instant;
 use async_trait::async_trait;
 use thiserror::Error;
 use tokio::sync::mpsc;
-use walrus::pg::walparser::{Oid, RelFileNode};
+use walrus::pg::walparser::RelFileNode;
 
 use crate::backfill::backup_source::{
     BackupSink, EntrySink, FileAction, FileKind, FileMeta, StartInfo,
 };
 use crate::backfill::copy_backfill::CopyRow;
-use crate::backfill::pg_path::{BaseRelFile, RelFork, parse_base_path};
+use crate::backfill::pg_path::{RelFile, RelFork, parse_rel_path};
 use crate::backfill::walk_barrier::WalkBarrier;
 use crate::decode::heap_decoder::{DecodeError, HEAP_HASEXTERNAL, TupleView, view_block_data};
 use crate::decode::visibility::{
@@ -168,12 +168,12 @@ impl BackfillTuple {
     }
 }
 
-/// Resolved `(db_node, rel_node) → RelDescriptor` map. Seeded before
+/// Resolved physical relation → `RelDescriptor` map. Seeded before
 /// [`PageWalkSink`] runs from source PG's
 /// `pg_class`/`pg_attribute`/`pg_type` for relations `oid >= 16384`.
 #[derive(Debug, Default, Clone)]
 pub struct CatalogMap {
-    by_filenode: HashMap<(Oid, Oid), Arc<RelDescriptor>>,
+    by_filenode: HashMap<RelFileNode, Arc<RelDescriptor>>,
     /// Heapless, so outside the filenode index
     partitioned: Vec<Arc<RelDescriptor>>,
 }
@@ -184,16 +184,15 @@ impl CatalogMap {
     }
 
     pub fn insert(&mut self, desc: Arc<RelDescriptor>) {
-        self.by_filenode
-            .insert((desc.rfn.db_node, desc.rfn.rel_node), desc);
+        self.by_filenode.insert(desc.rfn, desc);
     }
 
     pub fn insert_partitioned(&mut self, desc: Arc<RelDescriptor>) {
         self.partitioned.push(desc);
     }
 
-    pub fn get(&self, db_node: Oid, rel_node: Oid) -> Option<Arc<RelDescriptor>> {
-        self.by_filenode.get(&(db_node, rel_node)).cloned()
+    pub fn get(&self, rfn: RelFileNode) -> Option<Arc<RelDescriptor>> {
+        self.by_filenode.get(&rfn).cloned()
     }
 
     /// Partitioned tables, which own destinations but no heap
@@ -205,9 +204,9 @@ impl CatalogMap {
         self.by_filenode.values()
     }
 
-    pub fn is_toast(&self, db_node: Oid, rel_node: Oid) -> bool {
+    pub fn is_toast(&self, rfn: RelFileNode) -> bool {
         self.by_filenode
-            .get(&(db_node, rel_node))
+            .get(&rfn)
             .is_some_and(|d| &*d.rel_name.namespace == PG_TOAST_NS)
     }
 
@@ -517,8 +516,8 @@ pub struct PageWalkSink {
     source_lsn: AtomicU64,
     /// Per-rfn `_lsn` tag overriding `source_lsn` (backup-sourced opt-in
     /// backfills tag each rel with its own boundary; greenfield leaves
-    /// this empty). Keyed `(db_node, rel_node)`.
-    lsn_overrides: HashMap<(Oid, Oid), u64>,
+    /// this empty)
+    lsn_overrides: HashMap<RelFileNode, u64>,
     pub stats: Arc<PageWalkStats>,
     /// Bounded ([`BOOTSTRAP_TUPLE_CHANNEL_CAP`]) slab channel: a full
     /// channel awaits in the entry sink, parking that entry's body read
@@ -531,7 +530,7 @@ pub struct PageWalkSink {
     /// Filenodes worth decoding, mapped relations plus their TOAST heaps.
     /// `None` taps everything the catalog map holds. A superset filter, not a
     /// second source of truth: the drain's `skip_initial` stays the authority
-    tap_filenodes: Option<Arc<HashSet<(Oid, Oid)>>>,
+    tap_filenodes: Option<Arc<HashSet<RelFileNode>>>,
     /// `pg_xact/` and `pg_multixact/` segments Tap into here for backfill
     /// visibility gate (architecture/bootstrap.md); `None` (greenfield) keeps Skip
     gate: Option<GateAccums>,
@@ -619,7 +618,7 @@ impl PageWalkSink {
 
     /// Decline filenodes outside `set` at `begin`. Bytes still drain off the
     /// wire; tuples never decode
-    pub fn with_tap_filenodes(mut self, set: Arc<HashSet<(Oid, Oid)>>) -> Self {
+    pub fn with_tap_filenodes(mut self, set: Arc<HashSet<RelFileNode>>) -> Self {
         self.tap_filenodes = Some(set);
         self
     }
@@ -632,7 +631,7 @@ impl PageWalkSink {
     }
 
     /// Tag listed rfns' rows with their own `_lsn` instead of `source_lsn`.
-    pub fn with_lsn_overrides(mut self, overrides: HashMap<(Oid, Oid), u64>) -> Self {
+    pub fn with_lsn_overrides(mut self, overrides: HashMap<RelFileNode, u64>) -> Self {
         self.lsn_overrides = overrides;
         self
     }
@@ -673,11 +672,11 @@ impl PageWalkSink {
         self.source_lsn.load(Ordering::Relaxed)
     }
 
-    fn classify(&self, meta: &FileMeta) -> Option<BaseRelFile> {
+    fn classify(&self, meta: &FileMeta) -> Option<RelFile> {
         if !matches!(meta.kind, FileKind::File) {
             return None;
         }
-        parse_base_path(&meta.path)
+        parse_rel_path(&meta.path)
     }
 
     fn classify_slru(path: &std::path::Path) -> Option<SlruSegment> {
@@ -725,7 +724,7 @@ impl BackupSink for PageWalkSink {
             })));
         }
         let Some(f) = self.classify(meta) else {
-            // Not base/<db>/<filenode>; multiplex sink falls back to lander
+            // Not a relation file; multiplex sink falls back to lander
             return Ok(FileAction::Skip);
         };
         if f.fork != RelFork::Main {
@@ -738,14 +737,14 @@ impl BackupSink for PageWalkSink {
         if self
             .tap_filenodes
             .as_ref()
-            .is_some_and(|set| !set.contains(&(f.db, f.filenode)))
+            .is_some_and(|set| !set.contains(&f.rfn))
         {
             self.stats
                 .files_skipped_unmapped
                 .fetch_add(1, Ordering::Relaxed);
             return Ok(FileAction::Skip);
         }
-        let Some(desc) = self.catalog.get(f.db, f.filenode) else {
+        let Some(desc) = self.catalog.get(f.rfn) else {
             // Filenode absent from map: seed race (greenfield) or non-opted
             // rel (filtered backfill pass, where this is most files). Skip
             // drains body without page buffering; mux honours the decline
@@ -764,7 +763,7 @@ impl BackupSink for PageWalkSink {
         }
         let lsn = self
             .lsn_overrides
-            .get(&(desc.rfn.db_node, desc.rfn.rel_node))
+            .get(&desc.rfn)
             .copied()
             .unwrap_or_else(|| self.source_lsn());
         let path = meta.path.to_string_lossy().into_owned();
@@ -1151,9 +1150,9 @@ pub(crate) fn make_rel() -> RelDescriptor {
 /// namespace, the way PostgreSQL names chunk relations
 #[cfg(test)]
 pub(crate) fn make_rel_named(
-    oid: Oid,
-    rel_node: Oid,
-    toast_oid: Oid,
+    oid: u32,
+    rel_node: u32,
+    toast_oid: u32,
     name: crate::schema::RelName,
 ) -> std::sync::Arc<RelDescriptor> {
     let mut desc = make_rel();
@@ -1435,6 +1434,22 @@ mod tests {
         assert!(toast_rows_from_page(&heap, &make_rel(), 0, 0x9000).is_empty());
     }
 
+    /// Relation numbers repeat across tablespaces, so two live relations can
+    /// share database and filenode
+    #[test]
+    fn catalog_map_keeps_colliding_filenodes_apart() {
+        let mut m = CatalogMap::new();
+        let here = make_rel();
+        let mut there = make_rel();
+        there.rfn.spc_node = 16385;
+        there.oid = 16401;
+        m.insert(Arc::new(here.clone()));
+        m.insert(Arc::new(there.clone()));
+        assert_eq!(m.len(), 2);
+        assert_eq!(m.get(here.rfn).unwrap().oid, here.oid);
+        assert_eq!(m.get(there.rfn).unwrap().oid, there.oid);
+    }
+
     #[test]
     fn catalog_map_routes_filenodes_and_marks_toast() {
         let mut m = CatalogMap::new();
@@ -1446,10 +1461,23 @@ mod tests {
         toast_rel.rel_name = RelName::new("pg_toast", &toast_rel.rel_name.name);
         m.insert(Arc::new(toast_rel));
 
-        assert!(m.get(5, 16400).is_some());
-        assert!(!m.is_toast(5, 16400));
-        assert!(m.get(5, 99999).is_some());
-        assert!(m.is_toast(5, 99999));
+        let rfn = |rel_node| RelFileNode {
+            spc_node: 1663,
+            db_node: 5,
+            rel_node,
+        };
+        assert!(m.get(rfn(16400)).is_some());
+        assert!(!m.is_toast(rfn(16400)));
+        assert!(m.get(rfn(99999)).is_some());
+        assert!(m.is_toast(rfn(99999)));
+        // Same database and filenode in another tablespace is another relation
+        assert!(
+            m.get(RelFileNode {
+                spc_node: 16385,
+                ..rfn(16400)
+            })
+            .is_none()
+        );
         assert_eq!(m.len(), 2);
     }
 
@@ -1610,9 +1638,10 @@ mod tests {
         toast.rfn.rel_node = 16401;
         toast.oid = 16401;
         toast.rel_name = RelName::new("pg_toast", "pg_toast_16400");
+        let toast_rfn = toast.rfn;
         catalog.insert(Arc::new(toast));
         let sink = PageWalkSink::new_capturing_with_toast(catalog)
-            .with_tap_filenodes(Arc::new([(5, 16401)].into_iter().collect()));
+            .with_tap_filenodes(Arc::new([toast_rfn].into_iter().collect()));
         sink.start(&StartInfo {
             start_lsn: 0x1000,
             timeline: 1,
@@ -1644,9 +1673,8 @@ mod tests {
         });
         assert_eq!(
             m,
-            Some(BaseRelFile {
-                db: 5,
-                filenode: 16400,
+            Some(RelFile {
+                rfn: make_rel().rfn,
                 fork: RelFork::Main,
                 segno: 0,
             })
@@ -1685,7 +1713,7 @@ mod tests {
         catalog.insert(Arc::new(mapped));
         catalog.insert(Arc::new(unmapped));
         let sink = PageWalkSink::new_capturing(catalog)
-            .with_tap_filenodes(Arc::new([(5, 16400)].into_iter().collect()));
+            .with_tap_filenodes(Arc::new([make_rel().rfn].into_iter().collect()));
         sink.start(&StartInfo {
             start_lsn: 0x1000,
             timeline: 1,
@@ -1876,7 +1904,7 @@ mod tests {
         // Each tuple carries its own file's rfn + value; a shared slot
         // would attribute both to rel B
         let captured = sink.captured();
-        let by_rel: HashMap<Oid, Option<Datum>> =
+        let by_rel: HashMap<u32, Option<Datum>> =
             captured.iter().map(|t| (t.rfn.rel_node, lead(t))).collect();
         assert_eq!(captured.len(), 2);
         assert_eq!(

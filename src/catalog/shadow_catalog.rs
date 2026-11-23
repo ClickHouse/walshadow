@@ -90,8 +90,6 @@ pub struct ShadowCatalog {
     /// DB oid this client is connected to; survives `reconnect` since
     /// `conninfo` pins the DB
     current_db_oid: Option<Oid>,
-    /// `pg_database.dattablespace`, memoized for the same reason
-    default_tablespace: Option<Oid>,
     bridge: Arc<Bridge>,
     stats: ShadowCatalogStats,
 }
@@ -137,7 +135,6 @@ impl ShadowCatalog {
             client,
             conninfo: conninfo.to_string(),
             current_db_oid: None,
-            default_tablespace: None,
             bridge,
             stats: ShadowCatalogStats::default(),
         })
@@ -533,20 +530,15 @@ impl ShadowCatalog {
     }
 
     /// What `pg_class.reltablespace = 0` means, and what WAL locators carry.
-    /// Memoized alongside [`Self::current_db_oid`].
+    /// Read per fetch: `ALTER DATABASE SET TABLESPACE` moves it
     async fn default_tablespace_oid(&mut self) -> Result<Oid> {
-        if let Some(oid) = self.default_tablespace {
-            return Ok(oid);
-        }
         let row = self
             .query_one_retry(
                 "SELECT dattablespace::oid FROM pg_database WHERE datname = current_database()",
                 &[],
             )
             .await?;
-        let oid = row.get(0);
-        self.default_tablespace = Some(oid);
-        Ok(oid)
+        Ok(row.get(0))
     }
 }
 

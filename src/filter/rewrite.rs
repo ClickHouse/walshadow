@@ -93,6 +93,53 @@ pub fn noop_replace(record_bytes: &mut [u8]) -> Result<(), RewriteError> {
     Ok(())
 }
 
+/// `XLOG_TBLSPC_CREATE`, PG `src/include/commands/tablespace.h`
+pub const XLOG_TBLSPC_CREATE: u8 = 0x00;
+/// `xl_tblspc_create_rec.ts_path` offset, past `ts_id`
+const TS_PATH_OFFSET: usize = 4;
+/// Body headers preceding main data: replication origin, top-level xid
+const XLR_BLOCK_ID_ORIGIN: u8 = 253;
+const XLR_BLOCK_ID_TOPLEVEL_XID: u8 = 252;
+
+pub fn is_tablespace_create(rmid: u8, info: u8) -> bool {
+    rmid == RmId::Tblspc as u8 && info & 0xF0 == XLOG_TBLSPC_CREATE
+}
+
+/// Point a `CREATE TABLESPACE` at an in-place directory: redo given an empty
+/// path creates `pg_tblspc/<oid>` itself, while any source path is absent on
+/// this host. Path only shrinks, so record length and successor LSNs hold.
+/// Returns whether bytes changed; caller checks [`is_tablespace_create`]
+pub fn blank_tablespace_path(record_bytes: &mut [u8]) -> bool {
+    let Some(path) = main_data_range(record_bytes)
+        .filter(|data| data.len() > TS_PATH_OFFSET)
+        .map(|data| data.start + TS_PATH_OFFSET)
+    else {
+        return false;
+    };
+    if record_bytes[path] == 0 {
+        return false;
+    }
+    record_bytes[path..].fill(0);
+    let crc = compute_crc(record_bytes);
+    record_bytes[CRC_OFFSET..CRC_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
+    true
+}
+
+/// Main data of a record without block references, which always ends it
+fn main_data_range(record_bytes: &[u8]) -> Option<std::ops::Range<usize>> {
+    let mut at = X_LOG_RECORD_HEADER_SIZE;
+    let start = loop {
+        match *record_bytes.get(at)? {
+            XLR_BLOCK_ID_DATA_SHORT => break at + MIN_SHORT_BODY,
+            XLR_BLOCK_ID_DATA_LONG => break at + MIN_LONG_BODY,
+            XLR_BLOCK_ID_ORIGIN => at += 3,
+            XLR_BLOCK_ID_TOPLEVEL_XID => at += 5,
+            _ => return None,
+        }
+    };
+    (start <= record_bytes.len()).then_some(start..record_bytes.len())
+}
+
 /// PG-compatible CRC32C over a record: body then header[0..20].
 pub fn compute_crc(record_bytes: &[u8]) -> u32 {
     let mut crc = 0u32;
@@ -190,6 +237,67 @@ mod tests {
             noop_replace(&mut bytes),
             Err(RewriteError::TooSmall(_))
         ));
+    }
+
+    /// `XLOG_TBLSPC_CREATE` body: optional preamble, SHORT main data
+    fn tablespace_create(preamble: &[u8], path: &str) -> Vec<u8> {
+        let mut data = 16385u32.to_le_bytes().to_vec();
+        data.extend_from_slice(path.as_bytes());
+        data.push(0);
+        let mut body = preamble.to_vec();
+        body.extend([XLR_BLOCK_ID_DATA_SHORT, data.len() as u8]);
+        body.extend(data);
+        let total = X_LOG_RECORD_HEADER_SIZE + body.len();
+        let mut bytes = header_le(
+            total as u32,
+            7,
+            0x42,
+            XLOG_TBLSPC_CREATE,
+            RmId::Tblspc as u8,
+        );
+        bytes.extend(body);
+        let crc = compute_crc(&bytes);
+        bytes[CRC_OFFSET..CRC_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
+        bytes
+    }
+
+    #[test]
+    fn tablespace_create_lands_in_place() {
+        let origin = [XLR_BLOCK_ID_ORIGIN, 1, 0];
+        let xid = [XLR_BLOCK_ID_TOPLEVEL_XID, 9, 0, 0, 0];
+        for preamble in [&[][..], &origin, &xid] {
+            let mut bytes = tablespace_create(preamble, "/srv/source/ts");
+            let len = bytes.len();
+            assert!(is_tablespace_create(bytes[17], bytes[16]));
+            assert!(blank_tablespace_path(&mut bytes));
+            assert_eq!(bytes.len(), len);
+            let parsed = parse_record_from_bytes(&bytes, XLP_PAGE_MAGIC_PG15).unwrap();
+            assert_eq!(parsed.header.crc32_hash, compute_crc(&bytes));
+            assert_eq!(&parsed.main_data[..4], &16385u32.to_le_bytes());
+            assert!(parsed.main_data[4..].iter().all(|b| *b == 0));
+            // Already in place
+            assert!(!blank_tablespace_path(&mut bytes));
+        }
+    }
+
+    #[test]
+    fn tablespace_rewrite_declines_other_shapes() {
+        assert!(!is_tablespace_create(RmId::Tblspc as u8, 0x10));
+        assert!(!is_tablespace_create(RmId::Heap as u8, XLOG_TBLSPC_CREATE));
+        // Block reference where main data should start
+        let mut bytes = tablespace_create(&[0], "/srv/ts");
+        assert!(!blank_tablespace_path(&mut bytes));
+        // Main data too short to hold a path
+        let mut bytes = header_le(28, 0, 0, XLOG_TBLSPC_CREATE, RmId::Tblspc as u8);
+        bytes.extend([XLR_BLOCK_ID_DATA_SHORT, 2, 1, 2]);
+        assert!(!blank_tablespace_path(&mut bytes));
+        // Header only
+        let mut bytes = header_le(24, 0, 0, XLOG_TBLSPC_CREATE, RmId::Tblspc as u8);
+        assert!(!blank_tablespace_path(&mut bytes));
+        // LONG marker claiming more than the record holds
+        let mut bytes = header_le(26, 0, 0, XLOG_TBLSPC_CREATE, RmId::Tblspc as u8);
+        bytes.extend([XLR_BLOCK_ID_DATA_LONG, 0]);
+        assert!(!blank_tablespace_path(&mut bytes));
     }
 
     #[test]

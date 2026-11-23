@@ -27,13 +27,14 @@
 use thiserror::Error;
 use tokio_postgres::Client;
 use tokio_postgres::types::Oid;
-use walrus::pg::walparser::{RmId, XLogRecord};
+use walrus::pg::walparser::{RelFileNode, RmId, XLogRecord};
 
 use crate::cursor::Cursor;
 use crate::decode::fpi::restore_block_image;
 use crate::decode::wal_xact::{XLOG_XACT_ABORT, XLOG_XACT_COMMIT, XLOG_XACT_OPMASK};
 use crate::filter::main_data::{
-    XL_RELMAP_UPDATE_HEADER_SIZE, XLOG_SMGR_CREATE, parse_xl_relmap_update, parse_xl_smgr_create,
+    XL_RELMAP_UPDATE_HEADER_SIZE, XLOG_DBASE_CREATE_FILE_COPY, XLOG_SMGR_CREATE,
+    parse_xl_dbase_create_file_copy, parse_xl_relmap_update, parse_xl_smgr_create,
 };
 use crate::filter::pg_class_decoder::{
     DecodeOutcome, PgClassRow, decode_pg_class_tuple, info_carries_new_tuple_heap,
@@ -78,9 +79,9 @@ pub const PG_NAMESPACE_OID: u32 = 2615;
 
 #[derive(Debug, Default)]
 pub struct CatalogTracker {
-    /// `(db_node, rel_node)`; `db_node == 0` is the shared catalog set,
-    /// consulted by queries on any db
-    nodes: HashSet<(u32, u32)>,
+    /// Catalog files; `db_node == 0` is the shared catalog set. Relation
+    /// numbers repeat across tablespaces, so tablespace is part of identity
+    nodes: HashSet<RelFileNode>,
     /// Current pg_class filenode per db. Empty bootstrap falls through to
     /// `rel == PG_CLASS_OID` (mapped-catalog relfilenode == oid until
     /// first rewrite).
@@ -178,30 +179,35 @@ impl CatalogTracker {
         }
     }
 
-    pub fn add(&mut self, db_node: u32, rel_node: u32) {
-        self.nodes.insert((db_node, rel_node));
+    pub fn add(&mut self, rfn: RelFileNode) {
+        self.nodes.insert(rfn);
     }
 
-    /// Known catalog `(db_node, rel_node)` pairs, for consumers that classify
-    /// off the same seed without carrying the tracker
-    pub fn nodes(&self) -> impl Iterator<Item = (u32, u32)> + '_ {
+    /// Known catalog files, for consumers that classify off the same seed
+    /// without carrying the tracker
+    pub fn nodes(&self) -> impl Iterator<Item = RelFileNode> + '_ {
         self.nodes.iter().copied()
     }
 
     /// `rel < FIRST_NORMAL_OBJECT_ID` is the bootstrap rule; relmap
-    /// updates add post-rewrite filenumbers. `db_node == 0` (shared:
-    /// pg_database, pg_authid, …) consulted for any db.
-    pub fn is_catalog(&self, db_node: u32, rel_node: u32) -> bool {
-        if rel_node == 0 {
+    /// updates and pg_class writes add post-rewrite filenumbers
+    pub fn is_catalog(&self, rfn: RelFileNode) -> bool {
+        if rfn.rel_node == 0 {
             return false;
         }
-        if rel_node < FIRST_NORMAL_OBJECT_ID {
-            return true;
-        }
-        if db_node == 0 {
-            return self.nodes.contains(&(0, rel_node));
-        }
-        self.nodes.contains(&(db_node, rel_node)) || self.nodes.contains(&(0, rel_node))
+        rfn.rel_node < FIRST_NORMAL_OBJECT_ID || self.nodes.contains(&rfn)
+    }
+
+    /// `ALTER DATABASE SET TABLESPACE` copies `db`'s files to `to`. Old
+    /// location stays catalog too, since the move commits after this record
+    fn learn_database_move(&mut self, db: u32, from: u32, to: u32) {
+        let moved: Vec<_> = self
+            .nodes
+            .iter()
+            .filter(|n| n.db_node == db && n.spc_node == from)
+            .map(|n| RelFileNode { spc_node: to, ..*n })
+            .collect();
+        self.nodes.extend(moved);
     }
 
     /// Observe catalog database and decoded user relation OID when present.
@@ -221,7 +227,15 @@ impl CatalogTracker {
             && self.catalog_rebuilds.contains(&record.header.xact_id)
             && let Some((rfn, _fork)) = parse_xl_smgr_create(&record.main_data)
         {
-            self.nodes.insert((rfn.db_node, rfn.rel_node));
+            self.nodes.insert(rfn);
+            return Observation::default();
+        }
+        if rm == RmId::Dbase as u8
+            && info_high == XLOG_DBASE_CREATE_FILE_COPY
+            && let Some(copy) = parse_xl_dbase_create_file_copy(&record.main_data)
+            && copy.src_db_id == copy.db_id
+        {
+            self.learn_database_move(copy.db_id, copy.src_tablespace_id, copy.tablespace_id);
             return Observation::default();
         }
         if rm == RmId::Xact as u8
@@ -253,9 +267,10 @@ impl CatalogTracker {
             let info_op = info_high & 0x70;
             if info_op == 0x10 {
                 // HEAP_DELETE
-                let Some((db, rel)) = self.pg_class_block(record) else {
+                let Some(pg_class) = self.pg_class_block(record) else {
                     return Observation::default();
                 };
+                let (db, rel) = (pg_class.db_node, pg_class.rel_node);
                 if let Some((blk, off)) = tuple_slots(record).old {
                     self.catalog_slots.remove(&(db, rel, blk, off));
                 }
@@ -268,24 +283,21 @@ impl CatalogTracker {
         Observation::default()
     }
 
-    /// First block's `(db_node, rel_node)` iff it targets the current
-    /// pg_class filenode; `None` otherwise.
-    fn pg_class_block(&self, record: &XLogRecord) -> Option<(u32, u32)> {
-        let blk = record.blocks.first()?;
-        let (db, rel) = (
-            blk.header.location.rel.db_node,
-            blk.header.location.rel.rel_node,
-        );
-        self.is_pg_class_relfilenode(db, rel).then_some((db, rel))
+    /// First block's file iff it is the current pg_class heap
+    fn pg_class_block(&self, record: &XLogRecord) -> Option<RelFileNode> {
+        let rfn = record.blocks.first()?.header.location.rel;
+        (self.is_catalog(rfn) && self.is_pg_class_relfilenode(rfn.db_node, rfn.rel_node))
+            .then_some(rfn)
     }
 
     /// Decode block 0 when `record` targets pg_class. PG registers the
     /// new tuple via `XLogRegisterBufData(0, ...)`; later block refs
     /// (heap_update's block 1 old page) carry no tuple, must not decode.
     fn harvest_pg_class_blocks(&mut self, record: &XLogRecord, page_magic: u16) -> Observation {
-        let Some((db, rel)) = self.pg_class_block(record) else {
+        let Some(pg_class) = self.pg_class_block(record) else {
             return Observation::default();
         };
+        let (db, rel) = (pg_class.db_node, pg_class.rel_node);
         let slots = tuple_slots(record);
         let old = slots
             .old
@@ -300,7 +312,7 @@ impl CatalogTracker {
                 }
                 if row.oid >= FIRST_NORMAL_OBJECT_ID {
                     user_oid = Some(row.oid);
-                    self.learn_rebuild(db, &row, record.header.xact_id);
+                    self.learn_rebuild(pg_class, &row, record.header.xact_id);
                 }
             }
             DecodeOutcome::OidInPrefix(logged) => {
@@ -320,7 +332,7 @@ impl CatalogTracker {
             }
         }
         if let Some((oid, relfilenode)) = catalog_row {
-            self.learn_catalog_row(db, oid, relfilenode);
+            self.learn_catalog_row(pg_class, oid, relfilenode);
         }
         if let Some((blk, off)) = slots.new {
             self.set_slot((db, rel, blk, off), catalog_row);
@@ -334,8 +346,14 @@ impl CatalogTracker {
         }
     }
 
-    fn learn_catalog_row(&mut self, db: u32, oid: u32, relfilenode: u32) {
-        self.nodes.insert((db, relfilenode));
+    /// Catalogs a pg_class row describes share its database's tablespace,
+    /// which is where pg_class itself lives
+    fn learn_catalog_row(&mut self, pg_class: RelFileNode, oid: u32, relfilenode: u32) {
+        let db = pg_class.db_node;
+        self.nodes.insert(RelFileNode {
+            rel_node: relfilenode,
+            ..pg_class
+        });
         if oid == PG_NAMESPACE_OID {
             self.pg_namespace_filenode.insert(db, relfilenode);
         }
@@ -354,11 +372,15 @@ impl CatalogTracker {
 
     /// Transient heap of a catalog rebuild: its storage, and everything its
     /// xact creates before the transient row drops, is catalog
-    fn learn_rebuild(&mut self, db: u32, row: &PgClassRow, xid: u32) {
+    fn learn_rebuild(&mut self, pg_class: RelFileNode, row: &PgClassRow, xid: u32) {
         let Some(parent) = row.rebuilt_catalog() else {
             return;
         };
-        self.nodes.insert((db, row.relfilenode));
+        let db = pg_class.db_node;
+        self.nodes.insert(RelFileNode {
+            rel_node: row.relfilenode,
+            ..pg_class
+        });
         if xid != 0 {
             self.catalog_rebuilds.insert(xid);
         }
@@ -369,9 +391,10 @@ impl CatalogTracker {
 
     /// In-place update confirms which row a slot holds
     fn learn_inplace(&mut self, record: &XLogRecord, page_magic: u16) {
-        let Some((db, rel)) = self.pg_class_block(record) else {
+        let Some(pg_class) = self.pg_class_block(record) else {
             return;
         };
+        let (db, rel) = (pg_class.db_node, pg_class.rel_node);
         let Some((blk, off)) = tuple_slots(record).new else {
             return;
         };
@@ -390,7 +413,7 @@ impl CatalogTracker {
         for block in &record.blocks {
             let loc = block.header.location;
             let (db, rel, blk) = (loc.rel.db_node, loc.rel.rel_node, loc.block_no);
-            if !block.header.has_image() || !self.reads_image(db, rel) {
+            if !block.header.has_image() || !self.reads_image(loc.rel) {
                 continue;
             }
             self.catalog_slots
@@ -408,12 +431,19 @@ impl CatalogTracker {
     }
 
     /// Whether a page image of this relation teaches pg_class slots
-    pub fn reads_image(&self, db: u32, rel: u32) -> bool {
-        self.is_pg_class_relfilenode(db, rel) || self.pg_class_transient.get(&db) == Some(&rel)
+    pub fn reads_image(&self, rfn: RelFileNode) -> bool {
+        let (db, rel) = (rfn.db_node, rfn.rel_node);
+        self.is_catalog(rfn)
+            && (self.is_pg_class_relfilenode(db, rel)
+                || self.pg_class_transient.get(&db) == Some(&rel))
     }
 
     /// Return true for a statistics catalog filenode
-    pub fn is_opaque_catalog(&self, db: u32, rel: u32) -> bool {
+    pub fn is_opaque_catalog(&self, rfn: RelFileNode) -> bool {
+        let (db, rel) = (rfn.db_node, rfn.rel_node);
+        if !self.is_catalog(rfn) {
+            return false;
+        }
         if self.opaque_filenodes.contains(&(db, rel)) {
             return true;
         }
@@ -439,7 +469,11 @@ impl CatalogTracker {
     /// is a stale `RelAttr.type_name` after `ALTER TYPE … RENAME`, which no
     /// decode path reads — accepted, with remediation options in
     /// `plans/catalog.md`
-    pub fn is_capture_all_catalog(&self, db: u32, rel: u32) -> bool {
+    pub fn is_capture_all_catalog(&self, rfn: RelFileNode) -> bool {
+        let (db, rel) = (rfn.db_node, rfn.rel_node);
+        if !self.is_catalog(rfn) {
+            return false;
+        }
         match self.pg_namespace_filenode.get(&db) {
             Some(&fnum) => fnum == rel,
             None => rel == PG_NAMESPACE_OID,
@@ -467,6 +501,7 @@ impl CatalogTracker {
             return None;
         }
         let dbid = header.dbid;
+        let spc_node = header.tsid;
         let mut map = &md[XL_RELMAP_UPDATE_HEADER_SIZE..];
         if map.i32()? != RELMAPPER_FILEMAGIC {
             return None;
@@ -479,7 +514,11 @@ impl CatalogTracker {
             let mapoid = map.u32()?;
             let filenum = map.u32()?;
             if mapoid != 0 && filenum != 0 {
-                self.nodes.insert((dbid, filenum));
+                self.nodes.insert(RelFileNode {
+                    spc_node,
+                    db_node: dbid,
+                    rel_node: filenum,
+                });
                 if mapoid == PG_CLASS_OID {
                     self.pg_class_filenode.insert(dbid, filenum);
                     self.catalog_slots
@@ -501,14 +540,13 @@ impl CatalogTracker {
         let rows = client
             .query(
                 "SELECT \
-                    CASE WHEN c.relisshared THEN 0::oid \
-                         ELSE (SELECT d.oid FROM pg_database d \
-                               WHERE d.datname = current_database()) \
-                    END AS db_node, \
+                    CASE WHEN c.relisshared THEN 0::oid ELSE d.oid END AS db_node, \
                     c.oid AS catalog_oid, \
                     pg_relation_filenode(c.oid) AS filenode, \
-                    c.ctid::text AS slot \
+                    c.ctid::text AS slot, \
+                    coalesce(nullif(c.reltablespace, 0), d.dattablespace) AS spc_node \
                  FROM pg_class c \
+                 JOIN pg_database d ON d.datname = current_database() \
                  WHERE c.oid < 16384 \
                    AND pg_relation_filenode(c.oid) IS NOT NULL",
                 &[],
@@ -525,7 +563,11 @@ impl CatalogTracker {
             {
                 slots.push((db_node, slot, catalog_oid, filenode));
             }
-            added += usize::from(self.nodes.insert((db_node, filenode)));
+            added += usize::from(self.nodes.insert(RelFileNode {
+                spc_node: row.get(4),
+                db_node,
+                rel_node: filenode,
+            }));
             if catalog_oid == PG_CLASS_OID {
                 self.pg_class_filenode.insert(db_node, filenode);
             }
@@ -566,12 +608,27 @@ fn parse_ctid(text: &str) -> Option<(u32, u16)> {
     Some((blk.parse().ok()?, off.parse().ok()?))
 }
 
+/// Test file in `pg_global` for shared `db == 0`, else `pg_default`
+#[cfg(test)]
+pub(crate) fn test_rfn(db_node: u32, rel_node: u32) -> RelFileNode {
+    use crate::schema::{DEFAULT_TABLESPACE_OID, GLOBAL_TABLESPACE_OID};
+    RelFileNode {
+        spc_node: if db_node == 0 {
+            GLOBAL_TABLESPACE_OID
+        } else {
+            DEFAULT_TABLESPACE_OID
+        },
+        db_node,
+        rel_node,
+    }
+}
+
 /// Well-formed `XLOG_RELMAP_UPDATE` record, shared with filter-engine tests.
 #[cfg(test)]
 pub(crate) fn test_relmap_record(dbid: u32, mappings: &[(u32, u32)]) -> XLogRecord<'static> {
     let mut data = Vec::new();
     data.extend_from_slice(&dbid.to_le_bytes());
-    data.extend_from_slice(&1664u32.to_le_bytes()); // tsid pg_global
+    data.extend_from_slice(&test_rfn(dbid, 0).spc_node.to_le_bytes());
     data.extend_from_slice(&(REL_MAP_FILE_SIZE as i32).to_le_bytes());
     data.extend_from_slice(&RELMAPPER_FILEMAGIC.to_le_bytes());
     data.extend_from_slice(&(mappings.len() as i32).to_le_bytes());
@@ -694,20 +751,20 @@ mod tests {
     #[test]
     fn bootstrap_low_oids_are_catalog() {
         let t = CatalogTracker::new();
-        assert!(t.is_catalog(5, 1259));
-        assert!(t.is_catalog(5, 16383));
-        assert!(!t.is_catalog(5, 16384));
-        assert!(!t.is_catalog(5, 0));
+        assert!(t.is_catalog(test_rfn(5, 1259)));
+        assert!(t.is_catalog(test_rfn(5, 16383)));
+        assert!(!t.is_catalog(test_rfn(5, 16384)));
+        assert!(!t.is_catalog(test_rfn(5, 0)));
     }
 
     #[test]
     fn statistics_catalogs_are_opaque_at_their_bootstrap_filenode() {
         let t = CatalogTracker::new();
-        assert!(t.is_opaque_catalog(5, 2619)); // pg_statistic
-        assert!(t.is_opaque_catalog(5, 2696)); // its index
-        assert!(t.is_opaque_catalog(5, 2840)); // its toast heap
-        assert!(!t.is_opaque_catalog(5, 1259)); // pg_class
-        assert!(!t.is_opaque_catalog(5, 16400)); // user rel
+        assert!(t.is_opaque_catalog(test_rfn(5, 2619))); // pg_statistic
+        assert!(t.is_opaque_catalog(test_rfn(5, 2696))); // its index
+        assert!(t.is_opaque_catalog(test_rfn(5, 2840))); // its toast heap
+        assert!(!t.is_opaque_catalog(test_rfn(5, 1259))); // pg_class
+        assert!(!t.is_opaque_catalog(test_rfn(5, 16400))); // user rel
     }
 
     #[test]
@@ -724,10 +781,13 @@ mod tests {
             xl_heap_update_no_compression(),
         );
         t.observe(&rec, MAGIC);
-        assert!(t.is_opaque_catalog(5, 40000));
-        assert!(!t.is_opaque_catalog(5, 2619), "old filenode may be reused",);
+        assert!(t.is_opaque_catalog(test_rfn(5, 40000)));
         assert!(
-            t.is_opaque_catalog(6, 2619),
+            !t.is_opaque_catalog(test_rfn(5, 2619)),
+            "old filenode may be reused",
+        );
+        assert!(
+            t.is_opaque_catalog(test_rfn(6, 2619)),
             "filenode tracking is per database",
         );
         let again = heap_block_record_with_main(
@@ -739,8 +799,11 @@ mod tests {
             xl_heap_update_no_compression(),
         );
         t.observe(&again, MAGIC);
-        assert!(t.is_opaque_catalog(5, 41000));
-        assert!(!t.is_opaque_catalog(5, 40000), "second move retires first");
+        assert!(t.is_opaque_catalog(test_rfn(5, 41000)));
+        assert!(
+            !t.is_opaque_catalog(test_rfn(5, 40000)),
+            "second move retires first"
+        );
     }
 
     #[test]
@@ -748,18 +811,76 @@ mod tests {
         let mut t = CatalogTracker::new();
         let r = relmap_record(5, &[(1259, 50000)]);
         t.observe(&r, MAGIC);
-        assert!(t.is_catalog(5, 50000));
+        assert!(t.is_catalog(test_rfn(5, 50000)));
         assert_eq!(t.relmap_updates, 1);
     }
 
+    fn dbase_copy(db: u32, to: u32, src_db: u32, from: u32) -> XLogRecord<'static> {
+        let data: Vec<u8> = [db, to, src_db, from]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        XLogRecord {
+            header: XLogRecordHeader {
+                resource_manager_id: RmId::Dbase as u8,
+                info: XLOG_DBASE_CREATE_FILE_COPY,
+                ..Default::default()
+            },
+            main_data_len: data.len() as u32,
+            main_data: std::borrow::Cow::Owned(data),
+            ..Default::default()
+        }
+    }
+
+    fn in_tablespace(spc_node: u32, rfn: RelFileNode) -> RelFileNode {
+        RelFileNode { spc_node, ..rfn }
+    }
+
+    /// Database's catalogs are catalog at both locations, since the move
+    /// commits after its copy record
     #[test]
-    fn shared_relmap_visible_across_dbs() {
+    fn database_move_copies_catalog_files_to_new_tablespace() {
+        let mut t = CatalogTracker::new();
+        t.add(test_rfn(5, 50000));
+        t.add(test_rfn(6, 50001));
+        t.observe(&dbase_copy(5, 16385, 5, 1663), MAGIC);
+        assert!(t.is_catalog(in_tablespace(16385, test_rfn(5, 50000))));
+        assert!(t.is_catalog(test_rfn(5, 50000)));
+        assert!(!t.is_catalog(in_tablespace(16385, test_rfn(6, 50001))));
+        // Copying a template is database creation, no move
+        t.observe(&dbase_copy(7, 16386, 5, 1663), MAGIC);
+        assert!(!t.is_catalog(in_tablespace(16386, test_rfn(5, 50000))));
+        assert!(!t.is_catalog(in_tablespace(16386, test_rfn(7, 50000))));
+    }
+
+    /// Relation numbers repeat across tablespaces: a user heap sharing a
+    /// rotated catalog's database and filenode is still user data
+    #[test]
+    fn user_file_in_another_tablespace_is_not_catalog() {
+        let mut t = CatalogTracker::new();
+        t.observe(&relmap_record(5, &[(PG_CLASS_OID, 50000)]), MAGIC);
+        let elsewhere = in_tablespace(16385, test_rfn(5, 50000));
+        assert!(t.is_catalog(test_rfn(5, 50000)));
+        assert!(!t.is_catalog(elsewhere));
+        assert!(!t.is_opaque_catalog(elsewhere));
+        assert!(!t.is_capture_all_catalog(elsewhere));
+        assert!(!t.reads_image(elsewhere));
+        let mut insert = heap_block_record(RmId::Heap, 0x00, 5, 50000, Vec::new());
+        insert.blocks[0].header.location.rel = elsewhere;
+        let obs = t.observe(&insert, MAGIC);
+        assert!(!obs.catalog_write, "user heap insert is no pg_class write");
+        assert_eq!(t.pg_class_writes_undecoded + t.pg_class_writes_decoded, 0);
+    }
+
+    #[test]
+    fn shared_relmap_names_only_the_shared_file() {
         let mut t = CatalogTracker::new();
         // pg_database (oid 1262) in shared/global (dbid 0)
         let r = relmap_record(0, &[(1262, 60000)]);
         t.observe(&r, MAGIC);
-        assert!(t.is_catalog(0, 60000));
-        assert!(t.is_catalog(99, 60000));
+        assert!(t.is_catalog(test_rfn(0, 60000)));
+        // Same number in a database is another relation's file
+        assert!(!t.is_catalog(test_rfn(99, 60000)));
     }
 
     #[test]
@@ -777,7 +898,7 @@ mod tests {
         let data = pg_class_block_data(2615, 30000);
         let rec = heap_block_record(RmId::Heap, 0x00, 5, 1259, data); // XLOG_HEAP_INSERT
         t.observe(&rec, MAGIC);
-        assert!(t.is_catalog(5, 30000));
+        assert!(t.is_catalog(test_rfn(5, 30000)));
         assert_eq!(t.pg_class_writes_decoded, 1);
         assert_eq!(t.pg_class_writes_undecoded, 0);
     }
@@ -798,7 +919,7 @@ mod tests {
             xl_heap_update_no_compression(),
         );
         t.observe(&rec, MAGIC);
-        assert!(t.is_catalog(5, 40000));
+        assert!(t.is_catalog(test_rfn(5, 40000)));
         assert_eq!(t.pg_class_writes_decoded, 1);
         assert_eq!(t.pg_class_writes_oid_in_prefix, 0);
     }
@@ -817,7 +938,7 @@ mod tests {
         assert_eq!(t.pg_class_writes_oid_in_prefix, 1);
         assert_eq!(t.pg_class_writes_undecoded, 0);
         assert_eq!(t.pg_class_writes_decoded, 0);
-        assert!(!t.is_catalog(5, 40000));
+        assert!(!t.is_catalog(test_rfn(5, 40000)));
     }
 
     #[test]
@@ -827,7 +948,7 @@ mod tests {
         let data = pg_class_block_data(50000, 50001);
         let rec = heap_block_record(RmId::Heap, 0x00, 5, 1259, data);
         t.observe(&rec, MAGIC);
-        assert!(!t.is_catalog(5, 50001));
+        assert!(!t.is_catalog(test_rfn(5, 50001)));
         assert_eq!(t.pg_class_writes_decoded, 1); // decoded, filtered by oid range
     }
 
@@ -848,7 +969,7 @@ mod tests {
         let data = pg_class_block_data(2608, 40000);
         let rec = heap_block_record(RmId::Heap, 0x30, 5, 1259, data);
         t.observe(&rec, MAGIC);
-        assert!(!t.is_catalog(5, 40000));
+        assert!(!t.is_catalog(test_rfn(5, 40000)));
         assert_eq!(t.pg_class_writes_decoded, 0);
     }
 
@@ -870,7 +991,7 @@ mod tests {
             xl_heap_update_no_compression(),
         );
         t.observe(&rec, MAGIC);
-        assert!(t.is_catalog(5, 70000));
+        assert!(t.is_catalog(test_rfn(5, 70000)));
         assert_eq!(t.pg_class_writes_decoded, 1);
     }
 
@@ -880,7 +1001,7 @@ mod tests {
         let mut r = relmap_record(5, &[(1259, 50000)]);
         r.main_data.to_mut().truncate(8); // chop off nbytes
         t.observe(&r, MAGIC);
-        assert!(!t.is_catalog(5, 50000));
+        assert!(!t.is_catalog(test_rfn(5, 50000)));
         assert_eq!(t.relmap_updates, 1); // counted, no update applied
     }
 
@@ -974,7 +1095,10 @@ mod tests {
                 .catalog_db_oid,
             Some(6)
         );
-        assert!(t.is_catalog(6, 50000), "foreign mapping still installed");
+        assert!(
+            t.is_catalog(test_rfn(6, 50000)),
+            "foreign mapping still installed"
+        );
         assert_eq!(
             t.observe(&relmap_record(0, &[(1262, 60000)]), MAGIC)
                 .catalog_db_oid,
@@ -1024,9 +1148,9 @@ mod tests {
     #[test]
     fn add_grows_len_idempotently() {
         let mut t = CatalogTracker::new();
-        t.add(5, 50000);
-        t.add(5, 50000); // duplicate
-        t.add(5, 50001);
+        t.add(test_rfn(5, 50000));
+        t.add(test_rfn(5, 50000)); // duplicate
+        t.add(test_rfn(5, 50001));
         assert!(!t.is_empty());
         assert_eq!(t.len(), 2);
     }
@@ -1038,7 +1162,7 @@ mod tests {
         // nbytes at main_data[8..12]; mismatch must short-circuit
         r.main_data.to_mut()[8..12].copy_from_slice(&12345i32.to_le_bytes());
         t.observe(&r, MAGIC);
-        assert!(!t.is_catalog(5, 50000));
+        assert!(!t.is_catalog(test_rfn(5, 50000)));
         assert_eq!(t.relmap_updates, 1);
     }
 
@@ -1049,7 +1173,7 @@ mod tests {
         // magic at main_data[12..16] (12 header + magic offset 0)
         r.main_data.to_mut()[12..16].copy_from_slice(&0xDEADBEEFu32.to_le_bytes());
         t.observe(&r, MAGIC);
-        assert!(!t.is_catalog(5, 50000));
+        assert!(!t.is_catalog(test_rfn(5, 50000)));
     }
 
     #[test]
@@ -1059,7 +1183,7 @@ mod tests {
         // num_mappings at main_data[16..20] (12 header + 4 magic)
         r.main_data.to_mut()[16..20].copy_from_slice(&((MAX_MAPPINGS + 1) as i32).to_le_bytes());
         t.observe(&r, MAGIC);
-        assert!(!t.is_catalog(5, 50000));
+        assert!(!t.is_catalog(test_rfn(5, 50000)));
     }
 
     #[test]
@@ -1077,7 +1201,7 @@ mod tests {
         let mut r = relmap_record(5, &[(1259, 50000)]);
         r.main_data.to_mut().truncate(4); // len < 12 + REL_MAP_FILE_SIZE
         t.observe(&r, MAGIC);
-        assert!(!t.is_catalog(5, 50000));
+        assert!(!t.is_catalog(test_rfn(5, 50000)));
     }
 
     /// pg_class tuple naming `relname` in `relnamespace`
@@ -1131,15 +1255,21 @@ mod tests {
             1u16.to_le_bytes().to_vec(),
         );
         t.observe(&with_xid(insert, 900), MAGIC);
-        assert!(t.is_catalog(5, 50000), "transient heap is catalog storage");
+        assert!(
+            t.is_catalog(test_rfn(5, 50000)),
+            "transient heap is catalog storage"
+        );
         t.observe(&smgr_create(5, 50003, 900), MAGIC);
-        assert!(t.is_catalog(5, 50003), "toast or rebuilt index");
+        assert!(t.is_catalog(test_rfn(5, 50003)), "toast or rebuilt index");
         t.observe(&smgr_create(5, 50004, 901), MAGIC);
-        assert!(!t.is_catalog(5, 50004), "other xact");
+        assert!(!t.is_catalog(test_rfn(5, 50004)), "other xact");
         let delete = heap_block_record_with_main(RmId::Heap, 0x10, 5, 1259, vec![], vec![0; 6]);
         t.observe(&with_xid(delete, 900), MAGIC);
         t.observe(&smgr_create(5, 50005, 900), MAGIC);
-        assert!(!t.is_catalog(5, 50005), "transient drop closes the rebuild");
+        assert!(
+            !t.is_catalog(test_rfn(5, 50005)),
+            "transient drop closes the rebuild"
+        );
     }
 
     #[test]
@@ -1154,13 +1284,16 @@ mod tests {
             1u16.to_le_bytes().to_vec(),
         );
         t.observe(&insert, MAGIC);
-        assert!(t.is_catalog(5, 50010));
+        assert!(t.is_catalog(test_rfn(5, 50010)));
         assert!(
-            t.reads_image(5, 50010),
+            t.reads_image(test_rfn(5, 50010)),
             "transient pg_class pages teach slots"
         );
         t.observe(&smgr_create(5, 50011, 0), MAGIC);
-        assert!(!t.is_catalog(5, 50011), "no xact claims later storage");
+        assert!(
+            !t.is_catalog(test_rfn(5, 50011)),
+            "no xact claims later storage"
+        );
     }
 
     #[test]
@@ -1176,8 +1309,8 @@ mod tests {
         );
         t.observe(&with_xid(insert, 900), MAGIC);
         t.observe(&smgr_create(5, 50003, 900), MAGIC);
-        assert!(!t.is_catalog(5, 50000));
-        assert!(!t.is_catalog(5, 50003));
+        assert!(!t.is_catalog(test_rfn(5, 50000)));
+        assert!(!t.is_catalog(test_rfn(5, 50003)));
     }
 
     #[test]
@@ -1203,7 +1336,7 @@ mod tests {
             update_main_data(7, 9, 0x20),
         );
         t.observe(&reindex, MAGIC);
-        assert!(t.is_catalog(5, 40000));
+        assert!(t.is_catalog(test_rfn(5, 40000)));
         // Chained rotation resolves from the new slot
         let again = heap_block_record_with_main(
             RmId::Heap,
@@ -1214,7 +1347,7 @@ mod tests {
             update_main_data(9, 10, 0x20),
         );
         t.observe(&again, MAGIC);
-        assert!(t.is_catalog(5, 40100));
+        assert!(t.is_catalog(test_rfn(5, 40100)));
     }
 
     /// Unrestorable pg_class image teaches nothing and forgets its page
@@ -1261,7 +1394,10 @@ mod tests {
             update_main_data(7, 8, 0x20),
         );
         t.observe(&rotate, MAGIC);
-        assert!(!t.is_catalog(5, 40000), "user index rotation stays user");
+        assert!(
+            !t.is_catalog(test_rfn(5, 40000)),
+            "user index rotation stays user"
+        );
     }
 
     #[test]

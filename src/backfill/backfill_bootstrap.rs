@@ -14,7 +14,7 @@
 //! 4. source.run(shadow_data_dir, mux) → (StartInfo, EndInfo)
 //!    - During run: catalog files Keep'd onto shadow_data_dir;
 //!      user heap pages decoded → BackfillTuple → mpsc → emitter task
-//!    - After run: user tablespaces relocate inside shadow_data_dir
+//!    - After run: tablespace_map retires, tablespaces stay in place
 //! 5. Return EndInfo; daemon writes standby.signal w/
 //!    recovery_target_lsn = end_lsn, starts shadow, waits replay,
 //!    then rebinds WAL pump at end_lsn.
@@ -62,7 +62,7 @@ pub struct BootstrapConfig {
     pub catalog_filenodes: CatalogFilenodes,
     /// Filenodes worth decoding: mapped relations plus their TOAST heaps.
     /// `None` taps every seeded relation
-    pub tap_filenodes: Option<Arc<foldhash::HashSet<(Oid, Oid)>>>,
+    pub tap_filenodes: Option<Arc<foldhash::HashSet<RelFileNode>>>,
     pub progress: BootstrapProgress,
 }
 
@@ -76,14 +76,14 @@ impl BootstrapConfig {
         }
     }
 
-    pub fn with_catalog_filenodes(mut self, c: impl IntoIterator<Item = (Oid, Oid)>) -> Self {
+    pub fn with_catalog_filenodes(mut self, c: impl IntoIterator<Item = RelFileNode>) -> Self {
         self.catalog_filenodes = c.into_iter().collect();
         self
     }
 
     /// Decline every filenode outside `set` at `begin`, so unmapped
     /// relations drain off the wire without a page decode
-    pub fn with_tap_filenodes(mut self, set: Arc<foldhash::HashSet<(Oid, Oid)>>) -> Self {
+    pub fn with_tap_filenodes(mut self, set: Arc<foldhash::HashSet<RelFileNode>>) -> Self {
         self.tap_filenodes = Some(set);
         self
     }
@@ -114,19 +114,17 @@ pub fn tap_filenode_set(
     catalog: &CatalogMap,
     routed: impl Fn(&RelDescriptor) -> bool,
     walked: impl Fn(&RelDescriptor) -> bool,
-) -> Option<foldhash::HashSet<(Oid, Oid)>> {
+) -> Option<foldhash::HashSet<RelFileNode>> {
     use foldhash::HashSetExt;
-    let by_oid: foldhash::HashMap<Oid, (Oid, Oid)> = catalog
-        .descriptors()
-        .map(|d| (d.oid, (d.rfn.db_node, d.rfn.rel_node)))
-        .collect();
+    let by_oid: foldhash::HashMap<Oid, RelFileNode> =
+        catalog.descriptors().map(|d| (d.oid, d.rfn)).collect();
     let mut set = foldhash::HashSet::new();
     for d in catalog.descriptors() {
         if !routed(d) {
             continue;
         }
         if walked(d) {
-            set.insert((d.rfn.db_node, d.rfn.rel_node));
+            set.insert(d.rfn);
         }
         if d.toast_oid == 0 {
             continue;
@@ -207,9 +205,9 @@ pub fn spawn_greenfield_bootstrap(
             .run(data_dir, sink, cfg.progress.pump.clone())
             .await
             .context("bootstrap: source.run")?;
-        crate::backfill::shadow_tablespaces::relocate(&cfg.shadow_data_dir)
+        crate::backfill::shadow_tablespaces::retire_map(&cfg.shadow_data_dir)
             .await
-            .context("bootstrap: relocate tablespaces")?;
+            .context("bootstrap: retire tablespace_map")?;
 
         // Dropping the last sink Arc closes the channel sender in `out_tx`,
         // so a concurrent drain observes channel-close on next recv
@@ -444,9 +442,14 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let cfg = BootstrapConfig::new(tmp.path().to_path_buf());
         assert!(cfg.catalog_filenodes.is_empty());
-        let cfg = cfg.with_catalog_filenodes([(5, 50000), (0, 99999)]);
+        let rfn = |spc_node, db_node, rel_node| RelFileNode {
+            spc_node,
+            db_node,
+            rel_node,
+        };
+        let cfg = cfg.with_catalog_filenodes([rfn(1663, 5, 50000), rfn(1664, 0, 99999)]);
         assert_eq!(cfg.catalog_filenodes.len(), 2);
-        assert!(cfg.catalog_filenodes.is_catalog(5, 50000));
+        assert!(cfg.catalog_filenodes.is_catalog(rfn(1663, 5, 50000)));
     }
 
     /// Emits a curated file-event sequence; tests orchestrator without live PG

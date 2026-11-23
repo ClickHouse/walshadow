@@ -21,9 +21,18 @@ mod ports;
 use std::time::Duration;
 
 use tokio_postgres::NoTls;
+use walrus::pg::walparser::RelFileNode;
 use walshadow::catalog_tracker::{CatalogTracker, PG_CLASS_OID};
 use walshadow::pg::socket_conninfo;
 use walshadow::shadow::{Shadow, ShadowConfig};
+
+fn local(db_node: u32, rel_node: u32) -> RelFileNode {
+    RelFileNode {
+        spc_node: 1663,
+        db_node,
+        rel_node,
+    }
+}
 
 fn make_cluster(tmp: &tempfile::TempDir, port: u16) -> Shadow {
     let mut cfg = ShadowConfig::new(tmp.path().join("data"), tmp.path().join("filtered"));
@@ -108,32 +117,31 @@ async fn seed_picks_up_initial_mapped_catalog_filenodes() {
 
     assert!(added > 0, "expected some catalog rows to seed");
     assert!(
-        tracker.is_catalog(db, pg_class_fn),
+        tracker.is_catalog(local(db, pg_class_fn)),
         "pg_class filenode {} (db {}) must be catalog after seed",
         pg_class_fn,
         db,
     );
     assert!(
-        tracker.is_catalog(db, pg_namespace_fn),
+        tracker.is_catalog(local(db, pg_namespace_fn)),
         "pg_namespace filenode {} (db {}) must be catalog after seed",
         pg_namespace_fn,
         db,
     );
-    // pg_database is shared — seeded under db_node = 0, visible from
-    // any db_node via the global fall-through.
+    // pg_database is shared, seeded under pg_global and db_node = 0
     let pg_database_fn: u32 = sh
         .psql_one("SELECT pg_relation_filenode('pg_database'::regclass)::int8")
         .unwrap()
         .parse()
         .unwrap();
     assert!(
-        tracker.is_catalog(0, pg_database_fn),
+        tracker.is_catalog(RelFileNode {
+            spc_node: 1664,
+            db_node: 0,
+            rel_node: pg_database_fn,
+        }),
         "pg_database shared filenode {} must be catalog under db_node=0",
         pg_database_fn,
-    );
-    assert!(
-        tracker.is_catalog(99, pg_database_fn),
-        "pg_database must remain visible from any db_node via global lookup",
     );
 }
 
@@ -189,7 +197,7 @@ async fn seed_closes_pre_attach_pg_class_rotation_hole() {
     // unconditionally.
     let unseeded = CatalogTracker::new();
     assert!(
-        !unseeded.is_catalog(db, pg_class_fn_after),
+        !unseeded.is_catalog(local(db, pg_class_fn_after)),
         "without seed_from_source the rotated pg_class filenode {} must NOT be catalog",
         pg_class_fn_after,
     );
@@ -199,7 +207,7 @@ async fn seed_closes_pre_attach_pg_class_rotation_hole() {
     let mut tracker = CatalogTracker::new();
     tracker.seed_from_source(&client).await.expect("seed");
     assert!(
-        tracker.is_catalog(db, pg_class_fn_after),
+        tracker.is_catalog(local(db, pg_class_fn_after)),
         "seed_from_source must add pg_class's current filenode {} to the catalog set",
         pg_class_fn_after,
     );
@@ -234,7 +242,7 @@ async fn seed_skips_user_tables() {
     let mut tracker = CatalogTracker::new();
     tracker.seed_from_source(&client).await.expect("seed");
     assert!(
-        !tracker.is_catalog(db, user_t_fn),
+        !tracker.is_catalog(local(db, user_t_fn)),
         "user_t filenode {} must NOT be catalog after seed",
         user_t_fn,
     );
@@ -280,8 +288,9 @@ async fn relation_seed_reads_dropped_identity_index_as_nothing() {
     assert_eq!(replident, [walshadow::schema::ReplIdent::Nothing]);
 }
 
+/// TOAST index moved apart from its heap lands with its own tablespace
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn shadow_toast_refuses_toast_index_outside_default_tablespace() {
+async fn shadow_toast_lands_toast_index_in_its_own_tablespace() {
     if !pg_available() {
         return;
     }
@@ -308,26 +317,35 @@ async fn shadow_toast_refuses_toast_index_outside_default_tablespace() {
          ALTER INDEX pg_toast.{index} SET TABLESPACE ts;\n"
     ))
     .expect("move toast index");
-    let spc = sh
-        .psql_one("SELECT oid FROM pg_tablespace WHERE spcname = 'ts'")
-        .unwrap();
+    let oid = |sql: &str| -> u32 { sh.psql_one(sql).unwrap().parse().unwrap() };
+    let index_rfn = RelFileNode {
+        spc_node: oid("SELECT oid FROM pg_tablespace WHERE spcname = 'ts'"),
+        db_node: current_db_oid(&sh),
+        rel_node: oid(&format!(
+            "SELECT pg_relation_filenode('pg_toast.{index}'::regclass)"
+        )),
+    };
 
     let client = connect(&sh).await;
     let catalog = walshadow::backfill_bootstrap::seed_catalog_from_source(&client)
         .await
         .unwrap();
-    let err = walshadow::toast::shadow_landing::toast_relations(
+    let rels = walshadow::toast::shadow_landing::toast_relations(
         &client,
         catalog.descriptors().map(std::sync::Arc::as_ref),
         None,
     )
     .await
-    .unwrap_err();
-    assert_eq!(
-        err.to_string(),
-        format!(
-            "bootstrap: TOAST index {index} is in tablespace {spc}; \
-             [toast] mode = shadow keeps files from default tablespace only"
-        )
+    .unwrap();
+    assert!(
+        rels.contains(&index_rfn),
+        "{index_rfn:?} missing from {rels:?}"
+    );
+    assert!(
+        !rels.contains(&RelFileNode {
+            spc_node: 1663,
+            ..index_rfn
+        }),
+        "index keeps its own tablespace"
     );
 }
