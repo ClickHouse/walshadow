@@ -216,9 +216,9 @@ types, and will not automatically include unrelated source columns
 ## Replace NaN and infinity
 
 ClickHouse `Decimal` cannot hold PostgreSQL `numeric` `NaN`, `Infinity`, or
-`-Infinity`. By default, encountering any of these values stops replication
-with an error identifying affected column. Map column to `String` to keep
-original text, or choose replacements with `nan`, `pos_inf`, and `neg_inf`:
+`-Infinity`. By default, these values are written as `0`. Map column to
+`String` to keep original text, or choose replacements with `nan`, `pos_inf`,
+and `neg_inf`:
 
 ```toml
 [table.app."*"]
@@ -231,14 +231,15 @@ columns = [
 
 | Value | Effect |
 |---|---|
-| `reject` | stop replication, default |
+| `reject` | stop replication with an error identifying affected column |
 | `null` | write NULL, destination must be `Nullable(Decimal(...))` |
 | `min`, `max` | write smallest or largest value of destination `Decimal(p,s)`, eg `-99999999.99` and `99999999.99` for `Decimal(10,2)` |
-| decimal number | write a fixed value, such as `0` or `-1.5`, that fits destination decimal type without rounding |
+| decimal number | write a fixed value, such as `0` (default) or `-1.5`, that fits destination decimal type without rounding |
 
 Set each replacement independently. For example, a column rule setting only
 `nan` keeps `pos_inf` and `neg_inf` from matching broader rules. Set `reject`
-to stop on that value even when a broader rule supplies a replacement
+to stop on that value instead of writing `0`, or when a broader rule supplies
+a replacement
 
 Numeric replacements apply to `Decimal` columns during initial loads and
 ongoing replication. They do not affect `String` columns or apply to column
