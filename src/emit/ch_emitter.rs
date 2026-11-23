@@ -1523,7 +1523,7 @@ enum Fill {
 
 impl NonFinite {
     /// Resolve settings against Decimal or temporal destination once per plan
-    fn compile(rule: &ColumnRule, ast: &TypeAst) -> Result<Self, String> {
+    fn compile(rule: &ColumnRule, ast: &TypeAst, zero_default: bool) -> Result<Self, String> {
         let nullable = ast.view().kind() == Some(Kind::Nullable);
         let inner = types::strip_nullable(ast.view());
         let decimal = decimal_wire_of(ast);
@@ -1535,6 +1535,7 @@ impl NonFinite {
         let bound = format!("{}.{}", "9".repeat(precision - scale), "9".repeat(scale));
         let cell = |key: &str, sub: &Option<Substitute>| {
             let text = match sub {
+                None if zero_default && decimal.is_some() => "0".to_owned(),
                 None | Some(Substitute::Reject) => return Ok(None),
                 Some(Substitute::Null) if nullable => return Ok(Some(Fill::Null)),
                 Some(Substitute::Null) => {
@@ -1819,10 +1820,11 @@ impl TablePlan {
                     "local temporal encoding needs Date32 or DateTime64 matching source type",
                 ));
             }
+            let local = plan.encoding == ColumnEncoding::Local;
             plan.non_finite =
-                NonFinite::compile(&settings, &plan.ast).map_err(|e| config_err(&e))?;
+                NonFinite::compile(&settings, &plan.ast, local).map_err(|e| config_err(&e))?;
             // Oracle cells never pass through substitution
-            if plan.encoding != ColumnEncoding::Local && plan.non_finite != NonFinite::default() {
+            if !local && plan.non_finite != NonFinite::default() {
                 return Err(config_err("substitution needs local encoding"));
             }
             // Attnums past the descriptor still source patched values
@@ -5060,7 +5062,7 @@ mod tests {
             neg_inf: Some(neg_inf.parse()?),
             ..ColumnRule::default()
         };
-        NonFinite::compile(&rule, &ast)
+        NonFinite::compile(&rule, &ast, true)
     }
 
     /// Substitute `text` encoded for Decimal type `ty`
@@ -5081,7 +5083,7 @@ mod tests {
                     pos_inf: Some(action.parse().unwrap()),
                     ..ColumnRule::default()
                 };
-                assert!(NonFinite::compile(&rule, &ast).is_err());
+                assert!(NonFinite::compile(&rule, &ast, true).is_err());
             }
             let nullable = TypeAst::parse(&format!("Nullable({ty})"), alloc).unwrap();
             let nf = NonFinite::compile(
@@ -5091,6 +5093,7 @@ mod tests {
                     ..ColumnRule::default()
                 },
                 &nullable,
+                true,
             )
             .unwrap();
             assert_eq!(nf.pos_inf, Some(Fill::Null));
@@ -5319,6 +5322,10 @@ mod tests {
         m.columns[0].target_type = "Decimal(10, 2)".into();
         let mut row = committed(1, None);
         row.decoded.new.as_mut().expect("insert tuple").columns[0] = Some(build::numeric("NaN"));
+        let zero = Wire::Fixed {
+            width: 8,
+            bytes: &0i64.to_le_bytes(),
+        };
 
         let plan = TablePlan::build(
             alloc,
@@ -5328,24 +5335,34 @@ mod tests {
             &SystemColumns::default(),
         )
         .unwrap();
+        let mut enc = TableEncoder::new(plan).unwrap();
+        enc.append_row(&row, &m, OP_INSERT).unwrap();
+        assert_eq!(enc.buffers[0].wire(), zero, "unset defaults to 0");
+
+        let rules_with = |nan: Substitute| {
+            let mut b = crate::column_rules::ColumnRulesBuilder::new();
+            b.add(
+                &RelName::new("public", "*"),
+                MatchKind::Glob,
+                "*",
+                MatchKind::Glob,
+                ColumnRule {
+                    nan: Some(nan),
+                    ..ColumnRule::default()
+                },
+            );
+            b.finish().0
+        };
+
+        let rules = rules_with(Substitute::Reject);
+        let plan = TablePlan::build(alloc, &rel, &m, &rules, &SystemColumns::default()).unwrap();
         let err = TableEncoder::new(plan)
             .unwrap()
             .append_row(&row, &m, OP_INSERT)
             .unwrap_err();
         assert!(err.to_string().contains("id"), "{err}");
 
-        let mut b = crate::column_rules::ColumnRulesBuilder::new();
-        b.add(
-            &RelName::new("public", "*"),
-            MatchKind::Glob,
-            "*",
-            MatchKind::Glob,
-            ColumnRule {
-                nan: Some(Substitute::Literal("0".into())),
-                ..ColumnRule::default()
-            },
-        );
-        let rules = b.finish().0;
+        let rules = rules_with(Substitute::Literal("0".into()));
         let plan = TablePlan::build(alloc, &rel, &m, &rules, &SystemColumns::default()).unwrap();
         assert_eq!(
             plan.columns[1].non_finite,
@@ -5354,13 +5371,7 @@ mod tests {
         );
         let mut enc = TableEncoder::new(plan).unwrap();
         enc.append_row(&row, &m, OP_INSERT).unwrap();
-        assert_eq!(
-            enc.buffers[0].wire(),
-            Wire::Fixed {
-                width: 8,
-                bytes: &0i64.to_le_bytes(),
-            }
-        );
+        assert_eq!(enc.buffers[0].wire(), zero);
     }
 
     #[test]
