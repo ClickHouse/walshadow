@@ -919,7 +919,8 @@ async fn session_body(
                 .map(|conn| (conn.oid, conn.bridge.clone()))
                 .collect(),
         )
-        .with_xid_ceiling(xid_ceiling),
+        .with_xid_ceiling(xid_ceiling)
+        .with_replay_wake(shadow_state.lock().await.applied()),
     ));
 
     // START_REPLICATION runs after sinks are built so archive fallback can

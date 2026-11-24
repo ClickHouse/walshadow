@@ -312,6 +312,7 @@ pub struct Oracle {
     /// the greenfield throwaway have exactly one shadow to ask
     bridges: Vec<(Oid, Arc<Bridge>)>,
     xid_ceiling: Arc<crate::toast::xid_ceiling::XidCeiling>,
+    replay_wake: Option<crate::pos::Gate<crate::pos::AppliedWake>>,
     pub stats: Arc<OracleStats>,
 }
 
@@ -328,6 +329,7 @@ impl Oracle {
         Self {
             bridges,
             xid_ceiling: Arc::default(),
+            replay_wake: None,
             stats: Arc::new(OracleStats::default()),
         }
     }
@@ -340,6 +342,15 @@ impl Oracle {
 
     pub fn xid_ceiling(&self) -> Arc<crate::toast::xid_ceiling::XidCeiling> {
         self.xid_ceiling.clone()
+    }
+
+    pub fn with_replay_wake(mut self, wake: crate::pos::Gate<crate::pos::AppliedWake>) -> Self {
+        self.replay_wake = Some(wake);
+        self
+    }
+
+    pub fn replay_wake(&self) -> Option<crate::pos::Gate<crate::pos::AppliedWake>> {
+        self.replay_wake.clone()
     }
 
     fn bridge(&self, db: Oid) -> Result<&Arc<Bridge>, OracleError> {

@@ -25,7 +25,7 @@ use crate::decode::heap_decoder::{
 };
 use crate::emit::ch_emitter::{EmitterConfig, EmitterStats, InlineValueOverflow, ToastMode};
 use crate::mimalloc;
-use crate::toast::read_ahead::{PendingReads, ReadValue, retained_bytes};
+use crate::toast::read_ahead::{AHEAD_BATCH, PendingReads, ReadValue, retained_bytes};
 use crate::xact::spill::{BodyRef, BodySpoolFile, ToastChunk, ToastDelete};
 use foldhash::{HashMap, HashMapExt, HashSet, HashSetExt};
 
@@ -417,6 +417,22 @@ pub trait ChunkStore: Send + Sync {
         values: &[(u32, usize)],
         max_lsn: u64,
     ) -> Result<Vec<FetchedValue>, ChunkStoreError>;
+    fn mixed_bounds(&self) -> bool {
+        false
+    }
+    async fn replayed_through(&self, _wait_for: u64) -> Option<u64> {
+        None
+    }
+    async fn fetch_bounded(
+        &self,
+        db_oid: u32,
+        toast_relid: u32,
+        values: &[(u32, usize, u64)],
+    ) -> Result<Vec<FetchedValue>, ChunkStoreError> {
+        let bound = values.iter().map(|v| v.2).max().unwrap_or(0);
+        let ids: Vec<(u32, usize)> = values.iter().map(|v| (v.0, v.1)).collect();
+        self.fetch_many(db_oid, toast_relid, &ids, bound).await
+    }
     /// [`Self::fetch_many`] for one value
     async fn fetch(
         &self,
@@ -1152,6 +1168,104 @@ async fn put_rows_batched(
     put_rows(store, stats, &rows[start..]).await
 }
 
+struct AheadRequest {
+    token: u64,
+    value_id: u32,
+    size: usize,
+    lsn: u64,
+    started: Arc<std::sync::atomic::AtomicBool>,
+    tx: tokio::sync::oneshot::Sender<FetchedValue>,
+}
+
+struct AheadFetch {
+    queued: std::sync::Mutex<HashMap<(u32, u32), Vec<AheadRequest>>>,
+    slots: Arc<tokio::sync::Semaphore>,
+    tokens: AtomicU64,
+    replayed: AtomicU64,
+    polling: std::sync::atomic::AtomicBool,
+    stalls: AtomicU64,
+    progress: tokio::sync::Notify,
+}
+
+struct ReplayPoll<'a>(&'a AheadFetch);
+
+impl Drop for ReplayPoll<'_> {
+    fn drop(&mut self) {
+        self.0.polling.store(false, Ordering::Release);
+        self.0.progress.notify_waiters();
+    }
+}
+
+struct Withdraw<'a> {
+    ahead: &'a AheadFetch,
+    key: (u32, u32),
+    token: u64,
+}
+
+impl Drop for Withdraw<'_> {
+    fn drop(&mut self) {
+        self.ahead.withdraw(self.key, self.token);
+    }
+}
+
+impl AheadFetch {
+    fn new() -> Self {
+        Self {
+            queued: std::sync::Mutex::default(),
+            slots: Arc::new(tokio::sync::Semaphore::new(
+                crate::ops::bridge::MAX_BRIDGE_WORKERS,
+            )),
+            tokens: AtomicU64::new(0),
+            replayed: AtomicU64::new(0),
+            polling: std::sync::atomic::AtomicBool::new(false),
+            stalls: AtomicU64::new(0),
+            progress: tokio::sync::Notify::new(),
+        }
+    }
+
+    fn withdraw(&self, key: (u32, u32), token: u64) -> Option<AheadRequest> {
+        let mut queued = self.queued.lock().expect("ahead fetch");
+        let waiting = queued.get_mut(&key)?;
+        let at = waiting.iter().position(|r| r.token == token)?;
+        let req = waiting.swap_remove(at);
+        if waiting.is_empty() {
+            queued.remove(&key);
+        }
+        Some(req)
+    }
+
+    fn push(&self, key: (u32, u32), req: AheadRequest) {
+        self.queued
+            .lock()
+            .expect("ahead fetch")
+            .entry(key)
+            .or_default()
+            .push(req);
+    }
+
+    fn take(&self, key: (u32, u32), covered: u64) -> Vec<AheadRequest> {
+        let mut queued = self.queued.lock().expect("ahead fetch");
+        let Some(waiting) = queued.remove(&key) else {
+            return Vec::new();
+        };
+        let mut ids = HashSet::new();
+        let mut batch = Vec::new();
+        let mut rest = Vec::new();
+        for req in waiting {
+            if req.lsn <= covered && batch.len() < AHEAD_BATCH && ids.insert(req.value_id) {
+                req.started.store(true, Ordering::Release);
+                batch.push(req);
+            } else {
+                rest.push(req);
+            }
+        }
+        if !rest.is_empty() {
+            queued.insert(key, rest);
+        }
+        batch
+    }
+}
+
 /// TOAST resolution policy and optional store
 #[derive(Clone)]
 pub struct ToastResolver {
@@ -1169,6 +1283,7 @@ pub struct ToastResolver {
     budget: Option<crate::budget::MemoryBudget>,
     /// Pending reads consumed by commit-ordered planning
     ahead: Option<Arc<std::sync::Mutex<PendingReads>>>,
+    coalesce: Option<Arc<AheadFetch>>,
     pending: Arc<tokio::sync::Mutex<PendingMirror>>,
 }
 
@@ -1184,6 +1299,7 @@ impl ToastResolver {
             overflow: InlineValueOverflow::default(),
             budget: None,
             ahead: None,
+            coalesce: None,
             pending: Arc::default(),
         }
     }
@@ -1246,6 +1362,7 @@ impl ToastResolver {
             overflow: emitter.inline_value_overflow,
             budget: None,
             ahead: None,
+            coalesce: None,
             pending: Arc::default(),
         }
     }
@@ -1262,6 +1379,7 @@ impl ToastResolver {
             overflow: InlineValueOverflow::default(),
             budget: None,
             ahead: None,
+            coalesce: None,
             pending: Arc::default(),
         }
     }
@@ -1283,19 +1401,27 @@ impl ToastResolver {
     /// Resident-payload pool, attached at pipeline spawn
     pub fn with_budget(mut self, budget: crate::budget::MemoryBudget) -> Self {
         self.ahead = None;
+        self.coalesce = None;
         self.budget = Some(budget);
         self
     }
 
     pub fn with_read_ahead(mut self) -> Self {
         self.ahead = None;
+        self.coalesce = None;
         if self.fill_on_miss() {
             return self;
         }
         let Some(budget) = self.budget.clone() else {
             return self;
         };
-        let pending = Arc::new(std::sync::Mutex::new(PendingReads::new(budget.clone())));
+        let reads = if self.store.as_ref().is_some_and(|s| s.mixed_bounds()) {
+            self.coalesce = Some(Arc::new(AheadFetch::new()));
+            PendingReads::batched(budget.clone())
+        } else {
+            PendingReads::new(budget.clone())
+        };
+        let pending = Arc::new(std::sync::Mutex::new(reads));
         budget.register_reclaimer(&pending);
         self.ahead = Some(pending);
         self
@@ -1318,11 +1444,11 @@ impl ToastResolver {
             ahead: None,
             ..self.clone()
         };
-        pending.reserve(db_oid, &p, lsn, |mut permit| async move {
+        pending.reserve(db_oid, &p, lsn, |mut permit, started| async move {
             this.stats
                 .toast_values_read_ahead
                 .fetch_add(1, Ordering::Relaxed);
-            let raw = this.read_raw(db_oid, p, lsn).await?;
+            let raw = this.read_raw(db_oid, p, lsn, started).await?;
             let fits = |held: usize| {
                 let need = retained_bytes(held, &p);
                 if need > permit.bytes() {
@@ -1339,21 +1465,119 @@ impl ToastResolver {
         });
     }
 
-    async fn read_raw(&self, db_oid: u32, p: ToastPointer, lsn: u64) -> Option<Vec<u8>> {
+    async fn read_raw(
+        &self,
+        db_oid: u32,
+        p: ToastPointer,
+        lsn: u64,
+        started: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Option<Vec<u8>> {
         // Unflushed mirror rows read as a miss, foreground resolution refetches
-        let got = self
-            .fetch_stored(
+        let got = if let Some(ahead) = &self.coalesce {
+            self.read_coalesced(ahead, db_oid, &p, lsn, started).await
+        } else {
+            self.fetch_stored(
                 db_oid,
                 p.va_toastrelid,
                 &[(p.va_valueid, pointer_extsize(&p))],
                 lsn,
             )
             .await
-            .ok()??;
-        let Some(FetchedValue::Assembled(stored)) = got.into_iter().next() else {
+            .ok()??
+            .into_iter()
+            .next()
+        };
+        let Some(FetchedValue::Assembled(stored)) = got else {
             return None;
         };
         finish_value(&p, stored).ok()
+    }
+
+    async fn read_coalesced(
+        &self,
+        ahead: &Arc<AheadFetch>,
+        db_oid: u32,
+        p: &ToastPointer,
+        lsn: u64,
+        started: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Option<FetchedValue> {
+        let key = (db_oid, p.va_toastrelid);
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        let token = ahead.tokens.fetch_add(1, Ordering::Relaxed);
+        ahead.push(
+            key,
+            AheadRequest {
+                token,
+                value_id: p.va_valueid,
+                size: pointer_extsize(p),
+                lsn,
+                started,
+                tx,
+            },
+        );
+        let _withdraw = Withdraw { ahead, key, token };
+        loop {
+            let slot = tokio::select! {
+                biased;
+                got = &mut rx => return got.ok(),
+                slot = ahead.slots.clone().acquire_owned() => slot.ok()?,
+            };
+            let mut covered = ahead.replayed.load(Ordering::Acquire);
+            if lsn > covered {
+                covered = self.replayed_through(db_oid, 0).await;
+                ahead.replayed.fetch_max(covered, Ordering::AcqRel);
+            }
+            let batch = ahead.take(key, covered);
+            if batch.is_empty() {
+                if covered != 0 && lsn > covered {
+                    drop(slot);
+                    let reached = tokio::select! {
+                        biased;
+                        got = &mut rx => return got.ok(),
+                        reached = self.replay_reaches(ahead, db_oid, lsn) => reached,
+                    };
+                    if !reached {
+                        return None;
+                    }
+                    continue;
+                }
+                let Some(own) = ahead.withdraw(key, token) else {
+                    drop(slot);
+                    return rx.await.ok();
+                };
+                own.started.store(true, Ordering::Release);
+                return self
+                    .fetch_stored(db_oid, key.1, &[(own.value_id, own.size)], own.lsn)
+                    .await
+                    .ok()??
+                    .into_iter()
+                    .next();
+            }
+            let this = self.clone();
+            let shared = ahead.clone();
+            tokio::spawn(async move {
+                let _slot = slot;
+                let mut batch = batch;
+                let values: Vec<(u32, usize, u64)> =
+                    batch.iter().map(|r| (r.value_id, r.size, r.lsn)).collect();
+                let got = {
+                    let abandoned =
+                        futures::future::join_all(batch.iter_mut().map(|r| r.tx.closed()));
+                    tokio::select! {
+                        biased;
+                        _ = abandoned => return,
+                        got = this.fetch_stored_bounded(key.0, key.1, &values) => got,
+                    }
+                };
+                if let Ok(Some(got)) = got {
+                    for (req, value) in batch.into_iter().zip(got) {
+                        let _ = req.tx.send(value);
+                    }
+                } else {
+                    shared.replayed.store(0, Ordering::Release);
+                }
+            });
+        }
     }
 
     /// Speculative read of `p` started ahead of planning, its permit
@@ -1496,22 +1720,75 @@ impl ToastResolver {
         values: &[(u32, usize)],
         max_lsn: u64,
     ) -> Result<Option<Vec<FetchedValue>>, ChunkStoreError> {
+        let bounded: Vec<(u32, usize, u64)> = values
+            .iter()
+            .map(|&(id, size)| (id, size, max_lsn))
+            .collect();
+        self.fetch_stored_bounded(db_oid, toast_relid, &bounded)
+            .await
+    }
+
+    fn store_for(&self, db_oid: u32) -> Result<Option<&Arc<dyn ChunkStore>>, ChunkStoreError> {
         let Some(store) = &self.store else {
+            return Ok(None);
+        };
+        Ok(Some(match &self.database_stores {
+            Some(stores) => stores.get(&db_oid).ok_or_else(|| {
+                ChunkStoreError::Shadow(format!("no TOAST store for database {db_oid}"))
+            })?,
+            None => store,
+        }))
+    }
+
+    async fn replayed_through(&self, db_oid: u32, wait_for: u64) -> u64 {
+        if let Ok(Some(store)) = self.store_for(db_oid)
+            && let Some(at) = store.replayed_through(wait_for).await
+        {
+            at
+        } else {
+            0
+        }
+    }
+
+    async fn replay_reaches(&self, ahead: &AheadFetch, db_oid: u32, lsn: u64) -> bool {
+        let stalls = ahead.stalls.load(Ordering::Acquire);
+        loop {
+            let progress = ahead.progress.notified();
+            let seen = ahead.replayed.load(Ordering::Acquire);
+            if seen >= lsn {
+                return true;
+            }
+            if ahead.stalls.load(Ordering::Acquire) != stalls {
+                return false;
+            }
+            if ahead.polling.swap(true, Ordering::AcqRel) {
+                progress.await;
+                continue;
+            }
+            let _poll = ReplayPoll(ahead);
+            let at = self.replayed_through(db_oid, seen + 1).await;
+            if at == 0 {
+                ahead.stalls.fetch_add(1, Ordering::AcqRel);
+                return false;
+            }
+            ahead.replayed.fetch_max(at, Ordering::AcqRel);
+        }
+    }
+
+    async fn fetch_stored_bounded(
+        &self,
+        db_oid: u32,
+        toast_relid: u32,
+        values: &[(u32, usize, u64)],
+    ) -> Result<Option<Vec<FetchedValue>>, ChunkStoreError> {
+        let Some(store) = self.store_for(db_oid)? else {
             return Ok(None);
         };
         if values.is_empty() {
             return Ok(Some(Vec::new()));
         }
-        let store = match &self.database_stores {
-            Some(stores) => stores.get(&db_oid).ok_or_else(|| {
-                ChunkStoreError::Shadow(format!("no TOAST store for database {db_oid}"))
-            })?,
-            None => store,
-        };
         let started = std::time::Instant::now();
-        let got = store
-            .fetch_many(db_oid, toast_relid, values, max_lsn)
-            .await?;
+        let got = store.fetch_bounded(db_oid, toast_relid, values).await?;
         self.stats
             .toast_value_fetch_nanos
             .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -3107,6 +3384,294 @@ mod tests {
             .expect("read ahead resumes after foreground reclaim");
             assert!(resolver.pending().unwrap().take(0, &next, 2).is_some());
         }
+    }
+
+    struct Coalescing {
+        body: Vec<u8>,
+        gate: tokio::sync::Semaphore,
+        replayed: AtomicU64,
+        stuck: std::sync::atomic::AtomicBool,
+        refuse: bool,
+        batches: std::sync::Mutex<Vec<Vec<(u32, u64)>>>,
+    }
+
+    #[async_trait]
+    impl ChunkStore for Coalescing {
+        async fn fetch_many(
+            &self,
+            _: u32,
+            _: u32,
+            values: &[(u32, usize)],
+            _: u64,
+        ) -> Result<Vec<FetchedValue>, ChunkStoreError> {
+            self.gate.acquire().await.unwrap().forget();
+            if self.refuse && values.len() > 1 {
+                return Err(ChunkStoreError::Shadow("refused".into()));
+            }
+            Ok(values.iter().map(|_| assembled(&self.body)).collect())
+        }
+        fn mixed_bounds(&self) -> bool {
+            true
+        }
+        async fn replayed_through(&self, wait_for: u64) -> Option<u64> {
+            while self.replayed.load(Ordering::Relaxed) < wait_for {
+                if self.stuck.load(Ordering::Relaxed) {
+                    return None;
+                }
+                tokio::task::yield_now().await;
+            }
+            Some(self.replayed.load(Ordering::Relaxed))
+        }
+        async fn fetch_bounded(
+            &self,
+            db_oid: u32,
+            toast_relid: u32,
+            values: &[(u32, usize, u64)],
+        ) -> Result<Vec<FetchedValue>, ChunkStoreError> {
+            self.batches
+                .lock()
+                .unwrap()
+                .push(values.iter().map(|v| (v.0, v.2)).collect());
+            let ids: Vec<(u32, usize)> = values.iter().map(|v| (v.0, v.1)).collect();
+            self.fetch_many(db_oid, toast_relid, &ids, 0).await
+        }
+    }
+
+    fn coalescing(refuse: bool) -> (Arc<Coalescing>, ToastResolver, Vec<u8>) {
+        let mut body = 0x5000_0001u32.to_le_bytes().to_vec();
+        body.extend_from_slice(&64u32.to_le_bytes());
+        body.extend_from_slice(&[1; 64]);
+        let store = Arc::new(Coalescing {
+            body: body.clone(),
+            gate: tokio::sync::Semaphore::new(0),
+            replayed: AtomicU64::new(120),
+            stuck: std::sync::atomic::AtomicBool::new(false),
+            refuse,
+            batches: std::sync::Mutex::default(),
+        });
+        let r = ToastResolver::with_store(store.clone(), Arc::new(EmitterStats::default()))
+            .with_budget(crate::budget::MemoryBudget::with_leaf_reserve(
+                8 << 20,
+                32 << 10,
+            ))
+            .with_read_ahead();
+        (store, r, body)
+    }
+
+    fn coalesced_pointer(body: &[u8], id: u32) -> ToastPointer {
+        ToastPointer {
+            va_rawsize: body.len() as i32 + VARHDRSZ,
+            va_extinfo: body.len() as u32,
+            va_valueid: id,
+            va_toastrelid: 16500,
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn refused_batch_leaves_its_reads_to_planning() {
+        let (store, r, body) = coalescing(true);
+        let pointer = |id: u32| coalesced_pointer(&body, id);
+        let leaders = crate::ops::bridge::MAX_BRIDGE_WORKERS as u32;
+        let total = leaders + 4;
+        for id in 1..=total {
+            r.read_ahead(0, pointer(id), 100 + id as u64);
+        }
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+        let cached = || {
+            r.coalesce
+                .as_ref()
+                .unwrap()
+                .replayed
+                .load(Ordering::Acquire)
+        };
+        assert_eq!(cached(), 120);
+        store.gate.add_permits(1024);
+        for _ in 0..256 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(cached(), 0);
+        for id in leaders + 1..=total {
+            let slot = r.pending().unwrap().take(0, &pointer(id), 100 + id as u64);
+            assert!(slot.unwrap().take().await.is_none());
+        }
+        let slot = r.pending().unwrap().take(0, &pointer(1), 101);
+        assert!(slot.unwrap().take().await.is_some());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reads_past_replay_leave_slots_to_readable_values() {
+        let (store, r, body) = coalescing(false);
+        let pointer = |id: u32| coalesced_pointer(&body, id);
+        store.gate.add_permits(1024);
+        let late = crate::ops::bridge::MAX_BRIDGE_WORKERS as u32 + 2;
+        for id in 1..=late {
+            r.read_ahead(0, pointer(id), 200 + id as u64);
+        }
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+        let free = || r.coalesce.as_ref().unwrap().slots.available_permits();
+        assert_eq!(free(), crate::ops::bridge::MAX_BRIDGE_WORKERS);
+        assert!(store.batches.lock().unwrap().is_empty());
+        r.read_ahead(0, pointer(99), 110);
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+        let slot = r.pending().unwrap().take(0, &pointer(99), 110);
+        assert!(slot.unwrap().take().await.is_some());
+        assert_eq!(*store.batches.lock().unwrap(), vec![vec![(99, 110)]]);
+        store.replayed.store(1000, Ordering::Relaxed);
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+        for id in 1..=late {
+            let slot = r.pending().unwrap().take(0, &pointer(id), 200 + id as u64);
+            assert!(slot.unwrap().take().await.is_some());
+        }
+        let batches = store.batches.lock().unwrap();
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[1].len(), late as usize);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stalled_replay_fails_every_waiting_read() {
+        let (store, r, body) = coalescing(false);
+        let pointer = |id: u32| coalesced_pointer(&body, id);
+        for id in 1..=3u32 {
+            r.read_ahead(0, pointer(id), 200 + id as u64);
+        }
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+        store.stuck.store(true, Ordering::Relaxed);
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            r.coalesce.as_ref().unwrap().stalls.load(Ordering::Acquire),
+            1
+        );
+        for id in 1..=3u32 {
+            let slot = r.pending().unwrap().take(0, &pointer(id), 200 + id as u64);
+            assert!(slot.unwrap().take().await.is_none());
+        }
+        assert!(store.batches.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn batch_stops_once_every_read_is_dropped() {
+        let (store, r, body) = coalescing(false);
+        for id in 1..=12u32 {
+            r.read_ahead(0, coalesced_pointer(&body, id), 100 + id as u64);
+        }
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+        let free = || r.coalesce.as_ref().unwrap().slots.available_permits();
+        assert_eq!(free(), 0);
+        r.pending().unwrap().clear();
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(free(), crate::ops::bridge::MAX_BRIDGE_WORKERS);
+        assert_eq!(store.gate.available_permits(), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn store_without_replay_position_reads_each_value_alone() {
+        struct Blind(std::sync::Mutex<Vec<usize>>);
+        #[async_trait]
+        impl ChunkStore for Blind {
+            async fn fetch_many(
+                &self,
+                _: u32,
+                _: u32,
+                values: &[(u32, usize)],
+                _: u64,
+            ) -> Result<Vec<FetchedValue>, ChunkStoreError> {
+                self.0.lock().unwrap().push(values.len());
+                Err(ChunkStoreError::Shadow("down".into()))
+            }
+            fn mixed_bounds(&self) -> bool {
+                true
+            }
+        }
+        let store = Arc::new(Blind(std::sync::Mutex::default()));
+        let r = ToastResolver::with_store(store.clone(), Arc::new(EmitterStats::default()))
+            .with_budget(crate::budget::MemoryBudget::with_leaf_reserve(
+                8 << 20,
+                32 << 10,
+            ))
+            .with_read_ahead();
+        let pointer = |id: u32| coalesced_pointer(&[0; 72], id);
+        for id in 1..=3 {
+            r.read_ahead(0, pointer(id), 100 + id as u64);
+        }
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(*store.0.lock().unwrap(), vec![1, 1, 1]);
+        for id in 1..=3 {
+            let slot = r.pending().unwrap().take(0, &pointer(id), 100 + id as u64);
+            assert!(slot.unwrap().take().await.is_none());
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn queued_reads_of_one_relation_share_round_trips() {
+        let (store, r, body) = coalescing(false);
+        let pointer = |id: u32| coalesced_pointer(&body, id);
+        let total = 31u32;
+        for id in 1..=total {
+            r.read_ahead(0, pointer(id), 100 + id as u64);
+        }
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+        let leaders = crate::ops::bridge::MAX_BRIDGE_WORKERS;
+        assert_eq!(store.batches.lock().unwrap().len(), leaders);
+        let queued = r
+            .pending()
+            .unwrap()
+            .take(0, &pointer(total), 100 + total as u64);
+        assert!(queued.unwrap().take().await.is_none());
+        store.gate.add_permits(1024);
+        for _ in 0..256 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            store
+                .batches
+                .lock()
+                .unwrap()
+                .iter()
+                .flatten()
+                .all(|&(_, lsn)| lsn <= 120)
+        );
+        store.replayed.store(1000, Ordering::Relaxed);
+        for _ in 0..256 {
+            tokio::task::yield_now().await;
+        }
+        for id in 1..total {
+            let slot = r.pending().unwrap().take(0, &pointer(id), 100 + id as u64);
+            let ReadValue { value, .. } = slot.unwrap().take().await.expect("value read");
+            assert_eq!(value, build::bytes(&body));
+        }
+        let batches = store.batches.lock().unwrap();
+        let shared: Vec<usize> = batches.iter().map(Vec::len).filter(|&n| n > 1).collect();
+        assert_eq!(shared, vec![20 - leaders, 10]);
+        assert!(
+            batches
+                .iter()
+                .flatten()
+                .all(|&(id, lsn)| lsn == 100 + id as u64)
+        );
+        let mut seen: Vec<(u32, u64)> = batches.iter().flatten().copied().collect();
+        seen.sort_unstable();
+        let want: Vec<(u32, u64)> = (1..total).map(|id| (id, 100 + id as u64)).collect();
+        assert_eq!(seen, want);
     }
 
     /// Values read ahead hold their stored bytes, whatever their type renders to

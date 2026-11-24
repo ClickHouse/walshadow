@@ -589,6 +589,7 @@ async fn chunks_younger_than_the_ceiling_read_as_a_later_generation() {
         ShadowToastStore::late(ShadowRead {
             bridge: bound(bridge.clone()),
             ceiling,
+            applied: None,
         })
     };
 
