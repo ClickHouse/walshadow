@@ -515,7 +515,7 @@ async fn drop_retire_survives_restart_from_ledger() {
     pipeline.shutdown().await.expect("first pipeline drains");
     assert_eq!(stats.toast_mirror_retires.load(Ordering::Relaxed), 0);
     assert_eq!(
-        walshadow::toast_retire::RetireLedger::load(&spill_dir, system_id, None)
+        walshadow::toast_retire::RetireLedger::load(&spill_dir, system_id)
             .await
             .expect("read ledger")
             .entries()
@@ -546,7 +546,7 @@ async fn drop_retire_survives_restart_from_ledger() {
         1
     );
     assert!(
-        walshadow::toast_retire::RetireLedger::load(&spill_dir, system_id, None)
+        walshadow::toast_retire::RetireLedger::load(&spill_dir, system_id)
             .await
             .expect("read ledger")
             .is_empty(),

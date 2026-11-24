@@ -373,13 +373,6 @@ named `pg_toast_<database oid>_<toast relation oid>`. Database OIDs keep mirror
 names stable across `ALTER DATABASE ... RENAME` and separate mirrors from
 databases that reuse relation OIDs.
 
-Older binaries named mirrors `pg_toast_<toast relation oid>`. When following
-only `[source] dbname`, startup renames these mirrors to include its database
-OID. When following multiple databases, startup fails if any old mirror names
-remain, because those mirrors may contain data from more than one database.
-Start once following only their original source database to rename them, or
-drop them and bootstrap tables with external TOAST values again.
-
 Missing required mirror tables stop replication. Do not delete active mirrors
 to reduce disk use. Relation-drop cleanup can leave empty mirror tables until
 operator cleanup; retain them while any restart can still reread older referring

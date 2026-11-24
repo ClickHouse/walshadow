@@ -949,7 +949,7 @@ async fn build_pipeline_inner(
         WAL_SEG_SIZE,
     ))));
     let system_id = ident.system_id;
-    let retires = walshadow::toast_retire::RetireLedger::load(&spill_dir, system_id, None)
+    let retires = walshadow::toast_retire::RetireLedger::load(&spill_dir, system_id)
         .await
         .expect("load toast retire ledger");
     let pending_rows = walshadow::visibility_pending::PendingLedger::load(&spill_dir, system_id)

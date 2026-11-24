@@ -764,7 +764,6 @@ async fn save(frag: &Fragment, root: &Table) -> Result<()> {
     .with_context(|| format!("write {}", frag.path().display()))
 }
 
-// TODO: use daemon catalog rather than a second connection per request
 /// `dbname` names one of the config's databases; `None` takes `[source] dbname`
 async fn pg_connect(root: &Table, dbname: Option<&str>) -> Result<Client> {
     let conn = SourceConn::from_table(root).map_err(|e| anyhow::anyhow!("[source] {e}"))?;

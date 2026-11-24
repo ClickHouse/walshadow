@@ -29,10 +29,7 @@
 //!
 //! Write atomically with [`crate::fs::write_atomic`]. Reject corrupt files
 //! and files from another source system. Treating them as empty would lose
-//! pending cleanup and leave unused mirrors behind. Rewrite older files
-//! without `system_id` to include it. Version 1 entries also lack database
-//! OIDs; assign them to sole followed database and rewrite file, matching
-//! [`crate::toast::adopt_legacy_mirrors`]
+//! pending cleanup and leave unused mirrors behind
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -47,10 +44,6 @@ pub const RETIRE_LEDGER_FILENAME: &str = "toast_retires.toml";
 /// Bump on any schema change; load rejects mismatched versions.
 pub const RETIRE_LEDGER_VERSION: u32 = 2;
 
-/// Identify older entries that lack database OIDs
-// TODO(0.2.0): remove with legacy loading after 0.1.x ledgers migrate
-const LEGACY_LEDGER_VERSION: u32 = 1;
-
 #[derive(Debug, Error)]
 pub enum RetireLedgerError {
     #[error("io: {0}")]
@@ -61,30 +54,18 @@ pub enum RetireLedgerError {
     Ser(#[from] toml::ser::Error),
     #[error("unsupported ledger schema version {0} (this build expects {RETIRE_LEDGER_VERSION})")]
     Version(u32),
-    #[error(
-        "version {LEGACY_LEDGER_VERSION} ledger lacks source database OIDs; start once \
-         following only its original source database"
-    )]
-    LegacyOwner,
 }
 
 pub fn ledger_path(spill_dir: &Path) -> PathBuf {
     spill_dir.join(RETIRE_LEDGER_FILENAME)
 }
 
-#[derive(Deserialize)]
-struct LegacyEntry {
-    toast_relid: u32,
-    commit_lsn: Pos<Commit>,
-}
-
 #[derive(Serialize, Deserialize)]
-struct RetireFile<E = RetireEntry> {
+struct RetireFile {
     version: u32,
-    #[serde(default)]
-    system_id: Option<u64>,
+    system_id: u64,
     #[serde(default = "Vec::new")]
-    retire: Vec<E>,
+    retire: Vec<RetireEntry>,
 }
 
 /// Record source TOAST relation dropped at `commit_lsn` for later mirror cleanup
@@ -104,51 +85,26 @@ pub struct RetireLedger {
 }
 
 impl RetireLedger {
-    /// Load pending cleanup; return empty ledger if file is absent, error if corrupt.
-    /// Use `legacy_owner` as database OID for older entries when following one database
-    pub async fn load(
-        spill_dir: &Path,
-        system_id: u64,
-        legacy_owner: Option<u32>,
-    ) -> Result<Self, RetireLedgerError> {
-        let mut ledger = Self {
+    /// Load pending cleanup; return empty ledger if file is absent, error if corrupt
+    pub async fn load(spill_dir: &Path, system_id: u64) -> Result<Self, RetireLedgerError> {
+        let path = ledger_path(spill_dir);
+        let entries = match tokio::fs::read_to_string(&path).await {
+            Ok(text) => {
+                let file: RetireFile = toml::from_str(&text)?;
+                crate::fs::check_source(&path, Some(file.system_id), system_id)?;
+                if file.version != RETIRE_LEDGER_VERSION {
+                    return Err(RetireLedgerError::Version(file.version));
+                }
+                file.retire
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
+            Err(e) => return Err(e.into()),
+        };
+        Ok(Self {
             dir: spill_dir.to_path_buf(),
             system_id,
-            entries: Vec::new(),
-        };
-        let path = ledger_path(spill_dir);
-        match tokio::fs::read_to_string(&path).await {
-            Ok(text) => {
-                let file: RetireFile<toml::Value> = toml::from_str(&text)?;
-                let unstamped = crate::fs::check_source(&path, file.system_id, system_id)?;
-                ledger.entries = match file.version {
-                    RETIRE_LEDGER_VERSION => file
-                        .retire
-                        .into_iter()
-                        .map(toml::Value::try_into)
-                        .collect::<Result<_, _>>()?,
-                    LEGACY_LEDGER_VERSION => file
-                        .retire
-                        .into_iter()
-                        .map(|v| {
-                            let e: LegacyEntry = v.try_into()?;
-                            Ok(RetireEntry {
-                                db_oid: legacy_owner.ok_or(RetireLedgerError::LegacyOwner)?,
-                                toast_relid: e.toast_relid,
-                                commit_lsn: e.commit_lsn,
-                            })
-                        })
-                        .collect::<Result<_, RetireLedgerError>>()?,
-                    v => return Err(RetireLedgerError::Version(v)),
-                };
-                if unstamped || file.version == LEGACY_LEDGER_VERSION {
-                    ledger.persist().await?;
-                }
-            }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e.into()),
-        }
-        Ok(ledger)
+            entries,
+        })
     }
 
     pub fn is_empty(&self) -> bool {
@@ -193,7 +149,7 @@ impl RetireLedger {
     async fn persist(&self) -> Result<(), RetireLedgerError> {
         let file = RetireFile {
             version: RETIRE_LEDGER_VERSION,
-            system_id: Some(self.system_id),
+            system_id: self.system_id,
             retire: self.entries.clone(),
         };
         let text = toml::to_string(&file)?;
@@ -218,20 +174,20 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn foreign_source_is_error_and_unstamped_file_upgrades() {
+    async fn foreign_or_unstamped_source_is_error() {
         let tmp = tempdir().unwrap();
+        let body = "\n[[retire]]\ndb_oid = 5\ntoast_relid = 1\ncommit_lsn = \"0/10\"\n";
+        std::fs::write(ledger_path(tmp.path()), format!("version = 2\n{body}")).unwrap();
+        let err = RetireLedger::load(tmp.path(), SYSID).await.unwrap_err();
+        assert!(matches!(err, RetireLedgerError::Parse(_)), "{err:?}");
         std::fs::write(
             ledger_path(tmp.path()),
-            "version = 2\n\n[[retire]]\ndb_oid = 5\ntoast_relid = 1\ncommit_lsn = \"0/10\"\n",
+            format!("version = 2\nsystem_id = {SYSID}\n{body}"),
         )
         .unwrap();
-        let ledger = RetireLedger::load(tmp.path(), SYSID, None).await.unwrap();
+        let ledger = RetireLedger::load(tmp.path(), SYSID).await.unwrap();
         assert_eq!(ledger.entries(), &[entry(1, 0x10)]);
-        let text = std::fs::read_to_string(ledger_path(tmp.path())).unwrap();
-        assert!(text.contains(&format!("system_id = {SYSID}")), "{text}");
-        let err = RetireLedger::load(tmp.path(), SYSID + 1, None)
-            .await
-            .unwrap_err();
+        let err = RetireLedger::load(tmp.path(), SYSID + 1).await.unwrap_err();
         assert!(matches!(err, RetireLedgerError::Io(_)), "{err:?}");
         assert!(
             err.to_string().contains("belongs to source system"),
@@ -244,12 +200,10 @@ mod tests {
     async fn unreadable_ledger_errors_and_absent_remove_noops() {
         let tmp = tempdir().unwrap();
         std::fs::create_dir(ledger_path(tmp.path())).unwrap();
-        let err = RetireLedger::load(tmp.path(), SYSID, None)
-            .await
-            .unwrap_err();
+        let err = RetireLedger::load(tmp.path(), SYSID).await.unwrap_err();
         assert!(matches!(err, RetireLedgerError::Io(_)), "{err:?}");
         std::fs::remove_dir(ledger_path(tmp.path())).unwrap();
-        let mut ledger = RetireLedger::load(tmp.path(), SYSID, None).await.unwrap();
+        let mut ledger = RetireLedger::load(tmp.path(), SYSID).await.unwrap();
         ledger.remove(entry(1, 0x10)).await.unwrap();
         assert!(
             !ledger_path(tmp.path()).exists(),
@@ -257,50 +211,17 @@ mod tests {
         );
     }
 
-    /// Require one followed database to migrate nonempty version 1 ledgers
-    #[tokio::test(flavor = "current_thread")]
-    async fn legacy_entries_take_the_sole_database() {
-        let tmp = tempdir().unwrap();
-        let legacy = format!(
-            "version = 1\nsystem_id = {SYSID}\n\n[[retire]]\ntoast_relid = 1\n\
-             commit_lsn = \"0/10\"\n"
-        );
-        std::fs::write(ledger_path(tmp.path()), &legacy).unwrap();
-        let err = RetireLedger::load(tmp.path(), SYSID, None)
-            .await
-            .unwrap_err();
-        assert!(matches!(err, RetireLedgerError::LegacyOwner), "{err:?}");
-        let ledger = RetireLedger::load(tmp.path(), SYSID, Some(5))
-            .await
-            .unwrap();
-        assert_eq!(ledger.entries(), &[entry(1, 0x10)]);
-        let reloaded = RetireLedger::load(tmp.path(), SYSID, None).await.unwrap();
-        assert_eq!(reloaded.entries(), &[entry(1, 0x10)], "rewritten as v2");
-        std::fs::write(
-            ledger_path(tmp.path()),
-            format!("version = 1\nsystem_id = {SYSID}\n"),
-        )
-        .unwrap();
-        assert!(
-            RetireLedger::load(tmp.path(), SYSID, None)
-                .await
-                .unwrap()
-                .is_empty(),
-            "empty legacy ledger needs no owner",
-        );
-    }
-
     #[tokio::test(flavor = "current_thread")]
     async fn load_absent_is_empty() {
         let tmp = tempdir().unwrap();
-        let ledger = RetireLedger::load(tmp.path(), SYSID, None).await.unwrap();
+        let ledger = RetireLedger::load(tmp.path(), SYSID).await.unwrap();
         assert!(ledger.is_empty());
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn push_persists_and_reloads() {
         let tmp = tempdir().unwrap();
-        let mut ledger = RetireLedger::load(tmp.path(), SYSID, None).await.unwrap();
+        let mut ledger = RetireLedger::load(tmp.path(), SYSID).await.unwrap();
         ledger.push(entry(16500, 0x1000)).await.unwrap();
         ledger.push(entry(16600, 0x2000)).await.unwrap();
         assert!(
@@ -309,7 +230,7 @@ mod tests {
                 .exists(),
             "rename must clean up the .tmp sidecar",
         );
-        let reloaded = RetireLedger::load(tmp.path(), SYSID, None).await.unwrap();
+        let reloaded = RetireLedger::load(tmp.path(), SYSID).await.unwrap();
         assert_eq!(
             reloaded.entries(),
             &[entry(16500, 0x1000), entry(16600, 0x2000)]
@@ -319,29 +240,29 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn push_dedups_replayed_drop() {
         let tmp = tempdir().unwrap();
-        let mut ledger = RetireLedger::load(tmp.path(), SYSID, None).await.unwrap();
+        let mut ledger = RetireLedger::load(tmp.path(), SYSID).await.unwrap();
         ledger.push(entry(16500, 0x1000)).await.unwrap();
         ledger.push(entry(16500, 0x1000)).await.unwrap();
         assert_eq!(ledger.entries(), &[entry(16500, 0x1000)]);
-        let reloaded = RetireLedger::load(tmp.path(), SYSID, None).await.unwrap();
+        let reloaded = RetireLedger::load(tmp.path(), SYSID).await.unwrap();
         assert_eq!(reloaded.entries(), &[entry(16500, 0x1000)]);
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn remove_persists() {
         let tmp = tempdir().unwrap();
-        let mut ledger = RetireLedger::load(tmp.path(), SYSID, None).await.unwrap();
+        let mut ledger = RetireLedger::load(tmp.path(), SYSID).await.unwrap();
         ledger.push(entry(16500, 0x1000)).await.unwrap();
         ledger.push(entry(16600, 0x2000)).await.unwrap();
         ledger.remove(entry(16500, 0x1000)).await.unwrap();
-        let reloaded = RetireLedger::load(tmp.path(), SYSID, None).await.unwrap();
+        let reloaded = RetireLedger::load(tmp.path(), SYSID).await.unwrap();
         assert_eq!(reloaded.entries(), &[entry(16600, 0x2000)]);
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn due_filters_below_cut() {
         let tmp = tempdir().unwrap();
-        let mut ledger = RetireLedger::load(tmp.path(), SYSID, None).await.unwrap();
+        let mut ledger = RetireLedger::load(tmp.path(), SYSID).await.unwrap();
         ledger.push(entry(1, 0x1000)).await.unwrap();
         ledger.push(entry(2, 0x2000)).await.unwrap();
         ledger.push(entry(3, 0x3000)).await.unwrap();
@@ -353,12 +274,10 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn corrupt_file_is_error_not_empty() {
         let tmp = tempdir().unwrap();
-        let mut ledger = RetireLedger::load(tmp.path(), SYSID, None).await.unwrap();
+        let mut ledger = RetireLedger::load(tmp.path(), SYSID).await.unwrap();
         ledger.push(entry(16500, 0x1000)).await.unwrap();
         std::fs::write(ledger_path(tmp.path()), "version = 2\n[[retire").unwrap();
-        let err = RetireLedger::load(tmp.path(), SYSID, None)
-            .await
-            .unwrap_err();
+        let err = RetireLedger::load(tmp.path(), SYSID).await.unwrap_err();
         assert!(matches!(err, RetireLedgerError::Parse(_)), "{err:?}");
     }
 
@@ -370,19 +289,19 @@ mod tests {
             "version = 2\n\n[[retire]]\ndb_oid = 5\ntoast_relid = 1\ncommit_lsn = \"nope\"\n",
         )
         .unwrap();
-        let err = RetireLedger::load(tmp.path(), SYSID, None)
-            .await
-            .unwrap_err();
+        let err = RetireLedger::load(tmp.path(), SYSID).await.unwrap_err();
         assert!(matches!(err, RetireLedgerError::Parse(_)), "{err:?}");
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn wrong_version_is_error() {
         let tmp = tempdir().unwrap();
-        std::fs::write(ledger_path(tmp.path()), "version = 999\n").unwrap();
-        let err = RetireLedger::load(tmp.path(), SYSID, None)
-            .await
-            .unwrap_err();
+        std::fs::write(
+            ledger_path(tmp.path()),
+            format!("version = 999\nsystem_id = {SYSID}\n"),
+        )
+        .unwrap();
+        let err = RetireLedger::load(tmp.path(), SYSID).await.unwrap_err();
         assert!(matches!(err, RetireLedgerError::Version(999)), "{err:?}");
     }
 
@@ -395,7 +314,7 @@ mod tests {
         use crate::source::manifest::resolved_floor;
         let n = 7 * SEG;
         let tmp = tempdir().unwrap();
-        let mut ledger = RetireLedger::load(tmp.path(), SYSID, None).await.unwrap();
+        let mut ledger = RetireLedger::load(tmp.path(), SYSID).await.unwrap();
         ledger.push(entry(16500, n + SEG + 42)).await.unwrap();
         assert!(
             ledger
