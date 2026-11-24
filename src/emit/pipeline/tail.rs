@@ -318,7 +318,7 @@ pub async fn spawn_with_config(
 ) -> Result<(mpsc::Sender<BatcherMsg>, AckHandle, TailParts), EmitterError> {
     let n = inserter_pool_size.max(1);
 
-    let (ack, collector) = ack::spawn(emitter_ack, fatal.clone());
+    let (ack, collector) = ack::spawn_observed(emitter_ack, fatal.clone(), Some(stats.clone()));
     let collector = AbortOnDropHandle::new(collector);
 
     // Rows and FlushAll share one FIFO channel so a flush can't overtake rows

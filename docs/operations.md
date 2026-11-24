@@ -75,6 +75,21 @@ under-reports during archive catch-up or a restart catch-up.
 source idleness as lag. The two views answer different questions: bytes say how
 much WAL is still to process, seconds say how stale the destination is.
 
+`walshadow_replication_latency_seconds` is a histogram of the delay of each
+transaction: the time from its commit on the source to ClickHouse confirming
+it, observed once per confirmed commit. Read it as quantiles:
+
+```promql
+histogram_quantile(0.99, sum by (le) (rate(walshadow_replication_latency_seconds_bucket[5m])))
+```
+
+Buckets run from 1 ms doubling to 131 s. The commit time comes from the
+source's clock and the confirmation time from the walshadow host's, so clock
+skew between the two shifts every sample by the same amount. Commits delivered
+during an archive catch-up are counted at their true delay, which lands in the
+top buckets. Initial loads and table backfills are not counted. It has no
+samples while the source commits nothing.
+
 Set `--metrics-bind` to expose OpenMetrics text metrics, which Prometheus
 scrapes directly. Counter series carry `_total`. Docker deployment uses port
 9484 and includes optional provisioned dashboard

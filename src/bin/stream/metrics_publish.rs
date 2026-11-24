@@ -606,6 +606,9 @@ pub(crate) fn stage_gauges_on(v: &StageCounters<'_>, base: MetricsSnapshot) -> M
         toast_values_per_fetch: v.emitter.map_or_else(HistogramSnapshot::default, |s| {
             s.toast_values_per_fetch.snapshot(1.0)
         }),
+        replication_latency_seconds: v.emitter.map_or_else(HistogramSnapshot::default, |s| {
+            s.replication_latency.snapshot(1e6)
+        }),
         toast_image_rows_mirrored_total: emitter(|s| &s.toast_image_rows_mirrored),
         toast_values_filled_superseded_total: emitter(|s| &s.toast_values_filled_superseded),
         toast_values_filled_mismatch_total: emitter(|s| &s.toast_values_filled_mismatch),
