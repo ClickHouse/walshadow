@@ -478,6 +478,8 @@ snapshot! {
         "Cumulative wall-clock planning spent waiting on values read ahead of it, apart from the store time those reads count in toast_value_fetch_seconds.",
     histogram toast_values_per_fetch: HistogramSnapshot =
         "Values requested per chunk-store fetch round trip; the distribution behind the batching factor toast_values_fetched_total / toast_value_fetch_batches_total.",
+    histogram replication_latency_seconds: HistogramSnapshot =
+        "Seconds from a transaction's commit on the source to ClickHouse confirming it, one observation per confirmed commit: 1ms doubling to 131s. The commit time is the source's clock and the confirmation time is this host's, so clock skew between them shifts every sample. Commits delivered during an archive catch-up are counted at their true, large delay. Initial loads and table backfills are not counted.",
     counter toast_image_rows_mirrored_total: u64 =
         "Chunk rows mirrored from restored page images during a backup window; non-zero means the backup copied TOAST pages mid-write.",
     counter toast_values_filled_superseded_total: u64 =

@@ -21,6 +21,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
@@ -28,6 +29,7 @@ use tokio::task::JoinHandle;
 use crate::ch::EndOfStream;
 #[cfg(feature = "test-support")]
 use crate::crash_test;
+use crate::emit::ch_emitter::EmitterStats;
 use crate::emit::pipeline::Fatal;
 use crate::pos::{AckFrontier, EmitterAck, Gate, GateClosed, Monotone, Pos};
 use crate::record::SinkError;
@@ -165,6 +167,15 @@ pub struct AckState {
     probe_tx: watch::Sender<AckSnapshot>,
     /// Tripped on first protocol fault so barrier waits fail instead of hanging
     fatal: Fatal,
+    stats: Option<Arc<EmitterStats>>,
+}
+
+fn micros_since_commit(commit_ts: i64) -> u64 {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_micros() as i64);
+    let committed = commit_ts.saturating_add(walrus::pg::replication::PG_EPOCH_USEC);
+    now.saturating_sub(committed).max(0) as u64
 }
 
 impl AckState {
@@ -173,6 +184,7 @@ impl AckState {
         frontier_cell: Monotone<AckFrontier>,
         probe_tx: watch::Sender<AckSnapshot>,
         fatal: Fatal,
+        stats: Option<Arc<EmitterStats>>,
     ) -> Self {
         Self {
             map: BTreeMap::new(),
@@ -187,6 +199,7 @@ impl AckState {
             late: 0,
             probe_tx,
             fatal,
+            stats,
         }
     }
 
@@ -282,6 +295,13 @@ impl AckState {
             if publish {
                 self.watermark = self.watermark.max(commit_lsn);
                 self.watermark_ts = self.watermark_ts.max(commit_ts);
+                if let Some(stats) = &self.stats
+                    && let Some(commit_ts) = commit_ts
+                {
+                    stats
+                        .replication_latency
+                        .observe(micros_since_commit(commit_ts));
+                }
             }
             self.frontier += 1;
         }
@@ -508,11 +528,19 @@ impl OpenSeq {
 /// Spawn the collector actor. When all [`AckHandle`] clones drop it drains
 /// and exits, completing the [`JoinHandle`]. A protocol fault sets `fatal`
 pub fn spawn(emitter_ack: Arc<Monotone<EmitterAck>>, fatal: Fatal) -> (AckHandle, JoinHandle<()>) {
+    spawn_observed(emitter_ack, fatal, None)
+}
+
+pub fn spawn_observed(
+    emitter_ack: Arc<Monotone<EmitterAck>>,
+    fatal: Fatal,
+    stats: Option<Arc<EmitterStats>>,
+) -> (AckHandle, JoinHandle<()>) {
     let (tx, mut rx) = mpsc::unbounded_channel::<AckEvent>();
     let frontier_cell = Monotone::default();
     let frontier = frontier_cell.watch();
     let (probe_tx, probe) = watch::channel(AckSnapshot::default());
-    let mut state = AckState::new(emitter_ack, frontier_cell, probe_tx, fatal);
+    let mut state = AckState::new(emitter_ack, frontier_cell, probe_tx, fatal, stats);
     let handle = tokio::spawn(async move {
         while let Some(ev) = rx.recv().await {
             state.apply(ev);
@@ -562,9 +590,45 @@ mod tests {
         let ack = Arc::new(Monotone::default());
         let (probe_tx, _probe) = watch::channel(AckSnapshot::default());
         (
-            AckState::new(ack.clone(), Monotone::default(), probe_tx, Fatal::new()),
+            AckState::new(
+                ack.clone(),
+                Monotone::default(),
+                probe_tx,
+                Fatal::new(),
+                None,
+            ),
             ack,
         )
+    }
+
+    #[test]
+    fn confirmed_commits_record_their_latency() {
+        let (probe_tx, _probe) = watch::channel(AckSnapshot::default());
+        let stats = Arc::new(EmitterStats::default());
+        let mut s = AckState::new(
+            Arc::new(Monotone::default()),
+            Monotone::default(),
+            probe_tx,
+            Fatal::new(),
+            Some(stats.clone()),
+        );
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_micros() as i64
+            - walrus::pg::replication::PG_EPOCH_USEC;
+        s.register(0, 100, Some(now - 5_000_000), true);
+        s.register(1, 200, Some(now + 60_000_000), true);
+        s.register(2, 300, Some(now), false);
+        s.register(3, 400, None, true);
+        for seq in 0..4 {
+            s.placed(seq, 1);
+            s.acked(seq, 1);
+        }
+        let latency = stats.replication_latency.snapshot(1e6);
+        assert_eq!(latency.count, 2);
+        assert!((5.0..65.0).contains(&latency.sum), "{}", latency.sum);
+        assert_eq!(latency.buckets[0].1, 1);
     }
 
     /// Guard against O(N²) placement scan when placement runs ahead of acks

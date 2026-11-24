@@ -3327,6 +3327,8 @@ fn oracle_cell(
 /// and the top is past a typical deferred-resolution batch
 pub type ValuesPerFetch = crate::ops::metrics::Histogram<1, 9>;
 
+pub type ReplicationLatency = crate::ops::metrics::Histogram<1_000, 18>;
+
 /// Default of `att` encoded for a one-row `ch_inner` column; `None` without
 /// a fast default or when the column can't hold it locally
 pub(crate) fn encode_default(att: &RelAttr, ch_inner: &str) -> Option<ColumnBuf> {
@@ -3403,6 +3405,7 @@ crate::atomic_stats! {
         pub toast_value_wait_nanos,
         /// Values requested per store fetch
         pub toast_values_per_fetch: ValuesPerFetch,
+        pub replication_latency: ReplicationLatency,
         /// Toasted values NULL/default-filled because no store could rebuild
         /// them (disabled mode). Surfaced, never silent
         pub toast_values_filled_default,
