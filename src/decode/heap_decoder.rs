@@ -1121,9 +1121,6 @@ pub fn text_datum(type_oid: u32, text: &[u8]) -> TextDatum {
             crate::decode::codecs::parse_tid(text)
                 .map(|(block, offset)| crate::decode::codecs::encode_tid(block, offset)),
         ),
-        // TODO(0.2.0): remove once 0.1.x descriptor logs migrate
-        NUMERICOID => crate::decode::codecs::numeric_from_text(text)
-            .map_or(TextDatum::Null, |b| TextDatum::Datum(Datum::Varlena(b))),
         _ => TextDatum::Opaque,
     }
 }
@@ -2440,6 +2437,8 @@ mod tests {
         let mut i4 = rel_attr(1, "x", INT4OID, 4, 'i');
         i4.missing_default = Some("42".into());
         assert_eq!(missing_value_for(&i4), build::int4(42));
+        i4.missing_default = Some("x".into());
+        assert_eq!(missing_value_for(&i4), Datum::Null);
 
         let mut i8 = rel_attr(1, "x", INT8OID, 8, 'd');
         i8.missing_default = Some("-9223372036854775808".into());
@@ -2449,11 +2448,6 @@ mod tests {
         txt.missing_default = Some("hello".into());
         assert_eq!(missing_value_for(&txt), build::out_text("hello"));
 
-        let mut num = rel_attr(1, "n", NUMERICOID, -1, 'i');
-        num.missing_default = Some("3.14".into());
-        assert_eq!(missing_value_for(&num), build::numeric("3.14"));
-        num.missing_default = Some("pi".into());
-        assert_eq!(missing_value_for(&num), Datum::Null);
         let mut ts = rel_attr(1, "t", TSVECTOROID, -1, 'i');
         ts.missing_default = Some("'a'".into());
         assert_eq!(missing_value_for(&ts), build::out_text("'a'"));

@@ -1636,6 +1636,21 @@ fn decode_batch(cur: &mut Cur<'_>, version: u16) -> Result<BatchRecord> {
     })
 }
 
+/// Logs written before 0.2.0 hold numeric fast defaults as `numeric_out`
+/// text, which replay can't encode into `Decimal`. GC writes them back raw
+fn raw_numeric_default(attr: &mut RelAttr) {
+    if attr.type_oid == crate::schema::NUMERICOID
+        && let Some(MissingDefault::Text(text)) = &attr.missing_default
+        && let Some(body) = crate::decode::codecs::numeric_from_text(text)
+    {
+        let mut elem = ((body.len() as u32 + 4) << 2).to_le_bytes().to_vec();
+        elem.extend_from_slice(&body);
+        attr.missing_default = Some(MissingDefault::Raw(
+            crate::decode::heap_decoder::raw_missing_array(attr.type_oid, &elem),
+        ));
+    }
+}
+
 fn decode_descriptor(cur: &mut Cur<'_>, version: u16) -> Result<RelDescriptor> {
     let rfn = RelFileNode {
         spc_node: cur.u32()?,
@@ -1666,7 +1681,7 @@ fn decode_descriptor(cur: &mut Cur<'_>, version: u16) -> Result<RelDescriptor> {
     let n = cur.u32()? as usize;
     let mut attributes = Vec::with_capacity(n);
     for _ in 0..n {
-        attributes.push(RelAttr {
+        let mut attr = RelAttr {
             attnum: cur.i16()?,
             name: cur.string()?,
             type_oid: cur.u32()?,
@@ -1679,7 +1694,9 @@ fn decode_descriptor(cur: &mut Cur<'_>, version: u16) -> Result<RelDescriptor> {
             type_align: cur.charlike()?,
             type_storage: cur.charlike()?,
             missing_default: cur.opt_missing()?,
-        });
+        };
+        raw_numeric_default(&mut attr);
+        attributes.push(attr);
     }
     let n = if version < ANCESTRY_VERSION {
         0
@@ -3107,5 +3124,38 @@ mod tests {
         let mut bad = body.clone();
         bad[at] = 7;
         assert_eq!(corrupt_detail(decode_body(&bad)), "missing_default tag 7");
+    }
+
+    #[test]
+    fn numeric_text_default_decodes_as_live_capture() {
+        let mut d = (*desc(16401, 16401, true)).clone();
+        let base = d.attributes[2].clone();
+        let numeric = |text: &str| RelAttr {
+            type_oid: crate::schema::NUMERICOID,
+            missing_default: Some(text.into()),
+            ..base.clone()
+        };
+        d.attributes = vec![numeric("12.50"), numeric("pi"), base];
+        d.attributes[2].missing_default = Some("12.50".into());
+        let rec = batch(5, vec![present(1, &Arc::new(d))]);
+        let got = decode_body(&encode_batch(&rec)).unwrap();
+        let desc = got.entries[0].value.present().unwrap();
+        // anyarray_send(attmissingval) for numeric default 12.50
+        let hex = "0000000100000000000006a400000001000000010000000c0002000000000002000c1388";
+        let send: Vec<u8> = (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+            .collect();
+        let live =
+            crate::backfill::copy_backfill::missing_from_send(crate::schema::NUMERICOID, &send);
+        let defaults: Vec<_> = desc.attributes.iter().map(|a| &a.missing_default).collect();
+        assert_eq!(
+            defaults,
+            [
+                &live.map(MissingDefault::Raw),
+                &Some("pi".into()),
+                &Some("12.50".into())
+            ]
+        );
     }
 }

@@ -606,59 +606,6 @@ pub fn mirror_table_name(db_oid: u32, toast_relid: u32) -> String {
     format!("pg_toast_{db_oid}_{toast_relid}")
 }
 
-/// Add `owner`'s database OID to older `pg_toast_<relid>` mirror names.
-/// Require one followed database because older mirrors may mix data from several
-// TODO(0.2.0): remove after 0.1.x deployments migrate
-pub async fn adopt_legacy_mirrors(
-    cfg: &EmitterConfig,
-    owner: Option<u32>,
-) -> Result<usize, EmitterError> {
-    let mut client = crate::ch::connect_client(cfg).await?;
-    let mut legacy: Vec<u32> = crate::ch::query_strings(
-        &mut client,
-        "SELECT name FROM system.tables \
-         WHERE database = currentDatabase() AND match(name, '^pg_toast_[1-9][0-9]*$')",
-    )
-    .await?
-    .iter()
-    .filter_map(|n| n.strip_prefix("pg_toast_")?.parse().ok())
-    .collect();
-    legacy.sort_unstable();
-    if legacy.is_empty() {
-        return Ok(0);
-    }
-    let Some(owner) = owner else {
-        return Err(EmitterError::Config(format!(
-            "ClickHouse database `{}` contains TOAST mirrors without source database \
-             OIDs in their names (pg_toast_{}); start once following only their original \
-             source database to rename them, or drop them and bootstrap tables with \
-             external TOAST values again",
-            cfg.conn.database,
-            legacy
-                .iter()
-                .map(u32::to_string)
-                .collect::<Vec<_>>()
-                .join(", pg_toast_"),
-        )));
-    };
-    // One statement per table: a Shared database refuses a multi-table RENAME
-    // (`DB::Exception: ... does not support renaming of multiple tables in
-    // single query`). Losing the group's atomicity is safe because the legacy
-    // scan above runs on every start, so a partial pass finishes on the next
-    for &relid in &legacy {
-        crate::ch::exec_drain(
-            &mut client,
-            &format!(
-                "RENAME TABLE {} TO {}",
-                quote_ident(&format!("pg_toast_{relid}")),
-                quote_ident(&mirror_table_name(owner, relid))
-            ),
-        )
-        .await?;
-    }
-    Ok(legacy.len())
-}
-
 /// Store TOAST rows by TID in a separate ClickHouse mirror per source database relation
 ///
 /// Fetch aggregates version history explicitly, independent of merge state

@@ -1289,18 +1289,8 @@ async fn resume_overrides_rebaseline_a_lost_descriptor_log() {
             "lost descriptor log not refused"
         );
 
-        // Pre-oid mirror name, which boot renames under the followed database
-        h.ch_get("CREATE TABLE demo.pg_toast_99999 (x UInt8) ENGINE = Memory")?;
         h.args.push("--ignore-cursor".into());
         h.restart(Duration::from_secs(60)).await?;
-        let renamed = h.ch_get(
-            "SELECT groupArray(name) FROM system.tables \
-             WHERE database = 'demo' AND name LIKE 'pg\\_toast\\_%'",
-        )?;
-        ensure!(
-            renamed == "['pg_toast_5_99999']",
-            "legacy mirror not renamed: {renamed}"
-        );
         h.psql("UPDATE demo.users SET email = 'after-rebaseline@x' WHERE id = 1")?;
         h.wait_ch(USER_EMAIL, "after-rebaseline@x", Duration::from_secs(15))
             .await?;
