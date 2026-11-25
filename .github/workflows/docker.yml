@@ -47,7 +47,7 @@ jobs:
       fail-fast: false
       matrix:
         pg-major: [16, 17, 18]
-    uses: docker/github-builder/.github/workflows/build.yml@v1
+    uses: docker/github-builder/.github/workflows/build.yml@bb1eb9fb69408ac52395fb21f49c6b52d564529a # v1
     permissions:
       contents: read
       packages: write
