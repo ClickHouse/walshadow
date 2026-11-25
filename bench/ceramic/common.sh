@@ -5,6 +5,8 @@
 PG=${PG:-18}
 PGBIN=${PGBIN:-/usr/lib/postgresql/$PG/bin}
 export PATH=$PGBIN:$PATH
+# Scripts parse pg_controldata labels and feed bc decimals to printf
+export LC_ALL=C
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # Shadow, out, spill and source WAL share DISK, a real disk as in production.
 # Source data files, sockets and ClickHouse sit on SHM: in production they are
