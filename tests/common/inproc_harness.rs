@@ -214,7 +214,6 @@ impl ChServer {
                 "--mysql_port=",
                 "--postgresql_port=",
                 "--grpc_port=",
-                "--prometheus.port=",
                 "--listen_host=127.0.0.1",
                 &format!("--path={}/", data_dir.display()),
                 &format!("--logger.log={}/server.log", log_dir.display()),
