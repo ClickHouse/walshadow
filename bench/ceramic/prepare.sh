@@ -115,6 +115,7 @@ pgbench -h "$SRUN/sock" -p "$SRC_PORT" -U postgres -d postgres -n -M prepared -f
   -D seed_rows="$SEED_ROWS" -D recent_ids="$RECENT_IDS" -D upd_pm="$UPD_PM" \
   -D rewrite_payload_b="${REWRITE_PAYLOAD_B:-1}" -D inline_end_pm="$INLINE_END_PM" -D ins_pm="$(bc <<<"$UPD_PM / $UPD_REPEAT")" \
   -D recent_pm="$(bc <<<"1000 * $UPD_RECENT_FRAC / 1")" \
+  -D bulk_rows="${BULK_ROWS:-700}" \
   -R "$TPS" -c "$CLIENTS" -j 16 -T "$GEN_SECS" >"$DRUN/pgbench.log" 2>&1 || {
   [[ -z $CKPT ]] || kill "$CKPT"
   tail "$DRUN/pgbench.log"
@@ -144,7 +145,7 @@ trap - EXIT
 cat >"$DRUN/meta.env" <<EOF
 BOOT_BUILD='$BUILD'
 GOLD_PG=$PG
-GOLDEN="pg$PG seed=$SEED_ROWS repeat=$UPD_REPEAT updates=$UPD_PM/$INLINE_UPD_PM recent=$UPD_RECENT_FRAC/$RECENT_IDS gen=${GEN_SECS}s tps=$TPS ckpt=${CHECKPOINT_S}s wal_compression=$WAL_COMPRESSION fpi=$FPI_SHARE%"
+GOLDEN="pg$PG seed=$SEED_ROWS repeat=$UPD_REPEAT updates=$UPD_PM/$INLINE_UPD_PM recent=$UPD_RECENT_FRAC/$RECENT_IDS gen=${GEN_SECS}s tps=$TPS ckpt=${CHECKPOINT_S}s wal_compression=$WAL_COMPRESSION fpi=$FPI_SHARE% $(basename "$WORKLOAD")"
 START_LSN=$START_LSN
 END_LSN=$END_LSN
 BACKLOG=$BACKLOG

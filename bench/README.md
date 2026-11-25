@@ -244,6 +244,20 @@ Updates retain wide `payload_a` and replace `payload_b`. Set
 `REWRITE_PAYLOAD_B=0` to retain both values and reduce WAL per update.
 `PAYLOAD_A_ITEMS` controls retained document width independently of updates.
 
+For bulk updates of TOAST-bearing rows, generate the backlog with `bulk.sql`:
+
+```bash
+WORKLOAD=bench/ceramic/bulk.sql SEED_ROWS=100000 TPS=100 CLIENTS=16 GEN_SECS=30 \
+bench/ceramic/prepare.sh
+```
+
+Each statement flips `status` on `BULK_ROWS` (default 700) consecutive rows
+and leaves `payload_a` and `payload_b` unchanged, so every updated row needs
+two values from shadow PostgreSQL. `TPS` counts statements, so the snapshot
+above holds about 2M row updates and 15M WAL records. Fetches per record run
+about five times the default workload's, and `TOAST-batches/1k-rows` shows
+how many values share a round trip.
+
 `drain` measures from daemon launch to ClickHouse acknowledgment of the fixed
 end LSN. Whole-run metrics include source WAL MiB/s, emitted rows/s, TOAST
 fetch batches/s, WAL KiB per emitted row and TOAST fetch batches per 1,000
