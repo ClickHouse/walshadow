@@ -130,7 +130,7 @@ async fn retained_routes_prevent_invalid_page_recovery_after_resume() {
             let rels = pg_path::user_relation_filenodes(&sh.config().data_dir, db)
                 .await
                 .unwrap();
-            assert!(rels.contains(&(db, rel)));
+            assert!(rels.iter().any(|r| (r.db_node, r.rel_node) == (db, rel)));
             stream.filter_mut().keep_user_rels(rels, end);
         }
         stream

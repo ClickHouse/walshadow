@@ -15,7 +15,11 @@ Review these limits before production use
 - prepared transactions are not supported for production use; commit and abort
   records are handled, but full restart and bootstrap cases are unvalidated
 - sequence state is not replicated, values already stored in table rows still replicate
-- non-default tablespaces are unsafe for bootstrap and managed-shadow lifecycle
+- shadow keeps every tablespace inside its own data dir, as PostgreSQL's
+  in-place tablespace, so catalogs of a database stored in a user tablespace
+  count toward shadow disk use. `ALTER DATABASE … SET TABLESPACE` fails on
+  source while a bootstrap or backfill session holds that database; retry
+  once it finishes
 - partitions replicate through their root only; see
   [partitioned tables](table-selection.md#replicate-partitioned-tables). Root
   renames, root replica identity changes, and attaching a partitioned table as

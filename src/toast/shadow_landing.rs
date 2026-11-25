@@ -4,16 +4,14 @@
 //! landed in place by the backup, then replayed. Index filenodes are absent
 //! from the catalog seed, so the source answers for them.
 
-use anyhow::{Context, Result, bail, ensure};
-use foldhash::{HashMap, HashSet, HashSetExt};
+use anyhow::{Context, Result};
+use foldhash::{HashMap, HashSet};
 use tokio::sync::Mutex;
+use walrus::pg::walparser::RelFileNode;
 
 use crate::catalog::shadow_catalog::ShadowCatalog;
 use crate::filter::shadow_relations::ShadowHeld;
 use crate::schema::{RelDescriptor, RelName};
-
-/// `pg_default`, PG `catalog/pg_tablespace.dat`
-pub const DEFAULT_TABLESPACE_OID: u32 = 1663;
 
 /// Find TOAST heaps shadow cannot replay, paired with their parent relations
 /// Use one catalog read for entire batch
@@ -37,7 +35,7 @@ async fn unheld_toasts<'a>(
         .into_iter()
         .filter_map(|desc| {
             let toast = by_oid.remove(&desc.toast_oid)?;
-            (!held.contains((toast.rfn.db_node, toast.rfn.rel_node))).then_some((desc, toast))
+            (!held.contains(toast.rfn)).then_some((desc, toast))
         })
         .collect())
 }
@@ -97,80 +95,60 @@ fn warn_unserved(desc: &RelDescriptor, toast: &RelDescriptor) {
     );
 }
 
-/// Opted-in TOAST heaps, refusing any the lander cannot place. It keys on
-/// `base/<db>/` paths, so a non-default tablespace has to fail here rather
-/// than at shadow's first read
+/// Opted-in TOAST heaps
 fn toast_heaps<'a>(
     descriptors: impl Iterator<Item = &'a RelDescriptor>,
-    tap_filenodes: Option<&HashSet<(u32, u32)>>,
-) -> Result<Vec<&'a RelDescriptor>> {
-    let heaps: Vec<_> = descriptors
+    tap_filenodes: Option<&HashSet<RelFileNode>>,
+) -> Vec<&'a RelDescriptor> {
+    descriptors
         .filter(|d| d.kind == 't')
-        .filter(|d| tap_filenodes.is_none_or(|set| set.contains(&(d.rfn.db_node, d.rfn.rel_node))))
-        .collect();
-    if let Some(d) = heaps
-        .iter()
-        .find(|d| d.rfn.spc_node != DEFAULT_TABLESPACE_OID)
-    {
-        bail!(
-            "bootstrap: TOAST relation {} (filenode {}) is in tablespace {}; \
-             [toast] mode = shadow keeps files from default tablespace only",
-            d.rel_name,
-            d.rfn.rel_node,
-            d.rfn.spc_node,
-        );
-    }
-    Ok(heaps)
+        .filter(|d| tap_filenodes.is_none_or(|set| set.contains(&d.rfn)))
+        .collect()
 }
 
 /// Filenodes to land and replay: every opted-in TOAST heap plus its indexes
 pub async fn toast_relations<'a>(
     sql: &tokio_postgres::Client,
     descriptors: impl Iterator<Item = &'a RelDescriptor>,
-    tap_filenodes: Option<&HashSet<(u32, u32)>>,
-) -> Result<HashSet<(u32, u32)>> {
-    let mut out = HashSet::new();
-    let mut heaps = Vec::new();
-    let mut db_oid = 0;
-    for d in toast_heaps(descriptors, tap_filenodes)? {
-        db_oid = d.rfn.db_node;
-        heaps.push(d.rfn.rel_node);
-        out.insert((db_oid, d.rfn.rel_node));
-    }
+    tap_filenodes: Option<&HashSet<RelFileNode>>,
+) -> Result<HashSet<RelFileNode>> {
+    let heaps: HashSet<RelFileNode> = toast_heaps(descriptors, tap_filenodes)
+        .into_iter()
+        .map(|d| d.rfn)
+        .collect();
+    let mut out = heaps.clone();
     // Reuse authenticated sidecar client from catalog seed
     // Interpolate because client has no `oid[]` Rust mapping
-    let list = heaps
+    let (rels, spcs): (Vec<_>, Vec<_>) = heaps
         .iter()
-        .map(u32::to_string)
-        .collect::<Vec<_>>()
-        .join(",");
+        .map(|r| (r.rel_node.to_string(), r.spc_node.to_string()))
+        .unzip();
     let rows = sql
         .query(
             &format!(
-                "SELECT ic.relfilenode::int8, ic.relname::text, \
-                 coalesce(nullif(ic.reltablespace, 0), \
-                          (SELECT dattablespace FROM pg_database \
-                           WHERE datname = current_database()))::int8 \
-                 FROM pg_class t \
+                "SELECT ic.relfilenode::int8, \
+                 coalesce(nullif(ic.reltablespace, 0), d.dattablespace)::int8, \
+                 d.oid::int8 \
+                 FROM unnest('{{{rels}}}'::oid[], '{{{spcs}}}'::oid[]) h(rel, spc) \
+                 JOIN pg_database d ON d.datname = current_database() \
+                 JOIN pg_class t ON t.relfilenode = h.rel \
+                 AND coalesce(nullif(t.reltablespace, 0), d.dattablespace) = h.spc \
                  JOIN pg_index i ON i.indrelid = t.oid \
                  JOIN pg_class ic ON ic.oid = i.indexrelid \
-                 WHERE t.relkind = 't' \
-                 AND t.relfilenode = ANY('{{{list}}}'::oid[])"
+                 WHERE t.relkind = 't'",
+                rels = rels.join(","),
+                spcs = spcs.join(","),
             ),
             &[],
         )
         .await
         .context("bootstrap: read toast index filenodes")?;
-    for row in &rows {
-        let spc = row.get::<_, i64>(2) as u32;
-        let index: String = row.get(1);
-        ensure!(
-            spc == DEFAULT_TABLESPACE_OID,
-            "bootstrap: TOAST index {index} is in tablespace {spc}; \
-             [toast] mode = shadow keeps files from default tablespace only",
-        );
-        out.insert((db_oid, row.get::<_, i64>(0) as u32));
-    }
+    let oid = |row: &tokio_postgres::Row, i| row.get::<_, i64>(i) as u32;
+    out.extend(rows.iter().map(|row| RelFileNode {
+        rel_node: oid(row, 0),
+        spc_node: oid(row, 1),
+        db_node: oid(row, 2),
+    }));
     tracing::info!(
         target: "walshadow::bootstrap",
         toast_heaps = heaps.len(),
@@ -183,8 +161,7 @@ pub async fn toast_relations<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{RelName, ReplIdent};
-    use walrus::pg::walparser::RelFileNode;
+    use crate::schema::{DEFAULT_TABLESPACE_OID, RelName, ReplIdent};
 
     fn desc(kind: char, rel_node: u32, spc_node: u32) -> RelDescriptor {
         RelDescriptor {
@@ -206,27 +183,18 @@ mod tests {
     }
 
     #[test]
-    fn heaps_take_opted_in_toast_and_refuse_another_tablespace() {
+    fn heaps_take_opted_in_toast_from_any_tablespace() {
         let all = [
             desc('t', 16400, DEFAULT_TABLESPACE_OID),
-            desc('t', 16401, DEFAULT_TABLESPACE_OID),
+            desc('t', 16401, 16385),
             desc('r', 16402, DEFAULT_TABLESPACE_OID),
         ];
-        let picked = toast_heaps(all.iter(), None).unwrap();
+        let picked = toast_heaps(all.iter(), None);
         assert_eq!(picked.len(), 2, "user heaps are not TOAST storage");
 
-        let tap = [(5u32, 16400u32)].into_iter().collect();
-        let picked = toast_heaps(all.iter(), Some(&tap)).unwrap();
-        assert_eq!(picked[0].rfn.rel_node, 16400, "opt-in narrows the set");
-
-        let elsewhere = [desc('t', 16403, 99)];
-        let err = toast_heaps(elsewhere.iter(), None).unwrap_err();
-        assert!(err.to_string().contains("tablespace 99"), "{err}");
-        // Out of the opted-in set, so its tablespace never matters
-        assert!(
-            toast_heaps(elsewhere.iter(), Some(&tap))
-                .unwrap()
-                .is_empty()
-        );
+        let tap = [all[1].rfn].into_iter().collect();
+        let picked = toast_heaps(all.iter(), Some(&tap));
+        assert_eq!(picked.len(), 1);
+        assert_eq!(picked[0].rfn, all[1].rfn, "opt-in narrows the set");
     }
 }

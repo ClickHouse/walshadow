@@ -8,7 +8,9 @@
 //! bootstrap-rule catalog. `>= 16384` come from `pg_class.relfilenode`
 //! and may be catalog (rotated via `VACUUM FULL` / `REINDEX`) or user
 //! heap; the whitelist covers the rotated-catalog case, seeded from
-//! `CatalogTracker::seed_from_source`.
+//! `CatalogTracker::seed_from_source`. Tablespace, database and filenode
+//! together name a relation file, so heaps in user tablespaces route the
+//! same way as `base/`.
 
 use std::io;
 use std::sync::Arc;
@@ -19,17 +21,16 @@ use async_trait::async_trait;
 use crate::backfill::backup_source::{
     BackupSink, EndInfo, FileAction, FileKind, FileMeta, StartInfo,
 };
-use crate::backfill::pg_path::{is_system_dir, parse_base_path};
+use crate::backfill::pg_path::{is_system_dir, parse_rel_path};
 use crate::schema::FIRST_NORMAL_OBJECT_ID;
 use foldhash::HashSet;
+use walrus::pg::walparser::RelFileNode;
 
 /// `relfilenode < 16384` is always bootstrap catalog. Rotated-catalog
 /// filenodes (`VACUUM FULL` / `REINDEX` on a catalog) land in `whitelist`.
 #[derive(Debug, Clone, Default)]
 pub struct CatalogFilenodes {
-    /// `(db_node, rel_node)` rotated catalogs; `db_node == 0` matches
-    /// any database (shared catalogs like `pg_database`)
-    whitelist: HashSet<(u32, u32)>,
+    whitelist: HashSet<RelFileNode>,
 }
 
 impl CatalogFilenodes {
@@ -37,18 +38,16 @@ impl CatalogFilenodes {
         Self::default()
     }
 
-    pub fn insert(&mut self, db_node: u32, rel_node: u32) {
-        self.whitelist.insert((db_node, rel_node));
+    pub fn insert(&mut self, rfn: RelFileNode) {
+        self.whitelist.insert(rfn);
     }
 
     /// Bootstrap rule (`rel_node < 16384`) or whitelist seed
-    pub fn is_catalog(&self, db_node: u32, rel_node: u32) -> bool {
-        if rel_node != 0 && rel_node < FIRST_NORMAL_OBJECT_ID {
+    pub fn is_catalog(&self, rfn: RelFileNode) -> bool {
+        if rfn.rel_node != 0 && rfn.rel_node < FIRST_NORMAL_OBJECT_ID {
             return true;
         }
-        self.whitelist
-            .iter()
-            .any(|&(d, r)| r == rel_node && (d == 0 || d == db_node))
+        self.whitelist.contains(&rfn)
     }
 
     pub fn len(&self) -> usize {
@@ -60,8 +59,8 @@ impl CatalogFilenodes {
     }
 }
 
-impl FromIterator<(u32, u32)> for CatalogFilenodes {
-    fn from_iter<I: IntoIterator<Item = (u32, u32)>>(iter: I) -> Self {
+impl FromIterator<RelFileNode> for CatalogFilenodes {
+    fn from_iter<I: IntoIterator<Item = RelFileNode>>(iter: I) -> Self {
         Self {
             whitelist: iter.into_iter().collect(),
         }
@@ -105,15 +104,15 @@ impl DiskLanderSink {
                 DiskAction::SkipDenylist
             };
         }
-        if let Some(f) = parse_base_path(&meta.path) {
-            return if self.catalog_filenodes.is_catalog(f.db, f.filenode) {
+        if let Some(f) = parse_rel_path(&meta.path) {
+            return if self.catalog_filenodes.is_catalog(f.rfn) {
                 DiskAction::Keep
             } else {
                 DiskAction::SkipUserHeap
             };
         }
         // global/, pg_xact/, pg_multixact/, pg_filenode.map,
-        // tablespace_map, backup_label, pg_control, pg_tblspc symlinks,
+        // tablespace_map, backup_label, pg_control, tablespace dirs,
         // non-denylisted top-level dirs: every recovery prerequisite
         DiskAction::Keep
     }
@@ -214,8 +213,17 @@ impl<T: BackupSink> BackupSink for MultiplexSink<T> {
 mod tests {
     use super::*;
     use crate::backfill::backup_source::testing::expect_tap;
-    use crate::backfill::pg_path::{BaseRelFile, RelFork, is_system_dir, parse_base_path};
+    use crate::backfill::pg_path::{RelFile, RelFork, is_system_dir, parse_rel_path};
+    use crate::schema::DEFAULT_TABLESPACE_OID;
     use std::path::{Path, PathBuf};
+
+    fn rfn(spc_node: u32, db_node: u32, rel_node: u32) -> RelFileNode {
+        RelFileNode {
+            spc_node,
+            db_node,
+            rel_node,
+        }
+    }
 
     #[tokio::test]
     async fn lander_keeps_and_counts_tablespace_symlinks() {
@@ -246,47 +254,48 @@ mod tests {
     }
 
     #[test]
-    fn parse_base_path_handles_segments_fsm_vm() {
+    fn parse_rel_path_handles_segments_fsm_vm() {
         let f = |filenode, fork, segno| {
-            Some(BaseRelFile {
-                db: 5,
-                filenode,
+            Some(RelFile {
+                rfn: rfn(DEFAULT_TABLESPACE_OID, 5, filenode),
                 fork,
                 segno,
             })
         };
         assert_eq!(
-            parse_base_path(Path::new("base/5/16400")),
+            parse_rel_path(Path::new("base/5/16400")),
             f(16400, RelFork::Main, 0)
         );
         assert_eq!(
-            parse_base_path(Path::new("base/5/16400.1")),
+            parse_rel_path(Path::new("base/5/16400.1")),
             f(16400, RelFork::Main, 1)
         );
         assert_eq!(
-            parse_base_path(Path::new("base/5/16400_fsm")),
+            parse_rel_path(Path::new("base/5/16400_fsm")),
             f(16400, RelFork::Fsm, 0)
         );
         assert_eq!(
-            parse_base_path(Path::new("base/5/16400_vm.2")),
+            parse_rel_path(Path::new("base/5/16400_vm.2")),
             f(16400, RelFork::Vm, 2)
         );
-        assert_eq!(parse_base_path(Path::new("base/5/16400_init")), None);
-        assert_eq!(parse_base_path(Path::new("base/5/16400.x")), None);
-        assert_eq!(parse_base_path(Path::new("global/1213")), None);
-        assert_eq!(parse_base_path(Path::new("pg_control")), None);
+        assert_eq!(parse_rel_path(Path::new("base/5/16400_init")), None);
+        assert_eq!(parse_rel_path(Path::new("base/5/16400.x")), None);
+        assert_eq!(parse_rel_path(Path::new("global/1213")), None);
+        assert_eq!(parse_rel_path(Path::new("pg_control")), None);
     }
 
     #[test]
     fn catalog_filenodes_bootstrap_rule_and_whitelist() {
         let mut c = CatalogFilenodes::new();
-        c.insert(5, 50000);
-        assert!(c.is_catalog(5, 1259)); // bootstrap rule
-        assert!(c.is_catalog(5, 50000)); // whitelist
-        assert!(!c.is_catalog(5, 60000));
-        c.insert(0, 99999); // db_node 0 = shared catalog
-        assert!(c.is_catalog(5, 99999));
-        assert!(c.is_catalog(7, 99999));
+        c.insert(rfn(1663, 5, 50000));
+        assert!(c.is_catalog(rfn(16385, 5, 1259))); // bootstrap rule
+        assert!(c.is_catalog(rfn(1663, 5, 50000))); // whitelist
+        assert!(!c.is_catalog(rfn(1663, 5, 60000)));
+        // Same database and filenode in another tablespace is another file
+        assert!(!c.is_catalog(rfn(16385, 5, 50000)));
+        c.insert(rfn(1664, 0, 99999));
+        assert!(c.is_catalog(rfn(1664, 0, 99999)));
+        assert!(!c.is_catalog(rfn(1663, 7, 99999)));
     }
 
     #[test]
@@ -326,7 +335,7 @@ mod tests {
 
     #[test]
     fn disk_lander_routes_keep_skip_denylist_skip_user_heap() {
-        let lander = DiskLanderSink::new(CatalogFilenodes::from_iter([(5, 50000)]));
+        let lander = DiskLanderSink::new(CatalogFilenodes::from_iter([rfn(1663, 5, 50000)]));
         let cases = [
             (
                 FileMeta {
@@ -394,6 +403,27 @@ mod tests {
                     ..Default::default()
                 },
                 DiskAction::Keep,
+            ),
+            (
+                FileMeta {
+                    path: PathBuf::from("pg_tblspc/16384/PG_18_202506291/5/16400"),
+                    ..Default::default()
+                },
+                DiskAction::SkipUserHeap,
+            ),
+            (
+                FileMeta {
+                    path: PathBuf::from("pg_tblspc/16384/PG_18_202506291/5/1259"),
+                    ..Default::default()
+                },
+                DiskAction::Keep,
+            ),
+            (
+                FileMeta {
+                    path: PathBuf::from("pg_tblspc/16384/PG_18_202506291/pgsql_tmp/t1.0"),
+                    ..Default::default()
+                },
+                DiskAction::SkipDenylist,
             ),
         ];
         for (meta, expected) in cases {
@@ -488,12 +518,12 @@ mod tests {
         let mut c = CatalogFilenodes::new();
         assert!(c.is_empty());
         assert_eq!(c.len(), 0);
-        c.insert(5, 50000);
-        c.insert(0, 99999);
+        c.insert(rfn(1663, 5, 50000));
+        c.insert(rfn(1664, 0, 99999));
         assert!(!c.is_empty());
         assert_eq!(c.len(), 2);
-        // Re-inserting an existing pair is a no-op
-        c.insert(5, 50000);
+        // Re-inserting an existing file is a no-op
+        c.insert(rfn(1663, 5, 50000));
         assert_eq!(c.len(), 2);
     }
 

@@ -383,6 +383,7 @@ async fn source_sql_fast_defaults_match_shadow_reads() {
         .await
         .expect("descriptor_by_name")
         .expect("fd.t exists");
+    assert_eq!((stored.rfn.db_node, stored.rfn.rel_node), (db, filenode));
 
     let cfg = shadow.config();
     let conninfo = socket_conninfo(
@@ -398,7 +399,7 @@ async fn source_sql_fast_defaults_match_shadow_reads() {
     let seeded = walshadow::backfill_bootstrap::seed_catalog_from_source(&client)
         .await
         .expect("seed catalog")
-        .get(db, filenode)
+        .get(stored.rfn)
         .expect("fd.t seeded");
 
     assert_eq!(seeded.attributes.len(), stored.attributes.len());

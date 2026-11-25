@@ -13,8 +13,9 @@
 //!
 //! 1. `start()` fires before any `begin()`, carrying start_lsn,
 //!    timeline, user tablespace list.
-//! 2. Tablespace symlinks (`pg_tblspc/<oid>`) emit as `FileKind::Symlink`
-//!    before any file under their subtree.
+//! 2. Tablespace contents emit under `pg_tblspc/<oid>/`; a tablespace
+//!    symlink, where one is sent, emits as `FileKind::Symlink` before any
+//!    file under its subtree. Landing keeps it as a directory.
 //! 3. `pg_control` emits last; PG's BASE_BACKUP protocol and wal-rus's
 //!    `list_tar_parts` both honour this, future impls must too.
 //! 4. `finish()` fires after the last `end()`, carrying end_lsn.
@@ -32,6 +33,8 @@ use tokio::io::AsyncRead;
 
 use walrus::pg::backup::tarball::{self, Kind};
 use walrus::pg::replication::base_backup::Tablespace;
+
+use crate::backfill::pg_path::tablespace_entry;
 
 crate::atomic_stats! {
     /// Bootstrap pump stage attribution, shared from the orchestrator down
@@ -187,6 +190,9 @@ pub struct PumpTarget {
     pub sink: Arc<dyn BackupSink>,
     pub stats: Arc<PumpStats>,
     pub part: Option<Arc<str>>,
+    /// Cluster-relative directory an archive's entries sit under. A
+    /// replication-protocol tablespace archive is rooted at the tablespace
+    pub root: Option<PathBuf>,
 }
 
 impl PumpTarget {
@@ -196,6 +202,7 @@ impl PumpTarget {
             sink,
             stats,
             part: None,
+            root: None,
         }
     }
 
@@ -206,6 +213,19 @@ impl PumpTarget {
             sink: self.sink.clone(),
             stats: self.stats.clone(),
             part: Some(Arc::from(key)),
+            root: self.root.clone(),
+        }
+    }
+
+    /// Land one tablespace's archive where an object-store backup carries
+    /// it, `pg_tblspc/<oid>/`, rather than over the data dir root
+    pub fn for_tablespace(&self, oid: u32) -> Self {
+        Self {
+            data_dir: self.data_dir.clone(),
+            sink: self.sink.clone(),
+            stats: self.stats.clone(),
+            part: self.part.clone(),
+            root: Some(crate::backfill::shadow_tablespaces::landing_root(oid)),
         }
     }
 }
@@ -278,6 +298,9 @@ where
             continue;
         };
         meta.part = target.part.clone();
+        if let Some(root) = &target.root {
+            meta.path = root.join(&meta.path);
+        }
         pump_entry(&mut body, &meta, target).await?;
     }
     Ok(())
@@ -335,26 +358,24 @@ where
     let target = data_dir.join(&meta.path);
     tokio::fs::create_dir_all(target.parent().unwrap_or(data_dir)).await?;
     match &meta.kind {
-        FileKind::Dir => {
+        FileKind::Symlink { target: link } if tablespace_entry(&meta.path).is_none() => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "symlink {} -> {} outside pg_tblspc",
+                    meta.path.display(),
+                    link.display()
+                ),
+            ));
+        }
+        // Source location does not exist here, so a tablespace link lands
+        // as an in-place tablespace directory
+        FileKind::Dir | FileKind::Symlink { .. } => {
             match tokio::fs::create_dir(&target).await {
                 Ok(()) => Ok(()),
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(()),
                 Err(e) => Err(e),
             }?;
-        }
-        FileKind::Symlink {
-            target: link_target,
-        } => {
-            #[cfg(unix)]
-            {
-                let _ = tokio::fs::remove_file(&target).await;
-                tokio::fs::symlink(link_target, &target).await?;
-            }
-            #[cfg(not(unix))]
-            {
-                let _ = link_target;
-                return Err(io::Error::other("symlink restore requires unix"));
-            }
         }
         FileKind::File => {
             let mut f = tokio::fs::OpenOptions::new()
@@ -554,9 +575,9 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
-    /// Kept symlinks replace whatever the path held; a repeated dir is no error
+    /// Repeated dirs and tablespace links land once, as directories
     #[tokio::test]
-    async fn pump_tar_lands_kept_symlinks_over_repeated_dirs() {
+    async fn pump_tar_lands_tablespace_links_as_dirs() {
         let tmp = tempfile::tempdir().unwrap();
         let mut link = tarball::Entry::new("pg_tblspc/16384", Kind::SymbolicLink, 0, 0o777, 0);
         link.link = "/srv/ts/a".into();
@@ -580,12 +601,32 @@ mod tests {
         pump_tar_to_sink(&mut tarball::Reader::new(bytes.as_slice()), &target)
             .await
             .unwrap();
-        assert_eq!(
-            std::fs::read_link(tmp.path().join("pg_tblspc/16384")).unwrap(),
-            PathBuf::from("/srv/ts/a")
-        );
+        let landed = std::fs::symlink_metadata(tmp.path().join("pg_tblspc/16384")).unwrap();
+        assert!(landed.is_dir(), "tablespace link must land in place");
         assert_eq!(recording.tapped.lock().unwrap().len(), 0);
         assert_eq!(recording.events.lock().unwrap().len(), 8);
+    }
+
+    /// Only tablespace links are expected, and none may point outside
+    #[tokio::test]
+    async fn pump_tar_refuses_symlinks_outside_pg_tblspc() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut link = tarball::Entry::new("pg_wal", Kind::SymbolicLink, 0, 0o777, 0);
+        link.link = "/srv/wal".into();
+        let mut w = tarball::Writer::new(Vec::new());
+        w.append(&link, tokio::io::empty()).await.unwrap();
+        let bytes = w.finish().await.unwrap();
+        let target = PumpTarget::new(
+            tmp.path().to_path_buf(),
+            Arc::new(Arc::new(RecordingSink::default())),
+            Arc::new(PumpStats::default()),
+        );
+        let err = pump_tar_to_sink(&mut tarball::Reader::new(bytes.as_slice()), &target)
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("/srv/wal"), "{err}");
+        assert!(!tmp.path().join("pg_wal").exists());
     }
 
     /// Kept dir the data dir cannot hold fails the pump
@@ -656,5 +697,49 @@ mod tests {
             })
             .sum();
         assert_eq!(tapped_bytes, 8192);
+    }
+
+    /// A replication-protocol tablespace archive is rooted at the
+    /// tablespace; its entries must not land over the data dir root
+    #[tokio::test]
+    async fn tablespace_archive_lands_under_pg_tblspc() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path();
+        let mut w = tarball::Writer::new(Vec::new());
+        let dir = tarball::Entry::new("PG_18_202506291", Kind::Directory, 0, 0o700, 0);
+        w.append(&dir, tokio::io::empty()).await.unwrap();
+        let file = tarball::Entry::new("PG_18_202506291/5/16400", Kind::Regular, 4, 0o600, 0);
+        w.append(&file, &b"page"[..]).await.unwrap();
+        let tar_bytes = w.finish().await.unwrap();
+
+        let recording = Arc::new(RecordingSink::default());
+        let sink: Arc<dyn BackupSink> = Arc::new(recording.clone());
+        let target = PumpTarget::new(data_dir.to_path_buf(), sink, Arc::new(PumpStats::default()))
+            .for_tablespace(16385);
+        let mut archive = tarball::Reader::new(tar_bytes.as_slice());
+        pump_tar_to_sink(&mut archive, &target).await.unwrap();
+
+        assert_eq!(
+            std::fs::read(data_dir.join("pg_tblspc/16385/PG_18_202506291/5/16400")).unwrap(),
+            b"page",
+        );
+        assert!(!data_dir.join("PG_18_202506291").exists());
+        let begun: Vec<_> = recording
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match e {
+                Event::Begin { path, .. } => Some(path.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            begun,
+            [
+                PathBuf::from("pg_tblspc/16385/PG_18_202506291"),
+                PathBuf::from("pg_tblspc/16385/PG_18_202506291/5/16400"),
+            ],
+        );
     }
 }

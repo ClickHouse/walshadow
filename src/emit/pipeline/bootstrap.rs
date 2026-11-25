@@ -773,13 +773,13 @@ impl Target {
         skip_initial: &HashSet<RelName>,
         rfn: RelFileNode,
     ) -> Self {
-        let Some(rel) = catalog.get(rfn.db_node, rfn.rel_node) else {
+        let Some(rel) = catalog.get(rfn) else {
             return Self::Unsupported;
         };
         if skip_initial.contains(&rel.rel_name) {
             return Self::Skipped;
         }
-        if catalog.is_toast(rfn.db_node, rfn.rel_node) {
+        if catalog.is_toast(rfn) {
             return Self::Toast(rel);
         }
         let Some(route) = routes.route(&rel) else {
@@ -963,7 +963,7 @@ async fn next_batch(
             _ => {
                 let rfn = tuple.rfn;
                 let table = catalog
-                    .get(rfn.db_node, rfn.rel_node)
+                    .get(rfn)
                     .and_then(|rel| Some((routes.route(&rel)?, rel)))
                     .map(|(route, rel)| {
                         batch.tables.push(RowTable { rel, route });

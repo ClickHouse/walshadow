@@ -210,7 +210,7 @@ impl PendingSpool {
         mut tuple: BackfillTuple,
         pending: PendingXids,
     ) -> Result<bool, String> {
-        let Some(rel) = self.catalog.get(tuple.rfn.db_node, tuple.rfn.rel_node) else {
+        let Some(rel) = self.catalog.get(tuple.rfn) else {
             return Ok(false);
         };
         let tally = self

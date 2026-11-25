@@ -11,7 +11,9 @@ cannot produce a consistent destination
 Backup files feed two paths: catalog and recovery files build shadow, while
 selected user pages become candidate destination rows. A visibility gate uses
 tuple hints, backup transaction logs, and backup-window WAL outcomes to decide
-which rows belong in initial state
+which rows belong in initial state. User tablespaces land inside shadow's data
+dir as in-place `pg_tblspc/<oid>` directories, since their source locations do
+not exist here. Streamed `CREATE TABLESPACE` lands the same way
 
 Concurrent WAL replay covers changes during backup. Walked rows carry an older
 coverage version so later committed changes win at destination. Bounded channels

@@ -12,7 +12,7 @@ use anyhow::{Context, Result};
 use tokio::sync::{Mutex, watch};
 use walrus::pg::backup::format_pg_lsn;
 use walrus::pg::wal::segment::SegmentName;
-use walrus::pg::walparser::Oid;
+use walrus::pg::walparser::{Oid, RelFileNode};
 
 use crate::backfill::backup_page_walk::CatalogMap;
 use crate::backfill::wal_replay::{
@@ -142,15 +142,12 @@ fn read_start(from_lsn: u64) -> u64 {
 /// Every catalog filenode decodes, so TOAST records reach their parent rows;
 /// only non-TOAST rels route. No ceiling: a leg owns every commit it decodes,
 /// the pump resumes at seal
-fn replay_scope(catalog: &CatalogMap) -> (HashSet<(Oid, Oid)>, ReplayTargets) {
-    let filter_rfns = catalog
-        .descriptors()
-        .map(|d| (d.rfn.db_node, d.rfn.rel_node))
-        .collect();
+fn replay_scope(catalog: &CatalogMap) -> (HashSet<RelFileNode>, ReplayTargets) {
+    let filter_rfns = catalog.descriptors().map(|d| d.rfn).collect();
     let targets = catalog
         .descriptors()
-        .filter(|d| !catalog.is_toast(d.rfn.db_node, d.rfn.rel_node))
-        .map(|d| ((d.rfn.db_node, d.rfn.rel_node), (d.clone(), u64::MAX)))
+        .filter(|d| !catalog.is_toast(d.rfn))
+        .map(|d| (d.rfn, (d.clone(), u64::MAX)))
         .collect();
     (filter_rfns, targets)
 }
@@ -498,7 +495,7 @@ mod tests {
 
         assert_eq!(filter.len(), 2);
         assert_eq!(
-            targets.keys().map(|(_, rel)| *rel).collect::<Vec<_>>(),
+            targets.keys().map(|rfn| rfn.rel_node).collect::<Vec<_>>(),
             [16400]
         );
         assert!(targets.values().all(|(_, ceiling)| *ceiling == u64::MAX));

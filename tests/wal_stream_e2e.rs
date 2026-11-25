@@ -30,7 +30,7 @@ use std::time::Duration;
 use walrus::pg::replication::conn::PgConfig;
 use walrus::pg::replication::tls::{SslMode, TlsParams};
 use walrus::pg::wal::segment::DEFAULT_WAL_SEG_SIZE;
-use walrus::pg::walparser::{WAL_PAGE_SIZE, WalParser};
+use walrus::pg::walparser::{RelFileNode, WAL_PAGE_SIZE, WalParser};
 use walshadow::pos::Pos;
 use walshadow::record::{CollectingRecordSink, MetricsRecordSink, WAL_SEG_SIZE};
 use walshadow::segment_sink::DirSegmentSink;
@@ -367,7 +367,11 @@ async fn pre_rotated_pg_class_seed_keeps_catalog_writes() {
         assert!(added > 0, "seed must add ≥1 catalog filenode");
     }
     assert!(
-        stream.filter().tracker().is_catalog(db, pg_class_fn),
+        stream.filter().tracker().is_catalog(RelFileNode {
+            spc_node: 1663,
+            db_node: db,
+            rel_node: pg_class_fn,
+        }),
         "after seed, rotated pg_class filenode {pg_class_fn} (db {db}) must be catalog",
     );
 

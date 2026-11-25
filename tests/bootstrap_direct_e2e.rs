@@ -256,9 +256,7 @@ async fn direct_source_self_hosted_via_replication_protocol() {
     let mut int_ids: HashSet<i32> = HashSet::new();
     for t in &tuples {
         assert_eq!(t.source_lsn, outcome.start.start_lsn);
-        let rel = catalog_map
-            .get(t.rfn.db_node, t.rfn.rel_node)
-            .expect("descriptor");
+        let rel = catalog_map.get(t.rfn).expect("descriptor");
         if let Some(Some(Datum::Fixed(v))) = t.cells(&rel).expect("cells").first() {
             let v = &i32::from_le_bytes(v.as_slice().try_into().expect("int4"));
             int_ids.insert(*v);

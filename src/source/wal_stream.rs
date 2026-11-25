@@ -26,6 +26,9 @@
 //!         SegmentSink       (DirSegmentSink — archive fallback + retention)
 //! ```
 //!
+//! `CREATE TABLESPACE` keeps its route but loses its path
+//! ([`blank_tablespace_path`]), landing in place on shadow.
+//!
 //! Per-record dispatch fires the moment a record's last byte arrives;
 //! segment-level dispatch fires on segment boundary with already-filtered
 //! bytes. No re-parse, no second walk.
@@ -40,7 +43,7 @@ use walrus::pg::walparser::{
 
 use crate::filter::Filter;
 use crate::filter::header_walk;
-use crate::filter::rewrite::noop_replace;
+use crate::filter::rewrite::{blank_tablespace_path, is_tablespace_create, noop_replace};
 use crate::pos::{Floor, Pos};
 #[cfg(test)]
 use crate::record::{
@@ -391,6 +394,14 @@ impl WalStream {
                             .rewrite_record_in_place(off, len, noop_replace)
                             .expect(NOOP_FITS);
                     }
+                }
+            } else if is_tablespace_create(
+                record.parsed.header.resource_manager_id,
+                record.parsed.header.info,
+            ) {
+                let mut bytes = completed.logical_bytes(self.walker.buffer()).to_vec();
+                if blank_tablespace_path(&mut bytes) {
+                    self.walker.rewrite_record(&byte_ranges, &bytes);
                 }
             }
             self.staged_end = self.staged_end.max(last_range.0 + last_range.1);
@@ -1217,7 +1228,7 @@ mod tests {
                     ShadowRelations::load(tmp.path())
                         .await
                         .unwrap()
-                        .contains(&(5, 16456))
+                        .contains(&crate::filter::catalog_tracker::test_rfn(5, 16456))
                 );
             }
             assert!(records.records.is_empty());

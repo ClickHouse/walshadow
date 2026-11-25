@@ -46,7 +46,7 @@ const RELMAPPER_FILEMAGIC: i32 = 0x592717;
 fn build_relmap_main_data(dbid: u32, mappings: &[(u32, u32)]) -> Vec<u8> {
     let mut data = Vec::new();
     data.extend_from_slice(&dbid.to_le_bytes());
-    data.extend_from_slice(&1664u32.to_le_bytes()); // tsid pg_global
+    data.extend_from_slice(&1663u32.to_le_bytes()); // tsid pg_default, database-local map
     data.extend_from_slice(&REL_MAP_FILE_SIZE.to_le_bytes());
     data.extend_from_slice(&RELMAPPER_FILEMAGIC.to_le_bytes());
     data.extend_from_slice(&(mappings.len() as i32).to_le_bytes());

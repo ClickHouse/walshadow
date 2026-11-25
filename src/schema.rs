@@ -10,6 +10,10 @@ use foldhash::HashMap;
 /// `FirstNormalObjectId`, PG src/include/access/transam.h
 pub const FIRST_NORMAL_OBJECT_ID: u32 = 16384;
 
+/// `pg_default` and `pg_global`, PG src/include/catalog/pg_tablespace.dat
+pub const DEFAULT_TABLESPACE_OID: u32 = 1663;
+pub const GLOBAL_TABLESPACE_OID: u32 = 1664;
+
 pub const BOOLOID: u32 = 16;
 pub const BYTEAOID: u32 = 17;
 pub const CHAROID: u32 = 18;

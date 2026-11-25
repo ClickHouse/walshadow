@@ -63,7 +63,8 @@
 //! `(db_node, rel_node)` alone can alias two live relations after OID
 //! wraparound. Capture resolves the `pg_class.reltablespace` 0 sentinel to
 //! the database's `dattablespace`, so stored rfns compare directly against
-//! WAL locators' physical spcOid. See `plans/tablespaces.md`
+//! WAL locators' physical spcOid. `ALTER DATABASE SET TABLESPACE` moves
+//! that default, so capture recaptures the database at the move's commit
 
 use std::collections::BTreeMap;
 use std::io::SeekFrom;

@@ -62,7 +62,7 @@ async fn unheld_toast_names_only_rels_shadow_cannot_serve() {
         .expect("unheld TOAST heap must name itself");
     assert_eq!(refused.rfn.rel_node, toast.rfn.rel_node);
 
-    let held = ShadowHeld::from_iter([(toast.rfn.db_node, toast.rfn.rel_node)]);
+    let held = ShadowHeld::from_iter([toast.rfn]);
     assert!(
         unheld_toast(&catalog, &held, &big).await.unwrap().is_none(),
         "a landed TOAST heap serves its rel",

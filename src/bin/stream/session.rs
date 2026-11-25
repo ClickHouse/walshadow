@@ -914,6 +914,9 @@ async fn session_body(
             .context("pre-flight rejected daemon start")?;
         tracing::info!(target: "walshadow::preflight", "pre-flight passed");
     }
+    // Leave followed database free for `ALTER DATABASE … SET TABLESPACE`,
+    // which waits on no session. Later uses redial
+    feed.drop_sql_client();
 
     // Share pump's xid samples with shadow TOAST reads to detect reused IDs
     let xid_ceiling = Arc::new(walshadow::toast::xid_ceiling::XidCeiling::default());

@@ -379,7 +379,7 @@ async fn bench_pump(shape: Shape) -> Report {
         let (mut n, mut digest) = (0u64, 0i64);
         while let Some(slab) = rx.recv().await {
             for t in &slab {
-                let rel = catalog.get(t.rfn.db_node, t.rfn.rel_node).unwrap();
+                let rel = catalog.get(t.rfn).unwrap();
                 let view = t.view(&rel).unwrap().unwrap();
                 n += 1;
                 for d in &view.datums {

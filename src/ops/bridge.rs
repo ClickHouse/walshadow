@@ -633,6 +633,21 @@ impl Bridge {
         Ok(stream)
     }
 
+    /// [`dial`](Self::dial) until a restarting worker listens again. Recovery
+    /// conflicts end workers too, as `ALTER DATABASE SET TABLESPACE` replay does
+    async fn redial(&self, slot: &Slot) -> Result<UnixStream, BridgeError> {
+        let deadline = tokio::time::Instant::now() + WORKER_RESTART_WAIT;
+        (|| self.dial(slot))
+            .retry(
+                ExponentialBuilder::default()
+                    .with_min_delay(Duration::from_millis(100))
+                    .with_max_delay(Duration::from_secs(1))
+                    .without_max_times(),
+            )
+            .when(move |e| worker_absent(e) && tokio::time::Instant::now() < deadline)
+            .await
+    }
+
     async fn hello(stats: &BridgeStats, slot: &Slot) -> Result<(UnixStream, Hello), BridgeError> {
         let mut stream = UnixStream::connect(&slot.path).await?;
         widen_sockbufs(&stream);
@@ -710,7 +725,7 @@ impl Bridge {
         // Every op is read-only, so replaying one costs nothing
         if is_transport_error(&res) {
             self.stats.reconnects.fetch_add(1, Ordering::Relaxed);
-            match self.dial(slot).await {
+            match self.redial(slot).await {
                 Ok(mut stream) => {
                     res = round_trip(&mut stream, &frame, &mut body).await;
                     if !is_transport_error(&res) {
@@ -776,6 +791,18 @@ fn record<T>(stats: &BridgeStats, op: Op, started: Instant, res: &Result<T, Brid
 
 fn is_transport_error<T>(res: &Result<T, BridgeError>) -> bool {
     matches!(res, Err(e) if e.is_transport())
+}
+
+/// Postmaster restarts an exited worker after its 5 s `bgw_restart_time`,
+/// see `pgext/worker.c`
+const WORKER_RESTART_WAIT: Duration = Duration::from_secs(15);
+
+/// Socket gone or not yet listening, as while a worker restarts
+fn worker_absent(e: &BridgeError) -> bool {
+    matches!(e, BridgeError::Io(e) if matches!(
+        e.kind(),
+        io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+    ))
 }
 
 /// Matches `WS_SOCKBUF_BYTES` in `pgext/worker.c`. A multi-megabyte frame
@@ -1579,6 +1606,47 @@ pub(crate) mod tests {
             matches!(&err, BridgeError::Protocol(m) if m == "response status 7"),
             "{err:?}"
         );
+        assert_eq!(bridge.stats.reconnects.load(Ordering::Relaxed), 1);
+    }
+
+    /// Worker exits and its socket goes with it until postmaster restarts it
+    #[tokio::test(flavor = "current_thread")]
+    async fn call_waits_out_a_worker_restart() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("bridge.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let gone = path.clone();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut hdr = [0u8; 4];
+            for answer in [Some(hello_body(PROTO_VERSION, PROJECTION_VERSION)), None] {
+                sock.read_exact(&mut hdr).await.unwrap();
+                let mut body = vec![0u8; u32::from_be_bytes(hdr) as usize];
+                sock.read_exact(&mut body).await.unwrap();
+                if let Some(resp) = answer {
+                    sock.write_all(&frame(resp)).await.unwrap();
+                }
+            }
+            drop(listener);
+            std::fs::remove_file(gone).unwrap();
+        });
+        let bridge = Bridge::connect(&path).await.unwrap();
+        let restart = async {
+            // Current-thread runtime: the first redial has failed by now
+            while bridge.stats.reconnects.load(Ordering::Relaxed) == 0 {
+                tokio::task::yield_now().await;
+            }
+            let listener = UnixListener::bind(&path).unwrap();
+            tokio::spawn(fake_worker(
+                listener,
+                vec![
+                    Some(hello_body(PROTO_VERSION, PROJECTION_VERSION)),
+                    Some(lsn_body(0x2000)),
+                ],
+            ));
+        };
+        let (lsn, ()) = tokio::join!(bridge.replay_lsn(), restart);
+        assert_eq!(lsn.unwrap(), 0x2000);
         assert_eq!(bridge.stats.reconnects.load(Ordering::Relaxed), 1);
     }
 
