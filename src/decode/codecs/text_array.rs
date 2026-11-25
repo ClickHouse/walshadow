@@ -1,35 +1,18 @@
 //! PG `text[]` element list, for runtime config's own key columns.
 
+use super::array::{ArrayBody, array_elem};
+
 /// Decode on-disk `text[]` body (outer varlena header stripped) for runtime
-/// config's key lists. `None` for anything else: nested dims, NULL elements
-/// (`dataoffset != 0`), other element types, malformed bytes
+/// config's key lists. `None` for anything else: nested dims, NULL elements,
+/// other element types, malformed bytes
 pub fn decode_text_array(body: &[u8]) -> Option<Vec<String>> {
-    let word = |at: usize| Some(i32::from_le_bytes(body.get(at..at + 4)?.try_into().ok()?));
-    let (ndim, dataoffset, elemtype) = (word(0)?, word(4)?, word(8)? as u32);
-    if dataoffset != 0 || elemtype != crate::schema::TEXTOID || !(0..=1).contains(&ndim) {
+    let arr = ArrayBody::parse(body, array_elem(crate::schema::TEXTARRAYOID)?).ok()?;
+    if arr.ndim() > 1 || arr.has_nulls() {
         return None;
     }
-    if ndim == 0 {
-        return Some(Vec::new());
-    }
-    let nitems = usize::try_from(word(12)?).ok()?;
-    // ARR_DATA_PTR: MAXALIGN(sizeof(ArrayType) + 2 * 4 * ndim) less stripped header
-    let mut cursor = 20usize;
-    let mut values = Vec::with_capacity(nitems);
-    for _ in 0..nitems {
-        cursor = cursor.next_multiple_of(4);
-        // Elements keep their own varlena header, nominal-aligned (`array_out`)
-        let first = *body.get(cursor)?;
-        let (header, total) = if first & 1 != 0 {
-            (1, (first >> 1) as usize)
-        } else {
-            (4, (word(cursor)? as u32 >> 2) as usize)
-        };
-        let text = body.get(cursor + header..cursor.checked_add(total)?)?;
-        values.push(std::str::from_utf8(text).ok()?.to_owned());
-        cursor += total;
-    }
-    Some(values)
+    arr.elements()
+        .map(|e| Some(std::str::from_utf8(e.ok()??).ok()?.to_owned()))
+        .collect()
 }
 
 #[cfg(test)]
@@ -63,10 +46,16 @@ mod tests {
         empty[8..12].copy_from_slice(&crate::schema::TEXTOID.to_le_bytes());
         assert!(decode_text_array(&empty).unwrap().is_empty());
 
-        // dataoffset != 0 marks a NULL bitmap
-        let mut with_null = text_array_body(&["tenant"]);
-        with_null[4..8].copy_from_slice(&32i32.to_le_bytes());
-        assert_eq!(decode_text_array(&with_null), None);
+        let stored = super::super::stored_array;
+        for refused in [
+            stored(1009, &[(2, 1)], &[Some(b"tenant"), None]),
+            stored(1009, &[(1, 1), (1, 1)], &[Some(b"a")]),
+            stored(1009, &[(1, 1)], &[Some(b"\xff")]),
+            stored(1015, &[(1, 1)], &[Some(b"a")]),
+            text_array_body(&["tenant"])[..22].to_vec(),
+        ] {
+            assert_eq!(decode_text_array(&refused), None, "{refused:?}");
+        }
 
         // 1-byte varlena header: length byte counts itself, `(len << 1) | 1`
         let mut short = text_array_body(&[]);

@@ -393,13 +393,14 @@ async fn one_request_covers_a_whole_sealed_batch() {
         "walshadow-oracle-batching",
         "CREATE TABLE public.bt (id int PRIMARY KEY, tags int[]);\n",
         "CREATE OR REPLACE TABLE walshadow_test.bt (\
-            id Int32, tags Array(Int32),\
+            id Int32, tags Array(Int64),\
             _lsn UInt64, _xid UInt32, _commit_ts DateTime64(6, 'UTC'), _is_deleted Bool\
          ) ENGINE = ReplacingMergeTree(_lsn, _is_deleted) ORDER BY id",
+        // Widened elements keep int4[] on the oracle
         vec![fx::TableMappingSpec {
             source_table: RelName::new("public", "bt"),
             target_table: TableTarget::new("walshadow_test", "bt"),
-            columns: vec![col(1, "id", "Int32"), col(2, "tags", "Array(Int32)")],
+            columns: vec![col(1, "id", "Int32"), col(2, "tags", "Array(Int64)")],
         }],
         &format!(
             "INSERT INTO public.bt SELECT g, ARRAY[g, g + 1] FROM generate_series(1, {ROWS}) g;\n\
@@ -631,4 +632,280 @@ async fn array_update_under_rif_resolves_old_tuple() {
             .unwrap(),
         "{3,4}",
     );
+}
+
+/// Source column, local target, and an oracle-bound twin target of equal
+/// text: widened or LowCardinality elements keep the twin on the oracle
+const TWINS: [(&str, &str, &str, &str); 21] = [
+    (
+        "i4",
+        "int4[]",
+        "Array(Nullable(Int32))",
+        "Array(Nullable(String))",
+    ),
+    (
+        "i2",
+        "int2[]",
+        "Array(Nullable(Int16))",
+        "Array(Nullable(String))",
+    ),
+    (
+        "i8",
+        "int8[]",
+        "Array(Nullable(Int64))",
+        "Array(Nullable(String))",
+    ),
+    (
+        "b",
+        "bool[]",
+        "Array(Nullable(Bool))",
+        "Array(Nullable(String))",
+    ),
+    (
+        "f4",
+        "real[]",
+        "Array(Nullable(Float32))",
+        "Array(Nullable(String))",
+    ),
+    (
+        "f8",
+        "float8[]",
+        "Array(Nullable(Float64))",
+        "Array(Nullable(String))",
+    ),
+    (
+        "o",
+        "oid[]",
+        "Array(Nullable(UInt32))",
+        "Array(Nullable(String))",
+    ),
+    (
+        "u",
+        "uuid[]",
+        "Array(Nullable(UUID))",
+        "Array(Nullable(String))",
+    ),
+    (
+        "t",
+        "text[]",
+        "Array(Nullable(String))",
+        "Array(LowCardinality(Nullable(String)))",
+    ),
+    (
+        "v",
+        "varchar[]",
+        "Array(String)",
+        "Array(LowCardinality(String))",
+    ),
+    (
+        "bp",
+        "char(3)[]",
+        "Array(Nullable(String))",
+        "Array(LowCardinality(Nullable(String)))",
+    ),
+    (
+        "n",
+        "name[]",
+        "Array(Nullable(String))",
+        "Array(LowCardinality(Nullable(String)))",
+    ),
+    (
+        "j",
+        "jsonb[]",
+        "Array(Nullable(String))",
+        "Array(LowCardinality(Nullable(String)))",
+    ),
+    (
+        "ip",
+        "inet[]",
+        "Array(Nullable(String))",
+        "Array(LowCardinality(Nullable(String)))",
+    ),
+    (
+        "net",
+        "cidr[]",
+        "Array(Nullable(String))",
+        "Array(LowCardinality(Nullable(String)))",
+    ),
+    (
+        "iv",
+        "interval[]",
+        "Array(Nullable(String))",
+        "Array(LowCardinality(Nullable(String)))",
+    ),
+    (
+        "tz",
+        "timetz[]",
+        "Array(Nullable(String))",
+        "Array(LowCardinality(Nullable(String)))",
+    ),
+    (
+        "mac",
+        "macaddr[]",
+        "Array(Nullable(String))",
+        "Array(LowCardinality(Nullable(String)))",
+    ),
+    (
+        "mac8",
+        "macaddr8[]",
+        "Array(Nullable(String))",
+        "Array(LowCardinality(Nullable(String)))",
+    ),
+    (
+        "ct",
+        "tid[]",
+        "Array(Nullable(String))",
+        "Array(LowCardinality(Nullable(String)))",
+    ),
+    // Added below with a fast default, read back by delete markers
+    (
+        "extra",
+        "int4[]",
+        "Array(Nullable(Int32))",
+        "Array(Nullable(String))",
+    ),
+];
+
+/// Arrays encoded in process land as the oracle converts them, across
+/// NULL elements, empty and NULL arrays, lower bounds, TOAST, updates,
+/// deletes, and a fast default
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn local_arrays_match_oracle_twins() {
+    if !fx::tools::requirements_available() {
+        return;
+    }
+    let source_cols: Vec<String> = TWINS[..20]
+        .iter()
+        .map(|(c, pg, _, _)| format!("{c} {pg}"))
+        .collect();
+    let mut ch_cols = vec!["id Int32".to_owned()];
+    let mut columns = vec![col(1, "id", "Int32")];
+    for (i, (c, _, local, twin)) in TWINS.iter().enumerate() {
+        let attnum = i as i16 + 2;
+        ch_cols.push(format!("{c} {local}, {c}_o {twin}"));
+        columns.push(col(attnum, c, local));
+        columns.push(col(attnum, &format!("{c}_o"), twin));
+    }
+    let (source, ch, _tmp) = run_oracle(
+        fx::Ports::alloc(),
+        "walshadow-oracle-array-twins",
+        &format!(
+            "CREATE TABLE public.tw (id int PRIMARY KEY, {});\n\
+             ALTER TABLE public.tw REPLICA IDENTITY FULL;\n",
+            source_cols.join(", ")
+        ),
+        &format!(
+            "CREATE OR REPLACE TABLE walshadow_test.tw ({}, \
+                _lsn UInt64, _xid UInt32, _commit_ts DateTime64(6, 'UTC'), _is_deleted Bool\
+             ) ENGINE = ReplacingMergeTree(_lsn, _is_deleted) ORDER BY id",
+            ch_cols.join(", ")
+        ),
+        vec![fx::TableMappingSpec {
+            source_table: RelName::new("public", "tw"),
+            target_table: TableTarget::new("walshadow_test", "tw"),
+            columns,
+        }],
+        "INSERT INTO public.tw VALUES \
+            (1, '{1,NULL,-3}', '{7}', '{9000000000,NULL}', '{t,f,NULL}', '{1.5,-0.25}', \
+                '{2.5,NULL}', '{4294967295,0}', '{00112233-4455-6677-8899-aabbccddeeff,NULL}', \
+                '{a,\"b,c\",NULL,\"\"}', '{x}', '{ab,\"  \",NULL}', '{nm,NULL}', \
+                '{\"{\\\"a\\\": [1, null, \\\"x,y\\\"]}\",NULL,\"\\\"s\\\"\",7,\"null\"}', \
+                '{10.0.0.1/24,NULL,::1,fe80::1/64}', '{10.0.0.0/8,2001:db8::/32}', \
+                '{\"1 year 2 mons 3 days 04:05:06.7\",NULL,-00:00:01}', \
+                '{01:02:03+05:30,NULL,23:59:59.5-08}', '{08:00:2b:01:02:03,NULL}', \
+                '{08:00:2b:01:02:03:04:05}', '{\"(1,2)\",NULL,\"(4294967295,65535)\"}'),\
+            (2, '{}', '{}', '{}', '{}', '{}', '{}', '{}', '{}', '{}', '{}', '{}', '{}', \
+                '{}', '{}', '{}', '{}', '{}', '{}', '{}', '{}'),\
+            (3, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, \
+                NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL),\
+            (4, '[5:6]={1,2}', '[0:0]={3}', '[-2:-2]={4}', NULL, NULL, NULL, NULL, NULL, \
+                '[2:3]={p,q}', NULL, NULL, NULL, '[0:0]={\"[]\"}', '[3:3]={1.2.3.4}', NULL, \
+                NULL, NULL, NULL, NULL, NULL);\n\
+         INSERT INTO public.tw (id, i4, t, j) SELECT 5, \
+            ARRAY(SELECT g FROM generate_series(1, 3000) g), \
+            ARRAY(SELECT md5(g::text) FROM generate_series(1, 400) g), \
+            ARRAY(SELECT jsonb_build_object('k', g, 'v', md5(g::text)) \
+                FROM generate_series(1, 400) g);\n\
+         INSERT INTO public.tw (id, i4) VALUES (6, '{6}');\n\
+         ALTER TABLE public.tw ADD COLUMN extra int4[] DEFAULT '{1,NULL}';\n\
+         UPDATE public.tw SET i4 = '{10,11}', t = '{updated}' WHERE id = 1;\n\
+         UPDATE public.tw SET b = '{t}' WHERE id = 5;\n\
+         UPDATE public.tw SET j = '{\"{\\\"u\\\": true}\"}', ip = '{192.168.0.1}' WHERE id = 1;\n\
+         DELETE FROM public.tw WHERE id IN (2, 6);\n\
+         SELECT pg_switch_wal();\n",
+    )
+    .await;
+    let _src = fx::StopOnDrop { sh: &source };
+
+    let q = |sql: &str| ch.query(sql).unwrap();
+    for (c, _, _, _) in TWINS {
+        let differ = q(&format!(
+            "SELECT countIf(toString(arrayMap(x -> toString(x), {c})) != toString({c}_o)), \
+                 count() FROM walshadow_test.tw"
+        ));
+        assert_eq!(differ, "0\t10", "{c}: rows differing, rows");
+    }
+    let live = |id: i32, expr: &str| {
+        q(&format!(
+            "SELECT {expr} FROM walshadow_test.tw FINAL WHERE id = {id} AND _is_deleted = 0"
+        ))
+    };
+    assert_eq!(live(1, "i4, t, bp"), "[10,11]\t['updated']\t['ab','',NULL]");
+    assert_eq!(live(1, "j, ip"), "['{\"u\": true}']\t['192.168.0.1/32']");
+    assert_eq!(live(3, "i4, t, v"), "[]\t[]\t[]", "NULL arrays land empty");
+    assert_eq!(live(4, "i4, i2, i8, t"), "[1,2]\t[3]\t[4]\t['p','q']");
+    let md5 = source.psql_one("SELECT md5('400')").unwrap();
+    assert_eq!(
+        live(
+            5,
+            "length(i4), i4[3000], length(t), t[400], b, length(j), j[400]"
+        ),
+        format!("3000\t3000\t400\t{md5}\t[true]\t400\t{{\"k\": 400, \"v\": \"{md5}\"}}"),
+        "TOASTed arrays resolve, unchanged under an update",
+    );
+    assert_eq!(
+        q("SELECT extra, extra_o FROM walshadow_test.tw WHERE id = 6 AND _is_deleted = 1"),
+        "[1,NULL]\t['1',NULL]",
+        "delete marker reads the fast default",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn covered_arrays_skip_the_oracle() {
+    if !fx::tools::requirements_available() {
+        return;
+    }
+    let (source, ch, _tmp, oracle) = run_oracle_stats(
+        fx::Ports::alloc(),
+        "walshadow-oracle-local-arrays",
+        "CREATE TABLE public.la (id int PRIMARY KEY, ints int[], tags text[]);\n",
+        "CREATE OR REPLACE TABLE walshadow_test.la (\
+            id Int32, ints Array(Int32), tags Array(Nullable(String)),\
+            _lsn UInt64, _xid UInt32, _commit_ts DateTime64(6, 'UTC'), _is_deleted Bool\
+         ) ENGINE = ReplacingMergeTree(_lsn, _is_deleted) ORDER BY id",
+        vec![fx::TableMappingSpec {
+            source_table: RelName::new("public", "la"),
+            target_table: TableTarget::new("walshadow_test", "la"),
+            columns: vec![
+                col(1, "id", "Int32"),
+                col(2, "ints", "Array(Int32)"),
+                col(3, "tags", "Array(Nullable(String))"),
+            ],
+        }],
+        "INSERT INTO public.la SELECT g, ARRAY[g, g + 1], ARRAY['a', NULL] \
+            FROM generate_series(1, 50) g;\n\
+         SELECT pg_switch_wal();\n",
+    )
+    .await;
+    let _src = fx::StopOnDrop { sh: &source };
+
+    assert_eq!(
+        ch.query(
+            "SELECT count(), sum(ints[2]), countIf(tags = ['a', NULL]) FROM walshadow_test.la"
+        )
+        .unwrap(),
+        "50\t1325\t50",
+    );
+    use std::sync::atomic::Ordering;
+    assert_eq!(oracle.stats.blocks.load(Ordering::Relaxed), 0);
 }

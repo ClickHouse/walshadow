@@ -1,6 +1,7 @@
 //! PG datum decoders and output formatters, grouped by type family
 //! Decode varlena bodies without outer headers, fixed-width datums as stored
 
+mod array;
 mod fixed;
 mod inet;
 mod interval;
@@ -10,6 +11,7 @@ mod text_array;
 mod time;
 mod uuid;
 
+pub use array::{ARRAY_ELEMS, ArrayBody, ArrayElem, array_elem, array_from_send};
 pub(crate) use fixed::{
     decode_tid, encode_tid, macaddr_to_text, macaddr8_to_text, parse_macaddr, parse_tid,
     tid_to_text,
@@ -26,6 +28,8 @@ pub use text_array::decode_text_array;
 pub(crate) use time::{format_time_us, timetz_to_text};
 pub(crate) use uuid::uuid_to_ch_wire;
 
+#[cfg(test)]
+pub(crate) use array::tests::{send as array_send, stored as stored_array, stored_jsonb};
 #[cfg(test)]
 pub(crate) use text_array::text_array_body;
 
@@ -53,4 +57,8 @@ pub enum CodecError {
     },
     #[error("malformed jsonb container: {0}")]
     BadJsonbContainer(&'static str),
+    #[error("malformed array: {0}")]
+    BadArray(&'static str),
+    #[error("array element type {got}, column holds {want}")]
+    ArrayElemType { want: u32, got: u32 },
 }

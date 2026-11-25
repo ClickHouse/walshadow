@@ -346,8 +346,14 @@ Common mappings include:
 Nullable source columns become `Nullable(...)` unless used as ClickHouse sort
 keys or mapped to arrays or maps. Default array and map mappings turn NULL into
 empty containers
-Arrays, maps, and vectors currently use shadow PostgreSQL conversion, including
-when destination uses Native container types
+Arrays of `bool`, `smallint`, `integer`, `bigint`, `real`, `double precision`,
+`oid`, `uuid`, `text`, `varchar`, `char`, `name`, `jsonb`, `inet`, `cidr`,
+`interval`, `timetz`, `macaddr`, `macaddr8`, and `tid` convert in walshadow
+when destination keeps one `Array` layer of the element's default type,
+elements `Nullable` or not. Lower bounds drop, `char` elements lose trailing
+spaces, and `inet` elements keep `/32` or `/128`, as shadow conversion's
+`text` cast does. Other arrays, element type overrides, nested arrays, maps,
+and vectors use shadow PostgreSQL conversion
 
 PostgreSQL `time` columns need ClickHouse 25.6+ for `Time64`; walshadow sends
 `enable_time_time64_type` with its DDL, which 25.6 through 25.11 require
