@@ -22,7 +22,7 @@ use clap::Parser;
 use tokio::io::AsyncReadExt;
 use walrus::pg::wal::segment_file::open_segment_file;
 use walshadow::pos::Pos;
-use walshadow::record::CountingRecordSink;
+use walshadow::record::{CountingRecordSink, WAL_SEG_SIZE};
 use walshadow::segment_sink::DirSegmentSink;
 use walshadow::wal_stream::WalStream;
 
@@ -77,6 +77,12 @@ async fn run(args: Args) -> Result<()> {
             .with_context(|| format!("read input {}", input.display()))?;
         let seg_size = long_header_seg_size(&bytes)
             .with_context(|| format!("{}: no long page header", input.display()))?;
+        // Untrusted header: cap before resize, else a tiny file drives a huge allocation.
+        ensure!(
+            seg_size <= WAL_SEG_SIZE,
+            "{}: segment size {seg_size} exceeds cap {WAL_SEG_SIZE}",
+            input.display()
+        );
         ensure!(
             seg_size.is_power_of_two() && bytes.len() as u64 <= seg_size,
             "{}: {} bytes against segment size {seg_size}",
@@ -180,8 +186,14 @@ mod tests {
         let mut oversized = vec![0u8; 64];
         oversized[32..36].copy_from_slice(&16u32.to_le_bytes());
         std::fs::write(&short, oversized).unwrap();
-        let err = run_err(vec![short], out).await;
+        let err = run_err(vec![short.clone()], out.clone()).await;
         assert!(err.contains("64 bytes against segment size 16"), "{err}");
+
+        let mut huge = vec![0u8; 36];
+        huge[32..36].copy_from_slice(&0x8000_0000u32.to_le_bytes());
+        std::fs::write(&short, huge).unwrap();
+        let err = run_err(vec![short], out).await;
+        assert!(err.contains("exceeds cap 16777216"), "{err}");
     }
 
     /// Decompressed fixture bytes written under `name` in `dir`
