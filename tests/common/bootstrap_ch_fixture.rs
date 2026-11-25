@@ -65,7 +65,6 @@ impl ChServer {
                 "--mysql_port=",
                 "--postgresql_port=",
                 "--grpc_port=",
-                "--prometheus.port=",
                 "--listen_host=127.0.0.1",
                 &format!("--path={}/", data_dir.display()),
                 // Relative to the server's cwd otherwise, which drops SQL-created
