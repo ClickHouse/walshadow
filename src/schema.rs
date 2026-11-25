@@ -273,6 +273,15 @@ impl SchemaDiff {
 
 pub fn compute_schema_diff(old: &RelDescriptor, new: &RelDescriptor) -> SchemaDiff {
     let mut diff = SchemaDiff::default();
+    // shortcut: attnum 0 is a sentinel (no real column has attnum 0); downstream
+    // must rekey the name-keyed route from old to new, no column DDL applies here
+    if old.rel_name != new.rel_name {
+        diff.renamed_columns.push((
+            0,
+            old.rel_name.to_string(),
+            new.rel_name.to_string(),
+        ));
+    }
     let mut old_by_num: HashMap<i16, &RelAttr> = old
         .attributes
         .iter()
@@ -472,6 +481,23 @@ mod tests {
         let d = compute_schema_diff(&old, &new);
         assert!(d.dropped_columns.is_empty());
         assert!(d.added_columns.is_empty());
+    }
+
+    #[test]
+    fn schema_diff_detects_relation_rename() {
+        let mut old = mk_desc(16400, vec![mk_attr(1, "id", 23, true)]);
+        old.rel_name = RelName::new("public", "old_name");
+        let mut new = old.clone();
+        new.rel_name = RelName::new("public", "new_name");
+        let d = compute_schema_diff(&old, &new);
+        assert!(!d.is_empty());
+        assert_eq!(
+            d.renamed_columns,
+            vec![(0, "public.old_name".into(), "public.new_name".into())]
+        );
+        assert!(d.added_columns.is_empty());
+        assert!(d.dropped_columns.is_empty());
+        assert!(d.type_changes.is_empty());
     }
 
     #[test]
