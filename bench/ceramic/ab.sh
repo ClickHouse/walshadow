@@ -5,6 +5,8 @@
 # BIN_A/B and BRIDGE_LIB_DIR_A/B override build artifacts for each side.
 # TOAST_READ_AHEAD_A/B overrides the TOAST setting for each side.
 set -euo pipefail
+# awk parses summary decimals in the locale
+export LC_ALL=C
 A=${1:?usage: ab.sh <treeA> <treeB> [runs] [metric...]}; B=${2:?}; N=${3:-4}; shift 3 2>/dev/null || shift $#
 METRICS=${*:-drain mib_s rows_s toast_batches_s rec_s wait cores c_fetch f}
 HERE=$(cd "$(dirname "$0")" && pwd)
