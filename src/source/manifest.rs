@@ -14,6 +14,8 @@
 //! version = 1
 //! # resume LSN = decode floor = GC cut; segment-aligned, archive-clamped
 //! floor = "0/6A000000"
+//! # full xid held on source for floor, only with horizon pin
+//! horizon_xmin = 12884902665
 //!
 //! [source]           # identity gate for every spill-dir artifact
 //! system_id = 7334001234567890123
@@ -127,6 +129,11 @@ pub struct Manifest {
     /// Resume LSN = decode floor = GC cut. Segment-aligned,
     /// archive-clamped at write time via [`resolved_floor`].
     pub floor: Pos<Floor>,
+    /// Horizon pin's full xid for `floor`, see
+    /// [`HorizonPin`](crate::toast::horizon_pin::HorizonPin). Restart holds it
+    /// again so source keeps values rows above `floor` still reference
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub horizon_xmin: Option<u64>,
     pub source: SourceIdentity,
     /// Absent in manifests written before timeline crossing landed; those runs
     /// never left the floor's branch, so the floor timeline is also the stream's
@@ -369,6 +376,7 @@ mod tests {
         Manifest {
             version: MANIFEST_VERSION,
             floor: (0x0123_4564_0000_0000 & !(SEG - 1)).into(),
+            horizon_xmin: None,
             source: ident(),
             wal: WalBranch { stream_timeline: 2 },
             lsn: LsnSet {
@@ -421,6 +429,16 @@ shadow_flush = \"1234563/0\"
         let text = toml::to_string(&sample()).unwrap();
         assert_eq!(text, EXPECTED);
         assert_eq!(toml::from_str::<Manifest>(EXPECTED).unwrap(), sample());
+        let pinned = Manifest {
+            horizon_xmin: Some((3 << 32) + 777),
+            ..sample()
+        };
+        let text = toml::to_string(&pinned).unwrap();
+        assert!(
+            text.starts_with("version = 2\nfloor = \"1234564/0\"\nhorizon_xmin = 12884902665\n"),
+            "{text}"
+        );
+        assert_eq!(toml::from_str::<Manifest>(&text).unwrap(), pinned);
     }
 
     #[test]

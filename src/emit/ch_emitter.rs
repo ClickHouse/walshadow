@@ -362,6 +362,14 @@ pub struct ToastSettings {
     pub mode: ToastMode,
     /// Start speculative TOAST reads before planning
     pub read_ahead: Option<bool>,
+    /// Hold source vacuum horizon for shadow reads, default true
+    pub source_horizon_pin: Option<bool>,
+}
+
+impl ToastSettings {
+    pub fn pins_source_horizon(&self) -> bool {
+        self.mode.is_shadow() && self.source_horizon_pin.unwrap_or(true)
+    }
 }
 
 pub(crate) const DEFAULT_INLINE_VALUE_MAX: usize = 1 << 30;

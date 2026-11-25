@@ -88,18 +88,28 @@ pub fn parse_xl_heap_truncate(mut md: &[u8]) -> Option<HeapTruncate> {
 /// Info byte for running-xacts records
 pub const XLOG_RUNNING_XACTS: u8 = 0x10;
 
-/// Offset of next xid in running-xacts payload
+/// Offset of next xid in running-xacts payload, oldest running xid follows
 const RUNNING_XACTS_NEXT_XID_OFFSET: usize = 12;
 /// Minimum running-xacts payload size
 const MIN_SIZE_OF_XACT_RUNNING_XACTS: usize = 24;
 
-/// Read next xid from a running-xacts payload
-pub fn parse_running_xacts_next_xid(md: &[u8]) -> Option<u32> {
+/// `xl_running_xacts` header fields (PG `src/include/storage/standbydefs.h`)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunningXacts {
+    pub next_xid: u32,
+    pub oldest_running_xid: u32,
+}
+
+pub fn parse_running_xacts(md: &[u8]) -> Option<RunningXacts> {
     if md.len() < MIN_SIZE_OF_XACT_RUNNING_XACTS {
         return None;
     }
     let at = RUNNING_XACTS_NEXT_XID_OFFSET;
-    Some(u32::from_le_bytes(md[at..at + 4].try_into().unwrap()))
+    let u32_at = |at: usize| u32::from_le_bytes(md[at..at + 4].try_into().unwrap());
+    Some(RunningXacts {
+        next_xid: u32_at(at),
+        oldest_running_xid: u32_at(at + 4),
+    })
 }
 
 /// `xl_relmap_update` header (PG `src/include/utils/relmapper.h`):
@@ -211,11 +221,16 @@ mod tests {
     }
 
     #[test]
-    fn running_xacts_next_xid_needs_full_header() {
+    fn running_xacts_needs_full_header() {
         let mut md = vec![0; MIN_SIZE_OF_XACT_RUNNING_XACTS];
         md[RUNNING_XACTS_NEXT_XID_OFFSET..][..4].copy_from_slice(&742u32.to_le_bytes());
-        assert_eq!(parse_running_xacts_next_xid(&md), Some(742));
-        assert_eq!(parse_running_xacts_next_xid(&md[..23]), None);
+        md[RUNNING_XACTS_NEXT_XID_OFFSET + 4..][..4].copy_from_slice(&731u32.to_le_bytes());
+        let want = RunningXacts {
+            next_xid: 742,
+            oldest_running_xid: 731,
+        };
+        assert_eq!(parse_running_xacts(&md), Some(want));
+        assert_eq!(parse_running_xacts(&md[..23]), None);
     }
 
     fn btree_reuse_record(spc: u32, db: u32, rel: u32) -> XLogRecord<'static> {

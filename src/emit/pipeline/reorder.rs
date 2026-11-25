@@ -1213,7 +1213,8 @@ impl ReorderSink {
                     commit_ts,
                     &mut view,
                     &resolver,
-                );
+                )
+                .with_commit_lsn(commit_lsn);
                 loop {
                     let Some(batch) = drain
                         .next_batch_admitting(batch_rows, batch_bytes, async |bytes| {

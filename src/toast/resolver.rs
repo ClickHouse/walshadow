@@ -1379,9 +1379,10 @@ impl ToastResolver {
         Some(value)
     }
 
-    pub fn forget_reads<'a>(&self, keys: impl IntoIterator<Item = &'a (u32, u32)>) {
+    /// Forget reads of `keys` reserved below `before`
+    pub fn forget_reads<'a>(&self, keys: impl IntoIterator<Item = &'a (u32, u32)>, before: u64) {
         if let Some(mut pending) = self.pending() {
-            keys.into_iter().for_each(|k| pending.forget(*k));
+            keys.into_iter().for_each(|k| pending.forget(*k, before));
         }
     }
 

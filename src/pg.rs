@@ -144,6 +144,18 @@ impl<'a> FromSql<'a> for Xid8 {
     accepts!(XID8);
 }
 
+/// `xid`, transaction id without epoch
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Xid(pub u32);
+
+impl<'a> FromSql<'a> for Xid {
+    fn from_sql(_: &Type, raw: &'a [u8]) -> Result<Self, SqlError> {
+        Ok(Self(u32::from_be_bytes(raw.try_into()?)))
+    }
+
+    accepts!(XID);
+}
+
 /// `tid`, heap tuple slot as (block, offset)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Tid(pub u32, pub u16);
@@ -259,6 +271,15 @@ mod tests {
         assert!(Xid8::from_sql(&Type::XID8, &raw[1..]).is_err());
         assert!(<Xid8 as FromSql>::accepts(&Type::XID8));
         assert!(!<Xid8 as FromSql>::accepts(&Type::INT8));
+    }
+
+    #[test]
+    fn xid_reads_big_endian() {
+        let raw = [0, 0, 1, 2];
+        assert_eq!(Xid::from_sql(&Type::XID, &raw).unwrap(), Xid(258));
+        assert!(Xid::from_sql(&Type::XID, &raw[1..]).is_err());
+        assert!(<Xid as FromSql>::accepts(&Type::XID));
+        assert!(!<Xid as FromSql>::accepts(&Type::XID8));
     }
 
     #[test]

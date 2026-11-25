@@ -142,6 +142,7 @@ pub(crate) fn resume_manifest(
     shadow_floor: manifest::ShadowFloor,
     stream_timeline: u32,
     lsn: manifest::LsnSet,
+    horizon_xmin: Option<u64>,
 ) -> manifest::Manifest {
     // A rewind (`--start-lsn`, `--ignore-cursor`) lowers the floor by seeding
     // `resume_floor` at the rewind point, never through these terms
@@ -162,6 +163,7 @@ pub(crate) fn resume_manifest(
     manifest::Manifest {
         version: manifest::MANIFEST_VERSION,
         floor,
+        horizon_xmin,
         source: manifest::SourceIdentity {
             system_id: identity.system_id,
             timeline: floor_timeline,
@@ -182,6 +184,7 @@ pub(crate) async fn commit_fork_resume(
     identity: &manifest::SourceIdentity,
     resume: walshadow::transition::ForkResume,
     lsn: manifest::LsnSet,
+    horizon_xmin: Option<u64>,
     resume_floor: &Monotone<Floor>,
     gc_floor: &Monotone<Floor>,
 ) -> Result<()> {
@@ -196,6 +199,7 @@ pub(crate) async fn commit_fork_resume(
     let committed = manifest::Manifest {
         version: manifest::MANIFEST_VERSION,
         floor,
+        horizon_xmin,
         source: manifest::SourceIdentity {
             system_id: identity.system_id,
             timeline: resume.timeline(),

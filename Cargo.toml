@@ -122,6 +122,10 @@ harness = false
 name = "jsonb"
 harness = false
 
+[[bench]]
+name = "shadow_toast_horizon"
+harness = false
+
 [dev-dependencies]
 walshadow = { path = ".", features = ["test-support"] }
 # Pre-main tracing subscriber for tests

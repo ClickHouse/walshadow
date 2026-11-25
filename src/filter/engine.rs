@@ -35,6 +35,7 @@ use crate::filter::main_data;
 use crate::filter::shadow_relations::ShadowRelations;
 use crate::record::{AffectedOid, BoundaryInfo, BoundaryKind, Route, rmgr_label};
 use crate::schema::FIRST_NORMAL_OBJECT_ID;
+use crate::toast::horizon_pin::HorizonPin;
 use crate::toast::xid_ceiling::{XidCeiling, follows};
 use foldhash::{HashMap, HashSet, HashSetExt};
 
@@ -156,6 +157,8 @@ pub struct Filter {
     /// Xid ceilings the shadow TOAST store reads. Absent for offline
     /// filters, which serve no reads
     xid_ceiling: Option<Arc<XidCeiling>>,
+    /// Source xmin held for shadow TOAST reads, absent when not pinning
+    horizon_pin: Option<HorizonPin>,
     skip_stats: Option<Arc<DecoderStats>>,
     header_routing: bool,
 }
@@ -173,6 +176,7 @@ impl Filter {
             creating_dbs: HashMap::default(),
             shadow_rels: None,
             xid_ceiling: None,
+            horizon_pin: None,
             skip_stats: None,
             header_routing: false,
         }
@@ -219,6 +223,15 @@ impl Filter {
     /// Feed xid ceilings for shadow TOAST generation checks
     pub fn set_xid_ceiling(&mut self, ceiling: Arc<XidCeiling>) {
         self.xid_ceiling = Some(ceiling);
+    }
+
+    /// Sample running xacts into source horizon pin
+    pub fn set_horizon_pin(&mut self, pin: HorizonPin) {
+        self.horizon_pin = Some(pin);
+    }
+
+    pub fn horizon_pin_mut(&mut self) -> Option<&mut HorizonPin> {
+        self.horizon_pin.as_mut()
     }
 
     /// Scope descriptor-capture input to the followed database. Live
@@ -371,9 +384,12 @@ impl Filter {
         // Running-xacts records provide observation points during streaming
         if record.header.resource_manager_id == RmId::Standby as u8
             && record.header.info & 0xF0 == main_data::XLOG_RUNNING_XACTS
-            && let Some(next_xid) = main_data::parse_running_xacts_next_xid(&record.main_data)
+            && let Some(running) = main_data::parse_running_xacts(&record.main_data)
         {
-            self.observe_from_xid(next_xid);
+            self.observe_from_xid(running.next_xid);
+            if let Some(pin) = &mut self.horizon_pin {
+                pin.observe(source_lsn, running.next_xid, running.oldest_running_xid);
+            }
         }
         let xid = record.header.xact_id;
         if xid != 0
@@ -1561,6 +1577,16 @@ mod tests {
         r.header.info = main_data::XLOG_RUNNING_XACTS;
         r.main_data = std::borrow::Cow::Owned(md);
         r
+    }
+
+    #[test]
+    fn running_xacts_feed_horizon_pin() {
+        let mut f = target_filter();
+        f.set_horizon_pin(HorizonPin::seed(900, 500, None, None));
+        let mut r = running_xacts_rec(800);
+        r.main_data.to_mut()[16..20].copy_from_slice(&650u32.to_le_bytes());
+        f.decide_record(&r, 10, 0xD116).unwrap();
+        assert_eq!(f.horizon_pin_mut().unwrap().advance(10), 650);
     }
 
     /// Build an in-place pg_class statistics write

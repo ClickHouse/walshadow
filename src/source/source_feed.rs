@@ -19,11 +19,15 @@ use walrus::pg::backup::format_pg_lsn;
 use walrus::pg::replication::conn::{
     PgConfig, ReplicationConn, SystemIdentity, error_code, error_message, message_kind,
 };
-use walrus::pg::replication::stream::{Frame, build_status_update, decode_frame};
+use walrus::pg::replication::stream::{
+    Frame, build_status_update, decode_frame, now_pg_microseconds,
+};
 use walrus::pg::replication::tls::{SocketStream, SslMode, maybe_upgrade};
 
+use crate::pg::{Xid, Xid8};
 use crate::pos::{Floor, Pos, ResumeSafe, ShadowReplay, SourceReceived};
 use crate::source::manifest::ShadowFloor;
+use crate::toast::horizon_pin::HorizonPin;
 
 /// Matches wal-rus / wal-g defaults; servers tolerate up to
 /// `wal_sender_timeout` of silence (default 60s).
@@ -142,6 +146,9 @@ pub struct StandbyStatus {
     /// `apply_lsn` PG sees: bounded by shadow replay LSN and CH emitter
     /// ack LSN, so source's slot won't recycle un-consumed WAL.
     pub apply_lsn: Pos<ResumeSafe>,
+    /// Full xid sent as hot-standby feedback xmin, zero releases a held one.
+    /// None sends no feedback
+    pub horizon_xmin: Option<u64>,
 }
 
 impl StandbyStatus {
@@ -165,6 +172,7 @@ impl StandbyStatus {
             write_lsn,
             flush_lsn: floor.min(apply_lsn.retag()),
             apply_lsn,
+            horizon_xmin: None,
         }
     }
 
@@ -174,6 +182,7 @@ impl StandbyStatus {
             write_lsn: Pos::new(lsn),
             flush_lsn: Pos::new(lsn),
             apply_lsn: Pos::new(lsn),
+            horizon_xmin: None,
         }
     }
 }
@@ -214,6 +223,30 @@ fn prepare_status(status: StandbyStatus, floors: &mut StatusFloors) -> StandbySt
             Pos::ZERO
         },
         apply_lsn: floors.apply,
+        horizon_xmin: status.horizon_xmin,
+    }
+}
+
+/// Hot-standby feedback `'h'` with no catalog xmin, see PG
+/// `ProcessStandbyHSFeedbackMessage`. Physical slot persists xmin, later
+/// feedback only raises it
+fn build_hs_feedback(xmin: u64) -> [u8; 25] {
+    let mut out = [0; 25];
+    out[0] = b'h';
+    out[1..9].copy_from_slice(&now_pg_microseconds().to_be_bytes());
+    out[9..13].copy_from_slice(&(xmin as u32).to_be_bytes());
+    out[13..17].copy_from_slice(&((xmin >> 32) as u32).to_be_bytes());
+    out
+}
+
+/// Standby source forwards xmin to its primary, where vacuum runs, only with
+/// `hot_standby_feedback`, see PG `XLogWalRcvSendHSFeedback`
+fn warn_unforwarded_feedback(unforwarded: bool) {
+    if unforwarded {
+        tracing::warn!(
+            target: "walshadow::source_feed",
+            "source is a standby with hot_standby_feedback off, horizon pin holds nothing on its primary",
+        );
     }
 }
 
@@ -241,12 +274,83 @@ pub struct SourceFeed {
     sql_client: Option<Client>,
     status_interval: Duration,
     last_status: Instant,
+    /// Feedback xmin source last heard and keeps until told otherwise
+    horizon_sent: Option<u64>,
     receive_deadline: Option<Instant>,
     parked_status_error: Option<anyhow::Error>,
     floors: StatusFloors,
     /// Most recent `server_wal_end` from a WAL frame or keepalive;
     /// surfaces "source ahead by N" without re-issuing IDENTIFY_SYSTEM.
     last_server_wal_end: u64,
+    /// Started on first `horizon_samples` call, stops with feed
+    horizon: Option<HorizonSampler>,
+}
+
+/// Running-xacts records arrive every 15s (`LOG_SNAPSHOT_INTERVAL_MS`)
+const HORIZON_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Statement snapshot precedes reading insert position, so every transaction
+/// writing at or after that position has an xid at or above snapshot xmin.
+/// Standby sources return no row, their running-xacts records still pin
+const HORIZON_SAMPLE_SQL: &str = "SELECT pg_current_wal_insert_lsn(), \
+     pg_snapshot_xmin(pg_current_snapshot()) WHERE NOT pg_is_in_recovery()";
+
+struct HorizonSampler {
+    rx: tokio::sync::mpsc::Receiver<(u64, u64)>,
+    _task: tokio_util::task::AbortOnDropHandle<()>,
+}
+
+impl HorizonSampler {
+    fn spawn(cfg: PgConfig, every: Duration) -> Self {
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let task = tokio::spawn(async move {
+            let mut tick = tokio::time::interval(every);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut client = None;
+            let mut failing = false;
+            loop {
+                tick.tick().await;
+                let sampled = async {
+                    let c = if let Some(c) = &client {
+                        c
+                    } else {
+                        client.insert(open_sql_client(&cfg).await?)
+                    };
+                    c.query(HORIZON_SAMPLE_SQL, &[])
+                        .await
+                        .context("sample source snapshot")
+                };
+                let rows = match sampled.await {
+                    Ok(rows) => rows,
+                    Err(e) => {
+                        client = None;
+                        if !failing {
+                            tracing::warn!(
+                                target: "walshadow::source_feed",
+                                error = %format!("{e:#}"),
+                                "horizon sampler failed, pin follows running-xacts records until it recovers",
+                            );
+                        }
+                        failing = true;
+                        continue;
+                    }
+                };
+                if failing {
+                    tracing::info!(target: "walshadow::source_feed", "horizon sampler recovered");
+                    failing = false;
+                }
+                for row in rows {
+                    let (lsn, Xid8(xmin)): (PgLsn, Xid8) = (row.get(0), row.get(1));
+                    // Pump drains every iteration, a full channel only skips samples
+                    let _ = tx.try_send((lsn.into(), xmin));
+                }
+            }
+        });
+        Self {
+            rx,
+            _task: tokio_util::task::AbortOnDropHandle::new(task),
+        }
+    }
 }
 
 impl SourceFeed {
@@ -258,11 +362,27 @@ impl SourceFeed {
             sql_client: None,
             status_interval: DEFAULT_STATUS_INTERVAL,
             last_status: Instant::now(),
+            horizon_sent: None,
             receive_deadline: None,
             parked_status_error: None,
             floors: StatusFloors::default(),
             last_server_wal_end: 0,
+            horizon: None,
         })
+    }
+
+    /// `(insert LSN, full snapshot xmin)` pairs sampled since last call, on a
+    /// connection of their own so a slow source never stalls pump. None on
+    /// first call, which starts sampling this connection
+    pub fn horizon_samples(&mut self) -> Option<Vec<(u64, u64)>> {
+        let Some(sampler) = &mut self.horizon else {
+            self.horizon = Some(HorizonSampler::spawn(
+                self.cfg.clone(),
+                HORIZON_SAMPLE_INTERVAL,
+            ));
+            return None;
+        };
+        Some(std::iter::from_fn(|| sampler.rx.try_recv().ok()).collect())
     }
 
     pub fn with_status_interval(mut self, interval: Duration) -> Self {
@@ -326,9 +446,6 @@ impl SourceFeed {
         status: StandbyStatus,
         buf: &'b mut Vec<u8>,
     ) -> Result<SourceEvent<'b>> {
-        if let Some(err) = self.parked_status_error.take() {
-            return Err(err);
-        }
         buf.clear();
         loop {
             // tokio::select! drops losing futures.
@@ -339,15 +456,16 @@ impl SourceFeed {
                 Instant::now() < deadline,
                 "source replication receive timeout"
             );
-            if Instant::now() >= self.status_due() {
-                self.send_status(status, true).await?;
-            }
+            self.report(status, false).await;
             let wake = self
                 .status_due()
                 .max(Instant::now() + Duration::from_millis(50));
             let Ok(msg) =
                 tokio::time::timeout_at(deadline.min(wake), self.conn.recv_message()).await
             else {
+                if let Some(err) = self.parked_status_error.take() {
+                    return Err(err);
+                }
                 continue;
             };
             let msg = msg?;
@@ -367,7 +485,7 @@ impl SourceFeed {
                         }
                         Frame::Keepalive(k) => {
                             if k.reply_requested {
-                                self.send_status(status, true).await?;
+                                self.report(status, true).await;
                             }
                             self.last_server_wal_end = k.server_wal_end;
                         }
@@ -450,6 +568,26 @@ impl SourceFeed {
         }
     }
 
+    /// Send changed feedback, and status when due or `reply` is owed. Source
+    /// holds nothing until first feedback, and vacuums past a stale pin.
+    /// A failed write parks: source may have closed behind frames still
+    /// unread, such as WAL up to a switchpoint
+    async fn report(&mut self, status: StandbyStatus, reply: bool) {
+        if self.parked_status_error.is_some() {
+            return;
+        }
+        let sent = async {
+            self.send_feedback(status.horizon_xmin).await?;
+            if reply || Instant::now() >= self.status_due() {
+                self.send_status(status, true).await?;
+            }
+            anyhow::Ok(())
+        };
+        if let Err(err) = sent.await {
+            self.parked_status_error = Some(err);
+        }
+    }
+
     async fn send_status(&mut self, status: StandbyStatus, request_reply: bool) -> Result<()> {
         let held = prepare_status(status, &mut self.floors);
         let mut payload = build_status_update(
@@ -460,8 +598,54 @@ impl SourceFeed {
         // Avoid soliciting replies while the pump isn't reading from COPY.
         *payload.last_mut().expect("standby status reply flag") = u8::from(request_reply);
         self.conn.send_copy_data(&payload).await?;
+        self.send_feedback(held.horizon_xmin).await?;
         self.last_status = Instant::now();
         Ok(())
+    }
+
+    /// Feedback frame alone, so a moving pin neither asks source for a
+    /// keepalive nor defers timed status. Source keeps xmin it last heard, so
+    /// an unchanged one is not sent again
+    async fn send_feedback(&mut self, xmin: Option<u64>) -> Result<()> {
+        if let Some(xmin) = xmin.filter(|x| self.horizon_sent != Some(*x)) {
+            self.conn.send_copy_data(&build_hs_feedback(xmin)).await?;
+            self.horizon_sent = Some(xmin);
+        }
+        Ok(())
+    }
+
+    /// Seed horizon pin from source's current snapshot, `slot`'s held xmin and
+    /// `saved`, xmin an earlier run held for floor this one resumes from
+    pub async fn horizon_pin_seed(
+        &mut self,
+        slot: Option<&str>,
+        saved: Option<u64>,
+    ) -> Result<HorizonPin> {
+        let client = self.sql_client().await?;
+        let row = client
+            .query_one(
+                "SELECT pg_snapshot_xmax(s), pg_snapshot_xmin(s), \
+                 (SELECT xmin FROM pg_replication_slots WHERE slot_name = $1), \
+                 (SELECT max(age(datfrozenxid)) FROM pg_database), \
+                 pg_is_in_recovery() AND NOT current_setting('hot_standby_feedback')::bool \
+                 FROM pg_current_snapshot() s",
+                &[&slot],
+            )
+            .await
+            .context("read source xid horizon")?;
+        let (Xid8(next), Xid8(oldest)) = (row.get(0), row.get(1));
+        let frozen_age: i32 = row.get(3);
+        let slot_xmin: Option<Xid> = row.get(2);
+        warn_unforwarded_feedback(row.get(4));
+        // Rows deleted below oldest datfrozenxid are gone, and an xmin that
+        // far back would stall freezing
+        let frozen = next - frozen_age as u64;
+        Ok(HorizonPin::seed(
+            next,
+            oldest,
+            slot_xmin.map(|Xid(x)| x),
+            saved.map(|x| x.max(frozen)),
+        ))
     }
 
     pub fn server_version_num(&self) -> i32 {
@@ -687,6 +871,7 @@ mod tests {
             write_lsn: Pos::new(0x4000),
             flush_lsn: Pos::new(0x2000),
             apply_lsn: Pos::new(0x3000),
+            horizon_xmin: Some((5 << 32) + 777),
         };
 
         for flush in [0x2000, 0] {
@@ -700,6 +885,17 @@ mod tests {
             assert_eq!(server.read_u64().await.unwrap(), 0x3000);
             let _timestamp = server.read_u64().await.unwrap();
             assert_eq!(server.read_u8().await.unwrap(), 0, "no reply requested");
+            // Source keeps xmin it heard, second status repeats none
+            if flush == 0 {
+                continue;
+            }
+            assert_eq!(server.read_u8().await.unwrap(), b'd');
+            assert_eq!(server.read_u32().await.unwrap(), 29);
+            assert_eq!(server.read_u8().await.unwrap(), b'h');
+            let _timestamp = server.read_u64().await.unwrap();
+            assert_eq!(server.read_u32().await.unwrap(), 777, "xmin");
+            assert_eq!(server.read_u32().await.unwrap(), 5, "epoch");
+            assert_eq!(server.read_u64().await.unwrap(), 0, "no catalog xmin");
         }
     }
 
@@ -722,6 +918,82 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    /// Parked write error waits for a silent source, not one still sending
+    #[tokio::test]
+    async fn parked_error_surfaces_once_source_goes_quiet() {
+        let (mut feed, _server) = mock_feed().await;
+        feed.parked_status_error = Some(anyhow::anyhow!("parked"));
+        tokio::time::pause();
+        let mut buf = Vec::new();
+        let e = feed.next_event(StandbyStatus::default(), &mut buf).await;
+        assert_eq!(e.unwrap_err().to_string(), "parked");
+    }
+
+    /// Source that closed behind its last frames fails a write first. Frames
+    /// still read, then the close surfaces
+    #[tokio::test]
+    async fn failed_write_still_reads_frames_source_sent() {
+        let (mut feed, mut socket) = mock_feed().await;
+        for lsn in [0x100u64, 0x104] {
+            let mut frame = vec![b'w'];
+            frame.extend_from_slice(&lsn.to_be_bytes());
+            frame.extend_from_slice(&0x108u64.to_be_bytes());
+            frame.extend_from_slice(&0u64.to_be_bytes());
+            frame.extend_from_slice(b"WAL!");
+            backend(&mut socket, b'd', &frame).await;
+        }
+        drop(socket);
+        let mut buf = Vec::new();
+        // Each changed pin writes ahead of the read
+        for (xmin, lsn) in [(700, 0x100), (800, 0x104)] {
+            let status = StandbyStatus {
+                horizon_xmin: Some(xmin),
+                ..StandbyStatus::default()
+            };
+            let event = feed.next_event(status, &mut buf).await;
+            assert!(matches!(event, Ok(SourceEvent::Wal(c)) if c.start_lsn == lsn));
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let status = StandbyStatus {
+            horizon_xmin: Some(900),
+            ..StandbyStatus::default()
+        };
+        assert!(feed.next_event(status, &mut buf).await.is_err());
+    }
+
+    /// Pin change sends feedback alone ahead of timer, held pin sends nothing
+    #[tokio::test]
+    async fn pin_change_sends_feedback_ahead_of_timer() {
+        let (mut feed, mut server) = mock_feed().await;
+        let poll = Duration::from_millis(20);
+        let mut buf = Vec::new();
+        for (xmin, sent) in [(700, true), (700, false), (900, true)] {
+            let status = StandbyStatus {
+                horizon_xmin: Some(xmin),
+                ..StandbyStatus::default()
+            };
+            let event = tokio::time::timeout(poll, feed.next_event(status, &mut buf)).await;
+            assert!(event.is_err(), "source sent nothing");
+            if !sent {
+                let early = tokio::time::timeout(poll, server.read_u8()).await;
+                assert!(early.is_err(), "held pin sent ahead of timer");
+                continue;
+            }
+            let mut frame = [0; 30];
+            server.read_exact(&mut frame).await.unwrap();
+            assert_eq!(frame[5], b'h', "no status frame ahead of feedback");
+            assert_eq!(frame[14..18], (xmin as u32).to_be_bytes());
+        }
+        let late = tokio::time::timeout(poll, server.read_u8()).await;
+        assert!(late.is_err(), "pin change deferred or sent timed status");
+    }
+
+    #[test]
+    fn standby_without_feedback_forwarding_warns() {
+        warn_unforwarded_feedback(false);
+        warn_unforwarded_feedback(true);
     }
 
     #[tokio::test]
@@ -757,6 +1029,7 @@ mod tests {
                 write_lsn: 3000.into(),
                 flush_lsn: 1000.into(),
                 apply_lsn: 800.into(),
+                ..StandbyStatus::default()
             },
             &mut floors,
         );
@@ -767,6 +1040,7 @@ mod tests {
                 write_lsn: 3000.into(),
                 flush_lsn: 1500.into(),
                 apply_lsn: 1200.into(),
+                ..StandbyStatus::default()
             },
             &mut floors,
         );
@@ -781,6 +1055,7 @@ mod tests {
                 write_lsn: 5000.into(),
                 flush_lsn: 4000.into(),
                 apply_lsn: 4000.into(),
+                ..StandbyStatus::default()
             },
             &mut floors,
         );
@@ -790,6 +1065,7 @@ mod tests {
                 write_lsn: 4500.into(),
                 flush_lsn: 3000.into(),
                 apply_lsn: 3500.into(),
+                ..StandbyStatus::default()
             },
             &mut floors,
         );
@@ -808,6 +1084,7 @@ mod tests {
                     write_lsn: 4000.into(),
                     flush_lsn: flush.into(),
                     apply_lsn: 0.into(),
+                    ..StandbyStatus::default()
                 },
                 &mut floors,
             );
@@ -902,6 +1179,61 @@ mod tests {
         let (history, ()) = tokio::join!(feed.timeline_history(2), server);
         let e = history.unwrap_err();
         assert_eq!(e.to_string(), "TIMELINE_HISTORY 2");
+    }
+
+    /// Read frontend messages through one tagged `until`
+    async fn frontend(socket: &mut TcpStream, until: u8) {
+        loop {
+            let tag = socket.read_u8().await.unwrap();
+            let len = socket.read_u32().await.unwrap() as usize;
+            socket.read_exact(&mut vec![0; len - 4]).await.unwrap();
+            if tag == until {
+                break;
+            }
+        }
+    }
+
+    /// Unreachable source yields no samples, failed query redials until a
+    /// session answers
+    #[tokio::test]
+    async fn horizon_sampler_redials_after_failed_query() {
+        let closed = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut unreachable = HorizonSampler::spawn(
+            mock_cfg(closed.local_addr().unwrap().port()),
+            Duration::from_millis(5),
+        );
+        drop(closed);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let cfg = mock_cfg(listener.local_addr().unwrap().port());
+        let mut sampler = HorizonSampler::spawn(cfg, Duration::from_millis(5));
+        // Each session completes startup, then hangs up on sample query
+        for _ in 0..2 {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let len = socket.read_u32().await.unwrap() as usize;
+            socket.read_exact(&mut vec![0; len - 4]).await.unwrap();
+            backend(&mut socket, b'R', &0u32.to_be_bytes()).await;
+            backend(&mut socket, b'Z', b"I").await;
+            socket.read_u8().await.unwrap();
+        }
+        // Standby source answers with no row. Wait for next sample's parse,
+        // sent once sampler handled this answer
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let len = socket.read_u32().await.unwrap() as usize;
+        socket.read_exact(&mut vec![0; len - 4]).await.unwrap();
+        backend(&mut socket, b'R', &0u32.to_be_bytes()).await;
+        backend(&mut socket, b'Z', b"I").await;
+        let prepared: [(u8, &[u8]); 3] = [(b'1', b""), (b't', &[0, 0]), (b'n', b"")];
+        let executed: [(u8, &[u8]); 2] = [(b'2', b""), (b'C', b"SELECT 0\0")];
+        for answer in [&prepared[..], &executed[..]] {
+            frontend(&mut socket, b'S').await;
+            for &(tag, body) in answer {
+                backend(&mut socket, tag, body).await;
+            }
+            backend(&mut socket, b'Z', b"I").await;
+        }
+        frontend(&mut socket, b'P').await;
+        assert!(sampler.rx.try_recv().is_err());
+        assert!(unreachable.rx.try_recv().is_err());
     }
 
     /// Sidecar SQL rides the replication connection's transport settings

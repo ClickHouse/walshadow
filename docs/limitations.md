@@ -162,12 +162,14 @@ old values until merges finish
 [configuration](configuration.md#value-mode)) serves both a greenfield
 bootstrap and live CDC. It has three important limitations:
 
-- **No reclamation fence.** walshadow does not delay prune, vacuum,
-  `TRUNCATE`, `DROP TABLE`, or rewrite records during shadow replay. Shadow
-  applies them as soon as WAL arrives, while rows wait for ClickHouse. If
-  shadow removes a value before ClickHouse writes its row, the value becomes
-  NULL and increments `toast_values_filled_superseded`. Restart from a
-  position below durable processing progress has the same risk
+- **Partial reclamation fence.** `[toast] source_horizon_pin` holds source
+  xmin so prune and vacuum keep values pending rows reference. It does not
+  cover `TRUNCATE`, `DROP TABLE`, rewrites, bootstrap window, slot
+  invalidation, or time disconnected without `[source] slot`. Shadow applies those
+  as soon as WAL arrives, while rows wait for ClickHouse. If shadow removes a
+  value before ClickHouse writes its row, the value becomes NULL and increments
+  `toast_values_filled_superseded`. Pin also delays cleanup and freezing
+  across source cluster for as long as ClickHouse lags
 - **Shadow stores required data, not only catalog state.** Losing shadow does
   not lose a ClickHouse chunk mirror, but it does lose values stored by this
   mode. Recovery requires a fresh bootstrap

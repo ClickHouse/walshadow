@@ -136,6 +136,7 @@ pub struct Planner<'a, V> {
     rows_base: usize,
     /// Chunk generations whose value ids the resolver already forgot
     generations_seen: usize,
+    births_before: u64,
 }
 
 impl<'a, V: PlanRouteView> Planner<'a, V> {
@@ -158,7 +159,14 @@ impl<'a, V: PlanRouteView> Planner<'a, V> {
             resolver,
             rows_base: 0,
             generations_seen: 0,
+            births_before: u64::MAX,
         }
+    }
+
+    /// Births all precede commit, so reads reserved past it keep
+    pub fn with_commit_lsn(mut self, commit_lsn: u64) -> Self {
+        self.births_before = commit_lsn;
+        self
     }
 
     /// Fold one drained batch. Chunk generations release with the batch —
@@ -173,7 +181,7 @@ impl<'a, V: PlanRouteView> Planner<'a, V> {
         let ref_maps: Vec<&ChunkRefMap> = chunks.iter().map(|g| g.map()).collect();
         // Chunks born here start a new value under their id
         for map in ref_maps.iter().skip(self.generations_seen) {
-            self.resolver.forget_reads(map.keys());
+            self.resolver.forget_reads(map.keys(), self.births_before);
         }
         self.generations_seen = ref_maps.len();
         // One spool per xact; generations sealed before spooling carry None
@@ -1078,8 +1086,9 @@ mod tests {
             unmapped: Vec::new(),
         };
         let path = dir.join(format!("{xid}.plan"));
-        let mut planner = planner(path, 1 << 20, usize::MAX, &mut view, resolver);
         let commit = u64::from(xid) << 12 | 0x100;
+        let mut planner =
+            planner(path, 1 << 20, usize::MAX, &mut view, resolver).with_commit_lsn(commit);
         let stash = StashResolved::nothing_stashed(xid);
         let mut drain = b
             .drain_committed(stash, 0, commit, &[], false)

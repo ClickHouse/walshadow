@@ -1,43 +1,40 @@
 # Safe reclamation for shadow TOAST
 
-Shadow value mode can lose a value when PostgreSQL reclaims its chunks before
-ClickHouse finishes older row work. Prevent source reclamation where possible,
-and save values before shadow reclaims them otherwise. Neither approach delays
-shadow replay. See [shadow TOAST architecture](../architecture/shadow-toast.md)
-for current data flow
+Shadow value mode can lose a value when PostgreSQL removes its chunks before
+walshadow reads them for ClickHouse. The [source horizon
+pin](../architecture/shadow-toast.md#source-horizon-pin) tells PostgreSQL to
+keep chunks walshadow may still need. Start protecting them earlier, limit
+that protection, and save any needed values before shadow replays a record
+that removes them.
 
-## Source horizon pin
+## Pin from slot creation
 
-walshadow already streams as a physical standby using a slot. Optional
-hot-standby feedback can hold source xmin at oldest transaction pending work
-may still read. This prevents reclamation from entering WAL, so shadow has
-nothing to delay or stage
+Today the pin starts when live streaming begins. During bootstrap, source
+vacuum can remove chunks referenced by rows from the start of the backup.
+Walshadow reads some of those values only after replaying WAL from the backup
+window. The oldest transaction still running at stream startup can be too
+recent to protect those values.
 
-Derive advertised xmin from resolved floor, already used for retention and
-resume. Sample `oldestRunningXid` from `xl_running_xacts`. Unlike generation
-checks, round down: keep newest sample at or below floor, so rounding retains
-more history
+Right after creating the physical slot and before `BASE_BACKUP`, read a source
+snapshot's `xmin`. Start a short `START_REPLICATION` session on that slot and
+send `xmin` as feedback. The slot keeps it after the session ends. Keep sending
+the same `xmin` while streaming WAL from the backup window, then resume from
+the slot's `xmin` when live streaming begins. Bootstrap without a slot still
+runs without a pin.
 
-Include xid epoch: walsender silently rejects feedback whose xmin is not in
-recent past. A slot's xmin only moves forward, so hold pin continuously from
-stream start. Releasing and restoring it cannot protect values reclaimed
-while it was absent
+## Bounded pin
 
-Pin covers removal governed by transaction horizon: prune, vacuum, dead line
-pointers, and tail truncation. It also prevents value-ID reuse, because
-PostgreSQL reissues an ID only after all its chunks are gone
-
-Pin does not cover file removal or replacement: `TRUNCATE`, `DROP TABLE`, and
-rewrites through `VACUUM FULL`, `CLUSTER`, or `ALTER TABLE`. Slot invalidation
-under `max_slot_wal_keep_size` also loses pin, as does source promotion, which
-leaves new primary unprotected. Source bloat grows with ClickHouse lag, so
-document when to release pin and rely on spilling values instead
+The pin affects every table in the source cluster. A long outage holds back
+vacuum, including transaction ID freezing. Release the pin once its age in
+transactions or its WAL lag exceeds a limit, then rely on saved values.
+Publish the held `xmin`, its age, and whether the pin was released as metrics.
+Today operators can only read the slot's `age(xmin)` on source.
 
 ## Value spill
 
-Copy affected chunks out of shadow before it replays records that destroy them.
-This covers operations pin cannot prevent and deployments that disable it.
-Missing any requirement below can lose values
+Save needed chunks before shadow replays WAL that removes them. This covers
+operations the pin cannot prevent and lets walshadow run with the pin disabled
+or released.
 
 Persist spilled values before publishing WAL. `WalStream` sends record bytes
 before awaiting record sink, so copying in sink can race shadow replay. Add a
@@ -50,8 +47,58 @@ Cover every path that publishes to shadow: live stream, filtered archive, and
 backup-window replay during bootstrap. Any uncovered path can destroy values
 before they are saved
 
-Read affected chunks just before destructive record. Wait for shadow to replay
-up to that position using bytes already sent, without waiting for ClickHouse
+One TOAST heap saw over 3,000 `PRUNE_ON_ACCESS` records per second across
+thousands of pages, with no vacuum records. Pruning in the user table was
+several times more frequent and touched no TOAST chunks. See the
+[churn benchmark](../benches/shadow_toast_horizon.rs).
+
+Use the relation file number (`relfilenode`) to identify records that touch
+TOAST. Each prune record lists positions on a page. Looking up the value IDs
+and saving chunks for every record would require thousands of shadow queries
+and disk syncs per second before WAL could reach shadow.
+
+### Held reads
+
+Read-ahead already fetches TOAST values when the WAL scan finds rows that carry
+a pointer in place of a value. Have the extension return each chunk's bytes
+and its location in the heap (TID). Keep a map from `(filenode, block, offset)`
+to value while the row's WAL position is at or above the resolved floor.
+
+At a destructive record, intersect its removed offsets with held TIDs from WAL
+record alone. Persist only hits, then publish. Records without a hit publish
+without a shadow round trip or fsync. Whole-relation destruction persists every
+held value of that relation, bounding work by held set instead of TOAST heap
+size
+
+Gate shadow publication of a destructive record until every pointer decoded
+before it has a completed read. Gate depends on shadow replay below held
+position, never on ClickHouse or floor, so it adds read latency to catalog
+boundaries without deadlock described below
+
+Held set lives in memory under `[memory]` budget and drops entries once floor
+passes their referring record. Crash loses only unhit entries, whose chunks
+shadow still holds, so restart rereads them. Hit entries are fsynced before
+publication and survive
+
+Work grows with the number of rows whose values walshadow needs to read. With
+the pin off, the benchmark lost values for about 0.1% of rows carrying only a
+TOAST pointer with read-ahead on and about 0.5% with it off. Waiting for reads
+to finish covers cases where shadow rejected an early read, then removed the
+chunks before walshadow retried.
+
+Shadow replay already limits how fast walshadow catches up. While draining a
+backlog, shadow's startup process uses almost a full core and the queue
+worker spends part of its time waiting on reads. Keep the extra work out of
+PostgreSQL's replay process.
+
+### Batched spill
+
+Fallback for pointers without a held read, such as gate disabled or budget
+exhausted. Hold shadow publication at first destructive record of a window,
+read every pending-referenced value once at that position, and publish window.
+Chunks inserted inside window come from decoded WAL, not shadow
+
+### Entries
 
 Key entries by tablespace, database, filenode, value ID, and destroying LSN.
 Resolve reads using referring position to distinguish reused IDs

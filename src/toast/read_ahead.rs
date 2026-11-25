@@ -143,8 +143,12 @@ impl PendingReads {
         &self.budget
     }
 
-    pub fn forget(&mut self, key: Key) {
-        self.entries.remove(&key);
+    /// Drop read of `key` reserved below `before`. A later reservation saw
+    /// pointer only after birth, so it reads the new value
+    pub fn forget(&mut self, key: Key, before: u64) {
+        if self.entries.get(&key).is_some_and(|e| e.read.lsn < before) {
+            self.entries.remove(&key);
+        }
     }
 
     pub fn clear(&mut self) {
@@ -205,14 +209,21 @@ mod tests {
         let mut pending = PendingReads::new(MemoryBudget::new(1024));
         let budget = pending.budget().clone();
         let p = pointer(1, 1);
-        pending.reserve(1, &p, 100, |permit| async move {
+        let hold = |permit| async move {
             let _permit = permit;
             std::future::pending().await
-        });
+        };
+        pending.reserve(1, &p, 100, hold);
         settle().await;
         pending.reserve(1, &pointer(2, 1), 100, ready("v"));
         assert!(pending.take(1, &pointer(2, 1), 100).is_none());
-        pending.forget((p.va_toastrelid, p.va_valueid));
+        pending.forget((p.va_toastrelid, p.va_valueid), 100);
+        assert!(
+            pending.take(1, &p, 100).is_some(),
+            "reserved at birth bound"
+        );
+        pending.reserve(1, &p, 100, hold);
+        pending.forget((p.va_toastrelid, p.va_valueid), 101);
         settle().await;
         assert_eq!(budget.resident_bytes(), 0);
         pending.reserve(1, &pointer(2, 1), 100, ready("v"));

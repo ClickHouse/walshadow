@@ -1,5 +1,6 @@
 pub mod toast_retire;
 
+pub mod horizon_pin;
 mod read_ahead;
 mod resolver;
 pub mod shadow_landing;
