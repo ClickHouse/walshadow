@@ -34,23 +34,82 @@ read-only from resolver perspective; decoded chunk writes never go back into
 PostgreSQL
 
 Bounded speculative reads fetch and decompress values ahead of commit planning.
-Planning consumes matching results or resolves values normally. Chunk births
-and schema barriers invalidate speculative reads; these reads do not prevent
-shadow reclamation
+Planning consumes matching results or resolves values normally. Schema barriers
+invalidate speculative reads, and planning a commit that births chunks drops
+reads of those IDs reserved before that commit. Prescan skips only values born
+in referring transaction, whose chunks resolve from its own WAL. These reads do
+not prevent shadow reclamation
 
 Reads select database-specific bridge using referring row’s database OID.
 Batched bootstrap lookups include database OID in value keys, so identical
 TOAST relation and value IDs across databases stay separate
 
-PostgreSQL can reclaim chunks through prune, vacuum, truncate, drop, or rewrite
-before slower ClickHouse work reads them. Current mode reports such values as
-superseded and emits NULL or column default. To detect reused value IDs,
-extension reports newest chunk xmin and daemon compares it with highest xid
-assigned at referring record. Newer chunks indicate a replacement, whether
-complete or partial. A short run with an older xmin still indicates partial
-reclamation of original value.
-Planned work prevents source reclamation where possible and saves values before
-shadow reclaims them, see [safe reclamation plan](../plans/shadow_toast.md)
+PostgreSQL can remove TOAST chunks before walshadow reads them for ClickHouse.
+If chunks are gone or belong to a replacement value, walshadow reports the
+value as superseded and writes NULL or the column default. To spot a reused
+value ID, compare the newest chunk's `xmin` with the highest transaction ID
+assigned when the row's WAL record was written. A newer chunk belongs to a
+replacement. If some chunks are missing and the rest are older, PostgreSQL
+removed part of the original value.
+
+See how walshadow could save values before shadow removes them in the
+[safe reclamation plan](../plans/shadow_toast.md)
+
+## Source horizon pin
+
+With `[toast] source_horizon_pin`, walshadow uses hot standby feedback to tell
+source PostgreSQL which deleted row versions to keep. This keeps pruning and
+vacuum from removing TOAST chunks walshadow may still need. Shadow only removes
+chunks when it replays WAL from source.
+
+The resolved floor is the WAL position walshadow can safely restart from. It
+stays at or before the first record of any open transaction. Walshadow picks
+the latest transaction ID sample taken at or before that position. Any
+transaction that marks chunks as deleted at or after the sample's WAL
+position has an ID at least as high as the sample, so PostgreSQL keeps those
+chunks.
+
+PostgreSQL logs the oldest running transaction ID (`oldestRunningXid`) about
+every 15 seconds while busy. On a primary, walshadow also uses a separate SQL
+connection to read a snapshot's `xmin`, then `pg_current_wal_insert_lsn()`,
+once a second. A transaction writing at or after that WAL position was running
+when PostgreSQL took the snapshot or started later. Walshadow orders samples
+by WAL position because the SQL connection can sample WAL ahead of the stream.
+A new source connection may follow another timeline, so walshadow drops
+samples ahead of the WAL it has consumed. It warns once when sampling fails
+and falls back to `oldestRunningXid` until sampling recovers.
+
+Walshadow sends feedback only when the `xmin` changes, apart from standby
+status, because PostgreSQL keeps the last value it received.
+
+PostgreSQL checks the transaction ID's epoch in feedback to reject IDs from
+outside the recent past. Walshadow uses the source's next full transaction ID
+to work out the epoch for each 32-bit ID from WAL. With a physical replication
+slot, PostgreSQL keeps the slot's `xmin` when walshadow disconnects and can
+only advance or clear it.
+
+Walshadow saves the `xmin` for the resolved floor in the resume manifest. At
+startup it uses the slot's `xmin` if it has one, and warns when that is ahead
+of the saved `xmin`. Otherwise it uses the saved `xmin` or the source's oldest
+running transaction ID, whichever is older, and never goes below the oldest
+`datfrozenxid`. Without a slot, nothing holds `xmin` while walshadow is
+disconnected, and a slot can lose its `xmin` when the source crashes before a
+checkpoint. Restoring the saved `xmin` only protects chunks that vacuum has
+not yet removed. Connecting with the pin disabled clears any `xmin` held by
+an earlier session.
+
+The pin also prevents reuse of a value ID while any of its chunks remain.
+PostgreSQL checks the TOAST index with `SnapshotAny`, which includes chunks
+that ordinary queries cannot see. `TRUNCATE`, `DROP TABLE`, `VACUUM FULL`,
+`CLUSTER`, and `ALTER TABLE` rewrites can still remove or replace whole files.
+Slot invalidation and promotion can lose the pin, and bootstrap runs before
+it starts. A standby source forwards feedback upstream only with
+`hot_standby_feedback = on`, and walshadow warns at startup when it is off.
+
+Even when walshadow keeps up, the pin advances only as ClickHouse acknowledges
+writes, walshadow saves its progress, and the floor reaches the next WAL
+segment boundary. Keeping old versions of frequently updated rows reduces
+source throughput in the [churn benchmark](../benches/shadow_toast_horizon.rs).
 
 ## Implementation
 

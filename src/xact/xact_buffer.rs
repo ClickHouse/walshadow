@@ -61,8 +61,9 @@ use crate::decode::heap_decoder::{
 #[cfg(test)]
 use crate::decode::wal_xact::{
     XACT_XINFO_HAS_DBINFO, XACT_XINFO_HAS_GID, XACT_XINFO_HAS_INVALS, XACT_XINFO_HAS_SUBXACTS,
-    XACT_XINFO_HAS_TWOPHASE, XLOG_XACT_HAS_INFO, parse_xact_assignment, parse_xact_payload,
+    XACT_XINFO_HAS_TWOPHASE, XLOG_XACT_HAS_INFO, parse_xact_payload,
 };
+use crate::decode::wal_xact::{XLOG_XACT_ASSIGNMENT, XLOG_XACT_OPMASK, parse_xact_assignment};
 use crate::emit::ch_emitter::EmitterStats;
 use crate::ops::trace::{InflightSnapshotEntry, TxnSpanRegistry, new_txn_span};
 use crate::pos::{Commit, Drain, EmitterAck, Pos, ResumeSafe, XactFirst};
@@ -2844,24 +2845,58 @@ pub(crate) fn reassemble_value_ref(
     Ok(Reassembled::Bytes(finish_value(p, concat)?))
 }
 
+/// Chunk births keyed by value, with count in window and newest birth xid
 #[derive(Default)]
 struct RecentToastBirths {
     order: VecDeque<(u32, u32)>,
-    counts: foldhash::HashMap<(u32, u32), usize>,
+    counts: foldhash::HashMap<(u32, u32), (usize, u32)>,
+    /// Subxid → top xid, from WAL naming a subtransaction's parent. Empty
+    /// without savepoints
+    tops: foldhash::HashMap<u32, u32>,
+    tops_order: VecDeque<u32>,
 }
 
 impl RecentToastBirths {
-    fn insert(&mut self, key: (u32, u32)) {
-        if self.order.len() == 1024 {
+    const WINDOW: usize = 1024;
+
+    fn insert(&mut self, key: (u32, u32), xid: u32) {
+        if self.order.len() == Self::WINDOW {
             let oldest = self.order.pop_front().unwrap();
-            let count = self.counts.get_mut(&oldest).unwrap();
+            let (count, _) = self.counts.get_mut(&oldest).unwrap();
             *count -= 1;
             if *count == 0 {
                 self.counts.remove(&oldest);
             }
         }
         self.order.push_back(key);
-        *self.counts.entry(key).or_default() += 1;
+        let entry = self.counts.entry(key).or_default();
+        *entry = (entry.0 + 1, xid);
+    }
+
+    fn link(&mut self, sub: u32, top: u32) {
+        if self.tops.insert(sub, top).is_none() {
+            if self.tops_order.len() == Self::WINDOW
+                && let Some(oldest) = self.tops_order.pop_front()
+            {
+                self.tops.remove(&oldest);
+            }
+            self.tops_order.push_back(sub);
+        }
+    }
+
+    fn top(&self, xid: u32) -> u32 {
+        self.tops.get(&xid).copied().unwrap_or(xid)
+    }
+
+    /// Chunks born in referring transaction resolve from its own WAL. Values
+    /// born in another transaction need store. Subtransactions share their
+    /// top's WAL, recognized only once WAL links them, see PG
+    /// `XLR_BLOCK_ID_TOPLEVEL_XID` (wal_level=logical) and
+    /// `XLOG_XACT_ASSIGNMENT` (every 64 subxacts)
+    fn born_in(&self, key: (u32, u32), xid: u32) -> bool {
+        self.counts
+            .get(&key)
+            .is_some_and(|&(_, born)| born == xid || self.top(born) == self.top(xid))
     }
 }
 
@@ -2870,7 +2905,7 @@ impl RecentToastBirths {
 fn read_ahead_kept(
     ahead: &ToastResolver,
     rel: &RelDescriptor,
-    source_lsn: u64,
+    (source_lsn, xid): (u64, u32),
     images: &[HeapImages<TupleView<'_>>],
     born: &std::sync::Mutex<RecentToastBirths>,
 ) {
@@ -2886,19 +2921,18 @@ fn read_ahead_kept(
             {
                 born.lock()
                     .expect("recent toast births")
-                    .insert((rel.oid, u32::from_le_bytes(id)));
+                    .insert((rel.oid, u32::from_le_bytes(id)), xid);
             }
             continue;
         }
         for t in [&d.new, &d.old].into_iter().flatten() {
             for datum in &t.datums {
                 if let &DatumRef::External(p) = datum {
-                    let recent = born
+                    let own = born
                         .lock()
                         .expect("recent toast births")
-                        .counts
-                        .contains_key(&(p.va_toastrelid, p.va_valueid));
-                    if !recent {
+                        .born_in((p.va_toastrelid, p.va_valueid), xid);
+                    if !own {
                         ahead.read_ahead(rel.rfn.db_node, p, source_lsn);
                     }
                 }
@@ -2957,13 +2991,28 @@ impl BufferingDecoderSink {
         let logs = self.logs.clone();
         let born = std::sync::Mutex::new(RecentToastBirths::default());
         move |record| {
-            let rm = record.parsed.header.resource_manager_id;
-            let op = record.parsed.header.info & XLOG_HEAP_OPMASK;
+            let header = &record.parsed.header;
+            if record.parsed.toplevel_xid != 0 {
+                born.lock()
+                    .expect("recent toast births")
+                    .link(header.xact_id, record.parsed.toplevel_xid);
+            }
+            let rm = header.resource_manager_id;
+            let op = header.info & XLOG_HEAP_OPMASK;
             let insert = if rm == RmId::Heap as u8 {
                 op == XLOG_HEAP_INSERT
             } else if rm == RmId::Heap2 as u8 {
                 op == XLOG_HEAP2_MULTI_INSERT
             } else {
+                if rm == RmId::Xact as u8
+                    && header.info & XLOG_XACT_OPMASK == XLOG_XACT_ASSIGNMENT
+                    && let Some((top, subs)) = parse_xact_assignment(&record.parsed.main_data)
+                {
+                    let mut born = born.lock().expect("recent toast births");
+                    for sub in subs {
+                        born.link(sub, top);
+                    }
+                }
                 return;
             };
             if rm == RmId::Heap as u8 && op == XLOG_HEAP_TRUNCATE
@@ -2984,7 +3033,8 @@ impl BufferingDecoderSink {
                 return;
             }
             let images = view_heap_record(&record.parsed, &rel).unwrap_or_default();
-            read_ahead_kept(&ahead, &rel, record.source_lsn, &images, &born);
+            let at = (record.source_lsn, record.parsed.header.xact_id);
+            read_ahead_kept(&ahead, &rel, at, &images, &born);
         }
     }
 
@@ -6822,17 +6872,38 @@ mod tests {
     #[test]
     fn recent_toast_births_keep_duplicate_until_last_entry_evicted() {
         let mut born = RecentToastBirths::default();
-        born.insert((1, 1));
-        born.insert((1, 1));
+        born.insert((1, 1), 7);
+        born.insert((1, 1), 8);
         for id in 2..=1024 {
-            born.insert((1, id));
+            born.insert((1, id), 8);
         }
-        assert!(born.counts.contains_key(&(1, 1)));
+        assert!(born.born_in((1, 1), 8));
+        assert!(!born.born_in((1, 1), 7), "newest birth xid decides");
         assert_eq!(born.order.len(), 1024);
-        born.insert((2, 1));
+        born.insert((2, 1), 8);
         assert!(!born.counts.contains_key(&(1, 1)));
         assert!(born.counts.contains_key(&(2, 1)));
         assert_eq!(born.counts.len(), 1024);
+    }
+
+    /// Savepoint's value stays own for its top and siblings once WAL links
+    /// them, unlinked xids keep exact match
+    #[test]
+    fn recent_toast_births_follow_subxact_links() {
+        let mut born = RecentToastBirths::default();
+        born.insert((1, 1), 8);
+        assert!(!born.born_in((1, 1), 9), "unlinked sibling");
+        born.link(8, 7);
+        born.link(9, 7);
+        born.link(9, 7);
+        assert!(born.born_in((1, 1), 9) && born.born_in((1, 1), 7));
+        assert!(!born.born_in((1, 1), 10), "other transaction");
+        for sub in 100..100 + 1023 {
+            born.link(sub, 50);
+        }
+        assert_eq!(born.tops_order.len(), 1024);
+        assert!(!born.born_in((1, 1), 9), "link left window");
+        assert_eq!(born.tops.len(), 1024);
     }
 
     /// Ordinary rows buffer as WAL bytes and decode at commit against the
@@ -6869,6 +6940,23 @@ mod tests {
         prescan(&Record {
             parsed: truncate,
             route: Route::ToDecoder,
+            ..Default::default()
+        });
+        let mut linked = raws[0].to_xlog_record();
+        linked.header.xact_id = 2;
+        linked.toplevel_xid = 1;
+        prescan(&Record {
+            parsed: linked,
+            route: Route::ToDecoder,
+            ..Default::default()
+        });
+        let mut assignment = walrus::pg::walparser::XLogRecord::default();
+        assignment.header.resource_manager_id = RmId::Xact as u8;
+        assignment.header.info = XLOG_XACT_ASSIGNMENT;
+        let md = [1u32.to_le_bytes(), 1i32.to_le_bytes(), 3u32.to_le_bytes()].concat();
+        assignment.main_data = md.into();
+        prescan(&Record {
+            parsed: assignment,
             ..Default::default()
         });
         let uncovered_raw = multi_insert_raw(1, 0x201, 16999, &[1]);

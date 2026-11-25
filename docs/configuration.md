@@ -222,6 +222,7 @@ Tune chunk-store buffering independently of inserter count, restart daemon to ap
 | `put_batch_bytes` | 67,108,864 | Seal chunk INSERT after this many body bytes |
 | `connections` | `ch.inserter_pool_size` | Limit concurrent chunk-store connections |
 | `read_ahead` | `true` | Fetch and decode external values ahead of planning |
+| `source_horizon_pin` | `true` | In `shadow` mode, hold source vacuum horizon for values still pending |
 
 Both seals apply to bootstrap and WAL chunk writes. Each bootstrap drain holds
 its own batch, so more lanes can multiply buffered chunk bodies. A byte seal
@@ -278,6 +279,13 @@ ClickHouse. Choose it only when limits below are acceptable
 - Shadow can remove a value before ClickHouse writes its row during heavy lag,
   table maintenance, truncate, drop, or restart. Affected destination value
   becomes NULL, or column default when destination column is not Nullable
+- `source_horizon_pin` stops source VACUUM from removing values pending rows
+  still reference, by reporting an xmin as hot-standby feedback. It samples
+  source snapshot every second over one more SQL connection. It holds back
+  cleanup of every table in source cluster while ClickHouse lags. Set
+  `[source] slot` so pin holds while walshadow is disconnected, and watch
+  `SELECT age(xmin) FROM pg_replication_slots` against
+  `autovacuum_freeze_max_age`. Setting it `false` releases xmin slot holds
 - Buffering settings above have no effect because this mode writes no chunks
 - Changing mode requires a fresh bootstrap
 - Only default tablespace is supported. Bootstrap refuses a mapped table whose

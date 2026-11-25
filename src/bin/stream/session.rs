@@ -959,6 +959,7 @@ async fn session_body(
     if let (Some(end_lsn), Some(resume)) = (bootstrap_end_lsn, bootstrap_resume_lsn) {
         let initial = manifest::Manifest {
             version: manifest::MANIFEST_VERSION,
+            horizon_xmin: None,
             // Shadow replayed through end_lsn before handoff, so its bound
             // never cuts below resume ≤ end_lsn
             floor: manifest::FloorInputs {
@@ -1002,6 +1003,21 @@ async fn session_body(
         stream.filter_mut().enable_header_routing();
     }
     let shadow_toast = ch_config.as_ref().is_some_and(|c| c.toast.mode.is_shadow());
+    if ch_config
+        .as_ref()
+        .is_some_and(|c| c.toast.pins_source_horizon())
+    {
+        // Saved xmin answers for manifest floor, not for a start pinned elsewhere
+        let saved = manifest_at_boot
+            .as_ref()
+            .filter(|_| !pinned)
+            .and_then(|m| m.horizon_xmin);
+        let pin = feed
+            .horizon_pin_seed(source_conn.slot.as_deref(), saved)
+            .await
+            .context("seed source horizon pin")?;
+        stream.filter_mut().set_horizon_pin(pin);
+    }
     // Check TOAST availability for opt-in and configured relations
     let mut shadow_toast_held = None;
     if shadow_toast {
@@ -1487,6 +1503,8 @@ async fn session_body(
     // only delays slot advance, never overshoots it.
     let cursor_write_interval = Duration::from_secs(args.status_interval);
     let mut last_cursor_write: Option<Instant> = None;
+    // Horizon pin xmin in last manifest written
+    let mut horizon_saved: Option<u64> = None;
     // A shadow catching up through `restore_command` holds no stream, so its
     // replay has to be polled or the floor freezes
     let mut shadow_replay_poll = walshadow::ticker::Ticker::new(cursor_write_interval);
@@ -1776,7 +1794,7 @@ async fn session_body(
         };
         let shadow_floor =
             manifest::ShadowFloor::new(shadow_toast, shadow_replay.get(), shadow_replay_seed);
-        let cur = resume_manifest(
+        let mut cur = resume_manifest(
             &history,
             &live_identity,
             resume_floor.get(),
@@ -1790,12 +1808,18 @@ async fn session_body(
                 emitter_ack: resume_safe_lsn,
                 shadow_flush: shadow_flush_lsn.get(),
             },
+            horizon_saved,
         );
         if last_cursor_write.is_none_or(|t| t.elapsed() >= cursor_write_interval) {
             mirror_resolver
                 .flush_mirror()
                 .await
                 .context("flush TOAST mirror before publishing the floor")?;
+            // Restart from this floor holds same xmin, source hears it below
+            // once manifest is durable
+            let pin = stream.filter_mut().horizon_pin_mut();
+            horizon_saved = pin.map(|p| p.advance(cur.floor.get()));
+            cur.horizon_xmin = horizon_saved;
             let persisted = manifest::write(&args.spill_dir, &cur)
                 .await
                 .context("write resume manifest")?;
@@ -1811,13 +1835,28 @@ async fn session_body(
         // flush caps physical slot's restart_lsn.
         // Manifest writes are cadence-gated above while keepalive replies inside
         // next_event can send this status at any time.
-        let status = StandbyStatus::bounded(
+        let mut status = StandbyStatus::bounded(
             received,
             resume_floor.get(),
             resume_safe_lsn,
             shadow_replay,
             shadow_floor,
         );
+        // Unpinned sessions release any xmin slot kept from an earlier one
+        let floor = status.flush_lsn.get();
+        let consumed = stream.next_lsn().get();
+        let pin = stream.filter_mut().horizon_pin_mut();
+        status.horizon_xmin = Some(pin.map_or(0, |p| {
+            if let Some(samples) = feed.horizon_samples() {
+                for (lsn, xmin) in samples {
+                    p.sample(lsn, xmin);
+                }
+            } else {
+                // Connection before this one may have sampled another timeline
+                p.forget_above(consumed);
+            }
+            p.advance(floor)
+        }));
         let dispatched_before = stream.dispatched_lsn();
         // Set inside the select arm, acted on once the chunk borrow is released
         let mut ancestor_ended = false;
@@ -2155,6 +2194,7 @@ async fn session_body(
                             emitter_ack: resume_safe,
                             shadow_flush: shadow_flush_lsn.get(),
                         },
+                        horizon_saved,
                         &resume_floor,
                         &gc_floor,
                     )
@@ -2488,6 +2528,7 @@ async fn session_body(
                 emitter_ack: resume_safe,
                 shadow_flush: shadow_flush_lsn.get(),
             },
+            horizon_saved,
         ),
     )
     .await

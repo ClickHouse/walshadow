@@ -25,6 +25,7 @@ fn sample() -> Manifest {
     Manifest {
         version: MANIFEST_VERSION,
         floor: Pos::new(0x05),
+        horizon_xmin: Some(0x04),
         source: ident(),
         wal: WalBranch { stream_timeline: 3 },
         lsn: LsnSet {

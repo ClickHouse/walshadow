@@ -21,7 +21,9 @@ use crate::toast::{ChunkStore, ChunkStoreError, FetchedValue};
 /// Round-trip payload target. Always allow one value even when it exceeds limit
 const FETCH_REQUEST_BYTES: usize = 64 << 20;
 
-/// Poll cadence while waiting for shadow replay to cover a read
+/// Poll cadence while waiting for shadow replay to cover a read. Reads ahead
+/// usually trail replay by a few records, so start short and back off
+const REPLAY_POLL_MIN: Duration = Duration::from_millis(1);
 const REPLAY_POLL: Duration = Duration::from_millis(20);
 /// Maximum poll interval while worker socket cannot accept connections
 const UNREACHABLE_POLL_MAX: Duration = Duration::from_secs(1);
@@ -123,7 +125,7 @@ impl ShadowToastStore {
         let mut since = Instant::now();
         let mut last: Option<u64> = None;
         let mut unreachable = false;
-        let mut poll = REPLAY_POLL;
+        let mut poll = REPLAY_POLL_MIN;
         loop {
             match bridge.replay_lsn().await {
                 Ok(at) if at >= through => return Ok(()),
@@ -140,7 +142,7 @@ impl ShadowToastStore {
                     }
                     unreachable = false;
                     last = Some(at);
-                    poll = REPLAY_POLL;
+                    poll = poll.min(REPLAY_POLL);
                 }
                 Err(BridgeError::Io(e)) => {
                     if !unreachable {
@@ -173,6 +175,9 @@ impl ShadowToastStore {
                 }));
             }
             tokio::time::sleep(poll).await;
+            if !unreachable {
+                poll = (poll * 2).min(REPLAY_POLL);
+            }
         }
     }
 }
