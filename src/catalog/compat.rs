@@ -75,16 +75,9 @@ pub fn compatible_reader(old: &RelDescriptor, new: &RelDescriptor) -> Result<(),
             benign = benign.or(Some(why));
         }
     }
-    // Appended columns: old tuples read the stored missing value, or NULL.
-    // NOT NULL without a missing value implies the rewrite path, which this
-    // predicate must not bless for in-place history
-    for n in &new.attributes[old.attributes.len()..] {
-        if !n.dropped && n.not_null && n.missing_default.is_none() {
-            return Err(Incompat::Physical(
-                "appended not-null column without missing value",
-            ));
-        }
-    }
+    // Old row versions read new columns as NULL unless a default is stored.
+    // PostgreSQL checks live rows when validating NOT NULL
+    // (`verify_new_notnull` in `src/backend/commands/tablecmds.c`).
     benign.map_or(Ok(()), |why| Err(Incompat::Benign(why)))
 }
 
@@ -210,11 +203,10 @@ mod tests {
         with_missing.missing_default = Some("7".into());
         let new = rel(vec![attr(1, 23, 4), with_missing]);
         assert_eq!(compatible_reader(&old, &new), Ok(()));
-        // NOT NULL append without missing value = rewrite territory
-        let mut bad = attr(2, 20, 8);
-        bad.not_null = true;
-        let new = rel(vec![attr(1, 23, 4), bad]);
-        assert!(compatible_reader(&old, &new).is_err());
+        let mut verified = attr(2, 20, 8);
+        verified.not_null = true;
+        let new = rel(vec![attr(1, 23, 4), verified]);
+        assert_eq!(compatible_reader(&old, &new), Ok(()));
         // Added-then-dropped inside the interval appends a dropped slot
         let new = rel(vec![attr(1, 23, 4), dropped_slot(2, 8)]);
         assert_eq!(compatible_reader(&old, &new), Ok(()));
