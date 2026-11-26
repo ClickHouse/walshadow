@@ -6,7 +6,7 @@ use std::pin::Pin;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use walrus::pg::wal::segment::SegmentName;
-use walrus::pg::walparser::{RmId, XLogRecord};
+use walrus::pg::walparser::{RelFileNode, RmId, XLogRecord};
 
 use crate::source::timeline::TimelineHistory;
 
@@ -153,6 +153,42 @@ pub struct BoundaryInfo {
     /// replay waits. Save an empty batch for restart, since evidence that
     /// only statistics changed is lost on restart
     pub stats_only: bool,
+    /// User heap filenodes written from this command's first catalog write
+    /// through its boundary. `None` when that WAL is out of view or leaves
+    /// unclear which descriptor rows need, which keeps the read
+    pub preceding_rows: Option<Vec<RelFileNode>>,
+    /// Same from the boundary through the next read covering its relations,
+    /// found in WAL already buffered. `None` keeps the read
+    pub following_rows: Option<Vec<RelFileNode>>,
+}
+
+impl BoundaryInfo {
+    /// Whether this boundary reads every relation command boundary `earlier`
+    /// names, as written by the same writer, so `earlier` can rely on it
+    pub fn covers(&self, earlier: &BoundaryInfo) -> bool {
+        let BoundaryKind::Command { writer_xid } = earlier.kind else {
+            return false;
+        };
+        let names_all = || {
+            earlier
+                .oids
+                .iter()
+                .all(|e| self.oids.iter().any(|a| a.oid == e.oid))
+        };
+        match self.kind {
+            BoundaryKind::Commit => {
+                !self.stats_only
+                    && (self.drain_xid == earlier.drain_xid
+                        || self.members.contains(&earlier.drain_xid))
+            }
+            BoundaryKind::Command { writer_xid: w } => {
+                w == writer_xid
+                    && self.drain_xid == earlier.drain_xid
+                    && (self.capture_all || !earlier.capture_all)
+                    && names_all()
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -482,6 +518,53 @@ impl RecordBytesSink for NoopBytesSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn covering_read_names_every_relation_for_the_same_writer() {
+        let oids = |oids: &[u32]| {
+            oids.iter()
+                .map(|&oid| AffectedOid {
+                    oid,
+                    pg_class_touch: None,
+                })
+                .collect()
+        };
+        let command = |writer_xid, names: &[u32], capture_all| BoundaryInfo {
+            drain_xid: 7,
+            oids: oids(names),
+            capture_all,
+            kind: BoundaryKind::Command { writer_xid },
+            ..Default::default()
+        };
+        let earlier = command(8, &[1], false);
+        assert!(command(8, &[1, 2], false).covers(&earlier));
+        assert!(command(8, &[1], true).covers(&earlier));
+        assert!(
+            !command(8, &[2], false).covers(&earlier),
+            "another relation"
+        );
+        assert!(!command(9, &[1], false).covers(&earlier), "another writer");
+        assert!(!command(8, &[1], false).covers(&command(8, &[1], true)));
+        let other_tree = BoundaryInfo {
+            drain_xid: 6,
+            ..command(8, &[1], false)
+        };
+        assert!(!other_tree.covers(&earlier));
+        let commit = |drain_xid, members: Vec<u32>, stats_only| BoundaryInfo {
+            drain_xid,
+            members,
+            stats_only,
+            ..Default::default()
+        };
+        assert!(commit(7, vec![], false).covers(&earlier));
+        assert!(commit(5, vec![5, 7], false).covers(&earlier), "late link");
+        assert!(!commit(5, vec![5], false).covers(&earlier));
+        assert!(!commit(7, vec![], true).covers(&earlier));
+        assert!(
+            !command(8, &[1], false).covers(&commit(7, vec![], false)),
+            "only command boundaries look ahead"
+        );
+    }
 
     #[test]
     fn ctx_prefixes_failed_step() {

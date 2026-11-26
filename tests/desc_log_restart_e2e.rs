@@ -11,83 +11,12 @@
 #[path = "common/inproc_harness.rs"]
 mod fx;
 
-use fx::spawn_txn;
-use std::io::Write as _;
-use std::process::{Command, Stdio};
+use fx::{TxnSession, spawn_txn, wait_idle_in_txn};
 use std::time::Duration;
 
 use walshadow::mapping::{ColumnMapping, TableTarget};
 use walshadow::pending::DegradeReason;
 use walshadow::schema::RelName;
-use walshadow::shadow::Shadow;
-
-/// psql session holding a transaction open across a pipeline restart;
-/// statements execute as lines arrive on stdin
-struct TxnSession {
-    child: std::process::Child,
-}
-
-impl TxnSession {
-    fn open(source: &Shadow) -> Self {
-        let child = Command::new("psql")
-            .args([
-                "-h",
-                source.config().socket_dir.to_str().unwrap(),
-                "-p",
-                &source.config().port.to_string(),
-                "-U",
-                "postgres",
-                "-d",
-                "postgres",
-                "-v",
-                "ON_ERROR_STOP=1",
-                "-f",
-                "-",
-            ])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn psql");
-        Self { child }
-    }
-
-    fn send(&mut self, sql: &str) {
-        self.child
-            .stdin
-            .as_mut()
-            .expect("stdin piped")
-            .write_all(sql.as_bytes())
-            .expect("write to held psql");
-    }
-
-    fn finish(mut self) {
-        drop(self.child.stdin.take());
-        let status = self.child.wait().expect("wait psql");
-        assert!(status.success(), "held psql session failed: {status}");
-    }
-}
-
-/// Poll until the held session ran its statement ending in `last` (session
-/// parked idle in transaction) so its WAL precedes the upcoming segment switch
-fn wait_idle_in_txn(source: &Shadow, last: &str) {
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    let probe = format!(
-        "SELECT count(*) FROM pg_stat_activity \
-         WHERE state = 'idle in transaction' AND query LIKE '%{last}'"
-    );
-    loop {
-        let n = source.psql_one(&probe).expect("poll pg_stat_activity");
-        if n.trim() == "1" {
-            return;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "open txn never appeared"
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    }
-}
 
 fn create_dest_table(ch: &fx::ChServer, table: &str) {
     ch.query("CREATE DATABASE IF NOT EXISTS walshadow_test")

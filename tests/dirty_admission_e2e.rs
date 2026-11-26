@@ -507,8 +507,8 @@ async fn benign_in_place_alter_then_dml_delivers() {
 /// the records stashed inside its interval. Neither decoding under the
 /// post-commit descriptor nor discarding is sound, so the stream stops.
 ///
-/// With `pending_max_boundaries_per_xact = 0`, capture skips all mid-transaction
-/// reads. The ambiguity interval spans from the first catalog change to commit.
+/// Every command read fails, so the ambiguity interval spans from the first
+/// catalog change to commit.
 /// `pending_capture_e2e::pending_timeline_decodes_the_post_ddl_row` is the
 /// same shape with the timeline on, where the fence shrinks to the run before
 /// the first boundary and the row lands
@@ -517,15 +517,15 @@ async fn physical_in_place_alter_fences_deferred_rows() {
     if !fx::tools::requirements_available() {
         return;
     }
-    let mut drill = build_drill_with(
+    let mut drill = build_drill(
         fx::Ports::alloc(),
         "CREATE SCHEMA daf;\n\
          CREATE TABLE daf.t (id bigint PRIMARY KEY, v varchar(10));\n",
         "daf",
         "walshadow-dirty-fence",
-        |cfg| cfg.pending_capture.max_boundaries_per_xact = 0,
     )
     .await;
+    drill.pipeline.sinks.capture.fail_command_read_after(0);
 
     let driver = spawn_txn(
         &drill.source,
@@ -551,22 +551,22 @@ async fn physical_in_place_alter_fences_deferred_rows() {
 }
 
 /// PostgreSQL allows `ADD COLUMN ... NOT NULL` without a default after
-/// deleting every row. Disable capture between statements so replay uses
-/// the final schema for the earlier insert and delete.
+/// deleting every row. Fail command reads so replay uses the final schema
+/// for the earlier insert and delete.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn not_null_append_on_empty_table_delivers() {
     if !fx::tools::requirements_available() {
         return;
     }
-    let mut drill = build_drill_with(
+    let mut drill = build_drill(
         fx::Ports::alloc(),
         "CREATE SCHEMA dan;\n\
          CREATE TABLE dan.t (id bigint PRIMARY KEY, v text);\n",
         "dan",
         "walshadow-dirty-notnull",
-        |cfg| cfg.pending_capture.max_boundaries_per_xact = 0,
     )
     .await;
+    drill.pipeline.sinks.capture.fail_command_read_after(0);
     let (_, capture_stats) = drill
         .pipeline
         .sinks

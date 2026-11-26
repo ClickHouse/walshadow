@@ -5,6 +5,7 @@ use crate::filter::catalog_tracker::PG_NAMESPACE_OID;
 
 pub(crate) const XLOG_XACT_OPMASK: u8 = 0x70;
 pub(crate) const XLOG_XACT_COMMIT: u8 = 0x00;
+pub(crate) const XLOG_XACT_PREPARE: u8 = 0x10;
 pub(crate) const XLOG_XACT_ABORT: u8 = 0x20;
 pub(crate) const XLOG_XACT_COMMIT_PREPARED: u8 = 0x30;
 pub(crate) const XLOG_XACT_ABORT_PREPARED: u8 = 0x40;

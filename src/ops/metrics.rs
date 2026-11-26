@@ -755,6 +755,8 @@ db_snapshot! {
     counter pending_captures_total: u64 =
         "Command boundaries read into the pending catalog timeline.",
     counter pending_rels_total: u64 = "Descriptors read across command boundaries.",
+    counter pending_skipped_total: u64 =
+        "Command boundaries left unread because WAL showed no row needs them.",
     counter pending_holds_total: u64 = "Publication holds taken for a command boundary.",
     counter pending_hold_seconds_total: f64 =
         "Cumulative seconds the pump parked in command-boundary holds.",

@@ -1036,10 +1036,6 @@ async fn session_body(
         );
         shadow_toast_held = Some(rels.held());
     }
-    let pending_cfg = ch_config
-        .as_ref()
-        .map(|c| c.pending_capture)
-        .unwrap_or_default();
     let pending_catalog = Arc::new(walshadow::pending::PendingCatalog::default());
     let smgr_markers = stream.filter().smgr_markers();
     let mut stream = stream.start();
@@ -1337,7 +1333,6 @@ async fn session_body(
                 xact_buffer.clone(),
                 smgr_markers.clone(),
                 pending_catalog.clone(),
-                pending_cfg,
             ),
         );
     }

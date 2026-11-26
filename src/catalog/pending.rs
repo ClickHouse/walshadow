@@ -12,7 +12,7 @@
 //! LSN is what does the temporal filtering: the latest uncommitted row
 //! version on the page *is* the state as of the boundary.
 //!
-//! If capture skips or fails to read a command boundary, record a miss for
+//! If capture cannot read a command boundary, record a miss for
 //! each relation it names. PostgreSQL registers a relation cache invalidation
 //! for writes to `pg_class`, `pg_attribute`, `pg_index`, and `pg_constraint`
 //! (`CacheInvalidateHeapTupleCommon` in `src/backend/utils/cache/inval.c`).
@@ -29,16 +29,14 @@ use std::sync::{Arc, RwLock};
 
 use tokio_postgres::types::Oid;
 
+use walrus::pg::walparser::RelFileNode;
+
 use crate::schema::RelDescriptor;
 use foldhash::HashMap;
 
-/// Why capture skipped or failed to read a command boundary.
+/// Why capture could not read a command boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DegradeReason {
-    /// Transaction passed `pending_max_boundaries_per_xact`
-    CapExceeded,
-    /// Transaction passed its cumulative hold budget
-    HoldBudget,
     /// Shadow replay was not parked where the boundary said it was
     ReplayMismatch,
     /// Overlay read failed
@@ -46,17 +44,10 @@ pub enum DegradeReason {
 }
 
 impl DegradeReason {
-    pub const ALL: [DegradeReason; 4] = [
-        DegradeReason::CapExceeded,
-        DegradeReason::HoldBudget,
-        DegradeReason::ReplayMismatch,
-        DegradeReason::QueryError,
-    ];
+    pub const ALL: [DegradeReason; 2] = [DegradeReason::ReplayMismatch, DegradeReason::QueryError];
 
     pub fn label(self) -> &'static str {
         match self {
-            DegradeReason::CapExceeded => "cap_exceeded",
-            DegradeReason::HoldBudget => "hold_budget",
             DegradeReason::ReplayMismatch => "replay_mismatch",
             DegradeReason::QueryError => "query_error",
         }
@@ -87,10 +78,6 @@ struct PendingXact {
     by_oid: HashMap<Oid, Vec<PendingSlot>>,
     /// Misses by relation OID, sorted by LSN.
     misses: HashMap<Oid, Vec<Miss>>,
-    /// Boundaries admitted, against `pending_max_boundaries_per_xact`
-    boundaries: u32,
-    /// Cumulative parked nanos, against the per-xact hold budget
-    hold_nanos: u64,
     /// Reason for the first miss, used to count each transaction once.
     missed: Option<DegradeReason>,
     /// Namespace changes and relation cache flushes, sorted by LSN.
@@ -131,8 +118,6 @@ impl PendingXact {
             .chain(unrefreshed(&other.name_refreshes, self))
             .collect();
         self.name_refreshes.extend(other.name_refreshes);
-        self.boundaries += other.boundaries;
-        self.hold_nanos += other.hold_nanos;
         self.missed = self.missed.or(other.missed);
         for slot in other.by_oid.into_values().flatten() {
             self.push(slot);
@@ -215,32 +200,6 @@ impl PromotedXact {
 }
 
 impl PendingCatalog {
-    /// Reserve a catalog read if the transaction has room under both limits.
-    /// Return the limit reached so the caller can record the miss.
-    pub fn admit(
-        &self,
-        top_xid: u32,
-        max_boundaries: u32,
-        hold_budget_nanos: u64,
-    ) -> Result<(), DegradeReason> {
-        let mut map = self.by_xid.write().expect("pending catalog poisoned");
-        let xact = map.entry(top_xid).or_default();
-        if xact.boundaries >= max_boundaries {
-            return Err(DegradeReason::CapExceeded);
-        }
-        if xact.hold_nanos >= hold_budget_nanos {
-            return Err(DegradeReason::HoldBudget);
-        }
-        xact.boundaries += 1;
-        Ok(())
-    }
-
-    /// Charge a released hold against the transaction's cumulative budget
-    pub fn charge_hold(&self, top_xid: u32, nanos: u64) {
-        let mut map = self.by_xid.write().expect("pending catalog poisoned");
-        map.entry(top_xid).or_default().hold_nanos += nanos;
-    }
-
     /// Record a missed read at `at` for each OID. Return `true` on the first
     /// miss for this transaction.
     pub fn miss(
@@ -280,6 +239,15 @@ impl PendingCatalog {
         if refreshes.last().is_none_or(|r| r.at != at) {
             refreshes.push(Miss { at, writer_xid });
         }
+    }
+
+    /// Relation a transaction's read placed on this filenode
+    pub fn rfn_owner(&self, rfn: RelFileNode) -> Option<Oid> {
+        let map = self.by_xid.read().expect("pending catalog poisoned");
+        map.values()
+            .flat_map(|x| x.by_oid.values().flatten())
+            .find(|s| s.desc.rfn == rfn)
+            .map(|s| s.desc.oid)
     }
 
     /// OIDs of relations already read for this transaction, in order.
@@ -350,10 +318,8 @@ impl PendingCatalog {
         for xact in map.values_mut() {
             dropped += xact.drop_writers(members);
         }
-        // Keep the parent's budget usage and first miss after savepoint rollback.
-        map.retain(|_, x| {
-            x.slots() > 0 || x.boundaries > 0 || x.missed.is_some() || !x.name_refreshes.is_empty()
-        });
+        // Keep the parent's first miss after savepoint rollback.
+        map.retain(|_, x| x.slots() > 0 || x.missed.is_some() || !x.name_refreshes.is_empty());
         dropped
     }
 
@@ -367,7 +333,6 @@ impl PendingCatalog {
 mod tests {
     use super::*;
     use crate::schema::{RelName, ReplIdent};
-    use walrus::pg::walparser::RelFileNode;
 
     fn desc(oid: Oid, rel_node: u32, name: &str) -> Arc<RelDescriptor> {
         Arc::new(RelDescriptor {
@@ -449,10 +414,10 @@ mod tests {
     fn abort_keeps_a_tree_that_already_missed() {
         let p = PendingCatalog::default();
         p.record(100, vec![slot(300, 101, desc(16400, 7000, "t"))]);
-        p.miss(100, 101, &[16400], 400, DegradeReason::CapExceeded);
+        p.miss(100, 101, &[16400], 400, DegradeReason::ReplayMismatch);
         assert_eq!(p.forget_members(&[101]), 1);
         assert!(
-            !p.miss(100, 100, &[16400], 500, DegradeReason::CapExceeded),
+            !p.miss(100, 100, &[16400], 500, DegradeReason::ReplayMismatch),
             "already counted a miss for this transaction",
         );
     }
@@ -464,7 +429,7 @@ mod tests {
         p.record(101, vec![slot(200, 101, desc(16400, 7000, "child"))]);
         p.miss(101, 101, &[16400], 300, DegradeReason::QueryError);
         p.record(100, vec![slot(400, 100, desc(16400, 7000, "top"))]);
-        p.miss(100, 100, &[16400], 250, DegradeReason::CapExceeded);
+        p.miss(100, 100, &[16400], 250, DegradeReason::ReplayMismatch);
         p.consolidate(100, &[100, 101]);
         assert_eq!(p.tracked_xacts(), 1);
         let promoted = p.promoted(100).expect("tree");
@@ -530,29 +495,35 @@ mod tests {
     }
 
     #[test]
-    fn admit_refuses_past_either_cap_without_state_change() {
+    fn filenode_owner_comes_from_any_transaction() {
         let p = PendingCatalog::default();
-        assert_eq!(p.admit(100, 2, u64::MAX), Ok(()));
-        assert_eq!(p.admit(100, 2, u64::MAX), Ok(()));
-        assert_eq!(p.admit(100, 2, u64::MAX), Err(DegradeReason::CapExceeded));
-        assert_eq!(
-            p.admit(100, 8, u64::MAX),
-            Ok(()),
-            "higher limit allows a read"
-        );
-        assert_eq!(p.admit(101, 64, 1_000), Ok(()));
-        p.charge_hold(101, 1_500);
-        assert_eq!(p.admit(101, 64, 1_000), Err(DegradeReason::HoldBudget));
+        p.record(100, vec![slot(200, 100, desc(16400, 7000, "a"))]);
+        p.record(100, vec![slot(300, 100, desc(16400, 7001, "b"))]);
+        p.record(101, vec![slot(250, 101, desc(16401, 7002, "c"))]);
+        let rfn = |rel_node| RelFileNode {
+            spc_node: 1663,
+            db_node: 5,
+            rel_node,
+        };
+        assert_eq!(p.rfn_owner(rfn(7000)), Some(16400));
+        assert_eq!(p.rfn_owner(rfn(7002)), Some(16401));
+        assert_eq!(p.rfn_owner(rfn(7003)), None);
     }
 
     #[test]
     fn first_miss_counts_once_and_repeats_collapse_per_run() {
         let p = PendingCatalog::default();
-        assert!(p.miss(100, 100, &[16400, 16401], 200, DegradeReason::CapExceeded));
-        assert!(!p.miss(100, 100, &[16400], 300, DegradeReason::HoldBudget));
+        assert!(p.miss(
+            100,
+            100,
+            &[16400, 16401],
+            200,
+            DegradeReason::ReplayMismatch
+        ));
+        assert!(!p.miss(100, 100, &[16400], 300, DegradeReason::QueryError));
         p.record(100, vec![slot(400, 100, desc(16400, 7000, "t"))]);
-        p.miss(100, 100, &[16400], 500, DegradeReason::CapExceeded);
-        p.miss(100, 102, &[16400], 600, DegradeReason::CapExceeded);
+        p.miss(100, 100, &[16400], 500, DegradeReason::ReplayMismatch);
+        p.miss(100, 102, &[16400], 600, DegradeReason::ReplayMismatch);
         let promoted = p.promoted(100).expect("tree");
         assert_eq!(
             promoted.misses_for(16400),

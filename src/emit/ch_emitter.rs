@@ -170,8 +170,6 @@ pub struct EmitterConfig {
     /// `$schema$_$table$`. The knob `replicate_all` needs: a namespace with no
     /// entry of its own still auto-creates under it
     pub auto_create_name_all: Option<crate::mapping::NameTemplate>,
-    /// Pending capture cost controls, boot-only
-    pub pending_capture: crate::source::catalog_capture::PendingCaptureConfig,
     /// Per-namespace defaults keyed on PG schema name; per-table
     /// entries in `tables` win for the relation they name
     pub namespaces: HashMap<String, NamespaceMapping>,
@@ -928,8 +926,6 @@ struct StreamSection {
     skip_attribution: bool,
     replicate_all: bool,
     auto_create_name_all: Option<String>,
-    #[serde(flatten)]
-    pending_capture: crate::source::catalog_capture::PendingCaptureConfig,
 }
 
 impl Default for StreamSection {
@@ -939,7 +935,6 @@ impl Default for StreamSection {
             skip_attribution: false,
             replicate_all: true,
             auto_create_name_all: None,
-            pending_capture: Default::default(),
         }
     }
 }
@@ -1041,7 +1036,6 @@ impl EmitterConfig {
             skip_attribution: stream.skip_attribution,
             replicate_all: stream.replicate_all,
             auto_create_name_all: None,
-            pending_capture: stream.pending_capture,
             namespaces: HashMap::new(),
             databases: Vec::new(),
             drop_table_strategy: ch.drop_table_strategy,
@@ -5760,8 +5754,6 @@ mod tests {
             paused = true
             skip_attribution = true
             replicate_all = false
-            pending_max_boundaries_per_xact = 22
-            pending_max_hold_ms = 23
 
             [table.public.foo]
             initial_load = "copy"
@@ -5808,11 +5800,6 @@ mod tests {
         assert!(c.skip_attribution);
         assert!(!plain.skip_attribution);
         assert!(!c.replicate_all);
-        assert_eq!(c.pending_capture.max_boundaries_per_xact, 22);
-        assert_eq!(
-            c.pending_capture.max_hold_per_xact,
-            Duration::from_millis(23)
-        );
         let rel = RelName::new("public", "foo");
         let t = c.tables.get(&rel).expect("mapping present");
         // target_database/target_table omitted: [ch] database + derived name
