@@ -551,6 +551,132 @@ async fn physical_in_place_alter_fences_deferred_rows() {
     );
 }
 
+/// The fence above is deterministic: a restart from the same floor
+/// re-reads the same record and fails the same way. It must trip the
+/// fail-closed latch, and once persisted the daemon binary must refuse to
+/// start with the fail-closed exit status, until the operator clears the
+/// marker
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fenced_record_stops_terminally_until_marker_cleared() {
+    use std::process::{Command, Stdio};
+    use walshadow::fail_closed::{EXIT_FAIL_CLOSED, MARKER_FILE, read_marker, write_marker};
+
+    if !fx::tools::requirements_available() {
+        return;
+    }
+    let mut drill = build_drill_with(
+        fx::Ports::alloc(),
+        "CREATE SCHEMA dft;\n\
+         CREATE TABLE dft.t (id bigint PRIMARY KEY, v varchar(10));\n",
+        "dft",
+        "walshadow-dirty-terminal",
+        |cfg| cfg.pending_capture.max_boundaries_per_xact = 0,
+    )
+    .await;
+    let driver = spawn_txn(
+        &drill.source,
+        "BEGIN;\n\
+         ALTER TABLE dft.t ALTER COLUMN v TYPE text;\n\
+         INSERT INTO dft.t (id, v) VALUES (1, 'fenced');\n\
+         COMMIT;\n\
+         SELECT pg_switch_wal();\n",
+    );
+    let err = fx::pump_segments_res(&mut drill.pipeline, 1, Duration::from_secs(45))
+        .await
+        .expect_err("fenced record must stop the stream");
+    let _ = driver.join();
+    let verdict = drill.pipeline.stats.fail_closed.get();
+    let _ = drill.pipeline.shutdown().await;
+    let _ = drill.shadow.stop();
+    let _ = drill.source.stop();
+    let verdict = verdict.unwrap_or_else(|| panic!("fence must trip the latch, got only {err}"));
+    assert_eq!(verdict.reason, "stash_ambiguous");
+    assert_ne!(verdict.lsn, 0, "verdict names the failing commit");
+    assert!(verdict.error.contains("inside ambiguity"), "{verdict}");
+
+    // What the daemon does on session exit
+    let spill = tempfile::tempdir().unwrap();
+    write_marker(spill.path(), &verdict).await.unwrap();
+    assert_eq!(read_marker(spill.path()).unwrap(), Some(verdict.clone()));
+
+    let bin = env!("CARGO_BIN_EXE_walshadow-stream");
+    let scratch = tempfile::tempdir().unwrap();
+    let daemon = || {
+        let mut cmd = Command::new(bin);
+        cmd.args(["--out-dir", scratch.path().join("out").to_str().unwrap()])
+            .args(["--spill-dir", spill.path().to_str().unwrap()])
+            .args([
+                "--shadow-socket-dir",
+                scratch.path().join("sock").to_str().unwrap(),
+            ])
+            .args([
+                "--bootstrap-shadow-data-dir",
+                scratch.path().join("shadow").to_str().unwrap(),
+            ])
+            // Nothing listens: past the gate the daemon fails on the source
+            .args([
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "1",
+                "--walsender-bind",
+                "127.0.0.1:1",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        cmd
+    };
+
+    // Restart refuses before reading WAL, with the status systemd's
+    // RestartPreventExitStatus= names
+    let out = daemon().output().expect("run daemon");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(EXIT_FAIL_CLOSED), "{stderr}");
+    assert!(stderr.contains("fail-closed stash_ambiguous"), "{stderr}");
+    assert!(stderr.contains("fail-closed clear --spill-dir"), "{stderr}");
+
+    let ctl = |action: &str| {
+        Command::new(bin)
+            .args([
+                "fail-closed",
+                action,
+                "--spill-dir",
+                spill.path().to_str().unwrap(),
+            ])
+            .output()
+            .expect("run fail-closed subcommand")
+    };
+    let show = ctl("show");
+    assert_eq!(show.status.code(), Some(EXIT_FAIL_CLOSED));
+    assert!(String::from_utf8_lossy(&show.stdout).contains("reason = stash_ambiguous"));
+    assert!(ctl("clear").status.success());
+    assert!(!spill.path().join(MARKER_FILE).exists());
+    assert_eq!(ctl("show").status.code(), Some(0));
+
+    // Cleared: startup passes the gate and fails, if at all, on the source
+    let mut child = daemon().spawn().expect("spawn daemon");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break Some(status);
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    let mut stderr = String::new();
+    std::io::Read::read_to_string(&mut child.stderr.take().unwrap(), &mut stderr).unwrap();
+    let _ = child.wait();
+    assert_ne!(
+        status.and_then(|s| s.code()),
+        Some(EXIT_FAIL_CLOSED),
+        "cleared marker still refuses: {stderr}"
+    );
+    assert!(!stderr.contains("refusing to start"), "{stderr}");
+}
+
 /// Top-level ROLLBACK of a DDL + row transaction: no descriptor batch
 /// appends, no rows emit, no fence counts, and the next transaction on
 /// the same connection inherits no dirty state.

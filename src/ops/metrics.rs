@@ -334,6 +334,11 @@ snapshot! {
         /// re-crosses and re-fails, so this is how the daemon says it is
         /// waiting for an operator
         crossing_blocked_on: &'static str,
+        /// Deterministic fail-closed verdict the daemon stopped on or found
+        /// persisted at startup, rendered `fail_closed` and
+        /// `fail_closed_info{reason,lsn}`. Set only on the way to a terminal
+        /// exit, or while `--fail-closed-hold` keeps the endpoint serving
+        fail_closed: Option<crate::fail_closed::FailClosed>,
         /// PostgreSQL source system identifier, rendered as a `source_info`
         /// label to hold 64 bits a float64 sample would round
         source_system_id: u64,
@@ -1212,6 +1217,26 @@ fn encode_snapshot(snap: &MetricsSnapshot, enc: &mut DescriptorEncoder<'_>) -> f
         "1 while a crossing is parked on a refusal only an operator can clear.",
         u64::from(!snap.crossing_blocked_on.is_empty()),
     )?;
+
+    gauge(
+        enc,
+        "walshadow_fail_closed",
+        "1 once the daemon stopped on a deterministic fail-closed verdict that only an operator can clear; a restart refuses until the spill-dir marker is cleared.",
+        u64::from(snap.fail_closed.is_some()),
+    )?;
+    if let Some(v) = &snap.fail_closed {
+        declare(
+            enc,
+            "walshadow_fail_closed_info",
+            "Reason label and commit LSN of the fail-closed verdict.",
+            MetricType::Gauge,
+        )?
+        .encode_family(&[
+            ("reason", v.reason.as_str()),
+            ("lsn", v.lsn_text().as_str()),
+        ])?
+        .encode_gauge(&1u64)?;
+    }
 
     let worker_rows = snap
         .worker_seconds

@@ -63,6 +63,31 @@ pub(crate) struct InitArgs {
     pub(crate) force: bool,
 }
 
+/// `walshadow-stream fail-closed`: inspect or clear the marker a
+/// deterministic fail-closed stop leaves in the spill directory. Works on
+/// the directory alone, with the daemon stopped
+#[derive(Debug, Parser)]
+#[command(
+    name = "walshadow-stream fail-closed",
+    version = walshadow::VERSION,
+    about = "Show or clear the fail-closed marker that blocks daemon startup."
+)]
+pub(crate) struct FailClosedArgs {
+    /// Spill directory the daemon runs with
+    #[arg(long, global = true)]
+    pub(crate) spill_dir: Option<PathBuf>,
+    #[command(subcommand)]
+    pub(crate) action: FailClosedAction,
+}
+
+#[derive(Debug, Clone, Copy, clap::Subcommand)]
+pub(crate) enum FailClosedAction {
+    /// Print the recorded verdict; exits 65 when one is present, 0 otherwise
+    Show,
+    /// Remove the marker so the next start resumes from the durable floor
+    Clear,
+}
+
 impl InitArgs {
     pub(crate) fn into_opts(self) -> walshadow::init::InitOpts {
         walshadow::init::InitOpts {
@@ -151,6 +176,13 @@ pub(crate) struct Args {
     /// Reconnect to compatible shadow PostgreSQL and leave it running on exit
     #[arg(long, env = "WALSHADOW_KEEP_SHADOW_RUNNING")]
     pub(crate) keep_shadow_running: bool,
+
+    /// On a deterministic fail-closed stop, or a start refused by the
+    /// spill-dir marker, keep the metrics endpoint and control socket
+    /// serving the verdict until SIGTERM instead of exiting at once. The
+    /// exit status is the fail-closed one either way
+    #[arg(long, env = "WALSHADOW_FAIL_CLOSED_HOLD")]
+    pub(crate) fail_closed_hold: bool,
 
     /// Stop after this many segments shipped (smoke tests). Zero = forever.
     #[arg(long, default_value_t = 0)]

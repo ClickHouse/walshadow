@@ -60,7 +60,8 @@ use walshadow::metrics::MetricsRegistry;
 use walshadow::mimalloc;
 
 use crate::args::{
-    Args, InitArgs, cli_base, url_base, validate_scratch_dir, validate_transport_args,
+    Args, FailClosedAction, FailClosedArgs, InitArgs, cli_base, url_base, validate_scratch_dir,
+    validate_transport_args,
 };
 use crate::runtime_cfg::spawn_shutdown_signals;
 use crate::session::run_session;
@@ -83,8 +84,72 @@ fn main() -> Result<()> {
             walshadow::init::run(opts).await
         });
     }
+    if argv.get(1).map(String::as_str) == Some("fail-closed") {
+        let rest =
+            std::iter::once(format!("{} fail-closed", argv[0])).chain(argv.into_iter().skip(2));
+        return run_fail_closed(FailClosedArgs::parse_from(rest));
+    }
     let args = Args::parse();
-    runtime(args.worker_threads)?.block_on(daemon(args))
+    if let Err(e) = runtime(args.worker_threads)?.block_on(daemon(args)) {
+        // Same rendering a returned `Err` gets, with a status systemd can
+        // tell apart: a fail-closed verdict must not restart
+        eprintln!("Error: {e:?}");
+        std::process::exit(walshadow::fail_closed::exit_status(&e));
+    }
+    Ok(())
+}
+
+/// `fail-closed show|clear`: operate on the spill-dir marker directly, so
+/// it works while the daemon refuses to start
+fn run_fail_closed(args: FailClosedArgs) -> Result<()> {
+    use walshadow::fail_closed::{EXIT_FAIL_CLOSED, clear_marker, read_marker};
+    let dir = args
+        .spill_dir
+        .context("--spill-dir is required: the daemon's spill directory")?;
+    match args.action {
+        FailClosedAction::Show => match read_marker(&dir).context("read fail-closed marker")? {
+            Some(v) => {
+                println!(
+                    "reason = {}\nlsn = {}\nat_unix = {}\nerror = {}",
+                    v.reason,
+                    v.lsn_text(),
+                    v.at_unix,
+                    v.error
+                );
+                std::process::exit(EXIT_FAIL_CLOSED);
+            }
+            None => println!("no fail-closed marker in {}", dir.display()),
+        },
+        FailClosedAction::Clear => match clear_marker(&dir).context("clear fail-closed marker")? {
+            Some(v) => println!("cleared {v}"),
+            None => println!("no fail-closed marker in {}", dir.display()),
+        },
+    }
+    Ok(())
+}
+
+/// Stop terminally on `verdict`: publish it on the metrics and status
+/// surfaces, optionally hold them up until shutdown, and return the error
+/// `main` maps onto the fail-closed exit status
+async fn stop_fail_closed(
+    args: &Args,
+    metrics: &MetricsRegistry,
+    shutdown: &tokio_util::sync::CancellationToken,
+    verdict: walshadow::fail_closed::FailClosed,
+) -> anyhow::Error {
+    metrics
+        .update(|snap| snap.fail_closed = Some(verdict.clone()))
+        .await;
+    if args.fail_closed_hold {
+        tracing::error!(
+            target: "walshadow",
+            reason = %verdict.reason,
+            lsn = %verdict.lsn_text(),
+            "fail-closed; holding metrics and control surfaces until SIGTERM",
+        );
+        shutdown.cancelled().await;
+    }
+    walshadow::fail_closed::FailClosedExit::new(verdict, &args.spill_dir).into()
 }
 
 fn runtime(workers: Option<NonZeroUsize>) -> std::io::Result<tokio::runtime::Runtime> {
@@ -194,10 +259,45 @@ async fn run(mut args: Args) -> Result<()> {
         None
     };
 
+    // A deterministic verdict persisted by an earlier run: refuse before
+    // touching WAL, which would only reach the same verdict again
+    if let Some(verdict) =
+        walshadow::fail_closed::read_marker(&args.spill_dir).context("read fail-closed marker")?
+    {
+        tracing::error!(
+            target: "walshadow",
+            marker = %args.spill_dir.join(walshadow::fail_closed::MARKER_FILE).display(),
+            "refusing to start: spill directory holds a fail-closed verdict",
+        );
+        return Err(stop_fail_closed(&args, &metrics, &shutdown, verdict).await);
+    }
+
+    let fail_closed = walshadow::fail_closed::FailClosedLatch::default();
     let mut sighup = sighup;
     loop {
         let attach: AttachSlot = Arc::default();
-        let result = run_session(&args, &metrics, &reloader, sighup, &shutdown, &attach).await;
+        let result = run_session(
+            &args,
+            &metrics,
+            &reloader,
+            sighup,
+            &shutdown,
+            &attach,
+            &fail_closed,
+        )
+        .await;
+        if let Some(verdict) = fail_closed.get() {
+            walshadow::fail_closed::write_marker(&args.spill_dir, &verdict)
+                .await
+                .context("persist fail-closed marker")?;
+            let session_err = result.err().map(|e| format!("{e:#}"));
+            tracing::error!(
+                target: "walshadow",
+                session_error = session_err.as_deref().unwrap_or(""),
+                "session ended on a fail-closed verdict; marker written",
+            );
+            return Err(stop_fail_closed(&args, &metrics, &shutdown, verdict).await);
+        }
         let Some(attached) = attach.lock().expect("attach slot poisoned").take() else {
             return result;
         };

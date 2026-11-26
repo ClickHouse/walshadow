@@ -25,6 +25,7 @@ Primary fields:
 | `shadow_replay` | newest position applied by managed shadow |
 | `source_swap_pending` | requested source endpoint has not completed handoff |
 | `crossing_blocked_on` | timeline crossing is parked on named proof |
+| `fail_closed` | deterministic fail-closed verdict (`reason`, `lsn`, `error`) the daemon stopped on; empty table otherwise. See [Fail-closed stops](#fail-closed-stops) |
 
 Each replicated relation is one `[[tables]]` entry:
 
@@ -203,6 +204,64 @@ mismatch fails startup
 `--ignore-cursor` and `--start-lsn` intentionally discard normal resume
 position. Reserve them for recovery drills or operator-directed rebuilds
 
+## Fail-closed stops
+
+Some verdicts depend only on source WAL. Replaying the same records from the
+same floor reaches the same verdict, so restarting cannot help:
+
+| Reason | Cause |
+|---|---|
+| `stash_ambiguous` | deferred row falls inside a descriptor ambiguity interval; no schema is proven safe for it |
+| `fail_closed_image_only`, `fail_closed_malformed`, `fail_closed_unsupported_op` | operation policy refused a deferred record |
+| `partial_update` | UPDATE elides tuple bytes no reconstruction path provides |
+| `missing_stash_resolution` | transaction stashed records but reached drain without a resolution |
+| `incomplete_toast` | TOAST generation observed without its creation marker |
+| `foreign_xid` | drained row carries an xid outside its owning transaction |
+
+On one of these, walshadow writes `fail_closed.json` (reason, commit LSN,
+error, time) into the spill directory and exits with status **65**. Every
+other failure, including source, ClickHouse and local I/O errors, keeps exit
+status 1 and stays retryable
+
+The systemd drop-in sets `RestartPreventExitStatus=65`, so the unit stays
+`failed` with `ExecMainStatus=65` instead of restarting. Any later start that
+finds the marker refuses before reading WAL and exits 65 again, naming the
+verdict. Alert on this separately from source reachability:
+
+- `systemctl show -p ExecMainStatus walshadow` reports `65`
+- `walshadow_fail_closed` is 1, and `walshadow_fail_closed_info{reason,lsn}`
+  names the verdict
+- `ctl status` shows the verdict under `fail_closed`
+
+The process exits right after publishing, so a scrape may miss the metrics.
+Pass `--fail-closed-hold` (or set `WALSHADOW_FAIL_CLOSED_HOLD=true`) to keep
+the metrics endpoint and control socket serving the verdict until SIGTERM.
+The process still exits 65 when it stops
+
+To recover:
+
+1. Read the verdict:
+
+   ```bash
+   walshadow-stream fail-closed show --spill-dir /var/lib/walshadow/spill
+   ```
+
+   It exits 65 while a marker is present and 0 when there is none
+2. Resolve the cause. For `stash_ambiguous` and the other snapshot-class
+   verdicts this usually means a fresh baseline for the affected tables, or
+   an operator-directed `--start-lsn` past the failing commit once its rows are
+   reloaded by other means. Clearing the marker without changing anything only
+   reproduces the same stop
+3. Clear the marker and start the unit:
+
+   ```bash
+   walshadow-stream fail-closed clear --spill-dir /var/lib/walshadow/spill
+   ```
+
+   ```bash
+   systemctl reset-failed walshadow && systemctl start walshadow
+   ```
+
 ## Retain source WAL
 
 Configure a physical replication slot when not using object storage. With
@@ -282,3 +341,4 @@ a deployment responsibility
 | source system ID mismatch | restore correct state/source pairing or perform explicit rebuild |
 | source WAL missing | restore archive coverage or rebuild from fresh baseline |
 | unsupported source type change | migrate ClickHouse column and set type override |
+| `refusing to start: spill directory holds a fail-closed verdict` (exit 65) | earlier run stopped on deterministic verdict; follow [Fail-closed stops](#fail-closed-stops) |

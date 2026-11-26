@@ -103,6 +103,34 @@ impl PlanError {
             Self::View(_) => "view",
         }
     }
+
+    /// Reason label when this failure is a function of the WAL alone, so a
+    /// restart from the same floor fails identically. `None` for spool,
+    /// encode and route-view failures, which retry
+    pub fn deterministic_reason(&self) -> Option<&'static str> {
+        match self {
+            Self::Detoast(e) => deterministic_reason(e),
+            Self::PartialUpdate { .. } => Some("partial_update"),
+            Self::Spool(_) | Self::View(_) => None,
+        }
+    }
+}
+
+/// Reason label for a drain error that fails closed on the WAL's own
+/// content: replaying the same records from the same floor reaches the
+/// same verdict, so a restart only loops. `None` for I/O, spill and detoast
+/// store failures, which a restart can clear. [`XactBufferError::ForeignXid`]
+/// shares `drain` with spill errors in [`drain_reason`]; here it gets its
+/// own label, since buffer keys are rebuilt from WAL and drift repeats
+pub fn deterministic_reason(e: &XactBufferError) -> Option<&'static str> {
+    match e {
+        XactBufferError::OrdinaryFailClosed { .. }
+        | XactBufferError::StashAmbiguous { .. }
+        | XactBufferError::IncompleteToastGeneration { .. }
+        | XactBufferError::MissingStashResolution { .. } => Some(drain_reason(e)),
+        XactBufferError::ForeignXid { .. } => Some("foreign_xid"),
+        _ => None,
+    }
 }
 
 /// `reason=` label for drain-side errors aborting a plan. Fail-closed
