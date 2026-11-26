@@ -1064,7 +1064,7 @@ mod tests {
 
     /// FlushAll seals everything sent before it and replies, even below budget
     /// with a huge deadline (the barrier's drain-before-DDL step). Shared FIFO
-    /// channel means the first-enqueued row can't be missed (bug `codex.md`).
+    /// channel means the first-enqueued row can't be missed.
     #[tokio::test]
     async fn flush_all_seals_rows_enqueued_before_it() {
         let (msg_tx, msg_rx) = mpsc::channel(64);

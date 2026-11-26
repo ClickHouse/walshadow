@@ -286,8 +286,8 @@ async fn bridge_listening(path: &Path, timeout: Duration) -> bool {
 /// A command boundary
 /// ([`BoundaryKind::Command`]) reuses
 /// that sequence unchanged, and capture reads the transaction's own
-/// uncommitted rows there. Capture declines the ones its cost controls rule
-/// out, before the park — a boundary nothing will read is a stall for
+/// uncommitted rows there. Capture declines, before the park, a boundary
+/// whose read WAL shows no row needs, since parking there stalls for
 /// nothing.
 ///
 /// Aborts drop their speculative slots here rather than at the drain: the
@@ -441,7 +441,7 @@ impl RecordSink for BoundaryHoldSink {
             self.inner.flush().await?;
             let parked = Instant::now();
             let held = self.hold(record).await?;
-            self.capture.charge_hold(info, parked.elapsed());
+            self.capture.count_hold(info, parked.elapsed());
             self.capture
                 .capture_boundary(info, record.source_lsn, &held)
                 .await?;

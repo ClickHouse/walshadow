@@ -1,7 +1,6 @@
-//! Reconstruct a full 8 KiB page from `XLogRecordBlock.image`. Mirrors PG's
-//! `RestoreBlockImage` (src/backend/access/transam/xlogreader.c) so decoders +
-//! BASEBACKUP.md path 1B+2A consume FPIs under
-//! `wal_compression = pglz|lz4|zstd`
+//! Reconstruct an 8 KiB page from `XLogRecordBlock.image`, including images
+//! compressed with pglz, lz4, or zstd. Mirror PostgreSQL's `RestoreBlockImage`
+//! (`src/backend/access/transam/xlogreader.c`).
 
 use walrus::pg::walparser::{BLOCK_SIZE, FpiCompressionMethod, XLogRecordBlock};
 

@@ -14,9 +14,13 @@ state, and publishes coverage before dependent row work proceeds
 
 At a command boundary, capture reads the transaction's uncommitted catalog
 for the tables named in WAL. Schema changes and table cache flushes can
-also refresh names for tables already read in that transaction. Record
-missed reads by table and WAL position. Abort discards provisional reads
-and misses.
+also refresh names for tables already read in that transaction. Skip a
+read only when WAL from the command's first catalog write through the next
+read covering the same tables writes none of their rows. The pump looks for
+that read in WAL it already buffered before sending bytes past the
+boundary, and reads at the boundary when buffered WAL ends first, or holds
+new storage, a rollback or a prepare. A failed read is a miss, recorded by
+table and WAL position. Abort discards provisional reads and misses.
 
 At commit, build each surviving table's descriptor history in WAL order.
 For a gap between known descriptors on the same file, check whether the

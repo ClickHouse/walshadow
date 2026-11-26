@@ -21,8 +21,8 @@ use walrus::pg::walparser::{
 use crate::decode::heap_decoder::{XLOG_HEAP_INPLACE, XLOG_HEAP_OPMASK};
 use crate::decode::wal_xact::{
     XLOG_XACT_ABORT, XLOG_XACT_ABORT_PREPARED, XLOG_XACT_ASSIGNMENT, XLOG_XACT_COMMIT,
-    XLOG_XACT_COMMIT_PREPARED, XLOG_XACT_INVALIDATIONS, XLOG_XACT_OPMASK, XactPayloadError,
-    parse_xact_assignment, parse_xact_invalidations, parse_xact_payload,
+    XLOG_XACT_COMMIT_PREPARED, XLOG_XACT_INVALIDATIONS, XLOG_XACT_OPMASK, XLOG_XACT_PREPARE,
+    XactPayloadError, parse_xact_assignment, parse_xact_invalidations, parse_xact_payload,
 };
 use tokio_postgres::Client;
 
@@ -89,6 +89,49 @@ pub struct Verdict {
     /// the stream: decoder must not decode with live descriptors, hold raw
     /// until commit-time capture publishes the final layout
     pub defer_catalog_decode: bool,
+    pub touch: Touch,
+}
+
+/// What one record means for skipping a command-boundary catalog read
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Touch {
+    #[default]
+    None,
+    /// Row data on a user relation of a followed database
+    Row(RelFileNode),
+    /// New storage, rollback, prepare or truncate. Which descriptor later
+    /// rows need is unclear, so keep the read
+    Unclear,
+}
+
+/// One transaction tree's row writes since its current command first wrote
+/// the catalog. `CREATE TABLE AS` and rewrites write rows before their
+/// command boundary, and those rows take the descriptor read there
+#[derive(Debug, Default)]
+struct CommandWindow {
+    /// A boundary of this tree was seen, so all its later WAL is in view
+    after_boundary: bool,
+    /// Current command wrote the catalog
+    open: bool,
+    rows: Vec<RelFileNode>,
+    unclear: bool,
+}
+
+impl CommandWindow {
+    fn absorb(&mut self, other: Self) {
+        self.after_boundary |= other.after_boundary;
+        self.open |= other.open;
+        self.unclear |= other.unclear;
+        for rfn in other.rows {
+            self.note_row(rfn);
+        }
+    }
+
+    fn note_row(&mut self, rfn: RelFileNode) {
+        if !self.rows.contains(&rfn) {
+            self.rows.push(rfn);
+        }
+    }
 }
 
 /// What one `Xact` rmgr record did to the dirty tree
@@ -144,6 +187,8 @@ pub struct Filter {
     /// `XLOG_XACT_INVALIDATIONS` set, plus subxid → top links; drained at
     /// commit / abort
     dirty: DirtyTree,
+    /// Command windows by dirty tree root
+    commands: HashMap<u32, CommandWindow>,
     /// Transactions that wrote only statistics
     stats_writers: HashSet<u32>,
     /// First xid known to be fully visible to this run
@@ -169,6 +214,7 @@ impl Filter {
             tracker: CatalogTracker::new(),
             stats: FilterStats::default(),
             dirty: DirtyTree::default(),
+            commands: HashMap::default(),
             stats_writers: HashSet::new(),
             observed_from_xid: None,
             smgr_markers: Arc::new(Mutex::new(SmgrMarkers::default())),
@@ -431,7 +477,11 @@ impl Filter {
             }) {
                 dirty.unenumerated = true;
             }
+            let root = self.dirty.root(xid);
+            self.commands.entry(root).or_default().open = true;
         }
+        let touch = self.touch(record, route);
+        self.note_touch(touch);
         let defer_catalog_decode = route == Route::ToDecoder && self.dirty.is_dirty(xid);
         let end = self.observe_xact_end(record, source_lsn, page_magic)?;
         self.stats
@@ -444,7 +494,87 @@ impl Filter {
             boundary: end.boundary,
             aborted_tree: end.aborted_tree,
             defer_catalog_decode,
+            touch,
         })
+    }
+
+    fn touch(&self, record: &XLogRecord, route: Route) -> Touch {
+        use crate::decode::heap_decoder::{
+            XLOG_HEAP_DELETE, XLOG_HEAP_HOT_UPDATE, XLOG_HEAP_INPLACE, XLOG_HEAP_INSERT,
+            XLOG_HEAP_TRUNCATE, XLOG_HEAP_UPDATE, XLOG_HEAP2_MULTI_INSERT,
+        };
+        let rm = record.header.resource_manager_id;
+        let op = record.header.info & XLOG_HEAP_OPMASK;
+        let block = record.blocks.first().map(|b| b.header.location.rel);
+        let target = block.is_some_and(|r| self.is_target_db(r.db_node));
+        if rm == RmId::Smgr as u8 && record.header.info & 0xF0 == main_data::XLOG_SMGR_CREATE {
+            let created = main_data::parse_xl_smgr_create(&record.main_data);
+            return if created.is_none_or(|(rfn, _)| self.is_target_db(rfn.db_node)) {
+                Touch::Unclear
+            } else {
+                Touch::None
+            };
+        }
+        if rm == RmId::Xact as u8 {
+            let op = record.header.info & XLOG_XACT_OPMASK;
+            return if matches!(
+                op,
+                XLOG_XACT_ABORT | XLOG_XACT_ABORT_PREPARED | XLOG_XACT_PREPARE
+            ) {
+                Touch::Unclear
+            } else {
+                Touch::None
+            };
+        }
+        if rm == RmId::Heap as u8 && op == XLOG_HEAP_TRUNCATE {
+            return Touch::Unclear;
+        }
+        if route == Route::ToShadow || !target {
+            return Touch::None;
+        }
+        let row = if rm == RmId::Heap as u8 {
+            if op == XLOG_HEAP_INPLACE {
+                return Touch::Unclear;
+            }
+            matches!(
+                op,
+                XLOG_HEAP_INSERT | XLOG_HEAP_DELETE | XLOG_HEAP_UPDATE | XLOG_HEAP_HOT_UPDATE
+            )
+        } else {
+            rm == RmId::Heap2 as u8 && op == XLOG_HEAP2_MULTI_INSERT
+        };
+        match block {
+            Some(rfn) if row => Touch::Row(rfn),
+            _ => Touch::None,
+        }
+    }
+
+    /// Feed every open command window, whichever transaction wrote the row
+    fn note_touch(&mut self, touch: Touch) {
+        let open = self.commands.values_mut().filter(|w| w.open);
+        match touch {
+            Touch::None => {}
+            Touch::Row(rfn) => open.for_each(|w| w.note_row(rfn)),
+            Touch::Unclear => open.for_each(|w| w.unclear = true),
+        }
+    }
+
+    /// Close the command a boundary ends and start watching the next one.
+    /// Return rows the command wrote, `None` when they are unknown
+    fn close_command(&mut self, root: u32, writer: u32) -> Option<Vec<RelFileNode>> {
+        let mut window = self.commands.remove(&root).unwrap_or_default();
+        if let Some(other) = self.commands.remove(&writer) {
+            window.absorb(other);
+        }
+        let known = window.after_boundary || self.fully_observed(root);
+        self.commands.insert(
+            root,
+            CommandWindow {
+                after_boundary: true,
+                ..Default::default()
+            },
+        );
+        (known && !window.unclear).then_some(window.rows)
     }
 
     /// Header-only stand-in for a record [`decide_record`](Self::decide_record)
@@ -558,6 +688,9 @@ impl Filter {
             self.dirty
                 .drain_tree(header_xid, payload.twophase_xid, &payload.subxacts);
         let root = payload.twophase_xid.unwrap_or(header_xid);
+        for xid in members.iter().chain([&header_xid, &root]) {
+            self.commands.remove(xid);
+        }
         let stats_only = self.stats_only_tree(root, &members, merged.is_some());
         // Remove statistics markers for all transaction members
         self.forget_stats_writers(&members);
@@ -660,6 +793,8 @@ impl Filter {
                 kind: BoundaryKind::Commit,
                 members,
                 stats_only,
+                preceding_rows: None,
+                following_rows: None,
             })),
             aborted_tree: None,
         })
@@ -735,6 +870,7 @@ impl Filter {
             touches.dedup_by_key(|a| a.oid);
             touches
         };
+        let preceding_rows = self.close_command(root, xid);
         Ok(Some(Arc::new(BoundaryInfo {
             drain_xid: root,
             tree_first_touch,
@@ -744,6 +880,8 @@ impl Filter {
             kind: BoundaryKind::Command { writer_xid: xid },
             members: Vec::new(),
             stats_only: false,
+            preceding_rows,
+            following_rows: None,
         })))
     }
 
@@ -2065,6 +2203,183 @@ mod tests {
         r.header.info = main_data::XLOG_SMGR_CREATE;
         r.main_data = std::borrow::Cow::Owned(md);
         r
+    }
+
+    fn rfn(db: u32, rel: u32) -> RelFileNode {
+        RelFileNode {
+            spc_node: 1663,
+            db_node: db,
+            rel_node: rel,
+        }
+    }
+
+    fn with_info(mut r: XLogRecord<'static>, info: u8) -> XLogRecord<'static> {
+        r.header.info = info;
+        r
+    }
+
+    #[test]
+    fn touch_names_rows_and_unclear_records() {
+        use crate::decode::heap_decoder::{
+            XLOG_HEAP_DELETE, XLOG_HEAP_LOCK, XLOG_HEAP_TRUNCATE, XLOG_HEAP2_MULTI_INSERT,
+        };
+        let mut f = target_filter();
+        let mut touch = |r: XLogRecord<'static>| f.decide_record(&r, 10, 0xD116).unwrap().touch;
+        let user = (TARGET_DB, 16500);
+        assert_eq!(
+            touch(rec(RmId::Heap, &[user])),
+            Touch::Row(rfn(TARGET_DB, 16500))
+        );
+        assert_eq!(
+            touch(with_info(rec(RmId::Heap, &[user]), XLOG_HEAP_DELETE)),
+            Touch::Row(rfn(TARGET_DB, 16500))
+        );
+        assert_eq!(
+            touch(with_info(
+                rec(RmId::Heap2, &[user]),
+                XLOG_HEAP2_MULTI_INSERT
+            )),
+            Touch::Row(rfn(TARGET_DB, 16500))
+        );
+        assert_eq!(
+            touch(rec(RmId::Heap2, &[user])),
+            Touch::None,
+            "page maintenance"
+        );
+        assert_eq!(
+            touch(with_info(rec(RmId::Heap, &[user]), XLOG_HEAP_LOCK)),
+            Touch::None
+        );
+        assert_eq!(touch(rec(RmId::Btree, &[user])), Touch::None);
+        assert_eq!(touch(rec(RmId::Heap, &[(FOREIGN_DB, 16500)])), Touch::None);
+        assert_eq!(
+            touch(rec(RmId::Heap, &[(TARGET_DB, 1259)])),
+            Touch::None,
+            "catalog rows"
+        );
+        assert_eq!(touch(rec(RmId::Heap, &[])), Touch::None);
+        assert_eq!(
+            touch(with_info(rec(RmId::Heap, &[user]), XLOG_HEAP_INPLACE)),
+            Touch::Unclear
+        );
+        assert_eq!(
+            touch(with_info(rec(RmId::Heap, &[]), XLOG_HEAP_TRUNCATE)),
+            Touch::Unclear
+        );
+        assert_eq!(touch(smgr_create(TARGET_DB, 24000, 0)), Touch::Unclear);
+        assert_eq!(touch(smgr_create(FOREIGN_DB, 24000, 0)), Touch::None);
+        assert_eq!(
+            touch(with_info(rec(RmId::Smgr, &[]), main_data::XLOG_SMGR_CREATE)),
+            Touch::Unclear,
+            "unparsed creation"
+        );
+        assert_eq!(
+            touch(xact_end(XLOG_XACT_ABORT, 9, &[], None)),
+            Touch::Unclear
+        );
+        assert_eq!(
+            touch(with_info(
+                rec_with_xid(RmId::Xact, &[], 9),
+                XLOG_XACT_PREPARE
+            )),
+            Touch::Unclear
+        );
+        assert_eq!(touch(xact_end(XLOG_XACT_COMMIT, 9, &[], None)), Touch::None);
+    }
+
+    fn preceding(f: &mut Filter, xid: u32, lsn: u64) -> Option<Vec<RelFileNode>> {
+        f.decide_record(&xact_invals_rec(xid, &[(-2, 5, 16400)]), lsn, 0xD116)
+            .unwrap()
+            .boundary
+            .expect("command boundary")
+            .preceding_rows
+            .clone()
+    }
+
+    #[test]
+    fn command_rows_start_at_its_catalog_write() {
+        let mut f = target_filter();
+        f.observe_from_xid(5);
+        let catalog = |xid| rec_with_xid(RmId::Heap, &[(TARGET_DB, 1259)], xid);
+        let row = |xid, rel| rec_with_xid(RmId::Heap, &[(TARGET_DB, rel)], xid);
+        f.decide_record(&catalog(7), 100, 0xD116).unwrap();
+        f.decide_record(&row(7, 16500), 110, 0xD116).unwrap();
+        f.decide_record(&row(8, 16501), 120, 0xD116).unwrap();
+        f.decide_record(&row(8, 16501), 125, 0xD116).unwrap();
+        assert_eq!(
+            preceding(&mut f, 7, 130),
+            Some(vec![rfn(TARGET_DB, 16500), rfn(TARGET_DB, 16501)]),
+            "rows from any transaction after the command's catalog write",
+        );
+        f.decide_record(&row(7, 16502), 140, 0xD116).unwrap();
+        assert_eq!(
+            preceding(&mut f, 7, 150),
+            Some(Vec::new()),
+            "rows before the next command's catalog write use the last read",
+        );
+        f.decide_record(&catalog(7), 160, 0xD116).unwrap();
+        f.decide_record(&smgr_create(TARGET_DB, 24000, 0), 170, 0xD116)
+            .unwrap();
+        assert_eq!(preceding(&mut f, 7, 180), None, "new storage");
+        f.decide_record(&xact_end(XLOG_XACT_COMMIT, 7, &[], None), 190, 0xD116)
+            .unwrap();
+        assert!(f.commands.is_empty(), "commit drops its windows");
+    }
+
+    #[test]
+    fn command_rows_before_view_are_unknown() {
+        let mut f = target_filter();
+        f.decide_record(
+            &rec_with_xid(RmId::Heap, &[(TARGET_DB, 1259)], 7),
+            100,
+            0xD116,
+        )
+        .unwrap();
+        assert_eq!(
+            preceding(&mut f, 7, 110),
+            None,
+            "transaction may predate the stream"
+        );
+        assert_eq!(
+            preceding(&mut f, 7, 120),
+            Some(Vec::new()),
+            "after a boundary all of the next command is in view",
+        );
+        f.decide_record(&xact_end(XLOG_XACT_ABORT, 7, &[], None), 130, 0xD116)
+            .unwrap();
+        assert!(f.commands.is_empty(), "abort drops its windows");
+    }
+
+    /// A subtransaction linked after its catalog write keeps the window it
+    /// opened under its own key
+    #[test]
+    fn command_rows_follow_a_late_link() {
+        let mut f = target_filter();
+        f.observe_from_xid(5);
+        f.decide_record(
+            &rec_with_xid(RmId::Heap, &[(TARGET_DB, 1259)], 101),
+            100,
+            0xD116,
+        )
+        .unwrap();
+        f.decide_record(
+            &rec_with_xid(RmId::Heap, &[(TARGET_DB, 16500)], 101),
+            110,
+            0xD116,
+        )
+        .unwrap();
+        f.decide_record(&xact_assignment(100, &[101]), 120, 0xD116)
+            .unwrap();
+        f.decide_record(
+            &rec_with_xid(RmId::Heap, &[(TARGET_DB, 16500)], 100),
+            125,
+            0xD116,
+        )
+        .unwrap();
+        assert_eq!(
+            preceding(&mut f, 101, 130),
+            Some(vec![rfn(TARGET_DB, 16500)])
+        );
     }
 
     #[test]

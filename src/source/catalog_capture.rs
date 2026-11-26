@@ -28,7 +28,10 @@
 //!
 //! At each [`crate::record::BoundaryKind::Command`], read the transaction's
 //! uncommitted catalog rows for the named relations into [`PendingCatalog`].
-//! Use these reads to build the log entries at commit.
+//! Use these reads to build the log entries at commit. Skip a read only when
+//! WAL shows no row of those relations is written between the command's
+//! first catalog write and the next read that covers them
+//! ([`crate::source::wal_stream`] finds that read in buffered WAL).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -72,6 +75,8 @@ crate::atomic_stats! {
         pub ambiguities_published,
         /// Command boundaries captured into the pending timeline
         pub pending_captures,
+        /// Command boundaries skipped because WAL showed no row needs them
+        pub pending_skipped,
         /// Descriptors read across those captures
         pub pending_rels,
         /// Publication holds taken for a command boundary
@@ -99,30 +104,6 @@ impl CaptureStats {
     }
 }
 
-/// Limits for catalog reads within a transaction (`[stream] pending_max_*`).
-#[derive(Debug, Clone, Copy, serde::Deserialize)]
-#[serde(default)]
-pub struct PendingCaptureConfig {
-    /// Boundaries one transaction may hold for
-    #[serde(rename = "pending_max_boundaries_per_xact")]
-    pub max_boundaries_per_xact: u32,
-    /// Cumulative parked time one transaction may cost
-    #[serde(
-        rename = "pending_max_hold_ms",
-        deserialize_with = "crate::toml_de::de_millis"
-    )]
-    pub max_hold_per_xact: Duration,
-}
-
-impl Default for PendingCaptureConfig {
-    fn default() -> Self {
-        Self {
-            max_boundaries_per_xact: 64,
-            max_hold_per_xact: Duration::from_secs(10),
-        }
-    }
-}
-
 pub struct CatalogCapture {
     log: Arc<DescriptorLog>,
     catalog: Arc<tokio::sync::Mutex<ShadowCatalog>>,
@@ -131,8 +112,11 @@ pub struct CatalogCapture {
     /// Speculative per-transaction catalog state, written here at command
     /// boundaries and read by the commit drain
     pending: Arc<PendingCatalog>,
-    pending_cfg: PendingCaptureConfig,
     stats: Arc<CaptureStats>,
+    /// Command reads left to succeed before every later one fails,
+    /// `u32::MAX` disarmed
+    #[cfg(feature = "test-support")]
+    reads_before_failure: std::sync::atomic::AtomicU32,
 }
 
 /// One derived schema event keyed at its drain LSN
@@ -148,7 +132,6 @@ impl CatalogCapture {
         buffer: Arc<tokio::sync::Mutex<XactBuffer>>,
         markers: Arc<std::sync::Mutex<SmgrMarkers>>,
         pending: Arc<PendingCatalog>,
-        pending_cfg: PendingCaptureConfig,
     ) -> Self {
         Self {
             log,
@@ -156,9 +139,33 @@ impl CatalogCapture {
             buffer,
             markers,
             pending,
-            pending_cfg,
             stats: Arc::new(CaptureStats::default()),
+            #[cfg(feature = "test-support")]
+            reads_before_failure: std::sync::atomic::AtomicU32::new(u32::MAX),
         }
+    }
+
+    /// Fail every command read after `reads` more succeed
+    #[cfg(feature = "test-support")]
+    pub fn fail_command_read_after(&self, reads: u32) {
+        self.reads_before_failure
+            .store(reads, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "test-support")]
+    fn forced_failure(&self) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        let left = self.reads_before_failure.load(Relaxed);
+        if left == u32::MAX || left == 0 {
+            return left == 0;
+        }
+        self.reads_before_failure.store(left - 1, Relaxed);
+        false
+    }
+
+    #[cfg(not(feature = "test-support"))]
+    fn forced_failure(&self) -> bool {
+        false
     }
 
     pub fn stats_handle(&self) -> Arc<CaptureStats> {
@@ -170,6 +177,12 @@ impl CatalogCapture {
         let BoundaryKind::Command { writer_xid } = info.kind else {
             return !info.stats_only;
         };
+        if no_row_needs(info, self.log.db_oid(), |rfn| self.owner(rfn)) {
+            self.stats
+                .pending_skipped
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return false;
+        }
         // At commit, record misses for reads from unlinked subtransactions
         // that this name refresh could not reach.
         if info.capture_all {
@@ -182,20 +195,10 @@ impl CatalogCapture {
             return false;
         }
         // Shadow has already replayed past boundaries covered by the log.
-        let refused = if next_lsn <= self.log.covered_through() {
-            Some(DegradeReason::ReplayMismatch)
-        } else {
-            self.pending
-                .admit(
-                    info.drain_xid,
-                    self.pending_cfg.max_boundaries_per_xact,
-                    self.pending_cfg.max_hold_per_xact.as_nanos() as u64,
-                )
-                .err()
-        };
-        let Some(reason) = refused else {
+        if next_lsn > self.log.covered_through() {
             return true;
-        };
+        }
+        let reason = DegradeReason::ReplayMismatch;
         if self.miss(info.drain_xid, writer_xid, &oids, next_lsn, reason) {
             tracing::warn!(
                 target: "walshadow::desc_log",
@@ -206,6 +209,15 @@ impl CatalogCapture {
             );
         }
         false
+    }
+
+    /// Relation whose rows a filenode holds now
+    fn owner(&self, rfn: RelFileNode) -> Option<Oid> {
+        self.log
+            .peek_spanned(rfn, u64::MAX)
+            .ok()
+            .map(|(desc, _)| desc.oid)
+            .or_else(|| self.pending.rfn_owner(rfn))
     }
 
     /// Read named relations. A cache flush or namespace change can also
@@ -239,17 +251,16 @@ impl CatalogCapture {
         first
     }
 
-    /// Charge a released command-boundary hold against the transaction's
-    /// cumulative budget
-    pub fn charge_hold(&self, info: &BoundaryInfo, held: Duration) {
+    /// Count a released command-boundary hold
+    pub fn count_hold(&self, info: &BoundaryInfo, held: Duration) {
         use std::sync::atomic::Ordering::Relaxed;
         let BoundaryKind::Command { .. } = info.kind else {
             return;
         };
-        let nanos = held.as_nanos() as u64;
         self.stats.pending_holds.fetch_add(1, Relaxed);
-        self.stats.pending_hold_nanos.fetch_add(nanos, Relaxed);
-        self.pending.charge_hold(info.drain_xid, nanos);
+        self.stats
+            .pending_hold_nanos
+            .fetch_add(held.as_nanos() as u64, Relaxed);
     }
 
     /// Aborted tree: its speculative slots die here, on the pump, before any
@@ -413,7 +424,9 @@ impl CatalogCapture {
         let next_lsn = parked.lsn();
         let top_xid = info.drain_xid;
         let oids = self.boundary_oids(info);
-        let read = {
+        let read = if self.forced_failure() {
+            Err(CatalogError::Parse("forced command read failure".into()))
+        } else {
             let mut cat = self.catalog.lock().await;
             cat.fetch_overlay_descriptors(&oids, top_xid, parked).await
         };
@@ -682,6 +695,22 @@ impl CatalogCapture {
     }
 }
 
+/// Whether skipping a command read leaves no row of database `db` without
+/// its descriptor. Rows of a filenode `owner` cannot place count, since they
+/// may belong to a relation this transaction created or rewrote
+fn no_row_needs(info: &BoundaryInfo, db: Oid, owner: impl Fn(RelFileNode) -> Option<Oid>) -> bool {
+    let (Some(before), Some(after)) = (&info.preceding_rows, &info.following_rows) else {
+        return false;
+    };
+    let mut rows = before.iter().chain(after).filter(|r| r.db_node == db);
+    if info.capture_all {
+        return rows.next().is_none();
+    }
+    // TOAST rows ride with a row on the owning heap
+    let named: Vec<Oid> = info.oids.iter().map(|a| a.oid).collect();
+    rows.all(|rfn| owner(*rfn).is_some_and(|oid| !named.contains(&oid)))
+}
+
 /// Shadow cannot rewind to retry a read at an earlier replay position.
 fn degrade_reason(err: &CatalogError) -> DegradeReason {
     match err {
@@ -795,6 +824,58 @@ mod tests {
     }
 
     #[test]
+    fn skipped_read_needs_rows_of_named_or_unknown_relations() {
+        use crate::record::AffectedOid;
+        let rfn = |db, rel_node| RelFileNode {
+            spc_node: 1663,
+            db_node: db,
+            rel_node,
+        };
+        let owner = |r: RelFileNode| match r.rel_node {
+            7000 => Some(42),
+            7001 => Some(43),
+            _ => None,
+        };
+        let info =
+            |before: Option<Vec<RelFileNode>>, after: Option<Vec<RelFileNode>>| BoundaryInfo {
+                oids: vec![AffectedOid {
+                    oid: 42,
+                    pg_class_touch: None,
+                }],
+                kind: BoundaryKind::Command { writer_xid: 7 },
+                preceding_rows: before,
+                following_rows: after,
+                ..Default::default()
+            };
+        let skip = |b: &BoundaryInfo| no_row_needs(b, 5, owner);
+        assert!(skip(&info(Some(vec![]), Some(vec![]))));
+        assert!(!skip(&info(None, Some(vec![]))), "command WAL unknown");
+        assert!(!skip(&info(Some(vec![]), None)), "no covering read found");
+        assert!(skip(&info(
+            Some(vec![rfn(5, 7001)]),
+            Some(vec![rfn(6, 7000)])
+        )));
+        assert!(
+            !skip(&info(Some(vec![]), Some(vec![rfn(5, 7000)]))),
+            "named"
+        );
+        assert!(
+            !skip(&info(Some(vec![rfn(5, 7002)]), Some(vec![]))),
+            "unknown"
+        );
+        let all = BoundaryInfo {
+            capture_all: true,
+            ..info(Some(vec![rfn(6, 7001)]), Some(vec![]))
+        };
+        assert!(skip(&all), "another database's rows");
+        let all = BoundaryInfo {
+            capture_all: true,
+            ..info(Some(vec![]), Some(vec![rfn(5, 7001)]))
+        };
+        assert!(!skip(&all), "names may change for any relation");
+    }
+
+    #[test]
     fn degrade_reason_separates_replay_mismatch_from_the_rest() {
         assert_eq!(
             degrade_reason(&CatalogError::Bridge(BridgeError::ReplayMismatch {
@@ -850,9 +931,16 @@ impl CaptureSet {
             .any(|capture| capture.admits(info, next_lsn))
     }
 
-    pub fn charge_hold(&self, info: &BoundaryInfo, held: Duration) {
+    pub fn count_hold(&self, info: &BoundaryInfo, held: Duration) {
         for capture in self.scoped(info.db_oid) {
-            capture.charge_hold(info, held);
+            capture.count_hold(info, held);
+        }
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn fail_command_read_after(&self, reads: u32) {
+        for (_, capture) in &self.by_db {
+            capture.fail_command_read_after(reads);
         }
     }
 

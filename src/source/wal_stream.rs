@@ -38,9 +38,9 @@ use walrus::pg::walparser::{
     ParseError, RmId, X_LOG_RECORD_ALIGNMENT, X_LOG_SWITCH, XLogRecord, parse_record_from_bytes,
 };
 
-use crate::filter::Filter;
 use crate::filter::header_walk;
 use crate::filter::rewrite::noop_replace;
+use crate::filter::{Filter, Touch};
 use crate::pos::{Floor, Pos};
 #[cfg(test)]
 use crate::record::{
@@ -60,6 +60,11 @@ use crate::source::streaming_walker::{CompletedRecord, StreamingWalker, WalkErro
 /// walsender's `MAX_SEND_SIZE` so replay ships at streaming cadence
 const STAGED_MAX_BYTES: usize = 128 * 1024;
 const STAGED_MAX_RECORDS: usize = 4096;
+
+/// How far past a command boundary to look in buffered WAL for proof that
+/// no row needs its catalog read
+const LOOKAHEAD_MAX_BYTES: usize = if cfg!(test) { 512 } else { 1024 * 1024 };
+const LOOKAHEAD_MAX_RECORDS: usize = if cfg!(test) { 8 } else { 4096 };
 
 /// Decoder routing needs a block or relation-naming main data, and the walker
 /// hands over whole records, so a NOOP always fits
@@ -129,9 +134,11 @@ pub struct WalStream {
     /// reset to `0` at segment boundary.
     wire_offset: usize,
     /// Records parsed but not yet dispatched, and the segment-relative end
-    /// of their bytes; shipped as one wire chunk ahead of their dispatch
-    staged: Vec<Record<'static>>,
+    /// of their bytes; shipped ahead of their dispatch
+    staged: Vec<Staged>,
     staged_end: usize,
+    /// Command boundaries in `staged` still looking ahead, in order
+    windows: Vec<Window>,
     /// CRC32C of the raw source bytes consumed in the current segment,
     /// `[raw_crc_from, next_lsn)`. What a fork verify compares against: the
     /// walker buffer cannot answer, because every dropped record is rewritten
@@ -183,6 +190,21 @@ impl WalStreamBuilder {
     }
 }
 
+struct Staged {
+    record: Record<'static>,
+    /// Segment-relative end of the record's bytes
+    end: usize,
+    parks: bool,
+    touch: Touch,
+}
+
+/// Row writes seen after one staged command boundary
+struct Window {
+    /// Index into `staged`
+    at: usize,
+    rows: Vec<walrus::pg::walparser::RelFileNode>,
+}
+
 /// Digest of the ancestor bytes a descendant repeats, from
 /// [`WalStream::fork_prefix`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -218,6 +240,7 @@ impl WalStream {
             wire_offset: 0,
             staged: Vec::new(),
             staged_end: 0,
+            windows: Vec::new(),
             raw_crc: 0,
             raw_crc_from: start_lsn,
             poisoned: false,
@@ -334,9 +357,13 @@ impl WalStream {
     ///
     /// Records stage until one may park on shadow replay
     /// ([`RecordSink::may_park`]), staging crosses a bound, or the walker
-    /// runs dry; then their bytes ship as one chunk and they dispatch in
-    /// order. A parking record ends its run, so no successor byte reaches
-    /// the wire while it holds
+    /// runs dry; then they dispatch in order, each run's bytes shipping
+    /// ahead of it. A parking record ends its run, so no successor byte
+    /// reaches the wire while it holds.
+    ///
+    /// A parking command boundary first looks ahead through buffered WAL
+    /// for the next read covering its relations ([`Self::look_ahead`]).
+    /// Nothing past it dispatches until that search ends
     async fn drain_records(
         &mut self,
         record_sink: &mut (dyn RecordSink + Send),
@@ -348,19 +375,23 @@ impl WalStream {
                     let seg = self.segment_for_lsn(self.current_lsn).format();
                     return Err(WalStreamError::Walk { seg, source });
                 }
-                None => return self.dispatch_staged(record_sink).await,
+                None => {
+                    // Source may stay idle, so decide with the bytes at hand
+                    self.windows.clear();
+                    return self.dispatch_staged(record_sink).await;
+                }
             };
             let start_offset = completed.start_offset;
             let page_magic = completed.page_magic;
             let byte_ranges = completed.byte_ranges.clone();
             let last_range = byte_ranges.last().copied().unwrap_or((0, 0));
             let source_lsn = self.current_lsn + start_offset as u64;
-            let record = if let Some(parsed) = self.filter.route_from_header(
+            let (record, touch) = if let Some(parsed) = self.filter.route_from_header(
                 completed.logical_bytes(self.walker.buffer()),
                 page_magic,
                 source_lsn,
             ) {
-                Record {
+                let record = Record {
                     next_lsn: self.end_rec_ptr(&last_range, &parsed),
                     defer_catalog_decode: self.filter.decide_from_header(&parsed, source_lsn),
                     parsed,
@@ -369,7 +400,8 @@ impl WalStream {
                     route: Route::ToDecoder,
                     boundary_info: None,
                     aborted_tree: None,
-                }
+                };
+                (record, Touch::None)
             } else {
                 self.decide(&completed, source_lsn, &last_range, record_sink)
                     .await?
@@ -393,16 +425,79 @@ impl WalStream {
                     }
                 }
             }
-            self.staged_end = self.staged_end.max(last_range.0 + last_range.1);
+            let end = last_range.0 + last_range.1;
+            self.staged_end = self.staged_end.max(end);
             let parks = record_sink.may_park(&record);
-            self.staged.push(record);
-            if parks
-                || self.staged.len() >= STAGED_MAX_RECORDS
-                || self.staged_end - self.wire_offset >= STAGED_MAX_BYTES
+            self.staged.push(Staged {
+                record,
+                end,
+                parks,
+                touch,
+            });
+            let looked = self.look_ahead();
+            if self.windows.is_empty()
+                && (parks
+                    || looked
+                    || self.staged.len() >= STAGED_MAX_RECORDS
+                    || self.staged_end - self.wire_offset >= STAGED_MAX_BYTES)
             {
                 self.dispatch_staged(record_sink).await?;
             }
         }
+    }
+
+    /// Feed the newest staged record to each open window, then open one if
+    /// it is a parking command boundary whose own command WAL is known.
+    ///
+    /// A window ends with proof at a read covering its relations
+    /// ([`BoundaryInfo::covers`](crate::record::BoundaryInfo::covers)),
+    /// recording the rows written since in `following_rows` for capture to
+    /// check. It ends without proof on a [`Touch::Unclear`] record or past
+    /// the lookahead bounds, which keeps the read. Return whether any window
+    /// was open
+    fn look_ahead(&mut self) -> bool {
+        let looked = !self.windows.is_empty();
+        let newest = self.staged.len() - 1;
+        let (end, touch) = (self.staged[newest].end, self.staged[newest].touch);
+        let later = self.staged[newest].record.boundary_info.clone();
+        let staged = &mut self.staged;
+        self.windows.retain_mut(|w| {
+            let from = &mut staged[w.at];
+            if touch == Touch::Unclear
+                || newest - w.at > LOOKAHEAD_MAX_RECORDS
+                || end - from.end > LOOKAHEAD_MAX_BYTES
+            {
+                return false;
+            }
+            if let Touch::Row(rfn) = touch
+                && !w.rows.contains(&rfn)
+            {
+                w.rows.push(rfn);
+            }
+            let info = from
+                .record
+                .boundary_info
+                .as_mut()
+                .expect("window on a boundary");
+            if !later.as_ref().is_some_and(|l| l.covers(info)) {
+                return true;
+            }
+            std::sync::Arc::make_mut(info).following_rows = Some(std::mem::take(&mut w.rows));
+            false
+        });
+        let s = &self.staged[newest];
+        if s.parks
+            && s.record.boundary_info.as_ref().is_some_and(|b| {
+                matches!(b.kind, crate::record::BoundaryKind::Command { .. })
+                    && b.preceding_rows.is_some()
+            })
+        {
+            self.windows.push(Window {
+                at: newest,
+                rows: Vec::new(),
+            });
+        }
+        looked
     }
 
     /// Full parse and routing verdict of `completed`
@@ -412,14 +507,14 @@ impl WalStream {
         source_lsn: u64,
         last_range: &(usize, usize),
         record_sink: &mut (dyn RecordSink + Send),
-    ) -> Result<Record<'static>, WalStreamError> {
+    ) -> Result<(Record<'static>, Touch), WalStreamError> {
         let offset = completed.start_offset;
         let page_magic = completed.page_magic;
         // Materialise to `'static` so the in-place NOOP can take
         // `&mut self.walker`, and the decoder reads the original bytes
         // after the shadow stream is clobbered. Skip the copy when
         // dispatch reads only the header
-        let record = {
+        let (record, touch) = {
             let parsed =
                 parse_record_from_bytes(completed.logical_bytes(self.walker.buffer()), page_magic)
                     .map_err(|source| WalStreamError::Parse { offset, source })?;
@@ -437,38 +532,58 @@ impl WalStream {
                 aborted_tree: verdict.aborted_tree,
                 defer_catalog_decode: verdict.defer_catalog_decode,
             };
-            if record_sink.header_only(&header) {
+            let record = if record_sink.header_only(&header) {
                 header
             } else {
                 Record {
                     parsed: parsed.into_owned(),
                     ..header
                 }
-            }
+            };
+            (record, verdict.touch)
         };
         self.filter
             .flush_shadow_rels()
             .await
             .map_err(WalStreamError::ShadowRelations)?;
-        Ok(record)
+        Ok((record, touch))
     }
 
-    /// Ship staged records' bytes, then hand the records to `record_sink`
+    /// Hand staged records to `record_sink` in runs, each ending at a
+    /// parking record, shipping a run's bytes ahead of it
     async fn dispatch_staged(
         &mut self,
         record_sink: &mut (dyn RecordSink + Send),
     ) -> Result<(), WalStreamError> {
-        // Frame buffer[wire_offset..staged_end] as one chunk: covers page
-        // headers + inter-record padding so shadow's walreceiver sees a
-        // stream byte-identical to disk `restore_command`.
-        if self.staged_end > self.wire_offset {
-            let chunk = &self.walker.buffer()[self.wire_offset..self.staged_end];
+        let staged = std::mem::take(&mut self.staged);
+        let mut run_end = self.staged_end;
+        let mut ends: Vec<usize> = staged
+            .iter()
+            .rev()
+            .map(|s| {
+                if s.parks {
+                    run_end = s.end;
+                }
+                run_end
+            })
+            .collect();
+        for s in staged {
+            self.ship_through(ends.pop().expect("one end per record"))
+                .await?;
+            record_sink.on_record_owned(s.record).await?;
+        }
+        self.ship_through(self.staged_end).await
+    }
+
+    /// Frame buffer[wire_offset..end] as one chunk: covers page headers and
+    /// inter-record padding so shadow's walreceiver sees a stream
+    /// byte-identical to disk `restore_command`
+    async fn ship_through(&mut self, end: usize) -> Result<(), WalStreamError> {
+        if end > self.wire_offset {
+            let chunk = &self.walker.buffer()[self.wire_offset..end];
             let start_lsn = self.current_lsn + self.wire_offset as u64;
             self.bytes_sink.on_wire_chunk(start_lsn, chunk).await?;
-            self.wire_offset = self.staged_end;
-        }
-        for record in self.staged.drain(..) {
-            record_sink.on_record_owned(record).await?;
+            self.wire_offset = end;
         }
         Ok(())
     }
@@ -1913,5 +2028,215 @@ mod tests {
             let payload_failed = matches!(err, Err(WalStreamError::Payload { offset: 40, .. }));
             assert_eq!((parse_failed, payload_failed), (parse, !parse), "{err:?}");
         }
+    }
+
+    /// Highest wire byte shipped, and each dispatch with the wire then
+    #[derive(Default)]
+    struct Dispatches {
+        wire: std::sync::Arc<std::sync::Mutex<u64>>,
+        seen: Vec<(Record<'static>, u64)>,
+    }
+
+    struct WireMark(std::sync::Arc<std::sync::Mutex<u64>>);
+
+    impl RecordBytesSink for WireMark {
+        fn on_wire_chunk<'a>(
+            &'a mut self,
+            start_lsn: u64,
+            bytes: &'a [u8],
+        ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
+            *self.0.lock().unwrap() = start_lsn + bytes.len() as u64;
+            Box::pin(std::future::ready(Ok(())))
+        }
+    }
+
+    impl RecordSink for Dispatches {
+        fn on_record<'a>(
+            &'a mut self,
+            record: &'a Record<'a>,
+        ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
+            let wire = *self.wire.lock().unwrap();
+            self.seen.push((record.to_static(), wire));
+            Box::pin(std::future::ready(Ok(())))
+        }
+
+        fn may_park(&self, record: &Record<'_>) -> bool {
+            record.boundary_info.is_some() || record.aborted_tree.is_some()
+        }
+    }
+
+    impl Dispatches {
+        /// `following_rows` of each command boundary, by relfilenode
+        fn following(&self) -> Vec<Option<Vec<u32>>> {
+            self.seen
+                .iter()
+                .filter_map(|(r, _)| r.boundary_info.as_ref())
+                .filter(|b| matches!(b.kind, crate::record::BoundaryKind::Command { .. }))
+                .map(|b| {
+                    b.following_rows
+                        .as_ref()
+                        .map(|rows| rows.iter().map(|r| r.rel_node).collect())
+                })
+                .collect()
+        }
+
+        /// No parking record dispatched with bytes past it on the wire, and
+        /// every record dispatched after its own bytes
+        fn assert_wire_order(&self) {
+            for (r, wire) in &self.seen {
+                assert!(
+                    *wire > r.source_lsn,
+                    "record at {:#X} ahead of its bytes",
+                    r.source_lsn
+                );
+                if self.may_park(r) {
+                    assert!(
+                        *wire <= r.next_lsn,
+                        "bytes through {wire:#X} shipped before parker at {:#X}",
+                        r.source_lsn
+                    );
+                }
+            }
+        }
+    }
+
+    const LOOK_SEG: u64 = 8192;
+
+    fn catalog_write(xid: u32) -> Vec<u8> {
+        raw_rec(RmId::Heap as u8, 0x00, xid, Some((1663, 5, 1259)), None)
+    }
+
+    fn row(xid: u32, rel: u32) -> Vec<u8> {
+        raw_rec(RmId::Heap as u8, 0x00, xid, Some((1663, 5, rel)), None)
+    }
+
+    fn command(xid: u32, rel: u32) -> Vec<u8> {
+        let mut md = 1i32.to_le_bytes().to_vec();
+        let mut msg = [0u8; 16];
+        msg[0] = -2i8 as u8;
+        msg[4..8].copy_from_slice(&5u32.to_le_bytes());
+        msg[8..12].copy_from_slice(&rel.to_le_bytes());
+        md.extend_from_slice(&msg);
+        raw_rec(RmId::Xact as u8, 0x60, xid, None, Some(&md))
+    }
+
+    fn xact_end(xid: u32, op: u8) -> Vec<u8> {
+        raw_rec(RmId::Xact as u8, op, xid, None, Some(&0i64.to_le_bytes()))
+    }
+
+    fn smgr_create(rel: u32) -> Vec<u8> {
+        let mut md = Vec::new();
+        for v in [1663u32, 5, rel, 0] {
+            md.extend_from_slice(&v.to_le_bytes());
+        }
+        raw_rec(RmId::Smgr as u8, 0x10, 0, None, Some(&md))
+    }
+
+    async fn look(records: &[Vec<u8>]) -> Dispatches {
+        let page = page_of(records, LOOK_SEG as usize);
+        let mut ws = WalStream::builder(1, LOOK_SEG, Pos::ZERO).unwrap();
+        ws.filter_mut().set_target_db(5);
+        ws.filter_mut().observe_from_xid(5);
+        let mut sink = Dispatches::default();
+        ws.set_bytes_sink(Box::new(WireMark(sink.wire.clone())));
+        let mut ws = ws.start();
+        let used = records
+            .iter()
+            .map(|r| r.len().next_multiple_of(8))
+            .sum::<usize>()
+            + 40;
+        let mut seg = CollectingSegmentSink::default();
+        ws.push(0, &page[..used], &mut sink, &mut seg)
+            .await
+            .unwrap();
+        assert_eq!(sink.seen.len(), records.len());
+        sink.assert_wire_order();
+        sink
+    }
+
+    /// Each command defers to the next read naming its relations, here the
+    /// next command and then the commit
+    #[tokio::test]
+    async fn lookahead_defers_catalog_only_commands_to_commit() {
+        let sink = look(&[
+            catalog_write(7),
+            command(7, 16400),
+            catalog_write(7),
+            command(7, 16400),
+            xact_end(7, 0x00),
+            row(8, 16400),
+        ])
+        .await;
+        assert_eq!(sink.following(), [Some(vec![]), Some(vec![])]);
+    }
+
+    #[tokio::test]
+    async fn lookahead_collects_rows_until_the_covering_read() {
+        let sink = look(&[
+            catalog_write(7),
+            command(7, 16400),
+            row(8, 16500),
+            row(7, 16400),
+            row(7, 16400),
+            command(9, 16400),
+            xact_end(7, 0x00),
+        ])
+        .await;
+        assert_eq!(
+            sink.following(),
+            [Some(vec![16500, 16400]), None],
+            "another writer's boundary covers nothing, and nothing covers it",
+        );
+    }
+
+    /// Storage creation and rollback leave unclear which descriptor rows need
+    #[tokio::test]
+    async fn lookahead_keeps_reads_past_unclear_records() {
+        let sink = look(&[
+            catalog_write(7),
+            command(7, 16400),
+            smgr_create(24000),
+            xact_end(7, 0x00),
+        ])
+        .await;
+        assert_eq!(sink.following(), [None]);
+        let sink = look(&[
+            catalog_write(7),
+            command(7, 16400),
+            xact_end(8, 0x20),
+            xact_end(7, 0x00),
+        ])
+        .await;
+        assert_eq!(sink.following(), [None]);
+    }
+
+    #[tokio::test]
+    async fn lookahead_stops_at_its_bounds() {
+        let mut records = vec![catalog_write(7), command(7, 16400)];
+        records.extend((0..LOOKAHEAD_MAX_RECORDS).map(|_| row(8, 16500)));
+        records.push(xact_end(7, 0x00));
+        assert_eq!(look(&records).await.following(), [None], "record bound");
+        let wide = raw_rec(
+            RmId::Heap as u8,
+            0x00,
+            8,
+            Some((1663, 5, 16500)),
+            Some(&[0; 255]),
+        );
+        let records = [
+            catalog_write(7),
+            command(7, 16400),
+            wide.clone(),
+            wide,
+            xact_end(7, 0x00),
+        ];
+        assert_eq!(look(&records).await.following(), [None], "byte bound");
+    }
+
+    /// Input ending before any covering read keeps the read
+    #[tokio::test]
+    async fn lookahead_decides_with_the_bytes_at_hand() {
+        let sink = look(&[catalog_write(7), command(7, 16400), row(8, 16500)]).await;
+        assert_eq!(sink.following(), [None]);
     }
 }

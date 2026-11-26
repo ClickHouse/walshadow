@@ -9,8 +9,8 @@
 //!    answers from the command boundary on, so the fence shrinks to the run
 //!    before it and the row lands.
 //!    `dirty_admission_e2e::physical_in_place_alter_fences_deferred_rows` is
-//!    the control: the same shape with the feature off fences the whole dirty
-//!    interval and stops the stream
+//!    the control: the same shape with every command read failing fences the
+//!    whole dirty interval and stops the stream
 //! 2. `relation_born_in_xact_keeps_a_slot_per_boundary` — two shapes of a
 //!    relation created in the same transaction, one slot each, the first at
 //!    the generation's smgr marker
@@ -23,10 +23,22 @@
 //! 6. `backfill_then_set_not_null_with_late_temp_table_delivers` checks that
 //!    backfilled values reach ClickHouse after `SET NOT NULL` and temp
 //!    table creation.
-//! 7. `unread_shape_change_reaches_later_rows` checks that skipping the
-//!    second `ADD COLUMN` read preserves both new columns in later rows.
+//! 7. `unread_shape_change_reaches_later_rows` checks that a failed second
+//!    `ADD COLUMN` read preserves both new columns in later rows.
 //! 8. `unread_shape_change_after_rewrite_reaches_later_rows` checks that a
-//!    skipped `ADD COLUMN` read after `TRUNCATE` still preserves the new column.
+//!    failed `ADD COLUMN` read after `TRUNCATE` still preserves the new column.
+//! 9. `every_change_a_row_needs_is_read` runs more schema changes than the
+//!    old per-transaction limit, each followed by a row.
+//! 10. `catalog_only_migration_reads_at_commit` checks that only the commit
+//!     reads when no row follows any command.
+//! 11. `rows_of_other_tables_leave_reads_unneeded` checks that rows of other
+//!     tables, including one created in the transaction, skip reads.
+//! 12. `idle_source_reads_at_the_current_boundary` checks that capture reads
+//!     with the WAL at hand when input stops after a command.
+//! 13. `row_position_picks_the_read` compares a row after two changes with a
+//!     row between them.
+//! 14. `rewrite_ctas_and_rollback_keep_their_reads` covers a rewrite,
+//!     `CREATE TABLE AS` and savepoint rollback.
 //!
 //! `varchar(10)` → `text` is binary coercible, so PG rewrites `atttypid` in
 //! place: same filenode, same walk fields, different type. That is the
@@ -52,15 +64,6 @@ struct Drill {
 }
 
 async fn build_drill(slot: fx::Ports, schema_sql: &str, app_name: &str) -> Drill {
-    build_drill_with(slot, schema_sql, app_name, |_| {}).await
-}
-
-async fn build_drill_with(
-    slot: fx::Ports,
-    schema_sql: &str,
-    app_name: &str,
-    tune: impl FnOnce(&mut walshadow::ch_emitter::EmitterConfig),
-) -> Drill {
     let tmp = tempfile::tempdir().unwrap();
     let (
         fx::BootstrappedClusters {
@@ -96,21 +99,18 @@ async fn build_drill_with(
         },
     );
 
-    let pipeline = fx::build_pipeline_with(
-        fx::BuildPipelineArgs {
-            tmp: &tmp,
-            source: &source,
-            shadow: &shadow,
-            shadow_filter_dir: &shadow_filter_dir,
-            shadow_stream_state,
-            ch_database: "walshadow_test",
-            ch_tcp_port: slot.ch_tcp,
-            mappings: vec![],
-            app_name,
-            ddl: Some(ddl_args),
-        },
-        tune,
-    )
+    let pipeline = fx::build_pipeline(fx::BuildPipelineArgs {
+        tmp: &tmp,
+        source: &source,
+        shadow: &shadow,
+        shadow_filter_dir: &shadow_filter_dir,
+        shadow_stream_state,
+        ch_database: "walshadow_test",
+        ch_tcp_port: slot.ch_tcp,
+        mappings: vec![],
+        app_name,
+        ddl: Some(ddl_args),
+    })
     .await;
 
     Drill {
@@ -125,6 +125,19 @@ async fn build_drill_with(
 async fn pump_and_drain(drill: &mut Drill) {
     let shipped = fx::pump_segments(&mut drill.pipeline, 1, Duration::from_secs(45)).await;
     assert!(shipped >= 1, "expected ≥1 shipped segment, got {shipped}");
+    wait_shadow(drill);
+}
+
+/// Finish `sql` on the source, then pump its WAL in one push so lookahead
+/// decides with the whole workload in view
+async fn run_then_pump(drill: &mut Drill, sql: &str) {
+    spawn_txn(&drill.source, sql).join().expect("workload");
+    let shipped = fx::pump_coalesced(&mut drill.pipeline, 1, Duration::from_secs(45)).await;
+    assert!(shipped >= 1, "expected ≥1 shipped segment, got {shipped}");
+    wait_shadow(drill);
+}
+
+fn wait_shadow(drill: &Drill) {
     let target = drill.pipeline.stream.dispatched_lsn();
     let observed = drill
         .shadow
@@ -492,33 +505,34 @@ async fn backfill_then_set_not_null_with_late_temp_table_delivers() {
     );
 }
 
-/// Allow one catalog read per transaction so capture skips the second
-/// `ADD COLUMN`. The commit descriptor can decode earlier rows, so use it
-/// from the missed read onward. An earlier descriptor used to stay in effect
-/// after commit and drop the second column from later rows.
+/// Fail every read after the first so the second `ADD COLUMN` goes unread.
+/// The commit descriptor can decode earlier rows, so use it from the missed
+/// read onward. An earlier descriptor used to stay in effect after commit
+/// and drop the second column from later rows.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn unread_shape_change_reaches_later_rows() {
     if !fx::tools::requirements_available() {
         return;
     }
-    let mut drill = build_drill_with(
+    let mut drill = build_drill(
         fx::Ports::alloc(),
         "CREATE SCHEMA pc;\n\
          CREATE TABLE pc.t (id bigint PRIMARY KEY, v int);\n",
         "walshadow-pending-unread-shape",
-        |cfg| cfg.pending_capture.max_boundaries_per_xact = 1,
     )
     .await;
+    drill.pipeline.sinks.capture.fail_command_read_after(1);
     let capture = capture_stats(&drill);
 
     let driver = spawn_txn(
         &drill.source,
         "BEGIN;\n\
          ALTER TABLE pc.t ADD COLUMN a int;\n\
+         INSERT INTO pc.t VALUES (1, 1, 11);\n\
          ALTER TABLE pc.t ADD COLUMN b int;\n\
-         INSERT INTO pc.t VALUES (1, 1, 11, 111);\n\
-         COMMIT;\n\
          INSERT INTO pc.t VALUES (2, 2, 22, 222);\n\
+         COMMIT;\n\
+         INSERT INTO pc.t VALUES (3, 3, 33, 333);\n\
          SELECT pg_switch_wal();\n",
     );
     pump_and_drain(&mut drill).await;
@@ -535,15 +549,11 @@ async fn unread_shape_change_reaches_later_rows() {
                 ifNull(toString(argMax(b, _lsn)), 'NULL')) AS c \
             FROM walshadow_test.t WHERE _is_deleted = 0 \
             GROUP BY id ORDER BY id)",
-        "1=11/111,2=22/222",
+        "1=11/NULL,2=22/222,3=33/333",
         "ClickHouse receives both new columns before and after commit",
     )
     .await;
-    assert_eq!(
-        unread(&capture),
-        1,
-        "one transaction reached its catalog read limit"
-    );
+    assert_eq!(unread(&capture), 1, "one transaction missed a read");
     assert_eq!(
         load(&capture.ambiguities_published),
         0,
@@ -551,22 +561,22 @@ async fn unread_shape_change_reaches_later_rows() {
     );
 }
 
-/// Capture reads the new filenode at `TRUNCATE` and skips `ADD COLUMN` at
-/// the read limit. The commit descriptor can decode rows from both versions
-/// of the table on the new filenode.
+/// Capture reads the new filenode at `TRUNCATE` and fails the `ADD COLUMN`
+/// read. The commit descriptor can decode rows from both versions of the
+/// table on the new filenode.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn unread_shape_change_after_rewrite_reaches_later_rows() {
     if !fx::tools::requirements_available() {
         return;
     }
-    let mut drill = build_drill_with(
+    let mut drill = build_drill(
         fx::Ports::alloc(),
         "CREATE SCHEMA pc;\n\
          CREATE TABLE pc.t (id bigint PRIMARY KEY, v int);\n",
         "walshadow-pending-unread-rewrite",
-        |cfg| cfg.pending_capture.max_boundaries_per_xact = 1,
     )
     .await;
+    drill.pipeline.sinks.capture.fail_command_read_after(1);
     let capture = capture_stats(&drill);
 
     let driver = spawn_txn(
@@ -597,14 +607,354 @@ async fn unread_shape_change_after_rewrite_reaches_later_rows() {
         "ClickHouse receives the new column before and after commit",
     )
     .await;
-    assert_eq!(
-        unread(&capture),
-        1,
-        "one transaction reached its catalog read limit"
-    );
+    assert_eq!(unread(&capture), 1, "one transaction missed a read");
     assert_eq!(
         load(&capture.ambiguities_published),
         0,
         "the added column leaves rewritten rows readable",
     );
+}
+
+/// More schema changes than the old per-transaction read limit, each
+/// followed by a row using the new column. Every row needs the read before it
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn every_change_a_row_needs_is_read() {
+    if !fx::tools::requirements_available() {
+        return;
+    }
+    const CHANGES: usize = 70;
+    let mut drill = build_drill(
+        fx::Ports::alloc(),
+        "CREATE SCHEMA pc;\n\
+         CREATE TABLE pc.t (id bigint PRIMARY KEY);\n",
+        "walshadow-pending-many",
+    )
+    .await;
+    let capture = capture_stats(&drill);
+
+    let mut sql = String::from("BEGIN;\n");
+    for n in 1..=CHANGES {
+        sql.push_str(&format!(
+            "ALTER TABLE pc.t ADD COLUMN c{n} int;\n\
+             INSERT INTO pc.t (id, c{n}) VALUES ({n}, {n});\n"
+        ));
+    }
+    sql.push_str("COMMIT;\nSELECT pg_switch_wal();\n");
+    let driver = spawn_txn(&drill.source, &sql);
+    pump_and_drain(&mut drill).await;
+    let _ = driver.join();
+
+    drill.pipeline.shutdown().await.expect("pipeline drains");
+    let _ = drill.shadow.stop();
+    let _ = drill.source.stop();
+
+    let cols: Vec<String> = (1..=CHANGES).map(|n| format!("c{n}")).collect();
+    fx::wait_query(
+        &drill.ch,
+        &format!(
+            "SELECT countIf(v = id) FROM (\
+                SELECT id, argMax([{}][id], _lsn) AS v \
+                FROM walshadow_test.t WHERE _is_deleted = 0 GROUP BY id)",
+            cols.join(", ")
+        ),
+        &CHANGES.to_string(),
+        "every row keeps the value of the column added just before it",
+    )
+    .await;
+    assert!(
+        load(&capture.pending_captures) >= CHANGES as u64,
+        "each change a row needs is read",
+    );
+    assert_eq!(unread(&capture), 0, "no read was missed");
+}
+
+/// Catalog-only migration: commit is in buffered WAL and no row is written
+/// before it, so the commit read alone covers every command
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn catalog_only_migration_reads_at_commit() {
+    if !fx::tools::requirements_available() {
+        return;
+    }
+    let mut drill = build_drill(
+        fx::Ports::alloc(),
+        "CREATE SCHEMA pc;\n\
+         CREATE TABLE pc.t (id bigint PRIMARY KEY, v int);\n",
+        "walshadow-pending-catalog-only",
+    )
+    .await;
+    let capture = capture_stats(&drill);
+
+    run_then_pump(
+        &mut drill,
+        "BEGIN;\n\
+         ALTER TABLE pc.t ADD COLUMN a int;\n\
+         ALTER TABLE pc.t ADD COLUMN b int;\n\
+         ALTER TABLE pc.t ADD COLUMN c int;\n\
+         COMMIT;\n\
+         INSERT INTO pc.t VALUES (1, 1, 11, 111, 1111);\n\
+         SELECT pg_switch_wal();\n",
+    )
+    .await;
+    drill.pipeline.shutdown().await.expect("pipeline drains");
+    let _ = drill.shadow.stop();
+    let _ = drill.source.stop();
+
+    fx::wait_query(
+        &drill.ch,
+        "SELECT concat(toString(argMax(a, _lsn)), '/', toString(argMax(b, _lsn)), '/', \
+            toString(argMax(c, _lsn))) FROM walshadow_test.t WHERE _is_deleted = 0",
+        "11/111/1111",
+        "row after the migration carries every new column",
+    )
+    .await;
+    assert_eq!(load(&capture.pending_captures), 0, "no command read");
+    assert_eq!(load(&capture.pending_holds), 0, "no command hold");
+    assert!(load(&capture.pending_skipped) >= 3, "each command skipped");
+    assert!(load(&capture.sql_captures) >= 1, "commit read");
+}
+
+/// Rows of other tables, one committed and one created in this transaction,
+/// need neither `ALTER` read
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rows_of_other_tables_leave_reads_unneeded() {
+    if !fx::tools::requirements_available() {
+        return;
+    }
+    let mut drill = build_drill(
+        fx::Ports::alloc(),
+        "CREATE SCHEMA pc;\n\
+         CREATE TABLE pc.t (id bigint PRIMARY KEY, v int);\n\
+         CREATE TABLE pc.o (id bigint PRIMARY KEY);\n",
+        "walshadow-pending-other-tables",
+    )
+    .await;
+    let capture = capture_stats(&drill);
+
+    run_then_pump(
+        &mut drill,
+        "BEGIN;\n\
+         CREATE TABLE pc.n (id bigint PRIMARY KEY);\n\
+         INSERT INTO pc.n VALUES (1);\n\
+         ALTER TABLE pc.t ADD COLUMN a int;\n\
+         INSERT INTO pc.n VALUES (2);\n\
+         INSERT INTO pc.o VALUES (1);\n\
+         ALTER TABLE pc.t ADD COLUMN b int;\n\
+         COMMIT;\n\
+         INSERT INTO pc.t VALUES (1, 1, 11, 111);\n\
+         SELECT pg_switch_wal();\n",
+    )
+    .await;
+    let skipped = load(&capture.pending_skipped);
+    drill.pipeline.shutdown().await.expect("pipeline drains");
+    let _ = drill.shadow.stop();
+    let _ = drill.source.stop();
+
+    let ids = |table: &str| {
+        format!(
+            "SELECT arrayStringConcat(groupArray(toString(id)), ',') FROM (\
+                SELECT id FROM walshadow_test.{table} WHERE _is_deleted = 0 \
+                GROUP BY id ORDER BY id)"
+        )
+    };
+    fx::wait_query(&drill.ch, &ids("n"), "1,2", "rows of the new table").await;
+    fx::wait_query(&drill.ch, &ids("o"), "1", "rows of the committed table").await;
+    fx::wait_query(
+        &drill.ch,
+        "SELECT concat(toString(argMax(a, _lsn)), '/', toString(argMax(b, _lsn))) \
+         FROM walshadow_test.t WHERE _is_deleted = 0",
+        "11/111",
+        "row after commit",
+    )
+    .await;
+    assert!(skipped >= 2, "both ALTER reads skipped, got {skipped}");
+    assert_eq!(unread(&capture), 0, "no read was missed");
+}
+
+/// Input stops after a command: capture reads at that boundary with the WAL
+/// it has rather than waiting for the commit
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn idle_source_reads_at_the_current_boundary() {
+    if !fx::tools::requirements_available() {
+        return;
+    }
+    let mut drill = build_drill(
+        fx::Ports::alloc(),
+        "CREATE SCHEMA pc;\n\
+         CREATE TABLE pc.t (id bigint PRIMARY KEY, v int);\n",
+        "walshadow-pending-idle",
+    )
+    .await;
+    let capture = capture_stats(&drill);
+
+    let mut txn = fx::TxnSession::open(&drill.source);
+    txn.send("BEGIN;\nALTER TABLE pc.t ADD COLUMN a int;\n");
+    fx::wait_idle_in_txn(&drill.source, "ADD COLUMN a int;");
+    drill.source.psql_one("CHECKPOINT").expect("flush WAL");
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while load(&capture.pending_captures) == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "capture waited for WAL past an idle command",
+        );
+        fx::pump_segments(&mut drill.pipeline, 1, Duration::from_millis(500)).await;
+    }
+    assert_eq!(
+        load(&capture.pending_skipped),
+        0,
+        "nothing proved the read unneeded"
+    );
+
+    txn.send(
+        "INSERT INTO pc.t VALUES (1, 1, 11);\n\
+         COMMIT;\n\
+         SELECT pg_switch_wal();\n",
+    );
+    txn.finish();
+    pump_and_drain(&mut drill).await;
+    drill.pipeline.shutdown().await.expect("pipeline drains");
+    let _ = drill.shadow.stop();
+    let _ = drill.source.stop();
+
+    fx::wait_query(
+        &drill.ch,
+        "SELECT toString(argMax(a, _lsn)) FROM walshadow_test.t WHERE _is_deleted = 0",
+        "11",
+        "row after the idle command uses its read",
+    )
+    .await;
+}
+
+/// A row after two changes needs only the read after the second. A row
+/// between them needs the read after the first, and the commit read covers
+/// the second
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn row_position_picks_the_read() {
+    if !fx::tools::requirements_available() {
+        return;
+    }
+    let mut drill = build_drill(
+        fx::Ports::alloc(),
+        "CREATE SCHEMA pc;\n\
+         CREATE TABLE pc.t (id bigint PRIMARY KEY, v int);\n\
+         CREATE TABLE pc.u (id bigint PRIMARY KEY, v int);\n",
+        "walshadow-pending-row-position",
+    )
+    .await;
+    let capture = capture_stats(&drill);
+
+    run_then_pump(
+        &mut drill,
+        "BEGIN;\n\
+         ALTER TABLE pc.t ADD COLUMN a int;\n\
+         ALTER TABLE pc.t ADD COLUMN b int;\n\
+         INSERT INTO pc.t VALUES (1, 1, 11, 111);\n\
+         COMMIT;\n\
+         SELECT pg_switch_wal();\n",
+    )
+    .await;
+    let after = (
+        load(&capture.pending_captures),
+        load(&capture.pending_skipped),
+    );
+    assert_eq!(after.0, 1, "one read, after the second change");
+    assert!(after.1 >= 1, "first change skipped");
+
+    run_then_pump(
+        &mut drill,
+        "BEGIN;\n\
+         ALTER TABLE pc.u ADD COLUMN a int;\n\
+         INSERT INTO pc.u VALUES (1, 1, 11);\n\
+         ALTER TABLE pc.u ADD COLUMN b int;\n\
+         COMMIT;\n\
+         INSERT INTO pc.u VALUES (2, 2, 22, 222);\n\
+         SELECT pg_switch_wal();\n",
+    )
+    .await;
+    assert_eq!(
+        load(&capture.pending_captures) - after.0,
+        1,
+        "one read, after the first change",
+    );
+    assert!(
+        load(&capture.pending_skipped) > after.1,
+        "second change skipped"
+    );
+    drill.pipeline.shutdown().await.expect("pipeline drains");
+    let _ = drill.shadow.stop();
+    let _ = drill.source.stop();
+
+    let rows = |table: &str| {
+        format!(
+            "SELECT arrayStringConcat(groupArray(c), ',') FROM (\
+                SELECT concat(toString(id), '=', toString(argMax(a, _lsn)), '/', \
+                    ifNull(toString(argMax(b, _lsn)), 'NULL')) AS c \
+                FROM walshadow_test.{table} WHERE _is_deleted = 0 \
+                GROUP BY id ORDER BY id)"
+        )
+    };
+    fx::wait_query(&drill.ch, &rows("t"), "1=11/111", "row after both changes").await;
+    fx::wait_query(
+        &drill.ch,
+        &rows("u"),
+        "1=11/NULL,2=22/222",
+        "row between the changes and row after commit",
+    )
+    .await;
+    assert_eq!(unread(&capture), 0, "no read was missed");
+}
+
+/// Rewrites, `CREATE TABLE AS` and savepoint rollback write rows or drop
+/// reads in ways only the read at each boundary can place
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rewrite_ctas_and_rollback_keep_their_reads() {
+    if !fx::tools::requirements_available() {
+        return;
+    }
+    let mut drill = build_drill(
+        fx::Ports::alloc(),
+        "CREATE SCHEMA pc;\n\
+         CREATE TABLE pc.t (id bigint PRIMARY KEY, v int);\n\
+         INSERT INTO pc.t VALUES (1, 1);\n",
+        "walshadow-pending-rewrite-ctas",
+    )
+    .await;
+    let capture = capture_stats(&drill);
+
+    run_then_pump(
+        &mut drill,
+        "BEGIN;\n\
+         ALTER TABLE pc.t ALTER COLUMN v TYPE bigint USING v * 10;\n\
+         INSERT INTO pc.t VALUES (2, 20);\n\
+         CREATE TABLE pc.u AS SELECT id, v FROM pc.t;\n\
+         ALTER TABLE pc.u ADD PRIMARY KEY (id);\n\
+         SAVEPOINT s;\n\
+         ALTER TABLE pc.t ADD COLUMN gone int;\n\
+         ROLLBACK TO s;\n\
+         INSERT INTO pc.t VALUES (3, 30);\n\
+         COMMIT;\n\
+         SELECT pg_switch_wal();\n",
+    )
+    .await;
+    drill.pipeline.shutdown().await.expect("pipeline drains");
+    let _ = drill.shadow.stop();
+    let _ = drill.source.stop();
+
+    let rows = |table: &str| {
+        format!(
+            "SELECT arrayStringConcat(groupArray(c), ',') FROM (\
+                SELECT concat(toString(id), '=', toString(argMax(v, _lsn))) AS c \
+                FROM walshadow_test.{table} WHERE _is_deleted = 0 \
+                GROUP BY id ORDER BY id)"
+        )
+    };
+    fx::wait_query(&drill.ch, &rows("t"), "1=10,2=20,3=30", "rewritten table").await;
+    fx::wait_query(
+        &drill.ch,
+        &rows("u"),
+        "1=10,2=20",
+        "table created from a query",
+    )
+    .await;
+    assert!(load(&capture.pending_captures) >= 2, "reads kept");
+    assert_eq!(unread(&capture), 0, "no read was missed");
 }

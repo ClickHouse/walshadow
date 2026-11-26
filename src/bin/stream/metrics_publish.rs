@@ -215,6 +215,7 @@ impl DbMetricSources {
             descriptor_ambiguous_total: cap(|s| &s.ambiguities_published),
             pending_captures_total: cap(|s| &s.pending_captures),
             pending_rels_total: cap(|s| &s.pending_rels),
+            pending_skipped_total: cap(|s| &s.pending_skipped),
             pending_holds_total: cap(|s| &s.pending_holds),
             pending_hold_seconds_total: cap_seconds(|s| &s.pending_hold_nanos),
             pending_entries_promoted_total: cap(|s| &s.pending_entries_promoted),

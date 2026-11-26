@@ -623,7 +623,7 @@ impl RecordSink for PipelineSinks {
                     wait_for_replay(&self.bridge, record.next_lsn)
                         .await
                         .map_err(|e| SinkError::Other(format!("harness boundary wait: {e}")))?;
-                    self.capture.charge_hold(info, std::time::Duration::ZERO);
+                    self.capture.count_hold(info, std::time::Duration::ZERO);
                     // Harness pump withholds successors while this runs
                     let parked = ParkedAt::assume_for_test(record.next_lsn);
                     self.capture
@@ -905,7 +905,6 @@ async fn build_pipeline_inner(
             .await
             .expect("persist shadow replay eligibility");
     }
-    let pending_cfg = emitter_cfg.pending_capture;
     let pending_catalog = Arc::new(walshadow::pending::PendingCatalog::default());
 
     // SIGHUP-reloadable mapping shared by the DDL applicator + decode pool.
@@ -1055,7 +1054,6 @@ async fn build_pipeline_inner(
             xact_buffer.clone(),
             smgr_markers,
             pending_catalog.clone(),
-            pending_cfg,
         ),
     );
     let sinks = PipelineSinks {
@@ -1186,6 +1184,129 @@ pub async fn pump_segments_res(
         deadline,
     )
     .await
+}
+
+/// [`pump_segments`] that joins chunks arriving back to back into one push,
+/// so lookahead sees a finished workload's WAL at once
+pub async fn pump_coalesced(
+    pipeline: &mut Pipeline,
+    segments_needed: u64,
+    deadline: Duration,
+) -> u64 {
+    let end = Instant::now() + deadline;
+    let mut shipped = 0u64;
+    let mut prev = pipeline.stream.dispatched_lsn();
+    let mut held: Option<(u64, Vec<u8>)> = None;
+    while shipped < segments_needed && Instant::now() < end {
+        let apply_lsn = pipeline.stream.dispatched_lsn();
+        let quiet = if held.is_some() {
+            Duration::from_millis(300)
+        } else {
+            Duration::from_secs(2)
+        };
+        let next = tokio::time::timeout(
+            quiet,
+            pipeline
+                .feed
+                .next_event(StandbyStatus::collapsed(apply_lsn), &mut pipeline.chunk_buf),
+        )
+        .await;
+        match next {
+            Ok(Ok(SourceEvent::Wal(c))) => match &mut held {
+                Some((start, buf)) if *start + buf.len() as u64 == c.start_lsn => {
+                    buf.extend_from_slice(c.data);
+                    continue;
+                }
+                Some(_) => panic!("source feed skipped bytes at {:#X}", c.start_lsn),
+                None => {
+                    held = Some((c.start_lsn, c.data.to_vec()));
+                    continue;
+                }
+            },
+            Ok(Ok(_)) => break,
+            Ok(Err(e)) => panic!("source feed: {e:#}"),
+            Err(_) => {}
+        }
+        if let Some((start, buf)) = held.take() {
+            pipeline
+                .stream
+                .push(start, &buf, &mut pipeline.sinks, &mut pipeline.segment_sink)
+                .await
+                .expect("push coalesced WAL");
+        }
+        let now = pipeline.stream.dispatched_lsn();
+        shipped += (now - prev) / WAL_SEG_SIZE;
+        prev = now;
+    }
+    shipped
+}
+
+/// psql session holding a transaction open across a pipeline restart;
+/// statements execute as lines arrive on stdin
+pub struct TxnSession {
+    child: std::process::Child,
+}
+
+impl TxnSession {
+    pub fn open(source: &Shadow) -> Self {
+        let child = Command::new("psql")
+            .args([
+                "-h",
+                source.config().socket_dir.to_str().unwrap(),
+                "-p",
+                &source.config().port.to_string(),
+                "-U",
+                "postgres",
+                "-d",
+                "postgres",
+                "-v",
+                "ON_ERROR_STOP=1",
+                "-f",
+                "-",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn psql");
+        Self { child }
+    }
+
+    pub fn send(&mut self, sql: &str) {
+        self.child
+            .stdin
+            .as_mut()
+            .expect("stdin piped")
+            .write_all(sql.as_bytes())
+            .expect("write to held psql");
+    }
+
+    pub fn finish(mut self) {
+        drop(self.child.stdin.take());
+        let status = self.child.wait().expect("wait psql");
+        assert!(status.success(), "held psql session failed: {status}");
+    }
+}
+
+/// Poll until the held session ran its statement ending in `last` (session
+/// parked idle in transaction) so its WAL precedes the upcoming segment switch
+pub fn wait_idle_in_txn(source: &Shadow, last: &str) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let probe = format!(
+        "SELECT count(*) FROM pg_stat_activity \
+         WHERE state = 'idle in transaction' AND query LIKE '%{last}'"
+    );
+    loop {
+        let n = source.psql_one(&probe).expect("poll pg_stat_activity");
+        if n.trim() == "1" {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "open txn never appeared"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 /// Poll `sql` until it returns `want` or the deadline passes (commit drains
