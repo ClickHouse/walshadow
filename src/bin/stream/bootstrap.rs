@@ -402,6 +402,25 @@ pub(crate) async fn run_bootstrap(
     .context("prepare shadow data dir for bootstrap")?;
     let resume =
         bootstrap_marker::resumable_extraction(&shadow_data_dir, marker.backup_name.as_deref())?;
+    // A fresh walk rebuilds every tapped mirror, and its `_lsn = 0` rows lose
+    // to anything an earlier run left there. A resumed attempt skips this:
+    // its mirrors hold the finished walk's only copy
+    if resume.is_none() {
+        let reset = walshadow::backfill_bootstrap::reset_walked_toast_mirrors(
+            &drain_catalog,
+            tap_filenodes.as_deref(),
+            &resolver,
+        )
+        .await
+        .context("bootstrap: reset TOAST chunk mirrors before the page walk")?;
+        if reset > 0 {
+            tracing::info!(
+                target: "walshadow::bootstrap",
+                mirrors = reset,
+                "reset TOAST chunk mirrors the page walk rebuilds",
+            );
+        }
+    }
 
     // Sample window floor before BASE_BACKUP
     let source_ident = feed
