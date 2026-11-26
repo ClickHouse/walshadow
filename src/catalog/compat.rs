@@ -30,13 +30,6 @@ pub enum Incompat {
 }
 
 impl Incompat {
-    /// Failing check's name, for logs and ambiguity diagnostics
-    pub fn why(&self) -> &'static str {
-        match self {
-            Self::Benign(why) | Self::Physical(why) => why,
-        }
-    }
-
     pub fn is_physical(&self) -> bool {
         matches!(self, Self::Physical(_))
     }

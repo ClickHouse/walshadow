@@ -673,10 +673,9 @@ impl Filter {
     /// entry with nothing to capture would hold publication at commit for
     /// nothing.
     ///
-    /// Same set bounds record: a relation absent from it did not change shape
-    /// at this command, so scan stays scoped to named relations. A capture-all
-    /// set still bounds nothing, capture degrades xact rather than scan whole
-    /// catalog per command
+    /// Invalidation messages name every relation whose layout changed.
+    /// On a cache flush or namespace change, also refresh names for
+    /// relations already read in this transaction.
     fn observe_xact_invals(
         &mut self,
         record: &XLogRecord,

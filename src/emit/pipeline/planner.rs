@@ -16,11 +16,10 @@
 //! emits nothing.
 //!
 //! Validation coverage, one enforcement point per plan-success guarantee:
-//! - descriptor Present and unambiguous → commit-time stash verdicts at
-//!   the drain, fenced per record against the resolved filenode's ambiguity
-//!   intervals (`XactBufferError::StashAmbiguous`); a tree that stashed and
-//!   reached the drain with no verdict installed fails closed too
-//!   (`MissingStashResolution`)
+//! - Look up each buffered record's descriptor by filenode and LSN.
+//!   Stop on an ambiguity interval ([`XactBufferError::StashAmbiguous`]),
+//!   a missing descriptor ([`XactBufferError::StashUncovered`]), or a
+//!   missing commit-time lookup ([`XactBufferError::MissingStashResolution`]).
 //! - operation supported with logical tuple data → raw operation policy
 //!   ([`FailClosedReason`])
 //! - decoded xid matches owning xact/subxact → merge ownership check
@@ -119,6 +118,7 @@ pub fn drain_reason(e: &XactBufferError) -> &'static str {
             FailClosedReason::PartialUpdate => "partial_update",
         },
         XactBufferError::StashAmbiguous { .. } => "stash_ambiguous",
+        XactBufferError::StashUncovered { .. } => "stash_uncovered",
         XactBufferError::IncompleteToastGeneration { .. } => "incomplete_toast",
         XactBufferError::MissingStashResolution { .. } => "missing_stash_resolution",
         XactBufferError::Detoast(_) | XactBufferError::ValueTooLarge { .. } => "detoast",
@@ -436,6 +436,13 @@ mod tests {
                 through_lsn: 3,
             }),
             "stash_ambiguous"
+        );
+        assert_eq!(
+            drain_reason(&XactBufferError::StashUncovered {
+                rel_node: 1,
+                lsn: 2,
+            }),
+            "stash_uncovered"
         );
         assert_eq!(
             drain_reason(&XactBufferError::IncompleteToastGeneration { relid: 1 }),

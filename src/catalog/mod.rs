@@ -3,4 +3,5 @@ pub mod desc_log;
 pub mod pending;
 pub mod shadow;
 pub mod shadow_catalog;
+pub mod timeline;
 pub mod type_bridge;

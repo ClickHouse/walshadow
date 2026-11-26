@@ -19,32 +19,16 @@
 //! statistics changed. Replay saved batch to avoid querying shadow after
 //! it has replayed past this commit
 //!
-//! valid_from bias-early: a descriptor is a backward-compatible reader of
-//! older tuples, never the reverse. Rotated filenode → the rfn's
-//! `XLOG_SMGR_CREATE` marker (before any page write); in-place change → the
-//! oid's first pg_class touch in the xact; fallback the xact tree's first
-//! catalog touch. Dropped tombstones at `next_lsn`.
+//! [`timeline::build`] combines the previous descriptor, reads and misses
+//! during the transaction, and the descriptor at commit. It records gaps
+//! where decoding may be unsafe. Record each gap by both filenode and OID
+//! so either lookup stops decoding there. Start a new filenode at its
+//! `XLOG_SMGR_CREATE` marker and retire its predecessor at the same LSN.
+//! Record dropped relations at `next_lsn`.
 //!
-//! Bias-early holds when the final descriptor provably reads the whole
-//! dirty interval, and when the only drift is one `catalog::compat` calls
-//! benign — declared shape changed, every byte reads the same. A physically
-//! unproven in-place transition publishes an `Ambiguity` over
-//! `[first_touch, next_lsn)` instead and lands its `Present` at `next_lsn`:
-//! post-commit rows decode, interval rows fail closed per record at the
-//! drain ([`crate::xact::xact_buffer::resolve_stash`]). One interval per
-//! identity key (rfn, oid) so both lookup paths see the same fence.
-//! Rotations skip the check: the rewrite emits final-layout tuples and
-//! superseded-generation rows retire with the old rfn. Fresh generations
-//! have no covered predecessor to compare.
-//!
-//! Command boundaries ([`crate::record::BoundaryKind::Command`]) sample the
-//! same relations mid-transaction, off the writing transaction's own
-//! uncommitted rows, into
-//! [`PendingCatalog`]. Nothing there
-//! is durable until this xact's commit folds those slots into the batch at
-//! their own positions, which is also what shrinks the fence: promoted slots
-//! are exact shapes at exact positions, so the ambiguity survives only over
-//! the run before the first of them, and rows past it decode.
+//! At each [`crate::record::BoundaryKind::Command`], read the transaction's
+//! uncommitted catalog rows for the named relations into [`PendingCatalog`].
+//! Use these reads to build the log entries at commit.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -52,13 +36,13 @@ use std::time::Duration;
 use tokio_postgres::types::Oid;
 use walrus::pg::walparser::RelFileNode;
 
-use crate::catalog::compat::Incompat;
 use crate::catalog::desc_log::{
     Ambiguity, AmbiguityReason, AmbiguityScope, BatchRecord, DescriptorLog, LogEntry, LogValue,
     ObservationKind, RelationObservation,
 };
 use crate::catalog::pending::{DegradeReason, PendingCatalog, PendingSlot};
 use crate::catalog::shadow_catalog::{CatalogError, ParkedAt, ShadowCatalog};
+use crate::catalog::timeline::{self, Shapes};
 #[cfg(feature = "test-support")]
 use crate::crash_test;
 use crate::filter::SmgrMarkers;
@@ -78,13 +62,13 @@ crate::atomic_stats! {
         pub skipped_covered,
         /// Descriptors fetched across SQL captures
         pub rels_captured,
-        /// Capture-all boundaries (whole-relcache inval or unenumerated
-        /// catalog write)
+        /// Commits that scanned the whole catalog after a cache flush or
+        /// a catalog write with no relation list.
         pub capture_all_runs,
         pub events_added,
         pub events_changed,
         pub events_dropped,
-        /// Ambiguity intervals published for unproven in-place changes
+        /// Intervals where no known descriptor could safely decode rows.
         pub ambiguities_published,
         /// Command boundaries captured into the pending timeline
         pub pending_captures,
@@ -98,7 +82,7 @@ crate::atomic_stats! {
         pub pending_entries_promoted,
         /// Pending slots dropped with an aborted tree
         pub pending_entries_dropped_abort,
-        /// Transactions degraded to commit-time capture, by reason
+        /// Transactions with missed catalog reads, by reason for the first miss.
         pub pending_degraded: [std::sync::atomic::AtomicU64; DegradeReason::ALL.len()],
         /// Capture duration, nanos (inside the boundary hold)
         pub capture_nanos,
@@ -115,9 +99,7 @@ impl CaptureStats {
     }
 }
 
-/// Cost controls on command-boundary capture. Every refusal degrades the
-/// transaction to commit-time capture, which is sound
-/// `[stream] pending_max_*` keys
+/// Limits for catalog reads within a transaction (`[stream] pending_max_*`).
 #[derive(Debug, Clone, Copy, serde::Deserialize)]
 #[serde(default)]
 pub struct PendingCaptureConfig {
@@ -183,49 +165,78 @@ impl CatalogCapture {
         self.stats.clone()
     }
 
-    /// Decide whether to wait for shadow replay before capture
-    /// Skip statistics-only commits and command boundaries excluded by
-    /// capture capabilities or invalidations
+    /// Decide whether to wait for shadow replay and read the catalog.
     pub fn admits(&self, info: &BoundaryInfo, next_lsn: u64) -> bool {
-        let BoundaryKind::Command { .. } = info.kind else {
+        let BoundaryKind::Command { writer_xid } = info.kind else {
             return !info.stats_only;
         };
-        // Aligned-prefix re-read: shadow replayed past this point long ago,
-        // so the scan could only answer for where replay is now. Degrades
-        // rather than skips silently — an xact straddling the horizon would
-        // otherwise claim coverage over boundaries nothing read
-        if next_lsn <= self.log.covered_through() {
-            self.degrade(info.drain_xid, DegradeReason::ReplayMismatch);
-            return false;
-        }
-        // Whole-relcache flush or a namespace catcache hit names no
-        // relations, and a full catalog scan per command is the one shape
-        // that makes holds expensive. Filter emits a command boundary only
-        // when it names relations or is one of those
+        // At commit, record misses for reads from unlinked subtransactions
+        // that this name refresh could not reach.
         if info.capture_all {
-            self.degrade(info.drain_xid, DegradeReason::CaptureAll);
+            self.pending
+                .name_refresh(info.drain_xid, writer_xid, next_lsn);
+        }
+        let oids = self.boundary_oids(info);
+        // A namespace change before any catalog reads has no names to refresh.
+        if oids.is_empty() {
             return false;
         }
-        match self.pending.admit(
-            info.drain_xid,
-            self.pending_cfg.max_boundaries_per_xact,
-            self.pending_cfg.max_hold_per_xact.as_nanos() as u64,
-        ) {
-            Ok(()) => true,
-            Err(reason) => {
-                if let Some(reason) = reason {
-                    self.stats.count_degrade(reason);
-                }
-                false
-            }
+        // Shadow has already replayed past boundaries covered by the log.
+        let refused = if next_lsn <= self.log.covered_through() {
+            Some(DegradeReason::ReplayMismatch)
+        } else {
+            self.pending
+                .admit(
+                    info.drain_xid,
+                    self.pending_cfg.max_boundaries_per_xact,
+                    self.pending_cfg.max_hold_per_xact.as_nanos() as u64,
+                )
+                .err()
+        };
+        let Some(reason) = refused else {
+            return true;
+        };
+        if self.miss(info.drain_xid, writer_xid, &oids, next_lsn, reason) {
+            tracing::warn!(
+                target: "walshadow::desc_log",
+                xid = info.drain_xid,
+                boundary = format_args!("{next_lsn:#X}"),
+                reason = reason.label(),
+                "skipped catalog read at command boundary",
+            );
         }
+        false
     }
 
-    /// Count a degrade only for the boundary that caused it
-    fn degrade(&self, xid: u32, reason: DegradeReason) {
-        if self.pending.degrade(xid, reason) {
+    /// Read named relations. A cache flush or namespace change can also
+    /// affect names, so re-read relations already captured for this
+    /// transaction. Layout changes always name their relations
+    /// ([`crate::catalog::pending`]).
+    fn boundary_oids(&self, info: &BoundaryInfo) -> Vec<Oid> {
+        let mut oids: Vec<Oid> = info.oids.iter().map(|a| a.oid).collect();
+        if info.capture_all {
+            oids.extend(self.pending.slot_oids(info.drain_xid));
+            oids.sort_unstable();
+            oids.dedup();
+        }
+        oids
+    }
+
+    /// Record a missed read. Count it and return `true` on the first miss
+    /// for this transaction.
+    fn miss(
+        &self,
+        top_xid: u32,
+        writer_xid: u32,
+        oids: &[Oid],
+        at: u64,
+        reason: DegradeReason,
+    ) -> bool {
+        let first = self.pending.miss(top_xid, writer_xid, oids, at, reason);
+        if first {
             self.stats.count_degrade(reason);
         }
+        first
     }
 
     /// Charge a released command-boundary hold against the transaction's
@@ -389,10 +400,9 @@ impl CatalogCapture {
         out
     }
 
-    /// One command boundary: the shapes the writing transaction sees at
-    /// `next_lsn`, where shadow's replay is parked. Best effort — every
-    /// failure degrades the transaction to commit-time capture instead of
-    /// poisoning the stream
+    /// Read the transaction's catalog changes while shadow replay is paused
+    /// at this command boundary. Record a miss if the read fails so commit
+    /// can check compatibility.
     async fn capture_command(
         &self,
         info: &BoundaryInfo,
@@ -402,7 +412,7 @@ impl CatalogCapture {
         use std::sync::atomic::Ordering::Relaxed;
         let next_lsn = parked.lsn();
         let top_xid = info.drain_xid;
-        let oids: Vec<Oid> = info.oids.iter().map(|a| a.oid).collect();
+        let oids = self.boundary_oids(info);
         let read = {
             let mut cat = self.catalog.lock().await;
             cat.fetch_overlay_descriptors(&oids, top_xid, parked).await
@@ -411,16 +421,14 @@ impl CatalogCapture {
             Ok(descs) => descs,
             Err(e) => {
                 let reason = degrade_reason(&e);
-                // Admitted, so not degraded before this read
-                self.pending.degrade(top_xid, reason);
-                self.stats.count_degrade(reason);
+                self.miss(top_xid, writer_xid, &oids, next_lsn, reason);
                 tracing::warn!(
                     target: "walshadow::desc_log",
                     xid = top_xid,
                     boundary = format_args!("{next_lsn:#X}"),
                     reason = reason.label(),
                     err = %e,
-                    "pending capture degraded, commit-time capture stands",
+                    "catalog read failed at command boundary",
                 );
                 return Ok(());
             }
@@ -428,26 +436,10 @@ impl CatalogCapture {
         let slots: Vec<PendingSlot> = descs
             .into_iter()
             .filter(|d| matches!(d.kind, b'r' | b'p' | b'm' | b't'))
-            .map(|desc| {
-                // A relation born in this xact cannot have changed layout
-                // before its first command boundary, and its rows start at
-                // the smgr create — the exact lower bound `CREATE TABLE AS`
-                // needs, where one command writes storage, fills it, and
-                // only then hits its CCI. Only the first shape seen on that
-                // generation may claim the marker; a later boundary
-                // answering from it would bury the earlier one
-                let pred_rfn = self.present_before(desc.oid, next_lsn).map(|d| d.rfn);
-                let first_seen =
-                    pred_rfn != Some(desc.rfn) && !self.pending.has_slots(top_xid, desc.rfn);
-                let valid_from = first_seen
-                    .then(|| self.marker_for(desc.rfn))
-                    .flatten()
-                    .unwrap_or(next_lsn);
-                PendingSlot {
-                    valid_from,
-                    writer_xid,
-                    desc: Arc::new(desc),
-                }
+            .map(|desc| PendingSlot {
+                boundary: next_lsn,
+                writer_xid,
+                desc: Arc::new(desc),
             })
             .collect();
         self.stats.pending_captures.fetch_add(1, Relaxed);
@@ -555,9 +547,6 @@ impl CatalogCapture {
             });
         }
 
-        // Command boundaries this xact held for. Slots are exact shapes at
-        // exact positions, so they promote even from a degraded xact; what
-        // degradation costs is the coverage claim, not the evidence
         let promoted = self.pending.promoted(info.drain_xid);
 
         let mut entries: Vec<Arc<LogEntry>> = Vec::new();
@@ -566,122 +555,70 @@ impl CatalogCapture {
             let pred_desc = self.present_before(oid, next_lsn);
             match fetched.get(&oid) {
                 Some(desc) => {
+                    let fin = Arc::new(desc.clone());
                     // Full physical identity: SET TABLESPACE changes spc
                     // alongside rel_node, and rel_node reuse across
                     // tablespaces must not read as "same filenode"
-                    let rotated = pred_desc.as_ref().is_some_and(|old| old.rfn != desc.rfn);
-                    let fresh = pred_desc.is_none();
-                    // New generation: rows cannot precede the smgr create,
-                    // the marker is an exact lower bound; in-place keeps
-                    // the pg_class-touch bias-early bound
-                    let marker = if rotated || fresh {
-                        self.marker_for(desc.rfn)
-                    } else {
-                        None
-                    };
-                    let first_touch = marker
-                        .or_else(|| pg_class_touch.get(&oid).copied())
+                    let in_place = pred_desc.as_ref().is_some_and(|old| old.rfn == fin.rfn);
+                    let first_touch = pg_class_touch
+                        .get(&oid)
+                        .copied()
                         .unwrap_or(info.tree_first_touch);
-                    if let Some(m) = marker {
+                    if !in_place && let Some(m) = self.marker_for(fin.rfn) {
                         observations.push(RelationObservation {
                             oid: Some(oid),
-                            rfn: Some(desc.rfn),
-                            first_touch_lsn: first_touch,
+                            rfn: Some(fin.rfn),
+                            first_touch_lsn: m,
                             smgr_create_lsn: Some(m),
                             kind: ObservationKind::SmgrCreate,
                         });
                     }
-                    if rotated && let Some(old) = &pred_desc {
-                        entries.push(Arc::new(LogEntry {
-                            valid_from: first_touch,
+                    let shapes = Shapes {
+                        pred: pred_desc.as_ref(),
+                        first_touch,
+                        slots: promoted.as_ref().map_or(&[][..], |p| p.slots_for(oid)),
+                        misses: promoted.as_ref().map_or(&[][..], |p| p.misses_for(oid)),
+                        fin: &fin,
+                        next_lsn,
+                    };
+                    let timeline = timeline::build(&shapes, |rfn| self.marker_for(rfn));
+                    for why in &timeline.benign {
+                        tracing::debug!(
+                            target: "walshadow::desc_log",
                             oid,
-                            rfn: old.rfn,
-                            value: LogValue::Retired,
-                        }));
+                            rel = %fin.rel_name,
+                            why,
+                            "descriptor change leaves row decoding unchanged",
+                        );
                     }
-                    let slots = promoted.as_ref().map_or(&[][..], |p| p.slots_for(oid));
-                    let changed = pred_desc.as_deref() != Some(desc);
-                    // A slot-carrying oid always lands its commit shape too,
-                    // even unchanged: the batch's last entry for an oid is
-                    // what event derivation reads, and an intermediate
-                    // version is not what CH is told about
-                    if changed || !slots.is_empty() {
-                        // In-place transition must prove the final
-                        // descriptor reads the whole dirty interval; a
-                        // rotation's rewrite emits final-layout tuples and
-                        // a fresh generation has no covered predecessor
-                        let mut valid_from = first_touch;
-                        if changed
-                            && !rotated
-                            && let Some(pred) = pred_desc.as_deref()
-                        {
-                            // The timeline answers from the first boundary
-                            // that named the relation on, so only the run
-                            // up to it stays fenced. Rows there predate the
-                            // transaction's first `CommandCounterIncrement`
-                            // and so were written under the predecessor,
-                            // which is what the fence protects: the exact
-                            // mutation position inside that run is still
-                            // unknown
-                            let covered_from = promoted.as_ref().and_then(|p| p.coverage_from(oid));
-                            let (from, published, incompat) = in_place_verdict(
-                                pred,
-                                desc,
-                                oid,
-                                first_touch,
-                                next_lsn,
-                                covered_from,
-                            );
-                            valid_from = from;
-                            if let Some(why) = incompat.filter(|i| !i.is_physical()) {
-                                tracing::debug!(
-                                    target: "walshadow::desc_log",
-                                    oid,
-                                    rel = %desc.rel_name,
-                                    why = why.why(),
-                                    "in-place change reads identically, bias-early kept",
-                                );
-                            }
-                            if !published.is_empty() {
-                                tracing::warn!(
-                                    target: "walshadow::desc_log",
-                                    oid,
-                                    rel = %desc.rel_name,
-                                    from = format_args!("{first_touch:#X}"),
-                                    through = format_args!("{next_lsn:#X}"),
-                                    why = incompat.map_or("", |i| i.why()),
-                                    "in-place change not provably decodable, ambiguity published",
-                                );
-                                // One verdict, one count: siblings name the
-                                // same event under different keys
-                                self.stats.ambiguities_published.fetch_add(1, Relaxed);
-                                ambiguities.extend(published.into_iter().map(Arc::new));
-                            }
-                        }
-                        // Promoted first, commit shape last: the batch reads
-                        // as the transaction's own sequence of shapes
-                        let mut prev = pred_desc.as_deref();
-                        for slot in slots {
-                            if prev == Some(slot.desc.as_ref()) {
-                                continue;
-                            }
-                            prev = Some(slot.desc.as_ref());
-                            entries.push(Arc::new(LogEntry {
-                                valid_from: slot.valid_from,
-                                oid,
-                                rfn: slot.desc.rfn,
-                                value: LogValue::Present(slot.desc.clone()),
-                            }));
-                            self.stats.pending_entries_promoted.fetch_add(1, Relaxed);
-                        }
-                        let desc = Arc::new(desc.clone());
-                        entries.push(Arc::new(LogEntry {
-                            valid_from,
+                    for run in &timeline.fenced {
+                        tracing::warn!(
+                            target: "walshadow::desc_log",
                             oid,
-                            rfn: desc.rfn,
-                            value: LogValue::Present(desc),
-                        }));
+                            rel = %fin.rel_name,
+                            from = format_args!("{:#X}", run.from),
+                            through = format_args!("{:#X}", run.through),
+                            why = run.why,
+                            "recorded an ambiguity interval because decoding may be unsafe",
+                        );
+                        // Count once even though both lookup keys get an entry.
+                        self.stats.ambiguities_published.fetch_add(1, Relaxed);
+                        let interval = |scope| {
+                            Arc::new(Ambiguity {
+                                scope,
+                                from_lsn: run.from,
+                                through_lsn: run.through,
+                                reason: AmbiguityReason::UnknownMutationPosition,
+                            })
+                        };
+                        // Keep entry order stable for batch equality and hashing.
+                        ambiguities.push(interval(AmbiguityScope::Rfn(fin.rfn)));
+                        ambiguities.push(interval(AmbiguityScope::Oid(oid)));
                     }
+                    self.stats
+                        .pending_entries_promoted
+                        .fetch_add(timeline.promoted as u64, Relaxed);
+                    entries.extend(timeline.entries.into_iter().map(Arc::new));
                 }
                 None => {
                     let Some(old) = pred_desc else { continue };
@@ -745,66 +682,12 @@ impl CatalogCapture {
     }
 }
 
-/// Why an overlay read failed, as the transaction's degrade reason. A
-/// replay position other than the boundary is its own case: shadow cannot
-/// rewind, so nothing later re-reads that point
+/// Shadow cannot rewind to retry a read at an earlier replay position.
 fn degrade_reason(err: &CatalogError) -> DegradeReason {
     match err {
         CatalogError::Bridge(BridgeError::ReplayMismatch { .. }) => DegradeReason::ReplayMismatch,
         _ => DegradeReason::QueryError,
     }
-}
-
-/// Entry LSN for an in-place final version + the ambiguities covering the
-/// dirty interval when the final descriptor is not a proven reader of it.
-/// First pg_class touch bounds the interval; exact change positions inside
-/// stay unknown (only the first touch is tracked). Half-open end: the final
-/// version answers from `next_lsn`, keeping the post-commit descriptor
-/// usable over the ambiguous interval.
-///
-/// `covered_from` is where this transaction's own timeline starts answering
-/// for the relation, which ends the fence there: the promoted slots are
-/// exact shapes at exact positions, so only the run before the first of them
-/// has an unknown mutation position left in it. An empty run publishes
-/// nothing.
-///
-/// A benign reject (declared shape drifted, every byte reads the same)
-/// keeps bias-early and publishes nothing. A physical one publishes one
-/// interval per identity key so the rfn-keyed decode path and the oid-keyed
-/// truncate path agree; order is fixed, batch equality and digest are
-/// order-sensitive
-fn in_place_verdict(
-    pred: &RelDescriptor,
-    fin: &RelDescriptor,
-    oid: Oid,
-    first_touch: u64,
-    next_lsn: u64,
-    covered_from: Option<u64>,
-) -> (u64, Vec<Ambiguity>, Option<Incompat>) {
-    let Err(incompat) = crate::catalog::compat::compatible_reader(pred, fin) else {
-        return (first_touch, Vec::new(), None);
-    };
-    if !incompat.is_physical() {
-        return (first_touch, Vec::new(), Some(incompat));
-    }
-    let through_lsn = covered_from.unwrap_or(next_lsn).min(next_lsn);
-    if through_lsn <= first_touch {
-        return (next_lsn, Vec::new(), Some(incompat));
-    }
-    let interval = |scope| Ambiguity {
-        scope,
-        from_lsn: first_touch,
-        through_lsn,
-        reason: AmbiguityReason::UnknownMutationPosition,
-    };
-    (
-        next_lsn,
-        vec![
-            interval(AmbiguityScope::Rfn(fin.rfn)),
-            interval(AmbiguityScope::Oid(oid)),
-        ],
-        Some(incompat),
-    )
 }
 
 /// Added / Changed for heap kinds; toast shape changes are internal (chunk
@@ -868,73 +751,6 @@ mod tests {
                 missing_default: None,
             }],
         }
-    }
-
-    #[test]
-    fn compatible_in_place_keeps_bias_early() {
-        let pred = rel(23, 4, "t");
-        let fin = rel(23, 4, "renamed");
-        let (from, published, incompat) = in_place_verdict(&pred, &fin, 42, 100, 500, None);
-        assert_eq!(from, 100);
-        assert!(published.is_empty());
-        assert_eq!(incompat, None);
-    }
-
-    #[test]
-    fn benign_in_place_keeps_bias_early() {
-        let pred = rel(1043, -1, "t");
-        let mut fin = rel(1043, -1, "t");
-        fin.attributes[0].typmod = 24;
-        let (from, published, incompat) = in_place_verdict(&pred, &fin, 42, 100, 500, None);
-        assert_eq!(from, 100, "read-identical drift keeps bias-early");
-        assert!(published.is_empty(), "no fence for a benign reject");
-        assert_eq!(incompat, Some(Incompat::Benign("typmod change")));
-    }
-
-    #[test]
-    fn physical_in_place_publishes_rfn_and_oid_siblings() {
-        let pred = rel(23, 4, "t");
-        let fin = rel(20, 8, "t");
-        let (from, published, incompat) = in_place_verdict(&pred, &fin, 42, 100, 500, None);
-        assert_eq!(from, 500, "final version serves post-commit rows only");
-        assert!(incompat.is_some_and(|i| i.is_physical()));
-        // Fixed order: batch equality and digest gate append idempotency
-        let scopes: Vec<AmbiguityScope> = published.iter().map(|a| a.scope).collect();
-        assert_eq!(
-            scopes,
-            vec![AmbiguityScope::Rfn(fin.rfn), AmbiguityScope::Oid(42)]
-        );
-        for amb in &published {
-            assert_eq!(amb.from_lsn, 100);
-            assert_eq!(amb.through_lsn, 500);
-            assert_eq!(amb.reason, AmbiguityReason::UnknownMutationPosition);
-        }
-    }
-
-    #[test]
-    fn pending_coverage_shrinks_the_fence_to_the_pre_boundary_run() {
-        let pred = rel(23, 4, "t");
-        let fin = rel(20, 8, "t");
-        let (from, published, _) = in_place_verdict(&pred, &fin, 42, 100, 500, Some(200));
-        assert_eq!(from, 500);
-        assert_eq!(published.len(), 2, "both identity keys still filed");
-        for amb in &published {
-            assert_eq!(amb.from_lsn, 100);
-            assert_eq!(
-                amb.through_lsn, 200,
-                "timeline answers from the first boundary on",
-            );
-        }
-    }
-
-    #[test]
-    fn coverage_from_the_first_touch_publishes_nothing() {
-        let pred = rel(23, 4, "t");
-        let fin = rel(20, 8, "t");
-        let (from, published, incompat) = in_place_verdict(&pred, &fin, 42, 100, 500, Some(100));
-        assert_eq!(from, 500);
-        assert!(published.is_empty(), "empty run needs no fence");
-        assert!(incompat.is_some_and(|i| i.is_physical()));
     }
 
     /// `ATTACH` and identity changes alter no column, yet decide routing

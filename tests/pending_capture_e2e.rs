@@ -16,6 +16,17 @@
 //!    the generation's smgr marker
 //! 3. `savepoint_rollback_drops_its_pending_slots` — a rolled-back savepoint's
 //!    shapes never reach the durable log, and its column never reaches CH
+//! 4. `namespace_boundaries_refresh_names_without_missing` checks that
+//!    creating a schema refreshes names already captured in the transaction.
+//! 5. `late_temp_table_keeps_the_timeline` checks that the session's first
+//!    temp table preserves history from an earlier type change.
+//! 6. `backfill_then_set_not_null_with_late_temp_table_delivers` checks that
+//!    backfilled values reach ClickHouse after `SET NOT NULL` and temp
+//!    table creation.
+//! 7. `unread_shape_change_reaches_later_rows` checks that skipping the
+//!    second `ADD COLUMN` read preserves both new columns in later rows.
+//! 8. `unread_shape_change_after_rewrite_reaches_later_rows` checks that a
+//!    skipped `ADD COLUMN` read after `TRUNCATE` still preserves the new column.
 //!
 //! `varchar(10)` → `text` is binary coercible, so PG rewrites `atttypid` in
 //! place: same filenode, same walk fields, different type. That is the
@@ -41,6 +52,15 @@ struct Drill {
 }
 
 async fn build_drill(slot: fx::Ports, schema_sql: &str, app_name: &str) -> Drill {
+    build_drill_with(slot, schema_sql, app_name, |_| {}).await
+}
+
+async fn build_drill_with(
+    slot: fx::Ports,
+    schema_sql: &str,
+    app_name: &str,
+    tune: impl FnOnce(&mut walshadow::ch_emitter::EmitterConfig),
+) -> Drill {
     let tmp = tempfile::tempdir().unwrap();
     let (
         fx::BootstrappedClusters {
@@ -76,18 +96,21 @@ async fn build_drill(slot: fx::Ports, schema_sql: &str, app_name: &str) -> Drill
         },
     );
 
-    let pipeline = fx::build_pipeline(fx::BuildPipelineArgs {
-        tmp: &tmp,
-        source: &source,
-        shadow: &shadow,
-        shadow_filter_dir: &shadow_filter_dir,
-        shadow_stream_state,
-        ch_database: "walshadow_test",
-        ch_tcp_port: slot.ch_tcp,
-        mappings: vec![],
-        app_name,
-        ddl: Some(ddl_args),
-    })
+    let pipeline = fx::build_pipeline_with(
+        fx::BuildPipelineArgs {
+            tmp: &tmp,
+            source: &source,
+            shadow: &shadow,
+            shadow_filter_dir: &shadow_filter_dir,
+            shadow_stream_state,
+            ch_database: "walshadow_test",
+            ch_tcp_port: slot.ch_tcp,
+            mappings: vec![],
+            app_name,
+            ddl: Some(ddl_args),
+        },
+        tune,
+    )
     .await;
 
     Drill {
@@ -312,11 +335,14 @@ async fn savepoint_rollback_drops_its_pending_slots() {
     );
 }
 
-/// Namespace writes name no relation, so each such boundary would need a
-/// whole-catalog scan: the first degrades the transaction to commit-time
-/// capture and counts, the second finds it degraded already
+fn unread(capture: &walshadow::catalog_capture::CaptureStats) -> u64 {
+    capture.pending_degraded.iter().map(load).sum()
+}
+
+/// Creating a schema refreshes any relation names already read in the
+/// transaction. Before the first catalog read, there are no names to refresh.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn namespace_boundaries_degrade_the_xact_once() {
+async fn namespace_boundaries_refresh_names_without_missing() {
     if !fx::tools::requirements_available() {
         return;
     }
@@ -332,9 +358,10 @@ async fn namespace_boundaries_degrade_the_xact_once() {
         &drill.source,
         "BEGIN;\n\
          CREATE SCHEMA pc_a;\n\
-         CREATE SCHEMA pc_b;\n\
          CREATE TABLE pc.t (id bigint PRIMARY KEY, v text);\n\
-         INSERT INTO pc.t VALUES (1, 'commit-time');\n\
+         INSERT INTO pc.t VALUES (1, 'before');\n\
+         CREATE SCHEMA pc_b;\n\
+         INSERT INTO pc.t VALUES (2, 'after');\n\
          COMMIT;\n\
          SELECT pg_switch_wal();\n",
     );
@@ -347,11 +374,237 @@ async fn namespace_boundaries_degrade_the_xact_once() {
 
     fx::wait_query(
         &drill.ch,
-        "SELECT argMax(v, _lsn) FROM walshadow_test.t WHERE id = 1 AND _is_deleted = 0",
-        "commit-time",
-        "commit-time capture still delivers the table",
+        "SELECT arrayStringConcat(groupArray(c), ',') FROM (\
+            SELECT concat(toString(id), '=', argMax(v, _lsn)) AS c \
+            FROM walshadow_test.t WHERE _is_deleted = 0 \
+            GROUP BY id ORDER BY id)",
+        "1=before,2=after",
+        "ClickHouse receives rows before and after schema creation",
     )
     .await;
-    let degraded: Vec<u64> = capture.pending_degraded.iter().map(load).collect();
-    assert_eq!(degraded, [1, 0, 0, 0, 0], "one CaptureAll degrade");
+    assert_eq!(unread(&capture), 0, "no missed catalog reads");
+    assert!(
+        load(&capture.pending_captures) >= 2,
+        "capture reads at table creation and refreshes at second schema creation",
+    );
+}
+
+/// PostgreSQL creates `pg_temp_N` for the session's first temp table.
+/// Refreshing names there preserves the descriptor used after the type change.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn late_temp_table_keeps_the_timeline() {
+    if !fx::tools::requirements_available() {
+        return;
+    }
+    let mut drill = build_drill(
+        fx::Ports::alloc(),
+        "CREATE SCHEMA pc;\n\
+         CREATE TABLE pc.t (id bigint PRIMARY KEY, v varchar(10));\n",
+        "walshadow-pending-late-temp",
+    )
+    .await;
+    let capture = capture_stats(&drill);
+
+    let driver = spawn_txn(
+        &drill.source,
+        "BEGIN;\n\
+         INSERT INTO pc.t (id, v) VALUES (1, 'pre');\n\
+         ALTER TABLE pc.t ALTER COLUMN v TYPE text;\n\
+         INSERT INTO pc.t (id, v) VALUES (2, 'post');\n\
+         CREATE TEMP TABLE scratch (x int);\n\
+         COMMIT;\n\
+         SELECT pg_switch_wal();\n",
+    );
+    pump_and_drain(&mut drill).await;
+    let _ = driver.join();
+
+    drill.pipeline.shutdown().await.expect("pipeline drains");
+    let _ = drill.shadow.stop();
+    let _ = drill.source.stop();
+
+    fx::wait_query(
+        &drill.ch,
+        "SELECT arrayStringConcat(groupArray(c), ',') FROM (\
+            SELECT concat(toString(id), '=', argMax(v, _lsn)) AS c \
+            FROM walshadow_test.t WHERE _is_deleted = 0 \
+            GROUP BY id ORDER BY id)",
+        "1=pre,2=post",
+        "the row after the type change uses the updated descriptor",
+    )
+    .await;
+    assert_eq!(unread(&capture), 0, "temp table caused no missed reads");
+}
+
+/// Reproduce the production sequence in one transaction. Each backfilled
+/// row stores the new column before `SET NOT NULL` and temp table creation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn backfill_then_set_not_null_with_late_temp_table_delivers() {
+    if !fx::tools::requirements_available() {
+        return;
+    }
+    let mut drill = build_drill(
+        fx::Ports::alloc(),
+        "CREATE SCHEMA pc;\n\
+         CREATE TABLE pc.lots (id int PRIMARY KEY, item uuid NOT NULL);\n\
+         CREATE TABLE pc.t (id bigint PRIMARY KEY, lot_id int NOT NULL);\n\
+         INSERT INTO pc.lots VALUES \
+           (1, '00000000-0000-0000-0000-00000000000a'), \
+           (2, '00000000-0000-0000-0000-00000000000b');\n\
+         INSERT INTO pc.t VALUES (1, 1), (2, 2), (3, 1);\n",
+        "walshadow-pending-backfill-not-null",
+    )
+    .await;
+    let capture = capture_stats(&drill);
+
+    let driver = spawn_txn(
+        &drill.source,
+        "BEGIN;\n\
+         ALTER TABLE pc.t ADD COLUMN item_id uuid;\n\
+         ALTER TABLE pc.t ADD CONSTRAINT t_lot_fk FOREIGN KEY (lot_id) REFERENCES pc.lots(id);\n\
+         UPDATE pc.t f SET item_id = l.item FROM pc.lots l WHERE l.id = f.lot_id;\n\
+         ALTER TABLE pc.t ALTER COLUMN item_id SET NOT NULL;\n\
+         CREATE TEMP TABLE scratch (x int);\n\
+         COMMIT;\n\
+         SELECT pg_switch_wal();\n",
+    );
+    pump_and_drain(&mut drill).await;
+    let _ = driver.join();
+
+    drill.pipeline.shutdown().await.expect("pipeline drains");
+    let _ = drill.shadow.stop();
+    let _ = drill.source.stop();
+
+    fx::wait_query(
+        &drill.ch,
+        "SELECT arrayStringConcat(groupArray(c), ',') FROM (\
+            SELECT concat(toString(id), '=', right(toString(argMax(item_id, _lsn)), 1)) AS c \
+            FROM walshadow_test.t WHERE _is_deleted = 0 \
+            GROUP BY id ORDER BY id)",
+        "1=a,2=b,3=a",
+        "ClickHouse receives every backfilled item_id",
+    )
+    .await;
+    assert_eq!(unread(&capture), 0, "temp table caused no missed reads");
+    assert_eq!(
+        load(&capture.ambiguities_published),
+        0,
+        "this transaction records no ambiguity intervals",
+    );
+}
+
+/// Allow one catalog read per transaction so capture skips the second
+/// `ADD COLUMN`. The commit descriptor can decode earlier rows, so use it
+/// from the missed read onward. An earlier descriptor used to stay in effect
+/// after commit and drop the second column from later rows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unread_shape_change_reaches_later_rows() {
+    if !fx::tools::requirements_available() {
+        return;
+    }
+    let mut drill = build_drill_with(
+        fx::Ports::alloc(),
+        "CREATE SCHEMA pc;\n\
+         CREATE TABLE pc.t (id bigint PRIMARY KEY, v int);\n",
+        "walshadow-pending-unread-shape",
+        |cfg| cfg.pending_capture.max_boundaries_per_xact = 1,
+    )
+    .await;
+    let capture = capture_stats(&drill);
+
+    let driver = spawn_txn(
+        &drill.source,
+        "BEGIN;\n\
+         ALTER TABLE pc.t ADD COLUMN a int;\n\
+         ALTER TABLE pc.t ADD COLUMN b int;\n\
+         INSERT INTO pc.t VALUES (1, 1, 11, 111);\n\
+         COMMIT;\n\
+         INSERT INTO pc.t VALUES (2, 2, 22, 222);\n\
+         SELECT pg_switch_wal();\n",
+    );
+    pump_and_drain(&mut drill).await;
+    let _ = driver.join();
+
+    drill.pipeline.shutdown().await.expect("pipeline drains");
+    let _ = drill.shadow.stop();
+    let _ = drill.source.stop();
+
+    fx::wait_query(
+        &drill.ch,
+        "SELECT arrayStringConcat(groupArray(c), ',') FROM (\
+            SELECT concat(toString(id), '=', toString(argMax(a, _lsn)), '/', \
+                ifNull(toString(argMax(b, _lsn)), 'NULL')) AS c \
+            FROM walshadow_test.t WHERE _is_deleted = 0 \
+            GROUP BY id ORDER BY id)",
+        "1=11/111,2=22/222",
+        "ClickHouse receives both new columns before and after commit",
+    )
+    .await;
+    assert_eq!(
+        unread(&capture),
+        1,
+        "one transaction reached its catalog read limit"
+    );
+    assert_eq!(
+        load(&capture.ambiguities_published),
+        0,
+        "the added columns leave earlier rows readable",
+    );
+}
+
+/// Capture reads the new filenode at `TRUNCATE` and skips `ADD COLUMN` at
+/// the read limit. The commit descriptor can decode rows from both versions
+/// of the table on the new filenode.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unread_shape_change_after_rewrite_reaches_later_rows() {
+    if !fx::tools::requirements_available() {
+        return;
+    }
+    let mut drill = build_drill_with(
+        fx::Ports::alloc(),
+        "CREATE SCHEMA pc;\n\
+         CREATE TABLE pc.t (id bigint PRIMARY KEY, v int);\n",
+        "walshadow-pending-unread-rewrite",
+        |cfg| cfg.pending_capture.max_boundaries_per_xact = 1,
+    )
+    .await;
+    let capture = capture_stats(&drill);
+
+    let driver = spawn_txn(
+        &drill.source,
+        "BEGIN;\n\
+         TRUNCATE pc.t;\n\
+         ALTER TABLE pc.t ADD COLUMN b int;\n\
+         INSERT INTO pc.t VALUES (1, 1, 11);\n\
+         COMMIT;\n\
+         INSERT INTO pc.t VALUES (2, 2, 22);\n\
+         SELECT pg_switch_wal();\n",
+    );
+    pump_and_drain(&mut drill).await;
+    let _ = driver.join();
+
+    drill.pipeline.shutdown().await.expect("pipeline drains");
+    let _ = drill.shadow.stop();
+    let _ = drill.source.stop();
+
+    fx::wait_query(
+        &drill.ch,
+        "SELECT arrayStringConcat(groupArray(c), ',') FROM (\
+            SELECT concat(toString(id), '=', toString(argMax(v, _lsn)), '/', \
+                ifNull(toString(argMax(b, _lsn)), 'NULL')) AS c \
+            FROM walshadow_test.t WHERE _is_deleted = 0 \
+            GROUP BY id ORDER BY id)",
+        "1=1/11,2=2/22",
+        "ClickHouse receives the new column before and after commit",
+    )
+    .await;
+    assert_eq!(
+        unread(&capture),
+        1,
+        "one transaction reached its catalog read limit"
+    );
+    assert_eq!(
+        load(&capture.ambiguities_published),
+        0,
+        "the added column leaves rewritten rows readable",
+    );
 }

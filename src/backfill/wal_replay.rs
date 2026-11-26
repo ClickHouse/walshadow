@@ -171,8 +171,6 @@ pub struct WalReplaySink {
     decoder: BufferingDecoderSink,
     buffer: Arc<Mutex<XactBuffer>>,
     log: Arc<DescriptorLog>,
-    /// Empty because replay applies committed history
-    pending: crate::catalog::pending::PendingCatalog,
     subxact_tracker: SubxactTracker,
     resolver: ToastResolver,
     filter_rfns: HashSet<(Oid, Oid)>,
@@ -267,7 +265,6 @@ impl WalReplaySink {
             ),
             buffer: inputs.buffer,
             log: inputs.log,
-            pending: Default::default(),
             subxact_tracker: SubxactTracker::new(),
             resolver: inputs.resolver,
             filter_rfns: inputs.filter_rfns,
@@ -562,7 +559,6 @@ impl WalReplaySink {
         let stash = resolve_stash(
             &self.buffer,
             &self.log,
-            &self.pending,
             xid,
             &payload.subxacts,
             record.next_lsn,
