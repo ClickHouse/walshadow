@@ -24,6 +24,10 @@
 //! 5. `backfill_then_set_not_null_with_late_temp_table_delivers` — the
 //!    production shape: nullable `ADD COLUMN`, backfill `UPDATE`, `SET NOT
 //!    NULL`, then a first temp table, all in one transaction
+//! 6. `shape_change_missed_after_a_degrade_reaches_later_rows` — `ADD
+//!    COLUMN`, a first temp table, then a second `ADD COLUMN` the degraded
+//!    transaction never captures. The commit shape answers from the cut, so
+//!    the second column lands in and after the transaction
 //!
 //! `varchar(10)` → `text` is binary coercible, so PG rewrites `atttypid` in
 //! place: same filenode, same walk fields, different type. That is the
@@ -489,5 +493,54 @@ async fn backfill_then_set_not_null_with_late_temp_table_delivers() {
         load(&capture.ambiguities_published),
         0,
         "nothing in this transaction is unproven",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shape_change_missed_after_a_degrade_reaches_later_rows() {
+    if !fx::tools::requirements_available() {
+        return;
+    }
+    let mut drill = build_drill(
+        fx::Ports::alloc(),
+        "CREATE SCHEMA pc;\n\
+         CREATE TABLE pc.t (id bigint PRIMARY KEY, v int);\n",
+        "walshadow-pending-missed-shape",
+    )
+    .await;
+    let capture = capture_stats(&drill);
+
+    let driver = spawn_txn(
+        &drill.source,
+        "BEGIN;\n\
+         ALTER TABLE pc.t ADD COLUMN a int;\n\
+         CREATE TEMP TABLE scratch (x int);\n\
+         ALTER TABLE pc.t ADD COLUMN b int;\n\
+         INSERT INTO pc.t VALUES (1, 1, 11, 111);\n\
+         COMMIT;\n\
+         INSERT INTO pc.t VALUES (2, 2, 22, 222);\n\
+         SELECT pg_switch_wal();\n",
+    );
+    pump_and_drain(&mut drill).await;
+    let _ = driver.join();
+
+    drill.pipeline.shutdown().await.expect("pipeline drains");
+    let _ = drill.shadow.stop();
+    let _ = drill.source.stop();
+
+    fx::wait_query(
+        &drill.ch,
+        "SELECT arrayStringConcat(groupArray(c), ',') FROM (\
+            SELECT concat(toString(id), '=', toString(argMax(a, _lsn)), '/', \
+                ifNull(toString(argMax(b, _lsn)), 'NULL')) AS c \
+            FROM walshadow_test.t WHERE _is_deleted = 0 \
+            GROUP BY id ORDER BY id)",
+        "1=11/111,2=22/222",
+        "column added past the degrade cut lands in and after the transaction",
+    )
+    .await;
+    assert!(
+        degraded(&capture, DegradeReason::CaptureAll) >= 1,
+        "first temp table in the session hit the capture_all degrade",
     );
 }

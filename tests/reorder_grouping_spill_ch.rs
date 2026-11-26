@@ -59,6 +59,7 @@ async fn grouped_small_commits_and_spilled_commit_reach_ch() {
             .context("daemon metrics endpoint never came up")?;
         fx::wait_ch_matches_source(&ch, &source, "s.t", "default.t", Duration::from_secs(30))
             .context("bootstrap rows")?;
+        daemon.wait_for_log("backup window shipped", Duration::from_secs(30))?;
 
         source.psql_one(
             "DO $$ BEGIN

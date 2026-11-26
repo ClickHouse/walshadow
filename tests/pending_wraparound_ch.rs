@@ -230,6 +230,7 @@ async fn truncated_pending_xids_stay_pending_until_resumed_outcomes() {
             Duration::from_secs(60),
         )
         .context("pending rows never reached ClickHouse")?;
+        daemon.wait_for_log("starting pump", Duration::from_secs(60))?;
 
         // Refused insert parks reorder at the TRUNCATE fence, ahead of both
         // outcomes, while shadow replays on

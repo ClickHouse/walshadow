@@ -176,7 +176,6 @@ pub struct PromotedXact {
     /// Per-oid chains, ascending by `valid_from`, oids ascending. Slots at
     /// or past `degraded_at` are already cut
     pub by_oid: Vec<(Oid, Vec<PendingSlot>)>,
-    pub degraded: Option<DegradeReason>,
     pub degraded_at: Option<u64>,
 }
 
@@ -356,7 +355,6 @@ impl PendingCatalog {
         by_oid.sort_unstable_by_key(|(oid, _)| *oid);
         Some(PromotedXact {
             by_oid,
-            degraded: xact.degraded,
             degraded_at: xact.degraded_at,
         })
     }

@@ -190,12 +190,13 @@ impl CatalogCapture {
         let BoundaryKind::Command { .. } = info.kind else {
             return !info.stats_only;
         };
+        let xid = info.drain_xid;
         // Aligned-prefix re-read: shadow replayed past this point long ago,
         // so the scan could only answer for where replay is now. Degrades
         // rather than skips silently — an xact straddling the horizon would
         // otherwise claim coverage over boundaries nothing read
         if next_lsn <= self.log.covered_through() {
-            self.degrade(info.drain_xid, DegradeReason::ReplayMismatch, next_lsn);
+            self.degrade(xid, DegradeReason::ReplayMismatch, next_lsn, None);
             return false;
         }
         // Whole-relcache flush or a namespace catcache hit names no
@@ -203,14 +204,11 @@ impl CatalogCapture {
         // that makes holds expensive. Filter emits a command boundary only
         // when it names relations or is one of those
         if info.capture_all {
-            self.degrade(info.drain_xid, DegradeReason::CaptureAll, next_lsn);
-            return false;
-        }
-        if info.oids.is_empty() {
+            self.degrade(xid, DegradeReason::CaptureAll, next_lsn, None);
             return false;
         }
         match self.pending.admit(
-            info.drain_xid,
+            xid,
             next_lsn,
             self.pending_cfg.max_boundaries_per_xact,
             self.pending_cfg.max_hold_per_xact.as_nanos() as u64,
@@ -218,7 +216,7 @@ impl CatalogCapture {
             Ok(()) => true,
             Err(reason) => {
                 if let Some(reason) = reason {
-                    self.degraded(info.drain_xid, reason, next_lsn, None);
+                    self.degraded(xid, reason, next_lsn, None);
                 }
                 false
             }
@@ -227,9 +225,9 @@ impl CatalogCapture {
 
     /// Degrade `xid`'s timeline at boundary `at`, counting and logging only
     /// the call that degraded it
-    fn degrade(&self, xid: u32, reason: DegradeReason, at: u64) {
+    fn degrade(&self, xid: u32, reason: DegradeReason, at: u64, err: Option<&CatalogError>) {
         if self.pending.degrade(xid, reason, at) {
-            self.degraded(xid, reason, at, None);
+            self.degraded(xid, reason, at, err);
         }
     }
 
@@ -430,10 +428,7 @@ impl CatalogCapture {
             Ok(descs) => descs,
             Err(e) => {
                 let reason = degrade_reason(&e);
-                // Admitted, so not degraded before this read
-                if self.pending.degrade(top_xid, reason, next_lsn) {
-                    self.degraded(top_xid, reason, next_lsn, Some(&e));
-                }
+                self.degrade(top_xid, reason, next_lsn, Some(&e));
                 return Ok(());
             }
         };
@@ -567,9 +562,9 @@ impl CatalogCapture {
             });
         }
 
-        // Command boundaries this xact held for. Slots are exact shapes at
-        // exact positions, so they promote even from a degraded xact; what
-        // degradation costs is the coverage claim, not the evidence
+        // Command boundaries this xact held for. Slots before a degrade cut
+        // are exact shapes at exact positions, so they promote even from a
+        // degraded xact; the cut costs coverage past it, not the evidence
         let promoted = self.pending.promoted(info.drain_xid);
 
         let mut entries: Vec<Arc<LogEntry>> = Vec::new();
@@ -676,7 +671,9 @@ impl CatalogCapture {
                             }
                         }
                         // Promoted first, commit shape last: the batch reads
-                        // as the transaction's own sequence of shapes
+                        // as the transaction's own sequence of shapes. Past a
+                        // degrade cut the commit shape answers from the cut,
+                        // or the lookup would keep resolving the last slot
                         let mut prev = pred_desc.as_deref();
                         for slot in slots {
                             if prev == Some(slot.desc.as_ref()) {
@@ -690,6 +687,11 @@ impl CatalogCapture {
                                 value: LogValue::Present(slot.desc.clone()),
                             }));
                             self.stats.pending_entries_promoted.fetch_add(1, Relaxed);
+                        }
+                        if !slots.is_empty()
+                            && let Some(cut) = promoted.as_ref().and_then(|p| p.degraded_at)
+                        {
+                            valid_from = valid_from.max(cut);
                         }
                         let desc = Arc::new(desc.clone());
                         entries.push(Arc::new(LogEntry {
@@ -788,7 +790,7 @@ fn degrade_reason(err: &CatalogError) -> DegradeReason {
 /// A degrade cuts the span at its boundary. Rows past the cut decode under
 /// the commit shape, so the tail is judged against the last shape recorded
 /// before the cut, the one those rows were written under up to the missed
-/// change. Uncovered entirely, the head runs to commit, as before.
+/// change. Uncovered entirely, the head runs to commit.
 ///
 /// A benign reject (declared shape drifted, every byte reads the same)
 /// keeps bias-early and publishes nothing. A physical one publishes one
@@ -803,15 +805,15 @@ fn in_place_verdict(
     next_lsn: u64,
     coverage: Option<Coverage<'_>>,
 ) -> (u64, Vec<Ambiguity>, Option<Incompat>) {
-    let head = crate::catalog::compat::compatible_reader(pred, fin).err();
-    let tail = coverage
-        .and_then(|c| Some((c.until.filter(|u| *u < next_lsn)?, c.last)))
-        .and_then(|(until, last)| {
-            let incompat = crate::catalog::compat::compatible_reader(last, fin).err()?;
-            Some((until, incompat))
-        });
+    use crate::catalog::compat::compatible_reader;
+    let head = compatible_reader(pred, fin).err();
+    let head_physical = head.is_some_and(|i| i.is_physical());
+    let tail = coverage.and_then(|c| {
+        let until = c.until.filter(|u| *u < next_lsn)?;
+        Some((until, compatible_reader(c.last, fin).err()?))
+    });
     let mut spans: Vec<(u64, u64)> = Vec::with_capacity(2);
-    if head.is_some_and(|i| i.is_physical()) {
+    if head_physical {
         let through = coverage.map_or(next_lsn, |c| c.from).min(next_lsn);
         if through > first_touch {
             spans.push((first_touch, through));
@@ -822,11 +824,7 @@ fn in_place_verdict(
     {
         spans.push((until.max(first_touch), next_lsn));
     }
-    let valid_from = if head.is_some_and(|i| i.is_physical()) {
-        next_lsn
-    } else {
-        first_touch
-    };
+    let valid_from = if head_physical { next_lsn } else { first_touch };
     let incompat = head.or(tail.map(|(_, i)| i));
     let published = spans
         .into_iter()
