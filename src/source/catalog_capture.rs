@@ -333,15 +333,21 @@ impl CatalogCapture {
     /// a boundary replayed from the log yields the same events by
     /// construction.
     ///
-    /// One event per oid: promoted command-boundary entries are intermediate
-    /// versions of the same commit, and capture always appends the commit
-    /// shape after them, so the oid's last non-`Retired` entry is the shape
-    /// CH is told about.
+    /// Send one event per table based on its final schema. Apply adds and
+    /// changes at its earliest `Present` entry so ClickHouse can accept
+    /// values for new columns before replay sends those rows.
     fn replay_events(&self, batch: &BatchRecord) -> Vec<PendingEvent> {
         let mut last_for_oid: HashMap<Oid, usize> = HashMap::with_capacity(batch.entries.len());
+        let mut first_present: HashMap<Oid, u64> = HashMap::with_capacity(batch.entries.len());
         for (at, entry) in batch.entries.iter().enumerate() {
             if !matches!(entry.value, LogValue::Retired) {
                 last_for_oid.insert(entry.oid, at);
+            }
+            if matches!(entry.value, LogValue::Present(_)) {
+                first_present
+                    .entry(entry.oid)
+                    .and_modify(|lsn| *lsn = (*lsn).min(entry.valid_from))
+                    .or_insert(entry.valid_from);
             }
         }
         let dropped_here: HashSet<Oid> = batch
@@ -357,10 +363,13 @@ impl CatalogCapture {
             }
             let pred_desc = self.present_before(entry.oid, batch.captured_at);
             // Not Present means Dropped, last_for_oid skips Retired
-            let event = if let LogValue::Present(desc) = &entry.value {
-                diff_event(pred_desc.as_deref(), desc)
+            let (lsn, event) = if let LogValue::Present(desc) = &entry.value {
+                (
+                    first_present[&entry.oid],
+                    diff_event(pred_desc.as_deref(), desc),
+                )
             } else {
-                pred_desc.map(|old| SchemaEvent::Dropped {
+                let dropped = pred_desc.map(|old| SchemaEvent::Dropped {
                     oid: entry.oid,
                     rel_name: old.rel_name.clone(),
                     partition: old.is_partition().then(|| DroppedPartition {
@@ -372,12 +381,10 @@ impl CatalogCapture {
                             .filter(|oid| dropped_here.contains(oid))
                             .collect(),
                     }),
-                })
+                });
+                (entry.valid_from, dropped)
             };
-            out.extend(event.map(|event| PendingEvent {
-                lsn: entry.valid_from,
-                event,
-            }));
+            out.extend(event.map(|event| PendingEvent { lsn, event }));
         }
         out
     }

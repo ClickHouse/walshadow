@@ -551,6 +551,122 @@ async fn physical_in_place_alter_fences_deferred_rows() {
     );
 }
 
+/// PostgreSQL allows `ADD COLUMN ... NOT NULL` without a default after
+/// deleting every row. Disable capture between statements so replay uses
+/// the final schema for the earlier insert and delete.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn not_null_append_on_empty_table_delivers() {
+    if !fx::tools::requirements_available() {
+        return;
+    }
+    let mut drill = build_drill_with(
+        fx::Ports::alloc(),
+        "CREATE SCHEMA dan;\n\
+         CREATE TABLE dan.t (id bigint PRIMARY KEY, v text);\n",
+        "dan",
+        "walshadow-dirty-notnull",
+        |cfg| cfg.pending_capture.max_boundaries_per_xact = 0,
+    )
+    .await;
+    let (_, capture_stats) = drill
+        .pipeline
+        .sinks
+        .capture
+        .stats_handles()
+        .next()
+        .expect("one capture");
+
+    let driver = spawn_txn(
+        &drill.source,
+        "BEGIN;\n\
+         ALTER TABLE dan.t SET (fillfactor = 90);\n\
+         INSERT INTO dan.t (id, v) VALUES (1, 'dead');\n\
+         DELETE FROM dan.t WHERE id = 1;\n\
+         ALTER TABLE dan.t ADD COLUMN w int NOT NULL;\n\
+         INSERT INTO dan.t (id, v, w) VALUES (2, 'live', 7);\n\
+         COMMIT;\n\
+         SELECT pg_switch_wal();\n",
+    );
+    pump_and_drain(&mut drill).await;
+    let _ = driver.join();
+    drill.pipeline.shutdown().await.expect("pipeline drains");
+    let _ = drill.shadow.stop();
+    let _ = drill.source.stop();
+
+    fx::wait_query(
+        &drill.ch,
+        "SELECT arrayStringConcat(groupArray(c), ',') FROM (\
+            SELECT concat(toString(id), '=', argMax(v, _lsn), '/', toString(argMax(w, _lsn))) AS c \
+            FROM walshadow_test.t \
+            GROUP BY id HAVING argMax(_is_deleted, _lsn) = 0 ORDER BY id)",
+        "2=live/7",
+        "only the row inserted after ADD COLUMN is visible",
+    )
+    .await;
+    assert_eq!(
+        capture_stats.ambiguities_published.load(Ordering::Relaxed),
+        0,
+        "adding NOT NULL to an empty table should report no schema ambiguity",
+    );
+}
+
+/// A type change delays when replay can use the final schema. ClickHouse
+/// still needs the new column before replay sends rows that use it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn physical_in_place_alter_keeps_added_column_values() {
+    if !fx::tools::requirements_available() {
+        return;
+    }
+    let mut drill = build_drill(
+        fx::Ports::alloc(),
+        "CREATE SCHEMA dap;\n\
+         CREATE TABLE dap.t (id int PRIMARY KEY, v varchar(10));\n\
+         INSERT INTO dap.t VALUES (1, 'a');\n",
+        "dap",
+        "walshadow-dirty-physical-add",
+    )
+    .await;
+    let (_, capture_stats) = drill
+        .pipeline
+        .sinks
+        .capture
+        .stats_handles()
+        .next()
+        .expect("one capture");
+
+    let driver = spawn_txn(
+        &drill.source,
+        "BEGIN;\n\
+         ALTER TABLE dap.t ALTER COLUMN v TYPE text;\n\
+         ALTER TABLE dap.t ADD COLUMN w int;\n\
+         INSERT INTO dap.t VALUES (2, 'b', 5);\n\
+         UPDATE dap.t SET w = 9 WHERE id = 1;\n\
+         COMMIT;\n\
+         SELECT pg_switch_wal();\n",
+    );
+    pump_and_drain(&mut drill).await;
+    let _ = driver.join();
+    drill.pipeline.shutdown().await.expect("pipeline drains");
+    let _ = drill.shadow.stop();
+    let _ = drill.source.stop();
+
+    fx::wait_query(
+        &drill.ch,
+        "SELECT arrayStringConcat(groupArray(c), ',') FROM (\
+            SELECT concat(toString(id), '=', argMax(v, _lsn), '/', toString(argMax(w, _lsn))) AS c \
+            FROM walshadow_test.t \
+            GROUP BY id HAVING argMax(_is_deleted, _lsn) = 0 ORDER BY id)",
+        "1=a/9,2=b/5",
+        "insert and update both keep their values for the new column",
+    )
+    .await;
+    assert_eq!(
+        capture_stats.ambiguities_published.load(Ordering::Relaxed),
+        1,
+        "only the interval before the first captured schema should be ambiguous",
+    );
+}
+
 /// Top-level ROLLBACK of a DDL + row transaction: no descriptor batch
 /// appends, no rows emit, no fence counts, and the next transaction on
 /// the same connection inherits no dirty state.

@@ -391,3 +391,66 @@ async fn keyless_full_identity_converges() {
         "1\ta2\n3\tx\n4\td",
     );
 }
+
+/// Add a column, fill it for existing rows, and set it to `NOT NULL` in
+/// one transaction. Then drop `NOT NULL` from another column and check
+/// that ClickHouse accepts NULL there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn backfilled_not_null_column_then_drop_not_null() {
+    if !fx::tools::requirements_available() {
+        return;
+    }
+    let (source, shadow, ch, _tmp) = run(
+        fx::Ports::alloc(),
+        "se_nn",
+        "walshadow-se-not-null",
+        "CREATE SCHEMA se_nn;\n",
+        vec![
+            "CREATE TABLE se_nn.items (id uuid PRIMARY KEY); \
+             CREATE TABLE se_nn.lots (id int PRIMARY KEY, item_id uuid NOT NULL); \
+             CREATE TABLE se_nn.t (id int PRIMARY KEY, lot_id int NOT NULL); \
+             CREATE FUNCTION se_nn.immutable() RETURNS trigger LANGUAGE plpgsql \
+             AS $$ BEGIN RAISE EXCEPTION 'immutable'; END $$; \
+             CREATE TRIGGER t_immutable BEFORE UPDATE ON se_nn.t \
+             FOR EACH ROW EXECUTE FUNCTION se_nn.immutable()"
+                .into(),
+            "INSERT INTO se_nn.items VALUES \
+             ('00000000-0000-0000-0000-00000000000a'), ('00000000-0000-0000-0000-00000000000b'); \
+             INSERT INTO se_nn.lots VALUES \
+             (1, '00000000-0000-0000-0000-00000000000a'), (2, '00000000-0000-0000-0000-00000000000b'); \
+             INSERT INTO se_nn.t SELECT i, 1 + i % 2 FROM generate_series(1, 300) i"
+                .into(),
+            "SELECT pg_switch_wal()".into(),
+            "BEGIN; \
+             ALTER TABLE se_nn.t ADD COLUMN item_id uuid; \
+             ALTER TABLE se_nn.t ADD CONSTRAINT t_item_fk \
+             FOREIGN KEY (item_id) REFERENCES se_nn.items (id); \
+             ALTER TABLE se_nn.t DISABLE TRIGGER t_immutable; \
+             UPDATE se_nn.t f SET item_id = l.item_id FROM se_nn.lots l WHERE l.id = f.lot_id; \
+             ALTER TABLE se_nn.t ENABLE TRIGGER t_immutable; \
+             ALTER TABLE se_nn.t ALTER COLUMN item_id SET NOT NULL; \
+             COMMIT"
+                .into(),
+            "SELECT pg_switch_wal()".into(),
+            "ALTER TABLE se_nn.t ALTER COLUMN lot_id DROP NOT NULL".into(),
+            "INSERT INTO se_nn.t VALUES (301, NULL, '00000000-0000-0000-0000-00000000000a')"
+                .into(),
+            "SELECT pg_switch_wal()".into(),
+        ],
+        3,
+    )
+    .await;
+    let _src = fx::StopOnDrop { sh: &source };
+    let _shd = fx::StopOnDrop { sh: &shadow };
+
+    assert_eq!(column_type(&ch, "t", "item_id"), "UUID");
+    assert_eq!(column_type(&ch, "t", "lot_id"), "Nullable(Int32)");
+    assert_eq!(
+        ch.query(
+            "SELECT count(), countIf(item_id = '00000000-0000-0000-0000-00000000000a'), \
+             countIf(lot_id IS NULL) FROM walshadow_test.t FINAL WHERE _is_deleted = 0"
+        )
+        .unwrap(),
+        "301\t151\t1",
+    );
+}
