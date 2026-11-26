@@ -747,7 +747,7 @@ enum Scope<'a> {
 /// (heap, partitioned parent, matview, toast). Indexes, sequences and views
 /// never decode.
 fn eligible(class: &ClassRow) -> bool {
-    class.oid >= FIRST_NORMAL_OBJECT_ID && matches!(class.relkind, 'r' | 'p' | 'm' | 't')
+    class.oid >= FIRST_NORMAL_OBJECT_ID && matches!(class.relkind, b'r' | b'p' | b'm' | b't')
 }
 
 /// One catalog's projection rows off the worker. First scan of a read fixes
@@ -1068,11 +1068,11 @@ mod tests {
             relkind: kind,
             ..class_row()
         };
-        for kind in ['r', 'p', 'm', 't'] {
-            assert!(eligible(&user(kind)), "{kind}");
+        for kind in *b"rpmt" {
+            assert!(eligible(&user(kind)), "{}", char::from(kind));
         }
-        for kind in ['i', 'S', 'v', 'c'] {
-            assert!(!eligible(&user(kind)), "{kind}");
+        for kind in *b"iSvc" {
+            assert!(!eligible(&user(kind)), "{}", char::from(kind));
         }
         assert!(!eligible(&ClassRow {
             oid: FIRST_NORMAL_OBJECT_ID - 1,
@@ -1088,9 +1088,9 @@ mod tests {
             oid: 16384,
             relnamespace: 2200,
             relname: "t".into(),
-            relkind: 'r',
-            relpersistence: 'p',
-            relreplident: 'd',
+            relkind: b'r',
+            relpersistence: b'p',
+            relreplident: b'd',
             reltoastrelid: 16387,
             reltablespace: 0,
             relfilenode: 16384,
@@ -1109,8 +1109,8 @@ mod tests {
             attisdropped: type_oid == 0,
             attbyval: type_oid == 23,
             attlen: if type_oid == 23 { 4 } else { -1 },
-            attalign: 'i',
-            attstorage: if type_oid == 23 { 'p' } else { 'x' },
+            attalign: b'i',
+            attstorage: if type_oid == 23 { b'p' } else { b'x' },
             attmissingval: None,
         }
     }
@@ -1186,13 +1186,13 @@ mod tests {
         assert!(slot.dropped);
         assert_eq!(slot.type_name, "", "no pg_type row for a zeroed atttypid");
         assert_eq!(slot.type_len, -1);
-        assert_eq!(slot.type_storage, 'x');
+        assert_eq!(slot.type_storage, b'x');
     }
 
     #[test]
     fn overlay_descriptor_picks_replident_index() {
         let class = ClassRow {
-            relreplident: 'i',
+            relreplident: b'i',
             ..class_row()
         };
         let indexes = [
@@ -1244,10 +1244,10 @@ mod tests {
         };
         let rows = DescriptorRows {
             class: vec![
-                class(16500, "a1", 'r', true),
-                class(16510, "kid", 'r', false),
-                class(16490, "a", 'p', true),
-                class(16480, "m", 'p', false),
+                class(16500, "a1", b'r', true),
+                class(16510, "kid", b'r', false),
+                class(16490, "a", b'p', true),
+                class(16480, "m", b'p', false),
             ],
             attrs: [16500, 16510, 16490, 16480].map(attrs).to_vec(),
             inherits: vec![
@@ -1405,7 +1405,7 @@ mod tests {
     #[test]
     fn descriptor_rejects_unknown_replica_identity() {
         let class = ClassRow {
-            relreplident: 'x',
+            relreplident: b'x',
             ..class_row()
         };
         let err = overlay(&class, &[], &[], &names(&[(2200, "public")])).unwrap_err();

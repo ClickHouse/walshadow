@@ -469,12 +469,12 @@ mod tests {
         vec![
             SourceTable {
                 rel: RelName::new("public", "users"),
-                replica_identity: 'd',
+                replica_identity: b'd',
                 has_pk: true,
             },
             SourceTable {
                 rel: RelName::new("public", "audit"),
-                replica_identity: 'd',
+                replica_identity: b'd',
                 has_pk: false,
             },
         ]

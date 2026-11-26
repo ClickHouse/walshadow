@@ -944,8 +944,8 @@ mod tests {
             type_name: type_name.into(),
             type_byval: false,
             type_len: -1,
-            type_align: 'd',
-            type_storage: 'm',
+            type_align: b'd',
+            type_storage: b'm',
             missing_default: None,
         };
         use crate::emit::ch_emitter::Codec;

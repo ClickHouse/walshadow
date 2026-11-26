@@ -289,10 +289,10 @@ mod tests {
     /// `m` > `a` > `a1`, `a1` storing columns in another order than `m`,
     /// whose slot 2 is a dropped column
     fn tree() -> (RelDescriptor, RelDescriptor, RelDescriptor) {
-        let m = int4_rel(16480, "m", 'p', &[(1, "id"), (2, ""), (3, "v")]);
-        let mut a = int4_rel(16490, "a", 'p', &[(1, "id"), (2, "v")]);
+        let m = int4_rel(16480, "m", b'p', &[(1, "id"), (2, ""), (3, "v")]);
+        let mut a = int4_rel(16490, "a", b'p', &[(1, "id"), (2, "v")]);
         a.ancestors = vec![m.as_ancestor()];
-        let mut a1 = int4_rel(16500, "a1", 'r', &[(1, "v"), (2, "id")]);
+        let mut a1 = int4_rel(16500, "a1", b'r', &[(1, "v"), (2, "id")]);
         a1.ancestors = vec![a.as_ancestor(), m.as_ancestor()];
         (m, a, a1)
     }

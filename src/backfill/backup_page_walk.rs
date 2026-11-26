@@ -1063,14 +1063,14 @@ pub(crate) fn toast_chunk_rel() -> RelDescriptor {
         type_name: String::new(),
         type_byval: type_len > 0,
         type_len,
-        type_align: 'i',
-        type_storage: 'p',
+        type_align: b'i',
+        type_storage: b'p',
         missing_default: None,
     };
     let mut rel = make_rel();
     rel.oid = 16401;
     rel.rfn.rel_node = 16401;
-    rel.kind = 't';
+    rel.kind = b't';
     rel.rel_name = RelName::new("pg_toast", "pg_toast_16400");
     rel.attributes = vec![
         attr(1, "chunk_id", OIDOID, 4),
@@ -1126,8 +1126,8 @@ pub(crate) fn make_rel() -> RelDescriptor {
         toast_oid: 0,
         namespace_oid: 2200,
         rel_name: RelName::new("public", "t"),
-        kind: 'r',
-        persistence: 'p',
+        kind: b'r',
+        persistence: b'p',
         ancestors: Vec::new(),
         replident: ReplIdent::Default { pk_attnums: None },
         attributes: vec![RelAttr {
@@ -1140,8 +1140,8 @@ pub(crate) fn make_rel() -> RelDescriptor {
             type_name: "int4".into(),
             type_byval: true,
             type_len: 4,
-            type_align: 'i',
-            type_storage: 'p',
+            type_align: b'i',
+            type_storage: b'p',
             missing_default: None,
         }],
     }
@@ -1161,9 +1161,9 @@ pub(crate) fn make_rel_named(
     desc.oid = oid;
     desc.toast_oid = toast_oid;
     desc.kind = if &*name.namespace == PG_TOAST_NS {
-        't'
+        b't'
     } else {
-        'r'
+        b'r'
     };
     desc.rel_name = name;
     std::sync::Arc::new(desc)

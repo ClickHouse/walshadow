@@ -96,8 +96,8 @@ pub struct RelDescriptor {
     pub toast_oid: Oid,
     pub namespace_oid: Oid,
     pub rel_name: RelName,
-    pub kind: char,
-    pub persistence: char,
+    pub kind: u8,
+    pub persistence: u8,
     pub replident: ReplIdent,
     pub attributes: Vec<RelAttr>,
     /// Declarative partition ancestors, parent first. Each omits its own
@@ -155,16 +155,16 @@ impl ReplIdent {
     /// Build from `pg_class.relreplident` plus the `pg_index` rows it names:
     /// the primary key for `d`/`f`, the replica-identity index for `i`
     pub fn from_parts(
-        c: char,
+        c: u8,
         pk_attnums: Option<Vec<i16>>,
         using_index: Option<(Oid, Vec<i16>)>,
     ) -> Result<Self, String> {
         match c {
-            'd' => Ok(ReplIdent::Default { pk_attnums }),
-            'n' => Ok(ReplIdent::Nothing),
-            'f' => Ok(ReplIdent::Full { pk_attnums }),
+            b'd' => Ok(ReplIdent::Default { pk_attnums }),
+            b'n' => Ok(ReplIdent::Nothing),
+            b'f' => Ok(ReplIdent::Full { pk_attnums }),
             // PG treats a dropped identity index as NOTHING, relreplident stays 'i'
-            'i' => Ok(
+            b'i' => Ok(
                 using_index.map_or(ReplIdent::Nothing, |(index_oid, key_attnums)| {
                     ReplIdent::UsingIndex {
                         index_oid,
@@ -173,7 +173,8 @@ impl ReplIdent {
                 }),
             ),
             other => Err(format!(
-                "unknown relreplident {other:?} (expected one of d/n/f/i)"
+                "unknown relreplident {:?} (expected one of d/n/f/i)",
+                char::from(other)
             )),
         }
     }
@@ -206,8 +207,8 @@ pub struct RelAttr {
     pub type_name: String,
     pub type_byval: bool,
     pub type_len: i16,
-    pub type_align: char,
-    pub type_storage: char,
+    pub type_align: u8,
+    pub type_storage: u8,
     pub missing_default: Option<MissingDefault>,
 }
 
@@ -307,19 +308,19 @@ pub fn compute_schema_diff(old: &RelDescriptor, new: &RelDescriptor) -> SchemaDi
 /// Build an int4 relation keyed on attribute 1. Use given attribute numbers;
 /// blank names mark dropped columns
 #[cfg(test)]
-pub(crate) fn int4_rel(oid: Oid, name: &str, kind: char, columns: &[(i16, &str)]) -> RelDescriptor {
+pub(crate) fn int4_rel(oid: Oid, name: &str, kind: u8, columns: &[(i16, &str)]) -> RelDescriptor {
     RelDescriptor {
         rfn: RelFileNode {
             spc_node: 1663,
             db_node: 5,
-            rel_node: if kind == 'p' { 0 } else { oid },
+            rel_node: if kind == b'p' { 0 } else { oid },
         },
         oid,
         toast_oid: 0,
         namespace_oid: 2200,
         rel_name: RelName::new("public", name),
         kind,
-        persistence: 'p',
+        persistence: b'p',
         replident: ReplIdent::Default {
             pk_attnums: Some(vec![1]),
         },
@@ -335,8 +336,8 @@ pub(crate) fn int4_rel(oid: Oid, name: &str, kind: char, columns: &[(i16, &str)]
                 type_name: "int4".into(),
                 type_byval: true,
                 type_len: 4,
-                type_align: 'i',
-                type_storage: 'p',
+                type_align: b'i',
+                type_storage: b'p',
                 missing_default: None,
             })
             .collect(),
@@ -352,11 +353,11 @@ mod tests {
     #[test]
     fn replident_missing_index_is_nothing_and_unknown_code_errors() {
         assert_eq!(
-            ReplIdent::from_parts('i', None, None).unwrap(),
+            ReplIdent::from_parts(b'i', None, None).unwrap(),
             ReplIdent::Nothing
         );
         assert!(
-            ReplIdent::from_parts('x', None, None)
+            ReplIdent::from_parts(b'x', None, None)
                 .unwrap_err()
                 .contains("'x'")
         );
@@ -373,8 +374,8 @@ mod tests {
             type_name: "test".into(),
             type_byval: true,
             type_len: 4,
-            type_align: 'i',
-            type_storage: 'p',
+            type_align: b'i',
+            type_storage: b'p',
             missing_default: None,
         }
     }
@@ -390,8 +391,8 @@ mod tests {
             toast_oid: 0,
             namespace_oid: 2200,
             rel_name: RelName::new("public", &format!("t{oid}")),
-            kind: 'r',
-            persistence: 'p',
+            kind: b'r',
+            persistence: b'p',
             ancestors: Vec::new(),
             replident: ReplIdent::Default { pk_attnums: None },
             attributes: attrs,

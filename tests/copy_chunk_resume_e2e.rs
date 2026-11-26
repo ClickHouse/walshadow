@@ -41,8 +41,8 @@ fn attr(attnum: i16, name: &str, type_oid: u32) -> RelAttr {
         type_name: String::new(),
         type_byval: type_oid == INT8OID,
         type_len: if type_oid == INT8OID { 8 } else { -1 },
-        type_align: 'd',
-        type_storage: 'p',
+        type_align: b'd',
+        type_storage: b'p',
         missing_default: None,
     }
 }
@@ -133,8 +133,8 @@ async fn chunked_copy_partitions_by_block_and_repeats_a_resumed_chunk() {
         toast_oid: 0,
         namespace_oid: 0,
         rel_name: RelName::new(SCHEMA, "chunks"),
-        kind: 'r',
-        persistence: 'p',
+        kind: b'r',
+        persistence: b'p',
         ancestors: Vec::new(),
         replident: ReplIdent::Nothing,
         attributes: vec![attr(1, "id", INT8OID), attr(2, "payload", TEXTOID)],

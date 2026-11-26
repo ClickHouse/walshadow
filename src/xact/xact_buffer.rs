@@ -695,7 +695,7 @@ pub async fn resolve_stash(
             continue;
         }
         match log.descriptor_at_spanned(rfn, next_lsn) {
-            Ok((rel, _)) if rel.kind == 't' => {
+            Ok((rel, _)) if rel.kind == b't' => {
                 // Chunk layout is fixed, so an interval on a toast heap is an
                 // unmodelled shape; there is no per-record verdict before
                 // decode_stashed_toast either way
@@ -2875,7 +2875,7 @@ fn read_ahead_kept(
     born: &std::sync::Mutex<RecentToastBirths>,
 ) {
     for d in images {
-        if rel.kind == 't' {
+        if rel.kind == b't' {
             // `chunk_id oid` leads every toast tuple
             if rel
                 .attributes
@@ -2980,7 +2980,7 @@ impl BufferingDecoderSink {
                 return;
             };
             // Ordinary inserts keep no older value; toast inserts are births
-            if insert && rel.kind != 't' {
+            if insert && rel.kind != b't' {
                 return;
             }
             let images = view_heap_record(&record.parsed, &rel).unwrap_or_default();
@@ -3113,7 +3113,7 @@ impl BufferingDecoderSink {
                 };
             // CH has no per-table internal toast; only user heap
             // ('r'/'p') TRUNCATE propagates
-            if rel.kind != 'r' && rel.kind != 'p' {
+            if rel.kind != b'r' && rel.kind != b'p' {
                 continue;
             }
             self.stats.record_op(HeapOp::Truncate, 1, false);
@@ -3275,7 +3275,7 @@ impl BufferingDecoderSink {
             self.skip(SkipReason::NoTuple, record, rfn);
             return Ok(());
         };
-        if rel.kind != 't' && config_kind.is_none() {
+        if rel.kind != b't' && config_kind.is_none() {
             // Ordinary rows stay as WAL bytes until commit, tuple bytes
             // validate where planning reads them
             self.stats.record_op(shape.op, shape.tuples, shape.partial);
@@ -3616,8 +3616,8 @@ pub(crate) mod raw_fixtures {
             toast_oid: 0,
             namespace_oid: 2200,
             rel_name: crate::schema::RelName::new("public", "copy_t"),
-            kind: 'r',
-            persistence: 'p',
+            kind: b'r',
+            persistence: b'p',
             ancestors: Vec::new(),
             replident: crate::schema::ReplIdent::Full { pk_attnums: None },
             attributes: vec![crate::schema::RelAttr {
@@ -3630,8 +3630,8 @@ pub(crate) mod raw_fixtures {
                 type_name: "int4".into(),
                 type_byval: true,
                 type_len: 4,
-                type_align: 'i',
-                type_storage: 'p',
+                type_align: b'i',
+                type_storage: b'p',
                 missing_default: None,
             }],
         })
@@ -3848,8 +3848,8 @@ mod tests {
             toast_oid: 0,
             namespace_oid: 2200,
             rel_name: crate::schema::RelName::new("public", "buf_t"),
-            kind: 'r',
-            persistence: 'p',
+            kind: b'r',
+            persistence: b'p',
             ancestors: Vec::new(),
             replident: crate::schema::ReplIdent::Full { pk_attnums: None },
             attributes: vec![],
@@ -4262,8 +4262,8 @@ mod tests {
             toast_oid: 0,
             namespace_oid: 99,
             rel_name: RelName::new("pg_toast", "pg_toast_16385"),
-            kind: 't',
-            persistence: 'p',
+            kind: b't',
+            persistence: b'p',
             ancestors: Vec::new(),
             replident: ReplIdent::Default { pk_attnums: None },
             attributes: vec![
@@ -4277,8 +4277,8 @@ mod tests {
                     type_name: "oid".into(),
                     type_byval: true,
                     type_len: 4,
-                    type_align: 'i',
-                    type_storage: 'p',
+                    type_align: b'i',
+                    type_storage: b'p',
                     missing_default: None,
                 },
                 RelAttr {
@@ -4291,8 +4291,8 @@ mod tests {
                     type_name: "int4".into(),
                     type_byval: true,
                     type_len: 4,
-                    type_align: 'i',
-                    type_storage: 'p',
+                    type_align: b'i',
+                    type_storage: b'p',
                     missing_default: None,
                 },
                 RelAttr {
@@ -4305,8 +4305,8 @@ mod tests {
                     type_name: "bytea".into(),
                     type_byval: false,
                     type_len: -1,
-                    type_align: 'i',
-                    type_storage: 'x',
+                    type_align: b'i',
+                    type_storage: b'x',
                     missing_default: None,
                 },
             ],
@@ -4366,8 +4366,8 @@ mod tests {
             toast_oid: 0,
             namespace_oid: 2200,
             rel_name: RelName::new("public", "t"),
-            kind: 'r',
-            persistence: 'p',
+            kind: b'r',
+            persistence: b'p',
             ancestors: Vec::new(),
             replident: ReplIdent::Default { pk_attnums: None },
             attributes: vec![crate::schema::RelAttr {
@@ -4380,8 +4380,8 @@ mod tests {
                 type_name: "bytea".into(),
                 type_byval: false,
                 type_len: -1,
-                type_align: 'i',
-                type_storage: 'x',
+                type_align: b'i',
+                type_storage: b'x',
                 missing_default: None,
             }],
         }

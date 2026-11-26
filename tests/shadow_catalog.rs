@@ -134,7 +134,7 @@ async fn user_relation_lookup_by_name() {
         .expect("wc.things exists");
     assert_eq!(&*desc.rel_name.name, "things");
     assert_eq!(&*desc.rel_name.namespace, "wc");
-    assert_eq!(desc.kind, 'r');
+    assert_eq!(desc.kind, b'r');
     assert_eq!(desc.attributes.len(), 3, "{:?}", desc.attributes);
     let id_col = &desc.attributes[0];
     assert_eq!(id_col.name, "id");
@@ -158,7 +158,7 @@ async fn user_relation_lookup_by_name() {
         .await
         .expect("toast lookup")
         .expect("jsonb column needs toast");
-    assert_eq!((toast.oid, toast.kind), (desc.toast_oid, 't'));
+    assert_eq!((toast.oid, toast.kind), (desc.toast_oid, b't'));
     let narrow = relation_oid(&shadow, "wc.narrow");
     assert!(
         cat.toast_descriptor_for(narrow)
@@ -322,8 +322,8 @@ async fn dropped_column_keeps_physical_slot() {
     assert_eq!(slot.type_name, "");
     // text physical layout survives the drop: varlena, int-aligned, extended
     assert_eq!(slot.type_len, -1);
-    assert_eq!(slot.type_align, 'i');
-    assert_eq!(slot.type_storage, 'x');
+    assert_eq!(slot.type_align, b'i');
+    assert_eq!(slot.type_storage, b'x');
     assert_eq!(desc.attributes[2].attnum, 3);
     assert!(!desc.attributes[2].dropped);
     assert_ne!(desc.toast_oid, 0, "text column gives wc.evolve a toast rel");
@@ -559,18 +559,18 @@ async fn fetch_all_descriptors_covers_eligible_kinds() {
         .iter()
         .find(|d| &*d.rel_name.name == "doc")
         .expect("wc.doc present");
-    assert_eq!(doc.kind, 'r');
+    assert_eq!(doc.kind, b'r');
     assert_ne!(doc.toast_oid, 0);
     assert!(
         descs
             .iter()
-            .any(|d| d.oid == doc.toast_oid && d.kind == 't'),
+            .any(|d| d.oid == doc.toast_oid && d.kind == b't'),
         "owner's toast rel captured alongside it",
     );
     assert!(
         descs
             .iter()
-            .all(|d| matches!(d.kind, 'r' | 'p' | 'm' | 't')),
+            .all(|d| matches!(d.kind, b'r' | b'p' | b'm' | b't')),
         "views/sequences/indexes excluded: {:?}",
         descs
             .iter()

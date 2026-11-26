@@ -21,13 +21,13 @@ use crate::table_rules::MatchKind;
 struct Case {
     oid: u32,
     len: i16,
-    align: char,
+    align: u8,
     type_name: &'static str,
     target: &'static str,
     datums: Vec<Option<Vec<u8>>>,
 }
 
-fn case(oid: u32, len: i16, align: char, target: &'static str, datums: Vec<Vec<u8>>) -> Case {
+fn case(oid: u32, len: i16, align: u8, target: &'static str, datums: Vec<Vec<u8>>) -> Case {
     let mut datums: Vec<_> = datums.into_iter().map(Some).collect();
     datums.push(None);
     Case {
@@ -40,7 +40,7 @@ fn case(oid: u32, len: i16, align: char, target: &'static str, datums: Vec<Vec<u
     }
 }
 
-fn attr(attnum: i16, oid: u32, len: i16, align: char, type_name: &str) -> RelAttr {
+fn attr(attnum: i16, oid: u32, len: i16, align: u8, type_name: &str) -> RelAttr {
     RelAttr {
         attnum,
         name: format!("c{attnum}"),
@@ -52,7 +52,7 @@ fn attr(attnum: i16, oid: u32, len: i16, align: char, type_name: &str) -> RelAtt
         type_byval: len > 0 && len <= 8,
         type_len: len,
         type_align: align,
-        type_storage: if len == -1 { 'x' } else { 'p' },
+        type_storage: if len == -1 { b'x' } else { b'p' },
         missing_default: None,
     }
 }
@@ -68,8 +68,8 @@ fn rel(attributes: Vec<RelAttr>) -> RelDescriptor {
         toast_oid: 0,
         namespace_oid: 2200,
         rel_name: RelName::new("public", "t"),
-        kind: 'r',
-        persistence: 'p',
+        kind: b'r',
+        persistence: b'p',
         ancestors: Vec::new(),
         replident: ReplIdent::Full { pk_attnums: None },
         attributes,
@@ -126,9 +126,9 @@ fn tuple(attrs: &[RelAttr], natts: usize, values: &[Option<&[u8]>]) -> Vec<u8> {
         // Short and external varlenas skip alignment
         if !(att.type_len == -1 && v[0] & 1 == 1) {
             let by = match att.type_align {
-                's' => 2,
-                'i' => 4,
-                'd' => 8,
+                b's' => 2,
+                b'i' => 4,
+                b'd' => 8,
                 _ => 1,
             };
             data.resize(data.len().next_multiple_of(by), 0);
@@ -239,9 +239,9 @@ fn assert_parity(
 /// alignment of neighbours runs through both walkers
 fn run(c: &Case, rules: &ColumnRules) {
     let rel = rel(vec![
-        attr(1, INT4OID, 4, 'i', "int4"),
+        attr(1, INT4OID, 4, b'i', "int4"),
         attr(2, c.oid, c.len, c.align, c.type_name),
-        attr(3, TEXTOID, -1, 'i', "text"),
+        attr(3, TEXTOID, -1, b'i', "text"),
     ]);
     let targets = ["Int32", c.target, "Nullable(String)"];
     let id = 7i32.to_le_bytes();
@@ -319,106 +319,124 @@ fn fixed_width_types_match() {
         1.5,
     ];
     let cases = [
-        case(BOOLOID, 1, 'c', "Bool", vec![vec![0], vec![1]]),
-        case(CHAROID, 1, 'c', "Int8", vec![vec![0x80], vec![65]]),
+        case(BOOLOID, 1, b'c', "Bool", vec![vec![0], vec![1]]),
+        case(CHAROID, 1, b'c', "Int8", vec![vec![0x80], vec![65]]),
         case(
             INT2OID,
             2,
-            's',
+            b's',
             "Int16",
             ints([i16::MIN, -1, 0, i16::MAX].map(i16::to_le_bytes)),
         ),
         case(
             INT4OID,
             4,
-            'i',
+            b'i',
             "Nullable(Int32)",
             ints([i32::MIN, -1, 0, i32::MAX].map(i32::to_le_bytes)),
         ),
         case(
             INT8OID,
             8,
-            'd',
+            b'd',
             "Int64",
             ints([i64::MIN, -1, 0, i64::MAX].map(i64::to_le_bytes)),
         ),
         case(
             MONEYOID,
             8,
-            'd',
+            b'd',
             "Int64",
             ints([-12_345i64, 0, 99].map(i64::to_le_bytes)),
         ),
-        case(FLOAT4OID, 4, 'i', "Float32", ints(f4.map(f32::to_le_bytes))),
+        case(
+            FLOAT4OID,
+            4,
+            b'i',
+            "Float32",
+            ints(f4.map(f32::to_le_bytes)),
+        ),
         case(
             FLOAT8OID,
             8,
-            'd',
+            b'd',
             "Nullable(Float64)",
             ints(f8.map(f64::to_le_bytes)),
         ),
         case(
             OIDOID,
             4,
-            'i',
+            b'i',
             "UInt32",
             ints([0u32, u32::MAX].map(u32::to_le_bytes)),
         ),
-        case(XIDOID, 4, 'i', "UInt32", ints([3u32].map(u32::to_le_bytes))),
-        case(CIDOID, 4, 'i', "UInt32", ints([9u32].map(u32::to_le_bytes))),
+        case(
+            XIDOID,
+            4,
+            b'i',
+            "UInt32",
+            ints([3u32].map(u32::to_le_bytes)),
+        ),
+        case(
+            CIDOID,
+            4,
+            b'i',
+            "UInt32",
+            ints([9u32].map(u32::to_le_bytes)),
+        ),
         case(
             OID8OID,
             8,
-            'd',
+            b'd',
             "UInt64",
             ints([u64::MAX].map(u64::to_le_bytes)),
         ),
         case(
             XID8OID,
             8,
-            'd',
+            b'd',
             "UInt64",
             ints([1u64 << 40].map(u64::to_le_bytes)),
         ),
         case(
             PG_LSNOID,
             8,
-            'd',
+            b'd',
             "UInt64",
             ints([0x16_B374_D848u64].map(u64::to_le_bytes)),
         ),
         case(
             DATEOID,
             4,
-            'i',
+            b'i',
             "Date32",
             ints([-1i32, 0, 8_000].map(i32::to_le_bytes)),
         ),
         case(
             TIMEOID,
             8,
-            'd',
+            b'd',
             "Time64(6)",
             ints([45_296_000_000i64, 0].map(i64::to_le_bytes)),
         ),
         case(
             TIMESTAMPOID,
             8,
-            'd',
+            b'd',
             "DateTime64(6, 'UTC')",
             ints([-1i64, 0, 1_700_000_000_000_000].map(i64::to_le_bytes)),
         ),
         case(
             TIMESTAMPTZOID,
             8,
-            'd',
+            b'd',
             "Nullable(DateTime64(3, 'UTC'))",
             ints([-1_999i64, 1_999].map(i64::to_le_bytes)),
         ),
         case(
             TIMETZOID,
             12,
-            'd',
+            b'd',
             "String",
             vec![
                 [
@@ -431,14 +449,14 @@ fn fixed_width_types_match() {
         case(
             UUIDOID,
             16,
-            'c',
+            b'c',
             "UUID",
             vec![(0u8..16).collect(), vec![0xff; 16]],
         ),
         case(
             INTERVALOID,
             16,
-            'd',
+            b'd',
             "String",
             vec![
                 [
@@ -452,19 +470,19 @@ fn fixed_width_types_match() {
         case(
             NAMEOID,
             64,
-            'c',
+            b'c',
             "String",
             vec![name(b"abc"), name(b""), name(b"\xc3\xa9t\xc3\xa9")],
         ),
         case(
             MACADDROID,
             6,
-            'i',
+            b'i',
             "String",
             vec![vec![0x08, 0, 0x2b, 1, 2, 0xab]],
         ),
-        case(MACADDR8OID, 8, 'i', "String", vec![vec![0xfe; 8]]),
-        case(TIDOID, 6, 's', "String", vec![vec![1, 0, 2, 0, 3, 0]]),
+        case(MACADDR8OID, 8, b'i', "String", vec![vec![0xfe; 8]]),
+        case(TIDOID, 6, b's', "String", vec![vec![1, 0, 2, 0, 3, 0]]),
     ];
     for c in &cases {
         run(c, &ColumnRules::default());
@@ -474,14 +492,14 @@ fn fixed_width_types_match() {
 #[test]
 fn codec_follows_source_type() {
     let cases = [
-        (INT4OID, 4, 'i', "Int32", Codec::Le),
-        (OIDOID, 4, 'i', "Int32", Codec::Le),
-        (MONEYOID, 8, 'd', "Int64", Codec::Le),
-        (BOOLOID, 1, 'c', "Bool", Codec::Le),
-        (DATEOID, 4, 'i', "Date32", Codec::Date),
-        (NUMERICOID, -1, 'i', "Decimal(10, 2)", Codec::Numeric),
-        (JSONBOID, -1, 'i', "String", Codec::Jsonb),
-        (999_999, -2, 'c', "String", Codec::Bytes),
+        (INT4OID, 4, b'i', "Int32", Codec::Le),
+        (OIDOID, 4, b'i', "Int32", Codec::Le),
+        (MONEYOID, 8, b'd', "Int64", Codec::Le),
+        (BOOLOID, 1, b'c', "Bool", Codec::Le),
+        (DATEOID, 4, b'i', "Date32", Codec::Date),
+        (NUMERICOID, -1, b'i', "Decimal(10, 2)", Codec::Numeric),
+        (JSONBOID, -1, b'i', "String", Codec::Jsonb),
+        (999_999, -2, b'c', "String", Codec::Bytes),
     ];
     for (oid, len, align, target, want) in cases {
         let rel = rel(vec![attr(1, oid, len, align, "")]);
@@ -492,7 +510,7 @@ fn codec_follows_source_type() {
             "{oid} {target}"
         );
     }
-    let rel = rel(vec![attr(1, 999_999, -1, 'd', "geometry")]);
+    let rel = rel(vec![attr(1, 999_999, -1, b'd', "geometry")]);
     let plan = plan(&rel, &["String"], &ColumnRules::default());
     assert_eq!(plan.columns[0].source.unwrap().codec, Codec::Wkt);
 }
@@ -505,7 +523,7 @@ fn varlena_types_match() {
         case(
             TEXTOID,
             -1,
-            'i',
+            b'i',
             "String",
             vec![
                 short(b""),
@@ -518,30 +536,30 @@ fn varlena_types_match() {
         case(
             VARCHAROID,
             -1,
-            'i',
+            b'i',
             "Nullable(String)",
             vec![long(b"abc"), lz4(&long_text)],
         ),
-        case(BPCHAROID, -1, 'i', "String", vec![short(b"ab  ")]),
+        case(BPCHAROID, -1, b'i', "String", vec![short(b"ab  ")]),
         case(
             BYTEAOID,
             -1,
-            'i',
+            b'i',
             "String",
             vec![short(&[0, 1, 0xff]), long(&[]), lz4(&long_text)],
         ),
-        case(JSONOID, -1, 'i', "String", vec![short(br#"{"a": 1}"#)]),
+        case(JSONOID, -1, b'i', "String", vec![short(br#"{"a": 1}"#)]),
         case(
             JSONBOID,
             -1,
-            'i',
+            b'i',
             "String",
             vec![short(&jsonb_scalar(b"abc")), long(&jsonb_scalar(b""))],
         ),
         case(
             NUMERICOID,
             -1,
-            'i',
+            b'i',
             "String",
             vec![
                 short(&numeric_short(false, 2, &[1, 5000])),
@@ -553,7 +571,7 @@ fn varlena_types_match() {
         case(
             NUMERICOID,
             -1,
-            'i',
+            b'i',
             "Decimal(10, 2)",
             vec![
                 short(&numeric_short(false, 2, &[1, 5000])),
@@ -563,14 +581,14 @@ fn varlena_types_match() {
         case(
             INETOID,
             -1,
-            'i',
+            b'i',
             "String",
             vec![short(&inet4), short(&[9, 9])],
         ),
         case(
             CIDROID,
             -1,
-            'i',
+            b'i',
             "String",
             vec![short(&[2, 8, 1, 4, 10, 0, 0, 0])],
         ),
@@ -584,12 +602,12 @@ fn varlena_types_match() {
 fn errors_match() {
     let cases = [
         // Unresolved pointer reaches encoder in both paths
-        case(TEXTOID, -1, 'i', "String", vec![external()]),
+        case(TEXTOID, -1, b'i', "String", vec![external()]),
         // Non-finite numeric into Decimal rejects
         case(
             NUMERICOID,
             -1,
-            'i',
+            b'i',
             "Decimal(10, 2)",
             vec![short(&0xC000u16.to_le_bytes())],
         ),
@@ -597,12 +615,12 @@ fn errors_match() {
         case(
             DATEOID,
             4,
-            'i',
+            b'i',
             "Date32",
             vec![i32::MAX.to_le_bytes().to_vec()],
         ),
         // Invalid name bytes stay unsupported
-        case(NAMEOID, 64, 'c', "String", vec![name(b"\xff")]),
+        case(NAMEOID, 64, b'c', "String", vec![name(b"\xff")]),
     ];
     for c in &cases {
         run(c, &ColumnRules::default());
@@ -613,18 +631,18 @@ fn errors_match() {
 fn overrides_and_substitutes_match() {
     let ints4 = ints([i32::MIN, -1, 0, i32::MAX].map(i32::to_le_bytes));
     run(
-        &case(INT4OID, 4, 'i', "Int32", ints4.clone()),
+        &case(INT4OID, 4, b'i', "Int32", ints4.clone()),
         &target_type("UInt32"),
     );
     run(
-        &case(INT4OID, 4, 'i', "Int32", ints4),
+        &case(INT4OID, 4, b'i', "Int32", ints4),
         &target_type("Nullable(Int32)"),
     );
     run(
         &case(
             NUMERICOID,
             -1,
-            'i',
+            b'i',
             "Decimal(10, 2)",
             vec![short(&numeric_short(false, 0, &[7]))],
         ),
@@ -640,7 +658,7 @@ fn overrides_and_substitutes_match() {
         &case(
             NUMERICOID,
             -1,
-            'i',
+            b'i',
             "Nullable(Decimal(10, 2))",
             vec![
                 short(&0xC000u16.to_le_bytes()),
@@ -660,7 +678,7 @@ fn overrides_and_substitutes_match() {
         &case(
             TIMESTAMPTZOID,
             8,
-            'd',
+            b'd',
             "Nullable(DateTime64(6, 'UTC'))",
             ints([i64::MAX, i64::MIN, 5].map(i64::to_le_bytes)),
         ),
@@ -675,7 +693,7 @@ fn oracle_columns_match() {
         &case(
             3614,
             -1,
-            'i',
+            b'i',
             "String",
             vec![short(b"\x01\x02"), lz4(&[7; 300])],
         ),
@@ -683,14 +701,14 @@ fn oracle_columns_match() {
     );
     // Composite target routes even local types to oracle
     run(
-        &case(TEXTOID, -1, 'i', "Array(String)", vec![short(b"{a,b}")]),
+        &case(TEXTOID, -1, b'i', "Array(String)", vec![short(b"{a,b}")]),
         &ColumnRules::default(),
     );
     run(
         &case(
             JSONBOID,
             -1,
-            'i',
+            b'i',
             "Map(String, String)",
             vec![short(&jsonb_scalar(b"x"))],
         ),
@@ -706,7 +724,7 @@ fn oracle_columns_match() {
         ..case(
             999_999,
             -1,
-            'd',
+            b'd',
             "String",
             vec![long(&point), short(&[0, 0, 0, 0, 3, 0, 0, 0])],
         )
@@ -717,12 +735,12 @@ fn oracle_columns_match() {
 #[test]
 fn defaults_dropped_and_absent_match() {
     let mut attrs = vec![
-        attr(1, INT4OID, 4, 'i', "int4"),
-        attr(2, TEXTOID, -1, 'i', "text"),
-        attr(3, INT8OID, 8, 'd', "int8"),
-        attr(4, TEXTOID, -1, 'i', "text"),
-        attr(5, NUMERICOID, -1, 'i', "numeric"),
-        attr(6, 3614, -1, 'i', "tsvector"),
+        attr(1, INT4OID, 4, b'i', "int4"),
+        attr(2, TEXTOID, -1, b'i', "text"),
+        attr(3, INT8OID, 8, b'd', "int8"),
+        attr(4, TEXTOID, -1, b'i', "text"),
+        attr(5, NUMERICOID, -1, b'i', "numeric"),
+        attr(6, 3614, -1, b'i', "tsvector"),
     ];
     attrs[1].dropped = true;
     attrs[2].missing_default = Some(MissingDefault::Text("-5".into()));
@@ -761,10 +779,10 @@ fn defaults_dropped_and_absent_match() {
 #[test]
 fn predeclared_columns_match() {
     // Mapping names attnum 2, descriptor predates it
-    let rel = rel(vec![attr(1, INT4OID, 4, 'i', "int4")]);
+    let rel = rel(vec![attr(1, INT4OID, 4, b'i', "int4")]);
     let mapping_rel = self::rel(vec![
-        attr(1, INT4OID, 4, 'i', "int4"),
-        attr(2, TEXTOID, -1, 'i', "text"),
+        attr(1, INT4OID, 4, b'i', "int4"),
+        attr(2, TEXTOID, -1, b'i', "text"),
     ]);
     let targets = ["Int32", "Nullable(String)"];
     let mapping = mapping_of(&mapping_rel, &targets);
@@ -821,8 +839,8 @@ fn predeclared_columns_match() {
 #[test]
 fn view_matches_owned_decode_for_records() {
     let rel = rel(vec![
-        attr(1, INT4OID, 4, 'i', "int4"),
-        attr(2, TEXTOID, -1, 'i', "text"),
+        attr(1, INT4OID, 4, b'i', "int4"),
+        attr(2, TEXTOID, -1, b'i', "text"),
     ]);
     let one = 1i32.to_le_bytes();
     let text = long(b"value");
@@ -922,9 +940,9 @@ fn plan_views_match_cells_for_row_changes() {
         },
     ] {
         let mut r = rel(vec![
-            attr(1, INT4OID, 4, 'i', "int4"),
-            attr(2, FLOAT8OID, 8, 'd', "float8"),
-            attr(3, TEXTOID, -1, 'i', "text"),
+            attr(1, INT4OID, 4, b'i', "int4"),
+            attr(2, FLOAT8OID, 8, b'd', "float8"),
+            attr(3, TEXTOID, -1, b'i', "text"),
         ]);
         r.replident = replident;
         let attrs = r.attributes.clone();
@@ -978,8 +996,8 @@ fn plan_views_match_cells_for_row_changes() {
 #[test]
 fn plan_views_match_cells_with_resolved_externals() {
     let mut r = rel(vec![
-        attr(1, INT4OID, 4, 'i', "int4"),
-        attr(2, TEXTOID, -1, 'i', "text"),
+        attr(1, INT4OID, 4, b'i', "int4"),
+        attr(2, TEXTOID, -1, b'i', "text"),
     ]);
     r.replident = ReplIdent::Full { pk_attnums: None };
     let attrs = r.attributes.clone();
@@ -1011,9 +1029,9 @@ fn plan_views_match_cells_with_resolved_externals() {
 #[test]
 fn plan_views_match_cells_across_value_forms() {
     let mut r = rel(vec![
-        attr(1, INT4OID, 4, 'i', "int4"),
-        attr(2, TEXTOID, -1, 'i', "text"),
-        attr(3, TEXTOID, -1, 'i', "text"),
+        attr(1, INT4OID, 4, b'i', "int4"),
+        attr(2, TEXTOID, -1, b'i', "text"),
+        attr(3, TEXTOID, -1, b'i', "text"),
     ]);
     r.replident = ReplIdent::Full { pk_attnums: None };
     let attrs = r.attributes.clone();
@@ -1078,14 +1096,14 @@ fn numeric_send(neg: bool, weight: i16, dscale: u16, digits: &[i16]) -> Vec<u8> 
 fn copy_fields_match_heap_views() {
     use crate::backfill::copy_backfill::{CopyRow, copy_slot, wire_kinds};
     let rel = rel(vec![
-        attr(1, INT4OID, 4, 'i', "int4"),
-        attr(2, INT8OID, 8, 'd', "int8"),
-        attr(3, FLOAT8OID, 8, 'd', "float8"),
-        attr(4, BOOLOID, 1, 'c', "bool"),
-        attr(5, DATEOID, 4, 'i', "date"),
-        attr(6, TEXTOID, -1, 'i', "text"),
-        attr(7, NUMERICOID, -1, 'i', "numeric"),
-        attr(8, NUMERICOID, -1, 'i', "numeric"),
+        attr(1, INT4OID, 4, b'i', "int4"),
+        attr(2, INT8OID, 8, b'd', "int8"),
+        attr(3, FLOAT8OID, 8, b'd', "float8"),
+        attr(4, BOOLOID, 1, b'c', "bool"),
+        attr(5, DATEOID, 4, b'i', "date"),
+        attr(6, TEXTOID, -1, b'i', "text"),
+        attr(7, NUMERICOID, -1, b'i', "numeric"),
+        attr(8, NUMERICOID, -1, b'i', "numeric"),
     ]);
     let targets = [
         "Int32",

@@ -83,8 +83,8 @@ async fn run(args: Args) -> anyhow::Result<()> {
         toast_oid: 0,
         namespace_oid: 2200,
         rel_name: RelName::new("public", "spill_bench"),
-        kind: 'r',
-        persistence: 'p',
+        kind: b'r',
+        persistence: b'p',
         ancestors: Vec::new(),
         replident: ReplIdent::Default { pk_attnums: None },
         attributes: vec![RelAttr {
@@ -97,8 +97,8 @@ async fn run(args: Args) -> anyhow::Result<()> {
             type_name: "text".into(),
             type_byval: false,
             type_len: -1,
-            type_align: 'i',
-            type_storage: 'x',
+            type_align: b'i',
+            type_storage: b'x',
             missing_default: None,
         }],
     });

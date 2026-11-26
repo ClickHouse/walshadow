@@ -766,7 +766,7 @@ impl DdlApplicator {
             Routing::Excluded => return Ok(()),
             // A partitioned relation holds no rows; its partitions share
             // the record
-            Routing::Ancestor(_) if desc.kind == 'p' => return Ok(()),
+            Routing::Ancestor(_) if desc.kind == b'p' => return Ok(()),
             Routing::Ancestor(root) => {
                 let Some(mapping) = self.mapping_for(&root.rel_name) else {
                     return Ok(());
@@ -1192,7 +1192,7 @@ fn check_partition(
             )));
         }
     }
-    if desc.persistence == 'u' {
+    if desc.persistence == b'u' {
         return Err(EmitterError::Config(format!(
             "unlogged partition `{}` of `{}` writes no WAL; make it logged or exclude it \
              with `replicate = false`",
@@ -1308,7 +1308,7 @@ fn partition_removal_sql(
 
 /// Name of `UInt32` partition column in a partitioned table's destination
 fn leaf_column<'a>(desc: &RelDescriptor, shape: &'a CreateShape<'_>) -> Option<&'a str> {
-    shape.system.leaf.as_deref().filter(|_| desc.kind == 'p')
+    shape.system.leaf.as_deref().filter(|_| desc.kind == b'p')
 }
 
 /// ClickHouse `ALTER_OF_COLUMN_IS_FORBIDDEN`, including rejected key retypes
@@ -1737,7 +1737,7 @@ fn render_create_table(
         cols.iter()
             .map(|c| (c.attnum, c.name.as_str(), c.resolved.ch_type.as_str())),
     );
-    if desc.kind == 'p' && !shape.order_by.is_empty() {
+    if desc.kind == b'p' && !shape.order_by.is_empty() {
         warn_partition_order_by(&target, desc, cols, shape.order_by);
     }
     let key = resolve_order_by(&target, shape.order_by, &orderable, derived);
@@ -2100,8 +2100,8 @@ mod tests {
             type_name: "test".into(),
             type_byval: true,
             type_len: 4,
-            type_align: 'i',
-            type_storage: 'p',
+            type_align: b'i',
+            type_storage: b'p',
             missing_default: missing.map(|s| crate::schema::MissingDefault::Text(s.into())),
         }
     }
@@ -2117,8 +2117,8 @@ mod tests {
             toast_oid: 0,
             namespace_oid: 2200,
             rel_name: RelName::new("public", name),
-            kind: 'r',
-            persistence: 'p',
+            kind: b'r',
+            persistence: b'p',
             ancestors: Vec::new(),
             replident: ReplIdent::Default { pk_attnums: pk },
             attributes: attrs,
@@ -2179,7 +2179,7 @@ mod tests {
             column_rules: Arc::default(),
         };
         let auto_creates = |namespace: &str, name: &str| {
-            let mut desc = crate::schema::int4_rel(16384, name, 'r', &[]);
+            let mut desc = crate::schema::int4_rel(16384, name, b'r', &[]);
             desc.rel_name = RelName::new(namespace, name);
             cfg.auto_creates(&desc)
         };
@@ -2336,7 +2336,7 @@ mod tests {
         labels.type_name = "tsvector".into();
         labels.type_byval = false;
         labels.type_len = -1;
-        labels.type_storage = 'x';
+        labels.type_storage = b'x';
         labels.missing_default = Some(MissingDefault::Raw(raw_missing_array(
             TSVECTOROID,
             &short_varlena(&[0x01, 0x20, 0x00]),
@@ -2368,7 +2368,7 @@ mod tests {
         let mut labels = att(2, "labels", JSONBOID, true, Some(r#"{"a": 1}"#));
         labels.type_byval = false;
         labels.type_len = -1;
-        labels.type_storage = 'x';
+        labels.type_storage = b'x';
         let resolved = type_bridge::map(&labels, false);
         assert_eq!(
             add_column_clause("labels", &resolved),
@@ -2401,7 +2401,7 @@ mod tests {
         let mut tsv = att(2, "tsv", TSVECTOROID, false, None);
         tsv.type_byval = false;
         tsv.type_len = -1;
-        tsv.type_storage = 'x';
+        tsv.type_storage = b'x';
         tsv.missing_default = Some(MissingDefault::Raw(raw_missing_array(
             TSVECTOROID,
             &short_varlena(b"\x01\x00\x00\x00"),
@@ -3210,11 +3210,11 @@ mod tests {
 
     /// `m (id, region)` keyed on both, partitioned into `m_eu`
     fn partition_pair() -> (RelDescriptor, RelDescriptor) {
-        let mut m = crate::schema::int4_rel(16480, "m", 'p', &[(1, "id"), (2, "region")]);
+        let mut m = crate::schema::int4_rel(16480, "m", b'p', &[(1, "id"), (2, "region")]);
         m.replident = ReplIdent::Default {
             pk_attnums: Some(vec![1, 2]),
         };
-        let mut leaf = crate::schema::int4_rel(16500, "m_eu", 'r', &[(1, "region"), (2, "id")]);
+        let mut leaf = crate::schema::int4_rel(16500, "m_eu", b'r', &[(1, "region"), (2, "id")]);
         leaf.replident = ReplIdent::Default {
             pk_attnums: Some(vec![2, 1]),
         };
@@ -3245,7 +3245,7 @@ mod tests {
         assert!(err.contains("may set only"), "{err}");
 
         let unlogged = RelDescriptor {
-            persistence: 'u',
+            persistence: b'u',
             ..leaf.clone()
         };
         let err = check_partition(&unlogged, &m, &none)

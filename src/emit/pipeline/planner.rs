@@ -462,8 +462,8 @@ mod tests {
             toast_oid: 0,
             namespace_oid: 2200,
             rel_name: RelName::new("public", &format!("t{rel_node}")),
-            kind: 'r',
-            persistence: 'p',
+            kind: b'r',
+            persistence: b'p',
             ancestors: Vec::new(),
             replident: crate::schema::ReplIdent::Full { pk_attnums: None },
             attributes: vec![RelAttr {
@@ -476,8 +476,8 @@ mod tests {
                 type_name: if type_oid == INT4OID { "int4" } else { "text" }.into(),
                 type_byval: type_oid == INT4OID,
                 type_len: if type_oid == INT4OID { 4 } else { -1 },
-                type_align: 'i',
-                type_storage: if type_oid == INT4OID { 'p' } else { 'x' },
+                type_align: b'i',
+                type_storage: if type_oid == INT4OID { b'p' } else { b'x' },
                 missing_default: None,
             }],
         })

@@ -197,8 +197,6 @@ pub enum DecodeError {
         "xl_heap_header at offset {offset} declares t_hoff={t_hoff} < SIZE_OF_HEAP_TUPLE_HEADER"
     )]
     BadHoff { offset: usize, t_hoff: u8 },
-    #[error("nominal alignment char {0:?} not one of c/s/i/d")]
-    BadAlign(char),
     #[error("xl_heap_update prefix/suffix bytes exceed block.data ({need} > {have})")]
     BadPrefixSuffix { need: usize, have: usize },
 }
@@ -1138,20 +1136,20 @@ fn decoded_size_or_skip(att: &RelAttr) -> Option<usize> {
 /// MAXALIGN dispatch over `pg_type.typalign`, for in-prefix / past-EOF where
 /// we can't peek to detect a short varlena header (`att_align_pointer`).
 #[cfg(any(test, feature = "test-support"))]
-fn align_bytes(attalign: char) -> usize {
+fn align_bytes(attalign: u8) -> usize {
     match attalign {
-        's' => 2,
-        'i' => 4,
-        'd' => 8,
+        b's' => 2,
+        b'i' => 4,
+        b'd' => 8,
         _ => 1,
     }
 }
 
-fn align_for(cur: usize, attalign: char) -> usize {
+fn align_for(cur: usize, attalign: u8) -> usize {
     match attalign {
-        's' => align_up(cur, 2),
-        'i' => align_up(cur, 4),
-        'd' => align_up(cur, 8),
+        b's' => align_up(cur, 2),
+        b'i' => align_up(cur, 4),
+        b'd' => align_up(cur, 8),
         // TYPALIGN_CHAR, unknown: no-align rather than panic
         _ => cur,
     }
@@ -1162,7 +1160,7 @@ fn align_for(cur: usize, attalign: char) -> usize {
 /// (`!VARATT_NOT_PAD_BYTE`); mirror by peeking `buf[abs]` before aligning.
 fn att_align_nominal(
     cur_offset: usize,
-    attalign: char,
+    attalign: u8,
     attlen: i16,
     buf: &[u8],
     abs_offset: usize,
@@ -1173,10 +1171,10 @@ fn att_align_nominal(
         return cur_offset;
     }
     match attalign {
-        's' => align_up(cur_offset, 2), // TYPALIGN_SHORT
-        'i' => align_up(cur_offset, 4), // TYPALIGN_INT
-        'd' => align_up(cur_offset, 8), // TYPALIGN_DOUBLE
-        _ => cur_offset,                // TYPALIGN_CHAR, unknown: no-align
+        b's' => align_up(cur_offset, 2), // TYPALIGN_SHORT
+        b'i' => align_up(cur_offset, 4), // TYPALIGN_INT
+        b'd' => align_up(cur_offset, 8), // TYPALIGN_DOUBLE
+        _ => cur_offset,                 // TYPALIGN_CHAR, unknown: no-align
     }
 }
 
@@ -1526,13 +1524,7 @@ mod tests {
     /// oracle converts
     const TSVECTOROID: u32 = 3614;
 
-    fn rel_attr(
-        attnum: i16,
-        name: &str,
-        type_oid: u32,
-        type_len: i16,
-        type_align: char,
-    ) -> RelAttr {
+    fn rel_attr(attnum: i16, name: &str, type_oid: u32, type_len: i16, type_align: u8) -> RelAttr {
         RelAttr {
             attnum,
             name: name.into(),
@@ -1544,7 +1536,7 @@ mod tests {
             type_byval: type_len > 0 && type_len <= 8,
             type_len,
             type_align,
-            type_storage: 'p',
+            type_storage: b'p',
             missing_default: None,
         }
     }
@@ -1560,8 +1552,8 @@ mod tests {
             toast_oid: 0,
             namespace_oid: 2200,
             rel_name: RelName::new("public", "t"),
-            kind: 'r',
-            persistence: 'p',
+            kind: b'r',
+            persistence: b'p',
             ancestors: Vec::new(),
             replident: ReplIdent::Default { pk_attnums: None },
             attributes: attrs,
@@ -1691,7 +1683,7 @@ mod tests {
 
     #[test]
     fn decode_cstring_bytes_and_truncated() {
-        let att = rel_attr(1, "c", 0, -2, 'c');
+        let att = rel_attr(1, "c", 0, -2, b'c');
         let cstring = |s: &[u8]| Datum::Cstring(s.to_vec());
         let (v, n) = decode_one_value(&att, b"hello\0", 0).unwrap();
         assert_eq!(v, cstring(b"hello"));
@@ -1716,11 +1708,11 @@ mod tests {
         let rel = descriptor(
             16390,
             vec![
-                rel_attr(1, "b", BOOLOID, 1, 'c'),
-                rel_attr(2, "s", INT2OID, 2, 's'),
-                rel_attr(3, "i", INT4OID, 4, 'i'),
-                rel_attr(4, "d", INT8OID, 8, 'd'),
-                rel_attr(5, "c", 0, -2, 'c'),
+                rel_attr(1, "b", BOOLOID, 1, b'c'),
+                rel_attr(2, "s", INT2OID, 2, b's'),
+                rel_attr(3, "i", INT4OID, 4, b'i'),
+                rel_attr(4, "d", INT8OID, 8, b'd'),
+                rel_attr(5, "c", 0, -2, b'c'),
             ],
         );
         let values = vec![
@@ -1740,8 +1732,8 @@ mod tests {
         let rel = descriptor(
             16391,
             vec![
-                rel_attr(1, "i", INT4OID, 4, 'i'),
-                rel_attr(2, "t", TEXTOID, -1, 'i'),
+                rel_attr(1, "i", INT4OID, 4, b'i'),
+                rel_attr(2, "t", TEXTOID, -1, b'i'),
             ],
         );
         let full = form_block_data(
@@ -1761,8 +1753,8 @@ mod tests {
         let rel = descriptor(
             16385,
             vec![
-                rel_attr(1, "a", INT4OID, 4, 'i'),
-                rel_attr(2, "b", INT8OID, 8, 'd'),
+                rel_attr(1, "a", INT4OID, 4, b'i'),
+                rel_attr(2, "b", INT8OID, 8, b'd'),
             ],
         );
         // int4 at 0..4, 4-byte pad, int8 8-aligned at 8..16
@@ -1788,8 +1780,8 @@ mod tests {
         let rel = descriptor(
             16386,
             vec![
-                rel_attr(1, "flag", BOOLOID, 1, 'c'),
-                rel_attr(2, "msg", TEXTOID, -1, 'i'),
+                rel_attr(1, "flag", BOOLOID, 1, b'c'),
+                rel_attr(2, "msg", TEXTOID, -1, b'i'),
             ],
         );
         let mut col_data = Vec::new();
@@ -1812,7 +1804,7 @@ mod tests {
 
     #[test]
     fn decode_insert_short_varlena() {
-        let rel = descriptor(16387, vec![rel_attr(1, "msg", TEXTOID, -1, 'i')]);
+        let rel = descriptor(16387, vec![rel_attr(1, "msg", TEXTOID, -1, b'i')]);
         // Short header: bit 0 set, total (incl header) in upper 7 bits
         let header = (3u8 << 1) | 0x01;
         let mut col_data = Vec::new();
@@ -1844,7 +1836,7 @@ mod tests {
         let comp = pglz::compress(text.as_bytes(), &pglz::Strategy::ALWAYS).expect("pglz compress");
         assert!(comp.len() < text.len(), "must actually compress");
         let buf = inline_compressed_varlena(0, &comp, text.len());
-        let att = rel_attr(1, "val", TEXTOID, -1, 'i');
+        let att = rel_attr(1, "val", TEXTOID, -1, b'i');
         let (v, consumed) = decode_one_value(&att, &buf, 0).unwrap();
         assert_eq!(consumed, buf.len());
         assert_eq!(v, build::text(&text));
@@ -1855,7 +1847,7 @@ mod tests {
         let text = "lz4-".repeat(4000);
         let comp = lz4::block::compress(text.as_bytes(), None, false).expect("lz4 compress");
         let buf = inline_compressed_varlena(1, &comp, text.len());
-        let att = rel_attr(1, "val", TEXTOID, -1, 'i');
+        let att = rel_attr(1, "val", TEXTOID, -1, b'i');
         let (v, consumed) = decode_one_value(&att, &buf, 0).unwrap();
         assert_eq!(consumed, buf.len());
         assert_eq!(v, build::text(&text));
@@ -1864,7 +1856,7 @@ mod tests {
     #[test]
     fn decode_inline_compressed_corrupt_surfaces_unsupported() {
         let buf = inline_compressed_varlena(0, &[0xff, 0xff, 0xff, 0xff], 4096);
-        let att = rel_attr(1, "val", TEXTOID, -1, 'i');
+        let att = rel_attr(1, "val", TEXTOID, -1, b'i');
         let (v, consumed) = decode_one_value(&att, &buf, 0).unwrap();
         assert_eq!(consumed, buf.len());
         assert!(matches!(v, Datum::BadTag(_)));
@@ -1891,9 +1883,9 @@ mod tests {
         let rel = descriptor(
             16388,
             vec![
-                rel_attr(1, "a", INT4OID, 4, 'i'),
-                rel_attr(2, "b", INT4OID, 4, 'i'),
-                rel_attr(3, "c", INT4OID, 4, 'i'),
+                rel_attr(1, "a", INT4OID, 4, b'i'),
+                rel_attr(2, "b", INT4OID, 4, b'i'),
+                rel_attr(3, "c", INT4OID, 4, b'i'),
             ],
         );
         // bits 0,2 set; bit 1 clear (NULL)
@@ -1919,7 +1911,7 @@ mod tests {
 
     #[test]
     fn decode_delete_with_old_key_emits_old() {
-        let rel = descriptor(16389, vec![rel_attr(1, "id", INT4OID, 4, 'i')]);
+        let rel = descriptor(16389, vec![rel_attr(1, "id", INT4OID, 4, b'i')]);
         // main_data: xl_heap_delete(8) + xl_heap_header(5) + bitmap_pad(1) + col data
         let mut main_data = vec![0u8; SIZE_OF_HEAP_DELETE];
         main_data[7] = XLH_DELETE_CONTAINS_OLD_KEY;
@@ -1940,8 +1932,8 @@ mod tests {
         let rel = descriptor(
             16390,
             vec![
-                rel_attr(1, "a", INT4OID, 4, 'i'),
-                rel_attr(2, "b", INT4OID, 4, 'i'),
+                rel_attr(1, "a", INT4OID, 4, b'i'),
+                rel_attr(2, "b", INT4OID, 4, b'i'),
             ],
         );
         // PREFIX_FROM_OLD, prefixlen=4 (col 1 elided). block 0:
@@ -1966,7 +1958,7 @@ mod tests {
 
     #[test]
     fn decode_hot_update_without_old_emits_no_old() {
-        let rel = descriptor(16391, vec![rel_attr(1, "id", INT4OID, 4, 'i')]);
+        let rel = descriptor(16391, vec![rel_attr(1, "id", INT4OID, 4, b'i')]);
         let mut block_data = Vec::new();
         block_data.extend_from_slice(&1u16.to_le_bytes());
         block_data.extend_from_slice(&0u16.to_le_bytes());
@@ -1984,9 +1976,9 @@ mod tests {
 
     #[test]
     fn decode_dropped_column_emits_null_and_advances() {
-        let mut dropped = rel_attr(1, "old", INT4OID, 4, 'i');
+        let mut dropped = rel_attr(1, "old", INT4OID, 4, b'i');
         dropped.dropped = true;
-        let rel = descriptor(16392, vec![dropped, rel_attr(2, "live", INT4OID, 4, 'i')]);
+        let rel = descriptor(16392, vec![dropped, rel_attr(2, "live", INT4OID, 4, b'i')]);
         let mut col_data = Vec::new();
         col_data.extend_from_slice(&0i32.to_le_bytes()); // dropped col still present
         col_data.extend_from_slice(&8888i32.to_le_bytes());
@@ -2001,7 +1993,7 @@ mod tests {
 
     #[test]
     fn decode_skips_lock_inplace_truncate() {
-        let rel = descriptor(16393, vec![rel_attr(1, "id", INT4OID, 4, 'i')]);
+        let rel = descriptor(16393, vec![rel_attr(1, "id", INT4OID, 4, b'i')]);
         for op in [XLOG_HEAP_LOCK, XLOG_HEAP_INPLACE, 0x30] {
             let rec = record_with(RmId::Heap, op, Vec::new(), Vec::new());
             let out = decode_heap_record(&rec, 0, &rel).unwrap();
@@ -2012,7 +2004,7 @@ mod tests {
     #[test]
     fn decode_skips_heap2_lock_updated_silently() {
         // 0x60 = Heap2 LOCK_UPDATED, skip path (MULTI_INSERT 0x50 tested apart)
-        let rel = descriptor(16394, vec![rel_attr(1, "id", INT4OID, 4, 'i')]);
+        let rel = descriptor(16394, vec![rel_attr(1, "id", INT4OID, 4, b'i')]);
         let rec = record_with(RmId::Heap2, 0x60, Vec::new(), Vec::new());
         let out = decode_heap_record(&rec, 0, &rel).unwrap();
         assert!(out.is_empty(), "non-multi-insert heap2 ops skip");
@@ -2020,7 +2012,7 @@ mod tests {
 
     #[test]
     fn decode_uuid_round_trip() {
-        let rel = descriptor(16395, vec![rel_attr(1, "u", UUIDOID, 16, 'c')]);
+        let rel = descriptor(16395, vec![rel_attr(1, "u", UUIDOID, 16, b'c')]);
         let uuid_bytes = [
             0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66,
             0x77, 0x88,
@@ -2035,7 +2027,7 @@ mod tests {
 
     #[test]
     fn decode_external_toast_pointer() {
-        let rel = descriptor(16396, vec![rel_attr(1, "blob", BYTEAOID, -1, 'i')]);
+        let rel = descriptor(16396, vec![rel_attr(1, "blob", BYTEAOID, -1, b'i')]);
         // varattrib_1b_e: 0x01, va_tag=18, then va_rawsize/extinfo/valueid/toastrelid
         let mut col_data = Vec::new();
         col_data.push(0x01);
@@ -2064,7 +2056,7 @@ mod tests {
     fn decode_unsupported_type_emits_pending() {
         // tsvector is outside the local matrix; its stored body survives for
         // the shadow extension to convert at emit
-        let rel = descriptor(16397, vec![rel_attr(1, "t", TSVECTOROID, -1, 'i')]);
+        let rel = descriptor(16397, vec![rel_attr(1, "t", TSVECTOROID, -1, b'i')]);
         let body = b"\x01opaque";
         let total = 4 + body.len();
         let header_u32 = (total as u32) << 2;
@@ -2083,13 +2075,13 @@ mod tests {
     fn missing_value_substitutes_when_natts_below_catalog() {
         // Catalog natts=3, wal natts=2 (pre-ALTER row); col 3 missing_default="7"
         // must surface 7 not NULL
-        let mut a3 = rel_attr(3, "c", INT4OID, 4, 'i');
+        let mut a3 = rel_attr(3, "c", INT4OID, 4, b'i');
         a3.missing_default = Some("7".into());
         let rel = descriptor(
             16500,
             vec![
-                rel_attr(1, "id", INT4OID, 4, 'i'),
-                rel_attr(2, "payload", INT4OID, 4, 'i'),
+                rel_attr(1, "id", INT4OID, 4, b'i'),
+                rel_attr(2, "payload", INT4OID, 4, b'i'),
                 a3,
             ],
         );
@@ -2113,9 +2105,9 @@ mod tests {
         let rel = descriptor(
             16501,
             vec![
-                rel_attr(1, "id", INT4OID, 4, 'i'),
-                rel_attr(2, "payload", INT4OID, 4, 'i'),
-                rel_attr(3, "c", INT4OID, 4, 'i'),
+                rel_attr(1, "id", INT4OID, 4, b'i'),
+                rel_attr(2, "payload", INT4OID, 4, b'i'),
+                rel_attr(3, "c", INT4OID, 4, b'i'),
             ],
         );
         let mut col_data = Vec::new();
@@ -2133,9 +2125,9 @@ mod tests {
     fn missing_value_physical_null_unaffected_by_default() {
         // Bitmap-clear NULL on a missing_default col stays NULL: substitution
         // applies only for natts below catalog, never to an explicit WAL NULL
-        let mut a2 = rel_attr(2, "b", INT4OID, 4, 'i');
+        let mut a2 = rel_attr(2, "b", INT4OID, 4, b'i');
         a2.missing_default = Some("99".into());
-        let rel = descriptor(16502, vec![rel_attr(1, "a", INT4OID, 4, 'i'), a2]);
+        let rel = descriptor(16502, vec![rel_attr(1, "a", INT4OID, 4, b'i'), a2]);
         let bitmap = 0b00000001u8; // bit 1 clear = NULL
         let mut payload = Vec::new();
         payload.extend_from_slice(&2u16.to_le_bytes());
@@ -2183,7 +2175,7 @@ mod tests {
 
     #[test]
     fn decode_multi_insert_three_rows() {
-        let rel = descriptor(16410, vec![rel_attr(1, "id", INT4OID, 4, 'i')]);
+        let rel = descriptor(16410, vec![rel_attr(1, "id", INT4OID, 4, b'i')]);
         // main_data: flags=CONTAINS_NEW_TUPLE, pad, ntuples=3,
         // offsets[3]=[1,2,3] (info != INIT_PAGE)
         let mut main_data = Vec::new();
@@ -2239,8 +2231,8 @@ mod tests {
         let rel = descriptor(
             16413,
             vec![
-                rel_attr(1, "id", INT4OID, 4, 'i'),
-                rel_attr(2, "msg", TEXTOID, -1, 'i'),
+                rel_attr(1, "id", INT4OID, 4, b'i'),
+                rel_attr(2, "msg", TEXTOID, -1, b'i'),
             ],
         );
         let mut block_data = Vec::new();
@@ -2278,8 +2270,8 @@ mod tests {
         let rel = descriptor(
             16414,
             vec![
-                rel_attr(1, "id", INT4OID, 4, 'i'),
-                rel_attr(2, "msg", TEXTOID, -1, 'i'),
+                rel_attr(1, "id", INT4OID, 4, b'i'),
+                rel_attr(2, "msg", TEXTOID, -1, b'i'),
             ],
         );
         let mut block_data = Vec::new();
@@ -2311,7 +2303,7 @@ mod tests {
 
     #[test]
     fn decode_multi_insert_truncated_body_errors() {
-        let rel = descriptor(16415, vec![rel_attr(1, "id", INT4OID, 4, 'i')]);
+        let rel = descriptor(16415, vec![rel_attr(1, "id", INT4OID, 4, b'i')]);
         let mut block_data = Vec::new();
         push_multi_insert_tuple(&mut block_data, 0, &[0; 5]);
         block_data.truncate(block_data.len() - 1);
@@ -2333,7 +2325,7 @@ mod tests {
 
     #[test]
     fn decode_multi_insert_zero_ntuples_errors() {
-        let rel = descriptor(16411, vec![rel_attr(1, "id", INT4OID, 4, 'i')]);
+        let rel = descriptor(16411, vec![rel_attr(1, "id", INT4OID, 4, b'i')]);
         let mut main_data = Vec::new();
         main_data.push(XLH_INSERT_CONTAINS_NEW_TUPLE);
         main_data.push(0); // pad
@@ -2345,7 +2337,7 @@ mod tests {
 
     #[test]
     fn decode_multi_insert_skips_without_new_tuple_flag() {
-        let rel = descriptor(16412, vec![rel_attr(1, "id", INT4OID, 4, 'i')]);
+        let rel = descriptor(16412, vec![rel_attr(1, "id", INT4OID, 4, b'i')]);
         // flags=0 (no CONTAINS_NEW_TUPLE): no tuple bytes => empty smallvec
         let mut main_data = Vec::new();
         main_data.push(0);
@@ -2360,18 +2352,18 @@ mod tests {
 
     #[test]
     fn fixed_system_types_decode_values() {
-        let cases: [(u32, Vec<u8>, char, Datum); 7] = [
-            (XIDOID, 7u32.to_le_bytes().to_vec(), 'i', build::oid(7)),
+        let cases: [(u32, Vec<u8>, u8, Datum); 7] = [
+            (XIDOID, 7u32.to_le_bytes().to_vec(), b'i', build::oid(7)),
             (
                 PG_LSNOID,
                 0x16_B374_D848u64.to_le_bytes().to_vec(),
-                'd',
+                b'd',
                 build::oid8(0x16_B374_D848),
             ),
             (
                 MONEYOID,
                 (-123_456i64).to_le_bytes().to_vec(),
-                'd',
+                b'd',
                 build::int8(-123_456),
             ),
             (
@@ -2381,25 +2373,25 @@ mod tests {
                     b.resize(64, 0);
                     b
                 },
-                'c',
+                b'c',
                 build::name("pg_class"),
             ),
             (
                 MACADDROID,
                 vec![0x08, 0x00, 0x2b, 0x01, 0x02, 0xab],
-                'i',
+                b'i',
                 Datum::fixed(&[0x08, 0x00, 0x2b, 0x01, 0x02, 0xab]),
             ),
             (
                 MACADDR8OID,
                 vec![0x08, 0x00, 0x2b, 0xff, 0xfe, 0x01, 0x02, 0x03],
-                'i',
+                b'i',
                 Datum::fixed(&[0x08, 0x00, 0x2b, 0xff, 0xfe, 0x01, 0x02, 0x03]),
             ),
             (
                 TIDOID,
                 vec![0, 0, 5, 0, 3, 0],
-                's',
+                b's',
                 Datum::fixed(&crate::decode::codecs::encode_tid(5, 3)),
             ),
         ];
@@ -2412,13 +2404,13 @@ mod tests {
 
     #[test]
     fn missing_value_text_parses_system_types() {
-        let mut lsn = rel_attr(1, "l", PG_LSNOID, 8, 'd');
+        let mut lsn = rel_attr(1, "l", PG_LSNOID, 8, b'd');
         lsn.missing_default = Some("16/B374D848".into());
         assert_eq!(missing_value_for(&lsn), build::oid8(0x16_B374_D848));
-        let mut x8 = rel_attr(1, "x", XID8OID, 8, 'd');
+        let mut x8 = rel_attr(1, "x", XID8OID, 8, b'd');
         x8.missing_default = Some("18446744073709551615".into());
         assert_eq!(missing_value_for(&x8), build::oid8(u64::MAX));
-        let mut mac = rel_attr(1, "m", MACADDROID, 6, 'i');
+        let mut mac = rel_attr(1, "m", MACADDROID, 6, b'i');
         mac.missing_default = Some("08:00:2b:01:02:03".into());
         assert_eq!(
             missing_value_for(&mac),
@@ -2428,37 +2420,37 @@ mod tests {
 
     #[test]
     fn missing_value_for_type_matrix() {
-        let mut bool_att = rel_attr(1, "b", BOOLOID, 1, 'c');
+        let mut bool_att = rel_attr(1, "b", BOOLOID, 1, b'c');
         bool_att.missing_default = Some("t".into());
         assert_eq!(missing_value_for(&bool_att), build::bool_(true));
         bool_att.missing_default = Some("false".into());
         assert_eq!(missing_value_for(&bool_att), build::bool_(false));
 
-        let mut i4 = rel_attr(1, "x", INT4OID, 4, 'i');
+        let mut i4 = rel_attr(1, "x", INT4OID, 4, b'i');
         i4.missing_default = Some("42".into());
         assert_eq!(missing_value_for(&i4), build::int4(42));
         i4.missing_default = Some("x".into());
         assert_eq!(missing_value_for(&i4), Datum::Null);
 
-        let mut i8 = rel_attr(1, "x", INT8OID, 8, 'd');
+        let mut i8 = rel_attr(1, "x", INT8OID, 8, b'd');
         i8.missing_default = Some("-9223372036854775808".into());
         assert_eq!(missing_value_for(&i8), build::int8(i64::MIN));
 
-        let mut txt = rel_attr(1, "n", TEXTOID, -1, 'i');
+        let mut txt = rel_attr(1, "n", TEXTOID, -1, b'i');
         txt.missing_default = Some("hello".into());
         assert_eq!(missing_value_for(&txt), build::out_text("hello"));
 
-        let mut ts = rel_attr(1, "t", TSVECTOROID, -1, 'i');
+        let mut ts = rel_attr(1, "t", TSVECTOROID, -1, b'i');
         ts.missing_default = Some("'a'".into());
         assert_eq!(missing_value_for(&ts), build::out_text("'a'"));
 
-        let none = rel_attr(1, "x", INT4OID, 4, 'i');
+        let none = rel_attr(1, "x", INT4OID, 4, b'i');
         assert_eq!(missing_value_for(&none), Datum::Null);
     }
 
     #[test]
     fn fast_default_raw_scalar_decodes_to_value() {
-        let mut a = rel_attr(1, "x", INT4OID, 4, 'i');
+        let mut a = rel_attr(1, "x", INT4OID, 4, b'i');
         a.missing_default = Some(MissingDefault::Raw(raw_missing_array(
             INT4OID,
             &7i32.to_le_bytes(),
@@ -2468,7 +2460,7 @@ mod tests {
 
     #[test]
     fn fast_default_raw_text_decodes_to_value() {
-        let mut a = rel_attr(1, "n", TEXTOID, -1, 'i');
+        let mut a = rel_attr(1, "n", TEXTOID, -1, b'i');
         a.missing_default = Some(MissingDefault::Raw(raw_missing_array(
             TEXTOID,
             &short_varlena(b"hi"),
@@ -2479,7 +2471,7 @@ mod tests {
     #[test]
     fn fast_default_raw_tier3_stays_pending_not_dropped() {
         // tsvector has no local text form: raw must survive as pending, not NULL
-        let mut a = rel_attr(1, "t", TSVECTOROID, -1, 'i');
+        let mut a = rel_attr(1, "t", TSVECTOROID, -1, b'i');
         let body = [0x01u8, 0x20, 0x00];
         a.missing_default = Some(MissingDefault::Raw(raw_missing_array(
             TSVECTOROID,
@@ -2492,7 +2484,7 @@ mod tests {
     #[test]
     fn fast_default_raw_jsonb_stays_stored() {
         // `{}`: bare container header, JB_FOBJECT with no pairs
-        let mut a = rel_attr(1, "j", JSONBOID, -1, 'i');
+        let mut a = rel_attr(1, "j", JSONBOID, -1, b'i');
         a.missing_default = Some(MissingDefault::Raw(raw_missing_array(
             JSONBOID,
             &short_varlena(&0x2000_0000u32.to_le_bytes()),
@@ -2505,53 +2497,53 @@ mod tests {
 
     #[test]
     fn fast_default_malformed_raw_is_null_not_panic() {
-        let mut a = rel_attr(1, "x", INT4OID, 4, 'i');
+        let mut a = rel_attr(1, "x", INT4OID, 4, b'i');
         a.missing_default = Some(MissingDefault::Raw(vec![0, 1, 2]));
         assert_eq!(missing_value_for(&a), Datum::Null);
     }
 
     #[test]
     fn fast_default_equivalent_across_raw_and_text() {
-        let mut raw7 = rel_attr(1, "x", INT4OID, 4, 'i');
+        let mut raw7 = rel_attr(1, "x", INT4OID, 4, b'i');
         raw7.missing_default = Some(MissingDefault::Raw(raw_missing_array(
             INT4OID,
             &7i32.to_le_bytes(),
         )));
-        let mut text7 = rel_attr(1, "x", INT4OID, 4, 'i');
+        let mut text7 = rel_attr(1, "x", INT4OID, 4, b'i');
         text7.missing_default = Some("7".into());
         assert!(missing_defaults_equivalent(&raw7, &text7));
 
-        let mut text8 = rel_attr(1, "x", INT4OID, 4, 'i');
+        let mut text8 = rel_attr(1, "x", INT4OID, 4, b'i');
         text8.missing_default = Some("8".into());
         assert!(!missing_defaults_equivalent(&raw7, &text8));
 
-        let mut raw_ts = rel_attr(1, "t", TSVECTOROID, -1, 'i');
+        let mut raw_ts = rel_attr(1, "t", TSVECTOROID, -1, b'i');
         raw_ts.missing_default = Some(MissingDefault::Raw(raw_missing_array(
             TSVECTOROID,
             &short_varlena(&[0x01, 0x20, 0x00]),
         )));
-        let mut text_ts = rel_attr(1, "t", TSVECTOROID, -1, 'i');
+        let mut text_ts = rel_attr(1, "t", TSVECTOROID, -1, b'i');
         text_ts.missing_default = Some("'a' 'b'".into());
         assert!(missing_defaults_equivalent(&raw_ts, &text_ts));
         // No default reads NULL even where no local parser covers the type
-        let bare_ts = rel_attr(1, "t", TSVECTOROID, -1, 'i');
+        let bare_ts = rel_attr(1, "t", TSVECTOROID, -1, b'i');
         assert!(missing_defaults_equivalent(&bare_ts, &bare_ts.clone()));
         assert!(!missing_defaults_equivalent(&bare_ts, &raw_ts));
     }
 
     #[test]
     fn fast_default_equivalent_across_raw_and_text_name() {
-        let mut raw = rel_attr(1, "n", NAMEOID, 64, 'c');
+        let mut raw = rel_attr(1, "n", NAMEOID, 64, b'c');
         let mut stored = b"nm".to_vec();
         stored.resize(64, 0);
         assert_eq!(build::name("nm"), Datum::fixed(&stored));
         raw.missing_default = Some(MissingDefault::Raw(raw_missing_array(NAMEOID, &stored)));
-        let mut text = rel_attr(1, "n", NAMEOID, 64, 'c');
+        let mut text = rel_attr(1, "n", NAMEOID, 64, b'c');
         text.missing_default = Some("nm".into());
         assert!(missing_defaults_equivalent(&raw, &text));
 
         // Text the parser rejects reads as NULL on both sides
-        let mut bad = rel_attr(1, "x", INT4OID, 4, 'i');
+        let mut bad = rel_attr(1, "x", INT4OID, 4, b'i');
         bad.missing_default = Some("x".into());
         assert!(missing_defaults_equivalent(&bad, &bad.clone()));
     }
@@ -2559,7 +2551,7 @@ mod tests {
     /// Owned datums view and resolve back to themselves, holding their bytes
     #[test]
     fn owned_datums_round_trip_through_views() {
-        let att = rel_attr(1, "x", INT4OID, 4, 'i');
+        let att = rel_attr(1, "x", INT4OID, 4, b'i');
         let pointer = ToastPointer {
             va_rawsize: 8,
             va_extinfo: 4,
@@ -2615,16 +2607,16 @@ mod tests {
     /// Raw and text both render, so jsonb equivalence is by document
     #[test]
     fn fast_default_equivalent_across_raw_and_text_jsonb() {
-        let mut raw_j = rel_attr(1, "j", JSONBOID, -1, 'i');
+        let mut raw_j = rel_attr(1, "j", JSONBOID, -1, b'i');
         raw_j.missing_default = Some(MissingDefault::Raw(raw_missing_array(
             JSONBOID,
             &short_varlena(&0x2000_0000u32.to_le_bytes()),
         )));
-        let mut text_j = rel_attr(1, "j", JSONBOID, -1, 'i');
+        let mut text_j = rel_attr(1, "j", JSONBOID, -1, b'i');
         text_j.missing_default = Some("{}".into());
         assert!(missing_defaults_equivalent(&raw_j, &text_j));
 
-        let mut other = rel_attr(1, "j", JSONBOID, -1, 'i');
+        let mut other = rel_attr(1, "j", JSONBOID, -1, b'i');
         other.missing_default = Some(r#"{"a": 1}"#.into());
         assert!(!missing_defaults_equivalent(&raw_j, &other));
     }
@@ -2661,7 +2653,7 @@ mod tests {
             (2202, 4),
         ];
         for (oid, len) in fixed {
-            let att = rel_attr(1, "c", oid, len, 'i');
+            let att = rel_attr(1, "c", oid, len, b'i');
             assert_eq!(
                 Codec::choose(&att) != Codec::Pending,
                 local_matrix_covers(oid, len),
@@ -2691,7 +2683,7 @@ mod tests {
             (3802, vec![0, 0, 0, 0]),
         ];
         for (oid, _) in varlena {
-            let att = rel_attr(1, "c", oid, -1, 'i');
+            let att = rel_attr(1, "c", oid, -1, b'i');
             assert_eq!(
                 Codec::choose(&att) != Codec::Pending,
                 local_matrix_covers(oid, -1),
@@ -2748,7 +2740,7 @@ mod tests {
 
     #[test]
     fn decode_rejects_short_main_data_per_op() {
-        let rel = descriptor(16400, vec![rel_attr(1, "id", INT4OID, 4, 'i')]);
+        let rel = descriptor(16400, vec![rel_attr(1, "id", INT4OID, 4, b'i')]);
         let mut old_tuple_update = vec![0u8; SIZE_OF_HEAP_UPDATE];
         old_tuple_update[7] = XLH_UPDATE_CONTAINS_OLD_TUPLE;
         let mut old_key_delete = vec![0u8; SIZE_OF_HEAP_DELETE];
@@ -2793,7 +2785,7 @@ mod tests {
 
     #[test]
     fn decode_without_block_yields_tupleless_ops() {
-        let rel = descriptor(16401, vec![rel_attr(1, "id", INT4OID, 4, 'i')]);
+        let rel = descriptor(16401, vec![rel_attr(1, "id", INT4OID, 4, b'i')]);
         let blockless = |rm, info, main_data| {
             let mut rec = record_with(rm, info, main_data, Vec::new());
             rec.blocks.clear();
@@ -2817,7 +2809,7 @@ mod tests {
 
     #[test]
     fn decode_multi_insert_short_tuple_header_errors() {
-        let rel = descriptor(16402, vec![rel_attr(1, "id", INT4OID, 4, 'i')]);
+        let rel = descriptor(16402, vec![rel_attr(1, "id", INT4OID, 4, b'i')]);
         let rec = record_with(
             RmId::Heap2,
             XLOG_HEAP2_MULTI_INSERT | XLOG_HEAP_INIT_PAGE,
@@ -2840,7 +2832,7 @@ mod tests {
 
     #[test]
     fn decode_insert_bad_header_errors() {
-        let rel = descriptor(16403, vec![rel_attr(1, "id", INT4OID, 4, 'i')]);
+        let rel = descriptor(16403, vec![rel_attr(1, "id", INT4OID, 4, b'i')]);
         let insert = |block| record_with(RmId::Heap, XLOG_HEAP_INSERT, vec![0; 3], block);
         // t_hoff below fixed header size
         let mut bad_hoff = build_tuple_payload(1, false, 24, &1i32.to_le_bytes());
@@ -2873,10 +2865,10 @@ mod tests {
         let rel = descriptor(
             16404,
             vec![
-                rel_attr(1, "a", INT4OID, 4, 'i'),
-                rel_attr(2, "b", INT4OID, 4, 'i'),
-                rel_attr(3, "c", TEXTOID, -1, 'i'),
-                rel_attr(4, "d", INT4OID, 4, 'i'),
+                rel_attr(1, "a", INT4OID, 4, b'i'),
+                rel_attr(2, "b", INT4OID, 4, b'i'),
+                rel_attr(3, "c", TEXTOID, -1, b'i'),
+                rel_attr(4, "d", INT4OID, 4, b'i'),
             ],
         );
         let mut main_data = vec![0u8; SIZE_OF_HEAP_UPDATE];
@@ -2903,8 +2895,8 @@ mod tests {
         let rel = descriptor(
             16405,
             vec![
-                rel_attr(1, "a", TEXTOID, -1, 'i'),
-                rel_attr(2, "b", INT4OID, 4, 'i'),
+                rel_attr(1, "a", TEXTOID, -1, b'i'),
+                rel_attr(2, "b", INT4OID, 4, b'i'),
             ],
         );
         let mut main_data = vec![0u8; SIZE_OF_HEAP_UPDATE];
@@ -2924,9 +2916,9 @@ mod tests {
         let rel = descriptor(
             16406,
             vec![
-                rel_attr(1, "a", INT4OID, 4, 'i'),
-                rel_attr(2, "b", INT8OID, 8, 'd'),
-                rel_attr(3, "c", INT4OID, 4, 'i'),
+                rel_attr(1, "a", INT4OID, 4, b'i'),
+                rel_attr(2, "b", INT8OID, 8, b'd'),
+                rel_attr(3, "c", INT4OID, 4, b'i'),
             ],
         );
         let mut col_data = 9i32.to_le_bytes().to_vec();
@@ -2946,23 +2938,23 @@ mod tests {
     fn varlena_alignment_skips_zero_pad_per_typalign() {
         let mut long_body = ((64u32) << 2).to_le_bytes().to_vec();
         long_body.extend_from_slice(&[b'x'; 60]);
-        let cases: [(char, Vec<u8>, Datum); 3] = [
-            ('s', short_varlena(b"hi"), build::text("hi")),
-            ('d', short_varlena(b"hi"), build::text("hi")),
+        let cases: [(u8, Vec<u8>, Datum); 3] = [
+            (b's', short_varlena(b"hi"), build::text("hi")),
+            (b'd', short_varlena(b"hi"), build::text("hi")),
             // Character alignment needs no padding; leading zero belongs to header
-            ('c', long_body, build::text("x".repeat(60))),
+            (b'c', long_body, build::text("x".repeat(60))),
         ];
         for (align, value, expect) in cases {
             let rel = descriptor(
                 16407,
                 vec![
-                    rel_attr(1, "f", BOOLOID, 1, 'c'),
+                    rel_attr(1, "f", BOOLOID, 1, b'c'),
                     rel_attr(2, "v", TEXTOID, -1, align),
                 ],
             );
             let pad = match align {
-                's' => 1,
-                'd' => 7,
+                b's' => 1,
+                b'd' => 7,
                 _ => 0,
             };
             let mut col_data = vec![1u8];
@@ -2986,7 +2978,7 @@ mod tests {
 
     #[test]
     fn decode_one_value_malformed_varlena_headers() {
-        let text = rel_attr(1, "t", TEXTOID, -1, 'i');
+        let text = rel_attr(1, "t", TEXTOID, -1, b'i');
         let compressed_short = ((6u32 << 2) | 0b10).to_le_bytes();
         let truncated_cases: [(&str, Vec<u8>); 7] = [
             ("empty", Vec::new()),
@@ -3017,7 +3009,7 @@ mod tests {
 
     #[test]
     fn decode_one_value_cstring_dropped_and_bad_bodies() {
-        let cstring = rel_attr(1, "c", 2275, -2, 'c');
+        let cstring = rel_attr(1, "c", 2275, -2, b'c');
         assert_eq!(
             decode_one_value(&cstring, b"ab\0", 0).unwrap(),
             (Datum::Cstring(b"ab".to_vec()), 3)
@@ -3029,14 +3021,14 @@ mod tests {
         };
         let null3 = (Datum::Null, 3);
         assert_eq!(
-            decode_one_value(&dropped(-1, 'i'), &short_varlena(b"zz"), 0).unwrap(),
+            decode_one_value(&dropped(-1, b'i'), &short_varlena(b"zz"), 0).unwrap(),
             null3
         );
         assert_eq!(
-            decode_one_value(&dropped(-2, 'c'), b"zz\0", 0).unwrap(),
+            decode_one_value(&dropped(-2, b'c'), b"zz\0", 0).unwrap(),
             null3
         );
-        let r = decode_one_value(&dropped(4, 'i'), &[0, 0], 0);
+        let r = decode_one_value(&dropped(4, b'i'), &[0, 0], 0);
         assert!(
             matches!(
                 r,
@@ -3048,7 +3040,7 @@ mod tests {
             ),
             "{r:?}"
         );
-        let r = decode_one_value(&rel_attr(1, "i", INT4OID, 4, 'i'), &[0, 0], 0);
+        let r = decode_one_value(&rel_attr(1, "i", INT4OID, 4, b'i'), &[0, 0], 0);
         assert!(
             matches!(
                 r,
@@ -3069,7 +3061,7 @@ mod tests {
 
     #[test]
     fn fast_default_raw_honours_dataoffset_and_rejects_multidim() {
-        let mut att = rel_attr(1, "x", INT4OID, 4, 'i');
+        let mut att = rel_attr(1, "x", INT4OID, 4, b'i');
         let mut arr = raw_missing_array(INT4OID, &77i32.to_le_bytes());
         arr[8..12].copy_from_slice(&24i32.to_le_bytes());
         att.missing_default = Some(MissingDefault::Raw(arr.clone()));

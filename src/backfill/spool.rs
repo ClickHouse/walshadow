@@ -703,7 +703,7 @@ mod tests {
         spool.push(copy).await.unwrap();
         let out = drain_all(spool).await;
         assert_eq!(out[0].data, TupleData::Copy(row.clone()));
-        let rel = crate::schema::int4_rel(16400, "t", 'r', &[(1, "id"), (2, "e"), (3, "f")]);
+        let rel = crate::schema::int4_rel(16400, "t", b'r', &[(1, "id"), (2, "e"), (3, "f")]);
         assert_eq!(copy_slot(&row, &rel, 1), DatumRef::Send(b"\x01send"));
         assert_eq!(copy_slot(&row, &rel, 2), DatumRef::Null);
     }

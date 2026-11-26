@@ -36,8 +36,8 @@ fn attr(attnum: i16, name: &str, type_oid: u32, not_null: bool) -> RelAttr {
         type_name: "test".into(),
         type_byval: type_oid != TEXTOID,
         type_len: if type_oid == TEXTOID { -1 } else { 4 },
-        type_align: 'i',
-        type_storage: if type_oid == TEXTOID { 'x' } else { 'p' },
+        type_align: b'i',
+        type_storage: if type_oid == TEXTOID { b'x' } else { b'p' },
         missing_default: None,
     }
 }
@@ -53,8 +53,8 @@ fn rel(oid: u32, name: &str, attributes: Vec<RelAttr>) -> RelDescriptor {
         toast_oid: 0,
         namespace_oid: 2200,
         rel_name: RelName::new("public", name),
-        kind: 'r',
-        persistence: 'p',
+        kind: b'r',
+        persistence: b'p',
         ancestors: Vec::new(),
         replident: ReplIdent::Default {
             pk_attnums: Some(vec![1]),
