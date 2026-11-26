@@ -84,9 +84,31 @@ struct PendingXact {
     /// Cumulative parked nanos, against the per-xact hold budget
     hold_nanos: u64,
     degraded: Option<DegradeReason>,
+    /// Boundary the degrade happened at: the first position no slot
+    /// accounts for. Slots before it stay exact; a late degrade must not
+    /// void the coverage earlier boundaries already read
+    degraded_at: Option<u64>,
 }
 
 impl PendingXact {
+    fn degrade(&mut self, reason: DegradeReason, at: u64) -> bool {
+        // Earliest position wins: a member's earlier miss bounds the tree
+        self.degraded_at = Some(self.degraded_at.map_or(at, |d| d.min(at)));
+        if self.degraded.is_some() {
+            return false;
+        }
+        self.degraded = Some(reason);
+        true
+    }
+
+    /// Slots a degrade has not voided
+    fn live<'a>(&self, slots: &'a [PendingSlot]) -> &'a [PendingSlot] {
+        let Some(at) = self.degraded_at else {
+            return slots;
+        };
+        &slots[..slots.partition_point(|s| s.valid_from < at)]
+    }
+
     fn push(&mut self, slot: PendingSlot) {
         let oid = slot.desc.oid;
         let rfn = slot.desc.rfn;
@@ -98,6 +120,10 @@ impl PendingXact {
         self.boundaries += other.boundaries;
         self.hold_nanos += other.hold_nanos;
         self.degraded = self.degraded.or(other.degraded);
+        self.degraded_at = match (self.degraded_at, other.degraded_at) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
         for slot in other.chains.into_values().flatten() {
             let rfn = slot.desc.rfn;
             insert_sorted(self.chains.entry(rfn).or_default(), slot);
@@ -147,26 +173,42 @@ pub struct PendingCatalog {
 
 /// What one transaction's timeline says at promotion
 pub struct PromotedXact {
-    /// Per-oid chains, ascending by `valid_from`, oids ascending
+    /// Per-oid chains, ascending by `valid_from`, oids ascending. Slots at
+    /// or past `degraded_at` are already cut
     pub by_oid: Vec<(Oid, Vec<PendingSlot>)>,
     pub degraded: Option<DegradeReason>,
+    pub degraded_at: Option<u64>,
+}
+
+/// Span of one relation's dirty interval the timeline answers for
+#[derive(Debug, Clone, Copy)]
+pub struct Coverage<'a> {
+    /// First boundary that named the relation
+    pub from: u64,
+    /// Where a degrade cut the timeline; `None` runs to commit
+    pub until: Option<u64>,
+    /// Last shape recorded before `until`: what the uncovered tail was
+    /// written under, up to whatever the missed boundary changed
+    pub last: &'a RelDescriptor,
 }
 
 impl PromotedXact {
-    /// LSN from which the timeline answers for `oid`, `None` when it does
-    /// not. From the first boundary that named the relation on, each slot
-    /// covers up to the next; before it, the transaction had not reached a
+    /// Span the timeline answers for `oid`, `None` when it names no slot.
+    /// From the first boundary that named the relation on, each slot covers
+    /// up to the next; before it, the transaction had not reached a
     /// `CommandCounterIncrement`, so the pre-transaction shape still reads
     /// its rows.
     ///
-    /// A degraded transaction missed at least one boundary, and a missed
-    /// boundary is a shape change nothing recorded, so none of its interval
-    /// is covered
-    pub fn coverage_from(&self, oid: Oid) -> Option<u64> {
-        if self.degraded.is_some() {
-            return None;
-        }
-        self.slots_for(oid).first().map(|s| s.valid_from)
+    /// A degrade missed a boundary, a shape change nothing recorded, so
+    /// coverage stops there. Slots read before it stay exact: rows they
+    /// cover were written under them whatever came later
+    pub fn coverage(&self, oid: Oid) -> Option<Coverage<'_>> {
+        let slots = self.slots_for(oid);
+        Some(Coverage {
+            from: slots.first()?.valid_from,
+            until: self.degraded_at,
+            last: &slots.last()?.desc,
+        })
     }
 
     /// One relation's shapes, ascending by `valid_from`
@@ -185,6 +227,7 @@ impl PendingCatalog {
     pub fn admit(
         &self,
         top_xid: u32,
+        at: u64,
         max_boundaries: u32,
         hold_budget_nanos: u64,
     ) -> Result<(), Option<DegradeReason>> {
@@ -201,7 +244,7 @@ impl PendingCatalog {
             None
         };
         if let Some(reason) = over {
-            xact.degraded = Some(reason);
+            xact.degrade(reason, at);
             return Err(Some(reason));
         }
         xact.boundaries += 1;
@@ -214,15 +257,18 @@ impl PendingCatalog {
         map.entry(top_xid).or_default().hold_nanos += nanos;
     }
 
-    /// First reason sticks; `true` when this call is what degraded it
-    pub fn degrade(&self, top_xid: u32, reason: DegradeReason) -> bool {
+    /// Degrade at boundary `at`. First reason sticks, earliest position
+    /// wins; `true` when this call is what degraded it
+    pub fn degrade(&self, top_xid: u32, reason: DegradeReason, at: u64) -> bool {
         let mut map = self.by_xid.write().expect("pending catalog poisoned");
-        let xact = map.entry(top_xid).or_default();
-        if xact.degraded.is_some() {
-            return false;
-        }
-        xact.degraded = Some(reason);
-        true
+        map.entry(top_xid).or_default().degrade(reason, at)
+    }
+
+    /// First position the timeline no longer answers for, `None` while it
+    /// answers through commit
+    pub fn degraded_at(&self, top_xid: u32) -> Option<u64> {
+        let map = self.by_xid.read().expect("pending catalog poisoned");
+        map.get(&top_xid).and_then(|x| x.degraded_at)
     }
 
     pub fn degraded(&self, top_xid: u32) -> Option<DegradeReason> {
@@ -251,8 +297,8 @@ impl PendingCatalog {
         lsn: u64,
     ) -> Option<Arc<RelDescriptor>> {
         let map = self.by_xid.read().expect("pending catalog poisoned");
-        let chain = map.get(&top_xid)?.chains.get(&rfn)?;
-        chain
+        let xact = map.get(&top_xid)?;
+        xact.live(xact.chains.get(&rfn)?)
             .iter()
             .rev()
             .find(|s| s.valid_from <= lsn)
@@ -268,13 +314,13 @@ impl PendingCatalog {
             .is_some_and(|x| x.chains.contains_key(&rfn))
     }
 
-    /// One filenode's whole chain, for a caller folding many records against
-    /// it. Empty when the transaction has no pending coverage of it
+    /// One filenode's chain up to any degrade, for a caller folding many
+    /// records against it. Empty when the transaction has no pending
+    /// coverage of it
     pub fn chain(&self, top_xid: u32, rfn: RelFileNode) -> Vec<PendingSlot> {
         let map = self.by_xid.read().expect("pending catalog poisoned");
         map.get(&top_xid)
-            .and_then(|x| x.chains.get(&rfn))
-            .cloned()
+            .and_then(|x| Some(x.live(x.chains.get(&rfn)?).to_vec()))
             .unwrap_or_default()
     }
 
@@ -304,12 +350,14 @@ impl PendingCatalog {
         let mut by_oid: Vec<(Oid, Vec<PendingSlot>)> = xact
             .by_oid
             .iter()
-            .map(|(oid, slots)| (*oid, slots.clone()))
+            .map(|(oid, slots)| (*oid, xact.live(slots).to_vec()))
+            .filter(|(_, slots)| !slots.is_empty())
             .collect();
         by_oid.sort_unstable_by_key(|(oid, _)| *oid);
         Some(PromotedXact {
             by_oid,
             degraded: xact.degraded,
+            degraded_at: xact.degraded_at,
         })
     }
 
@@ -440,7 +488,7 @@ mod tests {
         // Child captured before its assignment named the top
         p.record(101, vec![slot(200, 101, desc(16400, 7000, "child"))]);
         p.record(100, vec![slot(400, 100, desc(16400, 7000, "top"))]);
-        p.degrade(101, DegradeReason::QueryError);
+        p.degrade(101, DegradeReason::QueryError, 500);
         p.consolidate(100, &[100, 101]);
         assert_eq!(p.tracked_xacts(), 1);
         let chain = p.chain(100, rfn);
@@ -466,23 +514,23 @@ mod tests {
     #[test]
     fn admit_caps_boundaries_then_degrades() {
         let p = PendingCatalog::default();
-        assert_eq!(p.admit(100, 2, u64::MAX), Ok(()));
-        assert_eq!(p.admit(100, 2, u64::MAX), Ok(()));
+        assert_eq!(p.admit(100, 0, 2, u64::MAX), Ok(()));
+        assert_eq!(p.admit(100, 0, 2, u64::MAX), Ok(()));
         assert_eq!(
-            p.admit(100, 2, u64::MAX),
+            p.admit(100, 0, 2, u64::MAX),
             Err(Some(DegradeReason::CapExceeded))
         );
         assert_eq!(p.degraded(100), Some(DegradeReason::CapExceeded));
-        assert_eq!(p.admit(100, 8, u64::MAX), Err(None), "degrade is sticky");
+        assert_eq!(p.admit(100, 0, 8, u64::MAX), Err(None), "degrade is sticky");
     }
 
     #[test]
     fn admit_stops_at_the_hold_budget() {
         let p = PendingCatalog::default();
-        assert_eq!(p.admit(100, 64, 1_000), Ok(()));
+        assert_eq!(p.admit(100, 0, 64, 1_000), Ok(()));
         p.charge_hold(100, 1_500);
         assert_eq!(
-            p.admit(100, 64, 1_000),
+            p.admit(100, 0, 64, 1_000),
             Err(Some(DegradeReason::HoldBudget))
         );
         assert_eq!(p.degraded(100), Some(DegradeReason::HoldBudget));
@@ -494,19 +542,56 @@ mod tests {
         p.record(100, vec![slot(400, 100, desc(16400, 7000, "t"))]);
         p.record(100, vec![slot(200, 100, desc(16400, 7000, "t"))]);
         let promoted = p.promoted(100).expect("tree");
-        assert_eq!(promoted.coverage_from(16400), Some(200));
-        assert_eq!(
-            promoted.coverage_from(16401),
-            None,
+        let cov = promoted.coverage(16400).expect("covered");
+        assert_eq!((cov.from, cov.until), (200, None));
+        assert!(
+            promoted.coverage(16401).is_none(),
             "oid with no slot is uncovered"
-        );
-        p.degrade(100, DegradeReason::CaptureAll);
-        assert_eq!(
-            p.promoted(100).expect("tree").coverage_from(16400),
-            None,
-            "a missed boundary is a shape change nothing recorded",
         );
         assert_eq!(p.forget_tree(100), 2);
         assert!(p.promoted(100).is_none());
+    }
+
+    /// A degrade cuts the timeline at its boundary: slots read before it
+    /// keep answering, nothing at or past it does
+    #[test]
+    fn late_degrade_keeps_earlier_slots() {
+        let p = PendingCatalog::default();
+        let rfn = desc(16400, 7000, "t").rfn;
+        p.record(100, vec![slot(200, 100, desc(16400, 7000, "added"))]);
+        p.record(100, vec![slot(400, 100, desc(16400, 7000, "not_null"))]);
+        assert!(p.degrade(100, DegradeReason::CaptureAll, 600));
+        let promoted = p.promoted(100).expect("tree");
+        let cov = promoted.coverage(16400).expect("pre-degrade slots stay");
+        assert_eq!((cov.from, cov.until), (200, Some(600)));
+        assert_eq!(&*cov.last.rel_name.name, "not_null");
+        assert_eq!(p.chain(100, rfn).len(), 2);
+
+        // A member's earlier miss bounds the whole tree, and voids the slot
+        // past it
+        p.record(101, vec![]);
+        assert!(p.degrade(101, DegradeReason::QueryError, 300));
+        p.consolidate(100, &[100, 101]);
+        assert_eq!(p.degraded_at(100), Some(300));
+        assert_eq!(p.degraded(100), Some(DegradeReason::CaptureAll));
+        let promoted = p.promoted(100).expect("tree");
+        let cov = promoted.coverage(16400).expect("slot before 300 stays");
+        assert_eq!((cov.from, cov.until), (200, Some(300)));
+        assert_eq!(&*cov.last.rel_name.name, "added");
+        assert_eq!(p.chain(100, rfn).len(), 1);
+        assert!(
+            p.descriptor_at(100, rfn, 450)
+                .is_some_and(|d| &*d.rel_name.name == "added")
+        );
+    }
+
+    /// Degrade before any boundary named the relation leaves nothing
+    #[test]
+    fn early_degrade_leaves_no_coverage() {
+        let p = PendingCatalog::default();
+        assert!(p.degrade(100, DegradeReason::ReplayMismatch, 100));
+        assert_eq!(p.admit(100, 200, 64, u64::MAX), Err(None), "sticky");
+        p.record(100, vec![slot(200, 100, desc(16400, 7000, "t"))]);
+        assert!(p.promoted(100).expect("tree").coverage(16400).is_none());
     }
 }

@@ -57,7 +57,7 @@ use crate::catalog::desc_log::{
     Ambiguity, AmbiguityReason, AmbiguityScope, BatchRecord, DescriptorLog, LogEntry, LogValue,
     ObservationKind, RelationObservation,
 };
-use crate::catalog::pending::{DegradeReason, PendingCatalog, PendingSlot};
+use crate::catalog::pending::{Coverage, DegradeReason, PendingCatalog, PendingSlot};
 use crate::catalog::shadow_catalog::{CatalogError, ParkedAt, ShadowCatalog};
 #[cfg(feature = "test-support")]
 use crate::crash_test;
@@ -195,7 +195,7 @@ impl CatalogCapture {
         // rather than skips silently — an xact straddling the horizon would
         // otherwise claim coverage over boundaries nothing read
         if next_lsn <= self.log.covered_through() {
-            self.degrade(info.drain_xid, DegradeReason::ReplayMismatch);
+            self.degrade(info.drain_xid, DegradeReason::ReplayMismatch, next_lsn);
             return false;
         }
         // Whole-relcache flush or a namespace catcache hit names no
@@ -203,29 +203,48 @@ impl CatalogCapture {
         // that makes holds expensive. Filter emits a command boundary only
         // when it names relations or is one of those
         if info.capture_all {
-            self.degrade(info.drain_xid, DegradeReason::CaptureAll);
+            self.degrade(info.drain_xid, DegradeReason::CaptureAll, next_lsn);
+            return false;
+        }
+        if info.oids.is_empty() {
             return false;
         }
         match self.pending.admit(
             info.drain_xid,
+            next_lsn,
             self.pending_cfg.max_boundaries_per_xact,
             self.pending_cfg.max_hold_per_xact.as_nanos() as u64,
         ) {
             Ok(()) => true,
             Err(reason) => {
                 if let Some(reason) = reason {
-                    self.stats.count_degrade(reason);
+                    self.degraded(info.drain_xid, reason, next_lsn, None);
                 }
                 false
             }
         }
     }
 
-    /// Count a degrade only for the boundary that caused it
-    fn degrade(&self, xid: u32, reason: DegradeReason) {
-        if self.pending.degrade(xid, reason) {
-            self.stats.count_degrade(reason);
+    /// Degrade `xid`'s timeline at boundary `at`, counting and logging only
+    /// the call that degraded it
+    fn degrade(&self, xid: u32, reason: DegradeReason, at: u64) {
+        if self.pending.degrade(xid, reason, at) {
+            self.degraded(xid, reason, at, None);
         }
+    }
+
+    /// One degrade, once: every path leaves the same trail, so a missing
+    /// log line never hides why a fence later spans the transaction
+    fn degraded(&self, xid: u32, reason: DegradeReason, at: u64, err: Option<&CatalogError>) {
+        self.stats.count_degrade(reason);
+        tracing::warn!(
+            target: "walshadow::desc_log",
+            xid,
+            boundary = format_args!("{at:#X}"),
+            reason = reason.label(),
+            err = err.map(tracing::field::display),
+            "pending capture degraded, timeline cut at this boundary",
+        );
     }
 
     /// Charge a released command-boundary hold against the transaction's
@@ -412,16 +431,9 @@ impl CatalogCapture {
             Err(e) => {
                 let reason = degrade_reason(&e);
                 // Admitted, so not degraded before this read
-                self.pending.degrade(top_xid, reason);
-                self.stats.count_degrade(reason);
-                tracing::warn!(
-                    target: "walshadow::desc_log",
-                    xid = top_xid,
-                    boundary = format_args!("{next_lsn:#X}"),
-                    reason = reason.label(),
-                    err = %e,
-                    "pending capture degraded, commit-time capture stands",
-                );
+                if self.pending.degrade(top_xid, reason, next_lsn) {
+                    self.degraded(top_xid, reason, next_lsn, Some(&e));
+                }
                 return Ok(());
             }
         };
@@ -623,15 +635,9 @@ impl CatalogCapture {
                             // which is what the fence protects: the exact
                             // mutation position inside that run is still
                             // unknown
-                            let covered_from = promoted.as_ref().and_then(|p| p.coverage_from(oid));
-                            let (from, published, incompat) = in_place_verdict(
-                                pred,
-                                desc,
-                                oid,
-                                first_touch,
-                                next_lsn,
-                                covered_from,
-                            );
+                            let coverage = promoted.as_ref().and_then(|p| p.coverage(oid));
+                            let (from, published, incompat) =
+                                in_place_verdict(pred, desc, oid, first_touch, next_lsn, coverage);
                             valid_from = from;
                             if let Some(why) = incompat.filter(|i| !i.is_physical()) {
                                 tracing::debug!(
@@ -643,12 +649,23 @@ impl CatalogCapture {
                                 );
                             }
                             if !published.is_empty() {
+                                // Siblings pair per span: log each span once,
+                                // as published, not the whole dirty interval
+                                let spans: Vec<String> = published
+                                    .iter()
+                                    .step_by(2)
+                                    .map(|a| format!("[{:#X}, {:#X})", a.from_lsn, a.through_lsn))
+                                    .collect();
                                 tracing::warn!(
                                     target: "walshadow::desc_log",
                                     oid,
                                     rel = %desc.rel_name,
                                     from = format_args!("{first_touch:#X}"),
                                     through = format_args!("{next_lsn:#X}"),
+                                    spans = spans.join(" "),
+                                    degraded_at = coverage
+                                        .and_then(|c| c.until)
+                                        .map(|u| format!("{u:#X}")),
                                     why = incompat.map_or("", |i| i.why()),
                                     "in-place change not provably decodable, ambiguity published",
                                 );
@@ -762,49 +779,67 @@ fn degrade_reason(err: &CatalogError) -> DegradeReason {
 /// version answers from `next_lsn`, keeping the post-commit descriptor
 /// usable over the ambiguous interval.
 ///
-/// `covered_from` is where this transaction's own timeline starts answering
-/// for the relation, which ends the fence there: the promoted slots are
-/// exact shapes at exact positions, so only the run before the first of them
-/// has an unknown mutation position left in it. An empty run publishes
-/// nothing.
+/// `coverage` is the span this transaction's own timeline answers for the
+/// relation. Its start ends the head fence: the promoted slots are exact
+/// shapes at exact positions, so only the run before the first of them has
+/// an unknown mutation position left in it, and that run was written under
+/// `pred`. An empty run publishes nothing.
+///
+/// A degrade cuts the span at its boundary. Rows past the cut decode under
+/// the commit shape, so the tail is judged against the last shape recorded
+/// before the cut, the one those rows were written under up to the missed
+/// change. Uncovered entirely, the head runs to commit, as before.
 ///
 /// A benign reject (declared shape drifted, every byte reads the same)
 /// keeps bias-early and publishes nothing. A physical one publishes one
 /// interval per identity key so the rfn-keyed decode path and the oid-keyed
 /// truncate path agree; order is fixed, batch equality and digest are
-/// order-sensitive
+/// order-sensitive. The returned verdict is the head's, else the tail's
 fn in_place_verdict(
     pred: &RelDescriptor,
     fin: &RelDescriptor,
     oid: Oid,
     first_touch: u64,
     next_lsn: u64,
-    covered_from: Option<u64>,
+    coverage: Option<Coverage<'_>>,
 ) -> (u64, Vec<Ambiguity>, Option<Incompat>) {
-    let Err(incompat) = crate::catalog::compat::compatible_reader(pred, fin) else {
-        return (first_touch, Vec::new(), None);
-    };
-    if !incompat.is_physical() {
-        return (first_touch, Vec::new(), Some(incompat));
+    let head = crate::catalog::compat::compatible_reader(pred, fin).err();
+    let tail = coverage
+        .and_then(|c| Some((c.until.filter(|u| *u < next_lsn)?, c.last)))
+        .and_then(|(until, last)| {
+            let incompat = crate::catalog::compat::compatible_reader(last, fin).err()?;
+            Some((until, incompat))
+        });
+    let mut spans: Vec<(u64, u64)> = Vec::with_capacity(2);
+    if head.is_some_and(|i| i.is_physical()) {
+        let through = coverage.map_or(next_lsn, |c| c.from).min(next_lsn);
+        if through > first_touch {
+            spans.push((first_touch, through));
+        }
     }
-    let through_lsn = covered_from.unwrap_or(next_lsn).min(next_lsn);
-    if through_lsn <= first_touch {
-        return (next_lsn, Vec::new(), Some(incompat));
+    if let Some((until, incompat)) = tail
+        && incompat.is_physical()
+    {
+        spans.push((until.max(first_touch), next_lsn));
     }
-    let interval = |scope| Ambiguity {
-        scope,
-        from_lsn: first_touch,
-        through_lsn,
-        reason: AmbiguityReason::UnknownMutationPosition,
+    let valid_from = if head.is_some_and(|i| i.is_physical()) {
+        next_lsn
+    } else {
+        first_touch
     };
-    (
-        next_lsn,
-        vec![
-            interval(AmbiguityScope::Rfn(fin.rfn)),
-            interval(AmbiguityScope::Oid(oid)),
-        ],
-        Some(incompat),
-    )
+    let incompat = head.or(tail.map(|(_, i)| i));
+    let published = spans
+        .into_iter()
+        .flat_map(|(from_lsn, through_lsn)| {
+            [AmbiguityScope::Rfn(fin.rfn), AmbiguityScope::Oid(oid)].map(|scope| Ambiguity {
+                scope,
+                from_lsn,
+                through_lsn,
+                reason: AmbiguityReason::UnknownMutationPosition,
+            })
+        })
+        .collect();
+    (valid_from, published, incompat)
 }
 
 /// Added / Changed for heap kinds; toast shape changes are internal (chunk
@@ -915,7 +950,8 @@ mod tests {
     fn pending_coverage_shrinks_the_fence_to_the_pre_boundary_run() {
         let pred = rel(23, 4, "t");
         let fin = rel(20, 8, "t");
-        let (from, published, _) = in_place_verdict(&pred, &fin, 42, 100, 500, Some(200));
+        let (from, published, _) =
+            in_place_verdict(&pred, &fin, 42, 100, 500, Some(cov(200, None, &fin)));
         assert_eq!(from, 500);
         assert_eq!(published.len(), 2, "both identity keys still filed");
         for amb in &published {
@@ -931,10 +967,74 @@ mod tests {
     fn coverage_from_the_first_touch_publishes_nothing() {
         let pred = rel(23, 4, "t");
         let fin = rel(20, 8, "t");
-        let (from, published, incompat) = in_place_verdict(&pred, &fin, 42, 100, 500, Some(100));
+        let (from, published, incompat) =
+            in_place_verdict(&pred, &fin, 42, 100, 500, Some(cov(100, None, &fin)));
         assert_eq!(from, 500);
         assert!(published.is_empty(), "empty run needs no fence");
         assert!(incompat.is_some_and(|i| i.is_physical()));
+    }
+
+    fn cov<'a>(from: u64, until: Option<u64>, last: &'a RelDescriptor) -> Coverage<'a> {
+        Coverage { from, until, last }
+    }
+
+    /// The incident shape: coverage from the first boundary, then a late
+    /// `capture_all` degrade after the last shape change. The tail past the
+    /// cut was written under the last recorded shape, which is the commit
+    /// shape, so only the head run stays fenced
+    #[test]
+    fn late_degrade_keeps_the_covered_middle_unfenced() {
+        let pred = rel(23, 4, "t");
+        let fin = rel(20, 8, "t");
+        let (from, published, incompat) =
+            in_place_verdict(&pred, &fin, 42, 100, 500, Some(cov(200, Some(450), &fin)));
+        assert_eq!(from, 500);
+        assert!(incompat.is_some_and(|i| i.is_physical()));
+        let spans: Vec<(u64, u64)> = published
+            .iter()
+            .map(|a| (a.from_lsn, a.through_lsn))
+            .collect();
+        assert_eq!(spans, vec![(100, 200), (100, 200)], "head only, both keys");
+    }
+
+    /// Head fine, but the missed boundary leaves a tail whose last recorded
+    /// shape no commit-shape reader proves: only the tail fences, and
+    /// bias-early survives for the head
+    #[test]
+    fn late_degrade_fences_an_unproven_tail_only() {
+        let pred = rel(23, 4, "t");
+        let fin = rel(23, 4, "renamed");
+        let mid = rel(20, 8, "t");
+        let (from, published, incompat) =
+            in_place_verdict(&pred, &fin, 42, 100, 500, Some(cov(200, Some(450), &mid)));
+        assert_eq!(from, 100, "head reads identically, bias-early kept");
+        assert!(
+            incompat.is_some_and(|i| i.is_physical()),
+            "tail verdict surfaces"
+        );
+        let scopes: Vec<AmbiguityScope> = published.iter().map(|a| a.scope).collect();
+        assert_eq!(
+            scopes,
+            vec![AmbiguityScope::Rfn(fin.rfn), AmbiguityScope::Oid(42)]
+        );
+        for amb in &published {
+            assert_eq!((amb.from_lsn, amb.through_lsn), (450, 500));
+        }
+    }
+
+    /// Both runs unproven: two spans per key, head first
+    #[test]
+    fn late_degrade_with_unproven_head_and_tail_fences_both() {
+        let pred = rel(23, 4, "t");
+        let fin = rel(20, 8, "t");
+        let mid = rel(1082, 4, "t");
+        let (_, published, _) =
+            in_place_verdict(&pred, &fin, 42, 100, 500, Some(cov(200, Some(450), &mid)));
+        let spans: Vec<(u64, u64)> = published
+            .iter()
+            .map(|a| (a.from_lsn, a.through_lsn))
+            .collect();
+        assert_eq!(spans, vec![(100, 200), (100, 200), (450, 500), (450, 500)]);
     }
 
     /// `ATTACH` and identity changes alter no column, yet decide routing

@@ -16,6 +16,14 @@
 //!    the generation's smgr marker
 //! 3. `savepoint_rollback_drops_its_pending_slots` — a rolled-back savepoint's
 //!    shapes never reach the durable log, and its column never reaches CH
+//! 4. `late_capture_all_keeps_the_earlier_timeline` — the same unproven type
+//!    change, then a `capture_all` boundary (first temp table in the
+//!    session inserts `pg_temp_N`) after the row. The degrade cuts the
+//!    timeline at its own boundary instead of voiding it, so the row still
+//!    lands
+//! 5. `backfill_then_set_not_null_with_late_temp_table_delivers` — the
+//!    production shape: nullable `ADD COLUMN`, backfill `UPDATE`, `SET NOT
+//!    NULL`, then a first temp table, all in one transaction
 //!
 //! `varchar(10)` → `text` is binary coercible, so PG rewrites `atttypid` in
 //! place: same filenode, same walk fields, different type. That is the
@@ -30,6 +38,7 @@ use fx::spawn_txn;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use walshadow::catalog::pending::DegradeReason;
 use walshadow::mapping::NamespaceMapping;
 
 struct Drill {
@@ -354,4 +363,131 @@ async fn namespace_boundaries_degrade_the_xact_once() {
     .await;
     let degraded: Vec<u64> = capture.pending_degraded.iter().map(load).collect();
     assert_eq!(degraded, [1, 0, 0, 0, 0], "one CaptureAll degrade");
+}
+
+fn degraded(capture: &walshadow::catalog_capture::CaptureStats, reason: DegradeReason) -> u64 {
+    let at = DegradeReason::ALL
+        .iter()
+        .position(|r| *r == reason)
+        .expect("known reason");
+    load(&capture.pending_degraded[at])
+}
+
+/// `capture_all` after the last shape change used to void the whole
+/// timeline: the commit shape then had to read the entire dirty interval,
+/// `varchar -> text` is not provably such a reader, and the post-ALTER row
+/// fenced. The degrade now cuts at its own boundary; the row before it keeps
+/// its boundary shape, and the tail past it reads under the commit shape the
+/// last slot already matched
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn late_capture_all_keeps_the_earlier_timeline() {
+    if !fx::tools::requirements_available() {
+        return;
+    }
+    let mut drill = build_drill(
+        fx::Ports::alloc(),
+        "CREATE SCHEMA pc;\n\
+         CREATE TABLE pc.t (id bigint PRIMARY KEY, v varchar(10));\n",
+        "walshadow-pending-late-degrade",
+    )
+    .await;
+    let capture = capture_stats(&drill);
+
+    let driver = spawn_txn(
+        &drill.source,
+        "BEGIN;\n\
+         INSERT INTO pc.t (id, v) VALUES (1, 'pre');\n\
+         ALTER TABLE pc.t ALTER COLUMN v TYPE text;\n\
+         INSERT INTO pc.t (id, v) VALUES (2, 'post');\n\
+         CREATE TEMP TABLE scratch (x int);\n\
+         COMMIT;\n\
+         SELECT pg_switch_wal();\n",
+    );
+    pump_and_drain(&mut drill).await;
+    let _ = driver.join();
+
+    drill.pipeline.shutdown().await.expect("pipeline drains");
+    let _ = drill.shadow.stop();
+    let _ = drill.source.stop();
+
+    fx::wait_query(
+        &drill.ch,
+        "SELECT arrayStringConcat(groupArray(c), ',') FROM (\
+            SELECT concat(toString(id), '=', argMax(v, _lsn)) AS c \
+            FROM walshadow_test.t WHERE _is_deleted = 0 \
+            GROUP BY id ORDER BY id)",
+        "1=pre,2=post",
+        "row before the late degrade decodes under its boundary shape",
+    )
+    .await;
+    assert!(
+        degraded(&capture, DegradeReason::CaptureAll) >= 1,
+        "first temp table in the session hit the capture_all degrade",
+    );
+    assert!(
+        load(&capture.pending_entries_promoted) >= 1,
+        "pre-degrade slot still folded into the commit batch",
+    );
+}
+
+/// The production shape: ADD COLUMN nullable, backfill, SET NOT NULL, then
+/// the first temp table of the session. Commit shape is NOT NULL with no
+/// missing value on the same filenode; every backfill row physically carries
+/// the column, so the whole transaction delivers with no fence
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn backfill_then_set_not_null_with_late_temp_table_delivers() {
+    if !fx::tools::requirements_available() {
+        return;
+    }
+    let mut drill = build_drill(
+        fx::Ports::alloc(),
+        "CREATE SCHEMA pc;\n\
+         CREATE TABLE pc.lots (id int PRIMARY KEY, item uuid NOT NULL);\n\
+         CREATE TABLE pc.t (id bigint PRIMARY KEY, lot_id int NOT NULL);\n\
+         INSERT INTO pc.lots VALUES \
+           (1, '00000000-0000-0000-0000-00000000000a'), \
+           (2, '00000000-0000-0000-0000-00000000000b');\n\
+         INSERT INTO pc.t VALUES (1, 1), (2, 2), (3, 1);\n",
+        "walshadow-pending-backfill-not-null",
+    )
+    .await;
+    let capture = capture_stats(&drill);
+
+    let driver = spawn_txn(
+        &drill.source,
+        "BEGIN;\n\
+         ALTER TABLE pc.t ADD COLUMN item_id uuid;\n\
+         ALTER TABLE pc.t ADD CONSTRAINT t_lot_fk FOREIGN KEY (lot_id) REFERENCES pc.lots(id);\n\
+         UPDATE pc.t f SET item_id = l.item FROM pc.lots l WHERE l.id = f.lot_id;\n\
+         ALTER TABLE pc.t ALTER COLUMN item_id SET NOT NULL;\n\
+         CREATE TEMP TABLE scratch (x int);\n\
+         COMMIT;\n\
+         SELECT pg_switch_wal();\n",
+    );
+    pump_and_drain(&mut drill).await;
+    let _ = driver.join();
+
+    drill.pipeline.shutdown().await.expect("pipeline drains");
+    let _ = drill.shadow.stop();
+    let _ = drill.source.stop();
+
+    fx::wait_query(
+        &drill.ch,
+        "SELECT arrayStringConcat(groupArray(c), ',') FROM (\
+            SELECT concat(toString(id), '=', right(toString(argMax(item_id, _lsn)), 1)) AS c \
+            FROM walshadow_test.t WHERE _is_deleted = 0 \
+            GROUP BY id ORDER BY id)",
+        "1=a,2=b,3=a",
+        "every backfilled row lands with its item_id",
+    )
+    .await;
+    assert!(
+        degraded(&capture, DegradeReason::CaptureAll) >= 1,
+        "first temp table in the session hit the capture_all degrade",
+    );
+    assert_eq!(
+        load(&capture.ambiguities_published),
+        0,
+        "nothing in this transaction is unproven",
+    );
 }

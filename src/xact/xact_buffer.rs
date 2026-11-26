@@ -599,6 +599,10 @@ pub enum StashOutcome {
         /// commit-time descriptor: same-xact `ALTER` then `INSERT` is two
         /// layouts, and only the timeline separates them
         pending: Vec<PendingSlot>,
+        /// Where a degrade cut the timeline. Records at or past it decode
+        /// under the commit-time descriptor: the last slot before the cut
+        /// predates a shape change nothing recorded
+        pending_until: Option<u64>,
     },
 }
 
@@ -634,6 +638,7 @@ impl StashResolved {
             valid_from,
             fence: Vec::new(),
             pending: Vec::new(),
+            pending_until: None,
         };
         outcomes.insert(rfn, outcome);
         Self {
@@ -744,6 +749,7 @@ pub async fn resolve_stash(
                         valid_from,
                         fence,
                         pending: pending.chain(top_xid, rfn),
+                        pending_until: pending.degraded_at(top_xid),
                     },
                 );
             }
@@ -1875,6 +1881,7 @@ impl MergedDrain {
                 valid_from,
                 fence,
                 pending,
+                pending_until,
             }) => {
                 // Shape this record was written under: the xact's own
                 // timeline where it covers the position, the commit-time
@@ -1882,10 +1889,14 @@ impl MergedDrain {
                 // command boundary were written under the pre-xact shape,
                 // which bias-early capture already lands there). PostgreSQL
                 // make_new_heap creates transient pg_temp_<oid>; rewrite swaps
-                // its filenode into owner resolved at commit
+                // its filenode into owner resolved at commit. Past a degrade
+                // cut the timeline no longer answers; capture judged that tail
+                // against the commit shape and fenced it if unproven
+                let timeline = pending_until.is_none_or(|u| raw.source_lsn < u);
                 let (rel, valid_from) = pending
                     .iter()
                     .rev()
+                    .filter(|_| timeline)
                     .find(|s| s.valid_from <= raw.source_lsn && s.desc.oid == rel.oid)
                     .map_or((rel.clone(), *valid_from), |s| {
                         (s.desc.clone(), s.valid_from)
@@ -3755,6 +3766,7 @@ pub(crate) mod raw_fixtures {
                 valid_from: 0x50,
                 fence,
                 pending: Vec::new(),
+                pending_until: None,
             },
         );
         StashResolved {
@@ -3769,6 +3781,7 @@ pub(crate) mod raw_fixtures {
         rfn: RelFileNode,
         rel: Arc<crate::schema::RelDescriptor>,
         pending: Vec<PendingSlot>,
+        pending_until: Option<u64>,
     ) -> StashResolved {
         let mut outcomes = HashMap::new();
         outcomes.insert(
@@ -3778,6 +3791,7 @@ pub(crate) mod raw_fixtures {
                 valid_from: 0x50,
                 fence: Vec::new(),
                 pending,
+                pending_until,
             },
         );
         StashResolved {
@@ -6138,6 +6152,7 @@ mod tests {
                 writer_xid: 1,
                 desc: boundary_shape,
             }],
+            None,
         );
         let mut drain = b
             .drain_committed(stash, 42, 0x2000, &[], false)
@@ -6168,6 +6183,65 @@ mod tests {
         drain.finish().await.unwrap();
     }
 
+    /// A degrade cuts the timeline: records past the cut decode under the
+    /// commit-time resolution, not the last slot before it, which predates
+    /// whatever the missed boundary changed. Records the slot covers before
+    /// the cut keep it
+    #[tokio::test(flavor = "current_thread")]
+    async fn raw_records_past_a_degrade_cut_fold_under_the_commit_shape() {
+        let tmp = tempdir().unwrap();
+        let mut b = XactBuffer::new(cfg(tmp.path().to_path_buf())).unwrap();
+        let boundary_shape = int4_descriptor(16419);
+        let mut commit_shape = (*boundary_shape).clone();
+        let mut extra = commit_shape.attributes[0].clone();
+        extra.attnum = 2;
+        extra.name = "added".into();
+        commit_shape.attributes.push(extra);
+        let rfn = boundary_shape.rfn;
+        for (lsn, v) in [(300, 1), (500, 2)] {
+            b.stash_raw(1, multi_insert_raw(1, lsn, 16419, &[v]))
+                .await
+                .unwrap();
+        }
+        let stash = inject_ordinary_pending(
+            rfn,
+            Arc::new(commit_shape),
+            vec![PendingSlot {
+                valid_from: 200,
+                writer_xid: 1,
+                desc: boundary_shape,
+            }],
+            Some(400),
+        );
+        let mut drain = b
+            .drain_committed(stash, 42, 0x2000, &[], false)
+            .await
+            .unwrap();
+        let batch = drain
+            .next_batch(8, usize::MAX, None)
+            .await
+            .unwrap()
+            .expect("one slice");
+        let shapes: Vec<(u64, usize, u64)> = batch
+            .cells()
+            .unwrap()
+            .iter()
+            .map(|h| {
+                (
+                    h.decoded.source_lsn,
+                    h.descriptor.attributes.len(),
+                    h.descriptor_valid_from,
+                )
+            })
+            .collect();
+        assert_eq!(
+            shapes,
+            vec![(300, 1, 200), (500, 2, 0x50)],
+            "slot answers before the cut, commit shape past it",
+        );
+        drain.finish().await.unwrap();
+    }
+
     /// PostgreSQL rewriting ALTER transfers transient heap's filenode to owner
     #[tokio::test(flavor = "current_thread")]
     async fn raw_rewrite_rows_fold_under_owner() {
@@ -6189,6 +6263,7 @@ mod tests {
                 writer_xid: 1,
                 desc: Arc::new(transient),
             }],
+            None,
         );
         let mut drain = b
             .drain_committed(stash, 42, 0x2000, &[], false)
