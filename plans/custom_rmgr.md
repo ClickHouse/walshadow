@@ -35,13 +35,14 @@ An unarmed callback during crash or archive replay must return without waiting
 Active waits need bounded timeouts and cancellation on session loss. Stale
 sessions must never release or capture another boundary
 
-Do not publish successor decoder work before pending coverage or explicit
-degradation is installed. Resume floor cannot pass unresolved work. Bound armed
-records, ahead WAL, decoder queues, and archive staging independently
+Record the descriptors read at the boundary or the missed read for each
+affected table before publishing later records to the decoder. Keep the
+resume floor behind unresolved work. Bound armed records, ahead WAL,
+decoder queues, and archive staging independently.
 
 If negotiation or arming fails before rewrite, use existing byte hold. If
-failure happens after publication, preserve current rejection/degradation
-behavior without guessing catalog state or leaving startup stuck
+publication already happened and capture fails, record the missed read for
+each affected table and release the startup process.
 
 Retained custom WAL creates a module dependency across restarts, even after
 feature is disabled. Keep module preloaded until those records age out; add
@@ -78,11 +79,12 @@ record end plus matching shared slot before and after scan. Preserve completed
 replay-pointer checks for ordinary scans, another rmgr may be executing outside
 interpose. Validate behavior against each supported PostgreSQL major
 
-Use bounded capture lane: arm and publish bytes, await matching arrival, scan,
-assemble descriptor through existing assembler, install pending coverage or
-degradation, release callback, then publish successor decoder records. Promote
-pending entries durably at commit and discard on abort, no per-command fsync
-requirement. Timeout may release redo but cannot authorize a stale catalog scan
+Use a bounded capture lane. Arm and publish bytes, wait for matching
+arrival, scan the catalog, and reuse the existing descriptor assembler.
+Record the result, release the callback, then publish later decoder
+records. Defer building and syncing descriptor history to commit.
+Discard provisional reads and misses on abort. A timeout may release
+redo. Require a matching replay position for any catalog scan.
 
 Filtered archive may run ahead of pending capture only under descriptor recovery
 rules. When combined with [shadow TOAST](shadow_toast.md), archive publication
@@ -98,8 +100,8 @@ also obeys reclamation gate. Include both gates in [wait-dependency audit](coord
    and byte-hold fallback, disabled by default
 4. Add bounded capture lane and successor publication gate, preserving commit
    promotion and spill/restart floor
-5. Run cross-major fault matrix before opt-in rollout, compare hold cost and
-   degradation rate against current path
+5. Run cross-major fault matrix before opt-in rollout. Compare hold cost
+   and rate of missed reads against current path.
 
 ## Completion
 

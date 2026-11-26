@@ -762,9 +762,9 @@ db_snapshot! {
         "Pending slots folded into a commit's descriptor-log batch.",
     counter pending_entries_dropped_abort_total: u64 =
         "Pending slots dropped with an aborted transaction tree.",
-    counter pending_degraded_by_reason: [u64; 5]
+    counter pending_degraded_by_reason: [u64; DegradeReason::ALL.len()]
         ["reason" = DegradeReason::ALL.map(|reason| reason.label())] =
-        "Transactions degraded to commit-time capture, by reason.",
+        "Transactions with missed catalog reads, grouped by reason for the first miss.",
     gauge desc_log_entries: u64 = "Descriptor-log index entries resident.",
     gauge desc_log_tail_bytes: u64 = "Descriptor-log tail bytes since last checkpoint.",
     gauge desc_log_batches: u64 = "Descriptor-log batches resident.",

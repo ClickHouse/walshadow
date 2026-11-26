@@ -12,26 +12,29 @@
 //! LSN is what does the temporal filtering: the latest uncommitted row
 //! version on the page *is* the state as of the boundary.
 //!
-//! Keys are the tree root as the pump knew it at capture, which for a subxact
-//! whose `XLOG_XACT_ASSIGNMENT` has not arrived is the subxid itself.
-//! [`PendingCatalog::consolidate`] folds those keys into the top at the
-//! commit, where the filter's drained member list names them all.
+//! If capture skips or fails to read a command boundary, record a miss for
+//! each relation it names. PostgreSQL registers a relation cache invalidation
+//! for writes to `pg_class`, `pg_attribute`, `pg_index`, and `pg_constraint`
+//! (`CacheInvalidateHeapTupleCommon` in `src/backend/utils/cache/inval.c`).
+//! A skipped read leaves those relations' definitions unknown until the next
+//! successful read or commit.
+//!
+//! Until `XLOG_XACT_ASSIGNMENT` links a subtransaction to its parent, capture
+//! stores its reads under its own transaction ID. At commit,
+//! [`PendingCatalog::consolidate`] uses the full member list to combine them.
+//! A boundary that refreshes names can only re-read relations stored under
+//! its own key. At commit, record a miss for earlier reads under other keys.
 
 use std::sync::{Arc, RwLock};
 
 use tokio_postgres::types::Oid;
-use walrus::pg::walparser::RelFileNode;
 
 use crate::schema::RelDescriptor;
 use foldhash::HashMap;
 
-/// Why one transaction's pending coverage stopped being trustworthy. Every
-/// reason falls back to commit-time capture, which is sound
+/// Why capture skipped or failed to read a command boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DegradeReason {
-    /// Boundary could not enumerate the relations it touched (whole-relcache
-    /// flush, pg_namespace catcache)
-    CaptureAll,
     /// Transaction passed `pending_max_boundaries_per_xact`
     CapExceeded,
     /// Transaction passed its cumulative hold budget
@@ -43,8 +46,7 @@ pub enum DegradeReason {
 }
 
 impl DegradeReason {
-    pub const ALL: [DegradeReason; 5] = [
-        DegradeReason::CaptureAll,
+    pub const ALL: [DegradeReason; 4] = [
         DegradeReason::CapExceeded,
         DegradeReason::HoldBudget,
         DegradeReason::ReplayMismatch,
@@ -53,7 +55,6 @@ impl DegradeReason {
 
     pub fn label(self) -> &'static str {
         match self {
-            DegradeReason::CaptureAll => "capture_all",
             DegradeReason::CapExceeded => "cap_exceeded",
             DegradeReason::HoldBudget => "hold_budget",
             DegradeReason::ReplayMismatch => "replay_mismatch",
@@ -65,144 +66,170 @@ impl DegradeReason {
 /// One relation's shape at one command boundary of one transaction
 #[derive(Debug, Clone)]
 pub struct PendingSlot {
-    /// First LSN this shape answers for: the boundary, or the generation's
-    /// `XLOG_SMGR_CREATE` marker when the relation was born in this xact
-    pub valid_from: u64,
+    /// LSN where capture read this descriptor.
+    pub boundary: u64,
     /// (Sub)xid current at capture; a subxact abort drops its slots
     pub writer_xid: u32,
     pub desc: Arc<RelDescriptor>,
 }
 
+/// A command boundary where a relation's definition went unread.
+#[derive(Debug, Clone, Copy)]
+struct Miss {
+    at: u64,
+    writer_xid: u32,
+}
+
 /// One transaction tree's timeline
 #[derive(Debug, Default)]
 struct PendingXact {
-    /// Per-filenode chains, ascending by `valid_from`
-    chains: HashMap<RelFileNode, Vec<PendingSlot>>,
+    /// Descriptors by relation OID, sorted by LSN.
     by_oid: HashMap<Oid, Vec<PendingSlot>>,
+    /// Misses by relation OID, sorted by LSN.
+    misses: HashMap<Oid, Vec<Miss>>,
     /// Boundaries admitted, against `pending_max_boundaries_per_xact`
     boundaries: u32,
     /// Cumulative parked nanos, against the per-xact hold budget
     hold_nanos: u64,
-    degraded: Option<DegradeReason>,
+    /// Reason for the first miss, used to count each transaction once.
+    missed: Option<DegradeReason>,
+    /// Namespace changes and relation cache flushes, sorted by LSN.
+    /// Each can refresh names only for relations stored under this key.
+    name_refreshes: Vec<Miss>,
 }
 
 impl PendingXact {
     fn push(&mut self, slot: PendingSlot) {
-        let oid = slot.desc.oid;
-        let rfn = slot.desc.rfn;
-        insert_sorted(self.chains.entry(rfn).or_default(), slot.clone());
-        insert_sorted(self.by_oid.entry(oid).or_default(), slot);
+        let chain = self.by_oid.entry(slot.desc.oid).or_default();
+        // Keep one descriptor per LSN, using the latest read.
+        match chain.binary_search_by_key(&slot.boundary, |s| s.boundary) {
+            Ok(at) => chain[at] = slot,
+            Err(at) => chain.insert(at, slot),
+        }
+    }
+
+    /// Keep the first missed read between successful reads for the same
+    /// writer. Keep other writers' misses for savepoint rollback.
+    fn push_miss(&mut self, oid: Oid, miss: Miss) {
+        let last_read = self
+            .by_oid
+            .get(&oid)
+            .and_then(|c| c.last())
+            .map(|s| s.boundary);
+        let list = self.misses.entry(oid).or_default();
+        let redundant = list
+            .last()
+            .is_some_and(|m| m.writer_xid == miss.writer_xid && last_read.is_none_or(|b| b < m.at));
+        if !redundant {
+            let at = list.partition_point(|m| m.at <= miss.at);
+            list.insert(at, miss);
+        }
     }
 
     fn absorb(&mut self, other: Self) {
+        let stale: Vec<(Oid, Miss)> = unrefreshed(&self.name_refreshes, &other)
+            .chain(unrefreshed(&other.name_refreshes, self))
+            .collect();
+        self.name_refreshes.extend(other.name_refreshes);
         self.boundaries += other.boundaries;
         self.hold_nanos += other.hold_nanos;
-        self.degraded = self.degraded.or(other.degraded);
-        for slot in other.chains.into_values().flatten() {
-            let rfn = slot.desc.rfn;
-            insert_sorted(self.chains.entry(rfn).or_default(), slot);
+        self.missed = self.missed.or(other.missed);
+        for slot in other.by_oid.into_values().flatten() {
+            self.push(slot);
         }
-        for (oid, slots) in other.by_oid {
-            let chain = self.by_oid.entry(oid).or_default();
-            for slot in slots {
-                insert_sorted(chain, slot);
-            }
+        for (oid, misses) in other.misses {
+            let list = self.misses.entry(oid).or_default();
+            list.extend(misses);
+            list.sort_unstable_by_key(|m| m.at);
+        }
+        for (oid, miss) in stale {
+            let list = self.misses.entry(oid).or_default();
+            let at = list.partition_point(|m| m.at <= miss.at);
+            list.insert(at, miss);
         }
     }
 
     fn slots(&self) -> usize {
-        self.chains.values().map(Vec::len).sum()
+        self.by_oid.values().map(Vec::len).sum()
     }
 
-    /// Drop every slot written by a member of the aborting subtree
+    /// Drop reads and misses from the aborted subtransaction and its children.
     fn drop_writers(&mut self, members: &[u32]) -> usize {
         let before = self.slots();
-        let keep =
-            |slots: &mut Vec<PendingSlot>| slots.retain(|s| !members.contains(&s.writer_xid));
-        self.chains.values_mut().for_each(keep);
-        self.chains.retain(|_, slots| !slots.is_empty());
-        self.by_oid.values_mut().for_each(keep);
+        self.by_oid
+            .values_mut()
+            .for_each(|s| s.retain(|s| !members.contains(&s.writer_xid)));
         self.by_oid.retain(|_, slots| !slots.is_empty());
+        self.misses
+            .values_mut()
+            .for_each(|m| m.retain(|m| !members.contains(&m.writer_xid)));
+        self.misses.retain(|_, misses| !misses.is_empty());
+        self.name_refreshes
+            .retain(|r| !members.contains(&r.writer_xid));
         before - self.slots()
     }
 }
 
-/// Chains stay `valid_from`-ascending. A re-capture at the same position
-/// (same command boundary re-read) replaces rather than appends: two shapes
-/// at one LSN have no order between them
-fn insert_sorted(chain: &mut Vec<PendingSlot>, slot: PendingSlot) {
-    match chain.binary_search_by_key(&slot.valid_from, |s| s.valid_from) {
-        Ok(at) => chain[at] = slot,
-        Err(at) => chain.insert(at, slot),
-    }
+/// Find earlier reads in `side` that these name refreshes could not reach.
+fn unrefreshed<'a>(
+    refreshes: &'a [Miss],
+    side: &'a PendingXact,
+) -> impl Iterator<Item = (Oid, Miss)> + 'a {
+    refreshes.iter().flat_map(move |r| {
+        side.by_oid
+            .iter()
+            .filter(move |(_, chain)| chain.first().is_some_and(|s| s.boundary < r.at))
+            .map(move |(oid, _)| (*oid, *r))
+    })
 }
 
-/// Speculative catalog state for every in-flight catalog-dirty transaction.
-/// Pump writes at command boundaries, the commit drain reads, and both the
-/// abort record (pump) and the finished drain (reorder) remove
+/// Catalog reads and misses for transactions with uncommitted catalog changes.
+/// Clear them on abort or after draining the commit.
 #[derive(Debug, Default)]
 pub struct PendingCatalog {
     by_xid: RwLock<HashMap<u32, PendingXact>>,
 }
 
-/// What one transaction's timeline says at promotion
+/// Catalog reads and misses ready to include in a commit batch.
 pub struct PromotedXact {
-    /// Per-oid chains, ascending by `valid_from`, oids ascending
-    pub by_oid: Vec<(Oid, Vec<PendingSlot>)>,
-    pub degraded: Option<DegradeReason>,
+    /// Descriptors sorted by relation OID, then LSN.
+    by_oid: Vec<(Oid, Vec<PendingSlot>)>,
+    /// Misses sorted by relation OID, then LSN.
+    misses: Vec<(Oid, Vec<u64>)>,
 }
 
 impl PromotedXact {
-    /// LSN from which the timeline answers for `oid`, `None` when it does
-    /// not. From the first boundary that named the relation on, each slot
-    /// covers up to the next; before it, the transaction had not reached a
-    /// `CommandCounterIncrement`, so the pre-transaction shape still reads
-    /// its rows.
-    ///
-    /// A degraded transaction missed at least one boundary, and a missed
-    /// boundary is a shape change nothing recorded, so none of its interval
-    /// is covered
-    pub fn coverage_from(&self, oid: Oid) -> Option<u64> {
-        if self.degraded.is_some() {
-            return None;
-        }
-        self.slots_for(oid).first().map(|s| s.valid_from)
-    }
-
-    /// One relation's shapes, ascending by `valid_from`
+    /// Descriptors read for this relation, sorted by LSN.
     pub fn slots_for(&self, oid: Oid) -> &[PendingSlot] {
         self.by_oid
             .binary_search_by_key(&oid, |(o, _)| *o)
             .map_or(&[][..], |at| &self.by_oid[at].1)
     }
+
+    /// Missed reads for this relation, sorted by LSN.
+    pub fn misses_for(&self, oid: Oid) -> &[u64] {
+        self.misses
+            .binary_search_by_key(&oid, |(o, _)| *o)
+            .map_or(&[][..], |at| &self.misses[at].1)
+    }
 }
 
 impl PendingCatalog {
-    /// Admit one command boundary against the transaction's caps. Refusal
-    /// degrades the transaction: a boundary the daemon declines to read is a
-    /// shape change it cannot account for. `Err(Some(reason))` when this
-    /// call is what degraded it, `Err(None)` when it already was
+    /// Reserve a catalog read if the transaction has room under both limits.
+    /// Return the limit reached so the caller can record the miss.
     pub fn admit(
         &self,
         top_xid: u32,
         max_boundaries: u32,
         hold_budget_nanos: u64,
-    ) -> Result<(), Option<DegradeReason>> {
+    ) -> Result<(), DegradeReason> {
         let mut map = self.by_xid.write().expect("pending catalog poisoned");
         let xact = map.entry(top_xid).or_default();
-        if xact.degraded.is_some() {
-            return Err(None);
+        if xact.boundaries >= max_boundaries {
+            return Err(DegradeReason::CapExceeded);
         }
-        let over = if xact.boundaries >= max_boundaries {
-            Some(DegradeReason::CapExceeded)
-        } else if xact.hold_nanos >= hold_budget_nanos {
-            Some(DegradeReason::HoldBudget)
-        } else {
-            None
-        };
-        if let Some(reason) = over {
-            xact.degraded = Some(reason);
-            return Err(Some(reason));
+        if xact.hold_nanos >= hold_budget_nanos {
+            return Err(DegradeReason::HoldBudget);
         }
         xact.boundaries += 1;
         Ok(())
@@ -214,20 +241,24 @@ impl PendingCatalog {
         map.entry(top_xid).or_default().hold_nanos += nanos;
     }
 
-    /// First reason sticks; `true` when this call is what degraded it
-    pub fn degrade(&self, top_xid: u32, reason: DegradeReason) -> bool {
+    /// Record a missed read at `at` for each OID. Return `true` on the first
+    /// miss for this transaction.
+    pub fn miss(
+        &self,
+        top_xid: u32,
+        writer_xid: u32,
+        oids: &[Oid],
+        at: u64,
+        reason: DegradeReason,
+    ) -> bool {
         let mut map = self.by_xid.write().expect("pending catalog poisoned");
         let xact = map.entry(top_xid).or_default();
-        if xact.degraded.is_some() {
-            return false;
+        for oid in oids {
+            xact.push_miss(*oid, Miss { at, writer_xid });
         }
-        xact.degraded = Some(reason);
-        true
-    }
-
-    pub fn degraded(&self, top_xid: u32) -> Option<DegradeReason> {
-        let map = self.by_xid.read().expect("pending catalog poisoned");
-        map.get(&top_xid).and_then(|x| x.degraded)
+        let first = xact.missed.is_none();
+        xact.missed = xact.missed.or(Some(reason));
+        first
     }
 
     /// Install one boundary's shapes
@@ -242,40 +273,24 @@ impl PendingCatalog {
         }
     }
 
-    /// Shape `top_xid` sees for `rfn` at `lsn`, `None` before its first
-    /// boundary — where the committed chain is the answer
-    pub fn descriptor_at(
-        &self,
-        top_xid: u32,
-        rfn: RelFileNode,
-        lsn: u64,
-    ) -> Option<Arc<RelDescriptor>> {
-        let map = self.by_xid.read().expect("pending catalog poisoned");
-        let chain = map.get(&top_xid)?.chains.get(&rfn)?;
-        chain
-            .iter()
-            .rev()
-            .find(|s| s.valid_from <= lsn)
-            .map(|s| s.desc.clone())
+    /// Record a name refresh. Multiple capture workers can report the same LSN.
+    pub fn name_refresh(&self, top_xid: u32, writer_xid: u32, at: u64) {
+        let mut map = self.by_xid.write().expect("pending catalog poisoned");
+        let refreshes = &mut map.entry(top_xid).or_default().name_refreshes;
+        if refreshes.last().is_none_or(|r| r.at != at) {
+            refreshes.push(Miss { at, writer_xid });
+        }
     }
 
-    /// Whether an earlier boundary of this transaction already recorded the
-    /// filenode. A generation's smgr marker is a lower bound only for the
-    /// first shape seen on it; later boundaries answer from themselves
-    pub fn has_slots(&self, top_xid: u32, rfn: RelFileNode) -> bool {
+    /// OIDs of relations already read for this transaction, in order.
+    pub fn slot_oids(&self, top_xid: u32) -> Vec<Oid> {
         let map = self.by_xid.read().expect("pending catalog poisoned");
-        map.get(&top_xid)
-            .is_some_and(|x| x.chains.contains_key(&rfn))
-    }
-
-    /// One filenode's whole chain, for a caller folding many records against
-    /// it. Empty when the transaction has no pending coverage of it
-    pub fn chain(&self, top_xid: u32, rfn: RelFileNode) -> Vec<PendingSlot> {
-        let map = self.by_xid.read().expect("pending catalog poisoned");
-        map.get(&top_xid)
-            .and_then(|x| x.chains.get(&rfn))
-            .cloned()
-            .unwrap_or_default()
+        let mut oids: Vec<Oid> = map
+            .get(&top_xid)
+            .map(|x| x.by_oid.keys().copied().collect())
+            .unwrap_or_default();
+        oids.sort_unstable();
+        oids
     }
 
     /// Fold every member key into the top. Links arrive late, so a subxact's
@@ -296,8 +311,7 @@ impl PendingCatalog {
         }
     }
 
-    /// The consolidated tree's timeline, left in place for the drain's
-    /// per-record fold
+    /// Copy the combined catalog history for a transaction.
     pub fn promoted(&self, top_xid: u32) -> Option<PromotedXact> {
         let map = self.by_xid.read().expect("pending catalog poisoned");
         let xact = map.get(&top_xid)?;
@@ -307,10 +321,13 @@ impl PendingCatalog {
             .map(|(oid, slots)| (*oid, slots.clone()))
             .collect();
         by_oid.sort_unstable_by_key(|(oid, _)| *oid);
-        Some(PromotedXact {
-            by_oid,
-            degraded: xact.degraded,
-        })
+        let mut misses: Vec<(Oid, Vec<u64>)> = xact
+            .misses
+            .iter()
+            .map(|(oid, m)| (*oid, m.iter().map(|m| m.at).collect()))
+            .collect();
+        misses.sort_unstable_by_key(|(oid, _)| *oid);
+        Some(PromotedXact { by_oid, misses })
     }
 
     /// Drop a finished tree, returning the slots dropped
@@ -333,9 +350,10 @@ impl PendingCatalog {
         for xact in map.values_mut() {
             dropped += xact.drop_writers(members);
         }
-        // A tree whose every slot the subtree wrote still owes its caps and
-        // its degrade verdict to the commit
-        map.retain(|_, x| x.slots() > 0 || x.boundaries > 0 || x.degraded.is_some());
+        // Keep the parent's budget usage and first miss after savepoint rollback.
+        map.retain(|_, x| {
+            x.slots() > 0 || x.boundaries > 0 || x.missed.is_some() || !x.name_refreshes.is_empty()
+        });
         dropped
     }
 
@@ -349,6 +367,7 @@ impl PendingCatalog {
 mod tests {
     use super::*;
     use crate::schema::{RelName, ReplIdent};
+    use walrus::pg::walparser::RelFileNode;
 
     fn desc(oid: Oid, rel_node: u32, name: &str) -> Arc<RelDescriptor> {
         Arc::new(RelDescriptor {
@@ -369,60 +388,51 @@ mod tests {
         })
     }
 
-    fn slot(valid_from: u64, writer_xid: u32, desc: Arc<RelDescriptor>) -> PendingSlot {
+    fn slot(boundary: u64, writer_xid: u32, desc: Arc<RelDescriptor>) -> PendingSlot {
         PendingSlot {
-            valid_from,
+            boundary,
             writer_xid,
             desc,
         }
     }
 
-    #[test]
-    fn descriptor_at_takes_latest_slot_not_past_lsn() {
-        let p = PendingCatalog::default();
-        let rfn = desc(16400, 7000, "t").rfn;
-        p.record(100, vec![slot(200, 100, desc(16400, 7000, "t"))]);
-        p.record(100, vec![slot(400, 100, desc(16400, 7000, "renamed"))]);
-        assert!(p.descriptor_at(100, rfn, 199).is_none(), "before coverage");
-        assert_eq!(
-            &*p.descriptor_at(100, rfn, 200).unwrap().rel_name.name,
-            "t",
-            "coverage starts at valid_from"
-        );
-        assert_eq!(&*p.descriptor_at(100, rfn, 399).unwrap().rel_name.name, "t");
-        assert_eq!(
-            &*p.descriptor_at(100, rfn, 400).unwrap().rel_name.name,
-            "renamed"
-        );
-        assert!(
-            p.descriptor_at(101, rfn, 500).is_none(),
-            "another transaction sees nothing"
-        );
+    fn names(p: &PromotedXact, oid: Oid) -> Vec<&str> {
+        p.slots_for(oid)
+            .iter()
+            .map(|s| &*s.desc.rel_name.name)
+            .collect()
     }
 
     #[test]
-    fn re_capture_at_one_position_replaces() {
+    fn slots_order_by_boundary_and_re_read_replaces() {
         let p = PendingCatalog::default();
-        let rfn = desc(16400, 7000, "t").rfn;
+        p.record(100, vec![slot(400, 100, desc(16400, 7000, "late"))]);
         p.record(100, vec![slot(200, 100, desc(16400, 7000, "first"))]);
         p.record(100, vec![slot(200, 100, desc(16400, 7000, "second"))]);
-        assert_eq!(p.chain(100, rfn).len(), 1);
-        assert_eq!(
-            &*p.descriptor_at(100, rfn, 200).unwrap().rel_name.name,
-            "second"
+        p.record(100, Vec::new());
+        let promoted = p.promoted(100).expect("tree");
+        assert_eq!(names(&promoted, 16400), ["second", "late"]);
+        assert!(promoted.slots_for(16401).is_empty());
+        assert_eq!(p.slot_oids(100), [16400]);
+        assert!(
+            p.slot_oids(101).is_empty(),
+            "another transaction has no catalog reads"
         );
+        assert!(p.promoted(101).is_none());
     }
 
     #[test]
     fn subxact_abort_drops_only_its_writers() {
         let p = PendingCatalog::default();
-        let rfn = desc(16400, 7000, "t").rfn;
         p.record(100, vec![slot(200, 100, desc(16400, 7000, "pre"))]);
         p.record(100, vec![slot(300, 101, desc(16400, 7000, "in-savepoint"))]);
+        p.miss(100, 101, &[16400], 350, DegradeReason::QueryError);
+        p.miss(100, 100, &[16401], 360, DegradeReason::QueryError);
         assert_eq!(p.forget_members(&[101]), 1);
-        let chain = p.chain(100, rfn);
-        assert_eq!(chain.len(), 1);
-        assert_eq!(&*chain[0].desc.rel_name.name, "pre", "parent slot survives");
+        let promoted = p.promoted(100).expect("tree");
+        assert_eq!(names(&promoted, 16400), ["pre"], "keep the parent's read");
+        assert!(promoted.misses_for(16400).is_empty(), "drop savepoint miss");
+        assert_eq!(promoted.misses_for(16401), [360], "keep the parent's miss");
     }
 
     #[test]
@@ -431,82 +441,125 @@ mod tests {
         p.record(101, vec![slot(300, 101, desc(16400, 7000, "t"))]);
         assert_eq!(p.forget_members(&[100, 101]), 1);
         assert_eq!(p.tracked_xacts(), 0);
+        p.consolidate(100, &[100, 101]);
+        assert_eq!(p.tracked_xacts(), 0, "aborted members have no history");
+    }
+
+    #[test]
+    fn abort_keeps_a_tree_that_already_missed() {
+        let p = PendingCatalog::default();
+        p.record(100, vec![slot(300, 101, desc(16400, 7000, "t"))]);
+        p.miss(100, 101, &[16400], 400, DegradeReason::CapExceeded);
+        assert_eq!(p.forget_members(&[101]), 1);
+        assert!(
+            !p.miss(100, 100, &[16400], 500, DegradeReason::CapExceeded),
+            "already counted a miss for this transaction",
+        );
     }
 
     #[test]
     fn consolidate_folds_member_keys_into_the_top() {
         let p = PendingCatalog::default();
-        let rfn = desc(16400, 7000, "t").rfn;
         // Child captured before its assignment named the top
         p.record(101, vec![slot(200, 101, desc(16400, 7000, "child"))]);
+        p.miss(101, 101, &[16400], 300, DegradeReason::QueryError);
         p.record(100, vec![slot(400, 100, desc(16400, 7000, "top"))]);
-        p.degrade(101, DegradeReason::QueryError);
+        p.miss(100, 100, &[16400], 250, DegradeReason::CapExceeded);
         p.consolidate(100, &[100, 101]);
         assert_eq!(p.tracked_xacts(), 1);
-        let chain = p.chain(100, rfn);
-        assert_eq!(chain.len(), 2);
-        assert_eq!(&*chain[0].desc.rel_name.name, "child");
+        let promoted = p.promoted(100).expect("tree");
+        assert_eq!(names(&promoted, 16400), ["child", "top"]);
         assert_eq!(
-            p.degraded(100),
-            Some(DegradeReason::QueryError),
-            "a member's degrade degrades the tree"
+            promoted.misses_for(16400),
+            [250, 300],
+            "merge missed reads in LSN order"
         );
+    }
+
+    /// When combining histories, record a miss for earlier reads a namespace
+    /// change could not refresh.
+    #[test]
+    fn consolidate_marks_relations_a_name_refresh_missed() {
+        let p = PendingCatalog::default();
+        p.record(101, vec![slot(200, 101, desc(16400, 7000, "child"))]);
+        p.name_refresh(101, 101, 250);
+        p.record(100, vec![slot(300, 100, desc(16401, 7001, "top"))]);
+        p.name_refresh(100, 100, 400);
+        p.name_refresh(100, 100, 400);
+        p.record(102, vec![slot(500, 102, desc(16402, 7002, "late"))]);
+        p.consolidate(100, &[100, 101, 102]);
+        let promoted = p.promoted(100).expect("tree");
+        assert_eq!(
+            promoted.misses_for(16400),
+            [400],
+            "parent's refresh missed the child's relation"
+        );
+        assert!(
+            promoted.misses_for(16401).is_empty(),
+            "child's refresh came before the parent's read",
+        );
+        assert!(
+            promoted.misses_for(16402).is_empty(),
+            "read after both refreshes"
+        );
+    }
+
+    #[test]
+    fn subxact_abort_drops_its_name_refreshes() {
+        let p = PendingCatalog::default();
+        p.name_refresh(100, 101, 250);
+        p.name_refresh(100, 100, 260);
+        p.forget_members(&[101]);
+        assert_eq!(p.tracked_xacts(), 1, "keep the parent's name refresh");
+        p.record(102, vec![slot(200, 102, desc(16400, 7000, "child"))]);
+        p.consolidate(100, &[100, 102]);
+        assert_eq!(p.promoted(100).expect("tree").misses_for(16400), [260]);
+        assert_eq!(p.forget_members(&[100]), 1);
+        assert_eq!(p.tracked_xacts(), 0);
     }
 
     #[test]
     fn consolidate_moves_a_tree_only_its_child_captured() {
         let p = PendingCatalog::default();
-        let rfn = desc(16400, 7000, "t").rfn;
         p.record(101, vec![slot(200, 101, desc(16400, 7000, "child"))]);
         p.consolidate(100, &[100, 101]);
         assert_eq!(p.tracked_xacts(), 1);
-        assert_eq!(&*p.chain(100, rfn)[0].desc.rel_name.name, "child");
+        assert_eq!(names(&p.promoted(100).expect("tree"), 16400), ["child"]);
+        assert_eq!(p.forget_tree(100), 1);
+        assert_eq!(p.tracked_xacts(), 0);
     }
 
     #[test]
-    fn admit_caps_boundaries_then_degrades() {
+    fn admit_refuses_past_either_cap_without_state_change() {
         let p = PendingCatalog::default();
         assert_eq!(p.admit(100, 2, u64::MAX), Ok(()));
         assert_eq!(p.admit(100, 2, u64::MAX), Ok(()));
+        assert_eq!(p.admit(100, 2, u64::MAX), Err(DegradeReason::CapExceeded));
         assert_eq!(
-            p.admit(100, 2, u64::MAX),
-            Err(Some(DegradeReason::CapExceeded))
+            p.admit(100, 8, u64::MAX),
+            Ok(()),
+            "higher limit allows a read"
         );
-        assert_eq!(p.degraded(100), Some(DegradeReason::CapExceeded));
-        assert_eq!(p.admit(100, 8, u64::MAX), Err(None), "degrade is sticky");
+        assert_eq!(p.admit(101, 64, 1_000), Ok(()));
+        p.charge_hold(101, 1_500);
+        assert_eq!(p.admit(101, 64, 1_000), Err(DegradeReason::HoldBudget));
     }
 
     #[test]
-    fn admit_stops_at_the_hold_budget() {
+    fn first_miss_counts_once_and_repeats_collapse_per_run() {
         let p = PendingCatalog::default();
-        assert_eq!(p.admit(100, 64, 1_000), Ok(()));
-        p.charge_hold(100, 1_500);
-        assert_eq!(
-            p.admit(100, 64, 1_000),
-            Err(Some(DegradeReason::HoldBudget))
-        );
-        assert_eq!(p.degraded(100), Some(DegradeReason::HoldBudget));
-    }
-
-    #[test]
-    fn coverage_starts_at_the_first_boundary_naming_the_oid() {
-        let p = PendingCatalog::default();
+        assert!(p.miss(100, 100, &[16400, 16401], 200, DegradeReason::CapExceeded));
+        assert!(!p.miss(100, 100, &[16400], 300, DegradeReason::HoldBudget));
         p.record(100, vec![slot(400, 100, desc(16400, 7000, "t"))]);
-        p.record(100, vec![slot(200, 100, desc(16400, 7000, "t"))]);
+        p.miss(100, 100, &[16400], 500, DegradeReason::CapExceeded);
+        p.miss(100, 102, &[16400], 600, DegradeReason::CapExceeded);
         let promoted = p.promoted(100).expect("tree");
-        assert_eq!(promoted.coverage_from(16400), Some(200));
         assert_eq!(
-            promoted.coverage_from(16401),
-            None,
-            "oid with no slot is uncovered"
+            promoted.misses_for(16400),
+            [200, 500, 600],
+            "keep one miss per writer between reads",
         );
-        p.degrade(100, DegradeReason::CaptureAll);
-        assert_eq!(
-            p.promoted(100).expect("tree").coverage_from(16400),
-            None,
-            "a missed boundary is a shape change nothing recorded",
-        );
-        assert_eq!(p.forget_tree(100), 2);
-        assert!(p.promoted(100).is_none());
+        assert_eq!(promoted.misses_for(16401), [200]);
+        assert!(promoted.misses_for(16402).is_empty());
     }
 }

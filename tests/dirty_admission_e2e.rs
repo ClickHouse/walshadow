@@ -507,9 +507,8 @@ async fn benign_in_place_alter_then_dml_delivers() {
 /// the records stashed inside its interval. Neither decoding under the
 /// post-commit descriptor nor discarding is sound, so the stream stops.
 ///
-/// Pending capture off (`pending_max_boundaries_per_xact = 0` degrades every
-/// transaction at its first command boundary), so the fence spans the whole
-/// dirty interval, the conservative fallback.
+/// With `pending_max_boundaries_per_xact = 0`, capture skips all mid-transaction
+/// reads. The ambiguity interval spans from the first catalog change to commit.
 /// `pending_capture_e2e::pending_timeline_decodes_the_post_ddl_row` is the
 /// same shape with the timeline on, where the fence shrinks to the run before
 /// the first boundary and the row lands

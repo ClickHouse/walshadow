@@ -403,17 +403,9 @@ async fn defer_catalog_decode_stashes_raw_and_commit_fences() {
         "defer path, not marker path"
     );
     let stats = Arc::new(EmitterStats::default());
-    let stash = resolve_stash(
-        &buffer,
-        &log,
-        &Default::default(),
-        77,
-        &[],
-        1000,
-        stats.clone(),
-    )
-    .await
-    .unwrap();
+    let stash = resolve_stash(&buffer, &log, 77, &[], 1000, stats.clone())
+        .await
+        .unwrap();
     let mut b = buffer.lock().await;
     let err = drain_all(&mut b, &ToastResolver::disabled(), stash, 0, 1000, &[])
         .await

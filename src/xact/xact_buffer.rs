@@ -48,9 +48,8 @@ use tracing::Instrument;
 use walrus::pg::walparser::{RelFileNode, RmId};
 
 use crate::catalog::desc_log::{
-    Ambiguity, DescriptorLog, DescriptorLogs, LogEntry, LogValue, LookupMiss,
+    DescriptorLog, DescriptorLogs, LogEntry, LogValue, LookupMiss, RfnHistory,
 };
-use crate::catalog::pending::{PendingCatalog, PendingSlot};
 use crate::decode::datum::{Datum, DatumRef};
 use crate::decode::decoder_sink::{DecoderSinkError, DecoderStats, SkipReason};
 #[cfg(any(test, feature = "test-support"))]
@@ -312,6 +311,9 @@ pub enum XactBufferError {
         from_lsn: u64,
         through_lsn: u64,
     },
+    /// No descriptor covers this buffered record, so decoding must stop.
+    #[error("no descriptor for buffered record on filenode {rel_node} at {lsn:#X}")]
+    StashUncovered { rel_node: u32, lsn: u64 },
     /// Raw entries drained under [`StashResolved::nothing_stashed`]: the
     /// discard arm would swallow every stashed row, fence included. Fail
     /// closed, resolve_stash must run for any xact that stashed
@@ -585,21 +587,9 @@ const MARKER_CAP: usize = 65536;
 pub enum StashOutcome {
     /// Resolved toast heap: decode stashed records at drain
     Toast(Arc<RelDescriptor>),
-    /// Resolved ordinary heap: stashed records drain as inputs under the
-    /// commit-resolution descriptor + its interval's valid_from
-    Ordinary {
-        rel: Arc<RelDescriptor>,
-        valid_from: u64,
-        /// Ambiguity intervals overlapping this filenode's stashed span.
-        /// Resolution happens at the commit's `next_lsn`, past every
-        /// interval's end, so the fence is applied per record at fold
-        fence: Vec<Arc<Ambiguity>>,
-        /// Shapes this xact's own command boundaries saw, ascending. A
-        /// record inside one decodes under it rather than under the
-        /// commit-time descriptor: same-xact `ALTER` then `INSERT` is two
-        /// layouts, and only the timeline separates them
-        pending: Vec<PendingSlot>,
-    },
+    /// Decode each buffered heap record with the descriptor at its LSN.
+    /// Capture saves the descriptors and ambiguity intervals before draining.
+    Ordinary(RfnHistory),
 }
 
 /// Resolution map for a finishing tree; filenodes absent from `outcomes`
@@ -624,17 +614,12 @@ impl StashResolved {
         Self { top_xid, res: None }
     }
 
-    /// `Ordinary` verdict for `rel`'s filenode, unfenced, no same-xact shapes
+    /// Build a result with one descriptor and no ambiguity intervals.
     #[cfg(any(test, feature = "test-support"))]
     pub fn ordinary(top_xid: u32, rel: Arc<RelDescriptor>, valid_from: u64) -> Self {
         let mut outcomes = HashMap::new();
         let rfn = rel.rfn;
-        let outcome = StashOutcome::Ordinary {
-            rel,
-            valid_from,
-            fence: Vec::new(),
-            pending: Vec::new(),
-        };
+        let outcome = StashOutcome::Ordinary(RfnHistory::fixture([(valid_from, rel)], Vec::new()));
         outcomes.insert(rfn, outcome);
         Self {
             top_xid,
@@ -653,18 +638,11 @@ impl StashResolved {
 /// marker-proven toast generations. A toast heap without its marker fails
 /// closed ([`XactBufferError::IncompleteToastGeneration`]).
 ///
-/// Ambiguity travels with the outcome, not the lookup: resolution asks at
-/// `next_lsn`, which every interval published by this commit ends at, so
-/// each filenode's overlapping intervals ride the `Ordinary` outcome and
-/// the drain's `fold_raw_ordinary` fences the records actually inside one.
-///
-/// `pending` is this tree's command-boundary timeline, already consolidated
-/// under `top_xid` by capture. It rides the outcome for the same reason the
-/// fence does: one lookup at commit, one verdict per record at fold.
+/// Use `next_lsn` to find which filenodes survive commit. Copy each surviving
+/// heap's history so the drain can look up descriptors at each record's LSN.
 pub async fn resolve_stash(
     buffer: &Arc<Mutex<XactBuffer>>,
     log: &DescriptorLog,
-    pending: &PendingCatalog,
     top_xid: u32,
     subxids: &[u32],
     next_lsn: u64,
@@ -721,7 +699,7 @@ pub async fn resolve_stash(
                 }
                 outcomes.insert(rfn, StashOutcome::Toast(rel));
             }
-            Ok((rel, valid_from)) => {
+            Ok((rel, _)) => {
                 if mark.payload_free {
                     // Markerless records were tracked without payload before
                     // the filenode resolved decodable; documented residual,
@@ -735,17 +713,8 @@ pub async fn resolve_stash(
                          those rows are not mirrored",
                     );
                 }
-                let fence =
-                    log.ambiguities_intersecting(rfn, Some(rel.oid), mark.first_lsn, next_lsn);
-                outcomes.insert(
-                    rfn,
-                    StashOutcome::Ordinary {
-                        rel,
-                        valid_from,
-                        fence,
-                        pending: pending.chain(top_xid, rfn),
-                    },
-                );
+                let history = log.rfn_history(rfn, rel.oid, mark.first_lsn, next_lsn);
+                outcomes.insert(rfn, StashOutcome::Ordinary(history));
             }
             // Point lookup at next_lsn sits past every interval this commit
             // published, so this arm answers only for an interval a later
@@ -1868,30 +1837,23 @@ impl MergedDrain {
                 c(s).fetch_add(1, Ordering::Relaxed);
             }
         };
-        let rel = match raw.rfn().and_then(|rfn| self.stash.outcomes.get(&rfn)) {
-            Some(StashOutcome::Toast(rel)) => rel.clone(),
-            Some(StashOutcome::Ordinary {
-                rel,
-                valid_from,
-                fence,
-                pending,
-            }) => {
-                // Shape this record was written under: the xact's own
-                // timeline where it covers the position, the commit-time
-                // resolution otherwise (records before the xact's first
-                // command boundary were written under the pre-xact shape,
-                // which bias-early capture already lands there). PostgreSQL
-                // make_new_heap creates transient pg_temp_<oid>; rewrite swaps
-                // its filenode into owner resolved at commit
-                let (rel, valid_from) = pending
-                    .iter()
-                    .rev()
-                    .find(|s| s.valid_from <= raw.source_lsn && s.desc.oid == rel.oid)
-                    .map_or((rel.clone(), *valid_from), |s| {
-                        (s.desc.clone(), s.valid_from)
-                    });
-                let fence = fence.clone();
-                return self.fold_raw_ordinary(raw, rel, valid_from, &fence);
+        let outcome = raw
+            .rfn()
+            .and_then(|rfn| Some((rfn.rel_node, self.stash.outcomes.get(&rfn)?)));
+        let rel = match outcome {
+            Some((_, StashOutcome::Toast(rel))) => rel.clone(),
+            Some((rel_node, StashOutcome::Ordinary(history))) => {
+                let lsn = raw.source_lsn;
+                let (rel, valid_from) = history.at(lsn).map_err(|miss| match miss {
+                    LookupMiss::Ambiguous(a) => XactBufferError::StashAmbiguous {
+                        rel_node,
+                        lsn,
+                        from_lsn: a.from_lsn,
+                        through_lsn: a.through_lsn,
+                    },
+                    _ => XactBufferError::StashUncovered { rel_node, lsn },
+                })?;
+                return self.fold_raw_ordinary(raw, rel, valid_from);
             }
             // No outcome = the filenode resolved Dropped / Retired /
             // NotCovered: rotated or dropped by this commit or a later
@@ -1923,17 +1885,13 @@ impl MergedDrain {
     /// descriptor, `None` when it yields no rows. Rebuilt header carries the
     /// writer xid, so rows keep the source `_xid`.
     ///
-    /// Operation policy: admit only shapes whose logical content is provably
-    /// whole in the record, skip page maintenance, fail closed on anything
-    /// else — silent skip here is the row-loss class raw decode exists to
-    /// kill. `fence` is the filenode's overlapping ambiguity intervals; a
-    /// record inside one has no proven reader and fails closed before decode
+    /// Decode records with complete row data and skip page maintenance.
+    /// Stop on any other operation to avoid losing rows.
     fn fold_raw_ordinary(
         &mut self,
         raw: &RawRecord,
         rel: Arc<RelDescriptor>,
         valid_from: u64,
-        fence: &[Arc<Ambiguity>],
     ) -> std::result::Result<Option<Box<DescribedInput>>, XactBufferError> {
         use crate::decode::heap_decoder::{
             XLOG_HEAP_CONFIRM, XLOG_HEAP_DELETE, XLOG_HEAP_HOT_UPDATE, XLOG_HEAP_INSERT,
@@ -1946,17 +1904,6 @@ impl MergedDrain {
             info: raw.info,
             reason,
         };
-        if let Some(a) = fence
-            .iter()
-            .find(|a| a.from_lsn <= raw.source_lsn && raw.source_lsn < a.through_lsn)
-        {
-            return Err(XactBufferError::StashAmbiguous {
-                rel_node: rel.rfn.rel_node,
-                lsn: raw.source_lsn,
-                from_lsn: a.from_lsn,
-                through_lsn: a.through_lsn,
-            });
-        }
         let rec = raw.to_xlog_record();
         // FPI consumed the registered tuple data; wal_level=logical retains
         // it (REGBUF_KEEP_DATA), so this means a non-logical writer
@@ -3748,38 +3695,22 @@ pub(crate) mod raw_fixtures {
         fence: Vec<Arc<crate::catalog::desc_log::Ambiguity>>,
     ) -> StashResolved {
         let mut outcomes = HashMap::new();
-        outcomes.insert(
-            rfn,
-            StashOutcome::Ordinary {
-                rel,
-                valid_from: 0x50,
-                fence,
-                pending: Vec::new(),
-            },
-        );
+        let history = RfnHistory::fixture([(0x50, rel)], fence);
+        outcomes.insert(rfn, StashOutcome::Ordinary(history));
         StashResolved {
             top_xid: 1,
             res: Some(StashResolution { outcomes, stats }),
         }
     }
 
-    /// `Ordinary` verdict carrying this xact's own command-boundary shapes,
-    /// as `resolve_stash` reads them off the pending catalog
-    pub(crate) fn inject_ordinary_pending(
+    /// Build a result for a filenode with several recorded descriptors.
+    pub(crate) fn inject_ordinary_shapes(
         rfn: RelFileNode,
-        rel: Arc<crate::schema::RelDescriptor>,
-        pending: Vec<PendingSlot>,
+        shapes: Vec<(u64, Arc<crate::schema::RelDescriptor>)>,
     ) -> StashResolved {
         let mut outcomes = HashMap::new();
-        outcomes.insert(
-            rfn,
-            StashOutcome::Ordinary {
-                rel,
-                valid_from: 0x50,
-                fence: Vec::new(),
-                pending,
-            },
-        );
+        let history = RfnHistory::fixture(shapes, Vec::new());
+        outcomes.insert(rfn, StashOutcome::Ordinary(history));
         StashResolved {
             top_xid: 1,
             res: Some(StashResolution {
@@ -5510,15 +5441,13 @@ mod tests {
         );
     }
 
-    /// `resolve_stash`'s Ordinary edge against a real log, the way capture
-    /// leaves it after a physical in-place verdict: `Present` at the commit's
-    /// `next_lsn`, siblings fencing `[first_touch, next_lsn)`. Resolution
-    /// queries at `next_lsn`, which no interval covers, so the fence has to
-    /// travel with the verdict for the drain to see it
+    /// Keep earlier ambiguity intervals in the history even when the
+    /// descriptor lookup at commit succeeds.
     #[tokio::test(flavor = "current_thread")]
     async fn resolve_stash_attaches_fence_from_log() {
         use crate::catalog::desc_log::{
-            AmbiguityReason, AmbiguityScope, BatchRecord, DescLogIdentity, LogEntry, LogValue,
+            Ambiguity, AmbiguityReason, AmbiguityScope, BatchRecord, DescLogIdentity, LogEntry,
+            LogValue,
         };
         let log_dir = tempdir().unwrap();
         let log = DescriptorLog::open(
@@ -5569,7 +5498,6 @@ mod tests {
         let stash = resolve_stash(
             &buffer,
             &log,
-            &PendingCatalog::default(),
             1,
             &[],
             0x300,
@@ -6108,11 +6036,9 @@ mod tests {
         drain.finish().await.unwrap();
     }
 
-    /// Records fold under the shape their own position had: the xact's
-    /// command-boundary slot where one covers, the commit-time resolution
-    /// before the first boundary
+    /// Decode buffered records using the descriptor in effect at each LSN.
     #[tokio::test(flavor = "current_thread")]
-    async fn raw_records_fold_against_the_pending_timeline() {
+    async fn raw_records_fold_under_the_shape_at_their_lsn() {
         let tmp = tempdir().unwrap();
         let mut b = XactBuffer::new(cfg(tmp.path().to_path_buf())).unwrap();
         // Commit shape has a second column the boundary shape lacks, so
@@ -6130,14 +6056,9 @@ mod tests {
         b.stash_raw(1, multi_insert_raw(1, 300, 16417, &[2]))
             .await
             .unwrap();
-        let stash = inject_ordinary_pending(
+        let stash = inject_ordinary_shapes(
             rfn,
-            Arc::new(commit_shape),
-            vec![PendingSlot {
-                valid_from: 200,
-                writer_xid: 1,
-                desc: boundary_shape,
-            }],
+            vec![(0x50, boundary_shape), (200, Arc::new(commit_shape))],
         );
         let mut drain = b
             .drain_committed(stash, 42, 0x2000, &[], false)
@@ -6162,50 +6083,41 @@ mod tests {
             .collect();
         assert_eq!(
             shapes,
-            vec![(100, 2, 0x50), (300, 1, 200)],
-            "record before the first boundary keeps the commit resolution",
+            vec![(100, 1, 0x50), (300, 2, 200)],
+            "each record uses the descriptor at its LSN",
         );
         drain.finish().await.unwrap();
     }
 
-    /// PostgreSQL rewriting ALTER transfers transient heap's filenode to owner
+    /// Stop if a buffered record predates the first known descriptor.
     #[tokio::test(flavor = "current_thread")]
-    async fn raw_rewrite_rows_fold_under_owner() {
+    async fn raw_record_before_any_shape_fails_closed() {
         let tmp = tempdir().unwrap();
         let mut b = XactBuffer::new(cfg(tmp.path().to_path_buf())).unwrap();
-        let owner = int4_descriptor(16418);
-        let mut transient = (*owner).clone();
-        transient.oid = 16500;
-        transient.rel_name = crate::schema::RelName::new("public", "pg_temp_16418");
-        let rfn = owner.rfn;
-        b.stash_raw(1, multi_insert_raw(1, 100, 16418, &[7]))
+        let rel = int4_descriptor(16418);
+        b.stash_raw(1, multi_insert_raw(1, 0x40, 16418, &[7]))
             .await
             .unwrap();
-        let stash = inject_ordinary_pending(
-            rfn,
-            owner.clone(),
-            vec![PendingSlot {
-                valid_from: 60,
-                writer_xid: 1,
-                desc: Arc::new(transient),
-            }],
-        );
+        let stash = StashResolved::ordinary(1, rel, 0x50);
         let mut drain = b
             .drain_committed(stash, 42, 0x2000, &[], false)
             .await
             .unwrap();
-        let batch = drain
+        let err = drain
             .next_batch(8, usize::MAX, None)
             .await
-            .unwrap()
-            .expect("one slice");
-        assert_eq!(batch.cells().unwrap().len(), 1);
-        assert_eq!(
-            batch.cells().unwrap()[0].descriptor.rel_name,
-            owner.rel_name
+            .err()
+            .expect("record before the first descriptor must fail");
+        assert!(
+            matches!(
+                err,
+                XactBufferError::StashUncovered {
+                    rel_node: 16418,
+                    lsn: 0x40
+                }
+            ),
+            "{err:?}"
         );
-        assert_eq!(batch.cells().unwrap()[0].descriptor_valid_from, 0x50);
-        drain.finish().await.unwrap();
     }
 
     /// Writer xid reaches fanned-out heaps identically whether the raw
@@ -7774,9 +7686,8 @@ mod tests {
                 b.track_unresolvable(xid, 0x200, rfn_of(rel_node));
             }
         }
-        let pending = PendingCatalog::default();
         let stats = Arc::new(EmitterStats::default());
-        let resolve = |xid| resolve_stash(&buffer, &log, &pending, xid, &[], 0x400, stats.clone());
+        let resolve = |xid| resolve_stash(&buffer, &log, xid, &[], 0x400, stats.clone());
 
         let err = resolve(1).await.err().expect("rotated toast generation");
         assert!(
@@ -7802,7 +7713,8 @@ mod tests {
         assert!(
             matches!(
                 outcomes.get(&rfn_of(16900)),
-                Some(StashOutcome::Ordinary { rel, valid_from: 0x100, .. }) if rel.oid == 16900
+                Some(StashOutcome::Ordinary(history))
+                    if history.at(0x200).is_ok_and(|(rel, at)| rel.oid == 16900 && at == 0x100)
             ),
             "{:?}",
             outcomes.keys().collect::<Vec<_>>()

@@ -1102,7 +1102,6 @@ impl ReorderSink {
         let stash = crate::xact::xact_buffer::resolve_stash(
             &self.buffer,
             &stash_log,
-            &self.pending,
             xid,
             &payload.subxacts,
             record.next_lsn,

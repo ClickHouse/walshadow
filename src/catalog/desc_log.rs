@@ -277,6 +277,48 @@ impl From<LookupMiss> for LookupResult {
     }
 }
 
+/// Copy of a filenode's descriptors and ambiguity intervals covering its
+/// buffered records. Look up each record by LSN without locking the index.
+#[derive(Debug, Clone)]
+pub struct RfnHistory {
+    chain: Vec<Slot>,
+    /// Sorted by `(from_lsn, through_lsn)`.
+    fences: Vec<Arc<Ambiguity>>,
+}
+
+impl RfnHistory {
+    /// Look up the descriptor as in [`DescriptorLog::peek_spanned`], including
+    /// ambiguity intervals recorded by relation OID.
+    pub fn at(&self, lsn: u64) -> std::result::Result<(Arc<RelDescriptor>, u64), LookupMiss> {
+        ambiguity_covering(Some(&self.fences), lsn).map_or_else(
+            || lookup_spanned(Some(&self.chain), lsn),
+            |a| Err(LookupMiss::Ambiguous(a)),
+        )
+    }
+
+    /// Build history from descriptors sorted by `valid_from`.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn fixture(
+        shapes: impl IntoIterator<Item = (u64, Arc<RelDescriptor>)>,
+        fences: Vec<Arc<Ambiguity>>,
+    ) -> Self {
+        let chain = shapes
+            .into_iter()
+            .map(|(valid_from, desc)| Slot {
+                valid_from,
+                captured_at: valid_from,
+                entry: Arc::new(LogEntry {
+                    valid_from,
+                    oid: desc.oid,
+                    rfn: desc.rfn,
+                    value: LogValue::Present(desc),
+                }),
+            })
+            .collect();
+        Self { chain, fences }
+    }
+}
+
 /// One key's version chain slot; `captured_at` denormalized for
 /// [`DescriptorLog::predecessor_before`]
 #[derive(Debug, Clone)]
@@ -689,6 +731,21 @@ impl DescriptorLog {
         }
         out.sort_unstable_by_key(|a| (a.from_lsn, a.through_lsn));
         out
+    }
+
+    /// Copy the entry in effect at `from` and later entries through `through`.
+    /// Include overlapping ambiguity intervals for both filenode and OID.
+    pub fn rfn_history(&self, rfn: RelFileNode, oid: Oid, from: u64, through: u64) -> RfnHistory {
+        let fences = self.ambiguities_intersecting(rfn, Some(oid), from, through);
+        let idx = self.index.read().unwrap();
+        let chain = idx.by_rfn.get(&rfn).map_or_else(Vec::new, |chain| {
+            let lo = chain
+                .partition_point(|s| s.valid_from <= from)
+                .saturating_sub(1);
+            let hi = chain.partition_point(|s| s.valid_from <= through);
+            chain[lo..hi].to_vec()
+        });
+        RfnHistory { chain, fences }
     }
 
     /// Newest `Present` at or below `lsn` on the rfn chain, skipping
