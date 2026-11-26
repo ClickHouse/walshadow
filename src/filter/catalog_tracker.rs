@@ -507,7 +507,7 @@ impl CatalogTracker {
                     END AS db_node, \
                     c.oid AS catalog_oid, \
                     pg_relation_filenode(c.oid) AS filenode, \
-                    c.ctid::text AS slot \
+                    c.ctid AS slot \
                  FROM pg_class c \
                  WHERE c.oid < 16384 \
                    AND pg_relation_filenode(c.oid) IS NOT NULL",
@@ -520,10 +520,9 @@ impl CatalogTracker {
             let db_node: Oid = row.get(0);
             let catalog_oid: Oid = row.get(1);
             let filenode: Oid = row.get(2);
-            if db_node != 0
-                && let Some(slot) = parse_ctid(row.get(3))
-            {
-                slots.push((db_node, slot, catalog_oid, filenode));
+            if db_node != 0 {
+                let crate::pg::Tid(blk, off) = row.get(3);
+                slots.push((db_node, (blk, off), catalog_oid, filenode));
             }
             added += usize::from(self.nodes.insert((db_node, filenode)));
             if catalog_oid == PG_CLASS_OID {
@@ -558,12 +557,6 @@ impl CatalogTracker {
     pub fn is_empty(&self) -> bool {
         self.nodes.is_empty()
     }
-}
-
-/// `(block, offnum)` from tid text `(b,o)`
-fn parse_ctid(text: &str) -> Option<(u32, u16)> {
-    let (blk, off) = text.strip_prefix('(')?.strip_suffix(')')?.split_once(',')?;
-    Some((blk.parse().ok()?, off.parse().ok()?))
 }
 
 /// Well-formed `XLOG_RELMAP_UPDATE` record, shared with filter-engine tests.
@@ -1270,12 +1263,5 @@ mod tests {
         t.catalog_slots.insert((5, 1259, 0, 7), (2674, 2674));
         t.observe(&relmap_record(5, &[(1259, 50000)]), MAGIC);
         assert!(t.catalog_slots.is_empty());
-    }
-
-    #[test]
-    fn parse_ctid_reads_tid_text() {
-        assert_eq!(parse_ctid("(12,3)"), Some((12, 3)));
-        assert_eq!(parse_ctid("12,3"), None);
-        assert_eq!(parse_ctid("(12,70000)"), None);
     }
 }

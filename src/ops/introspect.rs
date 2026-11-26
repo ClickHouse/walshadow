@@ -46,7 +46,7 @@ pub async fn tables(
     client: &Client,
     namespace: Option<&str>,
 ) -> Result<Vec<SourceTable>, tokio_postgres::Error> {
-    const BASE: &str = "SELECT n.nspname, c.relname, c.relreplident::text, \
+    const BASE: &str = "SELECT n.nspname, c.relname, c.relreplident, \
          EXISTS (SELECT 1 FROM pg_index i WHERE i.indrelid = c.oid AND i.indisprimary) \
          FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
          WHERE c.relkind = 'r' AND n.nspname NOT IN ('pg_catalog','information_schema') \
@@ -61,13 +61,10 @@ pub async fn tables(
     };
     Ok(rows
         .iter()
-        .map(|r| {
-            let ident: String = r.get(2);
-            SourceTable {
-                rel: RelName::new(r.get(0), r.get(1)),
-                replica_identity: ident.chars().next().unwrap_or('?'),
-                has_pk: r.get(3),
-            }
+        .map(|r| SourceTable {
+            rel: RelName::new(r.get(0), r.get(1)),
+            replica_identity: crate::pg::char_at(r, 2),
+            has_pk: r.get(3),
         })
         .collect())
 }

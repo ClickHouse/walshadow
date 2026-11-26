@@ -258,9 +258,9 @@ pub async fn seed_catalog_from_source(client: &Client) -> Result<CatalogMap> {
                 c.relnamespace::oid, \
                 n.nspname::text, \
                 c.relname::text, \
-                c.relkind::text, \
-                c.relpersistence::text, \
-                c.relreplident::text, \
+                c.relkind, \
+                c.relpersistence, \
+                c.relreplident, \
                 c.reltoastrelid::oid, \
                 coalesce(nullif(c.reltablespace, 0), \
                          (SELECT dattablespace FROM pg_database \
@@ -284,9 +284,9 @@ pub async fn seed_catalog_from_source(client: &Client) -> Result<CatalogMap> {
         let namespace_oid: Oid = row.get(1);
         let namespace_name: String = row.get(2);
         let name: String = row.get(3);
-        let kind = one_char(row.get::<_, String>(4), "relkind")?;
-        let persistence = one_char(row.get::<_, String>(5), "relpersistence")?;
-        let replident_char = one_char(row.get::<_, String>(6), "relreplident")?;
+        let kind = crate::pg::char_at(&row, 4);
+        let persistence = crate::pg::char_at(&row, 5);
+        let replident_char = crate::pg::char_at(&row, 6);
         let toast_oid: Oid = row.get(7);
         let spc_node: Oid = row.get(8);
         let rel_node: Oid = row.get(9);
@@ -381,13 +381,10 @@ async fn fetch_replident(client: &Client, c: char, rel_oid: Oid) -> Result<ReplI
 
 async fn fetch_attributes(client: &Client, rel_oid: Oid) -> Result<Vec<RelAttr>> {
     let rows = client.query(crate::pg::ATTR_SQL, &[&rel_oid]).await?;
-    rows.iter()
-        .map(|row| {
-            crate::pg::RawAttr::from_row(row)
-                .build()
-                .map_err(anyhow::Error::msg)
-        })
-        .collect()
+    Ok(rows
+        .iter()
+        .map(|row| crate::pg::RawAttr::from_row(row).build())
+        .collect())
 }
 
 async fn current_database_oid(client: &Client) -> Result<Oid> {
@@ -399,14 +396,6 @@ async fn current_database_oid(client: &Client) -> Result<Oid> {
         .await
         .context("bootstrap: current_database() oid lookup")?;
     Ok(row.get(0))
-}
-
-fn one_char(s: String, what: &str) -> Result<char> {
-    let mut it = s.chars();
-    match (it.next(), it.next()) {
-        (Some(c), None) => Ok(c),
-        _ => anyhow::bail!("bootstrap: expected single char for {what}, got {s:?}"),
-    }
 }
 
 #[cfg(test)]
@@ -425,14 +414,6 @@ mod tests {
         let mut catalog = CatalogMap::new();
         catalog.insert(Arc::new(rel));
         assert!(tap_filenode_set(&catalog, |_| true, |_| true).is_none());
-    }
-
-    #[test]
-    fn one_char_rejects_empty_and_long_values() {
-        assert_eq!(one_char("r".into(), "relkind").unwrap(), 'r');
-        for s in ["", "rp"] {
-            assert!(one_char(s.into(), "relkind").is_err());
-        }
     }
 
     #[test]

@@ -1008,12 +1008,12 @@ fn descriptor_from_rows(
             type_name: types.get(&attr.atttypid).cloned(),
             type_byval: attr.attbyval,
             type_len: attr.attlen,
-            type_align: attr.attalign.to_string(),
-            type_storage: attr.attstorage.to_string(),
+            type_align: attr.attalign,
+            type_storage: attr.attstorage,
             missing: None,
             missing_send: None,
         };
-        let mut rel_attr = raw.build().map_err(CatalogError::Parse)?;
+        let mut rel_attr = raw.build();
         if let Some(hex) = attr.attmissingval.as_deref()
             && let Some(bytes) = decode_hex(hex)
         {
