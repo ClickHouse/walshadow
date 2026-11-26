@@ -12,6 +12,7 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, ensure};
+use walshadow::pg::Xid8;
 use walshadow::shadow::Shadow;
 use walshadow::source_feed::open_sql_client;
 
@@ -177,12 +178,11 @@ async fn truncated_pending_xids_stay_pending_until_resumed_outcomes() {
     let truncated_segment = boundary / per_segment - 1;
     for (client, tag, from) in [(&committer, "kept", 1001), (&aborter, "rolled", 2001)] {
         client.batch_execute("BEGIN").await.expect("BEGIN");
-        let xid: String = client
-            .query_one("SELECT pg_current_xact_id()::text", &[])
+        let Xid8(xid) = client
+            .query_one("SELECT pg_current_xact_id()", &[])
             .await
             .expect("assign xid")
             .get(0);
-        let xid: u64 = xid.parse().unwrap();
         assert_eq!(
             xid / per_segment,
             truncated_segment,

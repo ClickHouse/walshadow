@@ -755,12 +755,9 @@ async fn session_body(
             .sql_client()
             .await
             .context("source sidecar sql for the absent database")?;
-        let visible_at = source_sql
-            .query_one("SELECT pg_current_wal_lsn()::text", &[])
+        let visible_at = walshadow::pg::current_wal_lsn(source_sql)
             .await
             .context("source WAL position for the absent database")?;
-        let visible_at = walshadow::pg::parse_pg_lsn(visible_at.get::<_, &str>(0))
-            .context("parse source WAL position")?;
         let dbname = &source_conn.dbname;
         let absent = format!("database {dbname} is configured but not on the source");
         let oid = *list_databases(source_sql)
@@ -794,12 +791,9 @@ async fn session_body(
             .sql_client()
             .await
             .context("source sidecar sql for database list")?;
-        let visible_at = source_sql
-            .query_one("SELECT pg_current_wal_lsn()::text", &[])
+        let visible_at = walshadow::pg::current_wal_lsn(source_sql)
             .await
             .context("source WAL position for database list")?;
-        let visible_at = walshadow::pg::parse_pg_lsn(visible_at.get::<_, &str>(0))
-            .context("parse source WAL position")?;
         let source_dbs = list_databases(source_sql)
             .await
             .context("list source databases")?;

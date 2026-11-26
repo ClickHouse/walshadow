@@ -248,7 +248,7 @@ pub async fn mapped_relations(
         let (ns, name): (&str, &str) = (&key.namespace, &key.name);
         let row = source_sql
             .query_opt(
-                "SELECT c.relreplident::text, \
+                "SELECT c.relreplident, \
                         EXISTS (SELECT 1 FROM pg_index i \
                                 WHERE i.indrelid = c.oid AND i.indisprimary) \
                  FROM pg_class c \
@@ -258,9 +258,8 @@ pub async fn mapped_relations(
             )
             .await?;
         if let Some(r) = row {
-            let id: String = r.get(0);
+            let ch = crate::pg::char_at(&r, 0);
             let has_pk: bool = r.get(1);
-            let ch = id.chars().next().unwrap_or('?');
             if !replica_identity_has_key(ch, has_pk) {
                 errors.push(PreflightError::BadReplicaIdentity {
                     rel: key.clone(),

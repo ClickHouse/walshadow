@@ -138,38 +138,30 @@ pub async fn toast_relations<'a>(
         out.insert((db_oid, d.rfn.rel_node));
     }
     // Reuse authenticated sidecar client from catalog seed
-    // Interpolate because client has no `oid[]` Rust mapping
-    let list = heaps
-        .iter()
-        .map(u32::to_string)
-        .collect::<Vec<_>>()
-        .join(",");
     let rows = sql
         .query(
-            &format!(
-                "SELECT ic.relfilenode::int8, ic.relname::text, \
-                 coalesce(nullif(ic.reltablespace, 0), \
-                          (SELECT dattablespace FROM pg_database \
-                           WHERE datname = current_database()))::int8 \
-                 FROM pg_class t \
-                 JOIN pg_index i ON i.indrelid = t.oid \
-                 JOIN pg_class ic ON ic.oid = i.indexrelid \
-                 WHERE t.relkind = 't' \
-                 AND t.relfilenode = ANY('{{{list}}}'::oid[])"
-            ),
-            &[],
+            "SELECT ic.relfilenode, ic.relname, \
+             coalesce(nullif(ic.reltablespace, 0), \
+                      (SELECT dattablespace FROM pg_database \
+                       WHERE datname = current_database())) \
+             FROM pg_class t \
+             JOIN pg_index i ON i.indrelid = t.oid \
+             JOIN pg_class ic ON ic.oid = i.indexrelid \
+             WHERE t.relkind = 't' \
+             AND t.relfilenode = ANY($1::oid[])",
+            &[&heaps],
         )
         .await
         .context("bootstrap: read toast index filenodes")?;
     for row in &rows {
-        let spc = row.get::<_, i64>(2) as u32;
+        let spc: u32 = row.get(2);
         let index: String = row.get(1);
         ensure!(
             spc == DEFAULT_TABLESPACE_OID,
             "bootstrap: TOAST index {index} is in tablespace {spc}; \
              [toast] mode = shadow keeps files from default tablespace only",
         );
-        out.insert((db_oid, row.get::<_, i64>(0) as u32));
+        out.insert((db_oid, row.get(0)));
     }
     tracing::info!(
         target: "walshadow::bootstrap",

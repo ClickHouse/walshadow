@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 
 use tokio_postgres::{Client, NoTls};
 use walshadow::bridge::{Bridge, BridgeError};
-use walshadow::pg::socket_conninfo;
+use walshadow::pg::{Xid8, socket_conninfo};
 use walshadow::shadow::{BridgeConf, Shadow, ShadowConfig};
 use walshadow::toast::FetchedValue;
 
@@ -85,13 +85,8 @@ async fn scalar(c: &Client, sql: &str) -> String {
 
 /// Assign and return a fresh xid to bound later writes
 async fn current_xid(c: &Client) -> u32 {
-    scalar(
-        c,
-        "SELECT (pg_current_xact_id()::text::numeric % 4294967296)::text",
-    )
-    .await
-    .parse()
-    .expect("xid fits 32 bits")
+    let row = c.query_one("SELECT pg_current_xact_id()", &[]).await;
+    row.expect("assign xid").get::<_, Xid8>(0).0 as u32
 }
 
 /// A toast relation is named for its parent's oid, not its own, so the name is

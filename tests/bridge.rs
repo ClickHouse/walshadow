@@ -17,6 +17,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use clickhouse_c::{Allocator, TypeAst};
+use tokio_postgres::types::FromSql;
 use tokio_postgres::{Client, NoTls};
 use walshadow::bridge::{
     AttributeRow, Bridge, BridgeError, Catalog, ClassRow, IndexRow, NamespaceRow,
@@ -25,7 +26,7 @@ use walshadow::bridge::{
 use walshadow::datum::{DatumRef, build};
 use walshadow::mimalloc;
 use walshadow::oracle::{Oracle, OracleCell, OracleColumnBuf, OracleRequestColumn};
-use walshadow::pg::socket_conninfo;
+use walshadow::pg::{Xid8, socket_conninfo};
 use walshadow::schema::{NUMERICOID, ReplIdent};
 use walshadow::shadow::{BridgeConf, Shadow, ShadowConfig};
 use walshadow::shadow_catalog::{CatalogError, ParkedAt, ShadowCatalog};
@@ -127,34 +128,23 @@ async fn open_mirror_catalog(sh: &Shadow, sock: &Path) -> (Arc<Bridge>, ShadowCa
     (bridge, cat)
 }
 
-async fn scalar(client: &Client, sql: &str) -> String {
-    client
-        .query_one(sql, &[])
-        .await
-        .expect(sql)
-        .get::<_, String>(0)
+async fn scalar<T: for<'a> FromSql<'a>>(client: &Client, sql: &str) -> T {
+    client.query_one(sql, &[]).await.expect(sql).get(0)
 }
 
 async fn oid_of(client: &Client, relname: &str) -> u32 {
-    scalar(client, &format!("SELECT '{relname}'::regclass::oid::text"))
-        .await
-        .parse()
-        .expect("oid")
+    scalar(client, &format!("SELECT '{relname}'::regclass::oid")).await
 }
 
 async fn oid_of_type(client: &Client, typname: &str) -> u32 {
-    scalar(client, &format!("SELECT '{typname}'::regtype::oid::text"))
-        .await
-        .parse()
-        .expect("type oid")
+    scalar(client, &format!("SELECT '{typname}'::regtype::oid")).await
 }
 
 /// `pg_current_xact_id` is xid8; the wire carries the 32-bit `TransactionId`
 async fn top_xid(client: &Client) -> u32 {
-    scalar(client, "SELECT pg_current_xact_id()::text")
+    scalar::<Xid8>(client, "SELECT pg_current_xact_id()")
         .await
-        .parse::<u64>()
-        .expect("xid8") as u32
+        .0 as u32
 }
 
 /// Uncompressed on-disk varlena body, ie header already stripped
@@ -332,7 +322,7 @@ async fn bridge_native_strings_match_typoutput() {
     assert_eq!(out.len(), cases.len());
 
     for (got, (ty, _, literal)) in out.iter().zip(&cases) {
-        let want = scalar(&sql, &format!("SELECT format('%s', ({literal})::{ty})")).await;
+        let want: String = scalar(&sql, &format!("SELECT format('%s', ({literal})::{ty})")).await;
         assert_eq!(got, &want, "{ty} from {literal} — PG renders {want}");
     }
 
@@ -708,13 +698,13 @@ async fn bridge_reconnects_after_worker_exit() {
     .await
     .expect("contrary defaults");
 
-    let killed = scalar(
+    let killed: i64 = scalar(
         &sql,
-        "SELECT count(pg_terminate_backend(pid))::text \
+        "SELECT count(pg_terminate_backend(pid)) \
          FROM pg_stat_activity WHERE backend_type = 'walshadow bridge'",
     )
     .await;
-    assert_eq!(killed, "1", "bridge worker not running");
+    assert_eq!(killed, 1, "bridge worker not running");
 
     // bgw_restart_time is 5s, so poll rather than assume the next call lands.
     // pg_terminate_backend returns at signal delivery, so a call can still
@@ -735,11 +725,14 @@ async fn bridge_reconnects_after_worker_exit() {
     }
     assert!(bridge.is_up());
     // Postmaster restarted the worker, not the cluster
-    assert_eq!(scalar(&sql, "SELECT 'alive'").await, "alive");
+    assert_eq!(scalar::<String>(&sql, "SELECT 'alive'").await, "alive");
 
     // The defaults did land on fresh connections...
     let fresh = connect_sql(&guard.sh).await;
-    assert_eq!(scalar(&fresh, "SHOW timezone").await, "America/New_York");
+    assert_eq!(
+        scalar::<String>(&fresh, "SHOW timezone").await,
+        "America/New_York"
+    );
     // ...and the worker pinned its canonical output over them
     let interval_90s = {
         let mut b = 90_000_000i64.to_le_bytes().to_vec(); // µs

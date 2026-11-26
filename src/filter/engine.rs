@@ -292,15 +292,7 @@ impl Filter {
 
     /// Seed observation state from source snapshot
     pub async fn seed_observed_from_source(&mut self, client: &Client) -> Result<u32, SeedError> {
-        let row = client
-            .query_one(
-                "SELECT (pg_snapshot_xmax(pg_current_snapshot())::text::numeric \
-                 % 4294967296)::bigint",
-                &[],
-            )
-            .await?;
-        let next_xid: i64 = row.get(0);
-        let next_xid = next_xid as u32;
+        let next_xid = crate::pg::next_xid(client).await?.0 as u32;
         self.observe_from_xid(next_xid);
         Ok(next_xid)
     }

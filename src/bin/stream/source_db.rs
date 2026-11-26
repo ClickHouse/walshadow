@@ -432,12 +432,9 @@ pub(crate) async fn list_databases(
     client: &tokio_postgres::Client,
 ) -> anyhow::Result<foldhash::HashMap<String, u32>> {
     let rows = client
-        .query("SELECT datname::text, oid::int8 FROM pg_database", &[])
+        .query("SELECT datname, oid FROM pg_database", &[])
         .await?;
-    Ok(rows
-        .iter()
-        .map(|r| (r.get::<_, String>(0), r.get::<_, i64>(1) as u32))
-        .collect())
+    Ok(rows.iter().map(|r| (r.get(0), r.get(1))).collect())
 }
 
 /// Source sidecar connection to one database, for config seeding and COPY
