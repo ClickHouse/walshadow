@@ -22,6 +22,9 @@ Restart may resend rows already inserted near checkpoint. Source row keys and
 LSN versions make normal replay converge. Losing required WAL or durable history
 is an error, not permission to skip ahead
 
+Starting below descriptor log's seed would skip seeded relations' records
+undecoded: refuse when a manifest exists, re-seed when none ever landed
+
 ## Separate retention needs
 
 Decoder history and TOAST cleanup follow persisted restart floor. Filtered WAL
