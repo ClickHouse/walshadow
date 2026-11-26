@@ -426,6 +426,9 @@ For systemd, install `deploy/walshadow.service.d/process-restart.conf` as
 `systemctl daemon-reload`. Launcher must `exec` walshadow, so MainPID receives
 SIGTERM. Drop-in scopes signals to walshadow; stopping unit deliberately leaves
 shadow running. Stop shadow explicitly with `pg_ctl` when retiring instance.
+Drop-in also sets `RestartPreventExitStatus=65`: a deterministic fail-closed
+stop leaves unit failed rather than restarting into same verdict. See
+[Fail-closed stops](operations.md#fail-closed-stops).
 
 When upgrading from a binary without `--keep-shadow-running` support, install
 replacement binary and drop-in, reload systemd, then signal only running MainPID

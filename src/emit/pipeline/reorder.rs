@@ -53,7 +53,7 @@ use crate::emit::pipeline::encode::{self, Encoders, PendingSegment};
 use crate::emit::pipeline::plan_spool::{
     EncoderCache, PlanItem, PlanPath, SealedPlan, Segment, SegmentBody,
 };
-use crate::emit::pipeline::planner::{PlanRouteView, Planner, drain_reason};
+use crate::emit::pipeline::planner::{PlanRouteView, Planner, deterministic_reason, drain_reason};
 use crate::emit::pipeline::{DbDdl, Fatal};
 use crate::emit::route::{RouteSnapshot, RowPolicy, route_via};
 use crate::mapping::{MappingSnapshot, TableMapping};
@@ -1109,7 +1109,7 @@ impl ReorderSink {
             self.stats.clone(),
         )
         .await
-        .map_err(SinkError::from)?;
+        .map_err(|e| xact_failed(&self.stats, e, record.source_lsn))?;
         let drain_span = trace_span!(
             !txn.is_none(),
             parent: &txn,
@@ -1136,7 +1136,7 @@ impl ReorderSink {
             )
             .instrument(reorder_span)
             .await
-            .map_err(SinkError::from)?
+            .map_err(|e| xact_failed(&self.stats, e, record.source_lsn))?
         };
         self.subxact_tracker.lock().await.forget_tree(xid);
         // Timeline outlived its use: resolution above already folded it
@@ -1222,7 +1222,12 @@ impl ReorderSink {
                         .instrument(drain_span.clone())
                         .await
                         .map_err(|PullError(drain, err)| {
-                            drain.inspect(|reason| bump_plan_failure(&stats, reason));
+                            if let Some(drain) = drain {
+                                bump_plan_failure(&stats, drain.reason);
+                                stats
+                                    .fail_closed
+                                    .trip_if(drain.deterministic, commit_lsn, &err);
+                            }
                             err
                         })?
                     else {
@@ -1232,14 +1237,16 @@ impl ReorderSink {
                     planner
                         .plan_batch(batch)
                         .await
-                        .map_err(plan_failed(&stats, "plan"))?;
+                        .map_err(plan_failed(&stats, "plan", commit_lsn))?;
                     if is_final {
                         break;
                     }
                 }
-                let plan = planner
-                    .seal(commit_lsn, commit_ts)
-                    .map_err(plan_failed(&stats, "plan seal"))?;
+                let plan = planner.seal(commit_lsn, commit_ts).map_err(plan_failed(
+                    &stats,
+                    "plan seal",
+                    commit_lsn,
+                ))?;
                 // Folded catalog events make routes this transaction's own
                 let ReorderRouteView {
                     mapping,
@@ -1343,22 +1350,48 @@ impl BootingReorder {
 
 /// Drain errors count as plan failures under their reason, admission
 /// errors carry none and are pipeline fatal
-struct PullError(Option<&'static str>, SinkError);
+struct PullError(Option<DrainFailure>, SinkError);
+
+/// Labels a drain error carries out of the admission callback
+struct DrainFailure {
+    reason: &'static str,
+    /// Set when the error repeats on every replay of the same WAL
+    deterministic: Option<&'static str>,
+}
 
 impl From<XactBufferError> for PullError {
     fn from(e: XactBufferError) -> Self {
-        Self(Some(drain_reason(&e)), e.into())
+        let failure = DrainFailure {
+            reason: drain_reason(&e),
+            deterministic: deterministic_reason(&e),
+        };
+        Self(Some(failure), e.into())
     }
 }
 
-/// Count a planning failure under its reason, failing the commit
+/// Commit-time stash resolution or drain setup failed: trip the
+/// fail-closed latch when the verdict is deterministic
+fn xact_failed(stats: &EmitterStats, e: XactBufferError, commit_lsn: u64) -> SinkError {
+    let deterministic = deterministic_reason(&e);
+    let err = SinkError::from(e);
+    stats.fail_closed.trip_if(deterministic, commit_lsn, &err);
+    err
+}
+
+/// Count a planning failure under its reason, failing the commit. A
+/// deterministic one also trips the fail-closed latch at `commit_lsn`
 fn plan_failed(
     stats: &EmitterStats,
     step: &'static str,
+    commit_lsn: u64,
 ) -> impl FnOnce(crate::emit::pipeline::planner::PlanError) -> SinkError {
     move |e| {
         bump_plan_failure(stats, e.reason());
-        SinkError::Other(format!("{step}: {e}"))
+        let err = SinkError::Other(format!("{step}: {e}"));
+        stats
+            .fail_closed
+            .trip_if(e.deterministic_reason(), commit_lsn, &err);
+        err
     }
 }
 

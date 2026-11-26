@@ -263,14 +263,26 @@ pub(crate) async fn run_session(
     sighup: tokio::signal::unix::Signal,
     shutdown: &CancellationToken,
     attach: &AttachSlot,
+    fail_closed: &walshadow::fail_closed::FailClosedLatch,
 ) -> Result<()> {
     let io = TaskTracker::new();
-    let res = session_body(args, metrics, reloader, sighup, shutdown, attach, &io).await;
+    let res = session_body(
+        args,
+        metrics,
+        reloader,
+        sighup,
+        shutdown,
+        attach,
+        fail_closed,
+        &io,
+    )
+    .await;
     io.close();
     io.wait().await;
     res
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn session_body(
     args: &Args,
     metrics: &MetricsRegistry,
@@ -278,6 +290,7 @@ async fn session_body(
     mut sighup: tokio::signal::unix::Signal,
     shutdown: &CancellationToken,
     attach: &AttachSlot,
+    fail_closed: &walshadow::fail_closed::FailClosedLatch,
     io: &TaskTracker,
 ) -> Result<()> {
     // Clone the Arc-backed registry so the body's `&metrics` uses are unchanged.
@@ -384,7 +397,10 @@ async fn session_body(
     // One emitter-counter handle for both phases. Bootstrap's insert tail and
     // the streaming pipeline write the same series, so sharing it is what
     // keeps inserter and TOAST totals from resetting at handoff
-    let emitter_stats = Arc::new(EmitterStats::default());
+    let emitter_stats = Arc::new(EmitterStats {
+        fail_closed: fail_closed.clone(),
+        ..EmitterStats::default()
+    });
     let mut bootstrap_metrics: Option<BootstrapMetrics> = None;
     let mut bootstrap_handoff = if let ShadowStart::Bootstrap(_, attempt) = &shadow_start {
         if !args.skip_preflight {
@@ -1264,7 +1280,10 @@ async fn session_body(
             buffer: xact_buffer.clone(),
             subxact_tracker: Arc::new(Mutex::new(SubxactTracker::new())),
             pending: pending_catalog.clone(),
-            stats: Arc::new(EmitterStats::default()),
+            stats: Arc::new(EmitterStats {
+                fail_closed: fail_closed.clone(),
+                ..EmitterStats::default()
+            }),
             span_registry: span_registry.clone(),
             retires,
             pending_rows: walshadow::visibility_pending::PendingLedger::empty().shared(),

@@ -1,6 +1,7 @@
 pub mod bridge;
 pub mod control;
 pub mod ctl;
+pub mod fail_closed;
 pub mod init;
 pub mod introspect;
 pub mod log_events;

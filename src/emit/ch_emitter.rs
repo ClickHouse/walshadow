@@ -3406,6 +3406,9 @@ crate::atomic_stats! {
         /// Values requested per store fetch
         pub toast_values_per_fetch: ValuesPerFetch,
         pub replication_latency: ReplicationLatency,
+        /// First deterministic fail-closed verdict; the daemon reads it on
+        /// session exit to stop terminally instead of restarting
+        pub fail_closed: crate::fail_closed::FailClosedLatch,
         /// Toasted values NULL/default-filled because no store could rebuild
         /// them (disabled mode). Surfaced, never silent
         pub toast_values_filled_default,

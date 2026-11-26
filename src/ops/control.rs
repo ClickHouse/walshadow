@@ -700,6 +700,15 @@ async fn stream_status(ctx: &SharedCtx) -> Result<String> {
         "crossing_detail".into(),
         snap.crossing_detail.clone().into(),
     );
+    // Deterministic verdict the daemon is stopping on: distinct from a source
+    // outage, it needs an operator and a restart will not clear it
+    let mut fail_closed = Table::new();
+    if let Some(v) = &snap.fail_closed {
+        fail_closed.insert("reason".into(), v.reason.clone().into());
+        fail_closed.insert("lsn".into(), v.lsn_text().into());
+        fail_closed.insert("error".into(), v.error.clone().into());
+    }
+    out.insert("fail_closed".into(), Value::Table(fail_closed));
     // Step 5's gate, off the endpoint the pump holds: whether the target may be
     // promoted, and which term says no
     out.insert("pause_refrozen".into(), snap.pause_refrozen.into());
