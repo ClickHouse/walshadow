@@ -3459,6 +3459,8 @@ crate::atomic_stats! {
         pub pending_undecidable_xids,
         pub toast_mirror_truncates,
         pub toast_mirror_retires,
+        /// Mirrors a fresh greenfield walk emptied before rebuilding them
+        pub toast_mirror_resets,
         /// Rewrite generations closed with residual `O - B` tombstones
         pub toast_rewrite_barriers,
         /// Stashed records decoded at commit against a resolved toast heap

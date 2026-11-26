@@ -505,6 +505,8 @@ snapshot! {
         "Mirror wipes from owner TRUNCATE, applied at the reorder barrier.",
     counter toast_mirror_retires_total: u64 =
         "Mirrors emptied because their toast rel dropped (owner DROP / rewrite); table retained.",
+    counter toast_mirror_resets_total: u64 =
+        "Mirrors emptied by a fresh greenfield bootstrap before its page walk rebuilds them, so rows an earlier run left cannot outrank walked chunks.",
     counter toast_rewrite_barriers_total: u64 =
         "Rewrite generations closed with residual O-B tombstones.",
     counter toast_stash_buffered_total: u64 =

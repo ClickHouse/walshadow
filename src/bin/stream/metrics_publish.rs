@@ -629,6 +629,7 @@ pub(crate) fn stage_gauges_on(v: &StageCounters<'_>, base: MetricsSnapshot) -> M
         bootstrap_gate_multixact_emitted_total: emitter(|s| &s.gate_multixact_emitted),
         toast_mirror_truncates_total: emitter(|s| &s.toast_mirror_truncates),
         toast_mirror_retires_total: emitter(|s| &s.toast_mirror_retires),
+        toast_mirror_resets_total: emitter(|s| &s.toast_mirror_resets),
         toast_rewrite_barriers_total: emitter(|s| &s.toast_rewrite_barriers),
         toast_stash_decoded_total: emitter(|s| &s.toast_stash_decoded),
         toast_stash_discarded_total: emitter(|s| &s.toast_stash_discarded),

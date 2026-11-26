@@ -1656,6 +1656,13 @@ impl ToastResolver {
             .await
     }
 
+    /// Empty a mirror a fresh greenfield walk is about to rebuild, no-op
+    /// without a writable store
+    pub async fn reset_mirror(&self, db_oid: u32, toast_relid: u32) -> Result<(), ChunkStoreError> {
+        self.clear_mirror(db_oid, toast_relid, &self.stats.toast_mirror_resets)
+            .await
+    }
+
     /// Empty retired mirror without dropping it, no-op without store
     pub async fn retire_mirror(
         &self,

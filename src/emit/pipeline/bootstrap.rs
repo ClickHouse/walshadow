@@ -2552,6 +2552,94 @@ mod tests {
         collector.await.unwrap();
     }
 
+    /// Greenfield walk over a mirror an earlier run left behind: the old
+    /// run's row at the walked TID carries a real `_lsn`, so it outranks the
+    /// walk's `_lsn = 0` copy unless the bootstrap resets the mirror first
+    async fn greenfield_over_stale_mirror(
+        reset: bool,
+    ) -> (
+        Result<BootstrapDrainOutcome, String>,
+        Vec<(u64, Vec<Datum>)>,
+    ) {
+        let mut catalog = CatalogMap::new();
+        catalog.insert(bytea_rel(16400));
+        catalog.insert(toast_rel(16500));
+        let mapping = Arc::new(
+            [(RelName::new("public", "t16400"), bytea_mapping_for(16400))]
+                .into_iter()
+                .collect(),
+        );
+        let stats = Arc::new(EmitterStats::default());
+        let store = Arc::new(MemChunkStore::new());
+        // Earlier run mirrored value 77 at TID (1, 1), which the source has
+        // since freed and reused for value 1. Its LSN predates this backup's
+        // start, the bound referrers resolve at
+        let toast = catalog.get(5, 16500).unwrap();
+        let stale = ToastRow {
+            chunk_id: 77,
+            lsn: 0x800,
+            ..chunk_row(&toast, 77, b"stale")
+        };
+        crate::toast::ChunkStore::put(&*store, &[stale])
+            .await
+            .unwrap();
+        let resolver = ToastResolver::with_store(store, stats.clone());
+        if reset {
+            let reset =
+                crate::backfill_bootstrap::reset_walked_toast_mirrors(&catalog, None, &resolver)
+                    .await
+                    .unwrap();
+            assert_eq!(reset, 1, "one walked toast relation");
+        }
+
+        let (ack, collector) = ack::spawn(Arc::default(), Fatal::new());
+        let (msg_tx, mut msg_rx) = mpsc::channel::<BatcherMsg>(64);
+        let (tup_tx, tup_rx) = mpsc::channel::<Vec<BackfillTuple>>(64);
+        tup_tx
+            .send(vec![toast_chunk_tuple(16500, 1, 0, b"hello")])
+            .await
+            .unwrap();
+        tup_tx
+            .send(vec![bytea_toast_tuple(16400, 16500, 1)])
+            .await
+            .unwrap();
+        drop(tup_tx);
+        let drain_task = tokio::spawn(drain(
+            tup_rx,
+            catalog,
+            freeze_routes(&mapping, None, &RowPolicy::default()),
+            msg_tx,
+            ack.clone(),
+            stats,
+            resolver,
+            Deferral::Local(mem_spool()),
+            HashSet::new(),
+            None,
+        ));
+        let rows = collect_rows(&mut msg_rx).await;
+        let outcome = drain_task.await.unwrap();
+        drop(ack);
+        collector.await.unwrap();
+        (outcome, rows)
+    }
+
+    /// Without the reset the stale row hides the walked chunk: the
+    /// production failure, kept so the mechanism stays pinned
+    #[tokio::test]
+    async fn stale_mirror_row_hides_walked_chunk() {
+        let (outcome, _) = greenfield_over_stale_mirror(false).await;
+        let err = outcome.unwrap_err();
+        assert!(err.contains("has no chunks in the store"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn greenfield_reset_drops_stale_mirror_rows() {
+        let (outcome, rows) = greenfield_over_stale_mirror(true).await;
+        assert_eq!(outcome.unwrap().rows_routed, 1);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].1[0], build::bytes(b"hello"));
+    }
+
     async fn replay_one(
         mapping: HashMap<RelName, Arc<TableMapping>>,
         resolver: ToastResolver,

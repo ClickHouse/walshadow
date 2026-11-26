@@ -148,6 +148,41 @@ pub fn tap_filenode_set(
     Some(set)
 }
 
+/// Empty the chunk mirror of every TOAST heap a fresh greenfield walk taps
+/// (`tap` as [`tap_filenode_set`] built it, `None` for all), returning how
+/// many it reset. Call before the walk or window leg puts any chunk, and
+/// never on an attempt resuming past extraction: its mirror rows are the
+/// only copy of what the finished walk put
+///
+/// The walk puts each chunk at `_lsn = 0`, its weakest version, so that any
+/// WAL-sourced row for the same TID outranks it. A mirror an earlier run
+/// left behind holds rows at real LSNs; at a TID the source has since
+/// reused, the stale row would win the as-of read and the walked value
+/// would go missing. The walk plus the window rebuild each mirror whole as
+/// of the backup's end, so nothing the old rows hold is still needed
+pub async fn reset_walked_toast_mirrors(
+    catalog: &CatalogMap,
+    tap: Option<&foldhash::HashSet<(Oid, Oid)>>,
+    resolver: &crate::toast::ToastResolver,
+) -> Result<usize, crate::toast::ChunkStoreError> {
+    if !resolver.stores_chunks() {
+        return Ok(0);
+    }
+    let mut mirrors: Vec<(Oid, Oid)> = catalog
+        .descriptors()
+        .filter(|d| catalog.is_toast(d.rfn.db_node, d.rfn.rel_node))
+        .filter(|d| tap.is_none_or(|t| t.contains(&(d.rfn.db_node, d.rfn.rel_node))))
+        // Mirror key, as `toast_row` stamps it
+        .map(|d| (d.rfn.db_node, d.oid))
+        .collect();
+    mirrors.sort_unstable();
+    mirrors.dedup();
+    for &(db_oid, toast_relid) in &mirrors {
+        resolver.reset_mirror(db_oid, toast_relid).await?;
+    }
+    Ok(mirrors.len())
+}
+
 /// Spawn pump on a tokio task, yield `(rx, handle)` so caller drains
 /// `BackfillTuple`s concurrently. Pump drops its sender on return;
 /// `rx.recv() == None` signals channel close.
@@ -414,6 +449,78 @@ mod tests {
         let mut catalog = CatalogMap::new();
         catalog.insert(Arc::new(rel));
         assert!(tap_filenode_set(&catalog, |_| true, |_| true).is_none());
+    }
+
+    /// Only tapped TOAST heaps reset, each under its mirror key (toast OID,
+    /// not the filenode a rewrite moved it to); main heaps and untapped
+    /// TOAST heaps keep their rows
+    #[tokio::test]
+    async fn greenfield_reset_empties_tapped_toast_mirrors_only() {
+        use crate::toast::{ChunkStore, FetchedValue, MemChunkStore, ToastResolver, ToastRow};
+        let main = make_rel();
+        let db = main.rfn.db_node;
+        let tapped = crate::backfill::backup_page_walk::toast_chunk_rel();
+        let mut untapped = tapped.clone();
+        untapped.oid = 16502;
+        untapped.rfn.rel_node = 16601;
+        untapped.rel_name = RelName::new("pg_toast", "pg_toast_16500");
+        let mut catalog = CatalogMap::new();
+        for d in [main.clone(), tapped.clone(), untapped.clone()] {
+            catalog.insert(Arc::new(d));
+        }
+        let row = |toast_relid| ToastRow {
+            db_oid: db,
+            toast_relid,
+            blkno: 0,
+            offnum: 1,
+            chunk_id: 7,
+            chunk_seq: 0,
+            chunk_data: bytes::Bytes::from_static(b"x"),
+            lsn: 0x10,
+        };
+        let present = async |store: &MemChunkStore, relid| {
+            matches!(
+                store.fetch(db, relid, 7, u64::MAX, 1).await.unwrap(),
+                FetchedValue::Assembled(_)
+            )
+        };
+        let tap: foldhash::HashSet<(Oid, Oid)> =
+            [(db, main.rfn.rel_node), (db, tapped.rfn.rel_node)]
+                .into_iter()
+                .collect();
+        let stats = Arc::new(crate::emit::ch_emitter::EmitterStats::default());
+
+        let store = Arc::new(MemChunkStore::new());
+        store.put(&[row(16401), row(16502)]).await.unwrap();
+        let resolver = ToastResolver::with_store(store.clone(), stats.clone());
+        let reset = reset_walked_toast_mirrors(&catalog, Some(&tap), &resolver)
+            .await
+            .unwrap();
+        assert_eq!(reset, 1);
+        assert!(!present(&store, 16401).await, "tapped mirror emptied");
+        assert!(present(&store, 16502).await, "untapped mirror kept");
+        assert_eq!(
+            stats
+                .toast_mirror_resets
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+
+        // Unfiltered walk taps every TOAST heap
+        let reset = reset_walked_toast_mirrors(&catalog, None, &resolver)
+            .await
+            .unwrap();
+        assert_eq!(reset, 2);
+        assert!(!present(&store, 16502).await);
+
+        // No writable store, nothing to reset
+        let disabled = ToastResolver::disabled();
+        assert_eq!(
+            reset_walked_toast_mirrors(&catalog, None, &disabled)
+                .await
+                .unwrap(),
+            0
+        );
     }
 
     #[test]
