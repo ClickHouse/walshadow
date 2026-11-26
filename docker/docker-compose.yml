@@ -24,6 +24,7 @@ services:
       dockerfile: docker/Dockerfile
       args:
         PG_MAJOR: ${PG_MAJOR:-18}
+    restart: unless-stopped
     environment:
       - RUST_LOG=${RUST_LOG:-warn,walshadow=info}
       # Bare names pass the shell's value through, so an unset URL stays unset
