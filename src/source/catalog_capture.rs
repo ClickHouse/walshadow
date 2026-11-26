@@ -440,18 +440,16 @@ impl CatalogCapture {
                 // before its first command boundary, and its rows start at
                 // the smgr create — the exact lower bound `CREATE TABLE AS`
                 // needs, where one command writes storage, fills it, and
-                // only then hits its CCI. Only the first shape seen on that
-                // generation may claim the marker; a later boundary
-                // answering from it would bury the earlier one
+                // only then hits its CCI. Pending keeps the marker only for
+                // the generation's earliest capture
                 let pred_rfn = self.present_before(desc.oid, next_lsn).map(|d| d.rfn);
-                let first_seen =
-                    pred_rfn != Some(desc.rfn) && !self.pending.has_slots(top_xid, desc.rfn);
-                let valid_from = first_seen
+                let valid_from = (pred_rfn != Some(desc.rfn))
                     .then(|| self.marker_for(desc.rfn))
                     .flatten()
                     .unwrap_or(next_lsn);
                 PendingSlot {
                     valid_from,
+                    captured_at: next_lsn,
                     writer_xid,
                     desc: Arc::new(desc),
                 }
@@ -618,10 +616,9 @@ impl CatalogCapture {
                         // rotation's rewrite emits final-layout tuples and
                         // a fresh generation has no covered predecessor
                         let mut valid_from = first_touch;
-                        if changed
-                            && !rotated
-                            && let Some(pred) = pred_desc.as_deref()
-                        {
+                        // Unchanged still judges a degraded tail: a missed
+                        // boundary may have restored the predecessor
+                        if !rotated && let Some(pred) = pred_desc.as_deref() {
                             // The timeline answers from the first boundary
                             // that named the relation on, so only the run
                             // up to it stays fenced. Rows there predate the
@@ -670,36 +667,21 @@ impl CatalogCapture {
                                 ambiguities.extend(published.into_iter().map(Arc::new));
                             }
                         }
-                        // Promoted first, commit shape last: the batch reads
-                        // as the transaction's own sequence of shapes. Past a
-                        // degrade cut the commit shape answers from the cut,
-                        // or the lookup would keep resolving the last slot
-                        let mut prev = pred_desc.as_deref();
-                        for slot in slots {
-                            if prev == Some(slot.desc.as_ref()) {
-                                continue;
-                            }
-                            prev = Some(slot.desc.as_ref());
-                            entries.push(Arc::new(LogEntry {
-                                valid_from: slot.valid_from,
-                                oid,
-                                rfn: slot.desc.rfn,
-                                value: LogValue::Present(slot.desc.clone()),
-                            }));
-                            self.stats.pending_entries_promoted.fetch_add(1, Relaxed);
-                        }
-                        if !slots.is_empty()
-                            && let Some(cut) = promoted.as_ref().and_then(|p| p.degraded_at)
-                        {
-                            valid_from = valid_from.max(cut);
-                        }
-                        let desc = Arc::new(desc.clone());
-                        entries.push(Arc::new(LogEntry {
+                        let until = promoted
+                            .as_ref()
+                            .and_then(|p| p.degraded_at)
+                            .unwrap_or(next_lsn);
+                        let (oid_entries, promoted_slots) = commit_entries(
+                            pred_desc.as_deref(),
+                            slots,
+                            &Arc::new(desc.clone()),
                             valid_from,
-                            oid,
-                            rfn: desc.rfn,
-                            value: LogValue::Present(desc),
-                        }));
+                            until,
+                        );
+                        self.stats
+                            .pending_entries_promoted
+                            .fetch_add(promoted_slots, Relaxed);
+                        entries.extend(oid_entries);
                     }
                 }
                 None => {
@@ -838,6 +820,49 @@ fn in_place_verdict(
         })
         .collect();
     (valid_from, published, incompat)
+}
+
+/// One oid's promoted slots, then its commit shape at `valid_from`: the
+/// batch reads as the transaction's own sequence of shapes, and event
+/// derivation anchors at its earliest entry. Lookup takes the newest
+/// `valid_from` at or before an LSN, ties to the later entry, and later
+/// transactions take the newest entry as predecessor. A slot newer than
+/// `valid_from` would keep answering from `until` on, where the timeline
+/// stops and the drain reads the commit shape, so the commit shape lands
+/// there too. Returns the entries and how many are slots
+fn commit_entries(
+    pred: Option<&RelDescriptor>,
+    slots: &[PendingSlot],
+    fin: &Arc<RelDescriptor>,
+    valid_from: u64,
+    until: u64,
+) -> (Vec<Arc<LogEntry>>, u64) {
+    let present = |valid_from, desc: &Arc<RelDescriptor>| {
+        Arc::new(LogEntry {
+            valid_from,
+            oid: desc.oid,
+            rfn: desc.rfn,
+            value: LogValue::Present(desc.clone()),
+        })
+    };
+    let mut entries: Vec<Arc<LogEntry>> = Vec::with_capacity(slots.len() + 2);
+    let mut prev = pred;
+    for slot in slots {
+        if prev == Some(slot.desc.as_ref()) {
+            continue;
+        }
+        prev = Some(slot.desc.as_ref());
+        entries.push(present(slot.valid_from, &slot.desc));
+    }
+    let promoted = entries.len() as u64;
+    let buried = entries.last().is_some_and(|e| {
+        e.value.present() != Some(fin) && !(e.valid_from..=until).contains(&valid_from)
+    });
+    entries.push(present(valid_from, fin));
+    if buried {
+        entries.push(present(until, fin));
+    }
+    (entries, promoted)
 }
 
 /// Added / Changed for heap kinds; toast shape changes are internal (chunk
@@ -1033,6 +1058,80 @@ mod tests {
             .map(|a| (a.from_lsn, a.through_lsn))
             .collect();
         assert_eq!(spans, vec![(100, 200), (100, 200), (450, 500), (450, 500)]);
+    }
+
+    /// A missed boundary that restored the predecessor leaves pred == fin,
+    /// yet the tail was written under the last slot
+    #[test]
+    fn restored_predecessor_still_fences_its_tail() {
+        let pred = rel(23, 4, "t");
+        let mid = rel(20, 8, "t");
+        let (from, published, _) =
+            in_place_verdict(&pred, &pred, 42, 100, 500, Some(cov(200, Some(450), &mid)));
+        assert_eq!(from, 100);
+        let spans: Vec<(u64, u64)> = published
+            .iter()
+            .map(|a| (a.from_lsn, a.through_lsn))
+            .collect();
+        assert_eq!(spans, vec![(450, 500), (450, 500)]);
+    }
+
+    fn pending_slot(valid_from: u64, desc: &RelDescriptor) -> PendingSlot {
+        PendingSlot {
+            valid_from,
+            captured_at: valid_from,
+            writer_xid: 1,
+            desc: Arc::new(desc.clone()),
+        }
+    }
+
+    fn present_at(entries: &[Arc<LogEntry>]) -> Vec<(u64, &str)> {
+        entries
+            .iter()
+            .map(|e| (e.valid_from, &*e.value.present().unwrap().rel_name.name))
+            .collect()
+    }
+
+    /// Bias-early commit shape stays the earliest entry for event
+    /// derivation, and lands again at the cut so the slot stops there
+    #[test]
+    fn commit_shape_answers_from_bias_early_and_the_cut() {
+        let pred = rel(23, 4, "pred");
+        let fin = Arc::new(rel(23, 4, "fin"));
+        let slots = [
+            pending_slot(150, &pred),
+            pending_slot(200, &rel(23, 4, "mid")),
+        ];
+        let (entries, promoted) = commit_entries(Some(&pred), &slots, &fin, 100, 450);
+        assert_eq!(promoted, 1, "slot equal to pred adds nothing");
+        assert_eq!(
+            present_at(&entries),
+            vec![(200, "mid"), (100, "fin"), (450, "fin")]
+        );
+    }
+
+    /// Head fenced, commit shape at commit: the slot would still answer
+    /// between the cut and commit
+    #[test]
+    fn commit_shape_past_the_cut_also_lands_at_it() {
+        let fin = Arc::new(rel(23, 4, "fin"));
+        let slots = [pending_slot(200, &rel(23, 4, "mid"))];
+        let (entries, _) = commit_entries(None, &slots, &fin, 500, 450);
+        assert_eq!(
+            present_at(&entries),
+            vec![(200, "mid"), (500, "fin"), (450, "fin")]
+        );
+    }
+
+    /// Commit shape already newest, or the last slot already is it
+    #[test]
+    fn commit_shape_lands_once_when_nothing_buries_it() {
+        let fin = Arc::new(rel(23, 4, "fin"));
+        let mid = rel(23, 4, "mid");
+        let (entries, _) = commit_entries(None, &[pending_slot(200, &mid)], &fin, 300, 450);
+        assert_eq!(present_at(&entries), vec![(200, "mid"), (300, "fin")]);
+        let (entries, _) = commit_entries(None, &[pending_slot(200, &fin)], &fin, 100, 450);
+        assert_eq!(present_at(&entries), vec![(200, "fin"), (100, "fin")]);
     }
 
     /// `ATTACH` and identity changes alter no column, yet decide routing

@@ -6149,6 +6149,7 @@ mod tests {
             Arc::new(commit_shape),
             vec![PendingSlot {
                 valid_from: 200,
+                captured_at: 200,
                 writer_xid: 1,
                 desc: boundary_shape,
             }],
@@ -6208,6 +6209,7 @@ mod tests {
             Arc::new(commit_shape),
             vec![PendingSlot {
                 valid_from: 200,
+                captured_at: 200,
                 writer_xid: 1,
                 desc: boundary_shape,
             }],
@@ -6260,6 +6262,7 @@ mod tests {
             owner.clone(),
             vec![PendingSlot {
                 valid_from: 60,
+                captured_at: 60,
                 writer_xid: 1,
                 desc: Arc::new(transient),
             }],

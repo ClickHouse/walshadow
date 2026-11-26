@@ -65,9 +65,13 @@ impl DegradeReason {
 /// One relation's shape at one command boundary of one transaction
 #[derive(Debug, Clone)]
 pub struct PendingSlot {
-    /// First LSN this shape answers for: the boundary, or the generation's
-    /// `XLOG_SMGR_CREATE` marker when the relation was born in this xact
+    /// First LSN this shape answers for: `captured_at`, or the generation's
+    /// `XLOG_SMGR_CREATE` marker for the first shape seen on a filenode born
+    /// in this xact
     pub valid_from: u64,
+    /// Boundary the shape was read at. Orders the chain and decides what a
+    /// degrade cuts: `valid_from` can reach back before evidence existed
+    pub captured_at: u64,
     /// (Sub)xid current at capture; a subxact abort drops its slots
     pub writer_xid: u32,
     pub desc: Arc<RelDescriptor>,
@@ -76,9 +80,9 @@ pub struct PendingSlot {
 /// One transaction tree's timeline
 #[derive(Debug, Default)]
 struct PendingXact {
-    /// Per-filenode chains, ascending by `valid_from`
+    /// Per-filenode chains, ascending by `captured_at` and so by
+    /// `valid_from`
     chains: HashMap<RelFileNode, Vec<PendingSlot>>,
-    by_oid: HashMap<Oid, Vec<PendingSlot>>,
     /// Boundaries admitted, against `pending_max_boundaries_per_xact`
     boundaries: u32,
     /// Cumulative parked nanos, against the per-xact hold budget
@@ -101,19 +105,28 @@ impl PendingXact {
         true
     }
 
-    /// Slots a degrade has not voided
-    fn live<'a>(&self, slots: &'a [PendingSlot]) -> &'a [PendingSlot] {
+    /// Slots read before any degrade
+    fn live<'a>(&self, chain: &'a [PendingSlot]) -> &'a [PendingSlot] {
         let Some(at) = self.degraded_at else {
-            return slots;
+            return chain;
         };
-        &slots[..slots.partition_point(|s| s.valid_from < at)]
+        &chain[..chain.partition_point(|s| s.captured_at < at)]
     }
 
+    /// A re-capture at one boundary replaces: two shapes read at one LSN
+    /// have no order between them. Only the earliest capture on a filenode
+    /// may answer from its smgr marker; a later one answering from there
+    /// would bury it. A subxact keyed apart until `consolidate` cannot see
+    /// the top's slots at capture, so this is decided here, not there
     fn push(&mut self, slot: PendingSlot) {
-        let oid = slot.desc.oid;
-        let rfn = slot.desc.rfn;
-        insert_sorted(self.chains.entry(rfn).or_default(), slot.clone());
-        insert_sorted(self.by_oid.entry(oid).or_default(), slot);
+        let chain = self.chains.entry(slot.desc.rfn).or_default();
+        match chain.binary_search_by_key(&slot.captured_at, |s| s.captured_at) {
+            Ok(at) => chain[at] = slot,
+            Err(at) => chain.insert(at, slot),
+        }
+        for later in chain.iter_mut().skip(1) {
+            later.valid_from = later.captured_at;
+        }
     }
 
     fn absorb(&mut self, other: Self) {
@@ -125,14 +138,7 @@ impl PendingXact {
             (a, b) => a.or(b),
         };
         for slot in other.chains.into_values().flatten() {
-            let rfn = slot.desc.rfn;
-            insert_sorted(self.chains.entry(rfn).or_default(), slot);
-        }
-        for (oid, slots) in other.by_oid {
-            let chain = self.by_oid.entry(oid).or_default();
-            for slot in slots {
-                insert_sorted(chain, slot);
-            }
+            self.push(slot);
         }
     }
 
@@ -147,19 +153,7 @@ impl PendingXact {
             |slots: &mut Vec<PendingSlot>| slots.retain(|s| !members.contains(&s.writer_xid));
         self.chains.values_mut().for_each(keep);
         self.chains.retain(|_, slots| !slots.is_empty());
-        self.by_oid.values_mut().for_each(keep);
-        self.by_oid.retain(|_, slots| !slots.is_empty());
         before - self.slots()
-    }
-}
-
-/// Chains stay `valid_from`-ascending. A re-capture at the same position
-/// (same command boundary re-read) replaces rather than appends: two shapes
-/// at one LSN have no order between them
-fn insert_sorted(chain: &mut Vec<PendingSlot>, slot: PendingSlot) {
-    match chain.binary_search_by_key(&slot.valid_from, |s| s.valid_from) {
-        Ok(at) => chain[at] = slot,
-        Err(at) => chain.insert(at, slot),
     }
 }
 
@@ -173,8 +167,8 @@ pub struct PendingCatalog {
 
 /// What one transaction's timeline says at promotion
 pub struct PromotedXact {
-    /// Per-oid chains, ascending by `valid_from`, oids ascending. Slots at
-    /// or past `degraded_at` are already cut
+    /// Per-oid chains, ascending by `valid_from`, oids ascending. Slots read
+    /// at or past `degraded_at` are already cut
     pub by_oid: Vec<(Oid, Vec<PendingSlot>)>,
     pub degraded_at: Option<u64>,
 }
@@ -304,15 +298,6 @@ impl PendingCatalog {
             .map(|s| s.desc.clone())
     }
 
-    /// Whether an earlier boundary of this transaction already recorded the
-    /// filenode. A generation's smgr marker is a lower bound only for the
-    /// first shape seen on it; later boundaries answer from themselves
-    pub fn has_slots(&self, top_xid: u32, rfn: RelFileNode) -> bool {
-        let map = self.by_xid.read().expect("pending catalog poisoned");
-        map.get(&top_xid)
-            .is_some_and(|x| x.chains.contains_key(&rfn))
-    }
-
     /// One filenode's chain up to any degrade, for a caller folding many
     /// records against it. Empty when the transaction has no pending
     /// coverage of it
@@ -346,13 +331,17 @@ impl PendingCatalog {
     pub fn promoted(&self, top_xid: u32) -> Option<PromotedXact> {
         let map = self.by_xid.read().expect("pending catalog poisoned");
         let xact = map.get(&top_xid)?;
-        let mut by_oid: Vec<(Oid, Vec<PendingSlot>)> = xact
-            .by_oid
-            .iter()
-            .map(|(oid, slots)| (*oid, xact.live(slots).to_vec()))
-            .filter(|(_, slots)| !slots.is_empty())
+        let mut slots: Vec<PendingSlot> = xact
+            .chains
+            .values()
+            .flat_map(|chain| xact.live(chain))
+            .cloned()
             .collect();
-        by_oid.sort_unstable_by_key(|(oid, _)| *oid);
+        slots.sort_unstable_by_key(|s| (s.desc.oid, s.valid_from, s.captured_at));
+        let by_oid = slots
+            .chunk_by(|a, b| a.desc.oid == b.desc.oid)
+            .map(|run| (run[0].desc.oid, run.to_vec()))
+            .collect();
         Some(PromotedXact {
             by_oid,
             degraded_at: xact.degraded_at,
@@ -415,9 +404,10 @@ mod tests {
         })
     }
 
-    fn slot(valid_from: u64, writer_xid: u32, desc: Arc<RelDescriptor>) -> PendingSlot {
+    fn slot(captured_at: u64, writer_xid: u32, desc: Arc<RelDescriptor>) -> PendingSlot {
         PendingSlot {
-            valid_from,
+            valid_from: captured_at,
+            captured_at,
             writer_xid,
             desc,
         }
@@ -581,6 +571,45 @@ mod tests {
             p.descriptor_at(100, rfn, 450)
                 .is_some_and(|d| &*d.rel_name.name == "added")
         );
+    }
+
+    /// A subxact keyed apart cannot see the top's slots at capture, so both
+    /// claim the generation's marker; only the earliest capture keeps it
+    #[test]
+    fn only_the_earliest_capture_claims_the_marker() {
+        let p = PendingCatalog::default();
+        let rfn = desc(16400, 7000, "t").rfn;
+        let marked = |captured_at, xid, name| PendingSlot {
+            valid_from: 100,
+            ..slot(captured_at, xid, desc(16400, 7000, name))
+        };
+        p.record(101, vec![marked(500, 101, "child")]);
+        p.record(100, vec![marked(300, 100, "top")]);
+        p.consolidate(100, &[100, 101]);
+        let chain = p.chain(100, rfn);
+        let shapes: Vec<(u64, &str)> = chain
+            .iter()
+            .map(|s| (s.valid_from, &*s.desc.rel_name.name))
+            .collect();
+        assert_eq!(shapes, vec![(100, "top"), (500, "child")]);
+    }
+
+    /// The cut keys on where a shape was read: a marker-backdated slot read
+    /// past it is gone, though its `valid_from` sits before it
+    #[test]
+    fn degrade_cuts_on_capture_not_valid_from() {
+        let p = PendingCatalog::default();
+        p.record(100, vec![slot(200, 100, desc(16400, 7000, "t"))]);
+        p.degrade(100, DegradeReason::CaptureAll, 400);
+        let born = PendingSlot {
+            valid_from: 150,
+            ..slot(600, 101, desc(16401, 7001, "born"))
+        };
+        p.record(101, vec![born.clone()]);
+        p.consolidate(100, &[100, 101]);
+        assert!(p.chain(100, born.desc.rfn).is_empty());
+        assert!(p.promoted(100).expect("tree").coverage(16401).is_none());
+        assert!(p.descriptor_at(100, born.desc.rfn, 300).is_none());
     }
 
     /// Degrade before any boundary named the relation leaves nothing
