@@ -13,7 +13,7 @@ use crate::schema::RelName;
 pub struct SourceTable {
     pub rel: RelName,
     /// `pg_class.relreplident`: `d` default, `n` nothing, `f` full, `i` index
-    pub replica_identity: char,
+    pub replica_identity: u8,
     pub has_pk: bool,
 }
 
@@ -21,8 +21,8 @@ impl SourceTable {
     /// DELETE needs a row key, and CH needs an `ORDER BY` to collapse on
     pub fn has_row_key(&self) -> bool {
         match self.replica_identity {
-            'd' => self.has_pk,
-            'n' => false,
+            b'd' => self.has_pk,
+            b'n' => false,
             _ => true,
         }
     }
@@ -30,11 +30,11 @@ impl SourceTable {
     /// Why the picker refuses it, or how it identifies rows
     pub fn row_key_note(&self) -> &'static str {
         match self.replica_identity {
-            'd' if self.has_pk => "primary key",
-            'd' => "no primary key — add one, or SET REPLICA IDENTITY FULL",
-            'n' => "REPLICA IDENTITY NOTHING — deletes cannot be replicated",
-            'f' => "REPLICA IDENTITY FULL",
-            'i' => "REPLICA IDENTITY USING INDEX",
+            b'd' if self.has_pk => "primary key",
+            b'd' => "no primary key — add one, or SET REPLICA IDENTITY FULL",
+            b'n' => "REPLICA IDENTITY NOTHING — deletes cannot be replicated",
+            b'f' => "REPLICA IDENTITY FULL",
+            b'i' => "REPLICA IDENTITY USING INDEX",
             _ => "unknown replica identity",
         }
     }
@@ -119,7 +119,7 @@ pub async fn columns(
 mod tests {
     use super::*;
 
-    fn table(ident: char, has_pk: bool) -> SourceTable {
+    fn table(ident: u8, has_pk: bool) -> SourceTable {
         SourceTable {
             rel: RelName::new("public", "t"),
             replica_identity: ident,
@@ -129,30 +129,30 @@ mod tests {
 
     #[test]
     fn default_identity_needs_a_primary_key() {
-        assert!(table('d', true).has_row_key());
-        assert!(!table('d', false).has_row_key());
+        assert!(table(b'd', true).has_row_key());
+        assert!(!table(b'd', false).has_row_key());
     }
 
     #[test]
     fn full_and_index_identity_carry_their_own_key() {
-        assert!(table('f', false).has_row_key());
-        assert!(table('i', false).has_row_key());
+        assert!(table(b'f', false).has_row_key());
+        assert!(table(b'i', false).has_row_key());
     }
 
     #[test]
     fn nothing_identity_never_has_a_key() {
-        assert!(!table('n', true).has_row_key());
+        assert!(!table(b'n', true).has_row_key());
     }
 
     #[test]
     fn row_key_note_names_each_identity() {
         let notes = [
-            ('d', true),
-            ('d', false),
-            ('n', false),
-            ('f', false),
-            ('i', false),
-            ('?', false),
+            (b'd', true),
+            (b'd', false),
+            (b'n', false),
+            (b'f', false),
+            (b'i', false),
+            (b'?', false),
         ]
         .map(|(ident, pk)| table(ident, pk).row_key_note());
         assert_eq!(

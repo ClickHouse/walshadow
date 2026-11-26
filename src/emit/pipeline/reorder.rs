@@ -685,7 +685,7 @@ impl ReorderSink {
         // Validate partitions against root destinations after creating roots
         descs.sort_by_key(|d| d.ancestors.len());
         for desc in descs {
-            if desc.kind == 't' {
+            if desc.kind == b't' {
                 continue;
             }
             let Some(DbScope {

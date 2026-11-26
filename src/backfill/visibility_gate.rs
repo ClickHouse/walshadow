@@ -989,7 +989,7 @@ mod tests {
         body.type_oid = crate::schema::TEXTOID;
         body.type_len = -1;
         // SET STORAGE PLAIN leaves existing external values untouched
-        body.type_storage = 'p';
+        body.type_storage = b'p';
         d.attributes.push(body);
         let mut catalog = CatalogMap::new();
         catalog.insert(desc.clone());

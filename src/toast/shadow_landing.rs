@@ -105,7 +105,7 @@ fn toast_heaps<'a>(
     tap_filenodes: Option<&HashSet<(u32, u32)>>,
 ) -> Result<Vec<&'a RelDescriptor>> {
     let heaps: Vec<_> = descriptors
-        .filter(|d| d.kind == 't')
+        .filter(|d| d.kind == b't')
         .filter(|d| tap_filenodes.is_none_or(|set| set.contains(&(d.rfn.db_node, d.rfn.rel_node))))
         .collect();
     if let Some(d) = heaps
@@ -178,7 +178,7 @@ mod tests {
     use crate::schema::{RelName, ReplIdent};
     use walrus::pg::walparser::RelFileNode;
 
-    fn desc(kind: char, rel_node: u32, spc_node: u32) -> RelDescriptor {
+    fn desc(kind: u8, rel_node: u32, spc_node: u32) -> RelDescriptor {
         RelDescriptor {
             rfn: RelFileNode {
                 spc_node,
@@ -190,7 +190,7 @@ mod tests {
             namespace_oid: 99,
             rel_name: RelName::new("pg_toast", &format!("pg_toast_{rel_node}")),
             kind,
-            persistence: 'p',
+            persistence: b'p',
             ancestors: Vec::new(),
             replident: ReplIdent::Default { pk_attnums: None },
             attributes: Vec::new(),
@@ -200,9 +200,9 @@ mod tests {
     #[test]
     fn heaps_take_opted_in_toast_and_refuse_another_tablespace() {
         let all = [
-            desc('t', 16400, DEFAULT_TABLESPACE_OID),
-            desc('t', 16401, DEFAULT_TABLESPACE_OID),
-            desc('r', 16402, DEFAULT_TABLESPACE_OID),
+            desc(b't', 16400, DEFAULT_TABLESPACE_OID),
+            desc(b't', 16401, DEFAULT_TABLESPACE_OID),
+            desc(b'r', 16402, DEFAULT_TABLESPACE_OID),
         ];
         let picked = toast_heaps(all.iter(), None).unwrap();
         assert_eq!(picked.len(), 2, "user heaps are not TOAST storage");
@@ -211,7 +211,7 @@ mod tests {
         let picked = toast_heaps(all.iter(), Some(&tap)).unwrap();
         assert_eq!(picked[0].rfn.rel_node, 16400, "opt-in narrows the set");
 
-        let elsewhere = [desc('t', 16403, 99)];
+        let elsewhere = [desc(b't', 16403, 99)];
         let err = toast_heaps(elsewhere.iter(), None).unwrap_err();
         assert!(err.to_string().contains("tablespace 99"), "{err}");
         // Out of the opted-in set, so its tablespace never matters

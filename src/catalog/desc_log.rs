@@ -777,7 +777,7 @@ impl DescriptorLog {
         self.active_present_at(lsn)
             .into_iter()
             .filter(|d| {
-                d.kind != 't'
+                d.kind != b't'
                     && !crate::emit::ch_ddl::is_system_namespace(
                         &d.rel_name.namespace,
                         config_schema,
@@ -1203,8 +1203,8 @@ fn encode_descriptor(out: &mut Vec<u8>, d: &RelDescriptor) {
     push_u32(out, *namespace_oid);
     push_str(out, namespace);
     push_str(out, name);
-    push_u8(out, *kind as u8);
-    push_u8(out, *persistence as u8);
+    push_u8(out, *kind);
+    push_u8(out, *persistence);
     match replident {
         ReplIdent::Default { pk_attnums } => {
             push_u8(out, 0);
@@ -1249,8 +1249,8 @@ fn encode_descriptor(out: &mut Vec<u8>, d: &RelDescriptor) {
         push_str(out, type_name);
         push_u8(out, *type_byval as u8);
         push_i16(out, *type_len);
-        push_u8(out, *type_align as u8);
-        push_u8(out, *type_storage as u8);
+        push_u8(out, *type_align);
+        push_u8(out, *type_storage);
         push_opt_missing(out, missing_default.as_ref());
     }
     push_u32(out, ancestors.len() as u32);
@@ -1371,9 +1371,6 @@ impl<'a> Cur<'a> {
             }
             t => return Err(self.corrupt(format!("missing_default tag {t}"))),
         })
-    }
-    fn charlike(&mut self) -> Result<char> {
-        Ok(self.u8()? as char)
     }
     fn boolish(&mut self) -> Result<bool> {
         Ok(self.u8()? != 0)
@@ -1662,8 +1659,8 @@ fn decode_descriptor(cur: &mut Cur<'_>, version: u16) -> Result<RelDescriptor> {
     let namespace_oid = cur.u32()?;
     let namespace = cur.string()?;
     let name = cur.string()?;
-    let kind = cur.charlike()?;
-    let persistence = cur.charlike()?;
+    let kind = cur.u8()?;
+    let persistence = cur.u8()?;
     let replident = match cur.u8()? {
         0 => ReplIdent::Default {
             pk_attnums: decode_opt_attnums(cur)?,
@@ -1691,8 +1688,8 @@ fn decode_descriptor(cur: &mut Cur<'_>, version: u16) -> Result<RelDescriptor> {
             type_name: cur.string()?,
             type_byval: cur.boolish()?,
             type_len: cur.i16()?,
-            type_align: cur.charlike()?,
-            type_storage: cur.charlike()?,
+            type_align: cur.u8()?,
+            type_storage: cur.u8()?,
             missing_default: cur.opt_missing()?,
         };
         raw_numeric_default(&mut attr);
@@ -1816,8 +1813,8 @@ mod tests {
                 type_name: "int8".into(),
                 type_byval: true,
                 type_len: 8,
-                type_align: 'd',
-                type_storage: 'p',
+                type_align: b'd',
+                type_storage: b'p',
                 missing_default: None,
             },
             // Dropped slot: physical layout retained, type link severed
@@ -1831,8 +1828,8 @@ mod tests {
                 type_name: String::new(),
                 type_byval: false,
                 type_len: -1,
-                type_align: 'i',
-                type_storage: 'x',
+                type_align: b'i',
+                type_storage: b'x',
                 missing_default: None,
             },
         ];
@@ -1847,8 +1844,8 @@ mod tests {
                 type_name: "int4".into(),
                 type_byval: true,
                 type_len: 4,
-                type_align: 'i',
-                type_storage: 'p',
+                type_align: b'i',
+                type_storage: b'p',
                 missing_default: Some("42".into()),
             });
         }
@@ -1858,8 +1855,8 @@ mod tests {
             toast_oid: 0,
             namespace_oid: 2200,
             rel_name: RelName::new("public", &format!("t{oid}")),
-            kind: 'r',
-            persistence: 'p',
+            kind: b'r',
+            persistence: b'p',
             ancestors: Vec::new(),
             replident: if extra_col {
                 ReplIdent::UsingIndex {

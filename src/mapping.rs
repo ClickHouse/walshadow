@@ -894,8 +894,8 @@ mod tests {
             type_name: String::new(),
             type_byval: true,
             type_len: 4,
-            type_align: 'i',
-            type_storage: 'p',
+            type_align: b'i',
+            type_storage: b'p',
             missing_default: None,
         }
     }
@@ -911,8 +911,8 @@ mod tests {
             toast_oid: 0,
             namespace_oid: 2200,
             rel_name: RelName::new("app", "events"),
-            kind: 'r',
-            persistence: 'p',
+            kind: b'r',
+            persistence: b'p',
             ancestors: Vec::new(),
             replident: crate::schema::ReplIdent::Default { pk_attnums: None },
             attributes: attrs,

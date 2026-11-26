@@ -120,8 +120,8 @@ fn descriptor(filenode: u32, shape: Shape) -> Arc<RelDescriptor> {
             type_name: "int4".into(),
             type_byval: true,
             type_len: 4,
-            type_align: 'i',
-            type_storage: 'p',
+            type_align: b'i',
+            type_storage: b'p',
             missing_default: None,
         })
         .collect();
@@ -133,7 +133,7 @@ fn descriptor(filenode: u32, shape: Shape) -> Arc<RelDescriptor> {
             type_name: "text".into(),
             type_byval: false,
             type_len: -1,
-            type_storage: 'x',
+            type_storage: b'x',
             ..attributes[0].clone()
         });
     }
@@ -147,8 +147,8 @@ fn descriptor(filenode: u32, shape: Shape) -> Arc<RelDescriptor> {
         toast_oid: 0,
         namespace_oid: 2200,
         rel_name: RelName::new("public", &format!("t{filenode}")),
-        kind: 'r',
-        persistence: 'p',
+        kind: b'r',
+        persistence: b'p',
         ancestors: Vec::new(),
         replident: ReplIdent::Default { pk_attnums: None },
         attributes,

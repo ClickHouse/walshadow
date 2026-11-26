@@ -1246,14 +1246,14 @@ impl CopyBackfiller {
         if mode == InitialLoadMode::None {
             return;
         }
-        if desc.kind == 'p' {
+        if desc.kind == b'p' {
             // No rows of its own: load each partition routed to it
             let rules = self.table_rules();
             let partitions: Vec<_> = self
                 .log
                 .active_present_at(opt_in_lsn)
                 .into_iter()
-                .filter(|d| d.kind != 'p')
+                .filter(|d| d.kind != b'p')
                 .filter(|d| {
                     matches!(routing(d, rules.as_deref()), Routing::Ancestor(r) if r.oid == desc.oid)
                 })
@@ -2431,8 +2431,8 @@ mod tests {
             type_name: String::new(),
             type_byval: true,
             type_len: 8,
-            type_align: 'd',
-            type_storage: 'p',
+            type_align: b'd',
+            type_storage: b'p',
             missing_default: None,
         }
     }
@@ -2448,8 +2448,8 @@ mod tests {
             toast_oid: 0,
             namespace_oid: 2200,
             rel_name: RelName::new("app", "orders"),
-            kind: 'r',
-            persistence: 'p',
+            kind: b'r',
+            persistence: b'p',
             ancestors: Vec::new(),
             replident: ReplIdent::Default { pk_attnums: None },
             attributes: attrs,
@@ -2460,8 +2460,8 @@ mod tests {
         RelAttr {
             type_len: -1,
             type_byval: false,
-            type_align: 'i',
-            type_storage: 'x',
+            type_align: b'i',
+            type_storage: b'x',
             ..attr(attnum, name, type_oid, false)
         }
     }

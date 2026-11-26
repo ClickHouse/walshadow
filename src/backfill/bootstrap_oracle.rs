@@ -624,8 +624,8 @@ mod tests {
             type_name: type_name.into(),
             type_byval: type_len > 0,
             type_len,
-            type_align: 'i',
-            type_storage: if type_len < 0 { 'x' } else { 'p' },
+            type_align: b'i',
+            type_storage: if type_len < 0 { b'x' } else { b'p' },
             missing_default: None,
         }
     }
@@ -641,8 +641,8 @@ mod tests {
             toast_oid: 0,
             namespace_oid: 2200,
             rel_name: RelName::new("public", "foo"),
-            kind: 'r',
-            persistence: 'p',
+            kind: b'r',
+            persistence: b'p',
             ancestors: Vec::new(),
             replident: ReplIdent::Default { pk_attnums: None },
             attributes: attrs,

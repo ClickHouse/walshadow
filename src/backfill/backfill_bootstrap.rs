@@ -322,7 +322,7 @@ pub async fn seed_catalog_from_source(client: &Client) -> Result<CatalogMap> {
             next = *up;
         }
         let desc = Arc::new(desc);
-        if desc.kind == 'p' {
+        if desc.kind == b'p' {
             map.insert_partitioned(desc);
         } else {
             map.insert(desc);
@@ -350,9 +350,9 @@ pub async fn seed_in_snapshot(client: &Client) -> Result<CatalogMap> {
     result
 }
 
-async fn fetch_replident(client: &Client, c: char, rel_oid: Oid) -> Result<ReplIdent> {
+async fn fetch_replident(client: &Client, c: u8, rel_oid: Oid) -> Result<ReplIdent> {
     // Capture the PK even under FULL so the CH ORDER BY uses it, not `_lsn`
-    let pk_attnums = if c == 'd' || c == 'f' {
+    let pk_attnums = if c == b'd' || c == b'f' {
         client
             .query_opt(
                 "SELECT indkey::int2[] FROM pg_index \
@@ -364,7 +364,7 @@ async fn fetch_replident(client: &Client, c: char, rel_oid: Oid) -> Result<ReplI
     } else {
         None
     };
-    let using_index = if c == 'i' {
+    let using_index = if c == b'i' {
         client
             .query_opt(
                 "SELECT indexrelid::oid, indkey::int2[] FROM pg_index \

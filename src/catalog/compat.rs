@@ -149,8 +149,8 @@ mod tests {
             type_name: "t".into(),
             type_byval: type_len > 0,
             type_len,
-            type_align: 'i',
-            type_storage: if type_len > 0 { 'p' } else { 'x' },
+            type_align: b'i',
+            type_storage: if type_len > 0 { b'p' } else { b'x' },
             missing_default: None,
         }
     }
@@ -178,8 +178,8 @@ mod tests {
             toast_oid: 0,
             namespace_oid: 2200,
             rel_name: RelName::new("public", "t"),
-            kind: 'r',
-            persistence: 'p',
+            kind: b'r',
+            persistence: b'p',
             ancestors: Vec::new(),
             replident: ReplIdent::Default { pk_attnums: None },
             attributes,
@@ -263,7 +263,7 @@ mod tests {
             Err(Incompat::Benign("typmod change"))
         );
         let mut storage = rel(vec![attr(1, 1043, -1)]);
-        storage.attributes[0].type_storage = 'e';
+        storage.attributes[0].type_storage = b'e';
         assert_eq!(
             compatible_reader(&old, &storage),
             Err(Incompat::Benign("storage change"))
@@ -303,10 +303,10 @@ mod tests {
     fn relation_level_changes() {
         let old = rel(vec![attr(1, 23, 4)]);
         let mut kind = rel(vec![attr(1, 23, 4)]);
-        kind.kind = 'm';
+        kind.kind = b'm';
         assert!(compatible_reader(&old, &kind).is_err());
         let mut persistence = rel(vec![attr(1, 23, 4)]);
-        persistence.persistence = 'u';
+        persistence.persistence = b'u';
         assert!(compatible_reader(&old, &persistence).is_err());
         // Toast creation: old rows predate any external pointer
         let mut toast_added = rel(vec![attr(1, 23, 4)]);

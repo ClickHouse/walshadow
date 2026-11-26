@@ -420,7 +420,7 @@ impl CatalogCapture {
         };
         let slots: Vec<PendingSlot> = descs
             .into_iter()
-            .filter(|d| matches!(d.kind, 'r' | 'p' | 'm' | 't'))
+            .filter(|d| matches!(d.kind, b'r' | b'p' | b'm' | b't'))
             .map(|desc| {
                 // A relation born in this xact cannot have changed layout
                 // before its first command boundary, and its rows start at
@@ -497,7 +497,7 @@ impl CatalogCapture {
 
         let fetched: HashMap<Oid, RelDescriptor> = descs
             .into_iter()
-            .filter(|d| matches!(d.kind, 'r' | 'p' | 'm' | 't'))
+            .filter(|d| matches!(d.kind, b'r' | b'p' | b'm' | b't'))
             .map(|d| (d.oid, d))
             .collect();
         // Tombstone scope: targeted capture checks its own oid list;
@@ -805,14 +805,14 @@ fn in_place_verdict(
 /// trees also report `ATTACH` / `DETACH` and identity or persistence
 /// changes, which decide whether a partition may route to its root
 fn diff_event(pred: Option<&RelDescriptor>, desc: &Arc<RelDescriptor>) -> Option<SchemaEvent> {
-    if desc.kind == 't' {
+    if desc.kind == b't' {
         return None;
     }
     match pred {
         None => Some(SchemaEvent::Added { desc: desc.clone() }),
         Some(old) => {
             let diff = compute_schema_diff(old, desc);
-            let tree = old.is_partition() || desc.is_partition() || desc.kind == 'p';
+            let tree = old.is_partition() || desc.is_partition() || desc.kind == b'p';
             let relinked = tree
                 && (old.parent_oid() != desc.parent_oid()
                     || old.replident != desc.replident
@@ -842,8 +842,8 @@ mod tests {
             toast_oid: 0,
             namespace_oid: 2200,
             rel_name: RelName::new("public", name),
-            kind: 'r',
-            persistence: 'p',
+            kind: b'r',
+            persistence: b'p',
             ancestors: Vec::new(),
             replident: ReplIdent::Default { pk_attnums: None },
             attributes: vec![RelAttr {
@@ -856,8 +856,8 @@ mod tests {
                 type_name: "t".into(),
                 type_byval: true,
                 type_len,
-                type_align: 'i',
-                type_storage: 'p',
+                type_align: b'i',
+                type_storage: b'p',
                 missing_default: None,
             }],
         }
@@ -934,7 +934,7 @@ mod tests {
     #[test]
     fn partition_relinks_surface_as_changed() {
         let root = Arc::new(RelDescriptor {
-            kind: 'p',
+            kind: b'p',
             ..rel(23, 4, "m")
         });
         let standalone = rel(23, 4, "t");
@@ -957,7 +957,7 @@ mod tests {
         });
         assert!(diff_event(Some(&attached), &full).is_some());
         let unlogged = Arc::new(RelDescriptor {
-            persistence: 'u',
+            persistence: b'u',
             ..(*root).clone()
         });
         assert!(diff_event(Some(&root), &unlogged).is_some());

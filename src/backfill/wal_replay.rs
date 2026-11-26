@@ -439,7 +439,7 @@ impl WalReplaySink {
             let Ok((rel, _)) = self.log.descriptor_at_spanned(rfn, record.next_lsn) else {
                 continue;
             };
-            if rel.kind != 't' {
+            if rel.kind != b't' {
                 continue;
             }
             let page = crate::decode::fpi::restore_block_image(block, record.page_magic)
@@ -1651,8 +1651,8 @@ mod tests {
             toast_oid: 0,
             namespace_oid: 2200,
             rel_name: RelName::new("public", "t"),
-            kind: 'r',
-            persistence: 'p',
+            kind: b'r',
+            persistence: b'p',
             ancestors: Vec::new(),
             replident: ReplIdent::Default { pk_attnums: None },
             attributes: Vec::new(),

@@ -158,8 +158,8 @@ fn int_rel(name: &str) -> Arc<RelDescriptor> {
         toast_oid: 0,
         namespace_oid: 2200,
         rel_name: RelName::new("public", name),
-        kind: 'r',
-        persistence: 'p',
+        kind: b'r',
+        persistence: b'p',
         ancestors: Vec::new(),
         replident: ReplIdent::Default { pk_attnums: None },
         attributes: vec![RelAttr {
@@ -172,8 +172,8 @@ fn int_rel(name: &str) -> Arc<RelDescriptor> {
             type_name: "int4".into(),
             type_byval: true,
             type_len: 4,
-            type_align: 'i',
-            type_storage: 'p',
+            type_align: b'i',
+            type_storage: b'p',
             missing_default: None,
         }],
     })

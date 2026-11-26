@@ -466,7 +466,7 @@ async fn bridge_scans_uncommitted_ddl() {
     let mut names: Vec<&str> = class.iter().map(|r| r.relname.as_str()).collect();
     names.sort_unstable();
     assert_eq!(names, ["t", "u"], "{class:#?}");
-    assert!(class.iter().all(|r| r.relkind == 'r'));
+    assert!(class.iter().all(|r| r.relkind == b'r'));
 
     let attrs = bridge
         .scan(Catalog::Attribute, xid, &[oid_t])
@@ -497,8 +497,8 @@ async fn bridge_scans_uncommitted_ddl() {
         type_name: "int4".into(),
         type_byval: true,
         type_len: 4,
-        type_align: 'i',
-        type_storage: 'p',
+        type_align: b'i',
+        type_storage: b'p',
         missing_default: Some(walshadow::schema::MissingDefault::Raw(bytes)),
     };
     assert_eq!(

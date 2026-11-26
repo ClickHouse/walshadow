@@ -263,7 +263,7 @@ pub async fn mapped_relations(
             if !replica_identity_has_key(ch, has_pk) {
                 errors.push(PreflightError::BadReplicaIdentity {
                     rel: key.clone(),
-                    got: ch,
+                    got: char::from(ch),
                 });
             }
         } else {
@@ -345,8 +345,8 @@ fn archive_mode_active(mode: &str) -> bool {
 /// Replica identity gives DELETE a row key: `FULL`/`USING INDEX` always carry
 /// one, `DEFAULT` only with a primary key, `NOTHING` never. Cleared non-key
 /// values on the tombstone are fine — the key alone marks the row deleted.
-fn replica_identity_has_key(relreplident: char, has_pk: bool) -> bool {
-    matches!(relreplident, 'f' | 'i') || (relreplident == 'd' && has_pk)
+fn replica_identity_has_key(relreplident: u8, has_pk: bool) -> bool {
+    matches!(relreplident, b'f' | b'i') || (relreplident == b'd' && has_pk)
 }
 
 async fn scalar_text(client: &Client, sql: &str) -> Result<String, tokio_postgres::Error> {
@@ -388,14 +388,14 @@ mod tests {
     #[test]
     fn replica_identity_key_matrix() {
         // FULL / USING INDEX always carry a key
-        assert!(replica_identity_has_key('f', false));
-        assert!(replica_identity_has_key('i', false));
+        assert!(replica_identity_has_key(b'f', false));
+        assert!(replica_identity_has_key(b'i', false));
         // DEFAULT only with a PK
-        assert!(replica_identity_has_key('d', true));
-        assert!(!replica_identity_has_key('d', false));
+        assert!(replica_identity_has_key(b'd', true));
+        assert!(!replica_identity_has_key(b'd', false));
         // NOTHING never; unknown char never
-        assert!(!replica_identity_has_key('n', true));
-        assert!(!replica_identity_has_key('?', true));
+        assert!(!replica_identity_has_key(b'n', true));
+        assert!(!replica_identity_has_key(b'?', true));
     }
 
     #[test]

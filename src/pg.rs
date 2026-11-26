@@ -64,8 +64,8 @@ pub struct RawAttr {
     pub type_name: Option<String>,
     pub type_byval: bool,
     pub type_len: i16,
-    pub type_align: char,
-    pub type_storage: char,
+    pub type_align: u8,
+    pub type_storage: u8,
     /// `attmissingval::text` array literal
     pub missing: Option<String>,
     /// `anyarray_send(attmissingval)`, preferred over `missing` where the
@@ -161,8 +161,8 @@ impl<'a> FromSql<'a> for Tid {
 }
 
 /// `"char"` column at `idx`
-pub fn char_at(row: &Row, idx: usize) -> char {
-    char::from(row.get::<_, i8>(idx) as u8)
+pub fn char_at(row: &Row, idx: usize) -> u8 {
+    row.get::<_, i8>(idx) as u8
 }
 
 /// Next xid to assign on the connected server
@@ -236,8 +236,8 @@ mod tests {
             type_name: None,
             type_byval: false,
             type_len: -1,
-            type_align: 'i',
-            type_storage: 'x',
+            type_align: b'i',
+            type_storage: b'x',
             missing: None,
             missing_send: None,
         };
@@ -245,8 +245,8 @@ mod tests {
         assert!(attr.dropped);
         assert_eq!(attr.type_name, "");
         assert_eq!(attr.type_len, -1);
-        assert_eq!(attr.type_align, 'i');
-        assert_eq!(attr.type_storage, 'x');
+        assert_eq!(attr.type_align, b'i');
+        assert_eq!(attr.type_storage, b'x');
     }
 
     #[test]

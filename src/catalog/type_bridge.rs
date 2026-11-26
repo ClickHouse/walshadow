@@ -472,8 +472,8 @@ mod tests {
             type_name: "test".into(),
             type_byval: true,
             type_len: 4,
-            type_align: 'i',
-            type_storage: 'p',
+            type_align: b'i',
+            type_storage: b'p',
             missing_default: missing.map(|s| crate::schema::MissingDefault::Text(s.into())),
         }
     }

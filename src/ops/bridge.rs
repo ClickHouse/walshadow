@@ -921,9 +921,9 @@ pub struct ClassRow {
     pub oid: u32,
     pub relnamespace: u32,
     pub relname: String,
-    pub relkind: char,
-    pub relpersistence: char,
-    pub relreplident: char,
+    pub relkind: u8,
+    pub relpersistence: u8,
+    pub relreplident: u8,
     pub reltoastrelid: u32,
     /// `0` means database default, which the daemon resolves against
     /// `pg_database` as its SQL already does
@@ -964,8 +964,8 @@ pub struct AttributeRow {
     pub attisdropped: bool,
     pub attbyval: bool,
     pub attlen: i16,
-    pub attalign: char,
-    pub attstorage: char,
+    pub attalign: u8,
+    pub attstorage: u8,
     /// `anyarray_out` form, `None` unless `atthasmissing`
     pub attmissingval: Option<String>,
 }
@@ -1094,13 +1094,12 @@ fn pg_bool(row: &[Option<String>], i: usize) -> Result<bool, BridgeError> {
     }
 }
 
-/// `charout` on a PG `"char"` column
-fn only_char(row: &[Option<String>], i: usize) -> Result<char, BridgeError> {
-    let mut cs = field(row, i)?.chars();
-    match (cs.next(), cs.next()) {
-        (Some(c), None) => Ok(c),
-        _ => Err(bad(row, i)),
-    }
+/// `"char"` sent as one raw byte by `ws_put_char`
+fn only_char(row: &[Option<String>], i: usize) -> Result<u8, BridgeError> {
+    let &[c] = field(row, i)?.as_bytes() else {
+        return Err(bad(row, i));
+    };
+    Ok(c)
 }
 
 // ----- framing -------------------------------------------------------------
@@ -1164,7 +1163,8 @@ impl<'a> Cursor<'a> {
     }
 }
 
-/// Shadow is always initdb'd UTF8, and the SQL path constrains the same way
+/// Shadow is always initdb'd UTF8, and the SQL path constrains the same way.
+/// `ws_put_char` ignores encoding, so a high-bit `"char"` fails here
 fn text(b: &[u8]) -> Result<String, BridgeError> {
     simdutf8::basic::from_utf8(b)
         .map(str::to_owned)
@@ -1205,8 +1205,8 @@ pub(crate) mod tests {
         let parsed = ClassRow::parse(&row).unwrap();
         assert_eq!(parsed.oid, 16384);
         assert_eq!(parsed.relname, "t");
-        assert_eq!(parsed.relkind, 'r');
-        assert_eq!(parsed.relreplident, 'd');
+        assert_eq!(parsed.relkind, b'r');
+        assert_eq!(parsed.relreplident, b'd');
         assert_eq!(parsed.reltablespace, 0);
     }
 
@@ -1221,7 +1221,7 @@ pub(crate) mod tests {
         let parsed = AttributeRow::parse(&row).unwrap();
         assert_eq!(parsed.attnum, 1);
         assert!(parsed.attnotnull && parsed.attbyval && !parsed.attisdropped);
-        assert_eq!(parsed.attalign, 'i');
+        assert_eq!(parsed.attalign, b'i');
         assert_eq!(parsed.attmissingval, None);
     }
 

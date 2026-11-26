@@ -174,8 +174,8 @@ fn attr(attnum: i16, type_oid: u32, type_len: i16) -> RelAttr {
         type_name: String::new(),
         type_byval: type_len > 0,
         type_len,
-        type_align: 'i',
-        type_storage: if type_len > 0 { 'p' } else { 'x' },
+        type_align: b'i',
+        type_storage: if type_len > 0 { b'p' } else { b'x' },
         missing_default: None,
     }
 }
@@ -229,8 +229,8 @@ async fn plan(args: &Args, repeat: usize) -> anyhow::Result<()> {
                 toast_oid: 0,
                 namespace_oid: 2200,
                 rel_name: RelName::new("public", &format!("spool_bench_{i}")),
-                kind: 'r',
-                persistence: 'p',
+                kind: b'r',
+                persistence: b'p',
                 ancestors: Vec::new(),
                 replident: ReplIdent::Default { pk_attnums: None },
                 attributes: vec![attr(1, INT4OID, 4), attr(2, TEXTOID, -1)],

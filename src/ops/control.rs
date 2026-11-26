@@ -347,7 +347,7 @@ async fn tables_list<'a>(ctx: &SharedCtx, req: &Request<'a>) -> Result<String> {
             row.insert("selected".into(), selected.contains(&key).into());
             row.insert(
                 "replica_identity".into(),
-                Value::String(t.replica_identity.to_string()),
+                Value::String(char::from(t.replica_identity).into()),
             );
             row.insert("has_row_key".into(), t.has_row_key().into());
             row.insert("namespace".into(), key.0.into());
@@ -1078,8 +1078,8 @@ mod tests {
             toast_oid: 0,
             namespace_oid: 2200,
             rel_name: RelName::new("public", "events"),
-            kind: 'r',
-            persistence: 'p',
+            kind: b'r',
+            persistence: b'p',
             ancestors: Vec::new(),
             replident: ReplIdent::Default { pk_attnums: None },
             attributes: vec![RelAttr {
@@ -1092,8 +1092,8 @@ mod tests {
                 type_name: "int4".into(),
                 type_byval: true,
                 type_len: 4,
-                type_align: 'i',
-                type_storage: 'p',
+                type_align: b'i',
+                type_storage: b'p',
                 missing_default: None,
             }],
         };
