@@ -16,6 +16,9 @@ use crate::toast::{pointer_extsize, pointer_footprint};
 
 pub const AHEAD_READS: usize = crate::ops::bridge::MAX_BRIDGE_WORKERS;
 pub const AHEAD_QUEUE: usize = 4096;
+pub const AHEAD_BATCHED_READS: usize = 1024;
+pub const AHEAD_BATCHED_QUEUE: usize = 65536;
+pub const AHEAD_BATCH: usize = 256;
 // Amortized slot and task bookkeeping
 const ENTRY_OVERHEAD: usize = 512;
 
@@ -55,6 +58,7 @@ pub struct PendingReads {
     /// Reads not yet finished, queued or running
     queued: Arc<Semaphore>,
     running: Arc<Semaphore>,
+    lazy: bool,
     entries: HashMap<Key, Entry>,
 }
 
@@ -73,11 +77,20 @@ pub fn retained_bytes(held: usize, p: &ToastPointer) -> u64 {
 
 impl PendingReads {
     pub fn new(budget: MemoryBudget) -> Self {
+        Self::admitting(budget, AHEAD_READS, AHEAD_QUEUE, false)
+    }
+
+    pub fn batched(budget: MemoryBudget) -> Self {
+        Self::admitting(budget, AHEAD_BATCHED_READS, AHEAD_BATCHED_QUEUE, true)
+    }
+
+    fn admitting(budget: MemoryBudget, running: usize, queue: usize, lazy: bool) -> Self {
         Self {
+            lazy,
             budget,
             runtime: tokio::runtime::Handle::current(),
-            queued: Arc::new(Semaphore::new(AHEAD_QUEUE + AHEAD_READS)),
-            running: Arc::new(Semaphore::new(AHEAD_READS)),
+            queued: Arc::new(Semaphore::new(queue + running)),
+            running: Arc::new(Semaphore::new(running)),
             entries: HashMap::new(),
         }
     }
@@ -88,7 +101,7 @@ impl PendingReads {
         db: u32,
         p: &ToastPointer,
         lsn: u64,
-        read: impl FnOnce(MemoryPermit) -> F,
+        read: impl FnOnce(MemoryPermit, Arc<AtomicBool>) -> F,
     ) where
         F: Future<Output = Option<ReadValue>> + Send + 'static,
     {
@@ -104,15 +117,18 @@ impl PendingReads {
         let Some(permit) = self.budget.try_speculate(read_cost(p)) else {
             return;
         };
-        let read = read(permit);
         let started = Arc::new(AtomicBool::new(false));
+        let read = read(permit, started.clone());
         let running = self.running.clone();
+        let lazy = self.lazy;
         let task = self.runtime.spawn({
             let started = started.clone();
             async move {
                 let _queued = queued;
                 let _running = running.acquire_owned().await.ok()?;
-                started.store(true, Ordering::Release);
+                if !lazy {
+                    started.store(true, Ordering::Release);
+                }
                 read.await
             }
         });
@@ -176,9 +192,11 @@ mod tests {
         }
     }
 
-    fn ready(value: &str) -> impl FnOnce(MemoryPermit) -> std::future::Ready<Option<ReadValue>> {
+    fn ready(
+        value: &str,
+    ) -> impl FnOnce(MemoryPermit, Arc<AtomicBool>) -> std::future::Ready<Option<ReadValue>> {
         let value = build::text(value);
-        |permit| std::future::ready(Some(ReadValue { value, permit }))
+        |permit, _| std::future::ready(Some(ReadValue { value, permit }))
     }
 
     async fn settle() {
@@ -209,7 +227,7 @@ mod tests {
         let mut pending = PendingReads::new(MemoryBudget::new(1024));
         let budget = pending.budget().clone();
         let p = pointer(1, 1);
-        let hold = |permit| async move {
+        let hold = |permit, _| async move {
             let _permit = permit;
             std::future::pending().await
         };

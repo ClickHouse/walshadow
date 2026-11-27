@@ -226,14 +226,14 @@ impl PipelineConfig {
         .with_budget(budget.clone());
 
         if emitter.toast.mode.is_shadow() && !matches!(tail, TailKind::Null) {
-            let ceiling = oracle
-                .as_ref()
-                .expect("shadow oracle checked")
-                .xid_ceiling();
+            let shadow_oracle = oracle.as_ref().expect("shadow oracle checked");
+            let ceiling = shadow_oracle.xid_ceiling();
+            let applied = shadow_oracle.replay_wake();
             resolver = resolver.with_database_stores(dbs.all().iter().map(|db| {
                 let read = crate::toast::shadow_store::ShadowRead {
                     bridge: crate::toast::shadow_store::bound(db.bridge.clone()),
                     ceiling: ceiling.clone(),
+                    applied: applied.clone(),
                 };
                 (
                     db.oid,

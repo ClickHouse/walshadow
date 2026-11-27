@@ -25,7 +25,8 @@ use crate::decode::heap_decoder::{
 };
 use crate::emit::ch_emitter::{EmitterConfig, EmitterStats, InlineValueOverflow, ToastMode};
 use crate::mimalloc;
-use crate::toast::read_ahead::{PendingReads, ReadValue, retained_bytes};
+use crate::toast::read_ahead::{AHEAD_BATCH, PendingReads, ReadValue, retained_bytes};
+use crate::toast::shadow_store::FETCH_REQUEST_BYTES;
 use crate::xact::spill::{BodyRef, BodySpoolFile, ToastChunk, ToastDelete};
 use foldhash::{HashMap, HashMapExt, HashSet, HashSetExt};
 
@@ -417,6 +418,22 @@ pub trait ChunkStore: Send + Sync {
         values: &[(u32, usize)],
         max_lsn: u64,
     ) -> Result<Vec<FetchedValue>, ChunkStoreError>;
+    fn mixed_bounds(&self) -> bool {
+        false
+    }
+    async fn replayed_through(&self) -> Option<u64> {
+        None
+    }
+    async fn fetch_bounded(
+        &self,
+        db_oid: u32,
+        toast_relid: u32,
+        values: &[(u32, usize, u64)],
+    ) -> Result<Vec<FetchedValue>, ChunkStoreError> {
+        let bound = values.iter().map(|v| v.2).max().unwrap_or(0);
+        let ids: Vec<(u32, usize)> = values.iter().map(|v| (v.0, v.1)).collect();
+        self.fetch_many(db_oid, toast_relid, &ids, bound).await
+    }
     /// [`Self::fetch_many`] for one value
     async fn fetch(
         &self,
@@ -1152,6 +1169,111 @@ async fn put_rows_batched(
     put_rows(store, stats, &rows[start..]).await
 }
 
+struct AheadRequest {
+    token: u64,
+    value_id: u32,
+    size: usize,
+    lsn: u64,
+    started: Arc<std::sync::atomic::AtomicBool>,
+    tx: tokio::sync::oneshot::Sender<FetchedValue>,
+}
+
+struct AheadFetch {
+    budget: crate::budget::MemoryBudget,
+    queued: std::sync::Mutex<HashMap<(u32, u32), Vec<AheadRequest>>>,
+    slots: Arc<tokio::sync::Semaphore>,
+    tokens: AtomicU64,
+    replayed: AtomicU64,
+}
+
+struct Withdraw<'a> {
+    ahead: &'a AheadFetch,
+    key: (u32, u32),
+    token: u64,
+}
+
+impl Drop for Withdraw<'_> {
+    fn drop(&mut self) {
+        self.ahead.withdraw(self.key, self.token);
+    }
+}
+
+impl AheadFetch {
+    fn new(budget: crate::budget::MemoryBudget) -> Self {
+        Self {
+            budget,
+            queued: std::sync::Mutex::default(),
+            slots: Arc::new(tokio::sync::Semaphore::new(
+                crate::ops::bridge::MAX_BRIDGE_WORKERS,
+            )),
+            tokens: AtomicU64::new(0),
+            replayed: AtomicU64::new(0),
+        }
+    }
+
+    fn withdraw(&self, key: (u32, u32), token: u64) -> Option<AheadRequest> {
+        let mut queued = self.queued.lock().expect("ahead fetch");
+        let waiting = queued.get_mut(&key)?;
+        let at = waiting.iter().position(|r| r.token == token)?;
+        let req = waiting.swap_remove(at);
+        if waiting.is_empty() {
+            queued.remove(&key);
+        }
+        Some(req)
+    }
+
+    fn push(&self, key: (u32, u32), req: AheadRequest) {
+        self.queued
+            .lock()
+            .expect("ahead fetch")
+            .entry(key)
+            .or_default()
+            .push(req);
+    }
+
+    /// Replayed reads fitting one bridge request, with a reservation for
+    /// their fetched bytes that outlives any reader dropping out
+    fn take(
+        &self,
+        key: (u32, u32),
+        covered: u64,
+    ) -> Option<(Vec<AheadRequest>, crate::budget::MemoryPermit)> {
+        let mut queued = self.queued.lock().expect("ahead fetch");
+        let waiting = queued.remove(&key)?;
+        let mut ids = HashSet::new();
+        let mut bytes = 0usize;
+        let mut batch = Vec::new();
+        let mut rest = Vec::new();
+        for req in waiting {
+            if req.lsn <= covered
+                && batch.len() < AHEAD_BATCH
+                && bytes < FETCH_REQUEST_BYTES
+                && ids.insert(req.value_id)
+            {
+                bytes = bytes.saturating_add(req.size);
+                batch.push(req);
+            } else {
+                rest.push(req);
+            }
+        }
+        let held = (!batch.is_empty())
+            .then(|| self.budget.try_speculate(bytes))
+            .flatten();
+        if held.is_none() {
+            batch.append(&mut rest);
+            std::mem::swap(&mut batch, &mut rest);
+        }
+        if !rest.is_empty() {
+            queued.insert(key, rest);
+        }
+        let held = held?;
+        for req in &batch {
+            req.started.store(true, Ordering::Release);
+        }
+        Some((batch, held))
+    }
+}
+
 /// TOAST resolution policy and optional store
 #[derive(Clone)]
 pub struct ToastResolver {
@@ -1169,6 +1291,7 @@ pub struct ToastResolver {
     budget: Option<crate::budget::MemoryBudget>,
     /// Pending reads consumed by commit-ordered planning
     ahead: Option<Arc<std::sync::Mutex<PendingReads>>>,
+    coalesce: Option<Arc<AheadFetch>>,
     pending: Arc<tokio::sync::Mutex<PendingMirror>>,
 }
 
@@ -1184,6 +1307,7 @@ impl ToastResolver {
             overflow: InlineValueOverflow::default(),
             budget: None,
             ahead: None,
+            coalesce: None,
             pending: Arc::default(),
         }
     }
@@ -1246,6 +1370,7 @@ impl ToastResolver {
             overflow: emitter.inline_value_overflow,
             budget: None,
             ahead: None,
+            coalesce: None,
             pending: Arc::default(),
         }
     }
@@ -1262,6 +1387,7 @@ impl ToastResolver {
             overflow: InlineValueOverflow::default(),
             budget: None,
             ahead: None,
+            coalesce: None,
             pending: Arc::default(),
         }
     }
@@ -1283,19 +1409,27 @@ impl ToastResolver {
     /// Resident-payload pool, attached at pipeline spawn
     pub fn with_budget(mut self, budget: crate::budget::MemoryBudget) -> Self {
         self.ahead = None;
+        self.coalesce = None;
         self.budget = Some(budget);
         self
     }
 
     pub fn with_read_ahead(mut self) -> Self {
         self.ahead = None;
+        self.coalesce = None;
         if self.fill_on_miss() {
             return self;
         }
         let Some(budget) = self.budget.clone() else {
             return self;
         };
-        let pending = Arc::new(std::sync::Mutex::new(PendingReads::new(budget.clone())));
+        let reads = if self.store.as_ref().is_some_and(|s| s.mixed_bounds()) {
+            self.coalesce = Some(Arc::new(AheadFetch::new(budget.clone())));
+            PendingReads::batched(budget.clone())
+        } else {
+            PendingReads::new(budget.clone())
+        };
+        let pending = Arc::new(std::sync::Mutex::new(reads));
         budget.register_reclaimer(&pending);
         self.ahead = Some(pending);
         self
@@ -1318,11 +1452,11 @@ impl ToastResolver {
             ahead: None,
             ..self.clone()
         };
-        pending.reserve(db_oid, &p, lsn, |mut permit| async move {
+        pending.reserve(db_oid, &p, lsn, |mut permit, started| async move {
             this.stats
                 .toast_values_read_ahead
                 .fetch_add(1, Ordering::Relaxed);
-            let raw = this.read_raw(db_oid, p, lsn).await?;
+            let raw = this.read_raw(db_oid, p, lsn, started).await?;
             let fits = |held: usize| {
                 let need = retained_bytes(held, &p);
                 if need > permit.bytes() {
@@ -1339,21 +1473,117 @@ impl ToastResolver {
         });
     }
 
-    async fn read_raw(&self, db_oid: u32, p: ToastPointer, lsn: u64) -> Option<Vec<u8>> {
+    async fn read_raw(
+        &self,
+        db_oid: u32,
+        p: ToastPointer,
+        lsn: u64,
+        started: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Option<Vec<u8>> {
         // Unflushed mirror rows read as a miss, foreground resolution refetches
-        let got = self
-            .fetch_stored(
+        let got = if let Some(ahead) = &self.coalesce {
+            self.read_coalesced(ahead, db_oid, &p, lsn, started).await
+        } else {
+            self.fetch_stored(
                 db_oid,
                 p.va_toastrelid,
                 &[(p.va_valueid, pointer_extsize(&p))],
                 lsn,
             )
             .await
-            .ok()??;
-        let Some(FetchedValue::Assembled(stored)) = got.into_iter().next() else {
+            .ok()??
+            .into_iter()
+            .next()
+        };
+        let Some(FetchedValue::Assembled(stored)) = got else {
             return None;
         };
         finish_value(&p, stored).ok()
+    }
+
+    async fn read_coalesced(
+        &self,
+        ahead: &Arc<AheadFetch>,
+        db_oid: u32,
+        p: &ToastPointer,
+        lsn: u64,
+        started: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Option<FetchedValue> {
+        let key = (db_oid, p.va_toastrelid);
+        let size = pointer_extsize(p);
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        let token = ahead.tokens.fetch_add(1, Ordering::Relaxed);
+        ahead.push(
+            key,
+            AheadRequest {
+                token,
+                value_id: p.va_valueid,
+                size,
+                lsn,
+                started: started.clone(),
+                tx,
+            },
+        );
+        let _withdraw = Withdraw { ahead, key, token };
+        let slot = loop {
+            let slot = tokio::select! {
+                biased;
+                got = &mut rx => {
+                    let Ok(got) = got else { break None };
+                    return Some(got);
+                }
+                slot = ahead.slots.clone().acquire_owned() => slot.ok()?,
+            };
+            let mut covered = ahead.replayed.load(Ordering::Acquire);
+            if lsn > covered {
+                covered = self.replayed_through(db_oid).await;
+                ahead.replayed.fetch_max(covered, Ordering::AcqRel);
+            }
+            let Some((mut batch, held)) = ahead.take(key, covered) else {
+                if ahead.withdraw(key, token).is_some() {
+                    break Some(slot);
+                }
+                drop(slot);
+                let Ok(got) = (&mut rx).await else { break None };
+                return Some(got);
+            };
+            let this = self.clone();
+            let shared = ahead.clone();
+            tokio::spawn(async move {
+                let _slot = slot;
+                let _held = held;
+                let values: Vec<(u32, usize, u64)> =
+                    batch.iter().map(|r| (r.value_id, r.size, r.lsn)).collect();
+                let got = {
+                    let abandoned =
+                        futures::future::join_all(batch.iter_mut().map(|r| r.tx.closed()));
+                    tokio::select! {
+                        biased;
+                        _ = abandoned => return,
+                        got = this.fetch_stored_bounded(key.0, key.1, &values) => got,
+                    }
+                };
+                if let Ok(Some(got)) = got {
+                    for (req, value) in batch.into_iter().zip(got) {
+                        let _ = req.tx.send(value);
+                    }
+                } else {
+                    shared.replayed.store(0, Ordering::Release);
+                }
+            });
+        };
+        // Past replay, over budget or batch failed: read alone as before batching
+        let _slot = if let Some(slot) = slot {
+            slot
+        } else {
+            ahead.slots.clone().acquire_owned().await.ok()?
+        };
+        started.store(true, Ordering::Release);
+        self.fetch_stored(db_oid, key.1, &[(p.va_valueid, size)], lsn)
+            .await
+            .ok()??
+            .into_iter()
+            .next()
     }
 
     /// Speculative read of `p` started ahead of planning, its permit
@@ -1496,22 +1726,50 @@ impl ToastResolver {
         values: &[(u32, usize)],
         max_lsn: u64,
     ) -> Result<Option<Vec<FetchedValue>>, ChunkStoreError> {
+        let bounded: Vec<(u32, usize, u64)> = values
+            .iter()
+            .map(|&(id, size)| (id, size, max_lsn))
+            .collect();
+        self.fetch_stored_bounded(db_oid, toast_relid, &bounded)
+            .await
+    }
+
+    fn store_for(&self, db_oid: u32) -> Result<Option<&Arc<dyn ChunkStore>>, ChunkStoreError> {
         let Some(store) = &self.store else {
+            return Ok(None);
+        };
+        Ok(Some(match &self.database_stores {
+            Some(stores) => stores.get(&db_oid).ok_or_else(|| {
+                ChunkStoreError::Shadow(format!("no TOAST store for database {db_oid}"))
+            })?,
+            None => store,
+        }))
+    }
+
+    async fn replayed_through(&self, db_oid: u32) -> u64 {
+        if let Ok(Some(store)) = self.store_for(db_oid)
+            && let Some(at) = store.replayed_through().await
+        {
+            at
+        } else {
+            0
+        }
+    }
+
+    async fn fetch_stored_bounded(
+        &self,
+        db_oid: u32,
+        toast_relid: u32,
+        values: &[(u32, usize, u64)],
+    ) -> Result<Option<Vec<FetchedValue>>, ChunkStoreError> {
+        let Some(store) = self.store_for(db_oid)? else {
             return Ok(None);
         };
         if values.is_empty() {
             return Ok(Some(Vec::new()));
         }
-        let store = match &self.database_stores {
-            Some(stores) => stores.get(&db_oid).ok_or_else(|| {
-                ChunkStoreError::Shadow(format!("no TOAST store for database {db_oid}"))
-            })?,
-            None => store,
-        };
         let started = std::time::Instant::now();
-        let got = store
-            .fetch_many(db_oid, toast_relid, values, max_lsn)
-            .await?;
+        let got = store.fetch_bounded(db_oid, toast_relid, values).await?;
         self.stats
             .toast_value_fetch_nanos
             .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -3107,6 +3365,288 @@ mod tests {
             .expect("read ahead resumes after foreground reclaim");
             assert!(resolver.pending().unwrap().take(0, &next, 2).is_some());
         }
+    }
+
+    struct Coalescing {
+        body: Vec<u8>,
+        gate: tokio::sync::Semaphore,
+        replayed: AtomicU64,
+        refuse: bool,
+        batches: std::sync::Mutex<Vec<Vec<(u32, u64)>>>,
+    }
+
+    #[async_trait]
+    impl ChunkStore for Coalescing {
+        async fn fetch_many(
+            &self,
+            _: u32,
+            _: u32,
+            values: &[(u32, usize)],
+            _: u64,
+        ) -> Result<Vec<FetchedValue>, ChunkStoreError> {
+            self.gate.acquire().await.unwrap().forget();
+            if self.refuse && values.len() > 1 {
+                return Err(ChunkStoreError::Shadow("refused".into()));
+            }
+            Ok(values.iter().map(|_| assembled(&self.body)).collect())
+        }
+        fn mixed_bounds(&self) -> bool {
+            true
+        }
+        async fn replayed_through(&self) -> Option<u64> {
+            tokio::task::yield_now().await;
+            Some(self.replayed.load(Ordering::Relaxed))
+        }
+        async fn fetch_bounded(
+            &self,
+            db_oid: u32,
+            toast_relid: u32,
+            values: &[(u32, usize, u64)],
+        ) -> Result<Vec<FetchedValue>, ChunkStoreError> {
+            self.batches
+                .lock()
+                .unwrap()
+                .push(values.iter().map(|v| (v.0, v.2)).collect());
+            let ids: Vec<(u32, usize)> = values.iter().map(|v| (v.0, v.1)).collect();
+            self.fetch_many(db_oid, toast_relid, &ids, 0).await
+        }
+    }
+
+    fn coalescing(refuse: bool) -> (Arc<Coalescing>, ToastResolver, Vec<u8>) {
+        let mut body = 0x5000_0001u32.to_le_bytes().to_vec();
+        body.extend_from_slice(&64u32.to_le_bytes());
+        body.extend_from_slice(&[1; 64]);
+        let store = Arc::new(Coalescing {
+            body: body.clone(),
+            gate: tokio::sync::Semaphore::new(0),
+            replayed: AtomicU64::new(120),
+            refuse,
+            batches: std::sync::Mutex::default(),
+        });
+        let r = ToastResolver::with_store(store.clone(), Arc::new(EmitterStats::default()))
+            .with_budget(crate::budget::MemoryBudget::with_leaf_reserve(
+                8 << 20,
+                32 << 10,
+            ))
+            .with_read_ahead();
+        (store, r, body)
+    }
+
+    fn coalesced_pointer(body: &[u8], id: u32) -> ToastPointer {
+        ToastPointer {
+            va_rawsize: body.len() as i32 + VARHDRSZ,
+            va_extinfo: body.len() as u32,
+            va_valueid: id,
+            va_toastrelid: 16500,
+        }
+    }
+
+    async fn settle_reads() {
+        for _ in 0..256 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[test]
+    fn batch_fits_one_request_and_a_reservation() {
+        let request = |value_id: u32, size| AheadRequest {
+            token: value_id.into(),
+            value_id,
+            size,
+            lsn: 100,
+            started: Arc::default(),
+            tx: tokio::sync::oneshot::channel().0,
+        };
+        let big = FETCH_REQUEST_BYTES / 2 + 1;
+        let roomy = AheadFetch::new(crate::budget::MemoryBudget::new(4 * FETCH_REQUEST_BYTES));
+        for id in 1..=3 {
+            roomy.push((0, 1), request(id, big));
+        }
+        let (batch, held) = roomy.take((0, 1), 100).unwrap();
+        let ids: Vec<u32> = batch.iter().map(|r| r.value_id).collect();
+        assert_eq!(ids, vec![1, 2]);
+        assert_eq!(held.bytes(), 2 * big as u64);
+        assert!(roomy.withdraw((0, 1), 3).is_some());
+        let tight = AheadFetch::new(crate::budget::MemoryBudget::new(big - 1));
+        tight.push((0, 1), request(1, big));
+        assert!(tight.take((0, 1), 100).is_none());
+        assert!(tight.withdraw((0, 1), 1).is_some());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn refused_batch_falls_back_to_reads_alone() {
+        let (store, r, body) = coalescing(true);
+        let pointer = |id: u32| coalesced_pointer(&body, id);
+        store.gate.add_permits(1024);
+        for id in 1..=4 {
+            r.read_ahead(0, pointer(id), 100 + id as u64);
+        }
+        settle_reads().await;
+        for id in 1..=4 {
+            let slot = r.pending().unwrap().take(0, &pointer(id), 100 + id as u64);
+            assert!(slot.unwrap().take().await.is_some());
+        }
+        let sizes: Vec<usize> = store.batches.lock().unwrap().iter().map(Vec::len).collect();
+        assert_eq!(sizes, vec![4, 1, 1, 1, 1]);
+        let cached = r
+            .coalesce
+            .as_ref()
+            .unwrap()
+            .replayed
+            .load(Ordering::Acquire);
+        assert_eq!(cached, 0);
+    }
+
+    /// Reads past replay hold every slot while a batched reader waits on one
+    async fn read_behind_busy_slots(refuse: bool) -> Vec<usize> {
+        let (store, r, body) = coalescing(refuse);
+        let pointer = |id: u32| coalesced_pointer(&body, id);
+        let total = crate::ops::bridge::MAX_BRIDGE_WORKERS as u32 + 1;
+        let lsn = |id: u32| if id + 1 >= total { 100 } else { 200 } + id as u64;
+        for id in 1..=total {
+            r.read_ahead(0, pointer(id), lsn(id));
+        }
+        settle_reads().await;
+        let free = r.coalesce.as_ref().unwrap().slots.available_permits();
+        assert_eq!(free, 0);
+        store.gate.add_permits(1024);
+        settle_reads().await;
+        for id in 1..=total {
+            let slot = r.pending().unwrap().take(0, &pointer(id), lsn(id));
+            assert!(slot.unwrap().take().await.is_some());
+        }
+        let batches = store.batches.lock().unwrap();
+        batches.iter().map(Vec::len).collect()
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reader_waiting_for_a_slot_takes_its_batched_value() {
+        let sizes = read_behind_busy_slots(false).await;
+        assert_eq!(sizes.iter().filter(|&&n| n == 2).count(), 1);
+        assert_eq!(sizes.len(), crate::ops::bridge::MAX_BRIDGE_WORKERS);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reader_waiting_for_a_slot_reads_alone_once_its_batch_fails() {
+        let sizes = read_behind_busy_slots(true).await;
+        assert_eq!(sizes.iter().filter(|&&n| n == 2).count(), 1);
+        assert_eq!(sizes.len(), crate::ops::bridge::MAX_BRIDGE_WORKERS + 2);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shared_fetch_keeps_reservation_of_dropped_reader() {
+        let (store, r, body) = coalescing(false);
+        let pointer = |id: u32| coalesced_pointer(&body, id);
+        let budget = r.budget().unwrap().clone();
+        for id in 1..=2 {
+            r.read_ahead(0, pointer(id), 100 + id as u64);
+        }
+        settle_reads().await;
+        assert_eq!(
+            *store.batches.lock().unwrap(),
+            vec![vec![(1, 101), (2, 102)]]
+        );
+        let both = budget.resident_bytes();
+        drop(r.pending().unwrap().take(0, &pointer(2), 102));
+        settle_reads().await;
+        let one = budget.resident_bytes();
+        assert_eq!(2 * one - both, 2 * body.len() as u64);
+        store.gate.add_permits(1);
+        let slot = r.pending().unwrap().take(0, &pointer(1), 101);
+        let ReadValue { value, permit } = slot.unwrap().take().await.expect("value read");
+        assert_eq!(value, build::bytes(&body));
+        drop(permit);
+        assert_eq!(budget.resident_bytes(), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn batch_stops_once_every_read_is_dropped() {
+        let (store, r, body) = coalescing(false);
+        for id in 1..=12u32 {
+            r.read_ahead(0, coalesced_pointer(&body, id), 100 + id as u64);
+        }
+        settle_reads().await;
+        assert!(!store.batches.lock().unwrap().is_empty());
+        r.pending().unwrap().clear();
+        settle_reads().await;
+        let free = r.coalesce.as_ref().unwrap().slots.available_permits();
+        assert_eq!(free, crate::ops::bridge::MAX_BRIDGE_WORKERS);
+        assert_eq!(r.budget().unwrap().resident_bytes(), 0);
+        assert_eq!(store.gate.available_permits(), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn store_without_replay_position_reads_each_value_alone() {
+        struct Blind(std::sync::Mutex<Vec<usize>>);
+        #[async_trait]
+        impl ChunkStore for Blind {
+            async fn fetch_many(
+                &self,
+                _: u32,
+                _: u32,
+                values: &[(u32, usize)],
+                _: u64,
+            ) -> Result<Vec<FetchedValue>, ChunkStoreError> {
+                self.0.lock().unwrap().push(values.len());
+                Err(ChunkStoreError::Shadow("down".into()))
+            }
+            fn mixed_bounds(&self) -> bool {
+                true
+            }
+        }
+        let store = Arc::new(Blind(std::sync::Mutex::default()));
+        let r = ToastResolver::with_store(store.clone(), Arc::new(EmitterStats::default()))
+            .with_budget(crate::budget::MemoryBudget::with_leaf_reserve(
+                8 << 20,
+                32 << 10,
+            ))
+            .with_read_ahead();
+        let pointer = |id: u32| coalesced_pointer(&[0; 72], id);
+        for id in 1..=3 {
+            r.read_ahead(0, pointer(id), 100 + id as u64);
+        }
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(*store.0.lock().unwrap(), vec![1, 1, 1]);
+        for id in 1..=3 {
+            let slot = r.pending().unwrap().take(0, &pointer(id), 100 + id as u64);
+            assert!(slot.unwrap().take().await.is_none());
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn replayed_reads_share_round_trips_and_later_reads_go_alone() {
+        let (store, r, body) = coalescing(false);
+        let pointer = |id: u32| coalesced_pointer(&body, id);
+        let lsn = |id: u32| {
+            if id > 20 {
+                100 + id as u64
+            } else {
+                100 + id as u64 / 2
+            }
+        };
+        let total = 24u32;
+        for id in 1..=total {
+            r.read_ahead(0, pointer(id), lsn(id));
+        }
+        settle_reads().await;
+        store.gate.add_permits(1024);
+        settle_reads().await;
+        for id in 1..=total {
+            let slot = r.pending().unwrap().take(0, &pointer(id), lsn(id));
+            let ReadValue { value, .. } = slot.unwrap().take().await.expect("value read");
+            assert_eq!(value, build::bytes(&body));
+        }
+        let batches = store.batches.lock().unwrap();
+        let shared: Vec<&Vec<(u32, u64)>> = batches.iter().filter(|b| b.len() > 1).collect();
+        assert!(!shared.is_empty());
+        assert!(shared.iter().all(|b| b.len() <= AHEAD_BATCH));
+        assert!(shared.iter().copied().flatten().all(|&(_, at)| at <= 120));
+        let mut seen: Vec<(u32, u64)> = batches.iter().flatten().copied().collect();
+        seen.sort_unstable();
+        let want: Vec<(u32, u64)> = (1..=total).map(|id| (id, lsn(id))).collect();
+        assert_eq!(seen, want);
     }
 
     /// Values read ahead hold their stored bytes, whatever their type renders to
