@@ -2893,6 +2893,18 @@ impl U256 {
         rem as u32
     }
 
+    /// 10^exp, or `None` when it no longer fits U256 (wire bound is tighter)
+    fn pow10(exp: u8) -> Option<Self> {
+        // Start at one, otherwise multiplying zero never produces a power.
+        let mut out = Self::one_shl(0);
+        for _ in 0..exp {
+            if !out.checked_mul_small(10) {
+                return None;
+            }
+        }
+        Some(out)
+    }
+
     fn from_le_bytes(b: [u8; 32]) -> Self {
         Self(std::array::from_fn(|i| {
             u64::from_le_bytes(b[i * 8..][..8].try_into().expect("8 bytes"))
@@ -2987,6 +2999,7 @@ fn decimal_text_to_scaled_le(
     let body = text.strip_prefix(['-', '+']).unwrap_or(text);
     let mut mag = U256::default();
     let mut frac_digits = 0i32;
+    let mut round_digit = 0;
     let mut seen_dot = false;
     let mut saw_digit = false;
 
@@ -2999,6 +3012,10 @@ fn decimal_text_to_scaled_le(
                     return Err(decimal_oob());
                 }
                 if seen_dot {
+                    // first digit past target scale decides half-up rounding
+                    if frac_digits == scale {
+                        round_digit = b - b'0';
+                    }
                     frac_digits += 1;
                 }
             }
@@ -3017,11 +3034,13 @@ fn decimal_text_to_scaled_le(
             }
         }
     } else if diff < 0 {
-        // More fractional digits than column scale: PG would have
-        // rounded on store, so defensive trunc, shouldn't occur for
-        // conforming values
+        // PG numeric rounds half away from zero on scaling down: the
+        // most-significant discarded digit decides the increment.
         for _ in 0..-diff {
             mag.div_small(10);
+        }
+        if round_digit >= 5 && !mag.checked_add_small(1) {
+            return Err(decimal_oob());
         }
     }
 
@@ -3034,6 +3053,7 @@ fn numeric_to_scaled_le(
     body: &[u8],
     scale: u8,
     width: DecimalWidth,
+    declared_precision: Option<u8>,
 ) -> Result<[u8; 32], EmitterError> {
     let scale = u32::from(scale);
     let (neg, weight, digits) = match parse_numeric(body) {
@@ -3054,6 +3074,10 @@ fn numeric_to_scaled_le(
     if !crate::decode::codecs::scaled_groups(weight, digits, scale, |m, a| {
         mag.checked_mul_small(m) && mag.checked_add_small(a)
     }) {
+        return Err(decimal_oob());
+    }
+    // Decimal(p,s) admits |scaled| < 10^p; wire width alone is too wide.
+    if matches!(declared_precision, Some(p) if matches!(U256::pow10(p), Some(limit) if mag >= limit)) {
         return Err(decimal_oob());
     }
     signed_le(mag, neg, width.bytes())
@@ -3224,7 +3248,10 @@ fn encode_datum(
             // Non-finite is unrepresentable in Decimal: error rather than
             // corrupt unless the column sets a substitute or maps to String
             Some(decimal) => {
-                let scaled = numeric_to_scaled_le(body, decimal.scale, decimal.width)?;
+                let precision = types::strip_nullable(plan.ast.view())
+                    .decimal_precision()
+                    .and_then(|p| u8::try_from(p).ok());
+                let scaled = numeric_to_scaled_le(body, decimal.scale, decimal.width, precision)?;
                 buf.append_fixed_bytes(&scaled[..decimal.width.bytes()])
             }
             None => {
@@ -4314,7 +4341,11 @@ mod tests {
         assert_eq!(le_i64("1.50", 2), 150i64.to_le_bytes());
         assert_eq!(le_i64("-12.34", 2), (-1234i64).to_le_bytes());
         assert_eq!(le_i64("0.001", 3), 1i64.to_le_bytes());
-        assert_eq!(le_i64("123.456", 2), 12345i64.to_le_bytes());
+        assert_eq!(le_i64("123.456", 2), 12346i64.to_le_bytes());
+        assert_eq!(le_i64("1.239", 2), 124i64.to_le_bytes());
+        assert_eq!(le_i64("1.235", 2), 124i64.to_le_bytes());
+        assert_eq!(le_i64("-1.239", 2), (-124i64).to_le_bytes());
+        assert_eq!(le_i64("1.234", 2), 123i64.to_le_bytes());
         assert!(decimal_text_to_scaled_le("--5", 0, DecimalWidth::D64).is_err());
         assert!(decimal_text_to_scaled_le("", 0, DecimalWidth::D64).is_err());
         assert!(decimal_text_to_scaled_le("1.2.3", 0, DecimalWidth::D64).is_err());
@@ -4426,6 +4457,38 @@ mod tests {
                 data: b"NaN",
                 absent: b"",
             }
+        );
+    }
+
+    #[test]
+    fn numeric_beyond_declared_precision_is_rejected() {
+        let alloc = Allocator::global(&mimalloc::MiMalloc);
+        let ast = TypeAst::parse("Decimal(10, 2)", alloc).unwrap();
+        let decimal = decimal_wire_of(&ast).unwrap();
+        let plan = ColumnPlan {
+            name: String::new(),
+            type_repr: String::new(),
+            ast,
+            decimal,
+            datetime64_scale: 0,
+            non_finite: NonFinite::default(),
+            encoding: ColumnEncoding::Local,
+            source: Some(SourceColumn {
+                index: 0,
+                codec: Codec::Numeric,
+                type_oid: 0,
+            }),
+        };
+        let mut buf = ColumnBuf::new_for_ast(&TypeAst::parse("Decimal(10, 2)", alloc).unwrap())
+            .unwrap();
+        assert!(
+            encode_datum(
+                &mut buf,
+                &plan,
+                build::numeric("100000000.00").view(),
+                &mut String::new()
+            )
+            .is_err()
         );
     }
 
