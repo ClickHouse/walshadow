@@ -70,12 +70,12 @@ jobs:
 
     steps:
       - name: Checkout walshadow
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           submodules: true
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
         with:
           targets: ${{ matrix.image.target }}
 
@@ -85,7 +85,7 @@ jobs:
       # against a newer glibc, and the link fails on symbols like
       # __isoc23_sscanf that this image cannot resolve.
       - name: Cargo cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@e9d7b9f1e587218970671bac74e5511ed9506e6a # v2
         with:
           key: release-${{ matrix.image.target }}-${{ matrix.image.runner }}
 
@@ -140,7 +140,7 @@ jobs:
           ls -l dist/*.tar.gz
 
       - name: Upload archive
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: ${{ steps.version.outputs.archive }}
           path: dist/*.tar.gz
@@ -181,7 +181,7 @@ jobs:
     steps:
       # pg-clickhouse-c is a recursive submodule native.o compiles against.
       - name: Checkout walshadow
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           submodules: recursive
 
@@ -237,7 +237,7 @@ jobs:
           ls -l dist/*.tar.gz
 
       - name: Upload archive
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: ${{ steps.version.outputs.archive }}
           path: dist/*.tar.gz
@@ -257,7 +257,7 @@ jobs:
 
     steps:
       - name: Fetch archives
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           pattern: walshadow-*
           path: dist
@@ -272,7 +272,7 @@ jobs:
 
       # Verify with: gh attestation verify <archive> --repo ClickHouse/walshadow
       - name: Attest build provenance
-        uses: actions/attest-build-provenance@v4
+        uses: actions/attest-build-provenance@8beda2b7ed98355c0e97c0a63bec38ae472e66c4 # v4
         with:
           subject-path: dist/*.tar.gz
 
