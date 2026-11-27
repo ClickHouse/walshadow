@@ -14,32 +14,54 @@ use url::{ParseError, Url};
 
 #[derive(Debug, Error)]
 pub enum DsnError {
-    #[error("{url:?}: expected a {expected} URL")]
+    #[error("{}: expected a {expected} URL", redacted(url))]
     Scheme { url: String, expected: &'static str },
-    #[error("{url:?}: invalid {kind} URL: {reason}")]
+    #[error("{}: invalid {kind} URL: {reason}", redacted(url))]
     Invalid {
         url: String,
         kind: &'static str,
         reason: String,
     },
-    #[error("{0:?}: no host")]
+    #[error("{}: no host", redacted(.0))]
     NoHost(String),
-    #[error("{0:?}: port not a number in 1..=65535")]
+    #[error("{}: port not a number in 1..=65535", redacted(.0))]
     BadPort(String),
-    #[error("{url:?}: unknown parameter {key:?} (supported: {supported})")]
+    #[error("{}: unknown parameter {key:?} (supported: {supported})", redacted(url))]
     UnknownParam {
         url: String,
         key: String,
         supported: &'static str,
     },
-    #[error("{url:?}: parameter {key:?} takes true or false, got {got:?}")]
+    #[error("{}: parameter {key:?} takes true or false, got {got:?}", redacted(url))]
     NotBool {
         url: String,
         key: String,
         got: String,
     },
-    #[error("{0:?}: URL component is not UTF-8")]
+    #[error("{}: URL component is not UTF-8", redacted(.0))]
     BadEncoding(String),
+}
+
+/// Keeps scheme/host/port/db and query keys, drops userinfo and `password=` values.
+/// String-based so unparseable DSNs still get a useful message.
+fn redacted(url: &str) -> String {
+    let (base, query) = url.split_once('?').unwrap_or((url, ""));
+    let base = base
+        .split_once("://")
+        .and_then(|(scheme, rest)| rest.rsplit_once('@').map(|(_, host)| (scheme, host)))
+        .map_or_else(|| base.to_owned(), |(scheme, host)| format!("{scheme}://***@{host}"));
+    if query.is_empty() {
+        return base;
+    }
+    let query = query
+        .split('&')
+        .map(|pair| match pair.split_once('=') {
+            Some((key, _)) if key.eq_ignore_ascii_case("password") => format!("{key}=***"),
+            _ => pair.to_owned(),
+        })
+        .collect::<Vec<_>>()
+        .join("&");
+    format!("{base}?{query}")
 }
 
 const PG_PARAMS: &str = "sslmode, slot, host, port, user, password, dbname";
@@ -362,6 +384,20 @@ mod tests {
     fn source_url_rejects_unknown_param() {
         let e = source_table("postgres://h/d?sslcert=x").unwrap_err();
         assert!(matches!(e, DsnError::UnknownParam { .. }), "{e}");
+    }
+
+    #[test]
+    fn errors_redact_credentials_but_keep_diagnostic() {
+        let e = source_table("postgres://svc:S3cr3tPw@db.internal:5432/wal?bogus=1").unwrap_err();
+        let msg = e.to_string();
+        assert!(!msg.contains("S3cr3tPw"), "{msg}");
+        assert!(msg.contains("db.internal:5432/wal") && msg.contains("bogus"), "{msg}");
+
+        let e = ch_table("clickhouse://ch/db?password=S3cr3tPw&bogus=1").unwrap_err();
+        assert!(!e.to_string().contains("S3cr3tPw"), "{e}");
+
+        let e = source_table("postgres://svc:S3cr3tPw@db.internal/wal?sslmode=maybe").unwrap_err();
+        assert!(!e.to_string().contains("S3cr3tPw"), "{e}");
     }
 
     #[test]
