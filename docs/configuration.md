@@ -244,7 +244,7 @@ The three buffering settings require positive integers.
 Read-ahead overlaps external-value reads and decoding with WAL processing.
 It allows one concurrent read per bridge worker and up to 4096 queued requests.
 In `shadow` mode, queued reads of one TOAST relation share a round trip, up to
-256 values each, and up to 65,536 requests queue.
+256 values or 64 MiB each, and up to 65,536 requests queue.
 A shared round trip carries only reads the shadow has already replayed past; a
 read ahead of replay goes alone.
 A row planned while its read is still queued fetches the value itself.

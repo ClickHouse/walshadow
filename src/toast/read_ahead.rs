@@ -19,7 +19,6 @@ pub const AHEAD_QUEUE: usize = 4096;
 pub const AHEAD_BATCHED_READS: usize = 1024;
 pub const AHEAD_BATCHED_QUEUE: usize = 65536;
 pub const AHEAD_BATCH: usize = 256;
-const AHEAD_REFERRERS: usize = 4;
 // Amortized slot and task bookkeeping
 const ENTRY_OVERHEAD: usize = 512;
 
@@ -60,7 +59,7 @@ pub struct PendingReads {
     queued: Arc<Semaphore>,
     running: Arc<Semaphore>,
     lazy: bool,
-    entries: HashMap<Key, Vec<Entry>>,
+    entries: HashMap<Key, Entry>,
 }
 
 /// Fetch and decompress transients; held values top up once their size is known
@@ -107,9 +106,7 @@ impl PendingReads {
         F: Future<Output = Option<ReadValue>> + Send + 'static,
     {
         let key = (p.va_toastrelid, p.va_valueid);
-        if self.entries.get(&key).is_some_and(|held| {
-            held.len() >= AHEAD_REFERRERS || held.iter().any(|e| e.read.lsn == lsn)
-        }) {
+        if self.entries.contains_key(&key) {
             return;
         }
         let Ok(queued) = self.queued.clone().try_acquire_owned() else {
@@ -135,31 +132,27 @@ impl PendingReads {
                 read.await
             }
         });
-        self.entries.entry(key).or_default().push(Entry {
-            db,
-            p: *p,
-            read: Pending {
-                lsn,
-                started,
-                task: AbortOnDropHandle::new(task),
+        self.entries.insert(
+            key,
+            Entry {
+                db,
+                p: *p,
+                read: Pending {
+                    lsn,
+                    started,
+                    task: AbortOnDropHandle::new(task),
+                },
             },
-        });
+        );
     }
 
     pub fn take(&mut self, db: u32, p: &ToastPointer, lsn: u64) -> Option<Pending> {
         let key = (p.va_toastrelid, p.va_valueid);
-        let held = self.entries.get_mut(&key)?;
-        let at = held
-            .iter()
-            .enumerate()
-            .filter(|(_, e)| (e.db, e.p) == (db, *p) && e.read.lsn <= lsn)
-            .min_by_key(|(_, e)| e.read.lsn)
-            .map(|(at, _)| at)?;
-        let read = held.swap_remove(at).read;
-        if held.is_empty() {
-            self.entries.remove(&key);
+        let e = self.entries.get(&key)?;
+        if (e.db, e.p) != (db, *p) || e.read.lsn > lsn {
+            return None;
         }
-        Some(read)
+        Some(self.entries.remove(&key)?.read)
     }
 
     pub fn budget(&self) -> &MemoryBudget {
@@ -169,11 +162,8 @@ impl PendingReads {
     /// Drop read of `key` reserved below `before`. A later reservation saw
     /// pointer only after birth, so it reads the new value
     pub fn forget(&mut self, key: Key, before: u64) {
-        if let Some(held) = self.entries.get_mut(&key) {
-            held.retain(|e| e.read.lsn >= before);
-            if held.is_empty() {
-                self.entries.remove(&key);
-            }
+        if self.entries.get(&key).is_some_and(|e| e.read.lsn < before) {
+            self.entries.remove(&key);
         }
     }
 
@@ -256,23 +246,6 @@ mod tests {
         assert_eq!(budget.resident_bytes(), 0);
         pending.reserve(1, &pointer(2, 1), 100, ready("v"));
         assert!(pending.take(1, &pointer(2, 1), 100).is_some());
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn referrers_of_one_value_take_reads_oldest_first() {
-        let p = pointer(1, 16);
-        let mut pending = PendingReads::new(MemoryBudget::new(128 << 10));
-        pending.reserve(1, &p, 100, ready("early"));
-        pending.reserve(1, &p, 200, ready("late"));
-        pending.reserve(1, &p, 200, ready("repeat"));
-        settle().await;
-        assert!(pending.take(1, &p, 50).is_none());
-        let early = pending.take(1, &p, 250).unwrap().take().await.unwrap();
-        assert_eq!(early.value, build::text("early"));
-        assert!(pending.take(1, &p, 150).is_none());
-        let late = pending.take(1, &p, 250).unwrap().take().await.unwrap();
-        assert_eq!(late.value, build::text("late"));
-        assert!(pending.take(1, &p, 300).is_none());
     }
 
     #[tokio::test(flavor = "current_thread")]

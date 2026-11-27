@@ -20,7 +20,7 @@ use crate::toast::xid_ceiling::{XidCeiling, follows};
 use crate::toast::{ChunkStore, ChunkStoreError, FetchedValue};
 
 /// Round-trip payload target. Always allow one value even when it exceeds limit
-const FETCH_REQUEST_BYTES: usize = 64 << 20;
+pub(crate) const FETCH_REQUEST_BYTES: usize = 64 << 20;
 
 /// Poll cadence while waiting for shadow replay to cover a read. Reads ahead
 /// usually trail replay by a few records, so start short and back off
@@ -223,7 +223,7 @@ impl ChunkStore for ShadowToastStore {
         max_lsn: u64,
     ) -> Result<Vec<FetchedValue>, ChunkStoreError> {
         let ceiling = self.read.ceiling.at(max_lsn);
-        let got = self.read_at(toast_relid, values, max_lsn, true).await?;
+        let got = self.read_at(toast_relid, values, max_lsn).await?;
         Ok(got.into_iter().map(|c| judge(c, ceiling)).collect())
     }
 
@@ -231,13 +231,10 @@ impl ChunkStore for ShadowToastStore {
         true
     }
 
-    async fn replayed_through(&self, wait_for: u64) -> Option<u64> {
+    async fn replayed_through(&self) -> Option<u64> {
         let bridge = self.read.bridge.get()?;
         if !bridge.info().in_recovery {
             return Some(u64::MAX);
-        }
-        if wait_for != 0 {
-            self.await_replay(bridge, wait_for).await.ok()?;
         }
         bridge.replay_lsn().await.ok()
     }
@@ -248,14 +245,15 @@ impl ChunkStore for ShadowToastStore {
         toast_relid: u32,
         values: &[(u32, usize, u64)],
     ) -> Result<Vec<FetchedValue>, ChunkStoreError> {
+        // Sample before reading, a sample evicted meanwhile raises ceiling
+        let ceilings: Vec<u32> = values.iter().map(|v| self.read.ceiling.at(v.2)).collect();
         let newest = values.iter().map(|v| v.2).max().unwrap_or(0);
         let ids: Vec<(u32, usize)> = values.iter().map(|v| (v.0, v.1)).collect();
-        let wait = values.iter().all(|v| v.2 == newest);
-        let got = self.read_at(toast_relid, &ids, newest, wait).await?;
+        let got = self.read_at(toast_relid, &ids, newest).await?;
         Ok(got
             .into_iter()
-            .zip(values)
-            .map(|(c, v)| judge(c, self.read.ceiling.at(v.2)))
+            .zip(ceilings)
+            .map(|(c, x)| judge(c, x))
             .collect())
     }
 }
@@ -266,7 +264,6 @@ impl ShadowToastStore {
         toast_relid: u32,
         values: &[(u32, usize)],
         max_lsn: u64,
-        wait: bool,
     ) -> Result<Vec<FetchedChunks>, ChunkStoreError> {
         if values.is_empty() {
             return Ok(Vec::new());
@@ -282,11 +279,10 @@ impl ShadowToastStore {
         // Worker refuses a floor above its replay position, so read first and
         // wait for replay only once refused or unreachable. Wait and read once
         // more for a restart that rewinds replay between the wait and the read
-        let retry = wait && floor != 0;
         let mut waits = 0;
         loop {
             match read_values(bridge, toast_relid, values, floor).await {
-                Err(BridgeError::Remote(_) | BridgeError::Io(_)) if retry && waits < 2 => {
+                Err(BridgeError::Remote(_) | BridgeError::Io(_)) if floor != 0 && waits < 2 => {
                     waits += 1;
                 }
                 got => return got.map_err(|e| ChunkStoreError::Shadow(e.to_string())),
@@ -347,6 +343,7 @@ fn request_slices(values: &[(u32, usize)]) -> impl Iterator<Item = &[(u32, usize
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::toast::xid_ceiling::SAMPLE_CAP;
 
     #[test]
     fn a_run_younger_than_the_ceiling_reads_as_a_later_generation() {
@@ -450,16 +447,18 @@ mod tests {
         ceiling.observe(1 << 20, 300);
         let store = ShadowToastStore::late(ShadowRead {
             bridge: bound(Arc::new(Bridge::connect(&path).await.unwrap())),
-            ceiling,
+            ceiling: ceiling.clone(),
             applied: None,
         });
         assert!(store.mixed_bounds());
-        let got = store
-            .fetch_bounded(0, 1, &[(7, 1, 0), (8, 1, 1 << 20)])
-            .await
-            .unwrap();
+        let mut got = std::pin::pin!(store.fetch_bounded(0, 1, &[(7, 1, 0), (8, 1, 1 << 20)]));
+        assert!(futures::poll!(got.as_mut()).is_pending());
+        for k in 2..=SAMPLE_CAP as u64 + 1 {
+            ceiling.observe(k << 20, 400);
+        }
+        assert_eq!(ceiling.at(0), 400);
         assert_eq!(
-            got,
+            got.await.unwrap(),
             vec![
                 FetchedValue::Generation,
                 FetchedValue::Assembled(b"b".to_vec())
@@ -468,47 +467,22 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn mixed_bounds_never_wait_for_replay() {
-        use crate::ops::bridge::tests::{hello_body, remote_body, spawn_worker};
-        use crate::ops::bridge::{Op, PROJECTION_VERSION, PROTO_VERSION};
-        use std::sync::atomic::Ordering;
-        let (_tmp, path) = spawn_worker(vec![
-            Some(hello_body(PROTO_VERSION, PROJECTION_VERSION)),
-            Some(remote_body("replay below the requested floor")),
-        ]);
-        let bridge = Arc::new(Bridge::connect(&path).await.unwrap());
-        let store = ShadowToastStore::new(bridge.clone());
-        let err = store
-            .fetch_bounded(0, 1, &[(7, 1, 0x1000), (8, 1, 0x2000)])
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("below the requested"), "{err}");
-        let sent = |op: Op| bridge.stats.requests[op.slot()].load(Ordering::Relaxed);
-        assert_eq!(sent(Op::ReplayLsn), 0);
-        assert_eq!(sent(Op::FetchToast), 1);
-    }
-
-    #[tokio::test(flavor = "current_thread")]
     async fn replay_position_follows_recovery_state() {
         use crate::ops::bridge::tests::{hello_body, lsn_body, spawn_worker};
         use crate::ops::bridge::{PROJECTION_VERSION, PROTO_VERSION};
         let unbound = ShadowToastStore::late(LateBridge::default());
-        assert_eq!(unbound.replayed_through(0).await, None);
+        assert_eq!(unbound.replayed_through().await, None);
         let (_tmp, path) = spawn_worker(vec![
             Some(hello_body(PROTO_VERSION, PROJECTION_VERSION)),
             Some(lsn_body(0x3000)),
-            Some(lsn_body(0x3000)),
-            Some(lsn_body(0x3000)),
         ]);
         let standby = ShadowToastStore::new(Arc::new(Bridge::connect(&path).await.unwrap()));
-        assert_eq!(standby.replayed_through(0).await, Some(0x3000));
-        assert_eq!(standby.replayed_through(0x2000).await, Some(0x3000));
+        assert_eq!(standby.replayed_through().await, Some(0x3000));
         let mut hello = hello_body(PROTO_VERSION, PROJECTION_VERSION);
         hello[13] = 0;
         let (_tmp, path) = spawn_worker(vec![Some(hello)]);
         let primary = ShadowToastStore::new(Arc::new(Bridge::connect(&path).await.unwrap()));
-        assert_eq!(primary.replayed_through(0).await, Some(u64::MAX));
+        assert_eq!(primary.replayed_through().await, Some(u64::MAX));
     }
 
     #[tokio::test(flavor = "current_thread")]

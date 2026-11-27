@@ -26,6 +26,7 @@ use crate::decode::heap_decoder::{
 use crate::emit::ch_emitter::{EmitterConfig, EmitterStats, InlineValueOverflow, ToastMode};
 use crate::mimalloc;
 use crate::toast::read_ahead::{AHEAD_BATCH, PendingReads, ReadValue, retained_bytes};
+use crate::toast::shadow_store::FETCH_REQUEST_BYTES;
 use crate::xact::spill::{BodyRef, BodySpoolFile, ToastChunk, ToastDelete};
 use foldhash::{HashMap, HashMapExt, HashSet, HashSetExt};
 
@@ -420,7 +421,7 @@ pub trait ChunkStore: Send + Sync {
     fn mixed_bounds(&self) -> bool {
         false
     }
-    async fn replayed_through(&self, _wait_for: u64) -> Option<u64> {
+    async fn replayed_through(&self) -> Option<u64> {
         None
     }
     async fn fetch_bounded(
@@ -1178,22 +1179,11 @@ struct AheadRequest {
 }
 
 struct AheadFetch {
+    budget: crate::budget::MemoryBudget,
     queued: std::sync::Mutex<HashMap<(u32, u32), Vec<AheadRequest>>>,
     slots: Arc<tokio::sync::Semaphore>,
     tokens: AtomicU64,
     replayed: AtomicU64,
-    polling: std::sync::atomic::AtomicBool,
-    stalls: AtomicU64,
-    progress: tokio::sync::Notify,
-}
-
-struct ReplayPoll<'a>(&'a AheadFetch);
-
-impl Drop for ReplayPoll<'_> {
-    fn drop(&mut self) {
-        self.0.polling.store(false, Ordering::Release);
-        self.0.progress.notify_waiters();
-    }
 }
 
 struct Withdraw<'a> {
@@ -1209,17 +1199,15 @@ impl Drop for Withdraw<'_> {
 }
 
 impl AheadFetch {
-    fn new() -> Self {
+    fn new(budget: crate::budget::MemoryBudget) -> Self {
         Self {
+            budget,
             queued: std::sync::Mutex::default(),
             slots: Arc::new(tokio::sync::Semaphore::new(
                 crate::ops::bridge::MAX_BRIDGE_WORKERS,
             )),
             tokens: AtomicU64::new(0),
             replayed: AtomicU64::new(0),
-            polling: std::sync::atomic::AtomicBool::new(false),
-            stalls: AtomicU64::new(0),
-            progress: tokio::sync::Notify::new(),
         }
     }
 
@@ -1243,26 +1231,46 @@ impl AheadFetch {
             .push(req);
     }
 
-    fn take(&self, key: (u32, u32), covered: u64) -> Vec<AheadRequest> {
+    /// Replayed reads fitting one bridge request, with a reservation for
+    /// their fetched bytes that outlives any reader dropping out
+    fn take(
+        &self,
+        key: (u32, u32),
+        covered: u64,
+    ) -> Option<(Vec<AheadRequest>, crate::budget::MemoryPermit)> {
         let mut queued = self.queued.lock().expect("ahead fetch");
-        let Some(waiting) = queued.remove(&key) else {
-            return Vec::new();
-        };
+        let waiting = queued.remove(&key)?;
         let mut ids = HashSet::new();
+        let mut bytes = 0usize;
         let mut batch = Vec::new();
         let mut rest = Vec::new();
         for req in waiting {
-            if req.lsn <= covered && batch.len() < AHEAD_BATCH && ids.insert(req.value_id) {
-                req.started.store(true, Ordering::Release);
+            if req.lsn <= covered
+                && batch.len() < AHEAD_BATCH
+                && bytes < FETCH_REQUEST_BYTES
+                && ids.insert(req.value_id)
+            {
+                bytes = bytes.saturating_add(req.size);
                 batch.push(req);
             } else {
                 rest.push(req);
             }
         }
+        let held = (!batch.is_empty())
+            .then(|| self.budget.try_speculate(bytes))
+            .flatten();
+        if held.is_none() {
+            batch.append(&mut rest);
+            std::mem::swap(&mut batch, &mut rest);
+        }
         if !rest.is_empty() {
             queued.insert(key, rest);
         }
-        batch
+        let held = held?;
+        for req in &batch {
+            req.started.store(true, Ordering::Release);
+        }
+        Some((batch, held))
     }
 }
 
@@ -1416,7 +1424,7 @@ impl ToastResolver {
             return self;
         };
         let reads = if self.store.as_ref().is_some_and(|s| s.mixed_bounds()) {
-            self.coalesce = Some(Arc::new(AheadFetch::new()));
+            self.coalesce = Some(Arc::new(AheadFetch::new(budget.clone())));
             PendingReads::batched(budget.clone())
         } else {
             PendingReads::new(budget.clone())
@@ -1502,6 +1510,7 @@ impl ToastResolver {
         started: Arc<std::sync::atomic::AtomicBool>,
     ) -> Option<FetchedValue> {
         let key = (db_oid, p.va_toastrelid);
+        let size = pointer_extsize(p);
         let (tx, mut rx) = tokio::sync::oneshot::channel();
         let token = ahead.tokens.fetch_add(1, Ordering::Relaxed);
         ahead.push(
@@ -1509,55 +1518,40 @@ impl ToastResolver {
             AheadRequest {
                 token,
                 value_id: p.va_valueid,
-                size: pointer_extsize(p),
+                size,
                 lsn,
-                started,
+                started: started.clone(),
                 tx,
             },
         );
         let _withdraw = Withdraw { ahead, key, token };
-        loop {
+        let slot = loop {
             let slot = tokio::select! {
                 biased;
-                got = &mut rx => return got.ok(),
+                got = &mut rx => {
+                    let Ok(got) = got else { break None };
+                    return Some(got);
+                }
                 slot = ahead.slots.clone().acquire_owned() => slot.ok()?,
             };
             let mut covered = ahead.replayed.load(Ordering::Acquire);
             if lsn > covered {
-                covered = self.replayed_through(db_oid, 0).await;
+                covered = self.replayed_through(db_oid).await;
                 ahead.replayed.fetch_max(covered, Ordering::AcqRel);
             }
-            let batch = ahead.take(key, covered);
-            if batch.is_empty() {
-                if covered != 0 && lsn > covered {
-                    drop(slot);
-                    let reached = tokio::select! {
-                        biased;
-                        got = &mut rx => return got.ok(),
-                        reached = self.replay_reaches(ahead, db_oid, lsn) => reached,
-                    };
-                    if !reached {
-                        return None;
-                    }
-                    continue;
+            let Some((mut batch, held)) = ahead.take(key, covered) else {
+                if ahead.withdraw(key, token).is_some() {
+                    break Some(slot);
                 }
-                let Some(own) = ahead.withdraw(key, token) else {
-                    drop(slot);
-                    return rx.await.ok();
-                };
-                own.started.store(true, Ordering::Release);
-                return self
-                    .fetch_stored(db_oid, key.1, &[(own.value_id, own.size)], own.lsn)
-                    .await
-                    .ok()??
-                    .into_iter()
-                    .next();
-            }
+                drop(slot);
+                let Ok(got) = (&mut rx).await else { break None };
+                return Some(got);
+            };
             let this = self.clone();
             let shared = ahead.clone();
             tokio::spawn(async move {
                 let _slot = slot;
-                let mut batch = batch;
+                let _held = held;
                 let values: Vec<(u32, usize, u64)> =
                     batch.iter().map(|r| (r.value_id, r.size, r.lsn)).collect();
                 let got = {
@@ -1577,7 +1571,19 @@ impl ToastResolver {
                     shared.replayed.store(0, Ordering::Release);
                 }
             });
-        }
+        };
+        // Past replay, over budget or batch failed: read alone as before batching
+        let _slot = if let Some(slot) = slot {
+            slot
+        } else {
+            ahead.slots.clone().acquire_owned().await.ok()?
+        };
+        started.store(true, Ordering::Release);
+        self.fetch_stored(db_oid, key.1, &[(p.va_valueid, size)], lsn)
+            .await
+            .ok()??
+            .into_iter()
+            .next()
     }
 
     /// Speculative read of `p` started ahead of planning, its permit
@@ -1740,38 +1746,13 @@ impl ToastResolver {
         }))
     }
 
-    async fn replayed_through(&self, db_oid: u32, wait_for: u64) -> u64 {
+    async fn replayed_through(&self, db_oid: u32) -> u64 {
         if let Ok(Some(store)) = self.store_for(db_oid)
-            && let Some(at) = store.replayed_through(wait_for).await
+            && let Some(at) = store.replayed_through().await
         {
             at
         } else {
             0
-        }
-    }
-
-    async fn replay_reaches(&self, ahead: &AheadFetch, db_oid: u32, lsn: u64) -> bool {
-        let stalls = ahead.stalls.load(Ordering::Acquire);
-        loop {
-            let progress = ahead.progress.notified();
-            let seen = ahead.replayed.load(Ordering::Acquire);
-            if seen >= lsn {
-                return true;
-            }
-            if ahead.stalls.load(Ordering::Acquire) != stalls {
-                return false;
-            }
-            if ahead.polling.swap(true, Ordering::AcqRel) {
-                progress.await;
-                continue;
-            }
-            let _poll = ReplayPoll(ahead);
-            let at = self.replayed_through(db_oid, seen + 1).await;
-            if at == 0 {
-                ahead.stalls.fetch_add(1, Ordering::AcqRel);
-                return false;
-            }
-            ahead.replayed.fetch_max(at, Ordering::AcqRel);
         }
     }
 
@@ -3390,7 +3371,6 @@ mod tests {
         body: Vec<u8>,
         gate: tokio::sync::Semaphore,
         replayed: AtomicU64,
-        stuck: std::sync::atomic::AtomicBool,
         refuse: bool,
         batches: std::sync::Mutex<Vec<Vec<(u32, u64)>>>,
     }
@@ -3413,13 +3393,8 @@ mod tests {
         fn mixed_bounds(&self) -> bool {
             true
         }
-        async fn replayed_through(&self, wait_for: u64) -> Option<u64> {
-            while self.replayed.load(Ordering::Relaxed) < wait_for {
-                if self.stuck.load(Ordering::Relaxed) {
-                    return None;
-                }
-                tokio::task::yield_now().await;
-            }
+        async fn replayed_through(&self) -> Option<u64> {
+            tokio::task::yield_now().await;
             Some(self.replayed.load(Ordering::Relaxed))
         }
         async fn fetch_bounded(
@@ -3445,7 +3420,6 @@ mod tests {
             body: body.clone(),
             gate: tokio::sync::Semaphore::new(0),
             replayed: AtomicU64::new(120),
-            stuck: std::sync::atomic::AtomicBool::new(false),
             refuse,
             batches: std::sync::Mutex::default(),
         });
@@ -3467,97 +3441,122 @@ mod tests {
         }
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn refused_batch_leaves_its_reads_to_planning() {
-        let (store, r, body) = coalescing(true);
-        let pointer = |id: u32| coalesced_pointer(&body, id);
-        let leaders = crate::ops::bridge::MAX_BRIDGE_WORKERS as u32;
-        let total = leaders + 4;
-        for id in 1..=total {
-            r.read_ahead(0, pointer(id), 100 + id as u64);
-        }
-        for _ in 0..64 {
-            tokio::task::yield_now().await;
-        }
-        let cached = || {
-            r.coalesce
-                .as_ref()
-                .unwrap()
-                .replayed
-                .load(Ordering::Acquire)
-        };
-        assert_eq!(cached(), 120);
-        store.gate.add_permits(1024);
+    async fn settle_reads() {
         for _ in 0..256 {
             tokio::task::yield_now().await;
         }
-        assert_eq!(cached(), 0);
-        for id in leaders + 1..=total {
-            let slot = r.pending().unwrap().take(0, &pointer(id), 100 + id as u64);
-            assert!(slot.unwrap().take().await.is_none());
+    }
+
+    #[test]
+    fn batch_fits_one_request_and_a_reservation() {
+        let request = |value_id: u32, size| AheadRequest {
+            token: value_id.into(),
+            value_id,
+            size,
+            lsn: 100,
+            started: Arc::default(),
+            tx: tokio::sync::oneshot::channel().0,
+        };
+        let big = FETCH_REQUEST_BYTES / 2 + 1;
+        let roomy = AheadFetch::new(crate::budget::MemoryBudget::new(4 * FETCH_REQUEST_BYTES));
+        for id in 1..=3 {
+            roomy.push((0, 1), request(id, big));
         }
-        let slot = r.pending().unwrap().take(0, &pointer(1), 101);
-        assert!(slot.unwrap().take().await.is_some());
+        let (batch, held) = roomy.take((0, 1), 100).unwrap();
+        let ids: Vec<u32> = batch.iter().map(|r| r.value_id).collect();
+        assert_eq!(ids, vec![1, 2]);
+        assert_eq!(held.bytes(), 2 * big as u64);
+        assert!(roomy.withdraw((0, 1), 3).is_some());
+        let tight = AheadFetch::new(crate::budget::MemoryBudget::new(big - 1));
+        tight.push((0, 1), request(1, big));
+        assert!(tight.take((0, 1), 100).is_none());
+        assert!(tight.withdraw((0, 1), 1).is_some());
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn reads_past_replay_leave_slots_to_readable_values() {
-        let (store, r, body) = coalescing(false);
+    async fn refused_batch_falls_back_to_reads_alone() {
+        let (store, r, body) = coalescing(true);
         let pointer = |id: u32| coalesced_pointer(&body, id);
         store.gate.add_permits(1024);
-        let late = crate::ops::bridge::MAX_BRIDGE_WORKERS as u32 + 2;
-        for id in 1..=late {
-            r.read_ahead(0, pointer(id), 200 + id as u64);
+        for id in 1..=4 {
+            r.read_ahead(0, pointer(id), 100 + id as u64);
         }
-        for _ in 0..64 {
-            tokio::task::yield_now().await;
+        settle_reads().await;
+        for id in 1..=4 {
+            let slot = r.pending().unwrap().take(0, &pointer(id), 100 + id as u64);
+            assert!(slot.unwrap().take().await.is_some());
         }
-        let free = || r.coalesce.as_ref().unwrap().slots.available_permits();
-        assert_eq!(free(), crate::ops::bridge::MAX_BRIDGE_WORKERS);
-        assert!(store.batches.lock().unwrap().is_empty());
-        r.read_ahead(0, pointer(99), 110);
-        for _ in 0..64 {
-            tokio::task::yield_now().await;
+        let sizes: Vec<usize> = store.batches.lock().unwrap().iter().map(Vec::len).collect();
+        assert_eq!(sizes, vec![4, 1, 1, 1, 1]);
+        let cached = r
+            .coalesce
+            .as_ref()
+            .unwrap()
+            .replayed
+            .load(Ordering::Acquire);
+        assert_eq!(cached, 0);
+    }
+
+    /// Reads past replay hold every slot while a batched reader waits on one
+    async fn read_behind_busy_slots(refuse: bool) -> Vec<usize> {
+        let (store, r, body) = coalescing(refuse);
+        let pointer = |id: u32| coalesced_pointer(&body, id);
+        let total = crate::ops::bridge::MAX_BRIDGE_WORKERS as u32 + 1;
+        let lsn = |id: u32| if id + 1 >= total { 100 } else { 200 } + id as u64;
+        for id in 1..=total {
+            r.read_ahead(0, pointer(id), lsn(id));
         }
-        let slot = r.pending().unwrap().take(0, &pointer(99), 110);
-        assert!(slot.unwrap().take().await.is_some());
-        assert_eq!(*store.batches.lock().unwrap(), vec![vec![(99, 110)]]);
-        store.replayed.store(1000, Ordering::Relaxed);
-        for _ in 0..64 {
-            tokio::task::yield_now().await;
-        }
-        for id in 1..=late {
-            let slot = r.pending().unwrap().take(0, &pointer(id), 200 + id as u64);
+        settle_reads().await;
+        let free = r.coalesce.as_ref().unwrap().slots.available_permits();
+        assert_eq!(free, 0);
+        store.gate.add_permits(1024);
+        settle_reads().await;
+        for id in 1..=total {
+            let slot = r.pending().unwrap().take(0, &pointer(id), lsn(id));
             assert!(slot.unwrap().take().await.is_some());
         }
         let batches = store.batches.lock().unwrap();
-        assert_eq!(batches.len(), 2);
-        assert_eq!(batches[1].len(), late as usize);
+        batches.iter().map(Vec::len).collect()
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn stalled_replay_fails_every_waiting_read() {
+    async fn reader_waiting_for_a_slot_takes_its_batched_value() {
+        let sizes = read_behind_busy_slots(false).await;
+        assert_eq!(sizes.iter().filter(|&&n| n == 2).count(), 1);
+        assert_eq!(sizes.len(), crate::ops::bridge::MAX_BRIDGE_WORKERS);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reader_waiting_for_a_slot_reads_alone_once_its_batch_fails() {
+        let sizes = read_behind_busy_slots(true).await;
+        assert_eq!(sizes.iter().filter(|&&n| n == 2).count(), 1);
+        assert_eq!(sizes.len(), crate::ops::bridge::MAX_BRIDGE_WORKERS + 2);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shared_fetch_keeps_reservation_of_dropped_reader() {
         let (store, r, body) = coalescing(false);
         let pointer = |id: u32| coalesced_pointer(&body, id);
-        for id in 1..=3u32 {
-            r.read_ahead(0, pointer(id), 200 + id as u64);
+        let budget = r.budget().unwrap().clone();
+        for id in 1..=2 {
+            r.read_ahead(0, pointer(id), 100 + id as u64);
         }
-        for _ in 0..64 {
-            tokio::task::yield_now().await;
-        }
-        store.stuck.store(true, Ordering::Relaxed);
-        for _ in 0..64 {
-            tokio::task::yield_now().await;
-        }
+        settle_reads().await;
         assert_eq!(
-            r.coalesce.as_ref().unwrap().stalls.load(Ordering::Acquire),
-            1
+            *store.batches.lock().unwrap(),
+            vec![vec![(1, 101), (2, 102)]]
         );
-        for id in 1..=3u32 {
-            let slot = r.pending().unwrap().take(0, &pointer(id), 200 + id as u64);
-            assert!(slot.unwrap().take().await.is_none());
-        }
-        assert!(store.batches.lock().unwrap().is_empty());
+        let both = budget.resident_bytes();
+        drop(r.pending().unwrap().take(0, &pointer(2), 102));
+        settle_reads().await;
+        let one = budget.resident_bytes();
+        assert_eq!(2 * one - both, 2 * body.len() as u64);
+        store.gate.add_permits(1);
+        let slot = r.pending().unwrap().take(0, &pointer(1), 101);
+        let ReadValue { value, permit } = slot.unwrap().take().await.expect("value read");
+        assert_eq!(value, build::bytes(&body));
+        drop(permit);
+        assert_eq!(budget.resident_bytes(), 0);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -3566,16 +3565,13 @@ mod tests {
         for id in 1..=12u32 {
             r.read_ahead(0, coalesced_pointer(&body, id), 100 + id as u64);
         }
-        for _ in 0..64 {
-            tokio::task::yield_now().await;
-        }
-        let free = || r.coalesce.as_ref().unwrap().slots.available_permits();
-        assert_eq!(free(), 0);
+        settle_reads().await;
+        assert!(!store.batches.lock().unwrap().is_empty());
         r.pending().unwrap().clear();
-        for _ in 0..64 {
-            tokio::task::yield_now().await;
-        }
-        assert_eq!(free(), crate::ops::bridge::MAX_BRIDGE_WORKERS);
+        settle_reads().await;
+        let free = r.coalesce.as_ref().unwrap().slots.available_permits();
+        assert_eq!(free, crate::ops::bridge::MAX_BRIDGE_WORKERS);
+        assert_eq!(r.budget().unwrap().resident_bytes(), 0);
         assert_eq!(store.gate.available_permits(), 0);
     }
 
@@ -3620,57 +3616,36 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn queued_reads_of_one_relation_share_round_trips() {
+    async fn replayed_reads_share_round_trips_and_later_reads_go_alone() {
         let (store, r, body) = coalescing(false);
         let pointer = |id: u32| coalesced_pointer(&body, id);
-        let total = 31u32;
+        let lsn = |id: u32| {
+            if id > 20 {
+                100 + id as u64
+            } else {
+                100 + id as u64 / 2
+            }
+        };
+        let total = 24u32;
         for id in 1..=total {
-            r.read_ahead(0, pointer(id), 100 + id as u64);
+            r.read_ahead(0, pointer(id), lsn(id));
         }
-        for _ in 0..64 {
-            tokio::task::yield_now().await;
-        }
-        let leaders = crate::ops::bridge::MAX_BRIDGE_WORKERS;
-        assert_eq!(store.batches.lock().unwrap().len(), leaders);
-        let queued = r
-            .pending()
-            .unwrap()
-            .take(0, &pointer(total), 100 + total as u64);
-        assert!(queued.unwrap().take().await.is_none());
+        settle_reads().await;
         store.gate.add_permits(1024);
-        for _ in 0..256 {
-            tokio::task::yield_now().await;
-        }
-        assert!(
-            store
-                .batches
-                .lock()
-                .unwrap()
-                .iter()
-                .flatten()
-                .all(|&(_, lsn)| lsn <= 120)
-        );
-        store.replayed.store(1000, Ordering::Relaxed);
-        for _ in 0..256 {
-            tokio::task::yield_now().await;
-        }
-        for id in 1..total {
-            let slot = r.pending().unwrap().take(0, &pointer(id), 100 + id as u64);
+        settle_reads().await;
+        for id in 1..=total {
+            let slot = r.pending().unwrap().take(0, &pointer(id), lsn(id));
             let ReadValue { value, .. } = slot.unwrap().take().await.expect("value read");
             assert_eq!(value, build::bytes(&body));
         }
         let batches = store.batches.lock().unwrap();
-        let shared: Vec<usize> = batches.iter().map(Vec::len).filter(|&n| n > 1).collect();
-        assert_eq!(shared, vec![20 - leaders, 10]);
-        assert!(
-            batches
-                .iter()
-                .flatten()
-                .all(|&(id, lsn)| lsn == 100 + id as u64)
-        );
+        let shared: Vec<&Vec<(u32, u64)>> = batches.iter().filter(|b| b.len() > 1).collect();
+        assert!(!shared.is_empty());
+        assert!(shared.iter().all(|b| b.len() <= AHEAD_BATCH));
+        assert!(shared.iter().copied().flatten().all(|&(_, at)| at <= 120));
         let mut seen: Vec<(u32, u64)> = batches.iter().flatten().copied().collect();
         seen.sort_unstable();
-        let want: Vec<(u32, u64)> = (1..total).map(|id| (id, 100 + id as u64)).collect();
+        let want: Vec<(u32, u64)> = (1..=total).map(|id| (id, lsn(id))).collect();
         assert_eq!(seen, want);
     }
 

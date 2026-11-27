@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 const SAMPLE_BYTES: u64 = 1 << 20;
 
 /// Retained samples, oldest evicted first. 16 GiB of lag at [`SAMPLE_BYTES`]
-const SAMPLE_CAP: usize = 16 * 1024;
+pub(crate) const SAMPLE_CAP: usize = 16 * 1024;
 
 /// True when `a` is later than `b` in xid order, PG `TransactionIdFollows`
 pub fn follows(a: u32, b: u32) -> bool {
