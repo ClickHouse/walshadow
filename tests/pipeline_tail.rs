@@ -7,8 +7,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use walshadow::ch::CompressionChoice;
-use walshadow::ch_emitter::{EmitterConfig, EmitterStats, InstanceConfig};
-use walshadow::pipeline::Fatal;
+use walshadow::emit::pipeline::fatal::Fatal;
+use walshadow::emit::stats::EmitterStats;
+use walshadow::emitter_config::{EmitterConfig, InstanceConfig};
 use walshadow::pipeline::tail;
 use walshadow::pos::{EmitterAck, Monotone};
 

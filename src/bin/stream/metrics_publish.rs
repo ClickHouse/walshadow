@@ -5,13 +5,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
+use walshadow::atomic_stats::HistogramSnapshot;
 use walshadow::backfill_bootstrap::BootstrapProgress;
 use walshadow::boundary_hold::BoundaryHoldStats;
-use walshadow::ch_emitter::EmitterStats;
 use walshadow::config::ConfigResolver;
-use walshadow::metrics::{Buffer, WorkerState};
+use walshadow::emit::stats::EmitterStats;
 use walshadow::metrics::{
-    DbSeries, HistogramSnapshot, MetricsRegistry, MetricsSnapshot, RateEstimator,
+    Buffer, DbSeries, MetricsRegistry, MetricsSnapshot, RateEstimator, WorkerState,
     source_server_wal_end,
 };
 use walshadow::pipeline::row_ledger::TableRowCounts;
@@ -475,7 +475,7 @@ pub(crate) async fn populate_pipeline_metrics(
 /// reset: the emitter handle is shared, and the two oracle bridges' cumulative
 /// counters sum into one series
 pub(crate) struct StageCounters<'a> {
-    pub(crate) emitter: Option<&'a walshadow::ch_emitter::EmitterStats>,
+    pub(crate) emitter: Option<&'a walshadow::emit::stats::EmitterStats>,
     /// `database=` label for a source database oid
     pub(crate) db_name: &'a (dyn Fn(u32) -> String + Sync),
     /// Live first, bootstrap's second. Only one of the pair is ever serving

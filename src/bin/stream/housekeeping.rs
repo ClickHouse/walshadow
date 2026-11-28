@@ -31,7 +31,7 @@ pub(crate) fn spawn_segment_fsync(
     out_dir: std::fs::File,
     mut rx: tokio::sync::mpsc::Receiver<SegFsync>,
     durable_lsn: Arc<Monotone<FilterDurable>>,
-    fatal: walshadow::pipeline::Fatal,
+    fatal: walshadow::emit::pipeline::fatal::Fatal,
 ) -> tokio::task::JoinHandle<()> {
     let dir = Arc::new(out_dir);
     tokio::spawn(async move {
@@ -61,7 +61,7 @@ pub(crate) fn spawn_segment_fsync(
 pub(crate) fn spawn_desc_log_gc(
     desc_log: Arc<walshadow::desc_log::DescriptorLog>,
     floor: Gate<Floor>,
-    fatal: walshadow::pipeline::Fatal,
+    fatal: walshadow::emit::pipeline::fatal::Fatal,
     io: &tokio_util::task::TaskTracker,
 ) -> tokio::task::JoinHandle<()> {
     io.spawn(async move {
@@ -179,7 +179,7 @@ pub(crate) mod tests {
         }
         sink.close().await.unwrap();
         let durable = Arc::new(Monotone::new(Pos::new(0)));
-        let fatal = walshadow::pipeline::Fatal::new();
+        let fatal = walshadow::emit::pipeline::fatal::Fatal::new();
         let dir = std::fs::File::open(tmp.path()).unwrap();
         spawn_segment_fsync(dir, rx, durable.clone(), fatal.clone())
             .await
@@ -207,7 +207,7 @@ pub(crate) mod tests {
         sink.on_segment(seg, &[0u8; 64]).await.unwrap();
         sink.close().await.unwrap();
         let durable = Arc::new(Monotone::new(Pos::new(0)));
-        let fatal = walshadow::pipeline::Fatal::new();
+        let fatal = walshadow::emit::pipeline::fatal::Fatal::new();
         spawn_segment_fsync(dir, rx, durable.clone(), fatal.clone())
             .await
             .unwrap();
@@ -233,7 +233,7 @@ pub(crate) mod tests {
             .await
             .unwrap();
         let floor = Monotone::<Floor>::default();
-        let fatal = walshadow::pipeline::Fatal::new();
+        let fatal = walshadow::emit::pipeline::fatal::Fatal::new();
         let io = tokio_util::task::TaskTracker::new();
         let gc = spawn_desc_log_gc(Arc::new(log), floor.watch(), fatal.clone(), &io);
         io.close();
@@ -285,7 +285,7 @@ pub(crate) mod tests {
         .unwrap();
         std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
         let floor = Monotone::<Floor>::new(Pos::new(100));
-        let fatal = walshadow::pipeline::Fatal::new();
+        let fatal = walshadow::emit::pipeline::fatal::Fatal::new();
         let io = tokio_util::task::TaskTracker::new();
         spawn_desc_log_gc(Arc::new(log), floor.watch(), fatal.clone(), &io)
             .await

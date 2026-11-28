@@ -12,7 +12,7 @@ use prometheus_client::encoding::DescriptorEncoder;
 use prometheus_client::encoding::{EncodeCounterValue, EncodeGaugeValue, NoLabelSet};
 use prometheus_client::metrics::MetricType;
 
-use crate::ops::metrics::{declare, gauge};
+use crate::ops::metrics::encode::{declare, gauge};
 
 const UNSET: u64 = u64::MAX;
 

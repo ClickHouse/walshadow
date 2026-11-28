@@ -18,8 +18,7 @@ mod fx;
 
 use std::fs;
 
-use walshadow::ch_emitter::EmitterConfig;
-use walshadow::config::SourceConn;
+use walshadow::emitter_config::{EmitterConfig, SourceConn};
 use walshadow::init::{InitOpts, run};
 use walshadow::schema::RelName;
 

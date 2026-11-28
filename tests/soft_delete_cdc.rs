@@ -8,8 +8,7 @@ mod fx;
 use fx::spawn_txn;
 use std::time::Duration;
 
-use walshadow::mapping::ColumnMapping;
-use walshadow::mapping::TableTarget;
+use walshadow::mapping::{ColumnMapping, TableTarget};
 use walshadow::schema::RelName;
 
 // walsender must clear ch_http by >1 (CH binds interserver = ch_http + 1).
@@ -66,7 +65,7 @@ async fn run_drill_with(
     slot: fx::Ports,
     app_name: &str,
     workload: &str,
-    tune: impl FnOnce(&mut walshadow::ch_emitter::EmitterConfig),
+    tune: impl FnOnce(&mut walshadow::emitter_config::EmitterConfig),
 ) -> (fx::ClusterGuard, fx::ChServer, tempfile::TempDir) {
     let tmp = tempfile::tempdir().unwrap();
     let (

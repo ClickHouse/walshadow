@@ -20,8 +20,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::sync::Mutex;
 
-use crate::ops::metrics::Histogram;
-use crate::toast::FetchedValue;
+use crate::atomic_stats::Histogram;
+use crate::toast::fetched::FetchedValue;
 
 /// Frame and op layouts. Must equal `WS_PROTO_VERSION` in `pgext/walshadow.h`
 pub const PROTO_VERSION: u32 = 8;

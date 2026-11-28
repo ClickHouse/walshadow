@@ -18,10 +18,11 @@ use walshadow::boundary_hold::{
     AttachSlot, BoundaryGateConfig, BoundaryHoldSink, CatalogBoundaryGate, PendingDatabase,
     PendingDatabases,
 };
-use walshadow::ch_emitter::{EmitterConfig, EmitterStats};
-use walshadow::config::{ConfigResolver, SourceConn};
+use walshadow::config::ConfigResolver;
 #[cfg(feature = "test-support")]
 use walshadow::crash_test;
+use walshadow::emit::stats::EmitterStats;
+use walshadow::emitter_config::{EmitterConfig, SourceConn};
 use walshadow::manifest;
 use walshadow::metrics::{MetricsRegistry, RateEstimator};
 use walshadow::pg::socket_conninfo;
@@ -287,7 +288,7 @@ async fn session_body(
     tasks.spawn("sighup reload", sighup_reload(sighup, reloader.clone()));
 
     let merged: toml::Table = match args.ch_config.as_deref() {
-        Some(p) => walshadow::ch_emitter::load_effective(p, cli_base(args))
+        Some(p) => walshadow::emitter_config::load_effective(p, cli_base(args))
             .await
             .context(format!("load config {}", p.display()))?,
         None => cli_base(args),
@@ -1248,12 +1249,12 @@ async fn session_body(
         let decoders = positive_usize(
             "decoder_pool_size",
             args.decoder_pool_size,
-            walshadow::ch_emitter::DEFAULT_DECODER_POOL,
+            walshadow::emitter_config::DEFAULT_DECODER_POOL,
         );
         let inserters = positive_usize(
             "inserter_pool_size",
             args.inserter_pool_size,
-            walshadow::ch_emitter::default_inserter_pool(),
+            walshadow::emitter_config::default_inserter_pool(),
         );
         tracing::info!(
             target: "walshadow::pipeline",
@@ -1378,7 +1379,7 @@ async fn session_body(
     let durable_lsn = Arc::new(Monotone::<FilterDurable>::new(Pos::new(
         stream.dispatched_lsn(),
     )));
-    let fsync_fatal = walshadow::pipeline::Fatal::new();
+    let fsync_fatal = walshadow::emit::pipeline::fatal::Fatal::new();
     let (fsync_tx, fsync_rx) = tokio::sync::mpsc::channel::<SegFsync>(SEGMENT_FSYNC_QUEUE);
     // Prior session's writes joined in `run_session`, so no temp is live
     let stale_temps = remove_stale_temps(&args.out_dir)
@@ -1396,7 +1397,7 @@ async fn session_body(
     // Descriptor-log GC off the pump task: the pump publishes each persisted
     // floor, the task compacts. Coalesces by construction — a watch holds
     // only the latest floor.
-    let gc_fatal = walshadow::pipeline::Fatal::new();
+    let gc_fatal = walshadow::emit::pipeline::fatal::Fatal::new();
     // Pruner's own cell, not `resume_floor`: dropping it is what tells the gc
     // task the session is done
     let gc_floor = Monotone::<Floor>::default();
@@ -2304,7 +2305,7 @@ async fn session_body(
             .collect::<Vec<_>>()
             .join(" ");
         let decoder_stats: &walshadow::decoder_sink::DecoderStats = &record_sink.decoder_stats;
-        let emitter_stats: Option<&walshadow::ch_emitter::EmitterStats> =
+        let emitter_stats: Option<&walshadow::emit::stats::EmitterStats> =
             record_sink.emitter_stats.as_deref();
         let shadow_apply_lsn = shadow_replay.get();
         rate_estimator.observe(Instant::now(), received.get());
@@ -2638,7 +2639,7 @@ fn log_replication_config(
 pub(crate) fn task_stopped(
     name: &str,
     res: Result<(), tokio::task::JoinError>,
-    fatal: &walshadow::pipeline::Fatal,
+    fatal: &walshadow::emit::pipeline::fatal::Fatal,
 ) -> anyhow::Error {
     match (fatal.message(), res) {
         (Some(msg), _) => anyhow::anyhow!("{name} failed: {msg}"),
@@ -2651,7 +2652,7 @@ pub(crate) fn task_stopped(
 fn task_finished(
     name: &str,
     res: Result<(), tokio::task::JoinError>,
-    fatal: &walshadow::pipeline::Fatal,
+    fatal: &walshadow::emit::pipeline::fatal::Fatal,
 ) -> Result<()> {
     if res.is_err() || fatal.is_set() {
         return Err(task_stopped(name, res, fatal));
@@ -2687,7 +2688,7 @@ async fn stand_in_primary(shadow: &Arc<walshadow::shadow::Shadow>, absent: &str)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use walshadow::ch_emitter::InstanceConfig;
+    use walshadow::emitter_config::InstanceConfig;
 
     #[test]
     fn stand_in_reuses_an_already_followed_database() {
@@ -2776,7 +2777,7 @@ mod tests {
 
     #[tokio::test]
     async fn task_stopped_prefers_fatal_over_join_result() {
-        let fatal = walshadow::pipeline::Fatal::new();
+        let fatal = walshadow::emit::pipeline::fatal::Fatal::new();
         let exited = task_stopped("gc", Ok(()), &fatal).to_string();
         assert_eq!(exited, "gc task exited");
         let panicked = tokio::spawn(async { panic!("boom") }).await;
@@ -2792,7 +2793,7 @@ mod tests {
 
     #[tokio::test]
     async fn finished_task_fails_on_panic_or_fatal() {
-        let fatal = walshadow::pipeline::Fatal::new();
+        let fatal = walshadow::emit::pipeline::fatal::Fatal::new();
         task_finished("fsync", Ok(()), &fatal).unwrap();
         let panicked = tokio::spawn(async { panic!("boom") }).await;
         let err = task_finished("fsync", panicked, &fatal).unwrap_err();

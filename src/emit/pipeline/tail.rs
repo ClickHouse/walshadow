@@ -17,15 +17,14 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::task::AbortOnDropHandle;
 
 use crate::ch::EmitterError;
-use crate::config::DestEmitter;
-use crate::config::ResolvedConfig;
-use crate::emit::ch_emitter::EmitterStats;
-use crate::emit::pipeline::Fatal;
+use crate::config::{DestEmitter, ResolvedConfig};
 use crate::emit::pipeline::ack::{self, AckHandle};
 use crate::emit::pipeline::batcher::{self, BatcherConfig, BatcherMsg, InsertBatch};
 use crate::emit::pipeline::encode::EncodedRun;
+use crate::emit::pipeline::fatal::Fatal;
 use crate::emit::pipeline::inserter;
 use crate::emit::pipeline::resolver::{self, ResolvedBatch};
+use crate::emit::stats::EmitterStats;
 use crate::pos::{EmitterAck, Monotone};
 use foldhash::{HashMap, HashMapExt};
 
@@ -393,7 +392,7 @@ pub async fn spawn_with_config(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::emit::pipeline::bootstrap::Slab;
+    use crate::emit::pipeline::batcher::Slab;
 
     /// One routed row under `seq`, opened and placed on `ack`
     fn placed_row(ack: &AckHandle, seq: u64) -> batcher::PlacedSegment {
@@ -435,13 +434,13 @@ mod tests {
 
     #[tokio::test]
     async fn unreachable_destination_fails_spawn_under_leg_context() {
-        let cfg = crate::emit::ch_emitter::EmitterConfig {
-            conn: crate::emit::ch_emitter::InstanceConfig {
+        let cfg = crate::emitter_config::EmitterConfig {
+            conn: crate::emitter_config::InstanceConfig {
                 host: "127.0.0.1".into(),
                 port: 1,
                 ..Default::default()
             },
-            retry: crate::emit::ch_emitter::RetryConfig {
+            retry: crate::emitter_config::RetryConfig {
                 max_attempts: 0,
                 ..Default::default()
             },

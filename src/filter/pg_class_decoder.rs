@@ -75,8 +75,8 @@
 
 use walrus::pg::walparser::XLogRecord;
 
-use crate::backfill::backup_page_walk::{page_max_offnum, page_tuple_bytes};
 use crate::decode::fpi::restore_block_image;
+use crate::decode::page::{page_max_offnum, page_tuple_bytes};
 use crate::schema::FIRST_NORMAL_OBJECT_ID;
 
 /// `sizeof(xl_heap_header)`, PG `heapam_xlog.h`

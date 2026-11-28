@@ -28,17 +28,23 @@ use tokio::task::JoinHandle;
 // Use Tokio clock so tests can pause time
 use tokio::time::Instant;
 
+use crate::backfill::tuple::{BackfillTuple, TupleData, copy_slot, metadata_patch};
+use crate::budget::MemoryPermit;
+use crate::ch::EmitterError;
 use crate::config::ResolvedConfig;
+use crate::decode::datum::Datum;
 #[cfg(any(test, feature = "test-support"))]
 use crate::decode::heap_decoder::CommittedTuple;
 use crate::decode::heap_decoder::TupleView;
-use crate::emit::ch_emitter::{
-    Append, ColumnBuf, ColumnEncoding, EmitterStats, EncodedChunk, TableEncoder, TablePlan,
-};
-use crate::emit::pipeline::bootstrap::Slab;
+use crate::decode::heap_decoder::view_block_data_into;
+use crate::emit::ch_emitter::{Append, EncodedChunk, TableEncoder, TablePlan};
+use crate::emit::ch_emitter::{OP_INSERT, RowStamp};
+use crate::emit::column::{ColumnBuf, ColumnEncoding};
+use crate::emit::pipeline::DEFAULT_PIPELINE_FLUSH;
 use crate::emit::pipeline::encode::EncodedRun;
-use crate::emit::pipeline::{DEFAULT_PIPELINE_FLUSH, Fatal};
+use crate::emit::pipeline::fatal::Fatal;
 use crate::emit::route::RouteSnapshot;
+use crate::emit::stats::EmitterStats;
 use crate::mimalloc;
 use crate::schema::{RelDescriptor, TableKey};
 use foldhash::HashMap;
@@ -763,6 +769,170 @@ async fn flush_all(
     Ok(())
 }
 
+pub(crate) fn decode_err(rel: &RelDescriptor, e: impl std::fmt::Display) -> String {
+    format!("bootstrap: {} tuple decode: {e}", rel.rel_name)
+}
+
+/// Rows per load slab; the byte limit bounds wide rows
+const LOAD_SEGMENT_ROWS: usize = 65536;
+
+/// Routed load rows, encoded by the batcher straight into its open blocks
+#[derive(Default)]
+pub struct Slab {
+    pub(crate) tables: Vec<RowTable>,
+    pub(crate) rows: Vec<LoadRow>,
+    pub(crate) bytes: usize,
+    /// Leaf permit riding these rows to insert ack
+    pub(crate) permit: Option<Arc<MemoryPermit>>,
+    /// Lane queue share, released once the batcher encoded the slab
+    pub(crate) queued: Option<MemoryPermit>,
+}
+
+pub(crate) struct LoadRow {
+    pub(crate) seq: u64,
+    /// Index into containing slab's `tables`
+    pub(crate) table: u32,
+    tuple: BackfillTuple,
+    /// Resolved external values
+    patch: Vec<(usize, Datum)>,
+}
+
+impl Slab {
+    pub(crate) fn push(
+        &mut self,
+        seq: u64,
+        rel: &Arc<RelDescriptor>,
+        route: &Arc<RouteSnapshot>,
+        tuple: BackfillTuple,
+        patch: Vec<(usize, Datum)>,
+    ) {
+        let table = match self
+            .tables
+            .iter()
+            .rposition(|t| Arc::ptr_eq(&t.rel, rel) && Arc::ptr_eq(&t.route, route))
+        {
+            Some(i) => i,
+            None => {
+                self.tables.push(RowTable {
+                    rel: rel.clone(),
+                    route: route.clone(),
+                });
+                self.tables.len() - 1
+            }
+        };
+        self.bytes += crate::backfill::tuple::approx_bytes(&tuple)
+            + patch.iter().map(|(_, v)| v.approx_bytes()).sum::<usize>();
+        self.rows.push(LoadRow {
+            seq,
+            table: table as u32,
+            tuple,
+            patch,
+        });
+    }
+
+    pub(crate) fn due(&self) -> bool {
+        self.rows.len() >= LOAD_SEGMENT_ROWS || self.bytes >= DECODE_CHUNK_BYTES
+    }
+
+    /// `(seq, rows)` per seq run
+    pub(crate) fn seq_rows(&self) -> Vec<(u64, u64)> {
+        let mut out: Vec<(u64, u64)> = Vec::new();
+        for row in &self.rows {
+            match out.last_mut() {
+                Some((s, n)) if *s == row.seq => *n += 1,
+                _ => out.push((row.seq, 1)),
+            }
+        }
+        out
+    }
+
+    /// Heap rows of `cells` under one seq
+    #[cfg(test)]
+    pub(crate) fn of_cells(seq: u64, t: &RowTable, rows: &[Vec<Option<Datum>>]) -> Self {
+        let mut slab = Self::default();
+        for cells in rows {
+            let tuple = BackfillTuple {
+                rfn: t.rel.rfn,
+                xid: 0,
+                xmax: 0,
+                infomask: 0,
+                source_lsn: 0,
+                page_lsn: 0,
+                blkno: 0,
+                offnum: 1,
+                data: TupleData::from_cells(cells),
+                pending: None,
+            };
+            slab.push(seq, &t.rel, &t.route, tuple, Vec::new());
+        }
+        slab
+    }
+
+    /// Each row encoded into its own chunk, under its seq
+    #[cfg(test)]
+    pub(crate) fn encoded(mut self) -> Vec<(u64, crate::emit::ch_emitter::EncodedChunk)> {
+        use crate::emit::pipeline::plan_spool::ChunkBuilder;
+        let mut out = Vec::new();
+        let mut view = TupleView::default();
+        for row in &mut self.rows {
+            let (t, seq) = (&self.tables[row.table as usize], row.seq);
+            let mut chunks = ChunkBuilder::new(usize::MAX, usize::MAX);
+            row.encode(&mut view, t, |append| {
+                chunks.append((), &t.rel, &t.route, append).unwrap();
+                Ok(())
+            })
+            .unwrap();
+            out.extend(chunks.take().into_iter().map(|(_, c)| (seq, c)));
+        }
+        out
+    }
+
+    /// `(seq, mapped cells)` per row
+    #[cfg(test)]
+    pub(crate) fn cells(self) -> Vec<(u64, Vec<Datum>)> {
+        self.encoded()
+            .into_iter()
+            .flat_map(|(seq, c)| c.cells().into_iter().map(move |cells| (seq, cells)))
+            .collect()
+    }
+}
+
+impl LoadRow {
+    /// Encode as an insert at its load version against `t`'s plan, through
+    /// `append`, which seals and retries on [`Append::Full`]. `view` is
+    /// scratch, refilled per heap row
+    pub(crate) fn encode<'r>(
+        &'r mut self,
+        view: &mut TupleView<'r>,
+        t: &RowTable,
+        append: impl FnOnce(
+            &mut dyn FnMut(&mut TableEncoder) -> Result<Append, EmitterError>,
+        ) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let LoadRow { tuple, patch, .. } = self;
+        let tuple: &'r BackfillTuple = tuple;
+        let RowTable { rel, route } = t;
+        let stamp = RowStamp {
+            source_lsn: tuple.source_lsn,
+            xid: tuple.xid,
+            commit_ts: 0,
+            op_code: OP_INSERT,
+            leaf: route.partition.as_ref().map(|p| p.leaf),
+        };
+        let appended = match &tuple.data {
+            TupleData::Heap(data) => {
+                view_block_data_into(data, rel, view).map_err(|e| decode_err(rel, e))?;
+                metadata_patch(tuple, rel, patch);
+                append(&mut |enc| enc.append_view(rel, &view.datums, patch, &stamp))
+            }
+            TupleData::Copy(row) => append(&mut |enc| {
+                enc.append_slots(|src| Ok(copy_slot(row, rel, src.index)), &stamp)
+            }),
+        };
+        appended.map_err(|e| format!("bootstrap: encode {}: {e}", rel.rel_name))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -959,9 +1129,9 @@ mod tests {
         let mut rules = crate::column_rules::ColumnRulesBuilder::new();
         rules.add(
             &RelName::new("public", "t"),
-            crate::table_rules::MatchKind::Exact,
+            crate::runtime_config::MatchKind::Exact,
             "id",
-            crate::table_rules::MatchKind::Exact,
+            crate::runtime_config::MatchKind::Exact,
             crate::column_rules::ColumnRule {
                 target_type: Some("UInt32".into()),
                 ..Default::default()

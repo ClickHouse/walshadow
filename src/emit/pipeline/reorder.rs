@@ -30,7 +30,7 @@ use crate::catalog::pending::PendingCatalog;
 use crate::crash_test;
 use crate::decode::visibility::{PgXactView, SealedPatch, read_pg_xact};
 use crate::emit::ch_ddl::{DdlApplicator, Stamp};
-use crate::emit::ch_emitter::EmitterStats;
+use crate::emit::stats::EmitterStats;
 use crate::record::{Record, RecordSink, SinkError};
 use crate::schema::{RelDescriptor, RelName, SchemaEvent, TableKey};
 use foldhash::{HashMap, HashMapExt, HashSet, HashSetExt};
@@ -47,16 +47,17 @@ use crate::xact::xact_buffer::{
 
 use crate::backfill::opt_in::Backfiller;
 use crate::config::{ConfigResolver, ResolvedConfig};
+use crate::emit::pipeline::DbDdl;
 use crate::emit::pipeline::ack::{AckHandle, BufferedRowSender, Publish, SeqAlloc};
 use crate::emit::pipeline::batcher::{BatcherMsg, PlacedSegment};
 use crate::emit::pipeline::encode::{self, Encoders, PendingSegment};
+use crate::emit::pipeline::fatal::Fatal;
 use crate::emit::pipeline::plan_spool::{
     EncoderCache, PlanItem, PlanPath, SealedPlan, Segment, SegmentBody,
 };
 use crate::emit::pipeline::planner::{PlanRouteView, Planner, drain_reason};
-use crate::emit::pipeline::{DbDdl, Fatal};
-use crate::emit::route::{RouteSnapshot, RowPolicy, route_via};
-use crate::mapping::{MappingSnapshot, TableMapping};
+use crate::emit::route::{RouteSnapshot, route_via};
+use crate::mapping::{MappingSnapshot, RowPolicy, TableMapping};
 use crate::pos::{Floor, Monotone, Pos};
 use crate::runtime_config::{ConfigEvent, TableRow};
 use crate::source_db::{SourceDb, SourceDbs};

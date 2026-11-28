@@ -9,13 +9,12 @@ use crate::decode::datum::{Datum, build};
 use crate::decode::heap_decoder::{
     CommittedTuple, DecodedHeap, HeapOp, decode_block_data, view_block_data,
 };
-use crate::emit::ch_emitter::{
-    Codec, ColumnBuf, OP_DELETE, OP_INSERT, RowStamp, TableEncoder, TablePlan,
-};
+use crate::emit::ch_emitter::{OP_DELETE, OP_INSERT, RowStamp, TableEncoder, TablePlan};
+use crate::emit::column::{Codec, ColumnBuf};
 use crate::mapping::{ColumnMapping, SystemColumns, TableMapping, TableTarget};
 use crate::mimalloc;
+use crate::runtime_config::MatchKind;
 use crate::schema::*;
-use crate::table_rules::MatchKind;
 
 /// One source column, its target, and stored datums to try, `None` for NULL
 struct Case {
@@ -856,7 +855,7 @@ type Change = (HeapOp, Option<Vec<u8>>, Option<Vec<u8>>);
 /// Plan row changes both ways; segments must carry identical rows.
 /// External values resolve through `values` by value id, as detoast would
 fn plan_both(rel: &RelDescriptor, targets: &[&str], changes: &[Change], values: &[(u32, Datum)]) {
-    let resolved = |p: crate::decode::heap_decoder::ToastPointer| {
+    let resolved = |p: crate::decode::datum::ToastPointer| {
         values
             .iter()
             .find(|(id, _)| *id == p.va_valueid)
@@ -1094,7 +1093,8 @@ fn numeric_send(neg: bool, weight: i16, dscale: u16, digits: &[i16]) -> Vec<u8> 
 /// COPY binary and text fields encode as page-walk views of same values do
 #[test]
 fn copy_fields_match_heap_views() {
-    use crate::backfill::copy_backfill::{CopyRow, copy_slot, wire_kinds};
+    use crate::backfill::copy_backfill::wire_kinds;
+    use crate::backfill::tuple::{CopyRow, copy_slot};
     let rel = rel(vec![
         attr(1, INT4OID, 4, b'i', "int4"),
         attr(2, INT8OID, 8, b'd', "int8"),

@@ -18,13 +18,14 @@ use tokio_util::task::AbortOnDropHandle;
 
 use bytes::Bytes;
 
-use crate::ch::{ChConn, EmitterError, drain_to_end_of_stream, is_retryable, quote_ident};
-use crate::decode::datum::Datum;
-use crate::decode::heap_decoder::{
-    ToastPointer, VARLENA_EXTSIZE_BITS, VARLENA_EXTSIZE_MASK, decompress_varlena,
-};
-use crate::emit::ch_emitter::{EmitterConfig, EmitterStats, InlineValueOverflow, ToastMode};
+use crate::ch::conn::ChConn;
+use crate::ch::{EmitterError, drain_to_end_of_stream, is_retryable, quote_ident};
+use crate::decode::datum::{Datum, ToastPointer};
+use crate::decode::heap_decoder::{VARLENA_EXTSIZE_BITS, VARLENA_EXTSIZE_MASK, decompress_varlena};
+use crate::emit::stats::EmitterStats;
+use crate::emitter_config::{EmitterConfig, InlineValueOverflow, ToastMode};
 use crate::mimalloc;
+use crate::toast::fetched::FetchedValue;
 use crate::toast::read_ahead::{PendingReads, ReadValue, retained_bytes};
 use crate::xact::spill::{BodyRef, BodySpoolFile, ToastChunk, ToastDelete};
 use foldhash::{HashMap, HashMapExt, HashSet, HashSetExt};
@@ -316,24 +317,6 @@ impl ToastRow<Body> {
             lsn: self.lsn,
         })
     }
-}
-
-/// Store-side value fetch outcome. Ordering violations are transport
-/// errors, not outcomes: ascending dense feed is part of the fetch
-/// contract.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum FetchedValue {
-    /// No live chunk visible at bound
-    Missing,
-    /// Chunk run deviates from pointer size (partial merge collapse or
-    /// generation mixing): gapped, short, or over-long. Fills per miss
-    /// policy, counted distinctly
-    Mismatch { got: usize },
-    /// Exactly `expected_size` bytes, seq-dense from 0
-    Assembled(Vec<u8>),
-    /// Chunks postdate referring record, indicating value-ID reuse
-    /// Applies to complete and partial replacements, shadow store only
-    Generation,
 }
 
 /// Ordered chunk assembler: seqs must arrive ascending, bytes append into
@@ -1846,7 +1829,7 @@ mod tests {
 
     use super::*;
     use crate::decode::datum::build;
-    use crate::emit::ch_emitter::InstanceConfig;
+    use crate::emitter_config::InstanceConfig;
     use std::time::Duration;
 
     /// Query orders by value id, so a smaller id after a larger one fails

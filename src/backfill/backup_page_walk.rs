@@ -22,20 +22,23 @@ use std::time::Instant;
 use async_trait::async_trait;
 use thiserror::Error;
 use tokio::sync::mpsc;
-use walrus::pg::walparser::{Oid, RelFileNode};
+use walrus::pg::walparser::Oid;
+#[cfg(test)]
+use walrus::pg::walparser::RelFileNode;
 
 use crate::backfill::backup_source::{
     BackupSink, EntrySink, FileAction, FileKind, FileMeta, StartInfo,
 };
-use crate::backfill::copy_backfill::CopyRow;
+
 use crate::backfill::pg_path::{BaseRelFile, RelFork, parse_base_path};
+use crate::backfill::tuple::{BackfillTuple, TupleData};
 use crate::backfill::walk_barrier::WalkBarrier;
-use crate::decode::heap_decoder::{DecodeError, HEAP_HASEXTERNAL, TupleView, view_block_data};
-use crate::decode::visibility::{
-    PendingXids, PgMultiXactAccum, PgXactAccum, PgXactView, SealedPatch,
+use crate::decode::heap_decoder::{DecodeError, view_block_data};
+use crate::decode::page::{
+    LP_NORMAL, SIZE_OF_ITEM_ID, SIZE_OF_PAGE_HEADER, page_max_offnum, page_pd_lsn, page_tuple_bytes,
 };
-#[cfg(any(test, feature = "test-support"))]
-use crate::decode::{datum::Datum, heap_decoder::decode_block_data};
+use crate::decode::visibility::{PgMultiXactAccum, PgXactAccum, PgXactView, SealedPatch};
+use crate::emit::stats::PageWalkStats;
 use crate::schema::RelDescriptor;
 use foldhash::{HashMap, HashMapExt, HashSet};
 
@@ -45,11 +48,6 @@ pub const PAGE_BYTES: usize = 8192;
 /// default at 8 KiB pages. A `.N` file's first page is global block
 /// `N * RELSEG_BLOCKS`
 pub const RELSEG_BLOCKS: u32 = 131_072;
-/// `PageHeaderData` size, 24 bytes since PG 8.x
-pub const SIZE_OF_PAGE_HEADER: usize = 24;
-pub const SIZE_OF_ITEM_ID: usize = 4;
-/// `lp_flags` value for a live tuple slot
-pub const LP_NORMAL: u8 = 1;
 
 /// `pg_toast` regnamespace; TOAST tables ship as `pg_toast_<relid>`
 pub const PG_TOAST_NS: &str = "pg_toast";
@@ -81,91 +79,6 @@ pub enum PageWalkError {
         len: usize,
         err: DecodeError,
     },
-}
-
-/// One tuple from a backup page or COPY; a synthetic INSERT at
-/// `_lsn = start_lsn`. Carries row bytes, decoded only at encode
-#[derive(Debug, Clone)]
-pub struct BackfillTuple {
-    pub rfn: RelFileNode,
-    /// `t_xmin`; sequencing not load-bearing, every backfill row shares
-    /// the same `_lsn = start_lsn`
-    pub xid: u32,
-    /// `t_xmax`, read with `infomask` by bootstrap visibility gate
-    pub xmax: u32,
-    /// `t_infomask` hint bits
-    pub infomask: u16,
-    pub source_lsn: u64,
-    /// Copied heap page's `pd_lsn`, or 0 without a page. TOAST writes precede
-    /// heap inserts; TOAST deletes follow heap deletes, so reads here match heap state
-    pub page_lsn: u64,
-    /// On-page TID; toast tuples become store rows keyed on it
-    /// ([`crate::toast::ToastRow`])
-    pub blkno: u32,
-    pub offnum: u16,
-    pub data: TupleData,
-    /// Xids an undecided row waits on, set once it enters a pending table
-    pub pending: Option<PendingXids>,
-}
-
-/// Row bytes of a [`BackfillTuple`]
-#[derive(Debug, Clone, PartialEq)]
-pub enum TupleData {
-    /// On-page tuple from `t_infomask2` on: the `block.data` shape heap
-    /// decode reads
-    Heap(Box<[u8]>),
-    Copy(CopyRow),
-}
-
-impl TupleData {
-    /// Heap image of `values`, see
-    /// [`form_block_data`](crate::decode::heap_decoder::form_block_data)
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn from_cells(values: &[Option<Datum>]) -> Self {
-        Self::Heap(crate::decode::heap_decoder::form_block_data(&[], values).into())
-    }
-
-    fn heap(&self) -> Option<&[u8]> {
-        if let Self::Heap(b) = self {
-            Some(b)
-        } else {
-            None
-        }
-    }
-
-    pub(crate) fn len(&self) -> usize {
-        match self {
-            Self::Heap(b) => b.len(),
-            Self::Copy(r) => r.bytes().len(),
-        }
-    }
-}
-
-impl BackfillTuple {
-    /// Whether the heap image's `t_infomask` flags an external TOAST pointer
-    pub fn has_external(&self) -> bool {
-        self.data
-            .heap()
-            .and_then(|b| b.get(2..4))
-            .is_some_and(|m| u16::from_le_bytes([m[0], m[1]]) & HEAP_HASEXTERNAL != 0)
-    }
-
-    /// Tuple image in place; `None` for COPY rows
-    pub fn view<'a>(&'a self, rel: &RelDescriptor) -> Result<Option<TupleView<'a>>, DecodeError> {
-        self.data
-            .heap()
-            .map(|b| view_block_data(b, rel))
-            .transpose()
-    }
-
-    /// Owned cells, attnum-1 indexed
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn cells(&self, rel: &RelDescriptor) -> Result<Vec<Option<Datum>>, DecodeError> {
-        match &self.data {
-            TupleData::Heap(b) => decode_block_data(b, rel).map(|t| t.columns),
-            TupleData::Copy(row) => Ok(crate::backfill::copy_backfill::copy_cells(row, rel)),
-        }
-    }
 }
 
 /// Resolved `(db_node, rel_node) → RelDescriptor` map. Seeded before
@@ -217,35 +130,6 @@ impl CatalogMap {
 
     pub fn is_empty(&self) -> bool {
         self.by_filenode.is_empty()
-    }
-}
-
-crate::atomic_stats! {
-    /// Per-pump counters, operator-visible. Atomic so per-entry walkers
-    /// share one handle instead of funnelling through the sink lock
-    pub struct PageWalkStats {
-        pub files_seen,
-        pub files_walked,
-        /// Filenode absent from catalog map, typically a race against the seed
-        pub files_skipped_unknown_filenode,
-        /// Filenode outside the mapped set, declined before any page decode
-        pub files_skipped_unmapped,
-        /// Walked by an earlier attempt of a resumed pass, declined here
-        pub files_resumed,
-        pub toast_files_observed,
-        pub pages_walked,
-        pub slots_seen,
-        pub tuples_emitted,
-        pub tuples_skipped_lp_flag,
-        pub tuples_skipped_truncated,
-        /// Trailing partial-page bytes; PG heap files are page-aligned so
-        /// nonzero is anomalous
-        pub tail_bytes_dropped,
-        /// `PageWalker::walk_page` CPU, decode included
-        pub decode_nanos,
-        /// Blocked on a free tuple-channel slot: the bootstrap
-        /// backpressure point, so this is emitter drain time seen by the walk
-        pub channel_block_nanos,
     }
 }
 
@@ -375,49 +259,6 @@ impl<'a> PageWalker<'a> {
         }
         Ok(())
     }
-}
-
-/// Tuple bytes behind `offnum`'s line pointer, `None` unless the slot is
-/// `LP_NORMAL` and in-bounds. Serves commit-time decode of a stashed
-/// insert whose tuple rides only the FPI (`HEAP_INSERT_NO_LOGICAL` strips
-/// `REGBUF_KEEP_DATA`, so a checkpoint mid-rewrite leaves no block data)
-pub(crate) fn page_tuple_bytes(page: &[u8], offnum: u16) -> Option<&[u8]> {
-    if offnum == 0 || page.len() < SIZE_OF_PAGE_HEADER {
-        return None;
-    }
-    let pd_lower = u16::from_le_bytes(page[12..14].try_into().unwrap()) as usize;
-    let off = SIZE_OF_PAGE_HEADER + (offnum as usize - 1) * SIZE_OF_ITEM_ID;
-    if off + SIZE_OF_ITEM_ID > pd_lower.min(page.len()) {
-        return None;
-    }
-    let raw = u32::from_le_bytes(page[off..off + 4].try_into().unwrap());
-    let lp_off = (raw & 0x7FFF) as usize;
-    let lp_flags = ((raw >> 15) & 0x3) as u8;
-    let lp_len = ((raw >> 17) & 0x7FFF) as usize;
-    if lp_flags != LP_NORMAL || lp_len == 0 || lp_off + lp_len > page.len() {
-        return None;
-    }
-    Some(&page[lp_off..lp_off + lp_len])
-}
-
-/// Slots the line pointer array holds
-pub(crate) fn page_max_offnum(page: &[u8]) -> u16 {
-    if page.len() < SIZE_OF_PAGE_HEADER {
-        return 0;
-    }
-    let pd_lower = u16::from_le_bytes(page[12..14].try_into().unwrap()) as usize;
-    (pd_lower.saturating_sub(SIZE_OF_PAGE_HEADER) / SIZE_OF_ITEM_ID) as u16
-}
-
-/// Version every tuple on the page predates. In a restored image this is
-/// the version before the carrying record: PG assembles the image inside
-/// the critical section, `PageSetLSN` runs after `XLogInsert` returns.
-/// `pd_lsn` is `PageXLogRecPtr`, high word (`xlogid`) first
-pub(crate) fn page_pd_lsn(page: &[u8]) -> u64 {
-    if page.len() < SIZE_OF_PAGE_HEADER {
-        return 0;
-    }
-    u64::from_le_bytes(page[0..8].try_into().unwrap()).rotate_left(32)
 }
 
 /// Chunk rows a TOAST page holds, TID-keyed and dated `lsn`
@@ -1310,15 +1151,6 @@ mod tests {
         assert_eq!(tally.tuples_emitted, 0);
     }
 
-    /// Header bytes from a PG 18 heap page that `page_header()` reports as
-    /// lsn 13/1085150
-    #[test]
-    fn page_pd_lsn_reads_xlogid_then_xrecoff() {
-        let mut page = [0u8; PAGE_BYTES];
-        page[0..8].copy_from_slice(&[0x13, 0x00, 0x00, 0x00, 0x50, 0x51, 0x08, 0x01]);
-        assert_eq!(page_pd_lsn(&page), 0x13_0108_5150);
-    }
-
     /// A restored image mirrors every chunk on the page, not only the tuple
     /// its record names: the neighbours are what a torn backup copy lost
     #[test]
@@ -1408,14 +1240,6 @@ mod tests {
         walker.walk_page(&page, 0, &mut out, &mut tally).unwrap();
         assert_eq!(out.len(), 1);
         assert_eq!(tally.tuples_skipped_truncated, 3);
-    }
-
-    #[test]
-    fn page_helpers_read_nothing_from_a_short_page() {
-        let short = [0u8; 8];
-        assert_eq!(page_tuple_bytes(&short, 1), None);
-        assert_eq!(page_max_offnum(&short), 0);
-        assert_eq!(page_pd_lsn(&short), 0);
     }
 
     #[test]

@@ -5,21 +5,9 @@ use std::sync::Arc;
 use tokio_postgres::types::Oid;
 
 use crate::column_rules::ColumnRules;
-use crate::mapping::{ColumnMapping, SystemColumns, TableMapping, TableTarget};
+use crate::mapping::{ColumnMapping, RowPolicy, SystemColumns, TableMapping, TableTarget};
 use crate::schema::{RelDescriptor, RelName};
 use crate::table_rules::{PartitionRoute, TableRules};
-
-/// Row-shape knobs, cloned into every frozen route so execution never reads
-/// live config. `soft_delete` is boot-only; the system columns are the
-/// cluster-wide `[system_columns]` set until [`Self::for_rel`] layers a
-/// per-relation rename over it
-#[derive(Debug, Clone, Default)]
-pub struct RowPolicy {
-    /// CH-side delete retention policy (the delete marker stays queryable)
-    pub soft_delete: bool,
-    /// Names + presence of the columns walshadow appends per row
-    pub system: Arc<SystemColumns>,
-}
 
 impl RowPolicy {
     /// Policy for one relation: a `[table.*]` block or `config_table` row can
@@ -283,8 +271,9 @@ impl FrozenRoutes {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime_config::MatchKind;
     use crate::schema::int4_rel;
-    use crate::table_rules::{MatchKind, TableRule, TableRulesBuilder};
+    use crate::table_rules::{TableRule, TableRulesBuilder};
 
     /// `m` > `a` > `a1`, `a1` storing columns in another order than `m`,
     /// whose slot 2 is a dropped column

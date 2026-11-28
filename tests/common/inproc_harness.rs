@@ -40,7 +40,8 @@ use tokio::sync::Mutex;
 use walshadow::bridge::Bridge;
 use walshadow::ch::CompressionChoice;
 use walshadow::ch_ddl::{DdlApplicator, DdlConfig};
-use walshadow::ch_emitter::{EmitterConfig, EmitterStats, InstanceConfig};
+use walshadow::emit::stats::EmitterStats;
+use walshadow::emitter_config::{EmitterConfig, InstanceConfig};
 use walshadow::mapping::{
     ColumnMapping, DropTableStrategy, NamespaceMapping, TableMapping, TableTarget,
 };
@@ -562,14 +563,14 @@ impl walshadow::opt_in::Backfiller for NoBackfill {
     async fn note_opt_in(
         self: Arc<Self>,
         _: Arc<walshadow::schema::RelDescriptor>,
-        _: walshadow::runtime_config::InitialLoadMode,
+        _: walshadow::mapping::InitialLoadMode,
         _: u64,
     ) {
     }
 
     async fn note_opt_out(&self, _: &walshadow::schema::RelName) {}
 
-    fn refuses(&self, _: walshadow::runtime_config::InitialLoadMode) -> Option<&'static str> {
+    fn refuses(&self, _: walshadow::mapping::InitialLoadMode) -> Option<&'static str> {
         None
     }
 }

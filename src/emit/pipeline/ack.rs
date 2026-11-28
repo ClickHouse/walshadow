@@ -29,8 +29,8 @@ use tokio::task::JoinHandle;
 use crate::ch::EndOfStream;
 #[cfg(feature = "test-support")]
 use crate::crash_test;
-use crate::emit::ch_emitter::EmitterStats;
-use crate::emit::pipeline::Fatal;
+use crate::emit::pipeline::fatal::Fatal;
+use crate::emit::stats::EmitterStats;
 use crate::pos::{AckFrontier, EmitterAck, Gate, GateClosed, Monotone, Pos};
 use crate::record::SinkError;
 

@@ -29,7 +29,8 @@ use crate::catalog::shadow_catalog::ShadowCatalog;
 use crate::ch::EmitterError;
 use crate::config::ConfigResolver;
 use crate::emit::ch_ddl::DdlApplicator;
-use crate::runtime_config::{InitialLoadMode, TableRow};
+use crate::mapping::InitialLoadMode;
+use crate::runtime_config::TableRow;
 use crate::schema::{RelDescriptor, RelName};
 
 #[async_trait]

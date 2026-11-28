@@ -835,10 +835,7 @@ impl DescriptorLog {
             .into_iter()
             .filter(|d| {
                 d.kind != b't'
-                    && !crate::emit::ch_ddl::is_system_namespace(
-                        &d.rel_name.namespace,
-                        config_schema,
-                    )
+                    && !crate::pg::is_system_namespace(&d.rel_name.namespace, config_schema)
             })
             .map(|d| d.rel_name.clone())
             .collect()
@@ -3200,8 +3197,7 @@ mod tests {
             .step_by(2)
             .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
             .collect();
-        let live =
-            crate::backfill::copy_backfill::missing_from_send(crate::schema::NUMERICOID, &send);
+        let live = crate::backfill::tuple::missing_from_send(crate::schema::NUMERICOID, &send);
         let defaults: Vec<_> = desc.attributes.iter().map(|a| &a.missing_default).collect();
         assert_eq!(
             defaults,

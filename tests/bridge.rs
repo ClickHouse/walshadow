@@ -1189,8 +1189,9 @@ fn spawn_toast_worker(
 #[tokio::test(flavor = "current_thread")]
 async fn shadow_store_read_survives_worker_restart() {
     use std::sync::atomic::{AtomicU64, Ordering};
+    use walshadow::toast::ChunkStore;
+    use walshadow::toast::fetched::FetchedValue;
     use walshadow::toast::shadow_store::ShadowToastStore;
-    use walshadow::toast::{ChunkStore, FetchedValue};
 
     let tmp = tempfile::tempdir().unwrap();
     let sock = tmp.path().join("toast.sock");

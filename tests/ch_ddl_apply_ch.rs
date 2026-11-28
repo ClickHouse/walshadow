@@ -16,8 +16,8 @@ use tokio::sync::watch;
 use walrus::pg::walparser::RelFileNode;
 use walshadow::ch::{CompressionChoice, EmitterError, connect_client, query_strings};
 use walshadow::ch_ddl::{DdlApplicator, DdlBoot, DdlConfig, Stamp};
-use walshadow::ch_emitter::{EmitterConfig, InstanceConfig, RetryConfig};
 use walshadow::config::{DestEmitter, ResolvedConfig};
+use walshadow::emitter_config::{EmitterConfig, InstanceConfig, RetryConfig};
 use walshadow::mapping::{ColumnMapping, DropTableStrategy, TableMapping, TableTarget};
 use walshadow::schema::{
     INT4OID, INT8OID, RelAttr, RelDescriptor, RelName, ReplIdent, SchemaDiff, SchemaEvent, TEXTOID,

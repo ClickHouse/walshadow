@@ -28,119 +28,28 @@ use std::time::Duration;
 use tokio::sync::{Mutex, watch};
 
 use clickhouse_c::{Allocator, TypeAst};
-use walrus::pg::replication::conn::PgConfig;
-use walrus::pg::replication::tls::{SslMode, TlsParams};
 
 use crate::ch::{CompressionChoice, EmitterError};
 use crate::column_rules::{ColumnRule, ColumnRules, ColumnRulesBuilder, Substitute};
-use crate::emit::ch_emitter::{EmitterConfig, InstanceConfig, default_database};
+use crate::emitter_config::{EmitterConfig, InstanceConfig, SourceConn, default_database};
 use crate::filter::shadow_relations::ShadowHeld;
+use crate::mapping::derive::{Retype, derive_columns_for_mapping, fold_diff_into_mapping};
 use crate::mapping::{
-    DropTableStrategy, MappingHandle, NameTemplate, NamespaceMapping, Retype, TableMapping,
-    TableTarget, derive_columns_for_mapping, fold_diff_into_mapping, named_instance,
+    DropTableStrategy, MappingHandle, NameTemplate, NamespaceMapping, TableMapping, TableTarget,
+    named_instance,
 };
 use crate::mimalloc;
-use crate::runtime_config::{ConfigEvent, ConfigOverlay, TableRow};
+use crate::runtime_config::{ConfigEvent, ConfigOverlay, MatchKind, TableRow};
 use crate::schema::{RelDescriptor, RelName, SchemaDiff};
-use crate::table_rules::{MatchKind, TableRule, TableRules, TableRulesBuilder};
+use crate::table_rules::{TableRule, TableRules, TableRulesBuilder};
 use foldhash::{HashMap, HashSet};
-
-#[derive(Clone, PartialEq, Eq, serde::Deserialize)]
-#[serde(default)]
-pub struct SourceConn {
-    pub host: String,
-    #[serde(deserialize_with = "crate::toml_de::de_port")]
-    pub port: u16,
-    pub user: String,
-    pub password: Option<String>,
-    pub dbname: String,
-    #[serde(deserialize_with = "de_sslmode")]
-    pub sslmode: SslMode,
-    #[serde(deserialize_with = "crate::toml_de::de_nonempty")]
-    pub slot: Option<String>,
-}
-
-impl Default for SourceConn {
-    fn default() -> Self {
-        Self {
-            host: String::new(),
-            port: 5432,
-            user: String::new(),
-            password: None,
-            dbname: String::new(),
-            // libpq default, matching `PgConfig::resolve`
-            sslmode: SslMode::Prefer,
-            slot: None,
-        }
-    }
-}
-
-/// Masks the password: `ResolvedConfig` is logged whole in places
-impl std::fmt::Debug for SourceConn {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SourceConn")
-            .field("host", &self.host)
-            .field("port", &self.port)
-            .field("user", &self.user)
-            .field("password", &self.password.as_ref().map(|_| "***"))
-            .field("dbname", &self.dbname)
-            .field("sslmode", &self.sslmode)
-            .field("slot", &self.slot)
-            .finish()
-    }
-}
-
-fn de_sslmode<'de, D: serde::Deserializer<'de>>(d: D) -> Result<SslMode, D::Error> {
-    use serde::Deserialize;
-    SslMode::parse(&String::deserialize(d)?).map_err(serde::de::Error::custom)
-}
-
-#[derive(serde::Deserialize)]
-struct SourceDocument {
-    #[serde(default)]
-    source: SourceConn,
-}
-
-impl SourceConn {
-    /// Parse `[source]` out of a merged config table. Absent section keeps the
-    /// defaults; a malformed port or sslmode is an error so `ctl apply`
-    /// rejects it before the daemon reloads onto an unreachable endpoint.
-    pub fn from_table(root: &toml::Table) -> Result<Self, String> {
-        let doc: SourceDocument = toml::Value::Table(root.clone())
-            .try_into()
-            .map_err(crate::toml_de::message)?;
-        Ok(doc.source)
-    }
-
-    /// Connection for the replication socket, its sidecar SQL client, and
-    /// backfill COPY. TLS material comes from the libpq env vars
-    /// (`PGSSLROOTCERT` / `PGSSLCERT` / `PGSSLKEY`), never from TOML, so it is
-    /// resolved per connect rather than carried here.
-    pub fn to_pg_config(&self) -> PgConfig {
-        PgConfig {
-            host: self.host.clone(),
-            port: self.port,
-            user: self.user.clone(),
-            password: self.password.clone(),
-            database: self.dbname.clone(),
-            application_name: "walshadow".into(),
-            sslmode: self.sslmode,
-            tls: TlsParams::resolve(&walrus::config::Vars::default()),
-        }
-    }
-
-    /// Credential-free endpoint for logs, metrics labels, and `ctl status`
-    pub fn endpoint(&self) -> String {
-        format!("{}:{}/{}", self.host, self.port, self.dbname)
-    }
-}
 
 /// Pre-materialised resolved config, snapshotted by subscribers via
 /// `watch::Receiver<Arc<ResolvedConfig>>`. Rebuilt whole on every reload,
 /// so a snapshot is internally consistent — no per-field tearing.
 #[derive(Debug, Clone)]
 pub struct ResolvedConfig {
-    pub instances: std::collections::BTreeMap<String, crate::emit::ch_emitter::InstanceConfig>,
+    pub instances: std::collections::BTreeMap<String, crate::emitter_config::InstanceConfig>,
     /// Per-relation destination mapping
     pub tables: HashMap<RelName, TableMapping>,
     /// Per-namespace defaults keyed on PG schema name
@@ -987,7 +896,7 @@ impl ConfigResolver {
             return Ok(());
         };
         let mut inner = self.inner.lock().await;
-        let merged = crate::ch_emitter::load_effective(path, self.cli_base.clone()).await?;
+        let merged = crate::emitter_config::load_effective(path, self.cli_base.clone()).await?;
         // This resolver's own database, not whichever one `[source]` names
         inner.base = EmitterConfig::for_database(&merged, &self.dbname)?;
         self.republish(&inner);
@@ -1000,6 +909,7 @@ mod tests {
     use super::*;
     use crate::runtime_config::{ColumnRow, GlobalRow, NamespaceRow, TableRow};
     use foldhash::HashMapExt;
+    use walrus::pg::replication::tls::SslMode;
 
     fn base_with(drop_strategy: &str) -> EmitterConfig {
         EmitterConfig::from_toml_str(&format!(
@@ -1552,7 +1462,7 @@ mod tests {
             &ColumnRules::default(),
         );
         assert_eq!(rejections, 0);
-        let policy = crate::emit::route::RowPolicy::default();
+        let policy = crate::mapping::RowPolicy::default();
         // No mapping, no descriptor, no CREATE yet: the shape is still known
         let sys = policy
             .for_rel(Some(&r), &RelName::new("app", "events_2026"))
@@ -1835,7 +1745,7 @@ mod tests {
                 .get(&p.rel_name)
                 .expect("mapping survives retain");
             assert_ne!(m.target.database, "wide", "glob target skipped");
-            let policy = crate::emit::route::RowPolicy::default();
+            let policy = crate::mapping::RowPolicy::default();
             assert_eq!(
                 policy.for_rel(Some(&snap), &p.rel_name).system.lsn,
                 "_lsn",

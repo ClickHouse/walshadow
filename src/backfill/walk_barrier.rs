@@ -22,7 +22,6 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 
 use crate::backfill::spool::SpoolMark;
-use crate::emit::pipeline::tail::OwnedTail;
 
 /// Seconds between stage publishes and checkpoint writes
 pub const WALK_CHECKPOINT_PERIOD: Duration = Duration::from_secs(30);
@@ -63,8 +62,13 @@ impl WalkProof {
         &self.files
     }
 
-    pub async fn prove(self, tail: &OwnedTail) -> Result<DurableWalk, String> {
-        tail.checkpoint(self.next_seq).await?;
+    /// `checkpoint` proves every seq below its argument durable, as
+    /// `OwnedTail::checkpoint` does
+    pub async fn prove<F>(self, checkpoint: impl FnOnce(u64) -> F) -> Result<DurableWalk, String>
+    where
+        F: Future<Output = Result<(), String>>,
+    {
+        checkpoint(self.next_seq).await?;
         Ok(DurableWalk(self))
     }
 }

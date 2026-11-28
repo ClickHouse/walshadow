@@ -8,9 +8,8 @@ use foldhash::HashSet;
 use tokio::sync::{Mutex, watch};
 use tokio_util::sync::CancellationToken;
 use walshadow::config::ResolvedConfig;
-use walshadow::mapping::MappingHandle;
+use walshadow::mapping::{InitialLoadMode, MappingHandle};
 use walshadow::pg::quote_ident;
-use walshadow::runtime_config::InitialLoadMode;
 use walshadow::schema::RelName;
 use walshadow::shadow_catalog::ShadowCatalog;
 

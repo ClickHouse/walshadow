@@ -8,7 +8,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use tokio_util::sync::CancellationToken;
 use walrus::pg::backup::format_pg_lsn;
-use walshadow::ch_emitter::EmitterConfig;
+use walshadow::emitter_config::EmitterConfig;
 use walshadow::pg::socket_conninfo;
 use walshadow::shadow::{ResumeOutcome, Shadow, ShadowConfig};
 

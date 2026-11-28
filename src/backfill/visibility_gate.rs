@@ -15,9 +15,10 @@ use anyhow::Result;
 use tokio::sync::mpsc;
 use tokio_util::task::AbortOnDropHandle;
 
-use crate::backfill::backup_page_walk::{BOOTSTRAP_TUPLE_CHANNEL_CAP, BackfillTuple, CatalogMap};
+use crate::backfill::backup_page_walk::{BOOTSTRAP_TUPLE_CHANNEL_CAP, CatalogMap};
 use crate::backfill::bootstrap_marker::SpooledRecords;
 use crate::backfill::spool::{DEFERRED_SPOOL_MEM_MAX, DeferredSpool};
+use crate::backfill::tuple::BackfillTuple;
 use crate::backfill::visibility_pending::{PendingManifest, PendingSpool};
 use crate::backfill::walk_barrier::{WALK_CHECKPOINT_PERIOD, WalkBarrier};
 use crate::config::ResolvedConfig;
@@ -25,13 +26,14 @@ use crate::decode::visibility::{
     HEAP_XMAX_IS_MULTI, PgXactView, SealedPatch, Visibility, deferred_xids, read_pg_multixact,
     read_pg_xact, tuple_visibility,
 };
-use crate::emit::ch_emitter::EmitterStats;
 use crate::emit::pipeline::ack::AckHandle;
 use crate::emit::pipeline::batcher::BatcherMsg;
+use crate::emit::pipeline::bootstrap;
 use crate::emit::pipeline::bootstrap::{BootstrapDrainOutcome, WindowCoverage};
+use crate::emit::pipeline::fatal::Fatal;
 use crate::emit::pipeline::tail::OwnedTail;
-use crate::emit::pipeline::{Fatal, bootstrap};
 use crate::emit::route::freeze_routes;
+use crate::emit::stats::EmitterStats;
 use crate::mapping::MappingSnapshot;
 use crate::schema::RelName;
 use crate::ticker::Ticker;
@@ -556,18 +558,17 @@ pub async fn resolve_greenfield(
 mod tests {
     use super::*;
     use crate::backfill::backup_page_walk::{
-        PAGE_BYTES, PageWalkSink, TupleData, make_rel, make_rel_named, synth_single_tuple_page,
+        PAGE_BYTES, PageWalkSink, make_rel, make_rel_named, synth_single_tuple_page,
     };
     use crate::backfill::backup_source::testing::expect_tap;
     use crate::backfill::backup_source::{BackupSink, FileMeta, StartInfo};
-    use crate::backfill::spool::DEFERRED_SPOOL_MEM_MAX;
-    use crate::backfill::spool::SpoolMark;
+    use crate::backfill::spool::{DEFERRED_SPOOL_MEM_MAX, SpoolMark};
+    use crate::backfill::tuple::TupleData;
     use crate::decode::datum::{Datum, build};
     use crate::decode::visibility::{
         HEAP_XMAX_COMMITTED, HEAP_XMAX_INVALID, HEAP_XMAX_IS_MULTI, HEAP_XMAX_LOCK_ONLY,
-        HEAP_XMIN_COMMITTED, HEAP_XMIN_INVALID,
+        HEAP_XMIN_COMMITTED, HEAP_XMIN_INVALID, PgMultiXactAccum, PgXactAccum,
     };
-    use crate::decode::visibility::{PgMultiXactAccum, PgXactAccum};
     use foldhash::HashSetExt;
     use std::path::PathBuf;
     use walrus::pg::walparser::RelFileNode;
@@ -802,7 +803,7 @@ mod tests {
         };
         let (ack, ack_task) = crate::emit::pipeline::ack::spawn(
             Arc::new(Default::default()),
-            crate::emit::pipeline::Fatal::new(),
+            crate::emit::pipeline::fatal::Fatal::new(),
         );
         let (msg_tx, _msg_rx) = mpsc::channel(1);
         let (mut txs, mut lanes) = sink
@@ -877,7 +878,7 @@ mod tests {
         for (i, first_seq) in [3u64, 7].into_iter().enumerate() {
             let (ack, ack_task) = crate::emit::pipeline::ack::spawn(
                 Arc::new(Default::default()),
-                crate::emit::pipeline::Fatal::new(),
+                crate::emit::pipeline::fatal::Fatal::new(),
             );
             let (msg_tx, msg_rx) = mpsc::channel(16);
             lanes.push(DeferredLane {
@@ -977,7 +978,7 @@ mod tests {
     /// them for chunk-store resolution
     #[tokio::test]
     async fn mapped_external_values_stream_untouched() {
-        use crate::decode::heap_decoder::ToastPointer;
+        use crate::decode::datum::ToastPointer;
         use crate::mapping::{ColumnMapping, TableMapping, TableTarget};
         use crate::schema::RelName;
 
@@ -1523,7 +1524,7 @@ mod tests {
         };
         let (ack, ack_task) = crate::emit::pipeline::ack::spawn(
             Arc::new(Default::default()),
-            crate::emit::pipeline::Fatal::new(),
+            crate::emit::pipeline::fatal::Fatal::new(),
         );
         let (msg_tx, _msg_rx) = mpsc::channel(1);
 

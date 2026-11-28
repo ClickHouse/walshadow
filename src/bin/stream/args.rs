@@ -7,8 +7,8 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::Parser;
-use walshadow::ch_emitter::{BootstrapMode, EmitterConfig};
 use walshadow::config::cli_over_toml;
+use walshadow::emitter_config::{BootstrapMode, EmitterConfig};
 use walshadow::mapping::DropTableStrategy;
 use walshadow::retention::DEFAULT_RETENTION_BYTES;
 use walshadow::schema::RelName;
@@ -241,7 +241,7 @@ pub(crate) struct Args {
     pub(crate) xact_buffer_max: usize,
     /// CH-Native emitter config (TOML). Set → drained tuples ship to
     /// ClickHouse via `clickhouse-c-rs`; unset → metrics-only. Shape: see
-    /// [`walshadow::ch_emitter::EmitterConfig::from_toml_str`]. Reloaded on
+    /// [`walshadow::emitter_config::EmitterConfig::from_toml_str`]. Reloaded on
     /// SIGHUP (atomic mapping swap; connection params stay boot-only).
     #[arg(long)]
     pub(crate) ch_config: Option<PathBuf>,
@@ -391,7 +391,7 @@ pub(crate) fn cli_base(args: &Args) -> toml::Table {
     s.insert("sslmode".into(), args.sslmode.clone().into());
     let mut root = toml::Table::new();
     root.insert("source".into(), toml::Value::Table(s));
-    walshadow::ch_emitter::merge_tables(&mut root, args.url_base.clone());
+    walshadow::emitter_config::merge_tables(&mut root, args.url_base.clone());
     root
 }
 

@@ -12,11 +12,13 @@ use tokio::sync::{Mutex, watch};
 use walrus::pg::replication::conn::PgConfig;
 use walshadow::backfill_staging::{self, StagingRel, StagingSession};
 use walshadow::backfill_types::BackupRequest;
-use walshadow::ch_emitter::{EmitterConfig, EmitterStats, InstanceConfig};
 use walshadow::copy_backfill::CopyBackfiller;
 use walshadow::desc_log::{BatchRecord, DescLogIdentity, DescriptorLog, LogEntry, LogValue};
-use walshadow::mapping::{ColumnMapping, MappingHandle, TableMapping, TableTarget, mapping_handle};
-use walshadow::runtime_config::InitialLoadMode;
+use walshadow::emit::stats::EmitterStats;
+use walshadow::emitter_config::{EmitterConfig, InstanceConfig};
+use walshadow::mapping::{
+    ColumnMapping, InitialLoadMode, MappingHandle, TableMapping, TableTarget, mapping_handle,
+};
 use walshadow::schema::{RelDescriptor, RelName};
 use walshadow::shadow::Shadow;
 use walshadow::shadow_catalog::ShadowCatalog;
@@ -280,7 +282,7 @@ async fn staging_follows_named_instance() {
     fx::create_ch_dest_table(&remote, "default", "t").unwrap();
     fixture.emitter.instances.insert(
         "archive".into(),
-        walshadow::ch_emitter::InstanceConfig {
+        walshadow::emitter_config::InstanceConfig {
             host: "127.0.0.1".into(),
             port: ports.ch_tcp,
             database: "history".into(),
@@ -1336,7 +1338,7 @@ async fn unreadable_source_rows_leave_copy_pending() {
     );
 
     // Disable TOAST seeding to reach COPY's column permission check
-    fx.emitter.toast.mode = walshadow::ch_emitter::ToastMode::Disabled;
+    fx.emitter.toast.mode = walshadow::emitter_config::ToastMode::Disabled;
     let restarted = fx.backfiller_as(dir.path(), pg.clone()).await;
     restarted
         .note_opt_in(&fx.desc, InitialLoadMode::Copy, 100)

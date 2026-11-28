@@ -2,8 +2,10 @@
 
 use foldhash::HashMap;
 
+use crate::mapping::set_if;
+use crate::runtime_config::MatchKind;
 use crate::schema::RelName;
-use crate::table_rules::{MatchKind, NamePattern, RelMatcher, set_if};
+use crate::table_rules::{NamePattern, RelMatcher};
 
 /// Replacement for a source value destination cannot hold
 #[derive(Debug, Clone, PartialEq, Eq)]

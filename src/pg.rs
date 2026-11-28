@@ -96,7 +96,7 @@ impl RawAttr {
         let missing_default = self
             .missing_send
             .as_deref()
-            .and_then(|send| crate::backfill::copy_backfill::missing_from_send(self.type_oid, send))
+            .and_then(|send| crate::backfill::tuple::missing_from_send(self.type_oid, send))
             .map(MissingDefault::Raw)
             .or_else(|| {
                 self.missing
@@ -190,6 +190,20 @@ pub async fn current_wal_lsn(client: &Client) -> anyhow::Result<u64> {
     let row = client.query_one("SELECT pg_current_wal_lsn()", &[]).await?;
     let lsn: PgLsn = row.get(0);
     Ok(lsn.into())
+}
+
+/// `pg_namespace.oid`; writes to it force capture-all (relcache invals
+/// enumerate rels only for pg_class/pg_attribute/pg_index/pg_constraint
+/// changes — PG `src/backend/utils/cache/inval.c` — while namespace rename
+/// changes every embedded namespace text with zero per-relation invals)
+pub const PG_NAMESPACE_OID: u32 = 2615;
+
+pub fn is_system_namespace(ns: &str, runtime_config_schema: Option<&str>) -> bool {
+    ns == "pg_catalog"
+        || ns == "information_schema"
+        || ns == "pg_toast"
+        || ns.starts_with("pg_")
+        || runtime_config_schema.is_some_and(|s| !s.is_empty() && s == ns)
 }
 
 #[cfg(test)]
@@ -288,5 +302,17 @@ mod tests {
         assert_eq!(Tid::from_sql(&Type::TID, &raw).unwrap(), Tid(258, 3));
         assert!(Tid::from_sql(&Type::TID, &raw[1..]).is_err());
         assert!(<Tid as FromSql>::accepts(&Type::TID));
+    }
+
+    #[test]
+    fn system_namespaces_excluded_from_replicate_all() {
+        assert!(is_system_namespace("pg_catalog", None));
+        assert!(is_system_namespace("pg_toast", None));
+        assert!(is_system_namespace("information_schema", None));
+        assert!(is_system_namespace("pg_temp_3", None));
+        assert!(!is_system_namespace("public", None));
+        assert!(is_system_namespace("walshadow", Some("walshadow")));
+        assert!(!is_system_namespace("walshadow", Some("")));
+        assert!(!is_system_namespace("public", Some("walshadow")));
     }
 }

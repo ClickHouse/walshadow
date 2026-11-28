@@ -47,7 +47,7 @@ use crate::ascii_buf::{AsciiArray, AsciiBuf};
 use crate::ch::types;
 use crate::decode::codecs::format_time_us;
 use crate::decode::heap_decoder::{TextDatum, text_datum};
-use crate::emit::ch_emitter::{ColumnBuf, decimal_le_to_text, encode_default};
+use crate::emit::column::{ColumnBuf, decimal_le_to_text, encode_default};
 use crate::mimalloc;
 use crate::schema::{
     BOOLOID, BPCHAROID, BYTEAOID, CHAROID, CIDOID, CIDROID, DATEOID, FLOAT4OID, FLOAT8OID, INETOID,

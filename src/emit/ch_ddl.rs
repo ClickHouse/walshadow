@@ -33,24 +33,27 @@ use clickhouse_c::Kind;
 use tokio::sync::watch;
 
 use crate::catalog::type_bridge::{self, ResolvedColumn};
-use crate::ch::{
-    ChConn, EmitterError, connect_creating_database, exec_drain, is_retryable, quote_ident, types,
-};
+use crate::ch::conn::{ChConn, connect_creating_database};
+use crate::ch::{EmitterError, exec_drain, is_retryable, quote_ident, types};
 use crate::column_rules::ColumnRules;
 use crate::config::{ConfigResolver, DestEmitter, ResolvedConfig};
 #[cfg(feature = "test-support")]
 use crate::crash_test;
 use crate::decode::datum::DatumRef;
 use crate::decode::heap_decoder;
-use crate::emit::ch_emitter::{DATETIME64_PG_EPOCH_US, EmitterConfig};
+use crate::emit::column::DATETIME64_PG_EPOCH_US;
 use crate::emit::route::{Routing, routing};
+use crate::emitter_config::EmitterConfig;
+use crate::mapping::InitialLoadMode;
+use crate::mapping::derive::{
+    Retype, RetypeKind, apply_column_rule, fold_diff_into_mapping, retyped_target,
+};
 use crate::mapping::{
     ColumnMapping, DropTableStrategy, MappingHandle, MappingSnapshot, NameTemplate,
-    NamespaceMapping, Retype, RetypeKind, SystemColumns, TableMapping, TableTarget, Tee,
-    apply_column_rule, fold_diff_into_mapping, named_instance, retyped_target,
+    NamespaceMapping, SystemColumns, TableMapping, TableTarget, Tee, named_instance,
 };
 use crate::ops::oracle::{Oracle, OracleCell};
-use crate::runtime_config::InitialLoadMode;
+use crate::pg::is_system_namespace;
 use crate::schema::{
     DroppedPartition, INT2OID, INT4OID, INT8OID, MissingDefault, RelAttr, RelDescriptor, RelName,
     ReplIdent, SchemaDiff, SchemaEvent, replident_key_attnums,
@@ -65,7 +68,7 @@ use tokio_postgres::types::Oid;
 /// restart.
 #[derive(Debug, Clone)]
 pub struct DdlConfig {
-    pub instances: std::collections::BTreeMap<String, crate::emit::ch_emitter::InstanceConfig>,
+    pub instances: std::collections::BTreeMap<String, crate::emitter_config::InstanceConfig>,
     pub drop_table_strategy: DropTableStrategy,
     pub detach_strategy: DropTableStrategy,
     pub truncate_strategy: DropTableStrategy,
@@ -112,7 +115,7 @@ pub struct DdlBoot {
 }
 
 impl DdlBoot {
-    pub fn from_emitter(cfg: &crate::emit::ch_emitter::EmitterConfig) -> Self {
+    pub fn from_emitter(cfg: &crate::emitter_config::EmitterConfig) -> Self {
         Self {
             target_database: cfg.conn.database.clone(),
             source_database: cfg.source.dbname.clone(),
@@ -175,7 +178,7 @@ impl DdlConfig {
     }
 
     fn target_database_for(&self, namespace: &str, instance: Option<&str>) -> &str {
-        crate::emit::ch_emitter::default_database(
+        crate::emitter_config::default_database(
             &self.namespaces,
             &self.instances,
             &self.target_database,
@@ -323,14 +326,6 @@ impl CreateShape<'_> {
             partition_by: None,
         }
     }
-}
-
-pub(crate) fn is_system_namespace(ns: &str, runtime_config_schema: Option<&str>) -> bool {
-    ns == "pg_catalog"
-        || ns == "information_schema"
-        || ns == "pg_toast"
-        || ns.starts_with("pg_")
-        || runtime_config_schema.is_some_and(|s| !s.is_empty() && s == ns)
 }
 
 /// CH-side DDL writer. Owns one BoxedAsyncClient over its own TCP.
@@ -1791,7 +1786,8 @@ async fn ensure_instance_database(cfg: &EmitterConfig) -> Result<bool, EmitterEr
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mapping::{ColumnMapping, TableMapping, derive_columns_for_mapping};
+    use crate::mapping::derive::derive_columns_for_mapping;
+    use crate::mapping::{ColumnMapping, TableMapping};
     use foldhash::HashSetExt;
     use std::sync::LazyLock;
 
@@ -1867,21 +1863,10 @@ mod tests {
             partition_by: None,
         }
     }
-    use crate::schema::{INT4OID, TEXTOID, TIMESTAMPTZOID};
-    use crate::schema::{RelAttr, RelDescriptor, ReplIdent, SchemaDiff};
-    use crate::table_rules::MatchKind;
-
-    #[test]
-    fn system_namespaces_excluded_from_replicate_all() {
-        assert!(is_system_namespace("pg_catalog", None));
-        assert!(is_system_namespace("pg_toast", None));
-        assert!(is_system_namespace("information_schema", None));
-        assert!(is_system_namespace("pg_temp_3", None));
-        assert!(!is_system_namespace("public", None));
-        assert!(is_system_namespace("walshadow", Some("walshadow")));
-        assert!(!is_system_namespace("walshadow", Some("")));
-        assert!(!is_system_namespace("public", Some("walshadow")));
-    }
+    use crate::runtime_config::MatchKind;
+    use crate::schema::{
+        INT4OID, RelAttr, RelDescriptor, ReplIdent, SchemaDiff, TEXTOID, TIMESTAMPTZOID,
+    };
 
     fn namespaces_with_bare_prefix(cfg: &mut DdlConfig) {
         cfg.namespaces.insert(
@@ -3488,12 +3473,12 @@ mod tests {
     /// reaches ClickHouse fails the test
     fn offline(cfg: DdlConfig, map: foldhash::HashMap<RelName, TableMapping>) -> DdlApplicator {
         let emitter = EmitterConfig {
-            conn: crate::emit::ch_emitter::InstanceConfig {
+            conn: crate::emitter_config::InstanceConfig {
                 host: "127.0.0.1".into(),
                 port: 1,
                 ..Default::default()
             },
-            retry: crate::emit::ch_emitter::RetryConfig {
+            retry: crate::emitter_config::RetryConfig {
                 max_attempts: 0,
                 ..Default::default()
             },

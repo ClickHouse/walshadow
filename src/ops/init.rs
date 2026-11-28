@@ -16,8 +16,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use toml::{Table, Value};
 
-use crate::ch_emitter::EmitterConfig;
-use crate::config::SourceConn;
+use crate::emitter_config::{EmitterConfig, SourceConn};
 use crate::introspect::{self, SourceTable};
 use crate::preflight::{self, MIN_SERVER_VERSION_NUM, PreflightError, SourceInputs};
 use crate::schema::RelName;

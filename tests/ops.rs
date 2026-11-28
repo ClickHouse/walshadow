@@ -27,7 +27,7 @@ use std::io::Write;
 use std::time::Duration;
 
 use anyhow::Result;
-use walshadow::ch_emitter::EmitterConfig;
+use walshadow::emitter_config::EmitterConfig;
 use walshadow::mapping::{ColumnMapping, TableMapping, TableTarget};
 use walshadow::preflight::{Inputs, PreflightError};
 use walshadow::schema::RelName;

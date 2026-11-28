@@ -402,6 +402,10 @@ jobs:
         working-directory: walshadow
         run: git ls-files '*.sh' | xargs shellcheck -x
 
+      - name: module cycles
+        working-directory: walshadow
+        run: find src -name '*.rs' | awk -f ci/module_cycles.awk
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:

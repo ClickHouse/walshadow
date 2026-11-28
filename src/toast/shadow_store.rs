@@ -15,8 +15,9 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 
 use crate::ops::bridge::{Bridge, BridgeError, FetchedChunks, MAX_FETCH_VALUES};
+use crate::toast::fetched::FetchedValue;
 use crate::toast::xid_ceiling::{XidCeiling, follows};
-use crate::toast::{ChunkStore, ChunkStoreError, FetchedValue};
+use crate::toast::{ChunkStore, ChunkStoreError};
 
 /// Round-trip payload target. Always allow one value even when it exceeds limit
 const FETCH_REQUEST_BYTES: usize = 64 << 20;

@@ -21,8 +21,7 @@ use std::path::PathBuf;
 use tokio::fs::OpenOptions;
 use tokio::io::AsyncSeekExt;
 
-use crate::backfill::backup_page_walk::{BackfillTuple, TupleData};
-use crate::backfill::copy_backfill::CopyRow;
+use crate::backfill::tuple::{BackfillTuple, CopyRow, TupleData, approx_bytes};
 use crate::decode::visibility::PendingXids;
 use crate::xact::spill::{
     ChunkReader, ChunkWriter, Cursor, IO_CHUNK, SpillError, push_u8, push_u16, push_u32, push_u64,
@@ -464,10 +463,6 @@ fn truncated() -> SpillError {
     }
 }
 
-pub(crate) fn approx_bytes(value: &BackfillTuple) -> usize {
-    std::mem::size_of::<BackfillTuple>() + value.data.len()
-}
-
 const DATA_HEAP: u8 = 0;
 const DATA_COPY: u8 = 1;
 
@@ -691,7 +686,7 @@ mod tests {
     /// as oracle binary input
     #[tokio::test]
     async fn file_records_keep_send_fields() {
-        use crate::backfill::copy_backfill::{WireKind, copy_slot};
+        use crate::backfill::tuple::{WireKind, copy_slot};
         use crate::decode::datum::DatumRef;
         let dir = tempdir().unwrap();
         let mut spool = DeferredSpool::new(dir.path().join("send.bin"), 0);

@@ -9,11 +9,13 @@ mod fx;
 use std::sync::Arc;
 use std::time::Duration;
 
+use walshadow::backfill::tuple::{BackfillTuple, TupleData};
 use walshadow::backfill_staging::StagingSession;
-use walshadow::backup_page_walk::{BackfillTuple, CatalogMap, TupleData};
-use walshadow::ch_emitter::{EmitterConfig, EmitterStats, InstanceConfig, RetryConfig};
+use walshadow::backup_page_walk::CatalogMap;
 use walshadow::config::DestEmitter;
 use walshadow::datum::{Datum, build};
+use walshadow::emit::stats::EmitterStats;
+use walshadow::emitter_config::{EmitterConfig, InstanceConfig, RetryConfig};
 use walshadow::mapping::{ColumnMapping, TableMapping, TableTarget};
 use walshadow::schema::{RelAttr, RelDescriptor, RelName, ReplIdent};
 use walshadow::toast::ToastResolver;

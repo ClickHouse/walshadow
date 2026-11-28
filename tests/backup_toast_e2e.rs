@@ -11,13 +11,16 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use tokio::sync::{Mutex, watch};
-use walshadow::backfill_types::{BackupRequest, PassContext, PassError, PassOutcome};
+use walshadow::backfill::pass::{PassContext, PassError, PassOutcome};
+use walshadow::backfill_types::BackupRequest;
 use walshadow::backup_checkpoint::BackupCheckpoint;
-use walshadow::ch_emitter::{EmitterConfig, EmitterStats, InstanceConfig};
 use walshadow::copy_backfill::CopyBackfiller;
 use walshadow::desc_log::{BatchRecord, DescLogIdentity, DescriptorLog, LogEntry, LogValue};
-use walshadow::mapping::{ColumnMapping, MappingHandle, TableMapping, TableTarget, mapping_handle};
-use walshadow::runtime_config::InitialLoadMode;
+use walshadow::emit::stats::EmitterStats;
+use walshadow::emitter_config::{EmitterConfig, InstanceConfig};
+use walshadow::mapping::{
+    ColumnMapping, InitialLoadMode, MappingHandle, TableMapping, TableTarget, mapping_handle,
+};
 use walshadow::schema::{RelDescriptor, RelName};
 use walshadow::shadow::Shadow;
 use walshadow::timeline::TimelineHistory;
@@ -445,7 +448,7 @@ async fn object_store_pass_resumes_from_its_checkpoint() {
         },
         inserter_pool_size: 4,
         backup: Some(settings.clone()),
-        bootstrap: walshadow::ch_emitter::BootstrapSettings {
+        bootstrap: walshadow::emitter_config::BootstrapSettings {
             object_store_parallelism: std::num::NonZeroUsize::new(1),
             ..Default::default()
         },

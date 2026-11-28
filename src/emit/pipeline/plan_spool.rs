@@ -1258,7 +1258,7 @@ mod tests {
     use super::*;
     use crate::decode::datum::{Datum, build};
     use crate::decode::heap_decoder::{CommittedTuple, DecodedHeap, DecodedTuple};
-    use crate::emit::ch_emitter::Wire;
+    use crate::emit::column::Wire;
     use crate::mapping::{ColumnMapping, TableMapping, TableTarget};
     use crate::schema::{INT4OID, RelAttr, RelName, SchemaEvent};
     use walrus::pg::walparser::RelFileNode;
@@ -1298,7 +1298,7 @@ mod tests {
     /// Index-key equality as `datumIsEqual` judges stored bytes
     #[test]
     fn datums_differ_matrix() {
-        use crate::decode::heap_decoder::ToastPointer;
+        use crate::decode::datum::ToastPointer;
         use crate::schema::FLOAT4OID;
         let mut att = descriptor(1).attributes[0].clone();
         let one = 1i32.to_le_bytes();
@@ -1631,7 +1631,7 @@ mod tests {
         let append_only = RouteSnapshot::freeze(
             route().mapping.clone(),
             Arc::default(),
-            crate::emit::route::RowPolicy {
+            crate::mapping::RowPolicy {
                 system: Arc::new(crate::mapping::SystemColumns {
                     is_deleted: None,
                     ..Default::default()

@@ -21,8 +21,8 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail};
 
 use crate::backfill::backfill_types::BackupRequest;
-use crate::backfill::copy_backfill::SwapPermit;
-use crate::ch::{ChConn, EmitterError, exec_drain, query_strings, quote_ident};
+use crate::ch::conn::ChConn;
+use crate::ch::{EmitterError, exec_drain, query_strings, quote_ident};
 use crate::config::DestEmitter;
 use crate::mapping::{MappingHandle, TableMapping, TableTarget};
 use crate::schema::RelName;
@@ -323,6 +323,22 @@ pub(crate) fn sql_str(s: &str) -> String {
     }
     out.push('\'');
     out
+}
+
+/// Ledger durably records the swap for `rel`, so EXCHANGE may run
+pub struct SwapPermit<'a> {
+    rel: &'a StagingRel,
+}
+
+impl<'a> SwapPermit<'a> {
+    /// Only the copy ledger mints one, after recording the swap
+    pub(crate) fn recorded(rel: &'a StagingRel) -> Self {
+        Self { rel }
+    }
+
+    pub fn rel(&self) -> &'a StagingRel {
+        self.rel
+    }
 }
 
 #[cfg(test)]

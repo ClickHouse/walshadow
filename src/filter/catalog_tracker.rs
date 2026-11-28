@@ -39,6 +39,7 @@ use crate::filter::pg_class_decoder::{
     DecodeOutcome, PgClassRow, decode_pg_class_tuple, info_carries_new_tuple_heap,
     info_carries_new_tuple_heap2, info_is_inplace, page_rows, tuple_slots,
 };
+use crate::pg::PG_NAMESPACE_OID;
 use crate::schema::FIRST_NORMAL_OBJECT_ID;
 use foldhash::{HashMap, HashSet};
 
@@ -70,11 +71,6 @@ const OPAQUE_CATALOG_OIDS: &[u32] = &[
     3431, // pg_toast_3429_index
     3433, // pg_statistic_ext_data_stxoid_inh_index
 ];
-/// `pg_namespace.oid`; writes to it force capture-all (relcache invals
-/// enumerate rels only for pg_class/pg_attribute/pg_index/pg_constraint
-/// changes — PG `src/backend/utils/cache/inval.c` — while namespace rename
-/// changes every embedded namespace text with zero per-relation invals)
-pub const PG_NAMESPACE_OID: u32 = 2615;
 
 #[derive(Debug, Default)]
 pub struct CatalogTracker {

@@ -6,7 +6,7 @@ use foldhash::{HashMap, HashMapExt};
 use prometheus_client::collector::Collector;
 use prometheus_client::encoding::DescriptorEncoder;
 
-use crate::ops::metrics::{counter_pairs, counter_series};
+use crate::ops::metrics::encode::{counter_pairs, counter_series};
 use tracing::{Event, Level, Subscriber};
 use tracing_subscriber::layer::{Context, Layer};
 

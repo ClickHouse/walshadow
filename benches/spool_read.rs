@@ -10,11 +10,11 @@ use std::time::{Duration, Instant};
 
 use clap::Parser;
 use foldhash::{HashMap, HashMapExt};
-use walrus::pg::walparser::RelFileNode;
 use walrus::pg::walparser::{
-    BlockLocation, RmId, XLogRecord, XLogRecordBlock, XLogRecordBlockHeader, XLogRecordHeader,
+    BlockLocation, RelFileNode, RmId, XLogRecord, XLogRecordBlock, XLogRecordBlockHeader,
+    XLogRecordHeader,
 };
-use walshadow::backup_page_walk::{BackfillTuple, TupleData};
+use walshadow::backfill::tuple::{BackfillTuple, TupleData};
 use walshadow::datum::build;
 use walshadow::emit::route::RouteSnapshot;
 use walshadow::mapping::{ColumnMapping, TableMapping, TableTarget};

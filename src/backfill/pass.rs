@@ -1,0 +1,83 @@
+//! Contract between the bootstrap driver and one backfill pass
+
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use tokio::sync::{Mutex, watch};
+use walrus::pg::replication::conn::PgConfig;
+
+use crate::backfill::backfill_types::WalkCounts;
+use crate::budget::MemoryBudget;
+use crate::catalog::desc_log::DescriptorLog;
+use crate::catalog::shadow_catalog::ShadowCatalog;
+use crate::config::ResolvedConfig;
+use crate::emit::stats::EmitterStats;
+use crate::mapping::MappingHandle;
+use crate::ops::oracle::Oracle;
+use crate::source::timeline::TimelineHistory;
+
+pub struct PassContext {
+    pub pg: PgConfig,
+    pub dest: Arc<crate::config::DestEmitter>,
+    /// Routing for this pass's rows; staging targets while a pass is
+    /// unpublished
+    pub mapping: MappingHandle,
+    /// Live published routing. Pending tables are siblings of the destination,
+    /// not of staging, since a promote lands after the swap
+    pub published: MappingHandle,
+    pub stats: Arc<EmitterStats>,
+    pub catalog: Arc<Mutex<ShadowCatalog>>,
+    pub log: Arc<DescriptorLog>,
+    pub scratch_dir: PathBuf,
+    pub config_rx: Option<watch::Receiver<Arc<ResolvedConfig>>>,
+    /// Branch the stream proved, re-seated at a crossing: a backup pass names
+    /// gap segments off it rather than re-deriving lineage from the archive
+    pub history_rx: watch::Receiver<Arc<TimelineHistory>>,
+    pub budget: Option<MemoryBudget>,
+    pub oracle: Option<Arc<Oracle>>,
+    /// Source PG major: picks the backup's pg_multixact offsets width
+    pub source_major: u32,
+    pub checkpoint: crate::backfill::backup_checkpoint::BackupCheckpoint,
+    /// Interval between walk and gap replay checkpoints
+    pub checkpoint_period: std::time::Duration,
+}
+
+#[derive(Debug)]
+pub enum PassError {
+    Preflight(anyhow::Error),
+    Load(anyhow::Error),
+}
+
+impl PassError {
+    pub fn inner(&self) -> &anyhow::Error {
+        match self {
+            Self::Preflight(e) | Self::Load(e) => e,
+        }
+    }
+}
+
+impl std::fmt::Display for PassError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if f.alternate() {
+            write!(f, "{:#}", self.inner())
+        } else {
+            write!(f, "{}", self.inner())
+        }
+    }
+}
+
+impl std::error::Error for PassError {}
+
+#[derive(Debug, Default, Clone)]
+pub struct PassOutcome {
+    pub counts: WalkCounts,
+    /// Undecided rows parked in pending tables
+    pub rows_pending: u64,
+    pub rows_replayed: u64,
+    pub replay_commits_past_s: u64,
+    pub gap_segments: u32,
+    pub b_redo: u64,
+    pub pg_xact_patch_len: usize,
+    /// Pending tables the pass wrote; the caller records them once it publishes
+    pub pending_tables: Vec<crate::backfill::visibility_pending::PendingManifest>,
+}

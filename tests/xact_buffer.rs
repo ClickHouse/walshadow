@@ -27,12 +27,11 @@ use std::time::Duration;
 
 use tokio::sync::Mutex;
 use walrus::pg::walparser::RelFileNode;
-use walshadow::ch_emitter::EmitterStats;
 use walshadow::datum::{Datum, build};
+use walshadow::decode::datum::ToastPointer;
 use walshadow::desc_log::{BatchRecord, DescLogIdentity, DescriptorLog, LogEntry, LogValue};
-use walshadow::heap_decoder::{
-    CommittedTuple, DecodedHeap, DecodedTuple, DescribedHeap, HeapOp, ToastPointer,
-};
+use walshadow::emit::stats::EmitterStats;
+use walshadow::heap_decoder::{CommittedTuple, DecodedHeap, DecodedTuple, DescribedHeap, HeapOp};
 use walshadow::pg::socket_conninfo;
 use walshadow::pos::Pos;
 use walshadow::shadow::{BridgeConf, Shadow, ShadowConfig};

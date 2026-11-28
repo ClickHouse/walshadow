@@ -22,10 +22,10 @@ use crate::backfill::wal_replay::{
 use crate::catalog::desc_log::{BatchRecord, DescLogIdentity, DescriptorLog, LogEntry, LogValue};
 use crate::config::ResolvedConfig;
 use crate::decode::visibility::PgXactPatch;
-use crate::emit::ch_emitter::EmitterStats;
-use crate::emit::pipeline::Fatal;
 use crate::emit::pipeline::ack::BufferedRowSender;
+use crate::emit::pipeline::fatal::Fatal;
 use crate::emit::pipeline::tail::OwnedTail;
+use crate::emit::stats::EmitterStats;
 use crate::mapping::MappingHandle;
 use crate::pos::Pos;
 use crate::record::{WAL_SEG_SIZE, segments_covering};

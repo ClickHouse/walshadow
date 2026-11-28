@@ -37,12 +37,12 @@ use tokio::task::JoinHandle;
 use crate::budget::MemoryBudget;
 use crate::ch::{CompressionChoice, EmitterError};
 use crate::config::ResolvedConfig;
-use crate::emit::ch_emitter::{
-    ColumnBuf, EmitterStats, RetryConfig, build_leaf, build_root, literal_column,
-};
-use crate::emit::pipeline::Fatal;
+use crate::emit::column::{ColumnBuf, build_leaf, build_root, literal_column};
 use crate::emit::pipeline::batcher::{BatchMeta, BlockSlabs, InsertBatch, NATIVE_BLOCK_BYTES};
+use crate::emit::pipeline::fatal::Fatal;
 use crate::emit::pipeline::sealed::SealedBlock;
+use crate::emit::stats::EmitterStats;
+use crate::emitter_config::RetryConfig;
 use crate::mimalloc;
 use crate::ops::oracle::{
     ORACLE_BATCH_SEAL_BYTES, Oracle, OracleBlock, OracleError, OracleRequestColumn,
@@ -380,7 +380,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::decode::datum::build;
     use crate::decode::heap_decoder::{CommittedTuple, DecodedHeap, DecodedTuple, HeapOp};
-    use crate::emit::ch_emitter::Wire;
+    use crate::emit::column::Wire;
     use crate::emit::pipeline::batcher::{BatcherConfig, BatcherMsg, PlacedSegment, RowTable};
     use crate::emit::route::RouteSnapshot;
     use crate::mapping::{ColumnMapping, TableMapping, TableTarget};

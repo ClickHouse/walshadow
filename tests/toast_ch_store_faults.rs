@@ -12,8 +12,9 @@ mod fx;
 
 use std::sync::Arc;
 
-use walshadow::ch_emitter::{EmitterConfig, InstanceConfig, RetryConfig};
-use walshadow::toast::{ChunkStore, ClickHouseChunkStore, FetchedValue, ToastRow};
+use walshadow::emitter_config::{EmitterConfig, InstanceConfig, RetryConfig};
+use walshadow::toast::fetched::FetchedValue;
+use walshadow::toast::{ChunkStore, ClickHouseChunkStore, ToastRow};
 
 const DB: &str = "walshadow_toast_faults";
 const SRC_DB: u32 = 16384;

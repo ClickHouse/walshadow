@@ -10,9 +10,8 @@ use crate::backfill::backfill_types::{BackupRequest, WalkCounts};
 use crate::backfill::spool::SpoolMark;
 use crate::backfill::walk_barrier::{DurableWalk, WalkBarrier};
 use crate::config::ResolvedConfig;
-use crate::emit::ch_emitter::EmitterConfig;
-use crate::mapping::MappingSnapshot;
-use crate::runtime_config::InitialLoadMode;
+use crate::emitter_config::EmitterConfig;
+use crate::mapping::{InitialLoadMode, MappingSnapshot};
 
 const FILENAME: &str = "backup_replay.json";
 /// Bumped whenever a phase's resume state changes shape; an older file loses
