@@ -67,7 +67,7 @@ returns bare `nan` regardless of target
    Validate signed/unsigned domains before accepting integer overrides
 3. Apply configured non-finite substitutes in
    [fast-default rendering](../src/catalog/type_bridge.rs). Share validation with
-   [row encoding](../src/emit/ch_emitter.rs) so SQL literals and wire values agree.
+   [row encoding](../src/emit/column.rs) so SQL literals and wire values agree.
    Reject unsupported policies before destination DDL or load begins, following
    [schema plan](schema.md)
 4. Distinguish real source NULL from absent delete payload. Reject source NULL

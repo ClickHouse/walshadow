@@ -51,17 +51,18 @@ use walrus::pg::replication::base_backup::BaseBackupOpts;
 use walrus::pg::wal::segment::SegmentName;
 use walrus::pg::walparser::{Oid, RmId};
 
-use crate::backfill::backfill_types::{BackupRequest, PassContext, PassError, PassOutcome};
+use crate::backfill::backfill_types::BackupRequest;
 use crate::backfill::backup_checkpoint::{self, BackupCheckpoint, WalkState};
 use crate::backfill::backup_page_walk::{
-    BOOTSTRAP_TUPLE_CHANNEL_CAP, BackfillTuple, CatalogMap, CompleteAccums, GateAccums,
-    PageWalkSink,
+    BOOTSTRAP_TUPLE_CHANNEL_CAP, CatalogMap, CompleteAccums, GateAccums, PageWalkSink,
 };
 use crate::backfill::backup_sentinel::build_lsn_pair;
 use crate::backfill::backup_source::{BackupSink, BackupSource, EndInfo, StartInfo};
 use crate::backfill::backup_source_direct::DirectSource;
 use crate::backfill::backup_source_object_store::ObjectStoreSource;
+use crate::backfill::pass::{PassContext, PassError, PassOutcome};
 use crate::backfill::spool::{DEFERRED_SPOOL_MEM_MAX, DeferredSpool, Replayable, SpoolMark};
+use crate::backfill::tuple::BackfillTuple;
 use crate::backfill::visibility_gate::{GateStats, resolve_phase, stream_phase};
 use crate::backfill::visibility_pending::{self, PendingSpool};
 use crate::backfill::wal_replay::{
@@ -74,16 +75,17 @@ use crate::decode::wal_xact::{
     XLOG_XACT_ABORT, XLOG_XACT_ABORT_PREPARED, XLOG_XACT_COMMIT, XLOG_XACT_COMMIT_PREPARED,
     XLOG_XACT_OPMASK, parse_xact_payload,
 };
-use crate::emit::ch_emitter::EmitterStats;
+use crate::emit::pipeline::bootstrap;
+use crate::emit::pipeline::fatal::Fatal;
 use crate::emit::pipeline::tail::OwnedTail;
-use crate::emit::pipeline::{Fatal, bootstrap};
 use crate::emit::route::freeze_routes;
+use crate::emit::stats::EmitterStats;
 use crate::filter::main_data::{parse_xl_heap_truncate, parse_xl_relmap_update};
 use crate::filter::pg_class_decoder::{
     DecodeOutcome, decode_pg_class_tuple, info_carries_new_tuple_heap,
 };
+use crate::mapping::InitialLoadMode;
 use crate::record::{Record, RecordSink, SinkError, WAL_SEG_SIZE, segments_covering_lineage};
-use crate::runtime_config::InitialLoadMode;
 use crate::schema::RelDescriptor;
 use crate::source::archive;
 use crate::source::timeline::TimelineHistory;
@@ -813,7 +815,7 @@ async fn record_walked(
     loop {
         tokio::time::sleep(barrier.period()).await;
         let walk = match barrier.collect().await {
-            Some(proof) => match proof.prove(tail).await {
+            Some(proof) => match proof.prove(|seq| tail.checkpoint(seq)).await {
                 Ok(walk) => Some(walk),
                 Err(e) => return anyhow::Error::msg(e),
             },
@@ -1171,7 +1173,7 @@ impl RecordSink for PrescanSink {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backfill::backup_page_walk::TupleData;
+    use crate::backfill::tuple::TupleData;
     use crate::decode::visibility::{
         HEAP_XMAX_INVALID, HEAP_XMAX_IS_MULTI, HEAP_XMIN_COMMITTED, HEAP_XMIN_INVALID,
         PgMultiXactAccum, PgXactAccum, PgXactView,
@@ -1982,7 +1984,7 @@ mod tests {
             InitialLoadMode::ObjectStore,
             &[],
             &Arc::default(),
-            &crate::emit::ch_emitter::EmitterConfig::default(),
+            &crate::emitter_config::EmitterConfig::default(),
             None,
         );
         let err = record_walked(Some(&barrier), &tail, &mut state, dir.path()).await;

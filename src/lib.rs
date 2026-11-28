@@ -40,6 +40,7 @@ mod cursor;
 pub mod decode;
 pub mod dsn;
 pub mod emit;
+pub mod emitter_config;
 pub mod filter;
 pub mod fs;
 pub mod mapping;

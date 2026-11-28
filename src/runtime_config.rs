@@ -21,9 +21,8 @@
 
 use crate::decode::datum::Datum;
 use crate::decode::heap_decoder::{DecodedHeap, HeapOp};
-use crate::schema::RelAttr;
-use crate::schema::{RelDescriptor, RelName};
-use crate::table_rules::MatchKind;
+use crate::schema::{RelAttr, RelDescriptor, RelName};
+
 use foldhash::HashMap;
 
 pub const CONFIG_GLOBAL: &str = "config_global";
@@ -86,7 +85,7 @@ pub struct TableRow {
     /// Inclusion switch: `Some(true)` opt-in, `Some(false)` opt-out, `None`
     /// leaves scope unchanged (legacy target-override-only behavior).
     pub replicate: Option<bool>,
-    /// One-time backfill mode for pre-opt-in rows, raw ([`InitialLoadMode`]
+    /// One-time backfill mode for pre-opt-in rows, raw ([`InitialLoadMode`](crate::mapping::InitialLoadMode)
     /// parses at dispatch in [`crate::backfill::opt_in`], validate-late like every
     /// overlay value); absent / `none` streams from opt-in LSN.
     pub initial_load: Option<String>,
@@ -116,46 +115,36 @@ impl TableRow {
     }
 }
 
-/// Parsed `config_table.initial_load` mode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum InitialLoadMode {
-    /// No backfill, stream from opt-in LSN only.
-    None,
-    /// Snapshot-free COPY at `_lsn = S` ([`crate::backfill::copy_backfill`]).
-    Copy,
-    /// Fresh `BASE_BACKUP` page-walk filtered to the opted-in rels
-    /// (architecture/bootstrap.md).
-    BaseBackup,
-    /// Object-store base backup + archive-WAL gap replay, filtered
-    /// (architecture/bootstrap.md).
-    ObjectStore,
+/// Pattern syntax used by config entry
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MatchKind {
+    #[default]
+    Exact,
+    Glob,
+    Regex,
 }
 
-impl std::str::FromStr for InitialLoadMode {
+impl std::str::FromStr for MatchKind {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, String> {
-        match s {
-            "none" => Ok(Self::None),
-            "copy" => Ok(Self::Copy),
-            "base_backup" => Ok(Self::BaseBackup),
-            "object_store" => Ok(Self::ObjectStore),
+        match s.trim().to_ascii_lowercase().as_str() {
+            "" | "exact" => Ok(Self::Exact),
+            "glob" => Ok(Self::Glob),
+            "regex" => Ok(Self::Regex),
             other => Err(format!(
-                "unknown initial_load mode `{other}` (expected none / copy / \
-                 base_backup / object_store)"
+                "unknown match kind `{other}` (expected exact / glob / regex)"
             )),
         }
     }
 }
 
-impl InitialLoadMode {
-    /// Canonical ledger and metric label
+impl MatchKind {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::None => "none",
-            Self::Copy => "copy",
-            Self::BaseBackup => "base_backup",
-            Self::ObjectStore => "object_store",
+            Self::Exact => "exact",
+            Self::Glob => "glob",
+            Self::Regex => "regex",
         }
     }
 }
@@ -967,23 +956,6 @@ mod tests {
         assert!(overlay.namespaces.is_empty());
         assert!(overlay.tables.is_empty());
         assert!(overlay.columns.is_empty());
-    }
-
-    #[test]
-    fn initial_load_parse_accepts_explicit_none() {
-        assert_eq!("none".parse(), Ok(InitialLoadMode::None));
-        assert_eq!("copy".parse(), Ok(InitialLoadMode::Copy));
-        assert_eq!("base_backup".parse(), Ok(InitialLoadMode::BaseBackup));
-        assert_eq!("object_store".parse(), Ok(InitialLoadMode::ObjectStore));
-        assert!("null".parse::<InitialLoadMode>().is_err());
-        for mode in [
-            InitialLoadMode::None,
-            InitialLoadMode::Copy,
-            InitialLoadMode::BaseBackup,
-            InitialLoadMode::ObjectStore,
-        ] {
-            assert_eq!(mode.as_str().parse(), Ok(mode));
-        }
     }
 
     /// Typed and `typoutput` text cells read alike

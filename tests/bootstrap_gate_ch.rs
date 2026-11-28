@@ -174,7 +174,7 @@ async fn unresolvable_multixact_fails_greenfield_resolution() {
     let tmp = tempfile::tempdir().unwrap();
     let mut deferred = DeferredSpool::new(tmp.path().join("gate.bin"), DEFERRED_SPOOL_MEM_MAX);
     deferred
-        .push(walshadow::backup_page_walk::BackfillTuple {
+        .push(walshadow::backfill::tuple::BackfillTuple {
             rfn: walrus::pg::walparser::RelFileNode {
                 spc_node: 1663,
                 db_node: 5,
@@ -187,13 +187,13 @@ async fn unresolvable_multixact_fails_greenfield_resolution() {
             page_lsn: 0,
             blkno: 0,
             offnum: 1,
-            data: walshadow::backup_page_walk::TupleData::Heap(Box::default()),
+            data: walshadow::backfill::tuple::TupleData::Heap(Box::default()),
             pending: None,
         })
         .await
         .unwrap();
-    let emitter = walshadow::ch_emitter::EmitterConfig {
-        conn: walshadow::ch_emitter::InstanceConfig {
+    let emitter = walshadow::emitter_config::EmitterConfig {
+        conn: walshadow::emitter_config::InstanceConfig {
             host: "127.0.0.1".into(),
             port: slot.ch_tcp,
             ..Default::default()
@@ -201,7 +201,7 @@ async fn unresolvable_multixact_fails_greenfield_resolution() {
         compression: walshadow::ch::CompressionChoice::None,
         ..Default::default()
     };
-    let stats = Arc::new(walshadow::ch_emitter::EmitterStats::default());
+    let stats = Arc::new(walshadow::emit::stats::EmitterStats::default());
     let gate = PendingGate {
         deferred: vec![deferred],
         sink: GreenfieldSink {

@@ -19,13 +19,15 @@ use std::sync::Arc;
 
 use walrus::pg::walparser::RelFileNode;
 use walshadow::ch::CompressionChoice;
-use walshadow::ch_emitter::{EmitterConfig, EmitterStats, InstanceConfig};
 use walshadow::datum::build;
+use walshadow::emit::pipeline::fatal::Fatal;
+use walshadow::emit::stats::EmitterStats;
+use walshadow::emitter_config::{EmitterConfig, InstanceConfig};
 use walshadow::heap_decoder::{CommittedTuple, DecodedHeap, DecodedTuple, HeapOp};
 use walshadow::mapping::{ColumnMapping, TableMapping, TableTarget};
 use walshadow::pipeline::ack::Publish;
 use walshadow::pipeline::batcher::{BatcherMsg, PlacedSegment};
-use walshadow::pipeline::{Fatal, tail};
+use walshadow::pipeline::tail;
 use walshadow::pos::{EmitterAck, Monotone};
 use walshadow::schema::{
     INT4OID, NUMERICOID, RelAttr, RelDescriptor, RelName, ReplIdent, TIMEOID, TIMETZOID,

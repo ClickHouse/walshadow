@@ -1,7 +1,7 @@
 //! Transaction WAL record parsing
 
 use crate::cursor::Cursor;
-use crate::filter::catalog_tracker::PG_NAMESPACE_OID;
+use crate::pg::PG_NAMESPACE_OID;
 
 pub(crate) const XLOG_XACT_OPMASK: u8 = 0x70;
 pub(crate) const XLOG_XACT_COMMIT: u8 = 0x00;

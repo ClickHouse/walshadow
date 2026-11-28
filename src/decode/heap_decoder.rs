@@ -69,6 +69,7 @@ use crate::decode::datum::{Datum, DatumRef};
 use thiserror::Error;
 use walrus::pg::walparser::{RelFileNode, RmId, XLogRecord};
 
+use crate::decode::datum::ToastPointer;
 use crate::schema::{
     BOOLOID, BPCHAROID, BYTEAOID, CHAROID, CIDOID, CIDROID, DATEOID, FLOAT4OID, FLOAT8OID, INETOID,
     INT2OID, INT4OID, INT8OID, INTERVALOID, JSONBOID, JSONOID, MACADDR8OID, MACADDROID, MONEYOID,
@@ -199,16 +200,6 @@ pub enum DecodeError {
     BadHoff { offset: usize, t_hoff: u8 },
     #[error("xl_heap_update prefix/suffix bytes exceed block.data ({need} > {have})")]
     BadPrefixSuffix { need: usize, have: usize },
-}
-
-/// On-disk TOAST pointer (PG `varatt.h` `struct varatt_external`), 16 bytes,
-/// unaligned in source tuple.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ToastPointer {
-    pub va_rawsize: i32,
-    pub va_extinfo: u32,
-    pub va_valueid: u32,
-    pub va_toastrelid: u32,
 }
 
 /// One decoded WAL heap record. Column count + ordering matches
@@ -1112,7 +1103,11 @@ pub fn text_datum(type_oid: u32, text: &[u8]) -> TextDatum {
         FLOAT8OID => fixed(text.parse::<f64>().ok().map(f64::to_le_bytes)),
         OIDOID | XIDOID | CIDOID => fixed(text.parse::<u32>().ok().map(u32::to_le_bytes)),
         OID8OID | XID8OID => fixed(text.parse::<u64>().ok().map(u64::to_le_bytes)),
-        PG_LSNOID => fixed(crate::pg::parse_pg_lsn(text).ok().map(u64::to_le_bytes)),
+        PG_LSNOID => fixed(
+            walrus::pg::backup::parse_pg_lsn(text)
+                .ok()
+                .map(u64::to_le_bytes),
+        ),
         MACADDROID => fixed(crate::decode::codecs::parse_macaddr::<6>(text)),
         MACADDR8OID => fixed(crate::decode::codecs::parse_macaddr::<8>(text)),
         TIDOID => fixed(
@@ -2623,7 +2618,7 @@ mod tests {
 
     #[test]
     fn local_matrix_agrees_with_codecs() {
-        use crate::emit::ch_emitter::Codec;
+        use crate::emit::column::Codec;
         let fixed: [(u32, i16); 26] = [
             (BOOLOID, 1),
             (CHAROID, 1),

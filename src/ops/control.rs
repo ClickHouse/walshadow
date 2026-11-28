@@ -18,8 +18,7 @@ use toml::{Table, Value};
 
 use walrus::pg::backup::format_pg_lsn;
 
-use crate::config::SourceConn;
-use crate::emit::ch_emitter::{InstanceConfig, instance_database};
+use crate::emitter_config::{InstanceConfig, SourceConn, instance_database};
 use crate::introspect;
 use crate::metrics::MetricsRegistry;
 use crate::schema::RelName;
@@ -240,7 +239,7 @@ async fn apply(ctx: &SharedCtx, req: &Request<'_>) -> Result<String> {
     }
     let _guard = ctx.frag_lock.lock().await;
     let mut root = load(&ctx.fragment.path()).await?;
-    crate::ch_emitter::merge_tables(&mut root, req.config.clone());
+    crate::emitter_config::merge_tables(&mut root, req.config.clone());
     commit(ctx, &ctx.fragment, &root).await
 }
 
@@ -278,11 +277,11 @@ async fn commit(ctx: &SharedCtx, frag: &Fragment, root: &Table) -> Result<String
 /// Matches startup validation so accepted fragments remain restart-safe
 async fn validate(ctx: &SharedCtx, frag: &Path, root: &Table) -> Result<()> {
     let mut merged = ctx.cli_base.clone();
-    crate::ch_emitter::merge_tables(
+    crate::emitter_config::merge_tables(
         &mut merged,
-        crate::ch_emitter::load_merged_with(&ctx.ch_config, Some((frag, root))).await?,
+        crate::emitter_config::load_merged_with(&ctx.ch_config, Some((frag, root))).await?,
     );
-    crate::ch_emitter::EmitterConfig::from_table(&merged)
+    crate::emitter_config::EmitterConfig::from_table(&merged)
         .map(|_| ())
         .map_err(|e| anyhow::anyhow!("{e}"))
 }
@@ -315,7 +314,7 @@ pub fn fragment_path(ch_config: &Path, name: &str) -> Result<Fragment> {
 }
 
 async fn get_config(ctx: &SharedCtx) -> Result<Table> {
-    Ok(crate::ch_emitter::load_effective(&ctx.ch_config, ctx.cli_base.clone()).await?)
+    Ok(crate::emitter_config::load_effective(&ctx.ch_config, ctx.cli_base.clone()).await?)
 }
 
 async fn tables_list<'a>(ctx: &SharedCtx, req: &Request<'a>) -> Result<String> {
@@ -432,7 +431,7 @@ fn selected_tables(root: &Table, db: &str) -> Vec<(String, String)> {
 }
 
 fn replicated_entries<'t>(root: &'t Table, db: &str) -> Vec<(&'t str, &'t str, &'t Table)> {
-    let mut out = crate::ch_emitter::table_entries_for(root, db);
+    let mut out = crate::emitter_config::table_entries_for(root, db);
     out.retain(|(.., block)| block.get("replicate").and_then(Value::as_bool) != Some(false));
     out
 }
@@ -890,7 +889,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("ch-config.toml");
         let doc: Table = "[ch]\nhost = \"ch\"\n".parse().unwrap();
-        let base = crate::ch_emitter::EmitterConfig::from_table(&doc).unwrap();
+        let base = crate::emitter_config::EmitterConfig::from_table(&doc).unwrap();
         let (resolver, _rx) = crate::config::ConfigResolver::new(
             &base,
             crate::config::CliOverrides::default(),
@@ -1059,7 +1058,7 @@ mod tests {
         let live_doc =
             format!("{doc}[table.public.items]\nreplicate = true\ninitial_load = \"copy\"\n");
         let base =
-            crate::ch_emitter::EmitterConfig::from_table(&live_doc.parse().unwrap()).unwrap();
+            crate::emitter_config::EmitterConfig::from_table(&live_doc.parse().unwrap()).unwrap();
         let (resolver, _rx) = crate::config::ConfigResolver::new(
             &base,
             crate::config::CliOverrides::default(),
@@ -1184,7 +1183,7 @@ mod tests {
         let path = dir.path().join("ch-config.toml");
         tokio::fs::write(&path, DOC).await.unwrap();
         let doc: Table = DOC.parse().unwrap();
-        let base = crate::ch_emitter::EmitterConfig::for_database(&doc, "app").unwrap();
+        let base = crate::emitter_config::EmitterConfig::for_database(&doc, "app").unwrap();
         let (resolver, _rx) = crate::config::ConfigResolver::new(
             &base,
             crate::config::CliOverrides::default(),
@@ -1417,9 +1416,10 @@ mod tests {
             std::fs::read_to_string(confd.join("50-api.toml")).unwrap(),
             "[stream]\npaused = false\n"
         );
-        let merged = crate::ch_emitter::load_merged_with(&dir.path().join("ch-config.toml"), None)
-            .await
-            .unwrap();
+        let merged =
+            crate::emitter_config::load_merged_with(&dir.path().join("ch-config.toml"), None)
+                .await
+                .unwrap();
         assert_eq!(merged["stream"]["paused"].as_bool(), Some(true));
 
         assert!(
@@ -1427,9 +1427,10 @@ mod tests {
                 .await
                 .starts_with("OK")
         );
-        let merged = crate::ch_emitter::load_merged_with(&dir.path().join("ch-config.toml"), None)
-            .await
-            .unwrap();
+        let merged =
+            crate::emitter_config::load_merged_with(&dir.path().join("ch-config.toml"), None)
+                .await
+                .unwrap();
         assert_eq!(merged["stream"]["paused"].as_bool(), Some(false));
     }
 

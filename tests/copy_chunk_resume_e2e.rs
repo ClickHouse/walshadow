@@ -18,10 +18,10 @@ use std::sync::Arc;
 
 use tokio::sync::mpsc;
 use walrus::pg::walparser::RelFileNode;
-use walshadow::backup_page_walk::BackfillTuple;
-use walshadow::ch_emitter::EmitterStats;
+use walshadow::backfill::tuple::BackfillTuple;
 use walshadow::copy_backfill::{BlockRange, copy_rows_into};
 use walshadow::datum::Datum;
+use walshadow::emit::stats::EmitterStats;
 use walshadow::schema::{INT8OID, RelAttr, RelDescriptor, RelName, ReplIdent, TEXTOID};
 use walshadow::source_feed::open_sql_client;
 

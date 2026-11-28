@@ -15,8 +15,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use walshadow::mapping::{NamespaceMapping, SystemColumns};
+use walshadow::runtime_config::MatchKind;
 use walshadow::schema::RelName;
-use walshadow::table_rules::{MatchKind, TableRule};
+use walshadow::table_rules::TableRule;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn renamed_system_columns_and_operator_keys() {

@@ -10,8 +10,9 @@ mod fx;
 use std::time::Duration;
 
 use walshadow::mapping::{NamespaceMapping, Tee};
+use walshadow::runtime_config::MatchKind;
 use walshadow::schema::RelName;
-use walshadow::table_rules::{MatchKind, TableRule};
+use walshadow::table_rules::TableRule;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tee_receives_rows_and_ddl() {
@@ -99,7 +100,7 @@ async fn run(named: bool) {
             if named {
                 cfg.instances.insert(
                     "warehouse".into(),
-                    walshadow::ch_emitter::InstanceConfig {
+                    walshadow::emitter_config::InstanceConfig {
                         host: "127.0.0.1".into(),
                         port: remote_ports.ch_tcp,
                         database: "walshadow_test".into(),

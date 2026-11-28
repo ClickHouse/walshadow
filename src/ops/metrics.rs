@@ -13,16 +13,14 @@
 //! design (no `/quit`, no admin verbs); operator actions stay on the CLI.
 
 use std::collections::{BTreeMap, VecDeque};
-use std::fmt;
-use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+use std::{fmt, io};
 
 use prometheus_client::collector::Collector;
 use prometheus_client::encoding::{
-    DescriptorEncoder, EncodeCounterValue, EncodeGaugeValue, MetricEncoder, NoLabelSet, text,
+    DescriptorEncoder, EncodeCounterValue, EncodeGaugeValue, NoLabelSet, text,
 };
 use prometheus_client::metrics::MetricType;
 use prometheus_client::registry::Registry;
@@ -32,12 +30,18 @@ use tokio::net::TcpListener;
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 
+use crate::atomic_stats::HistogramSnapshot;
 use crate::catalog::pending::DegradeReason;
 use crate::decode::heap_decoder::HEAP_OP_LABELS;
 use crate::ops::bridge::{OP_COUNT, OP_LABELS};
+use crate::ops::metrics::encode::{
+    counter, counter_pairs, counter_series, declare, gauge, gauge_series, histogram,
+};
 use crate::pos::{Drain, EmitterAck, FilterDispatched, Floor, Pos, ShadowReplay, SourceReceived};
 use crate::source::shadow_stream::SocketEvent;
 use crate::source::transition::SWITCH_FAILURE_REASONS;
+
+pub mod encode;
 
 #[macro_export]
 macro_rules! label_class {
@@ -905,197 +909,6 @@ pub fn source_server_wal_end(wal_end: Option<u64>) -> Option<u64> {
 /// `mode=` label order of [`DbSeries::config_backfills_pending_by_mode`]
 const BACKFILL_MODES: [&str; 3] = ["copy", "base_backup", "object_store"];
 
-/// Family declaration off a snapshot field name: a `_by_<label>` tail names
-/// the label rather than the family, and OpenMetrics appends `_total` to
-/// counter samples itself, so a counter family declares the name without it
-pub(crate) fn declare<'s>(
-    enc: &'s mut DescriptorEncoder<'_>,
-    name: &'s str,
-    help: &str,
-    kind: MetricType,
-) -> Result<MetricEncoder<'s>, fmt::Error> {
-    let name = name.rsplit_once("_by_").map_or(name, |(head, _)| head);
-    let name = if matches!(kind, MetricType::Counter) {
-        name.strip_suffix("_total").unwrap_or(name)
-    } else {
-        name
-    };
-    enc.encode_descriptor(name, help, None, kind)
-}
-
-pub(crate) fn counter<V: EncodeCounterValue>(
-    enc: &mut DescriptorEncoder<'_>,
-    name: &str,
-    help: &str,
-    value: V,
-) -> fmt::Result {
-    declare(enc, name, help, MetricType::Counter)?
-        .encode_counter::<NoLabelSet, _, u64>(&value, None)
-}
-
-pub(crate) fn gauge<V: EncodeGaugeValue>(
-    enc: &mut DescriptorEncoder<'_>,
-    name: &str,
-    help: &str,
-    value: V,
-) -> fmt::Result {
-    declare(enc, name, help, MetricType::Gauge)?.encode_gauge(&value)
-}
-
-/// One `key=` labelled series per `(label, value)`, under one declaration
-pub(crate) fn counter_series<'a, V: EncodeCounterValue>(
-    enc: &mut DescriptorEncoder<'_>,
-    name: &str,
-    help: &str,
-    key: &str,
-    series: impl IntoIterator<Item = (&'a str, V)>,
-) -> fmt::Result {
-    let mut family = declare(enc, name, help, MetricType::Counter)?;
-    for (label, value) in series {
-        family
-            .encode_family(&[(key, label)])?
-            .encode_counter::<NoLabelSet, _, u64>(&value, None)?;
-    }
-    Ok(())
-}
-
-pub(crate) fn counter_pairs<'a, V: EncodeCounterValue, const N: usize>(
-    enc: &mut DescriptorEncoder<'_>,
-    name: &str,
-    help: &str,
-    keys: [&str; N],
-    series: impl IntoIterator<Item = ([&'a str; N], V)>,
-) -> fmt::Result {
-    let mut family = declare(enc, name, help, MetricType::Counter)?;
-    for (values, value) in series {
-        let labels: [(&str, &str); N] = std::array::from_fn(|i| (keys[i], values[i]));
-        family
-            .encode_family(&labels)?
-            .encode_counter::<NoLabelSet, _, u64>(&value, None)?;
-    }
-    Ok(())
-}
-
-pub(crate) fn gauge_series<'a, V: EncodeGaugeValue>(
-    enc: &mut DescriptorEncoder<'_>,
-    name: &str,
-    help: &str,
-    key: &str,
-    series: impl IntoIterator<Item = (&'a str, V)>,
-) -> fmt::Result {
-    let mut family = declare(enc, name, help, MetricType::Gauge)?;
-    for (label, value) in series {
-        family
-            .encode_family(&[(key, label)])?
-            .encode_gauge(&value)?;
-    }
-    Ok(())
-}
-
-/// Fixed-bucket histogram observed lock-free off the hot path: one relaxed
-/// `fetch_add` per bucket and sum. `N` finite upper bounds starting at
-/// `FIRST` and doubling, in the owner's integer unit (nanoseconds, values),
-/// plus an implicit `+Inf` bucket. A scrape racing an observation can see the
-/// count one ahead of the sum
-#[derive(Debug)]
-pub struct Histogram<const FIRST: u64, const N: usize> {
-    /// Per-bucket, not cumulative; the encoder accumulates
-    counts: [AtomicU64; N],
-    overflow: AtomicU64,
-    sum: AtomicU64,
-}
-
-impl<const FIRST: u64, const N: usize> Default for Histogram<FIRST, N> {
-    fn default() -> Self {
-        Self {
-            counts: std::array::from_fn(|_| AtomicU64::new(0)),
-            overflow: AtomicU64::new(0),
-            sum: AtomicU64::new(0),
-        }
-    }
-}
-
-impl<const FIRST: u64, const N: usize> Histogram<FIRST, N> {
-    fn bound(i: usize) -> u64 {
-        FIRST << i
-    }
-
-    /// A sample lands in the first bucket with `v <= bound`
-    pub fn observe(&self, v: u64) {
-        let i = (0..N).find(|i| v <= Self::bound(*i));
-        let bucket = i.map_or(&self.overflow, |i| &self.counts[i]);
-        bucket.fetch_add(1, Ordering::Relaxed);
-        self.sum.fetch_add(v, Ordering::Relaxed);
-    }
-
-    /// Bounds and sum divided by `scale` into the exported unit
-    pub fn snapshot(&self, scale: f64) -> HistogramSnapshot {
-        let mut buckets: Vec<(f64, u64)> = self
-            .counts
-            .iter()
-            .enumerate()
-            .map(|(i, c)| (Self::bound(i) as f64 / scale, c.load(Ordering::Relaxed)))
-            .collect();
-        buckets.push((f64::INFINITY, self.overflow.load(Ordering::Relaxed)));
-        HistogramSnapshot {
-            count: buckets.iter().map(|(_, c)| c).sum(),
-            sum: self.sum.load(Ordering::Relaxed) as f64 / scale,
-            buckets,
-        }
-    }
-}
-
-/// A [`Histogram`] read at scrape time: per-bucket counts under finite upper
-/// bounds, closed by an `f64::INFINITY` bucket that renders as `+Inf`. Empty until
-/// something publishes one
-#[derive(Debug, Default, Clone, PartialEq)]
-pub struct HistogramSnapshot {
-    pub buckets: Vec<(f64, u64)>,
-    pub sum: f64,
-    pub count: u64,
-}
-
-impl HistogramSnapshot {
-    /// Buckets as rendered: a snapshot nobody published still closes with
-    /// `+Inf`, which every histogram sample needs
-    fn encoded_buckets(&self) -> &[(f64, u64)] {
-        if self.buckets.is_empty() {
-            &[(f64::INFINITY, 0)]
-        } else {
-            &self.buckets
-        }
-    }
-
-    /// Fold another histogram over the same bounds in, as one database's
-    /// bootstrap and live bridges share a series
-    pub fn merge(&mut self, other: HistogramSnapshot) {
-        if self.buckets.is_empty() {
-            *self = other;
-            return;
-        }
-        debug_assert_eq!(self.buckets.len(), other.buckets.len());
-        for (mine, theirs) in self.buckets.iter_mut().zip(other.buckets) {
-            mine.1 += theirs.1;
-        }
-        self.sum += other.sum;
-        self.count += other.count;
-    }
-}
-
-pub(crate) fn histogram(
-    enc: &mut DescriptorEncoder<'_>,
-    name: &str,
-    help: &str,
-    value: &HistogramSnapshot,
-) -> fmt::Result {
-    declare(enc, name, help, MetricType::Histogram)?.encode_histogram::<NoLabelSet>(
-        value.sum,
-        value.count,
-        value.encoded_buckets(),
-        None,
-    )
-}
-
 /// `kind=`/`op=` grid over [`HEAP_OP_LABELS`]
 fn counter_kind_op(
     enc: &mut DescriptorEncoder<'_>,
@@ -1458,6 +1271,7 @@ async fn handle_client(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::atomic_stats::Histogram;
 
     /// Every family encodes through `?`, so a writer that gives out partway
     /// has to surface as an error rather than a panic or a truncated scrape

@@ -45,8 +45,9 @@ use walrus::pg::walparser::RelFileNode;
 use walshadow::backfill::backup_source::{
     BackupSink, BackupSource, EndInfo, PumpStats, PumpTarget, StartInfo, pump_tar_to_sink,
 };
+use walshadow::backfill::tuple::{BackfillTuple, TupleData};
 use walshadow::backfill_bootstrap::{BootstrapConfig, spawn_greenfield_bootstrap};
-use walshadow::backup_page_walk::{BackfillTuple, CatalogMap, PAGE_BYTES, TupleData};
+use walshadow::backup_page_walk::{CatalogMap, PAGE_BYTES};
 use walshadow::datum::build;
 use walshadow::decode::datum::DatumRef;
 use walshadow::mapping::{ColumnMapping, TableMapping, TableTarget};
@@ -421,7 +422,7 @@ async fn bench_drain(shape: Shape) -> Report {
 
     let (msg_tx, ack, tail) = walshadow::pipeline::tail::spawn_null(
         Arc::new(Monotone::<EmitterAck>::default()),
-        walshadow::pipeline::Fatal::new(),
+        walshadow::emit::pipeline::fatal::Fatal::new(),
     );
     let (tup_tx, tup_rx) = tokio::sync::mpsc::channel::<Vec<BackfillTuple>>(16);
 
@@ -461,7 +462,7 @@ async fn bench_drain(shape: Shape) -> Report {
         }
     });
 
-    let stats = Arc::new(walshadow::ch_emitter::EmitterStats::default());
+    let stats = Arc::new(walshadow::emit::stats::EmitterStats::default());
     let started = Instant::now();
     let outcome = bootstrap::drain(
         tup_rx,
@@ -508,9 +509,9 @@ async fn bench_load(shape: Shape) -> Report {
         parts,
         parallelism: shape.parallelism,
     });
-    let emitter = walshadow::ch_emitter::EmitterConfig::default();
-    let stats = Arc::new(walshadow::ch_emitter::EmitterStats::default());
-    let fatal = walshadow::pipeline::Fatal::new();
+    let emitter = walshadow::emitter_config::EmitterConfig::default();
+    let stats = Arc::new(walshadow::emit::stats::EmitterStats::default());
+    let fatal = walshadow::emit::pipeline::fatal::Fatal::new();
     let batcher = walshadow::pipeline::batcher::BatcherConfig {
         row_budget: emitter.row_budget,
         byte_budget: emitter.byte_budget,

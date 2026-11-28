@@ -23,16 +23,18 @@ use thiserror::Error;
 use tokio::sync::mpsc;
 
 use crate::backfill::backfill_staging::{StagingSession, sql_str};
-use crate::backfill::backup_page_walk::{BOOTSTRAP_TUPLE_CHANNEL_CAP, BackfillTuple, CatalogMap};
+use crate::backfill::backup_page_walk::{BOOTSTRAP_TUPLE_CHANNEL_CAP, CatalogMap};
 use crate::backfill::spool::{DEFERRED_SPOOL_MEM_MAX, DeferredSpool};
+use crate::backfill::tuple::BackfillTuple;
+use crate::backfill::tuple::metadata_base;
 use crate::ch::quote_ident;
 use crate::config::ResolvedConfig;
-use crate::decode::datum::Datum;
 use crate::decode::visibility::{PendingXids, PgXactView, XidStatus};
-use crate::emit::ch_emitter::EmitterStats;
+use crate::emit::pipeline::bootstrap;
+use crate::emit::pipeline::fatal::Fatal;
 use crate::emit::pipeline::tail::OwnedTail;
-use crate::emit::pipeline::{Fatal, bootstrap};
 use crate::emit::route::{FrozenRoutes, PartitionOf, RouteSnapshot, partition_mapping, routing};
+use crate::emit::stats::EmitterStats;
 use crate::mapping::{ColumnMapping, MappingSnapshot, TableMapping, TableTarget};
 use crate::ops::oracle::Oracle;
 use crate::pos::{Pos, Snapshot};
@@ -110,14 +112,6 @@ impl PendingRel {
     }
 }
 
-fn metadata_base(rel: &RelDescriptor) -> usize {
-    rel.attributes
-        .iter()
-        .map(|a| a.attnum.max(0) as usize)
-        .max()
-        .unwrap_or(0)
-}
-
 fn pending_table_mapping(
     mapping: &TableMapping,
     rel: &RelDescriptor,
@@ -157,24 +151,6 @@ fn pending_table_mapping(
             })
             .collect(),
     }
-}
-
-/// Values a pending row adds past `rel`'s attributes, see
-/// [`pending_table_mapping`]
-pub(crate) fn metadata_patch(
-    tuple: &BackfillTuple,
-    rel: &RelDescriptor,
-    out: &mut Vec<(usize, Datum)>,
-) {
-    let Some(pending) = tuple.pending else {
-        return;
-    };
-    let base = metadata_base(rel);
-    out.extend([
-        (base, Datum::fixed(&pending.insert.to_le_bytes())),
-        (base + 1, Datum::fixed(&pending.delete.to_le_bytes())),
-        (base + 2, Datum::fixed(&tuple.infomask.to_le_bytes())),
-    ]);
 }
 
 #[derive(Debug)]
@@ -941,8 +917,9 @@ fn xid_list(xids: &[u32]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backfill::backup_page_walk::{TupleData, make_rel_named};
-    use crate::decode::datum::build;
+    use crate::backfill::backup_page_walk::make_rel_named;
+    use crate::backfill::tuple::{TupleData, metadata_patch};
+    use crate::decode::datum::{Datum, build};
 
     fn manifest(rel: &str, xids: Vec<u32>) -> PendingManifest {
         PendingManifest {

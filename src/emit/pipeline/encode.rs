@@ -18,8 +18,9 @@ use std::sync::{Arc, Mutex, PoisonError};
 use tokio::task::JoinHandle;
 
 use crate::budget::MemoryPermit;
-use crate::emit::ch_emitter::{EmitterStats, EncodedChunk};
+use crate::emit::ch_emitter::EncodedChunk;
 use crate::emit::pipeline::plan_spool::{ChunkBuilder, EncoderCache, PendingRows, SeqRows};
+use crate::emit::stats::EmitterStats;
 
 /// Chunks one job encoded, each with the seqs of its rows
 pub struct EncodedRun {

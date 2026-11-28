@@ -164,7 +164,7 @@ async fn unservable_opt_ins_stay_out_of_scope() {
             }),
         },
         |cfg| {
-            cfg.toast.mode = walshadow::ch_emitter::ToastMode::Shadow;
+            cfg.toast.mode = walshadow::emitter_config::ToastMode::Shadow;
             cfg.replicate_all = false;
         },
         Some(oracle),

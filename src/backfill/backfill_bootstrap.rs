@@ -32,13 +32,13 @@ use tokio::task::JoinHandle;
 use tokio_postgres::Client;
 use walrus::pg::walparser::{Oid, RelFileNode};
 
-use crate::backfill::backup_page_walk::{
-    BOOTSTRAP_TUPLE_CHANNEL_CAP, BackfillTuple, CatalogMap, PageWalkSink, PageWalkStats,
-};
+use crate::backfill::backup_page_walk::{BOOTSTRAP_TUPLE_CHANNEL_CAP, CatalogMap, PageWalkSink};
 use crate::backfill::backup_sink::{
     CatalogFilenodes, DiskLanderSink, DiskLanderStats, MultiplexSink,
 };
 use crate::backfill::backup_source::{BackupSink, BackupSource, EndInfo, PumpStats, StartInfo};
+use crate::backfill::tuple::BackfillTuple;
+use crate::emit::stats::PageWalkStats;
 use crate::schema::{RelAttr, RelDescriptor, RelName, ReplIdent};
 
 /// Live counter handles, readable while the pump runs. The pump publishes

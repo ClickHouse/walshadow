@@ -580,11 +580,12 @@ mod tests {
     use super::*;
     use crate::column_rules::{ColumnRule, ColumnRulesBuilder};
     use crate::decode::heap_decoder::local_matrix_covers;
-    use crate::mapping::{TableMapping, TableTarget, derive_columns_for_mapping};
+    use crate::mapping::derive::derive_columns_for_mapping;
+    use crate::mapping::{TableMapping, TableTarget};
+    use crate::runtime_config::MatchKind;
     use crate::schema::{
         INT4OID, JSONBOID, JSONOID, RelAttr, RelDescriptor, RelName, ReplIdent, TEXTOID,
     };
-    use crate::table_rules::MatchKind;
 
     #[test]
     fn present_sockets_counts_each_worker_socket() {

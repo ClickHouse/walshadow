@@ -25,13 +25,13 @@ use crate::decode::wal_xact::{
     XLOG_XACT_ABORT, XLOG_XACT_ABORT_PREPARED, XLOG_XACT_ASSIGNMENT, XLOG_XACT_COMMIT,
     XLOG_XACT_COMMIT_PREPARED, XLOG_XACT_OPMASK, parse_xact_assignment, parse_xact_payload,
 };
-use crate::emit::ch_emitter::EmitterStats;
 use crate::emit::pipeline::ack::{AckHandle, BufferedRowSender, OpenSeq, Publish, SeqAlloc};
 use crate::emit::pipeline::batcher::{
     BatcherClosed, BatcherMsg, DECODE_CHUNK_BYTES, PlacedSegment,
 };
 use crate::emit::pipeline::plan_spool::{ChunkBuilder, ViewChange};
 use crate::emit::route::{RouteSnapshot, freeze_routes};
+use crate::emit::stats::EmitterStats;
 use crate::mapping::MappingSnapshot;
 use crate::pos::Pos;
 use crate::record::{Record, RecordSink, SegmentSink, SinkError, WAL_SEG_SIZE};
@@ -63,7 +63,7 @@ pub struct WalReplayInputs {
     pub mapping: MappingSnapshot,
     pub stats: Arc<EmitterStats>,
     pub budget: Option<MemoryBudget>,
-    pub row_policy: crate::emit::route::RowPolicy,
+    pub row_policy: crate::mapping::RowPolicy,
     pub config: Option<Arc<ResolvedConfig>>,
     pub batch_rows: usize,
     pub batch_bytes: usize,
@@ -445,7 +445,7 @@ impl WalReplaySink {
                 &page,
                 &rel,
                 block.header.location.block_no,
-                crate::backfill::backup_page_walk::page_pd_lsn(&page),
+                crate::decode::page::page_pd_lsn(&page),
             );
             // Insert reaches mirror at its own LSN on commit
             if block.header.block_id == 0
@@ -1116,7 +1116,8 @@ mod tests {
     #[tokio::test]
     async fn image_harvest_mirrors_every_chunk_on_the_page() {
         use crate::backfill::backup_page_walk::{synth_toast_chunk_page, toast_chunk_rel};
-        use crate::toast::{ChunkStore, FetchedValue, MemChunkStore};
+        use crate::toast::fetched::FetchedValue;
+        use crate::toast::{ChunkStore, MemChunkStore};
 
         let dir = tempfile::tempdir().unwrap();
         let rel = Arc::new(toast_chunk_rel());
@@ -1160,7 +1161,8 @@ mod tests {
     #[tokio::test]
     async fn image_harvest_batches_rows_across_records() {
         use crate::backfill::backup_page_walk::{synth_toast_chunk_page, toast_chunk_rel};
-        use crate::toast::{ChunkStore, FetchedValue, MemChunkStore};
+        use crate::toast::fetched::FetchedValue;
+        use crate::toast::{ChunkStore, MemChunkStore};
         use std::sync::atomic::Ordering;
 
         let dir = tempfile::tempdir().unwrap();
@@ -1227,7 +1229,8 @@ mod tests {
     #[tokio::test]
     async fn image_harvest_skips_the_slot_its_insert_fills() {
         use crate::backfill::backup_page_walk::{synth_toast_chunk_page, toast_chunk_rel};
-        use crate::toast::{ChunkStore, FetchedValue, MemChunkStore};
+        use crate::toast::fetched::FetchedValue;
+        use crate::toast::{ChunkStore, MemChunkStore};
 
         let dir = tempfile::tempdir().unwrap();
         let rel = Arc::new(toast_chunk_rel());
@@ -1260,7 +1263,8 @@ mod tests {
     /// insert see old value alone, not old chunk 0 spliced onto new chunk 1
     #[tokio::test]
     async fn committed_birth_hides_walked_copy_of_its_slot_below_insert() {
-        use crate::toast::{ChunkStore, FetchedValue, MemChunkStore};
+        use crate::toast::fetched::FetchedValue;
+        use crate::toast::{ChunkStore, MemChunkStore};
 
         let dir = tempfile::tempdir().unwrap();
         let rel = Arc::new(crate::backfill::backup_page_walk::toast_chunk_rel());
@@ -1373,7 +1377,7 @@ mod tests {
         let (msg_tx, _msg_rx) = mpsc::channel(8);
         let (ack, _collector) = ack::spawn(
             Arc::new(Monotone::<EmitterAck>::default()),
-            crate::emit::pipeline::Fatal::new(),
+            crate::emit::pipeline::fatal::Fatal::new(),
         );
         WalReplaySink::new(WalReplayInputs {
             log,
@@ -1445,7 +1449,7 @@ mod tests {
         let (msg_tx, msg_rx) = mpsc::channel(8);
         let (ack, _collector) = ack::spawn(
             Arc::new(Monotone::<EmitterAck>::default()),
-            crate::emit::pipeline::Fatal::new(),
+            crate::emit::pipeline::fatal::Fatal::new(),
         );
         let mut inputs = WalReplayInputs {
             log: Arc::new(log),

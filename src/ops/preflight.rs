@@ -26,7 +26,7 @@ use std::fmt;
 use thiserror::Error;
 use tokio_postgres::Client;
 
-use crate::emit::ch_emitter::EmitterConfig;
+use crate::emitter_config::EmitterConfig;
 use crate::schema::RelName;
 
 /// Catalog accessors assume PG-16 column layouts; PG <16 unsupported.

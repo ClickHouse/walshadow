@@ -28,9 +28,8 @@ mod fx;
 
 use std::time::Duration;
 
-use walshadow::ch_emitter::EmitterConfig;
-use walshadow::mapping::TableTarget;
-use walshadow::mapping::{ColumnMapping, DropTableStrategy, NamespaceMapping};
+use walshadow::emitter_config::EmitterConfig;
+use walshadow::mapping::{ColumnMapping, DropTableStrategy, NamespaceMapping, TableTarget};
 use walshadow::schema::RelName;
 
 // Each test shifts these by +0 / +10 / +20. The CH server's

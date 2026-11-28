@@ -15,14 +15,15 @@
 use clickhouse_c::QueryOpts;
 use tokio::task::JoinHandle;
 
-use crate::ch::{ChConn, EmitterError, EndOfStream, INSERT_GATE, drain_to_end_of_stream};
+use crate::ch::conn::ChConn;
+use crate::ch::{EmitterError, EndOfStream, INSERT_GATE, drain_to_end_of_stream};
 use crate::config::DestEmitter;
-use crate::emit::ch_emitter::EmitterStats;
-use crate::emit::pipeline::Fatal;
 use crate::emit::pipeline::ack::AckHandle;
 use crate::emit::pipeline::batcher::BatchMeta;
+use crate::emit::pipeline::fatal::Fatal;
 use crate::emit::pipeline::resolver::ResolvedBatch;
 use crate::emit::pipeline::sealed::SealedBlock;
+use crate::emit::stats::EmitterStats;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 

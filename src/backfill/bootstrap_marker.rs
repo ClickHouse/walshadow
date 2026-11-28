@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-use crate::ch_emitter::BootstrapMode;
+use crate::emitter_config::BootstrapMode;
 use crate::visibility_pending::PendingRecorded;
 
 pub const MARKER_FILENAME: &str = "walshadow_bootstrap.incomplete";

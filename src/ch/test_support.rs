@@ -5,7 +5,7 @@ use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 
 use crate::ch::CompressionChoice;
-use crate::emit::ch_emitter::{EmitterConfig, InstanceConfig, RetryConfig};
+use crate::emitter_config::{EmitterConfig, InstanceConfig, RetryConfig};
 
 /// Server expecting `sql` then `blocks` one-row Data blocks per attempt.
 /// First attempt drops connection without reply, after `cut` blocks when set.

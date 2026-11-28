@@ -1,10 +1,19 @@
 //! Tuple attributes as PostgreSQL stores or sends them. Encoders read source
 //! bytes in place; owned copies hold only bytes that outlive their record
 
-use crate::decode::heap_decoder::ToastPointer;
 use smallvec::SmallVec;
 
 /// One attribute as stored in a tuple image, storage framing stripped
+/// On-disk TOAST pointer (PG `varatt.h` `struct varatt_external`), 16 bytes,
+/// unaligned in source tuple.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ToastPointer {
+    pub va_rawsize: i32,
+    pub va_extinfo: u32,
+    pub va_valueid: u32,
+    pub va_toastrelid: u32,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum DatumRef<'a> {
     /// Not in WAL image: prefix/suffix elision or truncated tail

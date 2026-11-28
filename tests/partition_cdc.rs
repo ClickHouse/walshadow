@@ -7,12 +7,13 @@ mod fx;
 
 use std::time::Duration;
 
-use walshadow::ch_emitter::EmitterConfig;
+use walshadow::emitter_config::EmitterConfig;
 use walshadow::mapping::{
     ColumnMapping, DropTableStrategy, NamespaceMapping, SystemColumnNames, TableTarget, Tee,
 };
+use walshadow::runtime_config::MatchKind;
 use walshadow::schema::RelName;
-use walshadow::table_rules::{MatchKind, PartitionRoute, TableRule};
+use walshadow::table_rules::{PartitionRoute, TableRule};
 
 struct Run {
     source: fx::ClusterGuard,

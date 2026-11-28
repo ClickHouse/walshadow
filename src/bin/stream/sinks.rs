@@ -85,7 +85,7 @@ pub(crate) struct DaemonSinks {
     pub(crate) decoder_stats: Arc<walshadow::decoder_sink::DecoderStats>,
     /// Shared with parallel pipeline's inserter pool (bumps counters
     /// post-`EndOfStream`). `None` when no CH pipeline is wired.
-    pub(crate) emitter_stats: Option<Arc<walshadow::ch_emitter::EmitterStats>>,
+    pub(crate) emitter_stats: Option<Arc<walshadow::emit::stats::EmitterStats>>,
     /// Per-txn span map; `Some` only with OTLP on. Registering at WAL read
     /// (here) makes the `txn` span cover the pump→worker channel wait.
     pub(crate) span_registry: Option<walshadow::trace::TxnSpanRegistry>,

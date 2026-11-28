@@ -948,7 +948,7 @@ mod tests {
             type_storage: b'm',
             missing_default: None,
         };
-        use crate::emit::ch_emitter::Codec;
+        use crate::emit::column::Codec;
         for (type_name, wkt) in [("geometry", true), ("geography", true), ("bytea", false)] {
             let codec = Codec::choose(&attr(1, type_name, false));
             assert_eq!(matches!(codec, Codec::Wkt), wkt, "{type_name}");

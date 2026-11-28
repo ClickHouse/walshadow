@@ -14,6 +14,7 @@ pub mod ack;
 pub mod batcher;
 pub mod bootstrap;
 pub mod encode;
+pub mod fatal;
 pub mod inserter;
 pub mod plan_spool;
 pub mod planner;
@@ -26,11 +27,13 @@ pub mod tail;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::{Mutex, watch};
+use tokio::sync::Mutex;
 
 use crate::ch::EmitterError;
 use crate::emit::ch_ddl::DdlApplicator;
-use crate::emit::ch_emitter::{EmitterConfig, EmitterStats};
+use crate::emit::pipeline::fatal::Fatal;
+use crate::emit::stats::EmitterStats;
+use crate::emitter_config::EmitterConfig;
 use crate::ops::oracle::Oracle;
 use crate::ops::trace::TxnSpanRegistry;
 use crate::pos::{EmitterAck, Floor, Monotone};
@@ -38,53 +41,6 @@ use crate::source_db::SourceDbs;
 use crate::xact::xact_buffer::{SubxactTracker, XactBuffer};
 use foldhash::HashMap;
 use tokio_postgres::types::Oid;
-
-/// One-shot fatal-error signal shared across pipeline stages. Pump polls
-/// [`Fatal::message`] to exit with the root cause; the DDL barrier `select`s
-/// on [`Fatal::wait`] so a CH outage mid-barrier surfaces instead of hanging.
-#[derive(Clone)]
-pub struct Fatal(Arc<watch::Sender<Option<String>>>);
-
-impl Default for Fatal {
-    fn default() -> Self {
-        Self(Arc::new(watch::channel(None).0))
-    }
-}
-
-impl Fatal {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Record the first message (root cause) and wake every waiter; later
-    /// calls keep the first.
-    pub fn set(&self, msg: String) {
-        self.0.send_if_modified(|slot| {
-            if slot.is_some() {
-                return false;
-            }
-            tracing::error!(target: "walshadow::pipeline", error = %msg, "pipeline fatal");
-            *slot = Some(msg);
-            true
-        });
-    }
-
-    pub fn is_set(&self) -> bool {
-        self.0.borrow().is_some()
-    }
-
-    pub fn message(&self) -> Option<String> {
-        self.0.borrow().clone()
-    }
-
-    /// Root cause, once set (now or later). Holding the sender keeps the
-    /// channel open, so this never resolves unset.
-    pub async fn wait(&self) -> String {
-        let mut rx = self.0.subscribe();
-        let set = rx.wait_for(Option::is_some).await;
-        set.ok().and_then(|m| m.clone()).unwrap_or_default()
-    }
-}
 
 /// Partial-batch flush deadline when operator left `flush_timeout` at 0;
 /// without it a cold table's rows pin the watermark indefinitely.
@@ -367,19 +323,11 @@ pub fn leaf_reserve_for(
 mod tests {
     use super::*;
 
-    #[test]
-    fn fatal_keeps_first_message() {
-        let fatal = Fatal::new();
-        fatal.set("root".into());
-        fatal.set("echo".into());
-        assert_eq!(fatal.message().as_deref(), Some("root"));
-    }
-
     /// Default byte values with a wide decode pool must fail startup, not
     /// zero out the admission compartment
     #[test]
     fn leaf_reserve_rejects_zero_admission_headroom() {
-        let defaults = crate::emit::ch_emitter::EmitterConfig::default();
+        let defaults = crate::emitter_config::EmitterConfig::default();
         let (pool, value) = (defaults.resident_payload_max, defaults.value_reserve);
         assert_eq!(leaf_reserve_for(pool, value, 1), Ok(value));
         assert_eq!(leaf_reserve_for(pool, value, 4), Ok(4 * value));
@@ -392,7 +340,7 @@ mod tests {
     /// Do not size pool from maximum value size
     #[test]
     fn hard_value_cap_does_not_size_the_pool() {
-        let cfg = crate::emit::ch_emitter::EmitterConfig {
+        let cfg = crate::emitter_config::EmitterConfig {
             resident_payload_max: 512 << 20,
             inline_value_max: 1 << 30,
             ..Default::default()
@@ -404,7 +352,7 @@ mod tests {
     /// else a mid-drain admit could wait on units the drain itself holds
     #[test]
     fn build_budget_rejects_admission_below_drain_floor() {
-        let mut cfg = crate::emit::ch_emitter::EmitterConfig::default();
+        let mut cfg = crate::emitter_config::EmitterConfig::default();
         assert!(build_budget(&cfg, 4).is_ok());
         cfg.resident_payload_max = 64 << 20;
         cfg.value_reserve = 1 << 20;

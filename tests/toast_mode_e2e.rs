@@ -21,7 +21,8 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use walshadow::ch_emitter::{EmitterStats, ToastMode};
+use walshadow::emit::stats::EmitterStats;
+use walshadow::emitter_config::ToastMode;
 use walshadow::mapping::{ColumnMapping, TableTarget};
 use walshadow::schema::RelName;
 

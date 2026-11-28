@@ -24,10 +24,12 @@ mod fx;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use walshadow::ch_emitter::{EmitterConfig, EmitterStats, InstanceConfig};
+use walshadow::emit::stats::EmitterStats;
+use walshadow::emitter_config::{EmitterConfig, InstanceConfig};
 use walshadow::spill::ToastDelete;
+use walshadow::toast::fetched::FetchedValue;
 use walshadow::toast::{
-    ChunkStore, ChunkStoreError, ClickHouseChunkStore, FetchedValue, ToastResolver, ToastRow,
+    ChunkStore, ChunkStoreError, ClickHouseChunkStore, ToastResolver, ToastRow,
 };
 
 fn assembled(body: &[u8]) -> FetchedValue {

@@ -6,9 +6,8 @@ use std::sync::Arc;
 use walshadow::backfill_staging::{StagingSession, prepare};
 use walshadow::backfill_types::BackupRequest;
 use walshadow::backup_checkpoint::BackupCheckpoint;
-use walshadow::ch_emitter::{EmitterConfig, InstanceConfig};
-use walshadow::mapping::{TableMapping, TableTarget, mapping_handle};
-use walshadow::runtime_config::InitialLoadMode;
+use walshadow::emitter_config::{EmitterConfig, InstanceConfig};
+use walshadow::mapping::{InitialLoadMode, TableMapping, TableTarget, mapping_handle};
 use walshadow::schema::{RelDescriptor, RelName, ReplIdent};
 
 #[tokio::test]

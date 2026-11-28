@@ -37,7 +37,7 @@ async fn build_drill_with(
     schema_sql: &str,
     namespace: &str,
     app_name: &str,
-    tune: impl FnOnce(&mut walshadow::ch_emitter::EmitterConfig),
+    tune: impl FnOnce(&mut walshadow::emitter_config::EmitterConfig),
 ) -> Drill {
     let tmp = tempfile::tempdir().unwrap();
     let (

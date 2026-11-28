@@ -27,7 +27,7 @@ use tokio_postgres::{Client, NoTls};
 use walshadow::bridge::{Bridge, BridgeError};
 use walshadow::pg::{Xid8, socket_conninfo};
 use walshadow::shadow::{BridgeConf, Shadow, ShadowConfig};
-use walshadow::toast::FetchedValue;
+use walshadow::toast::fetched::FetchedValue;
 
 /// Autovacuum off throughout, so every reclamation in here is one the test
 /// asked for and a Missing names the operation that caused it

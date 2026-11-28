@@ -15,14 +15,16 @@ use walshadow::bootstrap_window::{
     WindowLegConfig, replay_segments, segments_in_dir, stream_window,
 };
 use walshadow::ch::CompressionChoice;
-use walshadow::ch_emitter::{EmitterConfig, EmitterStats, InstanceConfig};
 use walshadow::config::ResolvedConfig;
+use walshadow::emit::pipeline::fatal::Fatal;
+use walshadow::emit::stats::EmitterStats;
+use walshadow::emitter_config::{EmitterConfig, InstanceConfig};
 use walshadow::mapping::{ColumnMapping, TableMapping, TableTarget};
-use walshadow::pipeline::Fatal;
 use walshadow::record::WAL_SEG_SIZE;
 use walshadow::schema::RelName;
 use walshadow::source_feed::{SourceFeed, open_sql_client};
-use walshadow::toast::{ChunkStore, ChunkStoreError, FetchedValue, MemChunkStore, ToastResolver};
+use walshadow::toast::fetched::FetchedValue;
+use walshadow::toast::{ChunkStore, ChunkStoreError, MemChunkStore, ToastResolver};
 use walshadow::visibility::PgXactPatch;
 use walshadow::wal_stream::WalStream;
 

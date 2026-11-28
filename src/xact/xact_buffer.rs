@@ -50,12 +50,12 @@ use walrus::pg::walparser::{RelFileNode, RmId};
 use crate::catalog::desc_log::{
     DescriptorLog, DescriptorLogs, LogEntry, LogValue, LookupMiss, RfnHistory,
 };
-use crate::decode::datum::{Datum, DatumRef};
+use crate::decode::datum::{Datum, DatumRef, ToastPointer};
 use crate::decode::decoder_sink::{DecoderSinkError, DecoderStats, SkipReason};
 #[cfg(any(test, feature = "test-support"))]
 use crate::decode::heap_decoder::{DecodedHeap, DescribedHeap};
 use crate::decode::heap_decoder::{
-    HeapImages, HeapOp, ToastPointer, TupleView, decode_heap_record, record_shape, view_heap_record,
+    HeapImages, HeapOp, TupleView, decode_heap_record, record_shape, view_heap_record,
 };
 #[cfg(test)]
 use crate::decode::wal_xact::{
@@ -63,15 +63,16 @@ use crate::decode::wal_xact::{
     XACT_XINFO_HAS_TWOPHASE, XLOG_XACT_HAS_INFO, parse_xact_payload,
 };
 use crate::decode::wal_xact::{XLOG_XACT_ASSIGNMENT, XLOG_XACT_OPMASK, parse_xact_assignment};
-use crate::emit::ch_emitter::EmitterStats;
+use crate::emit::stats::EmitterStats;
 use crate::ops::trace::{InflightSnapshotEntry, TxnSpanRegistry, new_txn_span};
 use crate::pos::{Commit, Drain, EmitterAck, Pos, ResumeSafe, XactFirst};
 use crate::record::{Record, RecordSink, Route, SinkError};
 use crate::runtime_config::{ConfigEvent, ConfigTableKind};
 use crate::schema::{RelDescriptor, SchemaEvent};
+use crate::toast::fetched::FetchedValue;
 use crate::toast::{
-    Body, ChunkRefMap, FetchedValue, ToastResolver, ToastRowRef, ToastValueError, ValueRef,
-    check_value_caps, detoasted_sized, finish_value, pointer_extsize,
+    Body, ChunkRefMap, ToastResolver, ToastRowRef, ToastValueError, ValueRef, check_value_caps,
+    detoasted_sized, finish_value, pointer_extsize,
 };
 use crate::xact::spill::{
     BodySpoolFile, BodySpoolWriter, DescribedInput, HeapInput, RawRecord, SpillEntry, SpillError,
@@ -242,8 +243,8 @@ impl XactBufferConfig {
             xact_buffer_max: DEFAULT_XACT_BUFFER_MAX,
             scratch_dir,
             toast_body_mem_max: TOAST_BODY_SPOOL_MEM_MAX,
-            drain_batch_rows: crate::emit::ch_emitter::DEFAULT_DRAIN_BATCH_ROWS,
-            drain_batch_bytes: crate::emit::ch_emitter::DEFAULT_DRAIN_BATCH_BYTES,
+            drain_batch_rows: crate::emitter_config::DEFAULT_DRAIN_BATCH_ROWS,
+            drain_batch_bytes: crate::emitter_config::DEFAULT_DRAIN_BATCH_BYTES,
         }
     }
 }
@@ -3545,7 +3546,7 @@ fn decode_image_insert(
     let block = rec.blocks.first().expect("image checked by caller");
     let page = crate::decode::fpi::restore_block_image(block, raw.page_magic)
         .map_err(|e| XactBufferError::Detoast(format!("stashed FPI restore: {e}")))?;
-    let Some(tuple) = crate::backfill::backup_page_walk::page_tuple_bytes(&page, offnum) else {
+    let Some(tuple) = crate::decode::page::page_tuple_bytes(&page, offnum) else {
         return Err(XactBufferError::Detoast(format!(
             "stashed image insert: no LP_NORMAL tuple at ({blkno},{offnum})"
         )));
@@ -3748,7 +3749,7 @@ mod tests {
     use super::*;
     use crate::decode::datum::{Datum, build};
     use crate::decode::heap_decoder::{DecodedTuple, HeapOp, VARLENA_EXTSIZE_BITS};
-    use crate::emit::ch_emitter::InlineValueOverflow;
+    use crate::emitter_config::InlineValueOverflow;
     use tempfile::tempdir;
     use walrus::pg::walparser::RelFileNode;
 
@@ -4401,7 +4402,7 @@ mod tests {
             }])
             .await
             .unwrap();
-        let stats = Arc::new(crate::emit::ch_emitter::EmitterStats::default());
+        let stats = Arc::new(crate::emit::stats::EmitterStats::default());
         let budget = crate::budget::MemoryBudget::with_leaf_reserve(2048, 1024);
         let resolver = ToastResolver::with_store(store, stats.clone())
             .with_budget(budget.clone())
@@ -4457,7 +4458,7 @@ mod tests {
             .put(&[row(55, b"abcd"), row(56, b"efgh")])
             .await
             .unwrap();
-        let stats = Arc::new(crate::emit::ch_emitter::EmitterStats::default());
+        let stats = Arc::new(crate::emit::stats::EmitterStats::default());
         let budget = crate::budget::MemoryBudget::with_leaf_reserve(2048, 1024);
         let resolver = ToastResolver::with_store(store, stats.clone())
             .with_budget(budget.clone())
@@ -4494,7 +4495,7 @@ mod tests {
     async fn read_ahead_declines_and_miss_leaves_pointer() {
         use std::sync::atomic::Ordering::Relaxed;
         let p = toast_ptr(55);
-        let stats = Arc::new(crate::emit::ch_emitter::EmitterStats::default());
+        let stats = Arc::new(crate::emit::stats::EmitterStats::default());
         let budget = crate::budget::MemoryBudget::with_leaf_reserve(1 << 20, 64 << 10);
         let store = Arc::new(crate::toast::MemChunkStore::new());
         let other = crate::toast::ToastRow {
@@ -4602,7 +4603,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn oversize_pointer_fills_null_under_null_overflow() {
         use std::sync::atomic::Ordering::Relaxed;
-        let stats = Arc::new(crate::emit::ch_emitter::EmitterStats::default());
+        let stats = Arc::new(crate::emit::stats::EmitterStats::default());
         let key = (16500u32, 55u32);
         let whole = mem_refs(key, &[(0, b"ab"), (1, b"cd")]);
         let maps = [&whole];
@@ -4733,7 +4734,7 @@ mod tests {
             (MissPolicy::BootstrapOwned, [1, 0, 0, 1, 2]),
         ];
         for (policy, want) in cases {
-            let stats = Arc::new(crate::emit::ch_emitter::EmitterStats::default());
+            let stats = Arc::new(crate::emit::stats::EmitterStats::default());
             let resolver = ToastResolver::disabled().with_stats(stats.clone());
             let mut errs = Vec::new();
             for miss in misses {
@@ -4766,7 +4767,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn value_observed_mid_write_resolves_from_store() {
-        let stats = Arc::new(crate::emit::ch_emitter::EmitterStats::default());
+        let stats = Arc::new(crate::emit::stats::EmitterStats::default());
         let resolver =
             ToastResolver::with_store(Arc::new(crate::toast::MemChunkStore::new()), stats.clone());
         let key = (16500u32, 55u32);
@@ -4813,7 +4814,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn resolve_tuple_splits_in_xact_gap_from_store_miss() {
         let tmp = tempdir().unwrap();
-        let stats = Arc::new(crate::emit::ch_emitter::EmitterStats::default());
+        let stats = Arc::new(crate::emit::stats::EmitterStats::default());
         let store_resolver =
             ToastResolver::with_store(Arc::new(crate::toast::MemChunkStore::new()), stats.clone());
 
@@ -4936,7 +4937,7 @@ mod tests {
 
         // Disabled mode: any miss NULL-fills as before, counted default,
         // in-xact gap included
-        let disabled_stats = Arc::new(crate::emit::ch_emitter::EmitterStats::default());
+        let disabled_stats = Arc::new(crate::emit::stats::EmitterStats::default());
         let disabled = ToastResolver::disabled().with_stats(disabled_stats.clone());
         let mut t = toast_ptr_tuple(55);
         seeded(&disabled, None, &[], HashMap::new())
@@ -4957,7 +4958,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "prefetched with the sites")]
     fn resolve_store_without_prefetch_panics() {
-        let stats = Arc::new(crate::emit::ch_emitter::EmitterStats::default());
+        let stats = Arc::new(crate::emit::stats::EmitterStats::default());
         let resolver =
             ToastResolver::with_store(Arc::new(crate::toast::MemChunkStore::new()), stats);
         let mut r = ValueResolution {
@@ -4996,7 +4997,7 @@ mod tests {
             }])
             .await
             .unwrap();
-        let stats = Arc::new(crate::emit::ch_emitter::EmitterStats::default());
+        let stats = Arc::new(crate::emit::stats::EmitterStats::default());
         let resolver = ToastResolver::with_store(store, stats.clone());
         let p = ToastPointer {
             va_rawsize: 8,
@@ -5058,7 +5059,7 @@ mod tests {
             lsn: 1,
         };
         store.put(&[row(55, 1), row(56, 2)]).await.unwrap();
-        let stats = Arc::new(crate::emit::ch_emitter::EmitterStats::default());
+        let stats = Arc::new(crate::emit::stats::EmitterStats::default());
         let resolver = ToastResolver::with_store(store, stats.clone());
         let ptr = |va_valueid| ToastPointer {
             va_rawsize: 8,

@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 use tokio_postgres::types::PgLsn;
 use walrus::pg::replication::conn::PgConfig;
 use walshadow::archive::{Archive, ArchiveFeed};
-use walshadow::config::SourceConn;
+use walshadow::emitter_config::SourceConn;
 use walshadow::manifest;
 use walshadow::metrics::{ErrorKind, SourceMode};
 use walshadow::pos::{Floor, Monotone, Pos};
@@ -276,7 +276,7 @@ pub(crate) async fn connect_source_waiting(
         let Some(path) = args.ch_config.as_deref() else {
             continue;
         };
-        match walshadow::ch_emitter::load_effective(path, cli_base(args)).await {
+        match walshadow::emitter_config::load_effective(path, cli_base(args)).await {
             Ok(table) => match SourceConn::from_table(&table).map(|mut next| {
                 // Preserve CLI slot override across reloads
                 if args.slot.is_some() {

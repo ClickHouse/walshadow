@@ -11,26 +11,27 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::mpsc;
 use walrus::pg::walparser::RelFileNode;
 
-use crate::backfill::backup_page_walk::{BackfillTuple, CatalogMap, TupleData, toast_row};
-use crate::backfill::copy_backfill::copy_slot;
+use crate::backfill::backup_page_walk::{CatalogMap, toast_row};
 use crate::backfill::spool::{DeferredReader, DeferredSpool, Replayable, SpoolMark};
-use crate::backfill::visibility_pending::metadata_patch;
+use crate::backfill::tuple::{BackfillTuple, TupleData};
 use crate::backfill::wal_replay::HeapTid;
 use crate::backfill::walk_barrier::{WALK_CHECKPOINT_PERIOD, WalkBarrier};
 use crate::budget::{MemoryBudget, MemoryPermit};
-use crate::ch::EmitterError;
 use crate::config::ResolvedConfig;
-use crate::decode::datum::{Datum, DatumRef};
-use crate::decode::heap_decoder::{ToastPointer, TupleView, view_block_data_into};
-use crate::emit::ch_emitter::{Append, EmitterStats, OP_INSERT, RowStamp, TableEncoder};
+use crate::decode::datum::{Datum, DatumRef, ToastPointer};
+use crate::decode::heap_decoder::TupleView;
 use crate::emit::pipeline::ack::{AckHandle, OpenSeq, Publish, SeqAlloc};
-use crate::emit::pipeline::batcher::{BatcherClosed, BatcherMsg, DECODE_CHUNK_BYTES, RowTable};
-use crate::emit::route::{FrozenRoutes, RouteSnapshot, RowPolicy, freeze_routes};
-use crate::mapping::{MappingSnapshot, TableMapping};
+use crate::emit::pipeline::batcher::{
+    BatcherClosed, BatcherMsg, DECODE_CHUNK_BYTES, RowTable, Slab, decode_err,
+};
+use crate::emit::route::{FrozenRoutes, RouteSnapshot, freeze_routes};
+use crate::emit::stats::EmitterStats;
+use crate::mapping::{MappingSnapshot, RowPolicy, TableMapping};
 use crate::schema::{RelDescriptor, RelName};
 use crate::ticker::Ticker;
+use crate::toast::fetched::FetchedValue;
 use crate::toast::{
-    ChunkStoreError, FetchedValue, ToastResolver, check_value_caps, detoasted_sized, finish_value,
+    ChunkStoreError, ToastResolver, check_value_caps, detoasted_sized, finish_value,
     pointer_extsize,
 };
 use crate::xact::xact_buffer::{MissPolicy, StoreMiss, fill_store_miss};
@@ -507,172 +508,8 @@ fn closed(e: BatcherClosed) -> String {
     format!("bootstrap: {e}")
 }
 
-fn decode_err(rel: &RelDescriptor, e: impl std::fmt::Display) -> String {
-    format!("bootstrap: {} tuple decode: {e}", rel.rel_name)
-}
-
-/// Rows per load slab; the byte limit bounds wide rows
-const LOAD_SEGMENT_ROWS: usize = 65536;
-
 /// Slab bytes a lane queues ahead of its batcher: one encoding, one waiting
 const LOAD_QUEUE_BYTES: usize = 2 * DECODE_CHUNK_BYTES;
-
-/// Routed load rows, encoded by the batcher straight into its open blocks
-#[derive(Default)]
-pub struct Slab {
-    pub(crate) tables: Vec<RowTable>,
-    pub(crate) rows: Vec<LoadRow>,
-    bytes: usize,
-    /// Leaf permit riding these rows to insert ack
-    pub(crate) permit: Option<Arc<MemoryPermit>>,
-    /// Lane queue share, released once the batcher encoded the slab
-    queued: Option<MemoryPermit>,
-}
-
-pub(crate) struct LoadRow {
-    pub(crate) seq: u64,
-    /// Index into containing slab's `tables`
-    pub(crate) table: u32,
-    tuple: BackfillTuple,
-    /// Resolved external values
-    patch: Vec<(usize, Datum)>,
-}
-
-impl Slab {
-    fn push(
-        &mut self,
-        seq: u64,
-        rel: &Arc<RelDescriptor>,
-        route: &Arc<RouteSnapshot>,
-        tuple: BackfillTuple,
-        patch: Vec<(usize, Datum)>,
-    ) {
-        let table = match self
-            .tables
-            .iter()
-            .rposition(|t| Arc::ptr_eq(&t.rel, rel) && Arc::ptr_eq(&t.route, route))
-        {
-            Some(i) => i,
-            None => {
-                self.tables.push(RowTable {
-                    rel: rel.clone(),
-                    route: route.clone(),
-                });
-                self.tables.len() - 1
-            }
-        };
-        self.bytes += crate::backfill::spool::approx_bytes(&tuple)
-            + patch.iter().map(|(_, v)| v.approx_bytes()).sum::<usize>();
-        self.rows.push(LoadRow {
-            seq,
-            table: table as u32,
-            tuple,
-            patch,
-        });
-    }
-
-    fn due(&self) -> bool {
-        self.rows.len() >= LOAD_SEGMENT_ROWS || self.bytes >= DECODE_CHUNK_BYTES
-    }
-
-    /// `(seq, rows)` per seq run
-    pub(crate) fn seq_rows(&self) -> Vec<(u64, u64)> {
-        let mut out: Vec<(u64, u64)> = Vec::new();
-        for row in &self.rows {
-            match out.last_mut() {
-                Some((s, n)) if *s == row.seq => *n += 1,
-                _ => out.push((row.seq, 1)),
-            }
-        }
-        out
-    }
-
-    /// Heap rows of `cells` under one seq
-    #[cfg(test)]
-    pub(crate) fn of_cells(seq: u64, t: &RowTable, rows: &[Vec<Option<Datum>>]) -> Self {
-        let mut slab = Self::default();
-        for cells in rows {
-            let tuple = BackfillTuple {
-                rfn: t.rel.rfn,
-                xid: 0,
-                xmax: 0,
-                infomask: 0,
-                source_lsn: 0,
-                page_lsn: 0,
-                blkno: 0,
-                offnum: 1,
-                data: TupleData::from_cells(cells),
-                pending: None,
-            };
-            slab.push(seq, &t.rel, &t.route, tuple, Vec::new());
-        }
-        slab
-    }
-
-    /// Each row encoded into its own chunk, under its seq
-    #[cfg(test)]
-    pub(crate) fn encoded(mut self) -> Vec<(u64, crate::emit::ch_emitter::EncodedChunk)> {
-        use crate::emit::pipeline::plan_spool::ChunkBuilder;
-        let mut out = Vec::new();
-        let mut view = TupleView::default();
-        for row in &mut self.rows {
-            let (t, seq) = (&self.tables[row.table as usize], row.seq);
-            let mut chunks = ChunkBuilder::new(usize::MAX, usize::MAX);
-            row.encode(&mut view, t, |append| {
-                chunks.append((), &t.rel, &t.route, append).unwrap();
-                Ok(())
-            })
-            .unwrap();
-            out.extend(chunks.take().into_iter().map(|(_, c)| (seq, c)));
-        }
-        out
-    }
-
-    /// `(seq, mapped cells)` per row
-    #[cfg(test)]
-    pub(crate) fn cells(self) -> Vec<(u64, Vec<Datum>)> {
-        self.encoded()
-            .into_iter()
-            .flat_map(|(seq, c)| c.cells().into_iter().map(move |cells| (seq, cells)))
-            .collect()
-    }
-}
-
-impl LoadRow {
-    /// Encode as an insert at its load version against `t`'s plan, through
-    /// `append`, which seals and retries on [`Append::Full`]. `view` is
-    /// scratch, refilled per heap row
-    pub(crate) fn encode<'r>(
-        &'r mut self,
-        view: &mut TupleView<'r>,
-        t: &RowTable,
-        append: impl FnOnce(
-            &mut dyn FnMut(&mut TableEncoder) -> Result<Append, EmitterError>,
-        ) -> Result<(), String>,
-    ) -> Result<(), String> {
-        let LoadRow { tuple, patch, .. } = self;
-        let tuple: &'r BackfillTuple = tuple;
-        let RowTable { rel, route } = t;
-        let stamp = RowStamp {
-            source_lsn: tuple.source_lsn,
-            xid: tuple.xid,
-            commit_ts: 0,
-            op_code: OP_INSERT,
-            leaf: route.partition.as_ref().map(|p| p.leaf),
-        };
-        let appended = match &tuple.data {
-            TupleData::Heap(data) => {
-                view_block_data_into(data, rel, view).map_err(|e| decode_err(rel, e))?;
-                metadata_patch(tuple, rel, patch);
-                append(&mut |enc| enc.append_view(rel, &view.datums, patch, &stamp))
-            }
-            TupleData::Copy(row) => append(&mut |enc| {
-                enc.append_slots(|src| Ok(copy_slot(row, rel, src.index)), &stamp)
-            }),
-        };
-        appended.map_err(|e| format!("bootstrap: encode {}: {e}", rel.rel_name))
-    }
-}
 
 /// Routed load rows go straight to the batcher, each seq placed after its
 /// rows. Router sends its slab before waiting on anything but the batcher
@@ -990,7 +827,7 @@ async fn next_batch(
         .map_err(|e| format!("bootstrap: {e}"))?;
         let mut patch = Vec::new();
         fill_oversize(&mut pointers, &mut patch, resolver);
-        batch.resident += crate::backfill::spool::approx_bytes(&tuple);
+        batch.resident += crate::backfill::tuple::approx_bytes(&tuple);
         batch.rows.push(ReplayRow {
             tuple,
             table,
@@ -1308,7 +1145,7 @@ mod tests {
     async fn a_miss_is_fatal_for_a_seeded_mirror_and_superseded_for_a_read_only_store() {
         use crate::toast::MemChunkStore;
 
-        let ptr = crate::decode::heap_decoder::ToastPointer {
+        let ptr = crate::decode::datum::ToastPointer {
             va_rawsize: 9104,
             va_extinfo: 9100,
             va_valueid: 16402,
@@ -1370,9 +1207,10 @@ mod tests {
             DEFERRED_SPOOL_MEM_MAX,
         )
     }
-    use crate::decode::heap_decoder::ToastPointer;
+    use crate::decode::datum::ToastPointer;
+    use crate::emit::pipeline::ack;
     use crate::emit::pipeline::batcher::BatcherMsg;
-    use crate::emit::pipeline::{Fatal, ack};
+    use crate::emit::pipeline::fatal::Fatal;
     use crate::schema::{RelAttr, RelDescriptor, RelName, ReplIdent};
     use crate::toast::{GatedStore, MemChunkStore};
     use foldhash::{HashMap, HashMapExt, HashSetExt};
@@ -1795,7 +1633,7 @@ mod tests {
             Arc::default(),
             ToastResolver::disabled()
                 .with_inline_value_max(1)
-                .with_overflow(crate::emit::ch_emitter::InlineValueOverflow::Error),
+                .with_overflow(crate::emitter_config::InlineValueOverflow::Error),
             Deferral::Rejected,
             HashSet::new(),
             None,
@@ -1921,7 +1759,7 @@ mod tests {
         // Pointer footprint is 5 bytes
         let resolver = ToastResolver::with_store(Arc::new(MemChunkStore::new()), stats.clone())
             .with_inline_value_max(4)
-            .with_overflow(crate::emit::ch_emitter::InlineValueOverflow::Null);
+            .with_overflow(crate::emitter_config::InlineValueOverflow::Null);
         let drain_task = tokio::spawn(drain(
             tup_rx,
             catalog,
@@ -2388,7 +2226,7 @@ mod tests {
                     let (_, chunk) = &slab.encoded()[0];
                     assert_eq!(
                         chunk.buffers[chunk.route.mapping.columns.len()].wire(),
-                        crate::emit::ch_emitter::Wire::Fixed {
+                        crate::emit::column::Wire::Fixed {
                             width: 8,
                             bytes: &0x1000u64.to_le_bytes(),
                         },
@@ -2598,7 +2436,7 @@ mod tests {
         let store = Arc::new(MemChunkStore::new());
         let resolver = ToastResolver::with_store(store, Arc::default())
             .with_inline_value_max(1)
-            .with_overflow(crate::emit::ch_emitter::InlineValueOverflow::Error);
+            .with_overflow(crate::emitter_config::InlineValueOverflow::Error);
         let (outcome, _) = replay_one(tables().into_iter().collect(), resolver, referrer()).await;
         let e = outcome.expect_err("oversize value fails replay");
         assert!(e.starts_with("bootstrap: "), "{e}");
@@ -2762,9 +2600,9 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn checkpoint_excludes_failed_prefetch_and_resumes_acknowledged_prefix() {
         use crate::backfill::backup_checkpoint::BackupCheckpoint;
-        use crate::emit::ch_emitter::EmitterConfig;
         use crate::emit::pipeline::tail::OwnedTail;
-        use crate::runtime_config::InitialLoadMode;
+        use crate::emitter_config::EmitterConfig;
+        use crate::mapping::InitialLoadMode;
         use crate::toast::{ChunkStore, ChunkStoreError};
 
         struct FailPrefetch(AtomicU64);
@@ -3129,9 +2967,9 @@ mod tests {
     #[tokio::test]
     async fn checkpointed_replay_of_covered_rows_places_no_seq() {
         use crate::backfill::backup_checkpoint::BackupCheckpoint;
-        use crate::emit::ch_emitter::EmitterConfig;
         use crate::emit::pipeline::tail::OwnedTail;
-        use crate::runtime_config::InitialLoadMode;
+        use crate::emitter_config::EmitterConfig;
+        use crate::mapping::InitialLoadMode;
 
         let dir = tempfile::tempdir().unwrap();
         let referrer = bytea_toast_tuple(16400, 16500, 1);

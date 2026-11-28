@@ -11,6 +11,7 @@ cargo nextest run --workspace --all-targets --locked
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 RUSTDOCFLAGS='-D warnings' cargo doc --no-deps --lib --bins
+find src -name '*.rs' | awk -f ci/module_cycles.awk
 ```
 
 Integration tests start PostgreSQL and ClickHouse instances. Put matching

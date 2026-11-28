@@ -18,9 +18,8 @@ use tokio_postgres::types::Oid;
 use crate::catalog::desc_log::DescriptorLog;
 use crate::catalog::shadow_catalog::{ShadowCatalog, with_transient_retry};
 use crate::config::{ConfigResolver, ResolvedConfig};
-use crate::emit::ch_emitter::EmitterConfig;
-use crate::emit::route::RowPolicy;
-use crate::mapping::MappingHandle;
+use crate::emitter_config::EmitterConfig;
+use crate::mapping::{MappingHandle, RowPolicy};
 use crate::ops::bridge::Bridge;
 
 /// Bridge pool and shadow catalog for one source database, opened before the

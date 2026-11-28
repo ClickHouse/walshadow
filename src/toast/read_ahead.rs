@@ -10,8 +10,7 @@ use tokio::sync::Semaphore;
 use tokio_util::task::AbortOnDropHandle;
 
 use crate::budget::{MemoryBudget, MemoryPermit};
-use crate::decode::datum::Datum;
-use crate::decode::heap_decoder::ToastPointer;
+use crate::decode::datum::{Datum, ToastPointer};
 use crate::toast::{pointer_extsize, pointer_footprint};
 
 pub const AHEAD_READS: usize = crate::ops::bridge::MAX_BRIDGE_WORKERS;

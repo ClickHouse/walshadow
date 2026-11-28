@@ -5,50 +5,9 @@ use std::sync::Arc;
 use globset::{Glob, GlobMatcher};
 use regex_automata::meta::Regex;
 
-use crate::mapping::{SystemColumnNames, SystemColumns, Tee};
-use crate::runtime_config::TableRow;
+use crate::mapping::{SystemColumnNames, SystemColumns, Tee, set_if};
+use crate::runtime_config::{MatchKind, TableRow};
 use crate::schema::{RelDescriptor, RelName};
-
-/// Overwrite only where the narrower layer states a value
-pub(crate) fn set_if<T: Clone>(dst: &mut Option<T>, src: &Option<T>) {
-    if src.is_some() {
-        dst.clone_from(src);
-    }
-}
-
-/// Pattern syntax used by config entry
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum MatchKind {
-    #[default]
-    Exact,
-    Glob,
-    Regex,
-}
-
-impl std::str::FromStr for MatchKind {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, String> {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "" | "exact" => Ok(Self::Exact),
-            "glob" => Ok(Self::Glob),
-            "regex" => Ok(Self::Regex),
-            other => Err(format!(
-                "unknown match kind `{other}` (expected exact / glob / regex)"
-            )),
-        }
-    }
-}
-
-impl MatchKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Exact => "exact",
-            Self::Glob => "glob",
-            Self::Regex => "regex",
-        }
-    }
-}
 
 /// Where a declarative partition's rows land
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

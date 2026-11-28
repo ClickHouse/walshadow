@@ -42,10 +42,10 @@ async fn fail_after(app_name: &str, sabotage: impl FnOnce(&Env), stmts: &[&str])
 /// the pipeline's counters
 async fn fail_after_tuned(
     app_name: &str,
-    tune: impl FnOnce(&mut walshadow::ch_emitter::EmitterConfig),
+    tune: impl FnOnce(&mut walshadow::emitter_config::EmitterConfig),
     sabotage: impl FnOnce(&Env),
     stmts: &[&str],
-) -> (String, Arc<walshadow::ch_emitter::EmitterStats>) {
+) -> (String, Arc<walshadow::emit::stats::EmitterStats>) {
     let slot = fx::Ports::alloc();
     let tmp = tempfile::tempdir().unwrap();
     let (

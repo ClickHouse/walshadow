@@ -4,7 +4,7 @@
 //! hands an operator, so they are accepted wherever `[source]` / `[ch]`
 //! are configured, with no transcription of fields into TOML. Output is a
 //! `[source]` / `[ch]` table, merged like any other config layer
-//! ([`crate::ch_emitter::load_effective`])
+//! ([`crate::emitter_config::load_effective`])
 
 use percent_encoding::percent_decode_str;
 use thiserror::Error;

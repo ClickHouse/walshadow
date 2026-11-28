@@ -378,11 +378,9 @@ type ImageViews<'a> = smallvec::SmallVec<[HeapImages<TupleView<'a>>; 1]>;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::decode::datum::{Datum, build};
-    use crate::decode::heap_decoder::{
-        DecodedHeap, DecodedTuple, DescribedHeap, HeapOp, ToastPointer,
-    };
-    use crate::emit::ch_emitter::Wire;
+    use crate::decode::datum::{Datum, ToastPointer, build};
+    use crate::decode::heap_decoder::{DecodedHeap, DecodedTuple, DescribedHeap, HeapOp};
+    use crate::emit::column::Wire;
     use crate::emit::pipeline::plan_spool::PlanItem;
     use crate::mapping::{TableMapping, TableTarget};
     use crate::schema::{INT4OID, RelAttr, RelDescriptor, RelName, SchemaEvent, TEXTOID};
@@ -718,7 +716,7 @@ mod tests {
         };
         let resolver = ToastResolver::with_store(
             Arc::new(crate::toast::MemChunkStore::new()),
-            Arc::new(crate::emit::ch_emitter::EmitterStats::default()),
+            Arc::new(crate::emit::stats::EmitterStats::default()),
         );
         let path = tmp.path().join("1.plan");
         let mut planner = planner(path.clone(), 1 << 20, usize::MAX, &mut view, &resolver);
@@ -1064,8 +1062,9 @@ mod tests {
             _toast_relid: u32,
             values: &[(u32, usize)],
             max_lsn: u64,
-        ) -> Result<Vec<crate::toast::FetchedValue>, crate::toast::ChunkStoreError> {
-            use crate::toast::FetchedValue;
+        ) -> Result<Vec<crate::toast::fetched::FetchedValue>, crate::toast::ChunkStoreError>
+        {
+            use crate::toast::fetched::FetchedValue;
             let index = self.0.lock().unwrap();
             Ok(values
                 .iter()
@@ -1167,7 +1166,7 @@ mod tests {
                 (rng % n) as u32
             };
             let store = Arc::new(ModelStore::default());
-            let stats = Arc::new(crate::emit::ch_emitter::EmitterStats::default());
+            let stats = Arc::new(crate::emit::stats::EmitterStats::default());
             let plain = ToastResolver::with_store(store.clone(), stats.clone());
             // Small and large speculative budgets
             let budget = [4096, 1 << 20][seed as usize % 2];
